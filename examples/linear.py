@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch import Tensor
 from torch.nn.parameter import Parameter
-import torch.functional as F
+import torch.nn.functional as F
 
 import combo.physical.operator as combo_op
 
@@ -38,11 +38,11 @@ class Linear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, input: Tensor) -> Tensor:
-        return combo_op.linear(input, self.weight, self.bias)
+        return combo_op.linear_op(input, self.weight, self.bias)
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, dropout=0., mult=4., classes=1000):
+    def __init__(self, dim, dropout=0., mult=16, classes=1000):
         super().__init__()
         self.net = nn.Sequential(
             Linear(dim, dim * mult),
@@ -56,7 +56,7 @@ class FeedForward(nn.Module):
     def forward(self, x, labels):
         output = self.net(x)
         output = self.classifier(output)
-        loss = F.cross_entory(output, labels)
+        loss = F.cross_entropy(output, labels)
         return loss
 
 
@@ -64,16 +64,17 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--dim', type=int, default=1024)
+    parser.add_argument('--heads', type=int, default=16)
     parser.add_argument('--bs', type=int, default=8)
     parser.add_argument('--classes', type=int, default=10)
     args = parser.parse_args()
 
     torch.cuda.set_device(0)
-    model = FeedForward(args.dim)
+    model = FeedForward(args.dim, mult=args.heads, classes=args.classes)
     model = model.cuda()
 
     inputs = torch.rand((args.bs, args.dim)).cuda()
-    labels = torch.randint((args.bs, args.classes)).cuda()
+    labels = torch.randint(0, 10, (args.bs, )).cuda()
     for _ in range(100):
         loss = model(inputs, labels)
         loss.backward()

@@ -3,7 +3,7 @@ import torch
 from torch import Tensor
 from torch.overrides import has_torch_function_variadic, handle_torch_function
 
-def linear(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tensor:
+def linear_op(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tensor:
     r"""
     Applies a linear transformation to the incoming data: :math:`y = xA^T + b`.
 
@@ -18,6 +18,6 @@ def linear(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tens
         - Output: :math:`(N, *, out\_features)`
     """
     if has_torch_function_variadic(input, weight):
-        print('go through here')
+        print('note: this branch should not pass')
         return handle_torch_function(linear, (input, weight), input, weight, bias=bias)
     return torch._C._nn.linear(input, weight, bias)
