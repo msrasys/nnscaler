@@ -43,7 +43,11 @@ class DeviceGroup:
     def get_group(self, ranks):
         """
         Create and return rank groups on-demand
+
+        None will be returned if length of ranks are equal to world size
         """
+        if len(ranks) == self.instance.world_size:
+            return None
         rank_bits = DeviceGroup.bitmap(ranks)
         if rank_bits not in self.instance.groups:
             self.groups[rank_bits] = torch.distributed.new_group(list(ranks))
