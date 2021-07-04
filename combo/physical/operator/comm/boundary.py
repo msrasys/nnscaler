@@ -117,7 +117,7 @@ class _ReduceOut(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output
+        return grad_output, None
 
 
 def parallel_in(input_, ranks):
@@ -132,5 +132,5 @@ def scatter_in(input_, dim, ranks):
     return _ScatterIn.apply(input_, dim, ranks)
 
 
-def reduce_out(input_):
-    return _ReduceOut.apply(input_)
+def reduce_out(input_, ranks):
+    return _ReduceOut.apply(input_, ranks)
