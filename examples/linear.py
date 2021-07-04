@@ -1,9 +1,21 @@
+"""
+python -m torch.distributed.launch \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    --node_rank=0 \
+    --master_addr=127.0.0.1 \
+    --master_port=6000 \
+    --use_env \
+    examples/linear.py
+"""
+
 import torch
 from torch import nn
 from torch import Tensor
 from torch.nn.parameter import Parameter
 import torch.nn.functional as F
 
+import combo
 import combo.physical.operator as combo_op
 
 import math
@@ -69,7 +81,10 @@ if __name__ == '__main__':
     parser.add_argument('--classes', type=int, default=10)
     args = parser.parse_args()
 
-    torch.cuda.set_device(0)
+    # init distributed env
+    group = combo.physical.device.group.DeviceGroup()
+    print(group)
+
     model = FeedForward(args.dim, mult=args.heads, classes=args.classes)
     model = model.cuda()
 
