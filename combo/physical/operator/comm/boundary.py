@@ -1,3 +1,7 @@
+"""
+Autograd backward needs to return the same number of gradients as input,
+even if they are not tensors.
+"""
 
 import torch
 
@@ -64,7 +68,7 @@ class _ParallelIn(torch.autograd.Function):
     def backward(ctx, grad_output):
         # allreduce
         group = ctx.constants
-        return _reduce(grad_output, group)
+        return _reduce(grad_output, group), None
 
 
 class _GatherOut(torch.autograd.Function):
@@ -83,7 +87,7 @@ class _GatherOut(torch.autograd.Function):
         group, dim = ctx.constants
         world_size = torch.distributed.get_world_size(group)
         rank = torch.distributed.get_rank(group)
-        return _split(grad_output, dim, world_size, rank)
+        return _split(grad_output, dim, world_size, rank), None, None
 
 
 class _ScatterIn(torch.autograd.Function):
@@ -100,7 +104,7 @@ class _ScatterIn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         group, dim = ctx.constants
-        return _gather(grad_output, dim, group)
+        return _gather(grad_output, dim, group), None, None
 
 
 class _ReduceOut(torch.autograd.Function):
