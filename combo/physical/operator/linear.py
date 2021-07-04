@@ -25,6 +25,11 @@ def linear_op(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> T
         print('note: this branch should not pass')
         return handle_torch_function(linear, (input, weight), input, weight, bias=bias)
 
+    # Information needed for enabling multiple GPUs:
+    #   - involved devices -> (could be involved in tensor interfacee design)
+    #   - which algorithm to take -> (semantic description / pattern match?)
+    #       e.g., semantic description: allgather(split(weight, dim=0) * input + split(bias, dim=0))
+    #   - how we handle weight -> (everytime we need chunk weight / bias if we only focus on op)
     devices = [0, 1]
     rank = torch.distributed.get_rank(DeviceGroup().get_group(devices))
 
