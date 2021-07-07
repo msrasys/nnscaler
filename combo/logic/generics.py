@@ -27,7 +27,7 @@ class HolisticOpFactory:
         #TODO: type check
         self.holist_ops.append(holist_ops)
 
-    def composite_op(self, args, **kwargs):
+    def get_op(self, args, **kwargs):
         """
         Given input tensor args, choose holistic operator(s)
         for distributed execution plan
@@ -51,4 +51,7 @@ class GenericLogicalOp:
         """
         Policy here to determine which holistic operator(s) are called
         """
-        pass
+        composite_op = self.factory.get_op(args, kwargs)
+        # run operator with the strategy plan
+        outputs = composite_op(args, kwargs)
+        return outputs
