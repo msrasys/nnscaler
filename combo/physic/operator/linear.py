@@ -3,8 +3,8 @@ import torch
 from torch import Tensor
 from torch.overrides import has_torch_function_variadic, handle_torch_function
 
-import combo.physical.operator.comm as comm
-from combo.physical.device.group import DeviceGroup
+import combo.physic.operator.comm as comm
+from combo.physic.device.group import DeviceGroup
 
 
 def linear_op(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tensor:
@@ -64,5 +64,15 @@ def linear_op(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> T
         output = torch._C._nn.linear(input, weight, bias)
         # forward: reduce; backward: identity
         output = comm.reduce_out(output, ranks=devices)
+
+    # Pesudo-code 
+    else:
+        # data parallelism
+        input=[(0, Split())], weight=[], bias=[], output=[(0, Split())]
+        # tensor parallelism, weight column split
+        input=[], weight=[(0, Split())], bias=[(0, Split())], output=[(-1, Split())]
+        # tensor parallelism: data column + weight row
+        input=[(1, Split())] weight=[(1, Split()], bias=[], output=[(ALL, Partial(Sum))]
+
 
     return output
