@@ -12,9 +12,6 @@ class GenericHolisticOp:
 
     def __init__(self, input_layout, output_layout):
 
-        # operator: take any inputs and generate output
-        self.F = func
-
         # holistic layout of input to work on
         self.input_layout = dict()
 
@@ -36,7 +33,8 @@ class GenericHolisticOp:
         pass
 
     def forward(self, args, **kwargs):
-        """Expert code for doing operation"""
+        """Expert code for doing operation
+        Call to the physical operator for execution"""
         pass
 
     def __call__(self, args, **kwargs):
@@ -45,7 +43,7 @@ class GenericHolisticOp:
         self.boundary_in(args, kwargs)
 
         # do execution
-        outputs = self.F(args, kwargs)
+        outputs = self.forward(args, kwargs)
 
         # wrap in holistic tensor with output layout
         outputs = self.warp_to_holistic_tensor(outputs)
