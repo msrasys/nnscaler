@@ -33,12 +33,14 @@ class ReductionOpPool(metaclass=_Reduction):
 
 class Community:
 
-    def __init__(self, logical_tensor, reduction=None):
+    def __init__(self, logical_tensor, segment, reduction=None):
         """Create Community based on the logical tensor
 
         Attribute:
             parent (LogicalTensor):
                 Logical Tensor the Community belongs to
+            segment (DataSegment):
+                indices of logical_tensor for this community
             reduction (Callable or None):
                 Reduction function for retrieve back physical tensors
 
