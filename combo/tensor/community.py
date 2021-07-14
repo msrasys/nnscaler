@@ -45,7 +45,13 @@ class Community:
                 Reduction function for retrieve back physical tensors
 
         """
+        # connection to logical tensor
         self.parent = logical_tensor
+        self.segment = segment
+
+        # connection to physical tensor
+        self.mapping = None
+
         self.reduction = reduction
 
     def spread(self, device_list):
