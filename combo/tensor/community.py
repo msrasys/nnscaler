@@ -36,6 +36,11 @@ class Community:
     def __init__(self, logical_tensor, segment, reduction=None):
         """Create Community based on the logical tensor
 
+        Community manages one:
+
+        1). Logical Tensor data mapping to Physical Tensor data storage
+        2). Materialized Physical Tensors
+
         Attribute:
             parent (LogicalTensor):
                 Logical Tensor the Community belongs to
@@ -47,17 +52,20 @@ class Community:
         """
         # connection to logical tensor
         self.parent = logical_tensor
+
+        # DataSegment to indicate both element set and data format mapping
         self.segment = segment
 
-        # connection to physical tensor
-        self.mapping = None
+        # connection to physical tensor (the PyTorch Tensor)
+        self.phsyical_tensor = None
+        self.materialized = False
 
         self.reduction = reduction
 
     def spread(self, device_list):
         """Spread physical tensors to devices
     
-        Create physical tensors for this community and spread out
+        Materialize physical tensors for this community and spread out
         based on the given device list.
 
         This offers policy module an interface to decide which devices
@@ -83,3 +91,14 @@ class Community:
     def sync(self):
         """Synchrnoize the spread physical tensors by reduction operation"""
         pass
+
+    def get_physical_tensor(self):
+        """Get physical tensor if materialized
+
+        Returns:
+            PhysicalTensor (if materialized)
+        """"
+        if self.materialized:
+            return self.physical_tensor
+        else:
+            raise RuntimeError("The Community has not been materialized to physical tensors")

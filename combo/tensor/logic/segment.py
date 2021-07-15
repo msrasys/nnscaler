@@ -10,12 +10,13 @@ class DataSegment:
     """
     The basic primitive to gather data in the logical tensor.
 
+    The order of indices indicate the physical storage (1-D array) order
     """
 
     def __init__(self, indices_list=None):
         """
         Args:
-            indices_list (list[ list[int] ]):
+            indices_list (list[ list[int], ]):
                 List of index
         """
 
@@ -26,6 +27,16 @@ class DataSegment:
         Convert to index list
         """
         pass
+
+    def reorder(self, new_orders):
+        """
+        Reorder the indices.
+
+        Note this can be only called before materialize physical tensors,
+        or called from underlying operation that will change physical storage format
+        """
+        #TODO: validation check
+        self.indices = new_orders
 
 
 ## Higher level interface to cover the most cases ##
@@ -52,6 +63,9 @@ class TileSegment(DataSegment):
         """
         Convert anchor and offset to index list
         """
+        pass
+
+    def reorder(self):
         pass
     
 
