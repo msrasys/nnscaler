@@ -10,25 +10,41 @@ happen in the front of the next executed op in case the layout doesn't match.
 
 class GenericHolisticOp:
 
-    def __init__(self, input_layout, output_layout):
+    def __init__(self, 
+                input_layout, output_layout,
+                input_format=None, output_format=None):
+        """
+        Layout is the community distribution requirement for input and
+        output logical tensors.
 
-        # holistic layout of input to work on
+        Format is the dimension ordering based on the logical format,
+        `None` indicates the format is consistent with logical op,
+        otherwise should be a list of integers like torch.Tensor.permute()
+        on the logical required format.
+        """
+        # holistic layout of input
         self.input_layout = dict()
+        self.input_format = input_format
 
         # holistic layout of output
         self.output_layout = dict()
+        self.output_format = output_format
     
-    def boundary_in(self, args, **kwargs):
+    def input_adapter(self, args, **kwargs):
         """
         Transform tensors in args and kwargs to match the
         input layout requirement
         """
+        # step 1: data reformat based on the input argument
+
+        # step 2: physical tensor placement (policy)
+
+        # step 3: community matching 
         pass
 
-    def warp_to_holistic_tensor(self, outputs):
+    def output_adapter(self, outputs):
         """
-        Wrap local computed tensor into a holistic view
-        by using self.output_layout
+        Data reformat to logical op format
         """
         pass
 
@@ -40,12 +56,12 @@ class GenericHolisticOp:
     def __call__(self, args, **kwargs):
 
         # data transformations to match input layout requirement
-        self.boundary_in(args, kwargs)
+        self.input_adapter(args, kwargs)
 
         # do execution
         outputs = self.forward(args, kwargs)
 
         # wrap in holistic tensor with output layout
-        outputs = self.warp_to_holistic_tensor(outputs)
+        outputs = self.output_adapter(outputs)
 
         return outputs
