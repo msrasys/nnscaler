@@ -69,8 +69,8 @@ def linear_data_parallel(input, weight, bias):
     ### Additional ops need to use ###
     
     ### Input Adapter ###
-    weight.register_hook(lambda grad: torch.distributed.allreduce(grad))
-    bias.register_hook(lambda grad: torch.distributed.allreduce(grad))
+    weight.register_hook(lambda grad: torch.distributed.all_reduce(grad))
+    bias.register_hook(lambda grad: torch.distributed.all_reduce(grad))
 
     ### Forward ###
     output = torch._C._nn.linear(input, weight, bias)
@@ -121,5 +121,11 @@ if __name__ == '__main__':
     print_each_rank('======== Model Parallel =========', [0])
 
     # data parallel
+    weight.grad = None
+    bias.grad = None
     print_each_rank('======== Data Parallel =========', [0])
+    output = linear_data_parallel(input, weight, bias)
+    loss = torch.mean(output)
+    loss.backward()
+    print_each_rank('weight grad: {}'.format(weight.grad.t()))
     print_each_rank('======== Data Parallel =========', [0])
