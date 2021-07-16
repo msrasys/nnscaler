@@ -11,7 +11,7 @@ The description includes two parts:
 """
 
 
-# primitives to describe segmentation pattern
+# interface to setup restrictions on the segmentation
 
 class SplitAxis:
 

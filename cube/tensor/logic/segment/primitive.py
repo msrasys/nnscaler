@@ -3,7 +3,7 @@ This is the runtime primitive sets to setup community for a logical tensor.
 """
 
 
-## Basic interface to cover all the cases
+## Basic structure for holding a segment -> cover all the cases ##
 class DataSegment:
     """
     The basic primitive to gather data in the logical tensor.
@@ -37,7 +37,7 @@ class DataSegment:
         self.indices = new_orders
 
 
-## Higher level interface to cover the most cases ##
+## Higher structure to cover the most cases ##
 class TileSegment(DataSegment):
     """
     A tile is a contigonous block on the logical tensor shape,
@@ -64,3 +64,21 @@ class TileSegment(DataSegment):
 
     def reorder(self):
         pass
+
+
+## Primitive sets for translation ##
+
+def create_from_indices(indices):
+    return DataSegment(indices)
+
+
+def create_from_tiles(anchor, offset):
+    # segments = list()
+    # dims = len(offset)
+    # for dim_id in range(dims):
+    #     indices = None # -> TODO: generate indices along the dim_id
+    #     segment = create_from_indices(indices)
+    #     segments.append(segment)
+    # segment = merge_segments(segments)
+    # return segment
+    return TileSegment(anchor, offset)
