@@ -1,10 +1,10 @@
-from combo.operator.holist.generics import GenericHolisticOp
+from cube.operator.holist.generics import GenericHolisticOp
 
-import combo.operator.physic as physic_op
+import cube.operator.physic as physic_op
 
-from combo.tensor.logic.tensor import LogicalTensor
-from combo.tensor.logic.segment import TileSegment
-from combo.tensor.community import Community
+from cube.tensor.logic.tensor import LogicalTensor
+from cube.tensor.logic.segment import TileSegment
+from cube.tensor.community import Community
 
 # expert space to declare all kinds of holistic operators
 

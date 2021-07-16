@@ -1,5 +1,5 @@
-from combo.operator.logic.generics import generics
-from combo.operator.holist.linear import kHolistLinearSets
+from cube.operator.logic.generics import generics
+from cube.operator.holist.linear import kHolistLinearSets
 
 __all__ = ['linear']
 

@@ -5,7 +5,7 @@ even if they are not tensors.
 
 import torch
 
-from combo.physical.device.group import DeviceGroup
+from cube.physical.device.group import DeviceGroup
 
 
 __all__ = ['parallel_in', 'gather_out', 'scatter_in', 'reduce_out']

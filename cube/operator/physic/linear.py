@@ -3,8 +3,8 @@ import torch
 from torch import Tensor
 from torch.overrides import has_torch_function_variadic, handle_torch_function
 
-import combo.physic.operator.comm as comm
-from combo.physic.device.group import DeviceGroup
+import cube.physic.operator.comm as comm
+from cube.physic.device.group import DeviceGroup
 
 
 def linear_op(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tensor:

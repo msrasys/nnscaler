@@ -1,4 +1,4 @@
-from combo.tensor.community import Community, ReductionOpPool
+from cube.tensor.community import Community, ReductionOpPool
 
 
 class LogicalTensor:
