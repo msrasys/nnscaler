@@ -16,9 +16,9 @@ if __name__ == '__main__':
     batch_size = 32
     out_features = 1024
     in_features = 1024
-    weight = Parameter(torch.rand((out_features, in_features))).cuda()
+    weight = torch.rand((out_features, in_features)).cuda().requires_grad_()
     # print('weight: ', weight)
-    bias = Parameter(torch.rand(out_features)).cuda()
+    bias = torch.rand(out_features).cuda().requires_grad_()
     # print('bias: ', bias)
     input = torch.rand((batch_size, in_features)).cuda()
     # print('input: ', input)
@@ -29,4 +29,5 @@ if __name__ == '__main__':
     loss = torch.mean(output)
     print(loss)
     loss.backward()
+    print('weight grad: ', weight.grad.t())
     print('======== Naive Single Device =======')

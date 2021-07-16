@@ -103,9 +103,9 @@ if __name__ == '__main__':
     batch_size = 32
     out_features = 1024
     in_features = 1024
-    weight = Parameter(torch.rand((out_features, in_features))).cuda()
+    weight = torch.rand((out_features, in_features)).cuda().requires_grad_()
     # print_each_rank('weight: {}'.format(weight))
-    bias = Parameter(torch.rand(out_features)).cuda()
+    bias = torch.rand(out_features).cuda().requires_grad_()
     # print_each_rank('bias: {}'.format(bias))
     input = torch.rand((batch_size, in_features)).cuda()
     # print_each_rank('input: {}'.format(input))
@@ -116,6 +116,8 @@ if __name__ == '__main__':
     loss = torch.mean(output)
     print_each_rank(loss)
     loss.backward()
+    # note weight is created as transposed
+    print_each_rank('weight grad: {}'.format(weight.grad.t()))
     print_each_rank('======== Model Parallel =========', [0])
 
     # data parallel
