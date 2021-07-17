@@ -7,7 +7,7 @@ python -m torch.distributed.launch \
     --master_addr=127.0.0.1 \
     --master_port=62000 \
     --use_env \
-    examples/case_study/config_linear.py
+    examples/case_study/parallel_linear.py
 """
 
 import torch
