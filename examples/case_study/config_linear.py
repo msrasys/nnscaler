@@ -15,6 +15,8 @@ import os
 from torch.nn.parameter import Parameter
 torch.manual_seed(121)
 
+hooks = list()
+
 # tensor parallel - split weight in column
 def linear_tensor_parallel(input, weight, bias):
     ### Policy need to know ###
@@ -70,8 +72,10 @@ def linear_data_parallel(input, weight, bias):
     ### Additional ops need to use ###
     
     ### Input Adapter ###
-    weight.register_hook(lambda grad: torch.distributed.all_reduce(grad))
-    bias.register_hook(lambda grad: torch.distributed.all_reduce(grad))
+    hw = weight.register_hook(lambda grad: torch.distributed.all_reduce(grad))
+    hb = bias.register_hook(lambda grad: torch.distributed.all_reduce(grad))
+    global hooks
+    hooks += [hw, hb]
 
     ### Forward ###
     output = torch._C._nn.linear(input, weight, bias)
@@ -83,24 +87,40 @@ def linear_data_parallel(input, weight, bias):
 # tensor + data parallel
 def linear_hybrid_tensor_data_parallel(input, weight, bias):
     ### Policy need to know ###
-    devices = [0, 1, 2, 3]                       # how many device to perform?
+    tp_size = 2                       # how many device to perform?
+    dp_size = 2
 
     ### Necessary information to execute ###
     rank = torch.distributed.get_rank()  # which role I participate?
-    if rank in [0,2]:
-        dp_group = torch.distributed.new_group([0,2])
-    else:
-        dp_group = torch.distributed.new_group([1,3])
-    dp_rank = torch.distributed.get_rank(group=dp_group)
-    
-    if rank in [0,1]:
-        tp_group = torch.distributed.new_group([0,1])
-    else:
-        tp_group = torch.distributed.new_group([2,3])
+
+    # data parallel group
+    dp_group = None
+    group = torch.distributed.new_group([0,2])
+    if rank in [0, 2]:
+        dp_group = group
+    group = torch.distributed.new_group([1,3])
+    if rank in [1, 3]:
+        dp_group = group
+
+    # tensor parallel group
+    tp_group = None
+    group = torch.distributed.new_group([0,1])
+    if rank in [0, 1]:
+        tp_group = group
+    group = torch.distributed.new_group([2,3])
+    if rank in [2, 3]:
+        tp_group = group
     tp_rank = torch.distributed.get_rank(group=tp_group)
     tp_world_size = torch.distributed.get_world_size(group=tp_group)
-    # print_each_rank('tp world size: {} tp rank: {}'.format(tp_world_size, tp_rank))
-    
+    print_each_rank(
+        'rank global:tp:dp=[{}:{}:{}] | size global:tp:dp=[{}:{}:{}]'.format(
+            torch.distributed.get_rank(),
+            torch.distributed.get_rank(tp_group),
+            torch.distributed.get_rank(dp_group),
+            torch.distributed.get_world_size(),
+            torch.distributed.get_world_size(tp_group),
+            torch.distributed.get_world_size(dp_group)
+        ))
 
     ### Additional Ops ###
     class InputAdapter(torch.autograd.Function):
@@ -209,15 +229,16 @@ if __name__ == '__main__':
     loss.backward()
     print_each_rank('weight grad: {}'.format(weight.grad.t()))
     print_each_rank('======== Data Parallel =========', [0])
-    #TODO: remove hook
 
     # hybrid tensor-data parallel
     weight.grad = None
     bias.grad = None
+    for hook in hooks:
+        hook.remove()
     print_each_rank('======== Data + Tensor Parallel =========', [0])
     output = linear_hybrid_tensor_data_parallel(input, weight, bias)
     loss = torch.mean(output)
-    print_each_rank(loss)
+    # print_each_rank(loss)
     loss.backward()
     print_each_rank('weight grad: {}'.format(weight.grad.t()))
     print_each_rank('======== Data + Tensor Parallel =========', [0])
