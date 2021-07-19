@@ -84,8 +84,12 @@ def linear_data_parallel(input, weight, bias):
     input = torch.chunk(input, chunks=len(devices), dim=0)[rank].contiguous()
 
     ### Input Adapter ### TODO: system generated according to segmentation
-    hw = weight.register_hook(lambda grad: torch.distributed.all_reduce(grad))
-    hb = bias.register_hook(lambda grad: torch.distributed.all_reduce(grad))
+    def grad_hook(grad):
+        torch.distributed.all_reduce(grad)
+        grad /= len(devices)
+        return grad
+    hw = weight.register_hook(grad_hook)
+    hb = bias.register_hook(grad_hook)
     global hooks
     hooks += [hw, hb]
 
@@ -173,8 +177,14 @@ def linear_hybrid_tensor_data_parallel(input, weight, bias):
     bias = torch.chunk(bias, chunks=tp_world_size, dim=0)[tp_rank].contiguous()
     
     ### Input Adapter - Data Parallel ### TODO: system generated according to segmentation
-    weight.register_hook(lambda grad: torch.distributed.all_reduce(grad, group=dp_group))
-    bias.register_hook(lambda grad: torch.distributed.all_reduce(grad, group=dp_group))
+    def grad_hook(grad):
+        torch.distributed.all_reduce(grad, group=dp_group)
+        grad /= dp_size
+        return grad
+    hw = weight.register_hook(grad_hook)
+    hb = bias.register_hook(grad_hook)
+    global hooks
+    hooks += [hw, hb]
 
     ### Input Adapter - Tensor Parallel ### TODO: system generated according to segmentation
     input = InputAdapter.apply(input, tp_group)
