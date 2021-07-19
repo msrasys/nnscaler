@@ -53,9 +53,11 @@ def linear_tensor_parallel(input, weight, bias):
             )
             return tensor_list[rank].contiguous()
 
-    ### Input Adapter ###
+    ### Input Slice ###
     weight = torch.chunk(weight, chunks=len(devices), dim=0)[rank].contiguous()
     bias = torch.chunk(bias, chunks=len(devices), dim=0)[rank].contiguous()
+
+    ### Input Adapter ###
     input = InputAdapter.apply(input)
     
     ### Forward ###
@@ -70,6 +72,7 @@ def linear_tensor_parallel(input, weight, bias):
 # data parallel
 def linear_data_parallel(input, weight, bias):
     ### Additional ops need to use ###
+    # -> torch.distributed.all_reduce at backward
     
     ### Input Adapter ###
     hw = weight.register_hook(lambda grad: torch.distributed.all_reduce(grad))
@@ -87,7 +90,7 @@ def linear_data_parallel(input, weight, bias):
 # tensor + data parallel
 def linear_hybrid_tensor_data_parallel(input, weight, bias):
     ### Policy need to know ###
-    tp_size = 2                       # how many device to perform?
+    tp_size = 2                       # how many slices? which device?
     dp_size = 2
 
     ### Necessary information to execute ###
