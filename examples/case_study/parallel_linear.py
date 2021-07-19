@@ -25,7 +25,7 @@ def linear_tensor_parallel(input, weight, bias):
     ### Necessary information to know ###
     rank = torch.distributed.get_rank()  # which role I participate?
 
-    ### Additional ops need to use ###
+    ### Additional ops need to use ### -- TODO: System Generated
     class InputAdapter(torch.autograd.Function):
         @staticmethod
         def forward(ctx, input_):
@@ -53,17 +53,17 @@ def linear_tensor_parallel(input, weight, bias):
             )
             return tensor_list[rank].contiguous()
 
-    ### Input Slice ###
+    ### Input Slice ### TODO: expert description on how to tile
     weight = torch.chunk(weight, chunks=len(devices), dim=0)[rank].contiguous()
     bias = torch.chunk(bias, chunks=len(devices), dim=0)[rank].contiguous()
 
-    ### Input Adapter ###
+    ### Input Adapter ### TODO: system generated according to segmentation
     input = InputAdapter.apply(input)
     
-    ### Forward ###
+    ### Forward ### TODO: expert description on how to compute
     output = torch._C._nn.linear(input, weight, bias)
 
-    ### Ouput Adapter ###
+    ### Ouput Adapter ### TODO: system generated according to segmentation
     # insert a forward + backward op at last (allgather - split)
     output = OutputAdapter.apply(output)
     return output
@@ -71,19 +71,28 @@ def linear_tensor_parallel(input, weight, bias):
 
 # data parallel
 def linear_data_parallel(input, weight, bias):
+    ### Policy need to know ###
+    devices = [0, 1, 2, 3]               # how many device to perform?
+
+    ### Necessary information to know ###
+    rank = torch.distributed.get_rank()  # which role I participate?
+
     ### Additional ops need to use ###
     # -> torch.distributed.all_reduce at backward
     
-    ### Input Adapter ###
+    ### Input Slice ### TODO: expert description on how to tile
+    input = torch.chunk(input, chunks=len(devices), dim=0)[rank].contiguous()
+
+    ### Input Adapter ### TODO: system generated according to segmentation
     hw = weight.register_hook(lambda grad: torch.distributed.all_reduce(grad))
     hb = bias.register_hook(lambda grad: torch.distributed.all_reduce(grad))
     global hooks
     hooks += [hw, hb]
 
-    ### Forward ###
+    ### Forward ### TODO: expert description on how to compute
     output = torch._C._nn.linear(input, weight, bias)
 
-    ### Output Adapter ### -> no need
+    ### Output Adapter ### TODO: system generated according to segmentation
     return output
 
 
@@ -104,6 +113,7 @@ def linear_hybrid_tensor_data_parallel(input, weight, bias):
     group = torch.distributed.new_group([1,3])
     if rank in [1, 3]:
         dp_group = group
+    dp_rank = torch.distributed.get_rank(group=dp_group)
 
     # tensor parallel group
     tp_group = None
@@ -157,23 +167,22 @@ def linear_hybrid_tensor_data_parallel(input, weight, bias):
             )
             return tensor_list[rank].contiguous(), None, None
 
-    ### Input Adapter - Slice ###
+    ### Input Adapter - Slice ### TODO: expert description on how to tile
+    input = torch.chunk(input, chunks=dp_size, dim=0)[dp_rank].contiguous()
     weight = torch.chunk(weight, chunks=tp_world_size, dim=0)[tp_rank].contiguous()
     bias = torch.chunk(bias, chunks=tp_world_size, dim=0)[tp_rank].contiguous()
-    # replicate is implicitly done due to SPMD
     
-    ### Input Adapter - Data Parallel ###
+    ### Input Adapter - Data Parallel ### TODO: system generated according to segmentation
     weight.register_hook(lambda grad: torch.distributed.all_reduce(grad, group=dp_group))
     bias.register_hook(lambda grad: torch.distributed.all_reduce(grad, group=dp_group))
 
-    torch.distributed.barrier()
-    ### Input Adapter - Tensor Parallel ###
+    ### Input Adapter - Tensor Parallel ### TODO: system generated according to segmentation
     input = InputAdapter.apply(input, tp_group)
 
-    ### Forward ###
+    ### Forward ### TODO: expert description on how to compute
     output = torch._C._nn.linear(input, weight, bias)
 
-    ### Output Adapter - Tensor Parallel ###
+    ### Output Adapter - Tensor Parallel ### TODO: system generated according to segmentation
     output = OutputAdapter.apply(output, tp_group, -1)
 
     ### Ouput Adapter - Data Parallel ###
