@@ -71,6 +71,8 @@ def checkpoint_module_linear(input, weight, bias):
 
 def swap_weight_grad_linear(input, weight, bias):
 
+    ### Policy ###
+
     # op placement
     op_device = torch.device('cuda:0')
 
@@ -86,6 +88,11 @@ def swap_weight_grad_linear(input, weight, bias):
         return grad
     weight.register_hook(grad_swap)
     bias.register_hook(grad_swap)
+
+    ## Timing when a tensor swapped in/out 
+    ## On-demand? Pre-fetch? All-consumed?
+    
+    #####
 
     class SwapLinear(torch.autograd.Function):
         @staticmethod
