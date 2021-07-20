@@ -223,8 +223,8 @@ if __name__ == '__main__':
 
     # tensor definition
     batch_size = 32
-    out_features = 1024
-    in_features = 1024
+    out_features = 10240
+    in_features = 10240
     weight = torch.rand((out_features, in_features)).cuda().requires_grad_()
     # print_each_rank('weight: {}'.format(weight))
     bias = torch.rand(out_features).cuda().requires_grad_()
@@ -235,7 +235,7 @@ if __name__ == '__main__':
     # model parallel
     print_each_rank('======== Model Parallel =========', [0])
     output = linear_tensor_parallel(input, weight, bias)
-    loss = torch.mean(output)
+    loss = torch.mean(output) * 100
     print_each_rank(loss)
     loss.backward()
     # note weight is created as transposed
@@ -247,7 +247,7 @@ if __name__ == '__main__':
     bias.grad = None
     print_each_rank('======== Data Parallel =========', [0])
     output = linear_data_parallel(input, weight, bias)
-    loss = torch.mean(output)
+    loss = torch.mean(output) * 100
     loss.backward()
     print_each_rank('weight grad: {}'.format(weight.grad.t()))
     print_each_rank('======== Data Parallel =========', [0])
@@ -259,7 +259,7 @@ if __name__ == '__main__':
         hook.remove()
     print_each_rank('======== Data + Tensor Parallel =========', [0])
     output = linear_hybrid_tensor_data_parallel(input, weight, bias)
-    loss = torch.mean(output)
+    loss = torch.mean(output) * 100
     # print_each_rank(loss)
     loss.backward()
     print_each_rank('weight grad: {}'.format(weight.grad.t()))

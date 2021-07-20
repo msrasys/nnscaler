@@ -14,8 +14,8 @@ if __name__ == '__main__':
 
     # tensor definition
     batch_size = 32
-    out_features = 1024
-    in_features = 1024
+    out_features = 10240
+    in_features = 10240
     weight = torch.rand((out_features, in_features)).cuda().requires_grad_()
     # print('weight: ', weight)
     bias = torch.rand(out_features).cuda().requires_grad_()
@@ -26,7 +26,7 @@ if __name__ == '__main__':
     # op compute
     print('======== Naive Single Device =======')
     output = linear(input, weight, bias)
-    loss = torch.mean(output)
+    loss = torch.mean(output) * 100
     print(loss)
     loss.backward()
     print('weight grad: ', weight.grad.t())
