@@ -71,32 +71,46 @@ def checkpoint_module_linear(input, weight, bias):
 
 def swap_weight_grad_linear_v2(input, weight, bias):
 
+    # op placement
+    op_device = torch.device('cuda:0')
+
+    # tensor placement: this should be set at tensor creation stage
+    # note here if change this, we also need to change tensor init at main
+    weight.host_device = torch.device('cpu')
+    bias.host_device = torch.device('cpu')
+
+    # grad placement: this can be set before running
+    grad_device = torch.device('cuda:0')
+    def grad_swap(grad):
+        grad.data = grad.detach().to(grad_device)
+        return grad
+    weight.register_hook(grad_swap)
+    bias.register_hook(grad_swap)
+
     class SwapLinear(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, input, weight, bias, swap_weight=True, swap_bias=True):
+        def forward(ctx, input, weight, bias):
 
             weight_id = id(weight)
             bias_id = id(bias)
             ctx.save_for_backward(input, torch.tensor(weight_id), torch.tensor(bias_id))
             tensor_map[weight_id] = weight
-            tensor_map[bias_id] = bias_id
-
-            ctx.constants = (swap_weight, swap_bias)
+            tensor_map[bias_id] = bias
 
             # retrieve from cpu memory
-            if swap_weight:
-                weight.data = weight.detach().cuda()
-            if swap_bias:
-                bias.data = bias.detach().cuda()
+            if weight.device != op_device:
+                weight.data = weight.detach().to(op_device)
+            if bias.get_device() != op_device:
+                bias.data = bias.detach().to(op_device)
 
             # compute
             output = torch._C._nn.linear(input, weight, bias)
 
             # offload to CPU
-            if swap_weight:
-                weight.data = weight.detach().cpu()
-            if swap_bias:
-                bias.data = bias.detach().cpu()
+            if weight.device != weight.host_device:
+                weight.data = weight.detach().to(weight.host_device)
+            if bias.device != bias.host_device:
+                bias.data = bias.detach().to(bias.host_device)
             return output
 
         @staticmethod
@@ -104,17 +118,16 @@ def swap_weight_grad_linear_v2(input, weight, bias):
             input, weight_id, bias_id = ctx.saved_tensors
             weight = tensor_map[weight_id.item()]
             bias = tensor_map[bias_id.item()]
-            swap_weight, swap_bias = ctx.constants
 
             grad_input = grad_weight = grad_bas = None
             if ctx.needs_input_grad[0]:
                 print('computing grad of input...')
                 # retrieve weight
-                if swap_weight:
-                    weight.data = weight.cuda()
+                if weight.device != op_device:
+                    weight.data = weight.detach().to(op_device)
                 grad_input = grad_output.matmul(weight)
-                if swap_weight:
-                    weight.data = weight.detach().cpu()
+                if weight.device != weight.host_device:
+                    weight.data = weight.detach().to(weight.host_device)
             if ctx.needs_input_grad[1]:
                 dim = grad_output.dim()
                 if dim > 2:
@@ -124,17 +137,20 @@ def swap_weight_grad_linear_v2(input, weight, bias):
                         .matmul(input.view(-1, input.shape[-1]))
                 else:
                     grad_weight = grad_output.t().matmul(input)
-                if swap_weight:
-                    grad_weight.data = grad_weight.detach().cpu()
             if ctx.needs_input_grad[2]:
                 grad_bias = grad_output.sum(0)
-                if swap_bias:
-                    grad_bias.data = grad_bias.detach().cpu()
-            print('here')
-            return grad_input, grad_weight, grad_bias, None, None
+
+            ### Move gradient to it's tensor host device ###
+            ### WARNING: there will be up to 2 redundant I/O if we require
+            ### gradient to place differently with its tensor
+            if grad_weight is not None:
+                grad_weight.data = grad_weight.detach().to(weight.host_device)
+            if grad_bias is not None:
+                grad_bias.data = grad_bias.detach().to(bias.host_device)
+
+            return grad_input, grad_weight, grad_bias
     
-    output = SwapLinear.apply(input, weight, bias,
-                              True, True)
+    output = SwapLinear.apply(input, weight, bias)
     return output
 
 
@@ -161,7 +177,7 @@ if __name__ == '__main__':
     weight_swap_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
 
     output = swap_weight_grad_linear_v2(input, weight_1, bias_1)
-    print('output: {}'.format(output))
+    # print('output: {}'.format(output))
     output = swap_weight_grad_linear_v2(output, weight_2, bias_2)
     loss = torch.mean(output) * 100
     loss.backward()
