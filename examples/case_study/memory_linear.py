@@ -88,7 +88,7 @@ def swap_weight_grad_linear(input, weight, bias):
     
     ### Adatper to swap out gradient ###
     def swap_out_grad(grad):
-        grad.data = grad.cpu()
+        grad.data = grad.detach().cpu()
         return grad
     if gradient_swap:
         weight.register_hook(swap_out_grad)
@@ -101,9 +101,11 @@ def swap_weight_grad_linear(input, weight, bias):
 
     ### Swap out if needed ### TODO: swapout can be in any place
     if weight_swap:
-        weight.data = weight.cpu()
+        weight.data = weight.detach().cpu()
     if bias_swap:
-        bias.data = bias.cpu()
+        bias.data = bias.detach().cpu()
+    # print(weight)
+    # print(bias)
 
     return output
 
@@ -112,27 +114,41 @@ def swap_weight_grad_linear(input, weight, bias):
 if __name__ == '__main__':
 
     torch.cuda.set_device(0)
+    init_memory = torch.cuda.memory_allocated()
 
     # tensor definition
     batch_size = 32
-    out_features = 1024
-    in_features = 1024
+    out_features = 10240
+    in_features = 10240  ## 100 MB weight
     weight = torch.rand((out_features, in_features)).cuda().requires_grad_()
     # print('weight: ', weight)
     bias = torch.rand(out_features).cuda().requires_grad_()
-    # print('bias: ', bias)
     input = torch.rand((batch_size, in_features)).cuda()
-    # print('input: ', input)
+
+    input_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
     
     # op compute
     print('======== Checkpointing Single Device =======')
-    # first locate on cpu
-    weight.data = weight.cpu()
-    bias.data = bias.cpu()
+    
+    # swap out weight
+    weight.data = weight.detach().cpu()
+    bias.data = bias.detach().cpu()
+
+    weight_swap_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
+
     output = swap_weight_grad_linear(input, weight, bias)
-    print('output device: {}'.format(output.get_device()))
-    loss = torch.mean(output)
-    print(loss)
+    loss = torch.mean(output) * 100
     loss.backward()
+    
+    finish_op_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
+    
+    # allocate tensor on gpu to see if swap workds
+    tmp = torch.rand((out_features, in_features)).cuda()
+    after_alloc_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
+
+    print('memory consumption (MB): input-require: {:.2f} | after swap weight: {:.2f} | after op run {:.2f} | after allocate {:.2f}'.format(
+        input_memory, weight_swap_memory, finish_op_memory, after_alloc_memory))
+
+    # correctness verify
     print('weight grad: ', weight.grad.t())
     print('======== Checkpointing Single Device =======')
