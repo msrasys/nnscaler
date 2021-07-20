@@ -68,58 +68,43 @@ def checkpoint_module_linear(input, weight, bias):
 
 
 ### Swap linear ###
-def swap_linear(input, weight, bias):
+def swap_weight_grad_linear(input, weight, bias):
     ## Note pytorch tensor.to() will always return a copy
 
     ### Policy ###
-    op_device_id = 0       # where to perform the device
-    output_swap = True      # whether output tensor needs swap
-
-    ### Additional Swap operator ###
-    # Note autograd will not work in pytorch
-    # as pytorch will record each input, even you do the inplacement-update
-    # class SwapOutTensor(torch.autograd.Function):
-    #     @staticmethod
-    #     def forward(ctx, tensor):
-    #         ctx.constants = tensor.get_device()
-    #         cpu_tensor = tensor.cpu()
-    #         tensor.data = cpu_tensor  # inplace-update
-    #         return tensor
-    #     @staticmethod
-    #     def backward(ctx, grad_output):
-    #         device_id = ctx.constants
-    #         grad = grad_output.cuda(device_id)
-    #         grad_output.data = grad
-    #         return grad_output
+    op_device_id = 0        # where to perform the device
+    # output_swap = False     # whether output tensor needs swap
+    weight_swap = True
+    bias_swap = True
+    gradient_swap = True
 
     ### Input swap-in (if needed) ###
-    input_swap = None
-    if input.get_device() != op_device_id:
-        input = input.cuda(op_device_id)
-        input_swap = -1 # CPU
-    weight_swap = None
-    if weight.get_device() != op_device_id:
-        weight_swap = -1 # CPU
-        weight = weight.cuda(op_device_id)
-    bias_swap = None
-    if bias.get_device() != op_device_id:
-        bias_swap = -1 # CPU
-        bias = bias.cuda(op_device_id)
+    weight_locate = weight.get_device()
+    if weight_locate == -1:
+        weight.data = weight.cuda(op_device_id)
+    bias_locate = bias.get_device()
+    if bias_locate == -1:  # current on CPU
+        bias.data = bias.cuda(op_device_id)
+    
+    ### Adatper to swap out gradient ###
+    def swap_out_grad(grad):
+        grad.data = grad.cpu()
+        return grad
+    if gradient_swap:
+        weight.register_hook(swap_out_grad)
+        bias.register_hook(swap_out_grad)
 
     ### Compute ###
     output = torch._C._nn.linear(input, weight, bias)
-    print(output)
-    # inplacement update
-    output.data = output.cpu()
-    print(output)
-
-    # Here we need the backward to take back the intermediate tensor
+    # inplacement swap
+    # output.data = output.cpu()
 
     ### Swap out if needed ### TODO: swapout can be in any place
-    # if output_swap:
-    #     output = SwapOutTensor.apply(output)
-    # if input_swap == -1:
-    #     input_swap = SwapOutTensor.apply(input, )
+    if weight_swap:
+        weight.data = weight.cpu()
+    if bias_swap:
+        bias.data = bias.cpu()
+
     return output
 
 
@@ -141,12 +126,11 @@ if __name__ == '__main__':
     
     # op compute
     print('======== Checkpointing Single Device =======')
-    output = swap_linear(input, weight, bias)
+    # first locate on cpu
+    weight.data = weight.cpu()
+    bias.data = bias.cpu()
+    output = swap_weight_grad_linear(input, weight, bias)
     print('output device: {}'.format(output.get_device()))
-    print(output)
-    output = output.cuda()
-    print('output device: {}'.format(output.get_device()))
-    print(output)
     loss = torch.mean(output)
     print(loss)
     loss.backward()
