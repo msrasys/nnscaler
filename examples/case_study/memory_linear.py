@@ -82,7 +82,7 @@ def swap_weight_grad_linear(input, weight, bias):
     bias.host_device = torch.device('cpu')
 
     # grad placement: this can be set before running
-    grad_device = torch.device('cpu')
+    grad_device = torch.device('cuda:0')
     def grad_swap(grad):
         grad.data = grad.detach().to(grad_device)
         return grad
@@ -189,14 +189,14 @@ if __name__ == '__main__':
     loss.backward()
     
     finish_op_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
+    max_allocated = (torch.cuda.max_memory_allocated() - init_memory) / 1024 / 1024
     
     # allocate tensor on gpu to see if swap workds
     tmp = torch.rand((out_features, in_features)).cuda()
     after_alloc_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
 
-    max_allocated = (torch.cuda.max_memory_allocated() - init_memory) / 1024 / 1024
-    print('memory consumption (MB): max allocated: {:.2f} | input-require: {:.2f} | after swap weight: {:.2f} | after op run {:.2f} | after allocate {:.2f}'.format(
-        max_allocated, input_memory, weight_swap_memory, finish_op_memory, after_alloc_memory))
+    print('Memory Consumption (MB):\n\t input-require: {:.2f}\n\t after swap weight: {:.2f}\n\t after op run {:.2f}\n\t max allocated: {:.2f}\n\t after allocate {:.2f}'.format(
+        input_memory, weight_swap_memory, finish_op_memory, max_allocated, after_alloc_memory))
 
     # correctness verify
     print('weight grad: ', weight_1.grad.t())
