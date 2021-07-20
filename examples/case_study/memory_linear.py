@@ -3,6 +3,8 @@ import os
 
 torch.manual_seed(121)
 
+tensor_map = dict()
+
 ### Checkpoint PyTorch Implementation (Skip un-deterministic scenario) ###
 # Note this implementation can only work with a module that consists
 # multiple operators. This will won't work for one OP because the output
@@ -67,48 +69,73 @@ def checkpoint_module_linear(input, weight, bias):
     return output
 
 
-### Swap linear ###
-def swap_weight_grad_linear(input, weight, bias):
-    ## Note pytorch tensor.to() will always return a copy
+def swap_weight_grad_linear_v2(input, weight, bias):
 
-    ### Policy ###
-    op_device_id = 0        # where to perform the device
-    # output_swap = False     # whether output tensor needs swap
-    weight_swap = True
-    bias_swap = True
-    gradient_swap = True
+    class SwapLinear(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, input, weight, bias, swap_weight=True, swap_bias=True):
 
-    ### Input swap-in (if needed) ###
-    weight_locate = weight.get_device()
-    if weight_locate == -1:
-        weight.data = weight.cuda(op_device_id)
-    bias_locate = bias.get_device()
-    if bias_locate == -1:  # current on CPU
-        bias.data = bias.cuda(op_device_id)
+            weight_id = id(weight)
+            bias_id = id(bias)
+            ctx.save_for_backward(input, torch.tensor(weight_id), torch.tensor(bias_id))
+            tensor_map[weight_id] = weight
+            tensor_map[bias_id] = bias_id
+
+            ctx.constants = (swap_weight, swap_bias)
+
+            # retrieve from cpu memory
+            if swap_weight:
+                weight.data = weight.detach().cuda()
+            if swap_bias:
+                bias.data = bias.detach().cuda()
+
+            # compute
+            output = torch._C._nn.linear(input, weight, bias)
+
+            # offload to CPU
+            if swap_weight:
+                weight.data = weight.detach().cpu()
+            if swap_bias:
+                bias.data = bias.detach().cpu()
+            return output
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            input, weight_id, bias_id = ctx.saved_tensors
+            weight = tensor_map[weight_id.item()]
+            bias = tensor_map[bias_id.item()]
+            swap_weight, swap_bias = ctx.constants
+
+            grad_input = grad_weight = grad_bas = None
+            if ctx.needs_input_grad[0]:
+                print('computing grad of input...')
+                # retrieve weight
+                if swap_weight:
+                    weight.data = weight.cuda()
+                grad_input = grad_output.matmul(weight)
+                if swap_weight:
+                    weight.data = weight.detach().cpu()
+            if ctx.needs_input_grad[1]:
+                dim = grad_output.dim()
+                if dim > 2:
+                    grad_weight = grad\
+                        .view(-1, grad_output.shape[-1])\
+                        .t()\
+                        .matmul(input.view(-1, input.shape[-1]))
+                else:
+                    grad_weight = grad_output.t().matmul(input)
+                if swap_weight:
+                    grad_weight.data = grad_weight.detach().cpu()
+            if ctx.needs_input_grad[2]:
+                grad_bias = grad_output.sum(0)
+                if swap_bias:
+                    grad_bias.data = grad_bias.detach().cpu()
+            print('here')
+            return grad_input, grad_weight, grad_bias, None, None
     
-    ### Adatper to swap out gradient ###
-    def swap_out_grad(grad):
-        grad.data = grad.detach().cpu()
-        return grad
-    if gradient_swap:
-        weight.register_hook(swap_out_grad)
-        bias.register_hook(swap_out_grad)
-
-    ### Compute ###
-    output = torch._C._nn.linear(input, weight, bias)
-    # inplacement swap
-    # output.data = output.cpu()
-
-    ### Swap out if needed ### TODO: swapout can be in any place
-    if weight_swap:
-        weight.data = weight.detach().cpu()
-    if bias_swap:
-        bias.data = bias.detach().cpu()
-    # print(weight)
-    # print(bias)
-
+    output = SwapLinear.apply(input, weight, bias,
+                              True, True)
     return output
-
 
 
 if __name__ == '__main__':
@@ -120,23 +147,22 @@ if __name__ == '__main__':
     batch_size = 32
     out_features = 10240
     in_features = 10240  ## 100 MB weight
-    weight = torch.rand((out_features, in_features)).cuda().requires_grad_()
-    # print('weight: ', weight)
-    bias = torch.rand(out_features).cuda().requires_grad_()
+    weight_1 = torch.rand((out_features, in_features)).requires_grad_()
+    bias_1 = torch.rand(out_features).requires_grad_()
+    weight_2 = torch.rand((out_features, in_features)).requires_grad_()
+    bias_2 = torch.rand(out_features).requires_grad_()
     input = torch.rand((batch_size, in_features)).cuda()
 
     input_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
     
     # op compute
     print('======== Checkpointing Single Device =======')
-    
-    # swap out weight
-    weight.data = weight.detach().cpu()
-    bias.data = bias.detach().cpu()
 
     weight_swap_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
 
-    output = swap_weight_grad_linear(input, weight, bias)
+    output = swap_weight_grad_linear_v2(input, weight_1, bias_1)
+    print('output: {}'.format(output))
+    output = swap_weight_grad_linear_v2(output, weight_2, bias_2)
     loss = torch.mean(output) * 100
     loss.backward()
     
@@ -146,9 +172,10 @@ if __name__ == '__main__':
     tmp = torch.rand((out_features, in_features)).cuda()
     after_alloc_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
 
-    print('memory consumption (MB): input-require: {:.2f} | after swap weight: {:.2f} | after op run {:.2f} | after allocate {:.2f}'.format(
-        input_memory, weight_swap_memory, finish_op_memory, after_alloc_memory))
+    max_allocated = (torch.cuda.max_memory_allocated() - init_memory) / 1024 / 1024
+    print('memory consumption (MB): max allocated: {:.2f} | input-require: {:.2f} | after swap weight: {:.2f} | after op run {:.2f} | after allocate {:.2f}'.format(
+        max_allocated, input_memory, weight_swap_memory, finish_op_memory, after_alloc_memory))
 
     # correctness verify
-    print('weight grad: ', weight.grad.t())
+    print('weight grad: ', weight_2.grad.t())
     print('======== Checkpointing Single Device =======')
