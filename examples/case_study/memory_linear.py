@@ -69,7 +69,7 @@ def checkpoint_module_linear(input, weight, bias):
     return output
 
 
-def swap_weight_grad_linear_v2(input, weight, bias):
+def swap_weight_grad_linear(input, weight, bias):
 
     # op placement
     op_device = torch.device('cuda:0')
@@ -80,7 +80,7 @@ def swap_weight_grad_linear_v2(input, weight, bias):
     bias.host_device = torch.device('cpu')
 
     # grad placement: this can be set before running
-    grad_device = torch.device('cuda:0')
+    grad_device = torch.device('cpu')
     def grad_swap(grad):
         grad.data = grad.detach().to(grad_device)
         return grad
@@ -165,21 +165,20 @@ if __name__ == '__main__':
     in_features = 10240  ## 100 MB weight
     weight_1 = torch.rand((out_features, in_features)).requires_grad_()
     bias_1 = torch.rand(out_features).requires_grad_()
+    input = torch.rand((batch_size, in_features)).cuda()
     weight_2 = torch.rand((out_features, in_features)).requires_grad_()
     bias_2 = torch.rand(out_features).requires_grad_()
-    input = torch.rand((batch_size, in_features)).cuda()
 
     input_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
     
     # op compute
-    print('======== Checkpointing Single Device =======')
-
+    print('======== Offloading Single Device =======')
     weight_swap_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
 
-    output = swap_weight_grad_linear_v2(input, weight_1, bias_1)
-    # print('output: {}'.format(output))
-    output = swap_weight_grad_linear_v2(output, weight_2, bias_2)
+    output = swap_weight_grad_linear(input, weight_1, bias_1)
+    output = swap_weight_grad_linear(output, weight_2, bias_2)
     loss = torch.mean(output) * 100
+    print('loss: {}'.format(loss))
     loss.backward()
     
     finish_op_memory = (torch.cuda.memory_allocated() - init_memory) / 1024 / 1024
@@ -193,5 +192,5 @@ if __name__ == '__main__':
         max_allocated, input_memory, weight_swap_memory, finish_op_memory, after_alloc_memory))
 
     # correctness verify
-    print('weight grad: ', weight_2.grad.t())
-    print('======== Checkpointing Single Device =======')
+    print('weight grad: ', weight_1.grad.t())
+    print('======== Offloading Single Device =======')
