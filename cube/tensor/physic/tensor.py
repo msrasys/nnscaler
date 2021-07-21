@@ -20,21 +20,21 @@ class PhysicTensor(torch.Tensor):
             self._data_host_device = self.device
         return self._data_host_device
 
-
     @data_host_device.setter
     def data_host_device(self, device):
         if not isinstance(device, torch.device):
             raise TypeError('Expected torch.device')
         self._data_host_device = device
-        # inplacement move device to the host place
+        # inplacement movement to host device
         if self.device != self.data_host_device:
-            self.data = self.to(self.data_host_device)
-
+            self.move_(self.data_host_device)
 
     @property
     def grad_host_device(self):
+        if not hasattr(self, '_grad_host_hook'):
+            self._grad_host_hook = None
         if not hasattr(self, '_grad_host_device'):
-            self._grad_host_device = self.device
+            self._grad_host_device = self._data_host_device
         return self._grad_host_device
 
 
@@ -43,9 +43,16 @@ class PhysicTensor(torch.Tensor):
         if not isinstance(device, torch.device):
             raise TypeError('Expected torch.device')
         self._grad_host_device = device
-        # inplacement move device to the host place
-        if self.device != self.grad_host_device:
-            self.data = self.to(self.grad_host_device)
+        # inplacement movement to host device
+        if self.grad is not None:
+            self.grad.data = self.grad.detach().to(self.grad_host_device)
+        # modify hooks
+        if self._grad_host_hook is not None:
+            self._grad_host_hook.remove()
+        def move_grad(grad):
+            grad.data = grad.detach().to(self.grad_host_device)
+            return grad
+        self._grad_host_hook = self.register_hook(move_grad)
 
 
     def move_(self, device):
@@ -54,4 +61,4 @@ class PhysicTensor(torch.Tensor):
         """
         if not isinstance(device, torch.device):
             raise TypeError('Expected torch.device')
-        self.data = self.to(device)
+        self.data = self.detach().to(device)
