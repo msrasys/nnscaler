@@ -3,7 +3,7 @@ from cube.operator.holist.generics import GenericHolisticOp
 import cube.operator.physic as physic_op
 
 from cube.tensor.logic.tensor import LogicalTensor
-from cube.tensor.logic.segment import TileSegment
+import cube.tensor.logic.segment.outline as outline
 from cube.tensor.community import Community
 
 # expert space to declare all kinds of holistic operators
@@ -19,13 +19,13 @@ class LinearColumnWeight(GenericHolisticOp):
     def __init__(self):
 
         # TODO
-        inputs_layout = None
+        inputs_layout = Full
         # TODO
-        weight_layout = None
+        weight_layout = outline.SplitAxis(axis=0, chunk_num=None, overlap=0)
         # TODO
-        bias_layout = None
+        bias_layout = outline.SplitAxis(axis=0, chunk_num=None, overlap=0)
         # TODO
-        output_layout = None
+        output_layout = outline.Align(weight_layout)
 
         super().__init__(
             input_layout=(inputs_layout, weight_layout),
