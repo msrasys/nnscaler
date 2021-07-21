@@ -13,9 +13,17 @@ The description includes two parts:
 
 # interface to setup restrictions on the segmentation
 
+class Full:
+
+    def __init__(self):
+        pass
+
+    def __call__(self, shape):
+        pass
+
 class SplitAxis:
 
-    def __init__(self, axis, chunk_num=None, chunk_size=None, overlap=0):
+    def __init__(self, axis, chunk_num=None, overlap=0):
         """
         Segmentation Pattern Requirement (parameters):
 
@@ -27,12 +35,7 @@ class SplitAxis:
             If an integer, only the specified chunk number is valid;
             If a tuple(min, max), the chunk number wihtin the scope [min,max] is valid
 
-        chunk_size (None, int, tuple(int, int)):
-            valid chunk size.
-            If None, any size is valid;
-            If an integer, each chunk size is valid;
-            if a tuple(min, max), the chunk size wihtin the scope [min,max] is valid
-        
+
         overlap (0, int, tuple(int, int)):
             valid size for overlaping on the boundary of each splitted chunks.
             If None, any overlapping is valid
@@ -42,11 +45,10 @@ class SplitAxis:
         """
         self.axis = axis
         self.chunk_num = chunk_num
-        self.chunk_size = chunk_size
         self.overlap = overlap
     
     def __call__(self, shape):
         """
-        Runtime community generation given the logical tensor shape
+        Runtime segment generation given the logical tensor shape
         """
         pass
