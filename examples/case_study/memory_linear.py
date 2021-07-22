@@ -89,8 +89,17 @@ def swap_weight_grad_linear(input, weight, bias):
     weight.register_hook(grad_swap)
     bias.register_hook(grad_swap)
 
+    ## Placement for a tensor swap in/out
+    ##      where to swap in: op.device (op placement policy)
+    ##      where to swap out: tensor.swap_to (policy)
+
     ## Timing when a tensor swapped in/out 
-    ## On-demand? Pre-fetch? All-consumed?
+    ##      Basic Time block (each op is a slot?)
+    ##      Event-driven (tesnor access? on-demand? | dynamic scenario?)
+
+    # Policy description
+    # op.device = torch.device('cuda:0')
+    # ...
     
     #####
 

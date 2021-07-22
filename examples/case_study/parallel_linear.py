@@ -25,7 +25,7 @@ def linear_tensor_parallel(input, weight, bias):
     ### Necessary information to know ###
     rank = torch.distributed.get_rank()  # which role I participate?
 
-    ### Additional ops need to use ### -- TODO: System Generated
+    ### Additional ops need to use ### -- TODO: System provided
     class InputAdapter(torch.autograd.Function):
         @staticmethod
         def forward(ctx, input_):
