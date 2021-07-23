@@ -1,7 +1,9 @@
 from cube.operator.logic.generics import generics
 from cube.operator.holist.linear import kHolistLinearSets
 
+
 __all__ = ['linear']
+
 
 def Linear(generics.GenericLogicalOp):
 
