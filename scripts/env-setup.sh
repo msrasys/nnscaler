@@ -11,6 +11,7 @@ sudo git config --global user.email "v-zhiql@microsoft.com"
 sudo chmod -R a+w /opt/conda
 
 sudo apt-get install tmux -y
+sudo apt-get install psmisc -y
 wget https://raw.githubusercontent.com/zhiqi-0/EnvDeployment/master/.tmux.conf -O ~/.tmux.conf
 wget https://raw.githubusercontent.com/zhiqi-0/EnvDeployment/master/.vimrc -O ~/.vimrc
 
