@@ -3,6 +3,36 @@ This is the runtime primitive sets to setup community for a logical tensor.
 """
 
 
+__all__ = ['ReductionOp', 'DataSegment', 'TileSegment']
+
+
+class _Reduction(type):
+
+    Sum = torch.distributed.all_reduce
+
+    # identity for replica
+    Replica = lambda physical_tensor, group : physical_tensor
+
+    def register(name, udf):
+        """
+        Reduction functions should be in function format:
+
+        Arguments:
+            PhysicalTensor
+            Communication Group
+
+        Return:
+            PhysicalTensor
+        """
+        if hasattr(cls, name):
+            raise KeyError("{} is registered".format(name))
+        setattr(cls, name, udf)
+
+
+class ReductionOp(metaclass=_Reduction):
+    pass
+
+
 ## Basic structure for holding a segment -> cover all the cases ##
 class DataSegment:
     """
@@ -11,7 +41,7 @@ class DataSegment:
     The order of indices indicate the physical storage (1-D array) order
     """
 
-    def __init__(self, indices_list=None):
+    def __init__(self, indices_list=None, reduction=None):
         """
         Args:
             indices_list (list[ list[int], ]):
@@ -19,6 +49,7 @@ class DataSegment:
         """
 
         self.indices = indices_list
+        self.reduction = None
 
     def convert_to_indices(self):
         """
@@ -44,7 +75,7 @@ class TileSegment(DataSegment):
     which can be represented as the start position + offset (shape)
     """
 
-    def __init__(self, anchor, offset):
+    def __init__(self, anchor, offset, reduction=None):
         """
         Args:
             anchor (list[int]): start position of the tile
@@ -52,7 +83,7 @@ class TileSegment(DataSegment):
         """
         if len(anchor) != len(offset):
             raise ValueError("Require anchor length to be equal with offset length")
-        super().__init__()
+        super().__init__(reduction=reduction)
         self.anchor = anchor
         self.offset = offset
     
@@ -68,11 +99,11 @@ class TileSegment(DataSegment):
 
 ## Primitive sets for translation ##
 
-def create_from_indices(indices):
-    return DataSegment(indices)
+def create_from_indices(indices, reduction):
+    return DataSegment(indices, reduction)
 
 
-def create_from_tiles(anchor, offset):
+def create_from_tiles(anchor, offset, reduction):
     # segments = list()
     # dims = len(offset)
     # for dim_id in range(dims):
@@ -81,4 +112,4 @@ def create_from_tiles(anchor, offset):
     #     segments.append(segment)
     # segment = merge_segments(segments)
     # return segment
-    return TileSegment(anchor, offset)
+    return TileSegment(anchor, offset, reduction)

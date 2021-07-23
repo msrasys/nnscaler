@@ -1,39 +1,13 @@
 import torch
 
 
-__all__ = ['ReductionOpPool', 'Community']
+__all__ = ['Community']
 
-
-class _Reduction(type):
-
-    Sum = torch.distributed.all_reduce
-
-    # identity for replica
-    Replica = lambda physical_tensor, group : physical_tensor
-
-    def register(name, udf):
-        """
-        Reduction functions should be in function format:
-
-        Arguments:
-            PhysicalTensor
-            Communication Group
-
-        Return:
-            PhysicalTensor
-        """
-        if hasattr(cls, name):
-            raise KeyError("{} is registered".format(name))
-        setattr(cls, name, udf)
-
-
-class ReductionOpPool(metaclass=_Reduction):
-    pass
 
 
 class Community:
 
-    def __init__(self, logical_tensor, segment, reduction=None):
+    def __init__(self, logical_tensor, segment):
         """Create Community based on the logical tensor
 
         Community manages one:
@@ -60,7 +34,6 @@ class Community:
         self.phsyical_tensor = None
         self.materialized = False
 
-        self.reduction = reduction
 
     def spread(self, device_list):
         """Spread physical tensors to devices

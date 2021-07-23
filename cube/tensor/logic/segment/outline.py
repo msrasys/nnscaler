@@ -49,6 +49,23 @@ class SplitAxis:
     
     def __call__(self, shape):
         """
-        Runtime segment generation given the logical tensor shape
+        Runtime community generation given the logical tensor shape
         """
         pass
+
+
+class Broadcast:
+
+    def __init__(self, reduce_op=None):
+        """
+        Segmentation Pattern Requirement:
+
+        The same shape with output but (may) need additional reduction
+        """
+        self.reduce_op = reduce_op
+
+    def __call__(self, shape):
+        """
+        Runtime segment generation given the logical tensor shape
+        """
+        return shape
