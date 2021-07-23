@@ -10,20 +10,25 @@ The description includes two parts:
         to the real segmentation on given logical tensor shape.
 """
 
+from cube.tensor.logic.segment.segment import TileSegment, ReductionOp
+
 
 # interface to setup restrictions on the segmentation
 
+
 class Full:
 
-    def __init__(self):
-        pass
+    def __init__(self, reduction=None):
+        self.reduction=None
 
     def __call__(self, shape):
-        pass
+        segment = TileSegment([0] * len(shape), shape, self.reduction)
+        return [segment]
+
 
 class SplitAxis:
 
-    def __init__(self, axis, chunk_num=None, overlap=0):
+    def __init__(self, axis, chunk_num=None, overlap=0, reduction=None, uniform=True):
         """
         Segmentation Pattern Requirement (parameters):
 
@@ -45,27 +50,22 @@ class SplitAxis:
         """
         self.axis = axis
         self.chunk_num = chunk_num
+        self.uniform = True
         self.overlap = overlap
-    
-    def __call__(self, shape):
-        """
-        Runtime community generation given the logical tensor shape
-        """
-        pass
-
-
-class Broadcast:
-
-    def __init__(self, reduce_op=None):
-        """
-        Segmentation Pattern Requirement:
-
-        The same shape with output but (may) need additional reduction
-        """
-        self.reduce_op = reduce_op
+        self.reduction = reduction
 
     def __call__(self, shape):
         """
         Runtime segment generation given the logical tensor shape
-        """
-        return shape
+
+        This is the policy that how to do the translation.
+        """ 
+        segments = list()
+        shape[axis] = shape[axis] // self.chunk_num
+        anchor = [0] * self.chunk_num
+        for _ in range(self.chunk_num):
+            segment = TileSegment(
+                list(anchor), list(shape), reduction=ReductionOp.Replica)
+            anchor[axis] += shape[axis]
+            segments.append(segment)
+        return segments
