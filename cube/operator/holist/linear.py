@@ -19,7 +19,7 @@ class LinearColumnWeight(GenericHolisticOp):
     def __init__(self):
 
         # TODO
-        inputs_layout = Full
+        inputs_layout = outline.Full
         # TODO
         weight_layout = outline.SplitAxis(axis=0, chunk_num=None, overlap=0)
         # TODO
@@ -28,7 +28,7 @@ class LinearColumnWeight(GenericHolisticOp):
         output_layout = outline.Align(weight_layout)
 
         super().__init__(
-            input_layout=(inputs_layout, weight_layout),
+            input_layout=(inputs_layout, weight_layout, bias_layout),
             output_layout=(output_layout,)
         )
 
@@ -54,16 +54,17 @@ class LinearColumnInputRowWeight(GenericHolisticOp):
     def __init__(self):
 
         # TODO
-        inputs_layout = None
+        inputs_layout = outline.SplitAxis(axis=-1, chunk_num=None, overlap=0)
         # TODO
-        weight_layout = None
+        align = outline.Align(inputs_layout.chunk_num)
+        weight_layout = outline.SplitAxis(axis=1, chunk_num=align, overlap=0)
         # TODO
-        bias_layout = None
+        bias_layout = outline.Broadcast(reduce=ReductionOpPool.Sum)
         # TODO
-        output_layout = None
+        output_layout = outline.Broadcast(reduce=ReductionOpPool.Sum)
 
         super().__init__(
-            input_layout=(inputs_layout, weight_layout),
+            input_layout=(inputs_layout, weight_layout, bias_layout),
             output_layout=(output_layout,)
         )
     
