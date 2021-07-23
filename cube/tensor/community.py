@@ -1,13 +1,12 @@
 import torch
-
+from cube.device.physic.group import DeviceGroup
 
 __all__ = ['Community']
 
 
-
 class Community:
 
-    def __init__(self, logical_tensor, segment):
+    def __init__(self, segment):
         """Create Community based on the logical tensor
 
         Community manages one:
@@ -16,27 +15,22 @@ class Community:
         2). Materialized Physical Tensors
 
         Attribute:
-            parent (LogicalTensor):
-                Logical Tensor the Community belongs to
             segment (DataSegment):
                 indices of logical_tensor for this community
-            reduction (Callable or None):
-                Reduction function for retrieve back physical tensors
+            
 
         """
         # connection to logical tensor
-        self.parent = logical_tensor
-
         # DataSegment to indicate both element set and data format mapping
         self.segment = segment
 
         # connection to physical tensor (the PyTorch Tensor)
         self.phsyical_tensor = None
+        self.group = list()
         self.materialized = False
 
-
-    def spread(self, device_list):
-        """Spread physical tensors to devices
+    def deploy(self, ranks, logic_tensor, value_map_fn=None):
+        """deploy (materialize) to physical tensors
     
         Materialize physical tensors for this community and spread out
         based on the given device list.
@@ -45,25 +39,36 @@ class Community:
         to spread.
 
         Argument:
-            device_list (list[int]): device id list
-        
-        Return:
-            PhysicalTensor(s) or None:
-
-                For SPMD programming model:
-                    if current device is in the `device_list`,
-                        than return the corresponding physical tensor,
-                    else None
-
-                For Global View programming model:
-                    return list[PhysicalTensor] with the same
-                    order of `device_list`.
+            ranks (list[int]): device id list
+            value_map_fn (callable):
+                takes the tensor, rank, world_size,
+                return a new tensor
         """
-        pass
+        
+        rank = DeviceGroup().rank
+        self.group = DeviceGroup().get_group(ranks)
+        if rank not in ranks:
+            self.physical_tensor = None
+        else:
+            if logic_tensor.data is None:
+                # TODO: check overlap
+                self.physical_tensor = torch.randn(self.segment.shape, device='cuda')
+            else:
+                # select from cpu view
+                self.physical_tensor = torch.empty(self.segment.shape, devic='cuda')
+                self.physical_tensor.copy_(logic_tensor[self.segment.get_indices()])
+            if value_map_fn is not None:
+                self.physical_tensor.data = self.value_map_fn(physical_tensor)
 
     def sync(self):
-        """Synchrnoize the spread physical tensors by reduction operation"""
-        pass
+        """
+        Synchrnoize the spread physical tensors by reduction operation
+
+        This should be a out-placement device for differentiable communication ops.
+        
+        Each device should call this, including no-physical-tensor devices
+        """
+        self.physical_tensor = self.segment.reduction(self.physical_tensor, self.group)
 
     def get_physical_tensor(self):
         """Get physical tensor if materialized

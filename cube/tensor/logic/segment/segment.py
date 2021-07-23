@@ -41,21 +41,31 @@ class DataSegment:
     The order of indices indicate the physical storage (1-D array) order
     """
 
-    def __init__(self, indices_list=None, reduction=None):
+    def __init__(self, indices_list=None, reduction=None, shape=None):
         """
         Args:
             indices_list (list[ list[int], ]):
                 List of index
+            reduction (ReductionOp):
+                How to reduction to the logical value
+            shape:
+                shape on the indices list
         """
 
         self.indices = indices_list
+        if shape is None:
+            if indices_list is None:
+                raise RuntimeError("Provide shape if indices_list is empty")
+            self.shape = (len(indices_list[0]),)
+        else:
+            self.shape = shape
         self.reduction = None
 
-    def convert_to_indices(self):
+    def get_indices(self):
         """
         Convert to index list
         """
-        pass
+        return self.indices
 
     def reorder(self, new_orders):
         """
@@ -64,8 +74,8 @@ class DataSegment:
         Note this can be only called before materialize physical tensors,
         or called from underlying operation that will change physical storage format
         """
-        #TODO: validation check
-        self.indices = new_orders
+        for dim in range(len(self.indices)):
+            self.indices[dim] = self.indices[dim][new_orders]
 
 
 ## Higher structure to cover the most cases ##
@@ -83,15 +93,18 @@ class TileSegment(DataSegment):
         """
         if len(anchor) != len(offset):
             raise ValueError("Require anchor length to be equal with offset length")
-        super().__init__(reduction=reduction)
+        super().__init__(reduction=reduction, shape=tuple(offset))
         self.anchor = anchor
         self.offset = offset
     
-    def convert_to_indices(self):
+    def get_indices(self):
         """
         Convert anchor and offset to index list
         """
-        pass
+        indices = list()
+        for start, ofst in zip(self.anchor, self.offset):
+            indices.append(slice(start, start + ofst))
+        return tuple(indices)
 
     def reorder(self):
         pass

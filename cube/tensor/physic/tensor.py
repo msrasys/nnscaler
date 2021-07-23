@@ -62,3 +62,12 @@ class PhysicTensor(torch.Tensor):
         if not isinstance(device, torch.device):
             raise TypeError('Expected torch.device')
         self.data = self.detach().to(device)
+
+    def move_grad_(self, device):
+        """
+        inplacement device move on tensor grad
+        """
+        if not isinstance(device, torch.device):
+            raise TypeError('Expected torch.device')
+        if self.grad is not None:
+            self.grad.data = self.grad.detach().to(device)
