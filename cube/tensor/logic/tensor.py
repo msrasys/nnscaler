@@ -15,6 +15,7 @@ class LogicalTensor:
         self.segments = list()
         self.data = None
         if init_data:
+            import torch
             self.data = torch.randn(shape).detach()
 
     def get_physical_tensor(self, segment):

@@ -1,6 +1,7 @@
 import torch
 from cube.device.physic.group import DeviceGroup
 
+
 __all__ = ['Community']
 
 
@@ -17,8 +18,6 @@ class Community:
         Attribute:
             segment (DataSegment):
                 indices of logical_tensor for this community
-            
-
         """
         # connection to logical tensor
         # DataSegment to indicate both element set and data format mapping
@@ -75,7 +74,7 @@ class Community:
 
         Returns:
             PhysicalTensor (if materialized)
-        """"
+        """
         if self.materialized:
             return self.physical_tensor
         else:
