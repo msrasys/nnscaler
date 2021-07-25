@@ -19,10 +19,10 @@ from cube.tensor.logic.segment.segment import TileSegment, ReductionOp
 class Full:
 
     def __init__(self, reduction=None):
-        self.reduction=None
+        self.reduction = reduction
 
     def __call__(self, shape):
-        segment = TileSegment([0] * len(shape), shape, self.reduction)
+        segment = TileSegment([0] * len(shape), list(shape), self.reduction)
         return [segment]
 
 
@@ -61,11 +61,12 @@ class SplitAxis:
         This is the policy that how to do the translation.
         """ 
         segments = list()
-        shape[axis] = shape[axis] // self.chunk_num
-        anchor = [0] * self.chunk_num
-        for _ in range(self.chunk_num):
+        shape = list(shape)
+        shape[self.axis] = shape[self.axis] // self.chunk_num
+        anchor = [0] * len(shape)
+        for cid in range(self.chunk_num):
             segment = TileSegment(
-                list(anchor), list(shape), reduction=ReductionOp.Replica)
-            anchor[axis] += shape[axis]
+                list(anchor), list(shape), reduction=self.reduction[cid])
+            anchor[self.axis] += shape[self.axis]
             segments.append(segment)
         return segments
