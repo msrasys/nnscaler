@@ -11,8 +11,27 @@ python -m torch.distributed.launch \
     tests/test_group.py
 """
 
-from combo.physical.device.group import DeviceGroup
+from cube.device.physic.group import DeviceGroup
 
+import torch
+
+
+def test_sub_group():
+
+    group = DeviceGroup()
+    myrank = group.rank
+    sub_group_1 = group.get_group([0,2])
+    if myrank in [0,2]:
+        assert torch.distributed.get_rank(sub_group_1) in [0,1]
+    else:
+        assert torch.distributed.get_rank(sub_group_1) == -1
+    
+    sub_group_2 = group.get_group([1,3])
+    if myrank in [1,3]:
+        assert torch.distributed.get_rank(sub_group_2) in [0,1]
+    else:
+        assert torch.distributed.get_rank(sub_group_2) == -1
+    # print(group)
 
 
 if __name__ == '__main__':
@@ -20,7 +39,4 @@ if __name__ == '__main__':
     # init distributed
     group = DeviceGroup()
 
-    sub_group_1 = group.get_group([0,2])
-    sub_group_2 = group.get_group([1,3])
-    
-    print(group)
+    test_sub_group()
