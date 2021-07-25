@@ -5,6 +5,7 @@ This is the runtime primitive sets to setup community for a logical tensor.
 import torch
 
 
+# TODO: reduction op should be in torch autograd function
 class _Reduction(type):
 
     Sum = torch.distributed.all_reduce
@@ -59,7 +60,7 @@ class DataSegment:
         else:
             # TODO: check shape
             self.shape = shape
-        self.reduction = reduction
+        self.reduction = staticmethod(reduction)
 
     def get_indices(self):
         """

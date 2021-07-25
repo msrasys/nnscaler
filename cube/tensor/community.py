@@ -24,7 +24,7 @@ class Community:
         self.segment = segment
 
         # connection to physical tensor (the PyTorch Tensor)
-        self.phsyical_tensor = None
+        self.physical_tensor = None
         self.group = list()
         self.materialized = False
 
@@ -51,13 +51,14 @@ class Community:
         else:
             if logic_tensor.data is None:
                 # TODO: check overlap
-                self.physical_tensor = torch.randn(self.segment.shape, device='cuda')
+                self.physical_tensor = torch.randn(tuple(self.segment.shape), device='cuda')
             else:
                 # select from cpu view
-                self.physical_tensor = torch.empty(self.segment.shape, devic='cuda')
-                self.physical_tensor.copy_(logic_tensor[self.segment.get_indices()])
+                self.physical_tensor = torch.empty(tuple(self.segment.shape), device='cuda')
+                self.physical_tensor.copy_(logic_tensor.data[self.segment.get_indices()])
             if value_map_fn is not None:
-                self.physical_tensor.data = self.value_map_fn(physical_tensor)
+                self.physical_tensor.data = value_map_fn(self.physical_tensor)
+        self.materialized = True
 
     def sync(self):
         """
@@ -67,7 +68,12 @@ class Community:
         
         Each device should call this, including no-physical-tensor devices
         """
-        self.physical_tensor = self.segment.reduction(self.physical_tensor, self.group)
+        if self.materialized:
+            if self.physical_tensor is not None:
+                # self.segment.reduction.__func__(self.physical_tensor, group=self.group)
+                torch.distributed.all_reduce(self.physical_tensor, group=self.group)
+        else:
+            raise RuntimeError("The Community has not been materialized to physical tensors")
 
     def get_physical_tensor(self):
         """Get physical tensor if materialized
