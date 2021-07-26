@@ -1,78 +1,12 @@
-from typing import Optional
+from cube.operator.physic.generics import GenericPhysicOp
+
 import torch
-from torch import Tensor
-from torch.overrides import has_torch_function_variadic, handle_torch_function
-
-import cube.physic.operator.comm as comm
-from cube.physic.device.group import DeviceGroup
 
 
-def linear_op(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tensor:
-    r"""
-    Applies a linear transformation to the incoming data: :math:`y = xA^T + b`.
-
-    This operator supports :ref:`TensorFloat32<tf32_on_ampere>`.
-
-    Shape:
-
-        - Input: :math:`(N, *, in\_features)` N is the batch size, `*` means any number of
-          additional dimensions
-        - Weight: :math:`(out\_features, in\_features)`
-        - Bias: :math:`(out\_features)`
-        - Output: :math:`(N, *, out\_features)`
+class Linear(GenericPhysicOp):
     """
-    if has_torch_function_variadic(input, weight):
-        print('note: this branch should not pass')
-        return handle_torch_function(linear, (input, weight), input, weight, bias=bias)
+    Apply matmul: Out = input * weight^T + bias
+    """
 
-    # Information needed for enabling multiple GPUs:
-    #   - involved devices -> (could be involved in tensor interfacee design)
-    #   - which algorithm to take -> (semantic description / pattern match?)
-    #       e.g., semantic description: allgather(split(weight, dim=0) * input + split(bias, dim=0))
-    #   - how we handle weight -> (everytime we need chunk weight / bias if we only focus on op)
-    devices = [0, 1]
-    rank = torch.distributed.get_rank(DeviceGroup().get_group(devices))
-
-    # single GPU version
-    if True:
-        output = torch._C._nn.linear(input, weight, bias)
-
-    # multi-GPU version 
-    #   - Assume input is full
-    #   - split cloumn of W: Y = XW + b where W = [W_1, ..., W_p]
-    elif False:
-        # get weight chunk
-        weight = torch.chunk(weight, chunks=len(devices), dim=0)[rank].contiguous()
-        if bias is not None:
-            bias = torch.chunk(bias, chunks=len(devices), dim=0)[rank].contiguous()
-        # forward: identity; backward: allreduce
-        input = comm.parallel_in(input, ranks=devices)
-        output = torch._C._nn.linear(input, weight, bias)
-        # forward: allgather; backward: split
-        output = comm.gather_out(output, dim=-1, ranks=devices)
-    
-    # multi-GPU version Y = XW + b
-    #   - Assume input is full
-    #   - split row of W, column of X: 
-    #       - Y = X = [X_1, ..., X_p]
-    #       - W = [W_1 // ... // W_p]
-    elif False:
-        # get weight chunk
-        weight = torch.chunk(weight, chunks=len(devices), dim=1)[rank]
-        # forward: scatter; backward: allgather
-        input = comm.scatter_in(input, dim=-1, ranks=devices)
-        output = torch._C._nn.linear(input, weight, bias)
-        # forward: reduce; backward: identity
-        output = comm.reduce_out(output, ranks=devices)
-
-    # Pesudo-code 
-    else:
-        # data parallelism
-        input=[(0, Split())], weight=[], bias=[], output=[(0, Split())]
-        # tensor parallelism, weight column split
-        input=[], weight=[(0, Split())], bias=[(0, Split())], output=[(-1, Split())]
-        # tensor parallelism: data column + weight row
-        input=[(1, Split())] weight=[(1, Split()], bias=[], output=[(ALL, Partial(Sum))]
-
-
-    return output
+    def __init__(self, placement=None):
+        super().__init__(torch._C._nn.linear, placement)
