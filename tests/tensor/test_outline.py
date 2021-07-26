@@ -4,12 +4,25 @@ import cube.tensor.logic.segment as segment
 import torch
 
 
+def test_base():
+
+    dsp1 = outline.BaseOutline(reduction=segment.ReductionOp.Sum)
+    assert isinstance(dsp1.reduction, outline.ConstantContainer)
+    assert dsp1.reduction.get() == segment.ReductionOp.Sum
+
+    choice = {segment.ReductionOp.Sum, segment.ReductionOp.Replica}
+    dsp2 = outline.BaseOutline(reduction=choice)
+    assert isinstance(dsp2.reduction, outline.MutableContainer)
+    assert dsp2.reduction.get() is None
+    assert dsp2.reduction.get(scope=True) == choice
+
+
 def test_full():
 
     shape = (10,10,10)
     tensor = torch.randn(shape)
     full_dsp = outline.Full(reduction=segment.ReductionOp.Replica)
-    assert full_dsp.reduction == segment.ReductionOp.Replica
+    assert full_dsp.reduction.get() == segment.ReductionOp.Replica
     
     segments = full_dsp(tensor.shape)
     assert len(segments) == 1
@@ -30,22 +43,23 @@ def test_split_axis():
     split_dsp = outline.SplitAxis(
         axis=axis, chunk_num=None, overlap=0, 
         reduction=segment.ReductionOp.Replica, uniform=True)
-    assert split_dsp.axis == 1
-    assert split_dsp.chunk_num is None
-    assert split_dsp.uniform is True
-    assert split_dsp.overlap == 0
-    assert split_dsp.reduction == segment.ReductionOp.Replica
+    assert split_dsp.axis.get() == 1
+    assert split_dsp.chunk_num.get() is None
+    assert split_dsp.uniform.get() is True
+    assert split_dsp.overlap.get() == 0
+    assert split_dsp.reduction.get() == segment.ReductionOp.Replica
 
     ## Policy here to decide how to split
-    if split_dsp.chunk_num is None:
+    if split_dsp.chunk_num.get() is None:
         split_dsp.chunk_num = num
-        split_dsp.reduction = [segment.ReductionOp.Replica] * num
     ###
 
 
     segs = split_dsp(tensor.shape)
     assert len(segs) == num
-    assert torch.all(torch.Tensor([type(seg) == segment.TileSegment for seg in segs]))
+    assert torch.all(
+        torch.Tensor(
+            [type(seg) == segment.TileSegment for seg in segs])).item() is True
     
     ofst = 0
     expected_shape = list(shape)
@@ -61,7 +75,24 @@ def test_split_axis():
         ofst += expected_shape[axis]
 
 
+def test_align():
+
+    dsp1 = outline.SplitAxis(
+        axis=1, chunk_num=None, overlap=0, 
+        reduction=segment.ReductionOp.Replica, uniform=True)
+    
+    dsp2 = outline.SplitAxis(
+        axis=2, chunk_num=dsp1.chunk_num, overlap=0, 
+        reduction=segment.ReductionOp.Replica, uniform=True)
+    
+    dsp1.chunk_num = 3
+    assert dsp2.chunk_num.get() == 3
+    assert dsp2.axis.get() == 2
+
+
 if __name__ == '__main__':
 
+    test_base()
     test_full()
     test_split_axis()
+    test_align()

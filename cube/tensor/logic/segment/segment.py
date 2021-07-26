@@ -10,10 +10,10 @@ import torch
 class _Reduction(type):
 
     # forward: all_reduce, backward: identity
-    Sum = [reduce_sum]
+    Sum = (reduce_sum,)
 
     # forward: identity, backward: all_reduce
-    Replica = [replicate]
+    Replica = (replicate,)
 
     def register(cls, name, udf):
         """
@@ -28,7 +28,7 @@ class _Reduction(type):
         """
         if hasattr(cls, name):
             raise KeyError("{} is registered".format(name))
-        setattr(cls, name, [udf])
+        setattr(cls, name, (udf,))
 
 
 class ReductionOp(metaclass=_Reduction):

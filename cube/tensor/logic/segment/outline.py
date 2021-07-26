@@ -13,20 +13,72 @@ The description includes two parts:
 from cube.tensor.logic.segment.segment import TileSegment, ReductionOp
 
 
+class MutableContainer:
+
+    def __init__(self, scope):
+        self.__val = None
+        self.__scope = scope
+
+    def get(self, scope=False):
+        if scope:
+            return self.__scope
+        else:
+            return self.__val
+    
+    def set(self, val):
+        if self.__scope is not None:
+            if val not in self.__scope:
+                raise ValueError("Fail to set container, out of range")
+        self.__val = val
+
+
+class ConstantContainer:
+
+    def __init__(self, val):
+        self.__val = val
+    
+    def get(self):
+        return self.__val
+
+    def set(self, val):
+        raise RuntimeError("Cannot set a ConstantContainer")
+
+
 # interface to setup restrictions on the segmentation
 
 
-class Full:
+class BaseOutline:
+    """
+    Basic class for declare outline
 
+    To setup an attribute (requirement), use `inst_baseoutline.attribute_name = val`
+    """
     def __init__(self, reduction=None):
         self.reduction = reduction
 
+    def __setattr__(self, key, val):
+        if key in self.__dict__:
+            self.__dict__[key].set(val)
+        #TODO: Align semantics will not allow setting val on child, need a new class
+        elif isinstance(val, MutableContainer) or isinstance(val, ConstantContainer):
+            self.__dict__[key] = val
+        elif val is None or isinstance(val, range) or isinstance(val, set):
+            self.__dict__[key] = MutableContainer(val)
+        else:
+            self.__dict__[key] = ConstantContainer(val)
+
+
+class Full(BaseOutline):
+
+    def __init__(self, reduction=None):
+        super().__init__(reduction)
+
     def __call__(self, shape):
-        segment = TileSegment([0] * len(shape), list(shape), self.reduction)
+        segment = TileSegment([0] * len(shape), list(shape), self.reduction.get())
         return [segment]
 
 
-class SplitAxis:
+class SplitAxis(BaseOutline):
 
     def __init__(self, axis, chunk_num=None, overlap=0, reduction=None, uniform=True):
         """
@@ -48,11 +100,11 @@ class SplitAxis:
             if a tuple(min, max), the overlap size wihtin the scope [min,max] is valid
 
         """
+        super().__init__(reduction)
         self.axis = axis
         self.chunk_num = chunk_num
-        self.uniform = True
+        self.uniform = uniform
         self.overlap = overlap
-        self.reduction = reduction
 
     def __call__(self, shape):
         """
@@ -62,11 +114,12 @@ class SplitAxis:
         """ 
         segments = list()
         shape = list(shape)
-        shape[self.axis] = shape[self.axis] // self.chunk_num
+        shape[self.axis.get()] = shape[self.axis.get()] // self.chunk_num.get()
         anchor = [0] * len(shape)
-        for cid in range(self.chunk_num):
+        #TODO: support list of reductions
+        for cid in range(self.chunk_num.get()):
             segment = TileSegment(
-                list(anchor), list(shape), reduction=self.reduction[cid])
-            anchor[self.axis] += shape[self.axis]
+                list(anchor), list(shape), reduction=self.reduction)
+            anchor[self.axis.get()] += shape[self.axis.get()]
             segments.append(segment)
         return segments
