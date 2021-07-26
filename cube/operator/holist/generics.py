@@ -16,8 +16,8 @@ class GenericHolisticOp:
 
     def __init__(self, 
                 input_layout, output_layout,
-                input_format=None, output_format=None,
-                dim_order=None):
+                input_format=None, output_format=None
+        ):
         """
         Layout is the community distribution requirement for input and
         output logical tensors.
@@ -39,6 +39,15 @@ class GenericHolisticOp:
         """
 
         # holistic layout (outliner) of input
+        if not isinstance(input_layout, list):
+            raise TypeError("Require input layout for HolistOp is a list")
+        if not isinstance(input_format, list) or input:
+            raise TypeError("Require input format for HolistOp is a list")
+        if not isinstance(output_layout, list):
+            raise TypeError("Require output layout for HolistOp is a list")
+        if not isinstance(output_format, list):
+            raise TypeError("Require output format for HolistOp is a list")
+
         self.input_layout = input_layout
         self.input_format = input_format
 
