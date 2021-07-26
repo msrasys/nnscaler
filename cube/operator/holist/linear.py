@@ -8,7 +8,9 @@ from cube.tensor.community import Community
 
 # expert space to declare all kinds of holistic operators
 
+
 __all__ = ['kHolistLinearSets']
+
 
 class LinearColumnWeight(GenericHolisticOp):
     """
@@ -25,11 +27,11 @@ class LinearColumnWeight(GenericHolisticOp):
         # TODO
         bias_layout = outline.SplitAxis(axis=0, chunk_num=None, overlap=0)
         # TODO
-        output_layout = outline.Align(weight_layout)
+        output_layout = weight_layout
 
         super().__init__(
-            input_layout=(inputs_layout, weight_layout, bias_layout),
-            output_layout=(output_layout,)
+            input_layout=[inputs_layout, weight_layout, bias_layout],
+            output_layout=[output_layout,]
         )
 
     def forward(self, inputs, weight, bias):
@@ -64,8 +66,8 @@ class LinearColumnInputRowWeight(GenericHolisticOp):
         output_layout = outline.Full(reduce=ReductionOpPool.Sum)
 
         super().__init__(
-            input_layout=(inputs_layout, weight_layout, bias_layout),
-            output_layout=(output_layout,)
+            input_layout=[inputs_layout, weight_layout, bias_layout],
+            output_layout=[output_layout,]
         )
     
     def forward(self, inputs, weight, bias):
