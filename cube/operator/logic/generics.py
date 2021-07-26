@@ -20,24 +20,26 @@ class HolisticOpFactory:
 
         self.holist_ops = list()
 
+    def __len__(self):
+        """
+        Return the number of holistic op registered
+        """
+        return len(self.holist_ops)
+
     def register(self, holistic_op):
         """
         Register a holistic op as one of the anchors 
         """
-        #TODO: type check
-        self.holist_ops.append(holist_ops)
+        self.holist_ops.append(holistic_op)
 
-    def get_op(self, args, **kwargs):
+    def get_op(self, idx):
         """
-        Given input tensor args, choose holistic operator(s)
-        for distributed execution plan
+        Get holistic operator based on idx
 
         Returns:
-            An hybrid-operator function which may composite by
-            nested holistic operators
+            HolisticOp instance
         """
-        # TODO: hybrid parallelism generation
-        return self.holist_ops[0]
+        return self.holist_ops[idx]
 
         
 
@@ -59,18 +61,34 @@ class GenericLogicalOp:
         """
         if not callable(policy_fn):
             raise TypeError("Expected a callable function")
-        self.policy_fn = policy_fn
+        self.policy_fn = [policy_fn]
+    
+    def shape_infer(self, *args, **kwargs):
+        """
+        Output shape inference according to inputs
 
-    def __call__(self, args, **kwargs):
+        Args:
+            Operator input
+
+        Returns:
+            shapes tuple(list[int]): shape for each output tensor
+        """
+        raise NotImplementedError("Expected a shape infer engine")
+
+    def get_op(self, *args, **kwargs):
+        # use default policy
+        if self.policy_fn is None:
+            composite_op = self.factory.get_op(0)
+        # use user-customized policy
+        else:
+            composite_op = self.policy_fn[0](self.factory, *args, **kwargs)
+        return composite_op
+
+    def __call__(self, *args, **kwargs):
         """
         Policy here to determine which holistic operator(s) are called
         """
-        # use default policy
-        if self.policy_fn is None:
-            composite_op = self.factory.get_op(args, kwargs)
-        # use user-customized policy
-        else:
-            composite_op = self.policy_fn(self.factory)
+        composite_op = self.get_op(*args, **kwargs)
         # run operator with the strategy plan
-        outputs = composite_op(args, kwargs)
+        outputs = composite_op(*args, **kwargs)
         return outputs

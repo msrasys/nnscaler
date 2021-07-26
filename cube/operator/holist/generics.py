@@ -8,11 +8,15 @@ The output communication works in a lazy execution way. Communication will only
 happen in the front of the next executed op in case the layout doesn't match.
 """
 
+from cube.tensor.logic.tensor import LogicalTensor
+from cube.tensor.community import Community
+
 class GenericHolisticOp:
 
     def __init__(self, 
                 input_layout, output_layout,
-                input_format=None, output_format=None):
+                input_format=None, output_format=None,
+                dim_order=None):
         """
         Layout is the community distribution requirement for input and
         output logical tensors.
@@ -21,70 +25,120 @@ class GenericHolisticOp:
         `None` indicates the format is consistent with logical op,
         otherwise should be a list of integers like torch.Tensor.permute()
         on the logical required format.
+
+        Args:
+            input_laytout (list[Outliner, None]): outliner for each input
+                The length of outliner should be equal to the number of input
+            input_format (list[list[int], None]): 
+                input dim order compare with logical definition
+            output_laytout (list[Outlinter, None]): outliner for each output
+                The length of outliner should be equal to the number of output
+            output_format (list[list[int], None]):
+                output dim order compare with logical definition
         """
-        # holistic layout of input
+
+        # holistic layout (outliner) of input
         self.input_layout = input_layout
         self.input_format = input_format
 
         # holistic layout of output
         self.output_layout = output_layout
         self.output_format = output_format
+
+        self.logical_op = None
     
-    def input_adapter(self, args, **kwargs):
+    def input_adapter(self, *args, **kwargs):
         """
         Transform tensors in args and kwargs to match the
-        input layout requirement
+        input layout requirement, Currently kwargs is not allowed to
+        have tensors
         """
+        #TODO: kwargs
+
+        input_num = len(args)
+        if len(self.input_layout) != input_num:
+            raise RuntimeError("Fail to adapt input: layout length not equal")
+        if len(self.input_format) != input_num:
+            raise RuntimeError("Fail to adapt input: format length not equal")
+        
         # step 1: data reformat based on the input argument
-        #TODO: data dimension format transformation
-        tensor_inputs = list()
-        for arg in args:
-            #TODO: kwargs
-            if cube.is_tensor(arg):
-                tensor_inputs.append(arg)
+        for input, dim_order in zip(args, self.input_layout):
+            if dim_order is not None and isinstance(input, LogicalTensor):
+                input.permute(dim_order)
+
+        # step 2: get segments based on expert discription
         tensor_segments = list()
-        for outliner, tensor in zip(self.input_layout, tensor_inputs):
-            segments = outliner(tensor.shape)
-            tensor_segments.append(segments)
+        for outliner, tensor in zip(self.input_layout, args):
+            if outliner is not None:
+                segments = outliner(tensor.shape)
+                tensor_segments.append(segments)
+            else:
+                tensor_segments.append(None)
 
-        # step 2: physical tensor placement (policy)
-        #TODO: policy module
-        tensor_communities = policy_module(tensor_segments)
+        # step 3: physical tensor placement (policy)
+        if self.policy_module is not None:
+            tensor_communities, tensor_devices = self.policy_fn[0](args, tensor_segments)
+        else:
+            # init community without policy decision
+            tensor_communities = [[Community(seg) for seg in segments] for segments in tensor_segments]
+            tensor_devices = None
+            tensor_val_map_fns = None
 
-        # step 3: community matching
-        for communities, tensor in zip(tensor_communities, tensor_inputs):
-            tensor.match(communities)
+        # step 4: community matching
+        for communities, devices, tensor in zip(tensor_communities, tensor_devices, tensor_inputs):
+            tensor.match(communities, tensor_devices, tensor_val_map_fns)
 
     def output_adapter(self, outputs):
         """
         Data reformat to logical op format
         """
-        if not isinstance(outputs, tuple):
-            outputs = (outputs,)
-        output_tensors = list()
-        for output in outputs:
-            if cube.is_tensor(output):
-                if cube.is_tensor(output):
-                    output_tensors.append(output)
-        for outliner, output in zip(self.output_layout, output_tensors):
-            segments = outliner(output.shape)
-            output.to_logic_tensor(segments)
+        if not isinstance(outputs, list):
+            outputs = [outputs]
+        # step 1: construct to logical tensor
+        logical_outputs = list()
+        for output_segs, outliner, shape in zip(self.outputs, self.output_layout, self.logical_shapes):
+            if shape is not None:
+                communities = outliner(shape)
+                output = construct_from_community(shape, communities, output_segs)
+                logical_outputs.append(output)
+            else:
+                logical_outputs.append(output_segs)
+        # step 2: data reformat based on the output
+        for out_id in range(len(self.output_format)):
+            dim_order = self.output_format[out_id]
+            if dim_order is not None and isinstance(logical_outputs[out_id], LogicalTensor):
+                logical_ouputs[out_id] = logical_ouputs[out_id].permute(dim_order)
+        return logical_outputs
+
         
 
-    def forward(self, args, **kwargs):
+    def forward(self, *args, **kwargs):
         """Expert code for doing operation
         Call to the physical operator for execution"""
-        pass
+        raise NotImplementedError("Error call to generics")
+    
 
-    def __call__(self, args, **kwargs):
+    def __call__(self, *args, **kwargs):
 
         # data transformations to match input layout requirement
-        self.input_adapter(args, kwargs)
+        self.input_adapter(*args, **kwargs)
 
         # do execution
-        outputs = self.forward(args, kwargs)
+        outputs = self.forward(*args, **kwargs)
 
-        # wrap in holistic tensor with output layout
+        # wrap to logical tensor
+        self.logical_shapes = self.logical_op.infer_shapes(*args, **kwargs)
         outputs = self.output_adapter(outputs)
 
         return outputs
+
+    def register_policy(self, policy_fn):
+        """
+        Register a policy to take inputs (logical tensors) and segments,
+        generate device placement for each community, and corresponding
+        message mapping
+
+        Args:
+            plicy_fn (callable)
+        """
+        self.policy_fn = [policy_fn]
