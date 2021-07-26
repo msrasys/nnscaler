@@ -5,10 +5,10 @@ even if they are not tensors.
 
 import torch
 
-from cube.physical.device.group import DeviceGroup
+from cube.device.physic.group import DeviceGroup
 
 
-__all__ = ['parallel_in', 'gather_out', 'scatter_in', 'reduce_out']
+__all__ = ['replicate', 'gather_out', 'scatter_in', 'reduce_sum']
 
 
 def _reduce(input_, group):
@@ -57,9 +57,8 @@ class _ParallelIn(torch.autograd.Function):
     """Pass the input to the model parallel region."""
     
     @staticmethod
-    def forward(ctx, input_, ranks):
+    def forward(ctx, input_, group):
         # record group
-        group = DeviceGroup().get_group(ranks)
         ctx.constants = group
         # identitfy forward
         return input_
@@ -68,16 +67,15 @@ class _ParallelIn(torch.autograd.Function):
     def backward(ctx, grad_output):
         # allreduce
         group = ctx.constants
-        return _reduce(grad_output, group), None
+        return torch.distributed.all_reduce(grad_output, group=group), None
 
 
 class _GatherOut(torch.autograd.Function):
     """Split the input and keep only the corresponding chuck to the rank."""
     
     @staticmethod
-    def forward(ctx, input_, dim, ranks):
+    def forward(ctx, input_, dim, group):
         # record group
-        group = DeviceGroup().get_group(ranks)
         ctx.constants = (group, dim)
         # allgather
         return _gather(input_, dim, group)
@@ -94,8 +92,7 @@ class _ScatterIn(torch.autograd.Function):
     """Split the input and keep only the corresponding chuck to the rank."""
 
     @staticmethod
-    def forward(ctx, input_, dim, ranks):
-        group = DeviceGroup().get_group(ranks)
+    def forward(ctx, input_, dim, group):
         world_size = torch.distributed.get_world_size(group)
         rank = torch.distributed.get_rank(group)
         ctx.constants = (group, dim)
@@ -111,8 +108,7 @@ class _ReduceOut(torch.autograd.Function):
     """All-reduce the input from the model parallel region."""
 
     @staticmethod
-    def forward(ctx, input_, ranks):
-        group = DeviceGroup().get_group(ranks)
+    def forward(ctx, input_, group):
         return _reduce(input_, group)
 
     @staticmethod
@@ -120,17 +116,18 @@ class _ReduceOut(torch.autograd.Function):
         return grad_output, None
 
 
-def parallel_in(input_, ranks):
-    return _ParallelIn.apply(input_, ranks)
+def replicate(input_, group):
+    return _ParallelIn.apply(input_, group)
 
 
-def gather_out(input_, dim, ranks):
-    return _GatherOut.apply(input_, dim, ranks)
+def gather_out(input_, dim, group):
+    return _GatherOut.apply(input_, dim, group)
 
 
-def scatter_in(input_, dim, ranks):
-    return _ScatterIn.apply(input_, dim, ranks)
+def scatter_in(input_, dim, group):
+    return _ScatterIn.apply(input_, dim, group)
 
 
-def reduce_out(input_, ranks):
-    return _ReduceOut.apply(input_, ranks)
+def reduce_sum(input_, group):
+    return _ReduceOut.apply(input_, group)
+

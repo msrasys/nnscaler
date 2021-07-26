@@ -22,6 +22,7 @@ class Community:
         # connection to logical tensor
         # DataSegment to indicate both element set and data format mapping
         self.segment = segment
+        self.reduction = segment.reduction
 
         # connection to physical tensor (the PyTorch Tensor)
         self.physical_tensor = None
@@ -70,8 +71,8 @@ class Community:
         """
         if self.materialized:
             if self.physical_tensor is not None:
-                # self.segment.reduction.__func__(self.physical_tensor, group=self.group)
-                torch.distributed.all_reduce(self.physical_tensor, group=self.group)
+                #TODO: elegant impl on calling reduction op
+                self.reduction[0](self.physical_tensor, group=self.group)
         else:
             raise RuntimeError("The Community has not been materialized to physical tensors")
 

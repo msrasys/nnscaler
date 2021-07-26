@@ -2,16 +2,18 @@
 This is the runtime primitive sets to setup community for a logical tensor.
 """
 
+from cube.operator.physic.comm import replicate, reduce_sum
 import torch
 
 
 # TODO: reduction op should be in torch autograd function
 class _Reduction(type):
 
-    Sum = torch.distributed.all_reduce
+    # forward: all_reduce, backward: identity
+    Sum = [reduce_sum]
 
-    # identity for replica
-    Replica = lambda physical_tensor, group : physical_tensor
+    # forward: identity, backward: all_reduce
+    Replica = [replicate]
 
     def register(cls, name, udf):
         """
@@ -26,7 +28,7 @@ class _Reduction(type):
         """
         if hasattr(cls, name):
             raise KeyError("{} is registered".format(name))
-        setattr(cls, name, udf)
+        setattr(cls, name, [udf])
 
 
 class ReductionOp(metaclass=_Reduction):
@@ -60,7 +62,7 @@ class DataSegment:
         else:
             # TODO: check shape
             self.shape = shape
-        self.reduction = staticmethod(reduction)
+        self.reduction = reduction
 
     def get_indices(self):
         """

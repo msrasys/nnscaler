@@ -11,14 +11,14 @@ def test_reduction_op_register():
     # segment.ReductionOp.register("Replica", reduce_fn)
 
     tensor = torch.randn((3,4))
-    out = segment.ReductionOp.ReduceSum(tensor, None)
+    out = segment.ReductionOp.ReduceSum[0](tensor, None)
     assert out is tensor
 
 
 ## TODO: test all the provided reduction op
 def test_reduction_op_replica():
     #TODO: check correctness
-    assert callable(segment.ReductionOp.Replica)
+    assert callable(segment.ReductionOp.Replica[0])
 
 
 def test_data_segment_init():
