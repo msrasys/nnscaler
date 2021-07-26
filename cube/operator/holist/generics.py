@@ -11,6 +11,7 @@ happen in the front of the next executed op in case the layout doesn't match.
 from cube.tensor.logic.tensor import LogicalTensor
 from cube.tensor.community import Community
 
+
 class GenericHolisticOp:
 
     def __init__(self, 
@@ -46,6 +47,14 @@ class GenericHolisticOp:
         self.output_format = output_format
 
         self.logical_op = None
+        self.policy_fn = None
+    
+    def set_logic_op(self, logic_op):
+        """
+        Set logic op. This will be automatically called when the
+        holistic op registered in a logical op.
+        """
+        self.logical_op = logic_op
     
     def input_adapter(self, *args, **kwargs):
         """
@@ -66,7 +75,7 @@ class GenericHolisticOp:
             if dim_order is not None and isinstance(input, LogicalTensor):
                 input.permute(dim_order)
 
-        # step 2: get segments based on expert discription
+        # step 2: get segments based on expert description
         tensor_segments = list()
         for outliner, tensor in zip(self.input_layout, args):
             if outliner is not None:
@@ -87,6 +96,20 @@ class GenericHolisticOp:
         # step 4: community matching
         for communities, devices, tensor in zip(tensor_communities, tensor_devices, tensor_inputs):
             tensor.match(communities, tensor_devices, tensor_val_map_fns)
+
+    def forward(self, *args, **kwargs):
+        """
+        Expert code for doing operation
+        Call to the physical operator for execution
+
+        Expert needs to gurantee the returned value is list[tuple(OpResult,),]
+
+        Each item in list is the corresponding output to logical op output.
+
+        Each item in the logical op output is a OpResult to the segment specified
+        by the expert. The order should be consistent with specified segment.
+        """
+        raise NotImplementedError("Error call to generics")
 
     def output_adapter(self, outputs):
         """
@@ -110,14 +133,6 @@ class GenericHolisticOp:
                 logical_ouputs[out_id] = logical_ouputs[out_id].permute(dim_order)
         return logical_outputs
 
-        
-
-    def forward(self, *args, **kwargs):
-        """Expert code for doing operation
-        Call to the physical operator for execution"""
-        raise NotImplementedError("Error call to generics")
-    
-
     def __call__(self, *args, **kwargs):
 
         # data transformations to match input layout requirement
@@ -127,6 +142,8 @@ class GenericHolisticOp:
         outputs = self.forward(*args, **kwargs)
 
         # wrap to logical tensor
+        if self.logical_op is None:
+            raise RuntimeError("This holistic op doesn't have logical op")
         self.logical_shapes = self.logical_op.infer_shapes(*args, **kwargs)
         outputs = self.output_adapter(outputs)
 

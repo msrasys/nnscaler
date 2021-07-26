@@ -59,9 +59,9 @@ class LinearColumnInputRowWeight(GenericHolisticOp):
         align = outline.Align(inputs_layout.chunk_num)
         weight_layout = outline.SplitAxis(axis=1, chunk_num=align, overlap=0)
         # TODO
-        bias_layout = outline.Broadcast(reduce=ReductionOpPool.Sum)
+        bias_layout = outline.Full(reduce=ReductionOpPool.Sum)
         # TODO
-        output_layout = outline.Broadcast(reduce=ReductionOpPool.Sum)
+        output_layout = outline.Full(reduce=ReductionOpPool.Sum)
 
         super().__init__(
             input_layout=(inputs_layout, weight_layout, bias_layout),
@@ -69,7 +69,6 @@ class LinearColumnInputRowWeight(GenericHolisticOp):
         )
     
     def forward(self, inputs, weight, bias):
-        #TODO: semantic errors on bias
         output = physic_op.linear(inputs, weight, bias)
         return [output]
 
