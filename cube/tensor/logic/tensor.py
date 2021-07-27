@@ -18,22 +18,29 @@ class LogicalTensor:
             import torch
             self.data = torch.randn(shape).detach()
 
-    def match(communities, ranks=None, val_map_fns=None):
+    def match(self, communities, ranks=None, val_map_fns=None):
         """
         Match the LogicalTensor with community list.
         """
+        # type check
+        ranks = [None] * len(communities) if ranks is None else ranks
+        val_map_fns = [None] * len(communities) if val_map_fns is None else val_map_fns
+        if not isinstance(ranks, list):
+            raise TypeError("Expected ranks to be a list or None")
+        if not isinstance(ranks, list):
+            raise TypeError("Expected ranks to be a list or None")
+        
         #TODO: community matching and transformation
-        if ranks is None:
-            ranks = [None] * len(communities)
-        if val_map_fn is None:
-            val_map_fn = [None] * len(communities)
         if len(self.communities) == 0:
             for cid in range(len(communities)):
+                community = communities[cid]
                 self.set_community(community)
                 if not community.materialized:
                     rank_list = ranks[cid]
-                    val_map_fn = ranks[cid]
-                    community.deploy(ranks, self, val_map_fn)
+                    val_map_fn = val_map_fns[cid]
+                    community.deploy(rank_list, self, val_map_fn)
+        else:
+            raise NotImplementedError
 
     def get_physical_tensor(self, segment):
         """
@@ -45,7 +52,7 @@ class LogicalTensor:
         Returns:
             torch.Tensor or None
         """
-        community = self.communities[idx]
+        community = self.communities[segment]
         return community.get_physical_tensor()
 
     def get_community(self, segment):
@@ -88,7 +95,7 @@ class LogicalTensor:
         with the given community's segment, the original community
         will be overrided
         """
-        if not isinstance(community):
+        if not isinstance(community, Community):
             raise TypeError("Expected a community")
         segment = community.segment
         if segment not in self.communities:
