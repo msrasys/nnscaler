@@ -84,6 +84,11 @@ class DataSegment:
         for dim in range(len(self.indices)):
             self.indices[dim] = [self.indices[dim][idx] for idx in new_orders]
 
+    def __repr__(self):
+        msg = 'DataSegment(indices_len={}, reduction={})'.format(
+            len(self.indices), self.reduction
+        )
+
 
 ## Higher structure to cover the most cases ##
 class TileSegment(DataSegment):
@@ -114,6 +119,12 @@ class TileSegment(DataSegment):
 
     def reorder(self):
         pass
+
+    def __repr__(self):
+        msg = 'TileSegment(anchor={}, shape={}, reduction={})'.format(
+            self.anchor, self.shape, self.reduction
+        )
+        return msg
 
 
 ## Primitive sets for translation ##
