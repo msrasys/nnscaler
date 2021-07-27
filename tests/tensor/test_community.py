@@ -86,7 +86,19 @@ def test_community_sync():
     else:
         # print('ref: {}'.format(ref_tensor))
         assert torch.allclose(sub_tensor, ref_tensor) is True
-    
+
+
+def test_community_set_physical_tensor():
+    seg = segment.TileSegment(
+        anchor=(2,3,1), shape=(4,4,4),
+        reduction=segment.ReductionOp.Sum)
+    community = Community(seg)
+
+    tensor = torch.randn((4,4,4))
+    community.set_physical_tensor(tensor, [0,1,2])
+    assert community.materialized is True
+    assert community.group == DeviceGroup().get_group([0,1,2])
+    assert community.physical_tensor is tensor
 
 
 if __name__ == '__main__':
@@ -97,3 +109,4 @@ if __name__ == '__main__':
     test_community_init()
     test_community_deploy()
     test_community_sync()
+    test_community_set_physical_tensor()

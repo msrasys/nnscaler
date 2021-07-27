@@ -86,3 +86,19 @@ class Community:
             return self.physical_tensor
         else:
             raise RuntimeError("The Community has not been materialized to physical tensors")
+
+    def set_physical_tensor(self, physical_tensor, ranks):
+        if self.materialized:
+            raise RuntimeError("Setting physical tensors to a materialized community")
+        if not isinstance(physical_tensor, torch.Tensor):
+            raise TypeError("physical_tensor: Expected a torch tensor")
+        if not isinstance(ranks, list):
+            raise TypeError("ranks: Expected a list[int]")
+        if physical_tensor.size() != torch.Size(self.segment.shape):
+            raise RuntimeError(
+                "Trying to set a community where physical tensor shape "
+                "doesn't match with segment shape")
+        #TODO: device check
+        self.physical_tensor = physical_tensor
+        self.group = DeviceGroup().get_group(ranks)
+        self.materialized = True
