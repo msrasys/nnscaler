@@ -119,7 +119,7 @@ class SplitAxis(BaseOutline):
         #TODO: support list of reductions
         for cid in range(self.chunk_num.get()):
             segment = TileSegment(
-                list(anchor), list(shape), reduction=self.reduction)
+                list(anchor), list(shape), reduction=self.reduction.get())
             anchor[self.axis.get()] += shape[self.axis.get()]
             segments.append(segment)
         return segments
