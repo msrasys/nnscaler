@@ -16,6 +16,9 @@ class OpResult:
     def get_result(self):
         return self.res
 
+    def __repr__(self):
+        return "OpResult(res={}, placement={})".format(self.res, self.placement)
+
 
 class GenericPhysicOp:
     """
@@ -30,10 +33,14 @@ class GenericPhysicOp:
         
         if not callable(func):
             raise TypeError("Expect callable function")
-        self.func = [func]
-        self._placement = placement
+        if not (isinstance(placement, list) or placement is None):
+            raise TypeError("Expected placement init with None or list[int]")
+        self.func = (func,)
+        self._placement = None
         self.execute_flag = False
         self.policy_fn = None
+        if isinstance(placement, list):
+            self.placement = placement
     
     @property
     def placement(self):

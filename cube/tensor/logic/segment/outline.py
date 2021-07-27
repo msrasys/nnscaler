@@ -55,6 +55,13 @@ class BaseOutline:
     """
     def __init__(self, reduction=None):
         self.reduction = reduction
+        # decide how to generate segmentation given the requirement
+        self.policy_fn = None
+
+    def set_policy(self, policy_fn):
+        if not callable(policy_fn):
+            raise TypeError("Expected a function to take BaseOutline instance")
+        self.policy_fn = policy_fn
 
     def __setattr__(self, key, val):
         if key in self.__dict__:
@@ -67,6 +74,10 @@ class BaseOutline:
         else:
             self.__dict__[key] = ConstantContainer(val)
 
+    def __call__(self):
+        if self.policy_fn is not None:
+            self.policy_fn.get()(self)
+
 
 class Full(BaseOutline):
 
@@ -74,6 +85,8 @@ class Full(BaseOutline):
         super().__init__(reduction)
 
     def __call__(self, shape):
+        #TODO: super call seperate
+        super().__call__()
         segment = TileSegment([0] * len(shape), list(shape), self.reduction.get())
         return [segment]
 
@@ -111,7 +124,9 @@ class SplitAxis(BaseOutline):
         Runtime segment generation given the logical tensor shape
 
         This is the policy that how to do the translation.
-        """ 
+        """
+        #TODO: super call seperate
+        super().__call__()
         segments = list()
         shape = list(shape)
         shape[self.axis.get()] = shape[self.axis.get()] // self.chunk_num.get()

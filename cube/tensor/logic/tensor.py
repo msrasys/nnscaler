@@ -29,6 +29,16 @@ class LogicalTensor:
             raise TypeError("Expected ranks to be a list or None")
         if not isinstance(ranks, list):
             raise TypeError("Expected ranks to be a list or None")
+        if len(ranks) != len(communities):
+            raise RuntimeError(
+                "Un-matched length of communities ({}) : ranks ({})".format(
+                    len(communities), len(ranks))
+            )
+        if len(val_map_fns) != len(communities):
+            raise RuntimeError(
+                "Un-matched length of communities ({}) : ranks ({})".format(
+                    len(communities), len(ranks))
+            )
         
         #TODO: community matching and transformation
         if len(self.communities) == 0:
@@ -49,7 +59,7 @@ class LogicalTensor:
             tensor.set_community(community)
         return tensor
 
-    def get_physical_tensor(self, segment):
+    def get_physical_tensor(self, segment_or_index):
         """
         Get physical tensor from the community.
 
@@ -59,8 +69,13 @@ class LogicalTensor:
         Returns:
             torch.Tensor or None
         """
-        community = self.communities[segment]
-        return community.get_physical_tensor()
+        return self.get_community(segment_or_index).get_physical_tensor()
+    
+    def __len__(self):
+        """
+        Return community number
+        """
+        return len(self.segments)
 
     def get_community(self, segment_or_index):
         """
@@ -72,10 +87,10 @@ class LogicalTensor:
         Returns:
             Community
         """
-        if isinstance(segment_or_index, DataSegment):
-            return self.communities[segment_or_index]
-        elif isinstance(segment_or_index, int):
+        if isinstance(segment_or_index, int):
             return self.communities[self.segments[segment_or_index]]
+        elif isinstance(segment_or_index, DataSegment):
+            return self.communities[segment_or_index]
         else:    
             raise ValueError("Expected (derived) DataSegment to chooese Community")
         return self.communities[segment]

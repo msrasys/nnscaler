@@ -15,11 +15,11 @@ def Linear(generics.GenericLogicalOp):
             holist_op.set_logic_op(self)
             self.factory.register(holist_op)
 
-    def shape_infer(self, input_shape, weight_shape, bias_shape=None)
+    def shape_infer(self, input_shape, weight_shape, bias_shape=None):
         """
         Return the outputs shape [list[int],]
         """
-        output_shape = list(input_shape)
-        output_shape[-1] = weight_shape[-1]
+        output_shape = input_shape.shape
+        output_shape[-1] = weight_shape.shape[0]
         return [output_shape]
 

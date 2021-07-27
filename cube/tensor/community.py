@@ -26,6 +26,7 @@ class Community:
 
         # connection to physical tensor (the PyTorch Tensor)
         self.physical_tensor = None
+        self.placement = list()
         self.group = list()
         self.materialized = False
 
@@ -45,6 +46,9 @@ class Community:
                 return a new tensor
         """
         
+        if not isinstance(ranks, list):
+            raise TypeError("Expected ranks in list[int]")
+        self.placement = ranks
         rank = DeviceGroup().rank
         self.group = DeviceGroup().get_group(ranks)
         if rank not in ranks:
@@ -90,15 +94,13 @@ class Community:
     def set_physical_tensor(self, physical_tensor, ranks):
         if self.materialized:
             raise RuntimeError("Setting physical tensors to a materialized community")
-        if not isinstance(physical_tensor, torch.Tensor):
-            raise TypeError("physical_tensor: Expected a torch tensor")
         if not isinstance(ranks, list):
             raise TypeError("ranks: Expected a list[int]")
-        if physical_tensor.size() != torch.Size(self.segment.shape):
-            raise RuntimeError(
-                "Trying to set a community where physical tensor shape "
-                "doesn't match with segment shape")
-        #TODO: device check
+        if physical_tensor is not None:
+            if list(physical_tensor.size()) != list(self.segment.shape):
+                raise RuntimeError(
+                    "Trying to set a community where physical tensor shape "
+                    "doesn't match with segment shape")
         self.physical_tensor = physical_tensor
         self.group = DeviceGroup().get_group(ranks)
         self.materialized = True

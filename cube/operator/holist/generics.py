@@ -28,11 +28,11 @@ class GenericHolisticOp:
         on the logical required format.
 
         Args:
-            input_laytout (list[Outliner, None]): outliner for each input
+            input_layout (list[Outliner, None]): outliner for each input
                 The length of outliner should be equal to the number of input
             input_format (list[list[int], None]): 
                 input dim order compare with logical definition
-            output_laytout (list[Outlinter, None]): outliner for each output
+            output_layout (list[Outlinter, None]): outliner for each output
                 The length of outliner should be equal to the number of output
             output_format (list[list[int], None]):
                 output dim order compare with logical definition
@@ -129,24 +129,39 @@ class GenericHolisticOp:
     def output_adapter(self, outputs):
         """
         Data reformat to logical op format
+
+        Args:
+            outputs (tuple(list[physical_tensor],))
+                each `list[physical_tensor]` represents a output of the op
+                with is communities
+        Returns:
+            logical outputs (tuple(LogicalTensor,)):
+                the logical tensor list
         """
-        if not isinstance(outputs, list):
-            outputs = [outputs]
+        #TODO: fix: data re-format order. Should be ahead of logical tensor construction
+        if not isinstance(outputs, tuple):
+            outputs = (outputs,)
         # step 1: construct to logical tensor
         logical_outputs = list()
-        for output_segs, outliner, shape in zip(self.outputs, self.output_layout, self.logical_shapes):
-            if shape is not None:
-                communities = outliner(shape)
-                output = construct_from_community(shape, communities, output_segs)
-                logical_outputs.append(output)
-            else:
-                logical_outputs.append(output_segs)
+        for output, outliner, shape in zip(outputs, self.output_layout, self.logical_shapes):
+            segments = outliner(shape)
+            communities = [Community(segment) for segment in segments]
+            for community, op_res in zip(communities, output):
+                #if DeviceGroup().rank == 0:
+                #    print(op_res.res.size(), community.segment.shape)
+                community.set_physical_tensor(op_res.res, op_res.placement)
+            output = LogicalTensor.construct(shape, communities)
+            logical_outputs.append(output)
         # step 2: data reformat based on the output
         for out_id in range(len(self.output_format)):
             dim_order = self.output_format[out_id]
             if dim_order is not None and isinstance(logical_outputs[out_id], LogicalTensor):
                 logical_ouputs[out_id] = logical_ouputs[out_id].permute(dim_order)
-        return logical_outputs
+    
+        if len(logical_outputs) == 1:
+            return logical_outputs[0]
+        else:
+            return tuple(logical_outputs)
 
     def __call__(self, *args, **kwargs):
 
@@ -159,12 +174,12 @@ class GenericHolisticOp:
         # wrap to logical tensor
         if self.logical_op is None:
             raise RuntimeError("This holistic op doesn't have logical op")
-        self.logical_shapes = self.logical_op.infer_shapes(*args, **kwargs)
+        self.logical_shapes = self.logical_op.shape_infer(*args, **kwargs)
         outputs = self.output_adapter(outputs)
 
         return outputs
 
-    def register_policy(self, policy_fn):
+    def set_deploy_policy(self, policy_fn):
         """
         Register a policy to take inputs (logical tensors) and segments,
         generate device placement for each community, and corresponding
@@ -176,3 +191,10 @@ class GenericHolisticOp:
         if not callable(policy_fn):
             raise TypeError("Expected callable function")
         self.policy_fn = (policy_fn,)
+    
+    def set_segmentation_policy(self, policy_fn):
+        for outliner in self.input_layout:
+            outliner.set_policy(policy_fn)
+        for outliner in self.output_layout:
+            outliner.set_policy(policy_fn)
+

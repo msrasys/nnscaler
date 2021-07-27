@@ -44,6 +44,6 @@ def test_generic_logical_op_register():
 
 if __name__ == '__main__':
 
-    test_factory
+    test_factory()
     test_generic_logical_op_init()
     test_generic_logical_op_register()
