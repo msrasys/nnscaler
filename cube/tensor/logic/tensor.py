@@ -42,6 +42,13 @@ class LogicalTensor:
         else:
             raise NotImplementedError
 
+    @staticmethod
+    def construct(shape, communities):
+        tensor = LogicalTensor(shape=shape, init_data=False)
+        for community in communities:
+            tensor.set_community(community)
+        return tensor
+
     def get_physical_tensor(self, segment):
         """
         Get physical tensor from the community.
@@ -55,14 +62,22 @@ class LogicalTensor:
         community = self.communities[segment]
         return community.get_physical_tensor()
 
-    def get_community(self, segment):
+    def get_community(self, segment_or_index):
         """
         Get Community based on the segment
+
+        Args:
+            segment_or_index (DataSegment or int):
+        
+        Returns:
+            Community
         """
-        if not isinstance(segment, DataSegment):
+        if isinstance(segment_or_index, DataSegment):
+            return self.communities[segment_or_index]
+        elif isinstance(segment_or_index, int):
+            return self.communities[self.segments[segment_or_index]]
+        else:    
             raise ValueError("Expected (derived) DataSegment to chooese Community")
-        if segment not in self.communities:
-            raise KeyError("The segment doesn't found in current tensor")
         return self.communities[segment]
 
     def __getitem__(self, key):
