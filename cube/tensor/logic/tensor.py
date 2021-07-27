@@ -18,6 +18,23 @@ class LogicalTensor:
             import torch
             self.data = torch.randn(shape).detach()
 
+    def match(communities, ranks=None, val_map_fns=None):
+        """
+        Match the LogicalTensor with community list.
+        """
+        #TODO: community matching and transformation
+        if ranks is None:
+            ranks = [None] * len(communities)
+        if val_map_fn is None:
+            val_map_fn = [None] * len(communities)
+        if len(self.communities) == 0:
+            for cid in range(len(communities)):
+                self.set_community(community)
+                if not community.materialized:
+                    rank_list = ranks[cid]
+                    val_map_fn = ranks[cid]
+                    community.deploy(ranks, self, val_map_fn)
+
     def get_physical_tensor(self, segment):
         """
         Get physical tensor from the community.
