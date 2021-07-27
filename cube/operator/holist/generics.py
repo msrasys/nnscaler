@@ -41,7 +41,7 @@ class GenericHolisticOp:
         # holistic layout (outliner) of input
         if not isinstance(input_layout, list):
             raise TypeError("Require input layout for HolistOp is a list")
-        if not isinstance(input_format, list) or input:
+        if not isinstance(input_format, list):
             raise TypeError("Require input format for HolistOp is a list")
         if not isinstance(output_layout, list):
             raise TypeError("Require output layout for HolistOp is a list")
@@ -80,31 +80,37 @@ class GenericHolisticOp:
             raise RuntimeError("Fail to adapt input: format length not equal")
         
         # step 1: data reformat based on the input argument
-        for input, dim_order in zip(args, self.input_layout):
-            if dim_order is not None and isinstance(input, LogicalTensor):
+        for input, dim_order in zip(args, self.input_format):
+            if dim_order is not None:
                 input.permute(dim_order)
 
-        # step 2: get segments based on expert description
-        tensor_segments = list()
-        for outliner, tensor in zip(self.input_layout, args):
-            if outliner is not None:
+        # step 2: get communities based on expert description
+        input_communities = list()
+        for tensor, outliner in zip(args, self.input_layout):
+            if outliner is not None and isinstance(tensor, LogicalTensor):
                 segments = outliner(tensor.shape)
-                tensor_segments.append(segments)
+                communities = [Community(seg) for seg in segments]
+                input_communities.append(communities)
             else:
-                tensor_segments.append(None)
+                input_communities.append(None)
 
         # step 3: physical tensor placement (policy)
-        if self.policy_module is not None:
-            tensor_communities, tensor_devices = self.policy_fn[0](args, tensor_segments)
+        if self.policy_fn is not None:
+            input_ranks, input_val_map_fns = \
+                self.policy_fn[0](input_communities, *args)
         else:
-            # init community without policy decision
-            tensor_communities = [[Community(seg) for seg in segments] for segments in tensor_segments]
-            tensor_devices = None
-            tensor_val_map_fns = None
+            # TODO: default policy
+            input_ranks = [None] * len(args)
+            input_val_map_fns = [None] * len(args)
 
         # step 4: community matching
-        for communities, devices, tensor in zip(tensor_communities, tensor_devices, tensor_inputs):
-            tensor.match(communities, tensor_devices, tensor_val_map_fns)
+        for tid in range(len(args)):
+            tensor = args[tid]
+            if isinstance(tensor, LogicalTensor):
+                communities = input_communities[tid]
+                ranks = input_ranks[tid]
+                val_map_fn = input_val_map_fns[tid]
+                tensor.match(communities, ranks, val_map_fn)
 
     def forward(self, *args, **kwargs):
         """
@@ -167,4 +173,6 @@ class GenericHolisticOp:
         Args:
             plicy_fn (callable)
         """
-        self.policy_fn = [policy_fn]
+        if not callable(policy_fn):
+            raise TypeError("Expected callable function")
+        self.policy_fn = (policy_fn,)
