@@ -10,7 +10,8 @@ The description includes two parts:
         to the real segmentation on given logical tensor shape.
 """
 
-from cube.tensor.logic.segment.segment import TileSegment, ReductionOp
+from cube.tensor.segment import Segment
+from cube.tensor.indices import TileIndices
 
 
 class MutableContainer:
@@ -46,7 +47,6 @@ class ConstantContainer:
 
 # interface to setup restrictions on the segmentation
 
-
 class BaseOutline:
     """
     Basic class for declare outline
@@ -74,9 +74,18 @@ class BaseOutline:
         else:
             self.__dict__[key] = ConstantContainer(val)
 
-    def __call__(self):
+    def interpret(self, logical_tensor):
+        raise NotImplementedError
+
+    def __call__(self, logical_tensor):
+        if not isinstance(logical_tensor, LogicalTensor):
+            raise TypeError("Expected logical_tensor is instance of LogicalTensor")
+
+        #TODO: merge out to fuse in configurable space
         if self.policy_fn is not None:
             self.policy_fn.get()(self)
+
+        self.interpret(logical_tensor)
 
 
 class Full(BaseOutline):
@@ -84,10 +93,10 @@ class Full(BaseOutline):
     def __init__(self, reduction=None):
         super().__init__(reduction)
 
-    def __call__(self, shape):
-        #TODO: super call seperate
-        super().__call__()
-        segment = TileSegment([0] * len(shape), list(shape), self.reduction.get())
+    def interpret(self, logical_tensor):
+        shape = logical_tensor.shape
+        indices = TileIndices([0] * len(shape), shape)
+        segment = Segment(logical_tensor, indices, self.reduction.get())
         return [segment]
 
 
@@ -119,22 +128,20 @@ class SplitAxis(BaseOutline):
         self.uniform = uniform
         self.overlap = overlap
 
-    def __call__(self, shape):
+    def interpret(self, logical_tensor):
         """
         Runtime segment generation given the logical tensor shape
 
         This is the policy that how to do the translation.
         """
-        #TODO: super call seperate
-        super().__call__()
         segments = list()
-        shape = list(shape)
+        shape = list(logical_tensor.shape)
         shape[self.axis.get()] = shape[self.axis.get()] // self.chunk_num.get()
         anchor = [0] * len(shape)
         #TODO: support list of reductions
         for cid in range(self.chunk_num.get()):
-            segment = TileSegment(
-                list(anchor), list(shape), reduction=self.reduction.get())
-            anchor[self.axis.get()] += shape[self.axis.get()]
+            indices = TileIndices(anchor, shape)
+            segment = Segment(logical_tensor, indices)
             segments.append(segment)
+            anchor[self.axis.get()] += shape[self.axis.get()]
         return segments

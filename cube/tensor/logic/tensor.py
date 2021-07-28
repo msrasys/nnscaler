@@ -21,6 +21,7 @@ class LogicalTensor:
     def match(self, communities, ranks=None, val_map_fns=None):
         """
         Match the LogicalTensor with community list.
+        TODO: change name
         """
         # type check
         ranks = [None] * len(communities) if ranks is None else ranks
