@@ -18,6 +18,18 @@ class BaseIndices:
         """
         self.indices = tuple(indices_list)
 
+    def ndim(self):
+        """
+        Return dims of this indices
+        """
+        return len(self.indices)
+
+    def size(self):
+        """
+        Return total number of index
+        """
+        return len(self.indices[0])
+
     def get(self):
         """
         Get indexable indices
@@ -34,8 +46,11 @@ class BaseIndices:
         Args:
             new_orders (iteratable): order of each index
         """
-        for dim in range(len(self.indices)):
-            self.indices[dim] = [self.indices[dim][idx] for idx in new_orders]
+        new_orders = list(new_orders)
+        indices = list(self.indices)
+        for dim in range(self.ndim()):
+            indices[dim] = [self.indices[dim][idx] for idx in new_orders]
+        self.indices = tuple(indices)
 
     def __repr__(self):
         msg = 'BaseIndices(indices_len={})'.format(
@@ -56,11 +71,26 @@ class TileIndices(BaseIndices):
             offset (list[int]): offset (shape) of the tile
         """
         indices = list()
+        size = 1
         for start, ofst in zip(self.anchor, self.shape):
             indices.append(slice(start, start + ofst))
+            size *= ofst 
         super().__init__(tuple(indices))
         self.anchor = anchor
         self.shape = shape
+        self.size = size
+    
+    def ndim(self):
+        """
+        Return dims of this indices
+        """
+        return len(self.indices)
+
+    def size(self):
+        """
+        Return total number of index
+        """
+        return self.size
 
     def reorder(self):
         raise NotImplementedError
