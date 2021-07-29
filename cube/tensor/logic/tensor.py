@@ -1,5 +1,5 @@
-from cube.tensor.community import Community
-from cube.tensor.logic.segment.segment import DataSegment
+from cube.tensor.segment import Segment
+from cube.tensor.indices import BaseIndices
 
 
 class LogicalTensor:
@@ -8,15 +8,19 @@ class LogicalTensor:
     """
 
     def __init__(self, shape, init_data=True):
-        
-        self.shape = shape
-        # segment -> community
-        self.communities = dict()
+        self.shape = tuple(shape)
         self.segments = list()
         self.data = None
         if init_data:
             import torch
             self.data = torch.randn(shape).detach()
+    
+    def select(self, indices, shape):
+        """
+        Create a Segment given the indices for this logical tensor,
+        and the Segment will use shape. 
+        """
+        self.segments.append(Segment(self, indices, shape))
 
     def match(self, communities, ranks=None, val_map_fns=None):
         """
@@ -98,16 +102,10 @@ class LogicalTensor:
 
     def __getitem__(self, key):
         """
-        key:
-            if key is DataSegment, return community
-            ##TODO: DOUBLE CHECK
-            if key is slice, return new logical tensor
+
         """
-        if isinstance(key, DataSegment):
-            return self.get_community(key)
-        else:
-            ## TODO: should return logical tensor / views
-            return self.data[key]
+        # TODO: create new logical tensor / change layout
+        return self.data[key]
 
     def create_community(self, segment):
         """

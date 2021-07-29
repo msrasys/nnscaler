@@ -1,94 +1,115 @@
-import cube.tensor.logic.segment as segment
+"""
+cmd for running the test
+
+python -m torch.distributed.launch \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    --node_rank=0 \
+    --master_addr=127.0.0.1 \
+    --master_port=62000 \
+    --use_env \
+    tests/tensor/test_segment.py
+"""
+
+from cube.tensor.logic.tensor import LogicalTensor
+from cube.tensor.segment import Segment
+from cube.tensor.indices import BaseIndices, TileIndices
+from cube.device.physic.group import DeviceGroup
+
 import torch
+import os
+torch.manual_seed(121)
 
 
-def test_reduction_op_register():
+def test_segment_init():
 
-    def reduce_fn(physical_tensor, group):
-        return physical_tensor
-    segment.ReductionOp.register("ReduceSum", reduce_fn)
+    tensor = LogicalTensor((10,10,10))
 
-    # segment.ReductionOp.register("Replica", reduce_fn)
+    anchor = [3,4,5]
+    ofst = [2,4,3]
+    indices = TileIndices(anchor, ofst)
 
-    tensor = torch.randn((3,4))
-    out = segment.ReductionOp.ReduceSum[0](tensor, None)
-    assert out is tensor
+    segment = Segment(tensor, indices, ofst)
 
-
-## TODO: test all the provided reduction op
-def test_reduction_op_replica():
-    #TODO: check correctness
-    assert callable(segment.ReductionOp.Replica[0])
-
-
-def test_data_segment_init():
-
-    tensor = torch.randn((10,10,10))
-    indices = [[5,3,2,4],
-               [1,2,7,4],
-               [3,4,5,4]]
-    seg = segment.DataSegment(
-        indices, shape=(4,1), reduction=segment.ReductionOp.Replica)
-    assert seg.indices == indices
-    assert seg.shape == (4,1)
-    assert seg.reduction == segment.ReductionOp.Replica
+    assert segment.logical_tensor is tensor
+    assert segment.shape == tuple(ofst)
+    assert segment.physical_tensor is None
+    assert len(segment.placement) == 0
+    assert segment.group is None
+    assert segment.deploy_op is None
+    assert segment.materialized is False
+    assert segment.merge_op is None
 
 
-def test_data_segment_get_indices():
+def test_segment_deploy():
 
-    tensor = torch.randn((10,10,10))
-    indices = [[5,3,2,4],
-               [1,2,7,4],
-               [3,4,5,4]]
-    seg = segment.DataSegment(
-        indices, shape=(4,1), reduction=segment.ReductionOp.Replica)
-    sub_tensor = tensor[seg.get_indices()]
-    assert sub_tensor.size() == torch.Size([4])
+    myrank = DeviceGroup().rank
+    tensor = LogicalTensor((10,10,10))
 
+    anchor = [3,4,5]
+    ofst = [2,4,3]
+    indices = TileIndices(anchor, ofst)
 
-def test_data_segment_reorder():
+    segment = Segment(tensor, indices, ofst)
 
-    tensor = torch.randn((10,10,10))
-    indices = [[5,3,2,4],
-               [1,2,7,4],
-               [3,4,5,4]]
-    seg = segment.DataSegment(
-        indices, shape=(4,1), reduction=segment.ReductionOp.Replica)
-    sub_tensor = tensor[seg.get_indices()]
+    ranks = [0,2]
+    segment.deploy(ranks, value_map_op=None)
 
-    seg.reorder([2,3,1,0])
-    ref_tensor = sub_tensor[([2,3,1,0])]
-    check_tensor = tensor[seg.get_indices()]
-    assert torch.all(torch.eq(ref_tensor, check_tensor))
-
-
-def test_tile_segment_init():
-
-    tensor = torch.randn((10,10,10))
-    seg = segment.TileSegment(
-        anchor=(2,3,1), shape=(4,4,4), reduction=segment.ReductionOp.Replica)
-    assert seg.shape == (4,4,4)
-    assert seg.anchor == (2,3,1)
-    assert seg.reduction == segment.ReductionOp.Replica
+    physical_tensor = segment.get_physical_tensor()
+    tensor_ref = tensor.data[indices.get()].cuda()
+    if myrank in ranks:
+        assert physical_tensor.device == torch.device('cuda:{}'.format(myrank))
+        assert torch.allclose(physical_tensor, tensor_ref)
+    else:
+        assert physical_tensor is None
+    assert segment.placement == ranks
+    assert segment.group == DeviceGroup().get_group(ranks)
+    assert segment.deploy_op is None
+    assert segment.materialized is True
+    assert segment.merge_op is None
 
 
-def test_tile_segment_get_indices():
+def test_segment_recover():
 
-    tensor = torch.randn((10,10,10))
-    seg = segment.TileSegment(
-        anchor=(2,3,1), shape=(4,4,4), reduction=segment.ReductionOp.Replica)
-    ref_tensor = tensor[(slice(2,2+4), slice(3,3+4), slice(1,1+4))]
-    sub_tensor = tensor[seg.get_indices()]
-    assert sub_tensor.size() == torch.Size([4,4,4])
-    assert torch.all(torch.eq(ref_tensor, sub_tensor))
+    myrank = DeviceGroup().rank
+    tensor = LogicalTensor((10,10,10))
+
+    anchor = [3,4,5]
+    ofst = [2,4,3]
+    indices = TileIndices(anchor, ofst)
+
+    segment = Segment(tensor, indices, ofst)
+
+    ranks = [0,2]
+    segment.deploy(ranks, value_map_op=lambda tensor: tensor / 2)
+
+    # deploy check
+    physical_tensor = segment.get_physical_tensor()
+    tensor_ref = tensor.data[indices.get()].cuda() / 2
+    if myrank in [0,2]:
+        assert physical_tensor.device == torch.device('cuda:{}'.format(myrank))
+        assert torch.allclose(physical_tensor, tensor_ref) is True
+    else:
+        assert physical_tensor is None
+
+    # recover to get logical value
+    def reduction_op(tensor, group):
+        torch.distributed.all_reduce(tensor, group=group)
+    segment.recover(reduction_op=reduction_op)
+    physical_tensor = segment.get_physical_tensor()
+    
+    tensor_ref = tensor.data[indices.get()].cuda()
+    if myrank in [0,2]:
+        assert physical_tensor.device == torch.device('cuda:{}'.format(myrank))
+        assert torch.allclose(physical_tensor, tensor_ref) is True
+    else:
+        assert physical_tensor is None
 
 
 if __name__ == '__main__':
 
-    test_reduction_op_register()
-    test_reduction_op_replica()
-    test_data_segment_init()
-    test_data_segment_get_indices()
-    test_data_segment_reorder()
-    test_tile_segment_init()
-    test_tile_segment_get_indices()
+    group = DeviceGroup()
+
+    test_segment_init()
+    test_segment_deploy()
+    test_segment_recover()

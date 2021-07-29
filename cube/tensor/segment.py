@@ -1,8 +1,7 @@
-import torch
 from cube.device.physic.group import DeviceGroup
+from cube.tensor.indices import BaseIndices
 
-
-__all__ = ['Segment']
+import torch
 
 
 class Segment:
@@ -23,8 +22,6 @@ class Segment:
             merge_op (None or callable):
                 merge op to take physical tensor
         """
-        if not isinstance(logical_tensor, LogicalTensor):
-            raise TypeError("Expected logical_tensor to be LogicalTensor")
         if not isinstance(indices, BaseIndices):
             raise TypeError("Expected indices to be BaseIndices")
 
@@ -33,14 +30,14 @@ class Segment:
         
         # segment info
         self.indices = indices
-        self.shape = shape
+        self.shape = tuple(shape)
 
         # physical tensor (the PyTorch Tensor)
         self.physical_tensor = None
 
         # deploy information
         self.placement = list()
-        self.group = list()
+        self.group = None
         self.deploy_op = None
         self.materialized = False
 
@@ -58,9 +55,8 @@ class Segment:
 
         Argument:
             ranks (list[int]): device id list
-            value_map_fn (callable):
-                takes the tensor, rank, world_size,
-                return a new tensor
+            value_map_op (callable):
+                takes the tensor, return a new tensor
         """
         if not isinstance(ranks, list):
             raise TypeError("Expected ranks in list[int]")
@@ -69,15 +65,15 @@ class Segment:
         self.placement = ranks
         self.group = DeviceGroup().get_group(ranks)
         if rank in ranks:
-            if self.logic_tensor.data is None:
+            if self.logical_tensor.data is None:
                 # TODO: check overlap
                 self.physical_tensor = torch.randn(tuple(self.segment.shape), device='cuda')
             else:
                 # select from logical data
                 self.physical_tensor = torch.empty(tuple(self.shape), device='cuda')
-                self.physical_tensor.copy_(self.logic_tensor.data[self.indices.get()])
+                self.physical_tensor.copy_(self.logical_tensor.data[self.indices.get()])
             if value_map_op is not None:
-                self.physical_tensor.data = value_map_fn(self.physical_tensor)
+                self.physical_tensor.data = value_map_op(self.physical_tensor)
         self.materialized = True
 
     def recover(self, reduction_op):
