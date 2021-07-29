@@ -71,7 +71,9 @@ class Segment:
             else:
                 # select from logical data
                 self.physical_tensor = torch.empty(tuple(self.shape), device='cuda')
-                self.physical_tensor.copy_(self.logical_tensor.data[self.indices.get()])
+                self.physical_tensor.copy_(
+                    self.logical_tensor.data[self.indices.get()].reshape(self.shape)
+                )
             if value_map_op is not None:
                 self.physical_tensor.data = value_map_op(self.physical_tensor)
         self.materialized = True
@@ -112,7 +114,7 @@ class Segment:
         if not isinstance(ranks, list):
             raise TypeError("ranks: Expected a list[int]")
         if physical_tensor is not None:
-            if list(physical_tensor.size()) != list(self.segment.shape):
+            if list(physical_tensor.size()) != list(self.shape):
                 raise RuntimeError(
                     "Trying to set a community where physical tensor shape "
                     "doesn't match with segment shape")
