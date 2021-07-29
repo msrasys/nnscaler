@@ -39,12 +39,12 @@ class LogicalTensor:
         for segment, physical_tensor, ranks in zip(self.segments, physical_tensors, ranks):
             segment.set_physical_tensor(physical_tensor, ranks)
     
-    def select(self, indices, shape):
+    def select(self, indices, val_map_op, shape):
         """
         Create a Segment given the indices for this logical tensor,
         and the Segment will use shape. 
         """
-        segment = Segment(self, indices, shape)
+        segment = Segment(self, indices, val_map_op, shape)
         return segment
 
     def transform(self, segments, ranks=None, val_map_ops=None):
@@ -66,7 +66,7 @@ class LogicalTensor:
                     if not isinstance(deploy_ranks, list):
                         raise TypeError('Expected ranks to be list[list[int],]')
                     deploy_ops = val_map_ops[sid]
-                    segment.deploy(deploy_ranks, deploy_ops)
+                    segment.deploy(deploy_ranks)
         #TODO: segment transformation on existing segments
         else:
             raise NotImplementedError
@@ -136,3 +136,10 @@ class LogicalTensor:
         else:
             raise ValueError("Expected Segment instance or index int")
 
+    def merge_segment(self, indices, reduction_op):
+        """
+        Merge segments for the logical tensor
+
+        The merged segments will be placed at the end of the list.
+        """
+        raise NotImplementedError

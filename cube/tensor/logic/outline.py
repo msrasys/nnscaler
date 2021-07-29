@@ -1,6 +1,6 @@
 """
 This is the description interface to describe the 
-segementation requirement (restrictions).
+segmentation requirement (restrictions).
 
 The description includes two parts:
 
@@ -14,37 +14,6 @@ from cube.tensor.segment import Segment
 from cube.tensor.indices import TileIndices
 
 
-class MutableContainer:
-
-    def __init__(self, scope):
-        self.__val = None
-        self.__scope = scope
-
-    def get(self, scope=False):
-        if scope:
-            return self.__scope
-        else:
-            return self.__val
-    
-    def set(self, val):
-        if self.__scope is not None:
-            if val not in self.__scope:
-                raise ValueError("Fail to set container, out of range")
-        self.__val = val
-
-
-class ConstantContainer:
-
-    def __init__(self, val):
-        self.__val = val
-    
-    def get(self):
-        return self.__val
-
-    def set(self, val):
-        raise RuntimeError("Cannot set a ConstantContainer")
-
-
 # interface to setup restrictions on the segmentation
 
 class BaseOutline:
@@ -53,7 +22,7 @@ class BaseOutline:
 
     To setup an attribute (requirement), use `inst_baseoutline.attribute_name = val`
     """
-    def __init__(self, reduction=None):
+    def __init__(self):
         self.reduction = reduction
         # decide how to generate segmentation given the requirement
         self.policy_fn = None
@@ -88,10 +57,10 @@ class BaseOutline:
         self.interpret(logical_tensor)
 
 
-class Full(BaseOutline):
+class Full(ConfigTemplate):
 
-    def __init__(self, reduction=None):
-        super().__init__(reduction)
+    def __init__(self):
+        pass
 
     def interpret(self, logical_tensor):
         shape = logical_tensor.shape
@@ -100,9 +69,9 @@ class Full(BaseOutline):
         return [segment]
 
 
-class SplitAxis(BaseOutline):
+class SplitAxis(ConfigTemplate):
 
-    def __init__(self, axis, chunk_num=None, overlap=0, reduction=None, uniform=True):
+    def __init__(self, axis, chunk_num=None, overlap=0, uniform=True):
         """
         Segmentation Pattern Requirement (parameters):
 
@@ -122,7 +91,7 @@ class SplitAxis(BaseOutline):
             if a tuple(min, max), the overlap size wihtin the scope [min,max] is valid
 
         """
-        super().__init__(reduction)
+        super().__init__()
         self.axis = axis
         self.chunk_num = chunk_num
         self.uniform = uniform
@@ -145,3 +114,11 @@ class SplitAxis(BaseOutline):
             segments.append(segment)
             anchor[self.axis.get()] += shape[self.axis.get()]
         return segments
+
+
+class SplitValue(ConfigTemplate):
+
+    def __init__(self, chunk_num=None, val_map_op=None):
+        ##TODO
+        self.chunk_num = chunk_num
+        self.val_map_op = val_map_op

@@ -36,7 +36,7 @@ def test_logical_tensor_select():
         [7,5,9,4]
     )
     indices = BaseIndices(sparse_indices)
-    segment = tensor.select(indices, shape=(2,2))
+    segment = tensor.select(indices, None, shape=(2,2))
     assert isinstance(segment, Segment)
     assert segment.materialized is False
 
@@ -52,7 +52,7 @@ def test_logical_tensor_fill():
         [7,5,9,4]
     )
     indices = BaseIndices(sparse_indices)
-    segment = tensor.select(indices, shape=(2,2))
+    segment = tensor.select(indices, None, shape=(2,2))
     tensor.add_segment(segment)
 
     assert segment.materialized is False
@@ -80,7 +80,7 @@ def test_logical_tensor_transform():
         [7,5,9,4]
     )
     indices = BaseIndices(sparse_indices)
-    segment = tensor.select(indices, shape=(2,2))
+    segment = tensor.select(indices, None, shape=(2,2))
 
     ranks = [0,1,3]
     tensor.transform([segment], [ranks], [None])

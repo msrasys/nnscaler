@@ -29,14 +29,14 @@ def test_segment_init():
     ofst = [2,4,3]
     indices = TileIndices(anchor, ofst)
 
-    segment = Segment(tensor, indices, ofst)
+    segment = Segment(tensor, indices, None, ofst)
 
     assert segment.logical_tensor is tensor
     assert segment.shape == tuple(ofst)
     assert segment.physical_tensor is None
     assert len(segment.placement) == 0
     assert segment.group is None
-    assert segment.deploy_op is None
+    assert len(segment.val_map_ops) == 0
     assert segment.materialized is False
     assert segment.merge_op is None
 
@@ -50,10 +50,10 @@ def test_segment_deploy():
     ofst = [2,4,3]
     indices = TileIndices(anchor, ofst)
 
-    segment = Segment(tensor, indices, ofst)
+    segment = Segment(tensor, indices, None, ofst)
 
     ranks = [0,2]
-    segment.deploy(ranks, value_map_op=None)
+    segment.deploy(ranks)
 
     physical_tensor = segment.get_physical_tensor()
     tensor_ref = tensor.data[indices.get()].cuda()
@@ -64,12 +64,12 @@ def test_segment_deploy():
         assert physical_tensor is None
     assert segment.placement == ranks
     assert segment.group == DeviceGroup().get_group(ranks)
-    assert segment.deploy_op is None
+    assert len(segment.val_map_ops) == 0
     assert segment.materialized is True
     assert segment.merge_op is None
 
 
-def test_segment_recover():
+def test_segment_deploy_with_val_map():
 
     myrank = DeviceGroup().rank
     tensor = LogicalTensor((10,10,10))
@@ -78,27 +78,20 @@ def test_segment_recover():
     ofst = [2,4,3]
     indices = TileIndices(anchor, ofst)
 
-    segment = Segment(tensor, indices, ofst)
+    segment = Segment(
+        logical_tensor = tensor,
+        indices = indices,
+        val_map_op = lambda tensor: tensor / 2,
+        shape = ofst
+    )
+    assert len(segment.val_map_ops) == 1
 
     ranks = [0,2]
-    segment.deploy(ranks, value_map_op=lambda tensor: tensor / 2)
+    segment.deploy(ranks)
 
     # deploy check
     physical_tensor = segment.get_physical_tensor()
     tensor_ref = tensor.data[indices.get()].cuda() / 2
-    if myrank in [0,2]:
-        assert physical_tensor.device == torch.device('cuda:{}'.format(myrank))
-        assert torch.allclose(physical_tensor, tensor_ref) is True
-    else:
-        assert physical_tensor is None
-
-    # recover to get logical value
-    def reduction_op(tensor, group):
-        torch.distributed.all_reduce(tensor, group=group)
-    segment.recover(reduction_op=reduction_op)
-    physical_tensor = segment.get_physical_tensor()
-    
-    tensor_ref = tensor.data[indices.get()].cuda()
     if myrank in [0,2]:
         assert physical_tensor.device == torch.device('cuda:{}'.format(myrank))
         assert torch.allclose(physical_tensor, tensor_ref) is True
@@ -112,4 +105,4 @@ if __name__ == '__main__':
 
     test_segment_init()
     test_segment_deploy()
-    test_segment_recover()
+    test_segment_deploy_with_val_map()
