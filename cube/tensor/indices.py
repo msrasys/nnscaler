@@ -72,13 +72,13 @@ class TileIndices(BaseIndices):
         """
         indices = list()
         size = 1
-        for start, ofst in zip(self.anchor, self.shape):
+        for start, ofst in zip(anchor, shape):
             indices.append(slice(start, start + ofst))
             size *= ofst 
         super().__init__(tuple(indices))
         self.anchor = anchor
         self.shape = shape
-        self.size = size
+        self.elenum = size
     
     def ndim(self):
         """
@@ -90,7 +90,7 @@ class TileIndices(BaseIndices):
         """
         Return total number of index
         """
-        return self.size
+        return self.elenum
 
     def reorder(self):
         raise NotImplementedError

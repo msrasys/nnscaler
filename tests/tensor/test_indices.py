@@ -39,5 +39,33 @@ def test_base_indices():
     assert torch.allclose(sub_tensor, ref_tensor) is True
 
 
+def test_tile_indices():
+
+    tensor = torch.randn((10, 10, 10))
+
+    anchor = [3,4,5]
+    ofst = [2,4,3]
+    indices = TileIndices(anchor, ofst)
+    assert indices.anchor == anchor
+    assert indices.shape == ofst
+    assert indices.elenum == 2 * 4 * 3
+
+    # test ndim
+    assert indices.ndim() == 3
+    
+    # test size
+    assert indices.size() == 2 * 4 * 3
+
+    # test get
+    sub_tensor = tensor[indices.get()]
+    assert sub_tensor.size() == torch.Size(ofst)
+    ref_tensor = tensor[(slice(3,3+2), slice(4,4+4), slice(5,5+3))]
+    assert torch.allclose(sub_tensor, ref_tensor) is True
+
+    # test reorder
+    ##TODO
+
+
 if __name__ == '__main__':
     test_base_indices()
+    test_tile_indices()
