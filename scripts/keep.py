@@ -46,7 +46,7 @@ def keep(rank, args):
         time.sleep(args.interval)
         while True:
             util = get_gpu_util(rank)
-            if util >= 0:
+            if util > 0:
                 break
             print('rank {}: find gpu busy, keep sleeping...'.format(rank))
             time.sleep(args.interval)

@@ -24,3 +24,5 @@ echo 'export CUDA_HOME=/usr/local/cuda' >> ~/.bashrc
 # find cube/ -name "*.py" -print0 | xargs -0 wc -l
 
 python setup.py develop
+pip install -r requirements.txt
+
