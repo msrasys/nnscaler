@@ -81,7 +81,7 @@ def test_segment_deploy_with_val_map():
     segment = Segment(
         logical_tensor = tensor,
         indices = indices,
-        val_map_op = lambda tensor: tensor / 2,
+        val_map_op = lambda tensor, rank, world_size: tensor / world_size,
         shape = ofst
     )
     assert len(segment.val_map_ops) == 1
@@ -91,7 +91,7 @@ def test_segment_deploy_with_val_map():
 
     # deploy check
     physical_tensor = segment.get_physical_tensor()
-    tensor_ref = tensor.data[indices.get()].cuda() / 2
+    tensor_ref = tensor.data[indices.get()].cuda() / len(ranks)
     if myrank in [0,2]:
         assert physical_tensor.device == torch.device('cuda:{}'.format(myrank))
         assert torch.allclose(physical_tensor, tensor_ref) is True

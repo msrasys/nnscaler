@@ -57,7 +57,8 @@ class Segment:
         Argument:
             ranks (list[int]): device id list
             value_map_op (callable):
-                takes the tensor, return a new tensor
+                takes the tensor, rank, world_size,
+                return a new tensor
         """
         if not isinstance(ranks, list):
             raise TypeError("Expected ranks in list[int]")
@@ -74,7 +75,7 @@ class Segment:
                 self.logical_tensor.data[self.indices.get()].reshape(self.shape)
             )
             for val_map_op in self.val_map_ops:
-                self.physical_tensor.data = val_map_op(self.physical_tensor)
+                self.physical_tensor.data = val_map_op(self.physical_tensor, rank, len(ranks))
         self.materialized = True
 
     def recover(self, reduction_op):
