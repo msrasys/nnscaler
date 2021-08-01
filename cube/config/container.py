@@ -4,7 +4,8 @@ class ConditionContainer:
     def __init__(self, satisfy_fn):
         if not callable(satisfy_fn):
             raise TypeError("Expected function")
-        self._satisfy_fn = satisfy_fn
+        self._satisfy_fn = (satisfy_fn,)
+        self._condition_fn = None
         self._val = None
         self._choices = None
         self._lock = False
@@ -20,11 +21,17 @@ class ConditionContainer:
         Set the value, will raise ValueError if not satisfy
         """
         if self._lock:
-            raise RuntimeError("Try to set a locked config")
+            raise False
         if self._choices is not None:
             if not self.satisfy(val, self._choices):
-                raise ValueError("Fail to set config")
+                return False
+        val_backup = self._val
         self._val = val
+        if self._condition_fn is not None:
+            if not self._condition_fn():
+                self._val = val_backup
+                return False
+        return True
 
     def lock(self):
         """
@@ -34,12 +41,12 @@ class ConditionContainer:
 
     def satisfy(self, val):
         """
-        Check whether the value satisfy the choices
+        Check whether the value satisfy the choices and conditions
 
         Returns:
             True if satisfy, False not
         """
-        return self._satisfy_fn(val, self._choices)
+        return self._satisfy_fn[0](val, self._choices)
 
     def choices(self):
         """
@@ -70,6 +77,8 @@ class ChoiceContainer(ConditionContainer):
         def satisfy_fn(val, choices):
             return val in choices
         super().__init__(satisfy_fn)
+        if not hasattr(choices, '__iter__'):
+            choices = [choices]
         self._choices = choices
 
 
@@ -90,3 +99,27 @@ class TypeContainer(ConditionContainer):
             return False
         super().__init__(satisfy_fn)
         self._choices = type_choices
+
+
+class UniformSumContainer(ConditionContainer):
+
+    def __init__(self, summation):
+        """
+        Create a summation restriction container
+        """
+        def satisfy_fn(val, choices):
+            return len(set(val) == 1) and sum(val) == choices
+        super().__init__(satisfy_fn)
+        self._choices = summation
+
+
+class SumContainer(ConditionContainer):
+
+    def __init__(self, summation, slots=None):
+        """
+        Create a summation restriction container
+        """
+        def satisfy_fn(val, choices):
+            return sum(val) == choices
+        super().__init__(satisfy_fn)
+        self._choices = summation
