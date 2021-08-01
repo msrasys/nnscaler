@@ -13,6 +13,8 @@ The description includes two parts:
 from cube.tensor.segment import Segment
 from cube.tensor.indices import TileIndices
 
+import z3
+
 
 # interface to setup restrictions on the segmentation
 
@@ -22,103 +24,171 @@ class BaseOutline:
 
     To setup an attribute (requirement), use `inst_baseoutline.attribute_name = val`
     """
-    def __init__(self):
-        self.reduction = reduction
-        # decide how to generate segmentation given the requirement
-        self.policy_fn = None
+    def __init__(self, solver, shape):
+        super().__init__()
+        self.solver = solver
+        self.shape = shape
+        self.attributes = list()
 
-    def set_policy(self, policy_fn):
-        if not callable(policy_fn):
-            raise TypeError("Expected a function to take BaseOutline instance")
-        self.policy_fn = policy_fn
+    def get_attributes(self):
+        return self.attributes
 
-    def __setattr__(self, key, val):
-        if key in self.__dict__:
-            self.__dict__[key].set(val)
-        #TODO: Align semantics will not allow setting val on child, need a new class
-        elif isinstance(val, MutableContainer) or isinstance(val, ConstantContainer):
-            self.__dict__[key] = val
-        elif val is None or isinstance(val, range) or isinstance(val, set):
-            self.__dict__[key] = MutableContainer(val)
-        else:
-            self.__dict__[key] = ConstantContainer(val)
+    def add_field(self, **kwargs):
+        """
+        Add a config field to current instance
 
-    def interpret(self, logical_tensor):
+        Usage: self.add_field(key=val):
+
+        key is the name for the config attribute, val is the choices
+
+        val type:
+            list[int]: the key can only be the options from the val;
+            int: the key can only be the val;
+            range: the key can only be the val in the range;
+            None: the key can be any integers
+            z3.z3.ArithRef: the key is aligned with another attribute
+        """
+        for key in kwargs:
+            if key in self.__dict__:
+                raise RuntimeError("{} already in config field".format(key))
+            val = kwargs[key]
+            if isinstance(val, list):
+                if not all([isinstance(arg, int) for arg in val]):
+                    raise TypeError("{} only supports list[int] choices".format(key))
+                self.__dict__[key] = z3.Int(key)
+                self.attributes.append(self.__dict__[key])
+                self.solver.add(z3.Or([self.__dict__[key] == val for val in val]))
+            elif isinstance(val, int):
+                self.__dict__[key] = z3.Int(str(id(self))+key)
+                self.attributes.append(self.__dict__[key])
+                self.solver.add(self.__dict__[key] == val)
+            elif isinstance(val, range):
+                self.__dict__[key] = z3.Int(str(id(self))+key)
+                self.attributes.append(self.__dict__[key])
+                self.solver.add(self.__dict__[key] >= val[0])
+                raise NotImplementedError
+            elif val is None:
+                self.__dict__[key] = z3.Int(str(id(self))+key)
+                self.attributes.append(self.__dict__[key])
+            elif isinstance(val, z3.z3.ArithRef):
+                self.__dict__[key] = val
+            else:
+                raise TypeError("{} can only be int, list[int], z3.Int()".format(key))
+    
+    def remove_config(self, config):
+        if not isinstance(config, z3.z3.ModelRef):
+            raise TypeError("Expected config from z3 model()")
+        self.solver.add(z3.Or([z3.Not(attr == config[attr]) for attr in self.attributes]))
+
+    def interpret(self, logical_tensor, config):
         raise NotImplementedError
 
-    def __call__(self, logical_tensor):
-        if not isinstance(logical_tensor, LogicalTensor):
-            raise TypeError("Expected logical_tensor is instance of LogicalTensor")
 
-        #TODO: merge out to fuse in configurable space
-        if self.policy_fn is not None:
-            self.policy_fn.get()(self)
+class Full(BaseOutline):
 
-        self.interpret(logical_tensor)
+    def __init__(self, solver, shape):
+        super().__init__(solver, shape)
 
-
-class Full(ConfigTemplate):
-
-    def __init__(self):
-        pass
-
-    def interpret(self, logical_tensor):
-        shape = logical_tensor.shape
-        indices = TileIndices([0] * len(shape), shape)
-        segment = Segment(logical_tensor, indices, self.reduction.get())
+    def interpret(self, logical_tensor, config):
+        if not isinstance(config, z3.z3.ModelRef):
+            raise TypeError("Expected config from z3 model()")
+        indices = TileIndices([0] * len(self.shape), self.shape)
+        segment = logical_tensor.select(indices, None, self.shape)
         return [segment]
 
 
-class SplitAxis(ConfigTemplate):
+class SplitAxis(BaseOutline):
 
-    def __init__(self, axis, chunk_num=None, overlap=0, uniform=True):
+    def __init__(self, solver, shape, axis, chunk_num, overlap):
         """
-        Segmentation Pattern Requirement (parameters):
+        Split the logical tensor spatially in `axis` dimension
 
-        axis (int): the axis to split
+        TODO: support split axis with non-uniform chunk size
 
-        chunk_num (None, int, tuple(int, int)):
-            valid chunk numbers to split.
-            If None, then any chunk number is valid;
-            If an integer, only the specified chunk number is valid;
-            If a tuple(min, max), the chunk number wihtin the scope [min,max] is valid
-
-
-        overlap (0, int, tuple(int, int)):
-            valid size for overlaping on the boundary of each splitted chunks.
-            If None, any overlapping is valid
-            If an integer, each overlap size is valid;
-            if a tuple(min, max), the overlap size wihtin the scope [min,max] is valid
-
+        shape: list / tuple int
+            shape of input logical tensor
+        axis: int
+            which axis to split
+        chunk_num: options (iterable int) / None / int:
+            how many segments to produce
+        uniform: Boolean
+            whether restrict to uniform split
+        overlap: options (iterable int) / int:
+            overlap size on the boundary
         """
-        super().__init__()
+        if not isinstance(axis, int):
+            raise RuntimeError("Expected axis to be an integer")
+
+        super().__init__(solver, shape)
         self.axis = axis
-        self.chunk_num = chunk_num
-        self.uniform = uniform
-        self.overlap = overlap
+        
+        self.add_field(overlap=overlap)
+        self.solver.add(self.overlap >= 0)
 
-    def interpret(self, logical_tensor):
-        """
-        Runtime segment generation given the logical tensor shape
+        self.add_field(chunk_num=chunk_num)
+        self.solver.add(self.chunk_num >= 0)
 
-        This is the policy that how to do the translation.
+        # TODO: change to array to adapt with non-uniform cases
+        self.add_field(chunk_size=None)
+        
+        # setup constraints
+        total_size = self.shape[self.axis]
+        self.solver.add(self.chunk_num * self.chunk_size - self.overlap * (self.chunk_num - 1) == total_size)
+
+    def interpret(self, logical_tensor, config):
         """
-        segments = list()
-        shape = list(logical_tensor.shape)
-        shape[self.axis.get()] = shape[self.axis.get()] // self.chunk_num.get()
+        Get segments from config
+
+        Args:
+            logical_tensor (LogicalTensor): 
+                the logical tensor
+            config:
+                Config searched by model output
+
+        """
+        if tuple(logical_tensor.shape) != tuple(self.shape):
+            raise RuntimeError("The logical tensor's shape doesn't match")
+        if not isinstance(config, z3.z3.ModelRef):
+            raise TypeError("Expected config from z3 model()")
+        chunk_num = config[self.chunk_num].as_long()
+        chunk_size = config[self.chunk_size].as_long()
+        shape = list(self.shape)
+        shape[self.axis] = chunk_size
         anchor = [0] * len(shape)
-        #TODO: support list of reductions
-        for cid in range(self.chunk_num.get()):
+        segments = list()
+        for cid in range(chunk_num):
             indices = TileIndices(anchor, shape)
-            segment = Segment(logical_tensor, indices)
+            segment = logical_tensor.select(indices, None, shape)
             segments.append(segment)
-            anchor[self.axis.get()] += shape[self.axis.get()]
+            anchor[self.axis] += shape[self.axis]
         return segments
 
 
-class SplitValue(ConfigTemplate):
+class SplitValue(BaseOutline):
 
-    def __init__(self, chunk_num=None, val_map_op=None):
-        ##TODO
-        self.chunk_num = chunk_num
+    def __init__(self, solver, shape, chunk_num, val_map_op):
+        """
+        Split the whole tensor in value dimension.
+
+        Each segment shape will be same with logical tensor.
+
+        Each segment value will be modified by `val_map_op`.
+        """
+        if not callable(val_map_op):
+            raise TypeError("Expected val_map_op a callable function")
+        super().__init__(solver, shape)
+        self.add_field(chunk_num=chunk_num)
+        self.solver.add(self.chunk_num >= 1)
         self.val_map_op = val_map_op
+
+    def interpret(self, logical_tensor, config):
+        if tuple(logical_tensor.shape) != tuple(self.shape):
+            raise RuntimeError("The logical tensor's shape doesn't match")
+        chunk_num = config[self.chunk_num].as_long()
+        segments = list()
+        for cid in range(chunk_num):
+            # full tensor shape
+            indices = TileIndices([0] * len(self.shape), self.shape)
+            segment = logical_tensor.select(indices, self.val_map_op, self.shape)
+            segments.append(segment)
+        return segments
