@@ -31,6 +31,11 @@ class Segment:
         self.indices = indices
         self.shape = tuple(shape)
 
+        # val ops
+        self.val_ops = list()
+        self.val_op_segs = list()
+        self.add_val_op(val_op)
+
         # physical tensor (the PyTorch Tensor)
         self.physical_tensor = None
 
@@ -39,11 +44,7 @@ class Segment:
         self.group = None
         self.materialized = False
 
-        # val ops
-        self.val_ops = list()
-        self.add_val_op(val_op)
-
-    def deploy(self, ranks):
+    def deploy(self, ranks=None):
         """deploy (materialize) to physical tensors
     
         Materialize physical tensors for this community and spread out
@@ -53,18 +54,27 @@ class Segment:
         to spread.
 
         Argument:
-            ranks (list[int]): device id list
+            ranks (list[int] or None): 
+                if rank id list: deploy based on this list
+                if None: deploy based on setted self.placement
             value_map_op (callable):
                 takes the tensor, rank, world_size,
                 return a new tensor
         """
-        if not isinstance(ranks, list):
-            raise TypeError("Expected ranks in list[int]")
+        if isinstance(ranks, list):
+            self.placement = ranks
+        elif ranks is None and self.placement is None:
+            raise TypeError("Expected self.placement when ranks is None")
+
+        #TODO: remove this constraints
+        if len(self.val_ops) > 0 and len(self.placement) > 1:
+            raise RuntimeError("Currently segment with val_ops only allows to deploy on one rank")
 
         rank = DeviceGroup().rank
-        self.placement = ranks
-        self.group = DeviceGroup().get_group(ranks)
-        if rank in ranks:
+        self.group = DeviceGroup().get_group(self.placement)
+
+        # set physical tensors
+        if rank in self.placement:
             if self.logical_tensor.data is None:
                 raise RuntimeError("Try deploying a segment from a logical tensor without data")
             # select from logical data
@@ -72,8 +82,16 @@ class Segment:
             self.physical_tensor.copy_(
                 self.logical_tensor.data[self.indices.get()].reshape(self.shape)
             )
-            for val_op in self.val_ops:
-                self.physical_tensor.data = val_op.map(self.physical_tensor, self.group)
+
+        # go through val_op
+        for val_op, segs in zip(self.val_ops, self.val_op_segs):
+            if len(segs) == 0:
+                raise RuntimeError("Missing segments for val op")
+            op_ranks = [seg.placement[0] for seg in segs]
+            group = DeviceGroup().get_group(op_ranks)
+            if rank in self.placement:
+                self.physical_tensor.data = val_op.map(self.physical_tensor, group)
+
         self.materialized = True
 
     def recover(self, reduction_op):

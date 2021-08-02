@@ -57,6 +57,7 @@ class LogicalTensor:
             raise ValueError("Expected ranks to be a list with equal length of segments")
     
         if len(self.segments) == 0:
+            # setting up the placement for all segments
             for sid in range(len(segments)):
                 segment = segments[sid]
                 self.add_segment(segment)
@@ -64,7 +65,11 @@ class LogicalTensor:
                     deploy_ranks = ranks[sid]
                     if not isinstance(deploy_ranks, list):
                         raise TypeError('Expected ranks to be list[list[int],]')
-                    segment.deploy(deploy_ranks)
+                    segment.placement = deploy_ranks
+            # deploy with the placement
+            for segment in self.segments:
+                if not segment.materialized:
+                    segment.deploy()
         #TODO: segment transformation on existing segments
         else:
             raise NotImplementedError

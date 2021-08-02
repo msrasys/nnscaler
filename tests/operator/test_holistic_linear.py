@@ -126,8 +126,92 @@ def test_holistic_linear_op_column_weight():
     # =============================== Test ==============================
 
 
+def test_holistic_linear_op_column_input_row_weight():
+
+    N = 1024
+    shapes = [(1024, 1024), (N, 1024), (N,), (1024, N)]
+    input = LogicalTensor(shape=shapes[0])
+    weight = LogicalTensor(shape=shapes[1])
+    bias = LogicalTensor(shape=shapes[2])
+
+    # ================================ Policy ===========================
+
+    holistic_op = LinearColumnInputRowWeight(shapes)
+
+    def policy(holist_op):
+        solver = holist_op.solver
+        attributes = holist_op.attributes
+        input_layout = holist_op.input_layouts[0]
+        weight_layout = holist_op.input_layouts[1]
+        bias_layout = holist_op.input_layouts[2]
+        output_layout = holist_op.output_layouts[0]
+
+        # add restrictions based on device num
+        device_num = torch.cuda.device_count()
+        solver.add(weight_layout.chunk_num == 4)
+        
+        # iterate all configs
+        configs = list()
+        while solver.check() == z3.sat:
+            config = solver.model()
+            if DeviceGroup().rank == 0:
+                print('find config: {}'.format(config))
+            configs.append(config)
+            solver.add(
+                z3.Or([z3.Not(attr == config[attr]) for attr in attributes])
+            )
+            if len(attributes) == 0:
+                break
+        # choose one config -- suppose to the first
+        config = configs[0]
+        if DeviceGroup().rank == 0:
+            print('selected config: {}'.format(config))
+
+        # deploy decisions
+        chunk_num = config[weight_layout.chunk_num].as_long()
+        input_ranks = list()
+        for rank in range(chunk_num):
+            input_ranks.append([rank])
+        weight_ranks = input_ranks
+        bias_ranks = weight_ranks
+
+        return config, [input_ranks, weight_ranks, bias_ranks]
+
+    # Missing Policy: where physical op executed?
+
+    holistic_op.set_policy(policy)
+    # ================================ Policy ===========================
+
+    output = holistic_op(input, weight, bias)
+    print('segments: {}'.format(len(output.segments)))
+
+    # =============================== Test ==============================
+    rank = DeviceGroup().rank
+    input_ref = torch.chunk(input.data.cuda(), chunks=4, dim=-1)[rank]
+    weight_ref = torch.chunk(weight.data.cuda(), chunks=4, dim=1)[rank]
+    bias_ref = bias.data.cuda() / 4
+    # if rank == 0:
+    #     print('input ref: ', input_ref)
+    #     print('weight ref: ', weight_ref)
+    #     print('bias ref: ', bias_ref)
+
+    output_ref = torch._C._nn.linear(
+        input_ref, weight_ref, bias_ref
+    )
+    out = output.get_physical_tensor(rank)
+    # if rank == 0:
+    #     print('ref: ', output_ref)
+    #     print('get: ', out)
+    #     print('max bias: ', torch.max(torch.abs(out - output_ref)))
+    #     print('sum bias: ', torch.sum(torch.abs(out - output_ref)))
+    error_max = torch.max(torch.abs(out - output_ref))
+    assert error_max.item() < 2e-4
+    # =============================== Test ==============================
+
+
 if __name__ == '__main__':
     group = DeviceGroup()
     
     # test_linear_POC()
     test_holistic_linear_op_column_weight()
+    test_holistic_linear_op_column_input_row_weight()

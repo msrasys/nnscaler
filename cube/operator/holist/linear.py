@@ -90,24 +90,24 @@ class LinearColumnInputRowWeight(GenericHolisticOp):
         super().__init__(shapes)
 
         input_layout = outline.SplitAxis(
-            self.solver, self.shapes,
+            self.solver, self.shapes[0],
             axis=-1, chunk_num=None, overlap=0,
         )
 
         weight_layout = outline.SplitAxis(
-            self.solver, self.shapes,
+            self.solver, self.shapes[1],
             axis=1, chunk_num=input_layout.chunk_num, overlap=0,
         )
 
         bias_layout = outline.SplitValue(
-            self.solver, self.shapes,
+            self.solver, self.shapes[2],
             chunk_num=input_layout.chunk_num,
             val_op=PartialSum
         )
 
         # output layout will only use reduce op
         output_layout = outline.SplitValue(
-            self.solver, self.shapes,
+            self.solver, self.shapes[3],
             chunk_num=input_layout.chunk_num,
             val_op=PartialSum
         )
@@ -121,8 +121,8 @@ class LinearColumnInputRowWeight(GenericHolisticOp):
             phy_op = phy_linear.Linear(placement=weight_seg.placement)
             output = phy_op(
                 input_seg.get_physical_tensor(), 
-                weight.get_physical_tensor(), 
-                bias.get_physical_tensor()
+                weight_seg.get_physical_tensor(), 
+                bias_seg.get_physical_tensor()
             )
             outputs.append(output)
         return outputs

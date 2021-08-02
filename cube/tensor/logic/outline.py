@@ -189,4 +189,6 @@ class SplitValue(BaseOutline):
             indices = TileIndices([0] * len(self.shape), self.shape)
             segment = logical_tensor.select(indices, self.val_op, self.shape)
             segments.append(segment)
+        for segment in segments:
+            segment.val_op_segs.append(segments)
         return segments
