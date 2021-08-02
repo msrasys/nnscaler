@@ -11,6 +11,8 @@ happen in the front of the next executed op in case the layout doesn't match.
 from cube.tensor.logic.tensor import LogicalTensor
 from cube.tensor.logic.outline import BaseOutline
 
+from cube.device.physic.group import DeviceGroup
+
 import z3
 
 
@@ -162,9 +164,10 @@ class GenericHolisticOp:
             outputs = (outputs,)
 
         # step 1: construct to logical tensor
+        logical_outputs = list()
         for output, outliner in zip(outputs, self.output_layouts):
             logical_tensor = LogicalTensor(outliner.shape, init_data=False)
-            segments = outliner.interpret(shape, self.config)
+            segments = outliner.interpret(logical_tensor, self.config)
             for segment in segments:
                 logical_tensor.add_segment(segment)
             logical_tensor.fill(
@@ -190,6 +193,7 @@ class GenericHolisticOp:
         self.input_adapter(*args, **kwargs)
 
         # do execution
+        args, kwargs = LogicalTensor.to_segments(*args, **kwargs)
         outputs = self.forward(*args, **kwargs)
 
         # wrap to logical tensor

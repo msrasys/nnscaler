@@ -12,7 +12,6 @@ python -m torch.distributed.launch \
 """
 
 from cube.tensor.logic.tensor import LogicalTensor
-import cube.tensor.logic.segment as sg
 
 from cube.operator.holist.linear import LinearColumnWeight
 from cube.operator.holist.linear import LinearColumnInputRowWeight
@@ -20,21 +19,8 @@ from cube.operator.holist.linear import LinearColumnInputRowWeight
 from cube.device.physic.group import DeviceGroup
 
 import torch
+import z3
 torch.manual_seed(100)
-
-
-class LogicalLinear:
-
-    def __init__(self): pass
-
-    def shape_infer(self, input_shape, weight_shape, bias_shape=None):
-        """
-        Return the outputs shape [list[int],]
-        """
-        #TODO: change all shape impl to list
-        output_shape = list(input_shape.shape)
-        output_shape[-1] = weight_shape.shape[0]
-        return [output_shape]
 
 
 def test_linear_POC():
@@ -67,48 +53,61 @@ def test_holistic_linear_op_column_weight():
     K results larger bias.
     """
     N = 1024
-    input = LogicalTensor(shape=(1024,1024))
-    weight = LogicalTensor(shape=(N,1024))
-    bias = LogicalTensor(shape=(N,))
-
-    # output = LogicalLinear(input, weight, bias)
+    shapes = [(1024, 1024), (N, 1024), (N,), (1024, N)]
+    input = LogicalTensor(shape=shapes[0])
+    weight = LogicalTensor(shape=shapes[1])
+    bias = LogicalTensor(shape=shapes[2])
 
     # ================================ Policy ===========================
 
-    holistic_op = LinearColumnWeight()
-    holistic_op.logical_op = LogicalLinear()
+    holistic_op = LinearColumnWeight(shapes)
 
-    def policy_for_how_many_tiles(outliner):
-        if isinstance(outliner, sg.outline.Full):
-            pass
-        elif isinstance(outliner, sg.outline.SplitAxis):
-            if outliner.chunk_num.get() is None:
-                outliner.chunk_num = 4
-        else:
-            raise TypeError("Unhandled outliner type")
-    # -> together
+    def policy(holist_op):
+        solver = holist_op.solver
+        attributes = holist_op.attributes
+        input_layout = holist_op.input_layouts[0]
+        weight_layout = holist_op.input_layouts[1]
+        bias_layout = holist_op.input_layouts[2]
+        output_layout = holist_op.output_layouts[0]
 
-    def policy_for_each_tile_placement(community, input, weight, bias):
-        # generate results (hard code) [helper function]
-        input_ranks = [
-            [[0,1,2,3]], [DeviceGroup().all_ranks()]
-            [[0],[1],[2],[3]],
-            [[0],[1],[2],[3]]
-        ]
-        input_val_map_fns = list([None, None, None])
-        return input_ranks, input_val_map_fns
+        # add restrictions based on device num
+        device_num = torch.cuda.device_count()
+        solver.add(weight_layout.chunk_num == 4)
+        
+        # iterate all configs
+        configs = list()
+        while solver.check() == z3.sat:
+            config = solver.model()
+            if DeviceGroup().rank == 0:
+                print('find config: {}'.format(config))
+            configs.append(config)
+            solver.add(
+                z3.Or([z3.Not(attr == config[attr]) for attr in attributes])
+            )
+            if len(attributes) == 0:
+                break
+        # choose one config -- suppose to the first
+        config = configs[0]
+        if DeviceGroup().rank == 0:
+            print('selected config: {}'.format(config))
+
+        # deploy decisions
+        chunk_num = config[weight_layout.chunk_num].as_long()
+        input_ranks = [list(range(0, chunk_num)),]
+        weight_ranks = list()
+        for rank in range(chunk_num):
+            weight_ranks.append([rank])
+        bias_ranks = weight_ranks
+
+        return config, [input_ranks, weight_ranks, bias_ranks]
     
     # Missing Policy: where physical op executed?
 
-    holistic_op.set_deploy_policy(
-        policy_for_each_tile_placement
-    )
-    holistic_op.set_segmentation_policy(
-        policy_for_how_many_tiles
-    )
+    holistic_op.set_policy(policy)
     # ================================ Policy ===========================
 
     output = holistic_op(input, weight, bias)
+    print('segments: {}'.format(len(output.segments)))
 
     # =============================== Test ==============================
     output_ref = torch._C._nn.linear(

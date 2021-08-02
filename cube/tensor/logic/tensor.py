@@ -1,6 +1,7 @@
 from cube.tensor.segment import Segment
 from cube.tensor.indices import BaseIndices
 
+from cube.device.physic.group import DeviceGroup
 
 class LogicalTensor:
     """
@@ -140,3 +141,24 @@ class LogicalTensor:
         The merged segments will be placed at the end of the list.
         """
         raise NotImplementedError
+
+    def __repr__(self):
+        return 'LogicalTensor[{} with {} Segments]'.format(
+            tuple(self.shape), len(self.segments)
+        )
+
+    @staticmethod
+    def to_segments(*args, **kwargs):
+        args_segments = list()
+        for arg in args:
+            if isinstance(arg, LogicalTensor):
+                args_segments.append(arg.segments)
+            else:
+                args_segments.append(arg)
+        kwargs_segments = dict()
+        for key in kwargs:
+            if isinstance(kwargs[key], LogicalTensor):
+                kwargs_segments[key] = kwargs[key].segments
+            else:
+                kwargs_segments[key] = kwargs[key]
+        return tuple(args_segments), kwargs_segments
