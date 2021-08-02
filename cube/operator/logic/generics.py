@@ -28,20 +28,21 @@ class HolisticOpFactory:
 
     def register(self, holistic_op):
         """
-        Register a holistic op as one of the anchors 
+        Register a holistic op (class) as one of the anchors 
         """
         self.holist_ops.append(holistic_op)
 
-    def get_op(self, idx):
+    def get_op(self, idx, shapes):
         """
         Get holistic operator based on idx
+
+        The holistic operator will be initialized with shapes
 
         Returns:
             HolisticOp instance
         """
-        return self.holist_ops[idx]
+        return self.holist_ops[idx](shapes)
 
-        
 
 class GenericLogicalOp:
 
@@ -51,7 +52,7 @@ class GenericLogicalOp:
         self.factory = HolisticOpFactory()
         self.policy_fn = None
 
-    def register_policy(self, policy_fn):
+    def set_policy(self, policy_fn):
         """
         Register a policy function to customize how composite
         holistic op generated during runtime.
@@ -75,13 +76,26 @@ class GenericLogicalOp:
         """
         raise NotImplementedError("Expected a shape infer engine")
 
+    def get_shapes(self, *args, **kwargs):
+        # get shapes of input and output
+        shapes = list()
+        for arg in args:
+            if isinstance(LogicalTensor, arg):
+                shapes.append(arg.shape)
+            else:
+                shapes.append(None)
+        shapes.append(self.shape_infer(*args, **kwargs))
+        return shapes
+
     def get_op(self, *args, **kwargs):
+        # get shapes of input and output
+        shapes = self.get_shapes()
         # use default policy
         if self.policy_fn is None:
-            composite_op = self.factory.get_op(0)
+            composite_op = self.factory.get_op(0, shapes)
         # use user-customized policy
         else:
-            composite_op = self.policy_fn[0](self.factory, *args, **kwargs)
+            composite_op = self.policy_fn[0](self.factory, shapes)
         return composite_op
 
     def __call__(self, *args, **kwargs):

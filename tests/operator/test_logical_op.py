@@ -6,14 +6,14 @@ def test_factory():
     factory = HolisticOpFactory()
     assert len(factory) == 0
 
-    class HolisticOp: pass
-    holistic_op = HolisticOp()
+    class HolisticOp:
+        def __init__(self, shape): pass
 
-    factory.register(holistic_op)
-    assert len(factor) == 1
+    factory.register(HolisticOp)
+    assert len(factory) == 1
 
-    op = factory.get_op(0)
-    assert op is holistic_op
+    op = factory.get_op(0, [(1024, 1024)])
+    assert isinstance(op, HolisticOp)
 
 
 def test_generic_logical_op_init():
@@ -27,19 +27,17 @@ def test_generic_logical_op_register():
 
     generic_op = GenericLogicalOp()
 
-    class HolisticOp: pass
-    holistic_op = HolisticOp()
+    class HolisticOp:
+        def __init__(self, shape): pass
 
-    generic_op.factory.register(holistic_op)
+    generic_op.factory.register(HolisticOp)
 
-    def policy_fn(factory):
-        return factory.get_op(0)
+    def policy_fn(factory, shapes):
+        return factory.get_op(0, shapes)
     
-    generic_op.register_policy(policy_fn)
+    generic_op.set_policy(policy_fn)
     assert generic_op.policy_fn is not None
 
-    op = generic_op.get_op()
-    assert op is holistic_op
 
 
 if __name__ == '__main__':
