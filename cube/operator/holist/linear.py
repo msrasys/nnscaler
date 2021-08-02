@@ -1,6 +1,7 @@
 from cube.operator.holist.generics import GenericHolisticOp
 
 import cube.operator.physic.linear as phy_linear
+from cube.operator.physic.comm.mapreduce import PartialSum
 
 from cube.tensor.logic.tensor import LogicalTensor
 import cube.tensor.logic.outline as outline
@@ -101,15 +102,14 @@ class LinearColumnInputRowWeight(GenericHolisticOp):
         bias_layout = outline.SplitValue(
             self.solver, self.shapes,
             chunk_num=input_layout.chunk_num,
-            val_map_op=lambda tensor, rank, world_size : tensor / world_size
+            val_op=PartialSum
         )
 
         # output layout will only use reduce op
         output_layout = outline.SplitValue(
             self.solver, self.shapes,
             chunk_num=input_layout.chunk_num,
-            val_map_op=lambda tensor, rank, world_size : tensor,
-            val_reduce_op=lambda tensor, rank, world_size : tensor
+            val_op=PartialSum
         )
 
         self.set_input_layouts([input_layout, weight_layout, bias_layout])

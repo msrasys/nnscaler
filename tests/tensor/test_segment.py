@@ -15,6 +15,7 @@ from cube.tensor.logic.tensor import LogicalTensor
 from cube.tensor.segment import Segment
 from cube.tensor.indices import BaseIndices, TileIndices
 from cube.device.physic.group import DeviceGroup
+from cube.operator.physic.comm.mapreduce import PartialSum
 
 import torch
 import os
@@ -36,9 +37,8 @@ def test_segment_init():
     assert segment.physical_tensor is None
     assert len(segment.placement) == 0
     assert segment.group is None
-    assert len(segment.val_map_ops) == 0
+    assert len(segment.val_ops) == 0
     assert segment.materialized is False
-    assert segment.merge_op is None
 
 
 def test_segment_deploy():
@@ -64,9 +64,8 @@ def test_segment_deploy():
         assert physical_tensor is None
     assert segment.placement == ranks
     assert segment.group == DeviceGroup().get_group(ranks)
-    assert len(segment.val_map_ops) == 0
+    assert len(segment.val_ops) == 0
     assert segment.materialized is True
-    assert segment.merge_op is None
 
 
 def test_segment_deploy_with_val_map():
@@ -81,10 +80,10 @@ def test_segment_deploy_with_val_map():
     segment = Segment(
         logical_tensor = tensor,
         indices = indices,
-        val_map_op = lambda tensor, rank, world_size: tensor / world_size,
+        val_op = PartialSum,
         shape = ofst
     )
-    assert len(segment.val_map_ops) == 1
+    assert len(segment.val_ops) == 1
 
     ranks = [0,2]
     segment.deploy(ranks)

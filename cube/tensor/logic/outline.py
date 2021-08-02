@@ -166,20 +166,18 @@ class SplitAxis(BaseOutline):
 
 class SplitValue(BaseOutline):
 
-    def __init__(self, solver, shape, chunk_num, val_map_op):
+    def __init__(self, solver, shape, chunk_num, val_op):
         """
         Split the whole tensor in value dimension.
 
         Each segment shape will be same with logical tensor.
 
-        Each segment value will be modified by `val_map_op`.
+        Each segment value will be modified by `val_op`.
         """
-        if not callable(val_map_op):
-            raise TypeError("Expected val_map_op a callable function")
         super().__init__(solver, shape)
         self.add_field(chunk_num=chunk_num)
         self.solver.add(self.chunk_num >= 1)
-        self.val_map_op = val_map_op
+        self.val_op = val_op
 
     def interpret(self, logical_tensor, config):
         if tuple(logical_tensor.shape) != tuple(self.shape):
@@ -189,6 +187,6 @@ class SplitValue(BaseOutline):
         for cid in range(chunk_num):
             # full tensor shape
             indices = TileIndices([0] * len(self.shape), self.shape)
-            segment = logical_tensor.select(indices, self.val_map_op, self.shape)
+            segment = logical_tensor.select(indices, self.val_op, self.shape)
             segments.append(segment)
         return segments

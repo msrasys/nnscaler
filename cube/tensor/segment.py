@@ -6,7 +6,7 @@ import torch
 
 class Segment:
 
-    def __init__(self, logical_tensor, indices, val_map_op, shape):
+    def __init__(self, logical_tensor, indices, val_op, shape):
         """Create Segment based on the logical tensor
 
         Segment manages:
@@ -17,10 +17,9 @@ class Segment:
         Attribute:
             indices (tuple(slice,) or list[list[int]]):
                 indices of logical_tensor for this segment
-            val_map_op (None or callable):
-                deploy op to take logical value and map
-            merge_op (None or callable):
-                merge op to take physical tensor
+            val_op (ValueMapReduceOp):
+                deploy op to take logical value and group in for value mapping
+                merge op to take mapped value and group in for value reduction
         """
         if not isinstance(indices, BaseIndices):
             raise TypeError("Expected indices to be BaseIndices")
@@ -30,8 +29,6 @@ class Segment:
         
         # segment info
         self.indices = indices
-        self.val_map_ops = list()
-        self.add_val_map_op(val_map_op)
         self.shape = tuple(shape)
 
         # physical tensor (the PyTorch Tensor)
@@ -42,8 +39,9 @@ class Segment:
         self.group = None
         self.materialized = False
 
-        # recover op
-        self.merge_op = None
+        # val ops
+        self.val_ops = list()
+        self.add_val_op(val_op)
 
     def deploy(self, ranks):
         """deploy (materialize) to physical tensors
@@ -74,8 +72,8 @@ class Segment:
             self.physical_tensor.copy_(
                 self.logical_tensor.data[self.indices.get()].reshape(self.shape)
             )
-            for val_map_op in self.val_map_ops:
-                self.physical_tensor.data = val_map_op(self.physical_tensor, rank, len(ranks))
+            for val_op in self.val_ops:
+                self.physical_tensor.data = val_op.map(self.physical_tensor, self.group)
         self.materialized = True
 
     def recover(self, reduction_op):
@@ -97,14 +95,14 @@ class Segment:
         else:
             raise RuntimeError("The Segment has not been materialized")
 
-    def add_val_map_op(self, val_map_op):
+    def add_val_op(self, val_op):
         """
-        Append val_map_op to the end 
+        Append val_op to the end 
         """
-        if val_map_op is not None:
-            if not callable(val_map_op):
-                raise TypeError("Expected val_map_op to be callable or None")
-            self.val_map_ops.append(val_map_op)
+        if val_op is not None:
+            if not (callable(val_op.map) and callable(val_op.reduce)):
+                raise TypeError("Expected val_op to be ValMapReudceOp")
+            self.val_ops.append(val_op)
 
     def get_physical_tensor(self):
         """Get physical tensor if materialized
@@ -132,6 +130,7 @@ class Segment:
         self.materialized = True
 
     def __repr__(self):
-        msg = 'Segment(Indices: {} | Materialized: {})'.format(self.indices, self.materialized)
-        return msg
+        return 'Segment(Indices: {} | Materialized: {})'.format(
+            self.indices, self.materialized
+        )
     

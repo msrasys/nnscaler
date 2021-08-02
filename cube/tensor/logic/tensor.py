@@ -40,12 +40,12 @@ class LogicalTensor:
         for segment, physical_tensor, ranks in zip(self.segments, physical_tensors, ranks):
             segment.set_physical_tensor(physical_tensor, ranks)
     
-    def select(self, indices, val_map_op, shape):
+    def select(self, indices, val_op, shape):
         """
         Create a Segment given the indices for this logical tensor,
         and the Segment will use shape. 
         """
-        segment = Segment(self, indices, val_map_op, shape)
+        segment = Segment(self, indices, val_op, shape)
         return segment
 
     def transform(self, segments, ranks=None):

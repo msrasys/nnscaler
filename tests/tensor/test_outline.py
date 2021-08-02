@@ -1,6 +1,7 @@
 from cube.tensor.logic.tensor import LogicalTensor
 import cube.tensor.logic.outline as outline
 from cube.tensor.segment import Segment
+from cube.operator.physic.comm.mapreduce import PartialSum
 
 import torch
 import z3
@@ -86,10 +87,9 @@ def test_split_axis_with_constraints():
 def test_split_value():
 
     shape = [1024, 32]
-    split_op = lambda tensor, rank, world_size : tensor / world_size
     solver = z3.Solver()
 
-    split_dsp = outline.SplitValue(solver, shape, None, split_op)
+    split_dsp = outline.SplitValue(solver, shape, None, PartialSum)
     split_dsp.solver.add(split_dsp.chunk_num <= 4)
     configs = list()
     for config in iter_each_config(solver, split_dsp.get_attributes()):

@@ -83,7 +83,7 @@ def test_logical_tensor_transform():
     segment = tensor.select(indices, None, shape=(2,2))
 
     ranks = [0,1,3]
-    tensor.transform([segment], [ranks], [None])
+    tensor.transform([segment], [ranks])
 
     myrank = DeviceGroup().rank
     if myrank in ranks:
