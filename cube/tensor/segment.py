@@ -130,3 +130,8 @@ class Segment:
         self.physical_tensor = physical_tensor
         self.group = DeviceGroup().get_group(ranks)
         self.materialized = True
+
+    def __repr__(self):
+        msg = 'Segment(Indices: {} | Materialized: {})'.format(self.indices, self.materialized)
+        return msg
+    

@@ -47,16 +47,14 @@ class LogicalTensor:
         segment = Segment(self, indices, val_map_op, shape)
         return segment
 
-    def transform(self, segments, ranks=None, val_map_ops=None):
+    def transform(self, segments, ranks=None):
         """
-        Transform the LogicalTensor with community list.
+        Transform the LogicalTensor with segment list.
         TODO: check if this should create a new logical tensor
         """
         if not (isinstance(ranks, list) and len(ranks) == len(segments)):
             raise ValueError("Expected ranks to be a list with equal length of segments")
-        if not (isinstance(ranks, list) and len(val_map_ops) == len(segments)):
-            raise ValueError("Expected ranks to be a list with equal length of segments")
-        
+    
         if len(self.segments) == 0:
             for sid in range(len(segments)):
                 segment = segments[sid]
@@ -65,7 +63,6 @@ class LogicalTensor:
                     deploy_ranks = ranks[sid]
                     if not isinstance(deploy_ranks, list):
                         raise TypeError('Expected ranks to be list[list[int],]')
-                    deploy_ops = val_map_ops[sid]
                     segment.deploy(deploy_ranks)
         #TODO: segment transformation on existing segments
         else:
