@@ -9,15 +9,14 @@ happen in the front of the next executed op in case the layout doesn't match.
 """
 
 from cube.tensor.logic.tensor import LogicalTensor
-from cube.tensor.community import Community
+from cube.tensor.logic.outline import BaseOutline
+
+import z3
 
 
 class GenericHolisticOp:
 
-    def __init__(self, 
-                input_layout, output_layout,
-                input_format=None, output_format=None
-        ):
+    def __init__(self, shapes):
         """
         Layout is the community distribution requirement for input and
         output logical tensors.
@@ -37,33 +36,58 @@ class GenericHolisticOp:
             output_format (list[list[int], None]):
                 output dim order compare with logical definition
         """
+        self.solver = z3.Solver()
+        self.shapes = shapes
 
-        # holistic layout (outliner) of input
-        if not isinstance(input_layout, list):
-            raise TypeError("Require input layout for HolistOp is a list")
-        if not isinstance(input_format, list):
-            raise TypeError("Require input format for HolistOp is a list")
-        if not isinstance(output_layout, list):
-            raise TypeError("Require output layout for HolistOp is a list")
-        if not isinstance(output_format, list):
-            raise TypeError("Require output format for HolistOp is a list")
-
-        self.input_layout = input_layout
-        self.input_format = input_format
-
-        # holistic layout of output
-        self.output_layout = output_layout
-        self.output_format = output_format
+        self.input_layouts = list()
+        self.output_layouts = list()
 
         self.logical_op = None
+        self.output_shapes = list()
+
+        self.attributes = list()
         self.policy_fn = None
+        self.config = None
+    
+    def set_input_layouts(self, layouts):
+        """
+        Set input layout
+
+        Args:
+            layouts (list[BaseOutline]): layout list for input logical tensor
+        """
+        for layout in layouts:
+            if not isinstance(layout, BaseOutline):
+                TypeError("Require input layout for HolistOp is a list[BaseOutline]")
+            self.attributes += layout.get_attributes()
+            self.input_layouts.append(layout)
+    
+    def set_output_layouts(self, layouts):
+        """
+        Set output layout
+
+        Args:
+            layouts (list[BaseOutline]): layout list for output logical tensor
+        """
+        for layout in layouts:
+            if not isinstance(layout, BaseOutline):
+                TypeError("Require input layout for HolistOp is a list[BaseOutline]")
+            self.attributes += layout.get_attributes()
+            self.output_layouts.append(layout)
     
     def set_logic_op(self, logic_op):
         """
         Set logic op. This will be automatically called when the
         holistic op registered in a logical op.
         """
+        # if not isinstance(logic_op, GenericLogicalOp):
+        #     raise TypeError("Require a logic op to register")
         self.logical_op = logic_op
+
+    def set_config(self, config):
+        if not isinstance(config, z3.z3.ModelRef):
+            raise TypeError("Expected config from z3 solver.model()")
+        self.config = config
     
     def input_adapter(self, *args, **kwargs):
         """
@@ -74,43 +98,38 @@ class GenericHolisticOp:
         #TODO: kwargs
 
         input_num = len(args)
-        if len(self.input_layout) != input_num:
+        if len(self.input_layouts) != input_num:
             raise RuntimeError("Fail to adapt input: layout length not equal")
-        if len(self.input_format) != input_num:
-            raise RuntimeError("Fail to adapt input: format length not equal")
+        # if len(self.input_format) != input_num:
+        #     raise RuntimeError("Fail to adapt input: format length not equal")
         
         # step 1: data reformat based on the input argument
-        for input, dim_order in zip(args, self.input_format):
-            if dim_order is not None:
-                input.permute(dim_order)
+        # for input, dim_order in zip(args, self.input_format):
+        #     if dim_order is not None:
+        #         input.permute(dim_order)
 
-        # step 2: get communities based on expert description
-        input_communities = list()
-        for tensor, outliner in zip(args, self.input_layout):
+        # step 2: Policy: segmentation + deploy decision
+        if self.policy_fn is None:
+            raise RuntimeError("Expected a runtime configuration policy")
+        config, input_ranks = self.policy_fn[0](self)
+        self.set_config(config)
+
+        # step 3: segmentation
+        input_segments = list()
+        for tensor, outliner in zip(args, self.input_layouts):
             if outliner is not None and isinstance(tensor, LogicalTensor):
-                segments = outliner(tensor.shape)
-                communities = [Community(seg) for seg in segments]
-                input_communities.append(communities)
+                segments = outliner.interpret(tensor, self.config)
+                input_segments.append(segments)
             else:
-                input_communities.append(None)
+                input_segments.append(None)
 
-        # step 3: physical tensor placement (policy)
-        if self.policy_fn is not None:
-            input_ranks, input_val_map_fns = \
-                self.policy_fn[0](input_communities, *args)
-        else:
-            # TODO: default policy
-            input_ranks = [None] * len(args)
-            input_val_map_fns = [None] * len(args)
-
-        # step 4: community matching
+        # step 4: deploy
         for tid in range(len(args)):
             tensor = args[tid]
             if isinstance(tensor, LogicalTensor):
-                communities = input_communities[tid]
+                segments = input_segments[tid]
                 ranks = input_ranks[tid]
-                val_map_fn = input_val_map_fns[tid]
-                tensor.match(communities, ranks, val_map_fn)
+                tensor.transform(segments, ranks)
 
     def forward(self, *args, **kwargs):
         """
@@ -131,9 +150,9 @@ class GenericHolisticOp:
         Data reformat to logical op format
 
         Args:
-            outputs (tuple(list[physical_tensor],))
-                each `list[physical_tensor]` represents a output of the op
-                with is communities
+            outputs (tuple(list[OpResult],))
+                each `list[OpResult]` represents a output of the op
+                with its segments
         Returns:
             logical outputs (tuple(LogicalTensor,)):
                 the logical tensor list
@@ -141,22 +160,24 @@ class GenericHolisticOp:
         #TODO: fix: data re-format order. Should be ahead of logical tensor construction
         if not isinstance(outputs, tuple):
             outputs = (outputs,)
+
         # step 1: construct to logical tensor
-        logical_outputs = list()
-        for output, outliner, shape in zip(outputs, self.output_layout, self.logical_shapes):
-            segments = outliner(shape)
-            communities = [Community(segment) for segment in segments]
-            for community, op_res in zip(communities, output):
-                #if DeviceGroup().rank == 0:
-                #    print(op_res.res.size(), community.segment.shape)
-                community.set_physical_tensor(op_res.res, op_res.placement)
-            output = LogicalTensor.construct(shape, communities)
-            logical_outputs.append(output)
+        for output, outliner in zip(outputs, self.output_layouts):
+            logical_tensor = LogicalTensor(outliner.shape, init_data=False)
+            segments = outliner.interpret(shape, self.config)
+            for segment in segments:
+                logical_tensor.add_segment(segment)
+            logical_tensor.fill(
+                physical_tensors=[op_res.res for op_res in output],
+                ranks=[op_res.placement for op_res in output]
+            )
+            logical_outputs.append(logical_tensor)
+
         # step 2: data reformat based on the output
-        for out_id in range(len(self.output_format)):
-            dim_order = self.output_format[out_id]
-            if dim_order is not None and isinstance(logical_outputs[out_id], LogicalTensor):
-                logical_ouputs[out_id] = logical_ouputs[out_id].permute(dim_order)
+        # for out_id in range(len(self.output_format)):
+        #     dim_order = self.output_format[out_id]
+        #     if dim_order is not None and isinstance(logical_outputs[out_id], LogicalTensor):
+        #         logical_ouputs[out_id] = logical_ouputs[out_id].permute(dim_order)
     
         if len(logical_outputs) == 1:
             return logical_outputs[0]
@@ -172,16 +193,13 @@ class GenericHolisticOp:
         outputs = self.forward(*args, **kwargs)
 
         # wrap to logical tensor
-        if self.logical_op is None:
-            raise RuntimeError("This holistic op doesn't have logical op")
-        self.logical_shapes = self.logical_op.shape_infer(*args, **kwargs)
         outputs = self.output_adapter(outputs)
 
         return outputs
 
-    def set_deploy_policy(self, policy_fn):
+    def set_policy(self, policy_fn):
         """
-        Register a policy to take inputs (logical tensors) and segments,
+        Register a policy to take layouts and solver,
         generate device placement for each community, and corresponding
         message mapping
 
@@ -191,10 +209,4 @@ class GenericHolisticOp:
         if not callable(policy_fn):
             raise TypeError("Expected callable function")
         self.policy_fn = (policy_fn,)
-    
-    def set_segmentation_policy(self, policy_fn):
-        for outliner in self.input_layout:
-            outliner.set_policy(policy_fn)
-        for outliner in self.output_layout:
-            outliner.set_policy(policy_fn)
 

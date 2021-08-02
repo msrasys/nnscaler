@@ -11,83 +11,104 @@ python -m torch.distributed.launch \
     tests/operator/test_holistic_op.py
 """
 
-import cube.tensor.logic.segment as sg
+import cube.tensor.logic.outline as outline
 from cube.tensor.logic.tensor import LogicalTensor
 from cube.operator.holist.generics import GenericHolisticOp
 from cube.device.physic.group import DeviceGroup
 import torch
+import z3
 
 def test_generic_holistic_op_init():
 
+    shapes = [(32, 2048), (1024, 2048), (32, 1024)]
+    op = GenericHolisticOp(shapes)
+
     # description
-    input_layout = sg.SplitAxis(
-        axis=0, overlap=0, reduction=sg.ReductionOp.Replica
+    input_layout = outline.Full(
+        op.solver, op.shapes[0],
     )
-    weight_layout = sg.Full(reduction=sg.ReductionOp.Replica)
-    output_layout = sg.SplitAxis(
-        axis=0, overlap=0, chunk_num=input_layout.chunk_num,
-        reduction=sg.ReductionOp.Replica
+    weight_layout = outline.SplitAxis(
+        op.solver, op.shapes[1],
+        axis=0, chunk_num=None, overlap=0,
     )
-
-    op = GenericHolisticOp(
-        input_layout=[input_layout, weight_layout],
-        output_layout=[output_layout],
-        input_format=[None, None],
-        output_format=[None],
+    output_layout = outline.SplitAxis(
+        op.solver, op.shapes[2],
+        axis=0, chunk_num=weight_layout.chunk_num, overlap=0,
     )
 
-    assert len(op.input_layout) == 2
-    assert len(op.input_format) == 2
-    assert len(op.output_layout) == 1
-    assert len(op.output_format) == 1
+    assert op.shapes == shapes
+    assert len(op.input_layouts) == 0
+    assert len(op.output_layouts) == 0
     assert op.logical_op is None
     assert op.policy_fn is None
+
+    op.set_input_layouts([input_layout, weight_layout])
+    op.set_output_layouts([output_layout])
+
+    assert len(op.input_layouts) == 2
+    assert len(op.output_layouts) == 1
+    assert len(op.attributes) == 5
 
 
 def test_generic_holistic_op_input_adapter():
 
-    input_layout = sg.SplitAxis(
-        axis=0, overlap=0, reduction=sg.ReductionOp.Replica
+    shapes = [(32, 512), (1024, 512), (32, 1024)]
+    input = LogicalTensor(shape=shapes[0])
+    weight = LogicalTensor(shape=shapes[1])
+
+    op = GenericHolisticOp(shapes)
+
+    # description
+    input_layout = outline.Full(
+        op.solver, op.shapes[0],
     )
-    weight_layout = sg.Full(reduction=sg.ReductionOp.Replica)
-    output_layout = sg.SplitAxis(
-        axis=0, overlap=0, chunk_num=input_layout.chunk_num,
-        reduction=sg.ReductionOp.Replica
+    weight_layout = outline.SplitAxis(
+        op.solver, op.shapes[1],
+        axis=0, chunk_num=None, overlap=0,
+    )
+    output_layout = outline.SplitAxis(
+        op.solver, op.shapes[2],
+        axis=0, chunk_num=weight_layout.chunk_num, overlap=0,
     )
 
-    op = GenericHolisticOp(
-        input_layout=[input_layout, weight_layout],
-        output_layout=[output_layout],
-        input_format=[None, None],
-        output_format=[None],
-    )
+    op.set_input_layouts([input_layout, weight_layout])
+    op.set_output_layouts([output_layout])
 
-    input = LogicalTensor(shape=(1024, 1024))
-    weight = LogicalTensor(shape=(1024, 1024))
+    def policy(holist_op):
+        solver = holist_op.solver
+        attributes = holist_op.attributes
+        input_layout = holist_op.input_layouts[0]
+        weight_layout = holist_op.input_layouts[1]
+        output_layout = holist_op.output_layouts[0]
 
-    ## Policy Here
-    input_layout.chunk_num = 4
-    assert output_layout.chunk_num.get() == 4
-    def policy_fn(input_communities, input, weight):
-        input_ranks = [
-            [[0],[1],[2],[3]],
-            [[0,1,2,3]]
-        ]
-        input_val_map_fns = list([None, None])
-        return input_ranks, input_val_map_fns
+        # add restrictions based on device num
+        device_num = torch.cuda.device_count()
+        solver.add(weight_layout.chunk_num <= 4)
+        
+        # iterate all configs
+        configs = list()
+        while solver.check() == z3.sat:
+            config = solver.model()
+            configs.append(config)
+            solver.add(
+                z3.Or([z3.Not(attr == config[attr]) for attr in attributes])
+            )
+            if len(attributes) == 0:
+                break
+        # choose one config -- suppose to the first
+        config = configs[0]
 
-    op.register_policy(policy_fn)
+        # deploy decisions
+        chunk_num = config[weight_layout.chunk_num].as_long()
+        input_ranks = [list(range(0, chunk_num)),]
+        weight_ranks = list()
+        for rank in range(chunk_num):
+            weight_ranks.append([rank])
+
+        return config, [input_ranks, weight_ranks]
+
+    op.set_policy(policy)
     op.input_adapter(input, weight)
-
-    myrank = DeviceGroup().rank
-    assert len(input.communities) == 4
-    assert len(weight.communities) == 1
-    physical_tensor = input.get_physical_tensor(input.segments[myrank])
-    piece = 1024 // 4
-    start = int(myrank * piece)
-    assert torch.allclose(physical_tensor, input.data.cuda()[start:start+piece, :]) is True
-    physical_tensor = weight.get_physical_tensor(weight.segments[0])
-    assert torch.allclose(physical_tensor, weight.data.cuda()) is True
 
 
 if __name__ == '__main__':

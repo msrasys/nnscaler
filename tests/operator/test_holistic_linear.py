@@ -71,10 +71,13 @@ def test_holistic_linear_op_column_weight():
     weight = LogicalTensor(shape=(N,1024))
     bias = LogicalTensor(shape=(N,))
 
+    # output = LogicalLinear(input, weight, bias)
+
+    # ================================ Policy ===========================
+
     holistic_op = LinearColumnWeight()
     holistic_op.logical_op = LogicalLinear()
 
-    # ================================ Policy ===========================
     def policy_for_how_many_tiles(outliner):
         if isinstance(outliner, sg.outline.Full):
             pass
@@ -83,15 +86,19 @@ def test_holistic_linear_op_column_weight():
                 outliner.chunk_num = 4
         else:
             raise TypeError("Unhandled outliner type")
+    # -> together
 
     def policy_for_each_tile_placement(community, input, weight, bias):
+        # generate results (hard code) [helper function]
         input_ranks = [
-            [[0,1,2,3]],
+            [[0,1,2,3]], [DeviceGroup().all_ranks()]
             [[0],[1],[2],[3]],
             [[0],[1],[2],[3]]
         ]
         input_val_map_fns = list([None, None, None])
         return input_ranks, input_val_map_fns
+    
+    # Missing Policy: where physical op executed?
 
     holistic_op.set_deploy_policy(
         policy_for_each_tile_placement
