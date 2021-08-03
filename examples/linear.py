@@ -41,30 +41,23 @@ def segment_policy(holist_op, input, weight, bias):
     """
     solver = holist_op.solver
     attributes = holist_op.attributes
-    input_layout = holist_op.input_layouts[0]
     weight_layout = holist_op.input_layouts[1]
-    bias_layout = holist_op.input_layouts[2]
-    output_layout = holist_op.output_layouts[0]
 
     # add restrictions based on device num
     holist_op.add_constraint(weight_layout.chunk_num == 4)
     
     # iterate all configs
     configs = list()
-    while solver.check() == z3.sat:
-        config = solver.model()
+    for config in cube.config.choices(solver, attributes):
         if DeviceGroup().rank == 0:
-            print('find config: {}'.format(config))
+            print('find config: \n', config)
         configs.append(config)
-        solver.add(
-            z3.Or([z3.Not(attr == config[attr]) for attr in attributes])
-        )
-        if len(attributes) == 0:
-            break
-    # choose one config -- suppose to the first
+
+    # choose one config -- policy decision
     config = configs[0]
     if DeviceGroup().rank == 0:
         print('selected config: {}'.format(config))
+
     # deploy decisions
     chunk_num = config[weight_layout.chunk_num].as_long()
     input_ranks = [list(range(0, chunk_num)),]
