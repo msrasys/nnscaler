@@ -57,7 +57,7 @@ class BaseOutline:
                     raise TypeError("{} only supports list[int] choices".format(key))
                 self.__dict__[key] = z3.Int(key)
                 self.attributes.append(self.__dict__[key])
-                self.solver.add(z3.Or([self.__dict__[key] == val for val in val]))
+                self.solver.add(z3.Or([self.__dict__[key] == v for v in val]))
             elif isinstance(val, int):
                 self.__dict__[key] = z3.Int(str(id(self))+key)
                 self.attributes.append(self.__dict__[key])
@@ -75,6 +75,14 @@ class BaseOutline:
             else:
                 raise TypeError("{} can only be int, list[int], z3.Int()".format(key))
     
+    def add_constraint(self, constraint):
+        """
+        Add a constraint
+        """
+        if not isinstance(constraint, z3.z3.BoolRef):
+            raise TypeError("Expected z3.z3.BoolRef constraints")
+        self.solver.add(constraint)
+
     def remove_config(self, config):
         if not isinstance(config, z3.z3.ModelRef):
             raise TypeError("Expected config from z3 model()")
@@ -123,17 +131,19 @@ class SplitAxis(BaseOutline):
         self.axis = axis
         
         self.add_field(overlap=overlap)
-        self.solver.add(self.overlap >= 0)
+        self.add_constraint(self.overlap >= 0)
 
         self.add_field(chunk_num=chunk_num)
-        self.solver.add(self.chunk_num >= 0)
+        self.add_constraint(self.chunk_num >= 0)
 
         # TODO: change to array to adapt with non-uniform cases
         self.add_field(chunk_size=None)
         
         # setup constraints
         total_size = self.shape[self.axis]
-        self.solver.add(self.chunk_num * self.chunk_size - self.overlap * (self.chunk_num - 1) == total_size)
+        self.add_constraint(
+            self.chunk_num * self.chunk_size - self.overlap * (self.chunk_num - 1) == total_size
+        )
 
     def interpret(self, logical_tensor, config):
         """
@@ -176,7 +186,7 @@ class SplitValue(BaseOutline):
         """
         super().__init__(solver, shape)
         self.add_field(chunk_num=chunk_num)
-        self.solver.add(self.chunk_num >= 1)
+        self.add_constraint(self.chunk_num >= 1)
         self.val_op = val_op
 
     def interpret(self, logical_tensor, config):
