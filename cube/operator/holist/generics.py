@@ -18,6 +18,8 @@ import z3
 
 class GenericHolisticOp:
 
+    _default_policy_fn = None
+
     def __init__(self, shapes):
         """
         Layout is the community distribution requirement for input and
@@ -77,14 +79,14 @@ class GenericHolisticOp:
             self.attributes += layout.get_attributes()
             self.output_layouts.append(layout)
     
-    def set_logic_op(self, logic_op):
+    def add_constraint(self, constraint):
         """
-        Set logic op. This will be automatically called when the
-        holistic op registered in a logical op.
+        Add cross-layout constraint to the solver
         """
-        # if not isinstance(logic_op, GenericLogicalOp):
-        #     raise TypeError("Require a logic op to register")
-        self.logical_op = logic_op
+        if not isinstance(constraint, z3.z3.BoolRef):
+            raise TypeError("Expected z3.z3.BoolRef constraints")
+        self.solver.add(constraint)
+        
 
     def set_config(self, config):
         if not isinstance(config, z3.z3.ModelRef):
@@ -111,9 +113,10 @@ class GenericHolisticOp:
         #         input.permute(dim_order)
 
         # step 2: Policy: segmentation + deploy decision
-        if self.policy_fn is None:
-            raise RuntimeError("Expected a runtime configuration policy")
-        config, input_ranks = self.policy_fn[0](self)
+        policy_fn = self._default_policy_fn
+        if self.policy_fn is not None:
+            policy_fn = self.policy_fn
+        config, input_ranks = policy_fn[0](self)
         self.set_config(config)
 
         # step 3: segmentation
@@ -203,9 +206,8 @@ class GenericHolisticOp:
 
     def set_policy(self, policy_fn):
         """
-        Register a policy to take layouts and solver,
-        generate device placement for each community, and corresponding
-        message mapping
+        Register a customized policy to take layouts and solver,
+        generate segmentation plan and deploy plan
 
         Args:
             plicy_fn (callable)
@@ -214,3 +216,15 @@ class GenericHolisticOp:
             raise TypeError("Expected callable function")
         self.policy_fn = (policy_fn,)
 
+    @classmethod
+    def set_default_policy(cls, policy_fn):
+        """
+        Register a policy for all instances. Take layouts and solver,
+        generate segmentation plan and deploy plan
+
+        Args:
+            plicy_fn (callable)
+        """
+        if not callable(policy_fn):
+            raise TypeError("Expected callable function")
+        cls._default_policy_fn = (policy_fn,)

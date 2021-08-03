@@ -36,13 +36,16 @@ class LinearColumnWeight(GenericHolisticOp):
         )
         bias_layout = outline.SplitAxis(
             self.solver, self.shapes[2],
-            axis=0, chunk_num=weight_layout.chunk_num, overlap=0
+            axis=0, chunk_num=None, overlap=0
         )
+        self.add_constraint(bias_layout.chunk_num == weight_layout.chunk_num)
+
         # output layouts
         output_layout = outline.SplitAxis(
             self.solver, self.shapes[3],
-            axis=1, chunk_num=weight_layout.chunk_num, overlap=0
+            axis=1, chunk_num=None, overlap=0
         )
+        self.add_constraint(output_layout.chunk_num == weight_layout.chunk_num)
 
         self.set_input_layouts([input_layout, weight_layout, bias_layout])
         self.set_output_layouts([output_layout])
@@ -96,21 +99,24 @@ class LinearColumnInputRowWeight(GenericHolisticOp):
 
         weight_layout = outline.SplitAxis(
             self.solver, self.shapes[1],
-            axis=1, chunk_num=input_layout.chunk_num, overlap=0,
+            axis=1, chunk_num=None, overlap=0,
         )
+        self.add_constraint(weight_layout.chunk_num == input_layout.chunk_num)
 
         bias_layout = outline.SplitValue(
             self.solver, self.shapes[2],
-            chunk_num=input_layout.chunk_num,
+            chunk_num=None,
             val_op=PartialSum
         )
+        self.add_constraint(bias_layout.chunk_num == input_layout.chunk_num)
 
         # output layout will only use reduce op
         output_layout = outline.SplitValue(
             self.solver, self.shapes[3],
-            chunk_num=input_layout.chunk_num,
+            chunk_num=None,
             val_op=PartialSum
         )
+        self.add_constraint(output_layout.chunk_num == input_layout.chunk_num)
 
         self.set_input_layouts([input_layout, weight_layout, bias_layout])
         self.set_output_layouts([output_layout])

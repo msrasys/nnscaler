@@ -1,5 +1,4 @@
 """
-
 A Logical Operator: 
     * Statusless
     * Can be executed by only one kernel (atomic) on single device
@@ -11,8 +10,10 @@ Logical Operator
     |- ...
 
 Holistic operators are allowed to nested in hybrid-distribution strategy
-
 """
+
+from cube.tensor.logic.tensor import LogicalTensor
+
 
 class HolisticOpFactory:
 
@@ -46,23 +47,13 @@ class HolisticOpFactory:
 
 class GenericLogicalOp:
 
+    _default_policy_fn = None
+
     def __init__(self):
 
         # candidate holistic operator
         self.factory = HolisticOpFactory()
         self.policy_fn = None
-
-    def set_policy(self, policy_fn):
-        """
-        Register a policy function to customize how composite
-        holistic op generated during runtime.
-
-        The `policy_fn` takes self.factory as input and returns a composite
-        holistic operator (callable)
-        """
-        if not callable(policy_fn):
-            raise TypeError("Expected a callable function")
-        self.policy_fn = [policy_fn]
     
     def shape_infer(self, *args, **kwargs):
         """
@@ -80,19 +71,20 @@ class GenericLogicalOp:
         # get shapes of input and output
         shapes = list()
         for arg in args:
-            if isinstance(LogicalTensor, arg):
+            if isinstance(arg, LogicalTensor):
                 shapes.append(arg.shape)
             else:
                 shapes.append(None)
-        shapes.append(self.shape_infer(*args, **kwargs))
+        shapes += self.shape_infer(*args, **kwargs)
         return shapes
 
     def get_op(self, *args, **kwargs):
         # get shapes of input and output
-        shapes = self.get_shapes()
+        shapes = self.get_shapes(*args, **kwargs)
+        print(shapes)
         # use default policy
         if self.policy_fn is None:
-            composite_op = self.factory.get_op(0, shapes)
+            composite_op = self._default_policy_fn[0](self.factory, shapes)
         # use user-customized policy
         else:
             composite_op = self.policy_fn[0](self.factory, shapes)
@@ -106,3 +98,28 @@ class GenericLogicalOp:
         # run operator with the strategy plan
         outputs = composite_op(*args, **kwargs)
         return outputs
+
+    def set_policy(self, policy_fn):
+        """
+        Register a policy function to customize how composite
+        holistic op generated during runtime.
+
+        The `policy_fn` takes self.factory as input and returns a composite
+        holistic operator (callable)
+        """
+        if not callable(policy_fn):
+            raise TypeError("Expected a callable function")
+        self.policy_fn = (policy_fn,)
+    
+    @classmethod
+    def set_default_policy(self, policy_fn):
+        """
+        Register a default policy function to all instances.
+        Customize how composite holistic op generated during runtime.
+
+        The `policy_fn` takes self.factory and shapes as input,
+        and returns a composite holistic operator (callable)
+        """
+        if not callable(policy_fn):
+            raise TypeError("Expected a callable function")
+        self._default_policy_fn = (policy_fn,)

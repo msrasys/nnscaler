@@ -9,88 +9,92 @@ python -m torch.distributed.launch \
     examples/linear.py
 """
 
+import cube
+from cube.tensor.logic.tensor import LogicalTensor
+from cube.device.physic.group import DeviceGroup
+
 import torch
 from torch import nn
-from torch import Tensor
-from torch.nn.parameter import Parameter
-import torch.nn.functional as F
-
-import combo
-import combo.physical.operator as combo_op
-
-import math
 import argparse
 
+import z3
 
-class Linear(nn.Module):
-
-    __constants__ = ['in_features', 'out_features']
-    in_features: int
-    out_features: int
-    weight: Tensor
-
-    def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 device=None, dtype=None) -> None:
-        factory_kwargs = {'device': device, 'dtype': dtype}
-        super(Linear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = Parameter(torch.empty((out_features, in_features), **factory_kwargs))
-        if bias:
-            self.bias = Parameter(torch.empty(out_features, **factory_kwargs))
-        else:
-            self.register_parameter('bias', None)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias, -bound, bound)
-
-    def forward(self, input: Tensor) -> Tensor:
-        return combo_op.linear_op(input, self.weight, self.bias)
+torch.manual_seed(100)
 
 
-class FeedForward(nn.Module):
-    def __init__(self, dim, dropout=0., mult=16, classes=1000):
-        super().__init__()
-        self.net = nn.Sequential(
-            Linear(dim, dim * mult),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            Linear(dim * mult, dim)
+# Expert Policy
+
+def select_policy(holistic_ops, shapes):
+    return holistic_ops.get_op(0, shapes)
+
+
+def segment_policy(holist_op):
+    solver = holist_op.solver
+    attributes = holist_op.attributes
+    input_layout = holist_op.input_layouts[0]
+    weight_layout = holist_op.input_layouts[1]
+    bias_layout = holist_op.input_layouts[2]
+    output_layout = holist_op.output_layouts[0]
+    # add restrictions based on device num
+    device_num = torch.cuda.device_count()
+    solver.add(weight_layout.chunk_num == 4)
+    
+    # iterate all configs
+    configs = list()
+    while solver.check() == z3.sat:
+        config = solver.model()
+        if DeviceGroup().rank == 0:
+            print('find config: {}'.format(config))
+        configs.append(config)
+        solver.add(
+            z3.Or([z3.Not(attr == config[attr]) for attr in attributes])
         )
+        if len(attributes) == 0:
+            break
+    # choose one config -- suppose to the first
+    config = configs[0]
+    if DeviceGroup().rank == 0:
+        print('selected config: {}'.format(config))
+    # deploy decisions
+    chunk_num = config[weight_layout.chunk_num].as_long()
+    input_ranks = [list(range(0, chunk_num)),]
+    weight_ranks = list()
+    for rank in range(chunk_num):
+        weight_ranks.append([rank])
+    bias_ranks = weight_ranks
+    return config, [input_ranks, weight_ranks, bias_ranks]
 
-        self.classifier = Linear(dim, classes)
 
-    def forward(self, x, labels):
+cube.operator.logic.linear.Linear.set_default_policy(select_policy)
+cube.operator.holist.linear.LinearColumnWeight.set_default_policy(segment_policy)
+
+
+
+# User Network
+class SingleLinear(nn.Module):
+
+    def __init__(self, dim, mult):
+        super().__init__()
+        self.net = cube.nn.Linear(dim, dim * mult)
+    
+    def forward(self, x):
         output = self.net(x)
-        output = self.classifier(output)
-        loss = F.cross_entropy(output, labels)
-        return loss
+        return output
 
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dim', type=int, default=1024)
-    parser.add_argument('--heads', type=int, default=16)
-    parser.add_argument('--bs', type=int, default=8)
-    parser.add_argument('--classes', type=int, default=10)
+    parser.add_argument('--bs', type=int, default=32)
+    parser.add_argument('--dim', type=int, default=128)
+    parser.add_argument('--mult', type=int, default=16)
     args = parser.parse_args()
 
     # init distributed env
-    group = combo.physical.device.group.DeviceGroup()
-    print(group)
+    group = DeviceGroup()
 
-    model = FeedForward(args.dim, mult=args.heads, classes=args.classes)
-    model = model.cuda()
+    model = SingleLinear(args.dim, args.mult)
 
-    inputs = torch.rand((args.bs, args.dim)).cuda()
-    labels = torch.randint(0, 10, (args.bs, )).cuda()
-    for _ in range(100):
-        loss = model(inputs, labels)
-        loss.backward()
+    inputs = LogicalTensor((args.bs, args.dim))
+    output = model(inputs)
     print('Done.')
