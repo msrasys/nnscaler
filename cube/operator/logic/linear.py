@@ -18,4 +18,3 @@ class Linear(GenericLogicalOp):
         output_shape = list(input.shape)
         output_shape[-1] = weight.shape[0]
         return [output_shape,]
-

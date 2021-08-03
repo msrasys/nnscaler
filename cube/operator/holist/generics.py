@@ -20,28 +20,18 @@ class GenericHolisticOp:
 
     _default_policy_fn = None
 
-    def __init__(self, shapes):
+    def __init__(self, outputs, *args, **kwargs):
         """
         Layout is the community distribution requirement for input and
         output logical tensors.
 
-        Format is the dimension ordering based on the logical format,
-        `None` indicates the format is consistent with logical op,
-        otherwise should be a list of integers like torch.Tensor.permute()
-        on the logical required format.
-
         Args:
-            input_layout (list[Outliner, None]): outliner for each input
-                The length of outliner should be equal to the number of input
-            input_format (list[list[int], None]): 
-                input dim order compare with logical definition
-            output_layout (list[Outlinter, None]): outliner for each output
-                The length of outliner should be equal to the number of output
-            output_format (list[list[int], None]):
-                output dim order compare with logical definition
+            outputs (list[LogicalTensor]):
+                output logical tensor (empty data)
+            *args, **kwargs: input arguments
+
         """
         self.solver = z3.Solver()
-        self.shapes = shapes
 
         self.input_layouts = list()
         self.output_layouts = list()
@@ -86,7 +76,6 @@ class GenericHolisticOp:
         if not isinstance(constraint, z3.z3.BoolRef):
             raise TypeError("Expected z3.z3.BoolRef constraints")
         self.solver.add(constraint)
-        
 
     def set_config(self, config):
         if not isinstance(config, z3.z3.ModelRef):
@@ -100,23 +89,16 @@ class GenericHolisticOp:
         have tensors
         """
         #TODO: kwargs
-
-        input_num = len(args)
-        if len(self.input_layouts) != input_num:
+        if len(self.input_layouts) != len(args):
             raise RuntimeError("Fail to adapt input: layout length not equal")
-        # if len(self.input_format) != input_num:
-        #     raise RuntimeError("Fail to adapt input: format length not equal")
-        
-        # step 1: data reformat based on the input argument
-        # for input, dim_order in zip(args, self.input_format):
-        #     if dim_order is not None:
-        #         input.permute(dim_order)
+
+        # step1: TODO: format (dimension reorder support)
 
         # step 2: Policy: segmentation + deploy decision
         policy_fn = self._default_policy_fn
         if self.policy_fn is not None:
             policy_fn = self.policy_fn
-        config, input_ranks = policy_fn[0](self)
+        config, input_ranks = policy_fn[0](self, *args, **kwargs)
         self.set_config(config)
 
         # step 3: segmentation
@@ -179,12 +161,8 @@ class GenericHolisticOp:
             )
             logical_outputs.append(logical_tensor)
 
-        # step 2: data reformat based on the output
-        # for out_id in range(len(self.output_format)):
-        #     dim_order = self.output_format[out_id]
-        #     if dim_order is not None and isinstance(logical_outputs[out_id], LogicalTensor):
-        #         logical_ouputs[out_id] = logical_ouputs[out_id].permute(dim_order)
-    
+        # step 2: TODO: data reformat based on the output
+
         if len(logical_outputs) == 1:
             return logical_outputs[0]
         else:

@@ -57,12 +57,13 @@ def test_holistic_linear_op_column_weight():
     input = LogicalTensor(shape=shapes[0])
     weight = LogicalTensor(shape=shapes[1])
     bias = LogicalTensor(shape=shapes[2])
+    outputs = [LogicalTensor(shapes[3])]
 
     # ================================ Policy ===========================
 
-    holistic_op = LinearColumnWeight(shapes)
+    holistic_op = LinearColumnWeight(outputs, input, weight, bias)
 
-    def policy(holist_op):
+    def policy(holist_op, input, weight, bias):
         solver = holist_op.solver
         attributes = holist_op.attributes
         input_layout = holist_op.input_layouts[0]
@@ -133,12 +134,13 @@ def test_holistic_linear_op_column_input_row_weight():
     input = LogicalTensor(shape=shapes[0])
     weight = LogicalTensor(shape=shapes[1])
     bias = LogicalTensor(shape=shapes[2])
+    outputs = [LogicalTensor(shapes[3])]
 
     # ================================ Policy ===========================
 
-    holistic_op = LinearColumnInputRowWeight(shapes)
+    holistic_op = LinearColumnInputRowWeight(outputs, input, weight, bias)
 
-    def policy(holist_op):
+    def policy(holist_op, input, weight, bias):
         solver = holist_op.solver
         attributes = holist_op.attributes
         input_layout = holist_op.input_layouts[0]

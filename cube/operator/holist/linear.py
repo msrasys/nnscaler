@@ -10,11 +10,6 @@ import cube.tensor.logic.outline as outline
 from cube.device.physic.group import DeviceGroup
 import torch
 
-# expert space to declare all kinds of holistic operators
-
-
-__all__ = ['kHolistLinearSets']
-
 
 class LinearColumnWeight(GenericHolisticOp):
     """
@@ -22,27 +17,26 @@ class LinearColumnWeight(GenericHolisticOp):
     Split W and b on the last dimension
     """
 
-    def __init__(self, shapes):
+    def __init__(self, outputs, input, weight, bias):
 
-        super().__init__(shapes)
+        super().__init__(outputs, input, weight, bias)
 
         # input layouts
-        input_layout = outline.Full(
-            self.solver, self.shapes[0]
-        )
+        input_layout = outline.Full(self.solver, input)
+
         weight_layout = outline.SplitAxis(
-            self.solver, self.shapes[1],
+            self.solver, weight,
             axis=0, chunk_num=None, overlap=0
         )
         bias_layout = outline.SplitAxis(
-            self.solver, self.shapes[2],
+            self.solver, bias,
             axis=0, chunk_num=None, overlap=0
         )
         self.add_constraint(bias_layout.chunk_num == weight_layout.chunk_num)
 
         # output layouts
         output_layout = outline.SplitAxis(
-            self.solver, self.shapes[3],
+            self.solver, outputs[0],
             axis=1, chunk_num=None, overlap=0
         )
         self.add_constraint(output_layout.chunk_num == weight_layout.chunk_num)
@@ -82,29 +76,30 @@ class LinearColumnInputRowWeight(GenericHolisticOp):
     """
     Perform 
         Y = XW + b 
-            -> Y = [X1,X2] * [W1//W2] + b]
-            -> Y = X1W1 + X2W2 + b
+            -> Y = [X1,X2] * [W1//W2] + [b1 + b2]]
+            -> Y = X1W1 + X2W2 + b1 + b2
     Split X (inputs) in column major (last dim),
     Split W (weights) in row major (first dim)
+    Split b (bias) in value major
     """
 
-    def __init__(self, shapes):
+    def __init__(self, outputs, input, weight, bias):
 
-        super().__init__(shapes)
+        super().__init__(outputs, input, weight, bias)
 
         input_layout = outline.SplitAxis(
-            self.solver, self.shapes[0],
+            self.solver, input,
             axis=-1, chunk_num=None, overlap=0,
         )
 
         weight_layout = outline.SplitAxis(
-            self.solver, self.shapes[1],
+            self.solver, weight,
             axis=1, chunk_num=None, overlap=0,
         )
         self.add_constraint(weight_layout.chunk_num == input_layout.chunk_num)
 
         bias_layout = outline.SplitValue(
-            self.solver, self.shapes[2],
+            self.solver, bias,
             chunk_num=None,
             val_op=PartialSum
         )
@@ -112,7 +107,7 @@ class LinearColumnInputRowWeight(GenericHolisticOp):
 
         # output layout will only use reduce op
         output_layout = outline.SplitValue(
-            self.solver, self.shapes[3],
+            self.solver, outputs[0],
             chunk_num=None,
             val_op=PartialSum
         )

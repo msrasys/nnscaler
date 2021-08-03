@@ -6,8 +6,8 @@ The description includes two parts:
 
     1). restriction description on tensor segementation
 
-    2). Translation procedure in runtime to translate such a restriction
-        to the real segmentation on given logical tensor shape.
+    2). Translation procedure to translate such a restriction
+        to the real segmentation on given logical tensor.
 """
 
 from cube.tensor.segment import Segment
@@ -16,18 +16,17 @@ from cube.tensor.indices import TileIndices
 import z3
 
 
-# interface to setup restrictions on the segmentation
-
 class BaseOutline:
     """
     Basic class for declare outline
 
     To setup an attribute (requirement), use `inst_baseoutline.attribute_name = val`
     """
-    def __init__(self, solver, shape):
-        super().__init__()
+    def __init__(self, solver, tensor):
+        if not isinstance(solver, z3.z3.Solver):
+            raise TypeError("Expected solver to be an z3.z3.Solver")
         self.solver = solver
-        self.shape = shape
+        self.shape = tensor.shape
         self.attributes = list()
 
     def get_attributes(self):
@@ -88,28 +87,38 @@ class BaseOutline:
             raise TypeError("Expected config from z3 model()")
         self.solver.add(z3.Or([z3.Not(attr == config[attr]) for attr in self.attributes]))
 
-    def interpret(self, logical_tensor, config):
+    def interpret(self, tensor, config):
+        """
+        Interpret to a list of segment based on the logical tensor and config
+
+        Args:
+            tensor (LogicalTensor)
+            config (z3.z3.ModelRef)
+
+        Returns:
+            list[Segment]
+        """
         raise NotImplementedError
 
 
 class Full(BaseOutline):
 
-    def __init__(self, solver, shape):
-        super().__init__(solver, shape)
+    def __init__(self, solver, tensor):
+        super().__init__(solver, tensor)
 
-    def interpret(self, logical_tensor, config):
+    def interpret(self, tensor, config):
         if not isinstance(config, z3.z3.ModelRef):
             raise TypeError("Expected config from z3 model()")
         indices = TileIndices([0] * len(self.shape), self.shape)
-        segment = logical_tensor.select(indices, None, self.shape)
+        segment = tensor.select(indices, None, self.shape)
         return [segment]
 
 
 class SplitAxis(BaseOutline):
 
-    def __init__(self, solver, shape, axis, chunk_num, overlap):
+    def __init__(self, solver, tensor, axis, chunk_num, overlap):
         """
-        Split the logical tensor spatially in `axis` dimension
+        Split the logical tensor uniformly in `axis` dimension
 
         TODO: support split axis with non-uniform chunk size
 
@@ -119,15 +128,13 @@ class SplitAxis(BaseOutline):
             which axis to split
         chunk_num: options (iterable int) / None / int:
             how many segments to produce
-        uniform: Boolean
-            whether restrict to uniform split
         overlap: options (iterable int) / int:
             overlap size on the boundary
         """
         if not isinstance(axis, int):
             raise RuntimeError("Expected axis to be an integer")
+        super().__init__(solver, tensor)
 
-        super().__init__(solver, shape)
         self.axis = axis
         
         self.add_field(overlap=overlap)
@@ -145,18 +152,8 @@ class SplitAxis(BaseOutline):
             self.chunk_num * self.chunk_size - self.overlap * (self.chunk_num - 1) == total_size
         )
 
-    def interpret(self, logical_tensor, config):
-        """
-        Get segments from config
-
-        Args:
-            logical_tensor (LogicalTensor): 
-                the logical tensor
-            config:
-                Config searched by model output
-
-        """
-        if tuple(logical_tensor.shape) != tuple(self.shape):
+    def interpret(self, tensor, config):
+        if tuple(tensor.shape) != tuple(self.shape):
             raise RuntimeError("The logical tensor's shape doesn't match")
         if not isinstance(config, z3.z3.ModelRef):
             raise TypeError("Expected config from z3 model()")
@@ -168,7 +165,7 @@ class SplitAxis(BaseOutline):
         segments = list()
         for cid in range(chunk_num):
             indices = TileIndices(anchor, shape)
-            segment = logical_tensor.select(indices, None, shape)
+            segment = tensor.select(indices, None, shape)
             segments.append(segment)
             anchor[self.axis] += shape[self.axis]
         return segments
@@ -176,7 +173,7 @@ class SplitAxis(BaseOutline):
 
 class SplitValue(BaseOutline):
 
-    def __init__(self, solver, shape, chunk_num, val_op):
+    def __init__(self, solver, tensor, chunk_num, val_op):
         """
         Split the whole tensor in value dimension.
 
@@ -184,20 +181,19 @@ class SplitValue(BaseOutline):
 
         Each segment value will be modified by `val_op`.
         """
-        super().__init__(solver, shape)
+        super().__init__(solver, tensor)
         self.add_field(chunk_num=chunk_num)
         self.add_constraint(self.chunk_num >= 1)
         self.val_op = val_op
 
-    def interpret(self, logical_tensor, config):
-        if tuple(logical_tensor.shape) != tuple(self.shape):
+    def interpret(self, tensor, config):
+        if tuple(tensor.shape) != tuple(self.shape):
             raise RuntimeError("The logical tensor's shape doesn't match")
         chunk_num = config[self.chunk_num].as_long()
         segments = list()
         for cid in range(chunk_num):
-            # full tensor shape
             indices = TileIndices([0] * len(self.shape), self.shape)
-            segment = logical_tensor.select(indices, self.val_op, self.shape)
+            segment = tensor.select(indices, self.val_op, self.shape)
             segments.append(segment)
         for segment in segments:
             segment.val_op_segs.append(segments)

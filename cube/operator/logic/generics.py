@@ -33,16 +33,20 @@ class HolisticOpFactory:
         """
         self.holist_ops.append(holistic_op)
 
-    def get_op(self, idx, shapes):
+    def get_op(self, idx, *args, **kwargs):
         """
         Get holistic operator based on idx
 
         The holistic operator will be initialized with shapes
 
+        Args:
+            idx (int): index for the holist op factory
+            args, kwargs: (logical) tensor inputs
+
         Returns:
             HolisticOp instance
         """
-        return self.holist_ops[idx](shapes)
+        return self.holist_ops[idx](*args, **kwargs)
 
 
 class GenericLogicalOp:
