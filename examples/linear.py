@@ -10,11 +10,11 @@ python -m torch.distributed.launch \
 """
 
 import cube
+from cube import nn
 from cube.tensor.logic.tensor import LogicalTensor
 from cube.device.physic.group import DeviceGroup
 
 import torch
-from torch import nn
 import argparse
 
 import z3
