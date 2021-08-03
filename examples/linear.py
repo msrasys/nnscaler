@@ -24,20 +24,30 @@ torch.manual_seed(100)
 
 # Expert Policy
 
-def select_policy(holistic_ops, shapes):
-    return holistic_ops.get_op(0, shapes)
+def select_policy(holistic_ops, outputs, *args, **kwargs):
+    """
+    Args:
+        Candidates: holistic_ops
+        *args, **kwargs: op input
+    """
+    return holistic_ops.get_op(0, outputs, *args, **kwargs)
 
 
-def segment_policy(holist_op):
+def segment_policy(holist_op, input, weight, bias):
+    """
+    Args:
+        holistic_op (HolisticOp)
+        *args, **kwargs: op input
+    """
     solver = holist_op.solver
     attributes = holist_op.attributes
     input_layout = holist_op.input_layouts[0]
     weight_layout = holist_op.input_layouts[1]
     bias_layout = holist_op.input_layouts[2]
     output_layout = holist_op.output_layouts[0]
+
     # add restrictions based on device num
-    device_num = torch.cuda.device_count()
-    solver.add(weight_layout.chunk_num == 4)
+    holist_op.add_constraint(weight_layout.chunk_num == 4)
     
     # iterate all configs
     configs = list()
@@ -75,7 +85,7 @@ class SingleLinear(nn.Module):
 
     def __init__(self, dim, mult):
         super().__init__()
-        self.net = cube.nn.Linear(dim, dim * mult)
+        self.net = nn.Linear(dim, dim * mult)
     
     def forward(self, x):
         output = self.net(x)
@@ -91,10 +101,13 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # init distributed env
-    group = DeviceGroup()
+    rank = DeviceGroup().rank
 
     model = SingleLinear(args.dim, args.mult)
 
     inputs = LogicalTensor((args.bs, args.dim))
     output = model(inputs)
+
+    assert isinstance(output, LogicalTensor)
+    assert torch.is_tensor(output.get_physical_tensor(rank))
     print('Done.')
