@@ -199,6 +199,7 @@ def scheduling_1f1b(model, inputs, bs, feats, micro_bs):
         # backward
         input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad)
         # send backward gradients
+        print('[cooldown] rank {}: step-{}: sending backward...'.format(myrank, i))
         send(input_tensor_grad, myrank-1)
 
 
