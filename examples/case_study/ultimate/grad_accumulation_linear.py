@@ -16,17 +16,16 @@ if __name__ == '__main__':
     for input_data in inputs:
         tic += 1
         # forward
-        print('forward')
         out = torch._C._nn.linear(input_data, weight, bias)
         loss = torch.sum(out)
         # backward - calculate grad:
-        # note pytorch in default accumulates gradients
-        print('backward')
         loss.backward()
-        
+        # Note: during backward, PyTorch will do tensor.grad += computed_grad
+        #       if tensor had gradient, then do accumulation by default.
+
         # weight update
         if tic % update_interval == 0:
-            print('weight update')
+            # weight update
             weight.data += weight.grad
             weight.grad = None
             bias.data += bias.grad
