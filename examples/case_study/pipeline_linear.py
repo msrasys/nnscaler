@@ -1,5 +1,18 @@
+"""Example Usage
+
+python -m torch.distributed.launch \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    --node_rank=0 \
+    --master_addr=127.0.0.1 \
+    --master_port=62000 \
+    --use_env \
+    examples/case_study/pipeline_linear.py
+"""
+
 import torch
 from torch import nn
+import os
 
 
 class Linears(nn.Module):
@@ -26,7 +39,7 @@ class Linears(nn.Module):
         return out
 
 
-def is_last_stage():
+def is_first_stage():
     return torch.distributed.get_rank() == 0
 
 
@@ -48,11 +61,11 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad):
     """
     Calculate input tensor gradient
     """
-    if input_tensor is not None:
+    if input_tensor is not None and input_tensor.requires_grad:
         input_tensor.retain_grad()
     torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
     input_tensor_grad = None
-    if input_tensor is not None:
+    if input_tensor is not None and input_tensor.requires_grad:
         input_tensor_grad = input_tensor.grad
     return input_tensor_grad
 
@@ -75,9 +88,9 @@ def send(tensor, to_rank):
     torch.cuda.synchronize()
 
 
-def recv(shape, from_rank, inputs_first_stage):
+def recv(shape, from_rank, boundary_tensor):
     if from_rank < 0 or from_rank >= torch.distributed.get_world_size():
-        return None
+        return boundary_tensor
     tensor = torch.empty(
         shape, requires_grad=True, device=torch.cuda.current_device()
     )
@@ -90,17 +103,17 @@ def recv(shape, from_rank, inputs_first_stage):
     torch.cuda.synchronize()
     return tensor
 
-def send_and_recv(send_tensor, to_rank, recv_shape, from_rank, inputs_first_stage):
-    if to_rank > torch.distributed.get_world_size() or from_rank < 0:
-        return None
+def send_and_recv(send_tensor, recv_shape, rank, boundary_tensor):
+    if rank < 0 or rank >= torch.distributed.get_world_size():
+        return boundary_tensor
     recv_tensor = torch.empty(
         recv_shape, requires_grad=True, device=torch.cuda.current_device()
     )
     send_op = torch.distributed.P2POp(
-        torch.distributed.isend, send_tensor, to_rank
+        torch.distributed.isend, send_tensor, rank
     )
     recv_op = torch.distributed.P2POp(
-        torch.distributed.irecv, recv_tensor, from_rank
+        torch.distributed.irecv, recv_tensor, rank
     )
     reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
     for req in reqs:
@@ -117,7 +130,7 @@ def send_and_recv(send_tensor, to_rank, recv_shape, from_rank, inputs_first_stag
 def scheduling_1f1b(model, inputs, bs, feats, micro_bs):
     myrank = torch.distributed.get_rank()
 
-    num_microbatches = bs / micro_bs
+    num_microbatches = int(bs / micro_bs)
     num_warmup_microbatches = \
         (torch.distributed.get_world_size() - 
          torch.distributed.get_rank() - 1)
@@ -127,15 +140,19 @@ def scheduling_1f1b(model, inputs, bs, feats, micro_bs):
     output_tensors = list()
 
     if inputs is not None:
-        inputs = torch.chunk(input_tensor, chunks=num_microbatches, dim=0)
+        inputs = torch.chunk(inputs, chunks=num_microbatches, dim=0)
+    else:
+        inputs = [None] * num_microbatches
 
     # warmup forward pass
     for i in range(num_warmup_microbatches):
         # recv forward
-        input_tensor = recv(torch.Size([bs, feats]), myrank-1, inputs)
+        print('[warmup] rank {}: step-{}: recving forward...'.format(myrank, i))
+        input_tensor = recv(torch.Size([micro_bs, feats]), myrank-1, inputs[i])
         # forward
         output_tensor = forward_step(model, input_tensor)
         # send forward
+        print('[warmup] rank {}: step-{}: sending forward...'.format(myrank, i))
         send(output_tensor, myrank+1)
 
         input_tensors.append(input_tensor)
@@ -144,17 +161,19 @@ def scheduling_1f1b(model, inputs, bs, feats, micro_bs):
     # before running 1F1B, need to recieve first forward tensor
     if num_warmup_remaining > 0:
         # recv forward
-        input_tensor = recv(torch.Size([bs, feats]), myrank-1, inputs)
-        if input_tensor is None:
-            input_tensor = inputs[i+num_warmup_microbatches]
+        print('[1f1b] rank {}: step-{}: recving forward...'.format(myrank, 0))
+        input_tensor = recv(torch.Size([micro_bs, feats]), myrank-1, inputs[num_warmup_microbatches])
 
     # run 1F1B
     for i in range(num_warmup_remaining):
         # forward
+        if input_tensor is None:
+            print('[1f1b] rank {}: Unexpected None at step {}'.format(myrank, i))
         output_tensor = forward_step(model, input_tensor)
         # send forward + recv backward grads
-        output_tensor_grad = send_and_recv_backward(
-            output_tensor, myrank+1, torch.Size([bs, feats]), myrank+1)
+        print('[1f1b] rank {}: step-{}: sending forward + recving backward...'.format(myrank, i))
+        output_tensor_grad = send_and_recv(
+            output_tensor, torch.Size([micro_bs, feats]), myrank+1, None)
         input_tensors.append(input_tensor)
         output_tensors.append(output_tensor)
         # backward
@@ -162,19 +181,21 @@ def scheduling_1f1b(model, inputs, bs, feats, micro_bs):
         input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad)
         if i != (num_warmup_remaining-1):
             # send backward grads + recv forward results
+            print('[1f1b] rank {}: step-{}: sending backward + recving forward...'.format(myrank, i))
             input_tensor = send_and_recv(
-                input_tensor_grad, myrank-1, torch.Size([bs, feats]), myrank-1)
+                input_tensor_grad, torch.Size([micro_bs, feats]), myrank-1, inputs[num_warmup_microbatches+i+1])
         else:   # last iteration - no more inputs
             input_tensor = None
             # send backward grads
-            send(input_tensor_grad, myrank - 1)
+            print('[1f1b] rank {}: step-{}: sending backward...'.format(myrank, i))
+            send(input_tensor_grad, myrank-1)
     
     # cooldown
     for i in range(num_warmup_microbatches):
         input_tensor = input_tensors.pop(0)
         output_tensor = output_tensors.pop(0)
         # recv backward gradients
-        output_tensor_grad = recv(torch.Size([bs, feats]), myrank+1)
+        output_tensor_grad = recv(torch.Size([micro_bs, feats]), myrank+1, None)
         # backward
         input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad)
         # send backward gradients
@@ -190,10 +211,18 @@ if __name__ == '__main__':
         backend='nccl',
         init_method='env://',
     )
+    myrank = torch.distributed.get_rank()
 
-    batch_size = 32
+    bs = 32
+    micro_bs = 1
     features = 1024
 
-    torch.randn((batch_size, features))
+    model = Linears(features, layers=4).cuda()
 
+    if myrank == 0:
+        inputs = torch.randn((bs, features)).cuda()
+    else:
+        inputs = None
 
+    for _ in range(50):
+        scheduling_1f1b(model, inputs, bs, features, micro_bs)
