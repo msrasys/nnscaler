@@ -13,6 +13,7 @@ python -m torch.distributed.launch \
 import torch
 from torch import nn
 import os
+import time
 
 
 class Linears(nn.Module):
@@ -227,3 +228,5 @@ if __name__ == '__main__':
 
     for _ in range(50):
         scheduling_1f1b(model, inputs, bs, features, micro_bs)
+        # torch.distributed.barrier() # for profiling only
+        # time.sleep(1)
