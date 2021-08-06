@@ -232,7 +232,7 @@ if __name__ == '__main__':
     input = torch.rand((batch_size, in_features)).cuda()
     # print_each_rank('input: {}'.format(input))
     
-    # model parallel
+    # tensor parallel
     print_each_rank('======== Model Parallel =========', [0])
     output = linear_tensor_parallel(input, weight, bias)
     loss = torch.mean(output) * 100
