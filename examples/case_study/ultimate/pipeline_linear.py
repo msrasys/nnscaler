@@ -7,7 +7,7 @@ python -m torch.distributed.launch \
     --master_addr=127.0.0.1 \
     --master_port=62000 \
     --use_env \
-    examples/case_study/pipeline_linear.py
+    examples/case_study/ultimate/pipeline_linear.py
 """
 
 import torch
@@ -21,15 +21,15 @@ class Linears(nn.Module):
     that belong to this rank
     """
 
-    def __init__(self, features, layers=4):
+    def __init__(self, features, op_num=4):
         super().__init__()
         self.ops = nn.ModuleList([])
 
         myrank = torch.distributed.get_rank()
         ngpus = torch.distributed.get_world_size()
-        op_per_rank = int(layers / ngpus)
+        op_num_per_rank = int(op_num / ngpus)
 
-        for _ in range(op_per_rank):
+        for _ in range(op_num_per_rank):
             self.ops.append(nn.Linear(features, features))
     
     def forward(self, x):
@@ -103,6 +103,7 @@ def recv(shape, from_rank, boundary_tensor):
     torch.cuda.synchronize()
     return tensor
 
+
 def send_and_recv(send_tensor, recv_shape, rank, boundary_tensor):
     if rank < 0 or rank >= torch.distributed.get_world_size():
         return boundary_tensor
@@ -121,11 +122,10 @@ def send_and_recv(send_tensor, recv_shape, rank, boundary_tensor):
     torch.cuda.synchronize()
     return recv_tensor
 
-
-
 #================= Between Stage functions ==================#
 
 
+#================= Scheduling ==================#
 
 def scheduling_1f1b(model, inputs, bs, feats, micro_bs):
     myrank = torch.distributed.get_rank()
@@ -167,8 +167,6 @@ def scheduling_1f1b(model, inputs, bs, feats, micro_bs):
     # run 1F1B
     for i in range(num_warmup_remaining):
         # forward
-        if input_tensor is None:
-            print('[1f1b] rank {}: Unexpected None at step {}'.format(myrank, i))
         output_tensor = forward_step(model, input_tensor)
         # send forward + recv backward grads
         print('[1f1b] rank {}: step-{}: sending forward + recving backward...'.format(myrank, i))
@@ -190,7 +188,7 @@ def scheduling_1f1b(model, inputs, bs, feats, micro_bs):
             print('[1f1b] rank {}: step-{}: sending backward...'.format(myrank, i))
             send(input_tensor_grad, myrank-1)
     
-    # cooldown
+    # cooldown gradient trans back
     for i in range(num_warmup_microbatches):
         input_tensor = input_tensors.pop(0)
         output_tensor = output_tensors.pop(0)
@@ -201,6 +199,8 @@ def scheduling_1f1b(model, inputs, bs, feats, micro_bs):
         # send backward gradients
         print('[cooldown] rank {}: step-{}: sending backward...'.format(myrank, i))
         send(input_tensor_grad, myrank-1)
+
+#================= Scheduling ==================#
 
 
 if __name__ == '__main__':
@@ -216,9 +216,9 @@ if __name__ == '__main__':
 
     bs = 32
     micro_bs = 1
-    features = 1024
+    features = 10240
 
-    model = Linears(features, layers=4).cuda()
+    model = Linears(features, op_num=4).cuda()
 
     if myrank == 0:
         inputs = torch.randn((bs, features)).cuda()
