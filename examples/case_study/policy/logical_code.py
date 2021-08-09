@@ -67,3 +67,9 @@ if __name__ == '__main__':
         # weight update
         optimizer.step()
         optimizer.zero_grad()
+
+
+## dynamics?
+
+## weight update + forward concurrent
+
