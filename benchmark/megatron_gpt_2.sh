@@ -10,7 +10,7 @@ NNODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-DATA_PATH=/data/webtext2/my-gpt2_text_document
+DATA_PATH=/mydata/LargeModel/GPT-2/webtext2/my-gpt2_text_document
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
@@ -18,15 +18,15 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $
 # --checkpoint-activations \
 # NCCL_P2P_DISABLE=1
 
-NCCL_P2P_DISABLE=1 python -m torch.distributed.launch $DISTRIBUTED_ARGS \
+python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        /workspace/Megatron-LM/pretrain_gpt.py \
-       --tensor-model-parallel-size 8 \
-       --pipeline-model-parallel-size 1 \
+       --tensor-model-parallel-size 1 \
+       --pipeline-model-parallel-size 8 \
        --num-layers 24 \
        --hidden-size 1024 \
        --num-attention-heads 16 \
        --micro-batch-size 4 \
-       --global-batch-size 16 \
+       --global-batch-size 64 \
        --seq-length 1024 \
        --max-position-embeddings 1024 \
        --train-iters 500000 \
