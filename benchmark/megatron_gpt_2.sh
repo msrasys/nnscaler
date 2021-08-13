@@ -32,8 +32,8 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --train-iters 500000 \
        --lr-decay-iters 320000 \
        --data-path $DATA_PATH \
-       --vocab-file /data/gpt2-vocab.json \
-       --merge-file /data/gpt2-merges.txt \
+       --vocab-file /mydata/LargeModel/GPT-2/gpt2-vocab.json \
+       --merge-file /mydata/LargeModel/GPT-2/gpt2-merges.txt \
        --data-impl mmap \
        --split 949,50,1 \
        --distributed-backend nccl \
