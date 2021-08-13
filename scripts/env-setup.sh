@@ -12,6 +12,22 @@ sudo chmod -R a+w /opt/conda
 
 sudo apt-get install tmux -y
 sudo apt-get install psmisc -y
+sudo apt-get install lsof -y
+
+# install blob
+# sudo apt-get install lsb-release -y
+# wget https://packages.microsoft.com/config/ubuntu/20.04/packages-microsoft-prod.deb
+# sudo dpkg -i packages-microsoft-prod.deb
+# sudo apt-get update
+# sudo apt-get install blobfuse -y
+# sudo rm packages-microsoft-prod.deb
+
+# install azcopy
+wget https://azcopyvnext.azureedge.net/release20210616/azcopy_linux_amd64_10.11.0.tar.gz -O azcopy.tar.gz
+tar -zxvf azcopy.tar.gz
+sudo mv azcopy_linux_amd64_10.11.0/azcopy /usr/bin/
+rm -rf azcopy_linux_amd64_10.11.0 azcopy.tar.gz
+
 wget https://raw.githubusercontent.com/zhiqi-0/EnvDeployment/master/.tmux.conf -O ~/.tmux.conf
 wget https://raw.githubusercontent.com/zhiqi-0/EnvDeployment/master/.vimrc -O ~/.vimrc
 
