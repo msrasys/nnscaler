@@ -17,15 +17,19 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $
 ## Optional Config ##
 # --checkpoint-activations \
 # NCCL_P2P_DISABLE=1
+# --fp16
+
+rm -rf /workspace/Megatron-LM/megatron/fused_kernels/build
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        /workspace/Megatron-LM/pretrain_gpt.py \
+       --checkpoint-activations \
        --tensor-model-parallel-size 1 \
        --pipeline-model-parallel-size 8 \
        --num-layers 24 \
-       --hidden-size 1024 \
-       --num-attention-heads 16 \
-       --micro-batch-size 4 \
+       --hidden-size 2304 \
+       --num-attention-heads 24 \
+       --micro-batch-size 1 \
        --global-batch-size 64 \
        --seq-length 1024 \
        --max-position-embeddings 1024 \
@@ -43,5 +47,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --weight-decay 1e-2 \
        --clip-grad 1.0 \
        --lr-warmup-fraction .01 \
-       --log-interval 100 \
-       --fp16
+       --no-masked-softmax-fusion \
+       --no-bias-dropout-fusion \
+       --no-bias-gelu-fusion \
+       --log-interval 10
