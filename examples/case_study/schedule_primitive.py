@@ -12,12 +12,12 @@ def execute(action, *args, **kwargs):
 
 def add_flow(*actions): pass
 
-def run(schedule):
+def run(schedule, *args, **kwargs):
     """
     Take a list of actions and execute in list order
     """
     for action in schedule:
-        outs = execute(action)
+        outs = execute(action, *args, **kwargs)
     return outs
 
 class Action: pass
@@ -100,3 +100,20 @@ def pipeline_schedule(model, data, optimizer, num_microbatches=4):
     ]
 
     return global_schedule[torch.distributed.get_rank()]
+
+
+if __name__ == '__main__':
+
+    # define logical model / optimizer / data loader
+    class LogicalModel: pass
+    class Optimizer: pass
+    class DataLoader: pass
+
+
+    model = LogicalModel()
+    optimizer = Optimizer(model.parameters())
+    dataloader = DataLoader()
+
+    schedule = pipeline_schedule(model, optimizer, num_microbatches=4)
+    for data in dataloader:
+        run(schedule, data)
