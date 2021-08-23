@@ -4,7 +4,7 @@ from functools import partial
 
 ## Primitive ##
 
-def select(tensor, indices, val_map_op=None):
+def select(tensor, indices, val_map_op=None, shape=None):
     pass
 
 def execute(action, *args, **kwargs):
