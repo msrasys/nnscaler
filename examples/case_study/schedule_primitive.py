@@ -38,9 +38,9 @@ def update(flow_in, optimizer): pass
 # ===================== Basic steps ================== #
 
 
-def naive_schedule(model, data, optimizer):
+def naive_schedule(model, optimizer):
 
-    f = Action(partial(forward, model=model, data=data))
+    f = Action(partial(forward, model=model))
     b = Action(partial(backward))
     u = Action(partial(update, optimizer=optimizer))
     
@@ -48,10 +48,10 @@ def naive_schedule(model, data, optimizer):
 
     schedules = [f, b, u]
     
-    return schedules
+    return partial(run, schedules)
 
 
-def pipeline_schedule(model, data, optimizer, num_microbatches=4):
+def pipeline_schedule(model, optimizer, num_microbatches=4):
 
     # forward, backward, update function
     f = partial(forward, model=model)
@@ -59,13 +59,16 @@ def pipeline_schedule(model, data, optimizer, num_microbatches=4):
     u = partial(update, optimizer=optimizer)
 
     # suppose we have 4 devices using 1f1b with num micro-batches=4
-    chunk_size = data.size(0) / 4
-    data = [
-        select(data, slice(chunk_size * 0, chunk_size * 1)),
-        select(data, slice(chunk_size * 1, chunk_size * 2)),
-        select(data, slice(chunk_size * 2, chunk_size * 3)),
-        select(data, slice(chunk_size * 3, chunk_size * 4))
-    ]
+
+    def slicer(data):
+        chunk_size = data.size(0) / 4
+        data = [
+            select(data, slice(chunk_size * 0, chunk_size * 1)),
+            select(data, slice(chunk_size * 1, chunk_size * 2)),
+            select(data, slice(chunk_size * 2, chunk_size * 3)),
+            select(data, slice(chunk_size * 3, chunk_size * 4))
+        ]
+    d0 = Action(slicer)
 
     f0 = Action(partial(f, data=data[0]))
     f1 = Action(partial(f, data=data[1]))
@@ -87,10 +90,10 @@ def pipeline_schedule(model, data, optimizer, num_microbatches=4):
 
     
     global_schedule = [
-        [f0, f1, f2, f3, b0, b1, b2, b3, u],  # rank 0
-        [f0, f1, f2, b0, f3, b1, b2, b3, u],  # rank 1
-        [f0, f1, b0, b2, f1, f3, b2, b3, u],  # rank 2
-        [f0, b0, f1, b1, f2, b2, f3, b3, u],  # rank 3
+        [d0, f0, f1, f2, f3, b0, b1, b2, b3, u],  # rank 0
+            [f0, f1, f2, b0, f3, b1, b2, b3, u],  # rank 1
+            [f0, f1, b0, b2, f1, f3, b2, b3, u],  # rank 2
+            [f0, b0, f1, b1, f2, b2, f3, b3, u],  # rank 3
     ]
 
     # schedules will be in dead lock
@@ -99,7 +102,7 @@ def pipeline_schedule(model, data, optimizer, num_microbatches=4):
         [f0, f1, b0, b1],
     ]
 
-    return global_schedule[torch.distributed.get_rank()]
+    return partial(run, global_schedule[torch.distributed.get_rank()])
 
 
 if __name__ == '__main__':
@@ -116,4 +119,4 @@ if __name__ == '__main__':
 
     schedule = pipeline_schedule(model, optimizer, num_microbatches=4)
     for data in dataloader:
-        run(schedule, data)
+        schedule(data=data)
