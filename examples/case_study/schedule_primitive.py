@@ -123,14 +123,15 @@ def dist_policy(DAG, resources):
     return DAG
 
 
-def schedule_policy(model, forward_fn, backward_fn, bs):
+def set_schedule_policy(model, specific_schedule, bs):
     """
     forward_fn: forward function
     backward_fn: backward_function
     bs: global batch size
     """
     num_microbs = 4 if bs >= 4 else bs
-    return pipeline_schedule(forward_fn, backward_fn, num_microbs)
+    schedule = pipeline_schedule(model.forward, backward, num_microbs)
+    model.set_schedule(schedule)
 
 
 if __name__ == '__main__':
@@ -145,23 +146,33 @@ if __name__ == '__main__':
     optimizer = Optimizer(model.parameters())
     dataloader = DataLoader(bs=1024)
 
-    def forward_step(flow_in, data, label, **kwargs):
-        # this requires loss computation needs to be in the model
-        output = model(data, label)
-        return output
-    
-    def backward_step(output, **kwargs):
-        output.backward()
-        return output
+    # def forward_step(flow_in, data, label, **kwargs):
+    #     # this requires loss computation needs to be in the model
+    #     # output = model(data, label)
+    #     output = model(data, label)
+    #     # function wrapper
+    #     loss = compute_loss(output)
+    #     return output
+    # 
+    # def backward_step(output, **kwargs):
+    #     output.backward()
+    #     return output
 
-    # policy for placement and parallelisms
-    model = dist_policy(get_dag(model, input_shapes), resources)
-    # data flow scheduling policy
-    schedule = schedule_policy(model, forward_step, backward_step, bs=1024)
+    # policy for placement and parallelisms -- will be hidden
+    model = dist_policy(get_dag(model, loss_compute, input_shapes), resources)
+    # data flow scheduling policy -- will be hidden
+    set_schedule_policy(model, pipeline_schedule, bs=1024)
 
     for epoch in range(100):
         for step, (data, label) in enumerate(dataloader):
-            loss = schedule(data=data)
+            # enqueue forward specfied by schedule and execute the first one
+            output = model(data)
+            # accessing partial output data without generation will rase warning
+            # pop forward until to generate the backward tensor
+            loss = compute_loss(output, label)
+            loss.backward()
+
+            # loss = schedule(data=data)
             optimizer.step()
             # lr_scheduler.step()
             optimizer.zero_grad()
@@ -170,3 +181,18 @@ if __name__ == '__main__':
         if (epoch + 1) % 4 == 0:
             model.eval()
             # evaluation
+
+
+# class Model:
+# 
+#     def forward(self, data):
+#         # non-torch op wrapper
+# 
+#         if data[0] > 1:
+#             self.net1(data)
+#         else:
+#             self.net2(data)
+# 
+#     def forward_(self, data)
+# 
+#         self.q = [(self.forward, data[0]), (xxx)]
