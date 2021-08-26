@@ -1,3 +1,4 @@
+from typing import Sequence
 import torch
 
 from functools import partial
@@ -74,46 +75,56 @@ def grad_accumulate(f, b, accum_times=4):
     return partial(run, schedules, num_microbs=accum_times)
 
 
-def pipeline_schedule(f, b, num_microbs=4):
+def pipeline_1f1b_schedule(forward, backward, update, num_stages=2, num_microbs=4):
     """
     f: forward function
     b: backward function
+
+    Suppose model is partitioned to `num_stages` with input `num_microbs` micro-batches
     """
-    # suppose we have 4 devices using 1f1b with num micro-batches=4
+    # suppose we have 2 stages using 1f1b with num micro-batches=4
 
-    f0 = Action(partial(f), fid=0)
-    f1 = Action(partial(f), fid=1)
-    f2 = Action(partial(f), fid=2)
-    f3 = Action(partial(f), fid=3)
+    # f[stage_id, data_id]
+    partial_sequences = []
+    for data_id in range(num_microbs):
+        one_mbatch = PartialSequence()
+        for stage_id in range(num_stages):
+            one_mbatch.append(Action(forward))
+        for stage_id in range(num_stages):
+            one_mbatch.append(Action(backward))
+            if data_id == num_microbs - 1:
+                one_mbatch.append(Action(update))
+        partial_sequences.append(one_mbatch)
+    for S in range(num_stages):
+        seq = PartialSequence([partial_sequences[-1-S][-num_stages-1]], Action(update))
+        partial_sequences.append(seq)
 
-    b0 = Action(b)
-    b1 = Action(b)
-    b2 = Action(b)
-    b3 = Action(b)
 
-    # add data flow f0 -> b0
-    add_flow(f0, b0)
-    add_flow(f1, b1)
-    add_flow(f2, b2)
-    add_flow(f3, b3)
+    # Action f[stage, micro-batch]
+    # f[S, D]: forward on stage S for micro-batch id D
+    f = [partial_sequences[i][:num_stages] for i in range(num_microbs)]
 
-    
+    # Action b[stage, micro-batch]
+    # b[S, D]: backward on stage S for micro-batch id D
+    b = [partial_sequences[i][num_stages:] for i in range(num_microbs)]
+
+    # Action u[stage, micro-batch]
+    # u[S, D]: update weight on stage S
+    u = [partial_sequences[i+num_microbs][1] for i in range(num_stages)]
+
+
+    # =========================
+    # !@#$#%$&^$# -- policy generated a legal global execution order
     global_schedule = [
-        [f0, f1, f2, f3, b0, b1, b2, b3],  # rank 0
-        [f0, f1, f2, b0, f3, b1, b2, b3],  # rank 1
-        [f0, f1, b0, b2, f1, f3, b2, b3],  # rank 2
-        [f0, b0, f1, b1, f2, b2, f3, b3],  # rank 3
+        f[0,0], f[1,0], b[1,0],
+        f[0,1], b[0,0], f[1,1], b[1,1],
+        f[0,2], b[0,1], f[1,2], b[0,2],
+        f[0,3], b[0,2], f[1,3], b[1,3], u[1],
+        u[0]
     ]
+    # =========================
 
-    myschedule = global_schedule[torch.distributed.get_rank()]
-
-    # schedules will be in dead lock
-    # [
-    #     [f0, b0, f1, b1],
-    #     [f0, f1, b0, b1],
-    # ]
-
-    return partial(run, myschedule, num_microbs=num_microbs)
+    return global_schedule
 
 
 def dist_policy(DAG, resources):
@@ -183,16 +194,76 @@ if __name__ == '__main__':
             # evaluation
 
 
-# class Model:
-# 
-#     def forward(self, data):
-#         # non-torch op wrapper
-# 
-#         if data[0] > 1:
-#             self.net1(data)
-#         else:
-#             self.net2(data)
-# 
-#     def forward_(self, data)
-# 
-#         self.q = [(self.forward, data[0]), (xxx)]
+def train_iter_grad_accumulate(model, datas, stage=2, micro_bs=4):
+
+    out_s0_d0 = forward(model[0], datas[0])
+    out_s1_d0 = forward(model[1], out_s0_d0)
+    grad_s1_d0 = backward(out_s1_d0)
+    grad_s0_d0 = backward(out_s0_d0, grad=grad_s1_d0)
+
+    out_s0_d1 = forward(model[0], datas[1])
+    out_s1_d1 = forward(model[1], out_s0_d1)
+    grad_s1_d1 = backward(out_s1_d1)
+    grad_s0_d1 = backward(out_s0_d0, grad=grad_s1_d1)
+
+    out_s0_d2 = forward(model[0], datas[2])
+    out_s1_d2 = forward(model[1], out_s0_d2)
+    grad_s1_d2 = backward(out_s1_d2)
+    grad_s0_d2 = backward(out_s0_d0, grad=grad_s1_d2)
+
+    out_s0_d3 = forward(model[0], datas[3])
+    out_s1_d3 = forward(model[1], out_s0_d3)
+    grad_s1_d3 = backward(out_s1_d3)
+    grad_s0_d3 = backward(out_s0_d0, grad=grad_s1_d3)
+
+    update_gradient(model[0])
+    update_gradient(model[1])
+
+
+def train_iter_1f1b(model, datas, stage=2, micro_bs=4):
+
+    out_s0_d0 = forward(model[0], datas[0])
+    out_s1_d0 = forward(model[1], out_s0_d0)
+    grad_s1_d0 = backward(out_s1_d0)
+
+    out_s0_d1 = forward(model[0], datas[1])
+    grad_s0_d0 = backward(out_s0_d0, grads=grad_s1_d0)
+    out_s1_d1 = forward(model[1], out_s0_d1)
+    grad_s1_d1 = backward(out_s1_d1)
+
+    out_s0_d2 = forward(model[0], datas[2])
+    grad_s0_d1 = backward(out_s0_d0, grad=grad_s1_d1)
+    out_s1_d2 = forward(model[1], out_s0_d2)
+    grad_s1_d2 = backward(out_s1_d2)
+
+    out_s0_d3 = forward(model[0], datas[3])
+    grad_s0_d2 = backward(out_s0_d0, grad=grad_s1_d2)
+    out_s1_d3 = forward(model[1], out_s0_d3)
+    grad_s1_d3 = backward(out_s1_d3)
+    update_gradient(model[1])
+
+    grad_s0_d3 = backward(out_s0_d0, grad=grad_s1_d3)
+    update_gradient(model[0])
+
+
+def train_iter_gpipe(model, datas, stage=2, micro_bs=4):
+
+    out_s0_d0 = forward(model[0], datas[0])
+    out_s1_d0 = forward(model[1], out_s0_d0)
+    out_s0_d1 = forward(model[0], datas[1])
+    out_s1_d1 = forward(model[1], out_s0_d1)
+    out_s0_d2 = forward(model[0], datas[2])
+    out_s1_d2 = forward(model[1], out_s0_d2)
+    out_s0_d3 = forward(model[0], datas[3])
+    out_s1_d3 = forward(model[1], out_s0_d3)
+
+    grad_s1_d0 = backward(out_s1_d0)
+    grad_s0_d0 = backward(out_s0_d0, grad=grad_s1_d0)
+    grad_s1_d1 = backward(out_s1_d1)
+    grad_s0_d1 = backward(out_s0_d0, grad=grad_s1_d1)
+    grad_s1_d2 = backward(out_s1_d2)
+    grad_s0_d2 = backward(out_s0_d0, grad=grad_s1_d2)
+    grad_s1_d3 = backward(out_s1_d3)
+    update_gradient(model[1])
+    grad_s0_d3 = backward(out_s0_d0, grad=grad_s1_d3)
+    update_gradient(model[0])
