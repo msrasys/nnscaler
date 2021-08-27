@@ -216,8 +216,8 @@ def train_iter_grad_accumulate(model, datas, stage=2, micro_bs=4):
     grad_s1_d3 = backward(out_s1_d3)
     grad_s0_d3 = backward(out_s0_d0, grad=grad_s1_d3)
 
-    update_gradient(model[0])
-    update_gradient(model[1])
+    update_gradient(model[0], model[0].weights.grad)
+    update_gradient(model[1], model[1].weights.grad)
 
 
 def train_iter_1f1b(model, datas, stage=2, micro_bs=4):
@@ -240,10 +240,10 @@ def train_iter_1f1b(model, datas, stage=2, micro_bs=4):
     grad_s0_d2 = backward(out_s0_d0, grad=grad_s1_d2)
     out_s1_d3 = forward(model[1], out_s0_d3)
     grad_s1_d3 = backward(out_s1_d3)
-    update_gradient(model[1])
+    update_gradient(model[1], model[1].weights.grad)
 
     grad_s0_d3 = backward(out_s0_d0, grad=grad_s1_d3)
-    update_gradient(model[0])
+    update_gradient(model[0], model[0].weights.grad)
 
 
 def train_iter_gpipe(model, datas, stage=2, micro_bs=4):
@@ -264,6 +264,6 @@ def train_iter_gpipe(model, datas, stage=2, micro_bs=4):
     grad_s1_d2 = backward(out_s1_d2)
     grad_s0_d2 = backward(out_s0_d0, grad=grad_s1_d2)
     grad_s1_d3 = backward(out_s1_d3)
-    update_gradient(model[1])
+    update_gradient(model[1], model[1].weights.grad)
     grad_s0_d3 = backward(out_s0_d0, grad=grad_s1_d3)
-    update_gradient(model[0])
+    update_gradient(model[0], model[0].weights.grad)
