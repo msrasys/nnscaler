@@ -21,6 +21,7 @@ def run(schedule, num_microbs, *args):
     """
     Take a list of actions and execute in list order
     """
+    myrank = torch.distributed.get_rank()
     chunked_args = list()
     for arg in args:
         if torch.is_tensor(arg):
@@ -33,7 +34,11 @@ def run(schedule, num_microbs, *args):
             ]
         chunked_args.append(arg)
     for action in schedule:
-        outs = execute(action, *tuple(args))
+        if action.device == myrank:
+            # wait for cross-device dependency (if have)
+            action.wait()
+            # execute
+            outs = execute(action, *tuple(args))
     return outs
 
 class Action: pass
