@@ -43,6 +43,8 @@ def run(schedule, num_microbs, *args):
 
 class Action: pass
 
+def check_consistency(sequence, actions, relations): pass
+
 
 # ===================== Basic steps ================== #
 def general_action(flow_in, *args, **kwargs):
@@ -80,56 +82,43 @@ def grad_accumulate(f, b, accum_times=4):
     return partial(run, schedules, num_microbs=accum_times)
 
 
-def pipeline_1f1b_schedule(forward, backward, update, num_stages=2, num_microbs=4):
+def pipeline_1f1b_schedules(actions, relations):
     """
-    f: forward function
-    b: backward function
+    Pipeline 1f1b policy description
 
-    Suppose model is partitioned to `num_stages` with input `num_microbs` micro-batches
+    Actions: a list of actions
+
+    relations: list[(Action1, Action2)]: a list of tuples indicate partial order
     """
-    # suppose we have 2 stages using 1f1b with num micro-batches=4
 
-    # f[stage_id, data_id]
-    partial_sequences = []
-    for data_id in range(num_microbs):
-        one_mbatch = PartialSequence()
-        for stage_id in range(num_stages):
-            one_mbatch.append(Action(forward))
-        for stage_id in range(num_stages):
-            one_mbatch.append(Action(backward))
-            if data_id == num_microbs - 1:
-                one_mbatch.append(Action(update))
-        partial_sequences.append(one_mbatch)
-    for S in range(num_stages):
-        seq = PartialSequence([partial_sequences[-1-S][-num_stages-1]], Action(update))
-        partial_sequences.append(seq)
+    # suppose input actions are forward and backward of grad accumulation
+    # suppose in forward -> ... -> forward -> backward -> ... -> backward
+    num_stage = torch.distributed.get_world_size()
+    num_micro_batch = len(actions) / 2 / num_stage
 
+    f = lambda stage, micro_batch_id: actions[2 * micro_batch_id * num_stage + stage]
+    b = lambda stage, micro_batch_id: actions[(2 * micro_batch_id + 1) * num_stage + stage]
 
-    # Action f[stage, micro-batch]
-    # f[S, D]: forward on stage S for micro-batch id D
-    f = [partial_sequences[i][:num_stages] for i in range(num_microbs)]
+    sequence = list()
 
-    # Action b[stage, micro-batch]
-    # b[S, D]: backward on stage S for micro-batch id D
-    b = [partial_sequences[i][num_stages:] for i in range(num_microbs)]
-
-    # Action u[stage, micro-batch]
-    # u[S, D]: update weight on stage S
-    u = [partial_sequences[i+num_microbs][1] for i in range(num_stages)]
-
-
-    # =========================
-    # !@#$#%$&^$# -- policy generated a legal global execution order
-    global_schedule = [
-        f[0,0], f[1,0], b[1,0],
-        f[0,1], b[0,0], f[1,1], b[1,1],
-        f[0,2], b[0,1], f[1,2], b[0,2],
-        f[0,3], b[0,2], f[1,3], b[1,3], u[1],
-        u[0]
-    ]
-    # =========================
-
-    return global_schedule
+    # warmup:
+    for stage in range(num_stage):
+        for mid in range(stage):
+            sequence.append(f(stage, mid))
+    
+    # steady + cooldown:
+    for mid in range(num_micro_batch):
+        # enqueue backward
+        for stage in range(num_stage-1, -1, -1):
+            sequence.append(b(stage, mid))
+        # enqueue forward
+        for stage in range(num_stage):
+            f_mid = mid + 1 + num_stage - stage
+            if f_mid >= num_micro_batch:
+                continue
+            sequence.append(f(stage, f_mid))
+    assert check_consistency(sequence, actions, relations)
+    return sequence
 
 
 def dist_policy(DAG, resources):
