@@ -84,7 +84,7 @@ def grad_accumulate(f, b, accum_times=4):
 
 def pipeline_1f1b_schedules(actions, relations):
     """
-    Pipeline 1f1b policy description
+    Pipeline 1f1b policy description -- generate a sequence
 
     Actions: a list of actions
 
@@ -94,10 +94,16 @@ def pipeline_1f1b_schedules(actions, relations):
     # suppose input actions are forward and backward of grad accumulation
     # suppose in forward -> ... -> forward -> backward -> ... -> backward
     num_stage = torch.distributed.get_world_size()
-    num_micro_batch = len(actions) / 2 / num_stage
+    num_microbatch = len(actions) / 2 / num_stage
 
     f = lambda stage, micro_batch_id: actions[2 * micro_batch_id * num_stage + stage]
     b = lambda stage, micro_batch_id: actions[(2 * micro_batch_id + 1) * num_stage + stage]
+
+    # action placement
+    for stage in range(num_stage):
+        for mid in range(num_microbatch):
+            f(stage, mid).device = torch.device.cuda(stage)
+            b(stage, mid).device = torch.device.cuda(stage)
 
     sequence = list()
 
@@ -107,18 +113,70 @@ def pipeline_1f1b_schedules(actions, relations):
             sequence.append(f(stage, mid))
     
     # steady + cooldown:
-    for mid in range(num_micro_batch):
+    for mid in range(num_microbatch):
         # enqueue backward
         for stage in range(num_stage-1, -1, -1):
             sequence.append(b(stage, mid))
         # enqueue forward
         for stage in range(num_stage):
             f_mid = mid + 1 + num_stage - stage
-            if f_mid >= num_micro_batch:
+            if f_mid >= num_microbatch:
                 continue
             sequence.append(f(stage, f_mid))
     assert check_consistency(sequence, actions, relations)
     return sequence
+
+
+def pipeline_1f1b_schedule(actions, relations):
+    """
+    Pipeline 1f1b policy description -- each device order
+
+    Actions: a list of actions
+
+    relations: list[(Action1, Action2)]: a list of tuples indicate partial order
+    """
+    num_stage = torch.distributed.get_world_size()
+    num_microbatch = len(actions) / 2 / num_stage
+
+    f = lambda stage, micro_batch_id: actions[2 * micro_batch_id * num_stage + stage]
+    b = lambda stage, micro_batch_id: actions[(2 * micro_batch_id + 1) * num_stage + stage]
+
+    # action placement
+    for stage in range(num_stage):
+        for mid in range(num_microbatch):
+            f(stage, mid).device = torch.device.cuda(stage)
+            b(stage, mid).device = torch.device.cuda(stage)
+
+    # action in-device order
+    stage_order = list()
+
+    for stage in range(num_stage):
+        order = list()
+        num_warmup_microbatch = num_stage - stage - 1
+        num_warmup_microbatch = min(num_warmup_microbatch, num_microbatch)
+        num_microbatch_remain = num_microbatch - num_warmup_microbatch
+
+        # warmup
+        for mid in range(num_warmup_microbatch):
+            order.append(f(stage, mid))
+        
+        # steady
+        for i in range(num_microbatch_remain):
+            f_mid = num_warmup_microbatch + i
+            b_mid = i
+            order.append(f(stage, f_mid))
+            order.append(b(stage, b_mid))
+        
+        # cooldown
+        for i in range(num_warmup_microbatch):
+            b_mid = num_microbatch_remain + i
+            order.append(b(stage, b_mid))
+        
+        stage_order.append(order)
+
+    assert check_consistency(stage_order, actions, relations)
+    return stage_order
+
 
 
 def dist_policy(DAG, resources):
