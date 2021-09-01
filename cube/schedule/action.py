@@ -10,6 +10,7 @@ class Action:
         self.pre_actions = list()
         self.outputs = None
         self.name = 'NotSet'
+        self.device = -1
     
     def __call__(self, *args, **kwargs):
         """
@@ -46,7 +47,7 @@ class Action:
         self.name = name
     
     def __repr__(self):
-        return self.name
+        return self.name+'@{}'.format(self.device)
 
 
 def add_flow(action1, action2):
