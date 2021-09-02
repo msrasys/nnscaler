@@ -62,5 +62,5 @@ def add_flow(action1, action2):
         raise TypeError("Expected action1 to be an Action")
     if not isinstance(action2, Action):
         raise TypeError("Expected action2 to be an Anction")
-    if not action1.depends_on(action2):
-        action1.add_pre_action(action2)
+    if not action2.depends_on(action1):
+        action2.add_pre_action(action1)

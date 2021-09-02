@@ -1,5 +1,5 @@
 from typing import Sequence
-from cube.schedule.action import Action
+from cube.schedule.action import Action, add_flow
 from cube.schedule.iterator import legal_sequence
 
 import argparse
@@ -19,7 +19,7 @@ def get_semantic(forward_fn, backward_fn, num_stage, num_microbatch):
             action.tag('f(S{},D{})'.format(stage, mid))
             if stage != 0:
                 relation = (actions[-1], action)
-                action.depends_on(actions[-1])
+                add_flow(actions[-1], action)
                 relations.append(relation)
             actions.append(action)
         # backward
@@ -28,7 +28,7 @@ def get_semantic(forward_fn, backward_fn, num_stage, num_microbatch):
             action.tag('b(S{},D{})'.format(num_stage - 1 - stage, mid))
             # relation
             relation = (actions[-1], action)
-            action.depends_on(actions[-1])
+            add_flow(actions[-1], action)
             # append to relation sets
             relations.append(relation)
             actions.append(action)
@@ -62,8 +62,7 @@ def draw_execution_plan(seq, forward_fn, backward_fn, ndevice):
             if dev_id == action.device:
                 continue
             # go through to check if the action has dependencies
-            for end_time, dev_action in zip(end_times, dev_actions):
-                print(dev_action)
+            for end_time, dev_action in zip(end_times[1:], dev_actions):
                 if action.depends_on(dev_action):
                     print('find dependency {} -> {}, end time: {}'.format(action, dev_action, end_time))
                     start_time = max(start_time, end_time)
@@ -76,23 +75,23 @@ def draw_execution_plan(seq, forward_fn, backward_fn, ndevice):
         elif action._fn[0] == backward_fn:
             span_time = backward_time
             color = 'orange'
-        # stage, mid = get_stage_and_mid(action)
-        recs[action.name] = Rectangle((start_time, action.device), span_time, 1,
+        recs[action] = Rectangle((start_time, action.device), span_time, 1,
                                       color=color, ec='black', lw=1.5)
         # update timeline
         current_time[action.device].append(start_time + span_time)
         device_actions[action.device].append(action)
     
     fig, ax = plt.subplots()
-    for r in recs:
-        ax.add_artist(recs[r])
-        rx, ry = recs[r].get_xy()
-        cx = rx + recs[r].get_width() / 2.0
-        cy = ry + recs[r].get_height() / 2.0
-        ax.annotate(r, (cx, cy), color='w', weight='bold',
+    for action in recs:
+        stage, mid = get_stage_and_mid(action)
+        ax.add_artist(recs[action])
+        rx, ry = recs[action].get_xy()
+        cx = rx + recs[action].get_width() / 2.0
+        cy = ry + recs[action].get_height() / 2.0
+        ax.annotate(f'S{stage}D{mid}', (cx, cy), color='w', weight='bold',
                     fontsize=8, ha='center', va='center')
     
-    ax.set_xlim((1, len(seq) + 1))
+    ax.set_xlim((1, int(len(seq) * 1.5) + 1))
     ax.set_ylim((0, ndevice))
     ax.set_aspect('equal')
     plt.savefig('./tmp.png')
@@ -110,8 +109,9 @@ def fixed_placement_sequence(actions, relations, ndevices, forward, backward):
         for action in seq:
             stage, mid = get_stage_and_mid(action)
             action.device = stage % ndevices
+        print(f'found seq > {seq}')
         draw_execution_plan(seq, forward, backward, ndevices)
-        break
+        input('>>> ')
     print('total found {} legal sequences'.format(cnt + 1))
 
 
