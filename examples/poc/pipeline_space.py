@@ -165,7 +165,8 @@ def space_search_mp(actions, relations, nstage, nmb, ndevice, outpath, space_ite
     # dump to json
     print(f'> totally done search on {nseqs} sequences')
     for key in memory_buckets:
-        memory_buckets[key] = memory_buckets[key].to_json()
+        if memory_buckets[key] is not None:
+            memory_buckets[key] = memory_buckets[key].to_json()
     with open(os.path.join(outpath, 'results.json'), 'w') as outfile:
         json.dump(memory_buckets, outfile)
 
