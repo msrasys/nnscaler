@@ -13,6 +13,7 @@ class Action:
         self.fid = None  # flow id
         self.device = -1
         self.est_latency = 1
+        self.est_memory = 1
     
     def __call__(self, *args, **kwargs):
         """

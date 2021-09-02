@@ -1,14 +1,11 @@
-from typing import Sequence
 from cube.schedule.action import Action, add_flow
-from cube.schedule.iterator import sequence_space
+from cube.schedule.iterator import sequence_space, placement_space
 from cube.schedule.plan import ExecutionPlan
 from cube.schedule.checker import correct_check
 
 import argparse
 import re
-
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+import json
 
 
 def get_semantic(forward_fn, backward_fn, num_stage, num_microbatch):
@@ -22,6 +19,7 @@ def get_semantic(forward_fn, backward_fn, num_stage, num_microbatch):
         for stage in range(num_stage):
             action = Action(forward_fn)
             action.est_latency = forward_time
+            action.est_memory = 1
             action.tag('fS{}D{}'.format(stage, mid))
             if stage != 0:
                 relation = (actions[-1], action)
@@ -34,6 +32,7 @@ def get_semantic(forward_fn, backward_fn, num_stage, num_microbatch):
         for stage in range(num_stage):
             action = Action(backward_fn)
             action.est_latency = backward_time
+            action.est_memory = -1
             action.tag('bS{}D{}'.format(num_stage - 1 - stage, mid))
             # relation
             relation = (actions[-1], action)
@@ -50,17 +49,42 @@ def get_stage_and_mid(action):
     return stage, mid
 
 
-def device_search(sequence):
-    pass
+def full_grid_search(actions, relations, ndevice, nmb):
+    """
+    Search minimal time plan under the memory constraints
+    """
 
+    memory_buckets = dict()
+    for activation_num in range(1, nmb+1):
+        memory_buckets[activation_num] = None
 
-def print_all_legal_sequence(actions, relations):
     for cnt, seq in enumerate(sequence_space(actions, relations)):
-        print(seq)
-    print('total found {} legal sequences'.format(cnt + 1))
+        for dev_num, dev_seq in enumerate(placement_space(seq, ndevice, fb_same=True)):
+            # print(f'on sequence > {dev_seq}')
+            execplan = ExecutionPlan(dev_seq, ndevice)
+            execplan.gen()
+            span = execplan.get_time()
+            memory = execplan.get_memory()
+            # update plan
+            for upper_mem in memory_buckets:
+                if memory <= upper_mem:
+                    if memory_buckets[upper_mem] is None:
+                        memory_buckets[upper_mem] = execplan
+                        execplan.draw(outfile=f'./figs/plan.mem{memory}.png')
+                    if span < memory_buckets[upper_mem].get_time():
+                        memory_buckets[upper_mem] = execplan
+                        execplan.draw(outfile=f'./figs/plan.mem{memory}.png')
+                        print(f'> found a better seq {seq} time {span} mem {memory}')
+        # input(f'>>> done on {dev_num+1} device placement ')
+    # dump to json
+    print(f'> totally done search on {cnt+1} sequences')
+    for key in memory_buckets:
+        memory_buckets[key] = memory_buckets[key].to_json()
+    with open('./figs/results.json', 'w') as outfile:
+        json.dump(memory_buckets, outfile)
 
 
-def fixed_placement_sequence(actions, relations, ndevice, max_time):
+def fixed_placement_search(actions, relations, ndevice, max_time):
     for cnt, seq in enumerate(sequence_space(actions, relations)):
         # assign device
         for action in seq:
@@ -158,8 +182,6 @@ if __name__ == '__main__':
                         help='number of micro-batch')
     parser.add_argument('--ndev', type=int, default=4,
                         help='number of devices')
-    parser.add_argument('--max-time', type=int, default=100,
-                        help='maximal time. Will filter out plans that have larger time than this')
     args = parser.parse_args()
     
     forward = lambda data: data
@@ -167,7 +189,8 @@ if __name__ == '__main__':
 
     actions, relations = get_semantic(forward, backward, args.nstage, args.nmb)
 
-    pipe_1f1b(actions, relations, args.nstage, args.ndev, args.nmb)
-    gpipe(actions, relations, args.nstage, args.ndev, args.nmb)
+    # pipe_1f1b(actions, relations, args.nstage, args.ndev, args.nmb)
+    # gpipe(actions, relations, args.nstage, args.ndev, args.nmb)
 
-    fixed_placement_sequence(actions, relations, args.ndev, args.max_time)
+    # fixed_placement_search(actions, relations, args.ndev, max_time=100)
+    full_grid_search(actions, relations, args.ndev, args.nmb)

@@ -65,7 +65,23 @@ class ExecutionPlan:
         if self.device_timeline is None:
             self.gen()
         return max(
-            [timeline[-1][1] for timeline in self.device_timeline]
+            [timeline[-1][1] for timeline in self.device_timeline if len(timeline) != 0]
+        )
+    
+    def get_memory(self):
+        if self.device_timeline is None:
+            self.gen()
+
+        def device_memory(actions):
+            max_mem = 0
+            cur_mem = 0
+            for action in actions:
+                cur_mem += action.est_memory
+                max_mem = max(cur_mem, max_mem)
+            return max_mem
+
+        return max(
+            [device_memory(actions) for actions in self.device_actions]
         )
 
     def draw(self, outfile='./execplan.png'):
@@ -110,3 +126,6 @@ class ExecutionPlan:
                             fontsize=10, ha='center', va='center')
         # plt.grid()
         plt.savefig(outfile)
+    
+    def to_json(self):
+        return [repr(action) for action in self.seq]
