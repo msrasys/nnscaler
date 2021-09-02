@@ -6,6 +6,7 @@ from cube.schedule.checker import correct_check
 import argparse
 import re
 import json
+import time
 
 
 def get_semantic(forward_fn, backward_fn, num_stage, num_microbatch):
@@ -58,6 +59,7 @@ def full_grid_search(actions, relations, ndevice, nmb):
     for activation_num in range(1, nmb+1):
         memory_buckets[activation_num] = None
 
+    tic = time.time()
     for cnt, seq in enumerate(sequence_space(actions, relations)):
         for dev_num, dev_seq in enumerate(placement_space(seq, ndevice, fb_same=True)):
             # print(f'on sequence > {dev_seq}')
@@ -76,6 +78,10 @@ def full_grid_search(actions, relations, ndevice, nmb):
                         execplan.draw(outfile=f'./figs/plan.mem{memory}.png')
                         print(f'> found a better seq {seq} time {span} mem {memory}')
         # input(f'>>> done on {dev_num+1} device placement ')
+        if (cnt+1) % 1000 == 0:
+            throughput = 1000 * (nmb ** ndevice) / (time.time() - tic)
+            tic = time.time()
+            print('> search [{}-{}] throughput {:.2f} spatial sequences / sec'.format(cnt+1-1000, cnt+1, throughput))
     # dump to json
     print(f'> totally done search on {cnt+1} sequences')
     for key in memory_buckets:
