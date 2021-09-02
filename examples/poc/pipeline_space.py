@@ -53,6 +53,13 @@ def get_stage_and_mid(action):
     return stage, mid
 
 
+def fixed_placement(actions, ndevice, **kwargs):
+    for action in actions:
+        stage, _ = get_stage_and_mid(action)
+        action.device = stage % ndevice
+    yield actions
+
+
 def full_grid_search(actions, relations, ndevice, nmb, outpath='./figs'):
     """
     Search minimal time plan under the memory constraints
@@ -93,12 +100,12 @@ def full_grid_search(actions, relations, ndevice, nmb, outpath='./figs'):
         json.dump(memory_buckets, outfile)
 
 
-def worker_search(seqs, nmb, ndevice):
+def worker_search(seqs, nstage, ndevice, space_iter=placement_space):
     sub_memory_buckets = dict()
-    for activation_num in range(1, nmb+1):
+    for activation_num in range(1, nstage+1):
         sub_memory_buckets[activation_num] = None
     for seq in seqs:
-        for dev_seq in placement_space(seq, ndevice, fb_same=True):
+        for dev_seq in space_iter(seq, ndevice, fb_same=True):
             execplan = ExecutionPlan(dev_seq, ndevice)
             execplan.gen()
             span = execplan.get_time()
@@ -113,14 +120,14 @@ def worker_search(seqs, nmb, ndevice):
     return sub_memory_buckets
 
 
-def full_grid_search_mp(actions, relations, ndevice, nmb, outpath='./figs', nworker=40):
+def space_search_mp(actions, relations, nstage, nmb, ndevice, outpath, space_iter=placement_space, nworker=40):
     """
     Search minimal time plan under the memory constraints
     """
     pool = mp.Pool(processes=nworker)
 
     memory_buckets = dict()
-    for activation_num in range(1, nmb+1):
+    for activation_num in range(1, nstage+1):
         memory_buckets[activation_num] = None
     
     def merge(sub_memory_buckets):
@@ -132,24 +139,24 @@ def full_grid_search_mp(actions, relations, ndevice, nmb, outpath='./figs', nwor
             memory = execplan.get_memory()
             if memory_buckets[upper_mem] is None:
                 memory_buckets[upper_mem] = execplan
-                execplan.draw(outfile=os.path.join(outpath, f'{ndevice}nmb{nmb}dev.mem{memory}.png'))
+                execplan.draw(outfile=os.path.join(outpath, f'{nstage}stage.{nmb}nmb.{ndevice}dev.mem{memory}.png'))
                 print(f'> found a better seq {execplan.seq} time {span} mem {memory}')
             if span < memory_buckets[upper_mem].get_time():
                 memory_buckets[upper_mem] = execplan
-                execplan.draw(outfile=os.path.join(outpath, f'{ndevice}nmb{nmb}dev.mem{memory}.png'))
+                execplan.draw(outfile=os.path.join(outpath, f'{nstage}stage.{nmb}nmb.{ndevice}dev.mem{memory}.png'))
                 print(f'> found a better seq {execplan.seq} time {span} mem {memory}')
 
-    bs = (nworker, 20)
+    bs = (nworker, 100)
     nseqs = 0
     for seqs in sequence_space_batched(actions, relations, bs=bs):
-        results = list()
+        handles = list()
         for wid in range(nworker):
-            res = pool.apply_async(worker_search, args=(seqs[wid], nmb, ndevice))
-            results.append(res)
+            handle = pool.apply_async(worker_search, args=(seqs[wid], nstage, ndevice, space_iter))
+            handles.append(handle)
         nseqs += sum([len(worker_seqs) for worker_seqs in seqs])
         print(f'assigned {nseqs} sequences')
-        for res in results:
-            sub_buckets = res.get()
+        for handle in handles:
+            sub_buckets = handle.get()
             merge(sub_buckets)
     
     pool.close()
@@ -163,24 +170,7 @@ def full_grid_search_mp(actions, relations, ndevice, nmb, outpath='./figs', nwor
         json.dump(memory_buckets, outfile)
 
 
-def fixed_placement_search(actions, relations, ndevice, max_time):
-    for cnt, seq in enumerate(sequence_space(actions, relations)):
-        # assign device
-        for action in seq:
-            stage, mid = get_stage_and_mid(action)
-            action.device = stage % ndevice
-        execplan = ExecutionPlan(seq, ndevice)
-        execplan.gen()
-        iter_time = execplan.get_time()
-        print(f'found seq > {seq} \t time {iter_time}')
-        if iter_time > max_time:
-            continue
-        execplan.draw(outfile='tmp.png')
-        input('>>> ')
-    print('total found {} legal sequences'.format(cnt + 1))
-
-
-def pipe_1f1b(actions, relations, nstage, ndevice, nmb):
+def pipe_1f1b(actions, relations, nstage, nmb, ndevice):
     num_stage = nstage
     num_microbatch = nmb
 
@@ -219,7 +209,7 @@ def pipe_1f1b(actions, relations, nstage, ndevice, nmb):
     execplan.draw(outfile='./pipeline-1f1b.png')
 
 
-def gpipe(actions, relations, nstage, ndevice, nmb):
+def gpipe(actions, relations, nstage, nmb, ndevice):
     num_stage = nstage
     num_microbatch = nmb
 
@@ -272,8 +262,6 @@ if __name__ == '__main__':
 
     actions, relations = get_semantic(forward, backward, args.nstage, args.nmb)
 
-    # pipe_1f1b(actions, relations, args.nstage, args.ndev, args.nmb)
-    # gpipe(actions, relations, args.nstage, args.ndev, args.nmb)
-
-    # fixed_placement_search(actions, relations, args.ndev, max_time=100)
-    full_grid_search_mp(actions, relations, args.ndev, args.nmb, args.outpath)
+    # pipe_1f1b(actions, relations, args.nstage, args.nmb, args.ndev)
+    # gpipe(actions, relations, args.nstage, args.nmb, args.ndev)
+    space_search_mp(actions, relations, args.nstage, args.nmb, args.ndev, args.outpath, space_iter=fixed_placement)
