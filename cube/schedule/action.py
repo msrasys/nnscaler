@@ -9,8 +9,10 @@ class Action:
         self._fn = [fn,]
         self.pre_actions = list()
         self.outputs = None
-        self.name = 'NotSet'
+        self.name = 'None'
+        self.fid = None  # flow id
         self.device = -1
+        self.est_latency = 1
     
     def __call__(self, *args, **kwargs):
         """
@@ -28,6 +30,7 @@ class Action:
 
     def add_pre_action(self, action):
         self.pre_actions.append(action)
+        self.fid = action.fid
 
     def depends_on(self, action):
         """
