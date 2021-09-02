@@ -70,6 +70,23 @@ def sequence_space(actions, relations, path_shuffle=True, seq=list()):
         seq = seq[:-1]
 
 
+def sequence_space_batched(actions, relations, bs):
+    """
+    bs: tuple (num_workers, seq_per_worker)
+    """
+    seqs = list()
+    for seq in sequence_space(actions, relations):
+        seqs.append(seq)
+        if len(seqs) % (bs[0] * bs[1]) == 0:
+            seqs = [seqs[wid*bs[1]:(wid+1)*bs[1]] for wid in range(bs[0])]
+            yield seqs
+            seqs = list()
+    # tail
+    if len(seqs) != 0:
+        seqs = [seqs[wid*bs[1]:(wid+1)*bs[1]] for wid in range(bs[0])]
+        yield seqs
+
+
 def placement_space(actions, ndevice, fb_same=True, path_shuffle=True, assigned=0):
     if assigned == len(actions):
         yield actions
