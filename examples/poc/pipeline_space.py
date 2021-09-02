@@ -1,5 +1,5 @@
 from cube.schedule.action import Action, add_flow
-from cube.schedule.iterator import sequence_space, placement_space
+from cube.schedule.iterator import sequence_space, sequence_space_batched, placement_space
 from cube.schedule.plan import ExecutionPlan
 from cube.schedule.checker import correct_check
 
@@ -8,6 +8,8 @@ import re
 import json
 import time
 import os
+import multiprocessing as mp
+from functools import partial
 
 
 def get_semantic(forward_fn, backward_fn, num_stage, num_microbatch):
@@ -85,6 +87,76 @@ def full_grid_search(actions, relations, ndevice, nmb, outpath='./figs'):
             print('> search [{}-{}] throughput {:.2f} spatial sequences / sec'.format(cnt+1-1000, cnt+1, throughput))
     # dump to json
     print(f'> totally done search on {cnt+1} sequences')
+    for key in memory_buckets:
+        memory_buckets[key] = memory_buckets[key].to_json()
+    with open(os.path.join(outpath, 'results.json'), 'w') as outfile:
+        json.dump(memory_buckets, outfile)
+
+
+def worker_search(seqs, nmb, ndevice):
+    sub_memory_buckets = dict()
+    for activation_num in range(1, nmb+1):
+        sub_memory_buckets[activation_num] = None
+    for seq in seqs:
+        for dev_seq in placement_space(seq, ndevice, fb_same=True):
+            execplan = ExecutionPlan(dev_seq, ndevice)
+            execplan.gen()
+            span = execplan.get_time()
+            memory = execplan.get_memory()
+            # update plan
+            for upper_mem in sub_memory_buckets:
+                if memory <= upper_mem:
+                    if sub_memory_buckets[upper_mem] is None:
+                        sub_memory_buckets[upper_mem] = execplan
+                    if span < sub_memory_buckets[upper_mem].get_time():
+                        sub_memory_buckets[upper_mem] = execplan
+    return sub_memory_buckets
+
+
+def full_grid_search_mp(actions, relations, ndevice, nmb, outpath='./figs', nworker=40):
+    """
+    Search minimal time plan under the memory constraints
+    """
+    pool = mp.Pool(processes=nworker)
+
+    memory_buckets = dict()
+    for activation_num in range(1, nmb+1):
+        memory_buckets[activation_num] = None
+    
+    def merge(sub_memory_buckets):
+        for upper_mem in sub_memory_buckets:
+            if sub_memory_buckets[upper_mem] is None:
+                continue
+            execplan = sub_memory_buckets[upper_mem]
+            span = execplan.get_time()
+            memory = execplan.get_memory()
+            if memory_buckets[upper_mem] is None:
+                memory_buckets[upper_mem] = execplan
+                execplan.draw(outfile=os.path.join(outpath, f'{ndevice}nmb{nmb}dev.mem{memory}.png'))
+                print(f'> found a better seq {execplan.seq} time {span} mem {memory}')
+            if span < memory_buckets[upper_mem].get_time():
+                memory_buckets[upper_mem] = execplan
+                execplan.draw(outfile=os.path.join(outpath, f'{ndevice}nmb{nmb}dev.mem{memory}.png'))
+                print(f'> found a better seq {execplan.seq} time {span} mem {memory}')
+
+    bs = (nworker, 20)
+    nseqs = 0
+    for seqs in sequence_space_batched(actions, relations, bs=bs):
+        results = list()
+        for wid in range(nworker):
+            res = pool.apply_async(worker_search, args=(seqs[wid], nmb, ndevice))
+            results.append(res)
+        nseqs += sum([len(worker_seqs) for worker_seqs in seqs])
+        print(f'assigned {nseqs} sequences')
+        for res in results:
+            sub_buckets = res.get()
+            merge(sub_buckets)
+    
+    pool.close()
+    pool.join()
+
+    # dump to json
+    print(f'> totally done search on {nseqs} sequences')
     for key in memory_buckets:
         memory_buckets[key] = memory_buckets[key].to_json()
     with open(os.path.join(outpath, 'results.json'), 'w') as outfile:
@@ -180,6 +252,12 @@ def gpipe(actions, relations, nstage, ndevice, nmb):
     execplan.draw(outfile='./gpipe.png')
 
 
+def forward(data):
+    pass
+
+def backward(grad):
+    pass
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
@@ -191,9 +269,6 @@ if __name__ == '__main__':
                         help='number of devices')
     parser.add_argument('--outpath', type=str, default='/mydata/MagicCube/search/pipeline/')
     args = parser.parse_args()
-    
-    forward = lambda data: data
-    backward = lambda grad: grad
 
     actions, relations = get_semantic(forward, backward, args.nstage, args.nmb)
 
@@ -201,4 +276,4 @@ if __name__ == '__main__':
     # gpipe(actions, relations, args.nstage, args.ndev, args.nmb)
 
     # fixed_placement_search(actions, relations, args.ndev, max_time=100)
-    full_grid_search(actions, relations, args.ndev, args.nmb, args.outpath)
+    full_grid_search_mp(actions, relations, args.ndev, args.nmb, args.outpath)
