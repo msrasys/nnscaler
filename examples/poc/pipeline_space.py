@@ -7,6 +7,7 @@ import argparse
 import re
 import json
 import time
+import os
 
 
 def get_semantic(forward_fn, backward_fn, num_stage, num_microbatch):
@@ -50,7 +51,7 @@ def get_stage_and_mid(action):
     return stage, mid
 
 
-def full_grid_search(actions, relations, ndevice, nmb):
+def full_grid_search(actions, relations, ndevice, nmb, outpath='./figs'):
     """
     Search minimal time plan under the memory constraints
     """
@@ -72,10 +73,10 @@ def full_grid_search(actions, relations, ndevice, nmb):
                 if memory <= upper_mem:
                     if memory_buckets[upper_mem] is None:
                         memory_buckets[upper_mem] = execplan
-                        execplan.draw(outfile=f'./figs/plan.mem{memory}.png')
+                        execplan.draw(outfile=os.path.join(outpath, f'{ndevice}nmb{nmb}dev.mem{memory}.png'))
                     if span < memory_buckets[upper_mem].get_time():
                         memory_buckets[upper_mem] = execplan
-                        execplan.draw(outfile=f'./figs/plan.mem{memory}.png')
+                        execplan.draw(outfile=os.path.join(outpath, f'{ndevice}nmb{nmb}dev.mem{memory}.png'))
                         print(f'> found a better seq {seq} time {span} mem {memory}')
         # input(f'>>> done on {dev_num+1} device placement ')
         if (cnt+1) % 1000 == 0:
@@ -86,7 +87,7 @@ def full_grid_search(actions, relations, ndevice, nmb):
     print(f'> totally done search on {cnt+1} sequences')
     for key in memory_buckets:
         memory_buckets[key] = memory_buckets[key].to_json()
-    with open('./figs/results.json', 'w') as outfile:
+    with open(os.path.join(outpath, 'results.json'), 'w') as outfile:
         json.dump(memory_buckets, outfile)
 
 
@@ -188,6 +189,7 @@ if __name__ == '__main__':
                         help='number of micro-batch')
     parser.add_argument('--ndev', type=int, default=4,
                         help='number of devices')
+    parser.add_argument('--outpath', type=str, default='/mydata/MagicCube/search/pipeline/')
     args = parser.parse_args()
     
     forward = lambda data: data
@@ -199,4 +201,4 @@ if __name__ == '__main__':
     # gpipe(actions, relations, args.nstage, args.ndev, args.nmb)
 
     # fixed_placement_search(actions, relations, args.ndev, max_time=100)
-    full_grid_search(actions, relations, args.ndev, args.nmb)
+    full_grid_search(actions, relations, args.ndev, args.nmb, args.outpath)
