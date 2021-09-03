@@ -5,6 +5,35 @@ import itertools
 import numpy as np
 
 
+def _comb(n, m):
+    """
+    Calcualte combination C(n,m): select n from m (n < m)
+    """
+    res = 1
+    for j in range(0, min(n, m)):
+        res *= (m-j) / (min(n, m) - j)
+    return int(res)
+
+
+def get_pipeline_seq_space_size(nstage, nmb):
+    """
+    Calculate legal sequence number given num stage and num microbatch
+
+    \prod \limits_{i=1}^{nmb} C(nstage, i*nstage)
+
+    Args:
+        nstage: number of stages
+        nmb: number of micro batch
+    
+    Return:
+        total legal line
+    """
+    res = 1
+    for i in range(1, nmb+1):
+        res *= _comb(nstage*2, i*nstage*2)
+    return res
+
+
 def legal_sequence(actions, relations):
     """
     Yield all possible legal sequence given the list of actions

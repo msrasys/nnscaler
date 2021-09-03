@@ -258,6 +258,8 @@ if __name__ == '__main__':
                         help='number of micro-batch')
     parser.add_argument('--ndev', type=int, default=4,
                         help='number of devices')
+    parser.add_argument('--full-placement', action='store_true',
+                        help='device assignment for each action will be fully explored')
     parser.add_argument('--outpath', type=str, default='/mydata/MagicCube/search/pipeline/')
     args = parser.parse_args()
 
@@ -265,4 +267,5 @@ if __name__ == '__main__':
 
     # pipe_1f1b(actions, relations, args.nstage, args.nmb, args.ndev)
     # gpipe(actions, relations, args.nstage, args.nmb, args.ndev)
-    space_search_mp(actions, relations, args.nstage, args.nmb, args.ndev, args.outpath, space_iter=fixed_placement)
+    space_iter = placement_space if args.full_placement else fixed_placement
+    space_search_mp(actions, relations, args.nstage, args.nmb, args.ndev, args.outpath, space_iter=space_iter)
