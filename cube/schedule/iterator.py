@@ -70,12 +70,23 @@ def sequence_space(actions, relations, path_shuffle=True, seq=list()):
         seq = seq[:-1]
 
 
-def sequence_space_batched(actions, relations, bs):
+def sequence_space_bfs(actions, relations, path_shuffle=True):
+    # reverse relation
+    reverse_relation = list()
+    for relation in relations:
+        reverse_relation.append((relation[1], relation[0]))
+    # reverse seq
+    for seq in sequence_space(actions, reverse_relation, path_shuffle):
+        yield seq[::-1]
+
+
+def sequence_space_batched(actions, relations, bs, bfs=False):
     """
     bs: tuple (num_workers, seq_per_worker)
     """
     seqs = list()
-    for seq in sequence_space(actions, relations):
+    space_iter = sequence_space_bfs if bfs else sequence_space
+    for seq in space_iter(actions, relations):
         seqs.append(seq)
         if len(seqs) % (bs[0] * bs[1]) == 0:
             seqs = [seqs[wid*bs[1]:(wid+1)*bs[1]] for wid in range(bs[0])]

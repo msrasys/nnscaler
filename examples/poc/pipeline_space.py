@@ -102,7 +102,7 @@ def full_grid_search(actions, relations, ndevice, nmb, outpath='./figs'):
 
 def worker_search(seqs, nstage, ndevice, space_iter=placement_space):
     sub_memory_buckets = dict()
-    for activation_num in range(1, nstage+1):
+    for activation_num in range(1, 2*nstage+1):
         sub_memory_buckets[activation_num] = None
     for seq in seqs:
         for dev_seq in space_iter(seq, ndevice, fb_same=True):
@@ -127,7 +127,7 @@ def space_search_mp(actions, relations, nstage, nmb, ndevice, outpath, space_ite
     pool = mp.Pool(processes=nworker)
 
     memory_buckets = dict()
-    for activation_num in range(1, nstage+1):
+    for activation_num in range(1, 2*nstage+1):
         memory_buckets[activation_num] = None
     
     def merge(sub_memory_buckets):
@@ -146,7 +146,7 @@ def space_search_mp(actions, relations, nstage, nmb, ndevice, outpath, space_ite
                 execplan.draw(outfile=os.path.join(outpath, f'{nstage}stage.{nmb}nmb.{ndevice}dev.mem{memory}.png'))
                 print(f'> found a better seq {execplan.seq} time {span} mem {memory}')
 
-    bs = (nworker, 100)
+    bs = (nworker, 256)
     nseqs = 0
     for seqs in sequence_space_batched(actions, relations, bs=bs):
         handles = list()
