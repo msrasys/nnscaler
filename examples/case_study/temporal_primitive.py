@@ -1,12 +1,14 @@
-from typing import Sequence
 import torch
 
 from functools import partial
 
-## Primitive ##
 
 def select(tensor, indices, val_map_op=None, shape=None):
     pass
+
+## Abstractions and Primitivse ##
+
+class Action: pass
 
 def execute(action, **kwargs):
     # action instance will automatically take flow-in results
@@ -16,6 +18,9 @@ def execute(action, **kwargs):
 def add_flow(*actions):
     # this will set all input actions with same flow-id
     pass
+
+
+## System Runtime units ##
 
 def run(schedule, num_microbs, *args):
     """
@@ -41,48 +46,29 @@ def run(schedule, num_microbs, *args):
             outs = execute(action, *tuple(args))
     return outs
 
-class Action: pass
-
 def check_consistency(sequence, actions, relations): pass
 
 
-# ===================== Basic steps ================== #
-def general_action(flow_in, *args, **kwargs):
+# Schedule example
+
+def naive_schedule(actions: list(Action), relations: set((Action, Action))) -> list(Action):
     """
-    flow_in: the output from previous actions
+    Args:
+        actions: order specified by AI scientist (the reference semantic)
+        relations: set of action dependencies (action1, action2): action1 -> action2
+
+    Returns:
+        a execution sequence following the abstraction
     """
-    pass
-
-def forward(flow_in, model, data):
-    loss = model(data)
-    return loss
-
-def backward(flow_in):
-    flow_in.backwrd()
-    return flow_in
-
-# ===================== Basic steps ================== #
+    # placement
+    for action in actions:
+        action.device = 0
+    # execution sequence
+    sequence = actions
+    return sequence
 
 
-def naive_schedule(f, b):
-    f = Action(f)
-    b = Action(b)
-    add_flow(f, b)
-    schedules = [f, b]
-    return partial(run, schedules, num_microbs=1)
-
-
-def grad_accumulate(f, b, accum_times=4):
-    forwards = [Action(f, fid=fid) for fid in range(accum_times)]
-    backwards = [Action(b, fid=fid) for fid in range(accum_times)]
-    schedules = list()
-    for f, b in zip(forwards, backwards):
-        add_flow(f, b)
-        schedules += [f, b]
-    return partial(run, schedules, num_microbs=accum_times)
-
-
-def pipeline_1f1b_schedules(actions, relations):
+def pipeline_1f1b_schedule(actions, relations):
     """
     Pipeline 1f1b policy description -- generate a sequence
 
@@ -97,7 +83,7 @@ def pipeline_1f1b_schedules(actions, relations):
     num_microbatch = len(actions) / 2 / num_stage
 
     f = lambda stage, micro_batch_id: actions[2 * micro_batch_id * num_stage + stage]
-    b = lambda stage, micro_batch_id: actions[(2 * micro_batch_id + 1) * num_stage + stage]
+    b = lambda stage, micro_batch_id: actions[(2 * micro_batch_id + 1) * num_stage + num_stage - 1 - stage]
 
     # action placement
     for stage in range(num_stage):
@@ -139,7 +125,7 @@ def pipeline_1f1b_schedule(actions, relations):
     num_microbatch = len(actions) / 2 / num_stage
 
     f = lambda stage, micro_batch_id: actions[2 * micro_batch_id * num_stage + stage]
-    b = lambda stage, micro_batch_id: actions[(2 * micro_batch_id + 1) * num_stage + stage]
+    b = lambda stage, micro_batch_id: actions[(2 * micro_batch_id + 1) * num_stage + num_stage - 1 - stage]
 
     # action placement
     for stage in range(num_stage):
@@ -179,52 +165,18 @@ def pipeline_1f1b_schedule(actions, relations):
 
 
 
-def dist_policy(DAG, resources):
-    """
-    Policy decided the parallelisms and op-placement
-    """    
-    return DAG
-
-
-def set_schedule_policy(model, specific_schedule, bs):
-    """
-    forward_fn: forward function
-    backward_fn: backward_function
-    bs: global batch size
-    """
-    num_microbs = 4 if bs >= 4 else bs
-    schedule = pipeline_schedule(model.forward, backward, num_microbs)
-    model.set_schedule(schedule)
-
-
 if __name__ == '__main__':
 
     # define logical model / optimizer / data loader
     class LogicalModel: pass
     class Optimizer: pass
     class DataLoader: pass
+    compute_loss = lambda output, label : output
 
 
     model = LogicalModel()
     optimizer = Optimizer(model.parameters())
     dataloader = DataLoader(bs=1024)
-
-    # def forward_step(flow_in, data, label, **kwargs):
-    #     # this requires loss computation needs to be in the model
-    #     # output = model(data, label)
-    #     output = model(data, label)
-    #     # function wrapper
-    #     loss = compute_loss(output)
-    #     return output
-    # 
-    # def backward_step(output, **kwargs):
-    #     output.backward()
-    #     return output
-
-    # policy for placement and parallelisms -- will be hidden
-    model = dist_policy(get_dag(model, loss_compute, input_shapes), resources)
-    # data flow scheduling policy -- will be hidden
-    set_schedule_policy(model, pipeline_schedule, bs=1024)
 
     for epoch in range(100):
         for step, (data, label) in enumerate(dataloader):
@@ -244,6 +196,15 @@ if __name__ == '__main__':
         if (epoch + 1) % 4 == 0:
             model.eval()
             # evaluation
+
+
+
+
+# ======== example sequences for all kinds of configuration =============
+
+forward = lambda model, data: model(data)
+backward = lambda grad, output: output.backward(grad)
+update_gradient = lambda model, grad: model.update(grad)
 
 
 def train_iter_grad_accumulate(model, datas, stage=2, micro_bs=4):
