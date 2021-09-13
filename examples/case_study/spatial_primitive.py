@@ -36,6 +36,10 @@ def generate(tensor: PhyiscalTensor, rank): pass
 def all_gather(tensors, dim): pass
 
 
+# the logical op linear:
+def linear(inputs, weight, bias) -> LogicalTensor: pass
+
+
 def linear_tensor_parallel(inputs, weight, bias, output):
     """
     inputs: (M, K)
@@ -110,6 +114,45 @@ def linear_tensor_parallel(inputs, weight, bias, output):
         ranks = [0, 1, 2, 3],
         merge_op = partial(all_gather, dim=1)
     )
+
+
+def linear_tensor_parallel_space(inputs, weight, bias, output):
+    """
+    inputs: (M, K)
+    weight: (N, K)
+    bias: (N,)
+    output: (M, N)
+
+    Perform: (M, K) * (\delta N, K) + (\delta N,) = (M, \delta N)
+    """
+
+    # no split
+    def Full(): pass
+    # split at axis
+    def SplitAxis(axis, chunk_num, overlap): pass
+
+    # add constraints for inter-tensors
+    def add_constraint(condition): pass
+
+    # ========= segmentation constraints ===========#
+    inputs.segment = Full()
+    weight.segment = SplitAxis(
+        axis=0, chunk_num=None, overlap=0
+    )
+    bias.segment = SplitAxis(
+        axis=0, chunk_num=None, overlap=0
+    )
+    add_constraint(bias.segment.chunk_num == weight.segment.chunk_num)
+    
+    output.segment = SplitAxis(
+        axis=1, chunk_num=None, overlap=0
+    )
+    add_constraint(output.segment.chunk_num == weight.layout.chunk_num)
+
+    # ========= distributed algorithms ============#
+    for pweight, pbias, pout in zip(weight, bias, output):
+        pout.fill(linear(inputs, pweight, pbias))
+    return output
 
 
 ## =============== tensor movement / re-generation ============== ##
