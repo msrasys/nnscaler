@@ -13,40 +13,37 @@ def sschedule_dp(pDAG, resources, input_tensors):
     Data Parallel Description
 
     Args:
-        * pDAG: partial semantic (logical) computation graph
+        * pDAG: (partial) logical computation graph
         * Resources: Environment inlcuding devices, network topology etc
     Returns:
         * pDAGs (list[DAG]) execution (local & physical) DAG for each rank
     """
+    # rank [0,1,..., pp_size-1], [pp_size, ..., 2*pp_size - 1], ...
     ndevs = resources.ndevs
-    for data in input_tensors:
-        shape = data.shape
-        # set num micro-batch to 4
-        for sid in range(ndevs * 4):
-            chunk_shape = ()
-            for dim, size in enumerate(shape):
-                if dim == 0:
-                    chunk_size = shape[0] // ndevs // 4
-                    chunk_shape.append(slice(sid * chunk_size, (sid+1) * chunk_size))
-                else:
-                    chunk_shape.append(slice(0, size))
-            data.add_segment(select(data, chunk_shape, None))
-    pDAG.op[0].set_partition(input_tensors)
-    for inputs, op, outputs in iter_op(pDAG):
-        # inputs: op input tensors
-        # outputs: op output tensors
-        for dist_op in op.dist_candidates():
+    # suppose 8 devices, 4 for pipeline, 2 for data parallel
+    dp_size = 2
+    pp_size = 4
+    for op in iter_op(pDAG):
+        for op_id, dist_op in enumerate(op.dist_candidates()):
             # find the data parallelism
-            if dist_op.satisfy_and_set(inputs):
-                # set placement
-                dist_op.op_placement = list(range(ndevs))
-                # replace logical op to data parallelism
-                input_adapter(dist_op.inputs, target=inputs)
-                # output will be in data parallel format
+            if is_data_parallelism(dist_op):
+                for tensor in dist_op.inputs + dist_op.outputs:
+                    if isinstance(tensor.segment, SplitAxis):
+                        # pipeline micro-batch = 4
+                        tensor.segment.chunk_num = dp_size * 4
+                        # translate to logical tensor segments
+                        tensor.segment.translate()
+                dist_op.generate_ops()
+                # setup placement
+                stage = op_id // (len(pDAG) // pp_size)
+                for dp_id, sub_op in enumerate(dist_op.ops):
+                    sub_op.device = (dp_id % dp_size) * pp_size + stage
+                # materialize -- call to the deploy
+                dist_op.materialize()
+                # generate input adapter
                 pDAG.replace(op, dist_op)
-    # materialize to physical op
-    DAGs = generate_for_each_rank(pDAG, resources)
-    return DAGs
+                break
+    return pDAG
 
 
 def tschedule_1f1b(actions, relations, resources):
@@ -62,12 +59,6 @@ def tschedule_1f1b(actions, relations, resources):
 
     f = lambda stage, micro_batch_id: actions[2 * micro_batch_id * num_stage + stage]
     b = lambda stage, micro_batch_id: actions[(2 * micro_batch_id + 1) * num_stage + num_stage - 1 - stage]
-
-    # action placement
-    for stage in range(num_stage):
-        for mid in range(num_microbatch):
-            f(stage, mid).device = torch.device.cuda(stage)
-            b(stage, mid).device = torch.device.cuda(stage)
 
     # action in-device order
     stage_order = list()
