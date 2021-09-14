@@ -6,21 +6,19 @@ import argparse
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, dropout=0., mult=16, classes=1000):
+    def __init__(self, dim, dropout=0., mult=4):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim * mult),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * mult, dim)
-        )
-
-        self.classifier = nn.Linear(dim, classes)
+        self.linear1 = nn.Linear(dim, dim * mult)
+        self.gelu = nn.GELU()
+        self.linear2 = nn.Linear(dim * mult, dim)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        output = self.net(x)
-        output = self.classifier(output)
-        return output
+        x = self.linear1(x)
+        x = self.gelu(x)
+        x = self.linear2(x)
+        x = self.dropout(x)
+        return x
 
 
 def data_iter(bs, dim, classes, length=64):
@@ -34,13 +32,12 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--dim', type=int, default=1024)
-    parser.add_argument('--heads', type=int, default=16)
     parser.add_argument('--bs', type=int, default=8)
     parser.add_argument('--classes', type=int, default=10)
     args = parser.parse_args()
 
-    model = FeedForward(args.dim, mult=args.heads, classes=args.classes)
-    model = model.cuda()
+    model = torch.jit.script(FeedForward(args.dim).cuda())
+    print(model.code)
 
     optimizer = torch.optim.Adam(
         model.parameters(),
