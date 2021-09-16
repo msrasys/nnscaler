@@ -1,7 +1,8 @@
 """
 Convert PyTorch nn.Module to our IRGraph
 """
-from typing import List, Optional
+from cube.graph.unique import IDGenerator
+from typing import List, Optional, Any
 
 
 __all__ = ['IROperation', 'IRTensor', 'IRGraph']
@@ -34,7 +35,7 @@ class IROperation:
                 op = torch._C._nn.linear
         """
         # node info
-        self._id: int = NotImplementedError
+        self._id: int = IDGenerator().gen_op_id()
         self.name: str = name
 
         # op signature
@@ -44,8 +45,8 @@ class IROperation:
         self._inputs: List[IRTensor] = [None] * input_length
         self._predecessors: List[IROperation] = [None] * input_length
         # todo for outputs
-        self._outputs: List[IRTensor] = [None] * output_length
-        self._successors: List[IROperation] = [None] * output_length
+        self._outputs: List[IRTensor] = [IRTensor() for _ in range(output_length)]
+        self._successors: List[List(IROperation)] = [list() for _ in range(output_length)]
 
     def inputs(self, index: Optional[int] = None):
         """
@@ -122,6 +123,24 @@ class IROperation:
         else:
             raise TypeError("Expected index to be None or int")
 
+    def set_input(self, input_index: int, val: Any):
+        """
+        Set the node inputs[input_index] with the tensor
+
+        val: IRTensor or any deterministic value (int, bool, str, etc)
+        """
+        if input_index >= len(self.inputs()):
+            raise RuntimeError(
+                f"Set the input out of range ({input_index} >= {len(self._inputs)})"
+            )
+        # set tensor
+        self._inputs[input_index] = val
+        if isinstance(val, IRTensor):
+            # set predecessor
+            self._predecessors[input_index] = val.src()
+            # set the source node successor
+            val.src()._add_successor(val, self)
+
     def set_predecessor(self, input_index: int, node, out_index: int):
         """
         Set self node the input node. self.input[input_index] = node.output[out_index]
@@ -136,26 +155,61 @@ class IROperation:
         self._predecessors[input_index] = node
         node.set_successor(out_index, self)
 
-    def set_successor(self, out_index: int, node):
+    def _add_successor(self, tensor, node):
         """
         Set self node the output index node. 
         `node` will take the self.outputs(index) as the input
         """
-        if out_index >= len(self._outputs):
-            raise RuntimeError(
-                f"Set output index out of range ({out_index} >= {len(self._outputs)}"
-            )
-        self._successors[out_index] = node
+        out_index = self._outputs.index(tensor)
+        if out_index < 0:
+            raise RuntimeError("Fail to find output tensor")
+        self._successors[out_index].append(node)
 
 
 class IRTensor:
     """
     IRTensor serves as IRGraph edge
     """
-    def __init__(self, edge_id: int, shape: List[int], label: str):
-        self._id = edge_id
-        self.shape = shape
-        self.label = label
+    def __init__(self, shape=None, name=None):
+
+        self._id: int = IDGenerator().gen_tensor_id()
+        self._shape: Optional(List[int]) = shape
+        self.name = name
+        self.device = -1
+
+        # connected to IROperation
+        self._src_nodes: IROperation = None # -> output of the node
+        self._dst_nodes: List[IROperation] = list() # -> input of the nodes
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @shape.setter
+    def shape(self, val):
+        if self._shape is not None:
+            raise RuntimeError("Try to change shape")
+        if not all([isinstance(size, int) for size in val]):
+            raise RuntimeError("Expected shape to be list[int]")
+        self._shape = val
+
+    def src(self) -> Optional[IROperation]:
+        return self._src_nodes
+
+    def dst(self, index: Optional[int] = None):
+        if index >= len(self._dst_nodes):
+            raise RuntimeError("get tensor dst out of range")
+        return self._dst_nodes[index]
+
+    def set_src_nodes(self, node: IROperation):
+        if not isinstance(node, IROperation):
+            raise TypeError("IRTensor source node should be IROperation")
+        self._src_nodes = node
+
+    def add_dst_nodes(self, node: IROperation):
+        if not isinstance(node, IROperation):
+            raise TypeError("IRTensor destination node should be IROperation")
+        self._dst_nodes.append(IROperation)
 
 
 class IRGraph:
