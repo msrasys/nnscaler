@@ -1,114 +1,10 @@
 import torch
 import enum
 import re
-from collections import OrderedDict
-from typing import List, Any, Tuple
+from typing import List, Tuple
 
 from cube.graph.graph import IROperation, IRTensor
-
-
-class _Frame:
-    """
-    Frame to save call stack and variable
-    """
-    def __init__(self):
-
-        # var name -> value (IRTesnor, deterministic)
-        self._vars: List[dict[str, Any]] = list()
-        self._var_stack: List[str] = list()
-
-    def push(self):
-        """
-        This should only be called when step in a module
-        """
-        self._vars.append(OrderedDict())
-
-    def pop(self):
-        """
-        This should only be called step out a module
-        """
-        if len(self._vars) == 0:
-            raise RuntimeError("Try to pop stack with 0 depth")
-        self._vars.pop()
-
-    def add_var(self, var_name: str, val: Any, graph_arg: int = 0):
-        """
-        Add variable to the current frame
-
-        Args:
-            var_name (str): variable name (unique)
-            val: variable content
-            graph_arg (int):
-                indicate whether it is an argument of the graph.
-                If is 0, is not a graph arg.
-                If > 0, is a graph arg, will try to find 
-                val from previous frame
-        """
-        if not isinstance(var_name, str):
-            raise RuntimeError("Expected var_name is str")
-        if var_name in self._vars[-1]:
-            raise KeyError("Try to insert an already existed variable")
-        if graph_arg == 0:
-            self._vars[-1][var_name] = val
-        elif graph_arg > 0:
-            # root graph entry
-            if self.depth() == 1:
-                self._vars[-1][var_name] = val
-            # fucnton call
-            else:
-                prev_frame = self._vars[-2]
-                param_name = self._var_stack[0-graph_arg]
-                val = prev_frame[param_name]
-                self._vars[-1][var_name] = val
-        else:
-            raise ValueError("graph_arg (int) must be >= 0")
-
-    def get_var(self, var_name: str) -> Any:
-        """
-        Get variable value according to var_name
-
-        Special mapping between frames (function calls):
-
-            input.x will be mapped to output.k at the about 1-hop frame
-
-        Returns:
-            val (Any)
-        """
-        # first check whether we have variable in this frame
-        if var_name in self._vars[-1]:
-            return self._vars[-1][var_name]
-        raise KeyError(f"Cannot find var name {var_name}")
-
-    def push_param(self, var_name):
-        """
-        push var name to the method stack
-
-        Args:
-            var_name (str): variable name
-        """
-        if var_name not in self._vars[-1]:
-            raise KeyError(f"push {var_name} not declared")
-        self._var_stack.append(var_name)
-
-    def pop_param(self, times=1):
-        """
-        pop var name from the method stack
-        """
-        for _ in range(times):
-            self._var_stack.pop()
-
-    def depth(self):
-        return len(self._vars)
-
-    def __repr__(self):
-        dscp = f'frame: depth: {self.depth()}\n  var table:'
-        for var_name in self._vars[-1].keys():
-            dscp += f'\n    {var_name} : {self._vars[-1][var_name]}'
-        dscp += f'\n  var stack:'
-        for var_name in self._var_stack:
-            dscp += f'\n    {var_name}'
-        return dscp
-
+from cube.graph.frame import Frame
 
 class ScriptNodeKind(enum.Enum):
     PrimGetAttr = 1
@@ -123,7 +19,8 @@ class ScriptModuleParser:
 
     @staticmethod
     def parse_module(module,
-                     frame: _Frame = _Frame()) -> Tuple[List[IROperation], List[IRTensor]]:
+                     frame: Frame = Frame()) \
+        -> Tuple[List[IRTensor], List[IROperation], List[IRTensor]]:
         """
         The overall entry to parse a torchscript graph module
         """
@@ -132,26 +29,27 @@ class ScriptModuleParser:
         # handle graph input -- Assuming all the inputs are tensors
         input_var_name = [input.debugName() for input in module.graph.inputs()]
         # [1:] is to omit self
-        for var_name in input_var_name[1:][::-1]:
-            frame.add_var(var_name, IRTensor(name=var_name), graph_arg=True)
+        for index, var_name in enumerate(input_var_name[1:]):
+            frame.add_var(var_name, IRTensor(name=var_name), graph_arg=index)
+        input_val = [frame.get_var(var_name) for var_name in input_var_name[1:]]
 
         all_ir_nodes: List[IROperation] = list()
         for node in module.graph.nodes():
             # debug info
-            print(f'on parsing:\n\t{node}')
+            # print(f'on parsing:\n\t{node}')
             ir_nodes = ScriptModuleParser.parse_node(node, module, frame)
-            print(f'> {frame}')
-            print(f'> {ir_nodes}')
-            _ = input('>>>')
+            # print(f'> {frame}')
+            # print(f'> {ir_nodes}')
+            # _ = input('>>>')
             if len(ir_nodes) != 0:
-                all_ir_nodes.append(ir_nodes)
+                all_ir_nodes += ir_nodes
         
         # handle graph output -- Assuming all the output are tensors
         output_var_name = [output.debugName() for output in module.graph.outputs()]
         output_val = [frame.get_var(var_name) for var_name in output_var_name]
 
         frame.pop()
-        return all_ir_nodes, output_val
+        return input_val, all_ir_nodes, output_val
 
     @staticmethod
     def ntype(node: torch._C.Node):
@@ -170,7 +68,7 @@ class ScriptModuleParser:
         raise RuntimeError(f"Unkown node kind {node.kind()} from torchscript module")
 
     @staticmethod
-    def parse_node(node: torch._C.Node, module, frame: _Frame) -> List[IROperation]:
+    def parse_node(node: torch._C.Node, module, frame: Frame) -> List[IROperation]:
         """
         Parse the node and return the IROperation nodes
         """
@@ -187,7 +85,7 @@ class ScriptModuleParser:
             return ScriptModuleParser.parse_prim_constant_node(node, module, frame)
 
     @staticmethod
-    def parse_prim_function_node(node, module, frame: _Frame) -> List[IROperation]:
+    def parse_prim_function_node(node, module, frame: Frame) -> List[IROperation]:
         """
         parse node like:
             Tensor = prim::CallFunction(%5, %input.1, %3, %4)
@@ -223,7 +121,7 @@ class ScriptModuleParser:
         return [ir_node]
 
     @staticmethod
-    def parse_aten_node(node, module, frame: _Frame) -> List[IROperation]:
+    def parse_aten_node(node, module, frame: Frame) -> List[IROperation]:
         """
         Parse script module node like:
             %13 : Tensor = aten::gt(%output1.1, %output2.1)
@@ -257,7 +155,7 @@ class ScriptModuleParser:
         return [ir_node]
 
     @staticmethod
-    def parse_prim_method_node(node, module, frame: _Frame) -> List[IROperation]:
+    def parse_prim_method_node(node, module, frame: Frame) -> List[IROperation]:
         """
         Parse script module node like:
             %output.1 : Tensor = prim::CallMethod[name="forward"](%2, %x.1)
@@ -272,35 +170,25 @@ class ScriptModuleParser:
         if label != 'forward':
             raise RuntimeError(f"{node} is calling function {label} that is not `forward`")
 
-        # cell node that will not appear in final graph
-        signature = frame.get_var(node.inputsAt(0).debugName())
-        ir_node = IROperation(
-            name = signature + '.' + label,
-            signature = signature,
-            input_length = len(inputs) - 1,
-            output_length = len(outputs)
-        )
-
         # handle inputs -- in stack with reverse order
-        for index, input in enumerate(inputs[1:][::-1]):
+        for input in inputs[1:][::-1]:
             var_name = input.debugName()
             val = frame.get_var(var_name)
-            ir_node.set_input(-1-index, val)
             frame.push_param(var_name)
 
-        print(f'> {frame}')
+        # print(f'> {frame}')
 
         # recursively parse the module
         module_label = node.inputsAt(0).node().s('name')
         call_module = getattr(module, module_label)
-        ir_nodes, outputs_val = ScriptModuleParser.parse_module(call_module, frame)
+        _, ir_nodes, outputs_val = ScriptModuleParser.parse_module(call_module, frame)
 
         # pop out the frame
         frame.pop_param(times=len(inputs)-1)
 
         # handle outputs
         outputs = [output for output in node.outputs()]
-        for index, (output, val) in enumerate(zip(outputs, outputs_val)):
+        for output, val in zip(outputs, outputs_val):
             frame.add_var(output.debugName(), val)
 
         return ir_nodes
@@ -364,6 +252,8 @@ class ScriptModuleParser:
 
         if dtype == 'Function':
             signature = repr(node.outputsAt(0).type())
+            if '__torch__.' in signature:
+                signature = re.sub('__torch__.', '', signature)
             frame.add_var(var_name, signature)
         else:
             val = node.outputsAt(0).toIValue()
@@ -371,7 +261,7 @@ class ScriptModuleParser:
         return list()
 
     @staticmethod
-    def parse_prim_if_node(node, module, frame: _Frame) -> List[IROperation]:
+    def parse_prim_if_node(node, module, frame: Frame) -> List[IROperation]:
         """
         Parse script module node like 
             %output2 : Tensor = prim::If(%15) # /tmp/ipykernel_27188/2459450745.py:13:8

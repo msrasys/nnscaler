@@ -24,15 +24,8 @@ class IROperation:
         Args:
             name (str): the op semantic name
             signature (str): the op signature, e.g., torch.functional.nn.linear
-
-        Example:
-            init code:
-                self.linear1 = torch.nn.Linear(input_feats, output_feats)
-            forward code:
-                output = self.linear1(input)
-            =>
-                label = linear1;
-                op = torch._C._nn.linear
+            input_length (int): the number of inputs for the op
+            output_length (int): the number of outputs for the op
         """
         # node info
         self._id: int = IDGenerator().gen_op_id()
@@ -46,6 +39,8 @@ class IROperation:
         self._predecessors: List[IROperation] = [None] * input_length
         # todo for outputs
         self._outputs: List[IRTensor] = [IRTensor() for _ in range(output_length)]
+        for tensor in self._outputs:
+            tensor.set_src_node(self)
         self._successors: List[List(IROperation)] = [list() for _ in range(output_length)]
 
     def inputs(self, index: Optional[int] = None):
@@ -206,7 +201,7 @@ class IRTensor:
             raise RuntimeError("get tensor dst out of range")
         return self._dst_nodes[index]
 
-    def set_src_nodes(self, node: IROperation):
+    def set_src_node(self, node: IROperation):
         if not isinstance(node, IROperation):
             raise TypeError("IRTensor source node should be IROperation")
         self._src_nodes = node
@@ -217,7 +212,7 @@ class IRTensor:
         self._dst_nodes.append(IROperation)
 
     def __repr__(self):
-        dscp = f'Tensor(id={self._id}, name={self.name}, shape={self.shape})'
+        dscp = f'Tensor(id={self._id}, shape={self.shape})'
         return dscp
 
 
@@ -228,9 +223,15 @@ class IRGraph:
     The IR Graph only contains forward graph
     """
 
-    def __init__(self, module_name: str):
+    def __init__(self, 
+                 nodes: List[IROperation],
+                 input_tensors: List[IRTensor], 
+                 output_tensors: List[IRTensor], 
+                 module_name: str):
         self.module_name = module_name
-        self._nodes: List[IROperation] = list()
+        self._nodes: List[IROperation] = nodes
+        self._input_tensors = input_tensors
+        self._output_tensors = output_tensors
 
     def add_node(self, node: IROperation):
         if not isinstance(node, IROperation):
@@ -252,3 +253,18 @@ class IRGraph:
         Replace the node with new nodes (IRGraph)
         """
         raise NotImplementedError
+
+    def __repr__(self):
+        dscp = ''
+        # inputs
+        dscp += f'Inputs: {self._input_tensors}\n'
+        # nodes
+        for node in self._nodes:
+            succ_node_ids = [None] * len(node.outputs())
+            for out_idx, node_list in enumerate(node.successors()):
+                node_list = [snode._id for snode in node_list]
+                succ_node_ids[out_idx] = node_list
+            dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}\n"
+        # outputs
+        dscp += f'\nOutputs: {self._output_tensors}'
+        return dscp
