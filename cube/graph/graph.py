@@ -139,7 +139,8 @@ class IROperation:
             # set predecessor
             self._predecessors[input_index] = val.src()
             # set the source node successor
-            val.src()._add_successor(val, self)
+            if isinstance(val.src(), IROperation):
+                val.src()._add_successor(val, self)
 
     def set_predecessor(self, input_index: int, node, out_index: int):
         """
@@ -164,6 +165,10 @@ class IROperation:
         if out_index < 0:
             raise RuntimeError("Fail to find output tensor")
         self._successors[out_index].append(node)
+
+    def __repr__(self):
+        dscp = f'Op(id={self._id}, signature={self.signature}, inputs={self._inputs}, outputs={self._outputs})'
+        return dscp
 
 
 class IRTensor:
@@ -210,6 +215,10 @@ class IRTensor:
         if not isinstance(node, IROperation):
             raise TypeError("IRTensor destination node should be IROperation")
         self._dst_nodes.append(IROperation)
+
+    def __repr__(self):
+        dscp = f'Tensor(id={self._id}, name={self.name}, shape={self.shape})'
+        return dscp
 
 
 class IRGraph:
