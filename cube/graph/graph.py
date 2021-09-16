@@ -230,8 +230,8 @@ class IRGraph:
                  module_name: str):
         self.module_name = module_name
         self._nodes: List[IROperation] = nodes
-        self._input_tensors = input_tensors
-        self._output_tensors = output_tensors
+        self._inputs = input_tensors
+        self._outputs = output_tensors
 
     def add_node(self, node: IROperation):
         if not isinstance(node, IROperation):
@@ -248,6 +248,38 @@ class IRGraph:
             )
         return self._nodes[index]
 
+    def inputs(self, index: Optional[int] = None):
+        if isinstance(index, int):
+            if index >= len(self._inputs):
+                raise RuntimeError(
+                    f"Get the input out of range ({index} >= {len(self._inputs)}"
+                )
+            return self._inputs[index]
+        elif index is None:
+            return self._inputs
+        else:
+            raise TypeError("Expected index to be None or int")
+
+    def outputs(self, index: Optional[int] = None):
+        """
+        Get output tensor at output index
+
+        Args:
+            index (int or None): 
+                index of the outputs, None will return the nodes
+                for all the outputs
+        """
+        if isinstance(index, int):
+            if index >= len(self._outputs):
+                raise RuntimeError(
+                    f"Get the output out of range ({index} >= {len(self._outputs)}"
+                )
+            return self._outputs[index]
+        elif index is None:
+            return self._outputs
+        else:
+            raise TypeError("Expected index to be None or int")
+
     def replace(self, target: IROperation, nodes: List[IROperation]):
         """
         Replace the node with new nodes (IRGraph)
@@ -257,7 +289,7 @@ class IRGraph:
     def __repr__(self):
         dscp = ''
         # inputs
-        dscp += f'Inputs: {self._input_tensors}\n'
+        dscp += f'Inputs: {self._inputs}\n'
         # nodes
         for node in self._nodes:
             succ_node_ids = [None] * len(node.outputs())
@@ -266,5 +298,5 @@ class IRGraph:
                 succ_node_ids[out_idx] = node_list
             dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}\n"
         # outputs
-        dscp += f'\nOutputs: {self._output_tensors}'
+        dscp += f'\nOutputs: {self._outputs}'
         return dscp

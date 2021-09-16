@@ -16,20 +16,13 @@ class SymbolTable:
     def __init__(self):
         self._varlist = list()
 
-    def create(self, var_name):
+    def create(self, var_name: str):
         """
-        Create a variable with a type.
-        
-        If var_name is already declared:
-            if the declared type matches with var_name, return False.
-            else raise Error
-        
-        If var name is not declared, decalre the var and return True.
+        Create a variable.
 
         Args:
             var_name (str): variable name
-            var_type (Dtype): variable type
-        
+
         Returns:
             True if declared, False if the var already exists.
         """
@@ -39,7 +32,7 @@ class SymbolTable:
         else:
             self._varlist.append(var_name)
     
-    def exist(self, var_name):
+    def exist(self, var_name: str):
         """
         Check whether a variable exists
         """

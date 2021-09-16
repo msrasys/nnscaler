@@ -1,4 +1,4 @@
-
+from typing import List
 
 class Block:
 
@@ -27,8 +27,15 @@ class Block:
 
 
 class FunctionBlock(Block):
+    """
+    Create a function block with function definition
+    """
 
-    def __init__(self, func_name, args):
+    def __init__(self, func_name: str, args: List[str]):
+        if not isinstance(func_name, str):
+            raise TypeError("Expected func_name to be str")
+        if not isinstance(args, list):
+            raise TypeError("Expcted args to be list[str]")
         self.func_name = func_name
         self.param_name = args
         args = ', '.join(args)
