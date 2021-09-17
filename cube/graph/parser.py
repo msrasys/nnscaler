@@ -143,24 +143,36 @@ class ScriptModuleParser:
         inputs = [input for input in node.inputs()]
         outputs = [output for output in node.outputs()]
 
+        # handle inputs:
+        # TODO: fix omitted kwargs
+        # We will omit arg index >= 2 as we assume the 
+        # tensor op at most gets 2 tensor, others are kwargs
+        input_val = list()
+        maybe_kwarg = len(inputs) > 2
+        for reverse_index, input in enumerate(inputs[::-1]):
+            var_name = input.debugName()
+            val = frame.get_var(var_name)
+            index = len(inputs) - 1 - reverse_index
+            if maybe_kwarg and (not isinstance(val, IRTensor)) and index > 1:
+                continue
+            else:
+                input_val.append(val)
+                maybe_kwarg = False
+        input_val = input_val[::-1]
+        if len(input_val) < len(inputs):
+            print(f"Warning: some non-tensor arguments are ommited in {fsig}")
+
         # create IR node
         ir_node = IROperation(
             signature = fsig,
             name = fsig,
-            input_length = len(inputs),
+            input_length = len(input_val),
             output_length = len(outputs)
         )
-
-        # handle inputs
-        inputs = [input for input in node.inputs()]
-        # in stack with reverse order
-        for index, input in enumerate(inputs):
-            var_name = input.debugName()
-            val = frame.get_var(var_name)
+        for index, val in enumerate(input_val):
             ir_node.set_input(index, val)
 
         # handle outputs
-        outputs = [output for output in node.outputs()]
         for index, output in enumerate(outputs):
             frame.add_var(output.debugName(), ir_node.outputs(index))
 

@@ -18,8 +18,8 @@ class FeedForward(nn.Module):
         output = self.linear1(data)
         output = self.gelu(output)
         output = self.dropout(output)
-        output = output + data
         output = self.linear2(output)
+        output = output + data
         output = self.classifier(output)
         return output
 
