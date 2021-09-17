@@ -1,13 +1,13 @@
 """
 Generate Pytorch code given the model DAG and the transformation config
 """
-
-from inspect import Arguments
 from typing import List, Any
 
 from cube.graph import IRGraph, IRTensor, IROperation
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
+
+import torch
 
 
 class SScheduleCodeGen:
@@ -27,6 +27,8 @@ class SScheduleCodeGen:
         self.forward_region: List[str] = list()
         # module member name
         self.symbols = SymbolTable()
+        # ref module to check shared variables
+        self._ref_module = torch.nn.Module()
 
     def gen(self, outfile=None) -> List[str]:
         """
@@ -84,13 +86,13 @@ class SScheduleCodeGen:
                 code = f'self.{name} = torch.nn.Parameter(torch.empty({tuple(var.shape)}))'
                 self.declare_region.append(code)
         elif isinstance(var, str):
-            # TODO: handle var that is not default in nn.Module
-            pass
-            # name = self.naming(var)
-            # if self.symbols.create(name):
-            #     #TODO: add type info
-            #     code = f'{name} = None'
-            #     self.declare_region.append(code)
+            name = self.naming(var)
+            if name.startswith('self.'):
+                if not hasattr(self._ref_module, var):
+                    if self.symbols.create(name):
+                        #TODO: add default value
+                        code = f'{name} = None'
+                        self.declare_region.append(code)
         return
 
     def emit_op_call(self, node: IROperation):
@@ -112,8 +114,11 @@ class SScheduleCodeGen:
         Will add prefix 'self.' for var defined in declare region
         """
         named_args : List[str] = list()
+        input_name = [self.naming(input) for input in self.graph.inputs()]
         for arg in args:
-            if isinstance(arg, IRTensor) and arg.is_leaf():
+            name = self.naming(arg)
+            if isinstance(arg, IRTensor) and \
+               arg.is_leaf() and (name not in input_name):
                 named_args.append('self.' + self.naming(arg))
             else:
                 named_args.append(self.naming(arg))
