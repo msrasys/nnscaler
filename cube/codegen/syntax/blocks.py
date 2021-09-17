@@ -31,9 +31,12 @@ class Block:
 class FunctionBlock(Block):
     """
     Create a function block with function definition
+
+    If class has derived class, then require the derived classes
+    has no argument for __init__
     """
 
-    def __init__(self, func_name: str, args: List[str]):
+    def __init__(self, func_name: str, args: List[str], derived=True):
         if not isinstance(func_name, str):
             raise TypeError("Expected func_name to be str")
         if not isinstance(args, list):
@@ -43,9 +46,19 @@ class FunctionBlock(Block):
         args = ', '.join(args)
         title = f'def {self.func_name}({args}):'
         super().__init__(title)
+        self.derived = derived
+
+    def __enter__(self):
+        # assume no argument for initialize super class
+        if self.derived and self.func_name == '__init__':
+            self.insert_body('super().__init__()')
+        return self
 
 
 class ClassBlock(Block):
+    """
+    Class definition.
+    """
 
     def __init__(self, class_name, derived=None):
         if not isinstance(class_name, str):

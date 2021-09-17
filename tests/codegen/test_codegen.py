@@ -27,11 +27,26 @@ class FeedForward(nn.Module):
 model = FeedForward(dim=1024)
 
 
+def import_from_file(filename):
+    print(f'> loading GenModel from {filename} ...')
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("GenModel", filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.GenModel
+
+
 def test_codegen(model):
     graph = cgraph.convert(model,
                            input_shapes=([1024,1024],[1,]))
     gener = SScheduleCodeGen(graph)
-    gener.gen(outfile='code.py')
+    code = gener.gen(outfile='code.py')
+    
+    # execute
+    print(code)
+    GenModel = import_from_file('code.py')
+    model = GenModel()
+    print(model)
 
 
 if __name__ == '__main__':
