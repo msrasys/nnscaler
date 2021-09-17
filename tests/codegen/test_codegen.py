@@ -36,6 +36,12 @@ def import_from_file(filename):
     return module.GenModel
 
 
+def init_weight(parameters):
+    for param in parameters:
+        with torch.no_grad():
+            torch.nn.init.uniform_(param)
+
+
 def test_codegen(model):
     graph = cgraph.convert(model,
                            input_shapes=([1024,1024],[1,]))
@@ -43,10 +49,26 @@ def test_codegen(model):
     code = gener.gen(outfile='code.py')
     
     # execute
+    print("> ===== Generated Code =====")
     print(code)
+    print("< ===== Generated Code =====")
+    
     GenModel = import_from_file('code.py')
-    model = GenModel()
-    print(model)
+    model = GenModel().cuda()
+
+    init_weight(model.parameters())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+
+    print("> training 10 iterations...")
+
+    for _ in range(10):
+        data = torch.randn([64,1024], device=torch.device('cuda:0'))
+        out = model(data, 0)
+        loss = torch.mean(out) / 1000
+        print(f'> loss: {loss.item()}')
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
 
 
 if __name__ == '__main__':
