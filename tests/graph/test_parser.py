@@ -1,5 +1,5 @@
-from cube.graph.parser import ScriptModuleParser
-import torch
+from cube.graph import parser
+import cube.graph.parser as parser
 from torch import nn
 
 import cube.graph as cgraph
@@ -30,7 +30,7 @@ def test_flatten(smodule):
     ScriptModuleParser.flatten(smodule)
 
 def test_parse_module(model):
-    return cgraph.convert(model, input_shapes=([1024,1024],[1,]))
+    return parser.convert(model, input_shapes=([1024,1024],[1,]))
 
 
 if __name__ == '__main__':

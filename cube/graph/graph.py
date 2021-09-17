@@ -321,6 +321,12 @@ class IRGraph:
         """
         raise NotImplementedError
 
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def __call__(self, *args, **kwargs):
+        raise NotImplementedError
+
     def __repr__(self):
         dscp = ''
         # inputs

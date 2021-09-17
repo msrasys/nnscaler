@@ -43,7 +43,7 @@ def init_weight(parameters):
 
 
 def test_codegen(model):
-    graph = cgraph.convert(model,
+    graph = cgraph.parser.convert(model,
                            input_shapes=([1024,1024],[1,]))
     gener = SScheduleCodeGen(graph)
     code = gener.gen(outfile='code.py')

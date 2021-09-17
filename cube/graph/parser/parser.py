@@ -4,7 +4,7 @@ import re
 from typing import List, Tuple, Optional
 
 from cube.graph import IROperation, IRTensor
-from cube.graph.frame import Frame
+from cube.graph.parser.frame import Frame
 
 class ScriptNodeKind(enum.Enum):
     PrimGetAttr = 1
