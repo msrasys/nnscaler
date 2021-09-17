@@ -1,7 +1,6 @@
-"""
-Convert PyTorch nn.Module to our IRGraph
-"""
 from cube.graph.unique import IDGenerator
+from cube.graph.mapping import IR2LogicOp
+
 from typing import List, Optional, Any
 
 
@@ -31,8 +30,9 @@ class IROperation:
         self._id: int = IDGenerator().gen_op_id()
         self.name: str = name
 
-        # op signature
+        # op signature and op class
         self.signature: str = signature
+        self.op = IR2LogicOp.map(self.signature)
         
         # edge (dataflow info)
         self._inputs: List[IRTensor] = [None] * input_length
@@ -161,6 +161,29 @@ class IROperation:
             raise RuntimeError("Fail to find output tensor")
         self._successors[out_index].append(node)
 
+    def infer_shape(self):
+        """
+        Infer output value shape
+        """
+        shapes = list()
+        for input in self.inputs():
+            if isinstance(input, IRTensor):
+                if input.shape is None:
+                    return False
+                shapes.append(input.shape)
+            else:
+                shapes.append([1,])
+        shapes = tuple(shapes)
+        out_shapes = self.op.shape_infer(*shapes)
+        if len(out_shapes) != len(self._outputs):
+            raise RuntimeError(
+                "The logical op semantic doesn't match with parsed op"
+            )
+        for shape, val in zip(out_shapes, self._outputs):
+            if isinstance(val, IRTensor):
+                val.shape = shape
+        return True
+
     def __repr__(self):
         dscp = f'Op(id={self._id}, signature={self.signature}, inputs={self._inputs}, outputs={self._outputs})'
         return dscp
@@ -187,9 +210,10 @@ class IRTensor:
 
     @shape.setter
     def shape(self, val):
-        if self._shape is not None:
+        if self._shape is not None and self._shape != val:
             raise RuntimeError("Try to change shape")
-        if not all([isinstance(size, int) for size in val]):
+        if not isinstance(val, list) or \
+           not all([isinstance(size, int) for size in val]):
             raise RuntimeError("Expected shape to be list[int]")
         self._shape = val
 

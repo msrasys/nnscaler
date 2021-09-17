@@ -1,9 +1,9 @@
 import torch
 import enum
 import re
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
-from cube.graph.graph import IROperation, IRTensor
+from cube.graph import IROperation, IRTensor
 from cube.graph.frame import Frame
 
 class ScriptNodeKind(enum.Enum):
@@ -19,6 +19,7 @@ class ScriptModuleParser:
 
     @staticmethod
     def parse_module(module,
+                     input_shapes: Optional[ Tuple[List[int],] ] = None,
                      frame: Frame = Frame()) \
         -> Tuple[List[IRTensor], List[IROperation], List[IRTensor]]:
         """
@@ -28,10 +29,19 @@ class ScriptModuleParser:
 
         # handle graph input -- Assuming all the inputs are tensors
         input_var_name = [input.debugName() for input in module.graph.inputs()]
-        # [1:] is to omit self
-        for index, var_name in enumerate(input_var_name[1:]):
+        for index, var_name in enumerate(input_var_name[1:]): # omit self
             frame.add_var(var_name, IRTensor(name=var_name), graph_arg=index)
         input_val = [frame.get_var(var_name) for var_name in input_var_name[1:]]
+
+        # handle input shape
+        if input_shapes:
+            if len(input_val) != len(input_shapes):
+                raise RuntimeError(
+                    f"Module {module.original_name} input shape mismatch (got {len(input_shapes)} != {len(input_val)})"
+                )
+            for shape, val in zip(input_shapes, input_val):
+                if isinstance(val, IRTensor):
+                    val.shape = shape
 
         all_ir_nodes: List[IROperation] = list()
         for node in module.graph.nodes():
@@ -42,6 +52,8 @@ class ScriptModuleParser:
             # print(f'> {ir_nodes}')
             # _ = input('>>>')
             if len(ir_nodes) != 0:
+                for ir_node in ir_nodes:
+                    ir_node.infer_shape()
                 all_ir_nodes += ir_nodes
         
         # handle graph output -- Assuming all the output are tensors
@@ -181,7 +193,7 @@ class ScriptModuleParser:
         # recursively parse the module
         module_label = node.inputsAt(0).node().s('name')
         call_module = getattr(module, module_label)
-        _, ir_nodes, outputs_val = ScriptModuleParser.parse_module(call_module, frame)
+        _, ir_nodes, outputs_val = ScriptModuleParser.parse_module(call_module, frame=frame)
 
         # pop out the frame
         frame.pop_param(times=len(inputs)-1)

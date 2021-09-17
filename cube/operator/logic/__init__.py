@@ -1,1 +1,1 @@
-from cube.operator.logic.linear import Linear
+from cube.operator.logic.function import *

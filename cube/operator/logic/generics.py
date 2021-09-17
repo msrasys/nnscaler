@@ -1,37 +1,23 @@
-"""
-A Logical Operator: 
-    * Statusless
-    * Can be executed by only one kernel (atomic) on single device
-
-Logical Operator
-    |- Holistic Operator 1
-    |   |- Physical Operator(s)
-    |- Holistic Operator 2
-    |- ...
-
-Holistic operators are allowed to nested in hybrid-distribution strategy
-"""
-
-from cube.tensor.logic.tensor import LogicalTensor
+from typing import List
 
 
-class HolisticOpFactory:
+class DistAlgorithmFactory:
 
     def __init__(self):
 
-        self.holist_ops = list()
+        self.algorithms = list()
 
     def __len__(self):
         """
         Return the number of holistic op registered
         """
-        return len(self.holist_ops)
+        return len(self.algorithms)
 
-    def register(self, holistic_op):
+    def register(self, algorithm):
         """
         Register a holistic op (class) as one of the anchors 
         """
-        self.holist_ops.append(holistic_op)
+        self.algorithms.append(algorithm)
 
     def get_op(self, idx, outputs, *args, **kwargs):
         """
@@ -46,20 +32,28 @@ class HolisticOpFactory:
         Returns:
             HolisticOp instance
         """
-        return self.holist_ops[idx](outputs, *args, **kwargs)
+        return self.algorithms[idx](outputs, *args, **kwargs)
 
 
 class GenericLogicalOp:
 
-    _default_policy_fn = None
+    def __init__(self, signature: str):
+        """
+        Generic logical operator
 
-    def __init__(self):
-
-        # candidate holistic operator
-        self.factory = HolisticOpFactory()
-        self.policy_fn = None
+        signature (str):
+            Framework implementation signature,
+                e.g., 'torch.nn.functional.linear'
+        """
+        if not isinstance(signature, str):
+            raise TypeError("Expect signature to be a string")
+        # factory 
+        self.factory = DistAlgorithmFactory()
+        # torch impl signature
+        self.signature = signature
     
-    def shape_infer(self, *args, **kwargs):
+    @staticmethod
+    def shape_infer(*args, **kwargs):
         """
         Output shape inference according to inputs
 
@@ -70,49 +64,31 @@ class GenericLogicalOp:
             shapes tuple(list[int]): shape for each output tensor
         """
         raise NotImplementedError("Expected a shape infer engine")
-
-    def get_op(self, *args, **kwargs):
-        # get shapes of input and output
-        shapes = self.shape_infer(*args, **kwargs)
-        outputs = [LogicalTensor(shape=shape, init_data=False) for shape in shapes]
-        # use default policy
-        if self.policy_fn is None:
-            composite_op = self._default_policy_fn[0](self.factory, outputs, *args, **kwargs)
-        # use user-customized policy
-        else:
-            composite_op = self.policy_fn[0](self.factory, outputs, *args, **kwargs)
-        return composite_op
-
-    def __call__(self, *args, **kwargs):
-        """
-        Policy here to determine which holistic operator(s) are called
-        """
-        composite_op = self.get_op(*args, **kwargs)
-        # run operator with the strategy plan
-        outputs = composite_op(*args, **kwargs)
-        return outputs
-
-    def set_policy(self, policy_fn):
-        """
-        Register a policy function to customize how composite
-        holistic op generated during runtime.
-
-        The `policy_fn` takes self.factory as input and returns a composite
-        holistic operator (callable)
-        """
-        if not callable(policy_fn):
-            raise TypeError("Expected a callable function")
-        self.policy_fn = (policy_fn,)
     
-    @classmethod
-    def set_default_policy(self, policy_fn):
+    def register_algorithm(self, algorithm):
         """
-        Register a default policy function to all instances.
-        Customize how composite holistic op generated during runtime.
+        Register a distributed algoritm description
+        """
+        self.factory.register(algorithm)
 
-        The `policy_fn` takes self.factory and shapes as input,
-        and returns a composite holistic operator (callable)
+    def translate(self, config):
         """
-        if not callable(policy_fn):
-            raise TypeError("Expected a callable function")
-        self._default_policy_fn = (policy_fn,)
+        Translate the algorithm to implementation
+        """
+        raise NotImplementedError("Expected a tranlation for operator")
+
+
+class ElementSameInputOp(GenericLogicalOp):
+
+    def __init__(self):
+        """
+        Elementwise Operator
+        """
+        super().__init__()
+
+    @staticmethod
+    def shape_infer(input: List[int], *args, **kwargs):
+        """
+        Element-wise single input op
+        """
+        return [input]
