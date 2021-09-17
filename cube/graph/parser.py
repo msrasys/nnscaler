@@ -220,7 +220,8 @@ class ScriptModuleParser:
 
         # this usually means weight (nn.Parameter in torch)
         if dtype == 'Tensor':
-            ir_tensor = IRTensor(name=label)
+            shape = list(getattr(module, label).shape)
+            ir_tensor = IRTensor(name=label, shape=shape)
             frame.add_var(var_name, ir_tensor)
         # symbolic attributes
         elif dtype in ['bool', 'int', 'float']:
