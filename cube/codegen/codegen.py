@@ -2,6 +2,7 @@
 Generate Pytorch code given the model DAG and the transformation config
 """
 
+from inspect import Arguments
 from typing import List, Any
 
 from cube.graph import IRGraph, IRTensor, IROperation
@@ -19,7 +20,7 @@ class SScheduleCodeGen:
             raise TypeError("graph should be IRGraph")
         self.graph = graph
         # model full code
-        self.code: List[str] = list()
+        self.code: List[str] = ['import torch', '', '']
         # module init code
         self.declare_region: List[str] = list()
         # module forward code
@@ -48,20 +49,27 @@ class SScheduleCodeGen:
                     self.symbols.create(self.naming(out))
 
         # generate full code
-        with ClassBlock(class_name='GenModel', derived='torch.nn.Module') as cb:
+        with ClassBlock(class_name='GenModel', derived=['torch.nn.Module']) as cb:
             with FunctionBlock(func_name='__init__', args=['self']) as ib:
                 ib.insert_body(self.declare_region)
+            cb.insert_body('')
             cb.insert_body(ib.code)
             with FunctionBlock(func_name='forward', args=['self']+fargs) as fb:
-                fb.insert_body(self.emit_op_call)
+                fb.insert_body(self.forward_region)
+                # generate output
+                out_names = self._forward_region_arg_names(self.graph.outputs())
+                return_code = f"return {', '.join(out_names)}"
+                fb.insert_body(return_code)
+            cb.insert_body('')
             cb.insert_body(fb.code)
-        self.code = cb.code
+        self.code += cb.code
+        self.code += ['']
 
         # write to file
         if outfile:
-            with open(outfile, 'w'):
-                for line in self.code:
-                    outfile.write(line)
+            with open(outfile, 'w') as f:
+                code = '\n'.join(self.code)
+                f.write(code)
 
         return self.code
 
@@ -73,14 +81,16 @@ class SScheduleCodeGen:
             name = self.naming(var)
             # indicate this is a leaf tensor, should be parameter
             if self.symbols.create(name):
-                code = f'self.{name} = torch.nn.Parameter(torch.empty({tuple(IRTensor.shape)}))'
+                code = f'self.{name} = torch.nn.Parameter(torch.empty({tuple(var.shape)}))'
                 self.declare_region.append(code)
         elif isinstance(var, str):
-            name = self.naming(var)
-            if self.symbols.create(name):
-                #TODO: add type info
-                code = f'self.{name} = None'
-                self.declare_region.append(code)
+            # TODO: handle var that is not default in nn.Module
+            pass
+            # name = self.naming(var)
+            # if self.symbols.create(name):
+            #     #TODO: add type info
+            #     code = f'{name} = None'
+            #     self.declare_region.append(code)
         return
 
     def emit_op_call(self, node: IROperation):
@@ -88,18 +98,38 @@ class SScheduleCodeGen:
         Emit op forward code
         """
         op_code = node.signature
-        out_region = ', '.join([self.naming(out) for out in node.outputs()])
-        arg_region = '(' + ', '.join([self.naming(arg) for arg in node.inputs()]) + ')'
-        code = f'{out_region} = {op_code}{arg_region}'
+        out_names = self._forward_region_arg_names(node.outputs())
+        out_names = ', '.join(out_names)
+        arg_names = self._forward_region_arg_names(node.inputs())
+        arg_region = '(' + ', '.join(arg_names) + ')'
+        code = f'{out_names} = {op_code}{arg_region}'
         self.forward_region.append(code)
+
+    def _forward_region_arg_names(self, args: List[Any]):
+        """
+        Generate arg name list for forward region.
+
+        Will add prefix 'self.' for var defined in declare region
+        """
+        named_args : List[str] = list()
+        for arg in args:
+            if isinstance(arg, IRTensor) and arg.is_leaf():
+                named_args.append('self.' + self.naming(arg))
+            else:
+                named_args.append(self.naming(arg))
+        return named_args
 
     def naming(self, tensor: Any) -> str:
         """
         Return the var name (unique for different variable)
+
+        If the var is a leaf tensor, will add prefix `self.` to its name
         """
         if isinstance(tensor, IRTensor):
             tensor_name = 'tensor' if tensor.name is None else tensor.name
-            name = '_'.join([tensor_name, tensor._id])
+            if '.' in tensor_name:
+                tensor_name = tensor_name.split('.')[0]
+            name = '_'.join([tensor_name, str(tensor._id)])
         else:
             name = str(tensor)
         return name

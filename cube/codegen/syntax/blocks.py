@@ -13,10 +13,12 @@ class Block:
     def insert_body(self, code):
         if isinstance(code, list):
             self.code += code
-        elif type(code) == str:
+        elif isinstance(code, str):
             self.code.append(code)
         else:
-            raise TypeError
+            raise TypeError(
+                f"Get type {type(code)} but expected list[str] or list"
+            )
 
     def __exit__(self, exc_type, exc_value, exc_tb):
         # add indent for function block
@@ -54,6 +56,5 @@ class ClassBlock(Block):
         if derived:
             derived = ', '.join(derived)
             derived = f'({derived})'
-        title = f'class {self.class_name}{derived}'
-        super().__init__(self, title)
-
+        title = f'class {self.class_name}{derived}:'
+        super().__init__(title)

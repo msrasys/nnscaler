@@ -31,7 +31,8 @@ class SymbolTable:
             return False
         else:
             self._varlist.append(var_name)
-    
+            return True
+
     def exist(self, var_name: str):
         """
         Check whether a variable exists

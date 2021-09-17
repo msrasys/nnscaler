@@ -235,6 +235,12 @@ class IRTensor:
             raise TypeError("IRTensor destination node should be IROperation")
         self._dst_nodes.append(IROperation)
 
+    def is_leaf(self):
+        """
+        Check if it is a leaf tensor (parameter)
+        """
+        return self.src() is None
+
     def __repr__(self):
         dscp = f'Tensor(id={self._id}, shape={self.shape})'
         return dscp
@@ -262,15 +268,20 @@ class IRGraph:
             raise TypeError("Expected node to be IROperation")
         self._nodes.append(node)
 
-    def nodes(self, index: Optional[int]):
+    def nodes(self, index: Optional[int] = None):
         """
         Get node at position index
         """
-        if index >= len(self._nodes):
-            raise RuntimeError(
-                f"Get node out of range ({index} >= {len(self._nodes)})"
-            )
-        return self._nodes[index]
+        if isinstance(index, int):
+            if index >= len(self._nodes):
+                raise RuntimeError(
+                    f"Get node out of range ({index} >= {len(self._nodes)})"
+                )
+            return self._nodes[index]
+        elif index is None:
+            return self._nodes
+        else:
+            raise TypeError("Expected index to be None or int")
 
     def inputs(self, index: Optional[int] = None):
         if isinstance(index, int):
