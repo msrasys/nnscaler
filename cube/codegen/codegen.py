@@ -67,13 +67,12 @@ class SScheduleCodeGen:
         self.code += cb.code
         self.code += ['']
 
+        code = '\n'.join(self.code)
         # write to file
         if outfile:
             with open(outfile, 'w') as f:
-                code = '\n'.join(self.code)
                 f.write(code)
-
-        return self.code
+        return code
 
     def emit_var_declare(self, var: Any):
         """
@@ -88,7 +87,7 @@ class SScheduleCodeGen:
         elif isinstance(var, str):
             name = self.naming(var)
             if name.startswith('self.'):
-                if not hasattr(self._ref_module, var):
+                if not hasattr(self._ref_module, var[5:]):
                     if self.symbols.create(name):
                         #TODO: add default value
                         code = f'{name} = None'
