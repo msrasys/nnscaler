@@ -1,7 +1,11 @@
 from cube.graph.unique import IDGenerator
 from cube.graph.mapping import IR2LogicOp
 
-from typing import List, Optional, Any
+from cube.tschedule.action import Action
+from cube.tschedule.pool import TSchedulePool
+
+from typing import Union, Tuple, List, Optional, Any
+import copy
 
 
 __all__ = ['IROperation', 'IRTensor', 'IRGraph']
@@ -32,7 +36,8 @@ class IROperation:
 
         # op signature and op class
         self.signature: str = signature
-        self.op = IR2LogicOp.map(self.signature)
+        self.semantic = IR2LogicOp.map(self.signature)
+        self.device = None
         
         # edge (dataflow info)
         self._inputs: List[IRTensor] = [None] * input_length
@@ -174,7 +179,7 @@ class IROperation:
             else:
                 shapes.append([1,])
         shapes = tuple(shapes)
-        out_shapes = self.op.shape_infer(*shapes)
+        out_shapes = self.semantic.shape_infer(*shapes)
         if len(out_shapes) != len(self._outputs):
             raise RuntimeError(
                 "The logical op semantic doesn't match with parsed op"
@@ -203,6 +208,18 @@ class IRTensor:
         # connected to IROperation
         self._src_nodes: IROperation = None # -> output of the node
         self._dst_nodes: List[IROperation] = list() # -> input of the nodes
+
+    def __copy__(self):
+        """
+        Copy the tensor that will be same except a new id
+        """
+        tensor = IRTensor(self._shape, self.name)
+        tensor.device = self.device
+        tensor._id = IDGenerator().gen_tensor_id()
+        return tensor
+
+    def __deepcopy__(self):
+        raise RuntimeError("DeepCopy is not allowed.")
 
     @property
     def shape(self):
@@ -240,6 +257,9 @@ class IRTensor:
         Check if it is a leaf tensor (parameter)
         """
         return self.src() is None
+
+    def backward(self, tensors = None):
+        raise NotImplementedError
 
     def __repr__(self):
         dscp = f'Tensor(id={self._id}, shape={self.shape})'
@@ -321,11 +341,55 @@ class IRGraph:
         """
         raise NotImplementedError
 
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError
+    def forward(self, *args, **kwargs) -> Union[IRTensor, Tuple[IRTensor]]:
+        """
+        forward will divide the graph into Actions according to
+        node device assignment
+
+        Currently each forward call will result in a new flow
+        even if the input is same
+
+        Returns:
+            List[Action]
+        """
+        if len(self._outputs) == 1:
+            return copy.copy(self._outputs[0])
+        else:
+            return tuple([copy.copy(output) for output in self._outputs])
 
     def __call__(self, *args, **kwargs):
-        raise NotImplementedError
+        """
+        Register forward action
+        """
+        curr_nodes: List[IROperation] = list()
+        curr_device = None
+
+        def _wrap_to_action():
+            sub_graph = IRGraph(
+                curr_nodes, self._inputs, self._outputs,
+                module_name=self.module_name
+            )
+            action = Action(sub_graph, device=curr_device)
+            action.tag('forward')
+            return action
+
+        for node in self.nodes():
+            device = node.device
+            if device is None:
+                raise RuntimeError("All the node should be assigned to devices")
+            if device != curr_device and curr_device is not None:
+                # note we still use same input and output to make consistency
+                action = _wrap_to_action()
+                # register to schedule space
+                TSchedulePool().add_action(action)
+                curr_nodes = list()
+            curr_device = device
+            curr_nodes.append(node)
+        if curr_device is not None:
+            action = _wrap_to_action()
+            TSchedulePool().add_action(action)
+
+        return self.forward(*args, **kwargs)
 
     def __repr__(self):
         dscp = ''

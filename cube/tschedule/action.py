@@ -1,21 +1,17 @@
 from typing import List
 
-from cube.graph import IRGraph
-
 
 class Action:
     """
     Action represents a (sub-)graph which contains operators on the
     same device
     """
-    def __init__(self, graph: IRGraph, device: int):
+    def __init__(self, ir_graph, device: int):
 
-        if not isinstance(graph, IRGraph):
-            raise TypeError("Require graph to be IRGraph")
         if not isinstance(device, int):
             raise TypeError("Require device to be int")
         # set up attributes
-        self.graph: IRGraph = graph
+        self.graph = ir_graph
         self.device: int = device
         self.name: str = None
         # dependencies
@@ -88,3 +84,8 @@ class Action:
         if not isinstance(action, Action):
             raise TypeError("Expected action to be Action")
         self._successors.append(action)
+
+    def __repr__(self):
+        dscp = f'Action({self.name}):\n\t{self.graph.outputs()} <- {self.graph.inputs()}'
+        return dscp
+    
