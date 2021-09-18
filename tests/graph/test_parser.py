@@ -1,9 +1,8 @@
-from cube.graph import parser
 import cube.graph.parser as parser
-from torch import nn
-
-import cube.graph as cgraph
 from cube.graph.parser import ScriptModuleParser
+
+import torch
+from torch import nn
 
 class FeedForward(nn.Module):
     def __init__(self, dim, dropout=0., mult=16, classes=1000):
@@ -26,7 +25,8 @@ class FeedForward(nn.Module):
 model = FeedForward(dim=1024)
 
 
-def test_flatten(smodule):
+def test_flatten(model):
+    smodule = torch.jit.script(model)
     ScriptModuleParser.flatten(smodule)
 
 def test_parse_module(model):
@@ -34,8 +34,7 @@ def test_parse_module(model):
 
 
 if __name__ == '__main__':
-
     
-    # test_flatten(smodule)
+    # test_flatten(model)
     graph = test_parse_module(model)
     print(graph)

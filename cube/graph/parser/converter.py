@@ -1,7 +1,7 @@
 from typing import Optional, List
 
 from cube.graph.parser import ScriptModuleParser
-from cube.graph.graph import IRGraph
+from cube.graph import IRGraph
 
 import torch
 
