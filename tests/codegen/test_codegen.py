@@ -14,7 +14,7 @@ class FeedForward(nn.Module):
         self.linear2 = nn.Linear(dim * mult, dim)
         self.classifier = nn.Linear(dim, classes)
 
-    def forward(self, data, x: int = 4):
+    def forward(self, data):
         output = self.linear1(data)
         output = self.gelu(output)
         output = self.dropout(output)
@@ -44,8 +44,10 @@ def init_weight(parameters):
 
 def test_codegen(model):
     graph = cgraph.parser.convert(model,
-                           input_shapes=([1024,1024],[1,]))
-    gener = SScheduleCodeGen(graph)
+                           input_shapes=([1024,1024],))
+    for node in graph.nodes():
+        node.device = 0
+    gener = SScheduleCodeGen(graph, device=0)
     code = gener.gen(outfile='code.py')
     
     # execute
@@ -63,7 +65,7 @@ def test_codegen(model):
 
     for _ in range(10):
         data = torch.randn([64,1024], device=torch.device('cuda:0'))
-        out = model(data, 0)
+        out = model(data)
         loss = torch.mean(out) / 1000
         print(f'> loss: {loss.item()}')
         loss.backward()

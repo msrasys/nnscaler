@@ -3,7 +3,7 @@ Generate Pytorch code given the model DAG and the transformation config
 """
 from typing import List, Any
 
-from cube.graph import IRGraph, IRTensor, IROperation
+from cube.graph import IRGraph, IRLocalGraph, IRTensor, IROperation
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
@@ -15,10 +15,10 @@ class SScheduleCodeGen:
     Generate spatial code for the model
     """
 
-    def __init__(self, graph: IRGraph):
+    def __init__(self, graph: IRGraph, device: int):
         if not isinstance(graph, IRGraph):
             raise TypeError("graph should be IRGraph")
-        self.graph = graph
+        self.graph = IRLocalGraph(graph, device=device)
         # model full code
         self.code: List[str] = ['import torch', '', '']
         # module init code

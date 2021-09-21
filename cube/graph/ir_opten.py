@@ -1,10 +1,17 @@
 from cube.graph.unique import IDGenerator
 from cube.graph.mapping import IR2LogicOp
 
-from typing import List, Optional, Any
+from enum import Enum
+from typing import List, Optional, Any, Union
 
 
-__all__ = ['IROperation', 'IRTensor']
+__all__ = ['OperationType', 'IROperation', 'IRTensor']
+
+
+class OperationType(Enum):
+
+    Comp = 1  # computation
+    Comm = 2  # communication
 
 
 class IROperation:
@@ -16,7 +23,8 @@ class IROperation:
                  name: str, 
                  signature: str,
                  input_length: int,
-                 output_length: int):
+                 output_length: int,
+                 type=OperationType.Comp):
         """
         Create a node with name (variable name) and module type (module_name)
 
@@ -33,8 +41,9 @@ class IROperation:
         # op signature and op class
         self.signature: str = signature
         self.semantic = IR2LogicOp.map(self.signature)
-        self.device = None
-        
+        self._type = type
+        self._device = None
+
         # edge (dataflow info)
         self._inputs: List[IRTensor] = [None] * input_length
         self._predecessors: List[IROperation] = [None] * input_length
@@ -43,6 +52,60 @@ class IROperation:
         for tensor in self._outputs:
             tensor.set_src_node(self)
         self._successors: List[List(IROperation)] = [list() for _ in range(output_length)]
+
+    @property
+    def type(self) -> OperationType:
+        return self._type
+
+    @type.setter
+    def type(self, _):
+        raise RuntimeError("Not allowed to set type except initialization")
+
+    @property
+    def device(self):
+        return self._device
+
+    @device.setter
+    def device(self, device_id: Union[int, List[int]]):
+        """
+        Set the operation device.
+
+        For computation operators, they are only allowed
+        to happen on one device (int)
+
+        For communication operators (e.g., move, all-reduce),
+        they are allowed to happend on multiple devices
+        """
+        if self.type == OperationType.Comp:
+            if not isinstance(device_id, int):
+                raise KeyError("Require computation op device: int")
+        elif self.type == OperationType.Comm:
+            if not isinstance(device_id, list):
+                raise TypeError("Require communication op device: List[int]")
+        else:
+            raise TypeError("Unknown operator type")
+        self._device = device_id
+        for output in self._outputs:
+            if isinstance(output, IRTensor):
+                output.device = device_id
+
+    def on_device(self, device_id: int):
+        """
+        Check whether the operation is on device_id
+
+        Returns:
+            Boolean
+        """
+        if not isinstance(device_id, int):
+            raise TypeError("Expected device id to be int")
+        if self._device is None:
+            return False
+        if self.type == OperationType.Comm:
+            return device_id in self.device
+        elif self.type == OperationType.Comp:
+            return device_id == self.device
+        else:
+            raise RuntimeError("Unkown Operation type") 
 
     def inputs(self, index: Optional[int] = None):
         """
@@ -199,7 +262,7 @@ class IRTensor:
         self._id: int = IDGenerator().gen_tensor_id()
         self._shape: Optional(List[int]) = shape
         self.name = name
-        self.device = -1
+        self._device = list()
 
         # connected to IROperation
         self._src_nodes: IROperation = None # -> output of the node
@@ -230,6 +293,24 @@ class IRTensor:
             raise RuntimeError("Expected shape to be list[int]")
         self._shape = val
 
+    @property
+    def device(self) -> List[int]:
+        return self._device
+
+    @device.setter
+    def device(self, device_id: Union[int, List[int]]):
+        """
+        Set placement of the tensor
+
+        A tensor can be placed on multiple devices as input
+        for multiple operations on different devices
+        """
+        if not (isinstance(device_id, int) or isinstance(device_id, list)):
+            raise TypeError(f"Expected device id to be int or List[int]")
+        if isinstance(device_id, int):
+            device_id = [device_id]
+        self._device = device_id
+
     def src(self) -> Optional[IROperation]:
         return self._src_nodes
 
@@ -254,7 +335,10 @@ class IRTensor:
         """
         return self.src() is None
 
-    def backward(self, tensors = None):
+    def backward(self):
+        """
+        Backward will generate a backward action scheduling pool
+        """
         raise NotImplementedError
 
     def __repr__(self):

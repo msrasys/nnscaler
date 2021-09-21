@@ -6,7 +6,7 @@ from typing import Union, Tuple, List, Optional
 import copy
 
 
-__all__ = ['IRGraph']
+__all__ = ['IRGraph', 'IRLocalGraph']
 
 
 class IRGraph:
@@ -148,3 +148,50 @@ class IRGraph:
         # outputs
         dscp += f'\nOutputs: {self._outputs}'
         return dscp
+
+
+class IRLocalGraph(IRGraph):
+
+    def __init__(self, graph: IRGraph, device: int):
+
+        if not isinstance(graph, IRGraph):
+            raise TypeError(f"Expected graph: IRGraph but go {type(graph)}")
+        if not isinstance(device, int):
+            raise TypeError(f"Expected device: int but not {type(device)}")
+        
+        self.global_graph = graph
+        self.device = device
+        self.send_tensors = list()
+        self.recv_tensors = list()
+        # get nodes belong to this graph
+        nodes = list()
+        all_tensors = set()
+        for node in self.global_graph.nodes():
+            # collect on device node, inputs and outputs
+            if node.on_device(self.device):
+                nodes.append(node)
+                # collect send tensors and recv tensors
+                if node.semantic == 'move':
+                    if device in node.inputs(0).device:
+                        self.send_tensors.append(node.inputs(0))
+                    if device in node.outputs(0).device:
+                        self.recv_tensors.append(node.outputs(0))
+                all_tensors.update(node.inputs())
+                all_tensors.update(node.outputs())
+
+        # model inputs and outputs
+        model_inputs = list()
+        model_outputs = list()
+        for input in self.global_graph.inputs():
+            if input in all_tensors:
+                model_inputs.append(input)
+        for output in self.global_graph.outputs():
+            if output in all_tensors:
+                model_outputs.append(output)
+
+        super().__init__(
+            nodes,
+            model_inputs + self.recv_tensors,  # input tensors
+            model_outputs + self.send_tensors,  # output tensors
+            self.global_graph.module_name + f'Rank{self.device}'
+        )
