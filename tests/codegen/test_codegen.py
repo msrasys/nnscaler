@@ -1,4 +1,4 @@
-import cube.graph as cgraph
+from cube.graph import parser, IRLocalGraph
 from cube.codegen.codegen import SScheduleCodeGen
 
 import torch
@@ -43,13 +43,14 @@ def init_weight(parameters):
 
 
 def test_codegen(model):
-    graph = cgraph.parser.convert(model,
+    graph = parser.convert(model,
                            input_shapes=([1024,1024],))
     for node in graph.nodes():
         node.device = 0
-    gener = SScheduleCodeGen(graph, device=0)
+    local_graph = IRLocalGraph(graph.nodes(), graph, device=0)
+    gener = SScheduleCodeGen(local_graph)
     code = gener.gen(outfile='code.py')
-    
+
     # execute
     print("> ===== Generated Code =====")
     print(code)

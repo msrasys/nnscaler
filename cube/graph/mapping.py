@@ -32,5 +32,8 @@ class IR2LogicOp:
 
         __ttemplate('add') : logic.TensorAdd,
 
+        # runtime collectives
+        'cube.runtime.spatial.move': 'move',
+
     }
 

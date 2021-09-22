@@ -25,6 +25,8 @@ class IRGraph:
         self._nodes: List[IROperation] = nodes
         self._inputs = input_tensors
         self._outputs = output_tensors
+        # default is forward graph
+        self.tag = 'forward'
 
     def add_node(self, node: IROperation):
         if not isinstance(node, IROperation):
@@ -96,9 +98,15 @@ class IRGraph:
             List[Action]
         """
         if len(self._outputs) == 1:
-            return copy.copy(self._outputs[0])
+            tensor = copy.copy(self._outputs[0])
+            tensor.set_forward_graph(self)
+            return tensor
         else:
-            return tuple([copy.copy(output) for output in self._outputs])
+            tensors = tuple([copy.copy(output) for output in self._outputs])
+            for tensor in tensors:
+                if isinstance(tensor, IRTensor):
+                    tensor.set_forward_graph(self)
+            return tensors
 
     def __call__(self, *args, **kwargs):
         """
@@ -108,17 +116,17 @@ class IRGraph:
         curr_device = None
 
         def _wrap_to_action():
-            sub_graph = IRGraph(
-                curr_nodes, self._inputs, self._outputs,
-                module_name=self.module_name
+            sub_graph = IRLocalGraph(
+                curr_nodes, self, device=curr_device[0]  #FIXME
             )
-            action = Action(sub_graph, device=curr_device)
-            action.tag('forward')
+            action = Action(sub_graph, device=curr_device[0])  #FIXME
+            action.tag(self.tag)
             return action
 
         for node in self.nodes():
+            #FIXME: will fail in multi-branch placement (backward)
             device = node.device
-            if device is None:
+            if len(node.device) == 0:
                 raise RuntimeError("All the node should be assigned to devices")
             if device != curr_device and curr_device is not None:
                 # note we still use same input and output to make consistency
@@ -133,6 +141,78 @@ class IRGraph:
             TSchedulePool().add_action(action)
 
         return self.forward(*args, **kwargs)
+
+    def backward(self):
+        """
+        Backward will generate a backward action scheduling pool
+
+        Construct a reverse graph of forward and seperate to actions
+        """
+        # travel graph in reverse order
+        all_tensors = dict()
+
+        def get_tensor_grad(tensor):
+            if tensor._id not in all_tensors:
+                new_tensor = copy.deepcopy(tensor)
+                if tensor.name is None:
+                    new_tensor.name = 'grad'
+                else:
+                    new_tensor.name = tensor.name + '_grad'
+                new_tensor._src_nodes = list()
+                new_tensor._dst_nodes = list()
+                # reverse op
+                devices = set()
+                for node in tensor.dst():
+                    devices.update(node.device)
+                new_tensor.device = list(devices)
+                all_tensors[tensor._id] = new_tensor
+                return new_tensor
+            else:
+                return all_tensors[tensor._id]
+
+        backward_nodes = list()
+        for fnode in self._nodes[::-1]:
+            inputs = list()
+            for input in fnode.outputs():
+                if isinstance(input, IRTensor) and input.requires_grad:
+                    tensor = get_tensor_grad(input)
+                    inputs.append(tensor)
+                else:
+                    inputs.append(None)
+            outputs = list()
+            for output in fnode.inputs():
+                if isinstance(output, IRTensor) and output.requires_grad:
+                    tensor = get_tensor_grad(output)
+                    outputs.append(tensor)
+                else:
+                    outputs.append(None)
+            bp_node = IROperation(
+                name = fnode.name + '_backward',
+                signature = fnode.signature,
+                input_length = len(inputs),
+                output_length = len(outputs),
+                type=fnode.type
+            )
+            bp_node.device = fnode.device
+            print(bp_node)
+            for idx, arg in enumerate(inputs):
+                bp_node.set_input(idx, arg)
+            for idx, arg in enumerate(outputs):
+                bp_node.set_output(idx, arg)
+            backward_nodes.append(bp_node)
+        # none inputs for loss
+        inputs = list()
+        # none outputs for loss
+        outputs = list()
+        graph = IRGraph(
+            backward_nodes,
+            inputs, outputs,
+            self.module_name + 'Backward'
+        )
+        print(graph)
+        graph.tag = 'backward'
+        graph()
+        
 
     def __repr__(self):
         dscp = ''
@@ -152,45 +232,67 @@ class IRGraph:
 
 class IRLocalGraph(IRGraph):
 
-    def __init__(self, graph: IRGraph, device: int):
+    def __init__(self, 
+                 sub_nodes: List[IROperation],
+                 global_graph: IRGraph,
+                 device: int
+        ):
 
-        if not isinstance(graph, IRGraph):
-            raise TypeError(f"Expected graph: IRGraph but go {type(graph)}")
+        if not isinstance(global_graph, IRGraph):
+            raise TypeError(f"Expected graph: IRGraph but go {type(global_graph)}")
         if not isinstance(device, int):
             raise TypeError(f"Expected device: int but not {type(device)}")
-        
-        self.global_graph = graph
+        for node in sub_nodes:
+            if not node.on_device(device):
+                raise RuntimeError(f"Local Graph requires all nodes on device {device}")
+        self.global_graph = global_graph
         self.device = device
         self.send_tensors = list()
+        self.send_devices = list()
         self.recv_tensors = list()
+        self.recv_devices = list()
         # get nodes belong to this graph
-        nodes = list()
-        all_tensors = set()
-        for node in self.global_graph.nodes():
-            # collect on device node, inputs and outputs
-            if node.on_device(self.device):
-                nodes.append(node)
-                # collect send tensors and recv tensors
-                if node.semantic == 'move':
-                    if device in node.inputs(0).device:
-                        self.send_tensors.append(node.inputs(0))
-                    if device in node.outputs(0).device:
-                        self.recv_tensors.append(node.outputs(0))
-                all_tensors.update(node.inputs())
-                all_tensors.update(node.outputs())
+        all_tensors = list()
+        for node in sub_nodes:
+            # collect recv tensors
+            for input in node.inputs():
+                if isinstance(input, IRTensor):
+                    if self.device not in input.device:
+                        if input not in self.recv_tensors:
+                            self.recv_tensors.append(input)
+                            self.recv_devices.append(self.device)
+            # collect send tensors
+            for output in node.outputs():
+                if isinstance(output, IRTensor):
+                    succ_nodes = output.dst()
+                    for succ_node in succ_nodes:
+                        if not succ_node.on_device(self.device):
+                            if output not in self.send_tensors:
+                                self.send_tensors.append(output)
+                                self.send_devices.append(succ_node.device)
+            # move semantic
+            # if node.semantic == 'move':
+            #     if device in node.inputs(0).device:
+            #         self.send_tensors.append(node.inputs(0))
+            #         self.send_devices.append(node.outputs(0).device)
+            #     if device in node.outputs(0).device:
+            #         self.recv_tensors.append(node.outputs(0))
+            #         self.recv_devices.append(node.inputs(0).device)
+            all_tensors += node.inputs()
+            all_tensors += node.outputs()
 
         # model inputs and outputs
         model_inputs = list()
         model_outputs = list()
         for input in self.global_graph.inputs():
-            if input in all_tensors:
+            if input in all_tensors and input not in self.recv_tensors:
                 model_inputs.append(input)
         for output in self.global_graph.outputs():
-            if output in all_tensors:
+            if output in all_tensors and output not in self.send_tensors:
                 model_outputs.append(output)
 
         super().__init__(
-            nodes,
+            sub_nodes,
             model_inputs + self.recv_tensors,  # input tensors
             model_outputs + self.send_tensors,  # output tensors
             self.global_graph.module_name + f'Rank{self.device}'

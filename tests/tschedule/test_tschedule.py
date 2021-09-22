@@ -1,7 +1,9 @@
+from cube.tschedule.pool import TSchedulePool
+from cube.graph.ir_opten import IRTensor
 from torch import nn
 
 import cube.graph.parser as parser
-import cube.tschedule as tschedule
+from cube.codegen.codegen import SScheduleCodeGen
 
 
 class FeedForward(nn.Module):
@@ -25,28 +27,51 @@ class FeedForward(nn.Module):
 
 model = FeedForward(dim=1024)
 ir_graph = parser.convert(model, input_shapes=([64,1024],[64,]))
+print(" > Forward IRGraph ========")
+print(ir_graph)
+print(" < ==============\n")
 
 # device assignment
-for node in ir_graph.nodes():
-    node.device = 0
+for input in ir_graph.inputs():
+    if isinstance(input, IRTensor):
+        input.device = [0,1]
+for nid, node in enumerate(ir_graph.nodes()):
+    if nid <= 2:
+        node.device = 0 
+    else:
+        node.device = 1
 
 
 def test_graph_forward(ir_graph):
 
+    TSchedulePool().clear()
     tensor1 = ir_graph()
     print(tensor1)
-    print(tschedule.pool.TSchedulePool())
+    # print(tschedule.pool.TSchedulePool())
     tensor2 = ir_graph()
     print(tensor2)
-    print(tschedule.pool.TSchedulePool())
+    for action in TSchedulePool().actions():
+        print('\n', action)
+        gener = SScheduleCodeGen(action.graph)
+        code = gener.gen()
+        print("> ===== Generated Code =====")
+        print(code)
+        print("< ===== Generated Code =====")
+    print(TSchedulePool())
 
 
 def test_graph_backward(ir_graph):
 
+    TSchedulePool().clear()
     tensor = ir_graph()
     tensor.backward()
+    #tensor = ir_graph()
+    #tensor.backward()
+    print('====== Backward Test =======')
+    print(TSchedulePool())
 
 
 if __name__ == '__main__':
 
-    test_graph_forward(ir_graph)
+    #test_graph_forward(ir_graph)
+    test_graph_backward(ir_graph)
