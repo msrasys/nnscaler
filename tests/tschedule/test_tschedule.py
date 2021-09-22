@@ -1,5 +1,5 @@
 from cube.tschedule.pool import TSchedulePool
-from cube.graph.ir_opten import IRTensor
+from cube.graph.ir_cten import IRTensor
 from torch import nn
 
 import cube.graph.parser as parser
@@ -15,18 +15,17 @@ class FeedForward(nn.Module):
         self.linear2 = nn.Linear(dim * mult, dim)
         self.classifier = nn.Linear(dim, classes)
 
-    def forward(self, data, label: int = 4):
+    def forward(self, data):
         output = self.linear1(data)
         output = self.gelu(output)
         output = self.dropout(output)
         output = self.linear2(output)
-        output = output + data
         output = self.classifier(output)
         return output
 
 
 model = FeedForward(dim=1024)
-ir_graph = parser.convert(model, input_shapes=([64,1024],[64,]))
+ir_graph = parser.convert(model, input_shapes=([64,1024],))
 print(" > Forward IRGraph ========")
 print(ir_graph)
 print(" < ==============\n")
@@ -34,7 +33,7 @@ print(" < ==============\n")
 # device assignment
 for input in ir_graph.inputs():
     if isinstance(input, IRTensor):
-        input.device = [0,1]
+        input.device = [0]
 for nid, node in enumerate(ir_graph.nodes()):
     if nid <= 2:
         node.device = 0 
@@ -45,15 +44,15 @@ for nid, node in enumerate(ir_graph.nodes()):
 def test_graph_forward(ir_graph):
 
     TSchedulePool().clear()
-    tensor1 = ir_graph()
+    tensor1 = ir_graph(IRTensor(shape=[64,1024]))
     print(tensor1)
     # print(tschedule.pool.TSchedulePool())
-    tensor2 = ir_graph()
-    print(tensor2)
+    # tensor2 = ir_graph()
+    # print(tensor2)
     for action in TSchedulePool().actions():
         print('\n', action)
         gener = SScheduleCodeGen(action.graph)
-        code = gener.gen()
+        code = gener.gen(device=action.device[0])
         print("> ===== Generated Code =====")
         print(code)
         print("< ===== Generated Code =====")
@@ -63,7 +62,7 @@ def test_graph_forward(ir_graph):
 def test_graph_backward(ir_graph):
 
     TSchedulePool().clear()
-    tensor = ir_graph()
+    tensor = ir_graph(IRTensor(shape=[64,1024]))
     tensor.backward()
     #tensor = ir_graph()
     #tensor.backward()

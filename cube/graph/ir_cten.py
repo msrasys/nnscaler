@@ -1,103 +1,51 @@
-"""
-IROperation:
-
-    Semantic operation representation (node) in IRGraph.
-    An operation is of Computation (Comp) or Communication (Comm) type.
-
-    A Comp type operation can be assigned to multiple devices for redundant computation.
-    A Comm type operation can be assigned to multiple devices (List[int]).
-
-    Each IROperation can have (multiple) input args and (multiple) output args.
-
-IRTensor:
-
-    Semantic tensor representation (edge) in IRGraph.
-
-    IRTensor can be assigned (deploy) to multiple devices (List[int])
-
-    The IRTensor is a logical tensor that
-    
-    1). can be generated from multipe operations (i.e., different operators
-    can generate different part of the IRTensor).
-    
-    => multiple source IROperation.
-
-    2). can be used as input for multiple operations.
-    
-    => multiple destination IROperation
-
-
-IROperation can accept tensors that are placed on the different devices.
-
-Set the operation device will in default change the output tensor placement
-and input leaf tensor placement to match with the operation.
-"""
-
-
-from cube.graph.unique import IDGenerator
-from cube.graph.mapping import IR2LogicOp
-
-from enum import Enum
-from typing import List, Optional, Any, Union
+from typing import List, Union, Optional, Any
 import copy
 
-
-__all__ = ['OperationType', 'IROperation', 'IRTensor']
-
-
-class OperationType(Enum):
-
-    Comp = 1  # computation
-    Comm = 2  # communication
+from cube.graph.unique import IDGenerator
 
 
-class IROperation:
+__all__ = ['IRCell', 'IRTensor']
+
+
+class IRCell:
     """
-    IROperation serves as IRGraph node
+    IRCell serves as a general node for different purpose
     """
 
     def __init__(self,
-                 name: str, 
+                 name: str,
                  signature: str,
                  input_length: int,
-                 output_length: int,
-                 type=OperationType.Comp):
+                 output_length: int):
         """
         Create a node with name (variable name) and module type (module_name)
 
         Args:
-            name (str): the op semantic name
-            signature (str): the op signature, e.g., torch.functional.nn.linear
+            name (str): the cell name
+            signature (str): the cell function signature,
+                e.g., torch.functional.nn.linear
             input_length (int): the number of inputs for the op
             output_length (int): the number of outputs for the op
         """
         # node info
-        self._id: int = IDGenerator().gen_op_id()
+        self._id: int = IDGenerator().gen_cell_id()
         self.name: str = name
+        self.signature = signature
 
-        # op signature and op class
-        self.signature: str = signature
-        self.semantic = IR2LogicOp.map(self.signature)
-        self._type = type
+        # device
         self._device = list()
 
-        # source operations
-        self._inputs: List[IRTensor] = [None] * input_length
-        self._predecessors: List[List[IROperation]] = [list() for _ in range(input_length)]
+        # source tensors
+        self._inputs: List[Any] = [None] * input_length
+        # source cells
+        self._predecessors: List[List[IRCell]] = [list() for _ in range(input_length)]
         
-        # destination operations
+        # destination tensors
         self._outputs: List[IRTensor] = [IRTensor() for _ in range(output_length)]
-        for tensor in self._outputs:
-            tensor.add_src_node(self)
-        self._successors: List[List[IROperation]] = [list() for _ in range(output_length)]
-
-    @property
-    def type(self) -> OperationType:
-        return self._type
-
-    @type.setter
-    def type(self, _):
-        raise RuntimeError("Not allowed to set type except initialization")
+        for output in self._outputs:
+            output.add_src_node(self)
+        # destination cells
+        self._successors: List[List[IRCell]] = [list() for _ in range(output_length)]
 
     @property
     def device(self):
@@ -107,29 +55,12 @@ class IROperation:
     def device(self, device_id: Union[int, List[int]]):
         """
         Set the operation device.
-
-        For computation operators, they are only allowed
-        to happen on one device (int)
-
-        For communication operators (e.g., move, all-reduce),
-        they are allowed to happend on multiple devices
         """
         if isinstance(device_id, int):
             device_id = [device_id]
         if not all([isinstance(devid, int) for devid in device_id]):
             raise KeyError("Require device Union[int, List[int]]")
         self._device = device_id
-        for input in self._inputs:
-            # in default, parameters will be placed on all devices
-            # that needs it
-            if isinstance(input, IRTensor) and input.is_leaf():
-                devices = set()
-                for node in input.dst():
-                    devices.update(node.device)
-                input.device = list(devices)
-        for output in self._outputs:
-            if isinstance(output, IRTensor):
-                output.device = device_id
 
     def on_device(self, device_id: int):
         """
@@ -139,7 +70,7 @@ class IROperation:
             Boolean
         """
         if not isinstance(device_id, int):
-            raise TypeError("Expected device id to be int")
+            raise TypeError(f"Expected device id to be int but got {type(device_id)}")
         return device_id in self.device
 
     def inputs(self, index: Optional[int] = None):
@@ -236,8 +167,8 @@ class IROperation:
             self._predecessors[input_index] = val.src()
             # set the source node successor
             for node in val.src():
-                if isinstance(node, IROperation):
-                    node._add_successor(val, self)
+                if isinstance(node, IRCell):
+                    node.add_successor(val, self)
 
     def set_output(self, output_index: int, val: Any):
         """
@@ -254,76 +185,58 @@ class IROperation:
         if isinstance(val, IRTensor):
             # set predecessor
             for node in val.src():
-                if isinstance(node, IROperation):
+                if isinstance(node, IRCell):
                     self._successors[output_index].append(node)
             # set the source node
             if self not in val.src():
                 val.add_src_node(self)
 
-    def set_predecessor(self, input_index: int, node, out_index: int):
+    def add_predecessor(self, input_index: int, node, out_index: int):
         """
         Set self node the input node. self.input[input_index] = node.output[out_index]
         """
-        if not isinstance(node, IROperation):
-            raise TypeError("Expected node to be IROperation")
+        if not isinstance(node, IRCell):
+            raise TypeError("Expected node to be IRCell")
         if input_index >= len(self.inputs()):
             raise RuntimeError(
                 f"Set the input out of range ({input_index} >= {len(self._inputs)})"
             )
         self._inputs[input_index] = node.outputs(out_index)
-        self._predecessors[input_index] = node
-        node.set_successor(out_index, self)
+        self._predecessors[input_index].append(node)
+        node.add_successor(out_index, self)
 
-    def _add_successor(self, tensor, node):
+    def add_successor(self, tensor, node):
         """
         Set self node the output index node. 
         `node` will take the self.outputs(index) as the input
         """
+        if not isinstance(node, IRCell):
+            raise TypeError("Expected node to be IRCell")
         out_index = self._outputs.index(tensor)
         if out_index < 0:
             raise RuntimeError("Fail to find output tensor")
         self._successors[out_index].append(node)
 
-    def infer_shape(self):
-        """
-        Infer output value shape
-        """
-        shapes = list()
-        for input in self.inputs():
-            if isinstance(input, IRTensor):
-                if input.shape is None:
-                    return False
-                shapes.append(input.shape)
-            else:
-                shapes.append([1,])
-        shapes = tuple(shapes)
-        out_shapes = self.semantic.shape_infer(*shapes)
-        if len(out_shapes) != len(self._outputs):
-            raise RuntimeError(
-                "The logical op semantic doesn't match with parsed op"
-            )
-        for shape, val in zip(out_shapes, self._outputs):
-            if isinstance(val, IRTensor):
-                val.shape = shape
-        return True
-
     def __repr__(self):
+        """
+        Cell string presentation
+        """
         inputs = list()
         for tensor in self.inputs():
             if isinstance(tensor, IRTensor):
                 inputs.append(f't{tensor._id}')
             else:
                 inputs.append(tensor)
-        
+
         outputs = list()
         for tensor in self.outputs():
             if isinstance(tensor, IRTensor):
                 outputs.append(f't{tensor._id}')
             else:
                 outputs.append(tensor)
-
-        dscp = f'Op(id={self._id}, signature={self.signature}, device={self.device}, inputs={inputs}, outputs={outputs})'
-        return dscp
+        dcsp = f'Cell-{self._id}({self.signature}, device={self.device})'\
+               f'({inputs}) -> {outputs}'
+        return dcsp
 
 
 class IRTensor:
@@ -337,19 +250,19 @@ class IRTensor:
         self.name = name
         self._device = list()
 
-        # connected to IROperation
-        self._src_nodes: List[IROperation] = list() # -> output of the node
-        self._dst_nodes: List[IROperation] = list() # -> input of the nodes
+        # connected to IRCell
+        self._src_nodes: List[IRCell] = list() # -> output of the node
+        self._dst_nodes: List[IRCell] = list() # -> input of the nodes
 
         # forward graph
         self.requires_grad = True
-        self.forward_graph = None
+        self.gen_graph = None
 
-    def set_forward_graph(self, graph):
+    def set_gen_graph(self, graph):
         """
         Set forward graph (IRGraph)
         """
-        self.forward_graph = graph
+        self.gen_graph = graph
 
     def __copy__(self):
         """
@@ -414,7 +327,7 @@ class IRTensor:
             raise TypeError(f"Expected device id to be int or List[int]")
         self._device = device_id
 
-    def src(self) -> List[IROperation]:
+    def src(self) -> List[IRCell]:
         return self._src_nodes
 
     def dst(self, index: Optional[int] = None):
@@ -424,14 +337,14 @@ class IRTensor:
             raise RuntimeError("get tensor dst out of range")
         return self._dst_nodes[index]
 
-    def add_src_node(self, node: IROperation):
-        if not isinstance(node, IROperation):
-            raise TypeError("IRTensor source node should be IROperation")
+    def add_src_node(self, node: IRCell):
+        if not isinstance(node, IRCell):
+            raise TypeError("IRTensor source node should be IRCell")
         self._src_nodes.append(node)
 
-    def add_dst_node(self, node: IROperation):
-        if not isinstance(node, IROperation):
-            raise TypeError("IRTensor destination node should be IROperation")
+    def add_dst_node(self, node: IRCell):
+        if not isinstance(node, IRCell):
+            raise TypeError("IRTensor destination node should be IRCell")
         self._dst_nodes.append(node)
 
     def is_leaf(self):
@@ -446,12 +359,11 @@ class IRTensor:
 
         Construct a reverse graph of forward and seperate to actions
         """
-        if self.forward_graph is None:
+        if self.gen_graph is None:
             raise RuntimeError("Backward on a tensor without forward graph")
-        self.forward_graph.backward()
+        self.gen_graph.backward(self)
 
 
     def __repr__(self):
         dscp = f'Tensor(id={self._id}, shape={self.shape}, device={self.device})'
         return dscp
-

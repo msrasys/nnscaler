@@ -1,15 +1,16 @@
-from cube.graph.ir_opten import IROperation, IRTensor
-from cube.tschedule.action import Action
+from cube.graph.ir_cten import IRTensor, IRCell
+from cube.graph.ir_op import IROperation
 from cube.tschedule.pool import TSchedulePool
 
-from typing import Union, Tuple, List, Optional
+from typing import Union, Tuple, List, Optional, Any
 import copy
 
 
-__all__ = ['IRGraph', 'IRLocalGraph']
+__all__ = ['IRGraph', 'IRAction']
 
 
-class IRGraph:
+
+class IRGraph(IRCell):
     """
     PyTorch IR Graph
 
@@ -21,15 +22,20 @@ class IRGraph:
                  input_tensors: List[IRTensor], 
                  output_tensors: List[IRTensor], 
                  module_name: str):
-        self.module_name = module_name
+        
         self._nodes: List[IROperation] = nodes
+        super().__init__(
+            name=module_name,
+            signature=module_name,
+            input_length=len(input_tensors),
+            output_length=len(output_tensors)
+        )
         self._inputs = input_tensors
         self._outputs = output_tensors
-        # default is forward graph
         self.tag = 'forward'
 
-    def add_node(self, node: IROperation):
-        if not isinstance(node, IROperation):
+    def add_node(self, node: IRCell):
+        if not isinstance(node, IRCell):
             raise TypeError("Expected node to be IROperation")
         self._nodes.append(node)
 
@@ -48,45 +54,13 @@ class IRGraph:
         else:
             raise TypeError("Expected index to be None or int")
 
-    def inputs(self, index: Optional[int] = None):
-        if isinstance(index, int):
-            if index >= len(self._inputs):
-                raise RuntimeError(
-                    f"Get the input out of range ({index} >= {len(self._inputs)}"
-                )
-            return self._inputs[index]
-        elif index is None:
-            return self._inputs
-        else:
-            raise TypeError("Expected index to be None or int")
-
-    def outputs(self, index: Optional[int] = None):
-        """
-        Get output tensor at output index
-
-        Args:
-            index (int or None): 
-                index of the outputs, None will return the nodes
-                for all the outputs
-        """
-        if isinstance(index, int):
-            if index >= len(self._outputs):
-                raise RuntimeError(
-                    f"Get the output out of range ({index} >= {len(self._outputs)}"
-                )
-            return self._outputs[index]
-        elif index is None:
-            return self._outputs
-        else:
-            raise TypeError("Expected index to be None or int")
-
     def replace(self, target: IROperation, nodes: List[IROperation]):
         """
         Replace the node with new nodes (IRGraph)
         """
         raise NotImplementedError
 
-    def forward(self, *args, **kwargs) -> Union[IRTensor, Tuple[IRTensor]]:
+    def forward(self, *args) -> Union[IRTensor, Tuple[IRTensor]]:
         """
         forward will divide the graph into Actions according to
         node device assignment
@@ -97,52 +71,71 @@ class IRGraph:
         Returns:
             List[Action]
         """
-        if len(self._outputs) == 1:
-            tensor = copy.copy(self._outputs[0])
-            tensor.set_forward_graph(self)
-            return tensor
-        else:
-            tensors = tuple([copy.copy(output) for output in self._outputs])
-            for tensor in tensors:
-                if isinstance(tensor, IRTensor):
-                    tensor.set_forward_graph(self)
-            return tensors
-
-    def __call__(self, *args, **kwargs):
-        """
-        Register forward action
-        """
-        curr_nodes: List[IROperation] = list()
-        curr_device = None
-
-        def _wrap_to_action():
-            sub_graph = IRLocalGraph(
-                curr_nodes, self, device=curr_device[0]  #FIXME
+        # check input num
+        if len(args) != len(self.inputs()):
+            raise RuntimeError(
+                f"Expected {len(self.inputs())} input args but got {len(args)}"
             )
-            action = Action(sub_graph, device=curr_device[0])  #FIXME
-            action.tag(self.tag)
-            return action
+        # check input type
+        if not all([type(arg) is type(input) for arg, input in zip(args, self.inputs())]):
+            raise RuntimeError(f"Expected input type the same")
+        
+        curr_nodes: List[IROperation] = list()
+        curr_device = list()
 
+        total_actions = list()
         for node in self.nodes():
-            #FIXME: will fail in multi-branch placement (backward)
             device = node.device
             if len(node.device) == 0:
                 raise RuntimeError("All the node should be assigned to devices")
-            if device != curr_device and curr_device is not None:
-                # note we still use same input and output to make consistency
-                action = _wrap_to_action()
+            if set(device) != set(curr_device) and len(curr_device) != 0:
+                # create action
+                action = IRAction(curr_nodes, self, devices=curr_device)
+                total_actions.append(action)
                 # register to schedule space
                 TSchedulePool().add_action(action)
                 curr_nodes = list()
             curr_device = device
             curr_nodes.append(node)
         if curr_device is not None:
-            action = _wrap_to_action()
+            action = IRAction(curr_nodes, self, devices=curr_device)
+            total_actions.append(action)
             TSchedulePool().add_action(action)
 
-        return self.forward(*args, **kwargs)
+        # setup action inputs
+        head = total_actions[0]
+        for idx, arg in enumerate(args):
+            head.set_input(idx + 1, arg)  # 0 is for graph itself
+        outputs_tensors = [*head.graph.outputs()]
+        outputs_actions = [head] * len(head.graph.outputs())
+        for action in total_actions[1:]:
+            for idx, input in enumerate(action.graph.inputs()):
+                if input not in outputs_tensors:
+                    raise RuntimeError(f"Cannot find {input} tensors")
+                pre_action = outputs_actions[outputs_tensors.index(input)]
+                val = pre_action.map_output(input)
+                action.set_input(idx + 1, val)
+            outputs_tensors += action.graph.outputs()
+            outputs_actions += [action] * len(action.graph.outputs())
 
-    def backward(self):
+        # return tensors
+        outputs = tuple(total_actions[-1].outputs())
+        for output in outputs:
+            output.set_gen_graph(self)
+        if len(outputs) == 1:
+            return outputs[0]
+        elif len(outputs) == 0:
+            return None
+        else:
+            return outputs
+
+    def __call__(self, *args):
+        """
+        Register forward action
+        """
+        return self.forward(*args)
+
+    def backward(self, loss: IRTensor):
         """
         Backward will generate a backward action scheduling pool
 
@@ -190,11 +183,9 @@ class IRGraph:
                 name = fnode.name + '_backward',
                 signature = fnode.signature,
                 input_length = len(inputs),
-                output_length = len(outputs),
-                type=fnode.type
+                output_length = len(outputs)
             )
             bp_node.device = fnode.device
-            print(bp_node)
             for idx, arg in enumerate(inputs):
                 bp_node.set_input(idx, arg)
             for idx, arg in enumerate(outputs):
@@ -207,12 +198,11 @@ class IRGraph:
         graph = IRGraph(
             backward_nodes,
             inputs, outputs,
-            self.module_name + 'Backward'
+            self.name + 'Backward'
         )
         print(graph)
         graph.tag = 'backward'
-        graph()
-        
+        graph(loss)
 
     def __repr__(self):
         dscp = ''
@@ -230,70 +220,125 @@ class IRGraph:
         return dscp
 
 
-class IRLocalGraph(IRGraph):
+# outputs = cube.runtime.temporal.forward(model, *args)
+_forward_signature = 'cube.runtime.temporal.forward'
+# grads = cube.runtime.temporal.backward(input_tensors, output_tensors, output_grads)
+_backward_signature = 'cube.runtime.temporal.backward'
 
-    def __init__(self, 
-                 sub_nodes: List[IROperation],
-                 global_graph: IRGraph,
-                 device: int
-        ):
+
+class IRAction(IRCell):
+
+    def __init__(self, sub_nodes, global_graph, devices: Union[List[int], int]):
+
+        if isinstance(devices, int):
+            devices = [devices]
 
         if not isinstance(global_graph, IRGraph):
             raise TypeError(f"Expected graph: IRGraph but go {type(global_graph)}")
-        if not isinstance(device, int):
-            raise TypeError(f"Expected device: int but not {type(device)}")
-        for node in sub_nodes:
-            if not node.on_device(device):
-                raise RuntimeError(f"Local Graph requires all nodes on device {device}")
-        self.global_graph = global_graph
-        self.device = device
+
+        if global_graph.tag == 'forward':
+            signature = _forward_signature
+        elif global_graph.tag == 'backward':
+            signature = _backward_signature
+        else:
+            raise RuntimeError(f"Unsupported graph tag: {self.global_graph.tag}")
+
+        # send tensors
         self.send_tensors = list()
         self.send_devices = list()
+
+        # recv tensors
         self.recv_tensors = list()
         self.recv_devices = list()
+
         # get nodes belong to this graph
         all_tensors = list()
         for node in sub_nodes:
             # collect recv tensors
             for input in node.inputs():
                 if isinstance(input, IRTensor):
-                    if self.device not in input.device:
+                    recv_devices = list(set(devices) - set(input.device))
+                    if len(recv_devices) != 0:
                         if input not in self.recv_tensors:
                             self.recv_tensors.append(input)
-                            self.recv_devices.append(self.device)
+                            self.recv_devices.append(recv_devices)
             # collect send tensors
             for output in node.outputs():
                 if isinstance(output, IRTensor):
                     succ_nodes = output.dst()
                     for succ_node in succ_nodes:
-                        if not succ_node.on_device(self.device):
+                        send_devices = list(set(devices) - set(succ_node.device))
+                        if len(send_devices) != 0:
                             if output not in self.send_tensors:
                                 self.send_tensors.append(output)
-                                self.send_devices.append(succ_node.device)
-            # move semantic
-            # if node.semantic == 'move':
-            #     if device in node.inputs(0).device:
-            #         self.send_tensors.append(node.inputs(0))
-            #         self.send_devices.append(node.outputs(0).device)
-            #     if device in node.outputs(0).device:
-            #         self.recv_tensors.append(node.outputs(0))
-            #         self.recv_devices.append(node.inputs(0).device)
+                                self.send_devices.append(send_devices)
             all_tensors += node.inputs()
             all_tensors += node.outputs()
 
-        # model inputs and outputs
-        model_inputs = list()
-        model_outputs = list()
-        for input in self.global_graph.inputs():
+        # action graph inputs and outputs
+        inputs = list()
+        outputs = list()
+        for input in global_graph.inputs():
             if input in all_tensors and input not in self.recv_tensors:
-                model_inputs.append(input)
-        for output in self.global_graph.outputs():
+                inputs.append(input)
+        for output in global_graph.outputs():
             if output in all_tensors and output not in self.send_tensors:
-                model_outputs.append(output)
+                outputs.append(output)
 
-        super().__init__(
-            sub_nodes,
-            model_inputs + self.recv_tensors,  # input tensors
-            model_outputs + self.send_tensors,  # output tensors
-            self.global_graph.module_name + f'Rank{self.device}'
+        self.graph = IRGraph(
+            nodes = sub_nodes,
+            input_tensors = inputs + self.recv_tensors,
+            output_tensors = outputs + self.send_tensors,
+            module_name = global_graph.name
         )
+
+        action_inputs = [self.graph] + [None] * len(self.graph.inputs())
+        super().__init__(
+            name          = global_graph.tag,
+            signature     = signature,
+            input_length  = len(action_inputs),
+            output_length = len(self.graph.outputs())
+        )
+        self.device = devices
+        self._inputs = action_inputs
+
+    def map_output(self, graph_output_tensor: Any) -> Any:
+        if graph_output_tensor not in self.graph.outputs():
+            return None
+        index = self.graph.outputs().index(graph_output_tensor)
+        return self.outputs(index)
+
+    def happen_before(self, action):
+        """
+        Check if the self -> (happened before) action
+        """
+        if not isinstance(action, IRAction):
+            raise TypeError("Expected action to be an Action")
+        for pre_actions in self.successors():
+            if action in pre_actions:
+                return True
+        return False
+
+    def happen_after(self, action):
+        """
+        Check if the action -> (happened before) self
+
+        Note: this may return false negative as it will only check
+        1-hop dependency
+        """
+        if not isinstance(action, IRAction):
+            raise TypeError("Expected action to be an Action")
+        for pre_actions in self.predecessors():
+            if action in pre_actions:
+                return True
+        return False
+
+    def add_flow(self, action):
+        """
+        self -> (happened before) action
+        """
+        raise NotImplementedError
+
+    def __repr__(self):
+        dscp = f'Action({self.name}):\n\t{self.graph.inputs()} -> {self.graph.outputs()}'
+        return dscp

@@ -1,6 +1,4 @@
-from typing import List, Callable
-
-from cube.tschedule.action import Action
+from typing import Callable
 
 
 class TSchedulePool:
@@ -9,7 +7,8 @@ class TSchedulePool:
 
         def __init__(self):
 
-            self._actions: List[Action] = list()
+            self._actions = list()
+            self._flow_id = -1
 
     instance = None
 
@@ -20,7 +19,7 @@ class TSchedulePool:
     def __getattr__(self, name):
         return getattr(self.instance, name)
 
-    def add_action(self, action: Action):
+    def add_action(self, action):
         self.instance._actions.append(action)
 
     def actions(self):
@@ -28,6 +27,14 @@ class TSchedulePool:
 
     def clear(self):
         self.instance._actions = list()
+        self.instance._flow_id = -1
+
+    def gen_id(self) -> int:
+        """
+        Generate an unique action id
+        """
+        self.instance._flow_id += 1
+        return self.instance._flow_id
 
     def __repr__(self):
         dscp = '\n'.join([repr(action) for action in self._actions])

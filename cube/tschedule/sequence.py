@@ -1,15 +1,10 @@
-from typing import List, Tuple, NewType
+from typing import List, Tuple, NewType, Any
 import numpy as np
-
-from cube.tschedule.action import Action
 
 
 class ASequence:
 
-    def __init__(self, actions: List[Action]):
-        
-        if not all([isinstance(action, Action) for action in actions]):
-            raise TypeError("Expected a list of Actions")
+    def __init__(self, actions):
 
         self.sequence = actions
 
@@ -25,12 +20,10 @@ class ASequence:
         """
         return len(self.sequence)
 
-    def append(self, action: Action):
-        if not isinstance(action, Action):
-            raise TypeError("Expected an action")
+    def append(self, action):
         self.sequence.append(action)
 
-    def pop(self) -> Action:
+    def pop(self):
         """
         Pop the last action and return
         """
@@ -57,13 +50,13 @@ class ASequence:
 
 # ======= Blow should be moved from this module ======== #
 
-Relation = NewType('Relation', List[Tuple[Action, Action]])
+Relation = NewType('Relation', List[Tuple[Any, Any]])
 
 
 class ScheduleSpace:
 
     @staticmethod
-    def tspace(remain_actions: List[Action],
+    def tspace(remain_actions,
               path_shuffle=True, 
               relations=None,
               seq: ASequence = ASequence(list())):
@@ -94,7 +87,7 @@ class ScheduleSpace:
 
 
     @staticmethod
-    def sspace(actions: List[Action], ndevice: int, path_shuffle=True, depth=0):
+    def sspace(actions, ndevice: int, path_shuffle=True, depth=0):
         """
         Iterate on the possible action space
         """
@@ -112,7 +105,7 @@ class ScheduleSpace:
 
 
     @staticmethod
-    def _ready_actions(actions: List[Action], sub_relations: Relation) -> List[Action]:
+    def _ready_actions(actions, sub_relations: Relation):
         """
         Get ready to emit actions based on sub_relations
         """
@@ -129,7 +122,7 @@ class ScheduleSpace:
 
 
     @staticmethod
-    def _get_relations(actions: List[Action]) -> Relation:
+    def _get_relations(actions) -> Relation:
         """
         Get relation tuples (Action1 -> Action2)
         """
@@ -142,7 +135,7 @@ class ScheduleSpace:
 
 
     @staticmethod
-    def _remove_action(target: Action, relations: Relation) -> Relation:
+    def _remove_action(target, relations: Relation) -> Relation:
         """
         Remove the target action from relation set
         """

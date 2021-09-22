@@ -10,7 +10,7 @@ class IDGenerator:
         def __init__(self):
 
             self._tensor_id = 0
-            self._op_id = 0
+            self._cell_id = 0
 
     instance = None
 
@@ -25,9 +25,9 @@ class IDGenerator:
         self.instance._tensor_id += 1
         return self.instance._tensor_id
 
-    def gen_op_id(self):
-        self.instance._op_id += 1
-        return self.instance._op_id
+    def gen_cell_id(self):
+        self.instance._cell_id += 1
+        return self.instance._cell_id
 
     def clear(self):
         self.instance._tensor_id = 0

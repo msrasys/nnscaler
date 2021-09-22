@@ -1,4 +1,4 @@
-from cube.graph.ir_opten import IRTensor
+from cube.graph.ir_cten import IRTensor
 from typing import Optional, List
 
 from cube.graph.parser import ScriptModuleParser

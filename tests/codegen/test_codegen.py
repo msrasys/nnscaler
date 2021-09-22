@@ -1,4 +1,4 @@
-from cube.graph import parser, IRLocalGraph
+from cube.graph import parser, IRAction, IRTensor
 from cube.codegen.codegen import SScheduleCodeGen
 
 import torch
@@ -47,9 +47,9 @@ def test_codegen(model):
                            input_shapes=([1024,1024],))
     for node in graph.nodes():
         node.device = 0
-    local_graph = IRLocalGraph(graph.nodes(), graph, device=0)
+    local_graph = IRAction(graph.nodes(), graph, devices=[0])
     gener = SScheduleCodeGen(local_graph)
-    code = gener.gen(outfile='code.py')
+    code = gener.gen(device=0, outfile='code.py')
 
     # execute
     print("> ===== Generated Code =====")
