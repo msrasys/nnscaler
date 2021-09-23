@@ -32,6 +32,8 @@ class IR2LogicOp:
 
         __ttemplate('add') : logic.TensorAdd,
 
+        __ttemplate('sum') : logic.TensorSum,
+
         # runtime collectives
         'cube.runtime.spatial.move': 'move',
 

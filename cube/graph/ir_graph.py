@@ -3,11 +3,9 @@ from cube.graph.ir_op import IROperation
 from cube.tschedule.pool import TSchedulePool
 
 from typing import Union, Tuple, List, Optional, Any
-import copy
 
 
 __all__ = ['IRGraph', 'IRAction']
-
 
 
 class IRGraph(IRCell):
@@ -105,7 +103,7 @@ class IRGraph(IRCell):
         # setup action inputs
         head = total_actions[0]
         for idx, arg in enumerate(args):
-            head.set_input(idx + 1, arg)  # 0 is for graph itself
+            head.set_input(idx, arg)
         outputs_tensors = [*head.graph.outputs()]
         outputs_actions = [head] * len(head.graph.outputs())
         for action in total_actions[1:]:
@@ -114,7 +112,7 @@ class IRGraph(IRCell):
                     raise RuntimeError(f"Cannot find {input} tensors")
                 pre_action = outputs_actions[outputs_tensors.index(input)]
                 val = pre_action.map_output(input)
-                action.set_input(idx + 1, val)
+                action.set_input(idx, val)
             outputs_tensors += action.graph.outputs()
             outputs_actions += [action] * len(action.graph.outputs())
 
@@ -146,13 +144,10 @@ class IRGraph(IRCell):
 
         def get_tensor_grad(tensor):
             if tensor._id not in all_tensors:
-                new_tensor = copy.deepcopy(tensor)
-                if tensor.name is None:
-                    new_tensor.name = 'grad'
-                else:
-                    new_tensor.name = tensor.name + '_grad'
-                new_tensor._src_nodes = list()
-                new_tensor._dst_nodes = list()
+                name = 'grad' if tensor.name is None else tensor.name + '_grad'
+                new_tensor = IRTensor(
+                    shape=tensor.shape, name=name
+                )
                 # reverse op
                 devices = set()
                 for node in tensor.dst():
@@ -163,12 +158,21 @@ class IRGraph(IRCell):
             else:
                 return all_tensors[tensor._id]
 
+        # backward graph inputs
+        graph_inputs = list()
+        # none outputs for loss
+        graph_outputs = list()
+        # nodes
         backward_nodes = list()
+        all_bp_tensors = list()
         for fnode in self._nodes[::-1]:
             inputs = list()
             for input in fnode.outputs():
                 if isinstance(input, IRTensor) and input.requires_grad:
                     tensor = get_tensor_grad(input)
+                    if tensor not in all_bp_tensors:
+                        graph_inputs.append(tensor)
+                        all_bp_tensors.append(tensor)
                     inputs.append(tensor)
                 else:
                     inputs.append(None)
@@ -176,6 +180,7 @@ class IRGraph(IRCell):
             for output in fnode.inputs():
                 if isinstance(output, IRTensor) and output.requires_grad:
                     tensor = get_tensor_grad(output)
+                    all_bp_tensors.append(tensor)
                     outputs.append(tensor)
                 else:
                     outputs.append(None)
@@ -191,13 +196,9 @@ class IRGraph(IRCell):
             for idx, arg in enumerate(outputs):
                 bp_node.set_output(idx, arg)
             backward_nodes.append(bp_node)
-        # none inputs for loss
-        inputs = list()
-        # none outputs for loss
-        outputs = list()
         graph = IRGraph(
             backward_nodes,
-            inputs, outputs,
+            graph_inputs, graph_outputs,
             self.name + 'Backward'
         )
         print(graph)
@@ -292,7 +293,7 @@ class IRAction(IRCell):
             module_name = global_graph.name
         )
 
-        action_inputs = [self.graph] + [None] * len(self.graph.inputs())
+        action_inputs = [None] * len(self.graph.inputs())
         super().__init__(
             name          = global_graph.tag,
             signature     = signature,
@@ -301,6 +302,7 @@ class IRAction(IRCell):
         )
         self.device = devices
         self._inputs = action_inputs
+        print(self.graph)
 
     def map_output(self, graph_output_tensor: Any) -> Any:
         if graph_output_tensor not in self.graph.outputs():
@@ -340,5 +342,7 @@ class IRAction(IRCell):
         raise NotImplementedError
 
     def __repr__(self):
-        dscp = f'Action({self.name}):\n\t{self.graph.inputs()} -> {self.graph.outputs()}'
+        action_inputs = [f't{tensor._id}' for tensor in self.inputs()]
+        action_outputs = [f't{tensor._id}' for tensor in self.outputs()]
+        dscp = f'Action({self.name}):\n\t{self.graph.inputs()} ({action_inputs}) -> {self.graph.outputs()} ({action_outputs})'
         return dscp

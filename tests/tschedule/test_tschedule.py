@@ -1,6 +1,7 @@
 from cube.tschedule.pool import TSchedulePool
 from cube.graph.ir_cten import IRTensor
 from torch import nn
+import torch
 
 import cube.graph.parser as parser
 from cube.codegen.codegen import SScheduleCodeGen
@@ -21,7 +22,8 @@ class FeedForward(nn.Module):
         output = self.dropout(output)
         output = self.linear2(output)
         output = self.classifier(output)
-        return output
+        loss = torch.sum(output)
+        return loss
 
 
 model = FeedForward(dim=1024)
@@ -74,3 +76,15 @@ if __name__ == '__main__':
 
     #test_graph_forward(ir_graph)
     test_graph_backward(ir_graph)
+
+
+
+"""
+loss = cube.runtime.temporal.forward(model, input1, input2, xxx)
+grad1, grad2, ... = cube.runtime.temporal.backward(loss, None)
+"""
+
+"""
+out1, out2 = cube.runtime.temporal.forward(model, input1)
+cube.runtime.temporal.backward(out1, out2, out1_grad, out2_grad)
+"""

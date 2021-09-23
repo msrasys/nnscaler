@@ -44,3 +44,14 @@ class TensorAdd(ElementSameInputOp):
 
     def __init__(self, signature: str):
         super().__init__(signature)
+
+
+class TensorSum(GenericLogicalOp):
+
+    @staticmethod
+    def candidates():
+        raise NotImplementedError
+
+    @staticmethod
+    def shape_infer(*args):
+        return [[1,],]
