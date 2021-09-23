@@ -1,4 +1,3 @@
-from torch._C import device
 from cube.graph.ir_cten import IRTensor, IRCell
 from cube.graph.ir_op import IROperation
 from cube.tschedule.pool import TSchedulePool
@@ -211,6 +210,66 @@ class IRGraph(IRCell):
         graph.tag = 'backward'
         graph(loss)
 
+    def subgraph(self, sub_nodes: List[IRCell]):
+        """
+        Create a subgraph with sub nodes.
+
+        The remote tensor will be set as graph input (recv tensors)
+        and graph output (send tensors)
+
+        Return:
+            IRGraph,
+            recv tensor starting offset (int) in input,
+            send tensor starting offset (int) in output
+        """
+        def _update(x_tensors, x_devices, tensor, devices):
+            if tensor not in x_tensors:
+                x_tensors.append(tensor)
+                x_devices.append(set(devices))
+            else:
+                idx = x_tensors.index(tensor)
+                x_devices[idx].update(set(devices))
+
+        # recv tensors
+        recv_tensors = list()
+        recv_devices = list()
+        # send tensors
+        send_tensors = list()
+        send_devices = list()
+        # get nodes belong to this graph
+        all_tensors = list()
+        for node in sub_nodes:
+            # collect recv tensors
+            tensors_and_devices = node.get_recv_tensors()
+            for r_tensor, r_devices in zip(*tensors_and_devices):
+                _update(recv_tensors, recv_devices, r_tensor, r_devices)
+            # collect send tensors
+            tensors_and_devices = node.get_send_tensors()
+            for s_tensor, s_devices in zip(*tensors_and_devices):
+                _update(send_tensors, send_devices, s_tensor, s_devices)
+            all_tensors += node.inputs()
+            all_tensors += node.outputs()
+
+        # set extra graph inputs and outputs
+        inputs = list()
+        outputs = list()
+        for input in self.inputs():
+            if input in all_tensors and input not in recv_tensors:
+                inputs.append(input)
+        for output in self.outputs():
+            if output in all_tensors and output not in send_tensors:
+                outputs.append(output)
+
+        graph = IRGraph(
+            nodes = sub_nodes,
+            input_tensors = inputs + recv_tensors,
+            output_tensors = outputs + send_tensors,
+            module_name = self.name
+        )
+
+        return graph, len(inputs), len(outputs)
+
+
     def __repr__(self):
         dscp = f"\n{self.name}:\n{'=' * len(self.name)}\n"
         # inputs
@@ -255,55 +314,9 @@ class IRAction(IRCell):
         else:
             raise RuntimeError(f"Unsupported graph tag: {self.global_graph.tag}")
 
-        # send tensors
-        send_tensors = list()
-        send_devices = list()
-        # recv tensors
-        recv_tensors = list()
-        recv_devices = list()
-        # get nodes belong to this graph
-        all_tensors = list()
-        for node in sub_nodes:
-            # collect recv tensors
-            for input in node.inputs():
-                if isinstance(input, IRTensor):
-                    recv_devices = list(set(devices) - set(input.device))
-                    if len(recv_devices) != 0:
-                        if input not in recv_tensors:
-                            recv_tensors.append(input)
-                            recv_devices.append(recv_devices)
-            # collect send tensors
-            for output in node.outputs():
-                if isinstance(output, IRTensor):
-                    succ_nodes = output.dst()
-                    for succ_node in succ_nodes:
-                        send_devices = list(set(devices) - set(succ_node.device))
-                        if len(send_devices) != 0:
-                            if output not in send_tensors:
-                                send_tensors.append(output)
-                                send_devices.append(send_devices)
-            all_tensors += node.inputs()
-            all_tensors += node.outputs()
-
-        # action graph inputs and outputs
-        inputs = list()
-        outputs = list()
-        for input in global_graph.inputs():
-            if input in all_tensors and input not in recv_tensors:
-                inputs.append(input)
-        for output in global_graph.outputs():
-            if output in all_tensors and output not in send_tensors:
-                outputs.append(output)
-
-        self._send_ofst = len(outputs)
-        self._recv_ofst = len(inputs)
-
-        self.graph = IRGraph(
-            nodes = sub_nodes,
-            input_tensors = inputs + recv_tensors,
-            output_tensors = outputs + send_tensors,
-            module_name = global_graph.name
-        )
+        self.graph, recv_ofst, send_ofst = global_graph.subgraph(sub_nodes)
+        self._recv_ofst = recv_ofst
+        self._send_ofst = send_ofst
 
         super().__init__(
             name          = global_graph.tag,
