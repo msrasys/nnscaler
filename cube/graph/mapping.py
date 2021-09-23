@@ -14,6 +14,7 @@ class IR2LogicOp:
         """
         if signature in IR2LogicOp.kOpMap:
             return IR2LogicOp.kOpMap[signature]
+        # return None
         raise KeyError(f"{signature} is not supported yet")
 
     # functional templates

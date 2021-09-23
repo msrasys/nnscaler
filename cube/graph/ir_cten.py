@@ -89,7 +89,7 @@ class IRCell:
                 )
             return self._inputs[index]
         elif index is None:
-            return self._inputs
+            return copy.copy(self._inputs)
         else:
             raise TypeError("Expected index to be None or int")
 
@@ -102,7 +102,7 @@ class IRCell:
                 raise RuntimeError(
                     f"Get the input out of range ({index} >= {len(self._inputs)}"
                 )
-            return self._predecessors[index]
+            return copy.copy(self._predecessors[index])
         elif index is None:
             predecessors = list()
             for pre_cells in self._predecessors:
@@ -127,7 +127,7 @@ class IRCell:
                 )
             return self._outputs[index]
         elif index is None:
-            return self._outputs
+            return copy.copy(self._outputs)
         else:
             raise TypeError("Expected index to be None or int")
 
@@ -145,7 +145,7 @@ class IRCell:
                 raise RuntimeError(
                     f"Get the output out of range ({index} >= {len(self._outputs)}"
                 )
-            return self._successors[index]
+            return copy.copy(self._successors[index])
         elif index is None:
             successors = list()
             for post_cells in self._successors:

@@ -1,3 +1,4 @@
+from torch._C import device
 from cube.graph.ir_cten import IRTensor, IRCell
 from cube.graph.ir_op import IROperation
 from cube.tschedule.pool import TSchedulePool
@@ -153,7 +154,10 @@ class IRGraph(IRCell):
                 devices = set()
                 for node in tensor.dst():
                     devices.update(node.device)
-                new_tensor.device = list(devices)
+                devices = list(devices)
+                if len(devices) == 0:
+                    devices = tensor.device
+                new_tensor.device = devices
                 all_tensors[tensor._id] = new_tensor
                 return new_tensor
             else:
@@ -166,6 +170,15 @@ class IRGraph(IRCell):
         # nodes
         backward_nodes = list()
         all_bp_tensors = list()
+        # the first node: loss to none
+        # none_node = IROperation(
+        #     name = 'tonone',
+        #     signature = 'cube.temporal.to_none',
+        #     input_length=1,
+        #     output_length=1
+        # )
+        # none_node.set_input(0, loss)
+
         for fnode in self._nodes[::-1]:
             inputs = list()
             for input in fnode.outputs():
@@ -207,7 +220,7 @@ class IRGraph(IRCell):
         graph(loss)
 
     def __repr__(self):
-        dscp = ''
+        dscp = f"\n{self.name}:\n{'=' * len(self.name)}\n"
         # inputs
         dscp += f'Inputs: {self._inputs}\n'
         # nodes
@@ -218,7 +231,7 @@ class IRGraph(IRCell):
                 succ_node_ids[out_idx] = node_list
             dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}\n"
         # outputs
-        dscp += f'\nOutputs: {self._outputs}'
+        dscp += f"\nOutputs: {self._outputs}\n{'=' * len(self.name)}\n"
         return dscp
 
 
@@ -229,6 +242,11 @@ _backward_signature = 'cube.runtime.temporal.backward'
 
 
 class IRAction(IRCell):
+    """
+    Action recv tensors must be inside of Action inputs,
+    and can be mapped to Action.graph.inputs
+
+    """
 
     def __init__(self, sub_nodes, global_graph, devices: Union[List[int], int]):
 
@@ -302,6 +320,9 @@ class IRAction(IRCell):
             output_length = len(self.graph.outputs())
         )
         self.device = devices
+        for output in self.outputs():
+            if isinstance(output, IRTensor):
+                output.device = devices
         self._inputs = action_inputs
         print(self.graph)
 
@@ -314,13 +335,13 @@ class IRAction(IRCell):
     def happen_before(self, action):
         """
         Check if the self -> (happened before) action
+
+        Note: this may return false negative as it will only check
+        1-hop dependency
         """
         if not isinstance(action, IRAction):
             raise TypeError("Expected action to be an Action")
-        for pre_actions in self.successors():
-            if action in pre_actions:
-                return True
-        return False
+        return self in action.predecessors()
 
     def happen_after(self, action):
         """
@@ -331,10 +352,7 @@ class IRAction(IRCell):
         """
         if not isinstance(action, IRAction):
             raise TypeError("Expected action to be an Action")
-        for pre_actions in self.predecessors():
-            if action in pre_actions:
-                return True
-        return False
+        return self in action.successors()
 
     def add_flow(self, action):
         """

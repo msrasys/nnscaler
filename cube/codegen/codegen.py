@@ -1,10 +1,10 @@
 """
 Generate Pytorch code given the model DAG and the transformation config
 """
-from cube.tschedule.sequence import ASequence
 from typing import List, Any, Dict
 
 from cube.graph import IRAction, IRTensor, IROperation
+from cube.graph.ir_seq import IRSequence
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
@@ -21,7 +21,9 @@ class SScheduleCodeGen:
             raise TypeError("graph should be IRGraph")
         self.graph = action.graph
         # model full code
-        self.code: List[str] = ['import torch', '', '']
+        self.code: List[str] = [
+            '########## Generated Code ###########',
+            'import torch', '', '']
         # module init code
         self.declare_region: List[str] = list()
         # module forward code
@@ -142,12 +144,14 @@ class SScheduleCodeGen:
 
 class TScheduleCodeGen:
 
-    def __init__(self, seq: ASequence):
-        if not isinstance(seq, ASequence):
-            raise TypeError("seq should be ASequence")
+    def __init__(self, seq: IRSequence):
+        if not isinstance(seq, IRSequence):
+            raise TypeError("seq should be IRSequence")
         self.seq = seq
         # model full code
-        self.code: List[str] = ['from typing import Tuple', 'import torch', '', '']
+        self.code: List[str] = [
+            '########## Generated Code ###########',
+            'from typing import Tuple', 'import torch', '', '']
         # module member name
         self.symbols = SymbolTable()
 
@@ -156,19 +160,30 @@ class TScheduleCodeGen:
         Generate scheduling code based on the given actions
         """
         actions = list()
-        for action in self.seq.actions():
+        for action in self.seq:
             if device in action.device:
                 actions.append(action)
 
         # {send: xxx, recv: xxx} action1 {send:xxx, recv:xxx} action2 ....
-        action_with_comms = list(dict())
+        action_with_comms = [dict()]
         for action in actions:
-            send_tensors = [self.naming(tensor) for tensor in action.graph.send_tensors]
-            send_devices = action.graph.send_devices
-            send_shapes = tuple([tensor.shape for tensor in send_tensors])
-            recv_tensors = [self.naming(tensor) for tensor in action.graph.recv_tensors]
-            recv_devices = action.graph.recv_devices
-            recv_shapes = tuple([tensor.shape for tensor in recv_tensors])
+            num_send_tensors = len(action.send_tensors)
+            if num_send_tensors == 0:
+                send_tensors = list()
+            else:
+                send_tensors = action.outputs()[-num_send_tensors:]
+            send_tensors = [self.naming(tensor) for tensor in send_tensors]
+            send_devices = action.send_devices
+            send_shapes = tuple([tensor.shape for tensor in action.send_tensors])
+
+            num_recv_tensors = len(action.recv_tensors)
+            if num_recv_tensors == 0:
+                recv_tensors = list()
+            else:
+                recv_tensors = action.inputs()[-num_recv_tensors:]
+            recv_tensors = [self.naming(tensor) for tensor in recv_tensors]
+            recv_devices = action.recv_devices
+            recv_shapes = tuple([tensor.shape for tensor in action.recv_tensors])
             
             comm = action_with_comms[-1]
             # recv before the action
@@ -220,8 +235,9 @@ class TScheduleCodeGen:
 
         # generate for send
         if ('send_tensors') in comm and ('recv_tensors' not in comm):
+            send_tensors = ', '.join(comm['send_tensors'])
             code = ssign.format(
-                send_tensors = comm['send_tensors'],
+                send_tensors = send_tensors,
                 shapes       = comm['send_shapes'],
                 to_devices   = comm['send_devices']
             )
@@ -232,58 +248,78 @@ class TScheduleCodeGen:
                 shapes       = comm['recv_shapes'],
                 from_devices = comm['recv_devices']
             )
-            return_val = repr(tuple(comm['recv_tensors']))
+            return_val = ','.join(comm['recv_tensors'])
             code = f'{return_val} = {body}'
             return code
         # generate for send + recv
-        else:
+        elif ('send_tensors' in comm) and ('recv_tensors' in comm):
+            send_tensors = ', '.join(comm['send_tensors'])
             body = srsign.format(
-                send_tensors = comm['send_tensors'],
-                shapes       = comm['send_shapes'],
+                send_tensors = send_tensors,
+                send_shapes  = comm['send_shapes'],
                 to_devices   = comm['send_devices'],
                 recv_shapes  = comm['recv_shapes'],
                 from_devices = comm['recv_devices']
             )
-            return_val = repr(tuple(comm['recv_tensors']))
+            return_val = ','.join(comm['recv_tensors'])
             code = f'{return_val} = {body}'
             return code
+        else:
+            return []
 
-    def emit_action(self, action) -> List[str]:
+    def emit_action(self, action: IRAction) -> List[str]:
         """
         Emit action code
         """
-        fsign = 'cube.runtime.temporal.forward({model}, *inputs[{fid}]})'
+        fsign = 'cube.runtime.temporal.forward({model}, *{inputs})'
         bsign = 'cube.runtime.temporal.backward({input_tensors}, {output_tensors}, {output_grads})'
         
-        if action.tag == 'forward':
+        if action.name == 'forward':
+            inputs = [self.naming(tensor) for tensor in action.inputs()]
+            inputs = '(' + ', '.join(inputs) + ',)'
             body = fsign.format(
                 model = 'model',
-                fid   = 0
+                inputs = inputs
             )
             outputs = [self.naming(output) for output in action.outputs()]
-            return_val = repr(tuple(outputs))
+            return_val = ','.join(outputs)
             code = f'{return_val} = {body}'
             return code
-        elif action.tag == 'backward':
+
+        elif action.name == 'backward':
             # 1). input_tensors are forward inputs (happened before action inputs)
-            # 2). output_tensors are forward results (action.inputs())
+            #       => backward graph output tensor (share tensor in forward / backward graph)
+            # 2). output_tensors are forward outputs (action.inputs())
+            #       => backward graph input tensor (share tensor in forward / backward)
             # 3). output_grads are recved tesnors of this graph (graph.recv_tensors)
-            output_tensors = [self.naming(input) for input in action.inputs()]
-            output_grads = None
-            if len(action.graph.recv_tensors) != 0:
-                output_grads = [self.naming(tensor) for tensor in action.graph.recv_tensors]
-                output_grads = repr(tuple(output_grads))
+            #       => backward graph input tensor (graph.recv_tensors)
+            forward_inputs = self.seq.get_forward_inputs(action)
+            forward_inputs = [self.naming(tensor) for tensor in forward_inputs]
+            forward_inputs = '(' + ', '.join(forward_inputs) + ',)'
+            forward_outputs = self.seq.get_forward_outputs(action)
+            forward_outputs = [self.naming(tensor) for tensor in forward_outputs]
+            forward_outputs = '(' + ', '.join(forward_outputs) + ',)'
+            num_recv_tensors = len(action.recv_tensors)
+            if num_recv_tensors == 0:
+                recv_grads = list()
+            else:
+                recv_grads = action.inputs()[-num_recv_tensors:]
+            recv_grads = [self.naming(tensor) for tensor in recv_grads]
+            recv_grads = '(' + ','.join(recv_grads) + ',)'
 
             body = bsign.format(
-                input_tensors = None,
-                output_tensors = output_tensors,
-                output_grads = output_grads
+                input_tensors = forward_inputs,
+                output_tensors = forward_outputs,
+                output_grads = recv_grads
             )
 
             # returned value are graph.outputs
-            return_val = [self.naming(tensor) for tensor in action.graph.outputs()]
-            return_val = repr(tuple(return_val))
-            code = f'{return_val} = {body}'
+            return_val = [self.naming(tensor) for tensor in action.outputs()]
+            if len(return_val) > 0:
+                return_code = ', '.join(return_val) + ' = '
+            else:
+                return_code = ''
+            code = f'{return_code}{body}'
             return code
         else:
             raise RuntimeError(f"Unsupported action tag: {action.tag}")

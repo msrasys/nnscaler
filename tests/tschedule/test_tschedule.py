@@ -1,5 +1,6 @@
 from cube.tschedule.pool import TSchedulePool
 from cube.graph.ir_cten import IRTensor
+from cube.graph.ir_seq import IRSequence
 from torch import nn
 import torch
 
@@ -66,10 +67,17 @@ def test_graph_backward(ir_graph):
     TSchedulePool().clear()
     tensor = ir_graph(IRTensor(shape=[64,1024]))
     tensor.backward()
-    #tensor = ir_graph()
-    #tensor.backward()
+    tensor = ir_graph(IRTensor(shape=[64,1024]))
+    tensor.backward()
     print('====== Backward Test =======')
     print(TSchedulePool())
+
+    sequence = IRSequence(TSchedulePool().actions())
+    from cube.codegen.codegen import TScheduleCodeGen
+    gener = TScheduleCodeGen(sequence)
+    code = gener.gen(device=0)
+    code = gener.gen(device=1)
+    print(code)
 
 
 if __name__ == '__main__':
