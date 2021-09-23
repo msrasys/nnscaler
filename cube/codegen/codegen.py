@@ -167,25 +167,18 @@ class TScheduleCodeGen:
         # {send: xxx, recv: xxx} action1 {send:xxx, recv:xxx} action2 ....
         action_with_comms = [dict()]
         for action in actions:
-            num_send_tensors = len(action.send_tensors)
-            if num_send_tensors == 0:
-                send_tensors = list()
-            else:
-                send_tensors = action.outputs()[-num_send_tensors:]
+            # send info
+            send_tensors, send_devices = action.get_send_tensors()
+            send_shapes = tuple([tensor.shape for tensor in send_tensors])
             send_tensors = [self.naming(tensor) for tensor in send_tensors]
-            send_devices = action.send_devices
-            send_shapes = tuple([tensor.shape for tensor in action.send_tensors])
 
-            num_recv_tensors = len(action.recv_tensors)
-            if num_recv_tensors == 0:
-                recv_tensors = list()
-            else:
-                recv_tensors = action.inputs()[-num_recv_tensors:]
+            # recv info
+            recv_tensors, recv_devices = action.get_recv_tensors()
+            recv_shapes = tuple([tensor.shape for tensor in recv_tensors])
             recv_tensors = [self.naming(tensor) for tensor in recv_tensors]
-            recv_devices = action.recv_devices
-            recv_shapes = tuple([tensor.shape for tensor in action.recv_tensors])
             
             comm = action_with_comms[-1]
+
             # recv before the action
             if len(recv_tensors) != 0:
                 comm.update({
@@ -193,8 +186,10 @@ class TScheduleCodeGen:
                     'recv_devices' : recv_devices,
                     'recv_shapes'  : recv_shapes
                 })
+
             # action
             action_with_comms.append(action)
+
             # send after the action
             comm = dict()
             if len(send_tensors) != 0:
@@ -207,7 +202,7 @@ class TScheduleCodeGen:
 
         # generate code
         with FunctionBlock(func_name='_train_step', 
-                           args=['model', 'inputs: Tuple[Tuple[Tensor]]']) as fb:
+                           args=['model', 'dataloader']) as fb:
             for action_or_comm in action_with_comms:
                 if isinstance(action_or_comm, dict):
                     code = self.emit_comm(action_or_comm)
@@ -331,10 +326,13 @@ class TScheduleCodeGen:
         If the var is a leaf tensor, will add prefix `self.` to its name
         """
         if isinstance(tensor, IRTensor):
-            tensor_name = 'tensor' if tensor.name is None else tensor.name
-            if '.' in tensor_name:
-                tensor_name = tensor_name.split('.')[0]
-            name = '_'.join([tensor_name, str(tensor._id)])
+            if len(tensor.src()) == 0:
+                name = '*next(dataloader)'
+            else:
+                tensor_name = 'tensor' if tensor.name is None else tensor.name
+                if '.' in tensor_name:
+                    tensor_name = tensor_name.split('.')[0]
+                name = '_'.join([tensor_name, str(tensor._id)])
         else:
             name = str(tensor)
         return name

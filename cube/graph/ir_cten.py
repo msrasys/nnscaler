@@ -1,4 +1,4 @@
-from typing import List, Union, Optional, Any
+from typing import List, Union, Optional, Any, Tuple
 import copy
 
 from cube.graph.unique import IDGenerator
@@ -222,6 +222,46 @@ class IRCell:
         if out_index < 0:
             raise RuntimeError("Fail to find output tensor")
         self._successors[out_index].append(node)
+
+    def get_send_tensors(self):
+        """
+        Collect send tensors at cell level.
+        This will not care what happened inside this cell
+
+        Returns:
+            send_tensors: list of IRTensor
+            send_devices: list of list[int] devices for each tensor
+        """
+        send_tensors = list()
+        send_devices = list()
+        for idx, output in enumerate(self.outputs()):
+            if isinstance(output, IRTensor):
+                succ_cells = self.successors(idx)
+                for cell in succ_cells:
+                    devices = set(cell.device) - set(output.device)
+                    if len(devices) != 0:
+                        send_tensors.append(output)
+                        send_devices.append(list(devices))
+        return send_tensors, send_devices
+
+    def get_recv_tensors(self):
+        """
+        Collect recv tensors at cell level.
+        This will not care what happened inside this cell
+
+        Returns:
+            recv_tensors: list of IRTensor
+            recv_devices: list of list[int] devices for each tensor
+        """
+        recv_tensors = list()
+        recv_devices = list()
+        for input in self.inputs():
+            if isinstance(input, IRTensor):
+                devices = set(self.device) - set(input.device)
+                if len(devices) != 0:
+                    recv_tensors.append(input)
+                    recv_devices.append(list(devices))
+        return recv_tensors, recv_devices
 
     def __repr__(self):
         """

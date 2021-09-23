@@ -170,14 +170,6 @@ class IRGraph(IRCell):
         # nodes
         backward_nodes = list()
         all_bp_tensors = list()
-        # the first node: loss to none
-        # none_node = IROperation(
-        #     name = 'tonone',
-        #     signature = 'cube.temporal.to_none',
-        #     input_length=1,
-        #     output_length=1
-        # )
-        # none_node.set_input(0, loss)
 
         for fnode in self._nodes[::-1]:
             inputs = list()
@@ -215,7 +207,7 @@ class IRGraph(IRCell):
             graph_inputs, graph_outputs,
             self.name + 'Backward'
         )
-        print(graph)
+        # print(graph)
         graph.tag = 'backward'
         graph(loss)
 
@@ -264,13 +256,11 @@ class IRAction(IRCell):
             raise RuntimeError(f"Unsupported graph tag: {self.global_graph.tag}")
 
         # send tensors
-        self.send_tensors = list()
-        self.send_devices = list()
-
+        send_tensors = list()
+        send_devices = list()
         # recv tensors
-        self.recv_tensors = list()
-        self.recv_devices = list()
-
+        recv_tensors = list()
+        recv_devices = list()
         # get nodes belong to this graph
         all_tensors = list()
         for node in sub_nodes:
@@ -279,9 +269,9 @@ class IRAction(IRCell):
                 if isinstance(input, IRTensor):
                     recv_devices = list(set(devices) - set(input.device))
                     if len(recv_devices) != 0:
-                        if input not in self.recv_tensors:
-                            self.recv_tensors.append(input)
-                            self.recv_devices.append(recv_devices)
+                        if input not in recv_tensors:
+                            recv_tensors.append(input)
+                            recv_devices.append(recv_devices)
             # collect send tensors
             for output in node.outputs():
                 if isinstance(output, IRTensor):
@@ -289,9 +279,9 @@ class IRAction(IRCell):
                     for succ_node in succ_nodes:
                         send_devices = list(set(devices) - set(succ_node.device))
                         if len(send_devices) != 0:
-                            if output not in self.send_tensors:
-                                self.send_tensors.append(output)
-                                self.send_devices.append(send_devices)
+                            if output not in send_tensors:
+                                send_tensors.append(output)
+                                send_devices.append(send_devices)
             all_tensors += node.inputs()
             all_tensors += node.outputs()
 
@@ -299,32 +289,42 @@ class IRAction(IRCell):
         inputs = list()
         outputs = list()
         for input in global_graph.inputs():
-            if input in all_tensors and input not in self.recv_tensors:
+            if input in all_tensors and input not in recv_tensors:
                 inputs.append(input)
         for output in global_graph.outputs():
-            if output in all_tensors and output not in self.send_tensors:
+            if output in all_tensors and output not in send_tensors:
                 outputs.append(output)
+
+        self._send_ofst = len(outputs)
+        self._recv_ofst = len(inputs)
 
         self.graph = IRGraph(
             nodes = sub_nodes,
-            input_tensors = inputs + self.recv_tensors,
-            output_tensors = outputs + self.send_tensors,
+            input_tensors = inputs + recv_tensors,
+            output_tensors = outputs + send_tensors,
             module_name = global_graph.name
         )
 
-        action_inputs = [None] * len(self.graph.inputs())
         super().__init__(
             name          = global_graph.tag,
             signature     = signature,
-            input_length  = len(action_inputs),
+            input_length  = len(self.graph.inputs()),
             output_length = len(self.graph.outputs())
         )
+        # set action device
         self.device = devices
-        for output in self.outputs():
-            if isinstance(output, IRTensor):
-                output.device = devices
-        self._inputs = action_inputs
-        print(self.graph)
+        # set output shape
+        for output, g_out in zip(self.outputs(), self.graph.outputs()):
+            output.device = devices
+            output.shape = g_out.shape
+
+    @property
+    def send_tensors(self):
+        return self._outputs[self._send_ofst:]
+    
+    @property
+    def recv_tensors(self):
+        return self._inputs[self._recv_ofst:]
 
     def map_output(self, graph_output_tensor: Any) -> Any:
         if graph_output_tensor not in self.graph.outputs():

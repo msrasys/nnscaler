@@ -1,3 +1,4 @@
+from cube.graph.ir_graph import IRGraph
 from cube.tschedule.pool import TSchedulePool
 from cube.graph.ir_cten import IRTensor
 from cube.graph.ir_seq import IRSequence
@@ -5,7 +6,7 @@ from torch import nn
 import torch
 
 import cube.graph.parser as parser
-from cube.codegen.codegen import SScheduleCodeGen
+from cube.codegen.codegen import SScheduleCodeGen, TScheduleCodeGen
 
 
 class FeedForward(nn.Module):
@@ -65,9 +66,13 @@ def test_graph_forward(ir_graph):
 def test_graph_backward(ir_graph):
 
     TSchedulePool().clear()
-    tensor = ir_graph(IRTensor(shape=[64,1024]))
+    input = IRTensor(shape=[64,1024])
+    input.device = [0]
+    tensor = ir_graph(input)
     tensor.backward()
-    tensor = ir_graph(IRTensor(shape=[64,1024]))
+    input = IRTensor(shape=[64,1024])
+    input.device = [0]
+    tensor = ir_graph(input)
     tensor.backward()
     print('====== Backward Test =======')
     print(TSchedulePool())
@@ -78,6 +83,21 @@ def test_graph_backward(ir_graph):
     code = gener.gen(device=0)
     code = gener.gen(device=1)
     print(code)
+
+def test_graph(ir_graph):
+
+    datas = None
+    model: IRGraph = None
+
+    @tschedule(model=ir_graph)
+    def train_step(model, datas):
+        for data in datas:
+            loss = model(data)
+            loss.backward()
+
+    for epoch in range(10):
+        for datas in dataloader(bs=64, mbs=4):
+            train_step(model, datas)
 
 
 if __name__ == '__main__':
