@@ -78,20 +78,21 @@ class IRGraph(IRCell):
         if not all([type(arg) is type(input) for arg, input in zip(args, self.inputs())]):
             raise RuntimeError(f"Expected input type the same")
         
-        curr_nodes: List[IROperation] = list()
-        curr_device = list()
+        curr_nodes: List[IRCell] = list()
+        curr_device = self.nodes(0).device
 
         total_actions = list()
         for node in self.nodes():
             device = node.device
             if len(node.device) == 0:
                 raise RuntimeError("All the node should be assigned to devices")
-            if set(device) != set(curr_device) and len(curr_device) != 0:
+            if set(device) != set(curr_device):
                 # create action
                 action = IRAction(curr_nodes, self, devices=curr_device)
                 total_actions.append(action)
                 # register to schedule space
                 TSchedulePool().add_action(action)
+                # clear
                 curr_nodes = list()
             curr_device = device
             curr_nodes.append(node)
@@ -101,31 +102,25 @@ class IRGraph(IRCell):
             TSchedulePool().add_action(action)
 
         # setup action inputs
-        head = total_actions[0]
-        for idx, arg in enumerate(args):
-            head.set_input(idx, arg)
-        outputs_tensors = [*head.graph.outputs()]
-        outputs_actions = [head] * len(head.graph.outputs())
-        for action in total_actions[1:]:
+        output_map = {
+            gten._id : aten for gten, aten in zip(self.inputs(), args)
+        }
+        for action in total_actions:
             for idx, input in enumerate(action.graph.inputs()):
-                if input not in outputs_tensors:
-                    raise RuntimeError(f"Cannot find {input} tensors")
-                pre_action = outputs_actions[outputs_tensors.index(input)]
-                val = pre_action.map_output(input)
-                action.set_input(idx, val)
-            outputs_tensors += action.graph.outputs()
-            outputs_actions += [action] * len(action.graph.outputs())
+                if isinstance(input, IRTensor):
+                    input = output_map[input._id]
+                action.set_input(idx, input)
+            for action_out, graph_out in zip(action.outputs(), action.graph.outputs()):
+                output_map[graph_out._id] = action_out
 
         # return tensors
         outputs = tuple(total_actions[-1].outputs())
         for output in outputs:
             output.set_gen_graph(self)
-        if len(outputs) == 1:
-            return outputs[0]
-        elif len(outputs) == 0:
-            return None
-        else:
-            return outputs
+
+        if    len(outputs) == 1: return outputs[0]
+        elif  len(outputs) == 0: return None
+        else: return outputs
 
     def __call__(self, *args):
         """
@@ -206,7 +201,6 @@ class IRGraph(IRCell):
             graph_inputs, graph_outputs,
             self.name + 'Backward'
         )
-        # print(graph)
         graph.tag = 'backward'
         graph(loss)
 
@@ -338,12 +332,6 @@ class IRAction(IRCell):
     @property
     def recv_tensors(self):
         return self._inputs[self._recv_ofst:]
-
-    def map_output(self, graph_output_tensor: Any) -> Any:
-        if graph_output_tensor not in self.graph.outputs():
-            return None
-        index = self.graph.outputs().index(graph_output_tensor)
-        return self.outputs(index)
 
     def happen_before(self, action):
         """
