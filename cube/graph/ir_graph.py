@@ -144,10 +144,11 @@ class IRGraph(IRCell):
 
         def get_tensor_grad(tensor):
             if tensor._id not in all_tensors:
-                name = 'grad' if tensor.name is None else tensor.name + '_grad'
+                #name = 'grad' if tensor.name is None else tensor.name + '_grad'
                 new_tensor = IRTensor(
-                    shape=tensor.shape, name=name
+                    shape=tensor.shape, name=tensor.name
                 )
+                new_tensor._id = tensor._id  # -> keep same tensor
                 # reverse op
                 devices = set()
                 for node in tensor.dst():
@@ -212,8 +213,8 @@ class IRGraph(IRCell):
         # nodes
         for node in self._nodes:
             succ_node_ids = [None] * len(node.outputs())
-            for out_idx, node_list in enumerate(node.successors()):
-                node_list = [snode._id for snode in node_list]
+            for out_idx in range(len(node.outputs())):
+                node_list = [snode._id for snode in node.successors(out_idx)]
                 succ_node_ids[out_idx] = node_list
             dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}\n"
         # outputs

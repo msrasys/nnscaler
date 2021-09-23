@@ -93,7 +93,7 @@ class IRCell:
         else:
             raise TypeError("Expected index to be None or int")
 
-    def predecessors(self, index: Optional[int] = None):
+    def predecessors(self, index: Optional[int] = None) -> List:
         """
         Get input operator at input index
         """
@@ -104,7 +104,10 @@ class IRCell:
                 )
             return self._predecessors[index]
         elif index is None:
-            return self._predecessors
+            predecessors = list()
+            for pre_cells in self._predecessors:
+                predecessors += pre_cells
+            return predecessors
         else:
             raise TypeError("Expected index to be None or int")
 
@@ -128,7 +131,7 @@ class IRCell:
         else:
             raise TypeError("Expected index to be None or int")
 
-    def successors(self, index: Optional[int] = None):
+    def successors(self, index: Optional[int] = None) -> List:
         """
         Get output operator at output index
 
@@ -144,7 +147,10 @@ class IRCell:
                 )
             return self._successors[index]
         elif index is None:
-            return self._successors
+            successors = list()
+            for post_cells in self._successors:
+                successors += post_cells
+            return post_cells
         else:
             raise TypeError("Expected index to be None or int")
 
