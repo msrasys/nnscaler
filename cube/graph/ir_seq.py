@@ -1,4 +1,4 @@
-from typing import List, Tuple, NewType, Any, Optional
+from typing import List, Any
 import numpy as np
 
 from cube.graph.ir_cten import IRCell, IRTensor

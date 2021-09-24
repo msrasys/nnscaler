@@ -1,4 +1,3 @@
-from typing import Callable
 
 
 class TSchedulePool:
@@ -39,22 +38,3 @@ class TSchedulePool:
     def __repr__(self):
         dscp = '\n'.join([repr(action) for action in self._actions])
         return dscp
-
-
-def schedule(fn: Callable, policy=None, *args, **kwargs):
-    """
-    AI Scientist calls like:
-
-        @cube.tschedule.schedule
-        def train_step(model, optimizer, datas, labels):
-            for (data, label) in datas:
-                loss = model(data, label)
-                loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-        ...
-        for datas, labels in dataloader():
-            train_step(model, optimizer, datas, labels)
-        ...
-    """
-    raise NotImplementedError

@@ -9,6 +9,7 @@ from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
 import torch
+import copy
 
 
 class SScheduleCodeGen:
@@ -21,8 +22,8 @@ class SScheduleCodeGen:
             raise TypeError("graph should be IRGraph")
         self.graph = action.graph
         # model full code
-        self.code: List[str] = [
-            '########## Generated Code ###########',
+        self.init_code: List[str] = [
+            '\n\n########## Generated Code ###########',
             'import torch', '', '']
         # module init code
         self.declare_region: List[str] = list()
@@ -33,10 +34,11 @@ class SScheduleCodeGen:
         # ref module to check shared variables
         self._ref_module = torch.nn.Module()
 
-    def gen(self, device: int, outfile=None) -> str:
+    def gen(self, device: int, outfile=None, attach=False) -> str:
         """
         Generate model implementation code based on the given graph.
         """
+        gencode = copy.copy(self.init_code)
         # register forward input
         fargs = [self.naming(input) for input in self.graph.inputs()]
         for name in fargs:
@@ -67,13 +69,13 @@ class SScheduleCodeGen:
                 fb.insert_body(return_code)
             cb.insert_body('')
             cb.insert_body(fb.code)
-        self.code += cb.code
-        self.code += ['']
+        gencode += cb.code
+        gencode += ['']
 
-        code = '\n'.join(self.code)
+        code = '\n'.join(gencode)
         # write to file
         if outfile:
-            with open(outfile, 'w') as f:
+            with open(outfile, 'a' if attach else 'w') as f:
                 f.write(code)
         return code
 
@@ -149,16 +151,17 @@ class TScheduleCodeGen:
             raise TypeError("seq should be IRSequence")
         self.seq = seq
         # model full code
-        self.code: List[str] = [
-            '########## Generated Code ###########',
-            'from typing import Tuple', 'import torch', '', '']
+        self.init_code: List[str] = [
+            '\n\n########## Generated Code ###########',
+            'import torch', 'import cube', '']
         # module member name
         self.symbols = SymbolTable()
 
-    def gen(self, device: int, outfile=None) -> str:
+    def gen(self, device: int, outfile=None, attach=False) -> str:
         """
         Generate scheduling code based on the given actions
         """
+        gencode = copy.copy(self.init_code)
         actions = list()
         for action in self.seq:
             if device in action.device:
@@ -210,13 +213,13 @@ class TScheduleCodeGen:
                 else:
                     code = self.emit_action(action_or_comm)
                     fb.insert_body(code)
-        self.code += fb.code
-        self.code += ['']
+        gencode += fb.code
+        gencode += ['']
 
-        code = '\n'.join(self.code)
+        code = '\n'.join(gencode)
         # write to file
         if outfile:
-            with open(outfile, 'w') as f:
+            with open(outfile, 'a' if attach else 'w') as f:
                 f.write(code)
         return code
 
@@ -224,40 +227,38 @@ class TScheduleCodeGen:
         """
         Emit send / recv code
         """
-        ssign = 'cube.runtime.spatial.send({send_tensors}, {shapes}, {to_devices})'
-        rsign = 'cube.runtime.spatial.recv({shapes}, {from_devices})'
-        srsign = 'cube.runtime.spatial.send_and_recv({send_tensors}, {send_shapes}, {to_devices}, {recv_shapes}, {from_devices})'
+        ssign = 'cube.runtime.collectives.send({send_tensors}, {to_devices})'
+        rsign = 'cube.runtime.collectives.recv({shapes}, {from_devices})'
+        srsign = 'cube.runtime.collectives.send_and_recv({send_tensors}, {to_devices}, {recv_shapes}, {from_devices})'
 
         # generate for send
         if ('send_tensors') in comm and ('recv_tensors' not in comm):
-            send_tensors = ', '.join(comm['send_tensors'])
+            send_tensors = '(' + ', '.join(comm['send_tensors'] + ['']) + ')'
             code = ssign.format(
                 send_tensors = send_tensors,
-                shapes       = comm['send_shapes'],
                 to_devices   = comm['send_devices']
             )
-            return code
+            return code + f"  # send: {comm['send_shapes']}"
         # generate for recv
         elif ('send_tensors' not in comm) and ('recv_tensors' in comm):
             body = rsign.format(
                 shapes       = comm['recv_shapes'],
                 from_devices = comm['recv_devices']
             )
-            return_val = ','.join(comm['recv_tensors'])
+            return_val = ', '.join(comm['recv_tensors'])
             code = f'{return_val} = {body}'
             return code
         # generate for send + recv
         elif ('send_tensors' in comm) and ('recv_tensors' in comm):
-            send_tensors = ', '.join(comm['send_tensors'])
+            send_tensors = '(' + ', '.join(comm['send_tensors'] + ['']) + ')'
             body = srsign.format(
                 send_tensors = send_tensors,
-                send_shapes  = comm['send_shapes'],
                 to_devices   = comm['send_devices'],
                 recv_shapes  = comm['recv_shapes'],
                 from_devices = comm['recv_devices']
             )
-            return_val = ','.join(comm['recv_tensors'])
-            code = f'{return_val} = {body}'
+            return_val = ', '.join(comm['recv_tensors'])
+            code = f"{return_val} = {body}  # send: {comm['send_shapes']}"
             return code
         else:
             return []
@@ -271,7 +272,7 @@ class TScheduleCodeGen:
         
         if action.name == 'forward':
             inputs = [self.naming(tensor) for tensor in action.inputs()]
-            inputs = '(' + ', '.join(inputs) + ',)'
+            inputs = '(' + ', '.join(inputs + ['']) + ')'
             body = fsign.format(
                 model = 'model',
                 inputs = inputs
@@ -290,17 +291,17 @@ class TScheduleCodeGen:
             #       => backward graph input tensor (graph.recv_tensors)
             forward_inputs = self.seq.get_forward_inputs(action)
             forward_inputs = [self.naming(tensor) for tensor in forward_inputs]
-            forward_inputs = '(' + ', '.join(forward_inputs) + ',)'
+            forward_inputs = '(' + ', '.join(forward_inputs + ['']) + ')'
             forward_outputs = self.seq.get_forward_outputs(action)
             forward_outputs = [self.naming(tensor) for tensor in forward_outputs]
-            forward_outputs = '(' + ', '.join(forward_outputs) + ',)'
+            forward_outputs = '(' + ', '.join(forward_outputs + ['']) + ')'
             num_recv_tensors = len(action.recv_tensors)
             if num_recv_tensors == 0:
                 recv_grads = list()
             else:
                 recv_grads = action.inputs()[-num_recv_tensors:]
             recv_grads = [self.naming(tensor) for tensor in recv_grads]
-            recv_grads = '(' + ','.join(recv_grads) + ',)'
+            recv_grads = '(' + ', '.join(recv_grads + ['']) + ')'
 
             body = bsign.format(
                 input_tensors = forward_inputs,

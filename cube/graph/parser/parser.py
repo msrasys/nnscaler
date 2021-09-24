@@ -159,6 +159,9 @@ class ScriptModuleParser:
                 input_val.append(val)
                 maybe_kwarg = False
         input_val = input_val[::-1]
+        # handle single operand e.g., torch.sum
+        if input_val[1] is None:
+            input_val = input_val[:1] + input_val[2:]
         if len(input_val) < len(inputs):
             print(f"Warning: some non-tensor arguments are ommited in {fsig}")
 
