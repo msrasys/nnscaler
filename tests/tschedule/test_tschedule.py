@@ -30,9 +30,9 @@ class FeedForward(nn.Module):
 
 model = FeedForward(dim=1024)
 ir_graph = parser.convert(model, input_shapes=([64,1024],))
-print(" > Forward IRGraph ========")
+print('====== Forward Graph =======\n')
 print(ir_graph)
-print(" < ==============\n")
+print('====== Forward Graph =======\n')
 
 # device assignment
 for input in ir_graph.inputs():
@@ -50,17 +50,13 @@ def test_graph_forward(ir_graph):
     TSchedulePool().clear()
     tensor1 = ir_graph(IRTensor(shape=[64,1024]))
     print(tensor1)
-    # print(tschedule.pool.TSchedulePool())
-    # tensor2 = ir_graph()
-    # print(tensor2)
+    print('====== Forward Test =======')
     for action in TSchedulePool().actions():
-        print('\n', action)
-        gener = SScheduleCodeGen(action.graph)
+        gener = SScheduleCodeGen(action)
         code = gener.gen(device=action.device[0])
-        print("> ===== Generated Code =====")
         print(code)
-        print("< ===== Generated Code =====")
     print(TSchedulePool())
+    print('\n====== Forward Test =======\n')
 
 
 def test_graph_backward(ir_graph):
@@ -74,45 +70,21 @@ def test_graph_backward(ir_graph):
     input.device = [0]
     tensor = ir_graph(input)
     tensor.backward()
-    print('====== Backward Test =======')
+    print('====== Backward Test =======\n')
     print(TSchedulePool())
 
     sequence = IRSequence(TSchedulePool().actions())
     from cube.codegen.codegen import TScheduleCodeGen
     gener = TScheduleCodeGen(sequence)
     code = gener.gen(device=0)
+    print(code)
     code = gener.gen(device=1)
     print(code)
 
-def test_graph(ir_graph):
-
-    datas = None
-    model: IRGraph = None
-
-    @tschedule(model=ir_graph)
-    def train_step(model, datas):
-        for data in datas:
-            loss = model(data)
-            loss.backward()
-
-    for epoch in range(10):
-        for datas in dataloader(bs=64, mbs=4):
-            train_step(model, datas)
+    print('\n====== Backward Test =======\n')
 
 
 if __name__ == '__main__':
 
-    #test_graph_forward(ir_graph)
+    test_graph_forward(ir_graph)
     test_graph_backward(ir_graph)
-
-
-
-"""
-loss = cube.runtime.temporal.forward(model, input1, input2, xxx)
-grad1, grad2, ... = cube.runtime.temporal.backward(loss, None)
-"""
-
-"""
-out1, out2 = cube.runtime.temporal.forward(model, input1)
-cube.runtime.temporal.backward(out1, out2, out1_grad, out2_grad)
-"""

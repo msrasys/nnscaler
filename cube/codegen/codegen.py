@@ -297,9 +297,10 @@ class TScheduleCodeGen:
             forward_outputs = '(' + ', '.join(forward_outputs + ['']) + ')'
             num_recv_tensors = len(action.recv_tensors)
             if num_recv_tensors == 0:
-                recv_grads = list()
+                recv_grads = [None]
             else:
-                recv_grads = action.inputs()[-num_recv_tensors:]
+                # recv_grads = action.inputs()[-num_recv_tensors:]
+                recv_grads = action.recv_tensors
             recv_grads = [self.naming(tensor) for tensor in recv_grads]
             recv_grads = '(' + ', '.join(recv_grads + ['']) + ')'
 

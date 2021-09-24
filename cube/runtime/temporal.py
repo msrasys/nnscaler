@@ -19,9 +19,10 @@ def backward(input_tensors, output_tensors, output_tensor_grads):
         if torch.is_tensor(tensor) and tensor.requires_grad:
             tensor.retain_grad()
 
-    # TODO: gen code should contain None in output_tensor_grads
     if len(output_tensor_grads) != len(output_tensors):
-        output_tensor_grads = [None] * len(output_tensors)
+        raise RuntimeError(
+            "Expected same length of out tensors and grads"
+        )
 
     for tensor, grads in zip(output_tensors, output_tensor_grads):
         print('backwarding... ')
