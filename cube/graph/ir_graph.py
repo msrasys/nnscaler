@@ -1,8 +1,7 @@
 from cube.graph.ir_cten import IRTensor, IRCell
 from cube.graph.ir_op import IROperation
-from cube.tschedule.pool import TSchedulePool
 
-from typing import Union, Tuple, List, Optional, Any
+from typing import Union, Tuple, List, Optional
 
 
 __all__ = ['IRGraph', 'IRAction']
@@ -69,6 +68,7 @@ class IRGraph(IRCell):
         Returns:
             List[Action]
         """
+        from cube.tschedule.pool import TSchedulePool
         # check input num
         if len(args) != len(self.inputs()):
             raise RuntimeError(

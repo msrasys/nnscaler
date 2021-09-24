@@ -257,7 +257,7 @@ class IRCell:
         recv_devices = list()
         for input in self.inputs():
             if isinstance(input, IRTensor):
-                devices = set(self.device) - set(input.device)
+                devices = set(input.device) - set(self.device)
                 if len(devices) != 0:
                     recv_tensors.append(input)
                     recv_devices.append(list(devices))
