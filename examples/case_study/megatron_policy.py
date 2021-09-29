@@ -14,28 +14,27 @@ def spolicy(model, runtime_info, tp_size, dp_size, pp_size):
 
     # each op is divided in (mp_dsize, dp_size)
     # and put in (pp_size) stage
-    # TODO
-    devices = device_rank_group(n_devices, tp_size, dp_size, pp_size)
+    # TODO groups[stage][dp_group][tp_group] = devices (List[int])
+    groups = parallel_group(n_devices, tp_size, dp_size, pp_size)
 
     # pipeline stage
     total_nodes = len(model.nodes())
     num_op_per_stage = total_nodes // pp_size
     for idx, op in enumerate(model.nodes()):
-        stage_id = idx // num_op_per_stage
-        assign(op, devices[stage_id])
+        pp_stage = idx // num_op_per_stage
+        op.group = [pp_stage]
 
     # data parallel
     for op in model.nodes():
         # data parallel algorithm (suppose at index 0)
         dp_algo = op.logical_op.dist_algo(0)
-        dp_devices = op.device
         sub_graph = select(
             op = op, 
             algorithm = dp_algo, 
             config = dict(chunk_num=dp_size, uniform=True)
         )
-        for dp_op, tp_devices in zip(sub_graph, dp_devices):
-            assign(dp_op, tp_devices)
+        for dp_stage, dp_op in sub_graph.nodes():
+            dp_op.group.append(dp_stage)
         model.replace(op, sub_graph)
 
     # tensor parallel
@@ -87,10 +86,14 @@ def spolicy(model, runtime_info, tp_size, dp_size, pp_size):
                 )
             # else: no change, do redundant computation
             if sub_graph:
-                # assign device
-                for op, device in zip(sub_graph, devices):
-                    assign(op, [device])
+                for tp_stage, op in enumerate(sub_graph):
+                    op.group.append(tp_stage)
                 model.replace(op, sub_graph)
+    # device assignment
+    for op in model.nodes():
+        pp_stage, dp_stage, tp_stage = op.group
+        device = groups[pp_stage][dp_stage][tp_stage]
+        assign(op, device)
     return model
 
 
