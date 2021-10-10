@@ -120,8 +120,10 @@ class SUSequence(IRCell):
         if not isinstance(su1, ScheduleUnit) or \
            not isinstance(su2, ScheduleUnit):
             raise TypeError("Expected SU1 and SU2 are ScheduleUnit")
-        if su1 not in self.sequence or su2 not in self.sequence:
-            raise ValueError("Expected both su1 and su2 are in sequence")
+        if su1 not in self.sequence:
+            raise ValueError(f"su1: {su1}  not in sequence")
+        if su2 not in self.sequence:
+            raise ValueError(f"su2: {su2}  not in sequence")
         
         # 2) all the nodes in both SU are on the same device
         if su1 == su2 or su1.tag != su2.tag:
@@ -134,9 +136,10 @@ class SUSequence(IRCell):
         index_su2 = self.sequence.index(su2)
         # make su1 happen before su2
         su1, su2 = (su1, su2) if index_su1 < index_su2 else (su2, su1)
+        index_su1, index_su2 = min(index_su1, index_su2), max(index_su1, index_su2)
         inter_sus = self.sequence[index_su1+1:index_su2]
         for su in inter_sus:
-            if su.happen_after(su1) and su.happen_before(su2):
+            if su1.happen_after(su) and su.happen_before(su2):
                 return None
 
         # merge forward su
@@ -195,6 +198,10 @@ class SUSequence(IRCell):
 
     def __repr__(self):
         dscp = f'ScheduleSeq (len={len(self)}):\n'
-        for su in self.sequence:
-            dscp += f'\t{su}\n'
+        for node in self.sequence:
+            succ_node_ids = [None] * len(node.outputs())
+            for out_idx in range(len(node.outputs())):
+                node_list = [snode._id for snode in node.successors(out_idx)]
+                succ_node_ids[out_idx] = node_list
+            dscp += f"\n{node._id}: {node} -> su id {succ_node_ids}\n"
         return dscp

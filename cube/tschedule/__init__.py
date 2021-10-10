@@ -21,7 +21,6 @@ class IRTesnorDataLoader:
         for data in datas:
             if torch.is_tensor(data):
                 tensor = IRTensor(shape=list(data.size()), name='input')
-                tensor.device = [0]
             else:
                 tensor = data
             ir_datas.append(tensor)
@@ -81,7 +80,7 @@ def schedule(model, dataloader, policy_fn: Optional[Callable] = None):
             for rank in range(world_size):
                 fname = filename.format(rank)
                 # generate spatial module code
-                model.gen_module(rank, fname, attach=False)
+                model.gen_module(seq, rank, fname, attach=False)
                 # generate temporal schedule code
                 tgener.gen(
                     device = rank,

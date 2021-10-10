@@ -1,7 +1,7 @@
 from typing import List
 from enum import Enum
 
-from cube.graph.ir_cten import IRCell
+from cube.graph.ir_cten import IRCell, IRTensor
 
 
 class IRCommType(Enum):
@@ -59,7 +59,37 @@ class IRCommunication(IRCell):
             self.recv_tensors.append(self.outputs(idx))
             self.recv_ranks.append(from_device)
 
+        self.msg_id = self._id
+
+    def pair(self, other):
+        """
+        Pair two comm node to have same message id.
+
+        The `other` message id is set same with caller
+        """
+        if not isinstance(other, IRCommunication):
+            raise RuntimeError("Expected IRCommunication to pair")
+        other.msg_id = self.msg_id
+
     def merge(self, other):
         if not isinstance(other, IRCommunication):
             raise RuntimeError("Expected IRCommunication to merge")
         raise NotImplementedError
+
+    def __repr__(self):
+        inputs = list()
+        for tensor in self.inputs():
+            if isinstance(tensor, IRTensor):
+                inputs.append(f't{tensor._id}-dev{tensor.device}')
+            else:
+                inputs.append(tensor)
+
+        outputs = list()
+        for tensor in self.outputs():
+            if isinstance(tensor, IRTensor):
+                outputs.append(f't{tensor._id}-dev{tensor.device}')
+            else:
+                outputs.append(tensor)
+
+        dscp = f'SendRecv(msg_id={self.msg_id}, device={self.device}, send={inputs}, recv={outputs})'
+        return dscp

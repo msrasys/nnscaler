@@ -15,19 +15,52 @@ import torch
 from torch import nn
 
 import cube
-from cube.graph.ir_cten import IRTensor
+
 
 def spolicy(ir_graph):
-
-    for input in ir_graph.inputs():
-        if isinstance(input, IRTensor):
-            input.device = [0]
     for nid, node in enumerate(ir_graph.nodes()):
-        if nid <= 2:
+        if nid < 3:
             node.device = 0 
         else:
             node.device = 1
     return ir_graph
+
+def tpolicy(seq):
+    # put to micro-batch forward-backward sequence
+    fb_op_seqs = list()
+    for su in seq.sus():
+        for fb_seq in fb_op_seqs:
+            for ksu in fb_seq[::-1]:
+                if seq.happen_before(ksu, su):
+                    fb_seq.append(su)
+                    break
+            else:
+                continue
+            break
+        else:
+            fb_op_seqs.append([su])
+    
+    # merge to stages
+    fb_stage_seqs = list()
+    for fb_seq in fb_op_seqs:
+        merged_su = fb_seq[0]
+        for su in fb_seq[1:]:
+            if su.tag == 'backward':
+                break
+            out_su = seq.merge(merged_su, su)
+            if out_su is not None:
+                merged_su = out_su
+            else:
+                print('=====', merged_su)
+                fb_stage_seqs.append(merged_su)
+                merged_su = su
+        fb_stage_seqs.append(merged_su)
+    
+    for mbs_seq in fb_stage_seqs:
+        print('mirobatch seq:', mbs_seq)
+    print(seq)
+    return seq
+
 
 
 class FakeDataLoader:
@@ -78,9 +111,9 @@ def train():
 
     dataloader = FakeDataLoader(64)
 
-    @cube.tschedule.schedule(model, dataloader)
+    @cube.tschedule.schedule(model, dataloader, policy_fn=tpolicy)
     def train_iter(model, dataloader):
-        for _ in range(4):
+        for _ in range(1):
             (data,) = next(dataloader)
             loss = model(data)
             loss.backward()

@@ -269,7 +269,6 @@ class IRGraph(IRCell):
         for fsu, bsu in zip(fsus, bsus[::-1]):
             fsu.set_mirror(bsu)
             bsu.set_mirror(fsu)
-            print(f'pair: {fsu} <-> {bsu}')
 
         # add forward schedule to pool
         for su in fsus:

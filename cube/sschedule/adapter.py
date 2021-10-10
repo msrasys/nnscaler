@@ -40,5 +40,6 @@ class Adapter:
             recv_ranks   = [from_rank]
         )
         ir_recv_node.device = to_rank
+        ir_send_node.pair(ir_recv_node)
         return ir_send_node, ir_recv_node
 

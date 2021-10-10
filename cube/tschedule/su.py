@@ -27,11 +27,15 @@ class ScheduleUnit(IRCell):
     #   input_tensors, output_tensors, output_grads
     # )
     _backward_signature = 'cube.runtime.temporal.backward'
+    # cube.runtime.collectives.sendrecv(send_tensors, send_ranks,
+    #   recv_shapes, from_ranks
+    # )
+    _adapter_signature = 'cube.runtime.collectives.sendrecv'
 
     def __init__(self, sub_nodes, graph, devices: Union[List[int], int]):
 
         if all([isinstance(node, IRCommunication) for node in sub_nodes]):
-            self.tag = 'forward'
+            self.tag = 'adapter'
         else:
             self.tag = graph.tag
 
@@ -41,6 +45,8 @@ class ScheduleUnit(IRCell):
             signature = ScheduleUnit._forward_signature
         elif self.tag == 'backward':
             signature = ScheduleUnit._backward_signature
+        elif self.tag == 'adapter':
+            signature = ScheduleUnit._adapter_signature
         else:
             raise RuntimeError(f"Unsupported graph tag: {self.tag}")
 

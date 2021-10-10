@@ -136,8 +136,27 @@ def test_graph_backward(ir_graph):
     print('\n====== Backward Test =======\n')
 
 
+def test_su_merge(ir_graph):
+    TSchedulePool().clear()
+    loss = ir_graph(IRTensor(shape=[64,1024]))
+    seq = SUSequence(TSchedulePool().sus())
+    sus = seq.sus()[0:4]
+    
+    su1 = seq.sus(0)
+    for su in sus[1:]:
+        su1 = seq.merge(su1, su)
+        assert su1 is not None
+    print(su1)
+    for node in su1.nodes():
+        print(node)
+    print('====')
+    for node in ir_graph.nodes():
+        print(node)
+
+
 if __name__ == '__main__':
 
     test_graph_forward(ir_graph)
     test_su_merge(ir_graph)
     test_graph_backward(ir_graph)
+    test_su_merge(ir_graph)

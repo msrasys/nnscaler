@@ -1,6 +1,6 @@
 from cube.graph import parser
 from cube.codegen.codegen import SScheduleCodeGen
-from cube.tschedule.su import ScheduleUnit
+from cube.sschedule.adapter import Adapter
 
 
 class SpatialModule:
@@ -48,4 +48,5 @@ def schedule(module, input_shapes, policy_fn=None):
     module = SpatialModule(ir_graph)
     if policy_fn:
         module._ir_graph = policy_fn(module.get_graph())
+    module._ir_graph = Adapter.adapt(module._ir_graph)
     return module

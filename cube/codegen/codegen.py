@@ -22,11 +22,11 @@ class SScheduleCodeGen:
     def __init__(self, seq: SUSequence):
         if not isinstance(seq, SUSequence):
             raise TypeError("seq should be SUSequence")
-        self.sus = seq.sus()
+        self.seq = seq
         # model full code
         self.init_code: List[str] = [
             '\n\n########## Generated Code ###########',
-            'import torch', '', '']
+            'import torch', 'import cube', '', '']
         # module init code
         self.declare_region: List[str] = list()
         # module forward code
@@ -41,7 +41,8 @@ class SScheduleCodeGen:
         """
         Generate model implementation code based on the given graph.
         """
-        device_sus = [su for su in self.sus if (device in su.device) and (su.tag == 'forward')]
+        device_sus = [su for su in self.seq.sus() \
+                      if device in su.device and su.tag != 'backward']
 
         gencode = copy.copy(self.init_code)
 
@@ -54,11 +55,7 @@ class SScheduleCodeGen:
             su_args.append(fargs)
 
         # parse graph body
-        print(f'device: {device}: {device_sus}')
         for su in device_sus:
-            print('====', su)
-            for node in su.nodes():
-                print(node)
             for node in su.nodes():
                 if isinstance(node, IRCommunication):
                     self.emit_comm_call(node, su)
@@ -82,7 +79,7 @@ class SScheduleCodeGen:
             cb.insert_body('')
             cb.insert_body(ib.code)
             for idx, su in enumerate(device_sus):
-                name = f'su{self.sus.index(su)}'
+                name = f'su{self.seq.sus().index(su)}'
                 input_args = ['self'] + su_args[idx]
                 forward_code = self.all_su_forward_region[idx]
                 with FunctionBlock(func_name=name, args=input_args) as fb:
@@ -155,11 +152,11 @@ class SScheduleCodeGen:
             send_tensors = '(' + ', '.join(send_tensors + ['']) + ')'
             code = f'{comm_code}({send_tensors}, {send_ranks})'
         elif node.comm_type == IRCommType.Recv:
-            recv_tensors = '(' + ', '.join(recv_tensors + ['']) + ')'
+            recv_tensors = ', '.join(recv_tensors)
             code = f'{recv_tensors} = {comm_code}({recv_shapes}, {recv_ranks})'
         elif node.comm_type == IRCommType.SendRecv:
             send_tensors = '(' + ', '.join(send_tensors + ['']) + ')'
-            recv_tensors = '(' + ', '.join(recv_tensors + ['']) + ')'
+            recv_tensors = ', '.join(recv_tensors)
             code = f'{recv_tensors} = {comm_code}({send_tensors}, {send_ranks}, {recv_shapes}, {recv_ranks})'
         else:
             raise TypeError(f"Unsupported IRCommmNode: {node.comm_type}")
@@ -274,7 +271,7 @@ class TScheduleCodeGen:
         fsign = 'cube.runtime.temporal.forward({model}, *{inputs})'
         bsign = 'cube.runtime.temporal.backward({input_tensors}, {output_tensors}, {output_grads})'
         
-        if su.tag == 'forward':
+        if su.tag == 'forward' or su.tag == 'adapter':
             inputs = [self.naming(tensor, su) for tensor in su.inputs()]
             inputs = '(' + ', '.join(inputs + ['']) + ')'
             body = fsign.format(
