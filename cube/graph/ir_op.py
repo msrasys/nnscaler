@@ -26,38 +26,6 @@ class IROperation(IRCell):
         super().__init__(name, signature, input_length, output_length)
         self.semantic = IR2LogicOp.map(self.signature)
 
-    @property
-    def device(self):
-        return self._device
-
-    @device.setter
-    def device(self, device_id: Union[int, List[int]]):
-        """
-        Set the operation device.
-
-        For computation operators, they are only allowed
-        to happen on one device (int)
-
-        For communication operators (e.g., move, all-reduce),
-        they are allowed to happend on multiple devices
-        """
-        if isinstance(device_id, int):
-            device_id = [device_id]
-        if not all([isinstance(devid, int) for devid in device_id]):
-            raise ValueError("Require device Union[int, List[int]]")
-        self._device = device_id
-        for input in self._inputs:
-            # in default, parameters will be placed on
-            # all devices that needs it
-            if isinstance(input, IRTensor) and input.is_leaf():
-                devices = set()
-                for node in input.dst():
-                    devices.update(node.device)
-                input.device = list(devices)
-        for output in self._outputs:
-            if isinstance(output, IRTensor):
-                output.device = device_id
-
     def infer_shape(self):
         """
         Infer output value shape
@@ -85,14 +53,14 @@ class IROperation(IRCell):
         inputs = list()
         for tensor in self.inputs():
             if isinstance(tensor, IRTensor):
-                inputs.append(f't{tensor._id}')
+                inputs.append(f't{tensor._id}-dev{tensor.device}')
             else:
                 inputs.append(tensor)
         
         outputs = list()
         for tensor in self.outputs():
             if isinstance(tensor, IRTensor):
-                outputs.append(f't{tensor._id}')
+                outputs.append(f't{tensor._id}-dev{tensor.device}')
             else:
                 outputs.append(tensor)
 

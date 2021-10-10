@@ -31,4 +31,4 @@ class IDGenerator:
 
     def clear(self):
         self.instance._tensor_id = 0
-        self.instance._op_id = 0
+        self.instance._cell_id = 0

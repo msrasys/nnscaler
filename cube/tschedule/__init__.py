@@ -3,7 +3,7 @@ import torch
 
 from cube.tschedule.pool import TSchedulePool
 from cube.graph.ir_cten import IRTensor
-from cube.graph.ir_seq import IRSequence
+from cube.tschedule.suseq import SUSequence
 from cube.codegen.codegen import TScheduleCodeGen
 
 
@@ -70,8 +70,8 @@ def schedule(model, dataloader, policy_fn: Optional[Callable] = None):
             TSchedulePool().clear()
             # collect trace
             fn(ir_graph, ir_dataloader)
-            actions = TSchedulePool().actions()
-            seq = IRSequence(actions)
+            sus = TSchedulePool().sus()
+            seq = SUSequence(sus)
             # policy
             if policy_fn:
                 seq = policy_fn(seq)

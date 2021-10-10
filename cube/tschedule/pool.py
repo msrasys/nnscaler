@@ -6,7 +6,7 @@ class TSchedulePool:
 
         def __init__(self):
 
-            self._actions = list()
+            self._sus = list()
             self._flow_id = -1
 
     instance = None
@@ -18,14 +18,14 @@ class TSchedulePool:
     def __getattr__(self, name):
         return getattr(self.instance, name)
 
-    def add_action(self, action):
-        self.instance._actions.append(action)
+    def add_su(self, su):
+        self.instance._sus.append(su)
 
-    def actions(self):
-        return self.instance._actions
+    def sus(self):
+        return self.instance._sus
 
     def clear(self):
-        self.instance._actions = list()
+        self.instance._sus = list()
         self.instance._flow_id = -1
 
     def gen_id(self) -> int:
@@ -36,5 +36,5 @@ class TSchedulePool:
         return self.instance._flow_id
 
     def __repr__(self):
-        dscp = '\n'.join([repr(action) for action in self._actions])
+        dscp = '\n'.join([repr(su) for su in self._sus])
         return dscp

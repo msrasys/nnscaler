@@ -1,10 +1,12 @@
 """
 Generate Pytorch code given the model DAG and the transformation config
 """
-from typing import List, Any, Dict
+from typing import List, Any
+from cube.graph.ir_comm import IRCommType, IRCommunication
 
-from cube.graph import IRAction, IRTensor, IROperation
-from cube.graph.ir_seq import IRSequence
+from cube.graph.ir_cten import IRTensor
+from cube.tschedule.suseq import SUSequence
+from cube.tschedule.su import ScheduleUnit
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
@@ -17,10 +19,10 @@ class SScheduleCodeGen:
     Generate spatial code for the model
     """
 
-    def __init__(self, action: IRAction):
-        if not isinstance(action, IRAction):
-            raise TypeError("graph should be IRGraph")
-        self.graph = action.graph
+    def __init__(self, seq: SUSequence):
+        if not isinstance(seq, SUSequence):
+            raise TypeError("seq should be SUSequence")
+        self.sus = seq.sus()
         # model full code
         self.init_code: List[str] = [
             '\n\n########## Generated Code ###########',
@@ -28,6 +30,7 @@ class SScheduleCodeGen:
         # module init code
         self.declare_region: List[str] = list()
         # module forward code
+        self.all_su_forward_region: List[List[str]] = list()
         self.forward_region: List[str] = list()
         # module member name
         self.symbols = SymbolTable()
@@ -38,22 +41,39 @@ class SScheduleCodeGen:
         """
         Generate model implementation code based on the given graph.
         """
+        device_sus = [su for su in self.sus if (device in su.device) and (su.tag == 'forward')]
+
         gencode = copy.copy(self.init_code)
+
         # register forward input
-        fargs = [self.naming(input) for input in self.graph.inputs()]
-        for name in fargs:
-            self.symbols.create(name)
+        su_args: List[List[str]] = list()
+        for su in device_sus:
+            fargs = [self.naming(input) for input in su.inputs()]
+            for name in fargs:
+                self.symbols.create(name)
+            su_args.append(fargs)
 
         # parse graph body
-        for node in self.graph.nodes():
-            self.emit_op_call(node)
-            # emit input declaration
-            for arg in node.inputs():
-                self.emit_var_declare(arg)
-            # record output tensor name
-            for out in node.outputs():
-                if isinstance(out, IRTensor) or isinstance(out, str):
-                    self.symbols.create(self.naming(out))
+        print(f'device: {device}: {device_sus}')
+        for su in device_sus:
+            print('====', su)
+            for node in su.nodes():
+                print(node)
+            for node in su.nodes():
+                if isinstance(node, IRCommunication):
+                    self.emit_comm_call(node, su)
+                else:
+                    self.emit_op_call(node, su)
+                # emit input declaration
+                for arg in node.inputs():
+                    self.emit_var_declare(arg)
+                # record output tensor name
+                for out in node.outputs():
+                    if isinstance(out, IRTensor) or isinstance(out, str):
+                        self.symbols.create(self.naming(out))
+                print(self.forward_region)
+            self.all_su_forward_region.append(self.forward_region)
+            self.forward_region = list()
 
         # generate full code
         with ClassBlock(class_name='GenModel', derived=['torch.nn.Module']) as cb:
@@ -61,14 +81,18 @@ class SScheduleCodeGen:
                 ib.insert_body(self.declare_region)
             cb.insert_body('')
             cb.insert_body(ib.code)
-            with FunctionBlock(func_name='forward', args=['self']+fargs) as fb:
-                fb.insert_body(self.forward_region)
-                # generate output
-                out_names = self._forward_region_arg_names(self.graph.outputs())
-                return_code = f"return {', '.join(out_names)}"
-                fb.insert_body(return_code)
-            cb.insert_body('')
-            cb.insert_body(fb.code)
+            for idx, su in enumerate(device_sus):
+                name = f'su{self.sus.index(su)}'
+                input_args = ['self'] + su_args[idx]
+                forward_code = self.all_su_forward_region[idx]
+                with FunctionBlock(func_name=name, args=input_args) as fb:
+                    fb.insert_body(forward_code)
+                    # generate output
+                    out_names = self._forward_region_arg_names(su.outputs(), su)
+                    return_code = f"return {', '.join(out_names)}"
+                    fb.insert_body(return_code)
+                cb.insert_body('')
+                cb.insert_body(fb.code)
         gencode += cb.code
         gencode += ['']
 
@@ -77,6 +101,9 @@ class SScheduleCodeGen:
         if outfile:
             with open(outfile, 'a' if attach else 'w') as f:
                 f.write(code)
+        
+        # clear used buffer
+        self.clear()
         return code
 
     def emit_var_declare(self, var: Any):
@@ -99,33 +126,59 @@ class SScheduleCodeGen:
                         self.declare_region.append(code)
         return
 
-    def emit_op_call(self, node: IROperation):
+    def emit_op_call(self, node, su: ScheduleUnit):
         """
         Emit op forward code
         """
         op_code = node.signature
-        out_names = self._forward_region_arg_names(node.outputs())
-        out_names = ', '.join(out_names)
-        arg_names = self._forward_region_arg_names(node.inputs())
+        arg_names = self._forward_region_arg_names(node.inputs(), su)
         arg_region = '(' + ', '.join(arg_names) + ')'
-        code = f'{out_names} = {op_code}{arg_region}'
+        if len(node.outputs()) == 0:
+            code = f'{op_code}{arg_region}'
+        else:
+            out_names = self._forward_region_arg_names(node.outputs(), su)
+            out_names = ', '.join(out_names)
+            code = f'{out_names} = {op_code}{arg_region}'
         self.forward_region.append(code)
 
-    def _forward_region_arg_names(self, args: List[Any]):
+    def emit_comm_call(self, node, su: ScheduleUnit):
+        """
+        Emit communication code
+        """
+        comm_code = node.signature
+        send_tensors = self._forward_region_arg_names(node.inputs(), su)
+        send_ranks = node.send_ranks
+        recv_tensors = self._forward_region_arg_names(node.outputs(), su)
+        recv_shapes = [tensor.shape for tensor in node.outputs()]
+        recv_ranks = node.recv_ranks
+        if node.comm_type == IRCommType.Send:
+            send_tensors = '(' + ', '.join(send_tensors + ['']) + ')'
+            code = f'{comm_code}({send_tensors}, {send_ranks})'
+        elif node.comm_type == IRCommType.Recv:
+            recv_tensors = '(' + ', '.join(recv_tensors + ['']) + ')'
+            code = f'{recv_tensors} = {comm_code}({recv_shapes}, {recv_ranks})'
+        elif node.comm_type == IRCommType.SendRecv:
+            send_tensors = '(' + ', '.join(send_tensors + ['']) + ')'
+            recv_tensors = '(' + ', '.join(recv_tensors + ['']) + ')'
+            code = f'{recv_tensors} = {comm_code}({send_tensors}, {send_ranks}, {recv_shapes}, {recv_ranks})'
+        else:
+            raise TypeError(f"Unsupported IRCommmNode: {node.comm_type}")
+        self.forward_region.append(code)
+
+    def _forward_region_arg_names(self, tensors: List[Any], su: ScheduleUnit):
         """
         Generate arg name list for forward region.
 
         Will add prefix 'self.' for var defined in declare region
         """
         named_args : List[str] = list()
-        input_name = [self.naming(input) for input in self.graph.inputs()]
-        for arg in args:
-            name = self.naming(arg)
-            if isinstance(arg, IRTensor) and \
-               arg.is_leaf() and (name not in input_name):
-                named_args.append('self.' + self.naming(arg))
+        for tensor in tensors:
+            name = self.naming(tensor)
+            if isinstance(tensor, IRTensor) and \
+               tensor.is_leaf(su.nodes()) and (tensor not in su.inputs()):
+                named_args.append('self.' + name)
             else:
-                named_args.append(self.naming(arg))
+                named_args.append(self.naming(name))
         return named_args
 
     def naming(self, tensor: Any) -> str:
@@ -143,12 +196,25 @@ class SScheduleCodeGen:
             name = str(tensor)
         return name
 
+    def clear(self):
+        """
+        Clear buffer that used for generating code
+        """
+        # module init code
+        self.declare_region: List[str] = list()
+        # module forward code
+        self.all_su_forward_region: List[List[str]] = list()
+        self.forward_region: List[str] = list()
+        # module member name
+        self.symbols = SymbolTable()
+
+
 
 class TScheduleCodeGen:
 
-    def __init__(self, seq: IRSequence):
-        if not isinstance(seq, IRSequence):
-            raise TypeError("seq should be IRSequence")
+    def __init__(self, seq: SUSequence):
+        if not isinstance(seq, SUSequence):
+            raise TypeError("seq should be SUSequence")
         self.seq = seq
         # model full code
         self.init_code: List[str] = [
@@ -159,60 +225,20 @@ class TScheduleCodeGen:
 
     def gen(self, device: int, outfile=None, attach=False) -> str:
         """
-        Generate scheduling code based on the given actions
+        Generate scheduling code based on the given sus
         """
         gencode = copy.copy(self.init_code)
-        actions = list()
-        for action in self.seq:
-            if device in action.device:
-                actions.append(action)
-
-        # {send: xxx, recv: xxx} action1 {send:xxx, recv:xxx} action2 ....
-        action_with_comms = [dict()]
-        for action in actions:
-            # send info
-            send_tensors, send_devices = action.get_send_tensors()
-            send_shapes = tuple([tensor.shape for tensor in send_tensors])
-            send_tensors = [self.naming(tensor) for tensor in send_tensors]
-
-            # recv info
-            recv_tensors, recv_devices = action.get_recv_tensors()
-            recv_shapes = tuple([tensor.shape for tensor in recv_tensors])
-            recv_tensors = [self.naming(tensor) for tensor in recv_tensors]
-            
-            comm = action_with_comms[-1]
-
-            # recv before the action
-            if len(recv_tensors) != 0:
-                comm.update({
-                    'recv_tensors' : recv_tensors,
-                    'recv_devices' : recv_devices,
-                    'recv_shapes'  : recv_shapes
-                })
-
-            # action
-            action_with_comms.append(action)
-
-            # send after the action
-            comm = dict()
-            if len(send_tensors) != 0:
-                comm.update({
-                    'send_tensors' : send_tensors,
-                    'send_devices' : send_devices,
-                    'send_shapes'  : send_shapes
-                })
-            action_with_comms.append(comm)
+        device_sus = [su for su in self.seq.sus() if device in su.device]
 
         # generate code
         with FunctionBlock(func_name='_train_step', 
                            args=['model', 'dataloader']) as fb:
-            for action_or_comm in action_with_comms:
-                if isinstance(action_or_comm, dict):
-                    code = self.emit_comm(action_or_comm)
-                    fb.insert_body(code)
-                else:
-                    code = self.emit_action(action_or_comm)
-                    fb.insert_body(code)
+            data_code = self.emit_data(device_sus)
+            fb.insert_body(data_code)
+            for su in device_sus:
+                name = f'su{self.seq.sus().index(su)}'
+                code = self.emit_su(su, name=name)
+                fb.insert_body(code)
         gencode += fb.code
         gencode += ['']
 
@@ -223,95 +249,76 @@ class TScheduleCodeGen:
                 f.write(code)
         return code
 
-    def emit_comm(self, comm: Dict) -> List[str]:
+    def emit_data(self, device_sus) -> List[str]:
         """
-        Emit send / recv code
+        Emit dataloader iter code
         """
-        ssign = 'cube.runtime.collectives.send({send_tensors}, {to_devices})'
-        rsign = 'cube.runtime.collectives.recv({shapes}, {from_devices})'
-        srsign = 'cube.runtime.collectives.send_and_recv({send_tensors}, {to_devices}, {recv_shapes}, {from_devices})'
+        # TODO: dataloader to op node
+        inputs = list()
+        for su in device_sus:
+            su_inputs = [
+                self.naming(input, su) for input in su.inputs() \
+                if input.is_leaf(device_sus)
+            ]
+            inputs += su_inputs
+        data_code = list()
+        if len(inputs) != 0:
+            inputs = '(' + ', '.join(inputs + ['']) + ')'
+            data_code.append(inputs + ' = next(dataloader)')
+        return data_code
 
-        # generate for send
-        if ('send_tensors') in comm and ('recv_tensors' not in comm):
-            send_tensors = '(' + ', '.join(comm['send_tensors'] + ['']) + ')'
-            code = ssign.format(
-                send_tensors = send_tensors,
-                to_devices   = comm['send_devices']
-            )
-            return code + f"  # send: {comm['send_shapes']}"
-        # generate for recv
-        elif ('send_tensors' not in comm) and ('recv_tensors' in comm):
-            body = rsign.format(
-                shapes       = comm['recv_shapes'],
-                from_devices = comm['recv_devices']
-            )
-            return_val = ', '.join(comm['recv_tensors'])
-            code = f'{return_val} = {body}'
-            return code
-        # generate for send + recv
-        elif ('send_tensors' in comm) and ('recv_tensors' in comm):
-            send_tensors = '(' + ', '.join(comm['send_tensors'] + ['']) + ')'
-            body = srsign.format(
-                send_tensors = send_tensors,
-                to_devices   = comm['send_devices'],
-                recv_shapes  = comm['recv_shapes'],
-                from_devices = comm['recv_devices']
-            )
-            return_val = ', '.join(comm['recv_tensors'])
-            code = f"{return_val} = {body}  # send: {comm['send_shapes']}"
-            return code
-        else:
-            return []
-
-    def emit_action(self, action: IRAction) -> List[str]:
+    def emit_su(self, su: ScheduleUnit, name: str) -> List[str]:
         """
-        Emit action code
+        Emit su code
         """
         fsign = 'cube.runtime.temporal.forward({model}, *{inputs})'
         bsign = 'cube.runtime.temporal.backward({input_tensors}, {output_tensors}, {output_grads})'
         
-        if action.name == 'forward':
-            inputs = [self.naming(tensor) for tensor in action.inputs()]
+        if su.tag == 'forward':
+            inputs = [self.naming(tensor, su) for tensor in su.inputs()]
             inputs = '(' + ', '.join(inputs + ['']) + ')'
             body = fsign.format(
-                model = 'model',
+                model = f'model.{name}',
                 inputs = inputs
             )
-            outputs = [self.naming(output) for output in action.outputs()]
+            outputs = [self.naming(output, su) for output in su.outputs()]
             return_val = ','.join(outputs)
-            code = f'{return_val} = {body}'
+            if len(su.outputs()) == 0:
+                code = body
+            else:
+                code = f'{return_val} = {body}'
             return code
 
-        elif action.name == 'backward':
-            # 1). input_tensors are forward inputs (happened before action inputs)
+        elif su.tag == 'backward':
+            # 1). input_tensors are forward inputs (happened before su inputs)
             #       => backward graph output tensor (share tensor in forward / backward graph)
-            # 2). output_tensors are forward outputs (action.inputs())
+            # 2). output_tensors are forward outputs (su.inputs())
             #       => backward graph input tensor (share tensor in forward / backward)
             # 3). output_grads are recved tesnors of this graph (graph.recv_tensors)
             #       => backward graph input tensor (graph.recv_tensors)
-            forward_inputs = self.seq.get_forward_inputs(action)
-            forward_inputs = [self.naming(tensor) for tensor in forward_inputs]
+            fsu = su.mirror
+            forward_inputs = [self.naming(tensor, fsu) for tensor in fsu.inputs()]
             forward_inputs = '(' + ', '.join(forward_inputs + ['']) + ')'
-            forward_outputs = self.seq.get_forward_outputs(action)
-            forward_outputs = [self.naming(tensor) for tensor in forward_outputs]
+            forward_outputs = [self.naming(tensor, fsu) for tensor in fsu.outputs()]
             forward_outputs = '(' + ', '.join(forward_outputs + ['']) + ')'
-            num_recv_tensors = len(action.recv_tensors)
-            if num_recv_tensors == 0:
-                recv_grads = [None]
-            else:
-                # recv_grads = action.inputs()[-num_recv_tensors:]
-                recv_grads = action.recv_tensors
-            recv_grads = [self.naming(tensor) for tensor in recv_grads]
-            recv_grads = '(' + ', '.join(recv_grads + ['']) + ')'
+
+            grads = list()
+            for tensor in su.inputs():
+                # the thensor is loss, no grad needs
+                if tensor in fsu.outputs():
+                    grads.append('None')
+                else:
+                    grads.append(self.naming(tensor, su))
+            grads = '(' + ', '.join(grads + ['']) + ')'
 
             body = bsign.format(
                 input_tensors = forward_inputs,
                 output_tensors = forward_outputs,
-                output_grads = recv_grads
+                output_grads = grads
             )
 
             # returned value are graph.outputs
-            return_val = [self.naming(tensor) for tensor in action.outputs()]
+            return_val = [self.naming(tensor, su) for tensor in su.outputs()]
             if len(return_val) > 0:
                 return_code = ', '.join(return_val) + ' = '
             else:
@@ -319,22 +326,23 @@ class TScheduleCodeGen:
             code = f'{return_code}{body}'
             return code
         else:
-            raise RuntimeError(f"Unsupported action tag: {action.tag}")
+            raise RuntimeError(f"Unsupported su tag: {su.tag}")
 
-    def naming(self, tensor: Any) -> str:
+    def naming(self, tensor: Any, su) -> str:
         """
         Return the var name (unique for different variable)
 
         If the var is a leaf tensor, will add prefix `self.` to its name
         """
         if isinstance(tensor, IRTensor):
-            if len(tensor.src()) == 0:
-                name = '*next(dataloader)'
-            else:
-                tensor_name = 'tensor' if tensor.name is None else tensor.name
-                if '.' in tensor_name:
-                    tensor_name = tensor_name.split('.')[0]
-                name = '_'.join([tensor_name, str(tensor._id)])
+            # note in su there is no parameters
+            # if len(tensor.src(su.nodes())) == 0:
+            #     name = '*next(dataloader)'
+            # else:
+            tensor_name = 'tensor' if tensor.name is None else tensor.name
+            if '.' in tensor_name:
+                tensor_name = tensor_name.split('.')[0]
+            name = '_'.join([tensor_name, str(tensor._id)])
         else:
             name = str(tensor)
         return name

@@ -1,10 +1,23 @@
+"""
+IRGraph:
+    a graph that is composed by node (IROperation) and edge (IRTensor).
+
+    Note the device of graph.inputs() can be different of the same input
+    tensor of operation node in the graph. In this case, a move operation
+    will be inserted at scheduling time.
+"""
+
+from typing import Union, Tuple, List, Optional, Any
+
 from cube.graph.ir_cten import IRTensor, IRCell
 from cube.graph.ir_op import IROperation
+from cube.graph.ir_comm import IRCommunication
+from cube.tschedule.su import ScheduleUnit, forward_convert
 
-from typing import Union, Tuple, List, Optional
+import copy
 
 
-__all__ = ['IRGraph', 'IRAction']
+__all__ = ['IRGraph']
 
 
 class IRGraph(IRCell):
@@ -21,15 +34,118 @@ class IRGraph(IRCell):
                  module_name: str):
         
         self._nodes: List[IROperation] = nodes
+        self.reset_dependency()
+
         super().__init__(
             name=module_name,
             signature=module_name,
             input_length=len(input_tensors),
             output_length=len(output_tensors)
         )
-        self._inputs = input_tensors
-        self._outputs = output_tensors
+
+        for idx, tensor in enumerate(input_tensors):
+            self.set_input(idx, tensor)
+        for idx, tensor in enumerate(output_tensors):
+            self.set_output(idx, tensor)
+
         self.tag = 'forward'
+
+    def reset_dependency(self):
+        """
+        Reset the node dataflow dependency
+        """
+        # set node predecessors and successors
+        for src_idx in range(len(self._nodes)):
+            src_cell = self._nodes[src_idx]
+            src_cell._successors = [
+                list() for _ in range(len(src_cell.outputs()))
+            ]
+            for dst_idx in range(src_idx + 1, len(self._nodes)):
+                dst_cell = self._nodes[dst_idx]
+                dst_cell._predecessors = [
+                    list() for _ in range(len(dst_cell.inputs()))
+                ]
+                for tensor in src_cell.outputs():
+                    if isinstance(tensor, IRTensor):
+                        if tensor in dst_cell.inputs():
+                            src_output_idx = src_cell.outputs().index(tensor)
+                            src_cell.add_successor(src_output_idx, dst_cell)
+                            dst_input_idx = dst_cell.inputs().index(tensor)
+                            dst_cell.add_predecessor(dst_input_idx, src_cell)
+
+    def copy(self, reverse=False):
+        """
+        Copy the graph but re-new the intermediate tensor
+        """
+        new_tensors = dict()  # old graph tensor._id -> new tensor
+
+        def _renew(val: Any):
+            if not isinstance(val, IRTensor):
+                return val
+            # parameters
+            if val.is_leaf(self.nodes()) and val not in self.inputs():
+                return val
+            # intermediate data
+            if val._id not in new_tensors:
+                tensor = val.renew()
+                new_tensors[val._id] = tensor
+            return new_tensors[val._id]
+
+        nodes = list()
+        for node in self.nodes():
+
+            if isinstance(node, IRCommunication):
+                send_tensors = [_renew(tensor) for tensor in node.inputs()]
+                send_ranks = node.send_ranks
+                recv_tensors = [_renew(tensor) for tensor in node.outputs()]
+                recv_ranks = node.recv_ranks
+                if reverse:
+                    send_tensors, recv_tensors = recv_tensors, send_tensors
+                    send_ranks, recv_ranks = recv_ranks, send_ranks
+
+                new_node = IRCommunication(
+                    send_tensors = send_tensors,
+                    send_ranks = send_ranks,
+                    recv_tensors = recv_tensors,
+                    recv_ranks = recv_ranks
+                )
+
+            elif isinstance(node, IROperation):
+                inputs = node.inputs()
+                outputs = node.outputs()
+                if reverse:
+                    inputs, outputs = outputs, inputs
+
+                new_node = IROperation(
+                    node.name, node.signature,
+                    len(inputs), len(outputs)
+                )
+                # set inputs
+                for idx, val in enumerate(inputs):
+                    new_node.set_input(idx, _renew(val))
+                # set outputs
+                for idx, val in enumerate(outputs):
+                    new_node.set_output(idx, _renew(val))
+            else:
+                raise TypeError("Found node with unsupported copy")
+            new_node.device = node.device
+            nodes.append(new_node)
+        
+        inputs = [_renew(input) for input in self.inputs()]
+        outputs = [_renew(output) for output in self.outputs()]
+
+        if reverse:
+            inputs, outputs = outputs, inputs
+            nodes = nodes[::-1]
+
+        copied_graph = IRGraph(
+            nodes = nodes,
+            input_tensors = inputs,
+            output_tensors = outputs,
+            module_name = self.name
+        )
+        copied_graph.tag = self.tag
+        return copied_graph
 
     def add_node(self, node: IRCell):
         if not isinstance(node, IRCell):
@@ -47,15 +163,67 @@ class IRGraph(IRCell):
                 )
             return self._nodes[index]
         elif index is None:
-            return self._nodes
+            return copy.copy(self._nodes)
         else:
             raise TypeError("Expected index to be None or int")
 
-    def replace(self, target: IROperation, nodes: List[IROperation]):
+    def insert(self, node, src_node=None, dst_node=None, replaced_tensor=None):
         """
-        Replace the node with new nodes (IRGraph)
+        Insert a node between src_node and dst_node. In default,
+        if dst_node is not None, the node will be inserted right before
+        dst_node. If the replaced_tensor is provided, the replaced_tensor
+        in dst_node's inputs will be removed, and the output of node will be
+        set as input for dst_node.
         """
-        raise NotImplementedError
+        if not isinstance(node, IRCell):
+            raise TypeError("Expected IRCell to insert")
+        if dst_node is not None:
+            if dst_node not in self._nodes:
+                raise KeyError("dst_node not found")
+            if replaced_tensor is not None:
+                if replaced_tensor not in dst_node.inputs():
+                    raise RuntimeError(f"Expected dst_node input has {replaced_tensor}")
+                # remove dst_node input
+                input_index = dst_node.inputs().index(replaced_tensor)
+                if len(node.outputs()) != 1:
+                    raise RuntimeError("replaced node requires output length to be 1")
+                dst_node.set_input(input_index, node.outputs(0))
+            # insert node
+            index = self._nodes.index(dst_node)
+            self._nodes.insert(index, node)
+        elif src_node is not None:
+            if src_node not in self._nodes:
+                raise KeyError("src_node not found")
+            index = self._nodes.index(src_node)
+            self._nodes = self._nodes[:index+1] + [node] + self._nodes[index+1:]
+        else:
+            raise TypeError("Expected at least one of [src_node, dst_node]")
+        #TODO: optimize this
+        self.reset_dependency()
+
+    def replace_tensor(self, old_tensor: IRTensor, new_tensor: IRTensor):
+        """
+        Replace tensor from old_tensor to new_tensor for all the graph.
+        """
+        def _replace_inputs(cell, old_tensor, new_tensor):
+            index = cell.inputs().index(old_tensor)
+            cell.set_input(index, new_tensor)
+
+        def _replace_outputs(cell, old_tensor, new_tensor):
+            index = cell.outputs().index(old_tensor)
+            cell.set_output(index, new_tensor)
+
+        if old_tensor in self.inputs():
+            _replace_inputs(self, old_tensor, new_tensor)
+
+        for node in self.nodes():
+            if old_tensor in node.inputs():
+                _replace_inputs(node, old_tensor, new_tensor)
+            if old_tensor in node.outputs():
+                _replace_outputs(node, old_tensor, new_tensor)
+        
+        if old_tensor in self.outputs():
+            _replace_outputs(self, old_tensor, new_tensor)
 
     def forward(self, *args) -> Union[IRTensor, Tuple[IRTensor]]:
         """
@@ -74,49 +242,38 @@ class IRGraph(IRCell):
             raise RuntimeError(
                 f"Expected {len(self.inputs())} input args but got {len(args)}"
             )
-        # check input type
-        if not all([type(arg) is type(input) for arg, input in zip(args, self.inputs())]):
-            raise RuntimeError(f"Expected input type the same")
-        
-        curr_nodes: List[IRCell] = list()
-        curr_device = self.nodes(0).device
 
-        total_actions = list()
-        for node in self.nodes():
-            device = node.device
-            if len(node.device) == 0:
-                raise RuntimeError("All the node should be assigned to devices")
-            if set(device) != set(curr_device):
-                # create action
-                action = IRAction(curr_nodes, self, devices=curr_device)
-                total_actions.append(action)
-                # register to schedule space
-                TSchedulePool().add_action(action)
-                # clear
-                curr_nodes = list()
-            curr_device = device
-            curr_nodes.append(node)
-        if curr_device is not None:
-            action = IRAction(curr_nodes, self, devices=curr_device)
-            total_actions.append(action)
-            TSchedulePool().add_action(action)
+        forward_graph = self.copy()
+        backward_graph = self.copy(reverse=True)
+        backward_graph.tag = 'backward'
 
-        # setup action inputs
-        output_map = {
-            gten._id : aten for gten, aten in zip(self.inputs(), args)
-        }
-        for action in total_actions:
-            for idx, input in enumerate(action.graph.inputs()):
-                if isinstance(input, IRTensor):
-                    input = output_map[input._id]
-                action.set_input(idx, input)
-            for action_out, graph_out in zip(action.outputs(), action.graph.outputs()):
-                output_map[graph_out._id] = action_out
+        # set input
+        for input, arg in zip(self.inputs(), args):
+            if type(arg) != type(input):
+                raise RuntimeError(f"Expected input type the same")
+            forward_graph.replace_tensor(input, arg)
+
+        fsus = forward_convert(forward_graph)
 
         # return tensors
-        outputs = tuple(total_actions[-1].outputs())
+        outputs = forward_graph.outputs()
         for output in outputs:
-            output.set_gen_graph(self)
+            output.set_trace(fsus)
+
+        # set backward graph input
+        for input, output in zip(backward_graph.inputs(), outputs):
+            backward_graph.replace_tensor(input, output)
+
+        bsus = forward_convert(backward_graph)
+
+        for fsu, bsu in zip(fsus, bsus[::-1]):
+            fsu.set_mirror(bsu)
+            bsu.set_mirror(fsu)
+            print(f'pair: {fsu} <-> {bsu}')
+
+        # add forward schedule to pool
+        for su in fsus:
+            TSchedulePool().add_su(su)
 
         if    len(outputs) == 1: return outputs[0]
         elif  len(outputs) == 0: return None
@@ -128,82 +285,6 @@ class IRGraph(IRCell):
         """
         return self.forward(*args)
 
-    def backward(self, loss: IRTensor):
-        """
-        Backward will generate a backward action scheduling pool
-
-        Construct a reverse graph of forward and seperate to actions
-        """
-        # travel graph in reverse order
-        all_tensors = dict()
-
-        def get_tensor_grad(tensor):
-            if tensor._id not in all_tensors:
-                #name = 'grad' if tensor.name is None else tensor.name + '_grad'
-                new_tensor = IRTensor(
-                    shape=tensor.shape, name=tensor.name
-                )
-                new_tensor._id = tensor._id  # -> keep same tensor
-                # reverse op
-                devices = set()
-                for node in tensor.dst():
-                    devices.update(node.device)
-                devices = list(devices)
-                if len(devices) == 0:
-                    devices = tensor.device
-                new_tensor.device = devices
-                all_tensors[tensor._id] = new_tensor
-                return new_tensor
-            else:
-                return all_tensors[tensor._id]
-
-        # backward graph inputs
-        graph_inputs = list()
-        # none outputs for loss
-        graph_outputs = list()
-        # nodes
-        backward_nodes = list()
-        all_bp_tensors = list()
-
-        for fnode in self._nodes[::-1]:
-            inputs = list()
-            for input in fnode.outputs():
-                if isinstance(input, IRTensor) and input.requires_grad:
-                    tensor = get_tensor_grad(input)
-                    if tensor not in all_bp_tensors:
-                        graph_inputs.append(tensor)
-                        all_bp_tensors.append(tensor)
-                    inputs.append(tensor)
-                else:
-                    inputs.append(None)
-            outputs = list()
-            for output in fnode.inputs():
-                if isinstance(output, IRTensor) and output.requires_grad:
-                    tensor = get_tensor_grad(output)
-                    all_bp_tensors.append(tensor)
-                    outputs.append(tensor)
-                else:
-                    outputs.append(None)
-            bp_node = IROperation(
-                name = fnode.name + '_backward',
-                signature = fnode.signature,
-                input_length = len(inputs),
-                output_length = len(outputs)
-            )
-            bp_node.device = fnode.device
-            for idx, arg in enumerate(inputs):
-                bp_node.set_input(idx, arg)
-            for idx, arg in enumerate(outputs):
-                bp_node.set_output(idx, arg)
-            backward_nodes.append(bp_node)
-        graph = IRGraph(
-            backward_nodes,
-            graph_inputs, graph_outputs,
-            self.name + 'Backward'
-        )
-        graph.tag = 'backward'
-        graph(loss)
-
     def subgraph(self, sub_nodes: List[IRCell]):
         """
         Create a subgraph with sub nodes.
@@ -212,56 +293,36 @@ class IRGraph(IRCell):
         and graph output (send tensors)
 
         Return:
-            IRGraph,
-            recv tensor starting offset (int) in input,
-            send tensor starting offset (int) in output
+            IRGraph
         """
-        def _update(x_tensors, x_devices, tensor, devices):
-            if tensor not in x_tensors:
-                x_tensors.append(tensor)
-                x_devices.append(set(devices))
-            else:
-                idx = x_tensors.index(tensor)
-                x_devices[idx].update(set(devices))
-
-        # recv tensors
-        recv_tensors = list()
-        recv_devices = list()
-        # send tensors
-        send_tensors = list()
-        send_devices = list()
-        # get nodes belong to this graph
-        all_tensors = list()
-        for node in sub_nodes:
-            # collect recv tensors
-            tensors_and_devices = node.get_recv_tensors()
-            for r_tensor, r_devices in zip(*tensors_and_devices):
-                _update(recv_tensors, recv_devices, r_tensor, r_devices)
-            # collect send tensors
-            tensors_and_devices = node.get_send_tensors()
-            for s_tensor, s_devices in zip(*tensors_and_devices):
-                _update(send_tensors, send_devices, s_tensor, s_devices)
-            all_tensors += node.inputs()
-            all_tensors += node.outputs()
-
-        # set extra graph inputs and outputs
+        # find input
         inputs = list()
         outputs = list()
-        for input in self.inputs():
-            if input in all_tensors and input not in recv_tensors:
-                inputs.append(input)
-        for output in self.outputs():
-            if output in all_tensors and output not in send_tensors:
-                outputs.append(output)
+        for node in sub_nodes:
+            outer_cells = list(set(self.nodes()) - set(sub_nodes))
+            for tensor in node.inputs():
+                if isinstance(tensor, IRTensor) and tensor not in inputs:
+                    # if a tensor is generated by other nodes out of sub_nodes,
+                    # then this tensor should be the input
+                    src_nodes = tensor.src(outer_cells)
+                    if len(src_nodes) != 0 or tensor in self.inputs():
+                        inputs.append(tensor)
+            for tensor in node.outputs():
+                if isinstance(tensor, IRTensor) and tensor not in outputs:
+                    # if a tensor is used by other nodes out of sub_nodes,
+                    # then this tensor should be output
+                    dst_nodes = tensor.dst(outer_cells)
+                    if len(dst_nodes) != 0 or tensor in self.outputs():
+                        outputs.append(tensor)
 
         graph = IRGraph(
             nodes = sub_nodes,
-            input_tensors = inputs + recv_tensors,
-            output_tensors = outputs + send_tensors,
+            input_tensors = inputs,
+            output_tensors = outputs,
             module_name = self.name
         )
 
-        return graph, len(inputs), len(outputs)
+        return graph
 
 
     def __repr__(self):
@@ -277,92 +338,4 @@ class IRGraph(IRCell):
             dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}\n"
         # outputs
         dscp += f"\nOutputs: {self._outputs}\n{'=' * len(self.name)}\n"
-        return dscp
-
-
-# outputs = cube.runtime.temporal.forward(model, *args)
-_forward_signature = 'cube.runtime.temporal.forward'
-# grads = cube.runtime.temporal.backward(input_tensors, output_tensors, output_grads)
-_backward_signature = 'cube.runtime.temporal.backward'
-
-
-class IRAction(IRCell):
-    """
-    Action recv tensors must be inside of Action inputs,
-    and can be mapped to Action.graph.inputs
-
-    """
-
-    def __init__(self, sub_nodes, global_graph, devices: Union[List[int], int]):
-
-        if isinstance(devices, int):
-            devices = [devices]
-
-        if not isinstance(global_graph, IRGraph):
-            raise TypeError(f"Expected graph: IRGraph but go {type(global_graph)}")
-
-        if global_graph.tag == 'forward':
-            signature = _forward_signature
-        elif global_graph.tag == 'backward':
-            signature = _backward_signature
-        else:
-            raise RuntimeError(f"Unsupported graph tag: {self.global_graph.tag}")
-
-        self.graph, recv_ofst, send_ofst = global_graph.subgraph(sub_nodes)
-        self._recv_ofst = recv_ofst
-        self._send_ofst = send_ofst
-
-        super().__init__(
-            name          = global_graph.tag,
-            signature     = signature,
-            input_length  = len(self.graph.inputs()),
-            output_length = len(self.graph.outputs())
-        )
-        # set action device
-        self.device = devices
-        # set output shape
-        for output, g_out in zip(self.outputs(), self.graph.outputs()):
-            output.device = devices
-            output.shape = g_out.shape
-
-    @property
-    def send_tensors(self):
-        return self._outputs[self._send_ofst:]
-    
-    @property
-    def recv_tensors(self):
-        return self._inputs[self._recv_ofst:]
-
-    def happen_before(self, action):
-        """
-        Check if the self -> (happened before) action
-
-        Note: this may return false negative as it will only check
-        1-hop dependency
-        """
-        if not isinstance(action, IRAction):
-            raise TypeError("Expected action to be an Action")
-        return self in action.predecessors()
-
-    def happen_after(self, action):
-        """
-        Check if the action -> (happened before) self
-
-        Note: this may return false negative as it will only check
-        1-hop dependency
-        """
-        if not isinstance(action, IRAction):
-            raise TypeError("Expected action to be an Action")
-        return self in action.successors()
-
-    def add_flow(self, action):
-        """
-        self -> (happened before) action
-        """
-        raise NotImplementedError
-
-    def __repr__(self):
-        action_inputs = [f't{tensor._id}' for tensor in self.inputs()]
-        action_outputs = [f't{tensor._id}' for tensor in self.outputs()]
-        dscp = f'Action({self.name}):\n\t{self.graph.inputs()} ({action_inputs}) -> {self.graph.outputs()} ({action_outputs})'
         return dscp

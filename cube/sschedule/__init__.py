@@ -1,6 +1,6 @@
 from cube.graph import parser
-from cube.graph.ir_graph import IRGraph, IRAction
 from cube.codegen.codegen import SScheduleCodeGen
+from cube.tschedule.su import ScheduleUnit
 
 
 class SpatialModule:
@@ -14,15 +14,11 @@ class SpatialModule:
     def get_graph(self):
         return self._ir_graph
 
-    def gen_module(self, rank, outfile, attach=False) -> str:
+    def gen_module(self, seq, rank, outfile, attach=False) -> str:
         """
         Set the module
         """
-        # TODO: support multiple graph segments
-        subnodes = [node for node in self._ir_graph.nodes() if node.on_device(rank)]
-        # subgraph = self._ir_graph.subgraph(subnodes)
-        action = IRAction(subnodes, self._ir_graph, devices=[rank])
-        gener = SScheduleCodeGen(action)
+        gener = SScheduleCodeGen(seq)
         code = gener.gen(device=rank, outfile=outfile, attach=attach)
         return code
 
