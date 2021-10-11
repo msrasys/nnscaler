@@ -6,7 +6,7 @@ from cube.graph.ir_comm import IRCommType, IRCommunication
 
 from cube.graph.ir_cten import IRTensor
 from cube.tschedule.suseq import SUSequence
-from cube.tschedule.su import ScheduleUnit
+from cube.tschedule.su import ScheduleUnit, SUType
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
@@ -42,7 +42,9 @@ class SScheduleCodeGen:
         Generate model implementation code based on the given graph.
         """
         device_sus = [su for su in self.seq.sus() \
-                      if device in su.device and su.tag != 'backward']
+                      if device in su.device \
+                      and su.stype != SUType.Backward \
+                      and su.stype != SUType.Dataloader]
 
         gencode = copy.copy(self.init_code)
 
@@ -271,7 +273,15 @@ class TScheduleCodeGen:
         fsign = 'cube.runtime.temporal.forward({model}, *{inputs})'
         bsign = 'cube.runtime.temporal.backward({input_tensors}, {output_tensors}, {output_grads})'
         
-        if su.tag == 'forward' or su.tag == 'adapter':
+        if su.stype == SUType.Dataloader:
+            if len(su.inputs()) != 0:
+                raise RuntimeError("Dataloader su has no inputs")
+            outputs = [self.naming(output, su) for output in su.outputs()]
+            return_val = ','.join(outputs)
+            code = f'{return_val} = {su.signature}'
+            return code
+
+        elif su.stype == SUType.Forward or su.stype == SUType.Adapter:
             inputs = [self.naming(tensor, su) for tensor in su.inputs()]
             inputs = '(' + ', '.join(inputs + ['']) + ')'
             body = fsign.format(
@@ -286,7 +296,7 @@ class TScheduleCodeGen:
                 code = f'{return_val} = {body}'
             return code
 
-        elif su.tag == 'backward':
+        elif su.stype == SUType.Backward:
             # 1). input_tensors are forward inputs (happened before su inputs)
             #       => backward graph output tensor (share tensor in forward / backward graph)
             # 2). output_tensors are forward outputs (su.inputs())

@@ -10,7 +10,9 @@ class SUSequence(IRCell):
     def __init__(self, sus: List[ScheduleUnit]):
 
         if not all([isinstance(su, ScheduleUnit) for su in sus]):
-            raise TypeError("Expected a list of ScheduleUnits")
+            raise TypeError(
+                f"Expected a list of ScheduleUnits, but got {type(sus)}"
+            )
 
         super().__init__(
             name = 'SU',
@@ -126,7 +128,7 @@ class SUSequence(IRCell):
             raise ValueError(f"su2: {su2}  not in sequence")
         
         # 2) all the nodes in both SU are on the same device
-        if su1 == su2 or su1.tag != su2.tag:
+        if su1 == su2 or su1.stype != su2.stype:
             return None
         if set(su1.device) != set(su2.device):
             return None
@@ -144,14 +146,16 @@ class SUSequence(IRCell):
 
         # merge forward su
         sub_nodes = su1.nodes() + su2.nodes()
-        merged_su = ScheduleUnit(sub_nodes, su1.global_graph, su1.device)
+        merged_su = ScheduleUnit(
+            sub_nodes, su1.global_graph, su1.device, su1.stype
+        )
 
         # merge mirrored su
         # mirror_su2 -> mirror_su1
         mirror_su1, mirror_su2 = su1.mirror, su2.mirror
         sub_nodes = mirror_su2.nodes() + mirror_su1.nodes()
         merged_mirror_su = ScheduleUnit(
-            sub_nodes, mirror_su1.global_graph, mirror_su1.device
+            sub_nodes, mirror_su1.global_graph, mirror_su1.device, mirror_su1.stype
         )
 
         # set mirror

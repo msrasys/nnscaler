@@ -1,7 +1,6 @@
 from typing import Union, List, Optional
 import copy
 from enum import Enum
-
 from cube.graph.ir_comm import IRCommunication
 
 from cube.graph.ir_cten import IRCell
@@ -9,9 +8,20 @@ from cube.graph.ir_cten import IRCell
 
 class SUType(Enum):
 
-    Forward = 'forward'
-    Backward = 'backward'
-    Adapter = 'adapter'
+    # outputs = cube.runtime.temporal.forward(model, *args)
+    Forward = 'cube.runtime.temporal.forward'
+
+    # grads = cube.runtime.temporal.backward(
+    #   input_tensors, output_tensors, output_grads
+    # )
+    Backward = 'cube.runtime.temporal.backward'
+
+    # cube.runtime.collectives.sendrecv(send_tensors, send_ranks,
+    #   recv_shapes, from_ranks
+    # )
+    Adapter = 'cube.runtime.collectives.sendrecv'
+
+    Dataloader = 'next(dataloader)'
 
 
 class ScheduleUnit(IRCell):
@@ -21,48 +31,29 @@ class ScheduleUnit(IRCell):
 
     """
 
-    # outputs = cube.runtime.temporal.forward(model, *args)
-    _forward_signature = 'cube.runtime.temporal.forward'
-    # grads = cube.runtime.temporal.backward(
-    #   input_tensors, output_tensors, output_grads
-    # )
-    _backward_signature = 'cube.runtime.temporal.backward'
-    # cube.runtime.collectives.sendrecv(send_tensors, send_ranks,
-    #   recv_shapes, from_ranks
-    # )
-    _adapter_signature = 'cube.runtime.collectives.sendrecv'
+    def __init__(self, sub_nodes, graph, devices: Union[List[int], int], stype: SUType):
 
-    def __init__(self, sub_nodes, graph, devices: Union[List[int], int]):
-
-        if all([isinstance(node, IRCommunication) for node in sub_nodes]):
-            self.tag = 'adapter'
-        else:
-            self.tag = graph.tag
-
+        if not isinstance(stype, SUType):
+            raise TypeError("Expected stype be SUType")
+        
+        self.stype = stype
         self.global_graph = graph
 
-        if self.tag == 'forward':
-            signature = ScheduleUnit._forward_signature
-        elif self.tag == 'backward':
-            signature = ScheduleUnit._backward_signature
-        elif self.tag == 'adapter':
-            signature = ScheduleUnit._adapter_signature
-        else:
-            raise RuntimeError(f"Unsupported graph tag: {self.tag}")
-
         subgraph = graph.subgraph(sub_nodes)
-        self._nodes = sub_nodes
+        inputs = subgraph.inputs()
+        outputs = subgraph.outputs()
 
         super().__init__(
-            name          = self.tag,
-            signature     = signature,
-            input_length  = len(subgraph.inputs()),
-            output_length = len(subgraph.outputs())
+            name          = graph.name,
+            signature     = stype.value,
+            input_length  = len(inputs),
+            output_length = len(outputs)
         )
 
-        for idx, input in enumerate(subgraph.inputs()):
+        self._nodes = sub_nodes
+        for idx, input in enumerate(inputs):
             self.set_input(idx, input)
-        for idx, output in enumerate(subgraph.outputs()):
+        for idx, output in enumerate(outputs):
             self.set_output(idx, output)
 
         # set su device
@@ -181,15 +172,20 @@ class ScheduleUnit(IRCell):
     def __repr__(self):
         su_inputs = [f't{tensor._id}-dev{tensor.device}' for tensor in self.inputs()]
         su_outputs = [f't{tensor._id}-dev{tensor.device}' for tensor in self.outputs()]
-        dscp = f'SU({self.name}, nodes={len(self.nodes())})-dev{self.device}: {su_inputs} -> {su_outputs}'
+        dscp = f'SU({self.stype}, nodes={len(self.nodes())})-dev{self.device}: {su_inputs} -> {su_outputs}'
         return dscp
 
 
-def forward_convert(graph) -> List[ScheduleUnit]:
+def logic_translator(graph, su_type: SUType) -> List[ScheduleUnit]:
+    if not isinstance(su_type, SUType):
+        raise TypeError("Expected SU Type")
     sus = list()
     for node in graph.nodes():
+        stype = su_type
+        if isinstance(node, IRCommunication):
+            stype = SUType.Adapter
         devices = node.device
         for device in devices:
-            su = ScheduleUnit([node], graph, device)
+            su = ScheduleUnit([node], graph, device, stype)
             sus.append(su)
     return sus

@@ -1,9 +1,9 @@
 from typing import Callable, Optional
 import torch
-
 from cube.tschedule.pool import TSchedulePool
-from cube.graph.ir_cten import IRTensor
+from cube.graph.ir_cten import IRTensor, IRCell
 from cube.tschedule.suseq import SUSequence
+from cube.tschedule.su import ScheduleUnit
 from cube.codegen.codegen import TScheduleCodeGen
 
 
@@ -16,15 +16,19 @@ class IRTesnorDataLoader:
         return self
 
     def __next__(self):
+        # generate a schedule node
         datas = next(self.dataloader)
-        ir_datas = list()
-        for data in datas:
-            if torch.is_tensor(data):
-                tensor = IRTensor(shape=list(data.size()), name='input')
-            else:
-                tensor = data
-            ir_datas.append(tensor)
-        return tuple(ir_datas)
+        if not isinstance(datas, tuple):
+            datas = (datas,)
+
+        outputs = [
+            IRTensor(shape=list(data.shape), name='data') for data in datas
+        ]
+        for output in outputs:
+            output.requires_grad = False
+
+        #TODO: check data type consistency
+        return tuple(outputs)
 
 
 def schedule(model, dataloader, policy_fn: Optional[Callable] = None):

@@ -15,6 +15,7 @@ import torch
 from torch import nn
 
 import cube
+from cube.tschedule.su import SUType
 
 
 def spolicy(ir_graph):
@@ -41,30 +42,20 @@ def tpolicy(seq):
             fb_op_seqs.append([su])
     
     # merge to stages
-    fb_stage_seqs = list()
     for fb_seq in fb_op_seqs:
         merged_su = fb_seq[0]
         for su in fb_seq[1:]:
-            if su.tag == 'backward':
-                break
-            out_su = seq.merge(merged_su, su)
-            if out_su is not None:
-                merged_su = out_su
-            else:
-                print('=====', merged_su)
-                fb_stage_seqs.append(merged_su)
-                merged_su = su
-        fb_stage_seqs.append(merged_su)
-    
-    for mbs_seq in fb_stage_seqs:
-        print('mirobatch seq:', mbs_seq)
+            if su.stype == SUType.Backward:
+                continue
+            msu = seq.merge(merged_su, su)
+            merged_su = su if msu is None else msu
     print(seq)
     return seq
 
 
 
 class FakeDataLoader:
-    def __init__(self, batch_size, num=32):
+    def __init__(self, batch_size, num=640):
         self.batch_size = batch_size
         self.length = num
         self.pos = 0
@@ -75,7 +66,7 @@ class FakeDataLoader:
         self.pos += 1
         if self.pos == self.length:
             raise StopIteration 
-        return (torch.randn((self.batch_size, 1024)).cuda(),)
+        return torch.randn((self.batch_size, 1024)).cuda()
 
 
 class FeedForward(nn.Module):
@@ -103,17 +94,19 @@ def init_weight(parameters):
 
 
 def train():
+    batch_size = 64
+
     model = FeedForward(dim=1024)
     model = cube.sschedule.schedule(
-        model, input_shapes=([64,1024],),
+        model, input_shapes=([batch_size,1024],),
         policy_fn=spolicy
     )
 
-    dataloader = FakeDataLoader(64)
+    dataloader = FakeDataLoader(batch_size)
 
     @cube.tschedule.schedule(model, dataloader, policy_fn=tpolicy)
     def train_iter(model, dataloader):
-        for _ in range(1):
+        for _ in range(4):
             (data,) = next(dataloader)
             loss = model(data)
             loss.backward()
@@ -123,7 +116,7 @@ def train():
     
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
-    for epoch in range(100):
+    for epoch in range(10):
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()

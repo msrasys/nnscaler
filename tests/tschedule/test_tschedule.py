@@ -66,10 +66,10 @@ def test_su_merge(ir_graph):
     loss = ir_graph(IRTensor(shape=[64,1024]))
     seq = SUSequence(TSchedulePool().sus())
 
-    first_stage = seq.sus()[0:3]
-    second_stage = seq.sus()[5:8]
+    first_stage = seq.sus()[1:4]
+    second_stage = seq.sus()[6:9]
 
-    su1 = seq.sus(0)
+    su1 = seq.sus(1)
     for su in first_stage[1:]:
         su1 = seq.merge(su1, su)
         assert su1 is not None
@@ -95,7 +95,7 @@ def test_su_merge(ir_graph):
 def test_graph_backward(ir_graph):
 
     TSchedulePool().clear()
-    micro_bs = 1
+    micro_bs = 2
     for _ in range(micro_bs):
         loss = ir_graph(IRTensor(shape=[64,1024]))
         loss.backward()
@@ -103,10 +103,10 @@ def test_graph_backward(ir_graph):
     print(TSchedulePool())
 
     seq = SUSequence(TSchedulePool().sus())
-    first_stage = seq.sus()[0:3]
-    second_stage = seq.sus()[5:8]
+    first_stage = seq.sus()[1:4]
+    second_stage = seq.sus()[6:9]
 
-    su1 = seq.sus(0)
+    su1 = seq.sus(1)
     for su in first_stage[1:]:
         su1 = seq.merge(su1, su)
         assert su1 is not None
@@ -136,27 +136,8 @@ def test_graph_backward(ir_graph):
     print('\n====== Backward Test =======\n')
 
 
-def test_su_merge(ir_graph):
-    TSchedulePool().clear()
-    loss = ir_graph(IRTensor(shape=[64,1024]))
-    seq = SUSequence(TSchedulePool().sus())
-    sus = seq.sus()[0:4]
-    
-    su1 = seq.sus(0)
-    for su in sus[1:]:
-        su1 = seq.merge(su1, su)
-        assert su1 is not None
-    print(su1)
-    for node in su1.nodes():
-        print(node)
-    print('====')
-    for node in ir_graph.nodes():
-        print(node)
-
-
 if __name__ == '__main__':
 
     test_graph_forward(ir_graph)
     test_su_merge(ir_graph)
     test_graph_backward(ir_graph)
-    test_su_merge(ir_graph)
