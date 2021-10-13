@@ -1,7 +1,7 @@
 from typing import Callable, Optional
 import torch
 from cube.tschedule.pool import TSchedulePool
-from cube.graph.ir_cten import IRTensor, IRCell
+from cube.graph.ir_cten import IRTensor
 from cube.tschedule.suseq import SUSequence
 from cube.tschedule.su import ScheduleUnit
 from cube.codegen.codegen import TScheduleCodeGen
@@ -24,11 +24,15 @@ class IRTesnorDataLoader:
         outputs = [
             IRTensor(shape=list(data.shape), name='data') for data in datas
         ]
-        for output in outputs:
-            output.requires_grad = False
+        for idx, (output, data) in enumerate(zip(outputs, datas)):
+            if not torch.is_tensor(data):
+                outputs[idx] = data
+            else:
+                output.requires_grad = False
 
-        #TODO: check data type consistency
-        return tuple(outputs)
+        if    len(outputs) == 0: return
+        elif  len(outputs) == 1: return outputs[0]
+        else: return tuple(outputs)
 
 
 def schedule(model, dataloader, policy_fn: Optional[Callable] = None):

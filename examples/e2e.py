@@ -107,7 +107,7 @@ def train():
     @cube.tschedule.schedule(model, dataloader, policy_fn=tpolicy)
     def train_iter(model, dataloader):
         for _ in range(4):
-            (data,) = next(dataloader)
+            data = next(dataloader)
             loss = model(data)
             loss.backward()
     model = model.get_gen_module()
