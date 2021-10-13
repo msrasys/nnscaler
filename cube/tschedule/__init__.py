@@ -7,7 +7,7 @@ from cube.tschedule.su import ScheduleUnit
 from cube.codegen.codegen import TScheduleCodeGen
 
 
-class IRTesnorDataLoader:
+class IRTensorDataLoader:
 
     def __init__(self, dataloader):
         self.dataloader = dataloader
@@ -58,7 +58,7 @@ def schedule(model, dataloader, policy_fn: Optional[Callable] = None):
         ...
     """
     ir_graph = model.get_graph()
-    ir_dataloader = IRTesnorDataLoader(dataloader)
+    ir_dataloader = IRTensorDataLoader(dataloader)
     myrank = torch.distributed.get_rank()
 
     def _load_tschedule_fn(filename) -> Callable:
