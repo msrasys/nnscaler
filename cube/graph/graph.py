@@ -9,13 +9,10 @@ IRGraph:
 
 from typing import Union, Tuple, List, Optional, Any
 
-from torch._C import device
-
-from cube.graph.ir_cten import IRTensor, IRCell
-from cube.graph.ir_op import IROperation
-from cube.graph.ir_comm import IRCommunication
-from cube.runtime.temporal import forward
-from cube.tschedule.su import SUType, logic_translator
+from cube.ir.cten import IRTensor, IRCell
+from cube.graph.operator import IROperation
+from cube.graph.comm import IRCommunication
+# from cube.tschedule.su import SUType, logic_translator
 
 import copy
 
@@ -155,11 +152,6 @@ class IRGraph(IRCell):
         copied_graph.tag = self.tag
         return copied_graph
 
-    def add_node(self, node: IRCell):
-        if not isinstance(node, IRCell):
-            raise TypeError("Expected node to be IROperation")
-        self._nodes.append(node)
-
     def nodes(self, index: Optional[int] = None):
         """
         Get node at position index
@@ -209,7 +201,7 @@ class IRGraph(IRCell):
         #TODO: optimize this
         self.reset_dependency()
 
-    def replace_tensor(self, old_tensor: IRTensor, new_tensor: IRTensor):
+    def _replace_tensor(self, old_tensor: IRTensor, new_tensor: IRTensor):
         """
         Replace tensor from old_tensor to new_tensor for all the graph.
         """
@@ -259,7 +251,7 @@ class IRGraph(IRCell):
         for input, arg in zip(fgraph.inputs(), args):
             if type(arg) != type(input):
                 raise RuntimeError(f"Expected input type the same")
-            fgraph.replace_tensor(input, arg)
+            fgraph._replace_tensor(input, arg)
         
         # dataloader su
         cell = IRCell(

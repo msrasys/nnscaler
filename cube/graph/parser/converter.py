@@ -1,8 +1,8 @@
-from cube.graph.ir_cten import IRTensor
 from typing import Optional, List
 
+from cube.ir.cten import IRTensor
 from cube.graph.parser import ScriptModuleParser
-from cube.graph import IRGraph, IRTensor
+from cube.graph import IRGraph
 
 import torch
 

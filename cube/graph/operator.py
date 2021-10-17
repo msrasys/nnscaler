@@ -1,6 +1,6 @@
 from typing import List, Union
 
-from cube.graph.ir_cten import IRTensor, IRCell
+from cube.ir.cten import IRTensor, IRCell
 from cube.graph.mapping import IR2LogicOp
 
 

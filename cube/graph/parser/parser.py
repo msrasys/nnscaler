@@ -3,7 +3,8 @@ import enum
 import re
 from typing import List, Tuple, Optional
 
-from cube.graph import IROperation, IRTensor
+from cube.graph import IROperation
+from cube.ir.cten import IRTensor
 from cube.graph.parser.frame import Frame
 
 class ScriptNodeKind(enum.Enum):

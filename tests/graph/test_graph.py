@@ -1,63 +1,119 @@
-
-import cube.graph.parser as parser
-from cube.sschedule.adapter import Adapter
-from cube.graph.unique import IDGenerator
-import copy
-
-import torch
-from torch import nn
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, dropout=0., mult=16, classes=1000):
-        super().__init__()
-        self.linear1 = nn.Linear(dim, dim * mult, bias=False)
-        self.gelu = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim * mult, dim)
-        self.classifier = nn.Linear(dim, classes)
-
-    def forward(self, data, x: int = 4):
-        output = self.linear1(data)
-        output = self.gelu(output)
-        output = self.dropout(output)
-        output = output + data
-        output = self.linear2(output)
-        output = self.classifier(output)
-        return output
-
-model = FeedForward(dim=1024)
-graph = parser.convert(model, input_shapes=([1024,1024],[1,]))
+from cube.graph.graph import IRGraph
+from cube.graph.tensor import IRFullTensor
+from cube.graph.operator import IROperation
 
 
-def test_sendrecv_adapter(graph):
-    for nid, node in enumerate(graph.nodes()):
-        if nid < 3:
-            node.device = 0
-        else:
-            node.device = 1
-    print('==== graph (not adapted) ====')
+def construct_model():
+
+    input = IRFullTensor(shape=[64,1024], name='data')
+    weight1 = IRFullTensor(shape=[1024, 1024], name='weight')
+    bias1 = IRFullTensor(shape=[1024, 1024], name='bias')
+    weight2 = IRFullTensor(shape=[1024, 1024], name='weight')
+    weight3 = IRFullTensor(shape=[1024, 1024], name='weight')
+    bias3 = IRFullTensor(shape=[1024, 1024], name='bias')
+
+    # linear1
+    linear1 = IROperation(
+        name='linear1',
+        signature='torch.nn.functional.linear',
+        input_length=3,
+        output_length=1
+    )
+    linear1.set_input(0, input)
+    linear1.set_input(1, weight1)
+    linear1.set_input(2, bias1)
+
+    # linear2
+    linear2 = IROperation(
+        name='linear2',
+        signature='torch.nn.functional.linear',
+        input_length=3,
+        output_length=1
+    )
+    linear2.set_input(0, linear1.outputs(0))
+    linear2.set_input(1, weight2)
+
+    # linear3
+    linear3 = IROperation(
+        name='linear2',
+        signature='torch.nn.functional.linear',
+        input_length=3,
+        output_length=1
+    )
+    linear3.set_input(0, linear2.outputs(0))
+    linear3.set_input(1, weight3)
+    linear3.set_input(2, bias3)
+
+    # return [input], [ops], [output]
+    return [input], [linear1, linear2, linear3], [linear3.outputs(0)]
+
+
+def test_graph_init():
+
+    inputs, ops, outputs = construct_model()
+    graph = IRGraph(ops, inputs, outputs, 'MLP')
     print(graph)
-    graph = Adapter.adapt(graph)
-    print('==== graph (after adapter) ====')
-    print(graph)
+
+    assert len(graph.inputs()) == 1
+    assert len(graph.outputs()) == 1
+    assert graph.tag == 'forward'
+    assert graph.name == 'MLP'
+
+    all_inputs = list()
+    all_outputs = list()
+    for node in graph.nodes():
+        all_inputs += node.inputs()
+        all_outputs += node.outputs()
+
+    # check inputs
+    for input in inputs:
+        assert input in graph.inputs()
+        assert input in all_inputs
+    for output in outputs:
+        assert output in graph.outputs()
+        assert output in all_outputs
+
+    # check dependency
+    node1, node2, node3 = graph.nodes()
+    assert node2 in node1.successors()
+    assert node3 in node2.successors()
+    assert node1 in node2.predecessors()
+    assert node2 in node3.predecessors()
+    # one-hop test
+    assert node1 not in node3.predecessors()
+    assert node3 not in node1.successors()
+    # false test
+    assert node1 not in node2.successors()
+    assert node3 not in node2.predecessors()
 
 
-def test_graph_copy(graph):
-    graph = graph.copy()
-    print('====== Copied Graph =====')
-    print(graph)
-    print('====== Copied Graph =====')
+def test_graph_nodes():
+    inputs, ops, outputs = construct_model()
+    graph = IRGraph(ops, inputs, outputs, 'MLP')
+    assert id(graph.nodes()) != id(graph.nodes())
+    assert graph.nodes(1) == ops[1]
 
 
-def test_graph_reverse(graph):
-    graph = graph.copy(reverse=True)
-    print('====== Reversed Graph =====')
-    print(graph)
-    print('====== Reversed Graph =====')
+def test_graph_copy():
+    inputs, ops, outputs = construct_model()
+    graph = IRGraph(ops, inputs, outputs, 'MLP')
 
+    cgraph = graph.copy(reverse=False)
+    print(cgraph)
+    for gnode, cnode in zip(graph.nodes(), cgraph.nodes()):
+        assert gnode.name == cnode.name
+        assert gnode.signature == cnode.signature
+        assert len(gnode.inputs()) == len(cnode.inputs())
+        assert len(gnode.outputs()) == len(cnode.outputs())
+        assert len(gnode.predecessors()) == len(cnode.predecessors())
+        assert len(gnode.successors()) == len(cnode.successors())
 
-if __name__ == '__main__':
-
-    test_sendrecv_adapter(graph)
-    test_graph_copy(graph)
-    test_graph_reverse(graph)
+    rgraph = graph.copy(reverse=True)
+    print(rgraph)
+    for gnode, cnode in zip(graph.nodes(), rgraph.nodes()[::-1]):
+        assert gnode.name == cnode.name
+        assert gnode.signature == cnode.signature
+        assert len(gnode.outputs()) == len(cnode.inputs())
+        assert len(gnode.inputs()) == len(cnode.outputs())
+        assert len(gnode.predecessors()) == len(cnode.successors())
+        assert len(gnode.successors()) == len(cnode.predecessors())

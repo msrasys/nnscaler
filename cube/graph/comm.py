@@ -1,7 +1,7 @@
 from typing import List
 from enum import Enum
 
-from cube.graph.ir_cten import IRCell, IRTensor
+from cube.ir.cten import IRCell, IRTensor
 
 
 class IRCommType(Enum):
