@@ -1,3 +1,5 @@
+import copy
+
 from cube.graph.tensor import IRFullTensor, IRSubTensor
 
 
@@ -7,6 +9,11 @@ def test_full_tensor_init():
     assert tensor.shape == [1024, 1024]
     assert tensor.name == 'full_tensor'
 
+def test_full_tensor_constrcut():
+
+    tensor = IRFullTensor(shape=[1024,1024], name='full_tensor')
+    ctensor = copy.copy(tensor)
+    assert isinstance(ctensor, IRFullTensor)
 
 def test_full_tensor_select():
 

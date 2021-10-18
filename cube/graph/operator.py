@@ -1,6 +1,7 @@
 from typing import List, Union
 
 from cube.ir.cten import IRTensor, IRCell
+from cube.graph.tensor import IRFullTensor
 from cube.graph.mapping import IR2LogicOp
 
 
@@ -24,6 +25,9 @@ class IROperation(IRCell):
             output_length (int): the number of outputs for the op
         """
         super().__init__(name, signature, input_length, output_length)
+        outputs = [IRFullTensor() for _ in range(output_length)]
+        for idx, output in enumerate(outputs):
+            self.set_output(idx, output)
         self.semantic = IR2LogicOp.map(self.signature)
 
     def infer_shape(self):

@@ -1,6 +1,7 @@
 from cube.graph.graph import IRGraph
 from cube.graph.tensor import IRFullTensor
 from cube.graph.operator import IROperation
+from cube.ir.cten import IRTensor
 
 
 def construct_model():
@@ -64,6 +65,13 @@ def test_graph_init():
     for node in graph.nodes():
         all_inputs += node.inputs()
         all_outputs += node.outputs()
+
+    for input in all_inputs:
+        if isinstance(input, IRTensor):
+            assert isinstance(input, IRFullTensor)
+    for output in all_outputs:
+        if isinstance(output, IRTensor):
+            assert isinstance(output, IRFullTensor)
 
     # check inputs
     for input in inputs:

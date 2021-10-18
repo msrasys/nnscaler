@@ -165,6 +165,38 @@ class IRFullTensor(IRTensor):
         # value op
         self._val_ops: List = list()
 
+    def __copy__(self):
+        """
+        Copy the tensor that will have the exactly same id
+        except the empty attached cell
+
+        Returns:
+            tensor
+        """
+        tensor = IRFullTensor(self._shape, self.name)
+        for key in self.__dict__:
+            setattr(tensor, key, getattr(self, key))
+        # clear attached cells
+        tensor._cell = list()
+        return tensor
+
+    def renew(self):
+        """
+        Renew a new tensor with same name and shape,
+        but with a different new id
+
+        Returns:
+            tensor
+        """
+        tensor = IRFullTensor(self._shape, self.name)
+        new_id = tensor._id
+        for key in self.__dict__:
+            setattr(tensor, key, getattr(self, key))
+        # clear attached cells
+        tensor._cell = list()
+        tensor._id = new_id
+        return tensor
+
     def segments(self, index: Optional[int] = None):
         """
         Get the SubTensors at index position
@@ -286,6 +318,38 @@ class IRSubTensor(IRTensor):
     @property
     def val_op(self):
         return self.val_merge_op
+
+    def __copy__(self):
+        """
+        Copy the tensor that will have the exactly same id
+        except the empty attached cell
+
+        Returns:
+            tensor
+        """
+        tensor = IRSubTensor(self._shape, self.name)
+        for key in self.__dict__:
+            setattr(tensor, key, getattr(self, key))
+        # clear attached cells
+        tensor._cell = list()
+        return tensor
+
+    def renew(self):
+        """
+        Renew a new tensor with same name and shape,
+        but with a different new id
+
+        Returns:
+            tensor
+        """
+        tensor = IRSubTensor(self._shape, self.name)
+        new_id = tensor._id
+        for key in self.__dict__:
+            setattr(tensor, key, getattr(self, key))
+        # clear attached cells
+        tensor._cell = list()
+        tensor._id = new_id
+        return tensor
 
     def select(self, indices, val_op, shape=None):
         """
