@@ -4,7 +4,7 @@ import re
 from typing import List, Tuple, Optional
 
 from cube.graph import IROperation
-from cube.ir.cten import IRTensor
+from cube.graph.tensor import IRFullTensor
 from cube.graph.parser.frame import Frame
 
 class ScriptNodeKind(enum.Enum):
@@ -22,7 +22,7 @@ class ScriptModuleParser:
     def parse_module(module,
                      input_shapes: Optional[ Tuple[List[int],] ] = None,
                      frame: Frame = Frame()) \
-        -> Tuple[List[IRTensor], List[IROperation], List[IRTensor]]:
+        -> Tuple[List[IRFullTensor], List[IROperation], List[IRFullTensor]]:
         """
         The overall entry to parse a torchscript graph module
         """
@@ -31,7 +31,7 @@ class ScriptModuleParser:
         # handle graph input -- Assuming all the inputs are tensors
         input_var_name = [input.debugName() for input in module.graph.inputs()]
         for index, var_name in enumerate(input_var_name[1:]): # omit self
-            frame.add_var(var_name, IRTensor(name=var_name), graph_arg=index)
+            frame.add_var(var_name, IRFullTensor(name=var_name), graph_arg=index)
         input_val = [frame.get_var(var_name) for var_name in input_var_name[1:]]
 
         # handle input shape
@@ -41,7 +41,7 @@ class ScriptModuleParser:
                     f"Module {module.original_name} input shape mismatch (got {len(input_shapes)} != {len(input_val)})"
                 )
             for shape, val in zip(input_shapes, input_val):
-                if isinstance(val, IRTensor):
+                if isinstance(val, IRFullTensor):
                     val.shape = shape
 
         all_ir_nodes: List[IROperation] = list()
@@ -154,7 +154,7 @@ class ScriptModuleParser:
             var_name = input.debugName()
             val = frame.get_var(var_name)
             index = len(inputs) - 1 - reverse_index
-            if maybe_kwarg and (not isinstance(val, IRTensor)) and index > 1:
+            if maybe_kwarg and (not isinstance(val, IRFullTensor)) and index > 1:
                 continue
             else:
                 input_val.append(val)
@@ -232,7 +232,7 @@ class ScriptModuleParser:
         This will add frame with the variable name and it's value
 
         The value can be:
-            1). (IRTensor) the tensor edge in graph
+            1). (IRFullTensor) the tensor edge in graph
             2). (str code) symbolic value based on runtime info (e.g., self.training)
             3). (str) Function or torch.nn.moudles
 
@@ -249,7 +249,7 @@ class ScriptModuleParser:
         # this usually means weight (nn.Parameter in torch)
         if dtype == 'Tensor':
             shape = list(getattr(module, label).shape)
-            ir_tensor = IRTensor(name=label, shape=shape)
+            ir_tensor = IRFullTensor(name=label, shape=shape)
             frame.add_var(var_name, ir_tensor)
         # symbolic attributes
         elif dtype in ['bool', 'int', 'float']:

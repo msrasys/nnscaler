@@ -316,7 +316,7 @@ class IRSubTensor(IRTensor):
             the full tensor, otherwise False
         """
         if not isinstance(other, IRTensor):
-            raise TypeError("Expected Tensor")
+            return False
         if isinstance(other, IRFullTensor):
             return self.parent == other
         elif isinstance(other, IRSubTensor):

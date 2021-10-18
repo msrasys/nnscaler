@@ -52,6 +52,15 @@ class IRGraph(IRCell):
         for idx, tensor in enumerate(output_tensors):
             self.set_output(idx, tensor)
 
+        # set parameter
+        self._parameters = list()
+        for node in self._nodes:
+            for input in node.inputs():
+                if isinstance(input, IRTensor):
+                    if input not in input_tensors and \
+                       input.is_leaf(self._nodes):
+                        input.as_param()
+                        self._parameters.append(input)
         self.tag = 'forward'
 
     def reset_dependency(self):
@@ -77,6 +86,12 @@ class IRGraph(IRCell):
                             dst_input_idx = dst_cell.inputs().index(tensor)
                             dst_cell.add_predecessor(dst_input_idx, src_cell)
 
+    def parameters(self):
+        """
+        Return parameter list
+        """
+        return copy.copy(self._parameters)
+
     def copy(self, reverse=False):
         """
         Copy the graph but re-new the intermediate tensor
@@ -87,7 +102,7 @@ class IRGraph(IRCell):
             if not isinstance(val, IRTensor):
                 return val
             # parameters
-            if val.is_leaf(self.nodes()) and val not in self.inputs():
+            if val.is_param():
                 return val
             # intermediate data
             if val._id not in new_tensors:
