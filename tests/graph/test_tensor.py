@@ -120,3 +120,38 @@ def test_sub_tensor_overlap():
     assert sub_tensor1.overlap(sub_tensor2)
     assert sub_tensor1.overlap(sub_tensor3)
     assert not sub_tensor2.overlap(sub_tensor3)
+
+
+def test_sub_tensor_common():
+
+    tensor1 = IRFullTensor(shape=[1024,1024], name='tensor')
+    sub_tensor_col1 = tensor1.select(
+        indices = (slice(0, 1024), slice(0, 512)),
+        val_op = None,
+        shape = (1024, 512)
+    )
+    sub_tensor_col2 = tensor1.select(
+        indices = (slice(0, 1024), slice(512, 1024)),
+        val_op = None,
+        shape = (1024, 512)
+    )
+    sub_tensor_row1 = tensor1.select(
+        indices = (slice(0, 512), slice(0, 1024)),
+        val_op = None,
+        shape = (512, 1024)
+    )
+    sub_tensor_row2 = tensor1.select(
+        indices = (slice(512, 1024), slice(0, 1024)),
+        val_op = None,
+        shape = (512, 1024)
+    )
+
+    lt = sub_tensor_col1.common(sub_tensor_row1)
+    rt = sub_tensor_col2.common(sub_tensor_row1)
+    lb = sub_tensor_row2.common(sub_tensor_col1)
+    rb = sub_tensor_row2.common(sub_tensor_col2)
+
+    assert lt.indices.get() == (slice(0, 512, 1), slice(0, 512, 1))
+    assert rt.indices.get() == (slice(0, 512, 1), slice(512, 1024, 1))
+    assert lb.indices.get() == (slice(512, 1024, 1), slice(0, 512, 1))
+    assert rb.indices.get() == (slice(512, 1024, 1), slice(512, 1024, 1))

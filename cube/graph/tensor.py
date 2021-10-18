@@ -1,6 +1,5 @@
 from typing import List, Optional, Callable
 import copy
-import math
 
 from cube.ir.cten import IRTensor
 
@@ -46,6 +45,19 @@ class IndexMap:
                 count = int(count // slicer.step)
             nelements *= count
         return nelements
+
+    @property
+    def shape(self) -> List[int]:
+        """
+        Get the shape of the slice
+        """
+        shape = list()
+        for slicer in self._indices:
+            count = slicer.stop - slicer.start
+            if slicer.step:
+                count = int(count // slicer.step)
+            shape.append(count)
+        return shape
 
     def map(self, submap):
         """
@@ -111,6 +123,34 @@ class IndexMap:
             else:
                 raise NotImplementedError(f"not supported for differnt steps")
         return True
+
+    def __and__(self, other):
+        """
+        Get the common part
+
+        Args:
+            other: IndexMap
+        
+        Returns:
+            IndexMap for the common part
+        """
+        if not self.overlap(other):
+            return None
+        slices = list()
+        for slicer1, slicer2 in zip(self.get(), other.get()):
+            start1, stop1 = slicer1.start, slicer1.stop
+            step1 = slicer1.step if slicer1.step else 1
+        
+            start2, stop2 = slicer2.start, slicer2.stop
+            step2 = slicer2.step if slicer2.step else 1
+
+            if step1 == step2:
+                start = max(start1, start2)
+                stop = min(stop1, stop2)
+                slices.append(slice(start, stop, step1))
+            else:
+                raise NotImplementedError(f"not supported for differnt steps")
+        return IndexMap(tuple(slices))
 
 
 class IRFullTensor(IRTensor):
@@ -193,6 +233,19 @@ class IRFullTensor(IRTensor):
         else:
             raise TypeError("Customized IRTensor not support")
 
+    def common(self, other) -> Optional[IRTensor]:
+        """
+        Get the common sub-tensor
+
+        Args:
+            IRTensor
+
+        Returns:
+            None for not overlap,
+            else IRSubTensor or IRFullTensor
+        """
+        return other if self.overlap(other) else None
+
 
 class IRSubTensor(IRTensor):
 
@@ -270,3 +323,29 @@ class IRSubTensor(IRTensor):
             return self.indices.overlap(other.indices)
         else:
             raise TypeError("Customized IRTensor not support")
+
+    def common(self, other):
+        """
+        Get the common sub-tensor
+
+        Args:
+            IRTensor
+
+        Returns:
+            None for not overlap,
+            else IRSubTensor or IRFullTensor
+        """
+        if self.overlap(other):
+            if isinstance(other, IRFullTensor):
+                return self
+            elif isinstance(other, IRSubTensor):
+                indices = self.indices & other.indices
+                sub_tensor = self.parent.select(
+                    indices = indices.get(),
+                    val_op = self.val_op,
+                    shape = indices.shape
+                )
+                return sub_tensor
+            else:
+                raise NotImplementedError("Customized IRTensor not support")
+        return None
