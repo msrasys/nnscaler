@@ -86,6 +86,10 @@ def test_graph_init():
     assert node1 not in node2.successors()
     assert node3 not in node2.predecessors()
 
+    # weight test
+    params = graph.parameters()
+    assert len(params) == 5
+
 
 def test_graph_nodes():
     inputs, ops, outputs = construct_model()
@@ -100,6 +104,11 @@ def test_graph_copy():
 
     cgraph = graph.copy(reverse=False)
     print(cgraph)
+
+    cparam_id = [param._id for param in cgraph.parameters()]
+    param_id = [param._id for param in graph.parameters()]
+    assert set(cparam_id) == set(param_id)
+
     for gnode, cnode in zip(graph.nodes(), cgraph.nodes()):
         assert gnode.name == cnode.name
         assert gnode.signature == cnode.signature
