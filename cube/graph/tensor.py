@@ -1,10 +1,116 @@
 from typing import List, Optional, Callable
 import copy
+import math
 
 from cube.ir.cten import IRTensor
 
 
-__all__ = ['IRFullTensor', 'IRSubTensor']
+__all__ = ['IndexMap', 'IRFullTensor', 'IRSubTensor']
+
+
+class IndexMap:
+
+    def __init__(self, indices):
+
+        if not isinstance(indices, tuple):
+            raise TypeError("Expected indices to be a tuple")
+
+        if not all([isinstance(s, slice) for s in indices]):
+            raise NotImplementedError(
+                "Only support for sliced index mapping"
+            )
+        self._indices = indices
+
+    def get(self):
+        """
+        Get indices
+        """
+        return self._indices
+
+    @property
+    def ndims(self) -> int:
+        """
+        Number of dimensions of the index map
+        """
+        return len(self._indices)
+
+    @property
+    def neles(self) -> int:
+        """
+        Number of elements of the index map
+        """
+        nelements = 1
+        for slicer in self._indices:
+            count = slicer.stop - slicer.start
+            if slicer.step:
+                count = int(count // slicer.step)
+            nelements *= count
+        return nelements
+
+    def map(self, submap):
+        """
+        Map from the current indices by sub_indices.
+
+        Args:
+            sub_indices: IndexMap
+
+        Returns:
+            sub_indices: IndexMap
+
+        """
+        if not isinstance(submap, IndexMap):
+            raise TypeError("Expected IndexMap")
+        if self.ndims != submap.ndims:
+            raise ValueError("Expected same length of sub_indices")
+
+        # e.g., (slice(0, M), slice(0, int(K // 2))
+        sub = list()
+        for dim_indices, dim_sub_indices in zip(self.get(), submap.get()):
+            start, stop = dim_indices.start, dim_indices.stop
+            step = dim_indices.step if dim_indices.step else 1
+
+            sub_start, sub_stop = dim_sub_indices.start, dim_sub_indices.stop
+            sub_step = dim_sub_indices.step if dim_sub_indices.step else 1
+    
+            new_start = start + sub_start
+            new_stop = new_start + sub_stop - sub_start
+            new_step = step * sub_step
+            if new_stop > stop:
+                raise ValueError("Trying to map a index out of range")
+            sub.append(slice(new_start, new_stop, new_step))
+        return IndexMap(tuple(sub))
+
+    def overlap(self, other):
+        """
+        Check if this indices overlapped with the other
+
+        Args:
+            other: IndexMap
+
+        Returns:
+            Boolean: True has overlap, otherwise False
+        """
+        if not isinstance(other, IndexMap):
+            raise TypeError("Expected IndexMap")
+        
+        if other.ndims != self.ndims:
+            raise TypeError("Expected same dimension")
+
+        for slicer1, slicer2 in zip(self.get(), other.get()):
+            start1, stop1 = slicer1.start, slicer1.stop
+            step1 = slicer1.step if slicer1.step else 1
+        
+            start2, stop2 = slicer2.start, slicer2.stop
+            step2 = slicer2.step if slicer2.step else 1
+        
+            if step1 == step2:
+                if min(stop1, stop2) <= max(start1, start2):
+                    return False
+                elif start1 % step1 != start2 % step2:
+                    return False
+            else:
+                raise NotImplementedError(f"not supported for differnt steps")
+        return True
 
 
 class IRFullTensor(IRTensor):
@@ -28,7 +134,7 @@ class IRFullTensor(IRTensor):
         else:
             return self._segments[index]
 
-    def indices(self, index: Optional[int] = None):
+    def indices(self, index: Optional[int] = None) -> IndexMap:
         """
         Get the SubTensors mapping indices
         """
@@ -66,12 +172,29 @@ class IRFullTensor(IRTensor):
         """
         sub_tensor = IRSubTensor(self, indices, val_op, shape)
         self._segments.append(sub_tensor)
-        self._indices.append(indices)
+        self._indices.append(IndexMap(indices))
         self._val_ops.append(val_op)
         return sub_tensor
 
+    def overlap(self, other):
+        """
+        Check if the two tensor is overlapped.
 
-class IRSubTensor:
+        Returns:
+            True if they are sharing co-located position in
+            the full tensor, otherwise False
+        """
+        if not isinstance(other, IRTensor):
+            raise TypeError("Expected Tensor")
+        if isinstance(other, IRFullTensor):
+            return self == other
+        elif isinstance(other, IRSubTensor):
+            return other.parent == self
+        else:
+            raise TypeError("Customized IRTensor not support")
+
+
+class IRSubTensor(IRTensor):
 
     def __init__(self, full_tensor: IRTensor, indices, val_op=None, shape=None):
         """
@@ -82,13 +205,13 @@ class IRSubTensor:
             indices: index list
             val_op: the value operation to merge SubTensors into one
         """
-        super.__init__(shape=shape, name=full_tensor.name)
+        super().__init__(shape=shape, name=full_tensor.name)
 
         # the full tensor
         self._full_tensor = full_tensor
 
         # the index from full_tensor
-        self._index_map = indices
+        self._index_map = IndexMap(indices)
 
         # val merge op
         self.val_merge_op = val_op
@@ -100,7 +223,8 @@ class IRSubTensor:
         """
         return self._full_tensor
 
-    def index_map(self):
+    @property
+    def indices(self) -> IndexMap:
         """
         Return indices list mapped to the full tensor
         """
@@ -125,6 +249,24 @@ class IRSubTensor:
         Returns:
             IRSubTensor
         """
-        index_map = self.index_map[indices]
-        sub_tensor = self.full_tensor.select(index_map, val_op, shape)
+        sub_map = IndexMap(indices)
+        index_map = self.indices.map(sub_map)
+        sub_tensor = self.parent.select(index_map.get(), val_op, shape)
         return sub_tensor
+
+    def overlap(self, other):
+        """
+        Check if the two tensor is overlapped.
+
+        Returns:
+            True if they are sharing co-located position in
+            the full tensor, otherwise False
+        """
+        if not isinstance(other, IRTensor):
+            raise TypeError("Expected Tensor")
+        if isinstance(other, IRFullTensor):
+            return self.parent == other
+        elif isinstance(other, IRSubTensor):
+            return self.indices.overlap(other.indices)
+        else:
+            raise TypeError("Customized IRTensor not support")
