@@ -322,6 +322,7 @@ class IRTensor:
         self._cell: List[IRCell] = list() 
 
         # forward graph
+        self._is_param = False
         self.requires_grad = True
         self.trace = None
 
@@ -353,6 +354,19 @@ class IRTensor:
             raise TypeError("Expected List[ScheduleUnit]")
         self.trace = sus
 
+    def as_param(self):
+        """
+        Set the tensor as trainable parameter
+        """
+        self.requires_grad = True
+        self._is_param = True
+
+    def is_param(self):
+        """
+        Check if the tensor is parameter
+        """
+        return self._is_param
+
     def renew(self):
         """
         Renew a new tensor with same name and shape,
@@ -383,22 +397,6 @@ class IRTensor:
             setattr(tensor, key, getattr(self, key))
         # clear attached cells
         tensor._cell = list()
-        return tensor
-
-    def __deepcopy__(self, memo):
-        """
-        Deep Copy will copy the exactly same tensor with same tensor id
-        """
-        tensor = IRTensor(self._shape, self.name)
-        for key in self.__dict__:
-            val = getattr(self, key)
-            if isinstance(val, IRTensor):
-                pass
-            if isinstance(val, list) and all([isinstance(v, IRTensor) for v in val]):
-                pass
-            else:
-                val = copy.copy(val)
-            setattr(tensor, key, val)
         return tensor
 
     def __eq__(self, tensor):
@@ -464,15 +462,10 @@ class IRTensor:
 
     def backward(self):
         """
-        Backward will generate a backward action scheduling pool
-
-        Construct a reverse graph of forward and seperate to actions
+        Autograd backward on the tensor
         """
-        if self.trace is None:
-            return
-        from cube.tschedule.pool import TSchedulePool
-        for fsu in self.trace[::-1]:
-            TSchedulePool().add_su(fsu.mirror)
+        from cube.schedule.translator import LogicTranslator
+        return LogicTranslator.backward(self)
 
     def __repr__(self):
         dscp = f'Tensor(id={self._id}, shape={self.shape}, device={self.device})'

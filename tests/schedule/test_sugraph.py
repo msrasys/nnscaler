@@ -116,3 +116,21 @@ def test_sugraph_merge():
     assert su1 not in sugraph.sus()
     assert su2 not in sugraph.sus()
     assert sugraph.happen_before(su12, su3)
+
+
+def test_sugraph_add_flow():
+
+    graph = construct_graph()
+    sus = [ScheduleUnit([node], SUType.Forward) for node in graph.nodes()]
+    
+    sugraph = SUGraph(sus)
+    su1, su2, su3 = sugraph.sus()
+
+    assert su1 not in su3.predecessors()
+    assert su3 not in su1.successors()
+
+    assert not sugraph.add_flow(su3, su1)
+
+    assert sugraph.add_flow(su1, su3)
+    assert su1 in su3.predecessors()
+    assert su3 in su1.successors()

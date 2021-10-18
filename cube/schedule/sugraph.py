@@ -177,14 +177,21 @@ class SUGraph(IRCell):
         self.reset_dependency()
         return merged_su
 
-    def add_flow(self, su1, su2):
+    def add_flow(self, su1: ScheduleUnit, su2: ScheduleUnit):
         """
         Add control flow dependency su1 -> su2
         """
         if not isinstance(su1, ScheduleUnit) or not isinstance(su2, ScheduleUnit):
             raise TypeError("Expected both SU1 and SU2 are ScheduleUnit")
-        su1.add_successors(-1, su2)
-        su2.add_predecessors(-1, su1)
+        if su1 not in self.sequence:
+            raise ValueError(f"su1 {su1} not in SUGraph")
+        if su2 not in self.sequence:
+            raise ValueError(f"su1 {su2} not in SUGraph")
+        if self.happen_before(su2, su1):
+            return False
+        su1.add_successor(-1, su2)
+        su2.add_predecessor(-1, su1)
+        return True
 
     def assign(self, su: ScheduleUnit, ranks: Union[int, List[int]]):
         """
