@@ -43,19 +43,19 @@ class SUGraph(IRCell):
         """
         # set node predecessors and successors
         for src_idx in range(self.nnodes):
-            src_cell = self.sequence[src_idx]
-            src_cell._successors = [
-                list() for _ in range(len(src_cell.outputs()))
+            src_su = self.sequence[src_idx]
+            src_su._successors = [
+                list() for _ in range(len(src_su.outputs()))
             ]
             for dst_su in self.sequence[src_idx+1:]:
                 dst_su._predecessors = [
                     list() for _ in range(len(dst_su.inputs()))
                 ]
-                for out_idx, out_tensor in enumerate(src_cell.outputs()):
+                for out_idx, out_tensor in enumerate(src_su.outputs()):
                     for in_idx, in_tensor in enumerate(dst_su.inputs()):
                         if out_tensor.overlap(in_tensor):
-                            src_cell.add_successor(out_idx, dst_su)
-                            dst_su.add_predecessor(in_idx, src_cell)
+                            src_su.add_successor(out_idx, dst_su)
+                            dst_su.add_predecessor(in_idx, src_su)
 
     def __len__(self):
         return len(self.sequence)
@@ -132,8 +132,12 @@ class SUGraph(IRCell):
         # 2) all the nodes in both SU are on the same device
         if su1 == su2 or su1.stype != su2.stype:
             return None
-        if set(su1.device) != set(su2.device):
+        if su1.device != su2.device:
             return None
+        
+        #TODO: GraphPass on remove redundant adapter also need TODO
+        if su1.stype == SUType.Adapter:
+            raise NotImplementedError("Not supported for merging Adapter")
 
         index_su1 = self.sequence.index(su1)
         index_su2 = self.sequence.index(su2)
@@ -148,19 +152,21 @@ class SUGraph(IRCell):
         # merge forward su
         sub_nodes = su1.nodes() + su2.nodes()
         merged_su = ScheduleUnit(sub_nodes, su1.stype)
+        merged_su.device = su1.device
 
         # merge mirrored su
         # mirror_su2 -> mirror_su1
         mirror_su1, mirror_su2 = su1.mirror, su2.mirror
-        if mirror_su1 is not None and mirror_su2 is not None:
-            sub_nodes = mirror_su2.nodes() + mirror_su1.nodes()
-            merged_mirror_su = ScheduleUnit(sub_nodes, mirror_su1.stype)
-            # set mirror
-            merged_su.set_mirror(merged_mirror_su)
-            merged_mirror_su.set_mirror(merged_su)
-        elif mirror_su1 is None and mirror_su2 is None:
-            merged_mirror_su = None
-        else:
+        merged_mirror_su = None
+        if mirror_su1 and mirror_su2:
+            if mirror_su1.device == mirror_su2.device:
+                sub_nodes = mirror_su2.nodes() + mirror_su1.nodes()
+                merged_mirror_su = ScheduleUnit(sub_nodes, mirror_su1.stype)
+                merged_mirror_su.device = mirror_su1.device
+                # set mirror
+                merged_su.set_mirror(merged_mirror_su)
+                merged_mirror_su.set_mirror(merged_su)
+        elif mirror_su1 or mirror_su2:
             raise RuntimeError(
                 "The merged su should be both have mirror or both not have."
             )
@@ -168,10 +174,11 @@ class SUGraph(IRCell):
         # replace
         self.sequence[index_su1] = merged_su
         self.sequence.remove(su2)
-        if mirror_su1 in self.sequence and mirror_su2 in self.sequence:
-            index_mirror_su2 = self.sequence.index(mirror_su2)
-            self.sequence[index_mirror_su2] = merged_mirror_su
-            self.sequence.remove(mirror_su1)
+        if merged_mirror_su:
+            if mirror_su1 in self.sequence and mirror_su2 in self.sequence:
+                index_mirror_su2 = self.sequence.index(mirror_su2)
+                self.sequence[index_mirror_su2] = merged_mirror_su
+                self.sequence.remove(mirror_su1)
 
         # TODO: optimize: reset dependency
         self.reset_dependency()
@@ -225,10 +232,9 @@ class SUGraph(IRCell):
             # TODO: adatper copy
             print('warning: Missing adapter copy!!')
             sus = [copy.copy(su) for _ in range(len(ranks)-1)]
-            sus = [self] + sus
-            for su in ranks:
+            for su in sus:
                 index = self.sus().index(su)
-                self.sequence.insert(su, index)
+                self.sequence.insert(index, su)
             self.reset_dependency()
             for su, rank in zip(sus, ranks):
                 self.assign(su, rank)

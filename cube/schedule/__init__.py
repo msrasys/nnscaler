@@ -4,6 +4,8 @@ import torch
 from cube.schedule.pool import SchedulePool
 from cube.schedule.translator import IRDataLoader, LogicTranslator
 from cube.schedule.sugraph import SUGraph
+from cube.schedule.graphpass import SUGraphPass
+
 from cube.codegen.codegen import SScheduleCodeGen, TScheduleCodeGen
 
 
@@ -113,6 +115,10 @@ def schedule(model: SemanticModel, dataloader, policy_fn: Optional[Callable] = N
                     raise RuntimeError(f"SU {su} device is not set")
             if not SUGraph.is_topo_order(su_graph.sus()):
                 raise RuntimeError(f"SUGraph order is not topological order")
+
+            # graph pass to remove redundant sus 
+            su_graph = SUGraphPass.remove_redundant_adapters(su_graph)
+            su_graph = SUGraphPass.merge_small_sus(su_graph)
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()
