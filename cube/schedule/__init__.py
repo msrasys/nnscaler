@@ -4,7 +4,7 @@ import torch
 from cube.schedule.pool import SchedulePool
 from cube.schedule.translator import IRDataLoader, LogicTranslator
 from cube.schedule.sugraph import SUGraph
-from cube.codegen.codegen import TScheduleCodeGen
+from cube.codegen.codegen import SScheduleCodeGen, TScheduleCodeGen
 
 
 class SemanticModel:
@@ -70,8 +70,13 @@ def schedule(model: SemanticModel, dataloader, policy_fn: Optional[Callable] = N
 
     ir_graph = model.get_graph()
     ir_dataloader = IRDataLoader(dataloader)
-    myrank = torch.distributed.get_rank()
 
+    if torch.distributed.is_initialized():
+        # multiple device
+        myrank = torch.distributed.get_rank()
+    else:
+        # single device
+        myrank = 0
 
     def _load_tschedule_fn(filename) -> Callable:
         import importlib.util
@@ -99,22 +104,36 @@ def schedule(model: SemanticModel, dataloader, policy_fn: Optional[Callable] = N
             # policy
             su_graph = SUGraph(sus_with_adapter)
             if policy_fn:
-                seq = policy_fn(su_graph)
+                # TODO: add resource
+                su_graph = policy_fn(su_graph, None)
+
+            # check assignment and order
+            for su in su_graph.sus():
+                if len(su.device) == 0:
+                    raise RuntimeError(f"SU {su} device is not set")
+            if not SUGraph.is_topo_order(su_graph.sus()):
+                raise RuntimeError(f"SUGraph order is not topological order")
+
+            if torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+            else:
+                world_size = 1
 
             # code generation
-            world_size = torch.distributed.get_world_size()
-            tgener = TScheduleCodeGen(seq)
+            tgener = TScheduleCodeGen(su_graph)
+            sgener = SScheduleCodeGen(su_graph)
             for rank in range(world_size):
                 fname = filename.format(rank)
                 # generate spatial module code
-                model.gen_module(seq, rank, fname, attach=False)
+                sgener.gen(rank, outfile=fname, attach=True)
                 # generate temporal schedule code
                 tgener.gen(
                     device = rank,
                     outfile = fname,
                     attach=True
                 )
-        torch.distributed.barrier()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         # load module
         model.load_module(filename.format(myrank))
         # load temporal
