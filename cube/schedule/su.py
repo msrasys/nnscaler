@@ -158,6 +158,23 @@ class ScheduleUnit(IRCell):
         else:
             raise TypeError("Expected index to be None or int")
 
+    def _clear_adapters(self):
+        """
+        Clear all adapters for this SU
+        """
+        self._send_in_adapters: List[List[ScheduleUnit]] = [
+            list() for _ in range(len(self.inputs()))
+        ]
+        self._recv_in_adapters: List[List[ScheduleUnit]] = [
+            list() for _ in range(len(self.inputs()))
+        ]
+        self._send_out_adapters: List[List[ScheduleUnit]] = [
+            list() for _ in range(len(self.outputs()))
+        ]
+        self._recv_out_adapters: List[List[ScheduleUnit]] = [
+            list() for _ in range(len(self.outputs()))
+        ]
+
     def _add_in_adapter(self, index: int, send_adapter, recv_adapter):
         """
         Add adapters to the input tensor of this SU

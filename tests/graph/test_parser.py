@@ -56,3 +56,5 @@ def test_parse_module():
     assert node3.successors() == [node4]
     assert node4.successors() == [node5]
     assert node5.successors() == [node6]
+
+    assert graph.outputs(0).shape == [1024, 1000]

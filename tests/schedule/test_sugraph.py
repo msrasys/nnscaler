@@ -7,7 +7,6 @@ from cube.schedule.su import SUType, ScheduleUnit
 from cube.schedule.sugraph import SUGraph
 
 
-
 def construct_graph():
 
     input = IRFullTensor(shape=[64,1024], name='data')
