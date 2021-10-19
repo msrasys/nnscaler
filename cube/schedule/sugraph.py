@@ -214,11 +214,16 @@ class SUGraph(IRCell):
         elif not all([isinstance(int, rank) for rank in ranks]):
             raise TypeError("Expected type ranks to be Union[int, List[int]]")
 
+        if su.stype == SUType.Adapter:
+            return False
+
         if set(su.device) == set(ranks):
-            return
+            return True
 
         if len(ranks) != 1:
             # copy su
+            # TODO: adatper copy
+            print('warning: Missing adapter copy!!')
             sus = [copy.copy(su) for _ in range(len(ranks)-1)]
             sus = [self] + sus
             for su in ranks:
@@ -249,16 +254,23 @@ class SUGraph(IRCell):
         return True
 
     def set_order(self, seq: List[ScheduleUnit]):
+        """
+        set a topological order for SUGraph, which requires seq:
+
+        1). The set of SUs in seq must be equal to set of SUGraph
+        2). Staisfies topological order
+
+        """
         if not all([isinstance(su, ScheduleUnit) for su in seq]):
             raise ValueError("Expected a list of SUs")
         if len(seq) != len(self.sequence):
-            raise ValueError("Expected seq length equal with Graph sus")
+            return False
         for su in seq:
             if su not in self.sequence:
-                raise ValueError(f"Found SU {su} in seq but not in graph")
+                return False
         # correctness check
         if not SUGraph.is_topo_order(seq, integrity_check=True):
-            raise ValueError("Cannot satisfy topological order")
+            return False
         self.sequence = seq
         return True
 

@@ -85,6 +85,7 @@ class ScheduleUnit(IRCell):
         Copy the SU. Note the mirror su is also copied
         """
         su = ScheduleUnit(self._nodes, self.stype, self.name)
+        #TODO: adapter copy
         if self.mirror is not None:
             mirror_su = self.mirror
             mirror_su = ScheduleUnit(
