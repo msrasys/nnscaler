@@ -11,7 +11,6 @@ from typing import Union, Tuple, List, Optional, Any
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.operator import IROperation
-from cube.graph.comm import IRCommunication
 
 import copy
 
@@ -113,23 +112,7 @@ class IRGraph(IRCell):
         nodes = list()
         for node in self.nodes():
 
-            if isinstance(node, IRCommunication):
-                send_tensors = [_renew(tensor) for tensor in node.inputs()]
-                send_ranks = node.send_ranks
-                recv_tensors = [_renew(tensor) for tensor in node.outputs()]
-                recv_ranks = node.recv_ranks
-                if reverse:
-                    send_tensors, recv_tensors = recv_tensors, send_tensors
-                    send_ranks, recv_ranks = recv_ranks, send_ranks
-
-                new_node = IRCommunication(
-                    send_tensors = send_tensors,
-                    send_ranks = send_ranks,
-                    recv_tensors = recv_tensors,
-                    recv_ranks = recv_ranks
-                )
-
-            elif isinstance(node, IROperation):
+            if isinstance(node, IROperation):
                 inputs = node.inputs()
                 outputs = node.outputs()
                 if reverse:

@@ -9,7 +9,7 @@ import torch
 
 from cube.ir.cten import IRCell, IRTensor
 from cube.graph.tensor import IRFullTensor
-from cube.graph.comm import IRCommunication
+from cube.schedule.adapter.comm import IRCommunication
 from cube.schedule.su import SUType, ScheduleUnit
 from cube.schedule.pool import SchedulePool
 from cube.schedule.sugraph import SUGraph

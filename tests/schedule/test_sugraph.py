@@ -1,10 +1,10 @@
 from cube.graph.tensor import IRFullTensor
-from cube.graph.comm import IRCommunication
 from cube.graph.operator import IROperation
 from cube.graph.graph import IRGraph
 
 from cube.schedule.su import SUType, ScheduleUnit
 from cube.schedule.sugraph import SUGraph
+from cube.schedule.adapter.comm import IRCommunication
 
 
 def construct_graph():
