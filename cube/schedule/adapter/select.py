@@ -43,7 +43,6 @@ class IRTensorReshape(IRCell):
             # select
             for tensor in dst_tensors:
                 indices = tensor.indices & src_tensor.indices
-                print(indices.get())
                 self._select_indices.append(indices)
         
         elif len(dst_tensors) == 1:
@@ -66,6 +65,10 @@ class IRTensorReshape(IRCell):
                     if self._merge_axis is not None:
                         raise NotImplementedError("Only support merge on one axis")
                     self._merge_axis = dim
+            if self._merge_axis is None:
+                # check the coverage
+                if src_tensors[0].indices != dst_tensor.indices:
+                    raise RuntimeError("Not cover all the indices to merge.")
             # get merge axis
             if self._merge_axis is not None:
                 dim_indices = indices[self._merge_axis]

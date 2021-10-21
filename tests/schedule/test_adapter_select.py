@@ -76,8 +76,13 @@ def test_adapter_select_is_identity():
     )
 
     reshape = IRTensorReshape(
-        dst_tensors=[tensor2],
-        src_tensors=[tensor4, tensor5]
+        src_tensors=[tensor2],
+        dst_tensors=[tensor4, tensor5]
     )
+    assert not reshape.is_identity()
 
+    reshape = IRTensorReshape(
+        src_tensors=[tensor3],
+        dst_tensors=[tensor4, tensor5]
+    )
     assert reshape.is_identity()
