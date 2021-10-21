@@ -112,7 +112,14 @@ class IRTensorReshape(IRCell):
         """
         Check if this transformation is a non-op
         """
-        if len(self.inputs()) == 1 and len(self.outputs()) == 1:
-            if self.inputs(0) == self.outputs(0):
+        if self.ttype == IRReshapeType.Select:
+            src_tensor = self.inputs(0)
+            for dst_tensor in self.outputs():
+                if dst_tensor != src_tensor:
+                    return False
+            return True
+        if self.ttype == IRReshapeType.Merge:
+            if self.merge_axis is None:
                 return True
+            return False
         return False
