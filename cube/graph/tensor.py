@@ -1,4 +1,4 @@
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Union, Tuple
 import copy
 
 from cube.ir.cten import IRTensor
@@ -19,6 +19,16 @@ class IndexMap:
                 "Only support for sliced index mapping"
             )
         self._indices = indices
+
+    def __eq__(self, other):
+        if isinstance(other, IndexMap):
+            if self.ndims != self.ndims:
+                return False
+            for myslicer, oslicer in zip(self.get(), other.get()):
+                if myslicer != oslicer:
+                    return False
+            return True
+        return False
 
     def get(self):
         """
@@ -224,7 +234,7 @@ class IRFullTensor(IRTensor):
         else:
             return self._val_ops[index]
 
-    def select(self, indices, val_op: Optional[Callable], shape: List[int]):
+    def select(self, indices: Union[Tuple, IndexMap], val_op: Optional[Callable], shape: List[int]):
         """
         Select a SubTensor from FullTensor.
 
@@ -242,11 +252,19 @@ class IRFullTensor(IRTensor):
         Returns:
             IRSubTensor
         """
-        sub_tensor = IRSubTensor(self, indices, val_op, shape)
-        self._segments.append(sub_tensor)
-        self._indices.append(IndexMap(indices))
-        self._val_ops.append(val_op)
-        return sub_tensor
+        if not isinstance(indices, IndexMap):
+            indices = IndexMap(indices)
+        if indices in self._indices:
+            index = self._indices.index(indices)
+            sub_tensor = self._segments[index]
+            if sub_tensor.val_op == val_op:
+                return sub_tensor
+        else:
+            sub_tensor = IRSubTensor(self, indices, val_op, shape)
+            self._segments.append(sub_tensor)
+            self._indices.append(indices)
+            self._val_ops.append(val_op)
+            return sub_tensor
 
     def overlap(self, other):
         """
@@ -278,6 +296,26 @@ class IRFullTensor(IRTensor):
         """
         return other if self.overlap(other) else None
 
+    def tosub(self):
+        """
+        Convert to SubTensor by selecting all indices
+        """
+        if self.shape is None:
+            raise RuntimeError("Expected know shape")
+        slicers = list()
+        for dim_len in self.shape:
+            slicers.append(slice(0, dim_len, 1))
+        sub_tensor = self.select(
+            indices=tuple(slicers),
+            val_op=None,
+            shape=self.shape
+        )
+        return sub_tensor
+
+    def __repr__(self):
+        dscp = f'FullTensor(id={self._id}, shape={self.shape}, device={self.device})'
+        return dscp
+
 
 class IRSubTensor(IRTensor):
 
@@ -290,16 +328,32 @@ class IRSubTensor(IRTensor):
             indices: index list
             val_op: the value operation to merge SubTensors into one
         """
+        if not isinstance(full_tensor, IRFullTensor):
+            raise TypeError(f"Expected IRFullTensor but got {full_tensor}")
         super().__init__(shape=shape, name=full_tensor.name)
 
         # the full tensor
         self._full_tensor = full_tensor
 
         # the index from full_tensor
-        self._index_map = IndexMap(indices)
+        if not isinstance(indices, IndexMap):
+            indices = IndexMap(indices)
+        self._index_map = indices
 
         # val merge op
         self.val_merge_op = val_op
+
+    def __eq__(self, other):
+
+        if isinstance(other, IRFullTensor):
+            return self.parent == other and self.shape == other.shape
+        if isinstance(other, IRSubTensor):
+            if self.parent != other.parent:
+                return False
+            if other.indices == self.indices and self.shape == other.shape:
+                return True
+            return False
+        return False
 
     @property
     def parent(self) -> IRFullTensor:
@@ -327,7 +381,7 @@ class IRSubTensor(IRTensor):
         Returns:
             tensor
         """
-        tensor = IRSubTensor(self._shape, self.name)
+        tensor = IRSubTensor(self.parent, self.indices, self.val_op, self._shape)
         for key in self.__dict__:
             setattr(tensor, key, getattr(self, key))
         # clear attached cells
@@ -342,7 +396,7 @@ class IRSubTensor(IRTensor):
         Returns:
             tensor
         """
-        tensor = IRSubTensor(self._shape, self.name)
+        tensor = IRSubTensor(self.parent, self.indices, self.val_op, self._shape)
         new_id = tensor._id
         for key in self.__dict__:
             setattr(tensor, key, getattr(self, key))
@@ -351,7 +405,7 @@ class IRSubTensor(IRTensor):
         tensor._id = new_id
         return tensor
 
-    def select(self, indices, val_op, shape=None):
+    def select(self, indices: Union[Tuple, IndexMap], val_op, shape=None):
         """
         Select an IRSubTensor
 
@@ -384,6 +438,8 @@ class IRSubTensor(IRTensor):
         if isinstance(other, IRFullTensor):
             return self.parent == other
         elif isinstance(other, IRSubTensor):
+            if self.parent != other.parent:
+                return False
             return self.indices.overlap(other.indices)
         else:
             raise TypeError("Customized IRTensor not support")
@@ -413,3 +469,7 @@ class IRSubTensor(IRTensor):
             else:
                 raise NotImplementedError("Customized IRTensor not support")
         return None
+
+    def __repr__(self):
+        dscp = f'SubTensor(id={self._id}, shape={self.shape}, device={self.device})'
+        return dscp

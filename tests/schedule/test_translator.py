@@ -5,7 +5,7 @@ from cube.schedule.translator import IRDataLoader
 from cube.schedule.su import SUType
 from cube.schedule.pool import SchedulePool
 
-from cube.graph.tensor import IRFullTensor
+from cube.graph.tensor import IRFullTensor, IRSubTensor
 from cube.graph.operator import IROperation
 from cube.graph.graph import IRGraph
 
@@ -84,7 +84,7 @@ def test_load_dataloader():
     dataloader = IRDataLoader(FakeDataLoader(batch_size=64))
 
     data1 = next(dataloader)
-    assert isinstance(data1, IRFullTensor)
+    assert isinstance(data1, IRSubTensor)
     assert data1.shape == [64, 1024]
 
     data2 = next(dataloader)
@@ -92,7 +92,7 @@ def test_load_dataloader():
     assert all([su.stype == SUType.Dataloader for su in SchedulePool().sus()])
 
     data3 = LogicTranslator.load_data(dataloader)
-    assert isinstance(data1, IRFullTensor)
+    assert isinstance(data1, IRSubTensor)
     assert data1.shape == [64, 1024]
     assert len(SchedulePool().sus()) == 3
     assert all([su.stype == SUType.Dataloader for su in SchedulePool().sus()])
@@ -103,10 +103,10 @@ def test_translator_forward():
 
     graph = construct_graph()
     print(graph)
-    data = IRFullTensor(shape=[64,1024], name='data')
+    data = IRFullTensor(shape=[64,1024], name='data').tosub()
     output = graph(data)
 
-    assert isinstance(output, IRFullTensor)
+    assert isinstance(output, IRSubTensor)
     assert output.shape == [64, 1024]
     assert output.trace is not None
 
@@ -122,7 +122,7 @@ def test_translator_backward():
     SchedulePool().clear()
 
     graph = construct_graph()
-    data = IRFullTensor(shape=[64,1024], name='data')
+    data = IRFullTensor(shape=[64,1024], name='data').tosub()
     output = graph(data)
 
     output.backward()
@@ -141,7 +141,7 @@ def test_translatro_gen_adapter():
     SchedulePool().clear()
 
     graph = construct_graph()
-    data = IRFullTensor(shape=[64,1024], name='data')
+    data = IRFullTensor(shape=[64,1024], name='data').tosub()
     output = graph(data)
 
     # forward adatpers

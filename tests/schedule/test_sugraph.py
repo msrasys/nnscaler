@@ -26,6 +26,7 @@ def construct_graph():
     linear1.set_input(0, input)
     linear1.set_input(1, weight1)
     linear1.set_input(2, bias1)
+    linear1.infer_shape()
 
     # linear2
     linear2 = IROperation(
@@ -36,6 +37,7 @@ def construct_graph():
     )
     linear2.set_input(0, linear1.outputs(0))
     linear2.set_input(1, weight2)
+    linear2.infer_shape()
 
     # linear3
     linear3 = IROperation(
@@ -47,6 +49,7 @@ def construct_graph():
     linear3.set_input(0, linear2.outputs(0))
     linear3.set_input(1, weight3)
     linear3.set_input(2, bias3)
+    linear3.infer_shape()
 
     graph = IRGraph(
         nodes=[linear1, linear2, linear3],

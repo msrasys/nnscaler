@@ -8,11 +8,11 @@ IRGraph:
 """
 
 from typing import Union, Tuple, List, Optional, Any
+import copy
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.operator import IROperation
-
-import copy
+from cube.graph.tensor import IRFullTensor
 
 
 __all__ = ['IRGraph']
@@ -32,6 +32,7 @@ class IRGraph(IRCell):
                  module_name: str):
         
         self._nodes: List[IROperation] = nodes
+        self._parameters = list()
         self.reset_dependency()
 
         if input_tensors is None:
@@ -46,13 +47,33 @@ class IRGraph(IRCell):
             output_length=len(output_tensors)
         )
 
-        for idx, tensor in enumerate(input_tensors):
+        # convert to SubTensor
+        inputs = list()
+        for tensor in input_tensors:
+            if isinstance(tensor, IRFullTensor):
+                tensor = tensor.tosub()
+            inputs.append(tensor)
+        outputs = list()
+        for tensor in output_tensors:
+            if isinstance(tensor, IRFullTensor):
+                tensor = tensor.tosub()
+            outputs.append(tensor)
+        for node in self.nodes():
+            for idx, tensor in enumerate(node.inputs()):
+                if isinstance(tensor, IRFullTensor):
+                    tensor = tensor.tosub()
+                    node.set_input(idx, tensor)
+            for idx, tensor in enumerate(node.outputs()):
+                if isinstance(tensor, IRFullTensor):
+                    tensor = tensor.tosub()
+                    node.set_output(idx, tensor)
+
+        for idx, tensor in enumerate(inputs):
             self.set_input(idx, tensor)
-        for idx, tensor in enumerate(output_tensors):
+        for idx, tensor in enumerate(outputs):
             self.set_output(idx, tensor)
 
         # set parameter
-        self._parameters = list()
         for node in self._nodes:
             for input in node.inputs():
                 if isinstance(input, IRTensor):
@@ -68,22 +89,23 @@ class IRGraph(IRCell):
         """
         # set node predecessors and successors
         for src_idx in range(len(self._nodes)):
-            src_cell = self._nodes[src_idx]
-            src_cell._successors = [
-                list() for _ in range(len(src_cell.outputs()))
+            src_node = self._nodes[src_idx]
+            src_node._successors = [
+                list() for _ in range(len(src_node.outputs()))
             ]
-            for dst_idx in range(src_idx + 1, len(self._nodes)):
-                dst_cell = self._nodes[dst_idx]
-                dst_cell._predecessors = [
-                    list() for _ in range(len(dst_cell.inputs()))
+            for dst_node in self._nodes[src_idx+1:]:
+                dst_node._predecessors = [
+                    list() for _ in range(len(dst_node.inputs()))
                 ]
-                for tensor in src_cell.outputs():
-                    if isinstance(tensor, IRTensor):
-                        if tensor in dst_cell.inputs():
-                            src_output_idx = src_cell.outputs().index(tensor)
-                            src_cell.add_successor(src_output_idx, dst_cell)
-                            dst_input_idx = dst_cell.inputs().index(tensor)
-                            dst_cell.add_predecessor(dst_input_idx, src_cell)
+                for out_idx, out_tensor in enumerate(src_node.outputs()):
+                    if not isinstance(out_tensor, IRTensor):
+                        continue
+                    for in_idx, in_tensor in enumerate(dst_node.inputs()):
+                        if not isinstance(in_tensor, IRTensor):
+                            continue
+                        if out_tensor.overlap(in_tensor):
+                            src_node.add_successor(out_idx, dst_node)
+                            dst_node.add_predecessor(in_idx, src_node)
 
     def parameters(self):
         """

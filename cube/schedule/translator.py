@@ -42,7 +42,7 @@ class LogicTranslator:
         outputs = list()
         for data in datas:
             if torch.is_tensor(data):
-                data = IRFullTensor(shape=list(data.shape), name='data')
+                data = IRFullTensor(shape=list(data.shape), name='data').tosub()
                 data.requires_grad = False
             outputs.append(data)
 
