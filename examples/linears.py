@@ -16,8 +16,8 @@ import torch
 from torch import nn
 
 import cube
-from cube.tschedule.su import ScheduleUnit
-from cube.tschedule.suseq import SUSequence
+from cube.schedule.su import ScheduleUnit
+from cube.schedule.sugraph import SUGraph
 
 
 def trans_policy(graph, resource):
@@ -25,13 +25,13 @@ def trans_policy(graph, resource):
     The transformation policy transposes linear using data parallel
     """
     ndevice = resource.ngpus
-    for node in graph.nodes():
-        algorithm = node.algorithms('data_parallel')
-        graph.select(node, algorithm, config=dict(chunk_size=ndevice))
+    for op in graph.nodes():
+        algorithm = op.algorithms('data_parallel')
+        graph.partition(op, algorithm, config=dict(chunk_size=ndevice))
     return graph
 
 
-def schedule_policy(seq: SUSequence, resource):
+def schedule_policy(seq: SUGraph, resource):
     """
     The schedule policy uses 1F1B (interleaved) pipeline
     """
@@ -71,10 +71,7 @@ def schedule_policy(seq: SUSequence, resource):
             if f_mirco_batch_id >= len(batch_seqs):
                 continue
             reorder.append(f(stage, f_mirco_batch_id))
-    
-    for idx, su in enumerate(reorder):
-        seq.move(su, idx)
-
+    SUGraph.set_order(reorder)
 
 
 
