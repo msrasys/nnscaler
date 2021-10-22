@@ -162,6 +162,10 @@ class IndexMap:
                 raise NotImplementedError(f"not supported for differnt steps")
         return IndexMap(tuple(slices))
 
+    def __repr__(self):
+        dscp = repr(self._indices)
+        return dscp
+
 
 class IRFullTensor(IRTensor):
 
