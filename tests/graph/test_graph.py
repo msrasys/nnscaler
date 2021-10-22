@@ -1,5 +1,5 @@
 from cube.graph.graph import IRGraph
-from cube.graph.tensor import IRFullTensor
+from cube.graph.tensor import IRFullTensor, IRSubTensor
 from cube.graph.operator import IROperation
 from cube.ir.cten import IRTensor
 
@@ -23,6 +23,7 @@ def construct_model():
     linear1.set_input(0, input)
     linear1.set_input(1, weight1)
     linear1.set_input(2, bias1)
+    linear1.infer_shape()
 
     # linear2
     linear2 = IROperation(
@@ -33,6 +34,7 @@ def construct_model():
     )
     linear2.set_input(0, linear1.outputs(0))
     linear2.set_input(1, weight2)
+    linear2.infer_shape()
 
     # linear3
     linear3 = IROperation(
@@ -44,6 +46,7 @@ def construct_model():
     linear3.set_input(0, linear2.outputs(0))
     linear3.set_input(1, weight3)
     linear3.set_input(2, bias3)
+    linear3.infer_shape()
 
     # return [input], [ops], [output]
     return [input], [linear1, linear2, linear3], [linear3.outputs(0)]
@@ -68,18 +71,20 @@ def test_graph_init():
 
     for input in all_inputs:
         if isinstance(input, IRTensor):
-            assert isinstance(input, IRFullTensor)
+            assert isinstance(input, IRSubTensor)
     for output in all_outputs:
         if isinstance(output, IRTensor):
-            assert isinstance(output, IRFullTensor)
+            assert isinstance(output, IRSubTensor)
 
     # check inputs
-    for input in inputs:
-        assert input in graph.inputs()
-        assert input in all_inputs
-    for output in outputs:
-        assert output in graph.outputs()
-        assert output in all_outputs
+    for full_input, sub_input in zip(inputs, graph.inputs()):
+        assert full_input.overlap(sub_input)
+        assert full_input.shape == sub_input.shape
+        assert sub_input in all_inputs
+    for full_output, sub_output in zip(outputs, graph.outputs()):
+        assert full_output.overlap(sub_output)
+        assert full_output.shape == sub_output.shape
+        assert sub_output in all_outputs
 
     # check dependency
     node1, node2, node3 = graph.nodes()
