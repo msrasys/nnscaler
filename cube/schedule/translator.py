@@ -5,11 +5,13 @@ The traning logic first translate the training logic into
 Schedule Units, and then add Adapter ScheduleUnit
 """
 from typing import List
+from numpy.lib.arraysetops import isin
 import torch
 
 from cube.ir.cten import IRCell, IRTensor
 from cube.graph.tensor import IRFullTensor
 from cube.schedule.adapter.comm import IRCommunication
+from cube.schedule.adapter.select import IRTensorReshape
 from cube.schedule.su import SUType, ScheduleUnit
 from cube.schedule.pool import SchedulePool
 from cube.schedule.sugraph import SUGraph
@@ -127,10 +129,13 @@ class LogicTranslator:
                 if not isinstance(input, IRTensor):
                     continue
                 pre_sus = su.predecessors(in_idx)
+                select_tensors = list()
                 for pre_su in pre_sus:
                     for out_idx, output in enumerate(pre_su.outputs()):
                         if output.overlap(input):
-                            sub_tensor = output.common(input)
+                            sub_tensor = input.common(output)
+                            if sub_tensor != input:
+                                select_tensors.append(sub_tensor)
                             send_op = IRCommunication(
                                 send_tensors=[sub_tensor],
                                 send_ranks = [-1]
@@ -144,7 +149,28 @@ class LogicTranslator:
                             recv_su = ScheduleUnit([recv_op], SUType.Adapter, name='recv')
                             su._add_in_adapter(in_idx, send_su, recv_su)
                             pre_su._add_out_adapter(out_idx, send_su, recv_su)
-
+                # TODO: add adapter for select
+                if len(select_tensors) != 0:
+                    select_op = IRTensorReshape(
+                        src_tensors=[input], dst_tensors=select_tensors
+                    )
+                    select_su = ScheduleUnit([select_op], SUType.Adapter, name='select')
+    
+            # TODO: add adapter for merge
+            for out_idx, output in enumerate(su.outputs()):
+                if not isinstance(output, IRTensor):
+                    continue
+                merge_tensors = list()
+                for send_adapters, recv_adapters in su.out_adapters(out_idx):
+                    for recv_adapter in recv_adapters:
+                        for tensor in recv_adapter.nodes(0).recv_tensors:
+                            if tensor != output:
+                                merge_tensors.append(tensor)
+                merge_op = IRTensorReshape(
+                    src_tensors=merge_tensors, dst_tensors=output
+                )
+                merge_su = ScheduleUnit([merge_op], SUType.Adapter, name='merge')
+    
         sus_with_adapter = list()
         for su in sus:
             for idx in range(len(su.inputs())):
