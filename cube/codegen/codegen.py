@@ -2,11 +2,11 @@
 Generate Pytorch code given the model DAG and the transformation config
 """
 from typing import List, Any
-from cube.graph.ir_comm import IRCommType, IRCommunication
 
-from cube.graph.ir_cten import IRTensor
-from cube.tschedule.suseq import SUSequence
-from cube.tschedule.su import ScheduleUnit, SUType
+from cube.ir.cten import IRTensor
+from cube.schedule.sugraph import SUGraph
+from cube.schedule.su import ScheduleUnit, SUType
+from cube.schedule.adapter.comm import IRCommType, IRCommunication
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
@@ -19,9 +19,9 @@ class SScheduleCodeGen:
     Generate spatial code for the model
     """
 
-    def __init__(self, seq: SUSequence):
-        if not isinstance(seq, SUSequence):
-            raise TypeError("seq should be SUSequence")
+    def __init__(self, seq: SUGraph):
+        if not isinstance(seq, SUGraph):
+            raise TypeError("seq should be SUGraph")
         self.seq = seq
         # model full code
         self.init_code: List[str] = [
@@ -70,7 +70,6 @@ class SScheduleCodeGen:
                 for out in node.outputs():
                     if isinstance(out, IRTensor) or isinstance(out, str):
                         self.symbols.create(self.naming(out))
-                print(self.forward_region)
             self.all_su_forward_region.append(self.forward_region)
             self.forward_region = list()
 
@@ -112,7 +111,8 @@ class SScheduleCodeGen:
         if isinstance(var, IRTensor):
             name = self.naming(var)
             # indicate this is a leaf tensor, should be parameter
-            if self.symbols.create(name):
+            if var.is_param():
+                self.symbols.create(name)
                 code = f'self.{name} = torch.nn.Parameter(torch.empty({tuple(var.shape)}))'
                 self.declare_region.append(code)
         elif isinstance(var, str):
@@ -164,6 +164,34 @@ class SScheduleCodeGen:
             raise TypeError(f"Unsupported IRCommmNode: {node.comm_type}")
         self.forward_region.append(code)
 
+    def emit_adapter_call(self, node, su: ScheduleUnit):
+        """
+        Emit in-device tensor transformation call.
+
+        Note the in-device transformation only happens on send
+        """
+        send_tensors, send_ranks = list(), list()
+        recv_tensors, recv_ranks = list(), list()
+        for node in su.nodes():
+            trans_tensors, trans_ranks = node.send_tensors, node.send_ranks
+            send_tensors = list()
+            send_ranks = list()
+            for trans_tensor, trans_rank in zip(trans_tensors, trans_ranks):
+                #TODO: tensor transformation
+                # cross-devie send
+                if su.device[0] != trans_rank:
+                    send_tensors.append(trans_tensor)
+                    send_ranks.append(trans_rank)
+            trans_tensors, trans_ranks = node.recv_tensors, node.recv_ranks
+            for trans_tensor, trans_rank in zip(trans_tensors, trans_ranks):
+                # cross-devie send
+                if su.device[0] != trans_rank:
+                    recv_tensors.append(trans_tensor)
+                    recv_ranks.append(trans_rank)
+        
+            
+
+
     def _forward_region_arg_names(self, tensors: List[Any], su: ScheduleUnit):
         """
         Generate arg name list for forward region.
@@ -173,8 +201,7 @@ class SScheduleCodeGen:
         named_args : List[str] = list()
         for tensor in tensors:
             name = self.naming(tensor)
-            if isinstance(tensor, IRTensor) and \
-               tensor.is_leaf(su.nodes()) and (tensor not in su.inputs()):
+            if isinstance(tensor, IRTensor) and tensor.is_param():
                 named_args.append('self.' + name)
             else:
                 named_args.append(self.naming(name))
@@ -183,8 +210,6 @@ class SScheduleCodeGen:
     def naming(self, tensor: Any) -> str:
         """
         Return the var name (unique for different variable)
-
-        If the var is a leaf tensor, will add prefix `self.` to its name
         """
         if isinstance(tensor, IRTensor):
             tensor_name = 'tensor' if tensor.name is None else tensor.name
@@ -211,9 +236,9 @@ class SScheduleCodeGen:
 
 class TScheduleCodeGen:
 
-    def __init__(self, seq: SUSequence):
-        if not isinstance(seq, SUSequence):
-            raise TypeError("seq should be SUSequence")
+    def __init__(self, seq: SUGraph):
+        if not isinstance(seq, SUGraph):
+            raise TypeError("seq should be SUGraph")
         self.seq = seq
         # model full code
         self.init_code: List[str] = [
