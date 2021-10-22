@@ -20,12 +20,13 @@ from cube.schedule.su import ScheduleUnit
 from cube.schedule.sugraph import SUGraph
 
 
-def trans_policy(graph, resource):
+def transform_policy(graph, resource):
     """
     The transformation policy transposes linear using data parallel
     """
     ndevice = resource.ngpus
     for op in graph.nodes():
+        # TODO: which dimension is batch
         algorithm = op.algorithms('data_parallel')
         graph.partition(op, algorithm, config=dict(chunk_size=ndevice))
     return graph
@@ -41,7 +42,7 @@ def schedule_policy(seq: SUGraph, resource):
     batch_seqs: List[List[ScheduleUnit]] = group_by_batches(seq.sus())
     num_fsus = len(seq.sus()) // len(batch_seqs) // 2
 
-    # assign devices -- intra device order
+    # device placement -- inter-device order
     for batch_seq in batch_seqs:
         for idx, su in enumerate(batch_seq):
             stage = idx // (num_fsus // ndevice)
@@ -50,8 +51,8 @@ def schedule_policy(seq: SUGraph, resource):
             else:
                 seq.assign(su, ndevice - stage % ndevice)
 
-    
-    # assign devices -- inter device order
+
+    # decide topo order -- intra-device order
     f = lambda stage, micro_batch_id: batch_seqs[micro_batch_id][stage]
     b = lambda stage, micro_batch_id: batch_seqs[micro_batch_id][-stage]
     
@@ -71,6 +72,7 @@ def schedule_policy(seq: SUGraph, resource):
             if f_mirco_batch_id >= len(batch_seqs):
                 continue
             reorder.append(f(stage, f_mirco_batch_id))
+    # inform system the topological order that could do pipeline parallelism
     SUGraph.set_order(reorder)
 
 
@@ -112,10 +114,12 @@ def train():
     dim = 1024
 
     model = MLP(dim=dim)
+    model = cube.schedule.transform(model, policy_fn=transform_policy)
     model = model.cuda()
 
     dataloader = FakeDataLoader((batch_size, dim))
 
+    @cube.schedule.schedule(model, dataloader, policy_fn=schedule_policy)
     def train_iter(model, dataloader):
         for _ in range(4):
             data = next(dataloader)

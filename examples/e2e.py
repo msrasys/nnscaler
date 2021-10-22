@@ -15,7 +15,7 @@ import torch
 from torch import nn
 
 import cube
-from cube.tschedule.su import SUType
+from cube.schedule.su import SUType
 
 
 def spolicy(ir_graph):

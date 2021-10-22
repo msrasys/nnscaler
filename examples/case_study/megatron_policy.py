@@ -1,142 +1,128 @@
 from typing import List
 
-# spatial
-def select(tensor, indices, val_op, shape): pass
-def assign(tensor, ranks: List): pass
-
-# temporal
-def merge(su1, su2): pass
+from cube.schedule.su import SUType
 
 
-def spolicy(model, runtime_info, tp_size, dp_size, pp_size):
+def transform_policy(graph, resource):
 
-    n_devices = runtime_info.ndevs
+    # suppose this is the policy config that both
+    # transformation and schedule policy know
+    tp_size = 8,
+    pp_size = 4,
+    dp_size = resource.ndev // (tp_size * pp_size)
+    num_micro_batch = 16
 
     # each op is divided in (mp_dsize, dp_size)
     # and put in (pp_size) stage
     # TODO groups[stage][dp_group][tp_group] = devices (List[int])
-    groups = parallel_group(n_devices, tp_size, dp_size, pp_size)
 
-    # pipeline stage
-    total_nodes = len(model.nodes())
-    num_op_per_stage = total_nodes // pp_size
-    for idx, op in enumerate(model.nodes()):
-        pp_stage = idx // num_op_per_stage
-        op.group = [pp_stage]
+    # data + pipeline parallelism: first transform graph
+    for idx, op in enumerate(graph.nodes()):
+        algorithm = op.algorithm('data_parallel')
+        graph.partition(
+            op, algorithm, config=dict(chunk_size=num_micro_batch * dp_size)
+        )
+        pp_stage = idx // (len(graph.nodes()) // pp_size)
+        op.tag('pp_stage', pp_stage)
 
     # data parallel
-    for op in model.nodes():
-        # data parallel algorithm (suppose at index 0)
-        dp_algo = op.logical_op.dist_algo(0)
-        sub_graph = select(
-            op = op, 
-            algorithm = dp_algo, 
-            config = dict(chunk_num=dp_size, uniform=True)
-        )
-        for dp_stage, dp_op in sub_graph.nodes():
-            dp_op.group.append(dp_stage)
-        model.replace(op, sub_graph)
+    for op in graph.nodes():
+        algorithm = op.algorithm('data_parallel')
+        graph.partition(op)
 
     # tensor parallel
     # a transformer attention layer: 
     #   [attention: col_split(mm + mm + mm) + row_split(mm)]
     # a transformer feedforward layer:
     #   [feedforwrd: col_split(mm) + row_split(mm)]
-    for idx in range(total_nodes):
-        for dp_rank in range(dp_size):
-            op = model.nodes(dp_size * idx + dp_rank)
-            devices = op.devices
-            sub_graph = None
-            # Attention block
-            # [1st linear -> 2nd linear)
-            if first_to_2nd_linear(op):
-                # split column
-                tp_col_algo = op.logical_op.dist_algo(1)
-                sub_graph = select(
-                    op = op,
-                    algorithm = tp_col_algo,
-                    config = dict(chunk_num=tp_size, uniform=True)
-                )
-            # 2nd linear
-            elif is_2nd_linear(op):
-                # split row
-                tp_row_algo = op.logical_op.dist_algo(2)
-                sub_graph = select(
-                    op = op,
-                    algorithm = tp_row_algo,
-                    config = dict(chunk_num=tp_size, uniform=True)
-                )
-            # MLP block
-            # [3rd linear -> 4th linear]
-            elif thrid_to_4th_linear(op):
-                # split column
-                tp_col_algo = op.logical_op.dist_algo(1)
-                sub_graph = select(
-                    op = op,
-                    algorithm = tp_col_algo,
-                    config = dict(chunk_num=tp_size, uniform=True)
-                )
-            elif is_4th_linear(op):
-                # split row
-                tp_row_algo = op.logical_op.dist_algo(2)
-                sub_graph = select(
-                    op = op,
-                    algorithm = tp_row_algo,
-                    config = dict(chunk_num=tp_size, uniform=True)
-                )
-            # else: no change, do redundant computation
-            if sub_graph:
-                for tp_stage, op in enumerate(sub_graph):
-                    op.group.append(tp_stage)
-                model.replace(op, sub_graph)
-    # device assignment
-    for op in model.nodes():
-        pp_stage, dp_stage, tp_stage = op.group
-        device = groups[pp_stage][dp_stage][tp_stage]
-        assign(op, device)
-    return model
+    for idx, op in enumerate(graph.nodes()):
+        # Attention block
+        # [1st linear -> 2nd linear)
+        if op_from_1st_to_2nd_linear(op):
+            # split column
+            tp_col_algo = op.logical_op.dist_algo(1)
+            graph.partition(
+                op = op,
+                algorithm = tp_col_algo,
+                config = dict(chunk_num=tp_size, uniform=True)
+            )
+        # 2nd linear
+        elif op_is_2nd_linear(op):
+            # split row
+            tp_row_algo = op.logical_op.dist_algo(2)
+            graph.partition(
+                op = op,
+                algorithm = tp_row_algo,
+                config = dict(chunk_num=tp_size, uniform=True)
+            )
+        # MLP block
+        # [3rd linear -> 4th linear]
+        elif op_from_3rd_to_4th_linear(op):
+            # split column
+            tp_col_algo = op.logical_op.dist_algo(1)
+            graph.partition(
+                op = op,
+                algorithm = tp_col_algo,
+                config = dict(chunk_num=tp_size, uniform=True)
+            )
+        elif op_is_4th_linear(op):
+            # split row
+            tp_row_algo = op.logical_op.dist_algo(2)
+            graph.partition(
+                op = op,
+                algorithm = tp_row_algo,
+                config = dict(chunk_num=tp_size, uniform=True)
+            )
+    return graph
 
 
-def tpolicy(sus, relations, tp_size, pp_size, num_microbatch):
-    """
-    Pipeline 1f1b policy description -- generate a sequence
+def schedule_policy(su_graph, resource):
 
-    Actions: a list of actions
+    # suppose this is the policy config that both
+    # transformation and schedule policy know
+    tp_size = 8,
+    pp_size = 4,
+    dp_size = resource.ndev // (tp_size * pp_size)
+    num_micro_batch = 16
 
-    relations: list[(Action1, Action2)]: a list of tuples indicate partial order
-    """
+    # given tp, pp, dp, num mirco batch, set the device id
+    # for hierachical: [pipeline][data][tensor] = device (int)
+    dev_groups = set_device_id(tp_size, dp_size, pp_size, num_micro_batch)
 
     # put sus to forward-backward sequences: List[List[SU(op)]]
-    fb_op_seqs = list()
-    for su in sus:
-        for fb_seq in fb_op_seqs:
-            if fb_seq[-1].happen_before(su):
-                fb_seq.append(su)
-                break
-        else:
-            fb_op_seqs.append([su])
-    
-    # merge to stages: List[List[SU(stage of ops)]]
-    fb_stage_seqs = list()
-    for fb_seq in fb_op_seqs:
-        merged_su = fb_seq[0]
-        merged_tag = fb_seq[0].tag
-        for su in fb_seq[1]:
-            if su.device == merged_su and su.tag == merged_tag:
-                merged_su = merge(merged_su, su)
+    fb_op_sus = list()
+    for su in su_graph.sus():
+        if su.stype == SUType.Forward or su.stype == SUType.Backward:
+            for fb_seq in fb_op_sus:
+                if fb_seq[-1].happen_before(su):
+                    fb_seq.append(su)
+                    break
             else:
-                fb_stage_seqs.append(merged_su)
-                merged_su = su
-                merged_tag = su.tag
-        merged_su = merge(merged_su, su)
-
-    # pp_size forward + pp_size backward
-    assert (pp_size * 2 == len(fb_stage_seqs[0]))
+                fb_op_sus.append([su])
+    
+    # merge to stages: List[List[SU(stage sequential of ops)]]
+    fb_stage_sus = list()
+    assert len(fb_op_sus) == tp_size * dp_size * num_micro_batch
+    for dp in range(dp_size):
+        for tp in range(tp_size):
+            fb_stage_sus.append([])
+            fb_sus = fb_op_sus[dp * dp_size + tp]
+            for idx, su in enumerate(fb_sus):
+                pp = idx // ( len(fb_sus) // pp_size)
+                device = dev_groups[pp][dp][tp]
+                su_graph.assign(su, device)
+            merged_su = None
+            for su in fb_sus:
+                if merged_su is None:
+                    merged_su = su
+                    fb_stage_sus[-1].append([su])
+                else:
+                    # same device op can be merged
+                    merged_su = su_graph.merge(merged_su, su)
 
     num_stage = pp_size
-
-    f = lambda stage, micro_batch_id: fb_stage_seqs[micro_batch_id][stage]
-    b = lambda stage, micro_batch_id: fb_stage_seqs[micro_batch_id][num_stage + stage]
+    f = lambda stage, micro_batch_id: fb_stage_sus[micro_batch_id][stage]
+    b = lambda stage, micro_batch_id: fb_stage_sus[micro_batch_id][num_stage + stage]
 
     sequence = list()
 
@@ -146,15 +132,17 @@ def tpolicy(sus, relations, tp_size, pp_size, num_microbatch):
             sequence.append(f(stage, mid))
     
     # steady + cooldown:
-    for mid in range(num_microbatch):
+    for mid in range(num_micro_batch):
         # enqueue backward
         for stage in range(num_stage-1, -1, -1):
             sequence.append(b(stage, mid))
         # enqueue forward
         for stage in range(num_stage):
             f_mid = mid + 1 + num_stage - stage
-            if f_mid >= num_microbatch:
+            if f_mid >= num_micro_batch:
                 continue
             sequence.append(f(stage, f_mid))
-    assert check_consistency(sequence, sus, relations)
-    return sequence
+
+    # infor system the control dependency by topological assignment
+    su_graph.set_order(sequence)
+    return su_graph
