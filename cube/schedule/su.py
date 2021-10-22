@@ -56,8 +56,9 @@ class ScheduleUnit(IRCell):
         for idx, output in enumerate(outputs):
             self.set_output(idx, output)
 
-        # each input is associated with
-        # send adapters and recv adapters (send + recv)
+        # each input is associated with a reshape (merge) adatpers and
+        # a couple of send adapters and recv adapters (send + recv)
+        self._merge_adapters: List[ScheduleUnit] = [None] * len(inputs)
         self._send_in_adapters: List[List[ScheduleUnit]] = [
             list() for _ in range(len(inputs))
         ]
@@ -65,8 +66,9 @@ class ScheduleUnit(IRCell):
             list() for _ in range(len(inputs))
         ]
 
-        # each output is associated with
-        # send adapters and recv adapters (send + recv)
+        # each input is associated with a reshape (select) adatpers and
+        # a couple of send adapters and recv adapters (send + recv)
+        self._select_adapters: List[ScheduleUnit] = [None] * len(outputs)
         self._send_out_adapters: List[List[ScheduleUnit]] = [
             list() for _ in range(len(outputs))
         ]
@@ -131,6 +133,25 @@ class ScheduleUnit(IRCell):
         else:
             raise TypeError("Expected index to be None or int")
 
+    def merge_adapters(self, index: Optional[int] = None) -> List:
+        """
+        Get select adapter for the input tensor at index
+
+        Returns:
+            Union[ScheduleUnit, List[ScheduleUnit]]
+        """
+        if isinstance(index, int):
+            if index >= len(self._inputs):
+                raise RuntimeError(
+                    f"Get index out of range ({index} >= {len(self._inputs)})"
+                )
+            select_adapter = self._merge_adapters[index]
+            return select_adapter
+        elif index is None:
+            return copy.copy(self._merge_adapters)
+        else:
+            raise TypeError("Expected index to be None or int")
+
     def out_adapters(self, index: Optional[int] = None) -> Tuple[List, List]:
         """
         Get adapter for the output tensor at index
@@ -155,6 +176,25 @@ class ScheduleUnit(IRCell):
             for adapters in self._recv_out_adapters:
                 all_recv_adapters += adapters
             return all_send_adapters, all_recv_adapters
+        else:
+            raise TypeError("Expected index to be None or int")
+
+    def select_adapters(self, index: Optional[int] = None) -> List:
+        """
+        Get select adapter for the input tensor at index
+
+        Returns:
+            Union[ScheduleUnit, List[ScheduleUnit]]
+        """
+        if isinstance(index, int):
+            if index >= len(self._outputs):
+                raise RuntimeError(
+                    f"Get index out of range ({index} >= {len(self._outputs)})"
+                )
+            select_adapter = self._select_adapters[index]
+            return select_adapter
+        elif index is None:
+            return copy.copy(self._select_adapters)
         else:
             raise TypeError("Expected index to be None or int")
 
@@ -193,6 +233,20 @@ class ScheduleUnit(IRCell):
         self._send_in_adapters[index].append(send_adapter)
         self._recv_in_adapters[index].append(recv_adapter)
 
+    def _set_merge_adapter(self, index: int, merge_adapter):
+        """
+        Set adapters to the input tensor of this SU
+
+        Args:
+            index (int): the input index
+            merge_adapter (ScheduleUnit)
+        """
+        if index >= len(self._inputs):
+            raise ValueError(f"index {index} out of range {len(self._inputs)}")
+        if not isinstance(merge_adapter, ScheduleUnit):
+            raise TypeError("Expected merge adapter to be ScheduleUnit")
+        self._merge_adapters[index] = merge_adapter
+
     def _add_out_adapter(self, index: int, send_adapter, recv_adapter):
         """
         Add adapters to the output tensor of this SU
@@ -210,6 +264,20 @@ class ScheduleUnit(IRCell):
             raise TypeError("Expected recv adapter to be ScheduleUnit")
         self._send_out_adapters[index].append(send_adapter)
         self._recv_out_adapters[index].append(recv_adapter)
+
+    def _set_select_adapter(self, index: int, select_adapter):
+        """
+        Set adapters to the output tensor of this SU
+
+        Args:
+            index (int): the output index
+            select_adapter (ScheduleUnit)
+        """
+        if index >= len(self._outputs):
+            raise ValueError(f"index {index} out of range {len(self._inputs)}")
+        if not isinstance(select_adapter, ScheduleUnit):
+            raise TypeError("Expected merge adapter to be ScheduleUnit")
+        self._select_adapters[index] = select_adapter
 
     def nodes(self, index: Optional[int] = None):
         """

@@ -5,7 +5,6 @@ The traning logic first translate the training logic into
 Schedule Units, and then add Adapter ScheduleUnit
 """
 from typing import List
-from numpy.lib.arraysetops import isin
 import torch
 
 from cube.ir.cten import IRCell, IRTensor
@@ -129,13 +128,13 @@ class LogicTranslator:
                 if not isinstance(input, IRTensor):
                     continue
                 pre_sus = su.predecessors(in_idx)
-                select_tensors = list()
+                tensor_segments = list()
                 for pre_su in pre_sus:
                     for out_idx, output in enumerate(pre_su.outputs()):
                         if output.overlap(input):
                             sub_tensor = input.common(output)
                             if sub_tensor != input:
-                                select_tensors.append(sub_tensor)
+                                tensor_segments.append(sub_tensor)
                             send_op = IRCommunication(
                                 send_tensors=[sub_tensor],
                                 send_ranks = [-1]
@@ -149,34 +148,49 @@ class LogicTranslator:
                             recv_su = ScheduleUnit([recv_op], SUType.Adapter, name='recv')
                             su._add_in_adapter(in_idx, send_su, recv_su)
                             pre_su._add_out_adapter(out_idx, send_su, recv_su)
-                # TODO: add adapter for select
-                if len(select_tensors) != 0:
-                    select_op = IRTensorReshape(
-                        src_tensors=[input], dst_tensors=select_tensors
+                # add adapter for merge
+                if len(tensor_segments) != 0:
+                    merge_op = IRTensorReshape(
+                        src_tensors=tensor_segments, dst_tensors=[input]
                     )
-                    select_su = ScheduleUnit([select_op], SUType.Adapter, name='select')
-    
-            # TODO: add adapter for merge
+                    merge_su = ScheduleUnit([merge_op], SUType.Adapter, name='merge')
+                    su._set_merge_adapter(in_idx, merge_su)
+
+            # add adapter for select
             for out_idx, output in enumerate(su.outputs()):
                 if not isinstance(output, IRTensor):
                     continue
-                merge_tensors = list()
-                for send_adapters, recv_adapters in su.out_adapters(out_idx):
-                    for recv_adapter in recv_adapters:
-                        for tensor in recv_adapter.nodes(0).recv_tensors:
-                            if tensor != output:
-                                merge_tensors.append(tensor)
-                merge_op = IRTensorReshape(
-                    src_tensors=merge_tensors, dst_tensors=output
-                )
-                merge_su = ScheduleUnit([merge_op], SUType.Adapter, name='merge')
+                select_tensors = list()
+                send_adapters, recv_adapters = su.out_adapters(out_idx)
+                for send_adapter in send_adapters:
+                    for tensor in send_adapter.nodes(0).send_tensors:
+                        if tensor != output:
+                            select_tensors.append(tensor)
+                if len(select_tensors) != 0:
+                    select_op = IRTensorReshape(
+                        src_tensors=[output], dst_tensors=select_tensors
+                    )
+                    select_su = ScheduleUnit(
+                        [select_op], SUType.Adapter, name='select'
+                    )
+                    su._set_select_adapter(out_idx, select_su)
     
         sus_with_adapter = list()
         for su in sus:
+            # send + recv + merge
             for idx in range(len(su.inputs())):
+                merge_su = su.merge_adapters(idx)
+                if merge_su:
+                    sus_with_adapter.append(merge_su)
                 send_adapters, recv_adapters = su.in_adapters(idx)
                 for send_su, recv_su in zip(send_adapters, recv_adapters):
                     sus_with_adapter.append(send_su)
                     sus_with_adapter.append(recv_su)
+            # excute
             sus_with_adapter.append(su)
+            # select
+            for idx in range(len(su.outputs())):
+                select_su = su.select_adapters(idx)
+                if select_su:
+                    sus_with_adapter.append(select_su)
         return sus_with_adapter

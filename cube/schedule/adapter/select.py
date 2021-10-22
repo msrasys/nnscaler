@@ -63,6 +63,8 @@ class IRTensorReshape(IRCell):
             for dim, dim_indices in enumerate(indices):
                 if len(dim_indices) != 1:
                     if self._merge_axis is not None:
+                        print("src: ", src_tensors)
+                        print("dst: ", dst_tensors)
                         raise NotImplementedError("Only support merge on one axis")
                     self._merge_axis = dim
             if self._merge_axis is None:
