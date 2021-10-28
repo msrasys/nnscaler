@@ -117,19 +117,32 @@ class IRGraph(IRCell):
         """
         Copy the graph but re-new the intermediate tensor
         """
-        new_tensors = dict()  # old graph tensor._id -> new tensor
+        # old graph tensor.parent._id -> new full tensor
+        new_full_tensors = dict()
 
         def _renew(val: Any):
             if not isinstance(val, IRTensor):
                 return val
+            elif isinstance(val, IRFullTensor):
+                raise RuntimeError("Found Full Tensor")
             # parameters
-            if val.is_param():
+            if not reverse and val.is_param():
                 return val
             # intermediate data
-            if val._id not in new_tensors:
-                tensor = val.renew()
-                new_tensors[val._id] = tensor
-            return new_tensors[val._id]
+            if val.parent._id not in new_full_tensors:
+                full_tensor = val.parent.renew()
+                new_full_tensors[val.parent._id] = full_tensor
+            else:
+                full_tensor = new_full_tensors[val.parent._id]
+            new_val = full_tensor.select(
+                indices=val.indices,
+                val_op=val.val_op,
+                shape=val.shape
+            )
+            if reverse and val.is_param():
+                #TODO: something strange here: id not change
+                new_val.name = 'grad_' + new_val.name
+            return new_val
 
         nodes = list()
         for node in self.nodes():

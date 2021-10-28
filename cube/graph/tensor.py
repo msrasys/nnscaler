@@ -25,7 +25,11 @@ class IndexMap:
             if self.ndims != self.ndims:
                 return False
             for myslicer, oslicer in zip(self.get(), other.get()):
-                if myslicer != oslicer:
+                mstart, mstop = myslicer.start, myslicer.stop
+                mstep = myslicer.step if myslicer.stop is not None else 1
+                ostart, ostop = oslicer.start, oslicer.stop
+                ostep = oslicer.step if oslicer.step is not None else 1
+                if mstart != ostart or mstop != ostop or mstep != ostep:
                     return False
             return True
         return False
@@ -262,13 +266,13 @@ class IRFullTensor(IRTensor):
             index = self._indices.index(indices)
             sub_tensor = self._segments[index]
             if sub_tensor.val_op == val_op:
+                print('here')
                 return sub_tensor
-        else:
-            sub_tensor = IRSubTensor(self, indices, val_op, shape)
-            self._segments.append(sub_tensor)
-            self._indices.append(indices)
-            self._val_ops.append(val_op)
-            return sub_tensor
+        sub_tensor = IRSubTensor(self, indices, val_op, shape)
+        self._segments.append(sub_tensor)
+        self._indices.append(indices)
+        self._val_ops.append(val_op)
+        return sub_tensor
 
     def overlap(self, other):
         """
@@ -390,23 +394,6 @@ class IRSubTensor(IRTensor):
             setattr(tensor, key, getattr(self, key))
         # clear attached cells
         tensor._cell = list()
-        return tensor
-
-    def renew(self):
-        """
-        Renew a new tensor with same name and shape,
-        but with a different new id
-
-        Returns:
-            tensor
-        """
-        tensor = IRSubTensor(self.parent, self.indices, self.val_op, self._shape)
-        new_id = tensor._id
-        for key in self.__dict__:
-            setattr(tensor, key, getattr(self, key))
-        # clear attached cells
-        tensor._cell = list()
-        tensor._id = new_id
         return tensor
 
     def select(self, indices: Union[Tuple, IndexMap], val_op, shape=None):
