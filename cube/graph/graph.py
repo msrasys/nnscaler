@@ -125,23 +125,21 @@ class IRGraph(IRCell):
                 return val
             elif isinstance(val, IRFullTensor):
                 raise RuntimeError("Found Full Tensor")
-            # parameters
-            if not reverse and val.is_param():
+            # parameters in forward
+            if (not reverse) and val.is_param():
                 return val
-            # intermediate data
+            # intermediate / gradient data
             if val.parent._id not in new_full_tensors:
-                full_tensor = val.parent.renew()
-                new_full_tensors[val.parent._id] = full_tensor
-            else:
-                full_tensor = new_full_tensors[val.parent._id]
+                new_full_tensors[val.parent._id] = val.parent.like()
+            full_tensor = new_full_tensors[val.parent._id]
             new_val = full_tensor.select(
                 indices=val.indices,
                 val_op=val.val_op,
                 shape=val.shape
             )
             if reverse and val.is_param():
-                #TODO: something strange here: id not change
                 new_val.name = 'grad_' + new_val.name
+                assert new_val.is_param()
             return new_val
 
         nodes = list()

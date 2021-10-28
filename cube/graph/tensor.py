@@ -198,21 +198,26 @@ class IRFullTensor(IRTensor):
         tensor._cell = list()
         return tensor
 
-    def renew(self):
+    def as_param(self):
         """
-        Renew a new tensor with same name and shape,
+        Set the tensor as trainable parameter
+        """
+        self.requires_grad = True
+        self._is_param = True
+        for sub_tensor in self._segments:
+            sub_tensor.as_param()
+
+    def like(self):
+        """
+        Create a new tensor with same name and shape,
         but with a different new id
 
         Returns:
             tensor
         """
         tensor = IRFullTensor(self._shape, self.name)
-        new_id = tensor._id
-        for key in self.__dict__:
-            setattr(tensor, key, getattr(self, key))
-        # clear attached cells
-        tensor._cell = list()
-        tensor._id = new_id
+        for attr in IRFullTensor._attr:
+            setattr(tensor, attr, getattr(self, attr))
         return tensor
 
     def segments(self, index: Optional[int] = None):
@@ -266,9 +271,12 @@ class IRFullTensor(IRTensor):
             index = self._indices.index(indices)
             sub_tensor = self._segments[index]
             if sub_tensor.val_op == val_op:
-                print('here')
                 return sub_tensor
+
         sub_tensor = IRSubTensor(self, indices, val_op, shape)
+        for attr in IRFullTensor._attr:
+            setattr(sub_tensor, attr, getattr(self, attr))
+
         self._segments.append(sub_tensor)
         self._indices.append(indices)
         self._val_ops.append(val_op)
@@ -395,6 +403,15 @@ class IRSubTensor(IRTensor):
         # clear attached cells
         tensor._cell = list()
         return tensor
+
+    def as_param(self):
+        """
+        Set the tensor as trainable parameter
+        """
+        if not self.parent.is_param():
+            self.parent.as_param()
+        self.requires_grad = True
+        self._is_param = True
 
     def select(self, indices: Union[Tuple, IndexMap], val_op, shape=None):
         """

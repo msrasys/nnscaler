@@ -312,6 +312,9 @@ class IRTensor:
     """
     IRTensor serves as IRGraph edge
     """
+
+    _attr = ['name', '_is_param', 'requires_grad']
+
     def __init__(self, shape=None, name=None):
 
         self._id: int = IDGenerator().gen_tensor_id()
