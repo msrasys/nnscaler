@@ -1,5 +1,7 @@
+import enum
 from typing import List, Optional, Union
 import copy
+from cube import schedule
 
 from cube.ir.cten import IRCell
 from cube.schedule.su import SUType, ScheduleUnit
@@ -98,7 +100,7 @@ class SUGraph(IRCell):
 
     def merge(self, su1: ScheduleUnit, su2: ScheduleUnit) -> ScheduleUnit:
         """
-        Merge two ScheduleUnit. This requires
+        Merge two ScheduleUnit as well as their adapters. This requires
         
         1). all the nodes in one SU happens before / after
         all the nodes in another SU. (Guaranteed by default
@@ -121,6 +123,62 @@ class SUGraph(IRCell):
             if fail: None
         """
 
+        def _adapter_merge(first_su: ScheduleUnit, second_su: ScheduleUnit, merged_su: ScheduleUnit):
+            # move from first_su adapter
+            # print(f' 1st SU: {first_su} \n 2nd SU: {second_su} \n merged SU: {merged_su}')
+            for idx, input in enumerate(first_su.inputs()):
+                send_adapters, recv_adapters = first_su.in_adapters(idx)
+                merge_adapter = first_su.merge_adapters(idx)
+                merge_idx = merged_su.inputs().index(input)
+                for send_adapter, recv_adapter in zip(send_adapters, recv_adapters):
+                    merged_su._add_in_adapter(merge_idx, send_adapter, recv_adapter)
+                if merge_adapter in self.sequence:
+                    merged_su._set_merge_adapter(merge_idx, merge_adapter)
+            for idx, output in enumerate(first_su.outputs()):
+                send_adapters, recv_adapters = first_su.out_adapters(idx)
+                select_adapter = first_su.select_adapters(idx)
+                if output in merged_su.outputs() and output not in second_su.outputs():
+                    merge_idx = merged_su.outputs().index(output)
+                    for send_adapter, recv_adapter in zip(send_adapters, recv_adapters):
+                        merged_su._add_out_adapter(merge_idx, send_adapter, recv_adapter)
+                    if select_adapter:
+                        merged_su._set_select_adapter(merge_idx, select_adapter)
+                else:
+                    if merge_adapter in self.sequence:
+                        self.sequence.remove(merge_adapter)
+            # move from su2 adapter
+            for idx, input in enumerate(second_su.inputs()):
+                send_adapters, recv_adapters = second_su.in_adapters(idx)
+                merge_adapter = second_su.merge_adapters(idx)
+                if input in merged_su.inputs() and input not in first_su.inputs():
+                    merge_idx = merged_su.inputs().index(input)
+                    for send_adapter, recv_adapter in zip(send_adapters, recv_adapters):
+                        merged_su._add_in_adapter(merge_idx, send_adapter, recv_adapter)
+                    if merge_adapter:
+                        merged_su._set_merge_adapter(merge_idx, merge_adapter)
+                else:
+                    for send_adapter, recv_adapter in zip(send_adapters, recv_adapters):
+                        # print(f'removing: {send_adapter}')
+                        # print(f'removing: {recv_adapter}')
+                        if send_adapter in self.sequence:
+                            self.sequence.remove(send_adapter)
+                        if recv_adapter in self.sequence:
+                            self.sequence.remove(recv_adapter)
+                    if merge_adapter in self.sequence:
+                        self.sequence.remove(merge_adapter)
+            for idx, output in enumerate(second_su.outputs()):
+                send_adapters, recv_adapters = second_su.out_adapters(idx)
+                select_adapter = second_su.select_adapters(idx)
+                if output in merged_su.outputs():
+                    merge_idx = merged_su.outputs().index(output)
+                    for send_adapter, recv_adapter in zip(send_adapters, recv_adapters):
+                        merged_su._add_out_adapter(merge_idx, send_adapter, recv_adapter)
+                    if select_adapter:
+                        merged_su._set_select_adapter(merge_idx, select_adapter)
+                else:
+                    if select_adapter:
+                        self.sequence.remove(select_adapter)
+
         if not isinstance(su1, ScheduleUnit) or \
            not isinstance(su2, ScheduleUnit):
             raise TypeError("Expected SU1 and SU2 are ScheduleUnit")
@@ -134,8 +192,7 @@ class SUGraph(IRCell):
             return None
         if su1.device != su2.device:
             return None
-        
-        #TODO: GraphPass on remove redundant adapter also need TODO
+
         if su1.stype == SUType.Adapter:
             raise NotImplementedError("Not supported for merging Adapter")
 
@@ -146,13 +203,19 @@ class SUGraph(IRCell):
         index_su1, index_su2 = min(index_su1, index_su2), max(index_su1, index_su2)
         inter_sus = self.sequence[index_su1+1:index_su2]
         for su in inter_sus:
-            if self.happen_before(su1, su) and self.happen_before(su, su2):
+            # in theory the below condition satisfies merge, but it may
+            # break the topo order
+            # e.g., su1 -> adapter1 ,....., adapter2 -> su2
+            # if self.happen_before(su1, su) and self.happen_before(su, su2):
+            # to keep topo order:
+            if self.happen_before(su, su2):
                 return None
 
         # merge forward su
         sub_nodes = su1.nodes() + su2.nodes()
         merged_su = ScheduleUnit(sub_nodes, su1.stype)
         merged_su.device = su1.device
+        _adapter_merge(su1, su2, merged_su)
 
         # merge mirrored su
         # mirror_su2 -> mirror_su1
@@ -163,6 +226,7 @@ class SUGraph(IRCell):
                 sub_nodes = mirror_su2.nodes() + mirror_su1.nodes()
                 merged_mirror_su = ScheduleUnit(sub_nodes, mirror_su1.stype)
                 merged_mirror_su.device = mirror_su1.device
+                _adapter_merge(mirror_su2, mirror_su1, merged_mirror_su)
                 # set mirror
                 merged_su.set_mirror(merged_mirror_su)
                 merged_mirror_su.set_mirror(merged_su)
@@ -204,8 +268,7 @@ class SUGraph(IRCell):
         """
         Assign SU to devices.
 
-        The assignment will automatically trigger the generation of
-        Adapter SU.
+        The assignment will automatically set device of its Adapter SU.
 
         1) if ranks has multiple int, then the su is copied as the same
            SU will be happened redundantly on multiple devices.
@@ -245,18 +308,24 @@ class SUGraph(IRCell):
         # set adapter device for the input
         for idx in range(len(su.inputs())):
             send_adapters, recv_adapters = su.in_adapters(idx)
+            merge_adapter = su.merge_adapters(idx)
             for send_adapter in send_adapters:
                 send_adapter.nodes(0).send_ranks = [ranks[0],]
             for recv_adapter in recv_adapters:
                 recv_adapter.device = ranks
+            if merge_adapter is not None:
+                merge_adapter.device = ranks
 
         # set adapter device for the output
         for idx in range(len(su.outputs())):
             send_adapters, recv_adapters = su.out_adapters(idx)
+            select_adapter = su.select_adapters(idx)
             for send_adapter in send_adapters:
                 send_adapter.device = ranks
             for recv_adapter in recv_adapters:
                 recv_adapter.nodes(0).recv_ranks = [ranks[0],]
+            if select_adapter is not None:
+                select_adapter.device = ranks
         return True
 
     def set_order(self, seq: List[ScheduleUnit]):

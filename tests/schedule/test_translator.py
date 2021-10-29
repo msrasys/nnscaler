@@ -137,7 +137,7 @@ def test_translator_backward():
         assert bsu.stype == SUType.Backward
 
 
-def test_translatro_gen_adapter():
+def test_translator_gen_adapter():
     SchedulePool().clear()
 
     graph = construct_graph()

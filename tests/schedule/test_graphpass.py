@@ -98,23 +98,23 @@ def test_merge_small_sus():
 
     # forward adatpers
     sus = SchedulePool().sus()
+    sus = LogicTranslator.gen_adapter(sus)
 
     sugraph = SUGraph(sus)
 
     for su in sugraph.sus():
-        sugraph.assign(su, 0)
+        if su.stype != SUType.Adapter:
+            sugraph.assign(su, 0)
 
     print('orignal:')
-    for su in sugraph.sus():
-        print(su)
+    print(sugraph)
 
     sugraph = SUGraphPass.merge_small_sus(sugraph)
 
-    print('changed:')
-    for su in sugraph.sus():
-        print(su)
+    print('merged:')
+    print(sugraph)
 
-    assert len(sugraph.sus()) == 2
+    assert len(sugraph.sus()) == 4
     assert sugraph.sus(0).stype == SUType.Forward
-    assert sugraph.sus(1).stype == SUType.Backward
-    assert sugraph.sus(0).mirror == sugraph.sus(1)
+    assert sugraph.sus(3).stype == SUType.Backward
+    assert sugraph.sus(0).mirror == sugraph.sus(3)

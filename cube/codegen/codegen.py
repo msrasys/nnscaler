@@ -2,30 +2,33 @@
 Generate Pytorch code given the model DAG and the transformation config
 """
 from typing import List, Any
+import torch
+import copy
 
 from cube.ir.cten import IRTensor
 from cube.schedule.sugraph import SUGraph
 from cube.schedule.su import ScheduleUnit, SUType
 from cube.schedule.adapter.comm import IRCommType, IRCommunication
+from cube.schedule.adapter.select import IRTensorReshape, IRReshapeType
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
-import torch
-import copy
 
-
-class SScheduleCodeGen:
+class ModelCodeGen:
     """
     Generate spatial code for the model
     """
 
-    def __init__(self, seq: SUGraph):
-        if not isinstance(seq, SUGraph):
-            raise TypeError("seq should be SUGraph")
-        self.seq = seq
+    def __init__(self, sugraph: SUGraph):
+        if not isinstance(sugraph, SUGraph):
+            raise TypeError("sugraph should be SUGraph")
+        for su in sugraph.sus():
+            if len(su.device) == 0:
+                raise RuntimeError(f"SU: {su} is not assigned to device")
+        self.seq = sugraph
         # model full code
         self.init_code: List[str] = [
-            '\n\n########## Generated Code ###########',
+            '\n\n########## Generated Model Code ###########',
             'import torch', 'import cube', '', '']
         # module init code
         self.declare_region: List[str] = list()
@@ -59,10 +62,12 @@ class SScheduleCodeGen:
         # parse graph body
         for su in device_sus:
             for node in su.nodes():
+                if isinstance(node, IRTensorReshape):
+                    self.emit_reshape_call(node)
                 if isinstance(node, IRCommunication):
-                    self.emit_comm_call(node, su)
+                    self.emit_comm_call(node)
                 else:
-                    self.emit_op_call(node, su)
+                    self.emit_op_call(node)
                 # emit input declaration
                 for arg in node.inputs():
                     self.emit_var_declare(arg)
@@ -86,7 +91,7 @@ class SScheduleCodeGen:
                 with FunctionBlock(func_name=name, args=input_args) as fb:
                     fb.insert_body(forward_code)
                     # generate output
-                    out_names = self._forward_region_arg_names(su.outputs(), su)
+                    out_names = self._forward_region_arg_names(su.outputs())
                     return_code = f"return {', '.join(out_names)}"
                     fb.insert_body(return_code)
                 cb.insert_body('')
@@ -111,8 +116,7 @@ class SScheduleCodeGen:
         if isinstance(var, IRTensor):
             name = self.naming(var)
             # indicate this is a leaf tensor, should be parameter
-            if var.is_param():
-                self.symbols.create(name)
+            if var.is_param()and self.symbols.create(name):
                 code = f'self.{name} = torch.nn.Parameter(torch.empty({tuple(var.shape)}))'
                 self.declare_region.append(code)
         elif isinstance(var, str):
@@ -125,74 +129,68 @@ class SScheduleCodeGen:
                         self.declare_region.append(code)
         return
 
-    def emit_op_call(self, node, su: ScheduleUnit):
+    def emit_op_call(self, node):
         """
         Emit op forward code
         """
         op_code = node.signature
-        arg_names = self._forward_region_arg_names(node.inputs(), su)
+        arg_names = self._forward_region_arg_names(node.inputs())
         arg_region = '(' + ', '.join(arg_names) + ')'
         if len(node.outputs()) == 0:
             code = f'{op_code}{arg_region}'
         else:
-            out_names = self._forward_region_arg_names(node.outputs(), su)
+            out_names = self._forward_region_arg_names(node.outputs())
             out_names = ', '.join(out_names)
             code = f'{out_names} = {op_code}{arg_region}'
         self.forward_region.append(code)
 
-    def emit_comm_call(self, node, su: ScheduleUnit):
+    def emit_comm_call(self, node):
         """
         Emit communication code
         """
         comm_code = node.signature
-        send_tensors = self._forward_region_arg_names(node.inputs(), su)
+        send_tensors = self._forward_region_arg_names(node.inputs())
+        send_tensors = '(' + ', '.join(send_tensors + ['']) + ')'
         send_ranks = node.send_ranks
-        recv_tensors = self._forward_region_arg_names(node.outputs(), su)
+        recv_tensors = self._forward_region_arg_names(node.outputs())
+        recv_tensors = ', '.join(recv_tensors)
         recv_shapes = [tensor.shape for tensor in node.outputs()]
         recv_ranks = node.recv_ranks
         if node.comm_type == IRCommType.Send:
-            send_tensors = '(' + ', '.join(send_tensors + ['']) + ')'
             code = f'{comm_code}({send_tensors}, {send_ranks})'
         elif node.comm_type == IRCommType.Recv:
-            recv_tensors = ', '.join(recv_tensors)
             code = f'{recv_tensors} = {comm_code}({recv_shapes}, {recv_ranks})'
         elif node.comm_type == IRCommType.SendRecv:
-            send_tensors = '(' + ', '.join(send_tensors + ['']) + ')'
-            recv_tensors = ', '.join(recv_tensors)
             code = f'{recv_tensors} = {comm_code}({send_tensors}, {send_ranks}, {recv_shapes}, {recv_ranks})'
         else:
             raise TypeError(f"Unsupported IRCommmNode: {node.comm_type}")
         self.forward_region.append(code)
 
-    def emit_adapter_call(self, node, su: ScheduleUnit):
+    def emit_reshape_call(self, node):
         """
-        Emit in-device tensor transformation call.
-
-        Note the in-device transformation only happens on send
+        Emit in-device tensor select / merge call.
         """
-        send_tensors, send_ranks = list(), list()
-        recv_tensors, recv_ranks = list(), list()
-        for node in su.nodes():
-            trans_tensors, trans_ranks = node.send_tensors, node.send_ranks
-            send_tensors = list()
-            send_ranks = list()
-            for trans_tensor, trans_rank in zip(trans_tensors, trans_ranks):
-                #TODO: tensor transformation
-                # cross-devie send
-                if su.device[0] != trans_rank:
-                    send_tensors.append(trans_tensor)
-                    send_ranks.append(trans_rank)
-            trans_tensors, trans_ranks = node.recv_tensors, node.recv_ranks
-            for trans_tensor, trans_rank in zip(trans_tensors, trans_ranks):
-                # cross-devie send
-                if su.device[0] != trans_rank:
-                    recv_tensors.append(trans_tensor)
-                    recv_ranks.append(trans_rank)
-        
-            
+        src_tensors = self._forward_region_arg_names(node.inputs())
+        dst_tensors = self._forward_region_arg_names(node.outputs())
+        # emit select
+        if node.ttype == IRReshapeType.Select:
+            src_tensor = src_tensors[0]
+            #TODO: relative indices
+            indices = node.select_indices
+            indices = [slicer.get() for slicer in indices]
+            dst_tensors = ', '.join(dst_tensors)
+            code = f'{dst_tensors} = {node.signature}({src_tensor}, {indices})'
+            self.forward_region.append(code)
+        elif node.ttype == IRReshapeType.Merge:
+            axis = node.merge_axis
+            src_tensor = '(' + ', '.join(src_tensors + ['']) + ')'
+            dst_tensor = dst_tensors[0]
+            code = f'{dst_tensor} = {node.signature}({src_tensor}, {axis})'
+            self.forward_region.append(code)
+        else:
+            raise TypeError(f"Unknown Reshape Type: {node.ttype}")
 
-
-    def _forward_region_arg_names(self, tensors: List[Any], su: ScheduleUnit):
+    def _forward_region_arg_names(self, tensors: List[Any]):
         """
         Generate arg name list for forward region.
 
@@ -233,8 +231,7 @@ class SScheduleCodeGen:
         self.symbols = SymbolTable()
 
 
-
-class TScheduleCodeGen:
+class ScheduleCodeGen:
 
     def __init__(self, seq: SUGraph):
         if not isinstance(seq, SUGraph):
@@ -242,7 +239,7 @@ class TScheduleCodeGen:
         self.seq = seq
         # model full code
         self.init_code: List[str] = [
-            '\n\n########## Generated Code ###########',
+            '\n\n########## Generated Schedule Code ###########',
             'import torch', 'import cube', '']
         # module member name
         self.symbols = SymbolTable()

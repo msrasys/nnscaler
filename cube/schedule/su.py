@@ -41,6 +41,7 @@ class ScheduleUnit(IRCell):
         inputs = IRCell.get_inputs(nodes)
         inputs = [input for input in inputs if not input.is_param()]
         outputs = IRCell.get_outputs(nodes)
+        outputs = [output for output in outputs if not output.is_param()]
         super().__init__(
             name          = name,
             signature     = stype.value,

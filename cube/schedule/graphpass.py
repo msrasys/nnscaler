@@ -40,11 +40,19 @@ class SUGraphPass:
         """
         Merge SU to a larger one if possible
         """
-        merged_su = None
+        devices = set()
         for su in sugraph.sus():
-            if su.stype == SUType.Forward:
-                if not isinstance(merged_su, ScheduleUnit):
-                    merged_su = su
-                    continue
-                merged_su = sugraph.merge(merged_su, su)
+            devices.update(set(su.device))
+        for device in devices:
+            dev_sus = [su for su in sugraph.sus() if device in su.device]
+            merged_su = None
+            for su in dev_sus:
+                if su.stype == SUType.Forward:
+                    if not isinstance(merged_su, ScheduleUnit):
+                        merged_su = su
+                        continue
+                    merged_su = sugraph.merge(merged_su, su)
+                    if not isinstance(merged_su, ScheduleUnit):
+                        merged_su = su
+
         return sugraph

@@ -3,7 +3,7 @@ from typing import List
 import torch
 
 
-def send(tensors, to_ranks: List[List[int]]):
+def send(tensors, to_ranks: List[int]):
     """
     send tensor to the remote devices. Each tensor can be
     sent to multiple devices
@@ -14,28 +14,22 @@ def send(tensors, to_ranks: List[List[int]]):
     """
     print('sending...')
     send_ops = list()
-    for tensor, ranks in zip(tensors, to_ranks):
-        for rank in ranks:
-            send_op = torch.distributed.P2POp(
-                torch.distributed.isend, tensor, rank
-            )
-            send_ops.append(send_op)
+    for tensor, rank in zip(tensors, to_ranks):
+        send_op = torch.distributed.P2POp(
+            torch.distributed.isend, tensor, rank
+        )
+        send_ops.append(send_op)
     reqs = torch.distributed.batch_isend_irecv(send_ops)
     for req in reqs:
         req.wait()
     torch.cuda.synchronize()
 
 
-def recv(shapes: List[List[int]], from_ranks: List[List[int]]):
+def recv(shapes: List[List[int]], from_ranks: List[int]):
     print('recving...')
     recv_ops = list()
     recv_tensors = list()
-    for shape, ranks in zip(shapes, from_ranks):
-        if len(ranks) != 1:
-            raise RuntimeError(
-                "Not supported for recving same tensor from multiple devices"
-            )
-        rank = ranks[0]
+    for shape, rank in zip(shapes, from_ranks):
         tensor = torch.empty(
             shape, requires_grad=True, device=torch.cuda.current_device()
         )

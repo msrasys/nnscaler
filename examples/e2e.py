@@ -18,21 +18,16 @@ import cube
 from cube.schedule.su import SUType
 
 
-def spolicy(ir_graph):
-    for nid, node in enumerate(ir_graph.nodes()):
-        if nid < 3:
-            node.device = 0 
-        else:
-            node.device = 1
+def trans_policy(ir_graph, resource):
     return ir_graph
 
-def tpolicy(seq):
+def schedule_policy(sugraph, resource):
     # put to micro-batch forward-backward sequence
     fb_op_seqs = list()
-    for su in seq.sus():
+    for su in sugraph.sus():
         for fb_seq in fb_op_seqs:
             for ksu in fb_seq[::-1]:
-                if seq.happen_before(ksu, su):
+                if sugraph.happen_before(ksu, su):
                     fb_seq.append(su)
                     break
             else:
@@ -41,17 +36,19 @@ def tpolicy(seq):
         else:
             fb_op_seqs.append([su])
     
-    # merge to stages
-    for fb_seq in fb_op_seqs:
-        merged_su = fb_seq[0]
-        for su in fb_seq[1:]:
-            if su.stype == SUType.Backward:
-                continue
-            msu = seq.merge(merged_su, su)
-            merged_su = su if msu is None else msu
-    print(seq)
-    return seq
-
+    for fb_sus in fb_op_seqs:
+        sugraph.assign(fb_sus[0], 0)
+        idx = 0
+        for su in fb_sus[1:]:
+            if su.stype == SUType.Forward:
+                if idx < 3:
+                    sugraph.assign(su, 0)
+                    sugraph.assign(su.mirror, 0)
+                else:
+                    sugraph.assign(su, 1)
+                    sugraph.assign(su.mirror, 1)
+                idx += 1
+    return sugraph
 
 
 class FakeDataLoader:
@@ -97,14 +94,14 @@ def train():
     batch_size = 64
 
     model = FeedForward(dim=1024)
-    model = cube.sschedule.schedule(
+    model = cube.schedule.SemanticModel(
         model, input_shapes=([batch_size,1024],),
-        policy_fn=spolicy
+        policy_fn=trans_policy
     )
 
     dataloader = FakeDataLoader(batch_size)
 
-    @cube.tschedule.schedule(model, dataloader, policy_fn=tpolicy)
+    @cube.schedule.schedule(model, dataloader, policy_fn=schedule_policy)
     def train_iter(model, dataloader):
         for _ in range(4):
             data = next(dataloader)

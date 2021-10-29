@@ -6,12 +6,12 @@ from cube.schedule.translator import IRDataLoader, LogicTranslator
 from cube.schedule.sugraph import SUGraph
 from cube.schedule.graphpass import SUGraphPass
 
-from cube.codegen.codegen import SScheduleCodeGen, TScheduleCodeGen
+from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
 
 class SemanticModel:
 
-    def __init__(self, model: torch.nn.Module, input_shapes):
+    def __init__(self, model: torch.nn.Module, input_shapes, policy_fn=None):
         """
         Create semantic model based on AI Scientist description.
         """
@@ -19,6 +19,8 @@ class SemanticModel:
         self.ir_graph = parser.convert(
             model, input_shapes=input_shapes
         )
+        if policy_fn:
+            self.ir_graph = policy_fn(self.ir_graph, None)
         self._loaded_module = None
 
     def get_graph(self):
@@ -119,6 +121,7 @@ def schedule(model: SemanticModel, dataloader, policy_fn: Optional[Callable] = N
             # graph pass to remove redundant sus 
             su_graph = SUGraphPass.remove_redundant_adapters(su_graph)
             su_graph = SUGraphPass.merge_small_sus(su_graph)
+            print(su_graph)
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()
@@ -126,14 +129,14 @@ def schedule(model: SemanticModel, dataloader, policy_fn: Optional[Callable] = N
                 world_size = 1
 
             # code generation
-            tgener = TScheduleCodeGen(su_graph)
-            sgener = SScheduleCodeGen(su_graph)
+            mgener = ModelCodeGen(su_graph)
+            sgener = ScheduleCodeGen(su_graph)
             for rank in range(world_size):
                 fname = filename.format(rank)
                 # generate spatial module code
-                sgener.gen(rank, outfile=fname, attach=True)
+                mgener.gen(rank, outfile=fname, attach=False)
                 # generate temporal schedule code
-                tgener.gen(
+                sgener.gen(
                     device = rank,
                     outfile = fname,
                     attach=True
