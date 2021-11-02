@@ -1,8 +1,5 @@
-from typing import List, Union
-
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.tensor import IRFullTensor
-from cube.graph.mapping import IR2LogicOp
 
 
 __call__ = ['IROperation']
@@ -28,43 +25,25 @@ class IROperation(IRCell):
         outputs = [IRFullTensor() for _ in range(output_length)]
         for idx, output in enumerate(outputs):
             self.set_output(idx, output)
-        self.semantic = IR2LogicOp.map(self.signature)
 
     def infer_shape(self):
         """
         Infer output value shape
         """
-        shapes = list()
-        for input in self.inputs():
-            if isinstance(input, IRTensor):
-                if input.shape is None:
-                    return False
-                shapes.append(input.shape)
-            else:
-                shapes.append([1,])
-        shapes = tuple(shapes)
-        out_shapes = self.semantic.shape_infer(*shapes)
-        if len(out_shapes) != len(self._outputs):
-            raise RuntimeError(
-                "The logical op semantic doesn't match with parsed op"
-            )
-        for shape, val in zip(out_shapes, self._outputs):
-            if isinstance(val, IRTensor):
-                val.shape = shape
-        return True
+        raise NotImplementedError
 
     def __repr__(self):
         inputs = list()
         for tensor in self.inputs():
             if isinstance(tensor, IRTensor):
-                inputs.append(f't{tensor._id}-dev{tensor.device}')
+                inputs.append(f't{tensor._id}')
             else:
                 inputs.append(tensor)
         
         outputs = list()
         for tensor in self.outputs():
             if isinstance(tensor, IRTensor):
-                outputs.append(f't{tensor._id}-dev{tensor.device}')
+                outputs.append(f't{tensor._id}')
             else:
                 outputs.append(tensor)
 

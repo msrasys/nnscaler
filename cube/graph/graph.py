@@ -314,6 +314,17 @@ class IRGraph(IRCell):
 
         return graph
 
+    ## Primitives for policy expression ##
+
+    def partition(self, op, op_partition_algorithm, config):
+        raise NotImplementedError
+
+    def merge(self, sub_graph, target_op, op_partition_algorithm):
+        raise NotImplementedError
+
+    def identity(self, input_tensor, dst_op):
+        raise NotImplementedError
+
     def __repr__(self):
         dscp = f"\n{self.name}:\n{'=' * len(self.name)}\n"
         # inputs

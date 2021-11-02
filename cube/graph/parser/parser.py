@@ -6,6 +6,8 @@ from typing import List, Tuple, Optional
 from cube.graph import IROperation
 from cube.graph.tensor import IRFullTensor
 from cube.graph.parser.frame import Frame
+from cube.graph.parser.mapping import Sign2Op
+
 
 class ScriptNodeKind(enum.Enum):
     PrimGetAttr = 1
@@ -113,20 +115,19 @@ class ScriptModuleParser:
             raise RuntimeError(f"Found unexpected function call node: {fnode}")
         fsig = frame.get_var(inputs[0].debugName())
 
-        # create IR node
-        ir_node = IROperation(
-            signature = fsig,
-            name = fnode.s('name'),
-            input_length=len(inputs) - 1,
-            output_length=len(outputs),
-        )
-
         # handle inputs -- in stack with reverse order
+        input_vals = list()
         for index, input in enumerate(inputs[1:]):
             var_name = input.debugName()
             val = frame.get_var(var_name)
-            ir_node.set_input(index, val)
-        
+            input_vals.append(val)
+
+        ir_node = Sign2Op.map(fsig)(inputs=input_vals, n_outputs=len(outputs))
+        if len(ir_node.outputs()) != len(outputs):
+            raise RuntimeError(
+                f"Parse fail: {fsig} has {len(outputs)} outputs != pre-defined {len(ir_node.outputs())}"
+            )
+
         # handle outputs
         for index, output in enumerate(outputs):
             frame.add_var(output.debugName(), ir_node.outputs(index))
@@ -167,14 +168,11 @@ class ScriptModuleParser:
             print(f"Warning: some non-tensor arguments are ommited in {fsig}")
 
         # create IR node
-        ir_node = IROperation(
-            signature = fsig,
-            name = fsig,
-            input_length = len(input_val),
-            output_length = len(outputs)
-        )
-        for index, val in enumerate(input_val):
-            ir_node.set_input(index, val)
+        ir_node = Sign2Op.map(fsig)(inputs=input_val, n_output=len(outputs))
+        if len(ir_node.outputs()) != len(outputs):
+            raise RuntimeError(
+                f"Parse fail: {fsig} has {len(outputs)} outputs != pre-defined {len(ir_node.outputs())}"
+            )
 
         # handle outputs
         for index, output in enumerate(outputs):
