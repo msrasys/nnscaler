@@ -1,7 +1,5 @@
-import enum
 from typing import List, Optional, Union
 import copy
-from cube import schedule
 
 from cube.ir.cten import IRCell
 from cube.schedule.su import SUType, ScheduleUnit
@@ -208,7 +206,7 @@ class SUGraph(IRCell):
             # e.g., su1 -> adapter1 ,....., adapter2 -> su2
             # if self.happen_before(su1, su) and self.happen_before(su, su2):
             # to keep topo order:
-            if self.happen_before(su, su2):
+            if su.stype != SUType.Adapter and self.happen_before(su, su2):
                 return None
 
         # merge forward su
