@@ -2,8 +2,9 @@ from typing import List, Optional, Dict
 
 from cube.algorithm.utils import split_axis, split_value
 from cube.algorithm.generics import GenericDistAlgo
+from cube.algorithm.factory import DistAlgorithmFactory
 
-from cube.operator.logic.function import Linear
+from cube.graph.operator.function import Linear
 
 
 _kWaitDecision = None
@@ -127,3 +128,8 @@ class LinearRowWeight(GenericDistAlgo):
             node.set_output(0, o)
             nodes.append(node)
         return nodes
+
+
+DistAlgorithmFactory().register(Linear, LinearDataParallel, tag='data')
+DistAlgorithmFactory().register(Linear, LinearColumnWeight, tag='column')
+DistAlgorithmFactory().register(Linear, LinearRowWeight, tag='row')
