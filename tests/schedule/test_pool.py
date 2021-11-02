@@ -1,7 +1,7 @@
 from cube.schedule.pool import SchedulePool
 from cube.schedule.su import SUType, ScheduleUnit
 
-from cube.ir.cten import IRCell, IRTensor
+from cube.ir.cten import IRCell
 
 
 def test_schedule_pool():

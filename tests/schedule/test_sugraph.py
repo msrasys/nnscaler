@@ -1,5 +1,5 @@
 from cube.graph.tensor import IRFullTensor
-from cube.graph.operator import IROperation
+from cube.graph.operator.function import Linear
 from cube.graph.graph import IRGraph
 
 from cube.schedule.su import SUType, ScheduleUnit
@@ -17,38 +17,27 @@ def construct_graph():
     bias3 = IRFullTensor(shape=[1024, 1024], name='bias')
 
     # linear1
-    linear1 = IROperation(
+    linear1 = Linear(
         name='linear1',
         signature='torch.nn.functional.linear',
-        input_length=3,
-        output_length=1
+        inputs= [input, weight1, bias1],
     )
-    linear1.set_input(0, input)
-    linear1.set_input(1, weight1)
-    linear1.set_input(2, bias1)
     linear1.infer_shape()
 
     # linear2
-    linear2 = IROperation(
+    linear2 = Linear(
         name='linear2',
         signature='torch.nn.functional.linear',
-        input_length=3,
-        output_length=1
+        inputs= [linear1.outputs(0), weight2, None],
     )
-    linear2.set_input(0, linear1.outputs(0))
-    linear2.set_input(1, weight2)
     linear2.infer_shape()
 
     # linear3
-    linear3 = IROperation(
-        name='linear2',
+    linear3 = Linear(
+        name='linear3',
         signature='torch.nn.functional.linear',
-        input_length=3,
-        output_length=1
+        inputs= [linear2.outputs(0), weight3, bias3],
     )
-    linear3.set_input(0, linear2.outputs(0))
-    linear3.set_input(1, weight3)
-    linear3.set_input(2, bias3)
     linear3.infer_shape()
 
     graph = IRGraph(
