@@ -2,7 +2,7 @@ from cube.schedule.su import SUType
 
 def choose_input(op, input_incarnation): pass
 def choose_output(op, output_incarnation): pass
-def create_incar(graph, tensor_or_op): pass
+def create_incar(tensor_or_op): pass
 
 
 def transformation_policy(graph, resource):
@@ -20,9 +20,9 @@ def transformation_policy(graph, resource):
             for output in op.outputs():
                 tensor_incar = graph.create_incar(output)
                 tensors_incar.append(tensor_incar)
-                ops_incar.choose_output(tensor_incar)
+                graph.choose_output(ops_incar, tensor_incar)
         for op in ops_incar[1:]:
-            for input in op.outputs():
+            for input in op.inputs():
                 for input_incar in input.get_incar():
                     if input_incar in tensors_incar:
                         graph.choose_input(op, input_incar)
