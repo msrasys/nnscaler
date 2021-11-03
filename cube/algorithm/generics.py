@@ -47,7 +47,7 @@ class GenericDistAlgo:
         """
         raise NotImplementedError
 
-    def instantiate(self, config: Dict):
+    def instantiate(self, node, config: Dict):
         """
         Instantiate the algorithm given the config
         """

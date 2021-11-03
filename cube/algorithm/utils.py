@@ -20,7 +20,7 @@ def split_axis(tensor: IRTensor, axis: int, chunk_num: int):
             chunk_shape.append(chunk_size)
 
     sub_tensors = list()
-    for cid in range(chunk_size):
+    for cid in range(chunk_num):
         shape_slicer[axis] = slice(chunk_size * cid, chunk_size * (cid + 1))
         sub_tensors.append(tensor.select(
             indices = tuple(shape_slicer),
@@ -31,4 +31,19 @@ def split_axis(tensor: IRTensor, axis: int, chunk_num: int):
 
 
 def split_value(tensor: IRTensor, chunk_num: int):
-    raise NotImplementedError
+
+    # full shape
+    shape_slicer = list()
+    for nele in tensor.shape:
+        shape_slicer.append(slice(0, nele, 1))
+
+    sub_tensors = list()
+    for idx in range(chunk_num):
+        sub_tensor = tensor.select(
+            indices = tuple(shape_slicer),
+            val_map = (idx, chunk_num),
+            shape = tensor.shape
+        )
+        sub_tensors.append(sub_tensor)
+
+    return sub_tensors

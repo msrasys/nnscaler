@@ -14,6 +14,7 @@ class DistAlgorithmFactory:
     def __init__(self):
         if not DistAlgorithmFactory.instance:
             DistAlgorithmFactory.instance = DistAlgorithmFactory.__DistAlgorithmFactory()
+            self._load_predefined_algos()
 
     def __getattr__(self, name):
         return getattr(self.instance, name)
@@ -24,7 +25,7 @@ class DistAlgorithmFactory:
         """
         if op not in self.instance._algos:
             self.instance._algos[op] = dict()
-        self._algos[op][tag] = algorithm
+        self.instance._algos[op][tag] = algorithm
 
     def algorithms(self, op, tag = None):
         """
@@ -37,7 +38,16 @@ class DistAlgorithmFactory:
         Returns:
             algorithm class
         """
+        if op not in self.instance._algos:
+            raise KeyError("Op {op} is not registered in factory")
         if tag:
             return self.instance._algos[op][tag]
         else:
             return self.instance._algos[op].values()
+
+    def _load_predefined_algos(self):
+
+        import cube.algorithm.linear as linear
+        self.register(linear.Linear, linear.LinearDataParallel, tag='data')
+        self.register(linear.Linear, linear.LinearColumnWeight, tag='column')
+        self.register(linear.Linear, linear.LinearRowWeight, tag='row')
