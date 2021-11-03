@@ -134,7 +134,7 @@ class IRGraph(IRCell):
             full_tensor = new_full_tensors[val.parent._id]
             new_val = full_tensor.select(
                 indices=val.indices,
-                val_op=val.val_op,
+                val_map=val.val_map,
                 shape=val.shape
             )
             if reverse and val.is_param():

@@ -11,13 +11,13 @@ def test_tensor_reshape_init():
     
     tensor2 = tensor1.select(
         indices = (slice(0, 512), slice(0, 1024)),
-        val_op  = None,
+        val_map  = None,
         shape = [512, 1024]
     )
 
     tensor3 = tensor1.select(
         indices = (slice(512, 1024), slice(0, 1024)),
-        val_op  = None,
+        val_map  = None,
         shape = [512, 1024]
     )
 
@@ -53,25 +53,25 @@ def test_adapter_select_is_identity():
     
     tensor2 = tensor1.select(
         indices = (slice(512, 1024), slice(0, 1024)),
-        val_op  = None,
+        val_map  = None,
         shape = [512, 1024]
     )
 
     tensor3 = tensor2.select(
         indices = (slice(0, 256), slice(0, 1024)),
-        val_op  = None,
+        val_map  = None,
         shape = [256, 1024]
     )
 
     tensor4 = tensor1.select(
         indices = (slice(512, 768), slice(0, 1024)),
-        val_op = None,
+        val_map = None,
         shape = [256, 1024]
     )
 
     tensor5 = tensor1.select(
         indices = (slice(512, 768), slice(0, 1024)),
-        val_op = None,
+        val_map = None,
         shape = [256, 1024]
     )
 

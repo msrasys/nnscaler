@@ -24,7 +24,7 @@ def split_axis(tensor: IRTensor, axis: int, chunk_num: int):
         shape_slicer[axis] = slice(chunk_size * cid, chunk_size * (cid + 1))
         sub_tensors.append(tensor.select(
             indices = tuple(shape_slicer),
-            val_op = None,
+            val_map = None,
             shape = chunk_shape
         ))
     return sub_tensors
