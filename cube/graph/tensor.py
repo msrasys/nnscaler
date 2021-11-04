@@ -217,6 +217,9 @@ class ValueMap:
                 return True
         return False
 
+    def __repr__(self):
+        return f'({self.idx}/{self.chunk_num})'
+
 
 def _to_index_map(indices: Union[Tuple, IndexMap]):
     if not isinstance(indices, tuple) and not isinstance(indices, IndexMap):
@@ -555,5 +558,5 @@ class IRSubTensor(IRTensor):
         return None
 
     def __repr__(self):
-        dscp = f'SubTensor(id={self._id}, shape={self.shape}, device={self.device})'
+        dscp = f'SubTensor(id={self._id}, shape={self.shape}, device={self.device}, ind={self.indices}, val={self.val_map})'
         return dscp
