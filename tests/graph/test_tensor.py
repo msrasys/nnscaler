@@ -1,6 +1,6 @@
 import copy
 
-from cube.graph.tensor import IRFullTensor, IRSubTensor
+from cube.graph.tensor import IRFullTensor, IRSubTensor, ValueMap
 
 
 def test_full_tensor_init():
@@ -105,7 +105,7 @@ def test_sub_tensor_select():
     assert sub_tensor3 in tensor1.segments()
 
 
-def test_sub_tensor_overlap():
+def test_sub_tensor_ind_overlap():
 
     tensor1 = IRFullTensor(shape=[1024,1024], name='tensor')
     sub_tensor1 = tensor1.select(
@@ -128,6 +128,36 @@ def test_sub_tensor_overlap():
     assert sub_tensor1.overlap(sub_tensor3)
     assert not sub_tensor2.overlap(sub_tensor3)
 
+
+def test_sub_tensor_val_overlap():
+    tensor1 = IRFullTensor(shape=[1024,1024], name='tensor')
+    sub_tensor1 = tensor1.select(
+        indices = (slice(0, 1024), slice(512, 1024)),
+        val_map = None,
+        shape = (1024, 512)
+    )
+    sub_tensor2 = tensor1.select(
+        indices = (slice(0, 1024), slice(0, 512)),
+        val_map = (0, 4),
+        shape = (1024, 512)
+    )
+    sub_tensor3 = tensor1.select(
+        indices = (slice(0, 1024), slice(512, 1024)),
+        val_map = (0, 4),
+        shape = (1024, 512)
+    )
+    sub_tensor4 = tensor1.select(
+        indices = (slice(0, 1024), slice(512, 1024)),
+        val_map = (1, 4),
+        shape = (1024, 512)
+    )
+
+    assert not sub_tensor1.overlap(sub_tensor2)
+    assert not sub_tensor2.overlap(sub_tensor3)
+    assert sub_tensor1.overlap(sub_tensor3)
+    assert sub_tensor1.overlap(sub_tensor4)
+    assert sub_tensor4.overlap(sub_tensor1)
+    assert not sub_tensor3.overlap(sub_tensor4)
 
 def test_sub_tensor_common():
 

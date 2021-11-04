@@ -211,6 +211,17 @@ class ValueMap:
         chunk_num = self.chunk_num - 1 + sub_map.chunk_num
         return ValueMap(idx, chunk_num)
 
+    def overlap(self, other):
+        if not isinstance(other, ValueMap):
+            raise TypeError("Expected ValueMap")
+        if self.chunk_num == other.chunk_num:
+            return self.idx == other.idx
+        else:
+            if self.chunk_num == 1 or other.chunk_num == 1:
+                return True
+            else:
+                raise NotImplementedError("Not Implemented")
+
     def __eq__(self, other):
         if isinstance(other, ValueMap):
             if other.idx == self.idx and other.chunk_num == self.chunk_num:
@@ -527,7 +538,7 @@ class IRSubTensor(IRTensor):
             if self.parent != other.parent:
                 return False
             return self.indices.overlap(other.indices) and \
-                   self.val_map == other.val_map
+                   self.val_map.overlap(other.val_map)
         else:
             raise TypeError("Customized IRTensor not support")
 
