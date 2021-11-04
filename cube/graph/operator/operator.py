@@ -1,5 +1,8 @@
+from typing import Optional
+
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.tensor import IRFullTensor
+from cube.algorithm.factory import DistAlgorithmFactory
 
 
 __call__ = ['IROperation']
@@ -31,6 +34,28 @@ class IROperation(IRCell):
         Infer output value shape
         """
         raise NotImplementedError
+
+    def algorithms(self, tag: Optional[str] = None):
+        """
+        get algorithm from algorithm factory
+
+        Args:
+            tag: str or None. If None, return all 
+        """
+        factory = DistAlgorithmFactory()
+        if tag is None:
+            templates = list()
+            if factory.exist(type(self)):
+                templates = factory.algorithms(type(self))
+            algos = list()
+            for template in templates:
+                algos.append(template(self))
+            return algos
+        else:
+            if not factory.exist(type(self)):
+                return None
+            template = factory.algorithms(type(self), tag)
+            return template(self)
 
     def __repr__(self):
         inputs = list()
