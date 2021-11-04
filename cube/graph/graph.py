@@ -7,12 +7,14 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Union, Tuple, List, Optional, Any
+from typing import Union, Tuple, List, Optional, Any, Dict
 import copy
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.operator import IROperation
 from cube.graph.tensor import IRFullTensor
+
+from cube.algorithm.generics import GenericDistAlgo
 
 
 __all__ = ['IRGraph']
@@ -33,7 +35,6 @@ class IRGraph(IRCell):
         
         self._nodes: List[IROperation] = nodes
         self._parameters = list()
-        self.reset_dependency()
 
         if input_tensors is None:
             input_tensors = IRCell.get_inputs(nodes)
@@ -82,21 +83,19 @@ class IRGraph(IRCell):
                         input.as_param()
                         self._parameters.append(input)
         self.tag = 'forward'
+        self.reset_dependency()
 
     def reset_dependency(self):
         """
         Reset the node dataflow dependency
         """
+        for node in self._nodes:
+            node.clear_predecessor()
+            node.clear_successor()
         # set node predecessors and successors
         for src_idx in range(len(self._nodes)):
             src_node = self._nodes[src_idx]
-            src_node._successors = [
-                list() for _ in range(len(src_node.outputs()))
-            ]
             for dst_node in self._nodes[src_idx+1:]:
-                dst_node._predecessors = [
-                    list() for _ in range(len(dst_node.inputs()))
-                ]
                 for out_idx, out_tensor in enumerate(src_node.outputs()):
                     if not isinstance(out_tensor, IRTensor):
                         continue
@@ -314,10 +313,46 @@ class IRGraph(IRCell):
 
         return graph
 
+    def _remove(self, node: IRCell):
+        """
+        Remove a node from graph
+        """
+        if node in self.nodes():
+            self._nodes.remove(node)
+        #TODO: remove parameters
+        self.reset_dependency()
+
     ## Primitives for policy expression ##
 
-    def partition(self, op, op_partition_algorithm, config):
-        raise NotImplementedError
+    def partition(self, op: IRCell, algo: GenericDistAlgo, config: Dict) -> Optional[List[IRCell]]:
+        """
+        Policy primitive. Partition an operator by using
+        op_partition_algorithm and its configuration
+
+        Args:
+            op: cell to be partitioned
+            algo: generic distributed algorithm related to the op
+            config: dict
+
+        Returns:
+            nodes: List[IRCell] if partitioned successfully.
+            None if failed
+        """
+        if not isinstance(op, IRCell):
+            raise TypeError("Expected op to be IRCell (IROperation)")
+        if not isinstance(algo, GenericDistAlgo):
+            raise TypeError("Expected algo to be GenericDistAlgo")
+
+        if algo.logic_op != type(op):
+            return None
+        if not algo.satisfy(config):
+            return None
+        nodes = algo.instantiate(op, config)
+        idx = self._nodes.index(op)
+        self._nodes = self._nodes[:idx] + nodes + self._nodes[idx+1:]
+        self.reset_dependency()
+        return copy.copy(nodes)
+
 
     def merge(self, sub_graph, target_op, op_partition_algorithm):
         raise NotImplementedError

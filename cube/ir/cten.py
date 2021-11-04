@@ -1,4 +1,4 @@
-"""
+r"""
 IRCell:
     a graph node component serving for different purpose,
     e.g., operator, device graph, graph
@@ -236,6 +236,14 @@ class IRCell:
         if cell not in self._predecessors[input_index]:
             self._predecessors[input_index].append(cell)
 
+    def clear_predecessor(self):
+        """
+        Clear all predecessors
+        """
+        self._predecessors = [
+            list() for _ in range(len(self.inputs()))
+        ]
+
     def add_successor(self, output_index: int, cell):
         """
         Set self node the output index node. 
@@ -245,6 +253,14 @@ class IRCell:
             raise TypeError("Expected node to be IRCell")
         if cell not in self._successors[output_index]:
             self._successors[output_index].append(cell)
+
+    def clear_successor(self):
+        """
+        Clear all successors
+        """
+        self._successors = [
+            list() for _ in range(len(self.outputs()))
+        ]
 
     @staticmethod
     def get_inputs(cells):

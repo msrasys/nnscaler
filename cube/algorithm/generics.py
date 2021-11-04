@@ -45,7 +45,7 @@ class GenericDistAlgo:
         self.input_shapes = input_shapes
         self.output_shapes = output_shapes
 
-        self._logical_op = node
+        self._logical_op = type(node)
 
     @property
     def logic_op(self):

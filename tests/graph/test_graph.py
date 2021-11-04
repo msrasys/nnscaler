@@ -128,3 +128,34 @@ def test_graph_copy():
         assert len(gnode.inputs()) == len(cnode.outputs())
         assert len(gnode.predecessors()) == len(cnode.successors())
         assert len(gnode.successors()) == len(cnode.predecessors())
+
+
+def test_graph_partition():
+
+    inputs, ops, outputs = construct_model()
+    graph = IRGraph(ops, inputs, outputs, 'MLP')
+
+    node1, node2, node3 = graph.nodes()
+
+    algo = node2.algorithms('data')
+    sub_nodes = graph.partition(node2, algo, config=dict(chunk_num=4))
+    assert sub_nodes is not None
+    assert len(graph.nodes()) == 6
+    dnode1, dnode2, dnode3, dnode4 = sub_nodes
+    assert dnode2 not in dnode1.successors()
+    assert dnode3 not in dnode1.successors()
+    assert dnode4 not in dnode1.successors()
+
+    algo = node3.algorithms('column')
+    sub_nodes = graph.partition(node3, algo, config=dict(chunk_num=4))
+    print(graph)
+
+    cnode1, cnode2, cnode3, cnode4 = sub_nodes
+    for cnode in sub_nodes:
+        print(cnode, cnode.successors())
+        print(cnode.predecessors(0))
+        assert dnode1 in cnode.predecessors()
+        assert dnode2 in cnode.predecessors()
+        assert dnode3 in cnode.predecessors()
+        assert dnode4 in cnode.predecessors()
+    assert len(graph.nodes()) == 9

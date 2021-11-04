@@ -52,7 +52,7 @@ class IROperation(IRCell):
                 algos.append(template(self))
             return algos
         else:
-            if not factory.exist(type(self)):
+            if not factory.exist(type(self), tag):
                 return None
             template = factory.algorithms(type(self), tag)
             return template(self)
