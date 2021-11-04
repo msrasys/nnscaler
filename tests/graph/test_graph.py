@@ -152,8 +152,6 @@ def test_graph_partition():
 
     cnode1, cnode2, cnode3, cnode4 = sub_nodes
     for cnode in sub_nodes:
-        print(cnode, cnode.successors())
-        print(cnode.predecessors(0))
         assert dnode1 in cnode.predecessors()
         assert dnode2 in cnode.predecessors()
         assert dnode3 in cnode.predecessors()

@@ -292,8 +292,8 @@ class ScheduleCodeGen:
         """
         Emit su code
         """
-        fsign = 'cube.runtime.temporal.forward({model}, *{inputs})'
-        bsign = 'cube.runtime.temporal.backward({input_tensors}, {output_tensors}, {output_grads})'
+        fsign = 'cube.runtime.executor.fexecute({model}, *{inputs})'
+        bsign = 'cube.runtime.executor.backward({input_tensors}, {output_tensors}, {output_grads})'
         
         if su.stype == SUType.Dataloader:
             if len(su.inputs()) != 0:

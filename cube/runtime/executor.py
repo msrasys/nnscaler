@@ -1,19 +1,23 @@
-from typing import Tuple, Any
+r"""
+SU Executor for runtime
+"""
+
+from typing import Tuple, Any, Callable
 import torch
 
 
-def forward(model, *input_tensors: Tuple[Any]):
+def fexecute(su: Callable, *input_tensors: Tuple[Any]):
     """
-    forward the model
+    forward the SUs
     """
-    outputs = model(*input_tensors)
+    outputs = su(*input_tensors)
     print('forwarding... ')
     return outputs
 
 
 def backward(input_tensors, output_tensors, output_tensor_grads):
     """
-    Backward on the tensors
+    Backward the SUs
     """
     for tensor in input_tensors:
         if torch.is_tensor(tensor) and tensor.requires_grad:
