@@ -10,9 +10,11 @@ _kWaitDecision = None
 
 class LinearDataParallel(GenericDistAlgo):
 
-    def __init__(self, input_shapes: List[Optional[List[int]]], output_shapes: List[int]):
+    def __init__(self, node: Linear):
 
-        super().__init__(input_shapes, output_shapes)
+        if not isinstance(node, Linear):
+            raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
+        super().__init__(node)
 
         self.chunk_num = _kWaitDecision
 
@@ -47,9 +49,11 @@ class LinearDataParallel(GenericDistAlgo):
 
 class LinearColumnWeight(GenericDistAlgo):
 
-    def __init__(self, input_shapes: List[Optional[List[int]]], output_shapes: List[int]):
+    def __init__(self, node: Linear):
 
-        super().__init__(input_shapes, output_shapes)
+        if not isinstance(node, Linear):
+            raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
+        super().__init__(node)
 
         self.chunk_num = _kWaitDecision
 
@@ -88,9 +92,11 @@ class LinearColumnWeight(GenericDistAlgo):
 
 class LinearRowWeight(GenericDistAlgo):
 
-    def __init__(self, input_shapes: List[Optional[List[int]]], output_shapes: List[int]):
+    def __init__(self, node: Linear):
 
-        super().__init__(input_shapes, output_shapes)
+        if not isinstance(node, Linear):
+            raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
+        super().__init__(node)
 
         self.chunk_num = _kWaitDecision
 

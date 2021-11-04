@@ -17,18 +17,7 @@ def test_linear_data_parallel():
     )
     semantic_op.infer_shape()
 
-    input_shapes = list()
-    for input in semantic_op.inputs():
-        input_shapes.append(input.shape)
-
-    output_shapes = list()
-    for output in semantic_op.outputs():
-        output_shapes.append(output.shape)
-
-    linear_dp = LinearDataParallel(
-        input_shapes=input_shapes,
-        output_shapes=output_shapes,
-    )
+    linear_dp = LinearDataParallel(semantic_op)
 
     assert linear_dp.chunk_num is None
 
@@ -81,18 +70,7 @@ def test_linear_column_weight():
     )
     semantic_op.infer_shape()
 
-    input_shapes = list()
-    for input in semantic_op.inputs():
-        input_shapes.append(input.shape)
-
-    output_shapes = list()
-    for output in semantic_op.outputs():
-        output_shapes.append(output.shape)
-
-    linear_col_weight = LinearColumnWeight(
-        input_shapes=input_shapes,
-        output_shapes=output_shapes,
-    )
+    linear_col_weight = LinearColumnWeight(semantic_op)
 
     # test satisfy
     assert linear_col_weight.satisfy(dict(chunk_num=4))
@@ -157,10 +135,7 @@ def test_linear_row():
     for output in semantic_op.outputs():
         output_shapes.append(output.shape)
 
-    linear_row_weight = LinearRowWeight(
-        input_shapes=input_shapes,
-        output_shapes=output_shapes,
-    )
+    linear_row_weight = LinearRowWeight(semantic_op)
 
     # test satisfy
     assert linear_row_weight.satisfy(dict(chunk_num=4))

@@ -19,6 +19,15 @@ class DistAlgorithmFactory:
     def __getattr__(self, name):
         return getattr(self.instance, name)
 
+    def exist(self, op):
+        """
+        Check if the factory has op's algorithm recorded
+
+        Returns:
+            True if have, False if not
+        """
+        return op in self.instance._algos
+
     def register(self, op, algorithm, tag: str):
         """
         Register a holistic op (class) as one of the anchors 

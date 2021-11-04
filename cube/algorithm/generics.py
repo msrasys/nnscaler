@@ -1,11 +1,11 @@
-from typing import List, Dict, Optional
+from typing import Dict
+
+from cube.ir.cten import IRCell, IRTensor
 
 
 class GenericDistAlgo:
 
-    def __init__(self,
-                 input_shapes: List[Optional[List[int]]],
-                 output_shapes: List[List[int]]):
+    def __init__(self, node: IRCell):
         """
         Layout is the community distribution requirement for input and
         output logical tensors.
@@ -26,20 +26,30 @@ class GenericDistAlgo:
         output_format (list[list[int], None]):
                 output dim order compare with logical definition
         """
+        if not isinstance(node, IRCell):
+            raise TypeError("Expected node to be IRCell")
+
+        input_shapes = list()
+        for input in node.inputs():
+            if isinstance(input, IRTensor):
+                input_shapes.append(input.shape)
+            else:
+                input_shapes.append(None)
+        output_shapes = list()
+        for output in node.outputs():
+            if isinstance(output, IRTensor):
+                output_shapes.append(output.shape)
+            else:
+                output_shapes.append(None)
 
         self.input_shapes = input_shapes
         self.output_shapes = output_shapes
 
-        self.logical_op = None
+        self._logical_op = node
 
-    def set_logic_op(self, logic_op):
-        """
-        Set logic op. This will be automatically called when the
-        holistic op registered in a logical op.
-        """
-        # if not isinstance(logic_op, GenericLogicalOp):
-        #     raise TypeError("Require a logic op to register")
-        self.logical_op = logic_op
+    @property
+    def logic_op(self):
+        return self._logical_op
 
     def satisfy(self, config: Dict):
         """
