@@ -11,7 +11,7 @@ python -m torch.distributed.launch \
     tests/test_group.py
 """
 
-from cube.device.physic.group import DeviceGroup
+from cube.runtime.device import DeviceGroup
 
 import torch
 
