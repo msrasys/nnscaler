@@ -24,7 +24,7 @@ __all__ = ['IRCell', 'IRTensor']
 
 
 class IRCell:
-    """
+    r"""
     IRCell serves as a general node for different purpose
     """
 
@@ -65,9 +65,11 @@ class IRCell:
         #   -- will only be set when initializing to a graph
         self._predecessors: List[List[IRCell]] = [list() for _ in range(input_length)]
 
+        self._mirror = None
+
     @property
     def device(self):
-        return self._device
+        return list(self._device)
 
     @device.setter
     def device(self, device_id: Union[int, List[int]]):
@@ -79,6 +81,19 @@ class IRCell:
         if not all([isinstance(devid, int) for devid in device_id]):
             raise KeyError("Require device Union[int, List[int]]")
         self._device = device_id
+
+    @property
+    def mirror(self):
+        """
+        The mirror cell. E.g., forward op / backward op.
+        """
+        return self._mirror
+
+    @mirror.setter
+    def mirror(self, other):
+        if not isinstance(other, IRCell):
+            raise TypeError("Expected mirror to be IRCell")
+        self._mirror = other
 
     def on_device(self, device_id: int):
         """
@@ -329,7 +344,7 @@ class IRTensor:
     IRTensor serves as IRGraph edge
     """
 
-    _attr = ['name', '_is_param', 'requires_grad']
+    _attr = ['name', '_is_param', '_requires_grad', '_is_grad', '_grad']
 
     def __init__(self, shape=None, name=None):
 
@@ -340,9 +355,12 @@ class IRTensor:
         # device
         self._cell: List[IRCell] = list() 
 
-        # forward graph
         self._is_param = False
-        self.requires_grad = True
+        self._is_grad = False
+        self._requires_grad = True
+
+        self._grad = None
+
         self.trace = None
 
     def attach_cell(self, cell: IRCell):
@@ -373,18 +391,56 @@ class IRTensor:
             raise TypeError("Expected List[ScheduleUnit]")
         self.trace = sus
 
+    @property
+    def requires_grad(self):
+        return self._requires_grad
+
+    @requires_grad.setter
+    def requires_grad(self, requires: bool):
+        if not isinstance(requires, bool):
+            raise TypeError("Expected bool")
+        self._requires_grad = requires
+        if not requires:
+            self.grad = None
+
     def as_param(self):
         """
         Set the tensor as trainable parameter
         """
         self.requires_grad = True
+        self._is_grad = False
         self._is_param = True
+        return self
 
     def is_param(self):
         """
         Check if the tensor is parameter
         """
         return self._is_param
+
+    @property
+    def grad(self):
+        return self._grad
+
+    @grad.setter
+    def grad(self, grad):
+        if grad is not None and not isinstance(grad, IRTensor):
+            raise TypeError("grad can only be None or Tensor")
+        if self.is_grad() and grad is not None:
+            raise RuntimeError("Cannot assign grad to a gradient")
+        if not self.requires_grad and grad is not None:
+            raise RuntimeError("Cannot assign grad to a frozen tensor")
+        self._grad = grad
+        self.requires_grad = True
+
+    def as_grad(self):
+        self.requires_grad = False
+        self._is_param = False
+        self._is_grad = True
+        return self
+
+    def is_grad(self):
+        return self._is_grad
 
     def renew(self):
         """
