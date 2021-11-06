@@ -1,6 +1,6 @@
 """
 IRGraph:
-    a graph that is composed by node (IROperation) and edge (IRTensor).
+    a graph that is composed by node (IRFwOperation) and edge (IRTensor).
 
     Note the device of graph.inputs() can be different of the same input
     tensor of operation node in the graph. In this case, a move operation
@@ -11,7 +11,6 @@ from typing import Union, Tuple, List, Optional, Any, Dict
 import copy
 
 from cube.ir.cten import IRTensor, IRCell
-from cube.graph.operator import IROperation
 from cube.graph.tensor import IRFullTensor
 
 from cube.algorithm.generics import GenericDistAlgo
@@ -28,12 +27,12 @@ class IRGraph(IRCell):
     """
 
     def __init__(self, 
-                 nodes: List[IROperation],
+                 nodes: List[IRCell],
                  input_tensors: Optional[List[IRTensor]], 
                  output_tensors: Optional[List[IRTensor]], 
                  module_name: str):
         
-        self._nodes: List[IROperation] = nodes
+        self._nodes: List[IRCell] = nodes
         self._parameters = list()
 
         if input_tensors is None:
@@ -82,7 +81,6 @@ class IRGraph(IRCell):
                        input.is_leaf(self._nodes):
                         input.as_param()
                         self._parameters.append(input)
-        self.tag = 'forward'
         self.reset_dependency()
 
     def reset_dependency(self):
@@ -111,75 +109,6 @@ class IRGraph(IRCell):
         Return parameter list
         """
         return copy.copy(self._parameters)
-
-    def copy(self, reverse=False):
-        """
-        Copy the graph but re-new the intermediate tensor
-        """
-        # old graph tensor.parent._id -> new full tensor
-        new_full_tensors = dict()
-
-        def _renew(val: Any):
-            if not isinstance(val, IRTensor):
-                return val
-            elif isinstance(val, IRFullTensor):
-                raise RuntimeError("Found Full Tensor")
-            # parameters in forward
-            if (not reverse) and val.is_param():
-                return val
-            # intermediate / gradient data
-            if val.parent._id not in new_full_tensors:
-                new_full_tensors[val.parent._id] = val.parent.like()
-            full_tensor = new_full_tensors[val.parent._id]
-            new_val = full_tensor.select(
-                indices=val.indices,
-                val_map=val.val_map,
-                shape=val.shape
-            )
-            if reverse and val.is_param():
-                new_val.name = 'grad_' + new_val.name
-                assert new_val.is_param()
-            return new_val
-
-        nodes = list()
-        for node in self.nodes():
-
-            if isinstance(node, IROperation):
-                inputs = node.inputs()
-                outputs = node.outputs()
-                if reverse:
-                    inputs, outputs = outputs, inputs
-
-                new_node = IROperation(
-                    node.name, node.signature,
-                    len(inputs), len(outputs)
-                )
-                # set inputs
-                for idx, val in enumerate(inputs):
-                    new_node.set_input(idx, _renew(val))
-                # set outputs
-                for idx, val in enumerate(outputs):
-                    new_node.set_output(idx, _renew(val))
-            else:
-                raise TypeError("Found node with unsupported copy")
-            new_node.device = node.device
-            nodes.append(new_node)
-        
-        inputs = [_renew(input) for input in self.inputs()]
-        outputs = [_renew(output) for output in self.outputs()]
-
-        if reverse:
-            inputs, outputs = outputs, inputs
-            nodes = nodes[::-1]
-
-        copied_graph = IRGraph(
-            nodes = nodes,
-            input_tensors = inputs,
-            output_tensors = outputs,
-            module_name = self.name
-        )
-        copied_graph.tag = self.tag
-        return copied_graph
 
     def nodes(self, index: Optional[int] = None):
         """
@@ -310,17 +239,7 @@ class IRGraph(IRCell):
             output_tensors = outputs,
             module_name = self.name
         )
-
         return graph
-
-    def _remove(self, node: IRCell):
-        """
-        Remove a node from graph
-        """
-        if node in self.nodes():
-            self._nodes.remove(node)
-        #TODO: remove parameters
-        self.reset_dependency()
 
     ## Primitives for policy expression ##
 
@@ -339,7 +258,7 @@ class IRGraph(IRCell):
             None if failed
         """
         if not isinstance(op, IRCell):
-            raise TypeError("Expected op to be IRCell (IROperation)")
+            raise TypeError("Expected op to be IRCell (IRFwOperation)")
         if not isinstance(algo, GenericDistAlgo):
             raise TypeError("Expected algo to be GenericDistAlgo")
 

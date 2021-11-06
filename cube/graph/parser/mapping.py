@@ -5,13 +5,13 @@ Mapping of
 from functools import partial
 
 import cube.graph.operator.function as function
-from cube.graph.operator.operator import IROperation
+from cube.graph.operator.operator import IRFwOperation
 
 
 class Sign2Op:
 
     @staticmethod
-    def map(signature: str) -> IROperation:
+    def map(signature: str) -> IRFwOperation:
         """
         Map the signature to GenericLogicalOp
         """

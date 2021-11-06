@@ -1,14 +1,14 @@
-from typing import Optional
+from typing import Any, Optional, Union, List
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.tensor import IRFullTensor
 from cube.algorithm.factory import DistAlgorithmFactory
 
 
-__call__ = ['IROperation']
+__call__ = ['IRFwOperation', 'IRBpOperation']
 
 
-class IROperation(IRCell):
+class IRFwOperation(IRCell):
 
     def __init__(self,
                  name: str, 
@@ -61,9 +61,118 @@ class IROperation(IRCell):
         inputs = list()
         for tensor in self.inputs():
             if isinstance(tensor, IRTensor):
-                inputs.append(f't{tensor._id}')
+                anno = 't'
+                if tensor.is_param():
+                    anno = 'w'
+                if tensor.is_grad():
+                    anno = 'g'
+                inputs.append(f'{anno}{tensor._id}')
             else:
                 inputs.append(tensor)
+        
+        outputs = list()
+        for tensor in self.outputs():
+            if isinstance(tensor, IRTensor):
+                anno = 't'
+                if tensor.is_param():
+                    anno = 'w'
+                if tensor.is_grad():
+                    anno = 'g'
+                outputs.append(f'{anno}{tensor._id}')
+            else:
+                outputs.append(tensor)
+
+        dscp = f'Op(id={self._id}, signature={self.signature}, device={self.device}, inputs={inputs}, outputs={outputs})'
+        return dscp
+
+
+class IRBpOperation(IRCell):
+
+    def __init__(self, data_num, grad_num, name='backward'):
+        signature = 'torch.autograd.backward'
+        self.data_num = data_num
+        self.grad_num = grad_num
+        super().__init__(
+            name, signature,
+            input_length=data_num + grad_num,
+            output_length=data_num
+        )
+
+    def datas(self, index: Optional[int] = None) -> Union[List[Any], Any]:
+        if index is None:
+            return self.inputs()[:self.data_num]
+        if index >= self.data_num:
+            raise RuntimeError(
+                f"Set the input out of range ({index} >= {self.data_num})"
+            )
+        return self.inputs(index)
+
+    def grads(self, index: Optional[int] = None) -> Union[List[Any], Any]:
+        if index is None:
+            return self.inputs()[self.data_num:]
+        elif index >= self.grad_num:
+            raise RuntimeError(
+                f"Set the input out of range ({index} >= {self.grad_num})"
+            )
+        return self.inputs(index + self.data_num)
+
+    def set_data(self, input_index: int, val: Any):
+        """
+        Set the node inputs[input_index] with the tensor
+
+        Args:
+            val: Union[IRTensor, Any]
+
+        Return:
+            the set tensor
+        """
+        if input_index >= self.data_num:
+            raise RuntimeError(
+                f"Set the input out of range ({input_index} >= {self.data_num})"
+            )
+        return self.set_input(input_index, val)
+
+    def set_grad(self, input_index: int, val: Any):
+        """
+        Set the node gradient at input index
+
+        Args:
+            input_idx: input index
+            val: Union[IRTensor, Any]
+
+        Return:
+            The set val
+        """
+        if input_index >= self.grad_num:
+            raise RuntimeError(
+                f"Set the grad out of range ({input_index} >= {self.grad_num})"
+            )
+        return self.set_input(input_index + self.data_num, val)
+
+    def __repr__(self):
+        datas = list()
+        for tensor in self.datas():
+            if isinstance(tensor, IRTensor):
+                anno = 't'
+                if tensor.is_param():
+                    anno = 'w'
+                if tensor.is_grad():
+                    anno = 'g'
+                datas.append(f'{anno}{tensor._id}')
+            else:
+                datas.append(tensor)
+
+        grads = list()
+        for tensor in self.grads():
+            if isinstance(tensor, IRTensor):
+                anno = 't'
+                if tensor.is_param():
+                    anno = 'w'
+                if tensor.is_grad():
+                    anno = 'g'
+                grads.append(f'{anno}{tensor._id}')
+            else:
+                grads.append(tensor)
         
         outputs = list()
         for tensor in self.outputs():
@@ -72,5 +181,13 @@ class IROperation(IRCell):
             else:
                 outputs.append(tensor)
 
-        dscp = f'Op(id={self._id}, signature={self.signature}, device={self.device}, inputs={inputs}, outputs={outputs})'
+        dscp = f'bOp(id={self._id}, signature={self.signature}, device={self.device}, grads={grads}, datas={datas}, outputs={outputs})'
         return dscp
+
+
+class IRDataOperation(IRCell):
+
+    def __init__(self, data_num: int, name='dataloader'):
+
+        signature = 'dataloader.__next__'
+        super().__init__(name, signature, 0, data_num)

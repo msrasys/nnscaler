@@ -3,7 +3,7 @@ import enum
 import re
 from typing import List, Tuple, Optional
 
-from cube.graph import IROperation
+from cube.graph import IRFwOperation
 from cube.graph.tensor import IRFullTensor
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.mapping import Sign2Op
@@ -24,7 +24,7 @@ class ScriptModuleParser:
     def parse_module(module,
                      input_shapes: Optional[ Tuple[List[int],] ] = None,
                      frame: Frame = Frame()) \
-        -> Tuple[List[IRFullTensor], List[IROperation], List[IRFullTensor]]:
+        -> Tuple[List[IRFullTensor], List[IRFwOperation], List[IRFullTensor]]:
         """
         The overall entry to parse a torchscript graph module
         """
@@ -46,7 +46,7 @@ class ScriptModuleParser:
                 if isinstance(val, IRFullTensor):
                     val.shape = shape
 
-        all_ir_nodes: List[IROperation] = list()
+        all_ir_nodes: List[IRFwOperation] = list()
         for node in module.graph.nodes():
             # debug info
             # print(f'on parsing:\n\t{node}')
@@ -83,9 +83,9 @@ class ScriptModuleParser:
         raise RuntimeError(f"Unkown node kind {node.kind()} from torchscript module")
 
     @staticmethod
-    def parse_node(node: torch._C.Node, module, frame: Frame) -> List[IROperation]:
+    def parse_node(node: torch._C.Node, module, frame: Frame) -> List[IRFwOperation]:
         """
-        Parse the node and return the IROperation nodes
+        Parse the node and return the IRFwOperation nodes
         """
         node_type = ScriptModuleParser.ntype(node)
         if node_type == ScriptNodeKind.PrimCallFunction:
@@ -100,7 +100,7 @@ class ScriptModuleParser:
             return ScriptModuleParser.parse_prim_constant_node(node, module, frame)
 
     @staticmethod
-    def parse_prim_function_node(node, module, frame: Frame) -> List[IROperation]:
+    def parse_prim_function_node(node, module, frame: Frame) -> List[IRFwOperation]:
         """
         parse node like:
             Tensor = prim::CallFunction(%5, %input.1, %3, %4)
@@ -135,7 +135,7 @@ class ScriptModuleParser:
         return [ir_node]
 
     @staticmethod
-    def parse_aten_node(node, module, frame: Frame) -> List[IROperation]:
+    def parse_aten_node(node, module, frame: Frame) -> List[IRFwOperation]:
         """
         Parse script module node like:
             %13 : Tensor = aten::gt(%output1.1, %output2.1)
@@ -181,7 +181,7 @@ class ScriptModuleParser:
         return [ir_node]
 
     @staticmethod
-    def parse_prim_method_node(node, module, frame: Frame) -> List[IROperation]:
+    def parse_prim_method_node(node, module, frame: Frame) -> List[IRFwOperation]:
         """
         Parse script module node like:
             %output.1 : Tensor = prim::CallMethod[name="forward"](%2, %x.1)
@@ -288,7 +288,7 @@ class ScriptModuleParser:
         return list()
 
     @staticmethod
-    def parse_prim_if_node(node, module, frame: Frame) -> List[IROperation]:
+    def parse_prim_if_node(node, module, frame: Frame) -> List[IRFwOperation]:
         """
         Parse script module node like 
             %output2 : Tensor = prim::If(%15) # /tmp/ipykernel_27188/2459450745.py:13:8

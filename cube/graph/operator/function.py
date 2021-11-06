@@ -1,10 +1,10 @@
 import copy
 
-from cube.graph.operator import IROperation
+from cube.graph.operator import IRFwOperation
 from cube.ir.cten import IRTensor
 
 
-class Linear(IROperation):
+class Linear(IRFwOperation):
 
     def __init__(self, signature, inputs, name='linear', **kwargs):
 
@@ -31,7 +31,7 @@ class Linear(IROperation):
         return False
 
 
-class ElementWise(IROperation):
+class ElementWise(IRFwOperation):
     """
     Functions like torch.add (tensor1 + tensor2 / scaler)
     """
@@ -56,7 +56,7 @@ class ElementWise(IROperation):
         return False
 
 
-class ElementWiseActivation(IROperation):
+class ElementWiseActivation(IRFwOperation):
     """
     functions like GELU, RELU, Dropout.
 
@@ -83,7 +83,7 @@ class ElementWiseActivation(IROperation):
         return False
 
 
-class Reduce(IROperation):
+class Reduce(IRFwOperation):
     """
     functions like sum, mean, cross_entropy
     """
@@ -101,7 +101,7 @@ class Reduce(IROperation):
         return True
 
 
-class UnkownOperator(IROperation):
+class UnkownOperator(IRFwOperation):
 
     def __init__(self, signature, inputs, name='unknown_op', n_output=None):
 

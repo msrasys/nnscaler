@@ -44,7 +44,7 @@ class DistAlgorithmFactory:
         Get op tranformed algorithms
 
         Args:
-            op (IROperation): index for the holist op factory
+            op (IRFwOperation): index for the holist op factory
             args, kwargs: (logical) tensor inputs
 
         Returns:

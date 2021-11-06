@@ -287,8 +287,17 @@ class IRFullTensor(IRTensor):
         """
         self.requires_grad = True
         self._is_param = True
+        self._is_grad = False
         for sub_tensor in self._segments:
             sub_tensor.as_param()
+
+    def as_grad(self):
+        self.requires_grad = False
+        self._is_param = False
+        self._is_grad = True
+        for sub_tensor in self._segments:
+            sub_tensor.as_grad()
+        return self
 
     def like(self):
         """
@@ -495,6 +504,16 @@ class IRSubTensor(IRTensor):
             self.parent.as_param()
         self.requires_grad = True
         self._is_param = True
+        self._is_grad = False
+        return self
+
+    def as_grad(self):
+        if not self.parent.is_grad():
+            self.parent.as_grad()
+        self.requires_grad = False
+        self._is_grad = True
+        self._is_param = False
+        return self
 
     def select(self, indices: Union[Tuple, IndexMap], val_map: Union[Tuple, ValueMap, None], shape=None):
         """
