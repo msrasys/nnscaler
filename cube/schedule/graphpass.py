@@ -44,15 +44,10 @@ class SUGraphPass:
         for su in sugraph.sus():
             devices.update(set(su.device))
         for device in devices:
-            dev_sus = [su for su in sugraph.sus() if device in su.device]
-            merged_su = None
-            for su in dev_sus:
-                if su.stype == SUType.Forward:
-                    if not isinstance(merged_su, ScheduleUnit):
-                        merged_su = su
-                        continue
-                    merged_su = sugraph.merge(merged_su, su)
-                    if not isinstance(merged_su, ScheduleUnit):
-                        merged_su = su
-
+            dev_sus = [su for su in sugraph.fsus() if device in su.device]
+            merged_su = dev_sus[0]
+            for su in dev_sus[1:]:
+                merged_su = sugraph.merge(merged_su, su)
+                if merged_su is None:
+                    merged_su = su
         return sugraph

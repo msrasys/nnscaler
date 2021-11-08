@@ -272,7 +272,7 @@ class SUGraph(IRCell):
             for idx, input in enumerate(su2.inputs()):
                 if input not in msu.inputs():
                     sadapters, radapters = su2.in_adapters(idx)
-                    for adapter in [sadapters + radapters]:
+                    for adapter in sadapters + radapters:
                         if adapter in self.sequence:
                             self.sequence.remove(adapter)
 

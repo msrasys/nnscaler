@@ -97,5 +97,4 @@ def test_merge_small_sus():
     print('merged:')
     print(sugraph)
 
-    assert len(sugraph.sus()) == 12
-    assert all([su.stype == SUType.Forward for su in sugraph.fsus()])
+    assert len(sugraph.sus()) == 2

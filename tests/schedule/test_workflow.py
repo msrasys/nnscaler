@@ -3,10 +3,10 @@ from torch import nn
 
 import cube
 from cube.graph.graph import IRGraph
-from cube.schedule.su import SUType, ScheduleUnit
+from cube.schedule.su import SUType
 from cube.schedule.pool import SchedulePool
-from cube.schedule.sugraph import SUGraph
-from cube.schedule.translator import LogicTranslator, IRDataLoader, SUGraphGener
+from cube.schedule.sugraph import SUGraphGener
+from cube.schedule.translator import IRDataLoader
 
 
 class MLP(nn.Module):

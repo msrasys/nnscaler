@@ -1,9 +1,10 @@
 import torch
 from cube.graph.operator.operator import IRBpOperation, IRDataOperation, IRFwOperation
 
-from cube.schedule.translator import LogicTranslator, SUGraphGener
+from cube.schedule.translator import LogicTranslator
 from cube.schedule.translator import IRDataLoader
 from cube.schedule.su import SUType
+from cube.schedule.sugraph import SUGraph, SUGraphGener
 from cube.schedule.pool import SchedulePool
 
 from cube.graph.tensor import IRFullTensor, IRSubTensor
@@ -98,7 +99,6 @@ def test_translator_forward():
 
     assert isinstance(output, IRSubTensor)
     assert output.shape == [64, 1024]
-    assert output.trace is not None
 
     nodes = SchedulePool().nodes()
     assert len(nodes) == 3
@@ -153,4 +153,4 @@ def test_sugraph_gener_gen():
         print(su)
     # note loss will be the input to autograd, therefore
     # have additional adapters
-    assert len(sugraph.sus()) == 18
+    assert len(sugraph.sus()) == 14

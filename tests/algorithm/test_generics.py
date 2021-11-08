@@ -13,7 +13,7 @@ def test_generic_algo_init():
     cell.outputs(0).shape = [1024, 1000]
 
     algo = GenericDistAlgo(cell)
-    assert algo.logic_op is cell
+    assert algo.logic_op is IRCell
     assert len(algo.input_shapes) == 3
     assert algo.input_shapes[0] == [1024, 1024]
     assert algo.input_shapes[1] == [1024, 1000]

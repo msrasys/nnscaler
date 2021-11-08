@@ -105,7 +105,7 @@ def test_sugraph_merge():
     su12 = sugraph.merge(su1, su2)
     print('merged: ')
     print(sugraph)
-    assert sugraph.nnodes == 4
+    assert sugraph.nnodes == 2
     assert len(su12.inputs()) == 4
     assert len(su12.outputs()) == 1
     assert len(su12.nodes()) == 2
