@@ -8,7 +8,7 @@ from cube.graph.operator import IRBpOperation
 from cube.ir.cten import IRTensor
 
 
-__all__ = ['forward', 'backward']
+__all__ = ['forward']
 
 
 class _TensorGener:
@@ -67,6 +67,8 @@ def forward(graph, *args) -> IRGraph:
 
         # forwrd node
         fnode = copy.copy(node)
+        fnode._inputs = inputs
+        fnode._outputs = outputs
         # set forward inputs
         for idx, val in enumerate(inputs):
             fnode.set_input(idx, gener.renew(val))
@@ -81,18 +83,20 @@ def forward(graph, *args) -> IRGraph:
             # set input
             bnode.set_data(idx, val)
             # set gradient output
-            val = val if isinstance(val, IRTensor) else None
-            grad = gener.renew(val, keep_param=False)
-            grad = grad.as_grad() if isinstance(grad, IRTensor) else grad
-            if isinstance(val, IRTensor) and val.requires_grad:
-                val.grad = grad
+            grad = None
+            if isinstance(val, IRTensor):
+                # TODO: requires_grad = False should be set to None
+                grad = gener.renew(val, keep_param=False).as_grad()
+                val.add_grad(grad)
             bnode.set_output(idx, grad)
         for idx, val in enumerate(fnode.outputs()):
             # set gradient input
-            grad = gener.renew(val, keep_param=False)
-            grad = grad.as_grad() if isinstance(grad, IRTensor) else grad
-            if isinstance(val, IRTensor) and val.requires_grad:
-                val.grad = grad
+            grad = None
+            if isinstance(val, IRTensor):
+                # TODO: requires_grad = False should be set to None
+                grad = gener.renew(val, keep_param=False).as_grad()
+                # TODO: this grad should be partitioned in value dimension
+                val.add_grad(grad)
             bnode.set_grad(idx, grad)
 
         fnode.device = node.device
@@ -109,7 +113,5 @@ def forward(graph, *args) -> IRGraph:
     outputs = [gener.renew(output) for output in graph.outputs()]
 
     fgraph = IRGraph(fnodes, inputs, outputs, graph.name)
-    for output in fgraph.outputs():
-        output.set_trace(fgraph.nodes())
     return fgraph
 

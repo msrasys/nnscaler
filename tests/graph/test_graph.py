@@ -137,6 +137,24 @@ def test_graph_forward():
     assert not bnode1 in bnode3.predecessors()
 
 
+def test_graph_multi_forward():
+    inputs, ops, outputs = construct_model()
+    graph = IRGraph(ops, inputs, outputs, 'MLP')
+
+    def _gen_data(graph):
+        data = list()
+        for input in graph.inputs():
+            data.append(input.parent.like().tosub())
+        return data
+    fgraph1 = gpass.forward(graph, *_gen_data(graph))
+    fgraph2 = gpass.forward(graph, *_gen_data(graph))
+    print(fgraph1)
+    print(fgraph2)
+    assert fgraph1.inputs != fgraph2.inputs()
+    for node1, node2 in zip(fgraph1.nodes(), fgraph2.nodes()):
+        assert node1.inputs() != node2.inputs()
+
+
 def test_graph_partition():
 
     inputs, ops, outputs = construct_model()
