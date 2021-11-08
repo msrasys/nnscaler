@@ -1,6 +1,7 @@
 import torch
+from cube.graph.operator.operator import IRBpOperation, IRDataOperation, IRFwOperation
 
-from cube.schedule.translator import LogicTranslator
+from cube.schedule.translator import LogicTranslator, SUGraphGener
 from cube.schedule.translator import IRDataLoader
 from cube.schedule.su import SUType
 from cube.schedule.pool import SchedulePool
@@ -77,14 +78,14 @@ def test_load_dataloader():
     assert data1.shape == [64, 1024]
 
     data2 = next(dataloader)
-    assert len(SchedulePool().sus()) == 2
-    assert all([su.stype == SUType.Dataloader for su in SchedulePool().sus()])
+    assert len(SchedulePool().nodes()) == 2
+    assert all([isinstance(node, IRDataOperation) for node in SchedulePool().nodes()])
 
     data3 = LogicTranslator.load_data(dataloader)
     assert isinstance(data1, IRSubTensor)
     assert data1.shape == [64, 1024]
-    assert len(SchedulePool().sus()) == 3
-    assert all([su.stype == SUType.Dataloader for su in SchedulePool().sus()])
+    assert len(SchedulePool().nodes()) == 3
+    assert all([isinstance(node, IRDataOperation) for node in SchedulePool().nodes()])
 
 
 def test_translator_forward():
@@ -99,12 +100,12 @@ def test_translator_forward():
     assert output.shape == [64, 1024]
     assert output.trace is not None
 
-    sus = SchedulePool().sus()
-    assert len(sus) == 3
-    assert output.trace == sus
-    for su in sus:
-        assert su.stype == SUType.Forward
-        assert su.mirror is not None
+    nodes = SchedulePool().nodes()
+    assert len(nodes) == 3
+    assert isinstance(SchedulePool().get_tape(output), list)
+    for node in nodes:
+        assert isinstance(node, IRFwOperation)
+        assert isinstance(node.mirror, IRBpOperation)
     
 
 def test_translator_backward():
@@ -113,20 +114,18 @@ def test_translator_backward():
     graph = construct_graph()
     data = IRFullTensor(shape=[64,1024], name='data').tosub()
     output = graph(data)
-
     output.backward()
 
-    sus = SchedulePool().sus()
-    assert len(sus) == 6
-    fsus = sus[0:3]
-    bsus = sus[3:]
-    for fsu, bsu in zip(fsus, bsus[::-1]):
+    nodes = SchedulePool().nodes()
+    assert len(nodes) == 6
+    fnodes = nodes[0:3]
+    bnodes = nodes[3:]
+    for fsu, bsu in zip(fnodes, bnodes[::-1]):
         assert fsu.mirror == bsu
         assert bsu.mirror == fsu
-        assert bsu.stype == SUType.Backward
 
 
-def test_translator_gen_adapter():
+def test_sugraph_gener_gen():
     SchedulePool().clear()
 
     graph = construct_graph()
@@ -134,24 +133,24 @@ def test_translator_gen_adapter():
     output = graph(data)
 
     # forward adatpers
-    sus = SchedulePool().sus()
-    sus = LogicTranslator.gen_adapter(sus)
-    assert len(sus) == 7
-    su1, send_su12, recv_su12, su2, send_su23, recv_su23, su3 = sus
+    nodes = SchedulePool().nodes()
+    sugraph = SUGraphGener.gen_sugraph(nodes)
+    assert len(sugraph.sus()) == 7
+    su1, send_su12, recv_su12, su2, send_su23, recv_su23, su3 = sugraph.sus()
     assert su1.stype == SUType.Forward
     assert su2.stype == SUType.Forward
     assert su3.stype == SUType.Forward
-    assert send_su12.stype == SUType.Adapter
-    assert recv_su12.stype == SUType.Adapter
-    assert send_su23.stype == SUType.Adapter
-    assert recv_su23.stype == SUType.Adapter
+    assert send_su12.stype == SUType.Comm
+    assert recv_su12.stype == SUType.Comm
+    assert send_su23.stype == SUType.Comm
+    assert recv_su23.stype == SUType.Comm
 
     # backward adapters
     output.backward()
-    sus = SchedulePool().sus()
-    sus = LogicTranslator.gen_adapter(sus)
-    for su in sus:
+    nodes = SchedulePool().nodes()
+    sugraph = SUGraphGener.gen_sugraph(nodes)
+    for su in sugraph.sus():
         print(su)
     # note loss will be the input to autograd, therefore
     # have additional adapters
-    assert len(sus) == 16
+    assert len(sugraph.sus()) == 18

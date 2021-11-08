@@ -6,8 +6,7 @@ from cube.graph.graph import IRGraph
 from cube.schedule.graphpass import SUGraphPass
 from cube.schedule.pool import SchedulePool
 from cube.schedule.su import SUType
-from cube.schedule.sugraph import SUGraph
-from cube.schedule.translator import LogicTranslator
+from cube.schedule.sugraph import SUGraphGener
 
 
 def construct_graph():
@@ -57,22 +56,20 @@ def test_remove_adapter():
     SchedulePool().clear()
 
     graph = construct_graph()
-    data = IRFullTensor(shape=[64,1024], name='data')
+    data = IRFullTensor(shape=[64,1024], name='data').tosub()
     output = graph(data)
     output.backward()
 
-    # forward adatpers
-    sus = SchedulePool().sus()
-    sus = LogicTranslator.gen_adapter(sus)
+    nodes = SchedulePool().nodes()
+    sugraph = SUGraphGener.gen_sugraph(nodes)
 
-    sugraph = SUGraph(sus)
     for su in sugraph.sus():
         sugraph.assign(su, 0)
     sugraph = SUGraphPass.remove_redundant_adapters(sugraph)
     for su in sugraph.sus():
         print(su)
     for su in sugraph.sus():
-        assert su.stype != SUType.Adapter
+        assert su.stype != SUType.Comm
     assert len(sugraph.sus()) == 6
 
 
@@ -81,18 +78,15 @@ def test_merge_small_sus():
     SchedulePool().clear()
 
     graph = construct_graph()
-    data = IRFullTensor(shape=[64,1024], name='data')
+    data = IRFullTensor(shape=[64,1024], name='data').tosub()
     output = graph(data)
     output.backward()
 
-    # forward adatpers
-    sus = SchedulePool().sus()
-    sus = LogicTranslator.gen_adapter(sus)
-
-    sugraph = SUGraph(sus)
+    nodes = SchedulePool().nodes()
+    sugraph = SUGraphGener.gen_sugraph(nodes)
 
     for su in sugraph.sus():
-        if su.stype != SUType.Adapter:
+        if su.stype != SUType.Comm:
             sugraph.assign(su, 0)
 
     print('orignal:')
@@ -103,7 +97,5 @@ def test_merge_small_sus():
     print('merged:')
     print(sugraph)
 
-    assert len(sugraph.sus()) == 4
-    assert sugraph.sus(0).stype == SUType.Forward
-    assert sugraph.sus(3).stype == SUType.Backward
-    assert sugraph.sus(0).mirror == sugraph.sus(3)
+    assert len(sugraph.sus()) == 12
+    assert all([su.stype == SUType.Forward for su in sugraph.fsus()])

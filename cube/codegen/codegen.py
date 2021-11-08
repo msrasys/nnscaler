@@ -54,7 +54,11 @@ class ModelCodeGen:
         # register forward input
         su_args: List[List[str]] = list()
         for su in device_sus:
-            fargs = [self.naming(input) for input in su.inputs()]
+            fargs = list()
+            for input in su.inputs():
+                if isinstance(input, IRTensor) and input.is_param():
+                    continue
+                fargs.append(self.naming(input))
             for name in fargs:
                 self.symbols.create(name)
             su_args.append(fargs)
@@ -115,8 +119,9 @@ class ModelCodeGen:
         """
         if isinstance(var, IRTensor):
             name = self.naming(var)
-            # indicate this is a leaf tensor, should be parameter
-            if var.is_param()and self.symbols.create(name):
+            # emit parameter code
+            if var.is_param() and not self.symbols.exist(name):
+                self.symbols.create(name)
                 code = f'self.{name} = torch.nn.Parameter(torch.empty({tuple(var.shape)}))'
                 self.declare_region.append(code)
         elif isinstance(var, str):
@@ -254,8 +259,6 @@ class ScheduleCodeGen:
         # generate code
         with FunctionBlock(func_name='_train_step', 
                            args=['model', 'dataloader']) as fb:
-            data_code = self.emit_data(device_sus)
-            fb.insert_body(data_code)
             for su in device_sus:
                 name = f'su{self.seq.sus().index(su)}'
                 code = self.emit_su(su, name=name)
@@ -270,24 +273,6 @@ class ScheduleCodeGen:
                 f.write(code)
         return code
 
-    def emit_data(self, device_sus) -> List[str]:
-        """
-        Emit dataloader iter code
-        """
-        # TODO: dataloader to op node
-        inputs = list()
-        for su in device_sus:
-            su_inputs = [
-                self.naming(input, su) for input in su.inputs() \
-                if input.is_leaf(device_sus)
-            ]
-            inputs += su_inputs
-        data_code = list()
-        if len(inputs) != 0:
-            inputs = '(' + ', '.join(inputs + ['']) + ')'
-            data_code.append(inputs + ' = next(dataloader)')
-        return data_code
-
     def emit_su(self, su: ScheduleUnit, name: str) -> List[str]:
         """
         Emit su code
@@ -300,11 +285,16 @@ class ScheduleCodeGen:
                 raise RuntimeError("Dataloader su has no inputs")
             outputs = [self.naming(output, su) for output in su.outputs()]
             return_val = ','.join(outputs)
-            code = f'{return_val} = {su.signature}'
+            code = f'{return_val} = next(dataloader)'
             return code
 
-        elif su.stype == SUType.Forward or su.stype == SUType.Adapter:
-            inputs = [self.naming(tensor, su) for tensor in su.inputs()]
+        elif su.stype == SUType.Forward or su.stype == SUType.Comm:
+            inputs = list()
+            for tensor in su.inputs():
+                if isinstance(tensor, IRTensor):
+                    if tensor.is_param():
+                        continue
+                inputs.append(self.naming(tensor, su))
             inputs = '(' + ', '.join(inputs + ['']) + ')'
             body = fsign.format(
                 model = f'model.{name}',
@@ -326,28 +316,38 @@ class ScheduleCodeGen:
             # 3). output_grads are recved tesnors of this graph (graph.recv_tensors)
             #       => backward graph input tensor (graph.recv_tensors)
             fsu = su.mirror
-            forward_inputs = [self.naming(tensor, fsu) for tensor in fsu.inputs()]
-            forward_inputs = '(' + ', '.join(forward_inputs + ['']) + ')'
-            forward_outputs = [self.naming(tensor, fsu) for tensor in fsu.outputs()]
-            forward_outputs = '(' + ', '.join(forward_outputs + ['']) + ')'
+            finputs = list()
+            for tensor in fsu.inputs():
+                if isinstance(tensor, IRTensor):
+                    if tensor.is_param():
+                        continue
+                finputs.append(self.naming(tensor, fsu))
+            fargs = '(' + ', '.join(finputs + ['']) + ')'
 
-            grads = list()
-            for tensor in su.inputs():
-                # the thensor is loss, no grad needs
-                if tensor in fsu.outputs():
-                    grads.append('None')
+            foutputs = list()
+            for tensor in fsu.outputs():
+                foutputs.append(self.naming(tensor, fsu))
+            foutputs = '(' + ', '.join(foutputs + ['']) + ')'
+
+            in_grads = list()
+            for tensor in fsu.outputs():
+                grad = tensor.grad
+                if grad in fsu.outputs():
+                    in_grads.append('None')
                 else:
-                    grads.append(self.naming(tensor, su))
-            grads = '(' + ', '.join(grads + ['']) + ')'
+                    in_grads.append(self.naming(grad, su))
+            in_grads = '(' + ', '.join(in_grads + ['']) + ')'
 
             body = bsign.format(
-                input_tensors = forward_inputs,
-                output_tensors = forward_outputs,
-                output_grads = grads
+                input_tensors = fargs,
+                output_tensors = foutputs,
+                output_grads = in_grads
             )
 
             # returned value are graph.outputs
             return_val = [self.naming(tensor, su) for tensor in su.outputs()]
+            # TODO: fix this by using grad attributed
+            return_val = return_val[:len(finputs)]
             if len(return_val) > 0:
                 return_code = ', '.join(return_val) + ' = '
             else:

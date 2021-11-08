@@ -89,9 +89,11 @@ def forward(graph, *args) -> IRGraph:
             bnode.set_output(idx, grad)
         for idx, val in enumerate(fnode.outputs()):
             # set gradient input
-            val = gener.renew(val, keep_param=False)
-            val = val.as_grad() if isinstance(val, IRTensor) else val
-            bnode.set_grad(idx, val)
+            grad = gener.renew(val, keep_param=False)
+            grad = grad.as_grad() if isinstance(grad, IRTensor) else grad
+            if isinstance(val, IRTensor) and val.requires_grad:
+                val.grad = grad
+            bnode.set_grad(idx, grad)
 
         fnode.device = node.device
         bnode.device = node.device

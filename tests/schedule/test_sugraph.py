@@ -55,6 +55,7 @@ def test_graph_init():
     sus = [ScheduleUnit([node], SUType.Forward) for node in graph.nodes()]
 
     sugraph = SUGraph(sus)
+    print(sugraph)
     assert len(sugraph.inputs()) == 1
     assert len(sugraph.outputs()) == 1
     assert graph.inputs() == sugraph.inputs()
@@ -95,13 +96,17 @@ def test_sugraph_merge():
     sus = [ScheduleUnit([node], SUType.Forward) for node in graph.nodes()]
 
     sugraph = SUGraph(sus)
-    su1, su2, su3 = sugraph.sus()
+    su1, su2, su3 = sugraph.fsus()
 
     assert sugraph.merge(su1, su3) is None
-    
+
+    print('origin: ')
+    print(sugraph)
     su12 = sugraph.merge(su1, su2)
-    assert sugraph.nnodes == 2
-    assert len(su12.inputs()) == 1
+    print('merged: ')
+    print(sugraph)
+    assert sugraph.nnodes == 4
+    assert len(su12.inputs()) == 4
     assert len(su12.outputs()) == 1
     assert len(su12.nodes()) == 2
     assert su12 in sugraph.sus()
@@ -128,7 +133,7 @@ def test_sugraph_add_flow():
     assert su3 in su1.successors()
 
 
-def test_sugraph_assign():
+def test_sugraph_assign1():
 
     graph = construct_graph()
     sus = [ScheduleUnit([node], SUType.Forward) for node in graph.nodes()]
@@ -145,8 +150,8 @@ def test_sugraph_assign():
         recv_ranks = [-1]
     )
     send_op.pair(recv_op)
-    send_su12 = ScheduleUnit([send_op], SUType.Adapter, name='send')
-    recv_su12 = ScheduleUnit([recv_op], SUType.Adapter, name='recv')
+    send_su12 = ScheduleUnit([send_op], SUType.Comm, name='send')
+    recv_su12 = ScheduleUnit([recv_op], SUType.Comm, name='recv')
     su1._add_out_adapter(0, send_su12, recv_su12)
     su2._add_in_adapter(0, send_su12, recv_su12)
 
@@ -160,8 +165,8 @@ def test_sugraph_assign():
         recv_ranks = [-1]
     )
     send_op.pair(recv_op)
-    send_su23 = ScheduleUnit([send_op], SUType.Adapter, name='send')
-    recv_su23 = ScheduleUnit([recv_op], SUType.Adapter, name='recv')
+    send_su23 = ScheduleUnit([send_op], SUType.Comm, name='send')
+    recv_su23 = ScheduleUnit([recv_op], SUType.Comm, name='recv')
     su2._add_out_adapter(0, send_su23, recv_su23)
     su3._add_in_adapter(0, send_su23, recv_su23)
 
@@ -193,7 +198,7 @@ def test_sugraph_assign():
     assert not sugraph.assign(send_su12, 3)
 
 
-def test_sugraph_assign():
+def test_sugraph_assign2():
 
     graph = construct_graph()
     sus = [ScheduleUnit([node], SUType.Forward) for node in graph.nodes()]
@@ -210,8 +215,8 @@ def test_sugraph_assign():
         recv_ranks = [-1]
     )
     send_op.pair(recv_op)
-    send_su12 = ScheduleUnit([send_op], SUType.Adapter, name='send')
-    recv_su12 = ScheduleUnit([recv_op], SUType.Adapter, name='recv')
+    send_su12 = ScheduleUnit([send_op], SUType.Comm, name='send')
+    recv_su12 = ScheduleUnit([recv_op], SUType.Comm, name='recv')
     su1._add_out_adapter(0, send_su12, recv_su12)
     su2._add_in_adapter(0, send_su12, recv_su12)
 
@@ -225,8 +230,8 @@ def test_sugraph_assign():
         recv_ranks = [-1]
     )
     send_op.pair(recv_op)
-    send_su23 = ScheduleUnit([send_op], SUType.Adapter, name='send')
-    recv_su23 = ScheduleUnit([recv_op], SUType.Adapter, name='recv')
+    send_su23 = ScheduleUnit([send_op], SUType.Comm, name='send')
+    recv_su23 = ScheduleUnit([recv_op], SUType.Comm, name='recv')
     su2._add_out_adapter(0, send_su23, recv_su23)
     su3._add_in_adapter(0, send_su23, recv_su23)
 

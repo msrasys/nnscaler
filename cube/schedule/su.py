@@ -2,35 +2,44 @@ from typing import List, Optional, Tuple
 import copy
 from enum import Enum
 
-from cube.ir.cten import IRCell
+from cube.ir.cten import IRCell, IRTensor
+from cube.graph.operator import IRBpOperation
 
 
 class SUType(Enum):
 
+    Dataloader = 'next(dataloader)'
+
     # outputs = cube.runtime.temporal.forward(model, *args)
-    Forward = 'cube.runtime.temporal.forward'
+    Forward = 'cube.runtime.executor.fexecute'
 
     # grads = cube.runtime.temporal.backward(
     #   input_tensors, output_tensors, output_grads
     # )
-    Backward = 'cube.runtime.temporal.backward'
+    Backward = 'cube.runtime.executor.backward'
+
+    Transform = 'cube.runtime.adapter.transform'
 
     # cube.runtime.collectives.sendrecv(send_tensors, send_ranks,
     #   recv_shapes, from_ranks
     # )
-    Adapter = 'cube.runtime.collectives.sendrecv'
+    Comm = 'cube.runtime.adapter.sendrecv'
 
-    Dataloader = 'next(dataloader)'
+    Empty = 'None'
 
 
 class ScheduleUnit(IRCell):
-    """
-    Action recv tensors must be inside of Action inputs,
-    and can be mapped to Action.graph.inputs
-
+    r"""
+    ScheduleUnit for policy scheduling.
     """
 
     def __init__(self, nodes: List[IRCell], stype: SUType, name='su'):
+        """
+        Create a ScheduleUnit.
+
+        Args:
+            nodes (List[IRCell]): A list of nodes in IRGraph
+        """
 
         if not all([isinstance(node, IRCell) for node in nodes]):
             raise ValueError("Expected each nodes to be List[IRCell]")
@@ -38,10 +47,11 @@ class ScheduleUnit(IRCell):
             raise TypeError("Expected stype be SUType")
 
         # get inputs and outputs
+        # TODO: fix bug on multi-branch
         inputs = IRCell.get_inputs(nodes)
-        inputs = [input for input in inputs if not input.is_param()]
+        # inputs = [input for input in inputs if not input.is_param()]
         outputs = IRCell.get_outputs(nodes)
-        outputs = [output for output in outputs if not output.is_param()]
+        # outputs = [output for output in outputs if not output.is_param()]
         super().__init__(
             name          = name,
             signature     = stype.value,
@@ -81,8 +91,6 @@ class ScheduleUnit(IRCell):
         self._ctrl_predecessors = list()
         self._ctrl_successors = list()
 
-        self.mirror = None
-
     def __copy__(self):
         """
         Copy the SU. Note the mirror su is also copied
@@ -94,18 +102,9 @@ class ScheduleUnit(IRCell):
             mirror_su = ScheduleUnit(
                 mirror_su._nodes, mirror_su.stype, mirror_su.name
             )
-            su.set_mirror(mirror_su)
-            mirror_su.set_mirror(su)
+            su.mirror = mirror_su
+            mirror_su.mirror = su
         return su
-
-    def set_mirror(self, su):
-        """
-        Create a mirrored ScheduleUnit: the 
-        inputs and outputs are reversed
-        """
-        if not isinstance(su, ScheduleUnit):
-            raise TypeError("Expected mirror to be ScheduleUnit")
-        self.mirror = su
 
     def in_adapters(self, index: Optional[int] = None) -> List:
         """
@@ -209,6 +208,8 @@ class ScheduleUnit(IRCell):
         self._recv_in_adapters: List[List[ScheduleUnit]] = [
             list() for _ in range(len(self.inputs()))
         ]
+        self._merge_adapters: List[ScheduleUnit] = [None] * len(self._inputs)
+        self._select_adapters: List[ScheduleUnit] = [None] * len(self._outputs)
         self._send_out_adapters: List[List[ScheduleUnit]] = [
             list() for _ in range(len(self.outputs()))
         ]
@@ -216,7 +217,7 @@ class ScheduleUnit(IRCell):
             list() for _ in range(len(self.outputs()))
         ]
 
-    def _add_in_adapter(self, index: int, send_adapter, recv_adapter):
+    def _add_in_adapter(self, index: int, send_adapters, recv_adapters):
         """
         Add adapters to the input tensor of this SU
 
@@ -227,12 +228,19 @@ class ScheduleUnit(IRCell):
         """
         if index >= len(self._inputs):
             raise ValueError(f"index {index} out of range {len(self._inputs)}")
-        if not isinstance(send_adapter, ScheduleUnit):
-            raise TypeError("Expected send adapter to be ScheduleUnit")
-        if not isinstance(recv_adapter, ScheduleUnit):
-            raise TypeError("Expected recv adapter to be ScheduleUnit")
-        self._send_in_adapters[index].append(send_adapter)
-        self._recv_in_adapters[index].append(recv_adapter)
+        if isinstance(send_adapters, ScheduleUnit):
+            send_adapters = [send_adapters]
+        if not all(isinstance(adapter, ScheduleUnit) for adapter in send_adapters):
+            raise TypeError("Expected send adapter to be (list of) ScheduleUnit")
+        if isinstance(recv_adapters, ScheduleUnit):
+            recv_adapters = [recv_adapters]
+        if not all(isinstance(adapter, ScheduleUnit) for adapter in send_adapters):
+            raise TypeError("Expected recv adapters to be (list of) ScheduleUnit")
+        if len(send_adapters) != len(recv_adapters):
+            raise ValueError("Expected same number of send / recv adapters")
+        for send_adapter, recv_adapter in zip(send_adapters, recv_adapters):
+            self._send_in_adapters[index].append(send_adapter)
+            self._recv_in_adapters[index].append(recv_adapter)
 
     def _set_merge_adapter(self, index: int, merge_adapter):
         """
@@ -244,11 +252,11 @@ class ScheduleUnit(IRCell):
         """
         if index >= len(self._inputs):
             raise ValueError(f"index {index} out of range {len(self._inputs)}")
-        if not isinstance(merge_adapter, ScheduleUnit):
-            raise TypeError("Expected merge adapter to be ScheduleUnit")
+        if merge_adapter is not None and not isinstance(merge_adapter, ScheduleUnit):
+            raise TypeError("Expected merge adapter to be None or ScheduleUnit")
         self._merge_adapters[index] = merge_adapter
 
-    def _add_out_adapter(self, index: int, send_adapter, recv_adapter):
+    def _add_out_adapter(self, index: int, send_adapters, recv_adapters):
         """
         Add adapters to the output tensor of this SU
 
@@ -259,12 +267,19 @@ class ScheduleUnit(IRCell):
         """
         if index >= len(self._outputs):
             raise ValueError(f"index {index} out of range {len(self._outputs)}")
-        if not isinstance(send_adapter, ScheduleUnit):
-            raise TypeError("Expected send adapter to be ScheduleUnit")
-        if not isinstance(recv_adapter, ScheduleUnit):
-            raise TypeError("Expected recv adapter to be ScheduleUnit")
-        self._send_out_adapters[index].append(send_adapter)
-        self._recv_out_adapters[index].append(recv_adapter)
+        if isinstance(send_adapters, ScheduleUnit):
+            send_adapters = [send_adapters]
+        if not all(isinstance(adapter, ScheduleUnit) for adapter in send_adapters):
+            raise TypeError("Expected send adapter to be (list of) ScheduleUnit")
+        if isinstance(recv_adapters, ScheduleUnit):
+            recv_adapters = [recv_adapters]
+        if not all(isinstance(adapter, ScheduleUnit) for adapter in send_adapters):
+            raise TypeError("Expected recv adapters to be (list of) ScheduleUnit")
+        if len(send_adapters) != len(recv_adapters):
+            raise ValueError("Expected same number of send / recv adapters")
+        for send_adapter, recv_adapter in zip(send_adapters, recv_adapters):
+            self._send_out_adapters[index].append(send_adapter)
+            self._recv_out_adapters[index].append(recv_adapter)
 
     def _set_select_adapter(self, index: int, select_adapter):
         """
@@ -276,9 +291,39 @@ class ScheduleUnit(IRCell):
         """
         if index >= len(self._outputs):
             raise ValueError(f"index {index} out of range {len(self._inputs)}")
-        if not isinstance(select_adapter, ScheduleUnit):
-            raise TypeError("Expected merge adapter to be ScheduleUnit")
+        if select_adapter is not None and not isinstance(select_adapter, ScheduleUnit):
+            raise TypeError("Expected merge adapter to be Optional[ScheduleUnit]")
         self._select_adapters[index] = select_adapter
+
+    def _remove_adapter(self, adapter):
+        """
+        Remove the adapter
+        """
+        for send_adapters in self._send_in_adapters:
+            if adapter in send_adapters:
+                send_adapters.remove(adapter)
+                return True
+        for recv_adapters in self._recv_in_adapters:
+            if adapter in recv_adapters:
+                recv_adapters.remove(adapter)
+                return True
+        if adapter in self._merge_adapters:
+            idx = self._merge_adapters.index(adapter)
+            self._merge_adapters[idx] = None
+            return True
+        if adapter in self._select_adapters:
+            idx = self._select_adapters.index(adapter)
+            self._select_adapters[idx] = None
+            return True
+        for send_adapters in self._send_out_adapters:
+            if adapter in send_adapters:
+                send_adapters.remove(adapter)
+                return True
+        for recv_adapters in self._recv_out_adapters:
+            if adapter in recv_adapters:
+                recv_adapters.remove(adapter)
+                return True
+        return False
 
     def nodes(self, index: Optional[int] = None):
         """
@@ -376,7 +421,27 @@ class ScheduleUnit(IRCell):
             raise TypeError("Expected index to be None or int")
 
     def __repr__(self):
-        su_inputs = [f't{tensor._id}-dev{tensor.device}' for tensor in self.inputs()]
-        su_outputs = [f't{tensor._id}-dev{tensor.device}' for tensor in self.outputs()]
+        su_inputs = list()
+        for tensor in self.inputs():
+            if isinstance(tensor, IRTensor):
+                anno = 't'
+                if tensor.is_param():
+                    anno = 'w'
+                if tensor.is_grad():
+                    anno = 'g'
+                su_inputs.append(f'{anno}{tensor._id}')
+            else:
+                su_inputs.append(tensor)
+        su_outputs = list()
+        for tensor in self.outputs():
+            if isinstance(tensor, IRTensor):
+                anno = 't'
+                if tensor.is_param():
+                    anno = 'w'
+                if tensor.is_grad():
+                    anno = 'g'
+                su_outputs.append(f'{anno}{tensor._id}')
+            else:
+                su_outputs.append(tensor)
         dscp = f'SU({self.stype}, nodes={len(self.nodes())})-dev{self.device}: {su_inputs} -> {su_outputs}'
         return dscp

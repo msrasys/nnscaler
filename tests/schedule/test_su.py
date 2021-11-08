@@ -51,27 +51,29 @@ def test_su_init():
     linear1, linear2, linear3 = nodes
 
     su1 = ScheduleUnit([linear1], stype=SUType.Forward)
-    assert len(su1.inputs()) == 1
+    assert len(su1.inputs()) == 3
     assert len(su1.outputs()) == 1
     assert su1.signature == SUType.Forward.value
 
     assert su1.mirror is None
     assert su1.stype == SUType.Forward
     assert su1._nodes == [linear1]
-    assert len(su1._send_in_adapters) == 1
-    assert len(su1._recv_in_adapters) == 1
+    assert len(su1._send_in_adapters) == 3
+    assert len(su1._recv_in_adapters) == 3
     assert len(su1._send_out_adapters) == 1
     assert len(su1._recv_out_adapters) == 1
     assert len(su1._ctrl_predecessors) == 0
     assert len(su1._ctrl_successors) == 0
 
     su2 = ScheduleUnit([linear1, linear2], stype=SUType.Forward)
-    assert len(su2.inputs()) == 1
+    print('su2:', su2)
+    assert len(su2.inputs()) == 4
     assert len(su2.outputs()) == 1
     assert su2.signature == SUType.Forward.value
 
     su3 = ScheduleUnit([linear1, linear2, linear3], stype=SUType.Forward)
-    assert len(su3.inputs()) == 1
+    print('su3:', su3)
+    assert len(su3.inputs()) == 6
     assert len(su3.outputs()) == 1
     assert su3.signature == SUType.Forward.value
 
@@ -83,16 +85,8 @@ def test_su_copy():
     linear1, linear2, linear3 = nodes
 
     su1 = ScheduleUnit([linear1, linear2], stype=SUType.Forward)
-    assert len(su1.inputs()) == 1
-    assert len(su1.outputs()) == 1
-    assert su1.signature == SUType.Forward.value
-
     su2 = ScheduleUnit([linear1, linear2, linear3], stype=SUType.Forward)
-    assert len(su2.inputs()) == 1
-    assert len(su2.outputs()) == 1
-    assert su2.signature == SUType.Forward.value
-
-    su1.set_mirror(su2)
+    su1.mirror = su2
 
     csu = copy.copy(su1)
     assert csu.inputs() == su1.inputs()

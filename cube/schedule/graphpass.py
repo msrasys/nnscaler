@@ -14,7 +14,7 @@ class SUGraphPass:
         """
         redundant_adapters = list()
         for su in sugraph.sus():
-            if su.stype != SUType.Adapter:
+            if su.stype != SUType.Comm:
                 for idx in range(len(su.outputs())):
                     send_adapters, recv_adapters = su.out_adapters(idx)
                     for sadapter, radapter in zip(send_adapters, recv_adapters):

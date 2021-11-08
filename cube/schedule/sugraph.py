@@ -1,8 +1,15 @@
 from typing import List, Optional, Union
 import copy
 
-from cube.ir.cten import IRCell
+
+from cube.ir.cten import IRCell, IRTensor
+from cube.graph.operator import IRBpOperation
+from cube.graph.operator import IRDataOperation
+from cube.graph.operator import IRFwOperation
+from cube.graph.graph import IRGraph
 from cube.schedule.su import SUType, ScheduleUnit
+from cube.schedule.adapter.comm import IRCommunication
+from cube.schedule.adapter.select import IRTensorReshape
 
 
 class SUGraph(IRCell):
@@ -15,7 +22,9 @@ class SUGraph(IRCell):
             )
 
         inputs = IRCell.get_inputs(sus)
+        inputs = [input for input in inputs if not input.is_param()]
         outputs = IRCell.get_outputs(sus)
+        outputs = [output for output in outputs if not output.is_param()]
         super().__init__(
             name = 'SU',
             signature = 'None',
@@ -28,7 +37,7 @@ class SUGraph(IRCell):
             self.set_output(idx, output)
 
         self.sequence = sus
-        self.reset_dependency()
+        SUGraph.reset_dependency(self.sequence)
 
     @property
     def nnodes(self) -> int:
@@ -37,25 +46,38 @@ class SUGraph(IRCell):
         """
         return len(self.sequence)
 
-    def reset_dependency(self):
+    @staticmethod
+    def reset_dependency(sus: List[ScheduleUnit]):
         """
         Reset the node dataflow dependency
         """
-        # set node predecessors and successors
-        for src_idx in range(self.nnodes):
-            src_su = self.sequence[src_idx]
-            src_su._successors = [
-                list() for _ in range(len(src_su.outputs()))
-            ]
-            for dst_su in self.sequence[src_idx+1:]:
-                dst_su._predecessors = [
-                    list() for _ in range(len(dst_su.inputs()))
-                ]
-                for out_idx, out_tensor in enumerate(src_su.outputs()):
-                    for in_idx, in_tensor in enumerate(dst_su.inputs()):
+        if not all([isinstance(su, ScheduleUnit) for su in sus]):
+            raise TypeError("Expected list of schedule unit")
+        for su in sus:
+            su.clear_predecessor()
+            su.clear_successor()
+        for src_idx in range(len(sus)):
+            src = sus[src_idx]
+            for dst in sus[src_idx+1:]:
+                for out_idx, out_tensor in enumerate(src.outputs()):
+                    for in_idx, in_tensor in enumerate(dst.inputs()):
                         if out_tensor.overlap(in_tensor):
-                            src_su.add_successor(out_idx, dst_su)
-                            dst_su.add_predecessor(in_idx, src_su)
+                            src.add_successor(out_idx, dst)
+                            dst.add_predecessor(in_idx, src)
+
+    @staticmethod
+    def gen_comm_adapter(sus: List[ScheduleUnit]):
+        """
+        Generate communication adapter for each SU
+        """
+        pass
+
+    @staticmethod
+    def gen_trans_adapter(sus: List[ScheduleUnit]):
+        """
+        Generate transformation adapter for each SU
+        """
+        pass
 
     def __len__(self):
         return len(self.sequence)
@@ -77,6 +99,21 @@ class SUGraph(IRCell):
             return copy.copy(self.sequence)
         else:
             raise TypeError("Expected index to be None or int")
+
+    def fsus(self) -> List[ScheduleUnit]:
+        """
+        Get forward ScheduleUnits sequence.
+        """
+        return [su for su in self.sequence if su.stype == SUType.Forward]
+
+    def get_graph(self, sus: List[ScheduleUnit], name: str) -> IRGraph:
+        """
+        Generate IRGraph
+        """
+        nodes = list()
+        for su in sus:
+            nodes += su.nodes()
+        return IRGraph(nodes, None, None, name)
 
     def happen_before(self, su1, su2):
         """
@@ -121,130 +158,111 @@ class SUGraph(IRCell):
             if fail: None
         """
 
-        def _adapter_merge(first_su: ScheduleUnit, second_su: ScheduleUnit, merged_su: ScheduleUnit):
-            # move from first_su adapter
-            # print(f' 1st SU: {first_su} \n 2nd SU: {second_su} \n merged SU: {merged_su}')
-            for idx, input in enumerate(first_su.inputs()):
-                send_adapters, recv_adapters = first_su.in_adapters(idx)
-                merge_adapter = first_su.merge_adapters(idx)
-                merge_idx = merged_su.inputs().index(input)
-                for send_adapter, recv_adapter in zip(send_adapters, recv_adapters):
-                    merged_su._add_in_adapter(merge_idx, send_adapter, recv_adapter)
-                if merge_adapter in self.sequence:
-                    merged_su._set_merge_adapter(merge_idx, merge_adapter)
-            for idx, output in enumerate(first_su.outputs()):
-                send_adapters, recv_adapters = first_su.out_adapters(idx)
-                select_adapter = first_su.select_adapters(idx)
-                if output in merged_su.outputs() and output not in second_su.outputs():
-                    merge_idx = merged_su.outputs().index(output)
-                    for send_adapter, recv_adapter in zip(send_adapters, recv_adapters):
-                        merged_su._add_out_adapter(merge_idx, send_adapter, recv_adapter)
-                    if select_adapter:
-                        merged_su._set_select_adapter(merge_idx, select_adapter)
-                else:
-                    if merge_adapter in self.sequence:
-                        self.sequence.remove(merge_adapter)
-            # move from su2 adapter
-            for idx, input in enumerate(second_su.inputs()):
-                send_adapters, recv_adapters = second_su.in_adapters(idx)
-                merge_adapter = second_su.merge_adapters(idx)
-                if input in merged_su.inputs() and input not in first_su.inputs():
-                    merge_idx = merged_su.inputs().index(input)
-                    for send_adapter, recv_adapter in zip(send_adapters, recv_adapters):
-                        merged_su._add_in_adapter(merge_idx, send_adapter, recv_adapter)
-                    if merge_adapter:
-                        merged_su._set_merge_adapter(merge_idx, merge_adapter)
-                else:
-                    for send_adapter, recv_adapter in zip(send_adapters, recv_adapters):
-                        # print(f'removing: {send_adapter}')
-                        # print(f'removing: {recv_adapter}')
-                        if send_adapter in self.sequence:
-                            self.sequence.remove(send_adapter)
-                        if recv_adapter in self.sequence:
-                            self.sequence.remove(recv_adapter)
-                    if merge_adapter in self.sequence:
-                        self.sequence.remove(merge_adapter)
-            for idx, output in enumerate(second_su.outputs()):
-                send_adapters, recv_adapters = second_su.out_adapters(idx)
-                select_adapter = second_su.select_adapters(idx)
-                if output in merged_su.outputs():
-                    merge_idx = merged_su.outputs().index(output)
-                    for send_adapter, recv_adapter in zip(send_adapters, recv_adapters):
-                        merged_su._add_out_adapter(merge_idx, send_adapter, recv_adapter)
-                    if select_adapter:
-                        merged_su._set_select_adapter(merge_idx, select_adapter)
-                else:
-                    if select_adapter:
-                        self.sequence.remove(select_adapter)
+        fsus = self.fsus()
+        if su1 not in fsus:
+            raise RuntimeError(f"SU1: {su1} not in forward SUs")
+        if su2 not in fsus:
+            raise RuntimeError(f"SU2: {su2} not in forward SUs")
 
-        if not isinstance(su1, ScheduleUnit) or \
-           not isinstance(su2, ScheduleUnit):
-            raise TypeError("Expected SU1 and SU2 are ScheduleUnit")
-        if su1 not in self.sequence:
-            raise ValueError(f"su1: {su1}  not in sequence")
-        if su2 not in self.sequence:
-            raise ValueError(f"su2: {su2}  not in sequence")
-        
-        # 2) all the nodes in both SU are on the same device
-        if su1 == su2 or su1.stype != su2.stype:
-            return None
+        idx1, idx2 = fsus.index(su1), fsus.index(su2)
+        su1, su2 = (su1, su2) if idx1 < idx2 else (su2, su1)
+
+        # condition 1): same device
         if su1.device != su2.device:
             return None
 
-        if su1.stype == SUType.Adapter:
-            raise NotImplementedError("Not supported for merging Adapter")
-
-        index_su1 = self.sequence.index(su1)
-        index_su2 = self.sequence.index(su2)
-        su1, su2 = (su1, su2) if index_su1 < index_su2 else (su2, su1)
-        # 3) deadlock-free merge
-        index_su1, index_su2 = min(index_su1, index_su2), max(index_su1, index_su2)
-        inter_sus = self.sequence[index_su1+1:index_su2]
+        # condition 2): su2 input cannot be got from both su1 and other su
+        start, stop = min(idx1, idx2), max(idx1, idx2)
+        inter_sus = fsus[start+1:stop]
         for su in inter_sus:
-            # in theory the below condition satisfies merge, but it may
-            # break the topo order
-            # e.g., su1 -> adapter1 ,....., adapter2 -> su2
-            # if self.happen_before(su1, su) and self.happen_before(su, su2):
-            # to keep topo order:
-            if su.stype != SUType.Adapter and self.happen_before(su, su2):
+            if self.happen_before(su, su2):
+                return None
+        for idx in range(len(su2.inputs())):
+            prev_sus = su2.predecessors(idx)
+            prev_sus = [su for su in prev_sus if su.stype != SUType.Comm]
+            if su2 in prev_sus and len(prev_sus) > 1:
                 return None
 
-        # merge forward su
-        sub_nodes = su1.nodes() + su2.nodes()
-        merged_su = ScheduleUnit(sub_nodes, su1.stype)
-        merged_su.device = su1.device
-        _adapter_merge(su1, su2, merged_su)
+        # start merging
+        fnodes = su1.nodes() + su2.nodes()
+        # TODO: fix multi-branch
+        fsu = ScheduleUnit(fnodes, SUType.Forward, name='fsu')
+        fsu.device = su1.device
 
-        # merge mirrored su
-        # mirror_su2 -> mirror_su1
-        mirror_su1, mirror_su2 = su1.mirror, su2.mirror
-        merged_mirror_su = None
-        if mirror_su1 and mirror_su2:
-            if mirror_su1.device == mirror_su2.device:
-                sub_nodes = mirror_su2.nodes() + mirror_su1.nodes()
-                merged_mirror_su = ScheduleUnit(sub_nodes, mirror_su1.stype)
-                merged_mirror_su.device = mirror_su1.device
-                _adapter_merge(mirror_su2, mirror_su1, merged_mirror_su)
-                # set mirror
-                merged_su.set_mirror(merged_mirror_su)
-                merged_mirror_su.set_mirror(merged_su)
-        elif mirror_su1 or mirror_su2:
-            raise RuntimeError(
-                "The merged su should be both have mirror or both not have."
+        bnodes = [node.mirror for node in fnodes][::-1]
+        skip_bp = all([bnode is None for bnode in bnodes])
+        if not skip_bp:
+            bnode = IRBpOperation(
+                data_num=len(fsu.inputs()),
+                grad_num=len(fsu.outputs())
             )
+            for idx, input in enumerate(fsu.inputs()):
+                bnode.set_data(idx, input)
+            fout_grads = [out.grad for out in fsu.outputs()]
+            for idx, fout_grad in enumerate(fout_grads):
+                bnode.set_grad(idx, fout_grad)
+            for idx, fin in enumerate(fsu.inputs()):
+                if isinstance(fin, IRTensor):
+                    bnode.set_output(idx, fin.grad)
+                else:
+                    bnode.set_output(idx, None)
+            for output in fsu.outputs():
+                print(output.grad)
+            bsu = ScheduleUnit([bnode], stype=SUType.Backward, name='bsu')
+            bsu.device = su2.mirror.device
+            fsu.mirror = bsu
+            bsu.mirror = fsu
 
-        # replace
-        self.sequence[index_su1] = merged_su
+        def _set_adapters(su1, su2, msu):
+            # set adapter
+            for idx, input in enumerate(msu.inputs()):
+                if input in su1.inputs():
+                    su1_idx = su1.inputs().index(input)
+                    adapters = su1.in_adapters(su1_idx)
+                    merge_adapter = su1.merge_adapters(su1_idx)
+                elif input in su2.inputs():
+                    su2_idx = su2.inputs().index(input)
+                    adapters = su2.in_adapters(su2_idx)
+                    merge_adapter = su2.merge_adapters(su2_idx)
+                else:
+                    raise RuntimeError("Internal Error: not found input SU")
+                msu._add_in_adapter(idx, *adapters)
+                msu._set_merge_adapter(idx, merge_adapter)
+            for idx, output in enumerate(msu.outputs()):
+                if output in su1.outputs():
+                    su1_idx = su1.outputs().index(output)
+                    adapters = su1.out_adapters(su1_idx)
+                    select_adapter = su1.select_adapters(su1_idx)
+                elif output in su2.outputs():
+                    su2_idx = su2.outputs().index(output)
+                    adapters = su2.out_adapters(su2_idx)
+                    select_adapter = su2.select_adapters(su2_idx)
+                else:
+                    raise RuntimeError("Internal Error: not found output SU")
+                msu._add_out_adapter(idx, *adapters)
+                msu._set_merge_adapter(idx, select_adapter)
+            # remove adapters
+            for idx, input in enumerate(su2.inputs()):
+                if input not in msu.inputs():
+                    sadapters, radapters = su2.in_adapters(idx)
+                    for adapter in [sadapters + radapters]:
+                        if adapter in self.sequence:
+                            self.sequence.remove(adapter)
+
+        _set_adapters(su1, su2, fsu)
+        if not skip_bp:
+            _set_adapters(su2.mirror, su1.mirror, bsu)
+
+        # replace 
+        self.sequence[self.sequence.index(su1)] = fsu
         self.sequence.remove(su2)
-        if merged_mirror_su:
-            if mirror_su1 in self.sequence and mirror_su2 in self.sequence:
-                index_mirror_su2 = self.sequence.index(mirror_su2)
-                self.sequence[index_mirror_su2] = merged_mirror_su
-                self.sequence.remove(mirror_su1)
+        if not skip_bp:
+            self.sequence[self.sequence.index(su2.mirror)] = bsu
+            self.sequence.remove(su1.mirror)
 
-        # TODO: optimize: reset dependency
-        self.reset_dependency()
-        return merged_su
+        # re-gen adapter
+        SUGraph.reset_dependency(self.sequence)
+        return fsu
 
     def add_flow(self, su1: ScheduleUnit, su2: ScheduleUnit):
         """
@@ -282,7 +300,7 @@ class SUGraph(IRCell):
         elif not all([isinstance(int, rank) for rank in ranks]):
             raise TypeError("Expected type ranks to be Union[int, List[int]]")
 
-        if su.stype == SUType.Adapter:
+        if su.stype == SUType.Comm:
             return False
 
         if set(su.device) == set(ranks):
@@ -296,7 +314,7 @@ class SUGraph(IRCell):
             for su in sus:
                 index = self.sus().index(su)
                 self.sequence.insert(index, su)
-            self.reset_dependency()
+            SUGraph.reset_dependency(self.sequence)
             for su, rank in zip(sus, ranks):
                 self.assign(su, rank)
 
@@ -347,6 +365,96 @@ class SUGraph(IRCell):
         self.sequence = seq
         return True
 
+    @staticmethod
+    def gen_adapter(sus: List[ScheduleUnit]) -> List[ScheduleUnit]:
+        """
+        Each computation SU has adapters for its inputs.
+        """
+        sugraph = SUGraph(sus)
+
+        # clear adapters
+        for su in sugraph.sus():
+            su._clear_adapters()
+
+        for su in sugraph.sus():
+            for in_idx, input in enumerate(su.inputs()):
+                if not isinstance(input, IRTensor):
+                    continue
+                pre_sus = su.predecessors(in_idx)
+                tensor_segments = list()
+                for pre_su in pre_sus:
+                    for out_idx, output in enumerate(pre_su.outputs()):
+                        if output.overlap(input):
+                            sub_tensor = input.common(output)
+                            if sub_tensor != input:
+                                tensor_segments.append(sub_tensor)
+                            send_op = IRCommunication(
+                                send_tensors=[sub_tensor],
+                                send_ranks = [-1]
+                            )
+                            recv_op = IRCommunication(
+                                recv_tensors=[sub_tensor],
+                                recv_ranks = [-1]
+                            )
+                            send_op.pair(recv_op)
+                            send_su = ScheduleUnit([send_op], SUType.Comm, name='send')
+                            recv_su = ScheduleUnit([recv_op], SUType.Comm, name='recv')
+                            su._add_in_adapter(in_idx, send_su, recv_su)
+                            send_su.device = su.device
+                            pre_su._add_out_adapter(out_idx, send_su, recv_su)
+                            recv_su.device = su.device
+                # add adapter for merge
+                if len(tensor_segments) != 0:
+                    merge_op = IRTensorReshape(
+                        src_tensors=tensor_segments, dst_tensors=[input]
+                    )
+                    merge_su = ScheduleUnit([merge_op], SUType.Comm, name='merge')
+                    su._set_merge_adapter(in_idx, merge_su)
+                    merge_su.device = su.device
+
+            # add adapter for select
+            for out_idx, output in enumerate(su.outputs()):
+                if not isinstance(output, IRTensor):
+                    continue
+                select_tensors = list()
+                send_adapters, recv_adapters = su.out_adapters(out_idx)
+                for send_adapter in send_adapters:
+                    for tensor in send_adapter.nodes(0).send_tensors:
+                        if tensor != output:
+                            select_tensors.append(tensor)
+                if len(select_tensors) != 0:
+                    select_op = IRTensorReshape(
+                        src_tensors=[output], dst_tensors=select_tensors
+                    )
+                    select_su = ScheduleUnit(
+                        [select_op], SUType.Comm, name='select'
+                    )
+                    su._set_select_adapter(out_idx, select_su)
+                    select_su.device = su.device
+    
+        sus_with_adapter = list()
+        for su in sus:
+            # send + recv + merge
+            for idx in range(len(su.inputs())):
+                merge_su = su.merge_adapters(idx)
+                send_adapters, recv_adapters = su.in_adapters(idx)
+                # PyTorch implementation issue: forward + backward happened on same device
+                if su.stype == SUType.Backward and not su.inputs(idx).is_grad():
+                    continue
+                for send_su, recv_su in zip(send_adapters, recv_adapters):
+                    sus_with_adapter.append(send_su)
+                    sus_with_adapter.append(recv_su)
+                if merge_su:
+                    sus_with_adapter.append(merge_su)
+            # excute
+            sus_with_adapter.append(su)
+            # select
+            for idx in range(len(su.outputs())):
+                select_su = su.select_adapters(idx)
+                if select_su:
+                    sus_with_adapter.append(select_su)
+        return sus_with_adapter
+
 
     @staticmethod
     def is_topo_order(seq: List[ScheduleUnit], integrity_check=False):
@@ -384,6 +492,39 @@ class SUGraph(IRCell):
                 succ_node_ids[out_idx] = node_list
             dscp += f"\n{node._id}: {node} -> su id {succ_node_ids}\n"
         return dscp
+
+
+class SUGraphGener:
+
+    @staticmethod
+    def gen_sugraph(nodes) -> SUGraph:
+        """
+        Generate SUGraph from SchedulePool
+        """
+        sus = list()
+        fnodes = list()
+        fsus: List[ScheduleUnit] = list()
+        for node in nodes:
+            su = ScheduleUnit([node], stype=SUType.Empty, name='su')
+            if isinstance(node, IRDataOperation):
+                stype = SUType.Dataloader
+            elif isinstance(node, IRFwOperation):
+                stype = SUType.Forward
+                fnodes.append(node)
+                fsus.append(su)
+            elif isinstance(node, IRBpOperation):
+                stype = SUType.Backward
+                index = fnodes.index(node.mirror)
+                fsu = fsus[index]
+                su.mirror = fsu
+                fsu.mirror = su
+            else:
+                raise NotImplementedError("Not implemented node type")
+            su.stype = stype
+            sus.append(su)
+        sus_with_adapter = SUGraph.gen_adapter(sus)
+        sugraph = SUGraph(sus_with_adapter)
+        return sugraph
 
 
 class SeqSpace:

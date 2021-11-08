@@ -96,14 +96,13 @@ def train():
     model = FeedForward(dim=1024)
     model = cube.schedule.SemanticModel(
         model, input_shapes=([batch_size,1024],),
-        policy_fn=trans_policy
     )
 
     dataloader = FakeDataLoader(batch_size)
 
-    @cube.schedule.schedule(model, dataloader, policy_fn=schedule_policy)
+    @cube.schedule.schedule(model, dataloader, transform_policy=trans_policy, schedule_policy=schedule_policy)
     def train_iter(model, dataloader):
-        for _ in range(4):
+        for _ in range(1):
             data = next(dataloader)
             loss = model(data)
             loss.backward()

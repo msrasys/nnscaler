@@ -3,10 +3,10 @@ from torch import nn
 
 import cube
 from cube.graph.graph import IRGraph
-from cube.schedule.su import SUType
+from cube.schedule.su import SUType, ScheduleUnit
 from cube.schedule.pool import SchedulePool
 from cube.schedule.sugraph import SUGraph
-from cube.schedule.translator import LogicTranslator, IRDataLoader
+from cube.schedule.translator import LogicTranslator, IRDataLoader, SUGraphGener
 
 
 class MLP(nn.Module):
@@ -37,7 +37,7 @@ class FakeDataLoader:
         self.pos += 1
         if self.pos == self.length:
             raise StopIteration 
-        return torch.randn(self.shape).cuda()
+        return torch.randn(self.shape)
 
 
 def test_semantic_model():
@@ -91,13 +91,13 @@ def test_schedule():
 
     train_iter(model, dataloader)
 
-    sus = SchedulePool().sus()
-    sus_with_adapter = LogicTranslator.gen_adapter(sus)
-    sugraph = SUGraph(sus_with_adapter)
+    nodes = SchedulePool().nodes()
+    graph = IRGraph(nodes, None, None, 'testmodel')
+    print(graph)
+
+    sugraph = SUGraphGener.gen_sugraph(nodes)
 
     sugraph = policy(sugraph, None)
+    print(sugraph)
 
-    for su in sugraph.sus():
-        print(su)
-
-    assert len(sugraph.sus()) == 1 + 2 * (4 * 3)
+    assert len(sugraph.sus()) == 33

@@ -42,7 +42,7 @@ class ExectuionPlan:
                     span = 1
                 elif su.stype == SUType.Backward:
                     span = 2
-                elif su.stype == SUType.Adapter:
+                elif su.stype == SUType.Comm:
                     span = 0.1
                 spans.append(span)
 

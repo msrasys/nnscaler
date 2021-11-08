@@ -4,16 +4,13 @@ Traning Logic Translator
 The traning logic first translate the training logic into
 Schedule Units, and then add Adapter ScheduleUnit
 """
-from typing import List
 import torch
 
-from cube.ir.cten import IRCell, IRTensor
+from cube.ir.cten import IRTensor
 from cube.graph.tensor import IRFullTensor
-from cube.schedule.adapter.comm import IRCommunication
-from cube.schedule.adapter.select import IRTensorReshape
-from cube.schedule.su import SUType, ScheduleUnit
+from cube.graph.operator import IRDataOperation
+import cube.graph.gpass as gpass
 from cube.schedule.pool import SchedulePool
-from cube.schedule.sugraph import SUGraph
 
 
 class IRDataLoader:
@@ -47,18 +44,13 @@ class LogicTranslator:
                 data.requires_grad = False
             outputs.append(data)
 
-        cell = IRCell(
-            name='dataloader',
-            signature='dataloader.__next__',
-            input_length=0,
-            output_length=len(datas)
+        data_op = IRDataOperation(
+            data_num=len(datas)
         )
         for idx, output in enumerate(outputs):
-            cell.set_output(idx, output)
+            data_op.set_output(idx, output)
 
-        su = ScheduleUnit([cell], stype=SUType.Dataloader, name='DataLoader')
-        SchedulePool().add_su(su)
-
+        SchedulePool().add_node(data_op)
         if    len(outputs) == 0: return
         elif  len(outputs) == 1: return outputs[0]
         else: return tuple(outputs)
@@ -68,129 +60,32 @@ class LogicTranslator:
         """
         Translator Action: forward an IRGraph
         """
-
-        def _forward(graph, stype, *args):
-            # set input
-            for input, arg in zip(graph.inputs(), args):
-                graph._replace_tensor(input, arg)
-            # translate to SUs
-            sus = list()
-            for node in graph.nodes():
-                su = ScheduleUnit([node], stype, name=str(stype))
-                sus.append(su)
-            return sus
-
-        # forward graph
-        fgraph = graph.copy(reverse=False)
-        # backward graph
-        bgraph = graph.copy(reverse=True)
-        bgraph.tag = 'backward'
-
-        # translate forward graph
-        fsus = _forward(fgraph, SUType.Forward, *args)
-        bsus = _forward(bgraph, SUType.Backward, *(fgraph.outputs()))
-        for fsu, bsu in zip(fsus, bsus[::-1]):
-            fsu.set_mirror(bsu)
-            bsu.set_mirror(fsu)
-            SchedulePool().add_su(fsu)
-        
+        fgraph = gpass.forward(graph, *args)
+        for node in fgraph.nodes():
+            SchedulePool().add_node(node)
         for output in fgraph.outputs():
-            output.set_trace(fsus)
-
+            SchedulePool().tape(output, fgraph.nodes())
         outputs = fgraph.outputs()
         if    len(outputs) == 1: return outputs[0]
         elif  len(outputs) == 0: return None
         else: return outputs
 
     @staticmethod
-    def backward(tensor: IRTensor):
+    def backward(loss: IRTensor):
         """
         Translator Action: backward a tensor
         """
-        if tensor.trace is None:
-            return
-        for fsu in tensor.trace[::-1]:
-            SchedulePool().add_su(fsu.mirror)
-
-    @staticmethod
-    def gen_adapter(sus: List[ScheduleUnit]) -> List[ScheduleUnit]:
-        """
-        Each computation SU has adapters for its inputs
-        """
-        sugraph = SUGraph(sus)
-
-        # clear adapters
-        for su in sugraph.sus():
-            su._clear_adapters()
-
-        for su in sugraph.sus():
-            for in_idx, input in enumerate(su.inputs()):
-                if not isinstance(input, IRTensor):
-                    continue
-                pre_sus = su.predecessors(in_idx)
-                tensor_segments = list()
-                for pre_su in pre_sus:
-                    for out_idx, output in enumerate(pre_su.outputs()):
-                        if output.overlap(input):
-                            sub_tensor = input.common(output)
-                            if sub_tensor != input:
-                                tensor_segments.append(sub_tensor)
-                            send_op = IRCommunication(
-                                send_tensors=[sub_tensor],
-                                send_ranks = [-1]
-                            )
-                            recv_op = IRCommunication(
-                                recv_tensors=[sub_tensor],
-                                recv_ranks = [-1]
-                            )
-                            send_op.pair(recv_op)
-                            send_su = ScheduleUnit([send_op], SUType.Adapter, name='send')
-                            recv_su = ScheduleUnit([recv_op], SUType.Adapter, name='recv')
-                            su._add_in_adapter(in_idx, send_su, recv_su)
-                            pre_su._add_out_adapter(out_idx, send_su, recv_su)
-                # add adapter for merge
-                if len(tensor_segments) != 0:
-                    merge_op = IRTensorReshape(
-                        src_tensors=tensor_segments, dst_tensors=[input]
-                    )
-                    merge_su = ScheduleUnit([merge_op], SUType.Adapter, name='merge')
-                    su._set_merge_adapter(in_idx, merge_su)
-
-            # add adapter for select
-            for out_idx, output in enumerate(su.outputs()):
-                if not isinstance(output, IRTensor):
-                    continue
-                select_tensors = list()
-                send_adapters, recv_adapters = su.out_adapters(out_idx)
-                for send_adapter in send_adapters:
-                    for tensor in send_adapter.nodes(0).send_tensors:
-                        if tensor != output:
-                            select_tensors.append(tensor)
-                if len(select_tensors) != 0:
-                    select_op = IRTensorReshape(
-                        src_tensors=[output], dst_tensors=select_tensors
-                    )
-                    select_su = ScheduleUnit(
-                        [select_op], SUType.Adapter, name='select'
-                    )
-                    su._set_select_adapter(out_idx, select_su)
-    
-        sus_with_adapter = list()
-        for su in sus:
-            # send + recv + merge
-            for idx in range(len(su.inputs())):
-                merge_su = su.merge_adapters(idx)
-                if merge_su:
-                    sus_with_adapter.append(merge_su)
-                send_adapters, recv_adapters = su.in_adapters(idx)
-                for send_su, recv_su in zip(send_adapters, recv_adapters):
-                    sus_with_adapter.append(send_su)
-                    sus_with_adapter.append(recv_su)
-            # excute
-            sus_with_adapter.append(su)
-            # select
-            for idx in range(len(su.outputs())):
-                select_su = su.select_adapters(idx)
-                if select_su:
-                    sus_with_adapter.append(select_su)
-        return sus_with_adapter
+        trace = SchedulePool().get_tape(loss)
+        if trace is None:
+            raise RuntimeError("No forward detected")
+        bnode = None
+        loss_idx = None
+        for node in trace[::-1]:
+            if loss in node.outputs():
+                bnode = node.mirror
+                loss_idx = node.outputs().index(loss)
+                node.outputs(loss_idx).grad = loss
+                bnode.set_grad(loss_idx, loss)
+                break
+        for node in trace[::-1]:
+            SchedulePool().add_node(node.mirror)

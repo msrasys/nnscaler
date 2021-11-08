@@ -1,9 +1,10 @@
 from typing import Callable, Optional
 import torch
+from cube.graph.graph import IRGraph
 
 from cube.schedule.pool import SchedulePool
-from cube.schedule.translator import IRDataLoader, LogicTranslator
-from cube.schedule.sugraph import SUGraph
+from cube.schedule.translator import IRDataLoader
+from cube.schedule.sugraph import SUGraph, SUGraphGener
 from cube.schedule.graphpass import SUGraphPass
 
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
@@ -11,7 +12,7 @@ from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
 class SemanticModel:
 
-    def __init__(self, model: torch.nn.Module, input_shapes, policy_fn=None):
+    def __init__(self, model: torch.nn.Module, input_shapes):
         """
         Create semantic model based on AI Scientist description.
         """
@@ -19,8 +20,6 @@ class SemanticModel:
         self.ir_graph = parser.convert(
             model, input_shapes=input_shapes
         )
-        if policy_fn:
-            self.ir_graph = policy_fn(self.ir_graph, None)
         self._loaded_module = None
 
     def get_graph(self):
@@ -47,7 +46,9 @@ class SemanticModel:
             return self.ir_graph(*args)
 
 
-def schedule(model: SemanticModel, dataloader, policy_fn: Optional[Callable] = None):
+def schedule(model: SemanticModel, dataloader,
+             transform_policy: Optional[Callable] = None,
+             schedule_policy:  Optional[Callable] = None):
     """
     AI Scientist calls like:
 
@@ -100,26 +101,30 @@ def schedule(model: SemanticModel, dataloader, policy_fn: Optional[Callable] = N
 
             # logic translator
             fn(ir_graph, ir_dataloader)
-            sus = SchedulePool().sus()
 
-            # adapter
-            sus_with_adapter = LogicTranslator.gen_adapter(sus)
+            nodes = SchedulePool().nodes()
 
-            # policy
-            su_graph = SUGraph(sus_with_adapter)
-            if policy_fn:
+            # graph transformation
+            graph = IRGraph(nodes, None, None, ir_graph.name)
+            if transform_policy:
+                graph = transform_policy(graph, None)
+
+            # sugraph
+            sugraph = SUGraphGener.gen_sugraph(graph.nodes())
+            if schedule_policy:
                 # TODO: add resource
-                su_graph = policy_fn(su_graph, None)
+                sugraph = schedule_policy(sugraph, None)
 
             # check assignment and order
-            for su in su_graph.sus():
+            print(sugraph)
+            for su in sugraph.sus():
                 if len(su.device) == 0:
                     raise RuntimeError(f"SU {su} device is not set")
-            if not SUGraph.is_topo_order(su_graph.sus()):
+            if not SUGraph.is_topo_order(sugraph.sus()):
                 raise RuntimeError(f"SUGraph order is not topological order")
 
             # graph pass to remove redundant sus 
-            su_graph = SUGraphPass.remove_redundant_adapters(su_graph)
+            su_graph = SUGraphPass.remove_redundant_adapters(sugraph)
             su_graph = SUGraphPass.merge_small_sus(su_graph)
             print(su_graph)
 
