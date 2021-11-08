@@ -26,7 +26,7 @@ class IndexMap:
                 return False
             for myslicer, oslicer in zip(self.get(), other.get()):
                 mstart, mstop = myslicer.start, myslicer.stop
-                mstep = myslicer.step if myslicer.stop is not None else 1
+                mstep = myslicer.step if myslicer.step is not None else 1
                 ostart, ostop = oslicer.start, oslicer.stop
                 ostep = oslicer.step if oslicer.step is not None else 1
                 if mstart != ostart or mstop != ostop or mstep != ostep:
@@ -292,7 +292,6 @@ class IRFullTensor(IRTensor):
             sub_tensor.as_param()
 
     def as_grad(self):
-        self.requires_grad = False
         self._is_param = False
         self._is_grad = True
         for sub_tensor in self._segments:
@@ -510,7 +509,6 @@ class IRSubTensor(IRTensor):
     def as_grad(self):
         if not self.parent.is_grad():
             self.parent.as_grad()
-        self.requires_grad = False
         self._is_grad = True
         self._is_param = False
         return self

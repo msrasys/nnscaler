@@ -1,6 +1,8 @@
 from cube.graph.graph import IRGraph
+from cube.graph.operator.operator import IRBpOperation
 from cube.graph.tensor import IRFullTensor, IRSubTensor
 from cube.graph.operator.function import Linear
+import cube.graph.gpass as gpass
 from cube.ir.cten import IRTensor
 
 
@@ -49,7 +51,6 @@ def test_graph_init():
 
     assert len(graph.inputs()) == 1
     assert len(graph.outputs()) == 1
-    assert graph.tag == 'forward'
     assert graph.name == 'MLP'
 
     all_inputs = list()
@@ -100,34 +101,40 @@ def test_graph_nodes():
     assert graph.nodes(1) == ops[1]
 
 
-def test_graph_copy():
+def test_graph_forward():
     inputs, ops, outputs = construct_model()
     graph = IRGraph(ops, inputs, outputs, 'MLP')
 
-    cgraph = graph.copy(reverse=False)
-    print(cgraph)
+    fgraph = gpass.forward(graph, *graph.inputs())
+    print(fgraph)
 
-    cparam_id = [param._id for param in cgraph.parameters()]
+    fparam_id = [param._id for param in fgraph.parameters()]
     param_id = [param._id for param in graph.parameters()]
-    assert set(cparam_id) == set(param_id)
+    assert set(fparam_id) == set(param_id)
 
-    for gnode, cnode in zip(graph.nodes(), cgraph.nodes()):
-        assert gnode.name == cnode.name
-        assert gnode.signature == cnode.signature
-        assert len(gnode.inputs()) == len(cnode.inputs())
-        assert len(gnode.outputs()) == len(cnode.outputs())
-        assert len(gnode.predecessors()) == len(cnode.predecessors())
-        assert len(gnode.successors()) == len(cnode.successors())
-
-    rgraph = graph.copy(reverse=True)
-    print(rgraph)
-    for gnode, cnode in zip(graph.nodes(), rgraph.nodes()[::-1]):
-        assert gnode.name == cnode.name
-        assert gnode.signature == cnode.signature
-        assert len(gnode.outputs()) == len(cnode.inputs())
-        assert len(gnode.inputs()) == len(cnode.outputs())
-        assert len(gnode.predecessors()) == len(cnode.successors())
-        assert len(gnode.successors()) == len(cnode.predecessors())
+    for gnode, fnode in zip(graph.nodes(), fgraph.nodes()):
+        assert gnode.name == fnode.name
+        assert gnode.signature == fnode.signature
+        assert len(gnode.inputs()) == len(fnode.inputs())
+        assert len(gnode.outputs()) == len(fnode.outputs())
+        assert len(gnode.predecessors()) == len(fnode.predecessors())
+        assert len(gnode.successors()) == len(fnode.successors())
+    
+    # test backward
+    bnodes = [node.mirror for node in fgraph.nodes()][::-1]
+    bgraph = IRGraph(bnodes, None, None, module_name='backwards')
+    print(bgraph)
+    bnode1, bnode2, bnode3 = bnodes
+    for bnode in bnodes:
+        assert isinstance(bnode, IRBpOperation)
+        assert len(bnode.inputs()) == 4
+        assert len(bnode.outputs()) == 3
+    assert bnode2 in bnode1.successors()
+    assert bnode3 in bnode2.successors()
+    assert not bnode3 in bnode1.successors()
+    assert bnode1 in bnode2.predecessors()
+    assert bnode2 in bnode3.predecessors()
+    assert not bnode1 in bnode3.predecessors()
 
 
 def test_graph_partition():

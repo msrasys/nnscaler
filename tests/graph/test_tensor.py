@@ -192,3 +192,40 @@ def test_sub_tensor_common():
     assert rt.indices.get() == (slice(0, 512, 1), slice(512, 1024, 1))
     assert lb.indices.get() == (slice(512, 1024, 1), slice(0, 512, 1))
     assert rb.indices.get() == (slice(512, 1024, 1), slice(512, 1024, 1))
+
+
+def test_sub_tensor_as_grad():
+    tensor1 = IRFullTensor(shape=[1024,1024], name='tensor')
+    sub_tensor1 = tensor1.select(
+        indices = (slice(0, 1024), slice(512, 1024)),
+        val_map = None,
+        shape = (1024, 512)
+    )
+
+    sub_tensor1.as_grad()
+    assert sub_tensor1.is_grad()
+
+    sub_tensor2 = tensor1.select(
+        indices = (slice(0, 1024), slice(0, 512)),
+        val_map = (0, 4),
+        shape = (1024, 512)
+    )
+    assert sub_tensor2.is_grad()
+
+
+def test_sub_tensor_copy():
+    tensor1 = IRFullTensor(shape=[1024,1024], name='tensor')
+    sub_tensor1 = tensor1.select(
+        indices = (slice(0, 1024), slice(512, 1024)),
+        val_map = None,
+        shape = (1024, 512)
+    )
+    sub_tensor2 = tensor1.select(
+        indices = (slice(0, 1024), slice(0, 512)),
+        val_map = (0, 4),
+        shape = (1024, 512)
+    )
+    sub_tensor1.grad = sub_tensor2
+    cpy_tensor = copy.copy(sub_tensor1)
+    assert cpy_tensor.grad == sub_tensor2
+    

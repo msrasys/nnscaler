@@ -426,15 +426,10 @@ class IRTensor:
     def grad(self, grad):
         if grad is not None and not isinstance(grad, IRTensor):
             raise TypeError("grad can only be None or Tensor")
-        if self.is_grad() and grad is not None:
-            raise RuntimeError("Cannot assign grad to a gradient")
-        if not self.requires_grad and grad is not None:
-            raise RuntimeError("Cannot assign grad to a frozen tensor")
         self._grad = grad
         self.requires_grad = True
 
     def as_grad(self):
-        self.requires_grad = False
         self._is_param = False
         self._is_grad = True
         return self
