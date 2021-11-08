@@ -344,7 +344,7 @@ class IRTensor:
     IRTensor serves as IRGraph edge
     """
 
-    _attr = ['name', '_is_param', '_requires_grad', '_is_grad', '_grad']
+    _attr = ['name', '_is_param', '_requires_grad', '_is_grad', '_grads']
 
     def __init__(self, shape=None, name=None):
 
@@ -359,9 +359,7 @@ class IRTensor:
         self._is_grad = False
         self._requires_grad = True
 
-        self._grad = None
-
-        self.trace = None
+        self._grads = list()
 
     def attach_cell(self, cell: IRCell):
         """
@@ -401,7 +399,7 @@ class IRTensor:
             raise TypeError("Expected bool")
         self._requires_grad = requires
         if not requires:
-            self.grad = None
+            self._grads = list()
 
     def as_param(self):
         """
@@ -419,15 +417,22 @@ class IRTensor:
         return self._is_param
 
     @property
-    def grad(self):
-        return self._grad
+    def grads(self) -> List:
+        return self._grads
 
-    @grad.setter
-    def grad(self, grad):
+    @grads.setter
+    def grads(self, grads: List):
+        if grads is None:
+            grads = list()
+        if not all([isinstance(grad, IRTensor) for grad in grads]):
+            raise TypeError("grad can only be None or List[Tensor]")
+        self._grads = grads
+        self.requires_grad = True
+
+    def add_grad(self, grad):
         if grad is not None and not isinstance(grad, IRTensor):
             raise TypeError("grad can only be None or Tensor")
-        self._grad = grad
-        self.requires_grad = True
+        self._grads += [grad]
 
     def as_grad(self):
         self._is_param = False

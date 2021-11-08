@@ -175,7 +175,8 @@ class SUGraph(IRCell):
         start, stop = min(idx1, idx2), max(idx1, idx2)
         inter_sus = fsus[start+1:stop]
         for su in inter_sus:
-            if self.happen_before(su, su2):
+            # FIXME: currently only allow other device su exists
+            if self.happen_before(su1, su) or self.happen_before(su, su2):
                 return None
         for idx in range(len(su2.inputs())):
             prev_sus = su2.predecessors(idx)
@@ -198,16 +199,39 @@ class SUGraph(IRCell):
             )
             for idx, input in enumerate(fsu.inputs()):
                 bnode.set_data(idx, input)
-            fout_grads = [out.grad for out in fsu.outputs()]
+
+            # FIXME: fail case: forward -> forward -> backward -> backward
+            fout_grads = list()
+            for fout in fsu.outputs():
+                for grad in fout.grads:
+                    if grad in su1.mirror.inputs() + su2.mirror.inputs():
+                        fout_grads.append(grad)
+                        break
+                else:
+                    raise RuntimeError("Cannot fout find gradient")
             for idx, fout_grad in enumerate(fout_grads):
                 bnode.set_grad(idx, fout_grad)
-            for idx, fin in enumerate(fsu.inputs()):
+
+            fin_grads = list()
+            for fin in fsu.inputs():
                 if isinstance(fin, IRTensor):
-                    bnode.set_output(idx, fin.grad)
+                    for grad in fin.grads:
+                        if grad in su1.mirror.outputs() + su2.mirror.outputs():
+                            fin_grads.append(grad)
+                            break
+                    else:
+                        print(f'msu = {fsu}')
+                        print(f'fin = {fin}')
+                        print(f'fin grads = {fin.grads}')
+                        print(f'fsu1 = {su1}')
+                        print(f'fsu2 = {su2}')
+                        print(f'bsu1 = {su1.mirror}')
+                        print(f'bsu2 = {su2.mirror}')
+                        raise RuntimeError("Cannot find fin gradient")
                 else:
-                    bnode.set_output(idx, None)
-            for output in fsu.outputs():
-                print(output.grad)
+                    fin_grads.append(None)
+            for idx, fin_grad in enumerate(fin_grads):
+                bnode.set_output(idx, fin_grad)
             bsu = ScheduleUnit([bnode], stype=SUType.Backward, name='bsu')
             bsu.device = su2.mirror.device
             fsu.mirror = bsu
@@ -225,6 +249,9 @@ class SUGraph(IRCell):
                     adapters = su2.in_adapters(su2_idx)
                     merge_adapter = su2.merge_adapters(su2_idx)
                 else:
+                    print(f'> Error: msu: {msu}')
+                    print(f'> Error: su1: {su1}')
+                    print(f'> Error: su2: {su2}')
                     raise RuntimeError("Internal Error: not found input SU")
                 msu._add_in_adapter(idx, *adapters)
                 msu._set_merge_adapter(idx, merge_adapter)

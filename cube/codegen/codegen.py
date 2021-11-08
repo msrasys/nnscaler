@@ -324,24 +324,26 @@ class ScheduleCodeGen:
                 finputs.append(self.naming(tensor, fsu))
             fargs = '(' + ', '.join(finputs + ['']) + ')'
 
-            foutputs = list()
+            fouts = list()
             for tensor in fsu.outputs():
-                foutputs.append(self.naming(tensor, fsu))
-            foutputs = '(' + ', '.join(foutputs + ['']) + ')'
+                fouts.append(self.naming(tensor, fsu))
+            fouts = '(' + ', '.join(fouts + ['']) + ')'
 
-            in_grads = list()
-            for tensor in fsu.outputs():
-                grad = tensor.grad
+            fout_grads = list()
+            for fout in fsu.outputs():
+                grad = None
+                for fout_grad in fout.grads:
+                    if fout_grad in su.inputs():
+                        grad = fout_grad
                 if grad in fsu.outputs():
-                    in_grads.append('None')
-                else:
-                    in_grads.append(self.naming(grad, su))
-            in_grads = '(' + ', '.join(in_grads + ['']) + ')'
+                    grad = None
+                fout_grads.append(self.naming(grad, su))
+            fout_grads = '(' + ', '.join(fout_grads + ['']) + ')'
 
             body = bsign.format(
                 input_tensors = fargs,
-                output_tensors = foutputs,
-                output_grads = in_grads
+                output_tensors = fouts,
+                output_grads = fout_grads
             )
 
             # returned value are graph.outputs

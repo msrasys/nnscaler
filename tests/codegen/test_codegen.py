@@ -82,24 +82,41 @@ def test_model_gen():
 
     SchedulePool().clear()
 
+    grad_accum = 2
+
     graph = construct_graph()
     dataloader = IRDataLoader(FakeDataLoader(batch_size=64))
     
-    data = next(dataloader)
-    output = graph(data)
-    output.backward()
+    for _ in range(grad_accum):
+        data = next(dataloader)
+        output = graph(data)
+        output.backward()
 
     nodes = SchedulePool().nodes()
     graph = IRGraph(nodes, None, None, module_name='Test')
 
     sugraph = SUGraphGener.gen_sugraph(nodes)
 
-    fsus = [su for su in sugraph.sus() if su.stype == SUType.Forward]
-    dsus = [su for su in sugraph.sus() if su.stype == SUType.Dataloader]
-    for dsu in dsus:
-        sugraph.assign(dsu, 0)
-    for idx, su in enumerate(fsus):
-        if su.stype == SUType.Forward:
+    fb_seqs = list()
+    for fsu in sugraph.fsus():
+        for fb_seq in fb_seqs:
+            for ksu in fb_seq[::-1]:
+                if sugraph.happen_before(ksu, fsu):
+                    fb_seq.append(fsu)
+                    break
+            else:
+                continue
+            break
+        else:
+            fb_seqs.append([fsu])
+    assert len(fb_seqs) == grad_accum
+
+    for su in sugraph.sus():
+        if su.stype == SUType.Dataloader:
+            sugraph.assign(su, 0)
+
+    for fb_seq in fb_seqs:
+        for idx, su in enumerate(fb_seq):
             if idx < 2:
                 sugraph.assign(su, 0)
                 sugraph.assign(su.mirror, 0)
@@ -107,13 +124,13 @@ def test_model_gen():
                 sugraph.assign(su, 1)
                 sugraph.assign(su.mirror, 1)
     
-    print('after asignment:\n', sugraph)
+    print('========= after asignment: ==========\n', sugraph)
 
     sugraph = SUGraphPass.remove_redundant_adapters(sugraph)
-    print('after remove adapter:\n', sugraph)
+    print('========= after remove adapter: ==========\n', sugraph)
 
     sugraph = SUGraphPass.merge_small_sus(sugraph)
-    print('after merge samll SU:\n', sugraph)
+    print('========= after merge small SU: ==========\n', sugraph)
 
     mgener = ModelCodeGen(sugraph)
     tgener = ScheduleCodeGen(sugraph)

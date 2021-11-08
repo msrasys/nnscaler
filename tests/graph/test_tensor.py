@@ -225,7 +225,7 @@ def test_sub_tensor_copy():
         val_map = (0, 4),
         shape = (1024, 512)
     )
-    sub_tensor1.grad = sub_tensor2
+    sub_tensor1.grads = [sub_tensor2]
     cpy_tensor = copy.copy(sub_tensor1)
-    assert cpy_tensor.grad == sub_tensor2
+    assert cpy_tensor.grads[0] == sub_tensor2
     

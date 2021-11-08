@@ -16,38 +16,40 @@ from torch import nn
 
 import cube
 from cube.schedule.su import SUType
+from cube.schedule.sugraph import SUGraph
 
 
 def trans_policy(ir_graph, resource):
     return ir_graph
 
-def schedule_policy(sugraph, resource):
+def schedule_policy(sugraph: SUGraph, resource):
     # put to micro-batch forward-backward sequence
     fb_op_seqs = list()
-    for su in sugraph.sus():
+    for fsu in sugraph.fsus():
         for fb_seq in fb_op_seqs:
             for ksu in fb_seq[::-1]:
-                if sugraph.happen_before(ksu, su):
-                    fb_seq.append(su)
+                if sugraph.happen_before(ksu, fsu):
+                    fb_seq.append(fsu)
                     break
             else:
                 continue
             break
         else:
-            fb_op_seqs.append([su])
+            fb_op_seqs.append([fsu])
     
+    for su in sugraph.sus():
+        if su.stype == SUType.Dataloader:
+            sugraph.assign(su, 0)
+    
+    print(f'> collect {len(fb_op_seqs)} forward-backward sequence')
     for fb_sus in fb_op_seqs:
-        sugraph.assign(fb_sus[0], 0)
-        idx = 0
-        for su in fb_sus[1:]:
-            if su.stype == SUType.Forward:
-                if idx < 3:
-                    sugraph.assign(su, 0)
-                    sugraph.assign(su.mirror, 0)
-                else:
-                    sugraph.assign(su, 1)
-                    sugraph.assign(su.mirror, 1)
-                idx += 1
+        for idx, su in enumerate(fb_sus):
+            if idx < 3:
+                sugraph.assign(su, 0)
+                sugraph.assign(su.mirror, 0)
+            else:
+                sugraph.assign(su, 1)
+                sugraph.assign(su.mirror, 1)
     return sugraph
 
 
@@ -102,7 +104,7 @@ def train():
 
     @cube.schedule.schedule(model, dataloader, transform_policy=trans_policy, schedule_policy=schedule_policy)
     def train_iter(model, dataloader):
-        for _ in range(1):
+        for _ in range(4):
             data = next(dataloader)
             loss = model(data)
             loss.backward()
