@@ -12,7 +12,7 @@ import copy
 from cube.graph.operator.operator import IRBpOperation
 
 from cube.ir.cten import IRTensor, IRCell
-from cube.graph.tensor import IRFullTensor
+from cube.graph.tensor import IRFullTensor, IRSubTensor
 
 from cube.algorithm.generics import GenericDistAlgo
 
@@ -37,9 +37,17 @@ class IRGraph(IRCell):
         self._parameters = list()
 
         if input_tensors is None:
-            input_tensors = IRCell.get_inputs(nodes)
+            input_tensors = list()
+            inputs = IRCell.get_inputs(nodes)
+            for input in inputs:
+                if not input.is_param():
+                    input_tensors.append(input)
         if output_tensors is None:
-            output_tensors = IRCell.get_outputs(nodes)
+            output_tensors = list()
+            outputs = IRCell.get_outputs(nodes)
+            for output in outputs:
+                if not output.is_param():
+                    output_tensors.append(output)
 
         super().__init__(
             name=module_name,
@@ -78,6 +86,10 @@ class IRGraph(IRCell):
         for node in self._nodes:
             for input in node.inputs():
                 if isinstance(input, IRTensor):
+                    if input.is_param():
+                        # parameters already set
+                        self._parameters.append(input)
+                        continue
                     if input not in input_tensors and \
                        input.is_leaf(self._nodes):
                         input.as_param()
@@ -268,11 +280,14 @@ class IRGraph(IRCell):
             return None
         if not algo.satisfy(config):
             return None
-        nodes = algo.instantiate(op, config)
+        fnodes = algo.instantiate(op, config)
+        # remove reference
+        for idx in range(len(op.inputs())):
+            op.set_input(idx, None)
         # set backward mirror node
         if op.mirror is not None:
             # generate mirror node
-            for fnode in nodes:
+            for fnode in fnodes:
                 bnode = IRBpOperation(
                     data_num=len(fnode.inputs()),
                     grad_num=len(fnode.outputs())
@@ -280,25 +295,32 @@ class IRGraph(IRCell):
                 for idx, val in enumerate(fnode.inputs()):
                     bnode.set_data(idx, val)
                     grad = None
-                    if isinstance(val, IRTensor):
-                        # this is wrong
-                        grad = val.grads[-1]
+                    if isinstance(val, IRSubTensor):
+                        if val.requires_grad and val.grad is None:
+                            grad = val.get_grad(fnode)
+                            val.grad = grad
+                        grad = val.grad
                     bnode.set_output(idx, grad)
                 for idx, val in enumerate(fnode.outputs()):
                     grad = None
-                    if isinstance(val, IRTensor):
-                        # this is wrong
-                        grad = val.grads[-1]
+                    if isinstance(val, IRSubTensor):
+                        if val.requires_grad and val.grad is None:
+                            grad = val.get_grad(fnode)
+                            val.grad = grad
+                        grad = val.grad
                     bnode.set_grad(idx, grad)
                 fnode.mirror = bnode
                 fnode.device = op.device
                 bnode.mirror = fnode
                 bnode.device = op.mirror.device
         idx = self._nodes.index(op)
-        self._nodes = self._nodes[:idx] + nodes + self._nodes[idx+1:]
+        self._nodes = self._nodes[:idx] + fnodes + self._nodes[idx+1:]
+        if op.mirror is not None:
+            idx = self._nodes.index(op.mirror)
+            bnodes = [node.mirror for node in fnodes][::-1]
+            self._nodes = self._nodes[:idx] + bnodes + self._nodes[idx+1:]
         self.reset_dependency()
-        return copy.copy(nodes)
-
+        return copy.copy(fnodes)
 
     def merge(self, sub_graph, target_op, op_partition_algorithm):
         raise NotImplementedError

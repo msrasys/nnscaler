@@ -1,3 +1,4 @@
+from cube.graph.operator.operator import IRDataOperation, IRFwOperation
 from cube.graph.tensor import IRFullTensor
 from cube.graph.operator.function import Linear
 from cube.graph.graph import IRGraph
@@ -82,20 +83,28 @@ def test_model_gen():
 
     SchedulePool().clear()
 
-    grad_accum = 1
+    grad_accum = 2
 
     graph = construct_graph()
     dataloader = IRDataLoader(FakeDataLoader(batch_size=64))
     
-    for _ in range(grad_accum):
-        data = next(dataloader)
-        output = graph(data)
-        output.backward()
+    data = next(dataloader)
+    output = graph(data)
+    output.backward()
 
     nodes = SchedulePool().nodes()
     graph = IRGraph(nodes, None, None, module_name='Test')
 
-    sugraph = SUGraphGener.gen_sugraph(nodes)
+    for node in graph.nodes():
+        if isinstance(node, IRDataOperation) or isinstance(node, IRFwOperation):
+            algo = node.algorithms('data')
+            graph.partition(node, algo, config=dict(chunk_num=grad_accum))
+
+    # print(graph)
+
+    sugraph = SUGraphGener.gen_sugraph(graph.nodes())
+
+    # print(sugraph)
 
     fb_seqs = list()
     for fsu in sugraph.fsus():
@@ -109,6 +118,12 @@ def test_model_gen():
             break
         else:
             fb_seqs.append([fsu])
+    
+    if len(fb_seqs) != grad_accum:
+        for idx, fb_seq in enumerate(fb_seqs):
+            print(f'> sequence {idx}:')
+            for su in fb_seq:
+                print(su)
     assert len(fb_seqs) == grad_accum
 
     for su in sugraph.sus():
@@ -123,8 +138,20 @@ def test_model_gen():
             else:
                 sugraph.assign(su, 1)
                 sugraph.assign(su.mirror, 1)
+
+    for fb_seq in fb_seqs:
+        fb_seq += [fsu.mirror for fsu in fb_seq][::-1]
     
     print('========= after asignment: ==========\n', sugraph)
+
+    seqs = list()
+    for fb_seq in fb_seqs:
+        seqs += fb_seq
+    print('> seqs:')
+    for su in seqs:
+        print(su)
+    sugraph.partial_set_order(seqs)
+    print('========= after reorder: ==========\n', sugraph)
 
     sugraph = SUGraphPass.remove_redundant_adapters(sugraph)
     print('========= after remove adapter: ==========\n', sugraph)

@@ -365,6 +365,56 @@ class SUGraph(IRCell):
         self.sequence = seq
         return True
 
+    def partial_set_order(self, seq: List[ScheduleUnit]):
+        """
+        Set a order of the sequence using part of SUs.
+
+        A random topological order will be set under
+        the constraints of given `seq` order
+        """
+        seq = copy.copy(seq)
+        for su in seq:
+            if su not in self.sequence:
+                raise RuntimeError(f"SU {su} is not in SUGraph")
+        if not SUGraph.is_topo_order(seq, integrity_check=False):
+            return False
+        remain_sus : ScheduleUnit = list()
+        for su in self.sequence:
+            if su not in seq:
+                remain_sus.append(su)
+        for rsu in remain_sus:
+            if len(rsu.inputs()) > 0:
+                happen_before_sus = rsu.predecessors()
+                idx = 0
+                while len(happen_before_sus) > 0:
+                    if idx == len(seq):
+                        raise RuntimeError(
+                            f"Internal Error: SU {rsu} cannot be inserted"
+                        )
+                    su = seq[idx]
+                    if su in happen_before_sus:
+                        happen_before_sus.remove(su)
+                    idx += 1
+                seq.insert(idx, rsu)
+            else:
+                succ_sus = rsu.successors()
+                idx = len(seq)
+                while len(succ_sus) > 0:
+                    idx -= 1
+                    if idx < 0:
+                        idx = 0
+                        break
+                    su = seq[idx]
+                    if su in succ_sus:
+                        succ_sus.remove(su)
+                seq.insert(idx, rsu)
+
+        if not SUGraph.is_topo_order(seq, integrity_check=True):
+            raise RuntimeError("Internal Error: topo is not guaranteed.")
+        self.sequence = seq
+        return True
+        
+
     @staticmethod
     def gen_adapter(sus: List[ScheduleUnit]) -> List[ScheduleUnit]:
         """
@@ -475,12 +525,14 @@ class SUGraph(IRCell):
         for index, su in enumerate(seq):
             for pre_su in su.predecessors():
                 # find the pre-su not appear in sequence
-                if integrity_check and not pre_su in seq:
+                if integrity_check:
+                    if pre_su not in seq:
                         return False
-                pre_idx = seq.index(pre_su)
-                # violate topological order
-                if pre_idx >= index:
-                    return False
+                if pre_su in seq:
+                    pre_idx = seq.index(pre_su)
+                    # violate topological order
+                    if pre_idx >= index:
+                        return False
         return True
 
     def __repr__(self):

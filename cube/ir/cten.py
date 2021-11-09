@@ -295,7 +295,8 @@ class IRCell:
             for input in cell.inputs():
                 if isinstance(input, IRTensor):
                     if input not in all_outputs:
-                        inputs.append(input)
+                        if input not in inputs:
+                            inputs.append(input)
         return inputs
 
     @staticmethod
@@ -314,7 +315,8 @@ class IRCell:
             for output in node.outputs():
                 if isinstance(output, IRTensor):
                     if output not in all_inputs:
-                        outputs.append(output)
+                        if output not in outputs:
+                            outputs.append(output)
         return outputs
 
     def __repr__(self):

@@ -315,7 +315,7 @@ class IRFullTensor(IRTensor):
             self._forward_dst_cells[idx] = None
 
     def forward_dst_cells(self):
-        return copy.copy(self._forward_dst_cells)
+        return [cell for cell in self._forward_dst_cells if cell is not None]
 
     def as_param(self):
         """

@@ -6,8 +6,7 @@ Schedule Units, and then add Adapter ScheduleUnit
 """
 import torch
 
-from cube.ir.cten import IRTensor
-from cube.graph.tensor import IRFullTensor
+from cube.graph.tensor import IRFullTensor, IRSubTensor
 from cube.graph.operator import IRDataOperation
 import cube.graph.gpass as gpass
 from cube.schedule.pool import SchedulePool
@@ -71,23 +70,21 @@ class LogicTranslator:
         else: return outputs
 
     @staticmethod
-    def backward(loss: IRTensor):
+    def backward(loss: IRSubTensor):
         """
         Translator Action: backward a tensor
         """
         trace = SchedulePool().get_tape(loss)
         if trace is None:
             raise RuntimeError("No forward detected")
+        # make gradient point to it self
+        loss.parent.grad = loss.parent
         bnode = None
-        loss_idx = None
-        for node in trace[::-1]:
-            if loss in node.outputs():
-                bnode = node.mirror
-                loss_idx = node.outputs().index(loss)
-                # TODO: fix why cannot use loss.add_grad
-                # assert False
-                node.outputs(loss_idx).grad = loss
-                bnode.set_grad(loss_idx, loss)
-                break
+        for node in trace:
+            for idx, output in enumerate(node.outputs()):
+                if loss.overlap(output):
+                    bnode = node.mirror
+                    output.grad = output
+                    bnode.set_grad(idx, output)
         for node in trace[::-1]:
             SchedulePool().add_node(node.mirror)

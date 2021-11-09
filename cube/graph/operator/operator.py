@@ -205,3 +205,25 @@ class IRDataOperation(IRCell):
 
         signature = 'dataloader.__next__'
         super().__init__(name, signature, 0, data_num)
+
+    def algorithms(self, tag: Optional[str] = None):
+        """
+        get algorithm from algorithm factory
+
+        Args:
+            tag: str or None. If None, return all 
+        """
+        factory = DistAlgorithmFactory()
+        if tag is None:
+            templates = list()
+            if factory.exist(type(self)):
+                templates = factory.algorithms(type(self))
+            algos = list()
+            for template in templates:
+                algos.append(template(self))
+            return algos
+        else:
+            if not factory.exist(type(self), tag):
+                return None
+            template = factory.algorithms(type(self), tag)
+            return template(self)

@@ -59,6 +59,9 @@ class DistAlgorithmFactory:
 
     def _load_predefined_algos(self):
 
+        import cube.algorithm.dataloader as dataloader
+        self.register(dataloader.IRDataOperation, dataloader.DPDataLoader, tag='data')
+
         import cube.algorithm.linear as linear
         self.register(linear.Linear, linear.LinearDataParallel, tag='data')
         self.register(linear.Linear, linear.LinearColumnWeight, tag='column')
