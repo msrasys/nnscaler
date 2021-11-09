@@ -85,7 +85,8 @@ class LogicTranslator:
                 bnode = node.mirror
                 loss_idx = node.outputs().index(loss)
                 # TODO: fix why cannot use loss.add_grad
-                node.outputs(loss_idx).add_grad(loss)
+                # assert False
+                node.outputs(loss_idx).grad = loss
                 bnode.set_grad(loss_idx, loss)
                 break
         for node in trace[::-1]:

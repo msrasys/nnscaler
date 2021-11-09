@@ -9,6 +9,7 @@ IRGraph:
 
 from typing import Union, Tuple, List, Optional, Any, Dict
 import copy
+from cube.graph.operator.operator import IRBpOperation
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.tensor import IRFullTensor
@@ -246,7 +247,8 @@ class IRGraph(IRCell):
     def partition(self, op: IRCell, algo: GenericDistAlgo, config: Dict) -> Optional[List[IRCell]]:
         """
         Policy primitive. Partition an operator by using
-        op_partition_algorithm and its configuration
+        op_partition_algorithm and its configuration. Note the
+        backward op-partition will be automatically done.
 
         Args:
             op: cell to be partitioned
@@ -267,6 +269,31 @@ class IRGraph(IRCell):
         if not algo.satisfy(config):
             return None
         nodes = algo.instantiate(op, config)
+        # set backward mirror node
+        if op.mirror is not None:
+            # generate mirror node
+            for fnode in nodes:
+                bnode = IRBpOperation(
+                    data_num=len(fnode.inputs()),
+                    grad_num=len(fnode.outputs())
+                )
+                for idx, val in enumerate(fnode.inputs()):
+                    bnode.set_data(idx, val)
+                    grad = None
+                    if isinstance(val, IRTensor):
+                        # this is wrong
+                        grad = val.grads[-1]
+                    bnode.set_output(idx, grad)
+                for idx, val in enumerate(fnode.outputs()):
+                    grad = None
+                    if isinstance(val, IRTensor):
+                        # this is wrong
+                        grad = val.grads[-1]
+                    bnode.set_grad(idx, grad)
+                fnode.mirror = bnode
+                fnode.device = op.device
+                bnode.mirror = fnode
+                bnode.device = op.mirror.device
         idx = self._nodes.index(op)
         self._nodes = self._nodes[:idx] + nodes + self._nodes[idx+1:]
         self.reset_dependency()
@@ -282,7 +309,29 @@ class IRGraph(IRCell):
     def __repr__(self):
         dscp = f"\n{self.name}:\n{'=' * len(self.name)}\n"
         # inputs
-        dscp += f'Inputs: {self._inputs}\n'
+        inputs = list()
+        for tensor in self.inputs():
+            if isinstance(tensor, IRTensor):
+                anno = 't'
+                if tensor.is_param():
+                    anno = 'w'
+                if tensor.is_grad():
+                    anno = 'g'
+                inputs.append(f'{anno}{tensor._id}')
+            else:
+                inputs.append(tensor)
+        outputs = list()
+        for tensor in self.outputs():
+            if isinstance(tensor, IRTensor):
+                anno = 't'
+                if tensor.is_param():
+                    anno = 'w'
+                if tensor.is_grad():
+                    anno = 'g'
+                outputs.append(f'{anno}{tensor._id}')
+            else:
+                outputs.append(tensor)
+        dscp += f"Inputs: {inputs}\n"
         # nodes
         for node in self._nodes:
             succ_node_ids = [None] * len(node.outputs())
@@ -291,5 +340,5 @@ class IRGraph(IRCell):
                 succ_node_ids[out_idx] = node_list
             dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}\n"
         # outputs
-        dscp += f"\nOutputs: {self._outputs}\n{'=' * len(self.name)}\n"
+        dscp += f"\nOutputs: {outputs}\n{'=' * len(self.name)}\n"
         return dscp

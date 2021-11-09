@@ -113,16 +113,19 @@ def test_translator_backward():
 
     graph = construct_graph()
     data = IRFullTensor(shape=[64,1024], name='data').tosub()
-    output = graph(data)
-    output.backward()
+    loss = graph(data)
+    loss.backward()
 
     nodes = SchedulePool().nodes()
+    for node in nodes:
+        print(node)
     assert len(nodes) == 6
     fnodes = nodes[0:3]
     bnodes = nodes[3:]
-    for fsu, bsu in zip(fnodes, bnodes[::-1]):
-        assert fsu.mirror == bsu
-        assert bsu.mirror == fsu
+    assert loss in bnodes[0].inputs()
+    for fnode, bnode in zip(fnodes, bnodes[::-1]):
+        assert fnode.mirror == bnode
+        assert bnode.mirror == fnode
 
 
 def test_sugraph_gener_gen():

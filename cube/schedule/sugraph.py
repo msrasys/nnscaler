@@ -197,47 +197,20 @@ class SUGraph(IRCell):
                 data_num=len(fsu.inputs()),
                 grad_num=len(fsu.outputs())
             )
-            for idx, input in enumerate(fsu.inputs()):
-                bnode.set_data(idx, input)
+            for idx, fin in enumerate(fsu.inputs()):
+                bnode.set_data(idx, fin)
 
-            # FIXME: fail case: forward -> forward -> backward -> backward
-            fout_grads = list()
-            for fout in fsu.outputs():
-                for grad in fout.grads:
-                    if grad in su1.mirror.inputs() + su2.mirror.inputs():
-                        fout_grads.append(grad)
-                        break
-                else:
-                    raise RuntimeError("Cannot fout find gradient")
-            for idx, fout_grad in enumerate(fout_grads):
-                bnode.set_grad(idx, fout_grad)
+            for idx, fout in enumerate(fsu.outputs()):
+                bnode.set_grad(idx, fout.grad)
 
-            fin_grads = list()
-            for fin in fsu.inputs():
-                if isinstance(fin, IRTensor):
-                    for grad in fin.grads:
-                        if grad in su1.mirror.outputs() + su2.mirror.outputs():
-                            fin_grads.append(grad)
-                            break
-                    else:
-                        print(f'msu = {fsu}')
-                        print(f'fin = {fin}')
-                        print(f'fin grads = {fin.grads}')
-                        print(f'fsu1 = {su1}')
-                        print(f'fsu2 = {su2}')
-                        print(f'bsu1 = {su1.mirror}')
-                        print(f'bsu2 = {su2.mirror}')
-                        raise RuntimeError("Cannot find fin gradient")
-                else:
-                    fin_grads.append(None)
-            for idx, fin_grad in enumerate(fin_grads):
-                bnode.set_output(idx, fin_grad)
+            for idx, fin in enumerate(fsu.inputs()):
+                bnode.set_output(idx, fin.grad)
             bsu = ScheduleUnit([bnode], stype=SUType.Backward, name='bsu')
             bsu.device = su2.mirror.device
             fsu.mirror = bsu
             bsu.mirror = fsu
 
-        def _set_adapters(su1, su2, msu):
+        def _set_adapters(su1: ScheduleUnit, su2: ScheduleUnit, msu: ScheduleUnit):
             # set adapter
             for idx, input in enumerate(msu.inputs()):
                 if input in su1.inputs():

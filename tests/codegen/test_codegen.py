@@ -82,7 +82,7 @@ def test_model_gen():
 
     SchedulePool().clear()
 
-    grad_accum = 2
+    grad_accum = 1
 
     graph = construct_graph()
     dataloader = IRDataLoader(FakeDataLoader(batch_size=64))

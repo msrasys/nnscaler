@@ -344,13 +344,13 @@ class IRTensor:
     IRTensor serves as IRGraph edge
     """
 
-    _attr = ['name', '_is_param', '_requires_grad', '_is_grad', '_grads']
+    _attr = ['name', '_is_param', '_requires_grad', '_is_grad', '_grad']
 
     def __init__(self, shape=None, name=None):
 
         self._id: int = IDGenerator().gen_tensor_id()
         self._shape: Optional(List[int]) = shape
-        self.name = name
+        self.name = name if name else 'tensor'
 
         # device
         self._cell: List[IRCell] = list() 
@@ -359,7 +359,7 @@ class IRTensor:
         self._is_grad = False
         self._requires_grad = True
 
-        self._grads = list()
+        self._grad = None
 
     def attach_cell(self, cell: IRCell):
         """
@@ -381,14 +381,6 @@ class IRTensor:
             raise RuntimeError("the target cell not in the attached list")
         self._cell.remove(cell)
 
-    def set_trace(self, sus: List):
-        """
-        Set tensor generation trace
-        """
-        if not isinstance(sus, list):
-            raise TypeError("Expected List[ScheduleUnit]")
-        self.trace = sus
-
     @property
     def requires_grad(self):
         return self._requires_grad
@@ -399,7 +391,7 @@ class IRTensor:
             raise TypeError("Expected bool")
         self._requires_grad = requires
         if not requires:
-            self._grads = list()
+            self.grad = None
 
     def as_param(self):
         """
@@ -417,22 +409,15 @@ class IRTensor:
         return self._is_param
 
     @property
-    def grads(self) -> List:
-        return self._grads
+    def grad(self):
+        return self._grad
 
-    @grads.setter
-    def grads(self, grads: List):
-        if grads is None:
-            grads = list()
-        if not all([isinstance(grad, IRTensor) for grad in grads]):
-            raise TypeError("grad can only be None or List[Tensor]")
-        self._grads = grads
-        self.requires_grad = True
-
-    def add_grad(self, grad):
-        if grad is not None and not isinstance(grad, IRTensor):
+    @grad.setter
+    def grad(self, grad):
+        if grad and not isinstance(grad, IRTensor):
             raise TypeError("grad can only be None or Tensor")
-        self._grads += [grad]
+        self._grad = grad
+        self.requires_grad = True
 
     def as_grad(self):
         self._is_param = False

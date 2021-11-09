@@ -1,7 +1,7 @@
 from typing import Any, Optional, Union, List
 
 from cube.ir.cten import IRTensor, IRCell
-from cube.graph.tensor import IRFullTensor
+from cube.graph.tensor import IRFullTensor, IRSubTensor
 from cube.algorithm.factory import DistAlgorithmFactory
 
 
@@ -56,6 +56,15 @@ class IRFwOperation(IRCell):
                 return None
             template = factory.algorithms(type(self), tag)
             return template(self)
+
+    def set_input(self, input_index: int, val: Any):
+        old_val = self.inputs(input_index)
+        # remove the old one
+        if isinstance(old_val, IRSubTensor):
+            old_val.parent._rm_fdst_cell(self)
+        if isinstance(val, IRSubTensor):
+            val.parent._add_fdst_cell(self)
+        return super().set_input(input_index, val)
 
     def __repr__(self):
         inputs = list()
@@ -177,7 +186,12 @@ class IRBpOperation(IRCell):
         outputs = list()
         for tensor in self.outputs():
             if isinstance(tensor, IRTensor):
-                outputs.append(f't{tensor._id}')
+                anno = 't'
+                if tensor.is_param():
+                    anno = 'w'
+                if tensor.is_grad():
+                    anno = 'g'
+                outputs.append(f'{anno}{tensor._id}')
             else:
                 outputs.append(tensor)
 

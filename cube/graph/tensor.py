@@ -1,7 +1,20 @@
+"""
+SubTensor Gradient rule:
+
+1). for input tensors, gradient SubTensor is:
+    indices = input.indices;
+    val is splitted by referencing times on the indices
+
+2). for output tensors, gradient SubTensor is:
+    indices = output.indices;
+    val follows same value splitting rules with output
+"""
+
+
 from typing import List, Optional, Union, Tuple
 import copy
 
-from cube.ir.cten import IRTensor
+from cube.ir.cten import IRCell, IRTensor
 
 
 __all__ = ['IndexMap', 'ValueMap', 'IRFullTensor', 'IRSubTensor']
@@ -256,7 +269,7 @@ def _to_value_map(val_map: Union[Tuple, ValueMap, None]):
 
 class IRFullTensor(IRTensor):
 
-    def __init__(self, shape=None, name=None):
+    def __init__(self, shape=None, name=None, requires_grad=True):
 
         super().__init__(shape, name)
 
@@ -266,20 +279,43 @@ class IRFullTensor(IRTensor):
         # value op
         self._val_maps: List = list()
 
+        # track gradient
+        self._forward_dst_cells = list()
+
+        self.requires_grad = requires_grad
+        if requires_grad:
+            grad = IRFullTensor(shape, 'g' + self.name, False).as_grad()
+            self.grad = grad
+
     def __copy__(self):
         """
-        Copy the tensor that will have the exactly same id
-        except the empty attached cell
+        Full tensor should only exist one instance per id
 
         Returns:
             tensor
         """
-        tensor = IRFullTensor(self._shape, self.name)
-        for key in self.__dict__:
-            setattr(tensor, key, getattr(self, key))
-        # clear attached cells
-        tensor._cell = list()
-        return tensor
+        return self
+
+    def _add_fdst_cell(self, cell: IRCell):
+        if not isinstance(cell, IRCell):
+            raise TypeError("Expect an IRCell")
+        if cell not in self._forward_dst_cells:
+            if None in self._forward_dst_cells:
+                idx = self._forward_dst_cells.index(None)
+                self._forward_dst_cells[idx] = cell
+            else:
+                self._forward_dst_cells.append(cell)
+
+    def _rm_fdst_cell(self, cell: IRCell):
+        if not isinstance(cell, IRCell):
+            raise TypeError("Expect an IRCell")
+        if cell in self._forward_dst_cells:
+            # setting to None to keep value map order
+            idx = self._forward_dst_cells.index(cell)
+            self._forward_dst_cells[idx] = None
+
+    def forward_dst_cells(self):
+        return copy.copy(self._forward_dst_cells)
 
     def as_param(self):
         """
@@ -368,6 +404,7 @@ class IRFullTensor(IRTensor):
         sub_tensor = IRSubTensor(self, indices, val_map, shape)
         for attr in IRFullTensor._attr:
             setattr(sub_tensor, attr, getattr(self, attr))
+        sub_tensor.grad = None
 
         self._segments.append(sub_tensor)
         self._indices.append(indices)
@@ -512,6 +549,44 @@ class IRSubTensor(IRTensor):
         self._is_grad = True
         self._is_param = False
         return self
+
+    def get_grad(self, fcell: IRCell):
+        """
+        Get gradient of this tensor which is associated by a
+        forward cell
+        """
+        if not self.requires_grad:
+            raise RuntimeError("require a gradient for a non-grad tensor")
+        full_grad = self.parent.grad
+        if full_grad is None:
+            return None
+        if self in fcell.inputs():
+            fdst_cells = self.parent.forward_dst_cells()
+            ref_cells = list()
+            for dst_cell in fdst_cells:
+                for input in dst_cell.inputs():
+                    if self.overlap(input):
+                        ref_cells.append(dst_cell)
+                        break
+            ref_times = len(ref_cells)
+            if ref_times == 0:
+                raise RuntimeError("Internal Error: ref time is 0")
+            idx = ref_cells.index(fcell)
+            grad = full_grad.select(
+                indices = self.indices,
+                val_map = (idx, ref_times),
+                shape = self.shape
+            )
+            return grad.as_grad()
+        elif self in fcell.outputs():
+            grad = full_grad.select(
+                indices = self.indices,
+                val_map = self.val_map,
+                shape = self.shape
+            )
+            return grad.as_grad()
+        else:
+            raise RuntimeError(f"{self} not found in cell {fcell}")
 
     def select(self, indices: Union[Tuple, IndexMap], val_map: Union[Tuple, ValueMap, None], shape=None):
         """

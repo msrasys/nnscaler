@@ -331,13 +331,7 @@ class ScheduleCodeGen:
 
             fout_grads = list()
             for fout in fsu.outputs():
-                grad = None
-                for fout_grad in fout.grads:
-                    if fout_grad in su.inputs():
-                        grad = fout_grad
-                if grad in fsu.outputs():
-                    grad = None
-                fout_grads.append(self.naming(grad, su))
+                fout_grads.append(self.naming(fout.grad, fsu))
             fout_grads = '(' + ', '.join(fout_grads + ['']) + ')'
 
             body = bsign.format(

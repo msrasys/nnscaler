@@ -66,7 +66,8 @@ def forward(graph, *args) -> IRGraph:
         outputs = node.outputs()
 
         # forwrd node
-        fnode = copy.copy(node)
+        # fnode = copy.copy(node)
+        fnode = node
         fnode._inputs = inputs
         fnode._outputs = outputs
         # set forward inputs
@@ -84,19 +85,22 @@ def forward(graph, *args) -> IRGraph:
             bnode.set_data(idx, val)
             # set gradient output
             grad = None
-            if isinstance(val, IRTensor):
+            if isinstance(val, IRSubTensor):
                 # TODO: requires_grad = False should be set to None
-                grad = gener.renew(val, keep_param=False).as_grad()
-                val.add_grad(grad)
+                # grad = gener.renew(val, keep_param=False).as_grad()
+                grad = val.get_grad(fnode)
+                val.grad = grad
             bnode.set_output(idx, grad)
         for idx, val in enumerate(fnode.outputs()):
             # set gradient input
             grad = None
-            if isinstance(val, IRTensor):
+            if isinstance(val, IRSubTensor):
                 # TODO: requires_grad = False should be set to None
-                grad = gener.renew(val, keep_param=False).as_grad()
+                grad = val.get_grad(fnode)
+                val.grad = grad
+                # grad = gener.renew(val, keep_param=False).as_grad()
                 # TODO: this grad should be partitioned in value dimension
-                val.add_grad(grad)
+                # val.add_grad(grad)
             bnode.set_grad(idx, grad)
 
         fnode.device = node.device
@@ -112,6 +116,10 @@ def forward(graph, *args) -> IRGraph:
     inputs = [gener.renew(input) for input in graph.inputs()]
     outputs = [gener.renew(output) for output in graph.outputs()]
 
-    fgraph = IRGraph(fnodes, inputs, outputs, graph.name)
-    return fgraph
+    for idx, input in enumerate(inputs):
+        graph.set_input(idx, input)
+    for idx, output in enumerate(outputs):
+        graph.set_output(idx, output)
 
+    # fgraph = IRGraph(fnodes, inputs, outputs, graph.name)
+    return graph
