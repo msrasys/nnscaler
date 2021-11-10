@@ -3,10 +3,14 @@ from cube.graph.tensor import IRFullTensor
 from cube.graph.operator.function import Linear
 from cube.graph.graph import IRGraph
 from cube.schedule.pool import SchedulePool
-from cube.schedule.su import SUType, ScheduleUnit
+from cube.schedule.su import SUType
 from cube.schedule.sugraph import SUGraphGener
 from cube.schedule.translator import IRDataLoader
-from cube.schedule.graphpass import SUGraphPass
+
+from cube.execplan import ExectuionPlan
+from cube.execplan.planpass.redundant import RemoveRedundantAdapters
+from cube.execplan.planpass.merge import MergeComputeSU
+
 import torch
 
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
@@ -151,16 +155,19 @@ def test_model_gen():
     for su in seqs:
         print(su)
     sugraph.partial_set_order(seqs)
-    print('========= after reorder: ==========\n', sugraph)
 
-    sugraph = SUGraphPass.remove_redundant_adapters(sugraph)
-    print('========= after remove adapter: ==========\n', sugraph)
+    # print('========= after reorder: ==========\n', sugraph)
 
-    sugraph = SUGraphPass.merge_small_sus(sugraph)
-    print('========= after merge small SU: ==========\n', sugraph)
+    execplan = ExectuionPlan(sugraph)
+    execplan = RemoveRedundantAdapters.apply(execplan)
 
-    mgener = ModelCodeGen(sugraph)
-    tgener = ScheduleCodeGen(sugraph)
+    # print('========= after remove adapter: ==========\n', execplan)
+
+    execplan = MergeComputeSU.apply(execplan)
+    # print('========= after merge small SU: ==========\n', execplan)
+
+    mgener = ModelCodeGen(execplan)
+    tgener = ScheduleCodeGen(execplan)
 
     mcode0 = mgener.gen(device = 0)
     tcode0 = tgener.gen(device = 0)

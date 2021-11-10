@@ -7,7 +7,10 @@ from cube.schedule.pool import SchedulePool
 from cube.schedule.su import SUType
 from cube.schedule.translator import IRDataLoader
 from cube.schedule.sugraph import SUGraph, SUGraphGener
-from cube.schedule.graphpass import SUGraphPass
+
+from cube.execplan import ExectuionPlan
+from cube.execplan.planpass.redundant import RemoveRedundantAdapters
+from cube.execplan.planpass.merge import MergeComputeSU
 
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
@@ -116,7 +119,6 @@ def schedule(model: SemanticModel, dataloader,
             # sugraph
             sugraph = SUGraphGener.gen_sugraph(graph.nodes())
             if schedule_policy:
-                # TODO: add resource
                 sugraph = schedule_policy(sugraph, resource)
 
             # check assignment and order
@@ -127,11 +129,12 @@ def schedule(model: SemanticModel, dataloader,
             if not SUGraph.is_topo_order(sugraph.sus()):
                 raise RuntimeError(f"SUGraph order is not topological order")
 
-            # graph pass to remove redundant sus 
-            sugraph = SUGraphPass.remove_redundant_adapters(sugraph)
-            # print(f'> after remove redundant adapters:\n {sugraph}')
-            sugraph = SUGraphPass.merge_small_sus(sugraph)
-            # print(f'> after merge small sus:\n {sugraph}')
+            execplan = ExectuionPlan(sugraph)
+            # plan pass to remove redundant sus 
+            execplan = RemoveRedundantAdapters.apply(execplan)
+            # print(f'> after remove redundant adapters:\n {execplan}')
+            execplan = MergeComputeSU.apply(execplan)
+            # print(f'> after merge compute SU:\n{execplan}')
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()
@@ -139,8 +142,8 @@ def schedule(model: SemanticModel, dataloader,
                 world_size = 1
 
             # code generation
-            mgener = ModelCodeGen(sugraph)
-            sgener = ScheduleCodeGen(sugraph)
+            mgener = ModelCodeGen(execplan)
+            sgener = ScheduleCodeGen(execplan)
             for rank in range(world_size):
                 fname = filename.format(rank)
                 # generate spatial module code

@@ -6,7 +6,8 @@ import torch
 import copy
 
 from cube.ir.cten import IRTensor
-from cube.schedule.sugraph import SUGraph
+from cube.execplan import ExectuionPlan
+
 from cube.schedule.su import ScheduleUnit, SUType
 from cube.schedule.adapter.comm import IRCommType, IRCommunication
 from cube.schedule.adapter.select import IRTensorReshape, IRReshapeType
@@ -19,13 +20,10 @@ class ModelCodeGen:
     Generate spatial code for the model
     """
 
-    def __init__(self, sugraph: SUGraph):
-        if not isinstance(sugraph, SUGraph):
-            raise TypeError("sugraph should be SUGraph")
-        for su in sugraph.sus():
-            if len(su.device) == 0:
-                raise RuntimeError(f"SU: {su} is not assigned to device")
-        self.seq = sugraph
+    def __init__(self, execplan: ExectuionPlan):
+        if not isinstance(execplan, ExectuionPlan):
+            raise TypeError("execplan should be ExecutionPlan")
+        self.execplan = execplan
         # model full code
         self.init_code: List[str] = [
             '\n\n########## Generated Model Code ###########',
@@ -44,9 +42,9 @@ class ModelCodeGen:
         """
         Generate model implementation code based on the given graph.
         """
-        device_sus = [su for su in self.seq.sus() \
-                      if device in su.device \
-                      and su.stype != SUType.Backward \
+        device_sus = self.execplan.sequence(device)
+        device_sus = [su for su in device_sus \
+                      if su.stype != SUType.Backward \
                       and su.stype != SUType.Dataloader]
 
         gencode = copy.copy(self.init_code)
@@ -89,7 +87,7 @@ class ModelCodeGen:
             cb.insert_body('')
             cb.insert_body(ib.code)
             for idx, su in enumerate(device_sus):
-                name = f'su{self.seq.sus().index(su)}'
+                name = f'su{su._id}'
                 input_args = ['self'] + su_args[idx]
                 forward_code = self.all_su_forward_region[idx]
                 with FunctionBlock(func_name=name, args=input_args) as fb:
@@ -238,10 +236,10 @@ class ModelCodeGen:
 
 class ScheduleCodeGen:
 
-    def __init__(self, seq: SUGraph):
-        if not isinstance(seq, SUGraph):
-            raise TypeError("seq should be SUGraph")
-        self.seq = seq
+    def __init__(self, execplan: ExectuionPlan):
+        if not isinstance(execplan, ExectuionPlan):
+            raise TypeError("execplan should be ExecutionPlan")
+        self.execplan = execplan
         # model full code
         self.init_code: List[str] = [
             '\n\n########## Generated Schedule Code ###########',
@@ -254,13 +252,13 @@ class ScheduleCodeGen:
         Generate scheduling code based on the given sus
         """
         gencode = copy.copy(self.init_code)
-        device_sus = [su for su in self.seq.sus() if device in su.device]
+        device_sus = self.execplan.sequence(device)
 
         # generate code
         with FunctionBlock(func_name='_train_step', 
                            args=['model', 'dataloader']) as fb:
             for su in device_sus:
-                name = f'su{self.seq.sus().index(su)}'
+                name = f'su{su._id}'
                 code = self.emit_su(su, name=name)
                 fb.insert_body(code)
         gencode += fb.code

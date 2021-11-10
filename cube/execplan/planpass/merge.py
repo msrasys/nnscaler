@@ -34,7 +34,7 @@ class MergeComputeSU(PlanPass):
                         pieces.append(su)
                         continue
                 # merge pieces
-                if len(pieces) > 1:
+                if len(pieces) > 0:
                     # merged forward su
                     mfsu = MergeComputeSU._merge(pieces, devid)
                     mbsu = mfsu.mirror
@@ -60,6 +60,8 @@ class MergeComputeSU(PlanPass):
         """
         Merge a list of SU into one.
         """
+        if len(pieces) == 1:
+            return pieces[0]
         fnodes = list()
         for fsu in pieces:
             fnodes += fsu.nodes()

@@ -148,3 +148,12 @@ class ExectuionPlan:
                                 fontsize=10, ha='center', va='center')
             # plt.grid()
             plt.savefig(outfile)
+
+
+    def __repr__(self):
+        dscp = f'Execution Plan ({self.sugraph.name}):\n'
+        for devid in self.devices():
+            dscp += f'====> Device {devid}:\n'
+            for su in self.sequence(devid):
+                dscp += f'{su}\n'
+        return dscp
