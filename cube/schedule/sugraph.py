@@ -60,6 +60,12 @@ class SUGraph(IRCell):
             src = sus[src_idx]
             for dst in sus[src_idx+1:]:
                 for out_idx, out_tensor in enumerate(src.outputs()):
+                    # special dependency for communication adapter
+                    if dst.stype == SUType.Comm:
+                        for recv_tensor in dst.outputs():
+                            if out_tensor.overlap(recv_tensor):
+                                src.add_successor(out_idx, dst)
+                                dst.add_predecessor(-1, src)
                     for in_idx, in_tensor in enumerate(dst.inputs()):
                         if out_tensor.overlap(in_tensor):
                             src.add_successor(out_idx, dst)
@@ -383,31 +389,18 @@ class SUGraph(IRCell):
             if su not in seq:
                 remain_sus.append(su)
         for rsu in remain_sus:
-            if len(rsu.inputs()) > 0:
-                happen_before_sus = rsu.predecessors()
-                idx = 0
-                while len(happen_before_sus) > 0:
-                    if idx == len(seq):
-                        raise RuntimeError(
-                            f"Internal Error: SU {rsu} cannot be inserted"
-                        )
-                    su = seq[idx]
-                    if su in happen_before_sus:
-                        happen_before_sus.remove(su)
-                    idx += 1
-                seq.insert(idx, rsu)
-            else:
-                succ_sus = rsu.successors()
-                idx = len(seq)
-                while len(succ_sus) > 0:
-                    idx -= 1
-                    if idx < 0:
-                        idx = 0
-                        break
-                    su = seq[idx]
-                    if su in succ_sus:
-                        succ_sus.remove(su)
-                seq.insert(idx, rsu)
+            happen_before_sus = rsu.predecessors()
+            idx = 0
+            while len(happen_before_sus) > 0:
+                if idx == len(seq):
+                    raise RuntimeError(
+                        f"Internal Error: SU {rsu} cannot be inserted"
+                    )
+                su = seq[idx]
+                if su in happen_before_sus:
+                    happen_before_sus.remove(su)
+                idx += 1
+            seq.insert(idx, rsu)
 
         if not SUGraph.is_topo_order(seq, integrity_check=True):
             raise RuntimeError("Internal Error: topo is not guaranteed.")

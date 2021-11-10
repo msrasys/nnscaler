@@ -1,11 +1,19 @@
-"""
+r"""
 SubTensor Gradient rule:
 
-1). for input tensors, gradient SubTensor is:
+SubTensor's logical grad = SubTensor.parent.grad.select(
+    indices = SubTensor.indices, 
+    val_map = SubTensor.val_map,
+    shape   = SubTensor.shape
+)
+
+FwOperation -> BpOperation rule:
+
+1). for (FwOp) input tensors, gradient SubTensor is:
     indices = input.indices;
     val is splitted by referencing times on the indices
 
-2). for output tensors, gradient SubTensor is:
+2). for (FwOp) output tensors, gradient SubTensor is:
     indices = output.indices;
     val follows same value splitting rules with output
 """
