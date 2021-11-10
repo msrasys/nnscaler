@@ -6,7 +6,7 @@ from cube.graph.operator.operator import IRBpOperation
 from cube.schedule.su import SUType, ScheduleUnit
 
 
-class MergeComputeAdapters(PlanPass):
+class MergeComputeSU(PlanPass):
 
     @staticmethod
     def apply(execplan: ExectuionPlan) -> ExectuionPlan:
@@ -36,7 +36,7 @@ class MergeComputeAdapters(PlanPass):
                 # merge pieces
                 if len(pieces) > 1:
                     # merged forward su
-                    mfsu = MergeComputeAdapters._merge(pieces, devid)
+                    mfsu = MergeComputeSU._merge(pieces, devid)
                     mbsu = mfsu.mirror
                     # insert merged forward su
                     dev_seq[seqidx-1] = mfsu

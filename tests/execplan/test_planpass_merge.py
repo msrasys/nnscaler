@@ -8,7 +8,7 @@ from cube.schedule.sugraph import SUGraphGener
 
 from cube.execplan import ExectuionPlan
 from cube.execplan.planpass.redundant import RemoveRedundantAdapters
-from cube.execplan.planpass.merge import MergeComputeAdapters
+from cube.execplan.planpass.merge import MergeComputeSU
 
 
 def construct_graph():
@@ -73,7 +73,7 @@ def test_planpass_merge():
 
     execplan = ExectuionPlan(sugraph)
     execplan = RemoveRedundantAdapters.apply(execplan)
-    execplan = MergeComputeAdapters.apply(execplan)
+    execplan = MergeComputeSU.apply(execplan)
 
     print('merged:')
     for devid in execplan.devices():
