@@ -66,3 +66,9 @@ class DistAlgorithmFactory:
         self.register(linear.Linear, linear.LinearDataParallel, tag='data')
         self.register(linear.Linear, linear.LinearColumnWeight, tag='column')
         self.register(linear.Linear, linear.LinearRowWeight, tag='row')
+
+        import cube.algorithm.elementwise as elew
+        self.register(elew.ElementWise, elew.ElementWiseDataParallel, tag='data')
+
+        import cube.algorithm.reduce as reduce
+        self.register(reduce.Reduce, reduce.ReduceDataParallel, tag='data')
