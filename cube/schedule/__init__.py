@@ -117,7 +117,7 @@ def schedule(model: SemanticModel, dataloader,
                 sugraph = schedule_policy(sugraph, None)
 
             # check assignment and order
-            print(sugraph)
+            # print(sugraph)
             for su in sugraph.sus():
                 if len(su.device) == 0:
                     raise RuntimeError(f"SU {su} device is not set")
@@ -127,7 +127,7 @@ def schedule(model: SemanticModel, dataloader,
             # graph pass to remove redundant sus 
             sugraph = SUGraphPass.remove_redundant_adapters(sugraph)
             sugraph = SUGraphPass.merge_small_sus(sugraph)
-            print(sugraph)
+            print(f'> after merge small sus:\n {sugraph}')
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()

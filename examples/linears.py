@@ -73,23 +73,7 @@ def schedule_policy(sugraph: SUGraph, resource):
     return sugraph
 
 
-class FakeDataLoader:
-    def __init__(self, shape, num=640):
-        self.shape = list(shape)
-        self.length = num
-        self.pos = 0
-    def __iter__(self):
-        self.pos = 0
-        return self
-    def reset(self, batch_size):
-        self.shape[0] = batch_size
-        self.pos = 0
-    def __next__(self):
-        self.pos += 1
-        if self.pos == self.length:
-            raise StopIteration 
-        return torch.randn(self.shape).cuda()
-
+# =================== Semantic Model Description ====================
 
 class MLP(nn.Module):
     def __init__(self, dim, mult=16):
@@ -117,7 +101,7 @@ def train():
         model, input_shapes=([batch_size, dim],),
     )
 
-    dataloader = FakeDataLoader([batch_size, dim])
+    dataloader = cube.runtime.syndata.SynDataLoader(640, [batch_size, dim])
 
     @cube.schedule.schedule(model, dataloader, transform_policy=transform_policy, schedule_policy=schedule_policy)
     def train_iter(model, dataloader):
