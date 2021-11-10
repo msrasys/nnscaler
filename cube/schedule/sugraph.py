@@ -458,11 +458,12 @@ class SUGraph(IRCell):
                     merge_op = IRTensorReshape(
                         src_tensors=tensor_segments, dst_tensors=[input]
                     )
-                    merge_su = ScheduleUnit([merge_op], SUType.Comm, name='merge')
+                    merge_su = ScheduleUnit([merge_op], SUType.Transform, name='merge')
                     su._set_merge_adapter(in_idx, merge_su)
                     merge_su.device = su.device
 
-            # add adapter for select
+        # add adapter for select
+        for su in sugraph.sus():
             for out_idx, output in enumerate(su.outputs()):
                 if not isinstance(output, IRTensor):
                     continue
@@ -477,7 +478,7 @@ class SUGraph(IRCell):
                         src_tensors=[output], dst_tensors=select_tensors
                     )
                     select_su = ScheduleUnit(
-                        [select_op], SUType.Comm, name='select'
+                        [select_op], SUType.Transform, name='select'
                     )
                     su._set_select_adapter(out_idx, select_su)
                     select_su.device = su.device
