@@ -61,6 +61,9 @@ class FakeDataLoader:
     def __iter__(self):
         self.pos = 0
         return self
+    def reset(self, batch_size):
+        self.batch_size = batch_size
+        self.pos = 0
     def __next__(self):
         self.pos += 1
         if self.pos == self.length:

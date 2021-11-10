@@ -8,15 +8,15 @@ python -m torch.distributed.launch \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    examples/e2e.py
+    examples/linears.py
 """
-from typing import List
 
 import torch
 from torch import nn
 
 import cube
-from cube.schedule.su import ScheduleUnit
+from cube.graph.operator.operator import IRDataOperation, IRFwOperation
+from cube.schedule.su import SUType
 from cube.schedule.sugraph import SUGraph
 
 
@@ -24,68 +24,66 @@ def transform_policy(graph, resource):
     """
     The transformation policy transposes linear using data parallel
     """
-    ndevice = resource.ngpus
-    for op in graph.nodes():
-        # TODO: which dimension is batch
-        algorithm = op.algorithms('data_parallel')
-        graph.partition(op, algorithm, config=dict(chunk_size=ndevice))
+    for node in graph.nodes():
+        if isinstance(node, IRDataOperation) or isinstance(node, IRFwOperation):
+            algo = node.algorithms('data')
+            graph.partition(node, algo, config=dict(chunk_num=2))
     return graph
 
 
-def schedule_policy(seq: SUGraph, resource):
+def schedule_policy(sugraph: SUGraph, resource):
     """
     The schedule policy uses 1F1B (interleaved) pipeline
     """
-    ndevice = resource.ngpus
-
-    # batch_seqs[idx]: the idx-th forward-backward 4 linear forward + backward
-    batch_seqs: List[List[ScheduleUnit]] = group_by_batches(seq.sus())
-    num_fsus = len(seq.sus()) // len(batch_seqs) // 2
-
-    # device placement -- inter-device order
-    for batch_seq in batch_seqs:
-        for idx, su in enumerate(batch_seq):
-            stage = idx // (num_fsus // ndevice)
-            if idx < num_fsus:
-                seq.assign(su, stage)
+    fb_seqs = list()
+    for fsu in sugraph.fsus():
+        for fb_seq in fb_seqs:
+            for ksu in fb_seq[::-1]:
+                if sugraph.happen_before(ksu, fsu):
+                    fb_seq.append(fsu)
+                    break
             else:
-                seq.assign(su, ndevice - stage % ndevice)
-
-
-    # decide topo order -- intra-device order
-    f = lambda stage, micro_batch_id: batch_seqs[micro_batch_id][stage]
-    b = lambda stage, micro_batch_id: batch_seqs[micro_batch_id][-stage]
-    
-    reorder = list()
-    # warmup
-    for stage in range(ndevice):
-        for micro_batch_id in range(stage):
-            reorder = reorder.append(f(stage, micro_batch_id))
-    # steady + cooldown
-    for stage in range(ndevice):
-        # backward
-        for micro_batch_id in range(len(batch_seqs)):
-            reorder.append(b(stage, micro_batch_id))
-        # forward
-        for stage in range(ndevice):
-            f_mirco_batch_id = micro_batch_id + 1 + ndevice - stage
-            if f_mirco_batch_id >= len(batch_seqs):
                 continue
-            reorder.append(f(stage, f_mirco_batch_id))
-    # inform system the topological order that could do pipeline parallelism
-    SUGraph.set_order(reorder)
+            break
+        else:
+            fb_seqs.append([fsu])
+    
+    # device assignment
+    for su in sugraph.sus():
+        if su.stype == SUType.Dataloader:
+            sugraph.assign(su, 0)
+    
+    for fb_seq in fb_seqs:
+        for idx, su in enumerate(fb_seq):
+            if idx < 2:
+                sugraph.assign(su, 0)
+                sugraph.assign(su.mirror, 0)
+            else:
+                sugraph.assign(su, 1)
+                sugraph.assign(su.mirror, 1)
 
+    # set partial order
+    for fb_seq in fb_seqs:
+        fb_seq += [fsu.mirror for fsu in fb_seq][::-1]
 
+    seqs = list()
+    for fb_seq in fb_seqs:
+        seqs += fb_seq
+    sugraph.partial_set_order(seqs)
+    return sugraph
 
 
 class FakeDataLoader:
     def __init__(self, shape, num=640):
-        self.shape = shape
+        self.shape = list(shape)
         self.length = num
         self.pos = 0
     def __iter__(self):
         self.pos = 0
         return self
+    def reset(self, batch_size):
+        self.shape[0] = batch_size
+        self.pos = 0
     def __next__(self):
         self.pos += 1
         if self.pos == self.length:
@@ -106,7 +104,8 @@ class MLP(nn.Module):
         output = self.linear2(output)
         output = self.linear3(output)
         output = self.linear4(output)
-        return output
+        loss = torch.sum(output)
+        return loss
 
 
 def train():
@@ -114,19 +113,19 @@ def train():
     dim = 1024
 
     model = MLP(dim=dim)
-    model = cube.schedule.transform(model, policy_fn=transform_policy)
-    model = model.cuda()
+    model = cube.schedule.SemanticModel(
+        model, input_shapes=([batch_size, dim],),
+    )
 
-    dataloader = FakeDataLoader((batch_size, dim))
+    dataloader = FakeDataLoader([batch_size, dim])
 
-    @cube.schedule.schedule(model, dataloader, policy_fn=schedule_policy)
+    @cube.schedule.schedule(model, dataloader, transform_policy=transform_policy, schedule_policy=schedule_policy)
     def train_iter(model, dataloader):
-        for _ in range(4):
-            data = next(dataloader)
-            output = model(data)
-            loss = torch.sum(output) / 1000
-            print(f'loss={loss.item()}')
-            loss.backward()
+        data = next(dataloader)
+        loss = model(data)
+        # print(f'loss={loss.item()}')
+        loss.backward()
+    model = model.get_gen_module()
     
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
@@ -138,4 +137,5 @@ def train():
 
 if __name__ == '__main__':
 
+    cube.DeviceGroup()
     train()

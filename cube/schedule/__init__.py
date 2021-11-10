@@ -3,6 +3,7 @@ import torch
 from cube.graph.graph import IRGraph
 
 from cube.schedule.pool import SchedulePool
+from cube.schedule.su import SUType
 from cube.schedule.translator import IRDataLoader
 from cube.schedule.sugraph import SUGraph, SUGraphGener
 from cube.schedule.graphpass import SUGraphPass
@@ -95,7 +96,7 @@ def schedule(model: SemanticModel, dataloader,
 
     def decorator(fn: Callable) -> Callable:
         filename = 'gencode{}.py'
-
+        batch_size = torch.tensor([-1], dtype=torch.int).cuda()
         if myrank == 0:
             SchedulePool().clear()
 
@@ -124,9 +125,9 @@ def schedule(model: SemanticModel, dataloader,
                 raise RuntimeError(f"SUGraph order is not topological order")
 
             # graph pass to remove redundant sus 
-            su_graph = SUGraphPass.remove_redundant_adapters(sugraph)
-            su_graph = SUGraphPass.merge_small_sus(su_graph)
-            print(su_graph)
+            sugraph = SUGraphPass.remove_redundant_adapters(sugraph)
+            sugraph = SUGraphPass.merge_small_sus(sugraph)
+            print(sugraph)
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()
@@ -134,8 +135,8 @@ def schedule(model: SemanticModel, dataloader,
                 world_size = 1
 
             # code generation
-            mgener = ModelCodeGen(su_graph)
-            sgener = ScheduleCodeGen(su_graph)
+            mgener = ModelCodeGen(sugraph)
+            sgener = ScheduleCodeGen(sugraph)
             for rank in range(world_size):
                 fname = filename.format(rank)
                 # generate spatial module code
@@ -146,8 +147,26 @@ def schedule(model: SemanticModel, dataloader,
                     outfile = fname,
                     attach=True
                 )
+            # get dataloader batch size
+            data = None
+            for su in sugraph.sus():
+                if su.stype == SUType.Dataloader:
+                    data = su.outputs(0)
+                    break
+            if data is None:
+                raise RuntimeError("dataloader not found in SUGraph")
+            # assume batch_size is always first dimension
+            batch_size = torch.tensor([data.shape[0]], dtype=torch.int).cuda()
+
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+        # reset dataloader
+        torch.distributed.broadcast(batch_size, src=0)
+        batch_size = batch_size.item()
+        print(f'> reseting dataloader batch size to {batch_size}')
+        dataloader.reset(batch_size=batch_size)
+
         # load module
         model.load_module(filename.format(myrank))
         # load temporal
