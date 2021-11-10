@@ -1,4 +1,5 @@
 from typing import List, Optional
+import copy
 
 from cube.schedule.sugraph import SUGraph
 from cube.schedule.su import SUType, ScheduleUnit
@@ -6,16 +7,51 @@ from cube.schedule.su import SUType, ScheduleUnit
 
 class ExectuionPlan:
 
-    def __init__(self, seq: SUGraph):
-
-        self.seq = seq
+    def __init__(self, sugraph: SUGraph):
+        if not isinstance(sugraph, SUGraph):
+            raise TypeError("Expected a list of ScheduleUnit")
+        self.sugraph = sugraph
         self.device_seq = dict()
-        for su in seq.sequence:
+        for su in sugraph.sus():
             device = su.device[0]
             if device not in self.device_seq:
                 self.device_seq[device] = [su]
             else:
                 self.device_seq[device].append(su)
+
+    def devices(self) -> List[int]:
+        """
+        Get device set
+        """
+        return self.device_seq.keys()
+
+    def sequence(self, device_id: int) -> List[ScheduleUnit]:
+        """
+        Get a copy of execution sequence for device id
+
+        Note changing the list content will not change the execution plan.
+        """
+        if device_id not in self.device_seq:
+            return list()
+        return copy.copy(self.device_seq[device_id])
+
+    def at(self, device_id: int) -> List[ScheduleUnit]:
+        """
+        Access the sequence for device id
+
+        Note changing the list content will change the execution plan.
+        """
+        if device_id not in self.device_seq:
+            return list()
+        return self.device_seq[device_id]
+
+    def set(self, device_id: int, seq: List[ScheduleUnit]):
+        """
+        Set device sequence
+        """
+        if not all([isinstance(su, ScheduleUnit) for su in seq]):
+            raise TypeError("Expected a list of ScheduleUnit")
+        self.device_seq[device_id] = seq
 
     def draw(self, spans: Optional[List[int]] = None, outfile='./execplan.png'):
         """
