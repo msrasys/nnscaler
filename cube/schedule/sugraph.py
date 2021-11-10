@@ -170,7 +170,7 @@ class SUGraph(IRCell):
         if su2 not in fsus:
             raise RuntimeError(f"SU2: {su2} not in forward SUs")
 
-        idx1, idx2 = fsus.index(su1), fsus.index(su2)
+        idx1, idx2 = self.sequence.index(su1), self.sequence.index(su2)
         su1, su2 = (su1, su2) if idx1 < idx2 else (su2, su1)
 
         # condition 1): same device
@@ -179,7 +179,8 @@ class SUGraph(IRCell):
 
         # condition 2): su2 input cannot be got from both su1 and other su
         start, stop = min(idx1, idx2), max(idx1, idx2)
-        inter_sus = fsus[start+1:stop]
+        inter_sus = self.sequence[start+1:stop]
+        inter_sus = [su for su in inter_sus if su.stype != SUType.Comm]
         for su in inter_sus:
             # FIXME: currently only allow other device su exists
             if self.happen_before(su1, su) or self.happen_before(su, su2):

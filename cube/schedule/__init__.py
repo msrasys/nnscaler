@@ -1,7 +1,8 @@
 from typing import Callable, Optional
 import torch
-from cube.graph.graph import IRGraph
 
+import cube
+from cube.graph.graph import IRGraph
 from cube.schedule.pool import SchedulePool
 from cube.schedule.su import SUType
 from cube.schedule.translator import IRDataLoader
@@ -99,8 +100,10 @@ def schedule(model: SemanticModel, dataloader,
         batch_size = torch.tensor([-1], dtype=torch.int).cuda()
         if myrank == 0:
             SchedulePool().clear()
+            resource = cube.runtime.resource.EnvResource()
 
             # logic translator
+            # print(f'> ir_graph:\n{ir_graph}')
             fn(ir_graph, ir_dataloader)
 
             nodes = SchedulePool().nodes()
@@ -108,13 +111,13 @@ def schedule(model: SemanticModel, dataloader,
             # graph transformation
             graph = IRGraph(nodes, None, None, ir_graph.name)
             if transform_policy:
-                graph = transform_policy(graph, None)
+                graph = transform_policy(graph, resource)
 
             # sugraph
             sugraph = SUGraphGener.gen_sugraph(graph.nodes())
             if schedule_policy:
                 # TODO: add resource
-                sugraph = schedule_policy(sugraph, None)
+                sugraph = schedule_policy(sugraph, resource)
 
             # check assignment and order
             # print(sugraph)
@@ -126,8 +129,9 @@ def schedule(model: SemanticModel, dataloader,
 
             # graph pass to remove redundant sus 
             sugraph = SUGraphPass.remove_redundant_adapters(sugraph)
+            # print(f'> after remove redundant adapters:\n {sugraph}')
             sugraph = SUGraphPass.merge_small_sus(sugraph)
-            print(f'> after merge small sus:\n {sugraph}')
+            # print(f'> after merge small sus:\n {sugraph}')
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()

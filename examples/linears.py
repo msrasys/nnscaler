@@ -15,7 +15,6 @@ import torch
 from torch import nn
 
 import cube
-from cube.graph.operator.operator import IRDataOperation, IRFwOperation
 from cube.schedule.su import SUType
 from cube.schedule.sugraph import SUGraph
 
@@ -24,16 +23,18 @@ def transform_policy(graph, resource):
     """
     The transformation policy transposes linear using data parallel
     """
+    from cube.graph.operator.operator import IRDataOperation, IRFwOperation
     for node in graph.nodes():
         if isinstance(node, IRDataOperation) or isinstance(node, IRFwOperation):
             algo = node.algorithms('data')
-            graph.partition(node, algo, config=dict(chunk_num=2))
+            assert algo is not None
+            graph.partition(node, algo, config=dict(chunk_num=resource.ngpus))
     return graph
 
 
 def schedule_policy(sugraph: SUGraph, resource):
     """
-    The schedule policy uses 1F1B (interleaved) pipeline
+    The schedule policy
     """
     fb_seqs = list()
     for fsu in sugraph.fsus():
@@ -53,14 +54,12 @@ def schedule_policy(sugraph: SUGraph, resource):
         if su.stype == SUType.Dataloader:
             sugraph.assign(su, 0)
     
+    print(f'> collect {len(fb_seqs)} forward-backward sequence')
     for fb_seq in fb_seqs:
         for idx, su in enumerate(fb_seq):
-            if idx < 2:
-                sugraph.assign(su, 0)
-                sugraph.assign(su.mirror, 0)
-            else:
-                sugraph.assign(su, 1)
-                sugraph.assign(su.mirror, 1)
+            devid = idx % resource.ngpus
+            sugraph.assign(su, devid)
+            sugraph.assign(su.mirror, devid)
 
     # set partial order
     for fb_seq in fb_seqs:
@@ -121,5 +120,5 @@ def train():
 
 if __name__ == '__main__':
 
-    cube.DeviceGroup()
+    cube.init()
     train()
