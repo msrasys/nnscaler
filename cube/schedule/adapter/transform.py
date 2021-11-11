@@ -1,9 +1,10 @@
+import copy
 from typing import List, Optional
 from enum import Enum
 import numpy as np
 
 from cube.ir.cten import IRCell
-from cube.graph.tensor import IRSubTensor, IndexMap
+from cube.graph.tensor import IRSubTensor, IndexMap, ValueMap
 
 
 class IRTransformType(Enum):
@@ -27,72 +28,28 @@ class IRTensorTransform(IRCell):
     """
     def __init__(self, src_tensors: List[IRSubTensor], dst_tensors: List[IRSubTensor]):
 
-        if len(src_tensors) != 1 and len(dst_tensors) != 1:
+        if not all([isinstance(t, IRSubTensor) for t in src_tensors]):
+            raise TypeError("Expected src tensors to be IRSubTensor")
+        if not all([isinstance(t, IRSubTensor) for t in dst_tensors]):
+            raise TypeError("Expected dst tensors to be IRSubTensor")
+        if not ((len(src_tensors) == 1) or (len(dst_tensors) == 1)):
             raise ValueError("Expected at least one of tensors has length 1")
 
         self.ttype = None
+        self._trace = list()
 
-        self._select_indices: List[IndexMap] = list()
-        self._merge_axis = None
-
+        # select
         if len(src_tensors) == 1:
             self.ttype = IRTransformType.Select
-            src_tensor = src_tensors[0]
-            if not isinstance(src_tensor, IRSubTensor):
-                raise TypeError(f"Expected IRSubTensor but got {type(src_tensor)}")
-            # select
-            for tensor in dst_tensors:
-                indices = tensor.indices & src_tensor.indices
-                self._select_indices.append(indices)
-        
+            self._trace = SelectPlan.gen(src_tensors[0], dst_tensors)
+
+        # merge
         elif len(dst_tensors) == 1:
             self.ttype = IRTransformType.Merge
-            dst_tensor = dst_tensors[0]
-            # find dims to concat
-            ndims = len(dst_tensor.shape)
-            indices = [set() for _ in range(ndims)]
-            for src_tensor in src_tensors:
-                if isinstance(src_tensor, IRSubTensor):
-                    for ndim, slicer in enumerate(src_tensor.indices.get()):
-                        indices[ndim].add((slicer.start, slicer.stop, slicer.step))
-                else:
-                    raise RuntimeError(
-                        f"Expected SubTensor but got {type(src_tensor)}"
-                    ) 
-            # check if only one dim set has multiple slicer
-            for dim, dim_indices in enumerate(indices):
-                if len(dim_indices) != 1:
-                    if self._merge_axis is not None:
-                        print("src: ", src_tensors)
-                        print("dst: ", dst_tensors)
-                        raise NotImplementedError("Only support merge on one axis")
-                    self._merge_axis = dim
-            if self._merge_axis is None:
-                # check the coverage
-                if src_tensors[0].indices != dst_tensor.indices:
-                    raise RuntimeError("Not cover all the indices to merge.")
-            # get merge axis
-            if self._merge_axis is not None:
-                dim_indices = indices[self._merge_axis]
-                # check if they are overlapped
-                starts = np.array([slicer[0] for slicer in dim_indices])
-                stops = np.array([slicer[1] for slicer in dim_indices])
-                steps = np.array([slicer[2] for slicer in dim_indices])
-                sorted_idx = np.argsort(starts)
-                sorted_starts = starts[sorted_idx]
-                sorted_stops = stops[sorted_idx]
-                sorted_steps = steps[sorted_idx]
-                for last_stop, begin_start in zip(sorted_stops[:-1], sorted_starts[1:]):
-                    if last_stop != begin_start:
-                        raise NotImplementedError(f"Concatenation fails due to axis {last_stop} != {begin_start}")
-                for step in sorted_steps:
-                    if step != 1:
-                        raise NotImplementedError(f"Found a SubTensor step {step} != 1")
-                # re-order
-                src_tensors = np.array(src_tensors)[sorted_idx]
+            self._trace = MergePlan.gen(src_tensors, dst_tensors[0])
 
         else:
-            raise RuntimeError("Internal Error")
+            raise NotImplementedError
 
         super().__init__(
             name = 'transformation',
@@ -105,26 +62,233 @@ class IRTensorTransform(IRCell):
         for idx, output in enumerate(dst_tensors):
             self.set_output(idx, output)
 
-    @property
-    def select_indices(self) -> List[IndexMap]:
-        return self._select_indices
-
-    @property
-    def merge_axis(self) -> Optional[int]:
-        return self._merge_axis
+    def trace(self):
+        """
+        Get trace of transformation
+        """
+        return copy.copy(self._trace)
 
     def is_identity(self):
         """
         Check if this transformation is a non-op
         """
-        if self.ttype == IRTransformType.Select:
-            src_tensor = self.inputs(0)
-            for dst_tensor in self.outputs():
-                if dst_tensor != src_tensor:
-                    return False
-            return True
-        if self.ttype == IRTransformType.Merge:
-            if self.merge_axis is None:
-                return True
-            return False
-        return False
+        return len(self._trace) == 0
+
+
+class SelectPrim:
+
+    def __init__(self, tensor: IRSubTensor, indices: IndexMap, val_map: ValueMap, shape: List[int]):
+        self.tensor = tensor
+        self.indices = indices
+        self.val_map = val_map
+        self.shape = shape
+        self.output = None
+    
+    def set_output(self, output: IRSubTensor):
+        self.output = output
+
+    def __repr__(self):
+        dscp = f't{self.output._id} = select(t{self.tensor._id}, {self.indices}, {self.val_map}, {self.shape})'
+        return dscp
+
+
+class SelectPlan:
+
+    @staticmethod
+    def gen(input: IRSubTensor, outputs: List[IRSubTensor]) -> List[SelectPrim]:
+        trace: List[SelectPrim] = list()
+        islicers: List[slice] = input.indices.get()
+        for output in outputs:
+            if output == input:
+                continue
+            oslicers: List[slice] = output.indices.get()
+            # indices
+            indices = list()
+            for islicer, oslicer in zip(islicers, oslicers):
+                istart, istop, istep = islicer.start, islicer.stop, islicer.step
+                ostart, ostop, ostep = oslicer.start, oslicer.stop, oslicer.step
+                if ostep % istep != 0:
+                    raise RuntimeError("Step condition fails")
+                # relative offset
+                start = ostart - istart
+                stop = start + ostop - ostart
+                slicer = slice(start, stop, ostep)
+                indices.append(slicer)
+            indices = IndexMap(tuple(indices))
+            # value map
+            if output.val_map == input.val_map:
+                val_map = ValueMap(0, 1)
+            elif input.val_map == ValueMap(0, 1):
+                val_map = output.val_map
+            else:
+                print(output)
+                raise NotImplementedError(
+                    f"Not supported value trans: {input.val_map} -> {output.val_map}"
+                )
+            prim = SelectPrim(input, indices, val_map, output.shape)
+            prim.set_output(output)
+            trace.append(prim)
+        return trace
+
+
+class MergePrim:
+    def __init__(self,
+                 tensors: List[IRSubTensor],
+                 concat: Optional[int] = None,
+                 add: bool = False):
+        if not ((concat is not None) ^ (add is True)):  # xor condition
+            raise RuntimeError("Expected concat or add")
+        self.tensors = tensors
+        self.concat = concat
+        self.add = add
+        self.output = None
+        # re-order tensor
+        if isinstance(concat, int):
+            slicers = [tensor.indices.get()[concat] for tensor in tensors]
+            starts = np.array([slicer.start for slicer in slicers], dtype=int)
+            sorted_idx = np.argsort(starts)
+            tensors = np.array(tensors)[sorted_idx]
+            self.tensors = tensors.tolist()
+
+    def set_output(self, output: IRSubTensor):
+        self.output = output
+
+
+    def __repr__(self):
+        tensors = [f't{t._id}' for t in self.tensors]
+        tensors = '[' + ', '.join(tensors) + ']'
+        dscp = f't{self.output._id} = merge({tensors}, axis={self.concat}, add={self.add})'
+        return dscp
+
+
+class MergePlan:
+
+    @staticmethod
+    def gen(inputs: List[IRSubTensor], output: IRSubTensor) -> List[MergePrim]:
+        """
+        Generate merge plan from input tensors to the output.
+        """
+        if not all([isinstance(t, IRSubTensor) for t in inputs]):
+            raise TypeError("Expected inputs: List[IRSubTensor]")
+        if not isinstance(output, IRSubTensor):
+            raise TypeError("Expected inputs: List[IRSubTensor]")
+
+        trace : List[MergePrim] = list()
+        remain_tensors = copy.copy(inputs)
+        dst_tensor = output
+        if dst_tensor in remain_tensors:
+            return trace
+        out = None
+        while out != dst_tensor:
+            # concat or merge
+            out = None
+            merge = False
+            for idx1 in range(len(remain_tensors) - 1):
+                for idx2 in range(idx1 + 1, len(remain_tensors)):
+                    tensor1 = remain_tensors[idx1]
+                    tensor2 = remain_tensors[idx2]
+                    out = MergePlan.concat(tensor1, tensor2)
+                    if out is not None:
+                        out_tensor, concat_dim = out
+                        out = out_tensor
+                        prim = MergePrim([tensor1, tensor2], concat_dim, False)
+                        prim.set_output(out_tensor)
+                        trace.append(prim)
+                        merge = True
+                        break
+                    out = MergePlan.add(tensor1, tensor2)
+                    if out is not None:
+                        prim = MergePrim([tensor1, tensor2], None, True)
+                        prim.set_output(out)
+                        trace.append(prim)
+                        merge = True
+                        break
+                if merge:
+                    remain_tensors.remove(tensor1)
+                    remain_tensors.remove(tensor2)
+                    remain_tensors.append(out)
+                    break
+            # cannot merge or add
+            if out is None:
+                raise RuntimeError("Merge Plan not found")
+        return trace
+
+
+    @staticmethod
+    def concat(tensor1: IRSubTensor, tensor2: IRSubTensor) -> int:
+        """
+        Check if two tensor can be merged.
+        If they can be merged, return the merge index
+        """
+        if not isinstance(tensor1, IRSubTensor) or not isinstance(tensor2, IRSubTensor):
+            raise TypeError("Expected two tensors")
+        if tensor1.overlap(tensor2):
+            return None
+        if tensor1.parent != tensor2.parent:
+            return None
+        if tensor1.val_map != tensor2.val_map:
+            return None
+        indices1 = tensor1.indices.get()
+        indices2 = tensor2.indices.get()
+        indices = list()
+        if len(indices1) != len(indices2):
+            return None
+        axis = None
+        for dim, (slicer1, slicer2) in enumerate(zip(indices1, indices2)):
+            if slicer1 != slicer2:
+                start1, stop1, step1 = slicer1.start, slicer1.stop, slicer1.step
+                start2, stop2, step2 = slicer2.start, slicer2.stop, slicer2.step
+                if step1 != step2:
+                    return None
+                if axis is not None:
+                    return None
+                if start1 < start2 and stop1 == start2:
+                    axis = dim
+                    indices.append(slice(start1, stop2, step1))
+                elif start1 > start2 and start1 == stop2:
+                    axis = dim
+                    indices.append(slice(start2, stop1, step1))
+                else:
+                    return None
+            else:
+                indices.append(slicer1)
+        shapes = list()
+        for idx, (nele1, nele2) in enumerate(zip(tensor1.shape, tensor2.shape)):
+            nele = nele1 if idx != axis else nele1 + nele2
+            shapes.append(nele)
+        mtensor = tensor1.parent.select(
+            indices = tuple(indices),
+            val_map = tensor1.val_map,
+            shape = shapes
+        )
+        return mtensor, axis
+
+    @staticmethod
+    def add(tensor1: IRSubTensor, tensor2: IRSubTensor) -> int:
+        if not isinstance(tensor1, IRSubTensor) or not isinstance(tensor2, IRSubTensor):
+            raise TypeError("Expected two tensors")
+        if tensor1.overlap(tensor2):
+            return None
+        if tensor1.parent != tensor2.parent:
+            return None
+        if tensor1.indices != tensor2.indices:
+            return None
+        if tensor1.val_map.chunk_num != tensor2.val_map.chunk_num:
+            return None
+        chunk_num = tensor1.val_map.chunk_num
+        idx1, idx2 = tensor1.val_map.idx, tensor2.val_map.idx
+        if chunk_num % 2 != 0:
+            return None
+        chunk_num = int(chunk_num // 2)
+        if chunk_num == 1:
+            idx = 0
+        else:
+            if int(idx1 // chunk_num) != int(idx2 // chunk_num):
+                return None
+            idx = int(idx1 // chunk_num)
+        mtensor = tensor1.parent.select(
+            indices = tensor1.indices,
+            val_map = (idx, chunk_num),
+            shape = tensor1.shape
+        )
+        return mtensor

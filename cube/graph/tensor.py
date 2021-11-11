@@ -228,8 +228,8 @@ class ValueMap:
     def map(self, sub_map):
         if not isinstance(sub_map, ValueMap):
             raise TypeError("Expected sub_map to be ValueMap")
-        idx = self.idx + sub_map.idx
-        chunk_num = self.chunk_num - 1 + sub_map.chunk_num
+        idx = self.chunk_num * self.idx + sub_map.idx
+        chunk_num = self.chunk_num * sub_map.chunk_num
         return ValueMap(idx, chunk_num)
 
     def overlap(self, other):
