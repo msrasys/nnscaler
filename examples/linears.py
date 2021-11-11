@@ -13,6 +13,8 @@ python -m torch.distributed.launch \
 
 import torch
 from torch import nn
+import math
+import random
 
 import cube
 from cube.schedule.su import SUType
@@ -56,8 +58,11 @@ def schedule_policy(sugraph: SUGraph, resource):
     
     print(f'> collect {len(fb_seqs)} forward-backward sequence')
     for fb_seq in fb_seqs:
+        chunk_num = int(math.ceil(len(fb_seq) / resource.ngpus))
         for idx, su in enumerate(fb_seq):
-            devid = idx % resource.ngpus
+            # devid = int(idx // chunk_num)
+            # devid = idx % resource.ngpus
+            devid = random.randint(0, resource.ngpus - 1)
             sugraph.assign(su, devid)
             sugraph.assign(su.mirror, devid)
 
@@ -92,7 +97,7 @@ class MLP(nn.Module):
 
 
 def train():
-    batch_size = 64
+    batch_size = 128
     dim = 1024
 
     model = MLP(dim=dim)
@@ -100,7 +105,7 @@ def train():
         model, input_shapes=([batch_size, dim],),
     )
 
-    dataloader = cube.runtime.syndata.SynDataLoader(640, [batch_size, dim])
+    dataloader = cube.runtime.syndata.SynDataLoader(1280, [batch_size, dim])
 
     @cube.compile(model, dataloader, policy=(transform_policy, schedule_policy))
     def train_iter(model, dataloader):
