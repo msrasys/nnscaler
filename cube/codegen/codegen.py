@@ -2,6 +2,7 @@
 Generate Pytorch code given the model DAG and the transformation config
 """
 from typing import List, Any
+from numpy import isin
 import torch
 import copy
 
@@ -10,7 +11,8 @@ from cube.execplan import ExectuionPlan
 
 from cube.schedule.su import ScheduleUnit, SUType
 from cube.schedule.adapter.comm import IRCommType, IRCommunication
-from cube.schedule.adapter.transform import IRTensorTransform, IRTransformType
+from cube.schedule.adapter.transform import IRTensorTransform
+from cube.schedule.adapter.transform import SelectPrim, MergePrim
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
@@ -65,7 +67,7 @@ class ModelCodeGen:
         for su in device_sus:
             for node in su.nodes():
                 if isinstance(node, IRTensorTransform):
-                    self.emit_reshape_call(node)
+                    self.emit_transform_call(node)
                 if isinstance(node, IRCommunication):
                     self.emit_comm_call(node)
                 else:
@@ -169,29 +171,25 @@ class ModelCodeGen:
             raise TypeError(f"Unsupported IRCommmNode: {node.comm_type}")
         self.forward_region.append(code)
 
-    def emit_reshape_call(self, node):
+    def emit_transform_call(self, node: IRTensorTransform):
         """
         Emit in-device tensor select / merge call.
         """
-        src_tensors = self._forward_region_arg_names(node.inputs())
-        dst_tensors = self._forward_region_arg_names(node.outputs())
-        # emit select
-        if node.ttype == IRTransformType.Select:
-            src_tensor = src_tensors[0]
-            #TODO: relative indices
-            indices = node.select_indices
-            indices = [slicer.get() for slicer in indices]
-            dst_tensors = ', '.join(dst_tensors)
-            code = f'{dst_tensors} = {node.signature}({src_tensor}, {indices})'
-            self.forward_region.append(code)
-        elif node.ttype == IRTransformType.Merge:
-            axis = node.merge_axis
-            src_tensor = '(' + ', '.join(src_tensors + ['']) + ')'
-            dst_tensor = dst_tensors[0]
-            code = f'{dst_tensor} = {node.signature}({src_tensor}, {axis})'
-            self.forward_region.append(code)
-        else:
-            raise TypeError(f"Unknown Reshape Type: {node.ttype}")
+        for prim in node.trace():
+            if isinstance(prim, SelectPrim):
+                signature = 'cube.runtime.transform.select({tensor}, {indices}, {val_map})'
+                input = self.naming(prim.tensor)
+                indices = repr(prim.indices)
+                val_map = repr(tuple([prim.val_map.idx, prim.val_map.chunk_num]))
+                output = self.naming(prim.output)
+                code = f'{output} = {signature.format(tensor=input, indices=indices, val_map=val_map)}'
+                self.forward_region.append(code)
+            elif isinstance(prim, MergePrim):
+                signature = 'cube.runtime.transform.merge({tensors}, {concat}, {add})'
+                inputs = self._forward_region_arg_names(prim.tensors)
+                output = self.naming(prim.output)
+                code = f'{output} = {signature.format(tensors=inputs, concat=prim.concat, add=prim.add)}'
+                self.forward_region.append(code)
 
     def _forward_region_arg_names(self, tensors: List[Any]):
         """
