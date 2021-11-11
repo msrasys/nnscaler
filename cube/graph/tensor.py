@@ -22,6 +22,8 @@ FwOperation -> BpOperation rule:
 from typing import List, Optional, Union, Tuple
 import copy
 
+from numpy.lib.arraysetops import isin
+
 from cube.ir.cten import IRCell, IRTensor
 
 
@@ -248,6 +250,21 @@ class ValueMap:
             if other.idx == self.idx and other.chunk_num == self.chunk_num:
                 return True
         return False
+
+    def __and__(self, other):
+        """
+        Find the common part
+        """
+        if not isinstance(other, ValueMap):
+            raise TypeError("Expected ValueMap for & operator")
+        if not self.overlap(other):
+            return None
+        if self.chunk_num == other.chunk_num:
+            return ValueMap(self.idx, self.chunk_num)
+        if self.chunk_num == 1:
+            return ValueMap(other.idx, other.chunk_num)
+        else:
+            return ValueMap(self.idx, self.chunk_num)
 
     def __repr__(self):
         return f'({self.idx}/{self.chunk_num})'
@@ -658,9 +675,10 @@ class IRSubTensor(IRTensor):
                 return self
             elif isinstance(other, IRSubTensor):
                 indices = self.indices & other.indices
+                val_map = self.val_map & other.val_map
                 sub_tensor = self.parent.select(
-                    indices = indices.get(),
-                    val_map = self.val_map,
+                    indices = indices,
+                    val_map = val_map,
                     shape = indices.shape
                 )
                 return sub_tensor

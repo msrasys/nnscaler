@@ -123,7 +123,7 @@ class SelectPlan:
             else:
                 print(output)
                 raise NotImplementedError(
-                    f"Not supported value trans: {input.val_map} -> {output.val_map}"
+                    f"Not supported value select: {input.val_map} -> {output.val_map}"
                 )
             prim = SelectPrim(input, indices, val_map, output.shape)
             prim.set_output(output)

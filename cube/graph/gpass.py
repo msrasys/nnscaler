@@ -87,7 +87,6 @@ def forward(graph, *args) -> IRGraph:
             grad = None
             if isinstance(val, IRSubTensor):
                 # TODO: requires_grad = False should be set to None
-                # grad = gener.renew(val, keep_param=False).as_grad()
                 grad = val.get_grad(fnode)
                 val.grad = grad
             bnode.set_output(idx, grad)
@@ -98,9 +97,6 @@ def forward(graph, *args) -> IRGraph:
                 # TODO: requires_grad = False should be set to None
                 grad = val.get_grad(fnode)
                 val.grad = grad
-                # grad = gener.renew(val, keep_param=False).as_grad()
-                # TODO: this grad should be partitioned in value dimension
-                # val.add_grad(grad)
             bnode.set_grad(idx, grad)
 
         fnode.device = node.device

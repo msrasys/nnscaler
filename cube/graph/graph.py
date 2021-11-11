@@ -296,18 +296,16 @@ class IRGraph(IRCell):
                     bnode.set_data(idx, val)
                     grad = None
                     if isinstance(val, IRSubTensor):
-                        if val.requires_grad and val.grad is None:
-                            grad = val.get_grad(fnode)
-                            val.grad = grad
-                        grad = val.grad
+                        # TODO: remove grad is grad doesn't require it
+                        grad = val.get_grad(fnode)
+                        val.grad = grad
                     bnode.set_output(idx, grad)
                 for idx, val in enumerate(fnode.outputs()):
                     grad = None
                     if isinstance(val, IRSubTensor):
-                        if val.requires_grad and val.grad is None:
-                            grad = val.get_grad(fnode)
-                            val.grad = grad
-                        grad = val.grad
+                        # TODO: remove grad is grad doesn't require it
+                        grad = val.get_grad(fnode)
+                        val.grad = grad
                     bnode.set_grad(idx, grad)
                 fnode.mirror = bnode
                 fnode.device = op.device
