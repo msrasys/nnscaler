@@ -1,8 +1,9 @@
-from cube.runtime.device import DeviceGroup
 from cube import schedule
 from cube import runtime
 
+from cube.compiler import SemanticModel, compile
+
 
 def init():
-    _ = DeviceGroup()
+    _ = runtime.device.DeviceGroup()
     _ = runtime.resource.EnvResource()

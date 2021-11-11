@@ -96,13 +96,13 @@ def train():
     dim = 1024
 
     model = MLP(dim=dim)
-    model = cube.schedule.SemanticModel(
+    model = cube.SemanticModel(
         model, input_shapes=([batch_size, dim],),
     )
 
     dataloader = cube.runtime.syndata.SynDataLoader(640, [batch_size, dim])
 
-    @cube.schedule.schedule(model, dataloader, transform_policy=transform_policy, schedule_policy=schedule_policy)
+    @cube.compile(model, dataloader, policy=(transform_policy, schedule_policy))
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
