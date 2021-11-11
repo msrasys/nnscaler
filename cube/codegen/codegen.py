@@ -10,7 +10,7 @@ from cube.execplan import ExectuionPlan
 
 from cube.schedule.su import ScheduleUnit, SUType
 from cube.schedule.adapter.comm import IRCommType, IRCommunication
-from cube.schedule.adapter.select import IRTensorReshape, IRReshapeType
+from cube.schedule.adapter.transform import IRTensorTransform, IRTransformType
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
@@ -64,7 +64,7 @@ class ModelCodeGen:
         # parse graph body
         for su in device_sus:
             for node in su.nodes():
-                if isinstance(node, IRTensorReshape):
+                if isinstance(node, IRTensorTransform):
                     self.emit_reshape_call(node)
                 if isinstance(node, IRCommunication):
                     self.emit_comm_call(node)
@@ -176,7 +176,7 @@ class ModelCodeGen:
         src_tensors = self._forward_region_arg_names(node.inputs())
         dst_tensors = self._forward_region_arg_names(node.outputs())
         # emit select
-        if node.ttype == IRReshapeType.Select:
+        if node.ttype == IRTransformType.Select:
             src_tensor = src_tensors[0]
             #TODO: relative indices
             indices = node.select_indices
@@ -184,7 +184,7 @@ class ModelCodeGen:
             dst_tensors = ', '.join(dst_tensors)
             code = f'{dst_tensors} = {node.signature}({src_tensor}, {indices})'
             self.forward_region.append(code)
-        elif node.ttype == IRReshapeType.Merge:
+        elif node.ttype == IRTransformType.Merge:
             axis = node.merge_axis
             src_tensor = '(' + ', '.join(src_tensors + ['']) + ')'
             dst_tensor = dst_tensors[0]

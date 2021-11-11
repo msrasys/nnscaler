@@ -6,13 +6,13 @@ from cube.ir.cten import IRCell
 from cube.graph.tensor import IRSubTensor, IndexMap
 
 
-class IRReshapeType(Enum):
+class IRTransformType(Enum):
 
     Select = 'cube.runtime.adapter.select'
     Merge  = 'cube.runtime.adapter.merge'
 
 
-class IRTensorReshape(IRCell):
+class IRTensorTransform(IRCell):
     """
     Tensor transformation by convert source tensors
     to destination tensors
@@ -36,7 +36,7 @@ class IRTensorReshape(IRCell):
         self._merge_axis = None
 
         if len(src_tensors) == 1:
-            self.ttype = IRReshapeType.Select
+            self.ttype = IRTransformType.Select
             src_tensor = src_tensors[0]
             if not isinstance(src_tensor, IRSubTensor):
                 raise TypeError(f"Expected IRSubTensor but got {type(src_tensor)}")
@@ -46,7 +46,7 @@ class IRTensorReshape(IRCell):
                 self._select_indices.append(indices)
         
         elif len(dst_tensors) == 1:
-            self.ttype = IRReshapeType.Merge
+            self.ttype = IRTransformType.Merge
             dst_tensor = dst_tensors[0]
             # find dims to concat
             ndims = len(dst_tensor.shape)
@@ -117,13 +117,13 @@ class IRTensorReshape(IRCell):
         """
         Check if this transformation is a non-op
         """
-        if self.ttype == IRReshapeType.Select:
+        if self.ttype == IRTransformType.Select:
             src_tensor = self.inputs(0)
             for dst_tensor in self.outputs():
                 if dst_tensor != src_tensor:
                     return False
             return True
-        if self.ttype == IRReshapeType.Merge:
+        if self.ttype == IRTransformType.Merge:
             if self.merge_axis is None:
                 return True
             return False

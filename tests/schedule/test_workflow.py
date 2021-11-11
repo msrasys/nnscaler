@@ -43,7 +43,7 @@ class FakeDataLoader:
 def test_semantic_model():
     dim = 1024
     model = MLP(dim=dim)
-    model = cube.schedule.SemanticModel(
+    model = cube.SemanticModel(
         model,
         input_shapes=([64, dim],)
     )
@@ -59,7 +59,7 @@ def test_schedule():
     batch_size = 64
 
     model = MLP(dim=dim)
-    model = cube.schedule.SemanticModel(
+    model = cube.SemanticModel(
         model,
         input_shapes=([batch_size, dim],)
     )
@@ -100,4 +100,4 @@ def test_schedule():
     sugraph = policy(sugraph, None)
     print(sugraph)
 
-    assert len(sugraph.sus()) == 33
+    assert len(sugraph.sus()) == 23

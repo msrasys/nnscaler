@@ -9,7 +9,7 @@ from cube.graph.operator import IRFwOperation
 from cube.graph.graph import IRGraph
 from cube.schedule.su import SUType, ScheduleUnit
 from cube.schedule.adapter.comm import IRCommunication
-from cube.schedule.adapter.select import IRTensorReshape
+from cube.schedule.adapter.transform import IRTensorTransform
 
 
 class SUGraph(IRCell):
@@ -449,7 +449,7 @@ class SUGraph(IRCell):
                             recv_su.device = su.device
                 # add adapter for merge
                 if len(tensor_segments) != 0:
-                    merge_op = IRTensorReshape(
+                    merge_op = IRTensorTransform(
                         src_tensors=tensor_segments, dst_tensors=[input]
                     )
                     merge_su = ScheduleUnit([merge_op], SUType.Transform, name='merge')
@@ -468,7 +468,7 @@ class SUGraph(IRCell):
                         if tensor != output:
                             select_tensors.append(tensor)
                 if len(select_tensors) != 0:
-                    select_op = IRTensorReshape(
+                    select_op = IRTensorTransform(
                         src_tensors=[output], dst_tensors=select_tensors
                     )
                     select_su = ScheduleUnit(
