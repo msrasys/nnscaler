@@ -15,8 +15,8 @@ import torch
 from torch import nn
 
 import cube
-from examples.policy.col_parallel import transform_policy
-from examples.policy.col_parallel import schedule_policy
+from examples.policy.hybrid_parallel import transform_policy
+from examples.policy.hybrid_parallel import schedule_policy
 
 # =================== Semantic Model Description ====================
 

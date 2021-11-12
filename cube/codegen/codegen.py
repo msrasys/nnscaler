@@ -281,6 +281,8 @@ class ScheduleCodeGen(CodeGen):
         # generate code
         with FunctionBlock(func_name='_train_step', 
                            args=['model', 'dataloader']) as fb:
+            if len(device_sus) == 0:
+                fb.insert_body('pass')
             for su in device_sus:
                 name = self.su_naming(su)
                 code = self.emit_su(su, name=name)
