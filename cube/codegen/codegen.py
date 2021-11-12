@@ -5,6 +5,7 @@ from typing import List, Any
 from numpy import isin
 import torch
 import copy
+from cube.graph.operator.operator import IRFwOperation, IROptimOperation
 
 from cube.ir.cten import IRTensor
 from cube.execplan import ExectuionPlan
@@ -35,6 +36,8 @@ class CodeGen:
             return f"comm{su._id}"
         if su.stype == SUType.Transform:
             return f"trans{su._id}"
+        if su.stype == SUType.Optimizer:
+            return f"optim{su._id}"
 
     def tensor_naming(self, tensor: Any) -> str:
         """
@@ -97,12 +100,14 @@ class ModelCodeGen(CodeGen):
         # parse graph body
         for su in device_sus:
             for node in su.nodes():
+                if isinstance(node, IRFwOperation):
+                    self.emit_op_call(node)
                 if isinstance(node, IRTensorTransform):
                     self.emit_transform_call(node)
                 elif isinstance(node, IRCommunication):
                     self.emit_comm_call(node)
-                else:
-                    self.emit_op_call(node)
+                elif isinstance(node, IROptimOperation):
+                    self.emit_optim_call(node)
                 # emit input declaration
                 for arg in node.inputs():
                     self.emit_var_declare(arg)
@@ -231,6 +236,21 @@ class ModelCodeGen(CodeGen):
             self.forward_region.append(code)
             code = f'{output} = {output}.requires_grad_()'
             self.forward_region.append(code)
+
+    def emit_optim_call(self, node: IROptimOperation):
+        ranks = node.ranks
+        grads = node.inputs()
+        reducer_name = f'self.reducer{node._id}'
+        # create reducer in declare region
+        init_code = f'{reducer_name} = cube.runtime.reducer.Reducer({ranks})'
+        self.declare_region.append(init_code)
+        grads = self._forward_region_arg_names(grads)
+        for grad in grads:
+            add_param_code = f'{reducer_name}.add_param({grad})'
+            self.declare_region.append(add_param_code)
+        # create call in forward region
+        call_code = f'{reducer_name}.allreduce()'
+        self.forward_region.append(call_code)
 
     def _forward_region_arg_names(self, tensors: List[Any]):
         """

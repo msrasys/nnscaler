@@ -1,11 +1,12 @@
 from typing import Any, Optional, Union, List
+import copy
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.tensor import IRFullTensor, IRSubTensor
 from cube.algorithm.factory import DistAlgorithmFactory
 
 
-__call__ = ['IRFwOperation', 'IRBpOperation']
+__all__ = ['IRFwOperation', 'IRBpOperation', 'IRDataOperation', 'IROptimOperation']
 
 
 class IRFwOperation(IRCell):
@@ -227,3 +228,19 @@ class IRDataOperation(IRCell):
                 return None
             template = factory.algorithms(type(self), tag)
             return template(self)
+
+
+class IROptimOperation(IRCell):
+
+    def __init__(self, grads: List[IRSubTensor], ranks: List[int], name='optimizer'):
+        if not all([isinstance(grad, IRSubTensor) and grad.is_grad() for grad in grads]):
+            raise RuntimeError("Expected a list of gradient IRSubTensor")
+        if not all([isinstance(rank, int) for rank in ranks]):
+            raise RuntimeError("Expected a list of int")
+        signature = None
+        self._ranks = ranks
+        super.__init__(name, signature, len(grads), 0)
+
+    @property
+    def ranks(self):
+        return copy.copy(self._ranks)

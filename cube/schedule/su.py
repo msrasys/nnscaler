@@ -18,12 +18,14 @@ class SUType(Enum):
     # )
     Backward = 'cube.runtime.executor.backward'
 
-    Transform = 'cube.runtime.adapter.transform'
+    Transform = 'cube.runtime.transform'
 
     # cube.runtime.collectives.sendrecv(send_tensors, send_ranks,
     #   recv_shapes, from_ranks
     # )
     Comm = 'cube.runtime.adapter.sendrecv'
+
+    Optimizer = 'cube.runtime.reducer.Reduce'
 
     Empty = 'None'
 

@@ -106,6 +106,12 @@ class SUGraph(IRCell):
         else:
             raise TypeError("Expected index to be None or int")
 
+    def get_sus(self, stype: SUType) -> List[ScheduleUnit]:
+        """
+        Get SUs that are of stype
+        """
+        return [su for su in self.sequence if su.stype == stype]
+
     def fsus(self) -> List[ScheduleUnit]:
         """
         Get forward ScheduleUnits sequence.
