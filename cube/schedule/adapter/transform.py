@@ -280,12 +280,9 @@ class MergePlan:
         if chunk_num % 2 != 0:
             return None
         chunk_num = int(chunk_num // 2)
-        if chunk_num == 1:
-            idx = 0
-        else:
-            if int(idx1 // chunk_num) != int(idx2 // chunk_num):
-                return None
-            idx = int(idx1 // chunk_num)
+        if int(idx1 // 2) != int(idx2 // 2):
+            return None
+        idx = int(idx1 // 2)
         mtensor = tensor1.parent.select(
             indices = tensor1.indices,
             val_map = (idx, chunk_num),
