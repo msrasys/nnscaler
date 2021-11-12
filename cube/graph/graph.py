@@ -293,17 +293,17 @@ class IRGraph(IRCell):
                     grad_num=len(fnode.outputs())
                 )
                 for idx, val in enumerate(fnode.inputs()):
-                    bnode.set_data(idx, val)
                     grad = None
                     if isinstance(val, IRSubTensor):
-                        # TODO: remove grad is grad doesn't require it
+                        # TODO: requires_grad = False should be set to None
                         grad = val.get_grad(fnode)
                         val.grad = grad
+                    bnode.set_data(idx, val)
                     bnode.set_output(idx, grad)
                 for idx, val in enumerate(fnode.outputs()):
                     grad = None
                     if isinstance(val, IRSubTensor):
-                        # TODO: remove grad is grad doesn't require it
+                        # TODO: requires_grad = False should be set to None
                         grad = val.get_grad(fnode)
                         val.grad = grad
                     bnode.set_grad(idx, grad)

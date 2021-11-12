@@ -81,14 +81,14 @@ def forward(graph, *args) -> IRGraph:
         bnode = IRBpOperation(data_num=len(inputs), grad_num=len(outputs))
         # set backward grad
         for idx, val in enumerate(fnode.inputs()):
-            # set input
-            bnode.set_data(idx, val)
-            # set gradient output
             grad = None
             if isinstance(val, IRSubTensor):
                 # TODO: requires_grad = False should be set to None
                 grad = val.get_grad(fnode)
                 val.grad = grad
+            # set input
+            bnode.set_data(idx, val)
+            # set gradient output
             bnode.set_output(idx, grad)
         for idx, val in enumerate(fnode.outputs()):
             # set gradient input

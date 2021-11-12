@@ -232,14 +232,17 @@ class IRDataOperation(IRCell):
 
 class IROptimOperation(IRCell):
 
-    def __init__(self, grads: List[IRSubTensor], ranks: List[int], name='optimizer'):
-        if not all([isinstance(grad, IRSubTensor) and grad.is_grad() for grad in grads]):
+    def __init__(self, weights: List[IRSubTensor], ranks: List[int], name='optimizer'):
+        if not all([isinstance(w, IRSubTensor) and w.is_param() for w in weights]):
             raise RuntimeError("Expected a list of gradient IRSubTensor")
         if not all([isinstance(rank, int) for rank in ranks]):
             raise RuntimeError("Expected a list of int")
         signature = None
         self._ranks = ranks
-        super.__init__(name, signature, len(grads), 0)
+
+        super().__init__(name, signature, len(weights), 0)
+        for idx, weight in enumerate(weights):
+            self.set_input(idx, weight)
 
     @property
     def ranks(self):

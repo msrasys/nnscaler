@@ -11,13 +11,14 @@ class MergeComputeSU(PlanPass):
     @staticmethod
     def apply(execplan: ExectuionPlan) -> ExectuionPlan:
         """
-        Merge consecutive forward SUs
+        Merge consecutive backward SUs. The forward SUs will
+        also be merged if possible
         """
         for devid in execplan.devices():
-            dev_seq = execplan.sequence(devid)
+            dev_seq = execplan.sequence(devid) + [None]
             pieces: List[ScheduleUnit] = list()
-            for seqidx, su in enumerate(execplan.sequence(devid)):
-                if su.stype in [SUType.Forward]:
+            for seqidx, su in enumerate(dev_seq):
+                if su and su.stype in [SUType.Backward]:
                     allow_merge = len(pieces) == 0
                     for psu in pieces[::-1]:
                         if execplan.sugraph.happen_before(psu, su):
@@ -25,31 +26,23 @@ class MergeComputeSU(PlanPass):
                             break
                     if allow_merge:
                         dev_seq[seqidx] = None
-                        if su.mirror is not None:
-                            if su.mirror not in dev_seq:
-                                raise RuntimeError(
-                                    "Expected backward and forward on same device")
-                            idx = dev_seq.index(su.mirror)
-                            dev_seq[idx] = None
                         pieces.append(su)
                         continue
-                # merge pieces
+                # merged forward su
                 if len(pieces) > 0:
-                    # merged forward su
-                    mfsu = MergeComputeSU._merge(pieces, devid)
+                    fsus = [bsu.mirror for bsu in pieces][::-1]
+                    if not all([fsu and (fsu in dev_seq) for fsu in fsus]):
+                        raise RuntimeError("Expected same device fw-bw")
+                    mfsu = MergeComputeSU._merge(fsus, devid)
                     mbsu = mfsu.mirror
-                    # insert merged forward su
-                    dev_seq[seqidx-1] = mfsu
                     # insert merged backward su
-                    bidx = len(dev_seq)
-                    for fsu in pieces:
-                        bsu = fsu.mirror
-                        if bsu is not None:
-                            idx = execplan.sequence(devid).index(bsu)
-                            dev_seq[idx] = None
-                            bidx = min(bidx, idx)
-                    if bidx != len(dev_seq):
-                        dev_seq[bidx] = mbsu
+                    dev_seq[seqidx-1] = mbsu
+                    fsus_idx = [dev_seq.index(fsu) for fsu in fsus]
+                    # insert merged forward su
+                    if max(fsus_idx) - min(fsus_idx) == len(fsus) - 1:
+                        for fidx in fsus_idx:
+                            dev_seq[fidx] = None
+                        dev_seq[min(fsus_idx)] = mfsu
                 pieces = list()
             dev_seq = [su for su in dev_seq if su is not None]
             execplan.set(devid, dev_seq)

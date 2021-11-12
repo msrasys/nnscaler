@@ -2,8 +2,11 @@
 Gradient Allreduce Fusion
 """
 from typing import Dict, Tuple, List
-from cube.graph.operator.operator import IROptimOperation
+import sys
+import copy
 
+
+from cube.graph.operator.operator import IROptimOperation
 from cube.graph.tensor import IRSubTensor
 
 from cube.execplan import ExectuionPlan
@@ -19,25 +22,31 @@ class WeightGradAllreduceFusion(PlanPass):
         Apply weight gradient allreduce fusion
         """
         reducers: Dict[Tuple[int], List[IRSubTensor]] = dict()
-        params = WeightGradAllreduceFusion._get_weight_grads(execplan)
-        for param in params:
-            grads = params[param]
+        weights, params = WeightGradAllreduceFusion._get_weight_grads(execplan)
+        for param_id in params:
+            grads = params[param_id]
             ranks = tuple(grads.keys())  # ranks are used for group
-            grads = [grads[devid][-1] for devid in grads]
             if len(ranks) == 1:
                 continue
+            grads_num = [len(grads[devid]) for devid in grads]
+            if len(set(grads_num)) > 1:
+                sys.stderr.write("May require weighted allreduce!\n")
             if ranks not in reducers:
                 reducers[ranks] = list()
-            for grad in grads:
-                reducers[ranks].append(grad)
+            reducers[ranks].append(weights[param_id])
         # generate reducer for each rank
         for ranks in reducers:
-            grads = reducers[ranks]
+            weights = reducers[ranks]
             # even though some ranks don't need allreduce,
             # pytorch still requires each rank simutaneously call the
             # communication group initialization
             for devid in execplan.devices():
-                opt_op = IROptimOperation(grads, ranks)
+                dev_weights = copy.copy(weights)
+                for idx, weight in enumerate(dev_weights):
+                    if devid not in params[weight._id]:
+                        dev_weights[idx] = None
+                dev_weights = [w for w in dev_weights if w is not None]
+                opt_op = IROptimOperation(dev_weights, ranks)
                 reduce_su = ScheduleUnit([opt_op], SUType.Optimizer)
                 reduce_su.device = devid
                 execplan.at(devid).append(reduce_su)
@@ -52,18 +61,25 @@ class WeightGradAllreduceFusion(PlanPass):
                (grads = params[param][device])
         """
         # grad = params[param][device]
-        params = dict()
+        grads = dict()
+        weights = dict()
         for devid in execplan.devices():
             bsus = [su for su in execplan.sequence(devid) if su.stype == SUType.Backward]
             for bsu in bsus:
                 # bsu has only one node
                 for input in bsu.inputs():
                     if isinstance(input, IRSubTensor) and input.is_param():
-                        if input not in params:
-                            params[input] = {devid : list()}
+                        if input._id not in grads:
+                            grads[input._id] = dict()
+                            weights[input._id] = input
+                        if devid not in grads[input._id]:
+                            grads[input._id][devid] = list()
                         grad = input.grad
-                        assert grad is not None
-                        if grad in params[input][devid]:
+                        if grad is None:
+                            print(input.name, input)
+                            print(grad)
+                            assert grad is not None
+                        if grad in grads[input._id][devid]:
                             raise RuntimeError("Already logged grad?")
-                        params[input][devid].append(grad)
-        return params
+                        grads[input._id][devid].append(grad)
+        return weights, grads

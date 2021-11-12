@@ -238,11 +238,11 @@ class ModelCodeGen(CodeGen):
             self.forward_region.append(code)
 
     def emit_optim_call(self, node: IROptimOperation):
-        ranks = node.ranks
+        ranks = list(node.ranks)
         grads = node.inputs()
         reducer_name = f'self.reducer{node._id}'
         # create reducer in declare region
-        init_code = f'{reducer_name} = cube.runtime.reducer.Reducer({ranks})'
+        init_code = f'{reducer_name} = cube.runtime.reducer.Reducer(ranks={ranks})'
         self.declare_region.append(init_code)
         grads = self._forward_region_arg_names(grads)
         for grad in grads:
@@ -264,7 +264,7 @@ class ModelCodeGen(CodeGen):
             if isinstance(tensor, IRTensor) and tensor.is_param():
                 named_args.append('self.' + name)
             else:
-                named_args.append(self.tensor_naming(name))
+                named_args.append(name)
         return named_args
 
     def clear(self):
@@ -321,7 +321,7 @@ class ScheduleCodeGen(CodeGen):
         """
         Emit su code
         """
-        fsu_types = [SUType.Forward, SUType.Comm, SUType.Transform]
+        fsu_types = [SUType.Forward, SUType.Comm, SUType.Transform, SUType.Optimizer]
         fsign = 'cube.runtime.executor.fexecute({model}, *{inputs})'
         bsign = 'cube.runtime.executor.backward({input_tensors}, {output_tensors}, {output_grads})'
         

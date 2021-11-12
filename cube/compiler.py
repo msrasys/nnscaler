@@ -11,6 +11,7 @@ from cube.schedule.sugraph import SUGraph, SUGraphGener
 from cube.execplan import ExectuionPlan
 from cube.execplan.planpass.redundant import RemoveRedundantAdapters
 from cube.execplan.planpass.merge import MergeComputeSU
+from cube.execplan.planpass.gfuse import WeightGradAllreduceFusion
 
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
@@ -141,8 +142,9 @@ def compile(model: SemanticModel, dataloader,
             execplan = ExectuionPlan(sugraph)
             # plan pass to remove redundant sus 
             execplan = RemoveRedundantAdapters.apply(execplan)
-            # print(f'> after remove redundant adapters:\n {execplan}')
+            print(f'> after remove redundant adapters:\n {execplan}')
             execplan = MergeComputeSU.apply(execplan)
+            execplan = WeightGradAllreduceFusion.apply(execplan)
             print(f'> after merge compute SU:\n{execplan}')
 
             if torch.distributed.is_initialized():
