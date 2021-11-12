@@ -30,7 +30,7 @@ def merge(tensors: List[torch.Tensor],
         concat: Optional[int]: the dimension to merge
         add: bool: whether to perform value merge
     """
-    if (concat is not None) ^ (add is True):  # xor condition
+    if not ((concat is not None) ^ (add is True)):  # xor condition
         raise RuntimeError("Expected concat or add")
     if concat is not None:
         with torch.no_grad():

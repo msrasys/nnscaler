@@ -17,15 +17,46 @@ from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
 
-class ModelCodeGen:
+class CodeGen:
+    """
+    Generate code for the model
+    """
+    def __init__(self, execplan: ExectuionPlan):
+        if not isinstance(execplan, ExectuionPlan):
+            raise TypeError("execplan should be ExecutionPlan")
+        self.execplan = execplan
+
+    def su_naming(self, su: ScheduleUnit) -> str:
+        if su.stype == SUType.Forward:
+            return f"fwcp{su._id}"
+        if su.stype == SUType.Backward:
+            return f"bwcp{su._id}"
+        if su.stype == SUType.Comm:
+            return f"comm{su._id}"
+        if su.stype == SUType.Transform:
+            return f"trans{su._id}"
+
+    def tensor_naming(self, tensor: Any) -> str:
+        """
+        Return the var name (unique for different variable)
+        """
+        if isinstance(tensor, IRTensor):
+            tensor_name = 'tensor' if tensor.name is None else tensor.name
+            if '.' in tensor_name:
+                tensor_name = tensor_name.split('.')[0]
+            name = '_'.join([tensor_name, str(tensor._id)])
+        else:
+            name = str(tensor)
+        return name
+
+
+class ModelCodeGen(CodeGen):
     """
     Generate spatial code for the model
     """
 
     def __init__(self, execplan: ExectuionPlan):
-        if not isinstance(execplan, ExectuionPlan):
-            raise TypeError("execplan should be ExecutionPlan")
-        self.execplan = execplan
+        super().__init__(execplan)
         # model full code
         self.init_code: List[str] = [
             '\n\n########## Generated Model Code ###########',
@@ -58,7 +89,7 @@ class ModelCodeGen:
             for input in su.inputs():
                 if isinstance(input, IRTensor) and input.is_param():
                     continue
-                fargs.append(self.naming(input))
+                fargs.append(self.tensor_naming(input))
             for name in fargs:
                 self.symbols.create(name)
             su_args.append(fargs)
@@ -68,7 +99,7 @@ class ModelCodeGen:
             for node in su.nodes():
                 if isinstance(node, IRTensorTransform):
                     self.emit_transform_call(node)
-                if isinstance(node, IRCommunication):
+                elif isinstance(node, IRCommunication):
                     self.emit_comm_call(node)
                 else:
                     self.emit_op_call(node)
@@ -78,7 +109,7 @@ class ModelCodeGen:
                 # record output tensor name
                 for out in node.outputs():
                     if isinstance(out, IRTensor) or isinstance(out, str):
-                        self.symbols.create(self.naming(out))
+                        self.symbols.create(self.tensor_naming(out))
             self.all_su_forward_region.append(self.forward_region)
             self.forward_region = list()
 
@@ -89,7 +120,7 @@ class ModelCodeGen:
             cb.insert_body('')
             cb.insert_body(ib.code)
             for idx, su in enumerate(device_sus):
-                name = f'su{su._id}'
+                name = self.su_naming(su)
                 input_args = ['self'] + su_args[idx]
                 forward_code = self.all_su_forward_region[idx]
                 with FunctionBlock(func_name=name, args=input_args) as fb:
@@ -118,14 +149,14 @@ class ModelCodeGen:
         Emit tensor declaration code
         """
         if isinstance(var, IRTensor):
-            name = self.naming(var)
+            name = self.tensor_naming(var)
             # emit parameter code
             if var.is_param() and not self.symbols.exist(name):
                 self.symbols.create(name)
                 code = f'self.{name} = torch.nn.Parameter(torch.empty({tuple(var.shape)}))'
                 self.declare_region.append(code)
         elif isinstance(var, str):
-            name = self.naming(var)
+            name = self.tensor_naming(var)
             if name.startswith('self.'):
                 if not hasattr(self._ref_module, var[5:]):
                     if self.symbols.create(name):
@@ -178,18 +209,28 @@ class ModelCodeGen:
         for prim in node.trace():
             if isinstance(prim, SelectPrim):
                 signature = 'cube.runtime.transform.select({tensor}, {indices}, {val_map})'
-                input = self.naming(prim.tensor)
+                input = self.tensor_naming(prim.tensor)
                 indices = repr(prim.indices)
                 val_map = repr(tuple([prim.val_map.idx, prim.val_map.chunk_num]))
-                output = self.naming(prim.output)
+                output = self.tensor_naming(prim.output)
                 code = f'{output} = {signature.format(tensor=input, indices=indices, val_map=val_map)}'
                 self.forward_region.append(code)
             elif isinstance(prim, MergePrim):
                 signature = 'cube.runtime.transform.merge({tensors}, {concat}, {add})'
                 inputs = self._forward_region_arg_names(prim.tensors)
-                output = self.naming(prim.output)
+                inputs = '(' + ', '.join(inputs) + ')'
+                output = self.tensor_naming(prim.output)
                 code = f'{output} = {signature.format(tensors=inputs, concat=prim.concat, add=prim.add)}'
                 self.forward_region.append(code)
+            else:
+                raise RuntimeError(f"Not supported prim: {type(prim)}")
+        for output in node.outputs():
+            # contiguous and requires grad
+            output = self.tensor_naming(output)
+            code = f'{output} = {output}.contiguous()'
+            self.forward_region.append(code)
+            code = f'{output} = {output}.requires_grad_()'
+            self.forward_region.append(code)
 
     def _forward_region_arg_names(self, tensors: List[Any]):
         """
@@ -199,25 +240,12 @@ class ModelCodeGen:
         """
         named_args : List[str] = list()
         for tensor in tensors:
-            name = self.naming(tensor)
+            name = self.tensor_naming(tensor)
             if isinstance(tensor, IRTensor) and tensor.is_param():
                 named_args.append('self.' + name)
             else:
-                named_args.append(self.naming(name))
+                named_args.append(self.tensor_naming(name))
         return named_args
-
-    def naming(self, tensor: Any) -> str:
-        """
-        Return the var name (unique for different variable)
-        """
-        if isinstance(tensor, IRTensor):
-            tensor_name = 'tensor' if tensor.name is None else tensor.name
-            if '.' in tensor_name:
-                tensor_name = tensor_name.split('.')[0]
-            name = '_'.join([tensor_name, str(tensor._id)])
-        else:
-            name = str(tensor)
-        return name
 
     def clear(self):
         """
@@ -232,12 +260,10 @@ class ModelCodeGen:
         self.symbols = SymbolTable()
 
 
-class ScheduleCodeGen:
+class ScheduleCodeGen(CodeGen):
 
     def __init__(self, execplan: ExectuionPlan):
-        if not isinstance(execplan, ExectuionPlan):
-            raise TypeError("execplan should be ExecutionPlan")
-        self.execplan = execplan
+        super().__init__(execplan)
         # model full code
         self.init_code: List[str] = [
             '\n\n########## Generated Schedule Code ###########',
@@ -256,7 +282,7 @@ class ScheduleCodeGen:
         with FunctionBlock(func_name='_train_step', 
                            args=['model', 'dataloader']) as fb:
             for su in device_sus:
-                name = f'su{su._id}'
+                name = self.su_naming(su)
                 code = self.emit_su(su, name=name)
                 fb.insert_body(code)
         gencode += fb.code
@@ -273,30 +299,31 @@ class ScheduleCodeGen:
         """
         Emit su code
         """
+        fsu_types = [SUType.Forward, SUType.Comm, SUType.Transform]
         fsign = 'cube.runtime.executor.fexecute({model}, *{inputs})'
         bsign = 'cube.runtime.executor.backward({input_tensors}, {output_tensors}, {output_grads})'
         
         if su.stype == SUType.Dataloader:
             if len(su.inputs()) != 0:
                 raise RuntimeError("Dataloader su has no inputs")
-            outputs = [self.naming(output, su) for output in su.outputs()]
+            outputs = [self.tensor_naming(output) for output in su.outputs()]
             return_val = ','.join(outputs)
             code = f'{return_val} = next(dataloader)'
             return code
 
-        elif su.stype == SUType.Forward or su.stype == SUType.Comm:
+        elif su.stype in fsu_types:
             inputs = list()
             for tensor in su.inputs():
                 if isinstance(tensor, IRTensor):
                     if tensor.is_param():
                         continue
-                inputs.append(self.naming(tensor, su))
+                inputs.append(self.tensor_naming(tensor))
             inputs = '(' + ', '.join(inputs + ['']) + ')'
             body = fsign.format(
                 model = f'model.{name}',
                 inputs = inputs
             )
-            outputs = [self.naming(output, su) for output in su.outputs()]
+            outputs = [self.tensor_naming(output) for output in su.outputs()]
             return_val = ','.join(outputs)
             if len(su.outputs()) == 0:
                 code = body
@@ -317,17 +344,17 @@ class ScheduleCodeGen:
                 if isinstance(tensor, IRTensor):
                     if tensor.is_param():
                         continue
-                finputs.append(self.naming(tensor, fsu))
+                finputs.append(self.tensor_naming(tensor))
             fargs = '(' + ', '.join(finputs + ['']) + ')'
 
             fouts = list()
             for tensor in fsu.outputs():
-                fouts.append(self.naming(tensor, fsu))
+                fouts.append(self.tensor_naming(tensor))
             fouts = '(' + ', '.join(fouts + ['']) + ')'
 
             fout_grads = list()
             for fout in fsu.outputs():
-                fout_grads.append(self.naming(fout.grad, fsu))
+                fout_grads.append(self.tensor_naming(fout.grad))
             fout_grads = '(' + ', '.join(fout_grads + ['']) + ')'
 
             body = bsign.format(
@@ -337,7 +364,7 @@ class ScheduleCodeGen:
             )
 
             # returned value are graph.outputs
-            return_val = [self.naming(tensor, su) for tensor in su.outputs()]
+            return_val = [self.tensor_naming(tensor) for tensor in su.outputs()]
             # TODO: fix this by using grad attributed
             return_val = return_val[:len(finputs)]
             if len(return_val) > 0:
@@ -347,23 +374,4 @@ class ScheduleCodeGen:
             code = f'{return_code}{body}'
             return code
         else:
-            raise RuntimeError(f"Unsupported su tag: {su.tag}")
-
-    def naming(self, tensor: Any, su) -> str:
-        """
-        Return the var name (unique for different variable)
-
-        If the var is a leaf tensor, will add prefix `self.` to its name
-        """
-        if isinstance(tensor, IRTensor):
-            # note in su there is no parameters
-            # if len(tensor.src(su.nodes())) == 0:
-            #     name = '*next(dataloader)'
-            # else:
-            tensor_name = 'tensor' if tensor.name is None else tensor.name
-            if '.' in tensor_name:
-                tensor_name = tensor_name.split('.')[0]
-            name = '_'.join([tensor_name, str(tensor._id)])
-        else:
-            name = str(tensor)
-        return name
+            raise RuntimeError(f"Unsupported SUType: {su.stype}")

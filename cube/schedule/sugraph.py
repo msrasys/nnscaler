@@ -304,7 +304,7 @@ class SUGraph(IRCell):
             raise ValueError(f"SU {su} is not in the SUGraph")
         if isinstance(ranks, int):
             ranks = [ranks]
-        elif not all([isinstance(int, rank) for rank in ranks]):
+        elif not all([isinstance(rank, int) for rank in ranks]):
             raise TypeError("Expected type ranks to be Union[int, List[int]]")
 
         if su.stype == SUType.Comm:
@@ -314,16 +314,18 @@ class SUGraph(IRCell):
             return True
 
         if len(ranks) != 1:
-            # copy su
-            # TODO: adatper copy
-            print('warning: Missing adapter copy!!')
-            sus = [copy.copy(su) for _ in range(len(ranks)-1)]
-            for su in sus:
-                index = self.sus().index(su)
-                self.sequence.insert(index, su)
-            SUGraph.reset_dependency(self.sequence)
-            for su, rank in zip(sus, ranks):
-                self.assign(su, rank)
+            if su.stype == SUType.Dataloader:
+                su.device = ranks
+            else:
+                raise NotImplementedError("Assign multiple ranks to one SU is not supported")
+            # print('warning: Missing adapter copy!!')
+            # sus = [copy.copy(su) for _ in range(len(ranks)-1)]
+            # for su in sus:
+            #     index = self.sus().index(su)
+            #     self.sequence.insert(index, su)
+            # SUGraph.reset_dependency(self.sequence)
+            # for su, rank in zip(sus, ranks):
+            #     self.assign(su, rank)
 
         # set device
         su.device = ranks
@@ -430,7 +432,7 @@ class SUGraph(IRCell):
                     for out_idx, output in enumerate(pre_su.outputs()):
                         if output.overlap(input):
                             sub_tensor = input.common(output)
-                            if sub_tensor != input:
+                            if sub_tensor != input and sub_tensor not in tensor_segments:
                                 tensor_segments.append(sub_tensor)
                             send_op = IRCommunication(
                                 send_tensors=[sub_tensor],
@@ -465,7 +467,7 @@ class SUGraph(IRCell):
                 send_adapters, recv_adapters = su.out_adapters(out_idx)
                 for send_adapter in send_adapters:
                     for tensor in send_adapter.nodes(0).send_tensors:
-                        if tensor != output:
+                        if tensor != output and tensor not in select_tensors:
                             select_tensors.append(tensor)
                 if len(select_tensors) != 0:
                     select_op = IRTensorTransform(
@@ -537,7 +539,8 @@ class SUGraph(IRCell):
             for out_idx in range(len(node.outputs())):
                 node_list = [snode._id for snode in node.successors(out_idx)]
                 succ_node_ids[out_idx] = node_list
-            dscp += f"\n{node._id}: {node} -> su id {succ_node_ids}\n"
+            dscp += f"{node._id}: {node}\n"
+            # dscp += f"\n{node._id}: {node} -> su id {succ_node_ids}\n"
         return dscp
 
 

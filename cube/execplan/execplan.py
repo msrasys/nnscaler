@@ -15,11 +15,11 @@ class ExectuionPlan:
         for su in sugraph.sus():
             if len(su.device) == 0:
                 raise RuntimeError(f"device not set: SU {su}")
-            device = su.device[0]
-            if device not in self.device_seq:
-                self.device_seq[device] = [su]
-            else:
-                self.device_seq[device].append(su)
+            for device in su.device:
+                if device not in self.device_seq:
+                    self.device_seq[device] = [su]
+                else:
+                    self.device_seq[device].append(su)
 
     def devices(self) -> List[int]:
         """
