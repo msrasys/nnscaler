@@ -2,7 +2,6 @@
 Generate Pytorch code given the model DAG and the transformation config
 """
 from typing import List, Any
-from numpy import isin
 import torch
 import copy
 from cube.graph.operator.operator import IRFwOperation, IROptimOperation
@@ -231,11 +230,12 @@ class ModelCodeGen(CodeGen):
                 raise RuntimeError(f"Not supported prim: {type(prim)}")
         for output in node.outputs():
             # contiguous and requires grad
-            output = self.tensor_naming(output)
-            code = f'{output} = {output}.contiguous()'
+            output_name = self.tensor_naming(output)
+            code = f'{output_name} = {output_name}.contiguous()'
             self.forward_region.append(code)
-            code = f'{output} = {output}.requires_grad_()'
-            self.forward_region.append(code)
+            if not output.is_grad():
+                code = f'{output_name} = {output_name}.requires_grad_()'
+                self.forward_region.append(code)
 
     def emit_optim_call(self, node: IROptimOperation):
         ranks = list(node.ranks)
