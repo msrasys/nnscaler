@@ -66,6 +66,7 @@ class IRCell:
         self._predecessors: List[List[IRCell]] = [list() for _ in range(input_length)]
 
         self._mirror = None
+        self._tag = None
 
     @property
     def device(self):
@@ -318,6 +319,17 @@ class IRCell:
                         if output not in outputs:
                             outputs.append(output)
         return outputs
+
+    @property
+    def tag(self) -> Any:
+        return self._tag
+
+    @tag.setter
+    def tag(self, info: Any):
+        """
+        Tag an info to the cell
+        """
+        self._tag = info
 
     def __repr__(self):
         """

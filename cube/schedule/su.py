@@ -91,6 +91,8 @@ class ScheduleUnit(IRCell):
         self._ctrl_predecessors = list()
         self._ctrl_successors = list()
 
+        self._tag = [node.tag for node in nodes]
+
     def __copy__(self):
         """
         Copy the SU. Note the mirror su is also copied
