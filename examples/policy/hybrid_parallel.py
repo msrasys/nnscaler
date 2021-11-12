@@ -18,6 +18,7 @@ def transform_policy(graph: IRGraph, resource):
                 algo = node.algorithms('row')
             if algo is None:
                 algo = node.algorithms('data')
+            idx += 1
             sub_nodes = graph.partition(node, algo, config=dict(chunk_num=resource.ngpus))
             for idx, sub_node in enumerate(sub_nodes):
                 sub_node.tag = idx
