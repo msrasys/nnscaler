@@ -376,6 +376,10 @@ class ScheduleCodeGen(CodeGen):
 
             fout_grads = list()
             for fout in fsu.outputs():
+                # the loss computed starting point
+                if fout == fout.grad:
+                    #TODO: mean<0, N> needs to divide by N times
+                    pass
                 fout_grads.append(self.tensor_naming(fout.grad))
             fout_grads = '(' + ', '.join(fout_grads + ['']) + ')'
 

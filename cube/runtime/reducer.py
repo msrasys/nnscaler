@@ -38,7 +38,7 @@ class Reducer:
             bucket = buckets[tp]
             grads = [param.grad.data for param in bucket]
             coalesced = self._flatten_dense_tensors(grads)
-            coalesced /= len(self.ranks)
+            # coalesced /= len(self.ranks)
             torch.distributed.all_reduce(coalesced, group=self._group)
             all_synced = self._unflatten_dense_tensors(coalesced, grads)
             for grad, synced in zip(grads, all_synced):
