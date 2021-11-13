@@ -1,6 +1,7 @@
-import sys
-import torch
 import time
+import sys
+
+import torch
 
 
 def print_each_rank(msg, rank_only=None, outfile=''):
@@ -23,11 +24,9 @@ def print_each_rank(msg, rank_only=None, outfile=''):
 
 
 class CudaTimer:
-
-    """
+    r"""
     Singleton Timer
     """
-
     class __CudaTimer:
 
         def __init__(self):
@@ -43,6 +42,11 @@ class CudaTimer:
             CudaTimer.instance = CudaTimer.__CudaTimer()
     
     def start(self, field_name='default'):
+        """
+        Start recording time on the the field
+
+        Note `start` and `stop` on the same field can be called nestly
+        """
         torch.cuda.synchronize()
         if field_name not in CudaTimer.instance.field:
             CudaTimer.instance.field[field_name] = list()
@@ -51,7 +55,10 @@ class CudaTimer:
     
     def stop(self, field_name='default'):
         """
-        Return in ms
+        Return the time span from last `start` on the smae field name to now
+
+        Returns:
+            float (ms)
         """
         if field_name not in CudaTimer.instance.field:
             raise RuntimeError("Missing start on the field")
