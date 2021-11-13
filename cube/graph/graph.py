@@ -271,10 +271,10 @@ class IRGraph(IRCell):
             nodes: List[IRCell] if partitioned successfully.
             None if failed
         """
-        if not isinstance(op, IRCell):
-            raise TypeError("Expected op to be IRCell (IRFwOperation)")
         if not isinstance(algo, GenericDistAlgo):
             raise TypeError("Expected algo to be GenericDistAlgo")
+        if op not in self.nodes():
+            raise RuntimeError("Not Exist: {op}")
 
         if algo.logic_op != type(op):
             return None

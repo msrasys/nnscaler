@@ -92,7 +92,8 @@ class IRFwOperation(IRCell):
             else:
                 outputs.append(tensor)
 
-        dscp = f'Op(id={self._id}, signature={self.signature}, device={self.device}, inputs={inputs}, outputs={outputs})'
+        sign = self.signature.split('.')[-1]
+        dscp = f'Op{self._id}(sign={sign}, inputs={inputs}, outputs={outputs})'
         return dscp
 
 
@@ -196,7 +197,8 @@ class IRBpOperation(IRCell):
             else:
                 outputs.append(tensor)
 
-        dscp = f'bOp(id={self._id}, signature={self.signature}, device={self.device}, grads={grads}, datas={datas}, outputs={outputs})'
+        sign = self.signature.split('.')[-1]
+        dscp = f'bOp{self._id}(sign={sign}, grads={grads}, datas={datas}, outputs={outputs})'
         return dscp
 
 
@@ -206,6 +208,12 @@ class IRDataOperation(IRCell):
 
         signature = 'dataloader.__next__'
         super().__init__(name, signature, 0, data_num)
+
+    def infer_shape(self):
+        """
+        Infer output value shape
+        """
+        return True
 
     def algorithms(self, tag: Optional[str] = None):
         """
