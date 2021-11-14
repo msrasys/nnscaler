@@ -121,7 +121,8 @@ class SelectPlan:
             elif input.val_map == ValueMap(0, 1):
                 val_map = output.val_map
             else:
-                print(output)
+                print('from: ', input)
+                print('to  : ', output)
                 raise NotImplementedError(
                     f"Not supported value select: {input.val_map} -> {output.val_map}"
                 )

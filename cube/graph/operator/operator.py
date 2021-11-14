@@ -76,7 +76,8 @@ class IRFwOperation(IRCell):
                     anno = 'w'
                 if tensor.is_grad():
                     anno = 'g'
-                inputs.append(f'{anno}{tensor._id}')
+                # inputs.append(f'{anno}{tensor._id}')
+                inputs.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.val_map})')
             else:
                 inputs.append(tensor)
         
@@ -88,7 +89,8 @@ class IRFwOperation(IRCell):
                     anno = 'w'
                 if tensor.is_grad():
                     anno = 'g'
-                outputs.append(f'{anno}{tensor._id}')
+                # outputs.append(f'{anno}{tensor._id}')
+                outputs.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.val_map})')
             else:
                 outputs.append(tensor)
 
@@ -169,7 +171,8 @@ class IRBpOperation(IRCell):
                     anno = 'w'
                 if tensor.is_grad():
                     anno = 'g'
-                datas.append(f'{anno}{tensor._id}')
+                # datas.append(f'{anno}{tensor._id}')
+                datas.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.val_map})')
             else:
                 datas.append(tensor)
 
@@ -181,7 +184,8 @@ class IRBpOperation(IRCell):
                     anno = 'w'
                 if tensor.is_grad():
                     anno = 'g'
-                grads.append(f'{anno}{tensor._id}')
+                # grads.append(f'{anno}{tensor._id}')
+                grads.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.val_map})')
             else:
                 grads.append(tensor)
         
@@ -193,7 +197,8 @@ class IRBpOperation(IRCell):
                     anno = 'w'
                 if tensor.is_grad():
                     anno = 'g'
-                outputs.append(f'{anno}{tensor._id}')
+                # outputs.append(f'{anno}{tensor._id}')
+                outputs.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.val_map})')
             else:
                 outputs.append(tensor)
 

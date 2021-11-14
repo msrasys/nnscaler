@@ -457,9 +457,12 @@ class SUGraph(IRCell):
                             recv_su.device = su.device
                 # add adapter for merge
                 if len(tensor_segments) != 0:
-                    merge_op = IRTensorTransform(
-                        src_tensors=tensor_segments, dst_tensors=[input]
-                    )
+                    try:
+                        merge_op = IRTensorTransform(
+                            src_tensors=tensor_segments, dst_tensors=[input]
+                        )
+                    except Exception:
+                        raise RuntimeError(f"Merge Generation Error: {su}")
                     merge_su = ScheduleUnit([merge_op], SUType.Transform, name='merge')
                     su._set_merge_adapter(in_idx, merge_su)
                     merge_su.device = su.device
@@ -476,9 +479,12 @@ class SUGraph(IRCell):
                         if tensor != output and tensor not in select_tensors:
                             select_tensors.append(tensor)
                 if len(select_tensors) != 0:
-                    select_op = IRTensorTransform(
-                        src_tensors=[output], dst_tensors=select_tensors
-                    )
+                    try:
+                        select_op = IRTensorTransform(
+                            src_tensors=[output], dst_tensors=select_tensors
+                        )
+                    except Exception:
+                        raise RuntimeError(f"Select Generation Error: {su}")
                     select_su = ScheduleUnit(
                         [select_op], SUType.Transform, name='select'
                     )

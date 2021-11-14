@@ -22,8 +22,6 @@ FwOperation -> BpOperation rule:
 from typing import List, Optional, Union, Tuple
 import copy
 
-from numpy.lib.arraysetops import isin
-
 from cube.ir.cten import IRCell, IRTensor
 
 
