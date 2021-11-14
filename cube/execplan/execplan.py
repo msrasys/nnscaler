@@ -25,7 +25,9 @@ class ExectuionPlan:
         """
         Get device set
         """
-        return self.device_seq.keys()
+        devices = list(self.device_seq.keys())
+        devices.sort()
+        return devices
 
     def sequence(self, device_id: int) -> List[ScheduleUnit]:
         """
