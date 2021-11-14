@@ -8,20 +8,24 @@ def transform_policy(graph: IRGraph, resource):
     """
     The transformation policy transposes linear using column parallel
     """
+    linear_idx = 0
     for node in graph.nodes():
-        idx = 0
         if isinstance(node, IRFwOperation):
             algo = None
-            if idx % 2 == 0:
+            if linear_idx % 2 == 0:
+                print(f'> column partition: {node}')
                 algo = node.algorithms('column')
             else:
+                print(f'> row partition: {node}')
                 algo = node.algorithms('row')
             if algo is None:
+                print(f'> data partition: {node}')
                 algo = node.algorithms('data')
-            idx += 1
+            linear_idx += 1
             sub_nodes = graph.partition(node, algo, config=dict(chunk_num=resource.ngpus))
             for idx, sub_node in enumerate(sub_nodes):
                 sub_node.tag = idx
+    print(graph)
     return graph
 
 
