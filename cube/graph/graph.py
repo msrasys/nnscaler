@@ -281,6 +281,15 @@ class IRGraph(IRCell):
         if not algo.satisfy(config):
             return None
         fnodes = algo.instantiate(op, config)
+
+        #FIXME: we don't allow non-weight input to be splitted in value
+        for fnode in fnodes:
+            for input in fnode.inputs():
+                if isinstance(input, IRSubTensor):
+                    if input.val_map.chunk_num != 1 and not input.is_param():
+                        raise NotImplementedError(
+                            f"Not support feature-map {input} to be splitted in value as input"
+                        )
         # remove reference
         for idx in range(len(op.inputs())):
             op.set_input(idx, None)
