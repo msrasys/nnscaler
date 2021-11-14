@@ -2,7 +2,7 @@
 example:
 
 python -m torch.distributed.launch \
-    --nproc_per_node=2 \
+    --nproc_per_node=4 \
     --nnodes=1 \
     --node_rank=0 \
     --master_addr=127.0.0.1 \
@@ -15,8 +15,8 @@ import torch
 from torch import nn
 
 import cube
-from examples.policy.hybrid_parallel import transform_policy
-from examples.policy.hybrid_parallel import schedule_policy
+from examples.policy.nested_parallel import transform_policy
+from examples.policy.nested_parallel import schedule_policy
 
 # =================== Semantic Model Description ====================
 
@@ -58,11 +58,13 @@ def train():
     
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
-    for epoch in range(10):
+    iter_num = 128
+    for step in range(iter_num):
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
-        print('====> end iteration')
+        if (step + 1) % 20 == 0:
+            print(f'iter [{step + 1}/{iter_num}]')
 
 
 if __name__ == '__main__':

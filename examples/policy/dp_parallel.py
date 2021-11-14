@@ -1,15 +1,15 @@
 from cube.graph import IRGraph
 from cube.schedule.su import SUType
 from cube.schedule.sugraph import SUGraph
-from cube.graph.operator.operator import IRFwOperation
+from cube.graph.operator.operator import IRDataOperation, IRFwOperation
 
 
 def transform_policy(graph: IRGraph, resource):
     """
-    The transformation policy transposes linear using column parallel
+    The transformation policy transposes linear using data parallel
     """
-    for node in graph.nodes():
-        if isinstance(node, IRFwOperation):
+    for node in graph.nodes():            
+        if isinstance(node, IRFwOperation) or isinstance(node, IRDataOperation):
             algo = node.algorithms('data')
             assert algo
             sub_nodes = graph.partition(node, algo, config=dict(chunk_num=resource.ngpus))
@@ -24,8 +24,8 @@ def schedule_policy(sugraph: SUGraph, resource):
     """
     for su in sugraph.sus():
         if su.stype == SUType.Dataloader:
-            sugraph.assign(su, 0)
-            # sugraph.assign(su, list(range(resource.ngpus)))
+            devid = su.tag[0]
+            sugraph.assign(su, devid)
     for su in sugraph.fsus():
         devid = su.tag[0]
         sugraph.assign(su, devid)
