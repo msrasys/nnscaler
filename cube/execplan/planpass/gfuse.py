@@ -25,7 +25,9 @@ class WeightGradAllreduceFusion(PlanPass):
         weights, params = WeightGradAllreduceFusion._get_weight_grads(execplan)
         for param_id in params:
             grads = params[param_id]
-            ranks = tuple(grads.keys())  # ranks are used for group
+            ranks = list(grads.keys())
+            ranks.sort()
+            ranks = tuple(ranks)  # ranks are used for group
             if len(ranks) == 1:
                 continue
             grads_num = [len(grads[devid]) for devid in grads]
