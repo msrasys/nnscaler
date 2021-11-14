@@ -144,10 +144,11 @@ def compile(model: SemanticModel, dataloader,
             execplan = ExectuionPlan(sugraph)
             # plan pass to remove redundant sus 
             execplan = RemoveRedundantAdapters.apply(execplan)
-            # print(f'> after remove redundant adapters:\n {execplan}')
+            print(f'> after remove redundant adapters:\n {execplan}')
             execplan = MergeComputeSU.apply(execplan)
+            print(f'> after merge backward SU:\n {execplan}')
             execplan = WeightGradAllreduceFusion.apply(execplan)
-            print(f'> after merge compute SU:\n{execplan}')
+            print(f'> after add allreduce:\n{execplan}')
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()
