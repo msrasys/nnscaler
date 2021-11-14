@@ -213,7 +213,7 @@ class ValueMap:
 
     def __init__(self, idx: int, chunk_num: int):
         if idx >= chunk_num or idx < 0:
-            raise ValueError("Expected idx in [0, chunk_num)")
+            raise ValueError(f"Expected idx {idx} in [0, {chunk_num})")
         self._idx = idx
         self._chunk_num = chunk_num
 
@@ -228,7 +228,7 @@ class ValueMap:
     def map(self, sub_map):
         if not isinstance(sub_map, ValueMap):
             raise TypeError("Expected sub_map to be ValueMap")
-        idx = self.chunk_num * self.idx + sub_map.idx
+        idx = self.idx * sub_map.chunk_num + sub_map.idx
         chunk_num = self.chunk_num * sub_map.chunk_num
         return ValueMap(idx, chunk_num)
 
