@@ -77,14 +77,16 @@ class LogicTranslator:
         trace = SchedulePool().get_tape(loss)
         if trace is None:
             raise RuntimeError("No forward detected")
-        # make gradient point to it self
-        loss.parent.grad = loss.parent
+        # make grad to 1.0
+        if not loss.shape == [1]:
+            raise RuntimeError("backward can only perform on the scaler tensor")
+        loss.parent.grad = None
         bnode = None
         for node in trace:
             for idx, output in enumerate(node.outputs()):
                 if loss.overlap(output):
                     bnode = node.mirror
-                    output.grad = output
-                    bnode.set_grad(idx, output)
+                    output.grad = None
+                    bnode.set_grad(idx, None)
         for node in trace[::-1]:
             SchedulePool().add_node(node.mirror)

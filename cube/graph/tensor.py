@@ -15,12 +15,13 @@ FwOperation -> BpOperation rule:
 
 2). for (FwOp) output tensors, gradient SubTensor is:
     indices = output.indices;
-    val follows same value splitting rules with output
+    val is always (0/1)
 """
 
 
 from typing import List, Optional, Union, Tuple
 import copy
+import math
 
 from cube.ir.cten import IRCell, IRTensor
 
@@ -241,7 +242,15 @@ class ValueMap:
             if self.chunk_num == 1 or other.chunk_num == 1:
                 return True
             else:
-                raise NotImplementedError("Not Implemented")
+                chk1, chk2 = self.chunk_num, other.chunk_num
+                time1 = int(chk2 / math.gcd(chk1, chk2))
+                time2 = int(chk1 / math.gcd(chk1, chk2))
+                span1 = (self.idx * time1, self.idx * time1 + time1)
+                span2 = (other.idx * time2, other.idx * time2 + time2)
+                if max(span1[0], span2[0]) < min(span1[1], span2[1]):
+                    return True
+                else:
+                    return False
 
     def __eq__(self, other):
         if isinstance(other, ValueMap):
@@ -604,7 +613,7 @@ class IRSubTensor(IRTensor):
         elif self in fcell.outputs():
             grad = full_grad.select(
                 indices = self.indices,
-                val_map = self.val_map,
+                val_map = (0, 1),
                 shape = self.shape
             )
             return grad.as_grad()
