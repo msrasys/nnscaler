@@ -30,9 +30,6 @@ class WeightGradAllreduceFusion(PlanPass):
             ranks = tuple(ranks)  # ranks are used for group
             if len(ranks) == 1:
                 continue
-            grads_num = [len(grads[devid]) for devid in grads]
-            if len(set(grads_num)) > 1:
-                sys.stderr.write("May require weighted allreduce!\n")
             if ranks not in reducers:
                 reducers[ranks] = list()
             reducers[ranks].append(weights[param_id])

@@ -17,15 +17,23 @@ class MergeComputeSU(PlanPass):
         for devid in execplan.devices():
             dev_seq = execplan.sequence(devid) + [None]
             pieces: List[ScheduleUnit] = list()
+            adapters: List[ScheduleUnit] = list()
             for seqidx, su in enumerate(dev_seq):
+                if su and su.stype in [SUType.Comm, SUType.Transform]:
+                    if len(pieces) > 0:
+                        adapters.append(su)
+                    continue
                 if su and su.stype in [SUType.Backward]:
                     allow_merge = len(pieces) == 0
                     for psu in pieces[::-1]:
                         if execplan.sugraph.happen_before(psu, su):
                             allow_merge = True
                             break
+                    for adapter in adapters:
+                        if execplan.sugraph.happen_before(adapter, su):
+                            allow_merge = False
+                            break
                     if allow_merge:
-                        dev_seq[seqidx] = None
                         pieces.append(su)
                         continue
                 # merged forward su
@@ -36,14 +44,20 @@ class MergeComputeSU(PlanPass):
                     mfsu = MergeComputeSU._merge(fsus, devid)
                     mbsu = mfsu.mirror
                     # insert merged backward su
-                    dev_seq[seqidx-1] = mbsu
-                    fsus_idx = [dev_seq.index(fsu) for fsu in fsus]
+                    mbsu_idx = min([dev_seq.index(bsu) for bsu in pieces])
+                    for bsu in pieces:
+                        dev_seq[dev_seq.index(bsu)] = None
+                    dev_seq[mbsu_idx] = mbsu
                     # insert merged forward su
+                    fsus_idx = [dev_seq.index(fsu) for fsu in fsus]
                     if max(fsus_idx) - min(fsus_idx) == len(fsus) - 1:
                         for fidx in fsus_idx:
                             dev_seq[fidx] = None
                         dev_seq[min(fsus_idx)] = mfsu
                 pieces = list()
+                if su and su.stype in [SUType.Backward]:
+                    pieces = [su]
+                adapters = list()
             dev_seq = [su for su in dev_seq if su is not None]
             execplan.set(devid, dev_seq)
         return execplan
