@@ -106,6 +106,7 @@ class ModelCodeGen(CodeGen):
                 elif isinstance(node, IRCommunication):
                     self.emit_comm_call(node)
                 elif isinstance(node, IROptimOperation):
+                    self.emit_optim_init(node)
                     self.emit_optim_call(node)
                 # emit input declaration
                 for arg in node.inputs():
@@ -118,7 +119,7 @@ class ModelCodeGen(CodeGen):
             self.forward_region = list()
 
         # generate full code
-        with ClassBlock(class_name='GenModel', derived=['torch.nn.Module']) as cb:
+        with ClassBlock(class_name='GenModel', derived=['cube.runtime.module.CubeModule']) as cb:
             with FunctionBlock(func_name='__init__', args=['self']) as ib:
                 ib.insert_body(self.declare_region)
             cb.insert_body('')
@@ -237,18 +238,27 @@ class ModelCodeGen(CodeGen):
                 code = f'{output_name} = {output_name}.requires_grad_()'
                 self.forward_region.append(code)
 
-    def emit_optim_call(self, node: IROptimOperation):
+    def emit_optim_init(self, node: IROptimOperation):
+        # reducer init interface
+        reducer_init = '{reducer} = cube.runtime.reducer.Reducer(ranks={ranks})'
+        reducer_add = 'self.add_reducer({reducer})'
+        add_param = '{reducer}.add_param({grad})'
+        # create reducer in declare region
         ranks = list(node.ranks)
         grads = node.inputs()
         reducer_name = f'self.reducer{node._id}'
-        # create reducer in declare region
-        init_code = f'{reducer_name} = cube.runtime.reducer.Reducer(ranks={ranks})'
+        self.declare_region.append('')
+        init_code = reducer_init.format(reducer=reducer_name, ranks=ranks)
         self.declare_region.append(init_code)
         grads = self._forward_region_arg_names(grads)
         for grad in grads:
-            add_param_code = f'{reducer_name}.add_param({grad})'
+            add_param_code = add_param.format(reducer=reducer_name, grad=grad)
             self.declare_region.append(add_param_code)
-        # create call in forward region
+        add_code = reducer_add.format(reducer=reducer_name)
+        self.declare_region.append(add_code)
+
+    def emit_optim_call(self, node: IROptimOperation):
+        reducer_name = f'self.reducer{node._id}'
         call_code = f'{reducer_name}.allreduce()'
         self.forward_region.append(call_code)
 

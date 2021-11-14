@@ -38,6 +38,8 @@ class SemanticModel:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self._loaded_module = module.GenModel().cuda()
+        # sync parameters before start training
+        self._loaded_module.sync_params()
 
     def get_gen_module(self):
         return self._loaded_module

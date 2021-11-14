@@ -44,6 +44,14 @@ class Reducer:
             for grad, synced in zip(grads, all_synced):
                 grad.copy_(synced)
 
+    def sync(self):
+        """
+        Sync parameters before training
+        """
+        for param in self._params:
+            torch.distributed.broadcast(param, self.ranks[0], group=self._group)
+        torch.cuda.synchronize()
+
     def _flatten_dense_tensors(self, tensors):
         """
         Flatten dense tensors into a contiguous 1D buffer. Assume tensors are of
