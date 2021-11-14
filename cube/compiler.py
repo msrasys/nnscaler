@@ -142,7 +142,7 @@ def compile(model: SemanticModel, dataloader,
             execplan = ExectuionPlan(sugraph)
             # plan pass to remove redundant sus 
             execplan = RemoveRedundantAdapters.apply(execplan)
-            print(f'> after remove redundant adapters:\n {execplan}')
+            # print(f'> after remove redundant adapters:\n {execplan}')
             execplan = MergeComputeSU.apply(execplan)
             execplan = WeightGradAllreduceFusion.apply(execplan)
             print(f'> after merge compute SU:\n{execplan}')

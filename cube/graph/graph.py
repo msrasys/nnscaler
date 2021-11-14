@@ -7,7 +7,7 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Union, Tuple, List, Optional, Any, Dict
+from typing import Union, Tuple, List, Optional, Dict
 import copy
 from cube.graph.operator.operator import IRBpOperation
 
@@ -274,7 +274,7 @@ class IRGraph(IRCell):
         if not isinstance(algo, GenericDistAlgo):
             raise TypeError("Expected algo to be GenericDistAlgo")
         if op not in self.nodes():
-            raise RuntimeError("Not Exist: {op}")
+            raise RuntimeError(f"Not Exist: {op}")
 
         if algo.logic_op != type(op):
             return None
@@ -286,6 +286,19 @@ class IRGraph(IRCell):
             op.set_input(idx, None)
         # set backward mirror node
         if op.mirror is not None:
+            # go through related op to reset the related gradient
+            for fnode in fnodes:
+                for val in fnode.inputs():
+                    if not isinstance(val, IRSubTensor):
+                        continue
+                    # TODO: requires_grad = False should be set to None
+                    val.grad = val.get_grad(fnode)
+                    for related_op in val.parent.forward_dst_cells():
+                        for idx, rval in enumerate(related_op.inputs()):
+                            if val.overlap(rval):
+                                rval.grad = rval.get_grad(related_op)
+                                if related_op.mirror is not None:
+                                    related_op.mirror.set_output(idx, rval.grad)
             # generate mirror node
             for fnode in fnodes:
                 bnode = IRBpOperation(
@@ -295,9 +308,7 @@ class IRGraph(IRCell):
                 for idx, val in enumerate(fnode.inputs()):
                     grad = None
                     if isinstance(val, IRSubTensor):
-                        # TODO: requires_grad = False should be set to None
-                        grad = val.get_grad(fnode)
-                        val.grad = grad
+                        grad = val.grad
                     bnode.set_data(idx, val)
                     bnode.set_output(idx, grad)
                 for idx, val in enumerate(fnode.outputs()):
