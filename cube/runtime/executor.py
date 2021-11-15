@@ -11,7 +11,7 @@ def fexecute(su: Callable, *input_tensors: Tuple[Any]):
     forward the SUs
     """
     outputs = su(*input_tensors)
-    print('forwarding... ')
+    # print('forwarding... ')
     return outputs
 
 
@@ -29,7 +29,7 @@ def backward(input_tensors, output_tensors, output_tensor_grads):
         )
 
     for tensor, grads in zip(output_tensors, output_tensor_grads):
-        print('backwarding... ')
+        # print('backwarding... ')
         torch.autograd.backward(tensor, grad_tensors=grads)
     grads = list()
     for tensor in input_tensors:

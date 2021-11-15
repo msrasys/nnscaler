@@ -12,7 +12,7 @@ def send(tensors, to_ranks: List[int]):
         tensors (List[torch.Tensor]): list of tensor to send
         tensor_devices (List[List[int]]): tensor sent devices
     """
-    print('sending...')
+    # print('sending...')
     send_ops = list()
     for tensor, rank in zip(tensors, to_ranks):
         send_op = torch.distributed.P2POp(
@@ -26,7 +26,7 @@ def send(tensors, to_ranks: List[int]):
 
 
 def recv(shapes: List[List[int]], from_ranks: List[int]):
-    print('recving...')
+    # print('recving...')
     recv_ops = list()
     recv_tensors = list()
     for shape, rank in zip(shapes, from_ranks):
@@ -49,7 +49,7 @@ def recv(shapes: List[List[int]], from_ranks: List[int]):
 
 
 def send_and_recv(send_tensors, to_ranks, recv_shapes, from_ranks):
-    print('sending and recving...')
+    # print('sending and recving...')
     ops = list()
     recv_tensors = list()
     for tensor, ranks in zip(send_tensors, to_ranks):
