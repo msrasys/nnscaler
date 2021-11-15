@@ -15,6 +15,7 @@ import torch
 from torch import nn
 
 import cube
+from cube.profiler import CudaTimer
 from examples.policy.hybrid_parallel import transform_policy
 from examples.policy.hybrid_parallel import schedule_policy
 
@@ -23,9 +24,9 @@ from examples.policy.hybrid_parallel import schedule_policy
 class MLP(nn.Module):
     def __init__(self, dim, mult=16):
         super().__init__()
-        self.linear1 = nn.Linear(dim, dim * mult, bias=False)
+        self.linear1 = nn.Linear(dim, dim * mult)
         self.linear2 = nn.Linear(dim * mult, dim)
-        self.linear3 = nn.Linear(dim, dim * mult, bias=False)
+        self.linear3 = nn.Linear(dim, dim * mult)
         self.linear4 = nn.Linear(dim * mult, dim)
 
     def forward(self, data):
@@ -52,7 +53,6 @@ def train():
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
-        # print(f'loss={loss.item()}')
         loss.backward()
     model = model.get_gen_module()
     
@@ -60,11 +60,18 @@ def train():
 
     iter_num = 128
     for step in range(iter_num):
+        if step >= 10:
+            CudaTimer().start('e2e')
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
+        if step >= 10:
+            CudaTimer().stop('e2e')
         if (step + 1) % 20 == 0:
             print(f'iter [{step + 1}/{iter_num}]')
+
+    print('e2e time (ms) per iteration: {} ms'.format(
+          CudaTimer().duration(iter_num-10, field_name='e2e')))
 
 
 if __name__ == '__main__':
