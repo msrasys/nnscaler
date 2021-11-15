@@ -20,3 +20,7 @@ class CubeModule(torch.nn.Module):
     def sync_params(self):
         for reducer in self._reducers:
             reducer.sync()
+
+    def init_param(self):
+        for param in self.parameters():
+            torch.nn.init.uniform_(param)
