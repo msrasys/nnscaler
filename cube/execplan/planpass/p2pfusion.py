@@ -31,35 +31,24 @@ class P2PFusion(PlanPass):
                     for val in fins[pid][devid]:
                         print(f'  i:', val)
         matchers = [
-            P2PFusion.match_allreduce, P2PFusion.match_allgather,
-            P2PFusion.match_reducescatter, P2PFusion.match_broadcast,
+            P2PFusion.match_allreduce,
+            P2PFusion.match_allgather,
+            P2PFusion.match_reducescatter,
+            P2PFusion.match_broadcast,
         ]
-        for pid in fins:
-            if pid not in fous:
-                continue
-            tous, tins = fous[pid], fins[pid]
-            if P2PFusion.have_comm(tous, tins):
-                colls : List[ScheduleUnit] = None
-                for matcher in matchers:
-                    colls = matcher(tous, tins)
-                    if colls:
-                        break
-                if colls is not None:
-                    for coll_su in colls:
-                        P2PFusion.add_collective(execplan, coll_su)
-        for pid in bins:
-            if pid not in bous:
-                continue
-            tous, tins = bous[pid], bins[pid]
-            if P2PFusion.have_comm(tous, tins):
-                colls : List[ScheduleUnit] = None
-                for matcher in matchers:
-                    colls = matcher(tous, tins)
-                    if colls:
-                        break
-                if colls is not None:
-                    for coll_su in colls:
-                        P2PFusion.add_collective(execplan, coll_su)
+        for ous, ins in zip([fous, bous], [fins, bins]):
+            for pid in ins:
+                if pid not in ous:
+                    continue
+                tous, tins = ous[pid], ins[pid]
+                if P2PFusion.have_comm(tous, tins):
+                    colls : List[ScheduleUnit] = None
+                    for matcher in matchers:
+                        colls = matcher(tous, tins)
+                        if colls:
+                            break
+                    if colls is not None:
+                        P2PFusion.add_collectives(execplan, colls)
         return execplan
 
     @staticmethod
@@ -114,50 +103,51 @@ class P2PFusion(PlanPass):
         return False
 
     @staticmethod
-    def add_collective(execplan: ExectuionPlan, coll_su: ScheduleUnit):
-        print(f'inserting Collective SU: {coll_su}')
-        # find insert place: the first send
-        devid = coll_su.device[0]
-        ranks = coll_su.nodes(0).ranks
-        for idx, su in enumerate(execplan.sequence(devid)):
-            # send or recv
-            if su.stype == SUType.P2P:
-                sr_tensor = (su.inputs() + su.outputs())[0]
-                if sr_tensor in coll_su.inputs() + coll_su.outputs():
-                    execplan.at(devid)[idx] = coll_su
-                    break
-            # merge
-            if su.stype == SUType.Transform and len(su.inputs()) > 1:
-                merge_out = su.outputs(0)
-                if merge_out in coll_su.outputs():
-                    assert len(coll_su.outputs()) == 1
-                    execplan.at(devid)[idx] = coll_su
-                    break
-
-        else:
-            raise RuntimeError("Cannot find a send P2P")
+    def add_collectives(execplan: ExectuionPlan, coll_sus: List[ScheduleUnit]):
+        for coll_su in coll_sus:
+            print(f'inserting Collective SU: {coll_su}')
+            # find insert place: the first send
+            devid = coll_su.device[0]
+            ranks = coll_su.nodes(0).ranks
+            for idx, su in enumerate(execplan.sequence(devid)):
+                # send or recv
+                if su.stype == SUType.P2P:
+                    sr_tensor = (su.inputs() + su.outputs())[0]
+                    if sr_tensor in coll_su.inputs() + coll_su.outputs():
+                        execplan.at(devid)[idx] = coll_su
+                        break
+                # merge
+                if su.stype == SUType.Transform and len(su.inputs()) > 1:
+                    merge_out = su.outputs(0)
+                    if merge_out in coll_su.outputs():
+                        assert len(coll_su.outputs()) == 1
+                        execplan.at(devid)[idx] = coll_su
+                        break
+            else:
+                raise RuntimeError("Cannot find a send P2P")
         # all the send, recv of the inputs will be removed in ranks
-        for input in coll_su.inputs():
-            for rank in ranks:
-                for su in execplan.sequence(rank):
-                    # remove send / recv
-                    if su.stype == SUType.P2P and input in (su.inputs() + su.outputs()):
-                        execplan.at(rank).remove(su)
-                    # remove merge if coll generate merge results
-                    if su.stype == SUType.Transform and len(su.inputs()) > 1:
-                        merge_out = su.outputs(0)
-                        if merge_out in coll_su.outputs():
-                            assert len(coll_su.outputs()) == 1
+        for coll_su in coll_sus:
+            for input in coll_su.inputs():
+                for rank in ranks:
+                    for su in execplan.sequence(rank):
+                        # remove send / recv
+                        if su.stype == SUType.P2P and input in (su.inputs() + su.outputs()):
                             execplan.at(rank).remove(su)
+                        # remove merge if coll generate merge results
+                        if su.stype == SUType.Transform and len(su.inputs()) > 1:
+                            merge_out = su.outputs(0)
+                            if merge_out in coll_su.outputs():
+                                assert len(coll_su.outputs()) == 1
+                                execplan.at(rank).remove(su)
 
     @staticmethod
     def transmission(tensor_ous, in_tensor) -> Dict[int, List[IRTensor]]:
         trans_tensors = dict()
         for devid in tensor_ous:
             for out in tensor_ous[devid]:
-                if devid not in trans_tensors:
-                    trans_tensors[devid] = list()
                 if in_tensor.overlap(out):
+                    if devid not in trans_tensors:
+                        trans_tensors[devid] = list()
                     trans_tensors[devid].append(out)
         return trans_tensors
 
@@ -170,7 +160,79 @@ class P2PFusion(PlanPass):
         sends to all device.
         The recved tensors are summed into one
         """
-        return None
+        allreduce_sus = list()
+        # {tensor_id: [device_id]}
+        in_devices: Dict[int, List[int]] = dict()
+        # {tensor_id: [tensors]
+        in_tensors: Dict[int, List[IRTensor]] = dict()
+        for devid in tins:
+            for in_tensor in tins[devid]:
+                if in_tensor.val_map != ValueMap(0, 1):
+                    continue
+                tid = in_tensor._id
+                if tid not in in_devices:
+                    in_devices[tid] = list()
+                    in_tensors[tid] = list()
+                in_devices[tid].append(devid)
+                in_tensors[tid].append(in_tensor)
+        for tid in in_devices:
+            # P2P transmission
+            if len(in_devices[tid]) <= 1:
+                continue
+            in_tensor = in_tensors[tid][0]
+            # {rank: [IRTensor]}}
+            out_tensors = P2PFusion.transmission(tous, in_tensor)
+            out_devices = set(out_tensors.keys())
+            # check out tensor and reduce in tensor devices are the same set
+            if out_devices == set(in_devices[tid]):
+                # multiple transmission FIXME: remove redundancy
+                if not all([len(out_tensors[odev]) == 1 for odev in out_devices]):
+                    continue
+                # check same indice map and no overlap value map
+                unique_indices = list()
+                for odev in out_tensors:
+                    indices = out_tensors[odev][0].indices
+                    if indices not in unique_indices:
+                        unique_indices.append(indices)
+                if len(unique_indices) != 1:
+                    continue
+                # check no overlap valmaps
+                all_valmaps = list()
+                overlap = False
+                for odev in out_tensors:
+                    valmap = out_tensors[odev][0].val_map
+                    for pre_valmp in all_valmaps:
+                        overlap = pre_valmp.overlap(valmap)
+                    all_valmaps.append(valmap)
+                if overlap:
+                    continue
+
+                ranks = list(out_tensors.keys())
+                inputs = [[out_tensors[rank][0]] for rank in ranks]
+
+                for input, rank in zip(inputs, ranks):
+                    for in_tensor in in_tensors[tid]:
+                        if in_tensor.device[0] == rank:
+                            outputs = [in_tensor]
+                            break
+                    else:
+                        raise RuntimeError("Internal Error")
+                    op = IRCollectives(input, outputs, ranks, IRCollType.AllReduce)
+                    su = ScheduleUnit([op], SUType.Coll, name='allgather')
+                    su.device = rank
+                    allreduce_sus.append(su)
+
+                print('>> find allreduce pattern:')
+                print(f'device group: {ranks}')
+                for input in inputs:
+                    print(f'src: {input}')
+                for output in outputs:
+                    print(f'dst: {output}')
+
+        if len(allreduce_sus) == 0:
+            return None
+        else:
+            return allreduce_sus
 
     @staticmethod
     def match_allgather(tous, tins):

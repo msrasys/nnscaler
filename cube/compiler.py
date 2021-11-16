@@ -12,6 +12,7 @@ from cube.execplan import ExectuionPlan
 from cube.execplan.planpass.redundant import RemoveRedundantAdapters
 from cube.execplan.planpass.merge import MergeComputeSU
 from cube.execplan.planpass.gfuse import WeightGradAllreduceFusion
+from cube.execplan.planpass.p2pfusion import P2PFusion
 
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
@@ -145,11 +146,14 @@ def compile(model: SemanticModel, dataloader,
             execplan = ExectuionPlan(sugraph)
             # plan pass to remove redundant sus 
             execplan = RemoveRedundantAdapters.apply(execplan)
-            print(f'> after remove redundant adapters:\n {execplan}')
+            # print(f'> after remove redundant adapters:\n {execplan}')
             execplan = MergeComputeSU.apply(execplan)
             print(f'> after merge backward SU:\n {execplan}')
             execplan = WeightGradAllreduceFusion.apply(execplan)
-            print(f'> after add allreduce:\n{execplan}')
+            # print(f'> after add allreduce:\n{execplan}')
+
+            execplan = P2PFusion.apply(execplan)
+            print(f'> after fuse P2P SU:\n {execplan}')
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()

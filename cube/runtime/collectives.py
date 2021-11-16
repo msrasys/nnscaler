@@ -103,6 +103,8 @@ def all_reduce(tensors: List[torch.Tensor], ranks: List[int]):
     """
     assert len(tensors) == 1
     tensor = tensors[0]
+    tensor = tensor.detach()
+    tensor = tensor.requires_grad_()
     group = DeviceGroup().get_group(ranks)
     torch.distributed.all_reduce(tensor, group=group)
     return tensor
@@ -133,7 +135,7 @@ def reduce_scatter(tensors: List[torch.Tensor], ranks: List[int]):
     tensors = list(tensors)
     group = DeviceGroup().get_group(ranks)
     idx = ranks.index(DeviceGroup().rank)
-    output = torch.empty_like(tensors[idx])
+    output = torch.empty_like(tensors[idx], requires_grad=True)
     torch.distributed.reduce_scatter(
         output, tensors, group=group
     )
