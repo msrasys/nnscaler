@@ -133,6 +133,7 @@ class P2PFusion(PlanPass):
                 raise RuntimeError("Cannot find a send P2P")
         # all the send, recv of the inputs will be removed in ranks
         for coll_su in coll_sus:
+            ranks = coll_su.nodes(0).ranks
             for input in coll_su.inputs():
                 for rank in ranks:
                     for su in execplan.sequence(rank):
