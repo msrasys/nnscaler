@@ -16,7 +16,7 @@ def transform_policy(graph: IRGraph, resource):
             algo = node.algorithms('data')
             sub_nodes = graph.partition(node, algo, config=dict(chunk_num=dp))
             for idx, sub_node in enumerate(sub_nodes):
-                sub_node.tag = idx * tp
+                sub_node.tag = idx
         # partition operators first in column and then in data
         if isinstance(node, IRFwOperation):
             all_sub_nodes = list()

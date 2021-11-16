@@ -2,7 +2,6 @@
 Generate Pytorch code given the model DAG and the transformation config
 """
 from typing import List, Any
-from numpy import isin
 import torch
 import copy
 from cube.graph.operator.operator import IRFwOperation, IROptimOperation
@@ -76,6 +75,25 @@ class ModelCodeGen(CodeGen):
         self.symbols = SymbolTable()
         # ref module to check shared variables
         self._ref_module = torch.nn.Module()
+        # groups
+        self._all_comm_groups = list()
+        self.get_all_groups()
+
+    def get_all_groups(self):
+        """
+        Get all communication groups.
+
+        Creating communication group requires all the devices
+        enter the same call.
+        """
+        for devid in self.execplan.devices():
+            for su in self.execplan.sequence(devid):
+                if su.stype == SUType.Coll:
+                    ranks = list(su.nodes(0).ranks)
+                    ranks.sort()
+                    ranks = tuple(ranks)
+                    if ranks not in self._all_comm_groups:
+                        self._all_comm_groups.append(ranks)
 
     def gen(self, device: int, outfile=None, attach=False) -> str:
         """
@@ -99,6 +117,9 @@ class ModelCodeGen(CodeGen):
             for name in fargs:
                 self.symbols.create(name)
             su_args.append(fargs)
+
+        # init group
+        self.emit_comm_group_creation()
 
         # parse graph body
         for su in device_sus:
@@ -177,6 +198,16 @@ class ModelCodeGen(CodeGen):
                         code = f'{name} = None'
                         self.declare_region.append(code)
         return
+
+    def emit_comm_group_creation(self):
+        """
+        Emit communication group creation code
+        """
+        sign = 'self.init_group(ranks={ranks})'
+        for ranks in self._all_comm_groups:
+            ranks = list(ranks)
+            code = sign.format(ranks=ranks)
+            self.declare_region.append(code)
 
     def emit_op_call(self, node):
         """

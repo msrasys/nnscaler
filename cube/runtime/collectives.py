@@ -13,7 +13,7 @@ def send(tensors, to_ranks: List[int]):
         tensors (List[torch.Tensor]): list of tensor to send
         tensor_devices (List[List[int]]): tensor sent devices
     """
-    # print('sending...')
+    # print(f'{torch.distributed.get_rank()}: sending...')
     send_ops = list()
 
     ## synthetic ##
@@ -31,7 +31,7 @@ def send(tensors, to_ranks: List[int]):
 
 
 def recv(shapes: List[List[int]], from_ranks: List[int]):
-    # print('recving...')
+    # print(f'{torch.distributed.get_rank()}: recving...')
     recv_ops = list()
     recv_tensors = list()
 
@@ -101,6 +101,7 @@ def all_reduce(tensors: List[torch.Tensor], ranks: List[int]):
     """
     Allreduce
     """
+    # print(f'{torch.distributed.get_rank()}: all_reduce...')
     assert len(tensors) == 1
     tensor = tensors[0]
     tensor = tensor.detach()
@@ -114,6 +115,7 @@ def all_gather(tensors: List[torch.Tensor], ranks: List[int]):
     """
     Allgather
     """
+    # print(f'{torch.distributed.get_rank()}: all_gather...')
     assert len(tensors) == 1
     tensor = tensors[0]
     group = DeviceGroup().get_group(ranks)
@@ -132,6 +134,7 @@ def reduce_scatter(tensors: List[torch.Tensor], ranks: List[int]):
     """
     ReduceScatter
     """
+    # print(f'{torch.distributed.get_rank()}: reduce-scatter...')
     tensors = list(tensors)
     group = DeviceGroup().get_group(ranks)
     idx = ranks.index(DeviceGroup().rank)
@@ -146,6 +149,7 @@ def broadcast(tensors: List[torch.Tensor], ranks: List[int], shape=None):
     """
     Broadcast. ranks[0] is the root
     """
+    # print(f'{torch.distributed.get_rank()}: broadcast...')
     if len(tensors) == 1:
         tensor = tensors[0]
     else:
