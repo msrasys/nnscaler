@@ -130,9 +130,10 @@ def reduce_scatter(tensors: List[torch.Tensor], ranks: List[int]):
     """
     ReduceScatter
     """
+    tensors = list(tensors)
     group = DeviceGroup().get_group(ranks)
     idx = ranks.index(DeviceGroup().rank)
-    output = tensors[idx]
+    output = torch.empty_like(tensors[idx])
     torch.distributed.reduce_scatter(
         output, tensors, group=group
     )

@@ -1,5 +1,6 @@
 from typing import List, Dict
 from cube.execplan import ExectuionPlan
+from cube.graph.tensor import ValueMap
 from cube.ir.cten import IRTensor
 from cube.schedule.su import SUType, ScheduleUnit
 from cube.execplan.planpass.planpass import PlanPass
@@ -37,6 +38,19 @@ class P2PFusion(PlanPass):
             if pid not in fous:
                 continue
             tous, tins = fous[pid], fins[pid]
+            if P2PFusion.have_comm(tous, tins):
+                colls : List[ScheduleUnit] = None
+                for matcher in matchers:
+                    colls = matcher(tous, tins)
+                    if colls:
+                        break
+                if colls is not None:
+                    for coll_su in colls:
+                        P2PFusion.add_collective(execplan, coll_su)
+        for pid in bins:
+            if pid not in bous:
+                continue
+            tous, tins = bous[pid], bins[pid]
             if P2PFusion.have_comm(tous, tins):
                 colls : List[ScheduleUnit] = None
                 for matcher in matchers:
@@ -112,6 +126,13 @@ class P2PFusion(PlanPass):
                 if sr_tensor in coll_su.inputs() + coll_su.outputs():
                     execplan.at(devid)[idx] = coll_su
                     break
+            # merge
+            if su.stype == SUType.Transform and len(su.inputs()) > 1:
+                merge_out = su.outputs(0)
+                if merge_out in coll_su.outputs():
+                    assert len(coll_su.outputs()) == 1
+                    execplan.at(devid)[idx] = coll_su
+                    break
 
         else:
             raise RuntimeError("Cannot find a send P2P")
@@ -122,6 +143,12 @@ class P2PFusion(PlanPass):
                     # remove send / recv
                     if su.stype == SUType.P2P and input in (su.inputs() + su.outputs()):
                         execplan.at(rank).remove(su)
+                    # remove merge if coll generate merge results
+                    if su.stype == SUType.Transform and len(su.inputs()) > 1:
+                        merge_out = su.outputs(0)
+                        if merge_out in coll_su.outputs():
+                            assert len(coll_su.outputs()) == 1
+                            execplan.at(rank).remove(su)
 
     @staticmethod
     def transmission(tensor_ous, in_tensor) -> Dict[int, List[IRTensor]]:
@@ -238,11 +265,94 @@ class P2PFusion(PlanPass):
         for devid in tins:
             for in_tensor in tins[devid]:
                 tid = in_tensor._id
+                if in_tensor.val_map != ValueMap(0, 1):
+                    continue
                 if tid not in in_devices:
                     in_devices[tid] = list()
                     in_tensors[tid] = list()
                 in_devices[tid].append(devid)
                 in_tensors[tid].append(in_tensor)
+        # {in_tensor_id: [reduce_tensor device]}
+        reduce_out_devices = dict()
+        # {in_tensor_id: [reduce out tensors]}
+        reduce_out_tensors = dict()
+        for tid in in_devices:
+            # P2P transmission
+            if len(in_devices[tid]) != 1:
+                continue
+            in_tensor = in_tensors[tid][0]
+            out_tensors = P2PFusion.transmission(tous, in_tensor)
+
+            is_reduce = True
+            for devid in out_tensors:
+                # multiple transmission FIXME: remove redundancy
+                if not all([len(out_tensors[odev]) == 1 for odev in out_tensors]):
+                    continue
+                if out_tensors[devid][0].val_map == ValueMap(0, 1):
+                    is_reduce = False
+                    break
+                if out_tensors[devid][0].indices != in_tensor.indices:
+                    is_reduce = False
+                    break
+            if is_reduce:
+                reduce_out_devices[tid] = list()
+                reduce_out_tensors[tid] = list()
+                for devid in out_tensors:
+                    reduce_out_devices[tid].append(devid)
+                    reduce_out_tensors[tid].append(out_tensors[devid][0])
+        # reverse reduce_devices {tuple(devices): [in_tensors]}
+        reduce_tensors = dict()
+        for tid in reduce_out_devices:
+            devices = tuple(set(reduce_out_devices[tid]))
+            if devices not in reduce_tensors:
+                reduce_tensors[devices] = list()
+            reduce_tensors[devices].append(in_tensors[tid][0])
+        # check conditions
+        for ranks in reduce_tensors:
+            reduce_in_tensors = reduce_tensors[ranks]
+            # reduce-scatter requires tensor num to be equal of num devs
+            if len(reduce_in_tensors) != len(ranks):
+                continue
+            # reduce in tensors should place on different devices
+            devices = [t.device[0] for t in reduce_in_tensors]
+            if set(devices) != set(ranks):
+                continue
+
+            # satisfied! set up inputs, outputs and ranks
+            ranks = list(ranks)
+            ranks.sort()
+
+            device_inputs = [None] * len(ranks)
+            for in_tensor in reduce_in_tensors:
+                out_tensors = reduce_out_tensors[in_tensor._id]
+                out_devs = [t.device[0] for t in out_tensors]
+                inputs = [
+                    out_tensors[out_devs.index(odev)] for odev in ranks
+                ]
+                ridx = ranks.index(in_tensor.device[0])
+                device_inputs[ridx] = inputs
+            for in_tensor in reduce_in_tensors:
+                rank = in_tensor.device[0]
+                outputs = [in_tensor]
+                inputs = [inputs[rank] for inputs in device_inputs]
+                op = IRCollectives(inputs, outputs, ranks, IRCollType.ReduceScatter)
+                su = ScheduleUnit([op], SUType.Coll, name='reducescatter')
+                su.device = rank
+                rs_sus.append(su)
+
+            print('>> find reduce-scatter pattern:')
+            print(f'device group: {ranks}')
+            for output in reduce_in_tensors:
+                tid = output._id
+                for input in reduce_out_tensors[tid]:
+                    print(f'src: {input}')
+                print(f'dst: {output}')
+
+        if len(rs_sus) == 0:
+            return None
+        else:
+            return rs_sus
+
 
     @staticmethod
     def match_broadcast(tous, tins):
