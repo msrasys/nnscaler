@@ -106,11 +106,13 @@ class P2PFusion(PlanPass):
         devid = coll_su.device[0]
         ranks = coll_su.nodes(0).ranks
         for idx, su in enumerate(execplan.sequence(devid)):
-            # send
-            if su.stype == SUType.P2P and len(su.inputs()) == 1:
-                if su.inputs(0) in coll_su.inputs():
+            # send or recv
+            if su.stype == SUType.P2P:
+                sr_tensor = (su.inputs() + su.outputs())[0]
+                if sr_tensor in coll_su.inputs() + coll_su.outputs():
                     execplan.at(devid)[idx] = coll_su
                     break
+
         else:
             raise RuntimeError("Cannot find a send P2P")
         # all the send, recv of the inputs will be removed in ranks
@@ -228,7 +230,19 @@ class P2PFusion(PlanPass):
 
         Each device performs same
         """
-        return None
+        rs_sus = list()
+        # {tensor_id: [device_id]}
+        in_devices: Dict[int, List[int]] = dict()
+        # {tensor_id: [tensors]
+        in_tensors: Dict[int, List[IRTensor]] = dict()
+        for devid in tins:
+            for in_tensor in tins[devid]:
+                tid = in_tensor._id
+                if tid not in in_devices:
+                    in_devices[tid] = list()
+                    in_tensors[tid] = list()
+                in_devices[tid].append(devid)
+                in_tensors[tid].append(in_tensor)
 
     @staticmethod
     def match_broadcast(tous, tins):

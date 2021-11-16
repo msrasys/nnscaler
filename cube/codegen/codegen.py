@@ -2,12 +2,14 @@
 Generate Pytorch code given the model DAG and the transformation config
 """
 from typing import List, Any
+from numpy import isin
 import torch
 import copy
 from cube.graph.operator.operator import IRFwOperation, IROptimOperation
 
 from cube.ir.cten import IRTensor
 from cube.execplan import ExectuionPlan
+from cube.schedule.adapter.collectives import IRCollectives
 
 from cube.schedule.su import ScheduleUnit, SUType
 from cube.schedule.adapter.comm import IRCommType, IRCommunication
@@ -32,7 +34,9 @@ class CodeGen:
         if su.stype == SUType.Backward:
             return f"bwcp{su._id}"
         if su.stype == SUType.P2P:
-            return f"comm{su._id}"
+            return f"p2p{su._id}"
+        if su.stype == SUType.Coll:
+            return f"coll{su._id}"
         if su.stype == SUType.Transform:
             return f"trans{su._id}"
         if su.stype == SUType.Optimizer:
@@ -101,13 +105,17 @@ class ModelCodeGen(CodeGen):
             for node in su.nodes():
                 if isinstance(node, IRFwOperation):
                     self.emit_op_call(node)
-                if isinstance(node, IRTensorTransform):
+                elif isinstance(node, IRTensorTransform):
                     self.emit_transform_call(node)
                 elif isinstance(node, IRCommunication):
                     self.emit_comm_call(node)
+                elif isinstance(node, IRCollectives):
+                    self.emit_collective_call(node)
                 elif isinstance(node, IROptimOperation):
                     self.emit_optim_init(node)
                     self.emit_optim_call(node)
+                else:
+                    raise RuntimeError(f"Un-recognized IRCell type: {type(node)}")
                 # emit input declaration
                 for arg in node.inputs():
                     self.emit_var_declare(arg)
@@ -205,6 +213,16 @@ class ModelCodeGen(CodeGen):
             code = f'{recv_tensors} = {comm_code}({send_tensors}, {send_ranks}, {recv_shapes}, {recv_ranks})'
         else:
             raise TypeError(f"Unsupported IRCommmNode: {node.comm_type}")
+        self.forward_region.append(code)
+
+
+    def emit_collective_call(self, node):
+        ranks = node.ranks
+        inputs = self._forward_region_arg_names(node.inputs())
+        inputs = '(' + ', '.join(inputs + ['']) + ')'
+        outputs = self._forward_region_arg_names(node.outputs())
+        outputs = ', '.join(outputs)
+        code = f'{outputs} = {node.signature}({inputs}, {ranks})'
         self.forward_region.append(code)
 
     def emit_transform_call(self, node: IRTensorTransform):
@@ -331,7 +349,7 @@ class ScheduleCodeGen(CodeGen):
         """
         Emit su code
         """
-        fsu_types = [SUType.Forward, SUType.P2P, SUType.Transform, SUType.Optimizer]
+        fsu_types = [SUType.Forward, SUType.P2P, SUType.Coll, SUType.Transform, SUType.Optimizer]
         fsign = 'cube.runtime.executor.fexecute({model}, *{inputs})'
         bsign = 'cube.runtime.executor.backward({input_tensors}, {output_tensors}, {output_grads})'
         
