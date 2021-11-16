@@ -142,12 +142,15 @@ def reduce_scatter(tensors: List[torch.Tensor], ranks: List[int]):
     return output
 
 
-def broadcast(tensors: List[torch.Tensor], ranks: List[int]):
+def broadcast(tensors: List[torch.Tensor], ranks: List[int], shape=None):
     """
     Broadcast. ranks[0] is the root
     """
-    assert len(tensors) == 1
-    tensor = tensors[0]
+    if len(tensors) == 1:
+        tensor = tensors[0]
+    else:
+        tensor = torch.empty(shape, device=torch.cuda.current_device())
+        # tensor.requires_grad_()
     group = DeviceGroup().get_group(ranks)
     torch.distributed.broadcast(tensor, ranks[0], group=group)
     return tensor

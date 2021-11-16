@@ -13,23 +13,28 @@ class P2PFusion(PlanPass):
     @staticmethod
     def apply(execplan: ExectuionPlan) -> ExectuionPlan:
         # dict[pid][devid] = list of sub_tensors
-        fous, fins = P2PFusion.collect_tensors(execplan, SUType.Forward)
-        bous, bins = P2PFusion.collect_tensors(execplan, SUType.Backward)
+        fous, fins = P2PFusion.collect_tensors(
+            execplan, [SUType.Dataloader, SUType.Forward]
+        )
+        bous, bins = P2PFusion.collect_tensors(
+            execplan, [SUType.Backward]
+        )
         # debug
-        print('=====> forward')
-        for pid in fins:
-            if pid not in fous:
-                continue
-            if P2PFusion.have_comm(fous[pid], fins[pid]):
-                print(f'=> parent tensor id: {pid}')
-                for devid in fous[pid]:
-                    print(f'  ==> device: {devid}')
-                    for val in fous[pid][devid]:
-                        print(f'  o:', val)
-                for devid in fins[pid]:
-                    print(f'  ==> device: {devid}')
-                    for val in fins[pid][devid]:
-                        print(f'  i:', val)
+        # print('=====> forward')
+        # for pid in fins:
+        #     if pid not in fous:
+        #         continue
+        #     if P2PFusion.have_comm(fous[pid], fins[pid]):
+        #         print(f'=> parent tensor id: {pid}')
+        #         for devid in fous[pid]:
+        #             print(f'  ==> device: {devid}')
+        #             for val in fous[pid][devid]:
+        #                 print(f'  o:', val)
+        #         for devid in fins[pid]:
+        #             print(f'  ==> device: {devid}')
+        #             for val in fins[pid][devid]:
+        #                 print(f'  i:', val)
+
         matchers = [
             P2PFusion.match_allreduce,
             P2PFusion.match_allgather,
@@ -52,16 +57,17 @@ class P2PFusion(PlanPass):
         return execplan
 
     @staticmethod
-    def collect_tensors(execplan: ExectuionPlan, stype: SUType):
+    def collect_tensors(execplan: ExectuionPlan, stypes: List[SUType]):
         # dict[pid][devid] = list of sub_tensors
         ous = dict()
         ins = dict()
         for devid in execplan.devices():
             dev_seq = execplan.sequence(devid)
             for su in dev_seq:
-                if su.stype == stype:
+                if su.stype in stypes:
                     for val in su.inputs():
-                        if isinstance(val, IRTensor):
+                        # FIXME: remove parameter constraints
+                        if isinstance(val, IRTensor) and not val.is_param():
                             pid = val.parent._id
                             if pid not in ins:
                                 ins[pid] = dict()
@@ -222,12 +228,12 @@ class P2PFusion(PlanPass):
                     su.device = rank
                     allreduce_sus.append(su)
 
-                print('>> find allreduce pattern:')
-                print(f'device group: {ranks}')
-                for input in inputs:
-                    print(f'src: {input}')
-                for output in outputs:
-                    print(f'dst: {output}')
+                # print('>> find allreduce pattern:')
+                # print(f'device group: {ranks}')
+                # for input in inputs:
+                #     print(f'src: {input}')
+                # for output in outputs:
+                #     print(f'dst: {output}')
 
         if len(allreduce_sus) == 0:
             return None
@@ -300,12 +306,12 @@ class P2PFusion(PlanPass):
                     su.device = rank
                     allgather_sus.append(su)
 
-                print('>> find allgather pattern:')
-                print(f'device group: {ranks}')
-                for input in inputs:
-                    print(f'src: {input}')
-                for output in outputs:
-                    print(f'dst: {output}')
+                # print('>> find allgather pattern:')
+                # print(f'device group: {ranks}')
+                # for input in inputs:
+                #     print(f'src: {input}')
+                # for output in outputs:
+                #     print(f'dst: {output}')
 
         if len(allgather_sus) == 0:
             return None
@@ -402,13 +408,13 @@ class P2PFusion(PlanPass):
                 su.device = rank
                 rs_sus.append(su)
 
-            print('>> find reduce-scatter pattern:')
-            print(f'device group: {ranks}')
-            for output in reduce_in_tensors:
-                tid = output._id
-                for input in reduce_out_tensors[tid]:
-                    print(f'src: {input}')
-                print(f'dst: {output}')
+            # print('>> find reduce-scatter pattern:')
+            # print(f'device group: {ranks}')
+            # for output in reduce_in_tensors:
+            #     tid = output._id
+            #     for input in reduce_out_tensors[tid]:
+            #         print(f'src: {input}')
+            #     print(f'dst: {output}')
 
         if len(rs_sus) == 0:
             return None
@@ -423,4 +429,65 @@ class P2PFusion(PlanPass):
 
         The root device send the its tensor to all the devices
         """
-        return None
+        broadcast_sus = list()
+        # {tensor_id: [device_id]}
+        in_devices: Dict[int, List[int]] = dict()
+        # {tensor_id: [tensors]
+        in_tensors: Dict[int, List[IRTensor]] = dict()
+        for devid in tins:
+            for in_tensor in tins[devid]:
+                tid = in_tensor._id
+                if in_tensor.val_map != ValueMap(0, 1):
+                    continue
+                if tid not in in_devices:
+                    in_devices[tid] = list()
+                    in_tensors[tid] = list()
+                in_devices[tid].append(devid)
+                in_tensors[tid].append(in_tensor)
+        
+        for tid in in_devices:
+            # P2P transmission
+            if len(in_devices[tid]) <= 2:
+                continue
+            in_tensor = in_tensors[tid][0]
+            out_tensors = P2PFusion.transmission(tous, in_tensor)
+            # multiple transmission FIXME: remove redundancy
+            if len(out_tensors.keys()) != 1:
+                continue
+            # multiple transmission FIXME: remove redundancy
+            if len(out_tensors[list(out_tensors.keys())[0]]) != 1:
+                continue
+            root_tensor = out_tensors[list(out_tensors.keys())[0]][0]
+            is_equal = True
+            for in_tensor in in_tensors[tid]:
+                if in_tensor != root_tensor:
+                    is_equal = False
+                    break
+            if not is_equal:
+                continue
+            ranks = [root_tensor.device[0]]
+            inputs = [[root_tensor],]
+            outputs = [[],]
+            for output in in_tensors[tid]:
+                devid = output.device[0]
+                if devid in ranks:
+                    continue
+                ranks.append(devid)
+                outputs.append([output])
+                inputs.append([])
+            for input, output, rank in zip(inputs, outputs, ranks):
+                op = IRCollectives(input, output, ranks, IRCollType.Broadcast)
+                su = ScheduleUnit([op], SUType.Coll, name='broadcast')
+                su.device = rank
+                broadcast_sus.append(su)
+
+                print('>> find broadcast pattern:')
+                print(f'device group: {ranks}')
+                print(su)
+
+        if len(broadcast_sus) == 0:
+            return None
+
+
+        else:
+            return broadcast_sus

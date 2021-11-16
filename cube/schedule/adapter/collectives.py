@@ -9,6 +9,7 @@ class IRCollType(Enum):
     AllReduce = 'all_reduce'
     AllGather = 'all_gather'
     ReduceScatter = 'reduce_scatter'
+    Broadcast = 'broadcast'
 
 
 class IRCollectives(IRCell):
@@ -31,6 +32,8 @@ class IRCollectives(IRCell):
             signature = 'cube.runtime.collectives.all_gather'
         if colltype == IRCollType.ReduceScatter:
             signature = 'cube.runtime.collectives.reduce_scatter'
+        if colltype == IRCollType.Broadcast:
+            signature = 'cube.runtime.collectives.broadcast'
 
         self.ranks = ranks
 

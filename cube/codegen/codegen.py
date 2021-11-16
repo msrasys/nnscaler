@@ -215,14 +215,22 @@ class ModelCodeGen(CodeGen):
             raise TypeError(f"Unsupported IRCommmNode: {node.comm_type}")
         self.forward_region.append(code)
 
-
     def emit_collective_call(self, node):
         ranks = node.ranks
         inputs = self._forward_region_arg_names(node.inputs())
+        shape = None
+        if len(inputs) == 0:
+            assert len(node.outputs()) == 1
+            shape = node.outputs(0).shape
         inputs = '(' + ', '.join(inputs + ['']) + ')'
         outputs = self._forward_region_arg_names(node.outputs())
         outputs = ', '.join(outputs)
-        code = f'{outputs} = {node.signature}({inputs}, {ranks})'
+        if shape:
+            code = f'{node.signature}({inputs}, {ranks}, {shape})'
+        else:
+            code = f'{node.signature}({inputs}, {ranks})'
+        if outputs:
+            code = f'{outputs} = {code}'
         self.forward_region.append(code)
 
     def emit_transform_call(self, node: IRTensorTransform):
