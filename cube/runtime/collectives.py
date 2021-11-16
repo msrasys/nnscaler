@@ -119,7 +119,11 @@ def all_gather(tensors: List[torch.Tensor], ranks: List[int]):
     idx = ranks.index(DeviceGroup().rank)
     tensor_list[idx] = tensor
     torch.distributed.all_gather(tensor_list, group=group)
-    return tensor_list
+    tensor_list = [t for oidx, t in enumerate(tensor_list) if oidx != idx]
+    if len(tensor_list) == 1:
+        return tensor_list[0]
+    else:
+        return tensor_list
 
 
 def reduce_scatter(tensors: List[torch.Tensor], ranks: List[int]):

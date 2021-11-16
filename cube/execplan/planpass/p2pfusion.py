@@ -38,11 +38,14 @@ class P2PFusion(PlanPass):
                 continue
             tous, tins = fous[pid], fins[pid]
             if P2PFusion.have_comm(tous, tins):
-                colls = None
+                colls : List[ScheduleUnit] = None
                 for matcher in matchers:
                     colls = matcher(tous, tins)
                     if colls:
                         break
+                if colls is not None:
+                    for coll_su in colls:
+                        P2PFusion.add_collective(execplan, coll_su)
         return execplan
 
     @staticmethod
@@ -97,6 +100,28 @@ class P2PFusion(PlanPass):
         return False
 
     @staticmethod
+    def add_collective(execplan: ExectuionPlan, coll_su: ScheduleUnit):
+        print(f'inserting Collective SU: {coll_su}')
+        # find insert place: the first send
+        devid = coll_su.device[0]
+        ranks = coll_su.nodes(0).ranks
+        for idx, su in enumerate(execplan.sequence(devid)):
+            # send
+            if su.stype == SUType.P2P and len(su.inputs()) == 1:
+                if su.inputs(0) in coll_su.inputs():
+                    execplan.at(devid)[idx] = coll_su
+                    break
+        else:
+            raise RuntimeError("Cannot find a send P2P")
+        # all the send, recv of the inputs will be removed in ranks
+        for input in coll_su.inputs():
+            for rank in ranks:
+                for su in execplan.sequence(rank):
+                    # remove send / recv
+                    if su.stype == SUType.P2P and input in (su.inputs() + su.outputs()):
+                        execplan.at(rank).remove(su)
+
+    @staticmethod
     def transmission(tensor_ous, in_tensor) -> Dict[int, List[IRTensor]]:
         trans_tensors = dict()
         for devid in tensor_ous:
@@ -142,7 +167,6 @@ class P2PFusion(PlanPass):
                 in_devices[tid].append(devid)
                 in_tensors[tid].append(in_tensor)
         for tid in in_devices:
-            share_tensors = in_tensors[tid]
             # P2P transmission
             if len(in_devices[tid]) <= 1:
                 continue
@@ -175,14 +199,13 @@ class P2PFusion(PlanPass):
 
                 ranks = list(out_tensors.keys())
                 inputs = [[out_tensors[rank][0]] for rank in ranks]
-                outputs = list()
-                for rank in ranks:
-                    sh_idx = in_devices[tid].index(rank)
-                    outputs.append([share_tensors[sh_idx]])
 
-                for input, output, rank in zip(inputs, outputs, ranks):
-                    op = IRCollectives(input, output, ranks, IRCollType.AllGather)
-                    su = ScheduleUnit([op], SUType.Comm, name='allgather')
+                for input, rank in zip(inputs, ranks):
+                    outputs = [
+                        input[0] for idx, input in enumerate(inputs) if idx != rank
+                    ]
+                    op = IRCollectives(input, outputs, ranks, IRCollType.AllGather)
+                    su = ScheduleUnit([op], SUType.Coll, name='allgather')
                     su.device = rank
                     allgather_sus.append(su)
 
