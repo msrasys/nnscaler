@@ -111,7 +111,7 @@ class P2PFusion(PlanPass):
     @staticmethod
     def add_collectives(execplan: ExectuionPlan, coll_sus: List[ScheduleUnit]):
         for coll_su in coll_sus:
-            print(f'inserting Collective SU: {coll_su}')
+            print(f'inserting Collective SU: {coll_su.name}: {coll_su}')
             # find insert place: the first send
             devid = coll_su.device[0]
             ranks = coll_su.nodes(0).ranks
@@ -295,13 +295,11 @@ class P2PFusion(PlanPass):
                     continue
 
                 ranks = list(out_tensors.keys())
-                inputs = [[out_tensors[rank][0]] for rank in ranks]
+                inputs = [out_tensors[rank][0] for rank in ranks]
 
                 for input, rank in zip(inputs, ranks):
-                    outputs = [
-                        input[0] for idx, input in enumerate(inputs) if idx != rank
-                    ]
-                    op = IRCollectives(input, outputs, ranks, IRCollType.AllGather)
+                    outputs = [t for t in inputs if t != input]
+                    op = IRCollectives([input], outputs, ranks, IRCollType.AllGather)
                     su = ScheduleUnit([op], SUType.Coll, name='allgather')
                     su.device = rank
                     allgather_sus.append(su)
@@ -402,7 +400,7 @@ class P2PFusion(PlanPass):
             for in_tensor in reduce_in_tensors:
                 rank = in_tensor.device[0]
                 outputs = [in_tensor]
-                inputs = [inputs[rank] for inputs in device_inputs]
+                inputs = [inputs[ranks.index(rank)] for inputs in device_inputs]
                 op = IRCollectives(inputs, outputs, ranks, IRCollType.ReduceScatter)
                 su = ScheduleUnit([op], SUType.Coll, name='reducescatter')
                 su.device = rank
