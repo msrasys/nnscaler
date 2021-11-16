@@ -31,7 +31,7 @@ class CodeGen:
             return f"fwcp{su._id}"
         if su.stype == SUType.Backward:
             return f"bwcp{su._id}"
-        if su.stype == SUType.Comm:
+        if su.stype == SUType.P2P:
             return f"comm{su._id}"
         if su.stype == SUType.Transform:
             return f"trans{su._id}"
@@ -331,7 +331,7 @@ class ScheduleCodeGen(CodeGen):
         """
         Emit su code
         """
-        fsu_types = [SUType.Forward, SUType.Comm, SUType.Transform, SUType.Optimizer]
+        fsu_types = [SUType.Forward, SUType.P2P, SUType.Transform, SUType.Optimizer]
         fsign = 'cube.runtime.executor.fexecute({model}, *{inputs})'
         bsign = 'cube.runtime.executor.backward({input_tensors}, {output_tensors}, {output_grads})'
         

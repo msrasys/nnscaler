@@ -61,7 +61,7 @@ class SUGraph(IRCell):
             for dst in sus[src_idx+1:]:
                 for out_idx, out_tensor in enumerate(src.outputs()):
                     # special dependency for communication adapter
-                    if dst.stype == SUType.Comm:
+                    if dst.stype == SUType.P2P:
                         for recv_tensor in dst.outputs():
                             if out_tensor.overlap(recv_tensor):
                                 src.add_successor(out_idx, dst)
@@ -186,14 +186,14 @@ class SUGraph(IRCell):
         # condition 2): su2 input cannot be got from both su1 and other su
         start, stop = min(idx1, idx2), max(idx1, idx2)
         inter_sus = self.sequence[start+1:stop]
-        inter_sus = [su for su in inter_sus if su.stype != SUType.Comm]
+        inter_sus = [su for su in inter_sus if su.stype != SUType.P2P]
         for su in inter_sus:
             # FIXME: currently only allow other device su exists
             if self.happen_before(su1, su) or self.happen_before(su, su2):
                 return None
         for idx in range(len(su2.inputs())):
             prev_sus = su2.predecessors(idx)
-            prev_sus = [su for su in prev_sus if su.stype != SUType.Comm]
+            prev_sus = [su for su in prev_sus if su.stype != SUType.P2P]
             if su2 in prev_sus and len(prev_sus) > 1:
                 return None
 
@@ -313,7 +313,7 @@ class SUGraph(IRCell):
         elif not all([isinstance(rank, int) for rank in ranks]):
             raise TypeError("Expected type ranks to be Union[int, List[int]]")
 
-        if su.stype == SUType.Comm:
+        if su.stype == SUType.P2P:
             return False
 
         if set(su.device) == set(ranks):
@@ -449,8 +449,8 @@ class SUGraph(IRCell):
                                 recv_ranks = [-1]
                             )
                             send_op.pair(recv_op)
-                            send_su = ScheduleUnit([send_op], SUType.Comm, name='send')
-                            recv_su = ScheduleUnit([recv_op], SUType.Comm, name='recv')
+                            send_su = ScheduleUnit([send_op], SUType.P2P, name='send')
+                            recv_su = ScheduleUnit([recv_op], SUType.P2P, name='recv')
                             su._add_in_adapter(in_idx, send_su, recv_su)
                             send_su.device = su.device
                             pre_su._add_out_adapter(out_idx, send_su, recv_su)

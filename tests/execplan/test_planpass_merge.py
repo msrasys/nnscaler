@@ -65,7 +65,7 @@ def test_planpass_merge():
     sugraph = SUGraphGener.gen_sugraph(nodes)
 
     for su in sugraph.sus():
-        if su.stype != SUType.Comm:
+        if su.stype != SUType.P2P:
             sugraph.assign(su, 0)
 
     print('orignal:')
@@ -80,5 +80,5 @@ def test_planpass_merge():
         print(f'> device {devid}')
         for su in execplan.sequence(devid):
             print(su)
-            assert su.stype != SUType.Comm
+            assert su.stype != SUType.P2P
     assert len(execplan.sequence(0)) == 2

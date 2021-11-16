@@ -143,10 +143,10 @@ def test_sugraph_gener_gen():
     assert su1.stype == SUType.Forward
     assert su2.stype == SUType.Forward
     assert su3.stype == SUType.Forward
-    assert send_su12.stype == SUType.Comm
-    assert recv_su12.stype == SUType.Comm
-    assert send_su23.stype == SUType.Comm
-    assert recv_su23.stype == SUType.Comm
+    assert send_su12.stype == SUType.P2P
+    assert recv_su12.stype == SUType.P2P
+    assert send_su23.stype == SUType.P2P
+    assert recv_su23.stype == SUType.P2P
 
     # backward adapters
     output.backward()

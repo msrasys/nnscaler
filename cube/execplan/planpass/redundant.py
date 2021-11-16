@@ -14,7 +14,7 @@ class RemoveRedundantAdapters(PlanPass):
         """
         for devid in execplan.devices():
             seq = execplan.sequence(devid)
-            comms = [su for su in seq if su.stype == SUType.Comm]
+            comms = [su for su in seq if su.stype == SUType.P2P]
             for comm in comms:
                 send_ranks = set([devid])
                 recv_ranks = set([devid])

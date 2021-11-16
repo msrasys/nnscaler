@@ -74,5 +74,5 @@ def test_remove_adapter():
         print(f'> device {devid}')
         for su in execplan.sequence(devid):
             print(su)
-            assert su.stype != SUType.Comm
+            assert su.stype != SUType.P2P
     assert len(execplan.sequence(0)) == 6

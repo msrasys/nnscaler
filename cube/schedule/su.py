@@ -23,7 +23,8 @@ class SUType(Enum):
     # cube.runtime.collectives.sendrecv(send_tensors, send_ranks,
     #   recv_shapes, from_ranks
     # )
-    Comm = 'cube.runtime.adapter.sendrecv'
+    P2P = 'cube.runtime.adapter.sendrecv'
+    Coll = 'cube.runtime.adapter.coll'
 
     Optimizer = 'cube.runtime.reducer.Reduce'
 

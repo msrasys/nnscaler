@@ -19,7 +19,7 @@ class MergeComputeSU(PlanPass):
             pieces: List[ScheduleUnit] = list()
             adapters: List[ScheduleUnit] = list()
             for seqidx, su in enumerate(dev_seq):
-                if su and su.stype in [SUType.Comm, SUType.Transform]:
+                if su and su.stype in [SUType.P2P, SUType.Transform]:
                     if len(pieces) > 0:
                         adapters.append(su)
                     continue
