@@ -116,13 +116,20 @@ class SUGraph(IRCell):
         """
         return [su for su in self.sequence if su.stype == SUType.Forward]
 
-    def happen_before(self, su1, su2):
+    def happen_before(self, su1, su2, visited=None):
         """
         Check if the su1 -> (happened before) su2
 
         Returns:
             Boolean
         """
+        # FIXME: there is still a strange bug may cause infinite loop
+        if visited is None:
+            visited = list()
+        if su1 in visited:
+            return False
+        visited.append(su1)
+
         if not isinstance(su1, ScheduleUnit) or \
            not isinstance(su2, ScheduleUnit):
             raise TypeError("Expected su to be an ScheduleUnit")
@@ -130,7 +137,10 @@ class SUGraph(IRCell):
             return True
         else:
             for succ_su in su1.successors():
-                if self.happen_before(succ_su, su2):
+                # don't need to consider P2P comm dependency
+                if succ_su.stype == SUType.P2P:
+                    continue
+                if self.happen_before(succ_su, su2, visited):
                     return True
             return False
 
@@ -540,8 +550,8 @@ class SUGraph(IRCell):
             for out_idx in range(len(node.outputs())):
                 node_list = [snode._id for snode in node.successors(out_idx)]
                 succ_node_ids[out_idx] = node_list
-            dscp += f"{node._id}: {node}\n"
-            # dscp += f"\n{node._id}: {node} -> su id {succ_node_ids}\n"
+            # dscp += f"{node._id}: {node}\n"
+            dscp += f"\n{node._id}: {node} -> su id {succ_node_ids}\n"
         return dscp
 
 
@@ -565,9 +575,13 @@ class SUGraphGener:
                 fsus.append(su)
             elif isinstance(node, IRBpOperation):
                 stype = SUType.Backward
-                index = fnodes.index(node.mirror)
+                # get the last one same node
+                index = len(fnodes) - fnodes[::-1].index(node.mirror) - 1
                 fsu = fsus[index]
                 IRCell.make_pair(su, fsu)
+                # remove fsu
+                fnodes.pop(index)
+                fsus.remove(fsu)
             else:
                 raise NotImplementedError("Not implemented node type")
             su.stype = stype

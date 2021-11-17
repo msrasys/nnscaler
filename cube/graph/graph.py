@@ -269,6 +269,7 @@ class IRGraph(IRCell):
             raise RuntimeError(f"Op {op} not exsits")
     
         ops = [op]
+        mirror_ops = [op.mirror]
         for _ in range(times - 1):
             cpy_op = copy.copy(op)
             for idx, input in enumerate(op.inputs()):
@@ -281,10 +282,17 @@ class IRGraph(IRCell):
                     cpy_mirror_op.set_input(idx, input)
                 for idx, output in enumerate(op.mirror.outputs()):
                     cpy_mirror_op.set_output(idx, output)
+                mirror_ops.append(cpy_mirror_op)
                 IRCell.make_pair(cpy_op, cpy_mirror_op)
             ops.append(cpy_op)
         idx = self.nodes().index(op)
+        # forward
         self._nodes = self._nodes[:idx] + ops + self._nodes[idx+1:]
+        # backward
+        if op.mirror:
+            mirror_ops = mirror_ops[::-1]
+            midx = self.nodes().index(op.mirror)
+            self._nodes = self._nodes[:midx] + mirror_ops + self._nodes[midx+1:]
         self.reset_dependency()
         return ops
 
