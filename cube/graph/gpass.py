@@ -5,7 +5,7 @@ from cube.graph.graph import IRGraph
 from cube.graph.tensor import IRSubTensor
 from cube.graph.operator import IRBpOperation
 
-from cube.ir.cten import IRTensor
+from cube.ir.cten import IRCell, IRTensor
 
 
 __all__ = ['forward']
@@ -103,8 +103,7 @@ def forward(graph, *args) -> IRGraph:
         bnode.device = node.device
         
         # mirror node for forward / backward
-        fnode.mirror = bnode
-        bnode.mirror = fnode
+        IRCell.make_pair(fnode, bnode)
 
         fnodes.append(fnode)
         bnodes.append(bnode)

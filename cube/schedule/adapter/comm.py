@@ -59,23 +59,6 @@ class IRCommunication(IRCell):
             self.recv_tensors.append(self.outputs(idx))
             self.recv_ranks.append(from_device)
 
-        self.msg_id = self._id
-
-    def pair(self, other):
-        """
-        Pair two comm node to have same message id.
-
-        The `other` message id is set same with caller
-        """
-        if not isinstance(other, IRCommunication):
-            raise RuntimeError("Expected IRCommunication to pair")
-        other.msg_id = self.msg_id
-
-    def merge(self, other):
-        if not isinstance(other, IRCommunication):
-            raise RuntimeError("Expected IRCommunication to merge")
-        raise NotImplementedError
-
     def __repr__(self):
         inputs = list()
         for tensor in self.inputs():
@@ -91,5 +74,5 @@ class IRCommunication(IRCell):
             else:
                 outputs.append(tensor)
 
-        dscp = f'SendRecv(msg_id={self.msg_id}, device={self.device}, send={inputs}, recv={outputs})'
+        dscp = f'SendRecv(id={self._id}, send={inputs}, recv={outputs})'
         return dscp

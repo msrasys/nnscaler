@@ -254,6 +254,40 @@ class IRGraph(IRCell):
         )
         return graph
 
+    def replicate(self, op: IRCell, times=1):
+        """
+        Replicate an operation with multiple times.
+
+        This is temporary use to enable assign with multiple devices
+        """
+        if not isinstance(op, IRCell):
+            raise TypeError("Expected an IRCell")
+        if not isinstance(times, int) or times < 1:
+            raise TypeError("Expected times to be int and >= 1")
+
+        if op not in self.nodes():
+            raise RuntimeError(f"Op {op} not exsits")
+    
+        ops = [op]
+        for _ in range(times - 1):
+            cpy_op = copy.copy(op)
+            for idx, input in enumerate(op.inputs()):
+                cpy_op.set_input(idx, input)
+            for idx, output in enumerate(op.outputs()):
+                cpy_op.set_output(idx, output)
+            if op.mirror is not None:
+                cpy_mirror_op = copy.copy(op.mirror)
+                for idx, input in enumerate(op.mirror.inputs()):
+                    cpy_mirror_op.set_input(idx, input)
+                for idx, output in enumerate(op.mirror.outputs()):
+                    cpy_mirror_op.set_output(idx, output)
+                IRCell.make_pair(cpy_op, cpy_mirror_op)
+            ops.append(cpy_op)
+        idx = self.nodes().index(op)
+        self._nodes = self._nodes[:idx] + ops + self._nodes[idx+1:]
+        self.reset_dependency()
+        return ops
+
     ## Primitives for policy expression ##
 
     def partition(self, op: IRCell, algo: GenericDistAlgo, config: Dict) -> Optional[List[IRCell]]:
@@ -327,9 +361,8 @@ class IRGraph(IRCell):
                         grad = val.get_grad(fnode)
                         val.grad = grad
                     bnode.set_grad(idx, grad)
-                fnode.mirror = bnode
+                IRCell.make_pair(fnode, bnode)
                 fnode.device = op.device
-                bnode.mirror = fnode
                 bnode.device = op.mirror.device
         idx = self._nodes.index(op)
         self._nodes = self._nodes[:idx] + fnodes + self._nodes[idx+1:]

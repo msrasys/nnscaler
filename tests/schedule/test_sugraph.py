@@ -1,6 +1,7 @@
 from cube.graph.tensor import IRFullTensor
 from cube.graph.operator.function import Linear
 from cube.graph.graph import IRGraph
+from cube.ir.cten import IRCell
 
 from cube.schedule.su import SUType, ScheduleUnit
 from cube.schedule.sugraph import SUGraph
@@ -149,7 +150,7 @@ def test_sugraph_assign1():
         recv_tensors=[su1.outputs(0)],
         recv_ranks = [-1]
     )
-    send_op.pair(recv_op)
+    IRCell.make_pair(send_op, recv_op)
     send_su12 = ScheduleUnit([send_op], SUType.P2P, name='send')
     recv_su12 = ScheduleUnit([recv_op], SUType.P2P, name='recv')
     su1._add_out_adapter(0, send_su12, recv_su12)
@@ -164,7 +165,7 @@ def test_sugraph_assign1():
         recv_tensors=[su1.outputs(0)],
         recv_ranks = [-1]
     )
-    send_op.pair(recv_op)
+    IRCell.make_pair(send_op, recv_op)
     send_su23 = ScheduleUnit([send_op], SUType.P2P, name='send')
     recv_su23 = ScheduleUnit([recv_op], SUType.P2P, name='recv')
     su2._add_out_adapter(0, send_su23, recv_su23)
@@ -214,7 +215,7 @@ def test_sugraph_assign2():
         recv_tensors=[su1.outputs(0)],
         recv_ranks = [-1]
     )
-    send_op.pair(recv_op)
+    IRCell.make_pair(send_op, recv_op)
     send_su12 = ScheduleUnit([send_op], SUType.P2P, name='send')
     recv_su12 = ScheduleUnit([recv_op], SUType.P2P, name='recv')
     su1._add_out_adapter(0, send_su12, recv_su12)
@@ -229,7 +230,7 @@ def test_sugraph_assign2():
         recv_tensors=[su1.outputs(0)],
         recv_ranks = [-1]
     )
-    send_op.pair(recv_op)
+    IRCell.make_pair(send_op, recv_op)
     send_su23 = ScheduleUnit([send_op], SUType.P2P, name='send')
     recv_su23 = ScheduleUnit([recv_op], SUType.P2P, name='recv')
     su2._add_out_adapter(0, send_su23, recv_su23)

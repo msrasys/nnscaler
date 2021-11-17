@@ -101,15 +101,6 @@ class ScheduleUnit(IRCell):
         Copy the SU. Note the mirror su is also copied
         """
         raise NotImplementedError("Copy SU is not supported yet")
-        su = ScheduleUnit(self._nodes, self.stype, self.name)
-        if self.mirror is not None:
-            mirror_su = self.mirror
-            mirror_su = ScheduleUnit(
-                mirror_su._nodes, mirror_su.stype, mirror_su.name
-            )
-            su.mirror = mirror_su
-            mirror_su.mirror = su
-        return su
 
     def in_adapters(self, index: Optional[int] = None) -> List:
         """

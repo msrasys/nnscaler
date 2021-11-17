@@ -3,6 +3,7 @@ from typing import List
 from cube.execplan import ExectuionPlan
 from cube.execplan.planpass.planpass import PlanPass
 from cube.graph.operator.operator import IRBpOperation
+from cube.ir.cten import IRCell
 from cube.schedule.su import SUType, ScheduleUnit
 
 
@@ -89,6 +90,5 @@ class MergeComputeSU(PlanPass):
         mbsu = ScheduleUnit([mbnode], SUType.Backward, name='bsu')
         mbsu.device = devid
 
-        mfsu.mirror = mbsu
-        mbsu.mirror = mfsu
+        IRCell.make_pair(mfsu, mbsu)
         return mfsu

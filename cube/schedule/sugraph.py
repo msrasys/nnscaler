@@ -1,12 +1,10 @@
 from typing import List, Optional, Union
 import copy
 
-
 from cube.ir.cten import IRCell, IRTensor
 from cube.graph.operator import IRBpOperation
 from cube.graph.operator import IRDataOperation
 from cube.graph.operator import IRFwOperation
-from cube.graph.graph import IRGraph
 from cube.schedule.su import SUType, ScheduleUnit
 from cube.schedule.adapter.comm import IRCommunication
 from cube.schedule.adapter.transform import IRTensorTransform
@@ -118,15 +116,6 @@ class SUGraph(IRCell):
         """
         return [su for su in self.sequence if su.stype == SUType.Forward]
 
-    def get_graph(self, sus: List[ScheduleUnit], name: str) -> IRGraph:
-        """
-        Generate IRGraph
-        """
-        nodes = list()
-        for su in sus:
-            nodes += su.nodes()
-        return IRGraph(nodes, None, None, name)
-
     def happen_before(self, su1, su2):
         """
         Check if the su1 -> (happened before) su2
@@ -220,8 +209,7 @@ class SUGraph(IRCell):
                 bnode.set_output(idx, fin.grad)
             bsu = ScheduleUnit([bnode], stype=SUType.Backward, name='bsu')
             bsu.device = su2.mirror.device
-            fsu.mirror = bsu
-            bsu.mirror = fsu
+            IRCell.make_pair(fsu, bsu)
 
         def _set_adapters(su1: ScheduleUnit, su2: ScheduleUnit, msu: ScheduleUnit):
             # set adapter
@@ -448,13 +436,14 @@ class SUGraph(IRCell):
                                 recv_tensors=[sub_tensor],
                                 recv_ranks = [-1]
                             )
-                            send_op.pair(recv_op)
+                            IRCell.make_pair(send_op, recv_op)
                             send_su = ScheduleUnit([send_op], SUType.P2P, name='send')
                             recv_su = ScheduleUnit([recv_op], SUType.P2P, name='recv')
                             su._add_in_adapter(in_idx, send_su, recv_su)
                             send_su.device = su.device
                             pre_su._add_out_adapter(out_idx, send_su, recv_su)
                             recv_su.device = su.device
+                            IRCell.make_pair(send_su, recv_su)
                 # add adapter for merge
                 if len(tensor_segments) != 0:
                     try:
@@ -578,8 +567,7 @@ class SUGraphGener:
                 stype = SUType.Backward
                 index = fnodes.index(node.mirror)
                 fsu = fsus[index]
-                su.mirror = fsu
-                fsu.mirror = su
+                IRCell.make_pair(su, fsu)
             else:
                 raise NotImplementedError("Not implemented node type")
             su.stype = stype

@@ -3,6 +3,7 @@ import copy
 from cube.graph.tensor import IRFullTensor
 from cube.graph.operator.function import Linear
 from cube.graph.graph import IRGraph
+from cube.ir.cten import IRCell
 
 from cube.schedule.su import SUType, ScheduleUnit
 
@@ -86,7 +87,7 @@ def test_su_copy():
 
     su1 = ScheduleUnit([linear1, linear2], stype=SUType.Forward)
     su2 = ScheduleUnit([linear1, linear2, linear3], stype=SUType.Forward)
-    su1.mirror = su2
+    IRCell.make_pair(su1, su2)
 
     csu = copy.copy(su1)
     assert csu.inputs() == su1.inputs()

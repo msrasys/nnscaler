@@ -92,9 +92,16 @@ class IRCell:
 
     @mirror.setter
     def mirror(self, other):
-        if not isinstance(other, IRCell):
-            raise TypeError("Expected mirror to be IRCell")
-        self._mirror = other
+        raise RuntimeError("Use IRCell.make_pair instead")
+
+    @staticmethod
+    def make_pair(cell1, cell2):
+        if not isinstance(cell1, IRCell):
+            raise TypeError("Expected cell1 to be IRCell")
+        if not isinstance(cell2, IRCell):
+            raise TypeError("Expected cell2 to be IRCell")
+        cell1._mirror = cell2
+        cell2._mirror = cell1
 
     def on_device(self, device_id: int):
         """

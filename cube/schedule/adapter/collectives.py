@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Type
 from enum import Enum
 
 from cube.ir.cten import IRCell, IRTensor
@@ -47,3 +47,4 @@ class IRCollectives(IRCell):
             self.set_input(idx, input)
         for idx, output in enumerate(outputs):
             self.set_output(idx, output)
+
