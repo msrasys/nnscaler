@@ -26,7 +26,7 @@ def transform_policy(graph: IRGraph, resource):
                 sub_nodes = graph.replicate(node, times=resource.ngpus)
             for idx, sub_node in enumerate(sub_nodes):
                 sub_node.tag = idx
-    print(graph)
+    # print(graph)
     return graph
 
 

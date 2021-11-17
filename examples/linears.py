@@ -16,8 +16,9 @@ from torch import nn
 
 import cube
 from cube.profiler import CudaTimer
-from examples.policy.hybrid_parallel import transform_policy
-from examples.policy.hybrid_parallel import schedule_policy
+from cube.profiler.timer import print_each_rank
+from examples.policy.megatron_parallel import transform_policy
+from examples.policy.megatron_parallel import schedule_policy
 
 # =================== Semantic Model Description ====================
 
@@ -58,6 +59,7 @@ def train():
     
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
+    torch.distributed.barrier()
     iter_num = 128
     for step in range(iter_num):
         if step >= 10:
@@ -68,9 +70,9 @@ def train():
         if step >= 10:
             CudaTimer().stop('e2e')
         if (step + 1) % 20 == 0:
-            print(f'iter [{step + 1}/{iter_num}]')
+            print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
-    print('e2e time (ms) per iteration: {} ms'.format(
+    print_each_rank('e2e time (ms) per iteration: {} ms'.format(
           CudaTimer().duration(iter_num-10, field_name='e2e')))
 
 

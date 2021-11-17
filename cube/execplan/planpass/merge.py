@@ -5,7 +5,6 @@ from cube.execplan.planpass.planpass import PlanPass
 from cube.graph.operator.operator import IRBpOperation
 from cube.ir.cten import IRCell
 from cube.schedule.su import SUType, ScheduleUnit
-from cube.schedule.sugraph import SUGraph
 
 
 class MergeComputeSU(PlanPass):

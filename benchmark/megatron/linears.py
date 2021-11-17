@@ -89,6 +89,8 @@ def train(args):
 
     def train_iter(model, dataloader):
         data = next(dataloader)
+        # torch.distributed.broadcast(data, 0)
+        # torch.cuda.synchronize()
         loss = model(data)
         loss.backward()
 
