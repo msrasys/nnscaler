@@ -1,7 +1,7 @@
 import torch
 import enum
 import re
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
 
 from cube.graph import IRFwOperation
 from cube.graph.tensor import IRFullTensor
@@ -107,7 +107,7 @@ class ScriptModuleParser:
         if node_type == ScriptNodeKind.PrimListUnpack:
             return ScriptModuleParser.parse_prim_listunpack_node(node, module, frame)
         if node_type == ScriptNodeKind.PrimTupleUnpack:
-            return ScriptModuleParser.parse_prim_tupleunpack_node(node, module, frame)
+            return list() # tuple unpack should only be used in prim function node
         raise NotImplementedError(f"Un-supported node type {node_type}")
 
     @staticmethod
@@ -119,6 +119,20 @@ class ScriptModuleParser:
         """
         inputs = [input for input in node.inputs()]
         outputs = [output for output in node.outputs()]
+
+        outputs: List[Union[torch._C.Value, IRFullTensor]] = list()
+        for output in node.outputs():
+            # unpack the output type
+            if isinstance(output.type(), torch._C.TupleType):
+                for unpack_node in module.graph.nodes():
+                    if ScriptModuleParser.ntype(unpack_node) == ScriptNodeKind.PrimTupleUnpack:
+                        if output in unpack_node.inputs():
+                            ScriptModuleParser.parse_prim_tupleunpack_node(unpack_node, module, frame)
+                            break
+                tuple_outputs = frame.get_var(output.debugName())
+                outputs += tuple_outputs
+            else:
+                outputs.append(output)
 
         # handle function node
         fnode = node.inputsAt(0).node()
@@ -141,7 +155,10 @@ class ScriptModuleParser:
 
         # handle outputs
         for index, output in enumerate(outputs):
-            frame.add_var(output.debugName(), ir_node.outputs(index))
+            if isinstance(output, IRFullTensor):
+                ir_node.set_output(index, output)
+            else:
+                frame.add_var(output.debugName(), ir_node.outputs(index))
 
         return [ir_node]
 
@@ -316,7 +333,28 @@ class ScriptModuleParser:
 
     @staticmethod
     def parse_prim_tupleunpack_node(node, module, frame) -> List[None]:
-        raise NotImplementedError
+        """
+        Parse script module node like:
+            %q.1 : Tensor, %k.1 : Tensor, %v.1 : Tensor = prim::TupleUnpack(%11)
+        """
+        inputs = [input for input in node.inputs()]
+        outputs = [output for output in node.outputs()]
+        if len(inputs) != 1:
+            raise RuntimeError("Find UnpackTuple has more than one input")
+        if len(outputs) == 1:
+            raise RuntimeError("Find UnpackTuple has only one output")
+        tuple_outs = list()
+        for output in outputs:
+            dtype = output.type().str()
+            var_name = output.debugName()
+            if dtype == 'Tensor':
+                ir_tensor = IRFullTensor(name=var_name)
+                tuple_outs.append(ir_tensor)
+                frame.add_var(var_name, ir_tensor)
+            else:
+                raise NotImplementedError
+        frame.add_var(inputs[0].debugName(), tuple_outs)
+        return list()
 
     @staticmethod
     def flatten(smodule, depth=0):
