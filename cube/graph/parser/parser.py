@@ -16,6 +16,8 @@ class ScriptNodeKind(enum.Enum):
     PrimConstant = 4
     AtenOp = 5            # -> the parser may end here
     PrimIf = 6            # dynamic
+    PrimListUnpack = 7
+    PrimTupleUnpack = 8
 
 
 class ScriptModuleParser:
@@ -80,6 +82,10 @@ class ScriptModuleParser:
             return ScriptNodeKind.AtenOp
         if node.kind() == 'prim::If':
             return ScriptNodeKind.PrimIf
+        if node.kind() == 'prim::ListUnpack':
+            return ScriptNodeKind.PrimListUnpack
+        if node.kind() == 'prim::TupleUnpack':
+            return ScriptNodeKind.PrimTupleUnpack
         raise RuntimeError(f"Unkown node kind {node.kind()} from torchscript module")
 
     @staticmethod
@@ -98,6 +104,11 @@ class ScriptModuleParser:
             return ScriptModuleParser.parse_prim_attr_node(node, module, frame)
         if node_type == ScriptNodeKind.PrimConstant:
             return ScriptModuleParser.parse_prim_constant_node(node, module, frame)
+        if node_type == ScriptNodeKind.PrimListUnpack:
+            return ScriptModuleParser.parse_prim_listunpack_node(node, module, frame)
+        if node_type == ScriptNodeKind.PrimTupleUnpack:
+            return ScriptModuleParser.parse_prim_tupleunpack_node(node, module, frame)
+        raise NotImplementedError(f"Un-supported node type {node_type}")
 
     @staticmethod
     def parse_prim_function_node(node, module, frame: Frame) -> List[IRFwOperation]:
@@ -168,7 +179,7 @@ class ScriptModuleParser:
             print(f"Warning: some non-tensor arguments are ommited in {fsig}")
 
         # create IR node
-        ir_node = Sign2Op.map(fsig)(inputs=input_val, n_output=len(outputs))
+        ir_node = Sign2Op.map(fsig)(inputs=input_val, n_outputs=len(outputs))
         if len(ir_node.outputs()) != len(outputs):
             raise RuntimeError(
                 f"Parse fail: {fsig} has {len(outputs)} outputs != pre-defined {len(ir_node.outputs())}"
@@ -298,6 +309,14 @@ class ScriptModuleParser:
                     -> (%output2.1)
         """
         raise NotImplementedError("Dynamic Graph is not supported yet")
+
+    @staticmethod
+    def parse_prim_listunpack_node(node, module, frame: Frame) -> List[None]:
+        raise NotImplementedError
+
+    @staticmethod
+    def parse_prim_tupleunpack_node(node, module, frame) -> List[None]:
+        raise NotImplementedError
 
     @staticmethod
     def flatten(smodule, depth=0):

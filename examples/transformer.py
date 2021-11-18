@@ -38,15 +38,14 @@ class MultiHeadSelfAttention(nn.Module):
         # [L, N, (num_heads * dim_head)] -> [L, (N * num_heads), dim_head]
         q = q.contiguous()
         q = q.view(self.seq_len, (bs * self.num_heads), self.dim_head)
-        # [L, N, (num_heads * dim_head)] -> [(N * num_heads), L, dim_head]
-        q = q.transpose(0, 1)
-    
         k = k.contiguous()
         k = k.view(self.seq_len, (bs * self.num_heads), self.dim_head)
-        k = k.transpose(0, 1)
-
         v = v.contiguous()
         v = v.view(self.seq_len, (bs * self.num_heads), self.dim_head)
+
+        # [L, N, (num_heads * dim_head)] -> [(N * num_heads), L, dim_head]
+        q = q.transpose(0, 1)
+        k = k.transpose(0, 1)
         v = v.transpose(0, 1)
 
         # [(N * num_heads), L, dim_head] -> [(N * num_heads), L, dim_head]
@@ -208,7 +207,7 @@ if __name__ == '__main__':
     E = 1024
     n_heads = 8
 
-    # test_attention()
+    test_attention()
     
     model = TransformerLayer(L, E, n_heads, 0.5).cuda()
     reset_parameter(model)
@@ -217,7 +216,7 @@ if __name__ == '__main__':
     mask = get_attn_mask(N, L).cuda()
 
     out = model(x, mask)
-    print(out)
+    # print(out)
     # print(out_ref)
     # assert torch.allclose(out, out_ref) is True
     print('Test passed')
