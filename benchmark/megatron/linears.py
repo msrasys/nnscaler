@@ -19,6 +19,7 @@ from benchmark.megatron.layers import ColumnParallelLinear, RowParallelLinear
 
 import cube
 from cube.profiler import CudaTimer
+from cube.profiler.timer import print_each_rank
 
 
 class ColumnMLP(nn.Module):
@@ -94,21 +95,22 @@ def train(args):
         loss = model(data)
         loss.backward()
 
+    CudaTimer().warmup(seconds=1.0)
     torch.distributed.barrier()
     iter_num = 128
     for step in range(iter_num):
-        if step >= 10:
+        if step >= 40:
             CudaTimer().start('e2e')
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
-        if step >= 10:
+        if step >= 40:
             CudaTimer().stop('e2e')
         if (step + 1) % 20 == 0:
-            print(f'iter [{step + 1}/{iter_num}]')
+            print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
     
-    print('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-10, field_name='e2e')))
+    print_each_rank('e2e time (ms) per iteration: {} ms'.format(
+          CudaTimer().duration(iter_num-40, field_name='e2e')))
 
 
 if __name__ == '__main__':

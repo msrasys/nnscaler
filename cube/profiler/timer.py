@@ -94,3 +94,20 @@ class CudaTimer:
         msg = ' | '.join(msg)
 
         print_each_rank(msg)
+
+    def warmup(self, seconds=1.0):
+        """
+        Warm up GPU for `span` seconds.
+        """
+        print('> warming up for 1 second')
+        data1 = torch.randn((4096, 4096), device=torch.cuda.current_device())
+        data2 = torch.randn((4096, 4096), device=torch.cuda.current_device())
+        # warm up 1s
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        start = time.time()
+        while time.time() - start < seconds:
+            out = torch.matmul(data1, data2)
+            # if torch.distributed.is_initialized():
+            #     torch.distributed.all_reduce(out)
+            torch.cuda.synchronize()
