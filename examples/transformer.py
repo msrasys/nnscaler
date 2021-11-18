@@ -27,12 +27,6 @@ class MultiHeadSelfAttention(nn.Module):
         ))
         self.dropout = nn.Dropout(dropout)
 
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        torch.nn.init.xavier_uniform_(self.weight_qkv)
-        torch.nn.init.xavier_uniform_(self.weight_out)
-
     def forward(self, x, mask):
         """
         x: [L, N, E]: seq_len, batch_size, embedding dimension
@@ -41,8 +35,9 @@ class MultiHeadSelfAttention(nn.Module):
         bs = x.shape[1]
 
         # [L, N, E] -> [L, N, (num_heads * dim_head * 3)]
-        qkv = F.linear(x, self.weight_qkv, None).chunk(3, dim=-1)
+        qkv = F.linear(x, self.weight_qkv, None)
         # [L, N, E] -> [L, N, (num_heads * dim_head)] x 3
+        qkv = qkv.chunk(3, dim=-1)
         q, k, v = qkv
 
         # [L, N, (num_heads * dim_head)] -> [L, (N * num_heads), dim_head]
