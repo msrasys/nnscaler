@@ -1,11 +1,6 @@
-from typing import Optional
 import torch
 from torch import nn
 import torch.nn.functional as F
-
-
-def max_neg_value(t):
-    return -torch.finfo(t.dtype).max
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -63,7 +58,8 @@ class MultiHeadSelfAttention(nn.Module):
         # [(N * num_heads), L, L] -> [N, num_heads, L, L]
         attn = attn.view(bs, self.num_heads, self.seq_len, self.seq_len)
         # [N, num_heads, L, L] -> [N, num_heads, L, L]
-        attn = attn.masked_fill_(mask, -10000.0)
+        # attn += mask  # pytorch official implementation
+        attn = attn.masked_fill_(mask, -100000.0)
         # [N, num_heads, L, L] -> [(N * num_heads), L, L]
         attn = attn.view((bs * self.num_heads), self.seq_len, self.seq_len)
 
@@ -84,10 +80,20 @@ class MultiHeadSelfAttention(nn.Module):
         output = F.linear(output, self.weight_out)
         return output
 
-    def _ref_forward(self, x, mask: Optional[torch.Tensor] = None):
+    def _ref_forward(self, x, mask=True):
         """
         X: [L, N, E]: seq_len, batch_size, embedding dimension
+        mask: whether to use mask
         """
+        if mask is not None:
+            ones = torch.ones(
+                (self.seq_len, self.seq_len),
+                device=torch.cuda.current_device()
+            )
+            mask = torch.tril(ones)
+            mask = (mask < 0.5)
+        else:
+            mask = None
         output, _ = F.multi_head_attention_forward(
             query=x,
             key=x,
@@ -102,8 +108,9 @@ class MultiHeadSelfAttention(nn.Module):
             dropout_p=self.dropout.p,
             out_proj_weight=self.weight_out,
             out_proj_bias=None,
+            attn_mask=mask,
             training=self.training,
-            need_weights=False
+            need_weights=False,
         )
         return output
 
@@ -174,6 +181,26 @@ def reset_parameter(model):
     for param in model.parameters():
         torch.nn.init.uniform_(param)
 
+
+def test_attention():
+    L = 64
+    N = 16
+    E = 128
+    n_heads = 8
+
+    model = MultiHeadSelfAttention(L, E, n_heads, dropout=0.0).cuda()
+    reset_parameter(model)
+
+    x = torch.rand((L, N, E)).cuda()
+    mask = get_attn_mask(N, L).cuda()
+    
+    out = model(x, mask)
+    out_ref = model._ref_forward(x, mask)
+
+    assert torch.allclose(out, out_ref) is True
+    print('test passed')
+
+
 if __name__ == '__main__':
 
     L = 64
@@ -181,6 +208,8 @@ if __name__ == '__main__':
     E = 1024
     n_heads = 8
 
+    # test_attention()
+    
     model = TransformerLayer(L, E, n_heads, 0.5).cuda()
     reset_parameter(model)
 
