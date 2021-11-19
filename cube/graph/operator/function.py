@@ -235,6 +235,7 @@ class Softmax(IRFwOperation):
             nele for idx, nele in enumerate(self.inputs(0).shape) if idx != dim
         ]
         self._outputs[0].shape = shape
+        return True
 
 
 class Transpose(IRFwOperation):
