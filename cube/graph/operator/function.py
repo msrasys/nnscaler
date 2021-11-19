@@ -270,6 +270,7 @@ class Transpose(IRFwOperation):
         self._outputs[0].shape = shape
         return True
 
+# ===================== Cube Complex Operation =======================
 
 class CubeComplexToQKV(IRFwOperation):
     """
@@ -313,6 +314,34 @@ class CubeComplexTrilMask(IRFwOperation):
         if self.inputs(0).shape is None:
             return False
         shape = copy.copy(self.inputs(0).shape)
+        self._outputs[0].shape = shape
+        return True
+
+
+class CubeComplexAttnView(IRFwOperation):
+    """
+    Funtion to attention view
+    """
+    def __init__(self, signature, inputs, name='attn_view', **kwargs):
+        if len(inputs) != 2:
+            raise TypeError("Expected 2 input")
+        tensor, num_head = inputs[0], inputs[1]
+        super().__init__(
+            name, signature,
+            input_length=2,
+            output_length=1
+        )
+        self.set_input(0, tensor)
+        self.set_input(1, num_head)
+
+    def infer_shape(self):
+        if self.inputs(0).shape is None:
+            return False
+        num_heads = self.inputs(1)
+        bs = self.inputs(0).shape[0] // num_heads
+        seqlen = self.inputs(0).shape[1]
+        dim_head = self.inputs(0).shape[2]
+        shape = [seqlen, bs, num_heads * dim_head]
         self._outputs[0].shape = shape
         return True
 

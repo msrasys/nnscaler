@@ -9,6 +9,9 @@ from cube.graph.parser.frame import Frame
 from cube.graph.parser.mapping import Sign2Op
 
 
+_refmodule = torch.nn.Module()
+
+
 class ScriptNodeKind(enum.Enum):
     PrimGetAttr = 1
     PrimCallMethod = 2
@@ -18,6 +21,7 @@ class ScriptNodeKind(enum.Enum):
     PrimIf = 6            # dynamic
     PrimListUnpack = 7
     PrimTupleUnpack = 8
+    PrimPythonOp = 9
 
 
 class ScriptModuleParser:
@@ -58,7 +62,9 @@ class ScriptModuleParser:
             # _ = input('>>>')
             if len(ir_nodes) != 0:
                 for ir_node in ir_nodes:
-                    ir_node.infer_shape()
+                    ret = ir_node.infer_shape()
+                    if not ret:
+                        print(f'warning: {ir_node} cannot infer shape')
                 all_ir_nodes += ir_nodes
         
         # handle graph output -- Assuming all the output are tensors
@@ -86,6 +92,8 @@ class ScriptModuleParser:
             return ScriptNodeKind.PrimListUnpack
         if node.kind() == 'prim::TupleUnpack':
             return ScriptNodeKind.PrimTupleUnpack
+        if node.kind() == 'prim::PythonOp':
+            return ScriptNodeKind.PrimPythonOp
         raise RuntimeError(f"Unkown node kind {node.kind()} from torchscript module")
 
     @staticmethod
@@ -108,6 +116,8 @@ class ScriptModuleParser:
             return ScriptModuleParser.parse_prim_listunpack_node(node, module, frame)
         if node_type == ScriptNodeKind.PrimTupleUnpack:
             return list() # tuple unpack should only be used in prim function node
+        if node_type == ScriptNodeKind.PrimPythonOp:
+            return ScriptModuleParser.parse_prim_python_op_node(node, module, frame)
         raise NotImplementedError(f"Un-supported node type {node_type}")
 
     @staticmethod
@@ -140,7 +150,7 @@ class ScriptModuleParser:
             raise RuntimeError(f"Found unexpected function call node: {fnode}")
         fsig = frame.get_var(inputs[0].debugName())
 
-        # handle inputs -- in stack with reverse order
+        # handle inputs
         input_vals = list()
         for index, input in enumerate(inputs[1:]):
             var_name = input.debugName()
@@ -174,26 +184,11 @@ class ScriptModuleParser:
         outputs = [output for output in node.outputs()]
 
         # handle inputs:
-        # TODO: fix omitted kwargs
-        # We will omit arg index >= 2 as we assume the 
-        # tensor op at most gets 2 tensor, others are kwargs
         input_val = list()
-        maybe_kwarg = len(inputs) > 2
-        for reverse_index, input in enumerate(inputs[::-1]):
+        for input in inputs:
             var_name = input.debugName()
             val = frame.get_var(var_name)
-            index = len(inputs) - 1 - reverse_index
-            if maybe_kwarg and (not isinstance(val, IRFullTensor)) and index > 1:
-                continue
-            else:
-                input_val.append(val)
-                maybe_kwarg = False
-        input_val = input_val[::-1]
-        # handle single operand e.g., torch.sum
-        if input_val[1] is None:
-            input_val = input_val[:1] + input_val[2:]
-        if len(input_val) < len(inputs):
-            print(f"Warning: some non-tensor arguments are ommited in {fsig}")
+            input_val.append(val)
 
         # create IR node
         ir_node = Sign2Op.map(fsig)(inputs=input_val, n_outputs=len(outputs))
@@ -265,6 +260,7 @@ class ScriptModuleParser:
         Returns:
             Empty list
         """
+        global _refmodule
         if node.inputsAt(0).debugName() != 'self':
             raise RuntimeError(f"Fail to parse {node} due to missing %self")
 
@@ -279,7 +275,12 @@ class ScriptModuleParser:
             frame.add_var(var_name, ir_tensor)
         # symbolic attributes
         elif dtype in ['bool', 'int', 'float']:
-            frame.add_var(var_name, 'self.' + label)
+            if hasattr(_refmodule, label):
+                val = 'self.' + label
+            else:
+                val = getattr(module, label)
+            # print(f'get: var_name {var_name}: {val}')
+            frame.add_var(var_name, val)
         # NoneType
         elif dtype == 'NoneType':
             frame.add_var(var_name, None)
@@ -355,6 +356,11 @@ class ScriptModuleParser:
                 raise NotImplementedError
         frame.add_var(inputs[0].debugName(), tuple_outs)
         return list()
+
+    @staticmethod
+    def parse_prim_python_op_node(node, module, frame):
+        raise NotImplementedError("Cannot support torch.jit.ignore")
+        print(dir(node))
 
     @staticmethod
     def flatten(smodule, depth=0):

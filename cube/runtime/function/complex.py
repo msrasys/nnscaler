@@ -49,3 +49,21 @@ def tril_mask(input: torch.Tensor, num_heads: int):
     masked_input = input.masked_fill_(mask, -100000.0)
     masked_input = masked_input.view((bs * num_heads), seqlen, seqlen)
     return masked_input
+
+
+def attn_view(input: torch.Tensor, num_heads: int):
+    """
+    Inputs:
+        [N * num_heads, L, dim_head]
+
+    Outputs:
+        [L, N, num_heads * dim_head]
+    """
+    bs: int = input.shape[0] // num_heads
+    seqlen: int = input.shape[1]
+    dim_head = input.shape[2]
+    # [(N * num_heads), L, dim_head] -> [L, (N * num_heads), dim_head]
+    input = input.transpose(0, 1).contiguous()
+    # [L, (N * num_heads), dim_head] -> [L, N, (num_heads * dim_head)]
+    input = input.view(seqlen, bs, num_heads * dim_head)
+    return input

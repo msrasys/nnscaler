@@ -28,17 +28,40 @@ class Sign2Op:
     # tensor template
     __ttemplate = lambda name: f'torch.{name}'
 
+    # customized
+    __customize = lambda name: f'cube.runtime.function.complex.{name}'
+
     kOpMap = {
 
+        # torch nn functional
+
         __ftemplate('linear') : function.Linear,
+
+        __ftemplate('softmax') : function.Softmax,
 
         __ftemplate('dropout') : partial(function.ElementWiseActivation, name='dropout'),
 
         __ftemplate('gelu') : partial(function.ElementWiseActivation, name='gelu'),
 
-        __ttemplate('add') : partial(function.ElementWise, name='add'),
+        # torch aten
 
-        __ttemplate('sum') : partial(function.Reduce, name='sum'),
+        __ttemplate('add') : partial(function.Add, name='add'),
+
+        __ttemplate('mul') : partial(function.ElementWise, name='mul'),
+
+        __ttemplate('bmm') : function.BatchLinear,
+
+        __ttemplate('sum') : partial(function.Sum, name='sum'),
+
+        __ttemplate('transpose') : function.Transpose,
+
+        # complex
+
+        __customize('toqkv'): partial(function.CubeComplexToQKV, name='toqkv'),
+
+        __customize('tril_mask'): function.CubeComplexTrilMask,
+
+        __customize('attn_view'): function.CubeComplexAttnView,
 
     }
 
