@@ -1,3 +1,4 @@
+import torch
 from torch import nn
 
 import cube.graph.parser as parser
@@ -58,3 +59,4 @@ def test_parse_module():
     assert node5.successors() == [node6]
 
     assert graph.outputs(0).shape == [1024, 1000]
+    assert False

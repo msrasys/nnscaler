@@ -277,20 +277,31 @@ class CubeComplexToQKV(IRFwOperation):
     function to QKV
     """
     def __init__(self, signature, inputs, name='toqkv', **kwargs):
+        if len(inputs) != 5:
+            raise TypeError(f"Expected 5 arguments but goit {inputs}")
+        qkv = inputs[0]
         super().__init__(
             name, signature,
-            input_length=len(inputs),
+            input_length=1,
             output_length=3
         )
-        for idx, input in enumerate(inputs):
-            self.set_input(idx, input)
+        self.set_input(0, qkv)
+        self.kwargs['bs'] = inputs[1]
+        self.kwargs['seqlen'] = inputs[2]
+        self.kwargs['num_heads'] = inputs[3]
+        self.kwargs['dim_head'] = inputs[4]
 
     def infer_shape(self):
         if self.inputs(0).shape is None:
             return False
-        shape = self.inputs(0).shape
+        bs = self.kwargs['bs']
+        seqlen = self.kwargs['seqlen']
+        num_heads = self.kwargs['num_heads']
+        dim_head = self.kwargs['dim_head']
+
+        shape = [seqlen, bs * num_heads, dim_head]
         for output in self.outputs():
-            output.shape = shape
+            output.shape = copy.copy(shape)
         return True
 
 

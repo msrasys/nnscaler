@@ -1,19 +1,16 @@
 import torch
-import torch.nn.functional as F
 
 
-def toqkv(input: torch.Tensor, weight: torch.nn.Parameter,
+def toqkv(qkv: torch.Tensor,
           bs: int, seqlen: int, num_heads: int, dim_head: int):
     """
-    input: [L, N, E] (seqlen, batch size, embed dim (hidden size))
-    weight: [E, E * 3]
+    input: [L, N, E * 3] (seqlen, batch size, num_heads * dim_head * 3))
 
     Returns:
-        Q: [L, N, E]
-        K: [L, N, E]
-        V: [L, N, E]
+        Q: [L, N * num_heads, dim_head]
+        K: [L, N * num_heads, dim_head]
+        V: [L, N * num_heads, dim_head]
     """
-    qkv = F.linear(input, weight, None)
     qkv = qkv.chunk(3, dim=-1)
     q, k, v = qkv
     q = q.contiguous()
