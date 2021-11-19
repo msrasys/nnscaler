@@ -258,14 +258,14 @@ class Transpose(IRFwOperation):
             output_length=1
         )
         self.set_input(0, inputs[0])
-        self.kwargs['dim1'] = inputs[1]
-        self.kwargs['dim2'] = inputs[2]
+        self.kwargs['dim0'] = inputs[1]
+        self.kwargs['dim1'] = inputs[2]
 
     def infer_shape(self):
         if self.inputs(0).shape is None:
             return False
-        dim1 = self.kwargs['dim1']
-        dim2 = self.kwargs['dim2']
+        dim1 = self.kwargs['dim0']
+        dim2 = self.kwargs['dim1']
         shape = copy.copy(list(self.inputs(0).shape))
         shape[dim1], shape[dim2] = shape[dim2], shape[dim1]
         self._outputs[0].shape = shape
