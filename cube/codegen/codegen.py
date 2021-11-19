@@ -215,6 +215,11 @@ class ModelCodeGen(CodeGen):
         """
         op_code = node.signature
         arg_names = self._forward_region_arg_names(node.inputs())
+        kwargs = list()
+        for key in node.kwargs:
+            code = f'{key}={node.kwargs[key]}'
+            kwargs.append(code)
+        arg_names += kwargs
         arg_region = '(' + ', '.join(arg_names) + ')'
         if len(node.outputs()) == 0:
             code = f'{op_code}{arg_region}'
