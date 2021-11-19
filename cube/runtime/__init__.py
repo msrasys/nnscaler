@@ -4,3 +4,4 @@ from cube.runtime import reducer
 from cube.runtime import syndata
 from cube.runtime import resource
 from cube.runtime import module
+from cube.runtime import function

@@ -25,6 +25,8 @@ class IRFwOperation(IRCell):
             input_length (int): the number of inputs for the op
             output_length (int): the number of outputs for the op
         """
+        # additional argument
+        self.kwargs = dict()
         super().__init__(name, signature, input_length, output_length)
         outputs = [IRFullTensor() for _ in range(output_length)]
         for idx, output in enumerate(outputs):
@@ -76,8 +78,13 @@ class IRFwOperation(IRCell):
                     anno = 'w'
                 if tensor.is_grad():
                     anno = 'g'
-                # inputs.append(f'{anno}{tensor._id}')
-                inputs.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.val_map})')
+                if isinstance(tensor, IRFullTensor):
+                    pid = tensor._id
+                    valmap = (0,1)
+                else:
+                    pid = tensor.parent._id
+                    valmap = tensor.val_map
+                inputs.append(f'{anno}{tensor._id}(p{pid},{tensor.shape},{valmap})')
             else:
                 inputs.append(tensor)
         
@@ -89,8 +96,14 @@ class IRFwOperation(IRCell):
                     anno = 'w'
                 if tensor.is_grad():
                     anno = 'g'
-                # outputs.append(f'{anno}{tensor._id}')
-                outputs.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.val_map})')
+                if isinstance(tensor, IRFullTensor):
+                    pid = tensor._id
+                    valmap = (0,1)
+                else:
+                    pid = tensor.parent._id
+                    valmap = tensor.val_map
+                pid = tensor.parent._id if hasattr(tensor, 'parent') else tensor._id
+                outputs.append(f'{anno}{tensor._id}(p{pid},{tensor.shape},{valmap})')
             else:
                 outputs.append(tensor)
 
