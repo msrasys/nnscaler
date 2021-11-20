@@ -34,12 +34,10 @@ class Linear(IRFwOperation):
 class BatchLinear(IRFwOperation):
     """
     Inputs:
-
         input1: [B, N, M]
         input2: [B, M, P]
 
     Outputs:
-
         output: [B, N, P]
     """
 

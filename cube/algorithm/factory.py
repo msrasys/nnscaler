@@ -83,3 +83,9 @@ class DistAlgorithmFactory:
         self.register(complex.CubeComplexAttnView, complex.CubeAttnViewDataParallel, tag='data')
         self.register(complex.CubeComplexAttnView, complex.CubeAttnViewHeadParallel, tag='head')
     
+        import cube.algorithm.ops.bmm as bmm
+        self.register(bmm.BatchLinear, bmm.BatchLinearDataParallel, tag='data')
+        self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='n')
+        self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='m')
+        self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='p')
+    

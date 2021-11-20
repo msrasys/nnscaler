@@ -21,9 +21,9 @@ class LinearDataParallel(GenericDistAlgo):
     def satisfy(self, config: Dict):
         chunk_num = int(config['chunk_num'])
         input_shape = self.input_shapes[0]
-        if chunk_num > 0 and input_shape[0] % chunk_num != 0:
-            return False
-        return True
+        if chunk_num > 0 and input_shape[0] % chunk_num == 0:
+            return True
+        return False
 
     def instantiate(self, node, config: Dict):
         if not self.satisfy(config):
