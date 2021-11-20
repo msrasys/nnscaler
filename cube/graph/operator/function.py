@@ -84,7 +84,7 @@ class ElementWise(IRFwOperation):
             raise TypeError(f"Expected 2 inputs but got {inputs}")
         super().__init__(
             name, signature,
-            input_length=len(inputs),
+            input_length=2,
             output_length=1
         )
         for idx, input in enumerate(inputs):
