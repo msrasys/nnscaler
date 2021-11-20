@@ -59,18 +59,24 @@ class DistAlgorithmFactory:
 
     def _load_predefined_algos(self):
 
-        import cube.algorithm.dataloader as dataloader
+        import cube.algorithm.ops.dataloader as dataloader
         self.register(dataloader.IRDataOperation, dataloader.DPDataLoader, tag='data')
 
-        import cube.algorithm.linear as linear
+        import cube.algorithm.ops.linear as linear
         self.register(linear.Linear, linear.LinearDataParallel, tag='data')
         self.register(linear.Linear, linear.LinearColumnWeight, tag='column')
         self.register(linear.Linear, linear.LinearRowWeight, tag='row')
 
-        import cube.algorithm.elementwise as elew
+        import cube.algorithm.ops.bmm as bmm
+        self.register(bmm.BatchLinear, bmm.BatchLinearDataParallel, tag='data')
+        self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='n')
+        self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='m')
+        self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='p')
+
+        import cube.algorithm.ops.elementwise as elew
         self.register(elew.ElementWise, elew.ElementWiseDataParallel, tag='data')
 
-        import cube.algorithm.reduce as reduce
+        import cube.algorithm.ops.reduce as reduce
         self.register(reduce.Reduce, reduce.ReduceDataParallel, tag='data')
 
         import cube.algorithm.ops.complex as complex
@@ -82,10 +88,3 @@ class DistAlgorithmFactory:
     
         self.register(complex.CubeComplexAttnView, complex.CubeAttnViewDataParallel, tag='data')
         self.register(complex.CubeComplexAttnView, complex.CubeAttnViewHeadParallel, tag='head')
-    
-        import cube.algorithm.ops.bmm as bmm
-        self.register(bmm.BatchLinear, bmm.BatchLinearDataParallel, tag='data')
-        self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='n')
-        self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='m')
-        self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='p')
-    
