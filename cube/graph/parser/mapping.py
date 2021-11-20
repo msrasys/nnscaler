@@ -39,19 +39,19 @@ class Sign2Op:
 
         __ftemplate('softmax') : function.Softmax,
 
-        __ftemplate('dropout') : partial(function.ElementWiseActivation, name='dropout'),
+        __ftemplate('dropout') : function.Dropout,
 
-        __ftemplate('gelu') : partial(function.ElementWiseActivation, name='gelu'),
+        __ftemplate('gelu') : partial(function.Activation, name='gelu'),
 
         # torch aten
 
-        __ttemplate('add') : partial(function.Add, name='add'),
+        __ttemplate('add') : function.Add,
 
         __ttemplate('mul') : partial(function.ElementWise, name='mul'),
 
         __ttemplate('bmm') : function.BatchLinear,
 
-        __ttemplate('sum') : partial(function.Sum, name='sum'),
+        __ttemplate('sum') : function.Sum,
 
         __ttemplate('transpose') : function.Transpose,
 
