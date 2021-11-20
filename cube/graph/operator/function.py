@@ -66,6 +66,7 @@ class BatchLinear(IRFwOperation):
         self._outputs[0].shape = shape
         return True
 
+# ============================= Elementwise ============================
 
 class ElementWise(IRFwOperation):
     """
@@ -120,6 +121,7 @@ class Add(ElementWise):
         alpha = inputs[2]
         self.kwargs['alpha'] = alpha
 
+# ============================= Activation ============================
 
 class Activation(IRFwOperation):
     """
@@ -180,24 +182,7 @@ class Softmax(Activation):
         self.kwargs['dtype'] = dtype
         self.stay_dims.append(dim)
 
-
-class Reduce(IRFwOperation):
-    """
-    functions like sum, mean, cross_entropy
-    """
-    def __init__(self, signature, inputs, name='reduce', **kwargs):
-        super().__init__(
-            name, signature,
-            input_length=len(inputs),
-            output_length=1
-        )
-        for idx, input in enumerate(inputs):
-            self.set_input(idx, input)
-
-    def infer_shape(self):
-        self._outputs[0].shape = [1]
-        return True
-
+# ===================== Loss Computation (Reduce) =========================
 
 class Sum(IRFwOperation):
     """
@@ -226,21 +211,35 @@ class Sum(IRFwOperation):
     def infer_shape(self):
         if self.inputs(0).shape is None:
             return False
-        shape = list()
+
+        # change dim to positive value
+        ndim = len(self.inputs(0).shape)
         if 'dim' in self.kwargs:
-            dim = [self.kwargs['dim']]
-            keepdim = self.kwargs['keepdim']
-            for idx, nele in enumerate(self.inputs(0).shape):
-                if idx in dim:
-                    if not keepdim:
-                        continue
-                    nele = 1
-                shape.append(nele)
+            dim = self.kwargs['dim']
+            dim = ndim + dim if dim < 0 else dim
+            self.kwargs['dim'] = dim
+            reduce_dims = [dim]
         else:
+            reduce_dims = list(range(ndim))
+
+        if 'keepdim' in self.kwargs:
+            keepdim = self.kwargs['keepdim']
+        else:
+            keepdim = False
+
+        shape = list()
+        for dim, nele in enumerate(self.inputs(0).shape):
+            if dim in reduce_dims:
+                if keepdim:
+                    shape.append(1)
+            else:
+                shape.append(nele)
+        if len(shape) == 0:
             shape = [1]
         self._outputs[0].shape = shape
         return True
 
+# ========================= Memory Operation ==========================
 
 class Transpose(IRFwOperation):
     """

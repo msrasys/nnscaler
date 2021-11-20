@@ -83,7 +83,7 @@ class DistAlgorithmFactory:
         self.register(activation.Softmax, activation.SoftmaxDimParallel, tag ='dim')
 
         import cube.algorithm.ops.reduce as reduce
-        self.register(reduce.Reduce, reduce.ReduceDataParallel, tag='data')
+        self.register(reduce.Sum, reduce.SumDimParallel, tag='dim')
 
         import cube.algorithm.ops.complex as complex
         self.register(complex.CubeComplexToQKV, complex.CubeToQKVDataParallel, tag='data')

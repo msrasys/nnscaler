@@ -15,7 +15,7 @@ _kWaitDecision = None
 
 class ActivationDimParallel(GenericDistAlgo):
 
-    def __init__(self, node: Activation, dim=None, execlude_dims=None):
+    def __init__(self, node: Activation, dim=None):
         if not isinstance(node, Activation):
             raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
         super().__init__(node)
@@ -82,7 +82,7 @@ class ActivationDimParallel(GenericDistAlgo):
             extra_input = self.get_extra_kwargs(node)
             sub_input = list(sub_input) + extra_input
             sub_node = type(node)(node.signature, inputs=sub_input, name=node.name)
-            sub_node.stay_dims = node.stay_dims
+            sub_node.stay_dims = copy.copy(node.stay_dims)
             nodes.append(sub_node)
         for idx, sub_output in enumerate(zip(*sub_outputs)):
             sub_node = nodes[idx]
