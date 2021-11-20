@@ -33,8 +33,10 @@ class MultiHeadSelfAttention(nn.Module):
         """
         bs = self.batch_size
 
-        # # [L, N, E] -> [L, N, (num_heads * dim_head * 3)]
-        qkv = F.linear(x, self.weight_qkv, None)
+        # [L, N, (num_heads * dim_head)],
+        # [(num_heads * dim_head), 3 * (num_heads * dim_head)]
+        # -> [L, N, (num_heads * dim_head * 3)]
+        # qkv = F.linear(x, self.weight_qkv, None)
     
         # # [L, N, E] -> [L, N, (num_heads * dim_head)] x 3
         # qkv = qkv.chunk(3, dim=-1)
@@ -50,7 +52,7 @@ class MultiHeadSelfAttention(nn.Module):
 
         # [L, N, E] -> 3 x [L, (N * num_heads), dim_head]
         q, k, v = cube.runtime.function.toqkv(
-            qkv, bs, self.seq_len, self.num_heads, self.dim_head
+            x, self.weight_qkv, self.num_heads
         )
 
         # [L, (N * num_heads), dim_head] -> [(N * num_heads), L, dim_head]
