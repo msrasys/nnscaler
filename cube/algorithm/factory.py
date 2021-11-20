@@ -94,3 +94,6 @@ class DistAlgorithmFactory:
     
         self.register(complex.CubeComplexAttnView, complex.CubeAttnViewDataParallel, tag='data')
         self.register(complex.CubeComplexAttnView, complex.CubeAttnViewHeadParallel, tag='head')
+
+        import cube.algorithm.ops.memory as mem
+        self.register(mem.Transpose, mem.TransposeDimParallel, tag='dim')
