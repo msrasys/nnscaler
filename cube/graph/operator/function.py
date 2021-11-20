@@ -1,4 +1,5 @@
 import copy
+from typing import Type
 
 from cube.graph.operator import IRFwOperation
 from cube.ir.cten import IRTensor
@@ -117,35 +118,69 @@ class Add(ElementWise):
             )
         super().__init__(signature, inputs[:2], name=name)
         alpha = inputs[2]
-        if alpha != 1:
-            self.kwargs['alpha'] = alpha
+        self.kwargs['alpha'] = alpha
 
 
-class ElementWiseActivation(IRFwOperation):
+class Activation(IRFwOperation):
     """
     functions like GELU, RELU, Dropout.
 
     Exclude softmax
     """
 
-    def __init__(self, signature, inputs, name='elementwise_activation', **kwargs):
+    def __init__(self, signature, inputs, name='activation', **kwargs):
+
+        if len(inputs) != 1:
+            raise TypeError("Expected single tensor input")
 
         super().__init__(
             name, signature,
-            input_length=len(inputs),
+            input_length=1,
             output_length=1
         )
-        for idx, input in enumerate(inputs):
-            self.set_input(idx, input)
+        self.set_input(0, inputs[0])
+        # this is for partitioning indicator
+        self.stay_dims = list()
 
     def infer_shape(self):
-        for input in self.inputs():
-            if isinstance(input, IRTensor):
-                if len(input.shape) != 0:
-                    self._outputs[0].shape = copy.copy(input.shape)
-                    return True
-                return False
-        return False
+        input = self.inputs(0)
+        if input.shape is None:
+            return False
+        self._outputs[0].shape = input.shape
+        return True
+
+
+class Dropout(Activation):
+    """
+    torch.nn.functional.dropout
+    """
+    def __init__(self, signature, inputs, name='dropout', **kwargs):
+
+        if len(inputs) != 4:
+            raise TypeError(f"Expected 4 inputs but got {inputs}")
+        super().__init__(signature, [inputs[0]], name)
+        self.set_input(0, inputs[0])
+        self.kwargs['p'] = inputs[1]
+        self.kwargs['training'] = inputs[2]
+        self.kwargs['inplace'] = inputs[3]
+
+
+class Softmax(Activation):
+
+    def __init__(self, signature, inputs, name='softmax', **kwargs):
+        
+        if len(inputs) != 4:
+            raise TypeError(f"Expected 4 inputs, but got: {inputs}")
+        
+        tensor, dim, stacklevel, dtype = inputs[0], inputs[1], inputs[2], inputs[3]
+        super().__init__(
+            name, signature, input_length=1, output_length=1
+        )
+        self.set_input(0, tensor)
+        self.kwargs['dim'] = dim
+        self.kwargs['_stacklevel'] = stacklevel
+        self.kwargs['dtype'] = dtype
+        self.stay_dims.append(dim)
 
 
 class Reduce(IRFwOperation):
@@ -205,33 +240,6 @@ class Sum(IRFwOperation):
                 shape.append(nele)
         else:
             shape = [1]
-        self._outputs[0].shape = shape
-        return True
-
-
-class Softmax(IRFwOperation):
-
-    def __init__(self, signature, inputs, name='softmax', **kwargs):
-        
-        if len(inputs) != 4:
-            raise TypeError(f"Expected 4 inputs, but got: {inputs}")
-        
-        tensor, dim, stacklevel, dtype = inputs[0], inputs[1], inputs[2], inputs[3]
-        super().__init__(
-            name, signature, input_length=1, output_length=1
-        )
-        self.set_input(0, tensor)
-        self.kwargs['dim'] = dim
-        self.kwargs['_stacklevel'] = stacklevel
-        self.kwargs['dtype'] = dtype
-
-    def infer_shape(self):
-        if self.inputs(0).shape is None:
-            return False
-        dim = self.kwargs['dim']
-        shape = [
-            nele for idx, nele in enumerate(self.inputs(0).shape) if idx != dim
-        ]
         self._outputs[0].shape = shape
         return True
 

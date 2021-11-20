@@ -74,7 +74,13 @@ class DistAlgorithmFactory:
         self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='p')
 
         import cube.algorithm.ops.elementwise as elew
-        self.register(elew.ElementWise, elew.ElementWiseDataParallel, tag='data')
+        self.register(elew.ElementWise, elew.ElementWiseDimParallel, tag='dim')
+        self.register(elew.Add, elew.AddDimParallel, tag='dim')
+
+        import cube.algorithm.ops.activation as activation
+        self.register(activation.Activation, activation.ActivationDimParallel, tag='dim')
+        self.register(activation.Dropout, activation.DropoutDimParallel, tag='dim')
+        self.register(activation.Softmax, activation.SoftmaxDimParallel, tag ='dim')
 
         import cube.algorithm.ops.reduce as reduce
         self.register(reduce.Reduce, reduce.ReduceDataParallel, tag='data')
