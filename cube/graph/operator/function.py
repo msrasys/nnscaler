@@ -275,7 +275,17 @@ class Transpose(IRFwOperation):
 
 class CubeComplexToQKV(IRFwOperation):
     """
-    function to QKV
+    Inputs:
+        hidden_state: [L, N, E]
+        weight: [3 * (num_heads * dim_head), E]
+        num_heads: int
+
+    where L = sequence length, N = batch size, E = num_heads * dim_head
+
+    Returns:
+        Q: [L, N * num_heads, dim_head]
+        K: [L, N * num_heads, dim_head]
+        V: [L, N * num_heads, dim_head]
     """
     def __init__(self, signature, inputs, name='toqkv', **kwargs):
         if len(inputs) != 3:
@@ -291,12 +301,12 @@ class CubeComplexToQKV(IRFwOperation):
         self.kwargs['num_heads'] = inputs[2]
 
     def infer_shape(self):
-        if self.inputs(0).shape is None:
+        if self.inputs(0).shape is None or self.inputs(1) is None:
             return False
         seqlen = self.inputs(0).shape[0]
         bs = self.inputs(0).shape[1]
         num_heads = self.kwargs['num_heads']
-        dim_head = self.inputs(0).shape[2] // num_heads
+        dim_head = self.inputs(1).shape[0] // 3 // num_heads
 
         shape = [seqlen, bs * num_heads, dim_head]
         for output in self.outputs():
@@ -306,48 +316,56 @@ class CubeComplexToQKV(IRFwOperation):
 
 class CubeComplexTrilMask(IRFwOperation):
     """
-    Function to tril_mask
+    Inputs:
+        input: [N * num_heads, L, L]
+        num_head: int
+    
+    Returns:
+        output: [N * num_heads, L, L]
     """
     def __init__(self, signature, inputs, name='trilmask', **kwargs):
         if len(inputs) != 2:
             raise TypeError("Expected 2 input")
-        tensor, num_head = inputs[0], inputs[1]
+        tensor, num_heads = inputs[0], inputs[1]
         super().__init__(
             name, signature,
-            input_length=2,
+            input_length=1,
             output_length=1
         )
         self.set_input(0, tensor)
-        self.set_input(1, num_head)
+        self.kwargs['num_heads'] = num_heads
 
     def infer_shape(self):
         if self.inputs(0).shape is None:
             return False
-        shape = copy.copy(self.inputs(0).shape)
-        self._outputs[0].shape = shape
+        self._outputs[0].shape = self.inputs(0).shape
         return True
 
 
 class CubeComplexAttnView(IRFwOperation):
     """
-    Funtion to attention view
+    Inputs:
+        [N * num_heads, L, dim_head]
+
+    Outputs:
+        [L, N, num_heads * dim_head]
     """
     def __init__(self, signature, inputs, name='attn_view', **kwargs):
         if len(inputs) != 2:
             raise TypeError("Expected 2 input")
-        tensor, num_head = inputs[0], inputs[1]
+        tensor, num_heads = inputs[0], inputs[1]
         super().__init__(
             name, signature,
-            input_length=2,
+            input_length=1,
             output_length=1
         )
         self.set_input(0, tensor)
-        self.set_input(1, num_head)
+        self.kwargs['num_heads'] = num_heads
 
     def infer_shape(self):
         if self.inputs(0).shape is None:
             return False
-        num_heads = self.inputs(1)
+        num_heads = self.kwargs['num_heads']
         bs = self.inputs(0).shape[0] // num_heads
         seqlen = self.inputs(0).shape[1]
         dim_head = self.inputs(0).shape[2]

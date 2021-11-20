@@ -6,8 +6,11 @@ def toqkv(hidden_state: torch.Tensor, weight: torch.Tensor,
           num_heads: int):
     """
     Inputs:
-        hidden_state: [L, N, E] (seqlen, batch size, num_heads * dim_head)
-        weight: [E * 3, E]
+        hidden_state: [L, N, E]
+        weight: [3 * (num_heads * dim_head), E]
+        num_heads: int
+
+    where L = sequence length, N = batch size, E = num_heads * dim_head
 
     Returns:
         Q: [L, N * num_heads, dim_head]

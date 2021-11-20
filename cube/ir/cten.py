@@ -492,7 +492,7 @@ class IRTensor:
 
     @property
     def shape(self):
-        return self._shape
+        return copy.copy(self._shape)
 
     @shape.setter
     def shape(self, val):
@@ -501,7 +501,7 @@ class IRTensor:
         if not isinstance(val, list) or \
            not all([isinstance(size, int) for size in val]):
             raise RuntimeError("Expected shape to be list[int]")
-        self._shape = val
+        self._shape = copy.copy(list(val))
 
     @property
     def device(self) -> List[int]:

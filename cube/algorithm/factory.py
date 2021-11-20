@@ -72,3 +72,14 @@ class DistAlgorithmFactory:
 
         import cube.algorithm.reduce as reduce
         self.register(reduce.Reduce, reduce.ReduceDataParallel, tag='data')
+
+        import cube.algorithm.ops.complex as complex
+        self.register(complex.CubeComplexToQKV, complex.CubeToQKVDataParallel, tag='data')
+        self.register(complex.CubeComplexToQKV, complex.CubeToQKVHeadParallel, tag='head')
+
+        self.register(complex.CubeComplexTrilMask, complex.CubeTrilMaskDataParallel, tag='data')
+        self.register(complex.CubeComplexTrilMask, complex.CubeTrilMaskHeadParallel, tag='head')
+    
+        self.register(complex.CubeComplexAttnView, complex.CubeAttnViewDataParallel, tag='data')
+        self.register(complex.CubeComplexAttnView, complex.CubeAttnViewHeadParallel, tag='head')
+    
