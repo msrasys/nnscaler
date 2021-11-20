@@ -80,7 +80,7 @@ class ActivationDimParallel(GenericDistAlgo):
         nodes = list()
         for idx, sub_input in enumerate(zip(*sub_inputs)):
             extra_input = self.get_extra_kwargs(node)
-            sub_input += extra_input
+            sub_input = list(sub_input) + extra_input
             sub_node = type(node)(node.signature, inputs=sub_input, name=node.name)
             sub_node.stay_dims = node.stay_dims
             nodes.append(sub_node)

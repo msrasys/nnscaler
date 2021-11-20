@@ -173,9 +173,7 @@ class Softmax(Activation):
             raise TypeError(f"Expected 4 inputs, but got: {inputs}")
         
         tensor, dim, stacklevel, dtype = inputs[0], inputs[1], inputs[2], inputs[3]
-        super().__init__(
-            name, signature, input_length=1, output_length=1
-        )
+        super().__init__(signature, inputs=[inputs[0]], name=name)
         self.set_input(0, tensor)
         self.kwargs['dim'] = dim
         self.kwargs['_stacklevel'] = stacklevel
