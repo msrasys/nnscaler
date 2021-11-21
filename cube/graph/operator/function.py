@@ -1,12 +1,18 @@
 import copy
-from typing import Type
 
 from cube.graph.operator import IRFwOperation
-from cube.ir.cten import IRTensor
 
 
 class Linear(IRFwOperation):
-
+    """
+    Input:
+        input: [N, *, in_features]
+        weight: [out_features, in_features]
+        bias: [out_features,]
+    
+    Output:
+        [N, *, in_features]
+    """
     def __init__(self, signature, inputs, name='linear', **kwargs):
 
         input, weight, bias = inputs

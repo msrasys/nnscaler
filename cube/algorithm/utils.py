@@ -3,7 +3,11 @@ from cube.ir.cten import IRTensor
 
 
 def split_axis(tensor: IRTensor, axis: int, chunk_num: int):
-
+    """
+    Split tensor along an axis. The axis can be positive or negative.
+    """
+    if axis < 0:
+        axis = len(tensor.shape) + axis
     if axis >= len(tensor.shape):
         raise RuntimeError(f"Axis should within dims ({axis} >= {len(tensor.shape)})")
     
