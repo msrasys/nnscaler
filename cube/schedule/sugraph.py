@@ -59,7 +59,9 @@ class SUGraph(IRCell):
             src = sus[src_idx]
             for dst in sus[src_idx+1:]:
                 # inter-adapter has no dependency
-                if src.stype in adapters and dst.stype in adapters:
+                if src.stype in adapters and \
+                   dst.stype in adapters and \
+                   src.stype == dst.stype:
                     continue
                 for out_idx, out_tensor in enumerate(src.outputs()):
                     # special dependency for communication adapter
