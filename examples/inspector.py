@@ -19,7 +19,8 @@ from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 
 
-kDataShapes = ([128, 1024],)
+kDataShapes = ([512, 32, 3072],)
+kBatchDims  = [1]
 
 
 def load_module(filename: str):
@@ -50,7 +51,9 @@ def load_train_fn(filename: str):
 def train(args):
     global kDataShapes
     
-    dataloader = cube.runtime.syndata.SynDataLoader(1280, *kDataShapes)
+    dataloader = cube.runtime.syndata.SynDataLoader(
+        1280, kBatchDims, *kDataShapes
+    )
 
     genfile = args.genfile.format(rank=torch.distributed.get_rank())
     model = load_module(genfile)

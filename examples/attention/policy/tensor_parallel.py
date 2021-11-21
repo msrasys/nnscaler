@@ -6,7 +6,7 @@ from cube.graph.operator.operator import IRFwOperation
 
 def transform_policy(graph: IRGraph, resource):
     """
-    The transformation policy transposes linear using data parallel
+    The transformation policy transposes linear using tensor parallel
     """
     ndevs = resource.ngpus
 
@@ -103,7 +103,8 @@ def schedule_policy(sugraph: SUGraph, resource):
             sugraph.assign(su, 0)
     for su in sugraph.fsus():
         devid = su.tag[0]
-        print(f'assinging {su.nodes(0)}')
         sugraph.assign(su, devid)
         sugraph.assign(su.mirror, devid)
+    fsus = sugraph.fsus()
+    sugraph.partial_set_order(fsus, lazy=False)
     return sugraph

@@ -89,7 +89,7 @@ class MultiHeadSelfAttention(nn.Module):
 
 
 def train():
-    L = 128  # seq len
+    L = 512  # seq len
     N = 32   # batch size
     # configs: [hidden size, num_head]
     # E, num_head = [1536, 16]  # 1.2B model
