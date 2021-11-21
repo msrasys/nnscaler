@@ -81,7 +81,8 @@ class MultiHeadSelfAttention(nn.Module):
         # [(N * num_head), L, dim_head] -> [L, N, num_head * dim_head]
         output = cube.runtime.function.attn_view(output, self.num_head)
 
-        # [L, (N * num_head), dim_head] * []
+        # [L, N, num_head * dim_head] * [E, embed_head * dim_head]
+        # -> [L, N, E]
         output = F.linear(output, self.weight_out)
 
         loss = torch.sum(output)
