@@ -108,7 +108,8 @@ def schedule_policy(sugraph: SUGraph, resource):
     """
     for su in sugraph.sus():
         if su.stype == SUType.Dataloader:
-            sugraph.assign(su, 0)
+            devid = su.tag[0]
+            sugraph.assign(su, devid)
     for su in sugraph.fsus():
         devid = su.tag[0]
         sugraph.assign(su, devid)

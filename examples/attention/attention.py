@@ -17,8 +17,8 @@ import torch.nn.functional as F
 import cube
 
 
-from examples.attention.policy.tensor_parallel import transform_policy
-from examples.attention.policy.tensor_parallel import schedule_policy
+from examples.attention.policy.data_parallel import transform_policy
+from examples.attention.policy.data_parallel import schedule_policy
 
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
@@ -103,11 +103,9 @@ def train():
         seq_len=L, embed_dim=E, heads=num_head, dropout=0.5
     )
     model = cube.SemanticModel(
-        # TODO: data parallel batch dim
         model, input_shapes=([L, N, E],),
     )
-    
-    # TODO: data parallel batch dim
+
     dataloader = cube.runtime.syndata.SynDataLoader(1280, [1], [L, N, E])
 
     @cube.compile(model, dataloader, policy=(transform_policy, schedule_policy))
