@@ -93,8 +93,8 @@ class ActivationDimParallel(GenericDistAlgo):
 
 class DropoutDimParallel(ActivationDimParallel):
 
-    def __init__(self, node: Activation, dim=None, execlude_dims=None):
-        super().__init__(node, dim=dim, execlude_dims=execlude_dims)
+    def __init__(self, node: Activation, dim=None):
+        super().__init__(node, dim=dim)
 
     def get_extra_kwargs(self, node: Dropout) -> List[Any]:
         if not isinstance(node, Dropout):
@@ -105,8 +105,8 @@ class DropoutDimParallel(ActivationDimParallel):
 
 class SoftmaxDimParallel(ActivationDimParallel):
 
-    def __init__(self, node: Activation, dim=None, execlude_dims=None):
-        super().__init__(node, dim=dim, execlude_dims=execlude_dims)
+    def __init__(self, node: Activation, dim=None):
+        super().__init__(node, dim=dim)
 
     def get_extra_kwargs(self, node) -> List[Any]:
         if not isinstance(node, Softmax):
