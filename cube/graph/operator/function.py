@@ -152,6 +152,7 @@ class LayerNorm(IRFwOperation):
         if self.inputs(0).shape is None:
             return False
         self.outputs(0).shape = self.inputs(0).shape
+        return True
 
 
 # ============================= Activation ============================

@@ -43,6 +43,8 @@ class Sign2Op:
 
         __ftemplate('gelu') : partial(function.Activation, name='gelu'),
 
+        __ftemplate('layer_norm'): function.LayerNorm,
+
         # torch aten
 
         __ttemplate('add') : function.Add,
