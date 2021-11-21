@@ -1,4 +1,5 @@
 from typing import Dict
+import copy
 
 from cube.algorithm.utils import split_axis
 from cube.algorithm.generics import GenericDistAlgo
@@ -38,7 +39,8 @@ class DPDataLoader(GenericDistAlgo):
         
         nodes = list()
         for sub_outs in zip(*sub_outputs):
-            node = IRDataOperation(data_num = len(sub_outs))
+            node = IRDataOperation(
+                data_num = len(sub_outs), batch_dims = copy.copy(self.batch_dims))
             for idx, out in enumerate(sub_outs):
                 node.set_output(idx, out)
             nodes.append(node)
