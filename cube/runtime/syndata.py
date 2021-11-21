@@ -56,17 +56,32 @@ class SynDataLoader(CubeDataLoader):
         self.length = num
         self.pos = 0
 
+        self._buffer_num = None
+        self.datas: torch.Tensor = list()
+        self.set_data_buffer()
+
     def __iter__(self):
         self.pos = 0
         return self
+
+    def set_data_buffer(self, buffer_num = 4):
+        self.datas = list()
+        self._buffer_num = buffer_num
+        for _ in range(self._buffer_num):
+            datas = list()
+            for shape in self.shapes:
+                data = torch.randn(shape).cuda()
+                datas.append(data)
+            self.datas.append(datas)
+
+    def reset(self, batch_size: int):
+        super().reset(batch_size)
+        self.set_data_buffer()
 
     def __next__(self):
         self.pos += 1
         if self.pos == self.length:
             raise StopIteration
-        datas = list()
-        for shape in self.shapes:
-            data = torch.randn(shape).cuda()
-            datas.append(data)
+        datas = self.datas[self.pos % self._buffer_num]
         if len(datas) == 1: return datas[0]
         else: return tuple(datas)
