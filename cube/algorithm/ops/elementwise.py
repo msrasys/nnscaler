@@ -71,7 +71,6 @@ class ElementWiseDimParallel(GenericDistAlgo):
 
         nodes = list()
         for idx, sub_input in enumerate(zip(*sub_inputs)):
-            print(sub_input)
             sub_input = list(sub_input) + self.get_extra_kwargs(node)
             sub_node = type(node)(node.signature, inputs=sub_input, name=node.name)
             sub_node.kwargs = copy.copy(node.kwargs)

@@ -3,6 +3,7 @@ import torch
 
 import cube
 from cube.graph.graph import IRGraph
+from cube.graph.operator.operator import IRDataOperation
 from cube.schedule.pool import SchedulePool
 from cube.schedule.su import SUType
 from cube.schedule.translator import IRDataLoader
@@ -174,15 +175,19 @@ def compile(model: SemanticModel, dataloader,
                     attach=True
                 )
             # get dataloader batch size
-            data = None
+            batch_size = dict()  # {devid: batch size}
             for su in sugraph.sus():
                 if su.stype == SUType.Dataloader:
-                    data = su.outputs(0)
-                    break
-            if data is None:
-                raise RuntimeError("dataloader not found in SUGraph")
+                    data_op: IRDataOperation = su.nodes(0)
+                    batch_dim = data_op.get_batch_dims()[0]
+                    dev_batch_size = data_op.outputs(0).shape[batch_dim]
+                    batch_size[su.device[0]] = dev_batch_size
+            all_batch_size = set([batch_size[dev] for dev in batch_size])
+            if len(all_batch_size) != 1:
+                raise NotImplementedError("Heterogenous batch size it not supported")
+            batch_size = list(all_batch_size)[0]
             # assume batch_size is always first dimension
-            batch_size = torch.tensor([data.shape[0]], dtype=torch.int).cuda()
+            batch_size = torch.tensor([batch_size], dtype=torch.int).cuda()
 
         if torch.distributed.is_initialized():
             torch.distributed.barrier()

@@ -15,15 +15,15 @@ class CubeToQKVDataParallel(GenericDistAlgo):
     """
     Inputs:
         hidden_state: [L, N, E]
-        weight: [3 * (num_heads * dim_head), E]
-        num_heads: int
+        weight: [3 * (num_head * dim_head), E]
+        num_head: int
 
-    where L = sequence length, N = batch size, E = num_heads * dim_head
+    where L = sequence length, N = batch size, E = num_head * dim_head
 
     Returns:
-        Q: [L, N * num_heads, dim_head]
-        K: [L, N * num_heads, dim_head]
-        V: [L, N * num_heads, dim_head]
+        Q: [L, N * num_head, dim_head]
+        K: [L, N * num_head, dim_head]
+        V: [L, N * num_head, dim_head]
     """
     def __init__(self, node: CubeComplexToQKV):
 
@@ -31,7 +31,7 @@ class CubeToQKVDataParallel(GenericDistAlgo):
             raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
         super().__init__(node)
         self.chunk_num = _kWaitDecision
-        self.num_heads = node.kwargs['num_heads']
+        self.num_head = node.kwargs['num_head']
         self.bs = node.inputs(0).shape[1]
 
     def satisfy(self, config: Dict):
@@ -55,7 +55,7 @@ class CubeToQKVDataParallel(GenericDistAlgo):
 
         nodes = list()
         for idx in range(self.chunk_num):
-            inputs = [ins[idx], weight, self.num_heads]
+            inputs = [ins[idx], weight, self.num_head]
             node = CubeComplexToQKV(
                 signature = 'cube.runtime.function.complex.toqkv',
                 inputs = inputs,
@@ -71,14 +71,14 @@ class CubeToQKVDataParallel(GenericDistAlgo):
 class CubeToQKVHeadParallel(GenericDistAlgo):
     """
     Inputs:
-        hidden_state: [L, N, E] (seqlen, batch size, num_heads * dim_head)
+        hidden_state: [L, N, E] (seqlen, batch size, num_head * dim_head)
         weight: [E * 3, E]
-        num_heads: int
+        num_head: int
 
     Returns:
-        Q: [L, N * num_heads, dim_head]
-        K: [L, N * num_heads, dim_head]
-        V: [L, N * num_heads, dim_head]
+        Q: [L, N * num_head, dim_head]
+        K: [L, N * num_head, dim_head]
+        V: [L, N * num_head, dim_head]
     """
     def __init__(self, node: CubeComplexToQKV):
 
@@ -86,12 +86,12 @@ class CubeToQKVHeadParallel(GenericDistAlgo):
             raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
         super().__init__(node)
         self.chunk_num = _kWaitDecision
-        self.num_heads = node.kwargs['num_heads']
+        self.num_head = node.kwargs['num_head']
         self.bs = node.inputs(0).shape[1]
 
     def satisfy(self, config: Dict):
         chunk_num = int(config['chunk_num'])
-        if chunk_num > 0 and self.num_heads % chunk_num == 0:
+        if chunk_num > 0 and self.num_head % chunk_num == 0:
             return True
         return False
 
@@ -110,7 +110,7 @@ class CubeToQKVHeadParallel(GenericDistAlgo):
 
         nodes = list()
         for idx in range(self.chunk_num):
-            inputs = [hidden_state, ws[idx], self.num_heads // self.chunk_num]
+            inputs = [hidden_state, ws[idx], self.num_head // self.chunk_num]
             node = CubeComplexToQKV(
                 signature = 'cube.runtime.function.complex.toqkv',
                 inputs = inputs,
@@ -126,11 +126,11 @@ class CubeToQKVHeadParallel(GenericDistAlgo):
 class CubeTrilMaskDataParallel(GenericDistAlgo):
     """
     Inputs:
-        input: [N * num_heads, L, L]
+        input: [N * num_head, L, L]
         num_head: int
     
     Returns:
-        output: [N * num_heads, L, L]
+        output: [N * num_head, L, L]
     """
     def __init__(self, node: CubeComplexTrilMask):
 
@@ -138,8 +138,8 @@ class CubeTrilMaskDataParallel(GenericDistAlgo):
             raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
         super().__init__(node)
         self.chunk_num = _kWaitDecision
-        self.num_heads = node.kwargs['num_heads']
-        self.bs = node.inputs(0).shape[0] // self.num_heads
+        self.num_head = node.kwargs['num_head']
+        self.bs = node.inputs(0).shape[0] // self.num_head
 
     def satisfy(self, config: Dict):
         chunk_num = int(config['chunk_num'])
@@ -160,7 +160,7 @@ class CubeTrilMaskDataParallel(GenericDistAlgo):
 
         nodes = list()
         for idx in range(self.chunk_num):
-            inputs = [ins[idx], self.num_heads]
+            inputs = [ins[idx], self.num_head]
             node = CubeComplexTrilMask(
                 signature = 'cube.runtime.function.complex.tril_mask',
                 inputs = inputs,
@@ -174,11 +174,11 @@ class CubeTrilMaskDataParallel(GenericDistAlgo):
 class CubeTrilMaskHeadParallel(GenericDistAlgo):
     """
     Inputs:
-        input: [N * num_heads, L, L]
+        input: [N * num_head, L, L]
         num_head: int
     
     Returns:
-        output: [N * num_heads, L, L]
+        output: [N * num_head, L, L]
     """
     def __init__(self, node: CubeComplexTrilMask):
 
@@ -186,12 +186,12 @@ class CubeTrilMaskHeadParallel(GenericDistAlgo):
             raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
         super().__init__(node)
         self.chunk_num = _kWaitDecision
-        self.num_heads = node.kwargs['num_heads']
-        self.bs = node.inputs(0).shape[0] // self.num_heads
+        self.num_head = node.kwargs['num_head']
+        self.bs = node.inputs(0).shape[0] // self.num_head
 
     def satisfy(self, config: Dict):
         chunk_num = int(config['chunk_num'])
-        if chunk_num > 0 and self.num_heads % chunk_num == 0:
+        if chunk_num > 0 and self.num_head % chunk_num == 0:
             return True
         return False
 
@@ -208,7 +208,7 @@ class CubeTrilMaskHeadParallel(GenericDistAlgo):
 
         nodes = list()
         for idx in range(self.chunk_num):
-            inputs = [ins[idx], self.num_heads // self.chunk_num]
+            inputs = [ins[idx], self.num_head // self.chunk_num]
             node = CubeComplexTrilMask(
                 signature = 'cube.runtime.function.complex.tril_mask',
                 inputs = inputs,
@@ -222,18 +222,18 @@ class CubeTrilMaskHeadParallel(GenericDistAlgo):
 class CubeAttnViewDataParallel(GenericDistAlgo):
     """
     Inputs:
-        [N * num_heads, L, dim_head]
+        [N * num_head, L, dim_head]
 
     Outputs:
-        [L, N, num_heads * dim_head]
+        [L, N, num_head * dim_head]
     """
     def __init__(self, node: CubeComplexAttnView):
         if not isinstance(node, CubeComplexAttnView):
             raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
         super().__init__(node)
         self.chunk_num = _kWaitDecision
-        self.num_heads = node.kwargs['num_heads']
-        self.bs = node.inputs(0).shape[0] // self.num_heads
+        self.num_head = node.kwargs['num_head']
+        self.bs = node.inputs(0).shape[0] // self.num_head
 
     def satisfy(self, config: Dict):
         chunk_num = int(config['chunk_num'])
@@ -254,7 +254,7 @@ class CubeAttnViewDataParallel(GenericDistAlgo):
 
         nodes = list()
         for idx in range(self.chunk_num):
-            inputs = [ins[idx], self.num_heads]
+            inputs = [ins[idx], self.num_head]
             node = CubeComplexAttnView(
                 signature = 'cube.runtime.function.complex.attn_view',
                 inputs = inputs,
@@ -268,22 +268,22 @@ class CubeAttnViewDataParallel(GenericDistAlgo):
 class CubeAttnViewHeadParallel(GenericDistAlgo):
     """
     Inputs:
-        [N * num_heads, L, dim_head]
+        [N * num_head, L, dim_head]
 
     Outputs:
-        [L, N, num_heads * dim_head]
+        [L, N, num_head * dim_head]
     """
     def __init__(self, node: CubeComplexAttnView):
         if not isinstance(node, CubeComplexAttnView):
             raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
         super().__init__(node)
         self.chunk_num = _kWaitDecision
-        self.num_heads = node.kwargs['num_heads']
-        self.bs = node.inputs(0).shape[0] // self.num_heads
+        self.num_head = node.kwargs['num_head']
+        self.bs = node.inputs(0).shape[0] // self.num_head
 
     def satisfy(self, config: Dict):
         chunk_num = int(config['chunk_num'])
-        if chunk_num > 0 and self.num_heads % chunk_num == 0:
+        if chunk_num > 0 and self.num_head % chunk_num == 0:
             return True
         return False
 
@@ -300,7 +300,7 @@ class CubeAttnViewHeadParallel(GenericDistAlgo):
 
         nodes = list()
         for idx in range(self.chunk_num):
-            inputs = [ins[idx], self.num_heads // self.chunk_num]
+            inputs = [ins[idx], self.num_head // self.chunk_num]
             node = CubeComplexAttnView(
                 signature = 'cube.runtime.function.complex.attn_view',
                 inputs = inputs,

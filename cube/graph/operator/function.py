@@ -293,15 +293,16 @@ class CubeComplexToQKV(IRFwOperation):
     """
     Inputs:
         hidden_state: [L, N, E]
-        weight: [3 * (num_heads * dim_head), E]
-        num_heads: int
+        weight: [3 * (num_head * dim_head), E]
+        num_head: int
+        dim_head: int 
 
-    where L = sequence length, N = batch size, E = num_heads * dim_head
+    where L = sequence length, N = batch size, E = num_head * dim_head
 
     Returns:
-        Q: [L, N * num_heads, dim_head]
-        K: [L, N * num_heads, dim_head]
-        V: [L, N * num_heads, dim_head]
+        Q: [L, N * num_head, dim_head]
+        K: [L, N * num_head, dim_head]
+        V: [L, N * num_head, dim_head]
     """
     def __init__(self, signature, inputs, name='toqkv', **kwargs):
         if len(inputs) != 3:
@@ -314,17 +315,17 @@ class CubeComplexToQKV(IRFwOperation):
         )
         self.set_input(0, qkv)
         self.set_input(1, weight)
-        self.kwargs['num_heads'] = inputs[2]
+        self.kwargs['num_head'] = inputs[2]
 
     def infer_shape(self):
         if self.inputs(0).shape is None or self.inputs(1) is None:
             return False
         seqlen = self.inputs(0).shape[0]
         bs = self.inputs(0).shape[1]
-        num_heads = self.kwargs['num_heads']
-        dim_head = self.inputs(1).shape[0] // 3 // num_heads
+        num_head = self.kwargs['num_head']
+        dim_head = self.inputs(1).shape[0] // 3 // num_head
 
-        shape = [seqlen, bs * num_heads, dim_head]
+        shape = [seqlen, bs * num_head, dim_head]
         for output in self.outputs():
             output.shape = shape
         return True
@@ -333,23 +334,23 @@ class CubeComplexToQKV(IRFwOperation):
 class CubeComplexTrilMask(IRFwOperation):
     """
     Inputs:
-        input: [N * num_heads, L, L]
+        input: [N * num_head, L, L]
         num_head: int
     
     Returns:
-        output: [N * num_heads, L, L]
+        output: [N * num_head, L, L]
     """
     def __init__(self, signature, inputs, name='trilmask', **kwargs):
         if len(inputs) != 2:
             raise TypeError("Expected 2 input")
-        tensor, num_heads = inputs[0], inputs[1]
+        tensor, num_head = inputs[0], inputs[1]
         super().__init__(
             name, signature,
             input_length=1,
             output_length=1
         )
         self.set_input(0, tensor)
-        self.kwargs['num_heads'] = num_heads
+        self.kwargs['num_head'] = num_head
 
     def infer_shape(self):
         if self.inputs(0).shape is None:
@@ -361,31 +362,31 @@ class CubeComplexTrilMask(IRFwOperation):
 class CubeComplexAttnView(IRFwOperation):
     """
     Inputs:
-        [N * num_heads, L, dim_head]
+        [N * num_head, L, dim_head]
 
     Outputs:
-        [L, N, num_heads * dim_head]
+        [L, N, num_head * dim_head]
     """
     def __init__(self, signature, inputs, name='attn_view', **kwargs):
         if len(inputs) != 2:
             raise TypeError("Expected 2 input")
-        tensor, num_heads = inputs[0], inputs[1]
+        tensor, num_head = inputs[0], inputs[1]
         super().__init__(
             name, signature,
             input_length=1,
             output_length=1
         )
         self.set_input(0, tensor)
-        self.kwargs['num_heads'] = num_heads
+        self.kwargs['num_head'] = num_head
 
     def infer_shape(self):
         if self.inputs(0).shape is None:
             return False
-        num_heads = self.kwargs['num_heads']
-        bs = self.inputs(0).shape[0] // num_heads
+        num_head = self.kwargs['num_head']
+        bs = self.inputs(0).shape[0] // num_head
         seqlen = self.inputs(0).shape[1]
         dim_head = self.inputs(0).shape[2]
-        shape = [seqlen, bs, num_heads * dim_head]
+        shape = [seqlen, bs, num_head * dim_head]
         self._outputs[0].shape = shape
         return True
 

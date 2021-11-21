@@ -4,6 +4,8 @@ Traning Logic Translator
 The traning logic first translate the training logic into
 Schedule Units, and then add Adapter ScheduleUnit
 """
+import copy
+from typing import Optional
 import torch
 
 from cube.graph.tensor import IRFullTensor, IRSubTensor
@@ -11,11 +13,20 @@ from cube.graph.operator import IRDataOperation
 import cube.graph.gpass as gpass
 from cube.schedule.pool import SchedulePool
 
+from cube.runtime.syndata import CubeDataLoader
+
 
 class IRDataLoader:
 
-    def __init__(self, dataloader):
+    def __init__(self, dataloader: CubeDataLoader):
         self.dataloader = iter(dataloader)
+        self.batch_dims = dataloader.get_batch_dims()
+
+    def get_batch_dims(self, idx: Optional[int] = None) -> int:
+        if idx is None:
+            return copy.copy(self.batch_dims)
+        else:
+            return self.batch_dims[idx]
 
     def __iter__(self):
         return self
@@ -44,7 +55,7 @@ class LogicTranslator:
             outputs.append(data)
 
         data_op = IRDataOperation(
-            data_num=len(datas)
+            data_num=len(datas), batch_dims=dataloader.get_batch_dims(),
         )
         for idx, output in enumerate(outputs):
             data_op.set_output(idx, output)

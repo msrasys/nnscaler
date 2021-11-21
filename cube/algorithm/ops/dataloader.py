@@ -1,4 +1,4 @@
-from typing import List, Dict, Type
+from typing import Dict
 
 from cube.algorithm.utils import split_axis
 from cube.algorithm.generics import GenericDistAlgo
@@ -15,13 +15,14 @@ class DPDataLoader(GenericDistAlgo):
         if not isinstance(node, IRDataOperation):
             raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
         super().__init__(node)
+        self.batch_dims = node.get_batch_dims()
 
         self.chunk_num = _kWaitDecision
 
     def satisfy(self, config: Dict):
         chunk_num = int(config['chunk_num'])
-        for shape in self.output_shapes:
-            if chunk_num > 0 and shape[0] % chunk_num != 0:
+        for bdim, shape in zip(self.batch_dims, self.output_shapes):
+            if chunk_num > 0 and shape[bdim] % chunk_num != 0:
                 return False
         return True
 
@@ -31,8 +32,8 @@ class DPDataLoader(GenericDistAlgo):
         self.chunk_num = int(config['chunk_num'])
         
         sub_outputs = list()
-        for output in node.outputs():
-            sub_output = split_axis(output, 0, self.chunk_num)
+        for bdim, output in zip(self.batch_dims, node.outputs()):
+            sub_output = split_axis(output, bdim, self.chunk_num)
             sub_outputs.append(sub_output)
         
         nodes = list()

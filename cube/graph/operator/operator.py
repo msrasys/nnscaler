@@ -1,6 +1,8 @@
 from typing import Any, Optional, Union, List
 import copy
 
+from torch._C import is_anomaly_enabled
+
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.tensor import IRFullTensor, IRSubTensor
 from cube.algorithm.factory import DistAlgorithmFactory
@@ -222,10 +224,17 @@ class IRBpOperation(IRCell):
 
 class IRDataOperation(IRCell):
 
-    def __init__(self, data_num: int, name='dataloader'):
-
+    def __init__(self, data_num: int, batch_dims: List[int], name='dataloader'):
+        if not isinstance(batch_dims, list):
+            raise RuntimeError("Expected batch dims to be a list")
+        if len(batch_dims) != data_num:
+            raise RuntimeError("Expected each output data has a specified batch dim")
         signature = 'dataloader.__next__'
         super().__init__(name, signature, 0, data_num)
+        self.batch_dims = batch_dims
+
+    def get_batch_dims(self):
+        return copy.copy(self.batch_dims)
 
     def infer_shape(self):
         """

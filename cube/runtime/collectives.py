@@ -106,6 +106,10 @@ def all_reduce(tensors: List[torch.Tensor], ranks: List[int]):
     tensor = tensors[0]
     tensor = tensor.detach()
     tensor = tensor.requires_grad_()
+
+    ### Bypass ###
+    # return tensor
+
     group = DeviceGroup().get_group(ranks)
     torch.distributed.all_reduce(tensor, group=group)
     return tensor
