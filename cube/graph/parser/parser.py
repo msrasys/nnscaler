@@ -19,9 +19,10 @@ class ScriptNodeKind(enum.Enum):
     PrimConstant = 4
     AtenOp = 5            # -> the parser may end here
     PrimIf = 6            # dynamic
-    PrimListUnpack = 7
-    PrimTupleUnpack = 8
-    PrimPythonOp = 9
+    PrimListConstruct = 7
+    PrimListUnpack = 8
+    PrimTupleUnpack = 9
+    PrimPythonOp = 10
 
 
 class ScriptModuleParser:
@@ -90,6 +91,8 @@ class ScriptModuleParser:
             return ScriptNodeKind.PrimIf
         if node.kind() == 'prim::ListUnpack':
             return ScriptNodeKind.PrimListUnpack
+        if node.kind() == 'prim::ListConstruct':
+            return ScriptNodeKind.PrimListConstruct
         if node.kind() == 'prim::TupleUnpack':
             return ScriptNodeKind.PrimTupleUnpack
         if node.kind() == 'prim::PythonOp':
@@ -101,7 +104,11 @@ class ScriptModuleParser:
         """
         Parse the node and return the IRFwOperation nodes
         """
-        node_type = ScriptModuleParser.ntype(node)
+        try:
+            node_type = ScriptModuleParser.ntype(node)
+        except RuntimeError:
+            print(module.graph)
+            raise RuntimeError("Unsupported node kind {node.kind()} found in parsing. See above graph.")
         if node_type == ScriptNodeKind.PrimCallFunction:
             return ScriptModuleParser.parse_prim_function_node(node, module, frame)
         if node_type == ScriptNodeKind.AtenOp:
@@ -112,6 +119,8 @@ class ScriptModuleParser:
             return ScriptModuleParser.parse_prim_attr_node(node, module, frame)
         if node_type == ScriptNodeKind.PrimConstant:
             return ScriptModuleParser.parse_prim_constant_node(node, module, frame)
+        if node_type == ScriptNodeKind.PrimListConstruct:
+            return ScriptModuleParser.parse_prim_list_construct_node(node, module, frame)
         if node_type == ScriptNodeKind.PrimListUnpack:
             return ScriptModuleParser.parse_prim_listunpack_node(node, module, frame)
         if node_type == ScriptNodeKind.PrimTupleUnpack:
@@ -327,6 +336,22 @@ class ScriptModuleParser:
                     -> (%output2.1)
         """
         raise NotImplementedError("Dynamic Graph is not supported yet")
+
+    @staticmethod
+    def parse_prim_list_construct_node(node, module, frame: Frame) -> List[None]:
+        """
+        Parse script module node like
+            %8 : int[] = prim::ListConstruct(%3)
+        """
+        inputs = [input for input in node.inputs()]
+        outputs = [output for output in node.outputs()]
+        assert len(outputs) == 1
+        output = outputs[0]
+        out_val = list()
+        for input in inputs:
+            out_val.append(frame.get_var(input.debugName()))
+        frame.add_var(output.debugName(), out_val)
+        return list()
 
     @staticmethod
     def parse_prim_listunpack_node(node, module, frame: Frame) -> List[None]:
