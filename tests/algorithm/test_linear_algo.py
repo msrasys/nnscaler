@@ -1,7 +1,7 @@
 from cube.graph.operator.function import Linear
-from cube.algorithm.linear import LinearDataParallel
-from cube.algorithm.linear import LinearColumnWeight
-from cube.algorithm.linear import LinearRowWeight
+from cube.algorithm.ops.linear import LinearDataParallel
+from cube.algorithm.ops.linear import LinearColumnWeight
+from cube.algorithm.ops.linear import LinearRowWeight
 from cube.graph.tensor import IRFullTensor, ValueMap
 
 
