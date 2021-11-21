@@ -77,6 +77,9 @@ class DistAlgorithmFactory:
         self.register(elew.ElementWise, elew.ElementWiseDimParallel, tag='dim')
         self.register(elew.Add, elew.AddDimParallel, tag='dim')
 
+        import cube.algorithm.ops.layernorm as ln
+        self.register(ln.LayerNorm, ln.LayerNormDimParallel, tag='dim')
+
         import cube.algorithm.ops.activation as activation
         self.register(activation.Activation, activation.ActivationDimParallel, tag='dim')
         self.register(activation.Dropout, activation.DropoutDimParallel, tag='dim')

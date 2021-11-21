@@ -127,6 +127,33 @@ class Add(ElementWise):
         alpha = inputs[2]
         self.kwargs['alpha'] = alpha
 
+
+class LayerNorm(IRFwOperation):
+
+    def __init__(self, signature, inputs, name='layernorm', **kwargs):
+
+        if len(inputs) != 5:
+            raise TypeError(f"Expected 5 inputs, but got: {inputs}")
+        input = inputs[0]
+        normalized_shape = inputs[1]
+        if not isinstance(normalized_shape, list):
+            raise TypeError(f"Expected list of int, but got: {type(normalized_shape)}")
+        weight = inputs[2]
+        bias = inputs[3]
+        eps = inputs[4]
+
+        inputs = [input, normalized_shape, weight, bias]
+        super().__init__(name, signature, input_length=4, output_length=1)
+        for idx, input in enumerate(inputs):
+            self.set_input(idx, input)
+        self.kwargs['eps'] = eps
+
+    def infer_shape(self):
+        if self.inputs(0).shape is None:
+            return False
+        self.outputs(0).shape = self.inputs(0).shape
+
+
 # ============================= Activation ============================
 
 class Activation(IRFwOperation):
@@ -187,6 +214,7 @@ class Softmax(Activation):
         self.kwargs['_stacklevel'] = stacklevel
         self.kwargs['dtype'] = dtype
         self.stay_dims.append(dim)
+
 
 # ===================== Loss Computation (Reduce) =========================
 
