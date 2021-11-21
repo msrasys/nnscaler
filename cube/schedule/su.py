@@ -3,7 +3,6 @@ import copy
 from enum import Enum
 
 from cube.ir.cten import IRCell, IRTensor
-from cube.graph.operator import IRBpOperation
 
 
 class SUType(Enum):
@@ -194,9 +193,13 @@ class ScheduleUnit(IRCell):
         else:
             raise TypeError("Expected index to be None or int")
 
-    def _clear_adapters(self):
+    def _clear_adapters(self, ctrl=False):
         """
-        Clear all adapters for this SU
+        Clear all adapters for this SU. By default control dependency is keeped
+
+        Args:
+            ctrl (boolean): if true, additional control dependency is removed.
+                            if false, additional control dependency is keeped.
         """
         self._send_in_adapters: List[List[ScheduleUnit]] = [
             list() for _ in range(len(self.inputs()))
@@ -212,6 +215,9 @@ class ScheduleUnit(IRCell):
         self._recv_out_adapters: List[List[ScheduleUnit]] = [
             list() for _ in range(len(self.outputs()))
         ]
+        if ctrl:
+            self._ctrl_predecessors = list()
+            self._ctrl_successors = list()
 
     def _add_in_adapter(self, index: int, send_adapters, recv_adapters):
         """

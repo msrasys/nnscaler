@@ -51,12 +51,16 @@ class SUGraph(IRCell):
         """
         if not all([isinstance(su, ScheduleUnit) for su in sus]):
             raise TypeError("Expected list of schedule unit")
+        adapters = [SUType.P2P, SUType.Coll, SUType.Transform]
         for su in sus:
             su.clear_predecessor()
             su.clear_successor()
         for src_idx in range(len(sus)):
             src = sus[src_idx]
             for dst in sus[src_idx+1:]:
+                # inter-adapter has no dependency
+                if src.stype in adapters and dst.stype in adapters:
+                    continue
                 for out_idx, out_tensor in enumerate(src.outputs()):
                     # special dependency for communication adapter
                     if dst.stype == SUType.P2P:
@@ -378,13 +382,22 @@ class SUGraph(IRCell):
         self.sequence = seq
         return True
 
-    def partial_set_order(self, seq: List[ScheduleUnit]):
+    def partial_set_order(self, seq: List[ScheduleUnit], lazy=False):
         """
         Set a order of the sequence using part of SUs.
 
         A random topological order will be set under
         the constraints of given `seq` order
+
+        Args:
+            seq: partial scheduling sequence
+            lazy:
+                if True, the remaining SU is inserted only when it is needed.
+                if False, the remaining SU is inserted once it is ready.
+
         """
+        if lazy:
+            raise NotImplementedError("Not supported for Lazy")
         seq = copy.copy(seq)
         for su in seq:
             if su not in self.sequence:
@@ -397,6 +410,11 @@ class SUGraph(IRCell):
                 remain_sus.append(su)
         for rsu in remain_sus:
             happen_before_sus = rsu.predecessors()
+            # A temporal fix for loss computation and backward
+            # -- as they have no dependency in theory
+            if rsu.stype == SUType.Backward:
+                if rsu.mirror not in happen_before_sus:
+                    happen_before_sus.append(rsu.mirror)
             idx = 0
             while len(happen_before_sus) > 0:
                 if idx == len(seq):
