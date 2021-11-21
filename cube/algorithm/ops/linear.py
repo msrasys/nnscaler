@@ -106,7 +106,7 @@ class LinearColumnWeight(GenericDistAlgo):
             bs = split_axis(bias, 0, self.chunk_num)
         else:
             bs = [None] * self.chunk_num
-        os = split_axis(output, 1, self.chunk_num)
+        os = split_axis(output, -1, self.chunk_num)
 
         nodes = list()
         for w, b, o in zip(ws, bs, os):
