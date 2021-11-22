@@ -28,9 +28,8 @@ def backward(input_tensors, output_tensors, output_tensor_grads):
             "Expected same length of out tensors and grads"
         )
 
-    for tensor, grads in zip(output_tensors, output_tensor_grads):
-        # print('backwarding... ')
-        torch.autograd.backward(tensor, grad_tensors=grads)
+    # print('backwarding... ')
+    torch.autograd.backward(output_tensors, grad_tensors=output_tensor_grads)
     grads = list()
     for tensor in input_tensors:
         # print('backward input tensor: {}'.format(tensor))
