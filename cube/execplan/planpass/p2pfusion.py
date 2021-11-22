@@ -46,6 +46,9 @@ class P2PFusion(PlanPass):
                 if pid not in ous:
                     continue
                 tous, tins = ous[pid], ins[pid]
+                # if they are on the single device, matching is skipped
+                if len(tous) == 1 and set(tous.keys()) == set(tins.keys()):
+                    continue
                 if P2PFusion.have_comm(tous, tins):
                     colls : List[ScheduleUnit] = None
                     for matcher in matchers:
