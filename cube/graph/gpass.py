@@ -2,7 +2,7 @@ from typing import Any
 import copy
 
 from cube.graph.graph import IRGraph
-from cube.graph.tensor import IRSubTensor
+from cube.graph.tensor import IRSubTensor, ValueMap
 from cube.graph.operator import IRBpOperation
 
 from cube.ir.cten import IRCell, IRTensor
@@ -61,11 +61,11 @@ def forward(graph, *args) -> IRGraph:
 
     fnodes = list()
     bnodes = list()
+
+    # generate forward nodes
     for node in graph.nodes():
         inputs = node.inputs()
         outputs = node.outputs()
-
-        # forwrd node
         # fnode = copy.copy(node)
         fnode = node
         fnode._inputs = inputs
@@ -76,8 +76,13 @@ def forward(graph, *args) -> IRGraph:
         # set forward outputs
         for idx, val in enumerate(outputs):
             fnode.set_output(idx, gener.renew(val))
-        
-        # backward node
+        fnodes.append(fnode)
+        fnode.device = node.device
+
+    # generate backward nodes
+    for fnode in fnodes:
+        inputs = fnode.inputs()
+        outputs = fnode.outputs()
         bnode = IRBpOperation(data_num=len(inputs), grad_num=len(outputs))
         # set backward grad
         for idx, val in enumerate(fnode.inputs()):
@@ -98,14 +103,10 @@ def forward(graph, *args) -> IRGraph:
                 grad = val.get_grad(fnode)
                 val.grad = grad
             bnode.set_grad(idx, grad)
-
-        fnode.device = node.device
         bnode.device = node.device
-        
+
         # mirror node for forward / backward
         IRCell.make_pair(fnode, bnode)
-
-        fnodes.append(fnode)
         bnodes.append(bnode)
     
     inputs = [gener.renew(input) for input in graph.inputs()]
