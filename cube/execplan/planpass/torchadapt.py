@@ -18,7 +18,7 @@ For the situation when the referred operators are on same device:
     For other referred op: grad is set to None
 """
 
-from typing import Dict, List
+from typing import Dict
 
 from cube.execplan import ExectuionPlan
 from cube.graph.tensor import IRSubTensor, ValueMap
@@ -32,18 +32,43 @@ class TorchRefAdapter(PlanPass):
     @staticmethod
     def apply(execplan: ExectuionPlan):
         # same device multiple reference
-        multiref = TorchRefAdapter.gather_tensor(execplan)
-        for tid in multiref:
-            print(f'tensor id: {tid}')
-            for devid in multiref[tid]:
-                for fsu in multiref[tid][devid]:
+        multiref_fsus, multiref_fnodes = TorchRefAdapter.multi_ref_cells(execplan)
+        for tid in multiref_fsus:
+            print(f'multi-referred tensor id: {tid}')
+            for devid in multiref_fsus[tid]:
+                for fsu in multiref_fsus[tid][devid]:
                     print(f'dev {devid}: {fsu}')
 
-        for tid in multiref:
-            grad_num = len(multiref[tid])
-            for idx, devid in enumerate(multiref[tid]):
+
+        for tid in multiref_fsus:
+            # check chunk num for each device
+            total_ops = set()
+            for devid in multiref_fnodes[tid]:
+                for op in multiref_fnodes[tid][devid]:
+                    total_ops.add(op._id)
+            total_ops = list(total_ops)
+            num_ops = len(total_ops)
+            # how many ops are computed for each device
+            dev_ops = dict()
+            for devid in multiref_fnodes[tid]:
+                op_index = list()
+                for op in multiref_fnodes[tid][devid]:
+                    op_index.append(total_ops.index(op._id))
+                cnt = len(op_index)
+                if cnt != 1 and cnt != num_ops:
+                    raise NotImplementedError("Only support even chunk for multi-ref")
+                dev_ops[devid] = op_index
+
+            for idx, devid in enumerate(multiref_fsus[tid]):
+                # the value map should be op_num / total_ops
+                op_index = dev_ops[devid]
+                if len(op_index) == num_ops:
+                    grad_idx, grad_num = 0, 1
+                elif len(op_index) == 1:
+                    grad_idx, grad_num = op_index[0], num_ops
+
                 # the first forward, the last backward
-                fsu = multiref[tid][devid][0]
+                fsu = multiref_fsus[tid][devid][0]
                 ftensor = None
                 for input in fsu.inputs():
                     if isinstance(input, IRSubTensor):
@@ -54,16 +79,18 @@ class TorchRefAdapter(PlanPass):
                     raise RuntimeError("Internal Error: fsu not found input tensor")
                 grad = ftensor.parent.grad.select(
                     indices = ftensor.indices,
-                    val_map = ValueMap(idx, grad_num),
+                    val_map = ValueMap(grad_idx, grad_num),
                     shape = ftensor.shape
                 )
                 rm_grad = TorchRefAdapter.set_grad(fsu, ftensor, grad)
-                TorchRefAdapter.replace_all(execplan, rm_grad, grad)
+                TorchRefAdapter.replace_all(execplan, rm_grad, grad, devid)
 
                 # all the other reference place: set grad to none
-                for fsu in multiref[tid][devid][1:]:
+                for fsu in multiref_fsus[tid][devid][1:]:
                     rm_grad = TorchRefAdapter.set_grad(fsu, ftensor, grad=None)
-                    TorchRefAdapter.replace_all(execplan, rm_grad, None)
+                    TorchRefAdapter.replace_all(execplan, rm_grad, None, devid)
+
+        print(execplan)
 
         # reset select and merge adapters
         for devid in execplan.devices():
@@ -92,34 +119,43 @@ class TorchRefAdapter(PlanPass):
         return execplan
 
     @staticmethod
-    def gather_tensor(execplan: ExectuionPlan) -> Dict:
+    def multi_ref_cells(execplan: ExectuionPlan) -> Dict:
         """
         Return:
         {
             sub_tensor id:
                 device id:
-                    [forward su]
+                    [forward su or forward node]
         }
         """
-        fwsus = dict()
+        fnodes = dict()
+        fsus = dict()
         for devid in execplan.devices():
             for fsu in execplan.sequence(devid):
                 if fsu.stype == SUType.Forward:
                     for input in fsu.inputs():
                         if isinstance(input, IRSubTensor):
                             tid = input._id
-                            if tid not in fwsus:
-                                fwsus[tid] = dict()
-                            if devid not in fwsus[tid]:
-                                fwsus[tid][devid] = list()
-                            fwsus[tid][devid].append(fsu)
-        multiref = dict()
-        for tid in fwsus:
-            for devid in fwsus[tid]:
-                if len(fwsus[tid][devid]) != 1:
-                    multiref[tid] = fwsus[tid]
+                            if tid not in fnodes:
+                                fnodes[tid] = dict()
+                                fsus[tid] = dict()
+                            if devid not in fnodes[tid]:
+                                fnodes[tid][devid] = list()
+                                fsus[tid][devid] = list()
+                            fsus[tid][devid].append(fsu)
+                            for node in fsu.nodes():
+                                if input in node.inputs():
+                                    fnodes[tid][devid].append(node)
+        multiref_fnodes = dict()
+        multiref_sus = dict()
+        for tid in fnodes:
+            for devid in fnodes[tid]:
+                if len(fnodes[tid][devid]) != 1:
+                    multiref_sus[tid] = fnodes[tid]
+                    multiref_fnodes[tid] = fsus[tid]
                     break
-        return multiref
+        return multiref_fnodes, multiref_sus
+ 
 
     @staticmethod
     def set_grad(fsu: ScheduleUnit, input: IRSubTensor, grad):
@@ -131,31 +167,54 @@ class TorchRefAdapter(PlanPass):
         # forward SU
         findex = fsu.inputs().index(input)
         fsu.inputs(findex).grad = grad
+        if not len(fsu.nodes()) == 1:
+            raise RuntimeError("TorchAdapt should call before merge")
+        fnode = fsu.nodes(0)
+        findex = fnode.inputs().index(input)
+        fnode.inputs(findex).grad = grad
         # backward SU
         bsu = fsu.mirror
         bindex = bsu.inputs().index(input)
         bin = bsu.inputs(bindex)
-        gindex = bsu.outputs().index(bin.grad)
+        try:
+            gindex = bsu.outputs().index(bin.grad)
+        except ValueError:
+            raise RuntimeError(
+                (f"Internal Error: cannot find given grad in bsu: {bsu}:\n"
+                 f"gradient given tensor: {bin}, grad: {bin.grad}")
+            )
         removed_grad = bin.grad
         bin.grad = grad
         bsu.set_output(gindex, grad)
         return removed_grad
 
     @staticmethod
-    def replace_all(execplan: ExectuionPlan, src: IRSubTensor, dst):
-        for devid in execplan.devices():
-            for su in execplan.sequence(devid):
-                if src in su.inputs():
-                    if len(su.inputs()) == 1:
-                        execplan.at(devid).remove(su)
-                        execplan.sugraph.sequence.remove(su)
-                    else:
-                        index = su.inputs().index(src)
-                        su.set_input(index, dst)
-                if src in su.outputs():
-                    if len(su.outputs()) == 1:
-                        execplan.at(devid).remove(su)
-                        execplan.sugraph.sequence.remove(su)
-                    else:
-                        index = su.outputs().index(src)
-                        su.set_output(index, dst)
+    def replace_all(execplan: ExectuionPlan, src: IRSubTensor, dst, devid: int):
+        for su in execplan.sequence(devid):
+            # pair removement for p2p will already remove su
+            if su not in execplan.at(devid):
+                continue
+            rm_su = None
+            if src in su.inputs():
+                if len(su.inputs()) == 1 and dst is None:
+                    execplan.at(devid).remove(su)
+                    execplan.sugraph.sequence.remove(su)
+                    rm_su = su
+                else:
+                    index = su.inputs().index(src)
+                    su.set_input(index, dst)
+            if src in su.outputs():
+                if len(su.outputs()) == 1 and dst is None:
+                    execplan.at(devid).remove(su)
+                    execplan.sugraph.sequence.remove(su)
+                    rm_su = su
+                else:
+                    index = su.outputs().index(src)
+                    su.set_output(index, dst)
+            # pair removement
+            if rm_su is not None and rm_su.stype == SUType.P2P:
+                mirror = rm_su.mirror
+                dev = mirror.device[0]
+                if mirror in execplan.at(dev):
+                    execplan.at(dev).remove(mirror)
+                    execplan.sugraph.sequence.remove(mirror)
