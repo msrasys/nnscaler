@@ -1,5 +1,6 @@
 from typing import List, Optional, Union
 import copy
+from cube.graph.tensor import IRSubTensor
 
 from cube.ir.cten import IRCell, IRTensor
 from cube.graph.operator import IRBpOperation
@@ -64,6 +65,8 @@ class SUGraph(IRCell):
                    src.stype == dst.stype:
                     continue
                 for out_idx, out_tensor in enumerate(src.outputs()):
+                    if not isinstance(out_tensor, IRTensor):
+                        continue
                     # special dependency for communication adapter
                     if dst.stype == SUType.P2P:
                         for recv_tensor in dst.outputs():

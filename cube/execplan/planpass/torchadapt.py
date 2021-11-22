@@ -83,8 +83,12 @@ class TorchRefAdapter(PlanPass):
                         if len(trans_su.outputs()) == 0:
                             # meaning outputs in inputs
                             execplan.at(devid).remove(su)
+                            execplan.sugraph.sequence.remove(su)
                         else:
                             execplan.at(devid)[idx] = trans_su
+                            suidx = execplan.sugraph.sequence.index(su)
+                            execplan.sugraph.sequence[suidx] = trans_su
+        execplan.sugraph.reset_dependency(execplan.sugraph.sus())
         return execplan
 
     @staticmethod
@@ -144,12 +148,14 @@ class TorchRefAdapter(PlanPass):
                 if src in su.inputs():
                     if len(su.inputs()) == 1:
                         execplan.at(devid).remove(su)
+                        execplan.sugraph.sequence.remove(su)
                     else:
                         index = su.inputs().index(src)
                         su.set_input(index, dst)
                 if src in su.outputs():
                     if len(su.outputs()) == 1:
                         execplan.at(devid).remove(su)
+                        execplan.sugraph.sequence.remove(su)
                     else:
                         index = su.outputs().index(src)
                         su.set_output(index, dst)
