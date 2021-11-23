@@ -10,6 +10,7 @@ from cube.schedule.translator import IRDataLoader
 from cube.schedule.sugraph import SUGraph, SUGraphGener
 
 from cube.execplan import ExectuionPlan
+from cube.execplan.planpass.torchadapt import TorchRefAdapter
 from cube.execplan.planpass.redundant import RemoveRedundantAdapters
 from cube.execplan.planpass.merge import MergeComputeSU
 from cube.execplan.planpass.gfuse import WeightGradAllreduceFusion
@@ -145,6 +146,9 @@ def compile(model: SemanticModel, dataloader,
                 raise RuntimeError(f"SUGraph order is not topological order")
 
             execplan = ExectuionPlan(sugraph)
+            # plan pass to adapt to pytorch semantic: multi branch gradient
+            # TODO: residual support
+            # execplan = TorchRefAdapter.apply(execplan)
             # plan pass to remove redundant sus 
             execplan = RemoveRedundantAdapters.apply(execplan)
             # print(f'> after remove redundant adapters:\n {execplan}')

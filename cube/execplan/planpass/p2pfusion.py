@@ -228,7 +228,7 @@ class P2PFusion(PlanPass):
                     else:
                         raise RuntimeError("Internal Error")
                     op = IRCollectives(input, outputs, ranks, IRCollType.AllReduce)
-                    su = ScheduleUnit([op], SUType.Coll, name='allgather')
+                    su = ScheduleUnit([op], SUType.Coll, name='allreduce')
                     su.device = rank
                     allreduce_sus.append(su)
 
