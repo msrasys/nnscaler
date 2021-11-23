@@ -17,8 +17,8 @@ from torch import nn
 import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
-from examples.mlp.policy.pipe_parallel import transform_policy
-from examples.mlp.policy.pipe_parallel import schedule_policy
+from examples.mlp.policy.pipe1f1b_parallel import transform_policy
+from examples.mlp.policy.pipe1f1b_parallel import schedule_policy
 
 # =================== Semantic Model Description ====================
 
