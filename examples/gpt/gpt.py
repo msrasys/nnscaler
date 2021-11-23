@@ -14,9 +14,7 @@ python -m torch.distributed.launch \
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.nn.modules.normalization import LayerNorm
 import cube
-from cube.runtime.function.function import embedding
 
 
 from examples.transformer.policy.tensor_parallel import transform_policy
@@ -139,9 +137,7 @@ class TransformerLayer(torch.nn.Module):
         ffn_out = self.ffn_dropout(ffn_out)
         # ffn_out = ffn_out + residual
         ffn_out = ffn_out * 2
-
-        loss = torch.sum(ffn_out)
-        return loss
+        return ffn_out
 
 
 class Embedding(torch.nn.Module):
@@ -188,7 +184,7 @@ class GPT(torch.nn.Module):
         )
 
         # final linear
-        self.final_layernorm = LayerNorm(
+        self.final_layernorm = torch.nn.LayerNorm(
             hidden_size, 1e-5
         )
 
@@ -237,7 +233,7 @@ class GPT(torch.nn.Module):
 
 def train():
     L = 512  # seq len
-    N = 32   # batch size
+    N = 1   # batch size
     # configs: [hidden size, num_head]
     # E, num_head = [1536, 16]  # 1.2B model
     # E, num_head = [1920, 20]  # 2.5B model
@@ -254,12 +250,12 @@ def train():
         model, input_shapes=([N, L], [N, L],),
     )
 
-    dataloader = cube.runtime.syndata.SynDataLoader(1280, [0, 0], [N, L], [N, L])
+    dataloader = cube.runtime.syndata.SynTextDataLoader(1280, [0, 0], [N, L], [N, L])
 
     @cube.compile(model, dataloader, policy=(transform_policy, schedule_policy))
     def train_iter(model, dataloader):
-        data = next(dataloader)
-        loss = model(data)
+        input_ids, position_ids = next(dataloader)
+        loss = model(input_ids, position_ids)
         loss.backward()
     model = model.get_gen_module()
 

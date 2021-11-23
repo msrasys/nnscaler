@@ -85,3 +85,16 @@ class SynDataLoader(CubeDataLoader):
         datas = self.datas[self.pos % self._buffer_num]
         if len(datas) == 1: return datas[0]
         else: return tuple(datas)
+
+
+class SynTextDataLoader(SynDataLoader):
+
+    def set_data_buffer(self, buffer_num=4, text_num=50257):
+        self.datas = list()
+        self._buffer_num = buffer_num
+        for _ in range(self._buffer_num):
+            datas = list()
+            for shape in self.shapes:
+                data = torch.randint(0, text_num, shape, dtype=torch.long).cuda()
+                datas.append(data)
+            self.datas.append(datas)
