@@ -65,5 +65,9 @@ class Sign2Op:
 
         __customize('attn_view'): function.CubeComplexAttnView,
 
+        __customize('self_attn'): function.CubeComplexSelfAttention,
+        
+        __customize('feedforward'): function.CubeComplexFeedForward,
+
     }
 
