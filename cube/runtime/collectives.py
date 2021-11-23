@@ -4,7 +4,7 @@ import torch
 from cube.runtime.device import DeviceGroup
 
 
-def send(tensors, to_ranks: List[int]):
+def send(tensors: List[torch.Tensor], to_ranks: List[int]):
     """
     send tensor to the remote devices. Each tensor can be
     sent to multiple devices
@@ -20,6 +20,8 @@ def send(tensors, to_ranks: List[int]):
     # return
 
     for tensor, rank in zip(tensors, to_ranks):
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
         send_op = torch.distributed.P2POp(
             torch.distributed.isend, tensor, rank
         )
