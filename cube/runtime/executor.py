@@ -2,7 +2,7 @@ r"""
 SU Executor for runtime
 """
 
-from typing import Tuple, Any, Callable
+from typing import Tuple, Any, Callable, List
 import torch
 
 
@@ -15,7 +15,7 @@ def fexecute(su: Callable, *input_tensors: Tuple[Any]):
     return outputs
 
 
-def backward(input_tensors, output_tensors, output_tensor_grads):
+def backward(input_tensors: List[torch.Tensor], output_tensors, output_tensor_grads):
     """
     Backward the SUs
     """
@@ -28,15 +28,39 @@ def backward(input_tensors, output_tensors, output_tensor_grads):
             "Expected same length of out tensors and grads"
         )
 
-    # print('backwarding... ')
-    torch.autograd.backward(output_tensors, grad_tensors=output_tensor_grads)
-    grads = list()
-    for tensor in input_tensors:
-        # print('backward input tensor: {}'.format(tensor))
-        if torch.is_tensor(tensor) and tensor.requires_grad:
-            grads.append(tensor.grad)
-        else:
-            grads.append(None)
+    inputs = list()
+    indices = list()
+    for idx, input in enumerate(input_tensors):
+        if torch.is_tensor(input) and input.requires_grad:
+            inputs.append(input)
+            indices.append(idx)
+    
+    grads = [None] * len(input_tensors)
+    if len(inputs) != 0:
+        # print('backwarding... ')
+        in_grads = torch.autograd.grad(output_tensors, inputs, output_tensor_grads)
+        for idx, grad in zip(indices, in_grads):
+            if input_tensors[idx].is_leaf:
+                input_tensors[idx].grad = grad
+            grads[idx] = grad
+
+    # if len(inputs) != 0:
+    #     torch.autograd.backward(
+    #         output_tensors,
+    #         grad_tensors=output_tensor_grads,
+    #         inputs=inputs
+    #     )
+    #     for idx, tensor in zip(indices, inputs):
+    #         grads[idx] = tensor.grad
+
+    # torch.autograd.backward(output_tensors, grad_tensors=output_tensor_grads)
+    # grads = list()
+    # for tensor in input_tensors:
+    #     # print('backward input tensor: {}'.format(tensor))
+    #     if torch.is_tensor(tensor) and tensor.requires_grad:
+    #         grads.append(tensor.grad)
+    #     else:
+    #         grads.append(None)
     if    len(grads) == 0: return None
     elif  len(grads) == 1: return grads[0]
     else: return tuple(grads)

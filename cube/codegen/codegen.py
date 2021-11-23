@@ -7,6 +7,7 @@ import copy
 from cube.graph.operator.operator import IRFwOperation, IROptimOperation
 
 from cube.ir.cten import IRTensor
+from cube.graph.tensor import ValueMap
 from cube.execplan import ExectuionPlan
 from cube.schedule.adapter.collectives import IRCollectives
 
@@ -437,6 +438,7 @@ class ScheduleCodeGen(CodeGen):
             for tensor in fsu.inputs():
                 if isinstance(tensor, IRTensor):
                     if tensor.is_param():
+                        finputs.append('model.' + self.tensor_naming(tensor))
                         continue
                 finputs.append(self.tensor_naming(tensor))
             fargs = '(' + ', '.join(finputs + ['']) + ')'
@@ -449,9 +451,7 @@ class ScheduleCodeGen(CodeGen):
             fout_grads = list()
             for fout in fsu.outputs():
                 # the loss computed starting point
-                if fout == fout.grad:
-                    #TODO: mean<0, N> needs to divide by N times
-                    pass
+                # if fout == fout.grad:
                 fout_grads.append(self.tensor_naming(fout.grad))
             fout_grads = '(' + ', '.join(fout_grads + ['']) + ')'
 
@@ -462,9 +462,15 @@ class ScheduleCodeGen(CodeGen):
             )
 
             # returned value are graph.outputs
-            return_val = [self.tensor_naming(tensor) for tensor in su.outputs()]
+            return_val = list()
+            for input in fsu.inputs():
+                if isinstance(input, IRTensor):
+                    return_val.append(self.tensor_naming(input.grad))
+                else:
+                    return_val.append(None)
+            # return_val = [self.tensor_naming(tensor.grad) for tensor in finputs]
             # TODO: fix this by using grad attributed
-            return_val = return_val[:len(finputs)]
+            # return_val = return_val[:len(finputs)]
             if len(return_val) > 0:
                 return_code = ', '.join(return_val) + ' = '
             else:
