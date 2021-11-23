@@ -53,7 +53,7 @@ def tril_mask(input: torch.Tensor, num_head: int):
     mask = mask.view(bs, 1, seqlen, seqlen)
     mask = (mask < 0.5)
     # mask
-    masked_input = input.masked_fill_(mask, -100000.0)
+    masked_input = input.masked_fill_(mask, -10000.0)
     masked_input = masked_input.view((bs * num_head), seqlen, seqlen)
     return masked_input
 
