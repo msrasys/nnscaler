@@ -420,6 +420,16 @@ class SUGraph(IRCell):
             if rsu.stype == SUType.Backward:
                 if rsu.mirror not in happen_before_sus:
                     happen_before_sus.append(rsu.mirror)
+            # send / recv su pair should be colocated
+            if rsu.stype == SUType.P2P:
+                if rsu in seq:
+                    continue
+                if rsu.mirror in seq:
+                    index = seq.index(rsu.mirror)
+                    seq.insert(idx+1, rsu)
+                    continue
+            if rsu in seq:
+                raise RuntimeError(f"Internal Error: should not appear SU: {rsu}")
             idx = 0
             while len(happen_before_sus) > 0:
                 if idx == len(seq):
