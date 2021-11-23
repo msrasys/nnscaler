@@ -7,7 +7,7 @@ import copy
 
 
 from cube.graph.operator.operator import IROptimOperation
-from cube.graph.tensor import IRSubTensor
+from cube.graph.tensor import IRSubTensor, ValueMap
 
 from cube.execplan import ExectuionPlan
 from cube.schedule.su import SUType, ScheduleUnit
@@ -54,12 +54,12 @@ class WeightGradAllreduceFusion(PlanPass):
     @staticmethod
     def _get_weight_grads(execplan: ExectuionPlan) -> Dict:
         """
-        Get weight gradient
+        Get weight and gradient
         
-        Return Dict[IRSubTensor, Dict[int, List[IRSubTensor]]]
-               (grads = params[param][device])
+        weights: Dict[param_id: int, IRSubTensor]
+        grads  : Dict[param_id: int, Dict[device: int, List[grad: IRSubTensor]]]
+
         """
-        # grad = params[param][device]
         grads = dict()
         weights = dict()
         for devid in execplan.devices():
@@ -68,16 +68,19 @@ class WeightGradAllreduceFusion(PlanPass):
                 # bsu has only one node
                 for input in bsu.inputs():
                     if isinstance(input, IRSubTensor) and input.is_param():
-                        if input._id not in grads:
-                            grads[input._id] = dict()
-                            weights[input._id] = input
-                        if devid not in grads[input._id]:
-                            grads[input._id][devid] = list()
                         grad = input.grad
                         if grad is None:
                             print(input.name, input)
                             print(grad)
                             assert grad is not None
+                        # nothing to sync
+                        if grad.val_map == ValueMap(0, 1):
+                            continue
+                        if input._id not in grads:
+                            grads[input._id] = dict()
+                            weights[input._id] = input
+                        if devid not in grads[input._id]:
+                            grads[input._id][devid] = list()
                         if grad in grads[input._id][devid]:
                             raise RuntimeError("Already logged grad?")
                         grads[input._id][devid].append(grad)
