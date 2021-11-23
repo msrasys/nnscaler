@@ -1,8 +1,6 @@
 from typing import Any, Optional, Union, List
 import copy
 
-from torch._C import is_anomaly_enabled
-
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.tensor import IRFullTensor, IRSubTensor
 from cube.algorithm.factory import DistAlgorithmFactory
@@ -71,6 +69,20 @@ class IRFwOperation(IRCell):
             val.parent._add_fdst_cell(self)
         return super().set_input(input_index, val)
 
+    def replicate(self):
+        """
+        Replicate the Operation
+        """
+        cpy = copy.copy(self)
+        cpy._device = list()
+        cpy._inputs = copy.copy(self._inputs)
+        cpy._outputs = copy.copy(self._outputs)
+        cpy._mirror = None
+        cpy._tag = None
+        cpy.clear_predecessor()
+        cpy.clear_successor()
+        return cpy
+
     def __repr__(self):
         inputs = list()
         for tensor in self.inputs():
@@ -125,6 +137,20 @@ class IRBpOperation(IRCell):
             input_length=data_num + grad_num,
             output_length=data_num
         )
+
+    def replicate(self):
+        """
+        Replicate the backward op
+        """
+        cpy = copy.copy(self)
+        cpy._device = list()
+        cpy._inputs = copy.copy(self._inputs)
+        cpy._outputs = copy.copy(self._outputs)
+        cpy._mirror = None
+        cpy._tag = None
+        cpy.clear_predecessor()
+        cpy.clear_successor()
+        return cpy
 
     def datas(self, index: Optional[int] = None) -> Union[List[Any], Any]:
         if index is None:
@@ -232,6 +258,20 @@ class IRDataOperation(IRCell):
         signature = 'dataloader.__next__'
         super().__init__(name, signature, 0, data_num)
         self.batch_dims = batch_dims
+
+    def replicate(self):
+        """
+        Replicate the Operation
+        """
+        cpy = copy.copy(self)
+        cpy._device = list()
+        cpy._inputs = copy.copy(self._inputs)
+        cpy._outputs = copy.copy(self._outputs)
+        cpy._mirror = None
+        cpy._tag = None
+        cpy.clear_predecessor()
+        cpy.clear_successor()
+        return cpy
 
     def get_batch_dims(self):
         return copy.copy(self.batch_dims)

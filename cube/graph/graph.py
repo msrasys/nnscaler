@@ -267,21 +267,16 @@ class IRGraph(IRCell):
 
         if op not in self.nodes():
             raise RuntimeError(f"Op {op} not exsits")
+            cpy_op = op.replicate()
+            if op.mirror is not None:
+                cpy_mirror_op = op.mirror.replicate()
     
         ops = [op]
         mirror_ops = [op.mirror]
         for _ in range(times - 1):
-            cpy_op = copy.copy(op)
-            for idx, input in enumerate(op.inputs()):
-                cpy_op.set_input(idx, input)
-            for idx, output in enumerate(op.outputs()):
-                cpy_op.set_output(idx, output)
+            cpy_op = op.replicate()
             if op.mirror is not None:
-                cpy_mirror_op = copy.copy(op.mirror)
-                for idx, input in enumerate(op.mirror.inputs()):
-                    cpy_mirror_op.set_input(idx, input)
-                for idx, output in enumerate(op.mirror.outputs()):
-                    cpy_mirror_op.set_output(idx, output)
+                cpy_mirror_op = op.mirror.replicate()
                 mirror_ops.append(cpy_mirror_op)
                 IRCell.make_pair(cpy_op, cpy_mirror_op)
             ops.append(cpy_op)

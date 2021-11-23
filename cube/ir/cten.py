@@ -75,7 +75,7 @@ class IRCell:
 
     @property
     def device(self):
-        return list(self._device)
+        return copy.copy(self._device)
 
     @device.setter
     def device(self, device_id: Union[int, List[int]]):
@@ -86,7 +86,7 @@ class IRCell:
             device_id = [device_id]
         if not all([isinstance(devid, int) for devid in device_id]):
             raise KeyError("Require device Union[int, List[int]]")
-        self._device = device_id
+        self._device = copy.copy(list(device_id))
 
     @property
     def mirror(self):
