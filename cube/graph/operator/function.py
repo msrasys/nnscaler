@@ -420,6 +420,81 @@ class CubeComplexAttnView(IRFwOperation):
         return True
 
 
+class CubeComplexSelfAttention(IRFwOperation):
+    """
+    Multi-Head Self-Attention.
+
+    L: sequence length
+    N: batch size
+    E: embedding size
+    
+    Inputs:
+        hidden_state: [L, N, E]
+        w_qkv       : [3 * num_head * dim_head, E]
+        w_out       : [E, E]
+        num_head: int
+        dim_head: int
+        dropout_p: float
+
+    Outputs:
+        hidden_state: [L, N, E]
+    """
+    def __init__(self, signature, inputs, name='selfattn', **kwargs):
+        if len(inputs) != 6:
+            raise RuntimeError(f"Expected 6 inputs but got {input}")
+        num_head: int = inputs[3]
+        dim_head: int = inputs[4]
+        dropout_p: float = inputs[5]
+        super().__init__(
+            name, signature,
+            input_length = 3,
+            output_length = 1
+        )
+        for idx, tensor in enumerate(inputs[:3]):
+            self.set_input(idx, tensor)
+        self.kwargs['num_head'] = num_head
+        self.kwargs['dim_head'] = dim_head
+        self.kwargs['dropout_p'] = dropout_p
+
+    def infer_shape(self):
+        if self.inputs(0).shape is None:
+            return False
+        self.outputs(0).shape = self.inputs(0).shape
+        return True
+
+
+class CubeComplexFeedForward(IRFwOperation):
+    """
+    FeedForward
+
+    Inputs:
+        hidden_state: [L, N, E]
+        w_proj1: [4 * E, E]
+        w_bias1: [4 * E,]
+        w_porj2: [E, 4 * E]
+        w_bias2: [E,]
+
+    Outputs:
+        hidden_state: [L, N, E]
+    """
+    def __init__(self, signature, inputs, name='selfattn', **kwargs):
+        if len(inputs) != 5:
+            raise RuntimeError(f"Expected 6 inputs but got {input}")
+        super().__init__(
+            name, signature,
+            input_length = 5,
+            output_length = 1
+        )
+        for idx, tensor in enumerate(inputs):
+            self.set_input(idx, tensor)
+
+    def infer_shape(self):
+        if self.inputs(0).shape is None:
+            return False
+        self.outputs(0).shape = self.inputs(0).shape
+        return True
+
+
 class UnkownOperator(IRFwOperation):
 
     def __init__(self, signature, inputs, name='unknown_op', n_outputs=None):

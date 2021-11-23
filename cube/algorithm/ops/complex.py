@@ -1,11 +1,13 @@
 from typing import Dict
 
-from cube.algorithm.utils import split_axis
+from cube.algorithm.utils import split_axis, split_value
 from cube.algorithm.generics import GenericDistAlgo
 
 from cube.graph.operator.function import CubeComplexToQKV
 from cube.graph.operator.function import CubeComplexTrilMask
 from cube.graph.operator.function import CubeComplexAttnView
+from cube.graph.operator.function import CubeComplexSelfAttention
+from cube.graph.operator.function import CubeComplexFeedForward
 
 
 _kWaitDecision = None
@@ -307,5 +309,254 @@ class CubeAttnViewHeadParallel(GenericDistAlgo):
                 name = 'attn_view'
             )
             node.set_output(0, ous[idx])
+            nodes.append(node)
+        return nodes
+
+
+class CubeSelfAttentionHeadParallel(GenericDistAlgo):
+    """
+    Multi-Head Self-Attention.
+
+    L: sequence length
+    N: batch size
+    E: embedding size
+    
+    Inputs:
+        hidden_state: [L, N, E]
+        w_qkv       : [3 * num_head * dim_head, E]
+        w_out       : [E, E]
+        num_head: int
+        dim_head: int
+        dropout_p: float
+
+    Outputs:
+        hidden_state: [L, N, E]
+    """
+    def __init__(self, node: CubeComplexSelfAttention):
+        if not isinstance(node, CubeComplexSelfAttention):
+            raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
+        super().__init__(node)
+        self.chunk_num = _kWaitDecision
+        self.num_head = node.kwargs['num_head']
+
+    def satisfy(self, config: Dict):
+        chunk_num = int(config['chunk_num'])
+        if chunk_num > 0 and self.num_head % chunk_num == 0:
+            return True
+        return False
+
+    def instantiate(self, node: CubeComplexSelfAttention, config: Dict):
+        if not self.satisfy(config):
+            raise RuntimeError("Instantiate failed. Condition not satisfied.")
+        self.chunk_num = int(config['chunk_num'])
+        
+        hidden_state = node.inputs(0)
+        w_qkv = node.inputs(1)
+        w_out = node.inputs(2)
+        num_head = node.kwargs['num_head']
+        dim_head = node.kwargs['dim_head']
+        dropout_p = node.kwargs['dropout_p']
+        out = node.outputs(0)
+
+        
+        w_qkvs = split_axis(w_qkv, 0, self.chunk_num)
+        w_outs = split_axis(w_out, 1, self.chunk_num)
+        ous = split_value(out, self.chunk_num)
+
+        nodes = list()
+        for idx in range(self.chunk_num):
+            inputs = [
+                hidden_state, w_qkvs[idx], w_outs[idx],
+                num_head // self.chunk_num, dim_head, dropout_p
+            ]
+            node = CubeComplexSelfAttention(
+                signature = 'cube.runtime.function.complex.self_attn',
+                inputs = inputs,
+            )
+            node.set_output(0, ous[idx])
+            nodes.append(node)
+        return nodes
+
+
+class CubeSelfAttentionDataParallel(GenericDistAlgo):
+    """
+    Multi-Head Self-Attention.
+
+    L: sequence length
+    N: batch size
+    E: embedding size
+    
+    Inputs:
+        hidden_state: [L, N, E]
+        w_qkv       : [3 * num_head * dim_head, E]
+        w_out       : [E, E]
+        num_head: int
+        dim_head: int
+        dropout_p: float
+
+    Outputs:
+        hidden_state: [L, N, E]
+    """
+    def __init__(self, node: CubeComplexSelfAttention):
+        if not isinstance(node, CubeComplexSelfAttention):
+            raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
+        super().__init__(node)
+        self.chunk_num = _kWaitDecision
+        self.bs = node.inputs(0).shape[1]
+
+    def satisfy(self, config: Dict):
+        chunk_num = int(config['chunk_num'])
+        if chunk_num > 0 and self.bs % chunk_num == 0:
+            return True
+        return False
+
+    def instantiate(self, node: CubeComplexSelfAttention, config: Dict):
+        if not self.satisfy(config):
+            raise RuntimeError("Instantiate failed. Condition not satisfied.")
+        self.chunk_num = int(config['chunk_num'])
+        
+        hidden_state = node.inputs(0)
+        w_qkv = node.inputs(1)
+        w_out = node.inputs(2)
+        num_head = node.kwargs['num_head']
+        dim_head = node.kwargs['dim_head']
+        dropout_p = node.kwargs['dropout_p']
+        out = node.outputs(0)
+
+        ins = split_axis(hidden_state, 1, self.chunk_num)
+        ous = split_axis(out, 1, self.chunk_num)
+
+        nodes = list()
+        for idx in range(self.chunk_num):
+            inputs = [
+                ins[idx], w_qkv, w_out,
+                num_head, dim_head, dropout_p
+            ]
+            node = CubeComplexSelfAttention(
+                signature = 'cube.runtime.function.complex.self_attn',
+                inputs = inputs,
+            )
+            node.set_output(0, ous[idx])
+            nodes.append(node)
+        return nodes
+
+
+class CubeFeedForwardTensorParallel(GenericDistAlgo):
+    """
+    FeedForward
+
+    Inputs:
+        hidden_state: [L, N, E]
+        w_proj1: [4 * E, E]
+        w_bias1: [4 * E,]
+        w_porj2: [E, 4 * E]
+        w_bias2: [E,]
+
+    Outputs:
+        hidden_state: [L, N, E]
+    """
+    def __init__(self, node: CubeComplexFeedForward):
+        if not isinstance(node, CubeComplexFeedForward):
+            raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
+        super().__init__(node)
+        self.chunk_num = _kWaitDecision
+        self.embed_size = node.inputs(1).shape[0]
+
+    def satisfy(self, config: Dict):
+        chunk_num = int(config['chunk_num'])
+        if chunk_num > 0 and self.embed_size % chunk_num == 0:
+            return True
+        return False
+
+    def instantiate(self, node: CubeComplexFeedForward, config: Dict):
+        if not self.satisfy(config):
+            raise RuntimeError("Instantiate failed. Condition not satisfied.")
+        self.chunk_num = int(config['chunk_num'])
+        
+        hidden_state = node.inputs(0)
+        w_proj1 = node.inputs(1)
+        w_bias1 = node.inputs(2)
+        w_proj2 = node.inputs(3)
+        w_bias2 = node.inputs(4)
+
+        out = node.outputs(0)
+
+        w_proj1s = split_axis(w_proj1, 0, self.chunk_num)
+        w_bias1s = split_axis(w_bias1, 0, self.chunk_num)
+        w_proj2s = split_axis(w_proj2, 1, self.chunk_num)
+        w_bias2s = split_value(w_bias2, self.chunk_num)
+
+        outs = split_value(out, self.chunk_num)
+
+        nodes = list()
+        for idx in range(self.chunk_num):
+            inputs = [
+                hidden_state, 
+                w_proj1s[idx], w_bias1s[idx],
+                w_proj2s[idx], w_bias2s[idx]
+            ]
+            node = CubeComplexFeedForward(
+                signature = 'cube.runtime.function.complex.feedforward',
+                inputs = inputs,
+            )
+            node.set_output(0, outs[idx])
+            nodes.append(node)
+        return nodes
+
+
+class CubeFeedForwardDataParallel(GenericDistAlgo):
+    """
+    FeedForward
+
+    Inputs:
+        hidden_state: [L, N, E]
+        w_proj1: [4 * E, E]
+        w_bias1: [4 * E,]
+        w_porj2: [E, 4 * E]
+        w_bias2: [E,]
+
+    Outputs:
+        hidden_state: [L, N, E]
+    """
+    def __init__(self, node: CubeComplexFeedForward):
+        if not isinstance(node, CubeComplexFeedForward):
+            raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
+        super().__init__(node)
+        self.chunk_num = _kWaitDecision
+        self.bs = node.inputs(0).shape[1]
+
+    def satisfy(self, config: Dict):
+        chunk_num = int(config['chunk_num'])
+        if chunk_num > 0 and self.bs % chunk_num == 0:
+            return True
+        return False
+
+    def instantiate(self, node: CubeComplexFeedForward, config: Dict):
+        if not self.satisfy(config):
+            raise RuntimeError("Instantiate failed. Condition not satisfied.")
+        self.chunk_num = int(config['chunk_num'])
+        
+        hidden_state = node.inputs(0)
+        w_proj1 = node.inputs(1)
+        w_bias1 = node.inputs(2)
+        w_proj2 = node.inputs(3)
+        w_bias2 = node.inputs(4)
+        out = node.outputs(0)
+
+        ins = split_axis(hidden_state, 1, self.chunk_num)
+        outs = split_axis(out, 1, self.chunk_num)
+
+        nodes = list()
+        for idx in range(self.chunk_num):
+            inputs = [
+                ins[idx], 
+                w_proj1, w_bias1,
+                w_proj2, w_bias2,
+            ]
+            node = CubeComplexFeedForward(
+                signature = 'cube.runtime.function.complex.feedforward',
+                inputs = inputs,
+            )
+            node.set_output(0, outs[idx])
             nodes.append(node)
         return nodes

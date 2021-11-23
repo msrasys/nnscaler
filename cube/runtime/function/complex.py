@@ -74,3 +74,70 @@ def attn_view(input: torch.Tensor, num_head: int):
     # [L, (N * num_head), dim_head] -> [L, N, (num_head * dim_head)]
     input = input.view(seqlen, bs, num_head * dim_head)
     return input
+
+
+def self_attn(hidden_state, w_qkv, w_out,
+              num_head: int, dim_head: int,
+              dropout_p: float):
+    """
+    Multi-Head Self-Attention.
+
+    L: sequence length
+    N: batch size
+    E: embedding size
+    
+    Inputs:
+        hidden_state: [L, N, E]
+        w_qkv       : [3 * num_head * dim_head, E]
+        w_out       : [E, E]
+
+    Outputs:
+        hidden_state: [L, N, E]
+    """
+    scale = dim_head ** -0.5
+    seqlen = hidden_state.shape[0]
+    bs = hidden_state.shape[1]
+
+    qkv = F.linear(hidden_state, w_qkv, None)
+    qkv = qkv.chunk(3, dim=-1)
+    q, k, v = qkv
+    q = q.contiguous()
+    q = q.view(seqlen, (bs * num_head), dim_head)
+    k = k.contiguous()
+    k = k.view(seqlen, (bs * num_head), dim_head)
+    v = v.contiguous()
+    v = v.view(seqlen, (bs * num_head), dim_head)
+
+    q = q.transpose(0, 1)
+    k = k.transpose(0, 1)
+    v = v.transpose(0, 1)
+
+    q = q * scale
+    k = k.transpose(-2, -1)
+    attn = torch.bmm(q, k)
+
+    attn = tril_mask(attn, num_head)
+    attn = F.softmax(attn, dim=-1)
+    attn = F.dropout(attn, dropout_p, True, False)
+    output = torch.bmm(attn, v)
+    output = attn_view(output, num_head)
+    
+    output = F.linear(output, w_out, None)
+    return output
+
+
+def feedforward(hidden_state, w_proj1, w_bias1, w_proj2, w_bias2):
+    """
+    FeedForward
+
+    Inputs:
+        hidden_state: [L, N, E]
+        w_proj1: [4 * E, E]
+        w_bias1: [4 * E,]
+        w_porj2: [E, 4 * E]
+        w_bias2: [E,]
+    """
+    out = F.linear(hidden_state, w_proj1, w_bias1)
+    out = F.gelu(out)
+    out = F.linear(out, w_proj2, w_bias2)
+    return out
