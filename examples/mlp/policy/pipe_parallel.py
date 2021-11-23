@@ -4,21 +4,22 @@ import random
 
 from cube.schedule.su import SUType, ScheduleUnit
 from cube.schedule.sugraph import SUGraph
+from cube.graph.operator.operator import IRDataOperation, IRFwOperation
 
 
 def transform_policy(graph, resource):
     """
     The transformation policy transposes linear using data parallel
     """
-    from cube.graph.operator.operator import IRDataOperation, IRFwOperation
+    micro_batch_num = resource.ngpus
     for node in graph.nodes():
         if isinstance(node, IRDataOperation) or isinstance(node, IRFwOperation):
             algo = node.algorithms('data')
             if algo is not None:
-                sub_nodes = graph.partition(node, algo, config=dict(chunk_num=resource.ngpus))
+                sub_nodes = graph.partition(node, algo, config=dict(chunk_num=micro_batch_num))
             else:
                 algo = node.algorithms('dim')
-                sub_nodes = graph.partition(node, algo, config=dict(dim=0, chunk_num=resource.ngpus))
+                sub_nodes = graph.partition(node, algo, config=dict(dim=0, chunk_num=micro_batch_num))
             for idx, sub_node in enumerate(sub_nodes):
                 sub_node.tag = idx
     return graph
@@ -28,8 +29,10 @@ def schedule_policy(sugraph: SUGraph, resource):
     """
     The schedule policy
     """
-    fseqs: List[List[ScheduleUnit]] = [list() for _ in range(resource.ngpus)]
-    fbseqs: List[List[ScheduleUnit]] = [list() for _ in range(resource.ngpus)]
+    micro_batch_num = resource.ngpus
+
+    fseqs: List[List[ScheduleUnit]] = [list() for _ in range(micro_batch_num)]
+    fbseqs: List[List[ScheduleUnit]] = [list() for _ in range(micro_batch_num)]
 
     for fsu in sugraph.fsus():
         micro_bs_id = fsu.tag[0]
@@ -58,4 +61,5 @@ def schedule_policy(sugraph: SUGraph, resource):
     for fb_seq in fbseqs:
         seqs += fb_seq
     sugraph.partial_set_order(seqs)
+    print(sugraph)
     return sugraph
