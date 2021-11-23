@@ -19,9 +19,9 @@ def backward(input_tensors: List[torch.Tensor], output_tensors, output_tensor_gr
     """
     Backward the SUs
     """
-    for tensor in input_tensors:
-        if torch.is_tensor(tensor) and tensor.requires_grad:
-            tensor.retain_grad()
+    # for tensor in input_tensors:
+    #     if torch.is_tensor(tensor) and tensor.requires_grad:
+    #         tensor.retain_grad()
 
     if len(output_tensor_grads) != len(output_tensors):
         raise RuntimeError(
@@ -40,7 +40,7 @@ def backward(input_tensors: List[torch.Tensor], output_tensors, output_tensor_gr
         # print('backwarding... ')
         in_grads = torch.autograd.grad(output_tensors, inputs, output_tensor_grads)
         for idx, grad in zip(indices, in_grads):
-            if input_tensors[idx].is_leaf:
+            if isinstance(input_tensors[idx], torch.nn.Parameter):
                 input_tensors[idx].grad = grad
             grads[idx] = grad
 
@@ -61,6 +61,7 @@ def backward(input_tensors: List[torch.Tensor], output_tensors, output_tensor_gr
     #         grads.append(tensor.grad)
     #     else:
     #         grads.append(None)
+
     if    len(grads) == 0: return None
     elif  len(grads) == 1: return grads[0]
     else: return tuple(grads)
