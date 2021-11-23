@@ -11,8 +11,12 @@ def transform_policy(graph: IRGraph, resource):
     for node in graph.nodes():            
         if isinstance(node, IRFwOperation) or isinstance(node, IRDataOperation):
             algo = node.algorithms('data')
-            assert algo
-            sub_nodes = graph.partition(node, algo, config=dict(chunk_num=resource.ngpus))
+            if algo is None:
+                algo = node.algorithms('dim')
+                assert algo
+                sub_nodes = graph.partition(node, algo, config=dict(dim=0, chunk_num=resource.ngpus))
+            else:
+                sub_nodes = graph.partition(node, algo, config=dict(chunk_num=resource.ngpus))
             for idx, sub_node in enumerate(sub_nodes):
                 sub_node.tag = idx
     print(graph)
@@ -31,4 +35,6 @@ def schedule_policy(sugraph: SUGraph, resource):
         devid = su.tag[0]
         sugraph.assign(su, devid)
         sugraph.assign(su.mirror, devid)
+    fsus = sugraph.fsus()
+    sugraph.partial_set_order(fsus, lazy=False)
     return sugraph

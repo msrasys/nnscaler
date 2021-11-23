@@ -8,7 +8,7 @@ python -m torch.distributed.launch \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    examples/linears.py
+    examples/mlp/linears.py
 """
 
 import torch
@@ -17,24 +17,32 @@ from torch import nn
 import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
-from examples.policy.hybrid_parallel import transform_policy
-from examples.policy.hybrid_parallel import schedule_policy
+from examples.mlp.policy.pipe_parallel import transform_policy
+from examples.mlp.policy.pipe_parallel import schedule_policy
 
 # =================== Semantic Model Description ====================
 
 class MLP(nn.Module):
-    def __init__(self, dim, mult=16):
+    def __init__(self, dim, mult=4):
         super().__init__()
         self.linear1 = nn.Linear(dim, dim * mult)
         self.linear2 = nn.Linear(dim * mult, dim)
         self.linear3 = nn.Linear(dim, dim * mult)
         self.linear4 = nn.Linear(dim * mult, dim)
+        self.linear5 = nn.Linear(dim, dim * mult)
+        self.linear6 = nn.Linear(dim * mult, dim)
+        self.linear7 = nn.Linear(dim, dim * mult)
+        self.linear8 = nn.Linear(dim * mult, dim)
 
     def forward(self, data):
         output = self.linear1(data)
         output = self.linear2(output)
         output = self.linear3(output)
         output = self.linear4(output)
+        output = self.linear5(output)
+        output = self.linear6(output)
+        output = self.linear7(output)
+        output = self.linear8(output)
         loss = torch.sum(output)
         return loss
 
@@ -48,7 +56,7 @@ def train():
         model, input_shapes=([batch_size, dim],),
     )
 
-    dataloader = cube.runtime.syndata.SynDataLoader(1280, [batch_size, dim])
+    dataloader = cube.runtime.syndata.SynDataLoader(1280, [0], [batch_size, dim])
 
     @cube.compile(model, dataloader, policy=(transform_policy, schedule_policy))
     def train_iter(model, dataloader):

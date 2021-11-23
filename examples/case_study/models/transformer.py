@@ -29,7 +29,7 @@ class MultiHeadSelfAttention(nn.Module):
         """
         bs = x.shape[1]
 
-        # [L, N, E] -> [L, N, (num_heads * dim_head * 3)]
+        # [L, N, E] -> [L, N, (3 * num_heads * dim_head)]
         qkv = F.linear(x, self.weight_qkv, None)
         # [L, N, E] -> [L, N, (num_heads * dim_head)] x 3
         qkv = qkv.chunk(3, dim=-1)
@@ -114,7 +114,7 @@ class MultiHeadSelfAttention(nn.Module):
         return output
 
 
-class MLP(torch.nn.Module):
+class FFN(torch.nn.Module):
 
     def __init__(self, hidden_size: int):
         super().__init__()
@@ -146,7 +146,7 @@ class TransformerLayer(torch.nn.Module):
         self.attn_dropout = torch.nn.Dropout(dropout)
 
         self.mlp_layernorm = torch.nn.LayerNorm(hidden_size, eps=0.00001)
-        self.mlp = MLP(hidden_size)
+        self.mlp = FFN(hidden_size)
         self.mlp_dropout = torch.nn.Dropout(dropout)
 
     def forward(self, hidden_states, attention_mask):
