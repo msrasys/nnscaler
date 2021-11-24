@@ -37,7 +37,7 @@ def backward(input_tensors: List[torch.Tensor], output_tensors, output_tensor_gr
     
     grads = [None] * len(input_tensors)
     if len(inputs) != 0:
-        # print('backwarding... ')
+        # print(f'{torch.distributed.get_rank()}: backwarding... ')
         in_grads = torch.autograd.grad(
             output_tensors, inputs, output_tensor_grads, allow_unused=True)
         for idx, grad in zip(indices, in_grads):

@@ -158,6 +158,7 @@ def broadcast(tensors: List[torch.Tensor], ranks: List[int], shape=None):
     Broadcast. ranks[0] is the root
     """
     # print(f'{torch.distributed.get_rank()}: broadcast...')
+    # FIXME: data type
     if len(tensors) == 1:
         tensor = tensors[0]
     else:

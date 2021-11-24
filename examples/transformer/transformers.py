@@ -20,6 +20,7 @@ from examples.transformer.policy.megatron_parallel import schedule_policy
 
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
+from cube.profiler.memory import memory_summary
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -108,15 +109,13 @@ class TransformerLayer(torch.nn.Module):
         attn_out = self.attention(in_attn_norm)
         # residual
         attn_out = self.attn_dropout(attn_out)
-        # residual = attn_out + hidden_states
-        residual = attn_out * 2
+        residual = attn_out + hidden_states
         # ffn
         in_ffn_norm = self.ffn_layernorm(residual)
         ffn_out = self.ffn(in_ffn_norm)
         # residual
         ffn_out = self.ffn_dropout(ffn_out)
-        # ffn_out = ffn_out + residual
-        ffn_out = ffn_out * 2
+        ffn_out = ffn_out + residual
         return ffn_out
 
 
@@ -142,12 +141,11 @@ class Transformers(torch.nn.Module):
 
 def train():
     L = 512  # seq len
-    N = 16   # batch size
+    N = 8   # batch size
     # configs: [hidden size, num_head]
-    # E, num_head = [1536, 16]  # 1.2B model
-    # E, num_head = [1920, 20]  # 2.5B model
-    # E, num_head = [2304, 24]  # 4.2B model
-    E, num_head = [3072, 32]  # 8.7B model
+    # E, num_head = [2304, 24, 24]  # 1.7B model
+    E, num_head, layers = [3072, 32, 30]  # 3.6B model
+    # E, num_head, layers = [4096, 32, 36]  # 7.5B model
 
 
     model = Transformers(
@@ -181,9 +179,13 @@ def train():
             CudaTimer().stop('e2e')
         if (step + 1) % 20 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
-    
-    print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-40, field_name='e2e')))
+
+    iter_time = CudaTimer().duration(iter_num-40, field_name='e2e')
+    throughput = N / iter_time * 1000
+    print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
+          iter_time, throughput)
+    )
+    memory_summary()
 
 if __name__ == '__main__':
 

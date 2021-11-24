@@ -144,15 +144,13 @@ class TransformerLayer(torch.nn.Module):
         attn_out = self.attention(in_attn_norm)
         # residual
         attn_out = self.attn_dropout(attn_out)
-        # residual = attn_out + hidden_states
-        residual = attn_out * 2
+        residual = attn_out + hidden_states
         # ffn
         in_ffn_norm = self.ffn_layernorm(residual)
         ffn_out = self.ffn(in_ffn_norm)
         # residual
         ffn_out = self.ffn_dropout(ffn_out)
-        # ffn_out = ffn_out + residual
-        ffn_out = ffn_out * 2
+        ffn_out = ffn_out + residual
         return ffn_out
 
 

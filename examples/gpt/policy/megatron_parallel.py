@@ -21,10 +21,14 @@ def transform_policy(graph: IRGraph, resource):
 
     dnodes = [node for node in graph.nodes() if isinstance(node, IRDataOperation)]
     for dnode in dnodes:
+        sub_nodes = list()
         algo = dnode.algorithms('data')
         dp_nodes = graph.partition(dnode, algo, config=dict(chunk_num=dp))
-        for idx, dp_node in enumerate(dp_nodes):
-            dp_node.tag = idx * tp
+        for dp_node in dp_nodes:
+            tp_nodes = graph.replicate(dp_node, times=tp)
+            sub_nodes += tp_nodes
+        for idx, sub_node in enumerate(sub_nodes):
+            sub_node.tag = idx
 
     fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
 
@@ -96,12 +100,6 @@ def transform_policy(graph: IRGraph, resource):
                 algo = dp_node.algorithms('column')
                 tp_nodes = graph.partition(dp_node, algo, config=dict(chunk_num=tp))
                 sub_nodes += tp_nodes
-        elif isinstance(fnode, Sum):
-            algo = fnode.algorithms('dim')
-            dp_nodes = graph.partition(fnode, algo, config=dict(dim=0, chunk_num=dp))
-            for dp_node in dp_nodes:
-                rep_nodes = graph.replicate(dp_node, times=tp)
-                sub_nodes += rep_nodes
         else:
             rep_nodes = graph.replicate(fnode, times=ndevs)
             sub_nodes += rep_nodes
