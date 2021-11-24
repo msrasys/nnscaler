@@ -1,9 +1,8 @@
-from torch.nn.modules import dropout
 from cube.graph import IRGraph
 from cube.graph.operator.function import CubeComplexFeedForward, CubeComplexSelfAttention
 from cube.schedule.su import SUType
 from cube.schedule.sugraph import SUGraph
-from cube.graph.operator.operator import IRFwOperation
+from cube.graph.operator.operator import IRDataOperation, IRFwOperation
 
 
 def transform_policy(graph: IRGraph, resource):
@@ -15,34 +14,44 @@ def transform_policy(graph: IRGraph, resource):
     dp = 2
     tp = ndevs // dp
 
+    # dataloader
+
+    dnodes = [node for node in graph.nodes() if isinstance(node, IRDataOperation)]
+    for dnode in dnodes:
+        algo = dnode.algorithms('data')
+        dp_nodes = graph.partition(dnode, algo, config=dict(chunk_num=dp))
+        for idx, dp_node in enumerate(dp_nodes):
+            dp_node.tag = idx * tp
+
     fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
 
     for fnode in fnodes:
         sub_nodes = list()
         if isinstance(fnode, CubeComplexSelfAttention):
-            algo = fnode.algorithms('head')
-            tp_nodes = graph.partition(fnode, algo, config=dict(chunk_num=tp))
-            for tp_node in tp_nodes:
-                algo = tp_node.algorithms('data')
-                dp_nodes = graph.partition(tp_node, algo, config=dict(chunk_num=dp))
-                sub_nodes += dp_nodes
+            algo = fnode.algorithms('data')
+            dp_nodes = graph.partition(fnode, algo, config=dict(chunk_num=dp))
+            for dp_node in dp_nodes:
+                algo = dp_node.algorithms('head')
+                tp_nodes = graph.partition(dp_node, algo, config=dict(chunk_num=tp))
+                sub_nodes += tp_nodes
         elif isinstance(fnode, CubeComplexFeedForward):
-            algo = fnode.algorithms('tensor')
-            tp_nodes = graph.partition(fnode, algo, config=dict(chunk_num=tp))
-            for tp_node in tp_nodes:
-                algo = tp_node.algorithms('data')
-                dp_nodes = graph.partition(tp_node, algo, config=dict(chunk_num=dp))
-                sub_nodes += dp_nodes
+            algo = fnode.algorithms('data')
+            dp_nodes = graph.partition(fnode, algo, config=dict(chunk_num=dp))
+            for dp_node in dp_nodes:
+                algo = dp_node.algorithms('tensor')
+                tp_nodes = graph.partition(dp_node, algo, config=dict(chunk_num=tp))
+                sub_nodes += tp_nodes
         else:
-            rep_nodes = graph.replicate(fnode, times=tp)
-            for rep_node in rep_nodes:
-                algo = rep_node.algorithms('dim')
-                dp_nodes = graph.partition(rep_node, algo, config=dict(dim=1, chunk_num=dp))
-                sub_nodes += dp_nodes
+            # note replicate should put in the last due to bugs:
+            algo = fnode.algorithms('dim')
+            dp_nodes = graph.partition(fnode, algo, config=dict(dim=1, chunk_num=dp))
+            for dp_node in dp_nodes:
+                rep_nodes = graph.replicate(dp_node, times=tp)
+                sub_nodes += rep_nodes
         for idx, sub_node in enumerate(sub_nodes):
             sub_node.tag = idx
 
-    # print(graph)
+    print(graph)
     # assert False
     return graph
 
@@ -53,7 +62,8 @@ def schedule_policy(sugraph: SUGraph, resource):
     """
     for su in sugraph.sus():
         if su.stype == SUType.Dataloader:
-            sugraph.assign(su, 0)
+            devid = su.tag[0]
+            sugraph.assign(su, devid)
     for su in sugraph.fsus():
         devid = su.tag[0]
         sugraph.assign(su, devid)
