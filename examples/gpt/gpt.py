@@ -17,23 +17,22 @@ import torch.nn.functional as F
 import cube
 
 
-from examples.transformer.policy.tensor_parallel import transform_policy
-from examples.transformer.policy.tensor_parallel import schedule_policy
+from examples.gpt.policy.megatron_parallel import transform_policy
+from examples.gpt.policy.megatron_parallel import schedule_policy
 
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
+from cube.profiler.memory import memory_summary
 
 
 class MultiHeadSelfAttention(nn.Module):
 
-    def __init__(self, seq_len, embed_dim, heads, dropout):
+    def __init__(self, embed_dim, heads, dropout):
         super().__init__()
 
-        self.seq_len = seq_len
-        self.embed_dim = embed_dim
         self.num_head = heads
         self.dim_head = embed_dim // heads
-        self.scale = self.dim_head ** -0.5
+        self.dropout = dropout
 
         self.weight_qkv = torch.nn.Parameter(torch.empty(
             3 * embed_dim, embed_dim
@@ -41,81 +40,65 @@ class MultiHeadSelfAttention(nn.Module):
         self.weight_out = torch.nn.Parameter(torch.empty(
             embed_dim, embed_dim
         ))
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         """
-        x: [L, N, E]: seq_len, batch_size, embedding dimension
-        output: [L, N, E]
+        Multi-Head Self-Attention.
+
+        L: sequence length
+        N: batch size
+        E: embedding size
+
+        Inputs:
+            hidden_state: [L, N, E]
+            w_qkv       : [3 * num_head * dim_head, E]
+            w_out       : [E, E]
+
+        Outputs:
+            hidden_state: [L, N, E]
         """
-        # [L, N, E] -> 3 x [L, (N * num_head), dim_head]
-        q, k, v = cube.runtime.function.toqkv(
-            x, self.weight_qkv, self.num_head
+        
+        hidden_state = cube.runtime.function.complex.self_attn(
+            x, self.weight_qkv, self.weight_out,
+            self.num_head, self.dim_head, self.dropout
         )
-
-        # [L, (N * num_head), dim_head] -> [(N * num_head), L, dim_head]
-        q = q.transpose(0, 1)
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-
-        # [(N * num_head), L, dim_head] -> [(N * num_head), L, dim_head]
-        q = q * self.scale
-        # [(N * num_head), L, dim_head] -> [(N * num_head), dim_head, L]
-        k = k.transpose(-2, -1)
-        # [(N * num_head), L, dim_head] * [(N * num_head), dim_head, L]
-        # -> [(N * num_head), L, L]
-        attn = torch.bmm(q, k)
-
-        # [(N * num_head), L, L] -> [(N * num_head), L, L]
-        attn = cube.runtime.function.tril_mask(attn, self.num_head)
-
-        # [(N * num_head), L, L] -> [(N * num_head), L, L]
-        attn = F.softmax(attn, dim=-1)
-
-        # [(N * num_head), L, L] -> [(N * num_head), L, L]
-        attn = self.dropout(attn)
-        # [(N * num_head), L, L] * [(N * num_head), L, dim_head]
-        # -> [(N * num_head), L, dim_head]
-        output = torch.bmm(attn, v)
-
-        # [(N * num_head), L, dim_head] -> [L, N, num_head * dim_head]
-        output = cube.runtime.function.attn_view(output, self.num_head)
-
-        # [L, N, num_head * dim_head] * [E, embed_head * dim_head]
-        # -> [L, N, E]
-        output = F.linear(output, self.weight_out)
-        return output
+        return hidden_state
 
 
 class FFN(torch.nn.Module):
 
     def __init__(self, hidden_size: int):
         super().__init__()
-        self.dense_h_to_4h = torch.nn.Linear(
-            hidden_size, 4 * hidden_size
+        self.proj1_weight = torch.nn.Parameter(
+            torch.empty(4 * hidden_size, hidden_size)
         )
-        self.dense_4h_to_h = torch.nn.Linear(
-            4 * hidden_size, hidden_size
+        self.proj1_bias = torch.nn.Parameter(
+            torch.empty(4 * hidden_size)
+        )
+        self.proj2_weight = torch.nn.Parameter(
+            torch.empty(hidden_size, 4 * hidden_size)
+        )
+        self.proj2_bias = torch.nn.Parameter(
+            torch.empty(hidden_size)
         )
 
     def forward(self, hidden_states):
-        # [L, N, E] * [E, 4E] -> [L, N, 4E]
-        out = self.dense_h_to_4h(hidden_states)
-        # [L, N, 4E] -> [L, N, 4E]
-        out = F.gelu(out)
-        # [L, N, 4E] * [4E, E] -> [L, N, E]
-        out = self.dense_4h_to_h(out)
-        return out
+        hidden_states = cube.runtime.function.complex.feedforward(
+            hidden_states,
+            self.proj1_weight, self.proj1_bias,
+            self.proj2_weight, self.proj2_bias
+        )
+        return hidden_states
 
 
 class TransformerLayer(torch.nn.Module):
 
-    def __init__(self, seq_len, hidden_size, head_num, dropout):
+    def __init__(self, hidden_size, num_head, dropout):
         super().__init__()
         # layer norm
         self.input_layernorm = torch.nn.LayerNorm(hidden_size, eps=0.00001)
 
-        self.attention = MultiHeadSelfAttention(seq_len, hidden_size, head_num, dropout)
+        self.attention = MultiHeadSelfAttention(hidden_size, num_head, dropout)
         self.attn_dropout = torch.nn.Dropout(dropout)
 
         self.ffn_layernorm = torch.nn.LayerNorm(hidden_size, eps=0.00001)
@@ -138,22 +121,6 @@ class TransformerLayer(torch.nn.Module):
         # ffn_out = ffn_out + residual
         ffn_out = ffn_out * 2
         return ffn_out
-
-
-class Embedding(torch.nn.Module):
-
-    def __init__(self, num_embed, dim_embed, dropout):
-        super().__init__()
-        self.num_embed = num_embed
-        self.weight = torch.nn.Parameter(
-            torch.empty(self.num_embed, dim_embed)
-        )
-
-    def forward(self, input):
-        embeddings = cube.runtime.function.embedding(
-            0, self.num_embed, input, self.weight
-        )
-        return embeddings
         
 
 class GPT(torch.nn.Module):
@@ -165,6 +132,7 @@ class GPT(torch.nn.Module):
         self.num_layers = num_layers
         self.bs = bs
         self.seqlen = seqlen
+        self.ntoken = 1.0 / self.bs * self.seqlen
 
         # embeddings
         self.vocab_size = vocab_size
@@ -179,9 +147,13 @@ class GPT(torch.nn.Module):
         self.embed_dropout = torch.nn.Dropout(0.5)
 
         # transformer layers
-        self.layers = torch.nn.ModuleList(
-            [TransformerLayer(seqlen, hidden_size, num_head, 0.5) for _ in range(num_layers)]
-        )
+        # self.layers = torch.nn.ModuleList(
+        #     [TransformerLayer(seqlen, hidden_size, num_head, 0.5) for _ in range(num_layers)]
+        # )
+        self.transform1 = TransformerLayer(hidden_size, num_head, 0.5)
+        self.transform2 = TransformerLayer(hidden_size, num_head, 0.5)
+        self.transform3 = TransformerLayer(hidden_size, num_head, 0.5)
+        self.transform4 = TransformerLayer(hidden_size, num_head, 0.5)
 
         # final linear
         self.final_layernorm = torch.nn.LayerNorm(
@@ -209,31 +181,37 @@ class GPT(torch.nn.Module):
         encoder_input = self.embed_dropout(embeddings)
 
         # [bs, seqlen, hidden size] -> [seqlen, bs, hidden size]
-        hidden_states = encoder_input.transpose(0, 1).contiguous()
+        hidden_states = encoder_input.transpose(0, 1) #.contiguous()
 
         # transformer
         # [seqlen, bs, hidden size] -> [seqlen, bs, hidden size]
-        for layer in self.layers:
-            hidden_states = layer(hidden_states)
+        # for layer in self.layers:
+        #     hidden_states = layer(hidden_states)
+        hidden_states = self.transform1(hidden_states)
+        hidden_states = self.transform2(hidden_states)
+        hidden_states = self.transform3(hidden_states)
+        hidden_states = self.transform4(hidden_states)
         
         hidden_states = self.final_layernorm(hidden_states)
 
         # post process
         # [seqlen, bs, hidden size] -> [bs, seqlen, hidden size]
-        hidden_states = hidden_states.transpose(0, 1).contiguous()
+        hidden_states = hidden_states.transpose(0, 1) # .contiguous()
         # [bs, seqlen, hidden size] * [self.vocab_size, hidden size]
         # => [bs, seqlen, self.vocab_size]
         logits = F.linear(hidden_states, self.vocab_embed_weight)
 
         # loss # for verification, the mask is ommitted
-        loss = torch.sum(logits) / (self.seqlen * self.bs)
+        # [bs, seqlen, self.vocab_size] -> [1]
+        loss = torch.sum(logits) 
+        # loss = loss * self.ntoken
 
         return loss
 
 
 def train():
     L = 512  # seq len
-    N = 1   # batch size
+    N = 4   # batch size
     # configs: [hidden size, num_head]
     # E, num_head = [1536, 16]  # 1.2B model
     # E, num_head = [1920, 20]  # 2.5B model
@@ -274,6 +252,8 @@ def train():
             CudaTimer().stop('e2e')
         if (step + 1) % 20 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
+    
+    memory_summary()
     
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
           CudaTimer().duration(iter_num-40, field_name='e2e')))

@@ -117,14 +117,12 @@ class TransformerLayer(torch.nn.Module):
         ffn_out = self.ffn_dropout(ffn_out)
         # ffn_out = ffn_out + residual
         ffn_out = ffn_out * 2
-
-        loss = torch.sum(ffn_out)
-        return loss
+        return ffn_out
 
 
 class Transformers(torch.nn.Module):
 
-    def __init__(self, hidden_size, head_num, layer_num):
+    def __init__(self, hidden_size, head_num):
         super().__init__()
 
         self.transformer1 = TransformerLayer(hidden_size, head_num, 0.5)
@@ -152,8 +150,8 @@ def train():
     E, num_head = [3072, 32]  # 8.7B model
 
 
-    model = TransformerLayer(
-        hidden_size=E, head_num=num_head, dropout=0.5
+    model = Transformers(
+        hidden_size=E, head_num=num_head
     )
     model = cube.SemanticModel(
         model, input_shapes=([L, N, E],),

@@ -156,6 +156,7 @@ def embedding(input: torch.Tensor, weight: torch.Tensor, start: int, stop: int):
     Outputs:
         output: [*, embed_size]
     """
+    input = input.long()
     input_mask = (input < start) | (input >= stop)
     masked_input = input.clone() - start
     masked_input[input_mask] = 0

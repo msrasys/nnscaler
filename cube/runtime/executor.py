@@ -38,7 +38,8 @@ def backward(input_tensors: List[torch.Tensor], output_tensors, output_tensor_gr
     grads = [None] * len(input_tensors)
     if len(inputs) != 0:
         # print('backwarding... ')
-        in_grads = torch.autograd.grad(output_tensors, inputs, output_tensor_grads)
+        in_grads = torch.autograd.grad(
+            output_tensors, inputs, output_tensor_grads, allow_unused=True)
         for idx, grad in zip(indices, in_grads):
             tensor = input_tensors[idx]
             if isinstance(tensor, torch.nn.Parameter):

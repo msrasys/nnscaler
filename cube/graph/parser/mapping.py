@@ -69,5 +69,7 @@ class Sign2Op:
         
         __customize('feedforward'): function.CubeComplexFeedForward,
 
+        __customize('embedding'): function.CubeComplexEmbedding,
+
     }
 
