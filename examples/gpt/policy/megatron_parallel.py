@@ -14,7 +14,7 @@ def transform_policy(graph: IRGraph, resource):
     """
     print('> transforming graph...')
     ndevs = resource.ngpus
-    dp = 2
+    dp = 1
     tp = ndevs // dp
 
     # dataloader
@@ -108,7 +108,7 @@ def transform_policy(graph: IRGraph, resource):
         for idx, sub_node in enumerate(sub_nodes):
             sub_node.tag = idx
 
-    print(graph)
+    # print(graph)
     # assert False
     return graph
 
@@ -117,6 +117,7 @@ def schedule_policy(sugraph: SUGraph, resource):
     """
     The schedule policy assign devices
     """
+    print('> scheduling SU...')
     for su in sugraph.sus():
         if su.stype == SUType.Dataloader:
             devid = su.tag[0]

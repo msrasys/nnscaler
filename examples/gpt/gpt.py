@@ -211,13 +211,11 @@ class GPT(torch.nn.Module):
 
 def train():
     L = 512  # seq len
-    N = 4   # batch size
+    N = 8   # batch size
     # configs: [hidden size, num_head]
-    # E, num_head = [1536, 16]  # 1.2B model
-    # E, num_head = [1920, 20]  # 2.5B model
-    # E, num_head = [2304, 24]  # 4.2B model
-    E, num_head = [3072, 32]  # 8.7B model
-    layers = 4
+    # E, num_head = [2304, 24, 24]  # 1.7B model
+    E, num_head, layers = [3072, 32, 30]  # 3.6B model
+    # E, num_head, layers = [4096, 32, 36]  # 7.5B model
 
 
     model = GPT(
@@ -253,10 +251,12 @@ def train():
         if (step + 1) % 20 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
     
+    iter_time = CudaTimer().duration(iter_num-40, field_name='e2e')
+    throughput = N / iter_time * 1000
+    print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
+          iter_time, throughput)
+    )
     memory_summary()
-    
-    print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-40, field_name='e2e')))
 
 
 if __name__ == '__main__':

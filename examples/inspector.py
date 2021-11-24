@@ -16,11 +16,16 @@ import time
 
 import cube
 from cube.profiler import CudaTimer
+from cube.profiler.memory import memory_summary
 from cube.profiler.timer import print_each_rank
 
-
-kDataShapes = ([512, 32, 3072],)
-kBatchDims  = [1]
+L, N, E = (512, 4, 3072)
+# gpt
+kBatchDims = [0, 0]
+kDataShapes = ([N // 2, L], [N // 2, L])
+# transformer
+# kBatchDims  = [1]
+# kDataShapes = ([512, 4, 3072],)
 
 
 def load_module(filename: str):
@@ -51,7 +56,10 @@ def load_train_fn(filename: str):
 def train(args):
     global kDataShapes
     
-    dataloader = cube.runtime.syndata.SynDataLoader(
+    # dataloader = cube.runtime.syndata.SynDataLoader(
+    #     1280, kBatchDims, *kDataShapes
+    # )
+    dataloader = cube.runtime.syndata.SynTextDataLoader(
         1280, kBatchDims, *kDataShapes
     )
 
@@ -81,6 +89,8 @@ def train(args):
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
           CudaTimer().duration(iter_num-40, field_name='e2e')))
+
+    memory_summary()
 
 
 if __name__ == '__main__':
