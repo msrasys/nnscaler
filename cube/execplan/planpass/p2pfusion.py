@@ -114,7 +114,7 @@ class P2PFusion(PlanPass):
     @staticmethod
     def add_collectives(execplan: ExectuionPlan, coll_sus: List[ScheduleUnit]):
         for coll_su in coll_sus:
-            print(f'inserting Collective SU: {coll_su.name}: {coll_su}')
+            # print(f'inserting Collective SU: {coll_su.name}: {coll_su}')
             # find insert place: the first send
             devid = coll_su.device[0]
             ranks = coll_su.nodes(0).ranks
@@ -483,9 +483,9 @@ class P2PFusion(PlanPass):
                 su.device = rank
                 broadcast_sus.append(su)
 
-                print('>> find broadcast pattern:')
-                print(f'device group: {ranks}')
-                print(su)
+                # print('>> find broadcast pattern:')
+                # print(f'device group: {ranks}')
+                # print(su)
 
         if len(broadcast_sus) == 0:
             return None

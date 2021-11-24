@@ -69,7 +69,7 @@ class ExectuionPlan:
             outfile:
                 the output file name
         """
-        ndevice = max(self.device_seq.keys()) + 1
+        ndevice = len(self.devices())
         # timeline [ [ (start_time, end_time), ... ], ... ]
         device_timeline = [list() for _ in range(ndevice)]
         device_sus = [list() for _ in range(ndevice)]
@@ -82,8 +82,10 @@ class ExectuionPlan:
                     span = 1
                 elif su.stype == SUType.Backward:
                     span = 2
-                elif su.stype == SUType.P2P:
+                elif su.stype in [SUType.P2P, SUType.Transform]:
                     span = 0.1
+                else:
+                    span = 0
                 spans.append(span)
 
         for su, span_time in zip(self.seq.sequence, spans):

@@ -1,5 +1,6 @@
 from typing import Callable, Optional, Tuple
 import torch
+import time
 
 import cube
 from cube.graph.graph import IRGraph
@@ -118,6 +119,9 @@ def compile(model: SemanticModel, dataloader,
         filename = 'gencode{}.py'
         batch_size = torch.tensor([-1], dtype=torch.int).cuda()
         if myrank == 0:
+
+            compile_start = time.time()
+
             SchedulePool().clear()
             resource = cube.runtime.resource.EnvResource()
 
@@ -192,6 +196,10 @@ def compile(model: SemanticModel, dataloader,
             batch_size = list(all_batch_size)[0]
             # assume batch_size is always first dimension
             batch_size = torch.tensor([batch_size], dtype=torch.int).cuda()
+
+            compile_end = time.time()
+            compile_time = compile_end - compile_start
+            print(f'> compile time: {compile_time} seconds')
 
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
