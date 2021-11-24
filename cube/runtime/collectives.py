@@ -106,6 +106,8 @@ def all_reduce(tensors: List[torch.Tensor], ranks: List[int]):
     # print(f'{torch.distributed.get_rank()}: all_reduce...')
     assert len(tensors) == 1
     tensor = tensors[0]
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
     tensor = tensor.detach()
     tensor = tensor.requires_grad_()
 
