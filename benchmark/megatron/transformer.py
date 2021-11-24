@@ -153,9 +153,7 @@ class TransformerLayer(torch.nn.Module):
         ffn_out = self.ffn_dropout(ffn_out)
         # ffn_out = ffn_out + residual
         ffn_out = ffn_out * 2
-
-        loss = torch.sum(ffn_out)
-        return loss
+        return ffn_out
 
 
 def train():
@@ -178,7 +176,8 @@ def train():
         data = next(dataloader)
         torch.distributed.broadcast(data, 0)
         torch.cuda.synchronize()
-        loss = model(data)
+        out = model(data)
+        loss = torch.sum(out)
         loss.backward()
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
@@ -197,8 +196,11 @@ def train():
         if (step + 1) % 20 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
     
-    print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-40, field_name='e2e')))
+    iter_time = CudaTimer().duration(iter_num-40, field_name='e2e')
+    throughput = N / iter_time * 1000
+    print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
+          iter_time, throughput)
+    )
 
 
 if __name__ == '__main__':

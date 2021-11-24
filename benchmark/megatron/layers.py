@@ -156,3 +156,35 @@ class RowParallelLinear(torch.nn.Module):
             output = output_parallel
         return output
 
+
+class ShardEmbedding(torch.nn.Module):
+
+    def __init__(self, num_embeddings, embedding_dim):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+
+        self.shard_num = torch.distributed.get_world_size()
+        self.myshard = torch.distributed.get_rank()
+
+        shard_num_embeddings = self.num_embeddings // self.shard_num
+        self.vocab_start_index = shard_num_embeddings * self.myshard
+        self.vocab_end_index = self.vocab_start_index + shard_num_embeddings 
+
+        self.weight = torch.nn.Parameter(
+            torch.empty(shard_num_embeddings, self.embedding_dim)
+        )
+
+    def forward(self, input_):
+        # Build the mask.
+        input_mask = (input_ < self.vocab_start_index) | \
+                     (input_ >= self.vocab_end_index)
+        # Mask the input.
+        masked_input = input_.clone() - self.vocab_start_index
+        masked_input[input_mask] = 0
+        output_parallel = F.embedding(
+            masked_input, self.weight,
+            None, None, 2., False, False
+        )
+        output = RowOutputAdapter.apply(output_parallel)
+        return output
