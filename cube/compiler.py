@@ -153,12 +153,12 @@ def compile(model: SemanticModel, dataloader,
             execplan = RemoveRedundantAdapters.apply(execplan)
             # print(f'> after remove redundant adapters:\n {execplan}')
             execplan = MergeComputeSU.apply(execplan)
-            print(f'> after merge backward SU:\n {execplan}')
+            # print(f'> after merge backward SU:\n {execplan}')
             execplan = WeightGradAllreduceFusion.apply(execplan)
             # print(f'> after add allreduce:\n{execplan}')
 
             execplan = P2PFusion.apply(execplan)
-            print(f'> after fuse P2P SU:\n {execplan}')
+            # print(f'> after fuse P2P SU:\n {execplan}')
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()
