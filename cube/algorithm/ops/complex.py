@@ -8,6 +8,7 @@ from cube.graph.operator.function import CubeComplexTrilMask
 from cube.graph.operator.function import CubeComplexAttnView
 from cube.graph.operator.function import CubeComplexSelfAttention
 from cube.graph.operator.function import CubeComplexFeedForward
+from cube.graph.operator.function import CubeComplexEmbedding
 
 
 _kWaitDecision = None
@@ -555,6 +556,101 @@ class CubeFeedForwardDataParallel(GenericDistAlgo):
             ]
             node = CubeComplexFeedForward(
                 signature = 'cube.runtime.function.complex.feedforward',
+                inputs = inputs,
+            )
+            node.set_output(0, outs[idx])
+            nodes.append(node)
+        return nodes
+
+
+class CubeEmbedDataParallel(GenericDistAlgo):
+
+    def __init__(self, node: CubeComplexEmbedding):
+        if not isinstance(node, CubeComplexEmbedding):
+            raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
+        super().__init__(node)
+        self.chunk_num = _kWaitDecision
+        self.dims = node.inputs(0).shape
+
+    def satisfy(self, config: Dict):
+        chunk_num = int(config['chunk_num'])
+        dim = int(config['dim'])
+        if dim >= len(self.dims):
+            return False
+        if chunk_num > 0 and self.dims[dim] % chunk_num == 0:
+            return True
+        return False
+
+    def instantiate(self, node: CubeComplexEmbedding, config: Dict):
+        if not self.satisfy(config):
+            raise RuntimeError("Instantiate failed. Condition not satisfied.")
+        self.chunk_num = int(config['chunk_num'])
+        dim = int(config['dim'])
+        
+        input = node.inputs(0)
+        weight = node.inputs(1)
+        start = node.kwargs['start']
+        stop = node.kwargs['stop']
+        
+        out = node.outputs(0)
+
+        ins = split_axis(input, dim, self.chunk_num)
+        outs = split_axis(out, dim, self.chunk_num)
+
+        nodes = list()
+        for idx in range(self.chunk_num):
+            inputs = [
+                ins[idx], weight, start, stop
+            ]
+            node = CubeComplexEmbedding(
+                signature = 'cube.runtime.function.complex.embedding',
+                inputs = inputs,
+            )
+            node.set_output(0, outs[idx])
+            nodes.append(node)
+        return nodes
+
+
+class CubeEmbedShardingParallel(GenericDistAlgo):
+
+    def __init__(self, node: CubeComplexEmbedding):
+        if not isinstance(node, CubeComplexEmbedding):
+            raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
+        super().__init__(node)
+        self.chunk_num = _kWaitDecision
+        self.vocabs = node.inputs(1).shape[0]
+
+    def satisfy(self, config: Dict):
+        chunk_num = int(config['chunk_num'])
+        if chunk_num > 0 and self.vocabs % chunk_num == 0:
+            return True
+        return False
+
+    def instantiate(self, node: CubeComplexEmbedding, config: Dict):
+        if not self.satisfy(config):
+            raise RuntimeError("Instantiate failed. Condition not satisfied.")
+        self.chunk_num = int(config['chunk_num'])
+        
+        input = node.inputs(0)
+        weight = node.inputs(1)
+        start = node.kwargs['start']
+        stop = node.kwargs['stop']
+        shard = (stop - start) // self.chunk_num
+        
+        out = node.outputs(0)
+
+        ws = split_axis(weight, 0, self.chunk_num)
+        outs = split_value(out, self.chunk_num)
+
+        nodes = list()
+        for idx in range(self.chunk_num):
+            shard_start = start + shard * idx
+            shard_stop = shard_start + shard
+            inputs = [
+                input, ws[idx], shard_start, shard_stop
+            ]
+            node = CubeComplexEmbedding(
+                signature = 'cube.runtime.function.complex.embedding',
                 inputs = inputs,
             )
             node.set_output(0, outs[idx])

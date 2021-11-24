@@ -459,3 +459,85 @@ def test_complex_feedforward_data_parallel():
         assert node.inputs(2).shape == [4 * E,]
         assert node.inputs(3).shape == [E, 4 * E]
         assert node.inputs(4).shape == [E,]
+
+
+def test_embed_shard_parallel():
+    L = 64      # seq len
+    N = 16      # batch
+    vocab = 50304
+    E = 1024
+
+    ids = IRFullTensor(shape=[L, N], name='hidden').tosub()
+    weight = IRFullTensor(shape=[vocab, E], name='hidden').tosub()
+    start = 0
+    stop = vocab
+
+    semantic_op = complex.CubeComplexEmbedding(
+        signature = 'cube.runtime.function.complex.embedding',
+        inputs = [ids, weight, start, stop]
+    )
+    semantic_op.infer_shape()
+
+    assert semantic_op.outputs(0).shape == [L, N, E]
+
+    op_shard = complex.CubeEmbedShardingParallel(semantic_op)
+    
+    assert op_shard.satisfy(config=dict(chunk_num=8))
+    assert op_shard.satisfy(config=dict(chunk_num=32))
+    assert not op_shard.satisfy(config=dict(chunk_num=256))
+
+    nodes = op_shard.instantiate(semantic_op, config=dict(chunk_num=4))
+    assert len(nodes) == 4
+    for node in nodes:
+        assert isinstance(node, complex.CubeComplexEmbedding)
+    
+    start = semantic_op.kwargs['start']
+    stop = semantic_op.kwargs['stop']
+    shard = (stop - start) // 4
+    for idx, node in enumerate(nodes):
+        assert node.outputs(0).shape == [L, N, E]
+        assert node.outputs(0).val_map == ValueMap(idx, 4)
+        assert node.inputs(0).shape == [L, N]
+        assert node.inputs(1).shape == [vocab // 4, E]
+        assert node.kwargs['start'] == start + idx * shard
+        assert node.kwargs['stop'] == start + (idx + 1) * shard
+
+
+def test_embed_shard_parallel():
+    L = 64      # seq len
+    N = 16      # batch
+    vocab = 50304
+    E = 1024
+
+    ids = IRFullTensor(shape=[L, N], name='hidden').tosub()
+    weight = IRFullTensor(shape=[vocab, E], name='hidden').tosub()
+    start = 0
+    stop = vocab
+
+    semantic_op = complex.CubeComplexEmbedding(
+        signature = 'cube.runtime.function.complex.embedding',
+        inputs = [ids, weight, start, stop]
+    )
+    semantic_op.infer_shape()
+
+    assert semantic_op.outputs(0).shape == [L, N, E]
+
+    op_shard = complex.CubeEmbedDataParallel(semantic_op)
+    
+    assert op_shard.satisfy(config=dict(dim=1, chunk_num=8))
+    assert not op_shard.satisfy(config=dict(dim=1, chunk_num=32))
+
+    nodes = op_shard.instantiate(semantic_op, config=dict(dim=1, chunk_num=4))
+    assert len(nodes) == 4
+    for node in nodes:
+        assert isinstance(node, complex.CubeComplexEmbedding)
+    
+    start = semantic_op.kwargs['start']
+    stop = semantic_op.kwargs['stop']
+    for idx, node in enumerate(nodes):
+        assert node.outputs(0).shape == [L, N // 4, E]
+        assert node.outputs(0).val_map == ValueMap(0, 1)
+        assert node.inputs(0).shape == [L, N // 4]
+        assert node.inputs(1).shape == [vocab, E]
+        assert node.kwargs['start'] == start
+        assert node.kwargs['stop'] == stop

@@ -141,3 +141,27 @@ def feedforward(hidden_state, w_proj1, w_bias1, w_proj2, w_bias2):
     out = F.gelu(out)
     out = F.linear(out, w_proj2, w_bias2)
     return out
+
+
+def embedding(input: torch.Tensor, weight: torch.Tensor, start: int, stop: int):
+    """
+    Embedding
+
+    Inputs:
+        input: torch.Tensor [*]
+        weight: [vocab size, embed size]
+        start: int
+        stop: int
+
+    Outputs:
+        output: [*, embed_size]
+    """
+    input_mask = (input < start) | (input >= stop)
+    masked_input = input.clone() - start
+    masked_input[input_mask] = 0
+    output = F.embedding(
+        masked_input, weight,
+        None, None, 2.0, False, False
+    )
+    output[input_mask, :] = 0.0
+    return output

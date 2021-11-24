@@ -479,7 +479,7 @@ class CubeComplexFeedForward(IRFwOperation):
     """
     def __init__(self, signature, inputs, name='selfattn', **kwargs):
         if len(inputs) != 5:
-            raise RuntimeError(f"Expected 6 inputs but got {input}")
+            raise RuntimeError(f"Expected 6 inputs but got {inputs}")
         super().__init__(
             name, signature,
             input_length = 5,
@@ -492,6 +492,32 @@ class CubeComplexFeedForward(IRFwOperation):
         if self.inputs(0).shape is None:
             return False
         self.outputs(0).shape = self.inputs(0).shape
+        return True
+
+
+class CubeComplexEmbedding(IRFwOperation):
+    """
+    Embedding
+    """
+    def __init__(self, signature, inputs, name='embedding', **kwargs):
+        if len(inputs) != 4:
+            raise RuntimeError(f"Expected 4 inputs but got {inputs}")
+        input, weight = inputs[0], inputs[1]
+        start, stop = inputs[2], inputs[3]
+        super().__init__(
+            name, signature,
+            input_length = 2,
+            output_length = 1
+        )
+        self.set_input(0, input)
+        self.set_input(1, weight)
+        self.kwargs['start'] = start
+        self.kwargs['stop'] = stop
+
+    def infer_shape(self):
+        if self.inputs(0).shape is None or self.inputs(1).shape is None:
+            return False
+        self.outputs(0).shape = self.inputs(0).shape + [self.inputs(1).shape[1]]
         return True
 
 
