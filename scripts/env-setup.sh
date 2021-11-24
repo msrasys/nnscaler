@@ -1,5 +1,5 @@
 
-echo using docker image pytorch-cuda11.3: nvcr.io/nvidia/pytorch:21.06-py3
+echo using docker image pytorch-cuda11.3: pytorch/pytorch:1.9.0-cuda10.2-cudnn7-runtime
 
 git config --global core.editor "vim"
 git config --global user.name "Zhiqi Lin"
@@ -38,7 +38,7 @@ echo 'export CUDA_HOME=/usr/local/cuda' >> ~/.bashrc
 
 # cmd for count code lines
 # find cube/ -name "*.py" -print0 | xargs -0 wc -l
-
+pip uninstall training_daemon
 python setup.py develop
 pip install -r requirements.txt
 
