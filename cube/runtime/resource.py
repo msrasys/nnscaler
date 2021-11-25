@@ -23,3 +23,7 @@ class EnvResource:
 
     def __getattr__(self, name):
         return getattr(self.instance, name)
+
+
+    def __setattr__(self, name, val) -> None:
+        setattr(EnvResource.instance, name, val)

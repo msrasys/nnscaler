@@ -17,6 +17,11 @@ from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 from cube.profiler.memory import memory_summary
 
+import argparse
+
+
+from benchmark.swin.layers import ColumnParallelLinear, RowParallelLinear
+
 
 def drop_path(x, drop_prob: float = 0.):
     if drop_prob == 0.:
@@ -29,14 +34,16 @@ def drop_path(x, drop_prob: float = 0.):
     return output
 
 
-class Mlp(nn.Module):
+class MegatronMlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
+        # self.fc1 = nn.Linear(in_features, hidden_features)
+        self.fc1 = ColumnParallelLinear(in_features, hidden_features, full_input=True, full_output=False)
         self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
+        # self.fc2 = nn.Linear(hidden_features, out_features)
+        self.fc2 = RowParallelLinear(hidden_features, out_features, full_input=False, full_output=True)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
@@ -96,7 +103,7 @@ def window_position_index(window_size_h: int, window_size_w: int):
     return relative_position_index
 
 
-class WindowAttention(nn.Module):
+class MegatronWindowAttention(nn.Module):
     r""" Window based multi-head self attention (W-MSA) module with relative position bias.
     It supports both of shifted and non-shifted window.
     Args:
@@ -114,17 +121,20 @@ class WindowAttention(nn.Module):
         super().__init__()
         self.dim = dim
         self.window_size = window_size  # Wh, Ww
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
+        self.global_num_heads = num_heads
+        self.num_heads = num_heads // torch.distributed.get_world_size()
+        self.dim_heads = dim // self.global_num_heads
+        self.scale = qk_scale or self.dim_heads ** -0.5
 
         # define a parameter table of relative position bias
         self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), self.num_heads))  # 2*Wh-1 * 2*Ww-1, nH
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv = ColumnParallelLinear(dim, dim * 3, bias=qkv_bias, full_input=True, full_output=False)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        # self.proj = nn.Linear(dim, dim)
+        self.proj = RowParallelLinear(dim, dim, full_input=False, full_output=True)
         self.proj_drop = nn.Dropout(proj_drop)
 
         # trunc_normal_(self.relative_position_bias_table, std=.02)
@@ -137,7 +147,7 @@ class WindowAttention(nn.Module):
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
         B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, self.dim_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
         q = q * self.scale
@@ -163,7 +173,7 @@ class WindowAttention(nn.Module):
 
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, self.num_heads * self.dim_heads)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -220,14 +230,14 @@ class SwinTransformerBlock(nn.Module):
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
-        self.attn = WindowAttention(
+        self.attn = MegatronWindowAttention(
             dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
             qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
 
         self.drop_path_p = drop_path
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.mlp = MegatronMlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
         if self.shift_size > 0:
             # calculate attention mask for SW-MSA
@@ -619,18 +629,20 @@ class SwinTransformer(nn.Module):
         return flops
 
 
-def train():
+def train(args):
+    resource = cube.runtime.resource.EnvResource()
 
     # image batch input
-    N, C, H, W = [1, 3, 224, 224]
-
-    embed_dim, depths, num_heads, window_size = [
-        96, [2, 2, 6, 2], [3, 6, 12, 24], 7
-    ]
+    N, C, H, W = [32, 3, 224, 224]
 
     # embed_dim, depths, num_heads, window_size = [
-    #     256, [2, 2, 18, 2], [8, 16, 32, 64], 7
+    #     96, [2, 2, 6, 2], [3, 6, 12, 24], 7
     # ]
+
+    # 348.55 M
+    embed_dim, depths, num_heads, window_size = [
+        256, [2, 2, 18, 2], [8, 16, 32, 64], 7
+    ]
 
     # 1.02B Model
     # embed_dim, depths, num_heads, window_size = [
@@ -642,13 +654,15 @@ def train():
                             depths = depths,
                             num_heads = num_heads,
                             window_size = window_size)
-    
-    
-    module = torch.jit.script(model)
-    print(module.graph)
-    # print(parser.ScriptModuleParser.flatten(module, depth=2))
-
     model = model.cuda()
+
+    # setup data parallel reducer
+    reducer = None
+    if torch.distributed.get_world_size(group=resource.dp_group) > 1:
+        print('> initialize weight reducer')
+        reducer = resource.reducer
+        for param in model.parameters():
+            reducer.add_param(param)
 
     dataloader = cube.runtime.syndata.SynDataLoader(1280, [0], [N, C, H, W])
 
@@ -657,8 +671,14 @@ def train():
         loss = model(img)
         loss = torch.sum(loss)
         loss.backward()
+        if reducer is not None:
+            reducer.allreduce()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # start training
+    nparams_million = sum(p.numel() for p in model.parameters()) / 1000 / 1000
+    print_each_rank('model has {:.2f} million parameters'.format(nparams_million))
 
     CudaTimer().warmup()
     torch.distributed.barrier()
@@ -670,7 +690,7 @@ def train():
         optimizer.step()
         optimizer.zero_grad()
         if step == 1:
-            print('> passed on iteration')
+            print('> passed on 1st iteration')
         if step >= 40:
             CudaTimer().stop('e2e')
         if (step + 1) % 20 == 0:
@@ -685,6 +705,62 @@ def train():
 
 
 if __name__ == '__main__':
+    
+    # resource allocation
+    parser = argparse.ArgumentParser(description='swin')
+    parser.add_argument('--tp', type=int, default=1,
+                        help='tensor parallel size')
+    parser.add_argument('--dp', type=int, default=1,
+                        help='data parallel size')
+    parser.add_argument('--pp', type=int, default=1,
+                        help='pipeline parallel size')
+    parser.add_argument('--micro-bs', type=int, default=-1)
+    args = parser.parse_args()
 
     cube.init()
-    train()
+
+    # allocate resource
+    resource = cube.runtime.resource.EnvResource()
+    ndevs = resource.ngpus
+
+    tp_size, tp_group_nums = args.tp, ndevs // args.tp
+    dp_size, dp_group_nums = args.dp, ndevs // args.dp
+    pp_size, pp_group_nums = args.pp, ndevs // args.pp
+
+    if not pp_size * dp_size * tp_size == ndevs:
+        raise RuntimeError("Expected all devices are used")
+
+    devs = cube.runtime.device.DeviceGroup()
+
+    myrank = torch.distributed.get_rank()
+
+    # initialize data parallel group
+    all_data_parallel_group_ranks = list()
+    for i in range(pp_size):
+        start_rank = i * pp_group_nums
+        end_rank = (i + 1) * pp_group_nums
+        for j in range(tp_size):
+            ranks = list(range(start_rank + j, end_rank, tp_size))
+            all_data_parallel_group_ranks.append(ranks)
+            # initialize groups
+            group = devs.get_group(ranks)
+            if myrank in ranks:
+                resource.dp_group = group
+                resource.reducer = cube.runtime.reducer.Reducer(ranks)
+
+    # initialize pipelne parallel groups
+    for i in range(dp_size):
+        ranks = [data_parallel_group_ranks[i]
+                 for data_parallel_group_ranks in all_data_parallel_group_ranks]
+        group = devs.get_group(ranks)
+        if myrank in ranks:
+            resource.pp_group = group
+
+    # initialize tensor parallel groups
+    for i in range(tp_group_nums):
+        ranks = list(range(i * tp_size, (i + 1) * tp_size))
+        group = devs.get_group(ranks)
+        if myrank in ranks:
+            resource.tp_group = group
+
+    train(args)
