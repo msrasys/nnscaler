@@ -270,27 +270,36 @@ class SwinTransformerBlock(nn.Module):
             shifted_x = x
 
         # partition windows
-        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+        # [B, H, W, C] -> [B * num_windows, window_size_h, windows_size_w, C]
+        x_windows = window_partition(shifted_x, self.window_size)
+        # -> [B * num_windows, window_size_h * windows_size_w, C]
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
 
         # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+        # same in/out: [B * num_windows, window_size_h * windows_size_w, C]
+        attn_windows = self.attn(x_windows, mask=self.attn_mask)
 
         # merge windows
+        # [B * num_windows, w_h * w_w, C] -> [B * num_windows, w_h, w_w, C]
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+        # [B * num_windows, window_size_h, windows_size_w, C] -> [B, H', W', C]
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
 
         # reverse cyclic shift
+        # [B, H', W', C] -> [B, H, W, C]
+        x = shifted_x
         if self.shift_size > 0:
             x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-        else:
-            x = shifted_x
+        # [B, H, W, C] -> [B, H * W, C]
         x = x.view(B, H * W, C)
-
-        # FFN
+        # [B, H * W, C] -> [B, H * W, C]
         x = shortcut + drop_path(x, self.drop_path_p)
+        # FFN
+        # [B, H * W, C] -> [B, H * W, C]
         ffn = self.norm2(x)
+        # [B, H * W, C] -> [B, H * W, C]
         ffn = self.mlp(ffn)
+        # [B, H * W, C] + [B, H * W, C] -> [B, H * W, C]
         x = x + drop_path(ffn, self.drop_path_p)
 
         return x
