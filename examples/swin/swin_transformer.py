@@ -82,6 +82,20 @@ def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int):
     return x
 
 
+def window_position_index(window_size_h: int, window_size_w: int):
+    coords_h = torch.arange(window_size_h)
+    coords_w = torch.arange(window_size_w)
+    coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+    coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+    relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+    relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+    relative_coords[:, :, 0] += window_size_h - 1  # shift to start from 0
+    relative_coords[:, :, 1] += window_size_w - 1
+    relative_coords[:, :, 0] *= 2 * window_size_w - 1
+    relative_position_index = relative_coords.sum(-1).view(-1)  # Wh*Ww, Wh*Ww
+    return relative_position_index
+
+
 class WindowAttention(nn.Module):
     r""" Window based multi-head self attention (W-MSA) module with relative position bias.
     It supports both of shifted and non-shifted window.
@@ -108,19 +122,6 @@ class WindowAttention(nn.Module):
         self.relative_position_bias_table = nn.Parameter(
             torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
 
-        # get pair-wise relative position index for each token inside the window
-        coords_h = torch.arange(self.window_size[0])
-        coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
-        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
-        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
-        relative_coords[:, :, 1] += self.window_size[1] - 1
-        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
-        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
-        self.register_buffer("relative_position_index", relative_position_index)
-
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
@@ -142,8 +143,13 @@ class WindowAttention(nn.Module):
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        relative_position_index = window_position_index(self.window_size[0], self.window_size[1])
+        relative_position_bias = self.relative_position_bias_table[relative_position_index]
+        # [Wh * Ww, Wh * Ww, nH]
+        relative_position_bias = relative_position_bias.view(
+            self.window_size[0] * self.window_size[1],
+            self.window_size[0] * self.window_size[1], -1
+        )
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
         attn = attn + relative_position_bias.unsqueeze(0)
 
@@ -628,8 +634,10 @@ def train():
                             num_heads = num_heads,
                             window_size = window_size)
     
+    
     module = torch.jit.script(model)
     print(module.graph)
+    # print(parser.ScriptModuleParser.flatten(module, depth=2))
 
     model = model.cuda()
 
