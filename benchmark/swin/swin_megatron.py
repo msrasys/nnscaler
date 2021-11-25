@@ -1,11 +1,16 @@
 
 # --------------------------------------------------------
-# Swin Transformer
-# Copyright (c) 2021 Microsoft
-# Licensed under The MIT License [see LICENSE for details]
-# Written by Ze Liu
-
-# Copied and modified from 
+# Modified from Swin-Transformer Repo
+"""
+python -m torch.distributed.launch \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    --node_rank=0 \
+    --master_addr=127.0.0.1 \
+    --master_port=8004 \
+    --use_env \
+    benchmark/swin/swin_megatron.py
+"""
 # --------------------------------------------------------
 
 from typing import Optional
