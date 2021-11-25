@@ -10,7 +10,7 @@ def _reduce(input_):
     """All-reduce the input tensor across model parallel group."""
 
     # Bypass the function if we are using only 1 GPU.
-    world_size = torch.distributed.get_world_size()
+    world_size = torch.distributed.get_world_size(group=EnvResource().tp_group)
     if world_size == 1:
         return input_
     group = EnvResource().tp_group
@@ -22,8 +22,8 @@ def _split(input_):
     """Split the tensor along its last dimension and keep the
     corresponding slice."""
 
-    world_size = torch.distributed.get_world_size()
-    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size(group=EnvResource().tp_group)
+    rank = torch.distributed.get_rank(group=EnvResource().tp_group)
     # Bypass the function if we are using only 1 GPU.
     if world_size==1:
         return input_
@@ -37,8 +37,8 @@ def _split(input_):
 def _gather(input_):
     """Gather tensors and concatinate along the last dimension."""
 
-    world_size = torch.distributed.get_world_size()
-    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size(group=EnvResource().tp_group)
+    rank = torch.distributed.get_rank(group=EnvResource().tp_group)
     # Bypass the function if we are using only 1 GPU.
     if world_size==1:
         return input_
@@ -100,7 +100,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.full_input = full_input
         self.full_output = full_output
 
-        world_size = torch.distributed.get_world_size()
+        world_size = torch.distributed.get_world_size(group=EnvResource().tp_group)
 
         # print_each_rank(f'> parallizing linear using column partition: '
         #                 f'{output_size} partitioned by {world_size} devices')
@@ -145,7 +145,7 @@ class RowParallelLinear(torch.nn.Module):
         self.full_input = full_input
         self.full_output = full_output
 
-        world_size = torch.distributed.get_world_size()
+        world_size = torch.distributed.get_world_size(group=EnvResource().tp_group)
 
         # print_each_rank(f'> parallizing linear using row partition: '
         #                 f'{output_size} partitioned by {world_size} devices')
@@ -187,8 +187,8 @@ class ShardEmbedding(torch.nn.Module):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
 
-        self.shard_num = torch.distributed.get_world_size()
-        self.myshard = torch.distributed.get_rank()
+        self.shard_num = torch.distributed.get_world_size(group=EnvResource().tp_group)
+        self.myshard = torch.distributed.get_rank(group=EnvResource().tp_group)
 
         shard_num_embeddings = self.num_embeddings // self.shard_num
         self.vocab_start_index = shard_num_embeddings * self.myshard

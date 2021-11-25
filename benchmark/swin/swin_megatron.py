@@ -122,7 +122,8 @@ class MegatronWindowAttention(nn.Module):
         self.dim = dim
         self.window_size = window_size  # Wh, Ww
         self.global_num_heads = num_heads
-        self.num_heads = num_heads // torch.distributed.get_world_size()
+        group = cube.runtime.resource.EnvResource().tp_group
+        self.num_heads = num_heads // torch.distributed.get_world_size(group=group)
         self.dim_heads = dim // self.global_num_heads
         self.scale = qk_scale or self.dim_heads ** -0.5
 
@@ -658,13 +659,14 @@ def train(args):
 
     # setup data parallel reducer
     reducer = None
-    if torch.distributed.get_world_size(group=resource.dp_group) > 1:
+    if args.dp > 1:
         print('> initialize weight reducer')
         reducer = resource.reducer
         for param in model.parameters():
             reducer.add_param(param)
 
-    dataloader = cube.runtime.syndata.SynDataLoader(1280, [0], [N, C, H, W])
+    dataloader = cube.runtime.syndata.SynDataLoader(
+        1280, [0], [N // args.dp, C, H, W])
 
     def train_iter(model, dataloader):
         img = next(dataloader)
@@ -745,8 +747,10 @@ if __name__ == '__main__':
             # initialize groups
             group = devs.get_group(ranks)
             if myrank in ranks:
+                dp_ranks = ranks
                 resource.dp_group = group
                 resource.reducer = cube.runtime.reducer.Reducer(ranks)
+    print_each_rank(f'initialzed data parallel group: {dp_ranks}', rank_only=myrank)
 
     # initialize pipelne parallel groups
     for i in range(dp_size):
@@ -754,13 +758,17 @@ if __name__ == '__main__':
                  for data_parallel_group_ranks in all_data_parallel_group_ranks]
         group = devs.get_group(ranks)
         if myrank in ranks:
+            pp_ranks = ranks
             resource.pp_group = group
+    print_each_rank(f'initialzed pipeline parallel group: {pp_ranks}', rank_only=myrank)
 
     # initialize tensor parallel groups
     for i in range(tp_group_nums):
         ranks = list(range(i * tp_size, (i + 1) * tp_size))
         group = devs.get_group(ranks)
         if myrank in ranks:
+            tp_ranks = ranks
             resource.tp_group = group
+    print_each_rank(f'initialzed tensor parallel group: {tp_ranks}', rank_only=myrank)
 
     train(args)
