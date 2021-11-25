@@ -18,6 +18,7 @@ def transform_policy(graph, resource):
                 sub_nodes = graph.partition(node, algo, config=dict(chunk_num=micro_batch_num))
             else:
                 algo = node.algorithms('dim')
+                # dim trace
                 sub_nodes = graph.partition(node, algo, config=dict(dim=0, chunk_num=micro_batch_num))
             for idx, sub_node in enumerate(sub_nodes):
                 sub_node.tag = idx
@@ -58,7 +59,7 @@ def schedule_policy(sugraph: SUGraph, resource):
         bstage = [fsu.mirror for fsu in fstage][::-1]
         return bstage
     
-    # assign su to stages
+    # assign su to SU Group
     for micro_bid, fseq in enumerate(fseqs):
         chunk_num = int(len(fseq) // resource.ngpus)
         for idx, fsu in enumerate(fseq):

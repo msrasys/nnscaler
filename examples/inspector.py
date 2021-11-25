@@ -19,10 +19,10 @@ from cube.profiler import CudaTimer
 from cube.profiler.memory import memory_summary
 from cube.profiler.timer import print_each_rank
 
-L, N, E = (512, 4, 3072)
+L, N, E = (512, 8, 3072)
 # gpt
 kBatchDims = [0, 0]
-kDataShapes = ([N // 2, L], [N // 2, L])
+kDataShapes = ([N, L], [N, L])
 # transformer
 # kBatchDims  = [1]
 # kDataShapes = ([512, 4, 3072],)
@@ -67,29 +67,39 @@ def train(args):
     model = load_module(genfile)
     train_fn = load_train_fn(genfile)
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     CudaTimer().warmup()
     torch.distributed.barrier()
-    with torch.profiler.profile() as prof:
-        iter_num = args.iter_num
+    iter_num = args.iter_num
+
+    def train_iters():
         for step in range(iter_num):
             if step >= 40:
                 CudaTimer().start('e2e')
             train_fn(model, dataloader)
             optimizer.step()
             optimizer.zero_grad()
+            if step == 1:
+                print('test passed')
             if step >= 40:
                 CudaTimer().stop('e2e')
             if (step + 1) % 20 == 0:
                 print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
             time.sleep(0.05)
 
-    prof.export_chrome_trace(f"trace{torch.distributed.get_rank()}.json")
+    if args.profile:
+        with torch.profiler.profile() as prof:
+            train_iters()
+        prof.export_chrome_trace(f"trace{torch.distributed.get_rank()}.json")
+    else:
+        train_iters()
 
-    print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-40, field_name='e2e')))
-
+    iter_time = CudaTimer().duration(iter_num-40, field_name='e2e')
+    throughput = N / iter_time * 1000
+    print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
+          iter_time, throughput)
+    )
     memory_summary()
 
 
@@ -100,6 +110,7 @@ if __name__ == '__main__':
                         default='gencode{rank}.py')
     parser.add_argument('--iter-num', type=int,
                         default=128)
+    parser.add_argument('--profile', dest='profile', action='store_true')
     args = parser.parse_args()
 
     cube.init()

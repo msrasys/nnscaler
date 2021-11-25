@@ -422,6 +422,26 @@ class ScheduleUnit(IRCell):
         else:
             raise TypeError("Expected index to be None or int")
 
+    def is_identity(self):
+        """
+        Check if the SU is identity
+        """
+        # not assigned
+        if len(self.device) == 0:
+            return False
+        if self.stype == SUType.P2P:
+            send_ranks = set(self.device)
+            recv_ranks = set(self.device)
+            for node in self.nodes():
+                send_ranks.update(node.send_ranks)
+                recv_ranks.update(node.recv_ranks)
+            if list(send_ranks) != self.device:
+                return False
+            if list(recv_ranks) != self.device:
+                return False
+            return True
+        return False
+
     @staticmethod
     def get_inputs(nodes):
         """

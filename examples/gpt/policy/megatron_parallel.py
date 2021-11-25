@@ -1,3 +1,5 @@
+import time
+
 from cube.graph import IRGraph
 from cube.graph.operator.function import CubeComplexEmbedding, Linear, Sum
 from cube.graph.operator.function import CubeComplexFeedForward
@@ -116,14 +118,21 @@ def schedule_policy(sugraph: SUGraph, resource):
     The schedule policy assign devices
     """
     print('> scheduling SU...')
+    start_time = time.time()
+
     for su in sugraph.sus():
         if su.stype == SUType.Dataloader:
             devid = su.tag[0]
             sugraph.assign(su, devid)
+    print('> [scheduling] assign device...')
     for su in sugraph.fsus():
         devid = su.tag[0]
         sugraph.assign(su, devid)
         sugraph.assign(su.mirror, devid)
     fsus = sugraph.fsus()
+    print('> [scheduling] setting schedule order...')
     sugraph.partial_set_order(fsus, lazy=False)
+
+    span = time.time() - start_time
+    print('> Done scheduling: {:.2f} seconds'.format(span))
     return sugraph

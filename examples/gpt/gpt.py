@@ -233,7 +233,7 @@ def train():
         loss.backward()
     model = model.get_gen_module()
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     CudaTimer().warmup()
     torch.distributed.barrier()
