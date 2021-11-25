@@ -123,6 +123,9 @@ class MegatronWindowAttention(nn.Module):
         self.window_size = window_size  # Wh, Ww
         self.global_num_heads = num_heads
         group = cube.runtime.resource.EnvResource().tp_group
+        tp_world_size = torch.distributed.get_world_size(group=group)
+        if num_heads % tp_world_size != 0:
+            print(f'detecting un-even num head {num_heads} partition to {tp_world_size}')
         self.num_heads = num_heads // torch.distributed.get_world_size(group=group)
         self.dim_heads = dim // self.global_num_heads
         self.scale = qk_scale or self.dim_heads ** -0.5
@@ -132,6 +135,7 @@ class MegatronWindowAttention(nn.Module):
             torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), self.num_heads))  # 2*Wh-1 * 2*Ww-1, nH
 
         # self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # print(f'qkv embed dim: {dim}')
         self.qkv = ColumnParallelLinear(dim, dim * 3, bias=qkv_bias, full_input=True, full_output=False)
         self.attn_drop = nn.Dropout(attn_drop)
         # self.proj = nn.Linear(dim, dim)
@@ -634,21 +638,26 @@ def train(args):
     resource = cube.runtime.resource.EnvResource()
 
     # image batch input
-    N, C, H, W = [32, 3, 224, 224]
+    N, C, H, W = [1, 3, 224, 224]
 
     # embed_dim, depths, num_heads, window_size = [
     #     96, [2, 2, 6, 2], [3, 6, 12, 24], 7
     # ]
 
     # 348.55 M
-    embed_dim, depths, num_heads, window_size = [
-        256, [2, 2, 18, 2], [8, 16, 32, 64], 7
-    ]
+    # embed_dim, depths, num_heads, window_size = [
+    #     256, [2, 2, 18, 2], [8, 16, 32, 64], 7
+    # ]
 
-    # 1.02B Model
+    # 895.7 M Model
     # embed_dim, depths, num_heads, window_size = [
     #     384, [2, 2, 22, 2], [12, 24, 48, 96], 7
     # ]
+
+    # 2.01B model
+    embed_dim, depths, num_heads, window_size = [
+        576, [2, 2, 22, 2], [12, 24, 48, 96], 7
+    ]
 
 
     model = SwinTransformer(embed_dim = embed_dim,
@@ -656,6 +665,7 @@ def train(args):
                             num_heads = num_heads,
                             window_size = window_size)
     model = model.cuda()
+    memory_summary()
 
     # setup data parallel reducer
     reducer = None
@@ -693,6 +703,7 @@ def train(args):
         optimizer.zero_grad()
         if step == 1:
             print('> passed on 1st iteration')
+            memory_summary()
         if step >= 40:
             CudaTimer().stop('e2e')
         if (step + 1) % 20 == 0:
