@@ -130,3 +130,98 @@ def roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, group):
         dim: int
     """
     return RollDimParallel.apply(input, shift, dim, group)
+
+
+class GridPartition(torch.autograd.Function):
+    """
+    Full input
+    """
+    @staticmethod
+    def forward(ctx, input_, nrow: int, ncol: int, group=None):
+        """
+        input: [B, H, W, C]
+        """
+        ctx.group = group
+        world_size = torch.distributed.get_world_size(group)
+        ctx.nrow = nrow
+        ctx.ncol = ncol
+        assert nrow * ncol == world_size
+        rank = torch.distributed.get_rank(group)
+        myrow = rank // ncol
+        mycol = rank % ncol
+
+        chunk = torch.chunk(input_, nrow, dim=1)[myrow]
+        chunk = torch.chunk(chunk, ncol, dim=2)[mycol].contiguous()
+        return chunk
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = ctx.group
+        nrow = ctx.nrow
+        ncol = ctx.ncol
+
+        world_size = torch.distributed.get_world_size(group)
+        rank = torch.distributed.get_rank(group)
+        grad_output = grad_output.contiguous()
+        tensor_list = [torch.empty_like(grad_output) for _ in range(world_size)]
+        tensor_list[rank] = grad_output
+        torch.distributed.all_gather(tensor_list, grad_output, group=group)
+
+        rows = list()
+        for row in range(nrow):
+            row_slice = torch.cat(tuple(tensor_list[row*ncol:(row+1)*ncol]), dim=2)
+            rows.append(row_slice)
+        grad_output = torch.cat(tuple(rows), dim=1).contiguous()
+        return grad_output, None, None, None
+
+
+class GridCollection(torch.autograd.Function):
+    """
+    Full input
+    """
+    @staticmethod
+    def forward(ctx, input_, nrow: int, ncol: int, group=None):
+        """
+        input: [B, H, W, C]
+        output: [B, nrow * H, ncol * W, C]
+        """
+        ctx.group = group
+        world_size = torch.distributed.get_world_size(group)
+        ctx.nrow = nrow
+        ctx.ncol = ncol
+        assert nrow * ncol == world_size
+
+        world_size = torch.distributed.get_world_size(group)
+        rank = torch.distributed.get_rank(group)
+        tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
+        tensor_list[rank] = input_
+        torch.distributed.all_gather(tensor_list, input_, group=group)
+
+        rows = list()
+        for row in range(nrow):
+            row_slice = torch.cat(tuple(tensor_list[row*ncol:(row+1)*ncol]), dim=2)
+            rows.append(row_slice)
+        output = torch.cat(tuple(rows), dim=1).contiguous()
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = ctx.group
+        nrow = ctx.nrow
+        ncol = ctx.ncol
+
+        rank = torch.distributed.get_rank(group)
+        myrow = rank // ncol
+        mycol = rank % ncol
+
+        chunk = torch.chunk(grad_output, nrow, dim=1)[myrow]
+        chunk = torch.chunk(chunk, ncol, dim=2)[mycol].contiguous()
+        return chunk, None, None, None
+
+
+def grid_partition(input_, nrow, ncol, group=None):
+    return GridPartition.apply(input_, nrow, ncol, group)
+
+
+def grid_collection(input_, nrow, ncol, group=None):
+    return GridCollection.apply(input_, nrow, ncol, group)

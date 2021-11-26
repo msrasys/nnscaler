@@ -80,8 +80,41 @@ def test_roll_parallel_autograd():
     print(input.grad)
 
 
+def test_grid_partition():
+
+    group = None
+    world_size = torch.distributed.get_world_size(group=group)
+    assert world_size == 4
+    input_size = [1, 56, 56, 256]
+    input = torch.randn(input_size).cuda() * 10
+    input = input.requires_grad_()
+    out = cube.runtime.function.grid_partition(input, 2, 2, group = None)
+    print(out.shape)
+    assert out.shape == torch.Size([1, 56 // 2, 56 // 2, 256])
+    loss = torch.sum(out)
+    loss.backward()
+    # print(input.grad)
+
+
+def test_grid_collection():
+
+    group = None
+    world_size = torch.distributed.get_world_size(group=group)
+    assert world_size == 4
+    input_size = [1, 56 // 2, 56 // 2, 256]
+    input = torch.randn(input_size).cuda() * 10
+    input = input.requires_grad_()
+    out = cube.runtime.function.grid_collection(input, 2, 2, group = None)
+    assert out.shape == torch.Size([1, 56, 56, 256])
+    loss = torch.sum(out)
+    loss.backward()
+    # print(input.grad)
+
+
 if __name__ == '__main__':
 
     cube.init()
     # test_roll_parallel()
-    test_roll_parallel_autograd()
+    # test_roll_parallel_autograd()
+    # test_grid_partition()
+    test_grid_collection()
