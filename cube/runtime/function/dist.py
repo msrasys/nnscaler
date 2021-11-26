@@ -1,4 +1,14 @@
 import torch
+from torch.distributed.distributed_c10d import _get_global_rank
+
+from cube.profiler.timer import print_each_rank
+
+
+def get_global_rank(group, group_rank):
+    if group is None:
+        return group_rank
+    else:
+        return _get_global_rank(group, group_rank)
 
 
 def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, group):
@@ -11,6 +21,8 @@ def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, group):
         dim: int
     """
     world_size = torch.distributed.get_world_size(group)
+    if world_size == 1:
+        return torch.roll(input, (shift), (dim,))
     rank = torch.distributed.get_rank(group)
     # halo exchange at H dimension
     if shift < 0:
@@ -24,14 +36,21 @@ def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, group):
         else:
             raise NotImplementedError("Only support on dim 1 and dim 2")
         recv_tensor = torch.empty_like(remote)
+
         # send to next rank and recv from prevous rank
+        # print_each_rank(f'send to {(rank - 1 + world_size) % world_size}, recv from {(rank + 1) % world_size}')
+        send_local_rank = (rank - 1 + world_size) % world_size
+        send_global_rank = get_global_rank(group, send_local_rank)
+        recv_local_rank = (rank + 1) % world_size
+        recv_global_rank = get_global_rank(group, recv_local_rank)
+
         send_op = torch.distributed.P2POp(
             torch.distributed.isend, remote,
-            (rank - 1 + world_size) % world_size, group=group
+            send_global_rank, group=group
         )
         recv_op = torch.distributed.P2POp(
             torch.distributed.irecv, recv_tensor,
-            (rank + 1) % world_size, group=group
+            recv_global_rank, group=group
         )
         ops = [send_op, recv_op] if rank % 2 == 0 else [recv_op, send_op]
         reqs = torch.distributed.batch_isend_irecv(ops)
@@ -50,13 +69,20 @@ def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, group):
         else:
             raise NotImplementedError("Only support on dim 1 and dim 2")
         recv_tensor = torch.empty_like(remote)
+
+        # to global rank
+        send_local_rank = (rank + 1) % world_size
+        send_global_rank = get_global_rank(group, send_local_rank)
+        recv_local_rank = (rank - 1 + world_size) % world_size
+        recv_global_rank = get_global_rank(group, recv_local_rank)
+
         send_op = torch.distributed.P2POp(
             torch.distributed.isend, remote,
-            (rank + 1) % world_size, group=group
+            send_global_rank, group=group
         )
         recv_op = torch.distributed.P2POp(
             torch.distributed.irecv, recv_tensor,
-            (rank - 1 + world_size) % world_size, group=group
+            recv_global_rank, group=group
         )
         ops = [send_op, recv_op] if rank % 2 == 0 else [recv_op, send_op]
         reqs = torch.distributed.batch_isend_irecv(ops)
