@@ -34,7 +34,7 @@ def test_roll_parallel():
     CudaTimer().start(field_name='roll_halo')
     for _ in range(1000):
         roll_out = cube.runtime.function.roll_dim_parallel(
-            input, -(9 // 2), 1, group
+            input, (9 // 2), 1, group
         )
     CudaTimer().stop(field_name='roll_halo')
     ref1 = roll_out
@@ -48,7 +48,7 @@ def test_roll_parallel():
     CudaTimer().start(field_name='roll_allgather')
     for _ in range(1000):
         roll_out = cube.runtime.function.roll_dim_allgather(
-            input, -(9 // 2), 1, group
+            input, (9 // 2), 1, group
         )
     CudaTimer().stop(field_name='roll_allgather')
     ref2 = roll_out
@@ -62,7 +62,26 @@ def test_roll_parallel():
         print('correctness test passed')
 
 
+def test_roll_parallel_autograd():
+
+    group = None
+    world_size = torch.distributed.get_world_size(group=group)
+    input_size = [1, 224 // world_size, 224, 256]
+    # input_size = torch.arange(0, )
+    input = torch.randn(input_size).cuda() * 10
+    input = input.requires_grad_()
+
+    out = cube.runtime.function.roll_dim_parallel(
+        input, (9 // 2), 1, group
+    )
+    loss = torch.sum(out)
+    loss.backward()
+    print(loss)
+    print(input.grad)
+
+
 if __name__ == '__main__':
 
     cube.init()
-    test_roll_parallel()
+    # test_roll_parallel()
+    test_roll_parallel_autograd()
