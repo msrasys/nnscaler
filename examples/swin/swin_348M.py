@@ -23,7 +23,6 @@ import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 from cube.profiler.memory import memory_summary
-from cube.runtime import reducer
 from cube.runtime.device import DeviceGroup
 from cube.runtime.reducer import Reducer
 
@@ -476,24 +475,24 @@ class BasicLayer(nn.Module):
                     break
             if nH > nW:
                 raise RuntimeError(f"layer {layer_id}: Cannot window partition plan")
-            print_each_rank(f"layer {layer_id}: Find partition plan: Width // {nW}, Height // {nH}")
+            print_each_rank(f"layer {layer_id}: Find partition plan: H{H} // {nH}, W{W} // {nW}")
             self.wp_resolution = (H // nH, W // nW)
             self.wp_group = wp_group
             # wp_group multi dim shift ranks
-            for i in range(nW):
-                ranks = list(range(i * nH, (i + 1) * nH))
+            for i in range(nH):
+                ranks = list(range(i * nW, (i + 1) * nW))
                 if torch.distributed.get_rank(wp_group) in ranks:
                     wp_nW_ranks = ranks
                     break
-            for i in range(nH):
-                ranks = list(range(i, wp, nH))
+            for i in range(nW):
+                ranks = list(range(i, wp, nW))
                 if torch.distributed.get_rank(wp_group) in ranks:
                     wp_nH_ranks = ranks
                     break
             assert wp_nH_ranks != [-1]
             assert wp_nW_ranks != [-1]
-            # print_each_rank(f'window parallel nH local ranks: {wp_nH_ranks}')
-            # print_each_rank(f'window parallel nW local ranks: {wp_nW_ranks}')
+            print_each_rank(f'window parallel nH group ranks: {wp_nH_ranks}')
+            print_each_rank(f'window parallel nW group ranks: {wp_nW_ranks}')
 
         # build blocks
         self.blocks = nn.ModuleList()
@@ -868,9 +867,9 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     pconfigs = [
-        dict(layer_id=1, tp=4, wp=2, dp=args.dp), # basic layer 0
+        dict(layer_id=1, tp=2, wp=4, dp=args.dp), # basic layer 0
         dict(layer_id=2, tp=4, wp=2, dp=args.dp), # basic layer 1
-        dict(layer_id=3, tp=4, wp=2, dp=args.dp), # basic layer 2
+        dict(layer_id=3, tp=2, wp=4, dp=args.dp), # basic layer 2  # prob at 8:1?
         dict(layer_id=4, tp=8, wp=1, dp=args.dp), # basic layer 3
     ]
 

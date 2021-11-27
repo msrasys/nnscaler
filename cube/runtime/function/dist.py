@@ -23,6 +23,7 @@ def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, dim_ranks, gro
         shift: int
         dim: int
     """
+    return input
     world_size = len(dim_ranks)
     if world_size == 1:
         return torch.roll(input, (shift), (dim,))
@@ -137,24 +138,24 @@ class RollDimParallel(torch.autograd.Function):
     """
     @staticmethod
     def forward(ctx, input_, shift: int, dim: int, dim_ranks: List[int], group=None):
-        CudaTimer().start(field_name='roll parallel_fw')
+        CudaTimer().start(field_name='roll parallel')
         ctx.shift = shift
         ctx.dim = dim
         ctx.group = group
         ctx.dim_ranks = dim_ranks
         output = _roll_dim_parallel(input_, shift, dim, dim_ranks, group)
-        CudaTimer().stop(field_name='roll parallel_fw')
+        CudaTimer().stop(field_name='roll parallel')
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        CudaTimer().start(field_name='roll parallel_bw')
+        CudaTimer().start(field_name='roll parallel')
         shift = ctx.shift
         dim = ctx.dim
         group = ctx.group
         dim_ranks = ctx.dim_ranks
         grad = _roll_dim_parallel(grad_output, 0-shift, dim, dim_ranks, group)
-        CudaTimer().stop(field_name='roll parallel_bw')
+        CudaTimer().stop(field_name='roll parallel')
         return grad, None, None, None, None
 
 
@@ -187,7 +188,7 @@ class GridPartition(torch.autograd.Function):
         """
         input: [B, H, W, C]
         """
-        CudaTimer().start(field_name='grid_partition_forward')
+        CudaTimer().start(field_name='grid_partition')
         ctx.group = group
         world_size = torch.distributed.get_world_size(group)
         ctx.nrow = nrow
@@ -199,12 +200,12 @@ class GridPartition(torch.autograd.Function):
 
         chunk = torch.chunk(input_, nrow, dim=1)[myrow]
         chunk = torch.chunk(chunk, ncol, dim=2)[mycol].contiguous()
-        CudaTimer().stop(field_name='grid_partition_forward')
+        CudaTimer().stop(field_name='grid_partition')
         return chunk
 
     @staticmethod
     def backward(ctx, grad_output):
-        CudaTimer().start(field_name='grid_partition_backward')
+        CudaTimer().start(field_name='grid_partition')
         group = ctx.group
         nrow = ctx.nrow
         ncol = ctx.ncol
@@ -221,7 +222,7 @@ class GridPartition(torch.autograd.Function):
             row_slice = torch.cat(tuple(tensor_list[row*ncol:(row+1)*ncol]), dim=2)
             rows.append(row_slice)
         grad_output = torch.cat(tuple(rows), dim=1).contiguous()
-        CudaTimer().stop(field_name='grid_partition_backward')
+        CudaTimer().stop(field_name='grid_partition')
         return grad_output, None, None, None
 
 
@@ -235,7 +236,7 @@ class GridCollection(torch.autograd.Function):
         input: [B, H, W, C]
         output: [B, nrow * H, ncol * W, C]
         """
-        CudaTimer().start(field_name='grid_collection_forward')
+        CudaTimer().start(field_name='grid_collection')
         ctx.group = group
         world_size = torch.distributed.get_world_size(group)
         ctx.nrow = nrow
@@ -253,12 +254,12 @@ class GridCollection(torch.autograd.Function):
             row_slice = torch.cat(tuple(tensor_list[row*ncol:(row+1)*ncol]), dim=2)
             rows.append(row_slice)
         output = torch.cat(tuple(rows), dim=1).contiguous()
-        CudaTimer().stop(field_name='grid_collection_forward')
+        CudaTimer().stop(field_name='grid_collection')
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        CudaTimer().start(field_name='grid_collection_backward')
+        CudaTimer().start(field_name='grid_collection')
         group = ctx.group
         nrow = ctx.nrow
         ncol = ctx.ncol
@@ -269,7 +270,7 @@ class GridCollection(torch.autograd.Function):
 
         chunk = torch.chunk(grad_output, nrow, dim=1)[myrow]
         chunk = torch.chunk(chunk, ncol, dim=2)[mycol].contiguous()
-        CudaTimer().stop(field_name='grid_collection_backward')
+        CudaTimer().stop(field_name='grid_collection')
         return chunk, None, None, None
 
 
