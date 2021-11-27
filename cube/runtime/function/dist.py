@@ -1,7 +1,10 @@
+from typing import Tuple, List
 import torch
 from torch.distributed.distributed_c10d import _get_global_rank
 
 from cube.profiler.timer import print_each_rank
+
+from cube.profiler.timer import CudaTimer
 
 
 def get_global_rank(group, group_rank):
@@ -11,7 +14,7 @@ def get_global_rank(group, group_rank):
         return _get_global_rank(group, group_rank)
 
 
-def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, group):
+def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, dim_ranks, group):
     """
     partition torch.roll at shifted dimension
 
@@ -20,10 +23,11 @@ def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, group):
         shift: int
         dim: int
     """
-    world_size = torch.distributed.get_world_size(group)
+    world_size = len(dim_ranks)
     if world_size == 1:
         return torch.roll(input, (shift), (dim,))
-    rank = torch.distributed.get_rank(group)
+    global_rank = torch.distributed.get_rank()
+    dim_rank = dim_ranks.index(torch.distributed.get_rank(group))
     # halo exchange at H dimension
     if shift < 0:
         shift = 0 - shift
@@ -38,26 +42,27 @@ def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, group):
         recv_tensor = torch.empty_like(remote)
 
         # send to next rank and recv from prevous rank
-        # print_each_rank(f'send to {(rank - 1 + world_size) % world_size}, recv from {(rank + 1) % world_size}')
-        send_local_rank = (rank - 1 + world_size) % world_size
+        send_local_rank = dim_ranks[(dim_rank - 1 + world_size) % world_size]
         send_global_rank = get_global_rank(group, send_local_rank)
-        recv_local_rank = (rank + 1) % world_size
+        recv_local_rank = dim_ranks[(dim_rank + 1) % world_size]
         recv_global_rank = get_global_rank(group, recv_local_rank)
+        # print_each_rank(f'send to {send_global_rank}, recv from {recv_global_rank}')
 
         send_op = torch.distributed.P2POp(
             torch.distributed.isend, remote,
-            send_global_rank, group=group
+            send_global_rank, group=group, tag=global_rank
         )
         recv_op = torch.distributed.P2POp(
             torch.distributed.irecv, recv_tensor,
-            recv_global_rank, group=group
+            recv_global_rank, group=group, tag=recv_global_rank
         )
-        ops = [send_op, recv_op] if rank % 2 == 0 else [recv_op, send_op]
+        ops = [send_op, recv_op] if dim_rank % 2 == 0 else [recv_op, send_op]
         reqs = torch.distributed.batch_isend_irecv(ops)
         for req in reqs:
             req.wait()
         tensor = torch.cat((local, recv_tensor), dim=dim).contiguous()
         return tensor
+
     elif shift > 0:
         boundary = input.shape[dim] - shift
         if dim == 1:
@@ -71,20 +76,21 @@ def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, group):
         recv_tensor = torch.empty_like(remote)
 
         # to global rank
-        send_local_rank = (rank + 1) % world_size
+        send_local_rank = dim_ranks[(dim_rank + 1) % world_size]
         send_global_rank = get_global_rank(group, send_local_rank)
-        recv_local_rank = (rank - 1 + world_size) % world_size
+        recv_local_rank = dim_ranks[(dim_rank - 1 + world_size) % world_size]
         recv_global_rank = get_global_rank(group, recv_local_rank)
+        # print_each_rank(f'send to {send_global_rank}, recv from {recv_global_rank}')
 
         send_op = torch.distributed.P2POp(
             torch.distributed.isend, remote,
-            send_global_rank, group=group
+            send_global_rank, group=group, tag=global_rank
         )
         recv_op = torch.distributed.P2POp(
             torch.distributed.irecv, recv_tensor,
-            recv_global_rank, group=group
+            recv_global_rank, group=group, tag=recv_global_rank
         )
-        ops = [send_op, recv_op] if rank % 2 == 0 else [recv_op, send_op]
+        ops = [send_op, recv_op] if dim_rank % 2 == 0 else [recv_op, send_op]
         reqs = torch.distributed.batch_isend_irecv(ops)
         for req in reqs:
             req.wait()
@@ -130,23 +136,29 @@ class RollDimParallel(torch.autograd.Function):
     
     """
     @staticmethod
-    def forward(ctx, input_, shift: int, dim: int, group=None):
+    def forward(ctx, input_, shift: int, dim: int, dim_ranks: List[int], group=None):
+        CudaTimer().start(field_name='roll parallel_fw')
         ctx.shift = shift
         ctx.dim = dim
         ctx.group = group
-        output = _roll_dim_parallel(input_, shift, dim, group)
+        ctx.dim_ranks = dim_ranks
+        output = _roll_dim_parallel(input_, shift, dim, dim_ranks, group)
+        CudaTimer().stop(field_name='roll parallel_fw')
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
+        CudaTimer().start(field_name='roll parallel_bw')
         shift = ctx.shift
         dim = ctx.dim
         group = ctx.group
-        grad = _roll_dim_parallel(grad_output, 0-shift, dim, group)
-        return grad, None, None, None
+        dim_ranks = ctx.dim_ranks
+        grad = _roll_dim_parallel(grad_output, 0-shift, dim, dim_ranks, group)
+        CudaTimer().stop(field_name='roll parallel_bw')
+        return grad, None, None, None, None
 
 
-def roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, group):
+def roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, dim_ranks, group):
     """
     partition torch.roll at shifted dimension
 
@@ -155,7 +167,15 @@ def roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, group):
         shift: int
         dim: int
     """
-    return RollDimParallel.apply(input, shift, dim, group)
+    return RollDimParallel.apply(input, shift, dim, dim_ranks, group)
+
+
+def roll_grid_parallel(input: torch.Tensor,
+                       shifts: Tuple[int, int], dims: Tuple[int, int],
+                       nh_group_ranks: List[int], nw_group_ranks: List[int], group):
+    input = roll_dim_parallel(input, shifts[0], 1, nh_group_ranks, group)
+    input = roll_dim_parallel(input, shifts[1], 2, nw_group_ranks, group)
+    return input
 
 
 class GridPartition(torch.autograd.Function):
@@ -167,6 +187,7 @@ class GridPartition(torch.autograd.Function):
         """
         input: [B, H, W, C]
         """
+        CudaTimer().start(field_name='grid_partition_forward')
         ctx.group = group
         world_size = torch.distributed.get_world_size(group)
         ctx.nrow = nrow
@@ -178,10 +199,12 @@ class GridPartition(torch.autograd.Function):
 
         chunk = torch.chunk(input_, nrow, dim=1)[myrow]
         chunk = torch.chunk(chunk, ncol, dim=2)[mycol].contiguous()
+        CudaTimer().stop(field_name='grid_partition_forward')
         return chunk
 
     @staticmethod
     def backward(ctx, grad_output):
+        CudaTimer().start(field_name='grid_partition_backward')
         group = ctx.group
         nrow = ctx.nrow
         ncol = ctx.ncol
@@ -198,6 +221,7 @@ class GridPartition(torch.autograd.Function):
             row_slice = torch.cat(tuple(tensor_list[row*ncol:(row+1)*ncol]), dim=2)
             rows.append(row_slice)
         grad_output = torch.cat(tuple(rows), dim=1).contiguous()
+        CudaTimer().stop(field_name='grid_partition_backward')
         return grad_output, None, None, None
 
 
@@ -211,6 +235,7 @@ class GridCollection(torch.autograd.Function):
         input: [B, H, W, C]
         output: [B, nrow * H, ncol * W, C]
         """
+        CudaTimer().start(field_name='grid_collection_forward')
         ctx.group = group
         world_size = torch.distributed.get_world_size(group)
         ctx.nrow = nrow
@@ -228,10 +253,12 @@ class GridCollection(torch.autograd.Function):
             row_slice = torch.cat(tuple(tensor_list[row*ncol:(row+1)*ncol]), dim=2)
             rows.append(row_slice)
         output = torch.cat(tuple(rows), dim=1).contiguous()
+        CudaTimer().stop(field_name='grid_collection_forward')
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
+        CudaTimer().start(field_name='grid_collection_backward')
         group = ctx.group
         nrow = ctx.nrow
         ncol = ctx.ncol
@@ -242,6 +269,7 @@ class GridCollection(torch.autograd.Function):
 
         chunk = torch.chunk(grad_output, nrow, dim=1)[myrow]
         chunk = torch.chunk(chunk, ncol, dim=2)[mycol].contiguous()
+        CudaTimer().stop(field_name='grid_collection_backward')
         return chunk, None, None, None
 
 

@@ -17,6 +17,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import argparse
+import time
 
 import cube
 from cube.profiler import CudaTimer
@@ -273,7 +274,7 @@ class SwinTransformerBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 tp_group=-1, wp_group=-1):
+                 tp_group=-1, wp_plans=-1):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -304,6 +305,7 @@ class SwinTransformerBlock(nn.Module):
         )
 
         if self.shift_size > 0:
+            self.wp_group, self.wp_nH_ranks, self.wp_nW_ranks = wp_plans
             # calculate attention mask for SW-MSA
             H, W = self.input_resolution
             img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
@@ -339,7 +341,11 @@ class SwinTransformerBlock(nn.Module):
 
         # cyclic shift
         if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            shifted_x = cube.runtime.function.roll_grid_parallel(
+                x, (-self.shift_size, -self.shift_size), (1,2),
+                self.wp_nH_ranks, self.wp_nW_ranks, self.wp_group
+            )
+            # shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
             shifted_x = x
 
@@ -363,7 +369,11 @@ class SwinTransformerBlock(nn.Module):
         # [B, H', W', C] -> [B, H, W, C]
         x = shifted_x
         if self.shift_size > 0:
-            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            x = cube.runtime.function.roll_grid_parallel(
+                shifted_x, (self.shift_size, self.shift_size), (1,2),
+                self.wp_nH_ranks, self.wp_nW_ranks, self.wp_group
+            )
+            # x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         # [B, H, W, C] -> [B, H * W, C]
         x = x.view(B, H * W, C)
         # [B, H * W, C] -> [B, H * W, C]
@@ -450,12 +460,47 @@ class BasicLayer(nn.Module):
         tp_ranks, wp_ranks, dp_ranks = setup_device_group(tp, wp, dp, layer_id)
         tp_group = DeviceGroup().get_group(tp_ranks)
         wp_group = DeviceGroup().get_group(wp_ranks)
+        wp_nH_ranks = [-1]
+        wp_nW_ranks = [-1]
+
+        # window parallel
+        self.wp_resolution = input_resolution
+        if wp > 1:
+            H, W = self.input_resolution
+            nH = 1
+            nW = wp // nH
+            while nH <= nW:
+                if H % nH != 0 or W % nW != 0:
+                    nW = nW // 2
+                    nH = int(nH * 2)
+                else:
+                    break
+            if nH > nW:
+                raise RuntimeError(f"layer {layer_id}: Cannot window partition plan")
+            print_each_rank(f"layer {layer_id}: Find partition plan: Width // {nW}, Height // {nH}")
+            self.wp_resolution = (H // nH, W // nW)
+            self.wp_group = wp_group
+            # wp_group multi dim shift ranks
+            for i in range(nW):
+                ranks = list(range(i * nH, (i + 1) * nH))
+                if torch.distributed.get_rank(wp_group) in ranks:
+                    wp_nW_ranks = ranks
+                    break
+            for i in range(nH):
+                ranks = list(range(i, wp, nH))
+                if torch.distributed.get_rank(wp_group) in ranks:
+                    wp_nH_ranks = ranks
+                    break
+            assert wp_nH_ranks != [-1]
+            assert wp_nW_ranks != [-1]
+            print_each_rank(f'window parallel nH local ranks: {wp_nH_ranks}')
+            print_each_rank(f'window parallel nW local ranks: {wp_nW_ranks}')
 
         # build blocks
         self.blocks = nn.ModuleList()
         for i in range(depth):
             block = SwinTransformerBlock(
-                dim=dim, input_resolution=input_resolution,
+                dim=dim, input_resolution=self.wp_resolution,
                 num_heads=num_heads, window_size=window_size,
                 shift_size=0 if (i % 2 == 0) else window_size // 2,
                 mlp_ratio=mlp_ratio,
@@ -463,17 +508,35 @@ class BasicLayer(nn.Module):
                 drop=drop, attn_drop=attn_drop,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_layer=norm_layer,
-                tp_group=tp_group, wp_group=wp_group
+                tp_group=tp_group, wp_plans=(wp_group, wp_nH_ranks, wp_nW_ranks)
             )
             self.blocks.append(block)
-        
+
+        self.wp_preprocess = False
+        self.wp_postprocess = False
         if wp > 1:
             for param in self.blocks.parameters():
-                _reducer_groups[tuple(wp_ranks)].add_param()
+                _reducer_groups[tuple(wp_ranks)].add_param(param)
+            self.wp_preprocess = True
+            self.wp_postprocess = True
 
     def forward(self, x):
+        if self.wp_preprocess:
+            oH, oW = self.input_resolution
+            pH, pW = self.wp_resolution
+            x = x.view(-1, oH, oW, self.dim)
+            x = cube.runtime.function.grid_partition(x, oH // pH, oW // pW, group=self.wp_group)
+            x = x.view(-1, pH * pW, self.dim).contiguous()
+
         for blk in self.blocks:
             x = blk(x)
+
+        if self.wp_postprocess:
+            oH, oW = self.input_resolution
+            pH, pW = self.wp_resolution
+            x = x.view(-1, pH, pW, self.dim)
+            x = cube.runtime.function.grid_collection(x, oH // pH, oW // pW, group=self.wp_group)
+            x = x.view(-1, oH * oW, self.dim)
         return x
 
 
@@ -583,7 +646,7 @@ class SwinTransformer(nn.Module):
 
 
         # ====================== depth 0 ===========================
-        pconfig = dict(layer_id=0, tp=4, wp=1, dp=dp)
+        pconfig = dict(layer_id=0, tp=1, wp=4, dp=dp)
         input_resolution = (
             patches_resolution[0] // (2 ** 0), patches_resolution[1] // (2 ** 0)
         )
@@ -606,7 +669,7 @@ class SwinTransformer(nn.Module):
         )
 
         # ====================== depth 1 ===========================
-        pconfig = dict(layer_id=1, tp=4, wp=1, dp=dp)
+        pconfig = dict(layer_id=1, tp=1, wp=4, dp=dp)
         input_resolution = (
             patches_resolution[0] // (2 ** 1), patches_resolution[1] // (2 ** 1)
         )
@@ -630,7 +693,7 @@ class SwinTransformer(nn.Module):
 
 
         # ====================== depth 2 ===========================
-        pconfig = dict(layer_id=2, tp=4, wp=1, dp=dp)
+        pconfig = dict(layer_id=2, tp=1, wp=4, dp=dp)
         input_resolution = (
             patches_resolution[0] // (2 ** 2), patches_resolution[1] // (2 ** 2)
         )
@@ -688,13 +751,21 @@ class SwinTransformer(nn.Module):
         x = self.patch_embed(x)
         x = self.pos_drop(x)
 
+        CudaTimer().start('basic_layer0')
         x = self.basic_layer0(x)
+        CudaTimer().stop('basic_layer0')
         x = self.merging0(x)
+        CudaTimer().start('basic_layer1')
         x = self.basic_layer1(x)
+        CudaTimer().stop('basic_layer1')
         x = self.merging1(x)
+        CudaTimer().start('basic_layer2')
         x = self.basic_layer2(x)
+        CudaTimer().stop('basic_layer2')
         x = self.merging2(x)
+        CudaTimer().start('basic_layer3')
         x = self.basic_layer3(x)
+        CudaTimer().stop('basic_layer3')
         
         x = self.norm(x)  # B L C
         x = self.avgpool(x.transpose(1, 2))  # B C L
@@ -762,12 +833,15 @@ def train(args):
     nparams_million = sum(p.numel() for p in model.parameters()) / 1000 / 1000
     print_each_rank('model has {:.2f} million parameters'.format(nparams_million))
 
-    CudaTimer().warmup()
+    CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
+    span = 0
     iter_num = 128
     for step in range(iter_num):
         if step >= 40:
-            CudaTimer().start('e2e')
+            torch.cuda.synchronize()
+            start = time.time()
+            CudaTimer(enable=True).start('e2e')
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
@@ -775,16 +849,20 @@ def train(args):
             print('> passed on 1st iteration')
             memory_summary()
         if step >= 40:
+            torch.cuda.synchronize()
+            stop = time.time()
+            span += (stop - start) * 1000
             CudaTimer().stop('e2e')
         if (step + 1) % 20 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
-    iter_time = CudaTimer().duration(iter_num-40, field_name='e2e')
+    iter_time = span / (iter_num-40)
     throughput = N / iter_time * 1000
     print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
           iter_time, throughput)
     )
     memory_summary()
+    CudaTimer().print_all(times=iter_num-40)
 
 
 if __name__ == '__main__':

@@ -29,17 +29,26 @@ class CudaTimer:
     """
     class __CudaTimer:
 
-        def __init__(self):
+        def __init__(self, **kwargs):
             self.start_t = None
             self.stop_t = None
             self.field = dict()
             self.field_data = dict()
+            self.enabled = True
+            if 'enable' in kwargs:
+                self.enabled = kwargs['enable']
     
     instance = None
 
-    def __init__(self):
+    def __init__(self, enable = None):
         if not CudaTimer.instance:
-            CudaTimer.instance = CudaTimer.__CudaTimer()
+            kwargs = dict()
+            if enable is not None:
+                kwargs = dict(enable=enable)
+            CudaTimer.instance = CudaTimer.__CudaTimer(**kwargs)
+        elif enable is not None:
+            CudaTimer.instance.enabled = enable
+
     
     def start(self, field_name='default'):
         """
@@ -47,6 +56,8 @@ class CudaTimer:
 
         Note `start` and `stop` on the same field can be called nestly
         """
+        if not CudaTimer.instance.enabled:
+            return
         torch.cuda.synchronize()
         if field_name not in CudaTimer.instance.field:
             CudaTimer.instance.field[field_name] = list()
@@ -60,6 +71,8 @@ class CudaTimer:
         Returns:
             float (ms)
         """
+        if not CudaTimer.instance.enabled:
+            return
         if field_name not in CudaTimer.instance.field:
             raise RuntimeError("Missing start on the field")
         torch.cuda.synchronize()
@@ -90,7 +103,7 @@ class CudaTimer:
             if 'send' in field_name or 'recv' in field_name:
                 comm_span += span
             msg.append('{} : {:.2f} ms'.format(field_name, span))
-        msg.append('{} : {:.2f} ms'.format('communication', comm_span))
+        # msg.append('{} : {:.2f} ms'.format('communication', comm_span))
         msg = ' | '.join(msg)
 
         print_each_rank(msg)

@@ -2,16 +2,20 @@ import torch
 from torch import autograd
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+from cube.profiler.timer import CudaTimer
 
 
 def _reduce(input_, group):
     """All-reduce the input tensor across model parallel group."""
 
     # Bypass the function if we are using only 1 GPU.
+    CudaTimer().start(field_name='tp_allreduce')
     world_size = torch.distributed.get_world_size(group)
     if world_size == 1:
+        CudaTimer().stop(field_name='tp_allreduce')
         return input_
     torch.distributed.all_reduce(input_, group=group)
+    CudaTimer().stop(field_name='tp_allreduce')
     return input_
 
 
@@ -33,11 +37,13 @@ def _split(input_, group):
 
 def _gather(input_, group):
     """Gather tensors and concatinate along the last dimension."""
+    CudaTimer().start(field_name='tp_allgather')
 
     world_size = torch.distributed.get_world_size(group=group)
     rank = torch.distributed.get_rank(group=group)
     # Bypass the function if we are using only 1 GPU.
     if world_size==1:
+        CudaTimer().stop(field_name='tp_allgather')
         return input_
     # Size and dimension.
     last_dim = input_.dim() - 1
@@ -46,6 +52,8 @@ def _gather(input_, group):
     torch.distributed.all_gather(tensor_list, input_, group=group)
     # Note: torch.cat already creates a contiguous tensor.
     output = torch.cat(tensor_list, dim=last_dim).contiguous()
+
+    CudaTimer().stop(field_name='tp_allgather')
     return output
 
 
