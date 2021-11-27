@@ -60,7 +60,6 @@ def setup_device_group(tp: int, wp: int, dp: int, layer_id: int):
         group = devs.get_group(ranks)
         if myrank in ranks:
             tp_ranks = ranks
-            resource.tp_group = group
     print_each_rank(f'layer {layer_id}: initialzed tensor parallel group: {tp_ranks}', rank_only=myrank)
 
     # initialize wp parallel group
@@ -193,7 +192,7 @@ class MegatronWindowAttention(nn.Module):
 
         tp_world_size = torch.distributed.get_world_size(group=tp_group)
         if num_heads % tp_world_size != 0:
-            print(f'detecting un-even num head {num_heads} partition to {tp_world_size}')
+            raise RuntimeError(f'detecting un-even num head {num_heads} partition to {tp_world_size}')
         self.num_heads = num_heads // tp_world_size
 
         self.dim_heads = dim // self.global_num_heads
@@ -493,8 +492,8 @@ class BasicLayer(nn.Module):
                     break
             assert wp_nH_ranks != [-1]
             assert wp_nW_ranks != [-1]
-            print_each_rank(f'window parallel nH local ranks: {wp_nH_ranks}')
-            print_each_rank(f'window parallel nW local ranks: {wp_nW_ranks}')
+            # print_each_rank(f'window parallel nH local ranks: {wp_nH_ranks}')
+            # print_each_rank(f'window parallel nW local ranks: {wp_nW_ranks}')
 
         # build blocks
         self.blocks = nn.ModuleList()
@@ -615,7 +614,7 @@ class SwinTransformer(nn.Module):
                  embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
-                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True, dp=1, **kwargs):
+                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True, pconfigs=None, **kwargs):
         super().__init__()
 
         self.num_classes = num_classes
@@ -646,7 +645,7 @@ class SwinTransformer(nn.Module):
 
 
         # ====================== depth 0 ===========================
-        pconfig = dict(layer_id=0, tp=1, wp=4, dp=dp)
+        pconfig = pconfigs[0]
         input_resolution = (
             patches_resolution[0] // (2 ** 0), patches_resolution[1] // (2 ** 0)
         )
@@ -669,7 +668,7 @@ class SwinTransformer(nn.Module):
         )
 
         # ====================== depth 1 ===========================
-        pconfig = dict(layer_id=1, tp=1, wp=4, dp=dp)
+        pconfig = pconfigs[1]
         input_resolution = (
             patches_resolution[0] // (2 ** 1), patches_resolution[1] // (2 ** 1)
         )
@@ -693,7 +692,7 @@ class SwinTransformer(nn.Module):
 
 
         # ====================== depth 2 ===========================
-        pconfig = dict(layer_id=2, tp=1, wp=4, dp=dp)
+        pconfig = pconfigs[2]
         input_resolution = (
             patches_resolution[0] // (2 ** 2), patches_resolution[1] // (2 ** 2)
         )
@@ -716,7 +715,7 @@ class SwinTransformer(nn.Module):
         )
 
         # ====================== depth 3 ===========================
-        pconfig = dict(layer_id=3, tp=4, wp=1, dp=dp)
+        pconfig = pconfigs[3]
         self.basic_layer3 = BasicLayer(
             dim=int(embed_dim * 2 ** 3),
             input_resolution=(patches_resolution[0] // (2 ** 3),
@@ -775,9 +774,7 @@ class SwinTransformer(nn.Module):
         return x
 
 
-def train(args):
-    resource = cube.runtime.resource.EnvResource()
-
+def train(args, pconfigs):
     # image batch input
     N, C, H, W = [1, 3, 224, 224]
 
@@ -786,14 +783,14 @@ def train(args):
     # ]
 
     # 348.55 M
-    embed_dim, depths, num_heads, window_size = [
-        256, [2, 2, 18, 2], [8, 16, 32, 64], 7
-    ]
+    # embed_dim, depths, num_heads, window_size = [
+    #     256, [2, 2, 18, 2], [8, 16, 32, 64], 7
+    # ]
 
     # 895.7 M Model
-    # embed_dim, depths, num_heads, window_size = [
-    #     384, [2, 2, 22, 2], [12, 24, 48, 96], 7
-    # ]
+    embed_dim, depths, num_heads, window_size = [
+        384, [2, 2, 22, 2], [12, 24, 48, 96], 7
+    ]
 
     # 2.01B model
     # embed_dim, depths, num_heads, window_size = [
@@ -804,17 +801,10 @@ def train(args):
     model = SwinTransformer(embed_dim = embed_dim,
                             depths = depths,
                             num_heads = num_heads,
-                            window_size = window_size)
+                            window_size = window_size,
+                            pconfigs = pconfigs)
     model = model.cuda()
     memory_summary()
-
-    # setup data parallel reducer
-    reducer = None
-    if args.dp > 1:
-        print('> initialize weight reducer')
-        reducer = resource.reducer
-        for param in model.parameters():
-            reducer.add_param(param)
 
     dataloader = cube.runtime.syndata.SynDataLoader(
         1280, [0], [N // args.dp, C, H, W])
@@ -824,8 +814,11 @@ def train(args):
         loss = model(img)
         loss = torch.sum(loss)
         loss.backward()
-        if reducer is not None:
+        CudaTimer().start('wp_allreduce')
+        for ranks in _reducer_groups:
+            reducer = _reducer_groups[ranks]
             reducer.allreduce()
+        CudaTimer().stop('wp_allreduce')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -869,68 +862,17 @@ if __name__ == '__main__':
     
     # resource allocation
     parser = argparse.ArgumentParser(description='swin')
-    parser.add_argument('--tp', type=int, default=1,
-                        help='tensor parallel size')
-    parser.add_argument('--wp', type=int, default=1,
-                        help='data parallel size')
     parser.add_argument('--dp', type=int, default=1,
                         help='pipeline parallel size')
     parser.add_argument('--micro-bs', type=int, default=-1)
     args = parser.parse_args()
 
+    pconfigs = [
+        dict(layer_id=1, tp=4, wp=2, dp=args.dp), # basic layer 0
+        dict(layer_id=2, tp=4, wp=2, dp=args.dp), # basic layer 1
+        dict(layer_id=3, tp=4, wp=2, dp=args.dp), # basic layer 2
+        dict(layer_id=4, tp=8, wp=1, dp=args.dp), # basic layer 3
+    ]
+
     cube.init()
-
-    """
-    # allocate resource
-    resource = cube.runtime.resource.EnvResource()
-    ndevs = resource.ngpus
-
-    tp_size, tp_group_nums = args.tp, ndevs // args.tp
-    wp_size, wp_group_nums = args.wp, ndevs // args.wp
-    dp_size, dp_group_nums = args.dp, ndevs // args.dp
-
-    if not tp_size * wp_size * dp_size == ndevs:
-        raise RuntimeError("Expected all devices are used")
-
-    devs = cube.runtime.device.DeviceGroup()
-
-    myrank = torch.distributed.get_rank()
-
-    # initialize tensor parallel groups
-    for i in range(tp_group_nums):
-        ranks = list(range(i * tp_size, (i + 1) * tp_size))
-        group = devs.get_group(ranks)
-        if myrank in ranks:
-            tp_ranks = ranks
-            resource.tp_group = group
-    print_each_rank(f'initialzed tensor parallel group: {tp_ranks}', rank_only=myrank)
-
-    # initialize wp parallel group
-    all_wp_parallel_group_ranks = list()
-    for i in range(dp_size):
-        start_rank = i * dp_group_nums
-        end_rank = (i + 1) * dp_group_nums
-        for j in range(tp_size):
-            ranks = list(range(start_rank + j, end_rank, tp_size))
-            all_wp_parallel_group_ranks.append(ranks)
-            # initialize groups
-            group = devs.get_group(ranks)
-            if myrank in ranks:
-                wp_ranks = ranks
-                resource.wp_group = group
-                resource.wp_reducer = cube.runtime.reducer.Reducer(ranks)
-    print_each_rank(f'initialzed window parallel group: {wp_ranks}', rank_only=myrank)
-
-    # initialize data parallel groups
-    start_rank = 0
-    end_rank = ndevs
-    for i in range(wp_size * tp_size):
-        ranks = list(range(i, ndevs, wp_size * tp_size))
-        group = devs.get_group(ranks)
-        if myrank in ranks:
-            dp_ranks = ranks
-            resource.dp_group = group
-            resource.dp_reducer = cube.runtime.reducer.Reducer(ranks)
-    print_each_rank(f'initialzed data parallel group: {dp_ranks}', rank_only=myrank)
-    """
-    train(args)
+    train(args, pconfigs)
