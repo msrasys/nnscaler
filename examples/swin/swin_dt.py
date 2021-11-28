@@ -525,7 +525,7 @@ class SwinTransformer(nn.Module):
                  embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
-                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True, pconfigs=None, **kwargs):
+                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True, pconfigs=None, fp16=False, **kwargs):
         super().__init__()
 
         self.num_classes = num_classes
@@ -581,6 +581,8 @@ class SwinTransformer(nn.Module):
             dp_ranks = tuple(l0_dp_ranks)
             if dp_ranks not in _dp_reducer:
                 _dp_reducer[dp_ranks] = Reducer(dp_ranks)
+            for param in self.patch_embed.parameters():
+                _dp_reducer[dp_ranks].add_param(param)
             for param in self.basic_layer0.parameters():
                 _dp_reducer[dp_ranks].add_param(param)
 
@@ -842,6 +844,9 @@ def train(args, pconfigs):
                             num_heads = num_heads,
                             window_size = window_size,
                             pconfigs = pconfigs)
+    if args.fp16:
+        print_each_rank('use half precision')
+        model = model.half()
     nparams_million = sum(p.numel() for p in model.parameters()) / 1000 / 1000
     print_each_rank('model has {:.2f} million parameters'.format(nparams_million))
 
@@ -850,6 +855,10 @@ def train(args, pconfigs):
 
     dataloader = cube.runtime.syndata.SynDataLoader(
         1280, [0], [N // args.dp, C, H, W])
+    
+    if args.fp16:
+        data_buff = [[e.half() for e in data] for data in dataloader.datas]
+        dataloader.datas = data_buff
 
     def train_iter(model, dataloader):
         img = next(dataloader)
@@ -916,7 +925,7 @@ if __name__ == '__main__':
                         help='data, tensor parallel config')
     parser.add_argument('--bs', type=int, default=1,
                         help='bs')
-    parser.add_argument('--micro-bs', type=int, default=-1)
+    parser.add_argument('--fp16', action='store_true', dest='fp16')
     args = parser.parse_args()
 
     assert len(args.layer0) == 2

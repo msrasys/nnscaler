@@ -848,11 +848,18 @@ def train(args, pconfigs):
     nparams_million = sum(p.numel() for p in model.parameters()) / 1000 / 1000
     print_each_rank('model has {:.2f} million parameters'.format(nparams_million))
 
+    if args.fp16:
+        print_each_rank('use half model')
+        model = model.half()
     model = model.cuda()
     memory_summary()
 
     dataloader = cube.runtime.syndata.SynDataLoader(
         1280, [0], [N // args.dp, C, H, W])
+
+    if args.fp16:
+        data_buff = [[e.half() for e in data] for data in dataloader.datas]
+        dataloader.datas = data_buff
 
     if args.dp > 1:
         assert len(_dp_reducer) == 1
@@ -938,7 +945,7 @@ if __name__ == '__main__':
                         help='data, window tensor parallel config')
     parser.add_argument('--bs', type=int, default=1,
                         help='bs')
-    parser.add_argument('--micro-bs', type=int, default=-1)
+    parser.add_argument('--fp16', action='store_true', dest='fp16')
     args = parser.parse_args()
 
     assert len(args.layer0) == 3
