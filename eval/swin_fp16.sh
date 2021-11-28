@@ -1,4 +1,4 @@
-mkdir -p expdata
+mkdir -p expdata_fp16
 
 # ================== Megatron Policy Parallel ===============
 
@@ -14,7 +14,7 @@ python -m torch.distributed.launch \
         --layer1 1 1 2 \
         --layer2 1 1 2 \
         --layer3 1 1 2 \
-    > expdata/2gpu_dp.txt
+    > expdata_fp16/2gpu_dp.txt
 
 python -m torch.distributed.launch \
     --nproc_per_node=4 \
@@ -28,7 +28,7 @@ python -m torch.distributed.launch \
         --layer1 2 1 2 \
         --layer2 2 1 2 \
         --layer3 2 1 2 \
-    > expdata/4gpu_dp.txt
+    > expdata_fp16/4gpu_dp.txt
 
 
 python -m torch.distributed.launch \
@@ -43,7 +43,7 @@ python -m torch.distributed.launch \
         --layer1 4 1 2 \
         --layer2 4 1 2 \
         --layer3 4 1 2 \
-    > expdata/8gpu_dp.txt
+    > expdata_fp16/8gpu_dp.txt
 
 # ================== Maximal Tensor Parallel ===============
 
@@ -59,7 +59,7 @@ python -m torch.distributed.launch \
         --layer1 1 1 2 \
         --layer2 1 1 2 \
         --layer3 1 1 2 \
-    > expdata/2gpu_tp.txt
+    > expdata_fp16/2gpu_tp.txt
 
 python -m torch.distributed.launch \
     --nproc_per_node=4 \
@@ -73,7 +73,7 @@ python -m torch.distributed.launch \
         --layer1 1 1 4 \
         --layer2 1 1 4 \
         --layer3 1 1 4 \
-    > expdata/4gpu_tp.txt
+    > expdata_fp16/4gpu_tp.txt
 
 
 python -m torch.distributed.launch \
@@ -88,7 +88,7 @@ python -m torch.distributed.launch \
         --layer1 2 1 4 \
         --layer2 2 1 4 \
         --layer3 2 1 4 \
-    > expdata/8gpu_2dp4tp.txt
+    > expdata_fp16/8gpu_2dp4tp.txt
 
 # ================== Window + Tensor Parallel ===============
 
@@ -104,7 +104,7 @@ python -m torch.distributed.launch \
         --layer1 1 2 1 \
         --layer2 1 1 2 \
         --layer3 1 1 2 \
-    > expdata/2gpu_2wp2tp.txt
+    > expdata_fp16/2gpu_2wp2tp.txt
 
 python -m torch.distributed.launch \
     --nproc_per_node=4 \
@@ -118,7 +118,7 @@ python -m torch.distributed.launch \
         --layer1 1 4 1 \
         --layer2 1 1 4 \
         --layer3 1 1 4 \
-    > expdata/4gpu_4wp4tp.txt
+    > expdata_fp16/4gpu_4wp4tp.txt
 
 python -m torch.distributed.launch \
     --nproc_per_node=8 \
@@ -132,7 +132,7 @@ python -m torch.distributed.launch \
         --layer1 1 1 8 \
         --layer2 1 1 8 \
         --layer3 1 1 8 \
-    > expdata/8gpu_8wp8tp.txt
+    > expdata_fp16/8gpu_8wp8tp.txt
 
 
 # ================== Data + Tensor Parallel ===============
@@ -148,7 +148,7 @@ python -m torch.distributed.launch \
         --layer1 2 1 \
         --layer2 1 2 \
         --layer3 1 2 \
-    > expdata/2gpu_dt_2dp2tp.txt
+    > expdata_fp16/2gpu_dt_2dp2tp.txt
 
 python -m torch.distributed.launch \
     --nproc_per_node=4 \
@@ -162,7 +162,7 @@ python -m torch.distributed.launch \
         --layer1 4 1 \
         --layer2 1 4 \
         --layer3 1 4 \
-    > expdata/4gpu_dt_4dp4tp.txt
+    > expdata_fp16/4gpu_dt_4dp4tp.txt
 
 python -m torch.distributed.launch \
     --nproc_per_node=8 \
@@ -176,4 +176,4 @@ python -m torch.distributed.launch \
         --layer1 8 1 \
         --layer2 1 8 \
         --layer3 1 8 \
-    > expdata/8gpu_dt_8dp8tp.txt
+    > expdata_fp16/8gpu_dt_8dp8tp.txt
