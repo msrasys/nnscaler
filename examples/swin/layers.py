@@ -19,7 +19,7 @@ def _reduce(input_, group):
     return input_
 
 
-def _split(input_, group):
+def _split(input_, group, dim=-1):
     """Split the tensor along its last dimension and keep the
     corresponding slice."""
 
@@ -28,14 +28,13 @@ def _split(input_, group):
     # Bypass the function if we are using only 1 GPU.
     if world_size==1:
         return input_
-    last_dim = input_.dim() - 1
-    last_dim_size = input_.size()[last_dim] // world_size
-    tensor_list = torch.split(input_, last_dim_size, dim=last_dim)
+    dim_size = input_.size()[dim] // world_size
+    tensor_list = torch.split(input_, dim_size, dim=dim)
     output = tensor_list[rank].contiguous()
     return output
 
 
-def _gather(input_, group):
+def _gather(input_, group, dim=-1):
     """Gather tensors and concatinate along the last dimension."""
     CudaTimer().start(field_name='tp_allgather')
 
@@ -46,15 +45,29 @@ def _gather(input_, group):
         CudaTimer().stop(field_name='tp_allgather')
         return input_
     # Size and dimension.
-    last_dim = input_.dim() - 1
     tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
     tensor_list[rank] = input_
     torch.distributed.all_gather(tensor_list, input_, group=group)
     # Note: torch.cat already creates a contiguous tensor.
-    output = torch.cat(tensor_list, dim=last_dim).contiguous()
+    output = torch.cat(tensor_list, dim=dim).contiguous()
 
     CudaTimer().stop(field_name='tp_allgather')
     return output
+
+def _scatter(input_, group, dim=0):
+    """Reduce-Scatter tensor"""
+    CudaTimer().start(field_name='tp_reduce_scatter')
+    world_size = torch.distributed.get_world_size(group=group)
+    if world_size == 1:
+        CudaTimer().stop(field_name='tp_reduce_scatter')
+        return input_
+    rank = torch.distributed.get_rank(group=group)
+    tensor_list = list(torch.chunk(input_, world_size, dim))
+    # for idx, tensor in enumerate(tensor_list):
+    #     tensor_list[idx] = tensor.contiguous()
+    torch.distributed.reduce_scatter(tensor_list[rank], tensor_list, group=group)
+    CudaTimer().stop(field_name='tp_reduce_scatter')
+    return tensor_list[rank]
 
 
 class ColumnInputAdapter(torch.autograd.Function):
@@ -102,15 +115,53 @@ class RowOutputAdapter(torch.autograd.Function):
         return grad_output, None
 
 
+class DPtoTPAdapter(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_, group):
+        """
+        split
+        """
+        ctx.group = group
+        return _gather(input_, group, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        reduce-scatter
+        """
+        group = ctx.group
+        return _split(grad_output, group, dim=0), None
+
+
+class TPtoDPAdapter(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_, group):
+        """
+        Reduce-scatter
+        """
+        ctx.group = group
+        return _split(input_, group, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        all-gather
+        """
+        group = ctx.group
+        return _gather(grad_output, group, dim=0), None
+
+
+
+
 class ColumnParallelLinear(torch.nn.Module):
 
-    def __init__(self, input_size, output_size, bias=True, full_input=True, full_output=False, tp_group=-1):
+    def __init__(self, input_size, output_size, bias=True, in_adapter=True, out_adapter=True, tp_group=-1):
         super().__init__()
         assert tp_group != -1
         self.input_size = input_size
         self.output_size = output_size
-        self.full_input = full_input
-        self.full_output = full_output
+        self.in_adapter = in_adapter
+        self.out_adapter = out_adapter
 
         self.group = tp_group
         world_size = torch.distributed.get_world_size(group=self.group)
@@ -138,11 +189,12 @@ class ColumnParallelLinear(torch.nn.Module):
 
     def forward(self, input_):
         bias = self.bias
-        if not self.full_input:
-            raise RuntimeError("Expected full tensor input")
-        input_parallel = ColumnInputAdapter.apply(input_, self.group)
+        if self.in_adapter:
+            input_parallel = ColumnInputAdapter.apply(input_, self.group)
+        else:
+            input_parallel = input_
         output_parallel = F.linear(input_parallel, self.weight, bias)
-        if self.full_output:
+        if self.out_adapter:
             output = ColumnOutputAdapter.apply(output_parallel, self.group)
         else:
             output = output_parallel
@@ -151,13 +203,13 @@ class ColumnParallelLinear(torch.nn.Module):
 
 class RowParallelLinear(torch.nn.Module):
 
-    def __init__(self, input_size, output_size, bias=True, full_input=True, full_output=False, tp_group=-1):
+    def __init__(self, input_size, output_size, bias=True, in_adapter=True, out_adapter=True, tp_group=-1):
         super().__init__()
         assert tp_group != -1
         self.input_size = input_size
         self.output_size = output_size
-        self.full_input = full_input
-        self.full_output = full_output
+        self.in_adapter = in_adapter
+        self.out_adapter = out_adapter
 
         self.group = tp_group
         world_size = torch.distributed.get_world_size(group=self.group)
@@ -183,12 +235,12 @@ class RowParallelLinear(torch.nn.Module):
 
     def forward(self, input_):
         bias = self.bias
-        if self.full_input:
+        if self.in_adapter:
             input_parallel = RowInputAdapter.apply(input_, self.group)
         else:
             input_parallel = input_
         output_parallel = F.linear(input_parallel, self.weight, bias)
-        if self.full_output:
+        if self.out_adapter:
             output = RowOutputAdapter.apply(output_parallel, self.group)
         else:
             output = output_parallel
@@ -227,3 +279,24 @@ class ShardEmbedding(torch.nn.Module):
         )
         output = RowOutputAdapter.apply(output_parallel, self.group)
         return output
+
+
+class DPtoTP(torch.nn.Module):
+
+    def __init__(self, dp_group):
+        super().__init__()
+        self.group = dp_group
+
+    def forward(self, input_):
+        return DPtoTPAdapter.apply(input_, self.group)
+
+
+class TPtoDP(torch.nn.Module):
+
+    def __init__(self, tp_group):
+        super().__init__()
+        self.group = tp_group
+
+    def forward(self, input_):
+        return TPtoDPAdapter.apply(input_, self.group)
+
