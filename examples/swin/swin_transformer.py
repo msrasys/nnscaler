@@ -624,17 +624,23 @@ def train():
     # image batch input
     N, C, H, W = [1, 3, 224, 224]
 
-    embed_dim, depths, num_heads, window_size = [
-        96, [2, 2, 6, 2], [3, 6, 12, 24], 7
-    ]
-
     # embed_dim, depths, num_heads, window_size = [
-    #     256, [2, 2, 18, 2], [8, 16, 32, 64], 7
+    #     96, [2, 2, 6, 2], [3, 6, 12, 24], 7
     # ]
 
-    # 1.02B Model
+    # 348.55 M
+    embed_dim, depths, num_heads, window_size = [
+        256, [2, 2, 18, 2], [8, 16, 32, 64], 7
+    ]
+
+    # 895.7 M Model -- 224x224
     # embed_dim, depths, num_heads, window_size = [
     #     384, [2, 2, 22, 2], [12, 24, 48, 96], 7
+    # ]
+
+    # 2.01B model
+    # embed_dim, depths, num_heads, window_size = [
+    #     576, [2, 2, 22, 2], [12, 24, 48, 96], 7
     # ]
 
 

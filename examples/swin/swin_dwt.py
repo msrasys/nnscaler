@@ -13,6 +13,7 @@ python -m torch.distributed.launch \
 """
 # --------------------------------------------------------
 
+from functools import reduce
 from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
@@ -29,7 +30,8 @@ from cube.runtime.reducer import Reducer
 from examples.swin.layers import ColumnParallelLinear, RowParallelLinear
 
 
-_reducer_groups: Dict[Tuple[int], Reducer] = dict()
+_wp_reducer: Dict[Tuple[int], Reducer] = dict()
+_dp_reducer: Dict[Tuple[int], Reducer] = dict()
 
 
 def setup_device_group(tp: int, wp: int, dp: int, layer_id: int):
@@ -73,7 +75,7 @@ def setup_device_group(tp: int, wp: int, dp: int, layer_id: int):
             group = devs.get_group(ranks)
             if myrank in ranks:
                 wp_ranks = ranks
-                _reducer_groups[tuple(ranks)] = Reducer(ranks)
+                _wp_reducer[tuple(ranks)] = Reducer(ranks)
     print_each_rank(f'layer {layer_id}: initialzed window parallel group: {wp_ranks}', rank_only=myrank)
 
     # initialize data parallel groups
@@ -84,7 +86,7 @@ def setup_device_group(tp: int, wp: int, dp: int, layer_id: int):
         group = devs.get_group(ranks)
         if myrank in ranks:
             dp_ranks = ranks
-            _reducer_groups[tuple(ranks)] = Reducer(ranks)
+            _dp_reducer[tuple(ranks)] = Reducer(ranks)
     print_each_rank(f'layer {layer_id}: initialzed data parallel group: {dp_ranks}', rank_only=myrank)
     return tp_ranks, wp_ranks, dp_ranks
 
@@ -302,8 +304,10 @@ class SwinTransformerBlock(nn.Module):
             tp_group=tp_group
         )
 
+        self.wp_group, self.wp_nH_ranks, self.wp_nW_ranks = wp_plans
+        self.use_wp = torch.distributed.get_world_size(self.wp_group) != 1
+
         if self.shift_size > 0:
-            self.wp_group, self.wp_nH_ranks, self.wp_nW_ranks = wp_plans
             # calculate attention mask for SW-MSA
             H, W = self.input_resolution
             img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
@@ -339,11 +343,13 @@ class SwinTransformerBlock(nn.Module):
 
         # cyclic shift
         if self.shift_size > 0:
-            shifted_x = cube.runtime.function.roll_grid_parallel(
-                x, (-self.shift_size, -self.shift_size), (1,2),
-                self.wp_nH_ranks, self.wp_nW_ranks, self.wp_group
-            )
-            # shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            if self.use_wp:
+                shifted_x = cube.runtime.function.roll_grid_parallel(
+                    x, (-self.shift_size, -self.shift_size), (1,2),
+                    self.wp_nH_ranks, self.wp_nW_ranks, self.wp_group
+                )
+            else:
+                shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
             shifted_x = x
 
@@ -367,11 +373,13 @@ class SwinTransformerBlock(nn.Module):
         # [B, H', W', C] -> [B, H, W, C]
         x = shifted_x
         if self.shift_size > 0:
-            x = cube.runtime.function.roll_grid_parallel(
-                shifted_x, (self.shift_size, self.shift_size), (1,2),
-                self.wp_nH_ranks, self.wp_nW_ranks, self.wp_group
-            )
-            # x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            if self.use_wp:
+                x = cube.runtime.function.roll_grid_parallel(
+                    shifted_x, (self.shift_size, self.shift_size), (1,2),
+                    self.wp_nH_ranks, self.wp_nW_ranks, self.wp_group
+                )
+            else:
+                x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         # [B, H, W, C] -> [B, H * W, C]
         x = x.view(B, H * W, C)
         # [B, H * W, C] -> [B, H * W, C]
@@ -514,7 +522,7 @@ class BasicLayer(nn.Module):
         self.wp_postprocess = False
         if wp > 1:
             for param in self.blocks.parameters():
-                _reducer_groups[tuple(wp_ranks)].add_param(param)
+                _wp_reducer[tuple(wp_ranks)].add_param(param)
             self.wp_preprocess = True
             self.wp_postprocess = True
 
@@ -774,26 +782,57 @@ class SwinTransformer(nn.Module):
 
 
 def train(args, pconfigs):
-    # image batch input
-    N, C, H, W = [1, 3, 224, 224]
 
-    # embed_dim, depths, num_heads, window_size = [
-    #     96, [2, 2, 6, 2], [3, 6, 12, 24], 7
+    # dim_head is always 32
+
+    # img resolution, windows size: 224, 384, 518, 640
+    C, H, W, window_size = [3, 224, 224, 7]
+    # C, H, W, window_size = [3, 384, 384, 12]
+    # C, H, W, window_size = [3, 518, 518, ?]
+    # C, H, W, window_size = [4, 640, 640, 20]
+
+    # image batch size
+    N = 8
+
+    # Swin-Tiny
+    # embed_dim, depths, num_heads = [
+    #     96, [2, 2, 6, 2], [3, 6, 12, 24]
     # ]
 
-    # 348.55 M
-    # embed_dim, depths, num_heads, window_size = [
-    #     256, [2, 2, 18, 2], [8, 16, 32, 64], 7
+    # SwinV2-B: 87 M
+    # embed_dim, depths, num_heads = [
+    #     128, [2, 2, 18, 2], [4, 8, 12, 24]
+    # ]
+
+    # SwinV2-L: 196 M
+    # embed_dim, depths, num_heads = [
+    #     192, [2, 2, 18, 2], [6, 12, 24, 48]
+    # ]
+
+    # SwinV2-H: 657 M
+    # embed_dim, depths, num_heads = [
+    #     352, [2, 2, 18, 2], [11, 22, 44, 88]
+    # ]
+
+    # SwinV2-H modified: 782 M
+    embed_dim, depths, num_heads = [
+        384, [2, 2, 18, 2], [12, 24, 48, 96]
+    ]
+
+    # SwinV2-G:  2.5B Model
+    # embed_dim, depths, num_heads = [
+    #     512, [2, 2, 42, 2], [16, 32, 64, 128]
     # ]
 
     # 895.7 M Model
-    embed_dim, depths, num_heads, window_size = [
-        384, [2, 2, 22, 2], [12, 24, 48, 96], 7
-    ]
+    # embed_dim, depths, num_heads = [
+    #     384, [2, 2, 22, 2], [12, 24, 48, 96]
+    # ]
+
 
     # 2.01B model
-    # embed_dim, depths, num_heads, window_size = [
-    #     576, [2, 2, 22, 2], [12, 24, 48, 96], 7
+    # embed_dim, depths, num_heads = [
+    #     576, [2, 2, 22, 2], [12, 24, 48, 96]
     # ]
 
 
@@ -802,11 +841,28 @@ def train(args, pconfigs):
                             num_heads = num_heads,
                             window_size = window_size,
                             pconfigs = pconfigs)
+    nparams_million = sum(p.numel() for p in model.parameters()) / 1000 / 1000
+    print_each_rank('model has {:.2f} million parameters'.format(nparams_million))
+
     model = model.cuda()
     memory_summary()
 
     dataloader = cube.runtime.syndata.SynDataLoader(
         1280, [0], [N // args.dp, C, H, W])
+
+    if args.dp > 1:
+        assert len(_dp_reducer) == 1
+        reducer = None
+        for ranks in _dp_reducer:
+            reducer = _dp_reducer[ranks]
+        for param in model.parameters():
+            reduced = False
+            for wp_ranks in _wp_reducer:
+                if param in _wp_reducer[wp_ranks]._params:
+                    reduced = True
+                    break
+            if not reduced:
+                reducer.add_param(param)
 
     def train_iter(model, dataloader):
         img = next(dataloader)
@@ -814,10 +870,15 @@ def train(args, pconfigs):
         loss = torch.sum(loss)
         loss.backward()
         CudaTimer().start('wp_allreduce')
-        for ranks in _reducer_groups:
-            reducer = _reducer_groups[ranks]
+        for ranks in _wp_reducer:
+            reducer = _wp_reducer[ranks]
             reducer.allreduce()
         CudaTimer().stop('wp_allreduce')
+        CudaTimer().start('dp_allreduce')
+        for ranks in _dp_reducer:
+            reducer = _dp_reducer[ranks]
+            reducer.allreduce()
+        CudaTimer().stop('dp_allreduce')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -867,10 +928,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     pconfigs = [
-        dict(layer_id=1, tp=2, wp=4, dp=args.dp), # basic layer 0
-        dict(layer_id=2, tp=4, wp=2, dp=args.dp), # basic layer 1
-        dict(layer_id=3, tp=2, wp=4, dp=args.dp), # basic layer 2  # prob at 8:1?
-        dict(layer_id=4, tp=8, wp=1, dp=args.dp), # basic layer 3
+        dict(layer_id=0, tp=4, wp=1, dp=args.dp), # basic layer 0
+        dict(layer_id=1, tp=4, wp=1, dp=args.dp), # basic layer 1
+        dict(layer_id=2, tp=4, wp=1, dp=args.dp), # basic layer 2  # prob at 8:1?
+        dict(layer_id=3, tp=4, wp=1, dp=args.dp), # basic layer 3
     ]
 
     cube.init()
