@@ -9,11 +9,15 @@ python -m torch.distributed.launch \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    examples/swin/swin_348M.py
+    examples/swin/swin_dwt.py --bs 8 \
+        --layer0 1 4 1 \
+        --layer1 1 4 1 \
+        --layer2 1 1 4 \
+        --layer3 1 1 4
+
 """
 # --------------------------------------------------------
 
-from functools import reduce
 from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
@@ -792,7 +796,7 @@ def train(args, pconfigs):
     # C, H, W, window_size = [4, 640, 640, 20]
 
     # image batch size
-    N = 8
+    N = args.bs
 
     # Swin-Tiny
     # embed_dim, depths, num_heads = [
@@ -919,20 +923,46 @@ def train(args, pconfigs):
 
 
 if __name__ == '__main__':
+
+    cube.init()
     
     # resource allocation
     parser = argparse.ArgumentParser(description='swin')
-    parser.add_argument('--dp', type=int, default=1,
-                        help='pipeline parallel size')
+    parser.add_argument('--layer0', type=int, nargs='+',
+                        help='data, window tensor parallel config')
+    parser.add_argument('--layer1', type=int, nargs='+',
+                        help='data, window tensor parallel config')
+    parser.add_argument('--layer2', type=int, nargs='+',
+                        help='data, window tensor parallel config')
+    parser.add_argument('--layer3', type=int, nargs='+',
+                        help='data, window tensor parallel config')
+    parser.add_argument('--bs', type=int, default=1,
+                        help='bs')
     parser.add_argument('--micro-bs', type=int, default=-1)
     args = parser.parse_args()
 
+    assert len(args.layer0) == 3
+    assert len(args.layer1) == 3
+    assert len(args.layer2) == 3
+    assert len(args.layer3) == 3
+
+    # data parallel should be same
+    assert args.layer0[0] == args.layer1[0] and args.layer1[0] == args.layer2[0] and args.layer2[0] == args.layer3[0]
+    args.dp = args.layer0[0]
+
     pconfigs = [
-        dict(layer_id=0, tp=4, wp=1, dp=args.dp), # basic layer 0
-        dict(layer_id=1, tp=4, wp=1, dp=args.dp), # basic layer 1
-        dict(layer_id=2, tp=4, wp=1, dp=args.dp), # basic layer 2  # prob at 8:1?
-        dict(layer_id=3, tp=4, wp=1, dp=args.dp), # basic layer 3
+        dict(layer_id=0, dp=args.layer0[0], wp=args.layer0[1], tp=args.layer0[2]), # basic layer 0
+        dict(layer_id=1, dp=args.layer1[0], wp=args.layer1[1], tp=args.layer1[2]), # basic layer 1
+        dict(layer_id=2, dp=args.layer2[0], wp=args.layer2[1], tp=args.layer2[2]), # basic layer 2  # prob at 8:1?
+        dict(layer_id=3, dp=args.layer3[0], wp=args.layer3[1], tp=args.layer3[2]), # basic layer 3
     ]
 
-    cube.init()
+    # pconfigs = [
+    #     dict(layer_id=0, tp=4, wp=1, dp=args.dp), # basic layer 0
+    #     dict(layer_id=1, tp=4, wp=1, dp=args.dp), # basic layer 1
+    #     dict(layer_id=2, tp=4, wp=1, dp=args.dp), # basic layer 2  # prob at 8:1?
+    #     dict(layer_id=3, tp=4, wp=1, dp=args.dp), # basic layer 3
+    # ]
+
+    print_each_rank(pconfigs, rank_only=0)
     train(args, pconfigs)
