@@ -10,8 +10,8 @@ python -m torch.distributed.launch \
     --master_port=8004 \
     --use_env \
     examples/swin/swin_dt.py --bs 8 \
-        --layer0 4 1 \
-        --layer1 4 1 \
+        --layer0 1 4 \
+        --layer1 1 4 \
         --layer2 1 4 \
         --layer3 1 4
 
@@ -789,10 +789,10 @@ def train(args, pconfigs):
     # dim_head is always 32
 
     # img resolution, windows size: 224, 384, 518, 640
-    C, H, W, window_size = [3, 224, 224, 7]
-    # C, H, W, window_size = [3, 384, 384, 12]
+    # C, H, W, window_size = [3, 224, 224, 7]
+    C, H, W, window_size = [3, 384, 384, 12]
     # C, H, W, window_size = [3, 518, 518, ?]
-    # C, H, W, window_size = [4, 640, 640, 20]
+    # C, H, W, window_size = [3, 640, 640, 20]
 
     # image batch size
     N = args.bs
@@ -804,7 +804,7 @@ def train(args, pconfigs):
 
     # SwinV2-B: 87 M
     # embed_dim, depths, num_heads = [
-    #     128, [2, 2, 18, 2], [4, 8, 12, 24]
+    #     128, [2, 2, 18, 2], [4, 8, 16, 32]
     # ]
 
     # SwinV2-L: 196 M
@@ -839,7 +839,8 @@ def train(args, pconfigs):
     # ]
 
 
-    model = SwinTransformer(embed_dim = embed_dim,
+    model = SwinTransformer(img_size = H,
+                            embed_dim = embed_dim,
                             depths = depths,
                             num_heads = num_heads,
                             window_size = window_size,

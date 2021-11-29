@@ -805,7 +805,7 @@ def train(args, pconfigs):
 
     # SwinV2-B: 87 M
     # embed_dim, depths, num_heads = [
-    #     128, [2, 2, 18, 2], [4, 8, 12, 24]
+    #     128, [2, 2, 18, 2], [4, 8, 16, 32]
     # ]
 
     # SwinV2-L: 196 M
@@ -840,7 +840,8 @@ def train(args, pconfigs):
     # ]
 
 
-    model = SwinTransformer(embed_dim = embed_dim,
+    model = SwinTransformer(img_size = H,
+                            embed_dim = embed_dim,
                             depths = depths,
                             num_heads = num_heads,
                             window_size = window_size,
