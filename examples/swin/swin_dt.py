@@ -3,17 +3,17 @@
 # Modified from Swin-Transformer Repo
 """
 python -m torch.distributed.launch \
-    --nproc_per_node=4 \
+    --nproc_per_node=2 \
     --nnodes=1 \
     --node_rank=0 \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    examples/swin/swin_dt.py --bs 8 \
-        --layer0 1 4 \
-        --layer1 1 4 \
-        --layer2 1 4 \
-        --layer3 1 4
+    examples/swin/swin_dt.py --bs 2 \
+        --layer0 1 2 \
+        --layer1 1 2 \
+        --layer2 1 2 \
+        --layer3 1 2
 
 """
 # --------------------------------------------------------
@@ -789,8 +789,8 @@ def train(args, pconfigs):
     # dim_head is always 32
 
     # img resolution, windows size: 224, 384, 518, 640
-    # C, H, W, window_size = [3, 224, 224, 7]
-    C, H, W, window_size = [3, 384, 384, 12]
+    C, H, W, window_size = [3, 224, 224, 7]
+    # C, H, W, window_size = [3, 384, 384, 12]
     # C, H, W, window_size = [3, 518, 518, ?]
     # C, H, W, window_size = [3, 640, 640, 20]
 

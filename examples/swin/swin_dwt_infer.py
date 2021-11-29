@@ -794,6 +794,7 @@ def train(args, pconfigs):
     # C, H, W, window_size = [3, 384, 384, 12]
     # C, H, W, window_size = [3, 518, 518, ?]
     C, H, W, window_size = [3, 640, 640, 20]
+    # C, H, W, window_size = [3, 1536, 1536, 48]
 
     # image batch size
     N = args.bs
@@ -819,14 +820,14 @@ def train(args, pconfigs):
     # ]
 
     # SwinV2-H modified: 782 M
-    embed_dim, depths, num_heads = [
-        384, [2, 2, 18, 2], [12, 24, 48, 96]
-    ]
+    # embed_dim, depths, num_heads = [
+    #     384, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
 
     # SwinV2-G:  2.5B Model
-    # embed_dim, depths, num_heads = [
-    #     512, [2, 2, 42, 2], [16, 32, 64, 128]
-    # ]
+    embed_dim, depths, num_heads = [
+        512, [2, 2, 42, 2], [16, 32, 64, 128]
+    ]
 
     # 895.7 M Model
     # embed_dim, depths, num_heads = [
@@ -838,6 +839,11 @@ def train(args, pconfigs):
     # embed_dim, depths, num_heads = [
     #     576, [2, 2, 22, 2], [12, 24, 48, 96]
     # ]
+
+    print_each_rank(
+        f'Test setting: Resolution {H}, Embed {embed_dim}, depths: {depths}, heads: {num_heads}'
+        rank_only=0
+    )
 
 
     model = SwinTransformer(img_size = H,
@@ -862,20 +868,6 @@ def train(args, pconfigs):
         data_buff = [[e.half() for e in data] for data in dataloader.datas]
         dataloader.datas = data_buff
 
-    if args.dp > 1:
-        assert len(_dp_reducer) == 1
-        reducer = None
-        for ranks in _dp_reducer:
-            reducer = _dp_reducer[ranks]
-        for param in model.parameters():
-            reduced = False
-            for wp_ranks in _wp_reducer:
-                if param in _wp_reducer[wp_ranks]._params:
-                    reduced = True
-                    break
-            if not reduced:
-                reducer.add_param(param)
-
     def infer_iter(model, dataloader):
         with torch.no_grad():
             img = next(dataloader)
@@ -890,9 +882,9 @@ def train(args, pconfigs):
     CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
     span = 0
-    iter_num = 128
+    iter_num = 60
     for step in range(iter_num):
-        if step >= 40:
+        if step >= 20:
             torch.cuda.synchronize()
             start = time.time()
             CudaTimer(enable=True).start('e2e')
@@ -900,7 +892,7 @@ def train(args, pconfigs):
         if step == 1:
             print('> passed on 1st iteration')
             memory_summary()
-        if step >= 40:
+        if step >= 20:
             torch.cuda.synchronize()
             stop = time.time()
             span += (stop - start) * 1000
@@ -908,13 +900,13 @@ def train(args, pconfigs):
         if (step + 1) % 20 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
-    iter_time = span / (iter_num-40)
+    iter_time = span / (iter_num-20)
     throughput = N / iter_time * 1000
     print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
           iter_time, throughput)
     )
     memory_summary()
-    CudaTimer().print_all(times=iter_num-40)
+    CudaTimer().print_all(times=iter_num-20)
 
 
 if __name__ == '__main__':
@@ -952,12 +944,7 @@ if __name__ == '__main__':
         dict(layer_id=3, dp=args.layer3[0], wp=args.layer3[1], tp=args.layer3[2]), # basic layer 3
     ]
 
-    # pconfigs = [
-    #     dict(layer_id=0, tp=4, wp=1, dp=args.dp), # basic layer 0
-    #     dict(layer_id=1, tp=4, wp=1, dp=args.dp), # basic layer 1
-    #     dict(layer_id=2, tp=4, wp=1, dp=args.dp), # basic layer 2  # prob at 8:1?
-    #     dict(layer_id=3, tp=4, wp=1, dp=args.dp), # basic layer 3
-    # ]
+    args.fp16 = True
 
     print_each_rank(pconfigs, rank_only=0)
     train(args, pconfigs)
