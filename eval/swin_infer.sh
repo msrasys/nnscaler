@@ -70,8 +70,8 @@ python -m torch.distributed.launch \
     --use_env \
     examples/swin/swin_dwt_infer.py --bs 1 \
         --layer0 1 8 1 \
-        --layer1 1 1 8 \
-        --layer2 1 1 8 \
+        --layer1 1 8 1 \
+        --layer2 1 4 2 \
         --layer3 1 1 8 \
     > expinfer32/8gpu_8wp8tp.txt
 
