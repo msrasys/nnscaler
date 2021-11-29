@@ -164,40 +164,37 @@ class ColumnParallelLinear(torch.nn.Module):
         self.out_adapter = out_adapter
 
         self.group = tp_group
-        world_size = torch.distributed.get_world_size(group=self.group)
+        self.world_size = torch.distributed.get_world_size(group=self.group)
 
         # print_each_rank(f'> parallizing linear using column partition: '
         #                 f'{output_size} partitioned by {world_size} devices')
 
         # not if output size is smaller than world size,
         # no parallel enbaled. Each device compute the same
-        if world_size > output_size:
-            world_size = 1
+        if self.world_size > output_size:
+            raise RuntimeError
 
         self.weight = Parameter(torch.empty(
-            int(self.output_size // world_size),
+            int(self.output_size // self.world_size),
             self.input_size,
         ))
         if bias:
             self.bias = Parameter(torch.empty(
-                int(self.output_size // world_size),
+                int(self.output_size // self.world_size),
             ))
-            with torch.no_grad():
-                self.bias.zero_()
         else:
-            self.register_parameter('bias', None)
+            self.bias = None
 
     def forward(self, input_):
-        bias = self.bias
-        if self.in_adapter:
-            input_parallel = ColumnInputAdapter.apply(input_, self.group)
-        else:
-            input_parallel = input_
-        output_parallel = F.linear(input_parallel, self.weight, bias)
-        if self.out_adapter:
-            output = ColumnOutputAdapter.apply(output_parallel, self.group)
-        else:
-            output = output_parallel
+
+        if self.in_adapter and self.world_size > 1:
+            input_ = ColumnInputAdapter.apply(input_, self.group)
+
+        output = F.linear(input_, self.weight, self.bias)
+
+        if self.out_adapter and self.world_size > 1:
+            output = ColumnOutputAdapter.apply(output, self.group)
+
         return output
 
 
@@ -212,19 +209,19 @@ class RowParallelLinear(torch.nn.Module):
         self.out_adapter = out_adapter
 
         self.group = tp_group
-        world_size = torch.distributed.get_world_size(group=self.group)
+        self.world_size = torch.distributed.get_world_size(group=self.group)
 
         # print_each_rank(f'> parallizing linear using row partition: '
         #                 f'{output_size} partitioned by {world_size} devices')
 
         # not if output size is smaller than world size,
         # no parallel enbaled. Each device compute the same
-        if world_size > output_size:
-            world_size = 1
+        if self.world_size > input_size:
+            raise RuntimeError
 
         self.weight = Parameter(torch.empty(
             self.output_size,
-            int(self.input_size // world_size),
+            int(self.input_size // self.world_size),
         ))
         if bias:
             self.bias = Parameter(torch.empty(self.output_size))
@@ -235,15 +232,14 @@ class RowParallelLinear(torch.nn.Module):
 
     def forward(self, input_):
         bias = self.bias
-        if self.in_adapter:
-            input_parallel = RowInputAdapter.apply(input_, self.group)
-        else:
-            input_parallel = input_
-        output_parallel = F.linear(input_parallel, self.weight, bias)
-        if self.out_adapter:
-            output = RowOutputAdapter.apply(output_parallel, self.group)
-        else:
-            output = output_parallel
+        if self.in_adapter and self.world_size > 1:
+            input_ = RowInputAdapter.apply(input_, self.group)
+
+        output = F.linear(input_, self.weight, bias)
+
+        if self.out_adapter and self.world_size > 1:
+            output = RowOutputAdapter.apply(output, self.group)
+
         return output
 
 
