@@ -841,7 +841,7 @@ def train(args, pconfigs):
     # ]
 
     print_each_rank(
-        f'Test setting: Resolution {H}, Embed {embed_dim}, depths: {depths}, heads: {num_heads}'
+        f'Test setting: Resolution {H}, Embed {embed_dim}, depths: {depths}, heads: {num_heads}',
         rank_only=0
     )
 
