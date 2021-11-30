@@ -88,10 +88,10 @@ python -m torch.distributed.launch \
     --master_port=8004 \
     --use_env \
     examples/swin/swin_dwt_infer.py --bs 2 \
-        --layer0 1 4 1 \
-        --layer1 1 4 1 \
-        --layer2 1 4 1 \
-        --layer3 1 1 4 \
+        --layer0 2 2 1 \
+        --layer1 2 2 1 \
+        --layer2 2 2 1 \
+        --layer3 2 1 2 \
         --fp16 \
     > expinfer_Gfp16_bs2/4gpu_4wp4tp.txt
 
@@ -103,10 +103,10 @@ python -m torch.distributed.launch \
     --master_port=8004 \
     --use_env \
     examples/swin/swin_dwt_infer.py --bs 2 \
-        --layer0 1 8 1 \
-        --layer1 1 8 1 \
-        --layer2 1 4 2 \
-        --layer3 1 1 8 \
+        --layer0 2 4 1 \
+        --layer1 2 4 1 \
+        --layer2 2 4 1 \
+        --layer3 2 1 4 \
         --fp16 \
     > expinfer_Gfp16_bs2/8gpu_8wp8tp.txt
 
