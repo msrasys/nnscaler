@@ -10,12 +10,15 @@ python -m torch.distributed.launch \
     --master_port=8004 \
     --use_env \
     examples/swin/swin_pipe.py --pp 8 --gbs 1 --mbs 1
+
+# V100-16GB: 8GPU: need checkpoint: 16 micro bs
 """
 # --------------------------------------------------------
 
 from typing import Optional
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as checkpoint
 
 import cube
 from cube.profiler import CudaTimer
@@ -661,8 +664,8 @@ def train(args):
     # dim_head is always 32
 
     # img resolution, windows size: 224, 384, 518, 640
-    # C, H, W, window_size = [3, 224, 224, 7]
-    C, H, W, window_size = [3, 384, 384, 12]
+    C, H, W, window_size = [3, 224, 224, 7]
+    # C, H, W, window_size = [3, 384, 384, 12]
     # C, H, W, window_size = [3, 518, 518, ?]
     # C, H, W, window_size = [3, 640, 640, 20]
     # C, H, W, window_size = [3, 1536, 1536, 48]
@@ -686,14 +689,14 @@ def train(args):
     # ]
 
     # SwinV2-H: 657 M
-    embed_dim, depths, num_heads = [
-        352, [2, 2, 18, 2], [11, 22, 44, 88]
-    ]
+    # embed_dim, depths, num_heads = [
+    #     352, [2, 2, 18, 2], [11, 22, 44, 88]
+    # ]
 
     # SwinV2-H modified: 782 M
-    # embed_dim, depths, num_heads = [
-    #     384, [2, 2, 18, 2], [12, 24, 48, 96]
-    # ]
+    embed_dim, depths, num_heads = [
+        384, [2, 2, 18, 2], [12, 24, 48, 96]
+    ]
 
     # SwinV2-G:  2.5B Model
     # embed_dim, depths, num_heads = [
@@ -722,14 +725,11 @@ def train(args):
 
     # setup data parallel reducer
     # reducer = None
-    if args.dp > 1:
-        print('> initialize weight reducer')
-        reducer = resource.reducer
-        for param in model.parameters():
-            reducer.add_param(param)
+    assert args.dp == 1
 
     dataloader = cube.runtime.syndata.SynDataLoader(
         1280, [0], [N // args.dp, C, H, W])
+    dataloader.set_data_buffer(buffer_num=16)
 
     def train_iter(model, dataloader):
         # with torch.no_grad():
@@ -766,6 +766,8 @@ def train(args):
     print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
           iter_time, throughput)
     )
+
+    CudaTimer().print_all(times=iter_num-40)
     memory_summary()
 
 
