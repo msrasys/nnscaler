@@ -10,11 +10,10 @@ python -m torch.distributed.launch \
     --master_port=8004 \
     --use_env \
     examples/swin/swin_dt.py --bs 2 \
-        --layer0 1 2 \
-        --layer1 1 2 \
-        --layer2 1 2 \
-        --layer3 1 2
-
+        --layer0 2 1 \
+        --layer1 2 1 \
+        --layer2 2 1 \
+        --layer3 2 1
 """
 # --------------------------------------------------------
 
@@ -185,6 +184,10 @@ class MegatronWindowAttention(nn.Module):
         self.relative_position_bias_table = nn.Parameter(
             torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), self.num_heads))  # 2*Wh-1 * 2*Ww-1, nH
 
+        # relative position index
+        relative_position_index = window_position_index(self.window_size[0], self.window_size[1])
+        self.register_buffer('relative_position_index', relative_position_index)
+
         # self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.qkv = ColumnParallelLinear(dim, dim * 3, bias=qkv_bias, in_adapter=True, out_adapter=False, tp_group=tp_group)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -208,8 +211,7 @@ class MegatronWindowAttention(nn.Module):
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
-        relative_position_index = window_position_index(self.window_size[0], self.window_size[1])
-        relative_position_bias = self.relative_position_bias_table[relative_position_index]
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index]
         # [Wh * Ww, Wh * Ww, nH]
         relative_position_bias = relative_position_bias.view(
             self.window_size[0] * self.window_size[1],
