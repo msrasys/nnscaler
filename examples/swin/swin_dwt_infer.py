@@ -483,7 +483,7 @@ class BasicLayer(nn.Module):
             nH = 1
             nW = wp // nH
             while nH <= nW:
-                if H % nH != 0 or W % nW != 0:
+                if H % nH != 0 or W % nW != 0 or (H // nH) % window_size != 0 or (W // nW) % window_size != 0:
                     nW = nW // 2
                     nH = int(nH * 2)
                 else:
