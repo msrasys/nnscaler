@@ -207,6 +207,10 @@ class MegatronWindowAttention(nn.Module):
         self.relative_position_bias_table = nn.Parameter(
             torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), self.num_heads))  # 2*Wh-1 * 2*Ww-1, nH
 
+        # relative position index
+        relative_position_index = window_position_index(self.window_size[0], self.window_size[1])
+        self.register_buffer('relative_position_index', relative_position_index)
+
         # self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         # print(f'qkv embed dim: {dim}')
         self.qkv = ColumnParallelLinear(dim, dim * 3, bias=qkv_bias, in_adapter=True, out_adapter=False, tp_group=tp_group)
@@ -231,8 +235,7 @@ class MegatronWindowAttention(nn.Module):
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
-        relative_position_index = window_position_index(self.window_size[0], self.window_size[1])
-        relative_position_bias = self.relative_position_bias_table[relative_position_index]
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index]
         # [Wh * Ww, Wh * Ww, nH]
         relative_position_bias = relative_position_bias.view(
             self.window_size[0] * self.window_size[1],
@@ -868,12 +871,11 @@ def train(args, pconfigs):
         data_buff = [[e.half() for e in data] for data in dataloader.datas]
         dataloader.datas = data_buff
 
+    model.eval()
     def infer_iter(model, dataloader):
         with torch.no_grad():
             img = next(dataloader)
             loss = model(img)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # start training
     nparams_million = sum(p.numel() for p in model.parameters()) / 1000 / 1000
@@ -943,8 +945,6 @@ if __name__ == '__main__':
         dict(layer_id=2, dp=args.layer2[0], wp=args.layer2[1], tp=args.layer2[2]), # basic layer 2  # prob at 8:1?
         dict(layer_id=3, dp=args.layer3[0], wp=args.layer3[1], tp=args.layer3[2]), # basic layer 3
     ]
-
-    args.fp16 = True
 
     print_each_rank(pconfigs, rank_only=0)
     train(args, pconfigs)
