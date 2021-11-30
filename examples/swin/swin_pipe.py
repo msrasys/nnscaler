@@ -590,6 +590,7 @@ class SwinTransformer(nn.Module):
         # pipeline stage
         pp_rank = torch.distributed.get_rank()
         pp_size = torch.distributed.get_world_size()
+
         chunk = len(layers) // pp_size
         if len(layers) % pp_size != 0:
             remain = len(layers) % pp_size
@@ -601,6 +602,19 @@ class SwinTransformer(nn.Module):
         else:
             start = pp_rank * chunk
         stop = start + chunk
+
+        # 8gpu layer assign
+        # layer_split = [3, 3, 3, 3, 3, 4, 4, 4]
+        # assert sum(layer_split) == 27
+        # start = sum(layer_split[0:pp_rank])
+        # stop = sum(layer_split[0:pp_rank+1])
+
+        self.use_checkpoint = [False] * (stop - start)
+        for idx in range(stop - start):
+            if pp_rank == 0:
+                if idx in [0, 1]:
+                    self.use_checkpoint[idx] = True
+
         print_each_rank(f'layer start -> end: {start} -> {stop}')
         self.layers = layers[start:stop]
         print_each_rank([str(type(layer)) + '\n' for layer in self.layers])
@@ -642,9 +656,11 @@ class SwinTransformer(nn.Module):
             x = self.pos_drop(x)
             feature_map = x
 
-        for layer in self.layers:
-            feature_map = checkpoint.checkpoint(layer, feature_map)
-            # feature_map = layer(feature_map)
+        for layer, use_checkpoint in zip(self.layers, self.use_checkpoint):
+            if use_checkpoint:
+                feature_map = checkpoint.checkpoint(layer, feature_map)
+            else:
+                feature_map = layer(feature_map)
         x = feature_map
 
         if self.postprocess:
