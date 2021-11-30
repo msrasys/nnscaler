@@ -207,6 +207,10 @@ class MegatronWindowAttention(nn.Module):
         self.relative_position_bias_table = nn.Parameter(
             torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), self.num_heads))  # 2*Wh-1 * 2*Ww-1, nH
 
+        # relative position index
+        relative_position_index = window_position_index(self.window_size[0], self.window_size[1])
+        self.register_buffer('relative_position_index', relative_position_index)
+
         # self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         # print(f'qkv embed dim: {dim}')
         self.qkv = ColumnParallelLinear(dim, dim * 3, bias=qkv_bias, in_adapter=True, out_adapter=False, tp_group=tp_group)
@@ -231,8 +235,7 @@ class MegatronWindowAttention(nn.Module):
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
-        relative_position_index = window_position_index(self.window_size[0], self.window_size[1])
-        relative_position_bias = self.relative_position_bias_table[relative_position_index]
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index]
         # [Wh * Ww, Wh * Ww, nH]
         relative_position_bias = relative_position_bias.view(
             self.window_size[0] * self.window_size[1],
