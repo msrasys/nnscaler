@@ -9,7 +9,7 @@ python -m torch.distributed.launch \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    examples/swin/swin_pipe.py --pp 4
+    examples/swin/swin_pipe.py --pp 8 --gbs 1 --mbs 1
 """
 # --------------------------------------------------------
 
@@ -69,7 +69,6 @@ def window_partition(x: torch.Tensor, window_size: int):
         windows: (num_windows*B, window_size, window_size, C)
     """
     B, H, W, C = x.shape
-    assert B == 1
     # [B, H_window_num, window_size, W_window_num, window_size, C]
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     # [B, H_window_num, W_window_num, window_size, window_size, C]
@@ -90,7 +89,6 @@ def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int):
         x: (B, H, W, C)
     """
     B = int(windows.shape[0] / (H * W / window_size / window_size))
-    assert B == 1
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
@@ -287,7 +285,6 @@ class SwinTransformerBlock(nn.Module):
     def forward(self, x):
         H, W = self.input_resolution
         B, L, C = x.shape
-        assert B == 1
         assert L == H * W, "input feature has wrong size"
 
         shortcut = x
@@ -379,7 +376,6 @@ class PatchMerging(nn.Module):
         """
         H, W = self.input_resolution
         B, L, C = x.shape
-        assert B == 1
         assert L == H * W, "input feature has wrong size"
         assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
 
