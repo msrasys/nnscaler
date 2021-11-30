@@ -603,19 +603,28 @@ class SwinTransformer(nn.Module):
             start = pp_rank * chunk
         stop = start + chunk
 
+        self.use_checkpoint = [True] * (stop - start)
+
         # 8gpu layer assign
-        # layer_split = [3, 3, 3, 3, 3, 4, 4, 4]
+        # layer_split = [3, 4, 3, 3, 3, 4, 4, 3]
         # assert sum(layer_split) == 27
         # start = sum(layer_split[0:pp_rank])
         # stop = sum(layer_split[0:pp_rank+1])
 
-        self.use_checkpoint = [False] * (stop - start)
-        for idx in range(stop - start):
-            if pp_rank == 0:
-                if idx in [0, 1]:
-                    self.use_checkpoint[idx] = True
+        # 4Ggpu layer assign
+        # layer_split = [6, 7, 7, 7]
+        # assert sum(layer_split) == 27
+        # start = sum(layer_split[0:pp_rank])
+        # stop = sum(layer_split[0:pp_rank+1])
+
+        # self.use_checkpoint = [False] * (stop - start)
+        # for idx in range(stop - start):
+        #     if pp_rank == 0:
+        #         if idx in [0,]:
+        #             self.use_checkpoint[idx] = True
 
         print_each_rank(f'layer start -> end: {start} -> {stop}')
+        print_each_rank(self.use_checkpoint)
         self.layers = layers[start:stop]
         print_each_rank([str(type(layer)) + '\n' for layer in self.layers])
 
@@ -756,7 +765,6 @@ def train(args):
     dataloader.set_data_buffer(buffer_num=16)
 
     def train_iter(model, dataloader):
-        # with torch.no_grad():
         img = next(dataloader)
         scheduling_1f1b(model, [img], args.gbs, args.mbs, dtype=torch.float)
         # if reducer is not None:
@@ -770,9 +778,9 @@ def train(args):
 
     CudaTimer().warmup()
     torch.distributed.barrier()
-    iter_num = 40
+    iter_num = 20
     for step in range(iter_num):
-        if step >= 20:
+        if step >= 10:
             CudaTimer().start('e2e')
         train_iter(model, dataloader)
         optimizer.step()
@@ -780,18 +788,18 @@ def train(args):
         if step == 1:
             print('> passed on 1st iteration')
             memory_summary()
-        if step >= 20:
+        if step >= 10:
             CudaTimer().stop('e2e')
         if (step + 1) % 10 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
-    iter_time = CudaTimer().duration(iter_num-20, field_name='e2e')
+    iter_time = CudaTimer().duration(iter_num-10, field_name='e2e')
     throughput = N / iter_time * 1000
     print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
           iter_time, throughput)
     )
 
-    CudaTimer().print_all(times=iter_num-20)
+    CudaTimer().print_all(times=iter_num-10)
     memory_summary()
 
 
