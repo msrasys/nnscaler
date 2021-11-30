@@ -11,7 +11,7 @@ python -m torch.distributed.launch \
     --use_env \
     examples/swin/swin_pipe.py --pp 8 --gbs 1 --mbs 1
 
-# V100-16GB: 8GPU: need checkpoint: 16 micro bs
+# V100-16GB: 8GPU: need checkpoint: 8 micro bs
 """
 # --------------------------------------------------------
 
@@ -19,6 +19,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
+
 
 import cube
 from cube.profiler import CudaTimer
@@ -587,14 +588,20 @@ class SwinTransformer(nn.Module):
                                module_lists=layers)
         
         # pipeline stage
-        resource =cube.runtime.resource.EnvResource()
         pp_rank = torch.distributed.get_rank()
         pp_size = torch.distributed.get_world_size()
         chunk = len(layers) // pp_size
-        start = pp_rank * chunk
-        stop = (pp_rank + 1) * chunk
-        if is_last_stage():
-            stop = len(layers)
+        if len(layers) % pp_size != 0:
+            remain = len(layers) % pp_size
+            if pp_rank < remain:
+                start = pp_rank * (chunk+1)
+                chunk = chunk + 1
+            else:
+                start = remain * (chunk + 1) + (pp_rank - remain) * chunk
+        else:
+            start = pp_rank * chunk
+        stop = start + chunk
+        print_each_rank(f'layer start -> end: {start} -> {stop}')
         self.layers = layers[start:stop]
         print_each_rank([str(type(layer)) + '\n' for layer in self.layers])
 
