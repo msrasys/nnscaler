@@ -603,10 +603,10 @@ class SwinTransformer(nn.Module):
             start = pp_rank * chunk
         stop = start + chunk
 
-        self.use_checkpoint = [True] * (stop - start)
+        # self.use_checkpoint = [True] * (stop - start)
 
         # 8gpu layer assign
-        # layer_split = [3, 4, 3, 3, 3, 4, 4, 3]
+        # layer_split = [3, 3, 3, 3, 3, 4, 4, 4]
         # assert sum(layer_split) == 27
         # start = sum(layer_split[0:pp_rank])
         # stop = sum(layer_split[0:pp_rank+1])
@@ -617,7 +617,7 @@ class SwinTransformer(nn.Module):
         # start = sum(layer_split[0:pp_rank])
         # stop = sum(layer_split[0:pp_rank+1])
 
-        # self.use_checkpoint = [False] * (stop - start)
+        self.use_checkpoint = [False] * (stop - start)
         # for idx in range(stop - start):
         #     if pp_rank == 0:
         #         if idx in [0,]:

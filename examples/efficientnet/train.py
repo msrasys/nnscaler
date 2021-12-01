@@ -47,6 +47,31 @@ def model_partition(model, in_size):
     # use_checkpoint = [False] * (stop - start)
     use_checkpoint = [True] * (stop - start)
 
+    # layer_split = [6, 6, 8, 16, 14, 13, 14, 11]
+    # assert sum(layer_split) == 88
+    # start = sum(layer_split[0:pp_rank])
+    # stop = sum(layer_split[0:pp_rank+1])
+    # 
+    # # use_checkpoint = [True] * (stop - start)
+    # use_checkpoint = [False] * (stop - start)
+    # # use_checkpoint = [True] * (stop - start)
+    # if pp_rank == 0:
+    #     for idx in range(stop - start):
+    #         if idx < 5:
+    #             use_checkpoint[idx] = True
+    # if pp_rank == 1:
+    #     for idx in range(stop - start):
+    #         if idx < 5:
+    #             use_checkpoint[idx] = True
+    # if pp_rank == 2:
+    #     for idx in range(stop - start):
+    #         if idx < 5:
+    #             use_checkpoint[idx] = True
+    # if pp_rank == 3:
+    #     for idx in range(stop - start):
+    #         if idx < 4:
+    #             use_checkpoint[idx] = True
+
     print_each_rank(f'layer start -> end: {start} -> {stop}')
     layers = layers[start:stop]
     model._blocks = layers
@@ -108,7 +133,7 @@ def train(args):
     CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
     span = 0
-    iter_num = 40
+    iter_num = 60
     for step in range(iter_num):
         if step >= 20:
             torch.cuda.synchronize()
@@ -153,6 +178,8 @@ if __name__ == '__main__':
     parser.add_argument('--gbs', type=int, default=-1)
     parser.add_argument('--mbs', type=int, default=-1)
     parser.add_argument('--fp16', action='store_true', dest='fp16')
+    parser.add_argument('--memory-limit', type=float, default=None,
+                        help='memory fraction limit')
     args = parser.parse_args()
 
 
@@ -204,5 +231,10 @@ if __name__ == '__main__':
             tp_ranks = ranks
             resource.tp_group = group
     print_each_rank(f'initialzed tensor parallel group: {tp_ranks}', rank_only=myrank)
+
+    if args.memory_limit is not None:
+        assert isinstance(args.memory_limit, float)
+        print_each_rank(f'set memory constraints on {args.memory_limit} fraction.')
+        torch.cuda.set_per_process_memory_fraction(args.memory_limit)
 
     train(args)
