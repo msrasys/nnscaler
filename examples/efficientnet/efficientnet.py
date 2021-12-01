@@ -64,6 +64,7 @@ class MBConvBlock(nn.Module):
             self._bn0 = nn.BatchNorm2d(num_features=oup, momentum=self._bn_mom, eps=self._bn_eps)
             # image_size = calculate_output_image_size(image_size, 1) <-- this wouldn't modify image_size
 
+        in_image_size = image_size
         # Depthwise convolution phase
         k = self._block_args.kernel_size
         s = self._block_args.stride
@@ -88,6 +89,9 @@ class MBConvBlock(nn.Module):
         self._bn2 = nn.BatchNorm2d(num_features=final_oup, momentum=self._bn_mom, eps=self._bn_eps)
         self._swish = MemoryEfficientSwish()
 
+        self.in_size = [inp, *in_image_size]
+        self.out_size = [final_oup, *image_size]
+
     def forward(self, inputs, drop_connect_rate=None):
         """MBConvBlock's forward function.
         Args:
@@ -99,6 +103,7 @@ class MBConvBlock(nn.Module):
 
         # Expansion and Depthwise Convolution
         x = inputs
+        assert list(x.shape)[1:] == self.in_size 
         if self._block_args.expand_ratio != 1:
             x = self._expand_conv(inputs)
             x = self._bn0(x)
@@ -127,6 +132,8 @@ class MBConvBlock(nn.Module):
             if drop_connect_rate:
                 x = drop_connect(x, p=drop_connect_rate, training=self.training)
             x = x + inputs  # skip connection
+
+        assert list(x.shape)[1:] == self.out_size 
         return x
 
     def set_swish(self, memory_efficient=True):
@@ -212,6 +219,9 @@ class EfficientNet(nn.Module):
         # set activation to memory efficient swish by default
         self._swish = MemoryEfficientSwish()
 
+        self.preprocess = True
+        self.postprocess = True
+
     def set_swish(self, memory_efficient=True):
         """Sets swish function as memory efficient (for training) or standard (for export).
         Args:
@@ -289,7 +299,7 @@ class EfficientNet(nn.Module):
 
         return x
 
-    def forward(self, inputs):
+    def forward(self, x, feature_map=None):
         """EfficientNet's forward function.
            Calls extract_features to extract features, applies final linear layer, and returns logits.
         Args:
@@ -297,14 +307,29 @@ class EfficientNet(nn.Module):
         Returns:
             Output of this model after processing.
         """
-        # Convolution layers
-        x = self.extract_features(inputs)
-        # Pooling and final linear layer
-        x = self._avg_pooling(x)
-        if self._global_params.include_top:
-            x = x.flatten(start_dim=1)
-            x = self._dropout(x)
-            x = self._fc(x)
+        if self.preprocess:
+            # Stem
+            x = self._swish(self._bn0(self._conv_stem(x)))
+            feature_map = x
+
+        # Blocks
+        for idx, block in enumerate(self._blocks):
+            drop_connect_rate = self._global_params.drop_connect_rate
+            if drop_connect_rate:
+                drop_connect_rate *= float(idx) / len(self._blocks)  # scale drop connect_rate
+            feature_map = block(feature_map, drop_connect_rate=drop_connect_rate)
+        x = feature_map
+
+        if self.postprocess:
+            # Head
+            x = self._swish(self._bn1(self._conv_head(x)))
+            # Pooling and final linear layer
+            x = self._avg_pooling(x)
+            if self._global_params.include_top:
+                x = x.flatten(start_dim=1)
+                x = self._dropout(x)
+                x = self._fc(x)
+            x = torch.sum(x)
         return x
 
     @classmethod
