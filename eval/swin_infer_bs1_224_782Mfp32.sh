@@ -1,5 +1,7 @@
 
-mkdir -p expinfer_224_782M_fp16
+logfile=expinfer_224_782M_fp32_bs1
+
+mkdir -p ${logfile}
 
 # ================== Maximal Tensor Parallel ===============
 python -m torch.distributed.launch \
@@ -14,8 +16,7 @@ python -m torch.distributed.launch \
         --layer1 1 1 1 \
         --layer2 1 1 1 \
         --layer3 1 1 1 \
-        --fp16 \
-    > expinfer_Gfp16_bs1/1gpu_tp.txt
+    > ${logfile}/1gpu_tp.txt
 
 python -m torch.distributed.launch \
     --nproc_per_node=2 \
@@ -29,8 +30,7 @@ python -m torch.distributed.launch \
         --layer1 1 1 2 \
         --layer2 1 1 2 \
         --layer3 1 1 2 \
-        --fp16 \
-    > expinfer_Gfp16_bs1/2gpu_tp.txt
+    > ${logfile}/2gpu_tp.txt
 
 python -m torch.distributed.launch \
     --nproc_per_node=4 \
@@ -44,8 +44,7 @@ python -m torch.distributed.launch \
         --layer1 1 1 4 \
         --layer2 1 1 4 \
         --layer3 1 1 4 \
-        --fp16 \
-    > expinfer_Gfp16_bs1/4gpu_tp.txt
+    > ${logfile}/4gpu_tp.txt
 
 
 # ================== Window + Tensor Parallel ===============
@@ -62,8 +61,7 @@ python -m torch.distributed.launch \
         --layer1 1 2 1 \
         --layer2 1 2 1 \
         --layer3 1 1 2 \
-        --fp16 \
-    > expinfer_Gfp16_bs1/2gpu_2wp2tp.txt
+    > ${logfile}/2gpu_2wp2tp.txt
 
 python -m torch.distributed.launch \
     --nproc_per_node=4 \
@@ -77,8 +75,7 @@ python -m torch.distributed.launch \
         --layer1 1 4 1 \
         --layer2 1 4 1 \
         --layer3 1 1 4 \
-        --fp16 \
-    > expinfer_Gfp16_bs1/4gpu_4wp4tp.txt
+    > ${logfile}/4gpu_4wp4tp.txt
 
 python -m torch.distributed.launch \
     --nproc_per_node=8 \
@@ -92,6 +89,5 @@ python -m torch.distributed.launch \
         --layer1 1 8 1 \
         --layer2 1 4 2 \
         --layer3 1 1 8 \
-        --fp16 \
-    > expinfer_Gfp16_bs1/8gpu_8wp8tp.txt
+    > ${logfile}/8gpu_8wp8tp.txt
 
