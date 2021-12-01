@@ -44,9 +44,13 @@ def model_partition(model, in_size):
         start = pp_rank * chunk
     stop = start + chunk
 
+    # use_checkpoint = [False] * (stop - start)
+    use_checkpoint = [True] * (stop - start)
+
     print_each_rank(f'layer start -> end: {start} -> {stop}')
     layers = layers[start:stop]
     model._blocks = layers
+    model.use_checkpoint = use_checkpoint
 
     if pp_rank == 0:
         model.preprocess = True

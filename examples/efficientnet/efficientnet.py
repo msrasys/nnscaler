@@ -24,6 +24,8 @@ from .utils import (
     calculate_output_image_size
 )
 
+import torch.utils.checkpoint as checkpoint
+
 
 VALID_MODELS = (
     'efficientnet-b0', 'efficientnet-b1', 'efficientnet-b2', 'efficientnet-b3',
@@ -219,6 +221,7 @@ class EfficientNet(nn.Module):
         # set activation to memory efficient swish by default
         self._swish = MemoryEfficientSwish()
 
+        self.use_checkpoint = [False] * len(self._blocks)
         self.preprocess = True
         self.postprocess = True
 
@@ -276,29 +279,6 @@ class EfficientNet(nn.Module):
 
         return endpoints
 
-    def extract_features(self, inputs):
-        """use convolution layer to extract feature .
-        Args:
-            inputs (tensor): Input tensor.
-        Returns:
-            Output of the final convolution
-            layer in the efficientnet model.
-        """
-        # Stem
-        x = self._swish(self._bn0(self._conv_stem(inputs)))
-
-        # Blocks
-        for idx, block in enumerate(self._blocks):
-            drop_connect_rate = self._global_params.drop_connect_rate
-            if drop_connect_rate:
-                drop_connect_rate *= float(idx) / len(self._blocks)  # scale drop connect_rate
-            x = block(x, drop_connect_rate=drop_connect_rate)
-
-        # Head
-        x = self._swish(self._bn1(self._conv_head(x)))
-
-        return x
-
     def forward(self, x, feature_map=None):
         """EfficientNet's forward function.
            Calls extract_features to extract features, applies final linear layer, and returns logits.
@@ -317,7 +297,13 @@ class EfficientNet(nn.Module):
             drop_connect_rate = self._global_params.drop_connect_rate
             if drop_connect_rate:
                 drop_connect_rate *= float(idx) / len(self._blocks)  # scale drop connect_rate
-            feature_map = block(feature_map, drop_connect_rate=drop_connect_rate)
+            else:
+                drop_connect_rate = None
+            if self.use_checkpoint[idx]:
+                feature_map = checkpoint.checkpoint(block, feature_map, drop_connect_rate)
+            else:
+                feature_map = block(feature_map, drop_connect_rate=drop_connect_rate)
+            # feature_map = block(feature_map, drop_connect_rate=drop_connect_rate)
         x = feature_map
 
         if self.postprocess:
