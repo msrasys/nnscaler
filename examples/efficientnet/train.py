@@ -70,12 +70,12 @@ def train(args):
     N = args.gbs
 
     # L2 config
-    # C, H, W = [3, 800, 800]
-    # model = EfficientNet.from_name('efficientnet-l2')
+    C, H, W = [3, 800, 800]
+    model = EfficientNet.from_name('efficientnet-l2')
     
     # B8 config
-    C, H, W = [3, 672, 672]
-    model = EfficientNet.from_name('efficientnet-b8')
+    # C, H, W = [3, 672, 672]
+    # model = EfficientNet.from_name('efficientnet-b8')
 
     model = model_partition(model, [C, H, W])
     if args.fp16:
