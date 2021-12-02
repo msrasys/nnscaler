@@ -3,13 +3,13 @@
 # Modified from Swin-Transformer Repo
 """
 python -m torch.distributed.launch \
-    --nproc_per_node=4 \
+    --nproc_per_node=8 \
     --nnodes=1 \
     --node_rank=0 \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    examples/swin/swin_pipe.py --pp 8 --gbs 1 --mbs 1
+    examples/swin/swin_pipe.py --pp 8 --gbs 32 --mbs 4
 
 # V100-16GB: 8GPU: need checkpoint: 8 micro bs
 """
@@ -603,25 +603,25 @@ class SwinTransformer(nn.Module):
             start = pp_rank * chunk
         stop = start + chunk
 
-        # self.use_checkpoint = [True] * (stop - start)
+        self.use_checkpoint = [True] * (stop - start)
+        # self.use_checkpoint = [False] * (stop - start)
 
         # 8gpu layer assign
         # layer_split = [3, 3, 3, 3, 3, 4, 4, 4]
         # assert sum(layer_split) == 27
         # start = sum(layer_split[0:pp_rank])
         # stop = sum(layer_split[0:pp_rank+1])
+        # self.use_checkpoint = [False] * (stop - start)
+        # for idx in range(stop - start):
+        #     if pp_rank == 0:
+        #         if idx < 1:
+        #             self.use_checkpoint[idx] = True
 
         # 4Ggpu layer assign
         # layer_split = [6, 7, 7, 7]
         # assert sum(layer_split) == 27
         # start = sum(layer_split[0:pp_rank])
         # stop = sum(layer_split[0:pp_rank+1])
-
-        self.use_checkpoint = [False] * (stop - start)
-        # for idx in range(stop - start):
-        #     if pp_rank == 0:
-        #         if idx in [0,]:
-        #             self.use_checkpoint[idx] = True
 
         print_each_rank(f'layer start -> end: {start} -> {stop}')
         print_each_rank(self.use_checkpoint)

@@ -793,10 +793,10 @@ def train(args, pconfigs):
     # dim_head is always 32
 
     # img resolution, windows size: 224, 384, 518, 640
-    # C, H, W, window_size = [3, 224, 224, 7]
+    C, H, W, window_size = [3, 224, 224, 7]
     # C, H, W, window_size = [3, 384, 384, 12]
     # C, H, W, window_size = [3, 518, 518, ?]
-    C, H, W, window_size = [3, 640, 640, 20]
+    # C, H, W, window_size = [3, 640, 640, 20]
     # C, H, W, window_size = [3, 1536, 1536, 48]
 
     # image batch size
@@ -823,14 +823,14 @@ def train(args, pconfigs):
     # ]
 
     # SwinV2-H modified: 782 M
-    # embed_dim, depths, num_heads = [
-    #     384, [2, 2, 18, 2], [12, 24, 48, 96]
-    # ]
+    embed_dim, depths, num_heads = [
+        384, [2, 2, 18, 2], [12, 24, 48, 96]
+    ]
 
     # SwinV2-G:  2.5B Model
-    embed_dim, depths, num_heads = [
-        512, [2, 2, 42, 2], [16, 32, 64, 128]
-    ]
+    # embed_dim, depths, num_heads = [
+    #     512, [2, 2, 42, 2], [16, 32, 64, 128]
+    # ]
 
     # 895.7 M Model
     # embed_dim, depths, num_heads = [
