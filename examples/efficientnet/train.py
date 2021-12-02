@@ -47,27 +47,71 @@ def model_partition(model, in_size):
     # use_checkpoint = [False] * (stop - start)
     use_checkpoint = [True] * (stop - start)
 
-    # layer_split = [6, 6, 8, 16, 14, 13, 14, 11]
-    # assert sum(layer_split) == 88
+    # layer_split = [8, 5, 7, 14, 15, 13, 15, 11]
+    # assert sum(layer_split) == 88, f"split {sum(layer_split)} != 88"
     # start = sum(layer_split[0:pp_rank])
     # stop = sum(layer_split[0:pp_rank+1])
     # 
-    # # use_checkpoint = [True] * (stop - start)
     # use_checkpoint = [False] * (stop - start)
-    # # use_checkpoint = [True] * (stop - start)
     # if pp_rank == 0:
     #     for idx in range(stop - start):
-    #         if idx < 5:
+    #         if idx < 7:
     #             use_checkpoint[idx] = True
     # if pp_rank == 1:
     #     for idx in range(stop - start):
-    #         if idx < 5:
+    #         if idx < 4:
+    #             use_checkpoint[idx] = True
+    # if pp_rank == 2:
+    #     for idx in range(stop - start):
+    #         if idx < 4:
+    #             use_checkpoint[idx] = True
+    # if pp_rank == 3:
+    #     for idx in range(stop - start):
+    #         if idx < 3:
+    #             use_checkpoint[idx] = True
+
+    # 8 gpu naive partition plan
+    # if pp_rank == 0:
+    #     for idx in range(stop - start):
+    #         if idx < 10:
+    #             use_checkpoint[idx] = True
+    # if pp_rank == 1:
+    #     for idx in range(stop - start):
+    #         if idx < 8:
+    #             use_checkpoint[idx] = True
+    # if pp_rank == 2:
+    #     for idx in range(stop - start):
+    #         if idx < 2:
+    #             use_checkpoint[idx] = True
+
+    # 8GB memory experiments
+    # layer_split = [8, 5, 7, 14, 14, 13, 16, 11]
+    # assert sum(layer_split) == 88, f"split {sum(layer_split)} != 88"
+    # start = sum(layer_split[0:pp_rank])
+    # stop = sum(layer_split[0:pp_rank+1])
+    # 
+    # use_checkpoint = [False] * (stop - start)
+    # if pp_rank == 0:
+    #     for idx in range(stop - start):
+    #         if idx < 8:
+    #             use_checkpoint[idx] = True
+    # if pp_rank == 1:
+    #     for idx in range(stop - start):
+    #         if idx < 4:
     #             use_checkpoint[idx] = True
     # if pp_rank == 2:
     #     for idx in range(stop - start):
     #         if idx < 5:
     #             use_checkpoint[idx] = True
     # if pp_rank == 3:
+    #     for idx in range(stop - start):
+    #         if idx < 8:
+    #             use_checkpoint[idx] = True
+    # if pp_rank == 4:
+    #     for idx in range(stop - start):
+    #         if idx < 5:
+    #             use_checkpoint[idx] = True
+    # if pp_rank == 5:
     #     for idx in range(stop - start):
     #         if idx < 4:
     #             use_checkpoint[idx] = True
@@ -133,7 +177,7 @@ def train(args):
     CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
     span = 0
-    iter_num = 60
+    iter_num = 40
     for step in range(iter_num):
         if step >= 20:
             torch.cuda.synchronize()
