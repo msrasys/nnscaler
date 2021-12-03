@@ -603,8 +603,8 @@ class SwinTransformer(nn.Module):
             start = pp_rank * chunk
         stop = start + chunk
 
-        self.use_checkpoint = [True] * (stop - start)
-        # self.use_checkpoint = [False] * (stop - start)
+        # self.use_checkpoint = [True] * (stop - start)
+        self.use_checkpoint = [False] * (stop - start)
 
         # 8gpu layer assign
         # layer_split = [3, 3, 3, 3, 3, 4, 4, 4]

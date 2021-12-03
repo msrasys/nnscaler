@@ -760,11 +760,12 @@ class SwinTransformer(nn.Module):
         self.use_checkpoint = [False] * (stop - start)
 
         # 8gpu layer assign
+        layer_split = [5, 5, 4, 3, 3, 3, 3, 5] # original
         # layer_split = [3, 3, 3, 3, 3, 4, 4, 4]
-        # assert sum(layer_split) == 27
-        # start = sum(layer_split[0:pp_rank])
-        # stop = sum(layer_split[0:pp_rank+1])
-        # self.use_checkpoint = [False] * (stop - start)
+        assert sum(layer_split) == 31
+        start = sum(layer_split[0:pp_rank])
+        stop = sum(layer_split[0:pp_rank+1])
+        self.use_checkpoint = [False] * (stop - start)
         # for idx in range(stop - start):
         #     if pp_rank == 0:
         #         if idx < 1:
@@ -818,7 +819,7 @@ class SwinTransformer(nn.Module):
         # block data parallel region 
         for block in self.layers:
             if isinstance(block, ParallelModule):
-                if block.use_dp:
+                if block.use_dp():
                     for param in block.parameters():
                         _dp_reducer[block.dp_ranks].add_param(param)
 
