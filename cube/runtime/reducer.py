@@ -66,7 +66,7 @@ class Reducer:
         Returns:
             A contiguous 1D buffer containing input tensors.
         """
-        return torch._C._nn.flatten_dense_tensors(tensors)
+        return torch._utils._flatten_dense_tensors(tensors)
 
     def _unflatten_dense_tensors(self, flat, tensors):
         """
@@ -82,4 +82,4 @@ class Reducer:
             Unflattened dense tensors with sizes same as tensors and values from
             flat.
         """
-        return torch._C._nn.unflatten_dense_tensors(flat, tensors)
+        return torch._utils._unflatten_dense_tensors(flat, tensors)
