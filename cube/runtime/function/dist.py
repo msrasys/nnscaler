@@ -23,7 +23,6 @@ def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, dim_ranks, gro
         shift: int
         dim: int
     """
-    return input
     world_size = len(dim_ranks)
     if world_size == 1:
         return torch.roll(input, (shift), (dim,))
