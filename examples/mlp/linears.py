@@ -17,39 +17,39 @@ from torch import nn
 import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
-from examples.mlp.policy.pipe1f1b_parallel import transform_policy
-from examples.mlp.policy.pipe1f1b_parallel import schedule_policy
+from examples.mlp.policy.col_parallel import transform_policy
+from examples.mlp.policy.col_parallel import schedule_policy
 
 # =================== Semantic Model Description ====================
 
 class MLP(nn.Module):
-    def __init__(self, dim, mult=4):
+    def __init__(self, dim, mult=1):
         super().__init__()
         self.linear1 = nn.Linear(dim, dim * mult)
         self.linear2 = nn.Linear(dim * mult, dim)
         self.linear3 = nn.Linear(dim, dim * mult)
         self.linear4 = nn.Linear(dim * mult, dim)
-        self.linear5 = nn.Linear(dim, dim * mult)
-        self.linear6 = nn.Linear(dim * mult, dim)
-        self.linear7 = nn.Linear(dim, dim * mult)
-        self.linear8 = nn.Linear(dim * mult, dim)
+        # self.linear5 = nn.Linear(dim, dim * mult)
+        # self.linear6 = nn.Linear(dim * mult, dim)
+        # self.linear7 = nn.Linear(dim, dim * mult)
+        # self.linear8 = nn.Linear(dim * mult, dim)
 
     def forward(self, data):
         output = self.linear1(data)
         output = self.linear2(output)
         output = self.linear3(output)
         output = self.linear4(output)
-        output = self.linear5(output)
-        output = self.linear6(output)
-        output = self.linear7(output)
-        output = self.linear8(output)
+        # output = self.linear5(output)
+        # output = self.linear6(output)
+        # output = self.linear7(output)
+        # output = self.linear8(output)
         loss = torch.sum(output)
         return loss
 
 
 def train():
-    batch_size = 128
-    dim = 1024
+    batch_size = 8192
+    dim = 8192
 
     model = MLP(dim=dim)
     model = cube.SemanticModel(
@@ -67,12 +67,12 @@ def train():
     
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
-    CudaTimer().warmup()
+    CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
     iter_num = 128
     for step in range(iter_num):
         if step >= 40:
-            CudaTimer().start('e2e')
+            CudaTimer(enable=True).start('e2e')
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
@@ -83,6 +83,7 @@ def train():
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
           CudaTimer().duration(iter_num-40, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num-40)
 
 
 if __name__ == '__main__':

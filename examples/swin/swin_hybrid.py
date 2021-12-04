@@ -10,11 +10,11 @@ python -m torch.distributed.launch \
     --master_port=8004 \
     --use_env \
     examples/swin/swin_hybrid.py \
-        --layer0 4 2 1 \
-        --layer1 4 2 1 \
-        --layer2 4 1 2 \
-        --layer3 4 1 2 \
-        --gbs 32 --mbs 2
+        --layer0 8 1 1 \
+        --layer1 8 1 1 \
+        --layer2 8 1 1 \
+        --layer3 8 1 1 \
+        --gbs 1 --mbs 1
 
 # V100-16GB: 8GPU: need checkpoint: 8 micro bs
 """
@@ -57,7 +57,7 @@ def setup_device_group(pp: int, dp: int, tp: int, layer_id: int):
     if not pp * tp * dp == ndevs:
         raise RuntimeError("Expected same device number")
 
-    assert tp == 1 or dp == 1, "Currently hybrid not supported"
+    # assert tp == 1 or dp == 1, "Currently hybrid not supported"
 
     devs = cube.runtime.device.DeviceGroup()
 
@@ -362,6 +362,7 @@ class SwinTransformerBlock(ParallelModule):
 
         H, W = self.input_resolution
 
+        assert fw_bs // len(dp_ranks) != 0
         self.set_in_size([fw_bs // len(dp_ranks), H * W, self.dim])
         self.set_out_size([fw_bs // len(dp_ranks), H * W, self.dim])
 
@@ -455,6 +456,7 @@ class PatchMerging(ParallelModule):
 
         H, W = self.input_resolution
 
+        assert fw_bs // len(dp_ranks) != 0
         self.set_in_size([fw_bs // len(dp_ranks), H * W, self.dim])
         self.set_out_size([fw_bs // len(dp_ranks), H // 2 * W // 2, self.dim * 2])
 
@@ -713,21 +715,24 @@ class SwinTransformer(nn.Module):
                 merging = None
 
             # adapter
-            if len(layer_tp_ranks) > 1 and len(next_layer_dp_ranks) > 1:
+            if len(layer_dp_ranks) == 1 and len(layer_tp_ranks) > 1 \
+               and len(next_layer_dp_ranks) > 1 and len(next_layer_tp_ranks) == 1:
                 print_each_rank('add tp to dp adapters')
                 adapter = TPtoDP(DeviceGroup().get_group(next_layer_dp_ranks))
                 adapter.in_size = layers[-1].out_size
                 out_size = [size for size in layers[-1].out_size]
                 out_size[0] = out_size[0] // len(next_layer_dp_ranks)
                 adapter.out_size = out_size
-            elif len(layer_dp_ranks) > 1 and len(next_layer_tp_ranks) > 1:
+            elif len(layer_tp_ranks) == 1 and len(layer_dp_ranks) > 1 \
+                 and len(next_layer_tp_ranks) > 1 and len(next_layer_dp_ranks) == 1:
                 print_each_rank('add dp to tp adapters')
                 adapter = DPtoTP(DeviceGroup().get_group(next_layer_tp_ranks))
                 adapter.in_size = layers[-1].out_size
                 out_size = [size for size in layers[-1].out_size]
                 out_size[0] = out_size[0] * len(layer_dp_ranks)
                 adapter.out_size = out_size
-            else:
+            elif len(layer_tp_ranks) == len(next_layer_tp_ranks) and \
+                 len(layer_dp_ranks) == len(next_layer_dp_ranks):
                 adapter = torch.nn.Identity()
                 adapter.in_size = layers[-1].out_size
                 adapter.out_size = layers[-1].out_size
@@ -756,16 +761,16 @@ class SwinTransformer(nn.Module):
             start = pp_rank * chunk
         stop = start + chunk
 
-        # self.use_checkpoint = [True] * (stop - start)
-        self.use_checkpoint = [False] * (stop - start)
+        # self.use_checkpoint = [False] * (stop - start)
+        self.use_checkpoint = [True] * (stop - start)
 
         # 8gpu layer assign
-        layer_split = [5, 5, 4, 3, 3, 3, 3, 5] # original
+        # layer_split = [5, 5, 4, 3, 3, 3, 3, 5] # original
         # layer_split = [3, 3, 3, 3, 3, 4, 4, 4]
-        assert sum(layer_split) == 31
-        start = sum(layer_split[0:pp_rank])
-        stop = sum(layer_split[0:pp_rank+1])
-        self.use_checkpoint = [False] * (stop - start)
+        # assert sum(layer_split) == 31
+        # start = sum(layer_split[0:pp_rank])
+        # stop = sum(layer_split[0:pp_rank+1])
+        # self.use_checkpoint = [False] * (stop - start)
         # for idx in range(stop - start):
         #     if pp_rank == 0:
         #         if idx < 1:
@@ -915,6 +920,14 @@ def train(args, pconfigs):
     embed_dim, depths, num_heads = [
         384, [2, 2, 18, 2], [12, 24, 48, 96]
     ]
+    # head dim 32 -> 48
+    embed_dim, depths, num_heads = [
+        576, [2, 2, 18, 2], [12, 24, 48, 96]
+    ]
+    # head dim 32 -> 64
+    # embed_dim, depths, num_heads = [
+    #     768, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
 
     # SwinV2-G:  2.5B Model
     # embed_dim, depths, num_heads = [

@@ -15,6 +15,7 @@ def _reduce(input_, group):
         CudaTimer().stop(field_name='tp_allreduce')
         return input_
     torch.distributed.all_reduce(input_, group=group)
+    torch.cuda.synchronize()
     CudaTimer().stop(field_name='tp_allreduce')
     return input_
 
@@ -48,6 +49,7 @@ def _gather(input_, group, dim=-1):
     tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
     tensor_list[rank] = input_
     torch.distributed.all_gather(tensor_list, input_, group=group)
+    torch.cuda.synchronize()
     # Note: torch.cat already creates a contiguous tensor.
     output = torch.cat(tensor_list, dim=dim).contiguous()
 

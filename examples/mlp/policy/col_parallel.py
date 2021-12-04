@@ -38,4 +38,7 @@ def schedule_policy(sugraph: SUGraph, resource):
             print(f'error su: {su}')
             assert False
         sugraph.assign(su.mirror, devid)
+    fsus = sugraph.fsus()
+    print('> [scheduling] setting schedule order...')
+    sugraph.partial_set_order(fsus, lazy=False)
     return sugraph
