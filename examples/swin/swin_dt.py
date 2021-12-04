@@ -823,6 +823,10 @@ def train(args, pconfigs):
     embed_dim, depths, num_heads = [
         384, [2, 2, 18, 2], [12, 24, 48, 96]
     ]
+    # head dim 32 -> 48
+    embed_dim, depths, num_heads = [
+        576, [2, 2, 18, 2], [12, 24, 48, 96]
+    ]
 
     # SwinV2-G:  2.5B Model
     # embed_dim, depths, num_heads = [
