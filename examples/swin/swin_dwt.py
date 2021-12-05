@@ -904,9 +904,9 @@ def train(args, pconfigs):
     CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
     span = 0
-    iter_num = 128
+    iter_num = 60
     for step in range(iter_num):
-        if step >= 40:
+        if step >= 20:
             torch.cuda.synchronize()
             start = time.time()
             CudaTimer(enable=True).start('e2e')
@@ -916,7 +916,7 @@ def train(args, pconfigs):
         if step == 1:
             print('> passed on 1st iteration')
             memory_summary()
-        if step >= 40:
+        if step >= 20:
             torch.cuda.synchronize()
             stop = time.time()
             span += (stop - start) * 1000
@@ -924,13 +924,13 @@ def train(args, pconfigs):
         if (step + 1) % 20 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
-    iter_time = span / (iter_num-40)
+    iter_time = span / (iter_num-20)
     throughput = N / iter_time * 1000
     print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
           iter_time, throughput)
     )
     memory_summary()
-    CudaTimer().print_all(times=iter_num-40)
+    CudaTimer().print_all(times=iter_num-20)
 
 
 if __name__ == '__main__':

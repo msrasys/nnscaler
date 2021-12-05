@@ -3,17 +3,17 @@
 # Modified from Swin-Transformer Repo
 """
 python -m torch.distributed.launch \
-    --nproc_per_node=2 \
+    --nproc_per_node=1 \
     --nnodes=1 \
     --node_rank=0 \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    examples/swin/swin_dt.py --bs 2 \
-        --layer0 2 1 \
-        --layer1 2 1 \
-        --layer2 2 1 \
-        --layer3 2 1
+    examples/swin/swin_dt.py --bs 16 \
+        --layer0 1 1 \
+        --layer1 1 1 \
+        --layer2 1 1 \
+        --layer3 1 1
 """
 # --------------------------------------------------------
 
@@ -815,33 +815,45 @@ def train(args, pconfigs):
     # ]
 
     # SwinV2-H: 657 M
-    # embed_dim, depths, num_heads = [
-    #     352, [2, 2, 18, 2], [11, 22, 44, 88]
-    # ]
-
-    # SwinV2-H modified: 782 M
     embed_dim, depths, num_heads = [
-        384, [2, 2, 18, 2], [12, 24, 48, 96]
-    ]
-    # head dim 32 -> 48
-    embed_dim, depths, num_heads = [
-        576, [2, 2, 18, 2], [12, 24, 48, 96]
+        352, [2, 2, 18, 2], [11, 22, 44, 88]
     ]
 
-    # SwinV2-G:  2.5B Model
+    # # SwinV2-H modified: 782 M
     # embed_dim, depths, num_heads = [
-    #     512, [2, 2, 42, 2], [16, 32, 64, 128]
+    #     384, [2, 2, 18, 2], [12, 24, 48, 96]
     # ]
-
-    # 895.7 M Model
+    # # head dim 32 -> 48
     # embed_dim, depths, num_heads = [
-    #     384, [2, 2, 22, 2], [12, 24, 48, 96]
+    #     576, [2, 2, 18, 2], [12, 24, 48, 96]
     # ]
-
-
-    # 2.01B model
+    # # head dim 32 -> 64 -- too much
     # embed_dim, depths, num_heads = [
-    #     576, [2, 2, 22, 2], [12, 24, 48, 96]
+    #     768, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
+    # # head dim 32 -> 80 
+    # embed_dim, depths, num_heads = [
+    #     960, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
+    # # head dim 32 -> 96
+    # embed_dim, depths, num_heads = [
+    #     1152, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
+    # # # head dim 32 -> 112
+    # embed_dim, depths, num_heads = [
+    #     1344, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
+    # # head dim 32 -> 128
+    # embed_dim, depths, num_heads = [
+    #     1536, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
+    # # head dim 32 -> 144
+    # embed_dim, depths, num_heads = [
+    #     1728, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
+    # # head dim 32 -> 160
+    # embed_dim, depths, num_heads = [
+    #     1920, [2, 2, 18, 2], [12, 24, 48, 96]
     # ]
 
 
@@ -887,9 +899,9 @@ def train(args, pconfigs):
     CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
     span = 0
-    iter_num = 128
+    iter_num = 60
     for step in range(iter_num):
-        if step >= 40:
+        if step >= 20:
             torch.cuda.synchronize()
             start = time.time()
             CudaTimer(enable=True).start('e2e')
@@ -899,7 +911,7 @@ def train(args, pconfigs):
         if step == 1:
             print('> passed on 1st iteration')
             memory_summary()
-        if step >= 40:
+        if step >= 20:
             torch.cuda.synchronize()
             stop = time.time()
             span += (stop - start) * 1000
@@ -907,13 +919,13 @@ def train(args, pconfigs):
         if (step + 1) % 20 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
-    iter_time = span / (iter_num-40)
+    iter_time = span / (iter_num-20)
     throughput = N / iter_time * 1000
     print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
           iter_time, throughput)
     )
     memory_summary()
-    CudaTimer().print_all(times=iter_num-40)
+    CudaTimer().print_all(times=iter_num-20)
 
 
 if __name__ == '__main__':
