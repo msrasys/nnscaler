@@ -1,10 +1,18 @@
 import torch
 
+from torch.distributed.distributed_c10d import _get_global_rank
 from cube.profiler.timer import CudaTimer
 
 
-def is_last_stage():
-    return torch.distributed.get_rank() == torch.distributed.get_world_size() - 1
+def get_global_rank(group, group_rank):
+    if group is None:
+        return group_rank
+    else:
+        return _get_global_rank(group, group_rank)
+
+
+def is_last_stage(group):
+    return torch.distributed.get_rank(group=group) == torch.distributed.get_world_size(group=group) - 1
 
 
 #================= WhatToDO functions ==================#
@@ -34,12 +42,14 @@ def backward_step(feature_map, output_tensor, output_tensor_grad):
 
 #================= Between Stage functions ==================#
 
-def send(tensors, to_rank):
+def send(tensors, to_rank, group):
     """
     send tensor to the target rank
     """
-    if to_rank < 0 or to_rank >= torch.distributed.get_world_size():
+    if to_rank < 0 or to_rank >= torch.distributed.get_world_size(group):
         return None
+    if group is not None:
+        to_rank = get_global_rank(group, to_rank)
     assert isinstance(tensors, list) or isinstance(tensors, tuple)
     CudaTimer().start("send")
     reqs = list()
@@ -60,10 +70,13 @@ def send(tensors, to_rank):
     CudaTimer().stop("send")
 
 
-def recv(shapes, from_rank, dtype=torch.float):
-    if from_rank < 0 or from_rank >= torch.distributed.get_world_size():
+def recv(shapes, from_rank, dtype, group):
+    if from_rank < 0 or from_rank >= torch.distributed.get_world_size(group):
         return [None] * len(shapes)
     assert isinstance(shapes, list) or isinstance(shapes, tuple)
+    if group is not None:
+        from_rank = get_global_rank(group, from_rank)
+        # print(f'recv: {torch.distributed.get_rank()} <- {from_rank}: {shapes}')
     CudaTimer().start("recv")
     reqs = list()
     recved_tensors = list()
@@ -88,9 +101,12 @@ def recv(shapes, from_rank, dtype=torch.float):
     return recved_tensors
 
 
-def send_and_recv(send_tensors, recv_shapes, rank, dtype=torch.float):
-    if rank < 0 or rank >= torch.distributed.get_world_size():
+def send_and_recv(send_tensors, recv_shapes, rank, dtype, group):
+    if rank < 0 or rank >= torch.distributed.get_world_size(group):
         return [None] * len(recv_shapes)
+    if group is not None:
+        rank = get_global_rank(group, rank)
+        # print(f'exchange: {torch.distributed.get_rank()} <-> {rank}: {recv_shapes}')
     assert isinstance(send_tensors, list) or isinstance(send_tensors, tuple)
     assert isinstance(recv_shapes, list) or isinstance(recv_shapes, tuple)
     CudaTimer().start("send_recv")
@@ -145,13 +161,13 @@ def split_batch(inputs, num_microbatches):
 
 #================= Scheduling ==================#
 
-def scheduling_1f1b(model, inputs, bs, micro_bs, dtype=torch.float):
-    myrank = torch.distributed.get_rank()
+def scheduling_1f1b(model, inputs, bs, micro_bs, dtype, group):
+    myrank = torch.distributed.get_rank(group)
 
     num_microbatches = int(bs / micro_bs)
     num_warmup_microbatches = \
-        (torch.distributed.get_world_size() - 
-         torch.distributed.get_rank() - 1)
+        (torch.distributed.get_world_size(group) - 
+         torch.distributed.get_rank(group) - 1)
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_warmup_remaining = num_microbatches - num_warmup_microbatches
     
@@ -165,14 +181,14 @@ def scheduling_1f1b(model, inputs, bs, micro_bs, dtype=torch.float):
         # recv forward
         # print('[warmup] rank {}: step-{}: recving forward...'.format(myrank, i))
         feature_map = recv(
-            (torch.Size([micro_bs] + model.in_size),), myrank-1, dtype
+            (torch.Size([micro_bs] + model.in_size),), myrank-1, dtype, group
         )[0]
         image = inputs[i][0]
         # forward
         output_tensor = forward_step(model, image, feature_map)
         # send forward
         # print('[warmup] rank {}: step-{}: sending forward...'.format(myrank, i))
-        send((output_tensor,), myrank+1)
+        send((output_tensor,), myrank+1, group)
 
         input_tensors.append(feature_map)
         output_tensors.append(output_tensor)
@@ -182,7 +198,7 @@ def scheduling_1f1b(model, inputs, bs, micro_bs, dtype=torch.float):
         # recv forward
         # print('[1f1b] rank {}: step-{}: recving forward...'.format(myrank, 0))
         feature_map = recv(
-            (torch.Size([micro_bs] + model.in_size),), myrank-1, dtype
+            (torch.Size([micro_bs] + model.in_size),), myrank-1, dtype, group
         )[0]
         image = inputs[num_warmup_microbatches][0]
 
@@ -195,7 +211,7 @@ def scheduling_1f1b(model, inputs, bs, micro_bs, dtype=torch.float):
         output_tensor_grad = send_and_recv(
             (output_tensor,),
             (torch.Size([micro_bs] + model.out_size),),
-            myrank+1, dtype
+            myrank+1, dtype, group
         )[0]
         input_tensors.append(feature_map)
         output_tensors.append(output_tensor)
@@ -208,14 +224,14 @@ def scheduling_1f1b(model, inputs, bs, micro_bs, dtype=torch.float):
             feature_map = send_and_recv(
                 (input_tensor_grad,),
                 (torch.Size([micro_bs] + model.in_size),),
-                myrank-1, dtype
+                myrank-1, dtype, group
             )[0]
             image = inputs[num_warmup_microbatches+i+1][0]
         else:   # last iteration - no more inputs
             feature_map = None
             # send backward grads
             # print('[1f1b] rank {}: step-{}: sending backward...'.format(myrank, i))
-            send((input_tensor_grad,), myrank-1)
+            send((input_tensor_grad,), myrank-1, group)
     
     # cooldown gradient trans back
     for i in range(num_warmup_microbatches):
@@ -223,12 +239,12 @@ def scheduling_1f1b(model, inputs, bs, micro_bs, dtype=torch.float):
         output_tensor = output_tensors.pop(0)
         # recv backward gradients
         output_tensor_grad = recv(
-            (torch.Size([micro_bs] + model.out_size),), myrank+1, dtype
+            (torch.Size([micro_bs] + model.out_size),), myrank+1, dtype, group
         )[0]
         # backward
         input_tensor_grad = backward_step(feature_map, output_tensor, output_tensor_grad)
         # send backward gradients
         # print('[cooldown] rank {}: step-{}: sending backward...'.format(myrank, i))
-        send((input_tensor_grad,), myrank-1)
+        send((input_tensor_grad,), myrank-1, group)
 
 #================= Scheduling ==================#

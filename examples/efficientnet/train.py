@@ -9,9 +9,7 @@ python -m torch.distributed.launch \
     examples/efficientnet/train.py \
         --pp 8 --gbs 8 --mbs 1
 """
-
 import torch
-from torch import nn
 from examples.efficientnet.efficientnet import EfficientNet
 import time
 import argparse
@@ -20,15 +18,14 @@ import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 from cube.profiler.memory import memory_summary
-from cube.runtime.device import DeviceGroup
-from cube.runtime.reducer import Reducer
 from examples.efficientnet.schedule import is_last_stage, scheduling_1f1b
 
 
 def model_partition(model, in_size):
+    resource = cube.runtime.resource.EnvResource()
     # pipeline stage
-    pp_rank = torch.distributed.get_rank()
-    pp_size = torch.distributed.get_world_size()
+    pp_rank = torch.distributed.get_rank(resource.pp_group)
+    pp_size = torch.distributed.get_world_size(resource.pp_group)
 
     layers = model._blocks
 
@@ -128,7 +125,7 @@ def model_partition(model, in_size):
         model.preprocess = False
         model.in_size = layers[0].in_size
 
-    if is_last_stage():
+    if is_last_stage(resource.pp_group):
         model.postprocess = True
         model.out_size = [1,]
     else:
@@ -139,8 +136,7 @@ def model_partition(model, in_size):
 
 
 def train(args):
-
-    N = args.gbs
+    resource = cube.runtime.resource.EnvResource()
 
     # L2 config
     C, H, W = [3, 800, 800]
@@ -159,10 +155,10 @@ def train(args):
     print_each_rank('model has {:.2f} million parameters'.format(nparams_million))
     memory_summary()
 
-    if N % args.gbs != 0:
+    if args.gbs % args.dp != 0:
         raise RuntimeError("global bs is not divisible by DP")
     dataloader = cube.runtime.syndata.SynDataLoader(
-        1280, [0], [N // args.dp, C, H, W])
+        1280, [0], [args.gbs // args.dp, C, H, W])
     
     if args.fp16:
         data_buff = [[e.half() for e in data] for data in dataloader.datas]
@@ -170,16 +166,24 @@ def train(args):
 
     def train_iter(model, dataloader):
         img = next(dataloader)
-        scheduling_1f1b(model, [img], args.gbs, args.mbs, dtype=torch.float)
+        scheduling_1f1b(model, [img], args.gbs // args.dp, args.mbs, torch.float, resource.pp_group)
+        CudaTimer().start('dp_allreduce')
+        resource.reducer.allreduce()
+        CudaTimer().stop('dp_allreduce')
 
     optimizer = torch.optim.RMSprop(model.parameters())
+
+    if args.dp > 1:
+        print_each_rank('adding param for allreduce sync')
+        for param in model.parameters():
+            resource.reducer.add_param(param)
 
     CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
     span = 0
-    iter_num = 40
+    iter_num = 10
     for step in range(iter_num):
-        if step >= 20:
+        if step >= 10:
             torch.cuda.synchronize()
             start = time.time()
             CudaTimer(enable=True).start('e2e')
@@ -189,21 +193,21 @@ def train(args):
         if step == 1:
             print('> passed on 1st iteration')
             memory_summary()
-        if step >= 20:
+        if step >= 10:
             torch.cuda.synchronize()
             stop = time.time()
             span += (stop - start) * 1000
             CudaTimer().stop('e2e')
-        if (step + 1) % 20 == 0:
+        if (step + 1) % 10 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
-    iter_time = CudaTimer().duration(iter_num-20, field_name='e2e')
-    throughput = N / iter_time * 1000
+    iter_time = CudaTimer().duration(iter_num-10, field_name='e2e')
+    throughput = args.gbs / iter_time * 1000
     print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
           iter_time, throughput)
     )
 
-    CudaTimer().print_all(times=iter_num-20)
+    CudaTimer().print_all(times=iter_num-10)
     memory_summary()
 
 
@@ -258,6 +262,7 @@ if __name__ == '__main__':
     print_each_rank(f'initialzed data parallel group: {dp_ranks}', rank_only=myrank)
 
     # initialize pipelne parallel groups
+    resource.pp_group = -1
     for i in range(dp_size):
         ranks = [data_parallel_group_ranks[i]
                  for data_parallel_group_ranks in all_data_parallel_group_ranks]
