@@ -16,6 +16,20 @@ python -m torch.distributed.launch \
         --layer3 8 1 1 \
         --gbs 1 --mbs 1
 
+python -m torch.distributed.launch \
+    --nproc_per_node=8 \
+    --nnodes=2 \
+    --node_rank=$NID \
+    --master_addr=worker-0 \
+    --master_port=8004 \
+    --use_env \
+    examples/swin/swin_hybrid.py \
+        --layer0 2 8 1 \
+        --layer1 2 8 1 \
+        --layer2 2 8 1 \
+        --layer3 2 8 1 \
+        --gbs 8 --mbs 8
+
 # V100-16GB: 8GPU: need checkpoint: 8 micro bs
 """
 # --------------------------------------------------------
@@ -464,6 +478,8 @@ class PatchMerging(ParallelModule):
         """
         x: B, H*W, C
         """
+        assert list(x.shape) == self.in_size
+
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -481,6 +497,7 @@ class PatchMerging(ParallelModule):
         x = self.norm(x)
         x = self.reduction(x)
 
+        assert list(x.shape) == self.out_size
         return x
 
     def extra_repr(self) -> str:
@@ -761,8 +778,8 @@ class SwinTransformer(nn.Module):
             start = pp_rank * chunk
         stop = start + chunk
 
-        self.use_checkpoint = [False] * (stop - start)
-        # self.use_checkpoint = [True] * (stop - start)
+        # self.use_checkpoint = [False] * (stop - start)
+        self.use_checkpoint = [True] * (stop - start)
 
         # 8gpu layer assign
         # layer_split = [5, 5, 4, 3, 3, 3, 3, 5] # original
@@ -776,9 +793,11 @@ class SwinTransformer(nn.Module):
         #         if idx < 1:
         #             self.use_checkpoint[idx] = True
 
-        # 4Ggpu layer assign
+        # 4 stage layer assign
+        # layer_split = [8, 8, 7, 8]  # original
         # layer_split = [6, 7, 7, 7]
-        # assert sum(layer_split) == 27
+        
+        # assert sum(layer_split) == 31
         # start = sum(layer_split[0:pp_rank])
         # stop = sum(layer_split[0:pp_rank+1])
 
@@ -920,14 +939,38 @@ def train(args, pconfigs):
     embed_dim, depths, num_heads = [
         384, [2, 2, 18, 2], [12, 24, 48, 96]
     ]
-    # head dim 32 -> 48
+    # # head dim 32 -> 48
     embed_dim, depths, num_heads = [
         576, [2, 2, 18, 2], [12, 24, 48, 96]
     ]
-    # head dim 32 -> 64
-    # embed_dim, depths, num_heads = [
-    #     768, [2, 2, 18, 2], [12, 24, 48, 96]
-    # ]
+    # # head dim 32 -> 64 -- too much
+    embed_dim, depths, num_heads = [
+        768, [2, 2, 18, 2], [12, 24, 48, 96]
+    ]
+    # # head dim 32 -> 80 
+    embed_dim, depths, num_heads = [
+        960, [2, 2, 18, 2], [12, 24, 48, 96]
+    ]
+    # # head dim 32 -> 96
+    embed_dim, depths, num_heads = [
+        1152, [2, 2, 18, 2], [12, 24, 48, 96]
+    ]
+    # # head dim 32 -> 112
+    embed_dim, depths, num_heads = [
+        1344, [2, 2, 18, 2], [12, 24, 48, 96]
+    ]
+    # head dim 32 -> 128
+    embed_dim, depths, num_heads = [
+        1536, [2, 2, 18, 2], [12, 24, 48, 96]
+    ]
+    # head dim 32 -> 144
+    embed_dim, depths, num_heads = [
+        1728, [2, 2, 18, 2], [12, 24, 48, 96]
+    ]
+    # head dim 32 -> 160
+    embed_dim, depths, num_heads = [
+        1920, [2, 2, 18, 2], [12, 24, 48, 96]
+    ]
 
     # SwinV2-G:  2.5B Model
     # embed_dim, depths, num_heads = [
@@ -944,6 +987,10 @@ def train(args, pconfigs):
     # embed_dim, depths, num_heads = [
     #     576, [2, 2, 22, 2], [12, 24, 48, 96]
     # ]
+
+    print_each_rank(
+        f'config: embed_dim: {embed_dim}, depths: {depths}, num_heads: {num_heads}'
+    )
 
 
     model = SwinTransformer(img_size = H,
@@ -963,6 +1010,7 @@ def train(args, pconfigs):
     def train_iter(model, dataloader):
         img = next(dataloader)
         scheduling_1f1b(model, [img], args.gbs, args.mbs, torch.float, model.pp_group)
+        torch.distributed.barrier()
         CudaTimer().start('dp_allreduce')
         for ranks in _dp_reducer:
             reducer = _dp_reducer[ranks]
@@ -975,15 +1023,17 @@ def train(args, pconfigs):
     nparams_million = sum(p.numel() for p in model.parameters()) / 1000 / 1000
     print_each_rank('model has {:.2f} million parameters'.format(nparams_million))
 
-    CudaTimer().warmup()
+    CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
     iter_num = 20
     for step in range(iter_num):
         if step >= 10:
-            CudaTimer().start('e2e')
+            CudaTimer(enable=True).start('e2e')
+        torch.distributed.barrier()
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
+        torch.distributed.barrier()
         if step == 1:
             print('> passed on 1st iteration')
             memory_summary()
