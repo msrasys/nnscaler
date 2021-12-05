@@ -47,7 +47,7 @@ python -m torch.distributed.launch \
     > ${logfile}/4gpu_tp.txt
 
 python -m torch.distributed.launch \
-    --nproc_per_node=4 \
+    --nproc_per_node=8 \
     --nnodes=1 \
     --node_rank=0 \
     --master_addr=127.0.0.1 \
