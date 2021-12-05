@@ -181,7 +181,7 @@ def train(args):
     CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
     span = 0
-    iter_num = 10
+    iter_num = 20
     for step in range(iter_num):
         if step >= 10:
             torch.cuda.synchronize()
