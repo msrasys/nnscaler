@@ -3,17 +3,17 @@
 # Modified from Swin-Transformer Repo
 """
 python -m torch.distributed.launch \
-    --nproc_per_node=1 \
+    --nproc_per_node=8 \
     --nnodes=1 \
     --node_rank=0 \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    examples/swin/swin_dt.py --bs 16 \
-        --layer0 1 1 \
-        --layer1 1 1 \
-        --layer2 1 1 \
-        --layer3 1 1
+    examples/swin/swin_flexflow.py --bs 8 \
+        --layer0 8 1 \
+        --layer1 8 1 \
+        --layer2 1 8 \
+        --layer3 1 8
 """
 # --------------------------------------------------------
 
@@ -30,7 +30,7 @@ from cube.profiler.memory import memory_summary
 from cube.runtime.device import DeviceGroup
 from cube.runtime.reducer import Reducer
 
-from examples.swin.layers import ColumnParallelLinear, DPtoTP, RowParallelLinear, TPtoDP
+from examples.swin.layers import ColumnParallelLinear, DPtoTP, ValueTPtoEleDP, RowParallelLinear, TPtoDP
 
 _dp_reducer: Dict[Tuple[int], Reducer] = dict()
 
@@ -92,7 +92,7 @@ class MegatronMlp(nn.Module):
         self.fc1 = ColumnParallelLinear(in_features, hidden_features, in_adapter=True, out_adapter=False, tp_group=tp_group)
         self.act = act_layer()
         # self.fc2 = nn.Linear(hidden_features, out_features)
-        self.fc2 = RowParallelLinear(hidden_features, out_features, in_adapter=False, out_adapter=True, tp_group=tp_group)
+        self.fc2 = RowParallelLinear(hidden_features, out_features, in_adapter=False, out_adapter=False, tp_group=tp_group)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
@@ -192,7 +192,7 @@ class MegatronWindowAttention(nn.Module):
         self.qkv = ColumnParallelLinear(dim, dim * 3, bias=qkv_bias, in_adapter=True, out_adapter=False, tp_group=tp_group)
         self.attn_drop = nn.Dropout(attn_drop)
         # self.proj = nn.Linear(dim, dim)
-        self.proj = RowParallelLinear(dim, dim, in_adapter=False, out_adapter=True, tp_group=tp_group)
+        self.proj = RowParallelLinear(dim, dim, in_adapter=False, out_adapter=False, tp_group=tp_group)
         self.proj_drop = nn.Dropout(proj_drop)
 
         # trunc_normal_(self.relative_position_bias_table, std=.02)
@@ -287,6 +287,16 @@ class SwinTransformerBlock(nn.Module):
             tp_group=tp_group
         )
 
+        self.partition_all_op = True
+        if self.partition_all_op and torch.distributed.get_world_size(tp_group) > 1:
+            print('> enabled all-op partitioning...')
+            self.val_tp_to_dp = ValueTPtoEleDP(tp_group)
+            self.tp_to_dp = TPtoDP(tp_group)
+            self.dp_to_tp = DPtoTP(tp_group)
+        else:
+            self.tp_to_dp = None
+            self.dp_to_tp = None
+
         if self.shift_size > 0:
             # calculate attention mask for SW-MSA
             H, W = self.input_resolution
@@ -350,15 +360,32 @@ class SwinTransformerBlock(nn.Module):
             x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         # [B, H, W, C] -> [B, H * W, C]
         x = x.view(B, H * W, C)
+
+        if self.partition_all_op and self.tp_to_dp is not None:
+            x = self.val_tp_to_dp(x)
+            shortcut = self.tp_to_dp(shortcut)
+    
         # [B, H * W, C] -> [B, H * W, C]
         x = shortcut + drop_path(x, self.drop_path_p)
+
+        if self.partition_all_op and self.dp_to_tp is not None:
+            x = self.dp_to_tp(x)
+    
         # FFN
         # [B, H * W, C] -> [B, H * W, C]
         ffn = self.norm2(x)
         # [B, H * W, C] -> [B, H * W, C]
         ffn = self.mlp(ffn)
         # [B, H * W, C] + [B, H * W, C] -> [B, H * W, C]
+
+        if self.partition_all_op and self.tp_to_dp is not None:
+            x = self.val_tp_to_dp(x)
+            ffn = self.tp_to_dp(ffn)
+
         x = x + drop_path(ffn, self.drop_path_p)
+
+        if self.partition_all_op and self.dp_to_tp is not None:
+            x = self.dp_to_tp(x)
 
         return x
 

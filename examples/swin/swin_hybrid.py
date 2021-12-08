@@ -968,9 +968,9 @@ def train(args, pconfigs):
         1728, [2, 2, 18, 2], [12, 24, 48, 96]
     ]
     # head dim 32 -> 160
-    embed_dim, depths, num_heads = [
-        1920, [2, 2, 18, 2], [12, 24, 48, 96]
-    ]
+    # embed_dim, depths, num_heads = [
+    #     1920, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
 
     # SwinV2-G:  2.5B Model
     # embed_dim, depths, num_heads = [

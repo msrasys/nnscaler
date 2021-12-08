@@ -134,6 +134,23 @@ class DPtoTPAdapter(torch.autograd.Function):
         group = ctx.group
         return _split(grad_output, group, dim=0), None
 
+class ValueTPtoEleDPAdapter(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_, group):
+        """
+        Reduce Scatter
+        """
+        ctx.group = group
+        return _scatter(input_, group, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Allgather
+        """
+        group = ctx.group
+        return _gather(grad_output, group, dim=0), None
+
 
 class TPtoDPAdapter(torch.autograd.Function):
     @staticmethod
@@ -298,3 +315,12 @@ class TPtoDP(torch.nn.Module):
     def forward(self, input_):
         return TPtoDPAdapter.apply(input_, self.group)
 
+
+class ValueTPtoEleDP(torch.nn.Module):
+
+    def __init__(self, tp_group):
+        super().__init__()
+        self.group = tp_group
+
+    def forward(self, input_):
+        return ValueTPtoEleDPAdapter.apply(input_, self.group)
