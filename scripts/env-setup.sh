@@ -13,6 +13,7 @@ sudo chmod -R a+w /opt/conda
 sudo apt-get install tmux -y
 sudo apt-get install psmisc -y
 sudo apt-get install lsof -y
+sudo apt-get install infiniband-diags -y
 
 # install blob
 # sudo apt-get install lsb-release -y
