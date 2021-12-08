@@ -29,27 +29,27 @@ class MLP(nn.Module):
         self.linear2 = nn.Linear(dim * mult, dim)
         self.linear3 = nn.Linear(dim, dim * mult)
         self.linear4 = nn.Linear(dim * mult, dim)
-        # self.linear5 = nn.Linear(dim, dim * mult)
-        # self.linear6 = nn.Linear(dim * mult, dim)
-        # self.linear7 = nn.Linear(dim, dim * mult)
-        # self.linear8 = nn.Linear(dim * mult, dim)
+        self.linear5 = nn.Linear(dim, dim * mult)
+        self.linear6 = nn.Linear(dim * mult, dim)
+        self.linear7 = nn.Linear(dim, dim * mult)
+        self.linear8 = nn.Linear(dim * mult, dim)
 
     def forward(self, data):
         output = self.linear1(data)
         output = self.linear2(output)
         output = self.linear3(output)
         output = self.linear4(output)
-        # output = self.linear5(output)
-        # output = self.linear6(output)
-        # output = self.linear7(output)
-        # output = self.linear8(output)
+        output = self.linear5(output)
+        output = self.linear6(output)
+        output = self.linear7(output)
+        output = self.linear8(output)
         loss = torch.sum(output)
         return loss
 
 
 def train():
-    batch_size = 8192
-    dim = 8192
+    batch_size = 4096
+    dim = 4096
 
     model = MLP(dim=dim)
     model = cube.SemanticModel(
