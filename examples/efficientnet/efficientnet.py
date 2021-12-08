@@ -102,7 +102,7 @@ class MBConvBlock(nn.Module):
         Returns:
             Output of this block after processing.
         """
-
+        # before_allocated = torch.cuda.max_memory_allocated()
         # Expansion and Depthwise Convolution
         x = inputs
         assert list(x.shape)[1:] == self.in_size 
@@ -136,6 +136,9 @@ class MBConvBlock(nn.Module):
             x = x + inputs  # skip connection
 
         assert list(x.shape)[1:] == self.out_size 
+        # after_allocated = torch.cuda.max_memory_allocated()
+        # consumption = (after_allocated - before_allocated) / 1024 / 1024
+        # print('{} {}'.format(self.layer_id, consumption))
         return x
 
     def set_swish(self, memory_efficient=True):

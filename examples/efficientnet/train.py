@@ -7,7 +7,7 @@ python -m torch.distributed.launch \
     --master_port=8004 \
     --use_env \
     examples/efficientnet/train.py \
-        --pp 8 --gbs 8 --mbs 1
+        --pp 8 --gbs 32 --mbs 1
 """
 import torch
 from examples.efficientnet.efficientnet import EfficientNet
@@ -28,6 +28,8 @@ def model_partition(model, in_size):
     pp_size = torch.distributed.get_world_size(resource.pp_group)
 
     layers = model._blocks
+    # for lid, layer in enumerate(layers):
+    #     layer.layer_id = lid
 
     chunk = len(layers) // pp_size
     if len(layers) % pp_size != 0:
@@ -41,10 +43,25 @@ def model_partition(model, in_size):
         start = pp_rank * chunk
     stop = start + chunk
 
-    # use_checkpoint = [False] * (stop - start)
-    use_checkpoint = [True] * (stop - start)
+    use_checkpoint = [False] * (stop - start)
+    # use_checkpoint = [True] * (stop - start)
 
-    # layer_split = [8, 5, 7, 14, 15, 13, 15, 11]
+    # 2 stage
+    # layer_split = [30, 58]
+    # assert sum(layer_split) == 88, f"split {sum(layer_split)} != 88"
+    # start = sum(layer_split[0:pp_rank])
+    # stop = sum(layer_split[0:pp_rank+1])  
+    # use_checkpoint = [False] * (stop - start)
+    # if pp_rank == 0:
+    #     for idx in range(stop - start):
+    #         if idx < 23:
+    #             use_checkpoint[idx] = True
+    # if pp_rank == 1:
+    #     for idx in range(stop - start):
+    #         if idx < 20:
+    #             use_checkpoint[idx] = True
+
+    # layer_split = [8, 5, 8, 13, 16, 12, 16, 10]
     # assert sum(layer_split) == 88, f"split {sum(layer_split)} != 88"
     # start = sum(layer_split[0:pp_rank])
     # stop = sum(layer_split[0:pp_rank+1])
@@ -52,12 +69,13 @@ def model_partition(model, in_size):
     # use_checkpoint = [False] * (stop - start)
     # if pp_rank == 0:
     #     for idx in range(stop - start):
-    #         if idx < 7:
+    #         if idx < 3:
     #             use_checkpoint[idx] = True
     # if pp_rank == 1:
     #     for idx in range(stop - start):
     #         if idx < 4:
     #             use_checkpoint[idx] = True
+
     # if pp_rank == 2:
     #     for idx in range(stop - start):
     #         if idx < 4:
