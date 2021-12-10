@@ -44,7 +44,7 @@ def model_partition(model, in_size):
     stop = start + chunk
 
     use_checkpoint = [False] * (stop - start)
-    # use_checkpoint = [True] * (stop - start)
+    use_checkpoint = [True] * (stop - start)
 
     # 2 stage
     # layer_split = [30, 58]
@@ -98,6 +98,34 @@ def model_partition(model, in_size):
     #     for idx in range(stop - start):
     #         if idx < 2:
     #             use_checkpoint[idx] = True
+
+    # 16GPU
+    # layer_split = [4, 3, 3, 3, 3, 5, 6, 7, 8, 8, 6, 6, 8, 8, 6, 4]
+    # assert sum(layer_split) == 88, f"split {sum(layer_split)} != 88"
+    # start = sum(layer_split[0:pp_rank])
+    # stop = sum(layer_split[0:pp_rank+1])
+    # use_checkpoint = [False] * (stop - start)
+    # if pp_rank == 1:
+    #     for idx in range(stop - start):
+    #         if idx < 2:
+    #             use_checkpoint[idx] = True
+    # if pp_rank == 2:
+    #     for idx in range(stop - start):
+    #         if idx < 1:
+    #             use_checkpoint[idx] = True
+    use_checkpoint = [False] * (stop - start)
+    if pp_rank == 0:
+        for idx in range(stop - start):
+            if idx < 2:
+                use_checkpoint[idx] = True
+    if pp_rank == 1:
+        for idx in range(stop - start):
+            if idx < 4:
+                use_checkpoint[idx] = True
+    if pp_rank == 2:
+        for idx in range(stop - start):
+            if idx < 3:
+                use_checkpoint[idx] = True
 
     # 8GB memory experiments
     # layer_split = [8, 5, 7, 14, 14, 13, 16, 11]
@@ -224,6 +252,9 @@ def train(args):
     print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
           iter_time, throughput)
     )
+    compute_time = CudaTimer().duration(iter_num-10, field_name='forward') + \
+                   CudaTimer().duration(iter_num-10, field_name='backward')
+    print_each_rank(f'compute time: {compute_time} ms')
 
     CudaTimer().print_all(times=iter_num-10)
     memory_summary()
