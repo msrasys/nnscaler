@@ -281,7 +281,7 @@ class SwinTransformerBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 tp_group=-1, wp_plans=-1):
+                 tp_group=-1, wp_plans=-1, layer_id=-1):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -289,8 +289,13 @@ class SwinTransformerBlock(nn.Module):
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
-        if min(self.input_resolution) <= self.window_size:
-            # if window size is larger than input resolution, we don't partition windows
+        self.wp_group, self.wp_nH_ranks, self.wp_nW_ranks = wp_plans
+        # if min(self.input_resolution) <= self.window_size:
+        #     # if window size is larger than input resolution, we don't partition windows
+        #     self.shift_size = 0
+        #     self.window_size = min(self.input_resolution)
+        if layer_id == 3:
+            print('set shift size to 0')
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
@@ -311,7 +316,6 @@ class SwinTransformerBlock(nn.Module):
             tp_group=tp_group
         )
 
-        self.wp_group, self.wp_nH_ranks, self.wp_nW_ranks = wp_plans
         self.use_wp = torch.distributed.get_world_size(self.wp_group) != 1
 
         if self.shift_size > 0:
@@ -329,7 +333,6 @@ class SwinTransformerBlock(nn.Module):
                 for w in w_slices:
                     img_mask[:, h, w, :] = cnt
                     cnt += 1
-
             mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
             mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
             attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
@@ -521,7 +524,8 @@ class BasicLayer(nn.Module):
                 drop=drop, attn_drop=attn_drop,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_layer=norm_layer,
-                tp_group=tp_group, wp_plans=(wp_group, wp_nH_ranks, wp_nW_ranks)
+                tp_group=tp_group, wp_plans=(wp_group, wp_nH_ranks, wp_nW_ranks),
+                layer_id = layer_id
             )
             self.blocks.append(block)
 

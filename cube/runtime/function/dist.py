@@ -26,7 +26,6 @@ def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, dim_ranks, gro
     world_size = len(dim_ranks)
     if world_size == 1:
         return torch.roll(input, (shift), (dim,))
-    global_rank = torch.distributed.get_rank()
     dim_rank = dim_ranks.index(torch.distributed.get_rank(group))
     # halo exchange at H dimension
     if shift < 0:
@@ -50,11 +49,11 @@ def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, dim_ranks, gro
 
         send_op = torch.distributed.P2POp(
             torch.distributed.isend, remote,
-            send_global_rank, group=group, tag=global_rank
+            send_global_rank
         )
         recv_op = torch.distributed.P2POp(
             torch.distributed.irecv, recv_tensor,
-            recv_global_rank, group=group, tag=recv_global_rank
+            recv_global_rank
         )
         ops = [send_op, recv_op] if dim_rank % 2 == 0 else [recv_op, send_op]
         reqs = torch.distributed.batch_isend_irecv(ops)
@@ -84,11 +83,11 @@ def _roll_dim_parallel(input: torch.Tensor, shift: int, dim: int, dim_ranks, gro
 
         send_op = torch.distributed.P2POp(
             torch.distributed.isend, remote,
-            send_global_rank, group=group, tag=global_rank
+            send_global_rank
         )
         recv_op = torch.distributed.P2POp(
             torch.distributed.irecv, recv_tensor,
-            recv_global_rank, group=group, tag=recv_global_rank
+            recv_global_rank
         )
         ops = [send_op, recv_op] if dim_rank % 2 == 0 else [recv_op, send_op]
         reqs = torch.distributed.batch_isend_irecv(ops)
