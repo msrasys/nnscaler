@@ -7,12 +7,12 @@ import torch
 
 
 def select(tensor: torch.Tensor,
-           indices: Tuple[slice], val_map: Tuple[int, int]) -> torch.Tensor:
+           indmap: Tuple[slice], valmap: Tuple[int, int]) -> torch.Tensor:
 
     with torch.no_grad():
-        sub_tensor = tensor[indices]
-        if val_map != (0, 1):
-            sub_tensor = sub_tensor / val_map[1]
+        sub_tensor = tensor[indmap]
+        if valmap != (0, 1):
+            sub_tensor = sub_tensor / valmap[1]
         sub_tensor = sub_tensor.contiguous()
     return sub_tensor
 

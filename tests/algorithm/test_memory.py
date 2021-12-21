@@ -43,4 +43,4 @@ def test_transpose_dim_parallel():
         for output in node.outputs():
             print(output)
             assert output.shape == [N, M // 4]
-            assert output.val_map == ValueMap(0, 1)
+            assert output.valmap == ValueMap(0, 1)

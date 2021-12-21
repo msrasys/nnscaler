@@ -2,19 +2,19 @@ r"""
 SubTensor Gradient rule:
 
 SubTensor's logical grad = SubTensor.parent.grad.select(
-    indices = SubTensor.indices, 
-    val_map = SubTensor.val_map,
+    indmap = SubTensor.indmap, 
+    valmap = SubTensor.valmap,
     shape   = SubTensor.shape
 )
 
 FwOperation -> BpOperation rule:
 
 1). for (FwOp) input tensors, gradient SubTensor is:
-    indices = input.indices;
-    val is splitted by referencing times on the indices
+    indmap = input.indmap;
+    val is splitted by referencing times on the indmap
 
 2). for (FwOp) output tensors, gradient SubTensor is:
-    indices = output.indices;
+    indmap = output.indmap;
     val is always (0/1)
 """
 
@@ -31,16 +31,16 @@ __all__ = ['IndexMap', 'ValueMap', 'IRFullTensor', 'IRSubTensor']
 
 class IndexMap:
 
-    def __init__(self, indices):
+    def __init__(self, indmap):
 
-        if not isinstance(indices, tuple):
-            raise TypeError("Expected indices to be a tuple")
+        if not isinstance(indmap, tuple):
+            raise TypeError("Expected indmap to be a tuple")
 
-        if not all([isinstance(s, slice) for s in indices]):
+        if not all([isinstance(s, slice) for s in indmap]):
             raise NotImplementedError(
                 "Only support for sliced index mapping"
             )
-        self._indices = indices
+        self._indices = indmap
 
     def __eq__(self, other):
         if isinstance(other, IndexMap):
@@ -58,7 +58,7 @@ class IndexMap:
 
     def get(self):
         """
-        Get indices
+        Get indmap
         """
         return self._indices
 
@@ -97,7 +97,7 @@ class IndexMap:
 
     def map(self, submap):
         """
-        Map from the current indices by sub_indices.
+        Map from the current indmap by sub_indices.
 
         Args:
             sub_indices: IndexMap
@@ -130,7 +130,7 @@ class IndexMap:
 
     def overlap(self, other):
         """
-        Check if this indices overlapped with the other
+        Check if this indmap overlapped with the other
 
         Args:
             other: IndexMap
@@ -277,26 +277,26 @@ class ValueMap:
         return f'({self.idx}/{self.chunk_num})'
 
 
-def _to_index_map(indices: Union[Tuple, IndexMap]):
-    if not isinstance(indices, tuple) and not isinstance(indices, IndexMap):
-        raise TypeError("Expected indices to be tuple or IndexMap")
-    if isinstance(indices, tuple):
-        indices = IndexMap(indices)
-    return indices
+def _to_indmap(indmap: Union[Tuple, IndexMap]):
+    if not isinstance(indmap, tuple) and not isinstance(indmap, IndexMap):
+        raise TypeError("Expected indmap to be tuple or IndexMap")
+    if isinstance(indmap, tuple):
+        indmap = IndexMap(indmap)
+    return indmap
 
 
-def _to_value_map(val_map: Union[Tuple, ValueMap, None]):
-    if not isinstance(val_map, tuple) and \
-       not isinstance(val_map, ValueMap) and \
-       not val_map is None:
-        raise TypeError("Expected val_map to be tuple, IndexMap or None")
-    if val_map is None:
-        val_map = ValueMap(0, 1)
-    elif isinstance(val_map, tuple):
-        if len(val_map) != 2:
+def _to_value_map(valmap: Union[Tuple, ValueMap, None]):
+    if not isinstance(valmap, tuple) and \
+       not isinstance(valmap, ValueMap) and \
+       not valmap is None:
+        raise TypeError("Expected valmap to be tuple, IndexMap or None")
+    if valmap is None:
+        valmap = ValueMap(0, 1)
+    elif isinstance(valmap, tuple):
+        if len(valmap) != 2:
             raise ValueError("Expected tuple to be (idx, chunk_num)")
-        val_map = ValueMap(*val_map)
-    return val_map
+        valmap = ValueMap(*valmap)
+    return valmap
 
 
 class IRFullTensor(IRTensor):
@@ -422,32 +422,32 @@ class IRFullTensor(IRTensor):
             setattr(tensor, attr, getattr(self, attr))
         return tensor
 
-    def select(self, indices: Union[Tuple, IndexMap], val_map: Union[Tuple, ValueMap, None], shape: List[int]):
+    def select(self, indmap: Union[Tuple, IndexMap], valmap: Union[Tuple, ValueMap, None], shape: List[int]):
         """
         Select a SubTensor from FullTensor.
 
         Note due to implementation issue, one value in the full tensor
-        cannot be splitted by different val_map
+        cannot be splitted by different valmap
 
         Args:
-            indices: the index of this tensor's index
+            indmap: the index of this tensor's index
 
-            val_map: how the tensor mapped from original value
+            valmap: how the tensor mapped from original value
 
             shape: the sub_tensor shape.
 
         Returns:
             IRSubTensor
         """
-        indices = _to_index_map(indices)
-        val_map = _to_value_map(val_map)
+        indmap = _to_indmap(indmap)
+        valmap = _to_value_map(valmap)
 
         # return tensor to keep id same for same sub tensor
         for sub_tensor in self.subtensors():
-            if sub_tensor.indices == indices and sub_tensor.val_map == val_map:
+            if sub_tensor.indmap == indmap and sub_tensor.valmap == valmap:
                 return sub_tensor
 
-        sub_tensor = IRSubTensor(self, indices, val_map, shape)
+        sub_tensor = IRSubTensor(self, indmap, valmap, shape)
         for attr in IRFullTensor._attr:
             setattr(sub_tensor, attr, getattr(self, attr))
         sub_tensor.grad = None
@@ -486,7 +486,7 @@ class IRFullTensor(IRTensor):
 
     def tosub(self):
         """
-        Convert to SubTensor by selecting all indices and full value
+        Convert to SubTensor by selecting all indmap and full value
         """
         if self.shape is None:
             raise RuntimeError("Expected know shape")
@@ -494,8 +494,8 @@ class IRFullTensor(IRTensor):
         for dim_len in self.shape:
             slicers.append(slice(0, dim_len, 1))
         sub_tensor = self.select(
-            indices=tuple(slicers),
-            val_map=None,
+            indmap=tuple(slicers),
+            valmap=None,
             shape=self.shape
         )
         return sub_tensor
@@ -507,14 +507,14 @@ class IRFullTensor(IRTensor):
 
 class IRSubTensor(IRTensor):
 
-    def __init__(self, full_tensor: IRTensor, indices, val_map: Optional[ValueMap] =None, shape=None):
+    def __init__(self, full_tensor: IRTensor, indmap, valmap: Optional[ValueMap] =None, shape=None):
         """
         Create an IRSubTensor.
 
         Args:
             full_tensor: the full tensor
-            indices: index list
-            val_map: the value operation to merge SubTensors into one
+            indmap: index list
+            valmap: the value operation to merge SubTensors into one
         """
         if not isinstance(full_tensor, IRFullTensor):
             raise TypeError(f"Expected IRFullTensor but got {full_tensor}")
@@ -524,21 +524,21 @@ class IRSubTensor(IRTensor):
         self._full_tensor = full_tensor
 
         # the index from full_tensor
-        self._index_map = _to_index_map(indices)
+        self._indmap = _to_indmap(indmap)
 
         # val map
-        self._val_map = _to_value_map(val_map)
+        self._valmap = _to_value_map(valmap)
 
     def __eq__(self, other):
 
         if isinstance(other, IRFullTensor):
             return self.parent == other and \
                    self.shape == other.shape and \
-                   self.val_map == ValueMap(0, 1)
+                   self.valmap == ValueMap(0, 1)
         if isinstance(other, IRSubTensor):
             return self.parent == other.parent and \
-                   self.indices == other.indices and \
-                   self.val_map == other.val_map and \
+                   self.indmap == other.indmap and \
+                   self.valmap == other.valmap and \
                    self.shape == other.shape
         return False
 
@@ -550,15 +550,15 @@ class IRSubTensor(IRTensor):
         return self._full_tensor
 
     @property
-    def indices(self) -> IndexMap:
+    def indmap(self) -> IndexMap:
         """
-        Return indices list mapped to the full tensor
+        Return indmap list mapped to the full tensor
         """
-        return copy.copy(self._index_map)
+        return copy.copy(self._indmap)
 
     @property
-    def val_map(self):
-        return copy.copy(self._val_map)
+    def valmap(self):
+        return copy.copy(self._valmap)
 
     def __copy__(self):
         """
@@ -568,7 +568,7 @@ class IRSubTensor(IRTensor):
         Returns:
             tensor
         """
-        tensor = IRSubTensor(self.parent, self.indices, self.val_map, self._shape)
+        tensor = IRSubTensor(self.parent, self.indmap, self.valmap, self._shape)
         for key in self.__dict__:
             setattr(tensor, key, getattr(self, key))
         # clear attached cells
@@ -615,45 +615,45 @@ class IRSubTensor(IRTensor):
                 raise RuntimeError("Internal Error: ref time is 0")
             idx = ref_cells.index(fcell)
             grad = full_grad.select(
-                indices = self.indices,
-                val_map = (idx, ref_times),
+                indmap = self.indmap,
+                valmap = (idx, ref_times),
                 shape = self.shape
             )
             return grad.as_grad()
         elif self in fcell.outputs():
             grad = full_grad.select(
-                indices = self.indices,
-                val_map = (0, 1),
+                indmap = self.indmap,
+                valmap = (0, 1),
                 shape = self.shape
             )
             return grad.as_grad()
         else:
             raise RuntimeError(f"{self} not found in cell {fcell}")
 
-    def select(self, indices: Union[Tuple, IndexMap], val_map: Union[Tuple, ValueMap, None], shape=None):
+    def select(self, indmap: Union[Tuple, IndexMap], valmap: Union[Tuple, ValueMap, None], shape=None):
         """
         Select an IRSubTensor
 
         Args:
-            indices: the index of this tensor's index
+            indmap: the index of this tensor's index
 
-            val_map: the value operation to merge 
-                    co-located indices of SubTensors into one
+            valmap: the value operation to merge 
+                    co-located indmap of SubTensors into one
 
             shape: the sub_tensor shape
 
         Returns:
             IRSubTensor
         """
-        sub_ind_map = _to_index_map(indices)
-        sub_val_map = _to_value_map(val_map)
+        sub_ind_map = _to_indmap(indmap)
+        sub_valmap = _to_value_map(valmap)
 
         # index mapping
-        index_map = self.indices.map(sub_ind_map)
+        index_map = self.indmap.map(sub_ind_map)
         # value mapping
-        val_map = self.val_map.map(sub_val_map)
+        valmap = self.valmap.map(sub_valmap)
 
-        sub_tensor = self.parent.select(index_map, val_map, shape)
+        sub_tensor = self.parent.select(index_map, valmap, shape)
         return sub_tensor
 
     def overlap(self, other):
@@ -671,8 +671,8 @@ class IRSubTensor(IRTensor):
         elif isinstance(other, IRSubTensor):
             if self.parent != other.parent:
                 return False
-            return self.indices.overlap(other.indices) and \
-                   self.val_map.overlap(other.val_map)
+            return self.indmap.overlap(other.indmap) and \
+                   self.valmap.overlap(other.valmap)
         else:
             raise TypeError("Customized IRTensor not support")
 
@@ -691,12 +691,12 @@ class IRSubTensor(IRTensor):
             if isinstance(other, IRFullTensor):
                 return self
             elif isinstance(other, IRSubTensor):
-                indices = self.indices & other.indices
-                val_map = self.val_map & other.val_map
+                indmap = self.indmap & other.indmap
+                valmap = self.valmap & other.valmap
                 sub_tensor = self.parent.select(
-                    indices = indices,
-                    val_map = val_map,
-                    shape = indices.shape
+                    indmap = indmap,
+                    valmap = valmap,
+                    shape = indmap.shape
                 )
                 return sub_tensor
             else:
@@ -704,5 +704,5 @@ class IRSubTensor(IRTensor):
         return None
 
     def __repr__(self):
-        dscp = f'SubTensor(id={self._id}, shape={self.shape}, device={self.device}, ind={self.indices}, val={self.val_map})'
+        dscp = f'SubTensor(id={self._id}, shape={self.shape}, device={self.device}, ind={self.indmap}, val={self.valmap})'
         return dscp

@@ -106,7 +106,7 @@ class IRFwOperation(IRCell):
                     valmap = (0,1)
                 else:
                     pid = tensor.parent._id
-                    valmap = tensor.val_map
+                    valmap = tensor.valmap
                 inputs.append(f'{anno}{tensor._id}(p{pid},{tensor.shape},{valmap})')
             else:
                 inputs.append(tensor)
@@ -124,7 +124,7 @@ class IRFwOperation(IRCell):
                     valmap = (0,1)
                 else:
                     pid = tensor.parent._id
-                    valmap = tensor.val_map
+                    valmap = tensor.valmap
                 pid = tensor.parent._id if hasattr(tensor, 'parent') else tensor._id
                 outputs.append(f'{anno}{tensor._id}(p{pid},{tensor.shape},{valmap})')
             else:
@@ -222,7 +222,7 @@ class IRBpOperation(IRCell):
                 if tensor.is_grad():
                     anno = 'g'
                 # datas.append(f'{anno}{tensor._id}')
-                datas.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.val_map})')
+                datas.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.valmap})')
             else:
                 datas.append(tensor)
 
@@ -235,7 +235,7 @@ class IRBpOperation(IRCell):
                 if tensor.is_grad():
                     anno = 'g'
                 # grads.append(f'{anno}{tensor._id}')
-                grads.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.val_map})')
+                grads.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.valmap})')
             else:
                 grads.append(tensor)
         
@@ -248,7 +248,7 @@ class IRBpOperation(IRCell):
                 if tensor.is_grad():
                     anno = 'g'
                 # outputs.append(f'{anno}{tensor._id}')
-                outputs.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.val_map})')
+                outputs.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.valmap})')
             else:
                 outputs.append(tensor)
 
@@ -316,7 +316,7 @@ class IRDataOperation(IRCell):
     def __repr__(self):
         outputs = list()
         for t in self.outputs():
-            name = f't{t._id}(p{t.parent._id},{t.shape},{t.val_map})'
+            name = f't{t._id}(p{t.parent._id},{t.shape},{t.valmap})'
             outputs.append(name)
         dscp = f'DataLoader-{self._id}(outputs={outputs})'
         return dscp

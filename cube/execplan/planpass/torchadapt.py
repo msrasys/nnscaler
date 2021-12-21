@@ -78,8 +78,8 @@ class TorchRefAdapter(PlanPass):
                 if ftensor is None:
                     raise RuntimeError("Internal Error: fsu not found input tensor")
                 grad = ftensor.parent.grad.select(
-                    indices = ftensor.indices,
-                    val_map = ValueMap(grad_idx, grad_num),
+                    indmap = ftensor.indmap,
+                    valmap = ValueMap(grad_idx, grad_num),
                     shape = ftensor.shape
                 )
                 rm_grad = TorchRefAdapter.set_grad(fsu, ftensor, grad)

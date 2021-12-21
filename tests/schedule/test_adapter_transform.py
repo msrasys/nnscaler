@@ -9,26 +9,26 @@ def test_tensor_transform_select():
     tensor1 = IRFullTensor(shape=[1024,1024], name='test1').tosub()
     
     tensor2 = tensor1.select(
-        indices = (slice(0, 512), slice(0, 1024)),
-        val_map  = (0, 1),
+        indmap = (slice(0, 512), slice(0, 1024)),
+        valmap  = (0, 1),
         shape = [512, 1024]
     )
 
     tensor3 = tensor1.select(
-        indices = (slice(512, 1024), slice(0, 1024)),
-        val_map  = (0, 2),
+        indmap = (slice(512, 1024), slice(0, 1024)),
+        valmap  = (0, 2),
         shape = [512, 1024]
     )
 
     tensor4 = tensor3.select(
-        indices = (slice(0, 256), slice(0, 512)),
-        val_map = (0, 1),
+        indmap = (slice(0, 256), slice(0, 512)),
+        valmap = (0, 1),
         shape = [256, 512]
     )
 
     tensor5 = tensor3.select(
-        indices = (slice(256, 512), slice(0, 512)),
-        val_map = (0, 1),
+        indmap = (slice(256, 512), slice(0, 512)),
+        valmap = (0, 1),
         shape = [256, 512]
     )
 
@@ -58,32 +58,32 @@ def test_tensor_transform_merge():
     tensor0 = IRFullTensor(shape=[1024,1024], name='test1').tosub()
     
     tensor1 = tensor0.select(
-        indices = (slice(0, 512), slice(0, 512)),
-        val_map  = None,
+        indmap = (slice(0, 512), slice(0, 512)),
+        valmap  = None,
         shape = [256, 1024]
     )
 
     tensor2 = tensor0.select(
-        indices = (slice(0, 512), slice(512, 1024)),
-        val_map  = None,
+        indmap = (slice(0, 512), slice(512, 1024)),
+        valmap  = None,
         shape = [256, 1024]
     )
 
     tensor3 = tensor0.select(
-        indices = (slice(512, 1024), slice(0, 512)),
-        val_map = None,
+        indmap = (slice(512, 1024), slice(0, 512)),
+        valmap = None,
         shape = [256, 512]
     )
 
     tensor4 = tensor0.select(
-        indices = (slice(512, 1024), slice(512, 1024)),
-        val_map = None,
+        indmap = (slice(512, 1024), slice(512, 1024)),
+        valmap = None,
         shape = [256, 512]
     )
 
     tensor5 = tensor0.select(
-        indices = (slice(512, 1024), slice(0, 1024)),
-        val_map = None,
+        indmap = (slice(512, 1024), slice(0, 1024)),
+        valmap = None,
         shape = [256, 512]
     )
 
@@ -113,29 +113,29 @@ def test_tensor_transform_merge():
     # assert False
 
     tensor6 = tensor0.select(
-        indices = (slice(0, 256), slice(0, 1024)),
-        val_map = (0, 4),
+        indmap = (slice(0, 256), slice(0, 1024)),
+        valmap = (0, 4),
         shape = [256, 1024]
     )
     tensor7 = tensor0.select(
-        indices = (slice(0, 256), slice(0, 1024)),
-        val_map = (1, 4),
+        indmap = (slice(0, 256), slice(0, 1024)),
+        valmap = (1, 4),
         shape = [256, 1024]
     )
     tensor8 = tensor0.select(
-        indices = (slice(0, 256), slice(0, 1024)),
-        val_map = (2, 4),
+        indmap = (slice(0, 256), slice(0, 1024)),
+        valmap = (2, 4),
         shape = [256, 1024]
     )
     tensor9 = tensor0.select(
-        indices = (slice(0, 256), slice(0, 1024)),
-        val_map = (3, 4),
+        indmap = (slice(0, 256), slice(0, 1024)),
+        valmap = (3, 4),
         shape = [256, 1024]
     )
 
     tensor10 = tensor0.select(
-        indices = (slice(0, 256), slice(0, 1024)),
-        val_map = (0, 1)
+        indmap = (slice(0, 256), slice(0, 1024)),
+        valmap = (0, 1)
     )
 
     merge3 = IRTensorTransform(
@@ -154,26 +154,26 @@ def test_transform_identity():
     tensor1 = IRFullTensor(shape=[1024,1024], name='test1').tosub()
     
     tensor2 = tensor1.select(
-        indices = (slice(512, 1024), slice(0, 1024)),
-        val_map  = None,
+        indmap = (slice(512, 1024), slice(0, 1024)),
+        valmap  = None,
         shape = [512, 1024]
     )
 
     tensor3 = tensor2.select(
-        indices = (slice(0, 256), slice(0, 1024)),
-        val_map  = None,
+        indmap = (slice(0, 256), slice(0, 1024)),
+        valmap  = None,
         shape = [256, 1024]
     )
 
     tensor4 = tensor1.select(
-        indices = (slice(512, 768), slice(0, 1024)),
-        val_map = None,
+        indmap = (slice(512, 768), slice(0, 1024)),
+        valmap = None,
         shape = [256, 1024]
     )
 
     tensor5 = tensor1.select(
-        indices = (slice(512, 768), slice(0, 1024)),
-        val_map = None,
+        indmap = (slice(512, 768), slice(0, 1024)),
+        valmap = None,
         shape = [256, 1024]
     )
 

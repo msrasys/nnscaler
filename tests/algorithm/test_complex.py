@@ -330,7 +330,7 @@ def test_complex_self_attention_head_parallel():
     
     for idx, node in enumerate(nodes):
         assert node.outputs(0).shape == [L, N, E]
-        assert node.outputs(0).val_map == ValueMap(idx, 4)
+        assert node.outputs(0).valmap == ValueMap(idx, 4)
         assert node.kwargs['num_head'] == num_head // 4
         assert node.inputs(0).shape == [L, N, E]
         assert node.inputs(1).shape == [3 * E // 4, E]
@@ -369,7 +369,7 @@ def test_complex_self_attention_data_parallel():
     
     for idx, node in enumerate(nodes):
         assert node.outputs(0).shape == [L, N // 4, E]
-        assert node.outputs(0).val_map == ValueMap(0, 1)
+        assert node.outputs(0).valmap == ValueMap(0, 1)
         assert node.kwargs['num_head'] == num_head
         assert node.inputs(0).shape == [L, N // 4, E]
         assert node.inputs(1).shape == [3 * E, E]
@@ -410,13 +410,13 @@ def test_complex_feedforward_tensor_parallel():
     
     for idx, node in enumerate(nodes):
         assert node.outputs(0).shape == [L, N, E]
-        assert node.outputs(0).val_map == ValueMap(idx, 4)
+        assert node.outputs(0).valmap == ValueMap(idx, 4)
         assert node.inputs(0).shape == [L, N, E]
         assert node.inputs(1).shape == [4 * E // 4, E]
         assert node.inputs(2).shape == [4 * E // 4,]
         assert node.inputs(3).shape == [E, 4 * E // 4]
         assert node.inputs(4).shape == [E,]
-        assert node.inputs(4).val_map == ValueMap(idx, 4)
+        assert node.inputs(4).valmap == ValueMap(idx, 4)
 
 
 def test_complex_feedforward_data_parallel():
@@ -453,7 +453,7 @@ def test_complex_feedforward_data_parallel():
     
     for idx, node in enumerate(nodes):
         assert node.outputs(0).shape == [L, N // 4, E]
-        assert node.outputs(0).val_map == ValueMap(0, 1)
+        assert node.outputs(0).valmap == ValueMap(0, 1)
         assert node.inputs(0).shape == [L, N // 4, E]
         assert node.inputs(1).shape == [4 * E, E]
         assert node.inputs(2).shape == [4 * E,]
@@ -496,7 +496,7 @@ def test_embed_shard_parallel():
     shard = (stop - start) // 4
     for idx, node in enumerate(nodes):
         assert node.outputs(0).shape == [L, N, E]
-        assert node.outputs(0).val_map == ValueMap(idx, 4)
+        assert node.outputs(0).valmap == ValueMap(idx, 4)
         assert node.inputs(0).shape == [L, N]
         assert node.inputs(1).shape == [vocab // 4, E]
         assert node.kwargs['start'] == start + idx * shard
@@ -536,7 +536,7 @@ def test_embed_shard_parallel():
     stop = semantic_op.kwargs['stop']
     for idx, node in enumerate(nodes):
         assert node.outputs(0).shape == [L, N // 4, E]
-        assert node.outputs(0).val_map == ValueMap(0, 1)
+        assert node.outputs(0).valmap == ValueMap(0, 1)
         assert node.inputs(0).shape == [L, N // 4]
         assert node.inputs(1).shape == [vocab, E]
         assert node.kwargs['start'] == start

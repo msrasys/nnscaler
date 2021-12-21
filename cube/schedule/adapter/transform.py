@@ -77,10 +77,10 @@ class IRTensorTransform(IRCell):
 
 class SelectPrim:
 
-    def __init__(self, tensor: IRSubTensor, indices: IndexMap, val_map: ValueMap, shape: List[int]):
+    def __init__(self, tensor: IRSubTensor, indmap: IndexMap, valmap: ValueMap, shape: List[int]):
         self.tensor = tensor
-        self.indices = indices
-        self.val_map = val_map
+        self.indmap = indmap
+        self.valmap = valmap
         self.shape = shape
         self.output = None
     
@@ -88,7 +88,7 @@ class SelectPrim:
         self.output = output
 
     def __repr__(self):
-        dscp = f't{self.output._id} = select(t{self.tensor._id}, {self.indices}, {self.val_map}, {self.shape})'
+        dscp = f't{self.output._id} = select(t{self.tensor._id}, {self.indmap}, {self.valmap}, {self.shape})'
         return dscp
 
 
@@ -97,13 +97,13 @@ class SelectPlan:
     @staticmethod
     def gen(input: IRSubTensor, outputs: List[IRSubTensor]) -> List[SelectPrim]:
         trace: List[SelectPrim] = list()
-        islicers: List[slice] = input.indices.get()
+        islicers: List[slice] = input.indmap.get()
         for output in outputs:
             if output == input:
                 continue
-            oslicers: List[slice] = output.indices.get()
-            # indices
-            indices = list()
+            oslicers: List[slice] = output.indmap.get()
+            # indmap
+            indmap = list()
             for islicer, oslicer in zip(islicers, oslicers):
                 istart, istop, istep = islicer.start, islicer.stop, islicer.step
                 ostart, ostop, ostep = oslicer.start, oslicer.stop, oslicer.step
@@ -113,20 +113,20 @@ class SelectPlan:
                 start = ostart - istart
                 stop = start + ostop - ostart
                 slicer = slice(start, stop, ostep)
-                indices.append(slicer)
-            indices = IndexMap(tuple(indices))
+                indmap.append(slicer)
+            indmap = IndexMap(tuple(indmap))
             # value map
-            if output.val_map == input.val_map:
-                val_map = ValueMap(0, 1)
-            elif input.val_map == ValueMap(0, 1):
-                val_map = output.val_map
+            if output.valmap == input.valmap:
+                valmap = ValueMap(0, 1)
+            elif input.valmap == ValueMap(0, 1):
+                valmap = output.valmap
             else:
                 print('from: ', input)
                 print('to  : ', output)
                 raise NotImplementedError(
-                    f"Not supported value select: {input.val_map} -> {output.val_map}"
+                    f"Not supported value select: {input.valmap} -> {output.valmap}"
                 )
-            prim = SelectPrim(input, indices, val_map, output.shape)
+            prim = SelectPrim(input, indmap, valmap, output.shape)
             prim.set_output(output)
             trace.append(prim)
         return trace
@@ -145,7 +145,7 @@ class MergePrim:
         self.output = None
         # re-order tensor
         if isinstance(concat, int):
-            slicers = [tensor.indices.get()[concat] for tensor in tensors]
+            slicers = [tensor.indmap.get()[concat] for tensor in tensors]
             starts = np.array([slicer.start for slicer in slicers], dtype=int)
             sorted_idx = np.argsort(starts)
             tensors = np.array(tensors)[sorted_idx]
@@ -227,11 +227,11 @@ class MergePlan:
             return None
         if tensor1.parent != tensor2.parent:
             return None
-        if tensor1.val_map != tensor2.val_map:
+        if tensor1.valmap != tensor2.valmap:
             return None
-        indices1 = tensor1.indices.get()
-        indices2 = tensor2.indices.get()
-        indices = list()
+        indices1 = tensor1.indmap.get()
+        indices2 = tensor2.indmap.get()
+        indmap = list()
         if len(indices1) != len(indices2):
             return None
         axis = None
@@ -245,21 +245,21 @@ class MergePlan:
                     return None
                 if start1 < start2 and stop1 == start2:
                     axis = dim
-                    indices.append(slice(start1, stop2, step1))
+                    indmap.append(slice(start1, stop2, step1))
                 elif start1 > start2 and start1 == stop2:
                     axis = dim
-                    indices.append(slice(start2, stop1, step1))
+                    indmap.append(slice(start2, stop1, step1))
                 else:
                     return None
             else:
-                indices.append(slicer1)
+                indmap.append(slicer1)
         shapes = list()
         for idx, (nele1, nele2) in enumerate(zip(tensor1.shape, tensor2.shape)):
             nele = nele1 if idx != axis else nele1 + nele2
             shapes.append(nele)
         mtensor = tensor1.parent.select(
-            indices = tuple(indices),
-            val_map = tensor1.val_map,
+            indmap = tuple(indmap),
+            valmap = tensor1.valmap,
             shape = shapes
         )
         return mtensor, axis
@@ -272,12 +272,12 @@ class MergePlan:
             return None
         if tensor1.parent != tensor2.parent:
             return None
-        if tensor1.indices != tensor2.indices:
+        if tensor1.indmap != tensor2.indmap:
             return None
-        if tensor1.val_map.chunk_num != tensor2.val_map.chunk_num:
+        if tensor1.valmap.chunk_num != tensor2.valmap.chunk_num:
             return None
-        chunk_num = tensor1.val_map.chunk_num
-        idx1, idx2 = tensor1.val_map.idx, tensor2.val_map.idx
+        chunk_num = tensor1.valmap.chunk_num
+        idx1, idx2 = tensor1.valmap.idx, tensor2.valmap.idx
         if chunk_num % 2 != 0:
             return None
         chunk_num = int(chunk_num // 2)
@@ -285,8 +285,8 @@ class MergePlan:
             return None
         idx = int(idx1 // 2)
         mtensor = tensor1.parent.select(
-            indices = tensor1.indices,
-            val_map = (idx, chunk_num),
+            indmap = tensor1.indmap,
+            valmap = (idx, chunk_num),
             shape = tensor1.shape
         )
         return mtensor

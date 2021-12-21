@@ -73,7 +73,7 @@ class MultiHeadSelfAttention(nn.Module):
         # attn = attn.masked_fill_(mask, -100000.0)
         # # [N, num_heads, L, L] -> [(N * num_heads), L, L]
         # attn = attn.view((bs * self.num_heads), self.seq_len, self.seq_len)
-        attn = cube.runtime.function.tril_mask(attn, bs)
+        attn = cube.runtime.function.tril_mask(attn, self.num_heads)
 
         # [(N * num_heads), L, L] -> [(N * num_heads), L, L]
         attn = F.softmax(attn, dim=-1)

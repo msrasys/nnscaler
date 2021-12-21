@@ -50,7 +50,7 @@ def test_bmm_data_parallel():
     for output in outputs:
         print(output)
         assert output.shape == [B // 4, N, P]
-        assert output.val_map == ValueMap(0, 1)
+        assert output.valmap == ValueMap(0, 1)
 
 
 def test_bmm_n_parallel():
@@ -101,7 +101,7 @@ def test_bmm_n_parallel():
     for output in outputs:
         print(output)
         assert output.shape == [B, N // 4, P]
-        assert output.val_map == ValueMap(0, 1)
+        assert output.valmap == ValueMap(0, 1)
 
 
 def test_bmm_m_parallel():
@@ -152,7 +152,7 @@ def test_bmm_m_parallel():
     for idx, output in enumerate(outputs):
         print(output)
         assert output.shape == [B, N, P]
-        assert output.val_map == ValueMap(idx, 4)
+        assert output.valmap == ValueMap(idx, 4)
 
 
 def test_bmm_p_parallel():
@@ -203,4 +203,4 @@ def test_bmm_p_parallel():
     for output in outputs:
         print(output)
         assert output.shape == [B, N, P // 4]
-        assert output.val_map == ValueMap(0, 1)
+        assert output.valmap == ValueMap(0, 1)

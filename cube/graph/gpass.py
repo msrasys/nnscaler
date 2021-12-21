@@ -25,8 +25,8 @@ class _TensorGener:
         if val.parent._id not in self.symbol:
             self.symbol[val.parent._id] = val.parent.like()
         new_val = self.symbol[val.parent._id].select(
-            indices=val.indices,
-            val_map=val.val_map,
+            indmap=val.indmap,
+            valmap=val.valmap,
             shape=val.shape
         )
         return new_val

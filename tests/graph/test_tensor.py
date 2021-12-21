@@ -19,18 +19,18 @@ def test_full_tensor_select():
 
     tensor = IRFullTensor(shape=[1024,1024], name='tensor')
     assert len(tensor.segments()) == 0
-    assert len(tensor.indices()) == 0
+    assert len(tensor.indmap()) == 0
     assert len(tensor.val_maps()) == 0
 
     sub_tensor1 = tensor.select(
-        indices = (slice(0, 1024), slice(0, 512)),
-        val_map = None,
+        indmap = (slice(0, 1024), slice(0, 512)),
+        valmap = None,
         shape = (1024, 512)
     )
 
     sub_tensor2 = tensor.select(
-        indices = (slice(0, 1024), slice(512, 1024)),
-        val_map = None,
+        indmap = (slice(0, 1024), slice(512, 1024)),
+        valmap = None,
         shape = (1024, 512)
     )
 
@@ -41,7 +41,7 @@ def test_full_tensor_select():
     assert sub_tensor2.name == 'tensor'
 
     assert len(tensor.segments()) == 2
-    assert len(tensor.indices()) == 2
+    assert len(tensor.indmap()) == 2
     assert len(tensor.val_maps()) == 2
 
 
@@ -49,19 +49,19 @@ def test_full_tensor_overlap():
 
     tensor1 = IRFullTensor(shape=[1024,1024], name='tensor')
     sub_tensor1 = tensor1.select(
-        indices = (slice(0, 1024), slice(256, 1024)),
-        val_map = None,
+        indmap = (slice(0, 1024), slice(256, 1024)),
+        valmap = None,
         shape = (1024, 768)
     )
 
     sub_tensor2 = tensor1.select(
-        indices = (slice(0, 1024, 2), slice(512, 1024)),
-        val_map = None,
+        indmap = (slice(0, 1024, 2), slice(512, 1024)),
+        valmap = None,
         shape = (1024, 512)
     )
     sub_tensor3 = tensor1.select(
-        indices = (slice(1, 1024, 2), slice(512, 1024)),
-        val_map = None,
+        indmap = (slice(1, 1024, 2), slice(512, 1024)),
+        valmap = None,
         shape = (1024, 512)
     )
 
@@ -79,25 +79,25 @@ def test_sub_tensor_select():
 
     tensor1 = IRFullTensor(shape=[1024,1024], name='tensor')
     sub_tensor1 = tensor1.select(
-        indices = (slice(0, 1024), slice(512, 1024)),
-        val_map = None,
+        indmap = (slice(0, 1024), slice(512, 1024)),
+        valmap = None,
         shape = (1024, 512)
     )
     sub_tensor2 = sub_tensor1.select(
-        indices = (slice(512, 1024), slice(0, 256)),
-        val_map = None,
+        indmap = (slice(512, 1024), slice(0, 256)),
+        valmap = None,
         shape = (512, 256)
     )
     sub_tensor3 = sub_tensor1.select(
-        indices = (slice(512, 1024), slice(256, 512)),
-        val_map = None,
+        indmap = (slice(512, 1024), slice(256, 512)),
+        valmap = None,
         shape = (512, 256)
     )
     
-    indices = sub_tensor2.indices.get()
-    assert indices == (slice(512, 1024, 1), slice(512, 768, 1))
-    indices = sub_tensor3.indices.get()
-    assert indices == (slice(512, 1024, 1), slice(768, 1024, 1))
+    indmap = sub_tensor2.indmap.get()
+    assert indmap == (slice(512, 1024, 1), slice(512, 768, 1))
+    indmap = sub_tensor3.indmap.get()
+    assert indmap == (slice(512, 1024, 1), slice(768, 1024, 1))
 
     assert len(tensor1.segments()) == 3
     assert sub_tensor1 in tensor1.segments()
@@ -109,18 +109,18 @@ def test_sub_tensor_ind_overlap():
 
     tensor1 = IRFullTensor(shape=[1024,1024], name='tensor')
     sub_tensor1 = tensor1.select(
-        indices = (slice(0, 1024), slice(512, 1024)),
-        val_map = None,
+        indmap = (slice(0, 1024), slice(512, 1024)),
+        valmap = None,
         shape = (1024, 512)
     )
     sub_tensor2 = sub_tensor1.select(
-        indices = (slice(512, 1024), slice(0, 256)),
-        val_map = None,
+        indmap = (slice(512, 1024), slice(0, 256)),
+        valmap = None,
         shape = (512, 256)
     )
     sub_tensor3 = sub_tensor1.select(
-        indices = (slice(512, 1024), slice(256, 512)),
-        val_map = None,
+        indmap = (slice(512, 1024), slice(256, 512)),
+        valmap = None,
         shape = (512, 256)
     )
 
@@ -132,23 +132,23 @@ def test_sub_tensor_ind_overlap():
 def test_sub_tensor_val_overlap():
     tensor1 = IRFullTensor(shape=[1024,1024], name='tensor')
     sub_tensor1 = tensor1.select(
-        indices = (slice(0, 1024), slice(512, 1024)),
-        val_map = None,
+        indmap = (slice(0, 1024), slice(512, 1024)),
+        valmap = None,
         shape = (1024, 512)
     )
     sub_tensor2 = tensor1.select(
-        indices = (slice(0, 1024), slice(0, 512)),
-        val_map = (0, 4),
+        indmap = (slice(0, 1024), slice(0, 512)),
+        valmap = (0, 4),
         shape = (1024, 512)
     )
     sub_tensor3 = tensor1.select(
-        indices = (slice(0, 1024), slice(512, 1024)),
-        val_map = (0, 4),
+        indmap = (slice(0, 1024), slice(512, 1024)),
+        valmap = (0, 4),
         shape = (1024, 512)
     )
     sub_tensor4 = tensor1.select(
-        indices = (slice(0, 1024), slice(512, 1024)),
-        val_map = (1, 4),
+        indmap = (slice(0, 1024), slice(512, 1024)),
+        valmap = (1, 4),
         shape = (1024, 512)
     )
 
@@ -163,23 +163,23 @@ def test_sub_tensor_common():
 
     tensor1 = IRFullTensor(shape=[1024,1024], name='tensor')
     sub_tensor_col1 = tensor1.select(
-        indices = (slice(0, 1024), slice(0, 512)),
-        val_map = None,
+        indmap = (slice(0, 1024), slice(0, 512)),
+        valmap = None,
         shape = (1024, 512)
     )
     sub_tensor_col2 = tensor1.select(
-        indices = (slice(0, 1024), slice(512, 1024)),
-        val_map = None,
+        indmap = (slice(0, 1024), slice(512, 1024)),
+        valmap = None,
         shape = (1024, 512)
     )
     sub_tensor_row1 = tensor1.select(
-        indices = (slice(0, 512), slice(0, 1024)),
-        val_map = None,
+        indmap = (slice(0, 512), slice(0, 1024)),
+        valmap = None,
         shape = (512, 1024)
     )
     sub_tensor_row2 = tensor1.select(
-        indices = (slice(512, 1024), slice(0, 1024)),
-        val_map = None,
+        indmap = (slice(512, 1024), slice(0, 1024)),
+        valmap = None,
         shape = (512, 1024)
     )
 
@@ -188,17 +188,17 @@ def test_sub_tensor_common():
     lb = sub_tensor_row2.common(sub_tensor_col1)
     rb = sub_tensor_row2.common(sub_tensor_col2)
 
-    assert lt.indices.get() == (slice(0, 512, 1), slice(0, 512, 1))
-    assert rt.indices.get() == (slice(0, 512, 1), slice(512, 1024, 1))
-    assert lb.indices.get() == (slice(512, 1024, 1), slice(0, 512, 1))
-    assert rb.indices.get() == (slice(512, 1024, 1), slice(512, 1024, 1))
+    assert lt.indmap.get() == (slice(0, 512, 1), slice(0, 512, 1))
+    assert rt.indmap.get() == (slice(0, 512, 1), slice(512, 1024, 1))
+    assert lb.indmap.get() == (slice(512, 1024, 1), slice(0, 512, 1))
+    assert rb.indmap.get() == (slice(512, 1024, 1), slice(512, 1024, 1))
 
 
 def test_sub_tensor_as_grad():
     tensor1 = IRFullTensor(shape=[1024,1024], name='tensor')
     sub_tensor1 = tensor1.select(
-        indices = (slice(0, 1024), slice(512, 1024)),
-        val_map = None,
+        indmap = (slice(0, 1024), slice(512, 1024)),
+        valmap = None,
         shape = (1024, 512)
     )
 
@@ -206,8 +206,8 @@ def test_sub_tensor_as_grad():
     assert sub_tensor1.is_grad()
 
     sub_tensor2 = tensor1.select(
-        indices = (slice(0, 1024), slice(0, 512)),
-        val_map = (0, 4),
+        indmap = (slice(0, 1024), slice(0, 512)),
+        valmap = (0, 4),
         shape = (1024, 512)
     )
     assert sub_tensor2.is_grad()
@@ -216,13 +216,13 @@ def test_sub_tensor_as_grad():
 def test_sub_tensor_copy():
     tensor1 = IRFullTensor(shape=[1024,1024], name='tensor')
     sub_tensor1 = tensor1.select(
-        indices = (slice(0, 1024), slice(512, 1024)),
-        val_map = None,
+        indmap = (slice(0, 1024), slice(512, 1024)),
+        valmap = None,
         shape = (1024, 512)
     )
     sub_tensor2 = tensor1.select(
-        indices = (slice(0, 1024), slice(0, 512)),
-        val_map = (0, 4),
+        indmap = (slice(0, 1024), slice(0, 512)),
+        valmap = (0, 4),
         shape = (1024, 512)
     )
     sub_tensor1.grads = [sub_tensor2]

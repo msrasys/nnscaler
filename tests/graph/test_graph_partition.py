@@ -130,7 +130,7 @@ def test_linear_hybrid_partition():
         print('grad    :', data_grad)
         print('grad ref:', data_grad_ref)
         assert data_grad == data_grad_ref
-        assert data_grad.val_map == ValueMap(idx, ngpus)
+        assert data_grad.valmap == ValueMap(idx, ngpus)
 
     print('===== algo 2 =====')
     for idx, su in enumerate(algosu2):
@@ -141,7 +141,7 @@ def test_linear_hybrid_partition():
         print('grad    :', data_grad)
         print('grad ref:', data_grad_ref)
         assert data_grad == data_grad_ref
-        assert data_grad.val_map == ValueMap(idx, ngpus)
+        assert data_grad.valmap == ValueMap(idx, ngpus)
 
     print('===== algo 3 =====')
     for idx, su in enumerate(algosu3):
@@ -152,6 +152,6 @@ def test_linear_hybrid_partition():
         print('grad    :', data_grad)
         print('grad ref:', data_grad_ref)
         assert data_grad == data_grad_ref
-        assert data_grad.val_map == ValueMap(idx, ngpus)
+        assert data_grad.valmap == ValueMap(idx, ngpus)
 
     assert False

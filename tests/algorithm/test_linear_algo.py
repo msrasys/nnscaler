@@ -45,7 +45,7 @@ def test_linear_data_parallel():
     
     for idx, x in enumerate(inputs):
         assert x.shape == [256, 1024]
-        assert x.indices.get()[0] == slice(256 * idx, 256 * (idx + 1), 1)
+        assert x.indmap.get()[0] == slice(256 * idx, 256 * (idx + 1), 1)
     assert not inputs[0].overlap(inputs[1])
     assert not inputs[0].overlap(inputs[2])
     assert not inputs[0].overlap(inputs[3])
@@ -104,16 +104,16 @@ def test_linear_column_weight():
 
     for idx, w in enumerate(weights):
         assert w.shape == [250, 1024]
-        assert w.indices.get()[0] == slice(250 * idx, 250 * (idx + 1), 1)
+        assert w.indmap.get()[0] == slice(250 * idx, 250 * (idx + 1), 1)
 
     for idx, b in enumerate(biass):
         assert b.shape == [250]
-        assert b.indices.get() == (slice(250 * idx, 250 * (idx + 1), 1),)
+        assert b.indmap.get() == (slice(250 * idx, 250 * (idx + 1), 1),)
     
     for idx, output in enumerate(outputs):
         assert output.shape == [1024, 250]
-        assert output.indices.get()[0] == slice(0, 1024, 1)
-        assert output.indices.get()[1] == slice(250 * idx, 250 * (idx + 1), 1)
+        assert output.indmap.get()[0] == slice(0, 1024, 1)
+        assert output.indmap.get()[1] == slice(250 * idx, 250 * (idx + 1), 1)
 
 
 def test_linear_row():
@@ -167,19 +167,19 @@ def test_linear_row():
 
     for idx, x in enumerate(inputs):
         assert x.shape == [1024, 256]
-        assert x.indices.get()[1] == slice(256 * idx, 256 * (idx + 1), 1)
-        assert x.val_map == ValueMap(0, 1)
+        assert x.indmap.get()[1] == slice(256 * idx, 256 * (idx + 1), 1)
+        assert x.valmap == ValueMap(0, 1)
 
     for idx, w in enumerate(weights):
         assert w.shape == [1000, 256]
-        assert w.indices.get()[1] == slice(256 * idx, 256 * (idx + 1), 1)
-        assert w.val_map == ValueMap(0, 1)
+        assert w.indmap.get()[1] == slice(256 * idx, 256 * (idx + 1), 1)
+        assert w.valmap == ValueMap(0, 1)
 
     for idx, b in enumerate(biass):
         assert b.shape == [1000,]
-        assert b.indices.get()[0] == slice(0, 1000, 1)
-        assert b.val_map == ValueMap(idx, 4)
+        assert b.indmap.get()[0] == slice(0, 1000, 1)
+        assert b.valmap == ValueMap(idx, 4)
 
     for idx, output in enumerate(outputs):
         assert output.shape == [1024, 1000]
-        assert output.val_map == ValueMap(idx, 4)
+        assert output.valmap == ValueMap(idx, 4)

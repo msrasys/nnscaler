@@ -177,7 +177,7 @@ class P2PFusion(PlanPass):
         in_tensors: Dict[int, List[IRTensor]] = dict()
         for devid in tins:
             for in_tensor in tins[devid]:
-                if in_tensor.val_map != ValueMap(0, 1):
+                if in_tensor.valmap != ValueMap(0, 1):
                     continue
                 tid = in_tensor._id
                 if tid not in in_devices:
@@ -201,16 +201,16 @@ class P2PFusion(PlanPass):
                 # check same indice map and no overlap value map
                 unique_indices = list()
                 for odev in out_tensors:
-                    indices = out_tensors[odev][0].indices
-                    if indices not in unique_indices:
-                        unique_indices.append(indices)
+                    indmap = out_tensors[odev][0].indmap
+                    if indmap not in unique_indices:
+                        unique_indices.append(indmap)
                 if len(unique_indices) != 1:
                     continue
                 # check no overlap valmaps
                 all_valmaps = list()
                 overlap = False
                 for odev in out_tensors:
-                    valmap = out_tensors[odev][0].val_map
+                    valmap = out_tensors[odev][0].valmap
                     for pre_valmp in all_valmaps:
                         overlap = pre_valmp.overlap(valmap)
                     all_valmaps.append(valmap)
@@ -279,22 +279,22 @@ class P2PFusion(PlanPass):
                 # multiple transmission FIXME: remove redundancy
                 if not all([len(out_tensors[odev]) == 1 for odev in out_devices]):
                     continue
-                # check same value map and no overlap indices
+                # check same value map and no overlap indmap
                 unique_valmaps = list()
                 for odev in out_tensors:
-                    valmap = out_tensors[odev][0].val_map
+                    valmap = out_tensors[odev][0].valmap
                     if valmap not in unique_valmaps:
                         unique_valmaps.append(valmap)
                 if len(unique_valmaps) != 1:
                     continue
-                # check no overlap indices
+                # check no overlap indmap
                 all_indices = list()
                 overlap = False
                 for odev in out_tensors:
-                    indices = out_tensors[odev][0].indices
+                    indmap = out_tensors[odev][0].indmap
                     for pre_indices in all_indices:
-                        overlap = pre_indices.overlap(indices)
-                    all_indices.append(indices)
+                        overlap = pre_indices.overlap(indmap)
+                    all_indices.append(indmap)
                 if overlap:
                     continue
 
@@ -335,7 +335,7 @@ class P2PFusion(PlanPass):
         for devid in tins:
             for in_tensor in tins[devid]:
                 tid = in_tensor._id
-                if in_tensor.val_map != ValueMap(0, 1):
+                if in_tensor.valmap != ValueMap(0, 1):
                     continue
                 if tid not in in_devices:
                     in_devices[tid] = list()
@@ -358,10 +358,10 @@ class P2PFusion(PlanPass):
                 # multiple transmission FIXME: remove redundancy
                 if not all([len(out_tensors[odev]) == 1 for odev in out_tensors]):
                     continue
-                if out_tensors[devid][0].val_map == ValueMap(0, 1):
+                if out_tensors[devid][0].valmap == ValueMap(0, 1):
                     is_reduce = False
                     break
-                if out_tensors[devid][0].indices != in_tensor.indices:
+                if out_tensors[devid][0].indmap != in_tensor.indmap:
                     is_reduce = False
                     break
             if is_reduce:
@@ -439,7 +439,7 @@ class P2PFusion(PlanPass):
         for devid in tins:
             for in_tensor in tins[devid]:
                 tid = in_tensor._id
-                if in_tensor.val_map != ValueMap(0, 1):
+                if in_tensor.valmap != ValueMap(0, 1):
                     continue
                 if tid not in in_devices:
                     in_devices[tid] = list()

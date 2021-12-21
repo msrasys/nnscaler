@@ -40,7 +40,7 @@ def test_reduce_dim_parallel():
         for output in node.outputs():
             print(output)
             assert output.shape == [1]
-            assert output.val_map == ValueMap(idx, 4)
+            assert output.valmap == ValueMap(idx, 4)
 
 
     dim = 1
@@ -65,4 +65,4 @@ def test_reduce_dim_parallel():
         for output in node.outputs():
             print(output)
             assert output.shape == [256]
-            assert output.val_map == ValueMap(0, 1)
+            assert output.valmap == ValueMap(0, 1)

@@ -276,12 +276,12 @@ class ModelCodeGen(CodeGen):
         """
         for prim in node.trace():
             if isinstance(prim, SelectPrim):
-                signature = 'cube.runtime.transform.select({tensor}, {indices}, {val_map})'
+                signature = 'cube.runtime.transform.select({tensor}, {indmap}, {valmap})'
                 input = self.tensor_naming(prim.tensor)
-                indices = repr(prim.indices)
-                val_map = repr(tuple([prim.val_map.idx, prim.val_map.chunk_num]))
+                indmap = repr(prim.indmap)
+                valmap = repr(tuple([prim.valmap.idx, prim.valmap.chunk_num]))
                 output = self.tensor_naming(prim.output)
-                code = f'{output} = {signature.format(tensor=input, indices=indices, val_map=val_map)}'
+                code = f'{output} = {signature.format(tensor=input, indmap=indmap, valmap=valmap)}'
                 self.forward_region.append(code)
             elif isinstance(prim, MergePrim):
                 signature = 'cube.runtime.transform.merge({tensors}, {concat}, {add})'

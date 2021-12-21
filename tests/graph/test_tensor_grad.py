@@ -87,8 +87,8 @@ def test_tensor_grad():
     for pten in all_parent_tensors:
         assert pten.grad is None
         print(pten.name, pten)
-        cell_ids = [cell._id for cell in pten.forward_dst_cells()]
-        print('forward_dst_cells id:', cell_ids)
+        cell_ids = [cell._id for cell in pten.consumers]
+        print('consumers id:', cell_ids)
         print('')
 
     print('test grad:')
@@ -96,37 +96,37 @@ def test_tensor_grad():
     input = linear1.inputs(0)
     assert input.grad is None
     gin = input.get_grad(linear1)
-    assert gin.val_map == ValueMap(0, 1)
+    assert gin.valmap == ValueMap(0, 1)
     print(gin.name, gin)
 
     weight = linear1.inputs(1)
     gw = weight.get_grad(linear1)
-    assert gw.val_map == ValueMap(0, 2)
+    assert gw.valmap == ValueMap(0, 2)
     print(gw.name, gw)
 
     weight = linear4.inputs(1)
     gw = weight.get_grad(linear4)
-    assert gw.val_map == ValueMap(1, 2)
+    assert gw.valmap == ValueMap(1, 2)
     print(gw.name, gw)
 
     out2 = linear2.outputs(0)
     gout2 = out2.get_grad(linear2)
     print(gout2.name, gout2)
-    assert gout2.val_map == ValueMap(0, 1)
+    assert gout2.valmap == ValueMap(0, 1)
     gout2 = out2.get_grad(linear3)
     print(gout2.name, gout2)
-    assert gout2.val_map == ValueMap(0, 2)
+    assert gout2.valmap == ValueMap(0, 2)
     gout2 = out2.get_grad(add5)
     print(gout2.name, gout2)
-    assert gout2.val_map == ValueMap(1, 2)
+    assert gout2.valmap == ValueMap(1, 2)
 
     out3 = linear3.outputs(0)
     gout3 = out3.get_grad(linear3)
     print(gout3.name, gout3)
-    assert gout3.val_map == ValueMap(0, 1)
+    assert gout3.valmap == ValueMap(0, 1)
     gout3 = out3.get_grad(add5)
     print(gout3.name, gout3)
-    assert gout3.val_map == ValueMap(0, 1)
+    assert gout3.valmap == ValueMap(0, 1)
 
     for node in graph.nodes():
         assert node.mirror is None
@@ -147,7 +147,7 @@ def test_tensor_grad():
 
     assert gw1.parent == gw4.parent
     assert gw1.shape == gw4.shape
-    assert gw1.indices == gw4.indices
-    assert gw1.val_map != gw4.val_map
+    assert gw1.indmap == gw4.indmap
+    assert gw1.valmap != gw4.valmap
 
     # assert False

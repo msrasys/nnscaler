@@ -34,7 +34,7 @@ def test_roll_parallel():
     CudaTimer().start(field_name='roll_halo')
     for _ in range(1000):
         roll_out = cube.runtime.function.roll_dim_parallel(
-            input, (9 // 2), 1, group
+            input, (9 // 2), 1, list(range(world_size)), group
         )
     CudaTimer().stop(field_name='roll_halo')
     ref1 = roll_out
@@ -60,6 +60,49 @@ def test_roll_parallel():
         print('correctness test failed')
     else:
         print('correctness test passed')
+
+
+def test_roll_grid_parallel():
+        # input size
+    group = None
+    world_size = torch.distributed.get_world_size(group=group)
+    myrank = torch.distributed.get_rank()
+    assert world_size == 4
+    # input_size = [1, 224 // 2, 224 // 2, 256]
+    # input = torch.randn(input_size).cuda() * 10
+    input = torch.arange(myrank * 4, (myrank + 1) * 4).view(1, 2, 2, 1).float()
+    input = input.cuda()
+    print_each_rank(f'input: {input.view(-1)}')
+
+    CudaTimer().warmup(seconds=2)
+
+    torch.distributed.barrier()
+    CudaTimer().start(field_name='roll_halo')
+    for _ in range(1):
+        roll_out = cube.runtime.function.roll_grid_parallel(
+            input, (9 // 2, 9 // 2), (1, 2), 2, 2, group
+        )
+    CudaTimer().stop(field_name='roll_halo')
+    ref1 = roll_out
+    # print_each_rank(ref1, rank_only=0)
+    assert roll_out.shape == input.shape
+    span = CudaTimer().duration(times=1000, field_name='roll_halo')
+    print_each_rank('span on halo exchange: {:.2f} ms'.format(span))
+
+    torch.distributed.barrier()
+    CudaTimer().start(field_name='roll_allgather')
+    for _ in range(1):
+        roll_out = cube.runtime.function.roll_dim_allgather(
+            input, (9 // 2), 1, group
+        )
+        roll_out = cube.runtime.function.roll_dim_allgather(
+            roll_out, (9 // 2), 2, group
+        )
+    CudaTimer().stop(field_name='roll_allgather')
+    ref2 = roll_out
+    # print_each_rank(ref2, rank_only=0)
+    span = CudaTimer().duration(times=1000, field_name='roll_allgather')
+    print_each_rank('span on allgather exchange: {:.2f} ms'.format(span))
 
 
 def test_roll_parallel_autograd():
@@ -114,7 +157,8 @@ def test_grid_collection():
 if __name__ == '__main__':
 
     cube.init()
-    # test_roll_parallel()
+    test_roll_parallel()
+    # test_roll_grid_parallel()
     # test_roll_parallel_autograd()
     # test_grid_partition()
-    test_grid_collection()
+    # test_grid_collection()

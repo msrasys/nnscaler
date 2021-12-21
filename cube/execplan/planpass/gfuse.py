@@ -74,7 +74,7 @@ class WeightGradAllreduceFusion(PlanPass):
                             print(grad)
                             assert grad is not None
                         # nothing to sync
-                        if grad.val_map == ValueMap(0, 1):
+                        if grad.valmap == ValueMap(0, 1):
                             continue
                         if input._id not in grads:
                             grads[input._id] = dict()

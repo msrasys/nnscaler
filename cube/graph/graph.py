@@ -323,7 +323,7 @@ class IRGraph(IRCell):
         for fnode in fnodes:
             for input in fnode.inputs():
                 if isinstance(input, IRSubTensor):
-                    if input.val_map.chunk_num != 1 and not input.is_param():
+                    if input.valmap.chunk_num != 1 and not input.is_param():
                         raise NotImplementedError(
                             f"Not support feature-map {input} to be splitted in value as input"
                         )

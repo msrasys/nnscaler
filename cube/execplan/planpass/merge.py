@@ -105,9 +105,9 @@ class MergeComputeSU(PlanPass):
         Check if there is an adapter connecting forward SUs
         """
         sugraph = execplan.sugraph
-        indices = [execplan.sequence(devid).index(fsu) for fsu in fpieces]
-        start = min(indices)
-        end = max(indices)
+        indmap = [execplan.sequence(devid).index(fsu) for fsu in fpieces]
+        start = min(indmap)
+        end = max(indmap)
         # check fsu1 -> asu -> fsu2
         for asu in execplan.sequence(devid)[start:end]:
             if asu.stype in [SUType.P2P, SUType.Transform, SUType.Coll]:
