@@ -301,18 +301,20 @@ def _to_value_map(val_map: Union[Tuple, ValueMap, None]):
 
 class IRFullTensor(IRTensor):
 
-    def __init__(self, shape=None, name=None, requires_grad=True):
+    def __init__(self, shape=None, name=None, requires_grad=True, dtype=float):
 
-        super().__init__(shape, name)
+        super().__init__(shape, name, dtype)
 
-        self._segments = list()
-        # indices: List[IndexMap] for each segment
-        self._indices: List = list()
-        # value op
-        self._val_maps: List = list()
+        # producer cell and produced sub tensor
+        self._producers: List[IRCell] = list()
+        self._ptensors : List[IRSubTensor] = list()
 
-        # track gradient
-        self._forward_dst_cells = list()
+        # consumer cell and consumed sub tensor
+        self._consumers: List[IRCell] = list()
+        self._ctensors : List[IRSubTensor] = list()
+
+        # record all created sub_tensors
+        self._segments : List[IRSubTensor] = list()
 
         self.requires_grad = requires_grad
         if requires_grad:
@@ -328,26 +330,67 @@ class IRFullTensor(IRTensor):
         """
         return self
 
-    def _add_fdst_cell(self, cell: IRCell):
-        if not isinstance(cell, IRCell):
-            raise TypeError("Expect an IRCell")
-        if cell not in self._forward_dst_cells:
-            if None in self._forward_dst_cells:
-                idx = self._forward_dst_cells.index(None)
-                self._forward_dst_cells[idx] = cell
-            else:
-                self._forward_dst_cells.append(cell)
+    @property
+    def producers(self) -> List[IRCell]:
+        """
+        Producer IRCell list
+        """
+        return self._producers
 
-    def _rm_fdst_cell(self, cell: IRCell):
-        if not isinstance(cell, IRCell):
-            raise TypeError("Expect an IRCell")
-        if cell in self._forward_dst_cells:
-            # setting to None to keep value map order
-            idx = self._forward_dst_cells.index(cell)
-            self._forward_dst_cells[idx] = None
+    @property
+    def ptensors(self):
+        """
+        Produced IRSubTensor list correspongding to producer IRCell
+        """
+        return self._ptensors
 
-    def forward_dst_cells(self):
-        return [cell for cell in self._forward_dst_cells if cell is not None]
+    @property
+    def consumers(self) -> List[IRCell]:
+        """
+        Consumer IRCell list
+        """
+        return self._consumers
+
+    @property
+    def ctensors(self):
+        """
+        Consumed IRSubTensor list correspongding to consumer IRCell
+        """
+        return self._ctensors
+
+    def add_producer(self, cell: IRCell, tensor: IRTensor):
+        if not isinstance(cell, IRCell) or not isinstance(tensor, IRTensor):
+            raise TypeError("Expect an IRCell and an IRTensor")
+        if cell not in self.consumers:
+            self.producers.append(cell)
+            self.ptensors.append(tensor)
+
+    def add_consumer(self, cell: IRCell, tensor: IRTensor):
+        if not isinstance(cell, IRCell) or not isinstance(tensor, IRTensor):
+            raise TypeError("Expect an IRCell and an IRTensor")
+        if cell not in self.consumers:
+            self.consumers.append(cell)
+            self.ctensors.append(tensor)
+
+    def rm_producer(self, cell: IRCell):
+        if cell not in self.producers:
+            raise KeyError(f"Cell {cell} not found in producer")
+        idx = self.producers.index(cell)
+        self.producers.pop(idx)
+        self.ptensors.pop(idx)
+
+    def rm_consumer(self, cell: IRCell):
+        if cell not in self.consumers:
+            raise KeyError(f"Cell {cell} not found in producer")
+        idx = self.consumers.index(cell)
+        self.consumers.pop(idx)
+        self.ctensors.pop(idx)
+
+    def subtensors(self):
+        """
+        Get created sub-tensors of this tensor.
+        """
+        return copy.copy(self._segments)
 
     def as_param(self):
         """
@@ -356,13 +399,13 @@ class IRFullTensor(IRTensor):
         self.requires_grad = True
         self._is_param = True
         self._is_grad = False
-        for sub_tensor in self._segments:
+        for sub_tensor in self.ptensors + self.ctensors:
             sub_tensor.as_param()
 
     def as_grad(self):
         self._is_param = False
         self._is_grad = True
-        for sub_tensor in self._segments:
+        for sub_tensor in self.ptensors + self.ctensors:
             sub_tensor.as_grad()
         return self
 
@@ -378,33 +421,6 @@ class IRFullTensor(IRTensor):
         for attr in IRFullTensor._attr:
             setattr(tensor, attr, getattr(self, attr))
         return tensor
-
-    def segments(self, index: Optional[int] = None):
-        """
-        Get the SubTensors at index position
-        """
-        if index is None:
-            return copy.copy(self._segments)
-        else:
-            return self._segments[index]
-
-    def indices(self, index: Optional[int] = None) -> IndexMap:
-        """
-        Get the SubTensors mapping indices
-        """
-        if index is None:
-            return copy.copy(self._indices)
-        else:
-            return self._indices[index]
-
-    def val_maps(self, index: Optional[int] = None):
-        """
-        Get the SubTensors val_map
-        """
-        if index is None:
-            return copy.copy(self._val_maps)
-        else:
-            return self._val_maps[index]
 
     def select(self, indices: Union[Tuple, IndexMap], val_map: Union[Tuple, ValueMap, None], shape: List[int]):
         """
@@ -426,21 +442,16 @@ class IRFullTensor(IRTensor):
         indices = _to_index_map(indices)
         val_map = _to_value_map(val_map)
 
-        for idx in range(len(self._segments)):
-            indmap = self._indices[idx]
-            valmap = self._val_maps[idx]
-            sub_tensor = self._segments[idx]
-            if indmap == indices and valmap == val_map:
+        # return tensor to keep id same for same sub tensor
+        for sub_tensor in self.subtensors():
+            if sub_tensor.indices == indices and sub_tensor.val_map == val_map:
                 return sub_tensor
 
         sub_tensor = IRSubTensor(self, indices, val_map, shape)
         for attr in IRFullTensor._attr:
             setattr(sub_tensor, attr, getattr(self, attr))
         sub_tensor.grad = None
-
         self._segments.append(sub_tensor)
-        self._indices.append(indices)
-        self._val_maps.append(val_map)
         return sub_tensor
 
     def overlap(self, other):
@@ -475,7 +486,7 @@ class IRFullTensor(IRTensor):
 
     def tosub(self):
         """
-        Convert to SubTensor by selecting all indices
+        Convert to SubTensor by selecting all indices and full value
         """
         if self.shape is None:
             raise RuntimeError("Expected know shape")
@@ -593,9 +604,8 @@ class IRSubTensor(IRTensor):
         if full_grad is None:
             return None
         if self in fcell.inputs():
-            fdst_cells = self.parent.forward_dst_cells()
             ref_cells = list()
-            for dst_cell in fdst_cells:
+            for dst_cell in self.parent.consumers:
                 for input in dst_cell.inputs():
                     if self.overlap(input):
                         ref_cells.append(dst_cell)

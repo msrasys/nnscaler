@@ -339,7 +339,7 @@ class IRGraph(IRCell):
                         continue
                     # TODO: requires_grad = False should be set to None
                     val.grad = val.get_grad(fnode)
-                    for related_op in val.parent.forward_dst_cells():
+                    for related_op in val.parent.consumers:
                         for idx, rval in enumerate(related_op.inputs()):
                             if val.overlap(rval):
                                 rval.grad = rval.get_grad(related_op)

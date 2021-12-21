@@ -370,9 +370,9 @@ class IRTensor:
     IRTensor serves as IRGraph edge
     """
 
-    _attr = ['name', '_is_param', '_requires_grad', '_is_grad', '_grad']
+    _attr = ['name', '_is_param', '_requires_grad', '_is_grad', '_grad', '_dtype']
 
-    def __init__(self, shape=None, name=None):
+    def __init__(self, shape=None, name=None, dtype=float):
 
         self._id: int = IDGenerator().gen_tensor_id()
         self._shape: Optional(List[int]) = shape
@@ -381,11 +381,36 @@ class IRTensor:
         # device
         self._cell: List[IRCell] = list() 
 
+        # TODO: support float16
+        self._dtype = dtype
+
         self._is_param = False
         self._is_grad = False
         self._requires_grad = True
 
         self._grad = None
+
+    @property
+    def requires_grad(self):
+        return self._requires_grad
+
+    @requires_grad.setter
+    def requires_grad(self, val: bool):
+        self._requires_grad = val
+
+    @property
+    def dtype(self):
+        """
+        Data type
+        """
+        return self._dtype
+
+    @dtype.setter
+    def dtype(self, val):
+        """
+        Set data type
+        """
+        self._dtype = val
 
     def attach_cell(self, cell: IRCell):
         """

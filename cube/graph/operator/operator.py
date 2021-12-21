@@ -64,10 +64,19 @@ class IRFwOperation(IRCell):
         old_val = self.inputs(input_index)
         # remove the old one
         if isinstance(old_val, IRSubTensor):
-            old_val.parent._rm_fdst_cell(self)
+            old_val.parent.rm_consumer(self)
         if isinstance(val, IRSubTensor):
-            val.parent._add_fdst_cell(self)
+            val.parent.add_consumer(self, val)
         return super().set_input(input_index, val)
+
+    def set_output(self, output_index: int, val: Any):
+        old_val = self.outputs(output_index)
+        # remove the old one
+        if isinstance(old_val, IRSubTensor):
+            old_val.parent.rm_producer(self)
+        if isinstance(val, IRSubTensor):
+            val.parent.add_producer(self, val)
+        return super().set_output(output_index, val)
 
     def replicate(self):
         """
@@ -303,6 +312,14 @@ class IRDataOperation(IRCell):
                 return None
             template = factory.algorithms(type(self), tag)
             return template(self)
+    
+    def __repr__(self):
+        outputs = list()
+        for t in self.outputs():
+            name = f't{t._id}(p{t.parent._id},{t.shape},{t.val_map})'
+            outputs.append(name)
+        dscp = f'DataLoader-{self._id}(outputs={outputs})'
+        return dscp
 
 
 class IROptimOperation(IRCell):

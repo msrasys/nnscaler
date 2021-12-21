@@ -400,9 +400,8 @@ class ScriptModuleParser:
                 print('    '*depth, node)
         else:
             for node in smodule.graph.nodes():
-                ntype = ScriptModuleParser.ntype(node)
                 print('    '*depth, node)
-                if ntype == ScriptNodeKind.PrimCallMethod:
+                if node.kind() == 'prim::CallMethod':
                     label = node.inputsAt(0).node().s('name')
                     submodule = getattr(smodule, label)
                     ScriptModuleParser.flatten(submodule, depth+1)

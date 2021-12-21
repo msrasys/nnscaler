@@ -146,22 +146,34 @@ def compile(model: SemanticModel, dataloader,
             for su in sugraph.sus():
                 if len(su.device) == 0:
                     raise RuntimeError(f"SU {su} device is not set")
-            if not SUGraph.is_topo_order(sugraph.sus()):
-                raise RuntimeError(f"SUGraph order is not topological order")
+            # if not SUGraph.is_topo_order(sugraph.sus()):
+            #     raise RuntimeError(f"SUGraph order is not topological order")
 
             execplan = ExectuionPlan(sugraph)
             # plan pass to adapt to pytorch semantic: multi branch gradient
             # TODO: residual support
             # execplan = TorchRefAdapter.apply(execplan)
-            # plan pass to remove redundant sus 
+            # plan pass to remove redundant sus
+            start = time.time()
             execplan = RemoveRedundantAdapters.apply(execplan)
+            span = time.time() - start
+            print('> planpass on remove redundant adapter: {:.2f} s'.format(span))
             # print(f'> after remove redundant adapters:\n {execplan}')
+            start = time.time()
             execplan = MergeComputeSU.apply(execplan)
+            span = time.time() - start
+            print('> planpass on merge compute: {:.2f} s'.format(span))
             # print(f'> after merge backward SU:\n {execplan}')
+            start = time.time()
             execplan = WeightGradAllreduceFusion.apply(execplan)
+            span = time.time() - start
+            print('> planpass on grad allreduce: {:.2f} s'.format(span))
             # print(f'> after add allreduce:\n{execplan}')
 
+            start = time.time()
             execplan = P2PFusion.apply(execplan)
+            span = time.time() - start
+            print('> planpass on p2p fusion: {:.2f} s'.format(span))
             # print(f'> after fuse P2P SU:\n {execplan}')
 
             if torch.distributed.is_initialized():

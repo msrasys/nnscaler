@@ -25,7 +25,7 @@ def schedule_policy(sugraph: SUGraph, resource):
     """
     The schedule policy assign devices
     """
-    print(sugraph)
+    # print(sugraph)
     for su in sugraph.sus():
         if su.stype == SUType.Dataloader:
             devid = su.tag[0]
