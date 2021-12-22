@@ -9,10 +9,11 @@ IRGraph:
 
 from typing import Union, Tuple, List, Optional, Dict
 import copy
+
 from cube.graph.operator.operator import IRBpOperation
 
 from cube.ir.cten import IRTensor, IRCell
-from cube.graph.tensor import IRFullTensor, IRSubTensor
+from cube.graph.tensor import IRSubTensor
 
 from cube.algorithm.generics import GenericDistAlgo
 
@@ -29,53 +30,26 @@ class IRGraph(IRCell):
 
     def __init__(self, 
                  nodes: List[IRCell],
-                 input_tensors: Optional[List[IRTensor]], 
-                 output_tensors: Optional[List[IRTensor]], 
+                 inputs: Optional[List[IRTensor]], 
+                 outputs: Optional[List[IRTensor]], 
                  module_name: str):
         
         self._nodes: List[IRCell] = nodes
         self._parameters = list()
 
-        if input_tensors is None:
-            input_tensors = list()
+        if inputs is None:
             inputs = IRCell.get_inputs(nodes)
-            for input in inputs:
-                if not input.is_param():
-                    input_tensors.append(input)
-        if output_tensors is None:
-            output_tensors = list()
+            inputs = [t for t in inputs if not t.is_param()]
+        if outputs is None:
             outputs = IRCell.get_outputs(nodes)
-            for output in outputs:
-                if not output.is_param():
-                    output_tensors.append(output)
+            outputs = [t for t in outputs if not t.is_param()]
 
         super().__init__(
             name=module_name,
             signature=module_name,
-            input_length=len(input_tensors),
-            output_length=len(output_tensors)
+            input_length=len(inputs),
+            output_length=len(outputs)
         )
-
-        # convert to SubTensor
-        inputs = list()
-        for tensor in input_tensors:
-            if isinstance(tensor, IRFullTensor):
-                tensor = tensor.tosub()
-            inputs.append(tensor)
-        outputs = list()
-        for tensor in output_tensors:
-            if isinstance(tensor, IRFullTensor):
-                tensor = tensor.tosub()
-            outputs.append(tensor)
-        for node in self.nodes():
-            for idx, tensor in enumerate(node.inputs()):
-                if isinstance(tensor, IRFullTensor):
-                    tensor = tensor.tosub()
-                    node.set_input(idx, tensor)
-            for idx, tensor in enumerate(node.outputs()):
-                if isinstance(tensor, IRFullTensor):
-                    tensor = tensor.tosub()
-                    node.set_output(idx, tensor)
 
         for idx, tensor in enumerate(inputs):
             self.set_input(idx, tensor)
@@ -247,6 +221,8 @@ class IRGraph(IRCell):
         )
         return graph
 
+    ## Parallel Policy Primitives ##
+
     def replicate(self, op: IRCell, times=1):
         """
         Replicate an operation with multiple times.
@@ -283,8 +259,6 @@ class IRGraph(IRCell):
             self._nodes = self._nodes[:midx] + mirror_ops + self._nodes[midx+1:]
         self.reset_dependency()
         return ops
-
-    ## Primitives for policy expression ##
 
     def partition(self, op: IRCell, algo: GenericDistAlgo, config: Dict) -> Optional[List[IRCell]]:
         """
@@ -375,32 +349,31 @@ class IRGraph(IRCell):
     def identity(self, input_tensor, dst_op):
         raise NotImplementedError
 
+    ## Assign Policy Primitives ##
+
+    def assign(self, op: IRCell, rank: int):
+        if op not in self._nodes:
+            raise KeyError(f"{op} is not in the graph")
+        if not isinstance(rank, int):
+            raise TypeError("Expected rank to be int")
+        op.device = rank
+        if op.mirror is not None:
+            op.mirror.device = rank
+        return True
+
+    ## Schedule Policy Primitives ##
+
+    def set_order(self, seq: List[IRCell]):
+        raise NotImplementedError
+
+    def partial_set_order(self, seq: List[IRCell], lazy=False):
+        raise NotImplementedError
+    
+
     def __repr__(self):
         dscp = f"\n{self.name}:\n{'=' * len(self.name)}\n"
         # inputs
-        inputs = list()
-        for tensor in self.inputs():
-            if isinstance(tensor, IRTensor):
-                anno = 't'
-                if tensor.is_param():
-                    anno = 'w'
-                if tensor.is_grad():
-                    anno = 'g'
-                inputs.append(f'{anno}{tensor._id}')
-            else:
-                inputs.append(tensor)
-        outputs = list()
-        for tensor in self.outputs():
-            if isinstance(tensor, IRTensor):
-                anno = 't'
-                if tensor.is_param():
-                    anno = 'w'
-                if tensor.is_grad():
-                    anno = 'g'
-                outputs.append(f'{anno}{tensor._id}')
-            else:
-                outputs.append(tensor)
-        dscp += f"Inputs: {inputs}\n"
+        dscp += f"Inputs: {self.inputs()}\n"
         # nodes
         for node in self._nodes:
             succ_node_ids = [None] * len(node.outputs())
@@ -409,5 +382,5 @@ class IRGraph(IRCell):
                 succ_node_ids[out_idx] = node_list
             dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}\n"
         # outputs
-        dscp += f"\nOutputs: {outputs}\n{'=' * len(self.name)}\n"
+        dscp += f"\nOutputs: {self.outputs()}\n{'=' * len(self.name)}\n"
         return dscp

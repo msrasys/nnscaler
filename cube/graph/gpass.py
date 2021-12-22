@@ -3,7 +3,7 @@ import copy
 
 from cube.graph.graph import IRGraph
 from cube.graph.tensor import IRSubTensor, ValueMap
-from cube.graph.operator import IRBpOperation
+from cube.graph.operator import IRFwOperation, IRBpOperation
 
 from cube.ir.cten import IRCell, IRTensor
 
@@ -60,14 +60,13 @@ def forward(graph, *args) -> IRGraph:
         gener.set_map(input, arg)
 
     fnodes = list()
-    bnodes = list()
 
     # generate forward nodes
     for node in graph.nodes():
         inputs = node.inputs()
         outputs = node.outputs()
         # fnode = copy.copy(node)
-        fnode = node
+        fnode : IRFwOperation = node
         fnode._inputs = inputs
         fnode._outputs = outputs
         # set forward inputs
@@ -77,37 +76,10 @@ def forward(graph, *args) -> IRGraph:
         for idx, val in enumerate(outputs):
             fnode.set_output(idx, gener.renew(val))
         fnodes.append(fnode)
-        fnode.device = node.device
 
-    # generate backward nodes
-    for fnode in fnodes:
-        inputs = fnode.inputs()
-        outputs = fnode.outputs()
-        bnode = IRBpOperation(data_num=len(inputs), grad_num=len(outputs))
-        # set backward grad
-        for idx, val in enumerate(fnode.inputs()):
-            grad = None
-            if isinstance(val, IRSubTensor):
-                # TODO: requires_grad = False should be set to None
-                grad = val.get_grad(fnode)
-                val.grad = grad
-            # set input
-            bnode.set_data(idx, val)
-            # set gradient output
-            bnode.set_output(idx, grad)
-        for idx, val in enumerate(fnode.outputs()):
-            # set gradient input
-            grad = None
-            if isinstance(val, IRSubTensor):
-                # TODO: requires_grad = False should be set to None
-                grad = val.get_grad(fnode)
-                val.grad = grad
-            bnode.set_grad(idx, grad)
-        bnode.device = node.device
-
-        # mirror node for forward / backward
-        IRCell.make_pair(fnode, bnode)
-        bnodes.append(bnode)
+    # reverse is only to make op id looks consecutive
+    for fnode in graph.nodes()[::-1]:
+        fnode.gen_backward()
     
     inputs = [gener.renew(input) for input in graph.inputs()]
     outputs = [gener.renew(output) for output in graph.outputs()]

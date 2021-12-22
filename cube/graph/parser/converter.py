@@ -1,6 +1,7 @@
 from typing import Optional, List
 
 from cube.ir.cten import IRTensor
+from cube.graph.tensor import IRFullTensor
 from cube.graph.parser import ScriptModuleParser
 from cube.graph import IRGraph
 
@@ -20,5 +21,23 @@ def convert(model: torch.nn.Module,
     for input in inputs:
         if isinstance(input, IRTensor):
             input.requires_grad = False
+    # convert to SubTensor
+    for idx, tensor in enumerate(inputs):
+        if isinstance(tensor, IRFullTensor):
+            tensor = tensor.tosub()
+        inputs[idx] = tensor
+    for idx, tensor in enumerate(outputs):
+        if isinstance(tensor, IRFullTensor):
+            tensor = tensor.tosub()
+        outputs[idx] = tensor
+    for node in nodes:
+        for idx, tensor in enumerate(node.inputs()):
+            if isinstance(tensor, IRFullTensor):
+                tensor = tensor.tosub()
+                node.set_input(idx, tensor)
+        for idx, tensor in enumerate(node.outputs()):
+            if isinstance(tensor, IRFullTensor):
+                tensor = tensor.tosub()
+                node.set_output(idx, tensor)
     graph = IRGraph(nodes, inputs, outputs, module_name)
     return graph

@@ -33,7 +33,8 @@ class IRCell:
                  name: str,
                  signature: str,
                  input_length: int,
-                 output_length: int):
+                 output_length: int,
+                 init_outputs = True):
         """
         Create a node with name (variable name) and module type (module_name)
 
@@ -56,9 +57,11 @@ class IRCell:
         self._inputs: List[Any] = [None] * input_length
         
         # destination tensors
-        self._outputs: List[IRTensor] = [IRTensor() for _ in range(output_length)]
-        for tensor in self._outputs:
-            tensor.attach_cell(self)
+        self._outputs: List[IRTensor] = [None] * output_length
+        if init_outputs:
+            self._outputs: List[IRTensor] = [IRTensor() for _ in range(output_length)]
+            for tensor in self._outputs:
+                tensor.attach_cell(self)
 
         # destination cells
         #   -- will only be set when initializing to a graph
@@ -393,7 +396,7 @@ class IRTensor:
         self.name = name if name else 'tensor'
 
         # device
-        self._cell: List[IRCell] = list() 
+        self._cell: Optional[IRCell] = None
 
         self._dtype: IRDType = dtype
 
@@ -433,19 +436,23 @@ class IRTensor:
         """
         if not isinstance(cell, IRCell):
             raise TypeError("Expected an IRCell")
-        if cell not in self._cell:
-            self._cell.append(cell)
+        self._cell = cell
 
-    def detach_cell(self, cell: IRCell):
+    def detach_cell(self):
         """
-        Detach from a cell, when removing from cell's input
-        and output
+        Detach from a cell
         """
-        if not isinstance(cell, IRCell):
-            raise TypeError("Expected an IRCell")
-        if cell not in self._cell:
-            raise RuntimeError("the target cell not in the attached list")
-        self._cell.remove(cell)
+        self._cell = None
+
+    @property
+    def device(self) -> List[int]:
+        return self._cell.device
+
+    @device.setter
+    def device(self, val: Union[int, List[int]]):
+        raise RuntimeError(
+            "tensor placement is not allowed to set manually"
+        )
 
     @property
     def requires_grad(self):
@@ -542,19 +549,6 @@ class IRTensor:
            not all([isinstance(size, int) for size in val]):
             raise RuntimeError("Expected shape to be list[int]")
         self._shape = copy.copy(list(val))
-
-    @property
-    def device(self) -> List[int]:
-        device = set()
-        for cell in self._cell:
-            device.update(set(cell.device))
-        return list(device)
-
-    @device.setter
-    def device(self, device_id: Union[int, List[int]]):
-        raise RuntimeError(
-            "tensor placement is not allowed to set manually"
-        )
 
     def src(self, cells: List[IRCell]) -> List[IRCell]:
         """

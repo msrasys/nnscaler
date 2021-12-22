@@ -573,7 +573,7 @@ class IRSubTensor(IRTensor):
         for key in self.__dict__:
             setattr(tensor, key, getattr(self, key))
         # clear attached cells
-        tensor._cell = list()
+        tensor._cell = None
         return tensor
 
     def get_grad(self, fcell: IRCell):
@@ -582,7 +582,7 @@ class IRSubTensor(IRTensor):
         forward cell
         """
         if not self.requires_grad:
-            raise RuntimeError("require a gradient for a non-grad tensor")
+            return None
         full_grad = self.parent.grad
         if full_grad is None:
             return None
@@ -687,5 +687,14 @@ class IRSubTensor(IRTensor):
         return None
 
     def __repr__(self):
-        dscp = f'SubTensor(id={self._id}, shape={self.shape}, device={self.device}, ind={self.indmap}, val={self.valmap})'
+        anno = 't'
+        if self.is_param():
+            anno = 'w'
+        if self.is_grad():
+            anno = 'g'
+        dscp = f'{anno}{self._id}(p{self.parent._id},{self.shape},{self.valmap})'
+        return dscp
+
+    def extra_repr(self):
+        dscp = f'Tensor(id={self._id}, shape={self.shape}, device={self.device}, ind={self.indmap}, val={self.valmap})'
         return dscp

@@ -1,7 +1,7 @@
 from typing import Any, Optional, Union, List
 import copy
 
-from cube.ir.cten import IRTensor, IRCell
+from cube.ir.cten import IRCell
 from cube.graph.tensor import IRFullTensor, IRSubTensor
 from cube.algorithm.factory import DistAlgorithmFactory
 
@@ -27,7 +27,7 @@ class IRFwOperation(IRCell):
         """
         # additional argument
         self.kwargs = dict()
-        super().__init__(name, signature, input_length, output_length)
+        super().__init__(name, signature, input_length, output_length, init_outputs=False)
         outputs = [IRFullTensor() for _ in range(output_length)]
         for idx, output in enumerate(outputs):
             self.set_output(idx, output)
@@ -92,46 +92,29 @@ class IRFwOperation(IRCell):
         cpy.clear_successor()
         return cpy
 
-    def __repr__(self):
-        inputs = list()
-        for tensor in self.inputs():
-            if isinstance(tensor, IRTensor):
-                anno = 't'
-                if tensor.is_param():
-                    anno = 'w'
-                if tensor.is_grad():
-                    anno = 'g'
-                if isinstance(tensor, IRFullTensor):
-                    pid = tensor._id
-                    valmap = (0,1)
-                else:
-                    pid = tensor.parent._id
-                    valmap = tensor.valmap
-                inputs.append(f'{anno}{tensor._id}(p{pid},{tensor.shape},{valmap})')
-            else:
-                inputs.append(tensor)
-        
-        outputs = list()
-        for tensor in self.outputs():
-            if isinstance(tensor, IRTensor):
-                anno = 't'
-                if tensor.is_param():
-                    anno = 'w'
-                if tensor.is_grad():
-                    anno = 'g'
-                if isinstance(tensor, IRFullTensor):
-                    pid = tensor._id
-                    valmap = (0,1)
-                else:
-                    pid = tensor.parent._id
-                    valmap = tensor.valmap
-                pid = tensor.parent._id if hasattr(tensor, 'parent') else tensor._id
-                outputs.append(f'{anno}{tensor._id}(p{pid},{tensor.shape},{valmap})')
-            else:
-                outputs.append(tensor)
+    def gen_backward(self):
+        if self.mirror is not None:
+            raise RuntimeError(
+                "Backward Op already generated. Use self.mirror.update() instead.")
+        bnode = IRBpOperation(
+            data_num=len(self.inputs()),
+            grad_num=len(self.outputs())
+        )
+        for idx, input in enumerate(self.inputs()):
+            grad = None
+            if isinstance(input, IRSubTensor):
+                grad = input.get_grad(self)
+            bnode.set_data(idx, input)
+            bnode.set_output(idx, grad)
+        for idx, output in enumerate(self.outputs()):
+            grad = output.get_grad(self)
+            bnode.set_grad(idx, grad)
+        IRCell.make_pair(self, bnode)
+        return bnode
 
+    def __repr__(self):
         sign = self.signature.split('.')[-1]
-        dscp = f'Op{self._id}(sign={sign}, inputs={inputs}, outputs={outputs})'
+        dscp = f'FwOp{self._id}-{self.device}(sign={sign}, inputs={self.inputs()}, outputs={self.outputs()})'
         return dscp
 
 
@@ -144,7 +127,8 @@ class IRBpOperation(IRCell):
         super().__init__(
             name, signature,
             input_length=data_num + grad_num,
-            output_length=data_num
+            output_length=data_num,
+            init_outputs=False
         )
 
     def replicate(self):
@@ -197,7 +181,9 @@ class IRBpOperation(IRCell):
 
     def set_grad(self, input_index: int, val: Any):
         """
-        Set the node gradient at input index
+        Set the node gradient at input index.
+        The grad is same order with corresponding output tensor
+        of it's forward tensor
 
         Args:
             input_idx: input index
@@ -212,48 +198,25 @@ class IRBpOperation(IRCell):
             )
         return self.set_input(input_index + self.data_num, val)
 
+    def update(self):
+        """
+        Update this backward operator.
+        This neccessary when op is partitioned and reference count is changed.
+        """
+        fnode = self.mirror
+        for idx, input in enumerate(fnode.inputs()):
+            grad = None
+            if isinstance(input, IRSubTensor):
+                grad = input.get_grad(self)
+            self.set_data(idx, input)
+            self.set_output(idx, grad)
+        for idx, output in enumerate(self.outputs()):
+            grad = output.get_grad(self)
+            self.set_grad(idx, grad)
+
     def __repr__(self):
-        datas = list()
-        for tensor in self.datas():
-            if isinstance(tensor, IRTensor):
-                anno = 't'
-                if tensor.is_param():
-                    anno = 'w'
-                if tensor.is_grad():
-                    anno = 'g'
-                # datas.append(f'{anno}{tensor._id}')
-                datas.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.valmap})')
-            else:
-                datas.append(tensor)
-
-        grads = list()
-        for tensor in self.grads():
-            if isinstance(tensor, IRTensor):
-                anno = 't'
-                if tensor.is_param():
-                    anno = 'w'
-                if tensor.is_grad():
-                    anno = 'g'
-                # grads.append(f'{anno}{tensor._id}')
-                grads.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.valmap})')
-            else:
-                grads.append(tensor)
-        
-        outputs = list()
-        for tensor in self.outputs():
-            if isinstance(tensor, IRTensor):
-                anno = 't'
-                if tensor.is_param():
-                    anno = 'w'
-                if tensor.is_grad():
-                    anno = 'g'
-                # outputs.append(f'{anno}{tensor._id}')
-                outputs.append(f'{anno}{tensor._id}(p{tensor.parent._id},{tensor.shape},{tensor.valmap})')
-            else:
-                outputs.append(tensor)
-
         sign = self.signature.split('.')[-1]
-        dscp = f'bOp{self._id}(sign={sign}, grads={grads}, datas={datas}, outputs={outputs})'
+        dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, grads={self.grads()}, datas={self.datas()}, outputs={self.outputs()})'
         return dscp
 
 
@@ -314,11 +277,7 @@ class IRDataOperation(IRCell):
             return template(self)
     
     def __repr__(self):
-        outputs = list()
-        for t in self.outputs():
-            name = f't{t._id}(p{t.parent._id},{t.shape},{t.valmap})'
-            outputs.append(name)
-        dscp = f'DataLoader-{self._id}(outputs={outputs})'
+        dscp = f'DataLoader-{self._id}(outputs={self.outputs()})'
         return dscp
 
 
