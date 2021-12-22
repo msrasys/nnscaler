@@ -85,15 +85,8 @@ class IRGraph(IRCell):
         # set parameter
         for node in self._nodes:
             for input in node.inputs():
-                if isinstance(input, IRTensor):
-                    if input.is_param():
-                        # parameters already set
-                        self._parameters.append(input)
-                        continue
-                    if input not in input_tensors and \
-                       input.is_leaf(self._nodes):
-                        input.as_param()
-                        self._parameters.append(input)
+                if isinstance(input, IRTensor) and input.is_param():
+                    self._parameters.append(input)
         self.reset_dependency()
 
     def reset_dependency(self):

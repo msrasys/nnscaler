@@ -18,9 +18,10 @@ from typing import List, Union, Optional, Any
 import copy
 
 from cube.ir.unique import IDGenerator
+from cube.ir.dtype import IRDType
 
 
-__all__ = ['IRCell', 'IRTensor']
+__all__ = ['IRCell', 'IRDType', 'IRTensor']
 
 
 class IRCell:
@@ -48,6 +49,7 @@ class IRCell:
         self.name: str = name
         self.signature = signature
 
+        self._dtype = IRDType.unknown
         self._device = list()
 
         # source tensors
@@ -228,6 +230,12 @@ class IRCell:
             val = copy.copy(val)
             # set tensor dst
             val.attach_cell(self)
+            # set input value dtype
+            if self._dtype != IRDType.unknown:
+                val.dtype = self._dtype
+            # set cell dtype
+            elif val.dtype != IRDType.unknown:
+                self._dtype = val.dtype
         self._inputs[input_index] = val
         return val
 
@@ -246,6 +254,12 @@ class IRCell:
         if isinstance(val, IRTensor):
             val = copy.copy(val)
             val.attach_cell(self)
+            # set output value dtype
+            if self._dtype != IRDType.unknown:
+                val.dtype = self._dtype
+            # set cell dtype
+            elif val.dtype != IRDType.unknown:
+                self._dtype = val.dtype
         self._outputs[output_index] = val
         return val
 
@@ -372,7 +386,7 @@ class IRTensor:
 
     _attr = ['name', '_is_param', '_requires_grad', '_is_grad', '_grad', '_dtype']
 
-    def __init__(self, shape=None, name=None, dtype=float):
+    def __init__(self, shape=None, name=None, dtype=IRDType.unknown):
 
         self._id: int = IDGenerator().gen_tensor_id()
         self._shape: Optional(List[int]) = shape
@@ -381,8 +395,7 @@ class IRTensor:
         # device
         self._cell: List[IRCell] = list() 
 
-        # TODO: support float16
-        self._dtype = dtype
+        self._dtype: IRDType = dtype
 
         self._is_param = False
         self._is_grad = False
@@ -406,10 +419,12 @@ class IRTensor:
         return self._dtype
 
     @dtype.setter
-    def dtype(self, val):
+    def dtype(self, val: IRDType):
         """
         Set data type
         """
+        if not isinstance(val, IRDType):
+            raise TypeError("Expected IRDType")
         self._dtype = val
 
     def attach_cell(self, cell: IRCell):

@@ -2,10 +2,13 @@
 Mapping of
     Signature -> IROperator
 """
+import torch
+
 from functools import partial
 
 import cube.graph.operator.function as function
 from cube.graph.operator.operator import IRFwOperation
+import cube.ir as ir
 
 
 class Sign2Op:
@@ -73,3 +76,28 @@ class Sign2Op:
 
     }
 
+
+class DType2IRDType:
+
+    @staticmethod
+    def map(dtype: torch.dtype):
+        """
+        Map the torch dtype to IRDType
+        """
+        return DType2IRDType.kDtypeMap[dtype]
+
+    kDtypeMap = {
+        torch.float32: ir.float32,
+        torch.float  : ir.float32,
+        torch.float16: ir.float16,
+        torch.half   : ir.float16,
+        torch.uint8  : ir.uint8,
+        torch.int8   : ir.int8,
+        torch.int16  : ir.int16,
+        torch.short  : ir.int16,
+        torch.int32  : ir.int32,
+        torch.int    : ir.int32,
+        torch.int64  : ir.int64,
+        torch.long   : ir.int64,
+        torch.bool   : ir.boolean
+    }

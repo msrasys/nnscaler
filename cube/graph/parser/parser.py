@@ -6,7 +6,7 @@ from typing import List, Tuple, Optional, Union
 from cube.graph import IRFwOperation
 from cube.graph.tensor import IRFullTensor
 from cube.graph.parser.frame import Frame
-from cube.graph.parser.mapping import Sign2Op
+from cube.graph.parser.mapping import Sign2Op, DType2IRDType
 
 
 _refmodule = torch.nn.Module()
@@ -40,7 +40,7 @@ class ScriptModuleParser:
         # handle graph input -- Assuming all the inputs are tensors
         input_var_name = [input.debugName() for input in module.graph.inputs()]
         for index, var_name in enumerate(input_var_name[1:]): # omit self
-            frame.add_var(var_name, IRFullTensor(name=var_name), graph_arg=index)
+            frame.add_var(var_name, IRFullTensor(name=var_name, requires_grad=False), graph_arg=index)
         input_val = [frame.get_var(var_name) for var_name in input_var_name[1:]]
 
         # handle input shape
@@ -279,8 +279,15 @@ class ScriptModuleParser:
 
         # this usually means weight (nn.Parameter in torch)
         if dtype == 'Tensor':
-            shape = list(getattr(module, label).shape)
-            ir_tensor = IRFullTensor(name=label, shape=shape)
+            tensor = getattr(module, label)
+            shape = list(tensor.shape)
+            ir_tensor = IRFullTensor(
+                name=label, shape=shape,
+                requires_grad=tensor.requires_grad,
+                dtype=DType2IRDType.map(tensor.dtype)
+            )
+            if isinstance(tensor, torch.nn.Parameter):
+                ir_tensor.as_param()
             frame.add_var(var_name, ir_tensor)
         # symbolic attributes
         elif dtype in ['bool', 'int', 'float']:

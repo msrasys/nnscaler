@@ -3,6 +3,7 @@ from torch import nn
 
 import cube.graph.parser as parser
 from cube.ir.cten import IRTensor
+import cube.ir as ir
 
 
 class FeedForward(nn.Module):
@@ -57,6 +58,13 @@ def test_parse_module():
     assert node3.successors() == [node4]
     assert node4.successors() == [node5]
     assert node5.successors() == [node6]
+
+    # dtype
+    for node in graph.nodes():
+        assert node._dtype == ir.float32
+        for val in node.inputs() + node.outputs():
+            if isinstance(val, IRTensor):
+                val.dtype == ir.float32
 
     assert graph.outputs(0).shape == [1024, 1000]
     assert False

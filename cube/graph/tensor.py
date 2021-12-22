@@ -24,6 +24,7 @@ import copy
 import math
 
 from cube.ir.cten import IRCell, IRTensor
+import cube.ir as ir
 
 
 __all__ = ['IndexMap', 'ValueMap', 'IRFullTensor', 'IRSubTensor']
@@ -301,7 +302,7 @@ def _to_value_map(valmap: Union[Tuple, ValueMap, None]):
 
 class IRFullTensor(IRTensor):
 
-    def __init__(self, shape=None, name=None, requires_grad=True, dtype=float):
+    def __init__(self, shape=None, name=None, requires_grad=True, dtype=ir.float32):
 
         super().__init__(shape, name, dtype)
 
@@ -399,14 +400,14 @@ class IRFullTensor(IRTensor):
         self.requires_grad = True
         self._is_param = True
         self._is_grad = False
-        for sub_tensor in self.ptensors + self.ctensors:
-            sub_tensor.as_param()
+        # for sub_tensor in self.ptensors + self.ctensors:
+        #     sub_tensor.as_param()
 
     def as_grad(self):
         self._is_param = False
         self._is_grad = True
-        for sub_tensor in self.ptensors + self.ctensors:
-            sub_tensor.as_grad()
+        # for sub_tensor in self.ptensors + self.ctensors:
+        #     sub_tensor.as_grad()
         return self
 
     def like(self):
@@ -575,24 +576,6 @@ class IRSubTensor(IRTensor):
         tensor._cell = list()
         return tensor
 
-    def as_param(self):
-        """
-        Set the tensor as trainable parameter
-        """
-        if not self.parent.is_param():
-            self.parent.as_param()
-        self.requires_grad = True
-        self._is_param = True
-        self._is_grad = False
-        return self
-
-    def as_grad(self):
-        if not self.parent.is_grad():
-            self.parent.as_grad()
-        self._is_grad = True
-        self._is_param = False
-        return self
-
     def get_grad(self, fcell: IRCell):
         """
         Get gradient of this tensor which is associated by a
@@ -619,14 +602,14 @@ class IRSubTensor(IRTensor):
                 valmap = (idx, ref_times),
                 shape = self.shape
             )
-            return grad.as_grad()
+            return grad
         elif self in fcell.outputs():
             grad = full_grad.select(
                 indmap = self.indmap,
                 valmap = (0, 1),
                 shape = self.shape
             )
-            return grad.as_grad()
+            return grad
         else:
             raise RuntimeError(f"{self} not found in cell {fcell}")
 
