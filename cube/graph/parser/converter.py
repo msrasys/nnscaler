@@ -4,10 +4,11 @@ from cube.ir.cten import IRTensor
 from cube.graph.tensor import IRFullTensor
 from cube.graph.parser import ScriptModuleParser
 from cube.graph import IRGraph
+from cube.logics.dataloader import IRDataLoader
 
 import torch
 
-def convert(model: torch.nn.Module,
+def convert_model(model: torch.nn.Module,
             input_shapes: Optional[ List[List[int],] ] = None) -> IRGraph:
     """
     Convert toch.nn.Module based model into IRGraph
@@ -41,3 +42,12 @@ def convert(model: torch.nn.Module,
                 node.set_output(idx, tensor)
     graph = IRGraph(nodes, inputs, outputs, module_name)
     return graph
+
+
+def convert_dataloader(dataloader) -> IRDataLoader:
+    """
+    convert pytorch dataloader into IRDataLoader
+    """
+    from cube.graph.parser.mapping import DType2IRDType
+    dataloader = IRDataLoader(dataloader, dtype_map=DType2IRDType)
+    return dataloader

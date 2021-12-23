@@ -427,7 +427,7 @@ class IRTensor:
         Set data type
         """
         if not isinstance(val, IRDType):
-            raise TypeError("Expected IRDType")
+            raise TypeError(f"Expected IRDType but got {val}")
         self._dtype = val
 
     def attach_cell(self, cell: IRCell):
@@ -584,7 +584,7 @@ class IRTensor:
         """
         Autograd backward on the tensor
         """
-        from cube.schedule.translator import LogicTranslator
+        from cube.logics.translator import LogicTranslator
         return LogicTranslator.backward(self)
 
     def __repr__(self):

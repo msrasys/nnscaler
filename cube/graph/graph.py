@@ -174,7 +174,7 @@ class IRGraph(IRCell):
         Returns:
             IRTensors
         """
-        from cube.schedule.translator import LogicTranslator
+        from cube.logics.translator import LogicTranslator
         return LogicTranslator.forward(self, *args)
 
     def __call__(self, *args):
@@ -357,6 +357,7 @@ class IRGraph(IRCell):
         if not isinstance(rank, int):
             raise TypeError("Expected rank to be int")
         op.device = rank
+        # pytorch requirement
         if op.mirror is not None:
             op.mirror.device = rank
         return True

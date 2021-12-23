@@ -1,7 +1,7 @@
-from cube import schedule
+from cube import logics
 from cube import runtime
 
-from cube.compiler import SemanticModel, compile
+# from cube.compiler import SemanticModel, compile
 
 
 def init():

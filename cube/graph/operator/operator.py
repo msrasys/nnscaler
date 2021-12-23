@@ -207,7 +207,7 @@ class IRBpOperation(IRCell):
         for idx, input in enumerate(fnode.inputs()):
             grad = None
             if isinstance(input, IRSubTensor):
-                grad = input.get_grad(self)
+                grad = input.get_grad(fnode)
             self.set_data(idx, input)
             self.set_output(idx, grad)
         for idx, output in enumerate(self.outputs()):

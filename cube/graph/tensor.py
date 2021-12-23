@@ -602,6 +602,7 @@ class IRSubTensor(IRTensor):
                 valmap = (idx, ref_times),
                 shape = self.shape
             )
+            self.grad = grad
             return grad
         elif self in fcell.outputs():
             grad = full_grad.select(
@@ -609,6 +610,7 @@ class IRSubTensor(IRTensor):
                 valmap = (0, 1),
                 shape = self.shape
             )
+            self.grad = grad
             return grad
         else:
             raise RuntimeError(f"{self} not found in cell {fcell}")
