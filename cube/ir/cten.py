@@ -307,6 +307,15 @@ class IRCell:
             list() for _ in range(len(self.outputs()))
         ]
 
+    def make_empty(self):
+        """
+        Clear all inputs, outputs of this Cell
+        """
+        for idx in range(len(self.inputs())):
+            self.set_input(idx, None)
+        for idx in range(len(self.outputs())):
+            self.set_output(idx, None)
+
     @staticmethod
     def get_inputs(cells):
         """
