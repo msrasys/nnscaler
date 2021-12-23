@@ -19,7 +19,7 @@ class SelectPrim:
         self.device = tensor.device
 
     def __repr__(self):
-        dscp = f't{self.output._id} = select(t{self.tensor._id}, {self.indmap}, {self.valmap}, {self.shape})'
+        dscp = f'{self.output} = select({self.tensor})'
         return dscp
 
 
@@ -32,6 +32,10 @@ class MovePrim:
         self.shape = tensor.shape
         self.dtype = tensor.dtype
         self.device = tensor.device
+
+    def __repr__(self):
+        dscp = f'move({self.tensor}, from={self.from_rank}, to={self.to_rank})'
+        return dscp
 
 
 class MergePrim:
@@ -133,9 +137,7 @@ class MergePrim:
         return mtensor
 
     def __repr__(self):
-        tensors = [f't{t._id}' for t in self.tensors]
-        tensors = '[' + ', '.join(tensors) + ']'
-        dscp = f't{self.output._id} = merge({tensors}, axis={self.concat}, add={self.add})'
+        dscp = f'{self.output} = merge({self.tensors}, axis={self.concat}, add={self.add})'
         return dscp
 
 
@@ -199,8 +201,15 @@ class IRAdapter(IRCell):
         for itensor in otensor.parent.ptensors:
             if not itensor.overlap(otensor):
                 continue
+
+            # intersection
             common = otensor.common(itensor)
             common.attach_cell(itensor._cell)
+            self._intersections.append(common)
+            self._select_ptensors.append(itensor)
+            if common == itensor:
+                continue
+
             islicers = itensor.indmap.get()
             oslicers = common.indmap.get()
             # index map
@@ -228,8 +237,6 @@ class IRAdapter(IRCell):
                 )
             prim = SelectPrim(itensor, indmap, valmap, common.shape, common)
             self._select_trace.append(prim)
-            self._intersections.append(common)
-            self._select_ptensors.append(itensor)
 
     def _gen_move(self):
         odevice = self.dst_tensor.device
@@ -293,3 +300,12 @@ class IRAdapter(IRCell):
         dscp = f'Adapter{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
         return dscp
     
+    def extra_repr(self):
+        """
+        Detailed information
+        """
+        dscp = repr(self) + ':\n'
+        # select
+        for prim in self._select_trace + self._move_trace + self._merge_trace:
+            dscp += '\t' + repr(prim) + '\n'
+        return dscp

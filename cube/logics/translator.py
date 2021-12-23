@@ -66,9 +66,9 @@ class LogicTranslator:
         trace = SchedulePool().get_tape(loss)
         if trace is None:
             raise RuntimeError("No forward detected")
-        # make grad to 1.0
         if not loss.shape == [1]:
             raise RuntimeError("backward can only perform on the scaler tensor")
+        # grad should be None or 1.0
         loss.parent.requires_grad = False
         for node in trace:
             for output in node.outputs():
