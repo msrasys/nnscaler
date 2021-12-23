@@ -61,22 +61,26 @@ class IRFwOperation(IRCell):
             return template(self)
 
     def set_input(self, input_index: int, val: Any):
+        # remove the consumer
         old_val = self.inputs(input_index)
-        # remove the old one
         if isinstance(old_val, IRSubTensor):
             old_val.parent.rm_consumer(self)
+        # add the consumer
+        val = super().set_input(input_index, val)
         if isinstance(val, IRSubTensor):
             val.parent.add_consumer(self, val)
-        return super().set_input(input_index, val)
+        return val
 
     def set_output(self, output_index: int, val: Any):
+        # remove the producer
         old_val = self.outputs(output_index)
-        # remove the old one
         if isinstance(old_val, IRSubTensor):
             old_val.parent.rm_producer(self)
+        # add the producer
+        val = super().set_output(output_index, val)
         if isinstance(val, IRSubTensor):
             val.parent.add_producer(self, val)
-        return super().set_output(output_index, val)
+        return val
 
     def replicate(self):
         """
@@ -210,12 +214,11 @@ class IRBpOperation(IRCell):
                 grad = input.get_grad(fnode)
             self.set_data(idx, input)
             self.set_output(idx, grad)
-        for idx, output in enumerate(self.outputs()):
-            grad = output.get_grad(self)
+        for idx, output in enumerate(fnode.outputs()):
+            grad = output.get_grad(fnode)
             self.set_grad(idx, grad)
 
     def __repr__(self):
-        sign = self.signature.split('.')[-1]
         dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, grads={self.grads()}, datas={self.datas()}, outputs={self.outputs()})'
         return dscp
 
@@ -254,6 +257,17 @@ class IRDataOperation(IRCell):
         """
         return True
 
+    def set_output(self, output_index: int, val: Any):
+        # remove the producer
+        old_val = self.outputs(output_index)
+        if isinstance(old_val, IRSubTensor):
+            old_val.parent.rm_producer(self)
+        # add the producer
+        val = super().set_output(output_index, val)
+        if isinstance(val, IRSubTensor):
+            val.parent.add_producer(self, val)
+        return val
+
     def algorithms(self, tag: Optional[str] = None):
         """
         get algorithm from algorithm factory
@@ -277,7 +291,7 @@ class IRDataOperation(IRCell):
             return template(self)
     
     def __repr__(self):
-        dscp = f'DataLoader-{self._id}(outputs={self.outputs()})'
+        dscp = f'DataLoader{self._id}-{self.device}(outputs={self.outputs()})'
         return dscp
 
 

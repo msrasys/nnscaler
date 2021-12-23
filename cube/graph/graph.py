@@ -10,8 +10,9 @@ IRGraph:
 from typing import Union, Tuple, List, Optional, Dict
 import copy
 
-from cube.graph.operator.operator import IRBpOperation
+from numpy import isin
 
+from cube.graph.operator.operator import IRBpOperation, IRFwOperation
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.tensor import IRSubTensor
 
@@ -294,46 +295,26 @@ class IRGraph(IRCell):
                         raise NotImplementedError(
                             f"Not support feature-map {input} to be splitted in value as input"
                         )
+
         # remove reference
-        for idx in range(len(op.inputs())):
-            op.set_input(idx, None)
-        # set backward mirror node
-        if op.mirror is not None:
-            # go through related op to reset the related gradient
-            for fnode in fnodes:
-                for val in fnode.inputs():
-                    if not isinstance(val, IRSubTensor):
-                        continue
-                    # TODO: requires_grad = False should be set to None
-                    val.grad = val.get_grad(fnode)
-                    for related_op in val.parent.consumers:
-                        for idx, rval in enumerate(related_op.inputs()):
-                            if val.overlap(rval):
-                                rval.grad = rval.get_grad(related_op)
-                                if related_op.mirror is not None:
-                                    related_op.mirror.set_output(idx, rval.grad)
-            # generate mirror node
-            for fnode in fnodes:
-                bnode = IRBpOperation(
-                    data_num=len(fnode.inputs()),
-                    grad_num=len(fnode.outputs())
-                )
-                for idx, val in enumerate(fnode.inputs()):
-                    grad = None
-                    if isinstance(val, IRSubTensor):
-                        grad = val.grad
-                    bnode.set_data(idx, val)
-                    bnode.set_output(idx, grad)
-                for idx, val in enumerate(fnode.outputs()):
-                    grad = None
-                    if isinstance(val, IRSubTensor):
-                        # TODO: requires_grad = False should be set to None
-                        grad = val.get_grad(fnode)
-                        val.grad = grad
-                    bnode.set_grad(idx, grad)
-                IRCell.make_pair(fnode, bnode)
-                fnode.device = op.device
-                bnode.device = op.mirror.device
+        finputs = op.inputs()
+        op.make_empty()
+
+        # generate backward
+        updated = set()
+        for input in finputs:
+            if not isinstance(input, IRSubTensor):
+                continue
+            # go through related consumers and update backward op
+            for fnode in input.parent.consumers:
+                if isinstance(fnode, IRFwOperation) and fnode._id not in updated:
+                    if fnode.mirror is not None:
+                        fnode.mirror.update()
+                    else:
+                        fnode.gen_backward()
+                    updated.add(fnode._id)
+
+        # insert nodes
         idx = self._nodes.index(op)
         self._nodes = self._nodes[:idx] + fnodes + self._nodes[idx+1:]
         if op.mirror is not None:
@@ -377,6 +358,8 @@ class IRGraph(IRCell):
         dscp += f"Inputs: {self.inputs()}\n"
         # nodes
         for node in self._nodes:
+            # if isinstance(node, IRBpOperation):
+            #     continue
             succ_node_ids = [None] * len(node.outputs())
             for out_idx in range(len(node.outputs())):
                 node_list = [snode._id for snode in node.successors(out_idx)]

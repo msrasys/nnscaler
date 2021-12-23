@@ -9,16 +9,14 @@ from cube.ir.cten import IRCell
 
 class SelectPrim:
 
-    def __init__(self, tensor: IRSubTensor, indmap: IndexMap, valmap: ValueMap, shape: List[int]):
+    def __init__(self, tensor: IRSubTensor, indmap: IndexMap, valmap: ValueMap,
+                 shape: List[int], output: IRSubTensor):
         self.tensor = tensor
         self.indmap = indmap
         self.valmap = valmap
         self.shape = shape
-        self.output = None
-        self.device = tensor.device
-    
-    def set_output(self, output: IRSubTensor):
         self.output = output
+        self.device = tensor.device
 
     def __repr__(self):
         dscp = f't{self.output._id} = select(t{self.tensor._id}, {self.indmap}, {self.valmap}, {self.shape})'
@@ -37,16 +35,15 @@ class MovePrim:
 
 
 class MergePrim:
-    def __init__(self,
-                 tensors: List[IRSubTensor],
-                 concat: Optional[int] = None,
-                 add: bool = False):
+    def __init__(self, tensors: List[IRSubTensor],
+                 output: IRSubTensor, device: List[int],
+                 concat: Optional[int] = None, add: bool = False):
         if not ((concat is not None) ^ (add is True)):  # xor condition
             raise RuntimeError("Expected concat or add")
         self.tensors = tensors
         self.concat = concat
         self.add = add
-        self.output = None
+        self.output = output
         # re-order tensor
         if isinstance(concat, int):
             slicers = [tensor.indmap.get()[concat] for tensor in tensors]
@@ -54,10 +51,9 @@ class MergePrim:
             sorted_idx = np.argsort(starts)
             tensors = np.array(tensors)[sorted_idx]
             self.tensors = tensors.tolist()
-        self.device = None
+        self.device = device
 
     def set_output(self, output: IRSubTensor):
-        self.device = output.device
         self.output = output
 
     @staticmethod
@@ -153,6 +149,7 @@ class IRAdapter(IRCell):
         * Merge: merge the produced tensors
     """
     def __init__(self, dst_tensor: IRSubTensor):
+        print(f'generating adapter for: {dst_tensor}')
         if not isinstance(dst_tensor, IRSubTensor):
             raise RuntimeError("Expected IRSubTensor")
         self.dst_tensor = dst_tensor
@@ -160,6 +157,7 @@ class IRAdapter(IRCell):
 
         # ====== select ======
         self._select_trace = list()
+        self._select_ptensors = list()
 
         # ====== move =======
         self._move_trace = list()
@@ -171,9 +169,20 @@ class IRAdapter(IRCell):
         self._gen_move()
         self._gen_merge()
 
+        super().__init__(
+            name='adapter', signature='adapter',
+            input_length=len(self._intersections), output_length=1,
+            init_outputs=False
+        )
+        for idx, ptensor in enumerate(self._select_ptensors):
+            self.set_input(idx, ptensor)
+        self.set_output(0, dst_tensor)
+
     def _gen_select(self):
         otensor = self.dst_tensor
         odevice = otensor.device
+
+        print(f'select: produced tensors: {otensor.parent.ptensors}')
 
         local, remote = list(), list()
         for ptensor in otensor.parent.ptensors:
@@ -184,6 +193,7 @@ class IRAdapter(IRCell):
         # check local tensor
         if otensor in local:
             self._intersections.append(otensor)
+            self._select_ptensors.append(ptensor)
             return
         # FIXME: multi producer may result overlapped region
         for itensor in otensor.parent.ptensors:
@@ -216,16 +226,16 @@ class IRAdapter(IRCell):
                 raise NotImplementedError(
                     f"Not supported value select: {input.valmap} -> {common.valmap}"
                 )
-            prim = SelectPrim(itensor, indmap, valmap, common.shape)
-            prim.set_output(common)
+            prim = SelectPrim(itensor, indmap, valmap, common.shape, common)
             self._select_trace.append(prim)
             self._intersections.append(common)
+            self._select_ptensors.append(itensor)
 
     def _gen_move(self):
         odevice = self.dst_tensor.device
         for tensor in self._intersections:
             if tensor.device != odevice:
-                prim = MovePrim(prim, from_rank=tensor.device, to_rank=odevice)
+                prim = MovePrim(tensor, from_rank=tensor.device, to_rank=odevice)
                 self._move_trace.append(prim)
 
     def _gen_merge(self):
@@ -244,18 +254,15 @@ class IRAdapter(IRCell):
                     # try concat
                     out = MergePrim.concat(tensor1, tensor2)
                     if out is not None:
-                        out_tensor, concat_dim = out
-                        out = out_tensor
-                        prim = MergePrim([tensor1, tensor2], concat_dim, False)
-                        prim.set_output(out_tensor)
+                        out, concat_dim = out
+                        prim = MergePrim([tensor1, tensor2], out, output.device, concat_dim, False)
                         self._merge_trace.append(prim)
                         merged = True
                         break
                     # try add
                     out = MergePrim.add(tensor1, tensor2)
                     if out is not None:
-                        prim = MergePrim([tensor1, tensor2], None, True)
-                        prim.set_output(out)
+                        prim = MergePrim([tensor1, tensor2], out, output.device, None, True)
                         self._merge_trace.append(prim)
                         merged = True
                         break
@@ -281,3 +288,8 @@ class IRAdapter(IRCell):
             return True
         else:
             return False
+
+    def __repr__(self):
+        dscp = f'Adapter{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
+        return dscp
+    
