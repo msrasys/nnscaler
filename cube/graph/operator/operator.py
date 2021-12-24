@@ -150,6 +150,9 @@ class IRBpOperation(IRCell):
         return cpy
 
     def datas(self, index: Optional[int] = None) -> Union[List[Any], Any]:
+        """
+        Forward inputs
+        """
         if index is None:
             return self.inputs()[:self.data_num]
         if index >= self.data_num:
@@ -159,6 +162,9 @@ class IRBpOperation(IRCell):
         return self.inputs(index)
 
     def grads(self, index: Optional[int] = None) -> Union[List[Any], Any]:
+        """
+        backward op input gradient (a.k.a. output gradient in forward)
+        """
         if index is None:
             return self.inputs()[self.data_num:]
         elif index >= self.grad_num:
@@ -185,7 +191,8 @@ class IRBpOperation(IRCell):
 
     def set_grad(self, input_index: int, val: Any):
         """
-        Set the node gradient at input index.
+        Set the node input gradient
+        (i.e., output gradient in forward) at input index.
         The grad is same order with corresponding output tensor
         of it's forward tensor
 
@@ -200,7 +207,30 @@ class IRBpOperation(IRCell):
             raise RuntimeError(
                 f"Set the grad out of range ({input_index} >= {self.grad_num})"
             )
-        return self.set_input(input_index + self.data_num, val)
+        input_index += self.data_num
+        # remove the consumer
+        old_val = self.inputs(input_index)
+        if isinstance(old_val, IRSubTensor):
+            old_val.parent.rm_consumer(self)
+        # add the consumer
+        val = super().set_input(input_index, val)
+        if isinstance(val, IRSubTensor):
+            val.parent.add_consumer(self, val)
+        return val
+
+    def set_output(self, output_index: int, val: Any):
+        """
+        Set op output grad (Forward input gradient)
+        """
+        # remove the producer
+        old_val = self.outputs(output_index)
+        if isinstance(old_val, IRSubTensor):
+            old_val.parent.rm_producer(self)
+        # add the producer
+        val = super().set_output(output_index, val)
+        if isinstance(val, IRSubTensor):
+            val.parent.add_producer(self, val)
+        return val
 
     def update(self):
         """

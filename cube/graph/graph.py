@@ -299,6 +299,8 @@ class IRGraph(IRCell):
         # remove reference
         finputs = op.inputs()
         op.make_empty()
+        if op.mirror is not None:
+            op.mirror.make_empty()
 
         # generate backward
         updated = set()
@@ -350,7 +352,6 @@ class IRGraph(IRCell):
 
     def partial_set_order(self, seq: List[IRCell], lazy=False):
         raise NotImplementedError
-    
 
     def __repr__(self):
         dscp = f"\n{self.name}:\n{'=' * len(self.name)}\n"

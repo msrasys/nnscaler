@@ -16,7 +16,7 @@ class SelectPrim:
         self.valmap = valmap
         self.shape = shape
         self.output = output
-        self.device = tensor.device
+        self.device: List[int] = tensor.device
 
     def __repr__(self):
         dscp = f'{self.output} = select({self.tensor})'
@@ -31,7 +31,7 @@ class MovePrim:
         self.to_rank = to_rank
         self.shape = tensor.shape
         self.dtype = tensor.dtype
-        self.device = tensor.device
+        self.device: List[int] = [from_rank, to_rank]
 
     def __repr__(self):
         dscp = f'move({self.tensor}, from={self.from_rank}, to={self.to_rank})'
@@ -55,7 +55,7 @@ class MergePrim:
             sorted_idx = np.argsort(starts)
             tensors = np.array(tensors)[sorted_idx]
             self.tensors = tensors.tolist()
-        self.device = device
+        self.device: List[int] = device
 
     def set_output(self, output: IRSubTensor):
         self.output = output
@@ -179,6 +179,12 @@ class IRAdapter(IRCell):
         for idx, ptensor in enumerate(self._select_ptensors):
             self.set_input(idx, ptensor)
         self.set_output(0, dst_tensor)
+        
+        # set up device
+        device = set()
+        for prim in self._select_trace + self._move_trace + self._merge_trace:
+            device.update(prim.device)
+        self.device = list(device)
 
     def _gen_select(self):
         otensor = self.dst_tensor
@@ -242,7 +248,11 @@ class IRAdapter(IRCell):
         odevice = self.dst_tensor.device
         for tensor in self._intersections:
             if tensor.device != odevice:
-                prim = MovePrim(tensor, from_rank=tensor.device, to_rank=odevice)
+                if len(tensor.device) != 1 or len(odevice) != 1:
+                    raise RuntimeError(
+                        f"Expected tensor on a single device but got {tensor.device} and {odevice}"
+                    )
+                prim = MovePrim(tensor, from_rank=tensor.device[0], to_rank=odevice[0])
                 self._move_trace.append(prim)
 
     def _gen_merge(self):
@@ -282,6 +292,34 @@ class IRAdapter(IRCell):
             if out is None:
                 raise RuntimeError("Merge Plan not found")
 
+    def prims(self, select=True, move=True, merge=True):
+        """
+        Return prim list
+        """
+        prims = list()
+        if select:
+            prims += self._select_trace
+        if move:
+            prims += self._move_trace
+        if merge:
+            prims += self._merge_trace
+        return prims
+
+    def dispatch(self, rank: int) -> List:
+        """
+        Get executed prim for a specific rank
+
+        Returns:
+            List[Prims]
+        """
+        if not isinstance(rank, int):
+            raise TypeError(f"Expected rank to be int but got {rank}")
+        prims = list()
+        for prim in self.prims():
+            if rank in prims.device:
+                prims.append(prim)
+        return prims
+
     def is_identity(self):
         """
         Check if the adapter does nothing
@@ -289,12 +327,7 @@ class IRAdapter(IRCell):
         Returns:
             Boolean
         """
-        if len(self._select_trace) == 0 and \
-           len(self._move_trace) == 0 and \
-           len(self._merge_trace) == 0:
-            return True
-        else:
-            return False
+        return len(self.prims()) == 0
 
     def __repr__(self):
         dscp = f'Adapter{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
