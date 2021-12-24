@@ -121,6 +121,15 @@ class IRFwOperation(IRCell):
         dscp = f'FwOp{self._id}-{self.device}(sign={sign}, inputs={self.inputs()}, outputs={self.outputs()})'
         return dscp
 
+    def module_repr(self) -> str:
+        """
+        Weight-hidden string representation
+        """
+        sign = self.signature.split('.')[-1]
+        ins = [t for t in self.inputs() if isinstance(t, IRSubTensor) and not t.is_param()]
+        dscp = f'FwOp{self._id}-{self.device}(sign={sign}, inputs={ins}, outputs={self.outputs()})'
+        return dscp
+
 
 class IRBpOperation(IRCell):
 
@@ -252,6 +261,16 @@ class IRBpOperation(IRCell):
         dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, grads={self.grads()}, datas={self.datas()}, outputs={self.outputs()})'
         return dscp
 
+    def module_repr(self) -> str:
+        """
+        Weight-hidden string representation
+        """
+        ins = [t for t in self.datas() if isinstance(t, IRSubTensor) and not t.is_param()]
+        outs = [t.grad for t in ins]
+        assert all([out in self.outputs() for out in outs])
+        dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, grads={self.grads()}, outputs={outs})'
+        return dscp
+
 
 class IRDataOperation(IRCell):
 
@@ -323,6 +342,9 @@ class IRDataOperation(IRCell):
     def __repr__(self):
         dscp = f'DataLoader{self._id}-{self.device}(outputs={self.outputs()})'
         return dscp
+
+    def module_repr(self) -> str:
+        return repr(self)
 
 
 class IROptimOperation(IRCell):

@@ -1,25 +1,27 @@
 from typing import List, Optional
 import copy
+from cube.graph.adapter.adapter import IRAdapter
+from cube.graph.operator.operator import IRBpOperation, IRFwOperation
 
-from cube.schedule.sugraph import SUGraph
-from cube.schedule.su import SUType, ScheduleUnit
+from cube.ir.cten import IRCell
+from cube.graph.graph import IRGraph
 
 
 class ExectuionPlan:
 
-    def __init__(self, sugraph: SUGraph):
-        if not isinstance(sugraph, SUGraph):
+    def __init__(self, graph: IRGraph):
+        if not isinstance(graph, IRGraph):
             raise TypeError("Expected a list of ScheduleUnit")
-        self.sugraph = sugraph
+        self.graph = graph
         self.device_seq = dict()
-        for su in sugraph.sus():
-            if len(su.device) == 0:
-                raise RuntimeError(f"device not set: SU {su}")
-            for device in su.device:
+        for node in graph.nodes():
+            if len(node.device) == 0:
+                raise RuntimeError(f"Node device not set: {node}")
+            for device in node.device:
                 if device not in self.device_seq:
-                    self.device_seq[device] = [su]
+                    self.device_seq[device] = [node]
                 else:
-                    self.device_seq[device].append(su)
+                    self.device_seq[device].append(node)
 
     def devices(self) -> List[int]:
         """
@@ -29,7 +31,7 @@ class ExectuionPlan:
         devices.sort()
         return devices
 
-    def sequence(self, device_id: int) -> List[ScheduleUnit]:
+    def sequence(self, device_id: int) -> List[IRCell]:
         """
         Get a copy of execution sequence for device id
 
@@ -39,7 +41,7 @@ class ExectuionPlan:
             return list()
         return copy.copy(self.device_seq[device_id])
 
-    def at(self, device_id: int) -> List[ScheduleUnit]:
+    def at(self, device_id: int) -> List[IRCell]:
         """
         Access the sequence for device id
 
@@ -49,12 +51,12 @@ class ExectuionPlan:
             return list()
         return self.device_seq[device_id]
 
-    def set(self, device_id: int, seq: List[ScheduleUnit]):
+    def set(self, device_id: int, seq: List[IRCell]):
         """
         Set device sequence
         """
-        if not all([isinstance(su, ScheduleUnit) for su in seq]):
-            raise TypeError("Expected a list of ScheduleUnit")
+        if not all([isinstance(su, IRCell) for su in seq]):
+            raise TypeError("Expected a list of Cell")
         self.device_seq[device_id] = seq
 
     def draw(self, spans: Optional[List[int]] = None, outfile='./execplan.png'):
@@ -64,7 +66,7 @@ class ExectuionPlan:
         Args:
             span (List[int]): 
                 length equal to schedule unit num.
-                Each element stands for the time span for corresponding SU
+                Each element stands for the time span for corresponding Cell
 
             outfile:
                 the output file name
@@ -76,13 +78,13 @@ class ExectuionPlan:
 
         if spans is None:
             spans = list()
-            for su in self.seq.sus():
+            for node in self.graph.nodes():
                 span = 0
-                if su.stype == SUType.Forward:
+                if isinstance(node, IRFwOperation):
                     span = 1
-                elif su.stype == SUType.Backward:
+                elif isinstance(node, IRBpOperation):
                     span = 2
-                elif su.stype in [SUType.P2P, SUType.Transform]:
+                elif isinstance(node, IRAdapter):
                     span = 0.1
                 else:
                     span = 0
@@ -155,9 +157,9 @@ class ExectuionPlan:
 
 
     def __repr__(self):
-        dscp = f'Execution Plan ({self.sugraph.name}):\n'
+        dscp = f'Execution Plan ({self.graph.name}):\n'
         for devid in self.devices():
             dscp += f'====> Device {devid}:\n'
-            for su in self.sequence(devid):
-                dscp += f'{su}\n'
+            for node in self.sequence(devid):
+                dscp += f'{node.module_repr()}\n'
         return dscp

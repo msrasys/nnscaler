@@ -10,10 +10,8 @@ IRGraph:
 from typing import Union, Tuple, List, Optional, Dict
 import copy
 
-from numpy import isin
-
-from cube.graph.operator.operator import IRBpOperation, IRFwOperation
 from cube.ir.cten import IRTensor, IRCell
+from cube.graph.operator.operator import IRBpOperation, IRFwOperation
 from cube.graph.tensor import IRSubTensor
 
 from cube.algorithm.generics import GenericDistAlgo
@@ -39,10 +37,10 @@ class IRGraph(IRCell):
         self._parameters = list()
 
         if inputs is None:
-            inputs = IRCell.get_inputs(nodes)
+            inputs = IRGraph.get_inputs(nodes)
             inputs = [t for t in inputs if not t.is_param()]
         if outputs is None:
-            outputs = IRCell.get_outputs(nodes)
+            outputs = IRGraph.get_outputs(nodes)
             outputs = [t for t in outputs if not t.is_param()]
 
         super().__init__(
@@ -106,39 +104,39 @@ class IRGraph(IRCell):
         else:
             raise TypeError("Expected index to be None or int")
 
-    def insert(self, node, src_node=None, dst_node=None, replaced_tensor=None):
-        """
-        Insert a node between src_node and dst_node. In default,
-        if dst_node is not None, the node will be inserted right before
-        dst_node. If the replaced_tensor is provided, the replaced_tensor
-        in dst_node's inputs will be removed, and the output of node will be
-        set as input for dst_node.
-        """
-        if not isinstance(node, IRCell):
-            raise TypeError("Expected IRCell to insert")
-        if dst_node is not None:
-            if dst_node not in self._nodes:
-                raise KeyError("dst_node not found")
-            if replaced_tensor is not None:
-                if replaced_tensor not in dst_node.inputs():
-                    raise RuntimeError(f"Expected dst_node input has {replaced_tensor}")
-                # remove dst_node input
-                input_index = dst_node.inputs().index(replaced_tensor)
-                if len(node.outputs()) != 1:
-                    raise RuntimeError("replaced node requires output length to be 1")
-                dst_node.set_input(input_index, node.outputs(0))
-            # insert node
-            index = self._nodes.index(dst_node)
-            self._nodes.insert(index, node)
-        elif src_node is not None:
-            if src_node not in self._nodes:
-                raise KeyError("src_node not found")
-            index = self._nodes.index(src_node)
-            self._nodes = self._nodes[:index+1] + [node] + self._nodes[index+1:]
-        else:
-            raise TypeError("Expected at least one of [src_node, dst_node]")
-        #TODO: optimize this
-        self.reset_dependency()
+    # def insert(self, node, src_node=None, dst_node=None, replaced_tensor=None):
+    #     """
+    #     Insert a node between src_node and dst_node. In default,
+    #     if dst_node is not None, the node will be inserted right before
+    #     dst_node. If the replaced_tensor is provided, the replaced_tensor
+    #     in dst_node's inputs will be removed, and the output of node will be
+    #     set as input for dst_node.
+    #     """
+    #     if not isinstance(node, IRCell):
+    #         raise TypeError("Expected IRCell to insert")
+    #     if dst_node is not None:
+    #         if dst_node not in self._nodes:
+    #             raise KeyError("dst_node not found")
+    #         if replaced_tensor is not None:
+    #             if replaced_tensor not in dst_node.inputs():
+    #                 raise RuntimeError(f"Expected dst_node input has {replaced_tensor}")
+    #             # remove dst_node input
+    #             input_index = dst_node.inputs().index(replaced_tensor)
+    #             if len(node.outputs()) != 1:
+    #                 raise RuntimeError("replaced node requires output length to be 1")
+    #             dst_node.set_input(input_index, node.outputs(0))
+    #         # insert node
+    #         index = self._nodes.index(dst_node)
+    #         self._nodes.insert(index, node)
+    #     elif src_node is not None:
+    #         if src_node not in self._nodes:
+    #             raise KeyError("src_node not found")
+    #         index = self._nodes.index(src_node)
+    #         self._nodes = self._nodes[:index+1] + [node] + self._nodes[index+1:]
+    #     else:
+    #         raise TypeError("Expected at least one of [src_node, dst_node]")
+    #     #TODO: optimize this
+    #     self.reset_dependency()
 
     def _replace_tensor(self, old_tensor: IRTensor, new_tensor: IRTensor):
         """
@@ -188,39 +186,74 @@ class IRGraph(IRCell):
         """
         Create a subgraph with sub nodes.
 
-        The remote tensor will be set as graph input (recv tensors)
-        and graph output (send tensors)
-
         Return:
             IRGraph
         """
-        # find input
-        inputs = list()
-        outputs = list()
-        for node in sub_nodes:
-            outer_cells = list(set(self.nodes()) - set(sub_nodes))
-            for tensor in node.inputs():
-                if isinstance(tensor, IRTensor) and tensor not in inputs:
-                    # if a tensor is generated by other nodes out of sub_nodes,
-                    # then this tensor should be the input
-                    src_nodes = tensor.src(outer_cells)
-                    if len(src_nodes) != 0 or tensor in self.inputs():
-                        inputs.append(tensor)
-            for tensor in node.outputs():
-                if isinstance(tensor, IRTensor) and tensor not in outputs:
-                    # if a tensor is used by other nodes out of sub_nodes,
-                    # then this tensor should be output
-                    dst_nodes = tensor.dst(outer_cells)
-                    if len(dst_nodes) != 0 or tensor in self.outputs():
-                        outputs.append(tensor)
-
-        graph = IRGraph(
+        subgraph = IRGraph(
             nodes = sub_nodes,
-            input_tensors = inputs,
-            output_tensors = outputs,
-            module_name = self.name
+            input_tensors = None,
+            output_tensors = None,
+            module_name = 'subgraph'
         )
-        return graph
+        return subgraph
+
+    @staticmethod
+    def get_inputs(nodes: List[IRCell]):
+        """
+        Get all the input tensors the is not generated by nodes
+
+        Inputs
+
+        Returns:
+            List[IRTensor]
+        """
+        all_outputs = list()
+        for node in nodes:
+            all_outputs += node.outputs()
+        inputs = list()
+        for cell in nodes:
+            for input in cell.inputs():
+                if isinstance(input, IRTensor):
+                    if input not in all_outputs:
+                        if input not in inputs:
+                            inputs.append(input)
+        return inputs
+
+    @staticmethod
+    def get_outputs(nodes: List[IRCell]):
+        """
+        Get all the output tensors the is not used by nodes
+
+        Args:
+            This will also consider the successor forward nodes.
+            If it is required by other outside forward nodes,
+            put in the outputs list
+
+        Returns:
+            List[IRTensor]
+        """
+        all_inputs = list()
+        for node in nodes:
+            all_inputs += node.inputs()
+        outputs = list()
+        for node in nodes:
+            for idx, output in enumerate(node.outputs()):
+                # not consumed tensor
+                if isinstance(output, IRSubTensor):
+                    if output not in all_inputs:
+                        if output not in outputs:
+                            outputs.append(output)
+                            continue
+                # consumed by other nodes
+                succs = node.successors(idx)
+                fsuccs = [
+                    fnode for fnode in succs if isinstance(fnode, IRFwOperation)
+                ]
+                for fsucc in fsuccs:
+                    if fsucc not in nodes:
+                        if output not in outputs:
+                            outputs.append(output)
+        return outputs
 
     ## Parallel Policy Primitives ##
 
@@ -237,9 +270,6 @@ class IRGraph(IRCell):
 
         if op not in self.nodes():
             raise RuntimeError(f"Op {op} not exsits")
-            cpy_op = op.replicate()
-            if op.mirror is not None:
-                cpy_mirror_op = op.mirror.replicate()
     
         ops = [op]
         mirror_ops = [op.mirror]
@@ -263,9 +293,9 @@ class IRGraph(IRCell):
 
     def partition(self, op: IRCell, algo: GenericDistAlgo, config: Dict) -> Optional[List[IRCell]]:
         """
-        Policy primitive. Partition an operator by using
-        op_partition_algorithm and its configuration. Note the
-        backward op-partition will be automatically done.
+        Partition an operator (op) by using
+        op partition algorithm (algo) and its configuration (config).
+        Note the backward op-partition will be automatically done.
 
         Args:
             op: cell to be partitioned
@@ -347,6 +377,26 @@ class IRGraph(IRCell):
 
     ## Schedule Policy Primitives ##
 
+    def happen_before(self, node1: IRCell, node2: IRCell, skip=None) -> bool:
+        """
+        Check node1 -> (happen before) node2
+
+        Returns:
+            Boolean
+        """
+        skip = list() if skip is None else skip
+        if node1 in skip:
+            return False
+        if not isinstance(node1, IRCell) or not isinstance(node2, IRCell):
+            raise TypeError("Expected node to be IRCell")
+        if node2 in node1.successors():
+            return True
+        else:
+            for succ_node in node1.successors():
+                if self.happen_before(succ_node, node2, skip):
+                    return True
+            return False
+
     def set_order(self, seq: List[IRCell]):
         raise NotImplementedError
 
@@ -354,6 +404,10 @@ class IRGraph(IRCell):
         raise NotImplementedError
 
     def __repr__(self):
+        dscp = f"Graph{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})"
+        return dscp
+
+    def extra_repr(self):
         dscp = f"\n{self.name}:\n{'=' * len(self.name)}\n"
         # inputs
         dscp += f"Inputs: {self.inputs()}\n"

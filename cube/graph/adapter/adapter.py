@@ -151,7 +151,7 @@ class IRAdapter(IRCell):
         * Merge: merge the produced tensors
     """
     def __init__(self, dst_tensor: IRSubTensor):
-        print(f'generating adapter for: {dst_tensor}')
+        # print(f'generating adapter for: {dst_tensor}')
         if not isinstance(dst_tensor, IRSubTensor):
             raise RuntimeError("Expected IRSubTensor")
         self.dst_tensor = dst_tensor
@@ -190,7 +190,7 @@ class IRAdapter(IRCell):
         otensor = self.dst_tensor
         odevice = otensor.device
 
-        print(f'select: produced tensors: {otensor.parent.ptensors}')
+        # print(f'select: produced tensors: {otensor.parent.ptensors}')
 
         local, remote = list(), list()
         for ptensor in otensor.parent.ptensors:
@@ -332,6 +332,9 @@ class IRAdapter(IRCell):
     def __repr__(self):
         dscp = f'Adapter{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
         return dscp
+
+    def module_repr(self) -> str:
+        return repr(self)
     
     def extra_repr(self):
         """
