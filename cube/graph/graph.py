@@ -38,10 +38,10 @@ class IRGraph(IRCell):
 
         if inputs is None:
             inputs = IRGraph.get_inputs(nodes)
-            inputs = [t for t in inputs if not t.is_param()]
+            # inputs = [t for t in inputs if not t.is_param()]
         if outputs is None:
             outputs = IRGraph.get_outputs(nodes)
-            outputs = [t for t in outputs if not t.is_param()]
+            # outputs = [t for t in outputs if not t.is_param()]
 
         super().__init__(
             name=module_name,
@@ -189,11 +189,31 @@ class IRGraph(IRCell):
         Return:
             IRGraph
         """
+        sub_inputs = list()
+        sub_outputs = list()
+        for node in sub_nodes:
+            sub_inputs += node.inputs()
+            sub_outputs += node.outputs()
+        remain_inputs = list()
+        remain_outputs = list()
+        for node in self.nodes():
+            if node in sub_nodes:
+                continue
+            remain_inputs += node.inputs()
+            remain_outputs += node.outputs()
+        inputs = list()
+        outputs = list()
+        for t in sub_inputs:
+            if isinstance(t, IRSubTensor) and t not in sub_outputs:
+                inputs.append(t)
+        for t in sub_outputs:
+            if isinstance(t, IRSubTensor) and t in remain_inputs:
+                outputs.append(t)
         subgraph = IRGraph(
             nodes = sub_nodes,
-            input_tensors = None,
-            output_tensors = None,
-            module_name = 'subgraph'
+            inputs = inputs,
+            outputs = outputs,
+            module_name = 'segment'
         )
         return subgraph
 
@@ -423,3 +443,6 @@ class IRGraph(IRCell):
         # outputs
         dscp += f"\nOutputs: {self.outputs()}\n{'=' * len(self.name)}\n"
         return dscp
+
+    def module_repr(self):
+        return repr(self)

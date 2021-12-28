@@ -17,16 +17,16 @@ class AdapterGener:
                     # skip parameter
                     if input.is_param():
                         continue
-                    adapter = IRAdapter(input)
+                    adapter = IRAdapter.gen(input)
                     if not adapter.is_identity():
                         idx = graph.nodes().index(node)
                         graph._nodes.insert(idx, adapter)
             if isinstance(node, IRBpOperation):
-                for grad in node.grads():
+                for grad in node.inputs():
                     if not isinstance(grad, IRSubTensor):
                         continue
                     # skip parameter
-                    adapter = IRAdapter(grad)
+                    adapter = IRAdapter.gen(grad)
                     if not adapter.is_identity():
                         idx = graph.nodes().index(node)
                         graph._nodes.insert(idx, adapter)

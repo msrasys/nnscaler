@@ -4,17 +4,16 @@ Generate Pytorch code given the model DAG and the transformation config
 from typing import List, Any
 import torch
 import copy
-from cube.graph.operator.operator import IRFwOperation, IROptimOperation
 
-from cube.ir.cten import IRTensor
-from cube.graph.tensor import ValueMap
+from cube.ir.cten import IRCell, IRTensor
+from cube.graph.tensor import IRSubTensor
+from cube.graph.operator.operator import IRBpOperation, IRDataOperation, IRFwOperation
+from cube.graph.operator.operator import IROptimOperation
+from cube.graph.adapter.adapter import IRAdapter, SelectPrim, MovePrim, MergePrim
 from cube.execplan import ExectuionPlan
-from cube.schedule.adapter.collectives import IRCollectives
+# from cube.schedule.adapter.collectives import IRCollectives
 
-from cube.schedule.su import ScheduleUnit, SUType
-from cube.schedule.adapter.comm import IRCommType, IRCommunication
-from cube.schedule.adapter.transform import IRTensorTransform
-from cube.schedule.adapter.transform import SelectPrim, MergePrim
+from cube.graph.graph import IRGraph
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
@@ -28,19 +27,8 @@ class CodeGen:
             raise TypeError("execplan should be ExecutionPlan")
         self.execplan = execplan
 
-    def su_naming(self, su: ScheduleUnit) -> str:
-        if su.stype == SUType.Forward:
-            return f"fwcp{su._id}"
-        if su.stype == SUType.Backward:
-            return f"bwcp{su._id}"
-        if su.stype == SUType.P2P:
-            return f"p2p{su._id}"
-        if su.stype == SUType.Coll:
-            return f"coll{su._id}"
-        if su.stype == SUType.Transform:
-            return f"trans{su._id}"
-        if su.stype == SUType.Optimizer:
-            return f"optim{su._id}"
+    def node_naming(self, node: IRCell) -> str:
+        return f"{node.name}{node._id}"
 
     def tensor_naming(self, tensor: Any) -> str:
         """
@@ -58,7 +46,7 @@ class CodeGen:
 
 class ModelCodeGen(CodeGen):
     """
-    Generate spatial code for the model
+    Generate model code
     """
 
     def __init__(self, execplan: ExectuionPlan):
@@ -70,7 +58,7 @@ class ModelCodeGen(CodeGen):
         # module init code
         self.declare_region: List[str] = list()
         # module forward code
-        self.all_su_forward_region: List[List[str]] = list()
+        self.forward_region_units: List[List[str]] = list()
         self.forward_region: List[str] = list()
         # module member name
         self.symbols = SymbolTable()
@@ -78,7 +66,7 @@ class ModelCodeGen(CodeGen):
         self._ref_module = torch.nn.Module()
         # groups
         self._all_comm_groups = list()
-        self.get_all_groups()
+        # self.get_all_groups()
 
     def get_all_groups(self):
         """
@@ -87,6 +75,7 @@ class ModelCodeGen(CodeGen):
         Creating communication group requires all the devices
         enter the same call.
         """
+        raise NotImplementedError
         for devid in self.execplan.devices():
             for su in self.execplan.sequence(devid):
                 if su.stype == SUType.Coll:
@@ -100,53 +89,50 @@ class ModelCodeGen(CodeGen):
         """
         Generate model implementation code based on the given graph.
         """
-        device_sus = self.execplan.sequence(device)
-        device_sus = [su for su in device_sus \
-                      if su.stype != SUType.Backward \
-                      and su.stype != SUType.Dataloader]
-
         gencode = copy.copy(self.init_code)
+        node_args: List[List[str]] = list()
+        gen_nodes: List[IRCell] = list()
 
-        # register forward input
-        su_args: List[List[str]] = list()
-        for su in device_sus:
-            fargs = list()
-            for input in su.inputs():
-                if isinstance(input, IRTensor) and input.is_param():
-                    continue
-                fargs.append(self.tensor_naming(input))
-            for name in fargs:
-                self.symbols.create(name)
-            su_args.append(fargs)
-
-        # init group
-        self.emit_comm_group_creation()
+        # TODO init group
+        # self.emit_comm_group_creation()
 
         # parse graph body
-        for su in device_sus:
-            for node in su.nodes():
-                if isinstance(node, IRFwOperation):
-                    self.emit_op_call(node)
-                elif isinstance(node, IRTensorTransform):
-                    self.emit_transform_call(node)
-                elif isinstance(node, IRCommunication):
-                    self.emit_comm_call(node)
-                elif isinstance(node, IRCollectives):
-                    self.emit_collective_call(node)
-                elif isinstance(node, IROptimOperation):
-                    self.emit_optim_init(node)
-                    self.emit_optim_call(node)
-                else:
-                    raise RuntimeError(f"Un-recognized IRCell type: {type(node)}")
-                # emit input declaration
-                for arg in node.inputs():
-                    self.emit_var_declare(arg)
-                # record output tensor name
-                for out in node.outputs():
-                    if isinstance(out, IRTensor) or isinstance(out, str):
-                        self.symbols.create(self.tensor_naming(out))
-            self.all_su_forward_region.append(self.forward_region)
+        for node in self.execplan.sequence(device):
+            if isinstance(node, IRGraph):
+                # skip backward ir graph
+                if all([isinstance(n, IRBpOperation) for n in node.nodes()]):
+                    continue
+                self.emit_graph_call(node)
+            elif isinstance(node, IRFwOperation):
+                self.emit_op_call(node)
+            elif isinstance(node, IRAdapter):
+                node = node.dispatch(rank=device)
+                self.emit_adapter_call(node)
+            # elif isinstance(node, IRCollectives):
+            #     self.emit_collective_call(node)
+            elif isinstance(node, IROptimOperation):
+                self.emit_optim_init(node)
+                self.emit_optim_call(node)
+            elif isinstance(node, IRBpOperation):
+                continue
+            elif isinstance(node, IRDataOperation):
+                continue
+            else:
+                raise RuntimeError(f"Un-recognized IRCell type: {type(node)}")
+            # emit node tensor declaration
+            self.emit_node_declare(node)
+            # emit node code
+            self.forward_region_units.append(self.forward_region)
             self.forward_region = list()
+            gen_nodes.append(node)
+            args = list()
+            for t in node.inputs():
+                if isinstance(t, IRSubTensor):
+                    if not t.is_param():
+                        args.append(self.tensor_naming(t))
+                else:
+                    args.append(self.tensor_naming(t))
+            node_args.append(args)
 
         # generate full code
         with ClassBlock(class_name='GenModel', derived=['cube.runtime.module.CubeModule']) as cb:
@@ -154,15 +140,15 @@ class ModelCodeGen(CodeGen):
                 ib.insert_body(self.declare_region)
             cb.insert_body('')
             cb.insert_body(ib.code)
-            for idx, su in enumerate(device_sus):
-                name = self.su_naming(su)
-                input_args = ['self'] + su_args[idx]
-                forward_code = self.all_su_forward_region[idx]
+            for idx, node in enumerate(gen_nodes):
+                name = self.node_naming(node)
+                input_args = ['self'] + node_args[idx]
+                forward_code = self.forward_region_units[idx]
                 with FunctionBlock(func_name=name, args=input_args) as fb:
                     fb.insert_body(forward_code)
                     # generate output
-                    out_names = self._forward_region_arg_names(su.outputs())
-                    return_code = f"return {', '.join(out_names)}"
+                    outputs = [self.tensor_naming(t) for t in node.outputs()]
+                    return_code = f"return {', '.join(outputs)}"
                     fb.insert_body(return_code)
                 cb.insert_body('')
                 cb.insert_body(fb.code)
@@ -179,127 +165,175 @@ class ModelCodeGen(CodeGen):
         self.clear()
         return code
 
-    def emit_var_declare(self, var: Any):
+    def emit_node_declare(self, node: IRCell):
         """
         Emit tensor declaration code
         """
-        if isinstance(var, IRTensor):
-            name = self.tensor_naming(var)
-            # emit parameter code
-            if var.is_param() and not self.symbols.exist(name):
-                self.symbols.create(name)
-                code = f'self.{name} = torch.nn.Parameter(torch.empty({tuple(var.shape)}))'
-                self.declare_region.append(code)
-        elif isinstance(var, str):
-            name = self.tensor_naming(var)
-            if name.startswith('self.'):
-                if not hasattr(self._ref_module, var[5:]):
-                    if self.symbols.create(name):
-                        #TODO: add default value
-                        code = f'{name} = None'
-                        self.declare_region.append(code)
+        for input in node.inputs():
+            name = self.tensor_naming(input)
+            if isinstance(input, IRTensor):
+                if input.is_param() and not self.symbols.exist(name):
+                    self.symbols.create(name)
+                    code = f'{name} = torch.nn.Parameter(torch.empty({tuple(input.shape)}))'
+                    self.declare_region.append(code)
+            if isinstance(input, str):
+                if name.startswith('self.'):
+                    if not hasattr(self._ref_module, name[5:]):
+                        raise NotImplementedError("member attribute is not added")
+        for output in node.outputs():
+            self.symbols.create(self.tensor_naming(output))
         return
 
-    def emit_comm_group_creation(self):
-        """
-        Emit communication group creation code
-        """
-        sign = 'self.init_group(ranks={ranks})'
-        for ranks in self._all_comm_groups:
-            ranks = list(ranks)
-            code = sign.format(ranks=ranks)
-            self.declare_region.append(code)
 
-    def emit_op_call(self, node):
+    def emit_graph_call(self, graph: IRGraph):
+        for node in graph.nodes():
+            if isinstance(node, IRBpOperation):
+                raise RuntimeError("IRBpOperation is not expected in GenModel")
+            self.emit_op_call(node)
+
+
+    # def emit_comm_group_creation(self):
+    #     """
+    #     Emit communication group creation code
+    #     """
+    #     sign = 'self.init_group(ranks={ranks})'
+    #     for ranks in self._all_comm_groups:
+    #         ranks = list(ranks)
+    #         code = sign.format(ranks=ranks)
+    #         self.declare_region.append(code)
+
+    def emit_op_call(self, node: IRFwOperation):
         """
         Emit op forward code
         """
         op_code = node.signature
-        arg_names = self._forward_region_arg_names(node.inputs())
+        inputs = [self.tensor_naming(t) for t in node.inputs()]
         kwargs = list()
         for key in node.kwargs:
             code = f'{key}={node.kwargs[key]}'
             kwargs.append(code)
-        arg_names += kwargs
-        arg_region = '(' + ', '.join(arg_names) + ')'
+        inputs += kwargs
+        inputs = ', '.join(inputs)
+        body = f'{op_code}({inputs})'
         if len(node.outputs()) == 0:
-            code = f'{op_code}{arg_region}'
+            code = body
         else:
-            out_names = self._forward_region_arg_names(node.outputs())
-            out_names = ', '.join(out_names)
-            code = f'{out_names} = {op_code}{arg_region}'
+            outputs = [self.tensor_naming(t) for t in node.outputs()]
+            outputs = ', '.join(outputs)
+            code = f'{outputs} = {body}'
         self.forward_region.append(code)
 
-    def emit_comm_call(self, node):
+    def emit_adapter_call(self, node: IRAdapter):
         """
-        Emit communication code
+        Emit adapter call
         """
-        comm_code = node.signature
-        send_tensors = self._forward_region_arg_names(node.inputs())
-        send_tensors = '(' + ', '.join(send_tensors + ['']) + ')'
-        send_ranks = node.send_ranks
-        recv_tensors = self._forward_region_arg_names(node.outputs())
-        recv_tensors = ', '.join(recv_tensors)
-        recv_shapes = [tensor.shape for tensor in node.outputs()]
-        recv_ranks = node.recv_ranks
-        if node.comm_type == IRCommType.Send:
-            code = f'{comm_code}({send_tensors}, {send_ranks})'
-        elif node.comm_type == IRCommType.Recv:
-            code = f'{recv_tensors} = {comm_code}({recv_shapes}, {recv_ranks})'
-        elif node.comm_type == IRCommType.SendRecv:
-            code = f'{recv_tensors} = {comm_code}({send_tensors}, {send_ranks}, {recv_shapes}, {recv_ranks})'
-        else:
-            raise TypeError(f"Unsupported IRCommmNode: {node.comm_type}")
-        self.forward_region.append(code)
-
-    def emit_collective_call(self, node):
-        ranks = node.ranks
-        inputs = self._forward_region_arg_names(node.inputs())
-        shape = None
-        if len(inputs) == 0:
-            assert len(node.outputs()) == 1
-            shape = node.outputs(0).shape
-        inputs = '(' + ', '.join(inputs + ['']) + ')'
-        outputs = self._forward_region_arg_names(node.outputs())
-        outputs = ', '.join(outputs)
-        if shape:
-            code = f'{node.signature}({inputs}, {ranks}, {shape})'
-        else:
-            code = f'{node.signature}({inputs}, {ranks})'
-        if outputs:
-            code = f'{outputs} = {code}'
-        self.forward_region.append(code)
-
-    def emit_transform_call(self, node: IRTensorTransform):
-        """
-        Emit in-device tensor select / merge call.
-        """
-        for prim in node.trace():
+        if len(node.device) != 1:
+            raise RuntimeError("Expected IRAdapter to be dispatched")
+        rank = node.device[0]
+        for prim in node.prims():
+            # emit select
             if isinstance(prim, SelectPrim):
-                signature = 'cube.runtime.transform.select({tensor}, {indmap}, {valmap})'
+                sign = 'cube.runtime.transform.select({tensor}, {indmap}, {valmap})'
                 input = self.tensor_naming(prim.tensor)
-                indmap = repr(prim.indmap)
-                valmap = repr(tuple([prim.valmap.idx, prim.valmap.chunk_num]))
                 output = self.tensor_naming(prim.output)
-                code = f'{output} = {signature.format(tensor=input, indmap=indmap, valmap=valmap)}'
+                valmap = (prim.valmap.idx, prim.valmap.chunk_num)
+                code = f'{output} = {sign.format(tensor=input, indmap=prim.indmap, valmap=valmap)}'
                 self.forward_region.append(code)
+            # emit move
+            elif isinstance(prim, MovePrim):
+                send_sign = 'cube.runtime.transform.send({tensor}, {send_rank})'
+                recv_sign = 'cube.runtime.transform.recv({shape}, {from_rank}, {dtype})'
+                tensor = self.tensor_naming(prim.tensor)
+                # send
+                if rank == prim.from_rank:
+                    code = f'{send_sign.format(tensor=tensor, send_rank=prim.to_rank)}'
+                    self.forward_region.append(code)
+                # recv
+                elif rank == prim.to_rank:
+                    output = self.tensor_naming(prim.tensor)
+                    code = f'{tensor} = {recv_sign.format(shape=prim.shape, from_rank=prim.from_rank, dtype=prim.dtype)}'
+                    self.forward_region.append(code)
+            # emit merge
             elif isinstance(prim, MergePrim):
-                signature = 'cube.runtime.transform.merge({tensors}, {concat}, {add})'
-                inputs = self._forward_region_arg_names(prim.tensors)
-                inputs = '(' + ', '.join(inputs) + ')'
+                sign = 'cube.runtime.transformation.merge({tensors}, {concat}, {add})'
+                inputs = [self.tensor_naming(t) for t in prim.tensors]
+                inputs = '(' + ','.join(inputs + ['']) + ')'
                 output = self.tensor_naming(prim.output)
-                code = f'{output} = {signature.format(tensors=inputs, concat=prim.concat, add=prim.add)}'
+                code = f'{output} = {sign.format(tensors=inputs, concat=prim.concat, add=prim.add)}'
                 self.forward_region.append(code)
             else:
-                raise RuntimeError(f"Not supported prim: {type(prim)}")
-        for output in node.outputs():
-            # contiguous and requires grad
-            output_name = self.tensor_naming(output)
-            code = f'{output_name} = {output_name}.contiguous()'
-            self.forward_region.append(code)
-            if not output.is_grad():
-                code = f'{output_name} = {output_name}.requires_grad_()'
-                self.forward_region.append(code)
+                raise TypeError(f"Unkown primitive types {type(prim)} of Adapter")
+
+    # def emit_comm_call(self, node):
+    #     """
+    #     Emit communication code
+    #     """
+    #     comm_code = node.signature
+    #     send_tensors = self._forward_region_arg_names(node.inputs())
+    #     send_tensors = '(' + ', '.join(send_tensors + ['']) + ')'
+    #     send_ranks = node.send_ranks
+    #     recv_tensors = self._forward_region_arg_names(node.outputs())
+    #     recv_tensors = ', '.join(recv_tensors)
+    #     recv_shapes = [tensor.shape for tensor in node.outputs()]
+    #     recv_ranks = node.recv_ranks
+    #     if node.comm_type == IRCommType.Send:
+    #         code = f'{comm_code}({send_tensors}, {send_ranks})'
+    #     elif node.comm_type == IRCommType.Recv:
+    #         code = f'{recv_tensors} = {comm_code}({recv_shapes}, {recv_ranks})'
+    #     elif node.comm_type == IRCommType.SendRecv:
+    #         code = f'{recv_tensors} = {comm_code}({send_tensors}, {send_ranks}, {recv_shapes}, {recv_ranks})'
+    #     else:
+    #         raise TypeError(f"Unsupported IRCommmNode: {node.comm_type}")
+    #     self.forward_region.append(code)
+
+    # def emit_collective_call(self, node):
+    #     ranks = node.ranks
+    #     inputs = self._forward_region_arg_names(node.inputs())
+    #     shape = None
+    #     if len(inputs) == 0:
+    #         assert len(node.outputs()) == 1
+    #         shape = node.outputs(0).shape
+    #     inputs = '(' + ', '.join(inputs + ['']) + ')'
+    #     outputs = self._forward_region_arg_names(node.outputs())
+    #     outputs = ', '.join(outputs)
+    #     if shape:
+    #         code = f'{node.signature}({inputs}, {ranks}, {shape})'
+    #     else:
+    #         code = f'{node.signature}({inputs}, {ranks})'
+    #     if outputs:
+    #         code = f'{outputs} = {code}'
+    #     self.forward_region.append(code)
+
+    # def emit_transform_call(self, node):
+    #     """
+    #     Emit in-device tensor select / merge call.
+    #     """
+    #     for prim in node.trace():
+    #         if isinstance(prim, SelectPrim):
+    #             signature = 'cube.runtime.transform.select({tensor}, {indmap}, {valmap})'
+    #             input = self.tensor_naming(prim.tensor)
+    #             indmap = repr(prim.indmap)
+    #             valmap = repr(tuple([prim.valmap.idx, prim.valmap.chunk_num]))
+    #             output = self.tensor_naming(prim.output)
+    #             code = f'{output} = {signature.format(tensor=input, indmap=indmap, valmap=valmap)}'
+    #             self.forward_region.append(code)
+    #         elif isinstance(prim, MergePrim):
+    #             signature = 'cube.runtime.transform.merge({tensors}, {concat}, {add})'
+    #             inputs = self._forward_region_arg_names(prim.tensors)
+    #             inputs = '(' + ', '.join(inputs) + ')'
+    #             output = self.tensor_naming(prim.output)
+    #             code = f'{output} = {signature.format(tensors=inputs, concat=prim.concat, add=prim.add)}'
+    #             self.forward_region.append(code)
+    #         else:
+    #             raise RuntimeError(f"Not supported prim: {type(prim)}")
+    #     for output in node.outputs():
+    #         # contiguous and requires grad
+    #         output_name = self.tensor_naming(output)
+    #         code = f'{output_name} = {output_name}.contiguous()'
+    #         self.forward_region.append(code)
+    #         if not output.is_grad():
+    #             code = f'{output_name} = {output_name}.requires_grad_()'
+    #             self.forward_region.append(code)
 
     def emit_optim_init(self, node: IROptimOperation):
         # reducer init interface
@@ -313,7 +347,7 @@ class ModelCodeGen(CodeGen):
         self.declare_region.append('')
         init_code = reducer_init.format(reducer=reducer_name, ranks=ranks)
         self.declare_region.append(init_code)
-        grads = self._forward_region_arg_names(grads)
+        grads = [self.tensor_naming(t) for t in grads]
         for grad in grads:
             add_param_code = add_param.format(reducer=reducer_name, grad=grad)
             self.declare_region.append(add_param_code)
@@ -325,20 +359,17 @@ class ModelCodeGen(CodeGen):
         call_code = f'{reducer_name}.allreduce()'
         self.forward_region.append(call_code)
 
-    def _forward_region_arg_names(self, tensors: List[Any]):
+    def tensor_naming(self, tensor: Any):
         """
-        Generate arg name list for forward region.
+        Generate tensor name.
 
-        Will add prefix 'self.' for var defined in declare region
+        Will add prefix 'self.' for parameters
         """
-        named_args : List[str] = list()
-        for tensor in tensors:
-            name = self.tensor_naming(tensor)
-            if isinstance(tensor, IRTensor) and tensor.is_param():
-                named_args.append('self.' + name)
-            else:
-                named_args.append(name)
-        return named_args
+        name = super().tensor_naming(tensor)
+        if isinstance(tensor, IRSubTensor):
+            if tensor.is_param():
+                name = 'self.' + name
+        return name
 
     def clear(self):
         """
@@ -347,7 +378,7 @@ class ModelCodeGen(CodeGen):
         # module init code
         self.declare_region: List[str] = list()
         # module forward code
-        self.all_su_forward_region: List[List[str]] = list()
+        self.forward_region_units: List[List[str]] = list()
         self.forward_region: List[str] = list()
         # module member name
         self.symbols = SymbolTable()
@@ -376,9 +407,9 @@ class ScheduleCodeGen(CodeGen):
                            args=['model', 'dataloader']) as fb:
             if len(device_sus) == 0:
                 fb.insert_body('pass')
-            for su in device_sus:
-                name = self.su_naming(su)
-                code = self.emit_su(su, name=name)
+            for node in device_sus:
+                name = self.node_naming(node)
+                code = self.emit_node(node, name=name)
                 fb.insert_body(code)
         gencode += fb.code
         gencode += ['']
@@ -390,92 +421,60 @@ class ScheduleCodeGen(CodeGen):
                 f.write(code)
         return code
 
-    def emit_su(self, su: ScheduleUnit, name: str) -> List[str]:
+    def emit_node(self, node: IRCell, name: str) -> List[str]:
         """
-        Emit su code
+        Emit node / subgraph code
         """
-        fsu_types = [SUType.Forward, SUType.P2P, SUType.Coll, SUType.Transform, SUType.Optimizer]
         fsign = 'cube.runtime.executor.fexecute({model}, *{inputs})'
         bsign = 'cube.runtime.executor.backward({input_tensors}, {output_tensors}, {output_grads})'
         
-        if su.stype == SUType.Dataloader:
-            if len(su.inputs()) != 0:
-                raise RuntimeError("Dataloader su has no inputs")
-            outputs = [self.tensor_naming(output) for output in su.outputs()]
+        inputs = [self.tensor_naming(t) for t in node.inputs() if not t.is_param()]
+        outputs = [self.tensor_naming(t) for t in node.outputs()]
+        inputs = '(' + ','.join(inputs + ['']) + ')'
+        outputs = ', '.join(outputs)
+
+        if isinstance(node, IRGraph):
+            is_backward = all([isinstance(n, IRBpOperation) for n in node.nodes()])
+            # emit forward
+            if not is_backward:
+                body = fsign.format(model=f'model.{name}', inputs=inputs)
+                code = f'{outputs} = {body}'
+            # emit backward
+            else:
+                finputs = [t.data for t in node.outputs() if isinstance(t, IRSubTensor)]
+                finputs = '(' + ','.join(finputs + ['']) + ')'
+                foutputs = [t.data for t in node.inputs() if isinstance(t, IRSubTensor)]
+                foutputs = '(' + ','.join(foutputs + ['']) + ')'
+                outputs = [self.tensor_naming(t) for t in node.outputs() if isinstance(t, IRSubTensor)]
+                outputs = ', '.join(outputs)
+                body = bsign.format(
+                    input_tensors=finputs, output_tensors=foutputs, output_grads=inputs
+                )
+                code = f'{outputs} = {body}'
+
+        elif isinstance(node, IRDataOperation):
+            if len(node.inputs()) != 0:
+                raise RuntimeError("Expect Dataloader node has no inputs")
+            outputs = [self.tensor_naming(output) for output in node.outputs()]
             return_val = ','.join(outputs)
             code = f'{return_val} = next(dataloader)'
-            return code
 
-        elif su.stype in fsu_types:
-            inputs = list()
-            for tensor in su.inputs():
-                if isinstance(tensor, IRTensor):
-                    if tensor.is_param():
-                        continue
-                inputs.append(self.tensor_naming(tensor))
-            inputs = '(' + ', '.join(inputs + ['']) + ')'
-            body = fsign.format(
-                model = f'model.{name}',
-                inputs = inputs
-            )
-            outputs = [self.tensor_naming(output) for output in su.outputs()]
-            return_val = ','.join(outputs)
-            if len(su.outputs()) == 0:
-                code = body
-            else:
-                code = f'{return_val} = {body}'
-            return code
+        elif isinstance(node, IRAdapter):
+            body = fsign.format(model=f'model.{name}', inputs=inputs)
+            code = f'{outputs} = {body}'
 
-        elif su.stype == SUType.Backward:
-            # 1). input_tensors are forward inputs (happened before su inputs)
-            #       => backward graph output tensor (share tensor in forward / backward graph)
-            # 2). output_tensors are forward outputs (su.inputs())
-            #       => backward graph input tensor (share tensor in forward / backward)
-            # 3). output_grads are recved tesnors of this graph (graph.recv_tensors)
-            #       => backward graph input tensor (graph.recv_tensors)
-            fsu = su.mirror
-            finputs = list()
-            for tensor in fsu.inputs():
-                if isinstance(tensor, IRTensor):
-                    if tensor.is_param():
-                        finputs.append('model.' + self.tensor_naming(tensor))
-                        continue
-                finputs.append(self.tensor_naming(tensor))
-            fargs = '(' + ', '.join(finputs + ['']) + ')'
-
-            fouts = list()
-            for tensor in fsu.outputs():
-                fouts.append(self.tensor_naming(tensor))
-            fouts = '(' + ', '.join(fouts + ['']) + ')'
-
-            fout_grads = list()
-            for fout in fsu.outputs():
-                # the loss computed starting point
-                # if fout == fout.grad:
-                fout_grads.append(self.tensor_naming(fout.grad))
-            fout_grads = '(' + ', '.join(fout_grads + ['']) + ')'
-
-            body = bsign.format(
-                input_tensors = fargs,
-                output_tensors = fouts,
-                output_grads = fout_grads
-            )
-
-            # returned value are graph.outputs
-            return_val = list()
-            for input in fsu.inputs():
-                if isinstance(input, IRTensor):
-                    return_val.append(self.tensor_naming(input.grad))
-                else:
-                    return_val.append(None)
-            # return_val = [self.tensor_naming(tensor.grad) for tensor in finputs]
-            # TODO: fix this by using grad attributed
-            # return_val = return_val[:len(finputs)]
-            if len(return_val) > 0:
-                return_code = ', '.join(return_val) + ' = '
-            else:
-                return_code = ''
-            code = f'{return_code}{body}'
-            return code
         else:
-            raise RuntimeError(f"Unsupported SUType: {su.stype}")
+            raise RuntimeError(f"Unspported node type: {type(node)}")
+        return code
+
+    def tensor_naming(self, tensor: Any):
+        """
+        Generate tensor name.
+
+        Will add prefix 'model.' for parameters
+        """
+        name = super().tensor_naming(tensor)
+        if isinstance(tensor, IRSubTensor):
+            if tensor.is_param():
+                name = 'model.' + name
+        return name

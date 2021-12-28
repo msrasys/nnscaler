@@ -409,11 +409,12 @@ class IRTensor:
 
         self._dtype: IRDType = dtype
 
-        self._is_param = False
-        self._is_grad = False
         self._requires_grad = True
+        self._is_param = False
 
-        self._grad = None
+        self._is_grad = False
+        self._grad = None  # the gradient of this tensor
+        self._data = None  # the tensor of this gradient belongs to
 
     @property
     def requires_grad(self):
@@ -491,15 +492,23 @@ class IRTensor:
         return self._is_param
 
     @property
+    def data(self):
+        return self._data
+
+    @property
     def grad(self):
         return self._grad
 
     @grad.setter
     def grad(self, grad):
-        if grad and not isinstance(grad, IRTensor):
+        if grad is None:
+            self._grad = grad
+            return
+        elif not isinstance(grad, IRTensor):
             raise TypeError("grad can only be None or Tensor")
-        self._grad = grad
         self.requires_grad = True
+        self._grad = grad
+        grad._data = self
 
     def as_grad(self):
         self._is_param = False

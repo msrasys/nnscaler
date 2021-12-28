@@ -108,11 +108,13 @@ class IRFwOperation(IRCell):
             grad = None
             if isinstance(input, IRSubTensor):
                 grad = input.get_grad(self)
+                input.grad = grad
             bnode.set_data(idx, input)
             bnode.set_output(idx, grad)
         for idx, output in enumerate(self.outputs()):
             grad = output.get_grad(self)
-            bnode.set_grad(idx, grad)
+            output.grad = grad
+            bnode.set_input(idx, grad)
         IRCell.make_pair(self, bnode)
         return bnode
 
@@ -133,13 +135,19 @@ class IRFwOperation(IRCell):
 
 class IRBpOperation(IRCell):
 
-    def __init__(self, data_num, grad_num, name='backward'):
+    def __init__(self, data_num: int, grad_num, name='backward'):
+        """
+        Args:
+            data_num (int): corresponding forward input length
+            grad_num (int): corresponding forward output length
+        """
         signature = 'torch.autograd.backward'
         self.data_num = data_num
         self.grad_num = grad_num
+        self._datas = [None] * data_num
         super().__init__(
             name, signature,
-            input_length=data_num + grad_num,
+            input_length=grad_num,
             output_length=data_num,
             init_outputs=False
         )
@@ -163,26 +171,14 @@ class IRBpOperation(IRCell):
         Forward inputs
         """
         if index is None:
-            return self.inputs()[:self.data_num]
+            return copy.copy(self._datas[:self.data_num])
         if index >= self.data_num:
             raise RuntimeError(
                 f"Set the input out of range ({index} >= {self.data_num})"
             )
-        return self.inputs(index)
+        return self._datas[index]
 
-    def grads(self, index: Optional[int] = None) -> Union[List[Any], Any]:
-        """
-        backward op input gradient (a.k.a. output gradient in forward)
-        """
-        if index is None:
-            return self.inputs()[self.data_num:]
-        elif index >= self.grad_num:
-            raise RuntimeError(
-                f"Set the input out of range ({index} >= {self.grad_num})"
-            )
-        return self.inputs(index + self.data_num)
-
-    def set_data(self, input_index: int, val: Any):
+    def set_data(self, data_index: int, val: Any):
         """
         Set the node inputs[input_index] with the tensor
 
@@ -192,13 +188,16 @@ class IRBpOperation(IRCell):
         Return:
             the set tensor
         """
-        if input_index >= self.data_num:
+        if data_index >= self.data_num:
             raise RuntimeError(
-                f"Set the input out of range ({input_index} >= {self.data_num})"
+                f"Set the input out of range ({data_index} >= {self.data_num})"
             )
-        return self.set_input(input_index, val)
+        val = copy.copy(val)
+        val.attach_cell(self)
+        self._datas[data_index] = val
+        return val
 
-    def set_grad(self, input_index: int, val: Any):
+    def set_input(self, input_index: int, val: Any):
         """
         Set the node input gradient
         (i.e., output gradient in forward) at input index.
@@ -212,11 +211,6 @@ class IRBpOperation(IRCell):
         Return:
             The set val
         """
-        if input_index >= self.grad_num:
-            raise RuntimeError(
-                f"Set the grad out of range ({input_index} >= {self.grad_num})"
-            )
-        input_index += self.data_num
         # remove the consumer
         old_val = self.inputs(input_index)
         if isinstance(old_val, IRSubTensor):
@@ -255,10 +249,10 @@ class IRBpOperation(IRCell):
             self.set_output(idx, grad)
         for idx, output in enumerate(fnode.outputs()):
             grad = output.get_grad(fnode)
-            self.set_grad(idx, grad)
+            self.set_input(idx, grad)
 
     def __repr__(self):
-        dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, grads={self.grads()}, datas={self.datas()}, outputs={self.outputs()})'
+        dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, inputs={self.inputs()}, datas={self.datas()}, outputs={self.outputs()})'
         return dscp
 
     def module_repr(self) -> str:
@@ -268,7 +262,7 @@ class IRBpOperation(IRCell):
         ins = [t for t in self.datas() if isinstance(t, IRSubTensor) and not t.is_param()]
         outs = [t.grad for t in ins]
         assert all([out in self.outputs() for out in outs])
-        dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, grads={self.grads()}, outputs={outs})'
+        dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, inputs={self.inputs()}, outputs={outs})'
         return dscp
 
 
