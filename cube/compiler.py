@@ -1,21 +1,24 @@
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Union
 import torch
 import time
 
 import cube
+
+from cube.graph import parser
+from cube.graph.adapter.gen import AdapterGener
 from cube.graph.graph import IRGraph
 from cube.graph.operator.operator import IRDataOperation
-from cube.schedule.pool import SchedulePool
-from cube.schedule.su import SUType
-from cube.schedule.translator import IRDataLoader
-from cube.schedule.sugraph import SUGraph, SUGraphGener
+
+from cube.logics.pool import SchedulePool
+from cube.logics.translator import LogicTranslator
 
 from cube.execplan import ExectuionPlan
-from cube.execplan.planpass.torchadapt import TorchRefAdapter
-from cube.execplan.planpass.redundant import RemoveRedundantAdapters
-from cube.execplan.planpass.merge import MergeComputeSU
-from cube.execplan.planpass.gfuse import WeightGradAllreduceFusion
-from cube.execplan.planpass.p2pfusion import P2PFusion
+# from cube.execplan.planpass.torchadapt import TorchRefAdapter
+# from cube.execplan.planpass.redundant import RemoveRedundantAdapters
+# from cube.execplan.planpass.merge import MergeComputeSU
+# from cube.execplan.planpass.gfuse import WeightGradAllreduceFusion
+# from cube.execplan.planpass.p2pfusion import P2PFusion
+from cube.execplan.planpass.grouping import Grouping
 
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
@@ -27,7 +30,7 @@ class SemanticModel:
         Create semantic model based on AI Scientist description.
         """
         from cube.graph import parser
-        self.ir_graph = parser.convert(
+        self.ir_graph = parser.convert_model(
             model, input_shapes=input_shapes
         )
         self._loaded_module = None
@@ -60,7 +63,7 @@ class SemanticModel:
 
 
 def compile(model: SemanticModel, dataloader,
-            policy: Tuple[Optional[Callable], Optional[Callable]] = (None, None)):
+            PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None):
     """
     AI Scientist calls like:
 
@@ -89,14 +92,11 @@ def compile(model: SemanticModel, dataloader,
     """
     if not isinstance(model, SemanticModel):
         raise TypeError("Expect Semantic Model")
-    if len(policy) != 2:
-        raise TypeError(
-            "Expected policy to be tuple of transformation + scheduling policy"
-        )
-    transform_policy, schedule_policy = policy
+    if callable(PAS):
+        PAS = (PAS,)
 
-    ir_graph = model.get_graph()
-    ir_dataloader = IRDataLoader(dataloader)
+    model_graph = model.get_graph()
+    ir_dataloader = parser.convert_dataloader(dataloader)
 
     if torch.distributed.is_initialized():
         # multiple device
@@ -126,54 +126,61 @@ def compile(model: SemanticModel, dataloader,
             resource = cube.runtime.resource.EnvResource()
 
             # logic translator
-            # print(f'> ir_graph:\n{ir_graph}')
-            fn(ir_graph, ir_dataloader)
+            fn(model_graph, ir_dataloader)
+            graph = LogicTranslator.gen_logic_graph()
 
-            nodes = SchedulePool().nodes()
-
-            # graph transformation
-            graph = IRGraph(nodes, None, None, ir_graph.name)
-            if transform_policy:
-                graph = transform_policy(graph, resource)
-
-            # sugraph
-            sugraph = SUGraphGener.gen_sugraph(graph.nodes())
-            if schedule_policy:
-                sugraph = schedule_policy(sugraph, resource)
+            if len(PAS) == 1:
+                graph = PAS[0](graph, resource)
+            elif len(PAS) == 3:
+                P, A, S = PAS
+                graph = P(graph, resource)
+                graph = A(graph, resource)
+                graph = S(graph, resource)
 
             # check assignment and order
-            # print(sugraph)
-            for su in sugraph.sus():
-                if len(su.device) == 0:
-                    raise RuntimeError(f"SU {su} device is not set")
+            for node in graph.nodes():
+                if len(node.device) == 0:
+                    raise RuntimeError(f"Node {node} device is not set")
             # if not SUGraph.is_topo_order(sugraph.sus()):
             #     raise RuntimeError(f"SUGraph order is not topological order")
 
-            execplan = ExectuionPlan(sugraph)
+            # generate adapter
+            graph = AdapterGener.gen(graph)
+
+            # to execution plan
+            execplan = ExectuionPlan(graph)
+
+            # plan pass for communication optimization
+            start = time.time()
+            execplan = Grouping.apply(execplan)
+            span = time.time() - start
+            print('> planpass on grouping operations: {:.2f} s'.format(span))
+
+
             # plan pass to adapt to pytorch semantic: multi branch gradient
             # TODO: residual support
             # execplan = TorchRefAdapter.apply(execplan)
             # plan pass to remove redundant sus
-            start = time.time()
-            execplan = RemoveRedundantAdapters.apply(execplan)
-            span = time.time() - start
-            print('> planpass on remove redundant adapter: {:.2f} s'.format(span))
-            # print(f'> after remove redundant adapters:\n {execplan}')
-            start = time.time()
-            execplan = MergeComputeSU.apply(execplan)
-            span = time.time() - start
-            print('> planpass on merge compute: {:.2f} s'.format(span))
-            # print(f'> after merge backward SU:\n {execplan}')
-            start = time.time()
-            execplan = WeightGradAllreduceFusion.apply(execplan)
-            span = time.time() - start
-            print('> planpass on grad allreduce: {:.2f} s'.format(span))
+            # start = time.time()
+            # execplan = RemoveRedundantAdapters.apply(execplan)
+            # span = time.time() - start
+            # print('> planpass on remove redundant adapter: {:.2f} s'.format(span))
+            # # print(f'> after remove redundant adapters:\n {execplan}')
+            # start = time.time()
+            # execplan = MergeComputeSU.apply(execplan)
+            # span = time.time() - start
+            # print('> planpass on merge compute: {:.2f} s'.format(span))
+            # # print(f'> after merge backward SU:\n {execplan}')
+            # start = time.time()
+            # execplan = WeightGradAllreduceFusion.apply(execplan)
+            # span = time.time() - start
+            # print('> planpass on grad allreduce: {:.2f} s'.format(span))
             # print(f'> after add allreduce:\n{execplan}')
 
-            start = time.time()
-            execplan = P2PFusion.apply(execplan)
-            span = time.time() - start
-            print('> planpass on p2p fusion: {:.2f} s'.format(span))
+            # start = time.time()
+            # execplan = P2PFusion.apply(execplan)
+            # span = time.time() - start
+            # print('> planpass on p2p fusion: {:.2f} s'.format(span))
             # print(f'> after fuse P2P SU:\n {execplan}')
 
             if torch.distributed.is_initialized():
@@ -194,14 +201,14 @@ def compile(model: SemanticModel, dataloader,
                     outfile = fname,
                     attach=True
                 )
+
             # get dataloader batch size
             batch_size = dict()  # {devid: batch size}
-            for su in sugraph.sus():
-                if su.stype == SUType.Dataloader:
-                    data_op: IRDataOperation = su.nodes(0)
-                    batch_dim = data_op.get_batch_dims()[0]
-                    dev_batch_size = data_op.outputs(0).shape[batch_dim]
-                    batch_size[su.device[0]] = dev_batch_size
+            for node in graph.nodes():
+                if isinstance(node, IRDataOperation):
+                    batch_dim = node.get_batch_dims()[0]
+                    dev_batch_size = node.outputs(0).shape[batch_dim]
+                    batch_size[node.device[0]] = dev_batch_size
             all_batch_size = set([batch_size[dev] for dev in batch_size])
             if len(all_batch_size) != 1:
                 raise NotImplementedError("Heterogenous batch size it not supported")

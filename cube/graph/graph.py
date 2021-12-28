@@ -287,6 +287,7 @@ class IRGraph(IRCell):
 
         This is temporary use to enable assign with multiple devices
         """
+        raise NotImplementedError("Replicate is not supported yet")
         if not isinstance(op, IRCell):
             raise TypeError("Expected an IRCell")
         if not isinstance(times, int) or times < 1:
@@ -296,22 +297,19 @@ class IRGraph(IRCell):
             raise RuntimeError(f"Op {op} not exsits")
     
         ops = [op]
-        mirror_ops = [op.mirror]
         for _ in range(times - 1):
-            cpy_op = op.replicate()
+            dup_op = op.replicate()
             if op.mirror is not None:
-                cpy_mirror_op = op.mirror.replicate()
-                mirror_ops.append(cpy_mirror_op)
-                IRCell.make_pair(cpy_op, cpy_mirror_op)
-            ops.append(cpy_op)
+                dup_op.gen_backward()
+            ops.append(dup_op)
         idx = self.nodes().index(op)
         # forward
         self._nodes = self._nodes[:idx] + ops + self._nodes[idx+1:]
         # backward
-        if op.mirror:
-            mirror_ops = mirror_ops[::-1]
+        if op.mirror is not None:
+            bops = [op.mirror for op in ops][::-1]
             midx = self.nodes().index(op.mirror)
-            self._nodes = self._nodes[:midx] + mirror_ops + self._nodes[midx+1:]
+            self._nodes = self._nodes[:midx] + bops + self._nodes[midx+1:]
         self.reset_dependency()
         return ops
 

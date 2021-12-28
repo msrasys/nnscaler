@@ -6,6 +6,7 @@ import torch
 import copy
 
 from cube.ir.cten import IRCell, IRTensor
+from cube.ir.dtype import IRDType
 from cube.graph.tensor import IRSubTensor
 from cube.graph.operator.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from cube.graph.operator.operator import IROptimOperation
@@ -26,6 +27,11 @@ class CodeGen:
         if not isinstance(execplan, ExectuionPlan):
             raise TypeError("execplan should be ExecutionPlan")
         self.execplan = execplan
+
+    def dtype_map(self, dtype: IRDType) -> str:
+        if not isinstance(dtype, IRDType):
+            raise TypeError("Expected IRDType")
+        return 'torch.' + dtype.value
 
     def node_naming(self, node: IRCell) -> str:
         return f"{node.name}{node._id}"
@@ -169,12 +175,13 @@ class ModelCodeGen(CodeGen):
         """
         Emit tensor declaration code
         """
+        sign = 'torch.nn.Parameter(torch.empty({shape}, dtype={dtype}))'
         for input in node.inputs():
             name = self.tensor_naming(input)
             if isinstance(input, IRTensor):
                 if input.is_param() and not self.symbols.exist(name):
                     self.symbols.create(name)
-                    code = f'{name} = torch.nn.Parameter(torch.empty({tuple(input.shape)}))'
+                    code = f'{name} = {sign.format(shape=tuple(input.shape), dtype=self.dtype_map(input.dtype))}'
                     self.declare_region.append(code)
             if isinstance(input, str):
                 if name.startswith('self.'):
@@ -233,7 +240,7 @@ class ModelCodeGen(CodeGen):
         for prim in node.prims():
             # emit select
             if isinstance(prim, SelectPrim):
-                sign = 'cube.runtime.transform.select({tensor}, {indmap}, {valmap})'
+                sign = 'cube.runtime.adapter.select({tensor}, {indmap}, {valmap})'
                 input = self.tensor_naming(prim.tensor)
                 output = self.tensor_naming(prim.output)
                 valmap = (prim.valmap.idx, prim.valmap.chunk_num)
@@ -241,8 +248,8 @@ class ModelCodeGen(CodeGen):
                 self.forward_region.append(code)
             # emit move
             elif isinstance(prim, MovePrim):
-                send_sign = 'cube.runtime.transform.send({tensor}, {send_rank})'
-                recv_sign = 'cube.runtime.transform.recv({shape}, {from_rank}, {dtype})'
+                send_sign = 'cube.runtime.adapter.send({tensor}, {send_rank})'
+                recv_sign = 'cube.runtime.adapter.recv({shape}, {from_rank}, {dtype})'
                 tensor = self.tensor_naming(prim.tensor)
                 # send
                 if rank == prim.from_rank:
@@ -251,11 +258,12 @@ class ModelCodeGen(CodeGen):
                 # recv
                 elif rank == prim.to_rank:
                     output = self.tensor_naming(prim.tensor)
-                    code = f'{tensor} = {recv_sign.format(shape=prim.shape, from_rank=prim.from_rank, dtype=prim.dtype)}'
+                    dtype = self.dtype_map(prim.dtype)
+                    code = f'{tensor} = {recv_sign.format(shape=prim.shape, from_rank=prim.from_rank, dtype=dtype)}'
                     self.forward_region.append(code)
             # emit merge
             elif isinstance(prim, MergePrim):
-                sign = 'cube.runtime.transformation.merge({tensors}, {concat}, {add})'
+                sign = 'cube.runtime.adapter.merge({tensors}, {concat}, {add})'
                 inputs = [self.tensor_naming(t) for t in prim.tensors]
                 inputs = '(' + ','.join(inputs + ['']) + ')'
                 output = self.tensor_naming(prim.output)
@@ -461,6 +469,8 @@ class ScheduleCodeGen(CodeGen):
                 foutputs = '(' + ', '.join(foutputs + ['']) + ')'
                 outputs = [self.tensor_naming(t) for t in outputs]
                 outputs = ', '.join(outputs)
+                if len(outputs) == 0:
+                    outputs = '_'
                 body = bsign.format(
                     input_tensors=finputs, output_tensors=foutputs, output_grads=inputs
                 )

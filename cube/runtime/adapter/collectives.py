@@ -5,7 +5,7 @@ from cube.runtime.device import DeviceGroup
 from cube.profiler.timer import CudaTimer
 
 
-def send(tensors: List[torch.Tensor], to_ranks: List[int]):
+def send(tensor: torch.Tensor, to_rank: int):
     """
     send tensor to the remote devices. Each tensor can be
     sent to multiple devices
@@ -16,18 +16,14 @@ def send(tensors: List[torch.Tensor], to_ranks: List[int]):
     """
     # print(f'{torch.distributed.get_rank()}: sending...')
     CudaTimer().start(field_name='comm')
+    
     send_ops = list()
-
-    ## synthetic ##
-    # return
-
-    for tensor, rank in zip(tensors, to_ranks):
-        if not tensor.is_contiguous():
-            tensor = tensor.contiguous()
-        send_op = torch.distributed.P2POp(
-            torch.distributed.isend, tensor, rank
-        )
-        send_ops.append(send_op)
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    send_op = torch.distributed.P2POp(
+        torch.distributed.isend, tensor, to_rank
+    )
+    send_ops.append(send_op)
     reqs = torch.distributed.batch_isend_irecv(send_ops)
     for req in reqs:
         req.wait()
@@ -35,37 +31,29 @@ def send(tensors: List[torch.Tensor], to_ranks: List[int]):
     CudaTimer().stop(field_name='comm')
 
 
-def recv(shapes: List[List[int]], from_ranks: List[int]):
-    CudaTimer().start(field_name='comm')
+def recv(shape: List[int], from_rank: int, dtype: torch.dtype):
     # print(f'{torch.distributed.get_rank()}: recving...')
-    recv_ops = list()
-    recv_tensors = list()
-
+    CudaTimer().start(field_name='comm')
     ## synthetic ##
     # for shape in shapes:
     #     recv_tensors.append(
     #         torch.ones(tuple(shape),
     #         device=torch.cuda.current_device()
     #     ))
-    for shape, rank in zip(shapes, from_ranks):
-        tensor = torch.empty(
-            shape, requires_grad=True, device=torch.cuda.current_device()
-        )
-        recv_tensors.append(tensor)
-        recv_op = torch.distributed.P2POp(
-            torch.distributed.irecv, tensor, rank
-        )
-        recv_ops.append(recv_op)
-    reqs = torch.distributed.batch_isend_irecv(recv_ops)
+    # 
+    tensor = torch.empty(
+        shape, requires_grad=True, dtype=dtype,
+        device=torch.cuda.current_device()
+    )
+    recv_op = torch.distributed.P2POp(
+        torch.distributed.irecv, tensor, from_rank
+    )
+    reqs = torch.distributed.batch_isend_irecv([recv_op])
     for req in reqs:
         req.wait()
     torch.cuda.synchronize()
-
     CudaTimer().stop(field_name='comm')
-
-    if    len(recv_tensors) == 0: return None
-    elif  len(recv_tensors) == 1: return recv_tensors[0]
-    else: return tuple(recv_tensors)
+    return tensor
 
 
 def send_and_recv(send_tensors, to_ranks, recv_shapes, from_ranks):
@@ -172,7 +160,7 @@ def reduce_scatter(tensors: List[torch.Tensor], ranks: List[int]):
     return output
 
 
-def broadcast(tensors: List[torch.Tensor], ranks: List[int], shape=None):
+def broadcast(tensors: List[torch.Tensor], ranks: List[int], shape=None, dtype=None):
     """
     Broadcast. ranks[0] is the root
     """
@@ -182,7 +170,7 @@ def broadcast(tensors: List[torch.Tensor], ranks: List[int], shape=None):
     if len(tensors) == 1:
         tensor = tensors[0]
     else:
-        tensor = torch.empty(shape, device=torch.cuda.current_device())
+        tensor = torch.empty(shape, device=torch.cuda.current_device(), dtype=dtype)
         # tensor.requires_grad_()
     group = DeviceGroup().get_group(ranks)
     torch.distributed.broadcast(tensor, ranks[0], group=group)

@@ -1,7 +1,7 @@
 from typing import List
 import torch
 from cube.runtime.device import DeviceGroup
-from cube.runtime.reducer import Reducer
+from cube.runtime.adapter.reducer import Reducer
 
 
 class CubeModule(torch.nn.Module):

@@ -1,72 +1,77 @@
 r"""
-SU Executor for runtime
+Executor for runtime
 """
 
 from typing import Tuple, Any, Callable, List
 import torch
 
 
-def fexecute(su: Callable, *input_tensors: Tuple[Any]):
+def fexecute(subgraph: Callable, *input_tensors: Tuple[Any]):
     """
-    forward the SUs
+    forward the sub-graph.
     """
-    outputs = su(*input_tensors)
+    outputs = subgraph(*input_tensors)
     # print('forwarding... ')
     return outputs
 
 
 def backward(input_tensors: List[torch.Tensor], output_tensors, output_tensor_grads):
     """
-    Backward the SUs
-    """
-    # for tensor in input_tensors:
-    #     if torch.is_tensor(tensor) and tensor.requires_grad:
-    #         tensor.retain_grad()
+    Backward Procedure.
 
-    if len(output_tensor_grads) != len(output_tensors):
-        raise RuntimeError(
-            "Expected same length of out tensors and grads"
-        )
-
-    inputs = list()
-    indmap = list()
-    for idx, input in enumerate(input_tensors):
-        if torch.is_tensor(input) and input.requires_grad:
-            inputs.append(input)
-            indmap.append(idx)
+    input_tensors: List[torch.Tensor]:
+        tensors that their gradient need to be computed, including parameters.
+        Correspoinding forward input tensors.
     
-    grads = [None] * len(input_tensors)
+    output_tensors:
+        tensors that start for gradient backward computation.
+        Corresponding to forward output tensors.
+
+    output_tensor_grads:
+        gradient tensors corresponding to output_tensors.
+
+    Returns:
+        gradient in order of non-parameter tensors in input_tensors.
+        (Note parameter tnesors already have gradient accumulated at .grad attribute)
+    """
+    # print(f'{torch.distributed.get_rank()}: backwarding... ')
+    inputs = list()
+    for input in enumerate(input_tensors):
+        # skip returning gradients of parameters
+        if torch.is_tensor(input) and not isinstance(input, torch.nn.Parameter):
+            inputs.append(inputs)
+    
+    grads = list()
     if len(inputs) != 0:
-        # print(f'{torch.distributed.get_rank()}: backwarding... ')
         in_grads = torch.autograd.grad(
             output_tensors, inputs, output_tensor_grads, allow_unused=True)
-        for idx, grad in zip(indmap, in_grads):
-            tensor = input_tensors[idx]
+        for tensor, grad in zip(inputs, in_grads):
             if isinstance(tensor, torch.nn.Parameter):
                 if tensor.grad is not None:
                     tensor.grad += grad
                 else:
                     tensor.grad = grad
-            grads[idx] = grad
-
-    # if len(inputs) != 0:
-    #     torch.autograd.backward(
-    #         output_tensors,
-    #         grad_tensors=output_tensor_grads,
-    #         inputs=inputs
-    #     )
-    #     for idx, tensor in zip(indmap, inputs):
-    #         grads[idx] = tensor.grad
-
-    # torch.autograd.backward(output_tensors, grad_tensors=output_tensor_grads)
-    # grads = list()
-    # for tensor in input_tensors:
-    #     # print('backward input tensor: {}'.format(tensor))
-    #     if torch.is_tensor(tensor) and tensor.requires_grad:
-    #         grads.append(tensor.grad)
-    #     else:
-    #         grads.append(None)
+            else:
+                grads.append(grad)
 
     if    len(grads) == 0: return None
     elif  len(grads) == 1: return grads[0]
     else: return tuple(grads)
+
+
+def backwardV2(input_tensors: List[torch.Tensor], output_tensors, output_tensor_grads):
+    inputs = list()
+    for input in enumerate(input_tensors):
+        # skip returning parameters
+        if torch.is_tensor(input) and not isinstance(input, torch.nn.Parameter):
+            inputs.append(inputs)
+    for tensor in input_tensors:
+        if torch.is_tensor(tensor) and tensor.requires_grad:
+            tensor.retain_grad()
+    torch.autograd.backward(
+        output_tensors,
+        grad_tensors=output_tensor_grads,
+        inputs=input_tensors
+    )
+    grads = [input.grad for input in inputs]
+    return grads

@@ -268,7 +268,7 @@ class IRAdapter(IRCell):
         # check local tensor
         if otensor in local:
             intersections.append(otensor)
-            inputs.append(ptensor)
+            inputs.append(otensor)
             return inputs, intersections, prims
 
         # FIXME: multi producer may result overlapped region
