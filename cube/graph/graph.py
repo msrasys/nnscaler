@@ -205,10 +205,14 @@ class IRGraph(IRCell):
         outputs = list()
         for t in sub_inputs:
             if isinstance(t, IRSubTensor) and t not in sub_outputs:
-                inputs.append(t)
+                if t not in inputs:
+                    inputs.append(t)
         for t in sub_outputs:
-            if isinstance(t, IRSubTensor) and t in remain_inputs:
-                outputs.append(t)
+            if isinstance(t, IRSubTensor):
+                # not consumed or used outside this subgraph
+                if t not in sub_inputs or t in remain_inputs:
+                    if t not in outputs:
+                        outputs.append(t)
         subgraph = IRGraph(
             nodes = sub_nodes,
             inputs = inputs,

@@ -400,14 +400,19 @@ class ScheduleCodeGen(CodeGen):
         Generate scheduling code based on the given sus
         """
         gencode = copy.copy(self.init_code)
-        device_sus = self.execplan.sequence(device)
+
+        device_nodes = self.execplan.sequence(device)
+        for idx, node in enumerate(device_nodes):
+            if isinstance(node, IRAdapter):
+                node = node.dispatch(rank=device)
+                device_nodes[idx] = node
 
         # generate code
         with FunctionBlock(func_name='_train_step', 
                            args=['model', 'dataloader']) as fb:
-            if len(device_sus) == 0:
+            if len(device_nodes) == 0:
                 fb.insert_body('pass')
-            for node in device_sus:
+            for node in device_nodes:
                 name = self.node_naming(node)
                 code = self.emit_node(node, name=name)
                 fb.insert_body(code)
@@ -430,8 +435,10 @@ class ScheduleCodeGen(CodeGen):
         
         inputs = [self.tensor_naming(t) for t in node.inputs() if not t.is_param()]
         outputs = [self.tensor_naming(t) for t in node.outputs()]
-        inputs = '(' + ','.join(inputs + ['']) + ')'
+        inputs = '(' + ', '.join(inputs + ['']) + ')'
         outputs = ', '.join(outputs)
+        if len(outputs) == 0:
+            outputs = '_'
 
         if isinstance(node, IRGraph):
             is_backward = all([isinstance(n, IRBpOperation) for n in node.nodes()])
@@ -442,10 +449,17 @@ class ScheduleCodeGen(CodeGen):
             # emit backward
             else:
                 finputs = [t.data for t in node.outputs() if isinstance(t, IRSubTensor)]
-                finputs = '(' + ','.join(finputs + ['']) + ')'
                 foutputs = [t.data for t in node.inputs() if isinstance(t, IRSubTensor)]
-                foutputs = '(' + ','.join(foutputs + ['']) + ')'
-                outputs = [self.tensor_naming(t) for t in node.outputs() if isinstance(t, IRSubTensor)]
+                outputs = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
+                # remove weight gradient in outputs
+                for input in finputs:
+                    if input.is_param():
+                        outputs.remove(input.grad)
+                finputs = [self.tensor_naming(t) for t in finputs]
+                finputs = '(' + ', '.join(finputs + ['']) + ')'
+                foutputs = [self.tensor_naming(t) for t in foutputs]
+                foutputs = '(' + ', '.join(foutputs + ['']) + ')'
+                outputs = [self.tensor_naming(t) for t in outputs]
                 outputs = ', '.join(outputs)
                 body = bsign.format(
                     input_tensors=finputs, output_tensors=foutputs, output_grads=inputs
