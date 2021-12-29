@@ -41,7 +41,7 @@ class CodeGen:
         Return the var name (unique for different variable)
         """
         if isinstance(tensor, IRTensor):
-            tensor_name = 'tensor' if tensor.name is None else tensor.name
+            tensor_name = tensor.name
             if '.' in tensor_name:
                 tensor_name = tensor_name.split('.')[0]
             name = '_'.join([tensor_name, str(tensor._id)])
@@ -271,6 +271,12 @@ class ModelCodeGen(CodeGen):
                 self.forward_region.append(code)
             else:
                 raise TypeError(f"Unkown primitive types {type(prim)} of Adapter")
+        # requires grad generation
+        sign = '{output} = {output}.contiguous().requires_grad_()'
+        for output in node.outputs():
+            if isinstance(output, IRSubTensor):
+                code = sign.format(output=self.tensor_naming(output))
+                self.forward_region.append(code)
 
     # def emit_comm_call(self, node):
     #     """
@@ -443,10 +449,8 @@ class ScheduleCodeGen(CodeGen):
         
         inputs = [self.tensor_naming(t) for t in node.inputs() if not t.is_param()]
         outputs = [self.tensor_naming(t) for t in node.outputs()]
-        inputs = '(' + ', '.join(inputs + ['']) + ')'
-        outputs = ', '.join(outputs)
-        if len(outputs) == 0:
-            outputs = '_'
+        inputs = self.tuple_naming(inputs)
+        outputs = self.return_naming(outputs)
 
         if isinstance(node, IRGraph):
             is_backward = all([isinstance(n, IRBpOperation) for n in node.nodes()])
@@ -456,21 +460,18 @@ class ScheduleCodeGen(CodeGen):
                 code = f'{outputs} = {body}'
             # emit backward
             else:
-                finputs = [t.data for t in node.outputs() if isinstance(t, IRSubTensor)]
-                foutputs = [t.data for t in node.inputs() if isinstance(t, IRSubTensor)]
-                outputs = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
+                finputs = [t for t in node.mirror.inputs() if t.requires_grad]
+                foutputs = node.mirror.outputs()
+                inputs = [t.grad for t in foutputs]
+                outputs = [t.grad for t in finputs]
                 # remove weight gradient in outputs
                 for input in finputs:
                     if input.is_param():
                         outputs.remove(input.grad)
-                finputs = [self.tensor_naming(t) for t in finputs]
-                finputs = '(' + ', '.join(finputs + ['']) + ')'
-                foutputs = [self.tensor_naming(t) for t in foutputs]
-                foutputs = '(' + ', '.join(foutputs + ['']) + ')'
-                outputs = [self.tensor_naming(t) for t in outputs]
-                outputs = ', '.join(outputs)
-                if len(outputs) == 0:
-                    outputs = '_'
+                finputs = self.tuple_naming(finputs)
+                foutputs = self.tuple_naming(foutputs)
+                inputs = self.tuple_naming(inputs)
+                outputs = self.return_naming(outputs)
                 body = bsign.format(
                     input_tensors=finputs, output_tensors=foutputs, output_grads=inputs
                 )
@@ -480,8 +481,8 @@ class ScheduleCodeGen(CodeGen):
             if len(node.inputs()) != 0:
                 raise RuntimeError("Expect Dataloader node has no inputs")
             outputs = [self.tensor_naming(output) for output in node.outputs()]
-            return_val = ','.join(outputs)
-            code = f'{return_val} = next(dataloader)'
+            outputs = self.return_naming(outputs)
+            code = f'{outputs} = next(dataloader)'
 
         elif isinstance(node, IRAdapter):
             body = fsign.format(model=f'model.{name}', inputs=inputs)
@@ -490,6 +491,19 @@ class ScheduleCodeGen(CodeGen):
         else:
             raise RuntimeError(f"Unspported node type: {type(node)}")
         return code
+
+    def tuple_naming(self, tensors: List[Any]) -> str:
+        tensors = [self.tensor_naming(t) for t in tensors]
+        tensors = '(' + ', '.join(tensors + ['']) + ')'
+        return tensors
+
+    def return_naming(self, tensors: List[Any]) -> str:
+        tensors = [self.tensor_naming(t) for t in tensors]
+        if len(tensors) == 0:
+            tensors = '_'
+        else:
+            tensors = ', '.join(tensors)
+        return tensors
 
     def tensor_naming(self, tensor: Any):
         """

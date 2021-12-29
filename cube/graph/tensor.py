@@ -582,9 +582,11 @@ class IRSubTensor(IRTensor):
         forward cell
         """
         if not self.requires_grad:
+            self.grad = None
             return None
         full_grad = self.parent.grad
         if full_grad is None:
+            self.grad = None
             return None
         if self in fcell.inputs():
             ref_cells = list()

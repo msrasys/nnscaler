@@ -15,7 +15,9 @@ def fexecute(subgraph: Callable, *input_tensors: Tuple[Any]):
     return outputs
 
 
-def backward(input_tensors: List[torch.Tensor], output_tensors, output_tensor_grads):
+def backward(input_tensors : List[torch.Tensor],
+             output_tensors: List[torch.Tensor],
+             output_tensor_grads: List[torch.Tensor]):
     """
     Backward Procedure.
 
@@ -34,26 +36,23 @@ def backward(input_tensors: List[torch.Tensor], output_tensors, output_tensor_gr
         gradient in order of non-parameter tensors in input_tensors.
         (Note parameter tnesors already have gradient accumulated at .grad attribute)
     """
-    # print(f'{torch.distributed.get_rank()}: backwarding... ')
-    inputs = list()
-    for input in enumerate(input_tensors):
-        # skip returning gradients of parameters
-        if torch.is_tensor(input) and not isinstance(input, torch.nn.Parameter):
-            inputs.append(inputs)
-    
+    if len(input_tensors) == 0:
+        return None
     grads = list()
-    if len(inputs) != 0:
-        in_grads = torch.autograd.grad(
-            output_tensors, inputs, output_tensor_grads, allow_unused=True)
-        for tensor, grad in zip(inputs, in_grads):
-            if isinstance(tensor, torch.nn.Parameter):
-                if tensor.grad is not None:
-                    tensor.grad += grad
-                else:
-                    tensor.grad = grad
+    in_grads = torch.autograd.grad(
+        outputs = output_tensors,
+        inputs  = input_tensors,
+        grad_outputs = output_tensor_grads,
+        allow_unused=True
+    )
+    for tensor, grad in zip(input_tensors, in_grads):
+        if isinstance(tensor, torch.nn.Parameter):
+            if tensor.grad is not None:
+                tensor.grad += grad
             else:
-                grads.append(grad)
-
+                tensor.grad = grad
+        else:
+            grads.append(grad)
     if    len(grads) == 0: return None
     elif  len(grads) == 1: return grads[0]
     else: return tuple(grads)

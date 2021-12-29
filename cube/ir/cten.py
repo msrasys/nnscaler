@@ -394,11 +394,14 @@ class IRCell:
 class IRTensor:
     """
     IRTensor serves as IRGraph edge
+
+    Note by setting IRTensor name to "None" indicates this tensor holds nothing
+    and will be translated to None in code generation. 
     """
 
     _attr = ['name', '_is_param', '_requires_grad', '_is_grad', '_grad', '_dtype']
 
-    def __init__(self, shape=None, name=None, dtype=IRDType.unknown):
+    def __init__(self, shape=None, name='tensor', dtype=IRDType.unknown):
 
         self._id: int = IDGenerator().gen_tensor_id()
         self._shape: Optional(List[int]) = shape

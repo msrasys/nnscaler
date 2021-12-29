@@ -1,4 +1,5 @@
 
+from numpy import isin
 from cube.graph.graph import IRGraph
 from cube.graph.adapter.adapter import IRAdapter
 from cube.graph.operator.operator import IRBpOperation, IRFwOperation
@@ -9,6 +10,11 @@ class AdapterGener:
 
     @staticmethod
     def gen(graph: IRGraph) -> IRGraph:
+        # update the gradient before generate adapter
+        for node in graph.nodes():
+            if isinstance(node, IRBpOperation):
+                node.update()
+        # generate adapter
         for node in graph.nodes():
             if isinstance(node, IRFwOperation):
                 for input in node.inputs():
