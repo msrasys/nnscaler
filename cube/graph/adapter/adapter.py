@@ -190,6 +190,24 @@ class IRAdapter(IRCell):
                 prims.append(prim)
         return prims
 
+    def idevice(self, input_index: int) -> List[int]:
+        """
+        Get device for input tensor at input index.
+
+        Returns:
+            device: List[int]
+        """
+        return self._idevices[input_index]
+
+    def odevice(self, output_index: int) -> List[int]:
+        """
+        Get device for output tensor at output index.
+
+        Returns:
+            device: List[int]
+        """
+        return self._odevices[output_index]
+
     def dispatch(self, rank: int):
         """
         Get Adapter for a specific rank
