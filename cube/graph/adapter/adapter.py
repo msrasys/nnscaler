@@ -228,13 +228,6 @@ class IRAdapter(IRCell):
         """
         return len(self._prims) == 0
 
-    def __repr__(self):
-        dscp = f'Adapter{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
-        return dscp
-
-    def module_repr(self) -> str:
-        return repr(self)
-
     @staticmethod
     def gen(dst_tensor: IRSubTensor):
         # print(f'generating adapter for: {dst_tensor}')
@@ -368,6 +361,13 @@ class IRAdapter(IRCell):
                 raise RuntimeError("Merge Plan not found")
         return prims
 
+    def __repr__(self):
+        dscp = f'Adapter{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
+        return dscp
+
+    def module_repr(self) -> str:
+        return repr(self)
+
     def extra_repr(self):
         """
         Detailed information
@@ -377,3 +377,21 @@ class IRAdapter(IRCell):
         for prim in self._select_prims + self._move_prims + self._merge_prims:
             dscp += '\t' + repr(prim) + '\n'
         return dscp
+
+
+class IRWeightReducer(IRCell):
+
+    def __init__(self, weights: List[IRSubTensor], name='reducer'):
+        if not all([isinstance(w, IRSubTensor) and w.is_param() for w in weights]):
+            raise RuntimeError("Expected a list of gradient IRSubTensor")
+        signature = None
+        super().__init__(name, signature, len(weights), 0)
+        for idx, weight in enumerate(weights):
+            self.set_input(idx, weight)
+
+    def __repr__(self):
+        dscp = f'WReducer{self._id}-{self.device}(inputs={self.inputs()})'
+        return dscp
+
+    def module_repr(self) -> str:
+        return repr(self)

@@ -1,7 +1,7 @@
 """
 Generate Pytorch code given the model DAG and the transformation config
 """
-from typing import List, Any
+from typing import Dict, List, Any, Tuple
 import torch
 import copy
 
@@ -9,8 +9,8 @@ from cube.ir.cten import IRCell, IRTensor
 from cube.ir.dtype import IRDType
 from cube.graph.tensor import IRSubTensor
 from cube.graph.operator.operator import IRBpOperation, IRDataOperation, IRFwOperation
-from cube.graph.operator.operator import IROptimOperation
 from cube.graph.adapter.adapter import IRAdapter, SelectPrim, MovePrim, MergePrim
+from cube.graph.adapter.adapter import IRWeightReducer
 from cube.execplan import ExectuionPlan
 # from cube.schedule.adapter.collectives import IRCollectives
 
@@ -70,26 +70,29 @@ class ModelCodeGen(CodeGen):
         self.symbols = SymbolTable()
         # ref module to check shared variables
         self._ref_module = torch.nn.Module()
-        # groups
-        self._all_comm_groups = list()
-        # self.get_all_groups()
 
-    def get_all_groups(self):
+    def init_comm_groups(self):
         """
         Get all communication groups.
 
         Creating communication group requires all the devices
         enter the same call.
         """
-        raise NotImplementedError
-        for devid in self.execplan.devices():
-            for su in self.execplan.sequence(devid):
-                if su.stype == SUType.Coll:
-                    ranks = list(su.nodes(0).ranks)
-                    ranks.sort()
-                    ranks = tuple(ranks)
-                    if ranks not in self._all_comm_groups:
-                        self._all_comm_groups.append(ranks)
+        sign = 'self.init_group(ranks={ranks})'
+        # collect groups from weight reducer
+        comm_groups: Dict[Tuple[int]] = list()
+        for node in self.execplan.graph.nodes():
+            if isinstance(node, IRWeightReducer):
+                ranks = list(node.device)
+                ranks.sort()
+                ranks = tuple(ranks)
+                if ranks not in comm_groups:
+                    comm_groups.append(ranks)
+        # TODO: collect groups from p2p fusion
+        # create communication group
+        for ranks in comm_groups:
+            code = sign.format(ranks=list(ranks))
+            self.declare_region.append(code)
 
     def gen(self, device: int, outfile=None, attach=False) -> str:
         """
@@ -99,8 +102,8 @@ class ModelCodeGen(CodeGen):
         node_args: List[List[str]] = list()
         gen_nodes: List[IRCell] = list()
 
-        # TODO init group
-        # self.emit_comm_group_creation()
+        # initialize communication groups
+        self.init_comm_groups()
 
         # parse graph body
         for node in self.execplan.sequence(device):
@@ -116,9 +119,9 @@ class ModelCodeGen(CodeGen):
                 self.emit_adapter_call(node)
             # elif isinstance(node, IRCollectives):
             #     self.emit_collective_call(node)
-            elif isinstance(node, IROptimOperation):
-                self.emit_optim_init(node)
-                self.emit_optim_call(node)
+            elif isinstance(node, IRWeightReducer):
+                self.emit_reducer_init(node)
+                self.emit_reducer_call(node)
             elif isinstance(node, IRBpOperation):
                 continue
             elif isinstance(node, IRDataOperation):
@@ -198,17 +201,6 @@ class ModelCodeGen(CodeGen):
                 raise RuntimeError("IRBpOperation is not expected in GenModel")
             self.emit_op_call(node)
 
-
-    # def emit_comm_group_creation(self):
-    #     """
-    #     Emit communication group creation code
-    #     """
-    #     sign = 'self.init_group(ranks={ranks})'
-    #     for ranks in self._all_comm_groups:
-    #         ranks = list(ranks)
-    #         code = sign.format(ranks=ranks)
-    #         self.declare_region.append(code)
-
     def emit_op_call(self, node: IRFwOperation):
         """
         Emit op forward code
@@ -278,98 +270,26 @@ class ModelCodeGen(CodeGen):
                 code = sign.format(output=self.tensor_naming(output))
                 self.forward_region.append(code)
 
-    # def emit_comm_call(self, node):
-    #     """
-    #     Emit communication code
-    #     """
-    #     comm_code = node.signature
-    #     send_tensors = self._forward_region_arg_names(node.inputs())
-    #     send_tensors = '(' + ', '.join(send_tensors + ['']) + ')'
-    #     send_ranks = node.send_ranks
-    #     recv_tensors = self._forward_region_arg_names(node.outputs())
-    #     recv_tensors = ', '.join(recv_tensors)
-    #     recv_shapes = [tensor.shape for tensor in node.outputs()]
-    #     recv_ranks = node.recv_ranks
-    #     if node.comm_type == IRCommType.Send:
-    #         code = f'{comm_code}({send_tensors}, {send_ranks})'
-    #     elif node.comm_type == IRCommType.Recv:
-    #         code = f'{recv_tensors} = {comm_code}({recv_shapes}, {recv_ranks})'
-    #     elif node.comm_type == IRCommType.SendRecv:
-    #         code = f'{recv_tensors} = {comm_code}({send_tensors}, {send_ranks}, {recv_shapes}, {recv_ranks})'
-    #     else:
-    #         raise TypeError(f"Unsupported IRCommmNode: {node.comm_type}")
-    #     self.forward_region.append(code)
-
-    # def emit_collective_call(self, node):
-    #     ranks = node.ranks
-    #     inputs = self._forward_region_arg_names(node.inputs())
-    #     shape = None
-    #     if len(inputs) == 0:
-    #         assert len(node.outputs()) == 1
-    #         shape = node.outputs(0).shape
-    #     inputs = '(' + ', '.join(inputs + ['']) + ')'
-    #     outputs = self._forward_region_arg_names(node.outputs())
-    #     outputs = ', '.join(outputs)
-    #     if shape:
-    #         code = f'{node.signature}({inputs}, {ranks}, {shape})'
-    #     else:
-    #         code = f'{node.signature}({inputs}, {ranks})'
-    #     if outputs:
-    #         code = f'{outputs} = {code}'
-    #     self.forward_region.append(code)
-
-    # def emit_transform_call(self, node):
-    #     """
-    #     Emit in-device tensor select / merge call.
-    #     """
-    #     for prim in node.trace():
-    #         if isinstance(prim, SelectPrim):
-    #             signature = 'cube.runtime.transform.select({tensor}, {indmap}, {valmap})'
-    #             input = self.tensor_naming(prim.tensor)
-    #             indmap = repr(prim.indmap)
-    #             valmap = repr(tuple([prim.valmap.idx, prim.valmap.chunk_num]))
-    #             output = self.tensor_naming(prim.output)
-    #             code = f'{output} = {signature.format(tensor=input, indmap=indmap, valmap=valmap)}'
-    #             self.forward_region.append(code)
-    #         elif isinstance(prim, MergePrim):
-    #             signature = 'cube.runtime.transform.merge({tensors}, {concat}, {add})'
-    #             inputs = self._forward_region_arg_names(prim.tensors)
-    #             inputs = '(' + ', '.join(inputs) + ')'
-    #             output = self.tensor_naming(prim.output)
-    #             code = f'{output} = {signature.format(tensors=inputs, concat=prim.concat, add=prim.add)}'
-    #             self.forward_region.append(code)
-    #         else:
-    #             raise RuntimeError(f"Not supported prim: {type(prim)}")
-    #     for output in node.outputs():
-    #         # contiguous and requires grad
-    #         output_name = self.tensor_naming(output)
-    #         code = f'{output_name} = {output_name}.contiguous()'
-    #         self.forward_region.append(code)
-    #         if not output.is_grad():
-    #             code = f'{output_name} = {output_name}.requires_grad_()'
-    #             self.forward_region.append(code)
-
-    def emit_optim_init(self, node: IROptimOperation):
+    def emit_reducer_init(self, node: IRWeightReducer):
         # reducer init interface
-        reducer_init = '{reducer} = cube.runtime.reducer.Reducer(ranks={ranks})'
+        reducer_init = '{reducer} = cube.runtime.adapter.Reducer(ranks={ranks})'
         reducer_add = 'self.add_reducer({reducer})'
-        add_param = '{reducer}.add_param({grad})'
+        add_param = '{reducer}.add_param({weight})'
         # create reducer in declare region
-        ranks = list(node.ranks)
-        grads = node.inputs()
-        reducer_name = f'self.reducer{node._id}'
+        weights = node.inputs()
+        reducer_name = f'self.wreducer{node._id}'
         self.declare_region.append('')
-        init_code = reducer_init.format(reducer=reducer_name, ranks=ranks)
+        init_code = reducer_init.format(reducer=reducer_name, ranks=node.device)
         self.declare_region.append(init_code)
-        grads = [self.tensor_naming(t) for t in grads]
-        for grad in grads:
-            add_param_code = add_param.format(reducer=reducer_name, grad=grad)
+        weights = [self.tensor_naming(t) for t in weights]
+        for weight in weights:
+            add_param_code = add_param.format(reducer=reducer_name, weight=weight)
             self.declare_region.append(add_param_code)
         add_code = reducer_add.format(reducer=reducer_name)
         self.declare_region.append(add_code)
 
-    def emit_optim_call(self, node: IROptimOperation):
-        reducer_name = f'self.reducer{node._id}'
+    def emit_reducer_call(self, node: IRWeightReducer):
+        reducer_name = f'self.wreducer{node._id}'
         call_code = f'{reducer_name}.allreduce()'
         self.forward_region.append(call_code)
 
@@ -486,6 +406,10 @@ class ScheduleCodeGen(CodeGen):
 
         elif isinstance(node, IRAdapter):
             body = fsign.format(model=f'model.{name}', inputs=inputs)
+            code = f'{outputs} = {body}'
+
+        elif isinstance(node, IRWeightReducer):
+            body = fsign.format(model=f'model.{name}', inputs='()')
             code = f'{outputs} = {body}'
 
         else:
