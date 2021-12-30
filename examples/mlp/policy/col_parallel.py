@@ -48,7 +48,7 @@ def PAS(graph: IRGraph, resource):
     """
     for node in graph.nodes():
         if isinstance(node, IRFwOperation) or isinstance(node, IRDataOperation):
-            algo = node.algorithms('data')
+            algo = node.algorithms('column')
             if algo:
                 sub_nodes = graph.partition(
                     node, algo, config=dict(chunk_num=resource.ngpus)
