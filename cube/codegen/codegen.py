@@ -9,7 +9,7 @@ from cube.ir.cten import IRCell, IRTensor
 from cube.ir.dtype import IRDType
 from cube.graph.tensor import IRSubTensor
 from cube.graph.operator.operator import IRBpOperation, IRDataOperation, IRFwOperation
-from cube.graph.adapter.adapter import IRAdapter, SelectPrim, MovePrim, MergePrim
+from cube.graph.adapter.adapter import CollectivePrim, IRAdapter, SelectPrim, MovePrim, MergePrim
 from cube.graph.adapter.adapter import IRWeightReducer
 from cube.execplan import ExectuionPlan
 # from cube.schedule.adapter.collectives import IRCollectives
@@ -256,10 +256,23 @@ class ModelCodeGen(CodeGen):
             # emit merge
             elif isinstance(prim, MergePrim):
                 sign = 'cube.runtime.adapter.merge({tensors}, {concat}, {add})'
-                inputs = [self.tensor_naming(t) for t in prim.tensors]
-                inputs = '(' + ','.join(inputs + ['']) + ')'
+                inputs = self.tuple_naming(prim.tensors)
                 output = self.tensor_naming(prim.output)
                 code = f'{output} = {sign.format(tensors=inputs, concat=prim.concat, add=prim.add)}'
+                self.forward_region.append(code)
+            # emit collectives
+            elif isinstance(prim, CollectivePrim):
+                sign = 'cube.runtime.adapter.{ctype}({input_tensors}, {output_shapes}, {output_dtypes}, {group})'
+                inputs = self.tuple_naming(prim.inputs)
+                outputs = self.return_naming(prim.outputs)
+                body = sign.format(
+                    ctype=prim.ctype.value,
+                    input_tensors = inputs,
+                    output_shapes = prim.output_shapes,
+                    output_dtypes = prim.output_dtypes,
+                    group=prim.group
+                )
+                code = f'{outputs} = {body}'
                 self.forward_region.append(code)
             else:
                 raise TypeError(f"Unkown primitive types {type(prim)} of Adapter")
@@ -292,6 +305,19 @@ class ModelCodeGen(CodeGen):
         reducer_name = f'self.wreducer{node._id}'
         call_code = f'{reducer_name}.allreduce()'
         self.forward_region.append(call_code)
+
+    def return_naming(self, tensors: List[Any]) -> str:
+        tensors = [self.tensor_naming(t) for t in tensors]
+        if len(tensors) == 0:
+            tensors = '_'
+        else:
+            tensors = ', '.join(tensors)
+        return tensors
+
+    def tuple_naming(self, tensors: List[Any]) -> str:
+        tensors = [self.tensor_naming(t) for t in tensors]
+        tensors = '(' + ', '.join(tensors + ['']) + ')'
+        return tensors
 
     def tensor_naming(self, tensor: Any):
         """

@@ -1,10 +1,12 @@
 
+from enum import Enum
 from typing import List, Optional, Tuple
 import copy
 import numpy as np
 
 from cube.graph.tensor import IRSubTensor, IndexMap, ValueMap
 from cube.ir.cten import IRCell
+from cube.ir.dtype import IRDType
 
 
 class SelectPrim:
@@ -35,6 +37,57 @@ class MovePrim:
 
     def __repr__(self):
         dscp = f'move({self.tensor}, from={self.from_rank}, to={self.to_rank})'
+        return dscp
+
+
+class CollectivePrim:
+
+    class Type(Enum):
+        AllReduce = 'all_reduce'
+        AllGather = 'all_gather'
+        ReduceScatter = 'reduce_scatter'
+        Broadcast = 'broadcast'
+
+    def __init__(self, ctype: Enum,
+                 device: List[int],
+                 group: List[int],
+                 inputs: List[IRSubTensor] = None,
+                 input_shapes: List[List[int]] = None,
+                 input_dtypes: List[IRDType] = None,
+                 outputs: List[IRSubTensor] = None,
+                 output_shapes: List[List[int]] = None,
+                 output_dtypes: List[IRDType] = None):
+        """
+        inputs:
+            the collective input tensors. Including remote tensors.
+        src_ranks:
+            the tensor rank for each corresponding input tensor
+        outputs:
+            the collective output tensors. Including remote tensors.
+        dst_ranks:
+            the tensor rank for each corresponding output tensor
+        device:
+            the collective to be performed rank.
+            Note n-device collective will have n CollectivePrim,
+            each needs to be assigned with a single device rank.
+        """
+        self.ctype = ctype
+        # inputs
+        self.inputs: List[IRSubTensor] = inputs
+        self.input_shapes: List[IRSubTensor] = input_shapes
+        self.input_dtypes: List[IRDType] = input_dtypes
+        # outputs
+        self.outputs: List[IRSubTensor] = outputs
+        self.output_shapes: List[IRSubTensor] = output_shapes
+        self.output_dtypes: List[IRDType] = output_dtypes
+        # communication group
+        group.sort()
+        self.group: List[int] = group
+        # device
+        self.device = device
+
+    def __repr__(self):
+        dscp = f'{self.outputs} = {self.ctype.value}(inputs={self.inputs}, group={self.group})'
         return dscp
 
 
@@ -176,7 +229,7 @@ class IRAdapter(IRCell):
             device.update(prim.device)
         self.device = list(device)
 
-    def prims(self, select=True, move=True, merge=True):
+    def prims(self, select=True, move=True, merge=True, coll=True):
         """
         Return prim list
         """
@@ -188,25 +241,33 @@ class IRAdapter(IRCell):
                 prims.append(prim)
             if merge and isinstance(prim, MergePrim):
                 prims.append(prim)
+            if coll and isinstance(prim, CollectivePrim):
+                prims.append(prim)
         return prims
 
-    def idevice(self, input_index: int) -> List[int]:
+    def idevice(self, input_index: int = None) -> List[int]:
         """
         Get device for input tensor at input index.
 
         Returns:
             device: List[int]
         """
-        return self._idevices[input_index]
+        if isinstance(input_index, int):
+            return self._idevices[input_index]
+        else:
+            return copy.copy(self._idevices)
 
-    def odevice(self, output_index: int) -> List[int]:
+    def odevice(self, output_index: int = None) -> List[int]:
         """
         Get device for output tensor at output index.
 
         Returns:
             device: List[int]
         """
-        return self._odevices[output_index]
+        if isinstance(output_index, int):
+            return self._odevices[output_index]
+        else:
+            return copy.copy(self._odevices)
 
     def dispatch(self, rank: int):
         """
@@ -392,7 +453,7 @@ class IRAdapter(IRCell):
         """
         dscp = repr(self) + ':\n'
         # select
-        for prim in self._select_prims + self._move_prims + self._merge_prims:
+        for prim in self._prims:
             dscp += '\t' + repr(prim) + '\n'
         return dscp
 

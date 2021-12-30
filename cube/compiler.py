@@ -19,6 +19,7 @@ from cube.execplan import ExectuionPlan
 # from cube.execplan.planpass.gfuse import WeightGradAllreduceFusion
 # from cube.execplan.planpass.p2pfusion import P2PFusion
 from cube.execplan.planpass.grouping import Grouping
+from cube.execplan.planpass.fusion import P2PFusion
 
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
@@ -155,6 +156,11 @@ def compile(model: SemanticModel, dataloader,
             execplan = Grouping.apply(execplan)
             span = time.time() - start
             print('> planpass on grouping operations: {:.2f} s'.format(span))
+
+            start = time.time()
+            execplan = P2PFusion.apply(execplan)
+            span = time.time() - start
+            print('> planpass on p2pfusion operations: {:.2f} s'.format(span))
 
 
             # plan pass to adapt to pytorch semantic: multi branch gradient
