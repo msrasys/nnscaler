@@ -2,7 +2,7 @@ from typing import List
 import torch
 
 from cube.runtime.device import DeviceGroup
-from cube.profiler.timer import CudaTimer
+from cube.profiler.timer import CudaTimer, print_each_rank
 
 
 def send(tensor: torch.Tensor, to_rank: int):
@@ -95,22 +95,27 @@ def send_and_recv(send_tensors, to_ranks, recv_shapes, from_ranks):
     else: return tuple(recv_tensors)
 
 
-def all_reduce(tensors: List[torch.Tensor], ranks: List[int]):
+### Collective Universal Interface ###
+# def universal(input_tensors: List[torch.Tensor],
+#               output_shapes: List[List[int]],
+#               output_dtypes: List[torch.dtype],
+#               ranks: List[int])
+
+
+def all_reduce(input_tensors: List[torch.Tensor],
+               output_shapes: List[List[int]],
+               output_dtypes: List[torch.dtype],
+               ranks: List[int]) -> torch.Tensor:
     """
     Allreduce
     """
     CudaTimer().start(field_name='comm')
-    # print(f'{torch.distributed.get_rank()}: all_reduce...')
-    assert len(tensors) == 1
-    tensor = tensors[0]
+    assert len(input_tensors) == 1
+    tensor = input_tensors
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
     tensor = tensor.detach()
     tensor = tensor.requires_grad_()
-
-    ### Bypass ###
-    # return tensor
-
     group = DeviceGroup().get_group(ranks)
     torch.distributed.all_reduce(tensor, group=group)
 
@@ -118,62 +123,62 @@ def all_reduce(tensors: List[torch.Tensor], ranks: List[int]):
     return tensor
 
 
-def all_gather(tensors: List[torch.Tensor], ranks: List[int]):
+def all_gather(input_tensors: List[torch.Tensor],
+               output_shapes: List[List[int]],
+               output_dtypes: List[torch.dtype],
+               ranks: List[int]) -> List[torch.Tensor]:
     """
     Allgather
     """
-    # print(f'{torch.distributed.get_rank()}: all_gather...')
     CudaTimer().start(field_name='comm')
-
-    assert len(tensors) == 1
-    tensor = tensors[0]
+    assert len(input_tensors) == 1
+    tensor = input_tensors[0]
     group = DeviceGroup().get_group(ranks)
     tensor_list = [torch.empty_like(tensor) for _ in ranks]
     idx = ranks.index(DeviceGroup().rank)
     tensor_list[idx] = tensor
     torch.distributed.all_gather(tensor_list, tensor, group=group)
-    tensor_list = [t for oidx, t in enumerate(tensor_list) if oidx != idx]
-
     CudaTimer().stop(field_name='comm')
-    if len(tensor_list) == 1:
-        return tensor_list[0]
-    else:
-        return tensor_list
+    return tensor_list
 
 
-def reduce_scatter(tensors: List[torch.Tensor], ranks: List[int]):
+def reduce_scatter(input_tensors: List[torch.Tensor],
+                   output_shapes: List[List[int]],
+                   output_dtypes: List[torch.dtype],
+                   ranks: List[int]) -> List[torch.Tensor]:
     """
     ReduceScatter
     """
-    # print(f'{torch.distributed.get_rank()}: reduce-scatter...')
     CudaTimer().start(field_name='comm')
-
-    tensors = list(tensors)
+    input_tensors = list(input_tensors)
     group = DeviceGroup().get_group(ranks)
     idx = ranks.index(DeviceGroup().rank)
-    output = torch.empty_like(tensors[idx], requires_grad=True)
+    output = torch.empty_like(input_tensors[idx], requires_grad=True)
     torch.distributed.reduce_scatter(
-        output, tensors, group=group
+        output, input_tensors, group=group
     )
-
     CudaTimer().stop(field_name='comm')
     return output
 
 
-def broadcast(tensors: List[torch.Tensor], ranks: List[int], shape=None, dtype=None):
+def broadcast(input_tensors: List[torch.Tensor],
+              output_shapes: List[List[int]],
+              output_dtypes: List[torch.dtype],
+              ranks: List[int]) -> List[torch.Tensor]:
     """
     Broadcast. ranks[0] is the root
     """
     CudaTimer().start(field_name='comm')
-    # print(f'{torch.distributed.get_rank()}: broadcast...')
-    # FIXME: data type
-    if len(tensors) == 1:
-        tensor = tensors[0]
+    assert len(input_tensors) == 1 or len(input_tensors) == 0
+    if len(input_tensors) == 1:
+        tensor = input_tensors[0]
     else:
+        assert len(output_shapes) == 1
+        assert len(output_dtypes) == 1
+        shape = output_shapes[0]
+        dtype = output_dtypes[0]
         tensor = torch.empty(shape, device=torch.cuda.current_device(), dtype=dtype)
-        # tensor.requires_grad_()
     group = DeviceGroup().get_group(ranks)
     torch.distributed.broadcast(tensor, ranks[0], group=group)
-
     CudaTimer().stop(field_name='comm')
     return tensor

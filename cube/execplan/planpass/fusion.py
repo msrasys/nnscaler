@@ -7,7 +7,7 @@ from typing import List, Dict
 from cube.graph.tensor import IRSubTensor, ValueMap
 
 from cube.graph.adapter.adapter import IRAdapter
-from cube.graph.adapter.adapter import CollectivePrim, MergePrim
+from cube.graph.adapter.adapter import CollectivePrim
 
 from cube.execplan import ExectuionPlan
 from cube.execplan.planpass.planpass import PlanPass
@@ -29,6 +29,15 @@ class P2PFusion(PlanPass):
         ]
         for matcher in matchers:
             matcher(execplan, adapters)
+        # update adapter devices
+        for node in execplan.graph.nodes():
+            if isinstance(node, IRAdapter):
+                node.update_device()
+        for devid in execplan.devices():
+            for node in execplan.sequence(devid):
+                if isinstance(node, IRAdapter):
+                    if devid not in node.device:
+                        execplan.at(devid).remove(node)
         return execplan
 
     @staticmethod
@@ -111,24 +120,32 @@ class P2PFusion(PlanPass):
         Given a list of adapters:
         1). [Num] each adapter has different one input and same one output
         2). [Dev] inputs/outputs among adapters are from different devices
-        3). [Indmap] inputs among adapters has same index-map with output.
-        4). [Valmap] inputs have parital value-map. Output has full value-map
+        3). [Dev] adapters have same device. adapters# is same to device set.
+        4). [Indmap] inputs among adapters has same index-map with output.
+        5). [Valmap] inputs have parital value-map. Output has full value-map
         """
-        return
         outputs, groups = P2PFusion.group_by_output(all_adapters)
         for tid in outputs:
-            adapters = groups[tid]
+            adapters: List[IRAdapter] = groups[tid]
             # condition 1)
             if not P2PFusion._check_multi_inputs(adapters):
                 continue
             if not P2PFusion._check_same_inputs(adapters):
                 continue
             # condition 2)
-            if not P2PFusion._check_different_inputs_devices(adapters, among=True):
+            if not P2PFusion._check_different_inputs_devices(adapters, among=False):
                 continue
             if not P2PFusion._check_different_outputs_devices(adapters, among=True):
                 continue
             # condition 3)
+            cond = True
+            for adapter in adapters:
+                if len(adapters) != len(adapter.device):
+                    cond = False
+                    break
+            if not cond:
+                continue
+            # condition 4)
             cond = True
             for adapter in adapters:
                 if not P2PFusion._check_indmap_same(adapter.inputs() + adapter.outputs()):
@@ -136,7 +153,7 @@ class P2PFusion(PlanPass):
                     break
             if not cond:
                 continue
-            # condition 4)
+            # condition 5)
             inputs = list()
             for adapter in adapters:
                 inputs += adapter.inputs()
@@ -172,14 +189,84 @@ class P2PFusion(PlanPass):
         ReduceScatter semantic:
 
         Given a list of adapters:
-        1). [Num] each adapter has different one input and different one output
+        1). [Num] each adapter has same multiple input and different one output
         2). [Dev] inputs/outputs among adapters are from different devices
-        3). [Indmap] inputs among adapters have same index-map
-        4). [Indmap] outputs among adapters have different index-map
-        5). [Valmap] inputs among adapters have different partial val-map.
-        6). [Valmap] outputs among adapters have same Full val-map
+        3). [Dev] adapters have same device. adapters# is same to device set
+        4). [Indmap] inputs of each adapter have same index-map
+        5). [Indmap] outputs among adapters have different index-map
+        6). [Valmap] inputs of each adapter have different partial val-map
+        7). [Valmap] outputs among adapters have same Full val-map
         """
-        pass
+        inputs, groups = P2PFusion.group_by_input(all_adapters)
+        for tids in inputs:
+            adapters: List[IRAdapter] = groups[tids]
+            # cond 1)
+            otids = [adapter.outputs(0)._id for adapter in adapters]
+            if len(set(otids)) != len(adapters):
+                continue
+            # cond 2)
+            if not P2PFusion._check_different_inputs_devices(adapters, among=False):
+                continue
+            if not P2PFusion._check_different_outputs_devices(adapters, among=True):
+                continue
+            # cond 3)
+            cond = True
+            for adapter in adapters:
+                if len(adapters) != len(adapter.device):
+                    cond = False
+                    break
+            if not cond:
+                continue
+            # cond 4)
+            cond = True
+            for adapter in adapters:
+                if not P2PFusion._check_indmap_same(adapter.inputs()):
+                    cond = False
+                    break
+            if not cond:
+                continue
+            # cond 5)
+            outputs = [adapter.outputs(0) for adapter in adapters]
+            if not P2PFusion._check_indmap_no_overlap(outputs):
+                continue
+            # cond 6)
+            cond = True
+            for adapter in adapters:
+                if not P2PFusion._check_valmap_no_overlap(adapter.inputs()):
+                    cond = False
+                    break
+            if not cond:
+                continue
+            # cond 7)
+            cond = True
+            for adapter in adapters:
+                if adapter.outputs(0).valmap != ValueMap(0, 1):
+                    cond = False
+                    break
+            if not cond:
+                continue
+            # gen reduce-scatter
+            print(f'generating reduce-scatter for tensor: {tids} ...')
+            all_select_prims = list()
+            for adapter in adapters:
+                all_select_prims += adapter.prims(move=False, merge=False, coll=False)
+            for adapter in adapters:
+                device = adapter.odevice(0)
+                sprims = [prim for prim in all_select_prims if prim.device == device]
+                if len(sprims) != len(adapters):
+                    raise RuntimeError(f"got {len(sprims)} (!={len(adapters)}) select prims for reduce-scatter")
+                inputs = [sprim.output for sprim in sprims]
+                coll = CollectivePrim(
+                    ctype = CollectivePrim.Type.ReduceScatter,
+                    device = device,
+                    group = adapter.device,
+                    inputs = inputs,
+                    outputs = adapter.outputs(),
+                )
+                prims = sprims + [coll]
+                adapter._prims = prims
+            for adapter in adapters:
+                all_adapters.remove(adapter)
 
     @staticmethod
     def broadcast_matcher(execplan: ExectuionPlan, all_adapters: List[IRAdapter]):
@@ -220,8 +307,7 @@ class P2PFusion(PlanPass):
         tensors = dict()  # Tuple[tensor_id] -> tensor
         groups = dict()   # Tuple[tensor_id] -> List[IRAdapter]
         for adapter in adapters:
-            tensors = adapter.inputs
-            tids = [tensor._id for tensor in tensors]
+            tids = [tensor._id for tensor in adapter.inputs()]
             tids.sort()
             tids = tuple(tids)
             if tids not in tensors:

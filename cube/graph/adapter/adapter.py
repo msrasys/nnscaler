@@ -298,6 +298,15 @@ class IRAdapter(IRCell):
         adapter.device = rank
         return adapter
 
+    def update_device(self):
+        """
+        Update device (needed when adapter content changes, e.g., P2PFusion)
+        """
+        device = set()
+        for prim in self._prims:
+            device.update(prim.device)
+        self.device = list(device)
+
     def is_identity(self):
         """
         Check if the adapter does nothing
