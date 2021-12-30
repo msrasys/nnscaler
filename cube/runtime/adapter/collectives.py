@@ -111,7 +111,7 @@ def all_reduce(input_tensors: List[torch.Tensor],
     """
     CudaTimer().start(field_name='comm')
     assert len(input_tensors) == 1
-    tensor = input_tensors
+    tensor = input_tensors[0]
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
     tensor = tensor.detach()

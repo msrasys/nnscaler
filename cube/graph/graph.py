@@ -104,40 +104,6 @@ class IRGraph(IRCell):
         else:
             raise TypeError("Expected index to be None or int")
 
-    # def insert(self, node, src_node=None, dst_node=None, replaced_tensor=None):
-    #     """
-    #     Insert a node between src_node and dst_node. In default,
-    #     if dst_node is not None, the node will be inserted right before
-    #     dst_node. If the replaced_tensor is provided, the replaced_tensor
-    #     in dst_node's inputs will be removed, and the output of node will be
-    #     set as input for dst_node.
-    #     """
-    #     if not isinstance(node, IRCell):
-    #         raise TypeError("Expected IRCell to insert")
-    #     if dst_node is not None:
-    #         if dst_node not in self._nodes:
-    #             raise KeyError("dst_node not found")
-    #         if replaced_tensor is not None:
-    #             if replaced_tensor not in dst_node.inputs():
-    #                 raise RuntimeError(f"Expected dst_node input has {replaced_tensor}")
-    #             # remove dst_node input
-    #             input_index = dst_node.inputs().index(replaced_tensor)
-    #             if len(node.outputs()) != 1:
-    #                 raise RuntimeError("replaced node requires output length to be 1")
-    #             dst_node.set_input(input_index, node.outputs(0))
-    #         # insert node
-    #         index = self._nodes.index(dst_node)
-    #         self._nodes.insert(index, node)
-    #     elif src_node is not None:
-    #         if src_node not in self._nodes:
-    #             raise KeyError("src_node not found")
-    #         index = self._nodes.index(src_node)
-    #         self._nodes = self._nodes[:index+1] + [node] + self._nodes[index+1:]
-    #     else:
-    #         raise TypeError("Expected at least one of [src_node, dst_node]")
-    #     #TODO: optimize this
-    #     self.reset_dependency()
-
     def _replace_tensor(self, old_tensor: IRTensor, new_tensor: IRTensor):
         """
         Replace tensor from old_tensor to new_tensor for all the graph.
