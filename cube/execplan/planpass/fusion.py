@@ -290,7 +290,7 @@ class P2PFusion(PlanPass):
             if not P2PFusion._check_different_outputs_devices(adapters, among=True):
                 continue
             # gen broadcast
-            print(f'generating broadcast for tensor: {outputs[tid]}')
+            print(f'generating broadcast for tensor: {outputs[tid]} ...')
             # put root rank to the first
             root = list(device)[0]
             group = set()

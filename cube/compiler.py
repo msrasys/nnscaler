@@ -1,4 +1,4 @@
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Tuple, Union
 import torch
 import time
 
@@ -6,23 +6,18 @@ import cube
 
 from cube.graph import parser
 from cube.graph.adapter.gen import AdapterGener
-from cube.graph.graph import IRGraph
 from cube.graph.operator.operator import IRDataOperation
 
 from cube.logics.pool import SchedulePool
 from cube.logics.translator import LogicTranslator
 
 from cube.execplan import ExectuionPlan
-# from cube.execplan.planpass.torchadapt import TorchRefAdapter
-# from cube.execplan.planpass.redundant import RemoveRedundantAdapters
-# from cube.execplan.planpass.merge import MergeComputeSU
-# from cube.execplan.planpass.gfuse import WeightGradAllreduceFusion
-# from cube.execplan.planpass.p2pfusion import P2PFusion
 from cube.execplan.planpass.grouping import Grouping
 from cube.execplan.planpass.fusion import P2PFusion
 
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
+from cube.profiler.timer import print_each_rank
 
 class SemanticModel:
 
@@ -41,7 +36,6 @@ class SemanticModel:
 
     def load_module(self, filename: str):
         import importlib.util
-        print(f'> loading generated spatial moduel from {filename}')
         spec = importlib.util.spec_from_file_location("GenModel", filename)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -108,7 +102,6 @@ def compile(model: SemanticModel, dataloader,
 
     def _load_tschedule_fn(filename) -> Callable:
         import importlib.util
-        print(f'> [{myrank}] loading generated schedule from {filename} ...')
         spec = importlib.util.spec_from_file_location(
             "_train_step", filename
         )
@@ -142,8 +135,6 @@ def compile(model: SemanticModel, dataloader,
             for node in graph.nodes():
                 if len(node.device) == 0:
                     raise RuntimeError(f"Node {node} device is not set")
-            # if not SUGraph.is_topo_order(sugraph.sus()):
-            #     raise RuntimeError(f"SUGraph order is not topological order")
 
             # generate adapter
             graph = AdapterGener.gen(graph)
@@ -161,33 +152,6 @@ def compile(model: SemanticModel, dataloader,
             execplan = P2PFusion.apply(execplan)
             span = time.time() - start
             print('> planpass on p2pfusion operations: {:.2f} s'.format(span))
-
-
-            # plan pass to adapt to pytorch semantic: multi branch gradient
-            # TODO: residual support
-            # execplan = TorchRefAdapter.apply(execplan)
-            # plan pass to remove redundant sus
-            # start = time.time()
-            # execplan = RemoveRedundantAdapters.apply(execplan)
-            # span = time.time() - start
-            # print('> planpass on remove redundant adapter: {:.2f} s'.format(span))
-            # # print(f'> after remove redundant adapters:\n {execplan}')
-            # start = time.time()
-            # execplan = MergeComputeSU.apply(execplan)
-            # span = time.time() - start
-            # print('> planpass on merge compute: {:.2f} s'.format(span))
-            # # print(f'> after merge backward SU:\n {execplan}')
-            # start = time.time()
-            # execplan = WeightGradAllreduceFusion.apply(execplan)
-            # span = time.time() - start
-            # print('> planpass on grad allreduce: {:.2f} s'.format(span))
-            # print(f'> after add allreduce:\n{execplan}')
-
-            # start = time.time()
-            # execplan = P2PFusion.apply(execplan)
-            # span = time.time() - start
-            # print('> planpass on p2p fusion: {:.2f} s'.format(span))
-            # print(f'> after fuse P2P SU:\n {execplan}')
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()
@@ -224,7 +188,7 @@ def compile(model: SemanticModel, dataloader,
 
             compile_end = time.time()
             compile_time = compile_end - compile_start
-            print(f'> compile time: {compile_time} seconds')
+            print('> compile time: {:.2f} seconds'.format(compile_time))
 
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -236,8 +200,11 @@ def compile(model: SemanticModel, dataloader,
         dataloader.reset(batch_size=batch_size)
 
         # load module
-        model.load_module(filename.format(myrank))
-        # load temporal
-        return _load_tschedule_fn(filename.format(myrank))
-    
+        filename = filename.format(myrank)
+        print_each_rank(f'loading generated module from {filename} ...')
+        model.load_module(filename)
+        # load temporal schedule
+        print_each_rank(f'loading generated schedule from {filename} ...')
+        return _load_tschedule_fn(filename)
+
     return decorator

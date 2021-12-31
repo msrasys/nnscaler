@@ -7,14 +7,15 @@ import copy
 
 from cube.ir.cten import IRCell, IRTensor
 from cube.ir.dtype import IRDType
+
 from cube.graph.tensor import IRSubTensor
 from cube.graph.operator.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from cube.graph.adapter.adapter import CollectivePrim, IRAdapter, SelectPrim, MovePrim, MergePrim
 from cube.graph.adapter.adapter import IRWeightReducer
-from cube.execplan import ExectuionPlan
-# from cube.schedule.adapter.collectives import IRCollectives
-
 from cube.graph.graph import IRGraph
+
+from cube.execplan import ExectuionPlan
+
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
@@ -78,17 +79,27 @@ class ModelCodeGen(CodeGen):
         Creating communication group requires all the devices
         enter the same call.
         """
+        graph = self.execplan.graph
         sign = 'self.init_group(ranks={ranks})'
         # collect groups from weight reducer
         comm_groups: Dict[Tuple[int]] = list()
-        for node in self.execplan.graph.nodes():
+        for node in graph.nodes():
             if isinstance(node, IRWeightReducer):
                 ranks = list(node.device)
                 ranks.sort()
                 ranks = tuple(ranks)
                 if ranks not in comm_groups:
                     comm_groups.append(ranks)
-        # TODO: collect groups from p2p fusion
+        # collect groups from p2p fusion
+        adapters = [n for n in graph.nodes() if isinstance(n, IRAdapter)]
+        for adapter in adapters:
+            for prim in adapter.prims(select=False, move=False, merge=False):
+                if not isinstance(prim, CollectivePrim):
+                    ranks = prim.group
+                    ranks.sort()
+                    ranks = tuple(ranks)
+                    if ranks not in comm_groups:
+                        comm_groups.append(ranks)
         # create communication group
         for ranks in comm_groups:
             code = sign.format(ranks=list(ranks))
@@ -117,8 +128,6 @@ class ModelCodeGen(CodeGen):
             elif isinstance(node, IRAdapter):
                 node = node.dispatch(rank=device)
                 self.emit_adapter_call(node)
-            # elif isinstance(node, IRCollectives):
-            #     self.emit_collective_call(node)
             elif isinstance(node, IRWeightReducer):
                 self.emit_reducer_init(node)
                 self.emit_reducer_call(node)
@@ -193,7 +202,6 @@ class ModelCodeGen(CodeGen):
         for output in node.outputs():
             self.symbols.create(self.tensor_naming(output))
         return
-
 
     def emit_graph_call(self, graph: IRGraph):
         for node in graph.nodes():
