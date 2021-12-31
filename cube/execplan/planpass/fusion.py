@@ -283,8 +283,10 @@ class P2PFusion(PlanPass):
                     break
             if not cond: continue
             # cond 2)
-            device = set([adapter.idevice(0)[0] for adapter in adapters])
-            if len(device) != 1:
+            root_device = set()
+            for adapter in adapters:
+                root_device.update(P2PFusion._get_input_devices(adapter))
+            if len(root_device) != 1:
                 continue
             # cond 3)
             if not P2PFusion._check_different_outputs_devices(adapters, among=True):
@@ -292,7 +294,7 @@ class P2PFusion(PlanPass):
             # gen broadcast
             print(f'generating broadcast for tensor: {outputs[tid]} ...')
             # put root rank to the first
-            root = list(device)[0]
+            root = list(root_device)[0]
             group = set()
             for adapter in adapters:
                 group.update(P2PFusion._get_output_devices(adapter))

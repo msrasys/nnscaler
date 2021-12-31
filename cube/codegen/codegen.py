@@ -96,7 +96,7 @@ class ModelCodeGen(CodeGen):
             for prim in adapter.prims():
                 if not isinstance(prim, CollectivePrim):
                     continue
-                ranks = prim.group
+                ranks = list(prim.group)
                 ranks.sort()
                 ranks = tuple(ranks)
                 if ranks not in comm_groups:

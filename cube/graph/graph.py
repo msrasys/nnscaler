@@ -12,6 +12,7 @@ import copy
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.operator.operator import IRBpOperation, IRFwOperation
+from cube.graph.adapter.adapter import IRAdapter
 from cube.graph.tensor import IRSubTensor
 
 from cube.algorithm.generics import GenericDistAlgo
@@ -71,6 +72,9 @@ class IRGraph(IRCell):
         for src_idx in range(len(self._nodes)):
             src_node = self._nodes[src_idx]
             for dst_node in self._nodes[src_idx+1:]:
+                # we don't consider dependencies among adapter
+                if isinstance(src_node, IRAdapter) and isinstance(dst_node, IRAdapter):
+                    continue
                 for out_idx, out_tensor in enumerate(src_node.outputs()):
                     if not isinstance(out_tensor, IRTensor):
                         continue

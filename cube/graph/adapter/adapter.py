@@ -49,14 +49,14 @@ class CollectivePrim:
         Broadcast = 'broadcast'
 
     def __init__(self, ctype: Enum,
-                 device: List[int],
-                 group: List[int],
-                 inputs: List[IRSubTensor] = None,
-                 input_shapes: List[List[int]] = None,
-                 input_dtypes: List[IRDType] = None,
-                 outputs: List[IRSubTensor] = None,
-                 output_shapes: List[List[int]] = None,
-                 output_dtypes: List[IRDType] = None):
+                 device: Tuple[int],
+                 group: Tuple[int],
+                 inputs: Tuple[IRSubTensor] = None,
+                 input_shapes: Tuple[Tuple[int]] = None,
+                 input_dtypes: Tuple[IRDType] = None,
+                 outputs: Tuple[IRSubTensor] = None,
+                 output_shapes: Tuple[Tuple[int]] = None,
+                 output_dtypes: Tuple[IRDType] = None):
         """
         inputs:
             the collective input tensors. Including remote tensors.
@@ -73,18 +73,17 @@ class CollectivePrim:
         """
         self.ctype = ctype
         # inputs
-        self.inputs: List[IRSubTensor] = inputs if inputs is not None else list()
-        self.input_shapes: List[IRSubTensor] = input_shapes
-        self.input_dtypes: List[IRDType] = input_dtypes
+        self.inputs: Tuple[IRSubTensor] = tuple(inputs) if inputs is not None else list()
+        self.input_shapes: Tuple[IRSubTensor] = input_shapes
+        self.input_dtypes: Tuple[IRDType] = input_dtypes
         # outputs
-        self.outputs: List[IRSubTensor] = outputs if outputs is not None else list()
+        self.outputs: Tuple[IRSubTensor] = outputs if outputs is not None else list()
         self.output_shapes: List[IRSubTensor] = output_shapes
         self.output_dtypes: List[IRDType] = output_dtypes
         # communication group
-        group.sort()
-        self.group: List[int] = group
+        self.group: Tuple[int] = tuple(group)
         # device
-        self.device = device
+        self.device = tuple(device)
 
     def __repr__(self):
         dscp = f'{self.outputs} = {self.ctype.value}(inputs={self.inputs}, group={self.group})'
