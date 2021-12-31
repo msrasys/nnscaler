@@ -9,20 +9,32 @@ from cube.graph.operator.operator import IRBpOperation, IRFwOperation
 class AdapterGener:
 
     @staticmethod
-    def gen(graph: IRGraph) -> IRGraph:
+    def gen(graph: IRGraph, eager=True) -> IRGraph:
         """
         Generate tensor adapter for both intermediate tensors and weights
+
+        Args:
+            graph: IRGraph.
+            eager (Boolean):
+                if True,
+                    each adapter will be inserted right after it's ready to execute.
+                if False (i.e., lazy),
+                    each adatper will be inserted right before the tensor needs it.
+            Note weight reducers are always append to last.
+        Returns:
+            graph (IRGraph)
         """
-        graph = AdapterGener.gen_activation_adapter(graph)
+        graph = AdapterGener.gen_activation_adapter(graph, eager)
         graph = AdapterGener.gen_weight_reducer(graph)
         return graph
 
     @staticmethod
-    def gen_activation_adapter(graph: IRGraph) -> IRGraph:
+    def gen_activation_adapter(graph: IRGraph, eager=True) -> IRGraph:
         # update the gradient before generate adapter
         for node in graph.nodes():
             if isinstance(node, IRBpOperation):
                 node.update()
+        all_adapters = list()
         # generate adapter for non-weight values
         for node in graph.nodes():
             if isinstance(node, IRFwOperation):
@@ -34,17 +46,24 @@ class AdapterGener:
                         continue
                     adapter = IRAdapter.gen(input)
                     if not adapter.is_identity():
+                        all_adapters.append(adapter)
                         idx = graph.nodes().index(node)
                         graph._nodes.insert(idx, adapter)
             if isinstance(node, IRBpOperation):
                 for grad in node.inputs():
                     if not isinstance(grad, IRSubTensor):
                         continue
-                    # skip parameter
                     adapter = IRAdapter.gen(grad)
                     if not adapter.is_identity():
+                        all_adapters.append(adapter)
                         idx = graph.nodes().index(node)
                         graph._nodes.insert(idx, adapter)
+        graph.reset_dependency()
+        if eager:
+            seq = graph.nodes()
+            for adapter in all_adapters:
+                seq.remove(adapter)
+            graph.partial_set_order(seq, eager=True)
         return graph
 
 
@@ -73,7 +92,7 @@ class AdapterGener:
                     if grad in grads[input._id][devid]:
                         raise RuntimeError("Already logged grad?")
                     grads[input._id][devid].append(grad)
-        # step 2: generate weight.
+        # step 2: generate reducers.
         # reducers: tuple(ranks): List[weight]
         reducers: Dict[Tuple[int], List[IRSubTensor]] = dict()
         for wid in grads:

@@ -38,10 +38,8 @@ class IRGraph(IRCell):
 
         if inputs is None:
             inputs = IRGraph.get_inputs(nodes)
-            # inputs = [t for t in inputs if not t.is_param()]
         if outputs is None:
             outputs = IRGraph.get_outputs(nodes)
-            # outputs = [t for t in outputs if not t.is_param()]
 
         super().__init__(
             name=module_name,
@@ -82,6 +80,14 @@ class IRGraph(IRCell):
                         if out_tensor.overlap(in_tensor):
                             src_node.add_successor(out_idx, dst_node)
                             dst_node.add_predecessor(in_idx, src_node)
+        # set mirror as control dependency
+        for idx1, node1 in enumerate(self._nodes):
+            node2 = node1.mirror
+            if isinstance(node2, IRCell) and node2 in self._nodes:
+                idx2 = self._nodes.index(node2)
+                if idx1 < idx2:
+                    node1.add_successor(-1, node2)
+                    node2.add_predecessor(-1, node1)
 
     def parameters(self):
         """
@@ -386,10 +392,84 @@ class IRGraph(IRCell):
             return False
 
     def set_order(self, seq: List[IRCell]):
-        raise NotImplementedError
+        """
+        Set a topological order for IRGraph, which requires seq:
 
-    def partial_set_order(self, seq: List[IRCell], lazy=False):
-        raise NotImplementedError
+        1). The set of nodes in seq must be same with this IRGraph
+        2). Staisfies topological order
+
+        Returns:
+            True if set succesfully, False not.
+        """
+        for node in seq:
+            if node not in self.nodes():
+                return False
+        if len(seq) != len(self.nodes()):
+            return False
+        if not IRGraph.check_legal_order(seq, integrity_check=True):
+            return False
+        self._nodes = seq
+        return True
+
+    def partial_set_order(self, seq: List[IRCell], eager=True):
+        """
+        Set a partial topological order for IRGrah.
+        The remaining nodes will be automatically inserted to
+        make the full legal sequence.
+
+        In most of the cases, `eager=True` has better performance.
+
+        Args:
+            seq: partial scheduling sequence
+            eager (default True):
+                if True, the remaining nodes are inserted once it is ready
+                if Flase, the remaining nodes are inserted only when it is needed.
+        
+        Returns:
+            True if set succesfully, False not.
+        """
+        seq = copy.copy(seq)
+        for node in seq:
+            if node not in self.nodes():
+                return False
+        if not IRGraph.check_legal_order(seq, integrity_check=False):
+            return False
+        remain: List[IRCell] = [node for node in self.nodes() if node not in seq]
+        for node in remain:
+            if eager:
+                pre_indices = [seq.index(pre) for pre in node.predecessors()]
+                index = max(pre_indices) + 1
+            else:
+                suc_indices = [seq.index[suc] for suc in node.successors()]
+                index = min(suc_indices)
+            seq.insert(index, node)
+        self._nodes = seq
+        return True
+
+    @staticmethod
+    def check_legal_order(seq: List[IRCell], integrity_check=False):
+        """
+        Check whether seq satisfies topological order.
+        
+        Args:
+            seq: List of IRCell
+            integrity_check:
+                If true, performs additional integrity check that requires
+                all the SUs in predecessor and successor of a SU should
+                appear in the sequence.
+        
+        Returns:
+            Boolean: True for satisfying topo order, otherwise False.
+        """
+        for index, node in enumerate(seq):
+            for pre in node.predecessors():
+                if pre in seq:
+                    pre_idx = seq.index(pre)
+                    if pre_idx >= index:
+                        return False
+                elif integrity_check:
+                    return False
+        return True
 
     def __repr__(self):
         dscp = f"Graph{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})"
@@ -403,10 +483,11 @@ class IRGraph(IRCell):
         for node in self._nodes:
             # if isinstance(node, IRBpOperation):
             #     continue
-            succ_node_ids = [None] * len(node.outputs())
-            for out_idx in range(len(node.outputs())):
-                node_list = [snode._id for snode in node.successors(out_idx)]
-                succ_node_ids[out_idx] = node_list
+            succ_node_ids = [node._id for node in node.successors()]
+            # succ_node_ids = [None] * len(node.outputs())
+            # for out_idx in range(len(node.outputs())):
+            #     node_list = [snode._id for snode in node.successors(out_idx)]
+            #     succ_node_ids[out_idx] = node_list
             dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}\n"
         # outputs
         dscp += f"\nOutputs: {self.outputs()}\n{'=' * len(self.name)}\n"
