@@ -272,6 +272,9 @@ class P2PFusion(PlanPass):
         for tid in outputs:
             adapters: List[IRAdapter] = groups[tid]
             cond = True
+            # note send can also be broadcast. We skip this case
+            if len(adapters) <= 2:
+                continue
             # cond 1)
             if not P2PFusion._check_same_inputs(adapters):
                 continue
