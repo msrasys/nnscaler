@@ -290,28 +290,27 @@ class P2PFusion(PlanPass):
             if not P2PFusion._check_different_outputs_devices(adapters, among=True):
                 continue
             # gen broadcast
-            print(f'generating broadcast for tensor: {outputs[tid]} ... (NOT SUPPORTED)')
-            return
+            print(f'generating broadcast for tensor: {outputs[tid]}')
             # put root rank to the first
             root = list(device)[0]
             group = set()
             for adapter in adapters:
                 group.update(P2PFusion._get_output_devices(adapter))
-            group.remove(root[0])
-            # inputs
-            tensor = adapters[0].inputs()
             group = [root] + list(group)
+            # input
+            tensor = adapters[0].inputs(0)
             
             prims = list()
             for device in group:
-                inputs = tensor if device == root else None
+                inputs = [tensor] if device == root else None
                 output_shapes = [tensor.shape]
                 output_dtypes = [tensor.dtype]
                 coll = CollectivePrim(
                     ctype = CollectivePrim.Type.Broadcast,
-                    device = device,
+                    device = [device],
                     group = group,
                     inputs = inputs,
+                    outputs = [tensor],
                     output_shapes = output_shapes,
                     output_dtypes = output_dtypes
                 )
@@ -323,8 +322,13 @@ class P2PFusion(PlanPass):
                 inputs=[tensor], idevices=[[root],],
                 outputs=[tensor], odevices=[[root],]
             )
-            # TODO: this should insert into graph and execution plan
-            for adapter in [root_adapter] + adapters:
+            # insert into graph and execution plan
+            index = min([execplan.graph.nodes().index(n) for n in adapters])
+            execplan.graph._nodes.insert(index, root_adapter)
+            seq = [node for node in execplan.graph.nodes() if root in node.device]
+            execplan.set(root, seq)
+
+            for adapter in adapters:
                 device = adapter.odevice(0)[0]
                 prim = prims[group.index(device)]
                 adapter._prims = [prim]

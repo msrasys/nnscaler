@@ -265,11 +265,15 @@ class ModelCodeGen(CodeGen):
                 sign = 'cube.runtime.adapter.{ctype}({input_tensors}, {output_shapes}, {output_dtypes}, {group})'
                 inputs = self.tuple_naming(prim.inputs)
                 outputs = self.return_naming(prim.outputs)
+                dtypes = None
+                if prim.output_dtypes is not None:
+                    dtypes = [self.dtype_map(dtype) for dtype in prim.output_dtypes]
+                    dtypes = self.tuple_naming(dtypes)
                 body = sign.format(
                     ctype=prim.ctype.value,
                     input_tensors = inputs,
                     output_shapes = prim.output_shapes,
-                    output_dtypes = prim.output_dtypes,
+                    output_dtypes = dtypes,
                     group=prim.group
                 )
                 code = f'{outputs} = {body}'
@@ -279,7 +283,7 @@ class ModelCodeGen(CodeGen):
         # requires grad generation
         sign = '{output} = {output}.contiguous().requires_grad_()'
         for output in node.outputs():
-            if isinstance(output, IRSubTensor):
+            if isinstance(output, IRSubTensor) and output.requires_grad:
                 code = sign.format(output=self.tensor_naming(output))
                 self.forward_region.append(code)
 

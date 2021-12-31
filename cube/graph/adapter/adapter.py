@@ -73,11 +73,11 @@ class CollectivePrim:
         """
         self.ctype = ctype
         # inputs
-        self.inputs: List[IRSubTensor] = inputs
+        self.inputs: List[IRSubTensor] = inputs if inputs is not None else list()
         self.input_shapes: List[IRSubTensor] = input_shapes
         self.input_dtypes: List[IRDType] = input_dtypes
         # outputs
-        self.outputs: List[IRSubTensor] = outputs
+        self.outputs: List[IRSubTensor] = outputs if outputs is not None else list()
         self.output_shapes: List[IRSubTensor] = output_shapes
         self.output_dtypes: List[IRDType] = output_dtypes
         # communication group
