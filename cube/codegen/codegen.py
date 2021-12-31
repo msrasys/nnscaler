@@ -93,17 +93,20 @@ class ModelCodeGen(CodeGen):
         # collect groups from p2p fusion
         adapters = [n for n in graph.nodes() if isinstance(n, IRAdapter)]
         for adapter in adapters:
-            for prim in adapter.prims(select=False, move=False, merge=False):
+            for prim in adapter.prims():
                 if not isinstance(prim, CollectivePrim):
-                    ranks = prim.group
-                    ranks.sort()
-                    ranks = tuple(ranks)
-                    if ranks not in comm_groups:
-                        comm_groups.append(ranks)
+                    continue
+                ranks = prim.group
+                ranks.sort()
+                ranks = tuple(ranks)
+                if ranks not in comm_groups:
+                    comm_groups.append(ranks)
         # create communication group
+        self.declare_region.append('# communication groups')
         for ranks in comm_groups:
             code = sign.format(ranks=list(ranks))
             self.declare_region.append(code)
+        self.declare_region.append(' ')
 
     def gen(self, device: int, outfile=None, attach=False) -> str:
         """
