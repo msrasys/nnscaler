@@ -151,6 +151,9 @@ def reduce_scatter(input_tensors: List[torch.Tensor],
     """
     CudaTimer().start(field_name='comm')
     input_tensors = list(input_tensors)
+    for idx, tensor in enumerate(input_tensors):
+        if not tensor.is_contiguous():
+            input_tensors[idx] = tensor.contiguous()
     group = DeviceGroup().get_group(ranks)
     idx = ranks.index(DeviceGroup().rank)
     output = torch.empty_like(input_tensors[idx], requires_grad=True)
