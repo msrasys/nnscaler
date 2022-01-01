@@ -17,7 +17,7 @@ from torch import nn
 import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
-from examples.mlp.policy.col_parallel import PAS
+from examples.mlp.policy.row_parallel import PAS
 
 # =================== Semantic Model Description ====================
 

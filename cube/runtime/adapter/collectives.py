@@ -171,7 +171,9 @@ def broadcast(input_tensors: List[torch.Tensor],
     CudaTimer().start(field_name='comm')
     assert len(input_tensors) == 1 or len(input_tensors) == 0
     if len(input_tensors) == 1:
-        tensor = input_tensors[0]
+        tensor: torch.Tensor = input_tensors[0]
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
     else:
         assert len(output_shapes) == 1
         assert len(output_dtypes) == 1
