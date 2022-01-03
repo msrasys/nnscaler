@@ -71,10 +71,10 @@ class IRCell:
         self._mirror = None
         self._tag = None
 
-    def __eq__(self, other):
-        if isinstance(other, IRCell):
-            return self._id == other._id
-        return False
+    # def __eq__(self, other):
+    #     if isinstance(other, IRCell):
+    #         return self._id == other._id
+    #     return False
 
     @property
     def device(self):

@@ -331,6 +331,9 @@ class IRAdapter(IRCell):
     @staticmethod
     def gen_select(dst_tensor):
 
+        # TODO: consider previous adapter output as later adapter in-tensor
+        # for residual cases
+
         inputs = list()
         intersections = list()
         prims = list()
@@ -338,6 +341,7 @@ class IRAdapter(IRCell):
         otensor = dst_tensor
         odevice = otensor.device
 
+        # local and remote adapter in-tensor
         local, remote = list(), list()
         for ptensor in otensor.parent.ptensors:
             if ptensor.device == odevice:
@@ -345,19 +349,19 @@ class IRAdapter(IRCell):
             else:
                 remote.append(ptensor)
 
-        # check local tensor
+        # first check local in tensor
         if otensor in local:
             intersections.append(otensor)
             inputs.append(otensor)
             return inputs, intersections, prims
-
-        # FIXME: multi producer may result overlapped region
-        for itensor in otensor.parent.ptensors:
+        
+        # check local + remote
+        for itensor in local + remote:
             if not itensor.overlap(otensor):
                 continue
 
             # intersection
-            common = otensor.common(itensor)
+            common: IRSubTensor = otensor.common(itensor)
             common.attach_cell(itensor._cell)
             intersections.append(common)
             inputs.append(itensor)
@@ -391,6 +395,9 @@ class IRAdapter(IRCell):
                 )
             prim = SelectPrim(itensor, indmap, valmap, common.shape, common)
             prims.append(prim)
+            # TODO: check union == otensor
+            if common == otensor:
+                break
         
         return inputs, intersections, prims
 

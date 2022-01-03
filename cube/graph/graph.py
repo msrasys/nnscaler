@@ -11,7 +11,7 @@ from typing import Union, Tuple, List, Optional, Dict
 import copy
 
 from cube.ir.cten import IRTensor, IRCell
-from cube.graph.operator.operator import IRBpOperation, IRFwOperation
+from cube.graph.operator.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from cube.graph.adapter.adapter import IRAdapter
 from cube.graph.tensor import IRSubTensor
 
@@ -113,30 +113,6 @@ class IRGraph(IRCell):
             return copy.copy(self._nodes)
         else:
             raise TypeError("Expected index to be None or int")
-
-    def _replace_tensor(self, old_tensor: IRTensor, new_tensor: IRTensor):
-        """
-        Replace tensor from old_tensor to new_tensor for all the graph.
-        """
-        def _replace_inputs(cell, old_tensor, new_tensor):
-            index = cell.inputs().index(old_tensor)
-            cell.set_input(index, new_tensor)
-
-        def _replace_outputs(cell, old_tensor, new_tensor):
-            index = cell.outputs().index(old_tensor)
-            cell.set_output(index, new_tensor)
-
-        if old_tensor in self.inputs():
-            _replace_inputs(self, old_tensor, new_tensor)
-
-        for node in self.nodes():
-            if old_tensor in node.inputs():
-                _replace_inputs(node, old_tensor, new_tensor)
-            if old_tensor in node.outputs():
-                _replace_outputs(node, old_tensor, new_tensor)
-        
-        if old_tensor in self.outputs():
-            _replace_outputs(self, old_tensor, new_tensor)
 
     def forward(self, *args) -> Union[IRTensor, Tuple[IRTensor]]:
         """
@@ -257,15 +233,14 @@ class IRGraph(IRCell):
 
     ## Parallel Policy Primitives ##
 
-    def replicate(self, op: IRCell, times=1):
+    def replicate(self, op: IRCell, times=1) -> Optional[List[IRCell]]:
         """
-        Replicate an operation with multiple times.
+        Replicate a forward or data operation multiple times.
 
-        This is temporary use to enable assign with multiple devices
+        The backward of the forward operation will automatically be replicated.
         """
-        raise NotImplementedError("Replicate is not supported yet")
-        if not isinstance(op, IRCell):
-            raise TypeError("Expected an IRCell")
+        if not (isinstance(op, IRFwOperation) or isinstance(op, IRDataOperation)):
+            raise TypeError("Expected op to be forward op or data op")
         if not isinstance(times, int) or times < 1:
             raise TypeError("Expected times to be int and >= 1")
 
@@ -274,15 +249,16 @@ class IRGraph(IRCell):
     
         ops = [op]
         for _ in range(times - 1):
-            dup_op = op.replicate()
-            if op.mirror is not None:
-                dup_op.gen_backward()
-            ops.append(dup_op)
+            ops.append(op.replicate())
+        if isinstance(op.mirror, IRBpOperation):
+            for rep_op in ops[1:]:
+                print(rep_op)
+                rep_op.gen_backward()
         idx = self.nodes().index(op)
         # forward
         self._nodes = self._nodes[:idx] + ops + self._nodes[idx+1:]
         # backward
-        if op.mirror is not None:
+        if isinstance(op.mirror, IRCell):
             bops = [op.mirror for op in ops][::-1]
             midx = self.nodes().index(op.mirror)
             self._nodes = self._nodes[:midx] + bops + self._nodes[midx+1:]
@@ -362,15 +338,35 @@ class IRGraph(IRCell):
 
     ## Assign Policy Primitives ##
 
-    def assign(self, op: IRCell, rank: int):
+    def assign(self, op: IRCell, ranks: Union[int, List[int]]):
+        """
+        Assign an operator (subgraph) to (multiple) rank(s).
+
+        If `ranks` has multiple integer, then the operator will be replicated
+        `len(ranks)` times and assigned to given device correspondingly.
+
+        Corresponding backward operators (if have) will also be replicated
+        and assigned to the same device with it's forward operator
+
+        Returns:
+            True if assigned successfully.
+            False if not.
+        """
         if op not in self._nodes:
             raise KeyError(f"{op} is not in the graph")
-        if not isinstance(rank, int):
+        if isinstance(ranks, int):
+            ranks = [ranks]
+        if not all([isinstance(rank, int) for rank in ranks]):
             raise TypeError("Expected rank to be int")
-        op.device = rank
-        # pytorch requirement
-        if op.mirror is not None:
-            op.mirror.device = rank
+        if len(ranks) > 1:
+            ops = self.replicate(op, times=len(ranks))
+        else:
+            ops = [op]
+        for op, rank in zip(ops, ranks):
+            op.device = rank
+            # pytorch requirement: forward + backward happened on same device
+            if op.mirror is not None:
+                op.mirror.device = rank
         return True
 
     ## Schedule Policy Primitives ##

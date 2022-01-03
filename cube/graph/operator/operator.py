@@ -4,9 +4,68 @@ import copy
 from cube.ir.cten import IRCell
 from cube.graph.tensor import IRFullTensor, IRSubTensor
 from cube.algorithm.factory import DistAlgorithmFactory
+from cube.ir.unique import IDGenerator
 
 
 __all__ = ['IRFwOperation', 'IRBpOperation', 'IRDataOperation']
+
+
+class BaseOperator:
+
+    def __init__(self, name: str, signature: str,
+                 input_length: int, output_length: int,
+                 init_outputs=False):
+        super().__init__(name, signature,
+                         input_length, output_length,
+                         init_outputs=init_outputs)
+
+    def infer_shape(self):
+        """
+        Infer output value shape
+        """
+        raise NotImplementedError
+
+    def set_input(self, input_index: int, val: Any):
+        # remove the consumer
+        old_val = self.inputs(input_index)
+        if isinstance(old_val, IRSubTensor):
+            old_val.parent.rm_consumer(self)
+        # add the consumer
+        val = super().set_input(input_index, val)
+        if isinstance(val, IRSubTensor):
+            val.parent.add_consumer(self, val)
+        return val
+
+    def set_output(self, output_index: int, val: Any):
+        # remove the producer
+        old_val = self.outputs(output_index)
+        if isinstance(old_val, IRSubTensor):
+            old_val.parent.rm_producer(self)
+        # add the producer
+        val = super().set_output(output_index, val)
+        if isinstance(val, IRSubTensor):
+            val.parent.add_producer(self, val)
+        return val
+
+    def replicate(self):
+        """
+        Replicate the Operation
+        """
+        cpy = copy.copy(self)
+        cpy._device = list()
+        cpy._id = IDGenerator().gen_cell_id()
+        # reset input and output
+        cpy._inputs = [None] * len(self.inputs())
+        for idx, input in enumerate(self.inputs()):
+            cpy.set_input(idx, input)
+        cpy._outputs = [None] * len(self.outputs())
+        for idx, output in enumerate(self.outputs()):
+            cpy.set_output(idx, output)
+        cpy._mirror = None
+        cpy._tag = None
+        cpy.clear_predecessor()
+        cpy.clear_successor()
+        return cpy
 
 
 class IRFwOperation(IRCell):
@@ -88,8 +147,14 @@ class IRFwOperation(IRCell):
         """
         cpy = copy.copy(self)
         cpy._device = list()
-        cpy._inputs = copy.copy(self._inputs)
-        cpy._outputs = copy.copy(self._outputs)
+        # cpy._id = IDGenerator().gen_cell_id()
+        # reset input and output
+        cpy._inputs = [None] * len(self.inputs())
+        for idx, input in enumerate(self.inputs()):
+            cpy.set_input(idx, input)
+        cpy._outputs = [None] * len(self.outputs())
+        for idx, output in enumerate(self.outputs()):
+            cpy.set_output(idx, output)
         cpy._mirror = None
         cpy._tag = None
         cpy.clear_predecessor()
@@ -158,8 +223,14 @@ class IRBpOperation(IRCell):
         """
         cpy = copy.copy(self)
         cpy._device = list()
-        cpy._inputs = copy.copy(self._inputs)
-        cpy._outputs = copy.copy(self._outputs)
+        cpy._id = IDGenerator().gen_cell_id()
+        # reset input and output
+        cpy._inputs = [None] * len(self.inputs())
+        for idx, input in enumerate(self.inputs()):
+            cpy.set_input(idx, input)
+        cpy._outputs = [None] * len(self.outputs())
+        for idx, output in enumerate(self.outputs()):
+            cpy.set_output(idx, output)
         cpy._mirror = None
         cpy._tag = None
         cpy.clear_predecessor()
@@ -283,8 +354,14 @@ class IRDataOperation(IRCell):
         """
         cpy = copy.copy(self)
         cpy._device = list()
-        cpy._inputs = copy.copy(self._inputs)
-        cpy._outputs = copy.copy(self._outputs)
+        cpy._id = IDGenerator().gen_cell_id()
+        # reset input and output
+        cpy._inputs = [None] * len(self.inputs())
+        for idx, input in enumerate(self.inputs()):
+            cpy.set_input(idx, input)
+        cpy._outputs = [None] * len(self.outputs())
+        for idx, output in enumerate(self.outputs()):
+            cpy.set_output(idx, output)
         cpy._mirror = None
         cpy._tag = None
         cpy.clear_predecessor()

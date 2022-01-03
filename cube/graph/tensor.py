@@ -589,16 +589,16 @@ class IRSubTensor(IRTensor):
             self.grad = None
             return None
         if self in fcell.inputs():
-            ref_cells = list()
+            ref_cell_ids = list()
             for dst_cell in self.parent.consumers:
                 for input in dst_cell.inputs():
-                    if self.overlap(input):
-                        ref_cells.append(dst_cell)
+                    if self.overlap(input) and dst_cell._id not in ref_cell_ids:
+                        ref_cell_ids.append(dst_cell._id)
                         break
-            ref_times = len(ref_cells)
+            ref_times = len(ref_cell_ids)
             if ref_times == 0:
                 raise RuntimeError("Internal Error: ref time is 0")
-            idx = ref_cells.index(fcell)
+            idx = ref_cell_ids.index(fcell._id)
             grad = full_grad.select(
                 indmap = self.indmap,
                 valmap = (idx, ref_times),
