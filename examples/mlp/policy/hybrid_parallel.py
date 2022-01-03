@@ -17,7 +17,7 @@ def PAS(graph: IRGraph, resource):
                     node, algo, config=dict(chunk_num=resource.ngpus)
                 )
             else:
-                sub_nodes = [node]
+                sub_nodes = graph.replicate(node, times=resource.ngpus)
             for idx, node in enumerate(sub_nodes):
                 graph.assign(node, idx)
     print(graph.extra_repr())
