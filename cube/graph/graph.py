@@ -438,7 +438,10 @@ class IRGraph(IRCell):
         for node in remain:
             if eager:
                 pre_indices = [seq.index(pre) for pre in node.predecessors()]
-                index = max(pre_indices) + 1
+                if len(pre_indices) == 0:
+                    index = 0
+                else:
+                    index = max(pre_indices) + 1
             else:
                 suc_indices = [seq.index[suc] for suc in node.successors()]
                 index = min(suc_indices)
@@ -461,6 +464,7 @@ class IRGraph(IRCell):
         Returns:
             Boolean: True for satisfying topo order, otherwise False.
         """
+        #TODO: check no new operators are created (including replicate)
         for index, node in enumerate(seq):
             for pre in node.predecessors():
                 if pre in seq:
@@ -481,14 +485,12 @@ class IRGraph(IRCell):
         dscp += f"Inputs: {self.inputs()}\n"
         # nodes
         for node in self._nodes:
-            # if isinstance(node, IRBpOperation):
-            #     continue
             succ_node_ids = [node._id for node in node.successors()]
             # succ_node_ids = [None] * len(node.outputs())
             # for out_idx in range(len(node.outputs())):
             #     node_list = [snode._id for snode in node.successors(out_idx)]
             #     succ_node_ids[out_idx] = node_list
-            dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}\n"
+            dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}"
         # outputs
         dscp += f"\nOutputs: {self.outputs()}\n{'=' * len(self.name)}\n"
         return dscp

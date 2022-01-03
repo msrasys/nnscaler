@@ -24,16 +24,16 @@ class AdapterGener:
         Returns:
             graph (IRGraph)
         """
+        # update the gradient before generate adapter
+        for node in graph.nodes():
+            if isinstance(node, IRBpOperation):
+                node.update()
         graph = AdapterGener.gen_activation_adapter(graph, eager)
         graph = AdapterGener.gen_weight_reducer(graph)
         return graph
 
     @staticmethod
     def gen_activation_adapter(graph: IRGraph, eager=True) -> IRGraph:
-        # update the gradient before generate adapter
-        for node in graph.nodes():
-            if isinstance(node, IRBpOperation):
-                node.update()
         all_adapters = list()
         # generate adapter for non-weight values
         for node in graph.nodes():
@@ -90,7 +90,11 @@ class AdapterGener:
                     if devid not in grads[input._id]:
                         grads[input._id][devid] = list()
                     if grad in grads[input._id][devid]:
-                        raise RuntimeError("Already logged grad?")
+                        raise RuntimeError(
+                            "Find two same gradient (not expected). "
+                            "This is usually due to replicated node assigned to same device. "
+                            f"\nCheck node:\n\t{fnode}"
+                        )
                     grads[input._id][devid].append(grad)
         # step 2: generate reducers.
         # reducers: tuple(ranks): List[weight]
