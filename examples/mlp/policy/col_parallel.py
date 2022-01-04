@@ -30,6 +30,7 @@ def A(graph, resource):
         if node.tag is not None:
             device = node.tag
             graph.assign(node, device)
+    return graph
 
 
 def S(graph, resource):
