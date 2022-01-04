@@ -153,6 +153,8 @@ def compile(model: SemanticModel, dataloader,
             span = time.time() - start
             print('> planpass on p2pfusion operations: {:.2f} s'.format(span))
 
+            # execplan.draw(outfile='execplan.png')
+
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()
             else:

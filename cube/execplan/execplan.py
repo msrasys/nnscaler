@@ -71,46 +71,71 @@ class ExectuionPlan:
             outfile:
                 the output file name
         """
+        self.graph.reset_dependency()
         ndevice = len(self.devices())
         # timeline [ [ (start_time, end_time), ... ], ... ]
         device_timeline = [list() for _ in range(ndevice)]
-        device_sus = [list() for _ in range(ndevice)]
+        device_nodes = [list() for _ in range(ndevice)]
+
+        def map2time(node):
+            if isinstance(node, IRGraph):
+                span = 0
+                for node in node.nodes():
+                    span += map2time(node)
+            if isinstance(node, IRFwOperation):
+                return 1
+            if isinstance(node, IRBpOperation):
+                return 2
+            if isinstance(node, IRAdapter):
+                return 0.5
+            return 0
+
+        def map2color(node):
+            if isinstance(node, IRGraph):
+                return map2color(node.nodes(0))
+            if isinstance(node, IRFwOperation):
+                return 'blue'
+            if isinstance(node, IRBpOperation):
+                return 'orange'
+            if isinstance(node, IRAdapter):
+                return 'green'
+
+        def map2name(node):
+            if isinstance(node, IRGraph):
+                if all([isinstance(n, IRFwOperation) for n in node.nodes()]):
+                    return f'f{node._id}'
+                if all([isinstance(n, IRBpOperation) for n in node.nodes()]):
+                    if node.mirror is not None:
+                        return f'b{node.mirror._id}'
+            return str(node._id)
 
         if spans is None:
+            print("Using default timing: fwop=1, bwop=2, adapter=0.1")
             spans = list()
             for node in self.graph.nodes():
-                span = 0
-                if isinstance(node, IRFwOperation):
-                    span = 1
-                elif isinstance(node, IRBpOperation):
-                    span = 2
-                elif isinstance(node, IRAdapter):
-                    span = 0.1
-                else:
-                    span = 0
+                span = map2time(node)
                 spans.append(span)
 
-        for su, span_time in zip(self.seq.sequence, spans):
-            device = su.device[0]
-
-            # tight execution if no dependency
-            if len(device_timeline[device]) == 0:
-                start_time = 1
-            else:
-                start_time = device_timeline[device][-1][1]
-
-            # check dependency
-            for devid, (timeline, dev_sus) in enumerate(zip(device_timeline, device_sus)):
-                if devid == device:
-                    continue
-                for suid, (_, end_time) in enumerate(timeline[::-1]):
-                    other_su = dev_sus[::-1][suid]
-                    if other_su.happen_before(su):
-                        start_time = max(start_time, end_time)
-                        break
-
-            device_timeline[device].append((start_time, start_time + span_time))
-            device_sus[device].append(su)
+        graph = self.graph
+        for node, span_time in zip(self.graph.nodes(), spans):
+            for device in node.device:
+                # tight execution if no dependency
+                if len(device_timeline[device]) == 0:
+                    start_time = 1
+                else:
+                    start_time = device_timeline[device][-1][1]
+                # check dependency
+                for devid, timeline in enumerate(device_timeline):
+                    dev_seq = device_nodes[devid]
+                    if devid == device:
+                        continue
+                    for nid, (_, end_time) in enumerate(timeline[::-1]):
+                        other_node = dev_seq[::-1][nid]
+                        if graph.happen_before(other_node, node):
+                            start_time = max(start_time, end_time)
+                            break
+                device_timeline[device].append((start_time, start_time + span_time))
+                device_nodes[device].append(node)
 
         # draw the timeline
         if outfile is not None:
@@ -124,13 +149,13 @@ class ExectuionPlan:
 
             fig, ax = plt.subplots()
             ax.set_xlim((1, max_time))
-            plt.xticks(list(range(1, max_time+1, 1)))
+            plt.xticks(list(range(1, int(max_time)+1, 1)))
             ax.xaxis.grid(True, linestyle='--')
             plt.xlabel('time')
 
             # yaxis
-            ax.set_ylim((0.5, self.ndevice+0.5))
-            plt.yticks(list(range(1, self.ndevice+1, 1)))
+            ax.set_ylim((0.5, len(self.devices())+0.5))
+            plt.yticks(list(range(1, len(self.devices())+1, 1)))
             ax.invert_yaxis()
             plt.ylabel('device id')
 
@@ -138,19 +163,20 @@ class ExectuionPlan:
 
             for devid in range(ndevice):
                 timeline = device_timeline[devid]
-                sus = device_sus[devid]
-                for su, (start, end) in zip(sus, timeline):
+                nodes = device_nodes[devid]
+                for node, (start, end) in zip(nodes, timeline):
+                    if end - start == 0:
+                        continue
                     # draw 
-                    color = 'blue' if (end - start) == 1 else 'orange'
+                    color = map2color(node)
                     rec = Rectangle((start, devid + 0.5), end-start, 1,
                                              color=color, ec='black', lw=1.5)
                     ax.add_artist(rec)
                     rx, ry = rec.get_xy()
                     cx = rx + rec.get_width() / 2.0
                     cy = ry + rec.get_height() / 2.0
-                    anno = str(su.stype)
-                    # anno = su.name if action.fid is None else action.fid
-                    ax.annotate(anno, (cx, cy), color='w', weight='bold',
+                    anno = map2name(node)
+                    ax.annotate(anno, (cx, cy), color='w', # weight='bold',
                                 fontsize=10, ha='center', va='center')
             # plt.grid()
             plt.savefig(outfile)
