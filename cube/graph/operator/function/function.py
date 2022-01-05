@@ -1,3 +1,4 @@
+import copy
 from typing import List
 import string
 
@@ -297,7 +298,7 @@ class Sum(IRFwOperation):
 
 # ========================= Memory Operation ==========================
 
-class Transpose(IRFwOperation):
+class Transpose(IREinops):
     """
     torch.transpose
     """
@@ -320,22 +321,26 @@ class Transpose(IRFwOperation):
         self.kwargs['dim0'] = inputs[1]
         self.kwargs['dim1'] = inputs[2]
 
-    def infer_shape(self):
-        if self.inputs(0).shape is None:
-            return False
-        ndim = len(self.inputs(0).shape)
+    def make_expression(self):
+        """
+        similar like a b c -> a c b
+        """
+        dims = string.ascii_lowercase
         dim0 = self.kwargs['dim0']
-        if dim0 < 0:
-            dim0 = ndim + dim0
-            self.kwargs['dim0'] = dim0
         dim1 = self.kwargs['dim1']
-        if dim1 < 0:
-            dim1 = ndim + dim1
-            self.kwargs['dim1'] = dim1
-        shape = list(self.inputs(0).shape)
-        shape[dim0], shape[dim1] = shape[dim1], shape[dim0]
-        self._outputs[0].shape = shape
-        return True
+        input = self.inputs(0)
+        in_dim = [EinDim(dims[d]) for d in range(len(input.shape))]
+        ou_dim = copy.copy(in_dim)
+        ou_dim[dim0], ou_dim[dim1] = in_dim[dim1], in_dim[dim0]
+
+    def renew(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        dim0 = self.kwargs['dim0']
+        dim1 = self.kwargs['dim1']
+        inputs += [dim0, dim1]
+        transpose = Transpose(self.signature, inputs, self.name)
+        for idx, output in enumerate(outputs):
+            transpose.set_output(idx, output)
+        return transpose
 
 # ===================== Cube Complex Operation =======================
 

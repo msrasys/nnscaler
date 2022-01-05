@@ -1,5 +1,4 @@
 from typing import List, Dict
-import warnings
 
 from cube.algorithm.utils import split_axis, split_value
 from cube.algorithm.generics import GenericDistAlgo
@@ -37,7 +36,7 @@ class DimSplitEinops(GenericDistAlgo):
         for attr in ['idx', 'dim', 'num']:
             if not attr in config:
                 raise KeyError("Expected idx, dim, num in the config")
-        node = self.node
+        node: IREinops = self.node
         idx: int = config['idx']
         dim: int = config['dim']
         num: int = config['num']
@@ -46,6 +45,8 @@ class DimSplitEinops(GenericDistAlgo):
         if node.inputs(idx).shape is None or abs(dim) >= len(node.inputs(idx).shape):
             return False
         if node.inputs(idx).shape[dim] % num != 0:
+            return False
+        if node._ieins[idx][dim].reduce == EinDim.ReduceType.Stay:
             return False
         return True
 
