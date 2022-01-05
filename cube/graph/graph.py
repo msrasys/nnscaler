@@ -252,7 +252,6 @@ class IRGraph(IRCell):
             ops.append(op.replicate())
         if isinstance(op.mirror, IRBpOperation):
             for rep_op in ops[1:]:
-                print(rep_op)
                 rep_op.gen_backward()
         idx = self.nodes().index(op)
         # forward
@@ -285,11 +284,11 @@ class IRGraph(IRCell):
         if op not in self.nodes():
             raise RuntimeError(f"Not Exist: {op}")
 
-        if algo.logic_op != type(op):
+        if algo.node != op:
             return None
         if not algo.satisfy(config):
             return None
-        fnodes = algo.instantiate(op, config)
+        fnodes = algo.instantiate(config)
 
         #FIXME: we don't allow non-weight input to be splitted in value
         for fnode in fnodes:

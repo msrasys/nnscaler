@@ -1,20 +1,16 @@
-import copy
+from typing import List
+import string
 
 from cube.graph.operator import IRFwOperation
+from cube.graph.operator.function.einops import EinDim, IREinops
+from cube.ir.cten import IRTensor
 
 
-class Linear(IRFwOperation):
+class Linear(IREinops):
     """
-    Input:
-        input: [N, *, in_features]
-        weight: [out_features, in_features]
-        bias: [out_features,]
-    
-    Output:
-        [N, *, in_features]
+    b * k, n k -> b * n
     """
     def __init__(self, signature, inputs, name='linear', **kwargs):
-
         input, weight, bias = inputs
         super().__init__(
             name, signature,
@@ -25,31 +21,38 @@ class Linear(IRFwOperation):
         self.set_input(1, weight)
         self.set_input(2, bias)
 
-    def infer_shape(self):
-        """
-        input:  [(D), M, K]
-        weight: [N, K]
-        bias:   [N,]
-        """
-        if self.inputs(0).shape is None or self.inputs(1).shape is None:
-            return False
-        shape = self.inputs(0).shape[:-1] + self.inputs(1).shape[:1]
-        self._outputs[0].shape = shape
-        return True
+    def make_expression(self):
+        expr = 'b * k, n k, n -> b * n'
+        [idims, wdims, bdims], [odims] = self.parse(expr)
+        if len(self.inputs(0).shape) == 2:
+            idims = [idims[0], idims[2]]
+            odims = [odims[0], odims[2]]
+        else:
+            extra_dims = list()
+            num_extra_dim = len(self.inputs(0).shape) - 2
+            dims = [c for c in string.ascii_lowercase if c not in 'bkn']
+            for num in range(num_extra_dim):
+                extra_dims.append(EinDim(dims[num]))
+            idims = [idims[0]] + extra_dims + [idims[-1]]
+            odims = [odims[0]] + extra_dims + [odims[-1]]
+        self.set_input_ein(0, idims)
+        self.set_input_ein(1, wdims)
+        if self.inputs(2) is not None:
+            self.set_input_ein(2, bdims)
+        self.set_output_ein(0, odims)
+
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        linear = Linear(self.signature, inputs, self.name)
+        for idx, output in enumerate(outputs):
+            linear.set_output(idx, output)
+        return linear
 
 
-class BatchLinear(IRFwOperation):
+class BatchLinear(IREinops):
     """
-    Inputs:
-        input1: [B, N, M]
-        input2: [B, M, P]
-
-    Outputs:
-        output: [B, N, P]
+    b m k, b k n -> b m n
     """
-
     def __init__(self, signature, inputs, name='bmm', **kwargs):
-
         if len(inputs) != 2:
             raise TypeError(f"Requires 2 inputs. But got {inputs}")
         input1, input2 = inputs
@@ -61,33 +64,27 @@ class BatchLinear(IRFwOperation):
         self.set_input(0, input1)
         self.set_input(1, input2)
 
-    def infer_shape(self):
-        if self.inputs(0).shape is None or self.inputs(1).shape is None:
-            return False
-        b1, n1, m1 = self.inputs(0).shape
-        b2, m2, p2 = self.inputs(1).shape
-        if m1 != m2 or b1 != b2:
-            raise RuntimeError("Unmatch {b1} != {b2} or {m1} != {m2}")
-        shape = [b1, n1, p2]
-        self._outputs[0].shape = shape
-        return True
+    def make_expression(self):
+        expr = 'b m k, b k n -> b m n'
+        input_dims, output_dims = self.parse(expr)
+        for idx, input_dim in enumerate(input_dims):
+            self.set_input_ein(idx, input_dim)
+        for idx, output_dim in enumerate(output_dims):
+            self.set_output_ein(idx, output_dim)
 
-# ============================= Elementwise ============================
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        bmm = BatchLinear(self.signature, inputs, self.name)
+        for idx, output in enumerate(outputs):
+            bmm.set_output(idx, output)
+        return bmm
 
-class ElementWise(IRFwOperation):
+
+class ElementWise(IREinops):
     """
-    Functions like torch.add, torch.mul, torch.sub, etc.
+    *, _ -> *
     """
 
     def __init__(self, signature, inputs, name='elementwise', **kwargs):
-        """
-        Inputs:
-            inputs[0]: IRTensor
-            inputs[1]: other (IRTensor or Number)
-        Outputs:
-            same shape as inputs[0]
-        """
-
         if len(inputs) != 2:
             raise TypeError(f"Expected 2 inputs but got {inputs}")
         super().__init__(
@@ -98,12 +95,27 @@ class ElementWise(IRFwOperation):
         for idx, input in enumerate(inputs):
             self.set_input(idx, input)
 
-    def infer_shape(self):
-        if self.inputs(0).shape is None:
-            return False
-        shape = copy.copy(self.inputs(0).shape)
-        self._outputs[0].shape = shape
-        return True
+    def make_expression(self):
+        """
+        """
+        dims = string.ascii_lowercase
+        i1, i2 = self.inputs()
+        dim1 = [EinDim(dims[d]) for d in range(len(i1.shape))]
+        if isinstance(i2, IRTensor):
+            if i2.shape == i1.shape:
+                dim2 = dim1
+            else:
+                raise NotImplementedError(f"Cannot match shape: {i1.shape} and {i2.shape}")
+        dim2 = list()
+        self.set_input_ein(0, dim1)
+        self.set_input_ein(1, dim2)
+        self.set_output_ein(0, dim1)
+
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        elew = ElementWise(self.signature, inputs, self.name)
+        for idx, output in enumerate(outputs):
+            elew.set_output(idx, output)
+        return elew
 
 
 class Add(ElementWise):
@@ -126,6 +138,13 @@ class Add(ElementWise):
         super().__init__(signature, inputs[:2], name=name)
         alpha = inputs[2]
         self.kwargs['alpha'] = alpha
+
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        inputs = inputs = self.kwags['alpha']
+        add = Add(self.signature, inputs, self.name)
+        for idx, output in enumerate(outputs):
+            add.set_output(idx, output)
+        return add
 
 
 class LayerNorm(IRFwOperation):
@@ -155,9 +174,7 @@ class LayerNorm(IRFwOperation):
         return True
 
 
-# ============================= Activation ============================
-
-class Activation(IRFwOperation):
+class Activation(IREinops):
     """
     functions like GELU, RELU, Dropout.
 
@@ -175,15 +192,15 @@ class Activation(IRFwOperation):
             output_length=1
         )
         self.set_input(0, inputs[0])
-        # this is for partitioning indicator
-        self.stay_dims = list()
 
-    def infer_shape(self):
-        input = self.inputs(0)
-        if input.shape is None:
-            return False
-        self._outputs[0].shape = input.shape
-        return True
+    def make_expression(self):
+        """
+        * -> *
+        """
+        dims = string.ascii_lowercase
+        dim1 = [EinDim(dims[d]) for d in range(len(self.inputs(0).shape))]
+        self.set_input_ein(0, dim1)
+        self.set_output_ein(0, dim1)
 
 
 class Dropout(Activation):
@@ -214,7 +231,11 @@ class Softmax(Activation):
         self.kwargs['dim'] = dim
         self.kwargs['_stacklevel'] = stacklevel
         self.kwargs['dtype'] = dtype
-        self.stay_dims.append(dim)
+    
+    def make_expression(self):
+        super().make_expression()
+        dim = self.kwargs['dim']
+        self._ieins[0][dim].reduce = EinDim.ReduceType.Stay
 
 
 # ===================== Loss Computation (Reduce) =========================

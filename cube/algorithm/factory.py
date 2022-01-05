@@ -62,31 +62,23 @@ class DistAlgorithmFactory:
         import cube.algorithm.ops.dataloader as dataloader
         self.register(dataloader.IRDataOperation, dataloader.DPDataLoader, tag='data')
 
-        import cube.algorithm.ops.linear as linear
-        self.register(linear.Linear, linear.LinearDataParallel, tag='data')
-        self.register(linear.Linear, linear.LinearColumnWeight, tag='column')
-        self.register(linear.Linear, linear.LinearRowWeight, tag='row')
+        import cube.algorithm.ops.einops as einops
+        self.register(einops.IREinops, einops.DimSplitEinops, tag='dim')
 
-        import cube.algorithm.ops.bmm as bmm
-        self.register(bmm.BatchLinear, bmm.BatchLinearDataParallel, tag='data')
-        self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='n')
-        self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='m')
-        self.register(bmm.BatchLinear, bmm.BatchLinearNParallel, tag='p')
-
-        import cube.algorithm.ops.elementwise as elew
-        self.register(elew.ElementWise, elew.ElementWiseDimParallel, tag='dim')
-        self.register(elew.Add, elew.AddDimParallel, tag='dim')
+        # import cube.algorithm.ops.elementwise as elew
+        # self.register(elew.ElementWise, elew.ElementWiseDimParallel, tag='dim')
+        # self.register(elew.Add, elew.AddDimParallel, tag='dim')
 
         import cube.algorithm.ops.layernorm as ln
         self.register(ln.LayerNorm, ln.LayerNormDimParallel, tag='dim')
 
-        import cube.algorithm.ops.activation as activation
-        self.register(activation.Activation, activation.ActivationDimParallel, tag='dim')
-        self.register(activation.Dropout, activation.DropoutDimParallel, tag='dim')
-        self.register(activation.Softmax, activation.SoftmaxDimParallel, tag ='dim')
+        # import cube.algorithm.ops.activation as activation
+        # self.register(activation.Activation, activation.ActivationDimParallel, tag='dim')
+        # self.register(activation.Dropout, activation.DropoutDimParallel, tag='dim')
+        # self.register(activation.Softmax, activation.SoftmaxDimParallel, tag ='dim')
 
-        import cube.algorithm.ops.reduce as reduce
-        self.register(reduce.Sum, reduce.SumDimParallel, tag='dim')
+        # import cube.algorithm.ops.reduce as reduce
+        # self.register(reduce.Sum, reduce.SumDimParallel, tag='dim')
 
         import cube.algorithm.ops.complex as complex
         self.register(complex.CubeComplexToQKV, complex.CubeToQKVDataParallel, tag='data')
