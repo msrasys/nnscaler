@@ -1,9 +1,8 @@
-from typing import Any, List, Dict
-import copy
+from typing import List, Dict
+import warnings
 
 from cube.algorithm.utils import split_axis, split_value
 from cube.algorithm.generics import GenericDistAlgo
-from cube.ir.cten import IRTensor
 
 from cube.graph.operator.function import IREinops, EinDim
 
@@ -68,7 +67,11 @@ class DimSplitEinops(GenericDistAlgo):
                 sub_tensors = split_axis(input, dim, num)
                 ins.append(sub_tensors)
             else:
-                ins.append([input] * num)
+                if axis.is_reduce():
+                    print(f'Warning: value split on one input tensor in node{node._id}:{node.name} as reduce axis {axis} not appeared.')
+                    ins.append(split_value(input, num))
+                else:
+                    ins.append([input] * num)
         for oidx, output in enumerate(node.outputs()):
             # split on the non-reduce axis, the output value keeps same
             # but the output shape gets splitted
@@ -90,6 +93,7 @@ class DimSplitEinops(GenericDistAlgo):
         for nid in range(num):
             inputs = [t[nid] for t in ins]
             outputs = [t[nid] for t in ous]
-            sub_node = node.new(inputs, outputs)
+            sub_node: IREinops = node.new(inputs, outputs)
+            sub_node.make_expression()
             sub_nodes.append(sub_node)
         return sub_nodes
