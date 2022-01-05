@@ -24,13 +24,10 @@ def PAS(graph: IRGraph, resource):
     stage_op_num = len(fnodes) // num_stage
     for idx, node in enumerate(fnodes):
         stage = min(idx // stage_op_num, num_stage - 1)
-        sub_nodes = None
-        algo = node.algorithms('data')
-        if algo is not None:
-            sub_nodes = graph.partition(node, algo, config=dict(chunk_num=num_micro_batch))
-        else:
-            algo = node.algorithms('dim')
-            sub_nodes = graph.partition(node, algo, config=dict(dim=0, chunk_num=num_micro_batch))
+        # partition at batch dimension
+        algo = node.algorithms('dim')
+        sub_nodes = graph.partition(
+            node, algo, config=dict(idx=0, dim=0, num=num_micro_batch))
         for mid, sub_node in enumerate(sub_nodes):
             f(mid, stage).append(sub_node)
             graph.assign(sub_node, stage)

@@ -7,14 +7,16 @@ def PAS(graph: IRGraph, resource):
     Linear Hybrid Partition
     """
     for idx, node in enumerate(graph.nodes()):
-        if isinstance(node, IRFwOperation) or isinstance(node, IRDataOperation):
+        if isinstance(node, IRDataOperation):
+            sub_nodes = graph.replicate(node, times=resource.ngpus)
+            for idx, node in enumerate(sub_nodes):
+                graph.assign(node, idx)
+        if isinstance(node, IRFwOperation):
             algo = node.algorithms('dim')
-            if algo:
-                sub_nodes = graph.partition(
-                    node, algo,
-                    config=dict(idx=1, dim=(idx+1)%2, num=resource.ngpus)
-                )
-            else:
+            sub_nodes = graph.partition(
+                node, algo, config=dict(idx=1, dim=(idx+1)%2, num=resource.ngpus)
+            )
+            if sub_nodes is None:  # partition fails
                 sub_nodes = graph.replicate(node, times=resource.ngpus)
             for idx, node in enumerate(sub_nodes):
                 graph.assign(node, idx)
