@@ -8,10 +8,10 @@ def P(graph, resource):
     """
     for node in graph.nodes():
         if isinstance(node, IRFwOperation) or isinstance(node, IRDataOperation):
-            algo = node.algorithms('column')
+            algo = node.algorithms('dim')
             if algo:
                 sub_nodes = graph.partition(
-                    node, algo, config=dict(chunk_num=resource.ngpus)
+                    node, algo, config=dict(idx=1, dim=0, num=resource.ngpus)
                 )
             else:
                 # graph.assign(node, list(range(resource.ngpus)))
@@ -46,10 +46,10 @@ def PAS(graph: IRGraph, resource):
     """
     for node in graph.nodes():
         if isinstance(node, IRFwOperation) or isinstance(node, IRDataOperation):
-            algo = node.algorithms('column')
+            algo = node.algorithms('dim')
             if algo:
                 sub_nodes = graph.partition(
-                    node, algo, config=dict(chunk_num=resource.ngpus)
+                    node, algo, config=dict(idx=1, dim=0, num=resource.ngpus)
                 )
             else:
                 # graph.assign(node, list(range(resource.ngpus)))

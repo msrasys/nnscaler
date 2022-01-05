@@ -10,19 +10,19 @@ def PAS(graph: IRGraph, resource):
     dp = resource.ngpus // tp
     for idx, node in enumerate(graph.nodes()):
         if isinstance(node, IRFwOperation) or isinstance(node, IRDataOperation):
-            if idx % 2 == 0:
-                algo = node.algorithms('row')
-            else:
-                algo = node.algorithms('column')
+            algo = node.algorithms('dim')
             if algo:
                 sub_nodes = list()
                 tp_nodes = graph.partition(
-                    node, algo, config=dict(chunk_num=tp)
+                    node, algo,
+                    config=dict(idx=1, dim=(idx+1)%2, num=tp)
                 )
                 for tp_node in tp_nodes:
-                    algo = tp_node.algorithms('data')
+                    algo = tp_node.algorithms('dim')
                     dp_nodes = graph.partition(
-                        tp_node, algo, config=dict(chunk_num=dp))
+                        tp_node, algo,
+                        config=dict(idx=0, dim=0, num=dp)
+                    )
                     sub_nodes += dp_nodes
             else:
                 sub_nodes = graph.replicate(node, times=resource.ngpus)

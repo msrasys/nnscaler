@@ -11,9 +11,10 @@ def PAS(graph, resource):
     micro_batch_num = resource.ngpus
     for node in graph.nodes():
         if isinstance(node, IRDataOperation) or isinstance(node, IRFwOperation):
-            algo = node.algorithms('data')
+            algo = node.algorithms('dim')
             if algo is not None:
-                sub_nodes = graph.partition(node, algo, config=dict(chunk_num=micro_batch_num))
+                sub_nodes = graph.partition(
+                    node, algo, config=dict(idx=0, dim=0, num=micro_batch_num))
             else:
                 sub_nodes = [node]
             for idx, sub_node in enumerate(sub_nodes):

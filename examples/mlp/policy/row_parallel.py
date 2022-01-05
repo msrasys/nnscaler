@@ -8,10 +8,10 @@ def PAS(graph: IRGraph, resource):
     """
     for node in graph.nodes():
         if isinstance(node, IRFwOperation) or isinstance(node, IRDataOperation):
-            algo = node.algorithms('row')
+            algo = node.algorithms('dim')
             if algo:
                 sub_nodes = graph.partition(
-                    node, algo, config=dict(chunk_num=resource.ngpus)
+                    node, algo, config=dict(idx=1, dim=1, num=resource.ngpus)
                 )
             else:
                 sub_nodes = graph.replicate(node, times=resource.ngpus)

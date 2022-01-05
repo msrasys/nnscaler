@@ -17,10 +17,10 @@ from torch import nn
 import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
-# from examples.mlp.policy.col_parallel import PAS
+from examples.mlp.policy.pipe_parallel import PAS
 
-from examples.mlp.policy.col_parallel import P, A, S
-PAS = (P, A, S)
+# from examples.mlp.policy.col_parallel import P, A, S
+# PAS = (P, A, S)
 
 # =================== Semantic Model Description ====================
 
