@@ -99,5 +99,5 @@ class DistAlgorithmFactory:
         self.register(complex.CubeComplexEmbedding, complex.CubeEmbedDataParallel, tag='data')
         self.register(complex.CubeComplexEmbedding, complex.CubeEmbedShardingParallel, tag='shard')
 
-        import cube.algorithm.ops.memory as mem
-        self.register(mem.Transpose, mem.TransposeDimParallel, tag='dim')
+        # import cube.algorithm.ops.memory as mem
+        # self.register(mem.Transpose, mem.TransposeDimParallel, tag='dim')

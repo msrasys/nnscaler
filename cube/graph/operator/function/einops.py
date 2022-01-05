@@ -16,7 +16,7 @@ class EinDim:
         Sum = 1
 
     def __init__(self, name: str, reduce=None):
-        if not (str.isidentifier(name) or name == '*'):
+        if not (str.isidentifier(name) or str.isdecimal(name) or name == '*'):
             raise ValueError("Einstein Axis name should be identifier")
         self.name: str = name
         self.reduce: Optional[EinDim.ReduceType] = reduce
@@ -81,6 +81,9 @@ class IREinops(IRFwOperation):
         for oidx in range(len(self._outputs)):
             output_shape = list()
             for oein in self._oeins[oidx]:
+                if str.isdecimal(oein.name):
+                    output_shape.append(int(oein.name))
+                    continue
                 for iidx in range(len(self._inputs)):
                     if oein in self._ieins[iidx]:
                         input = self.inputs(iidx)
@@ -118,18 +121,20 @@ class IREinops(IRFwOperation):
     def algorithms(self, tag: Optional[str] = None):
         factory = DistAlgorithmFactory()
         if tag is None:
-            templates = list()
-            if factory.exist(IREinops):
-                templates = factory.algorithms(IREinops)
             algos = list()
-            for template in templates:
-                algos.append(template(self))
+            if factory.exist(type(self)):
+                algos += [template(self) for template in factory.algorithms(type(self))]
+            if factory.exist(IREinops):
+                algos += [template(self) for template in factory.algorithms(IREinops)]
             return algos
         else:
-            if not factory.exist(IREinops, tag):
-                return None
-            template = factory.algorithms(IREinops, tag)
-            return template(self)
+            if factory.exist(type(self), tag):
+                template = factory.algorithms(type(self), tag)
+                return template(self)
+            if factory.exist(IREinops, tag):
+                template = factory.algorithms(IREinops, tag)
+                return template(self)
+            return None
 
     def parse(self, expr: str):
         """

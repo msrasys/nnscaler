@@ -203,6 +203,12 @@ class Activation(IREinops):
         self.set_input_ein(0, dim1)
         self.set_output_ein(0, dim1)
 
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        op = Activation(self.signature, inputs, self.name)
+        for idx, output in enumerate(outputs):
+            op.set_output(idx, output)
+        return op
+
 
 class Dropout(Activation):
     """
@@ -217,6 +223,13 @@ class Dropout(Activation):
         self.kwargs['p'] = inputs[1]
         self.kwargs['training'] = inputs[2]
         self.kwargs['inplace'] = inputs[3]
+
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        inputs = inputs + [self.kwargs['p'], self.kwargs['training'], self.kwargs['inplace']]
+        op = Dropout(self.signature, inputs, self.name)
+        for idx, output in enumerate(outputs):
+            op.set_output(idx, output)
+        return op
 
 
 class Softmax(Activation):
@@ -238,10 +251,16 @@ class Softmax(Activation):
         dim = self.kwargs['dim']
         self._ieins[0][dim].reduce = EinDim.ReduceType.Stay
 
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        inputs = inputs + [self.kwargs['dim'], self.kwargs['_stacklevel'], self.kwargs['dtype']]
+        op = Dropout(self.signature, inputs, self.name)
+        for idx, output in enumerate(outputs):
+            op.set_output(idx, output)
+        return op
 
 # ===================== Loss Computation (Reduce) =========================
 
-class Sum(IRFwOperation):
+class Sum(IREinops):
     """
     torch.sum
     """
@@ -265,36 +284,43 @@ class Sum(IRFwOperation):
             else:
                 self.kwargs['keepdim'] = False
 
-    def infer_shape(self):
-        if self.inputs(0).shape is None:
-            return False
-
-        # change dim to positive value
-        ndim = len(self.inputs(0).shape)
-        if 'dim' in self.kwargs:
-            dim = self.kwargs['dim']
-            dim = ndim + dim if dim < 0 else dim
-            self.kwargs['dim'] = dim
-            reduce_dims = [dim]
-        else:
-            reduce_dims = list(range(ndim))
-
-        if 'keepdim' in self.kwargs:
-            keepdim = self.kwargs['keepdim']
-        else:
-            keepdim = False
-
-        shape = list()
-        for dim, nele in enumerate(self.inputs(0).shape):
-            if dim in reduce_dims:
-                if keepdim:
-                    shape.append(1)
+    def make_expression(self):
+        """
+        * -> 1         (no extra kwarg)
+        a b c -> a c   (dim b)
+        a b c -> a 1 c (dim b and keepdim)
+        """
+        reducedim = None if 'dim' not in self.kwargs else self.kwargs['dim']
+        keepdim = False if 'keepdim' not in self.kwargs else self.kwargs['keepdim']
+        input = self.inputs(0)
+        dims = string.ascii_lowercase
+        in_dim = [
+            EinDim(dims[d]) for d in range(len(input.shape))]
+        ou_dim = copy.copy(in_dim)
+        if reducedim is not None:
+            in_dim[reducedim].reduce = EinDim.ReduceType.Sum
+            if keepdim:
+                ou_dim[reducedim] = EinDim('1')
             else:
-                shape.append(nele)
-        if len(shape) == 0:
-            shape = [1]
-        self._outputs[0].shape = shape
-        return True
+                ou_dim.pop(reducedim)
+        else:
+            for dim in in_dim:
+                dim.reduce = EinDim.ReduceType.Sum
+            ou_dim = [EinDim('1')]
+        self.set_input_ein(0, in_dim)
+        self.set_output_ein(0, ou_dim)
+
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        reducedim = None if 'dim' not in self.kwargs else self.kwargs['dim']
+        keepdim = False if 'keepdim' not in self.kwargs else self.kwargs['keepdim']
+        inputs += [reducedim]
+        if reducedim is not None:
+            if keepdim:
+                inputs += [keepdim]
+        sum_op = Sum(self.signature, inputs, self.name)
+        for idx, output in enumerate(outputs):
+            sum_op.set_output(idx, output)
+        return sum_op
 
 # ========================= Memory Operation ==========================
 
@@ -332,15 +358,17 @@ class Transpose(IREinops):
         in_dim = [EinDim(dims[d]) for d in range(len(input.shape))]
         ou_dim = copy.copy(in_dim)
         ou_dim[dim0], ou_dim[dim1] = in_dim[dim1], in_dim[dim0]
+        self.set_input_ein(0, in_dim)
+        self.set_output_ein(0, ou_dim)
 
-    def renew(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
         dim0 = self.kwargs['dim0']
         dim1 = self.kwargs['dim1']
         inputs += [dim0, dim1]
-        transpose = Transpose(self.signature, inputs, self.name)
+        op = Transpose(self.signature, inputs, self.name)
         for idx, output in enumerate(outputs):
-            transpose.set_output(idx, output)
-        return transpose
+            op.set_output(idx, output)
+        return op
 
 # ===================== Cube Complex Operation =======================
 
