@@ -16,8 +16,10 @@ def get_plan(graph: IRGraph, fnode: IRFwOperation, configs: List[Dict]) -> List[
             sub = graph.partition(node, algo, config)
             if sub is None:
                 sub = graph.replicate(node, times=config['num'])
+                fnode.tag = ('rep', 'rep')
             sub_nodes += sub
         all_nodes = sub_nodes
+    fnode.tag = tuple(config['name'] for config in configs)
     return all_nodes
 
 
@@ -29,9 +31,9 @@ def compositions(graph: IRGraph, fnode: IRFwOperation, nest: List[int]) -> List[
     will get 9 partition strategies of 8-nodes 
     """
     all_configs = [
-        dict(idx=0, dim=0),  # data parallel
-        dict(idx=0, dim=1),  # row parallel
-        dict(idx=1, dim=0),  # col parallel
+        dict(idx=0, dim=0, name='dat'),  # data parallel
+        dict(idx=0, dim=1, name='row'),  # row parallel
+        dict(idx=1, dim=0, name='col'),  # col parallel
     ]
     config_iter = combinations(all_configs, len(nest))
     for configs in config_iter:
@@ -40,6 +42,7 @@ def compositions(graph: IRGraph, fnode: IRFwOperation, nest: List[int]) -> List[
         nodes = get_plan(graph, fnode, configs)
         yield nodes
         graph.merge(nodes, fnode)
+        fnode.tag = None
 
 
 def sequence(graph: IRGraph, fnodes: IRFwOperation, resource):
@@ -57,7 +60,14 @@ def sequence(graph: IRGraph, fnodes: IRFwOperation, resource):
                     graph.assign(node, idx)
                 for remain in sequence(graph, fnodes[1:], resource):
                     yield seq + remain
-            
+
+
+def comm_estimate(graph: IRGraph) -> int:
+    """
+    Estimate communications
+    """
+    pass
+
 
 def PAS(graph: IRGraph, resource):
 
@@ -68,14 +78,18 @@ def PAS(graph: IRGraph, resource):
             for idx, node in enumerate(sub_nodes):
                 graph.assign(node, idx)
 
+    # replicate loss operation
     fnodes = [fnode for fnode in graph.nodes() if isinstance(fnode, IRFwOperation)]
+    loss = fnodes[-1]
+    sub_nodes = graph.replicate(loss, times=resource.ngpus)
 
+    # search for linear operations
+    fnodes = fnodes[:-1] # only search linears
     for idx, seq in enumerate(sequence(graph, fnodes, resource)):
         print(f'searching index: {idx}')
-        print(graph.extra_repr())
-        # for node in seq:
-        #     print(node)
-        # print('\n')
+        # print(graph.extra_repr())
+        for node in fnodes:
+            print(node.tag)
     print(f'==> grid searched on {idx+1} seq')
 
     raise NotImplementedError
