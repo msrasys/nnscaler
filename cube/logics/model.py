@@ -62,11 +62,12 @@ def forward(graph, *args) -> IRGraph:
     fnodes = list()
 
     # generate forward nodes
-    for node in graph.nodes():
-        inputs = node.inputs()
-        outputs = node.outputs()
-        # fnode = copy.copy(node)
-        fnode : IRFwOperation = node
+    for fnode in graph.nodes():
+        fidx = graph.detach(fnode)
+        inputs = fnode.inputs()
+        outputs = fnode.outputs()
+        # fnode = copy.copy(fnode)
+        fnode : IRFwOperation = fnode
         fnode._inputs = inputs
         fnode._outputs = outputs
         # set forward inputs
@@ -75,6 +76,7 @@ def forward(graph, *args) -> IRGraph:
         # set forward outputs
         for idx, val in enumerate(outputs):
             fnode.set_output(idx, gener.renew(val))
+        graph.attach(fnode, fidx)
         fnodes.append(fnode)
 
     # reverse is only to make op id looks consecutive

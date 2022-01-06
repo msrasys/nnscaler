@@ -452,7 +452,12 @@ class IRAdapter(IRCell):
                     break
             # cannot merge or add
             if out is None:
-                raise RuntimeError("Merge Plan not found")
+                print(f'failed tensor: {dst_tensor}')
+                print(f'ptensor:')
+                for tensor in dst_tensor.parent.ptensors:
+                    print(f'node-{tensor._cell._id}: {tensor}')
+                print(f'intersections: {intersections}')
+                raise RuntimeError(f"Merge plan of tensor {dst_tensor} not found")
         return prims
 
     def __repr__(self):

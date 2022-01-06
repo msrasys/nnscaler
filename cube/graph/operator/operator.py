@@ -25,27 +25,27 @@ class BaseOperator:
         """
         raise NotImplementedError
 
-    def set_input(self, input_index: int, val: Any):
-        # remove the consumer
-        old_val = self.inputs(input_index)
-        if isinstance(old_val, IRSubTensor):
-            old_val.parent.rm_consumer(self)
-        # add the consumer
-        val = super().set_input(input_index, val)
-        if isinstance(val, IRSubTensor):
-            val.parent.add_consumer(self, val)
-        return val
+    # def set_input(self, input_index: int, val: Any):
+    #     # remove the consumer
+    #     old_val = self.inputs(input_index)
+    #     if isinstance(old_val, IRSubTensor):
+    #         old_val.parent.rm_consumer(self)
+    #     # add the consumer
+    #     val = super().set_input(input_index, val)
+    #     if isinstance(val, IRSubTensor):
+    #         val.parent.add_consumer(self, val)
+    #     return val
 
-    def set_output(self, output_index: int, val: Any):
-        # remove the producer
-        old_val = self.outputs(output_index)
-        if isinstance(old_val, IRSubTensor):
-            old_val.parent.rm_producer(self)
-        # add the producer
-        val = super().set_output(output_index, val)
-        if isinstance(val, IRSubTensor):
-            val.parent.add_producer(self, val)
-        return val
+    # def set_output(self, output_index: int, val: Any):
+    #     # remove the producer
+    #     old_val = self.outputs(output_index)
+    #     if isinstance(old_val, IRSubTensor):
+    #         old_val.parent.rm_producer(self)
+    #     # add the producer
+    #     val = super().set_output(output_index, val)
+    #     if isinstance(val, IRSubTensor):
+    #         val.parent.add_producer(self, val)
+    #     return val
 
     def replicate(self):
         """
@@ -119,28 +119,6 @@ class IRFwOperation(IRCell):
             template = factory.algorithms(type(self), tag)
             return template(self)
 
-    def set_input(self, input_index: int, val: Any):
-        # remove the consumer
-        old_val = self.inputs(input_index)
-        if isinstance(old_val, IRSubTensor):
-            old_val.parent.rm_consumer(self)
-        # add the consumer
-        val = super().set_input(input_index, val)
-        if isinstance(val, IRSubTensor):
-            val.parent.add_consumer(self, val)
-        return val
-
-    def set_output(self, output_index: int, val: Any):
-        # remove the producer
-        old_val = self.outputs(output_index)
-        if isinstance(old_val, IRSubTensor):
-            old_val.parent.rm_producer(self)
-        # add the producer
-        val = super().set_output(output_index, val)
-        if isinstance(val, IRSubTensor):
-            val.parent.add_producer(self, val)
-        return val
-
     def replicate(self):
         """
         Replicate the Operation
@@ -162,6 +140,15 @@ class IRFwOperation(IRCell):
         return cpy
 
     def gen_backward(self):
+        """
+        Generate backward operator for this forward operator.
+
+        Note by calling this API, this forward operator must be
+        attached into any of one IRGraph, or will lead to reference
+        count 0 error on gradient calcaultion.
+
+        return: IRBpOperation
+        """
         if self.mirror is not None:
             raise RuntimeError(
                 "Backward Op already generated. Use self.mirror.update() instead.")
@@ -268,48 +255,19 @@ class IRBpOperation(IRCell):
         self._datas[data_index] = val
         return val
 
-    def set_input(self, input_index: int, val: Any):
-        """
-        Set the node input gradient
-        (i.e., output gradient in forward) at input index.
-        The grad is same order with corresponding output tensor
-        of it's forward tensor
-
-        Args:
-            input_idx: input index
-            val: Union[IRTensor, Any]
-
-        Return:
-            The set val
-        """
-        # remove the consumer
-        old_val = self.inputs(input_index)
-        if isinstance(old_val, IRSubTensor):
-            old_val.parent.rm_consumer(self)
-        # add the consumer
-        val = super().set_input(input_index, val)
-        if isinstance(val, IRSubTensor):
-            val.parent.add_consumer(self, val)
-        return val
-
-    def set_output(self, output_index: int, val: Any):
-        """
-        Set op output grad (Forward input gradient)
-        """
-        # remove the producer
-        old_val = self.outputs(output_index)
-        if isinstance(old_val, IRSubTensor):
-            old_val.parent.rm_producer(self)
-        # add the producer
-        val = super().set_output(output_index, val)
-        if isinstance(val, IRSubTensor):
-            val.parent.add_producer(self, val)
-        return val
-
     def update(self):
         """
         Update this backward operator.
-        This neccessary when op is partitioned and reference count is changed.
+        This is neccessary when op is partitioned and reference count is changed.
+
+        Note in order to update produced and consumed tensor list, this call should be
+        wrapped with IRGraph detach and attach:
+
+        ```
+        idx = graph.detach(node)
+        node.update()
+        graph.attach(node, idx)
+        ```
         """
         fnode = self.mirror
         for idx, input in enumerate(fnode.inputs()):
@@ -376,17 +334,6 @@ class IRDataOperation(IRCell):
         Infer output value shape
         """
         return True
-
-    def set_output(self, output_index: int, val: Any):
-        # remove the producer
-        old_val = self.outputs(output_index)
-        if isinstance(old_val, IRSubTensor):
-            old_val.parent.rm_producer(self)
-        # add the producer
-        val = super().set_output(output_index, val)
-        if isinstance(val, IRSubTensor):
-            val.parent.add_producer(self, val)
-        return val
 
     def algorithms(self, tag: Optional[str] = None):
         """

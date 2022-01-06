@@ -27,7 +27,9 @@ class AdapterGener:
         # update the gradient before generate adapter
         for node in graph.nodes():
             if isinstance(node, IRBpOperation):
+                idx = graph.detach(node)
                 node.update()
+                graph.attach(node, idx)
         graph = AdapterGener.gen_activation_adapter(graph, eager)
         graph = AdapterGener.gen_weight_reducer(graph)
         return graph

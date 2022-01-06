@@ -362,7 +362,7 @@ class IRFullTensor(IRTensor):
     def add_producer(self, cell: IRCell, tensor: IRTensor):
         if not isinstance(cell, IRCell) or not isinstance(tensor, IRTensor):
             raise TypeError("Expect an IRCell and an IRTensor")
-        if cell not in self.consumers:
+        if cell not in self.producers:
             self.producers.append(cell)
             self.ptensors.append(tensor)
 

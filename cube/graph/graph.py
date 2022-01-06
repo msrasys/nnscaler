@@ -33,8 +33,8 @@ class IRGraph(IRCell):
                  inputs: Optional[List[IRTensor]], 
                  outputs: Optional[List[IRTensor]], 
                  module_name: str):
-        
-        self._nodes: List[IRCell] = nodes
+
+        self._nodes: List[IRCell] = list()
         self._parameters = list()
 
         if inputs is None:
@@ -53,6 +53,10 @@ class IRGraph(IRCell):
             self.set_input(idx, tensor)
         for idx, tensor in enumerate(outputs):
             self.set_output(idx, tensor)
+
+        # insert node from nodes
+        for idx, node in enumerate(nodes):
+            self.attach(node, idx)
 
         # set parameter
         for node in self._nodes:
@@ -173,6 +177,54 @@ class IRGraph(IRCell):
         )
         return subgraph
 
+    def detach(self, node: IRCell, reset_dependency=False) -> int:
+        """
+        Detach (remove) a node from current graph.
+
+        All the used input and output tensors inside the node
+        are removed from consumed and produced tensor list.
+
+        Return:
+            index (int): index of the detached node in the graph
+        """
+        if node not in self.nodes():
+            raise KeyError(f"node {node} is not in graph.")
+        ops = node.nodes() if isinstance(node, IRGraph) else [node]
+        for op in ops:
+            for input in op.inputs():
+                if isinstance(input, IRSubTensor):
+                    input.parent.rm_consumer(op)
+            for output in op.outputs():
+                if isinstance(output, IRSubTensor):
+                    output.parent.rm_producer(op)
+        index = self._nodes.index(node)
+        self._nodes.pop(index)
+        if reset_dependency:
+            self.reset_dependency()
+        return index
+
+    def attach(self, node: IRCell, index, reset_dependency=False):
+        """
+        Attach (insert) a node into current graph at node index.
+
+        All the used input and output tensors inside the node are 
+        recorded in consumed and produced tensor list.
+        """
+        if node in self.nodes():
+            raise KeyError(f"node {node} is already in graph.")
+        ops = node.nodes() if isinstance(node, IRGraph) else [node]
+        for op in ops:
+            for input in op.inputs():
+                if isinstance(input, IRSubTensor):
+                    input.parent.add_consumer(op, input)
+            for output in op.outputs():
+                if isinstance(output, IRSubTensor):
+                    output.parent.add_producer(op, output)
+        self._nodes.insert(index, node)
+        if reset_dependency:
+            self.reset_dependency()
+        return
+
     @staticmethod
     def get_inputs(nodes: List[IRCell]):
         """
@@ -247,22 +299,21 @@ class IRGraph(IRCell):
         if op not in self.nodes():
             raise RuntimeError(f"Op {op} not exsits")
     
-        ops = [op]
-        for _ in range(times - 1):
-            ops.append(op.replicate())
+        fnodes = [op.replicate() for _ in range(times - 1)]
+        # insert forward
+        fidx = self.nodes().index(op)
+        for idx, fnode in enumerate(fnodes):
+            self.attach(fnode, fidx + idx) 
+        # insert backward
         if isinstance(op.mirror, IRBpOperation):
-            for rep_op in ops[1:]:
-                rep_op.gen_backward()
-        idx = self.nodes().index(op)
-        # forward
-        self._nodes = self._nodes[:idx] + ops + self._nodes[idx+1:]
-        # backward
-        if isinstance(op.mirror, IRCell):
-            bops = [op.mirror for op in ops][::-1]
-            midx = self.nodes().index(op.mirror)
-            self._nodes = self._nodes[:midx] + bops + self._nodes[midx+1:]
+            for fnode in fnodes:
+                fnode.gen_backward()
+            bnodes = [fnode.mirror for fnode in fnodes][::-1]
+            bidx = self.nodes().index(op.mirror)
+            for idx, bnode in enumerate(bnodes):
+                self.attach(bnode, bidx + idx)
         self.reset_dependency()
-        return ops
+        return [op] + fnodes
 
     def partition(self, op: IRCell, algo: GenericDistAlgo, config: Dict) -> Optional[List[IRCell]]:
         """
@@ -283,6 +334,8 @@ class IRGraph(IRCell):
             raise TypeError("Expected algo to be GenericDistAlgo")
         if op not in self.nodes():
             raise RuntimeError(f"Not Exist: {op}")
+        if not (isinstance(op, IRFwOperation) or isinstance(op, IRDataOperation)):
+            raise ValueError("Only allow op to be forward op or data op.")
 
         if algo.node != op:
             return None
@@ -298,36 +351,30 @@ class IRGraph(IRCell):
                         raise NotImplementedError(
                             f"Not support feature-map {input} to be splitted in value as input"
                         )
-
-        # remove reference
-        finputs = op.inputs()
-        op.make_empty()
-        if op.mirror is not None:
-            op.mirror.make_empty()
-
-        # generate backward
+        # update forward
+        findex = self.detach(op)
+        for idx, fnode in enumerate(fnodes):
+            self.attach(fnode, findex + idx)
+        # update backward
+        if isinstance(op.mirror, IRBpOperation):
+            bindex = self.detach(op.mirror)
+            bnodes = [fnode.gen_backward() for fnode in fnodes][::-1]
+            for idx, bnode in enumerate(bnodes):
+                self.attach(bnode, bindex + idx)
+        # update gradient
         updated = set()
-        for input in finputs:
+        for input in op.inputs():
             if not isinstance(input, IRSubTensor):
                 continue
-            # go through related consumers and update backward op
             for fnode in input.parent.consumers:
-                if isinstance(fnode, IRFwOperation) and fnode._id not in updated:
-                    if fnode.mirror is not None:
-                        fnode.mirror.update()
-                    else:
-                        fnode.gen_backward()
-                    updated.add(fnode._id)
-
-        # insert nodes
-        idx = self._nodes.index(op)
-        self._nodes = self._nodes[:idx] + fnodes + self._nodes[idx+1:]
-        if op.mirror is not None:
-            idx = self._nodes.index(op.mirror)
-            bnodes = [node.mirror for node in fnodes][::-1]
-            self._nodes = self._nodes[:idx] + bnodes + self._nodes[idx+1:]
+                bnode = fnode.mirror
+                if isinstance(bnode, IRBpOperation) and fnode._id not in updated:
+                    idx = self.detach(bnode)
+                    bnode.update()
+                    self.attach(bnode, idx)
+                updated.add(fnode._id)
         self.reset_dependency()
-        return copy.copy(fnodes)
+        return fnodes
 
     def merge(self, sub_graph, target_op, op_partition_algorithm):
         raise NotImplementedError
