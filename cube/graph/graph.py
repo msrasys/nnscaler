@@ -376,8 +376,60 @@ class IRGraph(IRCell):
         self.reset_dependency()
         return fnodes
 
-    def merge(self, sub_graph, target_op, op_partition_algorithm):
-        raise NotImplementedError
+    def merge(self, nodes: List[IRCell], target_node: IRCell):
+        """
+        Merge consecutive nodes in the graph to the target_node.
+        Note corresponding mirror nodes (if have) will also be merged.
+
+        We don't check computation equivalence between nodes and target_node.
+
+        Merge requires nodes are consecutive in the graph sequence.
+        """
+        if not isinstance(target_node, IRCell):
+            raise TypeError("Expected target node to be IRCell")
+        if target_node in self.nodes():
+            raise ValueError("Target node is already in the graph")
+        for node in nodes:
+            if node not in self.nodes():
+                raise KeyError(f"node {node} is not in the graph")
+        indices = [self.nodes().index(node) for node in nodes]
+        # consecutive
+        if max(indices) - min(indices) != len(indices) - 1:
+            return False
+        index = min(indices)
+        # update forward
+        for node in nodes:
+            self.detach(node)
+        self.attach(target_node, index)
+        # update backward
+        if all([isinstance(node.mirror, IRCell) for node in nodes]):
+            bidx = len(self.nodes())
+            for node in nodes:
+                idx = self.detach(node.mirror)
+                bidx = min(idx, bidx)
+            if target_node.mirror is None:
+                if not isinstance(target_node, IRFwOperation):
+                    raise RuntimeError("target node is not FwOp and doens't have mirror node")
+                target_node.gen_backward()
+            self.attach(target_node.mirror, bidx)
+        elif all([isinstance(node.mirror, None) for node in nodes]):
+            pass
+        else:
+            raise ValueError("nodes should have nothing-or-all mirror nodes")
+        # update weights
+        updated = set()
+        for node in nodes + [target_node]:
+            for input in node.inputs():
+                if not isinstance(input, IRSubTensor):
+                    continue
+                for fnode in input.parent.consumers:
+                    bnode = fnode.mirror
+                    if isinstance(bnode, IRBpOperation) and fnode._id not in updated:
+                        idx = self.detach(bnode)
+                        bnode.update()
+                        self.attach(bnode, idx)
+                    updated.add(fnode._id)
+        return True
 
     def identity(self, input_tensor, dst_op):
         raise NotImplementedError
