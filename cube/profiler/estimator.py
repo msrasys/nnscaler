@@ -1,4 +1,5 @@
 
+from cube.graph.operator.operator import IRBpOperation, IRFwOperation
 from cube.graph.tensor import IRSubTensor, ValueMap
 from cube.graph.adapter.adapter import IRAdapter
 from cube.graph import IRGraph
@@ -34,6 +35,11 @@ class Estimator:
         """
         Estimate node message recv volume.
         This has no requirement for generating adapters in graph.
+
+        Note for intermediate tensor communication, the estimated
+        communication volume is:
+            Volume = 0 if local produced tensor can covor all the needed region.
+                       else N#(remote produced overlapping region)
         """
         if node not in self.graph.nodes():
             raise KeyError(f"node {node} not in graph")
@@ -54,13 +60,27 @@ class Estimator:
                             remote.append(ptensor)
                         else:
                             local.append(ptensor)
-                    if input in local:
+                    # check local
+                    local_cover = False
+                    for ptensor in local:
+                        if input.overlap(ptensor):
+                            intersection = input.common(ptensor)
+                            if intersection == input:
+                                local_cover = True
+                                break
+                    if local_cover:
                         continue
-                    else:
-                        for ptensor in remote:
-                            if input.overlap(ptensor):
-                                intersection = input.common(ptensor)
-                                volume += intersection.nele()
+                    for ptensor in remote:
+                        if input.overlap(ptensor):
+                            intersection = input.common(ptensor)
+                            volume += intersection.nele()
+        # debug info
+        # if isinstance(node, IRFwOperation):
+        #     print(f'fw{node._id}-{node.device}-{node.name}: {volume}')
+        # elif isinstance(node, IRBpOperation):
+        #     print(f'bw{node._id}(fw{node.mirror._id}): {volume}')
+        # else:
+        #     print(f'cell{node._id}-{node.device}-{node.name}: {volume}')
         return volume
 
     def flops(self) -> int:
