@@ -1,6 +1,8 @@
 
 from typing import Dict, List
+import time
 from itertools import combinations
+
 from cube.graph import IRGraph
 from cube.graph.operator.operator import IRDataOperation, IRFwOperation
 import cube.search.iterator as iterator
@@ -93,6 +95,8 @@ def PAS(graph: IRGraph, resource):
         graph.assign(sub_node, idx)
 
     # search for linear operations
+    start = time.time()
+
     fnodes = fnodes[:-1] # only search linears
     seqs = list()
     comms = list()
@@ -104,11 +108,11 @@ def PAS(graph: IRGraph, resource):
         comms.append(comm)
         plan = [node.tag for node in fnodes]
         plans.append(plan)
-        print(f'comm volume: {comm}')
+        print(f'comm volume param#: {comm}')
         # for node in fnodes:
         #     print(node.tag)
         # print(graph.extra_repr())
-    print(f'==> grid search done on {idx+1} seq')
+    print(f'==> grid search done on {idx+1} plans')
     print(f'\n\n')
 
     comms = np.array(comms)
@@ -121,6 +125,9 @@ def PAS(graph: IRGraph, resource):
         print(f'top {top_idx} (plan index {idx}):')
         for lid, node in enumerate(plan):
             print(f'linear{lid}: {node}')
-        print(f'===> comm: {comm}')
+        print(f'===> comm param#: {comm}')
+
+    end = time.time()
+    print('grid search time: {:.2f}'.format(end-start))
 
     raise NotImplementedError
