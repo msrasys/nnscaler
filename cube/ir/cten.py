@@ -574,6 +574,17 @@ class IRTensor:
             raise RuntimeError("Expected shape to be list[int]")
         self._shape = copy.copy(list(val))
 
+    def nele(self) -> int:
+        """
+        Get total number of element in the tensor.
+        """
+        if self.shape is None:
+            raise RuntimeError("Tensor shape is not set")
+        cnt = 1
+        for num in self.shape:
+            cnt *= num
+        return cnt
+
     def src(self, cells: List[IRCell]) -> List[IRCell]:
         """
         Return all the cells that will generate this tensor
