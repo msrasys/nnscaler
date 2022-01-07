@@ -4,6 +4,9 @@ from itertools import combinations
 from cube.graph import IRGraph
 from cube.graph.operator.operator import IRDataOperation, IRFwOperation
 import cube.search.iterator as iterator
+from cube.profiler.estimator import Estimator
+
+import numpy as np
 
 
 def get_plan(graph: IRGraph, fnode: IRFwOperation, configs: List[Dict]) -> List[IRFwOperation]:
@@ -19,7 +22,7 @@ def get_plan(graph: IRGraph, fnode: IRFwOperation, configs: List[Dict]) -> List[
                 fnode.tag = ('rep', 'rep')
             sub_nodes += sub
         all_nodes = sub_nodes
-    fnode.tag = tuple(config['name'] for config in configs)
+    fnode.tag = tuple('{}-{}'.format(config['name'], config['num']) for config in configs)
     return all_nodes
 
 
@@ -62,11 +65,15 @@ def sequence(graph: IRGraph, fnodes: IRFwOperation, resource):
                     yield seq + remain
 
 
-def comm_estimate(graph: IRGraph) -> int:
+def comm_estimate(graph: IRGraph, ndevice: int) -> int:
     """
     Estimate communications
     """
-    pass
+    estimator = Estimator(graph)
+    total_volume = 0
+    for devid in range(ndevice):
+        total_volume += estimator.comm_volume(devid)
+    return total_volume
 
 
 def PAS(graph: IRGraph, resource):
@@ -82,14 +89,38 @@ def PAS(graph: IRGraph, resource):
     fnodes = [fnode for fnode in graph.nodes() if isinstance(fnode, IRFwOperation)]
     loss = fnodes[-1]
     sub_nodes = graph.replicate(loss, times=resource.ngpus)
+    for idx, sub_node in enumerate(sub_nodes):
+        graph.assign(sub_node, idx)
 
     # search for linear operations
     fnodes = fnodes[:-1] # only search linears
+    seqs = list()
+    comms = list()
+    plans = list()
     for idx, seq in enumerate(sequence(graph, fnodes, resource)):
-        print(f'searching index: {idx}')
+        print(f'searching index: {idx}...')
+        seqs.append(seq)
+        comm = comm_estimate(graph, resource.ngpus)
+        comms.append(comm)
+        plan = [node.tag for node in fnodes]
+        plans.append(plan)
+        print(f'comm volume: {comm}')
+        # for node in fnodes:
+        #     print(node.tag)
         # print(graph.extra_repr())
-        for node in fnodes:
-            print(node.tag)
-    print(f'==> grid searched on {idx+1} seq')
+    print(f'==> grid search done on {idx+1} seq')
+    print(f'\n\n')
+
+    comms = np.array(comms)
+    indices = np.argsort(comms)
+
+    top_indices = indices[:10]
+    top_plan = [plans[idx] for idx in top_indices]
+    top_comm = [comms[idx] for idx in top_indices]
+    for top_idx, (idx, plan, comm) in enumerate(zip(top_indices, top_plan, top_comm)):
+        print(f'top {top_idx} (plan index {idx}):')
+        for lid, node in enumerate(plan):
+            print(f'linear{lid}: {node}')
+        print(f'===> comm: {comm}')
 
     raise NotImplementedError
