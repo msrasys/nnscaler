@@ -60,7 +60,7 @@ class Estimator:
                             remote.append(ptensor)
                         else:
                             local.append(ptensor)
-                    # check local
+                    # check local producer
                     local_cover = False
                     for ptensor in local:
                         if input.overlap(ptensor):
@@ -70,10 +70,29 @@ class Estimator:
                                 break
                     if local_cover:
                         continue
+                    # check remote producer
+                    remote_producer_volume = 0
                     for ptensor in remote:
                         if input.overlap(ptensor):
                             intersection = input.common(ptensor)
-                            volume += intersection.nele()
+                            remote_producer_volume += intersection.nele()
+                    # check remote consumer
+                    # TODO: need to check if all consumers can be
+                    # merged to input
+                    remote_consumer_volume = None
+                    index = input.parent.consumers.index(node)
+                    for ctensor in input.parent.ctensors[:index]:
+                        if input.overlap(ctensor):
+                            if remote_consumer_volume is None:
+                                remote_consumer_volume = 0
+                            intersection = input.common(ctensor)
+                            remote_consumer_volume += intersection.nele()
+                        if intersection == input:
+                            break
+                    if remote_consumer_volume is None:
+                        volume += remote_producer_volume
+                    else:
+                        volume += min(remote_consumer_volume, remote_producer_volume)
         # debug info
         # if isinstance(node, IRFwOperation):
         #     print(f'fw{node._id}-{node.device}-{node.name}: {volume}')
