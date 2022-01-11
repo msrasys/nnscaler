@@ -9,17 +9,29 @@ python -m torch.distributed.launch \
     --master_port=8004 \
     --use_env \
     examples/ffn/ffn.py
+
+OMP_NUM_THREADS=4 torchrun --standalone \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    examples/ffn/ffn.py
+
+OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=8 \
+    --nnodes=2 \
+    --rdzv_id=888 \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=worker0:8004 \
+    examples/ffn/ffn.py
 """
 
 import torch
 import torch.nn.functional as F
+
 import cube
-
-from examples.ffn.policy.data_parallel import transform_policy
-from examples.ffn.policy.data_parallel import schedule_policy
-
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
+
+from examples.ffn.policy.data import PAS
 
 
 class FFN(torch.nn.Module):
@@ -60,9 +72,13 @@ def train():
         model, input_shapes=([L, N, E],),
     )
 
-    dataloader = cube.runtime.syndata.SynDataLoader(1280, [1], [L, N, E])
+    dataloader = cube.runtime.syndata.SynDataLoader(
+        shapes=([L, N, E],),
+        dtypes=(torch.float32,),
+        batch_dims=(1,)
+    )
 
-    @cube.compile(model, dataloader, policy=(transform_policy, schedule_policy))
+    @cube.compile(model, dataloader, PAS=PAS)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
@@ -71,12 +87,12 @@ def train():
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
-    CudaTimer().warmup()
+    CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
     iter_num = 128
     for step in range(iter_num):
         if step >= 40:
-            CudaTimer().start('e2e')
+            CudaTimer(enable=True).start('e2e')
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
@@ -87,6 +103,7 @@ def train():
     
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
           CudaTimer().duration(iter_num-40, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num-40)
 
 
 if __name__ == '__main__':
