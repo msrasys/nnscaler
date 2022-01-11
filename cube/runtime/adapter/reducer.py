@@ -6,7 +6,7 @@ from typing import List
 import torch
 
 from cube.runtime.device import DeviceGroup
-
+from cube.profiler.timer import CudaTimer, print_each_rank
 
 class Reducer:
 
@@ -35,6 +35,7 @@ class Reducer:
                 # param.main_grad = param.grad
         # for each bucket, do all-reduce
         for tp in buckets:
+            CudaTimer().start(field_name='comm')
             bucket = buckets[tp]
             grads = [param.grad.data for param in bucket]
             coalesced = self._flatten_dense_tensors(grads)
@@ -43,6 +44,7 @@ class Reducer:
             all_synced = self._unflatten_dense_tensors(coalesced, grads)
             for grad, synced in zip(grads, all_synced):
                 grad.copy_(synced)
+            CudaTimer().stop(field_name='comm')
 
     def sync(self):
         """

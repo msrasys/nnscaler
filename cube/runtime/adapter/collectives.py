@@ -133,6 +133,8 @@ def all_gather(input_tensors: List[torch.Tensor],
     CudaTimer().start(field_name='comm')
     assert len(input_tensors) == 1
     tensor = input_tensors[0]
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
     group = DeviceGroup().get_group(ranks)
     tensor_list = [torch.empty_like(tensor) for _ in ranks]
     idx = ranks.index(DeviceGroup().rank)
