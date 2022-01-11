@@ -9,6 +9,11 @@ python -m torch.distributed.launch \
     --master_port=8004 \
     --use_env \
     examples/inspector.py
+
+OMP_NUM_THREADS=4 torchrun --standalone \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    examples/inspector.py
 """
 import torch
 import argparse
@@ -19,13 +24,21 @@ from cube.profiler import CudaTimer
 from cube.profiler.memory import memory_summary
 from cube.profiler.timer import print_each_rank
 
-L, N, E = (512, 8, 3072)
 # gpt
-kBatchDims = [0, 0]
-kDataShapes = ([N, L], [N, L])
+# L, N, E = (512, 8, 3072)
+# kBatchDims = (0, 0)
+# kDataShapes = ([N, L], [N, L])
+# kDTypes = (torch.float, torch.long)
+
+# mlp
+kBatchDims = (0,)
+kDataShapes = ([8192, 8192],)
+kDTypes = (torch.float,)
+
 # transformer
-# kBatchDims  = [1]
+# kBatchDims  = (1, )
 # kDataShapes = ([512, 4, 3072],)
+# kDTypes = (torch.float,)
 
 
 def load_module(filename: str):
@@ -55,12 +68,10 @@ def load_train_fn(filename: str):
 
 def train(args):
     global kDataShapes
-    
-    # dataloader = cube.runtime.syndata.SynDataLoader(
-    #     1280, kBatchDims, *kDataShapes
-    # )
-    dataloader = cube.runtime.syndata.SynTextDataLoader(
-        1280, kBatchDims, *kDataShapes
+    global kDTypes
+    global kBatchDims
+    dataloader = cube.runtime.syndata.SynDataLoader(
+        kDataShapes, kDTypes, kBatchDims
     )
 
     genfile = args.genfile.format(rank=torch.distributed.get_rank())
@@ -69,19 +80,19 @@ def train(args):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    CudaTimer().warmup()
+    CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
     iter_num = args.iter_num
 
     def train_iters():
         for step in range(iter_num):
             if step >= 40:
-                CudaTimer().start('e2e')
+                CudaTimer(enable=True).start('e2e')
             train_fn(model, dataloader)
             optimizer.step()
             optimizer.zero_grad()
             if step == 1:
-                print('test passed')
+                print('passed 1 iteration')
             if step >= 40:
                 CudaTimer().stop('e2e')
             if (step + 1) % 20 == 0:
@@ -95,11 +106,9 @@ def train(args):
     else:
         train_iters()
 
-    iter_time = CudaTimer().duration(iter_num-40, field_name='e2e')
-    throughput = N / iter_time * 1000
-    print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
-          iter_time, throughput)
-    )
+    print_each_rank('e2e time (ms) per iteration: {} ms'.format(
+          CudaTimer().duration(iter_num-40, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num-40)
     memory_summary()
 
 
