@@ -2,12 +2,17 @@
 example:
 
 python -m torch.distributed.launch \
-    --nproc_per_node=2 \
+    --nproc_per_node=4 \
     --nnodes=1 \
     --node_rank=0 \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
+    benchmark/megatron/linears.py
+
+torchrun --standalone \
+    --nproc_per_node=4 \
+    --nnodes=1 \
     benchmark/megatron/linears.py
 """
 
@@ -23,7 +28,7 @@ from cube.profiler.timer import print_each_rank
 
 
 class ColumnMLP(nn.Module):
-    def __init__(self, dim, mult=16):
+    def __init__(self, dim, mult=1):
         super().__init__()
         self.linear1 = ColumnParallelLinear(dim, dim * mult, full_input=True, full_output=True)
         self.linear2 = ColumnParallelLinear(dim * mult, dim, full_input=True, full_output=True)
@@ -40,7 +45,7 @@ class ColumnMLP(nn.Module):
 
 
 class RowMLP(nn.Module):
-    def __init__(self, dim, mult=16):
+    def __init__(self, dim, mult=1):
         super().__init__()
         self.linear1 = RowParallelLinear(dim, dim * mult, full_input=True, full_output=True)
         self.linear2 = RowParallelLinear(dim * mult, dim, full_input=True, full_output=True)
@@ -57,7 +62,7 @@ class RowMLP(nn.Module):
 
 
 class HybridMLP(nn.Module):
-    def __init__(self, dim, mult=16):
+    def __init__(self, dim, mult=1):
         super().__init__()
         self.linear1 = ColumnParallelLinear(dim, dim * mult, full_input=True, full_output=False)
         self.linear2 = RowParallelLinear(dim * mult, dim, full_input=False, full_output=True)
@@ -75,8 +80,8 @@ class HybridMLP(nn.Module):
 
 def train(args):
 
-    batch_size = 128
-    dim = 1024
+    batch_size = 8192
+    dim = 8192
 
     # model = ColumnMLP(dim=dim).cuda()
     # model = RowMLP(dim=dim).cuda()
@@ -85,7 +90,11 @@ def train(args):
     for param in model.parameters():
         torch.nn.init.uniform_(param)
 
-    dataloader = cube.runtime.syndata.SynDataLoader(1280, [batch_size, dim])
+    dataloader = cube.runtime.syndata.SynDataLoader(
+        shapes=([batch_size, dim],),
+        dtypes=(torch.float32,),
+        batch_dims=(0,)
+    )
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
     def train_iter(model, dataloader):

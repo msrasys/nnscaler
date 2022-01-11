@@ -9,6 +9,19 @@ python -m torch.distributed.launch \
     --master_port=8004 \
     --use_env \
     examples/mlp/linears.py
+
+OMP_NUM_THREADS=4 torchrun --standalone \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    examples/mlp/linears.py
+
+OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=8 \
+    --nnodes=2 \
+    --rdzv_id=888 \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=worker0:8004 \
+    examples/mlp/linears.py
 """
 
 import torch
@@ -58,7 +71,11 @@ def train():
         model, input_shapes=([batch_size, dim],),
     )
 
-    dataloader = cube.runtime.syndata.SynDataLoader(1280, [0], [batch_size, dim])
+    dataloader = cube.runtime.syndata.SynDataLoader(
+        shapes=([batch_size, dim],),
+        dtypes=(torch.float32,),
+        batch_dims=(0,)
+    )
 
     @cube.compile(model, dataloader, PAS=PAS)
     def train_iter(model, dataloader):
