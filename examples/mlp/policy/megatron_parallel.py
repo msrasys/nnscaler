@@ -6,7 +6,7 @@ def PAS(graph: IRGraph, resource):
     """
     Linear Hybrid + Nested Partition
     """
-    tp = 2
+    tp = 4
     dp = resource.ngpus // tp
     for idx, node in enumerate(graph.nodes()):
         if isinstance(node, IRDataOperation):

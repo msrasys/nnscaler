@@ -17,7 +17,7 @@ from torch import nn
 import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
-from examples.mlp.policy.pipe_parallel import PAS
+from examples.mlp.policy.optimal import PAS
 
 # from examples.mlp.policy.col_parallel import P, A, S
 # PAS = (P, A, S)
@@ -50,8 +50,8 @@ class MLP(nn.Module):
 
 
 def train():
-    batch_size = 4096
-    dim = 4096
+    batch_size = 8192
+    dim = 8192
 
     model = MLP(dim=dim)
     model = cube.SemanticModel(
