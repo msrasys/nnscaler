@@ -210,6 +210,27 @@ class Activation(IREinops):
         return op
 
 
+class GELU(Activation):
+    """
+    torch.nn.functional.gelu(input, approximate: bool = False)
+
+    Note `approximate` argument is new at pytorch version v1.11
+    """
+    def __init__(self, signature, inputs, name='gelu', **kwargs):
+
+        super().__init__(signature, [inputs[0]], name)
+        if len(inputs) == 2:
+            self.kwargs['approximate'] = inputs[1]
+        self.set_input(0, inputs[0])
+
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        if 'approximate' in self.kwargs:
+            inputs.append(self.kwargs['approximate'])
+        op = GELU(self.signature, inputs, self.name)
+        op.set_output(0, outputs[0])
+        return op
+
+
 class Dropout(Activation):
     """
     torch.nn.functional.dropout

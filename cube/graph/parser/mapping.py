@@ -44,7 +44,7 @@ class Sign2Op:
 
         __ftemplate('dropout') : function.Dropout,
 
-        __ftemplate('gelu') : partial(function.Activation, name='gelu'),
+        __ftemplate('gelu') : function.GELU,
 
         __ftemplate('layer_norm'): function.LayerNorm,
 
