@@ -3,33 +3,73 @@
 # Modified from Swin-Transformer Repo
 """
 python -m torch.distributed.launch \
-    --nproc_per_node=8 \
+    --nproc_per_node=1 \
     --nnodes=1 \
     --node_rank=0 \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    examples/swin/swin_pipe.py --pp 8 --gbs 32 --mbs 4
-
-# V100-16GB: 8GPU: need checkpoint: 8 micro bs
+    examples/swin/swin_dt.py --bs 16 \
+        --layer0 1 1 \
+        --layer1 1 1 \
+        --layer2 1 1 \
+        --layer3 1 1
 """
 # --------------------------------------------------------
 
-from typing import Optional
+from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
-import torch.utils.checkpoint as checkpoint
-
+import argparse
+import time
 
 import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 from cube.profiler.memory import memory_summary
+from cube.runtime.device import DeviceGroup
+from cube.runtime.adapter.reducer import Reducer
 
-import argparse
+from handcraft.swin.layers import ColumnParallelLinear, DPtoTP, RowParallelLinear, TPtoDP
 
-from examples.swin.schedule import scheduling_1f1b, is_last_stage
-from benchmark.swin.layers import ColumnParallelLinear, RowParallelLinear
+_dp_reducer: Dict[Tuple[int], Reducer] = dict()
+
+
+def setup_device_group(tp: int, dp: int, layer_id: int):
+    """
+    Layer wise device group initialize
+
+    Returns:
+
+    """
+    resource = cube.runtime.resource.EnvResource()
+    ndevs = resource.ngpus
+
+    if not tp * dp == ndevs:
+        raise RuntimeError("Expected same device number")
+
+    assert tp == 1 or dp == 1, "Currently hybrid not supported"
+
+    devs = cube.runtime.device.DeviceGroup()
+
+    myrank = torch.distributed.get_rank()
+
+    # initialize tensor parallel groups
+    for i in range(dp):
+        ranks = list(range(i * tp, (i + 1) * tp))
+        group = devs.get_group(ranks)
+        if myrank in ranks:
+            tp_ranks = ranks
+    print_each_rank(f'layer {layer_id}: initialzed tensor parallel group: {tp_ranks}', rank_only=myrank)
+
+    # initialize data parallel groups
+    for i in range(tp):
+        ranks = list(range(i, ndevs, tp))
+        group = devs.get_group(ranks)
+        if myrank in ranks:
+            dp_ranks = ranks
+    print_each_rank(f'layer {layer_id}: initialzed data parallel group: {dp_ranks}', rank_only=myrank)
+    return tp_ranks, dp_ranks
 
 
 def drop_path(x, drop_prob: float = 0.):
@@ -44,15 +84,15 @@ def drop_path(x, drop_prob: float = 0.):
 
 
 class MegatronMlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., tp_group=-1):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         # self.fc1 = nn.Linear(in_features, hidden_features)
-        self.fc1 = ColumnParallelLinear(in_features, hidden_features, full_input=True, full_output=False)
+        self.fc1 = ColumnParallelLinear(in_features, hidden_features, in_adapter=True, out_adapter=False, tp_group=tp_group)
         self.act = act_layer()
         # self.fc2 = nn.Linear(hidden_features, out_features)
-        self.fc2 = RowParallelLinear(hidden_features, out_features, full_input=False, full_output=True)
+        self.fc2 = RowParallelLinear(hidden_features, out_features, in_adapter=False, out_adapter=True, tp_group=tp_group)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
@@ -125,17 +165,18 @@ class MegatronWindowAttention(nn.Module):
         proj_drop (float, optional): Dropout ratio of output. Default: 0.0
     """
 
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0., tp_group=-1):
 
         super().__init__()
         self.dim = dim
         self.window_size = window_size  # Wh, Ww
         self.global_num_heads = num_heads
-        group = cube.runtime.resource.EnvResource().tp_group
-        tp_world_size = torch.distributed.get_world_size(group=group)
+
+        tp_world_size = torch.distributed.get_world_size(group=tp_group)
         if num_heads % tp_world_size != 0:
-            print(f'detecting un-even num head {num_heads} partition to {tp_world_size}')
-        self.num_heads = num_heads // torch.distributed.get_world_size(group=group)
+            raise RuntimeError(f'detecting un-even num head {num_heads} partition to {tp_world_size}')
+        self.num_heads = num_heads // tp_world_size
+
         self.dim_heads = dim // self.global_num_heads
         self.scale = qk_scale or self.dim_heads ** -0.5
 
@@ -147,13 +188,11 @@ class MegatronWindowAttention(nn.Module):
         relative_position_index = window_position_index(self.window_size[0], self.window_size[1])
         self.register_buffer('relative_position_index', relative_position_index)
 
-
         # self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        # print(f'qkv embed dim: {dim}')
-        self.qkv = ColumnParallelLinear(dim, dim * 3, bias=qkv_bias, full_input=True, full_output=False)
+        self.qkv = ColumnParallelLinear(dim, dim * 3, bias=qkv_bias, in_adapter=True, out_adapter=False, tp_group=tp_group)
         self.attn_drop = nn.Dropout(attn_drop)
         # self.proj = nn.Linear(dim, dim)
-        self.proj = RowParallelLinear(dim, dim, full_input=False, full_output=True)
+        self.proj = RowParallelLinear(dim, dim, in_adapter=False, out_adapter=True, tp_group=tp_group)
         self.proj_drop = nn.Dropout(proj_drop)
 
         # trunc_normal_(self.relative_position_bias_table, std=.02)
@@ -196,22 +235,6 @@ class MegatronWindowAttention(nn.Module):
         x = self.proj_drop(x)
         return x
 
-    def extra_repr(self) -> str:
-        return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
-
-    def flops(self, N):
-        # calculate flops for 1 window with token length of N
-        flops = 0
-        # qkv = self.qkv(x)
-        flops += N * self.dim * 3 * self.dim
-        # attn = (q @ k.transpose(-2, -1))
-        flops += self.num_heads * N * (self.dim // self.num_heads) * N
-        #  x = (attn @ v)
-        flops += self.num_heads * N * N * (self.dim // self.num_heads)
-        # x = self.proj(x)
-        flops += N * self.dim * self.dim
-        return flops
-
 
 class SwinTransformerBlock(nn.Module):
     r""" Swin Transformer Block.
@@ -233,7 +256,8 @@ class SwinTransformerBlock(nn.Module):
 
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                 tp_group=-1):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -250,12 +274,18 @@ class SwinTransformerBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = MegatronWindowAttention(
             dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
+            tp_group=tp_group)
 
         self.drop_path_p = drop_path
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = MegatronMlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.mlp = MegatronMlp(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            act_layer=act_layer, drop=drop,
+            tp_group=tp_group
+        )
 
         if self.shift_size > 0:
             # calculate attention mask for SW-MSA
@@ -281,10 +311,6 @@ class SwinTransformerBlock(nn.Module):
             attn_mask = None
 
         self.register_buffer("attn_mask", attn_mask)
-
-        H, W = self.input_resolution
-        self.in_size = [H * W, self.dim]
-        self.out_size = [H * W, self.dim]
 
     def forward(self, x):
         H, W = self.input_resolution
@@ -336,24 +362,6 @@ class SwinTransformerBlock(nn.Module):
 
         return x
 
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
-               f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
-
-    def flops(self):
-        flops = 0
-        H, W = self.input_resolution
-        # norm1
-        flops += self.dim * H * W
-        # W-MSA/SW-MSA
-        nW = H * W / self.window_size / self.window_size
-        flops += nW * self.attn.flops(self.window_size * self.window_size)
-        # mlp
-        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
-        # norm2
-        flops += self.dim * H * W
-        return flops
-
 
 class PatchMerging(nn.Module):
     r""" Patch Merging Layer.
@@ -369,10 +377,6 @@ class PatchMerging(nn.Module):
         self.dim = dim
         self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
         self.norm = norm_layer(4 * dim)
-
-        H, W = self.input_resolution
-        self.in_size = [H * W, self.dim]
-        self.out_size = [H // 2 * W // 2, self.dim * 2]
 
     def forward(self, x):
         """
@@ -397,15 +401,6 @@ class PatchMerging(nn.Module):
 
         return x
 
-    def extra_repr(self) -> str:
-        return f"input_resolution={self.input_resolution}, dim={self.dim}"
-
-    def flops(self):
-        H, W = self.input_resolution
-        flops = H * W * self.dim
-        flops += (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
-        return flops
-
 
 class BasicLayer(nn.Module):
     """ A basic Swin Transformer layer for one stage.
@@ -427,7 +422,8 @@ class BasicLayer(nn.Module):
 
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, module_lists=None):
+                 drop_path=0., norm_layer=nn.LayerNorm,
+                 tp_group=-1, layer_id=-1):
 
         super().__init__()
         self.dim = dim
@@ -435,35 +431,25 @@ class BasicLayer(nn.Module):
         self.depth = depth
 
         # build blocks
+        self.blocks = nn.ModuleList()
         for i in range(depth):
-            block = SwinTransformerBlock(dim=dim, input_resolution=input_resolution,
-                                 num_heads=num_heads, window_size=window_size,
-                                 shift_size=0 if (i % 2 == 0) else window_size // 2,
-                                 mlp_ratio=mlp_ratio,
-                                 qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                 drop=drop, attn_drop=attn_drop,
-                                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                                 norm_layer=norm_layer)
-            module_lists.append(block)
-
-        # patch merging layer
-        if downsample is not None:
-            merging = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
-            module_lists.append(merging)
+            block = SwinTransformerBlock(
+                dim=dim, input_resolution=self.input_resolution,
+                num_heads=num_heads, window_size=window_size,
+                shift_size=0 if (i % 2 == 0) else window_size // 2,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop, attn_drop=attn_drop,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                norm_layer=norm_layer,
+                tp_group=tp_group,
+            )
+            self.blocks.append(block)
 
     def forward(self, x):
-        raise RuntimeError("Error call here")
-
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
-
-    def flops(self):
-        flops = 0
         for blk in self.blocks:
-            flops += blk.flops()
-        if self.downsample is not None:
-            flops += self.downsample.flops()
-        return flops
+            x = blk(x)
+        return x
 
 
 class PatchEmbed(nn.Module):
@@ -541,7 +527,7 @@ class SwinTransformer(nn.Module):
                  embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
-                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True, **kwargs):
+                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True, pconfigs=None, fp16=False, **kwargs):
         super().__init__()
 
         self.num_classes = num_classes
@@ -570,82 +556,184 @@ class SwinTransformer(nn.Module):
         # stochastic depth
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
 
-        # build layers
-        layers = nn.ModuleList()
-        for i_layer in range(self.num_layers):
-            _ = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
-                               input_resolution=(patches_resolution[0] // (2 ** i_layer),
-                                                 patches_resolution[1] // (2 ** i_layer)),
-                               depth=depths[i_layer],
-                               num_heads=num_heads[i_layer],
-                               window_size=window_size,
-                               mlp_ratio=self.mlp_ratio,
-                               qkv_bias=qkv_bias, qk_scale=qk_scale,
-                               drop=drop_rate, attn_drop=attn_drop_rate,
-                               drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
-                               norm_layer=norm_layer,
-                               downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
-                               module_lists=layers)
-        
-        # pipeline stage
-        pp_rank = torch.distributed.get_rank()
-        pp_size = torch.distributed.get_world_size()
 
-        chunk = len(layers) // pp_size
-        if len(layers) % pp_size != 0:
-            remain = len(layers) % pp_size
-            if pp_rank < remain:
-                start = pp_rank * (chunk+1)
-                chunk = chunk + 1
-            else:
-                start = remain * (chunk + 1) + (pp_rank - remain) * chunk
+        # ====================== depth 0 ===========================
+        pconfig = pconfigs[0]
+        l0_tp_ranks, l0_dp_ranks = setup_device_group(**pconfig)
+        tp_group = DeviceGroup().get_group(l0_tp_ranks)
+
+        input_resolution = (
+            patches_resolution[0] // (2 ** 0), patches_resolution[1] // (2 ** 0)
+        )
+        self.basic_layer0 = BasicLayer(
+            dim=int(embed_dim * 2 ** 0),
+            input_resolution=input_resolution,
+            depth=depths[0],
+            num_heads=num_heads[0],
+            window_size=window_size,
+            mlp_ratio=self.mlp_ratio,
+            qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate,
+            drop_path=dpr[sum(depths[:0]):sum(depths[:0 + 1])],
+            norm_layer=norm_layer,
+            tp_group=tp_group,
+        )
+
+        if len(l0_dp_ranks) > 1:
+            dp_ranks = tuple(l0_dp_ranks)
+            if dp_ranks not in _dp_reducer:
+                _dp_reducer[dp_ranks] = Reducer(dp_ranks)
+            for param in self.patch_embed.parameters():
+                _dp_reducer[dp_ranks].add_param(param)
+            for param in self.basic_layer0.parameters():
+                _dp_reducer[dp_ranks].add_param(param)
+
+
+        # ====================== depth 1 ===========================
+        pconfig = pconfigs[1]
+        l1_tp_ranks, l1_dp_ranks = setup_device_group(**pconfig)
+        tp_group = DeviceGroup().get_group(l1_tp_ranks)
+
+        # adapter
+        if len(l0_dp_ranks) > 1  and len(l1_tp_ranks) > 1:
+            print_each_rank('add dp to tp adapters')
+            self.adapter01 = DPtoTP(DeviceGroup().get_group(l0_dp_ranks))
+        elif len(l0_tp_ranks) > 1 and len(l1_dp_ranks) > 1:
+            print_each_rank('add dp to tp adapters')
+            self.adapter01 = TPtoDP(DeviceGroup().get_group(l0_tp_ranks))
         else:
-            start = pp_rank * chunk
-        stop = start + chunk
+            self.adapter01 = torch.nn.Identity()
 
-        # self.use_checkpoint = [True] * (stop - start)
-        # self.use_checkpoint = [False] * (stop - start)
+        self.merging0 = PatchMerging(
+            input_resolution, dim=int(embed_dim * 2 ** 0), norm_layer=norm_layer
+        )
 
-        # 8gpu layer assign
-        # layer_split = [3, 4, 3, 3, 3, 4, 3, 4]
-        # assert sum(layer_split) == 27
-        # start = sum(layer_split[0:pp_rank])
-        # stop = sum(layer_split[0:pp_rank+1])
-        # self.use_checkpoint = [False] * (stop - start)
-        # for idx in range(stop - start):
-        #     if pp_rank == 0:
-        #         if idx < 1:
-        #             self.use_checkpoint[idx] = True
+        input_resolution = (
+            patches_resolution[0] // (2 ** 1), patches_resolution[1] // (2 ** 1)
+        )
+        self.basic_layer1 = BasicLayer(
+            dim=int(embed_dim * 2 ** 1),
+            input_resolution=input_resolution,
+            depth=depths[1],
+            num_heads=num_heads[1],
+            window_size=window_size,
+            mlp_ratio=self.mlp_ratio,
+            qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate,
+            drop_path=dpr[sum(depths[:1]):sum(depths[:1 + 1])],
+            norm_layer=norm_layer,
+            tp_group=tp_group,
+        )
 
-        # 4Ggpu layer assign
-        # layer_split = [6, 7, 7, 7]
-        # assert sum(layer_split) == 27
-        # start = sum(layer_split[0:pp_rank])
-        # stop = sum(layer_split[0:pp_rank+1])
-
-        print_each_rank(f'layer start -> end: {start} -> {stop}')
-        print_each_rank(self.use_checkpoint)
-        self.layers = layers[start:stop]
-        print_each_rank([str(type(layer)) + '\n' for layer in self.layers])
-
-        self.in_size = self.layers[0].in_size
-        assert isinstance(self.in_size, list)
-        self.out_size = self.layers[-1].out_size
-        assert isinstance(self.out_size, list)
+        if len(l1_dp_ranks) > 1:
+            dp_ranks = tuple(l1_dp_ranks)
+            if dp_ranks not in _dp_reducer:
+                _dp_reducer[dp_ranks] = Reducer(dp_ranks)
+            for param in self.basic_layer1.parameters():
+                _dp_reducer[dp_ranks].add_param(param)
+            for param in self.merging0.parameters():
+                _dp_reducer[dp_ranks].add_param(param)
 
 
-        self.preprocess = False
-        if pp_rank == 0:
-            self.preprocess = True
-            self.in_size = [in_chans, img_size, img_size]
-        self.postprocess = False
-        if is_last_stage():
-            self.postprocess = True
-            self.out_size = [1,]
+        # ====================== depth 2 ===========================
+        pconfig = pconfigs[2]
+        l2_tp_ranks, l2_dp_ranks = setup_device_group(**pconfig)
+        tp_group = DeviceGroup().get_group(l2_tp_ranks)
+
+        # adapter
+        if len(l1_dp_ranks) > 1  and len(l2_tp_ranks) > 1:
+            print_each_rank('add dp to tp adapters')
+            self.adapter12 = DPtoTP(DeviceGroup().get_group(l1_dp_ranks))
+        elif len(l1_tp_ranks) > 1 and len(l2_dp_ranks) > 1:
+            print_each_rank('add dp to tp adapters')
+            self.adapter12 = TPtoDP(DeviceGroup().get_group(l1_tp_ranks))
+        else:
+            self.adapter12 = torch.nn.Identity()
+
+
+        self.merging1 = PatchMerging(
+            input_resolution, dim=int(embed_dim * 2 ** 1), norm_layer=norm_layer
+        )
+
+        input_resolution = (
+            patches_resolution[0] // (2 ** 2), patches_resolution[1] // (2 ** 2)
+        )
+        self.basic_layer2 = BasicLayer(
+            dim=int(embed_dim * 2 ** 2),
+            input_resolution=input_resolution,
+            depth=depths[2],
+            num_heads=num_heads[2],
+            window_size=window_size,
+            mlp_ratio=self.mlp_ratio,
+            qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate,
+            drop_path=dpr[sum(depths[:2]):sum(depths[:2 + 1])],
+            norm_layer=norm_layer,
+            tp_group=tp_group
+        )
+
+        if len(l2_dp_ranks) > 1:
+            dp_ranks = tuple(l2_dp_ranks)
+            if dp_ranks not in _dp_reducer:
+                _dp_reducer[dp_ranks] = Reducer(dp_ranks)
+            for param in self.basic_layer2.parameters():
+                _dp_reducer[dp_ranks].add_param(param)
+            for param in self.merging1.parameters():
+                _dp_reducer[dp_ranks].add_param(param)
+
+        # ====================== depth 3 ===========================
+        pconfig = pconfigs[3]
+        l3_tp_ranks, l3_dp_ranks = setup_device_group(**pconfig)
+        tp_group = DeviceGroup().get_group(l3_tp_ranks)
+
+        # adapter
+        if len(l2_dp_ranks) > 1  and len(l3_tp_ranks) > 1:
+            print_each_rank('add dp to tp adapters')
+            self.adapter23 = DPtoTP(DeviceGroup().get_group(l2_dp_ranks))
+        elif len(l2_tp_ranks) > 1 and len(l3_dp_ranks) > 1:
+            print_each_rank('add dp to tp adapters')
+            self.adapter23 = TPtoDP(DeviceGroup().get_group(l2_tp_ranks))
+        else:
+            self.adapter23 = torch.nn.Identity()
+
+        self.merging2 = PatchMerging(
+            input_resolution, dim=int(embed_dim * 2 ** 2), norm_layer=norm_layer
+        )
+
+        self.basic_layer3 = BasicLayer(
+            dim=int(embed_dim * 2 ** 3),
+            input_resolution=(patches_resolution[0] // (2 ** 3),
+                              patches_resolution[1] // (2 ** 3)),
+            depth=depths[3],
+            num_heads=num_heads[3],
+            window_size=window_size,
+            mlp_ratio=self.mlp_ratio,
+            qkv_bias=qkv_bias, qk_scale=qk_scale,
+            drop=drop_rate, attn_drop=attn_drop_rate,
+            drop_path=dpr[sum(depths[:3]):sum(depths[:3 + 1])],
+            norm_layer=norm_layer,
+            tp_group=tp_group
+        )
+
+        if len(l3_dp_ranks) > 1:
+            dp_ranks = tuple(l3_dp_ranks)
+            if dp_ranks not in _dp_reducer:
+                _dp_reducer[dp_ranks] = Reducer(dp_ranks)
+            for param in self.basic_layer3.parameters():
+                _dp_reducer[dp_ranks].add_param(param)
+            for param in self.merging2.parameters():
+                _dp_reducer[dp_ranks].add_param(param)
 
         self.norm = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Linear(self.num_features, num_classes)
+
+        if len(l3_dp_ranks) > 1:
+            dp_ranks = tuple(l3_dp_ranks)
+            for param in self.norm.parameters():
+                _dp_reducer[dp_ranks].add_param(param)
+            for param in self.head.parameters():
+                _dp_reducer[dp_ranks].add_param(param)
 
         self.apply(self._init_weights)
 
@@ -658,41 +746,47 @@ class SwinTransformer(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, image, feature_map=None):
-        
-        if self.preprocess:
-            x = self.patch_embed(image)
-            x = self.pos_drop(x)
-            feature_map = x
+    def forward(self, x):
+        x = self.patch_embed(x)
+        x = self.pos_drop(x)
 
-        for layer, use_checkpoint in zip(self.layers, self.use_checkpoint):
-            if use_checkpoint:
-                feature_map = checkpoint.checkpoint(layer, feature_map)
-            else:
-                feature_map = layer(feature_map)
-        x = feature_map
+        CudaTimer().start('basic_layer0')
+        x = self.basic_layer0(x)
+        CudaTimer().start('adapter')
+        x = self.adapter01(x)
+        CudaTimer().stop('adapter')
+        x = self.merging0(x)
+        CudaTimer().stop('basic_layer0')
 
-        if self.postprocess:
-            x = self.norm(x)  # B L C
-            x = self.avgpool(x.transpose(1, 2))  # B C L
-            x = torch.flatten(x, 1)
-            x = self.head(x)
-            # simulate for simplicity
-            x = torch.sum(x)
+        CudaTimer().start('basic_layer1')
+        x = self.basic_layer1(x)
+        CudaTimer().start('adapter')
+        x = self.adapter12(x)
+        CudaTimer().stop('adapter')
+        x = self.merging1(x)
+        CudaTimer().stop('basic_layer1')
+
+        CudaTimer().start('basic_layer2')
+        x = self.basic_layer2(x)
+        CudaTimer().start('adapter')
+        x = self.adapter23(x)
+        CudaTimer().stop('adapter')
+        x = self.merging2(x)
+        CudaTimer().stop('basic_layer2')
+
+        CudaTimer().start('basic_layer3')
+        x = self.basic_layer3(x)
+        CudaTimer().stop('basic_layer3')
+
+        x = self.norm(x)  # B L C
+        x = self.avgpool(x.transpose(1, 2))  # B C L
+        x = torch.flatten(x, 1)
+
+        x = self.head(x)
         return x
 
-    def flops(self):
-        flops = 0
-        flops += self.patch_embed.flops()
-        for i, layer in enumerate(self.layers):
-            flops += layer.flops()
-        flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
-        flops += self.num_features * self.num_classes
-        return flops
 
-
-def train(args):
-    resource = cube.runtime.resource.EnvResource()
+def train(args, pconfigs):
 
     # dim_head is always 32
 
@@ -701,10 +795,9 @@ def train(args):
     # C, H, W, window_size = [3, 384, 384, 12]
     # C, H, W, window_size = [3, 518, 518, ?]
     # C, H, W, window_size = [3, 640, 640, 20]
-    # C, H, W, window_size = [3, 1536, 1536, 48]
 
     # image batch size
-    N = args.gbs
+    N = args.bs
 
     # Swin-Tiny
     # embed_dim, depths, num_heads = [
@@ -722,29 +815,45 @@ def train(args):
     # ]
 
     # SwinV2-H: 657 M
-    # embed_dim, depths, num_heads = [
-    #     352, [2, 2, 18, 2], [11, 22, 44, 88]
-    # ]
+    embed_dim, depths, num_heads = [
+        352, [2, 2, 18, 2], [11, 22, 44, 88]
+    ]
 
-    # SwinV2-H modified: 782 M
+    # # SwinV2-H modified: 782 M
     embed_dim, depths, num_heads = [
         384, [2, 2, 18, 2], [12, 24, 48, 96]
     ]
-
-    # SwinV2-G:  2.5B Model
+    # # head dim 32 -> 48
     # embed_dim, depths, num_heads = [
-    #     512, [2, 2, 42, 2], [16, 32, 64, 128]
+    #     576, [2, 2, 18, 2], [12, 24, 48, 96]
     # ]
-
-    # 895.7 M Model
+    # # head dim 32 -> 64 -- too much
     # embed_dim, depths, num_heads = [
-    #     384, [2, 2, 22, 2], [12, 24, 48, 96]
+    #     768, [2, 2, 18, 2], [12, 24, 48, 96]
     # ]
-
-
-    # 2.01B model
+    # # head dim 32 -> 80 
     # embed_dim, depths, num_heads = [
-    #     576, [2, 2, 22, 2], [12, 24, 48, 96]
+    #     960, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
+    # # head dim 32 -> 96
+    # embed_dim, depths, num_heads = [
+    #     1152, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
+    # # # head dim 32 -> 112
+    # embed_dim, depths, num_heads = [
+    #     1344, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
+    # # head dim 32 -> 128
+    # embed_dim, depths, num_heads = [
+    #     1536, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
+    # # head dim 32 -> 144
+    # embed_dim, depths, num_heads = [
+    #     1728, [2, 2, 18, 2], [12, 24, 48, 96]
+    # ]
+    # # head dim 32 -> 160
+    # embed_dim, depths, num_heads = [
+    #     1920, [2, 2, 18, 2], [12, 24, 48, 96]
     # ]
 
 
@@ -752,23 +861,34 @@ def train(args):
                             embed_dim = embed_dim,
                             depths = depths,
                             num_heads = num_heads,
-                            window_size = window_size)
+                            window_size = window_size,
+                            pconfigs = pconfigs)
+    if args.fp16:
+        print_each_rank('use half precision')
+        model = model.half()
+    nparams_million = sum(p.numel() for p in model.parameters()) / 1000 / 1000
+    print_each_rank('model has {:.2f} million parameters'.format(nparams_million))
+
     model = model.cuda()
     memory_summary()
 
-    # setup data parallel reducer
-    # reducer = None
-    assert args.dp == 1
-
     dataloader = cube.runtime.syndata.SynDataLoader(
         1280, [0], [N // args.dp, C, H, W])
-    dataloader.set_data_buffer(buffer_num=16)
+    
+    if args.fp16:
+        data_buff = [[e.half() for e in data] for data in dataloader.datas]
+        dataloader.datas = data_buff
 
     def train_iter(model, dataloader):
         img = next(dataloader)
-        scheduling_1f1b(model, [img], args.gbs, args.mbs, dtype=torch.float)
-        # if reducer is not None:
-        #     reducer.allreduce()
+        loss = model(img)
+        loss = torch.sum(loss)
+        loss.backward()
+        CudaTimer().start('dp_allreduce')
+        for ranks in _dp_reducer:
+            reducer = _dp_reducer[ranks]
+            reducer.allreduce()
+        CudaTimer().stop('dp_allreduce')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -776,97 +896,71 @@ def train(args):
     nparams_million = sum(p.numel() for p in model.parameters()) / 1000 / 1000
     print_each_rank('model has {:.2f} million parameters'.format(nparams_million))
 
-    CudaTimer().warmup()
+    CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
-    iter_num = 20
+    span = 0
+    iter_num = 60
     for step in range(iter_num):
-        if step >= 10:
-            CudaTimer().start('e2e')
+        if step >= 20:
+            torch.cuda.synchronize()
+            start = time.time()
+            CudaTimer(enable=True).start('e2e')
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
         if step == 1:
             print('> passed on 1st iteration')
             memory_summary()
-        if step >= 10:
+        if step >= 20:
+            torch.cuda.synchronize()
+            stop = time.time()
+            span += (stop - start) * 1000
             CudaTimer().stop('e2e')
-        if (step + 1) % 10 == 0:
+        if (step + 1) % 20 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
-    iter_time = CudaTimer().duration(iter_num-10, field_name='e2e')
+    iter_time = span / (iter_num-20)
     throughput = N / iter_time * 1000
     print_each_rank('e2e time {:.2f} ms/iter. Throughput: {:.2f} samples/sec'.format(
           iter_time, throughput)
     )
-
-    CudaTimer().print_all(times=iter_num-10)
     memory_summary()
+    CudaTimer().print_all(times=iter_num-20)
 
 
 if __name__ == '__main__':
+
+    cube.init()
     
     # resource allocation
     parser = argparse.ArgumentParser(description='swin')
-    parser.add_argument('--tp', type=int, default=1,
-                        help='tensor parallel size')
-    parser.add_argument('--dp', type=int, default=1,
-                        help='data parallel size')
-    parser.add_argument('--pp', type=int, default=1,
-                        help='pipeline parallel size')
-    parser.add_argument('--gbs', type=int, default=-1)
-    parser.add_argument('--mbs', type=int, default=-1)
+    parser.add_argument('--layer0', type=int, nargs='+',
+                        help='data, tensor parallel config')
+    parser.add_argument('--layer1', type=int, nargs='+',
+                        help='data, tensor parallel config')
+    parser.add_argument('--layer2', type=int, nargs='+',
+                        help='data, tensor parallel config')
+    parser.add_argument('--layer3', type=int, nargs='+',
+                        help='data, tensor parallel config')
+    parser.add_argument('--bs', type=int, default=1,
+                        help='bs')
+    parser.add_argument('--fp16', action='store_true', dest='fp16')
     args = parser.parse_args()
 
-    cube.init()
+    assert len(args.layer0) == 2
+    assert len(args.layer1) == 2
+    assert len(args.layer2) == 2
+    assert len(args.layer3) == 2
 
-    # allocate resource
-    resource = cube.runtime.resource.EnvResource()
-    ndevs = resource.ngpus
+    # data parallel should be same
+    args.dp = args.layer0[0]
 
-    tp_size, tp_group_nums = args.tp, ndevs // args.tp
-    dp_size, dp_group_nums = args.dp, ndevs // args.dp
-    pp_size, pp_group_nums = args.pp, ndevs // args.pp
+    pconfigs = [
+        dict(layer_id=0, dp=args.layer0[0], tp=args.layer0[1]), # basic layer 0
+        dict(layer_id=1, dp=args.layer1[0], tp=args.layer1[1]), # basic layer 1
+        dict(layer_id=2, dp=args.layer2[0], tp=args.layer2[1]), # basic layer 2
+        dict(layer_id=3, dp=args.layer3[0], tp=args.layer3[1]), # basic layer 3
+    ]
 
-    if not pp_size * dp_size * tp_size == ndevs:
-        raise RuntimeError("Expected all devices are used")
-
-    devs = cube.runtime.device.DeviceGroup()
-
-    myrank = torch.distributed.get_rank()
-
-    # initialize data parallel group
-    all_data_parallel_group_ranks = list()
-    for i in range(pp_size):
-        start_rank = i * pp_group_nums
-        end_rank = (i + 1) * pp_group_nums
-        for j in range(tp_size):
-            ranks = list(range(start_rank + j, end_rank, tp_size))
-            all_data_parallel_group_ranks.append(ranks)
-            # initialize groups
-            group = devs.get_group(ranks)
-            if myrank in ranks:
-                dp_ranks = ranks
-                resource.dp_group = group
-                resource.reducer = cube.runtime.reducer.Reducer(ranks)
-    print_each_rank(f'initialzed data parallel group: {dp_ranks}', rank_only=myrank)
-
-    # initialize pipelne parallel groups
-    for i in range(dp_size):
-        ranks = [data_parallel_group_ranks[i]
-                 for data_parallel_group_ranks in all_data_parallel_group_ranks]
-        group = devs.get_group(ranks)
-        if myrank in ranks:
-            pp_ranks = ranks
-            resource.pp_group = group
-    print_each_rank(f'initialzed pipeline parallel group: {pp_ranks}', rank_only=myrank)
-
-    # initialize tensor parallel groups
-    for i in range(tp_group_nums):
-        ranks = list(range(i * tp_size, (i + 1) * tp_size))
-        group = devs.get_group(ranks)
-        if myrank in ranks:
-            tp_ranks = ranks
-            resource.tp_group = group
-    print_each_rank(f'initialzed tensor parallel group: {tp_ranks}', rank_only=myrank)
-
-    train(args)
+    print_each_rank(pconfigs, rank_only=0)
+    train(args, pconfigs)

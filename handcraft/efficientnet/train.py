@@ -10,7 +10,7 @@ python -m torch.distributed.launch \
         --pp 8 --gbs 32 --mbs 1
 """
 import torch
-from examples.efficientnet.efficientnet import EfficientNet
+from handcraft.efficientnet.efficientnet import EfficientNet
 import time
 import argparse
 
@@ -18,7 +18,7 @@ import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 from cube.profiler.memory import memory_summary
-from examples.efficientnet.schedule import is_last_stage, scheduling_1f1b
+from handcraft.efficientnet.schedule import is_last_stage, scheduling_1f1b
 
 
 def model_partition(model, in_size):

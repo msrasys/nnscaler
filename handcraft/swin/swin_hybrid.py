@@ -9,7 +9,7 @@ python -m torch.distributed.launch \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    examples/swin/swin_hybrid.py \
+    handcraft/swin/swin_hybrid.py \
         --layer0 8 1 1 \
         --layer1 8 1 1 \
         --layer2 8 1 1 \
@@ -23,7 +23,7 @@ python -m torch.distributed.launch \
     --master_addr=worker-0 \
     --master_port=8004 \
     --use_env \
-    examples/swin/swin_hybrid.py \
+    handcraft/swin/swin_hybrid.py \
         --layer0 2 8 1 \
         --layer1 2 8 1 \
         --layer2 2 8 1 \
@@ -45,14 +45,14 @@ from cube.profiler import CudaTimer
 from cube.runtime.device import DeviceGroup
 from cube.profiler.timer import print_each_rank
 from cube.profiler.memory import memory_summary
-from cube.runtime.reducer import Reducer
+from cube.runtime.adapter.reducer import Reducer
 
 import argparse
 
-from examples.swin.hybrid_schedule import scheduling_1f1b, is_last_stage
-from examples.swin.layers import ColumnParallelLinear, RowParallelLinear, DPtoTP, TPtoDP
+from handcraft.swin.hybrid_schedule import scheduling_1f1b, is_last_stage
+from handcraft.swin.layers import ColumnParallelLinear, RowParallelLinear, DPtoTP, TPtoDP
 
-from examples.swin.pmodule import ParallelModule
+from handcraft.swin.pmodule import ParallelModule
 
 
 _dp_reducer: Dict[Tuple[int], Reducer] = dict()

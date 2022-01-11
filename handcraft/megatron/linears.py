@@ -8,19 +8,19 @@ python -m torch.distributed.launch \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    benchmark/megatron/linears.py
+    handcraft/megatron/linears.py
 
 torchrun --standalone \
     --nproc_per_node=4 \
     --nnodes=1 \
-    benchmark/megatron/linears.py
+    handcraft/megatron/linears.py
 """
 
 import argparse
 
 import torch
 from torch import nn
-from benchmark.megatron.layers import ColumnParallelLinear, RowParallelLinear
+from handcraft.megatron.layers import ColumnParallelLinear, RowParallelLinear
 
 import cube
 from cube.profiler import CudaTimer

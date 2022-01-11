@@ -8,14 +8,14 @@ python -m torch.distributed.launch \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    benchmark/megatron/gpt.py
+    handcraft/megatron/gpt.py
 """
 
 import torch
 import torch.nn.functional as F
 import cube
-from benchmark.megatron.layers import ColumnOutputAdapter, ShardEmbedding
-from benchmark.megatron.transformer import TransformerLayer
+from handcraft.megatron.layers import ColumnOutputAdapter, ShardEmbedding
+from handcraft.megatron.transformer import TransformerLayer
 
 
 from cube.profiler import CudaTimer

@@ -8,12 +8,12 @@ python -m torch.distributed.launch \
     --master_addr=127.0.0.1 \
     --master_port=8004 \
     --use_env \
-    examples/ffn/ffn.py
+    examples/feedforward/ffn.py
 
 OMP_NUM_THREADS=4 torchrun --standalone \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/ffn/ffn.py
+    examples/feedforward/ffn.py
 
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=8 \
@@ -21,7 +21,7 @@ OMP_NUM_THREADS=4 torchrun \
     --rdzv_id=888 \
     --rdzv_backend=c10d \
     --rdzv_endpoint=worker0:8004 \
-    examples/ffn/ffn.py
+    examples/feedforward/ffn.py
 """
 
 import torch
@@ -31,7 +31,7 @@ import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 
-from examples.ffn.policy.data import PAS
+from examples.feedforward.policy.data import PAS
 
 
 class FFN(torch.nn.Module):
