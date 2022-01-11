@@ -69,7 +69,7 @@ class DimSplitEinops(GenericDistAlgo):
                 ins.append(sub_tensors)
             else:
                 if axis.is_reduce():
-                    print(f'Warning: value split on one input tensor in node{node._id}:{node.name} as reduce axis {axis} not appeared.')
+                    # print(f'Warning: value split on one input tensor in node{node._id}:{node.name} as reduce axis {axis} not appeared.')
                     ins.append(split_value(input, num))
                 else:
                     ins.append([input] * num)
@@ -98,3 +98,27 @@ class DimSplitEinops(GenericDistAlgo):
             sub_node.make_expression()
             sub_nodes.append(sub_node)
         return sub_nodes
+
+    def space(self, num_device: int) -> List[Dict[str, int]]:
+        """
+        Return a list of possible configurations
+        given the number of devices
+        """
+        possible_idx = list()
+        possible_dim = list()
+        num = num_device
+        dims = list()
+        node: IREinops = self.node
+        for idx, eindims in enumerate(node._ieins):
+            for dim, eindim in enumerate(eindims):
+                if eindim.reduce != EinDim.ReduceType.Stay:
+                    if eindim not in dims:
+                        dims.append(eindim)
+                        possible_idx.append(idx)
+                        possible_dim.append(dim)
+        possible_configs = list()
+        for idx, dim in zip(possible_idx, possible_dim):
+            config = dict(idx=idx, dim=dim, num=num)
+            if self.satisfy(config):
+                possible_configs.append(config)
+        return possible_configs
