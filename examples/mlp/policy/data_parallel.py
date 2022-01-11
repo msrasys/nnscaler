@@ -7,14 +7,17 @@ def PAS(graph: IRGraph, resource):
     Linear Column Partition
     """
     for node in graph.nodes():
-        if isinstance(node, IRFwOperation) or isinstance(node, IRDataOperation):
+        if isinstance(node, IRDataOperation):
+            algo = node.algorithms('data')
+            sub_nodes = graph.partition(node, algo, config=dict(num=resource.ngpus))
+            for idx, subnode in enumerate(sub_nodes):
+                graph.assign(subnode, idx)
+            batch_dim = node.get_batch_dims()[0]
+    for node in graph.nodes():
+        if isinstance(node, IRFwOperation):
             algo = node.algorithms('dim')
-            if algo:
-                sub_nodes = graph.partition(
-                    node, algo, config=dict(idx=0, dim=0, num=resource.ngpus)
-                )
-            else:
-                sub_nodes = graph.replicate(node, times=resource.ngpus)
+            sub_nodes = graph.partition(
+                node, algo, config=dict(idx=0, dim=batch_dim, num=resource.ngpus))
             for idx, node in enumerate(sub_nodes):
                 graph.assign(node, idx)
     print(graph.extra_repr())
