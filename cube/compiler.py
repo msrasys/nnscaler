@@ -18,6 +18,7 @@ from cube.execplan.planpass.fusion import P2PFusion
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
 from cube.profiler.timer import print_each_rank
+from cube.runtime.syndata import CubeDataLoader
 
 class SemanticModel:
 
@@ -57,7 +58,7 @@ class SemanticModel:
             return self.ir_graph(*args)
 
 
-def compile(model: SemanticModel, dataloader,
+def compile(model: SemanticModel, dataloader: CubeDataLoader,
             PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None):
     """
     AI Scientist calls like:
@@ -87,6 +88,8 @@ def compile(model: SemanticModel, dataloader,
     """
     if not isinstance(model, SemanticModel):
         raise TypeError("Expect Semantic Model")
+    if not isinstance(dataloader, CubeDataLoader):
+        raise TypeError("Expect dataloader derived from CubeDataLoader")
     if callable(PAS):
         PAS = (PAS,)
 
@@ -174,19 +177,15 @@ def compile(model: SemanticModel, dataloader,
                     attach=True
                 )
 
-            # get dataloader batch size
-            batch_size = dict()  # {devid: batch size}
-            for node in graph.nodes():
-                if isinstance(node, IRDataOperation):
-                    batch_dim = node.get_batch_dims()[0]
-                    dev_batch_size = node.outputs(0).shape[batch_dim]
-                    batch_size[node.device[0]] = dev_batch_size
-            all_batch_size = set([batch_size[dev] for dev in batch_size])
+            # setup batch size
+            all_batch_size = set()
+            dnodes = [node for node in graph.nodes() if isinstance(node, IRDataOperation)]
+            for dnode in dnodes:
+                bs = [out.shape[dim] for out, dim in zip(dnode.outputs(), dnode.get_batch_dims())]
+                all_batch_size.update(bs)
             if len(all_batch_size) != 1:
-                raise NotImplementedError("Heterogenous batch size it not supported")
-            batch_size = list(all_batch_size)[0]
-            # assume batch_size is always first dimension
-            batch_size = torch.tensor([batch_size], dtype=torch.int).cuda()
+                raise NotImplementedError("Heterogenous batch size is not supported")
+            batch_size = torch.tensor(list(all_batch_size), dtype=torch.int).cuda()
 
             compile_end = time.time()
             compile_time = compile_end - compile_start
@@ -198,7 +197,7 @@ def compile(model: SemanticModel, dataloader,
         # reset dataloader
         torch.distributed.broadcast(batch_size, src=0)
         batch_size = batch_size.item()
-        print(f'> reseting dataloader batch size to {batch_size}')
+        print_each_rank(f'reseting dataloader batch size to {batch_size}')
         dataloader.reset(batch_size=batch_size)
 
         # load module
