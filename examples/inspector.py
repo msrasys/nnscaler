@@ -119,7 +119,8 @@ if __name__ == '__main__':
                         default='gencode{rank}.py')
     parser.add_argument('--iter-num', type=int,
                         default=128)
-    parser.add_argument('--profile', dest='profile', action='store_true')
+    parser.add_argument('--profile', dest='profile', action='store_true',
+                        help='use edge://tracing/ or chrome://tracing/ to open the file')
     args = parser.parse_args()
 
     cube.init()
