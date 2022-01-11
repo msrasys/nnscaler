@@ -1,12 +1,9 @@
-from typing import Dict
+from typing import Dict, List
 import copy
 
 from cube.algorithm.utils import split_axis
 from cube.algorithm.generics import GenericDistAlgo
 from cube.graph.operator.operator import IRDataOperation
-
-
-_kWaitDecision = None
 
 
 class DPDataLoader(GenericDistAlgo):
@@ -16,32 +13,41 @@ class DPDataLoader(GenericDistAlgo):
         if not isinstance(node, IRDataOperation):
             raise TypeError(f"f{type(node)} can not be transformed to {type(self)}")
         super().__init__(node)
-        self.batch_dims = node.get_batch_dims()
-
-        self.chunk_num = _kWaitDecision
 
     def satisfy(self, config: Dict):
-        chunk_num = int(config['chunk_num'])
-        for bdim, shape in zip(self.batch_dims, self.output_shapes):
-            if chunk_num > 0 and shape[bdim] % chunk_num != 0:
+        """
+        config = dict(dim=int)
+        num: int
+            number of chunks to partition
+        """
+        for attr in ['num']:
+            if not attr in config:
+                raise KeyError("Expected idx, dim, num in the config")
+        node: IRDataOperation = self.node
+        num: int = config['num']
+        dims: List[int] = node.get_batch_dims()
+        for dim, output in zip(dims, node.outputs()):
+            if output.shape[dim] % num != 0:
                 return False
         return True
 
-    def instantiate(self, node, config: Dict):
+    def instantiate(self, config: Dict):
         if not self.satisfy(config):
             raise RuntimeError("Instantiate failed. Condition not satisfied.")
-        self.chunk_num = int(config['chunk_num'])
+        node: IRDataOperation = self.node
+        num: int = config['num']
+        dims: List[int] = node.get_batch_dims()
         
-        sub_outputs = list()
-        for bdim, output in zip(self.batch_dims, node.outputs()):
-            sub_output = split_axis(output, bdim, self.chunk_num)
-            sub_outputs.append(sub_output)
-        
+        outputs = list()
+        for dim, output in zip(dims, node.outputs()):
+            output = split_axis(output, dim, num)
+            outputs.append(output)
+
         nodes = list()
-        for sub_outs in zip(*sub_outputs):
+        for outs in zip(*outputs):
             node = IRDataOperation(
-                data_num = len(sub_outs), batch_dims = copy.copy(self.batch_dims))
-            for idx, out in enumerate(sub_outs):
+                data_num=len(outs), batch_dims=copy.copy(dims))
+            for idx, out in enumerate(outs):
                 node.set_output(idx, out)
             nodes.append(node)
         return nodes
