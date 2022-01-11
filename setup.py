@@ -2,11 +2,11 @@ import setuptools
 
 setuptools.setup(
   name=             'cube',
-  version=          '0.1',
+  version=          '0.2',
   author=           'Zhiqi Lin',
   author_email=     'v-zhiql@microsoft.com',
-  description=      'Magic Cube for configurable-DNN framework',
-  long_description= 'Magic Cube for configurable-DNN framework',
+  description=      'Parallelize DNN Traning from A Systematic Way',
+  long_description= 'Parallelize DNN Traning from A Systematic Way',
   packages=         ['cube'],
   python_requires=  '>=3.6',
 )

@@ -1,5 +1,5 @@
 
-echo using docker image nvcr.io/pytorch:pytorch-21.06-py3
+echo using docker image nvcr.io/pytorch:pytorch-21.12-py3
 
 git config --global core.editor "vim"
 git config --global user.name "Zhiqi Lin"
@@ -10,6 +10,7 @@ sudo git config --global user.name "Zhiqi Lin"
 sudo git config --global user.email "v-zhiql@microsoft.com"
 sudo chmod -R a+w /opt/conda
 
+sudo apt-get install htop -y
 sudo apt-get install tmux -y
 sudo apt-get install psmisc -y
 sudo apt-get install lsof -y
@@ -24,10 +25,10 @@ sudo apt-get install infiniband-diags -y
 # sudo rm packages-microsoft-prod.deb
 
 # install azcopy
-wget https://azcopyvnext.azureedge.net/release20210616/azcopy_linux_amd64_10.11.0.tar.gz -O azcopy.tar.gz
-tar -zxvf azcopy.tar.gz
-sudo mv azcopy_linux_amd64_10.11.0/azcopy /usr/bin/
-rm -rf azcopy_linux_amd64_10.11.0 azcopy.tar.gz
+# wget https://azcopyvnext.azureedge.net/release20210616/azcopy_linux_amd64_10.11.0.tar.gz -O azcopy.tar.gz
+# tar -zxvf azcopy.tar.gz
+# sudo mv azcopy_linux_amd64_10.11.0/azcopy /usr/bin/
+# rm -rf azcopy_linux_amd64_10.11.0 azcopy.tar.gz
 
 wget https://raw.githubusercontent.com/zhiqi-0/EnvDeployment/master/.tmux.conf -O ~/.tmux.conf
 wget https://raw.githubusercontent.com/zhiqi-0/EnvDeployment/master/.vimrc -O ~/.vimrc
@@ -39,6 +40,8 @@ echo 'export CUDA_HOME=/usr/local/cuda' >> ~/.bashrc
 
 # cmd for count code lines
 # find cube/ -name "*.py" -print0 | xargs -0 wc -l
+
+# training_daemon will disable torch.jit.script
 pip uninstall training_daemon -y
 python setup.py develop
 pip install -r requirements.txt
