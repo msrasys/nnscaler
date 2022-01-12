@@ -1,6 +1,7 @@
 from enum import Enum
 
 class IRDType(Enum):
+    float64 = 'float64'
     float16 = 'float16'
     float32 = 'float32'
     int64   = 'int64'
@@ -12,6 +13,7 @@ class IRDType(Enum):
     unknown = 'unknown'
 
 
+float64 = IRDType.float64
 float16 = IRDType.float16
 float32 = IRDType.float32
 int64   = IRDType.int64

@@ -87,6 +87,7 @@ class DType2IRDType:
         return DType2IRDType.kDtypeMap[dtype]
 
     kDtypeMap = {
+        torch.float64: ir.float64,
         torch.float32: ir.float32,
         torch.float  : ir.float32,
         torch.float16: ir.float16,
