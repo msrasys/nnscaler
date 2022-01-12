@@ -94,11 +94,11 @@ class ExectuionPlan:
             if isinstance(node, IRGraph):
                 return map2color(node.nodes(0))
             if isinstance(node, IRFwOperation):
-                return 'blue'
+                return '#4472C4'  # excel blue
             if isinstance(node, IRBpOperation):
-                return 'orange'
+                return '#ED7D31'  # excel orange
             if isinstance(node, IRAdapter):
-                return 'green'
+                return '#70AD47'  # excel green
 
         def map2name(node):
             if isinstance(node, IRGraph):
@@ -141,26 +141,27 @@ class ExectuionPlan:
         if outfile is not None:
             import matplotlib.pyplot as plt
             from matplotlib.patches import Rectangle
-            plt.rcParams['figure.figsize'] = (12.0, 4.0)
 
             max_time = max(
                 [tline[-1][1] for tline in device_timeline if len(tline) != 0]
             )
-
+            plt.rcParams['figure.figsize'] = (4.0 * max_time // ndevice, 4.0)
             fig, ax = plt.subplots()
+            renderer = fig.canvas.get_renderer()
+
+            # xaxis
             ax.set_xlim((1, max_time))
             plt.xticks(list(range(1, int(max_time)+1, 1)))
             ax.xaxis.grid(True, linestyle='--')
-            plt.xlabel('time')
-
             # yaxis
             ax.set_ylim((0.5, len(self.devices())+0.5))
             plt.yticks(list(range(1, len(self.devices())+1, 1)))
             ax.invert_yaxis()
-            plt.ylabel('device id')
 
             ax.set_aspect('equal')
 
+            fontsize = 100
+            txts = list()
             for devid in range(ndevice):
                 timeline = device_timeline[devid]
                 nodes = device_nodes[devid]
@@ -170,15 +171,35 @@ class ExectuionPlan:
                     # draw 
                     color = map2color(node)
                     rec = Rectangle((start, devid + 0.5), end-start, 1,
-                                             color=color, ec='black', lw=1.5)
+                                    color=color, ec='black', lw=1.5)
                     ax.add_artist(rec)
                     rx, ry = rec.get_xy()
                     cx = rx + rec.get_width() / 2.0
                     cy = ry + rec.get_height() / 2.0
                     anno = map2name(node)
-                    ax.annotate(anno, (cx, cy), color='w', # weight='bold',
-                                fontsize=10, ha='center', va='center')
+                    txt = ax.text(x=cx, y=cy, s=anno, fontsize=40, ha='center', va='center', color='w')
+
+                    rbox = rec.get_window_extent(renderer)
+                    for fs in range(40, 1, -2):
+                        txt.set_fontsize(fs)
+                        tbox = txt.get_window_extent(renderer)
+                        if tbox.x0 >= rbox.x0 and tbox.x1 <= rbox.x1 and tbox.y0 >= rbox.y0 and tbox.y1 <= rbox.y1:
+                            break
+                    fontsize = min(fontsize, fs)
+                    txts.append(txt)
+            
+            # set font size to same
+            for txt in txts:
+                txt.set_fontsize(fontsize)
+            for tick in ax.xaxis.get_major_ticks():
+                tick.label.set_fontsize(fontsize)
+            for tick in ax.yaxis.get_major_ticks():
+                tick.label.set_fontsize(fontsize)
+            plt.xlabel('Time Step', fontsize=fontsize)
+            plt.ylabel('Device ID', fontsize=fontsize)
+
             # plt.grid()
+            plt.tight_layout()
             plt.savefig(outfile)
 
 
