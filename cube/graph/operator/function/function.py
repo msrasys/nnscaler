@@ -391,6 +391,68 @@ class Transpose(IREinops):
             op.set_output(idx, output)
         return op
 
+
+class Conv2D(IREinops):
+    """
+    torch.conv2d(input, weight, bias, stride, padding, dialation, groups)
+    https://pytorch.org/docs/stable/generated/torch.nn.functional.conv2d.html?highlight=torch%20conv2d#torch.nn.functional.conv2d
+    """
+    def __init__(self, signature, inputs, name='conv2d', **kwargs):
+        if len(inputs) != 7:
+            raise RuntimeError(f"expected 7 operators for conv2d but got {len(inputs)}")
+        super().__init__(
+            name, signature,
+            input_length=3,
+            output_length=1
+        )
+        for idx, input in enumerate(inputs[:3]):
+            self.set_input(idx, input)
+        self.kwargs['stride'] = inputs[3]
+        self.kwargs['padding'] = inputs[4]
+        self.kwargs['dilation'] = inputs[5]
+        self.kwargs['groups'] = inputs[6]
+
+    def make_expression(self):
+        input = 'N I {iH} {iW}'
+        weight = 'O {group_channel} {kH} {kW}'
+        bias = 'O'
+        output = 'N O {oH} {oW}'
+        # parameters
+        groups = self.kwargs['groups']
+        stride = self.kwargs['stride']
+        padding = self.kwargs['padding']
+        dilation = self.kwargs['dilation']
+        kH = self.inputs(1).shape[2]
+        kW = self.inputs(1).shape[3]
+
+        iH, iW = self.inputs(0).shape[0:2]
+        group_channel = self.inputs(0).shape[2] // groups
+        oH = (iH + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
+        oW = (iH + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
+
+        input = input.format(iH=iH, iW=iW)
+        weight = weight.format(group_channel=group_channel, kH=kH, kW=kW)
+        output = output.format(oH=oH, oW=oW)
+        
+        expr = f'{input}, {weight}, {bias} -> {output}'
+        [idims, wdims, bdims], [odims] = self.parse(expr)
+        self.set_input_ein(0, idims)
+        self.set_input_ein(1, wdims)
+        if self.inputs(2) is not None:
+            self.set_input_ein(2, bdims)
+        self.set_output_ein(0, odims)
+
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        groups = self.kwargs['groups']
+        stride = self.kwargs['stride']
+        padding = self.kwargs['padding']
+        dilation = self.kwargs['dilation']
+        inputs += [groups, stride, padding, dilation]
+        op = Conv2D(self.signature, inputs, self.name)
+        op.set_output(0, outputs[0])
+        return op
+
+
 # ===================== Cube Complex Operation =======================
 
 class CubeComplexToQKV(IRFwOperation):

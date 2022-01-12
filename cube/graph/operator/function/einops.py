@@ -2,6 +2,7 @@
 This operator class is highly inspired by eniops.
 """
 import enum
+import string
 from typing import List, Optional, Tuple
 
 from cube.ir.cten import IRTensor
@@ -136,7 +137,7 @@ class IREinops(IRFwOperation):
                 return template(self)
             return None
 
-    def parse(self, expr: str):
+    def parse(self, expr: str) -> Tuple[List[List[EinDim]], List[List[EinDim]]]:
         """
         parse string like:
             b m k, b k n -> b m n
@@ -154,6 +155,9 @@ class IREinops(IRFwOperation):
             axises = list()
             for dim in input:
                 reduce = EinDim.ReduceType.Sum if dim not in output else None
+                # a fixed numeric value indicates the axis is not splittable
+                if str.isnumeric(dim):
+                    reduce = EinDim.ReduceType.Stay
                 axises.append(EinDim(dim, reduce))
             input_axises.append(axises)
         outputs = output.split(',')
