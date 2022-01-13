@@ -191,12 +191,16 @@ class IRGraph(IRCell):
             raise KeyError(f"node {node} is not in graph.")
         ops = node.nodes() if isinstance(node, IRGraph) else [node]
         for op in ops:
+            removed = list()
             for input in op.inputs():
-                if isinstance(input, IRSubTensor):
+                if isinstance(input, IRSubTensor) and input not in removed:
                     input.parent.rm_consumer(op)
+                    removed.append(input)
+            removed = list()
             for output in op.outputs():
-                if isinstance(output, IRSubTensor):
+                if isinstance(output, IRSubTensor) and output not in removed:
                     output.parent.rm_producer(op)
+                    removed.append(output)
         index = self._nodes.index(node)
         self._nodes.pop(index)
         if reset_dependency:
