@@ -41,6 +41,7 @@ class Grouping(PlanPass):
                     execplan.at(devid).insert(idx, subgraph)
                     for node in pieces:
                         execplan.at(devid).remove(node)
+        print(execplan)
         return execplan
 
     @staticmethod
@@ -61,9 +62,7 @@ class Grouping(PlanPass):
             fpieces, bpieces = list(), list()
             seq = execplan.sequence(devid)
             fnodes = [fnode for fnode in seq if isinstance(fnode, IRFwOperation)]
-            have_backward = all(
-                [isinstance(fnode.mirror, IRBpOperation) for fnode in fnodes]
-            )
+            have_backward = all([fnode.mirror in seq for fnode in fnodes])
             # training
             if have_backward:
                 bnodes = [fnode.mirror for fnode in fnodes]
@@ -80,15 +79,16 @@ class Grouping(PlanPass):
                         fpieces, bpieces = [fnode], [bnode]
             # inference
             else:
-                for fnode in fnodes:
+                for fnode in fnodes + [-1]:
                     fconsecutive = Grouping.consecutive(seq, fpieces, fnode)
                     if fconsecutive:
                         fpieces.append(fnode)
+                        bpieces.append(None)
                     else:
                         if len(fpieces) != 0:
                             fgroups[devid].append(fpieces)
                             bgroups[devid].append(None)
-                        fpieces, bpieces = [fnode], list()
+                        fpieces, bpieces = [fnode], [None]
         return fgroups, bgroups
 
     @staticmethod

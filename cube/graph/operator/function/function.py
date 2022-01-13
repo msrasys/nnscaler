@@ -483,9 +483,6 @@ class Conv2D(IREinops):
         
         expr = f'{input}, {weight}, {bias} -> {output}'
         [idims, wdims, bdims], [odims] = self.parse(expr)
-        print(idims)
-        print(wdims)
-        print(bdims)
         self.set_input_ein(0, idims)
         self.set_input_ein(1, wdims)
         if self.inputs(2) is not None:
