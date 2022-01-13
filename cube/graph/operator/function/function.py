@@ -472,7 +472,7 @@ class Conv2D(IREinops):
         kH = self.inputs(1).shape[2]
         kW = self.inputs(1).shape[3]
 
-        iH, iW = self.inputs(0).shape[0:2]
+        iH, iW = self.inputs(0).shape[2:4]
         group_channel = self.inputs(0).shape[2] // groups
         oH = (iH + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
         oW = (iH + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1

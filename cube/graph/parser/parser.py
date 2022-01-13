@@ -74,6 +74,13 @@ class ScriptModuleParser:
         # handle graph output -- Assuming all the output are tensors
         output_var_name = [output.debugName() for output in module.graph.outputs()]
         output_val = [frame.get_var(var_name) for var_name in output_var_name]
+        outputs = list()
+        for val in output_val:
+            if isinstance(val, list):
+                outputs += val
+            else:
+                outputs.append(val)
+        output_val = outputs
 
         frame.pop()
         return input_val, all_ir_nodes, output_val
@@ -95,6 +102,8 @@ class ScriptModuleParser:
         if node.kind() == 'prim::ListUnpack':
             return ScriptNodeKind.PrimListUnpack
         if node.kind() == 'prim::ListConstruct':
+            return ScriptNodeKind.PrimListConstruct
+        if node.kind() == 'prim::TupleConstruct':
             return ScriptNodeKind.PrimListConstruct
         if node.kind() == 'prim::TupleUnpack':
             return ScriptNodeKind.PrimTupleUnpack
