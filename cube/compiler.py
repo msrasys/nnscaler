@@ -1,4 +1,4 @@
-from typing import Callable, Tuple, Union
+from typing import Callable, Tuple, Union, Optional
 import torch
 import time
 
@@ -58,7 +58,7 @@ class SemanticModel:
             return self.ir_graph(*args)
 
 
-def compile(model: SemanticModel, dataloader: CubeDataLoader,
+def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None):
     """
     AI Scientist calls like:
@@ -88,6 +88,9 @@ def compile(model: SemanticModel, dataloader: CubeDataLoader,
     """
     if not isinstance(model, SemanticModel):
         raise TypeError("Expect Semantic Model")
+    if dataloader is None:
+        # create empty dataloader
+        dataloader = cube.runtime.syndata.SynDataLoader(shapes=(),dtypes=())
     if not isinstance(dataloader, CubeDataLoader):
         raise TypeError("Expect dataloader derived from CubeDataLoader")
     if callable(PAS):
@@ -123,8 +126,10 @@ def compile(model: SemanticModel, dataloader: CubeDataLoader,
             resource = cube.runtime.resource.EnvResource()
 
             # logic translator
-            fn(model_graph, ir_dataloader)
-            graph = LogicTranslator.gen_logic_graph()
+            outputs = fn(model_graph, ir_dataloader)
+            if outputs is None:
+                outputs = []
+            graph = LogicTranslator.gen_logic_graph(outputs=outputs)
 
             if len(PAS) == 1:
                 graph = PAS[0](graph, resource)

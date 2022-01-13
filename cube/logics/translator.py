@@ -10,12 +10,12 @@ from cube.graph.operator import IRDataOperation
 class LogicTranslator:
 
     @staticmethod
-    def gen_logic_graph():
+    def gen_logic_graph(outputs=None):
         """
         Generate Training Logic Graph
         """
         nodes = SchedulePool().nodes()
-        graph = IRGraph(nodes, inputs=[], outputs=None, module_name='LogicGraph')
+        graph = IRGraph(nodes, inputs=[], outputs=outputs, module_name='LogicGraph')
         return graph
 
     @staticmethod

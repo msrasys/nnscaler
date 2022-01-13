@@ -41,7 +41,6 @@ class Grouping(PlanPass):
                     execplan.at(devid).insert(idx, subgraph)
                     for node in pieces:
                         execplan.at(devid).remove(node)
-        print(execplan)
         return execplan
 
     @staticmethod

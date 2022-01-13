@@ -166,7 +166,7 @@ class IRGraph(IRCell):
         for t in sub_outputs:
             if isinstance(t, IRSubTensor):
                 # not consumed or used outside this subgraph
-                if t not in sub_inputs or t in remain_inputs:
+                if t not in sub_inputs or t in remain_inputs or t in self.outputs():
                     if t not in outputs:
                         outputs.append(t)
         subgraph = IRGraph(
