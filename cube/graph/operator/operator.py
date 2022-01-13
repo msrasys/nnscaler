@@ -1,7 +1,7 @@
 from typing import Any, Optional, Union, List
 import copy
 
-from cube.ir.cten import IRCell
+from cube.ir.cten import IRCell, IRTensor
 from cube.graph.tensor import IRFullTensor, IRSubTensor
 from cube.algorithm.factory import DistAlgorithmFactory
 from cube.ir.unique import IDGenerator
@@ -251,7 +251,8 @@ class IRBpOperation(IRCell):
                 f"Set the input out of range ({data_index} >= {self.data_num})"
             )
         val = copy.copy(val)
-        val.attach_cell(self)
+        if isinstance(val, IRTensor):
+            val.attach_cell(self)
         self._datas[data_index] = val
         return val
 
