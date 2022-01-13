@@ -101,16 +101,34 @@ class ElementWise(IREinops):
         """
         dims = string.ascii_lowercase
         i1, i2 = self.inputs()
-        dim1 = [EinDim(dims[d]) for d in range(len(i1.shape))]
-        if isinstance(i2, IRTensor):
-            if i2.shape == i1.shape:
-                dim2 = dim1
+        if isinstance(i1, IRTensor) and isinstance(i2, IRTensor):
+            shape1 = [EinDim(dims[d]) for d in range(len(i1.shape))]
+            shape2 = [EinDim(dims[d]) for d in range(len(i2.shape))]
+            if len(i1.shape) == len(i2.shape):
+                for idx, (dim1, dim2) in enumerate(zip(i1.shape, i2.shape)):
+                    if dim1 != dim2:
+                        shape1[idx] = EinDim(str(dim1), EinDim.ReduceType.Stay)
+                        shape2[idx] = EinDim(str(dim2), EinDim.ReduceType.Stay)
             else:
-                raise NotImplementedError(f"Cannot match shape: {i1.shape} and {i2.shape}")
-        dim2 = list()
-        self.set_input_ein(0, dim1)
-        self.set_input_ein(1, dim2)
-        self.set_output_ein(0, dim1)
+                if len(i1.shape) == 1:
+                    shape1[0].name = str(i1.shape[0])
+                elif len(i2.shape) == 1:
+                    shape2[0].name = str(i2.shape[0])
+            out_shape = shape1 if i1.nele() > i2.nele() else shape2
+            self.set_input_ein(0, shape1)
+            self.set_input_ein(1, shape2)
+            self.set_output_ein(0, out_shape)
+        else:
+            if isinstance(i1, IRTensor):
+                shape1 = [EinDim(dims[d]) for d in range(len(i1.shape))]
+                self.set_input_ein(0, shape1)
+                self.set_output_ein(0, shape1)
+            elif isinstance(i2, IRTensor):
+                shape2 = [EinDim(dims[d]) for d in range(len(i2.shape))]
+                self.set_input_ein(1, shape2)
+                self.set_output_ein(0, shape2)
+            else:
+                raise RuntimeError("both inputs {i1} and {i2} are not IRTensor")
 
     def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
         elew = ElementWise(self.signature, inputs, self.name)
@@ -143,6 +161,35 @@ class Add(ElementWise):
     def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
         inputs = inputs = self.kwags['alpha']
         add = Add(self.signature, inputs, self.name)
+        for idx, output in enumerate(outputs):
+            add.set_output(idx, output)
+        return add
+
+
+class Sub(ElementWise):
+    """
+    torch.add
+    """
+    def __init__(self, signature, inputs, name='sub', **kwargs):
+        """
+        Inputs:
+            inputs[0]: IRTensor
+            inputs[1]: other (IRTensor or Number)
+            inputs[2]: alpha (Number)
+        Outputs:
+            same shape as inputs[0]
+        """
+        if len(inputs) != 3:
+            raise TypeError(
+                f"Add expected 3 inputs: [tensor, other, alpha], but got {inputs}"
+            )
+        super().__init__(signature, inputs[:2], name=name)
+        alpha = inputs[2]
+        self.kwargs['alpha'] = alpha
+
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        inputs = inputs = self.kwags['alpha']
+        add = Sub(self.signature, inputs, self.name)
         for idx, output in enumerate(outputs):
             add.set_output(idx, output)
         return add
@@ -436,6 +483,9 @@ class Conv2D(IREinops):
         
         expr = f'{input}, {weight}, {bias} -> {output}'
         [idims, wdims, bdims], [odims] = self.parse(expr)
+        print(idims)
+        print(wdims)
+        print(bdims)
         self.set_input_ein(0, idims)
         self.set_input_ein(1, wdims)
         if self.inputs(2) is not None:

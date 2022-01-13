@@ -52,13 +52,19 @@ class Sign2Op:
 
         __ttemplate('add') : function.Add,
 
+        __ttemplate('sub') : function.Sub,
+
         __ttemplate('mul') : partial(function.ElementWise, name='mul'),
+
+        __ttemplate('div') : partial(function.ElementWise, name='div'),
 
         __ttemplate('bmm') : function.BatchLinear,
 
         __ttemplate('sum') : function.Sum,
 
         __ttemplate('transpose') : function.Transpose,
+
+        __ttemplate('conv2d'): function.Conv2D,
 
         # complex
 

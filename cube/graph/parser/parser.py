@@ -63,9 +63,12 @@ class ScriptModuleParser:
             # _ = input('>>>')
             if len(ir_nodes) != 0:
                 for ir_node in ir_nodes:
-                    ret = ir_node.infer_shape()
-                    if not ret:
-                        print(f'warning: {ir_node} cannot infer shape')
+                    try:
+                        ret = ir_node.infer_shape()
+                        if not ret:
+                            print(f'warning: {ir_node} cannot infer shape')
+                    except Exception:
+                        raise RuntimeError(f"Shape infer error at: {ir_node}")
                 all_ir_nodes += ir_nodes
         
         # handle graph output -- Assuming all the output are tensors

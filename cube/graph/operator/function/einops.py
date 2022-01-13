@@ -17,7 +17,7 @@ class EinDim:
         Sum = 1
 
     def __init__(self, name: str, reduce=None):
-        if not (str.isidentifier(name) or str.isdecimal(name) or name == '*'):
+        if not (str.isidentifier(name) or str.isnumeric(name) or name == '*'):
             raise ValueError("Einstein Axis name should be identifier")
         self.name: str = name
         self.reduce: Optional[EinDim.ReduceType] = reduce
@@ -32,7 +32,7 @@ class EinDim:
         return self.reduce == EinDim.ReduceType.Sum
 
     def __repr__(self):
-        return self.name if not self.is_reduce() else self.name + "'"
+        return self.name if not self.is_reduce() else self.name + "+"
 
 
 class IREinops(IRFwOperation):
@@ -70,7 +70,7 @@ class IREinops(IRFwOperation):
         self.make_expression()
         # check expression
         for input, ein_dims in zip(self.inputs(), self._ieins):
-            if len(ein_dims) == 0:
+            if len(ein_dims) == 0 or ein_dims is None:
                 if isinstance(input, IRTensor):
                     raise RuntimeError(f"{self}: {input} has no ein-dims but is a tensor")
             if len(ein_dims) != 0:
@@ -144,12 +144,16 @@ class IREinops(IRFwOperation):
         """
         if not isinstance(expr, str):
             raise TypeError("Expected string")
-        # remove space
-        expr = expr.replace(' ', '')
+        # split to inputs and outputs
         if expr.count('->') != 1:
             raise ValueError("string must contain one ->")
+        # split to each tensor
         input, output = expr.split('->')
         inputs = input.split(',')
+        outputs = output.split(',')
+        inputs = [[dim for dim in input.split(' ') if len(dim) != 0] for input in inputs]
+        outputs = [[dim for dim in output.split(' ') if len(dim) != 0] for output in outputs]
+        # parse each tensor
         input_axises = list()
         for input in inputs:
             axises = list()
@@ -160,7 +164,6 @@ class IREinops(IRFwOperation):
                     reduce = EinDim.ReduceType.Stay
                 axises.append(EinDim(dim, reduce))
             input_axises.append(axises)
-        outputs = output.split(',')
         output_axises = list()
         for output in outputs:
             axises = [EinDim(dim) for dim in output]
