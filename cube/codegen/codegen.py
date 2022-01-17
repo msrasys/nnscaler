@@ -391,6 +391,10 @@ class ScheduleCodeGen(CodeGen):
                 name = self.node_naming(node)
                 code = self.emit_node(node, name=name)
                 fb.insert_body(code)
+            # return code
+            outputs = self.return_naming(self.execplan.graph.outputs())
+            code = f'return {outputs}'
+            fb.insert_body(code)
         gencode += fb.code
         gencode += ['']
 
