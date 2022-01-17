@@ -5,6 +5,7 @@ from cube.graph.operator.operator import IRBpOperation, IRFwOperation
 
 from cube.ir.cten import IRCell
 from cube.graph.graph import IRGraph
+from cube.graph.tensor import IRFullTensor, IRSubTensor
 
 
 class ExectuionPlan:
@@ -22,6 +23,19 @@ class ExectuionPlan:
                     self.device_seq[device] = [node]
                 else:
                     self.device_seq[device].append(node)
+        # check whether graph output is replicated across device
+        # FIXME: should use adapter to generate communication for
+        # traning logic output
+        for output in graph.outputs():
+            devices = self.devices()
+            ltensor: IRFullTensor = output.parent  # logic tensor
+            if isinstance(output, IRSubTensor):
+                for ptensor, producer in zip(ltensor.ptensors, ltensor.producers):
+                    if ptensor == output:
+                        if producer.device[0] in devices:
+                            devices.remove(producer.device[0])
+            if len(devices) != 0:
+                raise NotImplementedError("Require return values of training logic is replicated across nodes.")
 
     def devices(self) -> List[int]:
         """
