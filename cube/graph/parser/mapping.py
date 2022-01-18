@@ -25,6 +25,18 @@ class Sign2Op:
             # print(f'warning: {signature} is not recognized')
             # return partial(function.UnkownOperator, signature=signature)
 
+    @staticmethod
+    def register(signature: str, op: IRFwOperation):
+        """
+        Register an operator
+        """
+        if not isinstance(signature, str):
+            raise TypeError(f"Expected signature to be str but got {type(signature)}")
+        if signature in Sign2Op.kOpMap:
+            raise KeyError(f"function {signature} is already registered")
+        print(f'registering op {signature}...')
+        Sign2Op.kOpMap[signature] = op
+
     # functional templates
     __ftemplate = lambda name: f'torch.nn.functional.{name}'
 

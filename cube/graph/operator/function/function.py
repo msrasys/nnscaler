@@ -500,6 +500,71 @@ class Conv2D(IREinops):
         return op
 
 
+class CustomizeEinop(IREinops):
+    """
+    Customize Einop
+    """
+    def __init__(self, signature: str, inputs, name, **kwargs):
+        expected = ['anno', 'stay', 'kwarg_idx', 'kwarg_name']
+        if not all([attr not in kwargs for attr in expected]):
+            raise KeyError("Expected anno, kwarg_idx, kwarg_name for UDF function")
+        self.anno: str = kwargs['anno']
+        self.stay: List[str] = kwargs['stay']
+        # get input output
+        input_anno, output_anno = self.anno.split('->')
+        ninputs = len(input_anno.split(','))
+        noutputs = len(output_anno.split(','))
+        self.kwarg_idx: List[int] = kwargs['kwarg_idx']
+        self.kwarg_name: List[str] = kwargs['kwarg_name']
+        kwarg_inputs = [inputs[idx] for idx in self.kwarg_idx]
+        op_inputs = [input for input in inputs if input not in kwarg_inputs]
+        if len(kwarg_inputs) + ninputs != len(inputs):
+            raise ValueError(
+                f"Got {len(inputs)} inputs but kwarg inputs"
+                f"({len(kwarg_inputs)}) + anno inputs ({ninputs}) doesn't match"
+            )
+        super().__init__(
+            name, signature,
+            input_length=ninputs,
+            output_length=noutputs
+        )
+        for name, kinput in zip(self.kwarg_name, kwarg_inputs):
+            self.kwargs[name] = kinput
+        for idx, input in enumerate(op_inputs):
+            self.set_input(idx, input)
+
+    def make_expression(self):
+        ishapes, oshapes = self.parse(self.anno)
+        for idx, ishape in enumerate(ishapes):
+            for idim in ishape:
+                if idim.name in self.stay:
+                    idim.reduce = EinDim.ReduceType.Stay
+            self.set_input_ein(idx, ishape)
+        for idx, oshape in enumerate(oshapes):
+            for odim in oshape:
+                if odim.name in self.stay:
+                    odim.reduce = EinDim.ReduceType.Stay
+            self.set_output_ein(idx, oshape)
+
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        kwargs = dict(
+            anno = self.anno,
+            stay = self.stay,
+            kwarg_idx = self.kwarg_idx,
+            kwarg_name = self.kwarg_name,
+        )
+        all_inputs = [None] * (len(self.inputs) + len(self.kwarg_idx))
+        remain_idx = list(range(len(all_inputs)))
+        for idx, name in zip(self.kwarg_idx, self.kwarg_name):
+            all_inputs[idx] = self.kwargs[name]
+            remain_idx.remove(idx)
+        for idx, input in zip(remain_idx, inputs):
+            all_inputs[idx] = input
+        op = CustomizeEinop(self.signature, all_inputs, self.name, **kwargs)
+        for idx, output in enumerate(outputs):
+            op.set_output(idx, output)
+        return op
+
 # ===================== Cube Complex Operation =======================
 
 class CubeComplexToQKV(IRFwOperation):
