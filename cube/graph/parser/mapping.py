@@ -34,7 +34,6 @@ class Sign2Op:
             raise TypeError(f"Expected signature to be str but got {type(signature)}")
         if signature in Sign2Op.kOpMap:
             raise KeyError(f"function {signature} is already registered")
-        print(f'registering op {signature}...')
         Sign2Op.kOpMap[signature] = op
 
     # functional templates

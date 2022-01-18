@@ -32,6 +32,7 @@ def register(anno: str, stay: List[str] = None):
             if kind != torch.Tensor:
                 kwarg_name.append(name)
                 kwarg_idx.append(idx)
+        print(f'registering op {func_name} with {len(args.parameters) - len(kwarg_idx)} inputs and {len(kwarg_idx)} kwargs...')
         udfop = partial(CustomizeEinop,
             name=func_name,
             anno=anno, stay=stay,
