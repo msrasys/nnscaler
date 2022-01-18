@@ -24,9 +24,70 @@ from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 
 
+@cube.graph.operator.register('L N E, (3 h d) E -> L N (h d)', stay=['L', 'd', 'E'])
+def attnfc1(x: torch.Tensor, wqkv: torch.Tensor, num_head: int,
+            scale: float, dropout: float, training: bool):
+    """
+    L: sequence length
+    N: batch size
+    E: embedding size
+    x: hidden state: [L, N, E]
+    wqkv: qkv weight: [3 * (num_head * dim_head), E]
+    dropout: float
+    num_head: int
+    """
+    L, N = x.shape[0], x.shape[1]
+    dim_head = wqkv.shape[0] // 3 // num_head
+    # L N E, (3 h d) E -> L N (3 h d)
+    qkv = F.linear(x, wqkv, None)
+    # L N (3 h d) -> L N (h d), L N (h d), L N (h d)
+    q, k, v = qkv.chunk(3, dim=-1)
+    # L N (h d) -> L (N h) d
+    q = q.contiguous().view(L, (N * num_head), dim_head)
+    # L N (h d) -> L (N h) d
+    k = k.contiguous().view(L, (N * num_head), dim_head)
+    # L N (h d) -> L (N h) d
+    v = v.contiguous().view(L, (N * num_head), dim_head)
+    # L (N h) d -> (N h) L d
+    q = q.transpose(0, 1)
+    # L (N h) d -> (N h) L d
+    k = k.transpose(0, 1)
+    # L (N h) d -> (N h) L d
+    v = v.transpose(0, 1)
+    # (N h) L d, 1 -> (N h) L d
+    q = q * scale
+    # (N h) L d -> (N h) d L
+    k = k.transpose(-2, -1)
+    # (N h) L d, (N h) d L -> (N h) L L
+    attn = torch.bmm(q, k)
+
+    # attention mask
+    # (N h) L L -> (N h) L L
+    attn = attn.view(N, num_head, L, L)
+    ones = torch.ones((N, L, L), device=attn.device)
+    mask = torch.tril(ones)
+    mask = mask.view(N, 1, L, L)
+    mask = (mask < 0.5)
+    attn = attn.masked_fill_(mask, -10000.0)
+    attn = attn.view((N, num_head), L, L)
+
+    # (N h) L L -> (N h) L L
+    attn = F.softmax(attn, dim=-1)
+    # (N h) L L -> (N h) L L
+    if training:
+        attn = F.dropout(attn, dropout, True, False)
+    # (N h) L L, (N h) L d -> (N h) L d
+    output = torch.bmm(attn, v)
+    # (N h) L d -> L (N h) d
+    output = output.transpose(0, 1).contiguous()
+    # L (N h) d -> L N (h d)
+    output = output.view(L, N, num_head * dim_head)
+    return output
+
+
 class MultiHeadSelfAttention(nn.Module):
 
-    def __init__(self, seq_len, embed_dim, heads, dropout):
+    def __init__(self, seq_len, embed_dim, heads, dropout: float):
         super().__init__()
 
         self.seq_len = seq_len
@@ -35,55 +96,24 @@ class MultiHeadSelfAttention(nn.Module):
         self.dim_head = embed_dim // heads
         self.scale = self.dim_head ** -0.5
 
-        self.weight_qkv = torch.nn.Parameter(torch.empty(
+        self.wqkv = torch.nn.Parameter(torch.empty(
             3 * embed_dim, embed_dim
         ))
-        self.weight_out = torch.nn.Parameter(torch.empty(
+        self.wout = torch.nn.Parameter(torch.empty(
             embed_dim, embed_dim
         ))
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = dropout
 
     def forward(self, x):
         """
         x: [L, N, E]: seq_len, batch_size, embedding dimension
         output: [L, N, E]
         """
-        # [L, N, E] -> 3 x [L, (N * num_head), dim_head]
-        q, k, v = cube.runtime.function.toqkv(
-            x, self.weight_qkv, self.num_head
-        )
-
-        # [L, (N * num_head), dim_head] -> [(N * num_head), L, dim_head]
-        q = q.transpose(0, 1)
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-
-        # [(N * num_head), L, dim_head] -> [(N * num_head), L, dim_head]
-        q = q * self.scale
-        # [(N * num_head), L, dim_head] -> [(N * num_head), dim_head, L]
-        k = k.transpose(-2, -1)
-        # [(N * num_head), L, dim_head] * [(N * num_head), dim_head, L]
-        # -> [(N * num_head), L, L]
-        attn = torch.bmm(q, k)
-
-        # [(N * num_head), L, L] -> [(N * num_head), L, L]
-        attn = cube.runtime.function.tril_mask(attn, self.num_head)
-
-        # [(N * num_head), L, L] -> [(N * num_head), L, L]
-        attn = F.softmax(attn, dim=-1)
-
-        # [(N * num_head), L, L] -> [(N * num_head), L, L]
-        attn = self.dropout(attn)
-        # [(N * num_head), L, L] * [(N * num_head), L, dim_head]
-        # -> [(N * num_head), L, dim_head]
-        output = torch.bmm(attn, v)
-
-        # [(N * num_head), L, dim_head] -> [L, N, num_head * dim_head]
-        output = cube.runtime.function.attn_view(output, self.num_head)
-
-        # [L, N, num_head * dim_head] * [E, embed_head * dim_head]
-        # -> [L, N, E]
-        output = F.linear(output, self.weight_out)
+        # L N E, (3 h d) E -> L N (h d)
+        output = attnfc1(x, self.wqkv, self.num_head,
+                         self.scale, self.dropout, self.training)
+        # L N (h d), E (h d) -> L N E
+        output = F.linear(output, self.wout)
 
         loss = torch.sum(output)
         return loss
