@@ -2,8 +2,7 @@
 This operator class is highly inspired by eniops.
 """
 import enum
-import string
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 from cube.ir.cten import IRTensor
 from cube.graph.operator.operator import IRFwOperation
@@ -16,11 +15,30 @@ class EinDim:
         Stay = 0  # the dim is not allowed to be split
         Sum = 1
 
-    def __init__(self, name: str, reduce=None):
-        if not (str.isidentifier(name) or str.isnumeric(name) or name == '*'):
-            raise ValueError("Einstein Axis name should be identifier")
-        self.name: str = name
-        self.reduce: Optional[EinDim.ReduceType] = reduce
+    def __init__(self, name: Union[str, List[str]], reduce=None):
+        if isinstance(name, str):
+            name = [name]
+        for n in name:
+            if not (str.isidentifier(n) or str.isnumeric(n) or n == '*'):
+                raise ValueError("Einstein Axis name should be identifier")
+        self._name: List[str] = name
+        self._reduce: Optional[EinDim.ReduceType] = reduce
+
+    @property
+    def name(self) -> str:
+        if len(self._name) == 1:
+            return self._name[0]
+        return '(' + ' '.join(self._name) + ')'
+
+    @property
+    def reduce(self) -> str:
+        return self._reduce
+    
+    @reduce.setter
+    def reduce(self, val):
+        if not isinstance(val, EinDim.ReduceType):
+            raise TypeError("Expected EinDim.ReduceType")
+        self._reduce = val
 
     def __eq__(self, other):
         if isinstance(other, EinDim):

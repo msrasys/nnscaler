@@ -506,8 +506,8 @@ class CustomizeEinop(IREinops):
     """
     def __init__(self, signature: str, inputs, name, **kwargs):
         expected = ['anno', 'stay', 'kwarg_idx', 'kwarg_name']
-        if not all([attr not in kwargs for attr in expected]):
-            raise KeyError("Expected anno, kwarg_idx, kwarg_name for UDF function")
+        if not all([attr in kwargs for attr in expected]):
+            raise KeyError("Expected anno, stay, kwarg_idx, kwarg_name for UDF function")
         self.anno: str = kwargs['anno']
         self.stay: List[str] = kwargs['stay']
         # get input output
