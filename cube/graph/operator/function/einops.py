@@ -30,6 +30,15 @@ class EinDim:
             return self._name[0]
         return '(' + ' '.join(self._name) + ')'
 
+    @name.setter
+    def name(self, val: Union[str, List[str]]):
+        if isinstance(val, str):
+            self._name = [val]
+        elif all([isinstance(n, str) for n in val]):
+            self._name = list(val)
+        else:
+            raise TypeError("Expected Union[str, List[str] for name")
+
     @property
     def reduce(self) -> str:
         return self._reduce
