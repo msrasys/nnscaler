@@ -9,6 +9,11 @@ python -m torch.distributed.launch \
     --master_port=8004 \
     --use_env \
     examples/attention/attention.py
+
+OMP_NUM_THREADS=4 torchrun --standalone \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    examples/attention/attention.py
 """
 
 import torch
@@ -17,15 +22,14 @@ import torch.nn.functional as F
 import cube
 
 
-from examples.attention.policy.data_parallel import transform_policy
-from examples.attention.policy.data_parallel import schedule_policy
+from examples.attention.policy.tensor_parallel import PAS
 
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 
 
-@cube.graph.operator.register('L N E, (3 h d) E -> L N (h d)', stay=['L', 'd', 'E'])
-def attnfc1(x: torch.Tensor, wqkv: torch.Tensor, num_head: int,
+@cube.graph.parser.register('L N E, (3 h d) E -> L N (h d)', stay=['L', 'd', 'E'])
+def attnfc1(x: torch.Tensor, wqkv: torch.Tensor, h: int,
             scale: float, dropout: float, training: bool):
     """
     L: sequence length
@@ -34,8 +38,9 @@ def attnfc1(x: torch.Tensor, wqkv: torch.Tensor, num_head: int,
     x: hidden state: [L, N, E]
     wqkv: qkv weight: [3 * (num_head * dim_head), E]
     dropout: float
-    num_head: int
+    h: int: number of heads
     """
+    num_head = h
     L, N = x.shape[0], x.shape[1]
     dim_head = wqkv.shape[0] // 3 // num_head
     # L N E, (3 h d) E -> L N (3 h d)
@@ -69,7 +74,7 @@ def attnfc1(x: torch.Tensor, wqkv: torch.Tensor, num_head: int,
     mask = mask.view(N, 1, L, L)
     mask = (mask < 0.5)
     attn = attn.masked_fill_(mask, -10000.0)
-    attn = attn.view((N, num_head), L, L)
+    attn = attn.view((N * num_head), L, L)
 
     # (N h) L L -> (N h) L L
     attn = F.softmax(attn, dim=-1)
@@ -136,9 +141,13 @@ def train():
         model, input_shapes=([L, N, E],),
     )
 
-    dataloader = cube.runtime.syndata.SynDataLoader(1280, [1], [L, N, E])
+    dataloader = cube.runtime.syndata.SynDataLoader(
+        shapes=([L, N, E],),
+        dtypes=(torch.float32,),
+        batch_dims=(1,)
+    )
 
-    @cube.compile(model, dataloader, policy=(transform_policy, schedule_policy))
+    @cube.compile(model, dataloader, policy=PAS)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)

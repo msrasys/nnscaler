@@ -7,13 +7,13 @@ import time
 torch.set_default_tensor_type(torch.DoubleTensor)
 
 import cube
-from examples.sci.policy.naive import PAS
+from examples.poisson.policy.naive import PAS
 
 """
 OMP_NUM_THREADS=4 torchrun --standalone \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/sci/sci.py
+    examples/poisson/sci.py
 """
 
 
