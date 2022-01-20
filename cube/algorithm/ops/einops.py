@@ -46,7 +46,7 @@ class DimSplitEinops(GenericDistAlgo):
             return False
         if node.inputs(idx).shape[dim] % num != 0:
             return False
-        if node._ieins[idx][dim].reduce == EinDim.ReduceType.Stay:
+        if node._iannos[idx][dim].reduce == EinDim.ReduceType.Stay:
             return False
         return True
 
@@ -57,18 +57,18 @@ class DimSplitEinops(GenericDistAlgo):
         idx: int = config['idx']
         dim: int = config['dim']
         num: int = config['num']
-        axis: EinDim = node._ieins[idx][dim]
+        edim: EinDim = node._iannos[idx][dim]
 
         # print(f'splitting: {node.einexpr()}')
 
         ins, ous = list(), list()
         for iidx, input in enumerate(node.inputs()):
-            if axis in node._ieins[iidx]:
-                dim = node._ieins[iidx].index(axis)
+            if edim in node._iannos[iidx]:
+                dim = node._iannos[iidx].index(edim)
                 sub_tensors = split_axis(input, dim, num)
                 ins.append(sub_tensors)
             else:
-                if axis.is_reduce():
+                if edim.reduce[0] == EinDim.ReduceType.Sum:
                     # print(f'Warning: value split on one input tensor in node{node._id}:{node.name} as reduce axis {axis} not appeared.')
                     ins.append(split_value(input, num))
                 else:
@@ -76,17 +76,17 @@ class DimSplitEinops(GenericDistAlgo):
         for oidx, output in enumerate(node.outputs()):
             # split on the non-reduce axis, the output value keeps same
             # but the output shape gets splitted
-            if axis in node._oeins[oidx]:
-                dim = node._oeins[oidx].index(axis)
-                if axis.is_reduce():
+            if edim in node._oannos[oidx]:
+                dim = node._oannos[oidx].index(edim)
+                if edim.reduce[0] == EinDim.ReduceType.Sum:
                     raise RuntimeError(f"Reduced axis {dim} appeared in output")
                 sub_tensors  = split_axis(output, dim, num)
                 ous.append(sub_tensors)
             # split on the reduce axis, the output shape keeps same 
             # but the output value get splitted
             else:
-                if not axis.is_reduce():
-                    raise RuntimeError(f"Expect axis {axis} to be reduced axis")
+                if edim.reduce[0] != EinDim.ReduceType.Sum:
+                    raise RuntimeError(f"Expect axis {edim} to be reduced axis")
                 sub_tensors = split_value(output, num)
                 ous.append(sub_tensors)
 
@@ -95,7 +95,7 @@ class DimSplitEinops(GenericDistAlgo):
             inputs = [t[nid] for t in ins]
             outputs = [t[nid] for t in ous]
             sub_node: IREinops = node.new(inputs, outputs)
-            sub_node.make_expression()
+            sub_node.infer_shape()
             sub_nodes.append(sub_node)
         return sub_nodes
 

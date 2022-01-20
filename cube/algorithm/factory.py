@@ -69,8 +69,8 @@ class DistAlgorithmFactory:
         # self.register(elew.ElementWise, elew.ElementWiseDimParallel, tag='dim')
         # self.register(elew.Add, elew.AddDimParallel, tag='dim')
 
-        import cube.algorithm.ops.layernorm as ln
-        self.register(ln.LayerNorm, ln.LayerNormDimParallel, tag='dim')
+        # import cube.algorithm.ops.layernorm as ln
+        # self.register(ln.LayerNorm, ln.LayerNormDimParallel, tag='dim')
 
         # import cube.algorithm.ops.activation as activation
         # self.register(activation.Activation, activation.ActivationDimParallel, tag='dim')
@@ -79,25 +79,6 @@ class DistAlgorithmFactory:
 
         # import cube.algorithm.ops.reduce as reduce
         # self.register(reduce.Sum, reduce.SumDimParallel, tag='dim')
-
-        import cube.algorithm.ops.complex as complex
-        self.register(complex.CubeComplexToQKV, complex.CubeToQKVDataParallel, tag='data')
-        self.register(complex.CubeComplexToQKV, complex.CubeToQKVHeadParallel, tag='head')
-
-        self.register(complex.CubeComplexTrilMask, complex.CubeTrilMaskDataParallel, tag='data')
-        self.register(complex.CubeComplexTrilMask, complex.CubeTrilMaskHeadParallel, tag='head')
-    
-        self.register(complex.CubeComplexAttnView, complex.CubeAttnViewDataParallel, tag='data')
-        self.register(complex.CubeComplexAttnView, complex.CubeAttnViewHeadParallel, tag='head')
-
-        self.register(complex.CubeComplexSelfAttention, complex.CubeSelfAttentionDataParallel, tag='data')
-        self.register(complex.CubeComplexSelfAttention, complex.CubeSelfAttentionHeadParallel, tag='head')
-
-        self.register(complex.CubeComplexFeedForward, complex.CubeFeedForwardDataParallel, tag='data')
-        self.register(complex.CubeComplexFeedForward, complex.CubeFeedForwardTensorParallel, tag='tensor')
-
-        self.register(complex.CubeComplexEmbedding, complex.CubeEmbedDataParallel, tag='data')
-        self.register(complex.CubeComplexEmbedding, complex.CubeEmbedShardingParallel, tag='shard')
 
         # import cube.algorithm.ops.memory as mem
         # self.register(mem.Transpose, mem.TransposeDimParallel, tag='dim')
