@@ -1,6 +1,54 @@
 """
-This operator class is highly inspired by eniops.
+This operator class is highly inspired by einops.
+
+* Annotating Dimensions:
+
+  e.g., 'a+', 'ab^', 'cd', '(ab+ c^ d)', '64'
+
+A dimension of a tensor can be annotated by {identifier}{reduce} template.
+
+An `identifier` must be one of:
+  1) symbolic annotation that must match with the criteria of python str.isidentifier.
+  2) numeric string that must match with python str.isnumeric. This indicates the shape is the same value
+     numeric string will always have '^' reduction type
+  3) '*': this special value indicates the dimension is dynamic will automatically get expanded given the shape
+
+A `reduce` can be a set of {'', '+', '^'}:
+  '' indicates this dimension will apear in output.
+  '+' indicates no this dimension will be reduced in output using sume
+  '^' means this dimension is out of scope, Einops will not handle this (cannot do split on it)
+
+A complex annotation for a dimension is using brackets, i.e., '(' and ')', to include
+more inner-dimensions. The value of inner dimension must be (partially) indicated by function args (of same name)
+so that letting system know (infer).
+
+* Annotating Operator:
+
+e.g., 'm k+, n k+ -> m n', '4 k+, k+ d -> 8 d', '* d^, s -> * s'
+
+An operator dimension can be annoted with input dimensions and output dimensions.
+Same identifier indicates the same shape and semantically same dimension propagation.
+
+'->' seperates the inputs (left) and outputs (right) and ',' separates each input and output.
+A shape needs to be annotated using dimension annotations with delimiters of (mulitple) space ' '.
+
+Dimension annotations in Output must apear in inputs, or using numeric string
+
+* Splitting Rule:
+
+Spatial Splitting (dimension with '' reduce type):
+    tensors that have this dimension will be splitted spatially.
+    tensors that don't have this dimension will be replicated.
+
+Numerical Splitting (dimension with '+' reduce type):
+    tensors that have this dimension will be splitted spatially,
+    tensors that don't have this dimension will be splitted numerically
+
+Illegal Splitting (dimension with '^' reduce type):
+    Illegal splitting algorithm on this dimension.
+
 """
+
 from typing import Callable, Dict, List, Union
 from typing import Optional, Set, Tuple, Optional
 import enum
@@ -26,8 +74,8 @@ class EinDim:
 
     class ReduceType(enum.Enum):
         Spatial=''
-        Stay = '^'  # the dim is not allowed to be split
         Sum = '+'
+        Stay = '^'  # the dim is not allowed to be split
 
     def __init__(self, name: Union[str, List[str]]):
         if isinstance(name, str):
@@ -50,6 +98,8 @@ class EinDim:
             # get identifier name
             if len(n) == 0 or not (str.isidentifier(n) or str.isnumeric(n) or n == '*'):
                 raise ValueError(f"EinDim name {n} should be identifier")
+            if str.isnumeric(n):
+                reduce = EinDim.ReduceType.Stay
             self._name.append(n)
             self._reduce.append(reduce)
         for n in self._name:
@@ -60,6 +110,9 @@ class EinDim:
         if len(self._name) == 1:
             return self._name[0]
         return '(' + ' '.join(self._name) + ')'
+
+    def names(self) -> List[str]:
+        return copy.copy(self._name)
 
     @property
     def reduce(self) -> str:
@@ -219,7 +272,6 @@ class IREinops(IRFwOperation):
             raise RuntimeError("No matching anno for given annos")
         dimlen: Dict[str, int] = dict()
         for input, ishape in zip(self.inputs(), self._iannos):
-            print(input.shape, ishape)
             if not ((ishape is None and not isinstance(input, IRTensor)) or
                     len(ishape) == len(input.shape)):
                 raise RuntimeError(f"node {self._id}: error match input: {input.shape} and einshape: {ishape}")
@@ -338,10 +390,10 @@ class IREinops(IRFwOperation):
     def einexpr(self) -> str:
         inputs = list()
         outputs = list()
-        for iein in self._ieins:
-            inputs.append(' '.join([repr(ein) for ein in iein]))
-        for oein in self._oeins:
-            outputs.append(' '.join([repr(ein) for ein in oein]))
+        for shape in self._iannos:
+            inputs.append(' '.join([repr(edim) for edim in shape]))
+        for shape in self._oannos:
+            outputs.append(' '.join([repr(edim) for edim in shape]))
         return ', '.join(inputs) + ' -> ' + ', '.join(outputs)
 
     def algorithms(self, tag: Optional[str] = None):
