@@ -178,7 +178,7 @@ class ScriptModuleParser:
             val = frame.get_var(var_name)
             input_vals.append(val)
         try:
-            ir_node = Sign2Op.map(fsig)(inputs=input_vals, n_outputs=len(outputs))
+            ir_node = Sign2Op.map(fsig)(inputs=input_vals)
         except Exception:
             # print(module.code)
             raise RuntimeError(f"Parsing error of {node}")
@@ -216,7 +216,7 @@ class ScriptModuleParser:
             input_val.append(val)
 
         # create IR node
-        ir_node = Sign2Op.map(fsig)(inputs=input_val, n_outputs=len(outputs))
+        ir_node = Sign2Op.map(fsig)(inputs=input_val)
         if len(ir_node.outputs()) != len(outputs):
             raise RuntimeError(
                 f"Parse fail: {fsig} has {len(outputs)} outputs != pre-defined {len(ir_node.outputs())}"

@@ -132,8 +132,13 @@ def Conv2D(signature, inputs):
         anno.outputs[0][2] = EinDim([str(oH)])
         anno.outputs[0][3] = EinDim([str(oW)])
         return anno
-    annos = [('N iC H W, oC GiC dH dW, oC -> N oC oH oW', adapt)]
+    annos = [
+        ('N iC H W, oC GiC dH dW, oC -> N oC oH oW', adapt),
+        ('N iC H W, oC GiC dH dW -> N oC oH oW', adapt),
+    ]
     tensors = inputs[0:3]
+    if tensors[-1] is None:
+        tensors = inputs[0:2]
     stride, padding, dilation, groups = inputs[3:]
     return IREinops(signature, annos, tensors, 'conv2d',
                     stride=stride, padding=padding, dilation=dilation, groups=groups)

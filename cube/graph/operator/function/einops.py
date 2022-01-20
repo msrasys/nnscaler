@@ -274,7 +274,7 @@ class IREinops(IRFwOperation):
         for input, ishape in zip(self.inputs(), self._iannos):
             if not ((ishape is None and not isinstance(input, IRTensor)) or
                     len(ishape) == len(input.shape)):
-                raise RuntimeError(f"node {self._id}: error match input: {input.shape} and einshape: {ishape}")
+                raise RuntimeError(f"node {self._id} {self.signature}: error match input: {input.shape} and einshape: {ishape}")
             for tdim, edim in zip(input.shape, ishape):
                 if len(edim._name) == 1:
                     if edim.name in dimlen and dimlen[edim.name] != tdim:
@@ -334,8 +334,6 @@ class IREinops(IRFwOperation):
         """
         parse annotations, assuming input tensor shape is given
         """
-        # copy
-        anno = EinopAnno(anno.anno)
         if len(anno.inputs) != len(self.inputs()):
             return False, None, None
         identifiers = anno.identifiers()
@@ -378,13 +376,16 @@ class IREinops(IRFwOperation):
         dimlen: Dict[str, int] = dict()
         for shape, input in zip(anno.inputs, self.inputs()):
             if not isinstance(input, IRTensor):
-                if shape.name != '1':
+                if not (len(shape) != 1 and shape[0].name != '1'):
                     return False, None, None
-            for dim, nele in zip(shape, input.shape):
-                if dim.name in dimlen:
-                    if nele != dimlen[dim.name]:
-                        return False, None, None
-                dimlen[dim.name] = nele
+            else:
+                if len(input.shape) != len(shape):
+                    return False, None, None
+                for edim, nele in zip(shape, input.shape):
+                    if edim.name in dimlen:
+                        if nele != dimlen[edim.name]:
+                            return False, None, None
+                    dimlen[edim.name] = nele
         return True, anno.inputs, anno.outputs
 
     def einexpr(self) -> str:

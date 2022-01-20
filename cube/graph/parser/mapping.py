@@ -55,9 +55,9 @@ class Sign2Op:
 
         __ftemplate('dropout') : function.Dropout,
 
-        __ftemplate('gelu') : function.GELU,
+        __ftemplate('gelu') : function.GeLU,
 
-        __ftemplate('layer_norm'): function.LayerNorm,
+        # __ftemplate('layer_norm'): function.LayerNorm,
 
         # torch aten
 
@@ -65,9 +65,9 @@ class Sign2Op:
 
         __ttemplate('sub') : function.Sub,
 
-        __ttemplate('mul') : partial(function.ElementWise, name='mul'),
+        __ttemplate('mul') : function.Mul,
 
-        __ttemplate('div') : partial(function.ElementWise, name='div'),
+        __ttemplate('div') : function.Div,
 
         __ttemplate('bmm') : function.BatchLinear,
 
@@ -76,20 +76,6 @@ class Sign2Op:
         __ttemplate('transpose') : function.Transpose,
 
         __ttemplate('conv2d'): function.Conv2D,
-
-        # complex
-
-        __customize('toqkv'): partial(function.CubeComplexToQKV, name='toqkv'),
-
-        __customize('tril_mask'): function.CubeComplexTrilMask,
-
-        __customize('attn_view'): function.CubeComplexAttnView,
-
-        __customize('self_attn'): function.CubeComplexSelfAttention,
-        
-        __customize('feedforward'): function.CubeComplexFeedForward,
-
-        __customize('embedding'): function.CubeComplexEmbedding,
 
     }
 
