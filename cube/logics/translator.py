@@ -1,3 +1,6 @@
+from cube.graph.operator.operator import IRFwOperation
+from cube.ir.cten import IRCell
+
 from cube.logics.dataloader import IRDataLoader
 from cube.logics import model
 from cube.logics.pool import SchedulePool
@@ -16,6 +19,12 @@ class LogicTranslator:
         """
         nodes = SchedulePool().nodes()
         graph = IRGraph(nodes, inputs=[], outputs=outputs, module_name='LogicGraph')
+        # remove backward nodes if no backward is called
+        for node in graph.nodes():
+            if isinstance(node, IRFwOperation):
+                bnode = node.mirror
+                if bnode not in graph.nodes():
+                    IRCell.make_pair(node, None)
         return graph
 
     @staticmethod

@@ -189,7 +189,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                 bs = [out.shape[dim] for out, dim in zip(dnode.outputs(), dnode.get_batch_dims())]
                 all_batch_size.update(bs)
             if len(all_batch_size) != 1:
-                raise NotImplementedError("Heterogenous batch size is not supported")
+                raise NotImplementedError(f"Heterogenous batch size {bs} is not supported")
             batch_size = torch.tensor(list(all_batch_size), dtype=torch.int).cuda()
 
             compile_end = time.time()
