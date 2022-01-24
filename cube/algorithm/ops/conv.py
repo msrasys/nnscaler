@@ -84,3 +84,33 @@ class DimSplitConv2D(GenericDistAlgo):
         for i, w, b, o in zip(inputs, weights, bias, outputs):
             subnodes.append(node.new([i, w, b], [o]))
         return subnodes
+
+
+class HaloSplitCon2D(GenericDistAlgo):
+    """
+    Halo-exchange split
+
+    N iC H W, oC iC dH dW, oC -> N oC oH oW
+    """
+
+    def __init__(self, node: IRConv2D):
+        if not isinstance(node, IRConv2D):
+            raise TypeError(f"Expect IRConv2D")
+        super().__init__(node)
+
+    def satisfy(self, config: Dict):
+        for attr in ['idx', 'dim', 'num']:
+            if not attr in config:
+                raise KeyError("Expected idx, dim, num in the config")
+        node: IRConv2D = self.node
+        idx: int = config['idx']
+        dim: int = config['dim']
+        num: int = config['num']
+        groups = node.kwargs['groups']
+        stride = node.kwargs['groups']
+        padding = node.kwargs['padding']
+        dilation = node.kwargs['dilation']
+        # split H
+        if (idx, dim) == (0, 2):
+            strideH = stride[0]
+            pass

@@ -104,12 +104,14 @@ class IRCell:
 
     @staticmethod
     def make_pair(cell1, cell2):
-        if not isinstance(cell1, IRCell):
-            raise TypeError("Expected cell1 to be IRCell")
-        if not isinstance(cell2, IRCell):
-            raise TypeError("Expected cell2 to be IRCell")
-        cell1._mirror = cell2
-        cell2._mirror = cell1
+        if isinstance(cell1, IRCell):
+            cell1._mirror = cell2
+        elif cell1 is not None:
+            raise TypeError("Expected cell1 to be IRCell or None")
+        if isinstance(cell2, IRCell):
+            cell2._mirror = cell1
+        elif cell2 is not None:
+            raise TypeError("Expected cell2 to be IRCell or None")
 
     def on_device(self, device_id: int):
         """
