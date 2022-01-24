@@ -309,7 +309,7 @@ class IRGraph(IRCell):
         for idx, fnode in enumerate(fnodes):
             self.attach(fnode, fidx + idx) 
         # insert backward
-        if isinstance(op.mirror, IRBpOperation):
+        if isinstance(op.mirror, IRBpOperation) and op.mirror in self.nodes():
             for fnode in fnodes:
                 fnode.gen_backward()
             bnodes = [fnode.mirror for fnode in fnodes][::-1]
