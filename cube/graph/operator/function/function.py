@@ -134,8 +134,8 @@ def Transpose(signature, inputs):
 #         anno.outputs[0][3] = EinDim([str(oW)])
 #         return anno
 #     annos = [
-#         ('N iC H W, oC GiC dH dW, oC -> N oC oH oW', adapt),
-#         ('N iC H W, oC GiC dH dW -> N oC oH oW', adapt),
+#         ('N iC+ H^ W^, oC iC+ dH^ dW^, oC -> N oC oH^ oW^', adapt),
+#         ('N iC+ H^ W^, oC iC+ dH^ dW^ -> N oC oH^ oW^', adapt),
 #     ]
 #     tensors = inputs[0:3]
 #     if tensors[-1] is None:
