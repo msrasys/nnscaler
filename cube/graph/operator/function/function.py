@@ -1,4 +1,5 @@
 from cube.graph.operator.function.einops import EinDim, EinopAnno, IREinops
+from cube.graph.operator.function.conv import IRConv2D
 
 
 def Linear(signature, inputs):
@@ -115,30 +116,42 @@ def Transpose(signature, inputs):
                     dim0=dim0, dim1=dim1)
 
 
+# def Conv2D(signature, inputs):
+#     """
+#     torch.conv2d(input, weight, bias, stride, padding, dialation, groups)
+#     https://pytorch.org/docs/stable/generated/torch.nn.functional.conv2d.html?highlight=torch%20conv2d#torch.nn.functional.conv2d
+#     """
+#     def adapt(anno: EinopAnno, node: IREinops) -> EinopAnno:
+#         iH, iW = node.inputs(0).shape[2:4]
+#         stride = node.kwargs['stride']
+#         padding = node.kwargs['padding']
+#         dilation = node.kwargs['dilation']
+#         dH = node.inputs(1).shape[2]
+#         dW = node.inputs(1).shape[3]
+#         oH = (iH + 2 * padding[0] - dilation[0] * (dH - 1) - 1) // stride[0] + 1
+#         oW = (iW + 2 * padding[1] - dilation[1] * (dW - 1) - 1) // stride[1] + 1
+#         anno.outputs[0][2] = EinDim([str(oH)])
+#         anno.outputs[0][3] = EinDim([str(oW)])
+#         return anno
+#     annos = [
+#         ('N iC H W, oC GiC dH dW, oC -> N oC oH oW', adapt),
+#         ('N iC H W, oC GiC dH dW -> N oC oH oW', adapt),
+#     ]
+#     tensors = inputs[0:3]
+#     if tensors[-1] is None:
+#         tensors = inputs[0:2]
+#     stride, padding, dilation, groups = inputs[3:]
+#     return IREinops(signature, annos, tensors, 'conv2d',
+#                     stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+
 def Conv2D(signature, inputs):
     """
     torch.conv2d(input, weight, bias, stride, padding, dialation, groups)
     https://pytorch.org/docs/stable/generated/torch.nn.functional.conv2d.html?highlight=torch%20conv2d#torch.nn.functional.conv2d
     """
-    def adapt(anno: EinopAnno, node: IREinops) -> EinopAnno:
-        iH, iW = node.inputs(0).shape[2:4]
-        stride = node.kwargs['stride']
-        padding = node.kwargs['padding']
-        dilation = node.kwargs['dilation']
-        dH = node.inputs(1).shape[2]
-        dW = node.inputs(1).shape[3]
-        oH = (iH + 2 * padding[0] - dilation[0] * (dH - 1) - 1) // stride[0] + 1
-        oW = (iW + 2 * padding[1] - dilation[1] * (dW - 1) - 1) // stride[1] + 1
-        anno.outputs[0][2] = EinDim([str(oH)])
-        anno.outputs[0][3] = EinDim([str(oW)])
-        return anno
-    annos = [
-        ('N iC H W, oC GiC dH dW, oC -> N oC oH oW', adapt),
-        ('N iC H W, oC GiC dH dW -> N oC oH oW', adapt),
-    ]
+    assert len(inputs) == 7, f"Expected 7 inputs but only got {len(inputs)}"
     tensors = inputs[0:3]
-    if tensors[-1] is None:
-        tensors = inputs[0:2]
     stride, padding, dilation, groups = inputs[3:]
-    return IREinops(signature, annos, tensors, 'conv2d',
+    return IRConv2D(signature, tensors, 'conv2d',
                     stride=stride, padding=padding, dilation=dilation, groups=groups)
