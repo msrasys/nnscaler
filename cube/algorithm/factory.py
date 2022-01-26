@@ -67,6 +67,7 @@ class DistAlgorithmFactory:
 
         import cube.algorithm.ops.conv as conv
         self.register(conv.IRConv2D, conv.DimSplitConv2D, tag='dim')
+        self.register(conv.IRConv2D, conv.HaloSplitConv2D, tag='halo')
 
         # import cube.algorithm.ops.elementwise as elew
         # self.register(elew.ElementWise, elew.ElementWiseDimParallel, tag='dim')

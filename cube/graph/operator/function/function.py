@@ -153,5 +153,10 @@ def Conv2D(signature, inputs):
     assert len(inputs) == 7, f"Expected 7 inputs but only got {len(inputs)}"
     tensors = inputs[0:3]
     stride, padding, dilation, groups = inputs[3:]
+    if isinstance(padding, int):
+        padding = [padding] * 4
+    elif len(padding) == 2:
+        padH, padW = padding
+        padding = [padH, padH, padW, padW]
     return IRConv2D(signature, tensors, 'conv2d',
                     stride=stride, padding=padding, dilation=dilation, groups=groups)

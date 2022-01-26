@@ -1,8 +1,8 @@
+from typing import List, Union
+from cube.graph.tensor import IRSubTensor
 
-from cube.ir.cten import IRTensor
 
-
-def split_axis(tensor: IRTensor, axis: int, chunk_num: int):
+def split_axis(tensor: IRSubTensor, axis: int, chunk_num: int):
     """
     Split tensor along an axis. The axis can be positive or negative.
     """
@@ -34,7 +34,33 @@ def split_axis(tensor: IRTensor, axis: int, chunk_num: int):
     return sub_tensors
 
 
-def split_value(tensor: IRTensor, chunk_num: int):
+def split_axis_custom(tensor: IRSubTensor, axis: int, chunks: List[slice]):
+    """
+    Split tensor along an axis with cutomized selection
+    """
+    if axis < 0:
+        axis = len(tensor.shape) + axis
+    if axis >= len(tensor.shape):
+        raise RuntimeError(f"Axis should within dims ({axis} >= {len(tensor.shape)})")
+    chunk_num = len(chunks)
+
+    slicers, shape = list(), list()
+    for nele in tensor.shape:
+        slicers.append(slice(0, nele, 1))
+        shape.append(nele)
+    sub_tensors = list()
+    for cid in range(chunk_num):
+        slicers[axis] = chunks[cid]
+        shape[axis] = chunks[cid].stop - chunks[cid].start
+        sub_tensors.append(tensor.select(
+            indmap = tuple(slicers),
+            valmap = None,
+            shape = shape
+        ))
+    return sub_tensors
+
+
+def split_value(tensor: IRSubTensor, chunk_num: int):
 
     # full shape
     shape_slicer = list()

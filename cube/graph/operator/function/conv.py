@@ -8,6 +8,7 @@ class IRConv2D(IRFwOperation):
 
     def __init__(self, signature: str, inputs: List[IRTensor], name: str,
                  **kwargs):
+        signature = 'cube.runtime.function.conv2d'
         assert len(inputs) == 3, "Expected only input, weight, bias as inputs"
         assert len(kwargs) == 4, "Expected 4 kwargs: stride, padding, dialation, groups"
         super().__init__(name, signature, 3, 1)
