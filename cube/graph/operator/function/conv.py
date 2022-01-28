@@ -30,8 +30,8 @@ class IRConv2D(IRFwOperation):
         dilation = self.kwargs['dilation']
         dH = self.inputs(1).shape[2]
         dW = self.inputs(1).shape[3]
-        oH = (iH + 2 * padding[0] - dilation[0] * (dH - 1) - 1) // stride[0] + 1
-        oW = (iW + 2 * padding[1] - dilation[1] * (dW - 1) - 1) // stride[1] + 1
+        oH = (iH + padding[0] + padding[1] - dilation[0] * (dH - 1) - 1) // stride[0] + 1
+        oW = (iW + padding[2] + padding[3] - dilation[1] * (dW - 1) - 1) // stride[1] + 1
         shape = [N, oC, oH, oW]
         self.outputs(0).shape = shape
         return True

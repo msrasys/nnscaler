@@ -452,11 +452,13 @@ class IRAdapter(IRCell):
                     break
             # cannot merge or add
             if out is None:
-                print(f'failed tensor: {dst_tensor}')
+                print(f'failed tensor: {dst_tensor.extra_repr()}')
                 print(f'ptensor:')
                 for tensor in dst_tensor.parent.ptensors:
-                    print(f'node-{tensor._cell._id}: {tensor}')
-                print(f'intersections: {intersections}')
+                    print(f'node-{tensor._cell._id}: {tensor.extra_repr()}')
+                print('intersections:')
+                for tensor in intersections:
+                    print(f'{tensor.extra_repr()}')
                 raise RuntimeError(f"Merge plan of tensor {dst_tensor} not found")
         return prims
 

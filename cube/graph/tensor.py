@@ -189,6 +189,66 @@ class IndexMap:
                 raise NotImplementedError(f"not supported for differnt steps")
         return IndexMap(tuple(slices))
 
+    def __sub__(self, other) -> Optional[List]:
+        """
+        Get the remaining part.
+        We reuqire other should completely inside this tensor
+        and the remaining part should be only one tile, else
+        will return None
+
+        Args:
+            other: IndexMap
+
+        Returns:
+            IndexMap for the remaining part
+        """
+        if not isinstance(other, IndexMap):
+            raise TypeError("Expected IndexMap")
+        if self.ndims != other.ndims:
+            return None
+        dim_common: List[List[slice]] = [list() for _ in range(self.ndims)]
+        dim_differ: List[List[slice]] = [list() for _ in range(self.ndims)]
+        for dim, (slicer1, slicer2) in enumerate(zip(self.get(), other.get())):
+            # self indices
+            start1, stop1 = slicer1.start, slicer1.stop
+            step1 = slicer1.step if slicer1.step else 1
+            # other indices
+            start2, stop2 = slicer2.start, slicer2.stop
+            step2 = slicer2.step if slicer2.step else 1
+            if step1 != 1 or step2 != 1:
+                return None
+            # no intersection
+            if min(stop1, stop2) <= max(start1, start2):
+                return None
+            # set common
+            start = max(start1, start2)
+            stop = min(stop1, stop2)
+            dim_common[dim].append(slice(start, stop, step1))
+            # set difference
+            if start1 == start2:
+                if stop2 < stop1:
+                    dim_differ[dim].append(slice(stop2, stop1, step1))
+            elif stop1 == stop2:
+                if start1 < start2:
+                    dim_differ.append(slice(start1, start2, step1))
+            else:
+                raise NotImplementedError("Multipe indexmap is not supported")
+        indmaps = list()
+        splitdim = set()
+        slices = list()
+        for dim in range(self.ndims):
+            common = dim_common[dim]
+            differ = dim_differ[dim]
+            if len(common) + len(differ) != 1:
+                raise NotImplementedError("Multipe indexmap is not supported")
+            if len(differ) == 1:
+                splitdim.add(dim)
+                slices.append(differ[0])
+            else:
+                slices.append(common[0])
+        indmaps.append(IndexMap(tuple(slices)))
+        return indmaps
+
     def __repr__(self):
         dscp = repr(self._indices)
         return dscp
@@ -689,6 +749,20 @@ class IRSubTensor(IRTensor):
             else:
                 raise NotImplementedError("Customized IRTensor not support")
         return None
+
+    def difference(self, other):
+        """
+        Get differene part of sub-tensor
+
+        Currently this requires tensor to be subset
+
+        Args:
+            other: IRSubTensor
+
+        Returns:
+            None for fail
+        """
+        pass
 
     def __repr__(self):
         anno = 't'
