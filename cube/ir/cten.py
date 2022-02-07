@@ -565,6 +565,8 @@ class IRTensor:
 
     @property
     def shape(self):
+        if self._shape is None:
+            return []
         return copy.copy(self._shape)
 
     @shape.setter

@@ -4,13 +4,13 @@ import torch
 import torch.nn.functional as F
 import time
 
-torch.set_default_tensor_type(torch.DoubleTensor)
+# torch.set_default_tensor_type(torch.DoubleTensor)
 
 import cube
 from examples.poisson.policy.naive import PAS
 
 """
-OMP_NUM_THREADS=4 torchrun --standalone \
+OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=2 \
     --nnodes=1 \
     examples/poisson/sci.py
@@ -89,7 +89,7 @@ def train_loop():
     model = ScientificModel()
     model = cube.SemanticModel(model, input_shapes=tuple(varloader.shapes),)
 
-    @cube.compile(model=model, dataloader=varloader, PAS=PAS)
+    @cube.compile(model=model, dataloader=varloader, PAS=PAS, override=True)
     def train_iter(model, dataloader):
         r0, p, phi, filter = next(dataloader)
         r0, p, phi, r1_sum = model(r0, p, phi, filter)

@@ -25,6 +25,14 @@ class LogicTranslator:
                 bnode = node.mirror
                 if bnode not in graph.nodes():
                     IRCell.make_pair(node, None)
+                    for input in node.inputs():
+                        if isinstance(input, IRSubTensor):
+                            input.grad = None
+                            input.requires_grad = False
+                    for output in node.outputs():
+                        if isinstance(output, IRSubTensor):
+                            output.grad = None
+                            output.requires_grad = False
         return graph
 
     @staticmethod
