@@ -9,8 +9,11 @@ def conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tenso
     input:  N  iC H  W
     weight: oC iC dH dW
     bias:   oC
-    padding: int, List[int], e.g., 1, [1, 1], [1, 0, 1, 0]
+    padding: List[int, int, int, int]: [Htop, Hbottom, Wtop, Wbottom] or
+             List[int, int]: [Hside, Wside]
     """
+    # switch H and W to match torch.nn.functional.pad
+    padding = padding[len(padding) // 2:] + padding[0:len(padding) // 2]
     input = TorchF.pad(input, padding, 'constant', 0)
     return TorchF.conv2d(input, weight, bias, stride=stride, dilation=dilation, groups=groups)
 

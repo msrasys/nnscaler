@@ -102,7 +102,7 @@ class HaloSplitConv2D(GenericDistAlgo):
             if not attr in config:
                 raise KeyError("Expected idx, dim, num in the config")
         node: IRConv2D = self.node
-        H, W = node.inputs(0).shape[2:]
+        oH, oW = node.outputs(0).shape[2:]
         idx: int = config['idx']
         dim: int = config['dim']
         num: int = config['num']
@@ -115,11 +115,11 @@ class HaloSplitConv2D(GenericDistAlgo):
             raise NotImplementedError("Splitting on dilation != [1,1] is not supported")
         # split H
         if (idx, dim) == (0, 2):
-            return H % num == 0
+            return oH % num == 0
         # split W
         if (idx, dim) == (0, 3):
-            return W % num == 0
-    
+            return oW % num == 0
+
     def instantiate(self, config: Dict):
         if not self.satisfy(config):
             return None
@@ -139,15 +139,19 @@ class HaloSplitConv2D(GenericDistAlgo):
             # input and padding
             slicers = list()
             pads = list()
-            for idx in range(num):
-                # input
-                start = max(0, H // num * idx - dH + 1)
-                stop = min(H, H // num * (idx + 1) + dH - 1)
-                slicers.append(slice(start, stop, 1))
+            start = 0 - padding[0]
+            for cid in range(num):
                 # padding
-                padl = padding[0] if start == 0 else 0
-                padr = padding[1] if stop == H else 0
+                padl = padding[0] if cid == 0 else 0
+                padr = padding[1] if cid == num - 1 else 0
                 pads.append([padl, padr, padding[2], padding[3]])
+                # input  -- FIXME: only work for stride=[1,1]
+                chunkH = oH // num + dilation[0] * (dH - 1)
+                stop = start + chunkH - padr
+                slicers.append(slice(max(0, start), min(H, stop)))
+                start = stop - dilation[0] * (dH - 1)
+                # start = 0 if cid == 0 else 1023
+                # stop = 1025 if cid == 0 else H
             inputs = split_axis_custom(node.inputs(0), axis=dim, chunks=slicers)
             # weight
             weights = [node.inputs(1)] * num
@@ -156,12 +160,7 @@ class HaloSplitConv2D(GenericDistAlgo):
             # padding
             pads.append([padl, padr, padding[2], padding[3]])
             # outputs
-            slicers = list()
-            for idx in range(num):
-                start = start = max(0, oH // num * idx - dH + 1)
-                stop = min(oH, oH // num * (idx + 1) + dH - 1)
-                slicers.append(slice(start, stop, 1))
-            outputs = split_axis_custom(node.outputs(0), axis=dim, chunks=slicers)
+            outputs = split_axis(node.outputs(0), axis=dim, chunk_num=num)
         # split W
         if (idx, dim) == (0, 1):
             raise NotImplementedError("Split on W is not supported yet")
