@@ -23,7 +23,8 @@ class Block:
     def __exit__(self, exc_type, exc_value, exc_tb):
         # add indent for function block
         for idx in range(1, len(self.code)):
-            self.code[idx] = '\t' + self.code[idx]
+            # use 4 space as indent
+            self.code[idx] = '    ' + self.code[idx]
         if not exc_tb is None:
             print('Error detected in function block')
 

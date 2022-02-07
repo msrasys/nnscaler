@@ -1,6 +1,7 @@
 from typing import Callable, Tuple, Union, Optional
 import torch
 import time
+import os
 
 import cube
 
@@ -59,7 +60,7 @@ class SemanticModel:
 
 
 def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
-            PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None):
+            PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None, override = True):
     """
     AI Scientist calls like:
 
@@ -118,6 +119,18 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
     def decorator(fn: Callable) -> Callable:
         filename = 'gencode{}.py'
         batch_size = torch.tensor([-1], dtype=torch.int).cuda()
+
+        if not override and os.path.exists(filename.format(myrank)):
+            filename = filename.format(myrank)
+            # TODO: set batch size
+            print('warning: dataloader batch size stay as default.')
+            # load module code
+            print_each_rank(f'loading existed module from {filename} ...')
+            model.load_module(filename)
+            # load schedule code
+            print_each_rank(f'loading existed schedule from {filename} ...')
+            return _load_tschedule_fn(filename)
+
         if myrank == 0:
 
             compile_start = time.time()
