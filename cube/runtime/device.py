@@ -13,9 +13,6 @@ class DeviceGroup:
         def __init__(self):
             torch.distributed.init_process_group(
                 backend='nccl',
-                init_method='env://',
-                # world_size=device_num,
-                # init_method='tcp://' + '{master_ip}:{port}'.format(master_ip=master_ip, port=port)
             )
             self.rank = torch.distributed.get_rank()
             self.world_size = torch.distributed.get_world_size()

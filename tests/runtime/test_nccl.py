@@ -1,12 +1,13 @@
 
 """
 Single node usage:
-e.g., 8 GPUs
-python -m torch.distributed.launch --nproc_per_node=4 test_nccl.py
-Multi-node usage:
-e.g., 2-node each with 8 GPUs
-python -m torch.distributed.launch --nproc_per_node=8 --node_rank=0 --master_port=6000 --master_addr='master ip iddress' --nnodes=2 test_nccl.py
-python -m torch.distributed.launch --nproc_per_node=8 --node_rank=1 --master_port=6000 --master_addr='master ip iddress' --nnodes=2 test_nccl.py
+e.g., 4 GPUs
+
+OMP_NUM_THREADS=4 torchrun --standalone \
+    --nproc_per_node=8 \
+    --nnodes=1 \
+    tests/runtime/test_nccl.py
+
 """
 
 import torch
@@ -62,11 +63,11 @@ def test_allgather(size, local_rank):
     toc = time.perf_counter()
 
 
-def benchmark(args):
+def benchmark(args, local_rank):
     size = args.begin
     while size <= args.end:
-        # test_allgather(size * 1024 * 1024, args.local_rank)
-        test_nccl(size * 1024 * 1024, args.local_rank)  # MB to B
+        # test_allgather(size * 1024 * 1024, local_rank)
+        test_nccl(size * 1024 * 1024, local_rank)  # MB to B
         size *= 2
     print_each_rank('test on nccl is done')
 
@@ -78,12 +79,12 @@ if __name__ == '__main__':
                         help='start message size in MB')
     parser.add_argument('--end', type=int, default=64,
                         help='end message size in MB')
-    parser.add_argument('--local_rank', type=int, required=True,
-                        help='specified by torch.distributed.launch')
     args = parser.parse_args()
 
+    print('> initializing distributed environ...')
     torch.distributed.init_process_group(backend='nccl')
-    print_each_rank('local rank-{} launches'.format(args.local_rank))
+    local_rank = int(os.environ.get('LOCAL_RANK'))
+    print_each_rank('local rank-{} launches'.format(local_rank))
 
-    torch.cuda.set_device(args.local_rank)
-    benchmark(args)
+    torch.cuda.set_device(local_rank)
+    benchmark(args, local_rank)
