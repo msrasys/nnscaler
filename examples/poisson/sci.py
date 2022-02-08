@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 import time
 
-# torch.set_default_tensor_type(torch.DoubleTensor)
+torch.set_default_tensor_type(torch.DoubleTensor)
 
 import cube
 from examples.poisson.policy.naive import PAS

@@ -108,6 +108,8 @@ class HaloSplitConv2D(GenericDistAlgo):
         num: int = config['num']
         stride = node.kwargs['stride']
         dilation = node.kwargs['dilation']
+        if dim not in [2, 3]:
+            return False
         # FIXME: stride
         if stride != [1, 1]:
             raise NotImplementedError("Splitting on stride != [1,1] is not supported")
@@ -157,13 +159,31 @@ class HaloSplitConv2D(GenericDistAlgo):
             weights = [node.inputs(1)] * num
             # bias
             bias = [node.inputs(2)] * num
-            # padding
-            pads.append([padl, padr, padding[2], padding[3]])
             # outputs
             outputs = split_axis(node.outputs(0), axis=dim, chunk_num=num)
         # split W
-        if (idx, dim) == (0, 1):
-            raise NotImplementedError("Split on W is not supported yet")
+        if (idx, dim) == (0, 3):
+            # input and padding
+            slicers = list()
+            pads = list()
+            start = 0 - padding[2]
+            for cid in range(num):
+                # padding
+                padt = padding[2] if cid == 0 else 0
+                padb = padding[3] if cid == num - 1 else 0
+                pads.append([padding[0], padding[1], padt, padb])
+                # input  -- FIXME: only work for stride=[1,1]
+                chunkH = oW // num + dilation[0] * (dH - 1)
+                stop = start + chunkH - padb
+                slicers.append(slice(max(0, start), min(H, stop)))
+                start = stop - dilation[0] * (dH - 1)
+            inputs = split_axis_custom(node.inputs(0), axis=dim, chunks=slicers)
+            # weight
+            weights = [node.inputs(1)] * num
+            # bias
+            bias = [node.inputs(2)] * num
+            # outputs
+            outputs = split_axis(node.outputs(0), axis=dim, chunk_num=num)
         sub_nodes = list()
         for i, w, b, pad, o in zip(inputs, weights, bias, pads, outputs):
             conv = IRConv2D(node.signature, [i, w, b], node.name,
