@@ -39,8 +39,9 @@ class ScriptModuleParser:
 
         # handle graph input -- Assuming all the inputs are tensors
         input_var_name = [input.debugName() for input in module.graph.inputs()]
+        kDefaultType = DType2IRDType.map(torch.get_default_dtype())
         for index, var_name in enumerate(input_var_name[1:]): # omit self
-            frame.add_var(var_name, IRFullTensor(name=var_name, requires_grad=False), graph_arg=index)
+            frame.add_var(var_name, IRFullTensor(name=var_name, requires_grad=False, dtype=kDefaultType), graph_arg=index)
         input_val = [frame.get_var(var_name) for var_name in input_var_name[1:]]
 
         # handle input shape
@@ -397,7 +398,8 @@ class ScriptModuleParser:
             dtype = output.type().str()
             var_name = output.debugName()
             if dtype == 'Tensor':
-                ir_tensor = IRFullTensor(name=var_name)
+                kDefaultType = DType2IRDType.map(torch.get_default_dtype())
+                ir_tensor = IRFullTensor(name=var_name, dtype=kDefaultType)
                 tuple_outs.append(ir_tensor)
                 frame.add_var(var_name, ir_tensor)
             else:

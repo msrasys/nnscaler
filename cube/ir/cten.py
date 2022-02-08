@@ -235,11 +235,12 @@ class IRCell:
             # set tensor dst
             val.attach_cell(self)
             # set input value dtype
-            if self._dtype != IRDType.unknown:
-                val.dtype = self._dtype
-            # set cell dtype
-            elif val.dtype != IRDType.unknown:
+            if self._dtype == IRDType.unknown:
                 self._dtype = val.dtype
+                for output in self.outputs():
+                    if isinstance(output, IRTensor):
+                        output.dtype = self._dtype
+            val.dtype = self._dtype
         self._inputs[input_index] = val
         return val
 
@@ -259,11 +260,7 @@ class IRCell:
             val = copy.copy(val)
             val.attach_cell(self)
             # set output value dtype
-            if self._dtype != IRDType.unknown:
-                val.dtype = self._dtype
-            # set cell dtype
-            elif val.dtype != IRDType.unknown:
-                self._dtype = val.dtype
+            val.dtype = self._dtype
         self._outputs[output_index] = val
         return val
 
