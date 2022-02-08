@@ -1,7 +1,7 @@
 
 ```
 function PADataParallel(Graph G, Resource R, Config C):
-    for node in G.nodes() do
+    for node in G.nodes do
         algorithm <- getPartitionAlgo(node, 'data parallelism')
         subnodes <- G.partition(node, algorithm, C.data_parallel_size)
         for dp_idx in 0 to C.data_parallel_size do
@@ -11,7 +11,7 @@ function PADataParallel(Graph G, Resource R, Config C):
 
 
 function PATensorParallel(Graph G, Resource R, Config C):
-    for node in G.nodes() do
+    for node in G.nodes do
         algorithm <- getPartitionAlgo(node, 'tensor parallelism')
         subnodes <- G.partition(node, algorithm, C.tensor_parallel_size)
         for tp_idx in 0 to C.tensor_parallel_size do
@@ -22,16 +22,16 @@ function PATensorParallel(Graph G, Resource R, Config C):
 
 function PAPipelineParallel(Graph G, Resource R, Config C):
 
-    for node in G.nodes() do
+    for node in G.nodes do
         algorithm <- getPartitionAlgo(node, 'data parallelism')
         G.partition(node, algorithm, C.num_micro_batches)
 
-    for node in G.nodes() do
-        stage_id <- getStageID(node, G, C.num_stages) // policy
+    for node in G.nodes do
+        stage_id <- getStageID(node, G, C.pipeline_parallel_size) // policy
         rank <- mapStageToRank(stage_id, R)
         G.assign(node, stage)
 
-    groupStageAndMicroBatch(G, C.num_stages, C.num_micro_batches)
+    groupStageAndMicroBatch(G, C.pipeline_parallel_size, C.num_micro_batches)
     return G
 
 
@@ -40,19 +40,19 @@ function PSPipelineParallel(Graph G, Resource R, Config C):
     sequence <- EmptyArray[]
     // warmup phase
     for micro_batch_id in 0 to C.num_micro_batches do
-        for stage_id in 0 to C.num_stages - micro_batch_id do
+        for stage_id in 0 to C.pipeline_parallel_size - micro_batch_id do
             node <- getForwardStage(G, micro_batch_id, stage_id)
             arrayPush(sequence, node)
     # steady and cooldown phase
     for micro_batch_id in 0 to C.num_micro_batches do
         // enqueue backward
-        for stage_id in C.num_stages to 0 do
+        for stage_id in C.pipeline_parallel_size to 0 do
             node <- getBackwardStage(G, micro_batch_id, stage_id)
             arrayPush(sequence, node)
         // enqueue forward
-        for stage_id in 0 to C.num_stages do
-            mid <- micro_batch_id + C.num_stages - stage_id
-            if mid <= C.num_stages then
+        for stage_id in 0 to C.pipeline_parallel_size do
+            mid <- micro_batch_id + C.pipeline_parallel_size - stage_id
+            if mid <= C.pipeline_parallel_size then
                 node <- getForwardStage(G, mid, stage_id)
                 arrayPush(sequence, node)
     G.schedule(sequence)
@@ -60,15 +60,32 @@ function PSPipelineParallel(Graph G, Resource R, Config C):
 
 
 function Megatron(Graph G, Resource R, Config C):
-    // Resource split
-    R_data, R_pipe, R_tensor <- splitResource(R, C)
-    // split to stages
-    G <- PAPipelineParallel(G, R_pipe, C)
-    // inner stage: data + tensor parallelism
-    for stage in G.nodes:
-        PADataParallel(stage, R_data, C)
-        PATensorParallel(stage, R_tensor, C)
-    // inter stage: 1F1B scheduling
-    G <- PSPipelineParallel(G, R_pipe, C)
+    // Graph    G: Dataflow graph containing operators as nodes
+    // Resource R: Environment Resource including GPU numbers and topology
+    // Config   C: policy user configuration including:
+    //               data_parallel_size,
+    //               tensor_parallel_size,
+    //               pipeline_parallel_size,
+    //               num_micro_batches
+
+    // Resource split: group resources
+    Rs <- splitResource(R, C)
+    R_pp <- getResourceForPP(Rs, C)
+
+    // split to stages and micro-batches
+    G <- PAPipelineParallel(G, R_pp, C)
+
+    // inter / inner stage scheduling: 1F1B scheduling
+    G <- PSPipelineParallel(G, R_pp, C)
+
+    // inner stage parallelism: hybrid parallelism
+    for stage in G.nodes do
+        // data parallelism
+        R_dp <- getResourceForDP(Rs, stage_id)
+        PADataParallel(stage, R_dp, C)
+        // tensor parallelism
+        R_tp <- getResourceForTP(Rs, stage_id)
+        PATensorParallel(stage, R_tp, C)
+
     return G
 ```
