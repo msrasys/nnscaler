@@ -5,8 +5,7 @@ function PADataParallel(Graph G, Resource R, Config C):
         algorithm <- getPartitionAlgo(node, 'data parallelism')
         subnodes <- G.partition(node, algorithm, C.data_parallel_size)
         for dp_idx in 0 to C.data_parallel_size do
-            rank <- mapDpToRank(dp_idx, R)
-            G.assign(subnodes[dp_idx], rank)
+            G.assign(subnodes[dp_idx], dp_idx)
     return G
 
 
@@ -15,8 +14,7 @@ function PATensorParallel(Graph G, Resource R, Config C):
         algorithm <- getPartitionAlgo(node, 'tensor parallelism')
         subnodes <- G.partition(node, algorithm, C.tensor_parallel_size)
         for tp_idx in 0 to C.tensor_parallel_size do
-            rank <- mapTpToRank(tp_idx, R)
-            G.assign(subnodes[tp_idx], rank)
+            G.assign(subnodes[tp_idx], tp_idx)
     return G
 
 
@@ -28,8 +26,7 @@ function PAPipelineParallel(Graph G, Resource R, Config C):
 
     for node in G.nodes do
         stage_id <- getStageID(node, G, C.pipeline_parallel_size) // policy
-        rank <- mapStageToRank(stage_id, R)
-        G.assign(node, stage)
+        G.assign(node, stage_id)
 
     // group to a sub-graph (block): A microbatch on one stage 
     groupStageAndMicroBatch(G, C.pipeline_parallel_size, C.num_micro_batches)
