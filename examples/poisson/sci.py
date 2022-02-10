@@ -11,7 +11,7 @@ from examples.poisson.policy.naive import PAS
 
 """
 OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=2 \
+    --nproc_per_node=4 \
     --nnodes=1 \
     examples/poisson/sci.py
 """
