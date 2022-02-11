@@ -1,3 +1,4 @@
+from email.headerregistry import Group
 from typing import Callable, Tuple, Union, Optional
 import torch
 import time
@@ -13,7 +14,7 @@ from cube.logics.pool import SchedulePool
 from cube.logics.translator import LogicTranslator
 
 from cube.execplan import ExectuionPlan
-from cube.execplan.planpass.grouping import Grouping
+from cube.execplan.planpass.grouping import Grouping, GroupingAdapter
 from cube.execplan.planpass.fusion import P2PFusion
 
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
@@ -173,6 +174,11 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             execplan = P2PFusion.apply(execplan)
             span = time.time() - start
             print('> planpass on p2pfusion operations: {:.2f} s'.format(span))
+
+            start = time.time()
+            execplan = GroupingAdapter.apply(execplan)
+            span = time.time() - start
+            print('> planpass on grouping adapters : {:.2f} s'.format(span))
 
             # execplan.draw(outfile='execplan.png')
 

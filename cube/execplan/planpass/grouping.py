@@ -2,10 +2,12 @@
 Operation grouping
 """
 
+from sqlite3 import adapt
 from typing import List, Dict, Tuple
 
 from cube.execplan import ExectuionPlan
 from cube.execplan.planpass.planpass import PlanPass
+from cube.graph.adapter.adapter import IRAdapter
 from cube.graph.operator.operator import IRBpOperation, IRFwOperation
 from cube.ir.cten import IRCell
 
@@ -112,3 +114,57 @@ class Grouping(PlanPass):
         if idx != max(pidx) + 1 and idx != min(pidx) - 1:
             return False
         return True
+
+
+class GroupingAdapter(PlanPass):
+
+    @staticmethod
+    def apply(execplan: ExectuionPlan) -> ExectuionPlan:
+        for devid in execplan.devices():
+            groups: List[List[IRAdapter]] = GroupingAdapter.consecutive(
+                execplan.sequence(devid))
+            for adapters in groups:
+                if len(adapters) <= 1:
+                    continue
+                sprims, tprims, mprims = list(), list(), list()
+                inputs, idevices = list(), list()
+                outputs, odevices = list(), list()
+                for adapter in adapters:
+                    sprims += adapter.prims(move=False, merge=False, coll=False)
+                    tprims += adapter.prims(select=False, merge=False)
+                    mprims += adapter.prims(select=False, move=False, coll=False)
+                    for idx, input in enumerate(adapter.inputs()):
+                        if devid in adapter.idevice(idx):
+                            if input not in inputs:
+                                inputs.append(input)
+                                idevices.append(adapter.idevice(idx))
+                    for idx, output in enumerate(adapter.outputs()):
+                        if devid in adapter.odevice(idx):
+                            if output not in outputs:
+                                outputs.append(output)
+                                odevices.append(adapter.odevice(idx))
+                prims = sprims + tprims + mprims
+                fused_adapter = IRAdapter(prims,
+                    inputs = inputs, idevices = idevices,
+                    outputs = outputs, odevices = odevices)
+                start = execplan.sequence(devid).index(adapters[0])
+                end = execplan.sequence(devid).index(adapters[-1])
+                for _ in range(end - start + 1):
+                    execplan.at(devid).pop(start)
+                execplan.at(devid).insert(start, fused_adapter)
+        return execplan
+
+    @staticmethod
+    def consecutive(seq: List[IRCell]) -> List[List[IRAdapter]]:
+        group = list()
+        curr = list()
+        curr_idx = -1
+        for idx, node in enumerate(seq + [None]):
+            if isinstance(node, IRAdapter) and idx == curr_idx + 1:
+                curr.append(node)
+            else:
+                if len(curr) != 0:
+                    group.append(curr)
+                curr = list()
+            curr_idx = idx
+        return group
