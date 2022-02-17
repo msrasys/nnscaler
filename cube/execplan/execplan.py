@@ -1,4 +1,5 @@
-from typing import List, Optional
+from ast import Call
+from typing import Callable, List, Optional
 import copy
 from cube.graph.adapter.adapter import IRAdapter
 from cube.graph.operator.operator import IRBpOperation, IRFwOperation
@@ -73,7 +74,11 @@ class ExectuionPlan:
             raise TypeError("Expected a list of Cell")
         self.device_seq[device_id] = seq
 
-    def draw(self, spans: Optional[List[int]] = None, outfile='./execplan.png'):
+    def analyze(self,
+                map2time: Optional[Callable] = None,
+                map2mem: Optional[Callable] = None,
+                map2name: Optional[Callable] = None,
+                outfile = None):
         """
         Draw the execution timeline.
 
@@ -90,19 +95,50 @@ class ExectuionPlan:
         # timeline [ [ (start_time, end_time), ... ], ... ]
         device_timeline = [list() for _ in range(ndevice)]
         device_nodes = [list() for _ in range(ndevice)]
+        device_mem = [0] * ndevice
+        device_peak_mem = [0] * ndevice
 
-        def map2time(node):
-            if isinstance(node, IRGraph):
-                span = 0
-                for node in node.nodes():
-                    span += map2time(node)
-            if isinstance(node, IRFwOperation):
-                return 1
-            if isinstance(node, IRBpOperation):
-                return 2
-            if isinstance(node, IRAdapter):
-                return 0.5
-            return 0
+        if map2time is None:
+            def map2time(node):
+                if isinstance(node, IRGraph):
+                    span = 0
+                    for node in node.nodes():
+                        span += map2time(node)
+                if isinstance(node, IRFwOperation):
+                    return 1
+                if isinstance(node, IRBpOperation):
+                    return 2
+                if isinstance(node, IRAdapter):
+                    return 0.5
+                return 0
+        
+        if map2mem is None:
+            def map2mem(node):
+                if isinstance(node, IRGraph):
+                    peak_mem = 0
+                    curr_mem = 0
+                    for node in node.nodes():
+                        curr_mem += map2mem(node)
+                    peak_mem = max(curr_mem, peak_mem)
+                if isinstance(node, IRFwOperation):
+                    return 1
+                if isinstance(node, IRBpOperation):
+                    return -1
+                return 0
+
+        if map2name is None:
+            def map2name(node):
+                if isinstance(node, IRGraph):
+                    if all([isinstance(n, IRFwOperation) for n in node.nodes()]):
+                        return f'f{node._id}'
+                    if all([isinstance(n, IRBpOperation) for n in node.nodes()]):
+                        if node.mirror is not None:
+                            return f'b{node.mirror._id}'
+                if isinstance(node, IRFwOperation):
+                    return f'f{node._id}'
+                if isinstance(node, IRBpOperation):
+                    return f'b{node.mirror._id}'
+                return str(node._id)
 
         def map2color(node):
             if isinstance(node, IRGraph):
@@ -114,25 +150,14 @@ class ExectuionPlan:
             if isinstance(node, IRAdapter):
                 return '#70AD47'  # excel green
 
-        def map2name(node):
-            if isinstance(node, IRGraph):
-                if all([isinstance(n, IRFwOperation) for n in node.nodes()]):
-                    return f'f{node._id}'
-                if all([isinstance(n, IRBpOperation) for n in node.nodes()]):
-                    if node.mirror is not None:
-                        return f'b{node.mirror._id}'
-            return str(node._id)
-
-        if spans is None:
-            print("Using default timing: fwop=1, bwop=2, adapter=0.1")
-            spans = list()
-            for node in self.graph.nodes():
-                span = map2time(node)
-                spans.append(span)
-
         graph = self.graph
-        for node, span_time in zip(self.graph.nodes(), spans):
+        for node in self.graph.nodes():
+            span, mem = map2time(node), map2mem(node)
             for device in node.device:
+                # memory
+                device_mem[device] += mem
+                if device_peak_mem[device] < device_mem[device]:
+                    device_peak_mem[device] = device_mem[device]
                 # tight execution if no dependency
                 if len(device_timeline[device]) == 0:
                     start_time = 1
@@ -148,17 +173,19 @@ class ExectuionPlan:
                         if graph.happen_before(other_node, node):
                             start_time = max(start_time, end_time)
                             break
-                device_timeline[device].append((start_time, start_time + span_time))
+                device_timeline[device].append((start_time, start_time + span))
                 device_nodes[device].append(node)
+
+        max_time = max(
+            [tline[-1][1] for tline in device_timeline if len(tline) != 0]
+        )
+        max_mem = max(device_peak_mem)
 
         # draw the timeline
         if outfile is not None:
             import matplotlib.pyplot as plt
             from matplotlib.patches import Rectangle
 
-            max_time = max(
-                [tline[-1][1] for tline in device_timeline if len(tline) != 0]
-            )
             plt.rcParams['figure.figsize'] = (4.0 * max_time // ndevice, 4.0)
             fig, ax = plt.subplots()
             renderer = fig.canvas.get_renderer()
@@ -197,7 +224,7 @@ class ExectuionPlan:
                     for fs in range(40, 1, -2):
                         txt.set_fontsize(fs)
                         tbox = txt.get_window_extent(renderer)
-                        if tbox.x0 >= rbox.x0 and tbox.x1 <= rbox.x1 and tbox.y0 >= rbox.y0 and tbox.y1 <= rbox.y1:
+                        if tbox.x0 > rbox.x0 and tbox.x1 < rbox.x1 and tbox.y0 > rbox.y0 and tbox.y1 < rbox.y1:
                             break
                     fontsize = min(fontsize, fs)
                     txts.append(txt)
@@ -216,6 +243,7 @@ class ExectuionPlan:
             plt.tight_layout()
             plt.savefig(outfile)
 
+        return max_time, max_mem
 
     def __repr__(self):
         dscp = f'Execution Plan ({self.graph.name}):\n'

@@ -359,7 +359,11 @@ class IREinops(IRFwOperation):
                             if len(unused_annos) < span:
                                 raise RuntimeError("Too many introduced dimensions")
                             for dim in range(span):
-                                expand_dims.append(EinDim([unused_annos[dim]]))
+                                if '*' not in anno.anno.split('->')[-1]:
+                                    anno_dim = EinDim([unused_annos[dim] + '+'])
+                                else:
+                                    anno_dim = EinDim([unused_annos[dim]])
+                                expand_dims.append(anno_dim)
                         if len(expand_dims) != span:
                             return False, None, None
                         anno.inputs[idx] = anno.inputs[idx][:start] + expand_dims + anno.inputs[idx][start+1:]

@@ -377,6 +377,11 @@ class IRGraph(IRCell):
                     bnode.update()
                     self.attach(bnode, idx)
                 updated.add(fnode._id)
+        # update device
+        for fnode in fnodes:
+            fnode.device = op.device
+            if isinstance(fnode.mirror, IRCell):
+                fnode.mirror.device = op.device
         self.reset_dependency()
         return fnodes
 
