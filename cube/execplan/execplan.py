@@ -90,7 +90,6 @@ class ExectuionPlan:
             outfile:
                 the output file name
         """
-        self.graph.reset_dependency()
         ndevice = len(self.devices())
         # timeline [ [ (start_time, end_time), ... ], ... ]
         device_timeline = [list() for _ in range(ndevice)]
@@ -170,7 +169,7 @@ class ExectuionPlan:
                         continue
                     for nid, (_, end_time) in enumerate(timeline[::-1]):
                         other_node = dev_seq[::-1][nid]
-                        if graph.happen_before(other_node, node):
+                        if other_node in node.predecessors():
                             start_time = max(start_time, end_time)
                             break
                 device_timeline[device].append((start_time, start_time + span))
@@ -185,7 +184,7 @@ class ExectuionPlan:
         if outfile is not None:
             import matplotlib.pyplot as plt
             from matplotlib.patches import Rectangle
-
+            plt.close('all')
             plt.rcParams['figure.figsize'] = (4.0 * max_time // ndevice, 4.0)
             fig, ax = plt.subplots()
             renderer = fig.canvas.get_renderer()

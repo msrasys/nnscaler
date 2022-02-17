@@ -6,6 +6,8 @@ from cube.graph.operator.operator import IRBpOperation, IRDataOperation
 from cube.ir.cten import IRCell
 from cube.execplan import ExectuionPlan
 
+from multiprocessing import Pool
+
 
 def ready_emit_set(remain: List[IRCell], seq: List[IRCell]):
     """
@@ -48,11 +50,22 @@ def topo_sequence(nodes: List[IRCell], seq = None):
         seq = seq[:-1]
 
 
-def stage_division(graph: IRGraph, node: IRCell, num_stages: int) -> int:
+def topo_sequence_batch(nodes: List[IRCell], bs=1):
+    seqs = list()
+    for idx, seq in enumerate(topo_sequence(nodes)):
+        seqs.append(seq)
+        if len(seqs) % bs == 0:
+            print(f'dispatch {len(seqs)} seq...')
+            yield seqs
+            seqs = list()
+    if len(seqs) > 0:
+        yield seqs
+
+
+def stage_division(fnodes: List[IRCell], node: IRCell, num_stages: int) -> int:
     """
     Determine stage division
     """
-    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
     num_fnodes = len(fnodes)
     idx = fnodes.index(node)
     stage = min(idx // (num_fnodes // num_stages), num_stages - 1)
@@ -66,8 +79,39 @@ def estimator(execplan: ExectuionPlan, map2time: Callable, map2mem: Callable):
     max_time, max_mem = execplan.analyze(map2time=map2time, map2mem=map2mem)
     return max_time, max_mem
 
+
+def worker(seqs: List[List[IRCell]], bucket_mem: List[int]):
+    def map2time(node: IRCell):
+        if isinstance(node, IRFwOperation):
+            return 1
+        if isinstance(node, IRBpOperation):
+            return 2
+        return 0
+
+    def map2mem(node: IRCell):
+        if isinstance(node, IRFwOperation):
+            return 1
+        if isinstance(node, IRBpOperation):
+            return -1
+        return 0
+
+    bucket_times = list([sys.maxsize for _ in range(len(bucket_mem))])
+    bucket_seqs = [None] * len(bucket_mem)
+    graph = IRGraph([], [], [], 'search')
+    for seq in seqs:
+        graph._nodes = seq
+        # graph.reset_dependency() # this needs as in other process dependency will break
+        execplan = ExectuionPlan(graph)
+        span, mem = execplan.analyze(map2time=map2time, map2mem=map2mem)
+        bucket = bucket_mem.index(mem)
+        if span < bucket_times[bucket]:
+            bucket_times[bucket] = span
+            bucket_seqs[bucket] = copy.copy(seq)
+    return bucket_times, bucket_seqs
+
+
 def PAS(graph: IRGraph, resource):
-    num_microbatch = 4
+    num_microbatch = 8
     num_stages = 4
     fstages = [list() for _ in range(num_microbatch * num_stages)]
 
@@ -87,14 +131,12 @@ def PAS(graph: IRGraph, resource):
 
     # split to micro batches
     for node in fnodes:
-        stage = stage_division(graph, node, num_stages=num_stages)
-        graph.assign(node, stage)
-    for node in fnodes:
-        # partition at batch dimension
+        stage = stage_division(fnodes, node, num_stages=num_stages)
         algo = node.algorithms('dim')
         sub_nodes = graph.partition(
             node, algo, config=dict(idx=0, dim=0, num=num_microbatch))
         for mid, sub_node in enumerate(sub_nodes):
+            graph.assign(sub_node, stage)
             f(mid, stage).append(sub_node)
 
     # pruning #2: symmetric microbatches, make micro-batch id smaller happen earlier
@@ -126,24 +168,53 @@ def PAS(graph: IRGraph, resource):
     bucket_seqs = [None] * len(bucket_mem)
 
     print('start sorting...')
-    for idx, seq in enumerate(topo_sequence(graph.nodes())):
-        # seqrepr = [node._id for node in seq]
-        # print(seqrepr)
-        graph._nodes = seq
-        execplan = ExectuionPlan(graph)
-        span, mem = execplan.analyze(map2time=map2time, map2mem=map2mem)
-        bucket = bucket_mem.index(mem)
-        
-        # execplan.draw(outfile='out.png')
-        # print(span, mem)
-        # input('>>> ')
-        if (idx + 1) % 5000 == 0:
-            print(f'progress: searched {(idx + 1) // 1000}K seqs')
-        
-        if span < bucket_times[bucket]:
-            print(f'find better plan at mem budget {mem}: span: {span}')
-            bucket_times[bucket] = span
-            bucket_seqs[bucket] = copy.copy(seq)
-            execplan.analyze(map2time=map2time, outfile=f'plan.mem{mem}.png')
-    print(f'done search on {idx + 1} sequences')
+
+    nproc = 24
+    worker_samples = 1000
+    pool = Pool(processes=nproc)
+    for idx, seqs in enumerate(topo_sequence_batch(graph.nodes(), bs=nproc * worker_samples)):
+        results = list()
+        for wid in range(nproc):
+            start = min(nproc * worker_samples, worker_samples* wid)
+            stop = min(nproc * worker_samples, start + worker_samples)
+            worker_seqs = seqs[start:stop]
+            results.append(pool.apply_async(worker, (worker_seqs, bucket_mem)))
+        results = map(lambda res: res.get(), results)
+        # merge results
+        for times, res_seqs in results:
+            for mem, (span_new, span_old) in enumerate(zip(times, bucket_times)):
+                if span_new < span_old:
+                    print(f'find better plan at mem budget {mem}: span: {span_new}')
+                    bucket_times[mem] = span_new
+                    bucket_seqs[mem] = res_seqs[mem]
+                    _graph = IRGraph([], [], [], 'search')
+                    _graph._nodes = res_seqs[mem]
+                    execplan = ExectuionPlan(_graph)
+                    execplan.analyze(map2time=map2time, outfile=f'plan.mem{mem}.png')
+        if (idx + 1) % 1 == 0:
+            print(f'progress: searched {(idx + 1) * nproc * worker_samples} K sequences')
+    if len(seqs) != worker_samples:
+        num = idx + len(seqs) / (worker_samples * nproc)
+        print(f'done search on {int(num * nproc * worker_samples)} K sequences')
     assert False
+
+    # _graph = IRGraph([], [], [], 'search')
+    # for idx, seq in enumerate(topo_sequence(graph.nodes())):
+    #     _graph._nodes = seq
+    #     execplan = ExectuionPlan(_graph)
+    #     span, mem = execplan.analyze(map2time=map2time, map2mem=map2mem)
+    #     bucket = bucket_mem.index(mem)
+    #     
+    #     # execplan.draw(outfile='out.png')
+    #     # print(span, mem)
+    #     # input('>>> ')
+    #     if (idx + 1) % 5000 == 0:
+    #         print(f'progress: searched {(idx + 1) // 1000}K seqs')
+    #     
+    #     if span < bucket_times[bucket]:
+    #         print(f'find better plan at mem budget {mem}: span: {span}')
+    #         bucket_times[bucket] = span
+    #         bucket_seqs[bucket] = copy.copy(seq)
+    #         execplan.analyze(map2time=map2time, outfile=f'plan.mem{mem}.png')
+    # print(f'done search on {idx + 1} sequences')
+    # assert False
