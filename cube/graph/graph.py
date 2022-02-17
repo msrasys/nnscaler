@@ -68,6 +68,8 @@ class IRGraph(IRCell):
     def reset_dependency(self):
         """
         Reset the node dataflow dependency
+
+        Note all the predefined control dependencies will be removed.
         """
         for node in self._nodes:
             node.clear_predecessor()
@@ -497,6 +499,24 @@ class IRGraph(IRCell):
                 if self.happen_before(succ_node, node2, skip):
                     return True
             return False
+
+    def add_schedule(self, nodes: List[IRCell]) -> bool:
+        """
+        Add node happen before dependencies according to nodes list order
+        """
+        if not all([isinstance(node, IRCell) for node in nodes]):
+            raise TypeError("Expected List[IRCell")
+        for idx in range(len(nodes) - 1):
+            prev = nodes[idx]
+            post = nodes[idx + 1]
+            if self.happen_before(post, prev):
+                return False
+        for idx in range(len(nodes) - 1):
+            prev = nodes[idx]
+            post = nodes[idx + 1]
+            prev.add_successor(output_index=-1, cell=post)
+            post.add_predecessor(input_index=-1, cell=prev)
+        return True
 
     def set_order(self, seq: List[IRCell]):
         """
