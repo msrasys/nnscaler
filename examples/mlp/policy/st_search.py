@@ -1,4 +1,6 @@
 import copy
+from os import stat
+import time
 from typing import List, Tuple, Dict
 from cube.graph.graph import IRGraph, IRFwOperation
 from cube.graph.operator.operator import IRBpOperation, IRDataOperation
@@ -40,14 +42,27 @@ class Estimator:
         return span
 
 
-class TSampler:
+class Sampler:
     """
     Schedule sampler
     """
     @staticmethod
-    def topo_sequence_batch(nodes: List[IRCell], bs=1):
+    def sample(graph: IRGraph, n_microbatch: int, n_stage: int, n_worker: int, n_sample_per_worker: int):
+        # spatial assignment
+        fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
+        assert n_microbatch * n_stage == len(fnodes), f"{n_microbatch * n_stage} != {len(fnodes)}"
+        for placement in Sampler.spatial(n_microbatch, n_stage, n_stage):
+            assert len(placement) == len(fnodes)
+            print(placement)
+            for fnode, devid in zip(fnodes, placement):
+                graph.assign(fnode, devid)
+            for seqs in Sampler.btemporal(graph.nodes(), bs=n_worker * n_sample_per_worker):
+                yield seqs
+
+    @staticmethod
+    def btemporal(nodes: List[IRCell], bs=1):
         seqs = list()
-        for idx, seq in enumerate(TSampler.topo_sequence(nodes)):
+        for idx, seq in enumerate(Sampler.temporal(nodes)):
             seqs.append(seq)
             if len(seqs) % bs == 0:
                 print(f'dispatch {len(seqs)} seq...')
@@ -57,20 +72,20 @@ class TSampler:
             yield seqs
 
     @staticmethod
-    def topo_sequence(nodes: List[IRCell], seq = None):
+    def temporal(nodes: List[IRCell], seq = None):
         if seq is None:
             seq = list()
         if len(nodes) == 0:
             yield seq
         # initial entry
-        entry_nodes = TSampler.ready_emit_set(remain=nodes, seq=seq)
+        entry_nodes = Sampler.ready_emit_set(remain=nodes, seq=seq)
         if len(entry_nodes) == 0:
             return None
         for node in entry_nodes:
             seq = seq + [node]
             nid = nodes.index(node)
             sub_nodes = nodes[:nid] + nodes[nid+1:]
-            for res in TSampler.topo_sequence(sub_nodes, seq):
+            for res in Sampler.temporal(sub_nodes, seq):
                 if res is None:
                     continue
                 yield res
@@ -97,6 +112,52 @@ class TSampler:
                 ready.append(node)
         return ready
 
+    @staticmethod
+    def spatial(num_microbatch: int, num_stage: int, num_device: int, placement = None):
+        # each device pick num_microbatch * num_stage // num_device blocks
+        per_device_nblocks = num_microbatch * num_stage // num_device
+        # placement each stage placement
+        placement = placement if placement is not None else []
+
+        if len(placement) == num_microbatch * num_stage:
+            bucket_min = [num_microbatch * num_stage] * num_device
+            for nid, devid in enumerate(placement):
+                bucket_min[devid] = min(bucket_min[devid], nid)
+            check = [bucket_min[idx + 1] - bucket_min[idx] for idx in range(num_device - 1)]
+            if min(check) < 0:
+                yield None
+            else:
+                yield placement
+        else:
+            # require strict increasing array [min(bucket) for bucket in buckets]
+            # bucket_min = list(range(num_microbatch * num_stage, num_microbatch * num_stage + num_device + 1))
+            bucket_cnt = [0] * num_device
+            for nid, devid in enumerate(placement):
+                # bucket_min[devid] = min(nid, bucket_min[devid]) if bucket_min[devid] is not None else nid
+                bucket_cnt[devid] += 1
+            for devid in range(num_device):
+                if bucket_cnt[devid] < per_device_nblocks:
+                    placement = placement + [devid]
+                    for seq in Sampler.spatial(num_microbatch, num_stage, num_device, placement):
+                        if seq is None:
+                            continue
+                        yield seq
+                    placement = placement[:-1]
+                # if bucket_cnt[devid] == per_device_nblocks:
+                #     continue
+                # # try to place on devid
+                # new_min = min(bucket_min[devid], len(placement))
+                # if bucket_min[devid + 1] < new_min:
+                #     continue
+                # placement.append(devid)
+                # print(placement)
+                # input(">>>1 ")
+                # if len(placement) == num_microbatch * num_stage:
+                #     yield placement
+                # for seq in Sampler.spatial(num_microbatch, num_stage, num_device, placement):
+                #     yield seq
+                # placement = placement[:-1]
+
 
 class Searcher:
 
@@ -118,8 +179,10 @@ class Searcher:
 
 
 def PAS(graph: IRGraph, resource):
-    num_microbatch = 4
-    num_stages = 4
+    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
+    num_microbatch = len(fnodes)
+    num_stages = len(fnodes)
+    print(f'num-microbatch: {num_microbatch}, num-stages: {num_stages}')
 
     # ============================ micro-batch / stage split ============================
     fstages = [list() for _ in range(num_microbatch * num_stages)]
@@ -130,7 +193,6 @@ def PAS(graph: IRGraph, resource):
         bstage = [fnode.mirror for fnode in fstage][::-1]
         return bstage
 
-    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
     def stage_division(fnodes: List[IRCell], node: IRCell, num_stages: int) -> int:
         """Determine stage division
         """
@@ -147,22 +209,22 @@ def PAS(graph: IRGraph, resource):
         for mid, sub_node in enumerate(sub_nodes):
             graph.assign(sub_node, stage)
             f(mid, stage).append(sub_node)
-    # data operator
-    for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            graph.assign(node, 0)
     # ============================ micro-batch / stage split ============================
 
     # pruning #2: symmetric microbatches, make micro-batch id smaller happen earlier
-    for sid in range(num_stages):
-        fops = list()
-        bops = list()
-        for mid in range(num_microbatch):
-            fops += f(mid, sid)
-            bops += b(mid, sid)
-        assert graph.add_schedule(fops)
-        assert graph.add_schedule(bops)
+    # for sid in range(num_stages):
+    #     fops = list()
+    #     bops = list()
+    #     for mid in range(num_microbatch):
+    #         fops += f(mid, sid)
+    #         bops += b(mid, sid)
+    #     assert graph.add_schedule(fops)
+    #     assert graph.add_schedule(bops)
 
+    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
+    graph = IRGraph([], [], [], 'search')
+    graph._nodes = fnodes + [fnode.mirror for fnode in fnodes[::-1]]
+    graph.reset_dependency()
     Estimator.taging(graph)
 
     # memory (int) -> (time, seq)
@@ -172,7 +234,8 @@ def PAS(graph: IRGraph, resource):
     nproc, worker_samples = 32, 512
     pool = Pool(processes=nproc)
     _graph = IRGraph([], [], [], 'search')
-    for idx, seqs in enumerate(TSampler.topo_sequence_batch(graph.nodes(), bs=nproc * worker_samples)):
+    for idx, seqs in enumerate(Sampler.sample(graph, num_microbatch, num_stages, nproc, worker_samples)):
+        tic = time.time()
         results = list()
         for wid in range(nproc):
             start = worker_samples* wid
@@ -194,9 +257,17 @@ def PAS(graph: IRGraph, resource):
                     _graph._nodes = seq
                     execplan = ExectuionPlan(_graph)
                     execplan.analyze(map2time=Estimator.map2time, outfile=f'plan.mem{mem}.png')
+        toc = time.time()
+        throughput = round(len(seqs) / (toc - tic), 2)
         if (idx + 1) % 1 == 0:
-            print(f'progress: searched {(idx) * nproc * worker_samples + len(seqs)} K sequences')
+            print(f'progress: searched {(idx) * nproc * worker_samples + len(seqs)} sequences, throughput: {throughput} seqs/s')
     if len(seqs) != worker_samples:
         num = idx * nproc * worker_samples + len(seqs)
-        print(f'done search on {num} K sequences')
+        print(f'done search on {num} sequences')
     assert False
+
+
+if __name__ == '__main__':
+    for idx, placement in enumerate(Sampler.spatial(3, 3, 3)):
+        print(placement)
+    print(f'total {idx + 1} seqs')
