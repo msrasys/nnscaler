@@ -58,14 +58,35 @@ class Sampler:
         flatten_nodes = list()
         for seq in micro_seqs:
             flatten_nodes += seq
-        graph._nodes = flatten_nodes
-        for placements in ssampler(n_microbatch, n_stage, n_device):
+        graph = IRGraph(flatten_nodes, [], [], 'search')
+        # graph._nodes = flatten_nodes
+        for sidx, placements in enumerate(ssampler(n_microbatch, n_stage, n_device)):
             print('seraching placement:\n', placements)
             # assign to device
             for mid in range(n_microbatch):
                 for devid, fnode in zip(placements[mid], micro_seqs[mid]):
                     graph.assign(fnode, devid)
+
+            # pruning: add dependecies for micro-batches with same device assignment
+            graph.reset_dependency()
+            same_microbatch = dict()
+            for mid, placement in enumerate(placements):
+                placement = tuple(placement)
+                if placement not in same_microbatch:
+                    same_microbatch[placement] = list()
+                same_microbatch[placement].append(mid)
+            for placement, mids in same_microbatch.items():
+                if len(mids) > 1:
+                    print(f'find {mids} microbatch same, add dependency')
+                    for sid in range(len(placement)):
+                        # add forward dependency
+                        graph.add_schedule([micro_seqs[mid][sid] for mid in mids])
+                        # add backward dependency
+                        graph.add_schedule([micro_seqs[mid][sid+len(placement)] for mid in mids])
+
+            # search
             for seqs in tsampler(graph.nodes()):
+                print(f'searching {len(seqs)} sequences under {sidx}-th placement')
                 yield seqs
 
 
@@ -77,10 +98,9 @@ class TemporalSampler:
     @staticmethod
     def btemporal(nodes: List[IRCell], bs=1):
         seqs = list()
-        for idx, seq in enumerate(TemporalSampler.temporal(nodes)):
+        for seq in TemporalSampler.temporal(nodes):
             seqs.append(seq)
             if len(seqs) % bs == 0:
-                print(f'dispatch {len(seqs)} seq...')
                 yield seqs
                 seqs = list()
         if len(seqs) > 0:
@@ -178,53 +198,74 @@ class SpatialSampler:
 
     @staticmethod
     def othogonal(n_microbatch: int, n_stage: int, n_device: int,
-                  wlimits: int, balance = True,  placements = None):
+                  wlimits: int, status = None, placements = None):
         """
-        Find most othogonal plans given weight_limits
+        Find othogonal plans given weight_limits
 
         Yield:
             List[microbatch][stage] = device (int)
         """
-        if balance:
-            nstages_per_dev = n_microbatch * n_stage // n_device
-        else:
-            nstages_per_dev = n_microbatch * n_stage
-        # wlimits = wlimits if wlimits < n_stage else n_stage
-        # placements = [] if placements is None else placements
-        wstatus = [set() for _ in range(n_device)]
-        bstatus = [0] * n_device
-        start_slots = np.array([n_stage] * n_device, dtype=int)
-        # if len(placements) == n_microbatch:
-        #     yield placements
-        # else:
-        #     for placement in placements:
-        #         for sid, devid in enumerate(placement):
-        #             wstatus[devid].add(sid)
-        #             start_slots[devid] = min(sid, start_slots[devid])
-        #             bstatus[devid] += 1
-        placements = []
-        for _ in range(n_microbatch):
-            placement = list()
+        # each element denotes number of block assigned
+        status = np.zeros((n_device, n_stage), dtype=int) if status is None else status
+        placements = [] if placements is None else placements
+        # repeat to reduce space
+        if len(placements) == wlimits:
+            for idx in range(n_microbatch - wlimits):
+                placements = placements + [copy.copy(placements[idx % wlimits])]
+            yield placements
+        # find othogonal placements
+        elif len(placements) == 0:
+            # fix the first one due to symmetric device
+            placements = placements + [[sid % n_device for sid in range(n_stage)]]
             for sid in range(n_stage):
-                # get last starting device
-                for devid in np.argsort(start_slots)[::-1]:
-                    if bstatus[devid] == nstages_per_dev:
-                        continue
-                    # try place
-                    if sid not in wstatus[devid] and len(wstatus[devid]) == wlimits:
-                        continue
-                    placement = placement + [devid]
-                    wstatus[devid].add(sid)
-                    bstatus[devid] += 1
-                    start_slots[devid] = min(sid, start_slots[devid])
-                    break
-            if len(placement) != n_stage:
-                raise RuntimeError("Cannot find othogonal plans")
-            placements = placements + [placement]
-            # for seq in SpatialSampler.othogonal(n_microbatch, n_stage, n_device, wlimits, placements):
-            #     yield seq
-            # placements = placements[:-1]
-        yield placements
+                status[sid % n_device][sid] += 1
+            for seqs in SpatialSampler.othogonal(n_microbatch, n_stage, n_device,
+                                                 wlimits, status, placements):
+                yield seqs
+        else:
+            for placement in SpatialSampler.microbatch_othogonal(np.copy(status)):
+                placements = placements + [placement]
+                for sid, devid in enumerate(placement):
+                    status[devid][sid] += 1
+                for seqs in SpatialSampler.othogonal(n_microbatch, n_stage, n_device,
+                                                     wlimits, status, placements):
+                    yield seqs
+                for sid, devid in enumerate(placement):
+                    status[devid][sid] -= 1
+                placements = placements[:-1]
+
+    @staticmethod
+    def microbatch_othogonal(status: np.ndarray, placement = None):
+        """
+        status:
+            2D array [n_device, n_stage], each element represents
+            how many stage blocks are assigned.
+        """
+        n_device, n_stage = status.shape
+        assert n_stage == 4
+        placement = [] if placement is None else placement
+        if len(placement) == n_stage:
+            # print(placement)
+            # input('>>>out')
+            yield placement
+        else:
+            sid = len(placement)
+            allocation = np.sum(status, axis=1)
+            min_alloc = np.min(allocation)
+            collision = status[:,sid]
+            valid = list()
+            for devid, coll in enumerate(collision):
+                if coll != 0 or allocation[devid] != min_alloc:
+                    continue
+                valid.append(devid)
+            for devid in valid:
+                placement = placement + [devid]
+                status[devid][sid] += 1
+                for seq in SpatialSampler.microbatch_othogonal(status, placement):
+                    yield seq
+                status[devid][sid] -= 1
+                placement = placement[:-1]
+
 
     @staticmethod
     def microbatch_placement(n_stage: int, n_device: int,
@@ -270,7 +311,7 @@ class Searcher:
         # merge results
         for worker_bucket in worker_buckets:
             for mem, (span, seq) in worker_bucket.items():
-                if mem in bucket and bucket[mem][0] < span:
+                if mem in bucket and bucket[mem][0] <= span:
                     continue
                 print(f'find better plan at mem budget {mem}: span: {span}')
                 bucket[mem] = (span, seq)

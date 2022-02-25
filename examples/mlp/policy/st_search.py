@@ -47,7 +47,7 @@ def PAS(graph: IRGraph, resource):
     M, S, D = 4, 4, 4
 
     # memory limits
-    wlimits = 1
+    wlimits = 2
     alimits = 4
 
     micro_seqs = MicroBatchView.split(graph, M)
@@ -55,16 +55,9 @@ def PAS(graph: IRGraph, resource):
     sgraph = IRGraph(MicroBatchView.flatten(micro_seqs), [], [], 'search')
     Estimator.taging(sgraph)
 
-    # pruning
-    for sid in range(S):
-        # forward intra-device dependency
-        sgraph.add_schedule([micro_seqs[mid][sid] for mid in range(M)])
-        # backward intra-device dependency
-        sgraph.add_schedule([micro_seqs[mid][sid+S] for mid in range(M)])
-
     n_worker, seq_per_worker = 32, 512
     tsampler = partial(TemporalSampler.btemporal, bs=n_worker*seq_per_worker)
-    ssampler = partial(SpatialSampler.same, wlimits=wlimits)
+    ssampler = partial(SpatialSampler.othogonal, wlimits=wlimits)
 
     bucket = dict()
     cnt = 0
