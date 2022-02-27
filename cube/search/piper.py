@@ -51,6 +51,14 @@ class MicroPlan:
             # find conflict
             sidx, tidx = (plan > 1).nonzero()
             return (False, (sidx, tidx))
+
+    def stall(self, step: int):
+        """
+        Primitive: insert a stall at stepline index `step`
+        """
+        slots = np.zeros((self.ndevs, 1), dtype=int)
+        self.plan = np.insert(self.plan, slice(step, step+1), slots, axis=1)
+        return True
     
     def shift(self, position: Tuple[int, int], distance: int) -> bool:
         """
@@ -123,7 +131,8 @@ def solve(micros: List[MicroPlan], conflicts: Dict[int, Tuple[int, int]]):
     devid = list(conflicts.keys())[0]
     mid, tid = conflicts[devid][0]
     print(f'select device: {devid}, micro id: {mid}, step: {tid} to solve')
-    micros[mid].shift((devid, tid), 1)
+    micros[mid].stall(tid)
+    # micros[mid].shift((devid, tid), 1)
     print(f'shift results: microbatch-{mid}')
     print(micros[mid])
     return (mid, devid, tid)
