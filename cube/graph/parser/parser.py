@@ -87,6 +87,49 @@ class ScriptModuleParser:
         return input_val, all_ir_nodes, output_val
 
     @staticmethod
+    def parse_module_method(module, method: torch._C.ScriptMethod, frame: Frame):
+        """
+        Parse module method
+        """
+        
+        frame.push()
+
+        input_var_name = [input.debugName() for input in method.graph.inputs()]
+        kDefaultType = DType2IRDType.map(torch.get_default_dtype())
+
+        for index, var_name in enumerate(input_var_name[1:]): # omit self
+            frame.add_var(var_name, IRFullTensor(name=var_name, requires_grad=False, dtype=kDefaultType), graph_arg=index)
+
+        input_val = [frame.get_var(var_name) for var_name in input_var_name[1:]]
+
+        all_ir_nodes: List[IRFwOperation] = list()
+        for node in method.graph.nodes():
+            ir_nodes = ScriptModuleParser.parse_node(node, module, frame)
+            if len(ir_nodes) != 0:
+                for ir_node in ir_nodes:
+                    try:
+                        ret = ir_node.infer_shape()
+                        if not ret:
+                            print(f'warning: {ir_node} cannot infer shape')
+                    except Exception:
+                        raise RuntimeError(f"Shape infer error at: {ir_node}")
+                all_ir_nodes += ir_nodes
+
+        # handle graph output -- Assuming all the output are tensors
+        output_var_name = [output.debugName() for output in method.graph.outputs()]
+        output_val = [frame.get_var(var_name) for var_name in output_var_name]
+        outputs = list()
+        for val in output_val:
+            if isinstance(val, list):
+                outputs += val
+            else:
+                outputs.append(val)
+        output_val = outputs
+
+        frame.pop()
+        return input_val, all_ir_nodes, output_val
+
+    @staticmethod
     def ntype(node: torch._C.Node):
         if node.kind() == 'prim::GetAttr':
             return ScriptNodeKind.PrimGetAttr
@@ -242,8 +285,8 @@ class ScriptModuleParser:
 
         # forward
         label = node.s('name')
-        if label != 'forward':
-            raise RuntimeError(f"{node} is calling function {label} that is not `forward`")
+        # if label != 'forward':
+        #     raise RuntimeError(f"{node} is calling function {label} that is not `forward`")
 
         # handle inputs -- in stack with reverse order
         for input in inputs[1:][::-1]:
@@ -254,9 +297,13 @@ class ScriptModuleParser:
         # print(f'> {frame}')
 
         # recursively parse the module
-        module_label = node.inputsAt(0).node().s('name')
-        call_module = getattr(module, module_label)
-        _, ir_nodes, outputs_val = ScriptModuleParser.parse_module(call_module, frame=frame)
+        if node.inputsAt(0).debugName() == 'self':
+            call_module = module
+        else:
+            call_module = getattr(module, node.inputsAt(0).debugName())
+
+        call_method = getattr(call_module, label)
+        _, ir_nodes, outputs_val = ScriptModuleParser.parse_module_method(call_module, call_method, frame=frame)
 
         # pop out the frame
         frame.pop_param(times=len(inputs)-1)
