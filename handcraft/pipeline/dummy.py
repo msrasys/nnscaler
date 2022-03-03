@@ -86,7 +86,8 @@ if __name__ == '__main__':
     dataloader = SynDataLoader(
         shapes=([mbs, dim, dim],),
         dtypes=(torch.float32, ),
-        batch_dims=(0,)
+        batch_dims=(0,),
+        length=128000
     )
 
     iter_num = 64
