@@ -45,6 +45,9 @@ class Sign2Op:
     # customized
     __customize = lambda name: f'cube.runtime.function.complex.{name}'
 
+    # einops
+    __einopsize = lambda name: f'einops._torch_specific.{name}'
+
     kOpMap = {
 
         # torch nn functional
@@ -56,6 +59,8 @@ class Sign2Op:
         __ftemplate('dropout') : function.Dropout,
 
         __ftemplate('gelu') : function.GeLU,
+
+        __ftemplate('_pad'): function.Pad,
 
         # __ftemplate('layer_norm'): function.LayerNorm,
 
@@ -76,6 +81,12 @@ class Sign2Op:
         __ttemplate('transpose') : function.Transpose,
 
         __ttemplate('conv2d'): function.Conv2D,
+
+        __ttemplate('conv3d'): function.Conv3D,
+
+        #einops
+        __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
+
 
     }
 

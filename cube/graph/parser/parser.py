@@ -157,6 +157,7 @@ class ScriptModuleParser:
 
     @staticmethod
     def parse_node(node: torch._C.Node, module, frame: Frame) -> List[IRFwOperation]:
+        # print("### parse_node {}".format(node))
         """
         Parse the node and return the IRFwOperation nodes
         """
@@ -365,7 +366,11 @@ class ScriptModuleParser:
         elif dtype == 'NoneType':
             frame.add_var(var_name, None)
         # module name or other things cannot handle
+        elif dtype == '__torch__.einops.einops.TransformRecipe':
+            recipe = getattr(module, label)
+            frame.add_var(var_name, recipe)
         else:
+            # print("### parse_prim_attr_node unknown: {}".format(dtype))
             frame.add_var(var_name, label)
         return list()
 

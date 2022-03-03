@@ -1,5 +1,9 @@
 from cube.graph.operator.function.einops import EinDim, EinopAnno, IREinops
 from cube.graph.operator.function.conv import IRConv2D
+from cube.graph.operator.function.conv import IRConv3D
+from cube.graph.operator.function.pad import IRPad
+from cube.graph.operator.function.scripteinops import IRScriptEinOps
+
 
 
 def Linear(signature, inputs):
@@ -160,3 +164,51 @@ def Conv2D(signature, inputs):
         padding = [padH, padH, padW, padW]
     return IRConv2D(signature, tensors, 'conv2d',
                     stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+
+def Conv3D(signature, inputs):
+    """
+    conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1) → Tensor
+    https://pytorch.org/docs/stable/generated/torch.nn.functional.conv3d.html?highlight=conv3d#torch.nn.functional.conv3d
+    """
+    assert len(inputs) == 7, f"Expected 7 inputs but only got {len(inputs)}"
+    tensors = inputs[0:3]
+    stride, padding, dilation, groups = inputs[3:]
+    if isinstance(padding, int):
+        padding = [padding] * 4
+    elif len(padding) == 2:
+        padH, padW = padding
+        padding = [padH, padH, padW, padW]
+    return IRConv3D(signature, tensors, 'conv3d',
+                    stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+def Pad(signature, inputs):
+    """
+    torch.nn.functional.pad(input, pad, mode='constant', value=0.0)
+    https://pytorch.org/docs/stable/generated/torch.nn.functional.pad.html#torch.nn.functional.pad
+    :param signature:
+    :param inputs:
+    :return:
+    """
+    # print("#Pad::inputs.len: {}".format(len(inputs)))
+    # idx = 0
+    # for input in inputs:
+    #     if idx >= 0:
+    #         print("#Pad::input[{}]: {}".format(idx, input))
+    #     idx += 1
+    tensors = inputs[0:1]
+    pad, mode, value = inputs[1:]
+    return IRPad(signature, tensors, 'pad', pad=pad, mode=mode, value=value)
+
+def ScriptEinOps(signature, inputs):
+    """
+    apply_for_scriptable_torch(recipe: TransformRecipe, tensor: torch.Tensor, reduction_type: str) -> torch.Tensor:
+    https://github.com/arogozhnikov/einops/blob/master/einops/_torch_specific.py
+    :param signature:
+    :param inputs:
+    :return:
+    """
+    recipe = inputs[0]
+    tensors = inputs[1:2]
+    reduction_type = inputs[2]
+    return IRScriptEinOps(signature, tensors, 'scripteinops', recipe=recipe, reduction_type=reduction_type)
