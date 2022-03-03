@@ -61,24 +61,24 @@ def schedule_naive(model, dataloader, num_microbatch: int):
         if is_first_stage():
             input = next(dataloader)
         else:
-            print(f'rank {rank} recving forward input...')
+            # print(f'rank {rank} recving forward input...')
             input = coll.recv(model.input_shape(), prev_rank, model.input_dtype())
         # forward
         output = forward_step(model, input)
         # send forward
         if not is_last_stage():
-            print(f'rank {rank} sending forward output...')
+            # print(f'rank {rank} sending forward output...')
             coll.send(output, next_rank)
         # recv backward
         output_grad = None
         if not is_last_stage():
-            print(f'rank {rank} recving backward input...')
+            # print(f'rank {rank} recving backward input...')
             output_grad = coll.recv(output.size(), next_rank, output.dtype)
         # backward
         input_grad = backward_step([input], [output], [output_grad])[0]
         # send backward
         if not is_first_stage():
-            print(f'rank {rank} sending backward output...')
+            # print(f'rank {rank} sending backward output...')
             coll.send(input_grad, prev_rank)
 
 

@@ -1,4 +1,5 @@
 from typing import List
+from unittest import defaultTestLoader
 import torch
 
 from cube.runtime.device import DeviceGroup
@@ -56,29 +57,28 @@ def recv(shape: List[int], from_rank: int, dtype: torch.dtype):
     return tensor
 
 
-def send_and_recv(send_tensors, to_ranks, recv_shapes, from_ranks):
+def sendrecv(input_tensors: List[torch.Tensor],
+                  output_shapes: List[List[int]],
+                  output_dtypes: List[torch.dtype],
+                  send_ranks: List[int],
+                  recv_ranks: List[int]) -> List[torch.Tensor]:
     CudaTimer().start(field_name='comm')
     # print('sending and recving...')
     ops = list()
-    recv_tensors = list()
-    for tensor, ranks in zip(send_tensors, to_ranks):
+    outputs = list()
+    for tensor, rank in zip(input_tensors, send_ranks):
         if not torch.is_tensor(tensor):
             raise RuntimeError(f"Expected {tensor} to be tensor")
-        for rank in ranks:
-            send_op = torch.distributed.P2POp(
-                torch.distributed.isend, tensor, rank
-            )
-            ops.append(send_op)
-    for shape, ranks in zip(recv_shapes, from_ranks):
-        if len(ranks) != 1:
-            raise RuntimeError(
-                "Not supported for recving same tensor from multiple devices"
-            )
-        rank = ranks[0]
-        tensor = torch.empty(
-            shape, requires_grad=True, device=torch.cuda.current_device()
+        send_op = torch.distributed.P2POp(
+            torch.distributed.isend, tensor, rank
         )
-        recv_tensors.append(tensor)
+        ops.append(send_op)
+    for shape, dtype, rank in zip(output_shapes, output_dtypes, recv_ranks):
+        tensor = torch.empty(
+            shape, dtype=dtype,
+            requires_grad=True, device=torch.cuda.current_device()
+        )
+        outputs.append(tensor)
         recv_op = torch.distributed.P2POp(
             torch.distributed.irecv, tensor, rank
         )
@@ -86,13 +86,9 @@ def send_and_recv(send_tensors, to_ranks, recv_shapes, from_ranks):
     reqs = torch.distributed.batch_isend_irecv(ops)
     for req in reqs:
         req.wait()
-    torch.cuda.synchronize()
 
     CudaTimer().stop(field_name='comm')
-
-    if    len(recv_tensors) == 0: return None
-    elif  len(recv_tensors) == 1: return recv_tensors[0]
-    else: return tuple(recv_tensors)
+    return outputs
 
 
 ### Collective Universal Interface ###
@@ -189,3 +185,81 @@ def broadcast(input_tensors: List[torch.Tensor],
     torch.distributed.broadcast(tensor, ranks[0], group=group)
     CudaTimer().stop(field_name='comm')
     return tensor
+
+
+def gather(input_tensors: List[torch.Tensor],
+           output_shapes: List[List[int]],
+           output_dtypes: List[torch.dtype],
+           ranks: List[int]) -> List[torch.Tensor]:
+    """
+    Gather. ranks[0] is the root
+    """
+    CudaTimer().start(field_name='comm')
+    assert len(input_tensors) == 1
+    input_tensor = input_tensors[0]
+    dst = ranks[0]
+    if DeviceGroup().rank == dst:
+        # recv
+        tensor_list = [input_tensor] + [torch.empty_like(input_tensor) for _ in range(len(ranks)-1)]
+        ops = list()
+        for rank, tensor in zip(ranks[1:], tensor_list[1:]):
+            recv_op = torch.distributed.P2POp(
+                torch.distributed.irecv, tensor, rank
+            )
+            ops.append(recv_op)
+        reqs = torch.distributed.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+    else:
+        # send
+        tensor_list = []
+        send_op = torch.distributed.P2POp(
+            torch.distributed.isend, input_tensor, ranks[0]
+        )
+        reqs = torch.distributed.batch_isend_irecv([send_op])
+        for req in reqs:
+            req.wait()
+    CudaTimer().stop(field_name='comm')
+    return tensor_list
+
+
+def scatter(input_tensors: List[torch.Tensor],
+            output_shapes: List[List[int]],
+            output_dtypes: List[torch.dtype],
+            ranks: List[int]) -> List[torch.Tensor]:
+    CudaTimer().start(field_name='comm')
+    output = None
+    src = ranks[0]
+    if DeviceGroup().rank == src:
+        # send
+        ops = list()
+        for rank, tensor in zip(ranks, input_tensors):
+            if rank == src:
+                output = tensor
+            else:
+                if not tensor.is_contiguous():
+                    with torch.no_grad():
+                        tensor = tensor.contiguous()
+                send_op = torch.distributed.P2POp(
+                    torch.distributed.isend, tensor, rank
+                )
+                ops.append(send_op)
+        reqs = torch.distributed.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+    else:
+        # recv
+        assert len(output_shapes) == 1 and len(output_dtypes) == 1
+        output = torch.empty(
+            output_shapes[0], dtype=output_dtypes[0],
+            requires_grad=True, device=torch.cuda.current_device()
+        )
+        recv_op = torch.distributed.P2POp(
+            torch.distributed.irecv, output, src
+        )
+        reqs = torch.distributed.batch_isend_irecv([recv_op])
+        for req in reqs:
+            req.wait()
+    torch.cuda.synchronize()
+    CudaTimer().stop(field_name='comm')
+    return output
