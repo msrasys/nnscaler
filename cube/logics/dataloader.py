@@ -21,7 +21,11 @@ class IRDataLoader:
         for data in datas:
             if torch.is_tensor(data):
                 self.dtypes.append(dtype_map.map(data.dtype))
-                self.shapes.append(list(data.shape))
+                shape = tuple(data.shape)
+                # special handler for scalar tensor shape
+                if len(shape) == 0:
+                    shape = (1,)
+                self.shapes.append(shape)
             else:
                 raise NotImplementedError("Data should be torch.Tensor")
 
