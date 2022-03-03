@@ -104,16 +104,21 @@ def schedule_tp_1f1b(model: torch.nn.Module,
         # gather
         outputs = coll.gather([output], None, None, [1,0,2,3])
         if rank == 1:
-            outputs[0], outputs[1] = outputs[1], outputs[0]
-            output = torch.cat(tuple(outputs), dim=-1)
+            with torch.no_grad():
+                outputs[0], outputs[1] = outputs[1], outputs[0]
+                output = torch.cat(tuple(outputs), dim=-1)
+            output = output.requires_grad_()
         else:
             output = None
         return output
 
     def tp_backward(grad: torch.Tensor):
-        with torch.no_grad():
-            grads = grad.chunk(4, dim=-1)
-            grads[0], grads[1] = grads[1], grads[0]
+        if rank == 1:
+            with torch.no_grad():
+                grads = list(grad.chunk(4, dim=-1))
+                grads[0], grads[1] = grads[1], grads[0]
+        else:
+            grads = None
         input_1st, output_1st = input_1st_tensors.pop(0), output_1st_tensors.pop(0)
         grad_1st = coll.scatter(grads, [output_1st.size()], [output_1st.dtype], [1,0,2,3])
         backward_step([input_1st], [output_1st], [grad_1st])[0]
@@ -125,79 +130,126 @@ def schedule_tp_1f1b(model: torch.nn.Module,
 
     fofst = [0, 0, 0, -1][rank]
     bofst = [0, -2, -2, -1][rank]
-    last_barrier_grad = None
+    last_backward = None
+    last_forward = None
     for step in range(num_microbatch + 2):
         torch.distributed.barrier()
-        print_each_rank('=========', rank_only=0)
+        # print_each_rank(f'=========begin rank {rank}=========')
         fmid, bmid = step + fofst, step + bofst
+        do_backward = 0 <= bmid and bmid <= num_microbatch - 1
+        do_forward = 0 <= fmid and fmid <= num_microbatch - 1
+    
         # step1: tp forward
         if 0 <= step and step <= num_microbatch - 1:
-            print(f'rank {rank} forward tp model ')
+            # print(f'rank {rank} forward tp model ')
             output_1st = tp_forward(first_stage_model, dataloader)
-        print(f'rank {rank} here')
-        # step2-1: backward + forward
-        if rank % 2 == 0:
-            # backward + forward
-            if rank == 0: pass
-            else:
-                if 0 <= bmid and bmid <= num_microbatch - 1:
-                    input, output = input_tensors.pop(0), output_tensors.pop(0)
-                    # recv output grad
-                    print(f'rank {rank} recv backward grad ')
-                    output_grad = recv_grad(output)
-                    # backward
-                    input_grad = backward_step([input], [output], [output_grad])[0]
-                    # send input grad
-                    print(f'rank {rank} send backward input ')
-                    coll.send(input_grad, prev_rank) 
-                if 0 <= fmid and fmid <= num_microbatch - 1:
-                    # recv input
-                    print(f'rank {rank} recv forward input ')
-                    input = coll.recv(model.input_shape(), prev_rank, model.input_dtype())
-                    # forward step
-                    output = forward_step(model, input)
-                    # send output
-                    print(f'rank {rank} send forward output ')
-                    coll.send(output, next_rank)
-                    input_tensors.append(input)
-                    output_tensors.append(output)
-        # step2-2: forward + backward
-        #FIXME: warmup forward transimission
-        if rank % 2 == 1:
-            if bmid >= 1 and rank != 2:
-                # cross-barrier send grad
-                print(f'rank {rank} send backward input ')
-                coll.send(last_barrier_grad, prev_rank)
-            if 0 <= fmid and fmid <= num_microbatch - 1:
-                # recv input
-                input = output_1st
-                if rank != 1:
-                    print(f'rank {rank} recv forward input ')
-                    input = coll.recv(model.input_shape(), prev_rank, model.input_dtype())
-                # forward
-                output = forward_step(model, input)
-                # send forward
-                if not is_last_stage():
-                    print(f'rank {rank} send forward output ')
-                    coll.send(output, next_rank)
-                input_tensors.append(input)
-                output_tensors.append(output)
-            if 0 <= bmid and bmid <= num_microbatch - 1:
+
+        # step2: backward + forward
+        if rank == 0:
+            pass
+
+        if rank == 2:
+            # inter-barrier
+            if do_backward and last_forward is not None:
+                # print(f'rank {rank} recv backward grad + send forward output ')
+                output_grad = coll.sendrecv(
+                    [last_forward], [model.output_shape()], [model.output_dtype()],
+                    [next_rank], [next_rank]
+                )[0]
+            elif do_backward:
+                # print(f'rank {rank} recv backward grad ')
+                output_grad = coll.recv(model.output_shape(), next_rank, model.output_dtype())
+            elif last_forward is not None:
+                # print(f'rank {rank} send forward output ')
+                coll.send(last_forward, next_rank)
+
+            # backward
+            if do_backward:
                 input, output = input_tensors.pop(0), output_tensors.pop(0)
-                # recv grad
-                print(f'rank {rank} recv backward grad ')
-                output_grad = recv_grad(output)
                 # backward
                 input_grad = backward_step([input], [output], [output_grad])[0]
-                # postpone send to next barrier
-                last_barrier_grad = input_grad
+            
+            # intra-barrier
+            if do_backward and do_forward:
+                # print(f'rank {rank} send backward grad + recv forward output ')
+                input = coll.sendrecv(
+                    [input_grad], [model.input_shape()], [model.input_dtype()],
+                    [prev_rank], [prev_rank]
+                )[0]
+            elif do_backward:
+                # print(f'rank {rank} send backward grad ')
+                coll.send(input_grad, prev_rank)
+            elif do_forward:
+                # print(f'rank {rank} recv forward output ')
+                input = coll.recv(model.input_shape(), prev_rank, model.input_dtype())
+
+            # forward
+            last_forward = None
+            if do_forward:
+                # forward step
+                output = forward_step(model, input)
+                input_tensors.append(input)
+                output_tensors.append(output)
+                last_forward = output
+
+        if rank == 1:
+
+            # forward
+            if do_forward:
+                input = output_1st
+                output = forward_step(model, input)
+                input_tensors.append(input)
+                output_tensors.append(output)
+
+            # intra-barrier send recv
+            if do_forward and do_backward:
+                # send forward recv backward
+                # print(f'rank {rank} recv backward grad + send forward output ')
+                output_grad = coll.sendrecv(
+                    [output], [output.size()], [output.dtype],
+                    [next_rank], [next_rank]
+                )[0]
+            elif do_forward:
+                # print(f'rank {rank} send forward output ')
+                coll.send(output, next_rank)
+            elif do_backward:
+                # print(f'rank {rank} recv backward grad ')
+                output_grad = coll.recv(model.output_shape(), next_rank, model.output_dtype())
+            
+            # backward
+            if do_backward:
+                input, output = input_tensors.pop(0), output_tensors.pop(0)
+                input_grad = backward_step([input], [output], [output_grad])[0]
+                last_backward = input_grad
+            
+        if rank == 3:
+
+            # inter-barrier
+            if do_forward and last_backward is not None:
+                # print(f'rank {rank} send backward grad + recv forward output ')
+                input = coll.sendrecv(
+                    [input_grad], [model.input_shape()], [model.input_dtype()],
+                    [prev_rank], [prev_rank]
+                )[0]
+            elif do_forward:
+                # print(f'rank {rank} recv forward output ')
+                input = coll.recv(model.input_shape(), prev_rank, model.input_dtype())
+            elif last_backward is not None:
+                # print(f'rank {rank} send backward grad ')
+                coll.send(last_backward, prev_rank)
+
+            # backward + forward
+            if do_forward:
+                output = forward_step(model, input)
+                input_grad = backward_step([input], [output], [None,])[0]
+                last_backward = input_grad
+
         # step3: tp backward
         if 0 <= (step-2) and (step-2) <= num_microbatch - 1:
-            print(f'rank {rank} backward tp model ')
-            tp_backward(last_barrier_grad)
+            # print(f'rank {rank} backward tp model ')
+            tp_backward(last_backward)
 
-        torch.distributed.barrier()
-        print_each_rank('=========', rank_only=0)
+        # print_each_rank(f'=========end rank {rank}=========')
 
 
 def schedule_1f1b(model: torch.nn.Module,
