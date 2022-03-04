@@ -5,9 +5,12 @@ OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
     handcraft/pipeline/dummy.py --use-naive
+
+OMP_NUM_THREADS=4 python -m torch.distributed.launch \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    handcraft/pipeline/dummy.py --use-naive
 """
-from sys import argv
-from threading import activeCount
 import torch
 import torch.nn.functional as F
 import cube
@@ -61,6 +64,8 @@ if __name__ == '__main__':
                         help='use naive pipeline')
     parser.add_argument('--use-tp1f1b', action='store_true',
                         help='use tensor parallel 1f1b')
+    parser.add_argument('--nmb', type=int, default=4,
+                        help='num of micro batch')
     args = parser.parse_args()
     assert args.use_naive ^ args.use_tp1f1b, "Specify (only) 1 way pipeline"
 
@@ -68,8 +73,8 @@ if __name__ == '__main__':
     rank = DeviceGroup().rank
 
     dim = 2048
-    gbs = 512
     mbs = 8
+    gbs = mbs * args.nmb
 
     # tp 1f1b
     if args.use_tp1f1b:
@@ -97,9 +102,9 @@ if __name__ == '__main__':
             CudaTimer(enable=True).start('e2e')
 
         if args.use_tp1f1b:
-            schedule_tp_1f1b(model, first_stage_model, dataloader, gbs // mbs)
+            schedule_tp_1f1b(model, first_stage_model, dataloader, args.nmb, DeviceGroup().world_size)
         if args.use_naive:
-            schedule_naive(model, dataloader, gbs // mbs)
+            schedule_naive(model, dataloader, args.nmb)
 
         if step >= 20:
             CudaTimer().stop('e2e')
