@@ -46,6 +46,18 @@ class ReduceEmbed(torch.autograd.Function):
         return grad_output
 
 
+class IdentityFoward(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input):
+        return input
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        torch.distributed.all_reduce(grad_output)
+        return grad_output
+
+
 
 class DummyModel(torch.nn.Module):
 
@@ -101,6 +113,8 @@ class DummyModel(torch.nn.Module):
             else:
                 input = F.embedding(input, self.embed_weight)
 
+        if self.sharding:
+            input = IdentityFoward.apply(input)
         output = F.linear(input, self.fc_weight)
 
         if self.is_last_stage:
