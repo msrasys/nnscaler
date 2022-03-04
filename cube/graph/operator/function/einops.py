@@ -92,7 +92,7 @@ class EinDim:
             if n[-1] == EinDim.ReduceType.Sum.value:
                 reduce = EinDim.ReduceType.Sum
                 n = n[:-1]
-            elif n[-1] == EinDim.ReduceType.Stay:
+            elif n[-1] == EinDim.ReduceType.Stay.value:
                 reduce = EinDim.ReduceType.Stay
                 n = n[:-1]
             # get identifier name
@@ -107,6 +107,9 @@ class EinDim:
 
     @property
     def name(self) -> str:
+        """
+        Return identifier without reduce
+        """
         if len(self._name) == 1:
             return self._name[0]
         return '(' + ' '.join(self._name) + ')'
@@ -134,7 +137,7 @@ class EinDim:
 
     def __repr__(self):
         name_reduce = [name + reduce.value for name, reduce in zip(self._name, self._reduce)]
-        if len(self._name) == 0:
+        if len(self._name) == 1:
             return self._name[0] + self._reduce[0].value
         return '(' + ' '.join(name_reduce) + ')'
 
@@ -272,9 +275,10 @@ class IREinops(IRFwOperation):
             raise RuntimeError("No matching anno for given annos")
         dimlen: Dict[str, int] = dict()
         for input, ishape in zip(self.inputs(), self._iannos):
-            if not ((ishape is None and not isinstance(input, IRTensor)) or
-                    len(ishape) == len(input.shape)):
-                raise RuntimeError(f"node {self._id} {self.signature}: error match input: {input.shape} and einshape: {ishape}")
+            if not isinstance(input, IRTensor):
+                continue
+            if len(ishape) != len(input.shape):
+                raise RuntimeError(f"node {self._id} {self.signature}: error match input: {input.shape} and ein_shape: {ishape}")
             for tdim, edim in zip(input.shape, ishape):
                 if len(edim._name) == 1:
                     if edim.name in dimlen and dimlen[edim.name] != tdim:
@@ -337,55 +341,47 @@ class IREinops(IRFwOperation):
         if len(anno.inputs) != len(self.inputs()):
             return False, None, None
         identifiers = anno.identifiers()
+
         # expand *
         expand_dims = None
         if '*' in identifiers:
-            for idx in range(len(anno.inputs)):
-                shape = anno.inputs[idx]
-                shape_anno = [dim.name for dim in shape]
-                if '*' in shape_anno:
-                    start = shape_anno.index('*')
-                    span = len(self.inputs(idx).shape) - len(shape) + 1
-                    if span <= 0:
-                        if expand_dims is None:
-                            expand_dims = list()
-                        if len(expand_dims) > 0:
-                            return False, None, None
-                        anno.inputs[idx].remove(EinDim('*'))
-                    if span > 0:
-                        if expand_dims is None:
-                            expand_dims = list()
-                            unused_annos = [c for c in string.ascii_lowercase if c not in identifiers]
-                            if len(unused_annos) < span:
-                                raise RuntimeError("Too many introduced dimensions")
-                            for dim in range(span):
-                                if '*' not in anno.anno.split('->')[-1]:
-                                    anno_dim = EinDim([unused_annos[dim] + '+'])
-                                else:
-                                    anno_dim = EinDim([unused_annos[dim]])
-                                expand_dims.append(anno_dim)
-                        if len(expand_dims) != span:
-                            return False, None, None
-                        anno.inputs[idx] = anno.inputs[idx][:start] + expand_dims + anno.inputs[idx][start+1:]
-            for idx in range(len(anno.outputs)):
-                shape = anno.outputs[idx]
-                shape_anno = [dim.name for dim in shape]
-                if '*' in shape_anno:
+            # names
+            in_names = [[e.name for e in input] for input in anno.inputs]
+            out_names = [[e.name for e in out] for out in anno.outputs]
+            spatial = all(['*' in names for names in out_names])
+            candicates = [c if spatial else c + '^' for c in string.ascii_lowercase if c not in identifiers]
+            # go through inputs
+            for idx, (names, input) in enumerate(zip(in_names, self.inputs())):
+                if '*' in names:
+                    if not isinstance(input, IRTensor):
+                        return False, None, None
+                    pos = names.index('*')
+                    span = len(self.inputs(idx).shape) - (len(names) - 1)
+                    if expand_dims is not None and len(expand_dims) != span:
+                        return False, None, None
                     if expand_dims is None:
-                        raise RuntimeError("* should appear in inputs")
-                    start = shape_anno.index('*')
-                    span = len(expand_dims)
-                    anno.outputs[idx] = anno.outputs[idx][:start] + expand_dims + anno.outputs[idx][start+1:]
+                        expand_dims = []
+                        if span > 0:
+                            expand_dims = [EinDim(candicates[dim]) for dim in range(span)]
+                    anno.inputs[idx] = anno.inputs[idx][:pos] + expand_dims + anno.inputs[idx][pos+1:]
+            # * should appear in inputs
+            if expand_dims is None:
+                return False, None, None
+            # go through outputs
+            for idx, names in enumerate(out_names):
+                if '*' in names:
+                    pos = names.index('*')
+                    anno.outputs[idx] = anno.outputs[idx][:pos] + expand_dims + anno.outputs[idx][pos+1:]
         # check dimension consistency
         dimlen: Dict[str, int] = dict()
-        for shape, input in zip(anno.inputs, self.inputs()):
+        for eshape, input in zip(anno.inputs, self.inputs()):
             if not isinstance(input, IRTensor):
-                if not (len(shape) != 1 and shape[0].name != '1'):
+                if not (len(eshape) == 1 and eshape[0].name == '1'):
                     return False, None, None
             else:
-                if len(input.shape) != len(shape):
+                if len(input.shape) != len(eshape):
                     return False, None, None
-                for edim, nele in zip(shape, input.shape):
+                for edim, nele in zip(eshape, input.shape):
                     if edim.name in dimlen:
                         if nele != dimlen[edim.name]:
                             return False, None, None
