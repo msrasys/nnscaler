@@ -7,6 +7,7 @@ import cube
 
 from cube.graph import parser
 from cube.graph.adapter.gen import AdapterGener
+from cube.graph.graph import IRGraph
 from cube.graph.operator.operator import IRDataOperation
 
 from cube.logics.pool import SchedulePool
@@ -142,6 +143,8 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             outputs = fn(model_graph, ir_dataloader)
             if outputs is None:
                 outputs = []
+            elif not (isinstance(outputs, tuple) or isinstance(outputs, list)):
+                outputs = [outputs]
             graph = LogicTranslator.gen_logic_graph(outputs=outputs)
 
             if len(PAS) == 1:
@@ -151,6 +154,9 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                 graph = P(graph, resource)
                 graph = A(graph, resource)
                 graph = S(graph, resource)
+
+            if not isinstance(graph, IRGraph):
+                raise RuntimeError("Expected policy return IRGraph")
 
             # check assignment and order
             for node in graph.nodes():
@@ -179,7 +185,8 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             span = time.time() - start
             print('> planpass on grouping adapters : {:.2f} s'.format(span))
 
-            # execplan.draw(outfile='execplan.png')
+            execplan.graph.reset_dependency()
+            # execplan.analyze(outfile='execplan.png')
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()
