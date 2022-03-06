@@ -36,6 +36,8 @@ class ScriptModuleParser:
         The overall entry to parse a torchscript graph module
         """
         frame.push()
+        print(module.graph)
+        print(module.code)
 
         # handle graph input -- Assuming all the inputs are tensors
         input_var_name = [input.debugName() for input in module.graph.inputs()]
@@ -254,11 +256,16 @@ class ScriptModuleParser:
         outputs = [output for output in node.outputs()]
 
         # handle inputs:
-        input_val = list()
-        for input in inputs:
-            var_name = input.debugName()
-            val = frame.get_var(var_name)
-            input_val.append(val)
+        input_val = [frame.get_var(input.debugName()) for input in inputs]
+
+        # special handling on aten::size(tensor: tensor, dim: int)
+        if fsig == 'torch.size':
+            assert len(inputs) == 2 and len(outputs) == 1, \
+                "Expected 2 inputs and 1 outputs for torch.size"
+            tensor, dim = input_val
+            output: int = tensor.shape[dim]
+            frame.add_var(outputs[0].debugName(), output)
+            return []
 
         # create IR node
         ir_node = Sign2Op.map(fsig)(inputs=input_val)
