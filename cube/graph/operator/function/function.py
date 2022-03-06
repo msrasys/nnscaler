@@ -102,6 +102,10 @@ def Sum(signature, inputs):
     dim = inputs[1]
     if dim is not None:
         keepdim = inputs[2] if len(inputs) > 2 else False
+        dim_len = len(tensor[0].shape)
+        anno = "".join([f'b{i} ' for i in range(dim_len)]) + " -> " + "".join([f'b{i} ' if i not in dim else "" for i in range(dim_len)])
+        annos.append(anno)
+        # print("### Sum::anno = {}", annos)
         return IREinops(signature, annos, tensor, 'sum',
                         dim=dim, keepdim=keepdim)
     else:
