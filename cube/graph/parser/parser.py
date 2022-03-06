@@ -36,8 +36,6 @@ class ScriptModuleParser:
         The overall entry to parse a torchscript graph module
         """
         frame.push()
-        print(module.graph)
-        print(module.code)
 
         # handle graph input -- Assuming all the inputs are tensors
         input_var_name = [input.debugName() for input in module.graph.inputs()]
@@ -58,21 +56,20 @@ class ScriptModuleParser:
 
         all_ir_nodes: List[IRFwOperation] = list()
         for node in module.graph.nodes():
-            # debug info
-            # print(f'on parsing:\n\t{node}')
             ir_nodes = ScriptModuleParser.parse_node(node, module, frame)
-            # print(f'> {frame}')
-            # print(f'> {ir_nodes}')
-            # _ = input('>>>')
-            if len(ir_nodes) != 0:
-                for ir_node in ir_nodes:
-                    try:
-                        ret = ir_node.infer_shape()
-                        if not ret:
-                            print(f'warning: {ir_node} cannot infer shape')
-                    except Exception:
-                        raise RuntimeError(f"Shape infer error at: {ir_node}")
-                all_ir_nodes += ir_nodes
+            for ir_node in ir_nodes:
+                try:
+                    ret = ir_node.infer_shape()
+                    if not ret:
+                        print(f'warning: {ir_node} cannot infer shape')
+                except Exception:
+                    raise RuntimeError(
+                        f"====== Shape Infer Error ====\n\n\n"
+                        f"IR Node: {ir_node}\n\n"
+                        f"Node:\n{node}\n"
+                        f"====== Shape Infer Error ====\n\n\n"
+                    )
+            all_ir_nodes += ir_nodes
         
         # handle graph output -- Assuming all the output are tensors
         output_var_name = [output.debugName() for output in module.graph.outputs()]
@@ -107,15 +104,20 @@ class ScriptModuleParser:
         all_ir_nodes: List[IRFwOperation] = list()
         for node in method.graph.nodes():
             ir_nodes = ScriptModuleParser.parse_node(node, module, frame)
-            if len(ir_nodes) != 0:
-                for ir_node in ir_nodes:
-                    try:
-                        ret = ir_node.infer_shape()
-                        if not ret:
-                            print(f'warning: {ir_node} cannot infer shape')
-                    except Exception:
-                        raise RuntimeError(f"Shape infer error at: {ir_node}")
-                all_ir_nodes += ir_nodes
+            for ir_node in ir_nodes:
+                try:
+                    ret = ir_node.infer_shape()
+                    if not ret:
+                        print(f'warning: {ir_node} cannot infer shape')
+                except Exception:
+                    raise RuntimeError(
+                        f"====== Shape Infer Error ====\n\n\n"
+                        f"IR Node: {ir_node}\n\n"
+                        f"Module:\n{module.code}\n\n"
+                        f"Node:\n{node}\n"
+                        f"====== Shape Infer Error ====\n\n\n"
+                    )
+            all_ir_nodes += ir_nodes
 
         # handle graph output -- Assuming all the output are tensors
         output_var_name = [output.debugName() for output in method.graph.outputs()]
