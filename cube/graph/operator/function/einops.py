@@ -274,6 +274,7 @@ class IREinops(IRFwOperation):
             self._oannos = oannos
             if ret: break
         if not ret:
+            print(f'self._annos = {self._annos}, self._adapt = {self._adapt}')
             raise RuntimeError("No matching anno for given annos")
         dimlen: Dict[str, int] = dict()
         for input, ishape in zip(self.inputs(), self._iannos):
@@ -340,9 +341,11 @@ class IREinops(IRFwOperation):
         """
         parse annotations, assuming input tensor shape is given
         """
+        print(f"anno = {anno}; anno.inputs = {anno.inputs}; self.inputs = {self.inputs()}")
         if len(anno.inputs) != len(self.inputs()):
             return False, None, None
         identifiers = anno.identifiers()
+        print(f'identifiers = {identifiers}')
 
         # expand *
         expand_dims = None
@@ -356,10 +359,12 @@ class IREinops(IRFwOperation):
             for idx, (names, input) in enumerate(zip(in_names, self.inputs())):
                 if '*' in names:
                     if not isinstance(input, IRTensor):
+                        print('Ln 362')
                         return False, None, None
                     pos = names.index('*')
                     span = len(self.inputs(idx).shape) - (len(names) - 1)
                     if expand_dims is not None and len(expand_dims) != span:
+                        print('Ln 367')
                         return False, None, None
                     if expand_dims is None:
                         expand_dims = []
@@ -368,6 +373,7 @@ class IREinops(IRFwOperation):
                     anno.inputs[idx] = anno.inputs[idx][:pos] + expand_dims + anno.inputs[idx][pos+1:]
             # * should appear in inputs
             if expand_dims is None:
+                print('Ln 376')
                 return False, None, None
             # go through outputs
             for idx, names in enumerate(out_names):
@@ -379,15 +385,19 @@ class IREinops(IRFwOperation):
         for eshape, input in zip(anno.inputs, self.inputs()):
             if not isinstance(input, IRTensor):
                 if not (len(eshape) == 1 and eshape[0].name == '1'):
+                    print('Ln 388')
                     return False, None, None
             else:
                 if len(input.shape) != len(eshape):
+                    print('Ln 392')
                     return False, None, None
                 for edim, nele in zip(eshape, input.shape):
                     if edim.name in dimlen:
                         if nele != dimlen[edim.name]:
+                            print('Ln 397')
                             return False, None, None
                     dimlen[edim.name] = nele
+        print('Ln 400')
         return True, anno.inputs, anno.outputs
 
     def einexpr(self) -> str:
