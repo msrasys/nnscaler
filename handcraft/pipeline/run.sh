@@ -18,6 +18,10 @@ OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
 OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
     handcraft/pipeline/dummy.py --use-naive --nmb 64 > 4dev64nmb-naive.txt
 
+OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
+    handcraft/pipeline/dummy.py --use-tp --nmb 64 > 4dev64nmb-tp.txt
+
+
 # 8 gpus
 
 OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
