@@ -42,9 +42,6 @@ class Sign2Op:
     # tensor template
     __ttemplate = lambda name: f'torch.{name}'
 
-    # customized
-    __customize = lambda name: f'cube.runtime.function.complex.{name}'
-
     # einops
     __einopsize = lambda name: f'einops._torch_specific.{name}'
 
@@ -79,6 +76,10 @@ class Sign2Op:
         __ttemplate('sum') : function.Sum,
 
         __ttemplate('transpose') : function.Transpose,
+
+        __ttemplate('view'): function.View,
+
+        __ttemplate('reshape'): function.Reshape,
 
         __ttemplate('conv2d'): function.Conv2D,
 

@@ -1,9 +1,61 @@
+from typing import Iterable, List, Optional, Union, Dict
+import string
+import copy
+
+from cube.ir.cten import IRTensor
 from cube.graph.operator.function.einops import EinDim, EinopAnno, IREinops
 from cube.graph.operator.function.conv import IRConv2D
 from cube.graph.operator.function.conv import IRConv3D
 from cube.graph.operator.function.pad import IRPad
 from cube.graph.operator.function.scripteinops import IRScriptEinOps
 
+
+def _create_eshape(shape: List[int], iterator: Optional[Iterable] = None,
+                  reduce: EinDim.ReduceType = EinDim.ReduceType.Spatial) -> List[str]:
+    """
+    Create dimension annotation given the shape and 
+    letter iterator
+    """
+    if iterator is None:
+        iterator = iter(string.ascii_lowercase)
+    return [next(iterator) + reduce.value for _ in range(len(shape))]
+
+
+def _create_anno(ins: List[List[Union[str, List[str]]]],
+                 ous: List[List[Union[str, List[str]]]]) -> str:
+    """
+    Create annotation string
+    e.g., 
+        ins = [ ['a', 'b', 'c+'], ['c+', ['d', 'e']] ]
+        ous = [ ['a', 'b', 'd', 'e'] ]
+    =>
+        'a b c+, c+ (d e) -> a b d e'
+    """
+    in_annos = list()
+    ou_annos = list()
+    for shape in ins:
+        flatten = list()
+        for edim in shape:
+            if isinstance(edim, str):
+                flatten.append(edim)
+            # List
+            elif len(edim) == 1:
+                flatten.append(edim[0])
+            else:
+                flatten.append('(' + ' '.join(edim) + ')')
+        in_annos.append(' '.join(flatten))
+    for shape in ous:
+        flatten = list()
+        for edim in shape:
+            if isinstance(edim, str):
+                flatten.append(edim)
+            # List
+            elif len(edim) == 1:
+                flatten.append(edim[0])
+            else:
+                flatten.append('(' + ' '.join(edim) + ')')
+        ou_annos.append(' '.join(flatten))
+    return ', '.join(in_annos) + ' -> ' + ', '.join(ou_annos)
 
 
 def Linear(signature, inputs):
@@ -24,24 +76,56 @@ def BatchLinear(signature, inputs):
 def Add(signature, inputs):
     assert len(inputs) == 3
     inputs, alpha = inputs[0:2], inputs[2]
-    # TODO: support broadcast
     annos = [
         '*, 1 -> *',
         '1, * -> *',
         '*, * -> *',
     ]
+    # broadcast
+    lhs, rhs = inputs
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
+       len(lhs.shape) == len(rhs.shape):
+        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
+            # TODO: support spatial partitioning on broadcast dim
+            lshape = _create_eshape(lhs.shape)
+            rshape = copy.copy(lshape)
+            oshape = copy.copy(lshape)
+            for dim in range(len(lhs.shape)):
+                if lhs.shape[dim] < rhs.shape[dim]:
+                    oshape[dim] = rshape[dim]
+                    lshape[dim] = str(lhs.shape[dim])
+                elif lhs.shape[dim] > rhs.shape[dim]:
+                    oshape[dim] = lshape[dim]
+                    rshape[dim] = str(rhs.shape[dim])
+            annos = [_create_anno([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, 'add', alpha=alpha)
 
 
 def Sub(signature, inputs):
     assert len(inputs) == 3
     inputs, alpha = inputs[0:2], inputs[2]
-    # TODO: support broadcast
     annos = [
         '*, 1 -> *',
         '1, * -> *',
         '*, * -> *',
     ]
+    # broadcast
+    lhs, rhs = inputs
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
+       len(lhs.shape) == len(rhs.shape):
+        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
+            # TODO: support spatial partitioning on broadcast dim
+            lshape = _create_eshape(lhs.shape)
+            rshape = copy.copy(lshape)
+            oshape = copy.copy(lshape)
+            for dim in range(len(lhs.shape)):
+                if lhs.shape[dim] < rhs.shape[dim]:
+                    oshape[dim] = rshape[dim]
+                    lshape[dim] = str(lhs.shape[dim])
+                elif lhs.shape[dim] > rhs.shape[dim]:
+                    oshape[dim] = lshape[dim]
+                    rshape[dim] = str(rhs.shape[dim])
+            annos = [_create_anno([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, 'sub', alpha=alpha)
 
 
@@ -51,6 +135,23 @@ def Mul(signature, inputs):
         '1, * -> *',
         '*, * -> *',
     ]
+    # broadcast
+    lhs, rhs = inputs
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
+       len(lhs.shape) == len(rhs.shape):
+        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
+            # TODO: support spatial partitioning on broadcast dim
+            lshape = _create_eshape(lhs.shape)
+            rshape = copy.copy(lshape)
+            oshape = copy.copy(lshape)
+            for dim in range(len(lhs.shape)):
+                if lhs.shape[dim] < rhs.shape[dim]:
+                    oshape[dim] = rshape[dim]
+                    lshape[dim] = str(lhs.shape[dim])
+                elif lhs.shape[dim] > rhs.shape[dim]:
+                    oshape[dim] = lshape[dim]
+                    rshape[dim] = str(rhs.shape[dim])
+            annos = [_create_anno([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, 'mul')
 
 
@@ -60,6 +161,23 @@ def Div(signature, inputs):
         '1, * -> *',
         '*, * -> *',
     ]
+    # broadcast
+    lhs, rhs = inputs
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
+       len(lhs.shape) == len(rhs.shape):
+        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
+            # TODO: support spatial partitioning on broadcast dim
+            lshape = _create_eshape(lhs.shape)
+            rshape = copy.copy(lshape)
+            oshape = copy.copy(lshape)
+            for dim in range(len(lhs.shape)):
+                if lhs.shape[dim] < rhs.shape[dim]:
+                    oshape[dim] = rshape[dim]
+                    lshape[dim] = str(lhs.shape[dim])
+                elif lhs.shape[dim] > rhs.shape[dim]:
+                    oshape[dim] = lshape[dim]
+                    rshape[dim] = str(rhs.shape[dim])
+            annos = [_create_anno([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, 'div')
 
 
@@ -113,15 +231,89 @@ def Sum(signature, inputs):
 
 
 def Transpose(signature, inputs):
-    def adapt(anno: EinopAnno, node: IREinops) -> EinopAnno:
-        dim0, dim1 = node.kwargs[0], node.kwargs[1]
-        anno.outputs[0][dim0], anno.outputs[0][dim1] = \
-            anno.inputs[0][dim1], anno.inputs[0][dim0]
-        return anno
-    annos = [('* -> *', adapt),]
-    inputs, dim0, dim1 = inputs[0:1], inputs[1], inputs[2]
-    return IREinops(signature, annos, inputs, 'transpose',
+    """
+    out = torch.transpose(tensor, dim0, dim1)
+    """
+    assert len(inputs) == 3
+    input, dim0, dim1 = inputs
+
+    edim_in = _create_eshape(input.shape)
+    edim_ou = copy.copy(edim_in)
+    edim_ou[dim0], edim_ou[dim1] = edim_ou[dim1], edim_ou[dim0]
+    anno = _create_anno([edim_in], [edim_ou])
+
+    return IREinops(signature, [anno], [input], 'transpose',
                     dim0=dim0, dim1=dim1)
+
+
+def View(signature, inputs):
+    """
+    out = torch.Tensor.view(tensor: torch.Tensor, shape: List[int])
+    """
+    assert len(inputs) == 2
+    input, shape = inputs
+    in_shape, ou_shape = list(input.shape), shape
+    print(in_shape, ou_shape)
+
+    # shape check
+    def nele(shape, nele=1):
+        for dimlen in shape: nele *= dimlen
+        return nele
+    # handle '-1' in shape
+    cnt = nele(in_shape)
+    if -1 in ou_shape:
+        idx = ou_shape.index(-1)
+        ou_shape[idx] = cnt // (-nele(ou_shape))
+    assert nele(in_shape) == nele(ou_shape), "shape mismatch"
+    # generate annotation
+    shape_map: Dict[str, int] = dict()
+    letters = iter(string.ascii_lowercase)
+    in_anno, ou_anno = [], []
+    in_dim, ou_dim = 0, 0
+    in_remain, ou_remain = in_shape[in_dim], ou_shape[ou_dim]
+    in_bracket, ou_bracket = [], []
+    in_dimlen, ou_dimlen = 1, 1
+    while True:
+        letter = next(letters)
+        dimlen = min(in_remain, ou_remain)
+        in_dimlen, ou_dimlen = in_dimlen * dimlen, ou_dimlen * dimlen
+        in_remain, ou_remain = in_remain // dimlen, ou_remain // dimlen
+        in_bracket.append(letter)
+        ou_bracket.append(letter)
+        shape_map[letter] = dimlen
+        if in_remain == 1:
+            in_anno.append(in_bracket)
+            in_bracket, in_dimlen = [], 1
+            in_dim += 1
+            if in_dim < len(in_shape):
+                in_remain = in_shape[in_dim]
+        if ou_remain == 1:
+            ou_anno.append(ou_bracket)
+            ou_bracket, ou_dimlen = [], 1
+            ou_dim += 1
+            if ou_dim < len(ou_shape):
+                ou_remain = ou_shape[ou_dim]
+        if in_dim == len(in_shape) and ou_dim == len(ou_shape):
+            break
+    # setup reduction: only first dimension can be spatially partitioned
+    spatial_in = set()
+    spatial_ou = set()
+    for in_bracket in in_anno:
+        spatial_in.add(in_bracket[0])
+    for ou_bracket in ou_anno:
+        spatial_ou.add(ou_bracket[0])
+    spatial = spatial_in.intersection(spatial_ou)
+    for bracket in in_anno + ou_anno:
+        for subdim, edim in enumerate(bracket):
+            if edim not in spatial:
+                bracket[subdim] = str(shape_map[edim])
+                # bracket[subdim] = edim + '^'
+    anno = _create_anno([in_anno], [ou_anno])
+    return IREinops(signature, [anno], [input], 'view', shape=shape)
+
+
+def Reshape(signature, inputs):
+    return View(signature, inputs)
 
 
 # def Conv2D(signature, inputs):
