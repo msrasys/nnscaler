@@ -191,20 +191,22 @@ class EinopAnno:
                 if bracket_group:
                     raise RuntimeError("brackets inside brackets not allowed")
                 bracket_group = True
-                identifiers.append(current_identifier)
+                if len(current_identifier) > 0:
+                    identifiers.append(current_identifier)
                 current_identifier = list()
             elif w == ')':
                 if not bracket_group:
                     raise RuntimeError("backets are not balanced at (")
                 bracket_group = False
-                identifiers.append(current_identifier)
+                if len(current_identifier) > 0:
+                    identifiers.append(current_identifier)
                 current_identifier = list()
             else:
                 if bracket_group:
                     current_identifier.append(w)
                     self._identifiers.add(w)
                 else:
-                    if len(current_identifier) != 0:
+                    if len(current_identifier) > 0:
                         identifiers.append(current_identifier)
                     current_identifier = [w]
                     self._identifiers.add(w)
@@ -280,7 +282,7 @@ class IREinops(IRFwOperation):
             if len(ishape) != len(input.shape):
                 raise RuntimeError(f"node {self._id} {self.signature}: error match input: {input.shape} and ein_shape: {ishape}")
             for tdim, edim in zip(input.shape, ishape):
-                if len(edim._name) == 1:
+                if len(edim.names()) == 1:
                     if edim.name in dimlen and dimlen[edim.name] != tdim:
                         raise RuntimeError(f"op: {self.signature} has different shape for same dim annotation {edim.name}")
                     dimlen[edim.name] = tdim
@@ -334,7 +336,7 @@ class IREinops(IRFwOperation):
             op.set_output(idx, output)
         return op
 
-    def parse(self, anno: EinopAnno):
+    def parse(self, anno: EinopAnno) -> Tuple[bool, List[List[EinDim]], List[List[EinDim]]]:
         """
         parse annotations, assuming input tensor shape is given
         """
