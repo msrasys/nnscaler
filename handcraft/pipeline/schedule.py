@@ -283,6 +283,10 @@ def schedule_tp_1f1b(model: torch.nn.Module,
             # print(f'rank {rank} backward tp model ')
             tp_backward(last_backward)
 
+        # if rank == 0:
+        #     io_input(f'{step}>>>')
+        # torch.distributed.barrier()
+
         # print_each_rank(f'=========end rank {rank}=========')
 
 
