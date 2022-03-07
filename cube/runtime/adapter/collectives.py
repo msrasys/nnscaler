@@ -219,6 +219,7 @@ def gather(input_tensors: List[torch.Tensor],
         reqs = torch.distributed.batch_isend_irecv([send_op])
         for req in reqs:
             req.wait()
+    torch.cuda.synchronize()
     CudaTimer().stop(field_name='comm')
     return tensor_list
 
