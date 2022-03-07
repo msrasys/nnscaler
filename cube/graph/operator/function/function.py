@@ -178,7 +178,42 @@ def Div(signature, inputs):
                     oshape[dim] = lshape[dim]
                     rshape[dim] = str(rhs.shape[dim])
             annos = [_create_anno([lshape, rshape], [oshape])]
+    print(f"Div::annos = {annos}")
     return IREinops(signature, annos, inputs, 'div')
+
+def Neg(signature, inputs):
+    annos = ['* -> *']
+    tensor = inputs[0:1]
+    if len(inputs) == 2:
+        # adapt for newest pytorch version
+        approximate = inputs[1]
+        return IREinops(signature, annos, tensor, 'neg',
+                        approximate=approximate)
+    else:
+        return IREinops(signature, annos, tensor, 'neg')
+
+def Sin(signature, inputs):
+    annos = ['* -> *']
+    tensor = inputs[0:1]
+    if len(inputs) == 2:
+        # adapt for newest pytorch version
+        approximate = inputs[1]
+        return IREinops(signature, annos, tensor, 'sin',
+                        approximate=approximate)
+    else:
+        return IREinops(signature, annos, tensor, 'sin')
+
+
+def Cos(signature, inputs):
+    annos = ['* -> *']
+    tensor = inputs[0:1]
+    if len(inputs) == 2:
+        # adapt for newest pytorch version
+        approximate = inputs[1]
+        return IREinops(signature, annos, tensor, 'cos',
+                        approximate=approximate)
+    else:
+        return IREinops(signature, annos, tensor, 'cos')
 
 
 def GeLU(signature, inputs):
