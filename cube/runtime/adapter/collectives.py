@@ -58,10 +58,10 @@ def recv(shape: List[int], from_rank: int, dtype: torch.dtype):
 
 
 def sendrecv(input_tensors: List[torch.Tensor],
-                  output_shapes: List[List[int]],
-                  output_dtypes: List[torch.dtype],
-                  send_ranks: List[int],
-                  recv_ranks: List[int]) -> List[torch.Tensor]:
+             output_shapes: List[List[int]],
+             output_dtypes: List[torch.dtype],
+             send_ranks: List[int],
+             recv_ranks: List[int]) -> List[torch.Tensor]:
     CudaTimer().start(field_name='comm')
     # print('sending and recving...')
     ops = list()
@@ -86,7 +86,7 @@ def sendrecv(input_tensors: List[torch.Tensor],
     reqs = torch.distributed.batch_isend_irecv(ops)
     for req in reqs:
         req.wait()
-
+    torch.cuda.synchronize()
     CudaTimer().stop(field_name='comm')
     return outputs
 
