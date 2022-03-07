@@ -71,6 +71,12 @@ class Sign2Op:
 
         __ttemplate('div') : function.Div,
 
+        __ttemplate('neg'): function.Neg,
+
+        __ttemplate('sin'): function.Sin,
+
+        __ttemplate('cos'): function.Cos,
+
         __ttemplate('bmm') : function.BatchLinear,
 
         __ttemplate('sum') : function.Sum,

@@ -15,7 +15,7 @@ from einops.layers.torch import Rearrange
 class Atmoshpere(torch.nn.Module):
     def __init__(self,
                  nz, ny, nx, dy, dx, x0, y0, deltaA, Y, f, sigma, P_, P, phi, zs, w,
-                 bar_x_filter, bar_y_filter, delta_x_filter, delta_y_filter,
+                 bar_x_filter, bar_y_filter, delta_x_filter, delta_y_filter, bar_y2_filter,bar_x2_filter,bar_z_filter,delta_z_filter,delta_E_filter,laplas_filter,bar_xy_filter,delta_D_filter,
                  device='cuda'):
         super().__init__()
         #self.device = torch.device(device)
@@ -53,6 +53,14 @@ class Atmoshpere(torch.nn.Module):
         self.bar_y_filter = bar_y_filter
         self.delta_x_filter = delta_x_filter
         self.delta_y_filter = delta_y_filter
+        self.bar_y2_filter = bar_y2_filter
+        self.bar_x2_filter = bar_x2_filter
+        self.bar_z_filter = bar_z_filter
+        self.delta_z_filter = delta_z_filter
+        self.delta_E_filter = delta_E_filter
+        self.laplas_filter = laplas_filter
+        self.bar_xy_filter = bar_xy_filter
+        self.delta_D_filter = delta_D_filter
 
         self.pre_conv3d_reshape = Rearrange('(b0 b1 Nz) Ny Nx -> b0 b1 Nz Ny Nx', b0=1, b1=1) # x = X.view(1, 1, Nz, Ny, Nx)
         self.post_conv3d_reshape = Rearrange('b0 b1 Nz Ny Nx -> (b0 b1 Nz) Ny Nx')
@@ -61,23 +69,24 @@ class Atmoshpere(torch.nn.Module):
 
     def step(self, dt, pi, theta, u, v, pi0, theta0, u0, v0):
         # flux
-        F = self.bar_x(self.pad_x(pi)) * u #* self.RE * self.dy  # (nz, ny, nx + 1)
-        G = self.bar_y(self.pad_y(pi)) * v #* self.RE * self.dx # * torch.cos(self.Y)  # (nz, ny + 1, nx)
-        # F = self.bar_x(self.pad_x(pi)) * 0.5 * u * self.RE * self.dy  # (nz, ny, nx + 1)
-        # G = self.bar_y(self.pad_y(pi)) * 0.5 * v * self.RE * self.dx * torch.cos(self.Y)  # (nz, ny + 1, nx)
-        # B = self.bar_y2(self.bar_x(self.pad_y(F))) / 12.  # (nz, ny, nx)
-        # C = self.bar_y2(self.bar_x(self.pad_y(self.pad_x(G)))) / 12.  # (nz, ny + 1, nx + 1)
-        # D = self.bar_y2(self.pad_y(G)) + self.bar_y(self.bar_x(self.pad_y(F))) / 24.  # (nx, ny + 1, nx)
-        # E = self.bar_y2(self.pad_y(G)) - self.bar_y(self.bar_x(self.pad_y(F))) / 24.  # (nx, ny + 1, nx)
-        # Q = self.bar_x2(self.bar_y(self.pad_x(self.pad_y(F)))) / 12.  # (nz, ny + 1, nx + 1)
-        # R = self.bar_x2(self.bar_y(self.pad_x(G))) / 12.  # (nz, ny, nx)
-        # S = self.bar_y(self.bar_x(self.pad_x(G))) + self.bar_x2(self.pad_x(F)) / 24.  # (nz, ny, nx + 1)
-        # T = self.bar_y(self.bar_x(self.pad_x(G))) - self.bar_x2(self.pad_x(F)) / 24.  # (nz, ny, nx + 1)
+        # F = self.bar_x(self.pad_x(pi)) * u * self.RE * self.dy  # (nz, ny, nx + 1)
+        # G = self.bar_y(self.pad_y(pi)) * v * self.RE * self.dx * torch.cos(self.Y)  # (nz, ny + 1, nx)
+        F = self.bar_x(self.pad_x(pi)) * 0.5 * u * self.RE * self.dy  # (nz, ny, nx + 1)
+        G = self.bar_y(self.pad_y(pi)) * 0.5 * v * self.RE * self.dx * torch.cos(self.Y)  # (nz, ny + 1, nx)
+        B = self.bar_y2(self.bar_x(self.pad_y(F))) / 12.  # (nz, ny, nx)
+        C = self.bar_y2(self.bar_x(self.pad_y(self.pad_x(G)))) / 12.  # (nz, ny + 1, nx + 1)
+        D = self.bar_y2(self.pad_y(G)) + self.bar_y(self.bar_x(self.pad_y(F))) / 24.  # (nx, ny + 1, nx)
+        E = self.bar_y2(self.pad_y(G)) - self.bar_y(self.bar_x(self.pad_y(F))) / 24.  # (nx, ny + 1, nx)
+        Q = self.bar_x2(self.bar_y(self.pad_x(self.pad_y(F)))) / 12.  # (nz, ny + 1, nx + 1)
+        R = self.bar_x2(self.bar_y(self.pad_x(G))) / 12.  # (nz, ny, nx)
+        S = self.bar_y(self.bar_x(self.pad_x(G))) + self.bar_x2(self.pad_x(F)) / 24.  # (nz, ny, nx + 1)
+        T = self.bar_y(self.bar_x(self.pad_x(G))) - self.bar_x2(self.pad_x(F)) / 24.  # (nz, ny, nx + 1)
 
-        # pi1 = pi0 - dt / self.deltaA * ((self.delta_x(F) + self.delta_y(G)) * self.dz).sum(axis=0)  # (nz, ny, nx)
-        tmp0 = ((self.delta_x(F) + self.delta_y(G)) * self.dz)
-        tmp1 = tmp0.sum(dim=0)
-        pi1 = pi0 - self.deltaA * tmp1 # pi1 = pi0 - dt / self.deltaA * tmp1
+        pi1 = pi0 - dt / self.deltaA * ((self.delta_x(F) + self.delta_y(G)) * self.dz).sum(dim=0) #sum(axis=0)  # (nz, ny, nx)
+        # tmp0 = ((self.delta_x(F) + self.delta_y(G)) * self.dz)
+        # tmp1 = tmp0.sum(dim=0)
+        # # pi1 = pi0 - self.deltaA * tmp1 #
+        # pi1 = pi0 - dt / self.deltaA * tmp1
 
         # print('pi:', pi1.mean())
 
@@ -89,15 +98,16 @@ class Atmoshpere(torch.nn.Module):
 
         # print('w:', self.w.mean())
 
-        # # update potential temperature theta (nz, ny, nx)
+        # update potential temperature theta (nz, ny, nx)
         # theta_ = self.pad_z(
         #     (self.bar_z(self.P * theta) - self.delta_z(theta) * self.P_[1:-1]) / self.delta_z(self.P)
         # )  # (nz + 1, ny, nx)
-        # theta1 = pi0 / pi1 * theta0 + dt / self.deltaA / pi1 * (
-        #     (self.delta_x(F * self.bar_x(self.pad_x(theta))) + self.delta_y(G * self.bar_y(self.pad_y(theta)))) / 2. +
-        #     pi * self.deltaA * self.delta_z(self.w * theta_) / self.dz +
-        #     10e8 * self.laplas(self.pad_z(self.pad_y(self.pad_x(theta))))
-        # )
+        theta_ = theta0 #TODO remove me
+        theta1 = pi0 / pi1 * theta0 + dt / self.deltaA / pi1 * (
+            (self.delta_x(F * self.bar_x(self.pad_x(theta))) + self.delta_y(G * self.bar_y(self.pad_y(theta)))) / 2. +
+            pi * self.deltaA * self.delta_z(self.w * theta_) / self.dz +
+            10e8 * self.laplas(self.pad_z(self.pad_y(self.pad_x(theta))))
+        )
 
         # print('theta:', theta1.mean())
 
@@ -110,64 +120,72 @@ class Atmoshpere(torch.nn.Module):
 
         # print('phi:', self.phi.mean())
 
-        # # update u (nz, ny, nx + 1)
-        # pi0_deltaA = self.bar_y2(self.bar_x(self.pad_y(self.pad_x(pi0 * self.deltaA)))) / 8.  # (nz, ny, nx + 1)
-        # pi1_deltaA = self.bar_y2(self.bar_x(self.pad_y(self.pad_x(pi1 * self.deltaA)))) / 8.  # (nz, ny, nx + 1)
-        # pi_w_deltaA = self.bar_y2(self.bar_x(self.pad_y(self.pad_x(pi * self.deltaA * self.w)))) / 8.  # (nz + 1, ny, nx + 1)
-        # advec = (
-        #     - self.delta_x(self.pad_x(B * self.bar_x(u)))
-        #     - self.delta_y(C * self.bar_y(self.pad_y(u)))
-        #     + self.delta_D(self.pad_x(D * self.bar_xy(self.pad_y(u))))
-        #     + self.delta_E(self.pad_x(E * self.bar_xy(self.pad_y(u))))
-        # ) / 2.
-        # trans = - self.delta_z(pi_w_deltaA * self.bar_z(self.pad_z(u)) * 0.5) / self.dz
-        # press = - self.RE * self.dy * (
-        #     self.delta_x(self.pad_x(self.phi)) * self.delta_x(self.pad_x(pi)) / 2. +
-        #     self.delta_x(self.pad_x(pi)) * 0.5 * self.CPD * self.bar_x(self.pad_x(
-        #         theta / self.dz * (self.delta_z(self.sigma * self.P_) - self.P * self.delta_z(self.sigma))
-        #     ))
-        # )
-        # diff = 10e8 * self.laplas(self.pad_z(self.pad_y(self.pad_x(u))))
-        # cori = self.RE * self.dx * self.dy * 0.25 * (
-        #     self.bar_x(self.pad_x(pi * self.bar_y(v) * (self.f + 0. * self.bar_x(u) * torch.sin(self.bar_y(self.Y)))))
-        # ) * 0.0
-        # u1 = (pi0_deltaA * u0 + dt * (advec + trans + press + diff + cori)) / pi1_deltaA
-        # # print('u1:', u1.mean())
+        # update u (nz, ny, nx + 1)
+        pi0_deltaA = self.bar_y2(self.bar_x(self.pad_y(self.pad_x(pi0 * self.deltaA)))) / 8.  # (nz, ny, nx + 1)
+        pi1_deltaA = self.bar_y2(self.bar_x(self.pad_y(self.pad_x(pi1 * self.deltaA)))) / 8.  # (nz, ny, nx + 1)
+        pi_w_deltaA = self.bar_y2(self.bar_x(self.pad_y(self.pad_x(pi * self.deltaA * self.w)))) / 8.  # (nz + 1, ny, nx + 1)
+        advec = (
+            - self.delta_x(self.pad_x(B * self.bar_x(u)))
+            - self.delta_y(C * self.bar_y(self.pad_y(u)))
+            + self.delta_D(self.pad_x(D * self.bar_xy(self.pad_y(u))))
+            + self.delta_E(self.pad_x(E * self.bar_xy(self.pad_y(u))))
+        ) / 2.
+        trans = - self.delta_z(pi_w_deltaA * self.bar_z(self.pad_z(u)) * 0.5) / self.dz
+        #TODO fixme press = - self.RE * self.dy * (
+        press = self.dy * (
+            self.delta_x(self.pad_x(self.phi)) * self.delta_x(self.pad_x(pi)) / 2. +
+            self.delta_x(self.pad_x(pi)) * 0.5 * self.CPD * self.bar_x(self.pad_x(
+                theta / self.dz * (self.delta_z(self.sigma * self.P_) - self.P * self.delta_z(self.sigma))
+            ))
+        )
+        diff = 10e8 * self.laplas(self.pad_z(self.pad_y(self.pad_x(u))))
+        #TODO fixme cori = self.RE * self.dx * self.dy * 0.25 * (
+        cori = self.dy * (
+            self.bar_x(self.pad_x(pi * self.bar_y(v) * (self.f + 0. * self.bar_x(u) * torch.sin(self.bar_y(self.Y)))))
+        ) * 0.0
+        u1 = (pi0_deltaA * u0 + dt * (advec + trans + press + diff + cori)) / pi1_deltaA
+        # print('u1:', u1.mean())
 
         # # update v (nz, ny + 1, nx)
-        # pi0_deltaA = self.bar_x2(self.bar_y(self.pad_x(self.pad_y(pi0 * self.deltaA)))) / 8.  # (nz, ny + 1, nx)
-        # pi1_deltaA = self.bar_x2(self.bar_y(self.pad_x(self.pad_y(pi1 * self.deltaA)))) / 8.  # (nz, ny + 1, nx)
-        # pi_w_deltaA = self.bar_x2(self.bar_y(self.pad_x(self.pad_y(pi * self.deltaA * self.w)))) / 8.  # (nz + 1, ny + 1, nx)
-        # advec = (
-        #     - self.delta_x(Q * self.bar_x(self.pad_x(v)))
-        #     - self.delta_y(self.pad_y(R * self.bar_y(v)))
-        #     + self.delta_D(self.pad_y(S * self.bar_xy(self.pad_x(v))))
-        #     + self.delta_E(self.pad_y(T * self.bar_xy(self.pad_x(v))))
-        # ) / 2.
-        # trans = - self.delta_z(pi_w_deltaA * self.bar_z(self.pad_z(v)) * 0.5) / self.dz
-        # press = - self.RE * self.dx * (
-        #     self.delta_y(self.pad_y(self.phi)) * self.delta_y(self.pad_y(pi)) / 2. +
-        #     self.delta_y(self.pad_y(pi)) * 0.5 * self.CPD * self.bar_y(self.pad_y(
-        #         theta / self.dz * (self.delta_z(self.sigma * self.P_) - self.P * self.delta_z(self.sigma))
-        #     ))
-        # )
-        # diff = 10e8 * self.laplas(self.pad_z(self.pad_y(self.pad_x(v))))
-        # cori = - self.RE * self.dx * self.dy * 0.25 * (
-        #     self.bar_y(self.pad_y(pi * self.bar_x(u) * (self.f + self.bar_x(u) * torch.sin(self.bar_y(self.Y)))))
-        # ) * 0.0
-        # v1 = (pi0_deltaA * v0 + dt * (advec + trans + press + diff + cori)) / pi1_deltaA
+        pi0_deltaA = self.bar_x2(self.bar_y(self.pad_x(self.pad_y(pi0 * self.deltaA)))) / 8.  # (nz, ny + 1, nx)
+        pi1_deltaA = self.bar_x2(self.bar_y(self.pad_x(self.pad_y(pi1 * self.deltaA)))) / 8.  # (nz, ny + 1, nx)
+        pi_w_deltaA = self.bar_x2(self.bar_y(self.pad_x(self.pad_y(pi * self.deltaA * self.w)))) / 8.  # (nz + 1, ny + 1, nx)
+        advec = (
+            - self.delta_x(Q * self.bar_x(self.pad_x(v)))
+            - self.delta_y(self.pad_y(R * self.bar_y(v)))
+            + self.delta_D(self.pad_y(S * self.bar_xy(self.pad_x(v))))
+            + self.delta_E(self.pad_y(T * self.bar_xy(self.pad_x(v))))
+        ) / 2.
+        trans = - self.delta_z(pi_w_deltaA * self.bar_z(self.pad_z(v)) * 0.5) / self.dz
+        #TODO fixme press = - self.RE * self.dx * (
+        press = self.dx * (
+            self.delta_y(self.pad_y(self.phi)) * self.delta_y(self.pad_y(pi)) / 2. +
+            self.delta_y(self.pad_y(pi)) * 0.5 * self.CPD * self.bar_y(self.pad_y(
+                theta / self.dz * (self.delta_z(self.sigma * self.P_) - self.P * self.delta_z(self.sigma))
+            ))
+        )
+        diff = 10e8 * self.laplas(self.pad_z(self.pad_y(self.pad_x(v))))
+        #TODO fixme cori = - self.RE * self.dx * self.dy * 0.25 * (
+        cori = self.dy * (
+            self.bar_y(self.pad_y(pi * self.bar_x(u) * (self.f + self.bar_x(u) * torch.sin(self.bar_y(self.Y)))))
+        ) * 0.0
+        v1 = (pi0_deltaA * v0 + dt * (advec + trans + press + diff + cori)) / pi1_deltaA
         # # print('v1:', v1.mean())
 
         # return pi1, theta1, u1, v1
         # return pi1, theta0, u0, v0
-        return pi1, theta0, u0, v0
+        return pi1, theta1, u1, v1
 
     def forward(self, pi, theta, u, v, dt):
         # pi_, theta_, u_, v_ = self.step(dt / 2., pi, theta, u, v, pi, theta, u, v)
         # return self.step(dt, pi_, theta_, u_, v_, pi, theta, u, v)
 
         #TODO recover me
-        return self.step(dt, pi, theta, u, v, pi, theta, u, v)
+        # pi1, theta0, u0, v0 = self.step(dt, pi, theta, u, v, pi, theta, u, v)
+        # return pi1, theta0, u0, v0
+        pi1, theta1, u1, v1 = self.step(dt, pi, theta, u, v, pi, theta, u, v)
+        return pi1, theta1, u1, v1
+
 
 
     def pad_x(self, X):
@@ -184,9 +202,11 @@ class Atmoshpere(torch.nn.Module):
         return x_unext
 
     def bar_x2(self, X):
-        nz, ny, nx = X.shape
-        filter = torch.tensor([1., 2., 1.]).view(1, 1, 1, 1, 3)
-        return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny, nx - 2)
+        # nz, ny, nx = X.shape
+        # filter = torch.tensor([1., 2., 1.]).view(1, 1, 1, 1, 3)
+        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny, nx - 2)
+        filter = self.bar_x2_filter
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
 
     def delta_x(self, X):
         # nz, ny, nx = X.shape
@@ -212,9 +232,11 @@ class Atmoshpere(torch.nn.Module):
         return x_unext
 
     def bar_y2(self, X):
-        nz, ny, nx = X.shape
-        filter = torch.tensor([1., 2., 1.]).view(1, 1, 1, 3, 1)
-        return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 2, nx)
+        # nz, ny, nx = X.shape
+        # filter = torch.tensor([1., 2., 1.]).view(1, 1, 1, 3, 1)
+        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 2, nx)
+        filter = self.bar_y2_filter #torch.tensor([1., 2., 1.]).view(1, 1, 1, 3, 1)
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
 
     def delta_y(self, X):
         # nz, ny, nx = X.shape
@@ -223,59 +245,74 @@ class Atmoshpere(torch.nn.Module):
         filter = self.delta_y_filter
         return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
 
-
     def bar_z(self, X):
-        nz, ny, nx = X.shape
-        filter = torch.tensor([1., 1.]).view(1, 1, 2, 1, 1)
-        return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz - 1, ny, nx)
+        # nz, ny, nx = X.shape
+        # filter = torch.tensor([1., 1.]).view(1, 1, 2, 1, 1)
+        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz - 1, ny, nx)
+        filter = self.bar_z_filter
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
 
     def pad_z(self, X):
-        nz, ny, nx = X.shape
-        return F.pad(X.view(1, 1, nz, ny, nx), (0, 0, 0, 0, 1, 1)).view(nz + 2, ny, nx)
+        # nz, ny, nx = X.shape
+        # return F.pad(X.view(1, 1, nz, ny, nx), (0, 0, 0, 0, 1, 1)).view(nz + 2, ny, nx)
+        return F.pad(X, (0, 0, 0, 0, 1, 1))
 
     def delta_z(self, X):
-        nz, ny, nx = X.shape
-        filter = torch.tensor([-1., 1.]).view(1, 1, 2, 1, 1)
-        return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz - 1, ny, nx)
+        # nz, ny, nx = X.shape
+        # filter = torch.tensor([-1., 1.]).view(1, 1, 2, 1, 1)
+        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz - 1, ny, nx)
+        filter = self.delta_z_filter
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+
 
     def delta_D(self, X):
-        nz, ny, nx = X.shape
-        filter = torch.tensor(
-            [[1., 0.],
-             [0., -1.]]
-        ).view(1, 1, 1, 2, 2)
-        return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 1, nx - 1)
+        # nz, ny, nx = X.shape
+        # filter = torch.tensor(
+        #     [[1., 0.],
+        #      [0., -1.]]
+        # ).view(1, 1, 1, 2, 2)
+        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 1, nx - 1)
+        filter = self.delta_D_filter
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
 
     def delta_E(self, X):
-        nz, ny, nx = X.shape
-        filter = torch.tensor(
-            [[0., 1.],
-             [-1., 0.]]
-        ).view(1, 1, 1, 2, 2)
-        return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 1, nx - 1)
+        # nz, ny, nx = X.shape
+        # filter = torch.tensor(
+        #     [[0., 1.],
+        #      [-1., 0.]]
+        # ).view(1, 1, 1, 2, 2)
+        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 1, nx - 1)
+        filter = self.delta_E_filter
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+
 
     def bar_xy(self, X):
-        nz, ny, nx = X.shape
-        filter = torch.tensor(
-            [[1., 0.],
-             [0., 1.]]
-        ).view(1, 1, 1, 2, 2)
-        return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 1, nx - 1)
+        # nz, ny, nx = X.shape
+        # filter = torch.tensor(
+        #     [[1., 0.],
+        #      [0., 1.]]
+        # ).view(1, 1, 1, 2, 2)
+        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 1, nx - 1)
+        filter = self.bar_xy_filter
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+
 
     def laplas(self, X):
-        nz, ny, nx = X.shape
-        filter = torch.tensor(
-            [[[0., 0., 0.],
-              [0., 1., 0.],
-              [0., 0., 0.]],
-             [[0., 1., 0.],
-              [1., -6, 1.],
-              [0., 1., 0.]],
-             [[0., 0., 0.],
-              [0., 1., 0.],
-              [0., 0., 0.]]],
-        ).view(1, 1, 3, 3, 3)
-        return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz - 2, ny - 2, nx - 2)
+        # nz, ny, nx = X.shape
+        # filter = torch.tensor(
+        #     [[[0., 0., 0.],
+        #       [0., 1., 0.],
+        #       [0., 0., 0.]],
+        #      [[0., 1., 0.],
+        #       [1., -6, 1.],
+        #       [0., 1., 0.]],
+        #      [[0., 0., 0.],
+        #       [0., 1., 0.],
+        #       [0., 0., 0.]]],
+        # ).view(1, 1, 3, 3, 3)
+        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz - 2, ny - 2, nx - 2)
+        filter = self.laplas_filter
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
 
 
 class LoopVariables(cube.runtime.syndata.CubeDataLoader):
@@ -283,7 +320,7 @@ class LoopVariables(cube.runtime.syndata.CubeDataLoader):
     def __init__(self, variables: List[torch.Tensor], constants: List[torch.Tensor]):
         # for var in variables + constants:
         #     print("### var = {}, type = {}".format(var, type(var)))
-        shapes = [list(var.size()) for var in variables + constants]
+        shapes = [list(var.size() if len(var.size()) > 0 else [1]) for var in variables + constants]
         dtypes = [var.dtype for var in variables + constants]
         batch_dims = [0] * (len(variables) + len(constants))
         super().__init__(shapes, dtypes, batch_dims)
@@ -469,10 +506,37 @@ if __name__ == "__main__":
     bar_y_filter = torch.tensor([1., 1.]).view(1, 1, 1, 2, 1)
     delta_x_filter = torch.tensor([-1., 1.]).view(1, 1, 1, 1, 2)
     delta_y_filter = torch.tensor([-1., 1.]).view(1, 1, 1, 2, 1)
+    bar_y2_filter = torch.tensor([1., 2., 1.]).view(1, 1, 1, 3, 1)
+    bar_x2_filter = torch.tensor([1., 2., 1.]).view(1, 1, 1, 1, 3)
+    bar_z_filter = torch.tensor([1., 1.]).view(1, 1, 2, 1, 1)
+    delta_z_filter = torch.tensor([-1., 1.]).view(1, 1, 2, 1, 1)
+    delta_E_filter = torch.tensor(
+        [[0., 1.],
+         [-1., 0.]]
+    ).view(1, 1, 1, 2, 2)
+    laplas_filter = torch.tensor(
+        [[[0., 0., 0.],
+          [0., 1., 0.],
+          [0., 0., 0.]],
+         [[0., 1., 0.],
+          [1., -6, 1.],
+          [0., 1., 0.]],
+         [[0., 0., 0.],
+          [0., 1., 0.],
+          [0., 0., 0.]]],
+    ).view(1, 1, 3, 3, 3)
+    bar_xy_filter = torch.tensor(
+        [[1., 0.],
+         [0., 1.]]
+    ).view(1, 1, 1, 2, 2)
+    delta_D_filter = torch.tensor(
+            [[1., 0.],
+             [0., -1.]]
+        ).view(1, 1, 1, 2, 2)
 
 
     model = Atmoshpere(nz, ny, nx, dy, dx, x0, y0, deltaA, Y, f, sigma, P_, P, phi, zs, w,
-                       bar_x_filter, bar_y_filter, delta_x_filter, delta_y_filter)
+                       bar_x_filter, bar_y_filter, delta_x_filter, delta_y_filter, bar_y2_filter, bar_x2_filter, bar_z_filter, delta_z_filter, delta_E_filter, laplas_filter,bar_xy_filter,delta_D_filter)
 
     print("[pi, theta, u, v, dt]")
     for var in [pi, theta, u, v, dt]:
