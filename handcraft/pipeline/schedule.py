@@ -63,7 +63,6 @@ def schedule_naive(model, dataloader, num_microbatch: int):
         # recv forward
         if is_first_stage():
             input = next(dataloader)
-            print(input)
         else:
             # print(f'rank {rank} recving forward input...')
             input = coll.recv(model.input_shape(), prev_rank, model.input_dtype())
@@ -160,7 +159,7 @@ def schedule_tp_1f1b(model: torch.nn.Module,
         if rank == 0:
             pass
 
-        if rank != 0 and rank % 2 == 0:
+        if rank % 2 == 0 and rank != 0:
             # inter-barrier
             if do_backward and last_forward is not None:
                 # print(f'rank {rank} recv backward grad + send forward output ')
@@ -203,52 +202,24 @@ def schedule_tp_1f1b(model: torch.nn.Module,
                 input_tensors.append(input)
                 output_tensors.append(output)
                 last_forward = output
-
-        if rank == 1:
-
-            # forward
-            if do_forward:
-                input = output_1st
-                output = forward_step(model, input)
-                input_tensors.append(input)
-                output_tensors.append(output)
-
-            # intra-barrier send recv
-            if do_forward and do_backward:
-                # send forward recv backward
-                # print(f'rank {rank} recv backward grad + send forward output ')
-                output_grad = coll.sendrecv(
-                    [output], [output.size()], [output.dtype],
-                    [next_rank], [next_rank]
-                )[0]
-            elif do_forward:
-                # print(f'rank {rank} send forward output ')
-                coll.send(output, next_rank)
-            elif do_backward:
-                # print(f'rank {rank} recv backward grad ')
-                output_grad = coll.recv(model.output_shape(), next_rank, model.output_dtype())
             
-            # backward
-            if do_backward:
-                input, output = input_tensors.pop(0), output_tensors.pop(0)
-                input_grad = backward_step([input], [output], [output_grad])[0]
-                last_backward = input_grad
-            
-        if rank != 1 and rank % 2 == 1:
-
+        if rank % 2 == 1:
             # inter-barrier
-            if do_forward and last_backward is not None:
-                # print(f'rank {rank} send backward grad + recv forward output ')
-                input = coll.sendrecv(
-                    [input_grad], [model.input_shape()], [model.input_dtype()],
-                    [prev_rank], [prev_rank]
-                )[0]
-            elif do_forward:
-                # print(f'rank {rank} recv forward output ')
-                input = coll.recv(model.input_shape(), prev_rank, model.input_dtype())
-            elif last_backward is not None:
-                # print(f'rank {rank} send backward grad ')
-                coll.send(last_backward, prev_rank)
+            if rank == 1:
+                input = output_1st
+            else:
+                if do_forward and last_backward is not None:
+                    # print(f'rank {rank} send backward grad + recv forward output ')
+                    input = coll.sendrecv(
+                        [input_grad], [model.input_shape()], [model.input_dtype()],
+                        [prev_rank], [prev_rank]
+                    )[0]
+                elif do_forward:
+                    # print(f'rank {rank} recv forward output ')
+                    input = coll.recv(model.input_shape(), prev_rank, model.input_dtype())
+                elif last_backward is not None:
+                    # print(f'rank {rank} send backward grad ')
+                    coll.send(last_backward, prev_rank)
 
             # forward
             if do_forward:
@@ -273,6 +244,7 @@ def schedule_tp_1f1b(model: torch.nn.Module,
                 output_grad = coll.recv(model.output_shape(), next_rank, model.output_dtype())
 
             # backward + forward
+            last_backward = None
             if do_backward:
                 input, output = input_tensors.pop(0), output_tensors.pop(0)
                 input_grad = backward_step([input], [output], [output_grad])[0]
@@ -391,6 +363,7 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
                 output_grad = coll.recv(model.output_shape(), next_rank, model.output_dtype())
 
             # backward
+            last_backward = None
             if do_backward:
                 input, output = input_tensors.pop(0), output_tensors.pop(0)
                 input_grad = backward_step([input], [output], [output_grad])[0]
@@ -450,7 +423,6 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
             tp_backward(last_backward)
 
         # memory_summary()
-        # print_each_rank(f'{len(input_1st_tensors)}, {len(input_tensors)}')
         # if rank == 0:
         #     io_input(f'{step}>>>')
         # torch.distributed.barrier()
