@@ -144,7 +144,7 @@ def schedule_tp_1f1b(model: torch.nn.Module,
     bofst = bofst[rank]
     last_backward = None
     last_forward = None
-    for step in range(num_microbatch + 2):
+    for step in range(num_microbatch + num_stage - 2):
         torch.distributed.barrier()
         # print_each_rank(f'=========begin rank {rank}=========')
         fmid, bmid = step + fofst, step + bofst
@@ -286,6 +286,11 @@ def schedule_tp_1f1b(model: torch.nn.Module,
         # if rank == 0:
         #     io_input(f'{step}>>>')
         # torch.distributed.barrier()
+
+    assert len(input_tensors) == 0
+    assert len(output_tensors) == 0
+    assert len(input_1st_tensors) == 0
+    assert len(output_1st_tensors) == 0
 
         # print_each_rank(f'=========end rank {rank}=========')
 
@@ -453,7 +458,6 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
 
     assert len(input_tensors) == 0
     assert len(output_tensors) == 0
-
     assert len(input_1st_tensors) == 0
     assert len(output_1st_tensors) == 0
 
