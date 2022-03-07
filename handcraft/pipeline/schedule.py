@@ -2,8 +2,11 @@ from typing import List
 import torch
 
 from cube.profiler.timer import CudaTimer, print_each_rank
+from cube.profiler.memory import memory_summary
 import cube.runtime.adapter.collectives as coll
 from cube.runtime.device import DeviceGroup
+
+io_input = input
 
 
 def forward_step(model, *args, **kwargs):
@@ -56,10 +59,11 @@ def schedule_naive(model, dataloader, num_microbatch: int):
     rank = DeviceGroup().rank
     next_rank = (DeviceGroup().rank + 1) % DeviceGroup().world_size
     prev_rank = (DeviceGroup().rank - 1) % DeviceGroup().world_size
-    for _ in range(num_microbatch):
+    for step in range(num_microbatch):
         # recv forward
         if is_first_stage():
             input = next(dataloader)
+            print(input)
         else:
             # print(f'rank {rank} recving forward input...')
             input = coll.recv(model.input_shape(), prev_rank, model.input_dtype())
@@ -80,6 +84,11 @@ def schedule_naive(model, dataloader, num_microbatch: int):
         if not is_first_stage():
             # print(f'rank {rank} sending backward output...')
             coll.send(input_grad, prev_rank)
+
+        # memory_summary()
+        # if rank == 0:
+        #     io_input(f'{step}>>>')
+        # torch.distributed.barrier()
 
 
 def schedule_tp_1f1b(model: torch.nn.Module,
@@ -353,6 +362,9 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
                 input_tensors.append(input)
                 output_tensors.append(output)
 
+            # mem = torch.cuda.max_memory_allocated()
+            # print(f'rank {rank}: {mem / 1024 / 1024 / 1024} GB forward')
+
             # intra-barrier send recv
             output_grad = None
             if (do_forward and not is_last_stage()) and (do_backward and not is_last_stage()):
@@ -428,6 +440,11 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
             # print(f'rank {rank} backward tp model ')
             tp_backward(last_backward)
 
+        # memory_summary()
+        # print_each_rank(f'{len(input_1st_tensors)}, {len(input_tensors)}')
+        # if rank == 0:
+        #     io_input(f'{step}>>>')
+        # torch.distributed.barrier()
         # print_each_rank(f'=========end rank {rank}: {step}=========')
 
     assert len(input_tensors) == 0

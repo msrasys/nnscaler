@@ -34,6 +34,8 @@ Stage Else:
 Condition: N > 8M - E
 """
 
+io_input = input
+
 class ReduceEmbed(torch.autograd.Function):
 
     @staticmethod
@@ -60,16 +62,17 @@ class IdentityFoward(torch.autograd.Function):
 
 class DummyModelEmbed(torch.nn.Module):
 
-    def __init__(self, M: int, N: int, E: int, stage_id: int, sharding=False):
+    def __init__(self, M: int, N: int, E: int, sharding=False):
         super().__init__()
         self.M = M
         self.N = N
         self.E = E
         self.sharding = sharding
-        chunk_num = torch.distributed.get_world_size() if sharding else 1
+        chunk_num = DeviceGroup().world_size if sharding else 1
+        stage_id = DeviceGroup().rank if sharding else 1
         self.vocab_start_index = N // chunk_num * stage_id
         self.vocab_end_index = N // chunk_num * (stage_id + 1)
-        self.embed_weight = torch.nn.Parameter(torch.zeros((N // chunk_num, E)))
+        self.embed_weight = torch.nn.Parameter(torch.ones((N // chunk_num, E)))
 
     def input_shape(self):
         return (self.M, )
@@ -90,6 +93,7 @@ class DummyModelEmbed(torch.nn.Module):
             input = input.clone() - self.vocab_start_index
             input[mask] = 0
             input = F.embedding(input, self.embed_weight)
+            input[mask, :] = 0.0
             input = ReduceEmbed.apply(input)
         else:
             input = F.embedding(input, self.embed_weight)
@@ -111,7 +115,7 @@ class DummyModel(torch.nn.Module):
         self.embed = embed
         # first stage
         chunk_num = torch.distributed.get_world_size() if sharding else 1
-        self.fc_weight = torch.nn.Parameter(torch.zeros((E // chunk_num, E)))
+        self.fc_weight = torch.nn.Parameter(torch.ones((E // chunk_num, E)) / 10000)
 
     def input_shape(self):
         if self.embed:
@@ -135,6 +139,7 @@ class DummyModel(torch.nn.Module):
         return torch.float32
 
     def forward(self, input: torch.Tensor):
+        # print(f'[{DeviceGroup().rank}] input: {input}, shape={input.size()}')
         if self.embed:
             input = self.embed(input)
 
@@ -144,6 +149,7 @@ class DummyModel(torch.nn.Module):
 
         if self.is_last_stage:
             output = torch.sum(output)
+        # print(f'[{DeviceGroup().rank}] output: {output}, shape={output.size()}')
         return output
 
 
@@ -158,39 +164,39 @@ class DummyModelTP(torch.nn.Module):
 
         self.vocab_start_index = N // self.stages * stage_id
         self.vocab_end_index = N // self.stages * (stage_id + 1)
-        self.embed_weight = torch.nn.Parameter(torch.zeros((N // self.stages, E)))
+        self.embed = DummyModelEmbed(M, N, E, sharding=True)
         self.fc_weights = torch.nn.ParameterList()
         for idx in range(self.stages):
             if idx % 2 == 0:
                 self.fc_weights.append(
-                    torch.nn.Parameter(torch.zeros((E // self.stages, E)))
+                    torch.nn.Parameter(torch.ones((E // self.stages, E)) / 10000)
                 )
             else:
                 self.fc_weights.append(
-                    torch.nn.Parameter(torch.zeros((E, E // self.stages)))
+                    torch.nn.Parameter(torch.ones((E, E // self.stages)) / 10000)
                 )
 
     def forward(self, input: torch.Tensor):
-        mask = (input < self.vocab_start_index) | \
-                        (input >= self.vocab_end_index)
-        input = input.clone() - self.vocab_start_index
-        input[mask] = 0
-        input = F.embedding(input, self.embed_weight)
-        x = ReduceEmbed.apply(input)
+        x = self.embed(input)
+        # print(f'embed: {x}')
         for idx in range(self.stages):
             # column partition
             if idx % 2 == 0:
                 x = IdentityFoward.apply(x)
                 x = F.linear(x, self.fc_weights[idx])
             else:
-                x = ReduceEmbed.apply(x)
                 x = F.linear(x, self.fc_weights[idx])
+                x = ReduceEmbed.apply(x)
+            # print(f'linear: {x}')
         # reduce
-        if self.stages % 2 == 0:
-            x = ReduceEmbed.apply(x)
-        else:
+        if self.stages % 2 != 0:
             raise RuntimeError("number of stages only supported to be mod 2 == 0")
-        return torch.sum(x)
+        loss = torch.sum(x)
+        # print(loss)
+        # if rank == 0:
+        #     io_input(f'{step}>>>')
+        # torch.distributed.barrier()
+        return loss
 
 
 if __name__ == '__main__':
@@ -221,26 +227,41 @@ if __name__ == '__main__':
 
     # tp 1f1b
     if args.use_tp1f1b:
-        embed = DummyModelEmbed(args.M, args.N, args.E, 0, sharding=True).cuda()
+        embed = DummyModelEmbed(args.M, args.N, args.E, sharding=True).cuda()
         first_stage_model = DummyModel(args.M, args.N, args.E, 0, sharding=True, embed=embed).cuda()
         if rank == 0:
             model = None
         else:
             model = DummyModel(args.M, args.N, args.E, rank, sharding=False).cuda()
+        # optimizer
+        if rank == 0:
+            parameters = first_stage_model.parameters()
+        else:
+            parameters = list(first_stage_model.parameters()) + list(model.parameters())
+        optimizer = torch.optim.Adam(parameters)
 
     if args.use_naive:
         # naive pipleline
         embed = None
         if rank == 0:
-            embed = DummyModelEmbed(args.M, args.N, args.E, 0, sharding=False).cuda()
+            embed = DummyModelEmbed(args.M, args.N, args.E, sharding=False).cuda()
         model = DummyModel(args.M, args.N, args.E, rank, sharding=False, embed=embed).cuda()
+        # optimizer
+        optimizer = torch.optim.Adam(model.parameters())
+
 
     if args.use_tp1f1b_pack:
-        embed = DummyModelEmbed(args.M, args.N, args.E, 0, sharding=True).cuda()
+        embed = DummyModelEmbed(args.M, args.N, args.E, sharding=True).cuda()
         model = DummyModel(args.M, args.N, args.E, rank, sharding=False).cuda()
+        optimizer = torch.optim.Adam(list(embed.parameters()) + list(model.parameters()))
 
     if args.use_tp:
         model = DummyModelTP(args.M, args.N, args.E, rank).cuda()
+        optimizer = torch.optim.Adam(model.parameters())
+
+    # 0.11GB
+    print_each_rank('model consumption')
+    memory_summary()
 
     dataloader = SynTextDataLoader(
         shapes=([args.M],),
@@ -248,6 +269,10 @@ if __name__ == '__main__':
         batch_dims=(0,),
         length=128000
     )
+
+    # 0.11GB
+    print_each_rank('model + dataloader consumption')
+    memory_summary()
 
     iter_num = 64
     CudaTimer(enable=False).warmup()
@@ -266,6 +291,9 @@ if __name__ == '__main__':
                 data = next(dataloader)
                 loss = model(data)
                 loss.backward()
+        
+        optimizer.step()
+        optimizer.zero_grad()
 
         if step >= 20:
             CudaTimer().stop('e2e')
