@@ -2,8 +2,7 @@
 Register cutomized function
 """
 
-from functools import partial
-from typing import Callable, List
+from typing import Any, Callable, List
 import inspect
 import torch
 
@@ -12,47 +11,44 @@ from cube.graph.operator.function.einops import IREinops
 from cube.graph.parser.mapping import Sign2Op
 
 
-def register(anno: str, stay: List[str] = None):
+def register(anno: str):
     """
     Register a function with einop annotations.
 
-    This function is cooperated with CustomizeEinop.
-    User needs to define a python function with type annotations
-    for each input argument. And user needs to pass dimension annotations
-    as well as (optional) frozen split dimensions (i.e., the dimensions cannot split).
+    This function is cooperated with IREinOp.
+    User needs to define a python function that satisfies
+        1). Has type annotations for each input
+        2). Tensor inputs goes first then other inputs
 
-    For EinDims containing brackets (e.g., (3 h d)),
-    user should have same argument name in the function definition
-    to help system infer each dim length, e.g.,
+    For EinDims containing brackets (e.g., (3 h d)) that can not be
+    inferred by system, user should have same argument name in the
+    function definition to help system infer each dim length, e.g.,
     
     @cube.register('a (b c) -> (a b) c')
     def funcname(x: torch.Tensor, b: int = 4):
         xxx
-    
     """
-    if stay is None:
-        stay = list()
-
     def decorator(fn: Callable):
         if not callable(fn):
             raise TypeError("Expected a function")
+        fsig = fn.__name__
         args = inspect.signature(fn)
         arg_names = list(args.parameters.keys())
         arg_kind = [args.parameters[name].annotation for name in arg_names]
-        func_name = fn.__name__
-        kwarg_idx = list()
-        kwarg_name = list()
-        for idx, (name, kind) in enumerate(zip(arg_names, arg_kind)):
-            if kind != torch.Tensor:
-                kwarg_name.append(name)
-                kwarg_idx.append(idx)
-        print(f'registering op {func_name} with {len(args.parameters) - len(kwarg_idx)} inputs and {len(kwarg_idx)} kwargs...')
-        udfop = partial(IREinops,
-            name=func_name,
-            anno=[anno],
-            kwarg_idx=kwarg_idx, kwarg_name=kwarg_name
-        )
-        Sign2Op.register(func_name, udfop)
+        kwarg_names = [name for (name, kind) in zip(arg_names, arg_kind) if kind != torch.Tensor]
+        nkwargs = len(kwarg_names)
+        ninputs = len(arg_names) - len(kwarg_names)
+
+        def udfop(signature: str, inputs: List[Any]):
+            tensors = inputs[:ninputs]
+            kwarg_vals = inputs[ninputs:]
+            kwargs = dict()
+            for name, val in zip(kwarg_names, kwarg_vals):
+                kwargs[name] = val
+            return IREinops(signature, [anno], tensors, **kwargs, name=fsig)
+
+        print(f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
+        Sign2Op.register(fsig, udfop)
         return fn
 
     return decorator

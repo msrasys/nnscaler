@@ -251,7 +251,12 @@ class IREinops(IRFwOperation):
                 self._oannos = anno.outputs
                 break
         else:
-            raise RuntimeError("No matching anno for given annos")
+            raise RuntimeError(
+                f"no matching anno for given annos."
+                f"op: {signature}\n"
+                f"inputs: {inputs}\n"
+                f"annos: {annos}\n"
+            )
 
         n_outputs = len(self._oannos)
         super().__init__(name, signature, len(inputs), n_outputs)

@@ -3,7 +3,7 @@ import string
 import copy
 
 from cube.ir.cten import IRTensor
-from cube.graph.operator.function.einops import EinDim, EinopAnno, IREinops
+from cube.graph.operator.function.einops import EinDim, IREinops
 from cube.graph.operator.function.conv import IRConv2D
 from cube.graph.operator.function.conv import IRConv3D
 from cube.graph.operator.function.pad import IRPad
@@ -63,6 +63,8 @@ def Linear(signature, inputs):
         'b * k+, n k+ -> b * n',   # no bias
         'b * k+, n k+, n -> b * n' # have bias
     ]
+    if inputs[2] is None:
+        inputs = inputs[0:2]
     return IREinops(signature, annos, inputs, 'linear')
 
 
