@@ -38,6 +38,9 @@ def register(anno: str):
         kwarg_names = [name for (name, kind) in zip(arg_names, arg_kind) if kind != torch.Tensor]
         nkwargs = len(kwarg_names)
         ninputs = len(arg_names) - len(kwarg_names)
+        # get customized op code
+        code = inspect.getsource(fn)
+        code = code[code.index('def'):]
 
         def udfop(signature: str, inputs: List[Any]):
             tensors = inputs[:ninputs]
@@ -48,7 +51,7 @@ def register(anno: str):
             return IREinops(signature, [anno], tensors, **kwargs, name=fsig)
 
         print(f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
-        Sign2Op.register(fsig, udfop)
+        Sign2Op.register(fsig, udfop, code)
         return fn
 
     return decorator

@@ -4,6 +4,7 @@ Generate Pytorch code given the model DAG and the transformation config
 from typing import Dict, List, Any, Tuple
 import torch
 import copy
+from cube.graph.parser.mapping import Sign2Op
 
 from cube.ir.cten import IRCell, IRTensor
 from cube.ir.dtype import IRDType
@@ -62,6 +63,10 @@ class ModelCodeGen(CodeGen):
         self.init_code: List[str] = [
             '\n\n########## Generated Model Code ###########',
             'import torch', 'import cube', '', '']
+        # customized op code
+        for _, op_impl in Sign2Op.kOpCodeDef.items():
+            self.init_code.append(op_impl)
+            self.init_code += ['', '']
         # module init code
         self.declare_region: List[str] = list()
         # module forward code

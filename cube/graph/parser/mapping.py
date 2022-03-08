@@ -2,6 +2,7 @@
 Mapping of
     Signature -> IROperator
 """
+from typing import Dict
 import torch
 
 from functools import partial
@@ -26,7 +27,7 @@ class Sign2Op:
             # return partial(function.UnkownOperator, signature=signature)
 
     @staticmethod
-    def register(signature: str, op: IRFwOperation):
+    def register(signature: str, op: IRFwOperation, code):
         """
         Register an operator
         """
@@ -35,6 +36,7 @@ class Sign2Op:
         if signature in Sign2Op.kOpMap:
             raise KeyError(f"function {signature} is already registered")
         Sign2Op.kOpMap[signature] = op
+        Sign2Op.kOpCodeDef[signature] = code
 
     # functional templates
     __ftemplate = lambda name: f'torch.nn.functional.{name}'
@@ -94,8 +96,10 @@ class Sign2Op:
         #einops
         __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
 
-
     }
+
+    # customized operator code: signature -> code
+    kOpCodeDef: Dict[str, str] = {}
 
 
 class DType2IRDType:
