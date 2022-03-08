@@ -2,6 +2,8 @@ from typing import Iterable, List, Optional, Union, Dict
 import string
 import copy
 
+from numpy import isin
+
 from cube.ir.cten import IRTensor
 from cube.graph.operator.function.einops import EinDim, IREinops
 from cube.graph.operator.function.conv import IRConv2D
@@ -244,7 +246,19 @@ def Dropout(signature, inputs):
     tensor = inputs[0:1]
     p, training, inplace = inputs[1], inputs[2], inputs[3]
     return IREinops(signature, annos, tensor, 'dropout',
-                    p=p, traning=training, inplace=inplace)
+                    p=p, training=training, inplace=inplace)
+
+
+def LayerNorm(signature, inputs):
+    input, normalized_shape, weight, bias, eps = inputs
+    if len(normalized_shape) != 1:
+        raise NotImplementedError("Only support normalized_shape to be int")
+    annos = [
+        f'N *, 1, {normalized_shape[0]}, {normalized_shape[0]} -> N *',
+        f'N *, 1, 1, 1 -> N *'
+    ]
+    return IREinops(signature, annos, [input, normalized_shape, weight, bias],
+                    'layernorm', eps=eps)
 
 
 def Sum(signature, inputs):

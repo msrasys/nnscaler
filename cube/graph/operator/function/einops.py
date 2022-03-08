@@ -365,6 +365,8 @@ class IREinops(IRFwOperation):
         # check dimension consistency
         dimlen: Dict[str, int] = dict()
         for eshape, input in zip(anno.inputs, inputs):
+            if input is None:
+                continue
             if not isinstance(input, IRTensor):
                 if not (len(eshape) == 1 and eshape[0].name == '1'):
                     return False

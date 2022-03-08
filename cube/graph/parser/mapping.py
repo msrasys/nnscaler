@@ -61,6 +61,8 @@ class Sign2Op:
 
         __ftemplate('_pad'): function.Pad,
 
+        __ftemplate('layer_norm'): function.LayerNorm,
+
         # __ftemplate('layer_norm'): function.LayerNorm,
 
         # torch aten
