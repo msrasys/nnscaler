@@ -15,7 +15,9 @@ from einops.layers.torch import Rearrange
 class Atmoshpere(torch.nn.Module):
     def __init__(self,
                  nz, ny, nx, dy, dx, x0, y0, deltaA, Y, f, sigma, P_, P, phi, zs, w,
-                 bar_x_filter, bar_y_filter, delta_x_filter, delta_y_filter, bar_y2_filter,bar_x2_filter,bar_z_filter,delta_z_filter,delta_E_filter,laplas_filter,bar_xy_filter,delta_D_filter,
+                 bar_x_filter, bar_y_filter, bar_z_filter,
+                 bar_x2_filter, bar_y2_filter, bar_xy_filter,
+                 delta_x_filter, delta_y_filter, delta_z_filter, delta_D_filter, delta_E_filter, laplas_filter,
                  device='cuda'):
         super().__init__()
         #self.device = torch.device(device)
@@ -66,11 +68,8 @@ class Atmoshpere(torch.nn.Module):
         self.post_conv3d_reshape = Rearrange('b0 b1 Nz Ny Nx -> (b0 b1 Nz) Ny Nx')
 
 
-
     def step(self, dt, pi, theta, u, v, pi0, theta0, u0, v0):
         # flux
-        # F = self.bar_x(self.pad_x(pi)) * u * self.RE * self.dy  # (nz, ny, nx + 1)
-        # G = self.bar_y(self.pad_y(pi)) * v * self.RE * self.dx * torch.cos(self.Y)  # (nz, ny + 1, nx)
         F = self.bar_x(self.pad_x(pi)) * 0.5 * u * self.RE * self.dy  # (nz, ny, nx + 1)
         G = self.bar_y(self.pad_y(pi)) * 0.5 * v * self.RE * self.dx * torch.cos(self.Y)  # (nz, ny + 1, nx)
         B = self.bar_y2(self.bar_x(self.pad_y(F))) / 12.  # (nz, ny, nx)
@@ -83,11 +82,6 @@ class Atmoshpere(torch.nn.Module):
         T = self.bar_y(self.bar_x(self.pad_x(G))) - self.bar_x2(self.pad_x(F)) / 24.  # (nz, ny, nx + 1)
 
         pi1 = pi0 - dt / self.deltaA * ((self.delta_x(F) + self.delta_y(G)) * self.dz).sum(dim=0) #sum(axis=0)  # (nz, ny, nx)
-        # tmp0 = ((self.delta_x(F) + self.delta_y(G)) * self.dz)
-        # tmp1 = tmp0.sum(dim=0)
-        # # pi1 = pi0 - self.deltaA * tmp1 #
-        # pi1 = pi0 - dt / self.deltaA * tmp1
-
         # print('pi:', pi1.mean())
 
         # TODO a custom Op needed
@@ -176,147 +170,76 @@ class Atmoshpere(torch.nn.Module):
         # return pi1, theta0, u0, v0
         return pi1, theta1, u1, v1
 
+
     def forward(self, pi, theta, u, v, dt):
-        # pi_, theta_, u_, v_ = self.step(dt / 2., pi, theta, u, v, pi, theta, u, v)
-        # return self.step(dt, pi_, theta_, u_, v_, pi, theta, u, v)
-
-        #TODO recover me
-        # pi1, theta0, u0, v0 = self.step(dt, pi, theta, u, v, pi, theta, u, v)
-        # return pi1, theta0, u0, v0
-        pi1, theta1, u1, v1 = self.step(dt, pi, theta, u, v, pi, theta, u, v)
+        pi_, theta_, u_, v_ = self.step(dt / 2., pi, theta, u, v, pi, theta, u, v)
+        pi1, theta1, u1, v1 = self.step(dt, pi_, theta_, u_, v_, pi, theta, u, v)
         return pi1, theta1, u1, v1
-
 
 
     def pad_x(self, X):
         return F.pad(X, (1, 1), "circular")
 
+
     def bar_x(self, X):
-        # nz, ny, nx = X.shape
-        # filter = torch.tensor([1., 1.]).view(1, 1, 1, 1, 2)
-        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny, nx - 1)
-        filter = self.bar_x_filter
-        x_ext = self.pre_conv3d_reshape(X)
-        x_convd = F.conv3d(x_ext, filter)
-        x_unext = self.post_conv3d_reshape(x_convd)
-        return x_unext
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.bar_x_filter))
+
 
     def bar_x2(self, X):
-        # nz, ny, nx = X.shape
-        # filter = torch.tensor([1., 2., 1.]).view(1, 1, 1, 1, 3)
-        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny, nx - 2)
-        filter = self.bar_x2_filter
-        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.bar_x2_filter))
+
 
     def delta_x(self, X):
-        # nz, ny, nx = X.shape
-        # filter = torch.tensor([-1., 1.]).view(1, 1, 1, 1, 2)
-        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny, nx - 1)
-        filter = self.delta_x_filter
-        return  self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+        return  self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.delta_x_filter))
 
 
     def pad_y(self, X):
-        # nz, ny, nx = X.shape
         #TODO check return F.pad(X.view(1, nz, ny, nx), (0, 0, 1, 1), "circular").view(nz, ny + 2, nx)
         return F.pad(X, (0, 0, 1, 1), "circular")
 
+
     def bar_y(self, X):
-        nz, ny, nx = X.shape
-        # filter = torch.tensor([1., 1.]).view(1, 1, 1, 2, 1)
-        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 1, nx)
-        filter = self.bar_y_filter
-        x_ext = self.pre_conv3d_reshape(X)
-        x_convd = F.conv3d(x_ext, filter)
-        x_unext = self.post_conv3d_reshape(x_convd)
-        return x_unext
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.bar_y_filter))
+
 
     def bar_y2(self, X):
-        # nz, ny, nx = X.shape
-        # filter = torch.tensor([1., 2., 1.]).view(1, 1, 1, 3, 1)
-        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 2, nx)
-        filter = self.bar_y2_filter #torch.tensor([1., 2., 1.]).view(1, 1, 1, 3, 1)
-        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.bar_y2_filter))
+
 
     def delta_y(self, X):
-        # nz, ny, nx = X.shape
-        # filter = torch.tensor([-1., 1.]).view(1, 1, 1, 2, 1)
-        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 1, nx)
-        filter = self.delta_y_filter
-        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.delta_y_filter))
+
 
     def bar_z(self, X):
-        # nz, ny, nx = X.shape
-        # filter = torch.tensor([1., 1.]).view(1, 1, 2, 1, 1)
-        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz - 1, ny, nx)
-        filter = self.bar_z_filter
-        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.bar_z_filter))
+
 
     def pad_z(self, X):
-        # nz, ny, nx = X.shape
         # return F.pad(X.view(1, 1, nz, ny, nx), (0, 0, 0, 0, 1, 1)).view(nz + 2, ny, nx)
         return F.pad(X, (0, 0, 0, 0, 1, 1))
 
+
     def delta_z(self, X):
-        # nz, ny, nx = X.shape
-        # filter = torch.tensor([-1., 1.]).view(1, 1, 2, 1, 1)
-        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz - 1, ny, nx)
-        filter = self.delta_z_filter
-        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.delta_z_filter))
 
 
     def delta_D(self, X):
-        # nz, ny, nx = X.shape
-        # filter = torch.tensor(
-        #     [[1., 0.],
-        #      [0., -1.]]
-        # ).view(1, 1, 1, 2, 2)
-        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 1, nx - 1)
-        filter = self.delta_D_filter
-        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.delta_D_filter))
+
 
     def delta_E(self, X):
-        # nz, ny, nx = X.shape
-        # filter = torch.tensor(
-        #     [[0., 1.],
-        #      [-1., 0.]]
-        # ).view(1, 1, 1, 2, 2)
-        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 1, nx - 1)
-        filter = self.delta_E_filter
-        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.delta_E_filter))
 
 
     def bar_xy(self, X):
-        # nz, ny, nx = X.shape
-        # filter = torch.tensor(
-        #     [[1., 0.],
-        #      [0., 1.]]
-        # ).view(1, 1, 1, 2, 2)
-        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz, ny - 1, nx - 1)
-        filter = self.bar_xy_filter
-        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.bar_xy_filter))
 
 
     def laplas(self, X):
-        # nz, ny, nx = X.shape
-        # filter = torch.tensor(
-        #     [[[0., 0., 0.],
-        #       [0., 1., 0.],
-        #       [0., 0., 0.]],
-        #      [[0., 1., 0.],
-        #       [1., -6, 1.],
-        #       [0., 1., 0.]],
-        #      [[0., 0., 0.],
-        #       [0., 1., 0.],
-        #       [0., 0., 0.]]],
-        # ).view(1, 1, 3, 3, 3)
-        # return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz - 2, ny - 2, nx - 2)
-        filter = self.laplas_filter
-        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), filter))
+        return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.laplas_filter))
 
 
 class LoopVariables(cube.runtime.syndata.CubeDataLoader):
-
     def __init__(self, variables: List[torch.Tensor], constants: List[torch.Tensor]):
         # for var in variables + constants:
         #     print("### var = {}, type = {}".format(var, type(var)))
@@ -338,14 +261,17 @@ class LoopVariables(cube.runtime.syndata.CubeDataLoader):
     def __iter__(self):
         return self
 
+
     def update(self, variables: List[torch.Tensor] = None, constants: List[torch.Tensor] = None):
         if variables is not None:
             self.variables = variables
         if constants is not None:
             self.constants = constants
 
+
     def reset(self, batch_size):
         pass
+
 
     def __next__(self):
         if len(self.variables) + len(self.constants) == 1:
@@ -496,7 +422,6 @@ if __name__ == "__main__":
 
         return pi, theta, deltaA, Y, f, sigma, P_, P, phi, zs, w
 
-
     pi, theta, deltaA, Y, f, sigma, P_, P, phi, zs, w = init(ps, pt, zs)
     print("[pi, theta, deltaA, Y, f, sigma, P_, P, phi, zs, w]")
     for var in [pi, theta, deltaA, Y, f, sigma, P_, P, phi, zs, w]:
@@ -534,9 +459,10 @@ if __name__ == "__main__":
              [0., -1.]]
         ).view(1, 1, 1, 2, 2)
 
-
     model = Atmoshpere(nz, ny, nx, dy, dx, x0, y0, deltaA, Y, f, sigma, P_, P, phi, zs, w,
-                       bar_x_filter, bar_y_filter, delta_x_filter, delta_y_filter, bar_y2_filter, bar_x2_filter, bar_z_filter, delta_z_filter, delta_E_filter, laplas_filter,bar_xy_filter,delta_D_filter)
+                       bar_x_filter, bar_y_filter, bar_z_filter,
+                       bar_x2_filter, bar_y2_filter, bar_xy_filter,
+                       delta_x_filter, delta_y_filter, delta_z_filter, delta_D_filter, delta_E_filter, laplas_filter)
 
     print("[pi, theta, u, v, dt]")
     for var in [pi, theta, u, v, dt]:
