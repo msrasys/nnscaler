@@ -18,7 +18,6 @@ OMP_NUM_THREADS=1 torchrun \
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 import cube
 from cube.profiler import CudaTimer
@@ -43,7 +42,7 @@ def attnfc1(x: torch.Tensor, wqkv: torch.Tensor, h: int,
     L, N = x.shape[0], x.shape[1]
     dim_head = wqkv.shape[0] // 3 // num_head
     # L N E, (3 h d) E -> L N (3 h d)
-    qkv = F.linear(x, wqkv, None)
+    qkv = torch.nn.functional.linear(x, wqkv, None)
     # L N (3 h d) -> L N (h d), L N (h d), L N (h d)
     q, k, v = qkv.chunk(3, dim=-1)
     # L N (h d) -> L (N h) d
@@ -76,10 +75,10 @@ def attnfc1(x: torch.Tensor, wqkv: torch.Tensor, h: int,
     attn = attn.view((N * num_head), L, L)
 
     # (N h) L L -> (N h) L L
-    attn = F.softmax(attn, dim=-1)
+    attn = torch.nn.functional.softmax(attn, dim=-1)
     # (N h) L L -> (N h) L L
     if training:
-        attn = F.dropout(attn, dropout, True, False)
+        attn = torch.nn.functional.dropout(attn, dropout, True, False)
     # (N h) L L, (N h) L d -> (N h) L d
     output = torch.bmm(attn, v)
     # (N h) L d -> L (N h) d
@@ -117,7 +116,7 @@ class MultiHeadSelfAttention(nn.Module):
         output = attnfc1(x, self.wqkv, self.num_head,
                          self.scale, self.dropout, self.training)
         # L N (h d), E (h d) -> L N E
-        output = F.linear(output, self.wout)
+        output = torch.nn.functional.linear(output, self.wout)
 
         loss = torch.sum(output)
         return loss
