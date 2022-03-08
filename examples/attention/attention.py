@@ -10,7 +10,7 @@ python -m torch.distributed.launch \
     --use_env \
     examples/attention/attention.py
 
-OMP_NUM_THREADS=4 torchrun --standalone \
+OMP_NUM_THREADS=1 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
     examples/attention/attention.py
@@ -19,16 +19,15 @@ OMP_NUM_THREADS=4 torchrun --standalone \
 import torch
 from torch import nn
 import torch.nn.functional as F
+
 import cube
-
-
-from examples.attention.policy.tensor_parallel import PAS
-
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 
+from examples.attention.policy.naive import PAS
 
-@cube.graph.parser.register('L N E, (3 h d) E -> L N (h d)', stay=['L', 'd', 'E'])
+
+@cube.graph.parser.register('L^ N E^, (3 h d^) E^ -> L^ N (h d^)')
 def attnfc1(x: torch.Tensor, wqkv: torch.Tensor, h: int,
             scale: float, dropout: float, training: bool):
     """
@@ -147,7 +146,7 @@ def train():
         batch_dims=(1,)
     )
 
-    @cube.compile(model, dataloader, policy=PAS)
+    @cube.compile(model, dataloader, PAS=PAS)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
