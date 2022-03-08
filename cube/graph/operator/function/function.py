@@ -178,7 +178,6 @@ def Div(signature, inputs):
                     oshape[dim] = lshape[dim]
                     rshape[dim] = str(rhs.shape[dim])
             annos = [_create_anno([lshape, rshape], [oshape])]
-    print(f"Div::annos = {annos}")
     return IREinops(signature, annos, inputs, 'div')
 
 def Neg(signature, inputs):
@@ -249,7 +248,7 @@ def Dropout(signature, inputs):
 def Sum(signature, inputs):
     # TODO: support dim reduction
     annos = [
-        '* -> 1',
+        '*+ -> 1',
     ]
     tensor = inputs[0:1]
     dim = inputs[1]
@@ -258,7 +257,6 @@ def Sum(signature, inputs):
         dim_len = len(tensor[0].shape)
         anno = "".join([f'b{i} ' for i in range(dim_len)]) + " -> " + "".join([f'b{i} ' if i not in dim else "" for i in range(dim_len)])
         annos.append(anno)
-        # print("### Sum::anno = {}", annos)
         return IREinops(signature, annos, tensor, 'sum',
                         dim=dim, keepdim=keepdim)
     else:
@@ -288,7 +286,6 @@ def View(signature, inputs):
     assert len(inputs) == 2
     input, shape = inputs
     in_shape, ou_shape = list(input.shape), shape
-    print(in_shape, ou_shape)
 
     # shape check
     def nele(shape, nele=1):

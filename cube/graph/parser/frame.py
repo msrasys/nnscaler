@@ -35,8 +35,8 @@ class Frame:
             val: variable content
             graph_arg (int):
                 indicate whether it is an argument of the graph.
-                If is 0, is not a graph arg.
-                If > 0, is a graph arg, will try to find 
+                If == -1, is not a graph arg.
+                If >= 0, is a graph arg, will try to find 
                 val from previous frame
         """
         if not isinstance(var_name, str):

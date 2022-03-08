@@ -147,7 +147,7 @@ class EinopAnno:
     def __init__(self, anno: str):
         """
         initializing annotations specfied in str, e.g.,
-            a (b c) d, d k -> a (b c) k
+            a (b c) d+, d+ k -> a (b c) k
         """
         if not isinstance(anno, str):
             raise TypeError("Expected anno to be str")
@@ -166,13 +166,14 @@ class EinopAnno:
         self.outputs: List[List[EinDim]] = [
             self.parse_shape(shape) for shape in outputs
         ]
+        self.reset_identifiers()
 
     def parse_shape(self, shape: str) -> List[EinDim]:
         """
         parsing annotations like of a single shape, e.g.,
-            a (b dim)  d
+            a (b+ dim)  d^
         """
-        # => ['a', '(', 'b', 'dim', ')', 'd']
+        # => ['a', '(', 'b+', 'dim', ')', 'd^']
         shapes = list()
         for group in re.split('\ +', shape):
             if len(group) == 0:
@@ -183,7 +184,7 @@ class EinopAnno:
                         shapes.append(group)
             else:
                 shapes.append(group)
-        identifiers: List[List[str]] = list()
+        edims: List[List[str]] = list()
         current_identifier = list()
         bracket_group = False
         for w in shapes:
@@ -192,30 +193,28 @@ class EinopAnno:
                     raise RuntimeError("brackets inside brackets not allowed")
                 bracket_group = True
                 if len(current_identifier) > 0:
-                    identifiers.append(current_identifier)
+                    edims.append(current_identifier)
                 current_identifier = list()
             elif w == ')':
                 if not bracket_group:
                     raise RuntimeError("backets are not balanced at (")
                 bracket_group = False
                 if len(current_identifier) > 0:
-                    identifiers.append(current_identifier)
+                    edims.append(current_identifier)
                 current_identifier = list()
             else:
                 if bracket_group:
                     current_identifier.append(w)
-                    self._identifiers.add(w)
                 else:
                     if len(current_identifier) > 0:
-                        identifiers.append(current_identifier)
+                        edims.append(current_identifier)
                     current_identifier = [w]
-                    self._identifiers.add(w)
         if bracket_group:
             raise RuntimeError("brackets are not balanced at )")
         if len(current_identifier) != 0:
-            identifiers.append(current_identifier)
-        identifiers = [EinDim(identifer) for identifer in identifiers]
-        return identifiers
+            edims.append(current_identifier)
+        edims = [EinDim(edim) for edim in edims]
+        return edims
 
     def identifiers(self) -> Set[str]:
         return copy.copy(self._identifiers)
@@ -355,29 +354,29 @@ class IREinops(IRFwOperation):
         expand_dims = None
         if '*' in identifiers:
             # names
-            in_names = [[e.name for e in input] for input in anno.inputs]
-            out_names = [[e.name for e in out] for out in anno.outputs]
-            spatial = all(['*' in names for names in out_names])
-            candicates = [c if spatial else c + '^' for c in string.ascii_lowercase if c not in identifiers]
+            candicates = [c for c in string.ascii_lowercase if c not in identifiers]
             # go through inputs
-            for idx, (names, input) in enumerate(zip(in_names, self.inputs())):
+            for idx, (eshape, input) in enumerate(zip(anno.inputs, self.inputs())):
+                names = [edim.name for edim in eshape]
                 if '*' in names:
                     if not isinstance(input, IRTensor):
                         return False, None, None
                     pos = names.index('*')
+                    split = eshape[pos].reduce[0].value
                     span = len(self.inputs(idx).shape) - (len(names) - 1)
                     if expand_dims is not None and len(expand_dims) != span:
                         return False, None, None
                     if expand_dims is None:
                         expand_dims = []
                         if span > 0:
-                            expand_dims = [EinDim(candicates[dim]) for dim in range(span)]
+                            expand_dims = [EinDim(candicates[dim]+split) for dim in range(span)]
                     anno.inputs[idx] = anno.inputs[idx][:pos] + expand_dims + anno.inputs[idx][pos+1:]
             # * should appear in inputs
             if expand_dims is None:
                 return False, None, None
             # go through outputs
-            for idx, names in enumerate(out_names):
+            for idx, eshape in enumerate(anno.outputs):
+                names = [edim.name for edim in eshape]
                 if '*' in names:
                     pos = names.index('*')
                     anno.outputs[idx] = anno.outputs[idx][:pos] + expand_dims + anno.outputs[idx][pos+1:]
