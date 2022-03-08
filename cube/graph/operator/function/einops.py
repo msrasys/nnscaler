@@ -49,7 +49,7 @@ Illegal Splitting (dimension with '^' reduce type):
 
 """
 
-from typing import Callable, Dict, List, Union
+from typing import Any, Dict, List, Union
 from typing import Optional, Set, Tuple, Optional
 import enum
 import re
@@ -237,28 +237,24 @@ class IREinops(IRFwOperation):
     """
     Einstein-inspired notation operations
     """
-    def __init__(self, signature: str, annos: List[Union[str, Tuple[str, Callable]]],
+    def __init__(self, signature: str, annos: Tuple[str],
                  inputs: List, name: str, **kwargs):        
-        noutputs = set()
-        self._annos: List[EinopAnno] = list()
-        self._adapt: List[Union[Callable, None]] = list()
-        for anno in annos:
-            if isinstance(anno, tuple):
-                anno, adapt = anno
-            elif isinstance(anno, str):
-                adapt = None
-            else:
-                raise TypeError("Expected annos to be list of tuples of list of str")
-            anno = EinopAnno(anno)
-            self._annos.append(anno)
-            self._adapt.append(adapt)
-            noutputs.add(len(anno.outputs))
+        self._annos_candidates: List[str] = tuple(annos)
         self._iannos: List[List[EinDim]] = None
         self._oannos: List[List[EinDim]] = None
 
-        if len(noutputs) != 1:
-            raise ValueError("Annotations should have same output length")
-        super().__init__(name, signature, len(inputs), list(noutputs)[0])
+        for anno in self._annos_candidates:
+            anno = EinopAnno(anno)
+            # expand * and check shape dimension consistency
+            if self.parse(inputs, anno):
+                self._iannos = anno.inputs
+                self._oannos = anno.outputs
+                break
+        else:
+            raise RuntimeError("No matching anno for given annos")
+
+        n_outputs = len(self._oannos)
+        super().__init__(name, signature, len(inputs), n_outputs)
         # set input
         for idx, input in enumerate(inputs):
             self.set_input(idx, input)
@@ -267,105 +263,84 @@ class IREinops(IRFwOperation):
 
     def infer_shape(self) -> bool:
         """
-        Shape inference by mathcing dimension annotations.
-        Assume input shape is given
+        Shape inference using the matched annotation
         """
-        # try parsing given anno candidates
-        ret = False
-        for anno, adapt in zip(self._annos, self._adapt):
-            if adapt is not None:
-                anno = adapt(anno, self)
-            ret, iannos, oannos = self.parse(anno)
-            self._iannos = iannos
-            self._oannos = oannos
-            if ret: break
-        if not ret:
-            raise RuntimeError("No matching anno for given annos")
         dimlen: Dict[str, int] = dict()
         for input, ishape in zip(self.inputs(), self._iannos):
             if not isinstance(input, IRTensor):
                 continue
-            if len(ishape) != len(input.shape):
-                raise RuntimeError(f"node {self._id} {self.signature}: error match input: {input.shape} and ein_shape: {ishape}")
-            for tdim, edim in zip(input.shape, ishape):
+            for tdim, edim in zip(input.shape, ishape):                    
                 if len(edim.names()) == 1:
-                    if edim.name in dimlen and dimlen[edim.name] != tdim:
-                        raise RuntimeError(f"op: {self.signature} has different shape for same dim annotation {edim.name}")
                     dimlen[edim.name] = tdim
-                    edim.setlen(edim.name, tdim)
-                else:
-                    toinfer = list()
-                    accum = 1
-                    for name in edim._name:
-                        if str.isnumeric(name):
-                            accum *= int(name)
-                            edim.setlen(name, int(name))
-                            dimlen[name] = int(name) 
-                        elif name in self.kwargs:
-                            accum *= self.kwargs[name]
-                            edim.setlen(name, self.kwargs[name])
-                            dimlen[name] = self.kwargs[name]
-                        else:
-                            toinfer.append(name)
-                    if len(toinfer) > 1:
-                        raise RuntimeError(f"Expected indication of dimension {toinfer} from kwargs")
-                    if len(toinfer) == 1:
-                        edim.setlen(toinfer[0], tdim // accum)
-                        dimlen[toinfer[0]] = tdim // accum
+                    continue
+                # infer hidden dim shape
+                toinfer = None
+                accum = 1
+                for name in edim.names():
+                    if str.isnumeric(name):
+                        accum *= int(name)
+                        dimlen[name] = int(name) 
+                    elif name in self.kwargs:
+                        accum *= self.kwargs[name]
+                        dimlen[name] = self.kwargs[name]
+                    else:
+                        if toinfer is not None:
+                            raise RuntimeError(f"Too many dimensions need to be inferred")
+                        toinfer = name
+                    if toinfer is not None:
+                        dimlen[toinfer] = tdim // accum
         # figure output shape
         for oidx in range(len(self._outputs)):
             output_shape = list()
             for odim in self._oannos[oidx]:
                 accum = 1
-                for name in odim._name:
-                    if str.isdecimal(name):
+                for name in odim.names():
+                    if str.isnumeric(name):
                         accum *= int(name)
                     else:
                         if name not in dimlen:
                             raise KeyError(f"Dim annotation {name} not in input")
                         accum *= dimlen[name]
-                        odim.setlen(name, dimlen[name])
                 output_shape.append(accum)
             self.outputs(oidx).shape = output_shape
-        return ret
+        return True
 
     def new(self, inputs: List, outputs: List):
         """
         construct a new operator sharing same kwargs with new inputs
         and outputs
         """
-        annos = list()
-        for anno, adapt in zip(self._annos, self._adapt):
-            annos.append((anno.anno, adapt))
+        annos = self._annos_candidates
         op = IREinops(self.signature, annos, inputs, self.name, **self.kwargs)
         for idx, output in enumerate(outputs):
             op.set_output(idx, output)
         return op
 
-    def parse(self, anno: EinopAnno) -> Tuple[bool, List[List[EinDim]], List[List[EinDim]]]:
+    def parse(self, inputs: List[Any], anno: EinopAnno) -> Tuple[bool, List[List[EinDim]], List[List[EinDim]]]:
         """
         parse annotations, assuming input tensor shape is given
         """
-        if len(anno.inputs) != len(self.inputs()):
-            return False, None, None
         identifiers = anno.identifiers()
+
+        # input shape match
+        if len(anno.inputs) != len(inputs):
+            return False
 
         # expand *
         expand_dims = None
         if '*' in identifiers:
-            # names
             candicates = [c for c in string.ascii_lowercase if c not in identifiers]
             # go through inputs
-            for idx, (eshape, input) in enumerate(zip(anno.inputs, self.inputs())):
+            for idx, (eshape, input) in enumerate(zip(anno.inputs, inputs)):
                 names = [edim.name for edim in eshape]
                 if '*' in names:
                     if not isinstance(input, IRTensor):
-                        return False, None, None
+                        return False
                     pos = names.index('*')
                     split = eshape[pos].reduce[0].value
-                    span = len(self.inputs(idx).shape) - (len(names) - 1)
+                    span = len(inputs[idx].shape) - (len(names) - 1)
                     if expand_dims is not None and len(expand_dims) != span:
-                        return False, None, None
+                        return False
                     if expand_dims is None:
                         expand_dims = []
                         if span > 0:
@@ -373,7 +348,7 @@ class IREinops(IRFwOperation):
                     anno.inputs[idx] = anno.inputs[idx][:pos] + expand_dims + anno.inputs[idx][pos+1:]
             # * should appear in inputs
             if expand_dims is None:
-                return False, None, None
+                return False
             # go through outputs
             for idx, eshape in enumerate(anno.outputs):
                 names = [edim.name for edim in eshape]
@@ -381,21 +356,22 @@ class IREinops(IRFwOperation):
                     pos = names.index('*')
                     anno.outputs[idx] = anno.outputs[idx][:pos] + expand_dims + anno.outputs[idx][pos+1:]
             anno.reset_identifiers()
+
         # check dimension consistency
         dimlen: Dict[str, int] = dict()
-        for eshape, input in zip(anno.inputs, self.inputs()):
+        for eshape, input in zip(anno.inputs, inputs):
             if not isinstance(input, IRTensor):
                 if not (len(eshape) == 1 and eshape[0].name == '1'):
-                    return False, None, None
+                    return False
             else:
                 if len(input.shape) != len(eshape):
-                    return False, None, None
+                    return False
                 for edim, nele in zip(eshape, input.shape):
                     if edim.name in dimlen:
                         if nele != dimlen[edim.name]:
-                            return False, None, None
+                            return False
                     dimlen[edim.name] = nele
-        return True, anno.inputs, anno.outputs
+        return True
 
     def einexpr(self) -> str:
         inputs = list()
