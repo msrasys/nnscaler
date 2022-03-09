@@ -6,7 +6,15 @@ from cube.profiler.memory import memory_summary
 import cube.runtime.adapter.collectives as coll
 from cube.runtime.device import DeviceGroup
 
+from torch.distributed.distributed_c10d import _get_global_rank
 io_input = input
+
+
+def get_global_rank(group, group_rank):
+    if group is None:
+        return group_rank
+    else:
+        return _get_global_rank(group, group_rank)
 
 
 def forward_step(model, *args, **kwargs):
@@ -55,13 +63,20 @@ def recv_input(model, dataloader, prev_rank: int):
         return coll.recv(model.input_shape(), prev_rank, model.input_dtype())
 
 
-def schedule_naive(model, dataloader, num_microbatch: int):
+def schedule_naive(model, dataloader, num_microbatch: int, neighbors = None):
     rank = DeviceGroup().rank
-    next_rank = (DeviceGroup().rank + 1) % DeviceGroup().world_size
-    prev_rank = (DeviceGroup().rank - 1) % DeviceGroup().world_size
+    if neighbors is None:
+        prev_rank = (rank - 1) % DeviceGroup().world_size
+        next_rank = (rank + 1) % DeviceGroup().world_size
+    else:
+        prev_rank, next_rank = neighbors
+    
+    is_first_stage = rank < prev_rank
+    is_last_stage = rank > next_rank
+
     for step in range(num_microbatch):
         # recv forward
-        if is_first_stage():
+        if is_first_stage:
             input = next(dataloader)
         else:
             # print(f'rank {rank} recving forward input...')
@@ -69,18 +84,18 @@ def schedule_naive(model, dataloader, num_microbatch: int):
         # forward
         output = forward_step(model, input)
         # send forward
-        if not is_last_stage():
+        if not is_last_stage:
             # print(f'rank {rank} sending forward output...')
             coll.send(output, next_rank)
         # recv backward
         output_grad = None
-        if not is_last_stage():
+        if not is_last_stage:
             # print(f'rank {rank} recving backward input...')
             output_grad = coll.recv(output.size(), next_rank, output.dtype)
         # backward
         input_grad = backward_step([input], [output], [output_grad])[0]
         # send backward
-        if not is_first_stage():
+        if not is_first_stage:
             # print(f'rank {rank} sending backward output...')
             coll.send(input_grad, prev_rank)
 
