@@ -1,7 +1,8 @@
 """
 Communication group settings among devices
 """
-
+from typing import List
+import numpy as np
 import torch
 import os
 
@@ -49,6 +50,33 @@ class DeviceGroup:
         if rank_bits not in self.instance.groups:
             self.groups[rank_bits] = torch.distributed.new_group(list(ranks))
         return self.groups[rank_bits]
+
+    def create_hybrid(self, group_num: List[int]) -> List[List[int]]:
+        """
+        Create hybrid (nested) groups given the each group number.
+
+        The product of group_num should be same with total devices.
+        """
+        group_num = np.array(group_num)
+        cnt = np.prod(group_num)
+        if cnt != self.world_size:
+            raise RuntimeError("product of group_num should be same with total device number")
+        grid = np.arange(cnt).reshape(tuple(group_num))
+        dims = list(range(len(group_num)))
+        outputs = []
+        for dim, num in enumerate(group_num):
+            remain = np.prod(np.delete(group_num, dim))
+            order = tuple(dims[:dim] + dims[dim+1:] + [dim])
+            grid_dim = np.transpose(grid, order).reshape((remain,num))
+            grid_dim = grid_dim.tolist()
+            for ranks in grid_dim:
+                # initialize group
+                _ = self.get_group(ranks)
+                if self.rank in ranks:
+                    outputs.append(ranks)
+        assert len(outputs) == len(group_num)
+        return outputs
+
 
     @staticmethod
     def bitmap(ranks):
