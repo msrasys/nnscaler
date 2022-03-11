@@ -8,7 +8,7 @@ torch.set_default_tensor_type(torch.DoubleTensor)
 
 from typing import List
 import cube
-from examples.poisson.policy.naive import PAS
+from examples.atmosphere.policy.naive import PAS
 
 from einops.layers.torch import Rearrange
 
@@ -166,8 +166,6 @@ class Atmoshpere(torch.nn.Module):
         v1 = (pi0_deltaA * v0 + dt * (advec + trans + press + diff + cori)) / pi1_deltaA
         # # print('v1:', v1.mean())
 
-        # return pi1, theta1, u1, v1
-        # return pi1, theta0, u0, v0
         return pi1, theta1, u1, v1
 
 
