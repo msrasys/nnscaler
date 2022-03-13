@@ -6,6 +6,7 @@ from torch import nn
 import torch.nn.functional as F
 # from linalg import tridiagonal
 
+from cube.runtime.syndata import SciLoopVariables
 from einops import rearrange
 from einops.layers.torch import Rearrange
 
@@ -318,43 +319,6 @@ class WRF(torch.nn.Module):
         pass
 
 
-class LoopVariables(cube.runtime.syndata.CubeDataLoader):
-
-    def __init__(self, variables: List[torch.Tensor], constants: List[torch.Tensor]):
-        # for var in variables + constants:
-        #     print("### var = {}, type = {}".format(var, type(var)))
-        shapes = [list(var.size()) for var in variables + constants]
-        dtypes = [var.dtype for var in variables + constants]
-        batch_dims = [0] * (len(variables) + len(constants))
-        super().__init__(shapes, dtypes, batch_dims)
-        self.variables = list()
-        self.constants = list()
-        for var in variables:
-            if torch.is_tensor(var) and var.device != torch.cuda.current_device():
-                var = var.cuda()
-            self.variables.append(var)
-        for const in constants:
-            if torch.is_tensor(const) and const.device != torch.cuda.current_device():
-                const = const.cuda()
-            self.constants.append(const)
-
-    def __iter__(self):
-        return self
-
-    def update(self, variables: List[torch.Tensor] = None, constants: List[torch.Tensor] = None):
-        if variables is not None:
-            self.variables = variables
-        if constants is not None:
-            self.constants = constants
-
-    def reset(self, batch_size):
-        pass
-
-    def __next__(self):
-        if len(self.variables) + len(self.constants) == 1:
-            return (self.variables + self.constants)[0]
-        return tuple(self.variables + self.constants)
-
 if __name__ == "__main__":
     cube.init()
 
@@ -393,7 +357,7 @@ if __name__ == "__main__":
     bar_x_filter = torch.tensor([1., 1.]).view(1, 1, 1, 1, 2)
     delta_z_filter = torch.tensor([1., 1.]).view(1, 1, 2, 1, 1)
 
-    varloader = LoopVariables(variables=[U, V, W, Theta, Mu, Phi, dt], constants=[Phi_t, Phi_s, theta_t, theta_s, P_t, P_s, dx, dy, dz, PREF, Rd, g, bar_x_filter, delta_z_filter])
+    varloader = SciLoopVariables(variables=[U, V, W, Theta, Mu, Phi, dt], constants=[Phi_t, Phi_s, theta_t, theta_s, P_t, P_s, dx, dy, dz, PREF, Rd, g, bar_x_filter, delta_z_filter])
     model = WRF()
     model = cube.SemanticModel(model, input_shapes=tuple(varloader.shapes), )
 

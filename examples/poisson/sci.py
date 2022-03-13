@@ -6,12 +6,13 @@ import time
 
 torch.set_default_tensor_type(torch.DoubleTensor)
 
+from cube.runtime.syndata import SciLoopVariables
 import cube
 from examples.poisson.policy.naive import PAS
 
 """
 OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=4 \
+    --nproc_per_node=1 \
     --nnodes=1 \
     examples/poisson/sci.py
 """
@@ -85,7 +86,7 @@ def train_loop():
     r0 = rho - F.conv2d(phi, filter, padding=1)
     p = r0
 
-    varloader = LoopVariables(variables=[r0, p, phi], constants=[filter])
+    varloader = SciLoopVariables(variables=[r0, p, phi], constants=[filter])
     model = ScientificModel()
     model = cube.SemanticModel(model, input_shapes=tuple(varloader.shapes),)
 
