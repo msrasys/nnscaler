@@ -1,39 +1,25 @@
-import copy
-from typing import Optional
-
-import torch
-
+from typing import Tuple
 from cube.runtime.syndata import CubeDataLoader
 
 
 class IRDataLoader:
 
     def __init__(self, dataloader: CubeDataLoader, dtype_map):
-        self.dataloader = iter(dataloader)
-        self.batch_dims = dataloader.get_batch_dims()
-        self.dtypes = list()
-        self.shapes = list()
+        if not isinstance(dataloader, CubeDataLoader):
+            raise TypeError("Expected data loader derived from CubeDataLoader")
+        self.dataloader: CubeDataLoader = iter(dataloader)
+        self.dtypes = [dtype_map.map(dtype) for dtype in dataloader.dtypes]
+        self.shapes = [list(shape) for shape in dataloader.shapes]
 
-        datas = next(dataloader)
-        if not isinstance(datas, tuple):
-            datas = (datas,)
-        
-        for data in datas:
-            if torch.is_tensor(data):
-                self.dtypes.append(dtype_map.map(data.dtype))
-                shape = tuple(data.shape)
-                # special handler for scalar tensor shape
-                if len(shape) == 0:
-                    shape = (1,)
-                self.shapes.append(shape)
-            else:
-                raise NotImplementedError("Data should be torch.Tensor")
+    def get_batch_dims(self) -> Tuple[int]:
+        return tuple(self.dataloader.batch_dims)
 
-    def get_batch_dims(self, idx: Optional[int] = None) -> int:
-        if idx is None:
-            return copy.copy(self.batch_dims)
-        else:
-            return self.batch_dims[idx]
+    def get_batch_size(self) -> int:
+        return self.dataloader.get_batch_size()
+
+    def set_batch_size(self, bs: int):
+        self.dataloader.set_batch_size(bs)
+        return
 
     def __iter__(self):
         return self

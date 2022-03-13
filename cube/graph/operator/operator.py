@@ -1,4 +1,4 @@
-from typing import Any, Optional, Union, List
+from typing import Any, Optional, Tuple, Union, List
 import copy
 
 from cube.ir.cten import IRCell, IRTensor
@@ -298,9 +298,7 @@ class IRBpOperation(IRCell):
 
 class IRDataOperation(IRCell):
 
-    def __init__(self, data_num: int, batch_dims: List[int], name='dataloader'):
-        if not isinstance(batch_dims, list):
-            raise RuntimeError("Expected batch dims to be a list")
+    def __init__(self, data_num: int, batch_dims: Tuple[int], name='dataloader'):
         if len(batch_dims) != data_num:
             raise RuntimeError("Expected each output data has a specified batch dim")
         signature = 'dataloader.__next__'

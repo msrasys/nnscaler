@@ -20,7 +20,8 @@ from cube.execplan.planpass.fusion import P2PFusion
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
 from cube.profiler.timer import print_each_rank
-from cube.runtime.syndata import CubeDataLoader
+from cube.runtime.syndata import CubeDataLoader, SciLoopVariables
+
 
 class SemanticModel:
 
@@ -208,14 +209,15 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                 )
 
             # setup batch size
-            all_batch_size = set()
-            dnodes = [node for node in graph.nodes() if isinstance(node, IRDataOperation)]
-            for dnode in dnodes:
-                bs = [out.shape[dim] for out, dim in zip(dnode.outputs(), dnode.get_batch_dims())]
-                all_batch_size.update(bs)
-            if len(all_batch_size) != 1:
-                raise NotImplementedError(f"Heterogenous batch size {bs} is not supported")
-            batch_size = torch.tensor(list(all_batch_size), dtype=torch.int).cuda()
+            if not isinstance(dataloader, SciLoopVariables):
+                all_batch_size = set()
+                dnodes = [node for node in graph.nodes() if isinstance(node, IRDataOperation)]
+                for dnode in dnodes:
+                    bs = [out.shape[dim] for out, dim in zip(dnode.outputs(), dnode.get_batch_dims())]
+                    all_batch_size.update(bs)
+                if len(all_batch_size) != 1:
+                    raise NotImplementedError(f"Heterogenous batch size {bs} is not supported")
+                batch_size = torch.tensor(list(all_batch_size), dtype=torch.int).cuda()
 
             compile_end = time.time()
             compile_time = compile_end - compile_start
@@ -228,7 +230,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
         torch.distributed.broadcast(batch_size, src=0)
         batch_size = batch_size.item()
         print_each_rank(f'reseting dataloader batch size to {batch_size}')
-        dataloader.reset(batch_size=batch_size)
+        dataloader.set_batch_size(batch_size)
 
         # load module
         filename = filename.format(myrank)

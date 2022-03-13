@@ -26,6 +26,11 @@ class DPDataLoader(GenericDistAlgo):
         node: IRDataOperation = self.node
         num: int = config['num']
         dims: List[int] = node.get_batch_dims()
+        # check batch size
+        all_batch_size = set([output.shape[dim] for dim, output in zip(dims, node.outputs())])
+        # batch size not same -- indicate a scientific model
+        if len(all_batch_size) != 1:
+            return False        
         for dim, output in zip(dims, node.outputs()):
             if output.shape[dim] % num != 0:
                 return False
