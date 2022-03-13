@@ -142,14 +142,14 @@ class ScriptModuleParser:
             return ScriptNodeKind.AtenOp
         if node.kind() == 'prim::If':
             return ScriptNodeKind.PrimIf
-        if node.kind() == 'prim::ListUnpack':
-            return ScriptNodeKind.PrimListUnpack
         if node.kind() == 'prim::ListConstruct':
             return ScriptNodeKind.PrimListConstruct
         if node.kind() == 'prim::TupleConstruct':
             return ScriptNodeKind.PrimListConstruct
+        if node.kind() == 'prim::ListUnpack':
+            return ScriptNodeKind.PrimListUnpack
         if node.kind() == 'prim::TupleUnpack':
-            return ScriptNodeKind.PrimTupleUnpack
+            return ScriptNodeKind.PrimListUnpack
         if node.kind() == 'prim::PythonOp':
             return ScriptNodeKind.PrimPythonOp
         raise RuntimeError(f"Unkown node kind {node.kind()} from torchscript module")
@@ -175,9 +175,7 @@ class ScriptModuleParser:
             if node_type == ScriptNodeKind.PrimListConstruct:
                 return ScriptModuleParser.parse_prim_list_construct_node(node, module, frame)
             if node_type == ScriptNodeKind.PrimListUnpack:
-                return ScriptModuleParser.parse_prim_listunpack_node(node, module, frame)
-            if node_type == ScriptNodeKind.PrimTupleUnpack:
-                return ScriptModuleParser.parse_prim_tupleunpack_node(node, module, frame)
+                return ScriptModuleParser.parse_prim_list_unpack_node(node, module, frame)
             if node_type == ScriptNodeKind.PrimPythonOp:
                 return ScriptModuleParser.parse_prim_python_op_node(node, module, frame)
             raise NotImplementedError(f"Un-supported node type {node_type}")
@@ -248,10 +246,12 @@ class ScriptModuleParser:
 
         # special handling on aten::size(tensor: tensor, dim: int)
         if fsig == 'torch.size':
-            assert len(inputs) == 2 and len(outputs) == 1, \
-                "Expected 2 inputs and 1 outputs for torch.size"
-            tensor, dim = input_val
-            output: int = tensor.shape[dim]
+            if len(inputs) == 2:
+                tensor, dim = input_val
+                output: int = tensor.shape[dim]
+            else:
+                tensor = input_val[0]
+                output: List[int] = list(tensor.shape)
             frame.add_var(outputs[0].debugName(), output)
             return []
 
@@ -420,11 +420,7 @@ class ScriptModuleParser:
         return list()
 
     @staticmethod
-    def parse_prim_listunpack_node(node, module, frame: Frame) -> List[None]:
-        raise NotImplementedError
-
-    @staticmethod
-    def parse_prim_tupleunpack_node(node, module, frame: Frame) -> List[None]:
+    def parse_prim_list_unpack_node(node, module, frame: Frame) -> List[None]:
         """
         Parse script module node like:
             %q.1 : Tensor, %k.1 : Tensor, %v.1 : Tensor = prim::TupleUnpack(%11)
