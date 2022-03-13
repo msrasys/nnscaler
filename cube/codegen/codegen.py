@@ -225,7 +225,10 @@ class ModelCodeGen(CodeGen):
         inputs = [self.tensor_naming(t) for t in node.inputs()]
         kwargs = list()
         for key in node.kwargs:
-            code = f'{key}={node.kwargs[key]}'
+            val = node.kwargs[key]
+            if isinstance(val, str) and 'self.' not in val:
+                val = '"' + val + '"'
+            code = f'{key}={val}'
             kwargs.append(code)
         inputs += kwargs
         inputs = ', '.join(inputs)
