@@ -15,7 +15,7 @@ import torch
 import cube
 from cube.runtime.syndata import SynTextDataLoader
 from cube.profiler import CudaTimer
-from cube.profiler.memory import memory_summary
+from cube.profiler.memory import memory_summary, model_summary
 from cube.profiler.timer import print_each_rank
 
 
@@ -27,7 +27,7 @@ from cube.profiler.timer import print_each_rank
 
 class Config:
 
-    num_embeddings = 500027
+    num_embeddings = 2500027
 
     encoder_embed_path = None
     encoder_embed_dim = 1024
@@ -152,6 +152,14 @@ class MultiheadAttention(torch.nn.Module):
         else:
             self.out_bias = None
 
+    def forward(self, query: torch.Tensor, key: torch.Tensor):
+        return attn_fn(query, key, 
+               self.q_proj, self.q_bias,
+               self.k_proj, self.k_bias,
+               self.v_proj, self.v_bias,
+               self.out_proj, self.out_bias,
+               self.num_heads, self.scaling, self.dropout_p)
+
     def forward_encoder_decoder_attn(self, query: torch.Tensor, key: torch.Tensor):
         # tgt_len, bsz, embed_dim = query.size()
         # q = torch.nn.functional.linear(query, self.q_proj, self.q_bias)
@@ -200,7 +208,7 @@ class EncoderLayer(torch.nn.Module):
     def forward(self, x):  # , encoder_padding_mask: Optional[torch.Tensor], attn_mask: Optional[torch.Tensor] = None):
         residual = x
         x = self.self_attn_layer_norm(x)
-        x = self.self_attn.forward_self_attn(x)
+        x = self.self_attn(x, x)
         x = self.dropout(x)
         x = x + residual
 
@@ -273,7 +281,7 @@ class DecoderLayer(torch.nn.Module):
         x = self.self_attn_layer_norm(x)
 
         # self attention
-        x = self.self_attn.forward_self_attn(x)
+        x = self.self_attn(x, x)
         x = self.dropout(x)
         x = residual + x
     
@@ -281,7 +289,7 @@ class DecoderLayer(torch.nn.Module):
         residual = x
         # normalize before
         x = self.encoder_attn_layer_norm(x)
-        x = self.encoder_attn.forward_encoder_decoder_attn(x, encoder_out)
+        x = self.encoder_attn(x, encoder_out)
         x = self.dropout(x)
         x = x + residual
 
@@ -384,15 +392,16 @@ def train():
     )
 
     def train_iter(model, dataloader):
-        model.eval()
+        # model.eval()
         src_tokens, prev_output_tokens = next(dataloader)
+        # model_summary(model, (src_tokens, prev_output_tokens))
         loss = model(src_tokens, prev_output_tokens)
         loss.backward()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
     CudaTimer(enable=False).warmup()
-    iter_num = 128
+    iter_num = 1
     for step in range(iter_num):
         if step >= 40:
             CudaTimer(enable=True).start('e2e')
@@ -404,8 +413,8 @@ def train():
         if (step + 1) % 20 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
     
-    print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-40, field_name='e2e')))
+    # print_each_rank('e2e time (ms) per iteration: {} ms'.format(
+    #       CudaTimer().duration(iter_num-40, field_name='e2e')))
     memory_summary()
 
 
