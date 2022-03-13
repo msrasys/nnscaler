@@ -2,8 +2,6 @@ from typing import Iterable, List, Optional, Union, Dict
 import string
 import copy
 
-from numpy import isin
-
 from cube.ir.cten import IRTensor
 from cube.graph.operator.function.einops import EinDim, IREinops
 from cube.graph.operator.function.conv import IRConv2D
@@ -301,6 +299,8 @@ def View(signature, inputs):
     """
     assert len(inputs) == 2
     input, shape = inputs
+    if not all([isinstance(dim, int) for dim in shape]):
+        raise TypeError("Expected tensor.view has static int shape")
     in_shape, ou_shape = list(input.shape), shape
 
     # shape check
