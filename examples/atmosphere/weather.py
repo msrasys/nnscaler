@@ -8,6 +8,7 @@ torch.set_default_tensor_type(torch.DoubleTensor)
 
 from typing import List
 import cube
+from cube.runtime.syndata import SciLoopVariables
 from examples.atmosphere.policy.naive import PAS
 
 from einops.layers.torch import Rearrange
@@ -237,46 +238,6 @@ class Atmoshpere(torch.nn.Module):
         return self.post_conv3d_reshape(F.conv3d(self.pre_conv3d_reshape(X), self.laplas_filter))
 
 
-class LoopVariables(cube.runtime.syndata.CubeDataLoader):
-    def __init__(self, variables: List[torch.Tensor], constants: List[torch.Tensor]):
-        # for var in variables + constants:
-        #     print("### var = {}, type = {}".format(var, type(var)))
-        shapes = [list(var.size() if len(var.size()) > 0 else [1]) for var in variables + constants]
-        dtypes = [var.dtype for var in variables + constants]
-        batch_dims = [0] * (len(variables) + len(constants))
-        super().__init__(shapes, dtypes, batch_dims)
-        self.variables = list()
-        self.constants = list()
-        for var in variables:
-            if torch.is_tensor(var) and var.device != torch.cuda.current_device():
-                var = var.cuda()
-            self.variables.append(var)
-        for const in constants:
-            if torch.is_tensor(const) and const.device != torch.cuda.current_device():
-                const = const.cuda()
-            self.constants.append(const)
-
-    def __iter__(self):
-        return self
-
-
-    def update(self, variables: List[torch.Tensor] = None, constants: List[torch.Tensor] = None):
-        if variables is not None:
-            self.variables = variables
-        if constants is not None:
-            self.constants = constants
-
-
-    def reset(self, batch_size):
-        pass
-
-
-    def __next__(self):
-        if len(self.variables) + len(self.constants) == 1:
-            return (self.variables + self.constants)[0]
-        return tuple(self.variables + self.constants)
-
-
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     cube.init()
@@ -466,7 +427,7 @@ if __name__ == "__main__":
     for var in [pi, theta, u, v, dt]:
         print(f'shape {var.shape}')
 
-    varloader = LoopVariables(variables=[pi, theta, u, v], constants=[dt])
+    varloader = SciLoopVariables(variables=[pi, theta, u, v], constants=[dt])
     model = cube.SemanticModel(model, input_shapes=tuple(varloader.shapes))
 
     @cube.compile(model=model, dataloader=varloader, PAS=PAS, override=True)
