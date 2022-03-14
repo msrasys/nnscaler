@@ -27,7 +27,7 @@ from cube.profiler.timer import print_each_rank
 
 class Config:
 
-    num_embeddings = 2500027
+    num_embeddings = 250027
 
     encoder_embed_path = None
     encoder_embed_dim = 1024
@@ -394,9 +394,9 @@ def train():
     def train_iter(model, dataloader):
         # model.eval()
         src_tokens, prev_output_tokens = next(dataloader)
-        # model_summary(model, (src_tokens, prev_output_tokens))
-        loss = model(src_tokens, prev_output_tokens)
-        loss.backward()
+        model_summary(model, (src_tokens, prev_output_tokens))
+        # loss = model(src_tokens, prev_output_tokens)
+        # loss.backward()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
@@ -406,6 +406,7 @@ def train():
         if step >= 40:
             CudaTimer(enable=True).start('e2e')
         train_iter(model, dataloader)
+        break
         optimizer.step()
         optimizer.zero_grad()
         if step >= 40:
