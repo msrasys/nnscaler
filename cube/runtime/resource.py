@@ -3,6 +3,7 @@ Runtime information
 """
 
 import torch
+import os
 
 
 class EnvResource:
@@ -11,7 +12,11 @@ class EnvResource:
 
         def __init__(self):
             # number of gpus
-            self.ngpus = torch.distributed.get_world_size()
+            single_device_mode = os.environ.get('SINGLE_DEV_MODE')
+            if single_device_mode:
+                self.ngpus = 1
+            else:
+                self.ngpus = torch.distributed.get_world_size()
             # device topology
             self.topo = None
 

@@ -455,4 +455,6 @@ def ScriptEinOps(signature, inputs):
     recipe = inputs[0]
     tensors = inputs[1:2]
     reduction_type = inputs[2]
-    return IRScriptEinOps(signature, tensors, 'scripteinops', recipe=recipe, reduction_type=reduction_type)
+    import pickle
+    recipe_str = pickle.dumps(recipe)
+    return IRScriptEinOps(signature, tensors, 'scripteinops', recipe_str=recipe_str, reduction_type=reduction_type)

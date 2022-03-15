@@ -83,6 +83,9 @@ class AdapterGener:
             for input in fnode.inputs():
                 if isinstance(input, IRSubTensor) and input.is_param():
                     grad = input.grad
+                    if grad is None: #TODO remove me, for weather.py test
+                        print(f'WARNING: skipping non grad of {fnode}')
+                        continue
                     # nothing to sync
                     if grad.valmap == ValueMap(0, 1):
                         continue
