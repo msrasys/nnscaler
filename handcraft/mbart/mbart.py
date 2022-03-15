@@ -19,7 +19,8 @@ from cube.profiler import CudaTimer
 from cube.profiler.memory import memory_summary, model_summary
 from cube.profiler.timer import print_each_rank
 
-from handcraft.mbart.schedule import schedule_naive
+from handcraft.mbart.schedule import schedule_naive, schedule_tp_1f1b_pack
+from handcraft.mbart.tp import AllGatherScatter, ParallelEmbed, BroadcastReduce, ReduceBroadcast
 
 _tp_group = -1
 _pp_group = -1
@@ -403,13 +404,116 @@ def criterion(output: torch.Tensor, prev_output_tokens: torch.Tensor, label_smoo
     return loss
 
 
-class mBARTFull(torch.nn.Module):
+class ShardHeadTail(torch.nn.Module):
 
-    def __init__(self, cfg: Config, dataloader):
+    def __init__(self, cfg: Config, group=-1):
+        """
+        group = -1 means no tensor parallelism
+        """
         super().__init__()
         self.cfg = cfg
-        self.dataloader = iter(dataloader)
+        self.group = group
+        self.shard_num = torch.distributed.get_world_size(group) if group != -1 else 1
+        self.shard_idx = torch.distributed.get_rank(group) if group != -1 else 0
+        if self.shard_num > 0:
+            print(f'[{torch.distributed.get_rank()}]: initialize sharding embed (x{self.shard_num})')
         
+        self.vocab_start_index = self.cfg.num_embeddings // self.shard_num * self.shard_idx
+        self.vocab_end_index = self.cfg.num_embeddings // self.shard_num * (self.shard_idx + 1)
+        self.weight = torch.nn.Parameter(torch.ones((self.cfg.num_embeddings // self.shard_num, self.cfg.encoder_embed_dim)))
+
+        # encoder-preprocess
+        self.embed_positions_encoder = torch.nn.Embedding(cfg.max_source_positions, cfg.encoder_embed_dim)
+        self.embed_scale_encoder = math.sqrt(cfg.encoder_embed_dim)
+        self.layernorm_embedding_encoder = torch.nn.LayerNorm(cfg.encoder_embed_dim)
+
+        # decoder-preprocess
+        self.embed_scale_decoder = math.sqrt(cfg.decoder_embed_dim)
+        self.embed_positions_decoder = torch.nn.Embedding(cfg.max_source_positions, cfg.decoder_embed_dim)
+        self.layernorm_embedding_decoder = torch.nn.LayerNorm(cfg.decoder_embed_dim)
+
+        # post-proces
+
+        self._inputs = (None, None)
+
+    def set_inputs(self, *inputs):
+        self._inputs = inputs
+
+    def criterion_input_shape(self):
+        return (
+            (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
+        )
+
+    def embed_lookup(self, tokens, dst: Optional[int] = None):
+        if self.shard_num > 1:
+            mask = (tokens < self.vocab_start_index) | \
+                        (tokens >= self.vocab_end_index)
+            tokens = tokens.clone() - self.vocab_start_index
+            tokens[mask] = 0
+            embed = torch.nn.functional.embedding(tokens, self.weight)
+            embed[mask, :] = 0.0
+            embed = ReduceBroadcast.apply(embed, dst, self.group)
+        else:
+            embed = torch.nn.functional.embedding(tokens, self.weight)
+        return embed
+
+    def encoder_preprocess(self, dst: Optional[int] = None):
+        source_tokens, _ = self._inputs
+        source_embed = self.embed_lookup(source_tokens, dst)
+        embed = self.embed_scale_encoder * source_embed
+        x = embed + self.embed_positions_encoder.weight
+        x = self.layernorm_embedding_encoder(x)
+        x = torch.nn.functional.dropout(x, p=0.0)
+        enc = x.transpose(0, 1)
+        return (enc,)
+
+    def decoder_preprocess(self, dst: Optional[int] = None):
+        _, prev_output_tokens = self._inputs
+        target_emb = self.embed_lookup(prev_output_tokens, dst)
+        embed = self.embed_scale_decoder * target_emb
+        embed = embed + self.embed_positions_decoder.weight
+        embed = self.layernorm_embedding_decoder(embed)
+        embed = torch.nn.functional.dropout(embed, p=0.0)
+        dec = embed.transpose(0, 1)
+        return (dec,)
+
+    def postprocess(self, output, src: Optional[int] = None):
+        _, prev_output_tokens = self._inputs
+        if self.group == -1:
+            output = self.layer_norm_decoder(output)
+            output = output.transpose(0, 1)
+            output = torch.nn.functional.linear(output, self.weight)
+            loss = criterion(output, prev_output_tokens)
+            return (loss,)
+        else:
+            assert src is not None
+            if self.shard_idx != src:
+                output = torch.empty(
+                    self.criterion_input_shape()[0],
+                    dtype=torch.float32,
+                    requires_grad=True,
+                    device=torch.cuda.current_device()
+                )
+            output = output.transpose(0, 1)
+            output = BroadcastReduce.apply(output, src, self.group)
+            # return (torch.sum(output.contiguous()),)
+            output = torch.nn.functional.linear(output, self.weight)
+            output = AllGatherScatter.apply(output, -1, self.group)
+            loss = criterion(output, prev_output_tokens)
+            return (loss,)
+
+
+
+class mBARTFull(torch.nn.Module):
+
+    def __init__(self, cfg: Config,
+                 encoder_preprocess=True,
+                 decoder_preprocess=True,
+                 post_process=True, shard=True):
+        super().__init__()
+        self.cfg = cfg
+        self._preprocess = [None, None] # enc, dec
+
         self.rank = DeviceGroup().rank
 
         global _pp_group
@@ -422,11 +526,15 @@ class mBARTFull(torch.nn.Module):
         self.layer_start = self.total_layers // self.num_stages * self.pp_stage
         self.layer_end = self.total_layers // self.num_stages * (self.pp_stage + 1)
 
-        self.encoder_preprocess = (self.pp_stage == 0)
-        self.encoder_forward    = (self.layer_start < cfg.encoder_layers)
-        self.decoder_preprocess = (self.pp_stage == self.num_stages // 2)
-        self.decoder_forward    = (self.layer_start >= cfg.encoder_layers)
-        self.loss_compute       = (self.pp_stage == self.num_stages - 1)
+        self.encoder_preprocess  = encoder_preprocess
+        self.encoder_forward     = (self.layer_start < cfg.encoder_layers)
+
+        self.decoder_preprocess  = decoder_preprocess
+        self.decoder_first_stage = self.layer_start == cfg.encoder_layers
+        self.decoder_forward     = (self.layer_start >= cfg.encoder_layers)
+        self.decoder_last_stage  = (self.layer_end == cfg.encoder_layers + cfg.decoder_layers)
+
+        self.postprocess         = post_process
 
         self.encoder_layer_start = self.layer_start
         self.encoder_layer_end = min(self.layer_end, cfg.encoder_layers)
@@ -434,47 +542,35 @@ class mBARTFull(torch.nn.Module):
         self.decoder_layer_start = max(cfg.encoder_layers, self.layer_start)
         self.decoder_layer_end = self.layer_end
 
-        self.emb = None
-
-        # encoder preprocess
-        if self.encoder_preprocess:
-            print(f'[{self.rank}]: initializing preprocess encoder parameters')
-            self.emb = torch.nn.Embedding(cfg.num_embeddings, cfg.encoder_embed_dim)
-            self.embed_positions_encoder = torch.nn.Embedding(cfg.max_source_positions, cfg.encoder_embed_dim)
-            self.embed_scale_encoder = math.sqrt(cfg.encoder_embed_dim)
-            self.layernorm_embedding_encoder = torch.nn.LayerNorm(cfg.encoder_embed_dim)
+        if encoder_preprocess or decoder_preprocess or post_process or shard:
+            self.headtail = ShardHeadTail(cfg, group = None if shard else -1)
+        else:
+            self.headtail = None
 
         # encoders
         if self.encoder_forward:
             print(f'[{self.rank}]: initializing {self.encoder_layer_end - self.encoder_layer_start} encoder layers')
             self.encoders = torch.nn.ModuleList([EncoderLayer(cfg) for _ in range(self.encoder_layer_end - self.encoder_layer_start)])
-        
-        # decoder preprocess
-        if self.decoder_preprocess:
-            print(f'[{self.rank}]: initializing preprocess decoder parameters')
-            if self.emb is None:
-                self.emb = torch.nn.Embedding(cfg.num_embeddings, cfg.encoder_embed_dim)
-            self.layer_norm_encoder = torch.nn.LayerNorm(cfg.encoder_embed_dim)
-            self.embed_scale_decoder = math.sqrt(cfg.decoder_embed_dim)
-            self.embed_positions_decoder = torch.nn.Embedding(cfg.max_source_positions, cfg.decoder_embed_dim)
-            self.layernorm_embedding_decoder = torch.nn.LayerNorm(cfg.decoder_embed_dim)
-        
+            if self.encoder_layer_end == cfg.encoder_layers:
+                self.layer_norm_encoder = torch.nn.LayerNorm(cfg.encoder_embed_dim)
+            else:
+                self.layer_norm_encoder = None
+
         # decoders
         if self.decoder_forward:
             print(f'[{self.rank}]: initializing {self.decoder_layer_end - self.decoder_layer_start} decoder layers')
             self.decoders = torch.nn.ModuleList([DecoderLayer(cfg) for _ in range(self.decoder_layer_end - self.decoder_layer_start)])
+            if self.decoder_layer_end == cfg.encoder_layers + cfg.decoder_layers:
+                self.layer_norm_decoder = torch.nn.LayerNorm(cfg.decoder_embed_dim)
+            else:
+                self.layer_norm_decoder = None
 
-        # compute loss
-        if self.loss_compute:
+        # postpross
+        if self.postprocess:
             print(f'[{self.rank}]: will compute loss')
-            if self.emb is None:
-                self.emb = torch.nn.Embedding(cfg.num_embeddings, cfg.encoder_embed_dim)
-            self.layer_norm_decoder = torch.nn.LayerNorm(cfg.decoder_embed_dim)
-
 
     def input_shape(self):
         if self.encoder_preprocess:
-            # src_tokens, prev_output_tokens
             return ()
         elif self.encoder_forward:
             return (
@@ -484,24 +580,38 @@ class mBARTFull(torch.nn.Module):
             return (
                 (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
             )
+        elif self.decoder_first_stage:
+            return (
+                (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
+            )
         elif self.decoder_forward:
             return (
                 (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
                 (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
             )
+        elif self.decoder_last_stage:
+            return (
+                (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
+                (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
+            )
         else:
-            assert False
+            assert False, "post-process is not allowed to be a single stage"
 
     def output_shape(self):
         shape = None
         if self.encoder_preprocess or self.encoder_forward:
             shape = (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
+        # decoder preprocess is not allowed to be a single stage
         if self.decoder_preprocess or self.decoder_forward:
             shape = (
                 (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
                 (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
             )
-        if self.loss_compute:
+        if self.decoder_last_stage:
+            shape = (
+                (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
+            )
+        if self.postprocess:
             shape = ((1,),)
         assert shape is not None
         return shape
@@ -523,64 +633,77 @@ class mBARTFull(torch.nn.Module):
         if self.encoder_preprocess or self.encoder_forward:
             dtype = (torch.float32,)
         if self.decoder_preprocess or self.decoder_forward:
-            dtype = (torch.float32, torch.float32)
-        if self.loss_compute:
-            dtype = ((1,),)
+            if self.pp_stage == self.num_stages - 1:
+                dtype = (torch.float32,)
+            else:
+                dtype = (torch.float32, torch.float32)
+        if self.postprocess:
+            dtype = ((torch.float32,),)
         assert dtype is not None
         return dtype
 
+    def set_inputs(self, *inputs):
+        assert len(inputs) == 2
+        if self.headtail is not None:
+            self.headtail.set_inputs(*inputs)
+
+    def set_preprocess(self, enc=None, dec=None):
+        if enc is not None:
+            self._preprocess[0] = enc
+        if dec is not None:
+            self._preprocess[1] = dec
+
+    def forward_encoder_preprocess(self, dst=None):
+        return self.headtail.encoder_preprocess(dst)
+
+    def forward_decoder_preprocess(self, dst=None):
+        return self.headtail.decoder_preprocess(dst)
+
+    def forward_postprocess(self, dec, src=None):
+        return self.headtail.postprocess(dec, src)
 
     def forward(self, enc=None, dec=None):
         """
-        x1: src_tokens or encoder output/input
-        x2: prev_output_tokens or decoder output/input
+        enc: encoder input/output
+        dec: decoder output/input
         """
-        src_tokens, prev_output_tokens = None, None
+        pre_enc, pre_dec = self._preprocess
+        enc = pre_enc if enc is None else enc
+        dec = pre_dec if dec is None else dec
+
         # encoder preprocess
         if self.encoder_preprocess:
-            src_tokens, prev_output_tokens = next(self.dataloader)
-            token_embedding = torch.nn.functional.embedding(src_tokens, self.emb.weight)
-            embed = self.embed_scale_encoder * token_embedding
-            x = embed + self.embed_positions_encoder.weight
-            x = self.layernorm_embedding_encoder(x)
-            x = torch.nn.functional.dropout(x, p=0.0)
-            enc = x.transpose(0, 1)
-            output = (enc,)
+            output = self.forward_encoder_preprocess(dst=None)
+            enc = output[0]
 
         # forward encoder
         if self.encoder_forward:
             for layer in self.encoders:
                 enc = layer(enc) # encoder_padding_mask if has_pads else None)
+            if self.layer_norm_encoder is not None:
+                enc = self.layer_norm_encoder(enc)
             output = (enc,)
 
         # decoder preprocess
         if self.decoder_preprocess:
-            enc = self.layer_norm_encoder(enc)
-            if prev_output_tokens is None:
-                _, prev_output_tokens = next(self.dataloader)
-            embed = torch.nn.functional.embedding(prev_output_tokens, self.emb.weight)
-            embed = self.embed_scale_decoder * embed
-            embed = embed + self.embed_positions_decoder.weight
-            embed = self.layernorm_embedding_decoder(embed)
-            embed = torch.nn.functional.dropout(embed, p=0.0)
-            dec = embed.transpose(0, 1)
-            output = (enc, dec)
+            output = self.forward_decoder_preprocess(dst=None)
+            dec = output[0]
 
         # forward decoder
         if self.decoder_forward:
+            dec = pre_dec if dec is None else dec
             for layer in self.decoders:
                 dec, enc = layer(dec, enc)
-            output = (enc, dec)
+            if self.layer_norm_decoder is not None:
+                dec = self.layer_norm_decoder(dec)
+                output = (dec,)
+            else:
+                output = (enc, dec)
 
         # postprocess
-        if self.loss_compute:
-            if prev_output_tokens is None:
-                _, prev_output_tokens = next(self.dataloader)
-            dec = self.layer_norm_decoder(dec)
-            dec = dec.transpose(0, 1)
-            dec = torch.nn.functional.linear(dec, self.emb.weight)
-            loss = criterion(dec, prev_output_tokens)
-            output = (loss,)
+        if self.postprocess:
+            output = self.forward_postprocess(dec)
+            loss = output[0]
 
         return output
 
@@ -590,7 +713,7 @@ def reduce_embed(model, pp_embed_group):
     Embedding gradients needs to be reduced across pipeline stages
     """
     if isinstance(model.emb, torch.nn.Module):
-        grad = model.emb.weight.grad
+        grad = model.emb.get_weight().grad
     else:
         grad = None
     if grad is not None:
@@ -598,39 +721,39 @@ def reduce_embed(model, pp_embed_group):
     torch.cuda.synchronize()
 
 
-
-
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='swin')
-    parser.add_argument('--tp-size', type=int,
-                        help='tensor parallelism size')
-    parser.add_argument('--pp-size', type=int,
-                        help='pipeline parallelism size')
     parser.add_argument('--nmb', type=int, default=4,
                         help='num of micro batch')
+    parser.add_argument('--use-naive', action='store_true',
+                        help='use naive pipeline')
+    parser.add_argument('--use-tp1f1b-pack', action='store_true',
+                    help='use tensor parallel 1f1b')
     args = parser.parse_args()
 
     print(args)
 
     cube.init()
-    pp_ranks, tp_ranks = DeviceGroup().create_hybrid([args.pp_size, args.tp_size])
+    pp_ranks = list(range(DeviceGroup().world_size))
+    # pp_ranks, tp_ranks = DeviceGroup().create_hybrid([args.pp_size, args.tp_size])
     print_each_rank(f'my pp ranks: {pp_ranks}')
-    print_each_rank(f'my tp_ranks: {tp_ranks}')
 
     if _pp_group == -1:
         _pp_group = DeviceGroup().get_group(pp_ranks)
         idx = pp_ranks.index(DeviceGroup().rank)
         _pp_next_rank = pp_ranks[(idx+1) % len(pp_ranks)]
         _pp_prev_rank = pp_ranks[(idx-1) % len(pp_ranks)]
-    if _tp_group == -1:
-        _tp_group = DeviceGroup().get_group(tp_ranks)
+        is_first_stage = idx == 0
+        is_first_decoder_stage = idx == len(pp_ranks) // 2
+        is_last_stage = idx == len(pp_ranks) - 1
     
     # create embed group: first encoder, first decoder, last stage
     # FIXME: only work for tp_size = 1
-    embed_ranks = [pp_ranks[0], pp_ranks[len(pp_ranks) // 2], pp_ranks[-1]]
-    embed_ranks = list(set(embed_ranks))
-    _pp_embed_group = DeviceGroup().get_group(embed_ranks)
+    if args.use_naive:
+        embed_ranks = [pp_ranks[0], pp_ranks[len(pp_ranks) // 2], pp_ranks[-1]]
+        embed_ranks = list(set(embed_ranks))
+        _pp_embed_group = DeviceGroup().get_group(embed_ranks)
     
 
     cfg = Config()
@@ -642,7 +765,14 @@ if __name__ == '__main__':
         dtypes=(torch.int64, torch.int64),
         batch_dims=(0,0,)
     )
-    model = mBARTFull(cfg, dataloader).cuda()
+    if args.use_naive:
+        encoder_preprocess = is_first_stage
+        decoder_preprocess = is_first_decoder_stage
+        postprocess = is_last_stage
+        model = mBARTFull(cfg, encoder_preprocess, decoder_preprocess, postprocess, shard=False).cuda()
+    else:
+        model = mBARTFull(cfg, False, False, False, shard=True).cuda()
+
     print_each_rank('model weight consumpition:')
     memory_summary()
 
@@ -653,8 +783,16 @@ if __name__ == '__main__':
     for step in range(iter_num):
         if step >= 20:
             CudaTimer(enable=True).start('e2e')
-        schedule_naive(model, args.nmb, (_pp_prev_rank, _pp_next_rank))
-        reduce_embed(model, _pp_embed_group)
+        if args.use_naive:
+            schedule_naive(model, iter(dataloader), args.nmb, (_pp_prev_rank, _pp_next_rank))
+            reduce_embed(model, _pp_embed_group)
+        if args.use_tp1f1b_pack:
+            schedule_tp_1f1b_pack(
+                model, iter(dataloader),
+                args.nmb, len(pp_ranks), (_pp_prev_rank, _pp_next_rank)
+            )
+        if step == 0:
+            print('passed 1st iteration')
         optimizer.step()
         optimizer.zero_grad()
         if step >= 20:

@@ -2,7 +2,7 @@ from typing import Tuple
 import torch
 
 
-class Reduce(torch.autograd.Function):
+class AllReduceIdentity(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input, group):
@@ -14,7 +14,7 @@ class Reduce(torch.autograd.Function):
         return grad_output, None
 
 
-class IdentityFoward(torch.autograd.Function):
+class IdentityAllreduce(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input, group):
@@ -27,62 +27,70 @@ class IdentityFoward(torch.autograd.Function):
         return grad_output, None
 
 
-def shard_linear_col(input, weight, bias, group):
-    world_size = torch.distributed.get_world_size(group)
-    if world_size == 1:
-        return torch.nn.functional(input, weight, bias)
-    input = IdentityFoward.apply(input, group)
-    return torch.nn.functional(input, weight, bias)
+class AllGatherScatter(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input, dim, group):
+        ctx._group = group
+        ctx._dim = dim
+        world_size = torch.distributed.get_world_size(group)
+        if world_size == 1:
+            return input
+        rank = torch.distributed.get_rank(group)
+        tensor_list = [torch.empty_like(input) for _ in range(world_size)]
+        tensor_list[rank] = input
+        torch.distributed.all_gather(tensor_list, input, group=group)
+        output = torch.cat(tensor_list, dim=dim).contiguous()
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        group = ctx._group
+        dim = ctx._dim
+        world_size = torch.distributed.get_world_size(group)
+        if world_size == 1:
+            return grad_output
+        input_list = grad_output.chunk(world_size, dim=dim)
+        rank = torch.distributed.get_rank(group)
+        grad = input_list[rank].contiguous()
+        return grad, None, None
 
 
-def shard_linear_row(input, weight, bias, group):
-    world_size = torch.distributed.get_world_size(group)
-    if world_size == 1:
-        return torch.nn.functional(input, weight, bias)
-    out = torch.nn.functional(input, weight, bias)
-    out = Reduce.apply(out, group)
-    return out
+class ReduceBroadcast(torch.autograd.Function):
 
-
-class DummyModelEmbed(torch.nn.Module):
-
-    def __init__(self, num_embeddings: int, embedding_dim: int,
-                 input_shape: Tuple[int, int], group = None):
-        super().__init__()
-
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-        self.input_shape = input_shape
-
-        self.tp_group = group
-        self.tp_size = torch.distributed.get_world_size(group)
-
-        shard_id = torch.distributed.get_rank(group)
-        self.vocab_start_index = num_embeddings // self.tp_size * shard_id
-        self.vocab_end_index = num_embeddings // self.tp_size * (shard_id + 1)
-        self.embed_weight = torch.nn.Parameter(torch.ones((num_embeddings // self.tp_size, embedding_dim)))
-
-    def input_shape(self):
-        return self.input_shape
-
-    def input_dtype(self):
-        return torch.int64
-
-    def output_shape(self):
-        return self.input_shape + (self.embedding_dim,)
-
-    def output_dtype(self):
-        return torch.float32
-
-    def forward(self, input: torch.Tensor):
-        if self.tp_size > 1:
-            mask = (input < self.vocab_start_index) | \
-                        (input >= self.vocab_end_index)
-            input = input.clone() - self.vocab_start_index
-            input[mask] = 0
-            input = torch.nn.functional.embedding(input, self.embed_weight)
-            input[mask, :] = 0.0
-            input = Reduce.apply(input, self.tp_group)
-        else:
-            input = torch.nn.functional.embedding(input, self.embed_weight)
+    @staticmethod
+    def forward(ctx, input, dst: int, group=None):
+        ctx._dst = dst
+        ctx._group = group
+        torch.distributed.reduce(input, dst, group=group)
+        torch.cuda.synchronize()
         return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        src = ctx._dst
+        group = ctx._group
+        torch.distributed.broadcast(grad_output, src, group=group)
+        torch.cuda.synchronize()
+        return grad_output, None, None
+
+
+class BroadcastReduce(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input, src: int, group=None):
+        ctx._src = src
+        ctx._group = group
+        torch.distributed.broadcast(input, src, group=group)
+        torch.cuda.synchronize()
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        dst = ctx._src
+        group = ctx._group
+        if not grad_output.is_contiguous():
+            grad_output = grad_output.contiguous()
+        torch.distributed.reduce(grad_output, dst, group=group)
+        torch.cuda.synchronize()
+        return grad_output, None, None
