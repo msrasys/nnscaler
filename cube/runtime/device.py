@@ -12,16 +12,27 @@ class DeviceGroup:
     class __DeviceGroup:
 
         def __init__(self):
-            torch.distributed.init_process_group(
-                backend='nccl',
-            )
-            self.rank = torch.distributed.get_rank()
-            self.world_size = torch.distributed.get_world_size()
-            # assume each node has the same device number
-            self.local_rank = int(os.environ.get('LOCAL_RANK'))
-            self.node_id = self.rank // torch.cuda.device_count()
-            self.groups = dict()
-            torch.cuda.set_device(self.local_rank)
+            single_device_mode = os.environ.get('SINGLE_DEV_MODE')
+            print(f'single_device_mode = {single_device_mode}')
+            if single_device_mode:
+                print(f"DeviceGroup init using single device mode...")
+                self.rank = 0
+                self.world_size = 1
+                self.local_rank = 0
+                self.node_id = 0
+                self.groups = dict()
+                torch.cuda.set_device(0)
+            else:
+                torch.distributed.init_process_group(
+                    backend='nccl',
+                )
+                self.rank = torch.distributed.get_rank()
+                self.world_size = torch.distributed.get_world_size()
+                # assume each node has the same device number
+                self.local_rank = int(os.environ.get('LOCAL_RANK'))
+                self.node_id = self.rank // torch.cuda.device_count()
+                self.groups = dict()
+                torch.cuda.set_device(self.local_rank)
 
     instance = None
 

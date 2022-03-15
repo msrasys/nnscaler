@@ -41,3 +41,10 @@ def embedding(input: torch.Tensor, weight: torch.Tensor, start: int, stop: int):
     )
     output[input_mask, :] = 0.0
     return output
+
+def einops(input: torch.Tensor, recipe_str, reduction_type: str):
+    import pickle
+    recipe = pickle.loads(recipe_str)
+    from einops.einops import _apply_recipe
+    output = _apply_recipe(recipe, input, reduction_type)
+    return output

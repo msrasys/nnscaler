@@ -68,6 +68,9 @@ class Atmoshpere(torch.nn.Module):
         self.pre_conv3d_reshape = Rearrange('(b0 b1 Nz) Ny Nx -> b0 b1 Nz Ny Nx', b0=1, b1=1) # x = X.view(1, 1, Nz, Ny, Nx)
         self.post_conv3d_reshape = Rearrange('b0 b1 Nz Ny Nx -> (b0 b1 Nz) Ny Nx')
 
+        self.pre_pady_reshape = Rearrange('(b0 Nz) Ny Nx -> b0 Nz Ny Nx', b0=1)
+        self.post_pady_reshape = Rearrange('b0 Nz Ny Nx -> (b0 Nz) Ny Nx')
+
 
     def step(self, dt, pi, theta, u, v, pi0, theta0, u0, v0):
         # flux
@@ -97,7 +100,7 @@ class Atmoshpere(torch.nn.Module):
         # theta_ = self.pad_z(
         #     (self.bar_z(self.P * theta) - self.delta_z(theta) * self.P_[1:-1]) / self.delta_z(self.P)
         # )  # (nz + 1, ny, nx)
-        theta_ = theta0 #TODO remove me
+        theta_ = self.pad_z(self.bar_z(theta0))  #theta0 #TODO remove me
         theta1 = pi0 / pi1 * theta0 + dt / self.deltaA / pi1 * (
             (self.delta_x(F * self.bar_x(self.pad_x(theta))) + self.delta_y(G * self.bar_y(self.pad_y(theta)))) / 2. +
             pi * self.deltaA * self.delta_z(self.w * theta_) / self.dz +
@@ -194,7 +197,7 @@ class Atmoshpere(torch.nn.Module):
 
     def pad_y(self, X):
         #TODO check return F.pad(X.view(1, nz, ny, nx), (0, 0, 1, 1), "circular").view(nz, ny + 2, nx)
-        return F.pad(X, (0, 0, 1, 1), "circular")
+        return self.post_pady_reshape(F.pad(self.pre_pady_reshape(X), (0, 0, 1, 1), "circular"))
 
 
     def bar_y(self, X):
@@ -451,4 +454,4 @@ if __name__ == "__main__":
         # plt.savefig(f'res2/res{i}.jpeg', dpi=300)
         # plt.clf()
 
-        # print(i)
+    print(f'pi = {pi}; theta = {theta}; u = {u}; v = {v}')

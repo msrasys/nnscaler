@@ -5,6 +5,11 @@ import torch
 
 
 def print_each_rank(msg, rank_only=None, outfile=''):
+    import os
+    single_device_mode = os.environ.get('SINGLE_DEV_MODE')
+    if single_device_mode:
+        return
+
     myrank = torch.distributed.get_rank()
     outfile = sys.stdout if outfile == '' else outfile
     for rank in range(torch.distributed.get_world_size()):

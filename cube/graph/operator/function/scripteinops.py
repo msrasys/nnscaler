@@ -12,9 +12,9 @@ class IRScriptEinOps(IRFwOperation):
 
     def __init__(self, signature: str, inputs: List[IRTensor], name: str,
                  **kwargs):
-        signature = 'einops._torch_specific.apply_for_scriptable_torch' #'cube.runtime.function.conv2d'
+        signature = 'cube.runtime.function.einops'
         assert len(inputs) == 1, "Expected only input"
-        assert len(kwargs) == 2, "Expected 2 kwargs: recipe, reduction_type"
+        assert len(kwargs) == 2, "Expected 2 kwargs: recipe_str, reduction_type"
         super().__init__(name, signature, 1, 1)
         for idx, input in enumerate(inputs):
             self.set_input(idx, input)
@@ -27,7 +27,10 @@ class IRScriptEinOps(IRFwOperation):
         if len(self.inputs(0).shape) == 0:
             return False
 
-        recipe = self.kwargs['recipe']
+        recipe_str = self.kwargs['recipe_str']
+        import pickle
+        recipe = pickle.loads(recipe_str)
+
         reduction_type = self.kwargs['reduction_type']
         tmp_tensor = torch.zeros(self.inputs(0).shape)
         tmp_output = _apply_recipe(recipe, tmp_tensor, reduction_type)
@@ -39,10 +42,10 @@ class IRScriptEinOps(IRFwOperation):
         construct a new operator sharing same kwargs with new inputs
         and outputs
         """
-        recipe = self.kwargs['recipe']
+        recipe_str = self.kwargs['recipe_str']
         reduction_type = self.kwargs['reduction_type']
         op = IRScriptEinOps(self.signature, inputs, self.name,
-                      recipe=recipe, reduction_type=reduction_type)
+                            recipe_str=recipe_str, reduction_type=reduction_type)
         assert len(outputs) == 1
         op.set_output(0, outputs[0])
         op.infer_shape()
