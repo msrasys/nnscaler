@@ -1,3 +1,4 @@
+from turtle import forward
 from typing import List, Tuple
 import torch
 
@@ -452,3 +453,73 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
     assert len(output_head_tensors) == 0
 
         # print_each_rank(f'=========end rank {rank}=========')
+
+
+def schedule_1f1b(model, dataloader, num_microbatch, num_stage, neighbors):
+
+    rank = torch.distributed.get_rank()
+    prev_rank, next_rank = neighbors
+    is_first_stage = rank < prev_rank
+    is_last_stage = rank > next_rank
+
+    num_warmup_microbatches = num_stage - 1 - rank
+    num_warmup_microbatches = min(num_warmup_microbatches, num_microbatch)
+    num_warmup_remaining = num_microbatch - num_warmup_microbatches
+
+    input_tensors = list()
+    output_tensors = list()
+
+    # warmup
+    for i in range(num_warmup_microbatches):
+        model.set_inputs(*next(dataloader))
+        # recv forward
+        inputs = () if is_first_stage else recv_forward(model, prev_rank)
+        # forward
+        outputs = forward_step(model, *inputs)
+        # send forward
+        send_forward(outputs, next_rank)
+        input_tensors.append(inputs)
+        output_tensors.append(outputs)
+
+    # before running 1f1b: need to recv first forward tensor
+    if num_warmup_remaining > 0:
+        model.set_inputs(*next(dataloader))
+        inputs = () if is_first_stage else recv_forward(model, prev_rank)
+
+    # run 1f1b
+    for i in range(num_warmup_remaining):
+        model.set_inputs(*next(dataloader))
+        # forward
+        outputs = forward_step(model, *inputs)
+        input_tensors.append(inputs)
+        output_tensors.append(outputs)
+
+        # send forward recv backward
+        grads = (None,)
+        if not is_last_stage:
+            grads = send_forward_recv_backward(outputs, model, next_rank)
+
+        # backward
+        inputs, outputs = input_tensors.pop(0), output_tensors.pop(0)
+        input_grads = backward_step(inputs, outputs, grads)
+        
+        # send backward
+        inputs = ()
+        if not is_first_stage:
+            if i != (num_warmup_remaining-1):
+                # send backward recv forward
+                inputs = send_backward_recv_forward(input_grads, model, prev_rank)
+            else:
+                # send backward
+                send_backward(input_grads, prev_rank)
+
+    # cooldown
+    for i in range(num_warmup_microbatches):
+        inputs, outputs = input_tensors.pop(0), output_tensors.pop(0)
+        # recv backward
+        grads = (None,) if is_last_stage else recv_backward(model, next_rank)
+        # backward
+        input_grads = backward_step(inputs, outputs, grads)
+        # send backward
+        if not is_first_stage:
+            send_backward(input_grads, prev_rank)

@@ -19,7 +19,7 @@ from cube.profiler import CudaTimer
 from cube.profiler.memory import memory_summary, model_summary
 from cube.profiler.timer import print_each_rank
 
-from handcraft.mbart.schedule import schedule_naive, schedule_tp_1f1b_pack
+from handcraft.mbart.schedule import schedule_naive, schedule_1f1b, schedule_tp_1f1b_pack
 from handcraft.mbart.tp import AllGatherScatter, BroadcastReduce, ReduceBroadcast
 
 _tp_group = -1
@@ -727,6 +727,8 @@ if __name__ == '__main__':
                         help='num of micro batch')
     parser.add_argument('--use-naive', action='store_true',
                         help='use naive pipeline')
+    parser.add_argument('--use-1f1b', action='store_true',
+                    help='use 1f1b scheduling')
     parser.add_argument('--use-tp1f1b-pack', action='store_true',
                     help='use tensor parallel 1f1b')
     args = parser.parse_args()
@@ -749,7 +751,7 @@ if __name__ == '__main__':
     
     # create embed group: first encoder, first decoder, last stage
     # FIXME: only work for tp_size = 1
-    if args.use_naive:
+    if args.use_naive or args.use_1f1b:
         embed_ranks = [pp_ranks[0], pp_ranks[len(pp_ranks) // 2], pp_ranks[-1]]
         embed_ranks = list(set(embed_ranks))
         _pp_embed_group = DeviceGroup().get_group(embed_ranks)
@@ -764,7 +766,7 @@ if __name__ == '__main__':
         dtypes=(torch.int64, torch.int64),
         batch_dims=(0,0,)
     )
-    if args.use_naive:
+    if args.use_naive or args.use_1f1b:
         encoder_preprocess = is_first_stage
         decoder_preprocess = is_first_decoder_stage
         postprocess = is_last_stage
@@ -784,6 +786,10 @@ if __name__ == '__main__':
             CudaTimer(enable=True).start('e2e')
         if args.use_naive:
             schedule_naive(model, iter(dataloader), args.nmb, (_pp_prev_rank, _pp_next_rank))
+            reduce_embed(model, _pp_embed_group)
+        if args.use_1f1b:
+            for _ in range(args.nmb // 2):
+                schedule_1f1b(model, iter(dataloader), 2, len(pp_ranks), (_pp_prev_rank, _pp_next_rank))
             reduce_embed(model, _pp_embed_group)
         if args.use_tp1f1b_pack:
             schedule_tp_1f1b_pack(
