@@ -20,7 +20,7 @@ from cube.profiler.memory import memory_summary, model_summary
 from cube.profiler.timer import print_each_rank
 
 from handcraft.mbart.schedule import schedule_naive, schedule_tp_1f1b_pack
-from handcraft.mbart.tp import AllGatherScatter, ParallelEmbed, BroadcastReduce, ReduceBroadcast
+from handcraft.mbart.tp import AllGatherScatter, BroadcastReduce, ReduceBroadcast
 
 _tp_group = -1
 _pp_group = -1
@@ -480,7 +480,6 @@ class ShardHeadTail(torch.nn.Module):
     def postprocess(self, output, src: Optional[int] = None):
         _, prev_output_tokens = self._inputs
         if self.group == -1:
-            output = self.layer_norm_decoder(output)
             output = output.transpose(0, 1)
             output = torch.nn.functional.linear(output, self.weight)
             loss = criterion(output, prev_output_tokens)
@@ -712,8 +711,8 @@ def reduce_embed(model, pp_embed_group):
     """
     Embedding gradients needs to be reduced across pipeline stages
     """
-    if isinstance(model.emb, torch.nn.Module):
-        grad = model.emb.get_weight().grad
+    if isinstance(model.headtail, torch.nn.Module):
+        grad = model.headtail.weight.grad
     else:
         grad = None
     if grad is not None:
@@ -779,9 +778,9 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
     CudaTimer(enable=False).warmup()
-    iter_num = 64
+    iter_num = 32
     for step in range(iter_num):
-        if step >= 20:
+        if step >= 10:
             CudaTimer(enable=True).start('e2e')
         if args.use_naive:
             schedule_naive(model, iter(dataloader), args.nmb, (_pp_prev_rank, _pp_next_rank))
@@ -795,11 +794,11 @@ if __name__ == '__main__':
             print('passed 1st iteration')
         optimizer.step()
         optimizer.zero_grad()
-        if step >= 20:
+        if step >= 10:
             CudaTimer().stop('e2e')
         if (step + 1) % 10 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-20, field_name='e2e')))
+          CudaTimer().duration(iter_num-10, field_name='e2e')))
     memory_summary()

@@ -440,11 +440,11 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
         if 0 <= encoder_mid and encoder_mid <= num_microbatch - 1:
             tp_head_backward(last_backward)
 
-        memory_summary()
-        if rank == 0:
-            io_input(f'{step}>>>')
-        torch.distributed.barrier()
-        print_each_rank(f'=========end rank {rank}: {step}=========')
+        # memory_summary()
+        # if rank == 0:
+        #     io_input(f'{step}>>>')
+        # torch.distributed.barrier()
+        # print_each_rank(f'=========end rank {rank}: {step}=========')
 
     assert len(input_tensors) == 0
     assert len(output_tensors) == 0
