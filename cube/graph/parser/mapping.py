@@ -95,6 +95,9 @@ class Sign2Op:
 
         __ttemplate('conv3d'): function.Conv3D,
 
+        #pytorch1.11
+        __ttemplate('linear'): function.Linear,
+
         #einops
         __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
 

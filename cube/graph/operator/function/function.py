@@ -59,6 +59,11 @@ def _create_anno(ins: List[List[Union[str, List[str]]]],
 
 
 def Linear(signature, inputs):
+    if signature == 'torch.linear':
+        import warnings
+        warnings.warn(f'signature {signature} replaced into torch.nn.functional.linear')
+        signature = 'torch.nn.functional.linear'
+
     annos = [
         'b * k+, n k+ -> b * n',   # no bias
         'b * k+, n k+, n -> b * n' # have bias
