@@ -77,6 +77,9 @@ class Config:
     pooler_activation_fn = 'tanh'
     pooler_dropout = 0.0
 
+    # classification task
+    num_classes = 2
+
 
 def attn_fn(query: torch.Tensor, key: torch.Tensor,
             wq: torch.Tensor, wq_bias: Optional[torch.Tensor],
@@ -404,6 +407,36 @@ def criterion(output: torch.Tensor, prev_output_tokens: torch.Tensor, label_smoo
     return loss
 
 
+class MBartClassificationHead(torch.nn.Module):
+    """Head for sentence-level classification tasks."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        inner_dim: int,
+        num_classes: int,
+        pooler_dropout: float,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.dense = torch.nn.Linear(input_dim, inner_dim)
+        self.dropout = torch.nn.Dropout(p=pooler_dropout)
+        self.out_proj = torch.nn.Linear(inner_dim, num_classes)
+        self.loss_fct = torch.nn.CrossEntropyLoss()
+
+    def forward(self, dec: torch.Tensor, labels):
+        # sentence_represent = dec[eos_mask,:].view(dec.size(0), -1, hidden_states.size(-1))[:,-1,:]
+        dec = dec.transpose(0, 1)[:,-1,:]
+        sentence_represent = dec
+        hidden_states = self.dropout(sentence_represent)
+        hidden_states = self.dense(hidden_states)
+        hidden_states = torch.tanh(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        logits = self.out_proj(hidden_states)
+        loss = self.loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
+        return (loss,)
+
+
 class ShardHeadTail(torch.nn.Module):
 
     def __init__(self, cfg: Config, group=-1):
@@ -434,15 +467,10 @@ class ShardHeadTail(torch.nn.Module):
 
         # post-proces
 
-        self._inputs = (None, None)
+        self._inputs = (None, )
 
     def set_inputs(self, *inputs):
         self._inputs = inputs
-
-    def criterion_input_shape(self):
-        return (
-            (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
-        )
 
     def embed_lookup(self, tokens, dst: Optional[int] = None):
         if self.shard_num > 1:
@@ -458,7 +486,7 @@ class ShardHeadTail(torch.nn.Module):
         return embed
 
     def encoder_preprocess(self, dst: Optional[int] = None):
-        source_tokens, _ = self._inputs
+        source_tokens = self._inputs[0]
         source_embed = self.embed_lookup(source_tokens, dst)
         embed = self.embed_scale_encoder * source_embed
         x = embed + self.embed_positions_encoder.weight
@@ -468,7 +496,7 @@ class ShardHeadTail(torch.nn.Module):
         return (enc,)
 
     def decoder_preprocess(self, dst: Optional[int] = None):
-        _, prev_output_tokens = self._inputs
+        prev_output_tokens = self._inputs[0]
         target_emb = self.embed_lookup(prev_output_tokens, dst)
         embed = self.embed_scale_decoder * target_emb
         embed = embed + self.embed_positions_decoder.weight
@@ -476,31 +504,6 @@ class ShardHeadTail(torch.nn.Module):
         embed = torch.nn.functional.dropout(embed, p=0.0)
         dec = embed.transpose(0, 1)
         return (dec,)
-
-    def postprocess(self, output, src: Optional[int] = None):
-        _, prev_output_tokens = self._inputs
-        if self.group == -1:
-            output = output.transpose(0, 1)
-            output = torch.nn.functional.linear(output, self.weight)
-            loss = criterion(output, prev_output_tokens)
-            return (loss,)
-        else:
-            assert src is not None
-            if self.shard_idx != src:
-                output = torch.empty(
-                    self.criterion_input_shape()[0],
-                    dtype=torch.float32,
-                    requires_grad=True,
-                    device=torch.cuda.current_device()
-                )
-            output = output.transpose(0, 1)
-            output = BroadcastReduce.apply(output, src, self.group)
-            # return (torch.sum(output.contiguous()),)
-            output = torch.nn.functional.linear(output, self.weight)
-            output = AllGatherScatter.apply(output, -1, self.group)
-            loss = criterion(output, prev_output_tokens)
-            return (loss,)
-
 
 
 class mBARTFull(torch.nn.Module):
@@ -511,6 +514,7 @@ class mBARTFull(torch.nn.Module):
                  post_process=True, shard=True):
         super().__init__()
         self.cfg = cfg
+        self.dummy_labels = torch.tensor([1]).cuda()
         self._preprocess = [None, None] # enc, dec
 
         self.rank = DeviceGroup().rank
@@ -567,6 +571,7 @@ class mBARTFull(torch.nn.Module):
         # postpross
         if self.postprocess:
             print(f'[{self.rank}]: will compute loss')
+            self.head = MBartClassificationHead(cfg.decoder_embed_dim, 1024, cfg.num_classes, 0.0)
 
     def input_shape(self):
         if self.encoder_preprocess:
@@ -588,13 +593,9 @@ class mBARTFull(torch.nn.Module):
                 (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
                 (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
             )
-        elif self.decoder_last_stage:
-            return (
-                (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
-                (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
-            )
-        else:
-            assert False, "post-process is not allowed to be a single stage"
+        elif self.postprocess:
+            return ((1,),)
+        assert False
 
     def output_shape(self):
         shape = None
@@ -606,12 +607,10 @@ class mBARTFull(torch.nn.Module):
                 (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
                 (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
             )
-        if self.decoder_last_stage:
-            shape = (
-                (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
-            )
         if self.postprocess:
-            shape = ((1,),)
+            shape = (
+                (1,),
+            )
         assert shape is not None
         return shape
 
@@ -642,7 +641,7 @@ class mBARTFull(torch.nn.Module):
         return dtype
 
     def set_inputs(self, *inputs):
-        assert len(inputs) == 2
+        assert len(inputs) == 1
         if self.headtail is not None:
             self.headtail.set_inputs(*inputs)
 
@@ -658,8 +657,8 @@ class mBARTFull(torch.nn.Module):
     def forward_decoder_preprocess(self, dst=None):
         return self.headtail.decoder_preprocess(dst)
 
-    def forward_postprocess(self, dec, src=None):
-        return self.headtail.postprocess(dec, src)
+    def forward_postprocess(self, dec):
+        return self.head(dec, self.dummy_labels)
 
     def forward(self, enc=None, dec=None):
         """
@@ -761,10 +760,9 @@ if __name__ == '__main__':
     dataloader = SynTextDataLoader(
         shapes=(
             [1, cfg.max_source_positions],
-            [1, cfg.max_target_positions]
         ),
-        dtypes=(torch.int64, torch.int64),
-        batch_dims=(0,0,)
+        dtypes=(torch.int64,),
+        batch_dims=(0,)
     )
     if args.use_naive or args.use_1f1b:
         encoder_preprocess = is_first_stage
@@ -772,7 +770,7 @@ if __name__ == '__main__':
         postprocess = is_last_stage
         model = mBARTFull(cfg, encoder_preprocess, decoder_preprocess, postprocess, shard=False).cuda()
     else:
-        model = mBARTFull(cfg, False, False, False, shard=True).cuda()
+        model = mBARTFull(cfg, False, False, is_last_stage, shard=True).cuda()
 
     print_each_rank('model weight consumpition:')
     memory_summary()
