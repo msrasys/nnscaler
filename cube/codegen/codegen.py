@@ -477,7 +477,7 @@ class ScheduleCodeGen(CodeGen):
     def return_naming(self, tensors: List[Any]) -> str:
         tensors = [self.tensor_naming(t) for t in tensors]
         if len(tensors) == 0:
-            tensors = '_'
+            tensors = ''
         else:
             tensors = ', '.join(tensors)
         return tensors
