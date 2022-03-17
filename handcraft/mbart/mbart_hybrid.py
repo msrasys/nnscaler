@@ -686,7 +686,6 @@ if __name__ == '__main__':
         dtypes=(torch.int64,),
         batch_dims=(0,)
     )
-    dataloader = iter(dataloader)
 
 
     if args.pp_size > 1:
@@ -708,11 +707,12 @@ if __name__ == '__main__':
         if step >= 10:
             CudaTimer(enable=True).start('e2e')
         if args.pp_size > 1:
-            schedule_naive(model, dataloader, args.nmb, (_pp_prev_rank, _pp_next_rank))
+            schedule_naive(model, iter(dataloader), args.nmb, (_pp_prev_rank, _pp_next_rank))
             reduce_embed(model, _pp_embed_group)
         else:
+            loader = iter(dataloader)
             for _ in range(args.nmb):
-                model.set_inputs(next(dataloader))
+                model.set_inputs(next(loader))
                 loss = model()[0]
                 loss.backward()
         if step == 0:
