@@ -751,7 +751,7 @@ if __name__ == '__main__':
     # create embed group: first encoder, first decoder, last stage
     # FIXME: only work for tp_size = 1
     if args.use_naive or args.use_1f1b:
-        embed_ranks = [pp_ranks[0], pp_ranks[len(pp_ranks) // 2], pp_ranks[-1]]
+        embed_ranks = [pp_ranks[0], pp_ranks[len(pp_ranks) // 2]]
         embed_ranks = list(set(embed_ranks))
         _pp_embed_group = DeviceGroup().get_group(embed_ranks)
     
@@ -796,6 +796,7 @@ if __name__ == '__main__':
             )
         if step == 0:
             print('passed 1st iteration')
+            memory_summary()
         optimizer.step()
         optimizer.zero_grad()
         if step >= 10:
