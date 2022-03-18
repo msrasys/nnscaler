@@ -29,7 +29,10 @@ def model_summary(model: torch.nn.Module, inputs: List[Any], do_eval=False, max_
     static_memory = torch.cuda.memory_allocated()
     print_each_rank(
         'static model: {:,.2f} MB'.format(static_memory / 1024 / 1024), rank_only=0)
-    
+    nparams = sum([param.numel() for param in model.parameters()])
+    print_each_rank(
+        'model paramters: {:,.2f} M'.format(nparams / 1000000), rank_only=0)
+
     stat = dict(depth=0)
     def before_forward(module, input):
         module._summary_depth = stat['depth']
