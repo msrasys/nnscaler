@@ -18,9 +18,9 @@ class IRCustomOps(IRFwOperation):
                 self.set_input(idx, input)
         elif signature == 'examples.custom_ops.update_diag':
             signature = signature.replace('examples.custom_ops', 'cube.runtime.function')
-            assert len(inputs) == 9, "Expected only input, weight, bias as inputs"
-            assert len(kwargs) == 2, "Expected 0 kwargs: "
-            super().__init__(name, signature, 1, 1)
+            assert len(inputs) == 10, "Expected only input, weight, bias as inputs"
+            assert len(kwargs) == 1, "Expected 0 kwargs: "
+            super().__init__(name, signature, len(inputs), 1)
             for idx, input in enumerate(inputs):
                 self.set_input(idx, input)
             self.kwargs.update(kwargs)

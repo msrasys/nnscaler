@@ -92,9 +92,9 @@ class Atmoshpere(torch.nn.Module):
         # for i in range(1, self.nz + 1):
         #     self.w[i] = - ((self.delta_x(F[:i]) + self.delta_y(G[:i])) * self.dz).sum(dim=0) / self.deltaA / pi1 \
         #         - self.sigma[i] * (pi1 - pi0) / dt / pi1
-        # TODO fix this custom Op
-        # self.w = custom_ops.update_diag(self.w, F, G, self.delta_x_filter, self.delta_y_filter, self.deltaA,
-        #                                 pi0, pi1, self.sigma, self.dz, dt)
+        # TODO fix SetAttr for "self.w ="
+        w = custom_ops.update_diag(self.w, F, G, self.delta_x_filter, self.delta_y_filter, self.deltaA,
+                                        pi0, pi1, self.sigma, dt, self.dz)
         # print('w:', self.w.mean())
 
         # update potential temperature theta (nz, ny, nx)
