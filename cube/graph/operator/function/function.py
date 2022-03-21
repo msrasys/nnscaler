@@ -8,6 +8,7 @@ from cube.graph.operator.function.conv import IRConv2D
 from cube.graph.operator.function.conv import IRConv3D
 from cube.graph.operator.function.pad import IRPad
 from cube.graph.operator.function.scripteinops import IRScriptEinOps
+from cube.graph.operator.function.customops import IRCustomOps
 
 
 def _create_eshape(shape: List[int], iterator: Optional[Iterable] = None,
@@ -463,3 +464,18 @@ def ScriptEinOps(signature, inputs):
     import pickle
     recipe_str = pickle.dumps(recipe)
     return IRScriptEinOps(signature, tensors, 'scripteinops', recipe_str=recipe_str, reduction_type=reduction_type)
+
+
+def CustomOps(signature, inputs):
+    if signature == 'examples.custom_ops.strip_2_borders':
+        tensors = inputs[0:1]
+        print(f'CustomOps:tensors[0] = {tensors[0]}')
+        return IRCustomOps(signature, tensors, 'custom_ops')
+    elif signature == 'example.custom_ops.update_diag':
+        tensors = inputs[0:9]
+        dz = inputs[9]
+        dt = inputs[10]
+        return IRCustomOps(signature, tensors, 'custom_ops', dz=dz, dt=dt)
+    else:
+        import warnings
+        warnings.warn(f"ERROR Unknown custom op, signature{signature}")

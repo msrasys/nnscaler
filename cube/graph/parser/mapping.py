@@ -47,6 +47,9 @@ class Sign2Op:
     # einops
     __einopsize = lambda name: f'einops._torch_specific.{name}'
 
+    # custom ops
+    __customops = lambda name: f'examples.custom_ops.{name}'
+
     kOpMap = {
 
         # torch nn functional
@@ -101,6 +104,9 @@ class Sign2Op:
         #einops
         __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
 
+        #custom ops
+        __customops('strip_2_borders'): function.CustomOps,
+        __customops('update_diag'): function.CustomOps,
     }
 
     # customized operator code: signature -> code

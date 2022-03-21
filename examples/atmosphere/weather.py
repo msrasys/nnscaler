@@ -1,17 +1,16 @@
-import math
 import torch
-import numpy as np
 import torch.nn.functional as F
 
 torch.set_default_tensor_type(torch.DoubleTensor)
 
-
-from typing import List
 import cube
 from cube.runtime.syndata import SciLoopVariables
 from examples.atmosphere.policy.naive import PAS
 
 from einops.layers.torch import Rearrange
+
+#custom ops
+import examples.custom_ops as custom_ops
 
 class Atmoshpere(torch.nn.Module):
     def __init__(self,
@@ -88,19 +87,21 @@ class Atmoshpere(torch.nn.Module):
         pi1 = pi0 - dt / self.deltaA * ((self.delta_x(F) + self.delta_y(G)) * self.dz).sum(dim=0) #sum(axis=0)  # (nz, ny, nx)
         # print('pi:', pi1.mean())
 
-        # TODO a custom Op needed
+
         # # update diagnostic variable w (nz + 1, ny, nx)
         # for i in range(1, self.nz + 1):
         #     self.w[i] = - ((self.delta_x(F[:i]) + self.delta_y(G[:i])) * self.dz).sum(dim=0) / self.deltaA / pi1 \
         #         - self.sigma[i] * (pi1 - pi0) / dt / pi1
-
+        # TODO fix this custom Op
+        # self.w = custom_ops.update_diag(self.w, F, G, self.delta_x_filter, self.delta_y_filter, self.deltaA,
+        #                                 pi0, pi1, self.sigma, self.dz, dt)
         # print('w:', self.w.mean())
 
         # update potential temperature theta (nz, ny, nx)
-        # theta_ = self.pad_z(
-        #     (self.bar_z(self.P * theta) - self.delta_z(theta) * self.P_[1:-1]) / self.delta_z(self.P)
-        # )  # (nz + 1, ny, nx)
-        theta_ = self.pad_z(self.bar_z(theta0))  #theta0 #TODO remove me
+        theta_ = self.pad_z(
+            (self.bar_z(self.P * theta) - self.delta_z(theta) * custom_ops.strip_2_borders(self.P_)) / self.delta_z(self.P)
+        )  # (nz + 1, ny, nx)
+
         theta1 = pi0 / pi1 * theta0 + dt / self.deltaA / pi1 * (
             (self.delta_x(F * self.bar_x(self.pad_x(theta))) + self.delta_y(G * self.bar_y(self.pad_y(theta)))) / 2. +
             pi * self.deltaA * self.delta_z(self.w * theta_) / self.dz +
@@ -242,7 +243,6 @@ class Atmoshpere(torch.nn.Module):
 
 
 if __name__ == "__main__":
-    import matplotlib.pyplot as plt
     cube.init()
 
     nz = 15
