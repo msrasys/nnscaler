@@ -106,7 +106,8 @@ class Sign2Op:
 
         #custom ops
         __customops('strip_2_borders'): function.CustomOps,
-        __customops('update_diag'): function.CustomOps,
+        __customops('update_diag_'): function.CustomOps,
+        __customops('update_geopotential_'): function.CustomOps,
     }
 
     # customized operator code: signature -> code

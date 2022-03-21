@@ -471,11 +471,18 @@ def CustomOps(signature, inputs):
         tensors = inputs[0:1]
         print(f'CustomOps:tensors[0] = {tensors[0]}')
         return IRCustomOps(signature, tensors, 'custom_ops')
-    elif signature == 'examples.custom_ops.update_diag':
+    elif signature == 'examples.custom_ops.update_diag_':
         tensors = inputs[0:10]
         # dt = inputs[9]
         dz = inputs[10]
         return IRCustomOps(signature, tensors, 'custom_ops', dz=dz)
+    elif signature == 'examples.custom_ops.update_geopotential_':
+        tensors = inputs[0:5]
+        g = inputs[5]
+        CPD = inputs[6]
+        nz = inputs[7]
+        return IRCustomOps(signature, tensors, 'custom_ops', g=g, CPD=CPD, nz=nz)
+
     else:
         import warnings
         warnings.warn(f"ERROR Unknown custom op, signature {signature}")

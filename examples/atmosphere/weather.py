@@ -93,7 +93,7 @@ class Atmoshpere(torch.nn.Module):
         #     self.w[i] = - ((self.delta_x(F[:i]) + self.delta_y(G[:i])) * self.dz).sum(dim=0) / self.deltaA / pi1 \
         #         - self.sigma[i] * (pi1 - pi0) / dt / pi1
         # TODO fix SetAttr for "self.w ="
-        w = custom_ops.update_diag(self.w, F, G, self.delta_x_filter, self.delta_y_filter, self.deltaA,
+        custom_ops.update_diag_(self.w, F, G, self.delta_x_filter, self.delta_y_filter, self.deltaA,
                                         pi0, pi1, self.sigma, dt, self.dz)
         # print('w:', self.w.mean())
 
@@ -116,7 +116,7 @@ class Atmoshpere(torch.nn.Module):
         # for i in range(1, self.nz):
         #     tmp = self.phi[-i] - self.CPD * (self.P_[-i - 1] - self.P[-i]) * theta[-i]
         #     self.phi[-1 - i] = tmp - self.CPD * (self.P[-1 - i] - self.P_[-1 - i]) * theta[-1 - i]
-
+        custom_ops.update_geopotential_(self.phi, self.zs, self.P, self.P_, theta, self.g, self.CPD, self.nz)
         # print('phi:', self.phi.mean())
 
         # update u (nz, ny, nx + 1)
