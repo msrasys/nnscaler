@@ -462,12 +462,12 @@ def schedule_1f1b(model, dataloader, num_microbatch, num_stage, neighbors):
 
     # before running 1f1b: need to recv first forward tensor
     if num_warmup_remaining > 0:
-        model.set_inputs(*next(dataloader))
+        model.set_inputs(next(dataloader))
         inputs = () if is_first_stage else recv_forward(model, prev_rank)
 
     # run 1f1b
     for i in range(num_warmup_remaining):
-        model.set_inputs(*next(dataloader))
+        model.set_inputs(next(dataloader))
         # forward
         outputs = forward_step(model, *inputs)
         input_tensors.append(inputs)

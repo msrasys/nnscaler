@@ -11,6 +11,7 @@ from typing import Optional
 import argparse
 import math
 import torch
+from torch.utils import checkpoint
 
 import cube
 from cube.runtime.device import DeviceGroup
@@ -20,7 +21,7 @@ from cube.profiler.memory import memory_summary, model_summary
 from cube.profiler.timer import print_each_rank
 
 from handcraft.mbart.schedule import schedule_naive, schedule_1f1b, schedule_tp_1f1b_pack
-from handcraft.mbart.tp import AllGatherScatter, AllReduceIdentity, BroadcastReduce, IdentityAllreduce, ReduceBroadcast
+from handcraft.mbart.tp import AllReduceIdentity, IdentityAllreduce, ReduceBroadcast
 
 _tp_group = -1
 _pp_group = -1
@@ -28,33 +29,25 @@ _pp_embed_group = -1
 _pp_next_rank = None
 _pp_prev_rank = None
 
-# fairseq task
-# translation_from_pretrained_bart
-
-# fairseq criterion
-# label_smoothed_cross_entropy, --label_smoothing = 0.2
 
 class Config:
 
     num_embeddings = 250027
 
-    encoder_embed_path = None
-    encoder_embed_dim = 1024
-    encoder_ffn_embed_dim = 4 * 1024
-    encoder_layers = 12
-    encoder_attention_heads = 16
-    encoder_normalize_before = True
-    encoder_learned_pos = True
-
-    decoder_embed_path = None
-    decoder_embed_dim = 1024
-    decoder_ffn_embed_dim = 4 * 1024
+    # d_ff
     decoder_layers = 12
-    decoder_attention_heads = 16
-    decoder_normalize_before = True
-    decoder_learned_pos = True
-    cross_self_attention = False
-    no_cross_attention = False
+    encoder_layers = 12
+    embed_dim = 1024
+
+    # 610M model -> original setting
+    # attention_heads = 16
+    # attention_inner_dim = attention_heads * 64
+    # ffn_dim = 4 * embed_dim
+
+    # t5-3b config
+    attention_heads = 32
+    attention_inner_dim = attention_heads * 128
+    ffn_dim = 16384
 
     attention_dropout = 0.0
     activation_dropout = 0.0
@@ -68,17 +61,9 @@ class Config:
     share_decoder_input_output_embed = True
     share_all_embeddings = True
 
-    decoder_output_dim = 1024  # same with decorder_embed_dim
-    decoder_input_dim = 1024   # same with decorder_embed_dim
-
-    no_scale_embedding = False # True in bart large
-    layernorm_embedding = True
-    activation_fn = 'gelu'
-    pooler_activation_fn = 'tanh'
-    pooler_dropout = 0.0
-
     # classification task
-    num_classes = 2
+    pooler_dropout = 0.0
+    num_classes = 3
 
 
 def attn_fn(query: torch.Tensor, key: torch.Tensor,
@@ -131,42 +116,29 @@ def attn_fn(query: torch.Tensor, key: torch.Tensor,
 
 class MultiheadAttention(torch.nn.Module):
 
-    def __init__(self, embed_dim: int, num_heads: int, dropout=0.0, bias=True):
+    def __init__(self, embed_dim: int, num_heads: int, inner_dim: int, dropout=0.0, bias=True):
         super().__init__()
         self.tp_group = _tp_group
         self.tp_size = 1 if _tp_group == -1 else torch.distributed.get_world_size(_tp_group)
 
-        self.qdim = embed_dim
-        self.kdim = embed_dim
-        self.vdim = embed_dim
-        self.head_dim = embed_dim // num_heads
-        self.scaling = self.head_dim ** -0.5
+        self.inner_dim = inner_dim
         self.num_heads = num_heads
+        self.head_dim = inner_dim // num_heads
+        self.scaling = self.head_dim ** -0.5
         self.dropout_p = dropout
         # K
-        self.k_proj = torch.nn.Parameter(torch.empty(embed_dim // self.tp_size, self.kdim))
-        if bias:
-            self.k_bias = torch.nn.Parameter(torch.empty(embed_dim // self.tp_size))
-        else:
-            self.k_bias = None
+        self.k_proj = torch.nn.Parameter(torch.empty(self.inner_dim // self.tp_size, embed_dim))
+        self.k_bias = torch.nn.Parameter(torch.empty(self.inner_dim // self.tp_size)) if bias else None
         # V
-        self.v_proj = torch.nn.Parameter(torch.empty(embed_dim // self.tp_size, self.vdim))
-        if bias:
-            self.v_bias = torch.nn.Parameter(torch.empty(embed_dim // self.tp_size))
-        else:
-            self.v_bias = None
+        self.v_proj = torch.nn.Parameter(torch.empty(self.inner_dim // self.tp_size, embed_dim))
+        self.v_bias = torch.nn.Parameter(torch.empty(self.inner_dim // self.tp_size)) if bias else None
         # Q
-        self.q_proj = torch.nn.Parameter(torch.empty(embed_dim // self.tp_size, self.qdim))
-        if bias:
-            self.q_bias = torch.nn.Parameter(torch.empty(embed_dim // self.tp_size))
-        else:
-            self.q_bias = None
+        self.q_proj = torch.nn.Parameter(torch.empty(self.inner_dim // self.tp_size, embed_dim))
+        self.q_bias = torch.nn.Parameter(torch.empty(self.inner_dim // self.tp_size)) if bias else None
         # Out
-        self.out_proj = torch.nn.Parameter(torch.empty(embed_dim, embed_dim // self.tp_size))
-        if bias:
-            self.out_bias = torch.nn.Parameter(torch.empty(embed_dim))
-        else:
-            self.out_bias = None
+        self.out_proj = torch.nn.Parameter(torch.empty(embed_dim, self.inner_dim // self.tp_size))
+        self.out_bias = torch.nn.Parameter(torch.empty(embed_dim)) if bias else None
+
 
     def forward(self, query: torch.Tensor, key: torch.Tensor):
         if key is not query:
@@ -190,21 +162,21 @@ class EncoderLayer(torch.nn.Module):
         self.tp_size = 1 if _tp_group == -1 else torch.distributed.get_world_size(_tp_group)
 
         self.cfg = cfg
-        self.self_attn = MultiheadAttention(cfg.encoder_embed_dim, cfg.encoder_attention_heads, cfg.attention_dropout)
-        self.self_attn_layer_norm = torch.nn.LayerNorm(cfg.encoder_embed_dim)
+        self.self_attn = MultiheadAttention(cfg.embed_dim, cfg.attention_heads, cfg.attention_inner_dim, cfg.attention_dropout)
+        self.self_attn_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
         self.dropout = torch.nn.Dropout(p=cfg.dropout)
         self.activation_dropout = torch.nn.Dropout(p=cfg.activation_dropout)
-        self.fc1 = torch.nn.Linear(cfg.encoder_embed_dim, cfg.encoder_ffn_embed_dim // self.tp_size)
-        self.fc2 = torch.nn.Linear(cfg.encoder_ffn_embed_dim // self.tp_size, cfg.encoder_embed_dim)
-        self.final_layer_norm = torch.nn.LayerNorm(cfg.encoder_embed_dim)
+        self.fc1 = torch.nn.Linear(cfg.embed_dim, cfg.ffn_dim // self.tp_size)
+        self.fc2 = torch.nn.Linear(cfg.ffn_dim // self.tp_size, cfg.embed_dim)
+        self.final_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
 
     def input_shape(self):
         # L, N, E
-        return (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim)
+        return (self.cfg.max_source_positions, 1, self.cfg.embed_dim)
 
     def output_shape(self):
         # L N E
-        return (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim)
+        return (self.cfg.max_source_positions, 1, self.cfg.embed_dim)
 
     def input_dtype(self):
         return torch.float32
@@ -247,28 +219,28 @@ class DecoderLayer(torch.nn.Module):
 
         self.cfg = cfg
         self.dropout = torch.nn.Dropout(p=cfg.dropout)
-        self.self_attn = MultiheadAttention(cfg.decoder_embed_dim, cfg.decoder_attention_heads, cfg.attention_dropout)
+        self.self_attn = MultiheadAttention(cfg.embed_dim, cfg.attention_heads, cfg.attention_inner_dim, cfg.attention_dropout)
         self.activation_dropout = torch.nn.Dropout(p=cfg.activation_dropout)
 
-        self.self_attn_layer_norm = torch.nn.LayerNorm(cfg.decoder_embed_dim)
+        self.self_attn_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
         # encoder atten
-        self.encoder_attn = MultiheadAttention(cfg.encoder_embed_dim, cfg.decoder_attention_heads, cfg.attention_dropout)
-        self.encoder_attn_layer_norm = torch.nn.LayerNorm(cfg.decoder_embed_dim)
+        self.encoder_attn = MultiheadAttention(cfg.embed_dim, cfg.attention_heads, cfg.attention_inner_dim, cfg.attention_dropout)
+        self.encoder_attn_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
 
-        self.fc1 = torch.nn.Linear(cfg.decoder_embed_dim, cfg.decoder_ffn_embed_dim // self.tp_size)
-        self.fc2 = torch.nn.Linear(cfg.decoder_ffn_embed_dim // self.tp_size, cfg.decoder_embed_dim)
-        self.final_layer_norm = torch.nn.LayerNorm(cfg.decoder_embed_dim)
+        self.fc1 = torch.nn.Linear(cfg.embed_dim, cfg.ffn_dim // self.tp_size)
+        self.fc2 = torch.nn.Linear(cfg.ffn_dim // self.tp_size, cfg.embed_dim)
+        self.final_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
 
     def input_shape(self):
         return (
-            (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
-            (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim)
+            (self.cfg.max_target_positions, 1, self.cfg.embed_dim),
+            (self.cfg.max_source_positions, 1, self.cfg.embed_dim)
         )
 
     def output_shape(self):
         return (
-            (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
-            (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim)
+            (self.cfg.max_target_positions, 1, self.cfg.embed_dim),
+            (self.cfg.max_source_positions, 1, self.cfg.embed_dim)
         )
 
     def input_dtype(self):
@@ -349,7 +321,7 @@ class MBartClassificationHead(torch.nn.Module):
         return (loss,)
 
 
-class ShardHeadTail(torch.nn.Module):
+class SharedEmbed(torch.nn.Module):
 
     def __init__(self, cfg: Config):
         """
@@ -366,17 +338,17 @@ class ShardHeadTail(torch.nn.Module):
         
         self.vocab_start_index = self.cfg.num_embeddings // self.tp_size * self.tp_idx
         self.vocab_end_index = self.cfg.num_embeddings // self.tp_size * (self.tp_idx + 1)
-        self.weight = torch.nn.Parameter(torch.ones((self.cfg.num_embeddings // self.tp_size, self.cfg.encoder_embed_dim)))
+        self.weight = torch.nn.Parameter(torch.ones((self.cfg.num_embeddings // self.tp_size, self.cfg.embed_dim)))
 
         # encoder-preprocess
-        self.embed_positions_encoder = torch.nn.Embedding(cfg.max_source_positions, cfg.encoder_embed_dim)
-        self.embed_scale_encoder = math.sqrt(cfg.encoder_embed_dim)
-        self.layernorm_embedding_encoder = torch.nn.LayerNorm(cfg.encoder_embed_dim)
+        self.embed_positions_encoder = torch.nn.Embedding(cfg.max_source_positions, cfg.embed_dim)
+        self.embed_scale_encoder = math.sqrt(cfg.embed_dim)
+        self.layernorm_embedding_encoder = torch.nn.LayerNorm(cfg.embed_dim)
 
         # decoder-preprocess
-        self.embed_scale_decoder = math.sqrt(cfg.decoder_embed_dim)
-        self.embed_positions_decoder = torch.nn.Embedding(cfg.max_source_positions, cfg.decoder_embed_dim)
-        self.layernorm_embedding_decoder = torch.nn.LayerNorm(cfg.decoder_embed_dim)
+        self.embed_scale_decoder = math.sqrt(cfg.embed_dim)
+        self.embed_positions_decoder = torch.nn.Embedding(cfg.max_source_positions, cfg.embed_dim)
+        self.layernorm_embedding_decoder = torch.nn.LayerNorm(cfg.embed_dim)
 
         self._inputs = (None, )
 
@@ -457,7 +429,7 @@ class mBARTFull(torch.nn.Module):
         self.decoder_layer_end = self.layer_end
 
         if encoder_preprocess or decoder_preprocess or post_process:
-            self.headtail = ShardHeadTail(cfg)
+            self.headtail = SharedEmbed(cfg)
         else:
             self.headtail = None
 
@@ -466,7 +438,7 @@ class mBARTFull(torch.nn.Module):
             print(f'[{self.rank}]: initializing {self.encoder_layer_end - self.encoder_layer_start} encoder layers')
             self.encoders = torch.nn.ModuleList([EncoderLayer(cfg) for _ in range(self.encoder_layer_end - self.encoder_layer_start)])
             if self.encoder_layer_end == cfg.encoder_layers:
-                self.layer_norm_encoder = torch.nn.LayerNorm(cfg.encoder_embed_dim)
+                self.layer_norm_encoder = torch.nn.LayerNorm(cfg.embed_dim)
             else:
                 self.layer_norm_encoder = None
 
@@ -475,34 +447,34 @@ class mBARTFull(torch.nn.Module):
             print(f'[{self.rank}]: initializing {self.decoder_layer_end - self.decoder_layer_start} decoder layers')
             self.decoders = torch.nn.ModuleList([DecoderLayer(cfg) for _ in range(self.decoder_layer_end - self.decoder_layer_start)])
             if self.decoder_layer_end == cfg.encoder_layers + cfg.decoder_layers:
-                self.layer_norm_decoder = torch.nn.LayerNorm(cfg.decoder_embed_dim)
+                self.layer_norm_decoder = torch.nn.LayerNorm(cfg.embed_dim)
             else:
                 self.layer_norm_decoder = None
 
         # postpross
         if self.postprocess:
             print(f'[{self.rank}]: will compute loss')
-            self.head = MBartClassificationHead(cfg.decoder_embed_dim, 1024, cfg.num_classes, 0.0)
+            self.head = MBartClassificationHead(cfg.embed_dim, 1024, cfg.num_classes, 0.0)
 
     def input_shape(self):
         if self.encoder_preprocess:
             return ()
         elif self.encoder_forward:
             return (
-                (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
+                (self.cfg.max_source_positions, 1, self.cfg.embed_dim),
             )
         elif self.decoder_preprocess:
             return (
-                (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
+                (self.cfg.max_source_positions, 1, self.cfg.embed_dim),
             )
         elif self.decoder_first_stage:
             return (
-                (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
+                (self.cfg.max_source_positions, 1, self.cfg.embed_dim),
             )
         elif self.decoder_forward:
             return (
-                (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
-                (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
+                (self.cfg.max_source_positions, 1, self.cfg.embed_dim),
+                (self.cfg.max_target_positions, 1, self.cfg.embed_dim),
             )
         elif self.postprocess:
             return ((1,),)
@@ -511,12 +483,12 @@ class mBARTFull(torch.nn.Module):
     def output_shape(self):
         shape = None
         if self.encoder_preprocess or self.encoder_forward:
-            shape = (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
+            shape = (self.cfg.max_source_positions, 1, self.cfg.embed_dim),
         # decoder preprocess is not allowed to be a single stage
         if self.decoder_preprocess or self.decoder_forward:
             shape = (
-                (self.cfg.max_source_positions, 1, self.cfg.encoder_embed_dim),
-                (self.cfg.max_target_positions, 1, self.cfg.decoder_embed_dim),
+                (self.cfg.max_source_positions, 1, self.cfg.embed_dim),
+                (self.cfg.max_target_positions, 1, self.cfg.embed_dim),
             )
         if self.postprocess:
             shape = (
@@ -588,7 +560,8 @@ class mBARTFull(torch.nn.Module):
         # forward encoder
         if self.encoder_forward:
             for layer in self.encoders:
-                enc = layer(enc) # encoder_padding_mask if has_pads else None)
+                enc = checkpoint.checkpoint(layer, enc)
+                # enc = layer(enc)
             if self.layer_norm_encoder is not None:
                 enc = self.layer_norm_encoder(enc)
             output = (enc,)
@@ -602,7 +575,8 @@ class mBARTFull(torch.nn.Module):
         if self.decoder_forward:
             dec = pre_dec if dec is None else dec
             for layer in self.decoders:
-                dec, enc = layer(dec, enc)
+                dec, enc = checkpoint.checkpoint(layer, dec, enc)
+                # dec, enc = layer(dec, enc)
             if self.layer_norm_decoder is not None:
                 dec = self.layer_norm_decoder(dec)
                 output = (dec,)
@@ -663,7 +637,7 @@ if __name__ == '__main__':
     if len(pp_ranks) > 1:
         pranks = [torch.zeros((args.pp_size,), dtype=torch.int, device=torch.cuda.current_device()) for _ in range(args.tp_size)]
         prank = torch.tensor(pp_ranks, dtype=torch.int).cuda()
-        pranks[torch.distributed.get_rank(_pp_group)] = prank
+        pranks[torch.distributed.get_rank(_tp_group)] = prank
         torch.distributed.all_gather(pranks, prank, group=_tp_group)
         torch.cuda.synchronize()
         print_each_rank(f'allgather-pp ranks: {pranks}')
