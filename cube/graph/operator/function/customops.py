@@ -41,9 +41,7 @@ class IRCustomOps(IRFwOperation):
             return True
         elif self.signature.endswith('update_diag'):
             shape = self.inputs(0).shape
-            print(f'### {self.signature} in.shape = {shape}')
             self.outputs(0).shape = shape
-            print(f'### {self.signature} out.shape = {shape}')
             return True
         else:
             raise RuntimeError(f'IRCustomOps::infer_shape unknown signature: {self.signature}')
