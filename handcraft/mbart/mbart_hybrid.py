@@ -480,25 +480,29 @@ class mBARTFull(torch.nn.Module):
         self.pp_stage = torch.distributed.get_rank(_pp_group)
         self.num_stages = torch.distributed.get_world_size(_pp_group)
 
-        encoder_stages = self.num_stages // 2
-        decoder_stages = self.num_stages // 2
-        if self.pp_stage < self.num_stages // 2:
+        if self.num_stages >= 2:
             encoder_stages = self.num_stages // 2
-            chunk = cfg.encoder_layers // encoder_stages
-            remain = cfg.encoder_layers % encoder_stages
-            layers = [chunk] * encoder_stages
-            for idx in range(remain):
-                layers[-idx] += 1
-            self.layer_start = sum(layers[0:self.pp_stage])
-            self.layer_end = self.layer_start + layers[self.pp_stage]
-        if self.pp_stage >= self.num_stages // 2:
-            chunk = cfg.decoder_layers // decoder_stages
-            remain = cfg.decoder_layers % decoder_stages
-            layers = [chunk] * decoder_stages
-            for idx in range(remain):
-                layers[-idx] += 1
-            self.layer_start = cfg.encoder_layers + sum(layers[0:self.pp_stage-encoder_stages])
-            self.layer_end = self.layer_start + layers[self.pp_stage-encoder_stages]
+            decoder_stages = self.num_stages // 2
+            if self.pp_stage < self.num_stages // 2:
+                encoder_stages = self.num_stages // 2
+                chunk = cfg.encoder_layers // encoder_stages
+                remain = cfg.encoder_layers % encoder_stages
+                layers = [chunk] * encoder_stages
+                for idx in range(remain):
+                    layers[-idx] += 1
+                self.layer_start = sum(layers[0:self.pp_stage])
+                self.layer_end = self.layer_start + layers[self.pp_stage]
+            if self.pp_stage >= self.num_stages // 2:
+                chunk = cfg.decoder_layers // decoder_stages
+                remain = cfg.decoder_layers % decoder_stages
+                layers = [chunk] * decoder_stages
+                for idx in range(remain):
+                    layers[-idx] += 1
+                self.layer_start = cfg.encoder_layers + sum(layers[0:self.pp_stage-encoder_stages])
+                self.layer_end = self.layer_start + layers[self.pp_stage-encoder_stages]
+        else:
+            self.layer_start = 0
+            self.layer_end = cfg.encoder_layers + cfg.decoder_layers
 
         self.encoder_preprocess  = encoder_preprocess
         self.encoder_forward     = (self.layer_start < cfg.encoder_layers)
@@ -711,7 +715,7 @@ if __name__ == '__main__':
         postprocess = is_last_stage
         model = mBARTFull(cfg, encoder_preprocess, decoder_preprocess, postprocess, args.embed_cpu).cuda()
     else:
-        model = mBARTFull(cfg, True, True, True, args.embd_cpu).cuda()
+        model = mBARTFull(cfg, True, True, True, args.embed_cpu).cuda()
 
     if args.embed_cpu:
         if model.headtail is not None:
