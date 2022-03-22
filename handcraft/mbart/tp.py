@@ -6,6 +6,9 @@ class AllReduceIdentity(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input, group):
+        world_size = torch.distributed.get_world_size(group)
+        if world_size == 1:
+            return input
         torch.distributed.all_reduce(input, group=group)
         return input
 
@@ -23,6 +26,9 @@ class IdentityAllreduce(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_output):
+        world_size = torch.distributed.get_world_size(ctx._group)
+        if world_size == 1:
+            return grad_output, None
         torch.distributed.all_reduce(grad_output, group=ctx._group)
         return grad_output, None
 
@@ -59,9 +65,12 @@ class AllGatherScatter(torch.autograd.Function):
 class ReduceBroadcast(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, input, dst: int, group=None):
+    def forward(ctx, input, dst: int, group):
         ctx._dst = dst
         ctx._group = group
+        world_size = torch.distributed.get_world_size(group)
+        if world_size == 1:
+            return input
         torch.distributed.reduce(input, dst, group=group)
         torch.cuda.synchronize()
         return input
@@ -70,6 +79,9 @@ class ReduceBroadcast(torch.autograd.Function):
     def backward(ctx, grad_output):
         src = ctx._dst
         group = ctx._group
+        world_size = torch.distributed.get_world_size(group)
+        if world_size == 1:
+            return grad_output, None, None
         torch.distributed.broadcast(grad_output, src, group=group)
         torch.cuda.synchronize()
         return grad_output, None, None
@@ -81,6 +93,9 @@ class BroadcastReduce(torch.autograd.Function):
     def forward(ctx, input, src: int, group=None):
         ctx._src = src
         ctx._group = group
+        world_size = torch.distributed.get_world_size(group)
+        if world_size == 1:
+            return input
         torch.distributed.broadcast(input, src, group=group)
         torch.cuda.synchronize()
         return input
@@ -89,6 +104,9 @@ class BroadcastReduce(torch.autograd.Function):
     def backward(ctx, grad_output):
         dst = ctx._src
         group = ctx._group
+        world_size = torch.distributed.get_world_size(group)
+        if world_size == 1:
+            return grad_output, None, None
         if not grad_output.is_contiguous():
             grad_output = grad_output.contiguous()
         torch.distributed.reduce(grad_output, dst, group=group)

@@ -29,6 +29,20 @@ _pp_embed_group = -1
 _pp_next_rank = None
 _pp_prev_rank = None
 
+parser = argparse.ArgumentParser(description='swin')
+parser.add_argument('--scale', type=int, default=0,
+                    help='scale of model, 0 is original one.')
+parser.add_argument('--nmb', type=int, default=4,
+                    help='num of micro batch')
+parser.add_argument('--use-naive', action='store_true',
+                    help='use naive pipeline')
+parser.add_argument('--use-1f1b', action='store_true',
+                help='use 1f1b scheduling')
+parser.add_argument('--use-tp1f1b-pack', action='store_true',
+                help='use tensor parallel 1f1b')
+args = parser.parse_args()
+print(args)
+
 # fairseq task
 # translation_from_pretrained_bart
 
@@ -444,7 +458,7 @@ class mBARTFull(torch.nn.Module):
         self.decoder_layer_start = max(cfg.encoder_layers, self.layer_start)
         self.decoder_layer_end = self.layer_end
 
-        if encoder_preprocess or decoder_preprocess or post_process or shard:
+        if encoder_preprocess or decoder_preprocess or shard:
             self.headtail = ShardEmbed(cfg, group = None if shard else -1)
         else:
             self.headtail = None
@@ -622,22 +636,8 @@ def reduce_embed(model, pp_embed_group):
 
 if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser(description='swin')
-    parser.add_argument('--nmb', type=int, default=4,
-                        help='num of micro batch')
-    parser.add_argument('--use-naive', action='store_true',
-                        help='use naive pipeline')
-    parser.add_argument('--use-1f1b', action='store_true',
-                    help='use 1f1b scheduling')
-    parser.add_argument('--use-tp1f1b-pack', action='store_true',
-                    help='use tensor parallel 1f1b')
-    args = parser.parse_args()
-
-    print(args)
-
     cube.init()
     pp_ranks = list(range(DeviceGroup().world_size))
-    # pp_ranks, tp_ranks = DeviceGroup().create_hybrid([args.pp_size, args.tp_size])
     print_each_rank(f'my pp ranks: {pp_ranks}')
 
     if _pp_group == -1:
@@ -679,9 +679,9 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
     CudaTimer(enable=False).warmup()
-    iter_num = 32
+    iter_num = 10
     for step in range(iter_num):
-        if step >= 10:
+        if step >= 3:
             CudaTimer(enable=True).start('e2e')
         if args.use_naive:
             schedule_naive(model, iter(dataloader), args.nmb, (_pp_prev_rank, _pp_next_rank))
@@ -703,11 +703,11 @@ if __name__ == '__main__':
         if step == 0:
             print('memory after optimizer')
             memory_summary()
-        if step >= 10:
+        if step >= 3:
             CudaTimer().stop('e2e')
-        if (step + 1) % 10 == 0:
+        if (step + 1) % 3 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-10, field_name='e2e')))
+          CudaTimer().duration(iter_num-3, field_name='e2e')))
     memory_summary()
