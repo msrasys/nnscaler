@@ -61,7 +61,7 @@ class Config:
     # attention_inner_dim = attention_heads * 64
     # ffn_dim = 4 * embed_dim
 
-    scale = 2
+    scale = args.scale
     scale_p = scale * 0.25
 
     num_embeddings = 250027 + int(250027*scale_p)
