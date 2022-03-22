@@ -21,7 +21,7 @@ from cube.profiler import CudaTimer
 from cube.profiler.memory import memory_summary, model_summary
 from cube.profiler.timer import print_each_rank
 
-from handcraft.mbart.schedule import schedule_1f1b, schedule_tp_1f1b_pack
+from handcraft.mbart.schedule import schedule_naive, schedule_1f1b
 from handcraft.mbart.tp import AllReduceIdentity, IdentityAllreduce, ReduceBroadcast
 
 _tp_group = -1
@@ -165,8 +165,8 @@ class MultiheadAttention(torch.nn.Module):
         self.tp_size = 1 if _tp_group == -1 else torch.distributed.get_world_size(_tp_group)
 
         self.inner_dim = inner_dim
-        self.num_heads = num_heads
         self.head_dim = inner_dim // num_heads
+        self.num_heads = num_heads // self.tp_size
         self.scaling = self.head_dim ** -0.5
         self.dropout_p = dropout
         # K
@@ -732,8 +732,9 @@ if __name__ == '__main__':
         if step >= 3:
             CudaTimer(enable=True).start('e2e')
         if args.pp_size > 1:
+            # schedule_naive(model, iter(dataloader), args.nmb, (_pp_prev_rank, _pp_next_rank))
             for _ in range(args.nmb // args.iter_nmb):
-                schedule_1f1b(model, iter(dataloader), args.iter_nmb, args.pp_size, (_pp_prev_rank, _pp_next_rank))
+                schedule_1f1b(model, iter(dataloader), args.iter_nmb, args.pp_size, (_pp_prev_rank, _pp_next_rank), group=_pp_group)
             # TODO: support gradient allreduce in cpu
             if not args.embed_cpu:
                 reduce_embed(model, _pp_embed_group)

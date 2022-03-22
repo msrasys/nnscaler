@@ -434,14 +434,14 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
         # print_each_rank(f'=========end rank {rank}=========')
 
 
-def schedule_1f1b(model, dataloader, num_microbatch, num_stage, neighbors):
+def schedule_1f1b(model, dataloader, num_microbatch, num_stage, neighbors, group=None):
 
     rank = torch.distributed.get_rank()
     prev_rank, next_rank = neighbors
     is_first_stage = rank < prev_rank
     is_last_stage = rank > next_rank
 
-    num_warmup_microbatches = num_stage - 1 - rank
+    num_warmup_microbatches = num_stage - 1 - torch.distributed.get_rank(group=group)
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatch)
     num_warmup_remaining = num_microbatch - num_warmup_microbatches
 
