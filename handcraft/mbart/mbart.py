@@ -37,22 +37,26 @@ _pp_prev_rank = None
 
 class Config:
 
-    num_embeddings = 250027
-
-    # d_ff
-    decoder_layers = 12
-    encoder_layers = 12
-    embed_dim = 1024
 
     # 610M model -> original setting
+    # num_embeddings = 250027
+    # decoder_layers = 12
+    # encoder_layers = 12
+    # embed_dim = 1024
     # attention_heads = 16
     # attention_inner_dim = attention_heads * 64
     # ffn_dim = 4 * embed_dim
 
-    # t5-3b config
-    attention_heads = 32
-    attention_inner_dim = attention_heads * 128
-    ffn_dim = 16384
+    scale = 2
+    scale_p = scale * 0.25
+
+    num_embeddings = 250027 + int(250027*scale_p)
+    decoder_layers = 12 + int(12*scale_p)
+    encoder_layers = 12 + int(12*scale_p)
+    embed_dim = 1024 + int(1024*scale_p)
+    attention_heads = 16 + int(16*scale_p)
+    attention_inner_dim = attention_heads * 64
+    ffn_dim = 4 * embed_dim
 
     attention_dropout = 0.0
     activation_dropout = 0.0
@@ -60,11 +64,6 @@ class Config:
 
     max_target_positions = 1024
     max_source_positions = 1024
-    adaptive_softmax_cutoff = None
-    adaptive_softmax_dropout = 0
-
-    share_decoder_input_output_embed = True
-    share_all_embeddings = True
 
     # classification task
     pooler_dropout = 0.0
@@ -117,6 +116,19 @@ def attn_fn(query: torch.Tensor, key: torch.Tensor,
     output = output.view(L, N, num_head * dim_head)  # (N h) L d -> L N (h d)
     output = torch.nn.functional.linear(output, wout, wout_bias) # L N (h d), E E  -> L N E
     return output
+
+
+class PositionalEmbedding(torch.nn.Embedding):
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        self.offset = 2
+        super().__init__(num_embeddings + self.offset, embedding_dim)
+
+    def forward(self, seq_len: int):
+        positions = torch.arange(
+            0, seq_len, dtype=torch.long, device=torch.cuda.current_device()
+        )
+        return super().forward(positions + self.offset)
 
 
 class MultiheadAttention(torch.nn.Module):
@@ -328,16 +340,14 @@ class ShardEmbed(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.ones((self.cfg.num_embeddings // self.shard_num, self.cfg.embed_dim)))
 
         # encoder-preprocess
-        self.embed_positions_encoder = torch.nn.Embedding(cfg.max_source_positions, cfg.embed_dim)
+        self.embed_positions_encoder = PositionalEmbedding(cfg.max_source_positions, cfg.embed_dim)
         self.embed_scale_encoder = math.sqrt(cfg.embed_dim)
         self.layernorm_embedding_encoder = torch.nn.LayerNorm(cfg.embed_dim)
 
         # decoder-preprocess
         self.embed_scale_decoder = math.sqrt(cfg.embed_dim)
-        self.embed_positions_decoder = torch.nn.Embedding(cfg.max_source_positions, cfg.embed_dim)
+        self.embed_positions_decoder = PositionalEmbedding(cfg.max_target_positions, cfg.embed_dim)
         self.layernorm_embedding_decoder = torch.nn.LayerNorm(cfg.embed_dim)
-
-        # post-proces
 
         self._inputs = (None, )
 
@@ -361,7 +371,7 @@ class ShardEmbed(torch.nn.Module):
         source_tokens = self._inputs[0]
         source_embed = self.embed_lookup(source_tokens, dst)
         embed = self.embed_scale_encoder * source_embed
-        x = embed + self.embed_positions_encoder.weight
+        x = embed + self.embed_positions_encoder(source_tokens.size(1))
         x = self.layernorm_embedding_encoder(x)
         x = torch.nn.functional.dropout(x, p=0.0)
         enc = x.transpose(0, 1)
@@ -371,7 +381,7 @@ class ShardEmbed(torch.nn.Module):
         prev_output_tokens = self._inputs[0]
         target_emb = self.embed_lookup(prev_output_tokens, dst)
         embed = self.embed_scale_decoder * target_emb
-        embed = embed + self.embed_positions_decoder.weight
+        embed = embed + self.embed_positions_decoder(prev_output_tokens.size(1))
         embed = self.layernorm_embedding_decoder(embed)
         embed = torch.nn.functional.dropout(embed, p=0.0)
         dec = embed.transpose(0, 1)
@@ -398,8 +408,25 @@ class mBARTFull(torch.nn.Module):
         self.pp_stage = torch.distributed.get_rank(_pp_group)
         self.num_stages = torch.distributed.get_world_size(_pp_group)
 
-        self.layer_start = self.total_layers // self.num_stages * self.pp_stage
-        self.layer_end = self.total_layers // self.num_stages * (self.pp_stage + 1)
+        encoder_stages = self.num_stages // 2
+        decoder_stages = self.num_stages // 2
+        if self.pp_stage < self.num_stages // 2:
+            encoder_stages = self.num_stages // 2
+            chunk = cfg.encoder_layers // encoder_stages
+            remain = cfg.encoder_layers % encoder_stages
+            layers = [chunk] * encoder_stages
+            for idx in range(remain):
+                layers[-idx] += 1
+            self.layer_start = sum(layers[0:self.pp_stage])
+            self.layer_end = self.layer_start + layers[self.pp_stage]
+        if self.pp_stage >= self.num_stages // 2:
+            chunk = cfg.decoder_layers // decoder_stages
+            remain = cfg.decoder_layers % decoder_stages
+            layers = [chunk] * decoder_stages
+            for idx in range(remain):
+                layers[-idx] += 1
+            self.layer_start = cfg.encoder_layers + sum(layers[0:self.pp_stage-encoder_stages])
+            self.layer_end = self.layer_start + layers[self.pp_stage-encoder_stages]
 
         self.encoder_preprocess  = encoder_preprocess
         self.encoder_forward     = (self.layer_start < cfg.encoder_layers)
@@ -549,8 +576,8 @@ class mBARTFull(torch.nn.Module):
         # forward encoder
         if self.encoder_forward:
             for layer in self.encoders:
-                enc = checkpoint.checkpoint(layer, enc)
-                # enc = layer(enc)
+                # enc = checkpoint.checkpoint(layer, enc)
+                enc = layer(enc)
             if self.layer_norm_encoder is not None:
                 enc = self.layer_norm_encoder(enc)
             output = (enc,)
@@ -564,8 +591,8 @@ class mBARTFull(torch.nn.Module):
         if self.decoder_forward:
             dec = pre_dec if dec is None else dec
             for layer in self.decoders:
-                dec, enc = checkpoint.checkpoint(layer, dec, enc)
-                # dec, enc = layer(dec, enc)
+                # dec, enc = checkpoint.checkpoint(layer, dec, enc)
+                dec, enc = layer(dec, enc)
             if self.layer_norm_decoder is not None:
                 dec = self.layer_norm_decoder(dec)
                 output = (dec,)

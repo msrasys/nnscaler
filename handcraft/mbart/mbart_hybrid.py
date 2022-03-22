@@ -32,22 +32,16 @@ _pp_prev_rank = None
 
 class Config:
 
-    num_embeddings = 250027
+    scale = 2
+    scale_p = scale * 0.25
 
-    # d_ff
-    decoder_layers = 12
-    encoder_layers = 12
-    embed_dim = 1024
-
-    # 610M model -> original setting
-    # attention_heads = 16
-    # attention_inner_dim = attention_heads * 64
-    # ffn_dim = 4 * embed_dim
-
-    # t5-3b config
-    attention_heads = 32
-    attention_inner_dim = attention_heads * 128
-    ffn_dim = 16384
+    num_embeddings = 250027 + int(250027*scale_p)
+    decoder_layers = 12 + int(12*scale_p)
+    encoder_layers = 12 + int(12*scale_p)
+    embed_dim = 1024 + int(1024*scale_p)
+    attention_heads = 16 + int(16*scale_p)
+    attention_inner_dim = attention_heads * 64
+    ffn_dim = 4 * embed_dim
 
     attention_dropout = 0.0
     activation_dropout = 0.0
@@ -152,6 +146,19 @@ class MultiheadAttention(torch.nn.Module):
                self.num_heads, self.scaling, self.dropout_p)
         attn = AllReduceIdentity.apply(attn, self.tp_group)
         return attn
+
+
+class PositionalEmbedding(torch.nn.Embedding):
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        self.offset = 2
+        super().__init__(num_embeddings + self.offset, embedding_dim)
+
+    def forward(self, seq_len: int):
+        positions = torch.arange(
+            0, seq_len, dtype=torch.long, device=torch.cuda.current_device()
+        )
+        return super().forward(positions + self.offset)
 
 
 class EncoderLayer(torch.nn.Module):
@@ -323,7 +330,7 @@ class MBartClassificationHead(torch.nn.Module):
 
 class SharedEmbed(torch.nn.Module):
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, embed_cpu=False):
         """
         group = -1 means no tensor parallelism
         """
@@ -331,29 +338,33 @@ class SharedEmbed(torch.nn.Module):
         self.tp_group = _tp_group
         self.tp_size = 1 if _tp_group == -1 else torch.distributed.get_world_size(_tp_group)
         self.tp_idx = 0 if _tp_group == -1 else torch.distributed.get_rank(_tp_group)
-
-        self.cfg = cfg
         if self.tp_size > 0:
             print(f'[{torch.distributed.get_rank()}]: initialize sharding embed (x{self.tp_size})')
+
+        self.embed_cpu = embed_cpu
+        self.cfg = cfg
         
         self.vocab_start_index = self.cfg.num_embeddings // self.tp_size * self.tp_idx
         self.vocab_end_index = self.cfg.num_embeddings // self.tp_size * (self.tp_idx + 1)
         self.weight = torch.nn.Parameter(torch.ones((self.cfg.num_embeddings // self.tp_size, self.cfg.embed_dim)))
 
         # encoder-preprocess
-        self.embed_positions_encoder = torch.nn.Embedding(cfg.max_source_positions, cfg.embed_dim)
+        self.embed_positions_encoder = PositionalEmbedding(cfg.max_source_positions, cfg.embed_dim)
         self.embed_scale_encoder = math.sqrt(cfg.embed_dim)
         self.layernorm_embedding_encoder = torch.nn.LayerNorm(cfg.embed_dim)
 
         # decoder-preprocess
         self.embed_scale_decoder = math.sqrt(cfg.embed_dim)
-        self.embed_positions_decoder = torch.nn.Embedding(cfg.max_source_positions, cfg.embed_dim)
+        self.embed_positions_decoder = PositionalEmbedding(cfg.max_target_positions, cfg.embed_dim)
         self.layernorm_embedding_decoder = torch.nn.LayerNorm(cfg.embed_dim)
 
         self._inputs = (None, )
 
     def set_inputs(self, *inputs):
-        self._inputs = inputs
+        if self.embed_cpu:
+            self._inputs = [input.cpu() for input in inputs]
+        else:
+            self._inputs = inputs
 
     def embed_lookup(self, tokens):
         if self.tp_size > 1:
@@ -363,16 +374,23 @@ class SharedEmbed(torch.nn.Module):
             tokens[mask] = 0
             embed = torch.nn.functional.embedding(tokens, self.weight)
             embed[mask, :] = 0.0
+            if self.embed_cpu:
+                embed = embed.cuda()
             embed = AllReduceIdentity.apply(embed, self.tp_group)
         else:
             embed = torch.nn.functional.embedding(tokens, self.weight)
+            if self.embed_cpu:
+                embed = embed.cuda()
         return embed
 
     def encoder_preprocess(self):
         source_tokens = self._inputs[0]
+        seq_len = source_tokens.size(1)
+        assert seq_len == self.cfg.max_source_positions
+
         source_embed = self.embed_lookup(source_tokens)
         embed = self.embed_scale_encoder * source_embed
-        x = embed + self.embed_positions_encoder.weight
+        x = embed + self.embed_positions_encoder(seq_len)
         x = self.layernorm_embedding_encoder(x)
         x = torch.nn.functional.dropout(x, p=0.0)
         enc = x.transpose(0, 1)
@@ -380,9 +398,12 @@ class SharedEmbed(torch.nn.Module):
 
     def decoder_preprocess(self):
         prev_output_tokens = self._inputs[0]
+        seq_len = prev_output_tokens.size(1)
+        assert seq_len == self.cfg.max_source_positions
+
         target_emb = self.embed_lookup(prev_output_tokens)
         embed = self.embed_scale_decoder * target_emb
-        embed = embed + self.embed_positions_decoder.weight
+        embed = embed + self.embed_positions_encoder(seq_len)
         embed = self.layernorm_embedding_decoder(embed)
         embed = torch.nn.functional.dropout(embed, p=0.0)
         dec = embed.transpose(0, 1)
@@ -394,7 +415,8 @@ class mBARTFull(torch.nn.Module):
     def __init__(self, cfg: Config,
                  encoder_preprocess=True,
                  decoder_preprocess=True,
-                 post_process=True):
+                 post_process=True,
+                 embed_cpu=False):
         super().__init__()
         self.cfg = cfg
         self.dummy_labels = torch.tensor([1]).cuda()
@@ -409,8 +431,25 @@ class mBARTFull(torch.nn.Module):
         self.pp_stage = torch.distributed.get_rank(_pp_group)
         self.num_stages = torch.distributed.get_world_size(_pp_group)
 
-        self.layer_start = self.total_layers // self.num_stages * self.pp_stage
-        self.layer_end = self.total_layers // self.num_stages * (self.pp_stage + 1)
+        encoder_stages = self.num_stages // 2
+        decoder_stages = self.num_stages // 2
+        if self.pp_stage < self.num_stages // 2:
+            encoder_stages = self.num_stages // 2
+            chunk = cfg.encoder_layers // encoder_stages
+            remain = cfg.encoder_layers % encoder_stages
+            layers = [chunk] * encoder_stages
+            for idx in range(remain):
+                layers[-idx] += 1
+            self.layer_start = sum(layers[0:self.pp_stage])
+            self.layer_end = self.layer_start + layers[self.pp_stage]
+        if self.pp_stage >= self.num_stages // 2:
+            chunk = cfg.decoder_layers // decoder_stages
+            remain = cfg.decoder_layers % decoder_stages
+            layers = [chunk] * decoder_stages
+            for idx in range(remain):
+                layers[-idx] += 1
+            self.layer_start = cfg.encoder_layers + sum(layers[0:self.pp_stage-encoder_stages])
+            self.layer_end = self.layer_start + layers[self.pp_stage-encoder_stages]
 
         self.encoder_preprocess  = encoder_preprocess
         self.encoder_forward     = (self.layer_start < cfg.encoder_layers)
@@ -428,8 +467,8 @@ class mBARTFull(torch.nn.Module):
         self.decoder_layer_start = max(cfg.encoder_layers, self.layer_start)
         self.decoder_layer_end = self.layer_end
 
-        if encoder_preprocess or decoder_preprocess or post_process:
-            self.headtail = SharedEmbed(cfg)
+        if encoder_preprocess or decoder_preprocess:
+            self.headtail = SharedEmbed(cfg, embed_cpu)
         else:
             self.headtail = None
 
@@ -560,8 +599,8 @@ class mBARTFull(torch.nn.Module):
         # forward encoder
         if self.encoder_forward:
             for layer in self.encoders:
-                enc = checkpoint.checkpoint(layer, enc)
-                # enc = layer(enc)
+                # enc = checkpoint.checkpoint(layer, enc)
+                enc = layer(enc)
             if self.layer_norm_encoder is not None:
                 enc = self.layer_norm_encoder(enc)
             output = (enc,)
@@ -575,8 +614,8 @@ class mBARTFull(torch.nn.Module):
         if self.decoder_forward:
             dec = pre_dec if dec is None else dec
             for layer in self.decoders:
-                dec, enc = checkpoint.checkpoint(layer, dec, enc)
-                # dec, enc = layer(dec, enc)
+                # dec, enc = checkpoint.checkpoint(layer, dec, enc)
+                dec, enc = layer(dec, enc)
             if self.layer_norm_decoder is not None:
                 dec = self.layer_norm_decoder(dec)
                 output = (dec,)
@@ -613,6 +652,8 @@ if __name__ == '__main__':
                         help='use pipeline parallelism')
     parser.add_argument('--tp-size', type=int, default=1,
                     help='use tensor parallelism')
+    parser.add_argument('--embed-cpu', action='store_true',
+                        help='put embedding inside CPU')
     args = parser.parse_args()
 
     print(args)
@@ -653,6 +694,7 @@ if __name__ == '__main__':
         assert _pp_embed_group != -1
 
     cfg = Config()
+    print_each_rank(cfg, rank_only=0)
     dataloader = SynTextDataLoader(
         shapes=(
             [1, cfg.max_source_positions],
@@ -666,9 +708,13 @@ if __name__ == '__main__':
         encoder_preprocess = is_first_stage
         decoder_preprocess = is_first_decoder_stage
         postprocess = is_last_stage
-        model = mBARTFull(cfg, encoder_preprocess, decoder_preprocess, postprocess).cuda()
+        model = mBARTFull(cfg, encoder_preprocess, decoder_preprocess, postprocess, args.embed_cpu).cuda()
     else:
-        model = mBARTFull(cfg, True, True, True).cuda()
+        model = mBARTFull(cfg, True, True, True, args.embd_cpu).cuda()
+
+    if args.embed_cpu:
+        if model.headtail is not None:
+            model.headtail.weight = torch.nn.Parameter(model.headtail.weight.cpu())
 
     print_each_rank('model weight consumpition:')
     memory_summary()
@@ -681,8 +727,11 @@ if __name__ == '__main__':
         if step >= 10:
             CudaTimer(enable=True).start('e2e')
         if args.pp_size > 1:
-            schedule_naive(model, iter(dataloader), args.nmb, (_pp_prev_rank, _pp_next_rank))
-            reduce_embed(model, _pp_embed_group)
+            schedule_1f1b(model, iter(dataloader), args.nmb, args.pp_size, (_pp_prev_rank, _pp_next_rank))
+            # schedule_naive(model, iter(dataloader), args.nmb, (_pp_prev_rank, _pp_next_rank))
+            # TODO: support gradient allreduce in cpu
+            if not args.embed_cpu:
+                reduce_embed(model, _pp_embed_group)
         else:
             loader = iter(dataloader)
             for _ in range(args.nmb):
