@@ -4,7 +4,8 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    handcraft/mbart/mbart.py --pp-size 4 --tp-size 1 --nmb 4
+    handcraft/mbart/mbart_hybrid.py --pp-size 4 --tp-size 1\
+    --nmb 4 --scale 0 --iter-nmb 4
 """
 
 from typing import Optional
@@ -20,7 +21,7 @@ from cube.profiler import CudaTimer
 from cube.profiler.memory import memory_summary, model_summary
 from cube.profiler.timer import print_each_rank
 
-from handcraft.mbart.schedule import schedule_naive, schedule_1f1b, schedule_tp_1f1b_pack
+from handcraft.mbart.schedule import schedule_1f1b, schedule_tp_1f1b_pack
 from handcraft.mbart.tp import AllReduceIdentity, IdentityAllreduce, ReduceBroadcast
 
 _tp_group = -1
@@ -30,9 +31,62 @@ _pp_next_rank = None
 _pp_prev_rank = None
 
 
+parser = argparse.ArgumentParser(description='swin')
+parser.add_argument('--nmb', type=int, default=4,
+                    help='num of micro batch')
+parser.add_argument('--scale', type=int, default=0,
+                    help='scale of model, 0 is original one.')
+parser.add_argument('--pp-size', type=int, default=1,
+                    help='use pipeline parallelism')
+parser.add_argument('--tp-size', type=int, default=1,
+                help='use tensor parallelism')
+parser.add_argument('--embed-cpu', action='store_true',
+                    help='put embedding inside CPU')
+parser.add_argument('--iter-nmb', type=int, default=0,
+                    help='num of micro batch per scheduling iteration (1f1b only)')
+args = parser.parse_args()
+print(args)
+
+cube.init()
+pp_ranks, tp_ranks = DeviceGroup().create_hybrid([args.pp_size, args.tp_size])
+print_each_rank(f'my pp ranks: {pp_ranks}')
+print_each_rank(f'my tp ranks: {tp_ranks}')
+
+if _tp_group == -1:
+    _tp_group = DeviceGroup().get_group(tp_ranks)
+
+if _pp_group == -1:
+    _pp_group = DeviceGroup().get_group(pp_ranks)
+    idx = pp_ranks.index(DeviceGroup().rank)
+    _pp_next_rank = pp_ranks[(idx+1) % len(pp_ranks)]
+    _pp_prev_rank = pp_ranks[(idx-1) % len(pp_ranks)]
+    is_first_stage = idx == 0
+    is_first_decoder_stage = idx == len(pp_ranks) // 2
+    is_last_stage = idx == len(pp_ranks) - 1
+
+if len(pp_ranks) > 1:
+    pranks = [torch.zeros((args.pp_size,), dtype=torch.int, device=torch.cuda.current_device()) for _ in range(args.tp_size)]
+    prank = torch.tensor(pp_ranks, dtype=torch.int).cuda()
+    pranks[torch.distributed.get_rank(_tp_group)] = prank
+    torch.distributed.all_gather(pranks, prank, group=_tp_group)
+    torch.cuda.synchronize()
+    print_each_rank(f'allgather-pp ranks: {pranks}')
+
+    for prank in pranks:
+        prank = prank.tolist()
+        embed_ranks = [prank[0], prank[len(prank) // 2]]
+        embed_ranks = list(set(embed_ranks))
+        group = DeviceGroup().get_group(embed_ranks)
+        if torch.distributed.get_rank(_tp_group) in prank:
+            print(f'embedding group: {embed_ranks}')
+            _pp_embed_group = group
+    assert _pp_embed_group != -1
+
+
+
 class Config:
 
-    scale = 2
+    scale = args.scale
     scale_p = scale * 0.25
 
     num_embeddings = 250027 + int(250027*scale_p)
@@ -49,11 +103,6 @@ class Config:
 
     max_target_positions = 1024
     max_source_positions = 1024
-    adaptive_softmax_cutoff = None
-    adaptive_softmax_dropout = 0
-
-    share_decoder_input_output_embed = True
-    share_all_embeddings = True
 
     # classification task
     pooler_dropout = 0.0
@@ -645,54 +694,6 @@ def reduce_embed(model, pp_embed_group):
 
 if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser(description='swin')
-    parser.add_argument('--nmb', type=int, default=4,
-                        help='num of micro batch')
-    parser.add_argument('--pp-size', type=int, default=1,
-                        help='use pipeline parallelism')
-    parser.add_argument('--tp-size', type=int, default=1,
-                    help='use tensor parallelism')
-    parser.add_argument('--embed-cpu', action='store_true',
-                        help='put embedding inside CPU')
-    args = parser.parse_args()
-
-    print(args)
-
-    cube.init()
-    pp_ranks, tp_ranks = DeviceGroup().create_hybrid([args.pp_size, args.tp_size])
-    print_each_rank(f'my pp ranks: {pp_ranks}')
-    print_each_rank(f'my tp ranks: {tp_ranks}')
-
-    if _tp_group == -1:
-        _tp_group = DeviceGroup().get_group(tp_ranks)
-
-    if _pp_group == -1:
-        _pp_group = DeviceGroup().get_group(pp_ranks)
-        idx = pp_ranks.index(DeviceGroup().rank)
-        _pp_next_rank = pp_ranks[(idx+1) % len(pp_ranks)]
-        _pp_prev_rank = pp_ranks[(idx-1) % len(pp_ranks)]
-        is_first_stage = idx == 0
-        is_first_decoder_stage = idx == len(pp_ranks) // 2
-        is_last_stage = idx == len(pp_ranks) - 1
-
-    if len(pp_ranks) > 1:
-        pranks = [torch.zeros((args.pp_size,), dtype=torch.int, device=torch.cuda.current_device()) for _ in range(args.tp_size)]
-        prank = torch.tensor(pp_ranks, dtype=torch.int).cuda()
-        pranks[torch.distributed.get_rank(_tp_group)] = prank
-        torch.distributed.all_gather(pranks, prank, group=_tp_group)
-        torch.cuda.synchronize()
-        print_each_rank(f'allgather-pp ranks: {pranks}')
-
-        for prank in pranks:
-            prank = prank.tolist()
-            embed_ranks = [prank[0], prank[len(prank) // 2]]
-            embed_ranks = list(set(embed_ranks))
-            group = DeviceGroup().get_group(embed_ranks)
-            if torch.distributed.get_rank(_tp_group) in prank:
-                print(f'embedding group: {embed_ranks}')
-                _pp_embed_group = group
-        assert _pp_embed_group != -1
-
     cfg = Config()
     print_each_rank(cfg, rank_only=0)
     dataloader = SynTextDataLoader(
@@ -722,13 +723,13 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
     CudaTimer(enable=False).warmup()
-    iter_num = 32
+    iter_num = 10
     for step in range(iter_num):
-        if step >= 10:
+        if step >= 3:
             CudaTimer(enable=True).start('e2e')
         if args.pp_size > 1:
-            schedule_1f1b(model, iter(dataloader), args.nmb, args.pp_size, (_pp_prev_rank, _pp_next_rank))
-            # schedule_naive(model, iter(dataloader), args.nmb, (_pp_prev_rank, _pp_next_rank))
+            for _ in range(args.nmb // args.iter_nmb):
+                schedule_1f1b(model, iter(dataloader), args.iter_nmb, args.pp_size, (_pp_prev_rank, _pp_next_rank))
             # TODO: support gradient allreduce in cpu
             if not args.embed_cpu:
                 reduce_embed(model, _pp_embed_group)
@@ -743,11 +744,14 @@ if __name__ == '__main__':
             memory_summary()
         optimizer.step()
         optimizer.zero_grad()
-        if step >= 10:
+        if step >= 3:
             CudaTimer().stop('e2e')
-        if (step + 1) % 10 == 0:
+        if step == 0:
+            print_each_rank('after optimizer')
+            memory_summary()
+        if (step + 1) % 3 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-10, field_name='e2e')))
+          CudaTimer().duration(iter_num-3, field_name='e2e')))
     memory_summary()
