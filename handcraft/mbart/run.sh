@@ -10,6 +10,10 @@ OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
 
 OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
     handcraft/mbart/mbart.py --use-1f1b --nmb 256 \
+    --scale 2 > ${evaldir}/4dev256nmb-1f1b.txt
+
+OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
+    handcraft/mbart/mbart_hybrid.py --tp-size 4 --pp-size 1 --nmb 256 \
     --scale 2 > ${evaldir}/4dev256nmb-tp.txt
 
 OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
@@ -24,7 +28,11 @@ OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
     --scale 4 > ${evaldir}/8dev256nmb-tp1f1b-pack.txt
 
 OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
-    handcraft/mbart/mbart.py --use-1f1b --nmb 256 \
+    handcraft/mbart/mbart.py --use-1f1b --nmb 1 \
+    --scale 4 > ${evaldir}/8dev256nmb-1f1b.txt
+
+OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
+    handcraft/mbart/mbart_hybrid.py --tp-size 8 --pp-size 1 --nmb 256 \
     --scale 4 > ${evaldir}/8dev256nmb-tp.txt
 
 OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
