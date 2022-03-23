@@ -57,7 +57,7 @@ if _pp_group == -1:
     is_last_stage = idx == len(pp_ranks) - 1
     
 # create embed group: first encoder, first decoder, last stage
-if args.use_naive or args.use_1f1b:
+if args.use_1f1b:
     embed_ranks = [pp_ranks[0], pp_ranks[len(pp_ranks) // 2]]
     embed_ranks = list(set(embed_ranks))
     _pp_embed_group = DeviceGroup().get_group(embed_ranks)
@@ -659,7 +659,7 @@ if __name__ == '__main__':
         dtypes=(torch.int64,),
         batch_dims=(0,)
     )
-    if args.use_naive or args.use_1f1b:
+    if args.use_1f1b:
         encoder_preprocess = is_first_stage
         decoder_preprocess = is_first_decoder_stage
         postprocess = is_last_stage
@@ -678,7 +678,6 @@ if __name__ == '__main__':
         if step >= 3:
             CudaTimer(enable=True).start('e2e')
         if args.use_1f1b:
-            iter_num = args.iter_nmb
             for _ in range(args.nmb // args.iter_nmb):
                 schedule_1f1b(model, iter(dataloader), args.iter_nmb, len(pp_ranks), (_pp_prev_rank, _pp_next_rank))
             reduce_embed(model, _pp_embed_group)
