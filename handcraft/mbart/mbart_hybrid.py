@@ -8,6 +8,7 @@ OMP_NUM_THREADS=4 torchrun \
     --nmb 4 --scale 0 --iter-nmb 4
 """
 
+import re
 from typing import Optional
 import argparse
 import math
@@ -44,6 +45,8 @@ parser.add_argument('--embed-cpu', action='store_true',
                     help='put embedding inside CPU')
 parser.add_argument('--iter-nmb', type=int, default=0,
                     help='num of micro batch per scheduling iteration (1f1b only)')
+parser.add_argument('--use-recompute', action='store_true',
+                    help='use recompute for a stage')
 args = parser.parse_args()
 print(args)
 
@@ -89,7 +92,7 @@ class Config:
     scale = args.scale
     scale_p = scale * 0.25
 
-    num_embeddings = 250027 + int(250027*scale_p)
+    num_embeddings = 500000 # 250027 + int(250027*scale_p)
     decoder_layers = 12 + int(12*scale_p)
     encoder_layers = 12 + int(12*scale_p)
     embed_dim = 1024 + int(1024*scale_p)
@@ -727,14 +730,22 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
     CudaTimer(enable=False).warmup()
-    iter_num = 10
+    iter_num = 6
     for step in range(iter_num):
-        if step >= 3:
+        if step >= 2:
             CudaTimer(enable=True).start('e2e')
         if args.pp_size > 1:
             # schedule_naive(model, iter(dataloader), args.nmb, (_pp_prev_rank, _pp_next_rank))
             for _ in range(args.nmb // args.iter_nmb):
-                schedule_1f1b(model, iter(dataloader), args.iter_nmb, args.pp_size, (_pp_prev_rank, _pp_next_rank), group=_pp_group)
+                schedule_1f1b(
+                    model,
+                    iter(dataloader),
+                    args.iter_nmb,
+                    args.pp_size,
+                    (_pp_prev_rank, _pp_next_rank),
+                    group=_pp_group,
+                    recompute=args.recompute
+                )
             # TODO: support gradient allreduce in cpu
             if not args.embed_cpu:
                 reduce_embed(model, _pp_embed_group)
@@ -749,14 +760,14 @@ if __name__ == '__main__':
             memory_summary()
         optimizer.step()
         optimizer.zero_grad()
-        if step >= 3:
+        if step >= 2:
             CudaTimer().stop('e2e')
         if step == 0:
             print_each_rank('after optimizer')
             memory_summary()
-        if (step + 1) % 3 == 0:
+        if (step + 1) % 2 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-3, field_name='e2e')))
+          CudaTimer().duration(iter_num-2, field_name='e2e')))
     memory_summary()

@@ -40,6 +40,8 @@ parser.add_argument('--use-1f1b', action='store_true',
                 help='use 1f1b scheduling')
 parser.add_argument('--use-tp1f1b-pack', action='store_true',
                 help='use tensor parallel 1f1b')
+parser.add_argument('--use-recompute', action='store_true',
+                    help='use recompute for a stage')
 args = parser.parse_args()
 print(args)
 
@@ -78,7 +80,7 @@ class Config:
     scale = args.scale
     scale_p = scale * 0.25
 
-    num_embeddings = 250027 + int(250027*scale_p)
+    num_embeddings = 500000 # 250027 + int(250027*scale_p)
     decoder_layers = 12 + int(12*scale_p)
     encoder_layers = 12 + int(12*scale_p)
     embed_dim = 1024 + int(1024*scale_p)
@@ -673,18 +675,25 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
     CudaTimer(enable=False).warmup()
-    iter_num = 10
+    iter_num = 6
     for step in range(iter_num):
-        if step >= 3:
+        if step >= 2:
             CudaTimer(enable=True).start('e2e')
         if args.use_1f1b:
             for _ in range(args.nmb // args.iter_nmb):
-                schedule_1f1b(model, iter(dataloader), args.iter_nmb, len(pp_ranks), (_pp_prev_rank, _pp_next_rank))
+                schedule_1f1b(
+                    model, iter(dataloader),
+                    args.iter_nmb, len(pp_ranks),
+                    (_pp_prev_rank, _pp_next_rank),
+                    recompute=args.use_recompute,
+                )
             reduce_embed(model, _pp_embed_group)
         if args.use_tp1f1b_pack:
             schedule_tp_1f1b_pack(
                 model, iter(dataloader),
-                args.nmb, len(pp_ranks), (_pp_prev_rank, _pp_next_rank)
+                args.nmb, len(pp_ranks),
+                (_pp_prev_rank, _pp_next_rank),
+                recompute=args.use_recompute,
             )
         if step == 0:
             print('passed 1st iteration')
@@ -694,11 +703,11 @@ if __name__ == '__main__':
         if step == 0:
             print('memory after optimizer')
             memory_summary()
-        if step >= 3:
+        if step >= 2:
             CudaTimer().stop('e2e')
-        if (step + 1) % 3 == 0:
+        if (step + 1) % 2 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-3, field_name='e2e')))
+          CudaTimer().duration(iter_num-2, field_name='e2e')))
     memory_summary()

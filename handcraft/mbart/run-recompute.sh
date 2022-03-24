@@ -1,4 +1,4 @@
-evaldir=/data/MagicCube/scale-mbart
+evaldir=/data/MagicCube/scale-mbart-recompute
 
 mkdir -p ${evaldir}
 
@@ -6,42 +6,42 @@ mkdir -p ${evaldir}
 
 OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
     handcraft/mbart/mbart.py --use-tp1f1b-pack --nmb 256 \
-    --scale 3 > ${evaldir}/4dev256nmb-tp1f1b-pack.txt
-# 
+    --scale 3 --use-recompute > ${evaldir}/4dev256nmb-tp1f1b-pack.txt
+
 OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
     handcraft/mbart/mbart.py --use-1f1b --nmb 256 \
-    --scale 3 --iter-nmb 1 > ${evaldir}/4dev256nmb-1f1b.txt
-# 
-# OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
-#     handcraft/mbart/mbart_hybrid.py --tp-size 4 --pp-size 1 --nmb 256 \
-#     --scale 3 > ${evaldir}/4dev256nmb-tp.txt
+    --scale 3 --iter-nmb 256 --use-recompute > ${evaldir}/4dev256nmb-1f1b.txt
 
-# OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
-#     handcraft/mbart/mbart_hybrid.py --tp-size 2 --pp-size 2 --nmb 256 \
-#     --scale 3 --iter-nmb 256 > ${evaldir}/4dev256nmb-tp2pp2.txt
+OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
+    handcraft/mbart/mbart_hybrid.py --tp-size 4 --pp-size 1 --nmb 256 \
+    --scale 3 --use-recompute > ${evaldir}/4dev256nmb-tp.txt
+
+OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 --nnodes=1 \
+    handcraft/mbart/mbart_hybrid.py --tp-size 2 --pp-size 2 --nmb 256 \
+    --scale 3 --iter-nmb 256 --use-recompute > ${evaldir}/4dev256nmb-tp2pp2.txt
 
 
 # 8 gpus
 
 OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
     handcraft/mbart/mbart.py --use-tp1f1b-pack --nmb 256 \
-    --scale 4 > ${evaldir}/8dev256nmb-tp1f1b-pack.txt
+    --scale 4 --use-recompute > ${evaldir}/8dev256nmb-tp1f1b-pack.txt
 
 OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
     handcraft/mbart/mbart.py --use-1f1b --nmb 256 \
-    --scale 4 --iter-nmb 1 > ${evaldir}/8dev256nmb-1f1b.txt
+    --scale 4 --iter-nmb 256 --use-recompute > ${evaldir}/8dev256nmb-1f1b.txt
 
-# OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
-#     handcraft/mbart/mbart_hybrid.py --tp-size 8 --pp-size 1 --nmb 256 \
-#     --scale 4 > ${evaldir}/8dev256nmb-tp.txt
-# 
-# OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
-#     handcraft/mbart/mbart_hybrid.py --tp-size 4 --pp-size 2 --nmb 256 \
-#     --scale 4 --iter-nmb 256 > ${evaldir}/8dev256nmb-tp4pp2.txt
-# 
-# OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
-#     handcraft/mbart/mbart_hybrid.py --tp-size 2 --pp-size 4 --nmb 256 \
-#     --scale 4 --iter-nmb 256 > ${evaldir}/8dev256nmb-tp2pp4.txt
+OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
+    handcraft/mbart/mbart_hybrid.py --tp-size 8 --pp-size 1 --nmb 256 \
+    --scale 4 --use-recompute > ${evaldir}/8dev256nmb-tp.txt
+
+OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
+    handcraft/mbart/mbart_hybrid.py --tp-size 4 --pp-size 2 --nmb 256 \
+    --scale 4 --iter-nmb 256 --use-recompute > ${evaldir}/8dev256nmb-tp4pp2.txt
+
+OMP_NUM_THREADS=4 torchrun --nproc_per_node=8 --nnodes=1 \
+    handcraft/mbart/mbart_hybrid.py --tp-size 2 --pp-size 4 --nmb 256 \
+    --scale 4 --iter-nmb 256 --use-recompute > ${evaldir}/8dev256nmb-tp2pp4.txt
 
 
 # 16 gpus

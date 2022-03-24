@@ -233,7 +233,8 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
                           dataloader,
                           num_microbatch: int,
                           num_stage: int,
-                          neighbors: Tuple[int, int]):
+                          neighbors: Tuple[int, int],
+                          recompute=False):
     rank = DeviceGroup().rank
     prev_rank, next_rank = neighbors
 
@@ -339,11 +340,20 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
                 input_tensors.append(inputs)
                 if is_first_stage:
                     inputs = ()
-                outputs = forward_step(model, *inputs)
-                output_tensors.append(outputs)
+                if recompute:
+                    with torch.no_grad():
+                        outputs = forward_step(model, *inputs)
+                    output_tensors.append(None)
+                else:
+                    outputs = forward_step(model, *inputs)
+                    output_tensors.append(outputs)
 
-            # mem = torch.cuda.max_memory_allocated()
-            # print(f'rank {rank}: {mem / 1024 / 1024 / 1024} GB forward')
+            # recompute if backward is needed
+            if do_backward:
+                inputs, outputs = input_tensors.pop(0), output_tensors.pop(0)
+                if recompute:
+                    assert outputs is None
+                    outputs = forward_step(model, *inputs)
 
             # intra-barrier send recv
             output_grads = (None,)
@@ -361,7 +371,7 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
             # backward
             last_backward = (None,)
             if do_backward:
-                inputs, outputs = input_tensors.pop(0), output_tensors.pop(0)
+                # inputs, outputs = input_tensors.pop(0), output_tensors.pop(0)
                 input_grads = backward_step(inputs, outputs, output_grads)
                 last_backward = input_grads
 
@@ -404,10 +414,25 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
             last_forward = (None,)
             if do_forward:
                 # forward step
-                outputs = forward_step(model, *inputs)
                 input_tensors.append(inputs)
-                output_tensors.append(outputs)
+                if recompute:
+                    with torch.no_grad():
+                        outputs = forward_step(model, *inputs)
+                        output_tensors.append(None)
+                else:
+                    outputs = forward_step(model, *inputs)
+                    output_tensors.append(outputs)
                 last_forward = outputs
+
+            next_backward = 0 <= (bmid+1) and (bmid+1) <= num_microbatch - 1
+            if next_backward:
+                if recompute:
+                    inputs, outputs = input_tensors[0], output_tensors[0]
+                    assert outputs is None
+                    outputs = forward_step(model, *inputs)
+                    input_tensors[0] = inputs
+                    output_tensors[0] = outputs
+
 
         # tp tail forward-backward
         if 0 <= decoder_bmid and decoder_bmid <= num_microbatch - 1:
@@ -434,7 +459,13 @@ def schedule_tp_1f1b_pack(model: torch.nn.Module,
         # print_each_rank(f'=========end rank {rank}=========')
 
 
-def schedule_1f1b(model, dataloader, num_microbatch, num_stage, neighbors, group=None):
+def schedule_1f1b(model: torch.nn.Module,
+                  dataloader,
+                  num_microbatch: int,
+                  num_stage: int,
+                  neighbors: Tuple[int, int],
+                  group=None,
+                  recompute=False):
 
     rank = torch.distributed.get_rank()
     prev_rank, next_rank = neighbors
@@ -454,11 +485,16 @@ def schedule_1f1b(model, dataloader, num_microbatch, num_stage, neighbors, group
         # recv forward
         inputs = () if is_first_stage else recv_forward(model, prev_rank)
         # forward
-        outputs = forward_step(model, *inputs)
+        if recompute:
+            with torch.no_grad():
+                outputs = forward_step(model, *inputs)
+                output_tensors.append(None)
+        else:
+            outputs = forward_step(model, *inputs)
+            output_tensors.append(outputs)
         # send forward
         send_forward(outputs, next_rank)
         input_tensors.append(inputs)
-        output_tensors.append(outputs)
 
     # before running 1f1b: need to recv first forward tensor
     if num_warmup_remaining > 0:
@@ -469,9 +505,14 @@ def schedule_1f1b(model, dataloader, num_microbatch, num_stage, neighbors, group
     for i in range(num_warmup_remaining):
         model.set_inputs(next(dataloader))
         # forward
-        outputs = forward_step(model, *inputs)
+        if recompute:
+            with torch.no_grad():
+                outputs = forward_step(model, *inputs)
+                output_tensors.append(None)
+        else:
+            outputs = forward_step(model, *inputs)
+            output_tensors.append(outputs)
         input_tensors.append(inputs)
-        output_tensors.append(outputs)
 
         # send forward recv backward
         grads = (None,)
@@ -480,6 +521,9 @@ def schedule_1f1b(model, dataloader, num_microbatch, num_stage, neighbors, group
 
         # backward
         inputs, outputs = input_tensors.pop(0), output_tensors.pop(0)
+        if recompute:
+            assert outputs is None
+            outputs = forward_step(model, *inputs)
         input_grads = backward_step(inputs, outputs, grads)
         
         # send backward
@@ -498,6 +542,9 @@ def schedule_1f1b(model, dataloader, num_microbatch, num_stage, neighbors, group
         # recv backward
         grads = (None,) if is_last_stage else recv_backward(model, next_rank)
         # backward
+        if recompute:
+            assert outputs is None
+            outputs = forward_step(model, *inputs)
         input_grads = backward_step(inputs, outputs, grads)
         # send backward
         if not is_first_stage:
