@@ -744,7 +744,7 @@ if __name__ == '__main__':
                     args.pp_size,
                     (_pp_prev_rank, _pp_next_rank),
                     group=_pp_group,
-                    recompute=args.recompute
+                    recompute=args.use_recompute
                 )
             # TODO: support gradient allreduce in cpu
             if not args.embed_cpu:
