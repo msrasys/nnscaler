@@ -4,20 +4,19 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    handcraft/mbart/mbart_hybrid.py --pp-size 4 --tp-size 1 --nmb 4
+    handcraft/mbart/mbart.py --use-tp1f1b-pack --nmb 4 --use-recompute
 """
 
 from typing import Optional
 import argparse
 import math
 import torch
-from torch.utils import checkpoint
 
 import cube
 from cube.runtime.device import DeviceGroup
 from cube.runtime.syndata import SynTextDataLoader
 from cube.profiler import CudaTimer
-from cube.profiler.memory import memory_summary, model_summary
+from cube.profiler.memory import memory_summary
 from cube.profiler.timer import print_each_rank
 
 from handcraft.mbart.schedule import schedule_1f1b, schedule_tp_1f1b_pack
@@ -30,12 +29,19 @@ _pp_next_rank = None
 _pp_prev_rank = None
 
 parser = argparse.ArgumentParser(description='swin')
-parser.add_argument('--scale', type=int, default=0,
-                    help='scale of model, 0 is original one.')
+# model arch
+parser.add_argument('--layers', type=int, default=12,
+                    help='number encoder/decoder of layers')
+parser.add_argument('--hidden-size', type=int, default=1024,
+                    help='hidden size')
+parser.add_argument('--heads', type=int, default=16,
+                    help='number of heads')
+# training config
 parser.add_argument('--nmb', type=int,
                     help='num of micro batch')
 parser.add_argument('--iter-nmb', type=int, default=0,
                     help='num of micro batch per scheduling iteration (1f1b only)')
+# parallelism
 parser.add_argument('--use-1f1b', action='store_true',
                 help='use 1f1b scheduling')
 parser.add_argument('--use-tp1f1b-pack', action='store_true',
@@ -77,14 +83,19 @@ class Config:
     # attention_inner_dim = attention_heads * 64
     # ffn_dim = 4 * embed_dim
 
-    scale = args.scale
-    scale_p = scale * 0.25
+    # scale = args.scale
+    # scale_p = scale * 0.25
 
     num_embeddings = 500000 # 250027 + int(250027*scale_p)
-    decoder_layers = 12 + int(12*scale_p)
-    encoder_layers = 12 + int(12*scale_p)
-    embed_dim = 1024 + int(1024*scale_p)
-    attention_heads = 16 + int(16*scale_p)
+    # decoder_layers = 12 + int(12*scale_p)
+    # encoder_layers = 12 + int(12*scale_p)
+    # embed_dim = 1024 + int(1024*scale_p)
+    # attention_heads = 16 + int(16*scale_p) if scale < 6 else 40 + 8*(scale-6)
+    decoder_layers = args.layers
+    encoder_layers = args.layers
+    embed_dim = args.hidden_size
+    attention_heads = args.heads
+
     attention_inner_dim = attention_heads * 64
     ffn_dim = 4 * embed_dim
 
@@ -654,6 +665,7 @@ if __name__ == '__main__':
 
 
     cfg = Config()
+    print_each_rank(f'enc/dec layer#: {cfg.encoder_layers}, embed_dim#: {cfg.embed_dim}, heads#: {cfg.attention_heads}, ffn_dim#: {cfg.ffn_dim}', rank_only=0)
     dataloader = SynTextDataLoader(
         shapes=(
             [1, cfg.max_source_positions],
