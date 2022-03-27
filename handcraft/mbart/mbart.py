@@ -31,6 +31,7 @@ _pp_group = -1
 _pp_embed_group = -1
 _pp_next_rank = None
 _pp_prev_rank = None
+_layer_divisions = []
 
 parser = argparse.ArgumentParser(description='swin')
 # model arch
@@ -66,14 +67,57 @@ if _pp_group == -1:
     idx = pp_ranks.index(DeviceGroup().rank)
     _pp_next_rank = pp_ranks[(idx+1) % len(pp_ranks)]
     _pp_prev_rank = pp_ranks[(idx-1) % len(pp_ranks)]
-    is_first_stage = idx == 0
-    is_first_decoder_stage = idx == len(pp_ranks) // 2
-    is_last_stage = idx == len(pp_ranks) - 1
+
+    encoder_time = [1] * args.layers
+    decoder_time = [2] * args.layers
+    times = encoder_time + decoder_time
+    num_stages = torch.distributed.get_world_size(_pp_group)
+    budget = sum(times) // num_stages
+    print_each_rank(f'budget: {budget}', rank_only=0)
+    start, end = 0, 1
+    for idx in range(num_stages):
+        accum = times[start]
+        assert end <= args.layers * 2
+        while end != args.layers * 2:
+            accum += times[end]
+            if accum > budget:
+                break
+            end += 1
+        if idx == num_stages - 1:
+            end = args.layers * 2
+        _layer_divisions.append((start, end))
+        start, end = end, end+1
+
+    # uniform division algorithm:
+    # num_stages = torch.distributed.get_world_size(_pp_group)
+    # chunk = args.layers // (num_stages // 2)
+    # encoder_nlayers = [chunk] * (num_stages // 2)
+    # for idx in range(args.layers % (num_stages // 2)):
+    #     encoder_nlayers[-idx] += 1
+    # encoder_layers = [
+    #     (sum(encoder_nlayers[:rank]),
+    #      sum(encoder_nlayers[:rank+1])) for rank in range(num_stages // 2)
+    # ]
+    # decoder_layers = [
+    #     (args.layers + sum(encoder_nlayers[:rank]),
+    #      args.layers + sum(encoder_nlayers[:rank+1])) for rank in range(num_stages // 2)
+    # ]
+    # _layer_divisions = encoder_layers + decoder_layers
+
+    print_each_rank(f'layer divisions: {_layer_divisions}', rank_only=0)
+
     
-# create embed group: first encoder, first decoder, last stage
+# create embed group: first encoder, first decoder
 if args.use_1f1b:
-    embed_ranks = [pp_ranks[0], pp_ranks[len(pp_ranks) // 2]]
-    embed_ranks = list(set(embed_ranks))
+    encoder_preprocess = 0
+    decoder_preprocess = None
+    for rank in range(len(pp_ranks)):
+        start, end = _layer_divisions[rank]
+        if start <= args.layers and end > args.layers:
+            decoder_preprocess = rank
+            break
+    assert decoder_preprocess is not None
+    embed_ranks = [encoder_preprocess, decoder_preprocess]
     _pp_embed_group = DeviceGroup().get_group(embed_ranks)
 
 
@@ -88,9 +132,6 @@ class Config:
     # attention_heads = 16
     # attention_inner_dim = attention_heads * 64
     # ffn_dim = 4 * embed_dim
-
-    # scale = args.scale
-    # scale_p = scale * 0.25
 
     num_embeddings = 500000 # 250027 + int(250027*scale_p)
     # decoder_layers = 12 + int(12*scale_p)
@@ -444,10 +485,7 @@ class ShardEmbed(torch.nn.Module):
 
 class mBARTFull(torch.nn.Module):
 
-    def __init__(self, cfg: Config,
-                 encoder_preprocess=True,
-                 decoder_preprocess=True,
-                 post_process=True, shard=True):
+    def __init__(self, cfg: Config, shard=True):
         super().__init__()
         self.cfg = cfg
         self.dummy_labels = torch.tensor([1]).cuda()
@@ -461,36 +499,17 @@ class mBARTFull(torch.nn.Module):
 
         self.pp_stage = torch.distributed.get_rank(_pp_group)
         self.num_stages = torch.distributed.get_world_size(_pp_group)
+        self.layer_start, self.layer_end = _layer_divisions[self.pp_stage]
 
-        encoder_stages = self.num_stages // 2
-        decoder_stages = self.num_stages // 2
-        if self.pp_stage < self.num_stages // 2:
-            encoder_stages = self.num_stages // 2
-            chunk = cfg.encoder_layers // encoder_stages
-            remain = cfg.encoder_layers % encoder_stages
-            layers = [chunk] * encoder_stages
-            for idx in range(remain):
-                layers[-idx] += 1
-            self.layer_start = sum(layers[0:self.pp_stage])
-            self.layer_end = self.layer_start + layers[self.pp_stage]
-        if self.pp_stage >= self.num_stages // 2:
-            chunk = cfg.decoder_layers // decoder_stages
-            remain = cfg.decoder_layers % decoder_stages
-            layers = [chunk] * decoder_stages
-            for idx in range(remain):
-                layers[-idx] += 1
-            self.layer_start = cfg.encoder_layers + sum(layers[0:self.pp_stage-encoder_stages])
-            self.layer_end = self.layer_start + layers[self.pp_stage-encoder_stages]
-
-        self.encoder_preprocess  = encoder_preprocess
+        self.encoder_preprocess  = self.layer_start == 0 if not shard else False
         self.encoder_forward     = (self.layer_start < cfg.encoder_layers)
 
-        self.decoder_preprocess  = decoder_preprocess
-        self.decoder_first_stage = self.layer_start == cfg.encoder_layers
-        self.decoder_forward     = (self.layer_start >= cfg.encoder_layers)
+        self.decoder_first_stage = self.layer_start <= cfg.encoder_layers and self.layer_end > cfg.encoder_layers
+        self.decoder_preprocess  = self.decoder_first_stage if not shard else False
+        self.decoder_forward     = (self.layer_end > cfg.encoder_layers)
         self.decoder_last_stage  = (self.layer_end == cfg.encoder_layers + cfg.decoder_layers)
 
-        self.postprocess         = post_process
+        self.postprocess         = self.decoder_last_stage
 
         self.encoder_layer_start = self.layer_start
         self.encoder_layer_end = min(self.layer_end, cfg.encoder_layers)
@@ -498,7 +517,7 @@ class mBARTFull(torch.nn.Module):
         self.decoder_layer_start = max(cfg.encoder_layers, self.layer_start)
         self.decoder_layer_end = self.layer_end
 
-        if encoder_preprocess or decoder_preprocess or shard:
+        if self.encoder_preprocess or self.decoder_preprocess or shard:
             self.headtail = ShardEmbed(cfg, group = None if shard else -1, swap=args.use_swap)
         else:
             self.headtail = None
@@ -675,7 +694,10 @@ def reduce_embed(model, pp_embed_group):
     else:
         grad = None
     if grad is not None:
+        CudaTimer().start('comm')
         torch.distributed.all_reduce(grad, group=pp_embed_group)
+        torch.cuda.synchronize()
+        CudaTimer().stop('comm')
     if isinstance(model.headtail, torch.nn.Module):
         if model.headtail.swap:
             with torch.no_grad():
@@ -696,12 +718,9 @@ if __name__ == '__main__':
         batch_dims=(0,)
     )
     if args.use_1f1b:
-        encoder_preprocess = is_first_stage
-        decoder_preprocess = is_first_decoder_stage
-        postprocess = is_last_stage
-        model = mBARTFull(cfg, encoder_preprocess, decoder_preprocess, postprocess, shard=False).cuda()
+        model = mBARTFull(cfg, shard=False).cuda()
     else:
-        model = mBARTFull(cfg, False, False, is_last_stage, shard=True).cuda()
+        model = mBARTFull(cfg, shard=True).cuda()
 
     print_each_rank('model weight consumpition:')
     memory_summary()

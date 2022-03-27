@@ -4,8 +4,10 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    handcraft/mbart/mbart_hybrid.py --pp-size 2 --tp-size 2\
-    --nmb 4 --scale 0 --iter-nmb 4
+    handcraft/mbart/mbart_hybrid.py \
+        --layers 12 --hidden-size 1024 --heads 16 \
+        --pp-size 2 --tp-size 2 --nmb 4 --iter-nmb 4 \
+        --use-recompute
 """
 
 from typing import Optional
@@ -28,6 +30,7 @@ _pp_group = -1
 _pp_embed_group = -1
 _pp_next_rank = None
 _pp_prev_rank = None
+_layer_divisions = []
 
 
 parser = argparse.ArgumentParser(description='mbart hybrid')
@@ -70,22 +73,50 @@ if _pp_group == -1:
     idx = pp_ranks.index(DeviceGroup().rank)
     _pp_next_rank = pp_ranks[(idx+1) % len(pp_ranks)]
     _pp_prev_rank = pp_ranks[(idx-1) % len(pp_ranks)]
-    is_first_stage = idx == 0
-    is_first_decoder_stage = idx == len(pp_ranks) // 2
-    is_last_stage = idx == len(pp_ranks) - 1
+
+    encoder_time = [1] * args.layers
+    decoder_time = [2] * args.layers
+    times = encoder_time + decoder_time
+    num_stages = torch.distributed.get_world_size(_pp_group)
+    budget = sum(times) // num_stages
+    print_each_rank(f'budget: {budget}', rank_only=0)
+    start, end = 0, 1
+    for idx in range(num_stages):
+        accum = times[start]
+        assert end <= args.layers * 2
+        while end != args.layers * 2:
+            accum += times[end]
+            if accum > budget:
+                break
+            end += 1
+        if idx == num_stages - 1:
+            end = args.layers * 2
+        _layer_divisions.append((start, end))
+        start, end = end, end+1
+    print_each_rank(f'layer divisions: {_layer_divisions}', rank_only=0)
 
 if len(pp_ranks) > 1:
-    pranks = [torch.zeros((args.pp_size,), dtype=torch.int, device=torch.cuda.current_device()) for _ in range(args.tp_size)]
+    pranks = [torch.zeros(
+        (args.pp_size,), dtype=torch.int, device=torch.cuda.current_device()) for _ in range(args.tp_size)
+    ]
     prank = torch.tensor(pp_ranks, dtype=torch.int).cuda()
     pranks[torch.distributed.get_rank(_tp_group)] = prank
     torch.distributed.all_gather(pranks, prank, group=_tp_group)
     torch.cuda.synchronize()
     # print_each_rank(f'allgather-pp ranks: {pranks}')
-
+    encoder_preprocess_tp = 0
+    decoder_preprocess_tp = None
+    for rank in range(len(pp_ranks)):
+        start, end = _layer_divisions[rank]
+        if start <= args.layers and end > args.layers:
+            decoder_preprocess_tp = rank
+            break
+    assert decoder_preprocess_tp is not None
     for prank in pranks:
         prank = prank.tolist()
-        embed_ranks = [prank[0], prank[len(prank) // 2]]
+        embed_ranks = [prank[encoder_preprocess_tp], prank[decoder_preprocess_tp]]
         embed_ranks = list(set(embed_ranks))
+        print_each_rank(f'init embed group: {embed_ranks}')
         group = DeviceGroup().get_group(embed_ranks)
         if torch.distributed.get_rank(_tp_group) in prank:
             print(f'embedding group: {embed_ranks}')
@@ -476,11 +507,7 @@ class SharedEmbed(torch.nn.Module):
 
 class mBARTFull(torch.nn.Module):
 
-    def __init__(self, cfg: Config,
-                 encoder_preprocess=True,
-                 decoder_preprocess=True,
-                 post_process=True,
-                 embed_cpu=False):
+    def __init__(self, cfg: Config, embed_cpu=False):
         super().__init__()
         self.cfg = cfg
         self.dummy_labels = torch.tensor([1]).cuda()
@@ -494,40 +521,17 @@ class mBARTFull(torch.nn.Module):
 
         self.pp_stage = torch.distributed.get_rank(_pp_group)
         self.num_stages = torch.distributed.get_world_size(_pp_group)
+        self.layer_start, self.layer_end = _layer_divisions[self.pp_stage]
 
-        if self.num_stages >= 2:
-            encoder_stages = self.num_stages // 2
-            decoder_stages = self.num_stages // 2
-            if self.pp_stage < self.num_stages // 2:
-                encoder_stages = self.num_stages // 2
-                chunk = cfg.encoder_layers // encoder_stages
-                remain = cfg.encoder_layers % encoder_stages
-                layers = [chunk] * encoder_stages
-                for idx in range(remain):
-                    layers[-idx] += 1
-                self.layer_start = sum(layers[0:self.pp_stage])
-                self.layer_end = self.layer_start + layers[self.pp_stage]
-            if self.pp_stage >= self.num_stages // 2:
-                chunk = cfg.decoder_layers // decoder_stages
-                remain = cfg.decoder_layers % decoder_stages
-                layers = [chunk] * decoder_stages
-                for idx in range(remain):
-                    layers[-idx] += 1
-                self.layer_start = cfg.encoder_layers + sum(layers[0:self.pp_stage-encoder_stages])
-                self.layer_end = self.layer_start + layers[self.pp_stage-encoder_stages]
-        else:
-            self.layer_start = 0
-            self.layer_end = cfg.encoder_layers + cfg.decoder_layers
-
-        self.encoder_preprocess  = encoder_preprocess
+        self.encoder_preprocess  = self.layer_start == 0
         self.encoder_forward     = (self.layer_start < cfg.encoder_layers)
 
-        self.decoder_preprocess  = decoder_preprocess
-        self.decoder_first_stage = self.layer_start == cfg.encoder_layers
+        self.decoder_first_stage = self.layer_start <= cfg.encoder_layers and self.layer_end > cfg.encoder_layers
+        self.decoder_preprocess  = self.decoder_first_stage
         self.decoder_forward     = (self.layer_end > cfg.encoder_layers)
         self.decoder_last_stage  = (self.layer_end == cfg.encoder_layers + cfg.decoder_layers)
 
-        self.postprocess         = post_process
+        self.postprocess         = self.decoder_last_stage
 
         self.encoder_layer_start = self.layer_start
         self.encoder_layer_end = min(self.layer_end, cfg.encoder_layers)
@@ -535,7 +539,7 @@ class mBARTFull(torch.nn.Module):
         self.decoder_layer_start = max(cfg.encoder_layers, self.layer_start)
         self.decoder_layer_end = self.layer_end
 
-        if encoder_preprocess or decoder_preprocess:
+        if self.encoder_preprocess or self.decoder_preprocess:
             self.headtail = SharedEmbed(cfg, embed_cpu)
         else:
             self.headtail = None
@@ -707,7 +711,10 @@ def reduce_embed(model, pp_embed_group):
     else:
         grad = None
     if grad is not None:
+        CudaTimer().start('comm')
         torch.distributed.all_reduce(grad, group=pp_embed_group)
+        torch.cuda.synchronize()
+        CudaTimer().stop('comm')
     torch.cuda.synchronize()
 
 
@@ -724,13 +731,7 @@ if __name__ == '__main__':
     )
 
 
-    if args.pp_size > 1:
-        encoder_preprocess = is_first_stage
-        decoder_preprocess = is_first_decoder_stage
-        postprocess = is_last_stage
-        model = mBARTFull(cfg, encoder_preprocess, decoder_preprocess, postprocess, args.embed_cpu).cuda()
-    else:
-        model = mBARTFull(cfg, True, True, True, args.embed_cpu).cuda()
+    model = mBARTFull(cfg, args.embed_cpu).cuda()
 
     if args.embed_cpu:
         if model.headtail is not None:
