@@ -86,4 +86,3 @@ def update_geopotential_(phi: torch.Tensor, zs: torch.Tensor, P: torch.Tensor, P
 
 def strip_2_borders(w: torch.Tensor):
     return w[1:-1]
-

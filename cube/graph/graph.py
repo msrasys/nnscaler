@@ -291,7 +291,7 @@ class IRGraph(IRCell):
 
     ## Parallel Policy Primitives ##
 
-    def replicate(self, op: IRCell, times=1) -> Optional[List[IRCell]]:
+    def replicate(self, op: IRCell, times=1, reset_dependency=True) -> Optional[List[IRCell]]:
         """
         Replicate a forward or data operation multiple times.
 
@@ -318,7 +318,8 @@ class IRGraph(IRCell):
             bidx = self.nodes().index(op.mirror)
             for idx, bnode in enumerate(bnodes):
                 self.attach(bnode, bidx + idx)
-        self.reset_dependency()
+        if reset_dependency:
+            self.reset_dependency()
         return [op] + fnodes
 
     def partition(self, op: IRCell, algo: GenericDistAlgo, config: Dict) -> Optional[List[IRCell]]:

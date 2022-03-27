@@ -342,7 +342,9 @@ class IRAdapter(IRCell):
         odevice = otensor.device
 
         # local and remote adapter in-tensor
-        local, remote = list(), list()
+        # local_remote instead of local + remote to preserve inputs order
+        # TODO check order as may affect merging result
+        local, remote, local_and_remote = list(), list(), otensor.parent.ptensors
         for ptensor in otensor.parent.ptensors:
             if ptensor.device == odevice:
                 local.append(ptensor)
@@ -356,7 +358,7 @@ class IRAdapter(IRCell):
             return inputs, intersections, prims
         
         # check local + remote
-        for itensor in local + remote:
+        for itensor in local_and_remote: #local + remote:
             if not itensor.overlap(otensor):
                 continue
 

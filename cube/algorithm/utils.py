@@ -36,7 +36,7 @@ def split_axis(tensor: IRSubTensor, axis: int, chunk_num: int):
 
 def split_axis_custom(tensor: IRSubTensor, axis: int, chunks: List[slice]):
     """
-    Split tensor along an axis with cutomized selection
+    Split tensor along an axis with customized selection
     """
     if axis < 0:
         axis = len(tensor.shape) + axis
