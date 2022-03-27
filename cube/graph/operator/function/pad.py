@@ -35,16 +35,17 @@ class IRPad(IRFwOperation):
         self.outputs(0).shape = shape
         return True
 
-    def new(self, inputs: List, outputs: List):
+    def new(self, inputs: List, outputs: List, pad = None):
         """
         construct a new operator sharing same kwargs with new inputs
         and outputs
         """
-        pad  = self.kwargs['pad']
+        if pad == None:
+            pad = self.kwargs['pad']
         mode = self.kwargs['mode']
         value = self.kwargs['value']
         op = IRPad(self.signature, inputs, self.name,
-                      pad=pad, mode=mode, value=value)
+                   pad=pad, mode=mode, value=value)
         assert len(outputs) == 1
         op.set_output(0, outputs[0])
         op.infer_shape()

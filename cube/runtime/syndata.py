@@ -150,6 +150,7 @@ class SynDataLoader(CubeDataLoader):
         return self
 
     def set_data_buffer(self, buffer_num = 4):
+        torch.manual_seed(0)
         self.datas = list()
         self._buffer_num = buffer_num
         for _ in range(self._buffer_num):
