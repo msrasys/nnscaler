@@ -17,6 +17,21 @@ def conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tenso
     input = TorchF.pad(input, padding, 'constant', 0)
     return TorchF.conv2d(input, weight, bias, stride=stride, dilation=dilation, groups=groups)
 
+def conv3d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
+           stride: int, padding: List[int], dilation, groups: int = 1):
+    """
+    input:  N iC D H W,
+    weight: oC iC dH dW, oC
+    bias:   oC
+    padding: List[int, int, int, int]: [Htop, Hbottom, Wtop, Wbottom] or
+             List[int, int]: [Hside, Wside]
+
+    output: N oC oD oH oW
+    """
+    # switch D, H and W to match torch.nn.functional.pad
+    padding = [padding[(2 + i) // 2 * (-2) + (i % 2)] for i in range(len(padding))]
+    input = TorchF.pad(input, padding, 'constant', 0)
+    return TorchF.conv3d(input, weight, bias, stride=stride, dilation=dilation, groups=groups)
 
 def embedding(input: torch.Tensor, weight: torch.Tensor, start: int, stop: int):
     """

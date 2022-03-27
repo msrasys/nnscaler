@@ -749,4 +749,5 @@ if __name__ == '__main__':
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
           CudaTimer().duration(iter_num-2, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num-2)
     memory_summary()
