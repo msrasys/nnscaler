@@ -40,10 +40,9 @@ import torch.nn.functional as F
 # =================== Semantic Model Description ====================
 
 class MLP(nn.Module):
-    def __init__(self, dim, mult=1):
+    def __init__(self, dim, mult=1, filter=None):
         super().__init__()
         self.linear1 = nn.Linear(dim, dim * mult)
-
 
     def forward(self, data):
         a = self.linear1(data)
@@ -53,21 +52,55 @@ class MLP(nn.Module):
         # return loss
         return output
 
+class ConvModel(nn.Module):
+    def __init__(self, dim, mult=1, filter=None):
+        super().__init__()
+        # self.linear1 = nn.Linear(dim, dim * mult)
+        self.filter = filter
+
+    def forward(self, data):
+        # a = self.linear1(data)
+        # paded = F.pad(a, (1, 1), "constant", 8.8)
+        # output = paded + 0
+        added = data + 1.0
+        convd = torch.nn.functional.conv3d(added, self.filter, padding=[1,1,1])
+        output = convd + 0
+
+        # loss = torch.sum(output)
+        # return loss
+        return output
 
 def train():
-    batch_size = 4
+    batch_size = 2
     dim = 4
+    in_channel, out_channel = 2, 2
+    dimT, dimH, dimW = 2, 4, 4
+    kT, kH, kW = 1, 3, 3
 
-    model = MLP(dim=dim)
-    model = cube.SemanticModel(
-        model, input_shapes=([batch_size, dim],),
-    )
+    to_test = "MLP"
+    to_test = "Conv3d"
+    if to_test == "MLP":
+        model = MLP(dim=dim)
+        model = cube.SemanticModel(
+            model, input_shapes=([batch_size, dim],),
+        )
+        dataloader = cube.runtime.syndata.SynDataLoader(
+            shapes=([batch_size, dim],),
+            dtypes=(torch.float32,),
+            batch_dims=(0,)
+        )
+    elif to_test == "Conv3d":
+        filter = torch.randn(out_channel, in_channel, kT, kH, kW)
+        model = ConvModel(dim=dim, filter=filter)
+        model = cube.SemanticModel(
+            model, input_shapes=([batch_size, in_channel, dimT, dimH, dimW],),
+        )
 
-    dataloader = cube.runtime.syndata.SynDataLoader(
-        shapes=([batch_size, dim],),
-        dtypes=(torch.float32,),
-        batch_dims=(0,)
-    )
+        dataloader = cube.runtime.syndata.SynDataLoader(
+            shapes=([batch_size, in_channel, dimT, dimH, dimW],),
+            dtypes=(torch.float32,),
+            batch_dims=(0,)
+        )
 
     @cube.compile(model, dataloader, PAS=PAS, override=True)
     def train_iter(model, dataloader):

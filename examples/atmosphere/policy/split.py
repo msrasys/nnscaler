@@ -25,11 +25,15 @@ def PAS(graph: IRGraph, resource):
                 print(f'### IRConv3D = {node}')
                 sub_nodes = list()
                 algo = node.algorithms('halo')
-                Wnodes = graph.partition(node, algo, config=dict(idx=0, dim=3, num=resource.ngpus // 2))
-                for Wnode in Wnodes:
-                    algo = Wnode.algorithms('halo')
-                    Hnodes = graph.partition(Wnode, algo, config=dict(idx=0, dim=2, num=2))
-                    sub_nodes += Hnodes
+                # Wnodes = graph.partition(node, algo, config=dict(idx=0, dim=3, num=resource.ngpus // 2))
+                Wnodes = graph.partition(node, algo, config=dict(idx=0, dim=3, num=resource.ngpus))
+                # for Wnode in Wnodes:
+                #     algo = Wnode.algorithms('halo')
+                #     Hnodes = graph.partition(Wnode, algo, config=dict(idx=0, dim=2, num=2))
+                #     sub_nodes += Hnodes
+                sub_nodes += Wnodes #TODO remove temp
+                for idx, sub_node in enumerate(sub_nodes):
+                    graph.assign(sub_node, idx)
             else:
                 print(f'### to-replicate = {node}')
                 sub_nodes = graph.replicate(node, times=resource.ngpus, reset_dependency=False)
