@@ -669,7 +669,7 @@ def reduce_embed(model, pp_embed_group):
         if model.headtail.swap:
             with torch.no_grad():
                 grad = model.headtail.embed.weight.grad
-                grad = grad.data.cuda()
+                grad = grad.cuda()
         else:
             grad = model.headtail.weight.grad
     else:
@@ -679,8 +679,7 @@ def reduce_embed(model, pp_embed_group):
     if isinstance(model.headtail, torch.nn.Module):
         if model.headtail.swap:
             with torch.no_grad():
-                grad = grad.cpu()
-                model.headtail.embed.weight.grad = grad
+                model.headtail.embed.weight.grad.copy_(grad)
     torch.cuda.synchronize()
 
 

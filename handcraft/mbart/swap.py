@@ -24,17 +24,22 @@ class _SwapEmbed(torch.autograd.Function):
 
         with torch.no_grad():
             # swap in
-            weight.data = weight.detach().cuda()
+            weight_gpu = torch.empty(
+                weight.size(), dtype=weight.dtype,
+                device=torch.cuda.current_device(),
+                requires_grad=True
+            )
+            weight_gpu.copy_(weight)
             # compute
-            output = torch.nn.functional.embedding(input, weight)
+            output = torch.nn.functional.embedding(input, weight_gpu)
             # swap out
-            weight.data = weight.detach().cpu()
+            del weight_gpu
 
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        print(f'debug: >> {torch.distributed.get_rank()} embed backward here')
+        # print(f'debug: >> {torch.distributed.get_rank()} embed backward here')
         (input, fake) = ctx.saved_tensors
 
         global _param_map
@@ -42,19 +47,22 @@ class _SwapEmbed(torch.autograd.Function):
 
         # swap in
         with torch.no_grad():
-            weight = weight.data.cuda().requires_grad_()
+            weight_gpu = torch.empty(
+                weight.size(), dtype=weight.dtype,
+                device=torch.cuda.current_device(),
+                requires_grad=True
+            )
+            weight_gpu.copy_(weight)
         # compute
         with torch.enable_grad():
-            output = torch.nn.functional.embedding(input, weight)
+            output = torch.nn.functional.embedding(input, weight_gpu)
         torch.autograd.backward((output,), (grad_output,))
         # swap out
-        assert weight.grad is not None
+        assert weight_gpu.grad is not None
         with torch.no_grad():
-            grad = weight.grad.data.cpu()
-            weight = weight.data.cpu().requires_grad_()
-            weight.grad = grad
+            weight.grad.copy_(weight_gpu.grad)
+        del weight_gpu
 
-        _param_map[ctx.weight_id] = weight
         fake_grad = torch.zeros_like(fake)
         return None, None, fake_grad
 
@@ -75,8 +83,9 @@ class SwapEmbed(torch.nn.Module):
             self.padding_idx = padding_idx
 
         _weight = torch.nn.Parameter(
-            torch.empty(num_embeddings, embedding_dim, requires_grad=True)
+            torch.empty(num_embeddings, embedding_dim, requires_grad=True, pin_memory=True)
         )
+        _weight.grad = torch.zeros_like(_weight, requires_grad=False, pin_memory=True)
         self.weight_id = id(_weight)
         # the fake parameter is preventing no grad fn
         self.fake = torch.nn.Parameter(torch.empty((1,), requires_grad=True))
