@@ -4,7 +4,10 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    handcraft/mbart/mbart.py --use-tp1f1b-pack --nmb 4 --use-recompute
+    handcraft/mbart/mbart.py \
+        --layers 12 --hidden-size 1024 --heads 16 \
+        --use-1f1b --nmb 4 --iter-nmb 4 \
+        --use-recompute --use-swap
 """
 
 from typing import Optional
@@ -20,6 +23,7 @@ from cube.profiler.memory import memory_summary
 from cube.profiler.timer import print_each_rank
 
 from handcraft.mbart.schedule import schedule_1f1b, schedule_tp_1f1b_pack
+from handcraft.mbart.swap import SwapEmbed, get_swap_parameters
 from handcraft.mbart.tp import ReduceBroadcast
 
 
@@ -48,6 +52,8 @@ parser.add_argument('--use-tp1f1b-pack', action='store_true',
                 help='use tensor parallel 1f1b')
 parser.add_argument('--use-recompute', action='store_true',
                     help='use recompute for a stage')
+parser.add_argument('--use-swap', action='store_true',
+                    help='use embedding swap (1f1b only)')
 args = parser.parse_args()
 print(args)
 
@@ -364,7 +370,7 @@ class MBartClassificationHead(torch.nn.Module):
 
 class ShardEmbed(torch.nn.Module):
 
-    def __init__(self, cfg: Config, group=-1):
+    def __init__(self, cfg: Config, group=-1, swap=False):
         """
         group = -1 means no tensor parallelism
         """
@@ -375,10 +381,15 @@ class ShardEmbed(torch.nn.Module):
         self.shard_idx = torch.distributed.get_rank(group) if group != -1 else 0
         if self.shard_num > 0:
             print(f'[{torch.distributed.get_rank()}]: initialize sharding embed (x{self.shard_num})')
+        assert not (swap and self.shard_idx > 1), "only 1f1b can use swap"
         
-        self.vocab_start_index = self.cfg.num_embeddings // self.shard_num * self.shard_idx
-        self.vocab_end_index = self.cfg.num_embeddings // self.shard_num * (self.shard_idx + 1)
-        self.weight = torch.nn.Parameter(torch.ones((self.cfg.num_embeddings // self.shard_num, self.cfg.embed_dim)))
+        self.swap = swap
+        if swap:
+            self.embed = SwapEmbed(self.cfg.num_embeddings, self.cfg.embed_dim)
+        else:
+            self.vocab_start_index = self.cfg.num_embeddings // self.shard_num * self.shard_idx
+            self.vocab_end_index = self.cfg.num_embeddings // self.shard_num * (self.shard_idx + 1)
+            self.weight = torch.nn.Parameter(torch.ones((self.cfg.num_embeddings // self.shard_num, self.cfg.embed_dim)))
 
         # encoder-preprocess
         self.embed_positions_encoder = PositionalEmbedding(cfg.max_source_positions, cfg.embed_dim)
@@ -396,7 +407,9 @@ class ShardEmbed(torch.nn.Module):
         self._inputs = inputs
 
     def embed_lookup(self, tokens, dst: Optional[int] = None):
-        if self.shard_num > 1:
+        if self.swap:
+            embed = self.embed(tokens)
+        elif self.shard_num > 1:
             mask = (tokens < self.vocab_start_index) | \
                         (tokens >= self.vocab_end_index)
             tokens = tokens.clone() - self.vocab_start_index
@@ -486,7 +499,7 @@ class mBARTFull(torch.nn.Module):
         self.decoder_layer_end = self.layer_end
 
         if encoder_preprocess or decoder_preprocess or shard:
-            self.headtail = ShardEmbed(cfg, group = None if shard else -1)
+            self.headtail = ShardEmbed(cfg, group = None if shard else -1, swap=args.use_swap)
         else:
             self.headtail = None
 
@@ -653,11 +666,21 @@ def reduce_embed(model, pp_embed_group):
     Embedding gradients needs to be reduced across pipeline stages
     """
     if isinstance(model.headtail, torch.nn.Module):
-        grad = model.headtail.weight.grad
+        if model.headtail.swap:
+            with torch.no_grad():
+                grad = model.headtail.embed.weight.grad
+                grad = grad.data.cuda()
+        else:
+            grad = model.headtail.weight.grad
     else:
         grad = None
     if grad is not None:
         torch.distributed.all_reduce(grad, group=pp_embed_group)
+    if isinstance(model.headtail, torch.nn.Module):
+        if model.headtail.swap:
+            with torch.no_grad():
+                grad = grad.cpu()
+                model.headtail.embed.weight.grad = grad
     torch.cuda.synchronize()
 
 
@@ -684,7 +707,11 @@ if __name__ == '__main__':
     print_each_rank('model weight consumpition:')
     memory_summary()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
+    if args.use_swap:
+        parameters = get_swap_parameters() + list(model.parameters())
+    else:
+        parameters = model.parameters()
+    optimizer = torch.optim.Adam(parameters, lr=3e-05, betas=(0.9, 0.98))
 
     CudaTimer(enable=False).warmup()
     iter_num = 6
