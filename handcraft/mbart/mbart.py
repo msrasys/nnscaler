@@ -69,7 +69,7 @@ if _pp_group == -1:
     _pp_prev_rank = pp_ranks[(idx-1) % len(pp_ranks)]
 
     encoder_time = [1] * args.layers
-    decoder_time = [2] * args.layers
+    decoder_time = [1] * args.layers
     times = encoder_time + decoder_time
     num_stages = torch.distributed.get_world_size(_pp_group)
     budget = sum(times) // num_stages
