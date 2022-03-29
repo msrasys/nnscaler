@@ -30,3 +30,5 @@ OMP_NUM_THREADS=4 torchrun \
     --img-size ${img_size} --window-size ${window_size} \
     --pp-size 1 --tp-size ${gpus} --dp-size 1  \
     --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp${gpus}-coshard1.txt
+
+python scripts/keep.py --gpus 8

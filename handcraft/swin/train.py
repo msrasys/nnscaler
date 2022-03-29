@@ -93,7 +93,7 @@ if len(pp_ranks) != 1:
     nlayers = 2 + 2 + args.layers + 2 + 3  # 3 is patch merging layers
     times = ([2039/2] * 2 + [0]) + \
             ([1118/2] * 2 + [0]) + \
-            ([5474/4] * args.layers + [0]) + \
+            ([2910/8] * args.layers + [0]) + \
             ([510/2] * 2)
     num_stages = len(pp_ranks)
     budget = sum(times) // num_stages
