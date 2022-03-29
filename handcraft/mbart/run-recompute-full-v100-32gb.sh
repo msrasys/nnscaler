@@ -1,4 +1,4 @@
-evaldir=/data/MagicCube/scale-mbart-recompute
+evaldir=eval/mbart-v100-32gb-pcie-recompute
 
 mkdir -p ${evaldir}
 
