@@ -768,7 +768,7 @@ class ImageDataLoader(cube.runtime.syndata.CubeDataLoader):
             shapes=([batch_size, 3, img_size, img_size,],
                     [batch_size],
             ),
-            dtypes=(torch.float, torch.int),
+            dtypes=(torch.float if not args.fp16 else torch.float16, torch.int),
             batch_dims=(0, 0)
         )
         self.samples = [self.random_sample()]
@@ -776,7 +776,7 @@ class ImageDataLoader(cube.runtime.syndata.CubeDataLoader):
     def random_sample(self):
         img = torch.rand(
             *(self.bs, 3, self.img_size, self.img_size),
-            dtype=torch.float,
+            dtype=torch.float if not args.fp16 else torch.float16,
             device=torch.cuda.current_device()
         )
         labels = torch.randint(
@@ -813,10 +813,13 @@ def train():
                             ape=False,
                             patch_norm=True,
                             use_checkpoint=False)
+    if args.fp16:
+        model = model.half()
     model = model.cuda()
     dataloader = ImageDataLoader(args.micro_bs, cfg.img_size, cfg.num_classes)
     if _dp_reducer is not None:
-        _dp_reducer.add_param(model.parameters())
+        for param in model.parameters():
+            _dp_reducer.add_param(param)
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999))
 
     print_each_rank('model weight consumpition:')
