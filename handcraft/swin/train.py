@@ -851,13 +851,13 @@ def train():
             _dp_reducer.allreduce()
 
     CudaTimer(enable=False).warmup()
-    iter_num = 10
+    iter_num = 6
     for step in range(iter_num):
 
         # if step == 0:
         #     model_summary(model, next(dataloader))
 
-        if step >= 4:
+        if step >= 2:
             CudaTimer(enable=True).start('e2e')
 
         # training
@@ -871,7 +871,7 @@ def train():
         optimizer.step()
         optimizer.zero_grad()
 
-        if step >= 4:
+        if step >= 2:
             CudaTimer().stop('e2e')
 
         if step == 0:
@@ -882,8 +882,8 @@ def train():
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-4, field_name='e2e')))
-    CudaTimer().print_all(times=iter_num-4)
+          CudaTimer().duration(iter_num-2, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num-2)
     memory_summary()
 
 train()
