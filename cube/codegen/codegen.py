@@ -393,6 +393,7 @@ class ScheduleCodeGen(CodeGen):
         # generate code
         with FunctionBlock(func_name='_train_step', 
                            args=['model', 'dataloader']) as fb:
+            fb.insert_body('_ = None')
             if len(device_nodes) == 0:
                 fb.insert_body('pass')
             for node in device_nodes:
@@ -477,7 +478,7 @@ class ScheduleCodeGen(CodeGen):
     def return_naming(self, tensors: List[Any]) -> str:
         tensors = [self.tensor_naming(t) for t in tensors]
         if len(tensors) == 0:
-            tensors = ''
+            tensors = '_'
         else:
             tensors = ', '.join(tensors)
         return tensors
