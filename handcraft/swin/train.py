@@ -91,10 +91,10 @@ if len(pp_ranks) != 1:
 
     # layer division
     nlayers = 2 + 2 + args.layers + 2 + 3  # 3 is patch merging layers
-    times = ([1] * 2 + [0]) + \
-            ([1] * 2 + [0]) + \
-            ([1] * args.layers + [0]) + \
-            ([1] * 2)
+    times = ([2039/2] * 2 + [0]) + \
+            ([1118/2] * 2 + [0]) + \
+            ([5474/4] * args.layers + [0]) + \
+            ([510/2] * 2)
     num_stages = len(pp_ranks)
     budget = sum(times) // num_stages
     print_each_rank(f'budget: {budget}', rank_only=0)
@@ -158,9 +158,11 @@ class Mlp(torch.nn.Module):
             x = AllReduceIdentity.apply(x, self._tp_group)
         return x
 
-    def forward(self, x):
-        x = checkpoint.checkpoint(self.forward_, x)
-        # x = self.forward_(x)
+    def forward(self, x, recompute=True):
+        if recompute:
+            x = checkpoint.checkpoint(self.forward_, x)
+        else:
+            x = self.forward_(x)
         return x
 
 
@@ -176,10 +178,10 @@ class SeqMlp(torch.nn.Module):
             [Mlp(in_features, hidden_features // coshard, out_features, act_layer, drop) for _ in range(coshard)]
         )
 
-    def forward(self, x):
+    def forward(self, x, recompute=True):
         outs = None
         for mlp in self.mlps:
-            x_out = mlp(x)
+            x_out = mlp(x, recompute=recompute)
             outs = x_out if outs is None else outs + x_out
         return outs
 
@@ -263,9 +265,11 @@ class WindowAttention(torch.nn.Module):
 
         return x
 
-    def forward(self, x, mask=None):
-        x = checkpoint.checkpoint(self.forward_, x, mask)
-        # x = self.forward_(x, mask)
+    def forward(self, x, mask=None, recompute=True):
+        if recompute:
+            x = checkpoint.checkpoint(self.forward_, x, mask)
+        else:
+            x = self.forward_(x, mask)
         return x
 
     def extra_repr(self) -> str:
@@ -299,10 +303,10 @@ class SeqWindowAttention(torch.nn.Module):
                 qkv_bias, qk_scale, attn_drop, proj_drop) for _ in range(coshard)]
         )
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, recompute=True):
         outs = None
         for attn in self.attns:
-            x_out = attn(x, mask)
+            x_out = attn(x, mask, recompute)
             outs = x_out if outs is None else outs + x_out
         return outs
 
@@ -396,8 +400,7 @@ class SwinTransformerBlock(PipeStage):
         )
         self.layer_id = layer_id # for profiling
 
-    def forward(self, x):
-        CudaTimer().start(f'layer{self.layer_id}')
+    def forward_(self, x):
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -417,7 +420,7 @@ class SwinTransformerBlock(PipeStage):
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+        attn_windows = self.attn(x_windows, mask=self.attn_mask, recompute=self.layer_id != 2)  # nW*B, window_size*window_size, C
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -432,7 +435,17 @@ class SwinTransformerBlock(PipeStage):
 
         # FFN
         x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x), recompute=self.layer_id != 2))
+        return x
+
+    def forward(self, x):
+        CudaTimer().start(f'layer{self.layer_id}')
+        # layer-wise recompute
+        if self.layer_id == 2:
+            x = checkpoint.checkpoint(self.forward_, x)
+        # attention/mlp-wise recompute
+        else:
+            x = self.forward_(x)
         CudaTimer().stop(f'layer{self.layer_id}')
         return x
 
