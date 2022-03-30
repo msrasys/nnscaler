@@ -126,9 +126,9 @@ if len(pp_ranks) != 1:
         accum = times[start]
         assert end <= nlayers
         while end != nlayers:
-            accum += times[end]
-            if accum > budget:
+            if budget - accum < 0.5 * times[end]:
                 break
+            accum += times[end]
             end += 1
         if idx == num_stages - 1:
             end = nlayers
