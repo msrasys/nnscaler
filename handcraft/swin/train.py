@@ -5,9 +5,9 @@ OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=1 \
     --nnodes=1 \
     handcraft/swin/train.py \
-        --layers 18 --dim 192 --heads 6 \
+        --layers 18 --dim 256 --heads 8 \
         --pp-size 1 --tp-size 1 --dp-size 1  \
-        --bs 4 --micro-bs 1 --coshard 1 --fp16
+        --bs 4 --micro-bs 1 --coshard 8 --fp16
 """
 
 import torch
@@ -37,9 +37,9 @@ parser.add_argument('--dim', type=int, default=192,
 parser.add_argument('--heads', type=int, default=6,
                     help='head num of first stage')
 # data
-parser.add_argument('--img-size', type=int, default=640,
+parser.add_argument('--img-size', type=int, default=1536,
                     help='image size, can be 224, 640, 1536')
-parser.add_argument('--window-size', type=int, default=40,
+parser.add_argument('--window-size', type=int, default=48,
                     help='image size, can be 7, 40, 48')
 # training
 parser.add_argument('--bs', type=int, default=256,
@@ -91,10 +91,33 @@ if len(pp_ranks) != 1:
 
     # layer division
     nlayers = 2 + 2 + args.layers + 2 + 3  # 3 is patch merging layers
-    times = ([2039/2] * 2 + [0]) + \
-            ([1118/2] * 2 + [0]) + \
-            ([2910/8] * args.layers + [0]) + \
-            ([510/2] * 2)
+    # metrics for V100-32GB-PCIe
+    if args.dim == 256:  # OK!
+        times = ([109.93] * 2 + [0]) + \
+                ([60.34] * 2 + [0]) + \
+                ([43.18] * args.layers + [0]) + \
+                ([27.51] * 2)
+    elif args.dim == 512: # OK!
+        times = ([255.10] * 2 + [0]) + \
+                ([139.92] * 2 + [0]) + \
+                ([90.98] * args.layers + [0]) + \
+                ([63.78] * 2)
+    elif args.dim == 768: # OK!
+        times = ([440.5] * 2 + [0]) + \
+                ([241.4] * 2 + [0]) + \
+                ([145.7] * args.layers + [0]) + \
+                ([108.9] * 2)
+    elif args.dim == 1024:  # TP needed
+        times = ([255.10] * 2 + [0]) + \
+                ([139.92] * 2 + [0]) + \
+                ([90.98] * args.layers + [0]) + \
+                ([63.78] * 2)
+    else:
+        print_each_rank('WARNING: NO Metric Logged!!')
+        times = ([1] * 2 + [0]) + \
+                ([1] * 2 + [0]) + \
+                ([1] * args.layers + [0]) + \
+                ([1] * 2)
     num_stages = len(pp_ranks)
     budget = sum(times) // num_stages
     print_each_rank(f'budget: {budget}', rank_only=0)
