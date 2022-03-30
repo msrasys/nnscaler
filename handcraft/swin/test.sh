@@ -36,6 +36,56 @@ test()
       --pp-size 1 --tp-size ${gpus} --dp-size 1  \
       --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp${gpus}-coshard1.txt
 
+  # # Hybrid TP-1F1B -- 4 GPU
+  if [ ${gpus} == 4 ]
+  then
+    echo "testing ${gpus}-dev: TP2-PP2: L${layers}E${dim}H${heads}"
+    OMP_NUM_THREADS=4 torchrun \
+      --nproc_per_node=${gpus} \
+      --nnodes=1 \
+      handcraft/swin/train.py \
+        --layers ${layers} --dim ${dim} --heads ${heads} \
+        --img-size ${img_size} --window-size ${window_size} \
+        --pp-size 2 --tp-size 2 --dp-size 1  \
+        --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp2-coshard1.txt
+    sleep 5
+    killall python
+    sleep 5
+    killall python
+  fi
+
+  # Hybrid TP-1F1B -- 8 GPU
+  if [ ${gpus} == 8 ]
+  then
+    echo "testing ${gpus}-dev: TP4-PP2: L${layers}E${dim}H${heads}"
+    OMP_NUM_THREADS=4 torchrun \
+      --nproc_per_node=${gpus} \
+      --nnodes=1 \
+      handcraft/swin/train.py \
+        --layers ${layers} --dim ${dim} --heads ${heads} \
+        --img-size ${img_size} --window-size ${window_size} \
+        --pp-size 2 --tp-size 4 --dp-size 1  \
+        --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp4pp2-coshard1.txt
+    sleep 5
+    killall python
+    sleep 5
+    killall python
+
+    echo "testing ${gpus}-dev: TP2-PP4: L${layers}E${dim}H${heads}"
+    OMP_NUM_THREADS=4 torchrun \
+      --nproc_per_node=${gpus} \
+      --nnodes=1 \
+      handcraft/swin/train.py \
+        --layers ${layers} --dim ${dim} --heads ${heads} \
+        --img-size ${img_size} --window-size ${window_size} \
+        --pp-size 4 --tp-size 2 --dp-size 1  \
+        --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp4-coshard1.txt
+    sleep 5
+    killall python
+    sleep 5
+    killall python
+  fi
+
   echo "testing ${gpus}-dev: PP-Coshard1: L${layers}E${dim}H${heads}"
   OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=${gpus} \
@@ -56,13 +106,14 @@ test 18 256 8  8  4
 test 18 512 16 16 4
 test 18 768 24 24 4
 
+test 26 256 8  8  4
 test 26 512 16 16 4
 test 26 768 24 24 4
-test 26 1024 32 32 4
+# test 26 1024 32 32 4
 
 test 34 256 8  8  8
 test 34 512 16 16 8
 test 34 768 24 24 8
-test 34 1024 32 32 8
+# test 34 1024 32 32 8
 
 python scripts/keep.py --gpus 8
