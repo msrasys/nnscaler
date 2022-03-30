@@ -17,34 +17,34 @@ test()
   gpus=$5
 
   echo "testing ${gpus}-dev: PP-Coshard${coshard}: L${layers}E${dim}H${heads}"
-  echo "OMP_NUM_THREADS=4 torchrun \
+  OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=${gpus} \
     --nnodes=1 \
     handcraft/swin/train.py \
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size ${gpus} --tp-size 1 --dp-size 1  \
-      --bs 256 --micro-bs 1 --coshard ${coshard} --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}-coshard${coshard}.txt"
+      --bs 256 --micro-bs 1 --coshard ${coshard} --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}-coshard${coshard}.txt
 
   echo "testing ${gpus}-dev: TP-Coshard1: L${layers}E${dim}H${heads}"
-  echo "OMP_NUM_THREADS=4 torchrun \
+  OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=${gpus} \
     --nnodes=1 \
     handcraft/swin/train.py \
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size 1 --tp-size ${gpus} --dp-size 1  \
-      --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp${gpus}-coshard1.txt"
+      --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp${gpus}-coshard1.txt
 
   echo "testing ${gpus}-dev: PP-Coshard1: L${layers}E${dim}H${heads}"
-  echo "OMP_NUM_THREADS=4 torchrun \
+  OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=${gpus} \
     --nnodes=1 \
     handcraft/swin/train.py \
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size ${gpus} --tp-size 1 --dp-size 1  \
-      --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}-coshard1.txt"
+      --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}-coshard1.txt
 
   killall python
   sleep 5
