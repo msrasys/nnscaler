@@ -26,7 +26,7 @@ class IRPad(IRFwOperation):
         pad  = self.kwargs['pad']
         mode = self.kwargs['mode']
         value = self.kwargs['value']
-        assert (len(pad) % 2 == 0, "IRPad::infer_shape len(pad) % 2 == 0")
+        assert len(pad) % 2 == 0, "IRPad::infer_shape len(pad) % 2 == 0"
 
         shape = self.inputs(0).shape
         for pad_idx, pad_size in enumerate(pad):
