@@ -8,15 +8,14 @@ img_size=1536
 window_size=48
 
 
-test()
+test_naive_pp()
 {
   layers=$1
   dim=$2
   heads=$3
-  coshard=$4
-  gpus=$5
+  gpus=$4
 
-  echo "testing ${gpus}-dev: PP-Coshard${coshard}: L${layers}E${dim}H${heads}"
+  echo "testing ${gpus}-dev: Pure PP${coshard}: L${layers}E${dim}H${heads}"
   OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=${gpus} \
     --nnodes=1 \
@@ -24,9 +23,21 @@ test()
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size ${gpus} --tp-size 1 --dp-size 1  \
-      --bs 256 --micro-bs 1 --coshard ${coshard} --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}-coshard${coshard}.txt
+      --bs 256 --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}.txt
+  sleep 5
+  killall python
+  sleep 5
+  killall python
+}
 
-  echo "testing ${gpus}-dev: TP-Coshard1: L${layers}E${dim}H${heads}"
+test_naive_tp()
+{
+  layers=$1
+  dim=$2
+  heads=$3
+  gpus=$4
+
+  echo "testing ${gpus}-dev: Pure TP: L${layers}E${dim}H${heads}"
   OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=${gpus} \
     --nnodes=1 \
@@ -34,9 +45,20 @@ test()
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size 1 --tp-size ${gpus} --dp-size 1  \
-      --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp${gpus}-coshard1.txt
+      --bs 256 --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp${gpus}.txt
+  sleep 5
+  killall python
+  sleep 5
+  killall python
+}
 
-  # # Hybrid TP-1F1B -- 4 GPU
+test_naive_hybrid_tp_pp()
+{
+  layers=$1
+  dim=$2
+  heads=$3
+  gpus=$4
+
   if [ ${gpus} == 4 ]
   then
     echo "testing ${gpus}-dev: TP2-PP2: L${layers}E${dim}H${heads}"
@@ -47,7 +69,7 @@ test()
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
         --pp-size 2 --tp-size 2 --dp-size 1  \
-        --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp2-coshard1.txt
+        --bs 256 --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp2.txt
     sleep 5
     killall python
     sleep 5
@@ -65,7 +87,7 @@ test()
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
         --pp-size 2 --tp-size 4 --dp-size 1  \
-        --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp4pp2-coshard1.txt
+        --bs 256 --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp4pp2.txt
     sleep 5
     killall python
     sleep 5
@@ -79,14 +101,22 @@ test()
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
         --pp-size 4 --tp-size 2 --dp-size 1  \
-        --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp4-coshard1.txt
+        --bs 256 --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp4.txt
     sleep 5
     killall python
     sleep 5
     killall python
   fi
+}
 
-  echo "testing ${gpus}-dev: PP-Coshard1: L${layers}E${dim}H${heads}"
+test_coshard_pp()
+{
+  layers=$1
+  dim=$2
+  heads=$3
+  gpus=$4
+
+  echo "testing ${gpus}-dev: Pure TP: L${layers}E${dim}H${heads}"
   OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=${gpus} \
     --nnodes=1 \
@@ -94,26 +124,96 @@ test()
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size ${gpus} --tp-size 1 --dp-size 1  \
-      --bs 256 --micro-bs 1 --coshard 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}-coshard1.txt
-
+      --bs 256 --micro-bs 1 --use-coshard --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}-coshard.txt
+  sleep 5
   killall python
   sleep 5
   killall python
 }
 
-# test Layers Dim Heads Coshard GPUs
-test 18 256 8  8  4
-test 18 512 16 16 4
-test 18 768 24 24 4
+test_coshard_hybrid_tp_pp()
+{
+  layers=$1
+  dim=$2
+  heads=$3
+  gpus=$4
 
-test 26 256 8  8  4
-test 26 512 16 16 4
-test 26 768 24 24 4
-# test 26 1024 32 32 4
+  if [ ${gpus} == 4 ]
+  then
+    echo "testing ${gpus}-dev: TP2-PP2: L${layers}E${dim}H${heads}"
+    OMP_NUM_THREADS=4 torchrun \
+      --nproc_per_node=${gpus} \
+      --nnodes=1 \
+      handcraft/swin/train.py \
+        --layers ${layers} --dim ${dim} --heads ${heads} \
+        --img-size ${img_size} --window-size ${window_size} \
+        --pp-size 2 --tp-size 2 --dp-size 1  \
+        --bs 256 --micro-bs 1 --use-coshard --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp2.txt
+    sleep 5
+    killall python
+    sleep 5
+    killall python
+  fi
 
-test 34 256 8  8  8
-test 34 512 16 16 8
-test 34 768 24 24 8
-# test 34 1024 32 32 8
+  # Hybrid TP-1F1B -- 8 GPU
+  if [ ${gpus} == 8 ]
+  then
+    echo "testing ${gpus}-dev: TP4-PP2: L${layers}E${dim}H${heads}"
+    OMP_NUM_THREADS=4 torchrun \
+      --nproc_per_node=${gpus} \
+      --nnodes=1 \
+      handcraft/swin/train.py \
+        --layers ${layers} --dim ${dim} --heads ${heads} \
+        --img-size ${img_size} --window-size ${window_size} \
+        --pp-size 2 --tp-size 4 --dp-size 1  \
+        --bs 256 --micro-bs 1 --use-coshard --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp4pp2.txt
+    sleep 5
+    killall python
+    sleep 5
+    killall python
+
+    echo "testing ${gpus}-dev: TP2-PP4: L${layers}E${dim}H${heads}"
+    OMP_NUM_THREADS=4 torchrun \
+      --nproc_per_node=${gpus} \
+      --nnodes=1 \
+      handcraft/swin/train.py \
+        --layers ${layers} --dim ${dim} --heads ${heads} \
+        --img-size ${img_size} --window-size ${window_size} \
+        --pp-size 4 --tp-size 2 --dp-size 1  \
+        --bs 256 --micro-bs 1 --use-coshard --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp4.txt
+    sleep 5
+    killall python
+    sleep 5
+    killall python
+  fi
+}
+
+test_all()
+{
+  layers=$1
+  dim=$2
+  heads=$3
+  gpus=$4
+  test_naive_pp $layers $dim $heads $gpus
+  test_naive_tp $layers $dim $heads $gpus
+  test_naive_hybrid_tp_pp $layers $dim $heads $gpus
+  test_coshard_pp $layers $dim $heads $gpus
+}
+
+
+# test Layers Dim Heads GPUs
+test_all 18 256 8  4
+test_all 18 512 16 4
+test_all 18 768 24 4
+
+test_all 26 256 8  8  4
+test_all 26 512 16 16 4
+test_all 26 768 24 24 4
+test_all 26 1024 32 32 4
+
+test_all 34 256  8   8
+test_all 34 512  16  8
+test_all 34 768  24  8
+test_all 34 1024 32  8
 
 python scripts/keep.py --gpus 8

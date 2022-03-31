@@ -1,13 +1,14 @@
 """
 example:
 
+gpus=4
 OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=1 \
+    --nproc_per_node=${gpus} \
     --nnodes=1 \
     handcraft/swin/train.py \
         --layers 18 --dim 256 --heads 8 \
-        --pp-size 1 --tp-size 1 --dp-size 1  \
-        --bs 4 --micro-bs 1 --coshard 8 --fp16
+        --pp-size 4 --tp-size 1 --dp-size 1  \
+        --bs ${gpus} --micro-bs 1 --use-coshard --fp16
 """
 
 import torch
@@ -19,7 +20,7 @@ from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary, model_summary
 from cube.runtime.adapter.reducer import Reducer
 from cube.runtime.device import DeviceGroup
-from cube.runtime.adapter.distnn import IdentityAllreduce, AllReduceIdentity
+from cube.runtime.adapter.distnn import IdentityAllreduce, AllReduceIdentity, AllGatherSplit
 from handcraft.module.schedule import schedule_1f1b
 from handcraft.module.stage import PipeStage
 from handcraft.swin.utils import create_position_bias, trunc_normal_, window_partition, window_reverse, DropPath
@@ -54,8 +55,8 @@ parser.add_argument('--dp-size', type=int, default=1,
                     help='data parallelism size')
 parser.add_argument('--schedule', type=str, default='1f1b', choices=['1f1b'],
                     help='scheduling algorithm')
-parser.add_argument('--coshard', type=int, default=1)
-parser.add_argument('--fp16', action='store_true', default='')
+parser.add_argument('--use-coshard', action='store_true', default=False)
+parser.add_argument('--fp16', action='store_true', default=False)
 
 args = parser.parse_args()
 print(args)
@@ -126,7 +127,7 @@ if len(pp_ranks) != 1:
         accum = times[start]
         assert end <= nlayers
         while end != nlayers:
-            if budget - accum < 0.5 * times[end]:
+            if times[end] > 0 and budget - accum < 0.5 * times[end]:
                 break
             accum += times[end]
             end += 1
@@ -318,15 +319,37 @@ class SeqWindowAttention(torch.nn.Module):
                  qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.,
                  coshard=1):
         super().__init__()
+        assert (num_heads // args.tp_size) % coshard == 0
+        # only coshard num heads of first two stages
         self.coshard = coshard
-        assert inner_dim % coshard == 0
         self.attns = torch.nn.ModuleList(
             [WindowAttention(
-                dim, inner_dim // coshard, window_size, num_heads // coshard,
-                qkv_bias, qk_scale, attn_drop, proj_drop) for _ in range(coshard)]
+                dim, inner_dim // self.coshard, window_size, num_heads // self.coshard,
+                qkv_bias, qk_scale, attn_drop, proj_drop) for _ in range(self.coshard)]
         )
 
     def forward(self, x, mask=None, recompute=True):
+
+        # ===> sharding from both window and heads
+        # B = x.size(0)
+        # if B % 2 == 0:
+        #     xs = torch.chunk(x, 2, dim=0)
+        #     masks = torch.chunk(mask, 2, dim=0) if mask is not None else (None,) * 2
+        # else:
+        #     xs = (x,)
+        #     masks = (mask,)
+        # outs = []
+        # for bid, (cx, cmask) in enumerate(zip(xs, masks)):
+        #     for attn in self.attns:
+        #         cx_out = attn(cx, cmask, recompute)
+        #         if len(outs) < bid + 1:
+        #             outs.append(cx_out)
+        #         else:
+        #             outs[bid] = outs[bid] + cx_out
+        # outs = torch.concat(tuple(outs), dim=0)
+        # return outs
+
+        # ===> sharding only from heads
         outs = None
         for attn in self.attns:
             x_out = attn(x, mask, recompute)
@@ -369,23 +392,25 @@ class SwinTransformerBlock(PipeStage):
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
-        if not use_coshard or args.coshard == 1:
+        if not use_coshard or layer_id in [2,3]:
             self.attn = WindowAttention(
                 dim, dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
                 qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
         else:
-            print(f'use colocate-sharding: {args.coshard}')
+            coshard = num_heads // args.tp_size
+            print(f'Swin-stage-{layer_id} using coshard {coshard}')
             self.attn = SeqWindowAttention(
                 dim, dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
-                qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, coshard=args.coshard)
+                qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, coshard=coshard)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        if not use_coshard or args.coshard == 1:
+        if not use_coshard or layer_id in [2,3]:
             self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         else:
-            self.mlp = SeqMlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, coshard=args.coshard)
+            coshard = num_heads // args.tp_size
+            self.mlp = SeqMlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, coshard=coshard)
 
         H, W = self.input_resolution
         if self.shift_size > 0:
@@ -421,7 +446,8 @@ class SwinTransformerBlock(PipeStage):
             ((args.micro_bs // args.dp_size, H * W, self.dim),),
             (torch.float32 if not args.fp16 else torch.float16,)
         )
-        self.layer_id = layer_id # for profiling
+        self.layer_id = layer_id
+        self.inner_recompute = False if not use_coshard else layer_id in [0,1]
 
     def forward_(self, x):
         H, W = self.input_resolution
@@ -443,7 +469,7 @@ class SwinTransformerBlock(PipeStage):
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask, recompute=self.layer_id != 2)  # nW*B, window_size*window_size, C
+        attn_windows = self.attn(x_windows, mask=self.attn_mask, recompute=self.inner_recompute)  # nW*B, window_size*window_size, C
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -458,13 +484,13 @@ class SwinTransformerBlock(PipeStage):
 
         # FFN
         x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm2(x), recompute=self.layer_id != 2))
+        x = x + self.drop_path(self.mlp(self.norm2(x), recompute=self.inner_recompute))
         return x
 
     def forward(self, x):
         CudaTimer().start(f'layer{self.layer_id}')
         # layer-wise recompute
-        if self.layer_id == 2:
+        if not self.inner_recompute:
             x = checkpoint.checkpoint(self.forward_, x)
         # attention/mlp-wise recompute
         else:
@@ -583,7 +609,7 @@ def create_basic_layter(dim, input_resolution, depth, num_heads, window_size,
                              qkv_bias=qkv_bias, qk_scale=qk_scale,
                              drop=drop, attn_drop=attn_drop,
                              drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                             norm_layer=norm_layer, use_coshard=depth==2, layer_id=layer_id)
+                             norm_layer=norm_layer, use_coshard=args.use_coshard, layer_id=layer_id)
         for i in range(depth)])
     # patch merging layer
     if downsample is not None:
@@ -775,9 +801,15 @@ class SwinTransformer(PipeStage):
         if self.is_last_stage:
             CudaTimer().start('post-process')
             _, labels = self.data
-            x = self.norm(x)  # B L C
-            x = self.avgpool(x.transpose(1, 2))  # B C 1
-            x = torch.flatten(x, 1)
+
+            def _post_process(x):
+                x = self.norm(x)  # B L C
+                x = self.avgpool(x.transpose(1, 2))  # B C 1
+                x = torch.flatten(x, 1)
+                x = self.head(x)
+                return x
+
+            x = checkpoint.checkpoint(_post_process, x)
             x = self.criterion(x, labels)
             CudaTimer().stop('post-process')
 
@@ -878,7 +910,8 @@ def train():
     for step in range(iter_num):
 
         # if step == 0:
-        #     model_summary(model, next(dataloader))
+        #     model.data = next(dataloader)
+        #     model_summary(model, (), rank_only=1)
 
         if step >= 2:
             CudaTimer(enable=True).start('e2e')

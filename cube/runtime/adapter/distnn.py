@@ -37,7 +37,7 @@ class IdentityAllreduce(torch.autograd.Function):
         return grad_output, None
 
 
-class AllGatherScatter(torch.autograd.Function):
+class AllGatherSplit(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input, dim, group):
