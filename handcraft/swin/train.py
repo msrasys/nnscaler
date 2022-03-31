@@ -1,14 +1,14 @@
 """
 example:
 
-gpus=4
+gpus=16
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=${gpus} \
     --nnodes=1 \
     handcraft/swin/train.py \
-        --layers 18 --dim 256 --heads 8 \
-        --pp-size 4 --tp-size 1 --dp-size 1  \
-        --bs ${gpus} --micro-bs 1 --use-coshard --fp16
+        --bs ${gpus} --micro-bs 1 --fp16 \
+        --dp-size 1 --pp-size 16 --tp-size 1 \
+        --layers 42 --dim 1024 --heads 32 --use-coshard
 """
 
 import torch
@@ -195,18 +195,31 @@ class SeqMlp(torch.nn.Module):
                  act_layer=nn.GELU, drop=0.,
                  coshard=1):
         super().__init__()
+        self._tp_group = _tp_group
+        self._tp_size = 1 if _tp_group == -1 else torch.distributed.get_world_size(_tp_group)
+
         self.coshard = coshard
         assert hidden_features is not None
         assert hidden_features % coshard == 0
         self.mlps = torch.nn.ModuleList(
             [Mlp(in_features, hidden_features // coshard, out_features, act_layer, drop) for _ in range(coshard)]
         )
+        # remove tp communication inside each mlp as it will be
+        # done outside here
+        for mlp in self.mlps:
+            mlp._tp_size = 1
 
     def forward(self, x, recompute=True):
+        if self._tp_size > 1:
+            x = IdentityAllreduce.apply(x, self._tp_group)
+
         outs = None
         for mlp in self.mlps:
             x_out = mlp(x, recompute=recompute)
             outs = x_out if outs is None else outs + x_out
+
+        if self._tp_size > 1:
+            outs = AllReduceIdentity.apply(outs, self._tp_group)
         return outs
 
 
@@ -319,7 +332,9 @@ class SeqWindowAttention(torch.nn.Module):
                  qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.,
                  coshard=1):
         super().__init__()
-        assert (num_heads // args.tp_size) % coshard == 0
+        self._tp_group = _tp_group
+        self._tp_size = 1 if _tp_group == -1 else torch.distributed.get_world_size(_tp_group)
+        assert (num_heads // args.tp_size) % coshard == 0        
         # only coshard num heads of first two stages
         self.coshard = coshard
         self.attns = torch.nn.ModuleList(
@@ -327,6 +342,10 @@ class SeqWindowAttention(torch.nn.Module):
                 dim, inner_dim // self.coshard, window_size, num_heads // self.coshard,
                 qkv_bias, qk_scale, attn_drop, proj_drop) for _ in range(self.coshard)]
         )
+        # remove communication inside each attention as it will be
+        # done outside here
+        for attn in self.attns:
+            attn._tp_size = 1
 
     def forward(self, x, mask=None, recompute=True):
 
@@ -350,10 +369,16 @@ class SeqWindowAttention(torch.nn.Module):
         # return outs
 
         # ===> sharding only from heads
+        if self._tp_size > 1:
+            x = IdentityAllreduce.apply(x, self._tp_group)
+
         outs = None
         for attn in self.attns:
             x_out = attn(x, mask, recompute)
             outs = x_out if outs is None else outs + x_out
+
+        if self._tp_size > 1:
+            outs = AllReduceIdentity.apply(outs, self._tp_group)
         return outs
 
 
@@ -398,7 +423,7 @@ class SwinTransformerBlock(PipeStage):
                 qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
         else:
             coshard = num_heads // args.tp_size
-            print(f'Swin-stage-{layer_id} using coshard {coshard}')
+            print_each_rank(f'Swin-stage-{layer_id} using coshard {coshard}', rank_only=0)
             self.attn = SeqWindowAttention(
                 dim, dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
                 qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, coshard=coshard)
@@ -919,10 +944,10 @@ def train():
         # training
         train_iter(model, dataloader)
 
-        if step == 0:
-            print_each_rank('passed first iteration', rank_only=0)
-            print_each_rank('memory consumption before optimizer:', rank_only=0)
-            memory_summary()
+        # if step == 0:
+        #     print_each_rank('passed first iteration', rank_only=0)
+        #     print_each_rank('memory consumption before optimizer:', rank_only=0)
+        #     memory_summary()
 
         optimizer.step()
         optimizer.zero_grad()
