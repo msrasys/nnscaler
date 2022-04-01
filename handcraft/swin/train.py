@@ -23,7 +23,7 @@ from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.distnn import IdentityAllreduce, AllReduceIdentity, AllGatherSplit
 from handcraft.module.schedule import schedule_1f1b
 from handcraft.module.stage import PipeStage
-from handcraft.swin.utils import create_position_bias, trunc_normal_, window_partition, window_reverse, DropPath
+from handcraft.swin.utils import create_position_bias, create_position_index, trunc_normal_, window_partition, window_reverse, DropPath
 
 import argparse
 
@@ -236,7 +236,9 @@ class WindowAttention(torch.nn.Module):
         proj_drop (float, optional): Dropout ratio of output. Default: 0.0
     """
 
-    def __init__(self, dim, inner_dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, inner_dim, window_size, num_heads,
+                 qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.,
+                 position_index=True):
 
         super().__init__()
         self._tp_group = _tp_group
@@ -250,24 +252,35 @@ class WindowAttention(torch.nn.Module):
         self.scale = qk_scale or self.head_dim ** -0.5
 
         # define define a parameter table of relative position bias
-        table, index = create_position_bias(self.window_size, self.num_heads)
+        table = create_position_bias(self.window_size, self.num_heads)
         self.relative_position_bias_table = table
-        self.register_buffer("relative_position_index", index)
+        if position_index:
+            index = create_position_index(window_size, cuda=False)
+            self.register_buffer("relative_position_index", index)
+        else:
+            self.relative_position_index = None
 
         self.qkv = nn.Linear(dim, inner_dim // self._tp_size * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(inner_dim // self._tp_size, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-
-        trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward_(self, x, mask=None):
+    def forward_(self, x, mask=None, position_index=None):
         """
         Args:
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
+        assert self.relative_position_index is None ^ position_index is None
+        if position_index is not None:
+            relative_position_index = self.position_index
+        else:
+            relative_position_index = self.relative_position_index
+
+        if position_index is None:
+            relative_position_index = create_position_index(self.window_size, cuda=True)
+
         if self._tp_size > 1:
             x = IdentityAllreduce.apply(x, self._tp_group)
 
@@ -278,7 +291,7 @@ class WindowAttention(torch.nn.Module):
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+        relative_position_bias = self.relative_position_bias_table[relative_position_index.view(-1)].view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
         attn = attn + relative_position_bias.unsqueeze(0)
@@ -302,11 +315,11 @@ class WindowAttention(torch.nn.Module):
 
         return x
 
-    def forward(self, x, mask=None, recompute=True):
+    def forward(self, x, mask=None, position_index=None, recompute=True):
         if recompute:
-            x = checkpoint.checkpoint(self.forward_, x, mask)
+            x = checkpoint.checkpoint(self.forward_, x, mask, position_index)
         else:
-            x = self.forward_(x, mask)
+            x = self.forward_(x, mask, position_index)
         return x
 
     def extra_repr(self) -> str:
@@ -340,10 +353,13 @@ class SeqWindowAttention(torch.nn.Module):
         self.attns = torch.nn.ModuleList(
             [WindowAttention(
                 dim, inner_dim // self.coshard, window_size, num_heads // self.coshard,
-                qkv_bias, qk_scale, attn_drop, proj_drop) for _ in range(self.coshard)]
+                qkv_bias, qk_scale, attn_drop, proj_drop, False) for _ in range(self.coshard)]
         )
-        # remove communication inside each attention as it will be
-        # done outside here
+        # 1) remove communication inside each attention as it will be
+        #    done outside here
+        # 2) share same relative position index
+        index = create_position_index(window_size, cuda=False)
+        self.register_buffer("relative_position_index", index)
         for attn in self.attns:
             attn._tp_size = 1
 
@@ -374,7 +390,7 @@ class SeqWindowAttention(torch.nn.Module):
 
         outs = None
         for attn in self.attns:
-            x_out = attn(x, mask, recompute)
+            x_out = attn(x, mask, self.relative_position_index, recompute)
             outs = x_out if outs is None else outs + x_out
 
         if self._tp_size > 1:
@@ -423,6 +439,7 @@ class SwinTransformerBlock(PipeStage):
                 qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
         else:
             coshard = num_heads // args.tp_size
+            coshard = coshard // 2 if layer_id > 0 else coshard
             print_each_rank(f'Swin-stage-{layer_id} using coshard {coshard}', rank_only=0)
             self.attn = SeqWindowAttention(
                 dim, dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
@@ -435,6 +452,7 @@ class SwinTransformerBlock(PipeStage):
             self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         else:
             coshard = num_heads // args.tp_size
+            coshard = coshard // 2 if layer_id > 0 else coshard
             self.mlp = SeqMlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, coshard=coshard)
 
         H, W = self.input_resolution
@@ -915,7 +933,7 @@ def train():
             _dp_reducer.add_param(param)
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999))
 
-    print_each_rank('model weight consumpition:')
+    print_each_rank('model weight consumpition:', rank_only=0)
     memory_summary()
 
     def train_iter(model, dataloader):
@@ -930,7 +948,7 @@ def train():
         if _dp_reducer is not None:
             _dp_reducer.allreduce()
 
-    CudaTimer(enable=False).warmup()
+    CudaTimer(enable=False)
     iter_num = 6
     for step in range(iter_num):
 

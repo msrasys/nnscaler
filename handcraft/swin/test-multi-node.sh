@@ -190,14 +190,12 @@ test_all()
 }
 
 
-# test                   Layers Dim Heads Nodes GPUs
-# test_naive_tp             42 1024 32  2 8
+# =================================================
+# selected experiments
+# =================================================
 test_coshard_hybrid_tp_pp 42 1024 32  2 16
-
-# test_naive_tp             50 1024 32  2 8
 test_coshard_hybrid_tp_pp 50 1024 32  2 16
-
-# test_naive_tp             34 1024 32  2 8
+test_naive_tp             34 1024 32  2 8
 test_coshard_hybrid_tp_pp 34 1024 32  2 16
 
 python scripts/keep.py --gpus 8

@@ -3,7 +3,7 @@
 evaldir=eval/swin-coshard
 mkdir -p ${evaldir}
 
-
+bs=256
 img_size=1536
 window_size=48
 
@@ -23,7 +23,7 @@ test_naive_pp()
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size ${gpus} --tp-size 1 --dp-size 1  \
-      --bs 256 --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}.txt
+      --bs ${bs} --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}.txt
   sleep 5
   killall python
   sleep 5
@@ -45,7 +45,7 @@ test_naive_tp()
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size 1 --tp-size ${gpus} --dp-size 1  \
-      --bs 256 --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp${gpus}.txt
+      --bs ${bs} --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp${gpus}.txt
   sleep 5
   killall python
   sleep 5
@@ -69,7 +69,7 @@ test_naive_hybrid_tp_pp()
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
         --pp-size 2 --tp-size 2 --dp-size 1  \
-        --bs 256 --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp2.txt
+        --bs ${bs} --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp2.txt
     sleep 5
     killall python
     sleep 5
@@ -87,7 +87,7 @@ test_naive_hybrid_tp_pp()
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
         --pp-size 2 --tp-size 4 --dp-size 1  \
-        --bs 256 --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp4pp2.txt
+        --bs ${bs} --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp4pp2.txt
     sleep 5
     killall python
     sleep 5
@@ -101,7 +101,7 @@ test_naive_hybrid_tp_pp()
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
         --pp-size 4 --tp-size 2 --dp-size 1  \
-        --bs 256 --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp4.txt
+        --bs ${bs} --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp4.txt
     sleep 5
     killall python
     sleep 5
@@ -116,7 +116,7 @@ test_coshard_pp()
   heads=$3
   gpus=$4
 
-  echo "testing ${gpus}-dev: Pure TP: L${layers}E${dim}H${heads}"
+  echo "testing ${gpus}-dev: Coshard PP: L${layers}E${dim}H${heads}"
   OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=${gpus} \
     --nnodes=1 \
@@ -124,7 +124,7 @@ test_coshard_pp()
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size ${gpus} --tp-size 1 --dp-size 1  \
-      --bs 256 --micro-bs 1 --use-coshard --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}-coshard.txt
+      --bs ${bs} --micro-bs 1 --use-coshard --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}-coshard.txt
   sleep 5
   killall python
   sleep 5
@@ -148,7 +148,8 @@ test_coshard_hybrid_tp_pp()
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
         --pp-size 2 --tp-size 2 --dp-size 1  \
-        --bs 256 --micro-bs 1 --use-coshard --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp2.txt
+        --bs ${bs} --micro-bs 1 --use-coshard \
+        --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp2-coshard.txt
     sleep 5
     killall python
     sleep 5
@@ -166,7 +167,8 @@ test_coshard_hybrid_tp_pp()
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
         --pp-size 2 --tp-size 4 --dp-size 1  \
-        --bs 256 --micro-bs 1 --use-coshard --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp4pp2.txt
+        --bs ${bs} --micro-bs 1 --use-coshard \
+        --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp4pp2-coshard.txt
     sleep 5
     killall python
     sleep 5
@@ -180,7 +182,8 @@ test_coshard_hybrid_tp_pp()
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
         --pp-size 4 --tp-size 2 --dp-size 1  \
-        --bs 256 --micro-bs 1 --use-coshard --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp4.txt
+        --bs ${bs} --micro-bs 1 --use-coshard \
+        --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp2pp4-coshard.txt
     sleep 5
     killall python
     sleep 5
@@ -200,20 +203,13 @@ test_all()
   test_coshard_pp $layers $dim $heads $gpus
 }
 
+# =================================================
+# selected experiments
+# =================================================
+test_coshard_pp 26 512 16 4
+test_naive_tp   26 512 16 4
+test_coshard_pp 34 768 24 8
+test_naive_tp   34 768 24 8
 
-# test Layers Dim Heads GPUs
-test_all 18 256 8  4
-test_all 18 512 16 4
-test_all 18 768 24 4
-
-test_all 26 256 8  8  4
-test_all 26 512 16 16 4
-test_all 26 768 24 24 4
-test_all 26 1024 32 32 4
-
-test_all 34 256  8   8
-test_all 34 512  16  8
-test_all 34 768  24  8
-test_all 34 1024 32  8
 
 python scripts/keep.py --gpus 8
