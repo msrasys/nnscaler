@@ -104,7 +104,7 @@ if len(pp_ranks) != 1:
     chunk_num = args.layers // (args.pp_size // 2)
     layers = [chunk_num] * (args.pp_size // 2)
     for idx in range(args.layers % chunk_num):
-        layers[-1-idx] += 1
+        layers[-2-idx] += 1
     layer_num_per_dev = layers + layers
     start = 0
     layer_scopes, start = [], 0
@@ -738,7 +738,7 @@ if __name__ == '__main__':
     print_each_rank('model weight consumpition:')
     memory_summary()
 
-    CudaTimer(enable=False).warmup()
+    CudaTimer(enable=False)
     iter_num = 6
     for step in range(iter_num):
         if step >= 2:
