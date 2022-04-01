@@ -272,9 +272,9 @@ class WindowAttention(torch.nn.Module):
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
-        assert self.relative_position_index is None ^ position_index is None
+        assert (self.relative_position_index is None) ^ (position_index is None)
         if position_index is not None:
-            relative_position_index = self.position_index
+            relative_position_index = position_index
         else:
             relative_position_index = self.relative_position_index
 
