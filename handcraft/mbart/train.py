@@ -101,27 +101,20 @@ if len(pp_ranks) != 1:
     _pp_global_ranks = tuple(pp_ranks)
 
     # layer division
-    encoder_time = [1] * args.layers
-    decoder_time = [1] * args.layers
-    times = encoder_time + decoder_time
-    num_stages = torch.distributed.get_world_size(_pp_group)
-    budget = sum(times) // num_stages
-    print_each_rank(f'budget: {budget}', rank_only=0)
-    start, end = 0, 1
-    for idx in range(num_stages):
-        accum = times[start]
-        assert end <= args.layers * 2
-        while end != args.layers * 2:
-            accum += times[end]
-            if accum > budget:
-                break
-            end += 1
-        if idx == num_stages - 1:
-            end = args.layers * 2
-        _layer_divisions.append((start, end))
+    chunk_num = args.layers // (args.pp_size // 2)
+    layers = [chunk_num] * (args.pp_size // 2)
+    for idx in range(args.layers % chunk_num):
+        layers[-1-idx] += 1
+    layer_num_per_dev = layers + layers
+    start = 0
+    layer_scopes, start = [], 0
+    for sid in range(args.pp_size):
+        end = start + layer_num_per_dev[sid]
+        layer_scopes.append((start, end))
         if start <= args.layers and end > args.layers:
-            _first_decoder_stage = idx
-        start, end = end, end+1
+            _first_decoder_stage = sid
+        start = end
+    _layer_divisions = layer_scopes
     assert _first_decoder_stage != _first_encoder_stage, "Not supported yet"
 else:
     _layer_divisions = [(0, args.layers * 2)]
@@ -287,8 +280,8 @@ class EncoderLayer(PipeStage):
         self.self_attn_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
         self.dropout = torch.nn.Dropout(p=cfg.dropout)
         self.activation_dropout = torch.nn.Dropout(p=cfg.activation_dropout)
-        self.fc1 = torch.nn.Linear(cfg.embed_dim, cfg.ffn_dim)
-        self.fc2 = torch.nn.Linear(cfg.ffn_dim, cfg.embed_dim)
+        self.fc1 = torch.nn.Linear(cfg.embed_dim, cfg.ffn_dim // self.tp_size)
+        self.fc2 = torch.nn.Linear(cfg.ffn_dim // self.tp_size, cfg.embed_dim)
         self.final_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
 
         self.inputs_info = (
@@ -342,8 +335,8 @@ class DecoderLayer(PipeStage):
         self.encoder_attn = MultiheadAttention(cfg.embed_dim, cfg.attention_heads, cfg.attention_inner_dim, cfg.attention_dropout)
         self.encoder_attn_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
 
-        self.fc1 = torch.nn.Linear(cfg.embed_dim, cfg.ffn_dim)
-        self.fc2 = torch.nn.Linear(cfg.ffn_dim, cfg.embed_dim)
+        self.fc1 = torch.nn.Linear(cfg.embed_dim, cfg.ffn_dim // self.tp_size)
+        self.fc2 = torch.nn.Linear(cfg.ffn_dim // self.tp_size, cfg.embed_dim)
         self.final_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
 
         self.inputs_info = (

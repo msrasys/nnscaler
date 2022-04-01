@@ -1,4 +1,4 @@
-evaldir=eval/mbart-v100-32gb-pcie-recompute
+evaldir=eval/mbart-fp32-v100-32gb
 mkdir -p ${evaldir}
 
 
@@ -12,7 +12,7 @@ test_mix_tp_1f1b()
     OMP_NUM_THREADS=4 torchrun --nproc_per_node=${gpus} --nnodes=1 \
         handcraft/mbart/train.py \
         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
-        --bs 256 --micro-bs 1 \
+        --bs 8 --micro-bs 1 \
         --pp-size ${gpus} --tp-size 1 \
         --schedule tp1f1b > ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp1f1b.txt
     sleep 5
@@ -31,7 +31,7 @@ test_tp()
     OMP_NUM_THREADS=4 torchrun --nproc_per_node=${gpus} --nnodes=1 \
         handcraft/mbart/train.py \
         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
-        --bs 256 --micro-bs 1 \
+        --bs 8 --micro-bs 1 \
         --pp-size 1 --tp-size ${gpus} \
         --schedule 1f1b > ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp.txt
     sleep 5
@@ -128,6 +128,14 @@ test_hybrid_tp_pp()
     fi
 }
 
+
+test_mix_tp_1f1b  27 2304 36 4
+test_tp           27 2304 36 4
+test_mix_tp_1f1b  33 2816 48 8
+test_tp           33 2816 48 8
+test_mix_tp_1f1b  24 4096 32 8
+test_tp           24 4096 32 8
+
 # =================================================
 # 4 gpus: arch layer 21,21, hidden 1792, heads 28
 # =================================================
@@ -163,8 +171,8 @@ test_hybrid_tp_pp()
 # =================================================
 # 4 gpus: arch layer 27,27, hidden 2304, heads 36
 # =================================================
-test_mix_tp_1f1b   27 2304 36 4
-test_tp           27 2304 36 4
+# test_mix_tp_1f1b   27 2304 36 4
+# test_tp           27 2304 36 4
 # test_pp           27 2304 36 4
 # test_hybrid_tp_pp 27 2304 36 4
 
@@ -187,16 +195,16 @@ test_tp           27 2304 36 4
 # =================================================
 # 8 gpus: arch layer 33,33, hidden 2816, heads 48
 # =================================================
-test_mix_tp_1f1b   33 2816 48 8
-test_tp           33 2816 48 8
+# test_mix_tp_1f1b   33 2816 48 8
+# test_tp           33 2816 48 8
 # test_pp           33 2816 48 8
 # test_hybrid_tp_pp 33 2816 48 8
 
 # =================================================
 # 8 gpus: arch layer 24,24, hidden 4096, heads 32
 # =================================================
-test_mix_tp_1f1b   24 4096 32 8
-test_tp           24 4096 32 8
+# test_mix_tp_1f1b   24 4096 32 8
+# test_tp           24 4096 32 8
 # test_pp           24 4096 32 8
 # test_hybrid_tp_pp 24 4096 32 8
 
