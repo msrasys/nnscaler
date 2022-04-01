@@ -80,8 +80,17 @@ class PipeStage(torch.nn.Module):
         self._is_first_stage = self._stage_lrank == 0
         self._is_last_stage = self._stage_lrank == self.num_stages - 1
 
+    def get_last(self, region: str = 'default') -> Any:
+        return self._cached[region][-1]
+
+    def pop_last(self, region: str = 'default') -> Any:
+        return self._cached[region].pop(-1)
+
     def pop(self, region: str = 'default') -> Any:
         return self._cached[region].pop(0)
+
+    def push_ahead(self, val: Any, region: str = 'default') -> Any:
+        self._cached[region] = [val] + self._cached[region]
 
     def push(self, val: Any, region: str = 'default'):
         if region not in self._cached:

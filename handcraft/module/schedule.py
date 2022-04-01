@@ -1,9 +1,7 @@
-from typing import List, Tuple
+from typing import List
 import torch
 
 from cube.profiler.timer import CudaTimer, print_each_rank
-from cube.profiler.memory import memory_summary
-from cube.runtime.device import DeviceGroup
 
 from handcraft.module.stage import PipeStage
 
@@ -281,6 +279,9 @@ def schedule_1f1b(model: PipeStage,
             with torch.no_grad():
                 outputs = forward_step(model, *inputs)
                 model.push(None, 'outputs')
+                # correctness checkprint
+                # if model.is_last_stage:
+                #     print(outputs)
         else:
             outputs = forward_step(model, *inputs)
             model.push(outputs, 'outputs')
@@ -320,5 +321,207 @@ def schedule_1f1b(model: PipeStage,
         # send backward
         if not model.is_first_stage:
             send_backward(input_grads, prev_rank)
+
+    model.assert_empty_cached()
+
+
+def schedule_tp1f1b(model: PipeStage,
+                    dataloader,
+                    num_microbatch: int,
+                    recompute=False):
+    
+    def tp_encoder_preprocess(model: PipeStage) -> torch.Tensor:
+        model.data = next(dataloader)
+        enc = model.forward_encoder_shard()
+        return (enc,)
+
+    def tp_decoder_preprocess(model: PipeStage) -> torch.Tensor:
+        model.data = next(dataloader)
+        dec = model.forward_decoder_shard()
+        return (dec,)
+
+    def tp_encoder_backward(model: PipeStage):
+        enc = model.pop('encoder_sharding_output')
+        if model.stage_local_rank == model.first_encoder_stage:
+            grads = model.pop('encoder_sharding_grad')
+        else:
+            grads = (torch.empty_like(enc),)
+        backward_step((), (enc,), grads)
+
+    def tp_decoder_backward(model: PipeStage):
+        dec = model.pop('decoder_sharding_output')
+        if model.stage_local_rank == model.first_decoder_stage:
+            grads = model.pop('decoder_sharding_grad')
+        else:
+            grads = (torch.empty_like(dec),)
+        backward_step((), (dec,), grads)
+
+    num_stage = model.num_stages
+    rank = model.stage_local_rank
+    prev_rank = model.prev_stage_global_grank
+    next_rank = model.next_stage_global_rank
+    fofst = [-(step // 2) for step in range(num_stage)]
+    bofst = [-(num_stage - 1 - (step // 2)) for step in range(num_stage)]
+
+    fofst = fofst[model.stage_local_rank]
+    bofst = bofst[model.stage_local_rank]
+    last_backward = (None,)
+    last_forward = (None,)
+
+    for step in range(num_microbatch + num_stage - 1):
+        fmid, bmid = step + fofst, step + bofst
+        encoder_fmid = step
+        decoder_fmid = step - num_stage // 2 // 2
+        encoder_bmid = step + 1 - num_stage // 2 * 2
+        decoder_bmid = step + 1 - int(num_stage // 2 * 1.5)
+        do_backward = 0 <= bmid and bmid <= num_microbatch - 1
+        do_forward = 0 <= fmid and fmid <= num_microbatch - 1
+
+        # step1: tp encoder forward
+        encoder_inputs = None
+        if 0 <= encoder_fmid and encoder_fmid <= num_microbatch - 1:
+            encoder_inputs = tp_encoder_preprocess(model)
+        # step2: tp decoder forward
+        decoder_inputs = None
+        if 0 <= decoder_fmid and decoder_fmid <= num_microbatch - 1:
+            decoder_inputs = tp_decoder_preprocess(model)
+
+        # step 3: forward + backward
+        if rank % 2 == 0:
+            # inter-barrier
+            inputs = ()
+            if not model.is_first_stage:
+                if do_forward and last_backward != (None,):
+                    # print(f'rank {rank} send backward grad + recv forward output ')
+                    inputs = send_backward_recv_forward(last_backward, model, prev_rank)
+                elif do_forward:
+                    # print(f'rank {rank} recv forward output ')
+                    inputs = recv_forward(model, prev_rank)
+                elif last_backward != (None,):
+                    # print(f'rank {rank} send backward grad ')
+                    send_backward(last_backward, prev_rank)
+
+            # forward
+            if do_forward:
+
+                if model.stage_local_rank == model.first_encoder_stage and encoder_inputs is not None:
+                    model.push(encoder_inputs, 'inputs')
+                elif model.stage_local_rank == model.first_decoder_stage and decoder_inputs is not None:
+                    assert len(inputs) == 1 and len(decoder_inputs) == 1
+                    model.push((inputs[0], decoder_inputs[0]), 'inputs')
+                else:
+                    model.push(inputs, 'inputs')
+    
+                if recompute:
+                    with torch.no_grad():
+                        outputs = forward_step(model, *inputs, recompute=True)
+                    model.push(None, 'outputs')
+                else:
+                    outputs = forward_step(model, *inputs)
+                    model.push(outputs, 'outputs')
+
+            # recompute if backward is needed
+            if do_backward:
+                inputs, outputs_bp = model.pop('inputs'), model.pop('outputs')
+                if recompute:
+                    assert outputs_bp is None
+                    outputs_bp = forward_step(model, *inputs)
+
+            # intra-barrier send recv
+            output_grads = (None,)
+            if (do_forward and not model.is_last_stage) and (do_backward and not model.is_last_stage):
+                # send forward recv backward
+                # print(f'rank {rank} recv backward grad + send forward output ')
+                output_grads = send_forward_recv_backward(outputs, model, next_rank)
+            elif do_forward and not model.is_last_stage:
+                # print(f'rank {rank} send forward output ')
+                send_forward(outputs, next_rank)
+            elif do_backward and not model.is_last_stage:
+                # print(f'rank {rank} recv backward grad ')
+                output_grads = recv_backward(model, next_rank)
+
+            # backward
+            last_backward = (None,)
+            if do_backward:
+                # inputs, outputs = input_tensors.pop(0), output_tensors.pop(0)
+                input_grads = backward_step(inputs, outputs_bp, output_grads)
+
+                if model.stage_local_rank == model.first_encoder_stage:
+                    assert len(input_grads) == 1
+                    model.push(input_grads, 'encoder_sharding_grad')
+                elif model.stage_local_rank == model.first_decoder_stage:
+                    assert len(input_grads) == 2
+                    model.push((input_grads[1],), 'decoder_sharding_grad')
+                    input_grads = (input_grads[0],)
+                last_backward = input_grads
+
+        # step 3: backward + forward
+        if rank % 2 == 1:
+            # inter-barrier
+            if model.is_last_stage:
+                output_grads = (None,)
+            else:
+                if do_backward and last_forward != (None,):
+                    # print(f'rank {rank} recv backward grad + send forward output ')
+                    output_grads = send_forward_recv_backward(last_forward, model, next_rank)
+                elif do_backward:
+                    # print(f'rank {rank} recv backward grad ')
+                    output_grads = recv_backward(model, next_rank)
+                elif last_forward != (None,):
+                    # print(f'rank {rank} send forward output ')
+                    send_forward(last_forward, next_rank)
+
+            # backward
+            last_backward = (None,)
+            if do_backward:
+                inputs, outputs_bp = model.pop('inputs'), model.pop('outputs')
+                # backward
+                input_grads = backward_step(inputs, outputs_bp, output_grads)
+                last_backward = input_grads
+            
+            # intra-barrier
+            if do_backward and do_forward:
+                # print(f'rank {rank} send backward grad + recv forward output ')
+                inputs = send_backward_recv_forward(input_grads, model, prev_rank)
+            elif do_backward:
+                # print(f'rank {rank} send backward grad ')
+                send_backward(input_grads, prev_rank)
+            elif do_forward:
+                # print(f'rank {rank} recv forward output ')
+                inputs = recv_forward(model, prev_rank)
+
+            # forward
+            last_forward = (None,)
+            if do_forward:
+                # forward step
+                model.push(inputs, 'inputs')
+                if recompute:
+                    with torch.no_grad():
+                        outputs = forward_step(model, *inputs, recompute=True)
+                        model.push(None, 'outputs')
+                        # correctness check print
+                        # if model.is_last_stage:
+                        #     print(outputs)
+                else:
+                    outputs = forward_step(model, *inputs)
+                    model.push(outputs, 'outputs')
+                last_forward = outputs
+
+            next_backward = 0 <= (bmid+1) and (bmid+1) <= num_microbatch - 1
+            if next_backward:
+                if recompute:
+                    inputs, outputs_bp = model.pop('inputs'), model.pop('outputs')
+                    assert outputs_bp is None
+                    outputs = forward_step(model, *inputs)
+                    model.push_ahead(inputs, 'inputs')
+                    model.push_ahead(outputs, 'outputs')
+
+        # step 4: sharding decoder backward
+        if 0 <= decoder_bmid and decoder_bmid <= num_microbatch - 1:
+            tp_decoder_backward(model)
+
+        # step 5: sharding encoder backward
+        if 0 <= encoder_bmid and encoder_bmid <= num_microbatch - 1:
+            tp_encoder_backward(model)
 
     model.assert_empty_cached()
