@@ -211,5 +211,8 @@ test_naive_tp   26 512 16 4
 test_coshard_pp 34 768 24 8
 test_naive_tp   34 768 24 8
 
+# DGX-2 testing cases
+# test_coshard_hybrid_tp_pp 42 1024 32 16
+
 
 python scripts/keep.py --gpus 8

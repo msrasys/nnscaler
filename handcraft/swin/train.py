@@ -22,7 +22,7 @@ from cube.runtime.adapter.reducer import Reducer
 from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.distnn import IdentityAllreduce, AllReduceIdentity, AllGatherSplit
 from handcraft.module.schedule import schedule_1f1b
-from handcraft.module.stage import PipeStage
+from handcraft.module.stage import PipeStage, layer_division
 from handcraft.swin.utils import create_position_bias, create_position_index, trunc_normal_, window_partition, window_reverse, DropPath
 
 import argparse
@@ -55,7 +55,10 @@ parser.add_argument('--dp-size', type=int, default=1,
                     help='data parallelism size')
 parser.add_argument('--schedule', type=str, default='1f1b', choices=['1f1b'],
                     help='scheduling algorithm')
-parser.add_argument('--use-coshard', action='store_true', default=False)
+parser.add_argument('--use-coshard', action='store_true', default=False,
+                    help='enable this will split head but co-locate them with re-compute')
+parser.add_argument('--use-inner-coshard', action='store_true', default=False,
+                    help='enable this will shard bmm in attention of q @ k')
 parser.add_argument('--fp16', action='store_true', default=False)
 
 args = parser.parse_args()
@@ -120,21 +123,12 @@ if len(pp_ranks) != 1:
                 ([1] * args.layers + [0]) + \
                 ([1] * 2)
     num_stages = len(pp_ranks)
-    budget = sum(times) // num_stages
-    print_each_rank(f'budget: {budget}', rank_only=0)
-    start, end = 0, 1
-    for idx in range(num_stages):
-        accum = times[start]
-        assert end <= nlayers
-        while end != nlayers:
-            if times[end] > 0 and budget - accum < 0.5 * times[end]:
-                break
-            accum += times[end]
-            end += 1
-        if idx == num_stages - 1:
-            end = nlayers
-        _layer_divisions.append((start, end))
-        start, end = end, end+1
+    _layer_divisions = layer_division(times, num_stages)
+    # specific rules for stage division in order to fit in memory
+    if args.dim == 1024 and args.tp_size == 4:
+        if _layer_divisions[0][1] > 8:
+            remain_times = times[8:]
+            _layer_divisions = [(0, 8)] + layer_division(remain_times, num_stages-1, start_id=8)
 else:
     _layer_divisions = [(0, 2 + 2 + args.layers + 2 + 3)]
 print_each_rank(f'layer divisions: {_layer_divisions}', rank_only=0)
@@ -278,9 +272,6 @@ class WindowAttention(torch.nn.Module):
         else:
             relative_position_index = self.relative_position_index
 
-        if position_index is None:
-            relative_position_index = create_position_index(self.window_size, cuda=True)
-
         if self._tp_size > 1:
             x = IdentityAllreduce.apply(x, self._tp_group)
 
@@ -289,7 +280,17 @@ class WindowAttention(torch.nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
         q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
+
+        k = k.transpose(-2, -1)
+        # inner coshard by splitting windows
+        if args.use_inner_coshard and (B_ == 64 or B_ == 16):
+            chunk_num = B_ // 4
+            attn = []
+            for shard_q, shard_k in zip(torch.chunk(q, chunks=chunk_num, dim=0), torch.chunk(k, chunks=chunk_num, dim=0)):
+                attn.append(shard_q @ shard_k)
+            attn = torch.concat(tuple(attn), dim=0)
+        else:
+            attn = (q @ k)
 
         relative_position_bias = self.relative_position_bias_table[relative_position_index.view(-1)].view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
