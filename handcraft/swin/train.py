@@ -1,14 +1,14 @@
 """
 example:
 
-gpus=16
+gpus=1
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=${gpus} \
     --nnodes=1 \
     handcraft/swin/train.py \
-        --bs ${gpus} --micro-bs 1 --fp16 \
-        --dp-size 1 --pp-size 16 --tp-size 1 \
-        --layers 42 --dim 1024 --heads 32 --use-coshard
+        --bs 32 --micro-bs 1 --fp16 \
+        --dp-size 1 --pp-size 1 --tp-size 1 \
+        --layers 18 --dim 128 --heads 4
 """
 
 import torch
@@ -329,14 +329,14 @@ class WindowAttention(torch.nn.Module):
     def flops(self, N):
         # calculate flops for 1 window with token length of N
         flops = 0
-        # qkv = self.qkv(x)
-        flops += N * self.dim * 3 * self.dim
+        # qkv = self.qkv(x) # M K N
+        flops += N * self.dim * (3 * self.head_dim * self.num_heads)
         # attn = (q @ k.transpose(-2, -1))
-        flops += self.num_heads * N * (self.dim // self.num_heads) * N
+        flops += self.num_heads * (N * self.head_dim * N)
         #  x = (attn @ v)
-        flops += self.num_heads * N * N * (self.dim // self.num_heads)
+        flops += self.num_heads * N * N * self.head_dim
         # x = self.proj(x)
-        flops += N * self.dim * self.dim
+        flops += N * self.head_dim * self.num_heads * self.dim
         return flops
 
 
@@ -397,6 +397,12 @@ class SeqWindowAttention(torch.nn.Module):
         if self._tp_size > 1:
             outs = AllReduceIdentity.apply(outs, self._tp_group)
         return outs
+
+    def flops(self, N):
+        flops = 0
+        for attn in self.attns:
+            flops += attn.flops(N)
+        return flops
 
 
 class SwinTransformerBlock(PipeStage):
@@ -925,6 +931,8 @@ def train():
                             ape=False,
                             patch_norm=True,
                             use_checkpoint=False)
+    nparams = sum([param.numel() for param in model.parameters()])
+    print_each_rank(f'Model Params#: {nparams}')
     if args.fp16:
         model = model.half()
     model = model.cuda()
