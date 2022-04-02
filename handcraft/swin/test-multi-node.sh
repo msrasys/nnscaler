@@ -91,8 +91,11 @@ test_naive_hybrid_tp_pp()
 
     echo "testing ${gpus}-dev: TP4-PP4: L${layers}E${dim}H${heads}"
     OMP_NUM_THREADS=4 torchrun \
-      --nproc_per_node=${gpus} \
-      --nnodes=1 \
+      --nproc_per_node=8 \
+      --nnodes=${nodes} \
+      --node_rank=${NODE_RANK} \
+      --master_addr="${MASTER_IP}" \
+      --master_port=${MASTER_PORT} \
       handcraft/swin/train.py \
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
@@ -199,9 +202,12 @@ test_all()
 # selected experiments
 # =================================================
 
-# test_naive_tp             42 1024 32 2 16
+test_naive_tp             42 1024 32 2 16
 test_coshard_hybrid_tp_pp 42 1024 32 2 16
-# test_naive_tp             50 1024 32 2 16
+# test_naive_hybrid_tp_pp   42 1024 32 2 16  # -> OOM
+
+test_naive_tp             50 1024 32 2 16
 test_coshard_hybrid_tp_pp 50 1024 32 2 16
+# test_naive_hybrid_tp_pp   50 1024 32 2 16  # -> OOM
 
 python scripts/keep.py --gpus 8

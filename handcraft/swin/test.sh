@@ -206,10 +206,19 @@ test_all()
 # =================================================
 # selected experiments
 # =================================================
-test_coshard_pp 26 512 16 4
-test_naive_tp   26 512 16 4
-test_coshard_pp 34 768 24 8
-test_naive_tp   34 768 24 8
+test_coshard_pp         26 512 16 4
+test_naive_tp           26 512 16 4
+# test_naive_hybrid_tp_pp 26 512 16 4  # --> OOM
+
+test_coshard_pp         34 512 16 8
+test_naive_tp           34 512 16 8
+test_naive_hybrid_tp_pp 34 512 16 8
+
+test_coshard_pp         42 768 24 8
+test_naive_tp           42 768 24 8
+# test_naive_hybrid_tp_pp 42 768 24 8  # --> OOM
+
+
 
 # DGX-2 testing cases
 # test_coshard_hybrid_tp_pp 42 1024 32 16
