@@ -651,16 +651,16 @@ def create_basic_layter(dim, input_resolution, depth, num_heads, window_size,
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
     """
     # swin transformer layers
-    blocks = nn.ModuleList([
-        SwinTransformerBlock(dim=dim, input_resolution=input_resolution,
-                             num_heads=num_heads, window_size=window_size,
-                             shift_size=0 if (i % 2 == 0) else window_size // 2,
-                             mlp_ratio=mlp_ratio,
-                             qkv_bias=qkv_bias, qk_scale=qk_scale,
-                             drop=drop, attn_drop=attn_drop,
-                             drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                             norm_layer=norm_layer, use_coshard=args.use_coshard, layer_id=layer_id)
-        for i in range(depth)])
+    blocks = [SwinTransformerBlock(
+                dim=dim, input_resolution=input_resolution,
+                num_heads=num_heads, window_size=window_size,
+                shift_size=0 if (i % 2 == 0) else window_size // 2,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop, attn_drop=attn_drop,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                norm_layer=norm_layer, use_coshard=args.use_coshard, layer_id=layer_id)
+              for i in range(depth)]
     # patch merging layer
     if downsample is not None:
         downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
@@ -761,7 +761,7 @@ class SwinTransformer(PipeStage):
         # stochastic depth
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
         # build layers
-        self.layers = nn.ModuleList()
+        layers = []
         for i_layer in range(self.num_layers):
             blocks = create_basic_layter(dim=int(embed_dim * 2 ** i_layer),
                                         input_resolution=(self.patches_resolution[0] // (2 ** i_layer),
@@ -776,12 +776,12 @@ class SwinTransformer(PipeStage):
                                         norm_layer=norm_layer,
                                         downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
                                         layer_id=i_layer)
-            self.layers += blocks
+            layers += blocks
 
         # pipeline split layers
         start, end = _layer_divisions[self.stage_local_rank]
-        print_each_rank(f'initializing layer ranging from [{start}, {end})')
-        self.layers = self.layers[start:end]
+        self.layers = torch.nn.ModuleList(layers[start:end])
+        print_each_rank(f'initialized layers ({len(self.layers)}) ranging from [{start}, {end})')
 
         self.inputs_info = self.layers[0].inputs_info
         self.outputs_info = self.layers[-1].outputs_info
