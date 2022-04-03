@@ -3,7 +3,7 @@
 evaldir=eval/swin-coshard
 mkdir -p ${evaldir}
 
-bs=8
+bs=256
 img_size=1536
 window_size=48
 
@@ -229,24 +229,28 @@ test_all()
 # =================================================
 # selected experiments
 # =================================================
-test_coshard_dp         18 256 8  2
+test_naive_tp     6  96   3  1
+test_naive_tp     10 128  4  1
+test_naive_tp     14 192  6  1
+# test_naive_tp     18 256  8  1  # --> OOM
+# test_naive_tp     26 512  16 1  # --> OOM
+test_coshard_pp   6  96   3  1
+test_coshard_pp   10 128  4  1
+test_coshard_pp   14 192  6  1
+test_coshard_pp   18 256  8  1
+test_coshard_pp   26 512  16 1
 
-# test_coshard_dp         26 512 16 4
-# test_coshard_pp         26 512 16 4
-# test_naive_tp           26 512 16 4
+test_coshard_dp         18 256 8  2
+test_naive_tp           18 256 8  2
+test_naive_hybrid_tp_pp 18 256 8  2
+
+test_coshard_dp         26 512 16 4
+test_coshard_pp         26 512 16 4
+test_naive_tp           26 512 16 4
 # test_naive_hybrid_tp_pp 26 512 16 4  # --> OOM
 
-# test_coshard_pp         42 768 24 8
-# test_naive_tp           42 768 24 8
+test_coshard_pp         42 768 24 8
+test_naive_tp           42 768 24 8
 # test_naive_hybrid_tp_pp 42 768 24 8  # --> OOM
-
-
-# test_coshard_pp         34 512 16 8
-# test_naive_tp           34 512 16 8
-# test_naive_hybrid_tp_pp 34 512 16 8
-
-# DGX-2 testing cases
-# test_coshard_hybrid_tp_pp 42 1024 32 16
-
 
 python scripts/keep.py --gpus 8

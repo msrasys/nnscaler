@@ -165,6 +165,12 @@ test_hybrid_tp_pp()
 # =================================================
 # selected experiments
 # =================================================
+
+# strong scalability test
+test_mix_tp_1f1b  16 3072 24 16
+test_tp           16 3072 24 16
+
+# model scaling test
 test_mix_tp_1f1b  32 5120 40 16
 test_tp           32 5120 40 16
 # test_hybrid_tp_pp 32 5120 40 16  # --> OOM
