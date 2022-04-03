@@ -5,9 +5,9 @@ OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
     handcraft/mbart/train.py \
-        --layers 12 --hidden-size 1024 --heads 16 \
-        --dp-size 1 --pp-size 4 --tp-size 1 \
-        --bs 4 --micro-bs 1 --schedule 1f1b
+        --layers 16 --hidden-size 3072 --heads 32 \
+        --pp-size 2 --tp-size 2 \
+        --bs 16 --micro-bs 1 --schedule 1f1b
 """
 
 from typing import Optional

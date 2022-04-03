@@ -133,12 +133,16 @@ test_hybrid_tp_pp()
 # =================================================
 # selected experiments
 # =================================================
-test_mix_tp_1f1b  27 2304 36 4
-test_tp           27 2304 36 4
-test_mix_tp_1f1b  33 2816 48 8
-test_tp           33 2816 48 8
-test_mix_tp_1f1b  24 4096 32 8
-test_tp           24 4096 32 8
+test_tp           8  2048 16 2
+test_mix_tp_1f1b  8  2048 16 2
+test_hybrid_tp_pp 8  2048 16 2
+
+test_mix_tp_1f1b  16 3072 24 4
+test_tp           16 3072 24 4
+
+# test_mix_tp_1f1b  24 4096 32 8
+# test_tp           24 4096 32 8
+
 
 # =================================================
 # 4 gpus: arch layer 21,21, hidden 1792, heads 28
