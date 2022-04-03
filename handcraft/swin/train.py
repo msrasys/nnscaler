@@ -487,13 +487,13 @@ class SwinTransformerBlock(PipeStage):
 
         self.register_buffer("attn_mask", attn_mask)
         
-        assert args.micro_bs // args.dp_size != 0
+        assert args.bs // (args.micro_bs * args.dp_size) != 0
         self.inputs_info = (
-            ((args.micro_bs // args.dp_size, H * W, self.dim),),
+            ((args.micro_bs, H * W, self.dim),),
             (torch.float32 if not args.fp16 else torch.float16,)
         )
         self.outputs_info = (
-            ((args.micro_bs // args.dp_size, H * W, self.dim),),
+            ((args.micro_bs, H * W, self.dim),),
             (torch.float32 if not args.fp16 else torch.float16,)
         )
         self.layer_id = layer_id
@@ -583,13 +583,13 @@ class PatchMerging(PipeStage):
         self.norm = norm_layer(4 * dim)
 
         H, W = self.input_resolution
-        assert args.micro_bs // args.dp_size != 0
+        assert args.bs // (args.micro_bs * args.dp_size) != 0
         self.inputs_info = (
-            ((args.micro_bs // args.dp_size, H * W, self.dim),),
+            ((args.micro_bs, H * W, self.dim),),
             (torch.float32 if not args.fp16 else torch.float16,)
         )
         self.outputs_info = (
-            ((args.micro_bs // args.dp_size, (H // 2) * (W // 2), self.dim * 2),),
+            ((args.micro_bs, (H // 2) * (W // 2), self.dim * 2),),
             (torch.float32 if not args.fp16 else torch.float16,)
         )
 
@@ -946,7 +946,7 @@ def train():
     memory_summary()
 
     def train_iter(model, dataloader):
-        num_microbatch = args.bs // args.micro_bs
+        num_microbatch = args.bs // (args.dp_size * args.micro_bs)
         if _pp_group != -1:
             _schedule(model, dataloader, num_microbatch)
         else:

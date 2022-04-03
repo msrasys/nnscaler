@@ -3,7 +3,7 @@
 evaldir=eval/swin-coshard
 mkdir -p ${evaldir}
 
-bs=256
+bs=8
 img_size=1536
 window_size=48
 
@@ -131,6 +131,29 @@ test_coshard_pp()
   killall python
 }
 
+test_coshard_dp()
+{
+  layers=$1
+  dim=$2
+  heads=$3
+  gpus=$4
+
+  echo "testing ${gpus}-dev: Coshard DP: L${layers}E${dim}H${heads}"
+  OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=${gpus} \
+    --nnodes=1 \
+    handcraft/swin/train.py \
+      --layers ${layers} --dim ${dim} --heads ${heads} \
+      --img-size ${img_size} --window-size ${window_size} \
+      --pp-size 1 --tp-size 1 --dp-size ${gpus} \
+      --bs ${bs} --micro-bs 1 --use-coshard \
+      --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-dp${gpus}-coshard.txt
+  sleep 5
+  killall python
+  sleep 5
+  killall python
+}
+
 test_coshard_hybrid_tp_pp()
 {
   layers=$1
@@ -206,19 +229,21 @@ test_all()
 # =================================================
 # selected experiments
 # =================================================
-test_coshard_pp         26 512 16 4
-test_naive_tp           26 512 16 4
+test_coshard_dp         18 256 8  2
+
+# test_coshard_dp         26 512 16 4
+# test_coshard_pp         26 512 16 4
+# test_naive_tp           26 512 16 4
 # test_naive_hybrid_tp_pp 26 512 16 4  # --> OOM
 
-test_coshard_pp         34 512 16 8
-test_naive_tp           34 512 16 8
-test_naive_hybrid_tp_pp 34 512 16 8
-
-test_coshard_pp         42 768 24 8
-test_naive_tp           42 768 24 8
+# test_coshard_pp         42 768 24 8
+# test_naive_tp           42 768 24 8
 # test_naive_hybrid_tp_pp 42 768 24 8  # --> OOM
 
 
+# test_coshard_pp         34 512 16 8
+# test_naive_tp           34 512 16 8
+# test_naive_hybrid_tp_pp 34 512 16 8
 
 # DGX-2 testing cases
 # test_coshard_hybrid_tp_pp 42 1024 32 16
