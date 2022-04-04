@@ -325,10 +325,181 @@ def schedule_1f1b(model: PipeStage,
     model.assert_empty_cached()
 
 
+def schedule_tp1f1b_pp2(model: PipeStage,
+                        dataloader,
+                        num_microbatch: int,
+                        recompute=False):
+    def tp_encoder_preprocess(model: PipeStage) -> torch.Tensor:
+        model.data = next(dataloader)
+        enc = model.forward_encoder_shard()
+        return (enc,)
+
+    def tp_decoder_preprocess(model: PipeStage) -> torch.Tensor:
+        model.data = next(dataloader)
+        dec = model.forward_decoder_shard()
+        return (dec,)
+
+    def tp_encoder_backward(model: PipeStage):
+        enc = model.pop('encoder_sharding_output')
+        if model.stage_local_rank == model.first_encoder_stage:
+            grads = model.pop('encoder_sharding_grad')
+        else:
+            grads = (torch.empty_like(enc),)
+        backward_step((), (enc,), grads)
+
+    def tp_decoder_backward(model: PipeStage):
+        dec = model.pop('decoder_sharding_output')
+        if model.stage_local_rank == model.first_decoder_stage:
+            grads = model.pop('decoder_sharding_grad')
+        else:
+            grads = (torch.empty_like(dec),)
+        backward_step((), (dec,), grads)
+
+    num_stage = model.num_stages
+    rank = model.stage_local_rank
+    prev_rank = model.prev_stage_global_grank
+    next_rank = model.next_stage_global_rank
+    
+    output_grads = (None,)
+    inputs = ()
+    for step in range(num_microbatch * 2 + 2):
+
+        encoder_fmid = step // 2
+        encoder_bmid = step - 2
+        decoder_fmid = step - 1
+        decoder_bmid = step - 3
+
+        # step1: forward sharding 0
+        if step % 2 == 0:
+            encoder_fmid = step // 2
+            encoder_inputs = None
+            if 0 <= encoder_fmid and encoder_fmid <= num_microbatch - 1:
+                encoder_inputs = tp_encoder_preprocess(model)
+        # step1: forward sharding 1
+        if step % 2 == 1:
+            decoder_fmid = (step - 1) // 2
+            decoder_inputs = None
+            if 0 <= decoder_fmid and decoder_fmid <= num_microbatch - 1:
+                decoder_inputs = tp_decoder_preprocess(model)
+
+        if rank % 2 == 0:
+            # do forward
+            if step % 2 == 0:
+                fmid = step // 2
+                do_forward = 0 <= fmid and fmid <= num_microbatch - 1
+                if do_forward:
+                    model.push(encoder_inputs, 'inputs')
+                    if recompute:
+                        with torch.no_grad():
+                            outputs = forward_step(model, *(), recompute=True)
+                        model.push(None, 'outputs')
+                    else:
+                        outputs = forward_step(model, *())
+                        model.push(outputs, 'outputs')
+    
+                # recompute
+                next_bmid = (step + 1 - 3) // 2 if step+1 >= 3 else -1
+                do_next_backward = 0 <= next_bmid and next_bmid <= num_microbatch - 1
+                if recompute and do_next_backward :
+                    outputs_bp = model.pop('outputs')
+                    assert outputs_bp is None
+                    outputs_bp = forward_step(model, *())
+                    model.push_ahead(outputs_bp, 'outputs')
+
+                # send forward recv backward
+                if do_forward and do_next_backward:
+                    # print(f'rank {rank}: step {step}: send forward recv backward')
+                    output_grads = send_forward_recv_backward(outputs, model, next_rank)
+                elif do_next_backward:
+                    # print(f'rank {rank}: step {step}: recv backward')
+                    output_grads = recv_backward(model, next_rank)
+                elif do_forward:
+                    # print(f'rank {rank}: step {step}: send forward')
+                    send_forward(outputs, next_rank)
+
+            # do backward
+            else:
+                bmid = (step - 3) // 2 if step >= 3 else -1
+                if 0 <= bmid and bmid <= num_microbatch - 1:
+                    inputs, outputs = model.pop('inputs'), model.pop('outputs')
+                    input_grads = backward_step(inputs, outputs, output_grads)
+                    output_grads = (None,)
+                    assert len(input_grads) == 1
+                    model.push(input_grads, 'encoder_sharding_grad')
+
+        if rank % 2 == 1:
+            # do backward
+            if step % 2 == 0:
+                bmid = (step - 2) // 2 if step >= 2 else -1
+                do_backward = 0 <= bmid and bmid <= num_microbatch - 1
+
+                # backward
+                if do_backward:
+                    inputs, outputs = model.pop('inputs'), model.pop('outputs')
+                    assert output_grads == (None,)
+                    input_grads = backward_step(inputs, outputs, output_grads)
+                    assert len(inputs) == 2
+                    model.push((input_grads[1],), 'decoder_sharding_grad')
+                    input_grads = (input_grads[0],)
+
+                # send backward recv forward
+                next_fmid = (step + 1 - 1) // 2
+                do_next_forward = 0 <= next_fmid and next_fmid <= num_microbatch - 1
+                if do_backward and do_next_forward:
+                    # print(f'rank {rank}: step {step}: send backward recv forward')
+                    inputs = send_backward_recv_forward(input_grads, model, prev_rank)
+                elif do_next_forward:
+                    # print(f'rank {rank}: step {step}: recv forward')
+                    inputs = recv_forward(model, prev_rank)
+                elif do_backward:
+                    # print(f'rank {rank}: step {step}: send backward')
+                    send_backward(input_grads, prev_rank)
+            # do forward
+            else:
+                # forward
+                fmid = (step - 1) // 2
+                if 0 <= fmid and fmid <= num_microbatch - 1:
+                    assert inputs != ()
+                    model.push((inputs[0], decoder_inputs[0]), 'inputs')
+                    if recompute:
+                        with torch.no_grad():
+                            outputs = forward_step(model, *inputs, recompute=True)
+                        model.push(None, 'outputs')
+                    else:
+                        outputs = forward_step(model, *inputs)
+                        model.push(outputs, 'outputs')
+                
+                    # recompute
+                    if recompute:
+                        inputs, outputs = model.pop('inputs'), model.pop('outputs')
+                        assert outputs is None
+                        outputs = forward_step(model, *inputs)
+                        model.push_ahead(inputs, 'inputs')
+                        model.push_ahead(outputs, 'outputs')
+
+
+        # step3: backward sharding 1
+        if step % 2 == 0:
+            decoder_bmid = (step - 2) // 2
+            if 0 <= decoder_bmid and decoder_bmid <= num_microbatch - 1:
+                tp_decoder_backward(model)
+        
+        # step3: backward sharding 0
+        if step % 2 == 1:
+            encoder_bmid = (step - 3) // 2
+            if 0 <= encoder_bmid and encoder_bmid <= num_microbatch - 1:
+                tp_encoder_backward(model)
+
+    model.assert_empty_cached()
+
+
 def schedule_tp1f1b(model: PipeStage,
                     dataloader,
                     num_microbatch: int,
                     recompute=False):
+    # special cases for pipeline stage == 2
+    if model.num_stages == 2:
+        return schedule_tp1f1b_pp2(model, dataloader, num_microbatch, recompute)
     
     def tp_encoder_preprocess(model: PipeStage) -> torch.Tensor:
         model.data = next(dataloader)

@@ -1,7 +1,7 @@
 evaldir=eval/mbart-fp32-v100-32gb
 mkdir -p ${evaldir}
 
-bs=256
+bs=16
 
 test_mix_tp_1f1b()
 {
@@ -133,9 +133,9 @@ test_hybrid_tp_pp()
 # =================================================
 # selected experiments
 # =================================================
-# test_tp           8  2048 16 2
-# test_mix_tp_1f1b  8  2048 16 2
-# test_hybrid_tp_pp 8  2048 16 2
+test_tp           8  2048 16 2
+test_mix_tp_1f1b  8  2048 16 2
+test_hybrid_tp_pp 8  2048 16 2
 
 test_mix_tp_1f1b  16 3072 24 4
 test_tp           16 3072 24 4
