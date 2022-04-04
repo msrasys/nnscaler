@@ -94,6 +94,7 @@ if len(dp_ranks) != 1:
 if len(tp_ranks) != 1:
     print_each_rank(f'initializing tp ranks: {tp_ranks}')
     _tp_group = DeviceGroup().get_group(tp_ranks)
+    assert args.heads % args.tp_size == 0, "cannot be divided by tp-size"
 
 if len(pp_ranks) != 1:
     print_each_rank(f'initializing pp ranks: {pp_ranks}')
@@ -728,6 +729,8 @@ if __name__ == '__main__':
     print_each_rank(f'enc/dec layer#: {cfg.encoder_layers}, embed_dim#: {cfg.embed_dim}, heads#: {cfg.attention_heads}, ffn_dim#: {cfg.ffn_dim}', rank_only=0)
 
     model = MBart(cfg)
+    nparams = sum([param.numel() for param in model.parameters()])
+    print_each_rank('model params: [{nparams}].  Launching model...')
     model = model.half().cuda() if args.fp16 else model.cuda()
 
     dataloader = MBartDataLoader(args.micro_bs, cfg)
@@ -739,6 +742,7 @@ if __name__ == '__main__':
     memory_summary()
 
     CudaTimer(enable=False)
+    torch.distributed.barrier()
     iter_num = 6
     for step in range(iter_num):
         if step >= 2:
