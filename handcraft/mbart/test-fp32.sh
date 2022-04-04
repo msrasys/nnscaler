@@ -1,7 +1,7 @@
 evaldir=eval/mbart-fp32-v100-32gb
 mkdir -p ${evaldir}
 
-bs=16
+bs=256
 
 test_mix_tp_1f1b()
 {
