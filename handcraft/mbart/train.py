@@ -104,7 +104,7 @@ if len(pp_ranks) != 1:
     # layer division
     chunk_num = args.layers // (args.pp_size // 2)
     layers = [chunk_num] * (args.pp_size // 2)
-    for idx in range(args.layers % chunk_num):
+    for idx in range(args.layers % args.pp_size):
         layers[-2-idx] += 1
     layer_num_per_dev = layers + layers
     start = 0
@@ -730,7 +730,7 @@ if __name__ == '__main__':
 
     model = MBart(cfg)
     nparams = sum([param.numel() for param in model.parameters()])
-    print_each_rank('model params: [{nparams}].  Launching model...')
+    print_each_rank(f'model params: [{nparams}].  Launching model...')
     model = model.half().cuda() if args.fp16 else model.cuda()
 
     dataloader = MBartDataLoader(args.micro_bs, cfg)
