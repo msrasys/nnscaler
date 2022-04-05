@@ -2,12 +2,11 @@
 example:
 
 OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=4 \
+    --nproc_per_node=1 \
     --nnodes=1 \
     handcraft/mbart/train.py \
-        --layers 16 --hidden-size 3072 --heads 32 \
-        --pp-size 2 --tp-size 2 \
-        --bs 16 --micro-bs 1 --schedule 1f1b
+        --layers 8 --hidden-size 2048 --heads 16 \
+        --bs 1 --micro-bs 1 --schedule 1f1b
 """
 
 from typing import Optional
@@ -236,6 +235,7 @@ class MultiheadAttention(torch.nn.Module):
         self.tp_group = _tp_group
         self.tp_size = 1 if _tp_group == -1 else torch.distributed.get_world_size(_tp_group)
 
+        self.embed_dim = embed_dim
         self.inner_dim = inner_dim
         self.head_dim = inner_dim // num_heads
         self.num_heads = num_heads // self.tp_size
@@ -269,6 +269,22 @@ class MultiheadAttention(torch.nn.Module):
             attn = AllReduceIdentity.apply(attn, self.tp_group)
         return attn
 
+    def flops(self, seqlen: int):
+        """
+        Get forward-pass FLOPs for 1 micro-batch
+        """
+        attn_flops = dict(
+            kqv=3 * seqlen * self.embed_dim * self.head_dim * self.num_heads,
+            kqv_bias=3 * seqlen * self.head_dim * self.num_heads,
+            q_scale=seqlen * self.num_heads * self.head_dim, # (N h) L d, 1 -> (N h) L d
+            attn_score=self.num_heads * seqlen * self.head_dim * seqlen, # (N h) L d, (N h) d L -> (N h) L L
+            attn_softmax=5 * self.num_heads * seqlen * seqlen, # (N h) L L
+            attn_dropout=self.num_heads * seqlen * seqlen, # (N h) L L -> (N h) L L
+            attn_output=self.num_heads * seqlen * seqlen * self.head_dim, # (N h) L L, (N h) L d -> (N h) L d
+            out_proj=seqlen * self.num_heads * self.head_dim * self.embed_dim, # L N (h d), E (h d)  -> L N E
+        )
+        return sum(attn_flops.values())
+
 
 class EncoderLayer(PipeStage):
 
@@ -282,6 +298,7 @@ class EncoderLayer(PipeStage):
         self.self_attn_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
         self.dropout = torch.nn.Dropout(p=cfg.dropout)
         self.activation_dropout = torch.nn.Dropout(p=cfg.activation_dropout)
+        self.hidden_dim = cfg.ffn_dim // self.tp_size
         self.fc1 = torch.nn.Linear(cfg.embed_dim, cfg.ffn_dim // self.tp_size)
         self.fc2 = torch.nn.Linear(cfg.ffn_dim // self.tp_size, cfg.embed_dim)
         self.final_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
@@ -319,6 +336,23 @@ class EncoderLayer(PipeStage):
         x = x + residual
         return x
 
+    def flops(self):
+        seqlen = self.cfg.max_source_positions
+        enc_flops = dict(
+            attn_layer_norm=5 * seqlen * self.cfg.embed_dim, # (L, N, E)
+            attn=self.self_attn.flops(seqlen),
+            dropout=seqlen * self.cfg.embed_dim, # (L, N, E)
+            attn_residual=seqlen * self.cfg.embed_dim,
+            fc_layer_norm=5 * seqlen * self.cfg.embed_dim, # (L, N, E)
+            fc1=seqlen * self.cfg.embed_dim * self.hidden_dim, # L N E, E hidden -> L N hidden
+            gelu=8 * seqlen * self.hidden_dim,
+            fc_inner_dropout=seqlen * self.hidden_dim,
+            fc2=seqlen * self.cfg.embed_dim * self.hidden_dim,  # L N hidden, hidden E -> L N E
+            fc_dropout=seqlen * self.cfg.embed_dim,
+            fc_residual=seqlen * self.cfg.embed_dim,
+        )
+        return sum(enc_flops.values())
+
 
 class DecoderLayer(PipeStage):
 
@@ -337,6 +371,7 @@ class DecoderLayer(PipeStage):
         self.encoder_attn = MultiheadAttention(cfg.embed_dim, cfg.attention_heads, cfg.attention_inner_dim, cfg.attention_dropout)
         self.encoder_attn_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
 
+        self.hidden_dim = cfg.ffn_dim // self.tp_size
         self.fc1 = torch.nn.Linear(cfg.embed_dim, cfg.ffn_dim // self.tp_size)
         self.fc2 = torch.nn.Linear(cfg.ffn_dim // self.tp_size, cfg.embed_dim)
         self.final_layer_norm = torch.nn.LayerNorm(cfg.embed_dim)
@@ -387,6 +422,23 @@ class DecoderLayer(PipeStage):
         x = x + residual
         return x, encoder_out
 
+    def flops(self):
+        seqlen = self.cfg.max_target_positions
+        dec_flops = dict(
+            attn_layer_norm=0, # ignore
+            attn=self.self_attn.flops(seqlen) * 2, # self attention + cross attention
+            dropout=seqlen * self.cfg.embed_dim, # (L, N, E)
+            attn_residual=seqlen * self.cfg.embed_dim,
+            fc_layer_norm=0, # ignore
+            fc1=seqlen * self.cfg.embed_dim * self.hidden_dim, # L N E, E hidden -> L N hidden
+            gelu=seqlen * self.hidden_dim,
+            fc_inner_dropout=seqlen * self.hidden_dim,
+            fc2=seqlen * self.cfg.embed_dim * self.hidden_dim,  # L N hidden, hidden E -> L N E
+            fc_dropout=seqlen * self.cfg.embed_dim,
+            fc_residual=seqlen * self.cfg.embed_dim,
+        )
+        return sum(dec_flops.values())
+
 
 class MBartClassificationHead(torch.nn.Module):
     """Head for sentence-level classification tasks."""
@@ -416,6 +468,9 @@ class MBartClassificationHead(torch.nn.Module):
         logits = self.out_proj(hidden_states)
         loss = self.loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
         return loss
+
+    def flops(self):
+        return 0  # ignore
 
 
 class ShardEmbed(torch.nn.Module):
@@ -491,6 +546,10 @@ class ShardEmbed(torch.nn.Module):
         x = torch.nn.functional.dropout(x, p=0.0)
         x = x.transpose(0, 1)
         return x
+
+    def flops(self):
+        # ignore
+        return 0
 
     def init_weight(self):
         for param in self.parameters():
@@ -662,6 +721,13 @@ class MBart(PipeStage):
 
         return output
 
+    def flops(self):
+        enc_flops = sum([enc.flops() for enc in self.encoders])
+        enc_layernorm = 5 * self.cfg.max_source_positions * self.cfg.embed_dim
+        dec_flops = sum([dec.flops() for dec in self.decoders])
+        dec_layernorm = 5 * self.cfg.max_target_positions * self.cfg.embed_dim
+        return enc_flops + enc_layernorm + dec_flops + dec_layernorm
+
 
 def reduce_embed(model: MBart, pp_embed_group):
     """
@@ -746,7 +812,9 @@ if __name__ == '__main__':
 
     model = MBart(cfg)
     nparams = sum([param.numel() for param in model.parameters()])
-    print_each_rank(f'model params: [{nparams}].  Launching model...')
+    forward_flops = model.flops()
+    flops = forward_flops * 4 # forward + re-compute forward + backward (=2 forward flops)
+    print_each_rank(f'model params: {nparams} | FLOPs: {flops}.  Launching model...')
     model = model.half().cuda() if args.fp16 else model.cuda()
 
     dataloader = MBartDataLoader(args.micro_bs, cfg)

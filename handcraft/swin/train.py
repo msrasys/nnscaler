@@ -1,14 +1,13 @@
 """
 example:
 
-gpus=1
 OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=${gpus} \
+    --nproc_per_node=1 \
     --nnodes=1 \
     handcraft/swin/train.py \
-        --bs 32 --micro-bs 1 --fp16 \
+        --bs 1 --micro-bs 1 --fp16 \
         --dp-size 1 --pp-size 1 --tp-size 1 \
-        --layers 18 --dim 128 --heads 4
+        --layers 10 --dim 128 --heads 4
 """
 
 import torch
@@ -159,6 +158,8 @@ class Mlp(torch.nn.Module):
 
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
+        self.in_features = in_features
+        self.hidden_features = hidden_features // self._tp_size
         self.fc1 = nn.Linear(in_features, hidden_features // self._tp_size)
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features // self._tp_size, out_features)
@@ -182,6 +183,16 @@ class Mlp(torch.nn.Module):
         else:
             x = self.forward_(x)
         return x
+
+    def flops(self, seqlen: int):
+        mlp_flops = dict(
+            fc1=seqlen * self.in_features * self.hidden_features,
+            act=8 * seqlen * self.hidden_features,
+            drop=seqlen * self.hidden_features,
+            fc2=seqlen * self.hidden_features * self.in_features,
+            final_drop=seqlen * self.in_features,
+        )
+        return sum(mlp_flops.values())
 
 
 class SeqMlp(torch.nn.Module):
@@ -215,6 +226,9 @@ class SeqMlp(torch.nn.Module):
         if self._tp_size > 1:
             outs = AllReduceIdentity.apply(outs, self._tp_group)
         return outs
+
+    def flops(self, seqlen: int):
+        return sum([mlp.flops(seqlen) for mlp in self.mlps])
 
 
 class WindowAttention(torch.nn.Module):
@@ -326,18 +340,21 @@ class WindowAttention(torch.nn.Module):
     def extra_repr(self) -> str:
         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
 
-    def flops(self, N):
-        # calculate flops for 1 window with token length of N
-        flops = 0
-        # qkv = self.qkv(x) # M K N
-        flops += N * self.dim * (3 * self.head_dim * self.num_heads)
-        # attn = (q @ k.transpose(-2, -1))
-        flops += self.num_heads * (N * self.head_dim * N)
-        #  x = (attn @ v)
-        flops += self.num_heads * N * N * self.head_dim
-        # x = self.proj(x)
-        flops += N * self.head_dim * self.num_heads * self.dim
-        return flops
+    def flops(self, seqlen: int):
+        # calculate flops for one window
+        # seqlen is window size * window size
+        attn_flops = dict(
+            kqv=3 * seqlen * self.dim * self.head_dim * self.num_heads,
+            kqv_bias= 3 * seqlen * self.head_dim * self.num_heads,
+            q_scale=seqlen * self.num_heads * self.head_dim,
+            attn_score=self.num_heads * seqlen * self.head_dim * seqlen, # q @ k
+            position_index=self.num_heads * seqlen * seqlen,
+            attn_softmax=5 * self.num_heads * seqlen * seqlen,
+            attn_dropout=self.num_heads * seqlen * seqlen,
+            attn_output=self.num_heads * seqlen * seqlen * self.head_dim, # attn @ v
+            out_proj=seqlen * self.num_heads * self.head_dim * self.dim # self.proj(x)
+        )
+        return sum(attn_flops.values())
 
 
 class SeqWindowAttention(torch.nn.Module):
@@ -398,10 +415,10 @@ class SeqWindowAttention(torch.nn.Module):
             outs = AllReduceIdentity.apply(outs, self._tp_group)
         return outs
 
-    def flops(self, N):
+    def flops(self, seqlen: int):
         flops = 0
         for attn in self.attns:
-            flops += attn.flops(N)
+            flops += attn.flops(seqlen)
         return flops
 
 
@@ -553,18 +570,22 @@ class SwinTransformerBlock(PipeStage):
                f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
 
     def flops(self):
-        flops = 0
         H, W = self.input_resolution
-        # norm1
-        flops += self.dim * H * W
-        # W-MSA/SW-MSA
-        nW = H * W / self.window_size / self.window_size
-        flops += nW * self.attn.flops(self.window_size * self.window_size)
-        # mlp
-        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
-        # norm2
-        flops += self.dim * H * W
-        return flops
+        num_windows = H * W / self.window_size / self.window_size
+        block_flops = dict(
+            norm1=5 * H * W * self.dim,
+            roll1=0, # ignore
+            window_partition=0, # ignore
+            attn=num_windows * self.attn.flops(self.window_size * self.window_size),
+            roll2=0, # ignore
+            attn_dropout=H * W * self.dim,
+            atnn_residual=H * W * self.dim,
+            norm2=5 * H * W * self.dim,
+            mlp=self.mlp.flops(H * W),
+            mlp_drop=H * W * self.dim,
+            mlp_residual=H * W * self.dim,
+        )
+        return sum(block_flops.values())
 
 
 class PatchMerging(PipeStage):
@@ -932,7 +953,9 @@ def train():
                             patch_norm=True,
                             use_checkpoint=False)
     nparams = sum([param.numel() for param in model.parameters()])
-    print_each_rank(f'Model Params#: {nparams}')
+    forward_flops = model.flops()
+    tflops = forward_flops * 4 / (1e12) # forward + recompute-forward + backward (2x)
+    print_each_rank(f'Model Params#: {nparams} | TFlops: {tflops}')
     if args.fp16:
         model = model.half()
     model = model.cuda()
