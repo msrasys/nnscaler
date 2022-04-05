@@ -565,8 +565,6 @@ class MBart(PipeStage):
         self.first_decoder_stage = _first_decoder_stage
 
         self.cfg = cfg
-        encoders = [EncoderLayer(cfg) for _ in range(self.cfg.encoder_layers)]
-        decoders = [DecoderLayer(cfg) for _ in range(self.cfg.decoder_layers)]
 
         start, end = _layer_divisions[self.stage_local_rank]
         print_each_rank(f'initializing layer ranging from [{start}, {end})')
@@ -590,11 +588,12 @@ class MBart(PipeStage):
             self.embed = ShardEmbed(cfg) if self.embed is None else self.embed
             inputs_info = ((), ()) if inputs_info is None else inputs_info
 
+        self.encoders = []
+        self.layer_norm_encoder = None
         if self.encoder_forward:
-            self.encoders = torch.nn.ModuleList(
-                encoders[start:min(end, cfg.encoder_layers)]
-            )
-            self.layer_norm_encoder = None
+            encoders = [EncoderLayer(cfg) for _ in range(min(end, cfg.encoder_layers) - start)]
+            assert len(encoders) == end - start
+            self.encoders = torch.nn.ModuleList(encoders)
             if self.decoder_preprocess or self.decoder_forward:
                 self.layer_norm_encoder = torch.nn.LayerNorm(cfg.embed_dim)
 
@@ -602,14 +601,16 @@ class MBart(PipeStage):
             outputs_info = self.encoders[-1].outputs_info
 
         if self.decoder_preprocess:
+            _encoder = EncoderLayer(cfg)
             self.embed = ShardEmbed(cfg) if self.embed is None else self.embed
-            inputs_info = encoders[-1].outputs_info if inputs_info is None else inputs_info
+            inputs_info = _encoder.outputs_info if inputs_info is None else inputs_info
 
+        self.decoders = []
+        self.layer_norm_decoder = None
         if self.decoder_forward:
-            self.decoders = torch.nn.ModuleList(
-                decoders[max(0, start-cfg.encoder_layers): end-cfg.encoder_layers]
-            )
-            self.layer_norm_decoder = None
+            decoders = [DecoderLayer(cfg) for _ in range(end - max(cfg.encoder_layers, start))]
+            assert len(decoders) == end - start, f"end: {end}, start: {start}"
+            self.decoders = torch.nn.ModuleList(decoders)
             if self.is_last_stage:
                 self.layer_norm_decoder = torch.nn.LayerNorm(cfg.embed_dim)
             
@@ -723,9 +724,9 @@ class MBart(PipeStage):
 
     def flops(self):
         enc_flops = sum([enc.flops() for enc in self.encoders])
-        enc_layernorm = 5 * self.cfg.max_source_positions * self.cfg.embed_dim
+        enc_layernorm = 5 * self.cfg.max_source_positions * self.cfg.embed_dim if self.layer_norm_decoder is None else 0
         dec_flops = sum([dec.flops() for dec in self.decoders])
-        dec_layernorm = 5 * self.cfg.max_target_positions * self.cfg.embed_dim
+        dec_layernorm = 5 * self.cfg.max_target_positions * self.cfg.embed_dim if self.layer_norm_decoder is None else 0
         return enc_flops + enc_layernorm + dec_flops + dec_layernorm
 
 
