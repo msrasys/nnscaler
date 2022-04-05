@@ -592,7 +592,6 @@ class MBart(PipeStage):
         self.layer_norm_encoder = None
         if self.encoder_forward:
             encoders = [EncoderLayer(cfg) for _ in range(min(end, cfg.encoder_layers) - start)]
-            assert len(encoders) == end - start
             self.encoders = torch.nn.ModuleList(encoders)
             if self.decoder_preprocess or self.decoder_forward:
                 self.layer_norm_encoder = torch.nn.LayerNorm(cfg.embed_dim)
@@ -609,7 +608,6 @@ class MBart(PipeStage):
         self.layer_norm_decoder = None
         if self.decoder_forward:
             decoders = [DecoderLayer(cfg) for _ in range(end - max(cfg.encoder_layers, start))]
-            assert len(decoders) == end - start, f"end: {end}, start: {start}"
             self.decoders = torch.nn.ModuleList(decoders)
             if self.is_last_stage:
                 self.layer_norm_decoder = torch.nn.LayerNorm(cfg.embed_dim)
@@ -814,8 +812,8 @@ if __name__ == '__main__':
     model = MBart(cfg)
     nparams = sum([param.numel() for param in model.parameters()])
     forward_flops = model.flops()
-    flops = forward_flops * 4 # forward + re-compute forward + backward (=2 forward flops)
-    print_each_rank(f'model params: {nparams} | FLOPs: {flops}.  Launching model...')
+    tflops = forward_flops * 4 / 1e12 # forward + re-compute forward + backward (=2 forward flops)
+    print_each_rank(f'model params: {nparams} | TFLOPs: {tflops}.  Launching model...')
     model = model.half().cuda() if args.fp16 else model.cuda()
 
     dataloader = MBartDataLoader(args.micro_bs, cfg)
