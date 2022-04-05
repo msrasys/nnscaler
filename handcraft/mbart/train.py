@@ -15,6 +15,7 @@ import argparse
 import math
 import numpy as np
 import torch
+import torch.utils.checkpoint as checkpoint
 
 import cube
 from cube.runtime.device import DeviceGroup
@@ -104,7 +105,7 @@ if len(pp_ranks) != 1:
     # layer division
     chunk_num = args.layers // (args.pp_size // 2)
     layers = [chunk_num] * (args.pp_size // 2)
-    for idx in range(args.layers % args.pp_size):
+    for idx in range(args.layers % (args.pp_size // 2)):
         layers[-2-idx] += 1
     layer_num_per_dev = layers + layers
     start = 0
@@ -615,8 +616,15 @@ class MBart(PipeStage):
                 enc = self.embed(source_tokens, encoder=True)
 
         if self.encoder_forward:
-            for layer in self.encoders:
-                enc = layer(enc)
+            if args.pp_size == 1:
+                def encoder_forward(enc):
+                    for layer in self.encoders:
+                        enc = layer(enc)
+                    return enc
+                enc = checkpoint.checkpoint(encoder_forward, enc)
+            else:
+                for layer in self.encoders:
+                    enc = layer(enc)
             if self.layer_norm_encoder is not None:
                 enc = self.layer_norm_encoder(enc)
             output = enc
@@ -632,9 +640,17 @@ class MBart(PipeStage):
                 dec = self.embed(prev_tokens, decoder=True)
 
         if self.decoder_forward:
-            assert enc is not None
-            for layer in self.decoders:
-                dec, enc = layer(dec, enc)
+            if args.pp_size == 1:
+                def decoder_forward(enc, dec):
+                    assert enc is not None
+                    for layer in self.decoders:
+                        dec, enc = layer(dec, enc)
+                    return enc, dec
+                enc, dec = checkpoint.checkpoint(decoder_forward, enc, dec)
+            else:
+                assert enc is not None
+                for layer in self.decoders:
+                    dec, enc = layer(dec, enc)
             if self.layer_norm_decoder is not None:
                 dec = self.layer_norm_decoder(dec)
             output = (enc, dec)
