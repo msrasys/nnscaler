@@ -10,11 +10,13 @@ sudo git config --global user.name "Zhiqi Lin"
 sudo git config --global user.email "v-zhiql@microsoft.com"
 sudo chmod -R a+w /opt/conda
 
+sudo apt-get update
 sudo apt-get install htop -y
 sudo apt-get install tmux -y
 sudo apt-get install psmisc -y
 sudo apt-get install lsof -y
-sudo apt-get install infiniband-diags -y
+sudo apt-get install infiniband-diags -y  # ibstatus => check ib link
+sudo apt-get install net-tools -y         # ifconfig
 
 # install blob
 # sudo apt-get install lsb-release -y
@@ -45,4 +47,3 @@ echo 'export CUDA_HOME=/usr/local/cuda' >> ~/.bashrc
 pip uninstall training_daemon -y
 python setup.py develop
 pip install -r requirements.txt
-
