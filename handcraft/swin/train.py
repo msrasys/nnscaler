@@ -464,7 +464,7 @@ class SwinTransformerBlock(PipeStage):
         else:
             coshard = num_heads // args.tp_size
             coshard = coshard // 2 if layer_id > 0 else coshard
-            print_each_rank(f'Swin-stage-{layer_id} using coshard {coshard}', rank_only=0)
+            print(f'rank [{torch.distributed.get_rank()}]: Swin-stage-{layer_id} using coshard {coshard}')
             self.attn = SeqWindowAttention(
                 dim, dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
                 qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, coshard=coshard)
@@ -653,7 +653,8 @@ class PatchMerging(PipeStage):
 
 def create_basic_layter(dim, input_resolution, depth, num_heads, window_size,
                         mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                        drop_path=0., norm_layer=nn.LayerNorm, downsample=None, layer_id=None):
+                        drop_path=0., norm_layer=nn.LayerNorm, downsample=None,
+                        layer_id=None, start_id=0):
     """ A basic Swin Transformer layer for one stage.
     Args:
         dim (int): Number of input channels.
@@ -675,7 +676,7 @@ def create_basic_layter(dim, input_resolution, depth, num_heads, window_size,
     blocks = [SwinTransformerBlock(
                 dim=dim, input_resolution=input_resolution,
                 num_heads=num_heads, window_size=window_size,
-                shift_size=0 if (i % 2 == 0) else window_size // 2,
+                shift_size=0 if ((i + start_id) % 2 == 0) else window_size // 2,
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop, attn_drop=attn_drop,
@@ -782,12 +783,24 @@ class SwinTransformer(PipeStage):
         # stochastic depth
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
         # build layers
+        total_layers = [3, 3, depths[2] + 1, 2]
+        # pipeline split layers
+        start, end = _layer_divisions[self.stage_local_rank]
         layers = []
         for i_layer in range(self.num_layers):
+            layer_start = sum(total_layers[:i_layer])
+            layer_end = sum(total_layers[:i_layer+1])
+            if max(layer_start, start) >= min(layer_end, end):
+                continue
+            have_downsample = start < layer_end and layer_end <= end and i_layer < self.num_layers - 1
+            layer_start_id = max(layer_start, start) - layer_start
+            layer_num = min(layer_end, end) - max(layer_start, start)
+            layer_num = layer_num if not have_downsample else layer_num - 1
+            assert layer_num >= 1
             blocks = create_basic_layter(dim=int(embed_dim * 2 ** i_layer),
                                         input_resolution=(self.patches_resolution[0] // (2 ** i_layer),
                                                           self.patches_resolution[1] // (2 ** i_layer)),
-                                        depth=depths[i_layer],
+                                        depth=layer_num,
                                         num_heads=num_heads[i_layer],
                                         window_size=window_size,
                                         mlp_ratio=self.mlp_ratio,
@@ -795,14 +808,13 @@ class SwinTransformer(PipeStage):
                                         drop=drop_rate, attn_drop=attn_drop_rate,
                                         drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                                         norm_layer=norm_layer,
-                                        downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
-                                        layer_id=i_layer)
+                                        downsample=PatchMerging if have_downsample else None,
+                                        layer_id=i_layer, start_id=layer_start_id)
             layers += blocks
-
-        # pipeline split layers
-        start, end = _layer_divisions[self.stage_local_rank]
-        self.layers = torch.nn.ModuleList(layers[start:end])
-        print_each_rank(f'initialized layers ({len(self.layers)}) ranging from [{start}, {end})')
+        assert (end - start) == len(layers), f"layer num not equal, [{start}, {end}) != {len(layers)} "
+        torch.distributed.barrier()
+        self.layers = torch.nn.ModuleList(layers)
+        print_each_rank(f'initialized {len(self.layers)} layers ranging from [{start}, {end})')
 
         self.inputs_info = self.layers[0].inputs_info
         self.outputs_info = self.layers[-1].outputs_info
@@ -888,11 +900,13 @@ class SwinTransformer(PipeStage):
 
     def flops(self):
         flops = 0
-        flops += self.patch_embed.flops()
+        if self.is_first_stage:
+            flops += self.patch_embed.flops()
         for i, layer in enumerate(self.layers):
             flops += layer.flops()
-        flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
-        flops += self.num_features * self.num_classes
+        if self.is_last_stage:
+            flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
+            flops += self.num_features * self.num_classes
         return flops
 
 
