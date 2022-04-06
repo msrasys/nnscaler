@@ -110,7 +110,7 @@ if len(pp_ranks) != 1:
                 ([241.4] * 2 + [0]) + \
                 ([145.7] * args.layers + [0]) + \
                 ([108.9] * 2)
-    elif args.dim == 1024:  # TP needed
+    elif args.dim >= 1024:  # TP needed
         times = ([255.10] * 2 + [0]) + \
                 ([139.92] * 2 + [0]) + \
                 ([90.98] * args.layers + [0]) + \
