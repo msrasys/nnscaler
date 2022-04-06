@@ -173,7 +173,8 @@ test_hybrid_tp_pp()
 # model scaling test
 test_mix_tp_1f1b  36 5120 32 16
 test_tp           36 5120 32 16
-# test_hybrid_tp_pp 40 5120 32 16  # --> OOM
 # test_hybrid_tp_pp 36 5120 32 16  # --> OOM
+
+# test_mix_tp_1f1b  40 5120 40 16
 
 python scripts/keep.py --gpus 8

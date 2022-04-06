@@ -42,7 +42,7 @@ test_tp()
       --master_port=${REMOTE_MASTER_PORT} \
       handcraft/mbart/train.py \
         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
-        --bs ${bs} --micro-bs 1 \
+        --bs 8 --micro-bs 1 \
         --pp-size 1 --tp-size ${gpus} \
         --schedule 1f1b > ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp.txt
     sleep 5
@@ -119,7 +119,7 @@ test_hybrid_tp_pp()
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --bs ${bs} --micro-bs 1 \
             --pp-size 2 --tp-size 16 \
-            --schedule 1f1b > ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp8pp2.txt
+            --schedule 1f1b > ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp16pp2.txt
         sleep 5
         killall python
         sleep 5
@@ -136,7 +136,7 @@ test_hybrid_tp_pp()
         #     --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
         #     --bs ${bs} --micro-bs 1 \
         #     --pp-size 4 --tp-size 8 \
-        #     --schedule 1f1b > ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp4pp4.txt
+        #     --schedule 1f1b > ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp8pp4.txt
         # sleep 5
         # killall python
         # sleep 5
@@ -153,7 +153,7 @@ test_hybrid_tp_pp()
         #     --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
         #     --bs ${bs} --micro-bs 1 \
         #     --pp-size 8 --tp-size 4 \
-        #     --schedule 1f1b > ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp8pp2.txt
+        #     --schedule 1f1b > ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp4pp8.txt
         # sleep 5
         # killall python
         # sleep 5
@@ -167,8 +167,38 @@ test_hybrid_tp_pp()
 # =================================================
 
 
-# test_hybrid_tp_pp 40 8192 64 32
-test_mix_tp_1f1b  40 8192 64 32
-# test_tp           40 6144 48 32
+test_mix_tp_1f1b  48 6144 32 32
+test_tp           48 6144 32 32
+test_hybrid_tp_pp 48 6144 32 32
 
 python scripts/keep.py --gpus 8
+
+# OOM: --layers 64 --hidden-size 6144 --heads 32
+# OOM: --layers 52 --hidden-size 6144 --heads 32 -- 29.64GB
+# SUC: --layers 48 --hidden-size 6144 --heads 32 -- 29.64GB
+# SUC: --layers 48 --hidden-size 5120 --heads 32
+
+# OMP_NUM_THREADS=4 torchrun \
+#       --nproc_per_node=8 \
+#       --nnodes=4 \
+#       --node_rank=${REMOTE_NODE_RANK} \
+#       --master_addr="${REMOTE_MASTER_IP}" \
+#       --master_port=${REMOTE_MASTER_PORT} \
+#       handcraft/mbart/train.py \
+#         --layers 48 --hidden-size 6144 --heads 32 \
+#         --bs 32 --micro-bs 1 \
+#         --pp-size 32 --tp-size 1 \
+#         --schedule tp1f1b
+# 
+# 
+# OMP_NUM_THREADS=4 torchrun \
+#       --nproc_per_node=8 \
+#       --nnodes=4 \
+#       --node_rank=${REMOTE_NODE_RANK} \
+#       --master_addr="${REMOTE_MASTER_IP}" \
+#       --master_port=${REMOTE_MASTER_PORT} \
+#       handcraft/mbart/train.py \
+#         --layers 52 --hidden-size 6144 --heads 32 \
+#         --bs 4 --micro-bs 1 \
+#         --pp-size 1 --tp-size 32 \
+#         --schedule 1f1b

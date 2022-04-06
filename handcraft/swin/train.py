@@ -125,12 +125,24 @@ if len(pp_ranks) != 1:
     _layer_divisions = layer_division(times, num_stages)
     # specific rules for stage division in order to fit in memory
     if args.dim == 1024 and args.tp_size == 4:
+        # first stage
         if _layer_divisions[0][1] > 8:
             remain_times = times[8:]
             _layer_divisions = [(0, 8)] + layer_division(remain_times, num_stages-1, start_id=8)
+    if args.dim == 1536 and args.tp_size == 8:
+        limits = [None] * args.pp_size
+        limits[0] = 4
+        _layer_divisions = layer_division(times, num_stages, limits=limits)
+    # if args.dim == 1536 and args.tp_size == 4:
+    #     limits = [None] * args.pp_size
+    #     limits[0] = 1
+    #     limits[1] = 3
+    #     limits[2] = 9
+    #     _layer_divisions = layer_division(times, num_stages, limits=limits)
+
 else:
     _layer_divisions = [(0, 2 + 2 + args.layers + 2 + 3)]
-print_each_rank(f'layer divisions: {_layer_divisions}', rank_only=0)
+print_each_rank(f'layer divisions: {_layer_divisions}')
 
 
 class Config:
@@ -796,7 +808,7 @@ class SwinTransformer(PipeStage):
             layer_start_id = max(layer_start, start) - layer_start
             layer_num = min(layer_end, end) - max(layer_start, start)
             layer_num = layer_num if not have_downsample else layer_num - 1
-            assert layer_num >= 1
+            assert layer_num >= 0
             blocks = create_basic_layter(dim=int(embed_dim * 2 ** i_layer),
                                         input_resolution=(self.patches_resolution[0] // (2 ** i_layer),
                                                           self.patches_resolution[1] // (2 ** i_layer)),

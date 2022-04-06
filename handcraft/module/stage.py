@@ -132,7 +132,7 @@ class PipeStage(torch.nn.Module):
         self._data = datas
 
 
-def layer_division(times: List[int], num_stages: int, start_id: int = 0):
+def layer_division(times: List[int], num_stages: int, start_id: int = 0, limits: List[int] = None):
     """
     Computation balance division
     """
@@ -140,10 +140,16 @@ def layer_division(times: List[int], num_stages: int, start_id: int = 0):
     budget = sum(times) / num_stages
     nlayers = len(times)
     start, end = 0, 1
+    if limits is None:
+        limits = [None] * num_stages
+    else:
+        assert len(limits) == num_stages
     for idx in range(num_stages):
         accum = times[start]
         assert end <= nlayers
         while end != nlayers:
+            if limits[idx] is not None and (end - start) == limits[idx]:
+                break
             if times[end] > 0 and budget - accum < 0.5 * times[end]:
                 break
             accum += times[end]
@@ -151,6 +157,8 @@ def layer_division(times: List[int], num_stages: int, start_id: int = 0):
         if idx == num_stages - 1:
             end = nlayers
         divisions.append((start, end))
+        if idx != num_stages - 1:
+            budget = sum(times[end:]) / (num_stages - 1 - idx)
         start, end = end, end+1
     for sid in range(num_stages):
         start, end = divisions[sid]

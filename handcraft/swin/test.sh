@@ -254,3 +254,16 @@ test_naive_tp           42 768 24 8
 # test_naive_hybrid_tp_pp 42 768 24 8  # --> OOM
 
 python scripts/keep.py --gpus 8
+
+
+# for test
+# coshard-pp
+# gpus=4
+# OMP_NUM_THREADS=4 torchrun \
+#     --nproc_per_node=${gpus} \
+#     --nnodes=1 \
+#     handcraft/swin/train.py \
+#       --layers 26 --dim 512 --heads 16 \
+#       --img-size 1536 --window-size 48 \
+#       --pp-size ${gpus} --tp-size 1 --dp-size 1  \
+#       --bs 16 --micro-bs 1 --use-coshard --fp16
