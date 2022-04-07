@@ -51,7 +51,7 @@ test_tp()
       --master_port=${MASTER_PORT} \
       handcraft/mbart/train.py \
         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
-        --bs ${bs} --micro-bs 1 \
+        --bs 16 --micro-bs 1 \
         --pp-size 1 --tp-size ${gpus} \
         --schedule 1f1b > ${evaldir}/${gpus}dev-${arch}-tp.txt
     sleep 5
