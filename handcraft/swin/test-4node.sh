@@ -56,7 +56,7 @@ test_naive_tp()
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size 1 --tp-size ${gpus} --dp-size 1  \
-      --bs ${bs} --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-${arch}-tp${gpus}.txt
+      --bs 16  --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-${arch}-tp${gpus}.txt
   sleep 5
   killall python
   sleep 5
