@@ -1,14 +1,30 @@
 """
 OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=1 \
+    --nnodes=1 \
+    handcraft/gpt3/train.py \
+        --layers 24 --hidden-size 2048 --heads 32 \
+        --dp-size 1 --tp-size 1 --pp-size 1 \
+        --seqlen 8192 --bs 8 --micro-bs 1 --fp16
+
+OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
     handcraft/gpt3/train.py \
-        --layers 16 --hidden-size 1024 --heads 16 \
+        --layers 32 --hidden-size 4096 --heads 32 \
         --dp-size 1 --tp-size 1 --pp-size 4 \
-        --bs 1 --micro-bs 1 --schedule 1f1b
+        --seqlen 1024 --bs 8 --micro-bs 1 --fp16
+
+350M: --layers 24 --hidden-size 1024 --heads 16 \
+1.3B: --layers 24 --hidden-size 2048 --heads 32 \
+2.6B: --layers 32 --hidden-size 2560 --heads 32 \
+6.7B: --layers 32 --hidden-size 4096 --heads 32 \
+15 B: --layers 48 --hidden-size 5120 --heads 32 \
+39 B: --layers 48 --hidden-size 8192 --heads 64 \
 """
 
 import torch
+import torch.utils.checkpoint as checkpoint
 import cube
 import math
 import numpy as np
@@ -37,6 +53,8 @@ parser.add_argument('--hidden-size', type=int, default=1024,
                     help='hidden size')
 parser.add_argument('--heads', type=int, default=16,
                     help='number of heads')
+parser.add_argument('--seqlen', type=int, default=1024,
+                    help='sequence length')
 # training config
 parser.add_argument('--bs', type=int, default=256,
                     help='num of micro batch')
@@ -52,6 +70,10 @@ parser.add_argument('--dp-size', type=int, default=1,
                     help='data parallelism size')
 parser.add_argument('--schedule', type=str, default='1f1b', choices=['1f1b'],
                     help='scheduling algorithm')
+parser.add_argument('--use-coshard', action='store_true', default=False)
+parser.add_argument('--coshard-num', type=int, default=4,
+                    help='if use coshard, the coshard number')
+
 args = parser.parse_args()
 print(args)
 
@@ -111,7 +133,7 @@ if args.schedule == '1f1b' and args.pp_size > 1:
 
 class Config:
     vocab_size = 50273
-    seqlen = 1024
+    seqlen = args.seqlen
     layers = args.layers
     heads = args.heads
     hidden_size = args.hidden_size
@@ -121,20 +143,21 @@ config = Config()
 
 class MLP(torch.nn.Module):
 
-    def __init__(self):
+    def __init__(self, hidden_dim: int = None):
         super().__init__()
-        self.tp_group = None if args.schedule == 'tp1f1b' else _tp_group
+        self.tp_group = _tp_group
         self.tp_size = 1 if self.tp_group == -1 else torch.distributed.get_world_size(self.tp_group)
         
+        hidden_dim = config.hidden_size * 4 if hidden_dim is None else hidden_dim
         self.dense_h_to_4h = torch.nn.Linear(
-            config.hidden_size, config.hidden_size * 4 // self.tp_size
+            config.hidden_size, hidden_dim // self.tp_size
         )
 
         self.dense_4h_to_h = torch.nn.Linear(
-            config.hidden_size * 4 // self.tp_size, config.hidden_size
+            hidden_dim // self.tp_size, config.hidden_size
         )
 
-    def forward(self, hidden_states):
+    def forward_(self, hidden_states):
         if self.tp_size > 1:
             hidden_states = IdentityAllreduce.apply(hidden_states, self.tp_group)
         x = self.dense_h_to_4h(hidden_states)
@@ -144,15 +167,50 @@ class MLP(torch.nn.Module):
             x = AllReduceIdentity.apply(x, self.tp_group)
         return x
 
+    def forward(self, hidden_states, recompute=False):
+        if recompute:
+            x = checkpoint.checkpoint(self.forward_, hidden_states)
+        else:
+            x = self.forward_(hidden_states)
+        return x
 
-class Attention(torch.nn.Module):
+
+class SeqMLP(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.tp_group = None if args.schedule == 'tp1f1b' else _tp_group
+        self.tp_group = _tp_group
         self.tp_size = 1 if self.tp_group == -1 else torch.distributed.get_world_size(self.tp_group)
         
-        self.num_heads = config.heads // self.tp_size
+        coshard = args.coshard_num
+        assert (config.hidden_size * 4) % (self.tp_size * coshard) == 0
+        hidden_dim = config.hidden_size * 4 // coshard
+        self.mlps = torch.nn.ModuleList([MLP(hidden_dim) for _ in range(coshard)])
+        for mlp in self.mlps:
+            mlp.tp_size = 1
+
+    def forward(self, x, recompute=True):
+        if self.tp_size > 1:
+            x = IdentityAllreduce.apply(x, self.tp_group)
+
+        outs = None
+        for mlp in self.mlps:
+            x_out = mlp(x, recompute=recompute)
+            outs = x_out if outs is None else outs + x_out
+
+        if self.tp_size > 1:
+            outs = AllReduceIdentity.apply(outs, self.tp_group)
+        return outs
+
+
+class Attention(torch.nn.Module):
+
+    def __init__(self, num_heads: int = None):
+        super().__init__()
+        self.tp_group = _tp_group
+        self.tp_size = 1 if self.tp_group == -1 else torch.distributed.get_world_size(self.tp_group)
+        
+        self.num_heads = num_heads if num_heads is not None else config.heads // self.tp_size
         self.head_dim = config.hidden_size // config.heads
         projection_size = self.num_heads * self.head_dim
 
@@ -166,29 +224,32 @@ class Attention(torch.nn.Module):
             projection_size, config.hidden_size
         )
 
-    def forward(self, x, mask):
+    def forward_(self, x, mask):
+        # x: [seqlen, bs, hidden], np: head num | hn: head dim
         if self.tp_size > 1:
             x = IdentityAllreduce.apply(x, self.tp_group)
 
+        # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
         mixed_x_layer = self.query_key_value(x)
         new_tensor_shape = mixed_x_layer.size()[:-1] + \
                 (self.num_heads, 3 * self.head_dim)
+        # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
         mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
-
+        # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
         query_layer, key_layer, value_layer = \
             torch.chunk(mixed_x_layer, 3, dim=-1)
         
-        # [b, np, sq, sk]
+        # [b, np, seqlen, seqlen]
         output_size = (query_layer.size(1),
                        query_layer.size(2),
                        query_layer.size(0),
                        key_layer.size(0))
 
-        # [sq, b, np, hn] -> [sq, b * np, hn]
+        # [seqlen, b, np, hn] -> [seqlen, b * np, hn]
         query_layer = query_layer.view(output_size[2],
                                        output_size[0] * output_size[1], -1)
 
-        # [sk, b, np, hn] -> [sk, b * np, hn]
+        # [seqlen, b, np, hn] -> [seqlen, b * np, hn]
         key_layer = key_layer.view(output_size[3],
                                    output_size[0] * output_size[1], -1)
 
@@ -199,17 +260,17 @@ class Attention(torch.nn.Module):
             dtype=query_layer.dtype,
             device=torch.cuda.current_device())
 
-        # Raw attention scores. [b * np, sq, sk]
+        # Raw attention scores. [b * np, seqlen, seqlen]
         matmul_result = torch.baddbmm(
             matmul_result,
-            query_layer.transpose(0, 1),   # [b * np, sq, hn]
-            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+            query_layer.transpose(0, 1),   # [b * np, seqlen, hn]
+            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, seqlen]
             beta=0.0, alpha=(1.0/self.norm_factor))
 
-        # change view to [b, np, sq, sk]
+        # change view to [b, np, seqlen, seqlen]
         attention_scores = matmul_result.view(*output_size)
 
-        # attention scores and attention mask [b, np, sq, sk]
+        # attention scores and attention mask [b, np, seqlen, seqlen]
         if mask is not None:
             attention_scores.masked_fill_(mask, -10000.0)
         attention_probs = self.softmax(attention_scores)
@@ -219,42 +280,79 @@ class Attention(torch.nn.Module):
                        query_layer.size(0),
                        value_layer.size(3))
 
-        # change view [sk, b * np, hn]
+        # change view [seqlen, b * np, hn]
         value_layer = value_layer.view(value_layer.size(0),
                                        output_size[0] * output_size[1], -1)
 
-        # change view [b * np, sq, sk]
+        # change view [b * np, seqlen, seqlen]
         attention_probs = attention_probs.view(output_size[0] * output_size[1],
                                                output_size[2], -1)
 
-        # matmul: [b * np, sq, hn]
+        # matmul: [b * np, seqlen, hn]
         context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
 
-        # change view [b, np, sq, hn]
+        # change view [b, np, seqlen, hn]
         context_layer = context_layer.view(*output_size)
 
-        # [b, np, sq, hn] --> [sq, b, np, hn]
+        # [b, np, seqlen, hn] --> [seqlen, b, np, hn]
         context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
 
-        # [sq, b, np, hn] --> [sq, b, hp]
+        # [seqlen, b, np, hn] --> [seqlen, b, hp]
         new_context_layer_shape = context_layer.size()[:-2] + \
             (self.head_dim * self.num_heads,)
         context_layer = context_layer.view(*new_context_layer_shape)
 
         # =================
-        # Output. [sq, b, h]
+        # Output. [seqlen, b, h]
         # =================
         output = self.dense(context_layer)
         if self.tp_size > 1:
             output = AllReduceIdentity.apply(output, self.tp_group)
         return output
 
+    def forward(self, x, mask, recompute=False):
+        if recompute:
+            x = checkpoint.checkpoint(self.forward_, x, mask)
+        else:
+            x = self.forward_(x, mask)
+        return x
+
+
+class SeqAttention(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.tp_group = _tp_group
+        self.tp_size = 1 if _tp_group == -1 else torch.distributed.get_world_size(_tp_group)
+
+        coshard = args.coshard_num
+        assert config.heads % (coshard * self.tp_size) == 0
+        self.shard_num_heads = config.heads // coshard
+        self.attns = torch.nn.ModuleList(
+            [Attention(self.shard_num_heads) for _ in range(coshard)]
+        )
+        for attn in self.attns:
+            attn._tp_size = 1
+
+    def forward(self, x, mask, recompute=True):
+        if self.tp_size > 1:
+            x = IdentityAllreduce.apply(x, self.tp_group)
+
+        outs = None
+        for attn in self.attns:
+            x_out = attn(x, mask, recompute)
+            outs = x_out if outs is None else outs + x_out
+
+        if self.tp_size > 1:
+            outs = AllReduceIdentity.apply(outs, self.tp_group)
+        return outs
+
 
 class Embedding(torch.nn.Module):
 
     def __init__(self, num_embeddings: int, embedding_dim: int):
         super().__init__()
-        self.tp_group = None if args.schedule == 'tp1f1b' else _tp_group
+        self.tp_group = _tp_group
         self.tp_size = 1 if self.tp_group == -1 else torch.distributed.get_world_size(self.tp_group)
         self.tp_id = 0 if self.tp_group == -1 else torch.distributed.get_rank(self.tp_group)
 
@@ -287,12 +385,21 @@ class TransformerLayer(PipeStage):
     def __init__(self):
         super().__init__()
         self.input_layernorm = torch.nn.LayerNorm(config.hidden_size)
-        self.self_attention = Attention()
+        if args.use_coshard:
+            print('use cosharding attention...')
+            self.self_attention = SeqAttention()
+        else:
+            self.self_attention = Attention()
+
         self.hidden_dropout = 0.0
         self.post_attention_layernorm = torch.nn.LayerNorm(config.hidden_size)
-        self.mlp = MLP()
+        if args.use_coshard:
+            print('use cosharding mlp...')
+            self.mlp = SeqMLP()
+        else:
+            self.mlp = MLP()
 
-        # sq, b, h
+        # seqlen, b, h
         self.inputs_info = (
             ((config.seqlen, args.micro_bs, config.hidden_size),),
             (torch.float16 if args.fp16 else torch.float32,)
@@ -340,7 +447,7 @@ class GPT3(PipeStage):
     def __init__(self):
         super().__init__()
         self.set_pipeline(pp_ranks)
-        self.tp_group = None if args.schedule == 'tp1f1b' else _tp_group
+        self.tp_group = _tp_group
         self.tp_size = 1 if self.tp_group == -1 else torch.distributed.get_world_size(self.tp_group)
 
         inputs_info = None
@@ -389,13 +496,19 @@ class GPT3(PipeStage):
             embeddings = word_embeddings + position_embeddings
             embeddings = self.embedding_dropout(embeddings)
             hidden_states = embeddings
+            # [seqlen, bs, hidden]
             hidden_states = hidden_states.transpose(0, 1).contiguous()
 
 
         assert hidden_states is not None
         _, _, attention_mask, _ = self.data
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask)
+            if args.use_coshard:
+                # inner recompute
+                hidden_states = layer(hidden_states, attention_mask)
+            else:
+                # block recompute
+                hidden_states = checkpoint.checkpoint(layer, hidden_states, attention_mask)
         outputs = hidden_states
 
         # postprocess
@@ -414,7 +527,7 @@ class GPT3(PipeStage):
             # minor changes from
             # https://github.com/NVIDIA/Megatron-LM/blob/e156d2fea7fc5c98e645f7742eb86b643956d840/pretrain_gpt.py#L75
             logits = logits.float()
-            logits = logits.view(config.seqlen, -1)
+            logits = logits.view(args.micro_bs * config.seqlen, -1)
             labels = labels.view(-1)
             loss = torch.nn.functional.cross_entropy(logits, labels)
             outputs = loss
