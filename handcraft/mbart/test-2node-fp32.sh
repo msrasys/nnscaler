@@ -1,6 +1,8 @@
 evaldir=eval/mbart-fp32-v100-32gb
 mkdir -p ${evaldir}
 
+wget https://raw.githubusercontent.com/zhiqi-0/EnvDeployment/master/email/notify.py
+
 bs=256
 
 test_mix_tp_1f1b()
@@ -9,6 +11,8 @@ test_mix_tp_1f1b()
     hidden=$2
     heads=$3
     gpus=$4
+    arch=${gpus}dev-L${layers}E${hidden}H${heads}
+
     echo "testing ${gpus}-dev mixture-1f1b: L${layers}E${hidden}H${heads}"
     OMP_NUM_THREADS=4 torchrun \
       --nproc_per_node=8 \
@@ -20,11 +24,14 @@ test_mix_tp_1f1b()
         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
         --bs ${bs} --micro-bs 1 \
         --pp-size ${gpus} --tp-size 1 \
-        --schedule tp1f1b > ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp1f1b.txt
+        --schedule tp1f1b > ${evaldir}/${gpus}dev-${arch}-tp1f1b.txt
     sleep 5
     killall python
     sleep 5
     killall python
+    python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
+      --msg "Test Results MBart Mixture-1f1b | Node ${Node_RANK} | ${evaldir}/${gpus}dev-${arch}-tp1f1b.txt"
+      --file ${evaldir}/${gpus}dev-${arch}-tp1f1b.txt
 }
 
 test_tp()
@@ -33,6 +40,8 @@ test_tp()
     hidden=$2
     heads=$3
     gpus=$4
+    arch=L${layers}E${hidden}H${heads}
+
     echo "testing ${gpus}-dev pure tp: L${layers}E${hidden}H${heads}"
     OMP_NUM_THREADS=4 torchrun \
       --nproc_per_node=8 \
@@ -44,11 +53,14 @@ test_tp()
         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
         --bs ${bs} --micro-bs 1 \
         --pp-size 1 --tp-size ${gpus} \
-        --schedule 1f1b > ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp.txt
+        --schedule 1f1b > ${evaldir}/${gpus}dev-${arch}-tp.txt
     sleep 5
     killall python
     sleep 5
     killall python
+    python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
+      --msg "Test Results MBart TP | Node Rank ${NODE_RANK} | ${evaldir}/${gpus}dev-${arch}-tp.txt"
+      --file ${evaldir}/${gpus}dev-${arch}-tp.txt
 }
 
 test_pp()
