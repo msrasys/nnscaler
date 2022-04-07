@@ -497,6 +497,11 @@ if __name__ == '__main__':
 
     dataloader = GPT3DataLoader(args.micro_bs)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
+    if _pp_embed_reducer is not None:
+        _pp_embed_reducer.add_param(model.word_embeddings.weight)
+    if _dp_reducer is not None:
+        for param in model.parameters():
+            _dp_reducer.add_param(param)
 
     print_each_rank('model weight consumpition:')
     memory_summary()
@@ -512,12 +517,14 @@ if __name__ == '__main__':
         num_microbatch = args.bs // args.micro_bs
         if args.pp_size > 1:
             _schedule(model, dataloader, num_microbatch)
-            reduce_embed(model, _pp_embed_group)
         else:
             for _ in range(num_microbatch):
                 model.data = next(dataloader)
                 loss = model()
                 loss.backward()
+
+        if _pp_embed_reducer is not None:
+            _pp_embed_reducer.allreduce()
         
         if _dp_reducer is not None:
             _dp_reducer.allreduce()
