@@ -1,9 +1,10 @@
 """
 OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=1 \
+    --nproc_per_node=4 \
     --nnodes=1 \
     handcraft/gpt3/train.py \
-        --layers 4 --hidden-size 1024 --heads 16 \
+        --layers 16 --hidden-size 1024 --heads 16 \
+        --dp-size 1 --tp-size 1 --pp-size 4 \
         --bs 1 --micro-bs 1 --schedule 1f1b
 """
 
@@ -21,7 +22,7 @@ from cube.profiler.memory import memory_summary
 from cube.profiler.timer import print_each_rank
 
 from handcraft.module.schedule import schedule_1f1b
-from handcraft.module.stage import PipeStage
+from handcraft.module.stage import PipeStage, layer_division
 
 import argparse
 
@@ -66,6 +67,7 @@ _layer_divisions = []
 _schedule = schedule_1f1b
 
 _pp_embed_group = -1
+_pp_embed_reducer = None
 cube.init()
 dp_ranks, pp_ranks, tp_ranks= DeviceGroup().create_hybrid(
     [args.dp_size, args.pp_size, args.tp_size]
@@ -88,9 +90,10 @@ if len(pp_ranks) != 1:
     _layer_divisions = layer_division([1] * args.layers, args.pp_size)
 else:
     _layer_divisions = [(0, args.layers)]
+print_each_rank(f'layer divisions: {_layer_divisions}')
 
 if args.schedule == '1f1b' and args.pp_size > 1:
-    grid = np.arange(args.dp_size, args.pp_size * args.tp_size).reshape(
+    grid = np.arange(args.dp_size * args.pp_size * args.tp_size).reshape(
         (args.dp_size, args.pp_size, args.tp_size))
     for dp_rank in range(args.dp_size):
         embed_ranks = np.vstack((grid[dp_rank, 0,  :], grid[dp_rank, -1, :]))
@@ -103,6 +106,7 @@ if args.schedule == '1f1b' and args.pp_size > 1:
             if grank in embed_rank:
                 print(f'rank [{grank}]: embedding group: {embed_rank}')
                 _pp_embed_group = group
+                _pp_embed_reducer = Reducer(embed_rank)
 
 
 class Config:
@@ -291,11 +295,11 @@ class TransformerLayer(PipeStage):
         # sq, b, h
         self.inputs_info = (
             ((config.seqlen, args.micro_bs, config.hidden_size),),
-            (torch.float16 if args.fp16 else torch.float32)
+            (torch.float16 if args.fp16 else torch.float32,)
         )
         self.outputs_info = (
             ((config.seqlen, args.micro_bs, config.hidden_size),),
-            (torch.float16 if args.fp16 else torch.float32)
+            (torch.float16 if args.fp16 else torch.float32,)
         )
 
 
@@ -339,21 +343,39 @@ class GPT3(PipeStage):
         self.tp_group = None if args.schedule == 'tp1f1b' else _tp_group
         self.tp_size = 1 if self.tp_group == -1 else torch.distributed.get_world_size(self.tp_group)
 
+        inputs_info = None
+        outputs_info = None
+
         self.word_embeddings = None
         if self.is_first_stage:
+            print(f'rank [{torch.distributed.get_rank()}]: initializing preprocess...')
             self.word_embeddings = Embedding(config.vocab_size, config.hidden_size)
             self.position_embeddings = torch.nn.Embedding(
                 config.seqlen, config.hidden_size
             )
             self.embedding_dropout = torch.nn.Dropout(0.0)
+            
+            inputs_info = ((), ()) if inputs_info is None else inputs_info
 
         start, end = _layer_divisions[self.stage_local_rank]
+        print_each_rank(f'initializing layers [{start}, {end})...')
         layers = [TransformerLayer() for _ in range(end - start)]
         self.layers = torch.nn.ModuleList(layers)
 
+        inputs_info = self.layers[0].inputs_info if inputs_info is None else inputs_info
+        outputs_info = self.layers[-1].outputs_info
+
         if self.is_last_stage:
+            print(f'rank [{torch.distributed.get_rank()}]: initializing postprocess...')
             self.word_embeddings = Embedding(config.vocab_size, config.hidden_size) if self.word_embeddings is None else self.word_embeddings
             self.final_layernorm = torch.nn.LayerNorm(config.hidden_size)
+            outputs_info = ((1,), (torch.float32,))
+        
+        assert inputs_info is not None
+        assert outputs_info is not None
+        self.inputs_info = inputs_info
+        self.outputs_info = outputs_info
+        print_each_rank(f'stage: inputs: {inputs_info} | outputs: {outputs_info}')
 
     def forward(self, hidden_states = None):
         # data
