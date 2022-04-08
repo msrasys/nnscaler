@@ -3,6 +3,8 @@
 evaldir=eval/swin-coshard
 mkdir -p ${evaldir}
 
+rm -f notify.py
+wget https://raw.githubusercontent.com/zhiqi-0/EnvDeployment/master/email/notify.py
 
 img_size=1536
 window_size=48
@@ -16,6 +18,7 @@ test_naive_pp()
   heads=$3
   nodes=$4
   gpus=$5
+  arch=L${layers}E${dim}H${heads}-${img_size}
 
   echo "testing ${gpus}-dev: Pure PP${coshard}: L${layers}E${dim}H${heads}"
   OMP_NUM_THREADS=4 torchrun \
@@ -28,11 +31,14 @@ test_naive_pp()
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size ${gpus} --tp-size 1 --dp-size 1  \
-      --bs ${bs} --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-pp${gpus}.txt
+      --bs ${bs} --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-${arch}-pp${gpus}.txt
   sleep 5
   killall python
   sleep 5
   killall python
+  python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
+    --msg "Test Results Swin PP | Node ${NODE_RANK} | ${evaldir}/${gpus}dev-${arch}-pp${gpus}.txt" \
+    --file ${evaldir}/${gpus}dev-${arch}-pp${gpus}.txt
 }
 
 test_naive_tp()
@@ -42,6 +48,7 @@ test_naive_tp()
   heads=$3
   nodes=$4
   gpus=$5
+  arch=L${layers}E${dim}H${heads}-${img_size}
 
   echo "testing ${gpus}-dev: Pure TP: L${layers}E${dim}H${heads}"
   OMP_NUM_THREADS=4 torchrun \
@@ -54,11 +61,14 @@ test_naive_tp()
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size 1 --tp-size ${gpus} --dp-size 1  \
-      --bs ${bs} --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp${gpus}.txt
+      --bs 16 --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-${arch}-tp${gpus}.txt
   sleep 5
   killall python
   sleep 5
   killall python
+  python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
+    --msg "Test Results Swin TP | Node ${NODE_RANK} | ${evaldir}/${gpus}dev-${arch}-tp${gpus}.txt" \
+    --file ${evaldir}/${gpus}dev-${arch}-tp${gpus}.txt
 }
 
 test_naive_hybrid_tp_pp()
@@ -76,9 +86,9 @@ test_naive_hybrid_tp_pp()
     OMP_NUM_THREADS=4 torchrun \
       --nproc_per_node=8 \
       --nnodes=${nodes} \
-      --node_rank=${NODE_RANK} \
-      --master_addr="${MASTER_IP}" \
-      --master_port=${MASTER_PORT} \
+      --node_rank=${REMOTE_NODE_RANK} \
+      --master_addr="${REMOTE_MASTER_IP}" \
+      --master_port=${REMOTE_MASTER_PORT} \
       handcraft/swin/train.py \
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
@@ -93,9 +103,9 @@ test_naive_hybrid_tp_pp()
     OMP_NUM_THREADS=4 torchrun \
       --nproc_per_node=8 \
       --nnodes=${nodes} \
-      --node_rank=${NODE_RANK} \
-      --master_addr="${MASTER_IP}" \
-      --master_port=${MASTER_PORT} \
+      --node_rank=${REMOTE_NODE_RANK} \
+      --master_addr="${REMOTE_MASTER_IP}" \
+      --master_port=${REMOTE_MASTER_PORT} \
       handcraft/swin/train.py \
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
@@ -169,9 +179,9 @@ test_coshard_hybrid_tp_pp()
     OMP_NUM_THREADS=4 torchrun \
       --nproc_per_node=8 \
       --nnodes=${nodes} \
-      --node_rank=${NODE_RANK} \
-      --master_addr="${MASTER_IP}" \
-      --master_port=${MASTER_PORT} \
+      --node_rank=${REMOTE_NODE_RANK} \
+      --master_addr="${REMOTE_MASTER_IP}" \
+      --master_port=${REMOTE_MASTER_PORT} \
       handcraft/swin/train.py \
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
@@ -182,6 +192,9 @@ test_coshard_hybrid_tp_pp()
     killall python
     sleep 5
     killall python
+    python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
+        --msg "Test Results Swin TP4-PP4+Coshard | Node ${NODE_RANK} | ${evaldir}/${gpus}dev-${arch}-tp4pp4-coshard.txt" \
+        --file ${evaldir}/${gpus}dev-${arch}-tp4pp4-coshard.txt
   fi
 }
 

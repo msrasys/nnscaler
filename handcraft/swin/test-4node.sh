@@ -8,6 +8,9 @@ img_size=1536
 window_size=48
 bs=256
 
+rm -f notify.py
+wget https://raw.githubusercontent.com/zhiqi-0/EnvDeployment/master/email/notify.py
+
 
 test_naive_pp()
 {
@@ -22,9 +25,9 @@ test_naive_pp()
   OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=8 \
     --nnodes=${nodes} \
-    --node_rank=${REMOTE_NODE_RANK} \
-    --master_addr="${REMOTE_MASTER_IP}" \
-    --master_port=${REMOTE_MASTER_PORT} \
+    --node_rank=${NODE_RANK} \
+    --master_addr="${MASTER_IP}" \
+    --master_port=${MASTER_PORT} \
     handcraft/swin/train.py \
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
@@ -49,9 +52,9 @@ test_naive_tp()
   OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=8 \
     --nnodes=${nodes} \
-    --node_rank=${REMOTE_NODE_RANK} \
-    --master_addr="${REMOTE_MASTER_IP}" \
-    --master_port=${REMOTE_MASTER_PORT} \
+    --node_rank=${NODE_RANK} \
+    --master_addr="${MASTER_IP}" \
+    --master_port=${MASTER_PORT} \
     handcraft/swin/train.py \
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
@@ -61,6 +64,9 @@ test_naive_tp()
   killall python
   sleep 5
   killall python
+  python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
+    --msg "Test Results Swin TP | Node ${NODE_RANK} | ${evaldir}/${gpus}dev-${arch}-tp${gpus}.txt" \
+    --file ${evaldir}/${gpus}dev-${arch}-tp${gpus}.txt
 }
 
 test_naive_hybrid_tp_pp()
@@ -79,9 +85,9 @@ test_naive_hybrid_tp_pp()
     OMP_NUM_THREADS=4 torchrun \
       --nproc_per_node=8 \
       --nnodes=${nodes} \
-      --node_rank=${REMOTE_NODE_RANK} \
-      --master_addr="${REMOTE_MASTER_IP}" \
-      --master_port=${REMOTE_MASTER_PORT} \
+      --node_rank=${NODE_RANK} \
+      --master_addr="${MASTER_IP}" \
+      --master_port=${MASTER_PORT} \
       handcraft/swin/train.py \
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
@@ -97,9 +103,9 @@ test_naive_hybrid_tp_pp()
     # OMP_NUM_THREADS=4 torchrun \
     #   --nproc_per_node=8 \
     #   --nnodes=${nodes} \
-    #   --node_rank=${REMOTE_NODE_RANK} \
-    #   --master_addr="${REMOTE_MASTER_IP}" \
-    #   --master_port=${REMOTE_MASTER_PORT} \
+    #   --node_rank=${NODE_RANK} \
+    #   --master_addr="${MASTER_IP}" \
+    #   --master_port=${MASTER_PORT} \
     #   handcraft/swin/train.py \
     #     --layers ${layers} --dim ${dim} --heads ${heads} \
     #     --img-size ${img_size} --window-size ${window_size} \
@@ -121,13 +127,13 @@ test_coshard_pp()
   gpus=$5
   arch=L${layers}E${dim}H${heads}-${img_size}
 
-  echo "testing ${gpus}-dev: Pure TP: L${layers}E${dim}H${heads}"
+  echo "testing ${gpus}-dev: Coshard PP: L${layers}E${dim}H${heads}"
   OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=8 \
     --nnodes=${nodes} \
-    --node_rank=${REMOTE_NODE_RANK} \
-    --master_addr="${REMOTE_MASTER_IP}" \
-    --master_port=${REMOTE_MASTER_PORT} \
+    --node_rank=${NODE_RANK} \
+    --master_addr="${MASTER_IP}" \
+    --master_port=${MASTER_PORT} \
     handcraft/swin/train.py \
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
@@ -138,6 +144,9 @@ test_coshard_pp()
   killall python
   sleep 5
   killall python
+  python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
+    --msg "Test Results Swin Coshard PP | Node ${NODE_RANK} | ${evaldir}/${gpus}dev-${arch}-pp${gpus}-coshard.txt" \
+    --file ${evaldir}/${gpus}dev-${arch}-pp${gpus}-coshard.txt
 }
 
 test_coshard_hybrid_tp_pp()
@@ -156,9 +165,9 @@ test_coshard_hybrid_tp_pp()
     # OMP_NUM_THREADS=4 torchrun \
     #   --nproc_per_node=8 \
     #   --nnodes=${nodes} \
-    #   --node_rank=${REMOTE_NODE_RANK} \
-    #   --master_addr="${REMOTE_MASTER_IP}" \
-    #   --master_port=${REMOTE_MASTER_PORT} \
+    #   --node_rank=${NODE_RANK} \
+    #   --master_addr="${MASTER_IP}" \
+    #   --master_port=${MASTER_PORT} \
     #   handcraft/swin/train.py \
     #     --layers ${layers} --dim ${dim} --heads ${heads} \
     #     --img-size ${img_size} --window-size ${window_size} \
@@ -174,9 +183,9 @@ test_coshard_hybrid_tp_pp()
     OMP_NUM_THREADS=4 torchrun \
       --nproc_per_node=8 \
       --nnodes=${nodes} \
-      --node_rank=${REMOTE_NODE_RANK} \
-      --master_addr="${REMOTE_MASTER_IP}" \
-      --master_port=${REMOTE_MASTER_PORT} \
+      --node_rank=${NODE_RANK} \
+      --master_addr="${MASTER_IP}" \
+      --master_port=${MASTER_PORT} \
       handcraft/swin/train.py \
         --layers ${layers} --dim ${dim} --heads ${heads} \
         --img-size ${img_size} --window-size ${window_size} \
@@ -187,14 +196,17 @@ test_coshard_hybrid_tp_pp()
     killall python
     sleep 5
     killall python
+    python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
+    --msg "Test Results Swin Coshard TP8-PP4 | Node ${NODE_RANK} | ${evaldir}/${gpus}dev-${arch}-pp${gpus}-coshard.txt" \
+    --file ${evaldir}/${gpus}dev-${arch}-pp${gpus}-coshard.txt
 
     # echo "testing coshard ${gpus}-dev: TP4-PP8: L${layers}E${dim}H${heads}"
     # OMP_NUM_THREADS=4 torchrun \
     #   --nproc_per_node=8 \
     #   --nnodes=${nodes} \
-    #   --node_rank=${REMOTE_NODE_RANK} \
-    #   --master_addr="${REMOTE_MASTER_IP}" \
-    #   --master_port=${REMOTE_MASTER_PORT} \
+    #   --node_rank=${NODE_RANK} \
+    #   --master_addr="${MASTER_IP}" \
+    #   --master_port=${MASTER_PORT} \
     #   handcraft/swin/train.py \
     #     --layers ${layers} --dim ${dim} --heads ${heads} \
     #     --img-size ${img_size} --window-size ${window_size} \
@@ -248,9 +260,9 @@ python scripts/keep.py --gpus 8
 # OMP_NUM_THREADS=4 torchrun \
 #       --nproc_per_node=8 \
 #       --nnodes=4 \
-#       --node_rank=${REMOTE_NODE_RANK} \
-#       --master_addr="${REMOTE_MASTER_IP}" \
-#       --master_port=${REMOTE_MASTER_PORT} \
+#       --node_rank=${NODE_RANK} \
+#       --master_addr="${MASTER_IP}" \
+#       --master_port=${MASTER_PORT} \
 #       handcraft/swin/train.py \
 #         --layers ${layers} --dim ${dim} --heads ${heads} \
 #         --img-size 1536 --window-size 48 \
@@ -262,9 +274,9 @@ python scripts/keep.py --gpus 8
 # OMP_NUM_THREADS=4 torchrun \
 #   --nproc_per_node=8 \
 #   --nnodes=4 \
-#   --node_rank=${REMOTE_NODE_RANK} \
-#   --master_addr="${REMOTE_MASTER_IP}" \
-#   --master_port=${REMOTE_MASTER_PORT} \
+#   --node_rank=${NODE_RANK} \
+#   --master_addr="${MASTER_IP}" \
+#   --master_port=${MASTER_PORT} \
 #   handcraft/swin/train.py \
 #     --layers ${layers} --dim ${dim} --heads ${heads} \
 #     --img-size 1536 --window-size 48 \
@@ -275,9 +287,9 @@ python scripts/keep.py --gpus 8
 # OMP_NUM_THREADS=4 torchrun \
 #   --nproc_per_node=8 \
 #   --nnodes=4 \
-#   --node_rank=${REMOTE_NODE_RANK} \
-#   --master_addr="${REMOTE_MASTER_IP}" \
-#   --master_port=${REMOTE_MASTER_PORT} \
+#   --node_rank=${NODE_RANK} \
+#   --master_addr="${MASTER_IP}" \
+#   --master_port=${MASTER_PORT} \
 #   handcraft/swin/train.py \
 #     --layers ${layers} --dim ${dim} --heads ${heads} \
 #     --img-size 1536 --window-size 48 \

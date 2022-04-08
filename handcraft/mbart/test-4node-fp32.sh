@@ -3,6 +3,9 @@ mkdir -p ${evaldir}
 
 bs=256
 
+rm -f notify.py
+wget https://raw.githubusercontent.com/zhiqi-0/EnvDeployment/master/email/notify.py
+
 test_mix_tp_1f1b()
 {
     layers=$1
@@ -13,9 +16,9 @@ test_mix_tp_1f1b()
     OMP_NUM_THREADS=4 torchrun \
       --nproc_per_node=8 \
       --nnodes=4 \
-      --node_rank=${REMOTE_NODE_RANK} \
-      --master_addr="${REMOTE_MASTER_IP}" \
-      --master_port=${REMOTE_MASTER_PORT} \
+      --node_rank=${NODE_RANK} \
+      --master_addr="${MASTER_IP}" \
+      --master_port=${MASTER_PORT} \
       handcraft/mbart/train.py \
         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
         --bs ${bs} --micro-bs 1 \
@@ -25,6 +28,9 @@ test_mix_tp_1f1b()
     killall python
     sleep 5
     killall python
+    python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
+      --msg "Test Results MBart Mixture-1f1b | Node ${NODE_RANK} | ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp1f1b.txt" \
+      --file ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp1f1b.txt
 }
 
 test_tp()
@@ -37,9 +43,9 @@ test_tp()
     OMP_NUM_THREADS=4 torchrun \
       --nproc_per_node=8 \
       --nnodes=4 \
-      --node_rank=${REMOTE_NODE_RANK} \
-      --master_addr="${REMOTE_MASTER_IP}" \
-      --master_port=${REMOTE_MASTER_PORT} \
+      --node_rank=${NODE_RANK} \
+      --master_addr="${MASTER_IP}" \
+      --master_port=${MASTER_PORT} \
       handcraft/mbart/train.py \
         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
         --bs 8 --micro-bs 1 \
@@ -49,6 +55,9 @@ test_tp()
     killall python
     sleep 5
     killall python
+    python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
+      --msg "Test Results MBart Pure TP | Node ${NODE_RANK} | ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp.txt" \
+      --file ${evaldir}/${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp.txt
 }
 
 test_pp()
@@ -61,9 +70,9 @@ test_pp()
     OMP_NUM_THREADS=4 torchrun \
       --nproc_per_node=8 \
       --nnodes=4 \
-      --node_rank=${REMOTE_NODE_RANK} \
-      --master_addr="${REMOTE_MASTER_IP}" \
-      --master_port=${REMOTE_MASTER_PORT} \
+      --node_rank=${NODE_RANK} \
+      --master_addr="${MASTER_IP}" \
+      --master_port=${MASTER_PORT} \
       handcraft/mbart/train.py \
         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
         --bs ${bs} --micro-bs 1 \
@@ -85,9 +94,9 @@ test_pp_swap()
     OMP_NUM_THREADS=4 torchrun \
       --nproc_per_node=8 \
       --nnodes=4 \
-      --node_rank=${REMOTE_NODE_RANK} \
-      --master_addr="${REMOTE_MASTER_IP}" \
-      --master_port=${REMOTE_MASTER_PORT} \
+      --node_rank=${NODE_RANK} \
+      --master_addr="${MASTER_IP}" \
+      --master_port=${MASTER_PORT} \
       handcraft/mbart/train.py \
         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
         --bs ${bs} --micro-bs 1 \
@@ -112,9 +121,9 @@ test_hybrid_tp_pp()
         OMP_NUM_THREADS=4 torchrun \
           --nproc_per_node=8 \
           --nnodes=4 \
-          --node_rank=${REMOTE_NODE_RANK} \
-          --master_addr="${REMOTE_MASTER_IP}" \
-          --master_port=${REMOTE_MASTER_PORT} \
+          --node_rank=${NODE_RANK} \
+          --master_addr="${MASTER_IP}" \
+          --master_port=${MASTER_PORT} \
           handcraft/mbart/train.py \
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --bs ${bs} --micro-bs 1 \
@@ -124,14 +133,17 @@ test_hybrid_tp_pp()
         killall python
         sleep 5
         killall python
+        python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
+          --msg "Test Results MBart TP16-PP2 | Node ${NODE_RANK} | ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp16pp2.txt" \
+          --file ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp16pp2.txt
 
         # echo "testing ${gpus}-dev tp:pp=8:4 | L${layers}E${hidden}H${heads}"
         # OMP_NUM_THREADS=4 torchrun \
         #   --nproc_per_node=8 \
         #   --nnodes=4 \
-        #   --node_rank=${REMOTE_NODE_RANK} \
-        #   --master_addr="${REMOTE_MASTER_IP}" \
-        #   --master_port=${REMOTE_MASTER_PORT} \
+        #   --node_rank=${NODE_RANK} \
+        #   --master_addr="${MASTER_IP}" \
+        #   --master_port=${MASTER_PORT} \
         #   handcraft/mbart/mbart_hybrid.py \
         #     --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
         #     --bs ${bs} --micro-bs 1 \
@@ -146,9 +158,9 @@ test_hybrid_tp_pp()
         # OMP_NUM_THREADS=4 torchrun \
         #   --nproc_per_node=8 \
         #   --nnodes=4 \
-        #   --node_rank=${REMOTE_NODE_RANK} \
-        #   --master_addr="${REMOTE_MASTER_IP}" \
-        #   --master_port=${REMOTE_MASTER_PORT} \
+        #   --node_rank=${NODE_RANK} \
+        #   --master_addr="${MASTER_IP}" \
+        #   --master_port=${MASTER_PORT} \
         #   handcraft/mbart/mbart_hybrid.py \
         #     --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
         #     --bs ${bs} --micro-bs 1 \
@@ -181,9 +193,9 @@ python scripts/keep.py --gpus 8
 # OMP_NUM_THREADS=4 torchrun \
 #       --nproc_per_node=8 \
 #       --nnodes=4 \
-#       --node_rank=${REMOTE_NODE_RANK} \
-#       --master_addr="${REMOTE_MASTER_IP}" \
-#       --master_port=${REMOTE_MASTER_PORT} \
+#       --node_rank=${NODE_RANK} \
+#       --master_addr="${MASTER_IP}" \
+#       --master_port=${MASTER_PORT} \
 #       handcraft/mbart/train.py \
 #         --layers 48 --hidden-size 6144 --heads 32 \
 #         --bs 32 --micro-bs 1 \
@@ -194,9 +206,9 @@ python scripts/keep.py --gpus 8
 # OMP_NUM_THREADS=4 torchrun \
 #       --nproc_per_node=8 \
 #       --nnodes=4 \
-#       --node_rank=${REMOTE_NODE_RANK} \
-#       --master_addr="${REMOTE_MASTER_IP}" \
-#       --master_port=${REMOTE_MASTER_PORT} \
+#       --node_rank=${NODE_RANK} \
+#       --master_addr="${MASTER_IP}" \
+#       --master_port=${MASTER_PORT} \
 #       handcraft/mbart/train.py \
 #         --layers 52 --hidden-size 6144 --heads 32 \
 #         --bs 4 --micro-bs 1 \

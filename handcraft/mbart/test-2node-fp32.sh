@@ -1,6 +1,7 @@
 evaldir=eval/mbart-fp32-v100-32gb
 mkdir -p ${evaldir}
 
+rm -f notify.py
 wget https://raw.githubusercontent.com/zhiqi-0/EnvDeployment/master/email/notify.py
 
 bs=256
@@ -11,7 +12,7 @@ test_mix_tp_1f1b()
     hidden=$2
     heads=$3
     gpus=$4
-    arch=${gpus}dev-L${layers}E${hidden}H${heads}
+    arch=L${layers}E${hidden}H${heads}
 
     echo "testing ${gpus}-dev mixture-1f1b: L${layers}E${hidden}H${heads}"
     OMP_NUM_THREADS=4 torchrun \
@@ -30,7 +31,7 @@ test_mix_tp_1f1b()
     sleep 5
     killall python
     python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
-      --msg "Test Results MBart Mixture-1f1b | Node ${Node_RANK} | ${evaldir}/${gpus}dev-${arch}-tp1f1b.txt"
+      --msg "Test Results MBart Mixture-1f1b | Node ${NODE_RANK} | ${evaldir}/${gpus}dev-${arch}-tp1f1b.txt" \
       --file ${evaldir}/${gpus}dev-${arch}-tp1f1b.txt
 }
 
@@ -59,7 +60,7 @@ test_tp()
     sleep 5
     killall python
     python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
-      --msg "Test Results MBart TP | Node Rank ${NODE_RANK} | ${evaldir}/${gpus}dev-${arch}-tp.txt"
+      --msg "Test Results MBart TP | Node Rank ${NODE_RANK} | ${evaldir}/${gpus}dev-${arch}-tp.txt" \
       --file ${evaldir}/${gpus}dev-${arch}-tp.txt
 }
 

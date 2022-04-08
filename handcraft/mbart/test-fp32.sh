@@ -32,7 +32,7 @@ test_tp()
     OMP_NUM_THREADS=4 torchrun --nproc_per_node=${gpus} --nnodes=1 \
         handcraft/mbart/train.py \
         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
-        --bs ${bs} --micro-bs 1 \
+        --bs 16 --micro-bs 1 \
         --pp-size 1 --tp-size ${gpus} \
         --schedule 1f1b > ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp.txt
     sleep 5
