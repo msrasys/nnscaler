@@ -210,7 +210,7 @@ class Attention(torch.nn.Module):
         self.tp_group = _tp_group
         self.tp_size = 1 if self.tp_group == -1 else torch.distributed.get_world_size(self.tp_group)
         
-        self.num_heads = num_heads if num_heads is not None else config.heads // self.tp_size
+        self.num_heads = (config.heads if num_heads is None else num_heads) // self.tp_size
         self.head_dim = config.hidden_size // config.heads
         projection_size = self.num_heads * self.head_dim
 
@@ -332,7 +332,7 @@ class SeqAttention(torch.nn.Module):
             [Attention(self.shard_num_heads) for _ in range(coshard)]
         )
         for attn in self.attns:
-            attn._tp_size = 1
+            attn.tp_size = 1
 
     def forward(self, x, mask, recompute=True):
         if self.tp_size > 1:
