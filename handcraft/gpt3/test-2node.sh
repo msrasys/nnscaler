@@ -96,7 +96,24 @@ test_hybrid()
     gpus=$5
     arch=L${layers}E${hidden}H${heads}-seq${seqlen}
 
-    echo "testing hybrid: dp:pp=2:8 : ${arch}"
+    # echo "testing hybrid: dp:pp=2:8 : ${arch}"
+    # OMP_NUM_THREADS=4 torchrun \
+    #     --nproc_per_node=8 \
+    #     --nnodes=2 \
+    #     --node_rank=${NODE_RANK} \
+    #     --master_addr="${MASTER_IP}" \
+    #     --master_port=${MASTER_PORT} \
+    #     handcraft/gpt3/train.py \
+    #         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
+    #         --dp-size 2 --pp-size 8 \
+    #         --seqlen ${seqlen} --bs  ${bs} --micro-bs 1 \
+    #         --fp16 > ${evaldir}/${gpus}dev-${arch}-dp2pp8.txt
+    # sleep 5
+    # killall python
+    # sleep 5
+    # killall python
+
+    echo "testing hybrid: tp:pp=2:8 : ${arch}"
     OMP_NUM_THREADS=4 torchrun \
         --nproc_per_node=8 \
         --nnodes=2 \
@@ -105,9 +122,9 @@ test_hybrid()
         --master_port=${MASTER_PORT} \
         handcraft/gpt3/train.py \
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
-            --dp-size 2 --pp-size 8 \
+            --tp-size 2 --pp-size 8 \
             --seqlen ${seqlen} --bs  ${bs} --micro-bs 1 \
-            --fp16 > ${evaldir}/${gpus}dev-${arch}-dp2pp8.txt
+            --fp16 > ${evaldir}/${gpus}dev-${arch}-tp2pp8.txt
     sleep 5
     killall python
     sleep 5
@@ -267,7 +284,7 @@ test_hybrid_coshard()
 }
 
 # 15B
-test_pp             48 5120 32 8192 16
+test_hybrid         48 5120 32 8192 16
 test_hybrid_coshard 48 5120 32 8192 16
 
 # ===========================
@@ -298,5 +315,9 @@ test_hybrid_coshard 48 5120 32 8192 16
 
 # 15B
 # test_hybrid         48 5120 32 4096 16  -> pp8tp2 15.62GB
-# test_hybrid         48 5120 32 8192 16 # OOM
-# test_hybrid_coshard 48 5120 32 8192 16
+# test_hybrid         48 5120 32 8192 16 # pp-dp OOM, pp8tp2: can run
+# test_pp             48 5120 32 8192 16 # OOM
+# test_hybrid_coshard 48 5120 32 8192 16 # can run
+# test_hybrid         48 5120 32 6144 16 # pp8dp2 can run
+# test_hybrid         32 4096 32 12288 16 # pp8dp2 OOM, pp8tp2 25.10G
+# test_pp             32 4096 32 12288 16 # OOM
