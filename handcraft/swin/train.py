@@ -1031,6 +1031,9 @@ def train():
         if step >= 2:
             CudaTimer().stop('e2e')
 
+        torch.cuda.empty_cache()
+        torch.distributed.barrier()
+
         if step == 0:
             print_each_rank('memory consumption after optimizer:', rank_only=0)
             memory_summary()
