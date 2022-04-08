@@ -26,7 +26,7 @@ test_pp()
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --pp-size ${gpus} --tp-size 1 \
             --seqlen ${seqlen} --bs ${bs} --micro-bs 1 \
-            --fp16 # > ${evaldir}/${gpus}dev-${arch}-pp.txt
+            --fp16 > ${evaldir}/${gpus}dev-${arch}-pp.txt
     sleep 5
     killall python
     sleep 5
@@ -53,7 +53,7 @@ test_pp_coshard()
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --pp-size ${gpus} --tp-size 1 \
             --seqlen ${seqlen} --bs ${bs} --micro-bs 1 --fp16 \
-            --use-coshard --coshard-num 8 # > ${evaldir}/${gpus}dev-${arch}-pp-coshard.txt
+            --use-coshard --coshard-num 8 > ${evaldir}/${gpus}dev-${arch}-pp-coshard.txt
     sleep 5
     killall python
     sleep 5
@@ -80,7 +80,7 @@ test_tp()
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --pp-size ${gpus} --tp-size 1 \
             --seqlen ${seqlen} --bs 16 --micro-bs 1 \
-            --fp16 # > ${evaldir}/${gpus}dev-${arch}-tp.txt
+            --fp16 > ${evaldir}/${gpus}dev-${arch}-tp.txt
     sleep 5
     killall python
     sleep 5
@@ -107,7 +107,7 @@ test_hybrid()
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --dp-size 2 --pp-size 8 \
             --seqlen ${seqlen} --bs  ${bs} --micro-bs 1 \
-            --fp16 # > ${evaldir}/${gpus}dev-${arch}-dp2pp8.txt
+            --fp16 > ${evaldir}/${gpus}dev-${arch}-dp2pp8.txt
     sleep 5
     killall python
     sleep 5
@@ -124,7 +124,7 @@ test_hybrid()
     #         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
     #         --dp-size 4 --pp-size 4 \
     #         --seqlen ${seqlen} --bs ${bs} --micro-bs 1 \
-    #         --fp16 # > ${evaldir}/${gpus}dev-${arch}-dp4pp4.txt
+    #         --fp16 > ${evaldir}/${gpus}dev-${arch}-dp4pp4.txt
     # sleep 5
     # killall python
     # sleep 5
@@ -141,7 +141,7 @@ test_hybrid()
     #         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
     #         --dp-size 8 --pp-size 2 \
     #         --seqlen ${seqlen} --bs ${bs} --micro-bs 1 \
-    #         --fp16 # > ${evaldir}/${gpus}dev-${arch}-dp8pp2.txt
+    #         --fp16 > ${evaldir}/${gpus}dev-${arch}-dp8pp2.txt
     # sleep 5
     # killall python
     # sleep 5
@@ -169,7 +169,7 @@ test_dp()
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --dp-size ${gpus} --pp-size 1 --tp-size 1 \
             --seqlen ${seqlen} --bs 16 --micro-bs 1 \
-            --fp16 # > ${evaldir}/${gpus}dev-${arch}-dp.txt
+            --fp16 > ${evaldir}/${gpus}dev-${arch}-dp.txt
     sleep 5
     killall python
     sleep 5
@@ -196,7 +196,7 @@ test_dp_coshard()
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --dp-size ${gpus} --pp-size 1 --tp-size 1 \
             --seqlen ${seqlen} --bs ${bs} --micro-bs 1 --fp16 \
-            --use-coshard --coshard-num 8 # > ${evaldir}/${gpus}dev-${arch}-dp-coshard.txt
+            --use-coshard --coshard-num 8 > ${evaldir}/${gpus}dev-${arch}-dp-coshard.txt
     sleep 5
     killall python
     sleep 5
@@ -224,7 +224,7 @@ test_hybrid_coshard()
     #         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
     #         --dp-size 2 --pp-size 8 \
     #         --seqlen ${seqlen} --bs  ${bs} --micro-bs 1 \
-    #         --fp16 --use-coshard --coshard-num 8 # > ${evaldir}/${gpus}dev-${arch}-dp2pp8-coshard.txt
+    #         --fp16 --use-coshard --coshard-num 8 > ${evaldir}/${gpus}dev-${arch}-dp2pp8-coshard.txt
     # sleep 5
     # killall python
     # sleep 5
@@ -241,7 +241,7 @@ test_hybrid_coshard()
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --dp-size 4 --pp-size 4 \
             --seqlen ${seqlen} --bs ${bs} --micro-bs 1 \
-            --fp16 --use-coshard --coshard-num 8 # > ${evaldir}/${gpus}dev-${arch}-dp4pp4-coshard.txt
+            --fp16 --use-coshard --coshard-num 8 > ${evaldir}/${gpus}dev-${arch}-dp4pp4-coshard.txt
     sleep 5
     killall python
     sleep 5
@@ -258,7 +258,7 @@ test_hybrid_coshard()
     #         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
     #         --dp-size 8 --pp-size 2 \
     #         --seqlen ${seqlen} --bs ${bs} --micro-bs 1 \
-    #         --fp16 --use-coshard --coshard-num 8 # > ${evaldir}/${gpus}dev-${arch}-dp4pp4-coshard.txt
+    #         --fp16 --use-coshard --coshard-num 8 > ${evaldir}/${gpus}dev-${arch}-dp4pp4-coshard.txt
     # sleep 5
     # killall python
     # sleep 5
