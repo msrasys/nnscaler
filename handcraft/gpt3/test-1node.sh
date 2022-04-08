@@ -4,7 +4,7 @@
 evaldir=eval/gpt3-coshard-v100-32gb
 mkdir -p ${evaldir}
 
-bs=8
+bs=256
 
 test_pp()
 {
@@ -97,7 +97,7 @@ test_hybrid()
                 --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
                 --pp-size 2 --dp-size 2 \
                 --seqlen ${seqlen} --bs  ${bs} --micro-bs 1 \
-                --fp16 > ${evaldir}/${gpus}dev-${arch}-tp2pp2.txt
+                --fp16 > ${evaldir}/${gpus}dev-${arch}-dp2pp2.txt
         sleep 5
         killall python
         sleep 5
@@ -114,13 +114,13 @@ test_hybrid()
         #         --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
         #         --dp-size 4 --pp-size 2 \
         #         --seqlen ${seqlen} --bs  ${bs} --micro-bs 1 \
-        #         --fp16 > ${evaldir}/${gpus}dev-${arch}-tp4pp2.txt
+        #         --fp16 > ${evaldir}/${gpus}dev-${arch}-dp4pp2.txt
         # sleep 5
         # killall python
         # sleep 5
         # killall python
 
-        echo "testing hybrid: tp:pp=2:4 : ${arch}"
+        echo "testing hybrid: dp:pp=2:4 : ${arch}"
         OMP_NUM_THREADS=4 torchrun \
             --nproc_per_node=${gpus} \
             --nnodes=1 \
@@ -128,7 +128,7 @@ test_hybrid()
                 --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
                 --dp-size 2 --pp-size 4 \
                 --seqlen ${seqlen} --bs ${bs} --micro-bs 1 \
-                --fp16 > ${evaldir}/${gpus}dev-${arch}-tp2pp4.txt
+                --fp16 > ${evaldir}/${gpus}dev-${arch}-dp2pp4.txt
         sleep 5
         killall python
         sleep 5
@@ -205,7 +205,7 @@ test_hybrid_coshard()
                 --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
                 --dp-size 2 --pp-size 2 \
                 --seqlen ${seqlen} --bs  ${bs} --micro-bs 1 \
-                --fp16  --use-coshard --coshard-num 8 > ${evaldir}/${gpus}dev-${arch}-tp2pp2-coshard.txt
+                --fp16  --use-coshard --coshard-num 8 > ${evaldir}/${gpus}dev-${arch}-dp2pp2-coshard.txt
         sleep 5
         killall python
         sleep 5
@@ -222,7 +222,7 @@ test_hybrid_coshard()
                 --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
                 --dp-size 4 --pp-size 2 \
                 --seqlen ${seqlen} --bs  ${bs} --micro-bs 1 \
-                --fp16 --use-coshard --coshard-num 8 > ${evaldir}/${gpus}dev-${arch}-tp4pp2-coshard.txt
+                --fp16 --use-coshard --coshard-num 8 > ${evaldir}/${gpus}dev-${arch}-dp4pp2-coshard.txt
         sleep 5
         killall python
         sleep 5
@@ -236,7 +236,7 @@ test_hybrid_coshard()
                 --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
                 --dp-size 2 --pp-size 4 \
                 --seqlen ${seqlen} --bs ${bs} --micro-bs 1 \
-                --fp16 --use-coshard --coshard-num 8 > ${evaldir}/${gpus}dev-${arch}-tp2pp4.txt
+                --fp16 --use-coshard --coshard-num 8 > ${evaldir}/${gpus}dev-${arch}-dp2pp4-coshard.txt
         sleep 5
         killall python
         sleep 5
