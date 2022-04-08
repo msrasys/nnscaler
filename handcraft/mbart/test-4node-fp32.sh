@@ -57,7 +57,7 @@ test_tp()
     killall python
     python notify.py --sender zhiqi.0@qq.com --code uyakwgslumknbfgg --recver zhiqi.0@outlook.com \
       --msg "Test Results MBart Pure TP | Node ${NODE_RANK} | ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp.txt" \
-      --file ${evaldir}/${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp.txt
+      --file ${evaldir}/${gpus}dev-L${layers}E${hidden}H${heads}-tp.txt
 }
 
 test_pp()
