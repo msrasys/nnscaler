@@ -648,6 +648,9 @@ if __name__ == '__main__':
         if step >= 2:
             CudaTimer().stop('e2e')
 
+        torch.cuda.empty_cache()
+        torch.distributed.barrier()
+
         if step == 0:
             print_each_rank('memory after optimizer:', rank_only=0)
             memory_summary()
