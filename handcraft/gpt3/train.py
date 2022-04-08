@@ -386,7 +386,7 @@ class TransformerLayer(PipeStage):
         super().__init__()
         self.input_layernorm = torch.nn.LayerNorm(config.hidden_size)
         if args.use_coshard:
-            print('use cosharding attention...')
+            # print('use cosharding attention...')
             self.self_attention = SeqAttention()
         else:
             self.self_attention = Attention()
@@ -394,7 +394,7 @@ class TransformerLayer(PipeStage):
         self.hidden_dropout = 0.0
         self.post_attention_layernorm = torch.nn.LayerNorm(config.hidden_size)
         if args.use_coshard:
-            print('use cosharding mlp...')
+            # print('use cosharding mlp...')
             self.mlp = SeqMLP()
         else:
             self.mlp = MLP()

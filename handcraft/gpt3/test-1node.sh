@@ -4,7 +4,7 @@
 evaldir=eval/gpt3-coshard-v100-32gb
 mkdir -p ${evaldir}
 
-bs=256
+bs=8
 
 test_pp()
 {
@@ -252,7 +252,6 @@ test_hybrid     32 2560 32 12288 4
 # 6.7B
 test_hybrid         32 4096 32 8192 8  # pp2dp4 OOM, pp4dp2: 26.06GB
 test_hybrid_coshard 32 4096 32 8192 8  # pp2dp4: 20.4GB
-test_pp_coshard 32 4096 32 12288 8 #  16.73GB
 test_hybrid_coshard 32 4096 32 12288 8 # pp2dp4: OOM, dp2pp4: 25.17GB
 
 
@@ -281,3 +280,5 @@ test_hybrid_coshard 32 4096 32 12288 8 # pp2dp4: OOM, dp2pp4: 25.17GB
 # test_pp     32 4096 32 12288 8 # OOM
 # test_pp_coshard 32 4096 32 12288 8 #  16.73GB
 # test_hybrid_coshard 32 4096 32 12288 8 # dp4pp2 OOM, dp2pp4: 25.17GB
+
+# 15B
