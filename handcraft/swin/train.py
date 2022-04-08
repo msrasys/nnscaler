@@ -1010,10 +1010,6 @@ def train():
     iter_num = 6
     for step in range(iter_num):
 
-        # if step == 0:
-        #     model.data = next(dataloader)
-        #     model_summary(model, (), rank_only=1)
-
         if step >= 2:
             CudaTimer(enable=True).start('e2e')
 
@@ -1030,6 +1026,9 @@ def train():
 
         if step >= 2:
             CudaTimer().stop('e2e')
+
+        torch.cuda.empty_cache()
+        torch.distributed.barrier()
 
         if step == 0:
             print_each_rank('memory consumption after optimizer:', rank_only=0)

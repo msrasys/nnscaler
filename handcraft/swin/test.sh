@@ -45,7 +45,7 @@ test_naive_tp()
       --layers ${layers} --dim ${dim} --heads ${heads} \
       --img-size ${img_size} --window-size ${window_size} \
       --pp-size 1 --tp-size ${gpus} --dp-size 1  \
-      --bs ${bs} --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp${gpus}.txt
+      --bs 16 --micro-bs 1 --fp16 > ${evaldir}/${gpus}dev-L${layers}E${dim}H${heads}-${img_size}-tp${gpus}.txt
   sleep 5
   killall python
   sleep 5
@@ -244,7 +244,6 @@ test_coshard_dp         18 256 8  2
 test_naive_tp           18 256 8  2
 test_naive_hybrid_tp_pp 18 256 8  2
 
-test_coshard_dp         26 512 16 4
 test_coshard_pp         26 512 16 4
 test_naive_tp           26 512 16 4
 # test_naive_hybrid_tp_pp 26 512 16 4  # --> OOM
