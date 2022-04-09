@@ -35,22 +35,23 @@ def keep(rank, args):
     a = torch.rand((8192, 8192)).cuda()
     b = torch.rand((8192, 8192)).cuda()
 
+    print(f'benchmarking {args.gpus} gpus...')
     while True:
         tic = time.time()
         for _ in range(5000):
             c = a * b
         torch.cuda.synchronize()
         toc = time.time()
-        if rank == 0:
-            print('benchmark 8K matmul: time span: {}ms'.format((toc - tic) * 1000 / 5000))
+        # if rank == 0:
+        #     print('benchmark 8K matmul: time span: {}ms'.format((toc - tic) * 1000 / 5000))
         time.sleep(args.interval)
         while True:
             util = get_gpu_util(rank)
             if util <= 10:
                 break
-            print('rank {}: find gpu busy, keep sleeping...'.format(rank))
+            # print('rank {}: find gpu busy, keep sleeping...'.format(rank))
             time.sleep(args.interval)
-        print('rank {} gets up'.format(rank))
+        # print('rank {} gets up'.format(rank))
 
 
 if __name__ == '__main__':
