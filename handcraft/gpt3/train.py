@@ -627,7 +627,7 @@ if __name__ == '__main__':
             CudaTimer(enable=True).start('e2e')
 
         # train 1 step
-        num_microbatch = args.bs // args.micro_bs
+        num_microbatch = args.bs // (args.micro_bs * args.dp_size)
         if args.pp_size > 1:
             _schedule(model, dataloader, num_microbatch)
         else:
