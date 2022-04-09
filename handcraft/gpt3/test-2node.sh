@@ -1,7 +1,7 @@
 ####
 # 2-Node Model Scaling Test
 ####
-evaldir=eval/gpt3-coshard-v100-32gb
+evaldir=eval/gpt3-coshard-v100-16gb
 mkdir -p ${evaldir}
 
 bs=256
@@ -50,7 +50,7 @@ test_hybrid_coshard()
     tp=$8
     arch=L${layers}E${hidden}H${heads}-seq${seqlen}
 
-    echo "testing coshard hybrid: dp:pp=${dp}:${pp}:${tp} : ${arch}"
+    echo "testing coshard hybrid: dp:pp:tp=${dp}:${pp}:${tp} : ${arch}"
     OMP_NUM_THREADS=4 torchrun \
         --nproc_per_node=8 \
         --nnodes=2 \
@@ -90,7 +90,7 @@ test_hybrid_coshard 32 4096 32 4096 16 4 4 1 # dp4pp4 10.45, dp8pp2 OOM
 test_hybrid         32 4096 32 8192 16 1 8 2 # dp4pp4 OOM dp2pp8 OOM pp16 OOM pp8tp2 13.46GB
 test_hybrid_coshard 32 4096 32 8192 16 4 4 1 # dp4pp4 14.38
 # test_hybrid         32 4096 32 12288 16 1 1 16 # pp8tp2 OOM pp4tp4 OOM pp2tp8 OOM pp1tp16 OOM
-test_hybrid_coshard   32 4096 32 12288 16 2 4 2 # dp2pp8 OOM dp2pp4tp2 13.31GB
+test_hybrid_coshard   32 4096 32 12288 16 1 4 4 # dp2pp8 OOM dp2pp4tp2 13.31GB
 
 
 # ===========================
