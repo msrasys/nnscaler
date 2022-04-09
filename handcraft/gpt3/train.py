@@ -91,6 +91,9 @@ _schedule = schedule_1f1b
 _pp_embed_group = -1
 _pp_embed_reducer = None
 cube.init()
+print_each_rank('setting memory constraints to 16GB')
+torch.cuda.set_per_process_memory_fraction(0.5)
+
 dp_ranks, pp_ranks, tp_ranks= DeviceGroup().create_hybrid(
     [args.dp_size, args.pp_size, args.tp_size]
 )
@@ -174,6 +177,14 @@ class MLP(torch.nn.Module):
             x = self.forward_(hidden_states)
         return x
 
+    def flops(self):
+        mlp_flops = dict(
+            fc1=config.seqlen * config.hidden_size * config.hidden_size * 4 // self.tp_size,
+            gelu=8 * config.seqlen * config.hidden_size * 4 // self.tp_size,
+            fc2=config.seqlen * (config.hidden_size * 4 // self.tp_size) * config.hidden_size,
+        )
+        return sum(mlp_flops.values())
+
 
 class SeqMLP(torch.nn.Module):
 
@@ -201,6 +212,9 @@ class SeqMLP(torch.nn.Module):
         if self.tp_size > 1:
             outs = AllReduceIdentity.apply(outs, self.tp_group)
         return outs
+
+    def flops(self):
+        return sum([mlp.flops() for mlp in self.mlps])
 
 
 class Attention(torch.nn.Module):
@@ -317,6 +331,19 @@ class Attention(torch.nn.Module):
             x = self.forward_(x, mask)
         return x
 
+    def flops(self):
+        seqlen = config.seqlen
+        attn_flops = dict(
+            kqv=3 * seqlen * config.hidden_size * self.head_dim * self.num_heads,
+            kqv_bias=3 * seqlen * self.head_dim * self.num_heads,
+            q_scale=seqlen * self.num_heads * self.head_dim, # (N h) L d, 1 -> (N h) L d
+            attn_score=self.num_heads * seqlen * self.head_dim * seqlen, # (N h) L d, (N h) d L -> (N h) L L
+            attn_softmax=5 * self.num_heads * seqlen * seqlen, # (N h) L L
+            attn_output=self.num_heads * seqlen * seqlen * self.head_dim, # (N h) L L, (N h) L d -> (N h) L d
+            out_proj=seqlen * self.num_heads * self.head_dim * config.hidden_size, # L N (h d), E (h d)  -> L N E
+        )
+        return sum(attn_flops.values())
+
 
 class SeqAttention(torch.nn.Module):
 
@@ -346,6 +373,9 @@ class SeqAttention(torch.nn.Module):
         if self.tp_size > 1:
             outs = AllReduceIdentity.apply(outs, self.tp_group)
         return outs
+
+    def flops(self):
+        return sum([attn.flops() for attn in self.attns])
 
 
 class Embedding(torch.nn.Module):
@@ -427,6 +457,20 @@ class TransformerLayer(PipeStage):
         output = torch.nn.functional.dropout(attention_output, p=self.hidden_dropout, training=self.training)
         output = layernorm_input + residual
         return output
+
+    def flops(self):
+        seqlen = config.seqlen
+        transformer_flops = dict(
+            attn_layer_norm=5 * seqlen * config.hidden_size, # (L, N, E)
+            attn=self.self_attention.flops(),
+            dropout=seqlen * config.hidden_size, # (L, N, E)
+            attn_residual=seqlen * config.hidden_size,
+            fc_layer_norm=5 * seqlen * config.hidden_size, # (L, N, E)
+            mlp=self.mlp.flops(),
+            fc_dropout=seqlen * config.hidden_size,
+            fc_residual=seqlen * config.hidden_size,
+        )
+        return sum(transformer_flops.values())
 
 
 class Pooler(torch.nn.Module):
@@ -534,6 +578,18 @@ class GPT3(PipeStage):
 
         return outputs
 
+    def flops(self):
+        flops = 0
+        if self.is_first_stage:
+            # ignore
+            flops += 0
+        # transformer layers
+        flops += sum([t.flops() for t in self.layers])
+        if self.is_last_stage:
+            # logits
+            flops += config.seqlen * config.hidden_size * config.vocab_size 
+        return flops
+
 
 class GPT3DataLoader(cube.runtime.syndata.CubeDataLoader):
 
@@ -599,13 +655,29 @@ class GPT3DataLoader(cube.runtime.syndata.CubeDataLoader):
         return attention_mask, loss_mask, position_ids
 
 
+def get_alpa_tflops():
+    batch_size = 1
+    seq_len = config.seqlen
+    hidden_size = config.hidden_size
+    num_layers = config.layers
+    vocab_size = config.vocab_size
+    factor = 96 # if checkpoint_activations else 72
+    total_flop = factor * batch_size * seq_len * (hidden_size ** 2) * num_layers * \
+          (1 + seq_len / (6 * hidden_size)) \
+          + 6 * batch_size * seq_len * hidden_size * vocab_size
+    # Note: if we use dot to compute forward embedding
+    # then the last term in total_flops should be
+    # "+ 10 * batch_size * seq_len * hidden_size * vocab_size".
+    tflops = total_flop / 1e12 # total_flop / latency / num_gpus / 1e12
+    return tflops
+
+
 if __name__ == '__main__':
 
+    print_each_rank(f'alpa calculated TFLOPs: {get_alpa_tflops()}', rank_only=0)
     model = GPT3()
     nparams = sum([param.numel() for param in model.parameters()])
-    # forward_flops = model.flops()
-    tflops = 0 # forward_flops * 4 / 1e12 # forward + re-compute forward + backward (=2 forward flops)
-    print_each_rank(f'model params (M): {nparams / 1e6}  | TFLOPs: {tflops}.  Launching model...')
+    print_each_rank(f'model params (M): {nparams / 1e6}. Launching model...')
     model = model.half().cuda() if args.fp16 else model.cuda()
 
     dataloader = GPT3DataLoader(args.micro_bs)

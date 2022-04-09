@@ -21,7 +21,7 @@ test_naive()
         handcraft/gpt3/train.py \
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --seqlen ${seqlen} --bs ${bs} --micro-bs 1 \
-            --fp16 > ${evaldir}/1dev-${arch}-naive.txt
+            --fp16 # > ${evaldir}/1dev-${arch}-naive.txt
     sleep 5
     killall python
     sleep 5
@@ -43,7 +43,7 @@ test_coshard()
         handcraft/gpt3/train.py \
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --seqlen ${seqlen} --bs ${bs} --micro-bs 1 --fp16 \
-            --use-coshard --coshard-num 8 > ${evaldir}/1dev-${arch}-coshard.txt
+            --use-coshard --coshard-num 8 # > ${evaldir}/1dev-${arch}-coshard.txt
     sleep 5
     killall python
     sleep 5
@@ -51,16 +51,21 @@ test_coshard()
 }
 
 
+test_naive   48 5120 32 2048
+test_naive   48 5120 32 4096
+test_naive   48 5120 32 8192
+test_naive   48 5120 32 12288
+
 # test_naive 24 2048 32 2048
 # test_naive 24 2048 32 4096
 # test_naive 24 2048 32 8192
-# # test_naive 24 2048 32 12288  # --> OOM
-# # test_naive 24 2048 32 16384  # --> OOM
+# # test_naive 24 2048 32 12288  # --# > OOM
+# # test_naive 24 2048 32 16384  # --# > OOM
 # 
 # test_coshard 24 2048 32 2048
 # test_coshard 24 2048 32 4096
 # test_coshard 24 2048 32 8192
-test_coshard 24 2048 32 12288
+# test_coshard 24 2048 32 12288
 # test_coshard 24 2048 32 16384
 # test_coshard 24 2048 32 20480
 # test_coshard 24 2048 32 24576

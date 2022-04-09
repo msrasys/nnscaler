@@ -30,7 +30,7 @@ test_hybrid()
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --dp-size ${dp} --pp-size ${pp} --tp-size ${tp} \
             --seqlen ${seqlen} --bs  ${bs} --micro-bs 1 \
-            --fp16 # > ${evaldir}/${gpus}dev-${arch}-dp${dp}pp${pp}tp${tp}.txt
+            --fp16 > ${evaldir}/${gpus}dev-${arch}-dp${dp}pp${pp}tp${tp}.txt
     sleep 5
     killall python
     sleep 5
@@ -61,7 +61,7 @@ test_hybrid_coshard()
             --layers ${layers} --hidden-size ${hidden} --heads ${heads} \
             --dp-size ${dp} --pp-size ${pp} --tp-size ${tp} \
             --seqlen ${seqlen} --bs ${bs} --micro-bs 1 \
-            --fp16 --use-coshard --coshard-num 8 # > ${evaldir}/${gpus}dev-${arch}-dp${dp}pp${pp}tp${tp}-coshard.txt
+            --fp16 --use-coshard --coshard-num 8 > ${evaldir}/${gpus}dev-${arch}-dp${dp}pp${pp}tp${tp}-coshard.txt
     sleep 5
     killall python
     sleep 5
@@ -70,20 +70,28 @@ test_hybrid_coshard()
 
 # 15B
 
-test_hybrid         48 5120 32 2048 16 4 4 1  # dp8pp2 OOM dp4pp4 18.91GB
-test_hybrid_coshard 48 5120 32 2048 16 4 4 1 # dp4pp4 20.93
+# test_hybrid         48 5120 32 2048 16 4 4 1  # dp8pp2 OOM dp4pp4 18.91GB
+# test_hybrid_coshard 48 5120 32 2048 16 4 4 1 # dp4pp4 20.93
+# 
+# test_hybrid         48 5120 32 4096 16 4 4 1 # dp4pp4 15.62
+# test_hybrid_coshard 48 5120 32 4096 16 4 4 1 # dp4pp4 20.93
+# 
+# test_hybrid         48 5120 32 8192 16 1 8 2 # pp8tp2 # pp2tp2 17.17GB
+# test_hybrid_coshard 48 5120 32 8192 16 4 4 1 # dp4pp4 # dp4pp4 26.73GB
+# 
+# test_hybrid         48 5120 32 12288 16 1 4 4 # pp8tp2 OOM pp4tp4 20.29GB
+# test_hybrid_coshard 48 5120 32 12288 16 2 8 1 # dp4pp4 OOM dp2pp8 26.88GB
 
-# test_hybrid         48 5120 32 4096 16 16 1 1 # pp16
-# test_hybrid         48 5120 32 4096 16 1 1 16 # tp16
-test_hybrid         48 5120 32 4096 16 4 4 1 # dp4pp4 15.62
-test_hybrid_coshard 48 5120 32 4096 16 4 4 1 # dp4pp4 20.93
+# 6.7B 251.35 TFLOPS
+test_hybrid         32 4096 32 2048 16 4 4 1 # dp8pp2 OOM dp4pp4 9.29GB
+test_hybrid_coshard 32 4096 32 2048 16 4 4 1 # dp4pp4 
+test_hybrid         32 4096 32 4096 16 4 4 1 # dp8pp2 OOM, dp4pp4 13.05GB
+test_hybrid_coshard 32 4096 32 4096 16 4 4 1 # dp4pp4 10.45, dp8pp2 OOM
+test_hybrid         32 4096 32 8192 16 1 8 2 # dp4pp4 OOM dp2pp8 OOM pp16 OOM pp8tp2 13.46GB
+test_hybrid_coshard 32 4096 32 8192 16 4 4 1 # dp4pp4 14.38
+# test_hybrid         32 4096 32 12288 16 1 1 16 # pp8tp2 OOM pp4tp4 OOM pp2tp8 OOM pp1tp16 OOM
+test_hybrid_coshard   32 4096 32 12288 16 2 4 2 # dp2pp8 OOM dp2pp4tp2 13.31GB
 
-# test_hybrid         48 5120 32 8192 16 16 1 1 # pp16 OOM
-test_hybrid         48 5120 32 8192 16 1 8 2 # pp8tp2 # pp2tp2 17.17GB
-test_hybrid_coshard 48 5120 32 8192 16 4 4 1 # dp4pp4 # dp4pp4 26.73GB
-
-test_hybrid         48 5120 32 12288 16 1 4 4 # pp8tp2 OOM pp4tp4 20.29GB
-test_hybrid_coshard 48 5120 32 12288 16 2 8 1 # dp4pp4 OOM dp2pp8 26.88GB
 
 # ===========================
 
@@ -102,3 +110,6 @@ test_hybrid_coshard 48 5120 32 12288 16 2 8 1 # dp4pp4 OOM dp2pp8 26.88GB
 
 # test_hybrid         48 5120 32 12288 16 1 4 4 # pp8tp2 OOM pp4tp4 20.29GB
 # test_hybrid_coshard 48 5120 32 12288 16 2 8 1 # dp4pp4 OOM dp2pp8 26.88GB
+
+python scripts/keep.py --gpus 8
+killall python
