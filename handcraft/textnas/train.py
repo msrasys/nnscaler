@@ -19,6 +19,7 @@ from cube.profiler.memory import memory_summary
 
 from handcraft.textnas.ops import ConvBN, LinearCombine, AvgPool, MaxPool, RNN, Attention, BatchNorm, GlobalMaxPool, GlobalAvgPool
 from handcraft.textnas.dataloader import SharedDataLoader
+from handcraft.module.stage import layer_division
 
 
 cube.init()
@@ -29,7 +30,9 @@ parser.add_argument('--schedule', type=str, default='replicate', choices=['repli
 parser.add_argument('--models', type=int, default=1,
                     help='number of models to be trained in total')
 parser.add_argument('--bs', type=int, default=128,
-                    help='num of micro batch')
+                    help='number of micro batch (default: paper setting)')
+parser.add_argument('--non-uniform', action='store_true', default=False,
+                    help='use non-uniform partition that Bert-allocated GPU can also have models')
 args = parser.parse_args()
 print(args)
 
@@ -43,10 +46,16 @@ if args.schedule == 'replicate':
         _model_divisions[-1-idx] += 1
 if args.schedule == 'pipe':
     num_trainers = DeviceGroup().world_size - 1
-    num_model_per_device = args.models // num_trainers
-    _model_divisions = [0] + [num_model_per_device] * num_trainers
-    for idx in range(args.models % num_trainers):
-        _model_divisions[-1-idx] += 1
+    if args.non_uniform:
+        times = [160.65] + [78.79] * args.models
+        _model_divisions = layer_division(times, DeviceGroup().world_size)
+        _model_divisions = [end-start for start, end in _model_divisions]
+        _model_divisions[0] -= 1
+    else:
+        num_model_per_device = args.models // num_trainers
+        _model_divisions = [0] + [num_model_per_device] * num_trainers
+        for idx in range(args.models % num_trainers):
+            _model_divisions[-1-idx] += 1
 print_each_rank(f'model number placements: {_model_divisions}')
 
 
@@ -228,7 +237,12 @@ if __name__ == '__main__':
     for step in range(iter_num):
         if step >= 8:
             CudaTimer(enable=True).start('e2e')
-
+        # if args.schedule == 'replicate':
+        #     # retiarii baseline
+        #     for _ in range(len(models)):
+        #         text, masks, labels = next(dataloader)
+        # else:
+        #     text, masks, labels = next(dataloader)
         text, masks, labels = next(dataloader)
         for model, optimizer in zip(models, optimizers):
             CudaTimer().start('nas-model')
@@ -237,6 +251,17 @@ if __name__ == '__main__':
             optimizer.step()
             optimizer.zero_grad()
             CudaTimer().stop('nas-model')
+
+        # CudaTimer().start('nas-model')
+        # losses = []
+        # for model in models:
+        #     losses.append(model(text, masks, labels))
+        # for loss in losses:
+        #     loss.backward()
+        # for optimizer in optimizers:
+        #     optimizer.step()
+        #     optimizer.zero_grad()
+        # CudaTimer().stop('nas-model')
         
         if step >= 8:
             CudaTimer().stop('e2e')
