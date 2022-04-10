@@ -47,7 +47,7 @@ if args.schedule == 'replicate':
 if args.schedule == 'pipe':
     num_trainers = DeviceGroup().world_size - 1
     if args.non_uniform:
-        times = [160.65] + [78.79] * args.models
+        times = [160] + [80] * args.models
         _model_divisions = layer_division(times, DeviceGroup().world_size)
         _model_divisions = [end-start for start, end in _model_divisions]
         _model_divisions[0] -= 1
@@ -224,7 +224,6 @@ if __name__ == '__main__':
         dataloader = SharedDataLoader(args.bs, replicate=False)
     else:
         assert False
-    dataloader = iter(dataloader)
     
     # initialize optimizer
     optimizers = [
@@ -233,9 +232,10 @@ if __name__ == '__main__':
 
     CudaTimer(enable=False)
     torch.distributed.barrier()
-    iter_num = 32
+    dataloader = iter(dataloader)
+    iter_num = 64
     for step in range(iter_num):
-        if step >= 8:
+        if step >= 16:
             CudaTimer(enable=True).start('e2e')
         # if args.schedule == 'replicate':
         #     # retiarii baseline
@@ -263,7 +263,7 @@ if __name__ == '__main__':
         #     optimizer.zero_grad()
         # CudaTimer().stop('nas-model')
         
-        if step >= 8:
+        if step >= 16:
             CudaTimer().stop('e2e')
 
         if step == 0:
@@ -275,6 +275,6 @@ if __name__ == '__main__':
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-8, field_name='e2e')))
-    CudaTimer().print_all(times=iter_num-8)
+          CudaTimer().duration(iter_num-16, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num-16)
     memory_summary()
