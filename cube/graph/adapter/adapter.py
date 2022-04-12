@@ -352,10 +352,38 @@ class IRAdapter(IRCell):
                 remote.append(ptensor)
 
         # first check local in tensor
-        if otensor in local:
-            intersections.append(otensor)
-            inputs.append(otensor)
-            return inputs, intersections, prims
+        for tensor in local:
+            common = tensor.common(otensor)
+            if tensor == otensor:
+                intersections.append(tensor)
+                inputs.append(tensor)
+                return inputs, intersections, prims
+            elif common == otensor:
+                # index map
+                indmap = list()
+                islicers = tensor.indmap.get()
+                oslicers = common.indmap.get()
+                for islicer, oslicer in zip(islicers, oslicers):
+                    istart, istop, istep = islicer.start, islicer.stop, islicer.step
+                    ostart, ostop, ostep = oslicer.start, oslicer.stop, oslicer.step
+                    # relative offset
+                    start = ostart - istart
+                    stop = start + ostop - ostart
+                    slicer = slice(start, stop, ostep)
+                    indmap.append(slicer)
+                # value map must be same
+                if tensor.valmap != common.valmap:
+                    break
+                valmap = ValueMap(0, 1)
+                prim = SelectPrim(tensor, indmap, valmap, common.shape, common)
+                prims.append(prim)
+                intersections.append(otensor)
+                inputs.append(tensor)
+                return inputs, intersections, prims
+        # if otensor in local:
+        #     intersections.append(otensor)
+        #     inputs.append(otensor)
+        #     return inputs, intersections, prims
         
         # check local + remote
         for itensor in local_and_remote: #local + remote:
