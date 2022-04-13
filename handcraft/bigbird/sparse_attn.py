@@ -4,29 +4,104 @@ https://papers.nips.cc/paper/2020/file/c8512d142a2d849725f31a9a7a361ab9-Paper.pd
 
 Understanding blog:
 https://github.com/huggingface/blog/blob/main/big-bird.md
+
+
+OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=1 \
+    --nnodes=1 \
+    handcraft/bigbird/sparse_attn.py \
+        --hidden-size 4096 --heads 32 --seqlen 4096 \
+        --bs 8 --fp16
 """
 
 import torch
+import torch.nn as nn
 import cube
+import math
+import numpy as np
+
+import argparse
+from cube.runtime.device import DeviceGroup
+from cube.profiler import CudaTimer
+from cube.profiler.memory import memory_summary
+from cube.profiler.timer import print_each_rank
+
+
+
+parser = argparse.ArgumentParser(description='sparse_attention')
+
+parser.add_argument('--hidden-size', type=int, default=4096,
+                    help='hidden size')
+parser.add_argument('--heads', type=int, default=32,
+                    help='number of heads')
+parser.add_argument('--seqlen', type=int, default=3096,
+                    help='sequence length')
+parser.add_argument('--blk-size', type=int, default=64,
+                    help='sequence length')
+# training config
+parser.add_argument('--bs', type=int, default=256,
+                    help='num of micro batch')
+parser.add_argument('--fp16', action='store_true', default=False)
+parser.add_argument('--sparse', action='store_true', default=False)
+args = parser.parse_args()
+print(args)
+cube.init()
+
 
 class Config:
 
-    num_attention_heads = 32
-    hidden_size = 4096
+    num_attention_heads = args.heads
+    hidden_size = args.hidden_size
     all_head_sie = hidden_size
-    max_position_embeddings = 4096 # seqlen
+    seqlen = args.seqlen # seqlen
     num_random_blocks = 3
-    block_size=4
+    block_size=args.blk_size
     use_bias = True
 
 config = Config()
+
+
+def create_mask():
+    batch_size = args.bs
+    seq_length = config.seqlen
+    block_size = config.block_size
+    attention_mask = torch.ones(((batch_size, seq_length)), device=torch.cuda.current_device())
+    assert (
+        seq_length % block_size == 0
+    ), f"Sequence length must be multiple of block size, but sequence length is {seq_length}, while block size is {block_size}."
+
+    def create_band_mask_from_inputs(from_blocked_mask, to_blocked_mask):
+        """
+        Create 3D attention mask from a 2D tensor mask.
+        Args:
+            from_blocked_mask: 2D Tensor of shape [batch_size,
+            from_seq_length//from_block_size, from_block_size].
+            to_blocked_mask: int32 Tensor of shape [batch_size,
+            to_seq_length//to_block_size, to_block_size].
+        Returns:
+            float Tensor of shape [batch_size, 1, from_seq_length//from_block_size-4, from_block_size,
+            3*to_block_size].
+        """
+        exp_blocked_to_pad = torch.cat(
+            [to_blocked_mask[:, 1:-3], to_blocked_mask[:, 2:-2], to_blocked_mask[:, 3:-1]], dim=2
+        )
+        band_mask = torch.einsum("blq,blk->blqk", from_blocked_mask[:, 2:-2], exp_blocked_to_pad)
+        band_mask.unsqueeze_(1)
+        return band_mask
+
+    blocked_encoder_mask = attention_mask.view(batch_size, seq_length // block_size, block_size)
+    band_mask = create_band_mask_from_inputs(blocked_encoder_mask, blocked_encoder_mask)
+    from_mask = attention_mask.view(batch_size, 1, seq_length, 1)
+    to_mask = attention_mask.view(batch_size, 1, 1, seq_length)
+    return blocked_encoder_mask, band_mask, from_mask, to_mask
+
 
 
 class BigBirdBlockSparseAttention(nn.Module):
     def __init__(self, seed=None):
         super().__init__()
 
-        self.max_seqlen = config.max_position_embeddings
+        self.max_seqlen = config.seqlen
         self.seed = seed
 
         if config.hidden_size % config.num_attention_heads != 0:
@@ -51,17 +126,10 @@ class BigBirdBlockSparseAttention(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
-    def forward(
-        self,
-        hidden_states,
-        band_mask=None,
-        from_mask=None,
-        to_mask=None,
-        from_blocked_mask=None,
-        to_blocked_mask=None,
-        output_attentions=None,
-    ):
+    def forward(self, hidden_states):
         # Currently this `class` can't be used in decoder.
+        blocked_mask, band_mask, from_mask, to_mask = create_mask()
+        from_blocked_mask = to_blocked_mask = blocked_mask
 
         batch_size, seqlen, _ = hidden_states.size()
         to_seq_length = from_seq_length = seqlen
@@ -74,7 +142,7 @@ class BigBirdBlockSparseAttention(nn.Module):
         key_layer = self.transpose_for_scores(self.key(hidden_states))
         value_layer = self.transpose_for_scores(self.value(hidden_states))
 
-        context_layer, attention_probs = self.bigbird_block_sparse_attention(
+        context_layer = self.bigbird_block_sparse_attention(
             query_layer,
             key_layer,
             value_layer,
@@ -94,13 +162,10 @@ class BigBirdBlockSparseAttention(nn.Module):
             seed=self.seed,
             plan_from_length=None,
             plan_num_rand_blocks=None,
-            output_attentions=output_attentions,
         )
 
         context_layer = context_layer.contiguous().view(batch_size, from_seq_length, -1)
-
-        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
-        return outputs
+        return context_layer
 
     @staticmethod
     def torch_bmm_nd(inp_1, inp_2, ndim=None):
@@ -126,8 +191,8 @@ class BigBirdBlockSparseAttention(nn.Module):
         band_mask,
         from_mask,
         to_mask,
-        from_blocked_mask,
-        to_blocked_mask,
+        from_blocked_mask, # same with blocked encoder mask
+        to_blocked_mask,   # same with blocked encoder mask
         n_heads,
         n_rand_blocks,
         attention_head_size,
@@ -139,7 +204,6 @@ class BigBirdBlockSparseAttention(nn.Module):
         seed,
         plan_from_length,
         plan_num_rand_blocks,
-        output_attentions,
     ):
 
         # BigBird block-sparse attention as suggested in paper
@@ -446,126 +510,7 @@ class BigBirdBlockSparseAttention(nn.Module):
         context_layer = context_layer.view((bsz, n_heads, from_seq_len, -1)) * from_mask
         context_layer = torch.transpose(context_layer, 1, 2)
 
-        # this is just for visualizing; forward pass doesn't depend on following code
-        if output_attentions:
-            # TODO(PVP): need to verify if below code is correct
-            attention_probs = torch.zeros(
-                bsz, n_heads, from_seq_len, to_seq_len, dtype=torch.float, device=context_layer.device
-            )
-
-            # 1st query block
-            # corresponding to `first_context_layer`
-            attention_probs[:, :, :from_block_size, :] = first_attn_weights  # all keys global
-
-            # 2nd query block
-            # corresponding to `second_context_layer`
-            attention_probs[:, :, from_block_size : 2 * from_block_size, : 3 * to_block_size] = second_attn_weights[
-                :, :, :, : 3 * to_block_size
-            ]  # 1st three key blocks (global + sliding)
-            attention_probs[:, :, from_block_size : 2 * from_block_size, -to_block_size:] = second_attn_weights[
-                :, :, :, 3 * to_block_size : 4 * to_block_size
-            ]  # last key block (global)
-            # random keys
-            for p1, i1, w1 in zip(range(bsz), rand_attn, second_attn_weights):
-                # p1, i1, w1 corresponds to batch_dim i.e. following operation is done for each sequence in batch
-                for p2, i2, w2 in zip(range(n_heads), i1, w1):
-                    # p2, i2, w2 corresponds to head_dim i.e. following operation is done for each heads
-                    attn_probs_view = attention_probs.view(
-                        bsz,
-                        n_heads,
-                        from_seq_len // from_block_size,
-                        from_block_size,
-                        to_seq_len // to_block_size,
-                        to_block_size,
-                    )
-                    right_slice = w2[:, 4 * to_block_size :]
-                    attn_probs_view[p1, p2, 1, :, i2[0]] = right_slice.view(
-                        from_block_size, n_rand_blocks, to_block_size
-                    )
-
-            # Middle query blocks
-            # corresponding to `context_layer`
-            # sliding keys
-            for q_idx in range(from_seq_len // from_block_size - 4):
-                attn_probs_view = attention_probs.view(
-                    bsz,
-                    n_heads,
-                    from_seq_len // from_block_size,
-                    from_block_size,
-                    to_seq_len // to_block_size,
-                    to_block_size,
-                )[:, :, 2:-2, :, 1:-1, :]
-                right_slice = attn_weights[:, :, q_idx, :, to_block_size : 4 * to_block_size]
-                attn_probs_view[:, :, q_idx, :, q_idx : q_idx + 3, :] = right_slice.view(
-                    bsz, n_heads, from_block_size, 3, to_block_size
-                )  # inner_band_product
-            # global keys (corresponding to 1st key block)
-            attention_probs[:, :, 2 * from_block_size : -2 * from_block_size, :to_block_size] = attn_weights[
-                :, :, :, :, :to_block_size
-            ].view(
-                bsz, n_heads, -1, to_block_size
-            )  # first_band_product
-            # global keys (corresponding to last key block)
-            attention_probs[:, :, 2 * from_block_size : -2 * from_block_size, -to_block_size:] = attn_weights[
-                :, :, :, :, -to_block_size:
-            ].view(
-                bsz, n_heads, -1, to_block_size
-            )  # last_band_product
-            # random keys
-            for p1, i1, w1 in zip(range(bsz), rand_attn, attn_weights):
-                # p1, i1, w1 corresponds to batch_dim i.e. following operation is done for each sequence in batch
-                for p2, i2, w2 in zip(range(n_heads), i1, w1):
-                    # p2, i2, w2 corresponds to head_dim i.e. following operation is done for each heads
-                    for q_idx in range(1, len(i2) - 1):
-                        attn_probs_view = attention_probs.view(
-                            bsz,
-                            n_heads,
-                            from_seq_len // from_block_size,
-                            from_block_size,
-                            to_seq_len // to_block_size,
-                            to_block_size,
-                        )
-                        right_slice = w2[q_idx - 1, :, 4 * to_block_size : -to_block_size]
-                        attn_probs_view[p1, p2, q_idx + 1, :, i2[q_idx]] = right_slice.view(
-                            from_block_size, n_rand_blocks, to_block_size
-                        )
-
-            # Second-last query block
-            # corresponding to `second_last_context_layer`
-            attention_probs[:, :, -2 * from_block_size : -from_block_size, :to_block_size] = second_last_attn_weights[
-                :, :, :, :to_block_size
-            ]  # 1st key block (global)
-            attention_probs[
-                :, :, -2 * from_block_size : -from_block_size, -3 * to_block_size :
-            ] = second_last_attn_weights[
-                :, :, :, to_block_size : 4 * to_block_size
-            ]  # last three blocks (global + sliding)
-            # random keys
-            for p1, i1, w1 in zip(range(bsz), rand_attn, second_last_attn_weights):
-                # p1, i1, w1 corresponds to batch_dim i.e. following operation is done for each sequence in batch
-                for p2, i2, w2 in zip(range(n_heads), i1, w1):
-                    # p2, i2, w2 corresponds to head_dim i.e. following operation is done for each heads
-                    attn_probs_view = attention_probs.view(
-                        bsz,
-                        n_heads,
-                        from_seq_len // from_block_size,
-                        from_block_size,
-                        to_seq_len // to_block_size,
-                        to_block_size,
-                    )
-                    right_slice = w2[:, 4 * to_block_size :]
-                    attn_probs_view[p1, p2, -2, :, i2[-1]] = right_slice.view(
-                        from_block_size, n_rand_blocks, to_block_size
-                    )
-
-            # last query block
-            # corresponding to `last_context_layer`
-            attention_probs[:, :, -from_block_size:, :] = last_attn_weights  # all keys global
-
-        else:
-            attention_probs = None
-
-        return context_layer, attention_probs
+        return context_layer
 
     @staticmethod
     def torch_gather_b2(params, indices):
@@ -899,16 +844,74 @@ class BigBirdBlockSparseAttention(nn.Module):
                 break
         return np.array(selected_random_blokcs, dtype=np.int32)
 
+    @torch.no_grad()
+    def forward_dense(self, hidden_state):
+        N, L = hidden_state.size(0), hidden_state.size(1)
+        num_head = self.num_attention_heads
+        dim_head = self.attention_head_size
+        scale = 1 / math.sqrt(self.attention_head_size)
 
-# class BigBirdDataLoader(cube.runtime.syndata.CubeDataLoader):
-# 
-#     def __init__(self, batch_size: int):
-#         self.bs = batch_size
-#         super().__init__(
-#             shapes=(
-#                 [batch_size, ]
-#             )
-#         )
+        # bs, seq, emb -> seq, bs, emb
+        hidden_state = hidden_state.transpose(0, 1)
+        q = self.query(hidden_state)
+        k = self.key(hidden_state)
+        v = self.value(hidden_state)
+        q = q.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
+        k = k.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
+        v = v.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
+        q = q.transpose(0, 1)  # L (N h) d -> (N h) L d
+        k = k.transpose(0, 1)  # L (N h) d -> (N h) L d
+        v = v.transpose(0, 1)  # L (N h) d -> (N h) L d
+        q = q * scale          # (N h) L d, 1 -> (N h) L d
+        k = k.transpose(1, 2)  # (N h) L d -> (N h) d L
+        attn = torch.bmm(q, k) # (N h) L d, (N h) d L -> (N h) L L
+
+        # attention mask
+        attn = attn.view(N, num_head, L, L)
+        ones = torch.ones((N, L, L), device=attn.device)
+        mask = ones # torch.tril(ones)
+        mask = mask.view(N, 1, L, L)
+        mask = (mask < 0.5)
+        attn = attn.masked_fill_(mask, -10000.0)
+        attn = attn.view((N * num_head), L, L)
+
+        attn = torch.nn.functional.softmax(attn, dim=-1) # (N h) L L -> (N h) L L
+        attn = torch.nn.functional.dropout(attn, 0.0, True, False) # (N h) L L -> (N h) L L
+        output = torch.bmm(attn, v) # (N h) L L, (N h) L d -> (N h) L d
+        output = output.transpose(0, 1).contiguous()     # (N h) L d -> L (N h) d
+        output = output.view(L, N, num_head * dim_head)  # (N h) L d -> L N (h d)
+        # output = torch.nn.functional.linear(output, out_proj, out_bias) # L N (h d), E E  -> L N E
+        output = output.transpose(0, 1).contiguous()
+        return output
+
+
+
+class BigBirdDataLoader(cube.runtime.syndata.CubeDataLoader):
+
+    def __init__(self, batch_size: int):
+        self.bs = batch_size
+        super().__init__(
+            shapes=(
+                [args.bs, config.seqlen, config.hidden_size],
+            ),
+            dtypes=(torch.float16 if args.fp16 else torch.float,),
+            batch_dims=(0,)
+        )
+        self.samples = [self.random_sample()]
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.samples[0]
+
+    def random_sample(self):
+        hidden_state = torch.randn(
+            self.bs, config.seqlen, config.hidden_size,
+            dtype=torch.float16 if args.fp16 else torch.float,
+            device=torch.cuda.current_device()
+        )
+        return hidden_state
 
 
 
@@ -918,8 +921,9 @@ if __name__ == '__main__':
     nparams = sum([param.numel() for param in model.parameters()])
     print_each_rank(f'model params (M): {nparams / 1e6}. Launching model...')
     model = model.half().cuda() if args.fp16 else model.cuda()
+    model.eval()
 
-    dataloader = GPT3DataLoader(args.micro_bs)
+    dataloader = BigBirdDataLoader(args.bs)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
     print_each_rank('model weight consumpition:')
@@ -927,31 +931,25 @@ if __name__ == '__main__':
 
     CudaTimer(enable=False)
     torch.distributed.barrier()
-    iter_num = 6
+    iter_num =32
     for step in range(iter_num):
-        if step >= 2:
+        if step >= 8:
             CudaTimer(enable=True).start('e2e')
 
         # train 1 step
-        num_microbatch = args.bs // (args.micro_bs * args.dp_size)
-        if args.pp_size > 1:
-            _schedule(model, dataloader, num_microbatch)
-        else:
-            for _ in range(num_microbatch):
-                model.data = next(dataloader)
-                loss = model()
-                loss.backward()
-
-        if _pp_embed_reducer is not None:
-            _pp_embed_reducer.allreduce()
-        
-        if _dp_reducer is not None:
-            _dp_reducer.allreduce()
+        # num_microbatch = 1
+        with torch.no_grad():
+            data = next(dataloader)
+            if args.sparse:
+                out = model(data)
+            else:
+                out = model.forward_dense(data)
+        # loss.backward()
 
         optimizer.step()
         optimizer.zero_grad()
 
-        if step >= 2:
+        if step >= 8:
             CudaTimer().stop('e2e')
 
         torch.cuda.empty_cache()
@@ -961,10 +959,10 @@ if __name__ == '__main__':
             print_each_rank('memory after optimizer:', rank_only=0)
             memory_summary()
 
-        if (step + 1) % 2 == 0:
+        if (step + 1) % 8 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-2, field_name='e2e')))
-    CudaTimer().print_all(times=iter_num-2)
+          CudaTimer().duration(iter_num-8, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num-8)
     memory_summary()
