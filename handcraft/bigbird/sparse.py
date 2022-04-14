@@ -85,6 +85,7 @@ def bmm(tensor1: torch.Tensor, tensor2: torch.Tensor, ndim: int):
 
 def stride_qk(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
               h: int, block_size: int):
+    CudaTimer().start('stride_qk')
     # print('start stride qk')
     # q, k, v: (N h) L d
     num_head = h
@@ -120,11 +121,13 @@ def stride_qk(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     qk = bmm(middle_q, sliding_keys, ndim=4)
     # (N h) ((nblock-2) blksize) (3 blksize)
     qk = qk.view(N * h, -1, block_size * 3)
+    CudaTimer().stop('stride_qk')
     return qk, stride_vals
 
 
 def global_qk(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
               h: int, block_size: int):
+    CudaTimer().start('global_qk')
     # print('start global qk')
     # q, k, v: (N h) L d
     num_head = h
@@ -145,11 +148,13 @@ def global_qk(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     # (N h) (2 blksize) d
     col_v = v[:, :2 * block_size]
     col = bmm(col_q, col_k, ndim=3) # (N h) ((nblock-2) blocksize) (2 blocksize)
+    CudaTimer().stop('global_qk')
     return head, head_v, col, col_v
 
 
 def randn_qk(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
              h: int, block_size: int):
+    CudaTimer().start('rand_qk')
     # q, k, v: (N h) L d
     rand_num = 2
     num_head = h
@@ -179,6 +184,7 @@ def randn_qk(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     qk = bmm(q, gathered_k.transpose(2,3), ndim=4)
     # (N h) ((nblock-2) blksize) (2 blksize)
     qk = qk.view(N * h, -1, 2 * block_size)
+    CudaTimer().stop('rand_qk')
     return qk, gathered_v
 
 
@@ -192,6 +198,7 @@ def sparse_attn(query: torch.Tensor,
     L, N = query.size(0), query.size(1)
     dim_head = q_proj.size(0) // num_head
 
+    CudaTimer().start('to_qkv')
     q = torch.nn.functional.linear(query, q_proj, q_bias) # L N E, (h d) E -> L N (h d)
     k = torch.nn.functional.linear(query, k_proj, k_bias)   # L N E, (h d) E -> L N (h d)
     v = torch.nn.functional.linear(query, v_proj, v_bias)   # L N E, (h d) E -> L N (h d)
@@ -202,6 +209,7 @@ def sparse_attn(query: torch.Tensor,
     k = k.transpose(0, 1)  # L (N h) d -> (N h) L d
     v = v.transpose(0, 1)  # L (N h) d -> (N h) L d
     q = q * scale          # (N h) L d, 1 -> (N h) L d
+    CudaTimer().stop('to_qkv')
 
     # sqk:   (N h) ((nblock-2) blksize) (3 blksize)
     # sqk_v: (N h) (nblock-2) (3 blksize) d
@@ -216,6 +224,7 @@ def sparse_attn(query: torch.Tensor,
     rqk, rqk_v = randn_qk(q, k, v, h, block_size=block_size)
 
     # (N h) ((nblock-2) blksize) L
+    CudaTimer().start('all_softmax')
     head_attn = torch.nn.functional.softmax(head, dim=-1)
     head_attn = torch.nn.functional.dropout(head_attn, dropout_p, True, False)
 
@@ -224,15 +233,18 @@ def sparse_attn(query: torch.Tensor,
     # (N h) ((nblock-2) blksize) (7 blksize)
     middle_attn = torch.nn.functional.softmax(middle_attn, dim=-1)
     middle_attn = torch.nn.functional.dropout(middle_attn, dropout_p, True, False)
+    CudaTimer().stop('all_softmax')
 
-    # select just for performance test
+    CudaTimer().start('global_qk')
     # (N h) (2 blocksize) L, (N h) L d -> (N h) (2 blksize) d
     head_output = bmm(head_attn, v, ndim=3)
 
     # global col v:  (N h) ((nblock-2) blksize) (2 blksize), (N h) (2 blksize) d
     #             :-> (N h) (L-(2 blksize)) d
     middle_output = bmm(middle_attn[:,:,:2 * block_size], col_v, ndim=3)
+    CudaTimer().stop('global_qk')
 
+    CudaTimer().start('stride_qk')
     middle_stride = middle_attn[:,:,2*block_size:5*block_size].view(
         N * h, L // block_size - 2, block_size, 3 * block_size
     )
@@ -240,8 +252,10 @@ def sparse_attn(query: torch.Tensor,
     #        : -> (N h) (nblock-2) blksize d
     middle_stride_output = bmm(middle_stride, sqk_v, ndim=4)
     middle_output += middle_stride_output.view(N * h, -1, sqk_v.size(-1))
+    CudaTimer().stop('stride_qk')
 
     # (N h) (nblock-2) blksize (2 blksize)
+    CudaTimer().start('rand_qk')
     middle_rand = middle_attn[:,:,5*block_size:].view(
         N * h, L // block_size - 2, block_size, 2 * block_size
     )
@@ -249,6 +263,7 @@ def sparse_attn(query: torch.Tensor,
     #         -> (N h) (nblock-2) blksize d
     middle_rand_output = bmm(middle_rand, rqk_v, ndim=4)
     middle_output += middle_rand_output.view(N * h, -1, rqk_v.size(-1))
+    CudaTimer().stop('rand_qk')
 
     # (N h) (2 blksize) d, (N h) ((nblock-2) blksize) d -> (N h) L d
     output = torch.cat((head_output, middle_output), dim=1)
