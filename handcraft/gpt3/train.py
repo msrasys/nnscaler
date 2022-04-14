@@ -91,8 +91,8 @@ _schedule = schedule_1f1b
 _pp_embed_group = -1
 _pp_embed_reducer = None
 cube.init()
-print_each_rank('setting memory constraints to 16GB')
-torch.cuda.set_per_process_memory_fraction(0.5)
+# print_each_rank('setting memory constraints to 16GB')
+# torch.cuda.set_per_process_memory_fraction(0.5)
 
 dp_ranks, pp_ranks, tp_ranks= DeviceGroup().create_hybrid(
     [args.dp_size, args.pp_size, args.tp_size]
@@ -288,6 +288,7 @@ class Attention(torch.nn.Module):
         if mask is not None:
             attention_scores.masked_fill_(mask, -10000.0)
         attention_probs = self.softmax(attention_scores)
+        attention_probs = torch.nn.functional.dropout(attention_probs, 0.0)
 
         output_size = (value_layer.size(1),
                        value_layer.size(2),
