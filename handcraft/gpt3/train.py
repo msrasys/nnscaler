@@ -135,7 +135,7 @@ if args.schedule == '1f1b' and args.pp_size > 1:
 
 
 class Config:
-    vocab_size = 50273
+    vocab_size = 50432
     seqlen = args.seqlen
     layers = args.layers
     heads = args.heads
@@ -390,7 +390,7 @@ class Embedding(torch.nn.Module):
         self.vocab_start_index = num_embeddings // self.tp_size * self.tp_id
         self.vocab_end_index = num_embeddings // self.tp_size * (self.tp_id + 1)
         self.weight = torch.nn.Parameter(
-            torch.ones((num_embeddings // self.tp_size, embedding_dim))
+            torch.ones((num_embeddings // self.tp_size, embedding_dim), requires_grad=True)
         )
 
     def forward(self, tokens):
@@ -443,20 +443,20 @@ class TransformerLayer(PipeStage):
 
     def forward(self, hidden_states, attention_mask):
 
-        layernrom_output = self.input_layernorm(hidden_states)
+        layernorm_output = self.input_layernorm(hidden_states)
         
-        attention_output = self.self_attention(layernrom_output, attention_mask)
+        attention_output = self.self_attention(layernorm_output, attention_mask)
         
         residual = hidden_states
-        layernorm_input = torch.nn.functional.dropout(attention_output, p=self.hidden_dropout, training=self.training)
+        layernorm_input = torch.nn.functional.dropout(attention_output, p=self.hidden_dropout)
         layernorm_input = layernorm_input + residual
-        layernrom_output = self.post_attention_layernorm(layernorm_input)
+        layernorm_output = self.post_attention_layernorm(layernorm_input)
 
-        mlp_output = self.mlp(layernrom_output)
+        mlp_output = self.mlp(layernorm_output)
 
         residual = layernorm_input
-        output = torch.nn.functional.dropout(attention_output, p=self.hidden_dropout, training=self.training)
-        output = layernorm_input + residual
+        output = torch.nn.functional.dropout(mlp_output, p=self.hidden_dropout)
+        output = output + residual
         return output
 
     def flops(self):
@@ -682,7 +682,7 @@ if __name__ == '__main__':
     model = model.half().cuda() if args.fp16 else model.cuda()
 
     dataloader = GPT3DataLoader(args.micro_bs)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
+    optimizer = torch.optim.Adam(model.parameters(), weight_decay=0.02, lr=3e-05, betas=(0.9, 0.98))
     if _pp_embed_reducer is not None:
         _pp_embed_reducer.add_param(model.word_embeddings.weight)
     if _dp_reducer is not None:
