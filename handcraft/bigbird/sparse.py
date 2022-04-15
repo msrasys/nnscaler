@@ -10,8 +10,8 @@ OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=1 \
     --nnodes=1 \
     handcraft/bigbird/sparse.py \
-        --hidden-size 4096 --heads 32 --seqlen 4096 \
-        --bs 8 --fp16
+        --hidden-size 5120 --heads 32 --seqlen 12288 \
+        --bs 1 --fp16
 """
 
 import torch
@@ -65,23 +65,24 @@ class Config:
     hidden_size = args.hidden_size
     all_head_sie = hidden_size
     seqlen = args.seqlen # seqlen
-    num_random_blocks = 3
+    num_random_blocks = 2
     block_size=args.blk_size
     use_bias = True
 
 config = Config()
 
 
-def bmm(tensor1: torch.Tensor, tensor2: torch.Tensor, ndim: int):
+def bmm(tensor1: torch.Tensor, tensor2: torch.Tensor, ndim: int, out=None):
     # print(f'bmm: {tensor1.size()} {tensor2.size()}')
     return torch.bmm(
         tensor1.reshape((-1,) + tensor1.shape[-2:]),
-        tensor2.reshape((-1,) + tensor2.shape[-2:])
+        tensor2.reshape((-1,) + tensor2.shape[-2:]),
+        out=out
     ).view(tensor1.shape[: ndim - 2] + (tensor1.shape[ndim - 2], tensor2.shape[ndim-1]))
 
 
 def stride_qk(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-              h: int, block_size: int):
+              h: int, block_size: int, out=None):
     CudaTimer().start('stride_q@k')
     # print('start stride qk')
     # q, k, v: (N h) L d
@@ -107,9 +108,9 @@ def stride_qk(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     sliding_keys = sliding_keys.transpose(2, 3)
 
     # (N h) (nblock-2) blksize (3 blksize)
-    qk = bmm(middle_q, sliding_keys, ndim=4)
+    out = bmm(middle_q, sliding_keys, ndim=4, out=out)
     # (N h) ((nblock-2) blksize) (3 blksize)
-    qk = qk.view(N * h, -1, block_size * 3)
+    qk = out.view(N * h, -1, block_size * 3)
     CudaTimer().stop('stride_q@k')
     return qk
 
@@ -192,7 +193,7 @@ def global_qk(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 
 
 def randn_qk(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-             h: int, block_size: int, rand_num: int = 2):
+             h: int, block_size: int, rand_num: int = 2, out=None):
     CudaTimer().start('rand_q@k')
     torch.manual_seed(0)
     # q, k, v: (N h) L d
@@ -218,9 +219,9 @@ def randn_qk(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     # (N h) nblock-2 blksize d
     q = q[:,2:]
     # (N h) nblock-2 blksize (randnum blksize)
-    qk = bmm(q, gathered_k.transpose(2, 3), ndim=4)
+    out = bmm(q, gathered_k.transpose(2, 3), ndim=4, out=out)
     # (N h) ((nblock-2) blksize) (randnum blksize)
-    qk = qk.view(N * h, -1, rand_num * block_size)
+    qk = out.view(N * h, -1, rand_num * block_size)
     CudaTimer().stop('rand_q@k')
     return qk
 
@@ -252,6 +253,7 @@ def sparse_attn(query: torch.Tensor,
     num_head = h
     L, N = query.size(0), query.size(1)
     dim_head = q_proj.size(0) // num_head
+    nblocks = L // block_size
 
     CudaTimer().start('to_qkv')
     q = torch.nn.functional.linear(query, q_proj, q_bias) # L N E, (h d) E -> L N (h d)
@@ -266,34 +268,48 @@ def sparse_attn(query: torch.Tensor,
     q = q * scale          # (N h) L d, 1 -> (N h) L d
     CudaTimer().stop('to_qkv')
 
+    # sqk = torch.empty(
+    #     N * h, (nblocks - 2) * block_size, 3 * block_size,
+    #     dtype=torch.float16 if args.fp16 else torch.float32,
+    #     device=torch.cuda.current_device()
+    # )
+    # 
+    # rqk = torch.empty(
+    #     N * h, (nblocks - 2) * block_size, 2 * block_size,
+    #     dtype=torch.float16 if args.fp16 else torch.float32,
+    #     device=torch.cuda.current_device()
+    # )
+    # we don't need pre-allocation as memory are sufficient
+    sqk = rqk = None
+
     CudaTimer().start('q@k')
     # sqk:   (N h) ((nblock-2) blksize) (3 blksize)
-    sqk = stride_qk(q, k, v, h, block_size=block_size)
+    sqk = stride_qk(q, k, v, h, block_size=block_size, out=sqk)
     # head: (N h) (2 blocksize) L
     # head_v: (N h) L d
     # col: (N h) ((nblock-2) blocksize) (2 blocksize)
     # col_v: (N h) (2 blksize) d
     head, head_v, col, col_v = global_qk(q, k, v, h, block_size=block_size)
     # rqk: (N h) ((nblock-2) blksize) (2 blksize)
-    rqk = randn_qk(q, k, v, h, block_size=block_size)
-    CudaTimer().stop('q@k')
-
-    # sqk_v: (N h) (nblock-2) (3 blksize) d
-    sqk_v = stride_v(v, h, block_size)
-    # rqk_v: (N h) (nblock-2) (2 blksize) d
-    rqk_v = randn_v(v, h, block_size)
-
-    # (N h) ((nblock-2) blksize) L
-    CudaTimer().start('all_softmax')
-    head_attn = torch.nn.functional.softmax(head, dim=-1)
-    head_attn = torch.nn.functional.dropout(head_attn, dropout_p, True, False)
-
+    rqk = randn_qk(q, k, v, h, block_size=block_size, out=rqk)
     # (N h) ((nblock-2) blksize) (7 blksize)
     middle_attn = torch.cat((col, sqk, rqk), dim=-1)
+    CudaTimer().stop('q@k')
+
+    CudaTimer().start('all_softmax')
+    # (N h) ((nblock-2) blksize) L
+    head_attn = torch.nn.functional.softmax(head, dim=-1)
+    head_attn = torch.nn.functional.dropout(head_attn, dropout_p, True, False)
     # (N h) ((nblock-2) blksize) (7 blksize)
     middle_attn = torch.nn.functional.softmax(middle_attn, dim=-1)
     middle_attn = torch.nn.functional.dropout(middle_attn, dropout_p, True, False)
     CudaTimer().stop('all_softmax')
+
+    CudaTimer().start('qk@v')
+    # sqk_v: (N h) (nblock-2) (3 blksize) d
+    sqk_v = stride_v(v, h, block_size)
+    # rqk_v: (N h) (nblock-2) (2 blksize) d
+    rqk_v = randn_v(v, h, block_size)
 
     CudaTimer().start('global_qk@v')
     # (N h) (2 blocksize) L, (N h) L d -> (N h) (2 blksize) d
@@ -327,109 +343,7 @@ def sparse_attn(query: torch.Tensor,
 
     # (N h) (2 blksize) d, (N h) ((nblock-2) blksize) d -> (N h) L d
     output = torch.cat((head_output, middle_output), dim=1)
-
-    output = output.transpose(0, 1).contiguous()     # (N h) L d -> L (N h) d
-    output = output.view(L, N, num_head * dim_head)  # (N h) L d -> L N (h d)
-    output = torch.nn.functional.linear(output, out_proj, out_bias) # L N (h d), E E  -> L N E
-    return output
-
-
-def parallel_sparse_attn(query: torch.Tensor,
-                         q_proj: torch.Tensor, q_bias: torch.Tensor,
-                         k_proj: torch.Tensor, k_bias: torch.Tensor,
-                         v_proj: torch.Tensor, v_bias: torch.Tensor,
-                         out_proj: torch.Tensor, out_bias: torch.Tensor,
-                         h: int, scale: float, dropout_p: float, block_size: int):
-    rand_num = 2
-    num_head = h
-    L, N = query.size(0), query.size(1)
-    dim_head = q_proj.size(0) // num_head
-
-    CudaTimer().start('to_qkv')
-    q = torch.nn.functional.linear(query, q_proj, q_bias) # L N E, (h d) E -> L N (h d)
-    k = torch.nn.functional.linear(query, k_proj, k_bias)   # L N E, (h d) E -> L N (h d)
-    v = torch.nn.functional.linear(query, v_proj, v_bias)   # L N E, (h d) E -> L N (h d)
-    q = q.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    k = k.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    v = v.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    q = q.transpose(0, 1)  # L (N h) d -> (N h) L d
-    k = k.transpose(0, 1)  # L (N h) d -> (N h) L d
-    v = v.transpose(0, 1)  # L (N h) d -> (N h) L d
-    q = q * scale          # (N h) L d, 1 -> (N h) L d
-    CudaTimer().stop('to_qkv')
-
-    nblocks = L // block_size - 2
-    scope = [nblocks // _tp_size] * _tp_size
-    for idx in range(nblocks % _tp_size):
-        scope[idx] += 1
-    start, end = sum(scope[:_tp_rank]), sum(scope[:_tp_rank+1])
-
-    CudaTimer().start('q@k')
-    # sqk:   (N h) ((nblock-2) blksize) (3 blksize)
-    sqk = parallel_stride_qk(
-        q, k, v, h, block_size, start, end)
-    req = torch.distributed.all_reduce(sqk, async_op=True)
-
-    # head: (N h) (2 blocksize) L
-    # head_v: (N h) L d
-    # col: (N h) ((nblock-2) blocksize) (2 blocksize)
-    # col_v: (N h) (2 blksize) d
-    head, head_v, col, col_v = global_qk(q, k, v, h, block_size=block_size)
-
-    # rqk: (N h) ((nblock-2) blksize) (2 blksize)
-    # rqk_v: (N h) (nblock-2) (2 blksize) d
-    rqk = randn_qk(q, k, v, h, block_size=block_size)
-    req.wait()
-    CudaTimer().stop('q@k')
-
-    # sqk_v: (N h) (nblock-2) (3 blksize) d
-    sqk_v = stride_v(v, h, block_size)
-    rqk_v = randn_v(v, h, block_size)
-
-    # (N h) ((nblock-2) blksize) L
-    CudaTimer().start('all_softmax')
-    head_attn = torch.nn.functional.softmax(head, dim=-1)
-    head_attn = torch.nn.functional.dropout(head_attn, dropout_p, True, False)
-
-    # (N h) ((nblock-2) blksize) (7 blksize)
-    middle_attn = torch.cat((col, sqk, rqk), dim=-1)
-    # (N h) ((nblock-2) blksize) (7 blksize)
-    middle_attn = torch.nn.functional.softmax(middle_attn, dim=-1)
-    middle_attn = torch.nn.functional.dropout(middle_attn, dropout_p, True, False)
-    CudaTimer().stop('all_softmax')
-
-    CudaTimer().start('global_qk@v')
-    # (N h) (2 blocksize) L, (N h) L d -> (N h) (2 blksize) d
-    head_output = bmm(head_attn, v, ndim=3)
-
-    # global col v:  (N h) ((nblock-2) blksize) (2 blksize), (N h) (2 blksize) d
-    #             :-> (N h) (L-(2 blksize)) d
-    middle_output = bmm(middle_attn[:,:,:2 * block_size], col_v, ndim=3)
-    CudaTimer().stop('global_qk@v')
-
-    CudaTimer().start('stride_qk@v')
-    middle_stride = middle_attn[:,:,2*block_size:5*block_size].view(
-        N * h, L // block_size - 2, block_size, 3 * block_size
-    )
-    # stide v: (N h) (nblock-2) blksize (3 blksize), (N h) (nblock-2) (3 blksize) d
-    #        : -> (N h) (nblock-2) blksize d
-    middle_stride_output = bmm(middle_stride, sqk_v, ndim=4)
-    middle_output += middle_stride_output.view(N * h, -1, sqk_v.size(-1))
-    CudaTimer().stop('stride_qk@v')
-
-    # (N h) (nblock-2) blksize (randnum blksize)
-    CudaTimer().start('rand_qk@v')
-    middle_rand = middle_attn[:,:,5*block_size:].view(
-        N * h, L // block_size - 2, block_size, rand_num * block_size
-    )
-    # rand v: (N h) (nblock-2) blksize (2 blksize), (N h) (nblock-2) (2 blksize) d
-    #         -> (N h) (nblock-2) blksize d
-    middle_rand_output = bmm(middle_rand, rqk_v, ndim=4)
-    middle_output += middle_rand_output.view(N * h, -1, rqk_v.size(-1))
-    CudaTimer().stop('rand_qk@v')
-
-    # (N h) (2 blksize) d, (N h) ((nblock-2) blksize) d -> (N h) L d
-    output = torch.cat((head_output, middle_output), dim=1)
+    CudaTimer().stop('qk@v')
 
     CudaTimer().start('out_proj')
     output = output.transpose(0, 1).contiguous()     # (N h) L d -> L (N h) d
@@ -449,19 +363,29 @@ def dense_attn(query: torch.Tensor,
     L, N = query.size(0), query.size(1)
     dim_head = q_proj.size(0) // num_head
 
+    CudaTimer().start('to_qkv')
     q = torch.nn.functional.linear(query, q_proj, q_bias) # L N E, (h d) E -> L N (h d)
     k = torch.nn.functional.linear(query, k_proj, k_bias)   # L N E, (h d) E -> L N (h d)
     v = torch.nn.functional.linear(query, v_proj, v_bias)   # L N E, (h d) E -> L N (h d)
     q = q.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     k = k.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     v = v.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    q = q.transpose(0, 1)  # L (N h) d -> (N h) L d
-    k = k.transpose(0, 1)  # L (N h) d -> (N h) L d
     v = v.transpose(0, 1)  # L (N h) d -> (N h) L d
+    q = q.transpose(0, 1).contiguous()  # L (N h) d -> (N h) L d
+    k = k.transpose(0, 1)  # L (N h) d -> (N h) L d
     q = q * scale          # (N h) L d, 1 -> (N h) L d
+    CudaTimer().stop('to_qkv')
+    # k = k.transpose(1, 2).contiguous()  # (N h) L d -> (N h) d L
+
+    CudaTimer().start('allocation')
+    attn = torch.empty(
+        (N * h), L, L, dtype=torch.float16 if args.fp16 else args.fp32,
+        device=torch.cuda.current_device()
+    )
+    CudaTimer().stop('allocation')
+
     CudaTimer().start('q@k')
-    k = k.transpose(1, 2)  # (N h) L d -> (N h) d L
-    attn = torch.bmm(q, k) # (N h) L d, (N h) d L -> (N h) L L
+    attn = torch.bmm(q, k.transpose(1, 2), out=attn) # (N h) L d, (N h) d L -> (N h) L L
     CudaTimer().stop('q@k')
 
     # attention mask
@@ -484,9 +408,11 @@ def dense_attn(query: torch.Tensor,
     output = torch.bmm(attn, v) # (N h) L L, (N h) L d -> (N h) L d
     CudaTimer().stop('qk@v')
 
+    CudaTimer().start('out_proj')
     output = output.transpose(0, 1).contiguous()     # (N h) L d -> L (N h) d
     output = output.view(L, N, num_head * dim_head)  # (N h) L d -> L N (h d)
     output = torch.nn.functional.linear(output, out_proj, out_bias) # L N (h d), E E  -> L N E
+    CudaTimer().stop('out_proj')
     return output
 
 
