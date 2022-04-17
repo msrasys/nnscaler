@@ -239,6 +239,9 @@ class Attention(torch.nn.Module):
         )
 
     def forward_(self, x, mask):
+        # to test attention memory consumpiton: enable this
+        # start_mem = torch.cuda.memory_allocated()
+
         # x: [seqlen, bs, hidden], np: head num | hn: head dim
         if self.tp_size > 1:
             x = IdentityAllreduce.apply(x, self.tp_group)
@@ -323,6 +326,11 @@ class Attention(torch.nn.Module):
         output = self.dense(context_layer)
         if self.tp_size > 1:
             output = AllReduceIdentity.apply(output, self.tp_group)
+
+        # to test attention memory consumpiton: enable this
+        # end_mem = torch.cuda.memory_allocated()
+        # print(f'mem: attention memory: {(end_mem - start_mem) / 1024 / 1024} MB')
+
         return output
 
     def forward(self, x, mask, recompute=False):
