@@ -10,7 +10,7 @@ OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=1 \
     --nnodes=1 \
     handcraft/bigbird/sparse.py \
-        --hidden-size 5120 --heads 32 --seqlen 12288 \
+        --hidden-size 5120 --heads 32 --seqlen 4096 \
         --bs 1 --fp16
 """
 
@@ -268,19 +268,19 @@ def sparse_attn(query: torch.Tensor,
     q = q * scale          # (N h) L d, 1 -> (N h) L d
     CudaTimer().stop('to_qkv')
 
-    # sqk = torch.empty(
-    #     N * h, (nblocks - 2) * block_size, 3 * block_size,
-    #     dtype=torch.float16 if args.fp16 else torch.float32,
-    #     device=torch.cuda.current_device()
-    # )
-    # 
-    # rqk = torch.empty(
-    #     N * h, (nblocks - 2) * block_size, 2 * block_size,
-    #     dtype=torch.float16 if args.fp16 else torch.float32,
-    #     device=torch.cuda.current_device()
-    # )
+    sqk = torch.empty(
+        N * h, (nblocks - 2) * block_size, 3 * block_size,
+        dtype=torch.float16 if args.fp16 else torch.float32,
+        device=torch.cuda.current_device()
+    )
+    
+    rqk = torch.empty(
+        N * h, (nblocks - 2) * block_size, 2 * block_size,
+        dtype=torch.float16 if args.fp16 else torch.float32,
+        device=torch.cuda.current_device()
+    )
     # we don't need pre-allocation as memory are sufficient
-    sqk = rqk = None
+    # sqk = rqk = None
 
     CudaTimer().start('q@k')
     # sqk:   (N h) ((nblock-2) blksize) (3 blksize)
@@ -297,7 +297,7 @@ def sparse_attn(query: torch.Tensor,
     CudaTimer().stop('q@k')
 
     CudaTimer().start('all_softmax')
-    # (N h) ((nblock-2) blksize) L
+    # (N h) (2 blksize) L
     head_attn = torch.nn.functional.softmax(head, dim=-1)
     head_attn = torch.nn.functional.dropout(head_attn, dropout_p, True, False)
     # (N h) ((nblock-2) blksize) (7 blksize)
@@ -370,7 +370,7 @@ def dense_attn(query: torch.Tensor,
     q = q.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     k = k.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     v = v.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    v = v.transpose(0, 1)  # L (N h) d -> (N h) L d
+    # v = v.transpose(0, 1)  # L (N h) d -> (N h) L d
     q = q.transpose(0, 1).contiguous()  # L (N h) d -> (N h) L d
     k = k.transpose(0, 1)  # L (N h) d -> (N h) L d
     q = q * scale          # (N h) L d, 1 -> (N h) L d
@@ -405,7 +405,7 @@ def dense_attn(query: torch.Tensor,
     CudaTimer().stop('all_softmax')
 
     CudaTimer().start('qk@v')
-    output = torch.bmm(attn, v) # (N h) L L, (N h) L d -> (N h) L d
+    output = torch.bmm(attn, v.transpose(0, 1)) # (N h) L L, (N h) L d -> (N h) L d
     CudaTimer().stop('qk@v')
 
     CudaTimer().start('out_proj')
@@ -514,7 +514,7 @@ if __name__ == '__main__':
     print_each_rank('model weight consumpition:')
     memory_summary()
 
-    CudaTimer(enable=False)
+    CudaTimer(enable=False).warmup(2)
     torch.distributed.barrier()
     iter_num =32
     for step in range(iter_num):
@@ -534,7 +534,7 @@ if __name__ == '__main__':
         if step >= 8:
             CudaTimer().stop('e2e')
 
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
         torch.distributed.barrier()
 
         if step == 0:
