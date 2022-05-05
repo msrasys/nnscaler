@@ -1,4 +1,5 @@
 from enum import Enum
+import sys
 
 # class NodeType(Enum):
 #     UNKNOWN = 0
@@ -7,6 +8,18 @@ from enum import Enum
 #     BACKWARD_A = 3
 #     BACKWARD_W = 4
 #     OPTIMIZER = 5
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
 
 nodeList = []
 global_node_id = -1
@@ -32,6 +45,8 @@ class AlgorithmMgr:
     def __init__(self):
         self.batch_split = 'batch_split'
         self.replica = 'replica'
+        self.split = 'split'
+        self.tensor_split = 'tensor_split'
 
 class Operator:
     algo: AlgorithmMgr
@@ -66,6 +81,10 @@ class Node:
             '\t'.join([str(x) for x in self.inputs] if len(self.inputs) > 0 else ""),
             '\t'.join([str(x) for x in self.outputs] if len(self.outputs) > 0 else ""))
 
+
+    def slim(self):
+        return "Node({}), {}".format(
+            self.id, str(type(self)).lstrip('<class \'__main__.').rstrip('\'>'))
 
 class NodeData(Node):
     def __init__(self):
@@ -268,8 +287,8 @@ graph = Graph(create_sample=True)
 print('graph = \n{}'.format(graph))
 global_new_graph = Graph()
 
-print('nodeList[{}] = \n{}'.format(len(nodeList), nodeList))
-print('tensorList[{}] = \n{}'.format(len(tensorList), tensorList))
+# print('nodeList[{}] = \n{}'.format(len(nodeList), nodeList))
+# print('tensorList[{}] = \n{}'.format(len(tensorList), tensorList))
 
 
 class Config:
@@ -297,33 +316,55 @@ def trans(node: Node, algo, num: int) -> [Node]:
                 ts.portion += '>batch-{}/{}'.format(idx, num)
         global_new_graph.nodes.extend(nodes)
         return nodes
+    elif algo == 'split': #elementwise split
+        for idx, nd in enumerate(nodes):
+            for ts in nd.inputs + nd.outputs:
+                ts.portion += '>flat-{}/{}'.format(idx, num)
+        global_new_graph.nodes.extend(nodes)
+        return nodes
+    elif algo == 'tensor_split':
+        for idx, nd in enumerate(nodes):
+            for ts in nd.inputs + nd.outputs:
+                ts.portion += '>tensor-{}/{}'.format(idx, num)
+        global_new_graph.nodes.extend(nodes)
+        return nodes
     else:
         assert False
 
 
-
 def sched_s(node: Node, dev: Device) -> None:
-    print("sched_s...")
+    print("{}sched_s...{} @ {}{}".format(bcolors.OKGREEN, node.slim(), dev, bcolors.ENDC))
     pass
 
 
-def sched_t(node_before: Node, node_after: Node) -> bool:
-    print("sched_t...")
-    pass
+def sched_t_pair(node_before: Node, node_after: Node) -> bool:
+    print("{}sched_t...{}-> {}{}".format(bcolors.OKBLUE, node_before.slim(), node_after.slim(), bcolors.ENDC))
+    #TODO legal check
+    return True
 
 
 def sched_t(nodes: [Node]) -> bool:
-    pass
+    for i in range (len(nodes) - 1):
+        if not sched_t_pair(nodes[i], nodes[i+1]):
+            return False
+    return True
 
 
-def set_affinity():
+def set_affinity(producer_node, consumer_node):
+    print("{}affinity...{}-> {}{}".format(bcolors.OKCYAN, producer_node.slim(), consumer_node.slim(), bcolors.ENDC))
     pass
+
 
 from collections import namedtuple
 def idxzip(list: []):
     Entry = namedtuple('Entry', ['idx', 'item'])
     # return [{'idx': i, 'item': x} for i, x in enumerate(list)]
     return [Entry(i, x) for i, x in enumerate(list)]
+
+
+def xmap(func, iterables):
+    if list(map(func, iterables)) is None:
+        print('xmap ERROR')
 
 
 ### TODO how about Tx in flexflow GSPMD etc.?
@@ -341,89 +382,174 @@ class DataParallelParallelizer(Parallelizer):
         global global_new_graph
         global_new_graph.nodes.clear()
 
+        # ----------------
         for node in g.nodes:
             if isinstance(node, (NodeData, NodeFwd, NodeBwd)):
-                nodes = trans(node, node.op.algo.batch_split, config.num)  # by batch-dim-slit
-                map(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
+                nodes = trans(node, node.op.algo.batch_split, config.num)  # by batch-dim-split
+                xmap(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
             elif isinstance(node, (NodeOpt)):
-                nodes = trans(node, node.op.algo.replica, config.num)
-                map(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
+                nodes = trans(node, node.op.algo.replica, config.num) #replicated optimizers
+                xmap(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
             else:
                 print(node)
                 print(type(node))
                 assert False
+        # ----------------
 
-        global_new_graph.nodes.extend([nd for nd in graph.nodes if not nd.removed])
+        global_new_graph.nodes[:0] = [nd for nd in graph.nodes if not nd.removed]
         return global_new_graph
 
 
 class DataParallelZeROParallelizer(Parallelizer):
     def run(self, g: Graph, config: Config) -> Graph:
+        global global_new_graph
+        global_new_graph.nodes.clear()
+
+        # ----------------
         for node in g.nodes:
-            if type(node) in [NodeData, NodeFwd, NodeBwd]:
-                nodes = node.trans(node.op.algo.batch_split, config.num)  # by batch-dim-slit
+            if isinstance(node, (NodeData, NodeFwd, NodeBwd)):
+                nodes = trans(node, node.op.algo.batch_split, config.num)  # by batch-dim-split
                 map(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
-            elif type(node) in [NodeOpt]:
-                nodes = node.trans(node.op.algo.split, config.num)
+            elif isinstance(node, (NodeOpt)):
+                nodes = trans(node, node.op.algo.split, config.num) #split optimizers
                 map(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
             else:
                 assert False
+        # ----------------
+
+        global_new_graph.nodes[:0] = [nd for nd in graph.nodes if not nd.removed]
+        return global_new_graph
 
 
 class GradientAccumulationParallelizer(Parallelizer):
     def run(self, g: Graph, config: Config) -> Graph:
+        global global_new_graph
+        global_new_graph.nodes.clear()
+
+        # ----------------
         for node in g.nodes:
-            if type(node) in [NodeData, NodeFwd, NodeBwd]:
+            if isinstance(node, (NodeData, NodeFwd, NodeBwd)):
                 nodes = trans(node, node.op.algo.batch_split, config.num)  # by batch-dim-slit
                 sched_t(nodes)  # sequential order
-            elif type(node) in [NodeOpt]:
+            elif isinstance(node, (NodeOpt)):
                 pass
             else:
                 assert False
+        # ----------------
+
+        global_new_graph.nodes[:0] = [nd for nd in graph.nodes if not nd.removed]
+        return global_new_graph
 
 
 def node_to_stage(g: Graph, config: Config) -> {}:  # return node->stage mapping
-    pass
+    ret = {}
+    nodes = g.nodes  # TODO topo forward traversal
+    fwd_node = list(filter(lambda x: type(x) is NodeFwd, nodes))
+
+    per_stage_size = len(nodes) // config.stages
+    for node in nodes:
+        # TODO replace dummy assignment
+        ret[node] = 0
+
+    return ret
 
 
 class GPipeParallelizer(Parallelizer):
     def run(self, g: Graph, config: Config) -> Graph:
+        global global_new_graph
+        global_new_graph.nodes.clear()
+
+        # ----------------
         n2stage = node_to_stage(g, config)
         for node in g.nodes:
-            device = n2stage(node)
-            if type(node) in [NodeData, NodeFwd, NodeBwd]:
+            device = n2stage[node]
+            if isinstance(node, (NodeData, NodeFwd, NodeBwd)):
                 nodes = trans(node, node.op.algo.batch_split, config.num)  # by batch-dim-slit
                 sched_t(nodes)  # sequential order
-                map(lambda x: sched_s(node=x, dev=device), nodes)  # assign same stage device
-            elif type(node) in [NodeOpt]:
+                xmap(lambda x: sched_s(node=x, dev=device), nodes)  # assign same stage device
+            elif isinstance(node, (NodeOpt)):
                 sched_s(node, device)
             else:
                 assert False
+        # ----------------
+
+        global_new_graph.nodes[:0] = [nd for nd in graph.nodes if not nd.removed]
+        return global_new_graph
 
 
 class TensorParallelParallelizer(Parallelizer):
     def run(self, g: Graph, config: Config) -> Graph:
+        global global_new_graph
+        global_new_graph.nodes.clear()
+
+        # ----------------
         for node in g.nodes:
-            if type(node) in [NodeFwd, NodeBwd, NodeOpt]:
+            if isinstance(node, (NodeFwd, NodeBwd, NodeOpt)):
                 nodes = trans(node, node.op.algo.tensor_split, config.num)  # by tensor-dim-slit
-                map(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
-            elif type(node) in [NodeData]:
+                xmap(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
+            elif isinstance(node, (NodeData)):
                 nodes = trans(node, node.op.algo.replica, config.num)
-                map(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
+                xmap(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
             else:
                 assert False
+        # ----------------
+
+        global_new_graph.nodes[:0] = [nd for nd in graph.nodes if not nd.removed]
+        return global_new_graph
+
+
+def find_consumers(graph: Graph, tensor: Tensor):
+    ret = []
+    for node in graph.nodes:
+        if any([input_tensor.logic == tensor.logic for input_tensor in node.inputs]):
+            ret.append(node)
+    return ret
+
+def find_producers(graph: Graph, tensor: Tensor):
+    ret = []
+    for node in graph.nodes:
+        if any([output_tensor.logic == tensor.logic for output_tensor in node.outputs]):
+            ret.append(node)
+    return ret
 
 
 class Recompute(Parallelizer):
     def run(self, g: Graph, config: Config) -> Graph:
+        global global_new_graph
+        global_new_graph.nodes.clear()
+
+        # ----------------
         for node in g.nodes:
-            if type(node) in [NodeFwd]:
-                nodes = trans(node, node.op.algo.replica, 2)
-                set_affinity()  # break dependencies op0.fwd -> op1.fwd; op0.fwd' -> op0.bwd
+            if isinstance(node, (NodeFwd)):
+                origin_fwd, recompute_fwd = trans(node, node.op.algo.replica, 2)
+                consumers = find_consumers(g, origin_fwd.outputs[0])
+                for consumer in consumers:
+                    if isinstance(consumer, NodeFwd):
+                        set_affinity(origin_fwd, consumer)  # break dependencies op0.fwd -> op1.fwd; op0.fwd' -> op0.bwd
+                    else:
+                        set_affinity(recompute_fwd, consumer)  # break dependencies op0.fwd -> op1.fwd; op0.fwd' -> op0.bwd
+                        producers = list(filter(lambda x: isinstance(x, NodeBwd), find_producers(g, consumer.inputs[0])))
+                        for producer in producers:
+                            sched_t_pair(producer, recompute_fwd)
+        # ----------------
+
+        global_new_graph.nodes[:0] = [nd for nd in graph.nodes if not nd.removed]
+        return global_new_graph
+
+class ActivationSwap(Parallelizer):
+    def run(self, g: Graph, config: Config) -> Graph:
+        pass
+
+# para = DataParallelParallelizer()
+# para = DataParallelZeROParallelizer()
+# para = GradientAccumulationParallelizer()
+# para = GPipeParallelizer()
+# para = TensorParallelParallelizer()
+para = Recompute()
 
 
-para = DataParallelParallelizer()
 config = Config()
 config.num = 2
+config.stages = 2
 global_new_graph = para.run(graph, config)
 print('new_graph = \n{}'.format(global_new_graph))
