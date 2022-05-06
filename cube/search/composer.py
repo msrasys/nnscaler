@@ -166,7 +166,7 @@ class SchedulePlan:
             micro.expand_to(max_steps)
         plans = tuple(micro.execplan for micro in micros)
         schedule = np.sum(np.stack(plans, axis=-1), axis=-1)
-        if len(np.where(self.schedule > 1)[0]) > 0:
+        if len(np.where(schedule > 1)[0]) > 0:
             raise ValueError("micro plans are not composable")
         # cut off redundant steps
         for idx in range(schedule.shape[1]):
@@ -275,9 +275,35 @@ if __name__ == '__main__':
             micro.add_dependency(blocks)
             micros.append(micro)
         return  micros
+    
+    def compose_1F1B(ndevs, nmicros):
+        # premise
+        micros = uniform_staging(ndevs, nmicros)
+        print('premise micros:')
+        for micro in micros:
+            print(micro)
+        # shift
+        for mid, micro in enumerate(micros):
+            block = micro.block(0, 0)
+            for _ in range(2 * mid):
+                micro.shift(block)
+        print('shifted micros:')
+        for micro in micros:
+            print(micro)
+        assert SchedulePlan.composable(micros)
+        schedule = SchedulePlan(micros)
+        print(f'schedule (step={schedule.nsteps}):')
+        print(schedule)
+        return schedule
+            
 
     ndevs = 4
-    micros = Composer.premise(uniform_staging, ndevs)
-    for mid, micro in enumerate(micros):
-        print(f'Microbatch #{mid}:')
-        print(micro)
+    nmicros = 8
+
+    # for test
+    # micros = Composer.premise(uniform_staging, ndevs)
+    # for mid, micro in enumerate(micros):
+    #     print(f'Microbatch #{mid}:')
+    #     print(micro)
+
+    compose_1F1B(ndevs, nmicros)
