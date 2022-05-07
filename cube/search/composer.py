@@ -47,181 +47,37 @@ class Block:
         return f'f{self.mid}' if self.type == Block.BType.FW else f'b{self.mid}'
 
 
-class MicroPlan:
+class PlanBase:
 
-    def __init__(self, mid: int, ndevs: int):
-        """
-        Create an empty microbatch execution plan
-
-        mid: microbatch id
-        ndevs: number of devices
-        """
-        self.mid = mid
+    def __init__(self, ndevs: int):
         self.blocks: Dict[Tuple[int, int], Block] = dict()
-        self.execplan = np.zeros((ndevs, ndevs * 2), dtype=int)
+        self.plan = np.zeros((ndevs, ndevs * 2), dtype=int)
 
     @property
     def ndevs(self):
-        return self.execplan.shape[0]
+        return self.plan.shape[0]
 
     @property
     def nsteps(self):
-        return self.execplan.shape[1]
-
-    def expand_to(self, nsteps: int):
-        if self.nsteps < nsteps:
-            extend = nsteps - self.nsteps
-            self.execplan = np.pad(self.execplan, ((0,0),(0,extend)))
+        return self.plan.shape[1]
 
     def block(self, dev: int, step: int):
         if (dev, step) not in self.blocks:
             return None
         return self.blocks[(dev, step)]
 
-    def add_block(self, pos: Tuple[int, int], btype: Block.BType) -> Block:
+    def squeeze(self):
         """
-        Add a execution block
+        remove redundant steps
         """
-        dev, step = pos
-        if dev >= self.ndevs:
-            raise ValueError("device out of scope")
-        if step >= self.nsteps:
-            self.expand_to(step + 1)
-        if self.execplan[dev, step] != 0:
-            raise ValueError(f"Postition {pos} already has blocks")
-        block = Block(self.mid, pos, btype)
-        self.execplan[dev, step] += 1
-        self.blocks[(dev, step)] = block
-        return block
-
-    def add_dependency(self, blocks: List[Block]):
-        """
-        Add dependent blocks:
-        block[0] < block[1] < block[2] < ...
-        """
-        for idx in range(len(blocks) - 1):
-            Block.add_dependency(blocks[idx], blocks[idx+1])
-
-    def shift(self, block: Block):
-        """
-        The primitive during search
-        """
-        # check block in this plan
-        if block not in self.blocks.values():
-            raise ValueError("Block not in this micro plan")
-        dev, step = block.position
-        for after_block in block.after:
-            if step + 1 == after_block.position[1]:
-                self.shift(after_block)
-        self.execplan[dev, step] = 0
-        if step + 1 >= self.nsteps:
-            self.expand_to(self.nsteps + 1)
-        self.execplan[dev, step+1] = 1
-        # update block and self.blocks
-        block.position = (dev, step+1)
-        del self.blocks[(dev, step)]
-        self.blocks[(dev, step+1)] = block
-
-    def unshift(self, block: Block):
-        """
-        reverse shift, for search only
-        """
-        dev, step = block.position
-        if step == 0:
-            raise ValueError("unshift a block with step = 0")
-        # shift back
-        self.execplan[dev, step] = 0
-        self.execplan[dev, step-1] = 1
-        block.position = (dev, step-1)
-        del self.blocks[(dev, step)]
-        self.blocks[(dev, step-1)] = 1
-        # shift back shifted blocks
-        for after_block in block.after:
-            if step + 1 == after_block.position[1]:
-                self.unshift(after_block)
-
-    def __repr__(self):
-        namelen = 2 + self.mid // 10
-        dscp = ''
-        for dev in range(self.ndevs):
-            for step in range(self.nsteps):
-                block = self.block(dev, step)
-                if block is None:
-                    dscp += '-' * namelen + ' '
-                else:
-                    # TODO: 2 replace to namelen
-                    dscp += '{: <2}'.format(repr(block)) + ' '
-            dscp += '\n'
-        return dscp
-
-
-class SchedulePlan:
-
-    def __init__(self, micros: List[MicroPlan]):
-        self.micros = micros
-
-        # get schedules
-        max_steps = max(micro.nsteps for micro in micros)
-        for micro in micros:
-            micro.expand_to(max_steps)
-        plans = tuple(micro.execplan for micro in micros)
-        schedule = np.sum(np.stack(plans, axis=-1), axis=-1)
-        if len(np.where(schedule > 1)[0]) > 0:
-            raise ValueError("micro plans are not composable")
-        # cut off redundant steps
-        for idx in range(schedule.shape[1]):
-            if np.sum(schedule[:, -idx-1]) != 0:
+        execflag = np.sum(self.plan, axis=1)
+        for idx in range(self.nsteps):
+            if execflag[-idx-1] != 0:
                 break
-        self.schedule = schedule[:, :-idx] if idx > 0 else schedule
-
-        # get blocks
-        self.blocks = dict()
-        for micro in micros:
-            self.blocks.update(micro.blocks)
-
-    @property
-    def ndevs(self):
-        return self.schedule.shape[0]
-
-    @property
-    def nsteps(self):
-        return self.schedule.shape[1]
-
-    def block(self, dev: int, step: int):
-        if (dev, step) not in self.blocks:
-            return None
-        return self.blocks[(dev, step)]
-
-    @staticmethod
-    def composable(micros: List[MicroPlan]) -> bool:
-        max_steps = max(micro.nsteps for micro in micros)
-        for micro in micros:
-            micro.expand_to(max_steps)
-        plans = tuple(micro.execplan for micro in micros)
-        schedule = np.sum(np.stack(plans, axis=-1), axis=-1)
-        devids = np.where(schedule > 1)[0]
-        return len(devids) == 0        
-
-    @staticmethod
-    def conflict(micros: List[MicroPlan], step: int) -> bool:
-        max_steps = max(micro.nsteps for micro in micros)
-        for micro in micros:
-            micro.expand_to(max_steps)
-        plans = tuple(micro.execplan[:,step] for micro in micros)
-        schedule = np.sum(np.stack(plans, axis=-1), axis=-1)
-        cmicros = []
-        cblocks = []
-        devids, steps = np.where(schedule > 1)
-        for dev, step in zip(devids, steps):
-            for micro in micros:
-                if micro.block[dev, step] is not None:
-                    cmicros.append(micro)
-                    cblocks.append(micro.block[dev, step])
-        return cmicros, cblocks
+        self.plan = self.plan[:, :-idx] if idx > 0 else self.plan
 
     def __repr__(self):
-        nmicros = len(self.micros)
-        namelen = 2 + nmicros // 10
+        namelen = 2
         dscp = ''
         for dev in range(self.ndevs):
             for step in range(self.nsteps):
@@ -299,6 +155,140 @@ class SchedulePlan:
             plt.show()
 
 
+class MicroPlan(PlanBase):
+
+    def __init__(self, mid: int, ndevs: int):
+        """
+        Create an empty microbatch execution plan
+
+        mid: microbatch id
+        ndevs: number of devices
+        """
+        super().__init__(ndevs)
+        self.mid = mid
+
+    def expand_to(self, nsteps: int):
+        if self.nsteps < nsteps:
+            extend = nsteps - self.nsteps
+            self.plan = np.pad(self.plan, ((0,0),(0,extend)))
+
+    def add_block(self, pos: Tuple[int, int], btype: Block.BType) -> Block:
+        """
+        Add a execution block
+        """
+        dev, step = pos
+        if dev >= self.ndevs:
+            raise ValueError("device out of scope")
+        if step >= self.nsteps:
+            self.expand_to(step + 1)
+        if self.plan[dev, step] != 0:
+            raise ValueError(f"Postition {pos} already has blocks")
+        block = Block(self.mid, pos, btype)
+        self.plan[dev, step] += 1
+        self.blocks[(dev, step)] = block
+        return block
+
+    def add_dependency(self, blocks: List[Block]):
+        """
+        Add dependent blocks:
+        block[0] < block[1] < block[2] < ...
+        """
+        for idx in range(len(blocks) - 1):
+            Block.add_dependency(blocks[idx], blocks[idx+1])
+
+    def shift(self, block: Block):
+        """
+        The primitive during search
+        """
+        # check block in this plan
+        if block not in self.blocks.values():
+            raise ValueError("Block not in this micro plan")
+        dev, step = block.position
+        for after_block in block.after:
+            if step + 1 == after_block.position[1]:
+                self.shift(after_block)
+        self.plan[dev, step] = 0
+        if step + 1 >= self.nsteps:
+            self.expand_to(self.nsteps + 1)
+        self.plan[dev, step+1] = 1
+        # update block and self.blocks
+        block.position = (dev, step+1)
+        del self.blocks[(dev, step)]
+        self.blocks[(dev, step+1)] = block
+
+    def unshift(self, block: Block):
+        """
+        reverse shift, for search only
+        """
+        dev, step = block.position
+        if step == 0:
+            raise ValueError("unshift a block with step = 0")
+        # shift back
+        self.plan[dev, step] = 0
+        self.plan[dev, step-1] = 1
+        block.position = (dev, step-1)
+        del self.blocks[(dev, step)]
+        self.blocks[(dev, step-1)] = 1
+        # shift back shifted blocks
+        for after_block in block.after:
+            if step + 1 == after_block.position[1]:
+                self.unshift(after_block)
+
+
+class SchedulePlan(PlanBase):
+
+    def __init__(self, micros: List[MicroPlan]):
+        ndevs = [micro.ndevs for micro in micros]
+        if len(set(ndevs)) != 1:
+            raise ValueError(f"Device number not same: {ndevs}")
+        ndevs = ndevs[0]
+
+        super().__init__(ndevs)
+        self.micros = micros
+
+        # get schedule plans
+        max_steps = max(micro.nsteps for micro in micros)
+        for micro in micros:
+            micro.expand_to(max_steps)
+        plans = tuple(micro.plan for micro in micros)
+        schedule = np.sum(np.stack(plans, axis=-1), axis=-1)
+        if len(np.where(schedule > 1)[0]) > 0:
+            raise ValueError("micro plans are not composable")
+        self.plan = schedule
+        self.squeeze()
+
+        # set blocks
+        for micro in micros:
+            self.blocks.update(micro.blocks)
+
+    @staticmethod
+    def composable(micros: List[MicroPlan]) -> bool:
+        max_steps = max(micro.nsteps for micro in micros)
+        for micro in micros:
+            micro.expand_to(max_steps)
+        plans = tuple(micro.plan for micro in micros)
+        schedule = np.sum(np.stack(plans, axis=-1), axis=-1)
+        devids = np.where(schedule > 1)[0]
+        return len(devids) == 0        
+
+    @staticmethod
+    def conflict(micros: List[MicroPlan], step: int) -> bool:
+        max_steps = max(micro.nsteps for micro in micros)
+        for micro in micros:
+            micro.expand_to(max_steps)
+        plans = tuple(micro.plan[:,step] for micro in micros)
+        schedule = np.sum(np.stack(plans, axis=-1), axis=-1)
+        cmicros = []
+        cblocks = []
+        devids, steps = np.where(schedule > 1)
+        for dev, step in zip(devids, steps):
+            for micro in micros:
+                if micro.block[dev, step] is not None:
+                    cmicros.append(micro)
+                    cblocks.append(micro.block[dev, step])
+        return cmicros, cblocks
+
+
 class Composer:
 
     @staticmethod
@@ -357,7 +347,7 @@ if __name__ == '__main__':
             
 
     ndevs = 4
-    nmicros = 4
+    nmicros = 8
 
     # for test
     # micros = Composer.premise(uniform_staging, ndevs)
