@@ -237,7 +237,66 @@ class SchedulePlan:
     def visualize(self, outfile=None):
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
-        plt.close('all')  
+        from matplotlib.ticker import AutoMinorLocator
+        plt.close('all')
+        fig, ax = plt.subplots(figsize=(4 * self.nsteps // self.ndevs, 4))
+        renderer = fig.canvas.get_renderer()
+
+        # xaxis
+        ax.set_xlim((0, self.nsteps))
+        plt.xticks(
+            ticks=np.arange(0.5, self.nsteps+0.5, 1.0, dtype=float),
+            labels=np.arange(1, self.nsteps+1, 1, dtype=int)
+        )
+        minor_locator = AutoMinorLocator(2)
+        plt.gca().xaxis.set_minor_locator(minor_locator)
+        ax.xaxis.grid(which='minor', linestyle='--')
+        # yaxis
+        ax.set_ylim((0.5, self.ndevs+0.5))
+        plt.yticks(np.arange(1, self.ndevs+1, 1, dtype=int))
+        ax.invert_yaxis()
+
+        fontsize = [40]
+        txts = list()
+        def draw_block(block: Block, fontsize):
+            color = '#4472C4' if block.type == Block.BType.FW else '#ED7D31'
+            dev, step = block.position
+            rec = Rectangle((step, dev+0.5), 1, 1, color=color, ec='black', lw=1.5)
+            ax.add_artist(rec)
+            rx, ry = rec.get_xy()
+            cx = rx + rec.get_width() / 2.0
+            cy = ry + rec.get_height() / 2.0
+            anno = str(block.mid)
+            txt = ax.text(x=cx, y=cy, s=anno, fontsize=40, ha='center', va='center', color='w')
+            rbox = rec.get_window_extent(renderer)
+            for fs in range(fontsize[0], 1, -2):
+                txt.set_fontsize(fs)
+                tbox = txt.get_window_extent(renderer)
+                if tbox.x0 > rbox.x0 and tbox.x1 < rbox.x1 and tbox.y0 > rbox.y0 and tbox.y1 < rbox.y1:
+                    break
+            fontsize[0] = min(fontsize[0], fs)
+            txts.append(txt)
+        
+        for dev in range(self.ndevs):
+            for step in range(self.nsteps):
+                block = self.block(dev, step)
+                if block is not None:
+                    draw_block(block, fontsize)
+        # set fontsize to same
+        fontsize = fontsize[0]
+        for txt in txts:
+            txt.set_fontsize(fontsize)
+        for tick in ax.xaxis.get_major_ticks():
+            tick.label.set_fontsize(fontsize)
+        for tick in ax.yaxis.get_major_ticks():
+            tick.label.set_fontsize(fontsize)
+        plt.xlabel('Time Step', fontsize=fontsize)
+        plt.ylabel('Device', fontsize=fontsize)
+        plt.tight_layout()
+        if outfile:
+            plt.savefig(outfile)
+        else:
+            plt.show()
 
 
 class Composer:
@@ -298,7 +357,7 @@ if __name__ == '__main__':
             
 
     ndevs = 4
-    nmicros = 8
+    nmicros = 4
 
     # for test
     # micros = Composer.premise(uniform_staging, ndevs)
@@ -306,4 +365,5 @@ if __name__ == '__main__':
     #     print(f'Microbatch #{mid}:')
     #     print(micro)
 
-    compose_1F1B(ndevs, nmicros)
+    schedule = compose_1F1B(ndevs, nmicros)
+    schedule.visualize('out.png')
