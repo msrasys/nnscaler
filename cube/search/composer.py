@@ -2,7 +2,7 @@
 Abstraction layer for microb-batch execution plan merge.
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 from enum import Enum
 
@@ -16,23 +16,12 @@ class Block:
         FW = 'forward'
         BW = 'backward'
 
-    def __init__(self, mid: int, pos: Tuple[int, int], btype: BType):
+    def __init__(self, mid: int, btype: BType):
         self.mid: int = mid
         self.type = btype
-        self._position = tuple(pos)
         # dependency track
         self.before: List[Block] = list()
         self.after: List[Block] = list()
-
-    @property
-    def position(self):
-        return self._position
-
-    @position.setter
-    def position(self, pos: Tuple[int, int]):
-        if len(pos) != 2:
-            raise ValueError("Expected positition to be Tuple[int, int]")
-        self._position = pos
 
     @staticmethod
     def add_dependency(before, after):
@@ -51,6 +40,7 @@ class PlanBase:
 
     def __init__(self, ndevs: int):
         self.blocks: Dict[Tuple[int, int], Block] = dict()
+        self.positions: Dict[int, Tuple[int, int]] = dict()
         self.plan = np.zeros((ndevs, ndevs * 2), dtype=int)
 
     @property
@@ -62,9 +52,22 @@ class PlanBase:
         return self.plan.shape[1]
 
     def block(self, dev: int, step: int):
+        """
+        Get block given a position
+        """
         if (dev, step) not in self.blocks:
             return None
         return self.blocks[(dev, step)]
+    
+    def position(self, block: Block) -> Optional[Tuple[int, int]]:
+        """
+        Get (dev, step) position given a block.
+        If block not in this plan, return None
+        """
+        if id(block) in self.positions:
+            return self.positions[id(block)]
+        else:
+            return None
 
     def squeeze(self):
         """
@@ -114,9 +117,9 @@ class PlanBase:
 
         fontsize = [40]
         txts = list()
-        def draw_block(block: Block, fontsize):
+        def draw_block(block: Block, position: Tuple[int, int], fontsize):
             color = '#4472C4' if block.type == Block.BType.FW else '#ED7D31'
-            dev, step = block.position
+            dev, step = position
             rec = Rectangle((step, dev+0.5), 1, 1, color=color, ec='black', lw=1.5)
             ax.add_artist(rec)
             rx, ry = rec.get_xy()
@@ -137,7 +140,7 @@ class PlanBase:
             for step in range(self.nsteps):
                 block = self.block(dev, step)
                 if block is not None:
-                    draw_block(block, fontsize)
+                    draw_block(block, self.position(block), fontsize)
         # set fontsize to same
         fontsize = fontsize[0]
         for txt in txts:
@@ -183,9 +186,10 @@ class MicroPlan(PlanBase):
             self.expand_to(step + 1)
         if self.plan[dev, step] != 0:
             raise ValueError(f"Postition {pos} already has blocks")
-        block = Block(self.mid, pos, btype)
+        block = Block(self.mid, btype)
         self.plan[dev, step] += 1
         self.blocks[(dev, step)] = block
+        self.positions[id(block)] = (dev, step)
         return block
 
     def add_dependency(self, blocks: List[Block]):
@@ -196,43 +200,55 @@ class MicroPlan(PlanBase):
         for idx in range(len(blocks) - 1):
             Block.add_dependency(blocks[idx], blocks[idx+1])
 
-    def shift(self, block: Block):
+    def copy(self):
         """
-        The primitive during search
+        copy a micro plan
         """
-        # check block in this plan
-        if block not in self.blocks.values():
-            raise ValueError("Block not in this micro plan")
-        dev, step = block.position
-        for after_block in block.after:
-            if step + 1 == after_block.position[1]:
-                self.shift(after_block)
-        self.plan[dev, step] = 0
-        if step + 1 >= self.nsteps:
-            self.expand_to(self.nsteps + 1)
-        self.plan[dev, step+1] = 1
-        # update block and self.blocks
-        block.position = (dev, step+1)
-        del self.blocks[(dev, step)]
-        self.blocks[(dev, step+1)] = block
+        micro = MicroPlan(self.ndevs, self.mid)
+        micro.plan = np.array(self.plan, copy=True)
+        micro.blocks.update(self.blocks)
+        micro.positions.update(self.positions)
+        return micro
 
-    def unshift(self, block: Block):
+    def shift(self, block: Block, inplace=True):
+        """
+        The primitive: shift a block by pushing one step later
+        """
+        micro = self if inplace else self.copy()
+        # check block in this plan
+        if block not in micro.blocks.values():
+            raise ValueError("Block not in this micro plan")
+        dev, step = micro.position(block)
+        for after_block in block.after:
+            if step + 1 == micro.position(after_block)[1]:
+                micro.shift(after_block, inplace=True)
+        micro.plan[dev, step] = 0
+        if step + 1 >= micro.nsteps:
+            micro.expand_to(micro.nsteps + 1)
+        micro.plan[dev, step+1] = 1
+        # update blocks and positions
+        del micro.blocks[(dev, step)]
+        micro.blocks[(dev, step+1)] = block
+        micro.positions[id(block)] = (dev, step+1)
+
+    def unshift(self, block: Block, inplace=True):
         """
         reverse shift, for search only
         """
-        dev, step = block.position
+        micro = self if inplace else self.copy()
+        dev, step = micro.position(block)
         if step == 0:
             raise ValueError("unshift a block with step = 0")
         # shift back
-        self.plan[dev, step] = 0
-        self.plan[dev, step-1] = 1
-        block.position = (dev, step-1)
-        del self.blocks[(dev, step)]
-        self.blocks[(dev, step-1)] = 1
+        micro.plan[dev, step] = 0
+        micro.plan[dev, step-1] = 1
+        del micro.blocks[(dev, step)]
+        micro.blocks[(dev, step-1)] = 1
+        micro.positions[id(block)] = (dev, step-1)
         # shift back shifted blocks
         for after_block in block.after:
-            if step + 1 == after_block.position[1]:
-                self.unshift(after_block)
+            if step + 1 == micro.position(after_block)[1]:
+                micro.unshift(after_block, inplace=True)
 
 
 class SchedulePlan(PlanBase):
@@ -257,9 +273,10 @@ class SchedulePlan(PlanBase):
         self.plan = schedule
         self.squeeze()
 
-        # set blocks
+        # set blocks and positions
         for micro in micros:
             self.blocks.update(micro.blocks)
+            self.positions.update(micro.positions)
 
     @staticmethod
     def composable(micros: List[MicroPlan]) -> bool:
@@ -272,21 +289,25 @@ class SchedulePlan(PlanBase):
         return len(devids) == 0        
 
     @staticmethod
-    def conflict(micros: List[MicroPlan], step: int) -> bool:
+    def conflict(micros: List[MicroPlan], step: int) -> Dict[int, List[Tuple[MicroPlan, Block]]]:
+        """
+        Get conflict blocks at `step`.
+        Return the conflicted (MicroPlan, Block) grouped by device id
+        """
         max_steps = max(micro.nsteps for micro in micros)
         for micro in micros:
             micro.expand_to(max_steps)
         plans = tuple(micro.plan[:,step] for micro in micros)
         schedule = np.sum(np.stack(plans, axis=-1), axis=-1)
-        cmicros = []
-        cblocks = []
-        devids, steps = np.where(schedule > 1)
-        for dev, step in zip(devids, steps):
+        conflicts = dict()
+        devids = np.where(schedule > 1)[0]
+        for dev in devids:
+            conflicts[dev] = []
             for micro in micros:
-                if micro.block[dev, step] is not None:
-                    cmicros.append(micro)
-                    cblocks.append(micro.block[dev, step])
-        return cmicros, cblocks
+                cblock = micro.block[dev, step]
+                if cblock is not None:
+                    conflicts[dev].append((micro, cblock))
+        return conflicts
 
 
 class Composer:
@@ -296,20 +317,60 @@ class Composer:
         micros = fn(ndevs)
         return micros
 
-    @staticmethod
-    def schedule(micros, step=0):
-        # DFS search
-        while not SchedulePlan.composable(micros):
-            cmicros, cblocks = SchedulePlan.conflict(micros, step)
-            if len(cmicros) == 0:
-                step += 1
-            else:
-                for micro, block in zip(cmicros, cblocks):
-                    micro.shift(block)
-                    Composer.schedule(micros, step=step)
-                    micro.unshift(block)
-        print(f'search a plan with step {step}')
 
+    @staticmethod
+    def bfs_schedule(micros: List[MicroPlan]):
+        step = 0
+        prev_step_trace: List[List[Tuple[MicroPlan, Block]]] = [[]]
+        next_step_trace: List[List[Tuple[MicroPlan, Block]]] = []
+        while not SchedulePlan.composable(micros):
+            for trace in prev_step_trace:
+                # move accroding to trace
+                for micro, block in trace:
+                    micro.shift(block)
+                # get and solve conflicts
+                conflicts = SchedulePlan.conflict(micros, step)
+                new_trace = [] # TODO
+                search_devs = []
+                for dev, microblocks in conflicts.items():
+                    cmicros = [micro for (micro, _) in microblocks]
+                    cblocks = [block for (_, block) in microblocks]
+                    if Composer.same_plans(cmicros, start_step=step):
+                        for cmicro, cblock in zip(cmicros[1:], cblocks[1:]):
+                            trace.append((cmicro, cblock))
+                    else:
+                        search_devs.append(dev)
+                if len(search_devs) == 0:
+                    next_step_trace.append(trace)
+                else:
+                    # TODO
+                    pass
+                # move back according to trace
+                for micro, block in trace[::-1]:
+                    micro.unshift(block)
+            if len(conflicts) == 0:
+                continue
+
+
+    @staticmethod
+    def same_plans(micros: List[MicroPlan], start_step: int = 0) -> bool:
+        Composer.to_same_step(micros)
+        plans = [micro.plan[:,start_step:] for micro in micros]
+        plan = plans[0]
+        for other in plans[1:]:
+            if not np.array_equal(plan, other):
+                return False
+        return True
+    
+    @staticmethod
+    def to_same_step(micros: List[MicroPlan]):
+        """
+        extend micros to same step
+        """
+        nsteps = max(micro.nsteps for micro in micros)
+        for micro in micros:
+            micro.expand_to(nsteps)
+        return micros
 
 
 if __name__ == '__main__':
