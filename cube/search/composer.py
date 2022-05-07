@@ -2,9 +2,10 @@
 Abstraction layer for microb-batch execution plan merge.
 """
 
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 import numpy as np
 from enum import Enum
+import time
 
 
 class Block:
@@ -204,7 +205,7 @@ class MicroPlan(PlanBase):
         """
         copy a micro plan
         """
-        micro = MicroPlan(self.ndevs, self.mid)
+        micro = MicroPlan(self.mid, self.ndevs)
         micro.plan = np.array(self.plan, copy=True)
         micro.blocks.update(self.blocks)
         micro.positions.update(self.positions)
@@ -230,6 +231,7 @@ class MicroPlan(PlanBase):
         del micro.blocks[(dev, step)]
         micro.blocks[(dev, step+1)] = block
         micro.positions[id(block)] = (dev, step+1)
+        return micro
 
     def unshift(self, block: Block, inplace=True):
         """
@@ -249,6 +251,7 @@ class MicroPlan(PlanBase):
         for after_block in block.after:
             if step + 1 == micro.position(after_block)[1]:
                 micro.unshift(after_block, inplace=True)
+        return micro
 
 
 class SchedulePlan(PlanBase):
@@ -304,7 +307,7 @@ class SchedulePlan(PlanBase):
         for dev in devids:
             conflicts[dev] = []
             for micro in micros:
-                cblock = micro.block[dev, step]
+                cblock = micro.block(dev, step)
                 if cblock is not None:
                     conflicts[dev].append((micro, cblock))
         return conflicts
@@ -313,43 +316,68 @@ class SchedulePlan(PlanBase):
 class Composer:
 
     @staticmethod
-    def premise(fn, ndevs: int):
-        micros = fn(ndevs)
+    def premise(fn, ndevs: int, nmicros: int):
+        micros = fn(ndevs, nmicros)
         return micros
 
 
     @staticmethod
     def bfs_schedule(micros: List[MicroPlan]):
+        micros.sort(key=lambda m: m.mid)
         step = 0
-        prev_step_trace: List[List[Tuple[MicroPlan, Block]]] = [[]]
-        next_step_trace: List[List[Tuple[MicroPlan, Block]]] = []
-        while not SchedulePlan.composable(micros):
-            for trace in prev_step_trace:
-                # move accroding to trace
-                for micro, block in trace:
-                    micro.shift(block)
+        prev: List[List[MicroPlan]] = [micros]
+        next: List[List[MicroPlan]] = []
+        output: List[List[MicroPlan]] = []
+        while True:
+            find = False
+            print(f'solving step {step}, candidates {len(prev)}...')
+            for micros in prev:
                 # get and solve conflicts
                 conflicts = SchedulePlan.conflict(micros, step)
-                new_trace = [] # TODO
+                # input(f'conflicts: dev: {list(conflicts.keys())}, mids: {[[conf[0].mid for conf in c] for c in conflicts.values()]} | >>>')
                 search_devs = []
+                # direct shift on symetrics
                 for dev, microblocks in conflicts.items():
                     cmicros = [micro for (micro, _) in microblocks]
                     cblocks = [block for (_, block) in microblocks]
                     if Composer.same_plans(cmicros, start_step=step):
                         for cmicro, cblock in zip(cmicros[1:], cblocks[1:]):
-                            trace.append((cmicro, cblock))
+                            # print(f'shift(micro{cmicro.mid}, block<{cmicro.position(cblock)}>)')
+                            cmicro.shift(cblock, inplace=True)
                     else:
                         search_devs.append(dev)
                 if len(search_devs) == 0:
-                    next_step_trace.append(trace)
+                    micros = [micro.copy() for micro in micros]
+                    next.append(micros)
+                    if SchedulePlan.composable(micros):
+                        output.append(micros)
+                        find = True
+                # search space using different shift choice
                 else:
-                    # TODO
-                    pass
-                # move back according to trace
-                for micro, block in trace[::-1]:
-                    micro.unshift(block)
-            if len(conflicts) == 0:
-                continue
+                    slots = [[micro.mid for (micro, _) in conflicts[dev]] for dev in search_devs]
+                    # input(f'search devs: {search_devs}, slots: {slots} | >>>')
+                    for keep_mids in Composer.otho_iter(slots):
+                        shifted_micros = [micro.copy() for micro in micros]
+                        shift_mids = [
+                            [mid for mid in slot if mid != kmid] for kmid, slot in zip(keep_mids, slots)
+                        ]
+                        for dev, mids in zip(search_devs, shift_mids):
+                            for mid in mids:
+                                block = micros[mid].block(dev, step)
+                                # print(f'shift(micro{mid}, block<{(dev, step)}>)')
+                                shifted_micros[mid] = micros[mid].shift(block, inplace=False)
+                        next.append(shifted_micros)
+                        if SchedulePlan.composable(shifted_micros):
+                            output.append(shifted_micros)
+                            shifted_micros=None
+                            find = True
+            prev, next = next, []
+            if find:
+                prev = output
+                break
+            step += 1
+        schedules = [SchedulePlan(micros) for micros in prev]
+        return schedules
 
 
     @staticmethod
@@ -371,6 +399,27 @@ class Composer:
         for micro in micros:
             micro.expand_to(nsteps)
         return micros
+
+    @staticmethod
+    def otho_iter(slots: List[List[Any]]):
+        """
+        othogonal pickers
+
+        item for each slot can be randomly selected
+        """
+        if len(slots) == 0:
+            yield []
+            return
+        slot = slots[0]
+        if len(slots) == 1:
+            for item in slot:
+                yield [item]
+        else:
+            slots = slots[1:]
+            for item in slot:
+                for res in Composer.otho_iter(slots):
+                    yield [item] + res
+        return
 
 
 if __name__ == '__main__':
@@ -405,16 +454,30 @@ if __name__ == '__main__':
         print(f'schedule (step={schedule.nsteps}):')
         print(schedule)
         return schedule
+
+    def search(ndevs, nmicros):
+        # premise
+        micros = Composer.premise(uniform_staging, ndevs, nmicros)
+        
+        # search shift
+        tic = time.time()
+        schedules = Composer.bfs_schedule(micros)
+        toc = time.time()
+        print('search done. time {:.2f}s'.format(toc - tic))
+
+        
+        steps = set(schedule.nsteps for schedule in schedules)
+        assert len(steps) == 1, f"got un-consistent step set: {steps}"
+        nsteps = list(steps)[0]
+        print(f'find {len(schedules)} step-optimal schedules of step: {nsteps}')
+        for idx, schedule in enumerate(schedules):
+            print(f'Schedule #{idx+1}:')
+            print(schedule)
             
 
     ndevs = 4
-    nmicros = 8
+    nmicros = 4
 
-    # for test
-    # micros = Composer.premise(uniform_staging, ndevs)
-    # for mid, micro in enumerate(micros):
-    #     print(f'Microbatch #{mid}:')
-    #     print(micro)
-
-    schedule = compose_1F1B(ndevs, nmicros)
-    schedule.visualize('out.png')
+    # schedule = compose_1F1B(ndevs, nmicros)
+    # schedule.visualize('out.png')
+    search(ndevs, nmicros)
