@@ -295,8 +295,9 @@ class Config:
     num: int
 
 
-class Device:
-    pass
+class Device(int):
+    def __init__(self, x, base=10):
+        super().__init__(x, base)
 
 
 class Parallelizer:
@@ -356,15 +357,10 @@ def set_affinity(producer_node, consumer_node):
 
 
 from collections import namedtuple
-def idxzip(list: []):
+def index_enumerate(list: []):
     Entry = namedtuple('Entry', ['idx', 'item'])
     # return [{'idx': i, 'item': x} for i, x in enumerate(list)]
     return [Entry(i, x) for i, x in enumerate(list)]
-
-
-def xmap(func, iterables):
-    if list(map(func, iterables)) is None:
-        print('xmap ERROR')
 
 
 ### TODO how about Tx in flexflow GSPMD etc.?
@@ -386,13 +382,11 @@ class DataParallelParallelizer(Parallelizer):
         for node in g.nodes:
             if isinstance(node, (NodeData, NodeFwd, NodeBwd)):
                 nodes = trans(node, node.op.algo.batch_split, config.num)  # by batch-dim-split
-                xmap(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
+                [sched_s(node=x.item, dev=x.idx) for x in index_enumerate(nodes)]
             elif isinstance(node, (NodeOpt)):
-                nodes = trans(node, node.op.algo.replica, config.num) #replicated optimizers
-                xmap(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
+                nodes = trans(node, node.op.algo.replica, config.num)  # replicated optimizers
+                [sched_s(node=x.item, dev=x.idx) for x in index_enumerate(nodes)]
             else:
-                print(node)
-                print(type(node))
                 assert False
         # ----------------
 
@@ -409,10 +403,10 @@ class DataParallelZeROParallelizer(Parallelizer):
         for node in g.nodes:
             if isinstance(node, (NodeData, NodeFwd, NodeBwd)):
                 nodes = trans(node, node.op.algo.batch_split, config.num)  # by batch-dim-split
-                map(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
+                [sched_s(node=x.item, dev=x.idx) for x in index_enumerate(nodes)]
             elif isinstance(node, (NodeOpt)):
-                nodes = trans(node, node.op.algo.split, config.num) #split optimizers
-                map(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
+                nodes = trans(node, node.op.algo.split, config.num)  # split optimizers
+                [sched_s(node=x.item, dev=x.idx) for x in index_enumerate(nodes)]
             else:
                 assert False
         # ----------------
@@ -466,7 +460,7 @@ class GPipeParallelizer(Parallelizer):
             if isinstance(node, (NodeData, NodeFwd, NodeBwd)):
                 nodes = trans(node, node.op.algo.batch_split, config.num)  # by batch-dim-slit
                 sched_t(nodes)  # sequential order
-                xmap(lambda x: sched_s(node=x, dev=device), nodes)  # assign same stage device
+                [sched_s(node=x, dev=device) for x in nodes]  # assign same stage device
             elif isinstance(node, (NodeOpt)):
                 sched_s(node, device)
             else:
@@ -486,10 +480,10 @@ class TensorParallelParallelizer(Parallelizer):
         for node in g.nodes:
             if isinstance(node, (NodeFwd, NodeBwd, NodeOpt)):
                 nodes = trans(node, node.op.algo.tensor_split, config.num)  # by tensor-dim-slit
-                xmap(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
+                [sched_s(node=x.item, dev=x.idx) for x in index_enumerate(nodes)]
             elif isinstance(node, (NodeData)):
                 nodes = trans(node, node.op.algo.replica, config.num)
-                xmap(lambda x: sched_s(node=x.item, dev=x.idx), idxzip(nodes))
+                [sched_s(node=x.item, dev=x.idx) for x in index_enumerate(nodes)]
             else:
                 assert False
         # ----------------
@@ -525,9 +519,9 @@ class Recompute(Parallelizer):
                 consumers = find_consumers(g, origin_fwd.outputs[0])
                 for consumer in consumers:
                     if isinstance(consumer, NodeFwd):
-                        set_affinity(origin_fwd, consumer)  # break dependencies op0.fwd -> op1.fwd; op0.fwd' -> op0.bwd
+                        set_affinity(origin_fwd, consumer)  # break dependencies op0.fwd -> op1.fwd;
                     else:
-                        set_affinity(recompute_fwd, consumer)  # break dependencies op0.fwd -> op1.fwd; op0.fwd' -> op0.bwd
+                        set_affinity(recompute_fwd, consumer)  # break dependencies op0.fwd' -> op0.bwd
                         producers = list(filter(lambda x: isinstance(x, NodeBwd), find_producers(g, consumer.inputs[0])))
                         for producer in producers:
                             sched_t_pair(producer, recompute_fwd)
@@ -538,14 +532,15 @@ class Recompute(Parallelizer):
 
 class ActivationSwap(Parallelizer):
     def run(self, g: Graph, config: Config) -> Graph:
+        #TODO activate consuming NodeBwd -> Identity(CPU) + NodeBwd
         pass
 
-# para = DataParallelParallelizer()
+para = DataParallelParallelizer()
 # para = DataParallelZeROParallelizer()
 # para = GradientAccumulationParallelizer()
 # para = GPipeParallelizer()
 # para = TensorParallelParallelizer()
-para = Recompute()
+# para = Recompute()
 
 
 config = Config()
