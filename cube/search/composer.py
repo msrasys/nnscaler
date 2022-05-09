@@ -324,12 +324,13 @@ class Composer:
     @staticmethod
     def bfs_schedule(micros: List[MicroPlan]):
         micros.sort(key=lambda m: m.mid)
+        same_micros = Composer.same_plans(micros, start_step=0)
         step = 0
+        opt_step = sum(micro.nsteps for micro in micros)  # initial
         prev: List[List[MicroPlan]] = [micros]
         next: List[List[MicroPlan]] = []
-        output: List[List[MicroPlan]] = []
-        while True:
-            find = False
+        schedules: List[SchedulePlan] = []
+        while step <= opt_step:
             print(f'solving step {step}, candidates {len(prev)}...')
             for micros in prev:
                 # get and solve conflicts
@@ -348,35 +349,51 @@ class Composer:
                         search_devs.append(dev)
                 if len(search_devs) == 0:
                     micros = [micro.copy() for micro in micros]
-                    next.append(micros)
                     if SchedulePlan.composable(micros):
-                        output.append(micros)
-                        find = True
+                        schedule = SchedulePlan(micros)
+                        schedules.append(schedule)
+                        if schedule.nsteps < opt_step:
+                            print(f'find fewer steps: {schedule.nsteps}')
+                        opt_step = min(opt_step, schedule.nsteps)
+                    else:
+                        next.append(micros)
+
                 # search space using different shift choice
                 else:
                     slots = [[micro.mid for (micro, _) in conflicts[dev]] for dev in search_devs]
+                    # prune for symmetric micro batch
+                    keep_slots = None
+                    if same_micros:
+                        # pruning: always shifts on later micro batches on forward and backward
+                        keep_slots = []
+                        for dev in search_devs:
+                            mids = []
+                            fmids = [micro.mid for (micro, block) in conflicts[dev] if block.type == Block.BType.FW]
+                            bmids = [micro.mid for (micro, block) in conflicts[dev] if block.type == Block.BType.BW]
+                            if len(fmids) > 0:
+                                mids.append(min(fmids))
+                            if len(bmids) > 0:
+                                mids.append(min(bmids))
+                            keep_slots.append(mids)
                     # input(f'search devs: {search_devs}, slots: {slots} | >>>')
-                    for keep_mids in Composer.otho_iter(slots):
+                    for shift_mids in Composer.iter_shifts(slots, keep_slots):
                         shifted_micros = [micro.copy() for micro in micros]
-                        shift_mids = [
-                            [mid for mid in slot if mid != kmid] for kmid, slot in zip(keep_mids, slots)
-                        ]
                         for dev, mids in zip(search_devs, shift_mids):
                             for mid in mids:
                                 block = micros[mid].block(dev, step)
                                 # print(f'shift(micro{mid}, block<{(dev, step)}>)')
                                 shifted_micros[mid] = micros[mid].shift(block, inplace=False)
-                        next.append(shifted_micros)
                         if SchedulePlan.composable(shifted_micros):
-                            output.append(shifted_micros)
-                            shifted_micros=None
-                            find = True
+                            schedule = SchedulePlan(shifted_micros)
+                            schedules.append(schedule)
+                            if schedule.nsteps < opt_step:
+                                print(f'find fewer steps: {schedule.nsteps}')
+                            opt_step = min(opt_step, schedule.nsteps)
+                        else:
+                            next.append(shifted_micros)
             prev, next = next, []
-            if find:
-                prev = output
-                break
             step += 1
-        schedules = [SchedulePlan(micros) for micros in prev]
+        schedules = [schedule for schedule in schedules if schedule.nsteps == opt_step]
         return schedules
 
 
@@ -401,11 +418,11 @@ class Composer:
         return micros
 
     @staticmethod
-    def otho_iter(slots: List[List[Any]]):
+    def iter_bucket(slots: List[List[Any]]):
         """
         othogonal pickers
 
-        item for each slot can be randomly selected
+        item for each slot can be iteratively selected
         """
         if len(slots) == 0:
             yield []
@@ -417,9 +434,25 @@ class Composer:
         else:
             slots = slots[1:]
             for item in slot:
-                for res in Composer.otho_iter(slots):
+                for res in Composer.iter_bucket(slots):
                     yield [item] + res
         return
+    
+    @staticmethod
+    def iter_shifts(conflicts: List[List[int]], keep_candidates: List[List[int]] = None) -> List[List[int]]:
+        """
+        conflicts: the conflicted micro ids grouped by devices.
+        keep_candidates: the candidates that can be preserved with no shift. By default, None
+                         indicates every block has the opportunity to be kept.
+        Yield:
+            microbatch ids need to be shifted
+        """
+        keep_candidates = conflicts if keep_candidates is None else keep_candidates
+        for keep_mids in Composer.iter_bucket(keep_candidates):
+            shift_mids = [
+                [mid for mid in slot if mid != kmid] for kmid, slot in zip(keep_mids, conflicts)
+            ]
+            yield shift_mids
 
 
 if __name__ == '__main__':
