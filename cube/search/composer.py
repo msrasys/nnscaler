@@ -322,7 +322,8 @@ class Composer:
 
 
     @staticmethod
-    def bfs_schedule(micros: List[MicroPlan]):
+    def bfs_schedule(micros: List[MicroPlan], mem_opt=True):
+        total_status = 1
         micros.sort(key=lambda m: m.mid)
         same_micros = Composer.same_plans(micros, start_step=0)
         step = 0
@@ -330,7 +331,7 @@ class Composer:
         prev: List[List[MicroPlan]] = [micros]
         next: List[List[MicroPlan]] = []
         schedules: List[SchedulePlan] = []
-        while step <= opt_step:
+        while step < opt_step:
             print(f'solving step {step}, candidates {len(prev)}...')
             for micros in prev:
                 # get and solve conflicts
@@ -391,9 +392,14 @@ class Composer:
                             opt_step = min(opt_step, schedule.nsteps)
                         else:
                             next.append(shifted_micros)
+            total_status += len(next)
             prev, next = next, []
             step += 1
+        total_status += len(schedules)
         schedules = [schedule for schedule in schedules if schedule.nsteps == opt_step]
+        if mem_opt:
+            schedules = [SchedulePlan(Composer.memory_opt(schedule.micros)) for schedule in schedules]
+        print(f'searched {total_status} status.')
         return schedules
 
 
@@ -454,10 +460,50 @@ class Composer:
             ]
             yield shift_mids
 
+    @staticmethod
+    def memory_opt(micros: List[MicroPlan]):
+        """
+        optimize memory given a schedule plan.
+        The micros are composable.
+        """
+        nsteps = max(micro.nsteps for micro in micros)
+        for step in range(nsteps-1, -1, -1):
+            micros = Composer.memory_opt_step(micros, step)
+        return micros
+
+    @staticmethod
+    def memory_opt_step(micros: List[MicroPlan], step: int):
+        splan = sum(micro.plan for micro in micros)
+        free_steps = [np.where(splan[dev,:] == 0)[0] for dev in range(micros[0].ndevs)]
+        for micro in micros:
+            devs = np.where(micro.plan[:,step] > 0)[0]
+            for dev in devs:
+                # find non-critical forward blocks
+                block = micro.block(dev, step)
+                if block.type != Block.BType.FW:
+                    continue
+                maxstep = min(micro.position(nblock)[1] for nblock in block.after) - 1
+                if maxstep == step: # no room for shift => critical
+                    continue
+                # find maximal shift distance
+                maxshift = None
+                for t in range(maxstep, step, -1):
+                    if t in free_steps[dev]:
+                        maxshift = t - step
+                        break
+                # apply shift by `distance` times
+                if maxshift is not None:
+                    for _ in range(maxshift):
+                        micro.shift(block, inplace=True)
+        return micros
+
 
 if __name__ == '__main__':
     
     def uniform_staging(ndevs: int, nmicros=4):
+        """
+        shape be can "v" or "^"
+        """
         micros = []
         for mid in range(nmicros):
             micro = MicroPlan(mid, ndevs)
@@ -466,7 +512,7 @@ if __name__ == '__main__':
             blocks = fblocks + bblocks
             micro.add_dependency(blocks)
             micros.append(micro)
-        return  micros
+        return micros
     
     def compose_1F1B(ndevs, nmicros):
         # premise
@@ -488,7 +534,7 @@ if __name__ == '__main__':
         print(schedule)
         return schedule
 
-    def search(ndevs, nmicros):
+    def search(ndevs, nmicros, visualize=False):
         # premise
         micros = Composer.premise(uniform_staging, ndevs, nmicros)
         
@@ -502,10 +548,12 @@ if __name__ == '__main__':
         steps = set(schedule.nsteps for schedule in schedules)
         assert len(steps) == 1, f"got un-consistent step set: {steps}"
         nsteps = list(steps)[0]
-        print(f'find {len(schedules)} step-optimal schedules of step: {nsteps}')
+        print(f'find {len(schedules)} step-optimal plans (step={nsteps})')
         for idx, schedule in enumerate(schedules):
             print(f'Schedule #{idx+1}:')
             print(schedule)
+            if visualize:
+                schedule.visualize(f'planlog/plan{idx+1}.png')
             
 
     ndevs = 4
