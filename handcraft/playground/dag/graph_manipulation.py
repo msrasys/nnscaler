@@ -284,7 +284,7 @@ class Graph:
 
 
 graph = Graph(create_sample=True)
-print('graph = \n{}'.format(graph))
+# print('graph = \n{}'.format(graph))
 global_new_graph = Graph()
 
 # print('nodeList[{}] = \n{}'.format(len(nodeList), nodeList))
@@ -543,8 +543,8 @@ para = DataParallelParallelizer()
 # para = Recompute()
 
 
-config = Config()
-config.num = 2
-config.stages = 2
-global_new_graph = para.run(graph, config)
-print('new_graph = \n{}'.format(global_new_graph))
+# config = Config()
+# config.num = 2
+# config.stages = 2
+# global_new_graph = para.run(graph, config)
+# print('new_graph = \n{}'.format(global_new_graph))

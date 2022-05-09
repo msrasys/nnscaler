@@ -1,7 +1,3 @@
-from graph_manipulation import *
-
-
-
 # general transformations
 '''
 Op := I -> Op (pre-identity)
@@ -9,7 +5,7 @@ Op := Op -> I (post-identity)
 Op := Op, Op (replicate)
 '''
 
-# batch transformation (due to operator sample-wise)
+# batch transformation (due to DL operators are sample-wise)
 '''
 DataLoader
     split (output)activation
@@ -47,5 +43,4 @@ Conv2D
 '''
 
 
-def trans(node, )->Node:
-    pass
+
