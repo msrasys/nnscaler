@@ -101,6 +101,8 @@ class Sign2Op:
         #pytorch1.11
         __ttemplate('linear'): function.Linear,
 
+        __ttemplate('cat'): function.Cat,
+
         #einops
         __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
 

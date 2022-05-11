@@ -1,6 +1,7 @@
 from typing import Iterable, List, Optional, Union, Dict
 import string
 import copy
+from cube.graph.operator.function.cat import IRCat
 
 from cube.ir.cten import IRTensor
 from cube.graph.operator.function.einops import EinDim, IREinops
@@ -449,6 +450,15 @@ def Pad(signature, inputs):
     tensors = inputs[0:1]
     pad, mode, value = inputs[1:]
     return IRPad(signature, tensors, 'pad', pad=pad, mode=mode, value=value)
+
+def Cat(signature, inputs):
+    """
+    torch.cat(inputs: List[Tensor], dim: int) -> Tensor
+    """
+    tensors : List[IRTensor]
+    dim : int
+    tensors, dim = inputs
+    return IRCat(signature, tensors, 'cat', dim=dim)
 
 def ScriptEinOps(signature, inputs):
     """
