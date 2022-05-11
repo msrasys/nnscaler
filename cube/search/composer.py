@@ -1,8 +1,10 @@
 """
+The Tetris.
+
 Abstraction layer for microb-batch execution plan merge.
 """
 
-from typing import Any, Dict, List, Tuple, Optional, Union
+from typing import Any, Callable, Dict, List, Tuple, Optional, Union
 import numpy as np
 from enum import Enum
 import time
@@ -340,7 +342,7 @@ class Composer:
     def bfs_schedule(micros: List[MicroPlan], mem_opt=True):
         total_status = 1
         micros.sort(key=lambda m: m.mid)
-        same_micros = Composer.same_plans(micros, start_step=0)
+        block_hash = Composer.construct_hash(micros) # False # Composer.same_plans(micros, start_step=0)
         step = 0
         opt_step = sum(micro.nsteps for micro in micros)  # initial
         prev: List[List[MicroPlan]] = [micros]
@@ -352,13 +354,17 @@ class Composer:
                 # get and solve conflicts
                 conflicts = SchedulePlan.conflict(micros, step)
                 # input(f'conflicts: dev: {list(conflicts.keys())}, mids: {[[conf[0].mid for conf in c] for c in conflicts.values()]} | >>>')
-                for shifts in Composer.iter_shifts(conflicts, step, prune_same_micro=True, keep_early_fw=same_micros):
+                for shifts in Composer.iter_shifts(conflicts, step, prune_same_micro=True, block_hash=block_hash):
                     # print(f"step {step}: {shifts}")
                     shifted_micros = [micro.copy() for micro in micros]
                     for cblock in shifts:
                         cmid = cblock.mid
                         cmicro = shifted_micros[cmid]
                         cmicro.shift(cblock, inplace=True)
+                    # print(f"solved results: ")
+                    # for micro in shifted_micros:
+                    #     print(f'microbatch #{micro.mid}:')
+                    #     print(micro)
                     if SchedulePlan.composable(shifted_micros):
                         schedule = SchedulePlan(shifted_micros)
                         schedules.append(schedule)
@@ -386,7 +392,42 @@ class Composer:
             if not np.array_equal(plan, other):
                 return False
         return True
-    
+
+    @staticmethod
+    def construct_hash(micros: List[MicroPlan]) -> Callable:
+        """
+        construct a hashing function to map "same" blocks into a same integer.
+
+        The "same" blocks refer to the same-position blocks of same micro plans.
+        """
+        # group same micro plans
+        same_plans: List[List[MicroPlan]] = [[]]
+        for micro in micros:
+            for smicros in same_plans:
+                if Composer.same_plans(smicros + [micro]):
+                    smicros.append(micro)
+                    break
+            else:
+                same_plans.append([micro])
+        print(f'detecting {len(same_plans)} same-microplan groups: {[[plan.mid for plan in smicros] for smicros in same_plans]}')
+        # for each micro plan group, group same hash functions
+        gid = 0
+        block2gid: Dict[int, int] = dict()
+        for smicros in same_plans:
+            positions: Dict[Tuple[Tuple[int], int], List[Block]] = dict()
+            for micro in smicros:
+                for pos, block in micro.blocks.items():
+                    if pos not in positions:
+                        positions[pos] = []
+                    positions[pos].append(block)
+            for blocks in positions.values():
+                for block in blocks:
+                    block2gid[id(block)] = gid
+                gid += 1
+        def blockhash(block: Block) -> int:
+            return block2gid[id(block)]
+        return blockhash
+
     @staticmethod
     def to_same_step(micros: List[MicroPlan]):
         """
@@ -401,7 +442,7 @@ class Composer:
     def iter_shifts(conflicts: Dict[int, List[Tuple[MicroPlan, Block]]],
                     step: int,
                     prune_same_micro = True,
-                    keep_early_fw = False) -> List[Block]:
+                    block_hash = Union[None, Callable]) -> List[Block]:
         """
         Enumerate shifted blocks to resolve conflicts on step `step`.
         """
@@ -420,59 +461,58 @@ class Composer:
                         cblocks = cblocks[:idx] + cblocks[idx+1:]
                         cmicros = cmicros[:idx] + cmicros[idx+1:]
                 if len(cblocks) <= 1:
+                    next_shifts.append(shifts)
                     continue
-                # pruning tech (for same micro plans): keep forward and backward blocks with smallest mid
-                if keep_early_fw:
-                    fcblocks = [cblock for cblock in cblocks if cblock.type == Block.BType.FW]
-                    bcblocks = [cblock for cblock in cblocks if cblock.type == Block.BType.BW]
-                    candidates = []
-                    if len(fcblocks) > 0:
-                        candidates.append(fcblocks[0])
-                    if len(bcblocks) > 0:
-                        candidates.append(bcblocks[0])
-                    for kblock in candidates:
-                        idx = cblocks.index(kblock)
-                        # keep blocks on the idx while shifts the rest
-                        nshifts = shifts + cblocks[:idx] + cblocks[idx+1:]
-                        # if the reserved block executes on multiple devices,
-                        # then the rest device must shift all other blocks
-                        for odev in cmicros[idx].position(kblock)[0]:
-                            if odev != dev:
-                                for _, ocblock in conflicts[odev]:
-                                    if ocblock != cblocks[idx] and ocblock not in nshifts:
-                                        nshifts.append(ocblock)
-                        next_shifts.append(shifts + cblocks[:idx] + cblocks[idx+1:])
-                # pruning tech: if micro plan is same, keep the first block
-                elif prune_same_micro:
-                    if Composer.same_plans(cmicros, start_step=step):
-                        shifts = shifts + cblocks[1:]
-                        next_shifts.append(shifts)
-                    else:
-                        for idx in range(len(cblocks)):
-                            # keep blocks on the idx while shifts the rest
-                            nshifts = shifts + cblocks[:idx] + cblocks[idx+1:]
-                            # if the reserved block executes on multiple devices,
-                            # then the rest device must shift all other blocks
-                            for odev in cmicros[idx].position(cblocks[idx])[0]:
-                                if odev != dev:
-                                    for _, ocblock in conflicts[odev]:
-                                        if ocblock != cblocks[idx] and ocblock not in nshifts:
-                                            nshifts.append(ocblock)
-                            next_shifts.append(nshifts)
-                # full conflicted space search
-                else:
-                    for idx in range(len(cblocks)):
-                        # keep blocks on the idx while shifts the rest
-                        nshifts = shifts + cblocks[:idx] + cblocks[idx+1:]
-                        # if the reserved block executes on multiple devices,
-                        # then the rest device must shift all other blocks
-                        for odev in cmicros[idx].position(cblocks[idx])[0]:
-                            if odev != dev:
-                                for _, ocblock in conflicts[odev]:
-                                    if ocblock != cblocks[idx] and ocblock not in nshifts:
-                                        nshifts.append(ocblock)
-                        next_shifts.append(nshifts)
 
+                candidates = []
+                if block_hash is not None:
+                    gids = [block_hash(cblock) for cblock in cblocks]
+                    for gid in set(gids):
+                        gblocks = [cblock for cblock, cgid in zip(cblocks, gids) if cgid == gid]
+                        gmids = [gblock.mid for gblock in gblocks]
+                        idx = gmids.index(min(gmids))
+                        candidates.append(gblocks[idx])
+                else:
+                    candidates = cblocks
+                
+                if prune_same_micro:
+                    if Composer.same_plans(cmicros, start_step=step):
+                        candidates = [candidates[0]]
+
+                # pruning tech (for same micro plans): keep forward and backward blocks with smallest mid
+                # if keep_early_fw:
+                #     fcblocks = [cblock for cblock in cblocks if cblock.type == Block.BType.FW]
+                #     bcblocks = [cblock for cblock in cblocks if cblock.type == Block.BType.BW]
+                #     candidates = []
+                #     if len(fcblocks) > 0:
+                #         candidates.append(fcblocks[0])
+                #     if len(bcblocks) > 0:
+                #         candidates.append(bcblocks[0])
+                #     for kblock in candidates:
+                #         idx = cblocks.index(kblock)
+                #         # keep blocks on the idx while shifts the rest
+                #         nshifts = shifts + cblocks[:idx] + cblocks[idx+1:]
+                #         # if the reserved block executes on multiple devices,
+                #         # then the rest device must shift all other blocks
+                #         for odev in cmicros[idx].position(kblock)[0]:
+                #             if odev != dev and odev in conflicts:
+                #                 for _, ocblock in conflicts[odev]:
+                #                     if ocblock != cblocks[idx] and ocblock not in nshifts:
+                #                         nshifts.append(ocblock)
+                #         next_shifts.append(shifts + cblocks[:idx] + cblocks[idx+1:])
+                # pruning tech: if micro plan is same, keep the first block
+                for kblock in candidates:
+                    idx = cblocks.index(kblock)
+                    # keep blocks on the idx while shifts the rest
+                    nshifts = shifts + cblocks[:idx] + cblocks[idx+1:]
+                    # if the reserved block executes on multiple devices,
+                    # then the rest device must shift all other blocks
+                    for odev in cmicros[idx].position(kblock)[0]:
+                        if odev != dev and odev in conflicts:
+                            for _, ocblock in conflicts[odev]:
+                                if ocblock != cblocks[idx] and ocblock not in nshifts:
+                                    nshifts.append(ocblock)
+                    next_shifts.append(nshifts)
             prev_shifts, next_shifts = next_shifts, []
         for shifts in prev_shifts:
             yield shifts
@@ -524,7 +564,10 @@ if __name__ == '__main__':
     
     def uniform_staging(ndevs: int, nmicros=4):
         """
-        shape be can "v" or "^"
+        f            b
+         f         b  
+           f     b    
+             f b      
         """
         micros = []
         for mid in range(nmicros):
@@ -533,6 +576,32 @@ if __name__ == '__main__':
             bblocks = [micro.add_block((ndevs-1-sid, sid+ndevs), Block.BType.BW) for sid in range(ndevs)]
             blocks = fblocks + bblocks
             micro.add_dependency(blocks)
+            micros.append(micro)
+        return micros
+
+    def mbart_staging(ndevs: int, nmicros=4):
+        """
+        f f  f         b   b b
+        f  f f         b b   b
+        f    f f     b b     b
+        f    f   f b   b     b
+        """
+        micros = []
+        for mid in range(nmicros):
+            micro = MicroPlan(mid, ndevs)
+            fblocks = []
+            bblocks = []
+            for step in range(ndevs+2):
+                if step in [0, ndevs // 2+1]:
+                    fblock = micro.add_block((tuple(range(ndevs)), step), Block.BType.FW)
+                    bblock = micro.add_block((tuple(range(ndevs)), (ndevs+2)*2-1-step), Block.BType.BW)
+                else:
+                    dev = step - 1 if step < ndevs//2+1 else step - 2
+                    fblock = micro.add_block((dev, step), Block.BType.FW)
+                    bblock = micro.add_block((dev, (ndevs+2)*2-1-step), Block.BType.BW)
+                fblocks.append(fblock)
+                bblocks.append(bblock)
+            micro.add_dependency(fblocks+bblocks[::-1])
             micros.append(micro)
         return micros
     
@@ -559,6 +628,12 @@ if __name__ == '__main__':
     def search(ndevs, nmicros, visualize=False):
         # premise
         micros = Composer.premise(uniform_staging, ndevs, nmicros)
+        # micros = Composer.premise(mbart_staging, ndevs, nmicros)
+        print('============== Premise ================')
+        for idx, micro in enumerate(micros):
+            print(f'microbatch #{idx}:')
+            print(micro)
+        print('============== Premise ================')
         
         # search shift
         tic = time.time()
@@ -584,3 +659,13 @@ if __name__ == '__main__':
     # schedule = compose_1F1B(ndevs, nmicros)
     # schedule.visualize('out.png')
     search(ndevs, nmicros, visualize=False)
+
+    # micros = mbart_staging(ndevs, nmicros)
+    # for idx, micro in enumerate(micros):
+    #     print(f'microbatch #{idx}:')
+    #     print(micro)
+    # 
+    # micros[0].shift(micros[0].block(0, 0))
+    # micros[0].shift(micros[0].block(0, 2))
+    # micros[0].shift(micros[0].block(0, 5))
+    # print(micros[0])
