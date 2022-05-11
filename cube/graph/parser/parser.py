@@ -23,6 +23,7 @@ class ScriptNodeKind(enum.Enum):
     PrimListUnpack = 8
     PrimTupleUnpack = 9
     PrimPythonOp = 10
+    PrimGetDevice = 11
 
 
 class ScriptModuleParser:
@@ -152,6 +153,8 @@ class ScriptModuleParser:
             return ScriptNodeKind.PrimListUnpack
         if node.kind() == 'prim::PythonOp':
             return ScriptNodeKind.PrimPythonOp
+        if node.kind() == 'prim::device':
+            return ScriptNodeKind.PrimGetDevice
         raise RuntimeError(f"Unkown node kind {node.kind()} from torchscript module")
 
     @staticmethod
@@ -178,6 +181,8 @@ class ScriptModuleParser:
                 return ScriptModuleParser.parse_prim_list_unpack_node(node, module, frame)
             if node_type == ScriptNodeKind.PrimPythonOp:
                 return ScriptModuleParser.parse_prim_python_op_node(node, module, frame)
+            if node_type == ScriptNodeKind.PrimGetDevice:
+                return ScriptModuleParser.parse_prim_get_device_node(node, module, frame)
             raise NotImplementedError(f"Un-supported node type {node_type}")
         except Exception:
             raise RuntimeError(f"\n\nParsing error at node:\n\t{node}\n")
@@ -253,6 +258,15 @@ class ScriptModuleParser:
                 tensor = input_val[0]
                 output: List[int] = list(tensor.shape)
             frame.add_var(outputs[0].debugName(), output)
+            return []
+        # aten::tensor(elems: List[T], dtype:ScalarType, device:Device, requires_grad:bool) -> Tensor
+        elif fsig == 'torch.tensor':
+            # originally 'aten::tensor' 
+            var_name = outputs[0].debugName()
+            elems, dtype, device, requires_grad = input_val
+            kDefaultType = DType2IRDType.map(dtype)
+            ir_tensor = IRFullTensor(shape=[len(elems)], name=var_name, requires_grad=requires_grad, dtype=kDefaultType)
+            frame.add_var(var_name, ir_tensor)
             return []
 
         # create IR node
@@ -442,6 +456,18 @@ class ScriptModuleParser:
     def parse_prim_python_op_node(node, module, frame):
         raise NotImplementedError("Cannot support torch.jit.ignore")
         print(dir(node))
+
+    @staticmethod
+    def parse_prim_get_device_node(node, module, frame):
+        inputs = list(node.inputs())
+        outputs = list(node.outputs())
+        if len(inputs) != 1:
+            raise RuntimeError("Find prim::device has not exactly one input")
+        if len(outputs) != 1:
+            raise RuntimeError("Find prim::device has not exactly one output")
+        input = frame.get_var(inputs[0].debugName())
+        frame.add_var(outputs[0].debugName(), "TODO DEFINE THE DEVICE")
+        return []
 
     @staticmethod
     def flatten(smodule, depth=0):
