@@ -564,10 +564,10 @@ if __name__ == '__main__':
     
     def uniform_staging(ndevs: int, nmicros=4):
         """
-        f            b
-         f         b  
-           f     b    
-             f b      
+        f             b
+          f         b  
+            f     b    
+              f b      
         """
         micros = []
         for mid in range(nmicros):
@@ -604,6 +604,31 @@ if __name__ == '__main__':
             micro.add_dependency(fblocks+bblocks[::-1])
             micros.append(micro)
         return micros
+
+    def chimera_staging(ndevs: int, nmicros: int):
+        """
+        f             b        f b
+          f         b        f     b
+            f     b        f         b
+              f b        f             b
+        """
+        micros = []
+        assert nmicros % 2 == 0, "require microbatch# can be divided by 2."
+        for mid in range(nmicros // 2):  # V shape
+            micro = MicroPlan(mid, ndevs)
+            fblocks = [micro.add_block((sid, sid), Block.BType.FW) for sid in range(ndevs)]
+            bblocks = [micro.add_block((ndevs-1-sid, sid+ndevs), Block.BType.BW) for sid in range(ndevs)]
+            blocks = fblocks + bblocks
+            micro.add_dependency(blocks)
+            micros.append(micro)
+        for mid in range(nmicros // 2): # ^ shape
+            micro = MicroPlan(mid + nmicros // 2, ndevs)
+            fblocks = [micro.add_block((ndevs-1-sid, sid), Block.BType.FW) for sid in range(ndevs)]
+            bblocks = [micro.add_block((sid, sid+ndevs), Block.BType.BW) for sid in range(ndevs)]
+            blocks = fblocks + bblocks
+            micro.add_dependency(blocks)
+            micros.append(micro)
+        return micros
     
     def compose_1F1B(ndevs, nmicros):
         # premise
@@ -627,7 +652,8 @@ if __name__ == '__main__':
 
     def search(ndevs, nmicros, visualize=False):
         # premise
-        micros = Composer.premise(uniform_staging, ndevs, nmicros)
+        # micros = Composer.premise(uniform_staging, ndevs, nmicros)
+        micros = Composer.premise(chimera_staging, ndevs, nmicros)
         # micros = Composer.premise(mbart_staging, ndevs, nmicros)
         print('============== Premise ================')
         for idx, micro in enumerate(micros):
