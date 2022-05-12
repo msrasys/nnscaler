@@ -309,61 +309,114 @@ def View(signature, inputs):
         raise TypeError("Expected tensor.view has static int shape")
     in_shape, ou_shape = list(input.shape), shape
 
-    # shape check
+    # infer -1
     def nele(shape, nele=1):
         for dimlen in shape: nele *= dimlen
         return nele
-    # handle '-1' in shape
+
     cnt = nele(in_shape)
     if -1 in ou_shape:
         idx = ou_shape.index(-1)
         ou_shape[idx] = cnt // (-nele(ou_shape))
     assert nele(in_shape) == nele(ou_shape), "shape mismatch"
+
     # generate annotation
-    shape_map: Dict[str, int] = dict()
+    rest_inshape = [dimlen for dimlen in in_shape]
+    rest_oushape = [dimlen for dimlen in ou_shape]
+    chain = []
+    can_bucket = True
+    while len(rest_inshape) != 0 or len(rest_oushape) != 0:
+        if len(rest_inshape) == 0:
+            chain = chain + rest_oushape
+            rest_oushape = []
+        elif len(rest_oushape) == 0:
+            chain = chain + rest_inshape
+            rest_inshape = []
+        else:
+            dimlen = min(rest_inshape[0], rest_oushape[0])
+            if max(rest_inshape[0], rest_oushape[0]) % dimlen == 0:
+                chain.append(dimlen)
+                if dimlen == rest_inshape[0]:
+                    rest_inshape.pop(0)
+                else:
+                    rest_inshape[0] = rest_inshape[0] // dimlen
+                if dimlen == rest_oushape[0]:
+                    rest_oushape.pop(0)
+                else:
+                    rest_oushape[0] = rest_oushape[0] // dimlen
+            else:
+                can_bucket = False
+                print(rest_inshape, rest_oushape)
+                # assert False
+                break
+
     letters = iter(string.ascii_lowercase)
-    in_anno, ou_anno = [], []
-    in_dim, ou_dim = 0, 0
-    in_remain, ou_remain = in_shape[in_dim], ou_shape[ou_dim]
-    in_bracket, ou_bracket = [], []
-    in_dimlen, ou_dimlen = 1, 1
-    while True:
-        letter = next(letters)
-        dimlen = min(in_remain, ou_remain)
-        in_dimlen, ou_dimlen = in_dimlen * dimlen, ou_dimlen * dimlen
-        in_remain, ou_remain = in_remain // dimlen, ou_remain // dimlen
-        in_bracket.append(letter)
-        ou_bracket.append(letter)
-        shape_map[letter] = dimlen
-        if in_remain == 1:
-            in_anno.append(in_bracket)
-            in_bracket, in_dimlen = [], 1
-            in_dim += 1
-            if in_dim < len(in_shape):
-                in_remain = in_shape[in_dim]
-        if ou_remain == 1:
-            ou_anno.append(ou_bracket)
-            ou_bracket, ou_dimlen = [], 1
-            ou_dim += 1
-            if ou_dim < len(ou_shape):
-                ou_remain = ou_shape[ou_dim]
-        if in_dim == len(in_shape) and ou_dim == len(ou_shape):
-            break
-    # setup reduction: only first dimension can be spatially partitioned
+    if can_bucket:
+        inchain = ouchain = chain
+        inedims = ouedims = edims = [next(letters) for _ in chain]
+    else:
+        inchain, ouchain = in_shape, ou_shape
+        inedims = [str(dimlen) for dimlen in in_shape]
+        ouedims = [str(dimlen) for dimlen in ou_shape]
+        chain = inchain + ouchain
+        edims = inedims + ouedims
+
+    shape_map: Dict[str, int] = {edim: eshape for (edim, eshape) in zip(edims, chain)}
+    print(inchain)
+
+    # generate input and output shape annotations
+    def buckets(shape: List[int], chain: List[int], edims: List[int]) -> List[List[str]]:
+        anno = []
+        dimidx = 0
+        for idx, dimlen in enumerate(shape):
+            elements, bracket = 1, []
+            maxele = len(chain) - dimidx - (len(shape) - 1 - idx)
+            while True:
+                if len(bracket) == maxele:
+                    assert elements == dimlen, f"internal match error1: {bracket}"
+                    break
+                if dimidx >= len(chain) or elements * chain[dimidx] > dimlen:
+                    assert elements == dimlen, f"internal match error2: {bracket}"
+                    break
+                else:
+                    elements *= chain[dimidx]
+                    bracket.append(edims[dimidx])
+                    dimidx += 1
+            anno.append(bracket)
+        return anno
+
+    in_anno = buckets(in_shape, inchain, inedims)
+    ou_anno = buckets(ou_shape, ouchain, ouedims)
+    print(in_anno, ou_anno)
+
+    # postprocess on dimlen == 1
+    shape_map['1'] = 1
+    for bracket in in_anno + ou_anno:
+        for subdim, edim in enumerate(bracket):
+            if shape_map[edim] == 1:
+                bracket[subdim] = str(shape_map[edim])
+
+    # find out the axis that can be partitioned
     spatial_in = set()
     spatial_ou = set()
     for in_bracket in in_anno:
-        spatial_in.add(in_bracket[0])
+        for edim in in_bracket:
+            if edim != '1':
+                spatial_in.add(edim)
+                break
     for ou_bracket in ou_anno:
-        spatial_ou.add(ou_bracket[0])
+        for edim in ou_bracket:
+            spatial_ou.add(edim)
     spatial = spatial_in.intersection(spatial_ou)
+
     for bracket in in_anno + ou_anno:
         for subdim, edim in enumerate(bracket):
             if edim not in spatial:
                 bracket[subdim] = str(shape_map[edim])
                 # bracket[subdim] = edim + '^'
     anno = _create_anno([in_anno], [ou_anno])
-    return IREinops(signature, [anno], [input], 'view', shape=shape)
+    print(f'torch.view anno: {anno}')
+    return IREinops(signature, [anno], [input], 'view', shape=tuple(shape))
 
 
 def Reshape(signature, inputs):
