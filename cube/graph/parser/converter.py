@@ -15,7 +15,8 @@ def convert_model(model: torch.nn.Module,
     """
     try:
         smodule = torch.jit.script(model)
-    except Exception:
+    except Exception as ex:
+        print(ex)
         raise RuntimeError("Cannot convert module into torchscript moudle.")
     module_name = smodule.original_name
     inputs, nodes, outputs = ScriptModuleParser.parse_module(smodule, input_shapes)

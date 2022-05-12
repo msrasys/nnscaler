@@ -1,7 +1,11 @@
 import torch
 import torch.nn.functional as F
 
+from cube.runtime.syndata import SciLoopVariables
+
 torch.set_default_tensor_type(torch.DoubleTensor)
+
+import cube
 
 
 class WRF(torch.nn.Module):
@@ -108,7 +112,7 @@ class WRF(torch.nn.Module):
 
         return U, V, W, O, Theta, phi1, mu1
 
-    def step(self, dtau, ntau, U, V, W, O, Theta, phi1, mu1, R_U, R_V, R_W, R_Theta, R_phi, R_mu):
+    def step(self, dtau:float, ntau:int, U, V, W, O, Theta, phi1, mu1, R_U, R_V, R_W, R_Theta, R_phi, R_mu):
         # initialize perturbed varibles
         U2 = torch.zeros(U.shape, device=self.device)
         V2 = torch.zeros(V.shape, device=self.device)
@@ -133,7 +137,7 @@ class WRF(torch.nn.Module):
 
         return U + U2, V + V2, W + W2, O + O2, Theta + Theta2, phi1 + phi2, mu1 + mu2
 
-    def ac_step(self, dtau,
+    def ac_step(self, dtau:float,
                 U2, V2, W2, O2, Theta2, phi2, mu2, pi2,
                 R_U, R_V, R_W, R_Theta, R_phi, R_mu,
                 U, V, Theta, phi, mu, alpha, p):
@@ -188,19 +192,12 @@ class WRF(torch.nn.Module):
         # print('Theta2_:\t', Theta2_.min(), Theta2_.max())
         # Theta2_ = torch.zeros(Theta2_.shape, device=Theta2_.device)
 
-        def f(x):
-            phi2_ = phi2 + dtau * (
-                R_phi - (O2_ * self.dz(self.bz(self.pzphi(phi))) - self.g * (x + W2) * 0.5) / self.bz(mu))
-            return (
-                R_W + (
-                    self.dz(C * self.dz(self.pz(phi2_))) + self.dz(self.GAMMA * p * Theta2_ / Theta) - self.bz(mu2_) +
-                    self.dz(C * self.dz(self.pz(phi2))) + self.dz(self.GAMMA * p * Theta2 / Theta) - self.bz(mu2)
-                ) * 0.5 * self.g
-            ) * dtau + W2 - x
+        W2_ = self.solve_tridiagonal_(
+            phi2, dtau, R_phi, phi, W2, mu, R_W, p, Theta, Theta2, mu2,
+            O2_, C, Theta2_, mu2_)
 
-        W2_ = self.solve_tridiagonal(f)
-        if torch.abs(f(W2_)).max() > 1e-6:
-            print("Triangular solver warning:\t", torch.abs(f(W2_)).max())
+        #if torch.abs(f(W2_)).max() > 1e-6:
+        #    print("Triangular solver warning:\t", torch.abs(f(W2_)).max())
         W2_ = W2_ / (1 + self.damping(phi, 0.2, self.ztop * 0.75) * dtau)
         # print((1 + self.damping(phi, 0.8, self.ztop * 0.75) * dtau)[:, 64, 64])
 
@@ -212,7 +209,7 @@ class WRF(torch.nn.Module):
 
         return U2_, V2_, W2_, O2_, Theta2_, phi2_, mu2_, pi2
 
-    def damping(self, phi, gamma, zd):
+    def damping(self, phi, gamma:float, zd):
         z = phi / self.g
         res = gamma * torch.sin(torch.pi / 2 * (1 - (self.ztop - z) / (self.ztop - zd)))**2
         return res * z.gt(zd).double()
@@ -233,7 +230,7 @@ class WRF(torch.nn.Module):
         R_U = (
             # pressure term
             - self.bx(mu) * (
-                + self.dx(self.bz(self.pz(phi1)))
+                self.dx(self.bz(self.pz(phi1)))
                 + self.bx(alpha) * self.dx(p1)
                 + self.bx(alpha1) * self.dx(self.p0))
             - self.dx(self.bz(self.pzphi(phi))) * (self.dz(self.bx(self.pzp1(self.bz(p1)))) - self.bx(mu1))
@@ -245,7 +242,7 @@ class WRF(torch.nn.Module):
         R_V = (
             # pressure term
             - self.by(mu) * (
-                + self.dy(self.bz(self.pz(phi1)))
+                self.dy(self.bz(self.pz(phi1)))
                 + self.by(alpha) * self.dy(p1)
                 + self.by(alpha1) * self.dy(self.p0))
             - self.dy(self.bz(self.pzphi(phi))) * (self.dz(self.by(self.pzp1(self.bz(p1)))) - self.by(mu1))
@@ -256,7 +253,8 @@ class WRF(torch.nn.Module):
         )
         R_W = (
             # pressure term
-            + self.g * (self.dz(p1) - self.bz(self.mu0) * 0.0) - self.bz(mu1) * self.g
+            #+ self.g * (self.dz(p1) - self.bz(self.mu0) * 0.0) - self.bz(mu1) * self.g
+            self.g * (self.dz(p1) - self.bz(self.mu0) * 0.0) - self.bz(mu1) * self.g
             # advection term
             - self.dx(self.px(self.bz(U) * self.bx(w)))
             - self.dy(self.py(self.bz(V) * self.by(w)))
@@ -336,28 +334,47 @@ class WRF(torch.nn.Module):
         filter = torch.tensor([1., 1.], device=X.device).view(1, 1, 2, 1, 1)
         return F.conv3d(X.view(1, 1, nz, ny, nx), filter).view(nz - 1, ny, nx) / 2.
 
-    def solve_tridiagonal(self, f):
-        r"""Solve tridiagonal system f(x) = Ax - b = 0
+    def tridiagonal_system(self, 
+                           phi2, dtau:float, R_phi, phi, W2, mu, R_W, p, Theta, Theta2, mu2,
+                           O2_, C, Theta2_, mu2_,
+                           x):
+        phi2_ = phi2 + dtau * (
+            R_phi - (O2_ * self.dz(self.bz(self.pzphi(phi))) - self.g * (x + W2) * 0.5) / self.bz(mu))
+        return (
+            R_W + (
+                self.dz(C * self.dz(self.pz(phi2_))) + self.dz(self.GAMMA * p * Theta2_ / Theta) - self.bz(mu2_) +
+                self.dz(C * self.dz(self.pz(phi2))) + self.dz(self.GAMMA * p * Theta2 / Theta) - self.bz(mu2)
+            ) * 0.5 * self.g
+        ) * dtau + W2 - x
 
-        Args:
-            f (Callable, return Tensor): Tridiagonal system (nz - 1, ny, nx) -> (nz - 1, ny, nx)
+    def solve_tridiagonal_(self,
+                           phi2, dtau:float, R_phi, phi, W2, mu, R_W, p, Theta, Theta2, mu2,
+                           O2_, C, Theta2_, mu2_):
+        b = - self.tridiagonal_system(
+            phi2, dtau, R_phi, phi, W2, mu, R_W, p, Theta, Theta2, mu2,
+            O2_, C, Theta2_, mu2_,
+            torch.zeros((self.nz - 1, self.ny, self.nx), device=self.device))
 
-        Returns:
-            Tensor: Solution of the linear system with shape (D, H, W)
-        """
-        b = - f(torch.zeros((self.nz - 1, self.ny, self.nx), device=self.device))
-
-        idx0 = torch.tensor([1., 0, 0], device=self.device).view(3, 1, 1)
+        idx0 = torch.tensor([1., 0., 0.], device=self.device).view(3, 1, 1)
         idx0 = idx0.repeat((self.nz - 1) // 3 + 1, self.ny, self.nx)[:self.nz - 1]
-        r0 = f(idx0) + b
+        r0 = self.tridiagonal_system(
+            phi2, dtau, R_phi, phi, W2, mu, R_W, p, Theta, Theta2, mu2,
+            O2_, C, Theta2_, mu2_,
+            idx0) + b
 
-        idx1 = torch.tensor([0., 1, 0], device=self.device).view(3, 1, 1)
+        idx1 = torch.tensor([0., 1., 0.], device=self.device).view(3, 1, 1)
         idx1 = idx1.repeat((self.nz - 1) // 3 + 1, self.ny, self.nx)[:self.nz - 1]
-        r1 = f(idx1) + b
+        r1 = self.tridiagonal_system(
+            phi2, dtau, R_phi, phi, W2, mu, R_W, p, Theta, Theta2, mu2,
+            O2_, C, Theta2_, mu2_,
+            idx1) + b
 
-        idx2 = torch.tensor([0., 0, 1], device=self.device).view(3, 1, 1)
+        idx2 = torch.tensor([0., 0., 1.], device=self.device).view(3, 1, 1)
         idx2 = idx2.repeat((self.nz - 1) // 3 + 1, self.ny, self.nx)[:self.nz - 1]
-        r2 = f(idx2) + b
+        r2 = self.tridiagonal_system(
+            phi2, dtau, R_phi, phi, W2, mu, R_W, p, Theta, Theta2, mu2,
+            O2_, C, Theta2_, mu2_,
+            idx2) + b
 
         d = (torch.stack([r0, r1, r2], 1) * torch.stack([idx0, idx1, idx2], 1)).sum(1)
         l = (torch.stack([r2, r0, r1], 1) * torch.stack([idx0, idx1, idx2], 1)).sum(1)[1:]
@@ -404,8 +421,18 @@ if __name__ == "__main__":
     W = torch.zeros((nz - 1, ny, nx)).cuda()
     O = torch.zeros((nz - 1, ny, nx)).cuda()
 
+    varloader = SciLoopVariables(variables=[U, V, W, O, Theta, phi1, mu1], constants=[])
+    model = cube.SemanticModel(wrf, input_shapes=tuple(varloader.shapes))
+
+    @cube.compile(model=model, dataloader=varloader)
+    def train_iter(model, dataloader):
+        U, V, W, O, Theta, phi1, mu1 = dataloader
+        U, V, W, O, Theta, phi1, mu1 = model(U, V, W, O, Theta, phi1, mu1)
+        return U, V, W, O, Theta, phi1, mu1 
+    model = model.get_gen_module()
+
     for i in range(10):
-        U, V, W, O, Theta, phi1, mu1 = wrf(U, V, W, O, Theta, phi1, mu1)
+        U, V, W, O, Theta, phi1, mu1 = train_iter(model, varloader)
         mu = wrf.mu0 + mu1
         u = U / wrf.bx(mu)
         v = V / wrf.by(mu)
