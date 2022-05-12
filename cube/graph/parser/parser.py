@@ -1,7 +1,7 @@
 import torch
 import enum
 import re
-from typing import List, Tuple, Optional
+from typing import Any, List, Tuple, Optional
 
 from cube.graph import IRFwOperation
 from cube.graph.tensor import IRFullTensor
@@ -10,6 +10,9 @@ from cube.graph.parser.mapping import Sign2Op, DType2IRDType
 
 
 _refmodule = torch.nn.Module()
+
+class ErasedDevice:
+    pass
 
 
 class ScriptNodeKind(enum.Enum):
@@ -23,7 +26,7 @@ class ScriptNodeKind(enum.Enum):
     PrimListUnpack = 8
     PrimTupleUnpack = 9
     PrimPythonOp = 10
-    PrimGetDevice = 11
+    PrimDevice = 11       # erased
 
 
 class ScriptModuleParser:
@@ -154,7 +157,7 @@ class ScriptModuleParser:
         if node.kind() == 'prim::PythonOp':
             return ScriptNodeKind.PrimPythonOp
         if node.kind() == 'prim::device':
-            return ScriptNodeKind.PrimGetDevice
+            return ScriptNodeKind.PrimDevice
         raise RuntimeError(f"Unkown node kind {node.kind()} from torchscript module")
 
     @staticmethod
@@ -181,8 +184,11 @@ class ScriptModuleParser:
                 return ScriptModuleParser.parse_prim_list_unpack_node(node, module, frame)
             if node_type == ScriptNodeKind.PrimPythonOp:
                 return ScriptModuleParser.parse_prim_python_op_node(node, module, frame)
-            if node_type == ScriptNodeKind.PrimGetDevice:
-                return ScriptModuleParser.parse_prim_get_device_node(node, module, frame)
+
+            # TODO bother assigning all ignored prim functions new NodeKinds?
+            if node_type == ScriptNodeKind.PrimDevice:
+                return ScriptModuleParser.parse_value_erased_node(node, module, frame, [ErasedDevice()])
+
             raise NotImplementedError(f"Un-supported node type {node_type}")
         except Exception:
             raise RuntimeError(f"\n\nParsing error at node:\n\t{node}\n")
@@ -259,13 +265,17 @@ class ScriptModuleParser:
                 output: List[int] = list(tensor.shape)
             frame.add_var(outputs[0].debugName(), output)
             return []
-        # aten::tensor(elems: List[T], dtype:ScalarType, device:Device, requires_grad:bool) -> Tensor
+        # aten::tensor(elems: List^{n:Nat}[T], dtype:Optional[ScalarType], device:Device, requires_grad:bool) -> Tensor
         elif fsig == 'torch.tensor':
             # originally 'aten::tensor' 
             var_name = outputs[0].debugName()
-            elems, dtype, device, requires_grad = input_val
-            kDefaultType = DType2IRDType.map(dtype)
-            ir_tensor = IRFullTensor(shape=[len(elems)], name=var_name, requires_grad=requires_grad, dtype=kDefaultType)
+            elems, dtype, erased_device, requires_grad = input_val
+
+            # dtype may be None, in PyTorch it's to infer dtype from 'elems'.
+            if dtype == None:
+                dtype = DType2IRDType.map(torch.get_default_dtype())
+
+            ir_tensor = IRFullTensor(shape=[len(elems)], name=var_name, requires_grad=requires_grad, dtype=dtype)
             frame.add_var(var_name, ir_tensor)
             return []
 
@@ -458,16 +468,15 @@ class ScriptModuleParser:
         print(dir(node))
 
     @staticmethod
-    def parse_prim_get_device_node(node, module, frame):
-        inputs = list(node.inputs())
+    def parse_value_erased_node(node, module, frame, erased_vals: List[Any]):
         outputs = list(node.outputs())
-        if len(inputs) != 1:
-            raise RuntimeError("Find prim::device has not exactly one input")
-        if len(outputs) != 1:
-            raise RuntimeError("Find prim::device has not exactly one output")
-        input = frame.get_var(inputs[0].debugName())
-        frame.add_var(outputs[0].debugName(), "TODO DEFINE THE DEVICE")
+
+        assert len(outputs) == len(erased_vals)
+        for output, erased_val in zip(outputs, erased_vals):
+            frame.add_var(output.debugName(), erased_vals)
         return []
+
+
 
     @staticmethod
     def flatten(smodule, depth=0):
