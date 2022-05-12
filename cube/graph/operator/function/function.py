@@ -347,8 +347,6 @@ def View(signature, inputs):
                     rest_oushape[0] = rest_oushape[0] // dimlen
             else:
                 can_bucket = False
-                print(rest_inshape, rest_oushape)
-                # assert False
                 break
 
     letters = iter(string.ascii_lowercase)
@@ -361,9 +359,7 @@ def View(signature, inputs):
         ouedims = [str(dimlen) for dimlen in ou_shape]
         chain = inchain + ouchain
         edims = inedims + ouedims
-
     shape_map: Dict[str, int] = {edim: eshape for (edim, eshape) in zip(edims, chain)}
-    print(inchain)
 
     # generate input and output shape annotations
     def buckets(shape: List[int], chain: List[int], edims: List[int]) -> List[List[str]]:
@@ -388,7 +384,6 @@ def View(signature, inputs):
 
     in_anno = buckets(in_shape, inchain, inedims)
     ou_anno = buckets(ou_shape, ouchain, ouedims)
-    print(in_anno, ou_anno)
 
     # postprocess on dimlen == 1
     shape_map['1'] = 1
@@ -416,7 +411,6 @@ def View(signature, inputs):
                 bracket[subdim] = str(shape_map[edim])
                 # bracket[subdim] = edim + '^'
     anno = _create_anno([in_anno], [ou_anno])
-    print(f'torch.view anno: {anno}')
     return IREinops(signature, [anno], [input], 'view', shape=tuple(shape))
 
 
