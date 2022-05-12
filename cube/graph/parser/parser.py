@@ -472,8 +472,8 @@ class ScriptModuleParser:
         outputs = list(node.outputs())
 
         assert len(outputs) == len(erased_vals)
-        for output, erased_val in zip(outputs, erased_vals):
-            frame.add_var(output.debugName(), erased_vals)
+        for output, ev in zip(outputs, erased_vals):
+            frame.add_var(output.debugName(), ev)
         return []
 
 
