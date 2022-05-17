@@ -1,6 +1,7 @@
-from ast import Call
 from typing import Callable, List, Optional
 import copy
+import numpy as np
+
 from cube.graph.adapter.adapter import IRAdapter
 from cube.graph.operator.operator import IRBpOperation, IRFwOperation
 
@@ -149,7 +150,6 @@ class ExectuionPlan:
             if isinstance(node, IRAdapter):
                 return '#70AD47'  # excel green
 
-        graph = self.graph
         for node in self.graph.nodes():
             span, mem = map2time(node), map2mem(node)
             for device in node.device:
@@ -179,11 +179,13 @@ class ExectuionPlan:
             [tline[-1][1] for tline in device_timeline if len(tline) != 0]
         )
         max_mem = max(device_peak_mem)
+        # max_mem = sum(device_peak_mem)
 
         # draw the timeline
         if outfile is not None:
             import matplotlib.pyplot as plt
             from matplotlib.patches import Rectangle
+            from matplotlib.ticker import AutoMinorLocator
             plt.close('all')
             plt.rcParams['figure.figsize'] = (4.0 * max_time // ndevice, 4.0)
             fig, ax = plt.subplots()
@@ -191,16 +193,19 @@ class ExectuionPlan:
 
             # xaxis
             ax.set_xlim((1, max_time))
-            plt.xticks(list(range(1, int(max_time)+1, 1)))
-            ax.xaxis.grid(True, linestyle='--')
+            plt.xticks(
+                ticks=np.arange(1.5, max_time+0.5, 1.0, dtype=float),
+                labels=np.arange(1, max_time, 1, dtype=int)
+            )
+            minor_locator = AutoMinorLocator(2)
+            plt.gca().xaxis.set_minor_locator(minor_locator)
+            ax.xaxis.grid(which='minor', linestyle='--')
             # yaxis
             ax.set_ylim((0.5, len(self.devices())+0.5))
             plt.yticks(list(range(1, len(self.devices())+1, 1)))
             ax.invert_yaxis()
 
-            ax.set_aspect('equal')
-
-            fontsize = 100
+            fontsize = 40
             txts = list()
             for devid in range(ndevice):
                 timeline = device_timeline[devid]
@@ -220,7 +225,7 @@ class ExectuionPlan:
                     txt = ax.text(x=cx, y=cy, s=anno, fontsize=40, ha='center', va='center', color='w')
 
                     rbox = rec.get_window_extent(renderer)
-                    for fs in range(40, 1, -2):
+                    for fs in range(fontsize, 1, -2):
                         txt.set_fontsize(fs)
                         tbox = txt.get_window_extent(renderer)
                         if tbox.x0 > rbox.x0 and tbox.x1 < rbox.x1 and tbox.y0 > rbox.y0 and tbox.y1 < rbox.y1:
