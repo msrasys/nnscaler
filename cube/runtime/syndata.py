@@ -160,8 +160,8 @@ class SynDataLoader(CubeDataLoader):
                 datas.append(data)
             self.datas.append(datas)
 
-    def reset(self, batch_size: int):
-        super().reset(batch_size)
+    def set_batch_size(self, batch_size: int):
+        super().set_batch_size(batch_size)
         self.set_data_buffer()
 
     def __next__(self):
