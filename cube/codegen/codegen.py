@@ -1,7 +1,7 @@
 """
 Generate Pytorch code given the model DAG and the transformation config
 """
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Union
 import torch
 import copy
 from cube.graph.parser.mapping import Sign2Op
@@ -19,6 +19,7 @@ from cube.execplan import ExectuionPlan
 
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
+from cube.codegen.register import VarManager
 
 
 class CodeGen:
@@ -377,18 +378,42 @@ class ScheduleCodeGen(CodeGen):
             'import torch', 'import cube', '']
         # module member name
         self.symbols = SymbolTable()
+        self.vars = VarManager()
 
     def gen(self, device: int, outfile=None, attach=False) -> str:
         """
         Generate scheduling code based on the given sus
         """
         gencode = copy.copy(self.init_code)
+        self.vars = VarManager()
 
         device_nodes = self.execplan.sequence(device)
         for idx, node in enumerate(device_nodes):
             if isinstance(node, IRAdapter):
                 node = node.dispatch(rank=device)
                 device_nodes[idx] = node
+
+        def refcount(tensor, node) -> int:
+            idx = device_nodes.index(node)
+            refcnt = 0
+            for ref_node in device_nodes[idx+1:]:
+                if isinstance(ref_node, IRGraph):
+                    if all([isinstance(rnode, IRFwOperation) for rnode in ref_node.nodes()]):
+                        if tensor in ref_node.inputs():
+                            refcnt += 1
+                    else:
+                        finputs = ref_node.mirror.inputs()
+                        foutputs = ref_node.mirror.outputs()
+                        grad_in = [t.grad for t in foutputs]
+                        if tensor in finputs + foutputs + grad_in:
+                            refcnt += 1
+                else:
+                    if tensor in ref_node.inputs():
+                        refcnt += 1
+            return refcnt
+
+        for node in device_nodes:
+            print(f'dev{device}: {node}')
 
         # generate code
         with FunctionBlock(func_name='_train_step', 
@@ -400,6 +425,12 @@ class ScheduleCodeGen(CodeGen):
                 name = self.node_naming(node)
                 code = self.emit_node(node, name=name)
                 fb.insert_body(code)
+                # free unused tensor
+                for tensor in node.inputs() + node.outputs():
+                    if isinstance(tensor, IRSubTensor) and not tensor.is_param():
+                        refcnt = refcount(tensor, node)
+                        if refcnt == 0:
+                            self.vars.free(tensor)
             # return code
             outputs = self.return_naming(self.execplan.graph.outputs())
             code = f'return {outputs}'
@@ -483,14 +514,13 @@ class ScheduleCodeGen(CodeGen):
             tensors = ', '.join(tensors)
         return tensors
 
-    def tensor_naming(self, tensor: Any):
+    def tensor_naming(self, tensor: Union[IRSubTensor, Any]):
         """
         Generate tensor name.
 
         Will add prefix 'model.' for parameters
         """
-        name = super().tensor_naming(tensor)
-        if isinstance(tensor, IRSubTensor):
-            if tensor.is_param():
-                name = 'model.' + name
-        return name
+        if isinstance(tensor, IRSubTensor) and tensor.is_param():
+            return 'model.' + self.vars.allocate(tensor)
+        else:
+            return self.vars.allocate(tensor)
