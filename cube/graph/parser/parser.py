@@ -265,6 +265,15 @@ class ScriptModuleParser:
                 output: List[int] = list(tensor.shape)
             frame.add_var(outputs[0].debugName(), output)
             return []
+
+        # aten::__getitem__.t(t[](a) list, int idx) -> t(*)"
+        # REMARK List-type only. '__getitem__' cannot serve as accessor to tensor element.
+        elif fsig == 'torch.__getitem__':
+            # NOTE there are other overloadings of '__getitem__' for 'str'(i.e. char list), 'Dict(t)' in TorchScript
+            container, index = input_val
+            frame.add_var(outputs[0].debugName(), container[index])
+            return []
+
         # aten::tensor(elems: List^{n:Nat}[T], dtype:Optional[ScalarType], device:Device, requires_grad:bool) -> Tensor
         elif fsig == 'torch.tensor':
             # originally 'aten::tensor' 
@@ -279,18 +288,30 @@ class ScriptModuleParser:
             frame.add_var(var_name, ir_tensor)
             return []
 
-        # create IR node
-        ir_node = Sign2Op.map(fsig)(inputs=input_val)
-        if len(ir_node.outputs()) != len(outputs):
-            raise RuntimeError(
-                f"Parse fail: {fsig} has {len(outputs)} outputs != pre-defined {len(ir_node.outputs())}"
-            )
+        # May be a symbolic object i.e. IRFwOperation,
+        # or, occasionally this node can be statically evaluated, therefore a concrete value
+        result = Sign2Op.map(fsig)(inputs=input_val)
 
-        # handle outputs
-        for index, output in enumerate(outputs):
-            frame.add_var(output.debugName(), ir_node.outputs(index))
+        if isinstance(result, IRFwOperation):
+            # to create IR node
 
-        return [ir_node]
+            ir_node = result
+            if len(ir_node.outputs()) != len(outputs):
+                raise RuntimeError(
+                    f"Parse fail: {fsig} has {len(outputs)} outputs != pre-defined {len(ir_node.outputs())}"
+                )
+
+            # handle outputs
+            for index, output in enumerate(outputs):
+                frame.add_var(output.debugName(), ir_node.outputs(index))
+
+            return [ir_node]
+
+        else:
+            # concrete value.
+            assert len(outputs) == 1, "Cases with multiple outputs are only List/Tuple-Unpack and handled specially"
+            frame.add_var(outputs[0].debugName(), result)
+            return []
 
     @staticmethod
     def parse_prim_method_node(node, module, frame: Frame) -> List[IRFwOperation]:
