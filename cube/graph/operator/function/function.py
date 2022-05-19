@@ -83,15 +83,28 @@ def BatchLinear(signature, inputs):
 
 
 def Add(signature, inputs):
-    assert len(inputs) == 3
-    inputs, alpha = inputs[0:2], inputs[2]
+    if len(inputs) == 2:
+        kwargs = {}
+    elif len(inputs) == 3:
+        alpha = inputs[2]
+        kwargs = {'alpha': alpha}
+        inputs = inputs[0:2]
+    else:
+        raise RuntimeError("The number of inputs must be 2 or 3")
+
+    lhs, rhs = inputs
+
+    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
+        # In this case there won't be an 'alpha' parameter.
+        assert not('alpha' in kwargs)
+        return lhs + rhs
+
     annos = [
         '*, 1 -> *',
         '1, * -> *',
         '*, * -> *',
     ]
     # broadcast
-    lhs, rhs = inputs
     if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
        len(lhs.shape) == len(rhs.shape):
         if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
@@ -107,19 +120,33 @@ def Add(signature, inputs):
                     oshape[dim] = lshape[dim]
                     rshape[dim] = str(rhs.shape[dim])
             annos = [_create_anno([lshape, rshape], [oshape])]
-    return IREinops(signature, annos, inputs, 'add', alpha=alpha)
+    return IREinops(signature, annos, inputs, 'add', **kwargs)
 
 
 def Sub(signature, inputs):
-    assert len(inputs) == 3
-    inputs, alpha = inputs[0:2], inputs[2]
+    if len(inputs) == 2:
+        alpha = 1
+        kwargs = {}
+    elif len(inputs) == 3:
+        alpha = inputs[2]
+        kwargs = {'alpha': alpha}
+        inputs = inputs[0:2]
+    else:
+        raise RuntimeError("The number of inputs must be 2 or 3")
+    
+    lhs, rhs = inputs
+
+    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
+        # In this case there won't be an 'alpha' parameter.
+        assert not('alpha' in kwargs)
+        return lhs - rhs
+
     annos = [
         '*, 1 -> *',
         '1, * -> *',
         '*, * -> *',
     ]
     # broadcast
-    lhs, rhs = inputs
     if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
        len(lhs.shape) == len(rhs.shape):
         if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
@@ -135,17 +162,21 @@ def Sub(signature, inputs):
                     oshape[dim] = lshape[dim]
                     rshape[dim] = str(rhs.shape[dim])
             annos = [_create_anno([lshape, rshape], [oshape])]
-    return IREinops(signature, annos, inputs, 'sub', alpha=alpha)
+    return IREinops(signature, annos, inputs, 'sub', **kwargs)
 
 
 def Mul(signature, inputs):
+    lhs, rhs = inputs
+
+    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
+        return lhs * rhs
+
     annos = [
         '*, 1 -> *',
         '1, * -> *',
         '*, * -> *',
     ]
     # broadcast
-    lhs, rhs = inputs
     if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
        len(lhs.shape) == len(rhs.shape):
         if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
@@ -165,13 +196,20 @@ def Mul(signature, inputs):
 
 
 def Div(signature, inputs):
+    lhs, rhs = inputs
+
+    if isinstance(lhs, int) and isinstance(rhs, int):
+        # only if both operands are int, do we do floor division.
+        return lhs // rhs
+    elif isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
+        return lhs / rhs
+
     annos = [
         '*, 1 -> *',
         '1, * -> *',
         '*, * -> *',
     ]
     # broadcast
-    lhs, rhs = inputs
     if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
        len(lhs.shape) == len(rhs.shape):
         if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
@@ -188,6 +226,37 @@ def Div(signature, inputs):
                     rshape[dim] = str(rhs.shape[dim])
             annos = [_create_anno([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, 'div')
+
+
+def Pow(signature, inputs):
+    lhs, rhs = inputs
+
+    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
+        return lhs ** rhs
+
+    annos = [
+        '*, 1 -> *',
+        '1, * -> *',
+        '*, * -> *',
+    ]
+    # broadcast
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
+       len(lhs.shape) == len(rhs.shape):
+        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
+            # TODO: support spatial partitioning on broadcast dim
+            lshape = _create_eshape(lhs.shape)
+            rshape = copy.copy(lshape)
+            oshape = copy.copy(lshape)
+            for dim in range(len(lhs.shape)):
+                if lhs.shape[dim] < rhs.shape[dim]:
+                    oshape[dim] = rshape[dim]
+                    lshape[dim] = str(lhs.shape[dim])
+                elif lhs.shape[dim] > rhs.shape[dim]:
+                    oshape[dim] = lshape[dim]
+                    rshape[dim] = str(rhs.shape[dim])
+            annos = [_create_anno([lshape, rshape], [oshape])]
+    return IREinops(signature, annos, inputs, 'pow')
+
 
 def Neg(signature, inputs):
     annos = ['* -> *']

@@ -2,7 +2,7 @@
 Mapping of
     Signature -> IROperator
 """
-from typing import Dict
+from typing import Any, Callable, Dict, Union
 import torch
 
 from functools import partial
@@ -15,7 +15,7 @@ import cube.ir as ir
 class Sign2Op:
 
     @staticmethod
-    def map(signature: str) -> IRFwOperation:
+    def map(signature: str) -> Callable[..., Union[IRFwOperation, int, float]]:
         """
         Map the signature to GenericLogicalOp
         """
@@ -27,7 +27,7 @@ class Sign2Op:
             # return partial(function.UnkownOperator, signature=signature)
 
     @staticmethod
-    def register(signature: str, op: IRFwOperation, code):
+    def register(signature: str, op: Callable[..., Union[IRFwOperation, int, float]], code):
         """
         Register an operator
         """
@@ -79,6 +79,8 @@ class Sign2Op:
         __ttemplate('div') : function.Div,
 
         __ttemplate('neg'): function.Neg,
+
+        __ttemplate('pow'): function.Pow,
 
         __ttemplate('sin'): function.Sin,
 
