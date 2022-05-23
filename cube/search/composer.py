@@ -479,28 +479,6 @@ class Composer:
                     if Composer.same_plans(cmicros, start_step=step):
                         candidates = [candidates[0]]
 
-                # pruning tech (for same micro plans): keep forward and backward blocks with smallest mid
-                # if keep_early_fw:
-                #     fcblocks = [cblock for cblock in cblocks if cblock.type == Block.BType.FW]
-                #     bcblocks = [cblock for cblock in cblocks if cblock.type == Block.BType.BW]
-                #     candidates = []
-                #     if len(fcblocks) > 0:
-                #         candidates.append(fcblocks[0])
-                #     if len(bcblocks) > 0:
-                #         candidates.append(bcblocks[0])
-                #     for kblock in candidates:
-                #         idx = cblocks.index(kblock)
-                #         # keep blocks on the idx while shifts the rest
-                #         nshifts = shifts + cblocks[:idx] + cblocks[idx+1:]
-                #         # if the reserved block executes on multiple devices,
-                #         # then the rest device must shift all other blocks
-                #         for odev in cmicros[idx].position(kblock)[0]:
-                #             if odev != dev and odev in conflicts:
-                #                 for _, ocblock in conflicts[odev]:
-                #                     if ocblock != cblocks[idx] and ocblock not in nshifts:
-                #                         nshifts.append(ocblock)
-                #         next_shifts.append(shifts + cblocks[:idx] + cblocks[idx+1:])
-                # pruning tech: if micro plan is same, keep the first block
                 for kblock in candidates:
                     idx = cblocks.index(kblock)
                     # keep blocks on the idx while shifts the rest
@@ -562,7 +540,7 @@ class Composer:
 
 if __name__ == '__main__':
     
-    def uniform_staging(ndevs: int, nmicros=4):
+    def uniform_staging(ndevs: int, nmicros=4) -> List[MicroPlan]:
         """
         f             b
           f         b  
@@ -579,7 +557,7 @@ if __name__ == '__main__':
             micros.append(micro)
         return micros
 
-    def mbart_staging(ndevs: int, nmicros=4):
+    def mbart_staging(ndevs: int, nmicros=4) -> List[MicroPlan]:
         """
         f f  f         b   b b
         f  f f         b b   b
@@ -605,7 +583,7 @@ if __name__ == '__main__':
             micros.append(micro)
         return micros
 
-    def chimera_staging(ndevs: int, nmicros: int):
+    def chimera_staging(ndevs: int, nmicros: int) -> List[MicroPlan]:
         """
         f             b        f b
           f         b        f     b
@@ -653,12 +631,14 @@ if __name__ == '__main__':
     def search(ndevs, nmicros, visualize=False):
         # premise
         # micros = Composer.premise(uniform_staging, ndevs, nmicros)
-        micros = Composer.premise(chimera_staging, ndevs, nmicros)
-        # micros = Composer.premise(mbart_staging, ndevs, nmicros)
+        # micros = Composer.premise(chimera_staging, ndevs, nmicros)
+        micros = Composer.premise(mbart_staging, ndevs, nmicros)
         print('============== Premise ================')
         for idx, micro in enumerate(micros):
             print(f'microbatch #{idx}:')
             print(micro)
+            if visualize:
+                micro.visualize(f'planlog/micro{idx}.png')
         print('============== Premise ================')
         
         # search shift
