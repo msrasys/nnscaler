@@ -42,6 +42,7 @@ class MicroBatchView:
 
 
 def PAS(graph: IRGraph, resource):
+    print(graph.extra_repr())
 
     # n_microbatch, n_stage, n_device
     M, S, D = 4, 4, 4
@@ -61,7 +62,7 @@ def PAS(graph: IRGraph, resource):
 
     bucket = dict()
     cnt = 0
-    for seqs in Sampler.sample(micro_seqs, M, S, D, ssampler, tsampler):
+    for seqs in Sampler.sample(micro_seqs, M, S, D, ssampler, tsampler, wlimits, alimits):
         Searcher.search(seqs, bucket, n_worker=n_worker)
         for mem, (span, seq) in bucket.items():
             sgraph._nodes = seq

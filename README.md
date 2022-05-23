@@ -1,6 +1,11 @@
 # MagicCube
 
-AI System Compiler to compile a semantic (single-device) model to distributed model using policies specified by System Expert.
+AI System Compiler to map a semantic (single-device) model into distributed execution using policies specified by System Expert.
+
+## Prerequisite
+
+* Python >= 3.7
+* PyTorch >= 1.9
 
 ## Install
 
@@ -14,12 +19,8 @@ python setup.py develop
 * [Micro Benchmark] Run a mutiple MLP Model
 
 ```sh
-python -m torch.distributed.launch \
-    --nproc_per_node=2 \
+OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=4 \
     --nnodes=1 \
-    --node_rank=0 \
-    --master_addr=127.0.0.1 \
-    --master_port=8004 \
-    --use_env \
-    examples/linears.py
+    examples/mlp/linears.pys
 ```

@@ -50,7 +50,7 @@ class Sampler:
     """
     @staticmethod
     def sample(micro_seqs: List[List[IRCell]], n_microbatch: int, n_stage: int, n_device: int,
-               ssampler: Callable, tsampler: Callable):
+               ssampler: Callable, tsampler: Callable, wlimits: int, alimits: int):
         assert len(micro_seqs) == n_microbatch
         for seq in micro_seqs:
             assert len(seq) // 2 == n_stage
@@ -68,21 +68,43 @@ class Sampler:
                     graph.assign(fnode, devid)
 
             # pruning: add dependecies for micro-batches with same device assignment
+            # this pruning guarantees the optimal
+            # graph.reset_dependency()
+            # same_microbatch = dict()
+            # for mid, placement in enumerate(placements):
+            #     placement = tuple(placement)
+            #     if placement not in same_microbatch:
+            #         same_microbatch[placement] = list()
+            #     same_microbatch[placement].append(mid)
+            # for placement, mids in same_microbatch.items():
+            #     if len(mids) > 1:
+            #         print(f'find {mids} microbatch same, add dependency')
+            #         for sid in range(len(placement)):
+            #             # add forward dependency
+            #             graph.add_schedule([micro_seqs[mid][sid] for mid in mids])
+            #             # add backward dependency
+            #             graph.add_schedule([micro_seqs[mid][sid+len(placement)] for mid in mids])
+
+            # pruning
             graph.reset_dependency()
-            same_microbatch = dict()
-            for mid, placement in enumerate(placements):
-                placement = tuple(placement)
-                if placement not in same_microbatch:
-                    same_microbatch[placement] = list()
-                same_microbatch[placement].append(mid)
-            for placement, mids in same_microbatch.items():
-                if len(mids) > 1:
-                    print(f'find {mids} microbatch same, add dependency')
-                    for sid in range(len(placement)):
-                        # add forward dependency
-                        graph.add_schedule([micro_seqs[mid][sid] for mid in mids])
-                        # add backward dependency
-                        graph.add_schedule([micro_seqs[mid][sid+len(placement)] for mid in mids])
+            forders = [[] for _ in range(n_device)]
+            # n_device x n_stage
+            borders = [[[] for _ in range(n_stage)] for _ in range(n_device)]
+            for sid in range(n_stage):
+                for mid in range(min(n_microbatch, alimits)):
+                    devid = placements[mid][sid]
+                    forders[devid].append((mid, sid))
+                    borders[devid][n_stage - 1 - sid].append(mid)
+            for devid, order in enumerate(forders):
+                fseq = list()
+                for mid, sid in order:
+                    fseq.append(micro_seqs[mid][sid])
+                graph.add_schedule(fseq)
+            for devid, order in enumerate(borders):
+                bseq = list()
+                for sid in range(n_stage):
+                    bseq += [micro_seqs[mid][n_stage-1-sid] for mid in order[sid]]
+                graph.add_schedule(bseq)
 
             # search
             for seqs in tsampler(graph.nodes()):

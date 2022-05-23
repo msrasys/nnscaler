@@ -47,6 +47,25 @@ def factorization(K: int, num=1):
                 for res in factorization(K // i, num-1):
                     yield [i] + res
 
+def diff_balls_diff_boxes(nballs: int, nboxes: int, remain = None, placement = None):
+    balls_per_box = nballs // nboxes
+    if placement is None and remain is None:
+            # placement[ball_id] = box_id
+            placement = []
+            # remain slots: remain_slots[box_id] = int
+            remain = [balls_per_box] * nboxes
+    if len(placement) == nballs:
+        yield placement
+    for box_id, remain_balls in enumerate(remain):
+        if remain_balls > 0:
+            placement.append(box_id)
+            remain[box_id] -= 1
+            for seq in diff_balls_diff_boxes(nballs, nboxes, remain, placement):
+                yield seq
+            remain[box_id] += 1
+            placement = placement[:-1]
+    
+
 
 if __name__ == '__main__':
 

@@ -1,8 +1,6 @@
 """
 Operation grouping
 """
-
-from sqlite3 import adapt
 from typing import List, Dict, Tuple
 
 from cube.execplan import ExectuionPlan
