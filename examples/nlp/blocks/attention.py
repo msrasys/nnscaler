@@ -8,7 +8,7 @@ def self_attention(query: torch.Tensor,
                    k_proj: torch.Tensor, k_bias: torch.Tensor,
                    v_proj: torch.Tensor, v_bias: torch.Tensor,
                    out_proj: torch.Tensor, out_bias: torch.Tensor,
-                   h: int, scale: float, dropout_p: float, mask=True):
+                   h: int, scale: float, dropout_p: float, mask: bool = True):
     num_head = h
     L, N = query.size(0), query.size(1)
     dim_head = q_proj.size(0) // num_head
@@ -90,28 +90,24 @@ def cross_attention(query: torch.Tensor, key: torch.Tensor,
 
 class MultiHeadSelfAttention(torch.nn.Module):
 
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0, bias=True):
+    def __init__(self, embed_dim: int, num_heads: int, inner_dim: int, dropout: float = 0.0, bias=True):
         super().__init__()
-        self.kdim = embed_dim
-        self.vdim = embed_dim
+        self.inner_dim = inner_dim
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = inner_dim // num_heads
         self.scaling = self.head_dim ** -0.5
         self.dropout_p = dropout
         # Q
-        self.q_proj = torch.nn.Parameter(torch.empty(embed_dim, embed_dim))
-        if bias:
-            self.q_bias = torch.nn.Parameter(torch.empty(embed_dim))
-        else:
-            self.q_bias = None
+        self.q_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
+        self.q_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
         # K
-        self.k_proj = torch.nn.Parameter(torch.empty(embed_dim, self.kdim))
-        self.k_bias = torch.nn.Parameter(torch.empty(embed_dim)) if bias else None
+        self.k_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
+        self.k_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
         # V
-        self.v_proj = torch.nn.Parameter(torch.empty(embed_dim, self.vdim))
-        self.v_bias = torch.nn.Parameter(torch.empty(embed_dim)) if bias else None
+        self.v_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
+        self.v_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
         # Out
-        self.out_proj = torch.nn.Parameter(torch.empty(embed_dim, embed_dim))
+        self.out_proj = torch.nn.Parameter(torch.empty(embed_dim, inner_dim))
         self.out_bias = torch.nn.Parameter(torch.empty(embed_dim)) if bias else None
 
     def forward(self, query):
@@ -127,28 +123,24 @@ class MultiHeadSelfAttention(torch.nn.Module):
 
 class MultiHeadCrossAttention(torch.nn.Module):
 
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0, bias=True):
+    def __init__(self, embed_dim: int, num_heads: int, inner_dim: int, dropout: float = 0.0, bias=True):
         super().__init__()
-        self.kdim = embed_dim
-        self.vdim = embed_dim
+        self.inner_dim = inner_dim
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = inner_dim // num_heads
         self.scaling = self.head_dim ** -0.5
         self.dropout_p = dropout
         # Q
-        self.q_proj = torch.nn.Parameter(torch.empty(embed_dim, embed_dim))
-        if bias:
-            self.q_bias = torch.nn.Parameter(torch.empty(embed_dim))
-        else:
-            self.q_bias = None
+        self.q_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
+        self.q_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
         # K
-        self.k_proj = torch.nn.Parameter(torch.empty(embed_dim, self.kdim))
-        self.k_bias = torch.nn.Parameter(torch.empty(embed_dim)) if bias else None
+        self.k_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
+        self.k_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
         # V
-        self.v_proj = torch.nn.Parameter(torch.empty(embed_dim, self.vdim))
-        self.v_bias = torch.nn.Parameter(torch.empty(embed_dim)) if bias else None
+        self.v_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
+        self.v_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
         # Out
-        self.out_proj = torch.nn.Parameter(torch.empty(embed_dim, embed_dim))
+        self.out_proj = torch.nn.Parameter(torch.empty(embed_dim, inner_dim))
         self.out_bias = torch.nn.Parameter(torch.empty(embed_dim)) if bias else None
 
     def forward(self, query: torch.Tensor, key: torch.Tensor):

@@ -1,5 +1,5 @@
 import torch
-import math
+
 
 from examples.nlp.blocks.encoder import EncoderLayer
 
@@ -13,7 +13,7 @@ class Config:
 
     # 1.7B model
     embed_dim = 2304
-    layers = 24
+    layers = 8 # 24
     attention_heads = 24
 
     # 3.6B model
@@ -26,7 +26,8 @@ class Config:
     # layers = 32
     # attention_heads = 36
 
-    ffn_embed_dim = embed_dim * 4
+    attn_hidden_dim = embed_dim
+    ffn_hidden_dim  = embed_dim * 4
     dropout = 0.0
     attn_dropout = 0.0
     activation_dropout = 0.0
@@ -44,7 +45,8 @@ class GPT(torch.nn.Module):
 
         self.layers = torch.nn.ModuleList(
             [EncoderLayer(
-                cfg.embed_dim, cfg.attention_heads, cfg.ffn_embed_dim,
+                cfg.embed_dim, cfg.attention_heads,
+                cfg.attn_hidden_dim, cfg.ffn_hidden_dim,
                 cfg.dropout, cfg.attn_dropout, cfg.activation_dropout
             ) for _ in range(cfg.layers)]
         )

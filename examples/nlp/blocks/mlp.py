@@ -16,8 +16,9 @@ def feedforward(x: torch.Tensor,
 
 class MLP(torch.nn.Module):
 
-    def __init__(self, embed_dim, hidden_dim, dropout: float, bias=True):
+    def __init__(self, embed_dim: int, hidden_dim: int, dropout: float, bias=True):
         super().__init__()
+        print((hidden_dim, embed_dim))
         self.proj1 = torch.nn.Parameter(torch.empty((hidden_dim, embed_dim)))
         self.proj1_bias = torch.nn.Parameter(torch.empty((hidden_dim,)))
         self.proj2 = torch.nn.Parameter(torch.empty((embed_dim, hidden_dim)))
