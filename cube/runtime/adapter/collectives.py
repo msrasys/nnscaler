@@ -1,5 +1,4 @@
 from typing import List
-from unittest import defaultTestLoader
 import torch
 
 from cube.runtime.device import DeviceGroup
