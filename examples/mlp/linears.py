@@ -1,16 +1,7 @@
 """
 example:
 
-python -m torch.distributed.launch \
-    --nproc_per_node=4 \
-    --nnodes=1 \
-    --node_rank=0 \
-    --master_addr=127.0.0.1 \
-    --master_port=8004 \
-    --use_env \
-    examples/mlp/linears.py
-
-OMP_NUM_THREADS=4 torchrun --standalone \
+OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
     examples/mlp/linears.py
@@ -31,9 +22,6 @@ import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 from examples.mlp.policy.optimal import PAS
-
-# from examples.mlp.policy.col_parallel import P, A, S
-# PAS = (P, A, S)
 
 # =================== Semantic Model Description ====================
 
@@ -88,21 +76,22 @@ def train():
 
     CudaTimer(enable=False).warmup()
     torch.distributed.barrier()
-    iter_num = 128
+    iter_num = 64
+    warmup = 20
     for step in range(iter_num):
-        if step >= 40:
+        if step >= warmup:
             CudaTimer(enable=True).start('e2e')
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
-        if step >= 40:
+        if step >= warmup:
             CudaTimer().stop('e2e')
         if (step + 1) % 20 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-40, field_name='e2e')))
-    CudaTimer().print_all(times=iter_num-40)
+          CudaTimer().duration(iter_num-warmup, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num-warmup)
 
 
 if __name__ == '__main__':
