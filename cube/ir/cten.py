@@ -577,6 +577,8 @@ class IRTensor:
            not all([isinstance(size, int) for size in val]):
             raise RuntimeError("Expected shape to be list[int]")
         self._shape = copy.copy(list(val))
+        if self.grad is not None:
+            self.grad.shape = copy.copy(list(val))
 
     def nele(self) -> int:
         """
