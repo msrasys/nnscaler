@@ -13,7 +13,7 @@ import copy
 from cube.ir.cten import IRTensor, IRCell
 from cube.graph.operator.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from cube.graph.adapter.adapter import IRAdapter
-from cube.graph.tensor import IRSubTensor
+from cube.graph.tensor import IRFullTensor, IRSubTensor
 
 from cube.algorithm.generics import GenericDistAlgo
 
@@ -36,6 +36,7 @@ class IRGraph(IRCell):
 
         self._nodes: List[IRCell] = list()
         self._parameters = list()
+        self._full_tensors: Dict[int, IRFullTensor] = dict()
 
         if inputs is None:
             inputs = IRGraph.get_inputs(nodes)
@@ -54,15 +55,22 @@ class IRGraph(IRCell):
         for idx, tensor in enumerate(outputs):
             self.set_output(idx, tensor)
 
+        # set parameters and full tensors
+        for node in nodes:
+            for tensor in node.inputs() + node.outputs():
+                if isinstance(tensor, IRSubTensor):
+                    pid = tensor.parent._id
+                    self._full_tensors[pid] = tensor.parent
+                    if tensor.is_param():
+                        self._parameters.append(input)
+
+        for ftensor in self._full_tensors.values():
+            ftensor.clear_producer_consumer()
+
         # insert node from nodes
         for idx, node in enumerate(nodes):
             self.attach(node, idx)
 
-        # set parameter
-        for node in self._nodes:
-            for input in node.inputs():
-                if isinstance(input, IRTensor) and input.is_param():
-                    self._parameters.append(input)
         self.reset_dependency()
 
     def reset_dependency(self):
@@ -104,6 +112,12 @@ class IRGraph(IRCell):
         Return parameter list
         """
         return copy.copy(self._parameters)
+
+    def full_tensors(self):
+        """
+        Return full tensor list
+        """
+        return list(self._full_tensors.values())
 
     def nodes(self, index: Optional[int] = None):
         """
@@ -191,20 +205,14 @@ class IRGraph(IRCell):
         """
         if node not in self.nodes():
             raise KeyError(f"node {node} is not in graph.")
-        ops = node.nodes() if isinstance(node, IRGraph) else [node]
-        for op in ops:
-            removed = list()
-            for input in op.inputs():
-                if isinstance(input, IRSubTensor) and input not in removed:
-                    input.parent.rm_consumer(op)
-                    removed.append(input)
-            removed = list()
-            for output in op.outputs():
-                if isinstance(output, IRSubTensor) and output not in removed:
-                    output.parent.rm_producer(op)
-                    removed.append(output)
         index = self._nodes.index(node)
         self._nodes.pop(index)
+        for itensor in node.inputs():
+            if isinstance(itensor, IRSubTensor):
+                itensor.parent.rm_consumer(node)
+        for otensor in node.outputs():
+            if isinstance(otensor, IRSubTensor):
+                otensor.parent.rm_producer(node)
         if reset_dependency:
             self.reset_dependency()
         return index
@@ -218,15 +226,27 @@ class IRGraph(IRCell):
         """
         if node in self.nodes():
             raise KeyError(f"node {node} is already in graph.")
-        ops = node.nodes() if isinstance(node, IRGraph) else [node]
-        for op in ops:
-            for input in op.inputs():
-                if isinstance(input, IRSubTensor):
-                    input.parent.add_consumer(op, input)
-            for output in op.outputs():
-                if isinstance(output, IRSubTensor):
-                    output.parent.add_producer(op, output)
         self._nodes.insert(index, node)
+        # update consumer
+        for itensor in node.inputs():
+            if isinstance(itensor, IRSubTensor):
+                idx = 0
+                for consumer in itensor.parent.consumers:
+                    if self.nodes().index(consumer) < index:
+                        idx += 1
+                    else:
+                        break
+                itensor.parent.add_consumer(node, itensor, idx)
+        # update producer
+        for otensor in node.outputs():
+            if isinstance(otensor, IRSubTensor):
+                idx = 0
+                for producer in otensor.parent.producers:
+                    if self.nodes().index(producer) < index:
+                        idx += 1
+                    else:
+                        break
+                otensor.parent.add_producer(node, otensor, idx)
         if reset_dependency:
             self.reset_dependency()
         return
@@ -625,3 +645,12 @@ class IRGraph(IRCell):
 
     def module_repr(self):
         return repr(self)
+
+
+class IRSegment(IRCell):
+    """
+    A segment refers to a piece of workload of IRGraph
+    """
+
+    def __init__(self, nodes: List[IRCell], inputs: List[IRTensor], outputs: List[IRTensor]):
+        pass

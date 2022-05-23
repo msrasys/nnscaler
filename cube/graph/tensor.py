@@ -27,9 +27,6 @@ from cube.ir.cten import IRCell, IRTensor
 import cube.ir as ir
 
 
-__all__ = ['IndexMap', 'ValueMap', 'IRFullTensor', 'IRSubTensor']
-
-
 class IndexMap:
 
     def __init__(self, indmap):
@@ -338,7 +335,7 @@ class ValueMap:
         return f'({self.idx}/{self.chunk_num})'
 
 
-def _to_indmap(indmap: Union[Tuple, IndexMap]):
+def _to_indmap(indmap: Union[Tuple, IndexMap]) -> IndexMap:
     if not isinstance(indmap, tuple) and not isinstance(indmap, IndexMap):
         raise TypeError("Expected indmap to be tuple or IndexMap")
     if isinstance(indmap, tuple):
@@ -346,7 +343,7 @@ def _to_indmap(indmap: Union[Tuple, IndexMap]):
     return indmap
 
 
-def _to_value_map(valmap: Union[Tuple, ValueMap, None]):
+def _to_value_map(valmap: Union[Tuple, ValueMap, None]) -> ValueMap:
     if not isinstance(valmap, tuple) and \
        not isinstance(valmap, ValueMap) and \
        not valmap is None:
@@ -361,6 +358,13 @@ def _to_value_map(valmap: Union[Tuple, ValueMap, None]):
 
 
 class IRFullTensor(IRTensor):
+    """
+    Full (logic) Tensor intermeidate representation.
+
+    It records its Sub (physical) Tensors with corresponding
+    producer operators and consumer operators following
+    the sequentail execution order by its graph.
+    """
 
     def __init__(self, shape=None, name=None, requires_grad=True, dtype=ir.float32):
 
@@ -419,33 +423,41 @@ class IRFullTensor(IRTensor):
         """
         return self._ctensors
 
-    def add_producer(self, cell: IRCell, tensor: IRTensor):
+    def add_producer(self, cell: IRCell, tensor: IRTensor, idx: int = 0):
         if not isinstance(cell, IRCell) or not isinstance(tensor, IRTensor):
             raise TypeError("Expect an IRCell and an IRTensor")
-        if cell not in self.producers:
-            self.producers.append(cell)
-            self.ptensors.append(tensor)
+        assert cell not in self._producers, f"{cell} already exists as producer"
+        self._producers.insert(idx, cell)
+        self._ptensors.insert(idx, tensor)
 
-    def add_consumer(self, cell: IRCell, tensor: IRTensor):
+    def add_consumer(self, cell: IRCell, tensor: IRTensor, idx: int = 0):
         if not isinstance(cell, IRCell) or not isinstance(tensor, IRTensor):
             raise TypeError("Expect an IRCell and an IRTensor")
-        if cell not in self.consumers:
-            self.consumers.append(cell)
-            self.ctensors.append(tensor)
+        assert cell not in self._consumers, f"{cell} already exists as consumer"
+        self._consumers.insert(idx, cell)
+        self._ctensors.insert(idx, tensor)
 
-    def rm_producer(self, cell: IRCell):
+    def rm_producer(self, cell: IRCell) -> int:
         if cell not in self.producers:
             raise KeyError(f"Cell {cell} not found in producer")
         idx = self.producers.index(cell)
         self.producers.pop(idx)
         self.ptensors.pop(idx)
+        return idx
 
-    def rm_consumer(self, cell: IRCell):
+    def rm_consumer(self, cell: IRCell) -> int:
         if cell not in self.consumers:
             raise KeyError(f"Cell {cell} not found in producer")
         idx = self.consumers.index(cell)
         self.consumers.pop(idx)
         self.ctensors.pop(idx)
+        return idx
+
+    def clear_producer_consumer(self) -> int:
+        self._producers = []
+        self._ptensors = []
+        self._consumers = []
+        self._ctensors = []
 
     def subtensors(self):
         """
@@ -568,7 +580,9 @@ class IRFullTensor(IRTensor):
 
 class IRSubTensor(IRTensor):
 
-    def __init__(self, full_tensor: IRTensor, indmap, valmap: Optional[ValueMap] =None, shape=None):
+    def __init__(self, full_tensor: IRTensor,
+                 indmap: List[Union[Tuple, IndexMap]],
+                 valmap: Optional[ValueMap] = None, shape=None):
         """
         Create an IRSubTensor.
 
