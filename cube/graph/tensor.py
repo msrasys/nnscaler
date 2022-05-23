@@ -38,7 +38,7 @@ class IndexMap:
             raise NotImplementedError(
                 "Only support for sliced index mapping"
             )
-        self._indices = indmap
+        self._indices: List[slice] = indmap
 
     def __eq__(self, other):
         if isinstance(other, IndexMap):
