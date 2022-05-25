@@ -1,8 +1,15 @@
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Tuple
 import copy
 import numpy as np
 
-from cube.graph.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
+from cube.graph.tensor import IRFullTensor, IRSubTensor
+from cube.graph.tensor import IndexMap, ValueMap
+
+from cube.graph.adapter.prim import AllGatherPrim      # d2r
+from cube.graph.adapter.prim import AllToAllPrim       # d2d
+from cube.graph.adapter.prim import AllReducePrim      # v2r
+from cube.graph.adapter.prim import ReduceScatterPrim  # v2d
+from cube.graph.adapter.prim import SplitDropDimPrim   # r2d
 
 
 class GridLayout:
@@ -62,11 +69,16 @@ class GridLayout:
         glayout = GridLayout.grid(self.ftensor,
                        r=layout[0], v=layout[1], dims=layout[2:])
         # set device
-        omat = GridLayout.transpose(self.mat, 0, 2+dim)
-        gmat = GridLayout.transpose(glayout.mat, 2+dim, 0)
-        for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
-            gtensor._cell = otensor._cell
-        return glayout
+        imat = GridLayout.transpose(self.mat, 0, 2+dim)
+        omat = GridLayout.transpose(glayout.mat, 2+dim, 0)
+        for itensor, otensor in zip(imat.flatten(), omat.flatten()):
+            otensor._cell = itensor._cell
+        prims = []
+        for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
+            print(itensors)
+            print(otensors)
+            prims.append(AllGatherPrim(itensors, otensors, dim))
+        return glayout, prims
 
     def d2d(self, from_dim: int, to_dim: int, chunks: int):
         """
@@ -79,11 +91,14 @@ class GridLayout:
         glayout = GridLayout.grid(self.ftensor,
                        r=layout[0], v=layout[1], dims=layout[2:])
         # set device
-        omat = GridLayout.transpose(self.mat, 2+to_dim, 2+from_dim)
-        gmat = GridLayout.transpose(glayout.mat, 2+from_dim, 2+to_dim)
-        for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
-            gtensor._cell = otensor._cell
-        return glayout
+        imat = GridLayout.transpose(self.mat, 2+to_dim, 2+from_dim)
+        omat = GridLayout.transpose(glayout.mat, 2+from_dim, 2+to_dim)
+        for itensor, otensor in zip(imat.flatten(), omat.flatten()):
+            otensor._cell = itensor._cell
+        prims = []
+        for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
+            prims.append(AllToAllPrim(itensors, otensors, from_dim, to_dim))
+        return glayout, prims
 
     def v2r(self, chunks: int):
         """
@@ -96,12 +111,14 @@ class GridLayout:
         glayout = GridLayout.grid(self.ftensor,
                        r=layout[0], v=layout[1], dims=layout[2:])
         # set device
-        omat = GridLayout.transpose(self.mat, 0, 1)
-        gmat = GridLayout.transpose(glayout.mat, 1, 0)
-        for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
-            gtensor._cell = otensor._cell
-        return glayout
-        
+        imat = GridLayout.transpose(self.mat, 0, 1)
+        omat = GridLayout.transpose(glayout.mat, 1, 0)
+        for itensor, otensor in zip(imat.flatten(), omat.flatten()):
+            otensor._cell = itensor._cell
+        prims = []
+        for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
+            prims.append(AllReducePrim(itensors, otensors))
+        return glayout, prims
 
     def v2d(self, dim: int, chunks: int):
         """
@@ -114,12 +131,14 @@ class GridLayout:
         glayout = GridLayout.grid(self.ftensor,
                        r=layout[0], v=layout[1], dims=layout[2:])
         # set device
-        omat = GridLayout.transpose(self.mat, 2+dim, 1)
-        gmat = GridLayout.transpose(glayout.mat, 1, 2+dim)
-        for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
-            gtensor._cell = otensor._cell
-        return glayout
-
+        imat = GridLayout.transpose(self.mat, 2+dim, 1)
+        omat = GridLayout.transpose(glayout.mat, 1, 2+dim)
+        for itensor, otensor in zip(imat.flatten(), omat.flatten()):
+            otensor._cell = itensor._cell
+        prims = []
+        for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
+            prims.append(ReduceScatterPrim(itensors, otensors, dim))
+        return glayout, prims
 
     def r2d(self, dim: int, chunks: int):
         """
@@ -132,11 +151,15 @@ class GridLayout:
         glayout = GridLayout.grid(self.ftensor,
                        r=layout[0], v=layout[1], dims=layout[2:])
         # set device
-        omat = GridLayout.transpose(self.mat, 2+dim, 0)
-        gmat = GridLayout.transpose(glayout.mat, 0, 2+dim)
-        for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
-            gtensor._cell = otensor._cell
-        return glayout
+        imat = GridLayout.transpose(self.mat, 2+dim, 0)
+        omat = GridLayout.transpose(glayout.mat, 0, 2+dim)
+        for itensor, otensor in zip(imat.flatten(), omat.flatten()):
+            otensor._cell = itensor._cell
+        prims = []
+        for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
+            for idx, (itensor, otensor) in enumerate(zip(itensors, otensors)):
+                prims.append(SplitDropDimPrim(itensor, otensor, dim, chunks, idx))
+        return glayout, prims
 
     # ================ solution ============= #
 
@@ -146,19 +169,20 @@ class GridLayout:
 
         order: R -> V -> S
         """
-        def step(layout: GridLayout, dec_idx: int, inc_idx: int, chunks: int) -> GridLayout:
+        def step(ilayout: GridLayout, dec_idx: int, inc_idx: int, chunks: int) -> GridLayout:
             if dec_idx >= 2 and inc_idx == 0:  # d2r
-                return layout.d2r(dec_idx-2, chunks)
+                return ilayout.d2r(dec_idx-2, chunks)
             if dec_idx >= 2 and inc_idx >= 2:  # d2d
-                return layout.d2d(dec_idx-2, inc_idx-2, chunks)
+                return ilayout.d2d(dec_idx-2, inc_idx-2, chunks)
             if dec_idx == 1 and inc_idx == 0:  # v2r
-                return layout.v2r(chunks)
+                return ilayout.v2r(chunks)
             if dec_idx == 1 and inc_idx >= 2:  # v2d
-                return layout.v2d(inc_idx-2, chunks)
+                return ilayout.v2d(inc_idx-2, chunks)
             if dec_idx == 0 and inc_idx >= 2:  # r2d
-                return layout.r2d(inc_idx-2, chunks)
+                return ilayout.r2d(inc_idx-2, chunks)
             raise RuntimeError("Cannot find primitive. Report as a bug")
-
+        
+        comm_prims = []
         paths: List[GridLayout] = [self]
         dst: GridLayout = dst
         while paths[-1].vec != dst.vec:
@@ -195,10 +219,11 @@ class GridLayout:
                         else:
                             raise RuntimeError("Cannot find feassible dimension. Report this as a bug.")
                     # print(chunks, need_chunks)
-                    layout = step(src, dec_idx, inc_idx, chunks)
-                    paths.append(layout)
+                    olayout, oprims = step(src, dec_idx, inc_idx, chunks)
+                    paths.append(olayout)
+                    comm_prims += oprims
                     break
-        return paths
+        return paths, comm_prims
 
     def __repr__(self):
         dscp = f'T{self.ftensor._id}<R({self.R}),V({self.V}),D({self.D})>'

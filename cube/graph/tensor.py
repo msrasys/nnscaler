@@ -518,6 +518,7 @@ class IRFullTensor(IRTensor):
         # return tensor to keep id same for same sub tensor
         for sub_tensor in self.subtensors():
             if sub_tensor.indmap == indmap and sub_tensor.valmap == valmap:
+                sub_tensor = copy.copy(sub_tensor)
                 return sub_tensor
 
         sub_tensor = IRSubTensor(self, indmap, valmap, shape)

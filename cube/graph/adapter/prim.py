@@ -11,8 +11,8 @@ from cube.graph.tensor import IRSubTensor, IndexMap, ValueMap
 class IRAdapterPrim:
 
     def __init__(self, inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
-        self._inputs = inputs
-        self._outputs = outputs
+        self._inputs = list(inputs)
+        self._outputs = list(outputs)
         self._device = []
         self.kwargs = dict()
 
@@ -70,7 +70,7 @@ class CommPrim(IRAdapterPrim):
                  otensors: List[IRSubTensor]):
         super().__init__(itensors, otensors)
         devices = []
-        for t in itensors + otensors:
+        for t in list(itensors) + list(otensors):
             devices += t.device
         self.device = list(set(devices))
 
@@ -113,6 +113,23 @@ class SplitDimPrim(SpatialPrim):
         self.device = itensor.device
 
 
+class SplitDropDimPrim(SpatialPrim):
+    """
+    split dimension in n chunks and take idx-th chunk
+    """
+    def __init__(self, itensor: IRSubTensor, otensor: IRSubTensor,
+                 dim: int, chunks: int, idx: int):
+        assert 0 <=idx and idx < chunks, "idx out of scope"
+        super().__init__([itensor], [otensor])
+        self.dim = dim
+        self.chunks = chunks
+        self.idx = idx
+        self.device = itensor.device
+
+    def __repr__(self) -> str:
+        return f'dev{self.device}: {self.outputs(0)} = split(dim={self.dim}, chunks={self.chunks}, idx={self.idx})'
+
+
 class MergeDimPrim(SpatialPrim):
     """
     concatenate dimension
@@ -126,7 +143,7 @@ class MergeDimPrim(SpatialPrim):
 
 # numerical primitive
 
-class ReducePrim(ValuePrim):
+class SumPrim(ValuePrim):
 
     def __init__(self, itensors: List[IRSubTensor], otensor: IRSubTensor):
         assert all(itensor.device == itensors[0].device for itensor in itensors), "device not same"
@@ -219,21 +236,31 @@ class AllReducePrim(CollectivePrim):
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor]):
         super().__init__(itensors, otensors)
 
+    def __repr__(self) -> str:
+        return f'dev{self.device}: {self.outputs()} = all_reduce({self.inputs()}'
+
 
 class AllGatherPrim(CollectivePrim):
     """
     non-differentiabl all-to-all
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor]):
-        super().__init__(itensors, otensors)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int):
+        super().__init__(itensors, otensors, dim=dim)
+
+    def __repr__(self) -> str:
+        return f'dev{self.device}: {self.outputs()} = all_gather({self.inputs()})'
 
 
 class ReduceScatterPrim(CollectivePrim):
     """
     non-differential reduce-scatter
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor]):
-        super().__init__(itensors, otensors)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int):
+        super().__init__(itensors, otensors, dim=dim)
+
+    def __repr__(self) -> str:
+        return f'dev{self.device}: {self.outputs()} = reduce_scatter({self.inputs()})'
+
 
 
 class BroadcastPrim(CollectivePrim):
@@ -263,6 +290,9 @@ class AllToAllPrim(CollectivePrim):
         idim != odim
         """
         super().__init__(itensors, otensors, idim=idim, odim=odim)
+
+    def __repr__(self) -> str:
+        return f"dev{self.device}: {self.outputs()} = all_to_all({self.inputs}, idim={self.kwargs['idm']}, odim={self.kwargs['odim']})"
 
 
 class DiffCollectivePrim(CollectivePrim):

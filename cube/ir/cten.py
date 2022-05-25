@@ -403,9 +403,9 @@ class IRTensor:
 
     _attr = ['name', '_is_param', '_requires_grad', '_is_grad', '_grad', '_dtype']
 
-    def __init__(self, shape=None, name='tensor', dtype=IRDType.unknown):
+    def __init__(self, shape=None, name='tensor', dtype=IRDType.unknown, tid=None):
 
-        self._id: int = IDGenerator().gen_tensor_id()
+        self._id: int = tid if isinstance(tid, int) else IDGenerator().gen_tensor_id()
         self._shape: Optional(List[int]) = shape
         self.name = name if name else 'tensor'
 
@@ -464,7 +464,7 @@ class IRTensor:
         if self._cell:
             return self._cell.device
         else:
-            return None
+            return []
 
     @device.setter
     def device(self, val: Union[int, List[int]]):
@@ -551,7 +551,7 @@ class IRTensor:
         Returns:
             tensor
         """
-        tensor = IRTensor(self._shape, self.name)
+        tensor = IRTensor(self._shape, self.name, tid=self._id)
         for key in self.__dict__:
             setattr(tensor, key, getattr(self, key))
         # clear attached cells
