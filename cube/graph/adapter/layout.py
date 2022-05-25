@@ -1,6 +1,5 @@
-from typing import Dict, List, Tuple, Union, Optional
+from typing import Dict, List, Tuple, Union
 import copy
-from matplotlib.style import available
 import numpy as np
 
 from cube.graph.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
@@ -47,12 +46,16 @@ class GridLayout:
     def ndims(self):
         return len(self._mats.shape)
 
-    # def index(self, subtensor: IRSubTensor) -> List[int]:
-    #     """
-    #     Get index of <R, V, dim1, ..., dimN> of the subtensor
-    #     """
-    #     assert id(subtensor) in self._tindex, f"tensor: {subtensor} not found"
-    #     return copy.copy(self._tindex(id(subtensor)))
+    @property
+    def mat(self):
+        return self._mats
+
+    def index(self, subtensor: IRSubTensor) -> Tuple[int]:
+        """
+        Get index of <R, V, dim1, ..., dimN> of the subtensor
+        """
+        assert id(subtensor) in self._tindex, f"tensor: {subtensor} not found"
+        return tuple(self._tindex(id(subtensor)))
 
     def get(self, r: bool = False, v: bool = False, d: Union[bool, int]=False) -> List[IRSubTensor]:        
         if r:
@@ -81,30 +84,14 @@ class GridLayout:
         assert layout[2+dim] % chunks == 0, f"not dividable dim: {layout[2+dim]} // {chunks}"
         layout[0] = layout[0] * chunks
         layout[2+dim] = layout[2+dim] // chunks
-        return grid(self.ftensor,
-                    r=layout[0], v=layout[1], dims=layout[2:])
-
-        # all_tensors = []
-        # for tensors in self.get(d=dim):
-        #     assert len(tensors) % chunks == 0, "not dividable dim and chunks"
-        #     tensors = tensors.reshape((-1, chunks))
-        #     for group_tensors in tensors:  # go through each row
-        #         indmap = []
-        #         for idim in range(self.ndims):
-        #             if idim != dim:
-        #                 indmap.append(group_tensors[0].valmap.get()[idim])
-        #             else:
-        #                 slicer = slice(
-        #                     group_tensors[0].indmap.get()[idim].start,
-        #                     group_tensors[-1].indmap.get()[idim].stop, 1
-        #                 )
-        #                 indmap.append(slicer)
-        #         valmap = group_tensors[0].valmap
-        #         for tensor in group_tensors:
-        #             gtensor = self.ftensor.select(indmap, tuple(valmap))
-        #             gtensor._cell = tensor._cell  # set device
-        #             all_tensors.append(gtensor)
-        # return GridLayout(self.ftensor, all_tensors)
+        glayout = GridLayout.grid(self.ftensor,
+                       r=layout[0], v=layout[1], dims=layout[2:])
+        # set device
+        gmat = GridLayout.transpose(glayout.mat, 0, 2+dim)
+        omat = GridLayout.transpose(self.mat, 0, 2+dim)
+        for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
+            gtensor._cell = otensor._cell
+        return glayout
 
     def d2d(self, from_dim: int, to_dim: int, chunks: int):
         """
@@ -114,43 +101,14 @@ class GridLayout:
         assert layout[2+from_dim] % chunks == 0, f"not dividable dim: {layout[2+from_dim]} // {chunks}"
         layout[2+from_dim] = layout[2+from_dim] // chunks
         layout[2+to_dim] = layout[2+to_dim] * chunks
-        return grid(self.ftensor,
-                    r=layout[0], v=layout[1], dims=layout[2:])
-
-        # if from_dim == to_dim:
-        #     return self
-        # all_tensors = []
-        # for tensors in self.get(d=from_dim):
-        #     assert len(tensors) % chunks == 0, "not dividable dim and chunks"
-        #     tensors = tensors.reshape((-1, chunks))
-        #     for group_tensors in tensors:
-        #         for cid, tensor in enumerate(group_tensors):
-        #             indmap = []
-        #             for dim in range(self.ndims):
-        #                 # from_dim gets nchunks larger
-        #                 if dim == from_dim:
-        #                     slicer = slice(
-        #                         group_tensors[0].indmap.get()[dim].start,
-        #                         group_tensors[-1].indmap.get()[dim].stop, 1
-        #                     )
-        #                     indmap.append(slicer)
-        #                 # to_dim gets nchunks smaller
-        #                 elif dim == to_dim:
-        #                     nele = tensor.shape[dim] // chunks
-        #                     start = tensor.indmap.get()[dim].start
-        #                     slicer = slice(
-        #                         start + nele * cid,
-        #                         start + nele * (cid + 1), 1
-        #                     )
-        #                     indmap.append(slicer)
-        #                 # others keep unchanged
-        #                 else:
-        #                     indmap = tensor.indmap.get()[dim]
-        #             valmap = tensor.valmap
-        #             ttensor = self.ftensor.select(indmap, tuple(valmap))
-        #             ttensor._cell = tensor
-        #             all_tensors.append(ttensor)
-        # return GridLayout(self.ftensor, all_tensors)
+        glayout = GridLayout.grid(self.ftensor,
+                       r=layout[0], v=layout[1], dims=layout[2:])
+        # set device
+        gmat = GridLayout.transpose(glayout.mat, 2+to_dim, 2+from_dim)
+        omat = GridLayout.transpose(self.mat, 2+to_dim, 2+from_dim)
+        for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
+            gtensor._cell = otensor._cell
+        return glayout
 
     def v2r(self, chunks: int):
         """
@@ -160,8 +118,14 @@ class GridLayout:
         assert layout[1] % chunks == 0, f"not dividable value chunks: {layout[1]} // {chunks}"
         layout[1] = layout[1] // chunks
         layout[0] = layout[0] * chunks
-        return grid(self.ftensor,
-                    r=layout[0], v=layout[1], dims=layout[2:])
+        glayout = GridLayout.grid(self.ftensor,
+                       r=layout[0], v=layout[1], dims=layout[2:])
+        # set device
+        gmat = GridLayout.transpose(glayout.mat, 0, 1)
+        omat = GridLayout.transpose(self.mat, 0, 1)
+        for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
+            gtensor._cell = otensor._cell
+        return glayout
         
 
     def v2d(self, dim: int, chunks: int):
@@ -172,8 +136,14 @@ class GridLayout:
         assert layout[1] % chunks == 0, f"not dividable value chunks: {layout[0]} // {chunks}"
         layout[1] = layout[1] // chunks
         layout[2+dim] = layout[2+dim] * chunks
-        return grid(self.ftensor,
-                    r=layout[0], v=layout[1], dims=layout[2:])
+        glayout = GridLayout.grid(self.ftensor,
+                       r=layout[0], v=layout[1], dims=layout[2:])
+        # set device
+        gmat = GridLayout.transpose(glayout.mat, 2+dim, 1)
+        omat = GridLayout.transpose(self.mat, 2+dim, 1)
+        for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
+            gtensor._cell = otensor._cell
+        return glayout
 
 
     def r2d(self, dim: int, chunks: int):
@@ -184,8 +154,14 @@ class GridLayout:
         assert layout[0] % chunks == 0, f"not dividable replica: {layout[0]} // {chunks}"
         layout[0] = layout[0] // chunks
         layout[2+dim] = layout[2+dim] * chunks
-        return grid(self.ftensor,
-                    r=layout[0], v=layout[1], dims=layout[2:])
+        glayout = GridLayout.grid(self.ftensor,
+                       r=layout[0], v=layout[1], dims=layout[2:])
+        # set device
+        gmat = GridLayout.transpose(glayout.mat, 2+dim, 0)
+        omat = GridLayout.transpose(self.mat, 2+dim, 0)
+        for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
+            gtensor._cell = otensor._cell
+        return glayout
 
     # ================ solution ============= #
 
@@ -215,7 +191,7 @@ class GridLayout:
             inc_idx, dec_idx = None, None
             for idx, (schunk, dchunk) in enumerate(zip(src.vec, dst.vec)):
                 if schunk != dchunk:
-                    print(f'src: {src.vec}, dst: {dst.vec}')
+                    # print(f'src: {src.vec}, dst: {dst.vec}')
                     if schunk < dchunk:
                         inc_idx = idx  # src should increase chunks on idx-dim
                         need_chunks = dchunk // schunk if dchunk % schunk == 0 else dchunk
@@ -243,7 +219,7 @@ class GridLayout:
                                 break
                         else:
                             raise RuntimeError("Cannot find feassible dimension. Report this as a bug.")
-                    print(chunks, need_chunks)
+                    # print(chunks, need_chunks)
                     layout = step(src, dec_idx, inc_idx, chunks)
                     paths.append(layout)
                     break
@@ -253,92 +229,125 @@ class GridLayout:
         dscp = f'T{self.ftensor._id}<R({self.R}),V({self.V}),D({self.D})>'
         return dscp
 
+    def print_dev_tensors(self):
+        """
+        print each device hold tensors.
+        """
+        devices: Dict[int, List[IRSubTensor]] = dict()
+        for tensor in self.subtensors:
+            assert len(tensor.device) == 1, f"got tensor device: {tensor.device}"
+            if tensor.device[0] not in devices:
+                devices[tensor.device[0]] = []
+            devices[tensor.device[0]].append(tensor)
+        devs = list(devices.keys())
+        devs.sort()
+        for dev in devs:
+            print(f'dev{dev}: {devices[dev]}')
 
-def grid(ftensor: IRFullTensor, r: int, v: int, dims: Tuple[int]) -> np.ndarray:
-    """
-    partition a ftensor using grid layout of <r, v, *dims>
-    """
-    mats = np.empty([r, v] + dims, dtype=IRSubTensor)
-    all_subtensors = []
+    @staticmethod
+    def transpose(mat: np.ndarray, dim0: int, dim1: int):
+        """
+        put the dim0 and dim1 of the mat to the last two dims
+        """
+        ndims = len(mat.shape)
+        axes = list(range(ndims))
+        assert dim0 < ndims and dim1 < ndims, "dim0 or dim1 out of index"
+        axes.pop(max(dim0, dim1))
+        axes.pop(min(dim0, dim1))
+        axes += [dim0, dim1]
+        return np.transpose(mat, axes)
 
-    def iter_idx(dims: List[int]) -> Tuple[int]:
-        if len(dims) == 0:
-            yield ()
-        else:
-            for i in range(dims[0]):
-                for indices in iter_idx(dims[1:]):
-                    yield (i,) + indices
-    # generate tensor for each index
-    for indices in iter_idx([v,]+dims):
-        valmap = ValueMap(indices[0], v)
-        indmap = []
-        shape = []
-        for dim, (nchunk, index) in enumerate(zip(dims, indices[1:])):
-            assert ftensor.shape[dim] % nchunk == 0, f"not dividable for {nchunk} chunks over dim {dim}"
-            csize = ftensor.shape[dim] // nchunk
-            start = csize * index
-            indmap.append(slice(start, start+csize, 1))
-            shape.append(csize)
-        subtensor = ftensor.select(tuple(indmap), valmap, shape)
-        # replicate
-        subtensors = [copy.copy(subtensor) for _ in range(r)]
-        all_subtensors += subtensors
-        mats[(slice(None),)+indices] = np.array(subtensors, dtype=IRSubTensor)
-    return GridLayout(ftensor, all_subtensors, mats)
+    @staticmethod
+    def grid(ftensor: IRFullTensor, r: int, v: int, dims: Tuple[int]):
+        """
+        partition a ftensor using grid layout of <r, v, *dims>
+        """
+        mats = np.empty([r, v] + dims, dtype=IRSubTensor)
+        all_subtensors = []
 
+        def iter_idx(dims: List[int]) -> Tuple[int]:
+            if len(dims) == 0:
+                yield ()
+            else:
+                for i in range(dims[0]):
+                    for indices in iter_idx(dims[1:]):
+                        yield (i,) + indices
+        # generate tensor for each index
+        for indices in iter_idx([v,]+dims):
+            valmap = ValueMap(indices[0], v)
+            indmap = []
+            shape = []
+            for dim, (nchunk, index) in enumerate(zip(dims, indices[1:])):
+                assert ftensor.shape[dim] % nchunk == 0, f"not dividable for {nchunk} chunks over dim {dim}"
+                csize = ftensor.shape[dim] // nchunk
+                start = csize * index
+                indmap.append(slice(start, start+csize, 1))
+                shape.append(csize)
+            subtensor = ftensor.select(tuple(indmap), valmap, shape)
+            # replicate
+            subtensors = [copy.copy(subtensor) for _ in range(r)]
+            all_subtensors += subtensors
+            mats[(slice(None),)+indices] = np.array(subtensors, dtype=IRSubTensor)
+        return GridLayout(ftensor, all_subtensors, mats)
 
-def togrid(ftensor: IRFullTensor, subtensors: List[IRSubTensor]) -> Optional[GridLayout]:
-    _replica: int = None
-    _value: int = None
-    _dims: List[int] = [None] * len(ftensor.shape)
-    _tindex: Dict[int, List[int]] = dict()
+    @staticmethod
+    def togrid(ftensor: IRFullTensor, subtensors: List[IRSubTensor]):
+        """
+        convert ftensor and subtensors into a GridLayout.
 
-    ndims = len(ftensor.shape)
+        If failed, raise error
+        """
+        _replica: int = None
+        _value: int = None
+        _dims: List[int] = [None] * len(ftensor.shape)
+        _tindex: Dict[int, List[int]] = dict()
 
-    replicas: Dict[int, List[IRSubTensor]] = dict()
-    vchunks: set = set()
-    dchunks: List[set] = [set() for _ in range(ndims)]
-    
-    for subtensor in subtensors:
-        tid = id(subtensor)
-        # set up replica
-        if subtensor._id not in replicas:
-            replicas[subtensor._id] = []
-        _tindex[tid] = [len(replicas[subtensor._id])]
-        replicas[subtensor._id].append(subtensor)
-        # setup value
-        _tindex[tid].append(subtensor.valmap.idx)
-        vchunks.add(subtensor.valmap.chunk_num)
-        # setup dimensions
+        ndims = len(ftensor.shape)
+
+        replicas: Dict[int, List[IRSubTensor]] = dict()
+        vchunks: set = set()
+        dchunks: List[set] = [set() for _ in range(ndims)]
+
+        for subtensor in subtensors:
+            tid = id(subtensor)
+            # set up replica
+            if subtensor._id not in replicas:
+                replicas[subtensor._id] = []
+            _tindex[tid] = [len(replicas[subtensor._id])]
+            replicas[subtensor._id].append(subtensor)
+            # setup value
+            _tindex[tid].append(subtensor.valmap.idx)
+            vchunks.add(subtensor.valmap.chunk_num)
+            # setup dimensions
+            for dim in range(ndims):
+                snele = subtensor.shape[dim]
+                start = subtensor.indmap.get()[dim].start
+                fnele = ftensor.shape[dim]
+                if fnele % snele != 0 or start % snele != 0:
+                    raise RuntimeError(f"dimension split error: full nele: {fnele}, sub nele: {snele}, start: {start}")
+                dchunks[dim].add(fnele // snele)
+                _tindex[tid].append(start // snele)
+        # replica (R)
+        nreplicas = set(len(ts) for ts in replicas.values())
+        if len(nreplicas) != 1:
+            raise RuntimeError(f"different replicas: {nreplicas}")
+        _replica = list(nreplicas)[0]
+        # value (V)
+        nchunks = set(t.valmap.chunk_num for t in subtensors)
+        if len(nchunks) != 1:
+            raise RuntimeError(f"different value split: {nchunks}")
+        _value = list(nchunks)[0]
+        # dimension (D)
         for dim in range(ndims):
-            snele = subtensor.shape[dim]
-            start = subtensor.indmap.get()[dim].start
-            fnele = ftensor.shape[dim]
-            if fnele % snele != 0 or start % snele != 0:
-                raise RuntimeError(f"dimension split error: full nele: {fnele}, sub nele: {snele}, start: {start}")
-            dchunks[dim].add(fnele // snele)
-            _tindex[tid].append(start // snele)
-    # replica (R)
-    nreplicas = set(len(ts) for ts in replicas.values())
-    if len(nreplicas) != 1:
-        raise RuntimeError(f"different replicas: {nreplicas}")
-    _replica = list(nreplicas)[0]
-    # value (V)
-    nchunks = set(t.valmap.chunk_num for t in subtensors)
-    if len(nchunks) != 1:
-        raise RuntimeError(f"different value split: {nchunks}")
-    _value = list(nchunks)[0]
-    # dimension (D)
-    for dim in range(ndims):
-        if len(dchunks[dim]) != 1:
-            raise RuntimeError(f"different dimension split: {dchunks[dim]}")
-        _dims[dim] = list(dchunks[dim])[0]
-    
-    # set matrix
-    mats = np.empty([_replica, _value] + _dims, dtype=IRSubTensor)
-    for subtensor in subtensors:
-        idx = tuple(_tindex[id(subtensor)])
-        assert mats[idx] is None, f"repeating entry. mutiple same {subtensor}"
-        mats[tuple(idx)] = subtensor
-    assert not (mats == None).any(), "at least one entry not set"
-    return GridLayout(ftensor, subtensors, mats)
+            if len(dchunks[dim]) != 1:
+                raise RuntimeError(f"different dimension split: {dchunks[dim]}")
+            _dims[dim] = list(dchunks[dim])[0]
+
+        # set matrix
+        mats = np.empty([_replica, _value] + _dims, dtype=IRSubTensor)
+        for subtensor in subtensors:
+            idx = tuple(_tindex[id(subtensor)])
+            assert mats[idx] is None, f"repeating entry. mutiple same {subtensor}"
+            mats[tuple(idx)] = subtensor
+        assert not (mats == None).any(), "at least one entry not set"
+        return GridLayout(ftensor, subtensors, mats)
