@@ -23,7 +23,6 @@ class GridLayout:
         """
         self.ftensor = ftensor
         self.subtensors = subtensors
-        self._tindex: Dict[int, List[int]] = dict()
         self._mats = mats
 
     @property
@@ -50,30 +49,6 @@ class GridLayout:
     def mat(self):
         return self._mats
 
-    def index(self, subtensor: IRSubTensor) -> Tuple[int]:
-        """
-        Get index of <R, V, dim1, ..., dimN> of the subtensor
-        """
-        assert id(subtensor) in self._tindex, f"tensor: {subtensor} not found"
-        return tuple(self._tindex(id(subtensor)))
-
-    def get(self, r: bool = False, v: bool = False, d: Union[bool, int]=False) -> List[IRSubTensor]:        
-        if r:
-            nchunks = self.R
-            idx = 0
-        elif v:
-            nchunks = self.V
-            idx = 1
-        elif isinstance(d, int):
-            nchunks = self.D[d]
-            idx = 2 + d
-        else:
-            raise ValueError("r, v, d should set at least one")
-        axes = list(range(idx)) + list(range(idx+1, self.ndims)) + [idx]
-        mat = np.transpose(self._mats, axes).reshape((-1, nchunks))
-        for i in mat.shape[0]:
-            yield mat[i]
-
     # ====== primitives ===== #
 
     def d2r(self, dim: int, chunks: int):
@@ -87,8 +62,8 @@ class GridLayout:
         glayout = GridLayout.grid(self.ftensor,
                        r=layout[0], v=layout[1], dims=layout[2:])
         # set device
-        gmat = GridLayout.transpose(glayout.mat, 0, 2+dim)
         omat = GridLayout.transpose(self.mat, 0, 2+dim)
+        gmat = GridLayout.transpose(glayout.mat, 2+dim, 0)
         for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
             gtensor._cell = otensor._cell
         return glayout
@@ -104,8 +79,8 @@ class GridLayout:
         glayout = GridLayout.grid(self.ftensor,
                        r=layout[0], v=layout[1], dims=layout[2:])
         # set device
-        gmat = GridLayout.transpose(glayout.mat, 2+to_dim, 2+from_dim)
         omat = GridLayout.transpose(self.mat, 2+to_dim, 2+from_dim)
+        gmat = GridLayout.transpose(glayout.mat, 2+from_dim, 2+to_dim)
         for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
             gtensor._cell = otensor._cell
         return glayout
@@ -121,8 +96,8 @@ class GridLayout:
         glayout = GridLayout.grid(self.ftensor,
                        r=layout[0], v=layout[1], dims=layout[2:])
         # set device
-        gmat = GridLayout.transpose(glayout.mat, 0, 1)
         omat = GridLayout.transpose(self.mat, 0, 1)
+        gmat = GridLayout.transpose(glayout.mat, 1, 0)
         for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
             gtensor._cell = otensor._cell
         return glayout
@@ -139,8 +114,8 @@ class GridLayout:
         glayout = GridLayout.grid(self.ftensor,
                        r=layout[0], v=layout[1], dims=layout[2:])
         # set device
-        gmat = GridLayout.transpose(glayout.mat, 2+dim, 1)
         omat = GridLayout.transpose(self.mat, 2+dim, 1)
+        gmat = GridLayout.transpose(glayout.mat, 1, 2+dim)
         for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
             gtensor._cell = otensor._cell
         return glayout
@@ -157,8 +132,8 @@ class GridLayout:
         glayout = GridLayout.grid(self.ftensor,
                        r=layout[0], v=layout[1], dims=layout[2:])
         # set device
-        gmat = GridLayout.transpose(glayout.mat, 2+dim, 0)
         omat = GridLayout.transpose(self.mat, 2+dim, 0)
+        gmat = GridLayout.transpose(glayout.mat, 0, 2+dim)
         for gtensor, otensor in zip(gmat.flatten(), omat.flatten()):
             gtensor._cell = otensor._cell
         return glayout
@@ -242,7 +217,9 @@ class GridLayout:
         devs = list(devices.keys())
         devs.sort()
         for dev in devs:
-            print(f'dev{dev}: {devices[dev]}')
+            print(f'dev{dev}:')
+            for tensor in devices[dev]:
+                print(f'\t{tensor.extra_repr()}')
 
     @staticmethod
     def transpose(mat: np.ndarray, dim0: int, dim1: int):
