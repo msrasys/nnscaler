@@ -2,7 +2,7 @@
 The primitive used for IRAdapter
 """
 
-from typing import Callable, List, Optional, Union
+from typing import List, Optional, Union
 import copy
 
 from cube.graph.tensor import IRSubTensor, IndexMap, ValueMap
@@ -15,6 +15,7 @@ class IRAdapterPrim:
         self._outputs = list(outputs)
         self._device = []
         self.kwargs = dict()
+        self.signature = None
 
     def inputs(self, idx: Optional[int] = None):
         assert idx is None or isinstance(idx, int),  "expected idx to be None or int"
@@ -31,6 +32,8 @@ class IRAdapterPrim:
             return self._outputs[idx]
 
     def dispatch(self, devid: int):
+        if devid not in self.device:
+            return None
         return self
 
     @property
@@ -109,7 +112,7 @@ class SplitDimPrim(SpatialPrim):
     def __init__(self, itensor: IRSubTensor, dim: int,
                  otensors: List[IRSubTensor]):
         super().__init__([itensor], otensors)
-        self.dim = dim
+        self.kwargs['dim'] = dim
         self.device = itensor.device
 
 
@@ -121,13 +124,14 @@ class SplitDropDimPrim(SpatialPrim):
                  dim: int, chunks: int, idx: int):
         assert 0 <=idx and idx < chunks, "idx out of scope"
         super().__init__([itensor], [otensor])
-        self.dim = dim
-        self.chunks = chunks
-        self.idx = idx
+        self.kwargs['dim'] = dim
+        self.kwargs['chunks'] = chunks
+        self.kwargs['idx'] = idx
         self.device = itensor.device
+        self.signature = 'cube.runtime.adapter.collectives.split_drop_dim'
 
     def __repr__(self) -> str:
-        return f'dev{self.device}: {self.outputs(0)} = split(dim={self.dim}, chunks={self.chunks}, idx={self.idx})'
+        return f"dev{self.device}: {self.outputs(0)} = split(dim={self.kwargs['dim']}, chunks={self.kwargs['chunks']}, idx={self.kwargs['idx']})"
 
 
 class MergeDimPrim(SpatialPrim):
@@ -218,14 +222,17 @@ class CollectivePrim(CommPrim):
         for arg, val in kwargs.items():
             self.kwargs[arg] = val
 
-    def dispatch(self, devid: int, init_method: Callable):
+    def dispatch(self, devid: int) -> Optional[CommPrim]:
         """
         dispatch to a given device
         """
+        if devid not in self.device:
+            return None
         assert devid in self.device, f"device {devid} not applied for this comm primitive"
         itensors = [itensor for itensor in self.inputs() if devid in itensor.device]
         otensors = [otensor for otensor in self.outputs() if devid in otensor.device]
-        prim = init_method(itensors, otensors, **self.kwargs)
+        prim = CollectivePrim(itensors, otensors, **self.kwargs)
+        prim.signature = self.signature
         return prim
 
 
@@ -235,6 +242,7 @@ class AllReducePrim(CollectivePrim):
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor]):
         super().__init__(itensors, otensors)
+        self.signature = 'cube.runtime.adapter.collectives.all_reduce'
 
     def __repr__(self) -> str:
         return f'dev{self.device}: {self.outputs()} = all_reduce({self.inputs()}'
@@ -246,6 +254,7 @@ class AllGatherPrim(CollectivePrim):
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int):
         super().__init__(itensors, otensors, dim=dim)
+        self.signature = 'cube.runtime.adapter.collectives.all_gather'
 
     def __repr__(self) -> str:
         return f'dev{self.device}: {self.outputs()} = all_gather({self.inputs()})'
@@ -257,6 +266,7 @@ class ReduceScatterPrim(CollectivePrim):
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int):
         super().__init__(itensors, otensors, dim=dim)
+        self.signature = 'cube.runtime.adapter.collectives.reduce_scatter'
 
     def __repr__(self) -> str:
         return f'dev{self.device}: {self.outputs()} = reduce_scatter({self.inputs()})'
@@ -290,6 +300,7 @@ class AllToAllPrim(CollectivePrim):
         idim != odim
         """
         super().__init__(itensors, otensors, idim=idim, odim=odim)
+        self.signature = 'cube.runtime.adapter.collectives.all_to_all'
 
     def __repr__(self) -> str:
         return f"dev{self.device}: {self.outputs()} = all_to_all({self.inputs}, idim={self.kwargs['idm']}, odim={self.kwargs['odim']})"
