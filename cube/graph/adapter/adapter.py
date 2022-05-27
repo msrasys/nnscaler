@@ -23,6 +23,11 @@ class IRAdapter(IRCell):
         self._prims: Optional[List[IRAdapterPrim]] = None
         self._differentiable = False
 
+        device = set()
+        for tensor in inputs + outputs:
+            device.update(set(tensor.device))
+        self.device = list(device)
+
     @property
     def prims(self) -> List[IRAdapterPrim]:
         if self.is_forward:
@@ -45,7 +50,6 @@ class IRAdapter(IRCell):
     def prims(self, prims: List[IRAdapterPrim]):
         assert all(isinstance(prim, IRAdapterPrim) for prim in prims), "Expect List[IRAdapterPrim]"
         self._prims = prims
-        self.update_device()
 
     @property
     def differentiable(self) -> bool:
@@ -57,12 +61,6 @@ class IRAdapter(IRCell):
     @differentiable.setter
     def differentiable(self, val: bool):
         self._differentiable = val
-
-    def update_device(self):
-        device = set()
-        for prim in self.prims:
-            device.update(prim.device)
-        self.device = list(device)
 
     def dispatch(self, devid: int):
         """

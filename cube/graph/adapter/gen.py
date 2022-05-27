@@ -135,7 +135,7 @@ class IRAdapterGener:
         #     print(f'detect no intersection')
         #     return []
         # general cases
-        warnings.warn('UserWarning: the adapter is generated using inefficient P2P send/recv')
+        warnings.warn('The adapter is generated using inefficient P2P send/recv')
         fprims, bprims = [], []
         for subtensor in ftensor.ctensors:
             fprims += IRAdapterGener.gen_subtensor(subtensor)

@@ -135,7 +135,6 @@ class ModelCodeGen(CodeGen):
                 self.emit_op_call(node)
             elif isinstance(node, IRAdapter):
                 node = node.dispatch(device)
-                print(node.extra_repr())
                 self.emit_adapter_call(node)
             elif isinstance(node, IRWeightReducer):
                 self.emit_reducer_init(node)
@@ -422,9 +421,6 @@ class ScheduleCodeGen(CodeGen):
                     if tensor in ref_node.inputs():
                         refcnt += 1
             return refcnt
-
-        for node in device_nodes:
-            print(f'dev{device}: {node}')
 
         # generate code
         with FunctionBlock(func_name='_train_step', 
