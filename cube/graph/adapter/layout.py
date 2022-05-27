@@ -9,7 +9,7 @@ from cube.graph.adapter.prim import AllGatherPrim      # d2r
 from cube.graph.adapter.prim import AllToAllPrim       # d2d
 from cube.graph.adapter.prim import AllReducePrim      # v2r
 from cube.graph.adapter.prim import ReduceScatterPrim  # v2d
-from cube.graph.adapter.prim import SplitDropDimPrim   # r2d
+from cube.graph.adapter.prim import ChunkPrim          # r2d
 
 
 class GridLayout:
@@ -156,7 +156,7 @@ class GridLayout:
         prims = []
         for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
             for idx, (itensor, otensor) in enumerate(zip(itensors, otensors)):
-                prims.append(SplitDropDimPrim(itensor, otensor, dim, chunks, idx))
+                prims.append(ChunkPrim(itensor, otensor, dim, chunks, idx))
         return glayout, prims
 
     # ================ solution ============= #
@@ -234,21 +234,21 @@ class GridLayout:
                     paths.append(olayout)
                     comm_prims += oprims
                     break
-        if auto_replace:
-            replaced = False
-            reorder : Dict[str, Tuple[int, int]] = dict()
-            for itensor, otensor in zip(paths[-1].mat.flatten(), dst.mat.flatten()):
-                assert len(itensor.device) == 1 and len(otensor.device) == 1, \
-                    "Expect tensor only has one device. Report this as a bug"
-                if itensor.device != otensor.device:
-                    inode, onode = itensor._cell, otensor._cell
-                    reorder[f'{onode.name}-{onode._id}'] = (onode.device[0], inode.device[0])
-                    onode.device = inode.device
-                    if onode.mirror is not None:
-                        onode.mirror.device = inode.device
-                    replaced = True
-            if replaced:
-                print(f'warning: a better device placement is found and set for op {reorder}')
+        # if auto_replace:
+        #     replaced = False
+        #     reorder : Dict[str, Tuple[int, int]] = dict()
+        #     for itensor, otensor in zip(paths[-1].mat.flatten(), dst.mat.flatten()):
+        #         assert len(itensor.device) == 1 and len(otensor.device) == 1, \
+        #             "Expect tensor only has one device. Report this as a bug"
+        #         if itensor.device != otensor.device:
+        #             inode, onode = itensor._cell, otensor._cell
+        #             reorder[f'{onode.name}-{onode._id}'] = (onode.device[0], inode.device[0])
+        #             onode.device = inode.device
+        #             if onode.mirror is not None:
+        #                 onode.mirror.device = inode.device
+        #             replaced = True
+        #     if replaced:
+        #         print(f'warning: a better device placement is found and set for op {reorder}')
 
         return paths, comm_prims
 

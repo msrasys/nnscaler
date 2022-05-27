@@ -1,519 +1,115 @@
-
-from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Optional
 import copy
-import numpy as np
 
-from cube.graph.tensor import IRSubTensor, IndexMap, ValueMap
+from cube.graph.adapter.prim import IRAdapterPrim, IdentityPrim
+from cube.graph.tensor import IRSubTensor
 from cube.ir.cten import IRCell
-from cube.ir.dtype import IRDType
-
-
-class SelectPrim:
-
-    def __init__(self, tensor: IRSubTensor, indmap: IndexMap, valmap: ValueMap,
-                 shape: List[int], output: IRSubTensor):
-        self.tensor = tensor
-        self.indmap = indmap
-        self.valmap = valmap
-        self.shape = shape
-        self.output = output
-        self.device: List[int] = tensor.device
-
-    def __repr__(self):
-        dscp = f'{self.output} = select({self.tensor})'
-        return dscp
-
-
-class MovePrim:
-
-    def __init__(self, tensor: IRSubTensor, from_rank: int, to_rank: int):
-        self.tensor = tensor
-        self.from_rank = from_rank
-        self.to_rank = to_rank
-        self.shape = tensor.shape
-        self.dtype = tensor.dtype
-        self.device: List[int] = [from_rank, to_rank]
-
-    def __repr__(self):
-        dscp = f'move({self.tensor}, from={self.from_rank}, to={self.to_rank})'
-        return dscp
-
-
-class CollectivePrim:
-
-    class Type(Enum):
-        AllReduce = 'all_reduce'
-        AllGather = 'all_gather'
-        ReduceScatter = 'reduce_scatter'
-        Broadcast = 'broadcast'
-
-    def __init__(self, ctype: Enum,
-                 device: Tuple[int],
-                 group: Tuple[int],
-                 inputs: Tuple[IRSubTensor] = None,
-                 input_shapes: Tuple[Tuple[int]] = None,
-                 input_dtypes: Tuple[IRDType] = None,
-                 outputs: Tuple[IRSubTensor] = None,
-                 output_shapes: Tuple[Tuple[int]] = None,
-                 output_dtypes: Tuple[IRDType] = None):
-        """
-        inputs:
-            the collective input tensors. Including remote tensors.
-        src_ranks:
-            the tensor rank for each corresponding input tensor
-        outputs:
-            the collective output tensors. Including remote tensors.
-        dst_ranks:
-            the tensor rank for each corresponding output tensor
-        device:
-            the collective to be performed rank.
-            Note n-device collective will have n CollectivePrim,
-            each needs to be assigned with a single device rank.
-        """
-        self.ctype = ctype
-        # inputs
-        self.inputs: Tuple[IRSubTensor] = tuple(inputs) if inputs is not None else list()
-        self.input_shapes: Tuple[IRSubTensor] = input_shapes
-        self.input_dtypes: Tuple[IRDType] = input_dtypes
-        # outputs
-        self.outputs: Tuple[IRSubTensor] = outputs if outputs is not None else list()
-        self.output_shapes: List[IRSubTensor] = output_shapes
-        self.output_dtypes: List[IRDType] = output_dtypes
-        # communication group
-        self.group: Tuple[int] = tuple(group)
-        # device
-        self.device = tuple(device)
-
-    def __repr__(self):
-        dscp = f'{self.outputs} = {self.ctype.value}(inputs={self.inputs}, group={self.group})'
-        return dscp
-
-
-class MergePrim:
-    def __init__(self, tensors: List[IRSubTensor],
-                 output: IRSubTensor, device: List[int],
-                 concat: Optional[int] = None, add: bool = False):
-        if not ((concat is not None) ^ (add is True)):  # xor condition
-            raise RuntimeError("Expected concat or add")
-        self.tensors = tensors
-        self.concat = concat
-        self.add = add
-        self.output = output
-        # re-order tensor
-        if isinstance(concat, int):
-            slicers = [tensor.indmap.get()[concat] for tensor in tensors]
-            starts = np.array([slicer.start for slicer in slicers], dtype=int)
-            sorted_idx = np.argsort(starts)
-            tensors = np.array(tensors)[sorted_idx]
-            self.tensors = tensors.tolist()
-        self.device: List[int] = device
-
-    def set_output(self, output: IRSubTensor):
-        self.output = output
-
-    @staticmethod
-    def concat(tensor1: IRSubTensor, tensor2: IRSubTensor) ->  Optional[Tuple[IRSubTensor, int]]:
-        """
-        Check if two tensor can be merged.
-        If they can be merged, return the merge index
-        """
-        if not isinstance(tensor1, IRSubTensor) or not isinstance(tensor2, IRSubTensor):
-            raise TypeError("Expected two tensors")
-        if tensor1.overlap(tensor2):
-            return None
-        if tensor1.parent != tensor2.parent:
-            return None
-        if tensor1.valmap != tensor2.valmap:
-            return None
-        indices1 = tensor1.indmap.get()
-        indices2 = tensor2.indmap.get()
-        indmap = list()
-        if len(indices1) != len(indices2):
-            return None
-        axis = None
-        for dim, (slicer1, slicer2) in enumerate(zip(indices1, indices2)):
-            if slicer1 != slicer2:
-                start1, stop1, step1 = slicer1.start, slicer1.stop, slicer1.step
-                start2, stop2, step2 = slicer2.start, slicer2.stop, slicer2.step
-                if step1 != step2:
-                    return None
-                if axis is not None:
-                    return None
-                if start1 < start2 and stop1 == start2:
-                    axis = dim
-                    indmap.append(slice(start1, stop2, step1))
-                elif start1 > start2 and start1 == stop2:
-                    axis = dim
-                    indmap.append(slice(start2, stop1, step1))
-                else:
-                    return None
-            else:
-                indmap.append(slicer1)
-        shapes = list()
-        for idx, (nele1, nele2) in enumerate(zip(tensor1.shape, tensor2.shape)):
-            nele = nele1 if idx != axis else nele1 + nele2
-            shapes.append(nele)
-        mtensor = tensor1.parent.select(
-            indmap = tuple(indmap),
-            valmap = tensor1.valmap,
-            shape = shapes
-        )
-        return mtensor, axis
-
-    @staticmethod
-    def add(tensor1: IRSubTensor, tensor2: IRSubTensor) -> Optional[IRSubTensor]:
-        if not isinstance(tensor1, IRSubTensor) or not isinstance(tensor2, IRSubTensor):
-            raise TypeError("Expected two tensors")
-        if tensor1.overlap(tensor2):
-            return None
-        if tensor1.parent != tensor2.parent:
-            return None
-        if tensor1.indmap != tensor2.indmap:
-            return None
-        if tensor1.valmap.chunk_num != tensor2.valmap.chunk_num:
-            return None
-        chunk_num = tensor1.valmap.chunk_num
-        idx1, idx2 = tensor1.valmap.idx, tensor2.valmap.idx
-        if chunk_num % 2 != 0:
-            return None
-        chunk_num = int(chunk_num // 2)
-        if int(idx1 // 2) != int(idx2 // 2):
-            return None
-        idx = int(idx1 // 2)
-        mtensor = tensor1.parent.select(
-            indmap = tensor1.indmap,
-            valmap = (idx, chunk_num),
-            shape = tensor1.shape
-        )
-        return mtensor
-
-    def __repr__(self):
-        dscp = f'{self.output} = merge({self.tensors}, axis={self.concat}, add={self.add})'
-        return dscp
 
 
 class IRAdapter(IRCell):
-    """
-    Tensor Adapter for each operator.
 
-    A Tensor Adapter has three stages:
-        * Select: select produced tensors
-        * Move: transfer the produced tensors
-        * Merge: merge the produced tensors
-    """
-
-    def __init__(self, prims,
-                inputs: List[IRSubTensor], idevices: List[List[int]],
-                outputs: List[IRSubTensor], odevices: List[List[int]]):
-        
-        self._prims = prims
-        self._idevices = tuple(idevices)
-        self._odevices = tuple(odevices)
-
+    def __init__(self, inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
         super().__init__(
             name='adapter', signature='adapter',
             input_length=len(inputs),
             output_length=len(outputs),
             init_outputs=False
         )
-        for idx, tensor in enumerate(inputs):
-            self.set_input(idx, tensor)
-        for idx, tensor in enumerate(outputs):
-            self.set_output(idx, tensor)
+        # we don't use input and output setter as this will
+        # change tensor device info
+        self._inputs = inputs
+        self._outputs = outputs
 
-        # set up device
+        self._prims: Optional[List[IRAdapterPrim]] = None
+        self._differentiable = False
+
+    @property
+    def prims(self) -> List[IRAdapterPrim]:
+        if self.is_forward:
+            if self.differentiable():
+                return self.diffcolls
+            else:
+                return self.forward
+        else:
+            if self.differentiable():
+                # not able to see
+                return []
+            else:
+                return self.backward
+
+    @property
+    def prims(self) -> List[IRAdapterPrim]:
+        return copy.copy(self._prims)
+
+    @prims.setter
+    def prims(self, prims: List[IRAdapterPrim]):
+        assert all(isinstance(prim, IRAdapterPrim) for prim in prims), "Expect List[IRAdapterPrim]"
+        self._prims = prims
+        self.update_device()
+
+    @property
+    def differentiable(self) -> bool:
+        """
+        return if the adapter is using differentiable primitives
+        """
+        return self._differentiable
+
+    @differentiable.setter
+    def differentiable(self, val: bool):
+        self._differentiable = val
+
+    def update_device(self):
         device = set()
-        for prim in self._prims:
+        for prim in self.prims:
             device.update(prim.device)
         self.device = list(device)
 
-    def prims(self, select=True, move=True, merge=True, coll=True):
-        """
-        Return prim list
-        """
-        prims = list()
-        for prim in self._prims:
-            if select and isinstance(prim, SelectPrim):
-                prims.append(prim)
-            if move and isinstance(prim, MovePrim):
-                prims.append(prim)
-            if merge and isinstance(prim, MergePrim):
-                prims.append(prim)
-            if coll and isinstance(prim, CollectivePrim):
-                prims.append(prim)
-        return prims
-
-    def idevice(self, input_index: int = None) -> List[int]:
-        """
-        Get device for input tensor at input index.
-
-        Returns:
-            device: List[int]
-        """
-        if isinstance(input_index, int):
-            return self._idevices[input_index]
-        else:
-            return copy.copy(self._idevices)
-
-    def odevice(self, output_index: int = None) -> List[int]:
-        """
-        Get device for output tensor at output index.
-
-        Returns:
-            device: List[int]
-        """
-        if isinstance(output_index, int):
-            return self._odevices[output_index]
-        else:
-            return copy.copy(self._odevices)
-
-    def dispatch(self, rank: int):
+    def dispatch(self, devid: int):
         """
         Get Adapter for a specific rank
 
         Returns:
             IRAdapter
         """
-        if not isinstance(rank, int):
-            raise TypeError(f"Expected rank to be int but got {rank}")
-        prims = list()
-        for prim in self.prims():
-            if rank in prim.device:
-                prims.append(prim)
-        inputs, idevs = list(), list()
-        for input, devs in zip(self.inputs(), self._idevices):
-            if rank in devs:
-                inputs.append(input)
-                idevs.append(devs)
-        outputs, odevs = list(), list()
-        for output, devs in zip(self.outputs(), self._odevices):
-            if rank in devs:
-                outputs.append(output)
-                odevs.append(devs)
-        adapter = IRAdapter(prims, inputs, idevs, outputs, odevs)
+        assert isinstance(devid, int), f"Expect devid to be int but got {devid}"
+        prims = [prim.dispatch(devid) for prim in self.prims]
+        prims = [prim for prim in prims if prim is not None]
+        # get inputs
+        inputs = []
+        for itensor in self.inputs():
+            if devid in itensor.device:
+                inputs.append(itensor) 
+        outputs = []
+        for otensor in self.outputs():
+            if devid in otensor.device:
+                outputs.append(otensor)
+        # insert identity prims
+        if len(prims) == 0:
+            assert len(inputs) == len(outputs) and all(itensor in outputs for itensor in inputs), \
+                "input/output tensor not match for empty prims"
+            for itensor in inputs:
+                prims.append(IdentityPrim(itensor))
+        # dispatch
+        adapter = IRAdapter(inputs, outputs)
+        adapter.prims = prims
         adapter.name = self.name
         adapter._id = self._id
-        adapter.device = rank
         return adapter
 
-    def update_device(self):
-        """
-        Update device (needed when adapter content changes, e.g., P2PFusion)
-        """
-        device = set()
-        for prim in self._prims:
-            device.update(prim.device)
-        self.device = list(device)
-
-    def is_identity(self):
-        """
-        Check if the adapter does nothing
-
-        Returns:
-            Boolean
-        """
-        return len(self._prims) == 0
-
-    @staticmethod
-    def gen(dst_tensor: IRSubTensor):
-        # print(f'generating adapter for: {dst_tensor}')
-        if not isinstance(dst_tensor, IRSubTensor):
-            raise RuntimeError("Expected IRSubTensor")
-        inputs, intersections, select_prims = IRAdapter.gen_select(dst_tensor)
-        move_prims = IRAdapter.gen_move(dst_tensor, intersections)
-        merge_prims = IRAdapter.gen_merge(dst_tensor, intersections)
-        prims = select_prims + move_prims + merge_prims
-        idevs = [t.device for t in inputs]
-        odevs = [dst_tensor.device]
-        return IRAdapter(prims, inputs, idevs, [dst_tensor], odevs)
-
-    @staticmethod
-    def gen_select(dst_tensor):
-
-        # TODO: consider previous adapter output as later adapter in-tensor
-        # for residual cases
-
-        inputs = list()
-        intersections = list()
-        prims = list()
-
-        otensor = dst_tensor
-        odevice = otensor.device
-
-        # local and remote adapter in-tensor
-        # local_remote instead of local + remote to preserve inputs order
-        # TODO check order as may affect merging result
-        local, remote, local_and_remote = list(), list(), otensor.parent.ptensors
-        for ptensor in otensor.parent.ptensors:
-            if ptensor.device == odevice:
-                local.append(ptensor)
-            else:
-                remote.append(ptensor)
-
-        # first check local in tensor
-        for tensor in local:
-            common = tensor.common(otensor)
-            if tensor == otensor:
-                intersections.append(tensor)
-                inputs.append(tensor)
-                return inputs, intersections, prims
-            elif common == otensor:
-                # index map
-                indmap = list()
-                islicers = tensor.indmap.get()
-                oslicers = common.indmap.get()
-                for islicer, oslicer in zip(islicers, oslicers):
-                    istart, istop, istep = islicer.start, islicer.stop, islicer.step
-                    ostart, ostop, ostep = oslicer.start, oslicer.stop, oslicer.step
-                    # relative offset
-                    start = ostart - istart
-                    stop = start + ostop - ostart
-                    slicer = slice(start, stop, ostep)
-                    indmap.append(slicer)
-                # value map must be same
-                if tensor.valmap != common.valmap:
-                    break
-                valmap = ValueMap(0, 1)
-                prim = SelectPrim(tensor, indmap, valmap, common.shape, common)
-                prims.append(prim)
-                intersections.append(otensor)
-                inputs.append(tensor)
-                return inputs, intersections, prims
-        # if otensor in local:
-        #     intersections.append(otensor)
-        #     inputs.append(otensor)
-        #     return inputs, intersections, prims
-        
-        # check local + remote
-        for itensor in local_and_remote: #local + remote:
-            if not itensor.overlap(otensor):
-                continue
-
-            # intersection
-            common: IRSubTensor = otensor.common(itensor)
-            common.attach_cell(itensor._cell)
-            intersections.append(common)
-            inputs.append(itensor)
-            if common == itensor:
-                continue
-
-            islicers = itensor.indmap.get()
-            oslicers = common.indmap.get()
-            # index map
-            indmap = list()
-            for islicer, oslicer in zip(islicers, oslicers):
-                istart, istop, istep = islicer.start, islicer.stop, islicer.step
-                ostart, ostop, ostep = oslicer.start, oslicer.stop, oslicer.step
-                if ostep % istep != 0:
-                    raise RuntimeError("Step condition fails")
-                # relative offset
-                start = ostart - istart
-                stop = start + ostop - ostart
-                slicer = slice(start, stop, ostep)
-                indmap.append(slicer)
-            # value map
-            if itensor.valmap == common.valmap:
-                valmap = ValueMap(0, 1)
-            elif itensor.valmap == ValueMap(0, 1):
-                valmap = common.valmap
-            else:
-                print('from: ', itensor)
-                print('to  : ', common)
-                raise NotImplementedError(
-                    f"Not supported value select: {input.valmap} -> {common.valmap}"
-                )
-            prim = SelectPrim(itensor, indmap, valmap, common.shape, common)
-            prims.append(prim)
-            # TODO: check union == otensor
-            if common == otensor:
-                break
-        
-        return inputs, intersections, prims
-
-    @staticmethod
-    def gen_move(dst_tensor, intersections):
-        prims = list()
-        odevice = dst_tensor.device
-        for tensor in intersections:
-            if tensor.device != odevice:
-                if len(tensor.device) != 1 or len(odevice) != 1:
-                    raise RuntimeError(
-                        f"Expected tensor on a single device but got {tensor.device} and {odevice}"
-                    )
-                prim = MovePrim(tensor, from_rank=tensor.device[0], to_rank=odevice[0])
-                prims.append(prim)
-        return prims
-
-    @staticmethod
-    def gen_merge(dst_tensor, intersections):
-        prims = list()
-        output = dst_tensor    
-        remain_tensors = copy.copy(intersections)
-        if output in remain_tensors:
-            return prims
-        out = None
-        while out != output:
-            out = None
-            merged = False
-            for idx1 in range(len(remain_tensors) - 1):
-                for idx2 in range(idx1 + 1, len(remain_tensors)):
-                    tensor1 = remain_tensors[idx1]
-                    tensor2 = remain_tensors[idx2]
-                    # try concat
-                    out = MergePrim.concat(tensor1, tensor2)
-                    if out is not None:
-                        out, concat_dim = out
-                        prim = MergePrim([tensor1, tensor2], out, output.device, concat_dim, False)
-                        prims.append(prim)
-                        merged = True
-                        break
-                    # try add
-                    out = MergePrim.add(tensor1, tensor2)
-                    if out is not None:
-                        prim = MergePrim([tensor1, tensor2], out, output.device, None, True)
-                        prims.append(prim)
-                        merged = True
-                        break
-                if merged:
-                    remain_tensors.remove(tensor1)
-                    remain_tensors.remove(tensor2)
-                    remain_tensors.append(out)
-                    break
-            # cannot merge or add
-            if out is None:
-                print(f'failed tensor: {dst_tensor.extra_repr()}')
-                print(f'ptensor:')
-                for tensor in dst_tensor.parent.ptensors:
-                    print(f'node-{tensor._cell._id}: {tensor.extra_repr()}')
-                print('intersections:')
-                for tensor in intersections:
-                    print(f'{tensor.extra_repr()}')
-                raise RuntimeError(f"Merge plan of tensor {dst_tensor} not found")
-        return prims
-
     def __repr__(self):
-        dscp = f'Adapter{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
-        return dscp
+        return f'Adapter-{self._id}{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
 
-    def module_repr(self) -> str:
-        return repr(self)
-
-    def extra_repr(self):
-        """
-        Detailed information
-        """
-        dscp = repr(self) + ':\n'
-        # select
-        for prim in self._prims:
-            dscp += '\t' + repr(prim) + '\n'
+    def extra_repr(self) -> str:
+        dscp = f'Adapter-{self._id}[{self.device}](inputs={self.inputs()}, outputs={self.outputs()})\n'
+        for prim in self.prims:
+            dscp += repr(prim) + '\n'
         return dscp
 
 
 class IRWeightReducer(IRCell):
 
     def __init__(self, weights: List[IRSubTensor], name='reducer'):
-        if not all([isinstance(w, IRSubTensor) and w.is_param() for w in weights]):
+        if not all(isinstance(w, IRSubTensor) and w.is_param() for w in weights):
             raise RuntimeError("Expected a list of gradient IRSubTensor")
         signature = None
         super().__init__(name, signature, len(weights), 0)

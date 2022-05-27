@@ -2,43 +2,66 @@
 Adapter: Tensor Transformation
 """
 
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 import torch
+
+
+def identity(tensor: torch.Tensor):
+    """
+    identity 
+    """
+    with torch.no_grad():
+        tensor = tensor.detach().requires_grad_()
+    return tensor
 
 
 def select(tensor: torch.Tensor,
            indmap: Tuple[slice], valmap: Tuple[int, int]) -> torch.Tensor:
-
+    """
+    Select a part of tensor spatially and numerically.
+    """
     with torch.no_grad():
         sub_tensor = tensor[indmap]
         if valmap != (0, 1):
             sub_tensor = sub_tensor / valmap[1]
-        sub_tensor = sub_tensor.contiguous()
+        sub_tensor = sub_tensor.detach().requires_grad_()
     return sub_tensor
 
-def merge(tensors: List[torch.Tensor],
-          concat: Optional[int] = None,
-          add: bool = False):
-    """
-    Runtime primitive to finish tensor transformation.
 
-    Warning: No contiguous is called!!! need to explicitly called
-    before communication
+def chunk(itensor: torch.Tensor, dim: int, chunks: int, idx: int) -> torch.Tensor:
+    """
+    split dimension in n chunks and take idx-th chunk
+    """
+    with torch.no_grad():
+        otensor = itensor.chunk(chunks, dim)[idx]
+        otensor = otensor.detach().requires_grad_()
+    return otensor
+
+
+def smerge(tensors: List[torch.Tensor], dim: int) -> torch.Tensor:
+    """
+    Runtime primitive of spatial merge.
+    Concatenate the tensors along a dimension
 
     Args:
         tensors: a list of torch tensor
-        concat: Optional[int]: the dimension to merge
-        add: bool: whether to perform value merge
+        dim: the dimension to concatenate.
     """
-    if not ((concat is not None) ^ (add is True)):  # xor condition
-        raise RuntimeError("Expected concat or add")
-    if concat is not None:
-        with torch.no_grad():
-            out = torch.cat(tensors, concat)
-        return out
-    if add is not None:
-        with torch.no_grad():
-            out = tensors[0]
-            for tensor in tensors[1:]:
-                out = out + tensor
-        return out
+    with torch.no_grad():
+        out = torch.concat(tuple(tensors), dim).requires_grad_()
+    return out
+
+
+def vmerge(tensors: List[torch.Tensor]) -> torch.Tensor:
+    """
+    Runtime primitives of numerical merge.
+    Sum the tensors.
+
+    Args:
+        tensors: a list of torch tensor
+    """
+    with torch.no_grad():
+        out = tensors[0]
+        for tensor in tensors[1:]:
+            out = out + tensor
+    return out.requires_grad_()

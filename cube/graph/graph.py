@@ -329,7 +329,7 @@ class IRGraph(IRCell):
         # insert forward
         fidx = self.nodes().index(op)
         for idx, fnode in enumerate(fnodes):
-            self.attach(fnode, fidx + idx) 
+            self.attach(fnode, fidx + idx + 1) 
         # insert backward
         if isinstance(op.mirror, IRBpOperation):
             for fnode in fnodes:

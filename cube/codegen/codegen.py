@@ -11,8 +11,7 @@ from cube.ir.dtype import IRDType
 
 from cube.graph.tensor import IRSubTensor
 from cube.graph.operator.operator import IRBpOperation, IRDataOperation, IRFwOperation
-from cube.graph.adapter.adapter import CollectivePrim, IRAdapter, SelectPrim, MovePrim, MergePrim
-from cube.graph.adapter.adapter import IRWeightReducer
+from cube.graph.adapter.adapter import IRWeightReducer, IRAdapter
 from cube.graph.graph import IRGraph
 
 from cube.execplan import ExectuionPlan
@@ -99,10 +98,10 @@ class ModelCodeGen(CodeGen):
         # collect groups from p2p fusion
         adapters = [n for n in graph.nodes() if isinstance(n, IRAdapter)]
         for adapter in adapters:
-            for prim in adapter.prims():
-                if not isinstance(prim, CollectivePrim):
+            for prim in adapter.prims:
+                if len(prim.device) == 1:
                     continue
-                ranks = list(prim.group)
+                ranks = list(prim.device)
                 ranks.sort()
                 ranks = tuple(ranks)
                 if ranks not in comm_groups:
@@ -135,7 +134,8 @@ class ModelCodeGen(CodeGen):
             elif isinstance(node, IRFwOperation):
                 self.emit_op_call(node)
             elif isinstance(node, IRAdapter):
-                node = node.dispatch(rank=device)
+                node = node.dispatch(device)
+                print(node.extra_repr())
                 self.emit_adapter_call(node)
             elif isinstance(node, IRWeightReducer):
                 self.emit_reducer_init(node)
@@ -246,66 +246,77 @@ class ModelCodeGen(CodeGen):
         """
         Emit adapter call
         """
-        if len(node.device) != 1:
-            raise RuntimeError("Expected IRAdapter to be dispatched")
-        rank = node.device[0]
-        for prim in node.prims():
-            # emit select
-            if isinstance(prim, SelectPrim):
-                sign = 'cube.runtime.adapter.select({tensor}, {indmap}, {valmap})'
-                input = self.tensor_naming(prim.tensor)
-                output = self.tensor_naming(prim.output)
-                valmap = (prim.valmap.idx, prim.valmap.chunk_num)
-                code = f'{output} = {sign.format(tensor=input, indmap=prim.indmap, valmap=valmap)}'
-                self.forward_region.append(code)
-            # emit move
-            elif isinstance(prim, MovePrim):
-                send_sign = 'cube.runtime.adapter.send({tensor}, {send_rank})'
-                recv_sign = 'cube.runtime.adapter.recv({shape}, {from_rank}, {dtype})'
-                tensor = self.tensor_naming(prim.tensor)
-                # send
-                if rank == prim.from_rank:
-                    code = f'{send_sign.format(tensor=tensor, send_rank=prim.to_rank)}'
-                    self.forward_region.append(code)
-                # recv
-                elif rank == prim.to_rank:
-                    output = self.tensor_naming(prim.tensor)
-                    dtype = self.dtype_map(prim.dtype)
-                    code = f'{tensor} = {recv_sign.format(shape=prim.shape, from_rank=prim.from_rank, dtype=dtype)}'
-                    self.forward_region.append(code)
-            # emit merge
-            elif isinstance(prim, MergePrim):
-                sign = 'cube.runtime.adapter.merge({tensors}, {concat}, {add})'
-                inputs = self.tuple_naming(prim.tensors)
-                output = self.tensor_naming(prim.output)
-                code = f'{output} = {sign.format(tensors=inputs, concat=prim.concat, add=prim.add)}'
-                self.forward_region.append(code)
-            # emit collectives
-            elif isinstance(prim, CollectivePrim):
-                sign = 'cube.runtime.adapter.{ctype}({input_tensors}, {output_shapes}, {output_dtypes}, {group})'
-                inputs = self.tuple_naming(prim.inputs)
-                outputs = self.return_naming(prim.outputs)
-                dtypes = None
-                if prim.output_dtypes is not None:
-                    dtypes = [self.dtype_map(dtype) for dtype in prim.output_dtypes]
-                    dtypes = self.tuple_naming(dtypes)
-                body = sign.format(
-                    ctype=prim.ctype.value,
-                    input_tensors = inputs,
-                    output_shapes = prim.output_shapes,
-                    output_dtypes = dtypes,
-                    group=prim.group
-                )
-                code = f'{outputs} = {body}'
-                self.forward_region.append(code)
+        assert len(node.device) == 1, f"Expected adapter to be dispatched:\n{node.extra_repr()}"
+        # rank = node.device[0]
+        for prim in node.prims:
+            # print(f'generating prim: {prim}')
+            if len(prim.inputs()) == 1:
+                itensors = self.tensor_naming(prim.inputs()[0])
             else:
-                raise TypeError(f"Unkown primitive types {type(prim)} of Adapter")
+                itensors = self.tuple_naming(prim.inputs())
+            kwargs = list()
+            for name, val in prim.kwargs.items():
+                kwargs.append(f'{name}={val}')
+            kwargs = ', '.join(kwargs)
+            outputs = self.return_naming(prim.outputs())
+            code = f'{outputs} = {prim.signature}({itensors}, {kwargs})'
+            self.forward_region.append(code)
+            # # emit select
+            # if isinstance(prim, SelectPrim):
+            #     sign = 'cube.runtime.adapter.select({tensor}, {indmap}, {valmap})'
+            #     input = self.tensor_naming(prim.tensor)
+            #     output = self.tensor_naming(prim.output)
+            #     valmap = (prim.valmap.idx, prim.valmap.chunk_num)
+            #     code = f'{output} = {sign.format(tensor=input, indmap=prim.indmap, valmap=valmap)}'
+            #     self.forward_region.append(code)
+            # # emit move
+            # elif isinstance(prim, MovePrim):
+            #     send_sign = 'cube.runtime.adapter.send({tensor}, {send_rank})'
+            #     recv_sign = 'cube.runtime.adapter.recv({shape}, {from_rank}, {dtype})'
+            #     tensor = self.tensor_naming(prim.tensor)
+            #     # send
+            #     if rank == prim.from_rank:
+            #         code = f'{send_sign.format(tensor=tensor, send_rank=prim.to_rank)}'
+            #         self.forward_region.append(code)
+            #     # recv
+            #     elif rank == prim.to_rank:
+            #         output = self.tensor_naming(prim.tensor)
+            #         dtype = self.dtype_map(prim.dtype)
+            #         code = f'{tensor} = {recv_sign.format(shape=prim.shape, from_rank=prim.from_rank, dtype=dtype)}'
+            #         self.forward_region.append(code)
+            # # emit merge
+            # elif isinstance(prim, MergePrim):
+            #     sign = 'cube.runtime.adapter.merge({tensors}, {concat}, {add})'
+            #     inputs = self.tuple_naming(prim.tensors)
+            #     output = self.tensor_naming(prim.output)
+            #     code = f'{output} = {sign.format(tensors=inputs, concat=prim.concat, add=prim.add)}'
+            #     self.forward_region.append(code)
+            # # emit collectives
+            # elif isinstance(prim, CollectivePrim):
+            #     sign = 'cube.runtime.adapter.{ctype}({input_tensors}, {output_shapes}, {output_dtypes}, {group})'
+            #     inputs = self.tuple_naming(prim.inputs)
+            #     outputs = self.return_naming(prim.outputs)
+            #     dtypes = None
+            #     if prim.output_dtypes is not None:
+            #         dtypes = [self.dtype_map(dtype) for dtype in prim.output_dtypes]
+            #         dtypes = self.tuple_naming(dtypes)
+            #     body = sign.format(
+            #         ctype=prim.ctype.value,
+            #         input_tensors = inputs,
+            #         output_shapes = prim.output_shapes,
+            #         output_dtypes = dtypes,
+            #         group=prim.group
+            #     )
+            #     code = f'{outputs} = {body}'
+            #     self.forward_region.append(code)
+            # else:
+            #     raise TypeError(f"Unkown primitive types {type(prim)} of Adapter")
         # requires grad generation
-        sign = '{output} = {output}.contiguous().requires_grad_()'
-        for output in node.outputs():
-            if isinstance(output, IRSubTensor) and output.requires_grad:
-                code = sign.format(output=self.tensor_naming(output))
-                self.forward_region.append(code)
+        # sign = '{output} = {output}.contiguous().requires_grad_()'
+        # for output in node.outputs():
+        #     if isinstance(output, IRSubTensor) and output.requires_grad:
+        #         code = sign.format(output=self.tensor_naming(output))
+        #         self.forward_region.append(code)
 
     def emit_reducer_init(self, node: IRWeightReducer):
         # reducer init interface
@@ -390,7 +401,7 @@ class ScheduleCodeGen(CodeGen):
         device_nodes = self.execplan.sequence(device)
         for idx, node in enumerate(device_nodes):
             if isinstance(node, IRAdapter):
-                node = node.dispatch(rank=device)
+                node = node.dispatch(device)
                 device_nodes[idx] = node
 
         def refcount(tensor, node) -> int:

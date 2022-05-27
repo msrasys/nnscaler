@@ -6,7 +6,7 @@ import os
 import cube
 
 from cube.graph import parser
-from cube.graph.adapter.gen import AdapterGener
+from cube.graph.adapter.gen import IRAdapterGener
 from cube.graph.graph import IRGraph
 from cube.graph.operator.operator import IRDataOperation
 
@@ -14,8 +14,7 @@ from cube.logics.pool import SchedulePool
 from cube.logics.translator import LogicTranslator
 
 from cube.execplan import ExectuionPlan
-from cube.execplan.planpass.grouping import Grouping, GroupingAdapter
-from cube.execplan.planpass.fusion import P2PFusion
+from cube.execplan.planpass.grouping import Grouping
 
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
@@ -165,7 +164,8 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                     raise RuntimeError(f"Node {node} device is not set")
 
             # generate adapter
-            graph = AdapterGener.gen(graph)
+            # graph = AdapterGener.gen(graph)
+            graph = IRAdapterGener.gen(graph)
 
             # to execution plan
             execplan = ExectuionPlan(graph)
@@ -176,15 +176,15 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             span = time.time() - start
             print('> planpass on grouping operations: {:.2f} s'.format(span))
 
-            start = time.time()
-            execplan = P2PFusion.apply(execplan)
-            span = time.time() - start
-            print('> planpass on p2pfusion operations: {:.2f} s'.format(span))
+            # start = time.time()
+            # execplan = P2PFusion.apply(execplan)
+            # span = time.time() - start
+            # print('> planpass on p2pfusion operations: {:.2f} s'.format(span))
 
-            start = time.time()
-            execplan = GroupingAdapter.apply(execplan)
-            span = time.time() - start
-            print('> planpass on grouping adapters : {:.2f} s'.format(span))
+            # start = time.time()
+            # execplan = GroupingAdapter.apply(execplan)
+            # span = time.time() - start
+            # print('> planpass on grouping adapters : {:.2f} s'.format(span))
 
             execplan.graph.reset_dependency()
             # execplan.analyze(outfile='execplan.png')
