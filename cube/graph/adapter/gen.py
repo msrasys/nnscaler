@@ -175,7 +175,7 @@ class IRAdapterGener:
         olayout = GridLayout.togrid(ftensor, ctensors)
         # print(f'forward full tensor: {ftensor}\n producer: {ilayout}, consumer: {olayout}')
         # find path
-        paths, fprims = ilayout.path(olayout, auto_replace=True)
+        paths, fprims = ilayout.path(olayout)
 
         # re-assign the operator if miss-ordered
         names, from_dev, to_dev = [], [], []

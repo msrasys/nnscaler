@@ -34,13 +34,16 @@ def select(tensor: torch.Tensor,
     return sub_tensor
 
 
-def chunk(itensor: torch.Tensor, dim: int, chunks: int, idx: int) -> torch.Tensor:
+def chunk(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
     """
     split dimension in n chunks and take idx-th chunk
+
+    ranks (Tuple[int]): the order of split tensor.
     """
+    idx = ranks.index(torch.distributed.get_rank())
     require_grad = itensor.requires_grad
     with torch.no_grad():
-        otensor = itensor.chunk(chunks, dim)[idx]
+        otensor = itensor.chunk(len(ranks), dim)[idx]
         otensor = otensor.detach()
     if require_grad:
         otensor = otensor.requires_grad_()

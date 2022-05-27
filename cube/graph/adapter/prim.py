@@ -2,7 +2,7 @@
 The primitive used for IRAdapter
 """
 
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 import copy
 
 from cube.graph.tensor import IRSubTensor, IndexMap, ValueMap
@@ -124,16 +124,17 @@ class ChunkPrim(SpatialPrim):
     split dimension in n chunks and take idx-th chunk
     """
     def __init__(self, itensor: IRSubTensor, otensor: IRSubTensor,
-                 dim: int, chunks: int, idx: int):
-        assert 0 <=idx and idx < chunks, "idx out of scope"
+                 dim: int, ranks: Tuple[int]):
+        assert itensor.device[0] in ranks, "idx out of scope"
         super().__init__([itensor], [otensor])
         self.kwargs['dim'] = dim
-        self.kwargs['chunks'] = chunks
-        self.kwargs['idx'] = idx
+        self.kwargs['ranks'] = ranks
         self.signature = 'cube.runtime.adapter.chunk'
 
     def __repr__(self) -> str:
-        return f"dev{self.device}: {self.outputs(0)} = split(dim={self.kwargs['dim']}, chunks={self.kwargs['chunks']}, idx={self.kwargs['idx']})"
+        chunks = len(self.kwargs['ranks'])
+        idx = self.kwargs['ranks'].index(self.device[0])
+        return f"dev{self.device}: {self.outputs(0)} = split(dim={self.kwargs['dim']}, chunks={chunks}, idx={idx})"
 
 
 class MergeDimPrim(SpatialPrim):

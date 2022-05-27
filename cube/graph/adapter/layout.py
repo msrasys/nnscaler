@@ -155,13 +155,14 @@ class GridLayout:
             otensor._cell = itensor._cell
         prims = []
         for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
+            ranks = tuple(t.device[0] for t in itensors)
             for idx, (itensor, otensor) in enumerate(zip(itensors, otensors)):
-                prims.append(ChunkPrim(itensor, otensor, dim, chunks, idx))
+                prims.append(ChunkPrim(itensor, otensor, dim, ranks))
         return glayout, prims
 
     # ================ solution ============= #
 
-    def path(self, dst, auto_replace: bool = False) -> Tuple:
+    def path(self, dst) -> Tuple:
         """
         Find a path from self to destination GridLayout using
         primitivies. This implementation uses search order of
@@ -234,22 +235,6 @@ class GridLayout:
                     paths.append(olayout)
                     comm_prims += oprims
                     break
-        # if auto_replace:
-        #     replaced = False
-        #     reorder : Dict[str, Tuple[int, int]] = dict()
-        #     for itensor, otensor in zip(paths[-1].mat.flatten(), dst.mat.flatten()):
-        #         assert len(itensor.device) == 1 and len(otensor.device) == 1, \
-        #             "Expect tensor only has one device. Report this as a bug"
-        #         if itensor.device != otensor.device:
-        #             inode, onode = itensor._cell, otensor._cell
-        #             reorder[f'{onode.name}-{onode._id}'] = (onode.device[0], inode.device[0])
-        #             onode.device = inode.device
-        #             if onode.mirror is not None:
-        #                 onode.mirror.device = inode.device
-        #             replaced = True
-        #     if replaced:
-        #         print(f'warning: a better device placement is found and set for op {reorder}')
-
         return paths, comm_prims
 
     def __repr__(self):
