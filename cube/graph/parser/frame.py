@@ -12,11 +12,21 @@ class Frame:
         self._vars: List[dict[str, Any]] = list()
         self._var_stack: List[str] = list()
 
-    def push(self):
+    def push(self, inherit_from_top=False):
         """
         This should only be called when step in a module
+
+        Args:
+            inherit_from_top (bool): 
+                whether to make all already defined variables in the top frame 
+                accessible to the evaluation procedure
+                (e.g. references to such variables won't cause VarNotFound exception).
         """
-        self._vars.append(OrderedDict())
+        if inherit_from_top:
+            assert len(self._vars) > 0
+            self._vars.append(self._vars[-1].copy())
+        else:
+            self._vars.append(OrderedDict())
 
     def pop(self):
         """
@@ -35,9 +45,13 @@ class Frame:
             val: variable content
             graph_arg (int):
                 indicate whether it is an argument of the graph.
+
                 If == -1, is not a graph arg.
-                If >= 0, is a graph arg, will try to find 
-                val from previous frame
+
+                If >= 0, is a graph arg, will try to find val from previous frame,
+                by associating the names of the formal parameters of the callee function
+                and the names of the arguments passed-in. 
+                (then look up the values of the arguments in the previous frame)
         """
         if not isinstance(var_name, str):
             raise RuntimeError("Expected var_name is str")

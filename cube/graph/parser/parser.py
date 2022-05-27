@@ -1,3 +1,4 @@
+from multiprocessing.synchronize import Condition
 import torch
 import enum
 import re
@@ -27,6 +28,7 @@ class ScriptNodeKind(enum.Enum):
     PrimTupleUnpack = 9
     PrimPythonOp = 10
     PrimDevice = 11       # erased
+    PrimLoop = 12
 
 
 class ScriptModuleParser:
@@ -146,6 +148,8 @@ class ScriptModuleParser:
             return ScriptNodeKind.AtenOp
         if node.kind() == 'prim::If':
             return ScriptNodeKind.PrimIf
+        if node.kind() == 'prim::Loop':
+            return ScriptNodeKind.PrimLoop
         if node.kind() == 'prim::ListConstruct':
             return ScriptNodeKind.PrimListConstruct
         if node.kind() == 'prim::TupleConstruct':
@@ -184,6 +188,8 @@ class ScriptModuleParser:
                 return ScriptModuleParser.parse_prim_list_unpack_node(node, module, frame)
             if node_type == ScriptNodeKind.PrimPythonOp:
                 return ScriptModuleParser.parse_prim_python_op_node(node, module, frame)
+            if node_type == ScriptNodeKind.PrimLoop:
+                return ScriptModuleParser.parse_prim_loop_node(node, module, frame)
 
             # TODO bother assigning all ignored prim functions new NodeKinds?
             if node_type == ScriptNodeKind.PrimDevice:
@@ -274,18 +280,16 @@ class ScriptModuleParser:
             frame.add_var(outputs[0].debugName(), container[index])
             return []
 
-        # aten::tensor(elems: List^{n:Nat}[T], dtype:Optional[ScalarType], device:Device, requires_grad:bool) -> Tensor
-        elif fsig == 'torch.tensor':
-            # originally 'aten::tensor' 
-            var_name = outputs[0].debugName()
-            elems, dtype, erased_device, requires_grad = input_val
+        elif fsig == 'torch.__range_length':
+            lo, hi, step = input_val
+            rng_len = ScriptModuleParser.aten___range_length(lo, hi, step)
+            frame.add_var(outputs[0].debugName(), rng_len)
+            return []
 
-            # dtype may be None, in PyTorch it's to infer dtype from 'elems'.
-            if dtype == None:
-                dtype = DType2IRDType.map(torch.get_default_dtype())
-
-            ir_tensor = IRFullTensor(shape=[len(elems)], name=var_name, requires_grad=requires_grad, dtype=dtype)
-            frame.add_var(var_name, ir_tensor)
+        elif fsig == 'torch.__derive_index':
+            index, start, step = input_val
+            derived = ScriptModuleParser.aten___derive_index(index, start, step)
+            frame.add_var(outputs[0].debugName(), derived)
             return []
 
         # May be a symbolic object i.e. IRFwOperation,
@@ -449,6 +453,125 @@ class ScriptModuleParser:
         raise NotImplementedError("Dynamic Graph is not supported yet")
 
     @staticmethod
+    def parse_prim_loop_node(node, module, frame) -> List[IRFwOperation]:
+        """
+        Inputs:
+            %max_iter_count : int
+            %init_condition : bool
+            %x_1 : T_1
+            ...
+            %x_N : T_N
+            %dependencies : R
+
+        Syntax:
+            %y_1 : T_1, ..., %y_N : T_N = prim::Loop(%max_iter_count, %init_condition, %x_1, ..., %x_N)
+              block0(%iter_step : int, %p_1 : T_1, ..., %p_N : T_N):
+                ...
+                %r_1 : T_1 = some_func(%x_1, %dependencies)
+                ...
+                %r_N : T_N = ...
+                %next_condition : bool = ...
+                -> (%next_condition, %r_1, ..., %r_N)
+
+        REMARK:
+            -   Outer variables (%dependencies) may be referenced in the Loop-body/subgraph, this is AKA _free variables_.
+                In contrast, a standalone TorchScript function/graph will have all variables,
+                including its parameters, defined within its scope.
+                
+                In other words, functions/graphs have no free variables.
+
+        Semantics:
+            -   The next step is evaluated if both (%iter_step < %max_iter_count) and (%next_condition == True).
+            -   (%y_1, ..., %y_N) are bound to the last (%r_1, ..., %r_N) returned.
+                If no step is ever evaluated, they are (%x_1, ..., %x_N).
+        """
+        inputs : List[torch._C.Value] = list(node.inputs())
+        outputs : List[torch._C.Value] = list(node.outputs())
+
+        in_vals = [frame.get_var(input.debugName()) for input in inputs]
+
+        max_iter_count, init_condition = in_vals[0:2]
+        if not isinstance(max_iter_count, int):
+            raise RuntimeError("The upper bound of the loop must be able to be statically evaluated")
+        if not isinstance(init_condition, bool):
+            raise RuntimeError("The init condition of the loop must be able to be statically evaluated")
+
+        # type: Subgraph
+        loop_block : torch._C.Block = list(node.blocks())[0]
+
+        body_in_vars : torch._C.Value = list(loop_block.inputs())
+        iter_step_var = body_in_vars[0]
+        p_vars = body_in_vars[1:]
+
+        body_out_vars = list(loop_block.outputs())
+
+        step = 0
+        condition = init_condition
+        loop_carried_vals = in_vals[2:]
+
+        all_ir_nodes : List[IRFwOperation] = []
+
+        while step < max_iter_count and condition:
+
+            # create the context for evaluating the body, and bind loop variables %iter_step, %p_1, ...
+
+            # Defensively we don't let variables defined in the Loop body subgraph pollute the outer graph.
+            # So we'd better duplicate all existing variables into a new frame (namely 'inherit_from_top'), 
+            # and clean up this new frame after the interpretation of the whole loop execution.
+            frame.push(inherit_from_top=True)
+
+            frame.add_var(iter_step_var.debugName(), step)
+
+            # At the evaluation of each step, we cannot call Frame's 'push_param(var_name)' and 'add_var(var_name, val, graph_arg=N)' APIs,
+            # because all intermediate loop-carried values do not have syntactically static names.
+            #
+            # For the sake of isolation, we don't bind carried values onto {y_i}s variables and overwrite the binding
+            # during evaluation, either.
+            assert len(p_vars) == len(loop_carried_vals)
+            for p_var, carried_val in zip(p_vars, loop_carried_vals):
+                frame.add_var(p_var.debugName(), carried_val)
+
+            # evaluate the body block
+            for subnode in loop_block.nodes():
+                subnode : torch._C.Node
+
+                sub_ir_nodes : List[IRFwOperation] = ScriptModuleParser.parse_node(subnode, module, frame)
+
+                for ir_node in sub_ir_nodes:
+                    try:
+                        ret = ir_node.infer_shape()
+                        if not ret:
+                            print(f'warning: {ir_node} cannot infer shape')
+                    except Exception:
+                        raise RuntimeError(
+                            f"====== Shape Infer Error ====\n\n\n"
+                            f"IR Node: {ir_node}\n\n"
+                            f"Module:\n{module.code}\n\n"
+                            f"Node:\n{node}\n"
+                            f"====== Shape Infer Error ====\n\n\n"
+                        )
+
+                all_ir_nodes += sub_ir_nodes
+
+            # rebind for next step and clean-ups
+            step_result_vals = [frame.get_var(body_out_var.debugName()) for body_out_var in body_out_vars]
+            condition = step_result_vals[0]
+            loop_carried_vals = step_result_vals[1:]
+            step += 1
+
+            frame.pop()
+
+            if not isinstance(condition, bool):
+                raise RuntimeError(f"At the {step}-th step the condition is not evaluated to a constant bool")
+
+        assert len(outputs) == len(loop_carried_vals)
+        for output, y_val in zip(outputs, loop_carried_vals):
+            frame.add_var(output.debugName(), y_val)
+
+        return all_ir_nodes
+
+
+    @staticmethod
     def parse_prim_list_construct_node(node, module, frame: Frame) -> List[None]:
         """
         Parse script module node like
@@ -517,5 +640,38 @@ class ScriptModuleParser:
                     label = node.inputsAt(0).node().s('name')
                     submodule = getattr(smodule, label)
                     ScriptModuleParser.flatten(submodule, depth+1)
+
+    @staticmethod
+    def aten___range_length(lo, hi, step):
+        """
+        aten::__range_length(int lo, int hi, int step) -> int
+
+        Python loops
+            ```
+            for i in range(L, H, S):
+                use(i)
+            ```
+        will be translated to TorchScript
+            ```
+            _c = aten::__range_length(L, H, S)
+            for _k < _c:
+                i = aten::__derive_index(k, L, S)
+                use(i)
+            ```
+        """
+        if not (isinstance(lo, int) and isinstance(hi, int) and isinstance(step, int)):
+            raise RuntimeError("All inputs to __range_length must be statically evaluated")
+        if step == 0:
+            raise RuntimeError("Step cannot be zero")
+
+        return len(range(lo, hi, step))
+
+    @staticmethod
+    def aten___derive_index(index, start, step):
+        if not (isinstance(index, int) and isinstance(start, int) and isinstance(step, int)):
+            raise RuntimeError("All inputs to __derive_index must be statically evaluated")
+
+        return start + index * step
+
 
 
