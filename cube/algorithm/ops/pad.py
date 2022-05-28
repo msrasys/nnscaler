@@ -3,7 +3,7 @@ from typing import Dict
 from cube.algorithm.utils import split_axis, split_axis_custom, split_value
 from cube.algorithm.generics import GenericDistAlgo
 
-from cube.graph.operator.function.pad import IRPad
+from cube.graph.function.pad import IRPad
 
 class DimSplitPad(GenericDistAlgo):
     """

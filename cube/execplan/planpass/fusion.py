@@ -1,17 +1,17 @@
 from typing import List
 
-from cube.graph.adapter.adapter import IRAdapter
+from cube.ir.adapter import IRAdapter
 
 from cube.execplan import ExectuionPlan
 from cube.execplan.planpass.planpass import PlanPass
 
-from cube.graph.adapter.prim import IRAdapterPrim
-from cube.graph.adapter.prim import AllReducePrim, AllGatherPrim, ReduceScatterPrim, AllToAllPrim
-from cube.graph.adapter.prim import IdentityPrim, ChunkPrim
-from cube.graph.adapter.prim import IdentityAllreducePrim, AllReduceIdentityPrim, AllReduceAllReducePrim
-from cube.graph.adapter.prim import AllGatherReduceScatterPrim, ReduceScatterAllGatherPrim
-from cube.graph.adapter.prim import SplitAllGatherPrim, AllGatherSplitPrim
-from cube.graph.adapter.prim import AllToAllAllToAllPrim
+from cube.ir.adapter.prim import IRAdapterPrim
+from cube.ir.adapter.prim import AllReducePrim, AllGatherPrim, ReduceScatterPrim, AllToAllPrim
+from cube.ir.adapter.prim import IdentityPrim, ChunkPrim
+from cube.ir.adapter.prim import IdentityAllreducePrim, AllReduceIdentityPrim, AllReduceAllReducePrim
+from cube.ir.adapter.prim import AllGatherReduceScatterPrim, ReduceScatterAllGatherPrim
+from cube.ir.adapter.prim import SplitAllGatherPrim, AllGatherSplitPrim
+from cube.ir.adapter.prim import AllToAllAllToAllPrim
 
 
 class DiffFusion(PlanPass):

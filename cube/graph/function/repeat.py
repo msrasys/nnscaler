@@ -1,7 +1,7 @@
 from typing import List, Optional, Tuple
 import itertools
 
-from cube.graph.operator.operator import IRFwOperation
+from cube.ir.operator import IRFwOperation
 from cube.ir.cten import IRTensor
 
 class IRRepeat(IRFwOperation):

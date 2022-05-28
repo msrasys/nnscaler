@@ -1,6 +1,6 @@
 from typing import List
 
-from cube.graph.operator.operator import IRFwOperation
+from cube.ir.operator import IRFwOperation
 from cube.ir.cten import IRTensor
 
 class IRPad(IRFwOperation):

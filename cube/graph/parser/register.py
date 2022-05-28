@@ -6,7 +6,7 @@ from typing import Any, Callable, List
 import inspect
 import torch
 
-from cube.graph.operator.function.einops import IREinops
+from cube.graph.function.einops import IREinops
 
 from cube.graph.parser.mapping import Sign2Op
 

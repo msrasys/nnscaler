@@ -3,8 +3,8 @@ from typing import Dict
 from cube.algorithm.utils import split_axis, split_axis_custom, split_value
 from cube.algorithm.generics import GenericDistAlgo
 
-from cube.graph.operator.function.conv import IRConv2D
-from cube.graph.operator.function.conv import IRConv3D
+from cube.graph.function.conv import IRConv2D
+from cube.graph.function.conv import IRConv3D
 
 
 class DimSplitConv2D(GenericDistAlgo):

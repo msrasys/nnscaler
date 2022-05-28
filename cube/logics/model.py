@@ -2,8 +2,8 @@ from typing import Any
 import copy
 
 from cube.graph.graph import IRGraph
-from cube.graph.tensor import IRSubTensor
-from cube.graph.operator import IRFwOperation
+from cube.ir.tensor import IRSubTensor
+from cube.ir.operator import IRFwOperation
 
 from cube.ir.cten import IRTensor
 

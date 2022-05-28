@@ -3,7 +3,7 @@ from typing import List, Dict
 from cube.algorithm.utils import split_axis, split_value
 from cube.algorithm.generics import GenericDistAlgo
 
-from cube.graph.operator.function import IREinops, EinDim
+from cube.graph.function import IREinops, EinDim
 
 
 class DimSplitEinops(GenericDistAlgo):

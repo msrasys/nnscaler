@@ -1,6 +1,7 @@
 from functools import partial
 from typing import List
-from cube.graph.graph import IRGraph, IRFwOperation
+from cube.graph import IRGraph
+from cube.ir.operator import IRFwOperation
 from cube.ir.cten import IRCell
 from cube.execplan import ExectuionPlan
 

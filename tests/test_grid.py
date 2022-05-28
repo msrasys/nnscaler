@@ -1,5 +1,5 @@
-from cube.graph.adapter.layout import GridLayout
-from cube.graph.tensor import IRFullTensor
+from cube.graph.gener.layout import GridLayout
+from cube.ir.tensor import IRFullTensor
 
 def test_grid():
 

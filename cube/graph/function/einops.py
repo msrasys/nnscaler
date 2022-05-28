@@ -57,7 +57,7 @@ import copy
 import string
 
 from cube.ir.cten import IRTensor
-from cube.graph.operator.operator import IRFwOperation
+from cube.ir.operator import IRFwOperation
 from cube.algorithm.factory import DistAlgorithmFactory
 
 

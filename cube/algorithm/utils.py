@@ -1,5 +1,5 @@
 from typing import List, Union
-from cube.graph.tensor import IRSubTensor
+from cube.ir.tensor import IRSubTensor
 
 
 def split_axis(tensor: IRSubTensor, axis: int, chunk_num: int):

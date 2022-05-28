@@ -3,15 +3,15 @@ import warnings
 import copy
 
 from cube.graph.graph import IRGraph
-from cube.graph.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
-from cube.graph.adapter.adapter import IRAdapter, IRWeightReducer
+from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
+from cube.ir.adapter import IRAdapter, IRWeightReducer
 
-from cube.graph.operator.operator import IRBpOperation, IRFwOperation
+from cube.ir.operator import IRBpOperation, IRFwOperation
 from cube.ir.cten import IRCell
 
-from cube.graph.adapter.prim import IRAdapterPrim
-from cube.graph.adapter.prim import SelectPrim, MovePrim, SumPrim, MergeDimPrim
-from cube.graph.adapter.layout import GridLayout
+from cube.ir.adapter.prim import IRAdapterPrim
+from cube.ir.adapter.prim import SelectPrim, MovePrim, SumPrim, MergeDimPrim
+from cube.graph.gener.layout import GridLayout
 
 
 class IRAdapterGener:

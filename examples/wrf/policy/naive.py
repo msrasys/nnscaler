@@ -1,5 +1,5 @@
 from cube.graph import IRGraph
-from cube.graph.operator.function import IRConv2D
+from cube.graph.function import IRConv2D
 
 def PAS(graph: IRGraph, resource):
     for node in graph.nodes():

@@ -2,12 +2,9 @@ from typing import Any, Optional, Tuple, Union, List
 import copy
 
 from cube.ir.cten import IRCell, IRTensor
-from cube.graph.tensor import IRFullTensor, IRSubTensor
+from cube.ir.tensor import IRFullTensor, IRSubTensor
 from cube.algorithm.factory import DistAlgorithmFactory
 from cube.ir.unique import IDGenerator
-
-
-__all__ = ['IRFwOperation', 'IRBpOperation', 'IRDataOperation']
 
 
 class BaseOperator:
@@ -24,28 +21,6 @@ class BaseOperator:
         Infer output value shape
         """
         raise NotImplementedError
-
-    # def set_input(self, input_index: int, val: Any):
-    #     # remove the consumer
-    #     old_val = self.inputs(input_index)
-    #     if isinstance(old_val, IRSubTensor):
-    #         old_val.parent.rm_consumer(self)
-    #     # add the consumer
-    #     val = super().set_input(input_index, val)
-    #     if isinstance(val, IRSubTensor):
-    #         val.parent.add_consumer(self, val)
-    #     return val
-
-    # def set_output(self, output_index: int, val: Any):
-    #     # remove the producer
-    #     old_val = self.outputs(output_index)
-    #     if isinstance(old_val, IRSubTensor):
-    #         old_val.parent.rm_producer(self)
-    #     # add the producer
-    #     val = super().set_output(output_index, val)
-    #     if isinstance(val, IRSubTensor):
-    #         val.parent.add_producer(self, val)
-    #     return val
 
     def replicate(self):
         """

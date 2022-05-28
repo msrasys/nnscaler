@@ -5,7 +5,7 @@ The primitive used for IRAdapter
 from typing import List, Optional, Union
 import copy
 
-from cube.graph.tensor import IRSubTensor, IndexMap, ValueMap
+from cube.ir.tensor import IRSubTensor, IndexMap, ValueMap
 
 
 # the general adapter primitive class

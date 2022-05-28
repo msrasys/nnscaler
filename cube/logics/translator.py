@@ -1,13 +1,13 @@
-from cube.graph.operator.operator import IRFwOperation
+from cube.ir.operator import IRFwOperation, IRDataOperation
 from cube.ir.cten import IRCell
+from cube.ir.tensor import IRFullTensor, IRSubTensor
+
+from cube.graph.graph import IRGraph
 
 from cube.logics.dataloader import IRDataLoader
 from cube.logics import model
 from cube.logics.pool import SchedulePool
 
-from cube.graph.graph import IRGraph
-from cube.graph.tensor import IRFullTensor, IRSubTensor
-from cube.graph.operator import IRDataOperation
 
 
 class LogicTranslator:

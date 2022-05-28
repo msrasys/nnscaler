@@ -4,7 +4,7 @@ import time
 from itertools import combinations
 
 from cube.graph import IRGraph
-from cube.graph.operator.operator import IRDataOperation, IRFwOperation
+from cube.ir.operator import IRDataOperation, IRFwOperation
 import cube.search.iterator as iterator
 from cube.profiler.estimator import Estimator
 

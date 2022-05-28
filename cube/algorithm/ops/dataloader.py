@@ -3,7 +3,7 @@ import copy
 
 from cube.algorithm.utils import split_axis
 from cube.algorithm.generics import GenericDistAlgo
-from cube.graph.operator.operator import IRDataOperation
+from cube.ir.operator import IRDataOperation
 
 
 class DPDataLoader(GenericDistAlgo):

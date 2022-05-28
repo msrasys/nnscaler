@@ -1,7 +1,7 @@
 import math
 import random
 
-from cube.graph.operator.operator import IRDataOperation, IRFwOperation
+from cube.ir.operator import IRDataOperation, IRFwOperation
 
 
 def PAS(graph, resource):

@@ -4,17 +4,17 @@ import copy
 import numpy
 
 from cube.ir.cten import IRTensor
-from cube.graph.operator.function.einops import EinDim, IREinops
-from cube.graph.operator.function.conv import IRConv2D
-from cube.graph.operator.function.conv import IRConv3D
-from cube.graph.operator.function.pad import IRPad
-from cube.graph.operator.function.scripteinops import IRScriptEinOps
-from cube.graph.operator.function.customops import IRCustomOps
-from cube.graph.operator.function.cat import IRCat, IRStack
-from cube.graph.operator.function.creators import IRToTensor, IRZeros
-from cube.graph.operator.function.select import IRSelect, IRSlice
-from cube.graph.operator.function.scatter import IRSelectScatter
-from cube.graph.operator.function.repeat import IRRepeat
+from cube.graph.function.einops import EinDim, IREinops
+from cube.graph.function.conv import IRConv2D
+from cube.graph.function.conv import IRConv3D
+from cube.graph.function.pad import IRPad
+from cube.graph.function.scripteinops import IRScriptEinOps
+from cube.graph.function.customops import IRCustomOps
+from cube.graph.function.cat import IRCat, IRStack
+from cube.graph.function.creators import IRToTensor, IRZeros
+from cube.graph.function.select import IRSelect, IRSlice
+from cube.graph.function.scatter import IRSelectScatter
+from cube.graph.function.repeat import IRRepeat
 
 
 def _create_eshape(shape: List[int], iterator: Optional[Iterable] = None,

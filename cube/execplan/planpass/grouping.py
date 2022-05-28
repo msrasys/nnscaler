@@ -5,8 +5,8 @@ from typing import List, Dict, Tuple
 
 from cube.execplan import ExectuionPlan
 from cube.execplan.planpass.planpass import PlanPass
-from cube.graph.adapter.adapter import IRAdapter
-from cube.graph.operator.operator import IRBpOperation, IRFwOperation
+from cube.ir.adapter import IRAdapter
+from cube.ir.operator import IRBpOperation, IRFwOperation
 from cube.ir.cten import IRCell
 
 

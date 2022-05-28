@@ -1,7 +1,7 @@
 
-from cube.graph.operator.operator import IRBpOperation, IRFwOperation
-from cube.graph.tensor import IRSubTensor, ValueMap
-from cube.graph.adapter.adapter import IRAdapter
+from cube.ir.operator import IRBpOperation, IRFwOperation
+from cube.ir.tensor import IRSubTensor, ValueMap
+from cube.ir.adapter import IRAdapter
 from cube.graph import IRGraph
 from cube.ir.cten import IRCell, IRTensor
 

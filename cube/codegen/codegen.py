@@ -9,9 +9,9 @@ from cube.graph.parser.mapping import Sign2Op
 from cube.ir.cten import IRCell, IRTensor
 from cube.ir.dtype import IRDType
 
-from cube.graph.tensor import IRSubTensor
-from cube.graph.operator.operator import IRBpOperation, IRDataOperation, IRFwOperation
-from cube.graph.adapter.adapter import IRWeightReducer, IRAdapter
+from cube.ir.tensor import IRSubTensor
+from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
+from cube.ir.adapter import IRWeightReducer, IRAdapter
 from cube.graph.graph import IRGraph, IRSegment
 
 from cube.execplan import ExectuionPlan

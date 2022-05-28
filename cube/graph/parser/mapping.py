@@ -8,8 +8,8 @@ import torch
 import operator
 from functools import partial
 
-import cube.graph.operator.function as function
-from cube.graph.operator.operator import IRFwOperation
+import cube.graph.function as function
+from cube.ir.operator import IRFwOperation
 import cube.ir as ir
 
 

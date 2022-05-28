@@ -1,5 +1,5 @@
 from cube.graph import IRGraph
-from cube.graph.operator.operator import IRFwOperation, IRDataOperation
+from cube.ir.operator import IRFwOperation, IRDataOperation
 
 
 def PAS(graph: IRGraph, resource):

@@ -2,14 +2,14 @@ from typing import Dict, List, Tuple
 import copy
 import numpy as np
 
-from cube.graph.tensor import IRFullTensor, IRSubTensor
-from cube.graph.tensor import IndexMap, ValueMap
+from cube.ir.tensor import IRFullTensor, IRSubTensor
+from cube.ir.tensor import IndexMap, ValueMap
 
-from cube.graph.adapter.prim import AllGatherPrim      # d2r
-from cube.graph.adapter.prim import AllToAllPrim       # d2d
-from cube.graph.adapter.prim import AllReducePrim      # v2r
-from cube.graph.adapter.prim import ReduceScatterPrim  # v2d
-from cube.graph.adapter.prim import ChunkPrim          # r2d
+from cube.ir.adapter.prim import AllGatherPrim      # d2r
+from cube.ir.adapter.prim import AllToAllPrim       # d2d
+from cube.ir.adapter.prim import AllReducePrim      # v2r
+from cube.ir.adapter.prim import ReduceScatterPrim  # v2d
+from cube.ir.adapter.prim import ChunkPrim          # r2d
 
 
 class GridLayout:

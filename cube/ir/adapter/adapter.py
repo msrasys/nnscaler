@@ -1,8 +1,8 @@
 from typing import List, Optional
 import copy
 
-from cube.graph.adapter.prim import IRAdapterPrim, IdentityPrim
-from cube.graph.tensor import IRSubTensor
+from cube.ir.adapter.prim import IRAdapterPrim, IdentityPrim
+from cube.ir.tensor import IRSubTensor
 from cube.ir.cten import IRCell
 
 

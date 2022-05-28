@@ -1,8 +1,7 @@
 from cube.graph import IRGraph
-from cube.graph.adapter.adapter import IRAdapter
-from cube.graph.operator.operator import IRBpOperation, IRDataOperation, IRFwOperation
-from cube.graph.operator.function.conv import IRConv3D
-from cube.graph.operator.function.pad import IRPad
+from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
+from cube.graph.function.conv import IRConv3D
+from cube.graph.function.pad import IRPad
 
 def PAS(graph: IRGraph, resource):
     print(graph.extra_repr())

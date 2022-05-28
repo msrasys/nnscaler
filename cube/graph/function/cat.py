@@ -2,7 +2,7 @@ from copy import copy
 import itertools
 from typing import List
 
-from cube.graph.operator.operator import IRFwOperation
+from cube.ir.operator import IRFwOperation
 from cube.ir.cten import IRTensor
 
 class IRCat(IRFwOperation):

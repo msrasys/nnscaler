@@ -1,7 +1,7 @@
 from typing import Optional, List
 
 from cube.ir.cten import IRTensor
-from cube.graph.tensor import IRFullTensor
+from cube.ir.tensor import IRFullTensor
 from cube.graph.parser import ScriptModuleParser
 from cube.graph import IRGraph
 from cube.logics.dataloader import IRDataLoader

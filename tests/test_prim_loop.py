@@ -7,7 +7,7 @@ import cube
 
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.parser import ScriptModuleParser
-from cube.graph.tensor import IRFullTensor
+from cube.ir.tensor import IRFullTensor
 from cube import ir
 
 # Stub objects:

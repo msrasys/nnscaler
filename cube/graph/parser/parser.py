@@ -3,8 +3,8 @@ import enum
 import re
 from typing import Any, List, Tuple, Optional
 
-from cube.graph import IRFwOperation
-from cube.graph.tensor import IRFullTensor
+from cube.ir.operator import IRFwOperation
+from cube.ir.tensor import IRFullTensor
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.mapping import Sign2Op, DType2IRDType
 

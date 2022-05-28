@@ -11,9 +11,9 @@ from typing import Union, Tuple, List, Optional, Dict
 import copy
 
 from cube.ir.cten import IRTensor, IRCell
-from cube.graph.operator.operator import IRBpOperation, IRFwOperation, IRDataOperation
-from cube.graph.adapter.adapter import IRAdapter
-from cube.graph.tensor import IRFullTensor, IRSubTensor
+from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
+from cube.ir.adapter import IRAdapter
+from cube.ir.tensor import IRFullTensor, IRSubTensor
 
 from cube.algorithm.generics import GenericDistAlgo
 

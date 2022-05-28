@@ -24,7 +24,7 @@ import copy
 import math
 
 from cube.ir.cten import IRCell, IRTensor
-import cube.ir as ir
+import cube.ir.dtype as irdtype 
 
 
 class IndexMap:
@@ -366,7 +366,7 @@ class IRFullTensor(IRTensor):
     the sequentail execution order by its graph.
     """
 
-    def __init__(self, shape=None, name=None, requires_grad=True, dtype=ir.float32):
+    def __init__(self, shape=None, name=None, requires_grad=True, dtype=irdtype.float32):
 
         super().__init__(shape, name, dtype)
 

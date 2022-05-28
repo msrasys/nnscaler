@@ -2,12 +2,12 @@ from typing import Callable, Dict, List, Optional
 import copy
 import numpy as np
 
-from cube.graph.adapter.adapter import IRAdapter
-from cube.graph.operator.operator import IRBpOperation, IRFwOperation
+from cube.ir.adapter import IRAdapter
+from cube.ir.operator import IRBpOperation, IRFwOperation
 
 from cube.ir.cten import IRCell
 from cube.graph.graph import IRGraph
-from cube.graph.tensor import IRFullTensor, IRSubTensor
+from cube.ir.tensor import IRFullTensor, IRSubTensor
 
 
 class ExectuionPlan:

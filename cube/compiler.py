@@ -6,9 +6,9 @@ import os
 import cube
 
 from cube.graph import parser
-from cube.graph.adapter.gen import IRAdapterGener
+from cube.graph.gener.gen import IRAdapterGener
 from cube.graph.graph import IRGraph
-from cube.graph.operator.operator import IRDataOperation
+from cube.ir.operator import IRDataOperation
 
 from cube.logics.pool import SchedulePool
 from cube.logics.translator import LogicTranslator

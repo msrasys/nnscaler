@@ -2,8 +2,8 @@
 Micro-batch sampler for scheduling search
 """
 from typing import Callable, Dict, List, Tuple
-from cube.graph.graph import IRGraph, IRFwOperation
-from cube.graph.operator.operator import IRBpOperation
+from cube.graph.graph import IRGraph
+from cube.ir.operator import IRFwOperation, IRBpOperation
 from cube.ir.cten import IRCell
 from cube.execplan import ExectuionPlan
 

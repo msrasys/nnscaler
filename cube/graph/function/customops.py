@@ -1,7 +1,6 @@
 from typing import List
 
-import cube.runtime.function
-from cube.graph.operator.operator import IRFwOperation
+from cube.ir.operator import IRFwOperation
 from cube.ir.cten import IRTensor
 
 class IRCustomOps(IRFwOperation):
