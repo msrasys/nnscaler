@@ -127,13 +127,16 @@ class IRAdapterGener:
         cdevs = set()
         for cnode in ftensor.consumers:
             cdevs.update(cnode.device)
+
         # sharing devices
         if pdevs == cdevs:
             return IRAdapterGener.gen_gridlayout(ftensor)
+
         # no-sharing devices
         # elif len(pdevs.intersection(cdevs)) == 0:
         #     print(f'detect no intersection')
         #     return []
+
         # general cases
         warnings.warn('The adapter is generated using inefficient P2P send/recv')
         fprims, bprims = [], []
@@ -141,14 +144,12 @@ class IRAdapterGener:
             fprims += IRAdapterGener.gen_subtensor(subtensor)
         fadapter = IRAdapter(ftensor.ptensors, ftensor.ctensors)
         fadapter.prims = fprims
-        # print(fadapter.extra_repr())
         grad: IRFullTensor = ftensor.grad
         if grad is not None:
             for subtensor in grad.ctensors:
                 bprims += IRAdapterGener.gen_subtensor(subtensor)
             badapter = IRAdapter(grad.ptensors, grad.ctensors)
             badapter.prims = bprims
-            # print(badapter.extra_repr())
             IRCell.make_pair(fadapter, badapter)
         if len(fprims) == 0 and len(bprims) == 0:
             return []
@@ -227,7 +228,6 @@ class IRAdapterGener:
             IRCell.make_pair(fadapter, badapter)
         if len(fprims) == 0 and len(bprims) == 0:
             return []
-        # print('=====')
         return [fadapter]
 
     @staticmethod
@@ -268,7 +268,7 @@ class IRAdapterGener:
                     continue
                 common = itensor.common(subtensor)
                 common.attach_cell(itensor._cell)
-                print(f'get common: {common.extra_repr()}')
+                # print(f'get common: {common.extra_repr()}')
                 intersections.append(common)
                 if common == itensor:
                     continue
@@ -284,7 +284,7 @@ class IRAdapterGener:
                 # TODO: check union == subtensor
                 if common == subtensor:
                     break
-        print(intersections)
+        # print(intersections)
         # ====== move ===== #
         tmoved = []
         for tensor in intersections:
@@ -359,4 +359,3 @@ class IRAdapterGener:
                     f"SubTensor:\n\t{subtensor.extra_repr()}"
                 )
         return prims
-                    

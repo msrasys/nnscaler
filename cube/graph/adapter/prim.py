@@ -2,19 +2,22 @@
 The primitive used for IRAdapter
 """
 
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 import copy
 
 from cube.graph.tensor import IRSubTensor, IndexMap, ValueMap
 
+
 # the general adapter primitive class
 class IRAdapterPrim:
 
-    def __init__(self, inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
+    def __init__(self, inputs: List[IRSubTensor], outputs: List[IRSubTensor], **kwargs):
         self._inputs = list(inputs)
         self._outputs = list(outputs)
         self._device = []
         self.kwargs = dict()
+        for arg, val in kwargs.items():
+            self.kwargs[arg] = val
         self.signature = None
 
     def inputs(self, idx: Optional[int] = None):
@@ -51,8 +54,8 @@ class SpatialPrim(IRAdapterPrim):
     """
     basic class for representing spatial primitives
     """
-    def __init__(self, inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
-        super().__init__(inputs, outputs)
+    def __init__(self, inputs: List[IRSubTensor], outputs: List[IRSubTensor], **kwargs):
+        super().__init__(inputs, outputs, **kwargs)
         self.device = list(set(t.device[0] for t in inputs))
 
 
@@ -71,10 +74,8 @@ class CommPrim(IRAdapterPrim):
     """
     communication primitive
     """
-    def __init__(self,
-                 itensors: List[IRSubTensor],
-                 otensors: List[IRSubTensor]):
-        super().__init__(itensors, otensors)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
+        super().__init__(itensors, otensors, **kwargs)
         devices = []
         for t in list(itensors) + list(otensors):
             devices += t.device
@@ -109,32 +110,12 @@ class SelectPrim(SpatialPrim):
                  itensor: IRSubTensor,
                  indmap: IndexMap, valmap: ValueMap,
                  otensor: IRSubTensor):
-        super().__init__([itensor], [otensor])
-        self.kwargs['indmap'] = indmap
-        self.kwargs['valmap'] = (valmap.idx, valmap.chunk_num)
+        super().__init__([itensor], [otensor], indmap=indmap, valmap=(valmap.idx, valmap.chunk_num))
         self.signature = f"cube.runtime.adapter.select"
 
     def __repr__(self):
         dscp = f"{self.outputs(0)} = select({self.inputs(0)}, indmap={self.kwargs['indmap']}, valmap={self.kwargs['valmap']})"
         return dscp
-
-
-class ChunkPrim(SpatialPrim):
-    """
-    split dimension in n chunks and take idx-th chunk
-    """
-    def __init__(self, itensor: IRSubTensor, otensor: IRSubTensor,
-                 dim: int, ranks: Tuple[int]):
-        assert itensor.device[0] in ranks, "idx out of scope"
-        super().__init__([itensor], [otensor])
-        self.kwargs['dim'] = dim
-        self.kwargs['ranks'] = ranks
-        self.signature = 'cube.runtime.adapter.chunk'
-
-    def __repr__(self) -> str:
-        chunks = len(self.kwargs['ranks'])
-        idx = self.kwargs['ranks'].index(self.device[0])
-        return f"dev{self.device}: {self.outputs(0)} = split(dim={self.kwargs['dim']}, chunks={chunks}, idx={idx})"
 
 
 class MergeDimPrim(SpatialPrim):
@@ -143,8 +124,7 @@ class MergeDimPrim(SpatialPrim):
     """
     def __init__(self, itensors: List[IRSubTensor], otensor: IRSubTensor, dim: int) -> None:
         assert all(itensor.device == itensors[0].device for itensor in itensors), "device not same"
-        super().__init__(itensors, [otensor])
-        self.kwargs['dim'] = dim
+        super().__init__(itensors, [otensor], dim=dim)
         self.signature = 'cube.runtime.adapter.smerge'
 
     def __repr__(self) -> str:
@@ -169,9 +149,7 @@ class SendPrim(CommPrim):
     P2P send prim
     """
     def __init__(self, tensor, dst: int):
-        super().__init__([tensor], [tensor])
-        self.kwargs['dst'] = dst
-        self.device = tensor.device
+        super().__init__([tensor], [tensor], dst=dst)
         self.signature = 'cube.runtime.adapter.send'
 
     def __repr__(self) -> str:
@@ -183,11 +161,8 @@ class RecvPrim(CommPrim):
     P2P recv prim
     """
     def __init__(self, tensor: IRSubTensor, src: int):
-        super().__init__([], [tensor])
-        self.kwargs['shape'] = tensor.shape
-        self.kwargs['dtype'] = 'torch.' + tensor.dtype.value
-        self.kwargs['src'] = src
-        self.device = tensor.device
+        super().__init__([], [tensor],
+                         shape=tensor.shape, dtype='torch.'+tensor.dtype.value, src=src)
         self.signature = 'cube.runtime.adapter.recv'
 
     def __repr__(self) -> str:
@@ -199,10 +174,8 @@ class MovePrim(CommPrim):
     P2P send/recv, non-differentiable
     """
     def __init__(self, itensor: IRSubTensor, otensor: IRSubTensor):
-        super().__init__([itensor], [otensor])
-        self.kwargs['src'] = itensor.device[0]
-        self.kwargs['dst'] = otensor.device[0]
-        self.device = itensor.device + otensor.device
+        assert itensor.device != otensor.device, "no movement detected."
+        super().__init__([itensor], [otensor], src=itensor.device[0], dst=otensor.device[0])
 
     def dispatch(self, devid: int) -> Union[SendPrim, RecvPrim]:
         if devid == self.kwargs['src']:
@@ -221,10 +194,9 @@ class CollectivePrim(CommPrim):
     Collective primitive, non-differentiable
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
-        super().__init__(itensors, otensors)
-        self.kwargs['ranks'] = self.device
-        for arg, val in kwargs.items():
-            self.kwargs[arg] = val
+        super().__init__(itensors, otensors, **kwargs)
+        if 'ranks' not in self.kwargs:
+            self.kwargs['ranks'] = self.device
 
     def dispatch(self, devid: int) -> Optional[CommPrim]:
         """
@@ -235,7 +207,7 @@ class CollectivePrim(CommPrim):
         assert devid in self.device, f"device {devid} not applied for this comm primitive"
         itensors = [itensor for itensor in self.inputs() if devid in itensor.device]
         otensors = [otensor for otensor in self.outputs() if devid in otensor.device]
-        prim = CollectivePrim(itensors, otensors, **self.kwargs)
+        prim = type(self)(itensors, otensors, **self.kwargs)
         prim.signature = self.signature
         return prim
 
@@ -244,8 +216,8 @@ class AllReducePrim(CollectivePrim):
     """
     non-differentiable allreduce
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor]):
-        super().__init__(itensors, otensors)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
+        super().__init__(itensors, otensors, **kwargs)
         self.signature = 'cube.runtime.adapter.all_reduce'
 
     def __repr__(self) -> str:
@@ -256,8 +228,8 @@ class AllGatherPrim(CollectivePrim):
     """
     non-differentiabl all-to-all
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int):
-        super().__init__(itensors, otensors, dim=dim)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        super().__init__(itensors, otensors, dim=dim, **kwargs)
         self.signature = 'cube.runtime.adapter.all_gather'
 
     def __repr__(self) -> str:
@@ -268,8 +240,8 @@ class ReduceScatterPrim(CollectivePrim):
     """
     non-differential reduce-scatter
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int):
-        super().__init__(itensors, otensors, dim=dim)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        super().__init__(itensors, otensors, dim=dim, **kwargs)
         self.signature = 'cube.runtime.adapter.reduce_scatter'
 
     def __repr__(self) -> str:
@@ -280,104 +252,149 @@ class BroadcastPrim(CollectivePrim):
     """
     non-differential reduce-scatter
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], src: int):
-        super().__init__(itensors, otensors, src=src)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], src: int, **kwargs):
+        super().__init__(itensors, otensors, src=src, **kwargs)
 
 
 class ReducePrim(CollectivePrim):
     """
     non-differential reduce prim
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dst: int):
-        super().__init__(itensors, otensors, dst=dst)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dst: int, **kwargs):
+        super().__init__(itensors, otensors, dst=dst, **kwargs)
 
 
 class AllToAllPrim(CollectivePrim):
     """
     non-differentiable all-to-all
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], idim: int, odim: int):
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], idim: int, odim: int, **kwargs):
         """
         itensors: each rank hosts one tensor splitted by idim
         otensors: each rank hosts one tensor splitted by odim
         idim != odim
         """
-        super().__init__(itensors, otensors, idim=idim, odim=odim)
+        super().__init__(itensors, otensors, idim=idim, odim=odim, **kwargs)
         self.signature = 'cube.runtime.adapter.all_to_all'
 
     def __repr__(self) -> str:
-        return f"dev{self.device}: {self.outputs()} = all_to_all({self.inputs}, idim={self.kwargs['idm']}, odim={self.kwargs['odim']})"
+        return f"dev{self.device}: {self.outputs()} = all_to_all({self.inputs()}, idim={self.kwargs['idm']}, odim={self.kwargs['odim']})"
 
 
-class DiffCollectivePrim(CollectivePrim):
+class ChunkPrim(CollectivePrim):
     """
-    Differentiable collective primitive
+    split dimension in n chunks and take idx-th chunk
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
-        """
-        differentiable collectives 
-        """
-        super().__init__(itensors, otensors, **kwargs)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        super().__init__(itensors, otensors, dim=dim, **kwargs)
+        self.signature = 'cube.runtime.adapter.chunk'
+
+    def __repr__(self) -> str:
+        return f"dev{self.device}: {self.outputs()} = split({self.inputs()}, dim={self.kwargs['dim']})"
 
 
-class AllReduceIdentityPrim(DiffCollectivePrim):
+class AllReduceIdentityPrim(AllReducePrim):
     """
     forward: allreduce.
     backward: identity
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor]):
-        super().__init__(itensors, otensors)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
+        super().__init__(itensors, otensors, **kwargs)
+        self.signature = 'cube.runtime.adapter.nn.allreduce_identity'
+
+    def __repr__(self) -> str:
+        return f"dev{self.device}: {self.outputs()} = nn.allreduce_identity({self.inputs()})"
 
 
-class IdentityAllreducePrim(DiffCollectivePrim):
+class IdentityAllreducePrim(AllReducePrim):
     """
     forward: identity
     backward: allreduce
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor]):
-        super().__init__(itensors, otensors)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
+        super().__init__(itensors, otensors, **kwargs)
+        self.signature = 'cube.runtime.adapter.nn.identity_allreduce'
+
+    def __repr__(self) -> str:
+        return f"dev{self.device}: {self.outputs()} = nn.identity_allreduce({self.inputs()})"
 
 
-class ReduceScatterAllGatherPrim(DiffCollectivePrim):
+class AllReduceAllReducePrim(AllReducePrim):
+    """
+    forward: allreduce
+    backward: allreduce
+    """
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
+        super().__init__(itensors, otensors, **kwargs)
+        self.signature = 'cube.runtime.adapter.nn.allreduce_allreduce'
+
+    def __repr__(self) -> str:
+        return f"dev{self.device}: {self.outputs} = nn.allreduce_allreduce({self.inputs()}"
+
+
+class ReduceScatterAllGatherPrim(ReduceScatterPrim):
     """
     forward: reduce-scatter
     backward: all-gather
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int):
-        super().__init__(itensors, otensors, dim=dim)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        super().__init__(itensors, otensors, dim, **kwargs)
+        self.signature = 'cube.runtime.adapter.nn.reducescatter_allgather'
 
 
-class AllGatherSplitPrim(DiffCollectivePrim):
+class AllGatherReduceScatterPrim(AllGatherPrim):
+    """
+    forward: all-gather
+    backward: reduce-scatter
+    """
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        super().__init__(itensors, otensors, dim, **kwargs)
+        self.signature = 'cube.runtime.adapter.nn.allgather_reducescatter'
+
+
+class AllGatherSplitPrim(AllGatherPrim):
     """
     forward: all-gather
     backward: split
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int):
-        super().__init__(itensors, otensors, dim=dim)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        super().__init__(itensors, otensors, dim, **kwargs)
+        self.signature = 'cube.runtime.adapter.nn.allgather_split'
 
 
-class SplitAllGatherPrim(DiffCollectivePrim):
+class SplitAllGatherPrim(AllGatherPrim):
     """
     forward: split
     backward: all-gather
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int):
-        super().__init__(itensors, otensors, dim=dim)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        super().__init__(itensors, otensors, dim, **kwargs)
+        self.signature = 'cube.runtime.adapter.nn.allgather_split'
 
 
-class ReduceBroadcastPrim(DiffCollectivePrim):
+class AllToAllAllToAllPrim(AllToAllPrim):
+    """
+    forward: all-to-all
+    backward: all-to-all
+    """
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], idim: int, odim: int, **kwargs):
+        super().__init__(itensors, otensors, idim, odim, **kwargs)
+        self.signature = 'cube.runtime.adapter.nn.alltoall_alltoall'
+
+
+class ReduceBroadcastPrim(CollectivePrim):
     """
     forward: broadcast
     backward: reduce
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dst: int):
-        super().__init__(itensors, otensors, dst=dst)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dst: int, **kwargs):
+        super().__init__(itensors, otensors, dst=dst, **kwargs)
 
 
-class BroadcastRedducePrim(DiffCollectivePrim):
+class BroadcastRedducePrim(CollectivePrim):
     """
     forward: broadcast
     backward: reduce
     """
-    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], src: int):
-        super().__init__(itensors, otensors, src=src)
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], src: int, **kwargs):
+        super().__init__(itensors, otensors, src=src, **kwargs)

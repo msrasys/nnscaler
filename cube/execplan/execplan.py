@@ -1,4 +1,4 @@
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 import copy
 import numpy as np
 
@@ -13,18 +13,38 @@ from cube.graph.tensor import IRFullTensor, IRSubTensor
 class ExectuionPlan:
 
     def __init__(self, graph: IRGraph):
-        if not isinstance(graph, IRGraph):
-            raise TypeError("Expected a list of ScheduleUnit")
-        self.graph = graph
-        self.device_seq = dict()
+        assert isinstance(graph, IRGraph), "Expected an IRGraph"
+        self._graph = graph
+        self._seq: Dict[int, List[IRCell]] = dict()
+
+        # execution sequence for each device  
         for node in graph.nodes():
             if len(node.device) == 0:
                 raise RuntimeError(f"Node device not set: {node}")
             for device in node.device:
-                if device not in self.device_seq:
-                    self.device_seq[device] = [node]
-                else:
-                    self.device_seq[device].append(node)
+                if device not in self._seq:
+                    self._seq[device] = []
+                self._seq[device].append(node)
+
+        # adapter dispatch
+        for devid in self.devices():
+            adapters = [node for node in self.at(devid) if isinstance(node, IRAdapter)]
+            while len(adapters) > 0:
+                fadapter = adapters[0]
+                badapter: Optional[IRAdapter] = fadapter.mirror
+                fnode = fadapter.dispatch(devid)
+                fidx = self.at(devid).index(fadapter)
+                self.at(devid)[fidx] = fnode
+                if badapter:
+                    bnode = badapter.dispatch(devid)
+                    IRCell.make_pair(fnode, bnode)
+                    bidx = self.at(devid).index(badapter)
+                    self.at(devid)[bidx] = bnode
+                # remove un-dispatched adapter
+                adapters.pop(0)
+                if badapter:
+                    adapters.remove(badapter)
+
         # check whether graph output is replicated across device
         # FIXME: should use adapter to generate communication for
         # traning logic output
@@ -39,41 +59,43 @@ class ExectuionPlan:
             if len(devices) != 0:
                 raise NotImplementedError("Require return values of training logic is replicated across nodes.")
 
+    @property
+    def graph(self) -> IRGraph:
+        return self._graph
+
     def devices(self) -> List[int]:
         """
         Get device set
         """
-        devices = list(self.device_seq.keys())
+        devices = list(self._seq.keys())
         devices.sort()
         return devices
 
-    def sequence(self, device_id: int) -> List[IRCell]:
+    def seq(self, devid: int) -> List[IRCell]:
         """
-        Get a copy of execution sequence for device id
+        Get a view of execution sequence for device id
 
         Note changing the list content will not change the execution plan.
         """
-        if device_id not in self.device_seq:
-            return list()
-        return copy.copy(self.device_seq[device_id])
+        assert devid in self._seq, f"device id {devid} not exists"
+        return copy.copy(self._seq[devid])
 
-    def at(self, device_id: int) -> List[IRCell]:
+    def at(self, devid: int) -> List[IRCell]:
         """
         Access the sequence for device id
 
         Note changing the list content will change the execution plan.
         """
-        if device_id not in self.device_seq:
-            return list()
-        return self.device_seq[device_id]
+        assert devid in self._seq, f"device id {devid} not exists"
+        return self._seq[devid]
 
-    def set(self, device_id: int, seq: List[IRCell]):
+    def set(self, devid: int, seq: List[IRCell]):
         """
         Set device sequence
         """
         if not all([isinstance(su, IRCell) for su in seq]):
             raise TypeError("Expected a list of Cell")
-        self.device_seq[device_id] = seq
+        self._seq[devid] = seq
 
     def analyze(self,
                 map2time: Optional[Callable] = None,
@@ -253,6 +275,6 @@ class ExectuionPlan:
         dscp = f'Execution Plan ({self.graph.name}):\n'
         for devid in self.devices():
             dscp += f'====> Device {devid}:\n'
-            for node in self.sequence(devid):
-                dscp += f'{node.module_repr()}\n'
+            for node in self._seq(devid):
+                dscp += f'{node}\n'
         return dscp

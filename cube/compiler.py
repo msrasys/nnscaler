@@ -14,6 +14,7 @@ from cube.logics.pool import SchedulePool
 from cube.logics.translator import LogicTranslator
 
 from cube.execplan import ExectuionPlan
+from cube.execplan.planpass.fusion import DiffFusion
 from cube.execplan.planpass.grouping import Grouping
 
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
@@ -172,14 +173,14 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
             # plan pass for communication optimization
             start = time.time()
+            execplan = DiffFusion.apply(execplan)
+            span = time.time() - start
+            print('> planpass on diff-fusion operations: {:.2f} s'.format(span))
+
+            start = time.time()
             execplan = Grouping.apply(execplan)
             span = time.time() - start
             print('> planpass on grouping operations: {:.2f} s'.format(span))
-
-            # start = time.time()
-            # execplan = P2PFusion.apply(execplan)
-            # span = time.time() - start
-            # print('> planpass on p2pfusion operations: {:.2f} s'.format(span))
 
             # start = time.time()
             # execplan = GroupingAdapter.apply(execplan)

@@ -155,9 +155,10 @@ class GridLayout:
             otensor._cell = itensor._cell
         prims = []
         for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
-            ranks = tuple(t.device[0] for t in itensors)
-            for idx, (itensor, otensor) in enumerate(zip(itensors, otensors)):
-                prims.append(ChunkPrim(itensor, otensor, dim, ranks))
+            prims.append(ChunkPrim(itensors, otensors, dim))
+            # ranks = tuple(t.device[0] for t in itensors)
+            # for idx, (itensor, otensor) in enumerate(zip(itensors, otensors)):
+            #     prims.append(ChunkPrim(itensor, otensor, dim, ranks))
         return glayout, prims
 
     # ================ solution ============= #

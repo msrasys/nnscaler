@@ -22,22 +22,15 @@ class Grouping(PlanPass):
         fgroups, bgroups = Grouping.group(execplan)
         for devid in execplan.devices():
             for fpieces, bpieces in zip(fgroups[devid], bgroups[devid]):
-                fsubgraph = graph.subgraph(fpieces)
-                fsubgraph.device = devid
+                fsubgraph = graph.segment(fpieces)
                 if bpieces is not None:
-                    bsubgraph = graph.subgraph(bpieces)
-                    bsubgraph.device = devid
+                    bsubgraph = graph.segment(bpieces)
                     IRCell.make_pair(fsubgraph, bsubgraph)
                 subgraphs = [fsubgraph] if bpieces is None else [fsubgraph, bsubgraph]
                 for subgraph in subgraphs:
-                    pieces = subgraph.nodes()
-                    # update graph: replace the nodes with the subgraph
-                    idx = graph.nodes().index(pieces[0])
-                    graph._nodes.insert(idx, subgraph)
-                    for node in pieces:
-                        graph._nodes.remove(node)
                     # update execution plan: replace the nodes with the subgraph
-                    idx = execplan.sequence(devid).index(pieces[0])
+                    pieces = subgraph.nodes()
+                    idx = execplan.seq(devid).index(pieces[0])
                     execplan.at(devid).insert(idx, subgraph)
                     for node in pieces:
                         execplan.at(devid).remove(node)
@@ -55,13 +48,21 @@ class Grouping(PlanPass):
         Returns:
             Tuple: (fgroups, bgroups)
         """
+        def is_forward_adapter(adapter: IRAdapter) -> bool:
+            return all(not t.is_grad() for t in adapter.inputs())
+
         fgroups, bgroups = dict(), dict()
         for devid in execplan.devices():
             fgroups[devid], bgroups[devid] = list(), list()
             fpieces, bpieces = list(), list()
-            seq = execplan.sequence(devid)
-            fnodes = [fnode for fnode in seq if isinstance(fnode, IRFwOperation)]
-            have_backward = all([fnode.mirror in seq for fnode in fnodes])
+            seq = execplan.seq(devid)
+            fnodes = []
+            for fnode in seq:
+                if isinstance(fnode, IRFwOperation):
+                    fnodes.append(fnode)
+                if isinstance(fnode, IRAdapter) and fnode.differentiable and is_forward_adapter(fnode):
+                    fnodes.append(fnode)
+            have_backward = all(fnode.mirror in seq for fnode in fnodes)
             # training
             if have_backward:
                 bnodes = [fnode.mirror for fnode in fnodes]
@@ -112,57 +113,3 @@ class Grouping(PlanPass):
         if idx != max(pidx) + 1 and idx != min(pidx) - 1:
             return False
         return True
-
-
-class GroupingAdapter(PlanPass):
-
-    @staticmethod
-    def apply(execplan: ExectuionPlan) -> ExectuionPlan:
-        for devid in execplan.devices():
-            groups: List[List[IRAdapter]] = GroupingAdapter.consecutive(
-                execplan.sequence(devid))
-            for adapters in groups:
-                if len(adapters) <= 1:
-                    continue
-                sprims, tprims, mprims = list(), list(), list()
-                inputs, idevices = list(), list()
-                outputs, odevices = list(), list()
-                for adapter in adapters:
-                    sprims += adapter.prims(move=False, merge=False, coll=False)
-                    tprims += adapter.prims(select=False, merge=False)
-                    mprims += adapter.prims(select=False, move=False, coll=False)
-                    for idx, input in enumerate(adapter.inputs()):
-                        if devid in adapter.idevice(idx):
-                            if input not in inputs:
-                                inputs.append(input)
-                                idevices.append(adapter.idevice(idx))
-                    for idx, output in enumerate(adapter.outputs()):
-                        if devid in adapter.odevice(idx):
-                            if output not in outputs:
-                                outputs.append(output)
-                                odevices.append(adapter.odevice(idx))
-                prims = sprims + tprims + mprims
-                fused_adapter = IRAdapter(prims,
-                    inputs = inputs, idevices = idevices,
-                    outputs = outputs, odevices = odevices)
-                start = execplan.sequence(devid).index(adapters[0])
-                end = execplan.sequence(devid).index(adapters[-1])
-                for _ in range(end - start + 1):
-                    execplan.at(devid).pop(start)
-                execplan.at(devid).insert(start, fused_adapter)
-        return execplan
-
-    @staticmethod
-    def consecutive(seq: List[IRCell]) -> List[List[IRAdapter]]:
-        group = list()
-        curr = list()
-        curr_idx = -1
-        for idx, node in enumerate(seq + [None]):
-            if isinstance(node, IRAdapter) and idx == curr_idx + 1:
-                curr.append(node)
-            else:
-                if len(curr) != 0:
-                    group.append(curr)
-                curr = list()
-            curr_idx = idx
-        return group

@@ -18,7 +18,47 @@ from cube.graph.tensor import IRFullTensor, IRSubTensor
 from cube.algorithm.generics import GenericDistAlgo
 
 
-__all__ = ['IRGraph']
+class IRSegment(IRCell):
+    """
+    A segment refers to a piece of workload of IRGraph
+    """
+
+    def __init__(self, nodes: List[IRCell], inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
+        self._nodes = nodes
+        super().__init__('segment', '', len(inputs), len(outputs), init_outputs=False)
+        for idx, val in enumerate(inputs):
+            self.set_input(idx, val)
+        for idx, val in enumerate(outputs):
+            self.set_output(idx, val)
+        # setup device
+        device = set()
+        for node in nodes:
+            device.update(node.device)
+        self.device = list(device)
+        # setup whether forward
+        fnodes = any(isinstance(n, IRFwOperation) for n in nodes)
+        bnodes = any(isinstance(n, IRBpOperation) for n in nodes)
+        assert not (fnodes and bnodes), "An IRSegment cannot have both forward nodes and backward nodes"
+        self._forward = fnodes
+
+    @property
+    def forward(self) -> bool:
+        return self._forward
+
+    def nodes(self, idx: Optional[int] = None) -> Union[IRCell, List[IRCell]]:
+        if isinstance(idx, int):
+            return self._nodes[idx]
+        else:
+            return copy.copy(self._nodes)
+
+    def __repr__(self):
+        return f'Segment{self._id}(inputs={self.inputs()}, outputs={self.outputs()})'
+
+    def extra_repr(self) -> str:
+        dscp = repr(self)
+        for node in self.nodes():
+            dscp += '\n\t' + repr(node)
+        return dscp
 
 
 class IRGraph(IRCell):
@@ -154,44 +194,31 @@ class IRGraph(IRCell):
         """
         return self.forward(*args)
 
-    def subgraph(self, sub_nodes: List[IRCell]):
+    def segment(self, nodes: List[IRCell]) -> IRSegment:
         """
-        Create a subgraph with sub nodes.
+        Create a segment (sub-graph) with part of the nodes.
 
         Return:
-            IRGraph
+            IRSegment
         """
-        sub_inputs = list()
-        sub_outputs = list()
-        for node in sub_nodes:
-            sub_inputs += node.inputs()
-            sub_outputs += node.outputs()
-        remain_inputs = list()
-        remain_outputs = list()
-        for node in self.nodes():
-            if node in sub_nodes:
-                continue
-            remain_inputs += node.inputs()
-            remain_outputs += node.outputs()
-        inputs = list()
-        outputs = list()
-        for t in sub_inputs:
-            if isinstance(t, IRSubTensor) and t not in sub_outputs:
-                if t not in inputs:
-                    inputs.append(t)
-        for t in sub_outputs:
-            if isinstance(t, IRSubTensor):
-                # not consumed or used outside this subgraph
-                if t not in sub_inputs or t in remain_inputs or t in self.outputs():
-                    if t not in outputs:
-                        outputs.append(t)
-        subgraph = IRGraph(
-            nodes = sub_nodes,
-            inputs = inputs,
-            outputs = outputs,
-            module_name = 'segment'
-        )
-        return subgraph
+        inputs, outputs = [], []
+        for node in nodes:
+            # update inputs
+            itensors = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
+            for itensor in itensors:
+                producers = [p for p in itensor.parent.producers if p.device == node.device]
+                # no producer means a weight
+                if len(producers) == 0 or any(p not in nodes for p in producers):
+                    inputs.append(itensor)
+            # update outputs
+            otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
+            for otensor in otensors:
+                consumers = [c for c in otensor.parent.consumers if c.device == node.device]
+                # no consumer usually means the loss
+                if len(consumers) == 0 or any(c not in nodes for c in consumers):
+                    outputs.append(otensor)
+        segment = IRSegment(nodes, inputs, outputs)
+        return segment
 
     def detach(self, node: IRCell, reset_dependency=False) -> int:
         """
@@ -207,6 +234,8 @@ class IRGraph(IRCell):
             raise KeyError(f"node {node} is not in graph.")
         index = self._nodes.index(node)
         self._nodes.pop(index)
+        if isinstance(node, IRAdapter):
+            return index
         for itensor in node.inputs():
             if isinstance(itensor, IRSubTensor):
                 itensor.parent.rm_consumer(node)
@@ -222,11 +251,14 @@ class IRGraph(IRCell):
         Attach (insert) a node into current graph at node index.
 
         All the used input and output tensors inside the node are 
-        recorded in consumed and produced tensor list.
+        recorded in consumed and produced tensor list. Adapter node
+        will not record the consumer and producer.
         """
         if node in self.nodes():
             raise KeyError(f"node {node} is already in graph.")
         self._nodes.insert(index, node)
+        if isinstance(node, IRAdapter):
+            return
         # update consumer
         for itensor in node.inputs():
             if isinstance(itensor, IRSubTensor):
@@ -647,10 +679,3 @@ class IRGraph(IRCell):
         return repr(self)
 
 
-class IRSegment(IRCell):
-    """
-    A segment refers to a piece of workload of IRGraph
-    """
-
-    def __init__(self, nodes: List[IRCell], inputs: List[IRTensor], outputs: List[IRTensor]):
-        pass

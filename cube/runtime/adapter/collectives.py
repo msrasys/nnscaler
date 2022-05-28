@@ -160,6 +160,23 @@ def all_to_all(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -
     return otensor
 
 
+def chunk(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
+    """
+    split dimension in n chunks and take idx-th chunk
+
+    ranks (Tuple[int]): the order of split tensor.
+    """
+    group = DeviceGroup().get_group(ranks)
+    idx = torch.distributed.get_rank(group)
+    require_grad = itensor.requires_grad
+    with torch.no_grad():
+        otensor = itensor.chunk(len(ranks), dim)[idx]
+        otensor = otensor.detach()
+    if require_grad:
+        otensor = otensor.requires_grad_()
+    return otensor
+
+
 def broadcast(input_tensors: List[torch.Tensor],
               output_shapes: List[List[int]],
               output_dtypes: List[torch.dtype],
