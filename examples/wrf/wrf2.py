@@ -174,12 +174,15 @@ class WRF(torch.nn.Module):
 
         O2_ = torch.zeros(O2.shape, device=O2.device)
         mu2_ = torch.zeros(mu2.shape, device=mu2.device)
+
         for i in range(1, O2.shape[0] + 1):
-            O2_[-i] = i * self.delta_z * dpi2 + \
+            sub = i * self.delta_z * dpi2 + \
                 (self.dx(self.px(U2_)) + self.dy(self.py(V2_)) - R_mu)[-i:].view(
                     -1, self.ny, self.nx).sum(0) * self.delta_z
+            O2_ = O2_.select_scatter(sub, dim=0, index=-i)
+
         for i in range(mu2.shape[0]):
-            mu2_[i] = pi2
+            mu2_ = mu2_.select_scatter(pi2, dim=0, index=i)
 
         # self.O2_ = O2_
 
@@ -383,14 +386,18 @@ class WRF(torch.nn.Module):
         # forward sweep
         for i in range(1, d.shape[0]):
             w = l[i - 1] / d[i - 1]
-            d[i] = d[i] - w * u[i - 1]
-            b[i] = b[i] - w * b[i - 1]
+
+            d_i = d[i] - w * u[i - 1]
+            b_i = b[i] - w * b[i - 1]
+
+            d = d.select_scatter(d_i, dim=0, index=i)
+            b = b.select_scatter(b_i, dim=0, index=i)
 
         # backward substitution
         x = torch.zeros(b.shape, device=b.device)
-        x[-1] = b[-1] / d[-1]
+        x.select_scatter(b[-1] / d[-1], dim=0, index=-1)
         for i in range(x.shape[0] - 2, -1, -1):
-            x[i] = (b[i] - u[i] * x[i + 1]) / d[i]
+            x.select_scatter( (b[i] - u[i] * x[i + 1]) / d[i], dim=0, index=i)
 
         return x
 

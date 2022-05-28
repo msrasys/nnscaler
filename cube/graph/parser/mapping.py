@@ -5,6 +5,7 @@ Mapping of
 from typing import Any, Callable, Dict, Union
 import torch
 
+import operator
 from functools import partial
 
 import cube.graph.operator.function as function
@@ -70,6 +71,11 @@ class Sign2Op:
 
         # torch aten
 
+        # creators
+        __ttemplate('zeros'): function.Zeros,
+        __ttemplate('tensor'): function.NewTensor,
+        __ttemplate('to'): function.ToTensor,
+
         __ttemplate('add') : function.Add,
 
         __ttemplate('sub') : function.Sub,
@@ -78,7 +84,14 @@ class Sign2Op:
 
         __ttemplate('div') : function.Div,
 
+        __ttemplate('floordiv') : function.FloorDiv,
+
         __ttemplate('neg'): function.Neg,
+
+        __ttemplate('gt'): partial(function.comparison_einops, operator.gt, 'gt'),
+        __ttemplate('lt'): partial(function.comparison_einops, operator.lt, 'lt'),
+        __ttemplate('ge'): partial(function.comparison_einops, operator.ge, 'ge'),
+        __ttemplate('le'): partial(function.comparison_einops, operator.le, 'le'),
 
         __ttemplate('pow'): function.Pow,
 
@@ -100,10 +113,21 @@ class Sign2Op:
 
         __ttemplate('conv3d'): function.Conv3D,
 
+        __ttemplate('select'): function.Select,
+
+        __ttemplate('slice'): function.Slice,
+
+        #pytorch1.11
+        __ttemplate('select_scatter'): function.SelectScatter,
+
+        __ttemplate('repeat'): function.Repeat,
+
         #pytorch1.11
         __ttemplate('linear'): function.Linear,
 
         __ttemplate('cat'): function.Cat,
+
+        __ttemplate('stack'): function.Stack,
 
         #einops
         __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,

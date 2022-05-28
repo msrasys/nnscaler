@@ -1,4 +1,5 @@
 from copy import copy
+import itertools
 from typing import List
 
 from cube.graph.operator.operator import IRFwOperation
@@ -17,7 +18,6 @@ class IRCat(IRFwOperation):
         for idx, input in enumerate(inputs):
             self.set_input(idx, input)
         self.kwargs.update(kwargs)
-        self._cat_count = len(inputs)
 
     def infer_shape(self) -> bool:
         """
@@ -50,3 +50,28 @@ class IRCat(IRFwOperation):
         s0.insert(dim, sumLen)
         self.outputs(0).shape = s0
         return True
+
+
+class IRStack(IRFwOperation):
+    def __init__(self, signature: str, inputs: List[IRTensor], name: str, dim: int):
+        # torch.stack(inputs:List[Tensor], dim:int) -> Tensor
+        assert len(inputs) > 0
+
+        super().__init__(name, signature, len(inputs), 1)
+        for idx, input in enumerate(inputs):
+            self.set_input(idx, input)
+        self.kwargs.update({"dim": dim})
+
+    def infer_shape(self) -> bool:
+        dim  = self.kwargs['dim']
+        tensors : List[IRTensor] = self.inputs(None) # None for all inputs
+        
+        # `stack` requires all input tensors to have the same shape
+        if len(set(t.shape for t in tensors)) != 1:
+            return False
+
+        shp : list = tensors[0].shape.copy()
+        shp.insert(dim, len(tensors))
+        self.outputs(0).shape = shp
+        return True
+

@@ -1,7 +1,7 @@
-from typing import Iterable, List, Optional, Union, Dict
+from typing import Any, Iterable, List, Optional, Tuple, Union, Dict
 import string
 import copy
-from cube.graph.operator.function.cat import IRCat
+import numpy
 
 from cube.ir.cten import IRTensor
 from cube.graph.operator.function.einops import EinDim, IREinops
@@ -10,6 +10,11 @@ from cube.graph.operator.function.conv import IRConv3D
 from cube.graph.operator.function.pad import IRPad
 from cube.graph.operator.function.scripteinops import IRScriptEinOps
 from cube.graph.operator.function.customops import IRCustomOps
+from cube.graph.operator.function.cat import IRCat, IRStack
+from cube.graph.operator.function.creators import IRToTensor, IRZeros
+from cube.graph.operator.function.select import IRSelect, IRSlice
+from cube.graph.operator.function.scatter import IRSelectScatter
+from cube.graph.operator.function.repeat import IRRepeat
 
 
 def _create_eshape(shape: List[int], iterator: Optional[Iterable] = None,
@@ -81,6 +86,56 @@ def BatchLinear(signature, inputs):
     ]
     return IREinops(signature, annos, inputs, 'bmm')
 
+
+def Zeros(signature, 
+          inputs: Tuple[ List[int], Optional[Any], Optional[Any], 'ErasedDevice', Optional[bool] ]):
+    # zeros(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+    #
+    # REMARK: in the PyTorch-internal operator definition expression, an asterisk ("*") is merely a marker of
+    #         the beginning of the sublist of _keyword arguments_, and does not result in an actual argument.
+
+    shape, dtype, layout, _erased_device, pin_memory = inputs
+
+    # TODO parameters to support, currently they are all None
+    assert dtype is None
+    assert layout is None
+    assert pin_memory is None
+
+    for dim, i in enumerate(shape):
+        if not isinstance(dim, int) and not dim >= 0:
+            raise RuntimeWarning(f"The {i}-th component of the shape must be non-negative integer")
+    return IRZeros(signature, shape, 'zeros')
+
+
+def NewTensor(signature, 
+              inputs: Tuple[ list, Optional[Any], 'ErasedDevice', bool ]):
+    # aten::tensor(t[] data, *, ScalarType? dtype=None, Device? device=None, bool requires_grad=False) -> Tensor
+    #
+    # REMARK: in the PyTorch-internal operator definition expression, an asterisk ("*") is merely a marker of
+    #         the beginning of the sublist of _keyword arguments_, and does not result in an actual argument.
+
+    data, dtype, _erased_device, requires_grad = inputs
+
+    # TODO parameters to support, currently they are all None
+    assert dtype is None
+    assert requires_grad == False
+
+    arr = numpy.array(data)
+
+    # ints or floats of any precision, e.g. i8, i64, f16, f32
+    # and the specified array is regular/non-ragged.
+    # Otherwise NumPy would decide the element type as _o_bject.
+    if not arr.dtype.kind in ['i','f']:
+        raise RuntimeError("The specified data to create new tensor must be ints or floats")
+
+    # TODO temporarily fake creation with Zeros
+    shape = list(arr.shape)
+    return IRZeros(signature, shape, 'tensor')
+
+def ToTensor(signature,
+             inputs: Tuple[ IRTensor, ... ]):
+    tensors = inputs[0:1]
+    return IRToTensor(signature, tensors, 'to')
 
 def Add(signature, inputs):
     if len(inputs) == 2:
@@ -198,10 +253,9 @@ def Mul(signature, inputs):
 def Div(signature, inputs):
     lhs, rhs = inputs
 
-    if isinstance(lhs, int) and isinstance(rhs, int):
-        # only if both operands are int, do we do floor division.
-        return lhs // rhs
-    elif isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
+    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
+        # For `aten::div` we always do floating division, even operands are both ints.
+        # TorchScript would dispatch frontend `a // b` to another op `aten::floordiv`.
         return lhs / rhs
 
     annos = [
@@ -226,6 +280,36 @@ def Div(signature, inputs):
                     rshape[dim] = str(rhs.shape[dim])
             annos = [_create_anno([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, 'div')
+
+
+def FloorDiv(signature, inputs):
+    lhs, rhs = inputs
+
+    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
+        return lhs // rhs
+
+    annos = [
+        '*, 1 -> *',
+        '1, * -> *',
+        '*, * -> *',
+    ]
+    # broadcast
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
+       len(lhs.shape) == len(rhs.shape):
+        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
+            # TODO: support spatial partitioning on broadcast dim
+            lshape = _create_eshape(lhs.shape)
+            rshape = copy.copy(lshape)
+            oshape = copy.copy(lshape)
+            for dim in range(len(lhs.shape)):
+                if lhs.shape[dim] < rhs.shape[dim]:
+                    oshape[dim] = rshape[dim]
+                    lshape[dim] = str(lhs.shape[dim])
+                elif lhs.shape[dim] > rhs.shape[dim]:
+                    oshape[dim] = lshape[dim]
+                    rshape[dim] = str(rhs.shape[dim])
+            annos = [_create_anno([lshape, rshape], [oshape])]
+    return IREinops(signature, annos, inputs, 'floordiv')
 
 
 def Pow(signature, inputs):
@@ -258,16 +342,59 @@ def Pow(signature, inputs):
     return IREinops(signature, annos, inputs, 'pow')
 
 
+# if both operands are scalars, returns bool.
+# if one operand is a tensor, returns a broadcasted tensor with dtype being bool.
+def comparison_einops(f, name, signature, inputs):
+    # f : (Scalar, Scalar) -> bool
+    assert len(inputs) == 2
+    lhs, rhs = inputs
+
+    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
+        return f(lhs, rhs)
+
+    annos = [
+        '*, 1 -> *',
+        '1, * -> *',
+        '*, * -> *',
+    ]
+    # broadcast
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
+       len(lhs.shape) == len(rhs.shape):
+        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
+            # TODO: support spatial partitioning on broadcast dim
+            lshape = _create_eshape(lhs.shape)
+            rshape = copy.copy(lshape)
+            oshape = copy.copy(lshape)
+            for dim in range(len(lhs.shape)):
+                if lhs.shape[dim] < rhs.shape[dim]:
+                    oshape[dim] = rshape[dim]
+                    lshape[dim] = str(lhs.shape[dim])
+                elif lhs.shape[dim] > rhs.shape[dim]:
+                    oshape[dim] = lshape[dim]
+                    rshape[dim] = str(rhs.shape[dim])
+            annos = [_create_anno([lshape, rshape], [oshape])]
+    return IREinops(signature, annos, inputs, name)
+
+
 def Neg(signature, inputs):
-    annos = ['* -> *']
-    tensor = inputs[0:1]
-    if len(inputs) == 2:
+    if len(inputs) == 1:
+        kwargs = {}
+    elif len(inputs) == 2:
         # adapt for newest pytorch version
         approximate = inputs[1]
-        return IREinops(signature, annos, tensor, 'neg',
-                        approximate=approximate)
+        kwargs = {'approximate': approximate}
+
+        inputs = inputs[0:1]
     else:
-        return IREinops(signature, annos, tensor, 'neg')
+        raise RuntimeError("The number of inputs must be 1 or 2")
+
+    arg, = inputs
+    if isinstance(arg, (int, float)):
+        assert not('approximate' in kwargs)
+        return -arg
+
+    annos = ['* -> *']
+    return IREinops(signature, annos, inputs, 'neg', **kwargs)
 
 def Sin(signature, inputs):
     annos = ['* -> *']
@@ -570,11 +697,52 @@ def Pad(signature, inputs):
 def Cat(signature, inputs):
     """
     torch.cat(inputs: List[Tensor], dim: int) -> Tensor
+
+    e.g. cat(tensor([2,3]), tensor([2,3])).shape == [4,3]
     """
     tensors : List[IRTensor]
     dim : int
     tensors, dim = inputs
     return IRCat(signature, tensors, 'cat', dim=dim)
+
+def Stack(signature, inputs: Tuple[List[IRTensor], int]):
+    """
+    torch.stack(inputs: List[Tensor], dim: int) -> Tensor
+
+    e.g. stack(tensor([2,3]), tensor([2,3])).shape == [2,2,3]
+    """
+    tensors, dim = inputs
+    return IRCat(signature, tensors, 'stack', dim=dim)
+
+def Select(signature, inputs: Tuple[IRTensor, int, int]):
+    """
+    torch.select(self:Tensor, dim:int, index:int) -> Tensor
+    """
+    tensor, dim, index = inputs
+    return IRSelect(signature, [tensor], 'select', dim, index)
+
+def Slice(signature, inputs: Tuple[IRTensor, int, Optional[int], Optional[int], int]):
+    """
+    aten::slice(input:Tensor, dim:int, start:Optional[int], end:Optional[int], step:int) -> Tensor
+    """
+    tensor, dim, start, end, step = inputs
+    return IRSlice(signature, [tensor], 'slice', dim, start, end, step)
+
+def SelectScatter(signature, inputs:Tuple[IRTensor, IRTensor, int, int]):
+    """
+    torch.select_scatter(self:Tensor, input:Tensor, dim:int, index:int) -> Tensor
+    """
+    self, input, dim, index = inputs
+    return IRSelectScatter(signature, [self, input], 'scatter_select', dim, index)
+
+
+def Repeat(signature, inputs:Tuple[IRTensor, List[int]]):
+    """
+    torch.repeat(tensor:Tensor, repeats: List[int]) -> Tensor
+    """
+    tensor, repeats = inputs
+    return IRRepeat(signature, [tensor], 'repeat', repeats)
+
 
 def ScriptEinOps(signature, inputs):
     """
