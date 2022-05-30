@@ -15,8 +15,7 @@ class Grouping(PlanPass):
     @staticmethod
     def apply(execplan: ExectuionPlan) -> ExectuionPlan:
         """
-        Group contiguous forward and contiguous backward
-        into subgraph
+        Group contiguous differentiable operators segments
         """
         graph = execplan.graph
         fgroups, bgroups = Grouping.group(execplan)
@@ -48,9 +47,6 @@ class Grouping(PlanPass):
         Returns:
             Tuple: (fgroups, bgroups)
         """
-        def is_forward_adapter(adapter: IRAdapter) -> bool:
-            return all(not t.is_grad() for t in adapter.inputs())
-
         fgroups, bgroups = dict(), dict()
         for devid in execplan.devices():
             fgroups[devid], bgroups[devid] = list(), list()
@@ -60,7 +56,7 @@ class Grouping(PlanPass):
             for fnode in seq:
                 if isinstance(fnode, IRFwOperation):
                     fnodes.append(fnode)
-                if isinstance(fnode, IRAdapter) and fnode.differentiable and is_forward_adapter(fnode):
+                if isinstance(fnode, IRAdapter) and fnode.differentiable and fnode.forward:
                     fnodes.append(fnode)
             have_backward = all(fnode.mirror in seq for fnode in fnodes)
             # training

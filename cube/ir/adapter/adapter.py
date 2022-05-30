@@ -28,6 +28,12 @@ class IRAdapter(IRCell):
             device.update(set(tensor.device))
         self.device = list(device)
 
+        # setup whether this adapter is for forward stage
+        is_fw = any(not t.is_grad() for t in self.inputs() + self.outputs())
+        is_bw = any(t.is_grad() for t in self.inputs() + self.outputs())
+        assert not (is_fw and is_bw), "An IRAdapter cannot serve for both forward and backward stage"
+        self._forward = is_fw
+
     @property
     def prims(self) -> List[IRAdapterPrim]:
         if self.is_forward:
@@ -61,6 +67,13 @@ class IRAdapter(IRCell):
     @differentiable.setter
     def differentiable(self, val: bool):
         self._differentiable = val
+
+    @property
+    def forward(self) -> bool:
+        """
+        return True if this adapter serves in forward stage.
+        """
+        return self._forward
 
     def dispatch(self, devid: int):
         """

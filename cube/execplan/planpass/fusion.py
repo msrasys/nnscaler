@@ -18,14 +18,13 @@ class DiffFusion(PlanPass):
 
     @staticmethod
     def apply(execplan: ExectuionPlan) -> ExectuionPlan:
-
-        def is_forward_adapter(adapter: IRAdapter):
-            return all(not t.is_grad() for t in adapter.inputs())
-
+        """
+        Fuse the non-differentiable adapters into differentiable adapters.
+        """
         cnt = 0
         for devid in execplan.devices():
             for node in execplan.seq(devid):
-                if isinstance(node, IRAdapter) and is_forward_adapter(node):
+                if isinstance(node, IRAdapter) and node.forward and not node.differentiable:
                     ret = DiffFusion.nnfuse(node)
                     cnt = cnt+1 if ret else cnt
         print(f'successfully generate {cnt} differentiable adapters')

@@ -369,7 +369,7 @@ class SplitAllGatherPrim(AllGatherPrim):
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
         super().__init__(itensors, otensors, dim, **kwargs)
-        self.signature = 'cube.runtime.adapter.nn.allgather_split'
+        self.signature = 'cube.runtime.adapter.nn.split_allgather'
 
 
 class AllToAllAllToAllPrim(AllToAllPrim):
