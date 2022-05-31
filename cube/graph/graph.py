@@ -7,7 +7,7 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Union, Tuple, List, Optional, Dict
+from typing import Any, Union, Tuple, List, Optional, Dict
 import copy
 
 from cube.ir.cten import IRTensor, IRCell
@@ -20,12 +20,16 @@ from cube.algorithm.generics import GenericDistAlgo
 
 class IRSegment(IRCell):
     """
-    A segment refers to a piece of workload of IRGraph
+    A distributed sub-graph representing a piece of workload in parent IRGraph
     """
 
     def __init__(self, nodes: List[IRCell], inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
-        self._nodes = nodes
         super().__init__('segment', '', len(inputs), len(outputs), init_outputs=False)
+
+        self._nodes = nodes
+        self._idevice = [t.device for t in inputs]
+        self._odevice = [t.device for t in outputs]
+
         for idx, val in enumerate(inputs):
             self.set_input(idx, val)
         for idx, val in enumerate(outputs):
@@ -51,8 +55,36 @@ class IRSegment(IRCell):
         else:
             return copy.copy(self._nodes)
 
+    def dispatch(self, devid: int, for_mirror=True) -> Optional[IRCell]:
+        """
+        Instantiate from distributed representation to a
+        device-specific sub-graph.
+        
+        The mirror will also be dispatched if it is not None.
+
+        Return the dispatched segment
+        """
+        if devid not in self.device:
+            return None
+        if len(self.device) == 1 and self.device == [devid]:
+            return self
+        itensors = [t for t, device in zip(self.inputs(), self._idevice) if devid in device]
+        otensors = [t for t, device in zip(self.outputs(), self._odevice) if devid in device]
+        nodes = [n for n in self.nodes() if devid in n.device]
+        for idx, adapter in enumerate(nodes):
+            if isinstance(adapter, IRAdapter):
+                nodes[idx] = adapter.dispatch(devid)
+        fseg = IRSegment(nodes, itensors, otensors)
+        fseg._id = self._id
+        # dispatch for mirror
+        if for_mirror and isinstance(self.mirror, IRSegment):
+            bseg = self.mirror.dispatch(devid, for_mirror=False)
+            IRCell.make_pair(fseg, bseg)
+        return fseg
+
     def __repr__(self):
-        return f'Segment{self._id}(inputs={self.inputs()}, outputs={self.outputs()})'
+        name = ('f' if self.forward else 'b') + 'Segment'
+        return f'{name}{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
 
     def extra_repr(self) -> str:
         dscp = repr(self)
@@ -63,9 +95,8 @@ class IRSegment(IRCell):
 
 class IRGraph(IRCell):
     """
-    PyTorch IR Graph
-
-    The IR Graph only contains forward graph
+    IR Graph. The hyperGraph for representing distributed
+    graph.
     """
 
     def __init__(self, 
@@ -77,6 +108,8 @@ class IRGraph(IRCell):
         self._nodes: List[IRCell] = list()
         self._parameters = list()
         self._full_tensors: Dict[int, IRFullTensor] = dict()
+
+        self._schedule_strategy = None
 
         if inputs is None:
             inputs = IRGraph.get_inputs(nodes)
@@ -113,6 +146,14 @@ class IRGraph(IRCell):
 
         self.reset_dependency()
 
+    @property
+    def schedule_plan(self) -> Optional[Any]:
+        return self._schedule_strategy
+
+    @schedule_plan.setter
+    def schedule_plan(self, val: Optional[Any]):
+        self._schedule_strategy = val
+
     def reset_dependency(self):
         """
         Reset the node dataflow dependency
@@ -122,30 +163,19 @@ class IRGraph(IRCell):
         for node in self._nodes:
             node.clear_predecessor()
             node.clear_successor()
-        # set node predecessors and successors
-        for src_idx in range(len(self._nodes)):
-            src_node = self._nodes[src_idx]
-            for dst_node in self._nodes[src_idx+1:]:
-                # we don't consider dependencies among adapter
-                if isinstance(src_node, IRAdapter) and isinstance(dst_node, IRAdapter):
-                    continue
-                for out_idx, out_tensor in enumerate(src_node.outputs()):
-                    if not isinstance(out_tensor, IRTensor):
-                        continue
-                    for in_idx, in_tensor in enumerate(dst_node.inputs()):
-                        if not isinstance(in_tensor, IRTensor):
-                            continue
-                        if out_tensor.overlap(in_tensor):
-                            src_node.add_successor(out_idx, dst_node)
-                            dst_node.add_predecessor(in_idx, src_node)
-        # set mirror as control dependency
-        for idx1, node1 in enumerate(self._nodes):
-            node2 = node1.mirror
-            if isinstance(node2, IRCell) and node2 in self._nodes:
-                idx2 = self._nodes.index(node2)
-                if idx1 < idx2:
-                    node1.add_successor(-1, node2)
-                    node2.add_predecessor(-1, node1)
+        # TODO: adapter dependency not set
+        for ftensor in self._full_tensors.values():
+            for ptensor, producer in zip(ftensor.ptensors, ftensor.producers):
+                for ctensor, consumer in zip(ftensor.ctensors, ftensor.consumers):
+                    if ptensor.overlap(ctensor):
+                        pidx = producer.outputs().index(ptensor)
+                        cidx = consumer.inputs().index(ctensor)
+                        producer.add_successor(pidx, consumer)
+                        consumer.add_predecessor(cidx, producer)
+                # set mirror as control dependency
+                if producer.mirror and isinstance(producer, IRFwOperation):
+                    producer.add_successor(-1, producer)
+                    producer.mirror.add_predecessor(-1, producer)
 
     def parameters(self):
         """
@@ -159,7 +189,7 @@ class IRGraph(IRCell):
         """
         return list(self._full_tensors.values())
 
-    def nodes(self, index: Optional[int] = None):
+    def nodes(self, index: Optional[int] = None) -> Union[IRCell, List[IRCell]]:
         """
         Get node at position index
         """
@@ -203,21 +233,38 @@ class IRGraph(IRCell):
         """
         inputs, outputs = [], []
         for node in nodes:
+            assert not isinstance(node, IRSegment), 'A segment cannot be in other segments'
             # update inputs
             itensors = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
             for itensor in itensors:
-                producers = [p for p in itensor.parent.producers if p.device == node.device]
-                # no producer means a weight
+                producers = [p for p in itensor.parent.producers if set(p.device).issubset(set(node.device))]
+                # no producer means a weight or cross device-group
                 if len(producers) == 0 or any(p not in nodes for p in producers):
                     inputs.append(itensor)
             # update outputs
             otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
             for otensor in otensors:
-                consumers = [c for c in otensor.parent.consumers if c.device == node.device]
-                # no consumer usually means the loss
+                consumers = [c for c in otensor.parent.consumers if set(c.device).issubset(set(node.device))]
+                # no consumer usually means the loss or cross device-group
                 if len(consumers) == 0 or any(c not in nodes for c in consumers):
                     outputs.append(otensor)
         segment = IRSegment(nodes, inputs, outputs)
+        return segment
+
+    def group(self, nodes: List[IRCell]) -> IRSegment:
+        """
+        Group consecutive nodes into IRSegment.
+
+        Currently this interface will break the dependency,
+        it can only be used after user policy
+        """
+        allnodes = self.nodes()
+        indices = [allnodes.index(n) for n in nodes]
+        minidx, maxidx = min(indices), max(indices)
+        assert maxidx - minidx + 1 == len(nodes), "nodes are not consecutive"
+        segment = self.segment(nodes)
+        self._nodes = allnodes[:minidx] + [segment] + allnodes[maxidx+1:]
+        # FIXME: set segment dependnecy
         return segment
 
     def detach(self, node: IRCell, reset_dependency=False) -> int:
@@ -282,6 +329,18 @@ class IRGraph(IRCell):
         if reset_dependency:
             self.reset_dependency()
         return
+
+    def flatten(self) -> List[IRCell]:
+        """
+        Flattent the graph by expanding nodes
+        """
+        nodes = []
+        for node in self.nodes():
+            if isinstance(node, IRSegment):
+                nodes += node.nodes()
+            else:
+                nodes.append(node)
+        return nodes
 
     @staticmethod
     def get_inputs(nodes: List[IRCell]):

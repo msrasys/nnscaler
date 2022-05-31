@@ -75,7 +75,7 @@ class IRAdapter(IRCell):
         """
         return self._forward
 
-    def dispatch(self, devid: int):
+    def dispatch(self, devid: int, for_mirror=True):
         """
         Get Adapter for a specific rank
 
@@ -101,11 +101,15 @@ class IRAdapter(IRCell):
             for itensor in inputs:
                 prims.append(IdentityPrim(itensor))
         # dispatch
-        adapter = IRAdapter(inputs, outputs)
-        adapter.prims = prims
-        adapter.name = self.name
-        adapter._id = self._id
-        return adapter
+        fadapter = IRAdapter(inputs, outputs)
+        fadapter.prims = prims
+        fadapter.name = self.name
+        fadapter._id = self._id
+        # dispatch for mirror
+        if for_mirror and isinstance(self.mirror, IRAdapter):
+            badapter = self.mirror.dispatch(devid, for_mirror=False)
+            IRCell.make_pair(fadapter, badapter)
+        return fadapter
 
     def __repr__(self):
         return f'Adapter-{self._id}{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'

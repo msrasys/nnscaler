@@ -12,7 +12,9 @@ from cube.ir.dtype import IRDType
 from cube.ir.tensor import IRSubTensor
 from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from cube.ir.adapter import IRWeightReducer, IRAdapter
+from cube.ir.adapter.prim import CollectivePrim
 from cube.graph.graph import IRGraph, IRSegment
+from cube.graph.schedule import IRScheduleStrategy
 
 from cube.execplan import ExectuionPlan
 
@@ -96,16 +98,15 @@ class ModelCodeGen(CodeGen):
                 if ranks not in comm_groups:
                     comm_groups.append(ranks)
         # collect groups from p2p fusion
-        adapters = [n for n in graph.nodes() if isinstance(n, IRAdapter)]
+        adapters = [n for n in graph.flatten() if isinstance(n, IRAdapter)]
         for adapter in adapters:
             for prim in adapter.prims:
-                if len(prim.device) == 1:
-                    continue
-                ranks = list(prim.device)
-                ranks.sort()
-                ranks = tuple(ranks)
-                if ranks not in comm_groups:
-                    comm_groups.append(ranks)
+                if isinstance(prim, CollectivePrim):
+                    ranks = list(prim.kwargs['ranks'])
+                    ranks.sort()
+                    ranks = tuple(ranks)
+                    if ranks not in comm_groups:
+                        comm_groups.append(ranks)
         # create communication group
         self.declare_region.append('# communication groups')
         for ranks in comm_groups:
@@ -365,22 +366,26 @@ class ScheduleCodeGen(CodeGen):
                         refcnt += 1
             return refcnt
 
-        # generate code
         with FunctionBlock(func_name='_train_step', 
                            args=['model', 'dataloader']) as fb:
             fb.insert_body('_ = None')
+            # body code
             if len(device_nodes) == 0:
                 fb.insert_body('pass')
-            for node in device_nodes:
-                name = self.node_naming(node)
-                code = self.emit_node(node, name=name)
+            elif self.execplan.graph.schedule_plan:
+                code = self.emit_schedule_plan(self.execplan.graph.schedule_plan, device)
                 fb.insert_body(code)
-                # free unused tensor
-                for tensor in node.inputs() + node.outputs():
-                    if isinstance(tensor, IRSubTensor) and not tensor.is_param():
-                        refcnt = refcount(tensor, node)
-                        if refcnt == 0:
-                            self.vars.free(tensor)
+            else:
+                for node in device_nodes:
+                    name = self.node_naming(node)
+                    code = self.emit_node(node, name=name)
+                    fb.insert_body(code)
+                    # free unused tensor
+                    for tensor in node.inputs() + node.outputs():
+                        if isinstance(tensor, IRSubTensor) and not tensor.is_param():
+                            refcnt = refcount(tensor, node)
+                            if refcnt == 0:
+                                self.vars.free(tensor)
             # return code
             outputs = self.return_naming(self.execplan.graph.outputs())
             code = f'return {outputs}'
@@ -395,7 +400,18 @@ class ScheduleCodeGen(CodeGen):
                 f.write(code)
         return code
 
-    def emit_node(self, node: IRCell, name: str) -> List[str]:
+    def emit_schedule_plan(self, schedplan: IRScheduleStrategy, devid: int):
+        signature = schedplan.signature
+        kwargs: Dict[str, Any] = schedplan.kwargs(devid)
+        strkwargs = dict()
+        for kwarg, val in kwargs.items():
+            name = str(val) if not isinstance(val, IRCell) else 'model.'+self.node_naming(val)
+            strkwargs[kwarg] = name
+        code = ', '.join(f'{kwarg}={name}' for kwarg, name in strkwargs.items())
+        code = f'{signature}({code})'
+        return code
+
+    def emit_node(self, node: IRCell, name: str) -> str:
         """
         Emit node / subgraph code
         """

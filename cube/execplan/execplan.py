@@ -2,12 +2,10 @@ from typing import Callable, Dict, List, Optional
 import copy
 import numpy as np
 
+from cube.ir.cten import IRCell
 from cube.ir.adapter import IRAdapter
 from cube.ir.operator import IRBpOperation, IRFwOperation
-
-from cube.ir.cten import IRCell
-from cube.graph.graph import IRGraph
-from cube.ir.tensor import IRFullTensor, IRSubTensor
+from cube.graph.graph import IRGraph, IRSegment
 
 
 class ExectuionPlan:
@@ -26,38 +24,26 @@ class ExectuionPlan:
                     self._seq[device] = []
                 self._seq[device].append(node)
 
-        # adapter dispatch
+        # adapter/segment dispatch
         for devid in self.devices():
-            adapters = [node for node in self.at(devid) if isinstance(node, IRAdapter)]
-            while len(adapters) > 0:
-                fadapter = adapters[0]
-                badapter: Optional[IRAdapter] = fadapter.mirror
-                fnode = fadapter.dispatch(devid)
-                fidx = self.at(devid).index(fadapter)
-                self.at(devid)[fidx] = fnode
-                if badapter:
-                    bnode = badapter.dispatch(devid)
-                    IRCell.make_pair(fnode, bnode)
-                    bidx = self.at(devid).index(badapter)
-                    self.at(devid)[bidx] = bnode
-                # remove un-dispatched adapter
-                adapters.pop(0)
-                if badapter:
-                    adapters.remove(badapter)
+            nodes = [node for node in self.at(devid) if isinstance(node, (IRAdapter, IRSegment))]
+            while len(nodes) > 0:
+                # dispatch
+                fnode = nodes[0]
+                fidx = self.at(devid).index(fnode)
+                fnode_dev = fnode.dispatch(devid)
+                self.at(devid)[fidx] = fnode_dev
+                nodes.pop(0)
+                if fnode.mirror is not None:
+                    bidx = self.at(devid).index(fnode.mirror)
+                    nodes.remove(fnode.mirror)
+                    self.at(devid)[bidx] = fnode_dev.mirror
 
-        # check whether graph output is replicated across device
-        # FIXME: should use adapter to generate communication for
-        # traning logic output
+        # TODO: adapter support for return consistency
         for output in graph.outputs():
-            devices = self.devices()
-            ltensor: IRFullTensor = output.parent  # logic tensor
-            if isinstance(output, IRSubTensor):
-                for ptensor, producer in zip(ltensor.ptensors, ltensor.producers):
-                    if ptensor == output:
-                        if producer.device[0] in devices:
-                            devices.remove(producer.device[0])
-            if len(devices) != 0:
-                raise NotImplementedError("Require return values of training logic is replicated across nodes.")
+            for devid in self.devices():
+                ptensors = [pt for pt in output.parent.ptensors if pt == output and devid in pt.device]
+                assert len(ptensors) >= 1, f"Missing full graph output tensor {output} in device {devid}"
 
     @property
     def graph(self) -> IRGraph:
@@ -88,6 +74,19 @@ class ExectuionPlan:
         """
         assert devid in self._seq, f"device id {devid} not exists"
         return self._seq[devid]
+
+    def flatten(self, devid: int) -> List[IRCell]:
+        """
+        Flatten the sequence by expanding segments
+        """
+        assert devid in self._seq, f"device id {devid} not exists"
+        nodes = []
+        for node in self._seq[devid]:
+            if isinstance(node, IRSegment):
+                nodes += node.nodes()
+            else:
+                nodes.append(node)
+        return nodes
 
     def set(self, devid: int, seq: List[IRCell]):
         """

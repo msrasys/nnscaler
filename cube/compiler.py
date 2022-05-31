@@ -165,8 +165,11 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                     raise RuntimeError(f"Node {node} device is not set")
 
             # generate adapter
-            # graph = AdapterGener.gen(graph)
             graph = IRAdapterGener.gen(graph)
+
+            if graph.schedule_plan:
+                graph = graph.schedule_plan.apply(graph)
+                print(graph.schedule_plan)
 
             # to execution plan
             execplan = ExectuionPlan(graph)
@@ -177,18 +180,15 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             span = time.time() - start
             print('> planpass on diff-fusion operations: {:.2f} s'.format(span))
 
-            start = time.time()
-            execplan = Grouping.apply(execplan)
-            span = time.time() - start
-            print('> planpass on grouping operations: {:.2f} s'.format(span))
-
-            # start = time.time()
-            # execplan = GroupingAdapter.apply(execplan)
-            # span = time.time() - start
-            # print('> planpass on grouping adapters : {:.2f} s'.format(span))
+            # plan pass for computation grouping
+            if not graph.schedule_plan:
+                start = time.time()
+                execplan = Grouping.apply(execplan)
+                span = time.time() - start
+                print('> planpass on grouping operations: {:.2f} s'.format(span))
 
             execplan.graph.reset_dependency()
-            # execplan.analyze(outfile='execplan.png')
+            execplan.analyze(outfile='execplan.png')
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()

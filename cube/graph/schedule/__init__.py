@@ -1,0 +1,1 @@
+from cube.graph.schedule.strategy import IRScheduleStrategy

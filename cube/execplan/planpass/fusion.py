@@ -1,4 +1,5 @@
 from typing import List
+from cube.graph.graph import IRSegment
 
 from cube.ir.adapter import IRAdapter
 
@@ -27,6 +28,17 @@ class DiffFusion(PlanPass):
                 if isinstance(node, IRAdapter) and node.forward and not node.differentiable:
                     ret = DiffFusion.nnfuse(node)
                     cnt = cnt+1 if ret else cnt
+                if isinstance(node, IRSegment) and node.forward:
+                    for fnode in node.nodes():
+                        if isinstance(fnode, IRAdapter) and node.forward and not fnode.differentiable:
+                            ret = DiffFusion.nnfuse(fnode)
+                            if not ret:
+                                raise NotImplementedError(
+                                    f"adapter within IRSegment cannot fuse to differientiable adapter"
+                                    f"\nforward: {fnode.extra_repr()}"
+                                    f"\nbackward: {fnode.mirror.extra_repr()}"
+                                )
+                            cnt = cnt + 1
         print(f'successfully generate {cnt} differentiable adapters')
         return execplan
 
