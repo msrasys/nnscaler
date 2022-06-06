@@ -406,6 +406,8 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     from matplotlib.ticker import ScalarFormatter
 
+    cube.init()
+
     nz = 16
     dz = 1. / 16
     ny = 128
