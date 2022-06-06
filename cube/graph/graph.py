@@ -283,9 +283,19 @@ class IRGraph(IRCell):
         self._nodes.pop(index)
         if isinstance(node, IRAdapter):
             return index
+        # update consumer
+        itensors = []
         for itensor in node.inputs():
+            if isinstance(itensor, IRSubTensor) and itensor not in itensors:
+                itensors.append(itensor)
+        for itensor in itensors:
             if isinstance(itensor, IRSubTensor):
                 itensor.parent.rm_consumer(node)
+        # update producer
+        otensors = []
+        for otensor in node.outputs():
+            if isinstance(otensor, IRSubTensor) and otensor not in otensors:
+                otensors.append(otensor)
         for otensor in node.outputs():
             if isinstance(otensor, IRSubTensor):
                 otensor.parent.rm_producer(node)
@@ -307,25 +317,31 @@ class IRGraph(IRCell):
         if isinstance(node, IRAdapter):
             return
         # update consumer
+        itensors = []
         for itensor in node.inputs():
-            if isinstance(itensor, IRSubTensor):
-                idx = 0
-                for consumer in itensor.parent.consumers:
-                    if self.nodes().index(consumer) < index:
-                        idx += 1
-                    else:
-                        break
-                itensor.parent.add_consumer(node, itensor, idx)
+            if isinstance(itensor, IRSubTensor) and itensor not in itensors:
+                itensors.append(itensor)
+        for itensor in itensors:
+            idx = 0
+            for consumer in itensor.parent.consumers:
+                if self.nodes().index(consumer) < index:
+                    idx += 1
+                else:
+                    break
+            itensor.parent.add_consumer(node, itensor, idx)
         # update producer
+        otensors = []
         for otensor in node.outputs():
-            if isinstance(otensor, IRSubTensor):
-                idx = 0
-                for producer in otensor.parent.producers:
-                    if self.nodes().index(producer) < index:
-                        idx += 1
-                    else:
-                        break
-                otensor.parent.add_producer(node, otensor, idx)
+            if isinstance(otensor, IRSubTensor) and otensor not in otensors:
+                otensors.append(otensor)
+        for otensor in otensors:
+            idx = 0
+            for producer in otensor.parent.producers:
+                if self.nodes().index(producer) < index:
+                    idx += 1
+                else:
+                    break
+            otensor.parent.add_producer(node, otensor, idx)
         if reset_dependency:
             self.reset_dependency()
         return
