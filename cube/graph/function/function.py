@@ -2,7 +2,6 @@ from typing import Any, Iterable, List, Optional, Tuple, Union, Dict
 import string
 import copy
 import numpy
-from torch import sign
 
 from cube.ir.cten import IRTensor
 from cube.graph.function.einops import EinDim, IREinops

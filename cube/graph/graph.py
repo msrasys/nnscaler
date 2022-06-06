@@ -284,21 +284,19 @@ class IRGraph(IRCell):
         if isinstance(node, IRAdapter):
             return index
         # update consumer
-        itensors = []
+        itensors: List[IRSubTensor] = []
         for itensor in node.inputs():
             if isinstance(itensor, IRSubTensor) and itensor not in itensors:
                 itensors.append(itensor)
         for itensor in itensors:
-            if isinstance(itensor, IRSubTensor):
-                itensor.parent.rm_consumer(node)
+            itensor.parent.rm_consumer(node)
         # update producer
-        otensors = []
+        otensors: List[IRSubTensor] = []
         for otensor in node.outputs():
             if isinstance(otensor, IRSubTensor) and otensor not in otensors:
                 otensors.append(otensor)
-        for otensor in node.outputs():
-            if isinstance(otensor, IRSubTensor):
-                otensor.parent.rm_producer(node)
+        for otensor in otensors:
+            otensor.parent.rm_producer(node)
         if reset_dependency:
             self.reset_dependency()
         return index
