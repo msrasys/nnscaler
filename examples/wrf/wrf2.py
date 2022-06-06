@@ -435,7 +435,7 @@ if __name__ == "__main__":
 
     @cube.compile(model=model, dataloader=varloader)
     def train_iter(model, dataloader):
-        U, V, W, O, Theta, phi1, mu1 = dataloader
+        U, V, W, O, Theta, phi1, mu1 = next(dataloader)
         U, V, W, O, Theta, phi1, mu1 = model(U, V, W, O, Theta, phi1, mu1)
         return U, V, W, O, Theta, phi1, mu1 
     model = model.get_gen_module()
