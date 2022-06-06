@@ -2,6 +2,7 @@ from typing import Any, Iterable, List, Optional, Tuple, Union, Dict
 import string
 import copy
 import numpy
+from torch import sign
 
 from cube.ir.cten import IRTensor
 from cube.graph.function.einops import EinDim, IREinops
@@ -463,21 +464,26 @@ def LayerNorm(signature, inputs):
 
 
 def Sum(signature, inputs):
-    # TODO: support dim reduction
-    annos = [
-        '*+ -> 1',
-    ]
-    tensor = inputs[0:1]
+    tensor = inputs[0]
     dim = inputs[1]
+    einput = _create_eshape(tensor.shape)
+    eoutput = copy.copy(einput)
     if dim is not None:
-        keepdim = inputs[2] if len(inputs) > 2 else False
-        dim_len = len(tensor[0].shape)
-        anno = "".join([f'b{i} ' for i in range(dim_len)]) + " -> " + "".join([f'b{i} ' if i not in dim else "" for i in range(dim_len)])
-        annos.append(anno)
-        return IREinops(signature, annos, tensor, 'sum',
-                        dim=dim, keepdim=keepdim)
+        keepdim = inputs[2]
+        sort_dim = list(dim)
+        sort_dim.sort()
+        for dimidx in sort_dim[::-1]:
+            eoutput.pop(dimidx)
+            einput[dimidx] = einput[dimidx] + '+'
     else:
-        return IREinops(signature, annos, tensor, 'sum')
+        eoutput = ['1']
+        # every dimension is reduced
+        einput = [edim + '+' for edim in einput]
+    anno = _create_anno([einput], [eoutput])
+    if dim is not None:
+        return IREinops(signature, [anno], [tensor], 'sum', dim=dim, keepdim=keepdim)
+    else:
+        return IREinops(signature, [anno], [tensor], 'sum')
 
 
 def Transpose(signature, inputs):
