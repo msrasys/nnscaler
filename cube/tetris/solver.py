@@ -2,12 +2,13 @@
 A solver based solution for scheduling plan
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 from enum import Enum
 
 from z3 import *
 import time
 import copy
+
 
 
 gsolver = Solver()
@@ -22,6 +23,7 @@ class Block:
     def __init__(self, mid: int, btype: BType, name: str, mem=1):
         global _uid
         global gsolver
+        self.name = name
         self.mid = mid
         self.step = Int(name)
         self.memory = mem if btype == Block.BType.FW else 0-mem
@@ -91,11 +93,13 @@ class SchedulePlan:
             step = self._solution[block.step]
         return (devid, step)
 
-    def add_block(self, block: Block, device: int):
+    def add_block(self, block: Block, devices: Tuple[int]):
         global gsolver
-        for blk in self._blocks[device]:
-            gsolver.add(blk.step != block.step)
-        self._blocks[device].append(block)
+        devices = (devices,) if isinstance(devices, int) else devices
+        for device in devices:
+            for blk in self._blocks[device]:
+                gsolver.add(blk.step != block.step)
+            self._blocks[device].append(block)
         # set plan step variable
         if self._nsteps is None:
             self._nsteps = block.step
@@ -130,7 +134,9 @@ class SchedulePlan:
         global gsolver
         tic = time.time()
         opt_step = max(len(blks) for blks in self._blocks)
+        max_step = self.nblocks
         while True:
+            assert opt_step <= max_step, "out of step boundary. consider this as a bug."
             gsolver.push()
             gsolver.add(self._nsteps == opt_step)
             if gsolver.check() == sat:
@@ -170,17 +176,20 @@ class SchedulePlan:
         gsolver.pop()
         toc = time.time()
         print('search memory time: {:.2f} seconds'.format(toc-tic))
-        print('solution:\n', self)
+        print('solution:')
+        print(self)
 
-        # self.iter_space(opt_step)
+        self.iter_space(opt_step, opt_mem)
 
-    def iter_space(self, nsteps: int, memory: int):
+    def iter_space(self, nsteps: int, memory: int = None):
         """
         iterate all solutions find by solver
         """
         global gsolver
         gsolver.push()
         gsolver.add(self._nsteps == nsteps)
+        if memory is not None:
+            gsolver.add(self._mem == memory)
         models = []
         while gsolver.check() == sat:
             model = gsolver.model()
@@ -194,6 +203,7 @@ class SchedulePlan:
             if len(models) % 10 == 0:
                 print(f'find {len(models)} solutions..')
         gsolver.pop()
+        print(f'find {len(models)} possible models')
 
 
     def __repr__(self) -> str:
@@ -235,10 +245,69 @@ if __name__ == '__main__':
                 sched.add_block(bblocks[ndevs-1-devid], devid)
         return sched
 
+    def chimera_staging(ndevs: int, nmicros: int) -> SchedulePlan:
+        """
+        f             b        f b
+          f         b        f     b
+            f     b        f         b
+              f b        f             b
+        """
+        sched = SchedulePlan(ndevs)
+        assert nmicros % 2 == 0, "require microbatch# can be devided by 2"
+        for mid in range(nmicros // 2): # V shape
+            fblocks = [Block(mid, Block.BType.FW, f'f{mid}d{devid}', mem=devid+1) for devid in range(ndevs)]
+            bblocks = [Block(mid, Block.BType.BW, f'b{mid}d{devid}', mem=devid+1) for devid in range(ndevs-1,-1,-1)]
+            blocks = fblocks + bblocks
+            for idx in range(ndevs * 2 - 1):
+                Block.add_dependency(blocks[idx], blocks[idx+1])
+            for devid in range(ndevs):
+                sched.add_block(fblocks[devid], devid)
+                sched.add_block(bblocks[ndevs-1-devid], devid)
+        for mid in range(nmicros // 2): # ^ shape
+            mid = mid + nmicros // 2
+            fblocks = [Block(mid, Block.BType.FW, f'f{mid}d{devid}', mem=ndevs-devid) for devid in range(ndevs-1,-1,-1)]
+            bblocks = [Block(mid, Block.BType.BW, f'b{mid}d{devid}', mem=ndevs-devid) for devid in range(ndevs)]
+            blocks = fblocks + bblocks
+            for idx in range(ndevs * 2 - 1):
+                Block.add_dependency(blocks[idx], blocks[idx+1])
+            for devid in range(ndevs):
+                sched.add_block(fblocks[ndevs-1-devid], devid)
+                sched.add_block(bblocks[devid], devid)
+        return sched
+
+    def mbart_staging(ndevs: int, nmicros: int) -> SchedulePlan:
+        """
+        f f   f         b   b b
+        f   f f         b b   b
+        f     f f     b b     b
+        f     f   f b   b     b
+        """
+        sched = SchedulePlan(ndevs)
+        for mid in range(nmicros):
+            fblocks = []
+            bblocks = []
+            for step in range(ndevs+2):
+                if step in [0, ndevs // 2 + 1]:
+                    fdevid = bdevid = tuple(range(ndevs))
+                    fblock = Block(mid, Block.BType.FW, f'fe{step}{mid}devall', mem=4)
+                    bblock = Block(mid, Block.BType.BW, f'be{step}{mid}devall', mem=4)
+                else:
+                    fdevid = bdevid = step - 1 if step < ndevs // 2 + 1 else step - 2
+                    fblock = Block(mid, Block.BType.FW, f'f{mid}dev{fdevid}', mem=1)
+                    bblock = Block(mid, Block.BType.BW, f'b{mid}dev{bdevid}', mem=1)
+                fblocks.append(fblock)
+                bblocks.append(bblock)
+                sched.add_block(fblock, fdevid)
+                sched.add_block(bblock, bdevid)
+            blocks = fblocks + bblocks[::-1]
+            for idx in range((ndevs + 2) * 2 - 1):
+                Block.add_dependency(blocks[idx], blocks[idx+1])
+        return sched
+
     ndevs = 4
     nmicros = 4
 
-    sched = uniform_staging(ndevs, nmicros)
+    # sched = uniform_staging(ndevs, nmicros)
+    # sched = chimera_staging(ndevs, nmicros)
+    sched = mbart_staging(ndevs, nmicros)  # ndev=4, nmicro=4 => solution: step=32
     sched.solve()
-            
-
