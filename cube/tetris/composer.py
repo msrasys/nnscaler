@@ -632,7 +632,7 @@ if __name__ == '__main__':
         # premise
         # micros = Composer.premise(uniform_staging, ndevs, nmicros)
         # micros = Composer.premise(chimera_staging, ndevs, nmicros)
-        micros = Composer.premise(mbart_staging, ndevs, nmicros)
+        micros = Composer.premise(uniform_staging, ndevs, nmicros)
         print('============== Premise ================')
         for idx, micro in enumerate(micros):
             print(f'microbatch #{idx}:')
