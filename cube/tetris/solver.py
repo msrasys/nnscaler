@@ -130,37 +130,44 @@ class SchedulePlan:
     def set_solution(self, solution: z3.z3.ModelRef):
         self._solution = solution
 
-    def solve(self):
+    def solve(self, decrease = True):
         global gsolver
         tic = time.time()
-        opt_step = max(len(blks) for blks in self._blocks)
+        min_step = max(len(blks) for blks in self._blocks)
         max_step = self.nblocks
+        opt_step = max_step if decrease else min_step
         while True:
-            assert opt_step <= max_step, "out of step boundary. consider this as a bug."
+            assert min_step <= opt_step and opt_step <= max_step, "out of step boundary. consider this as a bug."
             gsolver.push()
             gsolver.add(self._nsteps == opt_step)
             if gsolver.check() == sat:
-                print(f'find optimal step in {opt_step} steps')
+                print(f'find scheduling plan in {opt_step} steps')
                 solution = gsolver.model()
                 self.set_solution(solution)
                 gsolver.pop()
-                break
+                if not decrease: break
             else:
                 print(f'fail to find solution for {opt_step} steps')
                 gsolver.pop()
-                opt_step += 1
+                if decrease:
+                    opt_step += 1
+                    break
+            opt_step = opt_step - 1 if decrease else opt_step + 1
         toc = time.time()
-        print('search time: {:.2f} seconds'.format(toc-tic))
+        print('search time: {:.2f} seconds. find optimal step: {}'.format(toc-tic, opt_step))
         print('solution:')
         print(self)
 
         # search for optimal memory
         tic = time.time()
-        opt_mem = 1
+        min_mem = max(min(blk.memory for blk in blks if blk.btype == Block.BType.FW) for blks in self._blocks)
+        max_mem = max(sum(blk.memory for blk in blks if blk.btype == Block.BType.FW) for blks in self._blocks)
+        opt_mem = max_mem if decrease else min_mem
         self.set_memory()
         gsolver.push()
         gsolver.add(self._nsteps == opt_step)
         while True:
+            assert min_mem <= opt_mem and opt_mem <= max_mem, "out of memory boundary. consider this as a bug"
             gsolver.push()
             gsolver.add(self._mem == opt_mem)
             if gsolver.check() == sat:
@@ -168,18 +175,21 @@ class SchedulePlan:
                 solution = gsolver.model()
                 self.set_solution(solution)
                 gsolver.pop()
-                break
+                if not decrease: break
             else:
                 print(f'fail to find solution for memory {opt_mem}')
                 gsolver.pop()
-                opt_mem += 1
+                if decrease:
+                    opt_mem += 1
+                    break
+            opt_mem = opt_mem - 1 if decrease else opt_mem + 1
         gsolver.pop()
         toc = time.time()
-        print('search memory time: {:.2f} seconds'.format(toc-tic))
+        print('search memory time: {:.2f} seconds. opt-memory: {}'.format(toc-tic, opt_mem))
         print('solution:')
         print(self)
 
-        self.iter_space(opt_step, opt_mem)
+        # self.iter_space(opt_step, opt_mem)
 
     def iter_space(self, nsteps: int, memory: int = None):
         """
@@ -307,7 +317,7 @@ if __name__ == '__main__':
     ndevs = 4
     nmicros = 4
 
-    # sched = uniform_staging(ndevs, nmicros)
+    sched = uniform_staging(ndevs, nmicros)
     # sched = chimera_staging(ndevs, nmicros)
-    sched = mbart_staging(ndevs, nmicros)  # ndev=4, nmicro=4 => solution: step=32
+    # sched = mbart_staging(ndevs, nmicros)  # ndev=4, nmicro=4 => solution: step=32
     sched.solve()
