@@ -339,10 +339,10 @@ class Composer:
         return micros
 
     @staticmethod
-    def bfs_schedule(micros: List[MicroPlan], mem_opt=True):
+    def bfs_schedule(micros: List[MicroPlan], mem_opt=True, prune_symmetric=True):
         total_status = 1
         micros.sort(key=lambda m: m.mid)
-        block_hash = Composer.construct_hash(micros) # False # Composer.same_plans(micros, start_step=0)
+        block_hash = Composer.construct_hash(micros) if prune_symmetric else None
         step = 0
         opt_step = sum(micro.nsteps for micro in micros)  # initial
         prev: List[List[MicroPlan]] = [micros]
@@ -354,7 +354,7 @@ class Composer:
                 # get and solve conflicts
                 conflicts = SchedulePlan.conflict(micros, step)
                 # input(f'conflicts: dev: {list(conflicts.keys())}, mids: {[[conf[0].mid for conf in c] for c in conflicts.values()]} | >>>')
-                for shifts in Composer.iter_shifts(conflicts, step, prune_same_micro=True, block_hash=block_hash):
+                for shifts in Composer.iter_shifts(conflicts, block_hash=block_hash):
                     # print(f"step {step}: {shifts}")
                     shifted_micros = [micro.copy() for micro in micros]
                     for cblock in shifts:
@@ -440,8 +440,6 @@ class Composer:
 
     @staticmethod
     def iter_shifts(conflicts: Dict[int, List[Tuple[MicroPlan, Block]]],
-                    step: int,
-                    prune_same_micro = True,
                     block_hash = Union[None, Callable]) -> List[Block]:
         """
         Enumerate shifted blocks to resolve conflicts on step `step`.
@@ -475,9 +473,9 @@ class Composer:
                 else:
                     candidates = cblocks
                 
-                if prune_same_micro:
-                    if Composer.same_plans(cmicros, start_step=step):
-                        candidates = [candidates[0]]
+                # if prune_same_micro:
+                #     if Composer.same_plans(cmicros, start_step=step):
+                #         candidates = [candidates[0]]
 
                 for kblock in candidates:
                     idx = cblocks.index(kblock)
@@ -631,8 +629,8 @@ if __name__ == '__main__':
     def search(ndevs, nmicros, visualize=False):
         # premise
         # micros = Composer.premise(uniform_staging, ndevs, nmicros)
-        # micros = Composer.premise(chimera_staging, ndevs, nmicros)
-        micros = Composer.premise(uniform_staging, ndevs, nmicros)
+        micros = Composer.premise(chimera_staging, ndevs, nmicros)
+        # micros = Composer.premise(mbart_staging, ndevs, nmicros)
         print('============== Premise ================')
         for idx, micro in enumerate(micros):
             print(f'microbatch #{idx}:')
@@ -643,7 +641,7 @@ if __name__ == '__main__':
         
         # search shift
         tic = time.time()
-        schedules = Composer.bfs_schedule(micros, mem_opt=True)
+        schedules = Composer.bfs_schedule(micros, mem_opt=True, prune_symmetric=True)
         toc = time.time()
         print('search done. time {:.2f}s'.format(toc - tic))
 
@@ -652,11 +650,11 @@ if __name__ == '__main__':
         assert len(steps) == 1, f"got un-consistent step set: {steps}"
         nsteps = list(steps)[0]
         print(f'find {len(schedules)} step-optimal plans (step={nsteps})')
-        for idx, schedule in enumerate(schedules):
-            print(f'Schedule #{idx+1}:')
-            print(schedule)
-            if visualize:
-                schedule.visualize(f'planlog/plan{idx+1}.png')
+        # for idx, schedule in enumerate(schedules):
+        #     print(f'Schedule #{idx+1}:')
+        #     print(schedule)
+        #     if visualize:
+        #         schedule.visualize(f'planlog/plan{idx+1}.png')
             
 
     ndevs = 4

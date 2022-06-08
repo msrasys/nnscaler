@@ -2,7 +2,7 @@
 A solver based solution for scheduling plan
 """
 
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 from enum import Enum
 
 from z3 import *
@@ -171,7 +171,7 @@ class SchedulePlan:
             gsolver.push()
             gsolver.add(self._mem == opt_mem)
             if gsolver.check() == sat:
-                print(f'find optimal memory {opt_mem}')
+                print(f'find scheduling plan in {opt_mem} memory')
                 solution = gsolver.model()
                 self.set_solution(solution)
                 gsolver.pop()
@@ -189,7 +189,11 @@ class SchedulePlan:
         print('solution:')
         print(self)
 
-        # self.iter_space(opt_step, opt_mem)
+        tic = time.time()
+        self.iter_space(opt_step, opt_mem)
+        toc = time.time()
+        print('iterate all plans: {:.2f} seconds.'.format(toc-tic))
+
 
     def iter_space(self, nsteps: int, memory: int = None):
         """
@@ -210,7 +214,7 @@ class SchedulePlan:
                 c = d()
                 block.append(c != model[d])
             gsolver.add(Or(block))
-            if len(models) % 10 == 0:
+            if len(models) % 100 == 0:
                 print(f'find {len(models)} solutions..')
         gsolver.pop()
         print(f'find {len(models)} possible models')
@@ -317,7 +321,7 @@ if __name__ == '__main__':
     ndevs = 4
     nmicros = 4
 
-    sched = uniform_staging(ndevs, nmicros)
+    # sched = uniform_staging(ndevs, nmicros)
     # sched = chimera_staging(ndevs, nmicros)
-    # sched = mbart_staging(ndevs, nmicros)  # ndev=4, nmicro=4 => solution: step=32
-    sched.solve()
+    sched = mbart_staging(ndevs, nmicros)  # ndev=4, nmicro=4 => solution: step=32
+    sched.solve(decrease=True)
