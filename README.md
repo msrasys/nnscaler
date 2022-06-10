@@ -5,7 +5,7 @@ AI System Compiler to map a semantic (single-device) model into distributed exec
 ## Prerequisite
 
 * Python >= 3.7
-* PyTorch >= 1.9
+* PyTorch >= 1.11
 
 ## Install
 

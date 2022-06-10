@@ -240,14 +240,16 @@ class IRGraph(IRCell):
                 producers = [p for p in itensor.parent.producers if set(p.device).issubset(set(node.device))]
                 # no producer means a weight or cross device-group
                 if len(producers) == 0 or any(p not in nodes for p in producers):
-                    inputs.append(itensor)
+                    if itensor not in inputs:
+                        inputs.append(itensor)
             # update outputs
             otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
             for otensor in otensors:
                 consumers = [c for c in otensor.parent.consumers if set(c.device).issubset(set(node.device))]
                 # no consumer usually means the loss or cross device-group
                 if len(consumers) == 0 or any(c not in nodes for c in consumers):
-                    outputs.append(otensor)
+                    if otensor not in outputs:
+                        outputs.append(otensor)
         segment = IRSegment(nodes, inputs, outputs)
         return segment
 

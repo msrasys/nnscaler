@@ -187,8 +187,8 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                 span = time.time() - start
                 print('> planpass on grouping operations: {:.2f} s'.format(span))
 
-            execplan.graph.reset_dependency()
-            execplan.analyze(outfile='execplan.png')
+            # execplan.graph.reset_dependency()
+            # execplan.analyze(outfile='execplan.png')
 
             if torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()

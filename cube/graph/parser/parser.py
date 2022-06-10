@@ -8,6 +8,8 @@ from cube.ir.tensor import IRFullTensor
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.mapping import Sign2Op, DType2IRDType
 
+import warnings
+
 
 _refmodule = torch.nn.Module()
 
@@ -390,6 +392,9 @@ class ScriptModuleParser:
                 dtype=DType2IRDType.map(tensor.dtype)
             )
             if isinstance(tensor, torch.nn.Parameter):
+                ir_tensor.as_param()
+            else:
+                warnings.warn('Detected non-parameter tensor as graph attribute. Regard them as parameters')
                 ir_tensor.as_param()
             frame.add_var(var_name, ir_tensor)
         # symbolic attributes

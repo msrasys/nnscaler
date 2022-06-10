@@ -612,6 +612,7 @@ def View(signature, inputs):
                 bracket[subdim] = str(shape_map[edim])
                 # bracket[subdim] = edim + '^'
     anno = _create_anno([in_anno], [ou_anno])
+    signature = 'torch.Tensor.view'
     return IREinops(signature, [anno], [input], 'view', shape=tuple(shape))
 
 

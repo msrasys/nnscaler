@@ -129,7 +129,7 @@ class IRAdapterGener:
             cdevs.update(cnode.device)
 
         # sharing devices
-        if pdevs == cdevs:
+        if pdevs == cdevs and len(pdevs) > 1:
             return IRAdapterGener.gen_gridlayout(ftensor)
 
         # no-sharing devices

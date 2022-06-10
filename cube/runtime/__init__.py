@@ -5,3 +5,4 @@ from cube.runtime import syndata
 from cube.runtime import resource
 from cube.runtime import module
 from cube.runtime import function
+from cube.runtime import schedule
