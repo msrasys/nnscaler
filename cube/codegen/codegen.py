@@ -347,24 +347,28 @@ class ScheduleCodeGen(CodeGen):
 
         device_nodes = self.execplan.seq(device)
 
-        def refcount(tensor, node) -> int:
+        def later_ref(tensor, node) -> bool:
+            """
+            check whether the output tensor of the node need to be later used.
+            """
             idx = device_nodes.index(node)
-            refcnt = 0
+            if tensor in self.execplan.graph.outputs():
+                return True
             for ref_node in device_nodes[idx+1:]:
                 if isinstance(ref_node, IRSegment):
                     if ref_node.forward:
                         if tensor in ref_node.inputs():
-                            refcnt += 1
+                            return True
                     else:
                         finputs = ref_node.mirror.inputs()
                         foutputs = ref_node.mirror.outputs()
                         grad_in = [t.grad for t in foutputs]
                         if tensor in finputs + foutputs + grad_in:
-                            refcnt += 1
+                            return True
                 else:
                     if tensor in ref_node.inputs():
-                        refcnt += 1
-            return refcnt
+                        return True
+            return False
 
         with FunctionBlock(func_name='_train_step', 
                            args=['model', 'dataloader']) as fb:
@@ -383,7 +387,7 @@ class ScheduleCodeGen(CodeGen):
                     # free unused tensor
                     for tensor in node.inputs() + node.outputs():
                         if isinstance(tensor, IRSubTensor) and not tensor.is_param():
-                            refcnt = refcount(tensor, node)
+                            refcnt = later_ref(tensor, node)
                             if refcnt == 0:
                                 self.vars.free(tensor)
             # return code

@@ -65,6 +65,13 @@ def _create_anno(ins: List[List[Union[str, List[str]]]],
     return ', '.join(in_annos) + ' -> ' + ', '.join(ou_annos)
 
 
+def Identity(signature, inputs):
+    signature = 'cube.runtime.function.identity'
+    eshape = _create_eshape(inputs[0].shape)
+    anno = _create_anno([eshape], [eshape])
+    return IREinops(signature, [anno], inputs, 'identity')
+
+
 def Linear(signature, inputs):
     if signature == 'torch.linear':
         import warnings

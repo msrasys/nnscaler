@@ -245,6 +245,8 @@ class IRGraph(IRCell):
             # update outputs
             otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
             for otensor in otensors:
+                if otensor in self.outputs():
+                    outputs.append(otensor)
                 consumers = [c for c in otensor.parent.consumers if set(c.device).issubset(set(node.device))]
                 # no consumer usually means the loss or cross device-group
                 if len(consumers) == 0 or any(c not in nodes for c in consumers):

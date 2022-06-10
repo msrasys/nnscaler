@@ -40,6 +40,7 @@ class IRAdapterGener:
                 graph.attach(node, idx)
         graph = IRAdapterGener.gen_activation(graph)
         graph = IRAdapterGener.gen_weight(graph)
+        # TODO: generate adapter for graph outputs
         return graph
 
     @staticmethod
@@ -129,7 +130,10 @@ class IRAdapterGener:
             cdevs.update(cnode.device)
 
         # sharing devices
-        if pdevs == cdevs and len(pdevs) > 1:
+        if pdevs == cdevs and len(pdevs) > 1 and \
+           len(pdevs) == len(ftensor.producers) and \
+           len(cdevs) == len(ftensor.consumers):
+            # TODO: enable tensor fusion of tensors on same device
             return IRAdapterGener.gen_gridlayout(ftensor)
 
         # no-sharing devices
@@ -205,7 +209,7 @@ class IRAdapterGener:
         # generate backward
         grad: IRFullTensor = ftensor.grad
         bprims = []
-        if grad is not None:
+        if grad is not None and (len(grad.ptensors) != 0 or len(grad.ctensors) != 0):
             # reorder ptensors to match with forward
             ptensors = [None] * len(devs)
             for ptensor in grad.ptensors:
