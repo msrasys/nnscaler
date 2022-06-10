@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from cube.runtime.syndata import SciLoopVariables
+from examples.wrf.policy.naive import PAS
 
 torch.set_default_tensor_type(torch.DoubleTensor)
 
@@ -454,7 +455,7 @@ if __name__ == "__main__":
     varloader = SciLoopVariables(variables=[U, V, W, O, Theta, phi1, mu1], constants=[])
     model = cube.SemanticModel(wrf, input_shapes=tuple(varloader.shapes))
 
-    @cube.compile(model=model, dataloader=varloader)
+    @cube.compile(model=model, dataloader=varloader, PAS=PAS)
     def train_iter(model, dataloader):
         U, V, W, O, Theta, phi1, mu1 = next(dataloader)
         U, V, W, O, Theta, phi1, mu1 = model(U, V, W, O, Theta, phi1, mu1)
