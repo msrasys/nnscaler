@@ -11,10 +11,13 @@ class Frame:
         # var name -> value (IRTesnor, deterministic)
         self._vars: List[dict[str, Any]] = list()
         self._var_stack: List[str] = list()
+        # module attributes
+        self._attributes: List[dict[str, Any]] = list()
 
-    def push(self, inherit_from_top=False):
+    def push_var(self, inherit_from_top=False):
         """
-        This should only be called when step in a module
+        Push a new variable frame as current variable frame.
+        This should only be called when stepping in a module or method.
 
         Args:
             inherit_from_top (bool): 
@@ -28,9 +31,10 @@ class Frame:
         else:
             self._vars.append(OrderedDict())
 
-    def pop(self):
+    def pop_var(self):
         """
-        This should only be called step out a module
+        Pop the current variable frame.
+        This should only be called when steping out a module or method.
         """
         if len(self._vars) == 0:
             raise RuntimeError("Try to pop stack with 0 depth")
@@ -44,14 +48,10 @@ class Frame:
             var_name (str): variable name (unique)
             val: variable content
             graph_arg (int):
-                indicate whether it is an argument of the graph.
-
-                If == -1, is not a graph arg.
-
-                If >= 0, is a graph arg, will try to find val from previous frame,
-                by associating the names of the formal parameters of the callee function
-                and the names of the arguments passed-in. 
-                (then look up the values of the arguments in the previous frame)
+                indicate whether it is an argument of the graph. -1 indicates not an argument.
+                If >= 0, is a graph arg, will try to find val from variable stack,
+                and link the name of the argument name from the callee function
+                to the names of the argument passed-in.
         """
         if not isinstance(var_name, str):
             raise RuntimeError("Expected var_name is str")
@@ -89,6 +89,42 @@ class Frame:
         if var_name in self._vars[-1]:
             return self._vars[-1][var_name]
         raise KeyError(f"Cannot find var name {var_name}")
+
+    def push_attr(self):
+        """
+        Push a new module attribut frame as current frame.
+        This should only be called when stepping in the graph.
+        """
+        self._attributes.append(OrderedDict())
+
+    def pop_attr(self):
+        """
+        Pop the current module attribute frame.
+        This should only be called when stepping out the graph.
+        """
+        self._attributes.pop()
+
+    def add_attr(self, name: str, val: Any):
+        """
+        Add module attribute <name: val>
+        """
+        if name in self._attributes[-1]:
+            raise KeyError("Try to add an already existed attributed")
+        self._attributes[-1][name] = val
+
+    def get_attr(self, name: str) -> Any:
+        """
+        Get module attribute by name
+        """
+        if name not in self._attributes[-1]:
+            raise KeyError(f"Cannot find var name {name}")
+        return self._attributes[-1][name]
+
+    def has_attr(self, name: str) -> bool:
+        """
+        Return if `name` exists in current attributes
+        """
+        return name in self._attributes[-1]
 
     def push_param(self, var_name):
         """

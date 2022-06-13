@@ -43,7 +43,8 @@ class ScriptModuleParser:
         The overall entry to parse a torchscript graph module
         """
         frame = frame if frame is not None else Frame()
-        frame.push()
+        frame.push_var()
+        frame.push_attr()
 
         inputs = list(module.graph.inputs())[1:]
         if input_shapes is not None and len(input_shapes) != len(inputs):
@@ -92,7 +93,8 @@ class ScriptModuleParser:
                 outputs.append(val)
         output_val = outputs
 
-        frame.pop()
+        frame.pop_var()
+        frame.pop_attr()
         return input_val, all_ir_nodes, output_val
 
     @staticmethod
@@ -100,7 +102,7 @@ class ScriptModuleParser:
         """
         Parse module method
         """
-        frame.push()
+        frame.push_var()
 
         input_var_name = [input.debugName() for input in method.graph.inputs()]
         kDefaultType = DType2IRDType.map(torch.get_default_dtype())
@@ -132,7 +134,7 @@ class ScriptModuleParser:
         output_var_name = [output.debugName() for output in method.graph.outputs()]
         output_val = [frame.get_var(var_name) for var_name in output_var_name]
 
-        frame.pop()
+        frame.pop_var()
         return input_val, all_ir_nodes, output_val
 
     @staticmethod
@@ -357,7 +359,7 @@ class ScriptModuleParser:
         return ir_nodes
 
     @staticmethod
-    def parse_prim_attr_node(node, module, frame) -> List[None]:
+    def parse_prim_attr_node(node, module, frame: Frame) -> List[None]:
         """
         Parse script module node like:
             %2 :__torch__.torch.nn.modules.linear.___torch_mangle_0.Linear = prim::GetAttr[name="linear1"](%self)
@@ -386,16 +388,20 @@ class ScriptModuleParser:
         if dtype == 'Tensor':
             tensor = getattr(module, label)
             shape = list(tensor.shape)
-            ir_tensor = IRFullTensor(
-                name=label, shape=shape,
-                requires_grad=tensor.requires_grad,
-                dtype=DType2IRDType.map(tensor.dtype)
-            )
-            if isinstance(tensor, torch.nn.Parameter):
-                ir_tensor.as_param()
+            if frame.has_attr(label):
+                ir_tensor = frame.get_attr(label)
             else:
-                warnings.warn('Detected non-parameter tensor as graph attribute. Regard them as parameters')
-                ir_tensor.as_param()
+                ir_tensor = IRFullTensor(
+                    name=label, shape=shape,
+                    requires_grad=tensor.requires_grad,
+                    dtype=DType2IRDType.map(tensor.dtype)
+                )
+                if isinstance(tensor, torch.nn.Parameter):
+                    ir_tensor.as_param()
+                else:
+                    warnings.warn('Detected non-parameter tensor as graph attribute. Regard them as parameters')
+                    ir_tensor.as_param()
+                frame.add_attr(label, ir_tensor)
             frame.add_var(var_name, ir_tensor)
         # symbolic attributes
         elif dtype in ['bool', 'int', 'float']:
@@ -457,7 +463,7 @@ class ScriptModuleParser:
         raise NotImplementedError("Dynamic Graph is not supported yet")
 
     @staticmethod
-    def parse_prim_loop_node(node, module, frame) -> List[IRFwOperation]:
+    def parse_prim_loop_node(node, module, frame: Frame) -> List[IRFwOperation]:
         """
         Inputs:
             %max_iter_count : int
@@ -522,7 +528,7 @@ class ScriptModuleParser:
             # Defensively we don't let variables defined in the Loop body subgraph pollute the outer graph.
             # So we'd better duplicate all existing variables into a new frame (namely 'inherit_from_top'), 
             # and clean up this new frame after the interpretation of the whole loop execution.
-            frame.push(inherit_from_top=True)
+            frame.push_var(inherit_from_top=True)
 
             frame.add_var(iter_step_var.debugName(), step)
 
@@ -563,7 +569,7 @@ class ScriptModuleParser:
             loop_carried_vals = step_result_vals[1:]
             step += 1
 
-            frame.pop()
+            frame.pop_var()
 
             if not isinstance(condition, bool):
                 raise RuntimeError(f"At the {step}-th step the condition is not evaluated to a constant bool")
