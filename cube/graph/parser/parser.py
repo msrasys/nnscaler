@@ -340,13 +340,18 @@ class ScriptModuleParser:
             frame.push_param(var_name)
 
         # recursively parse the module
-        if node.inputsAt(0).debugName() == 'self':
+        self_module = node.inputsAt(0).debugName() == 'self'
+        if self_module:
             call_module = module
         else:
             call_module = getattr(module, node.inputsAt(0).debugName())
+            frame.push_attr()
 
         call_method = getattr(call_module, label)
         _, ir_nodes, outputs_val = ScriptModuleParser.parse_module_method(call_module, call_method, frame=frame)
+
+        if not self_module:
+            frame.pop_attr()
 
         # pop out the frame
         frame.pop_param(times=len(inputs)-1)
