@@ -463,19 +463,24 @@ class IRFullTensor(IRTensor):
         return copy.copy(self._segments)
 
     @property
-    def grad(self) -> Optional[IRTensor]:
+    def grad(self) -> Optional[Union[IRTensor, float]]:
         return self._grad
 
     @grad.setter
-    def grad(self, val: Optional[IRTensor]):
-        assert isinstance(val, IRFullTensor) or val is None, f"grad can only be IRFullTensor or None, but got {val}"
+    def grad(self, val: Optional[Union[IRTensor, float]]):
+        """
+        int indicates the tensor is the loss tensor.
+        """
+        assert isinstance(val, (IRFullTensor, float)) or val is None, f"grad can only be IRFullTensor or None, but got {val}"
         self._grad = val
         if val is None:
             self._requires_grad = False
-            for t in self.producers + self.consumers:
+            for t in self.ptensors + self.ctensors:
                 t.grad = None
-        else:
+        elif isinstance(val, IRFullTensor):
             assert val.shape == self.shape, f"IRFullTensor gradient shape mismatch."
+            self._requires_grad = True
+        else:
             self._requires_grad = True
 
     @property
@@ -486,9 +491,9 @@ class IRFullTensor(IRTensor):
     def requires_grad(self, val: bool):
         self._requires_grad = val
         if val and self.grad is None:
-            self._grad = IRFullTensor(self.shape, 'g' + self.name, False).as_grad()
+            self.grad = IRFullTensor(self.shape, 'g' + self.name, False).as_grad()
         elif not val and self.grad is not None:
-            self._grad = None
+            self.grad = None
 
     def as_param(self):
         """
@@ -628,17 +633,19 @@ class IRSubTensor(IRTensor):
         self._valmap = _to_value_map(valmap)
 
     @property
-    def grad(self) -> Optional[IRTensor]:
+    def grad(self) -> Optional[Union[IRTensor, float]]:
         return self._grad
 
     @grad.setter
-    def grad(self, val: Optional[IRTensor]):
-        assert isinstance(val, IRSubTensor) or val is None, f"grad can only be IRFullTensor or None, but got {val}"
+    def grad(self, val: Optional[Union[IRTensor, float]]):
+        assert isinstance(val, (IRSubTensor, float)) or val is None, f"grad can only be IRFullTensor or None, but got {val}"
         self._grad = val
         if val is None:
             self._requires_grad = False
-        else:
+        elif isinstance(val, IRSubTensor):
             assert val.shape == self.shape, f"IRFullTensor gradient shape mismatch."
+            self._requires_grad = True
+        else:
             self._requires_grad = True
 
     def __eq__(self, other):
@@ -692,10 +699,10 @@ class IRSubTensor(IRTensor):
         Get gradient of this tensor which is associated by a
         forward cell
         """
-        if self.parent.grad is None:
-            self.grad = None
-            return None
         full_grad = self.parent.grad
+        if full_grad is None or isinstance(full_grad, float):
+            self.grad = full_grad
+            return full_grad
         if self in fcell.inputs():
             ref_cell_ids = list()
             for dst_cell in self.parent.consumers:

@@ -424,7 +424,7 @@ class ScheduleCodeGen(CodeGen):
         
         inputs = [self.tensor_naming(t) for t in node.inputs() if not t.is_param()]
         outputs = [self.tensor_naming(t) for t in node.outputs()]
-        req_grad = any(t.requires_grad is not None for t in outputs if isinstance(t, IRTensor))
+        req_grad = any(t.requires_grad for t in node.outputs() if isinstance(t, IRTensor))
         inputs = self.tuple_naming(inputs)
         outputs = self.return_naming(outputs)
 
@@ -438,6 +438,10 @@ class ScheduleCodeGen(CodeGen):
                 finputs = [t for t in node.mirror.inputs() if t.requires_grad]
                 foutputs = node.mirror.outputs()
                 inputs = [t.grad for t in foutputs]
+                for idx, itensor in enumerate(inputs):
+                    if isinstance(itensor, float):
+                        assert itensor == 1.0, "Loss gradient should be 1.0"
+                        inputs[idx] = None
                 outputs = [t.grad for t in finputs]
                 # remove weight gradient in outputs
                 for input in finputs:
@@ -464,7 +468,7 @@ class ScheduleCodeGen(CodeGen):
             code = f'{outputs} = {body}'
 
         elif isinstance(node, IRWeightReducer):
-            body = fsign.format(model=f'model.{name}', inputs='()')
+            body = fsign.format(model=f'model.{name}', inputs='()', req_grad=req_grad)
             code = f'{outputs} = {body}'
 
         else:

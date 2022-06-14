@@ -1,4 +1,4 @@
-from cube.ir.operator import IRFwOperation, IRDataOperation
+from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from cube.ir.cten import IRCell
 from cube.ir.tensor import IRFullTensor, IRSubTensor
 
@@ -19,17 +19,17 @@ class LogicTranslator:
         """
         nodes = SchedulePool().nodes()
         graph = IRGraph(nodes, inputs=[], outputs=outputs, module_name='LogicGraph')
+        has_bp = any(n for n in graph.nodes() if isinstance(n, IRBpOperation))
+        if has_bp:
+            assert (fnode.mirror in graph.nodes() for node in graph.nodes() if isinstance(node, IRFwOperation)), \
+                "Training requires all nodes have backward."
+            return graph
         # remove backward nodes if no backward is called
         fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
         for fnode in fnodes:
-            if fnode.mirror not in graph.nodes():
-                IRCell.make_pair(fnode, None)
-                for itensor in fnode.inputs():
-                    if isinstance(itensor, IRSubTensor):
-                        itensor.grad = None
-                for otensor in fnode.outputs():
-                    if isinstance(otensor, IRSubTensor):
-                        otensor.parent.grad = None
+            IRCell.make_pair(fnode, None)
+        for ftensor in graph.full_tensors():
+            ftensor.requires_grad = False
         return graph
 
     @staticmethod
@@ -83,11 +83,11 @@ class LogicTranslator:
         if loss.nelement() != 1:
             raise RuntimeError("backward can only perform on the scaler tensor")
         # grad should be None or 1.0
-        loss.parent._grad = None
-        for node in trace:
-            for output in node.outputs():
-                if loss.overlap(output):
-                    node.mirror.update()
+        loss.parent.grad = 1.0
+        for node in loss.parent.producers:
+            for otensor in node.outputs():
+                if isinstance(otensor, IRSubTensor) and otensor.overlap(loss):
+                    loss.grad = loss.parent.grad
         for node in trace[::-1]:
             SchedulePool().add_node(node.mirror)
 
