@@ -88,11 +88,11 @@ class IRAdapter(IRCell):
         # get inputs
         inputs = []
         for itensor in self.inputs():
-            if devid in itensor.device:
+            if devid in itensor.device and itensor not in inputs:
                 inputs.append(itensor) 
         outputs = []
         for otensor in self.outputs():
-            if devid in otensor.device:
+            if devid in otensor.device and otensor not in outputs:
                 outputs.append(otensor)
         # insert identity prims
         if len(prims) == 0:

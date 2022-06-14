@@ -108,9 +108,9 @@ class IRAdapterGener:
                 idx = min([graph.nodes().index(c) for c in ftensor.consumers])
                 graph._nodes.insert(idx, fadapter)
                 # insert backward adapter
-                grad: Optional[IRFullTensor] = ftensor.grad
-                if grad is not None: 
-                    badapter: IRAdapter = fadapter.mirror
+                badapter: IRAdapter = fadapter.mirror
+                if badapter is not None:
+                    grad: Optional[IRFullTensor] = ftensor.grad
                     idx = min([graph.nodes().index(c) for c in grad.consumers])
                     graph._nodes.insert(idx, badapter)
         return graph
@@ -149,7 +149,8 @@ class IRAdapterGener:
         fadapter = IRAdapter(ftensor.ptensors, ftensor.ctensors)
         fadapter.prims = fprims
         grad: IRFullTensor = ftensor.grad
-        if grad is not None:
+        # TODO: understand why grad cannot be None in inference-only
+        if grad is not None and (len(grad.ptensors) != 0 or len(grad.ctensors) != 0):
             for subtensor in grad.ctensors:
                 bprims += IRAdapterGener.gen_subtensor(subtensor)
             badapter = IRAdapter(grad.ptensors, grad.ctensors)
@@ -246,6 +247,16 @@ class IRAdapterGener:
         # category to local tensor and remote tensor
         local = [t for t in ftensor.ptensors if t.device == subtensor.device]
         remote = [t for t in ftensor.ptensors if t.device != subtensor.device]
+        # consumers before this consumer can also be considered as input
+        cidx = ftensor.consumers.index(subtensor._cell)
+        for ctensor in ftensor.ctensors[:cidx]:
+            if subtensor.device == ctensor.device:
+                if ctensor not in local:
+                    local.append(ctensor)
+            # TODO: also consider consumers on other devices
+            # else:
+            #     if ctensor not in remote:
+            #         remote.append(ctensor)
         prims = []
 
         # ==== select ==== #
@@ -254,7 +265,7 @@ class IRAdapterGener:
         for tensor in local:
             common = tensor.common(subtensor)
             if tensor == subtensor:
-                return prims
+                return []
             elif common == subtensor:
                 indmap = []
                 for islicer, oslicer in zip(tensor.indmap.get(), common.indmap.get()):
@@ -339,7 +350,7 @@ class IRAdapterGener:
                                     indmap.append(None)
                             else:
                                 indmap.append(s1)
-                        if None in indmap:
+                        if None in indmap or len(cat_dim) > 1:
                             continue
                         indmap = IndexMap(tuple(indmap))
                         valmap = t1.valmap
