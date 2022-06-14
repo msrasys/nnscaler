@@ -419,18 +419,19 @@ class ScheduleCodeGen(CodeGen):
         """
         Emit node / subgraph code
         """
-        fsign = 'cube.runtime.executor.fexecute({model}, *{inputs})'
+        fsign = 'cube.runtime.executor.fexecute({model}, *{inputs}, requires_grad={req_grad})'
         bsign = 'cube.runtime.executor.backward({input_tensors}, {output_tensors}, {output_grads})'
         
         inputs = [self.tensor_naming(t) for t in node.inputs() if not t.is_param()]
         outputs = [self.tensor_naming(t) for t in node.outputs()]
+        req_grad = any(t.requires_grad is not None for t in outputs if isinstance(t, IRTensor))
         inputs = self.tuple_naming(inputs)
         outputs = self.return_naming(outputs)
 
         if isinstance(node, IRSegment):
             # emit forward
             if node.forward:
-                body = fsign.format(model=f'model.{name}', inputs=inputs)
+                body = fsign.format(model=f'model.{name}', inputs=inputs, req_grad=req_grad)
                 code = f'{outputs} = {body}'
             # emit backward
             else:
@@ -459,7 +460,7 @@ class ScheduleCodeGen(CodeGen):
             code = f'{outputs} = next(dataloader)'
 
         elif isinstance(node, IRAdapter):
-            body = fsign.format(model=f'model.{name}', inputs=inputs)
+            body = fsign.format(model=f'model.{name}', inputs=inputs, req_grad=req_grad)
             code = f'{outputs} = {body}'
 
         elif isinstance(node, IRWeightReducer):

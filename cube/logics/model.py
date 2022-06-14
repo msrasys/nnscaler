@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, List
 import copy
 
 from cube.graph.graph import IRGraph
@@ -47,49 +47,32 @@ class _TensorGener:
                 raise TypeError("Tensor only allows to be SubTensor")
 
 
-def forward(graph, *args) -> IRGraph:
+def forward(graph: IRGraph, *args) -> IRGraph:
     """
     Forward the IRGraph, replacing all the intermediate tensors
     """
     if not isinstance(graph, IRGraph):
-        raise TypeError("Forwarding requires IRGraph")
-    
-    gener = _TensorGener()
-
-    for input, arg in zip(graph.inputs(), args):
-        gener.set_map(input, arg)
-
-    fnodes = list()
-
-    # generate forward nodes
-    for fnode in graph.nodes():
-        fidx = graph.detach(fnode)
-        inputs = fnode.inputs()
-        outputs = fnode.outputs()
-        # fnode = copy.copy(fnode)
-        fnode : IRFwOperation = fnode
-        fnode._inputs = inputs
-        fnode._outputs = outputs
-        # set forward inputs
-        for idx, val in enumerate(inputs):
-            fnode.set_input(idx, gener.renew(val))
-        # set forward outputs
-        for idx, val in enumerate(outputs):
-            fnode.set_output(idx, gener.renew(val))
-        graph.attach(fnode, fidx)
-        fnodes.append(fnode)
-
-    # reverse is only to make op id looks consecutive
-    for fnode in graph.nodes()[::-1]:
+        raise TypeError("Requires IRGraph for forward")
+    # align graph with input tensors
+    itensors: List[IRSubTensor] = graph.inputs()
+    for idx, (itensor, arg) in enumerate(zip(itensors, args)):
+        graph.set_input(idx, arg)
+        for producer in copy.copy(itensor.parent.producers):
+            pidx = graph.detach(producer)
+            while itensor in producer.outputs():
+                oidx = producer.outputs().index(itensor)
+                producer.set_output(oidx, arg)
+            graph.attach(producer, pidx)
+        for consumer in copy.copy(itensor.parent.consumers):
+            cidx = graph.detach(consumer)
+            while itensor in consumer.inputs():
+                iidx = consumer.inputs().index(itensor)
+                consumer.set_input(iidx, arg)
+            graph.attach(consumer, cidx)
+        while itensor in graph.outputs():
+            oidx = graph.outputs().index(itensor)
+            graph.set_output(oidx, arg)
+    # generate backward reverse is only to make op id looks consecutive
+    for fnode in [n for n in graph.nodes() if isinstance(n, IRFwOperation)][::-1]:
         fnode.gen_backward()
-    
-    inputs = [gener.renew(input) for input in graph.inputs()]
-    outputs = [gener.renew(output) for output in graph.outputs()]
-
-    for idx, input in enumerate(inputs):
-        graph.set_input(idx, input)
-    for idx, output in enumerate(outputs):
-        graph.set_output(idx, output)
-
-    # fgraph = IRGraph(fnodes, inputs, outputs, graph.name)
     return graph

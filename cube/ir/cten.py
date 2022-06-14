@@ -14,7 +14,7 @@ If an IRTensor is the output of Cell, then Cell.device == IRTensor.device
 """
 
 
-from typing import List, Union, Optional, Any
+from typing import List, Tuple, Union, Optional, Any
 import copy
 
 from cube.ir.unique import IDGenerator
@@ -406,7 +406,7 @@ class IRTensor:
     def __init__(self, shape=None, name='tensor', dtype=IRDType.unknown, tid=None):
 
         self._id: int = tid if isinstance(tid, int) else IDGenerator().gen_tensor_id()
-        self._shape: Optional(List[int]) = shape
+        self._shape: Optional(List[int]) = () if shape is None else tuple(shape)
         self.name = name if name else 'tensor'
 
         # device
@@ -471,18 +471,6 @@ class IRTensor:
         raise RuntimeError(
             "tensor placement is not allowed to set manually"
         )
-
-    @property
-    def requires_grad(self):
-        return self._requires_grad
-
-    @requires_grad.setter
-    def requires_grad(self, requires: bool):
-        if not isinstance(requires, bool):
-            raise TypeError("Expected bool")
-        self._requires_grad = requires
-        if not requires:
-            self.grad = None
 
     def as_param(self):
         """
@@ -564,23 +552,16 @@ class IRTensor:
         return self._id == tensor._id
 
     @property
-    def shape(self):
-        if self._shape is None:
-            return []
-        return copy.copy(self._shape)
+    def shape(self) -> Tuple[int]:
+        return list(self._shape)
 
     @shape.setter
-    def shape(self, val):
-        if self._shape is not None and self._shape != val:
-            raise RuntimeError("Try to change shape")
-        if not isinstance(val, list) or \
-           not all([isinstance(size, int) for size in val]):
-            raise RuntimeError("Expected shape to be list[int]")
-        self._shape = copy.copy(list(val))
+    def shape(self, val: Tuple[int]):
+        self._shape = tuple(val)
         if self.grad is not None:
-            self.grad.shape = copy.copy(list(val))
+            self.grad.shape = tuple(val)
 
-    def nele(self) -> int:
+    def nelement(self) -> int:
         """
         Get total number of element in the tensor.
         """

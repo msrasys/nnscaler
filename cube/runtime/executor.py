@@ -6,11 +6,15 @@ from typing import Tuple, Any, Callable, List
 import torch
 
 
-def fexecute(subgraph: Callable, *input_tensors: Tuple[Any]):
+def fexecute(subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
     """
     forward the sub-graph.
     """
-    outputs = subgraph(*input_tensors)
+    if not requires_grad:
+        with torch.no_grad():
+            outputs = subgraph(*input_tensors)
+    else:
+        outputs = subgraph(*input_tensors)
     # print('forwarding... ')
     return outputs
 

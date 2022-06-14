@@ -20,19 +20,16 @@ class LogicTranslator:
         nodes = SchedulePool().nodes()
         graph = IRGraph(nodes, inputs=[], outputs=outputs, module_name='LogicGraph')
         # remove backward nodes if no backward is called
-        for node in graph.nodes():
-            if isinstance(node, IRFwOperation):
-                bnode = node.mirror
-                if bnode not in graph.nodes():
-                    IRCell.make_pair(node, None)
-                    for input in node.inputs():
-                        if isinstance(input, IRSubTensor):
-                            input.grad = None
-                            input.requires_grad = False
-                    for output in node.outputs():
-                        if isinstance(output, IRSubTensor):
-                            output.grad = None
-                            output.requires_grad = False
+        fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
+        for fnode in fnodes:
+            if fnode.mirror not in graph.nodes():
+                IRCell.make_pair(fnode, None)
+                for itensor in fnode.inputs():
+                    if isinstance(itensor, IRSubTensor):
+                        itensor.grad = None
+                for otensor in fnode.outputs():
+                    if isinstance(otensor, IRSubTensor):
+                        otensor.parent.grad = None
         return graph
 
     @staticmethod
@@ -83,10 +80,10 @@ class LogicTranslator:
         trace = SchedulePool().get_tape(loss)
         if trace is None:
             raise RuntimeError("No forward detected")
-        if not loss.shape == [1]:
+        if loss.nelement() != 1:
             raise RuntimeError("backward can only perform on the scaler tensor")
         # grad should be None or 1.0
-        loss.parent.requires_grad = False
+        loss.parent._grad = None
         for node in trace:
             for output in node.outputs():
                 if loss.overlap(output):
