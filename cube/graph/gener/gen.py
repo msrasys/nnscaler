@@ -343,7 +343,7 @@ class IRAdapterGener:
                                     if s1.start < s2.start:
                                         cat_dim[dim] = [t1, t2]
                                     else:
-                                        cat_dim[dim] = [t1, t2]
+                                        cat_dim[dim] = [t2, t1]
                                     indmap.append(slice(min(s1.start, s2.start), max(s1.stop, s2.stop), 1))
                                 else:
                                     cat_dim[dim] = None
