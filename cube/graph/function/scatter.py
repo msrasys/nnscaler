@@ -57,4 +57,3 @@ class IRSelectScatter(IRFwOperation):
         self.outputs(0).shape = s2
         return True
 
-

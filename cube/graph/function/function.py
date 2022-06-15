@@ -1,7 +1,8 @@
 from typing import Any, Iterable, List, Optional, Tuple, Union, Dict
 import string
 import copy
-import numpy
+import torch
+import warnings
 
 from cube.ir.cten import IRTensor
 from cube.graph.function.einops import EinDim, IREinops
@@ -15,6 +16,8 @@ from cube.graph.function.creators import IRToTensor, IRZeros
 from cube.graph.function.select import IRSelect, IRSlice
 from cube.graph.function.scatter import IRSelectScatter
 from cube.graph.function.repeat import IRRepeat
+from cube.ir.dtype import IRDType
+from cube.graph.torch_dtype_mapping import DType2IRDType, TorchScalarTypeEnumMap
 
 
 def _create_eshape(shape: List[int], iterator: Optional[Iterable] = None,
@@ -101,17 +104,21 @@ def Zeros(signature,
     # REMARK: in the PyTorch-internal operator definition expression, an asterisk ("*") is merely a marker of
     #         the beginning of the sublist of _keyword arguments_, and does not result in an actual argument.
 
-    shape, dtype, layout, _erased_device, pin_memory = inputs
+    size, dtype, layout, _erased_device, pin_memory = inputs
 
     # TODO parameters to support, currently they are all None
     assert dtype is None
     assert layout is None
     assert pin_memory is None
 
-    for dim, i in enumerate(shape):
+    ir_dtype : Optional[IRDType] = None
+    if dtype is not None:
+        ir_dtype = DType2IRDType.map(dtype)
+
+    for dim, i in enumerate(size):
         if not isinstance(dim, int) and not dim >= 0:
-            raise RuntimeWarning(f"The {i}-th component of the shape must be non-negative integer")
-    return IRZeros(signature, shape, 'zeros')
+            raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
+    return IRZeros(signature, size, 'zeros', ir_dtype)
 
 
 def NewTensor(signature, 
@@ -127,22 +134,58 @@ def NewTensor(signature,
     assert dtype is None
     assert requires_grad == False
 
-    arr = numpy.array(data)
+    ir_dtype : Optional[IRDType] = None
+    if dtype is not None:
+        ir_dtype = DType2IRDType.map(dtype)
 
-    # ints or floats of any precision, e.g. i8, i64, f16, f32
-    # and the specified array is regular/non-ragged.
-    # Otherwise NumPy would decide the element type as _o_bject.
-    if not arr.dtype.kind in ['i','f']:
-        raise RuntimeError("The specified data to create new tensor must be ints or floats")
+    # if 'data' is not:
+    # 1) ints or floats of any precision, e.g. i8, i64, f16, f32
+    # 2) non-ragged
+    # ... then this call will throw.
+    arr = torch.tensor(data, dtype=dtype)
 
     # TODO temporarily fake creation with Zeros
+    # and remark that originally aten::tensor should be able to infer the dtype from the specified 'data',
+    # but since we have omitted the 'data', we must do type inferrence ourselves,
+    # only in this way we get correct dtype e.g. ints or bools.
     shape = list(arr.shape)
-    return IRZeros(signature, shape, 'tensor')
+    torch_inferred_dtype = arr.dtype
+    ir_dtype = DType2IRDType.map(torch_inferred_dtype)
+    signature = 'torch.zeros'
+    return IRZeros(signature, shape, 'tensor', ir_dtype=ir_dtype)
 
 def ToTensor(signature,
              inputs: Tuple[ IRTensor, ... ]):
-    tensors = inputs[0:1]
-    return IRToTensor(signature, tensors, 'to')
+    """
+    'aten::to' has many overloadings that need resolution,
+    they differ by both the arity and the type of the argument (possibly at the same position):
+
+    ```
+    aten::to.device(Tensor self, Device device, int dtype, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor):
+    aten::to.dtype(Tensor self, int dtype, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor):
+    aten::to.dtype_layout(Tensor self, *, int dtype, int layout, Device device, bool pin_memory=False, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor):
+    aten::to.other(Tensor self, Tensor other, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor):
+    aten::to.prim_Device(Tensor(a) self, Device? device, int? dtype=None, bool non_blocking=False, bool copy=False) -> (Tensor(b|a)):
+    aten::to.prim_dtype(Tensor(a) self, int? dtype=None, bool non_blocking=False, bool copy=False) -> (Tensor(b|a)):
+    aten::to.prim_other(Tensor(a) self, bool non_blocking=False, bool copy=False) -> (Tensor(b|a)):
+    ```
+    ... where the 'int? dtype' is the underlying type for the enum 'ScalarType'.
+    """
+
+    # in our case we only care the overloading 'to.dtype' (arity=5)
+    assert len(inputs) == 5
+    tensor : IRTensor
+    dtype_underlying : int
+    non_blocking : bool
+    copy : bool
+    opt_memory_format : Optional[int]
+    tensor, dtype_underlying, non_blocking, copy, opt_memory_format = inputs
+
+    dtype : torch.dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
+    ir_dtype : IRDType = DType2IRDType.map(dtype)
+    
+    signature = 'torch.Tensor.to'
+    return IRToTensor(signature, [tensor], 'to', ir_dtype=ir_dtype)
 
 def Add(signature, inputs):
     if len(inputs) == 2:
@@ -510,7 +553,7 @@ def Transpose(signature, inputs):
 
 def View(signature, inputs):
     """
-    out = torch.Tensor.view(tensor: torch.Tensor, shape: List[int])
+    out = torch.Tensor.view(tensor: torch.Tensor, size: List[int])
     """
     assert len(inputs) == 2
     input, shape = inputs
@@ -620,10 +663,19 @@ def View(signature, inputs):
                 # bracket[subdim] = edim + '^'
     anno = _create_anno([in_anno], [ou_anno])
     signature = 'torch.Tensor.view'
-    return IREinops(signature, [anno], [input], 'view', shape=tuple(shape))
+    return IREinops(signature, [anno], [input], 'view', size=tuple(shape))
 
 
 def Reshape(signature, inputs):
+    """
+    torch.reshape(Tensor self, int[] shape) -> Tensor
+    """
+
+    warnings.warn("""
+    'torch.reshape' is currently dispatched to 'torch.Tensor.view',
+    but 'reshape' has keyword parameter 'shape' while 'view' has 'size'.
+    ArgumentMissing error may be raised during codegen.""")
+
     return View(signature, inputs)
 
 
@@ -754,6 +806,10 @@ def Repeat(signature, inputs:Tuple[IRTensor, List[int]]):
     torch.repeat(tensor:Tensor, repeats: List[int]) -> Tensor
     """
     tensor, repeats = inputs
+
+    assert signature == 'torch.repeat' # this is the API in TorchScript
+    signature = 'torch.Tensor.repeat'  # this is the API in Python frontend and is not a Tensor member method
+
     return IRRepeat(signature, [tensor], 'repeat', repeats)
 
 

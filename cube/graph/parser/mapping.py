@@ -10,8 +10,9 @@ from functools import partial
 
 import cube.graph.function as function
 from cube.ir.operator import IRFwOperation
-import cube.ir as ir
 
+# TODO this is a backwards-compatible alias
+from cube.graph.torch_dtype_mapping import DType2IRDType
 
 class Sign2Op:
 
@@ -140,30 +141,3 @@ class Sign2Op:
 
     # customized operator code: signature -> code
     kOpCodeDef: Dict[str, str] = {}
-
-
-class DType2IRDType:
-
-    @staticmethod
-    def map(dtype: torch.dtype):
-        """
-        Map the torch dtype to IRDType
-        """
-        return DType2IRDType.kDtypeMap[dtype]
-
-    kDtypeMap = {
-        torch.float64: ir.float64,
-        torch.float32: ir.float32,
-        torch.float  : ir.float32,
-        torch.float16: ir.float16,
-        torch.half   : ir.float16,
-        torch.uint8  : ir.uint8,
-        torch.int8   : ir.int8,
-        torch.int16  : ir.int16,
-        torch.short  : ir.int16,
-        torch.int32  : ir.int32,
-        torch.int    : ir.int32,
-        torch.int64  : ir.int64,
-        torch.long   : ir.int64,
-        torch.bool   : ir.boolean
-    }

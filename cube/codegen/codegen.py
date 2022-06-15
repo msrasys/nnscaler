@@ -21,6 +21,7 @@ from cube.execplan import ExectuionPlan
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 from cube.codegen.register import VarManager
+from cube.codegen.frontend_mapping import Sign2EmitRule
 
 
 class CodeGen:
@@ -227,18 +228,18 @@ class ModelCodeGen(CodeGen):
         """
         Emit op forward code
         """
-        op_code = node.signature
+        signature = node.signature
         inputs = [self.tensor_naming(t) for t in node.inputs()]
-        kwargs = list()
+        kwargs = {}
         for key in node.kwargs:
             val = node.kwargs[key]
             if isinstance(val, str) and 'self.' not in val:
                 val = '"' + val + '"'
-            code = f'{key}={val}'
-            kwargs.append(code)
-        inputs += kwargs
-        inputs = ', '.join(inputs)
-        body = f'{op_code}({inputs})'
+            kwargs[key] = val
+
+        emit_rule = Sign2EmitRule.map(signature)
+        body = emit_rule(node, inputs, kwargs)
+
         if len(node.outputs()) == 0:
             code = body
         else:
