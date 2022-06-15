@@ -10,6 +10,95 @@ from cube.ir.operator import IRFwOperation
 
 import torch
 
+# By default, we flatten all args and join them by ","
+# this includes ops with a fixed number of parameters like 'add(x,y)',
+# or ops allowing multiple parameters at the frontend like 'block_diag(t1,t2'
+def _common_rule_join_all(node:IRFwOperation, arg_vars:List[str], kw_pairs:dict) -> str:
+    signature = node.signature
+
+    kw_assigns = list()
+    for key, val in kw_pairs.items():
+        code = f'{key}={val}'
+        kw_assigns.append(code)
+
+    args = ", ".join(arg_vars + kw_assigns)
+    return f"{signature}({args})"
+
+def _common_rule_input_as_list(node:IRFwOperation, arg_vars:List[str], kw_pairs:dict) -> str:
+    signature = node.signature
+
+    kw_assigns = list()
+    for key, val in kw_pairs.items():
+        code = f'{key}={val}'
+        kw_assigns.append(code)
+    
+    args = ", ".join(arg_vars)
+    kwargs = ", ".join(kw_assigns)
+    return f"{signature}([{args}], {kwargs})"
+
+def emit_slice(node, arg_vars:list, kw_pairs:dict) -> str:
+    """
+    The op is:
+        aten::slice(input:Tensor, dim:int=0, start:Optional[int]=None, end:Optional[int]=None, step:int=1) -> Tensor
+    
+    but at the frontend such an invocation must be rewritten as 'x[:, l:h:s, :, :]'
+    depending on the 'input's rank and the 'dim' value.
+    """
+    out_tensors : list = node.outputs()
+    assert len(out_tensors) == 1
+    out_tensor : IRTensor = out_tensors[0]
+
+    assert len(arg_vars) == 1
+    in_tensor_var : str = arg_vars[0]
+
+    dim : int = kw_pairs["dim"]
+    start : Optional[int] = kw_pairs["start"]
+    end : Optional[int] = kw_pairs["end"]
+    step : int = kw_pairs["step"]
+    
+    rank = len(out_tensor.shape)
+    subscript_components = [":"] * rank
+
+    slice_str = f"{start or ''}:{end or ''}:{step}"
+    subscript_components[dim] = slice_str
+
+    return f"{in_tensor_var}[{', '.join(subscript_components)}]"
+
+
+# TODO consider making the IR-Torch conversion like IRDType2TorchDType intrinsic to codegen,
+# so that we don't need to ad hoc do the conversion as in these emission functions.
+# Also, we'd better limit the complexity of the values in 'kw_pairs' so we know for sure we have
+# done all necessary conversion.
+#
+# Basically to convert internal 'IRDType' to frontend 'torch.dtype'
+def emit_zeros(node, arg_vars:list, kw_pairs:dict) -> str:
+    """
+    zeros(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+    """
+    kw_pairs = kw_pairs.copy()
+    if 'dtype' in kw_pairs:
+        ir_dtype : IRDType = kw_pairs['dtype']
+        if ir_dtype is not None:
+            kw_pairs['dtype'] = IRDType2DType.map(ir_dtype)
+    
+    # TODO make all intermediately created tensors CUDA, to fit with other parts of the system, like SynDataLoader.
+    assert 'device' not in kw_pairs
+    kw_pairs['device'] = 'torch.cuda.current_device()' # str will get directly dumped as it's.
+
+    assert len(arg_vars) == 0
+    return _common_rule_join_all(node, arg_vars, kw_pairs)
+
+# Basically to convert internal 'IRDType' to frontend 'torch.dtype'
+def emit_to(node, arg_vars:list, kw_pairs:dict) -> str:
+    kw_pairs = kw_pairs.copy()
+
+    # Unlike 'zeros' who has 'ScalarType? dtype', 'to' has a non-nullable 'dtype'.
+    ir_dtype : IRDType = kw_pairs['dtype']
+    assert ir_dtype is not None
+    kw_pairs['dtype'] = IRDType2DType.map(ir_dtype)
+
+    return _common_rule_join_all(node, arg_vars, kw_pairs)
+
 class Sign2EmitRule:
 
     @staticmethod
@@ -27,101 +116,7 @@ class Sign2EmitRule:
         'kw_pairs' are dict whose values has been preprocessed and can be directly stringified, 
             e.g., {"dim":1, "layout"="nchw"}
         """
-        return Sign2EmitRule._signMap.get(signature) or Sign2EmitRule._common_rule_join_all
-
-    # By default, we flatten all args and join them by ","
-    # this includes ops with a fixed number of parameters like 'add(x,y)',
-    # or ops allowing multiple parameters at the frontend like 'block_diag(t1,t2'
-    @staticmethod
-    def _common_rule_join_all(node:IRFwOperation, arg_vars:List[str], kw_pairs:dict) -> str:
-        signature = node.signature
-
-        kw_assigns = list()
-        for key, val in kw_pairs.items():
-            code = f'{key}={val}'
-            kw_assigns.append(code)
-
-        args = ", ".join(arg_vars + kw_assigns)
-        return f"{signature}({args})"
-
-    @staticmethod
-    def _common_rule_input_as_list(node:IRFwOperation, arg_vars:List[str], kw_pairs:dict) -> str:
-        signature = node.signature
-
-        kw_assigns = list()
-        for key, val in kw_pairs.items():
-            code = f'{key}={val}'
-            kw_assigns.append(code)
-        
-        args = ", ".join(arg_vars)
-        kwargs = ", ".join(kw_assigns)
-        return f"{signature}([{args}], {kwargs})"
-
-    @staticmethod
-    def emit_slice(node, arg_vars:list, kw_pairs:dict) -> str:
-        """
-        The op is:
-            aten::slice(input:Tensor, dim:int=0, start:Optional[int]=None, end:Optional[int]=None, step:int=1) -> Tensor
-        
-        but at the frontend such an invocation must be rewritten as 'x[:, l:h:s, :, :]'
-        depending on the 'input's rank and the 'dim' value.
-        """
-        out_tensors : list = node.outputs()
-        assert len(out_tensors) == 1
-        out_tensor : IRTensor = out_tensors[0]
-
-        assert len(arg_vars) == 1
-        in_tensor_var : str = arg_vars[0]
-
-        dim : int = kw_pairs["dim"]
-        start : Optional[int] = kw_pairs["start"]
-        end : Optional[int] = kw_pairs["end"]
-        step : int = kw_pairs["step"]
-        
-        rank = len(out_tensor.shape)
-        subscript_components = [":"] * rank
-
-        slice_str = f"{start or ''}:{end or ''}:{step}"
-        subscript_components[dim] = slice_str
-
-        return f"{in_tensor_var}[{', '.join(subscript_components)}]"
-
-
-    # TODO consider making the IR-Torch conversion like IRDType2TorchDType intrinsic to codegen,
-    # so that we don't need to ad hoc do the conversion as in these emission functions.
-    # Also, we'd better limit the complexity of the values in 'kw_pairs' so we know for sure we have
-    # done all necessary conversion.
-    #
-    # Basically to convert internal 'IRDType' to frontend 'torch.dtype'
-    @staticmethod
-    def emit_zeros(node, arg_vars:list, kw_pairs:dict) -> str:
-        """
-        zeros(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
-        """
-        kw_pairs = kw_pairs.copy()
-        if 'dtype' in kw_pairs:
-            ir_dtype : IRDType = kw_pairs['dtype']
-            if ir_dtype is not None:
-                kw_pairs['dtype'] = IRDType2DType.map(ir_dtype)
-        
-        # TODO make all intermediately created tensors CUDA, to fit with other parts of the system, like SynDataLoader.
-        assert 'device' not in kw_pairs
-        kw_pairs['device'] = 'torch.cuda.current_device()' # str will get directly dumped as it's.
-
-        assert len(arg_vars) == 0
-        return Sign2EmitRule._common_rule_join_all(node, arg_vars, kw_pairs)
-
-    # Basically to convert internal 'IRDType' to frontend 'torch.dtype'
-    @staticmethod
-    def emit_to(node, arg_vars:list, kw_pairs:dict) -> str:
-        kw_pairs = kw_pairs.copy()
-
-        # Unlike 'zeros' who has 'ScalarType? dtype', 'to' has a non-nullable 'dtype'.
-        ir_dtype : IRDType = kw_pairs['dtype']
-        assert ir_dtype is not None
-        kw_pairs['dtype'] = IRDType2DType.map(ir_dtype)
-
-        return Sign2EmitRule._common_rule_join_all(node, arg_vars, kw_pairs)
+        return Sign2EmitRule._signMap.get(signature) or _common_rule_join_all
 
 
     _signMap = {
