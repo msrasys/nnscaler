@@ -191,6 +191,8 @@ class ScriptModuleParser:
                 return ScriptModuleParser.parse_prim_list_unpack_node(node, module, frame)
             if node_type == ScriptNodeKind.PrimPythonOp:
                 return ScriptModuleParser.parse_prim_python_op_node(node, module, frame)
+            if node_type == ScriptNodeKind.PrimIf:
+                return ScriptModuleParser.parse_prim_if_node(node, module, frame)
             if node_type == ScriptNodeKind.PrimLoop:
                 return ScriptModuleParser.parse_prim_loop_node(node, module, frame)
 
@@ -468,13 +470,68 @@ class ScriptModuleParser:
     def parse_prim_if_node(node, module, frame: Frame) -> List[IRFwOperation]:
         """
         Parse script module node like 
-            %output2 : Tensor = prim::If(%15) # /tmp/ipykernel_27188/2459450745.py:13:8
+            %output1 : Tensor, %output2 : Tensor = prim::If(%15) # /tmp/ipykernel_27188/2459450745.py:13:8
                 block0():
-                    -> (%output1.1)
+                    -> (%1, %2)
                 block1():
-                    -> (%output2.1)
+                    -> (%3, %4)
+        
+        and the only input (e.g. %15) must be of type bool.
         """
-        raise NotImplementedError("Dynamic Graph is not supported yet")
+
+        inputs : List[torch._C.Value] = list(node.inputs())
+        outputs : List[torch._C.Value] = list(node.outputs())
+
+        assert len(inputs) == 1
+        in_val = frame.get_var(inputs[0].debugName())
+        if not isinstance(in_val, bool):
+            raise RuntimeError("Dynamic Graph is not supported yet")
+        
+        # type: torch._C.Block
+        true_block, false_block = node.blocks()
+        chosen_block : torch._C.Block = true_block if in_val else false_block
+        body_out_vars = list(chosen_block.outputs())
+
+        all_ir_nodes : List[IRFwOperation] = []
+
+        # Evaluate the 'eval_block' in a new frame, to isolate within-block variables from
+        # polluting the current frame. And we'll manually bind all resultant variables later on.
+        frame.push_var(inherit_from_top=True)
+
+        # prim::If's blocks do not have any subgraph parameters, directly evaluate the body
+        for subnode in chosen_block.nodes():
+            subnode : torch._C.Node
+            
+            sub_ir_nodes : List[IRFwOperation] = ScriptModuleParser.parse_node(subnode, module, frame)
+
+            for ir_node in sub_ir_nodes:
+                try:
+                    ret = ir_node.infer_shape()
+                    if not ret:
+                        print(f'warning: {ir_node} cannot infer shape')
+                except Exception:
+                    raise RuntimeError(
+                        f"====== Shape Infer Error ====\n\n\n"
+                        f"IR Node: {ir_node}\n\n"
+                        f"Module:\n{module.code}\n\n"
+                        f"Node:\n{node}\n"
+                        f"====== Shape Infer Error ====\n\n\n"
+                    )
+
+            all_ir_nodes += sub_ir_nodes
+
+        # retrieve the block's resultant values
+        result_vals = [frame.get_var(body_out_var.debugName()) for body_out_var in body_out_vars]
+
+        # clean up
+        frame.pop_var()
+
+        # bind the prim:If's resultant variables
+        assert len(result_vals) == len(outputs)
+        for output, out_val in zip(outputs, result_vals):
+            frame.add_var(output.debugName(), out_val)
+        
+        return all_ir_nodes
 
     @staticmethod
     def parse_prim_loop_node(node, module, frame: Frame) -> List[IRFwOperation]:

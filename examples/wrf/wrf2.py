@@ -32,12 +32,17 @@ class WRF(torch.nn.Module):
 
         self.device = torch.device(device)
 
-        # TODO remove these testing parameters
-        # These three are to control the size of the unrolled graph, and they are related to the three layers of the nested loops, respectively.
-        # The magnitude is almost decided by `ntau` only.
+        # These three fields are to control the size of the unrolled graph 
+        # by faking the loop upper bounds (UB),
+        # and they are related to the three layers of the nested loops, respectively.
+        # 
+        # By setting to -1 we can recover the original loop upper bound.
+        #
+        # NOTE The magnitude is almost decided by `ntau` only. The final graph size may vary 
+        # from ~4k (all fake UBs are 1) to ~23k (all fake UBs are -1, i.e. the original)
         self._step_fake_ntau = 1
-        self._ac_step_fake_ub = 2
-        self._solver_fake_ub = 2
+        self._ac_step_fake_ub = 1
+        self._solver_fake_ub = 1
         
 
     def init(self, theta, Ptop=250e2):
@@ -137,8 +142,7 @@ class WRF(torch.nn.Module):
         alpha = - self.dz(self.pzphi(phi)) / mu
         p = self.PREF * (self.RD * Theta / mu / self.PREF / alpha)**self.GAMMA
 
-        # TODO fake upper bound
-        ntau = self._step_fake_ntau
+        ntau = self._step_fake_ntau if self._step_fake_ntau >= 0 else ntau
 
         for i in range(ntau):
             U2, V2, W2, O2, Theta2, phi2, mu2, pi2 = \
@@ -187,17 +191,15 @@ class WRF(torch.nn.Module):
         O2_ = torch.zeros(O2.shape, device=O2.device)
         mu2_ = torch.zeros(mu2.shape, device=mu2.device)
 
-        # TODO fake upper bound
-        #for i in range(1, O2.shape[0] + 1):
-        for i in range(1, self._ac_step_fake_ub):
+        _ctrl_O2_ub = self._ac_step_fake_ub + 1 if self._ac_step_fake_ub >= 0 else O2.shape[0] + 1
+        for i in range(1, _ctrl_O2_ub):
             sub = i * self.delta_z * dpi2 + \
                 (self.dx(self.px(U2_)) + self.dy(self.py(V2_)) - R_mu)[-i:].view(
                     -1, self.ny, self.nx).sum(0) * self.delta_z
             O2_ = O2_.select_scatter(sub, dim=0, index=-i)
 
-        # TODO fake upper bound
-        #for i in range(mu2.shape[0]):
-        for i in range(1, self._ac_step_fake_ub):
+        _ctrl_mu2_ub = self._ac_step_fake_ub if self._ac_step_fake_ub >= 0 else mu2.shape[0]
+        for i in range(_ctrl_mu2_ub):
             mu2_ = mu2_.select_scatter(pi2, dim=0, index=i)
 
         # self.O2_ = O2_
@@ -401,9 +403,8 @@ class WRF(torch.nn.Module):
 
         # forward sweep
 
-        # TODO fake upper bound
-        #for i in range(1, d.shape[0]):
-        for i in range(1, self._solver_fake_ub):
+        _ctrl_d_ub = self._solver_fake_ub + 1 if self._solver_fake_ub >= 0 else d.shape[0]
+        for i in range(1, _ctrl_d_ub):
             w = l[i - 1] / d[i - 1]
 
             d_i = d[i] - w * u[i - 1]
@@ -414,12 +415,11 @@ class WRF(torch.nn.Module):
 
         # backward substitution
         x = torch.zeros(b.shape, device=b.device)
-        x.select_scatter(b[-1] / d[-1], dim=0, index=-1)
+        x = x.select_scatter(b[-1] / d[-1], dim=0, index=-1)
 
-        # TODO fake upper bound
-        #for i in range(x.shape[0] - 2, -1, -1):
-        for i in range(1, self._solver_fake_ub):
-            x.select_scatter( (b[i] - u[i] * x[i + 1]) / d[i], dim=0, index=i)
+        _ctrl_x_range_start = self._solver_fake_ub - 1 if self._solver_fake_ub >= 0 else x.shape[0] - 2
+        for i in range(_ctrl_x_range_start, -1, -1):
+            x = x.select_scatter( (b[i] - u[i] * x[i + 1]) / d[i], dim=0, index=i)
 
         return x
 
