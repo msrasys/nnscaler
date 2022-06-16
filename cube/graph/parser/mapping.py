@@ -68,6 +68,8 @@ class Sign2Op:
 
         __ftemplate('layer_norm'): function.LayerNorm,
 
+        __ftemplate('embedding'): function.Embedding,
+
         # __ftemplate('layer_norm'): function.LayerNorm,
 
         # torch aten

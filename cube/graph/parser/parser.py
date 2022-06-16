@@ -226,6 +226,8 @@ class ScriptModuleParser:
             input_vals.append(val)
 
         # map to IR operator
+        if 'torch' not in fsig: # indicate a customized operator
+            fsig = fsig.split('.')[-1]
         ir_node = Sign2Op.map(fsig)(inputs=input_vals)
         
         # push output in the frame
@@ -344,7 +346,9 @@ class ScriptModuleParser:
         if self_module:
             call_module = module
         else:
-            call_module = getattr(module, node.inputsAt(0).debugName())
+            call_module = frame.get_var(node.inputsAt(0).debugName())
+            assert isinstance(call_module, torch.nn.Module), "the call module is not torch.nn.Module"
+            # call_module = getattr(module, node.inputsAt(0).debugName())
             frame.push_attr()
 
         call_method = getattr(call_module, label)
@@ -369,7 +373,9 @@ class ScriptModuleParser:
         Parse script module node like:
             %2 :__torch__.torch.nn.modules.linear.___torch_mangle_0.Linear = prim::GetAttr[name="linear1"](%self)
             %3 : Tensor = prim::GetAttr[name="weight"](%self)
-        The __torch__.torch.nn.modules.* will be ignored
+        Or:
+            %embed.1 : __torch__.torch.nn.modules.sparse.Embedding = prim::GetAttr[name="embed"](%self)
+            %embed.3 : Tensor = prim::CallMethod[name="forward"](%embed.1, %input_ids.1)
 
         This will add frame with the variable name and it's value
 
@@ -382,8 +388,10 @@ class ScriptModuleParser:
             Empty list
         """
         global _refmodule
-        if node.inputsAt(0).debugName() != 'self':
-            raise RuntimeError(f"Fail to parse {node} due to missing %self")
+
+        module_name = node.inputsAt(0).debugName()
+        module = module if module_name == 'self' else frame.get_var(module_name)
+        assert isinstance(module, torch.nn.Module)
 
         label = node.s('name')
         var_name = node.outputsAt(0).debugName()
@@ -414,18 +422,19 @@ class ScriptModuleParser:
                 val = 'self.' + label
             else:
                 val = getattr(module, label)
-            # print(f'get: var_name {var_name}: {val}')
             frame.add_var(var_name, val)
         # NoneType
         elif dtype == 'NoneType':
             frame.add_var(var_name, None)
-        # module name or other things cannot handle
-        elif dtype == '__torch__.einops.einops.TransformRecipe':
-            recipe = getattr(module, label)
-            frame.add_var(var_name, recipe)
         else:
-            # print("### parse_prim_attr_node unknown: {}".format(dtype))
-            frame.add_var(var_name, label)
+            if isinstance(module, torch.nn.ModuleList):
+                if str.isdecimal(label):
+                    val = module[int(label)]
+                else:
+                    val = getattr(module, label)
+            else:
+                val = getattr(module, label)
+            frame.add_var(var_name, val)
         return list()
 
     @staticmethod

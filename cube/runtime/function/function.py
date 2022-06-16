@@ -40,7 +40,8 @@ def conv3d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tenso
     input = TorchF.pad(input, pad_padding, 'constant', 0)
     return TorchF.conv3d(input, weight, bias, stride=stride, dilation=dilation, groups=groups)
 
-def embedding(input: torch.Tensor, weight: torch.Tensor, start: int, stop: int):
+
+def embedding(input: torch.Tensor, weight: torch.Tensor, padding_idx: Optional[int], start: int, stop: int):
     """
     Embedding
 
@@ -58,11 +59,12 @@ def embedding(input: torch.Tensor, weight: torch.Tensor, start: int, stop: int):
     masked_input = input.clone() - start
     masked_input[input_mask] = 0
     output = TorchF.embedding(
-        masked_input, weight,
-        None, None, 2.0, False, False
+        masked_input, weight, padding_idx,
+        None, 2.0, False, False
     )
     output[input_mask, :] = 0.0
     return output
+
 
 def einops(input: torch.Tensor, recipe_str, reduction_type: str):
     import pickle

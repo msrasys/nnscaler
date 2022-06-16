@@ -813,6 +813,21 @@ def Repeat(signature, inputs:Tuple[IRTensor, List[int]]):
     return IRRepeat(signature, [tensor], 'repeat', repeats)
 
 
+def Embedding(signature, inputs: List):
+    """
+    torch.nn.functional.embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False)
+    """
+    signature = 'cube.runtime.function.embedding'
+    itensor, weight = inputs[:2]
+    padding_idx = inputs[3]
+    start, stop = 0, weight.shape[0]
+    letters = iter(string.ascii_lowercase)
+    ishapes = [_create_eshape(itensor.shape, letters), _create_eshape(weight.shape, letters)]
+    oshapes = [ishapes[0] + [ishapes[1][-1]]]
+    anno = _create_anno(ishapes, oshapes)
+    return IREinops(signature, [anno], [itensor, weight], 'embedding', padding_idx=padding_idx, start=start, stop=stop)
+
+
 def ScriptEinOps(signature, inputs):
     """
     apply_for_scriptable_torch(recipe: TransformRecipe, tensor: torch.Tensor, reduction_type: str) -> torch.Tensor:
