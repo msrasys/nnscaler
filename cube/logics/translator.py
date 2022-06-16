@@ -21,7 +21,7 @@ class LogicTranslator:
         graph = IRGraph(nodes, inputs=[], outputs=outputs, module_name='LogicGraph')
         has_bp = any(n for n in graph.nodes() if isinstance(n, IRBpOperation))
         if has_bp:
-            assert (fnode.mirror in graph.nodes() for node in graph.nodes() if isinstance(node, IRFwOperation)), \
+            assert all(fnode.mirror in graph.nodes() for fnode in graph.nodes() if isinstance(fnode, IRFwOperation)), \
                 "Training requires all nodes have backward."
             return graph
         # remove backward nodes if no backward is called
@@ -30,6 +30,11 @@ class LogicTranslator:
             IRCell.make_pair(fnode, None)
         for ftensor in graph.full_tensors():
             ftensor.requires_grad = False
+        #TODO: ad hoc fix on operators with multiple same input tensors
+        for node in graph.nodes():
+            for itensor in node.inputs():
+                if isinstance(itensor, IRSubTensor):
+                    itensor._dirty_grad = True
         return graph
 
     @staticmethod
@@ -82,12 +87,8 @@ class LogicTranslator:
             raise RuntimeError("No forward detected")
         if loss.nelement() != 1:
             raise RuntimeError("backward can only perform on the scaler tensor")
-        # grad should be None or 1.0
+        # loss tensor grad should be 1.0
         loss.parent.grad = 1.0
-        for node in loss.parent.producers:
-            for otensor in node.outputs():
-                if isinstance(otensor, IRSubTensor) and otensor.overlap(loss):
-                    loss.grad = loss.parent.grad
         for node in trace[::-1]:
             SchedulePool().add_node(node.mirror)
 

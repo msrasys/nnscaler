@@ -401,38 +401,29 @@ class IRTensor:
     and will be translated to None in code generation. 
     """
 
-    _attr = ['name', '_is_param', '_requires_grad', '_is_grad', '_grad', '_dtype']
+    _attr = ['name', '_is_param', '_is_grad', '_requires_grad', '_dtype']
 
     def __init__(self, shape=None, name='tensor', dtype=IRDType.unknown, tid=None):
 
         self._id: int = tid if isinstance(tid, int) else IDGenerator().gen_tensor_id()
-        self._shape: Optional(List[int]) = () if shape is None else tuple(shape)
-        self.name = name if name else 'tensor'
+        self._shape: Tuple[int] = () if shape is None else tuple(shape)
+        self.name: str = name if name else 'tensor'
 
         # device
         self._cell: Optional[IRCell] = None
 
         self._dtype: IRDType = dtype
+        self._is_param: bool = False
+        self._is_grad: bool = False
 
-        self._requires_grad = True
-        self._is_param = False
-
-        self._is_grad = False
-        self._grad = None  # the gradient of this tensor
-        self._data = None  # the tensor of this gradient belongs to
-
-    @property
-    def requires_grad(self):
-        return self._requires_grad
-
-    @requires_grad.setter
-    def requires_grad(self, val: bool):
-        self._requires_grad = val
+        # tensor gradient
+        self._requires_grad: bool = True
+        self._grad: Optional[Union[IRTensor, float]] = None
 
     @property
-    def dtype(self):
+    def dtype(self) -> IRDType:
         """
-        Data type
+        Tensor data type
         """
         return self._dtype
 
@@ -445,6 +436,15 @@ class IRTensor:
             raise TypeError(f"Expected IRDType but got {val}")
         self._dtype = val
 
+    @property
+    def cell(self) -> Optional[IRCell]:
+        return self._cell
+
+    @cell.setter
+    def cell(self, val: Optional[IRCell]):
+        assert isinstance(val, IRCell) or val is None, "Expected cell to be Optional[IRCell]"
+        self._cell = val
+
     def attach_cell(self, cell: IRCell):
         """
         Attach to a cell, to be with input or output
@@ -452,12 +452,6 @@ class IRTensor:
         if not isinstance(cell, IRCell):
             raise TypeError("Expected an IRCell")
         self._cell = cell
-
-    def detach_cell(self):
-        """
-        Detach from a cell
-        """
-        self._cell = None
 
     @property
     def device(self) -> List[int]:
@@ -476,7 +470,8 @@ class IRTensor:
         """
         Set the tensor as trainable parameter
         """
-        self.requires_grad = True
+        assert self._grad is not None, "missing grad tensor"
+        self._requires_grad = True
         self._is_grad = False
         self._is_param = True
         return self
@@ -487,25 +482,6 @@ class IRTensor:
         """
         return self._is_param
 
-    @property
-    def data(self):
-        return self._data
-
-    @property
-    def grad(self):
-        return self._grad
-
-    @grad.setter
-    def grad(self, grad):
-        if grad is None:
-            self._grad = grad
-            return
-        elif not isinstance(grad, IRTensor):
-            raise TypeError("grad can only be None or Tensor")
-        self.requires_grad = True
-        self._grad = grad
-        grad._data = self
-
     def as_grad(self):
         self._is_param = False
         self._is_grad = True
@@ -514,22 +490,9 @@ class IRTensor:
     def is_grad(self):
         return self._is_grad
 
-    def renew(self):
-        """
-        Renew a new tensor with same name and shape,
-        but with a different new id
-
-        Returns:
-            tensor
-        """
-        tensor = IRTensor(self._shape, self.name)
-        new_id = tensor._id
-        for key in self.__dict__:
-            setattr(tensor, key, getattr(self, key))
-        # clear attached cells
-        tensor._cell = list()
-        tensor._id = new_id
-        return tensor
+    @property
+    def requires_grad(self) -> bool:
+        return self._requires_grad
 
     def __copy__(self):
         """
@@ -543,7 +506,7 @@ class IRTensor:
         for key in self.__dict__:
             setattr(tensor, key, getattr(self, key))
         # clear attached cells
-        tensor._cell = list()
+        tensor.cell = None
         return tensor
 
     def __eq__(self, tensor):
@@ -558,8 +521,8 @@ class IRTensor:
     @shape.setter
     def shape(self, val: Tuple[int]):
         self._shape = tuple(val)
-        if self.grad is not None:
-            self.grad.shape = tuple(val)
+        if isinstance(self._grad, IRTensor):
+            self._grad.shape = tuple(val)
 
     def nelement(self) -> int:
         """
@@ -571,36 +534,6 @@ class IRTensor:
         for num in self.shape:
             cnt *= num
         return cnt
-
-    def src(self, cells: List[IRCell]) -> List[IRCell]:
-        """
-        Return all the cells that will generate this tensor
-        """
-        src_cells = list()
-        for cell in cells:
-            if not isinstance(cell, IRCell):
-                raise TypeError("Expected cells to be List[IRCell]")
-            if self in cell.outputs():
-                src_cells.append(cell)
-        return src_cells
-
-    def dst(self, cells: List[IRCell]) -> List[IRCell]:
-        """
-        Return all the cells that will generate this tensor
-        """
-        dst_cells = list()
-        for cell in cells:
-            if not isinstance(cell, IRCell):
-                raise TypeError("Expected cells to be List[IRCell]")
-            if self in cell.inputs():
-                dst_cells.append(cell)
-        return dst_cells
-
-    def is_leaf(self, cells: List[IRCell]):
-        """
-        Check if it is a leaf tensor (parameter or input data)
-        """
-        return len(self.src(cells)) == 0
 
     def backward(self):
         """

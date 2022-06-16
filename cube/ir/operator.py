@@ -7,16 +7,20 @@ from cube.algorithm.factory import DistAlgorithmFactory
 from cube.ir.unique import IDGenerator
 
 
-class BaseOperator:
+class IRBaseOp(IRCell):
 
     def __init__(self, name: str, signature: str,
-                 input_length: int, output_length: int,
-                 init_outputs=False):
-        super().__init__(name, signature,
-                         input_length, output_length,
-                         init_outputs=init_outputs)
+                 inputs: List[IRTensor], outputs: List[IRTensor], **kwargs):
+        super().__init__(name, signature, len(inputs), len(outputs), init_outputs=False)
+        self.kwargs = kwargs
+        assert all(isinstance(t, IRTensor) for t in inputs), "expect all inputs to be IRTensors"
+        assert all(isinstance(t, IRTensor) for t in outputs), "expect all outputs to be IRTensors"
+        for idx, itensor in enumerate(inputs):
+            self.set_input(idx, itensor)
+        for idx, otensor in enumerate(outputs):
+            self.set_output(idx, otensor)
 
-    def infer_shape(self):
+    def infer_shape(self) -> bool:
         """
         Infer output value shape
         """
@@ -26,21 +30,10 @@ class BaseOperator:
         """
         Replicate the Operation
         """
-        cpy = copy.copy(self)
-        cpy._device = list()
-        cpy._id = IDGenerator().gen_cell_id()
-        # reset input and output
-        cpy._inputs = [None] * len(self.inputs())
-        for idx, input in enumerate(self.inputs()):
-            cpy.set_input(idx, input)
-        cpy._outputs = [None] * len(self.outputs())
-        for idx, output in enumerate(self.outputs()):
-            cpy.set_output(idx, output)
-        cpy._mirror = None
-        cpy._tag = None
-        cpy.clear_predecessor()
-        cpy.clear_successor()
-        return cpy
+        node = type(self)(
+            self.name, self.signature, self.inputs(), self.outputs(), **self.kwargs)
+        node._id = self._id
+        return node
 
 
 class IRFwOperation(IRCell):
@@ -131,16 +124,12 @@ class IRFwOperation(IRCell):
             data_num=len(self.inputs()),
             grad_num=len(self.outputs())
         )
-        for idx, input in enumerate(self.inputs()):
-            grad = None
-            if isinstance(input, IRSubTensor):
-                grad = input.get_grad(self)
-                input.grad = grad
-            bnode.set_data(idx, input)
+        for idx, itensor in enumerate(self.inputs()):
+            grad = itensor.grad if isinstance(itensor, IRSubTensor) else None
+            bnode.set_data(idx, itensor)
             bnode.set_output(idx, grad)
-        for idx, output in enumerate(self.outputs()):
-            grad = output.get_grad(self)
-            output.grad = grad
+        for idx, otensor in enumerate(self.outputs()):
+            grad = otensor.grad if isinstance(otensor, IRSubTensor) else None
             bnode.set_input(idx, grad)
         IRCell.make_pair(self, bnode)
         return bnode
@@ -245,29 +234,18 @@ class IRBpOperation(IRCell):
         graph.attach(node, idx)
         ```
         """
-        fnode = self.mirror
-        for idx, input in enumerate(fnode.inputs()):
-            grad = None
-            if isinstance(input, IRSubTensor):
-                grad = input.get_grad(fnode)
-            self.set_data(idx, input)
+        fnode: IRFwOperation = self.mirror
+        assert isinstance(fnode, IRFwOperation), "Cannot find corresponding IRFwOperation"
+        for idx, itensor in enumerate(fnode.inputs()):
+            grad = itensor.grad if isinstance(itensor, IRSubTensor) else None
+            self.set_data(idx, itensor)
             self.set_output(idx, grad)
-        for idx, output in enumerate(fnode.outputs()):
-            grad = output.get_grad(fnode)
+        for idx, otensor in enumerate(fnode.outputs()):
+            grad = otensor.grad if isinstance(otensor, IRSubTensor) else None
             self.set_input(idx, grad)
 
     def __repr__(self):
         dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, inputs={self.inputs()}, datas={self.datas()}, outputs={self.outputs()})'
-        return dscp
-
-    def module_repr(self) -> str:
-        """
-        Weight-hidden string representation
-        """
-        ins = [t for t in self.datas() if isinstance(t, IRSubTensor) and not t.is_param()]
-        outs = [t.grad for t in ins]
-        assert all([out in self.outputs() for out in outs])
-        dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, inputs={self.inputs()}, outputs={outs})'
         return dscp
 
 

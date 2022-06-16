@@ -433,6 +433,8 @@ class IRFullTensor(IRTensor):
         assert cell not in self._consumers, f"{cell} already exists as consumer"
         self._consumers.insert(idx, cell)
         self._ctensors.insert(idx, tensor)
+        for t in self.ctensors:
+            t._dirty_grad = True
 
     def rm_producer(self, cell: IRCell) -> int:
         if cell not in self.producers:
@@ -473,15 +475,11 @@ class IRFullTensor(IRTensor):
         """
         assert isinstance(val, (IRFullTensor, float)) or val is None, f"grad can only be IRFullTensor or None, but got {val}"
         self._grad = val
-        if val is None:
-            self._requires_grad = False
-            for t in self.ptensors + self.ctensors:
-                t.grad = None
-        elif isinstance(val, IRFullTensor):
+        self._requires_grad = False if val is None else True
+        if isinstance(val, IRFullTensor):
             assert val.shape == self.shape, f"IRFullTensor gradient shape mismatch."
-            self._requires_grad = True
-        else:
-            self._requires_grad = True
+        for tensor in self.ctensors + self.ptensors:
+            tensor._dirty_grad = True
 
     @property
     def requires_grad(self):
@@ -494,6 +492,8 @@ class IRFullTensor(IRTensor):
             self.grad = IRFullTensor(self.shape, 'g' + self.name, False).as_grad()
         elif not val and self.grad is not None:
             self.grad = None
+        for tensor in self.ctensors + self.ptensors:
+            tensor._dirty_grad = True
 
     def as_param(self):
         """
@@ -504,7 +504,7 @@ class IRFullTensor(IRTensor):
         self._is_grad = False
 
     def as_grad(self):
-        self._requires_grad = False
+        self.requires_grad = False
         self._is_param = False
         self._is_grad = True
         return self
@@ -551,8 +551,8 @@ class IRFullTensor(IRTensor):
         sub_tensor = IRSubTensor(self, indmap, valmap, shape)
         for attr in IRFullTensor._attr:
             setattr(sub_tensor, attr, getattr(self, attr))
-        sub_tensor.grad = None
         self._segments.append(sub_tensor)
+        sub_tensor._dirty_grad = True
         return sub_tensor
 
     def overlap(self, other):
@@ -632,21 +632,8 @@ class IRSubTensor(IRTensor):
         # val map
         self._valmap = _to_value_map(valmap)
 
-    @property
-    def grad(self) -> Optional[Union[IRTensor, float]]:
-        return self._grad
-
-    @grad.setter
-    def grad(self, val: Optional[Union[IRTensor, float]]):
-        assert isinstance(val, (IRSubTensor, float)) or val is None, f"grad can only be IRFullTensor or None, but got {val}"
-        self._grad = val
-        if val is None:
-            self._requires_grad = False
-        elif isinstance(val, IRSubTensor):
-            assert val.shape == self.shape, f"IRFullTensor gradient shape mismatch."
-            self._requires_grad = True
-        else:
-            self._requires_grad = True
+        # grad flag
+        self._dirty_grad = True
 
     def __eq__(self, other):
 
@@ -676,7 +663,7 @@ class IRSubTensor(IRTensor):
         return copy.copy(self._indmap)
 
     @property
-    def valmap(self):
+    def valmap(self) -> ValueMap:
         return copy.copy(self._valmap)
 
     def __copy__(self):
@@ -694,16 +681,30 @@ class IRSubTensor(IRTensor):
         tensor._cell = None
         return tensor
 
-    def get_grad(self, fcell: IRCell) -> Optional[IRTensor]:
+    @property
+    def grad(self) -> Optional[Union[IRTensor, float]]:
         """
         Get gradient of this tensor which is associated by a
         forward cell
+
+        Gradient can be:
+         - None: if the tensor doesn't require gradient
+         - 1.0: if the tensor is loss tensor
+         - IRSubTensor: if the tensor requires gradient and not the loss tensor
+
+        Gradient cannot be set and can only be inferred by its IRFullTensor.
         """
+        if not self._dirty_grad:
+            return self._grad
+
+        assert isinstance(self._cell, IRCell), "No cell attached to this tensor."
         full_grad = self.parent.grad
+        # None indicate the tensor doesn't need grad.
+        # float means this tensor is a loss tensor
         if full_grad is None or isinstance(full_grad, float):
-            self.grad = full_grad
-            return full_grad
-        if self in fcell.inputs():
+            self._grad = full_grad
+        # this tensor is consumed
+        elif self in self._cell.inputs():
             ref_cell_ids = list()
             for dst_cell in self.parent.consumers:
                 for input in dst_cell.inputs():
@@ -712,27 +713,36 @@ class IRSubTensor(IRTensor):
                         break
             ref_times = len(ref_cell_ids)
             if ref_times == 0:
-                raise RuntimeError("Internal Error: ref time is 0")
-            idx = ref_cell_ids.index(fcell._id)
+                raise RuntimeError("Internal error: consumer doesn't have the operator attached to this tensor")
+            idx = ref_cell_ids.index(self._cell._id)
             grad = full_grad.select(
                 indmap = self.indmap,
                 valmap = (idx, ref_times),
                 shape = self.shape
             )
-            self.grad = grad
+            self._grad = grad
+            self._dirty_grad = False
             return grad
-        elif self in fcell.outputs():
+        # this tensor is produced
+        elif self in self._cell.outputs():
             grad = full_grad.select(
                 indmap = self.indmap,
                 valmap = (0, 1),
                 shape = self.shape
             )
-            self.grad = grad
-            return grad
+            self._grad = grad
         else:
-            raise RuntimeError(f"{self} not found in cell {fcell}")
+            raise RuntimeError("visiting a tensor grad that potentially generated by IRAdapter")
+        self._dirty_grad = False
+        self._requires_grad = False if full_grad is None else True
+        return self._grad
 
-    def select(self, indmap: Union[Tuple, IndexMap], valmap: Union[Tuple, ValueMap, None], shape=None):
+    @property
+    def requires_grad(self) -> bool:
+        _ = self.grad
+        return self._requires_grad
+
+    def select(self, indmap: Union[Tuple, IndexMap], valmap: Union[Tuple, ValueMap, None], shape=None) -> IRTensor:
         """
         Select an IRSubTensor
 
