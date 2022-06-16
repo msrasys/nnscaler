@@ -4,7 +4,7 @@ The Tetris.
 Abstraction layer for microb-batch execution plan merge.
 """
 
-from typing import Any, Callable, Dict, List, Tuple, Optional, Union
+from typing import Callable, Dict, List, Tuple, Optional, Union
 import numpy as np
 from enum import Enum
 import time
@@ -19,9 +19,10 @@ class Block:
         FW = 'forward'
         BW = 'backward'
 
-    def __init__(self, mid: int, btype: BType):
+    def __init__(self, mid: int, btype: BType, mem: int = 1):
         self.mid: int = mid
-        self.type = btype
+        self.btype = btype
+        self.memory = abs(mem) if btype == Block.BType.FW else 0-abs(mem)
         # dependency track
         self.before: List[Block] = list()
         self.after: List[Block] = list()
@@ -36,14 +37,16 @@ class Block:
             after.before.append(before)
 
     def __repr__(self):
-        return f'f{self.mid}' if self.type == Block.BType.FW else f'b{self.mid}'
+        return f'f{self.mid}' if self.btype == Block.BType.FW else f'b{self.mid}'
 
 
 class PlanBase:
 
     def __init__(self, ndevs: int):
-        self.blocks: Dict[Tuple[Tuple[int], int], Block] = dict()
-        self.positions: Dict[int, Tuple[int, int]] = dict()
+        # (device, step) -> block
+        self.blocks: Dict[Tuple[int, int], Block] = dict()
+        # block id -> ((device,), step)
+        self.positions: Dict[int, Tuple[Tuple[int], int]] = dict()
         self.plan = np.zeros((ndevs, ndevs * 2), dtype=int)
 
     @property
@@ -53,6 +56,25 @@ class PlanBase:
     @property
     def nsteps(self):
         return self.plan.shape[1]
+
+    def memory(self, devid: Optional[int] = None) -> Union[List[int], int]:
+        """
+        Get memory of the this plan
+        """
+        if isinstance(devid, int):
+            memory = 0
+            peak_mem = memory
+            for step, have_block in enumerate(self.plan[devid]):
+                have_block = have_block != 0
+                if have_block:
+                    memory += self.block(devid, step).memory
+                    peak_mem = max(peak_mem, memory)
+            return peak_mem
+        else:
+            dev_peak_mem = []
+            for devid in range(self.ndevs):
+                dev_peak_mem.append(self.memory(devid))
+            return dev_peak_mem
 
     def block(self, dev: int, step: int):
         """
@@ -76,7 +98,7 @@ class PlanBase:
         """
         remove redundant steps
         """
-        execflag = np.sum(self.plan, axis=1)
+        execflag = np.sum(self.plan, axis=0)
         for idx in range(self.nsteps):
             if execflag[-idx-1] != 0:
                 break
@@ -121,7 +143,7 @@ class PlanBase:
         fontsize = [40]
         txts = list()
         def draw_block(block: Block, position: Tuple[Tuple[int], int], fontsize):
-            color = '#4472C4' if block.type == Block.BType.FW else '#ED7D31'
+            color = '#4472C4' if block.btype == Block.BType.FW else '#ED7D31'
             devs, step = position
             for dev in devs:
                 rec = Rectangle((step, dev+0.5), 1, 1, color=color, ec='black', lw=1.5)
@@ -314,6 +336,8 @@ class SchedulePlan(PlanBase):
         """
         Get conflict blocks at `step`.
         Return the conflicted (MicroPlan, Block) grouped by device id
+
+        This assumes micros are composable < step - 1
         """
         max_steps = max(micro.nsteps for micro in micros)
         for micro in micros:
@@ -339,7 +363,10 @@ class Composer:
         return micros
 
     @staticmethod
-    def bfs_schedule(micros: List[MicroPlan], mem_opt=True, prune_symmetric=True):
+    def bfs_schedule(micros: List[MicroPlan],
+                     mem_constraints: Union[int, Tuple[int]],
+                     mem_opt=True, prune_symmetric=True):
+        mem_constraints = [mem_constraints] * micros[0].ndevs if isinstance(mem_constraints, int) else mem_constraints
         total_status = 1
         micros.sort(key=lambda m: m.mid)
         block_hash = Composer.construct_hash(micros) if prune_symmetric else None
@@ -353,8 +380,11 @@ class Composer:
             for micros in prev:
                 # get and solve conflicts
                 conflicts = SchedulePlan.conflict(micros, step)
+                if len(conflicts) == 0:
+                    next.append(micros)
+                    continue
                 # input(f'conflicts: dev: {list(conflicts.keys())}, mids: {[[conf[0].mid for conf in c] for c in conflicts.values()]} | >>>')
-                for shifts in Composer.iter_shifts(conflicts, block_hash=block_hash):
+                for shifts in Composer.iter_shifts(micros, conflicts, step, mem_constraints, block_hash=block_hash):
                     # print(f"step {step}: {shifts}")
                     shifted_micros = [micro.copy() for micro in micros]
                     for cblock in shifts:
@@ -439,58 +469,89 @@ class Composer:
         return micros
 
     @staticmethod
-    def iter_shifts(conflicts: Dict[int, List[Tuple[MicroPlan, Block]]],
+    def memory(micros: List[MicroPlan], to_step: int) -> List[int]:
+        """
+        Get memory consumption from of step [0, `to_step`)
+        """
+        if to_step == 0:
+            return [0] * micros[0].ndevs
+        micros = [micro.copy() for micro in micros]
+        for micro in micros:
+            micro.expand_to(to_step-1)
+            micro.plan = micro.plan[:,:to_step]
+            for block in set(micro.blocks.values()):
+                devices, step = micro.position(block)
+                if step >= to_step:
+                    for devid in devices:
+                        del micro.blocks[(devid, step)]
+                    del micro.positions[id(block)]
+        sched_plan = SchedulePlan(micros)
+        return sched_plan.memory()
+
+    @staticmethod
+    def iter_shifts(micros: List[MicroPlan],
+                    conflicts: Dict[int, List[Tuple[MicroPlan, Block]]],
+                    step: int,
+                    memory_constraints: List[int],
                     block_hash = Union[None, Callable]) -> List[Block]:
         """
         Enumerate shifted blocks to resolve conflicts on step `step`.
         """
         devs = list(conflicts.keys())
-        prev_shifts: List[List[Block]] = [[],]
-        next_shifts: List[List[Block]] = []
+        prev_keep: List[Dict[int, Block]] = [{devid: None for devid in devs}]
+        next_keep: List[Dict[int, Block]] = []
+
+        # memory constraints to decide keep candidates
+        keep_candidates: Dict[int, List[Tuple[MicroPlan, Block]]] = {devid: [] for devid in devs}
+        memory = Composer.memory(micros, step)
+        for devid in devs:
+            cmicro_blocks = conflicts[devid]
+            for cmicro, cblock in cmicro_blocks:
+                for cdev in cmicro.position(cblock)[0]:
+                    if memory[cdev] + cblock.memory <= memory_constraints[cdev]:
+                        keep_candidates[devid].append((cmicro, cblock))
+        # print(memory, memory_constraints)
+
         for dev in devs:
-            for shifts in prev_shifts:
-                cmicros = [c[0] for c in conflicts[dev]]
-                cblocks = [c[1] for c in conflicts[dev]]
-                # since a same block can be on multiple devices (e.g., tensor parallel)
-                # we need to remove shifted blocks if it is decided before
-                for sblock in shifts:
-                    if sblock in cblocks:
-                        idx = cblocks.index(sblock)
-                        cblocks = cblocks[:idx] + cblocks[idx+1:]
-                        cmicros = cmicros[:idx] + cmicros[idx+1:]
-                if len(cblocks) <= 1:
-                    next_shifts.append(shifts)
-                    continue
-
-                candidates = []
-                if block_hash is not None:
-                    gids = [block_hash(cblock) for cblock in cblocks]
-                    for gid in set(gids):
-                        gblocks = [cblock for cblock, cgid in zip(cblocks, gids) if cgid == gid]
-                        gmids = [gblock.mid for gblock in gblocks]
-                        idx = gmids.index(min(gmids))
-                        candidates.append(gblocks[idx])
+            for keeps in prev_keep:
+                cmicros = [c[0] for c in keep_candidates[dev]]
+                cblocks = [c[1] for c in keep_candidates[dev]]
+                if keeps[dev] is None:
+                    # get candidate by pruning the symetric block
+                    candidates = []
+                    if block_hash is not None:
+                        gids = [block_hash(cblock) for cblock in cblocks]
+                        for gid in set(gids):
+                            gblocks = [cblock for cblock, cgid in zip(cblocks, gids) if cgid == gid]
+                            gmids = [gblock.mid for gblock in gblocks]
+                            idx = gmids.index(min(gmids))
+                            candidates.append(gblocks[idx])
+                    else:
+                        candidates = cblocks
+                    for kblock in candidates:
+                        idx = cblocks.index(kblock)
+                        kmicro = cmicros[idx]
+                        empty = True
+                        for kdev in kmicro.position(kblock)[0]:
+                            if kdev in keeps and keeps[kdev] is not None:
+                                empty = False
+                                break
+                        if empty:
+                            new_keeps = {devid: blk for devid, blk in keeps.items()}
+                            for kdev in kmicro.position(kblock)[0]:
+                                if kdev in new_keeps:
+                                    new_keeps[kdev] = kblock
+                            next_keep.append(new_keeps)
                 else:
-                    candidates = cblocks
-                
-                # if prune_same_micro:
-                #     if Composer.same_plans(cmicros, start_step=step):
-                #         candidates = [candidates[0]]
+                    next_keep.append(keeps)
+            prev_keep, next_keep = next_keep, []
 
-                for kblock in candidates:
-                    idx = cblocks.index(kblock)
-                    # keep blocks on the idx while shifts the rest
-                    nshifts = shifts + cblocks[:idx] + cblocks[idx+1:]
-                    # if the reserved block executes on multiple devices,
-                    # then the rest device must shift all other blocks
-                    for odev in cmicros[idx].position(kblock)[0]:
-                        if odev != dev and odev in conflicts:
-                            for _, ocblock in conflicts[odev]:
-                                if ocblock != cblocks[idx] and ocblock not in nshifts:
-                                    nshifts.append(ocblock)
-                    next_shifts.append(nshifts)
-            prev_shifts, next_shifts = next_shifts, []
-        for shifts in prev_shifts:
+        for keeps in prev_keep:
+            shifts = []
+            for devid, block in keeps.items():
+                for cmicro, cblock in conflicts[devid]:
+                    if cblock != block and cblock not in shifts:
+                        shifts.append(cblock)
             yield shifts
 
     @staticmethod
@@ -514,7 +575,7 @@ class Composer:
             # find forward blocks
             for dev in devs:
                 block = micro.block(dev, step)
-                if block.type != Block.BType.FW:
+                if block.btype != Block.BType.FW:
                     continue
                 if block not in fblocks:
                     fblocks.append(block)
@@ -628,8 +689,8 @@ if __name__ == '__main__':
 
     def search(ndevs, nmicros, visualize=False):
         # premise
-        # micros = Composer.premise(uniform_staging, ndevs, nmicros)
-        micros = Composer.premise(chimera_staging, ndevs, nmicros)
+        micros = Composer.premise(uniform_staging, ndevs, nmicros)
+        # micros = Composer.premise(chimera_staging, ndevs, nmicros)
         # micros = Composer.premise(mbart_staging, ndevs, nmicros)
         print('============== Premise ================')
         for idx, micro in enumerate(micros):
@@ -641,7 +702,7 @@ if __name__ == '__main__':
         
         # search shift
         tic = time.time()
-        schedules = Composer.bfs_schedule(micros, mem_opt=True, prune_symmetric=True)
+        schedules = Composer.bfs_schedule(micros, 10, mem_opt=False, prune_symmetric=True)
         toc = time.time()
         print('search done. time {:.2f}s'.format(toc - tic))
 
@@ -650,11 +711,11 @@ if __name__ == '__main__':
         assert len(steps) == 1, f"got un-consistent step set: {steps}"
         nsteps = list(steps)[0]
         print(f'find {len(schedules)} step-optimal plans (step={nsteps})')
-        # for idx, schedule in enumerate(schedules):
-        #     print(f'Schedule #{idx+1}:')
-        #     print(schedule)
-        #     if visualize:
-        #         schedule.visualize(f'planlog/plan{idx+1}.png')
+        for idx, schedule in enumerate(schedules):
+            print(f'Schedule #{idx+1}:')
+            print(schedule)
+            if visualize:
+                schedule.visualize(f'planlog/plan{idx+1}.png')
             
 
     ndevs = 4
@@ -663,13 +724,3 @@ if __name__ == '__main__':
     # schedule = compose_1F1B(ndevs, nmicros)
     # schedule.visualize('out.png')
     search(ndevs, nmicros, visualize=False)
-
-    # micros = mbart_staging(ndevs, nmicros)
-    # for idx, micro in enumerate(micros):
-    #     print(f'microbatch #{idx}:')
-    #     print(micro)
-    # 
-    # micros[0].shift(micros[0].block(0, 0))
-    # micros[0].shift(micros[0].block(0, 2))
-    # micros[0].shift(micros[0].block(0, 5))
-    # print(micros[0])
