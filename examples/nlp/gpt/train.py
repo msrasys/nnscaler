@@ -17,29 +17,34 @@ import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary, model_summary
 
+from examples.nlp.gpt.policy.naive import PAS
+
 
 def train():
 
     batch_size = 1
 
-    model = GPT().cuda()
+    model = GPT()
     dataloader = GPTDataLoader(batch_size)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
     print_each_rank('model weight consumpition:')
     memory_summary()
 
+    model = cube.SemanticModel(model, dataloader.shapes)
+    @cube.compile(model, dataloader, PAS=PAS, override=True)
     def train_iter(model, dataloader):
         input_ids, position_ids = next(dataloader)
         loss = model(input_ids, position_ids)
         loss.backward()
+    model = model.get_gen_module()
 
     CudaTimer(enable=False).warmup()
     iter_num = 64
     for step in range(iter_num):
 
-        if step == 0:
-            model_summary(model, next(dataloader))
+        # if step == 0:
+        #     model_summary(model, next(dataloader))
 
         if step >= 20:
             CudaTimer(enable=True).start('e2e')

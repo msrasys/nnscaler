@@ -2,7 +2,7 @@ import torch
 import cube
 
 
-@cube.graph.parser.register('L^ N E^, H+ E^, H+, H+ E^, H+, H+ E^, H+, E^ H+, E^ -> L^ N E')
+@cube.graph.parser.register('L^ N E^, H+ E^, H+, H+ E^, H+, H+ E^, H+, E^ H+, E^ -> L^ N E^')
 def self_attention(query: torch.Tensor,
                    q_proj: torch.Tensor, q_bias: torch.Tensor,
                    k_proj: torch.Tensor, k_bias: torch.Tensor,
@@ -30,10 +30,10 @@ def self_attention(query: torch.Tensor,
     if mask: # (N h) L L -> (N h) L L
         attn = attn.view(N, num_head, L, L)
         ones = torch.ones((N, L, L), device=attn.device)
-        mask = torch.tril(ones)
-        mask = mask.view(N, 1, L, L)
-        mask = (mask < 0.5)
-        attn = attn.masked_fill_(mask, -10000.0)
+        amask = torch.tril(ones)
+        amask = amask.view(N, 1, L, L)
+        amask = (amask < 0.5)
+        attn = attn.masked_fill_(amask, -10000.0)
         attn = attn.view((N * num_head), L, L)
 
     attn = torch.nn.functional.softmax(attn, dim=-1) # (N h) L L -> (N h) L L
@@ -45,7 +45,7 @@ def self_attention(query: torch.Tensor,
     return output
 
 
-@cube.graph.parser.register('L^ N E^, L^ N E^, H+ E^, H+, H+ E^, H+, H+ E^, H+, E^ H+, E^ -> L^ N E')
+@cube.graph.parser.register('L^ N E^, L^ N E^, H+ E^, H+, H+ E^, H+, H+ E^, H+, E^ H+, E^ -> L^ N E^')
 def cross_attention(query: torch.Tensor, key: torch.Tensor,
                     q_proj: torch.Tensor, q_bias: torch.Tensor,
                     k_proj: torch.Tensor, k_bias: torch.Tensor,
