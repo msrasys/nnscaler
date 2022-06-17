@@ -194,6 +194,46 @@ class SchedulePlan:
         toc = time.time()
         print('iterate all plans: {:.2f} seconds.'.format(toc-tic))
 
+    def solve_mconstraints(self, memory: int, decrease=True):
+        global gsolver
+        tic = time.time()
+        min_step = max(len(blks) for blks in self._blocks)
+        max_step = self.nblocks
+        opt_step = max_step if decrease else min_step
+
+        self.set_memory()
+        
+        # memory constraints
+        gsolver.push()
+        gsolver.add(self._mem <= memory)
+        # find optimal step
+        while True:
+            assert min_step <= opt_step and opt_step <= max_step, "out of step boundary. consider this as a bug."
+            gsolver.push()
+            gsolver.add(self._nsteps == opt_step)
+            if gsolver.check() == sat:
+                print(f'find scheduling plan in {opt_step} steps')
+                solution = gsolver.model()
+                self.set_solution(solution)
+                gsolver.pop()
+                if not decrease: break
+            else:
+                print(f'fail to find solution for {opt_step} steps')
+                gsolver.pop()
+                if decrease:
+                    opt_step += 1
+                    break
+            opt_step = opt_step - 1 if decrease else opt_step + 1
+        toc = time.time()
+        print('search time: {:.2f} seconds. find optimal step: {}'.format(toc-tic, opt_step))
+        print('solution:')
+        print(self)
+
+        tic = time.time()
+        self.iter_space(opt_step)
+        toc = time.time()
+        print('iterate all plans: {:.2f} seconds.'.format(toc-tic))
+
 
     def iter_space(self, nsteps: int, memory: int = None):
         """
@@ -269,8 +309,8 @@ if __name__ == '__main__':
         sched = SchedulePlan(ndevs)
         assert nmicros % 2 == 0, "require microbatch# can be devided by 2"
         for mid in range(nmicros // 2): # V shape
-            fblocks = [Block(mid, Block.BType.FW, f'f{mid}d{devid}', mem=devid+1) for devid in range(ndevs)]
-            bblocks = [Block(mid, Block.BType.BW, f'b{mid}d{devid}', mem=devid+1) for devid in range(ndevs-1,-1,-1)]
+            fblocks = [Block(mid, Block.BType.FW, f'f{mid}d{devid}', mem=1) for devid in range(ndevs)]
+            bblocks = [Block(mid, Block.BType.BW, f'b{mid}d{devid}', mem=1) for devid in range(ndevs-1,-1,-1)]
             blocks = fblocks + bblocks
             for idx in range(ndevs * 2 - 1):
                 Block.add_dependency(blocks[idx], blocks[idx+1])
@@ -279,8 +319,8 @@ if __name__ == '__main__':
                 sched.add_block(bblocks[ndevs-1-devid], devid)
         for mid in range(nmicros // 2): # ^ shape
             mid = mid + nmicros // 2
-            fblocks = [Block(mid, Block.BType.FW, f'f{mid}d{devid}', mem=ndevs-devid) for devid in range(ndevs-1,-1,-1)]
-            bblocks = [Block(mid, Block.BType.BW, f'b{mid}d{devid}', mem=ndevs-devid) for devid in range(ndevs)]
+            fblocks = [Block(mid, Block.BType.FW, f'f{mid}d{devid}', mem=1) for devid in range(ndevs-1,-1,-1)]
+            bblocks = [Block(mid, Block.BType.BW, f'b{mid}d{devid}', mem=1) for devid in range(ndevs)]
             blocks = fblocks + bblocks
             for idx in range(ndevs * 2 - 1):
                 Block.add_dependency(blocks[idx], blocks[idx+1])
@@ -303,8 +343,8 @@ if __name__ == '__main__':
             for step in range(ndevs+2):
                 if step in [0, ndevs // 2 + 1]:
                     fdevid = bdevid = tuple(range(ndevs))
-                    fblock = Block(mid, Block.BType.FW, f'fe{step}{mid}devall', mem=4)
-                    bblock = Block(mid, Block.BType.BW, f'be{step}{mid}devall', mem=4)
+                    fblock = Block(mid, Block.BType.FW, f'fe{step}{mid}devall', mem=1)
+                    bblock = Block(mid, Block.BType.BW, f'be{step}{mid}devall', mem=1)
                 else:
                     fdevid = bdevid = step - 1 if step < ndevs // 2 + 1 else step - 2
                     fblock = Block(mid, Block.BType.FW, f'f{mid}dev{fdevid}', mem=1)
@@ -318,10 +358,10 @@ if __name__ == '__main__':
                 Block.add_dependency(blocks[idx], blocks[idx+1])
         return sched
 
-    ndevs = 4
-    nmicros = 4
+    ndevs = 8
+    nmicros = 8
 
-    # sched = uniform_staging(ndevs, nmicros)
+    sched = uniform_staging(ndevs, nmicros)
     # sched = chimera_staging(ndevs, nmicros)
-    sched = mbart_staging(ndevs, nmicros)  # ndev=4, nmicro=4 => solution: step=32
-    sched.solve(decrease=True)
+    # sched = mbart_staging(ndevs, nmicros)  # ndev=4, nmicro=4 => solution: step=30
+    sched.solve_mconstraints(memory=ndevs, decrease=True)
