@@ -63,6 +63,7 @@ class Sign2Op:
         __ftemplate('dropout') : function.Dropout,
 
         __ftemplate('gelu') : function.GeLU,
+        __ttemplate('gelu') : function.GeLU,
 
         __ftemplate('_pad'): function.Pad,
 

@@ -76,11 +76,7 @@ def Identity(signature, inputs):
 
 
 def Linear(signature, inputs):
-    if signature == 'torch.linear':
-        import warnings
-        warnings.warn(f'signature {signature} replaced into torch.nn.functional.linear')
-        signature = 'torch.nn.functional.linear'
-
+    signature = 'torch.nn.functional.linear'
     annos = [
         'b * k+, n k+ -> b * n',   # no bias
         'b * k+, n k+, n -> b * n' # have bias
@@ -472,6 +468,7 @@ def Cos(signature, inputs):
 
 def GeLU(signature, inputs):
     annos = ['* -> *']
+    signature = 'torch.nn.functional.gelu'
     tensor = inputs[0:1]
     if len(inputs) == 2:
         # adapt for newest pytorch version
