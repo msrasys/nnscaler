@@ -1,26 +1,14 @@
-from typing import Dict
+from typing import List, Optional
 
-from cube.ir.cten import IRCell, IRTensor
+from cube.ir.cten import IRCell
 
 
 class GenericDistAlgo:
+    """!
+    Generic distributed algorithm that partitions a node into sub-nodes.
+    """
 
     def __init__(self, node: IRCell):
-        """
-        Layout is the community distribution requirement for input and
-        output logical tensors.
-
-        Format is the dimension ordering based on the logical format,
-        `None` indicates the format is consistent with logical op,
-        otherwise should be a list of integers like torch.Tensor.permute()
-        on the logical required format.
-
-        # TODO:
-        input_format (list[list[int], None]): 
-                input dim order compare with logical definition
-        output_format (list[list[int], None]):
-                output dim order compare with logical definition
-        """
         if not isinstance(node, IRCell):
             raise TypeError("Expected node to be IRCell")
         self._node = node
@@ -29,14 +17,22 @@ class GenericDistAlgo:
     def node(self) -> IRCell:
         return self._node
 
-    def satisfy(self, config: Dict):
-        """
+    def satisfy(self, **config) -> bool:
+        """!
         Check if the config satisfies instantiation conditions
+
+        @param config Dict: configuration for the algorithm, like number of partitioned chunks.
+
+        @return satisfy bool: True if the configuration can satisfy for this node
         """
         raise NotImplementedError
 
-    def instantiate(self, config: Dict):
-        """
+    def instantiate(self, **config) -> Optional[List[IRCell]]:
+        """!
         Instantiate the algorithm given the config
+
+        @param config Dict: configuration for the algorithm, like number of partitioned chunks.
+
+        @return sub_nodes Optional[List[IRCell]]: if sucess, the partitioned sub nodes, else None
         """
         raise NotImplementedError

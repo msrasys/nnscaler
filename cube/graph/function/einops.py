@@ -1,59 +1,70 @@
 """
-This operator class is highly inspired by einops.
+Dimension Annotion Operations.
 
-* Annotating Dimensions:
+An operator has (multiple) input tensors and (multiple) output tensors.
+Each tensor can be annotated with dimension annotations (DimAnno) using `identifiers`.
+The same `identifier` indicates the they have the same real length.
+
+* Dimension Annotation:
 
   e.g., 'a+', 'ab^', 'cd', '(ab+ c^ d)', '64'
 
-A dimension of a tensor can be annotated by {identifier}{reduce} template.
+A dimension of a tensor can be annotated by {identifier}{reduction} template.
 
 An `identifier` must be one of:
   1) symbolic annotation that must match with the criteria of python str.isidentifier.
-  2) numeric string that must match with python str.isnumeric. This indicates the shape is the same value
-     numeric string will always have '^' reduction type
-  3) '*': this special value indicates the dimension is dynamic will automatically get expanded given the shape
+  2) numeric string that must match with python str.isdecimal. This indicates the shape is the same value
+     numeric string will always have '^' reduction type'
 
-A `reduce` can be a set of {'', '+', '^'}:
-  '' indicates this dimension will apear in output.
-  '+' indicates no this dimension will be reduced in output using sume
-  '^' means this dimension is out of scope, Einops will not handle this (cannot do split on it)
+Special identifier:
+  1) '*': this special identifier indicates the dimension is dynamic, which will automatically get expanded given the shape
+  2) '?': this special identifier indicates the value is not a tensor, which will be ignored
 
-A complex annotation for a dimension is using brackets, i.e., '(' and ')', to include
-more inner-dimensions. The value of inner dimension must be (partially) indicated by function args (of same name)
-so that letting system know (infer).
+A `reduction` can be a set of {'', '+', '^'}:
+  '' indicates this dimension can be partitioned, and each output should have this dimension.
+  '+' indicates this dimension can be partitioned, and each ouutput doesn't have this and need to do sum-reduction.
+  '^' means this dimension cannot be partitioned.
 
-* Annotating Operator:
+A dimension can also be annotated with inner-dimensions using brackets, i.e., '(' and ')'.
+The value of inner dimension needs to be inferrable, or indicated by function args (of same name).
 
-e.g., 'm k+, n k+ -> m n', '4 k+, k+ d -> 8 d', '* d^, s -> * s'
+* Shape Annotation:
 
-An operator dimension can be annoted with input dimensions and output dimensions.
-Same identifier indicates the same shape and semantically same dimension propagation.
+  e.g., 'a (c+ d^) e'
 
-'->' seperates the inputs (left) and outputs (right) and ',' separates each input and output.
-A shape needs to be annotated using dimension annotations with delimiters of (mulitple) space ' '.
+A shape annotation consists of dimension annotation separated by (multiple) spaces.
 
-Dimension annotations in Output must apear in inputs, or using numeric string
 
-* Splitting Rule:
+* Operator Annotation:
 
-Spatial Splitting (dimension with '' reduce type):
-    tensors that have this dimension will be splitted spatially.
-    tensors that don't have this dimension will be replicated.
+  e.g., 'm k+, n k+ -> m n', '4 k+, k+ d -> 8 d', '* d^, s -> * s'
 
-Numerical Splitting (dimension with '+' reduce type):
-    tensors that have this dimension will be splitted spatially,
-    tensors that don't have this dimension will be splitted numerically
+  An operator can be annotated with input shape annotations and output shape annotations.
 
-Illegal Splitting (dimension with '^' reduce type):
-    Illegal splitting algorithm on this dimension.
+  '->' seperates the inputs (left) and outputs (right) and ',' separates each input and output tensor.
+
+  Identifiers in output tensor annotation needs to be
+  1) apearred in input tensor annotations
+  2) using numeric string
+
+* Operator Partitioning Rule:
+
+  1) Spatial Partition (dimension with '' reduce type):
+      tensors can be uniformly partitioned on dimensions having spatial reduction type.
+      other tensors in the operator that don't have this dimension will be replicated.
+
+  2) Value Partition (dimension with '+' reduce type):
+      * tensors can be uniformly partition on dimensions having numerical reduction type
+      * other tensors in the the operator that don't have this dimension will be partitioned numerically.
+
+  3) Illegal Splitting (dimension with '^' reduce type):
+      * tensors can not be partitioned on dimensions having '^' reduction type.
 
 """
 
-from typing import Any, Dict, List, Union
-from typing import Optional, Set, Tuple, Optional
+from typing import Dict, Iterable, List, Union, Optional, Set, Tuple, Optional
 import enum
 import re
-import copy
 import string
 
 from cube.ir.cten import IRTensor
@@ -61,7 +72,10 @@ from cube.ir.operator import IRFwOperation
 from cube.algorithm.factory import DistAlgorithmFactory
 
 
-class EinDim:
+_kSpecialIdentifiers = ('*', '?')
+
+
+class DimAnno:
     """
     To represent a dimension, name = {identifier}{reducetype}
     e.g.,
@@ -73,109 +87,156 @@ class EinDim:
     """
 
     class ReduceType(enum.Enum):
-        Spatial=''
+        Dim = ''
         Sum = '+'
-        Stay = '^'  # the dim is not allowed to be split
+        Freeze = '^'  # the dim is not allowed to be split
 
-    def __init__(self, name: Union[str, List[str]]):
-        if isinstance(name, str):
-            name = [name]
-        self._name: List[str] = list()
-        self._reduce: List[EinDim.ReduceType] = list()
-        self._length: Dict[str, Optional[int]] = dict()
-        for n in name:
-            # complex name cannot have *
-            if len(name) > 1 and '*' in n:
-                raise ValueError("Einstein Axis name cannot have * for multiple inner-dimension")
-            # get reduce type
-            reduce = EinDim.ReduceType.Spatial
-            if n[-1] == EinDim.ReduceType.Sum.value:
-                reduce = EinDim.ReduceType.Sum
-                n = n[:-1]
-            elif n[-1] == EinDim.ReduceType.Stay.value:
-                reduce = EinDim.ReduceType.Stay
-                n = n[:-1]
-            # get identifier name
-            if len(n) == 0 or not (str.isidentifier(n) or str.isnumeric(n) or n == '*'):
-                raise ValueError(f"EinDim name {n} should be identifier")
-            if str.isnumeric(n):
-                reduce = EinDim.ReduceType.Stay
-            self._name.append(n)
-            self._reduce.append(reduce)
-        for n in self._name:
-            self._length[n] = None
+    def __init__(self, name: Union[str, Tuple[str]]):
+        identifiers, reduces = DimAnno.parse(name)
+        self._identifiers: Tuple[str] = identifiers
+        self._reduces: Tuple[DimAnno.ReduceType] = reduces
 
     @property
     def name(self) -> str:
         """
         Return identifier without reduce
         """
-        if len(self._name) == 1:
-            return self._name[0]
-        return '(' + ' '.join(self._name) + ')'
+        if len(self._identifiers) == 1:
+            return self._identifiers[0]
+        return '(' + ' '.join(self._identifiers) + ')'
 
-    def names(self) -> List[str]:
-        return copy.copy(self._name)
+    def length(self, identifier: str) -> Optional[int]:
+        """
+        Return the integer of identifer
+        """
+        assert identifier in self._identifiers, f"identifier {identifier} not in {self}"
+        return self._length[identifier]
 
     @property
-    def reduce(self) -> str:
-        return self._reduce
+    def identifiers(self) -> Tuple[str]:
+        return self._identifiers
 
-    def setlen(self, anno: str, dim: int):
-        if anno not in self._name:
-            raise KeyError(f"Cannot find anno: {anno} in {self.name}")
-        self._length[anno] = dim
+    @property
+    def reduces(self) -> Tuple[ReduceType]:
+        return self._reduces
 
     def __eq__(self, other):
-        if isinstance(other, EinDim):
+        if isinstance(other, DimAnno):
             if other.name == self.name:
                 return True
         return False
 
-    def is_reduce(self):
-        return self.reduce == EinDim.ReduceType.Sum
-
     def __repr__(self):
-        name_reduce = [name + reduce.value for name, reduce in zip(self._name, self._reduce)]
-        if len(self._name) == 1:
-            return self._name[0] + self._reduce[0].value
+        name_reduce = [name + reduce.value for name, reduce in zip(self._identifiers, self._reduces)]
+        if len(name_reduce) == 1:
+            return name_reduce[0]
         return '(' + ' '.join(name_reduce) + ')'
 
+    @staticmethod
+    def parse(anno: Union[str, Tuple[str]]) -> Tuple[Tuple[str], Tuple[ReduceType]]:
+        assert isinstance(anno, str) or all(isinstance(n, str) for n in anno), \
+            "Expect anno to be str or Tuple[str]"
+        if isinstance(anno, str):
+            anno = (anno,)
+        if len(anno) > 1 and any(i in anno for i in _kSpecialIdentifiers):
+            raise ValueError(f"Dim annotation cannot have {_kSpecialIdentifiers} as partial dimension.")
+        identifiers, reduces = [], []
+        for identifier in anno:
+            # get reduce type
+            reduce = DimAnno.ReduceType.Dim
+            if identifier[-1] == DimAnno.ReduceType.Sum.value:
+                reduce = DimAnno.ReduceType.Sum
+                identifier = identifier[:-1]
+            elif identifier[-1] == DimAnno.ReduceType.Freeze.value:
+                reduce = DimAnno.ReduceType.Freeze
+                identifier = identifier[:-1]
+            # get identifier name
+            assert str.isdecimal(identifier) or str.isidentifier(identifier) or identifier in _kSpecialIdentifiers, \
+                f"identifier can only be integer or python identifier but got {identifier}"
+            # integer will always have stay reduction type
+            if str.isdecimal(identifier):
+                reduce = DimAnno.ReduceType.Freeze
+            identifiers.append(identifier)
+            reduces.append(reduce)
+        return tuple(identifiers), tuple(reduces)
 
-class EinopAnno:
 
-    def __init__(self, anno: str):
-        """
-        initializing annotations specfied in str, e.g.,
-            a (b c) d+, d+ k -> a (b c) k
-        """
-        if not isinstance(anno, str):
-            raise TypeError("Expected anno to be str")
-        self.anno = anno
-        if '->' not in self.anno:
-            raise ValueError("Expected -> in anno")
-        # to inputs and outputs
-        inputs, outputs = self.anno.split('->')
-        inputs = inputs.split(',')
-        outputs = outputs.split(',')
-        # to eindims
-        self._identifiers: Set[str] = set()
-        self.inputs: List[List[EinDim]] = [
-            self.parse_shape(shape) for shape in inputs
-        ]
-        self.outputs: List[List[EinDim]] = [
-            self.parse_shape(shape) for shape in outputs
-        ]
-        self.reset_identifiers()
+class ShapeAnno:
+    """
+    Shape annotation
 
-    def parse_shape(self, shape: str) -> List[EinDim]:
+    e.g., a (b+ dim)  d^
+    """
+
+    def __init__(self, dim_annos: Union[str, Tuple[DimAnno]]):
+        assert isinstance(dim_annos, str) or all(isinstance(adim, DimAnno) for adim in dim_annos), \
+            f"dim_annos must be str or Tuple[DimAnno] but got {dim_annos}"
+        if isinstance(dim_annos, str):
+            dim_annos = ShapeAnno.parse(dim_annos)
+        self._dims: Tuple[DimAnno] = dim_annos
+
+    @property
+    def dims(self) -> Tuple[DimAnno]:
+        return self._dims
+
+    @property
+    def ndims(self) -> int:
+        """!
+        Get dimension number
         """
-        parsing annotations like of a single shape, e.g.,
+        return len(self._dims)
+
+    def getdims(self, identifier: str) -> List[int]:
+        """!
+        Get dims that has the identifier
+
+        @param identifier str: the query identifier
+
+        @return dims List[int]: dimensions that contain the identifier
+        """
+        dims = []
+        for dim, dim_anno in enumerate(self.dims):
+            if identifier in dim_anno.identifiers:
+                dims.append(dim)
+        return dims
+
+    def __getitem__(self, dim: int) -> DimAnno:
+        assert isinstance(dim, int), "indexing only support int, but got {dim}"
+        assert dim < len(self._dims), f"dim {dim} out of boudary {len(self._dims)}"
+        return self._dims[dim]
+
+    def __setitem__(self, index: int, dim_anno: Union[DimAnno, str]):
+        assert isinstance(index, int), "Expected index to be int"
+        assert isinstance(dim_anno, (DimAnno, str)), "Expected DimAnno or str"
+        if isinstance(dim_anno, str):
+            dim_anno = DimAnno(dim_anno)
+        self._dims[index] = dim_anno
+
+    def __repr__(self) -> str:
+        return ' '.join(repr(dim) for dim in self._dims)
+
+    @property
+    def ignore(self) -> bool:
+        """!
+        Check if the shape should be ignored, i.e., annotation is '?'.
+
+        @return is_ignored bool: True if the shape should ignore else False
+        """
+        return self.ndims == 1 and self._dims[0].name == '?'
+
+    @staticmethod
+    def parse(shape_anno: str) -> Tuple[DimAnno]:
+        """
+        Parse annotations like of a single shape, e.g.,
             a (b+ dim)  d^
+
+        @param shape str: shape annotation
+        
+        @return dim_annos Tuple[DimAnno]: tuple of dimension annotations
         """
         # => ['a', '(', 'b+', 'dim', ')', 'd^']
         shapes = list()
-        for group in re.split('\ +', shape):
+        for group in re.split('\ +', shape_anno):
             if len(group) == 0:
                 continue
             if '(' in group or ')' in group:
@@ -189,15 +250,13 @@ class EinopAnno:
         bracket_group = False
         for w in shapes:
             if w == '(':
-                if bracket_group:
-                    raise RuntimeError("brackets inside brackets not allowed")
+                assert not bracket_group, "Syntax Error: brackets inside brackets not allowed"
                 bracket_group = True
                 if len(current_identifier) > 0:
                     edims.append(current_identifier)
                 current_identifier = list()
             elif w == ')':
-                if not bracket_group:
-                    raise RuntimeError("backets are not balanced at (")
+                assert bracket_group, "Syntax Error: backets are not balanced at ("
                 bracket_group = False
                 if len(current_identifier) > 0:
                     edims.append(current_identifier)
@@ -209,27 +268,210 @@ class EinopAnno:
                     if len(current_identifier) > 0:
                         edims.append(current_identifier)
                     current_identifier = [w]
-        if bracket_group:
-            raise RuntimeError("brackets are not balanced at )")
+        assert not bracket_group, "Syntax Error: brackets are not balanced at )"
         if len(current_identifier) != 0:
             edims.append(current_identifier)
-        edims = [EinDim(edim) for edim in edims]
-        return edims
+        dim_annos = tuple(DimAnno(edim) for edim in edims)
+        return dim_annos
 
+    @staticmethod
+    def create_shape_str(shape: Tuple[int], reduction: str = '', iterator: Optional[Iterable] = None) -> List[str]:
+        """
+        Create dimension string annotation given the shape and identity iterator
+        e.g., ['a+', 'b+', 'c+']
+
+        @param shape List[int]: tensor shape
+        @param iterator Optional[Iterable]: identity iterators. If None, use string.ascii_lowercase
+        @param reduce (str): reduction type must be in '', '+' or '^'
+
+        @return strs List[str]: each element in strs represents a dimension
+        """
+        if iterator is None:
+            iterator = iter(string.ascii_lowercase)
+        return [next(iterator) + reduction for _ in range(len(shape))]
+
+
+class OpAnno:
+    """
+    Operator annotation.
+
+    e.g., a (b c) d+, d+ k -> a (b c) k
+
+    """
+
+    def __init__(self, anno: Union[str, Tuple[Tuple[ShapeAnno], Tuple[ShapeAnno]]]):
+        assert isinstance(anno, str) or \
+            (len(anno) == 2 and all(isinstance(ashape, ShapeAnno) for ashape in list(anno[0]) + list(anno[1]))), \
+            "Expected anno to be str or (inputs: [ShapeAnno], outputs: [ShapeAnno])"
+        if isinstance(anno, str):
+            anno = OpAnno.parse(anno)
+        inputs, outputs = anno
+        self._inputs: Tuple[ShapeAnno] = tuple(inputs)
+        self._outputs: Tuple[ShapeAnno] = tuple(outputs)
+        self._identifiers: Dict[str, int] = dict()
+        self.reset_identifiers()
+
+    @property
     def identifiers(self) -> Set[str]:
-        return copy.copy(self._identifiers)
+        """!
+        Get all identifier set
+
+        @return identifiers Set[str]
+        """
+        return tuple(self._identifiers.keys())
+
+    def inputs(self, index: Optional[int] = None) -> Union[ShapeAnno, Tuple[ShapeAnno]]:
+        """!
+        Get shape annotation of index-th input.
+        If index is None, will return all shape annotations
+
+        @param index Optional[int]: the index of input.
+        
+        @return shape_annos Union[ShapeAnno, Tuple[ShapeAnno]]: the shape annotation
+        """
+        assert index is None or index < len(self._inputs), "index out of boundary"
+        if index is None:
+            return self._inputs
+        else:
+            return self._inputs[index]
+
+    def set_input(self, index: int, shape_anno: Union[str, ShapeAnno]):
+        """
+        set the shape of index-th input tensors
+        """
+        assert isinstance(shape_anno, (str, ShapeAnno)), f"must be str or ShapeAnno but got {shape_anno}"
+        assert index is None or index < len(self._inputs), "index out of boundary"
+        inputs = list(self._inputs)
+        inputs[index] = shape_anno if isinstance(shape_anno, ShapeAnno) else ShapeAnno(shape_anno)
+        self._inputs = tuple(inputs)
+
+    def outputs(self, index: Optional[int] = None) -> Union[ShapeAnno, Tuple[ShapeAnno]]:
+        assert index is None or index < len(self._outputs), "index out of boundary"
+        if index is None:
+            return self._outputs
+        else:
+            return self._outputs[index]
+
+    def set_output(self, index: int, shape_anno: Union[str, ShapeAnno]):
+        """
+        set the shape of index-th input tensors
+        """
+        assert isinstance(shape_anno, (str, ShapeAnno)), f"must be str or ShapeAnno but got {shape_anno}"
+        assert index is None or index < len(self._outputs), "index out of boundary"
+        outputs = list(self._outputs)
+        outputs[index] = shape_anno if isinstance(shape_anno, ShapeAnno) else ShapeAnno(shape_anno)
+        self._outputs = tuple(outputs)
 
     def reset_identifiers(self):
-        self._identifiers = set()
-        for eshape in self.inputs + self.outputs:
-            for edim in eshape:
-                for name in edim.names():
-                    self._identifiers.add(name)
+        """!
+        Reset identifier set.
+
+        @return None
+        """
+        self._identifiers = dict()
+        shape_annos = list(self._inputs) + list(self._outputs)
+        for ashape in shape_annos:
+            for adim in ashape.dims:
+                self._identifiers.update({identifier: None for identifier in adim.identifiers})
+        for identifier in self._identifiers.keys():
+            if str.isdecimal(identifier):
+                self._identifiers[identifier] = int(identifier)
+
+    def setlen(self, identifier: str, length: int, override=False) -> bool:
+        """!
+        Set identifier length
+
+        @param identifier str: identifier name
+        @param length int: the real length of identifier
+        @param override bool: if True will always set length, else will check if the existing length matches the new length
+
+        @return success True if sucessfully set else False
+        """
+        assert identifier in self._identifiers, f"{identifier} not int identifier set {self._identifiers}"
+        if not override:
+            prelen = self._identifiers[identifier]
+            if prelen is not None and prelen != length:
+                return False
+        self._identifiers[identifier] = length
+        return True
+
+    def getlen(self, identifier: str) -> Optional[int]:
+        """!
+        Get identifier length
+
+        @param identifier str: identifier name
+        
+        @return length Optional[int]: the length of identifier
+        """
+        assert identifier in self._identifiers, f"{identifier} not int identifier set {self._identifiers}"
+        return self._identifiers[identifier]
 
     def __repr__(self) -> str:
-        inputs = ', '.join([repr(input) for input in self.inputs])
-        outputs = ', '.join(repr(output) for output in self.outputs)
+        inputs = ', '.join(repr(input) for input in self.inputs())
+        outputs = ', '.join(repr(output) for output in self.outputs())
         return inputs + ' -> ' + outputs
+
+    @staticmethod
+    def parse(anno: str) -> Tuple[Tuple[ShapeAnno], Tuple[ShapeAnno]]:
+        """!
+        Parse op annotation string to input shape annos and output shape annos.
+
+        @param anno str: operator annotation
+
+        @return (inputs, outputs) Tuple[Tuple[ShapeAnno], Tuple[ShapeAnno]]
+        """
+        # to inputs and outputs
+        if '->' not in anno:
+            raise ValueError("Syntax Error: Expected -> in operator anno")
+        inputs, outputs = anno.split('->')
+        inputs = inputs.split(',')
+        outputs = outputs.split(',')
+        # to ShapeAnnos
+        inputs: Tuple[ShapeAnno] = tuple(ShapeAnno(shape) for shape in inputs)
+        outputs: Tuple[ShapeAnno] = tuple(ShapeAnno(shape) for shape in outputs)
+        return inputs, outputs
+
+    @staticmethod
+    def create_op_str(ins: Tuple[Tuple[Union[str, Tuple[str]]]],
+                      ous: Tuple[Tuple[Union[str, Tuple[str]]]]) -> str:
+        """!
+        Create operator annotation string
+        e.g., 
+            ins = [ ['a', 'b', 'c+'], ['c+', ['d', 'e']] ]
+            ous = [ ['a', 'b', 'd', 'e'] ]
+        =>
+            'a b c+, c+ (d e) -> a b d e'
+
+        @param ins Tuple[Tuple[Union[str, Tuple[str]]]: input identifier list
+        @param ous Tuple[Tuple[Union[str, Tuple[str]]]: output identifier list
+        
+        @return anno str: operator annotation
+        """
+        in_annos = list()
+        ou_annos = list()
+        for shape in ins:
+            flatten = list()
+            for edim in shape:
+                if isinstance(edim, str):
+                    flatten.append(edim)
+                # List
+                elif len(edim) == 1:
+                    flatten.append(edim[0])
+                else:
+                    flatten.append('(' + ' '.join(edim) + ')')
+            in_annos.append(' '.join(flatten))
+        for shape in ous:
+            flatten = list()
+            for edim in shape:
+                if isinstance(edim, str):
+                    flatten.append(edim)
+                # List
+                elif len(edim) == 1:
+                    flatten.append(edim[0])
+                else:
+                    flatten.append('(' + ' '.join(edim) + ')')
+            ou_annos.append(' '.join(flatten))
+        return ', '.join(in_annos) + ' -> ' + ', '.join(ou_annos)
 
 
 
@@ -238,17 +480,29 @@ class IREinops(IRFwOperation):
     Einstein-inspired notation operations
     """
     def __init__(self, signature: str, annos: Tuple[str],
-                 inputs: List, name: str, **kwargs):        
+                 inputs: List[IRTensor], name: str, **kwargs):
+        """!
+        Create a IRDimops
+
+        @param signature str: operator signature
+        @param annos List[str]: annotation candidates
+        @param inputs List[IRTensor]: input tensor list
+        @param name str: the name of the operator
+        @param kwargs: the kwarg non-tensor parameters
+        """
+        assert all(isinstance(anno, str) for anno in annos), "Expect annos to be List[str]"      
         self._annos_candidates: List[str] = tuple(annos)
-        self._iannos: List[List[EinDim]] = None
-        self._oannos: List[List[EinDim]] = None
+        self._anno: OpAnno = None
+        self._iannos: List[ShapeAnno] = None
+        self._oannos: List[ShapeAnno] = None
 
         for anno in self._annos_candidates:
-            anno = EinopAnno(anno)
+            anno = OpAnno(anno)
             # expand * and check shape dimension consistency
-            if self.parse(inputs, anno):
-                self._iannos = anno.inputs
-                self._oannos = anno.outputs
+            if self.align(inputs, anno, **kwargs):
+                self._iannos = anno.inputs()
+                self._oannos = anno.outputs()
+                self._anno = anno
                 break
         else:
             raise RuntimeError(
@@ -266,54 +520,61 @@ class IREinops(IRFwOperation):
         for name in kwargs:
             self.kwargs[name] = kwargs[name]
 
+    @property
+    def anno(self) -> OpAnno:
+        return self._anno
+
+    def ianno(self, index: int) -> Tuple[DimAnno]:
+        """!
+        Get index-th input tensor shape annotation
+
+        @param index int: the input index
+
+        @return dim_annos Tuple[DimAnno]: a tuple that each element is a dimension annotation
+        """
+        assert index < len(self.inputs()), "index out of boudary"
+        return tuple(self._iannos[index])
+
+    def oanno(self, index: int) -> Tuple[DimAnno]:
+        """!
+        Get index-th output tensor shape annotation
+
+        @param index int: the output index
+
+        @return dim_annos Tuple[DimAnno]: a tuple that each element is a dimension annotation
+        """
+        assert index < len(self.outputs()), "index out of boudary"
+        return self._oannos[index]
+
     def infer_shape(self) -> bool:
         """
         Shape inference using the matched annotation
+
+        @return sucess: True if successfully inferred shape
         """
-        dimlen: Dict[str, int] = dict()
-        for input, ishape in zip(self.inputs(), self._iannos):
-            if not isinstance(input, IRTensor):
-                continue
-            for tdim, edim in zip(input.shape, ishape):                    
-                if len(edim.names()) == 1:
-                    dimlen[edim.name] = tdim
-                    continue
-                # infer hidden dim shape
-                toinfer = None
+        for oidx, otensor in enumerate(self.outputs()):
+            shape_anno = self.oanno(oidx)
+            shape = []
+            for odim in range(shape_anno.ndims):
                 accum = 1
-                for name in edim.names():
-                    if str.isnumeric(name):
-                        accum *= int(name)
-                        dimlen[name] = int(name) 
-                    elif name in self.kwargs:
-                        accum *= self.kwargs[name]
-                        dimlen[name] = self.kwargs[name]
-                    else:
-                        if toinfer is not None:
-                            raise RuntimeError(f"Too many dimensions need to be inferred")
-                        toinfer = name
-                    if toinfer is not None:
-                        dimlen[toinfer] = tdim // accum
-        # figure output shape
-        for oidx in range(len(self._outputs)):
-            output_shape = list()
-            for odim in self._oannos[oidx]:
-                accum = 1
-                for name in odim.names():
-                    if str.isnumeric(name):
-                        accum *= int(name)
-                    else:
-                        if name not in dimlen:
-                            raise KeyError(f"Dim annotation {name} not in input")
-                        accum *= dimlen[name]
-                output_shape.append(accum)
-            self.outputs(oidx).shape = output_shape
+                for identifier in shape_anno[odim].identifiers:
+                    accum *= self.anno.getlen(identifier)
+                shape.append(accum)
+            otensor.shape = shape
+        # print(f'=> sign: {self.signature} anno: {self.anno}\n'
+        #       f'=> inputs: {self.inputs()}\n'
+        #       f'=> outputs: {self.outputs()}')
         return True
 
-    def new(self, inputs: List, outputs: List):
-        """
-        construct a new operator sharing same kwargs with new inputs
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        """!
+        Construct a new operator sharing same kwargs with new inputs
         and outputs
+
+        @param inputs List[IRTensor]: input tensors
+        @param outputs List[IRTensor]: output tensors
+
+        @return op IRDimop: the new constructed operator
         """
         annos = self._annos_candidates
         op = IREinops(self.signature, annos, inputs, self.name, **self.kwargs)
@@ -321,73 +582,88 @@ class IREinops(IRFwOperation):
             op.set_output(idx, output)
         return op
 
-    def parse(self, inputs: List[Any], anno: EinopAnno) -> Tuple[bool, List[List[EinDim]], List[List[EinDim]]]:
-        """
-        parse annotations, assuming input tensor shape is given
-        """
-        identifiers = anno.identifiers()
+    def align(self, inputs: List[IRTensor], op_anno: OpAnno, **kwargs) -> bool:
+        """!
+        Align input tensor shapes to the operator annotation.
 
+        @param inputs List[IRTensor]: input tensor list
+        @param op_anno OpAnno: operator annotation
+
+        @return success True if align success else False
+        """
+        identifiers = op_anno.identifiers
         # input shape match
-        if len(anno.inputs) != len(inputs):
+        if len(op_anno.inputs()) != len(inputs):
             return False
-
         # expand *
         expand_dims = None
         if '*' in identifiers:
             candicates = [c for c in string.ascii_lowercase if c not in identifiers]
             # go through inputs
-            for idx, (eshape, input) in enumerate(zip(anno.inputs, inputs)):
-                names = [edim.name for edim in eshape]
+            for idx, (ashape, itensor) in enumerate(zip(op_anno.inputs(), inputs)):
+                names = [dim_anno.name for dim_anno in ashape.dims]
                 if '*' in names:
-                    if not isinstance(input, IRTensor):
+                    if not isinstance(itensor, IRTensor):
                         return False
                     pos = names.index('*')
-                    split = eshape[pos].reduce[0].value
-                    span = len(inputs[idx].shape) - (len(names) - 1)
-                    if expand_dims is not None and len(expand_dims) != span:
+                    reduce = ashape[pos].reduces[0].value
+                    ndims = len(inputs[idx].shape) - (len(names) - 1)
+                    if expand_dims is not None and len(expand_dims) != ndims:
                         return False
                     if expand_dims is None:
                         expand_dims = []
-                        if span > 0:
-                            expand_dims = [EinDim(candicates[dim]+split) for dim in range(span)]
-                    anno.inputs[idx] = anno.inputs[idx][:pos] + expand_dims + anno.inputs[idx][pos+1:]
+                        if ndims > 0:
+                            expand_dims = list(DimAnno(candicates[dim] + reduce) for dim in range(ndims))
+                    shape_anno = list(op_anno.inputs(idx).dims[:pos]) + expand_dims + list(op_anno.inputs(idx).dims[pos+1:])
+                    shape_anno = ShapeAnno(tuple(shape_anno))
+                    op_anno.set_input(idx, shape_anno)
             # * should appear in inputs
-            if expand_dims is None:
-                return False
+            assert expand_dims is not None, f"Syntax Error: {op_anno}: * should also appear in inputs"
             # go through outputs
-            for idx, eshape in enumerate(anno.outputs):
-                names = [edim.name for edim in eshape]
+            for idx, shape_anno in enumerate(op_anno.outputs()):
+                names = [dim_anno.name for dim_anno in shape_anno.dims]
                 if '*' in names:
                     pos = names.index('*')
-                    anno.outputs[idx] = anno.outputs[idx][:pos] + expand_dims + anno.outputs[idx][pos+1:]
-            anno.reset_identifiers()
+                    shape_anno = list(op_anno.outputs(idx).dims[:pos]) + expand_dims + list(op_anno.outputs(idx).dims[pos+1:])
+                    shape_anno = ShapeAnno(tuple(shape_anno))
+                    op_anno.set_output(idx, shape_anno)
+            op_anno.reset_identifiers()
 
         # check dimension consistency
-        dimlen: Dict[str, int] = dict()
-        for eshape, input in zip(anno.inputs, inputs):
-            if input is None:
+        for ashape, itensor in zip(op_anno.inputs(), inputs):
+            if not (isinstance(itensor, IRTensor) ^ ashape.ignore):
+                return False
+            if not isinstance(itensor, IRTensor):
                 continue
-            if not isinstance(input, IRTensor):
-                if not (len(eshape) == 1 and eshape[0].name == '1'):
+            if ashape.ndims != len(itensor.shape):
+                return False
+            for adim, dimlen in zip(ashape.dims, itensor.shape):
+                ret = True
+                identifiers = adim.identifiers
+                if len(identifiers) == 1:
+                    ret = op_anno.setlen(identifiers[0], dimlen)
+                else:
+                    toinfer, accum = [], 1
+                    for identifier in identifiers:
+                        length = op_anno.getlen(identifier)
+                        if length is None:
+                            if identifier not in kwargs:
+                                toinfer.append(identifier)
+                            else:
+                                assert isinstance(kwargs[identifier], int), "require integer for annotation inference"
+                                ret = op_anno.setlen(identifier, kwargs[identifier])
+                                accum *= kwargs[identifier]
+                        else:
+                            accum *= length
+                    if len(toinfer) == 0 and accum != dimlen:
+                        return False
+                    assert len(toinfer) <= 1, f"Syntax Error {op_anno}: cannot infer hidden dim: {adim}"
+                    if len(toinfer) == 1:
+                        assert dimlen % accum == 0, f"{dimlen} % {accum} != 0"
+                        ret = op_anno.setlen(toinfer[0], dimlen // accum)
+                if not ret:
                     return False
-            else:
-                if len(input.shape) != len(eshape):
-                    return False
-                for edim, nele in zip(eshape, input.shape):
-                    if edim.name in dimlen:
-                        if nele != dimlen[edim.name]:
-                            return False
-                    dimlen[edim.name] = nele
         return True
-
-    def einexpr(self) -> str:
-        inputs = list()
-        outputs = list()
-        for shape in self._iannos:
-            inputs.append(' '.join([repr(edim) for edim in shape]))
-        for shape in self._oannos:
-            outputs.append(' '.join([repr(edim) for edim in shape]))
-        return ', '.join(inputs) + ' -> ' + ', '.join(outputs)
 
     def algorithms(self, tag: Optional[str] = None):
         factory = DistAlgorithmFactory()

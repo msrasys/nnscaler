@@ -19,22 +19,17 @@ class DimSplitConv2D(GenericDistAlgo):
             raise TypeError(f"Expect IRConv2D")
         super().__init__(node)
 
-    def satisfy(self, config: Dict):
-        """
-        config = dict(idx=int, dim=int, num=num)
+    def satisfy(self, idx: int, dim: int, num: int):
+        """!
+        Dimension split on Conv2D operator:
 
         N iC H W, oC iC dH dW, oC -> N oC oH oW
 
         Splittable dimension: N, oC
         Reduce dimension: oC 
         """
-        for attr in ['idx', 'dim', 'num']:
-            if not attr in config:
-                raise KeyError("Expected idx, dim, num in the config")
+        assert all(isinstance(t, int) for t in [idx, dim, num]), "idx, dim and num should be integer"
         node: IRConv2D = self.node
-        idx: int = config['idx']
-        dim: int = config['dim']
-        num: int = config['num']
         groups = node.kwargs['groups']
         # split N:
         if (idx, dim) == (0, 0):
@@ -46,14 +41,10 @@ class DimSplitConv2D(GenericDistAlgo):
         if (idx, dim) == (0, 1) or (idx, dim) == (1, 1):
             return groups == 1 and node.inputs(1).shape[0] % 0 == num
 
-    def instantiate(self, config: Dict):
-        if not self.satisfy(config):
+    def instantiate(self, idx: int, dim: int, num: int):
+        if not self.satisfy(idx, dim, num):
             return False
         node: IRConv2D = self.node
-        idx: int = config['idx']
-        dim: int = config['dim']
-        num: int = config['num']
-
         inputs, weights, bias = list(), list(), list()
         outputs = list()
         # split N
@@ -98,15 +89,10 @@ class HaloSplitConv2D(GenericDistAlgo):
             raise TypeError(f"Expect IRConv2D")
         super().__init__(node)
 
-    def satisfy(self, config: Dict):
-        for attr in ['idx', 'dim', 'num']:
-            if not attr in config:
-                raise KeyError("Expected idx, dim, num in the config")
+    def satisfy(self, idx: int, dim: int, num: int):
+        assert all(isinstance(t, int) for t in [idx, dim, num]), "idx, dim and num should be integer"
         node: IRConv2D = self.node
         oH, oW = node.outputs(0).shape[2:]
-        idx: int = config['idx']
-        dim: int = config['dim']
-        num: int = config['num']
         stride = node.kwargs['stride']
         dilation = node.kwargs['dilation']
         if dim not in [2, 3]:
@@ -123,16 +109,13 @@ class HaloSplitConv2D(GenericDistAlgo):
         if (idx, dim) == (0, 3):
             return oW % num == 0
 
-    def instantiate(self, config: Dict):
-        if not self.satisfy(config):
+    def instantiate(self, idx: int, dim: int, num: int):
+        if not self.satisfy(idx, dim, num):
             return None
         node: IRConv2D = self.node
         H, W = node.inputs(0).shape[2:]
         dH, dW = node.inputs(1).shape[2:]
         oH, oW = node.outputs(0).shape[2:]
-        idx: int = config['idx']
-        dim: int = config['dim']
-        num: int = config['num']
         groups = node.kwargs['groups']
         stride = node.kwargs['stride']
         padding = node.kwargs['padding']
@@ -208,15 +191,10 @@ class HaloSplitConv3D(GenericDistAlgo):
             raise TypeError(f"Expect IRConv2D")
         super().__init__(node)
 
-    def satisfy(self, config: Dict):
-        for attr in ['idx', 'dim', 'num']:
-            if not attr in config:
-                raise KeyError("Expected idx, dim, num in the config")
+    def satisfy(self, idx: int, dim: int, num: int):
+        assert all(isinstance(t, int) for t in [idx, dim, num]), "idx, dim and num should be integer"
         node: IRConv3D = self.node
         oD, oH, oW = node.outputs(0).shape[2:]
-        idx: int = config['idx']
-        dim: int = config['dim']
-        num: int = config['num']
         stride = node.kwargs['stride']
         dilation = node.kwargs['dilation']
         if dim not in [2, 3]:
@@ -233,16 +211,13 @@ class HaloSplitConv3D(GenericDistAlgo):
         if (idx, dim) == (0, 3):
             return oW % num == 0
 
-    def instantiate(self, config: Dict):
-        if not self.satisfy(config):
+    def instantiate(self, idx: int, dim: int, num: int):
+        if not self.satisfy(idx, dim, num):
             return None
         node: IRConv3D = self.node
         D, H, W = node.inputs(0).shape[2:]
         dD, dH, dW = node.inputs(1).shape[2:]
         oD, oH, oW = node.outputs(0).shape[2:]
-        idx: int = config['idx']
-        dim: int = config['dim']
-        num: int = config['num']
         groups = node.kwargs['groups']
         stride = node.kwargs['stride']
         padding = node.kwargs['padding']

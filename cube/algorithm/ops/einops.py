@@ -1,9 +1,9 @@
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from cube.algorithm.utils import split_axis, split_value
 from cube.algorithm.generics import GenericDistAlgo
 
-from cube.graph.function import IREinops, EinDim
+from cube.graph.function.einops import IREinops, DimAnno
 
 
 class DimSplitEinops(GenericDistAlgo):
@@ -21,73 +21,78 @@ class DimSplitEinops(GenericDistAlgo):
         if not isinstance(node, IREinops):
             raise TypeError(f"Expect IREinops")
         super().__init__(node)
+        self._adim: str = None
+        self._reduce: DimAnno.ReduceType = None
     
-    def satisfy(self, config: Dict):
+    def satisfy(self, idx: int, dim: int, num: int) -> bool:
         """
-        config = dict(idx=int, dim=int)
+        Check whether the condition satisfies.
         
-        idx: int
-            input index
-        dim: int
-            dimension of index-th input
-        num: int
-            number of chunks to partition
+        @param idx int: input index
+        @param dim int: input dimension
+        @param num int: chunks to partition the dimension
+
+        @return satisfy bool: true if can be partitioned, elsewise false.
         """
-        for attr in ['idx', 'dim', 'num']:
-            if not attr in config:
-                raise KeyError("Expected idx, dim, num in the config")
+        assert all(isinstance(cond, int) for cond in [idx, dim, num]), "expect int condition"
         node: IREinops = self.node
-        idx: int = config['idx']
-        dim: int = config['dim']
-        num: int = config['num']
-        if not (isinstance(idx, int) and abs(idx) < len(node.inputs())):
+        
+        ninputs = len(node.inputs())
+        if idx >= ninputs or idx < 0-ninputs:
             return False
         if node.inputs(idx).shape is None or abs(dim) >= len(node.inputs(idx).shape):
             return False
-        if node.inputs(idx).shape[dim] % num != 0:
+        # due to implementation limits, we only partition the first annotated dimension
+        # for inner-dimension cases.
+        self._adim: str = node.anno.inputs(idx).dims[dim].identifiers[0]
+        self._reduce: DimAnno.ReduceType = node.anno.inputs(idx).dims[dim].reduces[0]
+        dimlen = node.anno.getlen(self._adim)
+        if self._reduce == DimAnno.ReduceType.Freeze:
             return False
-        if node._iannos[idx][dim].reduce == EinDim.ReduceType.Stay:
+        if dimlen % num != 0:
             return False
         return True
 
-    def instantiate(self, config: Dict) -> List[IREinops]:
-        if not self.satisfy(config):
+    def instantiate(self, idx: int, dim: int, num: int) -> Optional[List[IREinops]]:
+        if not self.satisfy(idx, dim, num):
             return False
         node: IREinops = self.node
-        idx: int = config['idx']
-        dim: int = config['dim']
-        num: int = config['num']
-        edim: EinDim = node._iannos[idx][dim]
-
-        # print(f'splitting: {node.einexpr()}')
+        print(node.anno, f'partition: {self._adim}; reduce: {self._reduce.value}')
 
         ins, ous = list(), list()
-        for iidx, input in enumerate(node.inputs()):
-            if edim in node._iannos[iidx]:
-                dim = node._iannos[iidx].index(edim)
-                sub_tensors = split_axis(input, dim, num)
+        for iidx, itensor in enumerate(node.inputs()):
+            shape_anno = node.anno.inputs(iidx)
+            split_dims = shape_anno.getdims(self._adim)
+            assert len(split_dims) <= 1, f"find split dims ({self._adim}) more than 1: {shape_anno}"
+            if len(split_dims) == 1:
+                dim = split_dims[0]
+                # split axis
+                sub_tensors = split_axis(itensor, dim, num)
                 ins.append(sub_tensors)
             else:
-                if edim.reduce[0] == EinDim.ReduceType.Sum:
-                    # print(f'Warning: value split on one input tensor in node{node._id}:{node.name} as reduce axis {axis} not appeared.')
-                    ins.append(split_value(input, num))
+                # replicate if no split dimension of this tensor
+                # ins.append([itensor] * num)
+                # ad-hoc FIXME: for linear function Ax+b of splitting reduction dimension, b should
+                # be splitted by value dimension.
+                if self._reduce == DimAnno.ReduceType.Sum:
+                    ins.append(split_value(itensor, num))
                 else:
-                    ins.append([input] * num)
-        for oidx, output in enumerate(node.outputs()):
-            # split on the non-reduce axis, the output value keeps same
-            # but the output shape gets splitted
-            if edim in node._oannos[oidx]:
-                dim = node._oannos[oidx].index(edim)
-                if edim.reduce[0] == EinDim.ReduceType.Sum:
-                    raise RuntimeError(f"Reduced axis {dim} appeared in output")
-                sub_tensors  = split_axis(output, dim, num)
+                    ins.append([itensor] * num)
+        
+        for oidx, otensor in enumerate(node.outputs()):
+            shape_anno = node.anno.outputs(oidx)
+            split_dims = shape_anno.getdims(self._adim)
+            assert len(split_dims) <= 1, f"find split dims ({self._adim}) more than 1: {shape_anno}"
+            # split axis
+            if self._reduce == DimAnno.ReduceType.Dim:
+                assert len(split_dims) == 1, f"expect only one spatial dimension in output tensor but got {len(split_dims)}"
+                dim = split_dims[0]
+                sub_tensors = split_axis(otensor, dim, num)
                 ous.append(sub_tensors)
-            # split on the reduce axis, the output shape keeps same 
-            # but the output value get splitted
+            # split numerical dimension
             else:
-                if edim.reduce[0] != EinDim.ReduceType.Sum:
-                    raise RuntimeError(f"Expect axis {edim} to be reduced axis")
-                sub_tensors = split_value(output, num)
+                assert len(split_dims) == 0, f"expect no numerical dimension in output tensor but got {len(split_dims)}"
+                sub_tensors = split_value(otensor, num)
                 ous.append(sub_tensors)
 
         sub_nodes = list()
@@ -98,27 +103,3 @@ class DimSplitEinops(GenericDistAlgo):
             sub_node.infer_shape()
             sub_nodes.append(sub_node)
         return sub_nodes
-
-    def space(self, num_device: int) -> List[Dict[str, int]]:
-        """
-        Return a list of possible configurations
-        given the number of devices
-        """
-        possible_idx = list()
-        possible_dim = list()
-        num = num_device
-        dims = list()
-        node: IREinops = self.node
-        for idx, eindims in enumerate(node._ieins):
-            for dim, eindim in enumerate(eindims):
-                if eindim.reduce != EinDim.ReduceType.Stay:
-                    if eindim not in dims:
-                        dims.append(eindim)
-                        possible_idx.append(idx)
-                        possible_dim.append(dim)
-        possible_configs = list()
-        for idx, dim in zip(possible_idx, possible_dim):
-            config = dict(idx=idx, dim=dim, num=num)
-            if self.satisfy(config):
-                possible_configs.append(config)
-        return possible_configs

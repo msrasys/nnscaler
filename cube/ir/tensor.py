@@ -708,8 +708,7 @@ class IRSubTensor(IRTensor):
             for consumer in self.parent.consumers:
                 for itensor in consumer.inputs():
                     if self.overlap(itensor):
-                        assert itensor == self, \
-                            "partial overlapping of consumed tensors is not supported during backward"
+                        # TODO: we should guarantee in final status itensor == self
                         # replicated nodes will have same node id
                         if consumer._id not in ref_consumers:
                             ref_consumers.append(consumer._id)

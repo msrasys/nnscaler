@@ -453,7 +453,7 @@ class IRGraph(IRCell):
             self.reset_dependency()
         return [op] + fnodes
 
-    def partition(self, op: IRCell, algo: GenericDistAlgo, config: Dict) -> Optional[List[IRCell]]:
+    def partition(self, op: IRCell, algo: GenericDistAlgo, **config) -> Optional[List[IRCell]]:
         """
         Partition an operator (op) by using
         op partition algorithm (algo) and its configuration (config).
@@ -477,9 +477,9 @@ class IRGraph(IRCell):
 
         if algo.node != op:
             return None
-        if not algo.satisfy(config):
+        if not algo.satisfy(**config):
             return None
-        fnodes = algo.instantiate(config)
+        fnodes = algo.instantiate(**config)
 
         #FIXME: we don't allow non-weight input to be splitted in value
         for fnode in fnodes:

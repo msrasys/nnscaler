@@ -2,7 +2,7 @@
 Register cutomized function
 """
 
-from typing import Any, Callable, List
+from typing import Any, Callable, List, Optional
 import inspect
 import torch
 
@@ -11,7 +11,7 @@ from cube.graph.function.einops import IREinops
 from cube.graph.parser.mapping import Sign2Op
 
 
-def register(anno: str):
+def register(anno: str, name: Optional[str] = None):
     """
     Register a function with einop annotations.
 
@@ -20,7 +20,7 @@ def register(anno: str):
         1). Has type annotations for each input
         2). Tensor inputs goes first then other inputs
 
-    For EinDims containing brackets (e.g., (3 h d)) that can not be
+    For DimAnnos containing brackets (e.g., (3 h d)) that can not be
     inferred by system, user should have same argument name in the
     function definition to help system infer each dim length, e.g.,
     
@@ -31,7 +31,7 @@ def register(anno: str):
     def decorator(fn: Callable):
         if not callable(fn):
             raise TypeError("Expected a function")
-        fsig = fn.__name__
+        fsig = fn.__name__ if name is None else name
         args = inspect.signature(fn)
         arg_names = list(args.parameters.keys())
         arg_kind = [args.parameters[name].annotation for name in arg_names]

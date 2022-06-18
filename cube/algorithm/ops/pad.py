@@ -1,6 +1,4 @@
-from typing import Dict
-
-from cube.algorithm.utils import split_axis, split_axis_custom, split_value
+from cube.algorithm.utils import split_axis, split_axis_custom
 from cube.algorithm.generics import GenericDistAlgo
 
 from cube.graph.function.pad import IRPad
@@ -15,17 +13,13 @@ class DimSplitPad(GenericDistAlgo):
             raise TypeError(f"Expect IRConv2D")
         super().__init__(node)
 
-    def satisfy(self, config: Dict):
+    def satisfy(self, dim: int, num: int):
         """
         config = dict(idx=int, dim=int, num=num)
 
         """
-        for attr in ['dim', 'num']:
-            if not attr in config:
-                raise KeyError("Expected dim, num in the config")
+        assert all(isinstance(t, int) for t in [dim, num]), "dim and num should be integer"
         node: IRPad = self.node
-        dim: int = config['dim']
-        num: int = config['num']
         pad = node.kwargs['pad']
         mode = node.kwargs['mode']
         value = node.kwargs['value']
@@ -40,12 +34,10 @@ class DimSplitPad(GenericDistAlgo):
             dim_in_pad = len(node.inputs(0).shape) - 1 - dim
             return (node.inputs(0).shape[dim] + pad[dim_in_pad * 2] + pad[dim_in_pad * 2 + 1]) % num == 0
 
-    def instantiate(self, config: Dict):
-        if not self.satisfy(config):
+    def instantiate(self, dim: int, num: int):
+        if not self.satisfy(dim, num):
             return False
         node: IRPad = self.node
-        dim: int = config['dim']
-        num: int = config['num']
         pad = node.kwargs['pad']
         mode = node.kwargs['mode']
         value = node.kwargs['value']

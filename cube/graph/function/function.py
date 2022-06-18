@@ -1,11 +1,11 @@
-from typing import Any, Iterable, List, Optional, Tuple, Union, Dict
+from typing import Any, List, Optional, Tuple, Dict
 import string
 import copy
 import torch
 import warnings
 
 from cube.ir.cten import IRTensor
-from cube.graph.function.einops import EinDim, IREinops
+from cube.graph.function.einops import ShapeAnno, OpAnno, IREinops
 from cube.graph.function.conv import IRConv2D
 from cube.graph.function.conv import IRConv3D
 from cube.graph.function.pad import IRPad
@@ -20,58 +20,10 @@ from cube.ir.dtype import IRDType
 from cube.graph.torch_dtype_mapping import DType2IRDType, TorchScalarTypeEnumMap
 
 
-def _create_eshape(shape: List[int], iterator: Optional[Iterable] = None,
-                  reduce: EinDim.ReduceType = EinDim.ReduceType.Spatial) -> List[str]:
-    """
-    Create dimension annotation given the shape and 
-    letter iterator
-    """
-    if iterator is None:
-        iterator = iter(string.ascii_lowercase)
-    return [next(iterator) + reduce.value for _ in range(len(shape))]
-
-
-def _create_anno(ins: List[List[Union[str, List[str]]]],
-                 ous: List[List[Union[str, List[str]]]]) -> str:
-    """
-    Create annotation string
-    e.g., 
-        ins = [ ['a', 'b', 'c+'], ['c+', ['d', 'e']] ]
-        ous = [ ['a', 'b', 'd', 'e'] ]
-    =>
-        'a b c+, c+ (d e) -> a b d e'
-    """
-    in_annos = list()
-    ou_annos = list()
-    for shape in ins:
-        flatten = list()
-        for edim in shape:
-            if isinstance(edim, str):
-                flatten.append(edim)
-            # List
-            elif len(edim) == 1:
-                flatten.append(edim[0])
-            else:
-                flatten.append('(' + ' '.join(edim) + ')')
-        in_annos.append(' '.join(flatten))
-    for shape in ous:
-        flatten = list()
-        for edim in shape:
-            if isinstance(edim, str):
-                flatten.append(edim)
-            # List
-            elif len(edim) == 1:
-                flatten.append(edim[0])
-            else:
-                flatten.append('(' + ' '.join(edim) + ')')
-        ou_annos.append(' '.join(flatten))
-    return ', '.join(in_annos) + ' -> ' + ', '.join(ou_annos)
-
-
 def Identity(signature, inputs):
     signature = 'cube.runtime.function.identity'
-    eshape = _create_eshape(inputs[0].shape)
-    anno = _create_anno([eshape], [eshape])
+    eshape = ShapeAnno.create_shape_str(inputs[0].shape)
+    anno = OpAnno.create_op_str([eshape], [eshape])
     return IREinops(signature, [anno], inputs, 'identity')
 
 
@@ -183,6 +135,51 @@ def ToTensor(signature,
     signature = 'torch.Tensor.to'
     return IRToTensor(signature, [tensor], 'to', ir_dtype=ir_dtype)
 
+
+def _handle_broadcast(lhs: IRTensor, rhs: IRTensor) -> Tuple[List[str]]:
+    """!
+    Create shape annotations for element wise operator following broadcastable rules:
+    https://pytorch.org/docs/stable/notes/broadcasting.html
+
+    @param lhs IRTensor: the lhs input tensor
+    @param rhs IRTensor: the rhs input tensor
+
+    @return lhs_shape, rhs_shape, out_shape: the lhs, rhs and output shape annotation
+    """
+    lndims, rndims = len(lhs.shape), len(rhs.shape)
+    # init lhs_shape and rhs_shape annotation string
+    shape_anno = ShapeAnno.create_shape_str(lhs.shape if lndims > rndims else rhs.shape)
+    lhs_shape = shape_anno[0-lndims:]
+    rhs_shape = shape_anno[0-rndims:]
+    # expand dimensions for empty dimensions
+    lofst = max(lndims, rndims) - lndims
+    lshape = [1] * lofst + list(lhs.shape)
+    rofst = max(lndims, rndims) - rndims
+    rshape = [1] * rofst + list(rhs.shape)
+    # init out_shape
+    out_shape = []
+    for dim in range(len(lshape)):
+        ldim_anno = None if dim - lofst < 0 else lhs_shape[dim-lofst]
+        rdim_anno = None if dim - rofst < 0 else rhs_shape[dim-rofst]
+        if lshape[dim] == rshape[dim]:
+            assert rdim_anno is not None or ldim_anno is not None
+            out_shape.append(rdim_anno if rdim_anno is not None else ldim_anno)
+        elif lshape[dim] == 1:
+            assert rdim_anno is not None
+            out_shape.append(rdim_anno)
+            if ldim_anno is not None:
+                lhs_shape[dim-lofst] = '1'
+        elif rshape[dim] == 1:
+            assert ldim_anno is not None
+            out_shape.append(ldim_anno)
+            if rdim_anno is not None:
+                rhs_shape[dim-rofst] = '1'
+        else:
+            raise ValueError(f"cannot broadcast lhs: {lhs.shape} and rhs: {rhs.shape}")
+    # print(lhs.shape, rhs.shape, lhs_shape, rhs_shape, out_shape)
+    return lhs_shape, rhs_shape, out_shape
+
+
 def Add(signature, inputs):
     if len(inputs) == 2:
         kwargs = {}
@@ -201,27 +198,14 @@ def Add(signature, inputs):
         return lhs + rhs
 
     annos = [
-        '*, 1 -> *',
-        '1, * -> *',
-        '*, * -> *',
+        '*, ? -> *',
+        '?, * -> *',
     ]
-    # broadcast
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
-       len(lhs.shape) == len(rhs.shape):
-        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
-            # TODO: support spatial partitioning on broadcast dim
-            lshape = _create_eshape(lhs.shape)
-            rshape = copy.copy(lshape)
-            oshape = copy.copy(lshape)
-            for dim in range(len(lhs.shape)):
-                if lhs.shape[dim] < rhs.shape[dim]:
-                    oshape[dim] = rshape[dim]
-                    lshape[dim] = str(lhs.shape[dim])
-                elif lhs.shape[dim] > rhs.shape[dim]:
-                    oshape[dim] = lshape[dim]
-                    rshape[dim] = str(rhs.shape[dim])
-            annos = [_create_anno([lshape, rshape], [oshape])]
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, 'add', **kwargs)
+
 
 
 def Sub(signature, inputs):
@@ -243,26 +227,12 @@ def Sub(signature, inputs):
         return lhs - rhs
 
     annos = [
-        '*, 1 -> *',
-        '1, * -> *',
-        '*, * -> *',
+        '*, ? -> *',
+        '?, * -> *',
     ]
-    # broadcast
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
-       len(lhs.shape) == len(rhs.shape):
-        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
-            # TODO: support spatial partitioning on broadcast dim
-            lshape = _create_eshape(lhs.shape)
-            rshape = copy.copy(lshape)
-            oshape = copy.copy(lshape)
-            for dim in range(len(lhs.shape)):
-                if lhs.shape[dim] < rhs.shape[dim]:
-                    oshape[dim] = rshape[dim]
-                    lshape[dim] = str(lhs.shape[dim])
-                elif lhs.shape[dim] > rhs.shape[dim]:
-                    oshape[dim] = lshape[dim]
-                    rshape[dim] = str(rhs.shape[dim])
-            annos = [_create_anno([lshape, rshape], [oshape])]
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, 'sub', **kwargs)
 
 
@@ -273,58 +243,29 @@ def Mul(signature, inputs):
         return lhs * rhs
 
     annos = [
-        '*, 1 -> *',
-        '1, * -> *',
-        '*, * -> *',
+        '*, ? -> *',
+        '?, * -> *',
     ]
-    # broadcast
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
-       len(lhs.shape) == len(rhs.shape):
-        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
-            # TODO: support spatial partitioning on broadcast dim
-            lshape = _create_eshape(lhs.shape)
-            rshape = copy.copy(lshape)
-            oshape = copy.copy(lshape)
-            for dim in range(len(lhs.shape)):
-                if lhs.shape[dim] < rhs.shape[dim]:
-                    oshape[dim] = rshape[dim]
-                    lshape[dim] = str(lhs.shape[dim])
-                elif lhs.shape[dim] > rhs.shape[dim]:
-                    oshape[dim] = lshape[dim]
-                    rshape[dim] = str(rhs.shape[dim])
-            annos = [_create_anno([lshape, rshape], [oshape])]
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, 'mul')
 
 
 def Div(signature, inputs):
     lhs, rhs = inputs
-
     if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
         # For `aten::div` we always do floating division, even operands are both ints.
         # TorchScript would dispatch frontend `a // b` to another op `aten::floordiv`.
         return lhs / rhs
 
     annos = [
-        '*, 1 -> *',
-        '1, * -> *',
-        '*, * -> *',
+        '*, ? -> *',
+        '?, * -> *',
     ]
-    # broadcast
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
-       len(lhs.shape) == len(rhs.shape):
-        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
-            # TODO: support spatial partitioning on broadcast dim
-            lshape = _create_eshape(lhs.shape)
-            rshape = copy.copy(lshape)
-            oshape = copy.copy(lshape)
-            for dim in range(len(lhs.shape)):
-                if lhs.shape[dim] < rhs.shape[dim]:
-                    oshape[dim] = rshape[dim]
-                    lshape[dim] = str(lhs.shape[dim])
-                elif lhs.shape[dim] > rhs.shape[dim]:
-                    oshape[dim] = lshape[dim]
-                    rshape[dim] = str(rhs.shape[dim])
-            annos = [_create_anno([lshape, rshape], [oshape])]
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, 'div')
 
 
@@ -335,26 +276,12 @@ def FloorDiv(signature, inputs):
         return lhs // rhs
 
     annos = [
-        '*, 1 -> *',
-        '1, * -> *',
-        '*, * -> *',
+        '*, ? -> *',
+        '?, * -> *',
     ]
-    # broadcast
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
-       len(lhs.shape) == len(rhs.shape):
-        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
-            # TODO: support spatial partitioning on broadcast dim
-            lshape = _create_eshape(lhs.shape)
-            rshape = copy.copy(lshape)
-            oshape = copy.copy(lshape)
-            for dim in range(len(lhs.shape)):
-                if lhs.shape[dim] < rhs.shape[dim]:
-                    oshape[dim] = rshape[dim]
-                    lshape[dim] = str(lhs.shape[dim])
-                elif lhs.shape[dim] > rhs.shape[dim]:
-                    oshape[dim] = lshape[dim]
-                    rshape[dim] = str(rhs.shape[dim])
-            annos = [_create_anno([lshape, rshape], [oshape])]
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, 'floordiv')
 
 
@@ -365,26 +292,12 @@ def Pow(signature, inputs):
         return lhs ** rhs
 
     annos = [
-        '*, 1 -> *',
-        '1, * -> *',
-        '*, * -> *',
+        '*, ? -> *',
+        '?, * -> *',
     ]
-    # broadcast
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
-       len(lhs.shape) == len(rhs.shape):
-        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
-            # TODO: support spatial partitioning on broadcast dim
-            lshape = _create_eshape(lhs.shape)
-            rshape = copy.copy(lshape)
-            oshape = copy.copy(lshape)
-            for dim in range(len(lhs.shape)):
-                if lhs.shape[dim] < rhs.shape[dim]:
-                    oshape[dim] = rshape[dim]
-                    lshape[dim] = str(lhs.shape[dim])
-                elif lhs.shape[dim] > rhs.shape[dim]:
-                    oshape[dim] = lshape[dim]
-                    rshape[dim] = str(rhs.shape[dim])
-            annos = [_create_anno([lshape, rshape], [oshape])]
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, 'pow')
 
 
@@ -399,26 +312,12 @@ def comparison_einops(f, name, signature, inputs):
         return f(lhs, rhs)
 
     annos = [
-        '*, 1 -> *',
-        '1, * -> *',
-        '*, * -> *',
+        '*, ? -> *',
+        '?, * -> *',
     ]
-    # broadcast
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor) and \
-       len(lhs.shape) == len(rhs.shape):
-        if not all([l == r for l, r in zip(lhs.shape, rhs.shape)]):
-            # TODO: support spatial partitioning on broadcast dim
-            lshape = _create_eshape(lhs.shape)
-            rshape = copy.copy(lshape)
-            oshape = copy.copy(lshape)
-            for dim in range(len(lhs.shape)):
-                if lhs.shape[dim] < rhs.shape[dim]:
-                    oshape[dim] = rshape[dim]
-                    lshape[dim] = str(lhs.shape[dim])
-                elif lhs.shape[dim] > rhs.shape[dim]:
-                    oshape[dim] = lshape[dim]
-                    rshape[dim] = str(rhs.shape[dim])
-            annos = [_create_anno([lshape, rshape], [oshape])]
+    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
     return IREinops(signature, annos, inputs, name)
 
 
@@ -502,8 +401,8 @@ def LayerNorm(signature, inputs):
     if len(normalized_shape) != 1:
         raise NotImplementedError("Only support normalized_shape to be int")
     annos = [
-        f'N *, 1, {normalized_shape[0]}, {normalized_shape[0]} -> N *',
-        f'N *, 1, 1, 1 -> N *'
+        f'N *, ?, {normalized_shape[0]}, {normalized_shape[0]} -> N *',
+        f'N *, ?, ?, ? -> N *'
     ]
     return IREinops(signature, annos, [input, normalized_shape, weight, bias],
                     'layernorm', eps=eps)
@@ -512,7 +411,7 @@ def LayerNorm(signature, inputs):
 def Sum(signature, inputs):
     tensor = inputs[0]
     dim = inputs[1]
-    einput = _create_eshape(tensor.shape)
+    einput = ShapeAnno.create_shape_str(tensor.shape)
     eoutput = copy.copy(einput)
     if dim is not None:
         keepdim = inputs[2]
@@ -525,7 +424,7 @@ def Sum(signature, inputs):
         eoutput = ['1']
         # every dimension is reduced
         einput = [edim + '+' for edim in einput]
-    anno = _create_anno([einput], [eoutput])
+    anno = OpAnno.create_op_str([einput], [eoutput])
     if dim is not None:
         return IREinops(signature, [anno], [tensor], 'sum', dim=dim, keepdim=keepdim)
     else:
@@ -539,10 +438,10 @@ def Transpose(signature, inputs):
     assert len(inputs) == 3
     input, dim0, dim1 = inputs
 
-    edim_in = _create_eshape(input.shape)
+    edim_in = ShapeAnno.create_shape_str(input.shape)
     edim_ou = copy.copy(edim_in)
     edim_ou[dim0], edim_ou[dim1] = edim_ou[dim1], edim_ou[dim0]
-    anno = _create_anno([edim_in], [edim_ou])
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
 
     return IREinops(signature, [anno], [input], 'transpose',
                     dim0=dim0, dim1=dim1)
@@ -658,7 +557,7 @@ def View(signature, inputs):
             if edim not in spatial:
                 bracket[subdim] = str(shape_map[edim])
                 # bracket[subdim] = edim + '^'
-    anno = _create_anno([in_anno], [ou_anno])
+    anno = OpAnno.create_op_str([in_anno], [ou_anno])
     signature = 'torch.Tensor.view'
     return IREinops(signature, [anno], [input], 'view', size=tuple(shape))
 
@@ -681,7 +580,7 @@ def Reshape(signature, inputs):
 #     torch.conv2d(input, weight, bias, stride, padding, dialation, groups)
 #     https://pytorch.org/docs/stable/generated/torch.nn.functional.conv2d.html?highlight=torch%20conv2d#torch.nn.functional.conv2d
 #     """
-#     def adapt(anno: EinopAnno, node: IREinops) -> EinopAnno:
+#     def adapt(anno: OpAnno, node: IREinops) -> OpAnno:
 #         iH, iW = node.inputs(0).shape[2:4]
 #         stride = node.kwargs['stride']
 #         padding = node.kwargs['padding']
@@ -690,8 +589,8 @@ def Reshape(signature, inputs):
 #         dW = node.inputs(1).shape[3]
 #         oH = (iH + 2 * padding[0] - dilation[0] * (dH - 1) - 1) // stride[0] + 1
 #         oW = (iW + 2 * padding[1] - dilation[1] * (dW - 1) - 1) // stride[1] + 1
-#         anno.outputs[0][2] = EinDim([str(oH)])
-#         anno.outputs[0][3] = EinDim([str(oW)])
+#         anno.outputs[0][2] = DimAnno([str(oH)])
+#         anno.outputs[0][3] = DimAnno([str(oW)])
 #         return anno
 #     annos = [
 #         ('N iC+ H^ W^, oC iC+ dH^ dW^, oC -> N oC oH^ oW^', adapt),
@@ -819,9 +718,12 @@ def Embedding(signature, inputs: List):
     padding_idx = inputs[3]
     start, stop = 0, weight.shape[0]
     letters = iter(string.ascii_lowercase)
-    ishapes = [_create_eshape(itensor.shape, letters), _create_eshape(weight.shape, letters)]
+    ishapes = [
+        ShapeAnno.create_shape_str(itensor.shape, iterator=letters),
+        ShapeAnno.create_shape_str(weight.shape, iterator=letters)
+    ]
     oshapes = [ishapes[0] + [ishapes[1][-1]]]
-    anno = _create_anno(ishapes, oshapes)
+    anno = OpAnno.create_op_str(ishapes, oshapes)
     return IREinops(signature, [anno], [itensor, weight], 'embedding', padding_idx=padding_idx, start=start, stop=stop)
 
 
