@@ -1,4 +1,9 @@
-from typing import List
+"""
+OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    examples/poisson/sci.py
+"""
 
 import torch
 import torch.nn.functional as F
@@ -8,14 +13,7 @@ torch.set_default_tensor_type(torch.DoubleTensor)
 
 from cube.runtime.syndata import SciLoopVariables
 import cube
-from examples.poisson.policy.naive import PAS
-
-"""
-OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=1 \
-    --nnodes=1 \
-    examples/poisson/sci.py
-"""
+from examples.poisson.policy.spmd import PASHaloConv as PAS
 
 
 class ScientificModel(torch.nn.Module):

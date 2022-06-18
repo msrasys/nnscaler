@@ -5,14 +5,6 @@ OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
     examples/mlp/linears.py
-
-OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=8 \
-    --nnodes=2 \
-    --rdzv_id=888 \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint=worker0:8004 \
-    examples/mlp/linears.py
 """
 
 import torch
@@ -21,7 +13,7 @@ from torch import nn
 import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
-from examples.mlp.policy.optimal import PAS
+from examples.mlp.policy.spmd import PASMegatron as PAS
 
 # =================== Semantic Model Description ====================
 
@@ -51,7 +43,7 @@ class MLP(nn.Module):
 
 
 def train():
-    batch_size = 8192
+    batch_size = 256
     dim = 8192
 
     model = MLP(dim=dim)

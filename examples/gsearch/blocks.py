@@ -3,7 +3,7 @@ import cube
 import warnings
 
 
-@cube.graph.parser.register('L N E+, (h d) E+, (h d), (h d) E+, (h d), (h d) E+, (h d) -> N h L d, N h L d, N h L d')
+@cube.graph.parser.register('L N E+, (h d) E+, (h d), (h d) E+, (h d), (h d) E+, (h d) -> N h L d, N h L d, N h L d', name='attn_qkv')
 def attn_qkv(query: torch.Tensor,
              q_proj: torch.Tensor, q_bias: torch.Tensor,
              k_proj: torch.Tensor, k_bias: torch.Tensor,
@@ -28,7 +28,7 @@ def attn_qkv(query: torch.Tensor,
     return q, k, v
 
 
-@cube.graph.parser.register('N h L d, N h L d -> N h L L')
+@cube.graph.parser.register('N h L d+, N h L d+ -> N h L L', name='attn_score')
 def attn_score(q: torch.Tensor, k: torch.Tensor, h: int, mask: bool = True):
     N, num_head, L, d = q.size()
     assert num_head == h
@@ -47,7 +47,7 @@ def attn_score(q: torch.Tensor, k: torch.Tensor, h: int, mask: bool = True):
     return attn
 
 
-@cube.graph.parser.register('N h L^ L^ -> N h L^ L^')
+@cube.graph.parser.register('N h L K^ -> N h L K^', name='attn_softmax')
 def attn_softmax(attn: torch.Tensor):
     N, h, L, L = attn.size()
     attn = attn.view((N * h), L, L)
@@ -55,7 +55,7 @@ def attn_softmax(attn: torch.Tensor):
     return attn.view(N, h, L, L)
 
 
-@cube.graph.parser.register('N h L L, N h L d -> L N (h d)')
+@cube.graph.parser.register('N h L K+, N h K+ d -> L N (h d)', name='attn_context')
 def attn_context(attn: torch.Tensor, v: torch.Tensor):
     N, h, L, d = v.size()
     attn = attn.view((N * h), L, L)

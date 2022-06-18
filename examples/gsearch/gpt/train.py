@@ -12,12 +12,11 @@ import torch
 
 from examples.gsearch.gpt.model import GPT
 from examples.gsearch.gpt.model import GPTDataLoader
+from examples.gsearch.gpt.policy.spmd import PASReplica as PAS
 
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary, model_summary
-
-from examples.nlp.gpt.policy.naive import PAS
 
 
 def train():
