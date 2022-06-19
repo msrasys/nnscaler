@@ -435,6 +435,9 @@ class ScheduleCodeGen(CodeGen):
         if isinstance(node, IRSegment):
             # emit forward
             if node.forward:
+                recompute = any(isinstance(n.recompute, int) for n in node.nodes())
+                if recompute:
+                    raise NotImplementedError("recompute mechanism is not supported")
                 body = fsign.format(model=f'model.{name}', inputs=inputs, req_grad=req_grad)
                 code = f'{outputs} = {body}'
             # emit backward

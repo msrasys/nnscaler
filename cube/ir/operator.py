@@ -37,23 +37,27 @@ class IRBaseOp(IRCell):
 
 
 class IRFwOperation(IRCell):
+    """
+    Forward operation
+    """
 
     def __init__(self,
                  name: str, 
                  signature: str,
                  input_length: int,
                  output_length: int):
-        """
-        Create a node with name (variable name) and module type (module_name)
+        """!
+        Create a forward operation.
 
-        Args:
-            name (str): the op semantic name
-            signature (str): the op signature, e.g., torch.functional.nn.linear
-            input_length (int): the number of inputs for the op
-            output_length (int): the number of outputs for the op
+        @param name str: the name of forward operation
+        @param signature str: the signature of the forward operation
+        @param input_length int: number of inputs
+        @param output_length int: number of outputs
         """
         # additional argument
         self.kwargs = dict()
+        # recompute schedule
+        self._recompute = None
         super().__init__(name, signature, input_length, output_length, init_outputs=False)
         outputs = [IRFullTensor() for _ in range(output_length)]
         for idx, output in enumerate(outputs):
@@ -64,6 +68,29 @@ class IRFwOperation(IRCell):
         Infer output value shape
         """
         raise NotImplementedError
+
+    @property
+    def recompute(self) -> Optional[int]:
+        """!
+        Get recompute group id.
+        To enable recompute, a recompute group refers to a sequence of operators that
+        will perform recompute optimization.
+
+        @return group_id Optional[int]: None if no recompute, else a group id.
+        """
+        return self._recompute
+
+    @recompute.setter
+    def recompute(self, group_id: Optional[int]):
+        """!
+        Set recompute group
+
+        @param group_id Optional[int]: recompute group id. None indicates no group is applied
+        """
+        assert group_id is None or isinstance(group_id, int), "Expect None or int"
+        if isinstance(group_id, int) and self._recompute is not None:
+            assert self._recompute == group_id, "The operator is set to recompute in another recompute group."
+        self._recompute = group_id
 
     def algorithms(self, tag: Optional[str] = None):
         """
@@ -88,12 +115,14 @@ class IRFwOperation(IRCell):
             return template(self)
 
     def replicate(self):
-        """
-        Replicate the Operation
+        """!
+        Replicate the forward operation.
+        The operator id, recompute and comment attribute will also be replicated.
+
+        @return replica IRFwOperation: the replicated operator
         """
         cpy = copy.copy(self)
         cpy._device = list()
-        # cpy._id = IDGenerator().gen_cell_id()
         # reset input and output
         cpy._inputs = [None] * len(self.inputs())
         for idx, input in enumerate(self.inputs()):
@@ -102,13 +131,12 @@ class IRFwOperation(IRCell):
         for idx, output in enumerate(self.outputs()):
             cpy.set_output(idx, output)
         cpy._mirror = None
-        cpy._tag = None
         cpy.clear_predecessor()
         cpy.clear_successor()
         return cpy
 
-    def gen_backward(self):
-        """
+    def gen_backward(self) -> IRCell:
+        """!
         Generate backward operator for this forward operator.
 
         Note by calling this API, this forward operator must be
@@ -120,18 +148,7 @@ class IRFwOperation(IRCell):
         if self.mirror is not None:
             raise RuntimeError(
                 "Backward Op already generated. Use self.mirror.update() instead.")
-        bnode = IRBpOperation(
-            data_num=len(self.inputs()),
-            grad_num=len(self.outputs())
-        )
-        for idx, itensor in enumerate(self.inputs()):
-            grad = itensor.grad if isinstance(itensor, IRSubTensor) else None
-            bnode.set_data(idx, itensor)
-            bnode.set_output(idx, grad)
-        for idx, otensor in enumerate(self.outputs()):
-            grad = otensor.grad if isinstance(otensor, IRSubTensor) else None
-            bnode.set_input(idx, grad)
-        IRCell.make_pair(self, bnode)
+        bnode = IRBpOperation(self)
         return bnode
 
     def __repr__(self):
@@ -150,75 +167,26 @@ class IRFwOperation(IRCell):
 
 
 class IRBpOperation(IRCell):
+    """
+    Backward operation
+    """
 
-    def __init__(self, data_num: int, grad_num, name='backward'):
+    def __init__(self, fwop: IRFwOperation):
         """
-        Args:
-            data_num (int): corresponding forward input length
-            grad_num (int): corresponding forward output length
+        Create dummy backward node for forward inputs and forward outputs
+        
+        @param fwop IRFwOperation: forward operator
         """
-        signature = 'torch.autograd.backward'
-        self.data_num = data_num
-        self.grad_num = grad_num
-        self._datas = [None] * data_num
+        assert isinstance(fwop, IRFwOperation), "Expected IRFwOperation"
+        finputs, foutputs = fwop.inputs(), fwop.outputs()
         super().__init__(
-            name, signature,
-            input_length=grad_num,
-            output_length=data_num,
-            init_outputs=False
+            'backward', 'torch.autograd.grad',
+            len(foutputs), len(finputs), init_outputs=False
         )
-
-    def replicate(self):
-        """
-        Replicate the backward op
-        """
-        cpy = copy.copy(self)
-        cpy._device = list()
-        cpy._id = IDGenerator().gen_cell_id()
-        # reset input and output
-        cpy._inputs = [None] * len(self.inputs())
-        for idx, input in enumerate(self.inputs()):
-            cpy.set_input(idx, input)
-        cpy._outputs = [None] * len(self.outputs())
-        for idx, output in enumerate(self.outputs()):
-            cpy.set_output(idx, output)
-        cpy._mirror = None
-        cpy._tag = None
-        cpy.clear_predecessor()
-        cpy.clear_successor()
-        return cpy
-
-    def datas(self, index: Optional[int] = None) -> Union[List[Any], Any]:
-        """
-        Forward inputs
-        """
-        if index is None:
-            return copy.copy(self._datas[:self.data_num])
-        if index >= self.data_num:
-            raise RuntimeError(
-                f"Set the input out of range ({index} >= {self.data_num})"
-            )
-        return self._datas[index]
-
-    def set_data(self, data_index: int, val: Any):
-        """
-        Set the node inputs[input_index] with the tensor
-
-        Args:
-            val: Union[IRTensor, Any]
-
-        Return:
-            the set tensor
-        """
-        if data_index >= self.data_num:
-            raise RuntimeError(
-                f"Set the input out of range ({data_index} >= {self.data_num})"
-            )
-        val = copy.copy(val)
-        if isinstance(val, IRTensor):
-            val.attach_cell(self)
-        self._datas[data_index] = val
-        return val
+        # pair forward op and backward op
+        IRCell.make_pair(self, fwop)
+        # set inputs and outputs
+        self.update()
 
     def update(self):
         """
@@ -238,14 +206,32 @@ class IRBpOperation(IRCell):
         assert isinstance(fnode, IRFwOperation), "Cannot find corresponding IRFwOperation"
         for idx, itensor in enumerate(fnode.inputs()):
             grad = itensor.grad if isinstance(itensor, IRSubTensor) else None
-            self.set_data(idx, itensor)
             self.set_output(idx, grad)
         for idx, otensor in enumerate(fnode.outputs()):
             grad = otensor.grad if isinstance(otensor, IRSubTensor) else None
             self.set_input(idx, grad)
 
-    def __repr__(self):
-        dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, inputs={self.inputs()}, datas={self.datas()}, outputs={self.outputs()})'
+    def replicate(self):
+        """
+        Replicate the backward op
+        """
+        cpy = copy.copy(self)
+        cpy._device = list()
+        cpy._id = IDGenerator().gen_cell_id()
+        # reset input and output
+        cpy._inputs = [None] * len(self.inputs())
+        for idx, input in enumerate(self.inputs()):
+            cpy.set_input(idx, input)
+        cpy._outputs = [None] * len(self.outputs())
+        for idx, output in enumerate(self.outputs()):
+            cpy.set_output(idx, output)
+        cpy._mirror = None
+        cpy.clear_predecessor()
+        cpy.clear_successor()
+        return cpy
+
+    def __repr__(self) -> str:
+        dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, inputs={self.inputs()}, outputs={self.outputs()})'
         return dscp
 
 
@@ -256,7 +242,7 @@ class IRDataOperation(IRCell):
             raise RuntimeError("Expected each output data has a specified batch dim")
         signature = 'dataloader.__next__'
         super().__init__(name, signature, 0, data_num)
-        self.batch_dims = batch_dims
+        self.batch_dims = tuple(batch_dims)
 
     def replicate(self):
         """
@@ -273,7 +259,6 @@ class IRDataOperation(IRCell):
         for idx, output in enumerate(self.outputs()):
             cpy.set_output(idx, output)
         cpy._mirror = None
-        cpy._tag = None
         cpy.clear_predecessor()
         cpy.clear_successor()
         return cpy

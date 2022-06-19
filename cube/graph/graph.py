@@ -11,6 +11,7 @@ from typing import Any, Union, Tuple, List, Optional, Dict
 import copy
 
 from cube.ir.cten import IRTensor, IRCell
+from cube.ir.unique import IDGenerator
 from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from cube.ir.adapter import IRAdapter
 from cube.ir.tensor import IRFullTensor, IRSubTensor
@@ -649,6 +650,12 @@ class IRGraph(IRCell):
             prev.add_successor(output_index=-1, cell=post)
             post.add_predecessor(input_index=-1, cell=prev)
         return True
+
+    def recompute(self, nodes: List[IRFwOperation]):
+        assert all(isinstance(fnode, IRFwOperation) for fnode in nodes), "require forward operations"
+        recompute_group_id = IDGenerator().gen_cell_id()
+        for fnode in nodes:
+            fnode.recompute = recompute_group_id
 
     def set_order(self, seq: List[IRCell]):
         """

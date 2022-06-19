@@ -28,6 +28,9 @@ class IRAdapter(IRCell):
             device.update(set(tensor.device))
         self.device = list(device)
 
+        # recompute group id
+        self._recompute = None
+
         # setup whether this adapter is for forward stage
         is_fw = any(not t.is_grad() for t in self.inputs() + self.outputs())
         is_bw = any(t.is_grad() for t in self.inputs() + self.outputs())
@@ -74,6 +77,29 @@ class IRAdapter(IRCell):
         return True if this adapter serves in forward stage.
         """
         return self._forward
+
+    @property
+    def recompute(self) -> Optional[int]:
+        """!
+        Get recompute group id.
+        To enable recompute, a recompute group refers to a sequence of operators that
+        will perform recompute optimization.
+
+        @return group_id Optional[int]: None if no recompute, else a group id.
+        """
+        return self._recompute
+
+    @recompute.setter
+    def recompute(self, group_id: Optional[int]):
+        """!
+        Set recompute group
+
+        @param group_id Optional[int]: recompute group id. None indicates no group is applied
+        """
+        assert group_id is None or isinstance(group_id, int), "Expect None or int"
+        if isinstance(group_id, int) and self._recompute is not None:
+            assert self._recompute == group_id, "The operator is set to recompute in another recompute group."
+        self._recompute = group_id
 
     def dispatch(self, devid: int, for_mirror=True):
         """
