@@ -55,6 +55,11 @@ def attn_softmax(attn: torch.Tensor):
     return attn.view(N, h, L, L)
 
 
+@cube.graph.parser.register('N h L L -> N h L L', name='attn_dropout')
+def attn_dropout(attn: torch.Tensor, dropout_p: float):
+    return torch.nn.functional.dropout(attn, dropout_p, True, False)
+
+
 @cube.graph.parser.register('N h L K+, N h K+ d -> L N (h d)', name='attn_context')
 def attn_context(attn: torch.Tensor, v: torch.Tensor):
     N, h, L, d = v.size()
@@ -64,6 +69,11 @@ def attn_context(attn: torch.Tensor, v: torch.Tensor):
     output = output.transpose(0, 1).contiguous()     # (N h) L d -> L (N h) d
     output = output.view(L, N, h * d)  # (N h) L d -> L N (h d)
     return output
+
+
+@cube.graph.parser.register('L N hd+, E hd+, E -> L N E', name='attn_dense_out')
+def attn_dense_out(context: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+    return torch.nn.functional.linear(context, weight, bias)
 
 
 class MultiHeadSelfAttention(torch.nn.Module):
@@ -102,11 +112,13 @@ class MultiHeadSelfAttention(torch.nn.Module):
         # softmax
         attn = attn_softmax(attn)
         # dropout
-        attn = torch.nn.functional.dropout(attn, self.dropout_p, True, False) # (N h) L L -> (N h) L L
+        attn = attn_dropout(attn, self.dropout_p) # N h L L -> N h L L
+        # attn = torch.nn.functional.dropout(attn, self.dropout_p, True, False) # N h L L -> N h L L
         # context
         context = attn_context(attn, v)
         # DenseOutput
-        output = torch.nn.functional.linear(context, self.out_proj, self.out_bias) # L N (h d), E E  -> L N E
+        # output = torch.nn.functional.linear(context, self.out_proj, self.out_bias) # L N (h d), E E  -> L N E
+        output = attn_dense_out(context, self.out_proj, self.out_bias) # L N (h d), E E  -> L N E
         return output
 
 

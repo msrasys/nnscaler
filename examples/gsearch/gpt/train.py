@@ -2,7 +2,7 @@
 example:
 
 OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=1 \
+    --nproc_per_node=4 \
     --nnodes=1 \
     examples/gsearch/gpt/train.py
 """
@@ -12,7 +12,7 @@ import torch
 
 from examples.gsearch.gpt.model import GPT
 from examples.gsearch.gpt.model import GPTDataLoader
-from examples.gsearch.gpt.policy.spmd import PASReplica as PAS
+from examples.gsearch.gpt.policy.spmd import PASMegatron as PAS
 
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank

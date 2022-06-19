@@ -1,5 +1,5 @@
 from cube.graph import IRGraph
-from cube.ir.operator import IRFwOperation
+from cube.ir.operator import IRDataOperation, IRFwOperation
 
 
 def PASReplica(graph: IRGraph, resource):
@@ -16,17 +16,20 @@ def PASMegatron(graph: IRGraph, resource):
     tp_size = resource.ngpus
     fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
     
-    def tensor_parallelism(node, idx: int, dim: int, num: int):
+    def tensor_parallelism(node: IRFwOperation, comment: str = None, **configs):
         algo = node.algorithms('dim')
-        sub_nodes = graph.partition(node, algo, config=dict(idx=idx, dim=dim, num=num))
+        sub_nodes = graph.partition(node, algo, **configs)
+        if isinstance(comment, str):
+            for sub_node in sub_nodes:
+                sub_node.comment = comment
         assert all(isinstance(n, IRFwOperation) for n in sub_nodes), f"Fail to partition node {node}"
         for idx, sub_node in enumerate(sub_nodes):
             graph.assign(sub_node, idx)
         return sub_nodes
 
     qkvs = [node for node in fnodes if node.name == 'attn_qkv']
-    for qkv in qkvs:
-        tensor_parallelism(qkv, idx=1, dim=0, num=tp_size)
+    for idx, qkv in enumerate(qkvs):
+        tensor_parallelism(qkv, f'====> start of transformer {idx}', idx=1, dim=0, num=tp_size)
 
     scores = [node for node in fnodes if node.name == 'attn_score']
     for score in scores:
@@ -36,13 +39,22 @@ def PASMegatron(graph: IRGraph, resource):
     for softmax in softmaxs:
         tensor_parallelism(softmax, idx=0, dim=1, num=tp_size)
 
+    dropouts = [node for node in fnodes if node.name == 'attn_dropout']
+    for dropout in dropouts:
+        tensor_parallelism(dropout, idx=0, dim=1, num=tp_size)
+
     contexts = [node for node in fnodes if node.name == 'attn_context']
     for context in contexts:
         tensor_parallelism(context, idx=0, dim=1, num=tp_size)
 
+    dense_outs = [node for node in fnodes if node.name == 'attn_dense_out']
+    for dense in dense_outs:
+        tensor_parallelism(dense, idx=0, dim=2, num=tp_size)
+
     for node in graph.nodes():
-        if isinstance(node, IRFwOperation) and len(node.device) == 0:
+        if isinstance(node, (IRFwOperation, IRDataOperation)) and len(node.device) == 0:
             rnodes = graph.replicate(node, times=tp_size)
             for idx, rnode in enumerate(rnodes):
                 graph.assign(rnode, idx)
+    print(graph.extra_repr())
     return graph
