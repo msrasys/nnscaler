@@ -187,7 +187,7 @@ def allgather_split(tensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.
 class SplitAllGather(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, itensor: torch.Tensor, dim: int, ranks: Tuple[int], group):
+    def forward(ctx, itensor: torch.Tensor, dim: int, ranks: Tuple[int]):
         """
         ranks should be the global rank
         """
@@ -203,7 +203,7 @@ class SplitAllGather(torch.autograd.Function):
         return grad, None, None
 
 
-def chunk_allgather(tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
+def split_allgather(tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
     return SplitAllGather.apply(tensor, dim, ranks)
 
 
