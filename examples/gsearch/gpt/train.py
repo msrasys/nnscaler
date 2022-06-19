@@ -64,6 +64,7 @@ def train():
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
           CudaTimer().duration(iter_num-40, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num-40)
     memory_summary()
 
 

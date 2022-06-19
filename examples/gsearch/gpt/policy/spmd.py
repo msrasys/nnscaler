@@ -3,6 +3,9 @@ from cube.ir.operator import IRDataOperation, IRFwOperation
 
 
 def PASReplica(graph: IRGraph, resource):
+    """
+    Single device test
+    """
     assert resource.ngpus == 1
     print(graph.extra_repr())
     for node in graph.nodes():
@@ -12,7 +15,9 @@ def PASReplica(graph: IRGraph, resource):
 
 
 def PASMegatron(graph: IRGraph, resource):
-
+    """
+    Megatron tensor parallelism (attention)
+    """
     tp_size = resource.ngpus
     fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
     
@@ -58,3 +63,17 @@ def PASMegatron(graph: IRGraph, resource):
                 graph.assign(rnode, idx)
     print(graph.extra_repr())
     return graph
+
+
+def PASRecompute(graph: IRGraph, resource):
+    """
+    Recompute parallelism test
+    """
+    assert resource.ngpus == 1
+    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
+    graph.recompute(fnodes)
+    for node in graph.nodes():
+        if isinstance(node, (IRFwOperation, IRDataOperation)):
+            graph.assign(node, 0)
+    return graph
+
