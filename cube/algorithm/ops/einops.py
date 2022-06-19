@@ -57,7 +57,7 @@ class DimSplitEinops(GenericDistAlgo):
         if not self.satisfy(idx, dim, num):
             return False
         node: IREinops = self.node
-        print(node.anno, f'partition: {self._adim}; reduce: {self._reduce.value}')
+        print(f'{node.anno} | => partition: {self._adim} reduce: {self._reduce.value}')
 
         ins, ous = list(), list()
         for iidx, itensor in enumerate(node.inputs()):
@@ -99,7 +99,10 @@ class DimSplitEinops(GenericDistAlgo):
         for nid in range(num):
             inputs = [t[nid] for t in ins]
             outputs = [t[nid] for t in ous]
-            sub_node: IREinops = node.new(inputs, outputs)
+            updated_kwargs = dict()
+            if self._adim in node.kwargs and isinstance(node.kwargs[self._adim], int):
+                updated_kwargs[self._adim] = node.kwargs[self._adim] // num
+            sub_node: IREinops = node.new(inputs, outputs, **updated_kwargs)
             sub_node.infer_shape()
             sub_nodes.append(sub_node)
         return sub_nodes

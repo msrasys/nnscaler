@@ -65,6 +65,7 @@ A shape annotation consists of dimension annotation separated by (multiple) spac
 from typing import Dict, Iterable, List, Union, Optional, Set, Tuple, Optional
 import enum
 import re
+import copy
 import string
 
 from cube.ir.cten import IRTensor
@@ -566,7 +567,7 @@ class IREinops(IRFwOperation):
         #       f'=> outputs: {self.outputs()}')
         return True
 
-    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor], **kwargs):
         """!
         Construct a new operator sharing same kwargs with new inputs
         and outputs
@@ -577,7 +578,9 @@ class IREinops(IRFwOperation):
         @return op IRDimop: the new constructed operator
         """
         annos = self._annos_candidates
-        op = IREinops(self.signature, annos, inputs, self.name, **self.kwargs)
+        updated_kwargs = copy.copy(self.kwargs)
+        updated_kwargs.update(kwargs)
+        op = IREinops(self.signature, annos, inputs, self.name, **updated_kwargs)
         for idx, output in enumerate(outputs):
             op.set_output(idx, output)
         return op

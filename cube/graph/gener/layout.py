@@ -339,7 +339,12 @@ class GridLayout:
                 start = subtensor.indmap.get()[dim].start
                 fnele = ftensor.shape[dim]
                 if fnele % snele != 0 or start % snele != 0:
-                    raise RuntimeError(f"dimension split error: full nele: {fnele}, sub nele: {snele}, start: {start}")
+                    print(subtensor, dim)
+                    raise RuntimeError(
+                        f"dimension split error:\n"
+                        f"Full Tensor: {ftensor}\n"
+                        f"full nele: {fnele}, sub nele: {snele}, start: {start}"
+                    )
                 dchunks[dim].add(fnele // snele)
                 _tindex[tid].append(start // snele)
         # replica (R)
