@@ -228,6 +228,9 @@ class ModelCodeGen(CodeGen):
         """
         Emit op forward code
         """
+        # insert comment
+        if node.comment is not None:
+            self.forward_region.append(f'# {node.comment}')
         signature = node.signature
         inputs = [self.tensor_naming(t) for t in node.inputs()]
         kwargs = {}

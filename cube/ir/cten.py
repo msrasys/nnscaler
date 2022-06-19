@@ -69,7 +69,9 @@ class IRCell:
         self._predecessors: List[List[IRCell]] = [list() for _ in range(input_length+1)]
 
         self._mirror = None
-        self._tag = None
+
+        # the comment for code generation
+        self._comment: Optional[str] = None
 
     # def __eq__(self, other):
     #     if isinstance(other, IRCell):
@@ -361,15 +363,16 @@ class IRCell:
         return outputs
 
     @property
-    def tag(self) -> Any:
-        return self._tag
+    def comment(self) -> Any:
+        return self._comment
 
-    @tag.setter
-    def tag(self, info: Any):
+    @comment.setter
+    def comment(self, info: str):
         """
         Tag an info to the cell
         """
-        self._tag = info
+        assert isinstance(info, str), "comment only allowed to be string"
+        self._comment = info 
 
     def __repr__(self):
         """
