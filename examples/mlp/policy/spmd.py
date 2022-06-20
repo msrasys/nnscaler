@@ -37,21 +37,20 @@ def PASCol(graph: IRGraph, resource):
     """
     Linear Column Parallel
     """
+    linears = [node for node in graph.nodes() if node.name == 'linear']
+    for idx, node in enumerate(linears):
+        algo = node.algorithms('dim')
+        sub_nodes = graph.partition(
+            node, algo, idx=1, dim=0, num=resource.ngpus
+        )
+        for idx, node in enumerate(sub_nodes):
+            graph.assign(node, idx)
     for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            sub_nodes = graph.replicate(node, times=resource.ngpus)
-            for idx, node in enumerate(sub_nodes):
-                graph.assign(node, idx)
-        if isinstance(node, IRFwOperation):
-            algo = node.algorithms('dim')
-            sub_nodes = graph.partition(
-                node, algo, idx=1, dim=0, num=resource.ngpus
-            )
-            if sub_nodes is None:  # partition fails
-                # graph.assign(node, list(range(resource.ngpus)))
-                sub_nodes = graph.replicate(node, times=resource.ngpus)
-            for idx, node in enumerate(sub_nodes):
-                graph.assign(node, idx)
+        if isinstance(node, (IRFwOperation, IRDataOperation)):
+            if len(node.device) == 0:
+                sub_nodes = graph.replicate(node, resource.ngpus)
+                for idx, node in enumerate(sub_nodes):
+                    graph.assign(node, idx)
     return graph
 
 
@@ -59,21 +58,20 @@ def PASRow(graph: IRGraph, resource):
     """
     Linear Column Parallel
     """
+    linears = [node for node in graph.nodes() if node.name == 'linear']
+    for idx, node in enumerate(linears):
+        algo = node.algorithms('dim')
+        sub_nodes = graph.partition(
+            node, algo, idx=1, dim=1, num=resource.ngpus
+        )
+        for idx, node in enumerate(sub_nodes):
+            graph.assign(node, idx)
     for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            sub_nodes = graph.replicate(node, times=resource.ngpus)
-            for idx, node in enumerate(sub_nodes):
-                graph.assign(node, idx)
-        if isinstance(node, IRFwOperation):
-            algo = node.algorithms('dim')
-            sub_nodes = graph.partition(
-                node, algo, idx=1, dim=1, num=resource.ngpus
-            )
-            if sub_nodes is None:  # partition fails
-                # graph.assign(node, list(range(resource.ngpus)))
-                sub_nodes = graph.replicate(node, times=resource.ngpus)
-            for idx, node in enumerate(sub_nodes):
-                graph.assign(node, idx)
+        if isinstance(node, (IRFwOperation, IRDataOperation)):
+            if len(node.device) == 0:
+                sub_nodes = graph.replicate(node, resource.ngpus)
+                for idx, node in enumerate(sub_nodes):
+                    graph.assign(node, idx)
     return graph
 
 
@@ -81,20 +79,18 @@ def PASHybrid(graph: IRGraph, resource):
     """
     Linear Hybrid Parallelism (Megatron)
     """
-    for idx, node in enumerate(graph.nodes()):
-        if isinstance(node, IRDataOperation):
-            sub_nodes = graph.replicate(node, times=resource.ngpus)
-            for idx, node in enumerate(sub_nodes):
-                graph.assign(node, idx)
-        if isinstance(node, IRFwOperation):
-            algo = node.algorithms('dim')
-            sub_nodes = graph.partition(
-                node, algo, idx=1, dim=(idx+1)%2, num=resource.ngpus
-            )
-            if sub_nodes is None:  # partition fails
-                sub_nodes = graph.replicate(node, times=resource.ngpus)
-            for idx, node in enumerate(sub_nodes):
-                graph.assign(node, idx)
+    linears = [node for node in graph.nodes() if node.name == 'linear']
+    for idx, node in enumerate(linears):
+        algo = node.algorithms('dim')
+        tp_nodes = graph.partition(node, algo, idx=1, dim=idx%2, num=resource.ngpus)
+        for idx, node in enumerate(tp_nodes):
+            graph.assign(node, idx)
+    for node in graph.nodes():
+        if isinstance(node, (IRFwOperation, IRDataOperation)):
+            if len(node.device) == 0:
+                sub_nodes = graph.replicate(node, resource.ngpus)
+                for idx, node in enumerate(sub_nodes):
+                    graph.assign(node, idx)
     print(graph.extra_repr())
     return graph
 
@@ -105,25 +101,23 @@ def PASMegatron(graph: IRGraph, resource):
     """
     tp = 2
     dp = resource.ngpus // tp
-    for idx, node in enumerate(graph.nodes()):
-        if isinstance(node, IRDataOperation):
-            sub_nodes = graph.replicate(node, times=resource.ngpus)
-            for idx, node in enumerate(sub_nodes):
-                graph.assign(node, idx)
-            continue
-        if isinstance(node, IRFwOperation):
-            sub_nodes = list()
-            algo = node.algorithms('dim')
-            tp_nodes = graph.partition(node, algo, idx=1, dim=(idx+1)%2, num=tp)
-            if tp_nodes is not None:
-                for tp_node in tp_nodes:
-                    algo = tp_node.algorithms('dim')
-                    dp_nodes = graph.partition(tp_node, algo, idx=0, dim=0, num=dp)
-                    sub_nodes += dp_nodes
-            else:
-                sub_nodes = graph.replicate(node, times=resource.ngpus)
-            for idx, node in enumerate(sub_nodes):
-                graph.assign(node, idx)
+    linears = [node for node in graph.nodes() if node.name == 'linear']
+    for idx, node in enumerate(linears):
+        sub_nodes = []
+        algo = node.algorithms('dim')
+        tp_nodes = graph.partition(node, algo, idx=1, dim=idx%2, num=tp)
+        for tp_node in tp_nodes:
+            algo = tp_node.algorithms('dim')
+            dp_nodes = graph.partition(tp_node, algo, idx=0, dim=0, num=dp)
+            sub_nodes += dp_nodes
+        for idx, node in enumerate(sub_nodes):
+            graph.assign(node, idx)
+    for node in graph.nodes():
+        if isinstance(node, (IRFwOperation, IRDataOperation)):
+            if len(node.device) == 0:
+                sub_nodes = graph.replicate(node, resource.ngpus)
+                for idx, node in enumerate(sub_nodes):
+                    graph.assign(node, idx)
     # print(graph.extra_repr())
     return graph
 
