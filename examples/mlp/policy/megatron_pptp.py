@@ -47,9 +47,10 @@ def PAS(graph: IRGraph, resource):
         sid = node2stage(node)
         tp_group = tp_mesh[sid]
         # partition
-        algo = node.algorithms('dim')
-        tp_nodes = graph.partition(node, algo, dict(idx=1, dim=idx%2, num=num_tp))
-        if tp_nodes is None:
+        if node.name == 'linear':
+            algo = node.algorithms('dim')
+            tp_nodes = graph.partition(node, algo, idx=1, dim=idx%2, num=num_tp)
+        else:
             tp_nodes = graph.replicate(node, times=num_tp)
         # assign
         for devid, node in zip(tp_group, tp_nodes):
