@@ -72,6 +72,15 @@ def forward(graph: IRGraph, *args) -> IRGraph:
         while itensor in graph.outputs():
             oidx = graph.outputs().index(itensor)
             graph.set_output(oidx, arg)
+    # setup gradient accum
+    for ftensor in graph.full_tensors():
+        naccum = len(ftensor.ctensors)
+        for idx, ctensor in enumerate(ftensor.ctensors):
+            ctensor.grad_accum = (idx, naccum)
+        # actually producer doesn't need to know accumulation
+        naccum = len(ftensor.producers)
+        for idx, ptensor in enumerate(ftensor.ptensors):
+            ptensor.grad_accum = (idx, naccum)
     # generate backward reverse is only to make op id looks consecutive
     for fnode in [n for n in graph.nodes() if isinstance(n, IRFwOperation)][::-1]:
         fnode.gen_backward()

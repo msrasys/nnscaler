@@ -24,7 +24,7 @@ import copy
 import math
 
 from cube.ir.cten import IRCell, IRTensor
-import cube.ir.dtype as irdtype 
+import cube.ir.dtype as irdtype
 
 
 class IndexMap:
@@ -428,6 +428,15 @@ class IRFullTensor(IRTensor):
         self._ptensors.insert(idx, tensor)
 
     def add_consumer(self, cell: IRCell, tensor: IRTensor, idx: int = 0):
+        """!
+        Add the tensor and its operator into consumer list.
+        The tensor should be in cell.inputs()
+
+        @param cell IRCell: node to be consumer
+        @param tensor IRTensor: tensor to be consumed tensors
+        @param idx int: the index to be inserted
+        """
+        assert tensor in cell.inputs(), f"tensor {tensor} not in node: {cell} inputs"
         if not isinstance(cell, IRCell) or not isinstance(tensor, IRTensor):
             raise TypeError("Expect an IRCell and an IRTensor")
         assert cell not in self._consumers, f"{cell} already exists as consumer"
@@ -508,19 +517,6 @@ class IRFullTensor(IRTensor):
         self._is_param = False
         self._is_grad = True
         return self
-
-    def like(self):
-        """
-        Create a new tensor with same name and shape,
-        but with a different new id
-
-        Returns:
-            tensor
-        """
-        tensor = IRFullTensor(self._shape, self.name)
-        for attr in IRFullTensor._attr:
-            setattr(tensor, attr, getattr(self, attr))
-        return tensor
 
     def select(self, indmap: Union[Tuple, IndexMap], valmap: Union[Tuple, ValueMap, None], shape: List[int]):
         """
@@ -666,6 +662,10 @@ class IRSubTensor(IRTensor):
     def valmap(self) -> ValueMap:
         return copy.copy(self._valmap)
 
+    @property
+    def ndims(self) -> int:
+        return len(self.shape)
+
     def __copy__(self):
         """
         Copy the tensor that will have the exactly same id
@@ -704,24 +704,25 @@ class IRSubTensor(IRTensor):
             self._grad = full_grad
         # this tensor is consumed
         elif self in self.cell.inputs():
-            ref_consumers = list()
-            for consumer in self.parent.consumers:
-                for itensor in consumer.inputs():
-                    if self.overlap(itensor):
-                        # TODO: we should guarantee in final status itensor == self
-                        # replicated nodes will have same node id
-                        if consumer._id not in ref_consumers:
-                            ref_consumers.append(consumer._id)
-                            # if one node has multiple same tensors,
-                            # will consider them as one
-                            break
-            ref_times = len(ref_consumers)
-            if ref_times == 0:
-                raise RuntimeError("Internal error: consumer doesn't have the operator attached to this tensor")
-            idx = ref_consumers.index(self.cell._id)
+            # ref_consumers = list()
+            # for consumer in self.parent.consumers:
+            #     for itensor in consumer.inputs():
+            #         if self.overlap(itensor):
+            #             # TODO: we should guarantee in final status itensor == self
+            #             # replicated nodes will have same node id
+            #             if consumer._id not in ref_consumers:
+            #                 ref_consumers.append(consumer._id)
+            #                 # if one node has multiple same tensors,
+            #                 # will consider them as one
+            #                 break
+            # ref_times = len(ref_consumers)
+            # if ref_times == 0:
+            #     raise RuntimeError("Internal error: consumer doesn't have the operator attached to this tensor")
+            # idx = ref_consumers.index(self.cell._id)
+            assert self.grad_accum is not None, "not supported for gradient accumulation"
             grad = full_grad.select(
                 indmap = self.indmap,
-                valmap = (idx, ref_times),
+                valmap = self.grad_accum, #(idx, ref_times),
                 shape = self.shape
             )
             self._grad = grad
@@ -745,6 +746,8 @@ class IRSubTensor(IRTensor):
     def requires_grad(self) -> bool:
         _ = self.grad
         return self._requires_grad
+
+    # partition primitives
 
     def select(self, indmap: Union[Tuple, IndexMap], valmap: Union[Tuple, ValueMap, None], shape=None) -> IRTensor:
         """
@@ -770,9 +773,85 @@ class IRSubTensor(IRTensor):
         valmap = self.valmap.map(sub_valmap)
 
         sub_tensor = self.parent.select(index_map, valmap, shape)
+        sub_tensor.grad_accum = None
         return sub_tensor
 
-    def overlap(self, other):
+    def replicate(self, num: int) -> List[IRTensor]:
+        """!
+        Partition primitive
+            - replicate: replicate the tensor.
+
+        @return tensor IRTensor: the copied tensor
+        """
+        aidx, chunks = self.grad_accum
+        tensors = []
+        for idx in range(num):
+            tensor = copy.copy(self)
+            tensor.grad_accum = (aidx * num + idx, chunks * num)
+            tensors.append(tensor)
+        return tensors
+
+    def split_dim(self, dim: int, num: int) -> List[IRTensor]:
+        """
+        Partition primitive:
+            split_dim: uniformly split the tensor along a dimension.
+
+        @param dim int: the dimension to get partitioned
+        @param num int: the number of sub-tensor generated
+
+        @return sub_tensors List[IRSubTensor]: the generated sub-tensors
+        """
+        dim = dim + self.ndims if dim < 0 else dim
+        assert dim < self.ndims, f"Dim should within ndims but {dim} >= {self.ndims})"
+        assert self.shape[dim] % num == 0, f"Expected dimension can be split: {self.shape[dim]} % {num} != 0"
+        chunk_size = self.shape[dim] // num
+
+        shape_slicer = list()
+        chunk_shape = list()
+        for tdim, nele in enumerate(self.shape):
+            if tdim != dim:
+                shape_slicer.append(slice(0, nele, 1))
+                chunk_shape.append(nele)
+            else:
+                shape_slicer.append(None)
+                chunk_shape.append(chunk_size)
+        sub_tensors = list()
+        for cid in range(num):
+            shape_slicer[dim] = slice(chunk_size * cid, chunk_size * (cid + 1), 1)
+            sub_tensor = self.select(
+                indmap = tuple(shape_slicer),
+                valmap = None,
+                shape = chunk_shape
+            )
+            sub_tensor.grad_accum = self.grad_accum
+            sub_tensors.append(sub_tensor)
+        return sub_tensors
+
+    def split_val(self, num: int) -> List[IRTensor]:
+        """!
+        Partition primitive:
+            split_val: uniformly split the tensor value.
+
+        @param num int: the number of sub-tensor generated
+
+        @return sub_tensors List[IRSubTensor]: the generated sub-tensors
+        """
+        # full shape
+        shape_slicer = list()
+        for nele in self.shape:
+            shape_slicer.append(slice(0, nele, 1))
+        sub_tensors = list()
+        for idx in range(num):
+            sub_tensor = self.select(
+                indmap = tuple(shape_slicer),
+                valmap = (idx, num),
+                shape = self.shape
+            )
+            sub_tensor.grad_accum = self.grad_accum
+            sub_tensors.append(sub_tensor)
+        return sub_tensors
+
+    def overlap(self, other) -> bool:
         """
         Check if the two tensor is overlapped.
 

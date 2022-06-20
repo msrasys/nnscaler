@@ -322,11 +322,13 @@ class IRGraph(IRCell):
         if isinstance(node, IRAdapter):
             return
         # update consumer
-        itensors = []
+        itensors: List[IRSubTensor] = []
         for itensor in node.inputs():
             if isinstance(itensor, IRSubTensor) and itensor not in itensors:
                 itensors.append(itensor)
         for itensor in itensors:
+            if itensor.parent._id not in self._full_tensors:
+                self._full_tensors[itensor.parent._id] = itensor.parent
             idx = 0
             for consumer in itensor.parent.consumers:
                 if self.nodes().index(consumer) < index:
@@ -335,11 +337,13 @@ class IRGraph(IRCell):
                     break
             itensor.parent.add_consumer(node, itensor, idx)
         # update producer
-        otensors = []
+        otensors: List[IRSubTensor] = []
         for otensor in node.outputs():
             if isinstance(otensor, IRSubTensor) and otensor not in otensors:
                 otensors.append(otensor)
         for otensor in otensors:
+            if otensor.parent._id not in self._full_tensors:
+                self._full_tensors[itensor.parent._id] = itensor.parent
             idx = 0
             for producer in otensor.parent.producers:
                 if self.nodes().index(producer) < index:
@@ -421,91 +425,95 @@ class IRGraph(IRCell):
                             outputs.append(output)
         return outputs
 
-    ## Parallel Policy Primitives ##
+    ##### Partition Primitives #####
 
-    def replicate(self, op: IRCell, times=1, reset_dependency=True) -> Optional[List[IRCell]]:
+    def replicate(self, node: Union[IRFwOperation, IRDataOperation],
+                  times=1, reset_dependency=True) -> Optional[List[IRCell]]:
         """
-        Replicate a forward or data operation multiple times.
+        Partition Primitive:
+            - replicate: replicate a forward or data operation multiple times.
+        
+        Each input and output will be replicated with no gradient accumulation.
 
         The backward of the forward operation will automatically be replicated.
+
+        @param: node: Union[IRFwOperation, IRDataOperation]
         """
-        if not (isinstance(op, IRFwOperation) or isinstance(op, IRDataOperation)):
+        if not isinstance(node, (IRFwOperation, IRDataOperation)):
             raise TypeError("Expected op to be forward op or data op")
         if not isinstance(times, int) or times < 1:
             raise TypeError("Expected times to be int and >= 1")
 
-        if op not in self.nodes():
-            raise RuntimeError(f"Op {op} not exsits")
+        if node not in self.nodes():
+            raise RuntimeError(f"Op {node} not exsits")
     
-        fnodes = [op.replicate() for _ in range(times - 1)]
+        fnodes = [node.replicate() for _ in range(times - 1)]
         # insert forward
-        fidx = self.nodes().index(op)
+        fidx = self.nodes().index(node)
         for idx, fnode in enumerate(fnodes):
             self.attach(fnode, fidx + idx + 1) 
         # insert backward
-        if isinstance(op.mirror, IRBpOperation):
+        if isinstance(node.mirror, IRBpOperation):
             for fnode in fnodes:
                 fnode.gen_backward()
             bnodes = [fnode.mirror for fnode in fnodes][::-1]
-            bidx = self.nodes().index(op.mirror)
+            bidx = self.nodes().index(node.mirror)
             for idx, bnode in enumerate(bnodes):
                 self.attach(bnode, bidx + idx)
         if reset_dependency:
             self.reset_dependency()
-        return [op] + fnodes
+        return [node] + fnodes
 
-    def partition(self, op: IRCell, algo: GenericDistAlgo, **config) -> Optional[List[IRCell]]:
+    def partition(self, node: Union[IRFwOperation, IRDataOperation],
+                  algo: GenericDistAlgo, **config) -> Optional[List[IRCell]]:
         """
-        Partition an operator (op) by using
-        op partition algorithm (algo) and its configuration (config).
-        Note the backward op-partition will be automatically done.
+        Partition Primitive:
+            - partition: partition a forward or data operation using algorithms.
+        
+        The backward of the forward operation will automaticall be partitioned.
 
-        Args:
-            op: cell to be partitioned
-            algo: generic distributed algorithm related to the op
-            config: dict
+        Requirement to partition algorithm:
+            if backward is required, the algorithm can only transform tensors in:
+                replicate: results in gradient accumulation
+                split dimensionL no gradient accumulation
+                split value (outputs only): no gradient accumulation
 
-        Returns:
-            nodes: List[IRCell] if partitioned successfully.
-            None if failed
+        Difference of partition and replicate primitive:
+          Both primitive may replicate the tensors, but `replicate` will not do gradient
+          accumulation while `partition` will always require gradient accumulation on
+          replicated tensors.
+        
+        @param node Union[IRFwOperation, IRDataOperation]: the node to partition
+        @param algo GenericDistAlgo: the partition algorithm related to the node
+        @param config Dict[str, Any]: the algorithm configuration, e.g., partition number
+
+        @return Optional[IRCell]: partitioned sub-nodes or None (fail to partition)
         """
-        if not isinstance(algo, GenericDistAlgo):
-            raise TypeError("Expected algo to be GenericDistAlgo")
-        if op not in self.nodes():
-            raise RuntimeError(f"Not Exist: {op}")
-        if not (isinstance(op, IRFwOperation) or isinstance(op, IRDataOperation)):
+        assert isinstance(algo, GenericDistAlgo) and node == algo.node, \
+            "The partition algorithm is not initialized for this node"
+        if node not in self.nodes():
+            raise RuntimeError(f"Not Exist: {node}")
+        if not (isinstance(node, IRFwOperation) or isinstance(node, IRDataOperation)):
             raise ValueError("Only allow op to be forward op or data op.")
 
-        if algo.node != op:
-            return None
-        if not algo.satisfy(**config):
-            return None
+        # get partitioned sub-nodes
         fnodes = algo.instantiate(**config)
+        if fnodes is None: return fnodes
 
-        #FIXME: we don't allow non-weight input to be splitted in value
-        for fnode in fnodes:
-            for input in fnode.inputs():
-                if isinstance(input, IRSubTensor):
-                    if input.valmap.chunk_num != 1 and not input.is_param():
-                        raise NotImplementedError(
-                            f"Not support feature-map {input} to be splitted in value as input"
-                        )
         # update forward
-        findex = self.detach(op)
+        findex = self.detach(node)
         for idx, fnode in enumerate(fnodes):
             self.attach(fnode, findex + idx)
         # update backward
-        if isinstance(op.mirror, IRBpOperation):
-            bindex = self.detach(op.mirror)
+        if isinstance(node.mirror, IRBpOperation):
+            bindex = self.detach(node.mirror)
             bnodes = [fnode.gen_backward() for fnode in fnodes][::-1]
             for idx, bnode in enumerate(bnodes):
                 self.attach(bnode, bindex + idx)
         # update gradient
         updated = set()
-        for input in op.inputs():
-            if not isinstance(input, IRSubTensor):
-                continue
-            for fnode in input.parent.consumers:
+        for itensor in [t for t in node.inputs() if isinstance(t, IRSubTensor)]:
+            for fnode in itensor.parent.consumers:
                 bnode = fnode.mirror
                 if isinstance(bnode, IRBpOperation) and fnode._id not in updated:
                     idx = self.detach(bnode)
@@ -514,10 +522,9 @@ class IRGraph(IRCell):
                 updated.add(fnode._id)
         # update device
         for fnode in fnodes:
-            fnode.device = op.device
+            fnode.device = node.device
             if isinstance(fnode.mirror, IRCell):
-                fnode.mirror.device = op.device
-        self.reset_dependency()
+                fnode.mirror.device = node.device
         return fnodes
 
     def merge(self, nodes: List[IRCell], target_node: IRCell):
@@ -578,7 +585,7 @@ class IRGraph(IRCell):
     def identity(self, input_tensor, dst_op):
         raise NotImplementedError
 
-    ## Assign Policy Primitives ##
+    ## Spatial Primitives ##
 
     def assign(self, op: IRCell, ranks: Union[int, List[int]]):
         """
@@ -651,11 +658,20 @@ class IRGraph(IRCell):
             post.add_predecessor(input_index=-1, cell=prev)
         return True
 
-    def recompute(self, nodes: List[IRFwOperation]):
+    def recompute(self, nodes: List[IRFwOperation]) -> bool:
+        """!
+        Recompute a set of nodes. The forward nodes will be assigned with a unique
+        recompute group id. A forward not can not be recomputed in different recompute groups.
+
+        @param nodes List[IRFwOperation]: nodes for a recompute group
+
+        @return success boolean: always success
+        """
         assert all(isinstance(fnode, IRFwOperation) for fnode in nodes), "require forward operations"
         recompute_group_id = IDGenerator().gen_cell_id()
         for fnode in nodes:
             fnode.recompute = recompute_group_id
+        return True
 
     def set_order(self, seq: List[IRCell]):
         """

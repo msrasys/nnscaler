@@ -96,6 +96,14 @@ class IRAdapterGener:
 
     @staticmethod
     def gen_activation(graph: IRGraph) -> IRGraph:
+        """!
+        Generate adapter for activation tensors.
+        The forward/backward adapter is inserted before the first consumers of its full tensor.
+
+        @param graph IRGraph: the graph the requires for adapter.
+
+        @return graph IRGraph: the (inplace) modified graph with activation adapters. 
+        """
         for ftensor in graph.full_tensors():
             # backward will gen in forward
             if ftensor.is_param() or ftensor.is_grad():
@@ -103,16 +111,18 @@ class IRAdapterGener:
             adapters = IRAdapterGener.gen_fulltensor(ftensor)
             if len(adapters) == 0:
                 continue
+            # insert forward adapter
+            fidx = min([graph.nodes().index(c) for c in ftensor.consumers])
             for fadapter in adapters:
-                # insert forward adapter
-                idx = min([graph.nodes().index(c) for c in ftensor.consumers])
-                graph._nodes.insert(idx, fadapter)
+                graph._nodes.insert(fidx, fadapter)
+            # insert bacward adapter
+            bidx = None if ftensor.grad is None else min([graph.nodes().index(c) for c in ftensor.grad.consumers])
+            for fadapter in adapters:
                 # insert backward adapter
                 badapter: IRAdapter = fadapter.mirror
                 if badapter is not None:
-                    grad: Optional[IRFullTensor] = ftensor.grad
-                    idx = min([graph.nodes().index(c) for c in grad.consumers])
-                    graph._nodes.insert(idx, badapter)
+                    assert isinstance(bidx, int), "have backward adapter but no gradient required."
+                    graph._nodes.insert(bidx, badapter)
         return graph
 
     @staticmethod
@@ -273,7 +283,7 @@ class IRAdapterGener:
                     stop = start + oslicer.stop - oslicer.start
                     indmap.append(slice(start, stop, 1))
                 valmap = ValueMap(0, 1)
-                common.attach_cell(subtensor._cell)
+                common.cell = subtensor.cell
                 prims.append(SelectPrim(tensor, indmap, valmap, common))
                 return prims
         # check local + remote
@@ -282,7 +292,7 @@ class IRAdapterGener:
                 if not itensor.overlap(subtensor):
                     continue
                 common = itensor.common(subtensor)
-                common.attach_cell(itensor._cell)
+                common.cell = itensor.cell
                 # print(f'get common: {common.extra_repr()}')
                 intersections.append(common)
                 if common == itensor:
@@ -307,7 +317,7 @@ class IRAdapterGener:
             mtensor = tensor
             if tensor.device != subtensor.device:
                 mtensor = copy.copy(tensor)
-                mtensor.attach_cell(subtensor._cell)
+                mtensor.cell = subtensor.cell
                 prims.append(MovePrim(tensor, mtensor))
             tmoved.append(mtensor)
 
@@ -329,7 +339,7 @@ class IRAdapterGener:
                             vid = min(vid1, vid2) // 2
                             valmap = ValueMap(vid, t1.valmap.chunk_num // 2)
                             out = subtensor.parent.select(t1.indmap, valmap, t1.shape)
-                            out.attach_cell(subtensor._cell)
+                            out.cell = subtensor.cell
                             prims.append(SumPrim([t1, t2], out))
                             merged = True
                             break
@@ -355,7 +365,7 @@ class IRAdapterGener:
                         indmap = IndexMap(tuple(indmap))
                         valmap = t1.valmap
                         out = t1.parent.select(indmap, valmap, indmap.shape)
-                        out.attach_cell(subtensor._cell)
+                        out.cell = subtensor.cell
                         cdim = list(cat_dim.keys())[0]
                         prims.append(MergeDimPrim(cat_dim[cdim], out, cdim))
                         merged = True

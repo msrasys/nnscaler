@@ -13,7 +13,7 @@ from cube.logics.pool import SchedulePool
 class LogicTranslator:
 
     @staticmethod
-    def gen_logic_graph(outputs=None):
+    def gen_logic_graph(outputs=None) -> IRGraph:
         """
         Generate Training Logic Graph
         """

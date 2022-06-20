@@ -106,13 +106,6 @@ class DimAnno:
             return self._identifiers[0]
         return '(' + ' '.join(self._identifiers) + ')'
 
-    def length(self, identifier: str) -> Optional[int]:
-        """
-        Return the integer of identifer
-        """
-        assert identifier in self._identifiers, f"identifier {identifier} not in {self}"
-        return self._length[identifier]
-
     @property
     def identifiers(self) -> Tuple[str]:
         return self._identifiers

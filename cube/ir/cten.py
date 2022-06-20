@@ -61,7 +61,7 @@ class IRCell:
         if init_outputs:
             self._outputs: List[IRTensor] = [IRTensor() for _ in range(output_length)]
             for tensor in self._outputs:
-                tensor.attach_cell(self)
+                tensor.cell = self
 
         # destination cells. [-1] for control dependency
         self._successors: List[List[IRCell]] = [list() for _ in range(output_length+1)]
@@ -72,11 +72,6 @@ class IRCell:
 
         # the comment for code generation
         self._comment: Optional[str] = None
-
-    # def __eq__(self, other):
-    #     if isinstance(other, IRCell):
-    #         return self._id == other._id
-    #     return False
 
     @property
     def device(self):
@@ -235,7 +230,7 @@ class IRCell:
             # copy the val
             val = copy.copy(val)
             # set tensor dst
-            val.attach_cell(self)
+            val.cell = self
             # set input value dtype
             if self._dtype == IRDType.unknown:
                 self._dtype = val.dtype
@@ -260,7 +255,7 @@ class IRCell:
             )
         if isinstance(val, IRTensor):
             val = copy.copy(val)
-            val.attach_cell(self)
+            val.cell = self
             # set output value dtype
             val.dtype = self._dtype
         self._outputs[output_index] = val
@@ -404,7 +399,7 @@ class IRTensor:
     and will be translated to None in code generation. 
     """
 
-    _attr = ['name', '_is_param', '_is_grad', '_requires_grad', '_dtype']
+    _attr = ['name', '_is_param', '_is_grad', '_requires_grad', '_dtype', '_grad_accum']
 
     def __init__(self, shape=None, name='tensor', dtype=IRDType.unknown, tid=None):
 
@@ -422,6 +417,8 @@ class IRTensor:
         # tensor gradient
         self._requires_grad: bool = True
         self._grad: Optional[Union[IRTensor, float]] = None
+        # multi-reference id
+        self._grad_accum: Tuple[int] = (0, 1)
 
     @property
     def dtype(self) -> IRDType:
@@ -448,14 +445,6 @@ class IRTensor:
         assert isinstance(val, IRCell) or val is None, "Expected cell to be Optional[IRCell]"
         self._cell = val
 
-    def attach_cell(self, cell: IRCell):
-        """
-        Attach to a cell, to be with input or output
-        """
-        if not isinstance(cell, IRCell):
-            raise TypeError("Expected an IRCell")
-        self._cell = cell
-
     @property
     def device(self) -> List[int]:
         if self._cell:
@@ -468,6 +457,23 @@ class IRTensor:
         raise RuntimeError(
             "tensor placement is not allowed to set manually"
         )
+
+    @property
+    def grad_accum(self) -> Tuple[int, int]:
+        return self._grad_accum
+
+    @grad_accum.setter
+    def grad_accum(self, accum: Optional[Tuple[int, int]]):
+        """!
+        Set gradient accumulation: (idx, chunks)
+        """
+        if accum is None:
+            self._grad_accum
+        else:
+            assert len(accum) == 2 and all(isinstance(acc, int) for acc in accum), \
+                "Expected accum to be [int, int]: [idx, chunks]"
+            assert accum[0] < accum[1]
+            self._grad_accum = tuple(accum)
 
     def as_param(self):
         """
