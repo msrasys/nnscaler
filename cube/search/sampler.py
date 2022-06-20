@@ -5,7 +5,7 @@ from typing import Callable, Dict, List, Tuple
 from cube.graph.graph import IRGraph
 from cube.ir.operator import IRFwOperation, IRBpOperation
 from cube.ir.cten import IRCell
-from cube.execplan import ExectuionPlan
+from cube.execplan import ExecutionPlan
 
 from multiprocessing import Pool
 import numpy as np
@@ -352,7 +352,7 @@ class Searcher:
         graph = IRGraph([], [], [], 'search')
         for seq in seqs:
             graph._nodes = seq
-            execplan = ExectuionPlan(graph)
+            execplan = ExecutionPlan(graph)
             span, mem = execplan.analyze(map2time=Estimator.map2time, map2mem=Estimator.map2mem)
             if mem not in bucket:
                 bucket[mem] = (span, copy.copy(seq))

@@ -3,7 +3,7 @@ from cube.graph.graph import IRSegment
 
 from cube.ir.adapter import IRAdapter
 
-from cube.execplan import ExectuionPlan
+from cube.execplan import ExecutionPlan
 from cube.execplan.planpass.planpass import PlanPass
 
 from cube.ir.adapter.prim import IRAdapterPrim
@@ -18,7 +18,7 @@ from cube.ir.adapter.prim import AllToAllAllToAllPrim
 class DiffFusion(PlanPass):
 
     @staticmethod
-    def apply(execplan: ExectuionPlan) -> ExectuionPlan:
+    def apply(execplan: ExecutionPlan) -> ExecutionPlan:
         """
         Fuse the non-differentiable adapters into differentiable adapters.
         """

@@ -16,7 +16,7 @@ from cube.ir.adapter.prim import CollectivePrim
 from cube.graph.graph import IRGraph, IRSegment
 from cube.graph.schedule import IRScheduleStrategy
 
-from cube.execplan import ExectuionPlan
+from cube.execplan import ExecutionPlan
 
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
@@ -28,8 +28,8 @@ class CodeGen:
     """
     Generate code for the model
     """
-    def __init__(self, execplan: ExectuionPlan):
-        if not isinstance(execplan, ExectuionPlan):
+    def __init__(self, execplan: ExecutionPlan):
+        if not isinstance(execplan, ExecutionPlan):
             raise TypeError("execplan should be ExecutionPlan")
         self.execplan = execplan
 
@@ -60,7 +60,7 @@ class ModelCodeGen(CodeGen):
     Generate model code
     """
 
-    def __init__(self, execplan: ExectuionPlan):
+    def __init__(self, execplan: ExecutionPlan):
         super().__init__(execplan)
         # model full code
         self.init_code: List[str] = [
@@ -332,7 +332,7 @@ class ModelCodeGen(CodeGen):
 
 class ScheduleCodeGen(CodeGen):
 
-    def __init__(self, execplan: ExectuionPlan):
+    def __init__(self, execplan: ExecutionPlan):
         super().__init__(execplan)
         # model full code
         self.init_code: List[str] = [

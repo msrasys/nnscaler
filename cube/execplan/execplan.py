@@ -8,7 +8,7 @@ from cube.ir.operator import IRBpOperation, IRFwOperation
 from cube.graph.graph import IRGraph, IRSegment
 
 
-class ExectuionPlan:
+class ExecutionPlan:
 
     def __init__(self, graph: IRGraph):
         assert isinstance(graph, IRGraph), "Expected an IRGraph"

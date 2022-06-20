@@ -3,7 +3,7 @@ Operation grouping
 """
 from typing import List, Dict, Tuple
 
-from cube.execplan import ExectuionPlan
+from cube.execplan import ExecutionPlan
 from cube.execplan.planpass.planpass import PlanPass
 from cube.ir.adapter import IRAdapter
 from cube.ir.operator import IRBpOperation, IRFwOperation
@@ -13,7 +13,7 @@ from cube.ir.cten import IRCell
 class Grouping(PlanPass):
 
     @staticmethod
-    def apply(execplan: ExectuionPlan) -> ExectuionPlan:
+    def apply(execplan: ExecutionPlan) -> ExecutionPlan:
         """
         Group contiguous differentiable operators segments
         """
