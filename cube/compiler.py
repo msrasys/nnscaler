@@ -13,7 +13,7 @@ from cube.ir.operator import IRDataOperation
 from cube.logics.pool import SchedulePool
 from cube.logics.translator import LogicTranslator
 
-from cube.execplan import ExectuionPlan
+from cube.execplan import ExecutionPlan
 from cube.execplan.planpass.fusion import DiffFusion
 from cube.execplan.planpass.grouping import Grouping
 
@@ -172,7 +172,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                 print(graph.schedule_plan)
 
             # to execution plan
-            execplan = ExectuionPlan(graph)
+            execplan = ExecutionPlan(graph)
 
             # plan pass for communication optimization
             start = time.time()

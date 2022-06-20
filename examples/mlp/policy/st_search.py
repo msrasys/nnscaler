@@ -3,7 +3,7 @@ from typing import List
 from cube.graph import IRGraph
 from cube.ir.operator import IRFwOperation
 from cube.ir.cten import IRCell
-from cube.execplan import ExectuionPlan
+from cube.execplan import ExecutionPlan
 
 from cube.search.sampler import Estimator, Sampler, SpatialSampler, TemporalSampler, Searcher
 
@@ -67,7 +67,7 @@ def PAS(graph: IRGraph, resource):
         Searcher.search(seqs, bucket, n_worker=n_worker)
         for mem, (span, seq) in bucket.items():
             sgraph._nodes = seq
-            execplan = ExectuionPlan(sgraph)
+            execplan = ExecutionPlan(sgraph)
             execplan.analyze(map2time=Estimator.map2time, outfile=f'plan.mem{mem}.png')
         cnt += len(seqs)
     print(f'done search on {cnt} sequences')

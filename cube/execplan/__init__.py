@@ -1,1 +1,1 @@
-from cube.execplan.execplan import ExectuionPlan
+from cube.execplan.execplan import ExecutionPlan
