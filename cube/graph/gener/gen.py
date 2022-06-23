@@ -129,9 +129,9 @@ class IRAdapterGener:
 
             fadapter = None
             # Case 1: sharing device (in-shard)
-            # if set(pdevs) == set(cdevs) and len(pdevs) > 1 and \
-            #    len(set(pdevs)) == len(ptensors) and len(set(cdevs)) == len(ctensors):
-            #     fadapter = IRAdapterGener.gen_in_shard(ftensor, allow_reorder=True)
+            if set(pdevs) == set(cdevs) and len(pdevs) > 1 and \
+               len(set(pdevs)) == len(ptensors) and len(set(cdevs)) == len(ctensors):
+                fadapter = IRAdapterGener.gen_in_shard(ftensor, allow_reorder=True)
 
             # Case 2: sperating device (cross-shard)
             if len(set(pdevs).intersection(cdevs)) == 0:
