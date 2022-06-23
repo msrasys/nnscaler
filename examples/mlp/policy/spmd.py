@@ -99,7 +99,7 @@ def PASMegatron(graph: IRGraph, resource):
     """
     Tensor + Data Parallelism
     """
-    tp = 2
+    tp = min(2, resource.ngpus)
     dp = resource.ngpus // tp
     linears = [node for node in graph.nodes() if node.name == 'linear']
     for idx, node in enumerate(linears):
