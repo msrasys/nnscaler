@@ -25,20 +25,23 @@ class DiffFusion(PlanPass):
         cnt = 0
         for devid in execplan.devices():
             for node in execplan.seq(devid):
-                if isinstance(node, IRAdapter) and node.forward and not node.differentiable:
-                    ret = DiffFusion.nnfuse(node)
-                    cnt = cnt+1 if ret else cnt
+                if isinstance(node, IRAdapter):
+                    print(node, node.cid)
+                    if node.forward:
+                        ret = DiffFusion.nnfuse(node)
+                        cnt = cnt+1 if ret else cnt
                 if isinstance(node, IRSegment) and node.forward:
                     for fnode in node.nodes():
-                        if isinstance(fnode, IRAdapter) and node.forward and not fnode.differentiable:
-                            ret = DiffFusion.nnfuse(fnode)
-                            if not ret:
-                                raise NotImplementedError(
-                                    f"adapter within IRSegment cannot fuse to differientiable adapter"
-                                    f"\nforward: {fnode.extra_repr()}"
-                                    f"\nbackward: {fnode.mirror.extra_repr()}"
-                                )
-                            cnt = cnt + 1
+                        if isinstance(fnode, IRAdapter):
+                            if node.forward:
+                                ret = DiffFusion.nnfuse(fnode)
+                                if not ret:
+                                    raise NotImplementedError(
+                                        f"adapter within IRSegment cannot fuse to differientiable adapter"
+                                        f"\nforward: {fnode.extra_repr()}"
+                                        f"\nbackward: {fnode.mirror.extra_repr()}"
+                                    )
+                                cnt = cnt + 1
         print(f'successfully generate {cnt} differentiable adapters')
         return execplan
 
@@ -103,7 +106,9 @@ class DiffFusion(PlanPass):
         if prims is not None:
             fadapter.prims = prims
             badapter.prims = prims
+            fadapter.custom = False
             fadapter.differentiable = True
+            badapter.custom = False
             badapter.differentiable = True
             return True
         return False

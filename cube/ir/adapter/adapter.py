@@ -15,6 +15,7 @@ class IRAdapter(IRCell):
             output_length=len(outputs),
             init_outputs=False
         )
+        self.kwargs = dict()
         # we don't use input and output setter as this will
         # change tensor device info
         self._inputs = inputs
@@ -22,6 +23,7 @@ class IRAdapter(IRCell):
 
         self._prims: List[IRAdapterPrim] = []
         self._differentiable = False
+        self.custom = True
 
         device = set()
         for tensor in inputs + outputs:
@@ -117,6 +119,8 @@ class IRAdapter(IRCell):
         fadapter.prims = prims
         fadapter.name = self.name
         fadapter._id = self._id
+        fadapter.differentiable = self.differentiable
+        fadapter.custom = self.custom
         # dispatch for mirror
         if for_mirror and isinstance(self.mirror, IRAdapter):
             badapter = self.mirror.dispatch(devid, for_mirror=False)

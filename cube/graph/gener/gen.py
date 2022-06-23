@@ -129,8 +129,9 @@ class IRAdapterGener:
 
             fadapter = None
             # Case 1: sharing device (in-shard)
-            if set(pdevs) == set(cdevs) and len(pdevs) > 1 and \
-               len(set(pdevs)) == len(ptensors) and len(set(cdevs)) == len(ctensors):
+            inshard = set(pdevs) == set(cdevs) and len(ptensors) == len(ctensors) and \
+                      len(pdevs) == len(ptensors)
+            if inshard and len(pdevs) > 1:
                 fadapter = IRAdapterGener.gen_in_shard(ftensor, allow_reorder=True)
 
             # Case 2: sperating device (cross-shard)
@@ -147,6 +148,11 @@ class IRAdapterGener:
             if (badapter is not None and len(fadapter.prims) == 0 and len(badapter.prims) == 0) or \
                (badapter is None and len(fadapter.prims) == 0):
                 continue
+
+            # set differentiable for autograd generation
+            if inshard and badapter is not None:
+                fadapter.differentiable = True
+                badapter.differentiable = True
 
             # insert forward adapter
             fidx = min([graph.nodes().index(consumer) for consumer in ftensor.consumers])

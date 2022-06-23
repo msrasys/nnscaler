@@ -12,7 +12,7 @@ from cube.ir.dtype import IRDType
 from cube.ir.tensor import IRSubTensor
 from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from cube.ir.adapter import IRWeightReducer, IRAdapter
-from cube.ir.adapter.prim import CollectivePrim
+from cube.ir.adapter.prim import CollectivePrim, IRAdapterPrim
 from cube.graph.graph import IRGraph, IRSegment
 from cube.graph.schedule import IRScheduleStrategy
 
@@ -53,6 +53,77 @@ class CodeGen:
         else:
             name = str(tensor)
         return name
+
+    def tuple_naming(self, tensors: List[Any]) -> str:
+        tensors = [self.tensor_naming(t) for t in tensors]
+        tensors = '(' + ', '.join(tensors + ['']) + ')'
+        return tensors
+
+    def return_naming(self, tensors: List[Any]) -> str:
+        tensors = [self.tensor_naming(t) for t in tensors]
+        if len(tensors) == 0:
+            tensors = '_'
+        else:
+            tensors = ', '.join(tensors)
+        return tensors
+
+
+class AutogradAdapterCodeGen(CodeGen):
+    """
+    Generate autograd adapter code (PyTorch)
+    """
+    def __init__(self):
+
+        self.fw_ins: List[IRSubTensor] = list()
+        self.fw_body: List[str] = list()
+        self.fw_ous: List[IRSubTensor] = list()
+
+        self.bw_ins: List[IRSubTensor] = list()
+        self.bw_body: List[str] = list()
+        self.bw_ous: List[IRSubTensor] = list()
+
+    def emit_prim(self, prim: IRAdapterPrim) -> str:
+        if len(prim.inputs()) == 1:
+            itensors = self.tensor_naming(prim.inputs()[0])
+        else:
+            itensors = self.tuple_naming(prim.inputs())
+        kwargs = list()
+        for name, val in prim.kwargs.items():
+            kwargs.append(f'{name}={val}')
+        kwargs = ', '.join(kwargs)
+        outputs = self.return_naming(prim.outputs())
+        code = f'{outputs} = {prim.signature}({itensors}, {kwargs})'
+        return code
+
+    def gen(self, fadapter: IRAdapter) -> List[str]:
+        assert fadapter.forward and fadapter.differentiable and fadapter.custom, "generate autograd for a non-differentiable adapter"
+        assert fadapter.mirror is not None
+        name = AutogradAdapterCodeGen.name(fadapter)
+        with ClassBlock(class_name=name, derived=['torch.autograd.Function']) as cb:
+            # forward
+            cb.insert_body('@staticmethod')
+            finputs = [self.tensor_naming(t) for t in fadapter.inputs()]
+            with FunctionBlock(func_name='forward', args=['ctx']+finputs) as fw:
+                for prim in fadapter.prims:
+                    fw.insert_body(self.emit_prim(prim))
+                outputs = self.return_naming(fadapter.outputs())
+                fw.insert_body(f'return {outputs}')
+            cb.insert_body(fw.code)
+            # backward
+            cb.insert_body('@staticmethod')
+            badapter: IRAdapter = fadapter.mirror
+            binputs = [self.tensor_naming(t) for t in badapter.inputs()]
+            with FunctionBlock(func_name='backward', args=['ctx']+binputs) as bw:
+                for prim in badapter.prims:
+                    bw.insert_body(self.emit_prim(prim))
+                outputs = self.return_naming(badapter.outputs())
+                bw.insert_body(f'return {outputs}')
+            cb.insert_body(bw.code)
+        return cb.code
+    
+    @staticmethod
+    def name(adapter: IRAdapter) -> str:
+        return f'Adapter{adapter.cid}'
 
 
 class ModelCodeGen(CodeGen):
@@ -122,6 +193,13 @@ class ModelCodeGen(CodeGen):
         gencode = copy.copy(self.init_code)
         node_args: List[List[str]] = list()
         gen_nodes: List[IRCell] = list()
+
+        # init customized adapter
+        for seg in [seg for seg in self.execplan.seq(device) if isinstance(seg, IRSegment)]:
+            for adapter in [n for n in seg.nodes() if isinstance(n, IRAdapter)]:
+                if adapter.forward and adapter.differentiable and adapter.custom:
+                    gencode += AutogradAdapterCodeGen().gen(adapter) + ['', '']
+                    adapter.signature = AutogradAdapterCodeGen.name(adapter) + '.apply'
 
         # initialize communication groups
         self.init_comm_groups()
@@ -256,7 +334,8 @@ class ModelCodeGen(CodeGen):
         Emit adapter call
         """
         assert len(node.device) == 1, f"Expected adapter to be dispatched:\n{node.extra_repr()}"
-        for prim in node.prims:
+        prims = [node] if node.differentiable and node.custom else [prim for prim in node.prims]
+        for prim in prims:
             if len(prim.inputs()) == 1:
                 itensors = self.tensor_naming(prim.inputs()[0])
             else:
@@ -291,19 +370,6 @@ class ModelCodeGen(CodeGen):
         reducer_name = f'self.wreducer{node._id}'
         call_code = f'{reducer_name}.allreduce()'
         self.forward_region.append(call_code)
-
-    def return_naming(self, tensors: List[Any]) -> str:
-        tensors = [self.tensor_naming(t) for t in tensors]
-        if len(tensors) == 0:
-            tensors = '_'
-        else:
-            tensors = ', '.join(tensors)
-        return tensors
-
-    def tuple_naming(self, tensors: List[Any]) -> str:
-        tensors = [self.tensor_naming(t) for t in tensors]
-        tensors = '(' + ', '.join(tensors + ['']) + ')'
-        return tensors
 
     def tensor_naming(self, tensor: Any):
         """
