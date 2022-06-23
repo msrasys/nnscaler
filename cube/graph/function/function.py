@@ -5,6 +5,7 @@ import torch
 import warnings
 
 from cube.ir.cten import IRTensor
+from cube.ir.tensor import IRFullTensor
 from cube.graph.function.einops import ShapeAnno, OpAnno, IREinops
 from cube.graph.function.conv import IRConv2D
 from cube.graph.function.conv import IRConv3D
@@ -725,6 +726,19 @@ def Embedding(signature, inputs: List):
     oshapes = [ishapes[0] + [ishapes[1][-1]]]
     anno = OpAnno.create_op_str(ishapes, oshapes)
     return IREinops(signature, [anno], [itensor, weight], 'embedding', padding_idx=padding_idx, start=start, stop=stop)
+
+
+def MultiRef(signature, inputs: List[IRFullTensor]):
+    """
+    cube.runtime.function.multiref(itensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]
+    """
+    signature = 'cube.runtime.function.multiref'
+    itensor, times = inputs
+    assert isinstance(itensor, IRFullTensor), "require all inputs to be IRSubTensor"
+    assert isinstance(times, int), "require int for second input"
+    anno = '* -> ' + ', '.join('*' for _ in range(times))
+    node = IREinops(signature, [anno], [itensor], 'multiref', times=times)
+    return node
 
 
 def ScriptEinOps(signature, inputs):

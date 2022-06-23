@@ -74,6 +74,15 @@ class IRCell:
         self._comment: Optional[str] = None
 
     @property
+    def cid(self) -> int:
+        """
+        Get cell id
+
+        @return cid int: the cell id.
+        """
+        return self._id
+
+    @property
     def device(self):
         return copy.copy(self._device)
 
@@ -399,7 +408,7 @@ class IRTensor:
     and will be translated to None in code generation. 
     """
 
-    _attr = ['name', '_is_param', '_is_grad', '_requires_grad', '_dtype', '_grad_accum']
+    _meta = ['name', '_is_param', '_is_grad', '_requires_grad', '_dtype']
 
     def __init__(self, shape=None, name='tensor', dtype=IRDType.unknown, tid=None):
 
@@ -417,8 +426,15 @@ class IRTensor:
         # tensor gradient
         self._requires_grad: bool = True
         self._grad: Optional[Union[IRTensor, float]] = None
-        # multi-reference id
-        self._grad_accum: Tuple[int] = (0, 1)
+
+    @property
+    def tid(self) -> int:
+        """
+        Get tensor id
+
+        @return cid int: the tensor id.
+        """
+        return self._id
 
     @property
     def dtype(self) -> IRDType:
@@ -457,23 +473,6 @@ class IRTensor:
         raise RuntimeError(
             "tensor placement is not allowed to set manually"
         )
-
-    @property
-    def grad_accum(self) -> Tuple[int, int]:
-        return self._grad_accum
-
-    @grad_accum.setter
-    def grad_accum(self, accum: Optional[Tuple[int, int]]):
-        """!
-        Set gradient accumulation: (idx, chunks)
-        """
-        if accum is None:
-            self._grad_accum
-        else:
-            assert len(accum) == 2 and all(isinstance(acc, int) for acc in accum), \
-                "Expected accum to be [int, int]: [idx, chunks]"
-            assert accum[0] < accum[1]
-            self._grad_accum = tuple(accum)
 
     def as_param(self):
         """

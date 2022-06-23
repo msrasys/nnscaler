@@ -18,46 +18,46 @@ FwOperation -> BpOperation rule:
     val is always (0/1)
 """
 
-
-from typing import List, Optional, Union, Tuple
-import copy
-import math
+from typing import List, Optional, Union, Tuple, NewType, Dict
 
 from cube.ir.cten import IRCell, IRTensor
 import cube.ir.dtype as irdtype
 
+StartEnd = NewType('[start:end)', Tuple[int, int])
+IdxChunk = NewType('(index, chunks)', Tuple[int, int])
+
 
 class IndexMap:
 
-    def __init__(self, indmap):
+    def __init__(self, indmap: Tuple[StartEnd]):
+        """!
+        Create an index map.
 
-        if not isinstance(indmap, tuple):
-            raise TypeError("Expected indmap to be a tuple")
-
-        if not all([isinstance(s, slice) for s in indmap]):
-            raise NotImplementedError(
-                "Only support for sliced index mapping"
-            )
-        self._indices: List[slice] = indmap
+        @param indmap Union[Tuple[StartEnd], IndexMap]: index range [start, end) for each dimension
+        
+        @return indmap IndexMap: the created new instance of index map.
+        """
+        if isinstance(indmap, IndexMap):
+            indmap = indmap.indices
+        assert all(isinstance(dim, tuple) and len(dim) == 2 for dim in indmap), "expected Tuple[Tuple[int, int]]"
+        self._indices: Tuple[StartEnd] = tuple(indmap)
+        self._shape = tuple(end - start for (start, end) in self._indices)
 
     def __eq__(self, other):
         if isinstance(other, IndexMap):
             if self.ndims != self.ndims:
                 return False
-            for myslicer, oslicer in zip(self.get(), other.get()):
-                mstart, mstop = myslicer.start, myslicer.stop
-                mstep = myslicer.step if myslicer.step is not None else 1
-                ostart, ostop = oslicer.start, oslicer.stop
-                ostep = oslicer.step if oslicer.step is not None else 1
-                if mstart != ostart or mstop != ostop or mstep != ostep:
+            for dim in range(self.ndims):
+                if self.indices[dim] != other.indices[dim]:
                     return False
             return True
         return False
 
-    def get(self):
-        """
-        Get indmap
-        """
+    def __hash__(self) -> int:
+        return hash(tuple([self.ndims]+list(self._indices)))
+
+    @property
+    def indices(self) -> Tuple[StartEnd]:
         return self._indices
 
     @property
@@ -68,73 +68,39 @@ class IndexMap:
         return len(self._indices)
 
     @property
-    def neles(self) -> int:
-        """
-        Number of elements of the index map
-        """
-        nelements = 1
-        for slicer in self._indices:
-            count = slicer.stop - slicer.start
-            if slicer.step:
-                count = int(count // slicer.step)
-            nelements *= count
-        return nelements
-
-    @property
     def shape(self) -> List[int]:
         """
         Get the shape of the slice
         """
-        shape = list()
-        for slicer in self._indices:
-            count = slicer.stop - slicer.start
-            if slicer.step:
-                count = int(count // slicer.step)
-            shape.append(count)
-        return shape
+        return self._shape
 
-    def map(self, submap):
-        """
+    def map(self, submap: Tuple[StartEnd]):
+        """!
         Map from the current indmap by sub_indices.
 
-        Args:
-            sub_indices: IndexMap
+        @param submap Union[Tuple[StartEnd], IndexMap]: IndexMap of this IndexMap
 
-        Returns:
-            sub_indices: IndexMap
-
+        @return indmap IndexMap: the mapped IndexMap
         """
-        if not isinstance(submap, IndexMap):
-            raise TypeError("Expected IndexMap")
-        if self.ndims != submap.ndims:
-            raise ValueError("Expected same length of sub_indices")
-
-        # e.g., (slice(0, M), slice(0, int(K // 2))
+        submap: IndexMap = IndexMap(submap)
+        assert self.ndims == submap.ndims, "Expected same dimensions of submap"
         sub = list()
-        for dim_indices, dim_sub_indices in zip(self.get(), submap.get()):
-            start, stop = dim_indices.start, dim_indices.stop
-            step = dim_indices.step if dim_indices.step else 1
-
-            sub_start, sub_stop = dim_sub_indices.start, dim_sub_indices.stop
-            sub_step = dim_sub_indices.step if dim_sub_indices.step else 1
-    
-            new_start = start + sub_start
-            new_stop = new_start + sub_stop - sub_start
-            new_step = step * sub_step
-            if new_stop > stop:
-                raise ValueError("Trying to map a index out of range")
-            sub.append(slice(new_start, new_stop, new_step))
+        for dim in range(self.ndims):
+            s1, e1 = self.indices[dim]
+            s2, e2 = submap.indices[dim]
+            start = s1 + s2
+            end = start + e2 - s2
+            assert end <= e1, f"select out of boundary at dim {dim}: ({self})[{submap}]"
+            sub.append((start, end))
         return IndexMap(tuple(sub))
 
-    def overlap(self, other):
+    def overlap(self, other) -> bool:
         """
         Check if this indmap overlapped with the other
 
-        Args:
-            other: IndexMap
+        @param other IndexMap
 
-        Returns:
-            Boolean: True has overlap, otherwise False
+        @return overlap bool: True has overlap, otherwise False
         """
         if not isinstance(other, IndexMap):
             raise TypeError("Expected IndexMap")
@@ -142,112 +108,34 @@ class IndexMap:
         if other.ndims != self.ndims:
             raise TypeError("Expected same dimension")
 
-        for slicer1, slicer2 in zip(self.get(), other.get()):
-            start1, stop1 = slicer1.start, slicer1.stop
-            step1 = slicer1.step if slicer1.step else 1
-        
-            start2, stop2 = slicer2.start, slicer2.stop
-            step2 = slicer2.step if slicer2.step else 1
-        
-            if step1 == step2:
-                if min(stop1, stop2) <= max(start1, start2):
-                    return False
-                elif start1 % step1 != start2 % step2:
-                    return False
-            else:
-                raise NotImplementedError(f"not supported for differnt steps")
+        for dim in range(self.ndims):
+            start1, end1 = self.indices[dim]
+            start2, end2 = other.indices[dim]
+            if min(end1, end2) <= max(start1, start2):
+                return False
         return True
 
     def __and__(self, other):
-        """
+        """!
         Get the common part
 
-        Args:
-            other: IndexMap
+        @param other IndexMap: the other one
         
-        Returns:
-            IndexMap for the common part
+        @return indexmap IndexMap: index map for the common part
         """
         if not self.overlap(other):
             return None
-        slices = list()
-        for slicer1, slicer2 in zip(self.get(), other.get()):
-            start1, stop1 = slicer1.start, slicer1.stop
-            step1 = slicer1.step if slicer1.step else 1
-        
-            start2, stop2 = slicer2.start, slicer2.stop
-            step2 = slicer2.step if slicer2.step else 1
-
-            if step1 == step2:
-                start = max(start1, start2)
-                stop = min(stop1, stop2)
-                slices.append(slice(start, stop, step1))
-            else:
-                raise NotImplementedError(f"not supported for differnt steps")
-        return IndexMap(tuple(slices))
-
-    def __sub__(self, other) -> Optional[List]:
-        """
-        Get the remaining part.
-        We reuqire other should completely inside this tensor
-        and the remaining part should be only one tile, else
-        will return None
-
-        Args:
-            other: IndexMap
-
-        Returns:
-            IndexMap for the remaining part
-        """
-        if not isinstance(other, IndexMap):
-            raise TypeError("Expected IndexMap")
-        if self.ndims != other.ndims:
-            return None
-        dim_common: List[List[slice]] = [list() for _ in range(self.ndims)]
-        dim_differ: List[List[slice]] = [list() for _ in range(self.ndims)]
-        for dim, (slicer1, slicer2) in enumerate(zip(self.get(), other.get())):
-            # self indices
-            start1, stop1 = slicer1.start, slicer1.stop
-            step1 = slicer1.step if slicer1.step else 1
-            # other indices
-            start2, stop2 = slicer2.start, slicer2.stop
-            step2 = slicer2.step if slicer2.step else 1
-            if step1 != 1 or step2 != 1:
-                return None
-            # no intersection
-            if min(stop1, stop2) <= max(start1, start2):
-                return None
-            # set common
-            start = max(start1, start2)
-            stop = min(stop1, stop2)
-            dim_common[dim].append(slice(start, stop, step1))
-            # set difference
-            if start1 == start2:
-                if stop2 < stop1:
-                    dim_differ[dim].append(slice(stop2, stop1, step1))
-            elif stop1 == stop2:
-                if start1 < start2:
-                    dim_differ.append(slice(start1, start2, step1))
-            else:
-                raise NotImplementedError("Multipe indexmap is not supported")
-        indmaps = list()
-        splitdim = set()
-        slices = list()
+        tile = []
         for dim in range(self.ndims):
-            common = dim_common[dim]
-            differ = dim_differ[dim]
-            if len(common) + len(differ) != 1:
-                raise NotImplementedError("Multipe indexmap is not supported")
-            if len(differ) == 1:
-                splitdim.add(dim)
-                slices.append(differ[0])
-            else:
-                slices.append(common[0])
-        indmaps.append(IndexMap(tuple(slices)))
-        return indmaps
+            start1, end1 = self.indices[dim]
+            start2, end2 = other.indices[dim]
+            start = max(start1, start2)
+            end = min(end1, end2)
+            tile.append((start, end))
+        return IndexMap(tuple(tile))
 
-    def __repr__(self):
-        dscp = repr(self._indices)
+    def __repr__(self) -> str:
+        dscp = ','.join(f'{start}:{end}' for (start, end) in self.indices)
         return dscp
 
 
@@ -255,106 +143,102 @@ class ValueMap:
     r"""
     Represent the value split.
 
-    Value is represented as a summation of several variables
+    replica: the replicated group:
+        different replicated operator (no gradient accumulation) stands for different group
 
-        value = \sigma_{i=1}^{chunk_num} a_i
-
-    two tensors consider as same value mapping:
-        they have same chunk num and share the same a_i (idx)
-
-    Note we regard these mapping as same:
-        1.0 = 0.9 (a1) + 0.1 (a2)
-        1.0 = 0.4 (a1) + 0.6 (a2)
-
-    The mapping doesn't consider what a1 really contains, but only
-    consider the variable (a) itself and number of variable.
+    weight: the partitioned but tensor replicated group:
+        different replicated tensor (gradient accumulation) stands for different group
     """
 
-    def __init__(self, idx: int, chunk_num: int):
-        if idx >= chunk_num or idx < 0:
-            raise ValueError(f"Expected idx {idx} in [0, {chunk_num})")
-        self._idx = idx
-        self._chunk_num = chunk_num
+    def __init__(self, weight: IdxChunk):
+        """
+        Create a value map.
+        @param weight Union[IdxChunk, ValueMap]: the (idx, nchunks)
+
+        @return valmap ValueMap: a new instance.
+        """
+        if isinstance(weight, ValueMap):
+            weight = weight.weight
+        assert len(weight) == 2 and all(isinstance(i, int) for i in weight), \
+            "expected weight to be (idx, nchunks)"
+        self._weight = weight
 
     @property
-    def idx(self):
-        return self._idx
-
-    @property
-    def chunk_num(self):
-        return self._chunk_num
-
-    def map(self, sub_map):
-        if not isinstance(sub_map, ValueMap):
-            raise TypeError("Expected sub_map to be ValueMap")
-        idx = self.idx * sub_map.chunk_num + sub_map.idx
-        chunk_num = self.chunk_num * sub_map.chunk_num
-        return ValueMap(idx, chunk_num)
-
-    def overlap(self, other):
+    def weight(self) -> IdxChunk:
+        """!
+        Get value partitioned chunks in tha accumulcated group
+        """
+        return self._weight
+    
+    def overlap(self, other) -> bool:
+        """!
+        Check on value overlapping.
+        Note the overlap can only be within a same accumulation group and 
+        a same replication group.
+        """
         if not isinstance(other, ValueMap):
             raise TypeError("Expected ValueMap")
-        if self.chunk_num == other.chunk_num:
-            return self.idx == other.idx
-        else:
-            if self.chunk_num == 1 or other.chunk_num == 1:
-                return True
-            else:
-                chk1, chk2 = self.chunk_num, other.chunk_num
-                time1 = int(chk2 / math.gcd(chk1, chk2))
-                time2 = int(chk1 / math.gcd(chk1, chk2))
-                span1 = (self.idx * time1, self.idx * time1 + time1)
-                span2 = (other.idx * time2, other.idx * time2 + time2)
-                if max(span1[0], span2[0]) < min(span1[1], span2[1]):
-                    return True
-                else:
-                    return False
-
-    def __eq__(self, other):
-        if isinstance(other, ValueMap):
-            if other.idx == self.idx and other.chunk_num == self.chunk_num:
-                return True
+        idx1, nchunk1 = self.weight
+        idx2, nchunk2 = self.weight
+        span1 = (idx1 * nchunk2, idx1 * nchunk2 + nchunk2)
+        span2 = (idx2 * nchunk1, idx2 * nchunk1 + nchunk1)
+        if max(span1[0], span2[0]) < min(span1[1], span2[1]):
+            return True
         return False
+
+    def __eq__(self, other) -> bool:
+        """!
+        Check whether tensor is same to other tensor.
+        Note we treat tensors in different replica region as different
+        tensors, also they may have same data in reality.
+        """
+        if isinstance(other, ValueMap):
+            return other.weight == self.weight
+        return False
+
+    def __hash__(self) -> int:
+        return hash(self._weight)
+
+    def map(self, submap: IdxChunk):
+        """!
+        Select the value chunk at position (idx, chunk) given the current view
+        No change will make for the replica group.
+
+        @param idnmap Union[ValueMap, IdxChunk]: the (index, chunk) for current view
+
+        @return valmap ValueMap: the selected one
+        """
+        if isinstance(submap, ValueMap):
+            submap: IdxChunk = submap.weight
+        idx, chunk = self.weight
+        sub_idx, sub_chunk = submap
+        idx = idx * sub_chunk + sub_idx
+        chunk = sub_chunk * chunk
+        return ValueMap((idx, chunk))
 
     def __and__(self, other):
         """
         Find the common part
+
+        @param other ValueMap
+
+        @return Optional[None]
         """
         if not isinstance(other, ValueMap):
             raise TypeError("Expected ValueMap for & operator")
         if not self.overlap(other):
             return None
-        if self.chunk_num == other.chunk_num:
-            return ValueMap(self.idx, self.chunk_num)
-        if self.chunk_num == 1:
-            return ValueMap(other.idx, other.chunk_num)
+        if self.weight[1] == other.weight[1]:
+            return ValueMap(self.weight)
+        if self.weight[1] == 1:
+            return ValueMap(other.weight)
+        elif other.weight[1] == 1:
+            return ValueMap(self.weight)
         else:
-            return ValueMap(self.idx, self.chunk_num)
+            raise ValueError(f"Not supported common value map: {self}, {other}")
 
     def __repr__(self):
-        return f'({self.idx}/{self.chunk_num})'
-
-
-def _to_indmap(indmap: Union[Tuple, IndexMap]) -> IndexMap:
-    if not isinstance(indmap, tuple) and not isinstance(indmap, IndexMap):
-        raise TypeError("Expected indmap to be tuple or IndexMap")
-    if isinstance(indmap, tuple):
-        indmap = IndexMap(indmap)
-    return indmap
-
-
-def _to_value_map(valmap: Union[Tuple, ValueMap, None]) -> ValueMap:
-    if not isinstance(valmap, tuple) and \
-       not isinstance(valmap, ValueMap) and \
-       not valmap is None:
-        raise TypeError("Expected valmap to be tuple, IndexMap or None")
-    if valmap is None:
-        valmap = ValueMap(0, 1)
-    elif isinstance(valmap, tuple):
-        if len(valmap) != 2:
-            raise ValueError("Expected tuple to be (idx, chunk_num)")
-        valmap = ValueMap(*valmap)
-    return valmap
+        return f'({self.weight[0]}/{self.weight[1]})'
 
 
 class IRFullTensor(IRTensor):
@@ -379,9 +263,12 @@ class IRFullTensor(IRTensor):
         self._ctensors : List[IRSubTensor] = list()
 
         # record all created sub_tensors
-        self._segments : List[IRSubTensor] = list()
+        self._segments : Dict[(ValueMap, IndexMap), int] = dict()
 
         self.requires_grad = requires_grad
+
+    def __hash__(self) -> int:
+        return self._id
 
     def __copy__(self):
         """
@@ -391,6 +278,15 @@ class IRFullTensor(IRTensor):
             tensor
         """
         return self
+
+    def like(self):
+        """!
+        Create a IRFullTensor with same meta data but a different id.
+
+        @return tensor IRFullTensor: the created tensor
+        """
+        tensor = IRFullTensor(self.shape, self.name, self.requires_grad, self.dtype)
+        return tensor
 
     @property
     def producers(self) -> List[IRCell]:
@@ -467,12 +363,6 @@ class IRFullTensor(IRTensor):
         self._consumers = []
         self._ctensors = []
 
-    def subtensors(self):
-        """
-        Get created sub-tensors of this tensor.
-        """
-        return copy.copy(self._segments)
-
     @property
     def grad(self) -> Optional[Union[IRTensor, float]]:
         return self._grad
@@ -518,82 +408,41 @@ class IRFullTensor(IRTensor):
         self._is_grad = True
         return self
 
-    def select(self, indmap: Union[Tuple, IndexMap], valmap: Union[Tuple, ValueMap, None], shape: List[int]):
-        """
+    def select(self, indmap: IndexMap, valmap: ValueMap):
+        """!
         Select a SubTensor from FullTensor.
 
-        Note due to implementation issue, one value in the full tensor
-        cannot be splitted by different valmap
+        @param indmap IndexMap: the index range of this tensor
+        @param valmap ValueMap: the value range of this tensor
 
-        Args:
-            indmap: the index of this tensor's index
-
-            valmap: how the tensor mapped from original value
-
-            shape: the sub_tensor shape.
-
-        Returns:
-            IRSubTensor
+        @return subtensor IRSubTensor: the selected SubTensor
         """
-        indmap = _to_indmap(indmap)
-        valmap = _to_value_map(valmap)
-
+        indmap, valmap = IndexMap(indmap), ValueMap(valmap)
+        keys = (indmap, valmap)
+        # print(f'key: {keys}, hash {hash(keys)}')
         # return tensor to keep id same for same sub tensor
-        for sub_tensor in self.subtensors():
-            if sub_tensor.indmap == indmap and sub_tensor.valmap == valmap:
-                sub_tensor = copy.copy(sub_tensor)
-                return sub_tensor
-
-        sub_tensor = IRSubTensor(self, indmap, valmap, shape)
-        for attr in IRFullTensor._attr:
-            setattr(sub_tensor, attr, getattr(self, attr))
-        self._segments.append(sub_tensor)
-        sub_tensor._dirty_grad = True
+        if keys in self._segments:
+            tid = self._segments[keys]
+            sub_tensor = IRSubTensor(self, indmap, valmap, tid=tid)
+        else:
+            sub_tensor = IRSubTensor(self, indmap, valmap)
+            self._segments[keys] = sub_tensor.tid
         return sub_tensor
 
-    def overlap(self, other):
-        """
-        Check if the two tensor is overlapped.
-
-        Returns:
-            True if they are sharing co-located position in
-            the full tensor, otherwise False
-        """
-        if not isinstance(other, IRTensor):
-            raise TypeError("Expected Tensor")
-        if isinstance(other, IRFullTensor):
-            return self == other
-        elif isinstance(other, IRSubTensor):
-            return other.parent == self
-        else:
-            raise TypeError("Customized IRTensor not support")
-
-    def common(self, other) -> Optional[IRTensor]:
-        """
-        Get the common sub-tensor
-
-        Args:
-            IRTensor
-
-        Returns:
-            None for not overlap,
-            else IRSubTensor or IRFullTensor
-        """
-        return other if self.overlap(other) else None
-
     def tosub(self):
-        """
+        """!
         Convert to SubTensor by selecting all indmap and full value
+
+        @return sub_tensor IRSubTensor: the sub-tensor
         """
         if self.shape is None:
             raise RuntimeError("Expected know shape")
-        slicers = list()
-        for dim_len in self.shape:
-            slicers.append(slice(0, dim_len, 1))
+        indmap = []
+        for dimlen in self.shape:
+            indmap.append((0, dimlen))
         sub_tensor = self.select(
-            indmap=tuple(slicers),
-            valmap=None,
-            shape=self.shape
+            indmap=tuple(indmap),
+            valmap=(0, 1),
         )
         return sub_tensor
 
@@ -604,45 +453,38 @@ class IRFullTensor(IRTensor):
 
 class IRSubTensor(IRTensor):
 
-    def __init__(self, full_tensor: IRTensor,
-                 indmap: List[Union[Tuple, IndexMap]],
-                 valmap: Optional[ValueMap] = None, shape=None):
+    def __init__(self, ftensor: IRFullTensor,
+                 indmap: Union[Tuple[StartEnd], IndexMap],
+                 valmap: Union[Tuple[StartEnd], ValueMap],
+                 **kwargs):
         """
         Create an IRSubTensor.
 
-        Args:
-            full_tensor: the full tensor
-            indmap: index list
-            valmap: the value operation to merge SubTensors into one
+        @param ftensor IRFullTensor: the full tensor
+        @param indmap IndexMap: index map
+        @param valmap ValueMap: value map
         """
-        if not isinstance(full_tensor, IRFullTensor):
-            raise TypeError(f"Expected IRFullTensor but got {full_tensor}")
-        super().__init__(shape=shape, name=full_tensor.name)
-
+        indmap, valmap = IndexMap(indmap), ValueMap(valmap)
+        assert isinstance(ftensor, IRFullTensor), "Expcted ftensor to be IRFullTensor"
+        super().__init__(shape=indmap.shape, name=ftensor.name, **kwargs)
+        for attr in IRFullTensor._meta:
+            setattr(self, attr, getattr(ftensor, attr))
+        self.cell = None
         # the full tensor
-        self._full_tensor = full_tensor
-
+        self._full_tensor = ftensor
         # the index from full_tensor
-        self._indmap = _to_indmap(indmap)
-
+        self._indmap: IndexMap = indmap
         # val map
-        self._valmap = _to_value_map(valmap)
-
+        self._valmap: ValueMap = valmap
         # grad flag
         self._dirty_grad = True
 
-    def __eq__(self, other):
-
-        if isinstance(other, IRFullTensor):
-            return self.parent == other and \
-                   self.shape == other.shape and \
-                   self.valmap == ValueMap(0, 1)
+    def __eq__(self, other) -> bool:
         if isinstance(other, IRSubTensor):
-            return self.parent == other.parent and \
-                   self.indmap == other.indmap and \
-                   self.valmap == other.valmap and \
-                   self.shape == other.shape
-        return False
+            return self._id == other._id
+
+    def __hash__(self) -> int:
+        return self._id
 
     @property
     def parent(self) -> IRFullTensor:
@@ -652,29 +494,129 @@ class IRSubTensor(IRTensor):
         return self._full_tensor
 
     @property
-    def indmap(self) -> IndexMap:
+    def indmap(self) -> Tuple[StartEnd]:
         """
-        Return indmap list mapped to the full tensor
+        Get index range of each dimension of this tensor in its full tensor
+
+        @return indices Tuple[StartEnd]: indices
         """
-        return copy.copy(self._indmap)
+        return self._indmap.indices
 
     @property
-    def valmap(self) -> ValueMap:
-        return copy.copy(self._valmap)
+    def valmap(self) -> IdxChunk:
+        """
+        Get value range of this tensor in tis full tensor
+
+        @return idxchunk IdxChunk: (idx, nchunks)
+        """
+        return self._valmap.weight
 
     @property
     def ndims(self) -> int:
         return len(self.shape)
+
+    def splitdims(self) -> Tuple[int]:
+        """!
+        Get partitioned dimensions
+
+        @return dims int: the partitioned dimension.
+        """
+        return tuple(
+            dim for dim in range(self.ndims) if self.shape[dim] != self.parent.shape[dim]
+        )
+
+    def catdims(self, other: IRTensor) -> Optional[int]:
+        """!
+        Get concatable dimensions with other IRSubTensor
+
+        @parm other IRSubTensor
+        @return dim int: the concatable dimension. None means no such dimension
+        """
+        assert isinstance(other, IRSubTensor), "expected IRSubTensor"
+        if other.parent != self.parent or self.valmap != other.valmap:
+            return None
+        cat_dim: int = None
+        for dim in range(self.ndims):
+            if self.indmap[dim] != other.indmap[dim]:
+                s1, e1 = self.indmap[dim]
+                s2, e2 = self.indmap[dim]
+                if min(e1, e2) == max(s1, s2):
+                    if cat_dim is not None:
+                        return None
+                    else:
+                        cat_dim = dim
+                else:
+                    return None
+        return cat_dim
+    
+    def concat(self, other: IRTensor, dim: int) -> IRTensor:
+        """!
+        concat dimension with other IRSubTensor. The concatenate
+        order will follow the index map order.
+
+        @param other IRSubTensor
+        @param dim int: the concat dimension
+        @return tensor IRSubTensor: the concatenated tensor
+        """
+        assert isinstance(other, IRSubTensor), "expected IRSubTensor"
+        assert self.parent == other.valmap and self.valmap == other.valmap
+        indmap = []
+        for cdim in range(self.ndims):
+            if cdim == dim:
+                (s1, e1), (s2, e2) = self.indmap[cdim], other.indmap[cdim]
+                assert min(e1, e2) == max(s1, s2), f"fail to concat: {cdim} should be concatable"
+                indmap.append((min(s1, s2), max(e1, e2)))
+            else:
+                assert self.indmap[cdim] == other.indmap[cdim], f"fail to concat: {cdim} should be same"
+                indmap.append(self.indmap[cdim])
+        valmap = self.valmap
+        tensor = self.parent.select(tuple(indmap), valmap)
+        return tensor
+
+    def accumable(self, tensors: Union[IRTensor, List[IRTensor]]) -> bool:
+        """!
+        Check whether tensors are accumable with this tensor
+
+        @param: tensors Union[IRTensor, List[IRTensor]]
+        @return accumable bool: True if accumable
+        """
+        tensors: List[IRSubTensor] = [tensors,] if isinstance(tensors, IRSubTensor) else tensors
+        assert all(isinstance(t, IRSubTensor) for t in tensors), "Expected IRSubTensor or List[IRSubTensor]"
+        if any(t.parent != self.parent for t in tensors) or any(t.indmap != self.indmap for t in tensors):
+            return False
+        if any(t.indmap != self.indmap for t in tensors):
+            return False
+        if any(t.valmap[1] != self.valmap[1] for t in tensors):
+            return False
+        return self.valmap[1] % (len(tensors) + 1) == 0
+
+    def accum(self, tensors: Union[IRTensor, List[IRTensor]]) -> IRTensor:
+        """!
+        Accumulate tensor on value dimension.
+        The replica id will be 
+
+        @param: tensors Union[IRTensor, List[IRTensor]]
+        @return tensor IRSubTensor: accumulated tensor
+        """
+        tensors: List[IRSubTensor] = [tensors,] if isinstance(tensors, IRSubTensor) else tensors
+        assert self.accumable(tensors), "Not accumable"
+        nreduce = len(tensors) + 1
+        assert self.valmap[1] % nreduce == 0
+        # TODO: make accum more robust
+        cid = min(t.valmap[0] for t in [self] + tensors) // nreduce
+        valmap = (cid, self.valmap[1] // nreduce)
+        indmap = self.indmap
+        tensor = self.parent.select(indmap, valmap)
+        return tensor
 
     def __copy__(self):
         """
         Copy the tensor that will have the exactly same id
         except the empty attached cell
 
-        Returns:
-            tensor
+        @return tensor IRSubTensor: the same tensor in a new instance
         """
-        tensor = IRSubTensor(self.parent, self.indmap, self.valmap, self._shape)
+        tensor = IRSubTensor(self.parent, self.indmap, self.valmap, tid=self.tid)
         for key in self.__dict__:
             setattr(tensor, key, getattr(self, key))
         # clear attached cells
@@ -704,26 +646,16 @@ class IRSubTensor(IRTensor):
             self._grad = full_grad
         # this tensor is consumed
         elif self in self.cell.inputs():
-            # ref_consumers = list()
-            # for consumer in self.parent.consumers:
-            #     for itensor in consumer.inputs():
-            #         if self.overlap(itensor):
-            #             # TODO: we should guarantee in final status itensor == self
-            #             # replicated nodes will have same node id
-            #             if consumer._id not in ref_consumers:
-            #                 ref_consumers.append(consumer._id)
-            #                 # if one node has multiple same tensors,
-            #                 # will consider them as one
-            #                 break
-            # ref_times = len(ref_consumers)
-            # if ref_times == 0:
-            #     raise RuntimeError("Internal error: consumer doesn't have the operator attached to this tensor")
-            # idx = ref_consumers.index(self.cell._id)
-            assert self.grad_accum is not None, "not supported for gradient accumulation"
+            # for backard, we assume in final distributed graph,
+            # each tensor can be represented as nested <replica, value, dim>
+            consumers = []
+            for ctensor, consumer in zip(self.parent.ctensors, self.parent.consumers):
+                if ctensor == self and consumer.cid not in consumers:
+                    consumers.append(consumer.cid)
+            valmap = (consumers.index(self.cell.cid), len(consumers))
             grad = full_grad.select(
                 indmap = self.indmap,
-                valmap = self.grad_accum, #(idx, ref_times),
-                shape = self.shape
+                valmap = valmap,
             )
             self._grad = grad
             self._dirty_grad = False
@@ -733,47 +665,38 @@ class IRSubTensor(IRTensor):
             grad = full_grad.select(
                 indmap = self.indmap,
                 valmap = (0, 1),
-                shape = self.shape
             )
             self._grad = grad
         else:
-            raise RuntimeError("Visit graidient of a tensor that is potentially generated by IRAdapter")
+            raise RuntimeError("Visit gradient of a tensor that is potentially generated by IRAdapter")
         self._dirty_grad = False
         self._requires_grad = False if full_grad is None else True
         return self._grad
 
     @property
     def requires_grad(self) -> bool:
-        _ = self.grad
-        return self._requires_grad
+        return self.parent._requires_grad
 
     # partition primitives
 
-    def select(self, indmap: Union[Tuple, IndexMap], valmap: Union[Tuple, ValueMap, None], shape=None) -> IRTensor:
+    def select(self,
+               indmap: Union[Tuple[StartEnd], IndexMap],
+               valmap: Union[IdxChunk, ValueMap]) -> IRTensor:
         """
         Select an IRSubTensor
 
-        Args:
-            indmap: the index of this tensor's index
+        @param indmap IndexMap: the index map of this tensor's index
 
-            valmap: the value operation to merge 
-                    co-located indmap of SubTensors into one
+        @param valmap ValueMap: the value map of this tensor's value
 
-            shape: the sub_tensor shape
-
-        Returns:
-            IRSubTensor
+        @return subtensor IRSubTensor: the selected tensor
         """
-        sub_ind_map = _to_indmap(indmap)
-        sub_valmap = _to_value_map(valmap)
-
+        indmap, valmap = IndexMap(indmap), ValueMap(valmap)
         # index mapping
-        index_map = self.indmap.map(sub_ind_map)
+        indmap = self._indmap.map(indmap)
         # value mapping
-        valmap = self.valmap.map(sub_valmap)
-
-        sub_tensor = self.parent.select(index_map, valmap, shape)
-        sub_tensor.grad_accum = None
+        valmap = self._valmap.map(valmap)
+        sub_tensor = self.parent.select(indmap, valmap)
         return sub_tensor
 
     def replicate(self, num: int) -> List[IRTensor]:
@@ -783,11 +706,12 @@ class IRSubTensor(IRTensor):
 
         @return tensor IRTensor: the copied tensor
         """
-        aidx, chunks = self.grad_accum
         tensors = []
-        for idx in range(num):
-            tensor = copy.copy(self)
-            tensor.grad_accum = (aidx * num + idx, chunks * num)
+        for _ in range(num):
+            tensor = self.parent.select(
+                indmap=self.indmap,
+                valmap=self.valmap,
+            )
             tensors.append(tensor)
         return tensors
 
@@ -806,24 +730,19 @@ class IRSubTensor(IRTensor):
         assert self.shape[dim] % num == 0, f"Expected dimension can be split: {self.shape[dim]} % {num} != 0"
         chunk_size = self.shape[dim] // num
 
-        shape_slicer = list()
-        chunk_shape = list()
+        indmap = []
         for tdim, nele in enumerate(self.shape):
             if tdim != dim:
-                shape_slicer.append(slice(0, nele, 1))
-                chunk_shape.append(nele)
+                indmap.append((0, nele))
             else:
-                shape_slicer.append(None)
-                chunk_shape.append(chunk_size)
+                indmap.append(None)
         sub_tensors = list()
         for cid in range(num):
-            shape_slicer[dim] = slice(chunk_size * cid, chunk_size * (cid + 1), 1)
+            indmap[dim] = (chunk_size * cid, chunk_size * (cid + 1))
             sub_tensor = self.select(
-                indmap = tuple(shape_slicer),
-                valmap = None,
-                shape = chunk_shape
+                indmap=tuple(indmap),
+                valmap=(0,1),
             )
-            sub_tensor.grad_accum = self.grad_accum
             sub_tensors.append(sub_tensor)
         return sub_tensors
 
@@ -837,90 +756,68 @@ class IRSubTensor(IRTensor):
         @return sub_tensors List[IRSubTensor]: the generated sub-tensors
         """
         # full shape
-        shape_slicer = list()
+        indmap = []
         for nele in self.shape:
-            shape_slicer.append(slice(0, nele, 1))
+            indmap.append((0, nele))
         sub_tensors = list()
         for idx in range(num):
+            valmap = self._valmap.map((idx, num))
             sub_tensor = self.select(
-                indmap = tuple(shape_slicer),
-                valmap = (idx, num),
-                shape = self.shape
+                indmap=tuple(indmap),
+                valmap=valmap,
             )
-            sub_tensor.grad_accum = self.grad_accum
             sub_tensors.append(sub_tensor)
         return sub_tensors
 
     def overlap(self, other) -> bool:
-        """
-        Check if the two tensor is overlapped.
+        """!
+        Check whether the two subtensors are overlapped.
 
-        Returns:
-            True if they are sharing co-located position in
-            the full tensor, otherwise False
+        @param other IRSubTensor
+
+        @return overlapped bool: True if they are overlapped else False
         """
-        if not isinstance(other, IRTensor):
-            return False
-        if isinstance(other, IRFullTensor):
-            return self.parent == other
-        elif isinstance(other, IRSubTensor):
+        if isinstance(other, IRSubTensor):
             if self.parent != other.parent:
                 return False
-            return self.indmap.overlap(other.indmap) and \
-                   self.valmap.overlap(other.valmap)
-        else:
-            raise TypeError("Customized IRTensor not support")
+            return self._indmap.overlap(other._indmap) and \
+                   self._valmap.overlap(other._valmap)
+        return False
 
-    def common(self, other):
-        """
+    def common(self, other) -> Optional[IRTensor]:
+        """!
         Get the common sub-tensor
 
-        Args:
-            IRTensor
+        @param other IRSubTensor
 
-        Returns:
-            None for not overlap,
-            else IRSubTensor or IRFullTensor
+        @return subtensor Optional[IRSubTensor]: the common sub-tensor.
+            If not common region, return None
         """
         if self.overlap(other):
-            if isinstance(other, IRFullTensor):
-                return self
-            elif isinstance(other, IRSubTensor):
-                indmap = self.indmap & other.indmap
-                valmap = self.valmap & other.valmap
-                sub_tensor = self.parent.select(
-                    indmap = indmap,
-                    valmap = valmap,
-                    shape = indmap.shape
-                )
-                return sub_tensor
-            else:
-                raise NotImplementedError("Customized IRTensor not support")
+            indmap = self._indmap & other._indmap
+            valmap = self._valmap & other._valmap
+            sub_tensor = self.parent.select(
+                indmap = indmap,
+                valmap = valmap,
+            )
+            return sub_tensor
         return None
 
-    def difference(self, other):
-        """
-        Get differene part of sub-tensor
-
-        Currently this requires tensor to be subset
-
-        Args:
-            other: IRSubTensor
-
-        Returns:
-            None for fail
-        """
-        pass
-
-    def __repr__(self):
+    def __repr__(self) -> str:
         anno = 't'
         if self.is_param():
             anno = 'w'
         if self.is_grad():
             anno = 'g'
-        dscp = f'{anno}{self._id}(p{self.parent._id},{self.shape},{self.valmap})'
+        split_dims = self.splitdims()
+        dscp = f'{anno}{self._id}(p{self.parent._id},{self.shape},d{split_dims},v{self._valmap})'
         return dscp
 
-    def extra_repr(self):
-        dscp = f'Tensor(id={self._id}, shape={self.shape}, device={self.device}, ind={self.indmap}, val={self.valmap})'
+    def extra_repr(self) -> str:
+        anno = 't'
+        if self.is_param():
+            anno = 'w'
+        if self.is_grad():
+            anno = 'g'
+        dscp = f'{anno}{self._id}(id={self._id}, shape={self.shape}, dev={self.device}, ind=[{self._indmap}], val={self._valmap})'
         return dscp

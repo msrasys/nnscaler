@@ -289,16 +289,16 @@ class GridLayout:
                         yield (i,) + indices
         # generate tensor for each index
         for indices in iter_idx([v,]+dims):
-            valmap = ValueMap(indices[0], v)
+            valmap = ValueMap((indices[0], v))
             indmap = []
             shape = []
             for dim, (nchunk, index) in enumerate(zip(dims, indices[1:])):
                 assert ftensor.shape[dim] % nchunk == 0, f"not dividable for {nchunk} chunks over dim {dim}"
                 csize = ftensor.shape[dim] // nchunk
                 start = csize * index
-                indmap.append(slice(start, start+csize, 1))
+                indmap.append((start, start+csize))
                 shape.append(csize)
-            subtensor = ftensor.select(tuple(indmap), valmap, shape)
+            subtensor = ftensor.select(tuple(indmap), valmap)
             # replicate
             subtensors = [copy.copy(subtensor) for _ in range(r)]
             all_subtensors += subtensors
@@ -331,15 +331,14 @@ class GridLayout:
             _tindex[tid] = [len(replicas[subtensor._id])]
             replicas[subtensor._id].append(subtensor)
             # setup value
-            _tindex[tid].append(subtensor.valmap.idx)
-            vchunks.add(subtensor.valmap.chunk_num)
+            _tindex[tid].append(subtensor.valmap[0])
+            vchunks.add(subtensor.valmap[1])
             # setup dimensions
             for dim in range(ndims):
                 snele = subtensor.shape[dim]
-                start = subtensor.indmap.get()[dim].start
+                start = subtensor.indmap[dim][0]
                 fnele = ftensor.shape[dim]
                 if fnele % snele != 0 or start % snele != 0:
-                    print(subtensor, dim)
                     raise RuntimeError(
                         f"dimension split error:\n"
                         f"Full Tensor: {ftensor}\n"
@@ -353,7 +352,7 @@ class GridLayout:
             raise RuntimeError(f"different replicas: {nreplicas}")
         _replica = list(nreplicas)[0]
         # value (V)
-        nchunks = set(t.valmap.chunk_num for t in subtensors)
+        nchunks = set(t.valmap[1] for t in subtensors)
         if len(nchunks) != 1:
             raise RuntimeError(f"different value split: {nchunks}")
         _value = list(nchunks)[0]

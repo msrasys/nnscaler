@@ -20,7 +20,7 @@ class IRAdapter(IRCell):
         self._inputs = inputs
         self._outputs = outputs
 
-        self._prims: Optional[List[IRAdapterPrim]] = None
+        self._prims: List[IRAdapterPrim] = []
         self._differentiable = False
 
         device = set()
@@ -36,20 +36,6 @@ class IRAdapter(IRCell):
         is_bw = any(t.is_grad() for t in self.inputs() + self.outputs())
         assert not (is_fw and is_bw), "An IRAdapter cannot serve for both forward and backward stage"
         self._forward = is_fw
-
-    @property
-    def prims(self) -> List[IRAdapterPrim]:
-        if self.is_forward:
-            if self.differentiable():
-                return self.diffcolls
-            else:
-                return self.forward
-        else:
-            if self.differentiable():
-                # not able to see
-                return []
-            else:
-                return self.backward
 
     @property
     def prims(self) -> List[IRAdapterPrim]:

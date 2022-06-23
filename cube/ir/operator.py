@@ -151,18 +151,12 @@ class IRFwOperation(IRCell):
         bnode = IRBpOperation(self)
         return bnode
 
-    def __repr__(self):
-        sign = self.signature.split('.')[-1]
-        dscp = f'FwOp{self._id}-{self.device}(sign={sign}, inputs={self.inputs()}, outputs={self.outputs()})'
-        return dscp
-
-    def module_repr(self) -> str:
-        """
-        Weight-hidden string representation
-        """
+    def __repr__(self) -> str:
         sign = self.signature.split('.')[-1]
         ins = [t for t in self.inputs() if isinstance(t, IRSubTensor) and not t.is_param()]
-        dscp = f'FwOp{self._id}-{self.device}(sign={sign}, inputs={ins}, outputs={self.outputs()})'
+        dscp = (f"FwOp{self._id}-{self.device}(sign={sign}, "
+                f"inputs={ins}, "
+                f"outputs={self.outputs()})")
         return dscp
 
 
@@ -231,7 +225,9 @@ class IRBpOperation(IRCell):
         return cpy
 
     def __repr__(self) -> str:
-        dscp = f'BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, inputs={self.inputs()}, outputs={self.outputs()})'
+        dscp = (f"BwOp{self._id}-{self.device}(FwOp{self.mirror._id}, "
+                f"inputs={self.inputs()}, "
+                f"outputs={self.outputs()})")
         return dscp
 
 
@@ -295,7 +291,7 @@ class IRDataOperation(IRCell):
             return template(self)
     
     def __repr__(self):
-        dscp = f'DataLoader{self._id}-{self.device}(outputs={self.outputs()})'
+        dscp = (f"DataLoader{self._id}-{self.device}(outputs={self.outputs()})")
         return dscp
 
     def module_repr(self) -> str:

@@ -9,6 +9,7 @@ IRGraph:
 
 from typing import Any, Union, Tuple, List, Optional, Dict
 import copy
+from cube.graph.function.function import MultiRef
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.ir.unique import IDGenerator
@@ -425,10 +426,67 @@ class IRGraph(IRCell):
                             outputs.append(output)
         return outputs
 
+    @staticmethod
+    def from_logic_graph(nodes: List[IRCell],
+                         inputs: List[IRFullTensor], outputs: List[IRFullTensor],
+                         module_name: str):
+        # handle multi-consumed tensor
+        consumers: Dict[IRFullTensor, List[IRCell]] = dict()
+        producers: Dict[IRFullTensor, IRCell] = dict()
+        for node in nodes:
+            ftensors = set()
+            for ftensor in node.inputs():
+                # remove redundant tensors within an operator
+                if isinstance(ftensor, IRFullTensor) and ftensor._id not in ftensors:
+                    ftensors.add(ftensor._id)
+                    if ftensor not in consumers:
+                        consumers[ftensor] = []
+                    consumers[ftensor].append(node)
+            for ftensor in node.outputs():
+                if isinstance(ftensor, IRFullTensor):
+                    producers[ftensor] = node
+        for ftensor, cnodes in consumers.items():
+            if len(cnodes) == 1: continue
+            itensors = [ftensor.like() for _ in range(len(cnodes))]
+            for itensor, consumer in zip(itensors, cnodes):
+                while ftensor in consumer.inputs():
+                    idx = consumer.inputs().index(ftensor)
+                    consumer.set_input(idx, itensor)
+            # create and insert multiref operation
+            multiref = MultiRef(None, [ftensor, len(cnodes)])
+            for idx, itensor in enumerate(itensors):
+                multiref.set_output(idx, itensor)
+            multiref.infer_shape()
+            idx = nodes.index(producers[ftensor]) + 1 if ftensor in producers else 0
+            nodes.insert(idx, multiref)
+        
+        # instantiate graph inputs / outputs
+        for idx, tensor in enumerate(inputs):
+            if isinstance(tensor, IRFullTensor):
+                tensor = tensor.tosub()
+            inputs[idx] = tensor
+        for idx, tensor in enumerate(outputs):
+            if isinstance(tensor, IRFullTensor):
+                tensor = tensor.tosub()
+            outputs[idx] = tensor
+
+        # instantiate to subtensor
+        for node in nodes:
+            for idx, ftensor in enumerate(node.inputs()):
+                ftensors = set()
+                if isinstance(ftensor, IRFullTensor):
+                    subtensor = ftensor.tosub()
+                    node.set_input(idx, subtensor)
+            for idx, ftensor in enumerate(node.outputs()):
+                if isinstance(ftensor, IRFullTensor):
+                    subtensor = ftensor.tosub()
+                    node.set_output(idx, subtensor)
+        graph = IRGraph(nodes, inputs, outputs, module_name)
+        return graph
+
     ##### Partition Primitives #####
 
-    def replicate(self, node: Union[IRFwOperation, IRDataOperation],
-                  times=1, reset_dependency=True) -> Optional[List[IRCell]]:
+    def replicate(self, node: Union[IRFwOperation, IRDataOperation], times=1) -> List[IRCell]:
         """
         Partition Primitive:
             - replicate: replicate a forward or data operation multiple times.
@@ -446,23 +504,22 @@ class IRGraph(IRCell):
 
         if node not in self.nodes():
             raise RuntimeError(f"Op {node} not exsits")
-    
-        fnodes = [node.replicate() for _ in range(times - 1)]
+
+        fidx = self.detach(node)
+        fnodes = [node.replicate() for _ in range(times)]
         # insert forward
-        fidx = self.nodes().index(node)
         for idx, fnode in enumerate(fnodes):
-            self.attach(fnode, fidx + idx + 1) 
+            self.attach(fnode, fidx + idx) 
         # insert backward
         if isinstance(node.mirror, IRBpOperation):
+            bidx = self.detach(node.mirror)
             for fnode in fnodes:
                 fnode.gen_backward()
             bnodes = [fnode.mirror for fnode in fnodes][::-1]
-            bidx = self.nodes().index(node.mirror)
             for idx, bnode in enumerate(bnodes):
                 self.attach(bnode, bidx + idx)
-        if reset_dependency:
-            self.reset_dependency()
-        return [node] + fnodes
+        #TODO: dependency set
+        return fnodes
 
     def partition(self, node: Union[IRFwOperation, IRDataOperation],
                   algo: GenericDistAlgo, **config) -> Optional[List[IRCell]]:
@@ -582,12 +639,10 @@ class IRGraph(IRCell):
                     updated.add(fnode._id)
         return True
 
-    def identity(self, input_tensor, dst_op):
-        raise NotImplementedError
-
     ## Spatial Primitives ##
 
-    def assign(self, op: IRCell, ranks: Union[int, List[int]]):
+    def assign(self, node: Union[IRFwOperation, IRBpOperation],
+               ranks: Union[int, Tuple[int]]):
         """
         Assign an operator (subgraph) to (multiple) rank(s).
 
@@ -597,25 +652,20 @@ class IRGraph(IRCell):
         Corresponding backward operators (if have) will also be replicated
         and assigned to the same device with it's forward operator
 
-        Returns:
-            True if assigned successfully.
-            False if not.
+        @param node Union[IRFwOperation, IRBpOperation]: operator
+        @param ranks Tuple[int, Tuple[int]]: assigned ranks
+
+        @return sucess bool: always true
         """
-        if op not in self._nodes:
-            raise KeyError(f"{op} is not in the graph")
-        if isinstance(ranks, int):
-            ranks = [ranks]
-        if not all([isinstance(rank, int) for rank in ranks]):
-            raise TypeError("Expected rank to be int")
-        if len(ranks) > 1:
-            ops = self.replicate(op, times=len(ranks))
-        else:
-            ops = [op]
-        for op, rank in zip(ops, ranks):
-            op.device = rank
-            # pytorch requirement: forward + backward happened on same device
-            if op.mirror is not None:
-                op.mirror.device = rank
+        assert node in self._nodes, f"{node} is not in the graph"
+        ranks = (ranks,) if isinstance(ranks, int) else ranks
+        assert all([isinstance(rank, int) for rank in ranks]), "Expected rank to be int"
+        nodes = [node] if len(ranks) == 1 else self.replicate(node, times=len(ranks))
+        for node, rank in zip(nodes, ranks):
+            node.device = rank
+            if isinstance(node.mirror, IRBpOperation):
+                bnode = node.mirror
+                bnode.device = rank
         return True
 
     ## Schedule Policy Primitives ##
@@ -767,12 +817,13 @@ class IRGraph(IRCell):
         dscp += f"Inputs: {self.inputs()}\n"
         # nodes
         for node in self._nodes:
-            succ_node_ids = [node._id for node in node.successors()]
+            # succ_node_ids = [node._id for node in node.successors()]
             # succ_node_ids = [None] * len(node.outputs())
             # for out_idx in range(len(node.outputs())):
             #     node_list = [snode._id for snode in node.successors(out_idx)]
             #     succ_node_ids[out_idx] = node_list
-            dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}"
+            # dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}"
+            dscp += f"\n{node}"
         # outputs
         dscp += f"\nOutputs: {self.outputs()}\n{'=' * len(self.name)}\n"
         return dscp

@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import torch
 import torch.nn.functional as TorchF
 
@@ -8,6 +8,14 @@ def identity(tensor: torch.Tensor) -> torch.Tensor:
     identity forward
     """
     return tensor
+
+
+def multiref(tensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]:
+    """
+    identity forward. Create multiple same tensor.
+    """
+    assert times > 1, "multiref can only be used for num of tensor >= 2"
+    return tuple([tensor] * times)
 
 
 def conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
