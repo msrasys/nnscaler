@@ -40,7 +40,6 @@ class VarManager:
             if tensor._id in self.tmap:
                 # fetch the original one
                 reg = self.tmap[tensor._id]
-                return f'{ttype}{reg}'
             else:
                 # allocate a new one
                 if len(self.slots) == 0:
@@ -49,7 +48,8 @@ class VarManager:
                 else:
                     reg = self.slots.pop(-1)
                 self.tmap[tensor._id] = reg
-                return f'{ttype}{reg}'
+            # reg = tensor._id  # => enable this for debug
+            return f'{ttype}{reg}'
         else:
             return str(tensor)
 

@@ -274,6 +274,6 @@ class ExecutionPlan:
         dscp = f'Execution Plan ({self.graph.name}):\n'
         for devid in self.devices():
             dscp += f'====> Device {devid}:\n'
-            for node in self._seq(devid):
+            for node in self._seq[devid]:
                 dscp += f'{node}\n'
         return dscp
