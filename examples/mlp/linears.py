@@ -67,7 +67,8 @@ def train():
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
     CudaTimer(enable=False).warmup()
-    torch.distributed.barrier()
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
     iter_num = 64
     warmup = 20
     for step in range(iter_num):

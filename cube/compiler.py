@@ -228,7 +228,8 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             torch.distributed.barrier()
 
         # reset dataloader
-        torch.distributed.broadcast(batch_size, src=0)
+        if torch.distributed.is_initialized():
+            torch.distributed.broadcast(batch_size, src=0)
         batch_size = batch_size.item()
         print_each_rank(f'reseting dataloader batch size to {batch_size}')
         dataloader.set_batch_size(batch_size)
