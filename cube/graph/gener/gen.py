@@ -129,9 +129,9 @@ class IRAdapterGener:
 
             fadapter = None
             # Case 1: sharing device (in-shard)
-            if set(pdevs) == set(cdevs) and len(pdevs) > 1 and \
-               len(set(pdevs)) == len(ptensors) and len(set(cdevs)) == len(ctensors):
-                fadapter = IRAdapterGener.gen_in_shard(ftensor, allow_reorder=True)
+            # if set(pdevs) == set(cdevs) and len(pdevs) > 1 and \
+            #    len(set(pdevs)) == len(ptensors) and len(set(cdevs)) == len(ctensors):
+            #     fadapter = IRAdapterGener.gen_in_shard(ftensor, allow_reorder=True)
 
             # Case 2: sperating device (cross-shard)
             if len(set(pdevs).intersection(cdevs)) == 0:
@@ -157,28 +157,6 @@ class IRAdapterGener:
                 bidx = min(graph.nodes().index(consumer) for consumer in ftensor.grad.consumers)
                 graph._nodes.insert(bidx, badapter)
         return graph
-
-    @staticmethod
-    def gen_fulltensor(ftensor: IRFullTensor, allow_reorder=False) -> Optional[IRAdapter]:
-        """
-        Generate forward / backward adapter for fulltensor
-        """
-        ptensors, ctensors = ftensor.ptensors, ftensor.ctensors
-        pdevs = tuple(ptensor.device[0] for ptensor in ptensors)
-        cdevs = tuple(ctensor.device[0] for ctensor in ctensors)
-
-        # Case 1: sharing device (in-shard)
-        if set(pdevs) == set(cdevs) and len(pdevs) > 1 and \
-           len(set(pdevs)) == len(ptensors) and len(set(cdevs)) == len(ctensors):
-            return IRAdapterGener.gen_in_shard(ftensor, allow_reorder)
-
-        # Case 2: sperating device (cross-shard)
-        if len(set(pdevs).intersection(cdevs)) == 0:
-            pass
-
-        # Case 3: General cases
-        # warnings.warn('The adapter is generated using inefficient P2P send/recv')
-        return IRAdapterGener.gen_general(ftensor)
 
     @staticmethod
     def gen_in_shard(ftensor: IRFullTensor, allow_reorder=False) -> Optional[IRAdapter]:
@@ -259,11 +237,13 @@ class IRAdapterGener:
         for ctensor in ftensor.ctensors:
             fprims += IRAdapterGener.gen_subtensor(ctensor, ftensor.ptensors)
         fadapter = IRAdapter(ftensor.ptensors, ftensor.ctensors)
+        fadapter.prims = fprims
         if ftensor.grad is not None:
             bprims = []
             for cgrad in ftensor.grad.ctensors:
                 bprims += IRAdapterGener.gen_subtensor(cgrad, ftensor.grad.ptensors)
             badapter = IRAdapter(ftensor.grad.ptensors, ftensor.grad.ctensors)
+            badapter.prims = bprims
             IRAdapter.make_pair(fadapter, badapter)
         return fadapter
 
@@ -331,9 +311,9 @@ class IRAdapterGener:
         while out != ctensor:
             out, merged = None, False
             for idx1 in range(len(remain_tensors) - 1):
-                for idx2 in range(idx1, len(remain_tensors)):
+                for idx2 in range(idx1+1, len(remain_tensors)):
                     t1, t2 = remain_tensors[idx1], remain_tensors[idx2]
-                    catdim = t1.catdims(t2)
+                    catdim = t1.catdim(t2)
                     if catdim is not None:
                         tensors = [t1, t2] if t1.indmap[catdim][0] < t2.indmap[catdim][0] else [t2, t1]
                         out = tensors[0].concat(tensors[1], dim=catdim)
@@ -355,10 +335,15 @@ class IRAdapterGener:
                     break
             if out is None:
                 ptensors = '\n\t'.join(t.extra_repr() for t in ptensors)
+                remain = '\n\t'.join(t.extra_repr() for t in remain_tensors)
+                print(remain_tensors[0].extra_repr())
+                print(remain_tensors[1].extra_repr())
+                print('cadim:', remain_tensors[0].catdim(remain_tensors[1]))
                 raise RuntimeError(
                     f"Fail to build adapter.\n"
                     f"FullTensor:{ctensor.parent}\n"
                     f"Producers:\n\t{ptensors}\n"
-                    f"SubTensor:\n\t{ctensor.extra_repr()}"
+                    f"SubTensor:\n\t{ctensor.extra_repr()}\n"
+                    f"Remain Tensor:\n\t{remain}"
                 )
         return prims

@@ -19,15 +19,15 @@ def identity(tensor: torch.Tensor):
 
 
 def select(tensor: torch.Tensor,
-           indmap: Tuple[slice], valmap: Tuple[int, int]) -> torch.Tensor:
+           indmap: Tuple[slice], valmap: int) -> torch.Tensor:
     """
     Select a part of tensor spatially and numerically.
     """
     require_grad = tensor.requires_grad
     with torch.no_grad():
         sub_tensor = tensor[indmap]
-        if valmap != (0, 1):
-            sub_tensor = sub_tensor / valmap[1]
+        if valmap != 1:
+            sub_tensor = sub_tensor / valmap
         sub_tensor = sub_tensor.detach()
     if require_grad:
         sub_tensor = sub_tensor.requires_grad_()

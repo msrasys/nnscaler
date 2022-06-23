@@ -525,7 +525,7 @@ class IRSubTensor(IRTensor):
             dim for dim in range(self.ndims) if self.shape[dim] != self.parent.shape[dim]
         )
 
-    def catdims(self, other: IRTensor) -> Optional[int]:
+    def catdim(self, other: IRTensor) -> Optional[int]:
         """!
         Get concatable dimensions with other IRSubTensor
 
@@ -539,12 +539,12 @@ class IRSubTensor(IRTensor):
         for dim in range(self.ndims):
             if self.indmap[dim] != other.indmap[dim]:
                 s1, e1 = self.indmap[dim]
-                s2, e2 = self.indmap[dim]
+                s2, e2 = other.indmap[dim]
                 if min(e1, e2) == max(s1, s2):
-                    if cat_dim is not None:
-                        return None
-                    else:
+                    if cat_dim is None:
                         cat_dim = dim
+                    else:
+                        return None
                 else:
                     return None
         return cat_dim
@@ -559,7 +559,7 @@ class IRSubTensor(IRTensor):
         @return tensor IRSubTensor: the concatenated tensor
         """
         assert isinstance(other, IRSubTensor), "expected IRSubTensor"
-        assert self.parent == other.valmap and self.valmap == other.valmap
+        assert self.parent == other.parent and self.valmap == other.valmap
         indmap = []
         for cdim in range(self.ndims):
             if cdim == dim:

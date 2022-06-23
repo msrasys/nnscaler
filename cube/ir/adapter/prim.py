@@ -110,6 +110,9 @@ class SelectPrim(SpatialPrim):
                  itensor: IRSubTensor,
                  indmap: IndexMap, valmap: ValueMap,
                  otensor: IRSubTensor):
+        indmap = IndexMap(indmap).indices
+        indmap = tuple(slice(s, e) for s, e in indmap)
+        valmap = ValueMap(valmap).weight[1]
         super().__init__([itensor], [otensor], indmap=indmap, valmap=valmap)
         self.signature = f"cube.runtime.adapter.select"
 
