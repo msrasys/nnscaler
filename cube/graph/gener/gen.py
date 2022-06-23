@@ -114,15 +114,6 @@ class IRAdapterGener:
                ftensor.consumers[0].device == ftensor.producers[0].device:
                 continue
 
-            # print(f'==> analyzing full tensor: {ftensor}')
-            # print('producer:')
-            # for ptensor in ftensor.ptensors:
-            #     print(ptensor, 'device:', ptensor.device)
-            # print('consumer')
-            # for ctensor in ftensor.ctensors:
-            #     print(ctensor, 'device:', ctensor.device)
-            # print('')
-
             ptensors, ctensors = ftensor.ptensors, ftensor.ctensors
             pdevs = tuple(ptensor.device[0] for ptensor in ptensors)
             cdevs = tuple(ctensor.device[0] for ctensor in ctensors)
@@ -132,7 +123,15 @@ class IRAdapterGener:
             inshard = set(pdevs) == set(cdevs) and len(ptensors) == len(ctensors) and \
                       len(pdevs) == len(ptensors)
             if inshard and len(pdevs) > 1:
-                fadapter = IRAdapterGener.gen_in_shard(ftensor, allow_reorder=True)
+                try:
+                    fadapter = IRAdapterGener.gen_in_shard(ftensor, allow_reorder=True)
+                except Exception as e:
+                    fadapter = None
+                    print(
+                        f"full tensor: {ftensor} cannot use grid generation.\n"
+                        f"Reason: {str(e)}\n"
+                        f"Switch to general P2P communication."
+                    )
 
             # Case 2: sperating device (cross-shard)
             if len(set(pdevs).intersection(cdevs)) == 0:
