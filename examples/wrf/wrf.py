@@ -16,7 +16,7 @@ torch.jit.script(Rearrange('(b0 b1 b2) c h w -> b0 b1 b2 h w c', b0=1, b1=1))
 print("torch einops 1")
 
 import cube
-from examples.poisson.policy.naive import PAS
+from examples.wrf.policy.hw_halo import PAS
 
 
 device = 'cuda' #
