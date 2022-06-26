@@ -14,7 +14,7 @@ def PASReplica(graph: IRGraph, resource):
     return graph
 
 
-def PASMegatron(graph: IRGraph, resource):
+def PASMegatronTP(graph: IRGraph, resource):
     """
     Megatron tensor parallelism (attention)
     """
@@ -32,6 +32,7 @@ def PASMegatron(graph: IRGraph, resource):
             graph.assign(sub_node, idx)
         return sub_nodes
 
+    # ============ Attention ===============
     qkvs = [node for node in fnodes if node.name == 'attn_qkv']
     for idx, qkv in enumerate(qkvs):
         tensor_parallelism(qkv, f'====> start of transformer {idx}', idx=1, dim=0, num=tp_size)
@@ -56,6 +57,20 @@ def PASMegatron(graph: IRGraph, resource):
     for dense in dense_outs:
         tensor_parallelism(dense, idx=0, dim=2, num=tp_size)
 
+    # ============= MLP ===================
+    linear1s = [node for node in fnodes if node.name == 'mlp_linear1']
+    for mlp_linear1 in linear1s:
+        tensor_parallelism(mlp_linear1, idx=1, dim=0, num=tp_size)
+
+    gelus = [node for node in fnodes if node.name == 'gelu']
+    for gelu in gelus:
+        tensor_parallelism(gelu, idx=0, dim=2, num=tp_size)
+
+    linear2s = [node for node in fnodes if node.name == 'mlp_linear2']
+    for mlp_linear2 in linear2s:
+        tensor_parallelism(mlp_linear2, idx=0, dim=2, num=tp_size)
+
+    # replicate others
     for node in graph.nodes():
         if isinstance(node, (IRFwOperation, IRDataOperation)) and len(node.device) == 0:
             rnodes = graph.replicate(node, times=tp_size)

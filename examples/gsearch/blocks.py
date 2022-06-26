@@ -1,6 +1,5 @@
 import torch
 import cube
-import warnings
 
 
 @cube.graph.parser.register('L N E+, (h d) E+, (h d), (h d) E+, (h d), (h d) E+, (h d) -> N h L d, N h L d, N h L d', name='attn_qkv')
@@ -76,6 +75,17 @@ def attn_dense_out(context: torch.Tensor, weight: torch.Tensor, bias: torch.Tens
     return torch.nn.functional.linear(context, weight, bias)
 
 
+@cube.graph.parser.register('L N E+, inner E+, inner -> L N inner', name='mlp_linear1')
+def mlp_linear1(x: torch.Tensor, proj: torch.Tensor, bias: torch.Tensor):
+    return torch.nn.functional.linear(x, proj, bias)
+
+
+@cube.graph.parser.register('L N inner+, E inner+, E -> L N E', name='mlp_linear2')
+def mlp_linear2(x: torch.Tensor, proj: torch.Tensor, bias: torch.Tensor):
+    return torch.nn.functional.linear(x, proj, bias)
+
+
+
 class MultiHeadSelfAttention(torch.nn.Module):
 
     def __init__(self, embed_dim: int, num_heads: int, inner_dim: int, dropout: float = 0.0, bias=True):
@@ -133,9 +143,11 @@ class MLP(torch.nn.Module):
         self.dropout = dropout
 
     def forward(self, x: torch.Tensor):
-        x = torch.nn.functional.linear(x, self.proj1, self.proj1_bias)
+        # L N E, inner E -> L N inner
+        x = mlp_linear1(x, self.proj1, self.proj1_bias)
+        # L N inner -> L N inner
         x = torch.nn.functional.gelu(x)
-        x = torch.nn.functional.linear(x, self.proj2, self.proj2_bias)
+        x = mlp_linear2(x, self.proj2, self.proj2_bias)
         x = torch.nn.functional.dropout(x, self.dropout, True, False)
         return x
 
@@ -153,17 +165,17 @@ class EncoderLayer(torch.nn.Module):
         self.dropout = torch.nn.Dropout(p=dropout)
         self.mlp = MLP(embed_dim, ffn_hidden_dim, activation_dropout)
         self.final_layer_norm = torch.nn.LayerNorm(embed_dim)
-        warnings.warn('residual is disabled in encoder block')
+        # warnings.warn('residual is disabled in encoder block')
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.self_attn_layer_norm(x)
         x = self.self_attn(x)
         x = self.dropout(x)
-        # x = x + residual
+        x = x + residual
 
         residual = x
         x = self.final_layer_norm(x)
         x = self.mlp(x)
-        # x = x + residual
+        x = x + residual
         return x

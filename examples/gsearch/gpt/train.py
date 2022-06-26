@@ -12,7 +12,7 @@ import torch
 
 from examples.gsearch.gpt.model import GPT
 from examples.gsearch.gpt.model import GPTDataLoader
-from examples.gsearch.gpt.policy.spmd import PASMegatron as PAS
+from examples.gsearch.gpt.policy.spmd import PASMegatronTP as PAS
 
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
