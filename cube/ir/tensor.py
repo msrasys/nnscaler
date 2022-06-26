@@ -727,8 +727,9 @@ class IRSubTensor(IRTensor):
         """
         dim = dim + self.ndims if dim < 0 else dim
         assert dim < self.ndims, f"Dim should within ndims but {dim} >= {self.ndims})"
-        assert self.shape[dim] % num == 0, f"Expected dimension can be split: {self.shape[dim]} % {num} != 0"
+        # assert self.shape[dim] % num == 0, f"Expected dimension can be split: {self.shape[dim]} % {num} != 0"
         chunk_size = self.shape[dim] // num
+        addone_num = self.shape[dim] % num
 
         indmap = []
         for tdim, nele in enumerate(self.shape):
@@ -738,7 +739,9 @@ class IRSubTensor(IRTensor):
                 indmap.append(None)
         sub_tensors = list()
         for cid in range(num):
-            indmap[dim] = (chunk_size * cid, chunk_size * (cid + 1))
+            num_prev_addone = addone_num if cid >= addone_num else cid
+            addone = int(cid < addone_num)
+            indmap[dim] = (chunk_size * cid + num_prev_addone, chunk_size * (cid+1) + addone + num_prev_addone)
             sub_tensor = self.select(
                 indmap=tuple(indmap),
                 valmap=(0,1),

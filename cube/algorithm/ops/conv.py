@@ -207,7 +207,7 @@ class HaloSplitConv3D(GenericDistAlgo):
 
     def __init__(self, node: IRConv3D):
         if not isinstance(node, IRConv3D):
-            raise TypeError(f"Expect IRConv2D")
+            raise TypeError(f"Expect IRConv3D")
         super().__init__(node)
 
     def satisfy(self, idx: int, dim: int, num: int):
@@ -225,10 +225,12 @@ class HaloSplitConv3D(GenericDistAlgo):
             raise NotImplementedError("Splitting on dilation != [1,1] is not supported")
         # split H
         if (idx, dim) == (0, 2):
-            return oH % num == 0
+            return oH >= num
+            # return oH % num == 0
         # split W
         if (idx, dim) == (0, 3):
-            return oW % num == 0
+            return oW >= num
+            # return oW % num == 0
 
     def instantiate(self, idx: int, dim: int, num: int):
         if not self.satisfy(idx, dim, num):
@@ -247,48 +249,54 @@ class HaloSplitConv3D(GenericDistAlgo):
             indmap = list()
             pads = list()
             start = 0 - padding[0]
+            addone_num = oH % num
             for cid in range(num):
-                # padding
                 padl = padding[1] if cid == 0 else 0
                 padr = padding[1] if cid == num - 1 else 0
-                pads.append([padding[0], padding[0], padl, padr, padding[2], padding[2]])
+                # padding  -- FIXME: padding here is not correct, only work for pad=[0,..,0]
+                pads.append([padding[0], padl, padr, padding[2], padding[2]])
                 # input  -- FIXME: only work for stride=[1,1]
                 chunkH = oH // num + dilation[0] * (dH - 1)
-                stop = start + chunkH - padr
+                addone = int(cid < addone_num)
+                stop = start + chunkH - padr + addone
+                # stop = start + chunkH - padr
                 indmap.append((max(0, start), min(H, stop)))
                 start = stop - dilation[0] * (dH - 1)
                 # start = 0 if cid == 0 else 1023
                 # stop = 1025 if cid == 0 else H
-            inputs = _split_axis_custom(node.inputs(0), dim=dim, chunks=indmap)
+            inputs = _split_axis_custom(node.inputs(0), dim=dim+1, chunks=indmap)
             # weight
             weights = [node.inputs(1)] * num
             # bias
             bias = [node.inputs(2)] * num
             # outputs
-            outputs = node.outputs(0).split_dim(dim, num)
+            outputs = node.outputs(0).split_dim(dim+1, num)
         # split W
         if (idx, dim) == (0, 3):
             # input and padding
             indmap = list()
             pads = list()
             start = 0 - padding[2]
+            addone_num = oW % num
             for cid in range(num):
                 # padding
                 padt = padding[2] if cid == 0 else 0
                 padb = padding[2] if cid == num - 1 else 0
-                pads.append([padding[0], padding[0], padding[1], padding[1], padt, padb])
+                # padding  -- FIXME: padding here is not correct, only work for pad=[0,..,0]
+                pads.append([padding[0], padding[1], padding[1], padt, padb])
                 # input  -- FIXME: only work for stride=[1,1]
-                chunkH = oW // num + dilation[0] * (dH - 1)
-                stop = start + chunkH - padb
-                indmap.append((max(0, start), min(H, stop)))
-                start = stop - dilation[0] * (dH - 1)
-            inputs = _split_axis_custom(node.inputs(0), dim=dim, chunks=indmap)
+                chunkH = oW // num + dilation[0] * (dW - 1)
+                addone = int(cid < addone_num)
+                stop = start + chunkH - padb + addone
+                indmap.append((max(0, start), min(W, stop)))
+                start = stop - dilation[0] * (dW - 1)
+            inputs = _split_axis_custom(node.inputs(0), dim=dim+1, chunks=indmap)
             # weight
             weights = [node.inputs(1)] * num
             # bias
             bias = [node.inputs(2)] * num
             # outputs
-            outputs = node.outputs(0).split_dim(dim, num)
+            outputs = node.outputs(0).split_dim(dim+1, num)
         sub_nodes = list()
         for i, w, b, pad, o in zip(inputs, weights, bias, pads, outputs):
             conv = IRConv3D(node.signature, [i, w, b], node.name,
