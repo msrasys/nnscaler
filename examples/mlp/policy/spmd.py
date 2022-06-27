@@ -8,7 +8,8 @@ def PASSingle(graph: IRGraph, resource):
     """
     assert resource.ngpus == 1, "only apply for single gpu case"
     for node in graph.nodes():
-        graph.assign(node, 0)
+        if isinstance(node, (IRDataOperation, IRFwOperation)):
+            graph.assign(node, 0)
     return graph
 
 

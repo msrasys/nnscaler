@@ -9,7 +9,8 @@ def PASReplica(graph: IRGraph, resource):
     assert resource.ngpus == 1
     print(graph.extra_repr())
     for node in graph.nodes():
-        graph.assign(node, 0)
+        if isinstance(node, (IRDataOperation, IRFwOperation)):
+            graph.assign(node, 0)
     # print(graph.extra_repr())
     return graph
 

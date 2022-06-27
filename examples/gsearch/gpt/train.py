@@ -4,7 +4,7 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/gsearch/gpt/train.py
+    examples/gsearch/gpt/train.py --policy PASMegatronTP
 """
 
 
@@ -16,8 +16,29 @@ from cube.profiler.memory import memory_summary, model_summary
 
 from examples.gsearch.gpt.model import GPT
 from examples.gsearch.gpt.model import GPTDataLoader
-from examples.gsearch.gpt.policy.spmd import PASMegatronTP as PAS
-# from examples.gsearch.gpt.policy.mpmd import PAS1F1B as PAS
+
+import examples.gsearch.gpt.policy.spmd as spmd
+import examples.gsearch.gpt.policy.mpmd as mpmd
+
+import argparse
+parser = argparse.ArgumentParser(description='comm primitive')
+parser.add_argument('--policy', type=str, help='PAS policy choice, starting with "PAS"')
+args = parser.parse_args()
+
+cube.init()
+
+# set up policy
+PAS = None
+policies = list(spmd.__dict__.keys()) + list(mpmd.__dict__.keys())
+if args.policy in spmd.__dict__:
+    PAS = spmd.__dict__[args.policy]
+    print_each_rank(f'using policy from spmd.{args.policy}')
+elif args.policy in mpmd.__dict__:
+    PAS = mpmd.__dict__[args.policy]
+    print_each_rank(f'using policy from mpmd.{args.policy}')
+else:
+    raise ValueError(f"policy {args.policy} not found. Candidates: {policies}")
+
 
 
 def train():
@@ -69,7 +90,4 @@ def train():
     memory_summary()
 
 
-if __name__ == '__main__':
-
-    cube.init()
-    train()
+train()

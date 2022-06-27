@@ -4,7 +4,7 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/mlp/linears.py
+    examples/mlp/linears.py --policy PASMegatron
 """
 
 import torch
@@ -13,7 +13,30 @@ from torch import nn
 import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
-from examples.mlp.policy.spmd import PASMegatron as PAS
+
+import examples.mlp.policy.spmd as spmd
+import examples.mlp.policy.mpmd as mpmd
+
+import argparse
+
+parser = argparse.ArgumentParser(description='comm primitive')
+parser.add_argument('--policy', type=str, help='PAS policy choice, starting with "PAS"')
+args = parser.parse_args()
+
+cube.init()
+
+# set up policy
+PAS = None
+policies = list(spmd.__dict__.keys()) + list(mpmd.__dict__.keys())
+if args.policy in spmd.__dict__:
+    PAS = spmd.__dict__[args.policy]
+    print_each_rank(f'using policy from spmd.{args.policy}')
+elif args.policy in mpmd.__dict__:
+    PAS = mpmd.__dict__[args.policy]
+    print_each_rank(f'using policy from mpmd.{args.policy}')
+else:
+    raise ValueError(f"policy {args.policy} not found. Candidates: {policies}")
+
 
 # =================== Semantic Model Description ====================
 
@@ -87,7 +110,4 @@ def train():
     CudaTimer().print_all(times=iter_num-warmup)
 
 
-if __name__ == '__main__':
-
-    cube.init()
-    train()
+train()
