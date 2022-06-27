@@ -26,7 +26,6 @@ class DiffFusion(PlanPass):
         for devid in execplan.devices():
             for node in execplan.seq(devid):
                 if isinstance(node, IRAdapter):
-                    print(node, node.cid)
                     if node.forward:
                         ret = DiffFusion.nnfuse(node)
                         cnt = cnt+1 if ret else cnt

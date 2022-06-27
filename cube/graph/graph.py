@@ -657,6 +657,7 @@ class IRGraph(IRCell):
 
         @return sucess bool: always true
         """
+        assert isinstance(node, (IRFwOperation, IRDataOperation)), "Only forward and data operation can be assigned to device."
         assert node in self._nodes, f"{node} is not in the graph"
         ranks = (ranks,) if isinstance(ranks, int) else ranks
         assert all([isinstance(rank, int) for rank in ranks]), "Expected rank to be int"
