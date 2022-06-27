@@ -279,19 +279,20 @@ class IRAdapterGener:
             common.cell = itensor.cell
             intersections.append(common)
             # create select primitive
-            indmap = []
-            for dim in range(itensor.ndims):
-                (s1, e1), (s2, e2) = itensor.indmap[dim], common.indmap[dim]
-                start = s2 - s1
-                end = start + e2 - s2
-                indmap.append((start, end))
-            indmap = IndexMap(tuple(indmap))
-            assert itensor.valmap == common.valmap, "Value map not same"
-            valmap = ValueMap((0, 1))
-            select_prim = SelectPrim(itensor, indmap, valmap, common)
+            if common != itensor:
+                indmap = []
+                for dim in range(itensor.ndims):
+                    (s1, e1), (s2, e2) = itensor.indmap[dim], common.indmap[dim]
+                    start = s2 - s1
+                    end = start + e2 - s2
+                    indmap.append((start, end))
+                indmap = IndexMap(tuple(indmap))
+                assert itensor.valmap == common.valmap, "Value map not same"
+                valmap = ValueMap((0, 1))
+                select_prim = SelectPrim(itensor, indmap, valmap, common)
+                prims.append(select_prim)
             if itensor.device == ctensor.device and common == ctensor:
                 return [select_prim]
-            prims.append(select_prim)
             # TODO: check union == subtensor
             if common == ctensor:
                 break
