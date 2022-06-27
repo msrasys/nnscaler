@@ -56,13 +56,14 @@ def Zeros(signature,
     size, dtype, layout, _erased_device, pin_memory = inputs
 
     # TODO parameters to support, currently they are all None
-    assert dtype is None
     assert layout is None
     assert pin_memory is None
 
-    ir_dtype : Optional[IRDType] = None
+    ir_dtype : IRDType
     if dtype is not None:
         ir_dtype = DType2IRDType.map(dtype)
+    else:
+        ir_dtype = DType2IRDType.map(torch.get_default_dtype())
 
     for dim, i in enumerate(size):
         if not isinstance(dim, int) and not dim >= 0:
@@ -80,12 +81,13 @@ def NewTensor(signature,
     data, dtype, _erased_device, requires_grad = inputs
 
     # TODO parameters to support, currently they are all None
-    assert dtype is None
     assert requires_grad == False
 
-    ir_dtype : Optional[IRDType] = None
+    ir_dtype : IRDType
     if dtype is not None:
         ir_dtype = DType2IRDType.map(dtype)
+    else:
+        ir_dtype = DType2IRDType.map(torch.get_default_dtype())
 
     # if 'data' is not:
     # 1) ints or floats of any precision, e.g. i8, i64, f16, f32
@@ -98,8 +100,6 @@ def NewTensor(signature,
     # but since we have omitted the 'data', we must do type inferrence ourselves,
     # only in this way we get correct dtype e.g. ints or bools.
     shape = list(arr.shape)
-    torch_inferred_dtype = arr.dtype
-    ir_dtype = DType2IRDType.map(torch_inferred_dtype)
     signature = 'torch.zeros'
     return IRZeros(signature, shape, 'tensor', ir_dtype=ir_dtype)
 
