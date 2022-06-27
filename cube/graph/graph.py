@@ -527,7 +527,8 @@ class IRGraph(IRCell):
         Partition Primitive:
             - partition: partition a forward or data operation using algorithms.
         
-        The backward of the forward operation will automaticall be partitioned.
+        The comment in the node will be inherited to partitioned nodes.
+        The backward of the forward operation will be automatically partitioned.
 
         Requirement to partition algorithm:
             if backward is required, the algorithm can only transform tensors in:
@@ -561,12 +562,16 @@ class IRGraph(IRCell):
         findex = self.detach(node)
         for idx, fnode in enumerate(fnodes):
             self.attach(fnode, findex + idx)
+            if isinstance(node.comment, str):
+                fnode.comment = node.comment
         # update backward
         if isinstance(node.mirror, IRBpOperation):
             bindex = self.detach(node.mirror)
             bnodes = [fnode.gen_backward() for fnode in fnodes][::-1]
             for idx, bnode in enumerate(bnodes):
                 self.attach(bnode, bindex + idx)
+                if isinstance(node.mirror.comment, str):
+                    bnode.comment = node.mirror.comment
         # update gradient
         updated = set()
         for itensor in [t for t in node.inputs() if isinstance(t, IRSubTensor)]:
@@ -657,7 +662,7 @@ class IRGraph(IRCell):
 
         @return sucess bool: always true
         """
-        assert isinstance(node, (IRFwOperation, IRDataOperation)), "Only forward and data operation can be assigned to device."
+        assert isinstance(node, (IRFwOperation, IRDataOperation)), f"Only forward and data operation can be assigned to device, but got {node}"
         assert node in self._nodes, f"{node} is not in the graph"
         ranks = (ranks,) if isinstance(ranks, int) else ranks
         assert all([isinstance(rank, int) for rank in ranks]), "Expected rank to be int"
