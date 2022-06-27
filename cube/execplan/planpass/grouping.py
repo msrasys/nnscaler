@@ -1,7 +1,8 @@
 """
 Operation grouping
 """
-from typing import List, Dict, Tuple
+import os
+from typing import List, Dict, Optional, Tuple
 
 from cube.execplan import ExecutionPlan
 from cube.execplan.planpass.planpass import PlanPass
@@ -9,9 +10,32 @@ from cube.ir.adapter import IRAdapter
 from cube.ir.operator import IRBpOperation, IRFwOperation
 from cube.ir.cten import IRCell
 
+SCIENTIFIC_COMPUTING = 'SCIENTIFIC_COMPUTING'
+_use_new_grouping_algo:Optional[bool] = None
+
+def _set_use_new_grouping_algo(use_new_grouping_algo:Optional[bool]) -> None:
+    """
+    Set the internal flag whether to use a new grouping algorithm which is faster for grouping forward-only graphs,
+    especially for workloads from scientific-computing domains.
+
+    Parameters:
+    - use_new_grouping_algo (bool):
+        'True' to force the use of the new grouping algorithm.
+        'False' to force the use of the old grouping algorithm.
+        'None' to use the new grouping algorithm if the environment variable 'SCIENTIFIC_COMPUTING' exists.
+    """
+    assert use_new_grouping_algo is None or isinstance(use_new_grouping_algo, bool)
+    global _use_new_grouping_algo
+    _use_new_grouping_algo = use_new_grouping_algo
+
+def _get_use_new_grouping_algo() -> bool:
+    if _use_new_grouping_algo is None:
+        return SCIENTIFIC_COMPUTING in os.environ
+    else:
+        return _use_new_grouping_algo
+        
 
 class Grouping(PlanPass):
-
     @staticmethod
     def apply(execplan: ExecutionPlan) -> ExecutionPlan:
         """
@@ -53,10 +77,16 @@ class Grouping(PlanPass):
             fpieces, bpieces = list(), list()
             seq = execplan.seq(devid)
             fnodes = []
-            for fnode in seq:
+
+            def is_forward_node(fnode):
                 if isinstance(fnode, IRFwOperation):
-                    fnodes.append(fnode)
+                    return True
                 if isinstance(fnode, IRAdapter) and fnode.differentiable and fnode.forward:
+                    return True
+                return False
+
+            for fnode in seq:
+                if is_forward_node(fnode):
                     fnodes.append(fnode)
             have_backward = all(fnode.mirror in seq for fnode in fnodes)
             # training
@@ -75,16 +105,37 @@ class Grouping(PlanPass):
                         fpieces, bpieces = [fnode], [bnode]
             # inference
             else:
-                for fnode in fnodes + [-1]:
-                    fconsecutive = Grouping.consecutive(seq, fpieces, fnode)
-                    if fconsecutive:
-                        fpieces.append(fnode)
-                        bpieces.append(None)
-                    else:
-                        if len(fpieces) != 0:
-                            fgroups[devid].append(fpieces)
-                            bgroups[devid].append(None)
-                        fpieces, bpieces = [fnode], [None]
+                if _get_use_new_grouping_algo():
+
+                    for fnode in seq:
+                        if is_forward_node(fnode):
+                            fpieces.append(fnode)
+                        else:
+                            if len(fpieces) != 0:
+                                fgroups[devid].append(fpieces)
+                                bgroups[devid].append(None)
+
+                            # If the fnode is not a "forward node", e.g. it's DataOp node, don't add it into the group.
+                            fpieces = []
+                            # 'bpieces' is never filled or returned in the inference mode
+                    
+                    if len(fpieces) != 0:
+                        fgroups[devid].append(fpieces)
+                        bgroups[devid].append(None)
+                
+                else: # Not using new algo
+                    
+                    for fnode in fnodes + [-1]:
+                        fconsecutive = Grouping.consecutive(seq, fpieces, fnode)
+                        if fconsecutive:
+                            fpieces.append(fnode)
+                            bpieces.append(None)
+                        else:
+                            if len(fpieces) != 0:
+                                fgroups[devid].append(fpieces)
+                                bgroups[devid].append(None)
+                            fpieces, bpieces = [fnode], [None]
+        
         return fgroups, bgroups
 
     @staticmethod
