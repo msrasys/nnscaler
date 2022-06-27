@@ -1,7 +1,6 @@
 from typing import List
 import copy
 
-from cube.algorithm.utils import split_axis
 from cube.algorithm.generics import GenericDistAlgo
 from cube.ir.operator import IRDataOperation
 
@@ -41,7 +40,7 @@ class DPDataLoader(GenericDistAlgo):
 
         outputs = list()
         for dim, output in zip(dims, node.outputs()):
-            output = split_axis(output, dim, num)
+            output = output.split_dim(dim, num)
             outputs.append(output)
 
         nodes = list()

@@ -1,7 +1,28 @@
-from cube.algorithm.utils import split_axis, split_axis_custom
+from typing import List, Tuple
 from cube.algorithm.generics import GenericDistAlgo
 
 from cube.graph.function.pad import IRPad
+from cube.ir.tensor import IRSubTensor
+
+
+def _split_axis_custom(tensor: IRSubTensor, dim: int, chunks: List[Tuple[int, int]]):
+    """
+    Split tensor along an axis with customized selection
+    """
+    dim = len(tensor.shape) + dim if dim < 0 else dim
+    assert dim < len(tensor.shape), f"dim should within ndims ({dim} >= {tensor.ndims})"
+    chunk_num = len(chunks)
+    indmap = list()
+    for nele in tensor.shape:
+        indmap.append((0, nele))
+    sub_tensors = list()
+    for cid in range(chunk_num):
+        indmap[dim] = chunks[cid]
+        sub_tensors.append(tensor.select(
+            indmap=tuple(indmap), valmap=(0,1)
+        ))
+    return sub_tensors
+
 
 class DimSplitPad(GenericDistAlgo):
     """
@@ -49,12 +70,12 @@ class DimSplitPad(GenericDistAlgo):
 
         # split non-pad dim
         if dim < len(node.inputs(0).shape) - pad_dim_count:
-            inputs = split_axis(node.inputs(0), axis=dim, chunk_num=num)
-            outputs = split_axis(node.outputs(0), axis=dim, chunk_num=num)
+            inputs = node.inputs(0).split_dim(dim, num)
+            outputs = node.outputs(0).split_dim(dim, num)
             for i, o in zip(inputs, outputs):
                 subnodes.append(node.new([i], [o]))
         else: # split pad dim
-            inputs = split_axis(node.inputs(0), axis=dim, chunk_num=num)
+            inputs = node.inputs(0).split_dim(dim, num)
             slicers = list()
             pads = list()
             dim_in_pad = len(node.inputs(0).shape) - 1 - dim
@@ -72,10 +93,10 @@ class DimSplitPad(GenericDistAlgo):
                 pads.append(cur_pad)
 
                 stop = start + padl + padr + chunk_size
-                slicers.append(slice(max(0, start), min(node.outputs(0).shape[dim], stop)))
+                slicers.append((max(0, start), min(node.outputs(0).shape[dim], stop)))
                 start = stop
 
-            outputs = split_axis_custom(node.outputs(0), axis=dim, chunks=slicers)
+            outputs = _split_axis_custom(node.outputs(0), dim, tuple(slicers))
 
             for i, o, p in zip(inputs, outputs, pads):
                 subnodes.append(node.new([i], [o], pad=p))
