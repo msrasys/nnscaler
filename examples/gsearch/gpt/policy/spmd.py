@@ -32,10 +32,15 @@ def PASMegatronTP(graph: IRGraph, resource):
             graph.assign(sub_node, idx)
         return sub_nodes
 
+    # annotating code structure
+    multirefs = [node for node in graph.nodes() if isinstance(node, IRFwOperation) and node.name == 'multiref']
+    for idx in range(0, len(multirefs), 2):
+        multirefs[idx].comment = f'====> start of transformer {idx // 2}'
+
     # ============ Attention ===============
     qkvs = [node for node in fnodes if node.name == 'attn_qkv']
     for idx, qkv in enumerate(qkvs):
-        tensor_parallelism(qkv, f'====> start of transformer {idx}', idx=1, dim=0, num=tp_size)
+        tensor_parallelism(qkv, idx=1, dim=0, num=tp_size)
 
     scores = [node for node in fnodes if node.name == 'attn_score']
     for score in scores:
@@ -76,7 +81,7 @@ def PASMegatronTP(graph: IRGraph, resource):
             rnodes = graph.replicate(node, times=tp_size)
             for idx, rnode in enumerate(rnodes):
                 graph.assign(rnode, idx)
-    print(graph.extra_repr())
+    # print(graph.extra_repr())
     return graph
 
 
