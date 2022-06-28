@@ -51,3 +51,31 @@ OMP_NUM_THREADS=4 torchrun \
     --nnodes=1 \
     examples/mlp/linears.py
 ```
+
+## Profile
+
+### Use cProfile
+
+Due to the multi-process architecture of `torch.distributed.launch`, instead of directly using
+the command-line interface of cProfile, we need to exactly specify the scope to profile, like:
+
+```python
+import cProfile
+prof = cProfile.Profile()
+prof.enable()
+
+# our code to profile goes here
+@cube.compile(...)
+def iter(dataloader):
+    x, y = next(dataloader)
+    z = model(x, y)
+    return z
+for i in range(N):
+    iter(...)
+# our code ends
+
+prof.disabled()
+pr.dump_stats('cube_%d.prof' % torch.distributed.get_rank()) # or use TID/PID, if to profile multi-thread/-process program.
+```
+
+After the modification, run the Python file using the same command line with `torchrun` as usual.
