@@ -88,6 +88,23 @@ def emit_zeros(node, arg_vars:list, kw_pairs:dict) -> str:
     assert len(arg_vars) == 0
     return _common_rule_join_all(node, arg_vars, kw_pairs)
 
+def emit_ones(node, arg_vars:list, kw_pairs:dict) -> str:
+    """
+    ones(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+    """
+    kw_pairs = kw_pairs.copy()
+    if 'dtype' in kw_pairs:
+        ir_dtype : IRDType = kw_pairs['dtype']
+        if ir_dtype is not None:
+            kw_pairs['dtype'] = IRDType2DType.map(ir_dtype)
+    
+    # TODO make all intermediately created tensors CUDA, to fit with other parts of the system, like SynDataLoader.
+    assert 'device' not in kw_pairs
+    kw_pairs['device'] = 'torch.cuda.current_device()' # str will get directly dumped as it's.
+
+    assert len(arg_vars) == 0
+    return _common_rule_join_all(node, arg_vars, kw_pairs)
+
 # Basically to convert internal 'IRDType' to frontend 'torch.dtype'
 def emit_to(node, arg_vars:list, kw_pairs:dict) -> str:
     kw_pairs = kw_pairs.copy()
@@ -125,6 +142,7 @@ class Sign2EmitRule:
 
         'torch.slice': emit_slice,
         'torch.zeros': emit_zeros,
+        'torch.ones': emit_ones,
         'torch.Tensor.to': emit_to,
     }
 

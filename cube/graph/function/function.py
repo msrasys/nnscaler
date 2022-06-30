@@ -13,7 +13,7 @@ from cube.graph.function.pad import IRPad
 from cube.graph.function.scripteinops import IRScriptEinOps
 from cube.graph.function.customops import IRCustomOps
 from cube.graph.function.cat import IRCat, IRStack
-from cube.graph.function.creators import IRToTensor, IRZeros
+from cube.graph.function.creators import IROnes, IRToTensor, IRZeros
 from cube.graph.function.select import IRSelect, IRSlice
 from cube.graph.function.scatter import IRSelectScatter
 from cube.graph.function.repeat import IRRepeat
@@ -70,6 +70,26 @@ def Zeros(signature,
             raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
     return IRZeros(signature, size, 'zeros', ir_dtype)
 
+def Ones(signature, 
+         inputs: Tuple[ List[int], Optional[Any], Optional[Any], 'ErasedDevice', Optional[bool] ]):
+    # ones(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+
+    size, dtype, layout, _erased_device, pin_memory = inputs
+
+    # TODO parameters to support, currently they are all None
+    assert layout is None
+    assert pin_memory is None
+
+    ir_dtype : IRDType
+    if dtype is not None:
+        ir_dtype = DType2IRDType.map(dtype)
+    else:
+        ir_dtype = DType2IRDType.map(torch.get_default_dtype())
+
+    for dim, i in enumerate(size):
+        if not isinstance(dim, int) and not dim >= 0:
+            raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
+    return IROnes(signature, size, 'ones', ir_dtype)
 
 def NewTensor(signature, 
               inputs: Tuple[ list, Optional[Any], 'ErasedDevice', bool ]):
@@ -100,8 +120,8 @@ def NewTensor(signature,
     # but since we have omitted the 'data', we must do type inferrence ourselves,
     # only in this way we get correct dtype e.g. ints or bools.
     shape = list(arr.shape)
-    signature = 'torch.zeros'
-    return IRZeros(signature, shape, 'tensor', ir_dtype=ir_dtype)
+    signature = 'torch.ones'
+    return IROnes(signature, shape, 'tensor', ir_dtype=ir_dtype)
 
 def ToTensor(signature,
              inputs: Tuple[ IRTensor, ... ]):

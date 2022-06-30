@@ -26,6 +26,26 @@ class IRZeros(IRFwOperation):
         self.outputs(0).shape = shape
         return True
 
+class IROnes(IRFwOperation):
+    def __init__(self, signature: str, shape: List[int], name: str, ir_dtype:IRDType):
+
+        # The shape information must be statically known integer values
+        assert all(isinstance(dim, int) for dim in shape)
+        assert isinstance(ir_dtype, IRDType)
+
+        super().__init__(name, signature, input_length=0, output_length=1)
+
+        # Customize output's dtype only after 'super().__init__' and 'self.set_input',
+        # otherwise it gets overwritten.
+        self.outputs(0).dtype = ir_dtype
+
+        # The positional argument to specify the shape is actually called 'size'.
+        self.kwargs.update({"size": copy(shape), "dtype": ir_dtype})
+
+    def infer_shape(self) -> bool:
+        shape : list = copy(self.kwargs["size"])
+        self.outputs(0).shape = shape
+        return True
 
 #class IRNewTensor(IRFwOperation):
 #    def __init__(self, signature: str, data, name:str):

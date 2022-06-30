@@ -77,6 +77,7 @@ class Sign2Op:
 
         # creators
         __ttemplate('zeros'): function.Zeros,
+        __ttemplate('ones'): function.Ones,
         __ttemplate('tensor'): function.NewTensor,
         __ttemplate('to'): function.ToTensor,
 
