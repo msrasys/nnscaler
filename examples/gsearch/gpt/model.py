@@ -9,7 +9,7 @@ import cube
 class Config:
 
     num_embeddings = 50304
-    seqlen = 512
+    seqlen = 1024
 
     # 1.7B model
     embed_dim = 2304
@@ -93,7 +93,7 @@ class GPTDataLoader(cube.runtime.syndata.CubeDataLoader):
         )
         position_ids = torch.arange(
             0, self.cfg.seqlen, dtype=torch.int64, device=torch.cuda.current_device()
-        ).repeat(self.bs)
+        ).repeat(self.bs).view((self.bs, -1))
         return (input_ids, position_ids)
 
     def __iter__(self):
