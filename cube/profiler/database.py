@@ -98,13 +98,13 @@ class ProfileDataBase:
         try:
             assert callable(func), "func should be callable"
             span = CompProfiler.profile(func, shapes, dtypes, backward=backward, **kwargs)
+            name = func.__name__
+            key = self.serialize(shapes, dtypes)
+            self.log(name, key, span)
+            print(f'profiled {func.__name__} | shapes: {shapes} | dtypes: {dtypes} => span: {round(span, 2)} ms')
         except Exception as e:
             print(f'fail to profile {func.__name__}: reason: {str(e)}')
-        name = func.__name__
-        key = self.serialize(shapes, dtypes)
-        self.log(name, key, span)
-        print(f'profiled {func.__name__} | shapes: {shapes} | dtypes: {dtypes} => span: {round(span, 2)} ms')
-    
+
     def log(self, name: str, key: str, span: float):
         """
         log the span of a function name with key 
