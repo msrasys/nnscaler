@@ -8,6 +8,7 @@ class IRPad(IRFwOperation):
                  **kwargs):
         # torch.nn.functional.pad(input, pad, mode='constant', value=0.0)
         # pad: List[int]
+        signature = 'torch.nn.functional.pad'
         assert len(inputs) == 1, "Expected only input, weight, bias as inputs"
         assert len(kwargs) == 3, "Expected 2 kwargs: mode, value"
         super().__init__(name, signature, 1, 1)

@@ -118,6 +118,8 @@ class Sign2Op:
 
         __ttemplate('conv3d'): function.Conv3D,
 
+        __ttemplate('pad'): function.Pad,
+
         __ttemplate('select'): function.Select,
 
         __ttemplate('slice'): function.Slice,
