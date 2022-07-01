@@ -18,23 +18,26 @@ class LogicTranslator:
         Generate Training Logic Graph
         """
         nodes = SchedulePool().nodes()
-        graph = IRGraph(nodes, inputs=[], outputs=outputs, module_name='LogicGraph')
-        has_bp = any(n for n in graph.nodes() if isinstance(n, IRBpOperation))
+        has_bp = any(n for n in nodes if isinstance(n, IRBpOperation))
         if has_bp:
-            assert all(fnode.mirror in graph.nodes() for fnode in graph.nodes() if isinstance(fnode, IRFwOperation)), \
+            assert all(fnode.mirror in nodes for fnode in nodes if isinstance(fnode, IRFwOperation)), \
                 "Training requires all nodes have backward."
-            return graph
-        # remove backward nodes if no backward is called
-        fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
-        for fnode in fnodes:
-            IRCell.make_pair(fnode, None)
-        for ftensor in graph.full_tensors():
-            ftensor.requires_grad = False
-        #TODO: ad hoc fix on operators with multiple same input tensors
-        for node in graph.nodes():
-            for itensor in node.inputs():
-                if isinstance(itensor, IRSubTensor):
-                    itensor._dirty_grad = True
+        else:
+            # remove backward nodes if no backward is called
+            fnodes = [node for node in nodes if isinstance(node, IRFwOperation)]
+            for fnode in fnodes:
+                IRCell.make_pair(fnode, None)
+            # remove node gradient
+            for node in nodes:
+                for itensor in node.inputs():
+                    if isinstance(itensor, IRSubTensor):
+                        itensor.parent.requires_grad = False
+                        # ad hoc fix on operators with multiple same input tensors
+                        itensor._dirty_grad = True
+                for otensor in node.outputs():
+                    if isinstance(otensor, IRSubTensor):
+                        otensor.parent.requires_grad = False
+        graph = IRGraph(nodes, inputs=[], outputs=outputs, module_name='LogicGraph')
         return graph
 
     @staticmethod

@@ -176,7 +176,7 @@ class IRGraph(IRCell):
                         consumer.add_predecessor(cidx, producer)
                 # set mirror as control dependency
                 if producer.mirror and isinstance(producer, IRFwOperation):
-                    producer.add_successor(-1, producer)
+                    producer.add_successor(-1, producer.mirror)
                     producer.mirror.add_predecessor(-1, producer)
 
     def parameters(self):
