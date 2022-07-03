@@ -469,7 +469,7 @@ class OpAnno:
 
 
 
-class IREinops(IRFwOperation):
+class IRDimops(IRFwOperation):
     """
     Einstein-inspired notation operations
     """
@@ -573,7 +573,7 @@ class IREinops(IRFwOperation):
         annos = self._annos_candidates
         updated_kwargs = copy.copy(self.kwargs)
         updated_kwargs.update(kwargs)
-        op = IREinops(self.signature, annos, inputs, self.name, **updated_kwargs)
+        op = IRDimops(self.signature, annos, inputs, self.name, **updated_kwargs)
         for idx, output in enumerate(outputs):
             op.set_output(idx, output)
         return op
@@ -667,14 +667,14 @@ class IREinops(IRFwOperation):
             algos = list()
             if factory.exist(type(self)):
                 algos += [template(self) for template in factory.algorithms(type(self))]
-            if factory.exist(IREinops):
-                algos += [template(self) for template in factory.algorithms(IREinops)]
+            if factory.exist(IRDimops):
+                algos += [template(self) for template in factory.algorithms(IRDimops)]
             return algos
         else:
             if factory.exist(type(self), tag):
                 template = factory.algorithms(type(self), tag)
                 return template(self)
-            if factory.exist(IREinops, tag):
-                template = factory.algorithms(IREinops, tag)
+            if factory.exist(IRDimops, tag):
+                template = factory.algorithms(IRDimops, tag)
                 return template(self)
             return None

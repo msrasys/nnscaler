@@ -1,7 +1,7 @@
 from typing import List, Optional
 from cube.algorithm.generics import GenericDistAlgo
 
-from cube.graph.function.einops import IREinops, DimAnno
+from cube.graph.function.dimops import IRDimops, DimAnno
 from cube.ir.tensor import IRSubTensor
 
 
@@ -16,9 +16,9 @@ class DimSplitEinops(GenericDistAlgo):
     For stay-reduce dimension, this dimension is not allowed to be splitted.
     """
 
-    def __init__(self, node: IREinops):
-        if not isinstance(node, IREinops):
-            raise TypeError(f"Expect IREinops")
+    def __init__(self, node: IRDimops):
+        if not isinstance(node, IRDimops):
+            raise TypeError(f"Expect IRDimops")
         super().__init__(node)
         self._adim: str = None
         self._reduce: DimAnno.ReduceType = None
@@ -34,7 +34,7 @@ class DimSplitEinops(GenericDistAlgo):
         @return satisfy bool: true if can be partitioned, elsewise false.
         """
         assert all(isinstance(cond, int) for cond in [idx, dim, num]), "expect int condition"
-        node: IREinops = self.node
+        node: IRDimops = self.node
         
         ninputs = len(node.inputs())
         idx = idx if idx >= 0 else idx + ninputs
@@ -53,9 +53,9 @@ class DimSplitEinops(GenericDistAlgo):
             return False
         return True
 
-    def instantiate(self, idx: int, dim: int, num: int) -> Optional[List[IREinops]]:
+    def instantiate(self, idx: int, dim: int, num: int) -> Optional[List[IRDimops]]:
 
-        node: IREinops = self.node
+        node: IRDimops = self.node
         satisfy = self.satisfy(idx, dim, num)
         print(f'partition {node.name}: {node.anno} | dim: {self._adim} reduce: {self._reduce.value}')
         if not satisfy:
@@ -107,7 +107,7 @@ class DimSplitEinops(GenericDistAlgo):
             updated_kwargs = dict()
             if self._adim in node.kwargs and isinstance(node.kwargs[self._adim], int):
                 updated_kwargs[self._adim] = node.kwargs[self._adim] // num
-            sub_node: IREinops = node.new(inputs, outputs, **updated_kwargs)
+            sub_node: IRDimops = node.new(inputs, outputs, **updated_kwargs)
             sub_node.infer_shape()
             sub_nodes.append(sub_node)
         return sub_nodes

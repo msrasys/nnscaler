@@ -62,8 +62,8 @@ class DistAlgorithmFactory:
         import cube.algorithm.ops.dataloader as dataloader
         self.register(dataloader.IRDataOperation, dataloader.DPDataLoader, tag='data')
 
-        import cube.algorithm.ops.einops as einops
-        self.register(einops.IREinops, einops.DimSplitEinops, tag='dim')
+        import cube.algorithm.ops.dimops as dimops
+        self.register(dimops.IRDimops, dimops.DimSplitEinops, tag='dim')
 
         import cube.algorithm.ops.conv as conv
         self.register(conv.IRConv2D, conv.DimSplitConv2D, tag='dim')

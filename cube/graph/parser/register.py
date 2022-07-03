@@ -6,7 +6,7 @@ from typing import Any, Callable, List, Optional
 import inspect
 import torch
 
-from cube.graph.function.einops import IREinops
+from cube.graph.function.dimops import IRDimops
 
 from cube.graph.parser.mapping import Sign2Op
 
@@ -48,7 +48,7 @@ def register(anno: str, name: Optional[str] = None):
             kwargs = dict()
             for name, val in zip(kwarg_names, kwarg_vals):
                 kwargs[name] = val
-            return IREinops(signature, [anno], tensors, **kwargs, name=fsig)
+            return IRDimops(signature, [anno], tensors, **kwargs, name=fsig)
 
         print(f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
         Sign2Op.register(fsig, udfop, code)
