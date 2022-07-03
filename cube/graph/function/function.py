@@ -12,7 +12,6 @@ from cube.graph.function.conv import IRConv3D
 from cube.graph.function.pad import IRPad
 from cube.graph.function.scripteinops import IRScriptEinOps
 from cube.graph.function.customops import IRCustomOps
-from cube.graph.function.cat import IRCat, IRStack
 from cube.graph.function.creators import IROnes, IRToTensor, IRZeros
 from cube.graph.function.select import IRSelect, IRSlice
 from cube.graph.function.scatter import IRSelectScatter
@@ -676,25 +675,41 @@ def Pad(signature, inputs):
     pad, mode, value = inputs[1:]
     return IRPad(signature, tensors, 'pad', pad=pad, mode=mode, value=value)
 
-def Cat(signature, inputs):
+
+def Cat(signature, inputs: Tuple[List[IRTensor], int]):
     """
     torch.cat(inputs: List[Tensor], dim: int) -> Tensor
 
     e.g. cat(tensor([2,3]), tensor([2,3])).shape == [4,3]
     """
-    tensors : List[IRTensor]
-    dim : int
     tensors, dim = inputs
-    return IRCat(signature, tensors, 'cat', dim=dim)
+    iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
+    dimlens = [t.shape[dim] for t in tensors]
+    for ashape, dimlen in zip(iannos, dimlens):
+        ashape[dim] = str(dimlen)
+    oannos = [copy.copy(iannos[-1])]
+    oannos[0][dim] = str(sum(dimlens))
+    anno = OpAnno.create_op_str(iannos, oannos)
+    return IREinops(signature, [anno], tensors, 'cat', dim=dim)
+
 
 def Stack(signature, inputs: Tuple[List[IRTensor], int]):
     """
     torch.stack(inputs: List[Tensor], dim: int) -> Tensor
 
+    inputs:
+        tensors: List[Tensor]: all tensors need to have same size
+        dim: the new inserted dim
+
     e.g. stack(tensor([2,3]), tensor([2,3])).shape == [2,2,3]
     """
     tensors, dim = inputs
-    return IRCat(signature, tensors, 'stack', dim=dim)
+    iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
+    oannos = [copy.copy(iannos[-1])]
+    oannos[0].insert(dim, str(len(tensors)))
+    anno = OpAnno.create_op_str(iannos, oannos)
+    return IREinops(signature, [anno], tensors, 'stack', dim=dim)
+
 
 def Select(signature, inputs: Tuple[IRTensor, int, int]):
     """
