@@ -47,7 +47,7 @@ def test_simple_unroll_evaluation():
             return (%z)
     ''')
     frame = Frame()
-    frame.push()
+    frame.push_var()
     frame.add_var("a", 0)
 
     for node in g.nodes():
@@ -71,7 +71,7 @@ def test_unroll_with_structural_info():
             return (%z)
     ''')
     frame = Frame()
-    frame.push()
+    frame.push_var()
 
     t_a = IRFullTensor(shape=[2,3])
     frame.add_var("a", t_a)
@@ -131,7 +131,7 @@ def test_nested_unroll():
     module = StubScriptModule()
 
     frame = Frame()
-    frame.push()
+    frame.push_var()
 
     t_a = IRFullTensor(shape=[2,3])
     frame.add_var("a", t_a)

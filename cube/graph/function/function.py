@@ -48,23 +48,26 @@ def BatchLinear(signature, inputs):
 
 
 def Zeros(signature, 
-          inputs: Tuple[ List[int], Optional[Any], Optional[Any], 'ErasedDevice', Optional[bool] ]):
+          inputs: Tuple[ List[int], Optional[int], Optional[Any], 'ErasedDevice', Optional[bool] ]):
     # zeros(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
     #
     # REMARK: in the PyTorch-internal operator definition expression, an asterisk ("*") is merely a marker of
     #         the beginning of the sublist of _keyword arguments_, and does not result in an actual argument.
 
-    size, dtype, layout, _erased_device, pin_memory = inputs
+    size, dtype_underlying, layout, _erased_device, pin_memory = inputs
 
     # TODO parameters to support, currently they are all None
     assert layout is None
     assert pin_memory is None
 
-    ir_dtype : IRDType
-    if dtype is not None:
-        ir_dtype = DType2IRDType.map(dtype)
+    if dtype_underlying is not None:
+        # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
+        # which is the underlying type of PyTorch C++ enum 'ScalarType'.
+        dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
     else:
-        ir_dtype = DType2IRDType.map(torch.get_default_dtype())
+        dtype = torch.get_default_dtype()
+
+    ir_dtype : IRDType = DType2IRDType.map(dtype)
 
     for dim, i in enumerate(size):
         if not isinstance(dim, int) and not dim >= 0:
@@ -72,20 +75,23 @@ def Zeros(signature,
     return IRZeros(signature, size, 'zeros', ir_dtype)
 
 def Ones(signature, 
-         inputs: Tuple[ List[int], Optional[Any], Optional[Any], 'ErasedDevice', Optional[bool] ]):
+         inputs: Tuple[ List[int], Optional[int], Optional[Any], 'ErasedDevice', Optional[bool] ]):
     # ones(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
 
-    size, dtype, layout, _erased_device, pin_memory = inputs
+    size, dtype_underlying, layout, _erased_device, pin_memory = inputs
 
     # TODO parameters to support, currently they are all None
     assert layout is None
     assert pin_memory is None
 
-    ir_dtype : IRDType
-    if dtype is not None:
-        ir_dtype = DType2IRDType.map(dtype)
+    if dtype_underlying is not None:
+        # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
+        # which is the underlying type of PyTorch C++ enum 'ScalarType'.
+        dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
     else:
-        ir_dtype = DType2IRDType.map(torch.get_default_dtype())
+        dtype = torch.get_default_dtype()
+
+    ir_dtype : IRDType = DType2IRDType.map(dtype)
 
     for dim, i in enumerate(size):
         if not isinstance(dim, int) and not dim >= 0:
@@ -93,28 +99,31 @@ def Ones(signature,
     return IROnes(signature, size, 'ones', ir_dtype)
 
 def NewTensor(signature, 
-              inputs: Tuple[ list, Optional[Any], 'ErasedDevice', bool ]):
+              inputs: Tuple[ list, Optional[int], 'ErasedDevice', bool ]):
     # aten::tensor(t[] data, *, ScalarType? dtype=None, Device? device=None, bool requires_grad=False) -> Tensor
     #
     # REMARK: in the PyTorch-internal operator definition expression, an asterisk ("*") is merely a marker of
     #         the beginning of the sublist of _keyword arguments_, and does not result in an actual argument.
 
-    data, dtype, _erased_device, requires_grad = inputs
+    data, dtype_underlying, _erased_device, requires_grad = inputs
 
     # TODO parameters to support, currently they are all None
     assert requires_grad == False
 
-    ir_dtype : IRDType
-    if dtype is not None:
-        ir_dtype = DType2IRDType.map(dtype)
+    if dtype_underlying is not None:
+        # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
+        # which is the underlying type of PyTorch C++ enum 'ScalarType'.
+        dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
     else:
-        ir_dtype = DType2IRDType.map(torch.get_default_dtype())
+        dtype = torch.get_default_dtype()
+
+    ir_dtype : IRDType = DType2IRDType.map(dtype)
 
     # if 'data' is not:
     # 1) ints or floats of any precision, e.g. i8, i64, f16, f32
     # 2) non-ragged
     # ... then this call will throw.
-    arr = torch.tensor(data, dtype=dtype)
+    arr = torch.tensor(data, dtype=dtype_underlying)
 
     # TODO temporarily fake creation with Zeros
     # and remark that originally aten::tensor should be able to infer the dtype from the specified 'data',
