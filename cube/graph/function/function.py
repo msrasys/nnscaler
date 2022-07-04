@@ -5,7 +5,8 @@ import torch
 import warnings
 
 from cube.ir.cten import IRTensor
-from cube.ir.tensor import IRFullTensor
+from cube.ir.operator import IRFwOperation
+from cube.ir.tensor import IRFullTensor, IRSubTensor
 from cube.graph.function.dimops import ShapeAnno, OpAnno, IRDimops
 from cube.graph.function.conv import IRConv2D
 from cube.graph.function.conv import IRConv3D
@@ -16,6 +17,7 @@ from cube.graph.function.creators import IROnes, IRToTensor, IRZeros
 from cube.graph.function.select import IRSelect, IRSlice
 from cube.graph.function.scatter import IRSelectScatter
 from cube.graph.function.repeat import IRRepeat
+from cube.graph.function.anchor import IRGraphAnchor
 from cube.ir.dtype import IRDType
 from cube.graph.torch_dtype_mapping import DType2IRDType, TorchScalarTypeEnumMap
 
@@ -773,6 +775,15 @@ def MultiRef(signature, inputs: List[IRFullTensor]):
     assert isinstance(times, int), "require int for second input"
     anno = '* -> ' + ', '.join('*' for _ in range(times))
     node = IRDimops(signature, [anno], [itensor], 'multiref', times=times)
+    return node
+
+
+def GraphAnchor(signature, inputs: List[IRSubTensor]):
+    """
+    cube.runtime.function.anchor() -> None
+    """
+    name: str = inputs[0]
+    node = IRGraphAnchor(signature, name)
     return node
 
 

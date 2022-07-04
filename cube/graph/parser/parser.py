@@ -228,8 +228,6 @@ class ScriptModuleParser:
             input_vals.append(val)
 
         # map to IR operator
-        if 'torch' not in fsig: # indicate a customized operator
-            fsig = fsig.split('.')[-1]
         ir_node = Sign2Op.map(fsig)(inputs=input_vals)
         
         # push output in the frame

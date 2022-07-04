@@ -9,6 +9,12 @@ def identity(tensor: torch.Tensor) -> torch.Tensor:
     """
     return tensor
 
+def anchor(name: str):
+    """
+    anchor operation for graph navigation 
+    """
+    return None
+
 
 def multiref(tensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]:
     """

@@ -9,6 +9,7 @@ from cube.graph import parser
 from cube.graph.gener.gen import IRAdapterGener
 from cube.graph.graph import IRGraph
 from cube.ir.operator import IRDataOperation
+from cube.graph.function.anchor import IRGraphAnchor
 
 from cube.logics.pool import SchedulePool
 from cube.logics.translator import LogicTranslator
@@ -159,9 +160,11 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             if not isinstance(graph, IRGraph):
                 raise RuntimeError("Expected policy return IRGraph")
 
-            # check assignment and order
+            # check assignment and remove anchor node
             for node in graph.nodes():
-                if len(node.device) == 0:
+                if isinstance(node, IRGraphAnchor) or isinstance(node.mirror, IRGraphAnchor):
+                    graph.detach(node)
+                elif len(node.device) == 0:
                     raise RuntimeError(f"Node {node} device is not set")
 
             # generate adapter

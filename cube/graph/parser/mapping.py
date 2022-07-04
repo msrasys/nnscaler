@@ -21,6 +21,8 @@ class Sign2Op:
         """
         Map the signature to GenericLogicalOp
         """
+        if 'torch.' not in signature and 'cube.runtime.' not in signature:
+            signature = signature.split('.')[-1]
         if signature in Sign2Op.kOpMap:
             return partial(Sign2Op.kOpMap[signature], signature=signature)
         else:
@@ -45,6 +47,9 @@ class Sign2Op:
 
     # tensor template
     __ttemplate = lambda name: f'torch.{name}'
+
+    # runtime template
+    __rtemplate = lambda name: f'cube.runtime.function.function.{name}'
 
     # einops
     __einopsize = lambda name: f'einops._torch_specific.{name}'
@@ -135,6 +140,9 @@ class Sign2Op:
         __ttemplate('cat'): function.Cat,
 
         __ttemplate('stack'): function.Stack,
+
+        # runtime functions
+        __rtemplate('anchor'): function.GraphAnchor,
 
         #einops
         __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
