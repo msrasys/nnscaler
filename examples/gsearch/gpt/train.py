@@ -49,9 +49,6 @@ def train():
     dataloader = GPTDataLoader(batch_size)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
-    print_each_rank('model weight consumpition:')
-    memory_summary()
-
     model = cube.SemanticModel(model, dataloader.shapes)
     @cube.compile(model, dataloader, PAS=PAS, override=True)
     def train_iter(model, dataloader):
@@ -59,6 +56,9 @@ def train():
         loss = model(input_ids, position_ids)
         loss.backward()
     model = model.get_gen_module()
+
+    print_each_rank('model weight consumpition:')
+    memory_summary()
 
     CudaTimer(enable=False).warmup()
     iter_num = 64

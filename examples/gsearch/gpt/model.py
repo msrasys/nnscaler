@@ -39,7 +39,8 @@ class GPT(torch.nn.Module):
         super().__init__()
         cfg = Config()
 
-        self.embed = torch.nn.Embedding(cfg.num_embeddings, cfg.embed_dim)
+        self.embedw = torch.nn.Parameter(torch.empty(cfg.num_embeddings, cfg.embed_dim))
+        # self.embed = torch.nn.Embedding(cfg.num_embeddings, cfg.embed_dim)
         self.position = torch.nn.Embedding(cfg.seqlen, cfg.embed_dim)
         self.embed_dropout = torch.nn.Dropout()
 
@@ -54,7 +55,11 @@ class GPT(torch.nn.Module):
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor):
 
-        embed = self.embed(input_ids)
+        # embed = self.embed(input_ids)
+        embed = torch.nn.functional.embedding(
+            input_ids, self.embedw, padding_idx=None,
+            max_norm=None, norm_type=2., scale_grad_by_freq=False, sparse=False
+        )
         pos_embed = self.position(position_ids)
         embed = embed + pos_embed
         embed = self.embed_dropout(embed)
@@ -64,7 +69,8 @@ class GPT(torch.nn.Module):
             enc = layer(enc)
         enc = self.final_layernorm(enc)
 
-        logits = torch.nn.functional.linear(enc, self.embed.weight)
+        # logits = torch.nn.functional.linear(enc, self.embed.weight)
+        logits = torch.nn.functional.linear(enc, self.embedw)
         # simplified
         loss = torch.sum(logits)
         return loss

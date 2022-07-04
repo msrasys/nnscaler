@@ -33,8 +33,8 @@ def PASMegatronTP(graph: IRGraph, resource):
             graph.assign(sub_node, idx)
         return sub_nodes
 
-    # annotating code structure
-    multirefs = [node for node in graph.nodes() if isinstance(node, IRFwOperation) and node.name == 'multiref']
+    # annotating code structure -- not consider multiref on embedding weight
+    multirefs = [node for node in graph.nodes() if isinstance(node, IRFwOperation) and node.name == 'multiref'][1:]
     for idx in range(0, len(multirefs), 2):
         multirefs[idx].comment = f'====> start of transformer {idx // 2}'
 
