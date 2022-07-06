@@ -143,6 +143,8 @@ class Sign2Op:
 
         # runtime functions
         __rtemplate('anchor'): function.GraphAnchor,
+        
+        __rtemplate('identity'): function.Identity,
 
         #einops
         __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
