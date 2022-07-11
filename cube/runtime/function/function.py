@@ -80,6 +80,21 @@ def embedding(input: torch.Tensor, weight: torch.Tensor, padding_idx: Optional[i
     return output
 
 
+# 'torch.select_scatter' isn't supported by Torch2ONNX yet.
+# Implement it with 'torch.masked_scatter' which is supported with ONNX opset=11.
+def select_scatter(input:torch.Tensor, src:torch.Tensor, dim:int, index:int):
+    # e.g. [..., 1, -1, 1, ...]
+    shape = [1] * input.ndim
+    shape[dim] = -1
+
+    d = input.shape[dim]
+    mask = torch.zeros([d], dtype=torch.bool, device=input.device)
+    mask[index] = True
+    mask = mask.reshape(shape)
+
+    return torch.masked_scatter(input, mask, src)
+
+
 def einops(input: torch.Tensor, recipe_str, reduction_type: str):
     import pickle
     recipe = pickle.loads(recipe_str)

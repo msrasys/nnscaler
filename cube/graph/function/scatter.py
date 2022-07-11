@@ -32,6 +32,7 @@ class IRSelectScatter(IRFwOperation):
     def __init__(self, signature: str, inputs:Tuple[IRTensor, IRTensor], name: str, dim:int, index:int):
         assert len(inputs) == 2
 
+        signature = 'cube.runtime.function.select_scatter'
         super().__init__(name, signature, 2, 1)
         self.set_input(0, inputs[0])
         self.set_input(1, inputs[1])
