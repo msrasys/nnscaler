@@ -123,7 +123,7 @@ def NewTensor(signature,
     # 1) ints or floats of any precision, e.g. i8, i64, f16, f32
     # 2) non-ragged
     # ... then this call will throw.
-    arr = torch.tensor(data, dtype=dtype_underlying)
+    arr = torch.tensor(data, dtype=dtype)
 
     # TODO temporarily fake creation with Zeros
     # and remark that originally aten::tensor should be able to infer the dtype from the specified 'data',
