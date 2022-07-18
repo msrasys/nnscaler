@@ -1,4 +1,4 @@
-from typing import Any, List
+from typing import Any, List, Tuple
 import copy
 
 from cube.graph.graph import IRGraph
@@ -15,7 +15,7 @@ def forward(graph: IRGraph, *args) -> IRGraph:
     if not isinstance(graph, IRGraph):
         raise TypeError("Requires IRGraph for forward")
     # align graph with input tensors
-    itensors: List[IRSubTensor] = graph.inputs()
+    itensors: Tuple[IRSubTensor, ...] = graph.inputs()
     for idx, (itensor, arg) in enumerate(zip(itensors, args)):
         graph.set_input(idx, arg)
         for producer in copy.copy(itensor.parent.producers):

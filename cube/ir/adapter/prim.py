@@ -20,19 +20,17 @@ class IRAdapterPrim:
             self.kwargs[arg] = val
         self.signature = None
 
-    def inputs(self, idx: Optional[int] = None):
-        assert idx is None or isinstance(idx, int),  "expected idx to be None or int"
-        if idx is None:
-            return copy.copy(self._inputs)
-        else:
-            return self._inputs[idx]
+    def input(self, idx:int):
+        return self._inputs[idx]
 
-    def outputs(self, idx: Optional[int] = None):
-        assert idx is None or isinstance(idx, int),  "expected idx to be None or int"
-        if idx is None:
-            return copy.copy(self._outputs)
-        else:
-            return self._outputs[idx]
+    def inputs(self):
+        return copy.copy(self._inputs)
+
+    def output(self, idx:int):
+        return self._outputs[idx]
+
+    def outputs(self):
+        return copy.copy(self._outputs)
 
     def dispatch(self, devid: int):
         if devid not in self.device:
@@ -100,7 +98,7 @@ class IdentityPrim(SpatialPrim):
         self.signature = 'cube.runtime.adapter.identity'
 
     def __repr__(self):
-        dscp = f"{self.outputs(0)} = identity({self.inputs(0)})"
+        dscp = f"{self.output(0)} = identity({self.input(0)})"
         return dscp
 
 
@@ -117,7 +115,7 @@ class SelectPrim(SpatialPrim):
         self.signature = f"cube.runtime.adapter.select"
 
     def __repr__(self):
-        dscp = f"{self.outputs(0)} = select({self.inputs(0)}, indmap={self.kwargs['indmap']}, valmap={self.kwargs['valmap']})"
+        dscp = f"{self.output(0)} = select({self.input(0)}, indmap={self.kwargs['indmap']}, valmap={self.kwargs['valmap']})"
         return dscp
 
 
@@ -131,7 +129,7 @@ class MergeDimPrim(SpatialPrim):
         self.signature = 'cube.runtime.adapter.smerge'
 
     def __repr__(self) -> str:
-        return f"dev{self.device}: {self.outputs(0)} = concat({self.inputs()}, dim={self.kwargs['dim']})"
+        return f"dev{self.device}: {self.output(0)} = concat({self.inputs()}, dim={self.kwargs['dim']})"
 
 # numerical primitive
 
@@ -143,7 +141,7 @@ class SumPrim(ValuePrim):
         self.signature = 'cube.runtime.adapter.vmerge'
 
     def __repr__(self) -> str:
-        return f"dev{self.device}: {self.outputs(0)} = add({self.inputs()})"
+        return f"dev{self.device}: {self.output(0)} = add({self.inputs()})"
 
 # communication primitive
 
@@ -156,7 +154,7 @@ class SendPrim(CommPrim):
         self.signature = 'cube.runtime.adapter.send'
 
     def __repr__(self) -> str:
-        return f"{self.inputs(0)} = send({self.inputs(0)}, dst={self.kwargs['dst']}"
+        return f"{self.input(0)} = send({self.input(0)}, dst={self.kwargs['dst']}"
 
 
 class RecvPrim(CommPrim):
@@ -169,7 +167,7 @@ class RecvPrim(CommPrim):
         self.signature = 'cube.runtime.adapter.recv'
 
     def __repr__(self) -> str:
-        return f"{self.outputs(0)} = recv(shape={self.kwargs['shape']}, dtype={self.kwargs['dtype']}, src={self.kwargs['src']}"
+        return f"{self.output(0)} = recv(shape={self.kwargs['shape']}, dtype={self.kwargs['dtype']}, src={self.kwargs['src']}"
 
 
 class MovePrim(CommPrim):
@@ -182,13 +180,13 @@ class MovePrim(CommPrim):
 
     def dispatch(self, devid: int) -> Union[SendPrim, RecvPrim]:
         if devid == self.kwargs['src']:
-            return SendPrim(self.inputs(0), self.kwargs['dst'])
+            return SendPrim(self.input(0), self.kwargs['dst'])
         if devid == self.kwargs['dst']:
-            return RecvPrim(self.outputs(0), self.kwargs['src'])
+            return RecvPrim(self.output(0), self.kwargs['src'])
         return None
 
     def __repr__(self):
-        dscp = f"move({self.inputs(0)}, src={self.kwargs['src']}, dst={self.kwargs['dst']})"
+        dscp = f"move({self.input(0)}, src={self.kwargs['src']}, dst={self.kwargs['dst']})"
         return dscp
 
 

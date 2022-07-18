@@ -42,13 +42,13 @@ def PAS_ALL_TEST(graph: IRGraph, resource):
             sub_nodes = graph.partition(node, algo, idx=0, dim=2, num=resource.ngpus)
         elif isinstance(node, IRDimops):
             sign = node.signature.split('.')[-1]
-            if (sign == 'mul' or sign == 'add' or sign == 'sub' or sign == 'div') and (len(node.inputs(0).shape) == 5 or len(node.inputs(0).shape) == 3):
+            if (sign == 'mul' or sign == 'add' or sign == 'sub' or sign == 'div') and (len(node.input(0).shape) == 5 or len(node.input(0).shape) == 3):
                 algo = node.algorithms('dim')
-                if len(node.inputs(0).shape) == 3:
+                if len(node.input(0).shape) == 3:
                     sub_nodes = graph.partition(node, algo, idx=0, dim=1, num=resource.ngpus)
                     if sub_nodes == None:
                         sub_nodes = graph.replicate(node, times=resource.ngpus)
-                elif len(node.inputs(0).shape) == 5:
+                elif len(node.input(0).shape) == 5:
                     sub_nodes = graph.partition(node, algo, idx=0, dim=3, num=resource.ngpus)
                     if sub_nodes == None:
                         sub_nodes = graph.replicate(node, times=resource.ngpus)
@@ -56,13 +56,13 @@ def PAS_ALL_TEST(graph: IRGraph, resource):
                 print('partition view')
                 print(node)
                 algo = node.algorithms('view_simp')
-                sub_nodes = graph.partition(node, algo, idx=0, dimi=node.inputs(0).ndims-2, dimo=node.outputs(0).ndims-2, num=resource.ngpus)
+                sub_nodes = graph.partition(node, algo, idx=0, dimi=node.input(0).ndims-2, dimo=node.output(0).ndims-2, num=resource.ngpus)
                 print(sub_nodes)
             else:
                 sub_nodes = graph.replicate(node, times=resource.ngpus)
         elif isinstance(node, IRPad):
             algo = node.algorithms('dim')
-            sub_nodes = graph.partition(node, algo, dim=node.inputs(0).ndims-2, num=resource.ngpus)
+            sub_nodes = graph.partition(node, algo, dim=node.input(0).ndims-2, num=resource.ngpus)
         else:
             sub_nodes = graph.replicate(node, times=resource.ngpus)
         for idx, sub_node in enumerate(sub_nodes):
@@ -81,7 +81,7 @@ def PAS_ALL_X(graph: IRGraph, resource):
             sub_nodes = graph.partition(node, algo, idx=0, dim=3, num=resource.ngpus)
         elif isinstance(node, IRDimops):
             if sign in ['mul', 'div', 'add', 'sub', 'multiref', 'neg', 'pow', 'cat']:
-                ndims = node.inputs(0).ndims
+                ndims = node.input(0).ndims
                 algo = node.algorithms('dim')
                 if ndims == 3 or ndims == 5:
                     sub_nodes = graph.partition(node, algo, idx=0, dim=ndims-1, num=resource.ngpus)
@@ -91,15 +91,15 @@ def PAS_ALL_X(graph: IRGraph, resource):
                     sub_nodes = graph.replicate(node, times=resource.ngpus)
             elif sign == 'view':
                 algo = node.algorithms('view_simp')
-                if node.inputs(0).ndims >= 3 and node.outputs(0).ndims >= 3:
-                    sub_nodes = graph.partition(node, algo, idx=0, dimi=node.inputs(0).ndims-1, dimo=node.outputs(0).ndims-1, num=resource.ngpus)
+                if node.input(0).ndims >= 3 and node.output(0).ndims >= 3:
+                    sub_nodes = graph.partition(node, algo, idx=0, dimi=node.input(0).ndims-1, dimo=node.output(0).ndims-1, num=resource.ngpus)
                 else:
                     sub_nodes = graph.replicate(node, times=resource.ngpus)
             else:
                 sub_nodes = graph.replicate(node, times=resource.ngpus)
         elif isinstance(node, IRPad):
             algo = node.algorithms('dim')
-            sub_nodes = graph.partition(node, algo, dim=node.inputs(0).ndims-1, num=resource.ngpus)
+            sub_nodes = graph.partition(node, algo, dim=node.input(0).ndims-1, num=resource.ngpus)
         else:
             sub_nodes = graph.replicate(node, times=resource.ngpus)
         for idx, sub_node in enumerate(sub_nodes):
@@ -118,7 +118,7 @@ def PAS_ALL_Y(graph: IRGraph, resource):
             sub_nodes = graph.partition(node, algo, idx=0, dim=2, num=resource.ngpus)
         elif isinstance(node, IRDimops):
             if sign in ['mul', 'div', 'add', 'sub', 'multiref', 'neg', 'pow', 'cat']:
-                ndims = node.inputs(0).ndims
+                ndims = node.input(0).ndims
                 algo = node.algorithms('dim')
                 if ndims == 3 or ndims == 5:
                     sub_nodes = graph.partition(node, algo, idx=0, dim=ndims-2, num=resource.ngpus)
@@ -128,15 +128,15 @@ def PAS_ALL_Y(graph: IRGraph, resource):
                     sub_nodes = graph.replicate(node, times=resource.ngpus)
             elif sign == 'view':
                 algo = node.algorithms('view_simp')
-                if node.inputs(0).ndims >= 3 and node.outputs(0).ndims >= 3:
-                    sub_nodes = graph.partition(node, algo, idx=0, dimi=node.inputs(0).ndims-2, dimo=node.outputs(0).ndims-2, num=resource.ngpus)
+                if node.input(0).ndims >= 3 and node.output(0).ndims >= 3:
+                    sub_nodes = graph.partition(node, algo, idx=0, dimi=node.input(0).ndims-2, dimo=node.output(0).ndims-2, num=resource.ngpus)
                 else:
                     sub_nodes = graph.replicate(node, times=resource.ngpus)
             else:
                 sub_nodes = graph.replicate(node, times=resource.ngpus)
         elif isinstance(node, IRPad):
             algo = node.algorithms('dim')
-            sub_nodes = graph.partition(node, algo, dim=node.inputs(0).ndims-2, num=resource.ngpus)
+            sub_nodes = graph.partition(node, algo, dim=node.input(0).ndims-2, num=resource.ngpus)
         else:
             sub_nodes = graph.replicate(node, times=resource.ngpus)
         for idx, sub_node in enumerate(sub_nodes):

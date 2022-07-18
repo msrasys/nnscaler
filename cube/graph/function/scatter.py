@@ -39,11 +39,11 @@ class IRSelectScatter(IRFwOperation):
         self.kwargs.update({"dim": dim, "index": index})
 
     def infer_shape(self) -> bool:
-        shp_self : List[int] = self.inputs(0).shape
+        shp_self : List[int] = self.input(0).shape
         if len(shp_self) == 0:
             return False
 
-        shp_input = self.inputs(1).shape
+        shp_input = self.input(1).shape
 
         if len(shp_input) == 0:
             print("The 0-length input shape is ambiguous, may be uninferrable or just of a 0-d tensor")
@@ -55,6 +55,6 @@ class IRSelectScatter(IRFwOperation):
                 raise RuntimeError(f"self shape {shp_self} and input shape {shp_input} with dim={dim} mismatch")
 
         s2 = copy(shp_self)
-        self.outputs(0).shape = s2
+        self.output(0).shape = s2
         return True
 

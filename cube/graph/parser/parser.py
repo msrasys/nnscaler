@@ -238,10 +238,10 @@ class ScriptModuleParser:
         for output in node.outputs():
             if isinstance(output.type(), torch._C.TupleType):
                 tuplen = len(output.type().elements())
-                ir_output = [ir_node.outputs(idx) for idx in range(cnt, cnt+tuplen)]
+                ir_output = [ir_node.output(idx) for idx in range(cnt, cnt+tuplen)]
                 cnt += tuplen
             else:
-                ir_output = ir_node.outputs(cnt)
+                ir_output = ir_node.output(cnt)
                 cnt += 1
             frame.add_var(output.debugName(), ir_output)
 
@@ -312,7 +312,7 @@ class ScriptModuleParser:
 
             # handle outputs
             for index, output in enumerate(outputs):
-                frame.add_var(output.debugName(), ir_node.outputs(index))
+                frame.add_var(output.debugName(), ir_node.output(index))
 
             return [ir_node]
 

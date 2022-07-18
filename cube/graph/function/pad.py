@@ -20,20 +20,20 @@ class IRPad(IRFwOperation):
         """
         Output shape inference given the input shapes
         """
-        if len(self.inputs(0).shape) == 0:
+        if len(self.input(0).shape) == 0:
             return False
 
-        N = self.inputs(0).shape[0]
+        N = self.input(0).shape[0]
         pad  = self.kwargs['pad']
         mode = self.kwargs['mode']
         value = self.kwargs['value']
         assert len(pad) % 2 == 0, "IRPad::infer_shape len(pad) % 2 == 0"
 
-        shape = self.inputs(0).shape
+        shape = self.input(0).shape
         for pad_idx, pad_size in enumerate(pad):
             shape[-1 - (pad_idx // 2)] += pad_size
 
-        self.outputs(0).shape = shape
+        self.output(0).shape = shape
         return True
 
     def new(self, inputs: List, outputs: List, pad = None):

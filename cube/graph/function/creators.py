@@ -16,14 +16,14 @@ class IRZeros(IRFwOperation):
 
         # Customize output's dtype only after 'super().__init__' and 'self.set_input',
         # otherwise it gets overwritten.
-        self.outputs(0).dtype = ir_dtype
+        self.output(0).dtype = ir_dtype
 
         # The positional argument to specify the shape is actually called 'size'.
         self.kwargs.update({"size": copy(shape), "dtype": ir_dtype})
 
     def infer_shape(self) -> bool:
         shape : list = copy(self.kwargs["size"])
-        self.outputs(0).shape = shape
+        self.output(0).shape = shape
         return True
 
 class IROnes(IRFwOperation):
@@ -37,14 +37,14 @@ class IROnes(IRFwOperation):
 
         # Customize output's dtype only after 'super().__init__' and 'self.set_input',
         # otherwise it gets overwritten.
-        self.outputs(0).dtype = ir_dtype
+        self.output(0).dtype = ir_dtype
 
         # The positional argument to specify the shape is actually called 'size'.
         self.kwargs.update({"size": copy(shape), "dtype": ir_dtype})
 
     def infer_shape(self) -> bool:
         shape : list = copy(self.kwargs["size"])
-        self.outputs(0).shape = shape
+        self.output(0).shape = shape
         return True
 
 #class IRNewTensor(IRFwOperation):
@@ -68,12 +68,12 @@ class IRToTensor(IRFwOperation):
 
         # Customize output's dtype only after 'super().__init__' and 'self.set_input',
         # otherwise it gets overwritten.
-        self.outputs(0).dtype = ir_dtype
+        self.output(0).dtype = ir_dtype
         
         self.kwargs.update({"dtype": ir_dtype})
 
     def infer_shape(self) -> bool:
-        self.outputs(0).shape = self.inputs(0).shape
+        self.output(0).shape = self.input(0).shape
         return True
 
 

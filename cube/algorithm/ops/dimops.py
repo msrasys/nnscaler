@@ -39,13 +39,13 @@ class DimSplitEinops(GenericDistAlgo):
         ninputs = len(node.inputs())
         idx = idx if idx >= 0 else idx + ninputs
         assert idx < ninputs, f"index out of boundary: {idx} >= {ninputs}"
-        assert isinstance(node.inputs(idx), IRSubTensor), f"partitioning on a non-tensor input"
-        dim = dim if dim >= 0 else dim + node.inputs(idx).ndims
-        assert dim < node.inputs(idx).ndims, f"dimension output of boundary: {dim} >= {node.inputs(idx).ndims}"
+        assert isinstance(node.input(idx), IRSubTensor), f"partitioning on a non-tensor input"
+        dim = dim if dim >= 0 else dim + node.input(idx).ndims
+        assert dim < node.input(idx).ndims, f"dimension output of boundary: {dim} >= {node.input(idx).ndims}"
         # due to implementation limits, we only partition the first annotated dimension
         # for inner-dimension cases.
-        self._adim: str = node.anno.inputs(idx).dims[dim].identifiers[0]
-        self._reduce: DimAnno.ReduceType = node.anno.inputs(idx).dims[dim].reduces[0]
+        self._adim: str = node.anno.input(idx).dims[dim].identifiers[0]
+        self._reduce: DimAnno.ReduceType = node.anno.input(idx).dims[dim].reduces[0]
         dimlen = node.anno.getlen(self._adim)
         if self._reduce == DimAnno.ReduceType.Freeze:
             return False
@@ -66,7 +66,7 @@ class DimSplitEinops(GenericDistAlgo):
             if not isinstance(itensor, IRSubTensor):
                 ins.append([itensor] * num)
                 continue
-            shape_anno = node.anno.inputs(iidx)
+            shape_anno = node.anno.input(iidx)
             split_dims = shape_anno.getdims(self._adim)
             assert len(split_dims) <= 1, f"find split dims ({self._adim}) more than 1: {shape_anno}"
             if len(split_dims) == 1:
@@ -87,7 +87,7 @@ class DimSplitEinops(GenericDistAlgo):
             if not isinstance(otensor, IRSubTensor):
                 ous.append([otensor] * num)
                 continue
-            shape_anno = node.anno.outputs(oidx)
+            shape_anno = node.anno.output(oidx)
             split_dims = shape_anno.getdims(self._adim)
             assert len(split_dims) <= 1, f"find split dims ({self._adim}) more than 1: {shape_anno}"
             # split axis
@@ -147,14 +147,14 @@ class SimpleViewSplitEinops(GenericDistAlgo):
         assert idx == 0, f"Index should be 0"
         assert len(node.inputs()) == 1, f"Inputs size should be 1"
         assert len(node.outputs()) == 1, f"Outputs size should be 1"
-        dimi = dimi if dimi >= 0 else dimi + node.inputs(0).ndims
-        dimo = dimo if dimo >= 0 else dimo + node.outputs(0).ndims
-        assert dimi < node.inputs(0).ndims, f"dimension out of boundary: {dimi} >= {node.inputs(0).ndims}"
-        assert dimo < node.outputs(0).ndims, f"dimension out of boundary"
+        dimi = dimi if dimi >= 0 else dimi + node.input(0).ndims
+        dimo = dimo if dimo >= 0 else dimo + node.output(0).ndims
+        assert dimi < node.input(0).ndims, f"dimension out of boundary: {dimi} >= {node.input(0).ndims}"
+        assert dimo < node.output(0).ndims, f"dimension out of boundary"
         # # due to implementation limits, we only partition the first annotated dimension
         # # for inner-dimension cases.
-        self._adimi: str = node.anno.inputs(0).dims[dimi].identifiers[0]
-        self._adimo: str = node.anno.outputs(0).dims[dimo].identifiers[0]
+        self._adimi: str = node.anno.input(0).dims[dimi].identifiers[0]
+        self._adimo: str = node.anno.output(0).dims[dimo].identifiers[0]
         dimlen = node.anno.getlen(self._adimi)
         if dimlen < num:
             return False
@@ -171,7 +171,7 @@ class SimpleViewSplitEinops(GenericDistAlgo):
         for iidx, itensor in enumerate(node.inputs()):
             if not isinstance(itensor, IRSubTensor):
                 assert 0, "should not happen"
-            shape_anno = node.anno.inputs(iidx)
+            shape_anno = node.anno.input(iidx)
             split_dims = shape_anno.getdims(self._adimi)
             assert len(split_dims) <= 1, f"find split dims ({self._adimi}) more than 1: {shape_anno}"
             if len(split_dims) == 1:
@@ -185,7 +185,7 @@ class SimpleViewSplitEinops(GenericDistAlgo):
         for oidx, otensor in enumerate(node.outputs()):
             if not isinstance(otensor, IRSubTensor):
                 assert 0, f"should not happen"
-            shape_anno = node.anno.outputs(oidx)
+            shape_anno = node.anno.output(oidx)
             split_dims = shape_anno.getdims(self._adimo)
             assert len(split_dims) <= 1, f"find split dims ({self._adimo}) more than 1: {shape_anno}"
             # split axis

@@ -612,12 +612,12 @@ def Reshape(signature, inputs):
 #     https://pytorch.org/docs/stable/generated/torch.nn.functional.conv2d.html?highlight=torch%20conv2d#torch.nn.functional.conv2d
 #     """
 #     def adapt(anno: OpAnno, node: IRDimops) -> OpAnno:
-#         iH, iW = node.inputs(0).shape[2:4]
+#         iH, iW = node.input(0).shape[2:4]
 #         stride = node.kwargs['stride']
 #         padding = node.kwargs['padding']
 #         dilation = node.kwargs['dilation']
-#         dH = node.inputs(1).shape[2]
-#         dW = node.inputs(1).shape[3]
+#         dH = node.input(1).shape[2]
+#         dW = node.input(1).shape[3]
 #         oH = (iH + 2 * padding[0] - dilation[0] * (dH - 1) - 1) // stride[0] + 1
 #         oW = (iW + 2 * padding[1] - dilation[1] * (dW - 1) - 1) // stride[1] + 1
 #         anno.outputs[0][2] = DimAnno([str(oH)])

@@ -33,7 +33,7 @@ def test_optional_dtype_none(aten_op, ir_op_cls):
         ir_nodes = ScriptModuleParser.parse_node(node, {}, frame)
         for node in ir_nodes:
             if isinstance(node, ir_op_cls):
-                assert node.outputs(0).dtype == DType2IRDType.map(torch.get_default_dtype())
+                assert node.output(0).dtype == DType2IRDType.map(torch.get_default_dtype())
 
 @pytest.mark.parametrize(
     "aten_op, ir_op_cls",
@@ -58,4 +58,4 @@ def test_optional_dtype_underlying_int(aten_op, ir_op_cls):
         ir_nodes = ScriptModuleParser.parse_node(node, {}, frame)
         for node in ir_nodes:
             if isinstance(node, ir_op_cls):
-                assert node.outputs(0).dtype == IRDType.int32
+                assert node.output(0).dtype == IRDType.int32

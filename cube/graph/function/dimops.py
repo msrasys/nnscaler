@@ -314,20 +314,12 @@ class OpAnno:
         """
         return tuple(self._identifiers.keys())
 
-    def inputs(self, index: Optional[int] = None) -> Union[ShapeAnno, Tuple[ShapeAnno]]:
-        """!
-        Get shape annotation of index-th input.
-        If index is None, will return all shape annotations
+    def input(self, index:int) -> ShapeAnno:
+        assert index < len(self._inputs), "index out of boundary"
+        return self._inputs[index]
 
-        @param index Optional[int]: the index of input.
-        
-        @return shape_annos Union[ShapeAnno, Tuple[ShapeAnno]]: the shape annotation
-        """
-        assert index is None or index < len(self._inputs), "index out of boundary"
-        if index is None:
-            return self._inputs
-        else:
-            return self._inputs[index]
+    def inputs(self) -> Tuple[ShapeAnno, ...]:
+        return self._inputs
 
     def set_input(self, index: int, shape_anno: Union[str, ShapeAnno]):
         """
@@ -339,12 +331,12 @@ class OpAnno:
         inputs[index] = shape_anno if isinstance(shape_anno, ShapeAnno) else ShapeAnno(shape_anno)
         self._inputs = tuple(inputs)
 
-    def outputs(self, index: Optional[int] = None) -> Union[ShapeAnno, Tuple[ShapeAnno]]:
-        assert index is None or index < len(self._outputs), "index out of boundary"
-        if index is None:
-            return self._outputs
-        else:
-            return self._outputs[index]
+    def output(self, index:int) -> ShapeAnno:
+        assert index < len(self._outputs), "index out of boundary"
+        return self._outputs[index]
+
+    def outputs(self) -> Tuple[ShapeAnno, ...]:
+        return self._outputs
 
     def set_output(self, index: int, shape_anno: Union[str, ShapeAnno]):
         """
@@ -610,7 +602,7 @@ class IRDimops(IRFwOperation):
                         expand_dims = []
                         if ndims > 0:
                             expand_dims = list(DimAnno(candicates[dim] + reduce) for dim in range(ndims))
-                    shape_anno = list(op_anno.inputs(idx).dims[:pos]) + expand_dims + list(op_anno.inputs(idx).dims[pos+1:])
+                    shape_anno = list(op_anno.input(idx).dims[:pos]) + expand_dims + list(op_anno.input(idx).dims[pos+1:])
                     shape_anno = ShapeAnno(tuple(shape_anno))
                     op_anno.set_input(idx, shape_anno)
             # * should appear in inputs
@@ -620,7 +612,7 @@ class IRDimops(IRFwOperation):
                 names = [dim_anno.name for dim_anno in shape_anno.dims]
                 if '*' in names:
                     pos = names.index('*')
-                    shape_anno = list(op_anno.outputs(idx).dims[:pos]) + expand_dims + list(op_anno.outputs(idx).dims[pos+1:])
+                    shape_anno = list(op_anno.output(idx).dims[:pos]) + expand_dims + list(op_anno.output(idx).dims[pos+1:])
                     shape_anno = ShapeAnno(tuple(shape_anno))
                     op_anno.set_output(idx, shape_anno)
             op_anno.reset_identifiers()

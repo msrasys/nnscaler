@@ -44,7 +44,7 @@ def emit_slice(node, arg_vars:list, kw_pairs:dict) -> str:
     but at the frontend such an invocation must be rewritten as 'x[:, l:h:s, :, :]'
     depending on the 'input's rank and the 'dim' value.
     """
-    out_tensors : list = node.outputs()
+    out_tensors : tuple = node.outputs()
     assert len(out_tensors) == 1
     out_tensor : IRTensor = out_tensors[0]
 

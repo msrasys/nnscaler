@@ -432,7 +432,7 @@ class ScheduleCodeGen(CodeGen):
                     else:
                         finputs = ref_node.mirror.inputs()
                         foutputs = ref_node.mirror.outputs()
-                        grad_in = [t.grad for t in foutputs]
+                        grad_in = tuple(t.grad for t in foutputs)
                         if tensor in finputs + foutputs + grad_in:
                             return True
                 else:

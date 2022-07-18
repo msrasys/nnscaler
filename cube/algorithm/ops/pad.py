@@ -48,14 +48,14 @@ class DimSplitPad(GenericDistAlgo):
         pad_dim_count = len(pad) / 2
 
         # split non-pad dim
-        if dim < len(node.inputs(0).shape) - pad_dim_count:
-            return node.inputs(0).shape[dim] >= num
-            # return node.inputs(0).shape[dim] % num == 0
+        if dim < len(node.input(0).shape) - pad_dim_count:
+            return node.input(0).shape[dim] >= num
+            # return node.input(0).shape[dim] % num == 0
         # split pad dim
         else:
-            dim_in_pad = len(node.inputs(0).shape) - 1 - dim
-            return (node.inputs(0).shape[dim] + pad[dim_in_pad * 2] + pad[dim_in_pad * 2 + 1]) >= num
-            # return (node.inputs(0).shape[dim] + pad[dim_in_pad * 2] + pad[dim_in_pad * 2 + 1]) % num == 0
+            dim_in_pad = len(node.input(0).shape) - 1 - dim
+            return (node.input(0).shape[dim] + pad[dim_in_pad * 2] + pad[dim_in_pad * 2 + 1]) >= num
+            # return (node.input(0).shape[dim] + pad[dim_in_pad * 2] + pad[dim_in_pad * 2 + 1]) % num == 0
 
     def instantiate(self, dim: int, num: int):
         if not self.satisfy(dim, num):
@@ -71,20 +71,20 @@ class DimSplitPad(GenericDistAlgo):
         subnodes = list()
 
         # split non-pad dim
-        if dim < len(node.inputs(0).shape) - pad_dim_count:
-            inputs = node.inputs(0).split_dim(dim, num)
-            outputs = node.outputs(0).split_dim(dim, num)
+        if dim < len(node.input(0).shape) - pad_dim_count:
+            inputs = node.input(0).split_dim(dim, num)
+            outputs = node.output(0).split_dim(dim, num)
             for i, o in zip(inputs, outputs):
                 subnodes.append(node.new([i], [o]))
         else: # split pad dim
-            inputs = node.inputs(0).split_dim(dim, num)
+            inputs = node.input(0).split_dim(dim, num)
             slicers = list()
             pads = list()
-            dim_in_pad = len(node.inputs(0).shape) - 1 - dim
+            dim_in_pad = len(node.input(0).shape) - 1 - dim
             global_padl = pad[dim_in_pad * 2]
             global_padr = pad[dim_in_pad * 2 + 1]
-            chunk_size = (node.outputs(0).shape[dim] - global_padl - global_padr) // num
-            addone_num = (node.outputs(0).shape[dim] - global_padl - global_padr) % num
+            chunk_size = (node.output(0).shape[dim] - global_padl - global_padr) // num
+            addone_num = (node.output(0).shape[dim] - global_padl - global_padr) % num
             start = 0
             for cid in range(num):
                 padl = global_padl if cid == 0 else 0
@@ -97,10 +97,10 @@ class DimSplitPad(GenericDistAlgo):
 
                 addone = int(cid < addone_num)
                 stop = start + padl + padr + chunk_size + addone
-                slicers.append((max(0, start), min(node.outputs(0).shape[dim], stop)))
+                slicers.append((max(0, start), min(node.output(0).shape[dim], stop)))
                 start = stop
 
-            outputs = _split_axis_custom(node.outputs(0), dim, tuple(slicers))
+            outputs = _split_axis_custom(node.output(0), dim, tuple(slicers))
 
             for i, o, p in zip(inputs, outputs, pads):
                 subnodes.append(node.new([i], [o], pad=p))

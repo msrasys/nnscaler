@@ -40,19 +40,19 @@ class IRCustomOps(IRFwOperation):
         Output shape inference given the input shapes
         """
         if self.signature.endswith('strip_2_borders'):
-            if len(self.inputs(0).shape) == 0:
+            if len(self.input(0).shape) == 0:
                 return False
-            shape = self.inputs(0).shape
+            shape = self.input(0).shape
             shape[0] = shape[0]-2
-            self.outputs(0).shape = shape
+            self.output(0).shape = shape
             return True
         elif self.signature.endswith('update_diag_'):
-            shape = self.inputs(0).shape
-            self.outputs(0).shape = shape
+            shape = self.input(0).shape
+            self.output(0).shape = shape
             return True
         elif self.signature.endswith('update_geopotential_'):
-            shape = self.inputs(0).shape
-            self.outputs(0).shape = shape
+            shape = self.input(0).shape
+            self.output(0).shape = shape
             return True
         else:
             raise RuntimeError(f'IRCustomOps::infer_shape unknown signature: {self.signature}')

@@ -16,7 +16,7 @@ class IRSelect(IRFwOperation):
         self.kwargs.update({"dim": dim, "index": index})
 
     def infer_shape(self) -> bool:
-        s : List[int] = self.inputs(0).shape
+        s : List[int] = self.input(0).shape
         if len(s) == 0:
             return False
 
@@ -24,7 +24,7 @@ class IRSelect(IRFwOperation):
 
         s2 = copy(s)
         s2.pop(dim)
-        self.outputs(0).shape = s2
+        self.output(0).shape = s2
 
         return True
 
@@ -43,7 +43,7 @@ class IRSlice(IRFwOperation):
         self.kwargs.update({"dim": dim, "start": start, "end": end, "step": step})
 
     def infer_shape(self) -> bool:
-        s : List[int] = self.inputs(0).shape
+        s : List[int] = self.input(0).shape
         if len(s) == 0:
             return False
 
@@ -70,7 +70,7 @@ class IRSlice(IRFwOperation):
         sliced_dim_len = len(range(start, end, step))
         s2 = s.copy()
         s2[dim] = sliced_dim_len
-        self.outputs(0).shape = s2
+        self.output(0).shape = s2
 
         return True
 

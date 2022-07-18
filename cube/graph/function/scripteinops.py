@@ -24,7 +24,7 @@ class IRScriptEinOps(IRFwOperation):
         """
         Output shape inference given the input shapes
         """
-        if len(self.inputs(0).shape) == 0:
+        if len(self.input(0).shape) == 0:
             return False
 
         recipe_str = self.kwargs['recipe_str']
@@ -32,9 +32,9 @@ class IRScriptEinOps(IRFwOperation):
         recipe = pickle.loads(recipe_str)
 
         reduction_type = self.kwargs['reduction_type']
-        tmp_tensor = torch.zeros(self.inputs(0).shape)
+        tmp_tensor = torch.zeros(self.input(0).shape)
         tmp_output = _apply_recipe(recipe, tmp_tensor, reduction_type)
-        self.outputs(0).shape = list(tmp_output.shape)
+        self.output(0).shape = list(tmp_output.shape)
         return True
 
     def new(self, inputs: List, outputs: List):

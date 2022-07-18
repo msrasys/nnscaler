@@ -90,7 +90,7 @@ def test_unroll_with_structural_info():
         assert in_val_1 == p
         assert in_val_2 == p
 
-        out_val = ir_node.outputs(0)
+        out_val = ir_node.output(0)
         assert out_val.shape == [ 2**(i+2) , 3]
 
         p = out_val
@@ -150,7 +150,7 @@ def test_nested_unroll():
         assert in_val_1 == p
         assert in_val_2 == p
 
-        out_val = ir_node.outputs(0)
+        out_val = ir_node.output(0)
         assert out_val.shape == [ 2**(i+2) , 3]
 
         p = out_val

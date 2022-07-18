@@ -19,7 +19,7 @@ class IRRepeat(IRFwOperation):
         self.kwargs.update({"repeats": repeats})
 
     def infer_shape(self) -> bool:
-        shp_self : List[int] = self.inputs(0).shape
+        shp_self : List[int] = self.input(0).shape
         if len(shp_self) == 0:
             return False
 
@@ -35,6 +35,6 @@ class IRRepeat(IRFwOperation):
         shp = [d1 * d2 for d1, d2 in itertools.zip_longest(s1, s2, fillvalue=1)]
         shp.reverse()
 
-        self.outputs(0).shape = shp
+        self.output(0).shape = shp
         return True
 

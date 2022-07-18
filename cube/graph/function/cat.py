@@ -1,6 +1,6 @@
 from copy import copy
 import itertools
-from typing import List
+from typing import List, Tuple
 
 from cube.ir.operator import IRFwOperation
 from cube.ir.cten import IRTensor
@@ -27,7 +27,7 @@ class IRCat(IRFwOperation):
 
         # validation
         # TODO how about zero inputs?
-        tensors : List[IRTensor] = self.inputs(None) # None for all inputs
+        tensors : Tuple[IRTensor, ...] = self.inputs() # None for all inputs
 
         # Shape without the dim-th component
         s0 : list = None
@@ -48,7 +48,7 @@ class IRCat(IRFwOperation):
 
         sumLen : int = sum(t.shape[dim] for t in tensors)
         s0.insert(dim, sumLen)
-        self.outputs(0).shape = s0
+        self.output(0).shape = s0
         return True
 
 
@@ -64,7 +64,7 @@ class IRStack(IRFwOperation):
 
     def infer_shape(self) -> bool:
         dim  = self.kwargs['dim']
-        tensors : List[IRTensor] = self.inputs(None) # None for all inputs
+        tensors : Tuple[IRTensor, ...] = self.inputs() # None for all inputs
         
         # `stack` requires all input tensors to have the same shape
         if len(set(t.shape for t in tensors)) != 1:
@@ -72,6 +72,6 @@ class IRStack(IRFwOperation):
 
         shp : list = tensors[0].shape.copy()
         shp.insert(dim, len(tensors))
-        self.outputs(0).shape = shp
+        self.output(0).shape = shp
         return True
 

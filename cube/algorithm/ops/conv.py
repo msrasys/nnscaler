@@ -53,13 +53,13 @@ class DimSplitConv2D(GenericDistAlgo):
         groups = node.kwargs['groups']
         # split N:
         if (idx, dim) == (0, 0):
-            return node.inputs(0).shape[0] % num == 0
+            return node.input(0).shape[0] % num == 0
         # split oC
         if (idx, dim) == (1, 0):
-            return node.inputs(1).shape[0] % num == 0
+            return node.input(1).shape[0] % num == 0
         # split iC
         if (idx, dim) == (0, 1) or (idx, dim) == (1, 1):
-            return groups == 1 and node.inputs(1).shape[0] % 0 == num
+            return groups == 1 and node.input(1).shape[0] % 0 == num
 
     def instantiate(self, idx: int, dim: int, num: int):
         if not self.satisfy(idx, dim, num):
@@ -69,28 +69,28 @@ class DimSplitConv2D(GenericDistAlgo):
         outputs = list()
         # split N
         if (idx, dim) == (0, 0):
-            inputs = node.inputs(0).split_dim(dim, num)
-            weights = [node.inputs(1)] * num
-            bias = [node.inputs(2)] * num
-            outputs = node.outputs(0).split_dim(dim, num)
+            inputs = node.input(0).split_dim(dim, num)
+            weights = [node.input(1)] * num
+            bias = [node.input(2)] * num
+            outputs = node.output(0).split_dim(dim, num)
         # split oC
         if (idx, dim) == (1, 0):
-            inputs = [node.inputs(0)] * num
-            weights = node.inputs(1).split_dim(dim, num)
-            if node.inputs(2) is None:
+            inputs = [node.input(0)] * num
+            weights = node.input(1).split_dim(dim, num)
+            if node.input(2) is None:
                 bias = [None] * num
             else:
-                bias = node.inputs(2).split_dim(dim, num)
-            outputs = node.outputs(0).split_dim(dim=1, num=num)
+                bias = node.input(2).split_dim(dim, num)
+            outputs = node.output(0).split_dim(dim=1, num=num)
         # split iC
         if (idx, dim) == (0, 1) or (idx, dim) == (1, 1):
-            inputs = node.inputs(0).split_dim(dim, num)
-            weights = node.inputs(1).split_dim(dim, num)
-            if node.inputs(2) is None:
+            inputs = node.input(0).split_dim(dim, num)
+            weights = node.input(1).split_dim(dim, num)
+            if node.input(2) is None:
                 bias = [None] * num
             else:
-                bias = node.inputs(2).split_val(num)
-            outputs = node.outputs(0).split_val(num)
+                bias = node.input(2).split_val(num)
+            outputs = node.output(0).split_val(num)
         subnodes = list()
         for i, w, b, o in zip(inputs, weights, bias, outputs):
             subnodes.append(node.new([i, w, b], [o]))
@@ -112,7 +112,7 @@ class HaloSplitConv2D(GenericDistAlgo):
     def satisfy(self, idx: int, dim: int, num: int):
         assert all(isinstance(t, int) for t in [idx, dim, num]), "idx, dim and num should be integer"
         node: IRConv2D = self.node
-        oH, oW = node.outputs(0).shape[2:]
+        oH, oW = node.output(0).shape[2:]
         stride = node.kwargs['stride']
         dilation = node.kwargs['dilation']
         if dim not in [2, 3]:
@@ -133,9 +133,9 @@ class HaloSplitConv2D(GenericDistAlgo):
         if not self.satisfy(idx, dim, num):
             return None
         node: IRConv2D = self.node
-        H, W = node.inputs(0).shape[2:]
-        dH, dW = node.inputs(1).shape[2:]
-        oH, oW = node.outputs(0).shape[2:]
+        H, W = node.input(0).shape[2:]
+        dH, dW = node.input(1).shape[2:]
+        oH, oW = node.output(0).shape[2:]
         groups = node.kwargs['groups']
         stride = node.kwargs['stride']
         padding = node.kwargs['padding']
@@ -158,13 +158,13 @@ class HaloSplitConv2D(GenericDistAlgo):
                 start = stop - dilation[0] * (dH - 1)
                 # start = 0 if cid == 0 else 1023
                 # stop = 1025 if cid == 0 else H
-            inputs = _split_axis_custom(node.inputs(0), dim=dim, chunks=tuple(indmap))
+            inputs = _split_axis_custom(node.input(0), dim=dim, chunks=tuple(indmap))
             # weight
-            weights = [node.inputs(1)] * num
+            weights = [node.input(1)] * num
             # bias
-            bias = [node.inputs(2)] * num
+            bias = [node.input(2)] * num
             # outputs
-            outputs = node.outputs(0).split_dim(dim, num)
+            outputs = node.output(0).split_dim(dim, num)
         # split W
         if (idx, dim) == (0, 3):
             # input and padding
@@ -181,13 +181,13 @@ class HaloSplitConv2D(GenericDistAlgo):
                 stop = start + chunkH - padb
                 indmap.append((max(0, start), min(H, stop)))
                 start = stop - dilation[0] * (dH - 1)
-            inputs = _split_axis_custom(node.inputs(0), dim=dim, chunks=tuple(indmap))
+            inputs = _split_axis_custom(node.input(0), dim=dim, chunks=tuple(indmap))
             # weight
-            weights = [node.inputs(1)] * num
+            weights = [node.input(1)] * num
             # bias
-            bias = [node.inputs(2)] * num
+            bias = [node.input(2)] * num
             # outputs
-            outputs = node.outputs(0).split_dim(dim, num)
+            outputs = node.output(0).split_dim(dim, num)
         sub_nodes = list()
         for i, w, b, pad, o in zip(inputs, weights, bias, pads, outputs):
             conv = IRConv2D(node.signature, [i, w, b], node.name,
@@ -213,7 +213,7 @@ class HaloSplitConv3D(GenericDistAlgo):
     def satisfy(self, idx: int, dim: int, num: int):
         assert all(isinstance(t, int) for t in [idx, dim, num]), "idx, dim and num should be integer"
         node: IRConv3D = self.node
-        oD, oH, oW = node.outputs(0).shape[2:]
+        oD, oH, oW = node.output(0).shape[2:]
         stride = node.kwargs['stride']
         dilation = node.kwargs['dilation']
         if dim not in [2, 3]:
@@ -236,9 +236,9 @@ class HaloSplitConv3D(GenericDistAlgo):
         if not self.satisfy(idx, dim, num):
             return None
         node: IRConv3D = self.node
-        D, H, W = node.inputs(0).shape[2:]
-        dD, dH, dW = node.inputs(1).shape[2:]
-        oD, oH, oW = node.outputs(0).shape[2:]
+        D, H, W = node.input(0).shape[2:]
+        dD, dH, dW = node.input(1).shape[2:]
+        oD, oH, oW = node.output(0).shape[2:]
         groups = node.kwargs['groups']
         stride = node.kwargs['stride']
         padding = node.kwargs['padding']
@@ -264,13 +264,13 @@ class HaloSplitConv3D(GenericDistAlgo):
                 start = stop - dilation[0] * (dH - 1)
                 # start = 0 if cid == 0 else 1023
                 # stop = 1025 if cid == 0 else H
-            inputs = _split_axis_custom(node.inputs(0), dim=dim+1, chunks=indmap)
+            inputs = _split_axis_custom(node.input(0), dim=dim+1, chunks=indmap)
             # weight
-            weights = [node.inputs(1)] * num
+            weights = [node.input(1)] * num
             # bias
-            bias = [node.inputs(2)] * num
+            bias = [node.input(2)] * num
             # outputs
-            outputs = node.outputs(0).split_dim(dim+1, num)
+            outputs = node.output(0).split_dim(dim+1, num)
         # split W
         if (idx, dim) == (0, 3):
             # input and padding
@@ -290,13 +290,13 @@ class HaloSplitConv3D(GenericDistAlgo):
                 stop = start + chunkH - padb + addone
                 indmap.append((max(0, start), min(W, stop)))
                 start = stop - dilation[0] * (dW - 1)
-            inputs = _split_axis_custom(node.inputs(0), dim=dim+1, chunks=indmap)
+            inputs = _split_axis_custom(node.input(0), dim=dim+1, chunks=indmap)
             # weight
-            weights = [node.inputs(1)] * num
+            weights = [node.input(1)] * num
             # bias
-            bias = [node.inputs(2)] * num
+            bias = [node.input(2)] * num
             # outputs
-            outputs = node.outputs(0).split_dim(dim+1, num)
+            outputs = node.output(0).split_dim(dim+1, num)
         sub_nodes = list()
         for i, w, b, pad, o in zip(inputs, weights, bias, pads, outputs):
             conv = IRConv3D(node.signature, [i, w, b], node.name,

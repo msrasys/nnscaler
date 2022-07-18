@@ -14,7 +14,7 @@ If an IRTensor is the output of Cell, then Cell.device == IRTensor.device
 """
 
 
-from typing import List, Tuple, Union, Optional, Any
+from typing import Iterable, List, Tuple, Union, Optional, Any
 import copy
 
 from cube.ir.unique import IDGenerator
@@ -54,12 +54,12 @@ class IRCell:
         self._device = list()
 
         # source tensors
-        self._inputs: List[Any] = [None] * input_length
+        self._inputs: Tuple[Optional[IRTensor], ...] = (None,) * input_length
         
         # destination tensors
-        self._outputs: List[IRTensor] = [None] * output_length
+        self._outputs: Tuple[Optional[IRTensor], ...] = (None,) * output_length
         if init_outputs:
-            self._outputs: List[IRTensor] = [IRTensor() for _ in range(output_length)]
+            self._outputs = tuple(IRTensor() for _ in range(output_length))
             for tensor in self._outputs:
                 tensor.cell = self
 
@@ -130,28 +130,31 @@ class IRCell:
             raise TypeError(f"Expected device id to be int but got {type(device_id)}")
         return device_id in self.device
 
-    def inputs(self, index: Optional[int] = None) -> Union[List[Any], Any]:
+    def input(self, index:int):
+        # type: (int) -> Optional[IRTensor]
         """
-        Get input tensor at input index
+        Get the input tensor at input index
 
         Args:
-            index (int or None): 
-                index of the inputs, None will return the nodes
-                for all the inputs
+            index (int): 
+                index of the inputs
 
         Returns:
-            values: Union[List[Any], Any]
+            values: Optional[IRTensor]
         """
-        if isinstance(index, int):
-            if index >= len(self._inputs):
-                raise RuntimeError(
-                    f"Get the input out of range ({index} >= {len(self._inputs)}"
-                )
-            return self._inputs[index]
-        elif index is None:
-            return copy.copy(self._inputs)
-        else:
-            raise TypeError("Expected index to be None or int")
+        return self._inputs[index]
+
+    def inputs(self):
+        # type: () -> Tuple[Optional[IRTensor], ...]
+        """
+        Get all input tensors
+
+        Returns:
+            values: Tuple[Optional[IRTensor], ...]
+        """
+
+        # self._inputs is a tuple and is immutable.
+        return self._inputs
 
     def predecessors(self, index: Optional[int] = None) -> List:
         """
@@ -175,28 +178,31 @@ class IRCell:
         else:
             raise TypeError("Expected index to be None or int")
 
-    def outputs(self, index: Optional[int] = None) -> Union[List[Any], Any]:
+    def output(self, index:int):
+        # type: (int) -> Optional[IRTensor]
         """
-        Get output tensor at output index
+        Get the output tensor at output index
 
         Args:
-            index (int or None): 
-                index of the outputs, None will return the nodes
-                for all the outputs
+            index (int): 
+                index of the outputs
 
         Returns:
-            values: Union[List[Any], Any]
+            values: Optional[IRTensor]
         """
-        if isinstance(index, int):
-            if index >= len(self._outputs):
-                raise RuntimeError(
-                    f"Get the output out of range ({index} >= {len(self._outputs)}"
-                )
-            return self._outputs[index]
-        elif index is None:
-            return copy.copy(self._outputs)
-        else:
-            raise TypeError("Expected index to be None or int")
+        return self._outputs[index]
+
+    def outputs(self):
+        # type: () -> Tuple[Optional[IRTensor], ...]
+        """
+        Get all output tensors
+
+        Returns:
+            values: Tuple[Optional[IRTensor], ...]
+        """
+
+        # self._outputs is a tuple and is immutable.
+        return self._outputs
 
     def successors(self, index: Optional[int] = None) -> List:
         """
@@ -221,19 +227,21 @@ class IRCell:
         else:
             raise TypeError("Expected index to be None or int")
 
-    def set_input(self, input_index: int, val: Any):
+    def set_input(self, input_index: int, val):
+        # type: (int, Optional[IRTensor]) -> Optional[IRTensor]
         """
         Set the node inputs[input_index] with the tensor
 
         Args:
-            val: Union[IRTensor, Any]
+            val: Optional[IRTensor]
 
         Return:
             the set tensor
         """
-        if input_index >= len(self.inputs()):
+        c = len(self._inputs)
+        if input_index >= c or input_index < -c:
             raise RuntimeError(
-                f"Set the input out of range ({input_index} >= {len(self._inputs)})"
+                f"Set the input out of range ({input_index} >= {c} or {input_index} < {-c})"
             )
         if isinstance(val, IRTensor):
             # copy the val
@@ -247,27 +255,36 @@ class IRCell:
                     if isinstance(output, IRTensor):
                         output.dtype = self._dtype
             val.dtype = self._dtype
-        self._inputs[input_index] = val
+
+        l = list(self._inputs)
+        l[input_index] = val
+        self._inputs = tuple(l)
+
         return val
 
-    def set_output(self, output_index: int, val: Any):
+    def set_output(self, output_index: int, val):
+        # type: (int, Optional[IRTensor]) -> Optional[IRTensor]
         """
         Set the node inputs[output_index] with the tensor
 
         Args:
-            val: Union[IRTensor, Any]
+            val: Optional[IRTensor]
                 IRTensor or any deterministic value (int, bool, str, etc)
         """
-        if output_index >= len(self.outputs()):
+        c = len(self._outputs)
+        if output_index >= c or output_index < -c:
             raise RuntimeError(
-                f"Set the input out of range ({output_index} >= {len(self._inputs)})"
+                f"Set the input out of range ({output_index} >= {c} or {output_index} < {-c})"
             )
         if isinstance(val, IRTensor):
             val = copy.copy(val)
             val.cell = self
             # set output value dtype
             val.dtype = self._dtype
-        self._outputs[output_index] = val
+
+        l = list(self._outputs)
+        l[output_index] = val
+        self._outputs = tuple(l)
         return val
 
     def add_predecessor(self, input_index: int, cell):
@@ -298,7 +315,7 @@ class IRCell:
     def add_successor(self, output_index: int, cell):
         """
         Set self node the output index node. 
-        `node` will take the self.outputs(index) as the input
+        `node` will take the self.output(index) as the input
 
         To add control dependency, use `output_index=-1`
         """
@@ -326,6 +343,7 @@ class IRCell:
 
     @staticmethod
     def get_inputs(cells):
+        # type: (Iterable[IRCell]) -> list[IRCell]
         """
         Get all the input tensors the is not generated by nodes
 
@@ -336,7 +354,7 @@ class IRCell:
         """
         all_outputs = list()
         for cell in cells:
-            all_outputs += cell.outputs()
+            all_outputs += list(cell.outputs())
         inputs = list()
         for cell in cells:
             for input in cell.inputs():
@@ -348,6 +366,7 @@ class IRCell:
 
     @staticmethod
     def get_outputs(cells):
+        # type: (Iterable[IRCell]) -> list[IRCell]
         """
         Get all the input tensors the is not generated by nodes
 
@@ -356,7 +375,7 @@ class IRCell:
         """
         all_inputs = list()
         for node in cells:
-            all_inputs += node.inputs()
+            all_inputs += list(node.inputs())
         outputs = list()
         for node in cells:
             for output in node.outputs():
