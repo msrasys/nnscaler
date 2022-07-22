@@ -322,14 +322,23 @@ class ModelCodeGen(CodeGen):
         Emit tensor declaration code
         """
         sign = 'torch.nn.Parameter(torch.empty({shape}, dtype={dtype}))'
-        for input in node.inputs():
-            name = self.tensor_naming(input, prefix_attr='self.')
-            if isinstance(input, IRTensor):
-                if input.is_param() and not self.symbols.exist(name):
+        map_sign = "self.add_full_map('{attr}', {tid}, {slicers}, {val_chunks})"
+        for itensor in node.inputs():
+            name = self.tensor_naming(itensor, prefix_attr='self.')
+            if isinstance(itensor, IRSubTensor):
+                if itensor.is_param() and not self.symbols.exist(name):
                     self.symbols.create(name)
-                    code = f'{name} = {sign.format(shape=tuple(input.shape), dtype=self.dtype_map(input.dtype))}'
+                    code = f'{name} = {sign.format(shape=tuple(itensor.shape), dtype=self.dtype_map(itensor.dtype))}'
                     self.declare_region.append(code)
-            if isinstance(input, str):
+                    tid = itensor.parent.tid
+                    slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
+                    val_chunks = itensor.valmap[1]
+                    code = map_sign.format(
+                        attr=self.tensor_naming(itensor), tid=tid,
+                        slicers=str(slicers), val_chunks=val_chunks
+                    )
+                    self.declare_region.append(code)
+            if isinstance(itensor, str):
                 if name.startswith('self.'):
                     if not hasattr(self._ref_module, name[5:]):
                         raise NotImplementedError("member attribute is not added")

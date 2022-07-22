@@ -95,6 +95,7 @@ class ScriptModuleParser:
 
         frame.pop_var()
         frame.pop_attr()
+        frame.save_attr_content()
         return input_val, all_ir_nodes, output_val
 
     @staticmethod
@@ -415,6 +416,7 @@ class ScriptModuleParser:
                     warnings.warn('Detected non-parameter tensor as graph attribute. Regard them as parameters')
                     ir_tensor.as_param()
                 frame.add_attr(label, ir_tensor)
+                frame.add_attr_content(ir_tensor.tid, tensor)
             frame.add_var(var_name, ir_tensor)
         # symbolic attributes
         elif dtype in ['bool', 'int', 'float']:

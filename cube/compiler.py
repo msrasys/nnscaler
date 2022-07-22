@@ -39,15 +39,16 @@ class SemanticModel:
     def get_graph(self):
         return self.ir_graph
 
-    def load_module(self, filename: str):
+    def load_module(self, filename: str, load_content=True):
         import importlib.util
         spec = importlib.util.spec_from_file_location("GenModel", filename)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self._loaded_module = module.GenModel().cuda()
-        self._loaded_module.init_param()
-        # sync parameters before start training
-        self._loaded_module.sync_params()
+        if load_content:
+            print_each_rank("> loading parameter content...")
+            # TODO: make hardcode ./fullmodel.pt programmable
+            self._loaded_module.load_attr_content('./fullmodel.pt')
 
     def get_gen_module(self):
         return self._loaded_module
