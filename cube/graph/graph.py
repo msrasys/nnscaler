@@ -484,7 +484,7 @@ class IRGraph(IRCell):
         graph = IRGraph(nodes, inputs, outputs, module_name)
         return graph
 
-    ##### Partition Primitives #####
+    ##### Transformation Primitives #####
 
     def replicate(self, node: Union[IRFwOperation, IRDataOperation], times=1) -> List[IRCell]:
         """
@@ -564,6 +564,8 @@ class IRGraph(IRCell):
             self.attach(fnode, findex + idx)
             if isinstance(node.comment, str):
                 fnode.comment = node.comment
+            if isinstance(node, IRFwOperation):
+                fnode.recompute = node.recompute
         # update backward
         if isinstance(node.mirror, IRBpOperation):
             bindex = self.detach(node.mirror)
