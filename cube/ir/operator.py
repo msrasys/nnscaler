@@ -131,6 +131,7 @@ class IRFwOperation(IRCell):
         for idx, output in enumerate(self.outputs()):
             cpy.set_output(idx, output)
         cpy._mirror = None
+        cpy.recompute = self.recompute
         cpy.clear_predecessor()
         cpy.clear_successor()
         return cpy

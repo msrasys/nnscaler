@@ -1,8 +1,7 @@
 """
 Generate Pytorch code given the model DAG and the transformation config
 """
-from sys import prefix
-from typing import Dict, List, Any, Tuple, Union, Optional
+from typing import Dict, List, Any, Tuple, Optional
 import torch
 import copy
 from cube.graph.parser.mapping import Sign2Op
@@ -14,7 +13,7 @@ from cube.ir.tensor import IRSubTensor
 from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from cube.ir.adapter import IRWeightReducer, IRAdapter
 from cube.ir.adapter.prim import CollectivePrim, IRAdapterPrim
-from cube.graph.graph import IRGraph, IRSegment
+from cube.graph.graph import IRSegment
 from cube.graph.schedule import IRScheduleStrategy
 
 from cube.execplan import ExecutionPlan
