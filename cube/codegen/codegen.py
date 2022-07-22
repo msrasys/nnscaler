@@ -1,7 +1,8 @@
 """
 Generate Pytorch code given the model DAG and the transformation config
 """
-from typing import Dict, List, Any, Tuple, Optional
+import itertools
+from typing import Dict, Generator, Iterable, List, Any, Optional, Set, Tuple, Union
 import torch
 import copy
 from cube.graph.parser.mapping import Sign2Op
@@ -21,6 +22,104 @@ from cube.execplan import ExecutionPlan
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 from cube.codegen.frontend_mapping import Sign2EmitRule
+
+
+# TODO this could be applied in all codegen: Segments, Adapters, Schedules...
+# TODO but Schedules don't have standalone inputs, while Segments and Adapters have and 
+#      those inputs may need to be released too.
+def calc_tenvars_lifetime(
+        nodes:Iterable[IRCell], subgraph_outputs:Iterable[IRTensor]
+    ) -> Dict[IRTensor, int]:
+    """
+    Calculate the lifetime of tensor variables ahead-of-time.
+    So that during schedule the GC on those variables can take place in time.
+
+    E.g. at what timings may a tensor variable O_i be discarded (i.e. no longer referred)?
+    ```
+    ..., O_i, O_j, ... = f(I_1, ..., I_M)
+    # Case 1, immediately, because it's never used
+    O_i = None
+    # Case 2, after some invocation, because it's no longer referred
+    ... = g(..., O_j, ...)
+    O_j = None
+    ```
+
+    Returns: `Dict[IRTensor, int]`
+
+        For each kv-pair `(t, i)` it indicates the last reference of tensor `t`
+        is at the `i`-th (0-based) node's inputs, 
+        i.e. the variable for tensor `t` could be released *AFTER* the `i`-th statement 
+        in codegen.
+
+        If a tensor is not included in the dict, it means that tensor is never referenced.
+
+        TODO If an input of the subgraph is never used, its corresponding `i` is `-1`.
+    
+    REMARK:
+    
+        We cannot `detele O_j` because it may be a variable alias and the tensor object
+        behind is still active (e.g. `runtime.multiref`).
+        So we just set it to `None`, decrement the reference count 
+        and let Python (the codegen target) decide the deletion.
+    """
+
+    lifetime : Dict[IRTensor, int] = dict()
+
+    def is_temp_tensor(v):
+        return isinstance(v, IRSubTensor) and not v.is_param()
+
+    #lifetime.update((tsin, -1) for tsin in subgraph_inputs if is_temp_tensor(tsin))
+
+    for i, node in enumerate(nodes):
+        # aggressively mark all outputs for immediate deletion, namely 'i'
+        # TODO should work fine even for IRBpOperation
+        lifetime.update((tout, i) for tout in node.outputs() if is_temp_tensor(tout))
+
+        # "fast-forward" all inputs to the current statement, namely 'i'
+        inputs : Iterable[IRTensor]
+
+        if isinstance(node, IRSegment):
+            if node.forward:
+                inputs = node.inputs()
+            else:
+                # NOTE
+                # An 'IRBpOperation' does not explicitly record all tensors that are
+                # inputs-and-outputs-to-its-correspondeding-autograd.grad-call after codegen,
+                #
+                # E.g.
+                # IRBpOperation bp_op{ pair=fw_op } has:
+                # ```
+                # len(bp_op.inputs())==len(fw_op.outputs())
+                # len(bp_op.outputs())==len(fw_op.inputs())
+                # ````
+                #
+                # while a call to 'torch.autograd.grad' in Python is like:
+                # ```
+                # grad_inputs : Tuple[torch.Tensor, ...] = torch.autograd.grad(outputs, inputs, grad_outputs)
+                # len(grad_inputs) == len(inputs)
+                # len(grad_outputs) == len(outputs)
+                # ```
+                # in other words, if we simply treat `autograd.grad` as an `g_op:IRCell`, it has:
+                # ```
+                # len(g_op.inputs()) == len(fw_op.outputs())*2 + len(fw_op.inputs())
+                # len(g_op.outputs()) == len(fw_op.inputs())
+                # ```
+                #
+                fw_inputs : tuple = node.mirror.inputs()
+                fw_outputs : tuple = node.mirror.outputs()
+                grad_inputs : Generator = (t.grad for t in fw_outputs)
+                
+                inputs = itertools.chain(fw_inputs, fw_outputs, grad_inputs)
+
+        else:
+            inputs = node.inputs()
+
+        lifetime.update((tin, i) for tin in inputs if is_temp_tensor(tin))
+
+    i += 1
+    lifetime.update((tsout, i) for tsout in subgraph_outputs if is_temp_tensor(tsout))
+
+    return lifetime
 
 
 class CodeGen:
@@ -523,37 +622,10 @@ class ScheduleCodeGen(CodeGen):
 
         device_nodes = self.execplan.seq(device)
 
-        def removable(node) -> bool:
-            """
-            Get removable tensor lists that will not be used after the execution of the node
-
-            @param node IRCell
-            """
-            inputs = [t for t in node.inputs() if isinstance(t, IRSubTensor) and not t.is_param()]
-            idx = device_nodes.index(node)
-            remove = []
-            for itensor in inputs:
-                free = True
-                for ref_node in device_nodes[idx+1:]:
-                    if isinstance(ref_node, IRSegment):
-                        if ref_node.forward:
-                            if itensor in ref_node.inputs():
-                                free = False
-                                break
-                        else:
-                            input_tensors = ref_node.mirror.inputs()
-                            output_tensors = ref_node.mirror.outputs()
-                            output_grads = tuple(t.grad for t in output_tensors)
-                            if itensor in input_tensors + output_tensors + output_grads:
-                                free = False
-                                break
-                    else:
-                        if itensor in ref_node.inputs():
-                            free = False
-                            break
-                if free:
-                    remove.append(itensor)
-            return remove
+        lifetime : Dict[IRTensor, int] = calc_tenvars_lifetime(device_nodes, self.execplan.graph.outputs())
+        lifetime_by_line_id : Dict[int, List[IRTensor]] = dict()
+        for tensor, line_id in lifetime.items():
+            lifetime_by_line_id.setdefault(line_id, []).append(tensor)
 
         with FunctionBlock(func_name='_train_step', 
                            args=['model', 'dataloader']) as fb:
@@ -565,16 +637,17 @@ class ScheduleCodeGen(CodeGen):
                 code = self.emit_schedule_plan(self.execplan.graph.schedule_plan, device)
                 fb.insert_body(code)
             else:
-                for node in device_nodes:
+                for i, node in enumerate(device_nodes):
                     name = self.node_naming(node)
                     code = self.emit_node(node, name=name)
                     fb.insert_body(code)
-                    # free unused tensor
-                    removable_tensors = removable(node)
-                    if len(removable_tensors) > 0:
-                        nones = ', '.join(['None'] * len(removable_tensors))
-                        code = f'{self.return_naming(removable_tensors)} = {nones}'
-                        fb.insert_body(code)
+
+                    # decrement reference counts for output tensors that are no longer used
+                    tensors : Optional[List[IRTensor]] = lifetime_by_line_id.get(i, None)
+                    if tensors is not None: # not necessarily to have one after each line
+                        tnames : Generator = (self.tensor_naming(t) for t in tensors)
+                        fb.insert_body(', '.join(tnames) + ' = ' + ', '.join(['None'] * len(tensors)))
+            
             # return code
             outputs = self.return_naming(self.execplan.graph.outputs())
             code = f'return {outputs}'
