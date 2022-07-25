@@ -389,6 +389,11 @@ class ModelCodeGen(CodeGen):
         with ClassBlock(class_name='GenModel', derived=['cube.runtime.module.CubeModule']) as cb:
             with FunctionBlock(func_name='__init__', args=['self']) as ib:
                 ib.insert_body(self.declare_region)
+                # switch to training or inference mode
+                if self.execplan.inference:
+                    ib.insert_body('self.eval()')
+                else:
+                    ib.insert_body('self.train()')
             cb.insert_body('')
             cb.insert_body(ib.code)
             for idx, node in enumerate(gen_nodes):
@@ -403,6 +408,8 @@ class ModelCodeGen(CodeGen):
                     fb.insert_body(return_code)
                 cb.insert_body('')
                 cb.insert_body(fb.code)
+
+
         gencode += cb.code
         gencode += ['']
 

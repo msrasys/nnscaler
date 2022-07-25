@@ -14,6 +14,7 @@ class ExecutionPlan:
         assert isinstance(graph, IRGraph), "Expected an IRGraph"
         self._graph = graph
         self._seq: Dict[int, List[IRCell]] = dict()
+        self._inference_only = not any(isinstance(n, IRBpOperation) for n in graph.nodes())
 
         # execution sequence for each device  
         for node in graph.nodes():
@@ -48,6 +49,10 @@ class ExecutionPlan:
     @property
     def graph(self) -> IRGraph:
         return self._graph
+
+    @property
+    def inference(self) -> bool:
+        return self._inference_only
 
     def devices(self) -> List[int]:
         """
