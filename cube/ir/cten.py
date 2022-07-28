@@ -14,6 +14,7 @@ If an IRTensor is the output of Cell, then Cell.device == IRTensor.device
 """
 
 
+from functools import lru_cache
 from typing import Iterable, List, Tuple, Union, Optional, Any
 import copy
 
@@ -54,12 +55,12 @@ class IRCell:
         self._device = list()
 
         # source tensors
-        self._inputs: Tuple[Optional[IRTensor], ...] = (None,) * input_length
+        self._inputs: List[Optional[IRTensor]] = [None,] * input_length
         
         # destination tensors
-        self._outputs: Tuple[Optional[IRTensor], ...] = (None,) * output_length
+        self._outputs: List[Optional[IRTensor]] = [None,] * output_length
         if init_outputs:
-            self._outputs = tuple(IRTensor() for _ in range(output_length))
+            self._outputs = [IRTensor() for _ in range(output_length)]
             for tensor in self._outputs:
                 tensor.cell = self
 
@@ -144,6 +145,8 @@ class IRCell:
         """
         return self._inputs[index]
 
+    # 'maxsize=None' set no limit on cache growth, but it's ok since we have no args
+    @lru_cache(maxsize=None)
     def inputs(self):
         # type: () -> Tuple[Optional[IRTensor], ...]
         """
@@ -153,8 +156,7 @@ class IRCell:
             values: Tuple[Optional[IRTensor], ...]
         """
 
-        # self._inputs is a tuple and is immutable.
-        return self._inputs
+        return tuple(self._inputs)
 
     def predecessors(self, index: Optional[int] = None) -> List:
         """
@@ -192,6 +194,8 @@ class IRCell:
         """
         return self._outputs[index]
 
+    # 'maxsize=None' set no limit on cache growth, but it's ok since we have no args
+    @lru_cache(maxsize=None)
     def outputs(self):
         # type: () -> Tuple[Optional[IRTensor], ...]
         """
@@ -201,8 +205,7 @@ class IRCell:
             values: Tuple[Optional[IRTensor], ...]
         """
 
-        # self._outputs is a tuple and is immutable.
-        return self._outputs
+        return tuple(self._outputs)
 
     def successors(self, index: Optional[int] = None) -> List:
         """
@@ -226,6 +229,13 @@ class IRCell:
             return successors
         else:
             raise TypeError("Expected index to be None or int")
+
+    def reset_inputs(self, length:int) -> None:
+        """
+        Resize the inputs list to the new length and reset all input items to None.
+        """
+        self._inputs = [None] * length
+        self.inputs.cache_clear()
 
     def set_input(self, input_index: int, val):
         # type: (int, Optional[IRTensor]) -> Optional[IRTensor]
@@ -256,11 +266,17 @@ class IRCell:
                         output.dtype = self._dtype
             val.dtype = self._dtype
 
-        l = list(self._inputs)
-        l[input_index] = val
-        self._inputs = tuple(l)
+        self._inputs[input_index] = val
+        self.inputs.cache_clear()
 
         return val
+
+    def reset_outputs(self, length:int) -> None:
+        """
+        Resize the outputs list to the new length and reset all output items to None.
+        """
+        self._outputs = [None] * length
+        self.outputs.cache_clear()
 
     def set_output(self, output_index: int, val):
         # type: (int, Optional[IRTensor]) -> Optional[IRTensor]
@@ -282,9 +298,9 @@ class IRCell:
             # set output value dtype
             val.dtype = self._dtype
 
-        l = list(self._outputs)
-        l[output_index] = val
-        self._outputs = tuple(l)
+        self._outputs[output_index] = val
+        self.outputs.cache_clear()
+
         return val
 
     def add_predecessor(self, input_index: int, cell):
@@ -354,7 +370,7 @@ class IRCell:
         """
         all_outputs = list()
         for cell in cells:
-            all_outputs += list(cell.outputs())
+            all_outputs.extend(cell.outputs())
         inputs = list()
         for cell in cells:
             for input in cell.inputs():
@@ -375,7 +391,7 @@ class IRCell:
         """
         all_inputs = list()
         for node in cells:
-            all_inputs += list(node.inputs())
+            all_inputs.extend(node.inputs())
         outputs = list()
         for node in cells:
             for output in node.outputs():

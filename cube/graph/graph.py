@@ -380,7 +380,7 @@ class IRGraph(IRCell):
         """
         all_outputs = list()
         for node in nodes:
-            all_outputs += list(node.outputs())
+            all_outputs.extend(node.outputs())
         inputs = list()
         for cell in nodes:
             for input in cell.inputs():
@@ -405,7 +405,7 @@ class IRGraph(IRCell):
         """
         all_inputs = list()
         for node in nodes:
-            all_inputs += list(node.inputs())
+            all_inputs.extend(node.inputs())
         outputs = list()
         for node in nodes:
             for idx, output in enumerate(node.outputs()):
