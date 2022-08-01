@@ -13,7 +13,7 @@ from cube.graph.function.conv import IRConv3D
 from cube.graph.function.pad import IRPad
 from cube.graph.function.scripteinops import IRScriptEinOps
 from cube.graph.function.customops import IRCustomOps
-from cube.graph.function.creators import IROnes, IRToTensor, IRZeros
+from cube.graph.function.creators import IROnes, IRToTensor, IRZeros, IRRand, IRNewTensor
 from cube.graph.function.select import IRSelect, IRSlice
 from cube.graph.function.scatter import IRSelectScatter
 from cube.graph.function.repeat import IRRepeat
@@ -98,6 +98,30 @@ def Ones(signature,
             raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
     return IROnes(signature, size, 'ones', ir_dtype)
 
+def Rand(signature, 
+         inputs: Tuple[ List[int], Optional[int], Optional[Any], 'ErasedDevice', Optional[bool] ]):
+    # ones(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+
+    size, dtype_underlying, layout, _erased_device, pin_memory = inputs
+
+    # TODO parameters to support, currently they are all None
+    assert layout is None
+    assert pin_memory is None
+
+    if dtype_underlying is not None:
+        # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
+        # which is the underlying type of PyTorch C++ enum 'ScalarType'.
+        dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
+    else:
+        dtype = torch.get_default_dtype()
+
+    ir_dtype : IRDType = DType2IRDType.map(dtype)
+
+    for dim, i in enumerate(size):
+        if not isinstance(dim, int) and not dim >= 0:
+            raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
+    return IRRand(signature, size, 'rand', ir_dtype)
+
 def NewTensor(signature, 
               inputs: Tuple[ list, Optional[int], 'ErasedDevice', bool ]):
     # aten::tensor(t[] data, *, ScalarType? dtype=None, Device? device=None, bool requires_grad=False) -> Tensor
@@ -129,9 +153,7 @@ def NewTensor(signature,
     # and remark that originally aten::tensor should be able to infer the dtype from the specified 'data',
     # but since we have omitted the 'data', we must do type inferrence ourselves,
     # only in this way we get correct dtype e.g. ints or bools.
-    shape = list(arr.shape)
-    signature = 'torch.ones'
-    return IROnes(signature, shape, 'tensor', ir_dtype=ir_dtype)
+    return IRNewTensor(signature, data, 'tensor', ir_dtype=ir_dtype)
 
 def ToTensor(signature,
              inputs: Tuple[ IRTensor, ... ]):

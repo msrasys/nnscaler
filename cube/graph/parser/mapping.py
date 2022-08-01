@@ -85,6 +85,7 @@ class Sign2Op:
         __ttemplate('ones'): function.Ones,
         __ttemplate('tensor'): function.NewTensor,
         __ttemplate('to'): function.ToTensor,
+        __ttemplate('rand'): function.Rand,
 
         __ttemplate('add') : function.Add,
 

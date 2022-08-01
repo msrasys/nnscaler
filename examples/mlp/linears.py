@@ -47,26 +47,42 @@ class MLP(nn.Module):
         self.linear2 = nn.Linear(dim * mult, dim)
         self.linear3 = nn.Linear(dim, dim * mult)
         self.linear4 = nn.Linear(dim * mult, dim)
-        # self.linear5 = nn.Linear(dim, dim * mult)
-        # self.linear6 = nn.Linear(dim * mult, dim)
-        # self.linear7 = nn.Linear(dim, dim * mult)
-        # self.linear8 = nn.Linear(dim * mult, dim)
+        self.linear5 = nn.Linear(dim, dim * mult)
+        self.linear6 = nn.Linear(dim * mult, dim)
+        self.linear7 = nn.Linear(dim, dim * mult)
+        self.linear8 = nn.Linear(dim * mult, dim)
+        self.linear9 = nn.Linear(dim, dim * mult)
+        self.linear10 = nn.Linear(dim * mult, dim)
+        self.linear11 = nn.Linear(dim, dim * mult)
+        self.linear12 = nn.Linear(dim * mult, dim)
+        self.linear13 = nn.Linear(dim, dim * mult)
+        self.linear14 = nn.Linear(dim * mult, dim)
+        self.linear15 = nn.Linear(dim, dim * mult)
+        self.linear16 = nn.Linear(dim * mult, dim)
 
     def forward(self, data):
         output = self.linear1(data)
         output = self.linear2(output)
         output = self.linear3(output)
         output = self.linear4(output)
-        # output = self.linear5(output)
-        # output = self.linear6(output)
-        # output = self.linear7(output)
-        # output = self.linear8(output)
+        output = self.linear5(output)
+        output = self.linear6(output)
+        output = self.linear7(output)
+        output = self.linear8(output)
+        output = self.linear9(output)
+        output = self.linear10(output)
+        output = self.linear11(output)
+        output = self.linear12(output)
+        output = self.linear13(output)
+        output = self.linear14(output)
+        output = self.linear15(output)
+        output = self.linear16(output)
         loss = torch.sum(output)
         return loss
 
 
 def train():
-    batch_size = 256
+    batch_size = 128
     dim = 8192
 
     model = MLP(dim=dim)
@@ -92,7 +108,7 @@ def train():
     CudaTimer(enable=False).warmup()
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
-    iter_num = 64
+    iter_num = 500
     warmup = 20
     for step in range(iter_num):
         if step >= warmup:

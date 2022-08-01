@@ -58,3 +58,9 @@ class IRSelectScatter(IRFwOperation):
         self.output(0).shape = s2
         return True
 
+    def new(self, inputs:Tuple[IRTensor, IRTensor], outputs: List[IRTensor]):
+        op = IRSelectScatter(self.signature, inputs, self.name, self.kwargs['dim'], self.kwargs['index'])
+        assert len(outputs) == 1, "Select_scatter: too many outputs"
+        op.set_output(0, outputs[0])
+        assert op.infer_shape(), "IRSelect::new infer_shape failed"
+        return op

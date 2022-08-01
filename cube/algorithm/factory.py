@@ -73,6 +73,18 @@ class DistAlgorithmFactory:
 
         import cube.algorithm.ops.pad as pad
         self.register(pad.IRPad, pad.DimSplitPad, tag='dim')
+        
+        import cube.algorithm.ops.select as select
+        self.register(select.IRSelect, select.DimSplitSelect, tag='dim')
+        self.register(select.IRSlice, select.DimSplitSlice, tag='dim')
+        
+        import cube.algorithm.ops.scatter as scatter
+        self.register(scatter.IRSelectScatter, scatter.DimSplitScatter, tag='dim')
+        
+        import cube.algorithm.ops.creators as creators
+        self.register(creators.IRToTensor, creators.DimSplitTo, tag='dim')
+        self.register(creators.IROnes, creators.DimSplitOnes, tag='dim')
+        self.register(creators.IRRand, creators.DimSplitRand, tag='dim')
         # import cube.algorithm.ops.elementwise as elew
         # self.register(elew.ElementWise, elew.ElementWiseDimParallel, tag='dim')
         # self.register(elew.Add, elew.AddDimParallel, tag='dim')

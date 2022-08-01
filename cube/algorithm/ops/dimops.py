@@ -106,6 +106,7 @@ class DimSplitEinops(GenericDistAlgo):
             outputs = [t[nid] for t in ous]
             updated_kwargs = dict()
             if self._adim in node.kwargs and isinstance(node.kwargs[self._adim], int):
+                assert 0, "Should not happen"
                 updated_kwargs[self._adim] = node.kwargs[self._adim] // num
             sub_node: IRDimops = node.new(inputs, outputs, **updated_kwargs)
             sub_node.infer_shape()
@@ -153,8 +154,10 @@ class SimpleViewSplitEinops(GenericDistAlgo):
         assert dimo < node.output(0).ndims, f"dimension out of boundary"
         # # due to implementation limits, we only partition the first annotated dimension
         # # for inner-dimension cases.
-        self._adimi: str = node.anno.input(0).dims[dimi].identifiers[0]
-        self._adimo: str = node.anno.output(0).dims[dimo].identifiers[0]
+        idi = 1 if dimi == 0 else 0
+        ido = 1 if dimo == 0 else 0
+        self._adimi: str = node.anno.input(0).dims[dimi].identifiers[idi]
+        self._adimo: str = node.anno.output(0).dims[dimo].identifiers[ido]
         dimlen = node.anno.getlen(self._adimi)
         if dimlen < num:
             return False
