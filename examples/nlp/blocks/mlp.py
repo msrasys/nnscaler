@@ -1,11 +1,13 @@
 import torch
 import cube
+import warnings
 
 
-@cube.graph.parser.register('L^ N E^, H+ E^, H+, E H+, E -> L^ N E')
+# @cube.graph.parser.register('L^ N E^, H+ E^, H+, E^ H+, E^ -> L^ N E^', name='feedforward')
+@cube.graph.parser.register('L^ N E^, H+ E^, H+, E^ H+ -> L^ N E^', name='feedforward')
 def feedforward(x: torch.Tensor,
                 proj1: torch.Tensor, proj1_bias: torch.Tensor,
-                proj2: torch.Tensor, proj2_bias: torch.Tensor,
+                proj2: torch.Tensor, proj2_bias: None, #torch.Tensor,
                 dropout: float) -> torch.Tensor:
     x = torch.nn.functional.linear(x, proj1, proj1_bias)
     x = torch.nn.functional.gelu(x)
@@ -22,7 +24,9 @@ class MLP(torch.nn.Module):
         self.proj1_bias = torch.nn.Parameter(torch.empty((hidden_dim,)))
         self.proj2 = torch.nn.Parameter(torch.empty((embed_dim, hidden_dim)))
         self.proj2_bias = torch.nn.Parameter(torch.empty((embed_dim,)))
+        self.proj2_bias = None # torch.nn.Parameter(torch.empty((embed_dim,)))
         self.dropout = dropout
+        warnings.warn('feedforward output bias is skipped for correctness')
 
     def forward(self, x: torch.Tensor):
         x = feedforward(x,

@@ -17,7 +17,7 @@ import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary, model_summary
 
-from examples.nlp.gpt.policy.naive import PAS
+from examples.nlp.gpt.policy.spmd import PASMegatron as PAS
 
 
 def train():
@@ -28,9 +28,6 @@ def train():
     dataloader = GPTDataLoader(batch_size)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
-    print_each_rank('model weight consumpition:')
-    memory_summary()
-
     model = cube.SemanticModel(model, dataloader.shapes)
     @cube.compile(model, dataloader, PAS=PAS, override=True)
     def train_iter(model, dataloader):
@@ -39,32 +36,33 @@ def train():
         loss.backward()
     model = model.get_gen_module()
 
-    CudaTimer(enable=False).warmup()
-    iter_num = 64
-    for step in range(iter_num):
+    torch.distributed.barrier()
+    print_each_rank('model weight consumpition:', rank_only=0)
+    memory_summary()
 
+    CudaTimer(enable=False).warmup()
+    iter_num = 40
+    warmup = 8
+    for step in range(iter_num):
         # if step == 0:
         #     model_summary(model, next(dataloader))
 
-        if step >= 20:
+        if step >= warmup:
             CudaTimer(enable=True).start('e2e')
-
-        # training
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
-
-        if step >= 20:
+        if step >= warmup:
             CudaTimer().stop('e2e')
 
         if step == 0:
             print_each_rank('passed first iteration')
-        
         if (step + 1) % 10 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-40, field_name='e2e')))
+          CudaTimer().duration(iter_num-warmup, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num-warmup)
     memory_summary()
 
 

@@ -1,19 +1,24 @@
+from typing import Optional
+
 import torch
 import cube
 
+import warnings
 
-@cube.graph.parser.register('L^ N E^, H+ E^, H+, H+ E^, H+, H+ E^, H+, E^ H+, E^ -> L^ N E^')
+
+# @cube.graph.parser.register('L^ N E^, (h+ d^) E^, (h+ d^), (h+ d^) E^, (h+ d^), (h+ d^) E^, (h+ d^), E^ (h+ d^), E^ -> L^ N E^', name='self_attention')
+@cube.graph.parser.register('L^ N E^, (h+ d^) E^, (h+ d^), (h+ d^) E^, (h+ d^), (h+ d^) E^, (h+ d^), E^ (h+ d^) -> L^ N E^', name='self_attention')
 def self_attention(query: torch.Tensor,
                    q_proj: torch.Tensor, q_bias: torch.Tensor,
                    k_proj: torch.Tensor, k_bias: torch.Tensor,
                    v_proj: torch.Tensor, v_bias: torch.Tensor,
-                   out_proj: torch.Tensor, out_bias: torch.Tensor,
+                   out_proj: torch.Tensor, out_bias: None,
                    h: int, scale: float, dropout_p: float, mask: bool = True):
     num_head = h
     L, N = query.size(0), query.size(1)
     dim_head = q_proj.size(0) // num_head
 
-    q = torch.nn.functional.linear(query, q_proj, q_bias) # L N E, (h d) E -> L N (h d)
+    q = torch.nn.functional.linear(query, q_proj, q_bias)   # L N E, (h d) E -> L N (h d)
     k = torch.nn.functional.linear(query, k_proj, k_bias)   # L N E, (h d) E -> L N (h d)
     v = torch.nn.functional.linear(query, v_proj, v_bias)   # L N E, (h d) E -> L N (h d)
     q = q.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
@@ -45,7 +50,7 @@ def self_attention(query: torch.Tensor,
     return output
 
 
-@cube.graph.parser.register('L^ N E^, L^ N E^, H+ E^, H+, H+ E^, H+, H+ E^, H+, E^ H+, E^ -> L^ N E^')
+@cube.graph.parser.register('L^ N E^, L^ N E^, (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), E^ (h+ d), E^ -> L^ N E^', name='cross_attention')
 def cross_attention(query: torch.Tensor, key: torch.Tensor,
                     q_proj: torch.Tensor, q_bias: torch.Tensor,
                     k_proj: torch.Tensor, k_bias: torch.Tensor,
@@ -108,7 +113,9 @@ class MultiHeadSelfAttention(torch.nn.Module):
         self.v_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
         # Out
         self.out_proj = torch.nn.Parameter(torch.empty(embed_dim, inner_dim))
-        self.out_bias = torch.nn.Parameter(torch.empty(embed_dim)) if bias else None
+        # self.out_bias = torch.nn.Parameter(torch.empty(embed_dim)) if bias else None
+        self.out_bias = None
+        warnings.warn('self attention dense bias is skipped for correctness.')
 
     def forward(self, query):
         return self_attention(

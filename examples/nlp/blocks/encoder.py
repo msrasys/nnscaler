@@ -1,7 +1,6 @@
 import torch
 from examples.nlp.blocks.attention import MultiHeadSelfAttention
 from examples.nlp.blocks.mlp import MLP
-import warnings
 
 
 class EncoderLayer(torch.nn.Module):
@@ -17,18 +16,17 @@ class EncoderLayer(torch.nn.Module):
         self.dropout = torch.nn.Dropout(p=dropout)
         self.mlp = MLP(embed_dim, ffn_hidden_dim, activation_dropout)
         self.final_layer_norm = torch.nn.LayerNorm(embed_dim)
-        warnings.warn('residual is disabled in encoder block')
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.self_attn_layer_norm(x)
         x = self.self_attn(x)
         x = self.dropout(x)
-        # x = x + residual
+        x = x + residual
 
         residual = x
         x = self.final_layer_norm(x)
         x = self.mlp(x)
         x = self.dropout(x)
-        # x = x + residual
+        x = x + residual
         return x
