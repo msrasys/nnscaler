@@ -20,8 +20,8 @@ class CompProfiler:
 
     @staticmethod
     def profile(func: Callable, shapes: Shapes, dtypes: DTypes,
-                warmup_sec: float = 2, prof_times: int = 50, backward = True,
-                **kwargs):
+                warmup_sec: float = 2, prof_times: int = 50,
+                **kwargs) -> Tuple[float, float, int]:
         """
         Profile a function
 
@@ -30,10 +30,11 @@ class CompProfiler:
         @param dtypes Optional[Tuple[torch.dtype]]: the dtype of each input tensor. Default will use torch.float32
         @param warmup_sec float: warmup seconds
         @param prof_times int: profile times
-        @param backward bool: whether profile backward times. Default true.
         @param kwargs Dict: other keyword argument for func call.
 
-        @return span float: the time in milliseconds for forward (+backward) time
+        @return fw_span float: the time in milliseconds for forward time
+        @return bw_span float: the time in milliseconds for backward time
+        @return memory int: the peak memory in bytes after forward
         """
         assert len(shapes) == len(dtypes), \
             f"func {func.__name__}: expected each shape has a corresponding dtype, but got {shapes} and {dtypes}"
@@ -49,28 +50,46 @@ class CompProfiler:
             f"{func.__name__}: require all the outputs to be tensors"
         grads = tuple(torch.zeros_like(otensor) for otensor in outputs)
 
+        def run_step(func, tensors, kwargs, backward: bool):
+            outputs = func(*tensors, **kwargs)
+            if backward:
+                torch.autograd.backward(outputs, grads)
+            return outputs
+
         # warmup
         tic = time.time()
         while time.time() - tic < warmup_sec:
-            # forward
-            outputs = func(*tensors, **kwargs)
-            # backward
-            if backward:
-                torch.autograd.backward(outputs, grads)
-        
-        # profile forward
+            run_step(func, tensors, kwargs, backward=True)
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        mtic = torch.cuda.max_memory_allocated()  # in bytes
+        outs = run_step(func, tensors, kwargs, backward=False)
+        mtoc = torch.cuda.max_memory_allocated()  # in bytes
+        memory = mtoc - mtic
+
+        # profile forward only
         torch.cuda.synchronize()
         tic = time.perf_counter()
         for _ in range(prof_times):
-            # forward
-            outputs = func(*tensors, **kwargs)
-            # backward
-            if backward:
-                torch.autograd.backward(outputs, grads)
+            with torch.no_grad():
+                run_step(func, tensors, kwargs, backward=False)
         torch.cuda.synchronize()
         toc = time.perf_counter()
-        span = (toc - tic) / prof_times * 1000 # in milliseconds
-        return span
+        fw_span = (toc - tic) / prof_times * 1000 # in milliseconds
+
+        # profile forward + backward
+        torch.cuda.synchronize()
+        tic = time.perf_counter()
+        for _ in range(prof_times):
+            run_step(func, tensors, kwargs, backward=True)
+        torch.cuda.synchronize()
+        toc = time.perf_counter()
+        fwbw_span = (toc - tic) / prof_times * 1000 # in milliseconds
+        bw_span = fwbw_span - fw_span
+
+        return fw_span, bw_span, memory
 
 
 class ProfileDataBase:
@@ -84,8 +103,7 @@ class ProfileDataBase:
         if filename is not None:
             self.load(filename)
 
-    def profile(self, func: Callable, shapes: Shapes, dtypes: DTypes,
-                backward=True, **kwargs):
+    def profile(self, func: Callable, shapes: Shapes, dtypes: DTypes, **kwargs):
         """!
         Profile the function and log into the database
 
@@ -97,22 +115,22 @@ class ProfileDataBase:
         """
         try:
             assert callable(func), "func should be callable"
-            span = CompProfiler.profile(func, shapes, dtypes, backward=backward, **kwargs)
+            fw_span, bw_span, memory = CompProfiler.profile(func, shapes, dtypes, **kwargs)
             name = func.__name__
             key = self.serialize(shapes, dtypes)
-            self.log(name, key, span)
-            print(f'profiled {func.__name__} | shapes: {shapes} | dtypes: {dtypes} => span: {round(span, 2)} ms')
+            self.log(name, key, fw_span, bw_span, memory)
+            print(f'profiled {func.__name__} | shapes: {shapes} | dtypes: {dtypes} => fw: {round(fw_span, 2)} ms | bw: {round(bw_span, 2)} | mem: {memory}')
         except Exception as e:
             print(f'fail to profile {func.__name__}: reason: {str(e)}')
 
-    def log(self, name: str, key: str, span: float):
+    def log(self, name: str, key: str, fw_span: float, bw_span: float, memory: float):
         """
         log the span of a function name with key 
         """
-        assert isinstance(name, str) and isinstance(span, float) and isinstance(key, str)
+        assert isinstance(name, str) and isinstance(key, str)
         if name not in self._data:
             self._data[name] = dict()
-        self._data[name][key] = span
+        self._data[name][key] = (fw_span, bw_span, memory)
 
     def query(self, func: NameOrFunc, shapes: Shapes, dtypes: DTypes) -> float:
         """!
@@ -122,7 +140,7 @@ class ProfileDataBase:
         @param shapes Tuple[Tuple[int]]: the shape of each input tensor
         @param dtypes Tuple[torch.dtype]: the dtype of each tensor
 
-        @return span float: the performance number
+        @return (fw_span, bw_span, mem) (float, float, int): the performance number
         """
         name = func if isinstance(func, str) else func.__name__
         key = self.serialize(shapes, dtypes)
@@ -249,14 +267,14 @@ if __name__ == '__main__':
     #   [shapes, dtypes, kwargs],
     # ]
     funcs = {
+        torch.nn.functional.gelu: [
+            [((1024, 8, 2304),), (dtype,), {}]
+        ],
+
         torch.nn.functional.linear: [
             [([1024, 1, 2304], [2304, 2304]), (dtype, dtype), {}],
             [([1024, 4, 2304], [2304, 2304]), (dtype, dtype), {}],
             [([1024, 8, 2304], [2304, 2304]), (dtype, dtype), {}]
-        ],
-    
-        torch.nn.functional.gelu: [
-            [((1024, 8, 2304),), (dtype,), {}]
         ],
     
         torch.nn.functional.softmax: [
@@ -266,7 +284,7 @@ if __name__ == '__main__':
     
     for func, keys in funcs.items():
         for shapes, dtypes, kwargs in keys:
-            db.profile(func, shapes, dtypes, backward=True, **kwargs)
+            db.profile(func, shapes, dtypes, **kwargs)
     
     db.dump(args.export, override=True)
 
