@@ -40,12 +40,6 @@ class ExecutionPlan:
                     nodes.remove(fnode.mirror)
                     self.at(devid)[bidx] = fnode_dev.mirror
 
-        # TODO: adapter support for return consistency
-        for output in graph.outputs():
-            for devid in self.devices():
-                ptensors = [pt for pt in output.parent.ptensors if pt == output and devid in pt.device]
-                assert len(ptensors) >= 1, f"Missing full graph output tensor {output} in device {devid}"
-
     @property
     def graph(self) -> IRGraph:
         return self._graph

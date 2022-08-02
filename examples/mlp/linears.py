@@ -41,43 +41,20 @@ else:
 # =================== Semantic Model Description ====================
 
 class MLP(nn.Module):
-    def __init__(self, dim, mult=1):
+    def __init__(self, dim, mult=1, nlayers=4):
         super().__init__()
-        self.linear1 = nn.Linear(dim, dim * mult)
-        self.linear2 = nn.Linear(dim * mult, dim)
-        self.linear3 = nn.Linear(dim, dim * mult)
-        self.linear4 = nn.Linear(dim * mult, dim)
-        self.linear5 = nn.Linear(dim, dim * mult)
-        self.linear6 = nn.Linear(dim * mult, dim)
-        self.linear7 = nn.Linear(dim, dim * mult)
-        self.linear8 = nn.Linear(dim * mult, dim)
-        self.linear9 = nn.Linear(dim, dim * mult)
-        self.linear10 = nn.Linear(dim * mult, dim)
-        self.linear11 = nn.Linear(dim, dim * mult)
-        self.linear12 = nn.Linear(dim * mult, dim)
-        self.linear13 = nn.Linear(dim, dim * mult)
-        self.linear14 = nn.Linear(dim * mult, dim)
-        self.linear15 = nn.Linear(dim, dim * mult)
-        self.linear16 = nn.Linear(dim * mult, dim)
+        self.layers = torch.nn.ModuleList([])
+        for lid in range(nlayers):
+            if lid % 2 == 0:
+                self.layers.append(nn.Linear(dim, dim * mult))
+            else:
+                self.layers.append(nn.Linear(dim * mult, dim))
 
     def forward(self, data):
-        output = self.linear1(data)
-        output = self.linear2(output)
-        output = self.linear3(output)
-        output = self.linear4(output)
-        output = self.linear5(output)
-        output = self.linear6(output)
-        output = self.linear7(output)
-        output = self.linear8(output)
-        output = self.linear9(output)
-        output = self.linear10(output)
-        output = self.linear11(output)
-        output = self.linear12(output)
-        output = self.linear13(output)
-        output = self.linear14(output)
-        output = self.linear15(output)
-        output = self.linear16(output)
-        loss = torch.sum(output)
+        x = data
+        for layer in self.layers:
+            x = layer(x)
+        loss = torch.sum(x)
         return loss
 
 
@@ -108,8 +85,8 @@ def train():
     CudaTimer(enable=False).warmup()
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
-    iter_num = 500
-    warmup = 20
+    iter_num = 32
+    warmup = 8
     for step in range(iter_num):
         if step >= warmup:
             CudaTimer(enable=True).start('e2e')

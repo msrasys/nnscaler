@@ -106,7 +106,6 @@ class DimSplitEinops(GenericDistAlgo):
             outputs = [t[nid] for t in ous]
             updated_kwargs = dict()
             if self._adim in node.kwargs and isinstance(node.kwargs[self._adim], int):
-                assert 0, "Should not happen"
                 updated_kwargs[self._adim] = node.kwargs[self._adim] // num
             sub_node: IRDimops = node.new(inputs, outputs, **updated_kwargs)
             sub_node.infer_shape()

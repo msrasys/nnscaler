@@ -3,6 +3,7 @@ import warnings
 import copy
 
 from cube.graph.graph import IRGraph
+from cube.graph.function import Identity
 from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
 from cube.ir.adapter import IRAdapter, IRWeightReducer
 
@@ -31,6 +32,19 @@ class IRAdapterGener:
         Returns:
             graph (IRGraph)
         """
+        # insert identity operator for graph output
+        devs = set()
+        for node in graph.nodes():
+            devs.update(node.device)
+        outputs = [otensor for otensor in graph.outputs() if isinstance(otensor, IRSubTensor)]
+        all_identities = []
+        for otensor in outputs:
+            identity = Identity('', [otensor])
+            graph.attach(identity, len(graph.nodes()))
+            identites = graph.replicate(identity, times=len(devs))
+            all_identities += identites
+            for devid, identity in zip(devs, identites):
+                graph.assign(identity, devid)
         # update the gradient before generate adapter
         for node in graph.nodes():
             if isinstance(node, IRBpOperation):
@@ -39,7 +53,9 @@ class IRAdapterGener:
                 graph.attach(node, idx)
         graph = IRAdapterGener.gen_activation(graph)
         graph = IRAdapterGener.gen_weight(graph)
-        # TODO: generate adapter for graph outputs
+        # remove inserted identity
+        for identity in all_identities:
+            graph.detach(identity)
         return graph
 
     @staticmethod
