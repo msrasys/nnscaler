@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Any
 from cube.algorithm.generics import GenericDistAlgo
 
 from cube.graph.function.dimops import IRDimops, DimAnno
@@ -6,14 +6,28 @@ from cube.ir.tensor import IRSubTensor
 
 
 class DimSplitEinops(GenericDistAlgo):
-    """
-    split Einops at dimension level.
+    """!
+    Split Dimops at tensor dimension.
 
-    The sum-reduce dimension and non-reduce dimension can be splitted.
+    Note: for dimensions of multiple identitifers, only the first identifier
+    can be partitioned.
 
-    For sum-reduce dimension, the output keeps same shape but has partial-sum valmap result.
-    For non-reduce dimension, the output keeps same valmap but has partial output shape.
-    For stay-reduce dimension, this dimension is not allowed to be splitted.
+    Rules for identifier split:
+        * Sum-reduce identifier ('+'):
+            * For inputs/outputs that have the identifier, will be partitioned on its diemension uniformly..
+            * For inputs that don't have the identifier, will be replicated
+            * For outputs that don't have the identifier, will be partitioned on its value uniformly.
+
+        * Spatial identifier (''):
+            * For inputs/outputs that have the identifier, will be partitioned on its diemnsion uniformly.
+            * For inputs/outputs that don't have the identifier, will be replicated
+
+        * Frozen identifier ('^'):
+            * Cannot be partitioned.
+        
+        Non-tensor will always be replicated.
+    
+    Note this rule will not correctly apply for some operators like linear: xw + b
     """
 
     def __init__(self, node: IRDimops):
@@ -42,8 +56,7 @@ class DimSplitEinops(GenericDistAlgo):
         assert isinstance(node.input(idx), IRSubTensor), f"partitioning on a non-tensor input"
         dim = dim if dim >= 0 else dim + node.input(idx).ndims
         assert dim < node.input(idx).ndims, f"dimension output of boundary: {dim} >= {node.input(idx).ndims}"
-        # due to implementation limits, we only partition the first annotated dimension
-        # for inner-dimension cases.
+        # we only partition the first annotated dimension for inner-dimension cases.
         self._adim: str = node.anno.input(idx).dims[dim].identifiers[0]
         self._reduce: DimAnno.ReduceType = node.anno.input(idx).dims[dim].reduces[0]
         dimlen = node.anno.getlen(self._adim)
@@ -61,44 +74,30 @@ class DimSplitEinops(GenericDistAlgo):
         if not satisfy:
             return None
 
+        def transform(tensor: Any, split_dims: List[int], is_input: bool):
+            # rule: non-tensor will always be replicated
+            if not isinstance(tensor, IRSubTensor):
+                return [tensor] * num
+            assert len(split_dims) <= 1, "find split dims ({self._adim}) more than 1"
+            # rule: spatial identifier ('')
+            if self._reduce == DimAnno.ReduceType.Dim:
+                return tensor.replicate(num) if len(split_dims) == 0 else tensor.split_dim(split_dims[0], num)
+            # rule: reduce-sum identifier ('+')
+            if self._reduce == DimAnno.ReduceType.Sum:
+                if len(split_dims) == 0:
+                    return tensor.replicate(num) if is_input else tensor.split_val(num)
+                else:
+                    return tensor.split_dim(split_dims[0], num)
+            raise RuntimeError(f"no matching reduce type for transform: {self._reduce}")
+
         ins, ous = list(), list()
         for iidx, itensor in enumerate(node.inputs()):
-            if not isinstance(itensor, IRSubTensor):
-                ins.append([itensor] * num)
-                continue
-            shape_anno = node.anno.input(iidx)
-            split_dims = shape_anno.getdims(self._adim)
-            assert len(split_dims) <= 1, f"find split dims ({self._adim}) more than 1: {shape_anno}"
-            if len(split_dims) == 1:
-                dim = split_dims[0]
-                # split axis
-                ins.append(itensor.split_dim(dim, num))
-            else:
-                # replicate if no split dimension of this tensor
-                # ins.append([itensor] * num)
-                # ad-hoc FIXME: for linear function Ax+b of splitting reduction dimension, b should
-                # be splitted by value dimension.
-                if self._reduce == DimAnno.ReduceType.Sum:
-                    ins.append(itensor.split_val(num))
-                else:
-                    ins.append(itensor.replicate(num))
+            split_dims = node.anno.input(iidx).getdims(self._adim)
+            ins.append(transform(itensor, split_dims, is_input=True))
 
         for oidx, otensor in enumerate(node.outputs()):
-            if not isinstance(otensor, IRSubTensor):
-                ous.append([otensor] * num)
-                continue
-            shape_anno = node.anno.output(oidx)
-            split_dims = shape_anno.getdims(self._adim)
-            assert len(split_dims) <= 1, f"find split dims ({self._adim}) more than 1: {shape_anno}"
-            # split axis
-            if self._reduce == DimAnno.ReduceType.Dim:
-                assert len(split_dims) == 1, f"expect only one spatial dimension in output tensor but got {len(split_dims)}"
-                dim = split_dims[0]
-                ous.append(otensor.split_dim(dim, num))
-            # split numerical dimension
-            else:
-                assert len(split_dims) == 0, f"expect no numerical dimension in output tensor but got {len(split_dims)}"
-                ous.append(otensor.split_val(num))
+            split_dims = node.anno.output(oidx).getdims(self._adim)
+            ous.append(transform(otensor, split_dims, is_input=False))
 
         sub_nodes = list()
         for nid in range(num):
@@ -110,6 +109,7 @@ class DimSplitEinops(GenericDistAlgo):
             sub_node: IRDimops = node.new(inputs, outputs, **updated_kwargs)
             sub_node.infer_shape()
             sub_nodes.append(sub_node)
+
         return sub_nodes
 
 

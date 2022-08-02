@@ -494,7 +494,7 @@ class IRDimops(IRFwOperation):
             raise RuntimeError(
                 f"no matching anno for given annos."
                 f"op: {signature}\n"
-                f"inputs: {inputs}\n"
+                f"inputs: {tuple(t.shape for t in inputs)}\n"
                 f"annos: {annos}\n"
             )
 

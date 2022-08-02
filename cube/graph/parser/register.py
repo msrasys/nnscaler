@@ -31,7 +31,8 @@ def register(anno: str, name: Optional[str] = None):
     def decorator(fn: Callable):
         if not callable(fn):
             raise TypeError("Expected a function")
-        fsig = fn.__name__ if name is None else name
+        fsig = fn.__name__
+        op_name = name if name is not None else fsig
         args = inspect.signature(fn)
         arg_names = list(args.parameters.keys())
         arg_kind = [args.parameters[name].annotation for name in arg_names]
@@ -48,7 +49,7 @@ def register(anno: str, name: Optional[str] = None):
             kwargs = dict()
             for name, val in zip(kwarg_names, kwarg_vals):
                 kwargs[name] = val
-            return IRDimops(signature, [anno], tensors, **kwargs, name=fsig)
+            return IRDimops(signature, [anno], tensors, **kwargs, name=op_name)
 
         print(f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
         Sign2Op.register(fsig, udfop, code)
