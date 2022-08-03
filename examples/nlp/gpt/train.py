@@ -2,7 +2,7 @@
 example:
 
 OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=1 \
+    --nproc_per_node=4 \
     --nnodes=1 \
     examples/nlp/gpt/train.py
 """
@@ -17,7 +17,7 @@ import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary, model_summary
 
-from examples.nlp.gpt.policy.spmd import PASMegatron as PAS
+from examples.nlp.gpt.policy.mpmd import PASRoundRobin as PAS
 
 
 def train():

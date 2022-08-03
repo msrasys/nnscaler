@@ -115,7 +115,8 @@ class MultiHeadSelfAttention(torch.nn.Module):
         self.out_proj = torch.nn.Parameter(torch.empty(embed_dim, inner_dim))
         # self.out_bias = torch.nn.Parameter(torch.empty(embed_dim)) if bias else None
         self.out_bias = None
-        warnings.warn('self attention dense bias is skipped for correctness.')
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            warnings.warn('self attention dense bias is skipped for correctness.')
 
     def forward(self, query):
         return self_attention(

@@ -26,7 +26,8 @@ class MLP(torch.nn.Module):
         self.proj2_bias = torch.nn.Parameter(torch.empty((embed_dim,)))
         self.proj2_bias = None # torch.nn.Parameter(torch.empty((embed_dim,)))
         self.dropout = dropout
-        warnings.warn('feedforward output bias is skipped for correctness')
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            warnings.warn('feedforward output bias is skipped for correctness')
 
     def forward(self, x: torch.Tensor):
         x = feedforward(x,
