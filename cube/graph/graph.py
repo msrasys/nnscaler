@@ -446,7 +446,7 @@ class IRGraph(IRCell):
                 if isinstance(ftensor, IRFullTensor):
                     producers[ftensor] = node
         for ftensor, cnodes in consumers.items():
-            if len(cnodes) == 1: continue
+            if len(cnodes) == 1 or ftensor.is_param(): continue
             itensors = [ftensor.like() for _ in range(len(cnodes))]
             for itensor, consumer in zip(itensors, cnodes):
                 while ftensor in consumer.inputs():
@@ -458,6 +458,7 @@ class IRGraph(IRCell):
                 multiref.set_output(idx, itensor)
             multiref.infer_shape()
             idx = nodes.index(producers[ftensor]) + 1 if ftensor in producers else 0
+            # idx = nodes.index(cnodes[0])
             nodes.insert(idx, multiref)
         
         # instantiate graph inputs / outputs
@@ -698,6 +699,89 @@ class IRGraph(IRCell):
                     return True
             return False
 
+    def depends(self, pre_node: IRCell, post_node: IRCell) -> bool:
+        """!
+        Check whether pre_node has dataflow dependency on post_node:
+            pre_node -> post_node
+
+        @param pre_node: the happen before node
+        @param post_node: the happen after node
+
+        @return ret bool: True if post_node depends on pre_node on dataflow, otherwise False.
+        """
+        itensors = [t for t in post_node.inputs() if isinstance(t, IRSubTensor)]
+        for otensor in pre_node.outputs():
+            if not isinstance(otensor, IRSubTensor): continue
+            for itensor in itensors:
+                if otensor.overlap(itensor):
+                    return True
+        return False
+
+    def schedule(self, node1: IRCell, action: str, node2: IRCell) -> bool:
+        """!
+        Schedule node1 and node2 based on the action
+
+        The node2 will keep unchanged in the sequence and schedule will perform
+        on node1.
+
+        @param node1 IRCell
+        @param node2 IRCell
+        @param action str:
+            'after': fixed node2 and schedule node1 after node2 in the sequence.
+            'before': fixed node2 and schedule node1 before node2 in the sequence.
+        
+        @return success bool: True if the scheduling success otherwise False.
+        """
+        idx1 = self._nodes.index(node1)
+        idx2 = self._nodes.index(node2)
+        # node2 -> node1
+        if action == 'after':
+            if idx2 < idx1:
+                return True
+            for idx in range(idx1+1, idx2+1):
+                if self.depends(node1, self._nodes[idx]):
+                    return False
+            self.detach(node1)
+            self.attach(node1, idx2)
+            return True
+        # node1 -> node2
+        if action  == 'before':
+            if idx1 < idx2:
+                return True
+            for idx in range(idx2, idx1):
+                if self.depends(self._nodes[idx], node1):
+                    return False
+            self.detach(node1)
+            self.attach(node2, idx2)
+            return True
+        raise KeyError(f"Unknown scheduling action {action}")
+                
+    @staticmethod
+    def legal_schedule(seq: List[IRCell], integrity_check=False):
+        """
+        Check whether seq satisfies topological order.
+
+        @note: this functionality is not enabled due to predecessor and succesor
+        functionality.
+        
+        @param seq List[IRCell]: the nodes in scheudled order
+        @param integrity_check bool:
+                If true, performs additional integrity check that requires
+                all the nodes in predecessor and successor of a node should
+                appear in the sequence.
+        
+        @return valid bool: True for satisfying topo order, otherwise False.
+        """
+        for index, node in enumerate(seq):
+            for pre in node.predecessors():
+                if pre in seq:
+                    pre_idx = seq.index(pre)
+                    if pre_idx >= index:
+                        return False
+                elif integrity_check:
+                    return False
+        return True
+
     def add_schedule(self, nodes: List[IRCell]) -> bool:
         """
         Add node happen before dependencies according to nodes list order
@@ -716,6 +800,9 @@ class IRGraph(IRCell):
             post.add_predecessor(input_index=-1, cell=prev)
         return True
 
+
+    # ================= Other optimizations ==================
+
     def recompute(self, nodes: List[IRFwOperation]) -> bool:
         """!
         Recompute a set of nodes. The forward nodes will be assigned with a unique
@@ -729,90 +816,6 @@ class IRGraph(IRCell):
         recompute_group_id = IDGenerator().gen_cell_id()
         for fnode in nodes:
             fnode.recompute = recompute_group_id
-        return True
-
-    def set_order(self, seq: List[IRCell]):
-        """
-        Set a topological order for IRGraph, which requires seq:
-
-        1). The set of nodes in seq must be same with this IRGraph
-        2). Staisfies topological order
-
-        Returns:
-            True if set succesfully, False not.
-        """
-        for node in seq:
-            if node not in self.nodes():
-                return False
-        if len(seq) != len(self.nodes()):
-            return False
-        if not IRGraph.check_legal_order(seq, integrity_check=True):
-            return False
-        self._nodes = seq
-        return True
-
-    def partial_set_order(self, seq: List[IRCell], eager=True):
-        """
-        Set a partial topological order for IRGrah.
-        The remaining nodes will be automatically inserted to
-        make the full legal sequence.
-
-        In most of the cases, `eager=True` has better performance.
-
-        Args:
-            seq: partial scheduling sequence
-            eager (default True):
-                if True, the remaining nodes are inserted once it is ready
-                if Flase, the remaining nodes are inserted only when it is needed.
-        
-        Returns:
-            True if set succesfully, False not.
-        """
-        seq = copy.copy(seq)
-        for node in seq:
-            if node not in self.nodes():
-                return False
-        if not IRGraph.check_legal_order(seq, integrity_check=False):
-            return False
-        remain: List[IRCell] = [node for node in self.nodes() if node not in seq]
-        for node in remain:
-            if eager:
-                pre_indices = [seq.index(pre) for pre in node.predecessors()]
-                if len(pre_indices) == 0:
-                    index = 0
-                else:
-                    index = max(pre_indices) + 1
-            else:
-                suc_indices = [seq.index[suc] for suc in node.successors()]
-                index = min(suc_indices)
-            seq.insert(index, node)
-        self._nodes = seq
-        return True
-
-    @staticmethod
-    def check_legal_order(seq: List[IRCell], integrity_check=False):
-        """
-        Check whether seq satisfies topological order.
-        
-        Args:
-            seq: List of IRCell
-            integrity_check:
-                If true, performs additional integrity check that requires
-                all the SUs in predecessor and successor of a SU should
-                appear in the sequence.
-        
-        Returns:
-            Boolean: True for satisfying topo order, otherwise False.
-        """
-        #TODO: check no new operators are created (including replicate)
-        for index, node in enumerate(seq):
-            for pre in node.predecessors():
-                if pre in seq:
-                    pre_idx = seq.index(pre)
-                    if pre_idx >= index:
-                        return False
-                elif integrity_check:
-                    return False
         return True
 
     def __repr__(self):
