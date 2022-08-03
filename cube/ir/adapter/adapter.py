@@ -110,8 +110,8 @@ class IRAdapter(IRCell):
                 outputs.append(otensor)
         # insert identity prims
         if len(prims) == 0:
-            assert len(inputs) == len(outputs) and all(itensor in outputs for itensor in inputs), \
-                "input/output tensor not match for empty prims"
+            assert all(otensor in inputs for otensor in outputs), \
+                "output tensor not apear in input tensors for empty prims"
             for itensor in inputs:
                 prims.append(IdentityPrim(itensor))
         # dispatch
@@ -126,6 +126,26 @@ class IRAdapter(IRCell):
             badapter = self.mirror.dispatch(devid, for_mirror=False)
             IRCell.make_pair(fadapter, badapter)
         return fadapter
+
+    @staticmethod
+    def merge(adapters: List):
+        """!
+        Merge adapters to one adapter
+        """
+        adapters : List[IRAdapter] = adapters
+        assert all(isinstance(n, IRAdapter) for n in adapters)
+        # TODO: check recompute consistency
+        itensors = []
+        otensors = []
+        prims = []
+        for adapter in adapters:
+            itensors += adapter.inputs()
+            otensors += adapter.outputs()
+            prims += adapter.prims
+        adapter = IRAdapter(itensors, otensors)
+        adapter.prims = prims
+        return adapter
+
 
     def __repr__(self):
         return f'Adapter-{self._id}{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
