@@ -12,7 +12,7 @@ class Config:
 
     # 340 M model
     embed_dim = 1024
-    layers = 8 # 24
+    layers = 4 # 24
     attention_heads = 16
 
     # 1.3 B model

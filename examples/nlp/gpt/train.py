@@ -17,7 +17,7 @@ import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary, model_summary
 
-from examples.nlp.gpt.policy.mpmd import PASRoundRobin as PAS
+from examples.nlp.gpt.policy.mpmd import PASMegatron as PAS
 
 
 def train():

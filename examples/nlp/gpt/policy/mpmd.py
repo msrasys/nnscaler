@@ -3,6 +3,7 @@ import numpy as np
 
 from cube.graph import IRGraph
 from cube.graph.function.anchor import IRGraphAnchor
+from cube.ir.cten import IRCell
 from cube.ir.operator import IRDataOperation, IRFwOperation
 from cube.graph.schedule.sched1f1b import IRSchedule1F1B
 
@@ -35,12 +36,7 @@ def _create_mesh(ngpus: int, group_num: Tuple[int]) -> Tuple[Tuple[Tuple[int]]]:
     return tuple(outputs)
 
 
-def PASRoundRobin(graph: IRGraph, resource):
-    """
-    roundrobin scheduling
-    """
-    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
-    
+def _group_to_transformers(fnodes) -> List[List[IRCell]]:
     # group to transformer layers
     transformers: List[List[IRFwOperation]] = []
     anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
@@ -54,6 +50,36 @@ def PASRoundRobin(graph: IRGraph, resource):
         if transformers[lid][-1].name == 'multiref':
             node = transformers[lid].pop()
             transformers[lid+1].insert(0, node)
+    return transformers
+
+# ========================= parallelisms =================================
+
+# tensor parallelism
+def _tp(graph: IRGraph, node: IRFwOperation, devs: List[int], **configs):
+    algo = node.algorithms('dim')
+    sub_nodes = graph.partition(node, algo, **configs)
+    assert sub_nodes is not None
+    for devid, sub_node in zip(devs, sub_nodes):
+        graph.assign(sub_node, devid)
+    return sub_nodes
+
+# replicate
+def _replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
+    sub_nodes = graph.replicate(node, times=len(devs))
+    for devid, sub_node in zip(devs, sub_nodes):
+        graph.assign(sub_node, devid)
+    return sub_nodes
+
+# ========================= parallelisms =================================
+
+def PASRoundRobin(graph: IRGraph, resource):
+    """
+    roundrobin scheduling
+    """
+    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
+    
+    # group to transformer layers
+    transformers = _group_to_transformers(fnodes)
     
     for lid, transformer in enumerate(transformers):
         stage_id = lid % resource.ngpus
@@ -64,8 +90,7 @@ def PASRoundRobin(graph: IRGraph, resource):
     for node in graph.nodes():
         if len(node.device) == 0:
             graph.assign(node, 0)
-    
-    # print(graph.extra_repr())
+
     return graph
 
 
@@ -74,24 +99,13 @@ def PAS1F1B(graph: IRGraph, resource):
     1F1B scheduling
     """
     num_stage = resource.ngpus
-    num_microbatch = resource.ngpus
+    num_microbatch = resource.ngpus * 8
     _, stage_mesh = _create_mesh(resource.ngpus, (num_stage, 1))
 
     fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
     
     # group to transformer layers
-    transformers: List[List[IRFwOperation]] = []
-    anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
-    indices = [fnodes.index(anchor) for anchor in anchors]
-    for lid, idx in enumerate(indices):
-        fnodes[idx-1].comment = f'===> start of transformer layer {lid}'
-        start = idx if lid != 0 else 0
-        end = indices[lid+1] if lid + 1 < len(anchors) else len(fnodes)
-        transformers.append(fnodes[start:end])
-    for lid in range(len(transformers) - 1):
-        if transformers[lid][-1].name == 'multiref':
-            node = transformers[lid].pop()
-            transformers[lid+1].insert(0, node)
+    transformers = _group_to_transformers(fnodes)
 
     # staging
     nlayer_per_stage = (len(transformers) // resource.ngpus)
@@ -105,6 +119,49 @@ def PAS1F1B(graph: IRGraph, resource):
         if isinstance(node, IRDataOperation):
             graph.assign(node, 0)
 
-    schedule = IRSchedule1F1B(num_microbatch, stage_mesh, recompute=False)
-    graph.schedule_plan = schedule
+    strategy = IRSchedule1F1B(graph, num_microbatch, stage_mesh)
+    graph.sched = strategy
+    return graph
+
+
+def PASMegatron(graph: IRGraph, resource):
+    """
+    1F1B scheduling
+    """
+    dp_size = 1
+    tp_size = 2
+    pp_size = resource.ngpus // (dp_size * tp_size)
+    num_microbatch = resource.ngpus
+
+    # device mesh
+    dp_groups, pp_groups, tp_groups = \
+        _create_mesh(resource.ngpus, (dp_size, pp_size, tp_size))
+    print(f'dp groups: {dp_groups}')
+    print(f'pp groups: {pp_groups}')
+    print(f'tp groups: {tp_groups}')
+
+    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
+
+    # group to transformer layers
+    transformers = _group_to_transformers(fnodes)
+
+    # staging
+    nlayer_per_stage = (len(transformers) // pp_size)
+    for lid, fnodes in enumerate(transformers):
+        sid = min(lid // nlayer_per_stage, pp_size-1)
+        print(f'assigning {lid}-th transformer layer to stage {sid}: {tp_groups[sid]}')
+        for fnode in fnodes:
+            if fnode.name == 'self_attention':
+                _tp(graph, fnode, tp_groups[sid], idx=1, dim=0, num=tp_size)
+            elif fnode.name == 'feedforward':
+                _tp(graph, fnode, tp_groups[sid], idx=1, dim=0, num=tp_size)
+            else:
+                _replica(graph, fnode, tp_groups[sid])
+    
+    for node in graph.nodes():
+        if isinstance(node, IRDataOperation):
+            _replica(graph, node, tp_groups[0])
+
+    strategy = IRSchedule1F1B(graph, num_microbatch, tp_groups)
+    graph.sched = strategy
     return graph
