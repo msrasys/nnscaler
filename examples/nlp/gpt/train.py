@@ -4,7 +4,7 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/nlp/gpt/train.py
+    examples/nlp/gpt/train.py --policy PASMegatronTP
 """
 
 
@@ -18,6 +18,31 @@ from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary, model_summary
 
 from examples.nlp.gpt.policy.mpmd import PASMegatron as PAS
+import examples.nlp.gpt.policy.spmd as spmd
+import examples.nlp.gpt.policy.mpmd as mpmd
+
+import argparse
+
+parser = argparse.ArgumentParser(description='GPT Train')
+parser.add_argument('--policy', type=str, help='PAS policy choice, starting with PAS')
+parser.add_argument('--fp16', action='store_true', default=False,
+                    help='use fp16 for the training')
+args = parser.parse_args()
+
+cube.init()
+
+PAS = None
+policies = list(spmd.__dict__.keys()) + list(mpmd.__dict__.keys())
+policies = [policy for policy in policies if policy.startswith('PAS')]
+if args.policy in spmd.__dict__:
+    PAS = spmd.__dict__[args.policy]
+    print_each_rank(f'using policy from spmd.{args.policy}')
+elif args.policy in mpmd.__dict__:
+    PAS = mpmd.__dict__[args.policy]
+    print_each_rank(f'using policy from mpmd.{args.policy}')
+else:
+    raise ValueError(f"policy {args.policy} not found. Candidates: {policies}")
+
 
 
 def train():
@@ -25,6 +50,7 @@ def train():
     batch_size = 1
 
     model = GPT()
+    model = model if not args.fp16 else model.half()
     dataloader = GPTDataLoader(batch_size)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 

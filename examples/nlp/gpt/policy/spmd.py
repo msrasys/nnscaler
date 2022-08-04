@@ -11,7 +11,7 @@ def PASSingle(graph: IRGraph, resource):
     return graph
 
 
-def PASMegatron(graph: IRGraph, resource):
+def PASMegatronTP(graph: IRGraph, resource):
     tp_size = resource.ngpus
     fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
 
