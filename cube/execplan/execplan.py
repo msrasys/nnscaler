@@ -14,7 +14,11 @@ class ExecutionPlan:
         assert isinstance(graph, IRGraph), "Expected an IRGraph"
         self._graph = graph
         self._seq: Dict[int, List[IRCell]] = dict()
-        self._inference_only = not any(isinstance(n, IRBpOperation) for n in graph.nodes())
+        self._inference_only = not any(
+             isinstance(n, IRBpOperation) or \
+            (isinstance(n, IRAdapter) and not n.forward) or \
+            (isinstance(n, IRSegment) and not n.forward) for n in graph.nodes()
+        )
 
         # execution sequence for each device  
         for node in graph.nodes():
