@@ -5,6 +5,7 @@ from typing import Any, List, Tuple, Optional
 
 from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor
+import cube.ir as ir
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.mapping import Sign2Op, DType2IRDType
 
@@ -51,11 +52,11 @@ class ScriptModuleParser:
             raise RuntimeError(f"Module {module.original_name} input shape mismatch (got {len(input_shapes)} != {len(inputs)})")
 
         # handle graph input -- Assuming all the inputs are tensors
-        kDefaultType = DType2IRDType.map(torch.get_default_dtype())
+        # kDefaultType = DType2IRDType.map(torch.get_default_dtype())
         for idx, input in enumerate(inputs):
             if isinstance(input.type(), torch._C.TensorType):
                 shape = None if input_shapes is None else input_shapes[idx]
-                dtype = kDefaultType
+                dtype = ir.IRDType.unknown # kDefaultType
                 val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.debugName())
             else:
                 raise NotImplementedError("Graph inputs only accepts Tensor")
