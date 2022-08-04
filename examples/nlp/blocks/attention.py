@@ -1,18 +1,13 @@
-from typing import Optional
-
 import torch
 import cube
 
-import warnings
 
-
-# @cube.graph.parser.register('L^ N E^, (h+ d^) E^, (h+ d^), (h+ d^) E^, (h+ d^), (h+ d^) E^, (h+ d^), E^ (h+ d^), E^ -> L^ N E^', name='self_attention')
 @cube.graph.parser.register('L^ N E^, (h+ d^) E^, (h+ d^), (h+ d^) E^, (h+ d^), (h+ d^) E^, (h+ d^), E^ (h+ d^) -> L^ N E^', name='self_attention')
 def self_attention(query: torch.Tensor,
                    q_proj: torch.Tensor, q_bias: torch.Tensor,
                    k_proj: torch.Tensor, k_bias: torch.Tensor,
                    v_proj: torch.Tensor, v_bias: torch.Tensor,
-                   out_proj: torch.Tensor, out_bias: None,
+                   out_proj: torch.Tensor,
                    h: int, scale: float, dropout_p: float, mask: bool = True):
     num_head = h
     L, N = query.size(0), query.size(1)
@@ -46,16 +41,16 @@ def self_attention(query: torch.Tensor,
     output = torch.bmm(attn, v) # (N h) L L, (N h) L d -> (N h) L d
     output = output.transpose(0, 1).contiguous()     # (N h) L d -> L (N h) d
     output = output.view(L, N, num_head * dim_head)  # (N h) L d -> L N (h d)
-    output = torch.nn.functional.linear(output, out_proj, out_bias) # L N (h d), E E  -> L N E
+    output = torch.nn.functional.linear(output, out_proj) # L N (h d), E E  -> L N E
     return output
 
 
-@cube.graph.parser.register('L^ N E^, L^ N E^, (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), E^ (h+ d), E^ -> L^ N E^', name='cross_attention')
+@cube.graph.parser.register('L^ N E^, L^ N E^, (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), E^ (h+ d) -> L^ N E^', name='cross_attention')
 def cross_attention(query: torch.Tensor, key: torch.Tensor,
                     q_proj: torch.Tensor, q_bias: torch.Tensor,
                     k_proj: torch.Tensor, k_bias: torch.Tensor,
                     v_proj: torch.Tensor, v_bias: torch.Tensor,
-                    out_proj: torch.Tensor, out_bias: torch.Tensor,
+                    out_proj: torch.Tensor,
                     h: int, scale: float, dropout_p: float, mask=True):
     num_head = h
     L, N = query.size(0), query.size(1)
@@ -89,13 +84,13 @@ def cross_attention(query: torch.Tensor, key: torch.Tensor,
     output = torch.bmm(attn, v) # (N h) L L, (N h) L d -> (N h) L d
     output = output.transpose(0, 1).contiguous()     # (N h) L d -> L (N h) d
     output = output.view(L, N, num_head * dim_head)  # (N h) L d -> L N (h d)
-    output = torch.nn.functional.linear(output, out_proj, out_bias) # L N (h d), E E  -> L N E
+    output = torch.nn.functional.linear(output, out_proj, None) # L N (h d), E E  -> L N E
     return output
 
 
 class MultiHeadSelfAttention(torch.nn.Module):
 
-    def __init__(self, embed_dim: int, num_heads: int, inner_dim: int, dropout: float = 0.0, bias=True):
+    def __init__(self, embed_dim: int, num_heads: int, inner_dim: int, dropout: float = 0.0):
         super().__init__()
         self.inner_dim = inner_dim
         self.num_heads = num_heads
@@ -104,34 +99,33 @@ class MultiHeadSelfAttention(torch.nn.Module):
         self.dropout_p = dropout
         # Q
         self.q_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
-        self.q_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
+        self.q_bias = torch.nn.Parameter(torch.empty(inner_dim))
         # K
         self.k_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
-        self.k_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
+        self.k_bias = torch.nn.Parameter(torch.empty(inner_dim))
         # V
         self.v_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
-        self.v_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
+        self.v_bias = torch.nn.Parameter(torch.empty(inner_dim))
         # Out
         self.out_proj = torch.nn.Parameter(torch.empty(embed_dim, inner_dim))
-        # self.out_bias = torch.nn.Parameter(torch.empty(embed_dim)) if bias else None
-        self.out_bias = None
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            warnings.warn('self attention dense bias is skipped for correctness.')
+        self.out_bias = torch.nn.Parameter(torch.empty(embed_dim))
 
     def forward(self, query):
-        return self_attention(
+        attn = self_attention(
             query,
             self.q_proj, self.q_bias,
             self.k_proj, self.k_bias,
             self.v_proj, self.v_bias,
-            self.out_proj, self.out_bias,
+            self.out_proj,
             self.num_heads, self.scaling, self.dropout_p, mask=True
         )
+        attn = attn + self.out_bias
+        return attn
 
 
 class MultiHeadCrossAttention(torch.nn.Module):
 
-    def __init__(self, embed_dim: int, num_heads: int, inner_dim: int, dropout: float = 0.0, bias=True):
+    def __init__(self, embed_dim: int, num_heads: int, inner_dim: int, dropout: float = 0.0):
         super().__init__()
         self.inner_dim = inner_dim
         self.num_heads = num_heads
@@ -140,19 +134,19 @@ class MultiHeadCrossAttention(torch.nn.Module):
         self.dropout_p = dropout
         # Q
         self.q_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
-        self.q_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
+        self.q_bias = torch.nn.Parameter(torch.empty(inner_dim))
         # K
         self.k_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
-        self.k_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
+        self.k_bias = torch.nn.Parameter(torch.empty(inner_dim))
         # V
         self.v_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
-        self.v_bias = torch.nn.Parameter(torch.empty(inner_dim)) if bias else None
+        self.v_bias = torch.nn.Parameter(torch.empty(inner_dim))
         # Out
         self.out_proj = torch.nn.Parameter(torch.empty(embed_dim, inner_dim))
-        self.out_bias = torch.nn.Parameter(torch.empty(embed_dim)) if bias else None
+        self.out_bias = torch.nn.Parameter(torch.empty(embed_dim))
 
     def forward(self, query: torch.Tensor, key: torch.Tensor):
-        return cross_attention(
+        attn = cross_attention(
             query, key,
             self.q_proj, self.q_bias,
             self.k_proj, self.k_bias,
@@ -160,3 +154,5 @@ class MultiHeadCrossAttention(torch.nn.Module):
             self.out_proj, self.out_bias,
             self.num_heads, self.scaling, self.dropout_p, mask=True
         )
+        attn = attn + self.out_bias
+        return attn

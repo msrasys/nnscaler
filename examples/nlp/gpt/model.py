@@ -11,9 +11,9 @@ class Config:
     seqlen = 1024
 
     # 340 M model
-    embed_dim = 1024
-    layers = 4 # 24
-    attention_heads = 16
+    # embed_dim = 1024
+    # layers = 24
+    # attention_heads = 16
 
     # 1.3 B model
     # embed_dim = 2048
@@ -21,9 +21,9 @@ class Config:
     # attention_heads = 32
 
     # 2.6 B model
-    # embed_dim = 2560
-    # layers = 32
-    # attention_heads = 32
+    embed_dim = 2560
+    layers = 32
+    attention_heads = 32
 
     # 6.7 B model
     # embed_dim = 4096
@@ -42,9 +42,9 @@ class Config:
 
     attn_hidden_dim = embed_dim
     ffn_hidden_dim  = embed_dim * 4
-    dropout = 0.0
-    attn_dropout = 0.0
-    activation_dropout = 0.0
+    dropout = 0.2
+    attn_dropout = 0.2
+    activation_dropout = 0.2
 
 
 class GPT(torch.nn.Module):
