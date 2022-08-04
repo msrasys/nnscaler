@@ -171,9 +171,12 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             # generate adapter
             graph = IRAdapterGener.gen(graph)
 
-            if graph.schedule_plan:
-                graph = graph.schedule_plan.apply(graph)
-                print(graph.schedule_plan)
+            if graph.sched is not None:
+                start = time.time()
+                graph.sched.apply()
+                span = time.time() - start
+                print('> planpass on applying schedule strategy: {:.2f} s'.format(span))
+                print(graph.sched)
 
             # to execution plan
             execplan = ExecutionPlan(graph)
@@ -185,7 +188,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             print('> planpass on diff-fusion operations: {:.2f} s'.format(span))
 
             # plan pass for computation grouping
-            if not graph.schedule_plan:
+            if not graph.sched:
                 start = time.time()
                 execplan = Grouping.apply(execplan)
                 span = time.time() - start

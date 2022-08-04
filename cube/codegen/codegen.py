@@ -640,8 +640,8 @@ class ScheduleCodeGen(CodeGen):
             # body code
             if len(device_nodes) == 0:
                 fb.insert_body('pass')
-            elif self.execplan.graph.schedule_plan:
-                code = self.emit_schedule_plan(self.execplan.graph.schedule_plan, device)
+            elif self.execplan.graph.sched:
+                code = self.emit_schedule_plan(self.execplan.graph.sched, device)
                 fb.insert_body(code)
             else:
                 for i, node in enumerate(device_nodes):

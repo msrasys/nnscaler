@@ -7,7 +7,7 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Any, Union, Tuple, List, Optional, Dict
+from typing import Union, Tuple, List, Optional, Dict
 import copy
 from cube.graph.function.function import MultiRef
 
@@ -84,9 +84,14 @@ class IRSegment(IRCell):
             IRCell.make_pair(fseg, bseg)
         return fseg
 
-    def __repr__(self):
+    def to_str(self, skip_attr: bool = False) -> str:
         name = ('f' if self.forward else 'b') + 'Segment'
-        return f'{name}{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
+        inputs = tuple(t for t in self.inputs() if not (t.is_param() and skip_attr))
+        outputs = tuple(t for t in self.outputs() if not (t.is_param() and skip_attr))
+        return f'{name}{self._id}-{self.device}(inputs={inputs}, outputs={outputs})'
+
+    def __repr__(self):
+        return self.to_str()
 
     def extra_repr(self) -> str:
         dscp = repr(self)
@@ -111,7 +116,7 @@ class IRGraph(IRCell):
         self._parameters = list()
         self._full_tensors: Dict[int, IRFullTensor] = dict()
 
-        self._schedule_strategy = None
+        self._sched = None  # the schedule strategy
 
         if inputs is None:
             inputs = IRGraph.get_inputs(nodes)
@@ -147,14 +152,6 @@ class IRGraph(IRCell):
             self.attach(node, idx)
 
         self.reset_dependency()
-
-    @property
-    def schedule_plan(self) -> Optional[Any]:
-        return self._schedule_strategy
-
-    @schedule_plan.setter
-    def schedule_plan(self, val: Optional[Any]):
-        self._schedule_strategy = val
 
     def reset_dependency(self):
         """
@@ -227,13 +224,17 @@ class IRGraph(IRCell):
         return self.forward(*args)
 
     def segment(self, nodes: List[IRCell]) -> IRSegment:
-        """
+        """!
         Create a segment (sub-graph) with part of the nodes.
+        Nodes are allowed to be on different devices.
+        The grouped segement will not add into graph.nodes().
 
-        Return:
-            IRSegment
+        @param nodes List[IRCell]: the subset nodes of this graph
+
+        @return segment IRSegment: the grouped segment. 
         """
         inputs, outputs = [], []
+        itdevs, otdevs = dict(), dict()
         for node in nodes:
             assert not isinstance(node, IRSegment), 'A segment cannot be in other segments'
             # update inputs
@@ -242,9 +243,11 @@ class IRGraph(IRCell):
                 producers = [p for p in itensor.parent.producers if set(p.device).issubset(set(node.device))]
                 # no producer means a weight or cross device-group
                 if len(producers) == 0 or any(p not in nodes for p in producers):
-                    # FIXME: itensor should also consider device difference
-                    if itensor not in inputs:
+                    if itensor not in itdevs:
+                        itdevs[itensor] = []
+                    if itensor.device not in itdevs[itensor]:
                         inputs.append(itensor)
+                        itdevs[itensor].append(itensor.device)
             # update outputs
             otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
             for otensor in otensors:
@@ -253,18 +256,25 @@ class IRGraph(IRCell):
                 consumers = [c for c in otensor.parent.consumers if set(c.device).issubset(set(node.device))]
                 # no consumer usually means the loss or cross device-group
                 if len(consumers) == 0 or any(c not in nodes for c in consumers):
-                    # FIXME: otensor should also consider device difference
-                    if otensor not in outputs:
+                    if otensor not in otdevs:
+                        otdevs[otensor] = []
+                    if otensor.device not in otdevs[otensor]:
                         outputs.append(otensor)
+                        otdevs[otensor].append(otensor.device)
         segment = IRSegment(nodes, inputs, outputs)
         return segment
 
     def group(self, nodes: List[IRCell]) -> IRSegment:
-        """
-        Group consecutive nodes into IRSegment.
+        """!
+        Group consecutive nodes into IRSegment. the grouped segment will
+        replace the nodes in the graph.
 
-        Currently this interface will break the dependency,
+        Note: Currently this interface will break the dependency,
         it can only be used after user policy
+
+        @param nodes List[IRCell]: the consecutive node subset of this graph
+        
+        @return segment IRSegment: the grouped segment
         """
         allnodes = self.nodes()
         indices = [allnodes.index(n) for n in nodes]
@@ -592,59 +602,23 @@ class IRGraph(IRCell):
                 fnode.mirror.device = node.device
         return fnodes
 
-    def merge(self, nodes: List[IRCell], target_node: IRCell):
-        """
-        Merge consecutive nodes in the graph to the target_node.
-        Note corresponding mirror nodes (if have) will also be merged.
+    def replace(self, old_nodes: List[IRCell], new_nodes: List[IRCell]):
+        """!
+        Replace nodes with node.
 
-        We don't check computation equivalence between nodes and target_node.
+        Note we don't check semantic correctness for the replacement.
 
-        Merge requires nodes are consecutive in the graph sequence.
+        @param old_nodes List[IRCell]: nodes to be replaced
+        @param new_nodes List[IRCell]: nodes to replace in
+
+        @return True
         """
-        if not isinstance(target_node, IRCell):
-            raise TypeError("Expected target node to be IRCell")
-        if target_node in self.nodes():
-            raise ValueError("Target node is already in the graph")
-        for node in nodes:
-            if node not in self.nodes():
-                raise KeyError(f"node {node} is not in the graph")
-        indices = [self.nodes().index(node) for node in nodes]
-        # consecutive
-        if max(indices) - min(indices) != len(indices) - 1:
-            return False
-        index = min(indices)
-        # update forward
-        for node in nodes:
-            self.detach(node)
-        self.attach(target_node, index)
-        # update backward
-        if all([isinstance(node.mirror, IRCell) for node in nodes]):
-            bidx = len(self.nodes())
-            for node in nodes:
-                idx = self.detach(node.mirror)
-                bidx = min(idx, bidx)
-            if target_node.mirror is None:
-                if not isinstance(target_node, IRFwOperation):
-                    raise RuntimeError("target node is not FwOp and doens't have mirror node")
-                target_node.gen_backward()
-            self.attach(target_node.mirror, bidx)
-        elif all([isinstance(node.mirror, None) for node in nodes]):
-            pass
-        else:
-            raise ValueError("nodes should have nothing-or-all mirror nodes")
-        # update weights
-        updated = set()
-        for node in nodes + [target_node]:
-            for input in node.inputs():
-                if not isinstance(input, IRSubTensor):
-                    continue
-                for fnode in input.parent.consumers:
-                    bnode = fnode.mirror
-                    if isinstance(bnode, IRBpOperation) and fnode._id not in updated:
-                        idx = self.detach(bnode)
-                        bnode.update()
-                        self.attach(bnode, idx)
-                    updated.add(fnode._id)
+        idx = len(self._nodes)
+        for old_node in old_nodes:
+            oidx = self.detach(old_node)
+            idx = min(oidx, idx)
+        for new_node in new_nodes[::-1]:
+            self.attach(new_node, idx)
         return True
 
     ## Spatial Primitives ##
@@ -752,10 +726,26 @@ class IRGraph(IRCell):
                 if self.depends(self._nodes[idx], node1):
                     return False
             self.detach(node1)
-            self.attach(node2, idx2)
+            self.attach(node1, idx2)
             return True
         raise KeyError(f"Unknown scheduling action {action}")
-                
+
+    @property
+    def sched(self):
+        """!
+        Return schedule plan for the execution.
+        """
+        return self._sched
+
+    @sched.setter
+    def sched(self, strategy):
+        """!
+        Set schedule plan for the execution.
+
+        @param strategy IRScheduleStrategy: the schedule strategy instance
+        """
+        self._sched = strategy
+
     @staticmethod
     def legal_schedule(seq: List[IRCell], integrity_check=False):
         """
