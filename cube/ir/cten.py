@@ -25,30 +25,6 @@ from cube.ir.dtype import IRDType
 __all__ = ['IRCell', 'IRDType', 'IRTensor']
 
 
-class DTypeInferRule:
-    """
-    According to promotion doc:
-    https://pytorch.org/docs/stable/tensor_attributes.html#type-promotion-doc
-
-    complex > floating > integral > boolean
-    """
-    @staticmethod
-    def infer(node, dtypes: List[IRDType]) -> IRDType:
-        dtypes = [dtype for dtype in dtypes if dtype != IRDType.unknown]
-        if IRDType.float32 in dtypes and IRDType.float16 in dtypes:
-            raise RuntimeError(f"Find node has both fp32 and fp16 inputs {node}")
-        # in priority: fp32 > fp16 > bool > int64 > int16 >
-        priority = [
-            IRDType.float64, IRDType.float32, IRDType.float16,
-            IRDType.int64, IRDType.int32, IRDType.int16, IRDType.int8,
-            IRDType.boolean
-        ]
-        for dtype in priority:
-            if dtype in dtypes:
-                return dtype
-        return IRDType.unknown
-
-
 class IRCell:
     r"""
     IRCell serves as a general node for different purpose
@@ -75,7 +51,6 @@ class IRCell:
         self.name: str = name
         self.signature = signature
 
-        self._dtype = IRDType.unknown  # output tensor dtype
         self._device = list()
 
         # source tensors
@@ -282,8 +257,6 @@ class IRCell:
             val = copy.copy(val)
             # set tensor dst
             val.cell = self
-            # update dtype
-            self._dtype = DTypeInferRule.infer(self, [self._dtype, val.dtype])
 
         self._inputs[input_index] = val
 
@@ -315,8 +288,6 @@ class IRCell:
         if isinstance(val, IRTensor):
             val = copy.copy(val)
             val.cell = self
-            # set output value dtype
-            val.dtype = self._dtype
 
         self._outputs[output_index] = val
         self.outputs.cache_clear()

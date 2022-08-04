@@ -21,7 +21,7 @@ FwOperation -> BpOperation rule:
 from typing import List, Optional, Union, Tuple, NewType, Dict
 
 from cube.ir.cten import IRCell, IRTensor
-import cube.ir.dtype as irdtype
+from cube.ir.dtype import IRDType
 
 StartEnd = NewType('[start:end)', Tuple[int, int])
 IdxChunk = NewType('(index, chunks)', Tuple[int, int])
@@ -250,7 +250,7 @@ class IRFullTensor(IRTensor):
     the sequentail execution order by its graph.
     """
 
-    def __init__(self, shape=None, name=None, requires_grad=True, dtype=irdtype.IRDType.unknown):
+    def __init__(self, shape=None, name=None, requires_grad=True, dtype=IRDType.unknown):
 
         super().__init__(shape, name, dtype)
 
@@ -466,6 +466,7 @@ class IRSubTensor(IRTensor):
         """
         indmap, valmap = IndexMap(indmap), ValueMap(valmap)
         assert isinstance(ftensor, IRFullTensor), "Expcted ftensor to be IRFullTensor"
+        assert 'dtype' not in kwargs, "IRSubTensor is not allowed to initialize with a dtype" 
         super().__init__(shape=indmap.shape, name=ftensor.name, **kwargs)
         for attr in IRFullTensor._meta:
             setattr(self, attr, getattr(ftensor, attr))
@@ -514,6 +515,18 @@ class IRSubTensor(IRTensor):
     @property
     def ndims(self) -> int:
         return len(self.shape)
+
+    @property
+    def dtype(self) -> IRDType:
+        return self.parent.dtype
+
+    @dtype.setter
+    def dtype(self, val: IRDType):
+        if self.parent.dtype == IRDType.unknown:
+            self.parent.dtype = val
+        else:
+            assert self.parent.dtype == val, \
+                f"dtype mis-matched with previous setting: {val} != {self.parent.dtype}"
 
     def splitdims(self) -> Tuple[int]:
         """!
