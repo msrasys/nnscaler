@@ -103,7 +103,7 @@ class WideResNet(nn.Module):
         x = self.norm1(x)
         x = self.act1(x)
         x = self.maxpool(x)
-        print(x.size())
+        # print(x.size())
 
         for block in self.layers:
             x = block(x)
