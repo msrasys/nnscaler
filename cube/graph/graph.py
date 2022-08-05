@@ -245,22 +245,22 @@ class IRGraph(IRCell):
                 if len(producers) == 0 or any(p not in nodes for p in producers):
                     if itensor not in itdevs:
                         itdevs[itensor] = []
-                    if itensor.device not in itdevs[itensor]:
+                    devs = set(itensor.device)
+                    if devs not in itdevs[itensor]:
                         inputs.append(itensor)
-                        itdevs[itensor].append(itensor.device)
+                        itdevs[itensor].append(devs)
             # update outputs
             otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
             for otensor in otensors:
-                if otensor in self.outputs():
-                    outputs.append(otensor)
                 consumers = [c for c in otensor.parent.consumers if set(c.device).issubset(set(node.device))]
                 # no consumer usually means the loss or cross device-group
-                if len(consumers) == 0 or any(c not in nodes for c in consumers):
+                if otensor in self.outputs() or len(consumers) == 0 or any(c not in nodes for c in consumers):
+                    devs = set(otensor.device)
                     if otensor not in otdevs:
                         otdevs[otensor] = []
-                    if otensor.device not in otdevs[otensor]:
+                    if devs not in otdevs[otensor]:
                         outputs.append(otensor)
-                        otdevs[otensor].append(otensor.device)
+                        otdevs[otensor].append(devs)
         segment = IRSegment(nodes, inputs, outputs)
         return segment
 
@@ -338,8 +338,8 @@ class IRGraph(IRCell):
             if isinstance(itensor, IRSubTensor) and itensor not in itensors:
                 itensors.append(itensor)
         for itensor in itensors:
-            if itensor.parent._id not in self._full_tensors:
-                self._full_tensors[itensor.parent._id] = itensor.parent
+            if itensor.parent.tid not in self._full_tensors:
+                self._full_tensors[itensor.parent.tid] = itensor.parent
             idx = 0
             for consumer in itensor.parent.consumers:
                 if self.nodes().index(consumer) < index:
