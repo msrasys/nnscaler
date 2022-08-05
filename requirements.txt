@@ -1,6 +1,7 @@
 einops
 matplotlib
 pytest
+more-itertools
 
 --find-links https://download.pytorch.org/whl/torch_stable.html
 torch==1.11.0+cu113

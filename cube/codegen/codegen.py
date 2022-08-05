@@ -5,6 +5,7 @@ import itertools
 from typing import Dict, Generator, Iterable, List, Any, Optional, Set, Tuple, Union
 import torch
 import copy
+from more_itertools import split_when
 from cube.graph.parser.mapping import Sign2Op
 
 from cube.ir.cten import IRCell, IRTensor
@@ -23,12 +24,37 @@ from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 from cube.codegen.frontend_mapping import Sign2EmitRule
 
+def get_backward_callsite_io_tensors(bp_segment:IRSegment):
+    """
+    Returns:
+    ```
+    (input_tensors, output_tensors, output_grads, input_grads)
+    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  ~~~~~~~~~~~
+    #inputs to 'backward'                         outputs of 'backward'
+    ```
+    """
+    assert isinstance(bp_segment, IRSegment) and not bp_segment.forward
 
-# TODO this could be applied in all codegen: Segments, Adapters, Schedules...
-# TODO but Schedules don't have standalone inputs, while Segments and Adapters have and 
-#      those inputs may need to be released too.
+    input_tensors = [t for t in bp_segment.mirror.inputs() if \
+        isinstance(t, IRSubTensor) and \
+        t.requires_grad and \
+        not t.is_param()
+    ]
+    output_tensors = [t for t in bp_segment.mirror.outputs() if isinstance(t, IRSubTensor)]
+    input_grads = [t.grad for t in input_tensors]
+
+    # WARNING !!!
+    # non-tensor gradients like scalar '1.0f' are removed in 'bpSeg.inputs()'
+    # so the items of 'bpSeg.inputs()' are generally disaligned with 'output_grads' here.
+    output_grads = [t.grad for t in output_tensors]
+
+    return input_tensors, output_tensors, output_grads, input_grads
+
+# TODO this could be applied in Adapters
 def calc_tenvars_lifetime(
-        nodes:Iterable[IRCell], subgraph_outputs:Iterable[IRTensor]
+        nodes:Iterable[IRCell], 
+        subgraph_outputs:Iterable[IRTensor],
+        subgraph_inputs:Iterable[IRTensor] = []
     ) -> Dict[IRTensor, int]:
     """
     Calculate the lifetime of tensor variables ahead-of-time.
@@ -48,19 +74,14 @@ def calc_tenvars_lifetime(
 
         For each kv-pair `(t, i)` it indicates the last reference of tensor `t`
         is at the `i`-th (0-based) node's inputs, 
-        i.e. the variable for tensor `t` could be released *AFTER* the `i`-th statement 
+        i.e. the variable for tensor `t` could be released *BEFORE* the `i`-th statement 
         in codegen.
 
-        If a tensor is not included in the dict, it means that tensor is never referenced.
-
-        TODO If an input of the subgraph is never used, its corresponding `i` is `-1`.
-    
-    REMARK:
-    
-        We cannot `detele O_j` because it may be a variable alias and the tensor object
-        behind is still active (e.g. `runtime.multiref`).
-        So we just set it to `None`, decrement the reference count 
-        and let Python (the codegen target) decide the deletion.
+        If an input of the subgraph is never used, its corresponding `i` is `0` -- this will
+        lead to an immediate release at the beginning of a function.
+        Tensors that exist till the end of the subgraph will have lifetime greater than the
+        size of that subgraph. Generally we don't need to manually release those tensors,
+        since they are automatically released when the generated function returns.
     """
 
     lifetime : Dict[IRTensor, int] = dict()
@@ -68,56 +89,70 @@ def calc_tenvars_lifetime(
     def is_temp_tensor(v):
         return isinstance(v, IRSubTensor) and not v.is_param()
 
-    #lifetime.update((tsin, -1) for tsin in subgraph_inputs if is_temp_tensor(tsin))
+    lifetime.update((tsin, 0) for tsin in subgraph_inputs if is_temp_tensor(tsin))
 
     for i, node in enumerate(nodes):
-        # aggressively mark all outputs for immediate deletion, namely 'i'
-        # TODO should work fine even for IRBpOperation
-        lifetime.update((tout, i) for tout in node.outputs() if is_temp_tensor(tout))
 
-        # "fast-forward" all inputs to the current statement, namely 'i'
+        outputs : Iterable[IRTensor]
         inputs : Iterable[IRTensor]
 
         if isinstance(node, IRSegment):
             if node.forward:
+                outputs = node.outputs()
                 inputs = node.inputs()
             else:
                 # NOTE
-                # An 'IRBpOperation' does not explicitly record all tensors that are
-                # inputs-and-outputs-to-its-correspondeding-autograd.grad-call after codegen,
+                # An backward 'IRSegment' does not explicitly record all tensors that are
+                # inputs-and-outputs-to-its-correspondeding-autograd.grad-call after codegen.
                 #
-                # E.g.
-                # IRBpOperation bp_op{ pair=fw_op } has:
-                # ```
-                # len(bp_op.inputs())==len(fw_op.outputs())
-                # len(bp_op.outputs())==len(fw_op.inputs())
-                # ````
-                #
-                # while a call to 'torch.autograd.grad' in Python is like:
+                # Where a call to 'torch.autograd.grad' in Python is like:
                 # ```
                 # grad_inputs : Tuple[torch.Tensor, ...] = torch.autograd.grad(outputs, inputs, grad_outputs)
                 # len(grad_inputs) == len(inputs)
                 # len(grad_outputs) == len(outputs)
                 # ```
-                # in other words, if we simply treat `autograd.grad` as an `g_op:IRCell`, it has:
-                # ```
-                # len(g_op.inputs()) == len(fw_op.outputs())*2 + len(fw_op.inputs())
-                # len(g_op.outputs()) == len(fw_op.inputs())
-                # ```
                 #
-                fw_inputs : tuple = node.mirror.inputs()
-                fw_outputs : tuple = node.mirror.outputs()
-                grad_inputs : Generator = (t.grad for t in fw_outputs)
-                
-                inputs = itertools.chain(fw_inputs, fw_outputs, grad_inputs)
+                # But a backward 'IRSegment' itself only records _extra_ information to take
+                # gradients for inputs to a forward 'IRSegment':
+                #
+                # - Inputs of the backward 'IRSegment' are
+                #   gradient tensors for outputs of the corresponding forward 'IRSegment'
+                #
+                #   WARNING: non-tensor gradients like scalar '1.0f' are removed,
+                #   so the items of 'bpSeg.inputs()' are generally disaligned with 'fw_outputs()'
+                #
+                # - Outputs of the backward 'IRSegment' are
+                #   gradient tensors for both explicit and implicit inputs of the forward 'IRSeg'
+                #
+                #   P.S. the implicit inputs of the forward 'IRSeg' are like 'nn.Parameter's
+                #   which are model fields and accessed by e.g. 'self.weights'.
+                #   Generally, by viewing a gradient tensor of some input, we cannot distinguish
+                #   whether the corresponding input is explicit or implicit.
+
+                fw_inputs, fw_outputs, output_grads, input_grads = \
+                    get_backward_callsite_io_tensors(node)
+
+                outputs = input_grads
+                inputs = list(itertools.chain(fw_inputs, fw_outputs, output_grads))
 
         else:
+            outputs = node.outputs()
             inputs = node.inputs()
 
-        lifetime.update((tin, i) for tin in inputs if is_temp_tensor(tin))
+        # aggressively mark all outputs for immediate deletion,
+        # namely *before* 'i+1'-th statement, in case it's never used.
+        lifetime.update((tout, i+1) for tout in outputs if is_temp_tensor(tout))
 
-    i += 1
-    lifetime.update((tsout, i) for tsout in subgraph_outputs if is_temp_tensor(tsout))
+        # "fast-forward" all inputs to the current statement, namely before 'i+1'-th node.
+        lifetime.update((tin, i+1) for tin in inputs if is_temp_tensor(tin))
+
+    # end of 'for'
+
+    # Here (i+1) is always greater than 'len(nodes)'
+    # Generally we don't manually release those tensors since the enclosing function is about to
+    # return, all local variables are automatically released.
+    # But we do need to update the lifetime of all outputs, to avoid early releasing.
+    lifetime.update((tsout, i+1) for tsout in subgraph_outputs if is_temp_tensor(tsout))
 
     return lifetime
 
@@ -213,6 +248,9 @@ class CodeGen:
         name = ', '.join(names)
         return name
 
+    def emit_tensors_release(self, tensors:Iterable[IRTensor]) -> str:
+        tnames : Generator = (self.tensor_naming(t) for t in tensors)
+        return 'del ' + ', '.join(tnames)
 
 class AutogradAdapterCodeGen(CodeGen):
     """
@@ -275,6 +313,49 @@ class AutogradAdapterCodeGen(CodeGen):
 class ModelCodeGen(CodeGen):
     """
     Generate model code
+
+    `ModelCodeGen` traverses all IR nodes and categorizes their intermediately generated
+    codes into different parts, 
+    then reorders and concatenates these parts into the final code for PyTorch to run.
+
+    These parts are progressively stored into fields of `ModelCodeGen`
+    
+    - `init_code : List[str]`
+        Statements like `import torch`
+
+    - `model_init_statements : List[str]`
+        Statements of the `__init__` constructor of the final `nn.Module` in codegen,
+
+        E.g. (lines are split into `List[str]`)
+        ```python
+        self.init_group(ranks=[0, 1, 2, 3])
+        self.weight_63 = torch.nn.Parameter(torch.empty((2048, 8192), dtype=torch.float32))
+        self.add_full_map('weight_63', 3, (slice(0, 2048, None), slice(0, 8192, None)), 1)
+        ```
+
+        including:
+        -- initialization of model weights, which are class fields;
+
+    - `model_methods_bodies : List[List[str]]`
+        Definitions of the Python code for forward computations like Segments or Adapters
+
+        Note that codes within this field haven't been organized into valid Python methods,
+        namely without signatures and return statements, both of which will be extracted
+        from corresponding IRSegment/IRAdapter in later processes.
+        E.g.
+        ```
+        [
+            # intermediate codes for 'segment123(self, tensor_2222)'
+            [
+                'tensor_3333 = torch.view(tensor_2222, [1,2,3,4])'
+            ]
+            
+            # intermediate codes for 'adapter456(self, tensor_4444)'
+            [
+                'tensor_5555 = cube.runtime.adapter.all_reduce(tensor_4444, ranks=[0,1,2,3])'
+            ]
+        ]
+        ```
     """
 
     def __init__(self, execplan: ExecutionPlan):
@@ -289,10 +370,9 @@ class ModelCodeGen(CodeGen):
             self.init_code.append(op_impl)
             self.init_code += ['']
         # module init code
-        self.declare_region: List[str] = list()
-        # module forward code
-        self.forward_region_units: List[List[str]] = list()
-        self.forward_region: List[str] = list()
+        self.model_init_statements: List[str] = list()
+        # module method bodies for forward computations, e.g. Segments, Adapters.
+        self.model_methods_bodies: List[List[str]] = list()
         # module member name
         self.symbols = SymbolTable()
         # ref module to check shared variables
@@ -304,6 +384,9 @@ class ModelCodeGen(CodeGen):
 
         Creating communication group requires all the devices
         enter the same call.
+
+        The fields storing intermediate codes that are populated by this method:
+        - `model_init_statements`
         """
         graph = self.execplan.graph
         sign = 'self.init_group(ranks={ranks})'
@@ -327,11 +410,11 @@ class ModelCodeGen(CodeGen):
                     if ranks not in comm_groups:
                         comm_groups.append(ranks)
         # create communication group
-        self.declare_region.append('# communication groups')
+        self.model_init_statements.append('# communication groups')
         for ranks in comm_groups:
             code = sign.format(ranks=list(ranks))
-            self.declare_region.append(code)
-        self.declare_region.append(' ')
+            self.model_init_statements.append(code)
+        self.model_init_statements.append(' ')
 
     def gen(self, device: int, outfile=None, attach=False) -> str:
         """
@@ -357,7 +440,7 @@ class ModelCodeGen(CodeGen):
                 if not node.forward: continue  # skip backward segment
                 codes = self.emit_segment_code(node)
             elif isinstance(node, IRFwOperation):
-                codes = self.emit_op_code(node)
+                raise RuntimeError(f"Unexcepted global-level op call: {node}")
             elif isinstance(node, IRAdapter):
                 codes = self.emit_adapter_code(node)
             elif isinstance(node, IRWeightReducer):
@@ -369,13 +452,16 @@ class ModelCodeGen(CodeGen):
                 continue
             else:
                 raise RuntimeError(f"Un-recognized IRCell type: {type(node)}")
-            self.forward_region += codes
-            # emit node tensor declaration
-            self.emit_node_declare(node)
+
+            # emit node tensor declaration into `__init__`
+            # typically it's about the `nn.Parameter`
+            self.emit_node_tensors_declare(node)
+
             # emit node code
-            self.forward_region_units.append(self.forward_region)
-            self.forward_region = list()
+            # codes : List[str]
+            self.model_methods_bodies.append(codes)
             gen_nodes.append(node)
+
             args = list()
             for t in node.inputs():
                 if isinstance(t, IRSubTensor):
@@ -388,7 +474,7 @@ class ModelCodeGen(CodeGen):
         # generate full code
         with ClassBlock(class_name='GenModel', derived=['cube.runtime.module.CubeModule']) as cb:
             with FunctionBlock(func_name='__init__', args=['self']) as ib:
-                ib.insert_body(self.declare_region)
+                ib.insert_body(self.model_init_statements)
                 # switch to training or inference mode
                 if self.execplan.inference:
                     ib.insert_body('self.eval()')
@@ -399,7 +485,7 @@ class ModelCodeGen(CodeGen):
             for idx, node in enumerate(gen_nodes):
                 name = self.node_naming(node)
                 input_args = ['self'] + node_args[idx]
-                forward_code = self.forward_region_units[idx]
+                forward_code = self.model_methods_bodies[idx]
                 with FunctionBlock(func_name=name, args=input_args) as fb:
                     fb.insert_body(forward_code)
                     # generate output
@@ -423,10 +509,17 @@ class ModelCodeGen(CodeGen):
         self.clear()
         return code
 
-    def emit_node_declare(self, node: IRCell):
+    def emit_node_tensors_declare(self, node: IRCell):
         """
         Emit tensor declaration code
+
+        The fields storing intermediate codes that are populated by this method:
+        - `model_init_statements`
+
+        This method also populates `self.symbols : SymbolTable` to record
+        the names of the variables for the tensors ever encountered.
         """
+
         sign = 'torch.nn.Parameter(torch.empty({shape}, dtype={dtype}))'
         map_sign = "self.add_full_map('{attr}', {tid}, {slicers}, {val_chunks})"
         for itensor in node.inputs():
@@ -435,7 +528,7 @@ class ModelCodeGen(CodeGen):
                 if itensor.is_param() and not self.symbols.exist(name):
                     self.symbols.create(name)
                     code = f'{name} = {sign.format(shape=tuple(itensor.shape), dtype=self.dtype_map(itensor.dtype))}'
-                    self.declare_region.append(code)
+                    self.model_init_statements.append(code)
                     tid = itensor.parent.tid
                     slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
                     val_chunks = itensor.valmap[1]
@@ -443,7 +536,7 @@ class ModelCodeGen(CodeGen):
                         attr=self.tensor_naming(itensor), tid=tid,
                         slicers=str(slicers), val_chunks=val_chunks
                     )
-                    self.declare_region.append(code)
+                    self.model_init_statements.append(code)
             if isinstance(itensor, str):
                 if name.startswith('self.'):
                     if not hasattr(self._ref_module, name[5:]):
@@ -452,84 +545,245 @@ class ModelCodeGen(CodeGen):
             self.symbols.create(self.tensor_naming(output, prefix_attr='self.'))
         return
 
-    def emit_segment_code(self, node: IRSegment) -> List[str]:
+    def emit_segment_code(self, segment: IRSegment) -> List[str]:
         """
-        Emit IRSegment code
+        Emit IRSegment code.
+
+        The resultant `List[str]` will be lines of the statements of the final
+        Python method for the targeted Segment.
+        The resultant lines will not include the signature and the return statement
+        of the generated Python method. These lines will be put into `model_methods_bodies`
+        and the missing Python-syntactic parts will be injected later on.
+
+        e.g.
+        ```
+        [
+            # no method signature
+            'tensor_3333 = torch.view(tensor_2222, [1,2,3,4])',
+            'tensor_2222 = None',   # if in dataflow there is no more reference
+            'tensor_4444 = torch.sum(tensor_3333)',
+            'def recompute(...):',
+            '    return ...',
+            'tensor_5555 = torch.utils.checkpoint(recompute, tensor_4444)',
+            'tensor_4444 = None',   # if in dataflow there is no more reference
+            # no return statement
+        ]
+        ```
 
         Nodes in the segment will group into recompute region
+
+        The fields storing intermediate codes that are populated by this method:
+        - NONE
         """
 
         codes = []
                     
-        def emit_nodes(nodes: List[IRCell]) -> List[str]:
+        def emit_nodes_invocations(i_nodes: List[Tuple[int, IRCell]], 
+                                   lifetime_by_line_id: Dict[int, List[IRTensor]]) -> List[str]:
+            """
+            Emit code to invoke operations and adapter, 
+            e.g. (the lines are split into `List[str]`)
+
+            ```
+            tensor_2222 = torch.view(tensor_1111, size=[3,6,9])
+            tensor_1111 = None      # if no more reference
+            tensor_3333 = cube.runtime.adapter.allgather_reducescatter(tensor_2222, dim=1, rank=[0,1])
+            tensor_2222 = None      # if no more reference
+            ```
+
+            The fields storing intermediate codes that are populated by this method:
+            - NONE
+            """
             node_codes = []
-            for node in nodes:
+            for i, node in i_nodes:
+
+                # NOTE
+                # If a tensor is still referenced in any later recomputing group, its lifetime is
+                # definitely greater than the current sequence of statements here.
+                # Therefore we get chance to extend the lifetime of tensors like that,
+                # and properly release them after the call to 'torch.utils.checkpoint'.
+                #
+                tensors_to_del : Optional[List[IRTensor]] = lifetime_by_line_id.get(i, None)
+                if tensors_to_del is not None:
+                    node_codes.append(self.emit_tensors_release(tensors_to_del))
+
                 if isinstance(node, IRFwOperation):
                     code = self.emit_op_code(node)
+                    node_codes += code
                 elif isinstance(node, IRAdapter):
                     code = self.emit_adapter_code(node)
+                    node_codes += code
                 else:
                     raise RuntimeError(f"unexpected type {type(node)} in IRSegment")
-                node_codes += code
+
             return node_codes
 
-        def emit_rc_nodes(nodes: List[IRCell]) -> List[str]:
+        # returns: (code_lines, group_inputs, group_outputs)
+        def emit_rc_nodes(i_nodes: List[Tuple[int, IRCell]], lifetime_by_line_id: dict) \
+            -> Tuple[List[str], List[IRTensor], List[IRTensor]]:
+            """
+            Emit code to define a Python function for ReComputing and invoke it
+            e.g. (the lines are split into `List[str]`)
+
+            ```
+            def recompute(tensor_2222):
+                tensor_3333 = torch.view(tensor_2222, size=[3,6,9])
+                tensor_2222 = None      # no more reference
+                return tensor_3333
+            # in the beginning we have `import torch.utils.checkpoint as ckpt`
+            tensor_4444 = ckpt.checkpoint(recompute, tensor_1111)            
+            ```
+
+            REMARK:
+            -   In the example above, 'tensor_2222' can be released within the RC subgraph, which also means that
+                the variable for this tensor can also be released within the enclosing graph, after the 'checkpoint' call.
+            -   The generated RC subgraph will have no "free variables".
+                All involved tensors that are defined outside of the RC group are made explicit inputs;
+                All tensors, that are defined within the RC group and are referenced after RC subgraph ends, are made explicit outputs;
+                And if a within-RC-group tensors are not used anymore, it's not returned.
+
+            The fields storing intermediate codes that are populated by this method:
+            - NONE
+            """
+            assert len(i_nodes) > 0
             node_codes = []
+
+            nodes : List[IRCell] = [node for i, node in i_nodes]
+
             subseg = self.execplan.graph.segment(nodes)
-            inputs = [self.tensor_naming(t) for t in subseg.inputs() if not t.is_param()]
-            inputs_tup = ', '.join(inputs)
-            outputs = [self.tensor_naming(t) for t in subseg.outputs()]
-            outputs = ', '.join(outputs)
-            with FunctionBlock('recompute', inputs, False) as fb:
-                for ncode in emit_nodes(nodes):
+
+            inputs = [t for t in subseg.inputs() if not t.is_param()]
+            input_names = [self.tensor_naming(t) for t in inputs]
+            input_names_tuple = ', '.join(input_names)
+            outputs = [t for t in subseg.outputs()]
+            output_names = [self.tensor_naming(t) for t in outputs]
+            output_names_tuple = ', '.join(output_names)
+
+            # 'graph.segment(nodes)' ensures that if a tensor is no longer used (in RC group or in later code), 
+            # it's not included in 'outputs'.
+            # And we will not generate 'return' statement for it, since it will cause the error
+            # that the variable is not defined (because it has been 'del'-ed).
+
+            with FunctionBlock('recompute', input_names, False) as fb:
+                # The nodes to recompute share the same space of line_ids (or "node ids") with non-recomputable nodes.
+                # e.g. those ids in subgraphs are not 0-based, and incremented after the preceding non-rc nodes and so on.
+                #
+                # So within the recomputing subgraph, tensors can be released if they are no longer used
+                # i.e. not returned by the 'def recompute(...)' 
+                # since 'execplan.graph.segment(nodes)' will make all "free variables" as explicit inputs/outputs
+                # to that subgraph.
+                for ncode in emit_nodes_invocations(i_nodes, lifetime_by_line_id):
                     fb.insert_body(ncode)
-                fb.insert_body(f'return {outputs}')
+                fb.insert_body(f'return {output_names_tuple}')
             node_codes += [''] + fb.code + ['']
             node_codes.append(
-                f'{outputs} = ckpt.checkpoint(recompute, {inputs_tup})'
+                f'{output_names_tuple} = ckpt.checkpoint(recompute, {input_names_tuple})'
             )
-            return node_codes
 
-        # to recompute region
-        curr_recompute_gid = None
-        curr_nodes = []
-        for node in node.nodes():
-            if isinstance(node, IRFwOperation):
-                if node.recompute != curr_recompute_gid:
-                    if len(curr_nodes) != 0:
-                        if curr_recompute_gid is None:
-                            codes += emit_nodes(curr_nodes)
-                        else:
-                            codes += emit_rc_nodes(curr_nodes)
-                    curr_recompute_gid = node.recompute
-                    curr_nodes = [node]
-                else:
-                    curr_nodes.append(node)
-            elif isinstance(node, IRAdapter):
-                # strategy 1: recompute close before adapter communication
-                if curr_recompute_gid is None:
-                    curr_nodes.append(node)
-                else:
-                    if len(curr_nodes) != 0:
-                        if curr_recompute_gid is None:
-                            codes += emit_nodes()
-                        else:
-                            codes += emit_rc_nodes()
-                    else:
-                        curr_recompute_gid = None
-                        curr_nodes = [node]
+            return node_codes, inputs, outputs
 
-        if len(curr_nodes) != 0:
-            if curr_recompute_gid is None:
-                codes += emit_nodes(curr_nodes)
+        def get_equiv_recompute_gid(node:Union[IRFwOperation, IRAdapter]) -> Optional[int]:
+            if isinstance(node, IRAdapter):
+                # IRAdapter is equivalent to be non-recomputable. And it always terminates the
+                # nodes sequence of any recomputing group before it.
+                return None
+            elif isinstance(node, IRFwOperation):
+                return node.recompute
             else:
-                codes += emit_rc_nodes(curr_nodes)
+                raise ValueError(f'Unexcepted node type {type(node)}')
+
+        def should_start_new_recompute_group(i_prev, i_cur) -> bool:
+            # i_prev, i_cur: Tuple[int, Union[IRFwOp,IRAdapter]]
+            prev_gid = get_equiv_recompute_gid(i_prev[1])
+            cur_gid = get_equiv_recompute_gid(i_cur[1])
+            return cur_gid != prev_gid
+
+        nodes : List[IRCell] = segment.nodes()
+
+        # After calculating the recompute groups, for each group, its input tensors' lifetime
+        # should be extend to at least beyond the lifetime of that group.
+        lifetime : Dict[IRTensor, int] = calc_tenvars_lifetime(nodes, segment.outputs(), segment.inputs())
+        lifetime_by_line_id : Dict[int, List[IRTensor]] = dict()
+        for tensor, line_id in lifetime.items():
+            lifetime_by_line_id.setdefault(line_id, []).append(tensor)
+
+        # more_itertools.split_when # type: (Iterable[T], (T,T)->bool) -> Iterator[List[T]]
+        recompute_groups : List[List[Tuple[int, IRCell]]] \
+            = list(split_when(enumerate(nodes), should_start_new_recompute_group))
+
+        for rc_group in recompute_groups:
+            # all FwOps/Adapters in a group have the same (equivalent) group id, 
+            # check that of the head item, and 'rc_group' will not be empty here.
+            gid : Optional[int] = get_equiv_recompute_gid(rc_group[0][1])
+            if gid is None:
+                codes += emit_nodes_invocations(rc_group, lifetime_by_line_id)
+            else:
+                assert len(rc_group) > 0
+
+                # Step 1: when entering a RC group:
+                #
+                # We insert tensor releasing statement *before* emitting each node.
+                # But here we are entering the scope of a RC group i.e. 'def recompute(...)'.
+                # Any releasing before the first node of the RC group, 
+                # should be done before and outside of the RC group.
+                rc_first_line_id, _rc_first_node = rc_group[0]
+                # ... and to avoid emitting again, 'pop' the lifetime record.
+                # Specify the default collection since there might not be any.
+                rel_tensors_before_rc : Optional[list] = lifetime_by_line_id.pop(rc_first_line_id, None)
+                if rel_tensors_before_rc is not None:
+                    codes.append(self.emit_tensors_release(rel_tensors_before_rc))
+
+                # Step 2
+                rc_codes, rc_inputs, rc_outputs = emit_rc_nodes(rc_group, lifetime_by_line_id)
+                codes += rc_codes
+
+                # Step 3: when exiting a RC group:
+                #
+                # `emit_rc_nodes` will not emit 'del`-statement for output tensors of the last
+                # node in the RC group, since those tensors will be immediately released
+                # as soon as 'recompute(...)' returns.
+                # We need to remove those tensors from the linearized lifetime 
+                # (namely those with lifetime 'rc_next_line_id')
+                # and do not release them before the next node after the RC group.
+                rc_last_line_id, _rc_last_node = rc_group[-1]
+                rc_next_line_id = rc_last_line_id + 1
+                lifetime_by_line_id.pop(rc_next_line_id, None) # specify a default to avoid KeyError
+                
+                # Step 4: after exiting a RC group:
+                #
+                # We need to release some argument tensors to the 'def recompute(...)' if they are
+                # no longer used.
+                # NOTE those tensors may have resulted in some 'del'-statements within the RC
+                # subfunction. But we need to release them again in the enclosing function,
+                # after the call to 'torch.checkpoint(recompute, *input_tensors)'.
+
+                # Only release an RC input if:
+                # - its lifetime does not exceed the lifetime of the RC group;
+                # - not the case that the function returns after 'checkpoint' the RC subgraph.
+                if rc_next_line_id != len(nodes):
+                    inputs_to_rel = [rcin for rcin in rc_inputs if lifetime[rcin] <= rc_next_line_id]
+                    if len(inputs_to_rel) > 0:
+                        del_stmt = self.emit_tensors_release(inputs_to_rel)
+                        codes.append(del_stmt)
+                
+                # any resultant tensors *defined within the RC group and not used after the group*
+                # will not be returned from the generate 'def recompute(...)',
+                # so here we have no resultant tensors (namely 'rc_outputs') to release.
 
         return codes
 
     def emit_op_code(self, node: IRFwOperation) -> List[str]:
         """
-        Emit op forward code
+        Emit the statement to call the op in the forward code
+        (e.g. in Segments, Adapter or CodeGen.Main)
+
+        The result will look like (the lines are split into `List[str]`)
+        ```
+        tensor_3333 = torch.view(tensor_2222, [1,2,3,4,5])
+        ```
+
+        The fields storing intermediate codes that are populated by this method:
+        -   NONE
         """
         codes = []
         # insert comment
@@ -558,11 +812,19 @@ class ModelCodeGen(CodeGen):
 
     def emit_adapter_code(self, node: IRAdapter) -> List[str]:
         """
-        Emit adapter call
+        Emit the statment of the adapter call
+        
+        The resultant `List[str]` will be lines of the statements of the final
+        Python method for the targeted Segment, 
+        without the method signature and the return statement.
+
+        The fields storing intermediate codes that are populated by this method:
+        -   NONE
         """
         codes = []
         assert len(node.device) == 1, f"Expected adapter to be dispatched:\n{node.extra_repr()}"
         prims = [node] if node.differentiable and node.custom else [prim for prim in node.prims]
+
         for prim in prims:
             if len(prim.inputs()) == 1:
                 itensors = self.tensor_naming(prim.inputs()[0], prefix_attr='self.')
@@ -574,7 +836,13 @@ class ModelCodeGen(CodeGen):
             codes.append(code)
         return codes
 
-    def emit_reducer_init(self, node: IRWeightReducer):
+    def emit_reducer_init(self, node: IRWeightReducer) -> None:
+        """
+        Emit code to initialize involved reducer objects in `__init__`.
+
+        The fields storing intermediate codes that are populated by this method:
+        -   `model_init_statements`
+        """
         # reducer init interface
         reducer_init = '{reducer} = cube.runtime.adapter.Reducer(ranks={ranks})'
         reducer_add = 'self.add_reducer({reducer})'
@@ -582,17 +850,23 @@ class ModelCodeGen(CodeGen):
         # create reducer in declare region
         weights = node.inputs()
         reducer_name = f'self.wreducer{node._id}'
-        self.declare_region.append('')
+        self.model_init_statements.append('')
         init_code = reducer_init.format(reducer=reducer_name, ranks=node.device)
-        self.declare_region.append(init_code)
+        self.model_init_statements.append(init_code)
         weights = [self.tensor_naming(t, prefix_attr='self.') for t in weights]
         for weight in weights:
             add_param_code = add_param.format(reducer=reducer_name, weight=weight)
-            self.declare_region.append(add_param_code)
+            self.model_init_statements.append(add_param_code)
         add_code = reducer_add.format(reducer=reducer_name)
-        self.declare_region.append(add_code)
+        self.model_init_statements.append(add_code)
 
     def emit_reducer_call(self, node: IRWeightReducer):
+        """
+        Emit the statment to invoke a reducer object.
+        
+        The fields storing intermediate codes that are populated by this method:
+        -   NONE
+        """
         reducer_name = f'self.wreducer{node._id}'
         code = f'{reducer_name}.allreduce()'
         return [code]
@@ -602,10 +876,9 @@ class ModelCodeGen(CodeGen):
         Clear buffer that used for generating code
         """
         # module init code
-        self.declare_region: List[str] = list()
+        self.model_init_statements: List[str] = list()
         # module forward code
-        self.forward_region_units: List[List[str]] = list()
-        self.forward_region: List[str] = list()
+        self.model_methods_bodies: List[List[str]] = list()
         # module member name
         self.symbols = SymbolTable()
 
@@ -645,15 +918,15 @@ class ScheduleCodeGen(CodeGen):
                 fb.insert_body(code)
             else:
                 for i, node in enumerate(device_nodes):
+                    # Decrement reference counts for output tensors that are no longer used
+                    # Tensors here need to release *before* the i-th statement.
+                    tensors : Optional[List[IRTensor]] = lifetime_by_line_id.get(i, None)
+                    if tensors is not None: # not necessarily to have one after each line
+                        fb.insert_body(self.emit_tensors_release(tensors))
+
                     name = self.node_naming(node)
                     code = self.emit_node(node, name=name)
                     fb.insert_body(code)
-
-                    # decrement reference counts for output tensors that are no longer used
-                    tensors : Optional[List[IRTensor]] = lifetime_by_line_id.get(i, None)
-                    if tensors is not None: # not necessarily to have one after each line
-                        tnames : Generator = (self.tensor_naming(t) for t in tensors)
-                        fb.insert_body(', '.join(tnames) + ' = ' + ', '.join(['None'] * len(tensors)))
             
             # return code
             outputs = self.return_naming(self.execplan.graph.outputs())
@@ -702,14 +975,9 @@ class ScheduleCodeGen(CodeGen):
                 )
             # emit backward
             else:
-                input_tensors = [t for t in node.mirror.inputs() if \
-                    isinstance(t, IRSubTensor) and \
-                    t.requires_grad and \
-                    not t.is_param()
-                ]
-                output_tensors = [t for t in node.mirror.outputs() if isinstance(t, IRSubTensor)]
-                input_grads = [t.grad for t in input_tensors]
-                output_grads = [t.grad for t in output_tensors]
+                input_tensors, output_tensors, output_grads, input_grads = \
+                    get_backward_callsite_io_tensors(node)
+                
                 for idx, tensor in enumerate(output_grads):
                     if isinstance(tensor, float):
                         assert tensor == 1.0, "Loss gradient should be 1.0"
