@@ -329,6 +329,9 @@ class IRGraph(IRCell):
                 otensors.append(otensor)
         for otensor in otensors:
             otensor.parent.rm_producer(node)
+            ftensor = otensor.parent
+            if len(ftensor.producers) == 0 and len(ftensor.consumers) == 0:
+                del self._full_tensors[otensor.parent.tid]
         if reset_dependency:
             self.reset_dependency()
         return index
@@ -368,7 +371,7 @@ class IRGraph(IRCell):
                 otensors.append(otensor)
         for otensor in otensors:
             if otensor.parent._id not in self._full_tensors:
-                self._full_tensors[itensor.parent._id] = itensor.parent
+                self._full_tensors[itensor.parent.tid] = itensor.parent
             idx = 0
             for producer in otensor.parent.producers:
                 if self.nodes().index(producer) < index:

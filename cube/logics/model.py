@@ -59,8 +59,6 @@ def forward(graph: IRGraph, *args) -> IRGraph:
         while itensor in graph.outputs():
             oidx = graph.outputs().index(itensor)
             graph.set_output(oidx, arg)
-    for itensor in itensors:
-        del graph._full_tensors[itensor.parent.tid]
 
     # dtype inference
     for node in graph.nodes():
