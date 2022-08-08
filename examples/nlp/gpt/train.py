@@ -4,7 +4,7 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/nlp/gpt/train.py --policy PASMegatronTP
+    examples/nlp/gpt/train.py --policy PASMeshShard --fp16
 """
 
 

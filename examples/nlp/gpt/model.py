@@ -11,9 +11,9 @@ class Config:
     seqlen = 1024
 
     # 340 M model
-    # embed_dim = 1024
-    # layers = 24
-    # attention_heads = 16
+    embed_dim = 1024
+    layers = 8 # 24
+    attention_heads = 16
 
     # 1.3 B model
     # embed_dim = 2048
@@ -21,9 +21,9 @@ class Config:
     # attention_heads = 32
 
     # 2.6 B model
-    embed_dim = 2560
-    layers = 32
-    attention_heads = 32
+    # embed_dim = 2560
+    # layers = 32
+    # attention_heads = 32
 
     # 6.7 B model
     # embed_dim = 4096
