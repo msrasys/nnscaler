@@ -387,6 +387,10 @@ class IRAdapterGener:
         to:
             producer --(ftensor)--> fused nodes --(new ftensor)--> consumer
 
+        Recompute policy: if all the producers are recomputed in a same
+        recompute group, then the additional generated cat/add are also
+        apllied with same recompute region. Otherwise no recompute.
+
         @param tensors List[IRSubTensor]: tensors to be fused in local device
         
         @return new_ftensor IRFullTensor: the new full tensor.
@@ -414,7 +418,7 @@ class IRAdapterGener:
             fuse_tensors[devid][tensor] = [tensor]
             tensor_map[devid][tensor] = tensor
 
-        nodes: List[IRCell] = []
+        nodes: List[IRFwOperation] = []
         for devid, tensors in devtensors.items():
             if len(tensors) == 1:
                 continue
@@ -461,6 +465,12 @@ class IRAdapterGener:
                     break
 
         if len(nodes) == 0: return ftensor
+
+        # recompute
+        rcid = set(producer.recompute for producer in ftensor.producers)
+        rcid = list(rcid)[0] if len(rcid) == 1 else None
+        for node in nodes:
+            node.recompute = rcid
 
         new_ftensor = ftensor.like()
 
