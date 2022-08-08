@@ -289,32 +289,32 @@ class IRFullTensor(IRTensor):
         return tensor
 
     @property
-    def producers(self) -> List[IRCell]:
+    def producers(self) -> Tuple[IRCell]:
         """
         Producer IRCell list
         """
-        return self._producers
+        return tuple(self._producers)
 
     @property
-    def ptensors(self):
+    def ptensors(self) -> Tuple[IRTensor]:
         """
         Produced IRSubTensor list correspongding to producer IRCell
         """
-        return self._ptensors
+        return tuple(self._ptensors)
 
     @property
-    def consumers(self) -> List[IRCell]:
+    def consumers(self) -> Tuple[IRCell]:
         """
         Consumer IRCell list
         """
-        return self._consumers
+        return tuple(self._consumers)
 
     @property
-    def ctensors(self):
+    def ctensors(self) -> Tuple[IRTensor]:
         """
         Consumed IRSubTensor list correspongding to consumer IRCell
         """
-        return self._ctensors
+        return tuple(self._ctensors)
 
     def add_producer(self, cell: IRCell, tensor: IRTensor, idx: int = 0):
         if not isinstance(cell, IRCell) or not isinstance(tensor, IRTensor):
@@ -335,26 +335,30 @@ class IRFullTensor(IRTensor):
         assert tensor in cell.inputs(), f"tensor {tensor} not in node: {cell} inputs"
         if not isinstance(cell, IRCell) or not isinstance(tensor, IRTensor):
             raise TypeError("Expect an IRCell and an IRTensor")
-        assert cell not in self._consumers, f"{cell} already exists as consumer"
+        if cell in self._consumers:
+            for idx, consumer in enumerate(self._consumers):
+                if cell == consumer:
+                    assert self._ctensors[idx] != tensor, f"double add a same consumer-tensor pair: {cell}"
         self._consumers.insert(idx, cell)
         self._ctensors.insert(idx, tensor)
-        for t in self.ctensors:
+        for t in self._ctensors:
             t._dirty_grad = True
 
     def rm_producer(self, cell: IRCell) -> int:
-        if cell not in self.producers:
+        if cell not in self._producers:
             raise KeyError(f"Cell {cell} not found in producer")
-        idx = self.producers.index(cell)
-        self.producers.pop(idx)
-        self.ptensors.pop(idx)
+        while cell in self._producers:
+            idx = self._producers.index(cell)
+            self._producers.pop(idx)
+            self._ptensors.pop(idx)
         return idx
 
     def rm_consumer(self, cell: IRCell) -> int:
-        if cell not in self.consumers:
+        if cell not in self._consumers:
             raise KeyError(f"Cell {cell} not found in producer")
-        idx = self.consumers.index(cell)
-        self.consumers.pop(idx)
-        self.ctensors.pop(idx)
+        idx = self._consumers.index(cell)
+        self._consumers.pop(idx)
+        self._ctensors.pop(idx)
         return idx
 
     def clear_producer_consumer(self) -> int:
@@ -377,7 +381,7 @@ class IRFullTensor(IRTensor):
         self._requires_grad = False if val is None else True
         if isinstance(val, IRFullTensor):
             assert val.shape == self.shape, f"IRFullTensor gradient shape mismatch."
-        for tensor in self.ctensors + self.ptensors:
+        for tensor in self._ctensors + self._ptensors:
             tensor._dirty_grad = True
 
     @property
@@ -391,7 +395,7 @@ class IRFullTensor(IRTensor):
             self.grad = IRFullTensor(self.shape, 'g' + self.name, False).as_grad()
         elif not val and self.grad is not None:
             self.grad = None
-        for tensor in self.ctensors + self.ptensors:
+        for tensor in self._ctensors + self._ptensors:
             tensor._dirty_grad = True
 
     def as_param(self):

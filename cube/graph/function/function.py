@@ -22,7 +22,7 @@ from cube.ir.dtype import IRDType
 from cube.graph.torch_dtype_mapping import DType2IRDType, TorchScalarTypeEnumMap
 
 
-def Identity(signature, inputs):
+def Identity(signature, inputs: List[IRTensor]):
     signature = 'cube.runtime.function.identity'
     eshape = ShapeAnno.create_shape_str(inputs[0].shape)
     anno = OpAnno.create_op_str([eshape], [eshape])
@@ -796,13 +796,13 @@ def Embedding(signature, inputs: List):
     return IRDimops(signature, [anno], [itensor, weight], 'embedding', padding_idx=padding_idx, start=start, stop=stop)
 
 
-def MultiRef(signature, inputs: List[IRFullTensor]):
+def MultiRef(signature, inputs: List[IRTensor]):
     """
     cube.runtime.function.multiref(itensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]
     """
     signature = 'cube.runtime.function.multiref'
     itensor, times = inputs
-    assert isinstance(itensor, IRFullTensor), "require all inputs to be IRSubTensor"
+    assert isinstance(itensor, IRTensor), "require all inputs to be IRSubTensor"
     assert isinstance(times, int), "require int for second input"
     anno = '* -> ' + ', '.join('*' for _ in range(times))
     node = IRDimops(signature, [anno], [itensor], 'multiref', times=times)

@@ -115,6 +115,11 @@ class IRGraph(IRCell):
         self._nodes: List[IRCell] = list()
         self._parameters = list()
         self._full_tensors: Dict[int, IRFullTensor] = dict()
+        self._train: bool = any(
+            isinstance(node, IRBpOperation) or
+            (isinstance(node, IRSegment) and node.forward) or
+            (isinstance(node, IRAdapter) and node.forward) for node in nodes
+        )
 
         self._sched = None  # the schedule strategy
 
@@ -152,6 +157,15 @@ class IRGraph(IRCell):
             self.attach(node, idx)
 
         self.reset_dependency()
+
+    @property
+    def train(self) -> bool:
+        """!
+        Train flag.
+
+        @return train bool: True if backward is required, otherwise False (inference only).
+        """
+        return self._train
 
     def reset_dependency(self):
         """

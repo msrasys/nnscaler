@@ -1,15 +1,16 @@
+import itertools
 from typing import Dict, List, Optional, Tuple
-import warnings
 import copy
 
 from cube.graph.graph import IRGraph
-from cube.graph.function import Identity
+from cube.ir.cten import IRCell
 from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
-from cube.ir.adapter import IRAdapter, IRWeightReducer
 
 from cube.ir.operator import IRBpOperation, IRFwOperation
 
 from cube.ir.adapter.prim import IRAdapterPrim
+from cube.ir.adapter import IRAdapter, IRWeightReducer
+from cube.graph.function.function import Add, Cat, Identity, MultiRef
 from cube.ir.adapter.prim import SelectPrim, MovePrim, SumPrim, MergeDimPrim
 from cube.graph.gener.layout import GridLayout
 
@@ -130,6 +131,11 @@ class IRAdapterGener:
                ftensor.consumers[0].device == ftensor.producers[0].device:
                 continue
 
+            # optimization: local fusion on producer
+            if graph.train:
+                ftensor = IRAdapterGener.local_producer_fusion(graph, ftensor)
+                IRAdapterGener.local_consumer_multiref(graph, ftensor)
+
             ptensors, ctensors = ftensor.ptensors, ftensor.ctensors
             pdevs = tuple(ptensor.device[0] for ptensor in ptensors)
             cdevs = tuple(ctensor.device[0] for ctensor in ctensors)
@@ -177,6 +183,8 @@ class IRAdapterGener:
             if badapter is not None:
                 bidx = min(graph.nodes().index(consumer) for consumer in ftensor.grad.consumers)
                 graph._nodes.insert(bidx, badapter)
+
+        # print(graph.extra_repr())
         return graph
 
     @staticmethod
@@ -369,3 +377,208 @@ class IRAdapterGener:
                     f"Remain Tensor:\n\t{remain}"
                 )
         return prims
+
+    @staticmethod
+    def local_producer_fusion(graph: IRGraph, ftensor: IRFullTensor) -> IRFullTensor:
+        """!
+        Fuse the producer tensors using concat and add.
+        This will add a new full tensor by chaging from:
+            producer --(ftensor)--> consumer
+        to:
+            producer --(ftensor)--> fused nodes --(new ftensor)--> consumer
+
+        @param tensors List[IRSubTensor]: tensors to be fused in local device
+        
+        @return new_ftensor IRFullTensor: the new full tensor.
+                                          If cannot fuse, the original ftensor.
+        """
+
+        def like(tensor: IRSubTensor, share: Optional[IRFullTensor] = None) -> IRSubTensor:
+            parent = tensor.parent.like() if share is None else share
+            return parent.select(tensor.indmap, tensor.valmap)
+
+        # collect device tensors
+        devtensors: Dict[int, List[IRSubTensor]] = dict()
+        # devid: old tensor -> [nodes,]
+        fuse_tensors: Dict[int, Dict[IRSubTensor, List[IRSubTensor]]] = dict()
+        tensor_map: Dict[int, Dict[IRSubTensor, IRSubTensor]] = dict()
+
+        for tensor in ftensor.ptensors:
+            assert len(tensor.device) == 1
+            devid = tensor.device[0]
+            if devid not in devtensors:
+                devtensors[devid] = []
+                fuse_tensors[devid] = dict()
+                tensor_map[devid] = dict()
+            devtensors[devid].append(tensor)
+            fuse_tensors[devid][tensor] = [tensor]
+            tensor_map[devid][tensor] = tensor
+
+        nodes: List[IRCell] = []
+        for devid, tensors in devtensors.items():
+            if len(tensors) == 1:
+                continue
+            
+            # repeatly search for combinable tensors
+            while True:
+                can_merge = False
+                out = None
+                node = None
+                for t1, t2 in itertools.combinations(tensors, 2):
+                    catdim = t1.catdim(t2)
+                    if catdim is not None:
+                        t1, t2 = [t1, t2] if t1.indmap[catdim][0] < t2.indmap[catdim][0] else [t2, t1]
+                        out = t1.concat(t2, dim=catdim)
+                        node = Cat(
+                            'torch.cat',
+                            ([tensor_map[devid][t1], tensor_map[devid][t2]], catdim)
+                        )
+                        can_merge = True
+                        break
+                    elif t1.accumable(t2):
+                        out = t1.accum(t2)
+                        node = Add(
+                            'torch.add',
+                            [tensor_map[devid][t1], tensor_map[devid][t2]]
+                        )
+                        can_merge = True
+                        break
+                # each time when creats a merge node, the output will be
+                # updated with a new full tensor. The corresponding input
+                # will be set according to the previous node output
+                if can_merge:
+                    tensor_map[devid][out] = like(out)
+                    node.set_output(0, tensor_map[devid][out])  # update output to a new full tensor
+                    tensors.remove(t1)
+                    tensors.remove(t2)
+                    tensors.append(out)
+                    nodes.append(node)
+                    node.device = devid
+                    fuse_tensors[devid][out] = fuse_tensors[devid][t1] + fuse_tensors[devid][t2]
+                    del fuse_tensors[devid][t1]
+                    del fuse_tensors[devid][t2]
+                else:
+                    break
+
+        if len(nodes) == 0: return ftensor
+
+        new_ftensor = ftensor.like()
+
+        # update consumer 
+        min_idx = len(graph.nodes())
+        assert len(ftensor.ctensors) == len(ftensor.consumers)
+        for ctensor, consumer in zip(ftensor.ctensors, ftensor.consumers):
+            fidx = graph.detach(consumer)
+            consumer.set_input(
+                consumer.inputs().index(ctensor),
+                new_ftensor.select(ctensor.indmap, ctensor.valmap)
+            )
+            graph.attach(consumer, fidx)
+            min_idx = min(fidx, min_idx)
+
+        # insert new producer
+        for devid, tensors in fuse_tensors.items():
+            for ptensor in tensors:
+                new_tensor = like(ptensor, share=new_ftensor)
+                if len(tensors[ptensor]) == 1:
+                    node = Identity('', [ptensor])
+                    node.device = devid
+                    node.set_output(0, new_tensor)
+                    nodes.append(node)
+                else:
+                    for node in nodes:
+                        if node.output(0) == tensor_map[devid][ptensor]:
+                            node.set_output(0, new_tensor)
+
+        for node in nodes[::-1]:
+            # print(node)
+            assert node not in graph.nodes()
+            assert len(node.outputs()) == 1
+            graph.attach(node, min_idx)
+
+        # insert and update backward node
+        if graph.train:
+            # update backward node
+            for consumer in new_ftensor.consumers:
+                assert isinstance(consumer.mirror, IRBpOperation)
+                bidx = graph.detach(consumer.mirror)
+                consumer.mirror.update()
+                graph.attach(consumer.mirror, bidx)
+            # insert backward node
+            bnodes = [node.gen_backward() for node in nodes]
+            bidx = min(graph.nodes().index(producer.mirror) for producer in ftensor.producers)
+            for bnode in bnodes:
+                bnode.device = bnode.mirror.device
+                graph.attach(bnode, bidx)
+
+        return new_ftensor
+
+    @staticmethod
+    def local_consumer_multiref(graph: IRGraph, ftensor: IRFullTensor):
+        """!
+        If a device have a same sub-tensor to be consumed multiple times,
+        then create a multiref forward node for it to make
+        each sub-tensor to be consumed only once in each device.
+
+        This is to adapt with pytorch autograd function.
+
+        producer -> consumers[0,1]
+
+        producer -> multiref -> consumer[0]
+                        |-----> consumer[1]
+
+        @param graph IRGraph
+        @param ftensor IRFullTensor: the forward full tensor
+        """
+        # collect to consumer tensors of each device
+        devtensors: Dict[int, Dict[IRSubTensor, List[IRCell]]] = dict()
+        for ctensor, consumer in zip(ftensor.ctensors, ftensor.consumers):
+            assert len(ctensor.device) == 1
+            devid = ctensor.device[0]
+            if devid not in devtensors:
+                devtensors[devid] = dict()
+            if ctensor not in devtensors[devid]:
+                devtensors[devid][ctensor] = []
+            devtensors[devid][ctensor].append(consumer)
+
+        # add multiref forward node
+        multirefs: Dict[MultiRef, List[IRFwOperation]] = dict()
+        for devid in devtensors:
+            for ctensor in devtensors[devid]:
+                consumers = devtensors[devid][ctensor]
+                if len(consumers) == 1:
+                    continue
+                multiref = MultiRef(None, [ctensor, len(consumers)])
+                multiref.device = devid
+                ftensors = [ctensor.parent.like() for _ in range(len(consumers))]
+                itensors = [ft.select(ctensor.indmap, ctensor.valmap) for ft in ftensors]
+                for idx, itensor in enumerate(itensors):
+                    multiref.set_output(idx, itensor)
+
+                # update consumer
+                min_fidx = len(graph.nodes())
+                for itensor, consumer in zip(itensors, consumers):
+                    fidx = graph.detach(consumer)
+                    idx = consumer.inputs().index(ctensor)
+                    consumer.set_input(idx, itensor)
+                    graph.attach(consumer, fidx)
+                    min_fidx = min(fidx, min_fidx)
+    
+                # insert forward multiref
+                graph.attach(multiref, min_fidx)
+                multirefs[multiref] = consumers
+
+        # insert / update backward
+        if graph.train:
+            for multiref, consumers in multirefs.items():
+                # update consumer backward
+                for consumer in consumers:
+                    assert isinstance(consumer.mirror, IRBpOperation)
+                    bidx = graph.detach(consumer.mirror)
+                    consumer.mirror.update()
+                    graph.attach(consumer.mirror, bidx)
+                # insert backward
+                bnode = multiref.gen_backward()
+                bnode.device = multiref.device
+                bidx = max(graph.nodes().index(consumer.mirror) for consumer in consumers)
+                graph.attach(bnode, bidx+1)

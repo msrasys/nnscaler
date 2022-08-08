@@ -326,10 +326,10 @@ class GridLayout:
         for subtensor in subtensors:
             tid = id(subtensor)
             # set up replica
-            if subtensor._id not in replicas:
-                replicas[subtensor._id] = []
-            _tindex[tid] = [len(replicas[subtensor._id])]
-            replicas[subtensor._id].append(subtensor)
+            if subtensor.tid not in replicas:
+                replicas[subtensor.tid] = []
+            _tindex[tid] = [len(replicas[subtensor.tid])]
+            replicas[subtensor.tid].append(subtensor)
             # setup value
             _tindex[tid].append(subtensor.valmap[0])
             vchunks.add(subtensor.valmap[1])
