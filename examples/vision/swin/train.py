@@ -18,6 +18,7 @@ import examples.vision.swin.policy.spmd as spmd
 
 PAS = spmd.PASSingle
 
+torch.random.manual_seed(0)
 
 def train():
 
@@ -26,7 +27,6 @@ def train():
     cfg = Config()
     model = SwinTransformer()
     dataloader = ImageDataLoader(batch_size, cfg.img_size, cfg.num_classes)
-    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999))
 
     model = cube.SemanticModel(model, dataloader.shapes)
     @cube.compile(model, dataloader, PAS=PAS, override=True)
@@ -34,11 +34,18 @@ def train():
         imgs, labels = next(dataloader)
         loss = model(imgs, labels)
         loss.backward()
-    model = model.get_gen_module()
+        return loss
+    model: torch.nn.Module = model.get_gen_module()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999))
 
     torch.distributed.barrier()
     print_each_rank('model weight consumpition:')
     memory_summary()
+    nparams = 0
+    for param in model.parameters():
+        nparams += param.nelement()
+    print_each_rank(f'model parameter: {nparams}')
 
     CudaTimer(enable=False).warmup()
     iter_num, warmup = 10, 2
@@ -48,7 +55,8 @@ def train():
             CudaTimer(enable=True).start('e2e')
 
         # training
-        train_iter(model, dataloader)
+        loss = train_iter(model, dataloader)
+        print(loss)
         optimizer.step()
         optimizer.zero_grad()
 

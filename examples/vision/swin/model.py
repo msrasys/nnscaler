@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 
@@ -161,38 +160,18 @@ class SwinTransformer(nn.Module):
         self.head = nn.Linear(self.num_features, cfg.num_classes) if cfg.num_classes > 0 else nn.Identity()
         self.criterion = nn.CrossEntropyLoss()
 
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'absolute_pos_embed'}
-
-    @torch.jit.ignore
-    def no_weight_decay_keywords(self):
-        return {'relative_position_bias_table'}
-
-    def forward_features(self, x):
-        x = self.patch_embed(x)
-        if self.ape:
-            x = x + self.absolute_pos_embed
-        x = self.pos_drop(x)
-
-        for layer in self.layers:
-            x = layer(x)
-
-        x = self.norm(x)  # B L C
-        x = self.avgpool(x.transpose(1, 2))  # B C 1
-        x = torch.flatten(x, 1)
-        return x
+        torch.manual_seed(0)
+        for param in self.parameters():
+            if len(param.size()) > 1:
+                trunc_normal_(param, std=.02)
+            else:
+                nn.init.constant_(param, 0)
+        # this is to match for the correctness with baseline
+        for basic_layer in self.layers:
+            for block in basic_layer.blocks:
+                with torch.no_grad():
+                    w: torch.Tensor = block.attn.qkv_w.view(3, -1, block.attn.qkv_w.size(-1))
+                    block.attn.qkv_w.copy_(w.permute(1,0,2).reshape(-1, w.size(-1)))
 
     def forward(self, x, labels: torch.Tensor):
         x = self.patch_embed(x)
@@ -239,6 +218,7 @@ class ImageDataLoader(cube.runtime.syndata.CubeDataLoader):
         self.samples = [self.random_sample(dtype)]
         
     def random_sample(self, dtype: torch.dtype):
+        torch.manual_seed(0)
         img = torch.rand(
             *(self.bs, 3, self.img_size, self.img_size),
             dtype=dtype,

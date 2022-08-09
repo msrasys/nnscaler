@@ -19,7 +19,6 @@ from cube.profiler.timer import CudaTimer, print_each_rank
 import cube
 
 
-
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
     # Method based on https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
@@ -151,7 +150,7 @@ class WindowAttention(nn.Module):
         # get pair-wise relative position index for each token inside the window
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
@@ -592,24 +591,12 @@ class SwinTransformer(nn.Module):
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
         self.criterion = nn.CrossEntropyLoss()
 
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'absolute_pos_embed'}
-
-    @torch.jit.ignore
-    def no_weight_decay_keywords(self):
-        return {'relative_position_bias_table'}
+        torch.manual_seed(0)
+        for param in self.parameters():
+            if len(param.size()) > 1:
+                trunc_normal_(param, std=.02)
+            else:
+                nn.init.constant_(param, 0)
 
     def forward_features(self, x):
         x = self.patch_embed(x)
@@ -658,6 +645,7 @@ class ImageDataLoader(cube.runtime.syndata.CubeDataLoader):
         self.samples = [self.random_sample()]
         
     def random_sample(self):
+        torch.manual_seed(0)
         img = torch.rand(
             *(self.bs, 3, self.img_size, self.img_size),
             dtype=torch.float,
@@ -742,17 +730,21 @@ def train():
     print_each_rank('model weight consumpition:')
     memory_summary()
 
+    print(list(model.parameters())[0].shape)
+    print(list(model.parameters())[0])
+
     def train_iter(model, dataloader):
         imgs, labels = next(dataloader)
         loss = model(imgs, labels)
         loss.backward()
+        print(loss)
 
     CudaTimer(enable=False).warmup()
     iter_num = 10
     for step in range(iter_num):
 
-        if step == 0:
-            model_summary(model, next(dataloader))
+        # if step == 0:
+        #     model_summary(model, next(dataloader))
 
         if step >= 4:
             CudaTimer(enable=True).start('e2e')
