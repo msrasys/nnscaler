@@ -71,4 +71,9 @@ OMP_NUM_THREADS=4 torchrun \
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=1 \
     --nnodes=1 \
-    examples/wrf/wrf2.py
+    examples/wrf/wrf2.py --policy PAS
+
+OMP_NUM_THREADS=1 torchrun \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    examples/wrf/wrf2.py --policy PAS_ALL_Y
