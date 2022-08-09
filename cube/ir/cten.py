@@ -434,7 +434,7 @@ class IRTensor:
     and will be translated to None in code generation. 
     """
 
-    _meta = ['name', '_is_param', '_is_grad', '_requires_grad', '_dtype']
+    _meta = ['name', '_is_attr', '_is_grad', '_requires_grad', '_dtype']
 
     def __init__(self, shape=None, name='tensor', dtype=IRDType.unknown, tid=None):
 
@@ -446,7 +446,7 @@ class IRTensor:
         self._cell: Optional[IRCell] = None
 
         self._dtype: IRDType = dtype
-        self._is_param: bool = False
+        self._is_attr: bool = False
         self._is_grad: bool = False
 
         # tensor gradient
@@ -500,29 +500,65 @@ class IRTensor:
             "tensor placement is not allowed to set manually"
         )
 
+    def is_attr(self) -> bool:
+        """!
+        Check if the tensor is graph attribute.
+
+        @return is_attr boolean: True if is graph attribute (buffer or parameter)
+        """
+        return self._is_attr
+
+    def is_param(self) -> bool:
+        """!
+        Check if the tensor is parameter
+
+        @return is_param boolean: True if is parameter.
+        """
+        return self._is_attr and self._requires_grad
+
+    def is_buffer(self) -> bool:
+        """!
+        Check if the tensor is buffer.
+
+        @return is_buffer boolean: True if is buffer.
+        """
+        return self._is_attr and not self._requires_grad
+
+    def is_grad(self) -> bool:
+        """!
+        Check if the tensor is gradient
+
+        @return is_grad boolean: True if is gradient
+        """
+        return self._is_grad
+
     def as_param(self):
         """
         Set the tensor as trainable parameter
         """
         assert self._grad is not None, "missing grad tensor"
         self._requires_grad = True
+        self._is_attr = True
         self._is_grad = False
-        self._is_param = True
         return self
 
-    def is_param(self):
+    def as_buffer(self):
         """
-        Check if the tensor is parameter
+        Set the tensor as un-trainable buffer
         """
-        return self._is_param
+        self._requires_grad = False
+        self._is_attr = True
+        self._is_grad = False
+        return self
 
     def as_grad(self):
+        """
+        Set the tensor as gradient
+        """
         self._is_param = False
+        self._is_attr = False
         self._is_grad = True
         return self
-
-    def is_grad(self):
-        return self._is_grad
 
     @property
     def requires_grad(self) -> bool:

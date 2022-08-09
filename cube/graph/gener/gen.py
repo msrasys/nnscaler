@@ -126,8 +126,11 @@ class IRAdapterGener:
             # no consumer usually mean loss
             if len(ftensor.consumers) == 0:
                 continue
+            # graph attribute: buffer
+            if len(ftensor.producers) == 0:
+                continue
             # no require for communication
-            if len(ftensor.consumers) == 1 and len(ftensor.producers) == 0 and \
+            if len(ftensor.consumers) == 1 and len(ftensor.producers) == 1 and \
                ftensor.consumers[0].device == ftensor.producers[0].device:
                 continue
 

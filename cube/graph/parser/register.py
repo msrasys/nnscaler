@@ -6,7 +6,7 @@ from typing import Any, Callable, List, Optional
 import inspect
 import torch
 
-from cube.graph.function.dimops import IRDimops
+from cube.graph.function.dimops import IRDimops, OpAnno
 
 from cube.graph.parser.mapping import Sign2Op
 
@@ -27,6 +27,9 @@ def register(anno: str, name: Optional[str] = None):
     @cube.register('a (b c) -> (a b) c')
     def funcname(x: torch.Tensor, b: int = 4):
         xxx
+
+    Note: for Optional[torch.Tensor] type, user should annotate the
+    dimension when the input is not None.
     """
     def decorator(fn: Callable):
         if not callable(fn):
@@ -35,21 +38,32 @@ def register(anno: str, name: Optional[str] = None):
         op_name = name if name is not None else fsig
         args = inspect.signature(fn)
         arg_names = list(args.parameters.keys())
-        arg_kind = [args.parameters[name].annotation for name in arg_names]
-        kwarg_names = [name for (name, kind) in zip(arg_names, arg_kind) if kind != torch.Tensor]
-        nkwargs = len(kwarg_names)
-        ninputs = len(arg_names) - len(kwarg_names)
+        arg_kinds = [args.parameters[name].annotation for name in arg_names]
+        allow_types = (torch.Tensor, Optional[torch.Tensor])
+        for ninputs, kind in enumerate(arg_kinds):
+            if kind in allow_types:
+                ninputs += 1
+                continue
+            assert not any(k in allow_types for k in arg_kinds[ninputs:]), \
+                f"Type of {allow_types} should be consecutive in parameter order."
+            break
+        nkwargs = len(arg_names) - ninputs
+        kwarg_names = [name for name in arg_names[ninputs:]]
         # get customized op code
         code = inspect.getsource(fn)
         code = code[code.index('def'):]
 
         def udfop(signature: str, inputs: List[Any]):
+            manno = OpAnno(anno)
             tensors = inputs[:ninputs]
+            for idx in range(ninputs):
+                if arg_kinds[idx] == Optional[torch.Tensor] and tensors[idx] is None:
+                    manno.set_input(idx, '?')
             kwarg_vals = inputs[ninputs:]
             kwargs = dict()
             for name, val in zip(kwarg_names, kwarg_vals):
                 kwargs[name] = val
-            return IRDimops(signature, [anno], tensors, **kwargs, name=op_name)
+            return IRDimops(signature, [repr(manno)], tensors, **kwargs, name=op_name)
 
         print(f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
         Sign2Op.register(fsig, udfop, code)

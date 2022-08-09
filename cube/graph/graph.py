@@ -86,8 +86,8 @@ class IRSegment(IRCell):
 
     def to_str(self, skip_attr: bool = False) -> str:
         name = ('f' if self.forward else 'b') + 'Segment'
-        inputs = tuple(t for t in self.inputs() if not (t.is_param() and skip_attr))
-        outputs = tuple(t for t in self.outputs() if not (t.is_param() and skip_attr))
+        inputs = tuple(t for t in self.inputs() if not (t.is_attr() and skip_attr))
+        outputs = tuple(t for t in self.outputs() if not (t.is_attr() and skip_attr))
         return f'{name}{self._id}-{self.device}(inputs={inputs}, outputs={outputs})'
 
     def __repr__(self):
@@ -113,7 +113,7 @@ class IRGraph(IRCell):
                  module_name: str):
 
         self._nodes: List[IRCell] = list()
-        self._parameters = list()
+        self._attributes = list()
         self._full_tensors: Dict[int, IRFullTensor] = dict()
         self._train: bool = any(
             isinstance(node, IRBpOperation) or
@@ -140,14 +140,14 @@ class IRGraph(IRCell):
         for idx, tensor in enumerate(outputs):
             self.set_output(idx, tensor)
 
-        # set parameters and full tensors
+        # set parameters / buffers and full tensors
         for node in nodes:
             for tensor in node.inputs() + node.outputs():
                 if isinstance(tensor, IRSubTensor):
                     pid = tensor.parent._id
                     self._full_tensors[pid] = tensor.parent
-                    if tensor.is_param():
-                        self._parameters.append(input)
+                    if tensor.is_attr():
+                        self._attributes.append(tensor)
 
         for ftensor in self._full_tensors.values():
             ftensor.clear_producer_consumer()
@@ -190,13 +190,13 @@ class IRGraph(IRCell):
                     producer.add_successor(-1, producer.mirror)
                     producer.mirror.add_predecessor(-1, producer)
 
-    def parameters(self):
+    def attributes(self) -> Tuple[IRSubTensor]:
         """
         Return parameter list
         """
-        return copy.copy(self._parameters)
+        return tuple(self._attributes)
 
-    def full_tensors(self):
+    def full_tensors(self) -> List[IRSubTensor]:
         """
         Return full tensor list
         """
@@ -370,8 +370,8 @@ class IRGraph(IRCell):
             if isinstance(otensor, IRSubTensor) and otensor not in otensors:
                 otensors.append(otensor)
         for otensor in otensors:
-            if otensor.parent._id not in self._full_tensors:
-                self._full_tensors[itensor.parent.tid] = itensor.parent
+            if otensor.parent.tid not in self._full_tensors:
+                self._full_tensors[otensor.parent.tid] = otensor.parent
             idx = 0
             for producer in otensor.parent.producers:
                 if self.nodes().index(producer) < index:
@@ -473,7 +473,7 @@ class IRGraph(IRCell):
                 if isinstance(ftensor, IRFullTensor):
                     producers[ftensor] = node
         for ftensor, cnodes in consumers.items():
-            if len(cnodes) == 1 or ftensor.is_param(): continue
+            if len(cnodes) == 1 or ftensor.is_attr(): continue
             itensors = [ftensor.like() for _ in range(len(cnodes))]
             for itensor, consumer in zip(itensors, cnodes):
                 while ftensor in consumer.inputs():

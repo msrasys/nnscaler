@@ -76,7 +76,7 @@ class Sign2Op:
 
         __ftemplate('embedding'): function.Embedding,
 
-        # __ftemplate('layer_norm'): function.LayerNorm,
+        __ftemplate('cross_entropy'): function.CrossEntropy,
 
         # torch aten
 
@@ -141,6 +141,12 @@ class Sign2Op:
         __ttemplate('cat'): function.Cat,
 
         __ttemplate('stack'): function.Stack,
+
+        __ttemplate('flatten'): function.Flatten,
+
+        __ttemplate('roll'): function.Roll,
+
+        __ttemplate('adaptive_avg_pool1d'): function.AdaptiveAvgPool1d,
 
         # runtime functions
         __rtemplate('anchor'): function.GraphAnchor,

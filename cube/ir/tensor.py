@@ -403,12 +403,20 @@ class IRFullTensor(IRTensor):
         Set the tensor as trainable parameter
         """
         self.requires_grad = True
-        self._is_param = True
+        self._is_attr = True
+        self._is_grad = False
+
+    def as_buffer(self):
+        """
+        Set the tensor as un-trainable buffer
+        """
+        self.requires_grad = False
+        self._is_attr = True
         self._is_grad = False
 
     def as_grad(self):
         self.requires_grad = False
-        self._is_param = False
+        self._is_attr = False
         self._is_grad = True
         return self
 
@@ -825,7 +833,7 @@ class IRSubTensor(IRTensor):
 
     def __repr__(self) -> str:
         anno = 't'
-        if self.is_param():
+        if self.is_attr():
             anno = 'w'
         if self.is_grad():
             anno = 'g'
@@ -835,7 +843,7 @@ class IRSubTensor(IRTensor):
 
     def extra_repr(self) -> str:
         anno = 't'
-        if self.is_param():
+        if self.is_attr():
             anno = 'w'
         if self.is_grad():
             anno = 'g'

@@ -9,8 +9,6 @@ import cube.ir as ir
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.mapping import Sign2Op, DType2IRDType
 
-import warnings
-
 
 _refmodule = torch.nn.Module()
 
@@ -399,6 +397,11 @@ class ScriptModuleParser:
         var_name = node.outputsAt(0).debugName()
         dtype = node.outputsAt(0).type().str()
 
+        if dtype == 'Tensor?':
+            tensor = getattr(module, label)
+            if torch.is_tensor(tensor):
+                dtype = 'Tensor'
+
         # this usually means weight (nn.Parameter in torch)
         if dtype == 'Tensor':
             tensor = getattr(module, label)
@@ -414,8 +417,7 @@ class ScriptModuleParser:
                 if isinstance(tensor, torch.nn.Parameter):
                     ir_tensor.as_param()
                 else:
-                    warnings.warn('Detected non-parameter tensor as graph attribute. Regard them as parameters')
-                    ir_tensor.as_param()
+                    ir_tensor.as_buffer()
                 frame.add_attr(label, ir_tensor)
                 frame.add_attr_content(ir_tensor.tid, tensor)
             frame.add_var(var_name, ir_tensor)

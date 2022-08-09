@@ -38,7 +38,7 @@ def get_backward_callsite_io_tensors(bp_segment:IRSegment):
     input_tensors = [t for t in bp_segment.mirror.inputs() if \
         isinstance(t, IRSubTensor) and \
         t.requires_grad and \
-        not t.is_param()
+        not t.is_attr()
     ]
     output_tensors = [t for t in bp_segment.mirror.outputs() if isinstance(t, IRSubTensor)]
     input_grads = [t.grad for t in input_tensors]
@@ -87,7 +87,7 @@ def calc_tenvars_lifetime(
     lifetime : Dict[IRTensor, int] = dict()
 
     def is_temp_tensor(v):
-        return isinstance(v, IRSubTensor) and not v.is_param()
+        return isinstance(v, IRSubTensor) and not v.is_attr()
 
     lifetime.update((tsin, 0) for tsin in subgraph_inputs if is_temp_tensor(tsin))
 
@@ -190,7 +190,7 @@ class CodeGen:
             if '.' in tensor_name:
                 tensor_name = tensor_name.split('.')[0]
             name = '_'.join([tensor_name, str(tensor.tid)])
-            if prefix_attr is not None and tensor.is_param():
+            if prefix_attr is not None and tensor.is_attr():
                 name = prefix_attr + name
         else:
             name = str(tensor)
@@ -209,7 +209,7 @@ class CodeGen:
         """
         names = []
         for t in tensors:
-            if isinstance(t, IRTensor) and skip_attr and t.is_param():
+            if isinstance(t, IRTensor) and skip_attr and t.is_attr():
                 continue
             names.append(self.tensor_naming(t, prefix_attr))
         name = '(' + ', '.join(names + ['']) + ')'
@@ -228,7 +228,7 @@ class CodeGen:
         """
         names = []
         for t in tensors:
-            if isinstance(t, IRTensor) and skip_attr and t.is_param():
+            if isinstance(t, IRTensor) and skip_attr and t.is_attr():
                 continue
             names.append(self.tensor_naming(t, prefix_attr))
         names = '_' if len(names) == 0 else ', '.join(names)
@@ -251,6 +251,7 @@ class CodeGen:
     def emit_tensors_release(self, tensors:Iterable[IRTensor]) -> str:
         tnames : Generator = (self.tensor_naming(t) for t in tensors)
         return 'del ' + ', '.join(tnames)
+
 
 class AutogradAdapterCodeGen(CodeGen):
     """
@@ -363,6 +364,7 @@ class ModelCodeGen(CodeGen):
         # model full code
         self.init_code: List[str] = [
             '\n\n########## Generated Model Code ###########',
+            'from typing import *',
             'import torch', 'import torch.utils.checkpoint as ckpt',
             'import cube', '', '']
         # customized op code
@@ -465,7 +467,7 @@ class ModelCodeGen(CodeGen):
             args = list()
             for t in node.inputs():
                 if isinstance(t, IRSubTensor):
-                    if not t.is_param():
+                    if not t.is_attr():
                         args.append(self.tensor_naming(t))
                 else:
                     args.append(self.tensor_naming(t))
@@ -519,15 +521,20 @@ class ModelCodeGen(CodeGen):
         This method also populates `self.symbols : SymbolTable` to record
         the names of the variables for the tensors ever encountered.
         """
-
-        sign = 'torch.nn.Parameter(torch.empty({shape}, dtype={dtype}))'
+        psign = "self.register_parameter('{name}', torch.nn.Parameter(torch.empty({shape}, dtype={dtype})))"
+        bsign = "self.register_buffer('{name}', torch.empty({shape}, dtype={dtype}))"
         map_sign = "self.add_full_map('{attr}', {tid}, {slicers}, {val_chunks})"
         for itensor in node.inputs():
             name = self.tensor_naming(itensor, prefix_attr='self.')
             if isinstance(itensor, IRSubTensor):
-                if itensor.is_param() and not self.symbols.exist(name):
+                if itensor.is_attr() and not self.symbols.exist(name):
                     self.symbols.create(name)
-                    code = f'{name} = {sign.format(shape=tuple(itensor.shape), dtype=self.dtype_map(itensor.dtype))}'
+                    sign = psign if itensor.is_param() else bsign
+                    code = sign.format(
+                        name=self.tensor_naming(itensor),
+                        shape=tuple(itensor.shape),
+                        dtype=self.dtype_map(itensor.dtype)
+                    )
                     self.model_init_statements.append(code)
                     tid = itensor.parent.tid
                     slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
@@ -537,6 +544,7 @@ class ModelCodeGen(CodeGen):
                         slicers=str(slicers), val_chunks=val_chunks
                     )
                     self.model_init_statements.append(code)
+                    self.model_init_statements.append('')
             if isinstance(itensor, str):
                 if name.startswith('self.'):
                     if not hasattr(self._ref_module, name[5:]):
@@ -652,7 +660,7 @@ class ModelCodeGen(CodeGen):
 
             subseg = self.execplan.graph.segment(nodes)
 
-            inputs = [t for t in subseg.inputs() if not t.is_param()]
+            inputs = [t for t in subseg.inputs() if not t.is_attr()]
             input_names = [self.tensor_naming(t) for t in inputs]
             input_names_tuple = ', '.join(input_names)
             outputs = [t for t in subseg.outputs()]
