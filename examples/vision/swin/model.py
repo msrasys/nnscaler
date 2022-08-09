@@ -188,7 +188,7 @@ class SwinTransformer(nn.Module):
                     w: torch.Tensor = block.attn.qkv_w.view(3, -1, block.attn.qkv_w.size(-1))
                     block.attn.qkv_w.copy_(w.permute(1,0,2).reshape(-1, w.size(-1)))
 
-    def forward(self, x, labels: torch.Tensor):
+    def forward(self, x):  # , labels: torch.Tensor):
         x = self.patch_embed(x)
         x = self.pos_drop(x)
 
@@ -200,7 +200,8 @@ class SwinTransformer(nn.Module):
         x = torch.flatten(x, 1)
 
         x = self.head(x)
-        loss = self.criterion(x, labels)
+        # loss = self.criterion(x, labels)
+        loss = torch.sum(x)
         return loss
 
     def flops(self):
@@ -224,11 +225,9 @@ class ImageDataLoader(cube.runtime.syndata.CubeDataLoader):
         self.img_size = img_size
         self.num_classes = num_classes
         super().__init__(
-            shapes=([batch_size, 3, img_size, img_size,],
-                    [batch_size],
-            ),
-            dtypes=(dtype, torch.int),
-            batch_dims=(0, 0)
+            shapes=([batch_size, 3, img_size, img_size,],),
+            dtypes=(dtype,),
+            batch_dims=(0,)
         )
         self.samples = [self.random_sample(dtype)]
         
@@ -239,13 +238,7 @@ class ImageDataLoader(cube.runtime.syndata.CubeDataLoader):
             dtype=dtype,
             device=torch.cuda.current_device()
         )
-        labels = torch.randint(
-            0, self.num_classes,
-            size=(self.bs,),
-            dtype=torch.int64,
-            device=torch.cuda.current_device()
-        )
-        return (img, labels)
+        return img
     
     def __iter__(self):
         return self

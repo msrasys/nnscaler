@@ -54,8 +54,8 @@ def train():
     model = cube.SemanticModel(model, dataloader.shapes)
     @cube.compile(model, dataloader, PAS=PAS, override=True)
     def train_iter(model, dataloader):
-        imgs, labels = next(dataloader)
-        loss = model(imgs, labels)
+        imgs = next(dataloader)
+        loss = model(imgs)
         loss.backward()
         # return loss
     model: torch.nn.Module = model.get_gen_module()
