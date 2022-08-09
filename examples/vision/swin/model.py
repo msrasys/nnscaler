@@ -11,17 +11,31 @@ import cube
 class Config:
 
     # swin-large 201M
-    embed_dim = 192
-    depths = [2, 2, 18, 2]
-    num_heads = [6, 12, 24, 48]
+    # embed_dim = 192
+    # depths = [2, 2, 18, 2]
+    # num_heads = [6, 12, 24, 48]
 
     # swin-huge: 2.5B
     # embed_dim = 512
     # depths = [2, 2, 42, 2]
     # num_heads = [16, 32, 64, 128]
 
-    mlp_ratio = 4
+    # 355M
+    embed_dim = 256
+    depths = [2, 2, 18, 2]
+    num_heads = [8, 16, 32, 64]
 
+    # 1.8B
+    # embed_dim = 512
+    # depths = [2, 2, 26, 2]
+    # num_heads = [16, 32, 64, 128]
+
+    # 6.6B
+    # embed_dim = 768
+    # depths = [2, 2, 42, 2]
+    # num_heads = [24, 48, 96, 192]
+
+    mlp_ratio = 4
     drop_path_rate = 0.2
     drop_rate = 0.2
     attn_drop_rate = 0.0
@@ -29,8 +43,8 @@ class Config:
     # dataloader
 
     # 224 x 224
-    img_size = 224
-    window_size = 7
+    # img_size = 224
+    # window_size = 7
 
     # 640 x 640
     img_size = 640
@@ -91,6 +105,7 @@ class BasicLayer(nn.Module):
 
     def forward(self, x):
         for blk in self.blocks:
+            cube.runtime.function.anchor('transformer block start')
             x = blk(x)
         if self.downsample is not None:
             x = self.downsample(x)

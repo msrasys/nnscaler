@@ -2,14 +2,12 @@ from typing import Optional
 import torch
 import cube
 
-from examples.vision.swin.blocks.utils import trunc_normal_
-
 
 # REMARK: as default attention has qkv project weight of (3 head dim_head) C, 
 # this cannot partition on head dimension
 # as the head dimension is a secondary hidden dimension in (3 head dim_head).
 # To make partition work (correctness guarantee), the dimension is swapped as (head dim_head 3)
-@cube.graph.parser.register('B N^ C^, (h+ dh^ 3) C^, (h+ dh^ 3), a^ b^, c^ d^, C^ (h+ dh^), B N^ N^ -> B N^ C^')
+@cube.graph.parser.register('B N^ C^, (h+ dh^ 3) C^, (h+ dh^ 3), (wh^ ww^) (wh^ ww^), t^ h+, C^ (h+ dh^), B N^ N^ -> B N^ C^')
 def window_attn(x: torch.Tensor,
                 qkv_w: torch.Tensor, qkv_bias: torch.Tensor,
                 relative_position_index: torch.Tensor,
@@ -24,24 +22,27 @@ def window_attn(x: torch.Tensor,
     @param ww int: window size of width
     """
     B_, N, C = x.shape
+    dh = qkv_w.size(0) // 3 // h
     # B N (h+ dh 3)
     qkv = torch.nn.functional.linear(x, qkv_w, qkv_bias)
-    # 3 B h N C//h
-    qkv = qkv.reshape(B_, N, h, C // h, 3).permute(4, 0, 2, 1, 3)
-    # 3 B h N C//h
-    # qkv = qkv.reshape(B_, N, 3, h, C // h).permute(2, 0, 3, 1, 4)
+    # 3 B h N dh
+    qkv = qkv.reshape(B_, N, h, dh, 3).permute(4, 0, 2, 1, 3)
+    # 3 B h N dh
+    # qkv = qkv.reshape(B_, N, 3, h, dh).permute(2, 0, 3, 1, 4)
+    # B h N dh
     q, k, v = qkv[0], qkv[1], qkv[2]
+    # B h N dh
     q = q * scale
+    # B h N dh @ B h dh N -> B h N N
     attn = (q @ k.transpose(-2, -1))
-
-    # Wh*Ww,Wh*Ww,nH
+    # (wh ww) (wh * ww) h
     relative_position_bias = relative_position_bias_table[
         relative_position_index.view(-1)
     ].view(wh * ww, wh * ww, -1)
-    # nH, Wh*Ww, Wh*Ww
+    # h (wh ww) (wh ww)
     relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+    # attn: B h N N
     attn = attn + relative_position_bias.unsqueeze(0)
-
     if mask is not None:
         nW = mask.shape[0]
         attn = attn.view(B_ // nW, nW, h, N, N) + mask.unsqueeze(1).unsqueeze(0)
@@ -49,10 +50,10 @@ def window_attn(x: torch.Tensor,
         attn = torch.nn.functional.softmax(attn, dim=-1)
     else:
         attn = torch.nn.functional.softmax(attn, dim=-1)
-
+    # attn: B h N N
     attn = torch.nn.functional.dropout(attn, attn_drop, True, False)
-
-    x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+    # B h N N @ B h N dh -> B h N dh -> B N h dh -> B N h * dh
+    x = (attn @ v).transpose(1, 2).reshape(B_, N, h * dh)
     x = torch.nn.functional.linear(x, dense_w)
     return x
 
@@ -82,7 +83,7 @@ class WindowAttention(torch.nn.Module):
         self.scale = qk_scale or head_dim ** -0.5
 
         # define a parameter table of relative position bias
-        self.relative_position_bias_table = torch.nn.Parameter(
+        self.rp_bias_table = torch.nn.Parameter(
             torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
 
         # get pair-wise relative position index for each token inside the window
@@ -96,7 +97,7 @@ class WindowAttention(torch.nn.Module):
         relative_coords[:, :, 1] += self.window_size[1] - 1
         relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
         relative_position_index = relative_coords.sum(-1)  # wh * ww, wh * ww
-        self.register_buffer('relative_position_index', relative_position_index)
+        self.register_buffer('rp_index', relative_position_index)
 
         self.attn_drop = attn_drop
         self.proj_drop = proj_drop
@@ -108,8 +109,6 @@ class WindowAttention(torch.nn.Module):
         self.out_w = torch.nn.Parameter(torch.empty(dim, dim))
         self.out_b = torch.nn.Parameter(torch.empty(dim))
 
-        trunc_normal_(self.relative_position_bias_table, std=.02)
-
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor]):
         """
         Args:
@@ -118,8 +117,8 @@ class WindowAttention(torch.nn.Module):
         """
         x = window_attn(
             x, self.qkv_w, self.qkv_b,
-            self.relative_position_index,
-            self.relative_position_bias_table,
+            self.rp_index,
+            self.rp_bias_table,
             self.out_w, mask,
             self.attn_drop, self.num_heads,
             self.scale, self.wh, self.ww
