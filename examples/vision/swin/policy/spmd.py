@@ -79,3 +79,38 @@ def PASMegatronTP(graph: IRGraph, resource):
             _replica(graph, node, tp_devs)
 
     return graph
+
+
+def PASMeshShard(graph: IRGraph, resource):
+
+    # print(graph.extra_repr())
+    tp_size = resource.ngpus
+    tp_devs = list(range(tp_size))
+    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
+
+    # annotating code structure -- not consider multiref on embedding weight
+    anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
+    indices = [fnodes.index(anchor) for anchor in anchors]
+    for lid, idx in enumerate(indices):
+        # why -1: multiref
+        fnodes[idx-1].comment = f'===> start of transformer layer {lid}'
+
+    # attention
+    attns = [node for node in fnodes if node.name == 'window_attn']
+    for attn in attns:
+        # _tp(graph, attn, tp_devs, idx=1, dim=0)
+        _coshard(graph, attn, tp_devs, colocate=2, idx=1, dim=0)
+    
+    # feedforward
+    ffns = [node for node in fnodes if node.name == 'feedforward']
+    for ffn in ffns:
+        # _tp(graph, ffn, tp_devs, idx=1, dim=0)
+        _coshard(graph, ffn, tp_devs, colocate=4, idx=1, dim=0)
+
+    # replicate other nodes
+    for node in graph.nodes():
+        if isinstance(node, (IRFwOperation, IRDataOperation)) and len(node.device) == 0:
+            _replica(graph, node, tp_devs)
+
+    # print(graph.extra_repr())
+    return graph

@@ -4,7 +4,7 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/vision/swin/train.py --policy PASMegatronTP --fp16
+    examples/vision/swin/train.py --policy PASMeshShard --fp16
 """
 
 import torch
