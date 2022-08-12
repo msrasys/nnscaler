@@ -160,6 +160,14 @@ class IRFwOperation(IRCell):
                 f"outputs={self.outputs()})")
         return dscp
 
+    def extra_repr(self) -> str:
+        sign = self.signature.split('.')[-1]
+        ins = [t for t in self.inputs()]
+        dscp = (f"FwOp{self._id}-{self.device}(sign={sign}, "
+                f"inputs={ins}, "
+                f"outputs={self.outputs()})")
+        return dscp
+
 
 class IRBpOperation(IRCell):
     """

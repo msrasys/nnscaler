@@ -1,7 +1,7 @@
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 from cube.algorithm.generics import GenericDistAlgo
 
-from cube.graph.function.dimops import IRDimops, DimAnno
+from cube.graph.function.dimops import IRDimops, DimAnno, DimopSplit, TransformRule
 from cube.ir.tensor import IRSubTensor
 
 
@@ -12,7 +12,7 @@ class DimSplitEinops(GenericDistAlgo):
     Note: for dimensions of multiple identitifers, only the first identifier
     can be partitioned.
 
-    Rules for identifier split:
+    Default rule for identifier split:
         * Sum-reduce identifier ('+'):
             * For inputs/outputs that have the identifier, will be partitioned on its diemension uniformly..
             * For inputs that don't have the identifier, will be replicated
@@ -24,18 +24,22 @@ class DimSplitEinops(GenericDistAlgo):
 
         * Frozen identifier ('^'):
             * Cannot be partitioned.
+
+        If the identifier appears as the same name in argument name, the
+        argument will also be uniformly partitioned.
         
         Non-tensor will always be replicated.
     
-    Note this rule will not correctly apply for some operators like linear: xw + b
+    Note the default rule isn't always expressive for all possible partition algorithms.
+    E.g., linear xw + b to partition on reduction dimension,
+    whitch requires b to be value split but actually according to the default rule, will be replicated.
+    Therefore we require special rules for such cases.
     """
 
     def __init__(self, node: IRDimops):
         if not isinstance(node, IRDimops):
             raise TypeError(f"Expect IRDimops")
         super().__init__(node)
-        self._adim: str = None
-        self._reduce: DimAnno.ReduceType = None
     
     def satisfy(self, idx: int, dim: int, num: int) -> bool:
         """
@@ -50,67 +54,121 @@ class DimSplitEinops(GenericDistAlgo):
         assert all(isinstance(cond, int) for cond in [idx, dim, num]), "expect int condition"
         node: IRDimops = self.node
         
+        assert isinstance(node.input(idx), IRSubTensor), f"partitioning on a non-tensor input"
         ninputs = len(node.inputs())
         idx = idx if idx >= 0 else idx + ninputs
         assert idx < ninputs, f"index out of boundary: {idx} >= {ninputs}"
-        assert isinstance(node.input(idx), IRSubTensor), f"partitioning on a non-tensor input"
         dim = dim if dim >= 0 else dim + node.input(idx).ndims
         assert dim < node.input(idx).ndims, f"dimension output of boundary: {dim} >= {node.input(idx).ndims}"
-        # we only partition the first annotated dimension for inner-dimension cases.
-        self._adim: str = node.anno.input(idx).dims[dim].identifiers[0]
-        self._reduce: DimAnno.ReduceType = node.anno.input(idx).dims[dim].reduces[0]
-        dimlen = node.anno.getlen(self._adim)
-        if self._reduce == DimAnno.ReduceType.Freeze:
+        
+        # we only partition the first non-1 annotated dimension for hidden-dimension cases.
+        for adim in node.anno.input(idx).dims[dim].identifiers:
+            if adim == '1^': continue
+            break
+        dimlen = node.anno.getlen(adim)
+        # check node special rules first
+        for rule in node.transform_rules:
+            if rule.input(idx) == DimopSplit.D(dim):
+                return dimlen >= num
+        # otherwise check for default rules
+        reduce = node.anno.input(idx).dims[dim].reduces[0]
+        if reduce == DimAnno.ReduceType.Freeze:
             return False
-        if dimlen < num:
-            return False
-        return True
+        return dimlen >= num
 
     def instantiate(self, idx: int, dim: int, num: int) -> Optional[List[IRDimops]]:
 
         node: IRDimops = self.node
         satisfy = self.satisfy(idx, dim, num)
-        print(f'partition {node.name}: {node.anno} | dim: {self._adim} reduce: {self._reduce.value}')
+        for adim in node.anno.input(idx).dims[dim].identifiers:
+            if adim == '1^': continue
+            break
+        reduce: DimAnno.ReduceType = node.anno.input(idx).dims[dim].reduces[0]
+        print(f'try split {node.name}: {node.anno} | dim: {adim} reduce: {reduce}')
         if not satisfy:
+            print(f'Failed!')
             return None
 
-        def transform(tensor: Any, split_dims: List[int], is_input: bool):
-            # rule: non-tensor will always be replicated
+        rule: TransformRule = self.infer(idx, dim, num)
+    
+        # transform
+        def transform(tensor: Any, split: DimopSplit) -> List[Any]:
             if not isinstance(tensor, IRSubTensor):
                 return [tensor] * num
-            assert len(split_dims) <= 1, "find split dims ({self._adim}) more than 1"
-            # rule: spatial identifier ('')
-            if self._reduce == DimAnno.ReduceType.Dim:
-                return tensor.replicate(num) if len(split_dims) == 0 else tensor.split_dim(split_dims[0], num)
-            # rule: reduce-sum identifier ('+')
-            if self._reduce == DimAnno.ReduceType.Sum:
-                if len(split_dims) == 0:
-                    return tensor.replicate(num) if is_input else tensor.split_val(num)
-                else:
-                    return tensor.split_dim(split_dims[0], num)
-            raise RuntimeError(f"no matching reduce type for transform: {self._reduce}")
+            if split.isD():
+                return tensor.split_dim(split.dim, num)
+            if split.isR():
+                return tensor.replicate(num)
+            if split.isV():
+                return tensor.split_val(num)
+            assert False, f"got unknown split: {split}"
 
-        ins, ous = list(), list()
-        for iidx, itensor in enumerate(node.inputs()):
-            split_dims = node.anno.input(iidx).getdims(self._adim)
-            ins.append(transform(itensor, split_dims, is_input=True))
-
-        for oidx, otensor in enumerate(node.outputs()):
-            split_dims = node.anno.output(oidx).getdims(self._adim)
-            ous.append(transform(otensor, split_dims, is_input=False))
+        ins = list()
+        for split, itensor in zip(rule.inputs(), node.inputs()):
+            ins.append(transform(itensor, split))
+        ous = list()
+        for split, otensor in zip(rule.outputs(), node.outputs()):
+            ous.append(transform(otensor, split))
+        kwargs = rule.modifier()(node.kwargs, idx, dim, num)
 
         sub_nodes = list()
         for nid in range(num):
             inputs = [t[nid] for t in ins]
             outputs = [t[nid] for t in ous]
-            updated_kwargs = dict()
-            if self._adim in node.kwargs and isinstance(node.kwargs[self._adim], int):
-                updated_kwargs[self._adim] = node.kwargs[self._adim] // num
-            sub_node: IRDimops = node.new(inputs, outputs, **updated_kwargs)
+            sub_node: IRDimops = node.new(inputs, outputs, **kwargs)
             sub_node.infer_shape()
             sub_nodes.append(sub_node)
 
         return sub_nodes
+
+    def infer(self, idx: int, dim: int, num: int) -> Optional[TransformRule]:
+        """
+        Given the partition choice on `dim` dimension of idx-th input,
+        return the partitioning of the output tensor.
+
+        @param idx int: the input index
+        @param dim int: the dimension to partition
+
+        @return rule TransformRule: the transformation rule
+        """
+        node: IRDimops = self.node
+        adim: str = node.anno.input(idx).dims[dim].identifiers[0]
+        reduce: DimAnno.ReduceType = node.anno.input(idx).dims[dim].reduces[0]
+        if reduce == DimAnno.ReduceType.Freeze:
+            return None
+        # check node special rules first
+        for r in node.transform_rules:
+            if r.input(idx) == DimopSplit.D(dim):
+                return r
+        # otherwise use default rule
+        itransform, otransform = [], []
+        # input
+        for idx, idim in enumerate(node.anno.inputs()):
+            dims = idim.getdims(adim)
+            assert len(dims) <= 1, "Cannot split on multple same tensors"
+            if len(dims) == 1:
+                itransform.append(DimopSplit.D(dims[0]))
+            else:
+                itransform.append(DimopSplit.R())
+        # output
+        for idx, odim in enumerate(node.anno.outputs()):
+            dims = odim.getdims(adim)
+            if len(dims) == 1:
+                otransform.append(DimopSplit.D(dims[0]))
+            else:
+                otransform.append(
+                    DimopSplit.R() if reduce == DimAnno.ReduceType.Dim else DimopSplit.V()
+                )
+        # modifier
+        def modify(kwargs: Dict, idx: int, dim: int, num: int):
+            updated_kwargs = dict(**kwargs)
+            if adim in updated_kwargs:
+                assert updated_kwargs[adim] % num == 0, \
+                    f"cannot set kwargs: {adim}: {updated_kwargs[adim]} % num ({num}) != 0"
+                updated_kwargs[adim] = updated_kwargs[adim] // num
+            return updated_kwargs
+
+        return TransformRule(itransform, otransform, modify)
 
 
 class SimpleViewSplitEinops(GenericDistAlgo):
@@ -210,7 +268,7 @@ class SimpleViewSplitEinops(GenericDistAlgo):
             if self._adimo in node.kwargs and isinstance(node.kwargs[self._adimo], int):
                 assert 0, "should not happen"
             assert len(outputs) == 1, f"outputs len should be one"
-            node.kwargs['size'] = outputs[0].shape
+            updated_kwargs['size'] = outputs[0].shape
             sub_node: IRDimops = node.new(inputs, outputs, **updated_kwargs)
             sub_node.infer_shape()
             sub_nodes.append(sub_node)

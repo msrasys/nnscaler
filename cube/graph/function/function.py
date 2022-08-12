@@ -7,7 +7,7 @@ import warnings
 from cube.ir.cten import IRTensor
 from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor, IRSubTensor
-from cube.graph.function.dimops import ShapeAnno, OpAnno, IRDimops
+from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
 from cube.graph.function.conv import IRConv2D
 from cube.graph.function.conv import IRConv3D
 from cube.graph.function.pad import IRPad
@@ -593,26 +593,57 @@ def View(signature, inputs):
                 bracket[subdim] = str(shape_map[edim])
 
     # find out the axis that can be partitioned
-    spatial_in = set()
-    spatial_ou = set()
-    for in_bracket in in_anno:
-        for edim in in_bracket:
-            if edim != '1':
-                spatial_in.add(edim)
-                break
-    for ou_bracket in ou_anno:
-        for edim in ou_bracket:
-            spatial_ou.add(edim)
-    spatial = spatial_in.intersection(spatial_ou)
-
+    ispatial = set()
+    ifirst = []
+    for bracket in in_anno:
+        for hdim in range(len(bracket)):
+            if bracket[hdim] == '1':
+                continue
+            ispatial.add(bracket[hdim])
+            ifirst.append(bracket[hdim])
+            break
+    ospatial = set()
+    ofirst = []
+    for bracket in ou_anno:
+        for hdim in range(len(bracket)):
+            if bracket[hdim] == '1':
+                continue
+            ospatial.add(bracket[hdim])
+            ofirst.append(bracket[hdim])
+            break
+    spatial = ispatial.intersection(ospatial)
+    
+    # set dimension cannot be partitioned
     for bracket in in_anno + ou_anno:
-        for subdim, edim in enumerate(bracket):
-            if edim not in spatial:
-                bracket[subdim] = str(shape_map[edim])
-                # bracket[subdim] = edim + '^'
+        for hdim in range(len(bracket)):
+            if bracket[hdim] not in spatial:
+                bracket[hdim] = str(shape_map[bracket[hdim]])
+
+    # TODO: strange behaviour if every identitifer creates own
+    # modifier, seems all previous modifiers will be overrided by
+    # the last one.
+    def view_modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
+        kwargs = dict(**kwargs)
+        ofirst = [bracket[0] for bracket in ou_anno]
+        identifier = in_anno[idx][0]
+        oidx = ofirst.index(identifier)
+        size = list(kwargs['size'])
+        size[oidx] = size[oidx] // num
+        kwargs['size'] = tuple(size)
+        return kwargs
+
+    # special rules: to change output size argument
+    rules = []
+    for identifier in spatial:
+        iidx = ifirst.index(identifier)
+        oidx = ofirst.index(identifier)
+        rules.append(
+            TransformRule([DimopSplit.D(iidx)], [DimopSplit.D(oidx)], view_modifier)
+        )
+
     anno = OpAnno.create_op_str([in_anno], [ou_anno])
     signature = 'torch.Tensor.view'
-    return IRDimops(signature, [anno], [input], 'view', size=tuple(shape))
+    return IRDimops(signature, [anno], [input], 'view', rules, size=tuple(shape))
 
 
 def Reshape(signature, inputs):
@@ -812,8 +843,10 @@ def Flatten(signature, inputs: List):
 def Roll(signature, inputs: Tuple[IRTensor, Union[int, Tuple[int]], Union[int, Tuple[int]]]):
     tensor = inputs[0]
     shifts, dims = inputs[1:]
-    # TODO: enable partition
-    ishape = ShapeAnno.create_shape_str(tensor.shape, reduction='^')
+    ishape = ShapeAnno.create_shape_str(tensor.shape)
+    for dim in range(len(ishape)):
+        if dims is None or dim in dims:
+            ishape[dim] += '^'
     anno = OpAnno.create_op_str([ishape], [ishape])
     return IRDimops(signature, [anno], [tensor], 'roll', shifts=shifts, dims=dims)
 
