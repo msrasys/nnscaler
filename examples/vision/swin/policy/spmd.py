@@ -1,8 +1,10 @@
-from typing import List
+from typing import Dict, List
 
 from cube.graph import IRGraph
 from cube.graph.function.anchor import IRGraphAnchor
+from cube.graph.function.dimops import DimopSplit, TransformRule
 from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
+from cube.ir.tensor import IRFullTensor, IRSubTensor
 
 
 # ========================= parallelisms =================================
@@ -37,7 +39,6 @@ def _coshard(graph: IRGraph, node: IRFwOperation, devs: List[int], colocate: int
             graph.assign(sub_node, devid)
     return sub_nodes
 
-
 # ========================= parallelisms =================================
 
 
@@ -48,6 +49,53 @@ def PASSingle(graph: IRGraph, resource):
     for node in graph.nodes():
         if not isinstance(node, IRBpOperation):
             graph.assign(node, 0)
+    return graph
+
+
+def PASData(graph: IRGraph, resource):
+    dp_size = resource.ngpus
+    dp_devs = list(range(dp_size))
+
+    ftensors: Dict[IRFullTensor, DimopSplit] = dict() # ftensor: producer partition index
+
+    dataloaders = [node for node in graph.nodes() if isinstance(node, IRDataOperation)]
+    for dataloader in dataloaders:
+        algo = dataloader.algorithms('data')
+        subnodes = graph.partition(dataloader, algo, num=dp_size)
+        for idx, sub_node in enumerate(subnodes):
+            graph.assign(sub_node, idx)
+        for oidx, output in enumerate(dataloader.outputs()):
+            if not isinstance(output, IRSubTensor):
+                continue
+            if output.parent not in ftensors:
+                bdim = dataloader.get_batch_dims()[oidx]
+                ftensors[output.parent] = DimopSplit.D(bdim)
+    
+
+    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
+    for node in fnodes:
+        if isinstance(node, IRGraphAnchor):
+            continue
+        partitioned = False
+        for iidx, itensor in enumerate(node.inputs()):
+            if not isinstance(itensor, IRSubTensor):
+                continue
+            if itensor.parent in ftensors:
+                dim = ftensors[itensor.parent]
+                assert dim.isD(), f"on partitioning node: {node}:\nexpected input to be partitioned on dimensions but found {dim}"
+                rule: TransformRule = node.algorithms('dim').infer(idx=iidx, dim=dim.dim, num=len(dp_devs))
+                # print(rule)
+                assert rule is not None, f"fail to infer node: {node}, idx={iidx}"
+                for odim, output in zip(rule.outputs(), node.outputs()):
+                    ftensors[output.parent] = odim
+                    # print(f'==> setting next dim: {odim}')
+                _tp(graph, node, dp_devs, idx=iidx, dim=dim.dim)
+                partitioned = True
+                break
+        if not partitioned:
+            print(f'warning: cannot partition of node using dim propagation, use replica instead: {node}')
+            _replica(graph, node, dp_devs)
+
     return graph
 
 

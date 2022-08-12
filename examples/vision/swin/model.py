@@ -10,6 +10,11 @@ import cube
 
 class Config:
 
+    # POC test case
+    embed_dim = 192
+    depths = [2, 2, 2, 2]
+    num_heads = [8, 16, 32, 64]
+
     # swin-large 201M
     # embed_dim = 192
     # depths = [2, 2, 18, 2]
@@ -21,9 +26,9 @@ class Config:
     # num_heads = [16, 32, 64, 128]
 
     # 355M
-    embed_dim = 256
-    depths = [2, 2, 18, 2]
-    num_heads = [8, 16, 32, 64]
+    # embed_dim = 256
+    # depths = [2, 2, 18, 2]
+    # num_heads = [8, 16, 32, 64]
 
     # 1.8B
     # embed_dim = 512
@@ -217,7 +222,7 @@ class SwinTransformer(nn.Module):
 # =========================== Data Loader =======================
 
 
-class ImageDataLoader(cube.runtime.syndata.CubeDataLoader):
+class ImageDataLoader(cube.runtime.syndata.SynDataLoader):
 
     def __init__(self, batch_size: int, img_size: int, num_classes: int, dtype=torch.float32):
 
@@ -229,19 +234,3 @@ class ImageDataLoader(cube.runtime.syndata.CubeDataLoader):
             dtypes=(dtype,),
             batch_dims=(0,)
         )
-        self.samples = [self.random_sample(dtype)]
-        
-    def random_sample(self, dtype: torch.dtype):
-        torch.manual_seed(0)
-        img = torch.rand(
-            *(self.bs, 3, self.img_size, self.img_size),
-            dtype=dtype,
-            device=torch.cuda.current_device()
-        )
-        return img
-    
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.samples[0]

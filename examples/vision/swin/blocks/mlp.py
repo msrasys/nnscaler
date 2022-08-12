@@ -3,7 +3,7 @@ import torch.nn as nn
 import cube
 
 
-@cube.graph.parser.register('L^ N E^, H+ E^, H+, E^ H+ -> L^ N E^', name='feedforward')
+@cube.graph.parser.register('B HW^ E^, H+ E^, H+, E^ H+ -> B HW^ E^', name='feedforward')
 def feedforward(x: torch.Tensor,
                 proj1: torch.Tensor, proj1_bias: torch.Tensor,
                 proj2: torch.Tensor, dropout: float) -> torch.Tensor:

@@ -61,6 +61,24 @@ OMP_NUM_THREADS=4 torchrun \
     examples/nlp/gpt/train.py --policy PASMeshShard --fp16
 
 
+# test Swin model
+
+OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    examples/vision/swin/train.py --policy PASData --fp16
+
+OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    examples/vision/swin/train.py --policy PASMegatronTP --fp16
+
+OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    examples/vision/swin/train.py --policy PASMegatron --fp16
+
+
 # test scientific model
 
 OMP_NUM_THREADS=4 torchrun \

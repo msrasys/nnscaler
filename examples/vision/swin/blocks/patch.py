@@ -22,6 +22,13 @@ def patch_merge(x: torch.Tensor, h: int, w: int):
     x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
     return x
 
+@cube.graph.parser.register('B ic+ (ps^ w^) (ps^ h^), oc ic+ k^ k^, oc -> B oc w^ h^')
+def patch(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, ps: int):
+    """
+    @param ps int: patch size
+    """
+    return torch.conv2d(x, w, b, stride=ps)
+
 
 class PatchMerging(nn.Module):
     r""" Patch Merging Layer.
@@ -72,8 +79,7 @@ class PatchEmbed(nn.Module):
     def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
         super().__init__()
         img_size = (img_size, img_size)
-        patch_size = (patch_size, patch_size)
-        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        patches_resolution = [img_size[0] // patch_size, img_size[1] // patch_size]
         self.img_size = img_size
         self.patch_size = patch_size
         self.patches_resolution = patches_resolution
@@ -82,21 +88,26 @@ class PatchEmbed(nn.Module):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
 
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        # patch_size = (patch_size, patch_size)
+        # self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.conv_w = nn.Parameter(torch.empty(embed_dim, in_chans, self.patch_size, self.patch_size))
+        self.conv_b = nn.Parameter(torch.empty(embed_dim))
+    
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
         else:
             self.norm = None
 
     def forward(self, x):
-        x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
+        # x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
+        x = patch(x, self.conv_w, self.conv_b, self.patch_size).flatten(2).transpose(1, 2)
         if self.norm is not None:
             x = self.norm(x)
         return x
 
     def flops(self):
         Ho, Wo = self.patches_resolution
-        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
+        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size * self.patch_size)
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
         return flops

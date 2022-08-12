@@ -42,7 +42,7 @@ else:
 
 def train():
 
-    batch_size = 1
+    batch_size = 4
 
     cfg = Config()
     model = SwinTransformer()
