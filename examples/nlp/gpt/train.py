@@ -52,7 +52,6 @@ def train():
     model = GPT()
     model = model if not args.fp16 else model.half()
     dataloader = GPTDataLoader(batch_size)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
     model = cube.SemanticModel(model, dataloader.shapes)
     @cube.compile(model, dataloader, PAS=PAS, override=True)
@@ -61,6 +60,8 @@ def train():
         loss = model(input_ids, position_ids)
         loss.backward()
     model = model.get_gen_module()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
     torch.distributed.barrier()
     print_each_rank('model weight consumpition:', rank_only=0)
