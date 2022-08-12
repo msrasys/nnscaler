@@ -2,7 +2,7 @@ from typing import List, Tuple, Optional
 
 from cube.algorithm.generics import GenericDistAlgo
 
-from cube.graph.function.creators import IRToTensor, IROnes, IRRand
+from cube.graph.function.creators import IRToTensor, IROnes, IRRand, IRZeros
 from cube.ir.tensor import IRSubTensor
 
 
@@ -52,6 +52,43 @@ class DimSplitTo(GenericDistAlgo):
             inputs = [t[nid] for t in ins]
             outputs = [t[nid] for t in ous]
             sub_nodes.append(node.new(inputs, outputs))
+        return sub_nodes
+
+class DimSplitZeros(GenericDistAlgo):
+    def __init__(self, node: IRZeros):
+        if not isinstance(node, IRZeros):
+            raise TypeError(f"Expect IRZeros")
+        super().__init__(node)
+
+    def satisfy(self, dim: int, num: int):
+        """
+        config = dict(idx=int, dim=int, num=num)
+
+        """
+        assert all(isinstance(t, int) for t in [dim, num]), "dim and num should be integer"
+        node: IRZeros = self.node
+        
+        assert dim < len(node.output(0).shape), "Split dimension should be smaller than tensor dimension"
+
+        # split non-pad dim
+        return node.output(0).shape[dim] >= num
+
+    def instantiate(self, dim: int, num: int) -> Optional[List[IRZeros]]:
+
+        node: IRZeros = self.node
+        satisfy = self.satisfy(dim, num)
+        if not satisfy:
+            return None
+        
+        ous = list()
+        for oidx, otensor in enumerate(node.outputs()):
+            assert isinstance(otensor, IRSubTensor), "Output of select should be IRSubTensor"
+            ous.append(otensor.split_dim(dim, num))
+
+        sub_nodes = list()
+        for nid in range(num):
+            outputs = [t[nid] for t in ous]
+            sub_nodes.append(node.new(outputs))
         return sub_nodes
     
     

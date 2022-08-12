@@ -28,6 +28,12 @@ class IRZeros(IRFwOperation):
         self.output(0).shape = shape
         return True
 
+    def new(self, outputs: List[IRTensor]):
+        op = IROnes(self.signature, outputs[0].shape, self.name, self.kwargs['dtype'])
+        op.set_output(0, outputs[0])
+        assert op.infer_shape(), "IRZeros::new infer_shape failed"
+        return op
+
 class IROnes(IRFwOperation):
     def __init__(self, signature: str, shape: List[int], name: str, ir_dtype:IRDType):
 

@@ -2,25 +2,11 @@ from cube.graph import IRGraph
 from cube.graph.function import IRConv2D, IRConv3D
 from cube.graph.function import IRDimops, IRPad
 from cube.ir.cten import IRTensor, IRCell
-from cube.graph.function import IRSelect, IRSelectScatter, IRSlice, IRToTensor, IROnes, IRRand
-
+from cube.graph.function import IRSelect, IRSelectScatter, IRSlice, IRToTensor, IROnes, IRRand, IRZeros
 
 def PAS(graph: IRGraph, resource):
     for node in graph.nodes():
-        if isinstance(node, IRConv3D):
-            sub_nodes = list()
-            algo = node.algorithms('halo')
-            Wnodes = graph.partition(node, algo, idx=0, dim=3, num=resource.ngpus // 2)
-            for Wnode in Wnodes:
-                algo = Wnode.algorithms('halo')
-                Hnodes = graph.partition(Wnode, algo, idx=0, dim=2, num=2)
-                sub_nodes += Hnodes
-        else:
-            sub_nodes = graph.replicate(node, times=resource.ngpus)
-        # sub_nodes = graph.replicate(node, times=resource.ngpus)
-
-        for idx, sub_node in enumerate(sub_nodes):
-            graph.assign(sub_node, idx)
+        graph.assign(node, 0)
     print(graph.extra_repr())
     return graph
 
@@ -164,6 +150,9 @@ def PAS_ALL_Y(graph: IRGraph, resource):
             algo = node.algorithms('dim')
             sub_nodes = graph.partition(node, algo, dim=node.output(0).ndims-2, num=resource.ngpus)
             assert sub_nodes != None
+        elif isinstance(node, IRZeros) and node.output(0).ndims >= 3:
+            algo = node.algorithms('dim')
+            sub_nodes = graph.partition(node, algo, dim=node.output(0).ndims-2, num=resource.ngpus)
         # elif isinstance(node, IRRand) and node.output(0).ndims >= 3:
         #     algo = node.algorithms('dim')
         #     sub_nodes = graph.partition(node, algo, dim=node.output(0).ndims-1, num=resource.ngpus)
