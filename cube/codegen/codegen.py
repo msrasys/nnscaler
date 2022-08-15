@@ -24,6 +24,8 @@ from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 from cube.codegen.frontend_mapping import Sign2EmitRule
 
+import os
+
 def get_backward_callsite_io_tensors(bp_segment:IRSegment):
     """
     Returns:
@@ -367,6 +369,11 @@ class ModelCodeGen(CodeGen):
             'from typing import *',
             'import torch', 'import torch.utils.checkpoint as ckpt',
             'import cube', '', '']
+
+        use_nnfusion = os.environ.get('USE_NNFUSION')
+        if use_nnfusion:
+            self.init_code.extend(['import nnfusion', ''])
+
         # customized op code
         for _, op_impl in Sign2Op.kOpCodeDef.items():
             self.init_code.append(op_impl)
@@ -473,6 +480,7 @@ class ModelCodeGen(CodeGen):
                     args.append(self.tensor_naming(t))
             node_args.append(args)
 
+        use_nnfusion = os.environ.get('USE_NNFUSION')
         # generate full code
         with ClassBlock(class_name='GenModel', derived=['cube.runtime.module.CubeModule']) as cb:
             with FunctionBlock(func_name='__init__', args=['self']) as ib:
@@ -488,6 +496,7 @@ class ModelCodeGen(CodeGen):
                 name = self.node_naming(node)
                 input_args = ['self'] + node_args[idx]
                 forward_code = self.model_methods_bodies[idx]
+
                 with FunctionBlock(func_name=name, args=input_args) as fb:
                     fb.insert_body(forward_code)
                     # generate output
@@ -495,6 +504,8 @@ class ModelCodeGen(CodeGen):
                     return_code = f"return {', '.join(outputs)}"
                     fb.insert_body(return_code)
                 cb.insert_body('')
+                if use_nnfusion and name.startswith('segment'):
+                    cb.insert_body('@nnfusion.jit')
                 cb.insert_body(fb.code)
 
 
