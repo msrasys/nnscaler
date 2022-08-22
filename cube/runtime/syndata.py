@@ -2,7 +2,7 @@ r"""
 Synthetic Data Loader
 """
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 import torch
 
 
@@ -121,7 +121,7 @@ class SynDataLoader(CubeDataLoader):
     for given shapes, dtypes.
     """
     def __init__(self, shapes: Tuple[List[int]], dtypes: Tuple[torch.dtype] = None,
-                 batch_dims: Tuple[int] = None, length: int = 1280):
+                 batch_dims: Tuple[int] = None):
         """
         shapes Tuple[Tuple[int]]:
             The shape for each data
@@ -129,8 +129,6 @@ class SynDataLoader(CubeDataLoader):
             The dtype for each data (Default None: use torch.float32)
         batch_dims Tuple[int]:
             The batch dimension of each data (Default None: dimension 0 is the batch dim)
-        length int:
-            Total number of sample batches. (Default 1280)
         """
         if batch_dims is None:
             batch_dims = tuple([0] * len(shapes))
@@ -138,50 +136,32 @@ class SynDataLoader(CubeDataLoader):
             dtypes = tuple([torch.float] * len(shapes))
 
         super().__init__(shapes, dtypes, batch_dims)
-        self.length = length
-        self.pos = 0
-
-        self._buffer_num = None
-        self.datas: torch.Tensor = list()
-        self.set_data_buffer()
+        self.buffer: Union[torch.Tensor, Tuple[torch.Tensor]] = None
+        self.set_random_sample()
 
     def __iter__(self):
-        self.pos = 0
         return self
 
-    def set_data_buffer(self, buffer_num = 4):
+    def __next__(self):
+        return self.buffer
+
+    def set_random_sample(self):
         torch.manual_seed(0)
-        self.datas = list()
-        self._buffer_num = buffer_num
-        for _ in range(self._buffer_num):
-            datas = list()
-            for shape, dtype in zip(self.shapes, self.dtypes):
-                data = torch.randn(shape, dtype=dtype).cuda()
-                datas.append(data)
-            self.datas.append(datas)
+        datas = []
+        for shape, dtype in zip(self.shapes, self.dtypes):
+            datas.append(
+                torch.rand(
+                    shape, dtype=dtype, 
+                    device=torch.cuda.current_device(),
+                    requires_grad=False)
+            )
+        if len(datas) == 0:
+            self.buffer = None
+        else:
+            datas = tuple(datas) if len(datas) > 1 else datas[0]
+            self.buffer = datas
 
     def set_batch_size(self, batch_size: int):
         super().set_batch_size(batch_size)
-        self.set_data_buffer()
+        self.set_random_sample()
 
-    def __next__(self):
-        self.pos += 1
-        if self.pos == self.length:
-            raise StopIteration
-        datas = self.datas[self.pos % self._buffer_num]
-        if len(datas) == 1: return datas[0]
-        else: return tuple(datas)
-
-
-class SynTextDataLoader(SynDataLoader):
-
-    def set_data_buffer(self, buffer_num=4, text_num=50257):
-        torch.manual_seed(0)
-        self.datas = list()
-        self._buffer_num = buffer_num
-        for _ in range(self._buffer_num):
-            datas = list()
-            for shape in self.shapes:
-                data = torch.randint(0, text_num, shape, dtype=torch.long).cuda()
-                datas.append(data)
-            self.datas.append(datas)
