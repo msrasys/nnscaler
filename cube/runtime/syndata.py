@@ -156,7 +156,11 @@ class SynDataLoader(CubeDataLoader):
         for _ in range(self._buffer_num):
             datas = list()
             for shape, dtype in zip(self.shapes, self.dtypes):
-                data = torch.randn(shape, dtype=dtype).cuda()
+                # TODO
+                if dtype == torch.int32:
+                    data = torch.randint(0, 20000, shape, dtype=dtype).cuda()
+                else:
+                    data = torch.randn(shape, dtype=dtype).cuda()
                 datas.append(data)
             self.datas.append(datas)
 
