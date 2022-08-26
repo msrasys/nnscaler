@@ -4,10 +4,10 @@
 
 ### Annotation for Shape Inference and Transformation
 
-SuperScaler uses annotated dimension to represent an operator (Dimop).
+SuperScaler uses annotation to represent an operator (Dimop).
 The goal of annotation is for 1). shape inference and 2) transformation plan.
 
-To annotate an operator, following example shows the annotation matrix multiplication. An operator has inputs and outputs. The inputs can be tensors or non-tensors, while outputs are usually tensors.
+To annotate an operator, following example shows the annotation of matrix multiplication. An operator has inputs and outputs. The inputs can be tensors or non-tensors, while outputs are usually tensors.
 
 ```py
 # annotation: m^ kd+, kd+ n -> m^ n
@@ -16,37 +16,39 @@ def operator(x: torch.Tensor, w: torch.Tensor, h: float) -> torch.Tensor:
     return out
 ```
 
-To separate inputs and outputs of an operator, `'->'` is a separation keyword where its left part are inputs and right part are outputs. Each tensor representation is further separated by `','`. 
+To separate inputs and outputs of an operator, `'->'` is a separation keyword where its left part are inputs and right part are outputs. Inside inputs and outputs region, annotation of each tensor is further separated by `','`. 
 
-Each tensor in inputs and outputs is reperented by **{identifiers}{reduction}** on each dimension, like `'m^ kd+'`, `'kd+ n'`, `'m^ n'`, where `m`, `kd` and `n` are identitifiers, `'^'` and `'+'` are reductions.
+Every dimension of a tensor is annotated by a template of **{identifiers}{reduction}**, like `'m^ kd+'`, `'kd+ n'`, `'m^ n'`, where `m`, `kd` and `n` are identitifiers, `'^'` and `'+'` are reductions.
 
 If a tensor is represented as `'m^ kd+'`, it indicates the tensor has two dimensions, the first dimension is `m` and the second dimension is `kd`. Dimensions need to be separated by space `' '`. 
 
 * Identifiers
 
-  Identifiers are served for the shape inference. Same identifier of different tensors indicates they have same length at their dimension.
+  Identifiers are served for shape inference. Same identifier of different tensors indicates they have same length of their dimension.
 
   An `identifier` must be one of:
 
     1) symbolic annotation that must match with the criterion of python `str.isidentifier`.
 
-    2) numeric string that must match with python str.isdecimal. This indicates the shape is the same value. numeric string will always have '^' reduction type'
+    2) numeric string that must match with python str.isdecimal. This indicates the shape is the same value. Numeric string will always have '^' reduction type
 
   Special identifier:
 
-    1) `'*'`: this special identifier indicates the dimension is dynamic, which will automatically get expanded given the shape
+    1) `'*'`: this special identifier indicates the dimension is dynamic, which will automatically get expanded given the shape. If there are multiple `*` for different tensors, then they must have same shape for the expanded dimensions,
+    
+        e.g., `'* t -> a * t'` can be expanded into `'b c t -> a b c t'`
 
     2) `'?'`: this special identifier indicates the value is not a tensor, which will be ignored
 
-  To infer the output shape, the identifiers in output tensors must be 1) appear in inputs, 2) numeric string.
+  To infer the output shape, the identifiers in output tensors must be 1) appear in inputs or 2) numeric string.
 
 * Reductions
 
   Reductions are served for transformation plans. The reduction can be one of {`''`, `'+'`, `'^'`}:
   
-    * `''` (empty) indicates this dimension can be partitioned, and each output should have this dimension.
+    * `''` (empty) indicates this dimension can be spatially partitioned, and each output that have this identifier will also be spatially partitioned.
 
-    * `'+'` indicates this dimension can be partitioned. Each output doesn't have this and need to do sum-reduction.
+    * `'+'` indicates this dimension can be spatially partitioned. And each output that doesn't have this identifier will be numerically partitioned (sum-reduction required).
 
     * `'^'` means this dimension cannot be partitioned.
 
@@ -63,12 +65,12 @@ If a tensor is represented as `'m^ kd+'`, it indicates the tensor has two dimens
       return out
   ```
 
-  This can be represented by annotating a dimension using brackets `()` that contains multple identifiers (and their reductions), like `'(h t) k'` here for the input tensor. To help system infer the number of `h` and `t` in the annotation, the function requires to put in a same-named argument `h` or `t` (`h=8` here in example).
+  This can be represented by annotating a dimension using brackets `()`. The bracket contains multple identifiers (and their reductions), like `'(h t)'` here for the first dimension of the input tensor. To help system infer the number of `h` and `t` in the annotation, the function requires to put in a same-named argument `h` or `t` (`h=8` here in example).
 
 
 ## Register Python Functions as Operators
 
-To register a customized "matmul" operator in the runtime, user can simply define the python function and add an decorator on the function with its annotations:
+To register a customized "matmul" operator in the runtime, user can simply define a python function and add an decorator on the function with its annotations:
 
 ```py
 @cube.graph.parser.register('(h^ m^) kd+, kd+ n -> h^ m^ n', name='matmul_custom')
