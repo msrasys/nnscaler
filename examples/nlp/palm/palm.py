@@ -104,17 +104,44 @@ class AlibiPositionalBias(nn.Module):
         return bias
 
 
-class SwiGLU(nn.Module):
+@cube.graph.parser.register('N L^ E^, E^ F^, E^ E^ -> N L^ E^',
+                            name='multi_head_attention')
+def multi_head_attention(x: torch.Tensor, qkv_proj: torch.Tensor,
+                         out_proj: torch.Tensor, heads: int, scale: float):
+    '''
+    x: [bs, len, dim]
+    qkv_proj: [dim, dim + dim_head]
+    out_proj: [dim, dim]
+    '''
+    bs, n, dim = x.size()
+    dim_head = dim // heads
 
-    def __init__(self, dim):
-        super().__init__()
+    q, kv = torch.matmul(x, qkv_proj).split((dim, dim_head), dim=-1)
+    q = q.view(bs, n, heads, dim_head).transpose(1, 2) * scale
+    q = q.reshape(bs, heads * n, dim_head)
+    trans_kv = kv.transpose(1, 2)
+    sim = torch.bmm(q, trans_kv).view(bs, heads, n, n)
+    attn = torch.nn.functional.softmax(sim, dim=-1)
+    attn = attn.view(bs, heads * n, n)
+    out = torch.bmm(attn, kv).view(bs, heads, n, dim_head)
+    out = torch.transpose(out, 1, 2).reshape(bs, n, dim)
+    out = torch.matmul(out, out_proj)
+    return out
 
-        self.dim = dim
 
-    def forward(self, x):
-        # x, gate = x.chunk(2, dim=-1)
-        u, gate = x[:, :, 0:self.dim // 2], x[:, :, self.dim // 2:]
-        return F.silu(gate) * u
+@cube.graph.parser.register('N L^ E^, E^ F^, G^ H^ -> N L^ H^',
+                            name='feedforward')
+def feedforward(x: torch.Tensor, proj1: torch.Tensor, proj2: torch.Tensor):
+    '''
+    x: [bs, len, dim]
+    proj1: [dim, 2 * ff_mult * dim]
+    proj2: [ff_mult * dim, dim]
+    '''
+    x = torch.matmul(x, proj1)
+    x, gate = x.chunk(2, dim=-1)
+    x = torch.nn.functional.silu(gate) * x
+    x = torch.matmul(x, proj2)
+    return x
 
 
 class PaLMLayer(nn.Module):
@@ -129,14 +156,13 @@ class PaLMLayer(nn.Module):
         # self.norm = RMSNorm(dim)
         self.norm = torch.nn.LayerNorm(self.dim)
 
-        self.qkv_proj = nn.Linear(dim, dim + dim_head, bias=False)
-        self.attn_out = nn.Linear(dim, dim, bias=False)
+        self.qkv_proj = torch.nn.Parameter(torch.randn(dim, dim + dim_head))
+        self.attn_out_proj = torch.nn.Parameter(torch.randn(dim, dim))
 
-        self.ff = nn.Sequential(nn.Linear(dim, 2 * ff_mult * dim, bias=False),
-                                SwiGLU(2 * ff_mult * dim),
-                                nn.Linear(ff_mult * dim, dim, bias=False))
+        self.ff_proj1 = torch.nn.Parameter(torch.randn(dim, 2 * ff_mult * dim))
+        self.ff_proj2 = torch.nn.Parameter(torch.randn(ff_mult * dim, dim))
 
-        self.register_buffer("mask", None, persistent=False)
+        # self.register_buffer("mask", None, persistent=False)
 
     def get_mask(self, n, device):
         if self.mask is not None and self.mask.shape[-1] >= n:
@@ -153,49 +179,12 @@ class PaLMLayer(nn.Module):
         # pre layernorm
         x = self.norm(in_x)
 
-        ff_out = self.ff(x)
+        attn_out = multi_head_attention(x, self.qkv_proj, self.attn_out_proj,
+                                        self.heads, self.scale)
 
-        # q, kv = self.qkv_proj(x).split((self.dim, self.dim_head), dim=-1)
-        proj = self.qkv_proj(x)
-        q, kv = proj[:, :, 0:self.dim], proj[:, :, self.dim:]
+        ff_out = feedforward(x, self.ff_proj1, self.ff_proj2)
 
-        # q = rearrange(q, 'b n (h d) -> b h n d', h = self.heads)
-        q = q.view(bs, n, self.heads, self.dim_head).transpose(1, 2)
-
-        # scale
-        q = q * self.scale
-
-        # similarity
-        # sim = einsum('b h i d, b j d -> b h i j', q, kv)
-        q = q.reshape(bs, self.heads * n, self.dim_head)
-        trans_kv = kv.transpose(1, 2)
-        sim = torch.bmm(q, trans_kv).view(bs, self.heads, n, n)
-
-        # TODO
-        # sim = sim + self.alibi_pos_biases(sim)
-
-        # TODO
-        # causal mask
-
-        # causal_mask = self.get_mask(n, device)
-        # sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
-
-        # attention
-
-        # attn = sim.softmax(dim=-1)
-        attn = torch.nn.functional.softmax(sim, dim=-1)
-
-        # out = einsum("b h i j, b j d -> b h i d", attn, kv)
-        attn = attn.view(bs, self.heads * n, n)
-        out = torch.bmm(attn, kv).view(bs, self.heads, n, self.dim_head)
-
-        # merge heads
-
-        # out = rearrange(out, "b h n d -> b n (h d)")
-        out = torch.transpose(out, 1, 2).reshape(bs, n, self.dim)
-
-        merge_heads = self.attn_out(out) + ff_out
-        return in_x + merge_heads
+        return in_x + attn_out + ff_out
 
 
 class PaLM(nn.Module):
@@ -212,7 +201,6 @@ class PaLM(nn.Module):
         self.net = nn.Sequential(
             nn.Embedding(num_tokens, dim),
             *[PaLMLayer(dim, dim_head, heads, ff_mult) for _ in range(depth)],
-            # TODO: RMSNorm(dim),
             torch.nn.LayerNorm(dim),
             nn.Linear(dim, num_tokens, bias=False),
         )
@@ -234,6 +222,34 @@ def PASSingle(graph: IRGraph, resource):
     return graph
 
 
+def PASData(graph: IRGraph, resource):
+    """
+    Data Parallel
+    """
+    assert resource.ngpus == 2
+
+    for node in graph.nodes():
+        if isinstance(node, IRDataOperation):
+            algo = node.algorithms('data')
+            sub_nodes = graph.partition(node, algo, num=resource.ngpus)
+            for idx, sub_node in enumerate(sub_nodes):
+                graph.assign(sub_node, idx)
+            batch_dim = node.get_batch_dims()[0]
+
+    for node in graph.nodes():
+        if isinstance(node, IRFwOperation):
+            sign = node.signature.split('.')[-1]
+            algo = node.algorithms('dim')
+            sub_nodes = graph.partition(node,
+                                        algo,
+                                        idx=0,
+                                        dim=batch_dim,
+                                        num=resource.ngpus)
+            for idx, sub_node in enumerate(sub_nodes):
+                graph.assign(sub_node, idx)
+    return graph
+
+
 def train():
     bs, n, dim = 8, 1024, 512
     num_tokens, depth, heads, dim_head = 20000, 1, 8, 64
@@ -251,10 +267,11 @@ def train():
     )
 
     dataloader = cube.runtime.syndata.SynDataLoader(shapes=([bs, n], ),
-                                                    dtypes=(torch.int32, ),
+                                                    dtypes=(torch.float32, ),
                                                     batch_dims=(0, ))
 
-    @cube.compile(model, dataloader, PAS=PASSingle)
+    # @cube.compile(model, dataloader, PAS=PASSingle)
+    @cube.compile(model, dataloader, PAS=PASData)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
