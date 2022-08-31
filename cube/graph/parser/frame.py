@@ -1,5 +1,6 @@
 from collections import OrderedDict
-from typing import List, Any
+from typing import List, Any, Dict
+import torch
 
 
 class Frame:
@@ -13,6 +14,7 @@ class Frame:
         self._var_stack: List[str] = list()
         # module attributes
         self._attributes: List[dict[str, Any]] = list()
+        self._attr_vals: Dict[int, Any] = dict()  # tensor tid to real value mapping
 
     def push_var(self, inherit_from_top=False):
         """
@@ -125,6 +127,20 @@ class Frame:
         Return if `name` exists in current attributes
         """
         return name in self._attributes[-1]
+
+    def add_attr_content(self, tid: int, val: torch.Tensor):
+        """
+        Add module attribute content
+        """
+        if torch.is_tensor(val):
+            val = val.cpu()
+        self._attr_vals[tid] = val
+
+    def save_attr_content(self, save_file: str = 'fullmodel.pt'):
+        """
+        Save attribute content into file.
+        """
+        torch.save(self._attr_vals, save_file)
 
     def push_param(self, var_name):
         """

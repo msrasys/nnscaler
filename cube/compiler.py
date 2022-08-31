@@ -30,24 +30,28 @@ class SemanticModel:
         """
         Create semantic model based on AI Scientist description.
         """
-        from cube.graph import parser
-        self.ir_graph = parser.convert_model(
-            model, input_shapes=input_shapes
-        )
+        dist = torch.distributed.is_initialized()
+        if (not dist) or (dist and torch.distributed.get_rank() == 0):
+            self.ir_graph = parser.convert_model(
+                model, input_shapes=input_shapes
+            )
+        else:
+            self.ir_graph = None
         self._loaded_module = None
 
     def get_graph(self):
         return self.ir_graph
 
-    def load_module(self, filename: str):
+    def load_module(self, filename: str, load_content=True):
         import importlib.util
         spec = importlib.util.spec_from_file_location("GenModel", filename)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self._loaded_module = module.GenModel().cuda()
-        self._loaded_module.init_param()
-        # sync parameters before start training
-        self._loaded_module.sync_params()
+        if load_content:
+            print_each_rank("> loading parameter content...")
+            # TODO: make hardcode ./fullmodel.pt programmable
+            self._loaded_module.load_attr_content('./fullmodel.pt')
 
     def get_gen_module(self):
         return self._loaded_module
@@ -170,9 +174,12 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             # generate adapter
             graph = IRAdapterGener.gen(graph)
 
-            if graph.schedule_plan:
-                graph = graph.schedule_plan.apply(graph)
-                print(graph.schedule_plan)
+            if graph.sched is not None:
+                start = time.time()
+                graph.sched.apply()
+                span = time.time() - start
+                print('> planpass on applying schedule strategy: {:.2f} s'.format(span))
+                print(graph.sched)
 
             # to execution plan
             execplan = ExecutionPlan(graph)
@@ -184,7 +191,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             print('> planpass on diff-fusion operations: {:.2f} s'.format(span))
 
             # plan pass for computation grouping
-            if not graph.schedule_plan:
+            if not graph.sched:
                 start = time.time()
                 execplan = Grouping.apply(execplan)
                 span = time.time() - start

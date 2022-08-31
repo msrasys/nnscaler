@@ -17,7 +17,7 @@ class IRGraphAnchor(IRFwOperation):
 
     def __repr__(self) -> str:
         sign = self.signature.split('.')[-1]
-        ins = [t for t in self.inputs() if isinstance(t, IRSubTensor) and not t.is_param()]
+        ins = [t for t in self.inputs() if isinstance(t, IRSubTensor) and not t.is_attr()]
         dscp = (f"FwOp{self._id}(sign={sign}[{self.name}], "
                 f"inputs={ins}, "
                 f"outputs={self.outputs()})")

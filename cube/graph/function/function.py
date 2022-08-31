@@ -1,4 +1,4 @@
-from typing import Any, List, Optional, Tuple, Dict
+from typing import Any, List, Optional, Tuple, Dict, Union
 import string
 import copy
 import torch
@@ -7,13 +7,13 @@ import warnings
 from cube.ir.cten import IRTensor
 from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor, IRSubTensor
-from cube.graph.function.dimops import ShapeAnno, OpAnno, IRDimops
+from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
 from cube.graph.function.conv import IRConv2D
 from cube.graph.function.conv import IRConv3D
 from cube.graph.function.pad import IRPad
 from cube.graph.function.scripteinops import IRScriptEinOps
 from cube.graph.function.customops import IRCustomOps
-from cube.graph.function.creators import IROnes, IRToTensor, IRZeros
+from cube.graph.function.creators import IROnes, IRToTensor, IRZeros, IRRand, IRNewTensor
 from cube.graph.function.select import IRSelect, IRSlice
 from cube.graph.function.scatter import IRSelectScatter
 from cube.graph.function.repeat import IRRepeat
@@ -22,7 +22,7 @@ from cube.ir.dtype import IRDType
 from cube.graph.torch_dtype_mapping import DType2IRDType, TorchScalarTypeEnumMap
 
 
-def Identity(signature, inputs):
+def Identity(signature, inputs: List[IRTensor]):
     signature = 'cube.runtime.function.identity'
     eshape = ShapeAnno.create_shape_str(inputs[0].shape)
     anno = OpAnno.create_op_str([eshape], [eshape])
@@ -98,6 +98,30 @@ def Ones(signature,
             raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
     return IROnes(signature, size, 'ones', ir_dtype)
 
+def Rand(signature,
+         inputs: Tuple[ List[int], Optional[int], Optional[Any], 'ErasedDevice', Optional[bool] ]):
+    # ones(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+
+    size, dtype_underlying, layout, _erased_device, pin_memory = inputs
+
+    # TODO parameters to support, currently they are all None
+    assert layout is None
+    assert pin_memory is None
+
+    if dtype_underlying is not None:
+        # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
+        # which is the underlying type of PyTorch C++ enum 'ScalarType'.
+        dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
+    else:
+        dtype = torch.get_default_dtype()
+
+    ir_dtype : IRDType = DType2IRDType.map(dtype)
+
+    for dim, i in enumerate(size):
+        if not isinstance(dim, int) and not dim >= 0:
+            raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
+    return IRRand(signature, size, 'rand', ir_dtype)
+
 def NewTensor(signature,
               inputs: Tuple[ list, Optional[int], 'ErasedDevice', bool ]):
     # aten::tensor(t[] data, *, ScalarType? dtype=None, Device? device=None, bool requires_grad=False) -> Tensor
@@ -129,9 +153,7 @@ def NewTensor(signature,
     # and remark that originally aten::tensor should be able to infer the dtype from the specified 'data',
     # but since we have omitted the 'data', we must do type inferrence ourselves,
     # only in this way we get correct dtype e.g. ints or bools.
-    shape = list(arr.shape)
-    signature = 'torch.ones'
-    return IROnes(signature, shape, 'tensor', ir_dtype=ir_dtype)
+    return IRNewTensor(signature, data, 'tensor', ir_dtype=ir_dtype)
 
 def ToTensor(signature,
              inputs: Tuple[ IRTensor, ... ]):
@@ -600,26 +622,57 @@ def View(signature, inputs):
                 bracket[subdim] = str(shape_map[edim])
 
     # find out the axis that can be partitioned
-    spatial_in = set()
-    spatial_ou = set()
-    for in_bracket in in_anno:
-        for edim in in_bracket:
-            if edim != '1':
-                spatial_in.add(edim)
-                break
-    for ou_bracket in ou_anno:
-        for edim in ou_bracket:
-            spatial_ou.add(edim)
-    spatial = spatial_in.intersection(spatial_ou)
+    ispatial = set()
+    ifirst = []
+    for bracket in in_anno:
+        for hdim in range(len(bracket)):
+            if bracket[hdim] == '1':
+                continue
+            ispatial.add(bracket[hdim])
+            ifirst.append(bracket[hdim])
+            break
+    ospatial = set()
+    ofirst = []
+    for bracket in ou_anno:
+        for hdim in range(len(bracket)):
+            if bracket[hdim] == '1':
+                continue
+            ospatial.add(bracket[hdim])
+            ofirst.append(bracket[hdim])
+            break
+    spatial = ispatial.intersection(ospatial)
 
+    # set dimension cannot be partitioned
     for bracket in in_anno + ou_anno:
-        for subdim, edim in enumerate(bracket):
-            if edim not in spatial:
-                bracket[subdim] = str(shape_map[edim])
-                # bracket[subdim] = edim + '^'
+        for hdim in range(len(bracket)):
+            if bracket[hdim] not in spatial:
+                bracket[hdim] = str(shape_map[bracket[hdim]])
+
+    # TODO: strange behaviour if every identitifer creates own
+    # modifier, seems all previous modifiers will be overrided by
+    # the last one.
+    def view_modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
+        kwargs = dict(**kwargs)
+        ofirst = [bracket[0] for bracket in ou_anno]
+        identifier = in_anno[idx][0]
+        oidx = ofirst.index(identifier)
+        size = list(kwargs['size'])
+        size[oidx] = size[oidx] // num
+        kwargs['size'] = tuple(size)
+        return kwargs
+
+    # special rules: to change output size argument
+    rules = []
+    for identifier in spatial:
+        iidx = ifirst.index(identifier)
+        oidx = ofirst.index(identifier)
+        rules.append(
+            TransformRule([DimopSplit.D(iidx)], [DimopSplit.D(oidx)], view_modifier)
+        )
+
     anno = OpAnno.create_op_str([in_anno], [ou_anno])
-    signature = 'torch.reshape'
-    return IRDimops(signature, [anno], [input], 'view', shape=tuple(shape))
+    signature = 'torch.Tensor.view'
+    return IRDimops(signature, [anno], [input], 'view', rules, size=tuple(shape))
 
 
 def Reshape(signature, inputs):
@@ -803,13 +856,66 @@ def Embedding(signature, inputs: List):
     return IRDimops(signature, [anno], [itensor, weight], 'embedding', padding_idx=padding_idx, start=start, stop=stop)
 
 
-def MultiRef(signature, inputs: List[IRFullTensor]):
+def Flatten(signature, inputs: List):
+    tensor: IRTensor = inputs[0]
+    start_dim, end_dim = inputs[1:]
+    end_dim = len(tensor.shape) + end_dim if end_dim < 0 else end_dim
+    ishape = ShapeAnno.create_shape_str(tensor.shape)
+    for dim in range(start_dim, end_dim+1):
+        ishape[dim] += '^'
+    oshape = ishape[:start_dim]
+    oshape.append(ishape[start_dim:end_dim+1])
+    anno = OpAnno.create_op_str([ishape], [oshape])
+    return IRDimops(signature, [anno], [tensor], 'flatten', start_dim=start_dim, end_dim=end_dim)
+
+
+def Roll(signature, inputs: Tuple[IRTensor, Union[int, Tuple[int]], Union[int, Tuple[int]]]):
+    tensor = inputs[0]
+    shifts, dims = inputs[1:]
+    ishape = ShapeAnno.create_shape_str(tensor.shape)
+    for dim in range(len(ishape)):
+        if dims is None or dim in dims:
+            ishape[dim] += '^'
+    anno = OpAnno.create_op_str([ishape], [ishape])
+    return IRDimops(signature, [anno], [tensor], 'roll', shifts=shifts, dims=dims)
+
+
+def AdaptiveAvgPool1d(signature, inputs: Tuple[IRTensor, Tuple[int]]):
+    tensor = inputs[0]
+    out_size = inputs[1]
+    ishape = ShapeAnno.create_shape_str(tensor.shape)
+    ishape[-1] += '^'
+    oshape = ishape[:-1] + [str(size) for size in out_size]
+    anno = OpAnno.create_op_str([ishape], [oshape])
+    return IRDimops(signature, [anno], [tensor], 'adaptive_avg_pool1d', output_size=out_size)
+
+
+def CrossEntropy(signature, inputs):
+    # FIXME: reduction is by default 'mean', in this way it cannot be partitioned
+    # no N dimension.
+    tensor, target, weight = inputs[0:3]
+    assert weight is None, "weight not supported for cross entropy"
+    size_average, ignore_index, reduce, reduction, label_smoothing = inputs[3:]
+    annos = [
+        'C^, N -> 1',
+        'N+ C, N+ -> 1',
+        'N+ C *, N+ * -> 1'
+    ]
+    return IRDimops(
+        signature, annos, [tensor, target], 'cross_entropy',
+        weight=weight, size_average=size_average, ignore_index=ignore_index,
+        reduce=reduce, reduction=reduction, label_smoothing=label_smoothing
+    )
+
+
+
+def MultiRef(signature, inputs: List[IRTensor]):
     """
     cube.runtime.function.multiref(itensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]
     """
     signature = 'cube.runtime.function.multiref'
     itensor, times = inputs
-    assert isinstance(itensor, IRFullTensor), "require all inputs to be IRSubTensor"
+    assert isinstance(itensor, IRTensor), "require all inputs to be IRSubTensor"
     assert isinstance(times, int), "require int for second input"
     anno = '* -> ' + ', '.join('*' for _ in range(times))
     node = IRDimops(signature, [anno], [itensor], 'multiref', times=times)

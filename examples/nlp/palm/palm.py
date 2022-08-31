@@ -223,9 +223,9 @@ def PASSingle(graph: IRGraph, resource):
 
 
 def PASData(graph: IRGraph, resource):
-    """
-    Data Parallel
-    """
+    '''
+    2 way Data Parallel
+    '''
     assert resource.ngpus == 2
 
     for node in graph.nodes():
@@ -238,7 +238,6 @@ def PASData(graph: IRGraph, resource):
 
     for node in graph.nodes():
         if isinstance(node, IRFwOperation):
-            sign = node.signature.split('.')[-1]
             algo = node.algorithms('dim')
             sub_nodes = graph.partition(node,
                                         algo,
@@ -247,6 +246,44 @@ def PASData(graph: IRGraph, resource):
                                         num=resource.ngpus)
             for idx, sub_node in enumerate(sub_nodes):
                 graph.assign(sub_node, idx)
+    return graph
+
+
+def PASBranch(graph: IRGraph, resource):
+    '''
+    2 way brach
+    '''
+    assert resource.ngpus == 2
+
+    for node in graph.nodes():
+        if isinstance(node, IRDataOperation):
+            algo = node.algorithms('data')
+            sub_nodes = graph.partition(node, algo, num=resource.ngpus)
+            for idx, sub_node in enumerate(sub_nodes):
+                graph.assign(sub_node, idx)
+            batch_dim = node.get_batch_dims()[0]
+
+    for node in graph.nodes():
+        if isinstance(node, IRFwOperation):
+            print(node)
+            if node.name == 'embedding' or node.name == 'linear':
+                # data parallel
+                algo = node.algorithms('dim')
+                sub_nodes = graph.partition(node, algo, idx=0, dim=batch_dim, num=resource.ngpus)
+                for idx, sub_node in enumerate(sub_nodes):
+                    graph.assign(sub_node, idx)
+            elif node.name == 'layernorm' or node.name == 'multiref' or node.name == 'add' or node.name == 'mean':
+                # replicate
+                sub_nodes = graph.replicate(node, times=resource.ngpus)
+                for idx, sub_node in enumerate(sub_nodes):
+                    graph.assign(sub_node, idx)
+            elif node.name == 'feedforward':
+                graph.assign(node, 0)
+            elif node.name == 'multi_head_attention':
+                graph.assign(node, 1)
+            else:
+                assert False, node.name
+
     return graph
 
 
@@ -271,7 +308,8 @@ def train():
                                                     batch_dims=(0, ))
 
     # @cube.compile(model, dataloader, PAS=PASSingle)
-    @cube.compile(model, dataloader, PAS=PASData)
+    # @cube.compile(model, dataloader, PAS=PASData)
+    @cube.compile(model, dataloader, PAS=PASBranch)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)

@@ -19,7 +19,7 @@ import torch.utils.checkpoint as checkpoint
 import cube
 from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.reducer import Reducer
-from cube.runtime.adapter.distnn import ReduceBroadcast, AllReduceIdentity, IdentityAllreduce
+from handcraft.module.distnn import ReduceBroadcast, AllReduceIdentity, IdentityAllreduce
 
 from cube.profiler import CudaTimer
 from cube.profiler.memory import memory_summary

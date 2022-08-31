@@ -62,10 +62,9 @@ A shape annotation consists of dimension annotation separated by (multiple) spac
 
 """
 
-from typing import Dict, Iterable, List, Union, Optional, Set, Tuple, Optional
+from typing import Callable, Dict, Iterable, List, Union, Set, Tuple, Optional
 import enum
 import re
-import copy
 import string
 
 from cube.ir.cten import IRTensor
@@ -460,13 +459,103 @@ class OpAnno:
         return ', '.join(in_annos) + ' -> ' + ', '.join(ou_annos)
 
 
+class DimopSplit:
+    """
+    Partition status of a tensor
+    """
+    def __init__(self, dim: Optional[int] = None, r = False, v = False) -> None:
+        self.dim = dim
+        self.rep = r
+        self.val = v
+
+    def isR(self) -> bool:
+        return self.rep
+
+    def isD(self) -> bool:
+        return self.dim is not None
+
+    def isV(self) -> bool:
+        return self.val
+
+    def __eq__(self, other):
+        if not isinstance(other, DimopSplit):
+            return False
+        if other.isR() and self.isR():
+            return True
+        if other.isD() and self.isD() and other.dim == self.dim:
+            return True
+        if other.isV() and self.isV():
+            return True
+        return False
+
+    def __hash__(self) -> int:
+        if self.isV():
+            return -1
+        elif self.isR():
+            return -2
+        else:
+            return self.dim
+
+    def __repr__(self) -> str:
+        if self.isD():
+            return f'D({self.dim})'
+        if self.isR():
+            return f'R'
+        if self.isV():
+            return f'V'
+        return 'Unknown-DimopSplit'
+
+    @staticmethod
+    def R():
+        return DimopSplit(r=True)
+
+    @staticmethod
+    def V():
+        return DimopSplit(v=True)
+
+    @staticmethod
+    def D(dim: int):
+        return DimopSplit(dim=dim)
+
+
+class TransformRule:
+    """
+    Partition rule
+    """
+    def __init__(self, irules: Tuple[DimopSplit], orules: Tuple[DimopSplit], kwarg_modifier: Optional[Callable] = None) -> None:
+        self._inputs = tuple(irules)
+        self._outputs = tuple(orules)
+        modifier = kwarg_modifier if kwarg_modifier is not None else lambda x : x
+        self._modifier = (modifier,)
+
+    def inputs(self) -> Tuple[DimopSplit]:
+        return self._inputs
+
+    def input(self, idx: int) -> DimopSplit:
+        return self._inputs[idx]
+
+    def outputs(self) -> Tuple[DimopSplit]:
+        return self._outputs
+
+    def output(self, idx: int) -> DimopSplit:
+        return self._outputs[idx]
+    
+    def modifier(self) -> Optional[Callable]:
+        return self._modifier[0]
+
+    def __repr__(self) -> str:
+        inputs = ', '.join(repr(split) for split in self._inputs)
+        outputs = ', '.join(repr(split) for split in self._outputs)
+        return f'{inputs} -> {outputs}'
+
 
 class IRDimops(IRFwOperation):
     """
     Einstein-inspired notation operations
     """
     def __init__(self, signature: str, annos: Tuple[str],
-                 inputs: List[IRTensor], name: str, **kwargs):
+                 inputs: List[IRTensor], name: str,
+                 transform_rules: Optional[Tuple[TransformRule]] = None, **kwargs):
         """!
         Create a IRDimops
 
@@ -474,6 +563,7 @@ class IRDimops(IRFwOperation):
         @param annos List[str]: annotation candidates
         @param inputs List[IRTensor]: input tensor list
         @param name str: the name of the operator
+        @param transform_rules: the special rules to partition the operator. Default None.
         @param kwargs: the kwarg non-tensor parameters
         """
         assert all(isinstance(anno, str) for anno in annos), "Expect annos to be List[str]"      
@@ -481,6 +571,7 @@ class IRDimops(IRFwOperation):
         self._anno: OpAnno = None
         self._iannos: List[ShapeAnno] = None
         self._oannos: List[ShapeAnno] = None
+        self._trans_rules: Tuple[TransformRule] = tuple(transform_rules) if transform_rules is not None else ()
 
         for anno in self._annos_candidates:
             anno = OpAnno(anno)
@@ -494,8 +585,9 @@ class IRDimops(IRFwOperation):
             raise RuntimeError(
                 f"no matching anno for given annos."
                 f"op: {signature}\n"
-                f"inputs: {inputs}\n"
+                f"inputs: {tuple(t.shape if isinstance(t, IRTensor) else t for t in inputs)}\n"
                 f"annos: {annos}\n"
+                f"kwargs: {kwargs}\n"
             )
 
         n_outputs = len(self._oannos)
@@ -509,6 +601,10 @@ class IRDimops(IRFwOperation):
     @property
     def anno(self) -> OpAnno:
         return self._anno
+
+    @property
+    def transform_rules(self) -> Tuple[TransformRule]:
+        return self._trans_rules
 
     def ianno(self, index: int) -> Tuple[DimAnno]:
         """!
@@ -563,9 +659,8 @@ class IRDimops(IRFwOperation):
         @return op IRDimop: the new constructed operator
         """
         annos = self._annos_candidates
-        updated_kwargs = copy.copy(self.kwargs)
-        updated_kwargs.update(kwargs)
-        op = IRDimops(self.signature, annos, inputs, self.name, **updated_kwargs)
+        rules = self._trans_rules
+        op = IRDimops(self.signature, annos, inputs, self.name, rules, **kwargs)
         for idx, output in enumerate(outputs):
             op.set_output(idx, output)
         return op

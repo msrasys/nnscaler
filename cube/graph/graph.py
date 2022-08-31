@@ -7,7 +7,7 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Any, Union, Tuple, List, Optional, Dict
+from typing import Union, Tuple, List, Optional, Dict
 import copy
 from cube.graph.function.function import MultiRef
 
@@ -84,9 +84,14 @@ class IRSegment(IRCell):
             IRCell.make_pair(fseg, bseg)
         return fseg
 
-    def __repr__(self):
+    def to_str(self, skip_attr: bool = False) -> str:
         name = ('f' if self.forward else 'b') + 'Segment'
-        return f'{name}{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
+        inputs = tuple(t for t in self.inputs() if not (t.is_attr() and skip_attr))
+        outputs = tuple(t for t in self.outputs() if not (t.is_attr() and skip_attr))
+        return f'{name}{self._id}-{self.device}(inputs={inputs}, outputs={outputs})'
+
+    def __repr__(self):
+        return self.to_str()
 
     def extra_repr(self) -> str:
         dscp = repr(self)
@@ -108,10 +113,15 @@ class IRGraph(IRCell):
                  module_name: str):
 
         self._nodes: List[IRCell] = list()
-        self._parameters = list()
+        self._attributes = list()
         self._full_tensors: Dict[int, IRFullTensor] = dict()
+        self._train: bool = any(
+            isinstance(node, IRBpOperation) or
+            (isinstance(node, IRSegment) and node.forward) or
+            (isinstance(node, IRAdapter) and node.forward) for node in nodes
+        )
 
-        self._schedule_strategy = None
+        self._sched = None  # the schedule strategy
 
         if inputs is None:
             inputs = IRGraph.get_inputs(nodes)
@@ -130,14 +140,14 @@ class IRGraph(IRCell):
         for idx, tensor in enumerate(outputs):
             self.set_output(idx, tensor)
 
-        # set parameters and full tensors
+        # set parameters / buffers and full tensors
         for node in nodes:
             for tensor in node.inputs() + node.outputs():
                 if isinstance(tensor, IRSubTensor):
                     pid = tensor.parent._id
                     self._full_tensors[pid] = tensor.parent
-                    if tensor.is_param():
-                        self._parameters.append(input)
+                    if tensor.is_attr():
+                        self._attributes.append(tensor)
 
         for ftensor in self._full_tensors.values():
             ftensor.clear_producer_consumer()
@@ -149,12 +159,13 @@ class IRGraph(IRCell):
         self.reset_dependency()
 
     @property
-    def schedule_plan(self) -> Optional[Any]:
-        return self._schedule_strategy
+    def train(self) -> bool:
+        """!
+        Train flag.
 
-    @schedule_plan.setter
-    def schedule_plan(self, val: Optional[Any]):
-        self._schedule_strategy = val
+        @return train bool: True if backward is required, otherwise False (inference only).
+        """
+        return self._train
 
     def reset_dependency(self):
         """
@@ -179,13 +190,13 @@ class IRGraph(IRCell):
                     producer.add_successor(-1, producer.mirror)
                     producer.mirror.add_predecessor(-1, producer)
 
-    def parameters(self):
+    def attributes(self) -> Tuple[IRSubTensor]:
         """
         Return parameter list
         """
-        return copy.copy(self._parameters)
+        return tuple(self._attributes)
 
-    def full_tensors(self):
+    def full_tensors(self) -> List[IRSubTensor]:
         """
         Return full tensor list
         """
@@ -227,13 +238,17 @@ class IRGraph(IRCell):
         return self.forward(*args)
 
     def segment(self, nodes: List[IRCell]) -> IRSegment:
-        """
+        """!
         Create a segment (sub-graph) with part of the nodes.
+        Nodes are allowed to be on different devices.
+        The grouped segement will not add into graph.nodes().
 
-        Return:
-            IRSegment
+        @param nodes List[IRCell]: the subset nodes of this graph
+
+        @return segment IRSegment: the grouped segment. 
         """
         inputs, outputs = [], []
+        itdevs, otdevs = dict(), dict()
         for node in nodes:
             assert not isinstance(node, IRSegment), 'A segment cannot be in other segments'
             # update inputs
@@ -242,29 +257,38 @@ class IRGraph(IRCell):
                 producers = [p for p in itensor.parent.producers if set(p.device).issubset(set(node.device))]
                 # no producer means a weight or cross device-group
                 if len(producers) == 0 or any(p not in nodes for p in producers):
-                    # FIXME: itensor should also consider device difference
-                    if itensor not in inputs:
+                    if itensor not in itdevs:
+                        itdevs[itensor] = []
+                    devs = set(itensor.device)
+                    if devs not in itdevs[itensor]:
                         inputs.append(itensor)
+                        itdevs[itensor].append(devs)
             # update outputs
             otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
             for otensor in otensors:
-                if otensor in self.outputs():
-                    outputs.append(otensor)
                 consumers = [c for c in otensor.parent.consumers if set(c.device).issubset(set(node.device))]
                 # no consumer usually means the loss or cross device-group
-                if len(consumers) == 0 or any(c not in nodes for c in consumers):
-                    # FIXME: otensor should also consider device difference
-                    if otensor not in outputs:
+                if otensor in self.outputs() or len(consumers) == 0 or any(c not in nodes for c in consumers):
+                    devs = set(otensor.device)
+                    if otensor not in otdevs:
+                        otdevs[otensor] = []
+                    if devs not in otdevs[otensor]:
                         outputs.append(otensor)
+                        otdevs[otensor].append(devs)
         segment = IRSegment(nodes, inputs, outputs)
         return segment
 
     def group(self, nodes: List[IRCell]) -> IRSegment:
-        """
-        Group consecutive nodes into IRSegment.
+        """!
+        Group consecutive nodes into IRSegment. the grouped segment will
+        replace the nodes in the graph.
 
-        Currently this interface will break the dependency,
+        Note: Currently this interface will break the dependency,
         it can only be used after user policy
+
+        @param nodes List[IRCell]: the consecutive node subset of this graph
+        
+        @return segment IRSegment: the grouped segment
         """
         allnodes = self.nodes()
         indices = [allnodes.index(n) for n in nodes]
@@ -305,6 +329,9 @@ class IRGraph(IRCell):
                 otensors.append(otensor)
         for otensor in otensors:
             otensor.parent.rm_producer(node)
+            ftensor = otensor.parent
+            if len(ftensor.producers) == 0 and len(ftensor.consumers) == 0:
+                del self._full_tensors[otensor.parent.tid]
         if reset_dependency:
             self.reset_dependency()
         return index
@@ -328,8 +355,8 @@ class IRGraph(IRCell):
             if isinstance(itensor, IRSubTensor) and itensor not in itensors:
                 itensors.append(itensor)
         for itensor in itensors:
-            if itensor.parent._id not in self._full_tensors:
-                self._full_tensors[itensor.parent._id] = itensor.parent
+            if itensor.parent.tid not in self._full_tensors:
+                self._full_tensors[itensor.parent.tid] = itensor.parent
             idx = 0
             for consumer in itensor.parent.consumers:
                 if self.nodes().index(consumer) < index:
@@ -343,8 +370,8 @@ class IRGraph(IRCell):
             if isinstance(otensor, IRSubTensor) and otensor not in otensors:
                 otensors.append(otensor)
         for otensor in otensors:
-            if otensor.parent._id not in self._full_tensors:
-                self._full_tensors[itensor.parent._id] = itensor.parent
+            if otensor.parent.tid not in self._full_tensors:
+                self._full_tensors[otensor.parent.tid] = otensor.parent
             idx = 0
             for producer in otensor.parent.producers:
                 if self.nodes().index(producer) < index:
@@ -380,7 +407,7 @@ class IRGraph(IRCell):
         """
         all_outputs = list()
         for node in nodes:
-            all_outputs += list(node.outputs())
+            all_outputs.extend(node.outputs())
         inputs = list()
         for cell in nodes:
             for input in cell.inputs():
@@ -405,7 +432,7 @@ class IRGraph(IRCell):
         """
         all_inputs = list()
         for node in nodes:
-            all_inputs += list(node.inputs())
+            all_inputs.extend(node.inputs())
         outputs = list()
         for node in nodes:
             for idx, output in enumerate(node.outputs()):
@@ -446,7 +473,7 @@ class IRGraph(IRCell):
                 if isinstance(ftensor, IRFullTensor):
                     producers[ftensor] = node
         for ftensor, cnodes in consumers.items():
-            if len(cnodes) == 1: continue
+            if len(cnodes) == 1 or ftensor.is_attr(): continue
             itensors = [ftensor.like() for _ in range(len(cnodes))]
             for itensor, consumer in zip(itensors, cnodes):
                 while ftensor in consumer.inputs():
@@ -458,6 +485,7 @@ class IRGraph(IRCell):
                 multiref.set_output(idx, itensor)
             multiref.infer_shape()
             idx = nodes.index(producers[ftensor]) + 1 if ftensor in producers else 0
+            # idx = nodes.index(cnodes[0])
             nodes.insert(idx, multiref)
         
         # instantiate graph inputs / outputs
@@ -484,7 +512,7 @@ class IRGraph(IRCell):
         graph = IRGraph(nodes, inputs, outputs, module_name)
         return graph
 
-    ##### Partition Primitives #####
+    ##### Transformation Primitives #####
 
     def replicate(self, node: Union[IRFwOperation, IRDataOperation], times=1) -> List[IRCell]:
         """
@@ -564,6 +592,8 @@ class IRGraph(IRCell):
             self.attach(fnode, findex + idx)
             if isinstance(node.comment, str):
                 fnode.comment = node.comment
+            if isinstance(node, IRFwOperation):
+                fnode.recompute = node.recompute
         # update backward
         if isinstance(node.mirror, IRBpOperation):
             bindex = self.detach(node.mirror)
@@ -589,59 +619,23 @@ class IRGraph(IRCell):
                 fnode.mirror.device = node.device
         return fnodes
 
-    def merge(self, nodes: List[IRCell], target_node: IRCell):
-        """
-        Merge consecutive nodes in the graph to the target_node.
-        Note corresponding mirror nodes (if have) will also be merged.
+    def replace(self, old_nodes: List[IRCell], new_nodes: List[IRCell]):
+        """!
+        Replace nodes with node.
 
-        We don't check computation equivalence between nodes and target_node.
+        Note we don't check semantic correctness for the replacement.
 
-        Merge requires nodes are consecutive in the graph sequence.
+        @param old_nodes List[IRCell]: nodes to be replaced
+        @param new_nodes List[IRCell]: nodes to replace in
+
+        @return True
         """
-        if not isinstance(target_node, IRCell):
-            raise TypeError("Expected target node to be IRCell")
-        if target_node in self.nodes():
-            raise ValueError("Target node is already in the graph")
-        for node in nodes:
-            if node not in self.nodes():
-                raise KeyError(f"node {node} is not in the graph")
-        indices = [self.nodes().index(node) for node in nodes]
-        # consecutive
-        if max(indices) - min(indices) != len(indices) - 1:
-            return False
-        index = min(indices)
-        # update forward
-        for node in nodes:
-            self.detach(node)
-        self.attach(target_node, index)
-        # update backward
-        if all([isinstance(node.mirror, IRCell) for node in nodes]):
-            bidx = len(self.nodes())
-            for node in nodes:
-                idx = self.detach(node.mirror)
-                bidx = min(idx, bidx)
-            if target_node.mirror is None:
-                if not isinstance(target_node, IRFwOperation):
-                    raise RuntimeError("target node is not FwOp and doens't have mirror node")
-                target_node.gen_backward()
-            self.attach(target_node.mirror, bidx)
-        elif all([isinstance(node.mirror, None) for node in nodes]):
-            pass
-        else:
-            raise ValueError("nodes should have nothing-or-all mirror nodes")
-        # update weights
-        updated = set()
-        for node in nodes + [target_node]:
-            for input in node.inputs():
-                if not isinstance(input, IRSubTensor):
-                    continue
-                for fnode in input.parent.consumers:
-                    bnode = fnode.mirror
-                    if isinstance(bnode, IRBpOperation) and fnode._id not in updated:
-                        idx = self.detach(bnode)
-                        bnode.update()
-                        self.attach(bnode, idx)
-                    updated.add(fnode._id)
+        idx = len(self._nodes)
+        for old_node in old_nodes:
+            oidx = self.detach(old_node)
+            idx = min(oidx, idx)
+        for new_node in new_nodes[::-1]:
+            self.attach(new_node, idx)
         return True
 
     ## Spatial Primitives ##
@@ -696,6 +690,105 @@ class IRGraph(IRCell):
                     return True
             return False
 
+    def depends(self, pre_node: IRCell, post_node: IRCell) -> bool:
+        """!
+        Check whether pre_node has dataflow dependency on post_node:
+            pre_node -> post_node
+
+        @param pre_node: the happen before node
+        @param post_node: the happen after node
+
+        @return ret bool: True if post_node depends on pre_node on dataflow, otherwise False.
+        """
+        itensors = [t for t in post_node.inputs() if isinstance(t, IRSubTensor)]
+        for otensor in pre_node.outputs():
+            if not isinstance(otensor, IRSubTensor): continue
+            for itensor in itensors:
+                if otensor.overlap(itensor):
+                    return True
+        return False
+
+    def schedule(self, node1: IRCell, action: str, node2: IRCell) -> bool:
+        """!
+        Schedule node1 and node2 based on the action
+
+        The node2 will keep unchanged in the sequence and schedule will perform
+        on node1.
+
+        @param node1 IRCell
+        @param node2 IRCell
+        @param action str:
+            'after': fixed node2 and schedule node1 after node2 in the sequence.
+            'before': fixed node2 and schedule node1 before node2 in the sequence.
+        
+        @return success bool: True if the scheduling success otherwise False.
+        """
+        idx1 = self._nodes.index(node1)
+        idx2 = self._nodes.index(node2)
+        # node2 -> node1
+        if action == 'after':
+            if idx2 < idx1:
+                return True
+            for idx in range(idx1+1, idx2+1):
+                if self.depends(node1, self._nodes[idx]):
+                    return False
+            self.detach(node1)
+            self.attach(node1, idx2)
+            return True
+        # node1 -> node2
+        if action  == 'before':
+            if idx1 < idx2:
+                return True
+            for idx in range(idx2, idx1):
+                if self.depends(self._nodes[idx], node1):
+                    return False
+            self.detach(node1)
+            self.attach(node1, idx2)
+            return True
+        raise KeyError(f"Unknown scheduling action {action}")
+
+    @property
+    def sched(self):
+        """!
+        Return schedule plan for the execution.
+        """
+        return self._sched
+
+    @sched.setter
+    def sched(self, strategy):
+        """!
+        Set schedule plan for the execution.
+
+        @param strategy IRScheduleStrategy: the schedule strategy instance
+        """
+        self._sched = strategy
+
+    @staticmethod
+    def legal_schedule(seq: List[IRCell], integrity_check=False):
+        """
+        Check whether seq satisfies topological order.
+
+        @note: this functionality is not enabled due to predecessor and succesor
+        functionality.
+        
+        @param seq List[IRCell]: the nodes in scheudled order
+        @param integrity_check bool:
+                If true, performs additional integrity check that requires
+                all the nodes in predecessor and successor of a node should
+                appear in the sequence.
+        
+        @return valid bool: True for satisfying topo order, otherwise False.
+        """
+        for index, node in enumerate(seq):
+            for pre in node.predecessors():
+                if pre in seq:
+                    pre_idx = seq.index(pre)
+                    if pre_idx >= index:
+                        return False
+                elif integrity_check:
+                    return False
+        return True
+
     def add_schedule(self, nodes: List[IRCell]) -> bool:
         """
         Add node happen before dependencies according to nodes list order
@@ -714,6 +807,9 @@ class IRGraph(IRCell):
             post.add_predecessor(input_index=-1, cell=prev)
         return True
 
+
+    # ================= Other optimizations ==================
+
     def recompute(self, nodes: List[IRFwOperation]) -> bool:
         """!
         Recompute a set of nodes. The forward nodes will be assigned with a unique
@@ -727,90 +823,6 @@ class IRGraph(IRCell):
         recompute_group_id = IDGenerator().gen_cell_id()
         for fnode in nodes:
             fnode.recompute = recompute_group_id
-        return True
-
-    def set_order(self, seq: List[IRCell]):
-        """
-        Set a topological order for IRGraph, which requires seq:
-
-        1). The set of nodes in seq must be same with this IRGraph
-        2). Staisfies topological order
-
-        Returns:
-            True if set succesfully, False not.
-        """
-        for node in seq:
-            if node not in self.nodes():
-                return False
-        if len(seq) != len(self.nodes()):
-            return False
-        if not IRGraph.check_legal_order(seq, integrity_check=True):
-            return False
-        self._nodes = seq
-        return True
-
-    def partial_set_order(self, seq: List[IRCell], eager=True):
-        """
-        Set a partial topological order for IRGrah.
-        The remaining nodes will be automatically inserted to
-        make the full legal sequence.
-
-        In most of the cases, `eager=True` has better performance.
-
-        Args:
-            seq: partial scheduling sequence
-            eager (default True):
-                if True, the remaining nodes are inserted once it is ready
-                if Flase, the remaining nodes are inserted only when it is needed.
-        
-        Returns:
-            True if set succesfully, False not.
-        """
-        seq = copy.copy(seq)
-        for node in seq:
-            if node not in self.nodes():
-                return False
-        if not IRGraph.check_legal_order(seq, integrity_check=False):
-            return False
-        remain: List[IRCell] = [node for node in self.nodes() if node not in seq]
-        for node in remain:
-            if eager:
-                pre_indices = [seq.index(pre) for pre in node.predecessors()]
-                if len(pre_indices) == 0:
-                    index = 0
-                else:
-                    index = max(pre_indices) + 1
-            else:
-                suc_indices = [seq.index[suc] for suc in node.successors()]
-                index = min(suc_indices)
-            seq.insert(index, node)
-        self._nodes = seq
-        return True
-
-    @staticmethod
-    def check_legal_order(seq: List[IRCell], integrity_check=False):
-        """
-        Check whether seq satisfies topological order.
-        
-        Args:
-            seq: List of IRCell
-            integrity_check:
-                If true, performs additional integrity check that requires
-                all the SUs in predecessor and successor of a SU should
-                appear in the sequence.
-        
-        Returns:
-            Boolean: True for satisfying topo order, otherwise False.
-        """
-        #TODO: check no new operators are created (including replicate)
-        for index, node in enumerate(seq):
-            for pre in node.predecessors():
-                if pre in seq:
-                    pre_idx = seq.index(pre)
-                    if pre_idx >= index:
-                        return False
-                elif integrity_check:
-                    return False
         return True
 
     def __repr__(self):

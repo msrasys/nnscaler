@@ -14,6 +14,11 @@ class ExecutionPlan:
         assert isinstance(graph, IRGraph), "Expected an IRGraph"
         self._graph = graph
         self._seq: Dict[int, List[IRCell]] = dict()
+        self._inference_only = not any(
+             isinstance(n, IRBpOperation) or \
+            (isinstance(n, IRAdapter) and not n.forward) or \
+            (isinstance(n, IRSegment) and not n.forward) for n in graph.nodes()
+        )
 
         # execution sequence for each device  
         for node in graph.nodes():
@@ -39,15 +44,13 @@ class ExecutionPlan:
                     nodes.remove(fnode.mirror)
                     self.at(devid)[bidx] = fnode_dev.mirror
 
-        # TODO: adapter support for return consistency
-        for output in graph.outputs():
-            for devid in self.devices():
-                ptensors = [pt for pt in output.parent.ptensors if pt == output and devid in pt.device]
-                assert len(ptensors) >= 1, f"Missing full graph output tensor {output} in device {devid}"
-
     @property
     def graph(self) -> IRGraph:
         return self._graph
+
+    @property
+    def inference(self) -> bool:
+        return self._inference_only
 
     def devices(self) -> List[int]:
         """

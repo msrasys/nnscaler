@@ -19,7 +19,7 @@ from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary, model_summary
 from cube.runtime.adapter.reducer import Reducer
 from cube.runtime.device import DeviceGroup
-from cube.runtime.adapter.distnn import IdentityAllreduce, AllReduceIdentity, AllGatherSplit
+from handcraft.module.distnn import IdentityAllreduce, AllReduceIdentity, AllGatherSplit
 from handcraft.module.schedule import schedule_1f1b
 from handcraft.module.stage import PipeStage, layer_division
 from handcraft.swin.utils import create_position_bias, create_position_index, trunc_normal_, window_partition, window_reverse, DropPath

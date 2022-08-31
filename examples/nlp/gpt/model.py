@@ -1,36 +1,50 @@
+
 import torch
 
-
 from examples.nlp.blocks.encoder import EncoderLayer
-
 import cube
 
 
 class Config:
 
-    num_embeddings = 50304
-    seqlen = 512
+    num_embeddings = 50432
+    seqlen = 1024
 
-    # 1.7B model
-    embed_dim = 2304
+    # 340 M model
+    embed_dim = 1024
     layers = 8 # 24
-    attention_heads = 24
+    attention_heads = 16
 
-    # 3.6B model
-    # embed_dim = 3072
+    # 1.3 B model
+    # embed_dim = 2048
+    # layers = 24
+    # attention_heads = 32
+
+    # 2.6 B model
+    # embed_dim = 2560
     # layers = 32
     # attention_heads = 32
 
-    # 7.5B model
+    # 6.7 B model
     # embed_dim = 4096
     # layers = 32
+    # attention_heads = 32
+
+    # 15 B model
+    # embed_dim = 5120
+    # layers = 48
     # attention_heads = 36
+
+    # 39 B model
+    # embed_dim = 8192
+    # layers = 48
+    # attention_heads = 64
 
     attn_hidden_dim = embed_dim
     ffn_hidden_dim  = embed_dim * 4
-    dropout = 0.0
-    attn_dropout = 0.0
-    activation_dropout = 0.0
+    dropout = 0.2
+    attn_dropout = 0.2
+    activation_dropout = 0.2
 
 
 class GPT(torch.nn.Module):
@@ -39,7 +53,8 @@ class GPT(torch.nn.Module):
         super().__init__()
         cfg = Config()
 
-        self.embed = torch.nn.Embedding(cfg.num_embeddings, cfg.embed_dim)
+        # self.embed = torch.nn.Embedding(cfg.num_embeddings, cfg.embed_dim)
+        self.embedw = torch.nn.Parameter(torch.empty(cfg.num_embeddings, cfg.embed_dim))
         self.position = torch.nn.Embedding(cfg.seqlen, cfg.embed_dim)
         self.embed_dropout = torch.nn.Dropout()
 
@@ -54,17 +69,23 @@ class GPT(torch.nn.Module):
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor):
 
-        embed = self.embed(input_ids)
+        # embed = self.embed(input_ids)
+        embed = torch.nn.functional.embedding(
+            input_ids, self.embedw, padding_idx=None,
+            max_norm=None, norm_type=2., scale_grad_by_freq=False, sparse=False
+        )
         pos_embed = self.position(position_ids)
         embed = embed + pos_embed
         embed = self.embed_dropout(embed)
         enc = embed.transpose(0, 1)
 
         for layer in self.layers:
+            cube.runtime.function.anchor('transformer start')
             enc = layer(enc)
         enc = self.final_layernorm(enc)
 
-        logits = torch.nn.functional.linear(enc, self.embed.weight)
+        # logits = torch.nn.functional.linear(enc, self.embed.weight)
+        logits = torch.nn.functional.linear(enc, self.embedw)
         # simplified
         loss = torch.sum(logits)
         return loss

@@ -28,6 +28,12 @@ class IRSelect(IRFwOperation):
 
         return True
 
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        op = IRSelect(self.signature, inputs, self.name, self.kwargs['dim'], self.kwargs['index'])
+        assert len(outputs) == 1
+        op.set_output(0, outputs[0])
+        assert op.infer_shape(), "IRSelect::new infer_shape failed"
+        return op
 
 class IRSlice(IRFwOperation):
     """
@@ -73,6 +79,14 @@ class IRSlice(IRFwOperation):
         self.output(0).shape = s2
 
         return True
+    
+    def new(self, inputs: List[IRTensor], outputs: List[IRTensor]):
+        assert len(inputs) == 1, "Slice: number of inputs not equal to 1"
+        op = IRSlice(self.signature, inputs, self.name, self.kwargs['dim'], self.kwargs['start'], self.kwargs['end'], self.kwargs['step'])
+        assert len(outputs) == 1
+        op.set_output(0, outputs[0])
+        assert op.infer_shape(), "IRSlice::new infer_shape failed"
+        return op    
 
 
 # torch.gather(input:Tensor, dim:int, index:LongTensor, *, sparse_grad=False, out=None) -> Tensor

@@ -5,10 +5,9 @@ from typing import Any, List, Tuple, Optional
 
 from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor
+import cube.ir as ir
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.mapping import Sign2Op, DType2IRDType
-
-import warnings
 
 
 _refmodule = torch.nn.Module()
@@ -51,11 +50,11 @@ class ScriptModuleParser:
             raise RuntimeError(f"Module {module.original_name} input shape mismatch (got {len(input_shapes)} != {len(inputs)})")
 
         # handle graph input -- Assuming all the inputs are tensors
-        kDefaultType = DType2IRDType.map(torch.get_default_dtype())
+        # kDefaultType = DType2IRDType.map(torch.get_default_dtype())
         for idx, input in enumerate(inputs):
             if isinstance(input.type(), torch._C.TensorType):
                 shape = None if input_shapes is None else input_shapes[idx]
-                dtype = kDefaultType
+                dtype = ir.IRDType.unknown # kDefaultType
                 val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.debugName())
             else:
                 raise NotImplementedError("Graph inputs only accepts Tensor")
@@ -95,6 +94,7 @@ class ScriptModuleParser:
 
         frame.pop_var()
         frame.pop_attr()
+        frame.save_attr_content()
         return input_val, all_ir_nodes, output_val
 
     @staticmethod
@@ -397,6 +397,11 @@ class ScriptModuleParser:
         var_name = node.outputsAt(0).debugName()
         dtype = node.outputsAt(0).type().str()
 
+        if dtype == 'Tensor?':
+            tensor = getattr(module, label)
+            if torch.is_tensor(tensor):
+                dtype = 'Tensor'
+
         # this usually means weight (nn.Parameter in torch)
         if dtype == 'Tensor':
             tensor = getattr(module, label)
@@ -412,9 +417,9 @@ class ScriptModuleParser:
                 if isinstance(tensor, torch.nn.Parameter):
                     ir_tensor.as_param()
                 else:
-                    warnings.warn('Detected non-parameter tensor as graph attribute. Regard them as parameters')
-                    ir_tensor.as_param()
+                    ir_tensor.as_buffer()
                 frame.add_attr(label, ir_tensor)
+                frame.add_attr_content(ir_tensor.tid, tensor)
             frame.add_var(var_name, ir_tensor)
         # symbolic attributes
         elif dtype in ['bool', 'int', 'float']:

@@ -2,12 +2,30 @@ import torch
 import torch.nn.functional as F
 
 from cube.runtime.syndata import SciLoopVariables
+from cube.profiler.timer import CudaTimer, print_each_rank
 from examples.wrf.policy.naive import PAS
+import examples.wrf.policy.onedim as onedim
 
 torch.set_default_tensor_type(torch.DoubleTensor)
 
 import cube
 
+import argparse
+
+parser = argparse.ArgumentParser(description='')
+parser.add_argument('--policy', type=str, help='PAS policy choice, starting with PAS')
+args = parser.parse_args()
+
+
+cube.init()
+chosenPAS = PAS
+policies = list(onedim.__dict__.keys())
+policies = [policy for policy in policies if policy.startswith('PAS')]
+if args.policy in onedim.__dict__:
+    chosenPAS = onedim.__dict__[args.policy]
+    print_each_rank(f'using policy from onedim.{args.policy}')
+else:
+    raise ValueError(f"policy {args.policy} not found. Candidates: {policies}")
 
 class WRF(torch.nn.Module):
     def __init__(self, dt, ntau, nz, ny, nx, dz, dy, dx, device):
@@ -455,7 +473,7 @@ if __name__ == "__main__":
     varloader = SciLoopVariables(variables=[U, V, W, O, Theta, phi1, mu1], constants=[])
     model = cube.SemanticModel(wrf, input_shapes=tuple(varloader.shapes))
 
-    @cube.compile(model=model, dataloader=varloader, PAS=PAS)
+    @cube.compile(model=model, dataloader=varloader, PAS=chosenPAS)
     def train_iter(model, dataloader):
         U, V, W, O, Theta, phi1, mu1 = next(dataloader)
         U, V, W, O, Theta, phi1, mu1 = model(U, V, W, O, Theta, phi1, mu1)

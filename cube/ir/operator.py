@@ -124,13 +124,14 @@ class IRFwOperation(IRCell):
         cpy = copy.copy(self)
         cpy._device = list()
         # reset input and output
-        cpy._inputs = (None,) * len(self.inputs())
+        cpy.reset_inputs(len(self.inputs()))
         for idx, input in enumerate(self.inputs()):
             cpy.set_input(idx, input)
-        cpy._outputs = (None,) * len(self.outputs())
+        cpy.reset_outputs(len(self.outputs()))
         for idx, output in enumerate(self.outputs()):
             cpy.set_output(idx, output)
         cpy._mirror = None
+        cpy.recompute = self.recompute
         cpy.clear_predecessor()
         cpy.clear_successor()
         return cpy
@@ -153,7 +154,15 @@ class IRFwOperation(IRCell):
 
     def __repr__(self) -> str:
         sign = self.signature.split('.')[-1]
-        ins = [t for t in self.inputs() if isinstance(t, IRSubTensor) and not t.is_param()]
+        ins = [t for t in self.inputs() if isinstance(t, IRSubTensor) and not t.is_attr()]
+        dscp = (f"FwOp{self._id}-{self.device}(sign={sign}, "
+                f"inputs={ins}, "
+                f"outputs={self.outputs()})")
+        return dscp
+
+    def extra_repr(self) -> str:
+        sign = self.signature.split('.')[-1]
+        ins = [t for t in self.inputs()]
         dscp = (f"FwOp{self._id}-{self.device}(sign={sign}, "
                 f"inputs={ins}, "
                 f"outputs={self.outputs()})")
@@ -213,10 +222,10 @@ class IRBpOperation(IRCell):
         cpy._device = list()
         cpy._id = IDGenerator().gen_cell_id()
         # reset input and output
-        cpy._inputs = (None,) * len(self.inputs())
+        cpy.reset_inputs(len(self.inputs()))
         for idx, input in enumerate(self.inputs()):
             cpy.set_input(idx, input)
-        cpy._outputs = (None,) * len(self.outputs())
+        cpy.reset_outputs(len(self.outputs()))
         for idx, output in enumerate(self.outputs()):
             cpy.set_output(idx, output)
         cpy._mirror = None
@@ -248,10 +257,10 @@ class IRDataOperation(IRCell):
         cpy._device = list()
         cpy._id = IDGenerator().gen_cell_id()
         # reset input and output
-        cpy._inputs = (None,) * len(self.inputs())
+        cpy.reset_inputs(len(self.inputs()))
         for idx, input in enumerate(self.inputs()):
             cpy.set_input(idx, input)
-        cpy._outputs = (None,) * len(self.outputs())
+        cpy.reset_outputs(len(self.outputs()))
         for idx, output in enumerate(self.outputs()):
             cpy.set_output(idx, output)
         cpy._mirror = None

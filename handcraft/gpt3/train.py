@@ -31,7 +31,7 @@ import numpy as np
 
 from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.reducer import Reducer
-from cube.runtime.adapter.distnn import AllReduceIdentity, IdentityAllreduce, AllGatherSplit
+from handcraft.module.distnn import AllReduceIdentity, IdentityAllreduce, AllGatherSplit
 
 from cube.profiler import CudaTimer
 from cube.profiler.memory import memory_summary
@@ -486,7 +486,7 @@ class Pooler(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.dense = troch.nn.Linear(config.hidden_size, config.hidden_size)
+        self.dense = torch.nn.Linear(config.hidden_size, config.hidden_size)
 
     def forward(self, hidden_states, sequence_index=0):
         pooled = hidden_states[:, sequence_index, :]
