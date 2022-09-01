@@ -359,6 +359,8 @@ class IRFullTensor(IRTensor):
         idx = self._consumers.index(cell)
         self._consumers.pop(idx)
         self._ctensors.pop(idx)
+        for t in self._ctensors:
+            t._dirty_grad = True
         return idx
 
     def clear_producer_consumer(self) -> int:
@@ -392,11 +394,30 @@ class IRFullTensor(IRTensor):
     def requires_grad(self, val: bool):
         self._requires_grad = val
         if val and self.grad is None:
-            self.grad = IRFullTensor(self.shape, 'g' + self.name, False).as_grad()
+            self.grad = IRFullTensor(self.shape, 'g' + self.name, False, dtype=self.dtype).as_grad()
         elif not val and self.grad is not None:
             self.grad = None
         for tensor in self._ctensors + self._ptensors:
             tensor._dirty_grad = True
+
+    @property
+    def dtype(self) -> IRDType:
+        """
+        Tensor data type
+        """
+        return self._dtype
+
+    @dtype.setter
+    def dtype(self, val: IRDType):
+        """
+        Set data type.
+        It's gradient data type will also be set.
+        """
+        if not isinstance(val, IRDType):
+            raise TypeError(f"Expected IRDType but got {val}")
+        self._dtype = val
+        if isinstance(self.grad, IRTensor):
+            self.grad.dtype = val
 
     def as_param(self):
         """
@@ -847,5 +868,5 @@ class IRSubTensor(IRTensor):
             anno = 'w'
         if self.is_grad():
             anno = 'g'
-        dscp = f'{anno}{self._id}(id={self._id}, shape={self.shape}, dev={self.device}, ind=[{self._indmap}], val={self._valmap})'
+        dscp = f'{anno}{self._id}(pid={self.parent.tid}, shape={self.shape}, dev={self.device}, ind=[{self._indmap}], val={self._valmap})'
         return dscp

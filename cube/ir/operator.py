@@ -1,39 +1,11 @@
-from typing import Any, Optional, Tuple, Union, List
+from typing import Optional, Tuple
 import copy
 
 from cube.ir.cten import IRCell, IRTensor
 from cube.ir.tensor import IRFullTensor, IRSubTensor
 from cube.algorithm.factory import DistAlgorithmFactory
 from cube.ir.unique import IDGenerator
-
-
-class IRBaseOp(IRCell):
-
-    def __init__(self, name: str, signature: str,
-                 inputs: List[IRTensor], outputs: List[IRTensor], **kwargs):
-        super().__init__(name, signature, len(inputs), len(outputs), init_outputs=False)
-        self.kwargs = kwargs
-        assert all(isinstance(t, IRTensor) for t in inputs), "expect all inputs to be IRTensors"
-        assert all(isinstance(t, IRTensor) for t in outputs), "expect all outputs to be IRTensors"
-        for idx, itensor in enumerate(inputs):
-            self.set_input(idx, itensor)
-        for idx, otensor in enumerate(outputs):
-            self.set_output(idx, otensor)
-
-    def infer_shape(self) -> bool:
-        """
-        Infer output value shape
-        """
-        raise NotImplementedError
-
-    def replicate(self):
-        """
-        Replicate the Operation
-        """
-        node = type(self)(
-            self.name, self.signature, self.inputs(), self.outputs(), **self.kwargs)
-        node._id = self._id
-        return node
+from cube.ir.dtype import IRDType, DTypeInferRule
 
 
 class IRFwOperation(IRCell):
@@ -62,6 +34,20 @@ class IRFwOperation(IRCell):
         outputs = [IRFullTensor() for _ in range(output_length)]
         for idx, output in enumerate(outputs):
             self.set_output(idx, output)
+
+    def infer_dtype(self):
+        """
+        Infer output value dtype.
+
+        By default will follow the same dtype promotion rule with PyTorch.
+        """
+        itensors = [t for t in self.inputs() if isinstance(t, IRTensor)]
+        assert len(itensors) > 0, "Missing input tensors, need to customize the infer rule"
+        odtype = DTypeInferRule.infer(self, [t.dtype for t in itensors])
+        assert odtype != IRDType.unknown, f"{self} : {[t.dtype for t in itensors]}"
+        otensors = [t for t in self.outputs() if isinstance(t, IRTensor)]
+        for tensor in otensors:
+            tensor.dtype = odtype
 
     def infer_shape(self):
         """
@@ -154,7 +140,7 @@ class IRFwOperation(IRCell):
 
     def __repr__(self) -> str:
         sign = self.signature.split('.')[-1]
-        ins = [t for t in self.inputs() if isinstance(t, IRSubTensor) and not t.is_attr()]
+        ins = [t for t in self.inputs() if isinstance(t, IRTensor) and not t.is_attr()]
         dscp = (f"FwOp{self._id}-{self.device}(sign={sign}, "
                 f"inputs={ins}, "
                 f"outputs={self.outputs()})")
@@ -200,9 +186,8 @@ class IRBpOperation(IRCell):
         wrapped with IRGraph detach and attach:
 
         ```
-        idx = graph.detach(node)
-        node.update()
-        graph.attach(node, idx)
+        with graph.update(node):
+            node.update()
         ```
         """
         fnode: IRFwOperation = self.mirror
