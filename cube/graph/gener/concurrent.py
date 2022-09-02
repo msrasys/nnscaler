@@ -1,0 +1,248 @@
+"""
+Concurrent producer / consumer Adapter Generator
+"""
+from typing import List, Optional
+import copy
+
+from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
+from cube.ir.adapter.prim import IRAdapterPrim
+from cube.ir.adapter import IRAdapter
+from cube.ir.adapter.prim import SelectPrim, MovePrim, SumPrim, MergeDimPrim
+
+from cube.graph.gener.layout import GridLayout
+
+
+class ConcurrentGener:
+
+    @staticmethod
+    def gen(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> Optional[IRAdapter]:
+        """
+        Generate forward adapter and backward adapter
+
+        @param ptensors List[IRSubTensor]: forward producer tensors
+        @param ctensors List[IRSubTensor]: forward consumer tensors
+
+        @return fadapter Optional[IRAdapter]: forward adapter
+            None indicate no adapter required.
+        """
+        pdevs = tuple(t.device[0] for t in ptensors)
+        cdevs = tuple(t.device[0] for t in ctensors)
+
+        fadapter: IRAdapter = None
+
+        # case 1: sharing device (in-shard)
+        inshard = (set(pdevs) == set(cdevs)) and (len(ptensors) == len(ctensors)) and (len(pdevs) == len(ptensors))
+        if inshard and len(pdevs) > 1:
+                try:
+                    fadapter = ConcurrentGener.gen_in_shard(ptensors, ctensors, allow_reorder=True)
+                except Exception as e:
+                    fadapter = None
+                    print(
+                        f"full tensor: {ptensors[0].parent} cannot use grid generation.\n"
+                        f"Reason: {str(e)}\n"
+                        f"Switch to general P2P communication."
+                    )
+
+        # Case 2: sperating device (cross-shard)
+        if len(set(pdevs).intersection(cdevs)) == 0:
+            pass
+
+        # Case 3: General cases
+        # warnings.warn('The adapter is generated using P2P communication')
+        if fadapter is None:
+            fadapter = ConcurrentGener.gen_general(ptensors, ctensors)
+        
+        return fadapter
+
+    @staticmethod
+    def gen_in_shard(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor], allow_reorder=False):
+        ftensor = ptensors[0].parent
+        # producer grid layout
+        ilayout = GridLayout.togrid(ftensor, ptensors)
+        # reorder ctensors to match with ptensors
+        devs = [ptensor.device for ptensor in ilayout.mat.flatten()]
+        ctensors = [None] * len(devs)
+        for ctensor in ctensors:
+            idx = devs.index(ctensor.device)
+            ctensors[idx] = ctensor
+        assert all(t is not None for t in ctensors), f"empty device slot {ctensors}"
+        # consumer grid layout
+        olayout = GridLayout.togrid(ftensor, ctensors)
+        # find path
+        paths, fprims = ilayout.path(olayout)
+
+        # re-assign the operator if miss-ordered
+        names, from_dev, to_dev = [], [], []
+        for itensor, otensor in zip(paths[-1].mat.flatten(), olayout.mat.flatten()):
+            assert len(itensor.device) == 1 and len(otensor.device) == 1, \
+                "Expect tensor only has one device. Report this as a bug"
+            if itensor.device != otensor.device:
+                inode, onode = itensor.cell, otensor.cell
+                names.append(f'{onode.name}{onode.cid}')
+                from_dev.append(onode.device[0])
+                to_dev.append(inode.device[0])
+                if allow_reorder:
+                    onode.device = inode.device
+                    if onode.mirror is not None:
+                        onode.mirror.device = inode.device
+                else:
+                    raise RuntimeError("device mismatch. Try to enable reorder")
+        if len(names) > 0:
+            print(f'UserWarning: a better device placement is found and set for op {names}: {from_dev} -> {to_dev}')
+
+        fadapter = IRAdapter(ftensor.ptensors, ftensor.ctensors)
+        fadapter.prims = fprims
+
+        # generate backward
+        grad: IRFullTensor = ftensor.grad
+        b_ptensors = [ctensor.grad for ctensor in ctensors]
+        b_ctensors = [ptensor.grad for ptensor in ptensors]
+        bprims = []
+        if grad is not None and (len(b_ptensors) != 0 or len(b_ctensors) != 0):
+            # reorder ptensors to match with forward
+            ptensors = [None] * len(devs)
+            for b_ptensor in b_ptensors:
+                idx = devs.index(b_ptensor.device)
+                assert ptensors[idx] is None, "same device of different tensors"
+                ptensors[idx] = b_ptensor
+            ilayout = GridLayout.togrid(grad, b_ptensors)
+            olayout = GridLayout.togrid(grad, b_ctensors)
+            paths, bprims = ilayout.path(olayout)
+            # check the device order
+            for itensor, otensor in zip(paths[-1].mat.flatten(), olayout.mat.flatten()):
+                assert len(itensor.device) == len(otensor.device), "backward device not match"
+            badapter = IRAdapter(b_ptensors, b_ctensors)
+            badapter.prims = bprims
+            IRAdapter.make_pair(fadapter, badapter)
+
+        return fadapter
+
+    @staticmethod
+    def gen_cross_shard(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> IRAdapter:
+        pass
+
+    @staticmethod
+    def gen_general(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> IRAdapter:
+        """
+        A general way to generate adapter.
+        FIXME: Assuming consumers at different devices can happen at the same time.
+               This will block the pipeline parallelism description.
+        
+        @param ftensor IRFullTensor
+        @return adapter IRAdapter
+        """
+        fprims = []
+        for ctensor in ctensors:
+            fprims += ConcurrentGener.gen_subtensor(ctensor, ptensors)
+        fadapter = IRAdapter(ptensors,ctensors)
+        fadapter.prims = fprims
+        # backward
+        b_ptensors = [ctensor.grad for ctensor in ctensors if ctensor.grad is not None]
+        b_ctensors = [ptensor.grad for ptensor in ptensors if ptensor.grad is not None]
+        bprims = []
+        for cgrad in b_ctensors:
+            bprims += ConcurrentGener.gen_subtensor(cgrad, b_ptensors)
+        badapter = IRAdapter(b_ptensors, b_ctensors)
+        badapter.prims = bprims
+        IRAdapter.make_pair(fadapter, badapter)
+        return fadapter
+
+    @staticmethod
+    def gen_subtensor(ctensor: IRSubTensor, ptensors: List[IRSubTensor]) -> List[IRAdapterPrim]:
+        """
+        Generate communiction primitives for ctensor
+        
+        @param ctensor IRSubTensor: the consumed tensor as destination
+        @param ptensors List[IRSubTensor]: the produced tensors as source
+
+        @return prims List[IRAdapterPrim]: the primitives for adapter
+        """
+        # category to local tensor and remote tensor
+        local = [t for t in ptensors if t.device == ctensor.device]
+        remote = [t for t in ptensors if t.device != ctensor.device]
+        prims = []
+
+        # ==== select ==== #
+        intersections = []
+        # check local
+        for itensor in local+remote:
+            if itensor.device == ctensor.device and itensor == ctensor:
+                return []
+            common: Optional[IRSubTensor] = itensor.common(ctensor)
+            if common is None:
+                continue
+            common.cell = itensor.cell
+            intersections.append(common)
+            # create select primitive
+            if common != itensor:
+                indmap = []
+                for dim in range(itensor.ndims):
+                    (s1, e1), (s2, e2) = itensor.indmap[dim], common.indmap[dim]
+                    start = s2 - s1
+                    end = start + e2 - s2
+                    indmap.append((start, end))
+                indmap = IndexMap(tuple(indmap))
+                assert itensor.valmap == common.valmap, "Value map not same"
+                valmap = ValueMap((0, 1))
+                select_prim = SelectPrim(itensor, indmap, valmap, common)
+                prims.append(select_prim)
+            if itensor.device == ctensor.device and common == ctensor:
+                return [select_prim]
+            # TODO: check union == subtensor
+            if common == ctensor:
+                break
+
+        # print(intersections)
+        # ====== move ===== #
+        tmoved = []
+        for tensor in intersections:
+            assert len(tensor.device) == 1 and len(ctensor.device) == 1, "Expected only one device."
+            mtensor = tensor
+            if tensor.device != ctensor.device:
+                mtensor = copy.copy(tensor)
+                mtensor.cell = ctensor.cell
+                prims.append(MovePrim(tensor, mtensor))
+            tmoved.append(mtensor)
+
+        # ===== merge ===== #
+        remain_tensors: List[IRSubTensor] = copy.copy(tmoved)
+        if ctensor in remain_tensors:
+            return prims
+        out = None
+        while out != ctensor:
+            out, merged = None, False
+            for idx1 in range(len(remain_tensors) - 1):
+                for idx2 in range(idx1+1, len(remain_tensors)):
+                    t1, t2 = remain_tensors[idx1], remain_tensors[idx2]
+                    catdim = t1.catdim(t2)
+                    if catdim is not None:
+                        tensors = [t1, t2] if t1.indmap[catdim][0] < t2.indmap[catdim][0] else [t2, t1]
+                        out = tensors[0].concat(tensors[1], dim=catdim)
+                        out.cell = ctensor.cell
+                        prims.append(MergeDimPrim(tensors, out, catdim))
+                        merged = True
+                        break
+                    # reduction
+                    if t1.accumable(t2):
+                        out = t1.accum(t2)
+                        out.cell = ctensor.cell
+                        prims.append(SumPrim([t1, t2], out))
+                        merged = True
+                        break
+                if merged:
+                    remain_tensors.remove(t1)
+                    remain_tensors.remove(t2)
+                    remain_tensors.append(out)
+                    break
+            if out is None:
+                ptensors = '\n\t'.join(t.extra_repr() for t in ptensors)
+                remain = '\n\t'.join(t.extra_repr() for t in remain_tensors)
+                raise RuntimeError(
+                    f"Fail to build adapter.\n"
+                    f"FullTensor:{ctensor.parent}\n"
+                    f"Produced Tensors:\n\t{ptensors}\n"
+                    f"Consumed Tensors:\n\t{ctensor.extra_repr()}\n"
+                    f"Consumer:\n\t{ctensor.cell}\n"
+                    f"Remain Tensor:\n\t{remain}"
+                )
+        return prims
