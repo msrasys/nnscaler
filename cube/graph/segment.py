@@ -1,4 +1,4 @@
-from typing import Union, Tuple, List, Optional, Dict
+from typing import Union, List, Optional, Set
 import copy
 
 from cube.ir.tensor import IRFullTensor, IRSubTensor
@@ -11,6 +11,9 @@ from cube.ir.adapter import IRAdapter
 class IRSegment(IRCell):
     """
     A distributed sub-graph representing a piece of workload in parent IRGraph
+
+    Once the segment is generated, its input and output will be fixed.
+    Inserting and removing nodes that could change input/output are not allowed.
     """
 
     def __init__(self, nodes: List[IRCell], inputs: List[IRTensor], outputs: List[IRSubTensor], name='segment'):
@@ -20,10 +23,19 @@ class IRSegment(IRCell):
         self._idevice = [t.device for t in inputs]
         self._odevice = [t.device for t in outputs]
 
-        for idx, val in enumerate(inputs):
-            self.set_input(idx, val)
-        for idx, val in enumerate(outputs):
-            self.set_output(idx, val)
+        self._inputs = list(inputs)
+        self._outputs = list(outputs)
+        # for idx, val in enumerate(inputs):
+        #     self.set_input(idx, val)
+        # for idx, val in enumerate(outputs):
+        #     self.set_output(idx, val)
+
+        # full tensors
+        self._full_tensors: Set[IRFullTensor] = set()
+        for node in nodes:
+            for tensor in node.inputs() + node.outputs():
+                if isinstance(tensor, IRSubTensor):
+                    self._full_tensors.add(tensor.parent)
 
         self._have_forward = any(isinstance(n, IRFwOperation) for n in nodes)
         self._have_backward = any(isinstance(n, IRBpOperation) for n in nodes)
@@ -31,6 +43,12 @@ class IRSegment(IRCell):
     @property
     def forward(self) -> bool:
         return self._have_forward
+
+    def full_tensors(self) -> List[IRFullTensor]:
+        """
+        Return full tensor list
+        """
+        return list(self._full_tensors)
 
     # ========================= Basic Graph access =======================
 
@@ -89,7 +107,7 @@ class IRSegment(IRCell):
         """
         Insert a node at index.
 
-        TODO: update input and output
+        TODO: check input and output
 
         @param node IRCell: the inserted node
         @param index int: the index
@@ -102,7 +120,7 @@ class IRSegment(IRCell):
         """
         Remove a node at index
 
-        # TODO: update input and output
+        # TODO: check input and output
 
         @param node IRCell: the removed node
         
@@ -117,7 +135,7 @@ class IRSegment(IRCell):
         """
         Replace one node by multiple nodes
 
-        # TODO: update input and output
+        # TODO: check input and output
 
         @param node IRCell: the replaced node
         @param new_nodes List[IRCell]: the nodes to be inserted.

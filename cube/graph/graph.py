@@ -10,15 +10,14 @@ IRGraph:
 from contextlib import contextmanager
 from typing import Union, Tuple, List, Optional, Dict, Set
 
-from cube.graph.function.anchor import IRGraphAnchor
-from cube.graph.function.function import Identity, MultiRef
-from cube.graph.segment import IRSegment
-
 from cube.ir.cten import IRTensor, IRCell
 from cube.ir.unique import IDGenerator
 from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from cube.ir.adapter import IRAdapter
-from cube.ir.tensor import IRFullTensor, IRSubTensor, StartEnd
+from cube.ir.tensor import IRFullTensor, IRSubTensor
+
+from cube.graph.function.function import Identity, MultiRef
+from cube.graph.segment import IRSegment
 
 from cube.algorithm.generics import GenericDistAlgo
 
@@ -79,11 +78,11 @@ class GraphIndex:
         return (self.gidx, self.sidx)
 
 
-
 class IRGraph(IRSegment):
     """
-    IR Graph. The hyperGraph for representing distributed
-    graph.
+    IRGraph.
+
+    IRGraph is used for reprensting a distributed training iteration.
     """
 
     def __init__(self, 
@@ -98,25 +97,19 @@ class IRGraph(IRSegment):
             outputs = IRGraph.get_outputs(nodes)
         super().__init__([], inputs, outputs, module_name)
 
-        self._attributes = set()
-        self._full_tensors: Set[IRFullTensor] = set()
-
-        self._train: bool = any(
-            isinstance(node, IRBpOperation) or
-            (isinstance(node, IRSegment) and node.forward) or
-            (isinstance(node, IRAdapter) and node.forward) for node in nodes
-        )
+        # atrribute tensors
+        self._attributes: Set[IRSubTensor] = set()
 
         self._sched = None  # the schedule strategy
 
-        # set parameters / buffers and full tensors
+        # set parameters / buffers
         for node in nodes:
-            for tensor in node.inputs() + node.outputs():
-                if isinstance(tensor, IRSubTensor):
-                    tensor.parent.clear_producer_consumer()
-                    self._full_tensors.add(tensor.parent)
-                    if tensor.is_attr():
-                        self._attributes.add(tensor)
+            tensors = node.inputs() + node.outputs()
+            tensors = [t for t in tensors if isinstance(t, IRSubTensor)]
+            for t in tensors:
+                t.parent.clear_producer_consumer()
+                if t.is_attr():
+                    self._attributes.add(t)
 
         # insert node from nodes
         for idx, node in enumerate(nodes):
@@ -131,7 +124,7 @@ class IRGraph(IRSegment):
 
         @return train bool: True if backward is required, otherwise False (inference only).
         """
-        return self._train
+        return self._have_forward and self._have_backward
 
     def reset_dependency(self):
         """
@@ -162,12 +155,6 @@ class IRGraph(IRSegment):
         """
         return tuple(self._attributes)
 
-    def full_tensors(self) -> List[IRFullTensor]:
-        """
-        Return full tensor list
-        """
-        return list(self._full_tensors)
-
     def forward(self, *args) -> Union[IRTensor, Tuple[IRTensor]]:
         """
         forward will divide the graph into Actions according to
@@ -187,7 +174,6 @@ class IRGraph(IRSegment):
         Register forward action
         """
         return self.forward(*args)
-
 
     # ====================== Graph Accessment =========================
     
@@ -252,7 +238,6 @@ class IRGraph(IRSegment):
         """
         index = GraphIndex(index, None) if isinstance(index, int) else index
         assert isinstance(index, GraphIndex)
-        assert len(index) == 2 and isinstance(index[0], int)
         node = self._nodes[index.gidx]
         if index.sidx is not None:
             assert isinstance(node, IRSegment), "Expected IRSegment"
@@ -431,8 +416,8 @@ class IRGraph(IRSegment):
         
         @return segment IRSegment: the grouped segment
         """
-        assert any(not isinstance(node, (IRBpOperation, IRSegment)) for node in fnodes), \
-            "grouped nodes cannot be backward operation or segment"
+        assert any(not isinstance(node, (IRBpOperation, IRSegment, IRDataOperation)) for node in fnodes), \
+            "grouped nodes cannot be backward operation, segment or data operation"
         
         findices = [self.index(fnode) for fnode in fnodes]
         
@@ -716,23 +701,27 @@ class IRGraph(IRSegment):
         """
         Assign an operator (subgraph) to (multiple) rank(s).
 
-        If `ranks` has multiple integer, then the operator will be replicated
-        `len(ranks)` times and assigned to given device correspondingly.
+        Corresponding backward operators (if have) will also be 
+        assigned to the same device.
 
-        Corresponding backward operators (if have) will also be replicated
-        and assigned to the same device with it's forward operator
-
-        @param node Union[IRFwOperation, IRBpOperation]: operator
-        @param ranks Tuple[int, Tuple[int]]: assigned ranks
+        @param node Union[IRFwOperation, IRBpOperation, IRSegment]: operator
+        @param device int: assigned device id
 
         @return sucess bool: always true
         """
-        assert isinstance(node, (IRFwOperation, IRDataOperation)), \
-            f"Only forward and data operation can be assigned to device, but got {node}"
         assert self.exist(node), f"{node} is not in the graph"
-        node.device = device
-        if node.mirror is not None:
-            node.mirror.device = device
+        if isinstance(node, IRSegment):
+            assert node.forward, "Only forward segment is allowed to assign devices"
+            for subnode in node.nodes():
+                subnode.device = device
+                if subnode.mirror is not None:
+                    subnode.mirror.device = device
+        else:
+            assert isinstance(node, (IRFwOperation, IRDataOperation)), \
+                "Only forward operators and dataloader operators are allowed to assign devices"
+            node.device = device
+            if node.mirror is not None:
+                node.mirror.device = device
         return True
 
     ## Schedule Policy Primitives ##
@@ -926,7 +915,7 @@ class IRGraph(IRSegment):
         @param starts  Tuple[int]: the start index of each stage
         @return None
         """
-        assert all(isinstance(node, (IRFwOperation, IRDataOperation)) for node in nodes), \
+        assert all(isinstance(node, IRFwOperation) for node in nodes), \
             f"Find node is not IRFwOperation or IRDataOperation: {node}"
         assert all(node in self._nodes for node in nodes), \
             f"Exist node is not in graph nodes"
@@ -939,36 +928,41 @@ class IRGraph(IRSegment):
             if not isinstance(node, IRBpOperation):
                 last_fidx = idx
         
-        fstages = []
+        fstages: List[List[IRCell]] = []
+        bstages: List[List[IRCell]] = []
         for sid in range(len(starts)):
             begin = starts[sid]
-            if sid == len(starts) - 1:
-                end = last_fidx + 1
-            else:
-                end = starts[sid+1]
-            if begin == end:
-                continue
+            end = starts[sid+1] if sid != len(starts) - 1 else last_fidx + 1
+            while isinstance(self.node(begin), IRDataOperation):
+                begin += 1
+            while isinstance(self.node(end), IRDataOperation):
+                end -= 1
+            if begin == end: continue
             assert begin < end
-            fstages.append(self._nodes[begin:end])
-        
-        # grouping into index
-        fsegs: List[IRSegment] = []
-        for sid in range(len(fstages)):
-            fsegs.append(self.group(fstages[sid]))
+            fnodes = self._nodes[begin:end]
+            bnodes = [fnode.mirror for fnode in fnodes[::-1] if fnode.mirror is not None]
+            fstages.append(fnodes)
+            bstages = [bnodes] + bstages
 
-        fidxs: List[int] = [self._nodes.index(seg) for seg in fsegs]
-        bidxs: List[Optional[int]] = [self._nodes.index(seg.mirror) if seg.mirror is not None else None for seg in fsegs]
+        def get_sid(fnode: IRCell) -> Optional[int]:
+            for idx, fnodes in enumerate(fstages):
+                if fnode in fnodes:
+                    return idx
+            return None
 
         def insert_identity(tensor: IRSubTensor, sid: int) -> IRFwOperation:
             identity = Identity('', [tensor])
             identity.infer_shape()
             identity.set_output(0, identity.output(0).tosub())
             # insert forward
-            self.insert(identity, GraphIndex(fidxs[sid], 0))
+            self.insert(identity, self.index(fstages[sid][0]))
+            fstages[sid].insert(0, identity)
+            
             # insert backward
             if self.train:
                 bnode = identity.gen_backward()
-                self.insert(bnode, GraphIndex(bidxs[sid], -1))
+                self.insert(bnode, self.index(bstages[sid][-1]) + 1)
+                bstages[sid].append(bnode)
             return identity
 
         # create identity op for cross-stage dataflow
@@ -978,16 +972,15 @@ class IRGraph(IRSegment):
             assert len(ftensor.producers) <= 1, \
                 "The staging interface should be called before any operator partition."
             if len(ftensor.consumers) == 0: continue
-            producer = ftensor.producers[0]
-            # TODO: robustness
-            psid = fidxs.index(self.index(producer).gidx)
-            ptensor = ftensor.ptensors[0]
+            producer, ptensor = ftensor.producers[0], ftensor.ptensors[0]
+            psid = get_sid(producer)
+            # outside of stages, not consider
+            if psid is None: continue 
             out = ptensor
             curr_sid = psid
             for ctensor, consumer in zip(ftensor.ctensors, ftensor.consumers):
                 assert ctensor == ptensor, "The staging interface should be called before any operator partition." 
-                # TODO: robustness
-                csid = fidxs.index(self.index(consumer).gidx)
+                csid = get_sid(consumer)
                 if curr_sid == csid: continue
                 for sid in range(curr_sid + 1, csid):
                     identity = insert_identity(out, sid)
@@ -1000,6 +993,11 @@ class IRGraph(IRSegment):
                     with self.update(consumer.mirror) as bnode:
                         bnode.update()
                 curr_sid = csid
+        
+        # grouping into segment
+        for sid in range(len(fstages)):
+            self.group(fstages[sid])
+
 
     # ================= Other optimizations ==================
 
