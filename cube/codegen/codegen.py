@@ -409,7 +409,7 @@ class ModelCodeGen(CodeGen):
                 if ranks not in comm_groups:
                     comm_groups.append(ranks)
         # collect groups from p2p fusion
-        adapters = [n for n in graph.flatten() if isinstance(n, IRAdapter)]
+        adapters = [n for n in graph.nodes(flatten=True) if isinstance(n, IRAdapter)]
         for adapter in adapters:
             for prim in adapter.prims:
                 if isinstance(prim, CollectivePrim):
@@ -535,33 +535,37 @@ class ModelCodeGen(CodeGen):
         psign = "self.register_parameter('{name}', torch.nn.Parameter(torch.empty({shape}, dtype={dtype})))"
         bsign = "self.register_buffer('{name}', torch.empty({shape}, dtype={dtype}))"
         map_sign = "self.add_full_map('{attr}', {tid}, {slicers}, {val_chunks})"
-        for itensor in node.inputs():
-            name = self.tensor_naming(itensor, prefix_attr='self.')
-            if isinstance(itensor, IRSubTensor):
-                if itensor.is_attr() and not self.symbols.exist(name):
-                    self.symbols.create(name)
-                    sign = psign if itensor.is_param() else bsign
-                    code = sign.format(
-                        name=self.tensor_naming(itensor),
-                        shape=tuple(itensor.shape),
-                        dtype=self.dtype_map(itensor.dtype)
-                    )
-                    self.model_init_statements.append(code)
-                    tid = itensor.parent.tid
-                    slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
-                    val_chunks = itensor.valmap[1]
-                    code = map_sign.format(
-                        attr=self.tensor_naming(itensor), tid=tid,
-                        slicers=str(slicers), val_chunks=val_chunks
-                    )
-                    self.model_init_statements.append(code)
-                    self.model_init_statements.append('')
-            if isinstance(itensor, str):
-                if name.startswith('self.'):
-                    if not hasattr(self._ref_module, name[5:]):
-                        raise NotImplementedError("member attribute is not added")
-        for output in node.outputs():
-            self.symbols.create(self.tensor_naming(output, prefix_attr='self.'))
+        if not isinstance(node, IRSegment):
+            for itensor in node.inputs():
+                name = self.tensor_naming(itensor, prefix_attr='self.')
+                if isinstance(itensor, IRSubTensor):
+                    if itensor.is_attr() and not self.symbols.exist(name):
+                        self.symbols.create(name)
+                        sign = psign if itensor.is_param() else bsign
+                        code = sign.format(
+                            name=self.tensor_naming(itensor),
+                            shape=tuple(itensor.shape),
+                            dtype=self.dtype_map(itensor.dtype)
+                        )
+                        self.model_init_statements.append(code)
+                        tid = itensor.parent.tid
+                        slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
+                        val_chunks = itensor.valmap[1]
+                        code = map_sign.format(
+                            attr=self.tensor_naming(itensor), tid=tid,
+                            slicers=str(slicers), val_chunks=val_chunks
+                        )
+                        self.model_init_statements.append(code)
+                        self.model_init_statements.append('')
+                if isinstance(itensor, str):
+                    if name.startswith('self.'):
+                        if not hasattr(self._ref_module, name[5:]):
+                            raise NotImplementedError("member attribute is not added")
+            for output in node.outputs():
+                self.symbols.create(self.tensor_naming(output, prefix_attr='self.'))
+        else:
+            for sub_node in node.nodes():
+                self.emit_node_tensors_declare(sub_node)
         return
 
     def emit_segment_code(self, segment: IRSegment) -> List[str]:
