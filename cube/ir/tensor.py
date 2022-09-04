@@ -574,21 +574,6 @@ class IRSubTensor(IRTensor):
         tensor._cell = None
         return tensor
 
-    def grad(self, graph: IRCell) -> Optional[IRTensor]:
-        """
-        Get gradient of this tensor.
-
-        Gradient can be:
-         - None: the tensor doesn't require gradient
-         - 1.0: the tensor is loss tensor (scalar)
-         - IRSubTensor: the tensor requires gradient and is not the loss tensor (scalar)
-
-        Gradient cannot be set and can only be inferred by its IRFullTensor.
-        The gradient will be lazy updated when its IRFullTensor gets
-        new consumed / produced tensors
-        """
-        return graph.grad(self)
-
     @property
     def requires_grad(self) -> bool:
         return self.parent._requires_grad

@@ -154,6 +154,10 @@ class IRBpOperation(IRCell):
             'backward', 'torch.autograd.grad',
             len(ograds), len(igrads), init_outputs=False
         )
+        for idx, ograd in enumerate(ograds):
+            self.set_input(idx, ograd)
+        for idx, igrad in enumerate(igrads):
+            self.set_output(idx, igrad)
 
     def update(self):
         """

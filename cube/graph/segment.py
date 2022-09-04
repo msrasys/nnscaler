@@ -291,6 +291,7 @@ class IRSegment(IRCell):
         fgrad = tensor.parent.grad
         # None means no gradient requirement, flaot means its the loss
         if fgrad is None or isinstance(fgrad, float):
+            tensor.grad = fgrad
             return fgrad
         ftensor = tensor.parent
         # this tensor is consumed
@@ -312,6 +313,7 @@ class IRSegment(IRCell):
                 indmap = tensor.indmap,
                 valmap = (0, 1),
             )
+        tensor.grad = grad
         return grad
 
     def debug_print_tensor_map(self):
@@ -608,6 +610,9 @@ class IRSegment(IRCell):
             for otensor in otensors:
                 ftensor = otensor.parent
                 if otensor.is_attr(): continue
+                # loss doesn't have consumers
+                if len(segment.consumers(ftensor)) == 0:
+                    outputs.add(otensor)
                 # from segment outputs
                 if any(t.overlap(otensor) for t in segment.outputs() if isinstance(t, IRSubTensor)):
                     outputs.add(otensor)
@@ -619,9 +624,6 @@ class IRSegment(IRCell):
                         continue
         segment = IRSegment(nodes, tuple(inputs), tuple(outputs))
         return segment
-
-
-    ###### ============ Transformation Primitives ============ #######
 
 
     def dispatch(self, devid: int, mirror=True) -> Optional[IRCell]:
