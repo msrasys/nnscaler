@@ -97,7 +97,7 @@ def TriangleMultiplication(
         tri_mul_norm2_bias: torch.Tensor, tri_mul_proj1: torch.Tensor,
         tri_mul_proj2: torch.Tensor, tri_mul_proj3: torch.Tensor,
         tri_mul_proj4: torch.Tensor, tri_mul_proj5: torch.Tensor,
-        tri_mul_proj6: torch.Tensor, cz: int, out_going: False):
+        tri_mul_proj6: torch.Tensor, cz: int, out_going: bool):
     pair_repr = torch.nn.functional.layer_norm(pair_repr, (cz, ),
                                                tri_mul_norm1_weight,
                                                tri_mul_norm1_bias)
@@ -146,30 +146,42 @@ a simplified version for evoformer in alphafold2
 
 class Evoformer(torch.nn.Module):
 
-    def __init__(self, s: int, cm: int, cz: int, c: int, head: int):
+    def __init__(self,
+                 s: int,
+                 cm: int,
+                 cz: int,
+                 c=32,
+                 msa_head=8,
+                 pair_head=4,
+                 c_tri_mult=128,
+                 ff_mult=4):
         super().__init__()
 
-        self.s, self.cm, self.cz, self.c, self.head = s, cm, cz, c, head
+        self.s, self.cm, self.cz, self.c, self.msa_head, self.pair_head, self.c_tri_mult, self.ff_mult = s, cm, cz, c, msa_head, pair_head, c_tri_mult, ff_mult
         self.scale = 1.0 / math.sqrt(c)
 
         # MSA row-wise gated self-attention with pair bias
         self.row_norm_m = torch.nn.LayerNorm(cm)
         self.row_norm_z = torch.nn.LayerNorm(cz)
-        self.row_gate_proj = torch.nn.Parameter(torch.randn(cm, head * c))
-        self.row_qkv_proj = torch.nn.Parameter(torch.randn(cm, 3 * head * c))
-        self.row_out_proj = torch.nn.Parameter(torch.randn(head * c, cm))
-        self.row_bias_proj = torch.nn.Parameter(torch.randn(cz, head))
+        self.row_gate_proj = torch.nn.Parameter(torch.randn(cm, msa_head * c))
+        self.row_qkv_proj = torch.nn.Parameter(
+            torch.randn(cm, 3 * msa_head * c))
+        self.row_out_proj = torch.nn.Parameter(torch.randn(msa_head * c, cm))
+        self.row_bias_proj = torch.nn.Parameter(torch.randn(cz, msa_head))
 
         # MSA column-wise gated self-attention
         self.col_norm = torch.nn.LayerNorm(cm)
-        self.col_gate_proj = torch.nn.Parameter(torch.randn(cm, head * c))
-        self.col_qkv_proj = torch.nn.Parameter(torch.randn(cm, 3 * head * c))
-        self.col_out_proj = torch.nn.Parameter(torch.randn(head * c, cm))
+        self.col_gate_proj = torch.nn.Parameter(torch.randn(cm, msa_head * c))
+        self.col_qkv_proj = torch.nn.Parameter(
+            torch.randn(cm, 3 * msa_head * c))
+        self.col_out_proj = torch.nn.Parameter(torch.randn(msa_head * c, cm))
 
         # MSA transition
         self.msa_transition_norm = torch.nn.LayerNorm(cm)
-        self.msa_transition_proj1 = torch.nn.Parameter(torch.randn(cm, 4 * cm))
-        self.msa_transition_proj2 = torch.nn.Parameter(torch.randn(4 * cm, cm))
+        self.msa_transition_proj1 = torch.nn.Parameter(
+            torch.randn(cm, ff_mult * cm))
+        self.msa_transition_proj2 = torch.nn.Parameter(
+            torch.randn(ff_mult * cm, cm))
 
         # Outer product mean
         self.outer_norm = torch.nn.LayerNorm(cm)
@@ -180,63 +192,76 @@ class Evoformer(torch.nn.Module):
         # Triangular multiplicative update using outgoing edges
         self.tri_mul_out_norm1_weight = torch.nn.Parameter(torch.empty(cz))
         self.tri_mul_out_norm1_bias = torch.nn.Parameter(torch.empty(cz))
-        self.tri_mul_out_norm2_weight = torch.nn.Parameter(torch.empty(128))
-        self.tri_mul_out_norm2_bias = torch.nn.Parameter(torch.empty(128))
-        self.tri_mul_out_proj1 = torch.nn.Parameter(torch.randn(cz, 128))
-        self.tri_mul_out_proj2 = torch.nn.Parameter(torch.randn(cz, 128))
-        self.tri_mul_out_proj3 = torch.nn.Parameter(torch.randn(cz, 128))
-        self.tri_mul_out_proj4 = torch.nn.Parameter(torch.randn(cz, 128))
-        self.tri_mul_out_proj5 = torch.nn.Parameter(torch.randn(128, cz))
+        self.tri_mul_out_norm2_weight = torch.nn.Parameter(
+            torch.empty(c_tri_mult))
+        self.tri_mul_out_norm2_bias = torch.nn.Parameter(
+            torch.empty(c_tri_mult))
+        self.tri_mul_out_proj1 = torch.nn.Parameter(torch.randn(
+            cz, c_tri_mult))
+        self.tri_mul_out_proj2 = torch.nn.Parameter(torch.randn(
+            cz, c_tri_mult))
+        self.tri_mul_out_proj3 = torch.nn.Parameter(torch.randn(
+            cz, c_tri_mult))
+        self.tri_mul_out_proj4 = torch.nn.Parameter(torch.randn(
+            cz, c_tri_mult))
+        self.tri_mul_out_proj5 = torch.nn.Parameter(torch.randn(
+            c_tri_mult, cz))
         self.tri_mul_out_proj6 = torch.nn.Parameter(torch.randn(cz, cz))
 
         # Triangular multiplicative update using incoming edges
         self.tri_mul_in_norm1_weight = torch.nn.Parameter(torch.empty(cz))
         self.tri_mul_in_norm1_bias = torch.nn.Parameter(torch.empty(cz))
-        self.tri_mul_in_norm2_weight = torch.nn.Parameter(torch.empty(128))
-        self.tri_mul_in_norm2_bias = torch.nn.Parameter(torch.empty(128))
-        self.tri_mul_in_proj1 = torch.nn.Parameter(torch.randn(cz, 128))
-        self.tri_mul_in_proj2 = torch.nn.Parameter(torch.randn(cz, 128))
-        self.tri_mul_in_proj3 = torch.nn.Parameter(torch.randn(cz, 128))
-        self.tri_mul_in_proj4 = torch.nn.Parameter(torch.randn(cz, 128))
-        self.tri_mul_in_proj5 = torch.nn.Parameter(torch.randn(128, cz))
+        self.tri_mul_in_norm2_weight = torch.nn.Parameter(
+            torch.empty(c_tri_mult))
+        self.tri_mul_in_norm2_bias = torch.nn.Parameter(
+            torch.empty(c_tri_mult))
+        self.tri_mul_in_proj1 = torch.nn.Parameter(torch.randn(cz, c_tri_mult))
+        self.tri_mul_in_proj2 = torch.nn.Parameter(torch.randn(cz, c_tri_mult))
+        self.tri_mul_in_proj3 = torch.nn.Parameter(torch.randn(cz, c_tri_mult))
+        self.tri_mul_in_proj4 = torch.nn.Parameter(torch.randn(cz, c_tri_mult))
+        self.tri_mul_in_proj5 = torch.nn.Parameter(torch.randn(c_tri_mult, cz))
         self.tri_mul_in_proj6 = torch.nn.Parameter(torch.randn(cz, cz))
 
         # Triangular gated self-attention around starting node
         self.tri_att_start_norm = torch.nn.LayerNorm(cz)
         self.tri_att_start_gate_proj = torch.nn.Parameter(
-            torch.randn(cz, 4 * c))
+            torch.randn(cz, pair_head * c))
         self.tri_att_start_qkv_proj = torch.nn.Parameter(
-            torch.randn(cz, 3 * 4 * c))
-        self.tri_att_start_out_proj = torch.nn.Parameter(torch.randn(
-            4 * c, cz))
-        self.tri_att_start_bias_proj = torch.nn.Parameter(torch.randn(cz, 4))
+            torch.randn(cz, 3 * pair_head * c))
+        self.tri_att_start_out_proj = torch.nn.Parameter(
+            torch.randn(pair_head * c, cz))
+        self.tri_att_start_bias_proj = torch.nn.Parameter(
+            torch.randn(cz, pair_head))
 
         # Triangular gated self-attention around ending node
         self.tri_att_end_norm = torch.nn.LayerNorm(cz)
-        self.tri_att_end_gate_proj = torch.nn.Parameter(torch.randn(cz, 4 * c))
+        self.tri_att_end_gate_proj = torch.nn.Parameter(
+            torch.randn(cz, pair_head * c))
         self.tri_att_end_qkv_proj = torch.nn.Parameter(
-            torch.randn(cz, 3 * 4 * c))
-        self.tri_att_end_out_proj = torch.nn.Parameter(torch.randn(4 * c, cz))
-        self.tri_att_end_bias_proj = torch.nn.Parameter(torch.randn(cz, 4))
+            torch.randn(cz, 3 * pair_head * c))
+        self.tri_att_end_out_proj = torch.nn.Parameter(
+            torch.randn(pair_head * c, cz))
+        self.tri_att_end_bias_proj = torch.nn.Parameter(
+            torch.randn(cz, pair_head))
 
         # Transition in the pair stack
         self.pair_transition_norm = torch.nn.LayerNorm(cz)
-        self.pair_transition_proj1 = torch.nn.Parameter(torch.randn(
-            cz, 4 * cz))
-        self.pair_transition_proj2 = torch.nn.Parameter(torch.randn(
-            4 * cz, cz))
+        self.pair_transition_proj1 = torch.nn.Parameter(
+            torch.randn(cz, ff_mult * cz))
+        self.pair_transition_proj2 = torch.nn.Parameter(
+            torch.randn(ff_mult * cz, cz))
 
     def forward(self, msa_repr: torch.Tensor, pair_repr: torch.Tensor):
 
         msa_repr = msa_repr + MSARowAttentionWithPairBias(
             self.row_norm_m(msa_repr), pair_repr, self.row_gate_proj,
             self.row_qkv_proj, self.row_out_proj, self.row_bias_proj,
-            self.head, self.c, self.scale)
+            self.msa_head, self.c, self.scale)
 
         msa_repr = msa_repr.transpose(-3, -2)
         msa_repr = msa_repr + MSAAttention(
             self.col_norm(msa_repr), self.col_gate_proj, self.col_qkv_proj,
-            self.col_out_proj, None, self.head, self.c, self.scale)
+            self.col_out_proj, None, self.msa_head, self.c, self.scale)
         msa_repr = msa_repr.transpose(-3, -2)
 
         msa_repr = msa_repr + MSATransition(self.msa_transition_norm(msa_repr),
@@ -261,18 +286,18 @@ class Evoformer(torch.nn.Module):
             self.tri_mul_in_norm2_bias, self.tri_mul_in_proj1,
             self.tri_mul_in_proj2, self.tri_mul_in_proj3,
             self.tri_mul_in_proj4, self.tri_mul_in_proj5,
-            self.tri_mul_in_proj6, self.cz, True)
+            self.tri_mul_in_proj6, self.cz, False)
 
         pair_repr = pair_repr + TriangleAttentionNode(
             self.tri_att_start_norm(pair_repr), self.tri_att_start_gate_proj,
             self.tri_att_start_qkv_proj, self.tri_att_start_out_proj,
-            self.tri_att_start_bias_proj, 4, self.c, self.scale)
+            self.tri_att_start_bias_proj, self.pair_head, self.c, self.scale)
 
         pair_repr = pair_repr.transpose(-3, -2)
         pair_repr = pair_repr + TriangleAttentionNode(
             self.tri_att_end_norm(pair_repr), self.tri_att_end_gate_proj,
             self.tri_att_end_qkv_proj, self.tri_att_end_out_proj,
-            self.tri_att_end_bias_proj, 4, self.c, self.scale)
+            self.tri_att_end_bias_proj, self.pair_head, self.c, self.scale)
         pair_repr = pair_repr.transpose(-3, -2)
 
         pair_repr = pair_repr + PairTransition(
@@ -283,8 +308,8 @@ class Evoformer(torch.nn.Module):
 
 
 def test():
-    bs, s, r, cm, cz, c, heads = 1, 128, 256, 256, 128, 32, 8
-    model = Evoformer(s, cm, cz, c, heads)
+    bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    model = Evoformer(s, cm, cz)
 
     msa = torch.randn(bs, s, r, cm)
     pair = torch.randn(bs, r, r, cz)
