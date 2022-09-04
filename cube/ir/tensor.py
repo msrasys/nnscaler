@@ -254,14 +254,6 @@ class IRFullTensor(IRTensor):
 
         super().__init__(shape, name, dtype)
 
-        # producer cell and produced sub tensor
-        self._producers: List[IRCell] = list()
-        self._ptensors : List[IRSubTensor] = list()
-
-        # consumer cell and consumed sub tensor
-        self._consumers: List[IRCell] = list()
-        self._ctensors : List[IRSubTensor] = list()
-
         # record all created sub_tensors
         self._segments : Dict[(ValueMap, IndexMap), int] = dict()
 
@@ -289,87 +281,6 @@ class IRFullTensor(IRTensor):
         return tensor
 
     @property
-    def producers(self) -> Tuple[IRCell]:
-        """
-        Producer IRCell list
-        """
-        return tuple(self._producers)
-
-    @property
-    def ptensors(self) -> Tuple[IRTensor]:
-        """
-        Produced IRSubTensor list correspongding to producer IRCell
-        """
-        return tuple(self._ptensors)
-
-    @property
-    def consumers(self) -> Tuple[IRCell]:
-        """
-        Consumer IRCell list
-        """
-        return tuple(self._consumers)
-
-    @property
-    def ctensors(self) -> Tuple[IRTensor]:
-        """
-        Consumed IRSubTensor list correspongding to consumer IRCell
-        """
-        return tuple(self._ctensors)
-
-    def add_producer(self, cell: IRCell, tensor: IRTensor, idx: int = 0):
-        if not isinstance(cell, IRCell) or not isinstance(tensor, IRTensor):
-            raise TypeError("Expect an IRCell and an IRTensor")
-        assert cell not in self._producers, f"{cell} already exists as producer"
-        self._producers.insert(idx, cell)
-        self._ptensors.insert(idx, tensor)
-
-    def add_consumer(self, cell: IRCell, tensor: IRTensor, idx: int = 0):
-        """!
-        Add the tensor and its operator into consumer list.
-        The tensor should be in cell.inputs()
-
-        @param cell IRCell: node to be consumer
-        @param tensor IRTensor: tensor to be consumed tensors
-        @param idx int: the index to be inserted
-        """
-        assert tensor in cell.inputs(), f"tensor {tensor} not in node: {cell} inputs"
-        if not isinstance(cell, IRCell) or not isinstance(tensor, IRTensor):
-            raise TypeError("Expect an IRCell and an IRTensor")
-        if cell in self._consumers:
-            for idx, consumer in enumerate(self._consumers):
-                if cell == consumer:
-                    assert self._ctensors[idx] != tensor, f"double add a same consumer-tensor pair: {cell}"
-        self._consumers.insert(idx, cell)
-        self._ctensors.insert(idx, tensor)
-        for t in self._ctensors:
-            t._dirty_grad = True
-
-    def rm_producer(self, cell: IRCell) -> int:
-        if cell not in self._producers:
-            raise KeyError(f"Cell {cell} not found in producer")
-        while cell in self._producers:
-            idx = self._producers.index(cell)
-            self._producers.pop(idx)
-            self._ptensors.pop(idx)
-        return idx
-
-    def rm_consumer(self, cell: IRCell) -> int:
-        if cell not in self._consumers:
-            raise KeyError(f"Cell {cell} not found in producer")
-        idx = self._consumers.index(cell)
-        self._consumers.pop(idx)
-        self._ctensors.pop(idx)
-        for t in self._ctensors:
-            t._dirty_grad = True
-        return idx
-
-    def clear_producer_consumer(self) -> int:
-        self._producers = []
-        self._ptensors = []
-        self._consumers = []
-        self._ctensors = []
-
-    @property
     def grad(self) -> Optional[Union[IRTensor, float]]:
         return self._grad
 
@@ -383,8 +294,6 @@ class IRFullTensor(IRTensor):
         self._requires_grad = False if val is None else True
         if isinstance(val, IRFullTensor):
             assert val.shape == self.shape, f"IRFullTensor gradient shape mismatch."
-        for tensor in self._ctensors + self._ptensors:
-            tensor._dirty_grad = True
 
     @property
     def requires_grad(self):
@@ -397,8 +306,6 @@ class IRFullTensor(IRTensor):
             self.grad = IRFullTensor(self.shape, 'g' + self.name, False, dtype=self.dtype).as_grad()
         elif not val and self.grad is not None:
             self.grad = None
-        for tensor in self._ctensors + self._ptensors:
-            tensor._dirty_grad = True
 
     @property
     def dtype(self) -> IRDType:
@@ -510,8 +417,6 @@ class IRSubTensor(IRTensor):
         self._indmap: IndexMap = indmap
         # val map
         self._valmap: ValueMap = valmap
-        # grad flag
-        self._dirty_grad = True
 
     def __eq__(self, other) -> bool:
         if isinstance(other, IRSubTensor):
@@ -669,8 +574,7 @@ class IRSubTensor(IRTensor):
         tensor._cell = None
         return tensor
 
-    @property
-    def grad(self) -> Optional[Union[IRTensor, float]]:
+    def grad(self, graph: IRCell) -> Optional[IRTensor]:
         """
         Get gradient of this tensor.
 
@@ -683,41 +587,7 @@ class IRSubTensor(IRTensor):
         The gradient will be lazy updated when its IRFullTensor gets
         new consumed / produced tensors
         """
-        if not self._dirty_grad:
-            return self._grad
-
-        assert isinstance(self.cell, IRCell), "No cell attached to this tensor."
-        full_grad = self.parent.grad
-        if full_grad is None or isinstance(full_grad, float):
-            self._grad = full_grad
-        # this tensor is consumed
-        elif self in self.cell.inputs():
-            # for backard, we assume in final distributed graph,
-            # each tensor can be represented as nested <replica, value, dim>
-            consumers = []
-            for ctensor, consumer in zip(self.parent.ctensors, self.parent.consumers):
-                if ctensor == self and consumer.cid not in consumers:
-                    consumers.append(consumer.cid)
-            valmap = (consumers.index(self.cell.cid), len(consumers))
-            grad = full_grad.select(
-                indmap = self.indmap,
-                valmap = valmap,
-            )
-            self._grad = grad
-            self._dirty_grad = False
-            return grad
-        # this tensor is produced
-        elif self in self.cell.outputs():
-            grad = full_grad.select(
-                indmap = self.indmap,
-                valmap = (0, 1),
-            )
-            self._grad = grad
-        else:
-            raise RuntimeError("Visit gradient of a tensor that is potentially generated by IRAdapter")
-        self._dirty_grad = False
-        self._requires_grad = False if full_grad is None else True
-        return self._grad
+        return graph.grad(self)
 
     @property
     def requires_grad(self) -> bool:

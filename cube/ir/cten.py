@@ -605,12 +605,14 @@ class IRTensor:
             cnt *= num
         return cnt
 
-    def backward(self):
+    def backward(self) -> IRCell:
         """
         Autograd backward on the tensor
+
+        @return graph IRGraph: the forward + backward graph
         """
-        from cube.logics.translator import LogicTranslator
-        return LogicTranslator.backward(self)
+        return self.cell.backward(self)
+        
 
     def __repr__(self):
         dscp = f'Tensor(id={self._id}, shape={self.shape}, device={self.device})'

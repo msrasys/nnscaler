@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 import copy
 
 from cube.ir.cten import IRCell, IRTensor
@@ -122,22 +122,6 @@ class IRFwOperation(IRCell):
         cpy.clear_successor()
         return cpy
 
-    def gen_backward(self) -> IRCell:
-        """!
-        Generate backward operator for this forward operator.
-
-        Note by calling this API, this forward operator must be
-        attached into any of one IRGraph, or will lead to reference
-        count 0 error on gradient calcaultion.
-
-        return: IRBpOperation
-        """
-        if self.mirror is not None:
-            raise RuntimeError(
-                "Backward Op already generated. Use self.mirror.update() instead.")
-        bnode = IRBpOperation(self)
-        return bnode
-
     def __repr__(self) -> str:
         sign = self.signature.split('.')[-1]
         ins = [t for t in self.inputs() if isinstance(t, IRTensor) and not t.is_attr()]
@@ -160,22 +144,16 @@ class IRBpOperation(IRCell):
     Backward operation
     """
 
-    def __init__(self, fwop: IRFwOperation):
+    def __init__(self, ograds: Tuple[Any], igrads: Tuple[Any]):
         """
         Create dummy backward node for forward inputs and forward outputs
         
         @param fwop IRFwOperation: forward operator
         """
-        assert isinstance(fwop, IRFwOperation), "Expected IRFwOperation"
-        finputs, foutputs = fwop.inputs(), fwop.outputs()
         super().__init__(
             'backward', 'torch.autograd.grad',
-            len(foutputs), len(finputs), init_outputs=False
+            len(ograds), len(igrads), init_outputs=False
         )
-        # pair forward op and backward op
-        IRCell.make_pair(self, fwop)
-        # set inputs and outputs
-        self.update()
 
     def update(self):
         """

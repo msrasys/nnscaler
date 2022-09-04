@@ -7,75 +7,18 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from contextlib import contextmanager
-from typing import Union, Tuple, List, Optional, Dict, Set
+from typing import Union, Tuple, List, Optional, Dict
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.ir.unique import IDGenerator
 from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
-from cube.ir.adapter import IRAdapter
 from cube.ir.tensor import IRFullTensor, IRSubTensor
+from cube.ir.dtype import IRDType, DTypeInferRule
 
 from cube.graph.function.function import Identity, MultiRef
 from cube.graph.segment import IRSegment
 
 from cube.algorithm.generics import GenericDistAlgo
-
-
-class GraphIndex:
-
-    def __init__(self, gidx: int, sidx: Optional[int]):
-        # inner-graph index
-        assert isinstance(gidx, int)
-        self.gidx = gidx
-        # inner-segment index
-        assert sidx is None or isinstance(sidx, int)
-        self.sidx: Optional[int] = sidx
-
-    def __hash__(self) -> int:
-        return hash((self.gidx, self.sidx))
-
-    def __eq__(self, other: object) -> bool:
-        assert isinstance(other, GraphIndex), "Cannot compare with non-GraphIndex object"
-        return self.gidx == other.gidx and self.sidx == other.gidx
-    
-    def __lt__(self, other: object) -> bool:
-        assert isinstance(other, GraphIndex), "Cannot compare with non-GraphIndex object"
-        if self.gidx < other.gidx:
-            return True
-        if self.gidx > other.gidx:
-            return False
-        if isinstance(self.sidx, int) and isinstance(other.sidx, int):
-            return self.sidx < other.sidx
-        if self.sidx is None and isinstance(other.sidx, int):
-            return True
-        return False
-    
-    def __le__(self, other: object) -> bool:
-        return self < other or self == other
-
-    def __gt__(self, other: object) -> bool:
-        return not self <= other
-
-    def __ge__(self, other: object) -> bool:
-        return not self < other
-
-    def __sub__(self, offset: int):
-        assert isinstance(offset, int)
-        if self.sidx is None:
-            return GraphIndex(self.gidx - offset, self.sidx)
-        else:
-            return GraphIndex(self.gidx, self.sidx - offset)
-
-    def __add__(self, offset: int):
-        assert isinstance(offset, int)
-        if self.sidx is None:
-            return GraphIndex(self.gidx + offset, self.sidx)
-        else:
-            return GraphIndex(self.gidx, self.sidx + offset)
-
-    def tuple(self) -> Tuple[int, Optional[int]]:
-        return (self.gidx, self.sidx)
 
 
 class IRGraph(IRSegment):
@@ -85,37 +28,13 @@ class IRGraph(IRSegment):
     IRGraph is used for reprensting a distributed training iteration.
     """
 
-    def __init__(self, 
-                 nodes: List[IRCell],
-                 inputs: Optional[List[IRTensor]], 
-                 outputs: Optional[List[IRTensor]], 
+    def __init__(self, nodes: List[IRCell], inputs: List[IRTensor], outputs: List[IRTensor], 
                  module_name: str):
 
-        if inputs is None:
-            inputs = IRGraph.get_inputs(nodes)
-        if outputs is None:
-            outputs = IRGraph.get_outputs(nodes)
-        super().__init__([], inputs, outputs, module_name)
-
-        # atrribute tensors
-        self._attributes: Set[IRSubTensor] = set()
+        super().__init__(nodes, inputs, outputs, module_name)
 
         self._sched = None  # the schedule strategy
 
-        # set parameters / buffers
-        for node in nodes:
-            tensors = node.inputs() + node.outputs()
-            tensors = [t for t in tensors if isinstance(t, IRSubTensor)]
-            for t in tensors:
-                t.parent.clear_producer_consumer()
-                if t.is_attr():
-                    self._attributes.add(t)
-
-        # insert node from nodes
-        for idx, node in enumerate(nodes):
-            self.insert(node, idx)
-
-        self.reset_dependency()
 
     @property
     def train(self) -> bool:
@@ -126,36 +45,15 @@ class IRGraph(IRSegment):
         """
         return self._have_forward and self._have_backward
 
-    def reset_dependency(self):
-        """
-        Reset the node dataflow dependency
+    # ================ Deep Learning Interfalce ======================
 
-        Note all the predefined control dependencies will be removed.
+    def __call__(self, *args):
         """
-        for node in self._nodes:
-            node.clear_predecessor()
-            node.clear_successor()
-        # TODO: adapter dependency not set
-        for ftensor in self._full_tensors:
-            for ptensor, producer in zip(ftensor.ptensors, ftensor.producers):
-                for ctensor, consumer in zip(ftensor.ctensors, ftensor.consumers):
-                    if ptensor.overlap(ctensor):
-                        pidx = producer.outputs().index(ptensor)
-                        cidx = consumer.inputs().index(ctensor)
-                        producer.add_successor(pidx, consumer)
-                        consumer.add_predecessor(cidx, producer)
-                # set mirror as control dependency
-                if producer.mirror and isinstance(producer, IRFwOperation):
-                    producer.add_successor(-1, producer.mirror)
-                    producer.mirror.add_predecessor(-1, producer)
-
-    def attributes(self) -> Tuple[IRSubTensor]:
+        Register forward action
         """
-        Return parameter list
-        """
-        return tuple(self._attributes)
-
-    def forward(self, *args) -> Union[IRTensor, Tuple[IRTensor]]:
+        return self.forward(*args)
+    
+    def forward(self, *args: Tuple[IRSubTensor]) -> Union[IRTensor, Tuple[IRTensor]]:
         """
         forward will divide the graph into Actions according to
         node device assignment
@@ -163,247 +61,82 @@ class IRGraph(IRSegment):
         Currently each forward call will result in a new flow
         even if the input is same
 
-        Returns:
-            IRTensors
-        """
-        from cube.logics.translator import LogicTranslator
-        return LogicTranslator.forward(self, *args)
+        @param args Tuple[Any]
 
-    def __call__(self, *args):
+        @return outputs Union[IRSubTensor, Tuple[IRSubTensor]]
         """
-        Register forward action
-        """
-        return self.forward(*args)
-
-    # ====================== Graph Accessment =========================
-    
-    def flatten(self) -> List[IRCell]:
-        """
-        Get all the single nodes by opening the segment.
-
-        @return List[]
-        """
-        nodes = []
+        # align graph with input tensors
+        itensors: Tuple[IRSubTensor, ...] = self.inputs()
+        assert len(args) == len(itensors)
+        for idx, (itensor, arg) in enumerate(zip(itensors, args)):
+            self.set_input(idx, arg)
+            for producer in self.producers(itensor.parent):
+                with self.update(producer):
+                    while itensor in producer.outputs():
+                        oidx = producer.outputs().index(itensor)
+                        producer.set_output(oidx, arg)
+            for consumer in self.consumers(itensor.parent):
+                with self.update(consumer):
+                    while itensor in consumer.inputs():
+                        iidx = consumer.inputs().index(itensor)
+                        consumer.set_input(iidx, arg)
+            while itensor in self.outputs():
+                oidx = self.outputs().index(itensor)
+                self.set_output(oidx, arg)
+            while itensor in self.inputs():
+                iidx = self.inputs().index(itensor)
+                self.set_input(iidx, arg)
+        
+        # dtype inference
         for node in self._nodes:
-            if isinstance(node, IRSegment):
-                nodes += node._nodes
-            else:
-                nodes.append(node)
-        return nodes
+            itensors = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
+            # setup gradient
+            for itensor in itensors:
+                if itensor.parent.grad is not None:
+                    itensor.parent.dtype = itensor.dtype
+            if len(itensors) == 0: continue
+            odtype = DTypeInferRule.infer(node, [t.dtype for t in itensors])
+            assert odtype != IRDType.unknown, f"{node} : {[t.dtype for t in itensors]}"
+            otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
+            for tensor in otensors:
+                tensor.dtype = odtype
+                # setup graidient
+                if tensor.parent.grad is not None:
+                    tensor.parent.grad.dtype = odtype
 
-    def index(self, node: IRCell) -> GraphIndex:
-        """
-        Get node index in the graph.
+        from cube.program import Program
+        Program().add_nodes(self.nodes())
 
-        @param node IRCell: the queried node
-        
-        @return index Tuple[int, Optional[int]]: (GraphIndex, SegmentIndex)
-            
-        """
-        if node in self._nodes:
-            return GraphIndex(self._nodes.index(node), None)
-        for idx, check_node in enumerate(self._nodes):
-            if isinstance(check_node, IRSegment):
-                if check_node.exist(node):
-                    return GraphIndex(idx, check_node.index(node))
-        raise KeyError(f"The queried node: {node} not in the graph.")
+        # return
+        if len(self.outputs()) == 1:
+            return self.output(0)
+        else:
+            return self.outputs()
 
-    def flatten_index(self, node: IRCell) -> int:
+    def backward(self, loss: IRSubTensor):
         """
-        Get node index of all the flatten nodes
-        
-        @param node IRCell: the queried node, cannot be IRSegment
+        Backward the graph from the entry tensor of loss.
 
-        @return index int: the index.
-        """
-        idx = 0
-        for check_node in self._nodes:
-            if isinstance(check_node, IRSegment):
-                if node in check_node._nodes:
-                    return idx + check_node.index(node)
-                else:
-                    idx += len(check_node.nnodes)
-            if check_node == node:
-                return idx
-        raise KeyError(f"Node {node} not exist in graph")
+        @param loss IRSubTensor: the loss tensor, must be in the output
+            of current graph. The loss shape should be (1,)
 
-    def node(self, index: Union[int, GraphIndex]) -> IRCell:
+        @return self IRGraph: None
         """
-        Get node given the index
+        assert loss in self.outputs() and tuple(loss.shape) == (1,), \
+            f"backward should be in graph outputs and the loss is of shape [1,] (got {loss.shape})"
+        from cube.program import Program
+        loss.parent.grad = 1.0
+        for fnode in self.nodes()[::-1]:
+            assert not isinstance(fnode, IRSegment), "Internal Error: Segment should not appear for now"
+            if isinstance(fnode, IRFwOperation):
+                bnode: IRBpOperation = self.bwop(fnode)
+                Program().add_node(bnode)
+        # set program graph mirror to self
+        Program().mirror_as_self()
+        return self
 
-        @param index Tuple[Optional[int], int]: the queired index of
-            (SegmentIndex, Index)
-        
-        @return node IRCell: the quried node.
-        """
-        index = GraphIndex(index, None) if isinstance(index, int) else index
-        assert isinstance(index, GraphIndex)
-        node = self._nodes[index.gidx]
-        if index.sidx is not None:
-            assert isinstance(node, IRSegment), "Expected IRSegment"
-            node = node.index(index.sidx)
-        return node
 
     # ========================= Graph Manipulation ========================
-
-    def remove(self, node: IRCell) -> GraphIndex:
-        """
-        Detach (remove) a node from current graph.
-        TODO: dataflow dependency update.
-
-        * Producer/consumer relationship:
-
-          All the used input and output tensors inside the node
-          are removed from consumed and produced tensor list.
-
-        @param node IRCell: the removed node.
-
-        @return index Tuple[int, Optional[int]]: index of the detached node in the graph
-        """
-        index = self.index(node)
-
-        # remove node
-        if index.sidx is None:
-            self._nodes.pop(index.gidx)
-        else:
-            segment = self._nodes[index.gidx]
-            assert isinstance(segment, IRSegment), "Internal Error: Removing at a wrong index"
-            segment.remove(node)
-
-        # update consumer and producer for non-adapter nodes
-        rm_nodes = node.nodes() if isinstance(node, IRSegment) else [node]
-        for node in rm_nodes:
-            # adapter doesn't need to consider producer and consumer
-            if isinstance(node, IRAdapter):
-                continue
-            # update consumer
-            itensors: List[IRSubTensor] = []
-            for itensor in node.inputs():
-                if isinstance(itensor, IRSubTensor) and itensor not in itensors:
-                    itensors.append(itensor)
-            for itensor in itensors:
-                itensor.parent.rm_consumer(node)
-            # update producer
-            otensors: List[IRSubTensor] = []
-            for otensor in node.outputs():
-                if isinstance(otensor, IRSubTensor) and otensor not in otensors:
-                    otensors.append(otensor)
-            for otensor in otensors:
-                otensor.parent.rm_producer(node)
-                ftensor = otensor.parent
-                if len(ftensor.producers) == 0 and len(ftensor.consumers) == 0:
-                    del self._full_tensors[otensor.parent]
-        return index
-
-    def insert(self, node: IRCell, index: Union[int, GraphIndex]):
-        """
-        Insert a node into current graph at node index.
-        TODO: dataflow dependency update.
-
-        * Producer/consumer relationship:
-
-          For the node except IRAdapter, all its input and output tensors 
-          will be recorded in consumed and produced tensor list. 
-        
-          IRAdapter node will not record the consumer and producer.
-
-        @param node IRCell: the inserted node
-        @param index Union[int, Tuple[int, Optional[int]]]: the inserted index
-        """
-        index = GraphIndex(index, None) if isinstance(index, int) else index
-        assert isinstance(index, GraphIndex)
-
-        # update producer and consumer
-        in_nodes = node.nodes() if isinstance(node, IRSegment) else [node]
-        for node in in_nodes:
-            if isinstance(node, IRAdapter): continue
-            # update consumer
-            itensors: List[IRSubTensor] = []
-            for itensor in node.inputs():
-                if isinstance(itensor, IRSubTensor) and itensor not in itensors:
-                    itensors.append(itensor)
-            for itensor in itensors:
-                self._full_tensors.add(itensor.parent)
-                idx = 0
-                for consumer in itensor.parent.consumers:
-                    if self.index(consumer) < index:
-                        idx += 1
-                    else:
-                        break
-                itensor.parent.add_consumer(node, itensor, idx)
-            # update producer
-            otensors: List[IRSubTensor] = []
-            for otensor in node.outputs():
-                if isinstance(otensor, IRSubTensor) and otensor not in otensors:
-                    otensors.append(otensor)
-            for otensor in otensors:
-                self._full_tensors.add(otensor.parent)
-                idx = 0
-                for producer in otensor.parent.producers:
-                    if self.index(producer) < index:
-                        idx += 1
-                    else:
-                        break
-                otensor.parent.add_producer(node, otensor, idx)
-        
-        # insert node
-        if index.sidx is None:
-            self._nodes.insert(index.gidx, node)
-        else:
-            segment = self._nodes[index.gidx]
-            assert isinstance(segment, IRSegment), "Expected to be a segment"
-            segment.insert(node, index.sidx)
-
-        return
-
-    def exist(self, node: IRCell) -> bool:
-        """
-        Check if the node is in the graph
-
-        @param node IRCell: the queried node
-        @return existence bool: True if exist otherwise False
-        """
-        if node in self._nodes:
-            return True
-        for segment in self._nodes:
-            if not isinstance(segment, IRSegment):
-                continue
-            if segment.exist(node):
-                return True
-        return False
-
-    @contextmanager
-    def update(self, node):
-        """
-        Update a node.
-        TODO: update operator dependency
-
-        e.g.,
-            with graph.modify(node) as node:
-                node.set_input(0, tensor)
-        
-        @param node IRCell: the node that must in the graph
-        @return node IRCell: the modify node
-        """
-        index = self.remove(node)
-        yield node
-        self.insert(node, index)
-
-    def replace(self, node: IRCell, new_nodes: List[IRCell]) -> int:
-        """
-        Replace one node by multiple nodes
-
-        TODO: update dataflow dependency
-
-        @param node IRCell: the replaced node
-        @param new_nodes List[IRCell]: the nodes to be inserted.
-
-        @return index int: the replaced node index
-        """
-        index = self.remove(node)
-        for new_node in new_nodes[::-1]:
-            self.insert(new_node, index)
-        return index
 
     def group(self, fnodes: List[IRCell]) -> IRSegment:
         """!
@@ -416,83 +149,48 @@ class IRGraph(IRSegment):
         
         @return segment IRSegment: the grouped segment
         """
-        assert any(not isinstance(node, (IRBpOperation, IRSegment, IRDataOperation)) for node in fnodes), \
+        assert any(not isinstance(node, (IRBpOperation, IRDataOperation)) for node in fnodes), \
             "grouped nodes cannot be backward operation, segment or data operation"
         
-        findices = [self.index(fnode) for fnode in fnodes]
+        fgraphs = [self.segment(fnode) for fnode in fnodes]
+        assert len(set(fgraphs)) == 1, "Cross-segment grouping is not allowed yet."
         
         # get backward nodes
         bnodes = [fnode.mirror for fnode in fnodes[::-1] if fnode.mirror is not None]
-        bindices = [self.index(bnode) for bnode in bnodes]
+        
+        fgraph: IRSegment = fgraphs[0]
+        bgraph: IRSegment = fgraph.mirror
 
-        assert all(idx.sidx is None for idx in findices), \
-            "Grouping operators that are already in segment is not allowed"
-        assert all(idx.sidx is None for idx in bindices), \
-            "Internal Error: backward operators found in segments"
-        findices = tuple(idx.gidx for idx in findices)
-        bindices = tuple(idx.gidx for idx in bindices)
+        findices: Tuple[int] = tuple(fgraph.index(fnode)[0] for fnode in fnodes)
+        bindices: Tuple[int] = tuple(bgraph.index(bnode)[0] for bnode in bnodes)
 
         minfidx, maxfidx = min(findices), max(findices)
         assert maxfidx - minfidx + 1 == len(fnodes), \
             "Forward nodes are not consecutive"
-            
+
         if len(bnodes) > 0:
             minbidx, maxbidx = min(bindices), max(bindices)
             assert maxbidx - minbidx + 1 == len(bnodes), \
                 f"Internal Error: backward nodes are not consecutive. maxbidx: {maxbidx}, minbidx: {minbidx}"
 
-        fsegment = self.segment(fnodes)
-        bsegment = self.segment(bnodes) if len(bnodes) > 0 else None
+        fsegment = fgraph.create_segment(fnodes)
+        bsegment = bgraph.create_segment(bnodes) if len(bnodes) > 0 else None
         IRCell.make_pair(fsegment, bsegment)
+
+        # replace forward
+        for fnode in fnodes:
+            fidx = fgraph.remove(fnode)
+        fgraph.insert(fsegment, fidx)
 
         # replace backward
         if len(bnodes) > 0:
-            self._nodes = self._nodes[:minbidx] + [bsegment] + self._nodes[maxbidx+1:]
-        # replace forward
-        self._nodes = self._nodes[:minfidx] + [fsegment] + self._nodes[maxfidx+1:]
+            for bnode in bnodes:
+                bidx = bgraph.remove(bnode)
+            bgraph.insert(bsegment, bidx)
 
         return fsegment
 
     # ========================== Graph Creation ========================
-
-    def segment(self, nodes: List[IRCell]) -> IRSegment:
-        """!
-        Create a segment with part of the nodes.
-
-        @param nodes List[IRCell]: the subset nodes of this graph
-
-        @return segment IRSegment: the grouped segment. 
-        """
-        inputs, outputs = [], []
-        itdevs, otdevs = dict(), dict()
-        for node in nodes:
-            assert not isinstance(node, IRSegment), 'A segment cannot be in other segments'
-            # update inputs
-            itensors = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
-            for itensor in itensors:
-                producers = [p for p in itensor.parent.producers if set(p.device).issubset(set(node.device))]
-                # no producer means a weight or cross device-group
-                if len(producers) == 0 or any(p not in nodes for p in producers):
-                    if itensor not in itdevs:
-                        itdevs[itensor] = []
-                    devs = set(itensor.device)
-                    if devs not in itdevs[itensor]:
-                        inputs.append(itensor)
-                        itdevs[itensor].append(devs)
-            # update outputs
-            otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
-            for otensor in otensors:
-                consumers = [c for c in otensor.parent.consumers if set(c.device).issubset(set(node.device))]
-                # no consumer usually means the loss or cross device-group
-                if otensor in self.outputs() or len(consumers) == 0 or any(c not in nodes for c in consumers):
-                    devs = set(otensor.device)
-                    if otensor not in otdevs:
-                        otdevs[otensor] = []
-                    if devs not in otdevs[otensor]:
-                        outputs.append(otensor)
-                        otdevs[otensor].append(devs)
-        segment = IRSegment(nodes, inputs, outputs)
-        return segment
 
     @staticmethod
     def from_logic_graph(nodes: List[IRCell],
@@ -609,29 +307,25 @@ class IRGraph(IRSegment):
         if not isinstance(times, int) or times < 1:
             raise TypeError("Expected times to be int and >= 1")
 
-        if node not in self.nodes():
-            raise RuntimeError(f"Op {node} not exsits")
-
+        fsegment: IRSegment = self.segment(node)
+        # replicate
         fnodes = [node.replicate() for _ in range(times)]
-
         # insert forward
-        self.replace(node, fnodes)
         for fnode in fnodes:
             if isinstance(node, IRFwOperation):
                 fnode.recompute = node.recompute
             if isinstance(node.comment, str):
                 fnode.comment = node.comment
             fnode.device = node.device
-        
+        fsegment.replace(node, fnodes)
         # insert backward
+        bsegment: IRSegment = fsegment.mirror
         if isinstance(node.mirror, IRBpOperation):
             bnode: IRBpOperation = node.mirror
-            for fnode in fnodes:
-                fnode.gen_backward()
-            bnodes = [fnode.mirror for fnode in fnodes[::-1]]
-            self.replace(bnode, bnodes)
+            bnodes = tuple(self.bwop(fnode) for fnode in fnodes[::-1])
             for bnode in bnodes:
                 bnode.device = node.device
+            bsegment.replace(bnode, bnodes)
         return fnodes
 
     def partition(self, node: Union[IRFwOperation, IRDataOperation],
@@ -664,34 +358,33 @@ class IRGraph(IRSegment):
             "The partition algorithm is not initialized for this node"
         assert isinstance(node, (IRFwOperation, IRDataOperation)), \
             f"Only allow op to be forward op or data op, but got: {node}"
-
+        
+        fsegment: IRSegment = self.segment(node)
         # get partitioned sub-nodes
         fnodes = algo.instantiate(**config)
-        if fnodes is None:
-            return None
-
+        assert fnodes is not None, f"Fail to partition node: {node} use algothim and config: {config}"
         # update forward
-        self.replace(node, fnodes)
         for fnode in fnodes:
             if isinstance(node, IRFwOperation):
                 fnode.recompute = node.recompute
             if isinstance(node.comment, str):
                 fnode.comment = node.comment
             fnode.device = node.device
+        fsegment.replace(node, fnodes)
         # update backward
+        bsegment: IRSegment = fsegment.mirror
         if isinstance(node.mirror, IRBpOperation):
-            bnodes = [fnode.gen_backward() for fnode in fnodes[::-1]]
-            self.replace(node.mirror, bnodes)
+            bnodes = tuple(self.bwop(fnode) for fnode in fnodes[::-1])
+            bsegment.replace(node.mirror, bnodes)
             for bnode in bnodes:
                 bnode.device = node.device
         # update gradient
         updated = set()
         for itensor in [t for t in node.inputs() if isinstance(t, IRSubTensor)]:
-            for fnode in itensor.parent.consumers:
+            for fnode in fsegment.consumers(itensor.parent):
                 bnode: IRBpOperation = fnode.mirror
                 if isinstance(bnode, IRBpOperation) and fnode.cid not in updated:
-                    with self.update(bnode):
-                        bnode.update()
+                    self.update_bwop(bnode)
                 updated.add(fnode.cid)
         return fnodes
 
@@ -969,16 +662,16 @@ class IRGraph(IRSegment):
         # the gradient flow of neighbor stages is automatically guaranteed
         for ftensor in self.full_tensors():
             if ftensor.is_grad() or ftensor.is_attr(): continue
-            assert len(ftensor.producers) <= 1, \
+            assert len(self.producers(ftensor)) <= 1, \
                 "The staging interface should be called before any operator partition."
-            if len(ftensor.consumers) == 0: continue
-            producer, ptensor = ftensor.producers[0], ftensor.ptensors[0]
+            if len(self.consumers(ftensor)) == 0: continue
+            producer, ptensor = self.producers(ftensor), self.consumers(ftensor)
             psid = get_sid(producer)
             # outside of stages, not consider
             if psid is None: continue 
             out = ptensor
             curr_sid = psid
-            for ctensor, consumer in zip(ftensor.ctensors, ftensor.consumers):
+            for ctensor, consumer in zip(self.ctensors(ftensor), self.consumers(ftensor)):
                 assert ctensor == ptensor, "The staging interface should be called before any operator partition." 
                 csid = get_sid(consumer)
                 if curr_sid == csid: continue
