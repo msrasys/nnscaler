@@ -6,6 +6,13 @@ from typing import Tuple, Any, Callable, List, Dict
 import torch
 
 
+def debug_id(tensors, msg: str, rank: int):
+    if torch.distributed.get_rank() == rank:
+        if torch.is_tensor(tensors):
+            print(f'[{torch.distributed.get_rank()}] {msg}: [{id(tensors)}]')
+        else:
+            print(f'[{torch.distributed.get_rank()}] {msg}: {[id(t) for t in tensors]}')
+
 
 class Executor:
 
@@ -21,6 +28,7 @@ class Executor:
                 outputs = subgraph(*input_tensors)
         else:
             # everytime forward a segment, detach the tensor from previous graph
+            # debug_id(input_tensors, 'outside fexecute args', 0)
             for itensor in input_tensors:
                 if torch.is_tensor(itensor) and itensor.requires_grad:
                     assert itensor not in Executor._detach
@@ -28,7 +36,9 @@ class Executor:
             input_tensors = tuple(
                 Executor._detach[t] if t in Executor._detach else t for t in input_tensors
             )
+            # debug_id(input_tensors, 'inside fexecute args', 0)
             outputs = subgraph(*input_tensors)
+            # debug_id(outputs, 'fexecute result', 0)
         # print('forwarding... ')
         return outputs
 
@@ -42,7 +52,7 @@ class Executor:
                 outputs = subgraph(*input_tensors)
         else:
             outputs = subgraph(*input_tensors)
-        # print('forwarding... ')
+            outputs = outputs.requires_grad_() if torch.is_tensor(outputs) else (t.requires_grad_() for t in outputs)
         return outputs
 
     @staticmethod
@@ -71,7 +81,10 @@ class Executor:
             return None
         inputs = list()
         # everytime backward a input tensor, remove it from _detach
+        # debug_id(input_tensors, 'outside grad of input', 0)
         input_tensors = [Executor._detach.pop(t) if t in Executor._detach else t for t in input_tensors]
+        # debug_id(input_tensors, 'inside grad of input', 0)
+        # debug_id(output_tensors, 'grad of output', 0)
         for input_ in input_tensors:
             if torch.is_tensor(input_) and not isinstance(input_, torch.nn.Parameter):
                 if input_.requires_grad:
@@ -82,12 +95,18 @@ class Executor:
             grad_tensors=output_tensor_grads,
         )
         grads = tuple(input_.grad for input_ in inputs)
+        assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
         if    len(grads) == 0: return None
         elif  len(grads) == 1: return grads[0]
         else: return tuple(grads)
 
+    @staticmethod
+    def clear():
+        Executor._detach = dict()
+
 
 fexecute = Executor.fexecute
+aexecute = Executor.aexecute
 backward = Executor.backward
 
 

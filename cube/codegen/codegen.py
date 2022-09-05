@@ -42,7 +42,7 @@ def get_backward_callsite_io_tensors(bp_segment:IRSegment):
         t.requires_grad and \
         not t.is_attr()
     ]
-    output_tensors = [t for t in bp_segment.mirror.outputs() if isinstance(t, IRSubTensor)]
+    output_tensors = [t for t in bp_segment.mirror.outputs() if isinstance(t, IRSubTensor) and t.grad is not None]
     input_grads = [t.grad for t in input_tensors]
 
     # WARNING !!!
@@ -981,6 +981,7 @@ class ScheduleCodeGen(CodeGen):
         Emit node / subgraph code
         """
         fsign = '{outputs} = cube.runtime.executor.fexecute({model}, *{inputs}, requires_grad={req_grad})'
+        asign = '{outputs} = cube.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
         bsign = '{input_grads} = cube.runtime.executor.backward({input_tensors}, {output_tensors}, {output_grads})'
         
         inputs = self.tuple_naming(node.inputs(), skip_attr=True, prefix_attr='model.')
@@ -1020,7 +1021,7 @@ class ScheduleCodeGen(CodeGen):
             code = f'{outputs} = next(dataloader)'
 
         elif isinstance(node, IRAdapter):
-            code = fsign.format(
+            code = asign.format(
                 outputs = outputs,
                 model = f'model.{name}',
                 inputs = inputs,
@@ -1028,7 +1029,7 @@ class ScheduleCodeGen(CodeGen):
             )
 
         elif isinstance(node, IRWeightReducer):
-            code = fsign.format(
+            code = asign.format(
                 outputs = outputs,
                 model=f'model.{name}',
                 inputs='()',
