@@ -90,7 +90,7 @@ def cross_attention(query: torch.Tensor, key: torch.Tensor,
 
 from typing import Optional, Tuple
 
-@cube.graph.parser.register('1 N E^, L^ N E^, L^ N E^, (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), E^ (h+ d) -> L^ N E^', name='cross_attention')
+@cube.graph.parser.register('l N E^, L^ N E^, L^ N E^, (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), E^ (h+ d) -> l N E^', name='one_attention')
 def one_attention(hidden_states: torch.Tensor,
                   past_embed_key: torch.Tensor,
                   past_embed_value: torch.Tensor,
@@ -98,7 +98,7 @@ def one_attention(hidden_states: torch.Tensor,
                   k_proj: torch.Tensor, k_bias: torch.Tensor,
                   v_proj: torch.Tensor, v_bias: torch.Tensor,
                   out_proj: torch.Tensor, #out_bias: torch.Tensor,
-                  h: int, scale: float, dropout_p: float, mask=True):
+                  h: int, scale: float, dropout_p: float, mask: bool = True):
     num_head = h
     L, N = hidden_states.size(0), hidden_states.size(1)
     dim_head = q_proj.size(0) // num_head
