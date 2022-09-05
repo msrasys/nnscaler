@@ -7,6 +7,8 @@ OMP_NUM_THREADS=4 torchrun \
     examples/nlp/gpt/infer.py --policy PASMeshShard --fp16
 
 PYTHONPATH=.:..:$PYTHONPATH python -m torch.distributed.launch --nproc_per_node=1  examples/nlp/gpt/infer.py --policy PASSingle --fp16
+
+PYTHONPATH=.:..:$PYTHONPATH python -m torch.distributed.launch --nproc_per_node=2  examples/nlp/gpt/infer.py --policy PASMegatronInferTP --fp16
 """
 
 
@@ -53,7 +55,7 @@ def inter():
 
     model = GPTInfer()
     model = model if not args.fp16 else model.half()
-    model = model.cuda()
+    # model = model.cuda() #only for PyTorch run
     model.eval()
     dataloader = GPTInferDataLoader(batch_size)
 
@@ -66,10 +68,37 @@ def inter():
         return loss
     model = model.get_gen_module()
 
-    iter_num = 2
+    torch.distributed.barrier()
+    print_each_rank('model weight consumpition:', rank_only=0)
+    memory_summary()
+
+    CudaTimer(enable=False).warmup()
+    iter_num = 4
+    warmup = 2
     for step in range(iter_num):
-        output = train_iter(model, dataloader)
-        print(f'output = {output}')
+        # if step == 0:
+        #     model_summary(model, next(dataloader))
+
+        if step >= warmup:
+            CudaTimer(enable=True).start('e2e')
+        train_iter(model, dataloader)
+        if step >= warmup:
+            CudaTimer().stop('e2e')
+
+        if step == 0:
+            print_each_rank('passed first iteration')
+        if (step + 1) % 10 == 0:
+            print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
+
+    print_each_rank('e2e time (ms) per iteration: {} ms'.format(
+        CudaTimer().duration(iter_num - warmup, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num - warmup)
+    memory_summary()
+
+    # iter_num = 2
+    # for step in range(iter_num):
+    #     output = train_iter(model, dataloader)
+    #     print(f'output = {output}')
 
     ################## PyTorch run
     # output = None
