@@ -17,7 +17,7 @@ class ExecutionPlan:
         self._inference_only = not any(
              isinstance(n, IRBpOperation) or \
             (isinstance(n, IRAdapter) and not n.forward) or \
-            (isinstance(n, IRSegment) and not n.forward) for n in graph.nodes()
+            (isinstance(n, IRSegment) and not n.isfw()) for n in graph.nodes()
         )
 
         # execution sequence for each device  

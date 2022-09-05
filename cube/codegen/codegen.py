@@ -35,7 +35,7 @@ def get_backward_callsite_io_tensors(bp_segment:IRSegment):
     #inputs to 'backward'                         outputs of 'backward'
     ```
     """
-    assert isinstance(bp_segment, IRSegment) and not bp_segment.forward
+    assert isinstance(bp_segment, IRSegment) and not bp_segment.isfw()
 
     input_tensors = [t for t in bp_segment.mirror.inputs() if \
         isinstance(t, IRSubTensor) and \
@@ -99,7 +99,7 @@ def calc_tenvars_lifetime(
         inputs : Iterable[IRTensor]
 
         if isinstance(node, IRSegment):
-            if node.forward:
+            if node.isfw():
                 outputs = node.outputs()
                 inputs = node.inputs()
             else:
@@ -446,7 +446,7 @@ class ModelCodeGen(CodeGen):
         # parse graph body
         for node in self.execplan.seq(device):
             if isinstance(node, IRSegment):
-                if not node.forward: continue  # skip backward segment
+                if not node.isfw(): continue  # skip backward segment
                 codes = self.emit_segment_code(node)
             elif isinstance(node, IRFwOperation):
                 raise RuntimeError(f"Unexcepted global-level op call: {node}")
@@ -989,7 +989,7 @@ class ScheduleCodeGen(CodeGen):
 
         if isinstance(node, IRSegment):
             # emit forward
-            if node.forward:
+            if node.isfw():
                 code = fsign.format(
                     outputs = outputs,
                     model = f'model.{name}',

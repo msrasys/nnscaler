@@ -29,7 +29,7 @@ class DiffFusion(PlanPass):
                     if node.forward:
                         ret = DiffFusion.nnfuse(node)
                         cnt = cnt+1 if ret else cnt
-                if isinstance(node, IRSegment) and node.forward:
+                if isinstance(node, IRSegment) and node.isfw():
                     for fnode in node.nodes():
                         if isinstance(fnode, IRAdapter):
                             if node.forward:

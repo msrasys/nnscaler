@@ -20,11 +20,11 @@ class Grouping(PlanPass):
         fgroups, bgroups = Grouping.group(execplan)
         for devid in execplan.devices():
             for fpieces, bpieces in zip(fgroups[devid], bgroups[devid]):
-                fsubgraph = graph.segment(fpieces)
+                fsubgraph = graph.create_segment(fpieces)
                 if bpieces is not None:
-                    bsubgraph = graph.segment(bpieces)
+                    bsubgraph = graph.create_segment(bpieces)
                     IRCell.make_pair(fsubgraph, bsubgraph)
-                subgraphs = [fsubgraph] if bpieces is None else [fsubgraph, bsubgraph]
+                subgraphs = [fsubgraph] if bpieces is None else [fsubgraph, fsubgraph.mirror]
                 for subgraph in subgraphs:
                     # update execution plan: replace the nodes with the subgraph
                     pieces = subgraph.nodes()
