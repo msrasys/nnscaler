@@ -129,7 +129,7 @@ class IRGraph(IRSegment):
         for fnode in self.nodes()[::-1]:
             assert not isinstance(fnode, IRSegment), "Internal Error: Segment should not appear for now"
             if isinstance(fnode, IRFwOperation):
-                bnode: IRBpOperation = self.bwop(fnode)
+                bnode: IRBpOperation = self.create_bwop(fnode)
                 Program().add_node(bnode)
         # set program graph mirror to self
         Program().mirror_as_self()
@@ -187,6 +187,8 @@ class IRGraph(IRSegment):
             for bnode in bnodes:
                 bidx = bgraph.remove(bnode)
             bgraph.insert(bsegment, bidx)
+            # setup gradient
+            self.update_bwop(bsegment)
 
         return fsegment
 
@@ -322,7 +324,7 @@ class IRGraph(IRSegment):
         bsegment: IRSegment = fsegment.mirror
         if isinstance(node.mirror, IRBpOperation):
             bnode: IRBpOperation = node.mirror
-            bnodes = tuple(self.bwop(fnode) for fnode in fnodes[::-1])
+            bnodes = tuple(self.create_bwop(fnode) for fnode in fnodes[::-1])
             for bnode in bnodes:
                 bnode.device = node.device
             bsegment.replace(bnode, bnodes)
@@ -374,7 +376,7 @@ class IRGraph(IRSegment):
         # update backward
         bsegment: IRSegment = fsegment.mirror
         if isinstance(node.mirror, IRBpOperation):
-            bnodes = tuple(self.bwop(fnode) for fnode in fnodes[::-1])
+            bnodes = tuple(self.create_bwop(fnode) for fnode in fnodes[::-1])
             bsegment.replace(node.mirror, bnodes)
             for bnode in bnodes:
                 bnode.device = node.device
@@ -648,14 +650,13 @@ class IRGraph(IRSegment):
             identity.infer_shape()
             identity.set_output(0, identity.output(0).tosub())
             # insert forward
-            self.insert(identity, self.index(fstages[sid][0]))
+            fidx = self.index(fstages[sid][0])
+            if tensor.requires_grad:
+                self.finsert(identity, fidx)
+                bstages[sid].append(identity.mirror)
+            else:
+                self.insert(identity, fidx)
             fstages[sid].insert(0, identity)
-            
-            # insert backward
-            if self.train:
-                bnode = identity.gen_backward()
-                self.insert(bnode, self.index(bstages[sid][-1]) + 1)
-                bstages[sid].append(bnode)
             return identity
 
         # create identity op for cross-stage dataflow
@@ -665,7 +666,7 @@ class IRGraph(IRSegment):
             assert len(self.producers(ftensor)) <= 1, \
                 "The staging interface should be called before any operator partition."
             if len(self.consumers(ftensor)) == 0: continue
-            producer, ptensor = self.producers(ftensor), self.consumers(ftensor)
+            producer, ptensor = self.producers(ftensor)[0], self.ptensors(ftensor)[0]
             psid = get_sid(producer)
             # outside of stages, not consider
             if psid is None: continue 
@@ -678,15 +679,13 @@ class IRGraph(IRSegment):
                 for sid in range(curr_sid + 1, csid):
                     identity = insert_identity(out, sid)
                     out = identity.output(0)
-                # update consumer and its backward
+                # update consumer
                 with self.update(consumer) as consumer:
                     tidx = consumer.inputs().index(ptensor)
                     consumer.set_input(tidx, out)
-                if self.train:
-                    with self.update(consumer.mirror) as bnode:
-                        bnode.update()
                 curr_sid = csid
-        
+            # update all its backward operators
+            self.update_ftensor_bw(ftensor.grad)
         # grouping into segment
         for sid in range(len(fstages)):
             self.group(fstages[sid])
@@ -726,20 +725,3 @@ class IRGraph(IRSegment):
                 fnode.recompute = recompute_group_id
     
         return True
-
-    def __repr__(self) -> str:
-        dscp = f"Graph{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})"
-        return dscp
-
-    def extra_repr(self) -> str:
-        dscp = f"\n{self.name}:\n{'=' * len(self.name)}\n"
-        # inputs
-        dscp += f"Inputs: {self.inputs()}\n"
-        for node in self._nodes:
-            dscp += f"\n{node}"
-            if isinstance(node, IRSegment):
-                for subnode in node.nodes():
-                    dscp += f"\n\t{subnode}"
-        # outputs
-        dscp += f"\nOutputs: {self.outputs()}\n{'=' * len(self.name)}\n"
-        return dscp

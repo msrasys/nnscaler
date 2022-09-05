@@ -578,6 +578,23 @@ class IRSubTensor(IRTensor):
     def requires_grad(self) -> bool:
         return self.parent._requires_grad
 
+    @property
+    def grad(self) -> bool:
+        return self._grad
+
+    @grad.setter
+    def grad(self, val: Optional[IRTensor]):
+        if isinstance(val, (IRSubTensor, float)):
+            assert self.requires_grad
+            if isinstance(val, IRSubTensor):
+                val.shape == self.shape
+            self._grad = val
+        elif val is None:
+            assert not self.requires_grad
+            self._grad = None
+        else:
+            raise ValueError(f"Expected grad to be None or IRSubTensor but got: {val}")
+
     # partition primitives
 
     def select(self,

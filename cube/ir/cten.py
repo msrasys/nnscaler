@@ -477,6 +477,8 @@ class IRTensor:
         if not isinstance(val, IRDType):
             raise TypeError(f"Expected IRDType but got {val}")
         self._dtype = val
+        if isinstance(self._grad, IRTensor):
+            self._dtype = val
 
     @property
     def cell(self) -> Optional[IRCell]:

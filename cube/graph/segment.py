@@ -101,9 +101,11 @@ class IRSegment(IRCell):
         self._have_forward = any(isinstance(n, IRFwOperation) for n in nodes)
         self._have_backward = any(isinstance(n, IRBpOperation) for n in nodes)
 
-    @property
-    def forward(self) -> bool:
+    def isfw(self) -> bool:
         return self._have_forward
+
+    def isbw(self) -> bool:
+        return self._have_backward
 
     def full_tensors(self) -> Tuple[IRFullTensor]:
         """
@@ -301,7 +303,6 @@ class IRSegment(IRCell):
                 assert not (ctensor != tensor and ctensor.overlap(tensor)), "parital overlap is not supported for gradient"
                 if ctensor == tensor and consumer not in consumers:
                     consumers.append(consumer)
-            # segment.debug_print_tensor_map()
             valmap = (consumers.index(tensor.cell), len(consumers))
             grad = ftensor.grad.select(
                 indmap = tensor.indmap,
@@ -316,8 +317,9 @@ class IRSegment(IRCell):
         tensor.grad = grad
         return grad
 
-    def debug_print_tensor_map(self):
-        for ftensor in self._ftensors:
+    def debug_print_tensor_map(self, ftensor: Optional[IRFullTensor] = None):
+        ftensors = [ftensor] if ftensor is not None else self._ftensors
+        for ftensor in ftensors:
             print(f'Full Tensor: {ftensor}')
             print(f'Producers:')
             for producer in self._producers[ftensor]:
@@ -326,40 +328,64 @@ class IRSegment(IRCell):
             for producer in self._consumers[ftensor]:
                 print(f'\t{producer}')
 
-    def bwop(self, fwop: IRFwOperation) -> IRBpOperation:
+    def create_bwop(self, fwop: IRFwOperation) -> IRBpOperation:
         """
         Create dummy backward operator for given forward operator
         """
         assert isinstance(fwop, IRFwOperation), "Expected IRFwOperation"
         fsegment: IRSegment = self.segment(fwop)
-        igrads = [fsegment.grad(t) if isinstance(t, IRSubTensor) else None for t in fwop.inputs()]
-        ograds = [fsegment.grad(t) if isinstance(t, IRSubTensor) else None for t in fwop.outputs()]
+        igrads = [fsegment.grad(t) if t.requires_grad else None for t in fwop.inputs() if isinstance(t, IRSubTensor)]
+        ograds = [fsegment.grad(t) if t.requires_grad else None for t in fwop.outputs() if isinstance(t, IRSubTensor)]
         bwop = IRBpOperation(ograds, igrads)
         IRCell.make_pair(fwop, bwop)
         return bwop
     
-    def update_bwop(self, bwop: IRBpOperation) -> IRBpOperation:
+    def update_bwop(self, bwop: IRCell) -> IRBpOperation:
         """
-        Update backward operator.
+        Update backward operator or a backward segment.
 
         This is neccessary when fwop is partitioned and reference count is changed.
         
-        @param bwop IRBpOperation: the backward operation.
+        @param bwop IRBpOperation or IRSegment: the backward operation.
             It can be at any hierarchy of this segemtn
 
         @return bwop IRBpOperation: the updated operation (inplace)
         """
+        assert isinstance(bwop, (IRBpOperation, IRSegment))
+        if isinstance(bwop, IRSegment):
+            assert bwop.isbw() and (not bwop.isfw())
         bsegment: IRSegment = self.segment(bwop)
         fsegment = bsegment.mirror
         with bsegment.update(bwop):
-            fwop: IRFwOperation = bwop.mirror
-            igrads = [fsegment.grad(t) if isinstance(t, IRSubTensor) else None for t in fwop.inputs()]
+            fwop: Union[IRFwOperation, IRSegment] = bwop.mirror
+            igrads = [fsegment.grad(t) if t.requires_grad else None for t in fwop.inputs() if isinstance(t, IRSubTensor)]
             for idx, igrad in enumerate(igrads):
                 bwop.set_output(idx, igrad)
-            ograds = [fsegment.grad(t) if isinstance(t, IRSubTensor) else None for t in fwop.outputs()]    
+            ograds = [fsegment.grad(t) if t.requires_grad else None for t in fwop.outputs() if isinstance(t, IRSubTensor)]
+            # Ad-hoc fix: remove float that could be caused by loss for segment
+            if isinstance(bwop, IRSegment):
+                ograds = [grad for grad in ograds if isinstance(grad, IRSubTensor)]
             for idx, ograd in enumerate(ograds):
                 bwop.set_input(idx, ograd)
         return bwop
+
+    def update_ftensor_bw(self, ftensor: IRFullTensor):
+        """
+        Update all backward operators for a full tensor.
+
+        @param ftensor IRFullTensor: the full tensor. If the full
+            tensor is not a gradient, will update backward operators
+            of ftensor.grad
+        
+        @return None
+        """
+        fgrad = ftensor.grad if not ftensor.is_grad() else ftensor
+        if fgrad is None:
+            return
+        for producer in self.producers(fgrad):
+            self.update_bwop(producer)
+        for consumer in self.consumers(fgrad):
+            self.update_bwop(consumer)
 
     # ====================== Basic Graph manipulations ======================
 
@@ -496,7 +522,9 @@ class IRSegment(IRCell):
     @contextmanager
     def update(self, node):
         """
-        Update a node.
+        Update a node. Note the related change in backward operator 
+        will not be automatically updated.
+    
         TODO: update operator dependency
 
         e.g.,
@@ -525,6 +553,40 @@ class IRSegment(IRCell):
             if segment.exist(node):
                 return True
         return False
+
+    def finsert(self, fwop: IRFwOperation, index: Union[int, CellPosition]) -> IRFwOperation:
+        """
+        Insert a forward node and create its backward.
+        The created backward operator will be happen right before
+        the backward of fwop's previous forward node
+
+        This requires the segment has its backward segment
+
+        @param fwop IRFwOperation: forward node
+        @param index Union[int, CellPosition]: inserted position
+
+        @return node IRFwOperation: the node itself
+        """
+        assert isinstance(fwop, IRFwOperation), "Only allow insert an IRFwOperation"
+        pos = CellPosition((index,)) if isinstance(index, int) else index
+        assert isinstance(pos, CellPosition), "Expect index to be int or CellPosition"
+    
+        index = pos.indices[-1]
+        fsegment = self if len(pos) == 1 else self.node(CellPosition(pos.indices[1:]))
+        fsegment.insert(fwop, index)
+        # create backward
+        bwop = fsegment.create_bwop(fwop)
+        # insert backward
+        assert fsegment.mirror is not None, "Missing backward segment"
+        bsegment: IRSegment = fsegment.mirror
+        bidx = 0
+        for idx in range(index - 1, -1, -1):
+            prev_fnode = fsegment.node(idx)
+            if prev_fnode.mirror is not None:
+                bidx = bsegment.index(prev_fnode.mirror)
+                break
+        bsegment.insert(bwop, bidx)
+        return fwop
 
     # ====================== Graph Generations ============================
     
@@ -665,7 +727,8 @@ class IRSegment(IRCell):
     # ========================== Graph Visualize ================================
 
     def __repr__(self):
-        dscp = f"Graph{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})"
+        fw = 'f' if self.isfw() else 'b'
+        dscp = f"{fw}Graph{self.cid}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})"
         return dscp
 
     def extra_repr(self) -> str:

@@ -159,28 +159,6 @@ class IRBpOperation(IRCell):
         for idx, igrad in enumerate(igrads):
             self.set_output(idx, igrad)
 
-    def update(self):
-        """
-        Update this backward operator.
-        This is neccessary when op is partitioned and reference count is changed.
-
-        Note in order to update produced and consumed tensor list, this call should be
-        wrapped with IRGraph detach and attach:
-
-        ```
-        with graph.update(node):
-            node.update()
-        ```
-        """
-        fnode: IRFwOperation = self.mirror
-        assert isinstance(fnode, IRFwOperation), "Cannot find corresponding IRFwOperation"
-        for idx, itensor in enumerate(fnode.inputs()):
-            grad = itensor.grad if isinstance(itensor, IRSubTensor) else None
-            self.set_output(idx, grad)
-        for idx, otensor in enumerate(fnode.outputs()):
-            grad = otensor.grad if isinstance(otensor, IRSubTensor) else None
-            self.set_input(idx, grad)
-
     def replicate(self):
         """
         Replicate the backward op
