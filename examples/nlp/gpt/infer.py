@@ -4,7 +4,9 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/nlp/gpt/train.py --policy PASMeshShard --fp16
+    examples/nlp/gpt/infer.py --policy PASMeshShard --fp16
+
+PYTHONPATH=.:..:$PYTHONPATH python -m torch.distributed.launch --nproc_per_node=1  examples/nlp/gpt/infer.py --policy PASSingle --fp16
 """
 
 
@@ -45,14 +47,17 @@ else:
     raise ValueError(f"policy {args.policy} not found. Candidates: {policies}")
 
 def inter():
+    print(f'torch.cuda.is_available() = {torch.cuda.is_available()}')
 
     batch_size = 1
 
     model = GPTInfer()
-    # model = model if not args.fp16 else model.half()
+    model = model if not args.fp16 else model.half()
+    model = model.cuda()
     model.eval()
     dataloader = GPTInferDataLoader(batch_size)
 
+    output = None
     for i in range(10):
         input_ids, position_ids = next(dataloader)
         print(f'input_ids = {input_ids} [{input_ids.size()}], position_ids = {position_ids} [{position_ids.size()}]')

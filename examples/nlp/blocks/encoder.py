@@ -50,14 +50,12 @@ class EncoderInferLayer(torch.nn.Module):
         tmp_batch_size = 1
         self.past_embed_key = torch.nn.Parameter(torch.rand(seqlen, tmp_batch_size, embed_dim))
         self.past_embed_value = torch.nn.Parameter(torch.rand(seqlen, tmp_batch_size, embed_dim))
-        self.past_embed = tuple([self.past_embed_key, self.past_embed_value])
-        print(f'self.past_embed.type = {type(self.past_embed)}')
 
     # def forward(self, x: torch.Tensor, encoder_output: torch.Tensor) -> torch.Tensor:
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.self_attn_layer_norm(x)
-        x = self.self_attn_partial(x, self.past_embed)
+        x = self.self_attn_partial(x, self.past_embed_key, self.past_embed_value)
         x = self.dropout(x)
         x = x + residual
 
