@@ -151,7 +151,7 @@ class SynDataLoader(CubeDataLoader):
         for shape, dtype in zip(self.shapes, self.dtypes):
             datas.append(
                 torch.rand(
-                    shape, dtype=dtype, 
+                    shape, dtype=dtype,
                     device=torch.cuda.current_device(),
                     requires_grad=False)
             )

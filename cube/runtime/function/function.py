@@ -11,7 +11,7 @@ def identity(tensor: torch.Tensor) -> torch.Tensor:
 
 def anchor(name: str):
     """
-    anchor operation for graph navigation 
+    anchor operation for graph navigation
     """
     return None
 
