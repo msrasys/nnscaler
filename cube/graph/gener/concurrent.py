@@ -15,33 +15,37 @@ from cube.graph.gener.layout import GridLayout
 class ConcurrentGener:
 
     @staticmethod
-    def gen(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> Optional[IRAdapter]:
+    def gen(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor], 
+            bptensors: List[IRSubTensor], bctensors: List[IRSubTensor]) -> Optional[IRAdapter]:
         """
         Generate forward adapter and backward adapter
 
-        @param ptensors List[IRSubTensor]: forward producer tensors
-        @param ctensors List[IRSubTensor]: forward consumer tensors
+        @param fptensors List[IRSubTensor]: forward producer tensors
+        @param fctensors List[IRSubTensor]: forward consumer tensors
+        @param bptensors List[IRSubTensor]: backward producer tensors
+        @param bctensors List[IRSubTensor]: backward consumer tensors
 
         @return fadapter Optional[IRAdapter]: forward adapter
             None indicate no adapter required.
         """
-        pdevs = tuple(t.device[0] for t in ptensors)
-        cdevs = tuple(t.device[0] for t in ctensors)
+        pdevs = tuple(t.device[0] for t in fptensors)
+        cdevs = tuple(t.device[0] for t in fctensors)
 
         fadapter: IRAdapter = None
 
         # case 1: sharing device (in-shard)
-        inshard = (set(pdevs) == set(cdevs)) and (len(ptensors) == len(ctensors)) and (len(pdevs) == len(ptensors))
+        inshard = (set(pdevs) == set(cdevs)) and (len(fptensors) == len(fctensors)) and (len(pdevs) == len(fptensors))
         if inshard and len(pdevs) > 1:
-                try:
-                    fadapter = ConcurrentGener.gen_in_shard(ptensors, ctensors, allow_reorder=True)
-                except Exception as e:
-                    fadapter = None
-                    print(
-                        f"full tensor: {ptensors[0].parent} cannot use grid generation.\n"
-                        f"Reason: {str(e)}\n"
-                        f"Switch to general P2P communication."
-                    )
+            # fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reorder=True)
+            try:
+                fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reorder=True)
+            except Exception as e:
+                fadapter = None
+                print(
+                    f"full tensor: {fptensors[0].parent} cannot use grid generation.\n"
+                    f"Reason: {str(e)}\n"
+                    f"Switch to general P2P communication."
+                )
 
         # Case 2: sperating device (cross-shard)
         if len(set(pdevs).intersection(cdevs)) == 0:
@@ -50,19 +54,21 @@ class ConcurrentGener:
         # Case 3: General cases
         # warnings.warn('The adapter is generated using P2P communication')
         if fadapter is None:
-            fadapter = ConcurrentGener.gen_general(ptensors, ctensors)
+            fadapter = ConcurrentGener.gen_general(fptensors, fctensors, bptensors, bctensors)
         
         return fadapter
 
     @staticmethod
-    def gen_in_shard(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor], allow_reorder=False):
-        ftensor = ptensors[0].parent
+    def gen_in_shard(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor], 
+                     bptensors: List[IRSubTensor], bctensors: List[IRSubTensor],
+                     allow_reorder=False):
+        ftensor = fptensors[0].parent
         # producer grid layout
-        ilayout = GridLayout.togrid(ftensor, ptensors)
+        ilayout = GridLayout.togrid(ftensor, fptensors)
         # reorder ctensors to match with ptensors
         devs = [ptensor.device for ptensor in ilayout.mat.flatten()]
         ctensors = [None] * len(devs)
-        for ctensor in ctensors:
+        for ctensor in fctensors:
             idx = devs.index(ctensor.device)
             ctensors[idx] = ctensor
         assert all(t is not None for t in ctensors), f"empty device slot {ctensors}"
@@ -90,28 +96,26 @@ class ConcurrentGener:
         if len(names) > 0:
             print(f'UserWarning: a better device placement is found and set for op {names}: {from_dev} -> {to_dev}')
 
-        fadapter = IRAdapter(ftensor.ptensors, ftensor.ctensors)
+        fadapter = IRAdapter(fptensors, fctensors)
         fadapter.prims = fprims
 
         # generate backward
         grad: IRFullTensor = ftensor.grad
-        b_ptensors = [ctensor.grad for ctensor in ctensors]
-        b_ctensors = [ptensor.grad for ptensor in ptensors]
         bprims = []
-        if grad is not None and (len(b_ptensors) != 0 or len(b_ctensors) != 0):
+        if grad is not None and (len(bptensors) != 0 or len(bctensors) != 0):
             # reorder ptensors to match with forward
             ptensors = [None] * len(devs)
-            for b_ptensor in b_ptensors:
-                idx = devs.index(b_ptensor.device)
+            for bptensor in bptensors:
+                idx = devs.index(bptensor.device)
                 assert ptensors[idx] is None, "same device of different tensors"
-                ptensors[idx] = b_ptensor
-            ilayout = GridLayout.togrid(grad, b_ptensors)
-            olayout = GridLayout.togrid(grad, b_ctensors)
+                ptensors[idx] = bptensor
+            ilayout = GridLayout.togrid(grad, ptensors)
+            olayout = GridLayout.togrid(grad, bctensors)
             paths, bprims = ilayout.path(olayout)
             # check the device order
             for itensor, otensor in zip(paths[-1].mat.flatten(), olayout.mat.flatten()):
                 assert len(itensor.device) == len(otensor.device), "backward device not match"
-            badapter = IRAdapter(b_ptensors, b_ctensors)
+            badapter = IRAdapter(bptensors, bctensors)
             badapter.prims = bprims
             IRAdapter.make_pair(fadapter, badapter)
 
@@ -122,7 +126,8 @@ class ConcurrentGener:
         pass
 
     @staticmethod
-    def gen_general(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> IRAdapter:
+    def gen_general(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor],
+                    bptensors: List[IRSubTensor], bctensors: List[IRSubTensor]) -> IRAdapter:
         """
         A general way to generate adapter.
         FIXME: Assuming consumers at different devices can happen at the same time.
@@ -132,19 +137,18 @@ class ConcurrentGener:
         @return adapter IRAdapter
         """
         fprims = []
-        for ctensor in ctensors:
-            fprims += ConcurrentGener.gen_subtensor(ctensor, ptensors)
-        fadapter = IRAdapter(ptensors,ctensors)
+        for ctensor in fctensors:
+            fprims += ConcurrentGener.gen_subtensor(ctensor, fptensors)
+        fadapter = IRAdapter(fptensors,fctensors)
         fadapter.prims = fprims
         # backward
-        b_ptensors = [ctensor.grad for ctensor in ctensors if ctensor.grad is not None]
-        b_ctensors = [ptensor.grad for ptensor in ptensors if ptensor.grad is not None]
-        bprims = []
-        for cgrad in b_ctensors:
-            bprims += ConcurrentGener.gen_subtensor(cgrad, b_ptensors)
-        badapter = IRAdapter(b_ptensors, b_ctensors)
-        badapter.prims = bprims
-        IRAdapter.make_pair(fadapter, badapter)
+        if len(bptensors) > 0 and len(bctensors) > 0:
+            bprims = []
+            for cgrad in bctensors:
+                bprims += ConcurrentGener.gen_subtensor(cgrad, bptensors)
+            badapter = IRAdapter(bptensors, bctensors)
+            badapter.prims = bprims
+            IRAdapter.make_pair(fadapter, badapter)
         return fadapter
 
     @staticmethod

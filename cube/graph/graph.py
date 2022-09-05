@@ -323,11 +323,10 @@ class IRGraph(IRSegment):
         # insert backward
         bsegment: IRSegment = fsegment.mirror
         if isinstance(node.mirror, IRBpOperation):
-            bnode: IRBpOperation = node.mirror
             bnodes = tuple(self.create_bwop(fnode) for fnode in fnodes[::-1])
             for bnode in bnodes:
                 bnode.device = node.device
-            bsegment.replace(bnode, bnodes)
+            bsegment.replace(node.mirror, bnodes)
         return fnodes
 
     def partition(self, node: Union[IRFwOperation, IRDataOperation],

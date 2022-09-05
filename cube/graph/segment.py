@@ -206,14 +206,17 @@ class IRSegment(IRCell):
 
     def index(self, node: IRCell) -> CellPosition:
         """
-        Get node index.
+        Get node index. The dispatched node (e.g., IRAdapter, IRSegment) 
+        will return the index to its un-dispatched node
 
         @param node IRCell: the queried node
 
         @return index int: the index
         """
-        if node in self._nodes:
-            return CellPosition((self._nodes.index(node),))
+        assert isinstance(node, IRCell)
+        cids = tuple(node.cid for node in self._nodes)
+        if node.cid in cids:
+            return CellPosition((cids.index(node.cid),))
         for idx, segment in enumerate(self._nodes):
             if isinstance(segment, IRSegment):
                 if segment.exist(node):
@@ -229,7 +232,7 @@ class IRSegment(IRCell):
 
         @return segment IRSegment
         """
-        assert isinstance(node, IRCell)
+        assert isinstance(node, IRCell), f"Expected IRCell, but got {node}"
         index = self.index(node)
         if len(index) == 1:
             return self
@@ -280,7 +283,7 @@ class IRSegment(IRCell):
         assert ftensor in self._ctensors, f"{ftensor} is not in the graph"
         return tuple(self._ctensors[ftensor])
 
-    def grad(self, tensor: IRSubTensor) -> IRSubTensor:
+    def grad(self, tensor: IRSubTensor, no_partial_overlap=False) -> IRSubTensor:
         """
         Get gradient of the tensor.
 
@@ -298,12 +301,17 @@ class IRSegment(IRCell):
         ftensor = tensor.parent
         # this tensor is consumed
         if tensor in tensor.cell.inputs():
-            consumers = []
+            consumer_cids = []
             for ctensor, consumer in zip(segment.ctensors(ftensor), segment.consumers(ftensor)):
-                assert not (ctensor != tensor and ctensor.overlap(tensor)), "parital overlap is not supported for gradient"
-                if ctensor == tensor and consumer not in consumers:
-                    consumers.append(consumer)
-            valmap = (consumers.index(tensor.cell), len(consumers))
+                if no_partial_overlap:
+                    assert not (ctensor != tensor and ctensor.overlap(tensor)), (
+                        f"parital overlapping is not supported for gradient\n"
+                        f"{self.debug_tensor_map_str(ctensor.parent)}"
+                    )
+                if ctensor == tensor and consumer.cid not in consumer_cids:
+                    consumer_cids.append(consumer.cid)
+            
+            valmap = (consumer_cids.index(tensor.cell.cid), len(consumer_cids))
             grad = ftensor.grad.select(
                 indmap = tensor.indmap,
                 valmap = valmap
@@ -317,16 +325,18 @@ class IRSegment(IRCell):
         tensor.grad = grad
         return grad
 
-    def debug_print_tensor_map(self, ftensor: Optional[IRFullTensor] = None):
+    def debug_tensor_map_str(self, ftensor: Optional[IRFullTensor] = None) -> str:
+        dscp : str = ''
         ftensors = [ftensor] if ftensor is not None else self._ftensors
         for ftensor in ftensors:
-            print(f'Full Tensor: {ftensor}')
-            print(f'Producers:')
+            dscp += f'====\nFull Tensor: {ftensor}\n'
+            dscp += f'Producers:\n'
             for producer in self._producers[ftensor]:
-                print(f'\t{producer}')
-            print(f'Consumers:')
-            for producer in self._consumers[ftensor]:
-                print(f'\t{producer}')
+                dscp += f'\t{producer}\n'
+            dscp += f'Consumers:\n'
+            for consumer in self._consumers[ftensor]:
+                dscp += f'\t{consumer}\n'
+        return dscp
 
     def create_bwop(self, fwop: IRFwOperation) -> IRBpOperation:
         """
@@ -334,8 +344,10 @@ class IRSegment(IRCell):
         """
         assert isinstance(fwop, IRFwOperation), "Expected IRFwOperation"
         fsegment: IRSegment = self.segment(fwop)
-        igrads = [fsegment.grad(t) if t.requires_grad else None for t in fwop.inputs() if isinstance(t, IRSubTensor)]
-        ograds = [fsegment.grad(t) if t.requires_grad else None for t in fwop.outputs() if isinstance(t, IRSubTensor)]
+        fins = [t for t in fwop.inputs() if isinstance(t, IRSubTensor)]
+        fous = [t for t in fwop.outputs() if isinstance(t, IRSubTensor)]
+        igrads = [fsegment.grad(t) if t.requires_grad else None for t in fins]
+        ograds = [fsegment.grad(t) if t.requires_grad else None for t in fous]
         bwop = IRBpOperation(ograds, igrads)
         IRCell.make_pair(fwop, bwop)
         return bwop
@@ -358,10 +370,12 @@ class IRSegment(IRCell):
         fsegment = bsegment.mirror
         with bsegment.update(bwop):
             fwop: Union[IRFwOperation, IRSegment] = bwop.mirror
-            igrads = [fsegment.grad(t) if t.requires_grad else None for t in fwop.inputs() if isinstance(t, IRSubTensor)]
+            fins = [t for t in fwop.inputs() if isinstance(t, IRSubTensor)]
+            fous = [t for t in fwop.outputs() if isinstance(t, IRSubTensor)]
+            igrads = [fsegment.grad(t) if t.requires_grad else None for t in fins]
+            ograds = [fsegment.grad(t) if t.requires_grad else None for t in fous]
             for idx, igrad in enumerate(igrads):
                 bwop.set_output(idx, igrad)
-            ograds = [fsegment.grad(t) if t.requires_grad else None for t in fwop.outputs() if isinstance(t, IRSubTensor)]
             # Ad-hoc fix: remove float that could be caused by loss for segment
             if isinstance(bwop, IRSegment):
                 ograds = [grad for grad in ograds if isinstance(grad, IRSubTensor)]
@@ -652,26 +666,74 @@ class IRSegment(IRCell):
         segment = segments[0]
 
         inputs, outputs = set(), set()
+
+        # go through adapters
+        adapter_ins: Dict[IRSubTensor, Set[int]] = dict()
+        adapter_ous: Dict[IRSubTensor, Set[int]] = dict()
+        for adapter in nodes:
+            if not isinstance(adapter, IRAdapter):
+                continue
+            for itensor in adapter.inputs():
+                if not isinstance(itensor, IRSubTensor): continue
+                if itensor not in adapter_ins:
+                    adapter_ins[itensor] = set()
+                adapter_ins[itensor].update(itensor.device)
+                # producers can from out side node
+                producers = []
+                for ptensor, prod in zip(segment.ptensors(itensor.parent), segment.producers(itensor.parent)):
+                    if ptensor == itensor and set(itensor.device).issubset(set(prod.device)):
+                        producers.append(prod)
+                if not any(p in nodes for p in producers):
+                    inputs.add(itensor)
+            for otensor in adapter.outputs():
+                if not isinstance(otensor, IRSubTensor): continue
+                if otensor not in adapter_ous:
+                    adapter_ous[otensor] = set()
+                adapter_ous[otensor].update(otensor.device)
+                consumers = []
+                for ctensor, cons in zip(segment.ctensors(otensor.parent), segment.consumers(otensor.parent)):
+                    if ctensor == otensor and set(otensor.device).issubset(set(cons.device)):
+                        consumers.append(cons)
+                if not any(c in nodes for c in consumers):
+                    outputs.add(otensor)
+
+        # go through non-adapter nodes
         for node in nodes:
+            if isinstance(node, IRAdapter):
+                assert node.differentiable, \
+                    "Non-differentiable IRAdapter is not allowed to be grouped"
+                continue
             # update inputs
             itensors = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
             for itensor in itensors:
                 ftensor = itensor.parent
                 if itensor.is_attr(): continue
+                # from inside adapters
+                if itensor in adapter_ous:
+                    if len(node.device) > 0 and set(itensor.device).issubset(adapter_ous[itensor]):
+                        continue
                 # from segment inputs
                 if any(t.overlap(itensor) for t in segment.inputs() if isinstance(t, IRSubTensor)):
                     inputs.add(itensor)
                     continue
                 # from outside producers
-                for ptensor, producer in zip(segment.ptensors(ftensor), segment.producers(ftensor)):
-                    if ptensor.overlap(itensor) and producer not in nodes:
-                        inputs.add(itensor)
-                        continue
+                producers, ptensors = segment.producers(ftensor), segment.ptensors(ftensor)
+                producers = [p for p, t in zip(producers, ptensors) if t == itensor]
+                if len(itensor.device) > 0:
+                    producers = [p for p in producers if set(itensor.device).issubset(set(p.device))]
+                # from graph inputs or outside adapter (no producer)
+                if len(producers) == 0 or any(p not in nodes for p in producers):
+                    inputs.add(itensor)
+                    continue
             # update outputs
             otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
             for otensor in otensors:
                 ftensor = otensor.parent
                 if otensor.is_attr(): continue
+                # from inside adapters
+                if otensor in adapter_ins:
+                    if len(node.device) > 0 and set(otensor.device).issubset(adapter_ins[otensor]):
+                        continue
                 # loss doesn't have consumers
                 if len(segment.consumers(ftensor)) == 0:
                     outputs.add(otensor)
@@ -680,10 +742,14 @@ class IRSegment(IRCell):
                     outputs.add(otensor)
                     continue
                 # for outside consumers
-                for ctensor, consumer in zip(segment.ctensors(ftensor), segment.consumers(ftensor)):
-                    if ctensor.overlap(otensor) and consumer not in nodes:
-                        outputs.add(otensor)
-                        continue
+                consumers, ctensors = segment.consumers(ftensor), segment.ctensors(ftensor)
+                consumers = [c for c, t in zip(consumers, ctensors) if t == otensor]
+                if len(otensor.device) > 0:
+                    consumers = [c for c in consumers if set(otensor.device).issubset(set(c.device))]
+                # for adapter (no consumer)
+                if len(consumers) == 0 or any(c not in nodes for c in consumers):
+                    outputs.add(otensor)
+                    continue
         segment = IRSegment(nodes, tuple(inputs), tuple(outputs))
         return segment
 
@@ -728,7 +794,11 @@ class IRSegment(IRCell):
 
     def __repr__(self):
         fw = 'f' if self.isfw() else 'b'
-        dscp = f"{fw}Graph{self.cid}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})"
+        inputs = tuple(t for t in self.inputs() if isinstance(t, IRTensor) and not t.is_param())
+        if self.isfw():
+            dscp = f"{fw}Graph{self.cid}-{self.device}(inputs={inputs}, outputs={self.outputs()})"
+        else:
+            dscp = f"{fw}Graph{self.cid}-{self.device}(fGraph{self.mirror.cid}, inputs={inputs}, outputs={self.outputs()})"
         return dscp
 
     def extra_repr(self) -> str:

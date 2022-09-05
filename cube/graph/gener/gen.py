@@ -1,5 +1,5 @@
 import itertools
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple
 import copy
 
 from cube.graph.function.anchor import IRGraphAnchor
@@ -8,7 +8,7 @@ from cube.graph.gener.concurrent import ConcurrentGener
 from cube.graph.graph import IRGraph
 from cube.graph.segment import IRSegment
 from cube.ir.cten import IRCell
-from cube.ir.tensor import IRFullTensor, IRSubTensor
+from cube.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 
 from cube.ir.operator import IRBpOperation, IRFwOperation
 
@@ -23,7 +23,11 @@ def to_device(tensor: IRSubTensor, device: int) -> IRFwOperation:
     fwop = IRFwOperation('dummy', 'dummpy', 1, 0)
     fwop.set_input(0, tensor)
     fwop.device = device
-    return fwop.input(0)
+    otensor = fwop.input(0)
+    otensor.grad = copy.copy(tensor.grad)
+    if isinstance(otensor.grad, IRSubTensor):
+        otensor.grad.cell = fwop
+    return otensor
 
 
 class IRAdapterGener:
@@ -37,17 +41,24 @@ class IRAdapterGener:
         @param graph IRGraph: the graph without adapter
         @return graph IRGraph: the graph with adapter inserted
         """
+        # remove anchor node
+        graph = IRAdapterGener.remove_anchor(graph)
         # update the gradient before generate adapter
-        for node in graph.nodes():
-            if isinstance(node, IRBpOperation):
-                graph.update_bwop(node)
+        graph = IRAdapterGener.update_grad(graph)
         # generate adapters for activation
         graph = IRAdapterGener.gen_activation(graph)
         # generate weight reducer
         graph = IRAdapterGener.gen_weight(graph)
-        # remove anchor node
-        IRAdapterGener.remove_anchor(graph)
-        print(graph.extra_repr())
+        return graph
+
+    @staticmethod
+    def update_grad(graph: IRSegment):
+        for ftensor in graph.full_tensors():
+            if ftensor.is_grad():
+                graph.update_ftensor_bw(ftensor)
+        for node in graph.nodes():
+            if isinstance(node, IRSegment) and node.isbw():
+                IRAdapterGener.update_grad(node)
         return graph
 
     @staticmethod
@@ -57,8 +68,9 @@ class IRAdapterGener:
                 graph.remove(anchor)
                 if anchor.mirror is not None:
                     graph.mirror.remove(anchor.mirror)
-            if isinstance(anchor, IRSegment):
+            elif isinstance(anchor, IRSegment):
                 IRAdapterGener.remove_anchor(anchor)
+        return graph
 
     @staticmethod
     def gen_weight(graph: IRGraph) -> IRGraph:
@@ -129,68 +141,58 @@ class IRAdapterGener:
             # IRAdapterGener.local_consumer_multiref(graph, ftensor)
 
             # producers can be operators and graph inputs
-            fproducers, bproducers, ptensors = [], [], []
-            # operators
-            for ptensor, producer in zip(graph.ptensors(ftensor), graph.producers(ftensor)):
-                for devid in producer.device:
-                    ptensors.append(to_device(ptensor, devid))
-                fproducers.append(graph.index(producer)[0])
-                if ptensor.requires_grad:
-                    bproducers.append(graph.mirror.index(producer.mirror)[0])
-            # graph inputs
-            for ptensor in graph.inputs():
-                if isinstance(ptensor, IRSubTensor) and ptensor.parent == ftensor:
-                    # TODO: mapping back forawrd / backward
-                    ptensor = ftensor.select(ptensor.indmap, (0, 1))
-                    for devid in devices:
-                        ptensors.append(to_device(ptensor, devid))
-                    fproducers.append(0)
-                    if ptensor.requires_grad:
-                        bproducers.append(graph.mirror.nnodes)
+            fproducers, fptensors = graph.producers(ftensor), graph.ptensors(ftensor)
+            assert all(len(ptensor.device) == 1 for ptensor in fptensors), "Not support for multi-device"
+            fconsumers, fctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
+            assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
 
-            # consumers can be operators and graph outputs
-            fconsumers, bconsumers, ctensors = [], [], []
-            # operators
-            for ctensor, consumer in zip(graph.ctensors(ftensor), graph.consumers(ftensor)):
-                for devid in consumer.device:
-                    ctensors.append(to_device(ctensor, devid))
-                fconsumers.append(graph.index(consumer)[0])
-                if ctensor.requires_grad:
-                    bconsumers.append(graph.mirror.index(consumer.mirror)[0])
-            # graph outputs
-            for ctensor in graph.outputs():
-                if isinstance(ctensor, IRSubTensor) and ctensor.parent == ftensor:
-                    # TODO: mapping back forward / backward
-                    ctensor = ftensor.select(ctensor.indmap, (0, 1))
-                    for devid in devices:
-                        ctensors.append(to_device(ctensor, devid))
-                    fconsumers.append(graph.nnodes)
-                    if ctensor.requires_grad:
-                        bconsumers.append(0)
+            bproducers, bptensors = [], []
+            bconsumers, bctensors = [], []
+            if isinstance(ftensor.grad, IRFullTensor):
+                bproducers, bptensors = graph.producers(ftensor.grad), graph.ptensors(ftensor.grad)
+                assert all(len(ptensor.device) == 1 for ptensor in bptensors), "Not support for multi-device"
+                bconsumers, bctensors = graph.consumers(ftensor.grad), graph.ctensors(ftensor.grad)    
+                assert all(len(ctensor.device) == 1 for ctensor in bctensors), "Not support for multi-device"
 
-            if skip(ptensors, ctensors): continue
+            if skip(fptensors, fctensors) and skip(bptensors, bctensors): continue
             
-            fadapter = ConcurrentGener.gen(ptensors, ctensors)
+
+            # print((f"generating for {ftensor}:\n"
+            #        f"fptensor device: {[t.device for t in fptensors]}\n"
+            #        f"fctensor device: {[t.device for t in fctensors]}\n"
+            #        f"bptensor device: {[t.device for t in bptensors]}\n"
+            #        f"bctensor device: {[t.device for t in bctensors]}\n"
+            # ))
+            fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors)
             if fadapter is None:
                 continue
 
+            badapter: Optional[IRAdapter] = fadapter.mirror
+
+            if (badapter is not None and len(fadapter.prims) == 0 and len(badapter.prims) == 0) or \
+               (badapter is None and len(fadapter.prims) == 0):
+                continue
+
             # insert forward adapter
-            # graph.insert(fadapter, max(producers))
-            graph.insert(fadapter, min(fconsumers))
+            # graph.insert(fadapter, max(producers) + 1)
+            graph.insert(fadapter, min(graph.index(c) for c in fconsumers))
 
             # insert backward adapter
-            if len(bproducers) > 0:
-                assert isinstance(fadapter.mirror, IRAdapter)
+            if badapter is not None:
+                assert isinstance(badapter, IRAdapter)
                 assert isinstance(graph.mirror, IRSegment)
-                bidx = max(bproducers)
-                graph.mirror.insert(fadapter.mirror, bidx)
+                bproducers = [
+                    graph.mirror.index(consumer.mirror) + 1 for \
+                        consumer in graph.consumers(ftensor)
+                ]
+                bidx = max(bproducers) if len(bproducers) > 0 else 0
+                graph.mirror.insert(badapter, bidx)
 
         # generate adapter for each segment
-        segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment)]
+        segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
         for segment in segments:
             IRAdapterGener.gen_activation(segment)
 
-        print(graph.extra_repr())
         return graph
 
 
