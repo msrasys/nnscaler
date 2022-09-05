@@ -1,10 +1,6 @@
 """
-example:
-
-OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=4 \
-    --nnodes=1 \
-    examples/mlp/linears.py --policy PASMegatron
+2 way branch:
+    OMP_NUM_THREADS=2 torchrun --nproc_per_node=2 --nnodes=1 palm.py
 """
 
 import torch
@@ -269,7 +265,11 @@ def PASBranch(graph: IRGraph, resource):
             if node.name == 'embedding' or node.name == 'linear':
                 # data parallel
                 algo = node.algorithms('dim')
-                sub_nodes = graph.partition(node, algo, idx=0, dim=batch_dim, num=resource.ngpus)
+                sub_nodes = graph.partition(node,
+                                            algo,
+                                            idx=0,
+                                            dim=batch_dim,
+                                            num=resource.ngpus)
                 for idx, sub_node in enumerate(sub_nodes):
                     graph.assign(sub_node, idx)
             elif node.name == 'layernorm' or node.name == 'multiref' or node.name == 'add' or node.name == 'mean':

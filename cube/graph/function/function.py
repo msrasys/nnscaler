@@ -680,10 +680,10 @@ def Reshape(signature, inputs):
     torch.reshape(Tensor self, int[] shape) -> Tensor
     """
 
-    # warnings.warn("""
-    # 'torch.reshape' is currently dispatched to 'torch.Tensor.view',
-    # but 'reshape' has keyword parameter 'shape' while 'view' has 'size'.
-    # ArgumentMissing error may be raised during codegen.""")
+    warnings.warn("""
+    'torch.reshape' is currently dispatched to 'torch.Tensor.view',
+    but 'reshape' has keyword parameter 'shape' while 'view' has 'size'.
+    ArgumentMissing error may be raised during codegen.""")
 
     return View(signature, inputs)
 
