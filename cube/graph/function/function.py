@@ -47,7 +47,7 @@ def BatchLinear(signature, inputs):
     return IRDimops(signature, annos, inputs, 'bmm')
 
 
-def Zeros(signature, 
+def Zeros(signature,
           inputs: Tuple[ List[int], Optional[int], Optional[Any], 'ErasedDevice', Optional[bool] ]):
     # zeros(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
     #
@@ -74,7 +74,7 @@ def Zeros(signature,
             raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
     return IRZeros(signature, size, 'zeros', ir_dtype)
 
-def Ones(signature, 
+def Ones(signature,
          inputs: Tuple[ List[int], Optional[int], Optional[Any], 'ErasedDevice', Optional[bool] ]):
     # ones(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
 
@@ -98,7 +98,7 @@ def Ones(signature,
             raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
     return IROnes(signature, size, 'ones', ir_dtype)
 
-def Rand(signature, 
+def Rand(signature,
          inputs: Tuple[ List[int], Optional[int], Optional[Any], 'ErasedDevice', Optional[bool] ]):
     # ones(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
 
@@ -122,7 +122,7 @@ def Rand(signature,
             raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
     return IRRand(signature, size, 'rand', ir_dtype)
 
-def NewTensor(signature, 
+def NewTensor(signature,
               inputs: Tuple[ list, Optional[int], 'ErasedDevice', bool ]):
     # aten::tensor(t[] data, *, ScalarType? dtype=None, Device? device=None, bool requires_grad=False) -> Tensor
     #
@@ -184,7 +184,7 @@ def ToTensor(signature,
 
     dtype : torch.dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
     ir_dtype : IRDType = DType2IRDType.map(dtype)
-    
+
     signature = 'torch.Tensor.to'
     return IRToTensor(signature, [tensor], 'to', ir_dtype=ir_dtype)
 
@@ -271,7 +271,7 @@ def Sub(signature, inputs):
         inputs = inputs[0:2]
     else:
         raise RuntimeError("The number of inputs must be 2 or 3")
-    
+
     lhs, rhs = inputs
 
     if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
@@ -431,6 +431,13 @@ def GeLU(signature, inputs):
         return IRDimops(signature, annos, tensor, 'gelu')
 
 
+def SiLU(signature, inputs):
+    annos = ['* -> *']
+    signature = 'torch.nn.functional.silu'
+    tensor = inputs[0:1]
+    return IRDimops(signature, annos, tensor, 'silu')
+
+
 def Softmax(signature, inputs):
     annos = ['* -> *']
     tensor = inputs[0:1]
@@ -482,6 +489,28 @@ def Sum(signature, inputs):
         return IRDimops(signature, [anno], [tensor], 'sum', dim=dim, keepdim=keepdim)
     else:
         return IRDimops(signature, [anno], [tensor], 'sum')
+
+def Mean(signature, inputs):
+    tensor = inputs[0]
+    dim = inputs[1]
+    einput = ShapeAnno.create_shape_str(tensor.shape)
+    eoutput = copy.copy(einput)
+    if dim is not None:
+        keepdim = inputs[2]
+        sort_dim = list(dim)
+        sort_dim.sort()
+        for dimidx in sort_dim[::-1]:
+            eoutput.pop(dimidx)
+            einput[dimidx] = einput[dimidx] + '+'
+    else:
+        eoutput = ['1']
+        # every dimension is reduced
+        einput = [edim + '+' for edim in einput]
+    anno = OpAnno.create_op_str([einput], [eoutput])
+    if dim is not None:
+        return IRDimops(signature, [anno], [tensor], 'mean', dim=dim, keepdim=keepdim)
+    else:
+        return IRDimops(signature, [anno], [tensor], 'mean')
 
 
 def Transpose(signature, inputs):
@@ -612,7 +641,7 @@ def View(signature, inputs):
             ofirst.append(bracket[hdim])
             break
     spatial = ispatial.intersection(ospatial)
-    
+
     # set dimension cannot be partitioned
     for bracket in in_anno + ou_anno:
         for hdim in range(len(bracket)):

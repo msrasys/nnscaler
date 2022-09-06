@@ -70,6 +70,9 @@ class Sign2Op:
         __ftemplate('gelu') : function.GeLU,
         __ttemplate('gelu') : function.GeLU,
 
+        __ftemplate('silu') : function.SiLU,
+        __ttemplate('silu') : function.SiLU,
+
         __ftemplate('_pad'): function.Pad,
 
         __ftemplate('layer_norm'): function.LayerNorm,
@@ -113,6 +116,7 @@ class Sign2Op:
         __ttemplate('bmm') : function.BatchLinear,
 
         __ttemplate('sum') : function.Sum,
+        __ttemplate('mean') : function.Mean,
 
         __ttemplate('transpose') : function.Transpose,
 
@@ -150,7 +154,7 @@ class Sign2Op:
 
         # runtime functions
         __rtemplate('anchor'): function.GraphAnchor,
-        
+
         __rtemplate('identity'): function.Identity,
 
         #einops
