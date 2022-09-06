@@ -140,6 +140,22 @@ def feedforward(x: torch.Tensor, proj1: torch.Tensor, proj2: torch.Tensor):
     return x
 
 
+@cube.graph.parser.register('N L^ E^, E^ F^ -> N L^ F^', name='feedforward1')
+def feedforward1(x: torch.Tensor, proj: torch.Tensor):
+    return torch.nn.functional.silu(torch.matmul(x, proj))
+
+
+@cube.graph.parser.register('N L^ E^, E^ F^ -> N L^ F^', name='feedforward2')
+def feedforward2(x: torch.Tensor, proj: torch.Tensor):
+    return torch.matmul(x, proj)
+
+
+@cube.graph.parser.register('N L^ E^, N L^ E^, E^ F -> N L^ F',
+                            name='feedforward3')
+def feedforward3(x: torch.Tensor, y: torch.Tensor, proj: torch.Tensor):
+    return torch.matmul(x * y, proj)
+
+
 class PaLMLayer(nn.Module):
 
     def __init__(self, dim, dim_head=64, heads=8, ff_mult=4):
@@ -183,6 +199,52 @@ class PaLMLayer(nn.Module):
         return in_x + attn_out + ff_out
 
 
+class PaLMLayerV2(nn.Module):
+
+    def __init__(self, dim, dim_head=64, heads=8, ff_mult=4):
+        super().__init__()
+
+        self.dim, self.dim_head, self.heads, self.scale = dim, dim_head, heads, dim_head**-0.5
+
+        # TODO
+        # self.alibi_pos_biases = AlibiPositionalBias(heads=self.heads)
+        # self.norm = RMSNorm(dim)
+        self.norm = torch.nn.LayerNorm(self.dim)
+
+        self.qkv_proj = torch.nn.Parameter(torch.randn(dim, dim + dim_head))
+        self.attn_out_proj = torch.nn.Parameter(torch.randn(dim, dim))
+
+        self.ff_proj1 = torch.nn.Parameter(torch.randn(dim, ff_mult * dim))
+        self.ff_proj2 = torch.nn.Parameter(torch.randn(dim, ff_mult * dim))
+        self.ff_proj3 = torch.nn.Parameter(torch.randn(ff_mult * dim, dim))
+
+        # self.register_buffer("mask", None, persistent=False)
+
+    def get_mask(self, n, device):
+        if self.mask is not None and self.mask.shape[-1] >= n:
+            return self.mask[:n, :n]
+
+        mask = torch.triu(torch.ones((n, n), device=device, dtype=torch.bool),
+                          1)
+        self.register_buffer("mask", mask, persistent=False)
+        return mask
+
+    def forward(self, in_x):
+        bs, n, device = in_x.shape[0], in_x.shape[1], in_x.device
+
+        # pre layernorm
+        x = self.norm(in_x)
+
+        attn_out = multi_head_attention(x, self.qkv_proj, self.attn_out_proj,
+                                        self.heads, self.scale)
+
+        ff1 = feedforward1(x, self.ff_proj1)
+        ff2 = feedforward2(x, self.ff_proj2)
+        ff_out = feedforward3(ff1, ff2, self.ff_proj3)
+
+        return in_x + attn_out + ff_out
+
+
 class PaLM(nn.Module):
 
     def __init__(self,
@@ -196,7 +258,11 @@ class PaLM(nn.Module):
 
         self.net = nn.Sequential(
             nn.Embedding(num_tokens, dim),
-            *[PaLMLayer(dim, dim_head, heads, ff_mult) for _ in range(depth)],
+            # *[PaLMLayer(dim, dim_head, heads, ff_mult) for _ in range(depth)],
+            *[
+                PaLMLayerV2(dim, dim_head, heads, ff_mult)
+                for _ in range(depth)
+            ],
             torch.nn.LayerNorm(dim),
             nn.Linear(dim, num_tokens, bias=False),
         )
@@ -261,7 +327,6 @@ def PASBranch(graph: IRGraph, resource):
 
     for node in graph.nodes():
         if isinstance(node, IRFwOperation):
-            print(node)
             if node.name == 'embedding' or node.name == 'linear':
                 # data parallel
                 algo = node.algorithms('dim')
@@ -287,9 +352,57 @@ def PASBranch(graph: IRGraph, resource):
     return graph
 
 
+def PASBranch3(graph: IRGraph, resource):
+    '''
+    3 way branch
+    '''
+    assert resource.ngpus == 3
+
+    for node in graph.nodes():
+        if isinstance(node, IRDataOperation):
+            algo = node.algorithms('data')
+            sub_nodes = graph.partition(node, algo, num=resource.ngpus)
+            for idx, sub_node in enumerate(sub_nodes):
+                graph.assign(sub_node, idx)
+            batch_dim = node.get_batch_dims()[0]
+
+    for node in graph.nodes():
+        if isinstance(node, IRFwOperation):
+            if node.name == 'embedding' or node.name == 'linear':
+                # data parallel
+                algo = node.algorithms('dim')
+                sub_nodes = graph.partition(node,
+                                            algo,
+                                            idx=0,
+                                            dim=batch_dim,
+                                            num=resource.ngpus)
+                for idx, sub_node in enumerate(sub_nodes):
+                    graph.assign(sub_node, idx)
+            elif node.name == 'layernorm' or node.name == 'multiref' or node.name == 'add' or node.name == 'mean':
+                # replicate
+                sub_nodes = graph.replicate(node, times=resource.ngpus)
+                for idx, sub_node in enumerate(sub_nodes):
+                    graph.assign(sub_node, idx)
+            elif node.name == 'feedforward1':
+                graph.assign(node, 0)
+            elif node.name == 'feedforward2':
+                graph.assign(node, 1)
+            elif node.name == 'feedforward3':
+                algo = node.algorithms('dim')
+                sub_nodes = graph.partition(node, algo, idx=2, dim=1, num=2)
+                graph.assign(sub_nodes[0], 0)
+                graph.assign(sub_nodes[1], 1)
+            elif node.name == 'multi_head_attention':
+                graph.assign(node, 2)
+            else:
+                assert False, node.name
+
+    return graph
+
+
 def train():
-    bs, n, dim = 8, 1024, 512
-    num_tokens, depth, heads, dim_head = 20000, 1, 8, 64
+    bs, n, dim = 3, 2048, 4096
+    num_tokens, depth, heads, dim_head = 20000, 1, 16, 256
 
     model = PaLM(dim, num_tokens, depth, heads=heads, dim_head=dim_head)
 
@@ -309,7 +422,8 @@ def train():
 
     # @cube.compile(model, dataloader, PAS=PASSingle)
     # @cube.compile(model, dataloader, PAS=PASData)
-    @cube.compile(model, dataloader, PAS=PASBranch)
+    # @cube.compile(model, dataloader, PAS=PASBranch)
+    @cube.compile(model, dataloader, PAS=PASBranch3)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
