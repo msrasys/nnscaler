@@ -673,7 +673,7 @@ class ModelCodeGen(CodeGen):
 
             nodes : List[IRCell] = [node for i, node in i_nodes]
 
-            subseg = self.execplan.graph.segment(nodes)
+            subseg = self.execplan.graph.create_segment(nodes)
 
             inputs = [t for t in subseg.inputs() if not t.is_attr()]
             input_names = [self.tensor_naming(t) for t in inputs]

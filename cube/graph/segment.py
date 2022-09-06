@@ -214,9 +214,8 @@ class IRSegment(IRCell):
         @return index int: the index
         """
         assert isinstance(node, IRCell)
-        cids = tuple(node.cid for node in self._nodes)
-        if node.cid in cids:
-            return CellPosition((cids.index(node.cid),))
+        if node in self._nodes:
+            return CellPosition((self._nodes.index(node),))
         for idx, segment in enumerate(self._nodes):
             if isinstance(segment, IRSegment):
                 if segment.exist(node):
@@ -484,7 +483,8 @@ class IRSegment(IRCell):
         @return index CellPosition: the removed index
         """
         pos = self.index(node) if _pos is None else _pos
-        assert self.node(pos) == node, "posititon doesn't not match with node"
+        assert self.node(pos) == node, \
+            f"posititon doesn't not match with node:\n\t{node}\nGot:\n\t{self.node(pos)}"
 
         if len(pos.indices) == 1:
             index = pos[0]
@@ -590,6 +590,7 @@ class IRSegment(IRCell):
         fsegment.insert(fwop, index)
         # create backward
         bwop = fsegment.create_bwop(fwop)
+        bwop.device = fwop.device
         # insert backward
         assert fsegment.mirror is not None, "Missing backward segment"
         bsegment: IRSegment = fsegment.mirror
@@ -661,9 +662,10 @@ class IRSegment(IRCell):
 
         @return segment IRSegment: the grouped segment. 
         """
-        segments: List[IRSegment] = [self.segment(node) for node in nodes]
-        assert len(set(segments)) == 1, "Cross segment hierarchy grouping is not allowed"
-        segment = segments[0]
+        segment = self
+        # segments: List[IRSegment] = [self.segment(node) for node in nodes]
+        # assert len(set(segments)) == 1, "Cross segment hierarchy grouping is not allowed"
+        # segment = segments[0]
 
         inputs, outputs = set(), set()
 

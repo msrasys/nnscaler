@@ -36,16 +36,16 @@ class ConcurrentGener:
         # case 1: sharing device (in-shard)
         inshard = (set(pdevs) == set(cdevs)) and (len(fptensors) == len(fctensors)) and (len(pdevs) == len(fptensors))
         if inshard and len(pdevs) > 1:
-            # fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reorder=True)
-            try:
-                fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reorder=True)
-            except Exception as e:
-                fadapter = None
-                print(
-                    f"full tensor: {fptensors[0].parent} cannot use grid generation.\n"
-                    f"Reason: {str(e)}\n"
-                    f"Switch to general P2P communication."
-                )
+            fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reorder=True)
+            # try:
+            #     fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reorder=True)
+            # except Exception as e:
+            #     fadapter = None
+            #     print(
+            #         f"full tensor: {fptensors[0].parent} cannot use grid generation.\n"
+            #         f"Reason: {str(e)}\n"
+            #         f"Switch to general P2P communication."
+            #     )
 
         # Case 2: sperating device (cross-shard)
         if len(set(pdevs).intersection(cdevs)) == 0:
@@ -56,6 +56,10 @@ class ConcurrentGener:
         if fadapter is None:
             fadapter = ConcurrentGener.gen_general(fptensors, fctensors, bptensors, bctensors)
         
+        if set(pdevs) == set(cdevs) and fadapter.mirror is not None:
+            fadapter.differentiable = True
+            fadapter.mirror.differentiable = True
+
         return fadapter
 
     @staticmethod

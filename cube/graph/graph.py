@@ -692,7 +692,7 @@ class IRGraph(IRSegment):
 
     # ================= Other optimizations ==================
 
-    def recompute(self, nodes: Union[List[IRFwOperation], IRSegment]) -> bool:
+    def recompute(self, nodes: Union[IRSegment, List[IRFwOperation]]) -> bool:
         """!
         Recompute a set of nodes. The forward nodes will be assigned with a unique
         recompute group id. A forward not can not be recomputed in different recompute groups.
@@ -701,25 +701,18 @@ class IRGraph(IRSegment):
 
         @return success boolean: always success
         """
-        assert all(isinstance(nodes, IRFwOperation)) or isinstance(nodes, IRSegment), \
+        assert all(isinstance(node, IRFwOperation) for node in nodes) or isinstance(nodes, IRSegment), \
             "Require forward nodes or a single segment"
 
-        recompute_group_id: int = IDGenerator().gen_cell_id()
-
         if isinstance(nodes, IRSegment):
-            assert nodes.forward, "Can only apply recompute on segment node"
-            for fnode in nodes.node():
-                fnode.recompute = recompute_group_id
+            assert nodes.isfw() and (not nodes.isbw()), "Only forward IRSegment can recompute"
+            return self.recompute(nodes.nodes())
+        
         else:
-            indices = [self.index(node) for node in nodes]
-            if all(idx[1] is None for idx in indices):
-                assert all(idx[0] == indices[0][0] for idx in indices), \
-                    f"Cross-stage recompute is not allowed yet."
-            elif all(idx[1] is not None for idx in indices):
-                assert all(idx[0] == indices[0][0] for idx in indices), \
-                    f"Cross-stage recompute is not allowed yet."
-            else:
-                assert False, f"Cross-stage recompute is not allowed yet."
+            segments = [self.segment(node) for node in nodes]
+            assert all(segment == segments[0] for segment in segments), \
+                "Cross-segment recompute is not allowed yet"
+            recompute_group_id: int = IDGenerator().gen_cell_id()
             for fnode in nodes:
                 fnode.recompute = recompute_group_id
     
