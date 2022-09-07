@@ -46,9 +46,9 @@ class MLP(nn.Module):
         self.layers = torch.nn.ModuleList([])
         for lid in range(nlayers):
             if lid % 2 == 0:
-                self.layers.append(nn.Linear(dim, dim * mult))
+                self.layers.append(nn.Linear(dim, dim * mult, bias=False))
             else:
-                self.layers.append(nn.Linear(dim * mult, dim))
+                self.layers.append(nn.Linear(dim * mult, dim, bias=False))
 
     def forward(self, data):
         x = data
