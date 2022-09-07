@@ -34,9 +34,9 @@ class Executor:
             for itensor in input_tensors:
                 if torch.is_tensor(itensor) and itensor.requires_grad:
                     if itensor not in Executor._detach[name]:
-                        Executor._detach[itensor] = itensor.detach().requires_grad_()
+                        Executor._detach[name][itensor] = itensor.detach().requires_grad_()
             input_tensors = tuple(
-                Executor._detach[t] if t in Executor._detach else t for t in input_tensors
+                Executor._detach[name][t] if t in Executor._detach[name] else t for t in input_tensors
             )
             # debug_id(input_tensors, 'inside fexecute args', 0)
             outputs = subgraph(*input_tensors)
@@ -86,7 +86,7 @@ class Executor:
         assert name in Executor._detach, f"forward graph: {name} not run before"
         input_tensors = [t for t in input_tensors if torch.is_tensor(t) and not isinstance(t, torch.nn.Parameter)]
         input_tensors = [t for t in input_tensors if t.requires_grad]
-        input_tensors = [Executor._detach[t] if t in Executor._detach else t for t in input_tensors]
+        input_tensors = [Executor._detach[name][t] if t in Executor._detach[name] else t for t in input_tensors]
         for t in input_tensors:
             t.retain_grad()
         torch.autograd.backward(
@@ -103,6 +103,11 @@ class Executor:
     @staticmethod
     def clear():
         Executor._detach = dict()
+
+    @staticmethod
+    def check_clear():
+        assert len(Executor._detach) == 0, \
+            f"Find remain not consumed sub-graph: {tuple(Executor._detach.keys())}"
 
 
 fexecute = Executor.fexecute

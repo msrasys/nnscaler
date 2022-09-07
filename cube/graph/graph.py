@@ -717,3 +717,41 @@ class IRGraph(IRSegment):
                 fnode.recompute = recompute_group_id
     
         return True
+
+    # =================== Helpers ====================
+
+    def auto_multiref(self):
+        """
+        Automatically partition and schedule multiref node.
+        This requires to call after all transformation and
+        scheduling.
+
+        The policy is to partition and assign multiref 
+        in the same way of its input producer
+        """
+        for node in self.nodes(flatten=True):
+            if node.name == 'multiref':
+                multirefs = []
+                segment: IRSegment = self.segment(node)
+                ftensor = node.input(0).parent
+                ptensors = segment.ptensors(ftensor)
+                for ptensor in ptensors:
+                    assert len(ptensor.device) > 0, \
+                        "Auto Multiref requires its producer nodes assigned to devices"
+                    for devid in ptensor.device:
+                        outputs = []
+                        for output in node.outputs():
+                            outputs.append(output.parent.select(ptensor.indmap, ptensor.valmap))
+                        multiref = MultiRef('', [ptensor, len(outputs)])
+                        for idx, otensor in enumerate(outputs):
+                            multiref.set_output(idx, otensor)
+                        multiref.device = devid
+                        multirefs.append(multiref)
+                fidx = self.remove(node)
+                if node.mirror is not None:
+                    self.remove(node.mirror)
+                for multiref in multirefs[::-1]:
+                    if node.mirror is not None:
+                        self.finsert(multiref, fidx)
+                    else:
+                        self.insert(multiref, fidx)
