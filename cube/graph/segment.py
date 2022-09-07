@@ -128,27 +128,30 @@ class IRSegment(IRCell):
     def reset_dependency(self):
         """
         Reset the node dataflow dependency
-
-        FIXME
-
+        
         Note all the predefined control dependencies will be removed.
+        TODO: adapter dependency is not set
         """
         for node in self._nodes:
             node.clear_predecessor()
             node.clear_successor()
         # TODO: adapter dependency not set
         for ftensor in self._ftensors:
-            for ptensor, producer in zip(ftensor.ptensors, ftensor.producers):
-                for ctensor, consumer in zip(ftensor.ctensors, ftensor.consumers):
+            for ptensor, producer in zip(self.ptensors(ftensor), self.producers(ftensor)):
+                for ctensor, consumer in zip(self.ctensors(ftensor), self.consumers(ftensor)):
                     if ptensor.overlap(ctensor):
                         pidx = producer.outputs().index(ptensor)
                         cidx = consumer.inputs().index(ctensor)
                         producer.add_successor(pidx, consumer)
                         consumer.add_predecessor(cidx, producer)
                 # set mirror as control dependency
-                if producer.mirror and isinstance(producer, IRFwOperation):
+                if producer.mirror is not None and isinstance(producer, IRFwOperation):
                     producer.add_successor(-1, producer.mirror)
                     producer.mirror.add_predecessor(-1, producer)
+        # sub segments
+        for segment in self._nodes:
+            if isinstance(segment, IRSegment):
+                segment.reset_dependency()
 
     # ========================= Basic Graph access =======================
 
