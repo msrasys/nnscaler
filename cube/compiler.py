@@ -5,14 +5,10 @@ import os
 
 import cube
 
-from cube.graph import parser
 from cube.graph.gener.gen import IRAdapterGener
 from cube.graph.graph import IRGraph
 from cube.ir.operator import IRDataOperation
 from cube.graph.function.anchor import IRGraphAnchor
-
-from cube.logics.pool import SchedulePool
-from cube.logics.translator import LogicTranslator
 
 from cube.execplan import ExecutionPlan
 from cube.execplan.planpass.fusion import DiffFusion
@@ -23,47 +19,7 @@ from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 from cube.profiler.timer import print_each_rank
 from cube.runtime.syndata import CubeDataLoader, SciLoopVariables
 
-
-class SemanticModel:
-
-    def __init__(self, model: torch.nn.Module, input_shapes):
-        """
-        Create semantic model based on AI Scientist description.
-        """
-        dist = torch.distributed.is_initialized()
-        if (not dist) or (dist and torch.distributed.get_rank() == 0):
-            self.ir_graph = parser.convert_model(
-                model, input_shapes=input_shapes
-            )
-        else:
-            self.ir_graph = None
-        self._loaded_module = None
-
-    def get_graph(self):
-        return self.ir_graph
-
-    def load_module(self, filename: str, load_content=True):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("GenModel", filename)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        self._loaded_module = module.GenModel().cuda()
-        if load_content:
-            print_each_rank("> loading parameter content...")
-            # TODO: make hardcode ./fullmodel.pt programmable
-            self._loaded_module.load_attr_content('./fullmodel.pt')
-
-    def get_gen_module(self):
-        return self._loaded_module
-
-    def clear_module(self):
-        self._loaded_module = None
-
-    def __call__(self, *args):
-        if self._loaded_module:
-            return self._loaded_module(*args)
-        else:
-            return self.ir_graph(*args)
+from cube.program import Program, SemanticDataLoader, SemanticModel
 
 
 def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
@@ -105,7 +61,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
         PAS = (PAS,)
 
     model_graph = model.get_graph()
-    ir_dataloader = parser.convert_dataloader(dataloader)
+    ir_dataloader = SemanticDataLoader(dataloader)
 
     if torch.distributed.is_initialized():
         # multiple device
@@ -142,17 +98,19 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
             compile_start = time.time()
 
-            SchedulePool().clear()
             resource = cube.runtime.resource.EnvResource()
 
-            # logic translator
+            # run once to get model structure and tensor shape
             outputs = fn(model_graph, ir_dataloader)
             if outputs is None:
                 outputs = []
             elif not (isinstance(outputs, tuple) or isinstance(outputs, list)):
                 outputs = [outputs]
-            graph = LogicTranslator.gen_logic_graph(outputs=outputs)
+            # setup program output
+            Program().set_output(outputs)
 
+            # run policy
+            graph = Program().get_graph()
             if len(PAS) == 1:
                 graph = PAS[0](graph, resource)
             elif len(PAS) == 3:
@@ -167,12 +125,15 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             # check assignment and remove anchor node
             for node in graph.nodes():
                 if isinstance(node, IRGraphAnchor) or isinstance(node.mirror, IRGraphAnchor):
-                    graph.detach(node)
-                elif len(node.device) == 0:
+                    continue
+                if len(node.device) == 0:
                     raise RuntimeError(f"Node {node} device is not set")
 
             # generate adapter
+            start = time.time()
             graph = IRAdapterGener.gen(graph)
+            span = time.time() - start
+            print('> finish generating adapters: {:.2f} s'.format(span))
 
             if graph.sched is not None:
                 start = time.time()
@@ -189,6 +150,8 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             execplan = DiffFusion.apply(execplan)
             span = time.time() - start
             print('> planpass on diff-fusion operations: {:.2f} s'.format(span))
+
+            # execplan.visualize(outfile='plan.png')
 
             # plan pass for computation grouping
             if not graph.sched:

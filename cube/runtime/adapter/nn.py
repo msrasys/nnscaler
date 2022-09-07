@@ -2,7 +2,6 @@ from typing import List, Tuple
 import torch
 
 from cube.profiler.timer import CudaTimer
-from cube.runtime.adapter.collectives import all_reduce
 from cube.runtime.device import DeviceGroup
 
 

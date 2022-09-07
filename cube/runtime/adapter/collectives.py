@@ -99,7 +99,7 @@ def all_reduce(itensor: torch.Tensor,
     CudaTimer().start(field_name='comm')
     if not itensor.is_contiguous():
         itensor = itensor.contiguous()
-    itensor = itensor.detach().requires_grad_()
+    itensor = itensor.detach()
     group = DeviceGroup().get_group(ranks)
     torch.distributed.all_reduce(itensor, group=group)
     torch.cuda.synchronize()
@@ -120,7 +120,7 @@ def all_gather(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tens
     torch.distributed.all_gather(tensor_list, itensor, group=group)
     torch.cuda.synchronize()
     # concat
-    otensor = torch.concat(tuple(tensor_list), dim=dim).requires_grad_()
+    otensor = torch.concat(tuple(tensor_list), dim=dim)
     CudaTimer().stop(field_name='comm')
     return otensor
 
@@ -135,7 +135,7 @@ def reduce_scatter(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.
         if not tensor.is_contiguous():
             itensors[idx] = tensor.contiguous()
     group = DeviceGroup().get_group(ranks)
-    otensor = torch.empty_like(itensors[0], requires_grad=True)
+    otensor = torch.empty_like(itensors[0], requires_grad=False)
     torch.distributed.reduce_scatter(otensor, itensors, group=group)
     torch.cuda.synchronize()
     CudaTimer().stop(field_name='comm')
@@ -155,7 +155,7 @@ def all_to_all(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -
     group = DeviceGroup().get_group(ranks)
     torch.distributed.all_to_all(otensors, itensors, group=group)
     torch.cuda.synchronize()
-    otensor = torch.concat(tuple(otensors), dim=idim).requires_grad_()
+    otensor = torch.concat(tuple(otensors), dim=idim)
     CudaTimer().stop(field_name='comm')
     return otensor
 

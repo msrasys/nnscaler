@@ -477,6 +477,8 @@ class IRTensor:
         if not isinstance(val, IRDType):
             raise TypeError(f"Expected IRDType but got {val}")
         self._dtype = val
+        if isinstance(self._grad, IRTensor):
+            self._dtype = val
 
     @property
     def cell(self) -> Optional[IRCell]:
@@ -605,12 +607,14 @@ class IRTensor:
             cnt *= num
         return cnt
 
-    def backward(self):
+    def backward(self) -> IRCell:
         """
         Autograd backward on the tensor
+
+        @return graph IRGraph: the forward + backward graph
         """
-        from cube.logics.translator import LogicTranslator
-        return LogicTranslator.backward(self)
+        return self.cell.backward(self)
+        
 
     def __repr__(self):
         dscp = f'Tensor(id={self._id}, shape={self.shape}, device={self.device})'

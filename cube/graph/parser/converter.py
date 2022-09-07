@@ -3,7 +3,6 @@ from typing import Optional, List
 from cube.ir.tensor import IRFullTensor
 from cube.graph.parser import ScriptModuleParser
 from cube.graph import IRGraph
-from cube.logics.dataloader import IRDataLoader
 
 import torch
 
@@ -25,11 +24,3 @@ def convert_model(model: torch.nn.Module,
     graph = IRGraph.from_logic_graph(nodes, inputs, outputs, module_name)
     return graph
 
-
-def convert_dataloader(dataloader) -> IRDataLoader:
-    """
-    convert pytorch dataloader into IRDataLoader
-    """
-    from cube.graph.parser.mapping import DType2IRDType
-    dataloader = IRDataLoader(dataloader, dtype_map=DType2IRDType)
-    return dataloader
