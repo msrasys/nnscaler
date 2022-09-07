@@ -81,6 +81,8 @@ class IRAdapterGener:
         graph = IRAdapterGener.gen_activation(graph)
         # generate weight reducer
         graph = IRAdapterGener.gen_weight(graph)
+        # fuse consecutive non-differentiable adapters into one
+        graph = IRAdapterGener.fusion(graph)
         # print(graph.extra_repr())
         return graph
 
@@ -444,3 +446,35 @@ class IRAdapterGener:
         if isinstance(ftensor.grad, IRFullTensor):
             graph.update_ftensor_bw(ftensor)
 
+    @staticmethod
+    def fusion(graph: IRSegment) -> IRSegment:
+        """
+        Fuse consecutive adapters into one
+        """
+        fadapters, badapters = [], []
+        for adapter in graph.nodes():
+            if isinstance(adapter, IRAdapter) and adapter.forward and not adapter.differentiable:
+                fadapters.append(adapter)
+                if adapter.mirror is not None:
+                    badapters.insert(0, adapter.mirror)
+            else:
+                if len(fadapters) > 1:
+                    # insert fused fadapter
+                    fused_fadapter = IRAdapter.merge(fadapters)
+                    for adapter in fadapters:
+                        idx = graph.remove(adapter)
+                    graph.insert(fused_fadapter, idx)
+                    # insert fused badapter
+                    fused_badapter = IRAdapter.merge(badapters) if len(badapters) > 0 else None
+                    for adapter in badapters:
+                        idx = graph.remove(adapter)
+                    if fused_badapter is not None:
+                        graph.insert(fused_badapter, idx)
+                    IRCell.make_pair(fused_fadapter, fused_badapter)
+                fadapters, badapters = [], []
+
+        for segment in graph.nodes():
+            if isinstance(segment, IRSegment) and segment.isfw():
+                IRAdapterGener.fusion(segment)
+
+        return graph

@@ -6,11 +6,13 @@ from typing import List, Dict, Tuple
 from cube.execplan import ExecutionPlan
 from cube.execplan.planpass.planpass import PlanPass
 from cube.ir.adapter import IRAdapter
+from cube.ir.adapter.prim import IdentityPrim
 from cube.ir.operator import IRFwOperation
 from cube.ir.cten import IRCell
         
 
 class Grouping(PlanPass):
+
     @staticmethod
     def apply(execplan: ExecutionPlan) -> ExecutionPlan:
         """
@@ -32,6 +34,11 @@ class Grouping(PlanPass):
                     execplan.at(devid).insert(idx, subgraph)
                     for node in pieces:
                         execplan.at(devid).remove(node)
+            # remove identity adapter
+            for adapter in execplan.seq(devid):
+                if isinstance(adapter, IRAdapter):
+                    if all(isinstance(prim, IdentityPrim) for prim in adapter.prims):
+                        execplan.at(devid).remove(adapter)
         return execplan
 
     @staticmethod

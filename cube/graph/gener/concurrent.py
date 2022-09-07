@@ -134,8 +134,6 @@ class ConcurrentGener:
                     bptensors: List[IRSubTensor], bctensors: List[IRSubTensor]) -> IRAdapter:
         """
         A general way to generate adapter.
-        FIXME: Assuming consumers at different devices can happen at the same time.
-               This will block the pipeline parallelism description.
         
         @param ftensor IRFullTensor
         @return adapter IRAdapter
