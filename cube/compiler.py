@@ -100,14 +100,17 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
             resource = cube.runtime.resource.EnvResource()
 
-            # logic translator
+            # run once to get model structure and tensor shape
             outputs = fn(model_graph, ir_dataloader)
             if outputs is None:
                 outputs = []
             elif not (isinstance(outputs, tuple) or isinstance(outputs, list)):
                 outputs = [outputs]
-            graph = Program().get_graph()
+            # setup program output
+            Program().set_output(outputs)
 
+            # run policy
+            graph = Program().get_graph()
             if len(PAS) == 1:
                 graph = PAS[0](graph, resource)
             elif len(PAS) == 3:
@@ -127,7 +130,10 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                     raise RuntimeError(f"Node {node} device is not set")
 
             # generate adapter
+            start = time.time()
             graph = IRAdapterGener.gen(graph)
+            span = time.time() - start
+            print('> finish generating adapters: {:.2f} s'.format(span))
 
             if graph.sched is not None:
                 start = time.time()
@@ -144,6 +150,8 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             execplan = DiffFusion.apply(execplan)
             span = time.time() - start
             print('> planpass on diff-fusion operations: {:.2f} s'.format(span))
+
+            # execplan.visualize(outfile='plan.png')
 
             # plan pass for computation grouping
             if not graph.sched:

@@ -8,7 +8,7 @@ from cube.graph.gener.concurrent import ConcurrentGener
 from cube.graph.graph import IRGraph
 from cube.graph.segment import IRSegment
 from cube.ir.cten import IRCell
-from cube.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
+from cube.ir.tensor import IRFullTensor, IRSubTensor
 
 from cube.ir.operator import IRBpOperation, IRFwOperation
 
@@ -30,6 +30,21 @@ def to_device(tensor: IRSubTensor, device: int) -> IRFwOperation:
     return otensor
 
 
+class DummyInputOuput(IRFwOperation):
+
+    def __init__(self, tensor: IRSubTensor, device: int, is_input=False, is_output=False):
+        super().__init__('dummy', '',
+            1 if is_input else 0,
+            1 if is_output else 0
+        )
+        assert (is_input and not is_output) or (is_output and not is_input)
+        if is_input:
+            self.set_input(0, tensor)
+        if is_output:
+            self.set_output(0, tensor)
+        self.device = device
+
+
 def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
     """
     Create dummy operators that 
@@ -45,19 +60,15 @@ def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
     for devid in devices:
         for tensor in segment.inputs():
             if not isinstance(tensor, IRSubTensor): continue
-            assert tensor.valmap == ValueMap((0, 1))
-            fwop = IRFwOperation('segment input', '', 0, 1)
-            fwop.set_output(0, tensor)
-            fwop.device = devid
+            assert tensor.valmap == (0, 1)
+            fwop = DummyInputOuput(tensor, devid, is_output=True)
             segment.insert(fwop, 0)
             fwops.append(fwop)
         for tensor in segment.outputs():
             if not isinstance(tensor, IRSubTensor): continue
-            assert tensor.valmap == ValueMap((0, 1))
-            fwop = IRFwOperation('segment output', '', 1, 0)
-            fwop.set_intput(0, tensor)
-            fwop.device = devid
-            segment.insert(fwop, -1)
+            assert tensor.valmap == (0, 1)
+            fwop = DummyInputOuput(tensor, devid, is_input=True)
+            segment.insert(fwop, segment.nnodes)
             fwops.append(fwop)
     return fwops
 
@@ -166,6 +177,7 @@ class IRAdapterGener:
         bgraph: Optional[IRSegment] = graph.mirror
         bdummies = create_dummy(bgraph) if isinstance(bgraph, IRSegment) else []
 
+        skip_grads = [t.parent for t in graph.inputs() + graph.outputs() if isinstance(t, IRSubTensor)]
         # generate adapter for inter-segments
         # FIXME: assume producers and consumers can run in parallel
         for ftensor in graph.full_tensors():
@@ -188,7 +200,7 @@ class IRAdapterGener:
 
             bproducers, bptensors = [], []
             bconsumers, bctensors = [], []
-            if isinstance(ftensor.grad, IRFullTensor):
+            if (ftensor not in skip_grads) and isinstance(ftensor.grad, IRFullTensor):
                 bproducers, bptensors = graph.producers(ftensor.grad), graph.ptensors(ftensor.grad)
                 assert all(len(ptensor.device) == 1 for ptensor in bptensors), (
                     f"Not support for multi-device:\n"
@@ -443,7 +455,7 @@ class IRAdapterGener:
                     graph.insert(multiref, min_fidx)
                 multirefs[multiref] = consumers
         
-        if isinstance(ftensor.grad, IRFullTensor):
+        if len(multirefs) > 0 and isinstance(ftensor.grad, IRFullTensor):
             graph.update_ftensor_bw(ftensor)
 
     @staticmethod

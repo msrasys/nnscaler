@@ -2,8 +2,8 @@ from typing import List, Tuple
 from cube.graph.torch_dtype_mapping import DType2IRDType
 
 from cube.ir.cten import IRCell, IRTensor
-from cube.ir.tensor import IRFullTensor
-from cube.ir.operator import IRDataOperation
+from cube.ir.tensor import IRFullTensor, IRSubTensor
+from cube.ir.operator import IRBpOperation, IRDataOperation
 
 from cube.graph import IRGraph
 from cube.graph import parser
@@ -39,7 +39,26 @@ class Program:
             self.add_node(node)
 
     def get_graph(self):
+        has_bp = any(isinstance(node, IRBpOperation) for node in self.instance._graph.nodes())
+        if not has_bp:
+            for ftensor in self.instance._graph.full_tensors():
+                ftensor.requires_grad = False
+            for node in self.instance._graph.nodes(flatten=True):
+                for itensor in node.inputs():
+                    if isinstance(itensor, IRSubTensor):
+                        itensor.grad = None
+                for otensor in node.outputs():
+                    if isinstance(otensor, IRSubTensor):
+                        otensor.grad = None
         return self.instance._graph
+
+    def set_output(self, outputs: List[IRTensor]):
+        for otensor in outputs:
+            if not isinstance(otensor, IRTensor):
+                raise NotImplementedError("Not support for non-tensor graph output")
+        self.instance._graph.reset_outputs(len(outputs))
+        for idx, otensor in enumerate(outputs):
+            self.instance._graph.set_output(idx, otensor)
 
     def mirror_as_self(self):
         """
