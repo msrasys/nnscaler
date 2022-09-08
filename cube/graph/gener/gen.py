@@ -201,13 +201,13 @@ class IRAdapterGener:
             bproducers, bptensors = [], []
             bconsumers, bctensors = [], []
             if (ftensor not in skip_grads) and isinstance(ftensor.grad, IRFullTensor):
-                bproducers, bptensors = graph.producers(ftensor.grad), graph.ptensors(ftensor.grad)
+                bproducers, bptensors = bgraph.producers(ftensor.grad), bgraph.ptensors(ftensor.grad)
                 assert all(len(ptensor.device) == 1 for ptensor in bptensors), (
                     f"Not support for multi-device:\n"
                     f"{[ptensor.device for ptensor in bptensors]}"
                     f"{[ptensor.cell for ptensor in bptensors]}"
                 )
-                bconsumers, bctensors = graph.consumers(ftensor.grad), graph.ctensors(ftensor.grad)    
+                bconsumers, bctensors = bgraph.consumers(ftensor.grad), bgraph.ctensors(ftensor.grad)    
                 assert all(len(ctensor.device) == 1 for ctensor in bctensors), "Not support for multi-device"
 
             if skip(fptensors, fctensors) and skip(bptensors, bctensors):
@@ -216,6 +216,17 @@ class IRAdapterGener:
             fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors)
             if fadapter is None:
                 continue
+
+            if not isinstance(graph, IRGraph):
+                if not fadapter.differentiable:
+                    raise NotImplementedError(
+                        "Require adapter to be differentiable for nested IRAdapter."
+                        "Condition to be differentiable: prodcuers have same device set with consumers"
+                        f"Failed FullTensor: {ftensor}"
+                        f"{graph.debug_tensor_map_str(ftensor)}"
+                        f"Failed FullTensor.grad: {ftensor.grad}"
+                        f"{bgraph.debug_tensor_map_str(ftensor.grad) if ftensor.grad is not None else None}"
+                    )
 
             badapter: Optional[IRAdapter] = fadapter.mirror
 

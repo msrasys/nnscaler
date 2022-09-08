@@ -1,5 +1,5 @@
 
-from typing import Dict, Tuple, Optional
+from typing import Dict, Optional, List
 
 from cube.ir.cten import IRCell
 from cube.ir.adapter.adapter import IRAdapter
@@ -19,11 +19,11 @@ class IRSchedule1F1B(IRScheduleStrategy):
     [Recv-Backward] Backward-Segment [Send-Backward]
     """
 
-    def __init__(self, graph, nmicros: int, devmesh: Tuple[Tuple[int]]):
-        super().__init__(graph, nmicros, devmesh)
+    def __init__(self, graph, nmicros: int):
+        super().__init__(graph, nmicros)
         self.signature = 'cube.runtime.schedule.Schedule1F1B.run'
         # forward body
-        self.segment: Dict[int, IRSegment] = dict()
+        self.fsegments: Dict[int, IRSegment] = dict()
         # forward send
         self.sfadapter: Dict[int, Optional[IRAdapter]] = dict()
         # forward recv
@@ -33,29 +33,48 @@ class IRSchedule1F1B(IRScheduleStrategy):
         # backward recv
         self.rbadapter: Dict[int, Optional[IRAdapter]] = dict()
         # num_stage
-        self.num_stages: int = len(devmesh)
+        self.num_stages: int = -1
         # stage id
         self.stage_id: Dict[int, int] = dict()
         # recompute
         self.recompute = False
 
+
     def apply(self) -> IRGraph:
-        self.segmentation()
-        for gid, devices in enumerate(self.devmesh):
-            for devid in devices:
-                # forward recv
-                self.rfadapter[devid] = None if gid == 0 else self.cross_groups[gid-1]
+        self.mesh()
+        # each forward has corresponding backward
+        assert all(fseg.mirror in self.segments for fseg in self.segments if fseg.isfw()), \
+            "Require backward of each forward stage"
+        # stage doesn't share devices
+        fsegments: List[IRSegment] = [fseg for fseg in self.segments if fseg.isfw()]
+        self.num_stages = len(fsegments)
+        for sid, fseg in enumerate(fsegments):
+            for devid in fseg.device:
                 # forward body
-                self.segment[devid] = self.inner_groups[gid]
-                # forward send
-                if gid == len(self.devmesh)-1: assert self.cross_groups[gid] is None
-                self.sfadapter[devid] = self.cross_groups[gid]
-                # backward recv
-                self.rbadapter[devid] = None if gid == len(self.devmesh)-1 else self.sfadapter[devid].mirror 
-                # backward send
-                self.sbadapter[devid] = None if gid == 0 else self.rfadapter[devid].mirror
+                assert devid not in self.fsegments, "One device cannot have multiple forward stages"
+                self.fsegments[devid] = fseg
+                # forward recv / backward send
+                assert len(self.recvers[fseg]) <= 1, "Corss-stage adapter can only be one"
+                if sid == 0:
+                    assert len(self.recvers[fseg]) == 0, "Expect no forward send at first stage"
+                    assert len(self.senders[fseg.mirror]) == 0, "Expect no backward send at first stage"
+                else:
+                    assert len(self.recvers[fseg]) == 1, "Expect one forward recv at non-first stage"
+                    assert len(self.senders[fseg.mirror]) == 1, "Expect one backward send at non-first stage"
+                self.rfadapter[devid] = None if sid == 0 else self.recvers[fseg][0]
+                self.sbadapter[devid] = None if sid == 0 else self.senders[fseg.mirror][0]
+                # forward send / backward recv
+                if sid == self.num_stages - 1:
+                    assert len(self.senders[fseg]) == 0, "Expect no forward send at last stage"
+                    assert len(self.recvers[fseg.mirror]) == 0, "Expect no backward recv at last stage"
+                else:
+                    assert len(self.senders[fseg]) == 1, "Expect no forward send at last stage"
+                    assert len(self.recvers[fseg.mirror]) == 1, "Expect no forward send at last stage"
+                self.sfadapter[devid] = None if sid == self.num_stages - 1 else self.senders[fseg][0]
+                self.rbadapter[devid] = None if sid == self.num_stages - 1 else self.recvers[fseg.mirror][0]
                 # stage id
-                self.stage_id[devid] = gid
+                self.stage_id[devid] = sid
+
         return self.graph
 
     def kwargs(self, devid: int) -> Dict[str, IRCell]:
@@ -63,7 +82,7 @@ class IRSchedule1F1B(IRScheduleStrategy):
         return kwargs for runtime caller
         """
         return dict(
-            segment = self.segment[devid],
+            segment = self.fsegments[devid],
             sfadapter = self.sfadapter[devid],
             rfadapter = self.rfadapter[devid],
             sbadapter = self.sbadapter[devid],
