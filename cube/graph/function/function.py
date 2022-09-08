@@ -853,7 +853,19 @@ def Embedding(signature, inputs: List):
     ]
     oshapes = [ishapes[0] + [ishapes[1][-1]]]
     anno = OpAnno.create_op_str(ishapes, oshapes)
-    return IRDimops(signature, [anno], [itensor, weight], 'embedding', padding_idx=padding_idx, start=start, stop=stop)
+
+    def embed_modifer(kwargs: Dict, idx, dim, num):
+        import warnings
+        warnings.warn('FIXME: The semantic is error when split embedding, but the computation cost is same.')
+        kwargs = dict(**kwargs)
+        kwargs['stop'] = kwargs['stop'] // num
+        return kwargs
+    rules = [TransformRule(
+        [DimopSplit.R(), DimopSplit.D(0)], [DimopSplit.V()], embed_modifer
+    )]
+
+    return IRDimops(signature, [anno], [itensor, weight], 'embedding', rules,
+                    padding_idx=padding_idx, start=start, stop=stop)
 
 
 def Flatten(signature, inputs: List):
