@@ -25,24 +25,30 @@ class DiffFusion(PlanPass):
         cnt = 0
         for devid in execplan.devices():
             for node in execplan.seq(devid):
-                if isinstance(node, IRAdapter):
-                    if node.forward:
-                        ret = DiffFusion.nnfuse(node)
-                        cnt = cnt+1 if ret else cnt
-                if isinstance(node, IRSegment) and node.isfw():
-                    for fnode in node.nodes():
-                        if isinstance(fnode, IRAdapter):
-                            if node.forward:
-                                ret = DiffFusion.nnfuse(fnode)
-                                if not ret:
-                                    raise NotImplementedError(
-                                        f"adapter within IRSegment cannot fuse to differientiable adapter"
-                                        f"\nforward: {fnode.extra_repr()}"
-                                        f"\nbackward: {fnode.mirror.extra_repr()}"
-                                    )
-                                cnt = cnt + 1
+                if isinstance(node, IRAdapter) and node.forward:
+                    ret = DiffFusion.nnfuse(node)
+                    cnt = cnt+1 if ret else cnt
+                elif isinstance(node, IRSegment) and node.isfw():
+                    cnt += DiffFusion._apply(node)
         print(f'successfully generate {cnt} differentiable adapters')
         return execplan
+
+    @staticmethod
+    def _apply(segment: IRSegment) -> int:
+        cnt = 0
+        for node in segment.nodes():
+            if isinstance(node, IRAdapter) and node.forward:
+                ret = DiffFusion.nnfuse(node)
+                if not ret and not node.differentiable:
+                    raise NotImplementedError(
+                        f"Adapter within IRSegment cannot fuse to differientiable adapter"
+                        f"\nforward: {node.extra_repr()}"
+                        f"\nbackward: {node.mirror.extra_repr()}"
+                    )
+                cnt = cnt + 1
+            elif isinstance(node, IRSegment) and node.isfw():
+                cnt += DiffFusion._apply(node)
+        return cnt
 
     @staticmethod
     def nnfuse(fadapter: IRAdapter) -> bool:

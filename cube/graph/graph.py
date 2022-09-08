@@ -174,9 +174,6 @@ class IRGraph(IRSegment):
                 f"Internal Error: backward nodes are not consecutive. maxbidx: {maxbidx}, minbidx: {minbidx}"
 
         fsegment = fgraph.create_segment(fnodes)
-        bsegment = bgraph.create_segment(bnodes) if len(bnodes) > 0 else None
-        IRCell.make_pair(fsegment, bsegment)
-
         # replace forward
         for fnode in fnodes:
             fidx = fgraph.remove(fnode)
@@ -184,6 +181,7 @@ class IRGraph(IRSegment):
 
         # replace backward
         if len(bnodes) > 0:
+            bsegment = fgraph.create_bwop(fsegment) if len(bnodes) > 0 else None
             for bnode in bnodes:
                 bidx = bgraph.remove(bnode)
             bgraph.insert(bsegment, bidx)

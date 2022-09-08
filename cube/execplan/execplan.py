@@ -43,6 +43,7 @@ class ExecutionPlan:
                     bidx = self.at(devid).index(fnode.mirror)
                     nodes.remove(fnode.mirror)
                     self.at(devid)[bidx] = fnode_dev.mirror
+                    assert fnode_dev.mirror is not None, f"Find None:\n{fnode_dev}"
 
     @property
     def graph(self) -> IRGraph:

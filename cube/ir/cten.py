@@ -506,7 +506,7 @@ class IRTensor:
         """!
         Check if the tensor is graph attribute.
 
-        @return is_attr boolean: True if is graph attribute (buffer or parameter)
+        @return is_attr boolean: True if is graph attribute (buffer or parameter or gradient of parameter)
         """
         return self._is_attr
 

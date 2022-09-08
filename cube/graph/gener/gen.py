@@ -1,39 +1,25 @@
 import itertools
 from typing import Dict, List, Optional, Tuple
-import copy
 
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.gener.concurrent import ConcurrentGener
-
 from cube.graph.graph import IRGraph
 from cube.graph.segment import IRSegment
+
 from cube.ir.cten import IRCell
 from cube.ir.tensor import IRFullTensor, IRSubTensor
-
-from cube.ir.operator import IRBpOperation, IRFwOperation
+from cube.ir.operator import IRFwOperation
 
 from cube.ir.adapter import IRAdapter, IRWeightReducer
 from cube.graph.function.function import Add, Cat, Identity, MultiRef
 
 
-def to_device(tensor: IRSubTensor, device: int) -> IRFwOperation:
-    """
-    This is used for changing tensor device
-    """
-    fwop = IRFwOperation('dummy', 'dummpy', 1, 0)
-    fwop.set_input(0, tensor)
-    fwop.device = device
-    otensor = fwop.input(0)
-    otensor.grad = copy.copy(tensor.grad)
-    if isinstance(otensor.grad, IRSubTensor):
-        otensor.grad.cell = fwop
-    return otensor
-
-
 class DummyInputOuput(IRFwOperation):
 
-    def __init__(self, tensor: IRSubTensor, device: int, is_input=False, is_output=False):
-        super().__init__('dummy', '',
+    def __init__(self, tensor: IRSubTensor, device: int, 
+                 is_input=False, is_output=False,
+                 name='dummy'):
+        super().__init__(name, name,
             1 if is_input else 0,
             1 if is_output else 0
         )
@@ -60,17 +46,46 @@ def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
     for devid in devices:
         for tensor in segment.inputs():
             if not isinstance(tensor, IRSubTensor): continue
-            assert tensor.valmap == (0, 1)
+            assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
             fwop = DummyInputOuput(tensor, devid, is_output=True)
             segment.insert(fwop, 0)
             fwops.append(fwop)
         for tensor in segment.outputs():
             if not isinstance(tensor, IRSubTensor): continue
-            assert tensor.valmap == (0, 1)
+            assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
             fwop = DummyInputOuput(tensor, devid, is_input=True)
             segment.insert(fwop, segment.nnodes)
             fwops.append(fwop)
     return fwops
+
+
+def expand_devices(tensors: List[IRSubTensor], 
+                   producer: bool = False, consumer: bool = False) -> List[IRSubTensor]:
+    """
+    Scatter a tensor if it is on multiple devices. It produces a tensor list where
+    each tensor is attached to one device, with tensor itself is replicated.
+
+    @param tensors List[IRSubTensor]: each tensor can be on multiple devices.
+    @param producer bool: if the tensor is producer role
+    @param consumer bool: if the tensor is consumer role
+
+    @return dtensors List[IRSubTensor]: each tensor is on one device
+    """
+    dtensors = []
+    for tensor in tensors:
+        if len(tensor.device) == 1:
+            dtensors.append(tensor)
+            continue
+        for devid in tensor.device:
+            if producer:
+                fwop = DummyInputOuput(tensor, devid, is_output=True, name=tensor.cell.name)
+                dtensors.append(fwop.output(0))
+            elif consumer:
+                fwop = DummyInputOuput(tensor, devid, is_input=True, name=tensor.cell.name)
+                dtensors.append(fwop.input(0))
+            else:
+                raise ValueError("At least one of producer or consumer")
+    return dtensors
 
 
 class IRAdapterGener:
@@ -194,20 +209,24 @@ class IRAdapterGener:
 
             # producers can be operators and graph inputs
             fproducers, fptensors = graph.producers(ftensor), graph.ptensors(ftensor)
+            fptensors = expand_devices(fptensors, producer=True)
             assert all(len(ptensor.device) == 1 for ptensor in fptensors), "Not support for multi-device"
             fconsumers, fctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
+            fctensors = expand_devices(fctensors, consumer=True)
             assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
 
             bproducers, bptensors = [], []
             bconsumers, bctensors = [], []
             if (ftensor not in skip_grads) and isinstance(ftensor.grad, IRFullTensor):
                 bproducers, bptensors = bgraph.producers(ftensor.grad), bgraph.ptensors(ftensor.grad)
+                bptensors = expand_devices(bptensors, producer=True)
                 assert all(len(ptensor.device) == 1 for ptensor in bptensors), (
                     f"Not support for multi-device:\n"
                     f"{[ptensor.device for ptensor in bptensors]}"
                     f"{[ptensor.cell for ptensor in bptensors]}"
                 )
                 bconsumers, bctensors = bgraph.consumers(ftensor.grad), bgraph.ctensors(ftensor.grad)    
+                bctensors = expand_devices(bctensors, consumer=True)
                 assert all(len(ctensor.device) == 1 for ctensor in bctensors), "Not support for multi-device"
 
             if skip(fptensors, fctensors) and skip(bptensors, bctensors):
@@ -292,15 +311,14 @@ class IRAdapterGener:
         tensor_map: Dict[int, Dict[IRSubTensor, IRSubTensor]] = dict()
 
         for tensor in graph.ptensors(ftensor):
-            assert len(tensor.device) == 1
-            devid = tensor.device[0]
-            if devid not in devtensors:
-                devtensors[devid] = []
-                fuse_tensors[devid] = dict()
-                tensor_map[devid] = dict()
-            devtensors[devid].append(tensor)
-            fuse_tensors[devid][tensor] = [tensor]
-            tensor_map[devid][tensor] = tensor
+            for devid in tensor.device:
+                if devid not in devtensors:
+                    devtensors[devid] = []
+                    fuse_tensors[devid] = dict()
+                    tensor_map[devid] = dict()
+                devtensors[devid].append(tensor)
+                fuse_tensors[devid][tensor] = [tensor]
+                tensor_map[devid][tensor] = tensor
 
         nodes: List[IRFwOperation] = []
         for devid, tensors in devtensors.items():
@@ -417,13 +435,12 @@ class IRAdapterGener:
         # collect to consumer tensors of each device
         devtensors: Dict[int, Dict[IRSubTensor, List[IRCell]]] = dict()
         for ctensor, consumer in zip(graph.ctensors(ftensor), graph.consumers(ftensor)):
-            assert len(ctensor.device) == 1
-            devid = ctensor.device[0]
-            if devid not in devtensors:
-                devtensors[devid] = dict()
-            if ctensor not in devtensors[devid]:
-                devtensors[devid][ctensor] = []
-            devtensors[devid][ctensor].append(consumer)
+            for devid in ctensor.device:
+                if devid not in devtensors:
+                    devtensors[devid] = dict()
+                if ctensor not in devtensors[devid]:
+                    devtensors[devid][ctensor] = []
+                devtensors[devid][ctensor].append(consumer)
         
         # restrict each device has same subtensor
         nl = '\n'

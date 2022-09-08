@@ -16,6 +16,12 @@ FwOperation -> BpOperation rule:
 2). for (FwOp) output tensors, gradient SubTensor is:
     indmap = output.indmap;
     val is always (0/1)
+
+Tensor can be graph attributes. In deep learning, these graph attribute tensors
+can be 
+    1) parameters (require gradient),
+    2) buffers (not require gradient)
+    3) gradient of parameters
 """
 
 from typing import List, Optional, Union, Tuple, NewType, Dict
@@ -289,11 +295,14 @@ class IRFullTensor(IRTensor):
         """
         int indicates the tensor is the loss tensor.
         """
-        assert isinstance(val, (IRFullTensor, float)) or val is None, f"grad can only be IRFullTensor or None, but got {val}"
+        if self._requires_grad:
+            assert isinstance(val, (IRFullTensor, float))
+            if isinstance(val, IRFullTensor):
+                assert val.shape == self.shape
+                assert val.is_attr() == self.is_attr()
+        else:
+            assert val is None
         self._grad = val
-        self._requires_grad = False if val is None else True
-        if isinstance(val, IRFullTensor):
-            assert val.shape == self.shape, f"IRFullTensor gradient shape mismatch."
 
     @property
     def requires_grad(self):
@@ -303,9 +312,13 @@ class IRFullTensor(IRTensor):
     def requires_grad(self, val: bool):
         self._requires_grad = val
         if val and self.grad is None:
-            self.grad = IRFullTensor(self.shape, 'g' + self.name, False, dtype=self.dtype).as_grad()
+            grad = IRFullTensor(
+                self.shape, 'g' + self.name, 
+                requires_grad=False, dtype=self.dtype
+            ).as_grad(self.is_attr())
+            self._grad = grad
         elif not val and self.grad is not None:
-            self.grad = None
+            self._grad = None
 
     @property
     def dtype(self) -> IRDType:
@@ -333,6 +346,8 @@ class IRFullTensor(IRTensor):
         self.requires_grad = True
         self._is_attr = True
         self._is_grad = False
+        if isinstance(self.grad, IRFullTensor):
+            self.grad._is_attr = True
 
     def as_buffer(self):
         """
@@ -342,9 +357,9 @@ class IRFullTensor(IRTensor):
         self._is_attr = True
         self._is_grad = False
 
-    def as_grad(self):
+    def as_grad(self, of_attr: bool = False):
+        self._attr = True if of_attr else False
         self.requires_grad = False
-        self._is_attr = False
         self._is_grad = True
         return self
 
