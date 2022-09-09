@@ -555,9 +555,11 @@ class IRDimops(IRFwOperation):
     """
     Einstein-inspired notation operations
     """
-    def __init__(self, signature: str, annos: Tuple[str],
-                 inputs: List[IRTensor], name: str,
-                 transform_rules: Optional[Tuple[TransformRule]] = None, **kwargs):
+    def __init__(self, create_fn: Callable, name: str,
+                 signature: str, annos: Tuple[str],
+                 inputs: List[IRTensor],
+                 transform_rules: Optional[Tuple[TransformRule]] = None,
+                 **kwargs):
         """!
         Create a IRDimops
 
@@ -574,6 +576,7 @@ class IRDimops(IRFwOperation):
         self._iannos: List[ShapeAnno] = None
         self._oannos: List[ShapeAnno] = None
         self._trans_rules: Tuple[TransformRule] = tuple(transform_rules) if transform_rules is not None else ()
+        self._create_fn: Tuple[Callable] = (create_fn,)
 
         for anno in self._annos_candidates:
             anno = OpAnno(anno)
@@ -666,9 +669,11 @@ class IRDimops(IRFwOperation):
 
         @return op IRDimop: the new constructed operator
         """
-        annos = self._annos_candidates
-        rules = self._trans_rules
-        op = IRDimops(self.signature, annos, inputs, self.name, rules, **kwargs)
+        inputs = inputs + [kwargs[key] for key in kwargs.keys()]
+        op = self._create_fn[0](self.signature, inputs)
+        # annos = self._annos_candidates
+        # rules = self._trans_rules
+        # op = IRDimops(self.signature, annos, inputs, self.name, rules, **kwargs)
         for idx, output in enumerate(outputs):
             op.set_output(idx, output)
         return op
