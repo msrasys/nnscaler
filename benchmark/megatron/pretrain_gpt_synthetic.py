@@ -91,7 +91,7 @@ def forward_step(data_iterator, model):
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
-    return None, None, None
+    return [1]*10000, None, None
 
 
 if __name__ == "__main__":
