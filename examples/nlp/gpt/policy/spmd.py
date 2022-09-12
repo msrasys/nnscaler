@@ -102,6 +102,26 @@ def PASMegatronInferTP(graph: IRGraph, resource):
     for ffn in ffns:
         _tp(graph, ffn, tp_devs, idx=1, dim=0)
 
+    # first embedding linear
+    first_emb_anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor) and node.name == 'first_embed']
+    print(f'last_emd_anchors = {first_emb_anchors}')
+    indices = [fnodes.index(anchor) for anchor in first_emb_anchors]
+    for lid, idx in enumerate(indices):
+        print(f'fnodes[idx+1].name = {fnodes[idx+1].name}')
+        print(f'fnodes[idx+1] = {fnodes[idx + 1]}')
+        first_emb_node = fnodes[idx+1]
+        _tp(graph, first_emb_node, tp_devs, idx=1, dim=0)
+
+    # last embedding linear
+    last_emb_anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor) and node.name == 'last_embed']
+    print(f'last_emd_anchors = {last_emb_anchors}')
+    indices = [fnodes.index(anchor) for anchor in last_emb_anchors]
+    for lid, idx in enumerate(indices):
+        print(f'fnodes[idx+1].name = {fnodes[idx+1].name}')
+        print(f'fnodes[idx+1] = {fnodes[idx + 1]}')
+        last_emb_node = fnodes[idx+1]
+        _tp(graph, last_emb_node, tp_devs, idx=1, dim=0)
+
     # replicate other nodes
     for node in graph.nodes():
         if isinstance(node, (IRFwOperation, IRDataOperation)) and len(node.device) == 0:

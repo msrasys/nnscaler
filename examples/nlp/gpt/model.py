@@ -130,6 +130,7 @@ class GPTInfer(torch.nn.Module):
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor):
 
         # embed = self.embed(input_ids)
+        cube.runtime.function.anchor('first_embed')
         embed = torch.nn.functional.embedding(
             input_ids, self.embedw, padding_idx=None,
             max_norm=None, norm_type=2., scale_grad_by_freq=False, sparse=False
@@ -145,6 +146,7 @@ class GPTInfer(torch.nn.Module):
         enc = self.final_layernorm(enc)
 
         # logits = torch.nn.functional.linear(enc, self.embed.weight)
+        cube.runtime.function.anchor('last_embed')
         logits = torch.nn.functional.linear(enc, self.embedw)
         # simplified
         loss = torch.sum(logits)

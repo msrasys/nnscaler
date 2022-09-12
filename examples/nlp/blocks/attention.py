@@ -88,8 +88,6 @@ def cross_attention(query: torch.Tensor, key: torch.Tensor,
     return output
 
 
-from typing import Optional, Tuple
-
 @cube.graph.parser.register('l N E^, L^ N (h+ d), L^ N (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), E^ (h+ d) -> l N E^', name='one_attention')
 def one_attention(hidden_states: torch.Tensor,
                   past_embed_key: torch.Tensor,
@@ -98,14 +96,14 @@ def one_attention(hidden_states: torch.Tensor,
                   k_proj: torch.Tensor, k_bias: torch.Tensor,
                   v_proj: torch.Tensor, v_bias: torch.Tensor,
                   out_proj: torch.Tensor, #out_bias: torch.Tensor,
-                  h: int, scale: float, dropout_p: float, mask: bool = True):
+                  h: int, scale: float, dropout_p: float, is_training: bool = True, mask: bool = True):
     num_head = h
-    L, N = hidden_states.size(0), hidden_states.size(1)
+    l, N = hidden_states.size(0), hidden_states.size(1)
     dim_head = q_proj.size(0) // num_head
 
-    q = torch.nn.functional.linear(hidden_states, q_proj, q_bias) # L N E, (h d) E -> L N (h d)
-    k = torch.nn.functional.linear(hidden_states, k_proj, k_bias)   # L N E, (h d) E -> L N (h d)
-    v = torch.nn.functional.linear(hidden_states, v_proj, v_bias)   # L N E, (h d) E -> L N (h d)
+    q = torch.nn.functional.linear(hidden_states, q_proj, q_bias)   # l N E, (h d) E -> l N (h d)
+    k = torch.nn.functional.linear(hidden_states, k_proj, k_bias)   # l N E, (h d) E -> l N (h d)
+    v = torch.nn.functional.linear(hidden_states, v_proj, v_bias)   # l N E, (h d) E -> l N (h d)
 
     if past_embed_key is not None and past_embed_value is not None:
         k = torch.cat((past_embed_key, k), dim=-3)
@@ -116,33 +114,25 @@ def one_attention(hidden_states: torch.Tensor,
     k_L = k.size(0)
     v_L = v.size(0)
 
-    q = q.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    k = k.contiguous().view(k_L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    v = v.contiguous().view(v_L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    q = q.transpose(0, 1)  # L (N h) d -> (N h) L d
-    k = k.transpose(0, 1)  # L (N h) d -> (N h) L d
-    v = v.transpose(0, 1)  # L (N h) d -> (N h) L d
+    q = q.contiguous().view(l, (N * num_head), dim_head)    # l N (h d) -> L (N h) d
+    k = k.contiguous().view(k_L, (N * num_head), dim_head)  # (L+l) N (h d) -> (L+l) (N h) d
+    v = v.contiguous().view(v_L, (N * num_head), dim_head)  # (L+l) N (h d) -> (L+l) (N h) d
+    q = q.transpose(0, 1)  # l (N h) d -> (N h) l d
+    k = k.transpose(0, 1)  # (L+l) (N h) d -> (N h) (L+l) d
+    v = v.transpose(0, 1)  # (L+l) (N h) d -> (N h) (L+l) d
     q = q * scale          # (N h) L d, 1 -> (N h) L d
-    k = k.transpose(1, 2)  # (N h) L d -> (N h) d L
-    attn = torch.bmm(q, k) # (N h) L d, (N h) d L -> (N h) L L
+    k = k.transpose(1, 2)  # (N h) (L+l) d -> (N h) d (L+l)
+    attn = torch.bmm(q, k) # (N h) l d, (N h) d (L+l) -> (N h) l (L+l)
 
-    # # attention mask
-    # if mask: # (N h) L L -> (N h) L L
-    #     attn = attn.view(N, num_head, L, L)
-    #     ones = torch.ones((N, L, L), device=attn.device)
-    #     mask = torch.tril(ones)
-    #     mask = mask.view(N, 1, L, L)
-    #     mask = (mask < 0.5)
-    #     attn = attn.masked_fill_(mask, -10000.0)
-    #     attn = attn.view((N * num_head), L, L)
-
-    attn = torch.nn.functional.softmax(attn, dim=-1) # (N h) L L -> (N h) L L
-    attn = torch.nn.functional.dropout(attn, dropout_p, True, False) # (N h) L L -> (N h) L L
-    output = torch.bmm(attn, v) # (N h) L L, (N h) L d -> (N h) L d
-    output = output.transpose(0, 1).contiguous()     # (N h) L d -> L (N h) d
-    output = output.view(L, N, num_head * dim_head)  # (N h) L d -> L N (h d)
-    output = torch.nn.functional.linear(output, out_proj, None) # L N (h d), E E  -> L N E
+    attn = torch.nn.functional.softmax(attn, dim=-1) # (N h) l (L+l) -> (N h) l (L+l)
+    #no dropout in inference attn
+    torch.nn.functional.dropout(attn, dropout_p, is_training, False)    # (N h) l (L+l) -> (N h) l (L+l)
+    output = torch.bmm(attn, v) # (N h) l (L+l), (N h) (L+l) d -> (N h) l d
+    output = output.transpose(0, 1).contiguous()     # (N h) l d -> l (N h) d
+    output = output.view(l, N, num_head * dim_head)  # l (N h) d -> l N (h d)
+    output = torch.nn.functional.linear(output, out_proj, None) # l N (h d), E E  -> l N E
     return output
+
 
 class MultiHeadSelfAttention(torch.nn.Module):
 
@@ -236,7 +226,6 @@ class MultiHeadOneAttention(torch.nn.Module):
         self.out_proj = torch.nn.Parameter(torch.rand(embed_dim, inner_dim))
         self.out_bias = torch.nn.Parameter(torch.rand(embed_dim))
 
-    from typing import Optional, Tuple
 
     def forward(self, query: torch.Tensor, past_embed_key: torch.Tensor, past_embed_value: torch.Tensor):
         attn = one_attention(
@@ -245,7 +234,7 @@ class MultiHeadOneAttention(torch.nn.Module):
             self.k_proj, self.k_bias,
             self.v_proj, self.v_bias,
             self.out_proj, #self.out_bias,
-            self.num_heads, self.scaling, self.dropout_p, mask=True
+            self.num_heads, self.scaling, self.dropout_p, self.training, mask=True
         )
         attn = attn + self.out_bias
         return attn
