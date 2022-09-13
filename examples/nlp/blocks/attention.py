@@ -2,20 +2,18 @@ import torch
 import cube
 
 
-@cube.graph.parser.register('L^ N E^, (h+ d^) E^, (h+ d^), (h+ d^) E^, (h+ d^), (h+ d^) E^, (h+ d^), E^ (h+ d^) -> L^ N E^', name='self_attention')
-def self_attention(query: torch.Tensor,
-                   q_proj: torch.Tensor, q_bias: torch.Tensor,
-                   k_proj: torch.Tensor, k_bias: torch.Tensor,
-                   v_proj: torch.Tensor, v_bias: torch.Tensor,
+@cube.graph.parser.register('L^ N E^, (h+ d^ 3) E^, (h+ d^ 3), E^ (h+ d^) -> L^ N E^', name='self_attention')
+def self_attention(query: torch.Tensor, 
+                   qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
                    out_proj: torch.Tensor,
                    h: int, scale: float, dropout_p: float, mask: bool = True):
     num_head = h
     L, N = query.size(0), query.size(1)
-    dim_head = q_proj.size(0) // num_head
+    dim_head = qkv_proj.size(0) // num_head // 3
 
-    q = torch.nn.functional.linear(query, q_proj, q_bias)   # L N E, (h d) E -> L N (h d)
-    k = torch.nn.functional.linear(query, k_proj, k_bias)   # L N E, (h d) E -> L N (h d)
-    v = torch.nn.functional.linear(query, v_proj, v_bias)   # L N E, (h d) E -> L N (h d)
+    qkv = torch.nn.functional.linear(query, qkv_proj, qkv_bias) # L N E, (h d 3) E -> L N (h d 3)
+    qkv = qkv.view(L, N, num_head * dim_head, 3) # L N (h d 3) -> L N (h d) 3
+    q, k, v = qkv.chunk(3, dim=-1)  # L N (3 h d) -> L N (h d), L N (h d), L N (h d)
     q = q.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     k = k.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     v = v.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
@@ -143,25 +141,16 @@ class MultiHeadSelfAttention(torch.nn.Module):
         self.head_dim = inner_dim // num_heads
         self.scaling = self.head_dim ** -0.5
         self.dropout_p = dropout
-        # Q
-        self.q_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
-        self.q_bias = torch.nn.Parameter(torch.empty(inner_dim))
-        # K
-        self.k_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
-        self.k_bias = torch.nn.Parameter(torch.empty(inner_dim))
-        # V
-        self.v_proj = torch.nn.Parameter(torch.empty(inner_dim, embed_dim))
-        self.v_bias = torch.nn.Parameter(torch.empty(inner_dim))
+        # QKV [(h d 3), E]
+        self.qkv_proj = torch.nn.Parameter(torch.empty(3 * inner_dim, embed_dim))
+        self.qkv_bias = torch.nn.Parameter(torch.empty(3 * inner_dim))
         # Out
         self.out_proj = torch.nn.Parameter(torch.empty(embed_dim, inner_dim))
         self.out_bias = torch.nn.Parameter(torch.empty(embed_dim))
 
     def forward(self, query):
         attn = self_attention(
-            query,
-            self.q_proj, self.q_bias,
-            self.k_proj, self.k_bias,
-            self.v_proj, self.v_bias,
+            query, self.qkv_proj, self.qkv_bias,
             self.out_proj,
             self.num_heads, self.scaling, self.dropout_p, mask=True
         )

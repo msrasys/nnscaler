@@ -73,9 +73,7 @@ def train():
     warmup = 8
     for step in range(iter_num):
         if step == warmup:
-            torch.cuda.synchronize()
-            start = time.time()
-            # CudaTimer(enable=True).start('e2e')
+            CudaTimer(enable=True).start('e2e')
 
         train_iter(model, dataloader)
         optimizer.step()
@@ -86,15 +84,10 @@ def train():
         if (step + 1) % 10 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
-    torch.cuda.synchronize()
-    stop = time.time()
-    span = (stop - start) / (iter_num - warmup) * 1000 # ms
-    print_each_rank(f'span time: {span} ms')
-
-    # CudaTimer(enable=True).stop('e2e')
-    # print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-    #       CudaTimer().duration(iter_num-warmup, field_name='e2e')))
-    # CudaTimer().print_all(times=iter_num-warmup)
+    CudaTimer().stop('e2e')
+    print_each_rank('e2e time (ms) per iteration: {} ms'.format(
+          CudaTimer().duration(iter_num-warmup, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num-warmup)
 
     memory_summary()
 
