@@ -75,7 +75,7 @@ for i in range(N):
 # our code ends
 
 prof.disabled()
-pr.dump_stats('cube_%d.prof' % torch.distributed.get_rank()) # or use TID/PID, if to profile multi-thread/-process program.
+prof.dump_stats('cube_RANK%d.prof' % torch.distributed.get_rank()) # or use TID/PID, if to profile multi-thread/-process program.
 ```
 
 After the modification, run the Python file using the same command line with `torchrun` as usual.
@@ -84,7 +84,7 @@ After dumping the profiling data, we can use `snakeviz` to visualize it:
 
 ```shell
 pip install snakeviz
-snakeviz cube_RANK_0.prof
+snakeviz cube_RANK0.prof
 ```
 
 ### Use viztracer
@@ -93,10 +93,10 @@ An alternative to cProfile + snakeviz is to use the profiler `viztracer`,
 as well as its builtin visualization.
 
 `viztracer` is aware of the multi-process architecture of `torchrun` and it offers a command-line
-interface and offers a very detailed profiling log.
+interface and offers a very detailed profiling log, including the sequence, timing and durations.
 
-P.S. However, too detailed to be effectively used to profile huge DAG like the 23k~ nodes unrolled
-WRF model.
+> P.S. However, too detailed to be effectively used to profile huge DAG like the 23k~ nodes unrolled
+> WRF model, it would output very big log file and be very slow to render.
 
 `viztracer` can be used like:
 
