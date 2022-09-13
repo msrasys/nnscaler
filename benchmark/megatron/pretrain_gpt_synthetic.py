@@ -55,7 +55,7 @@ def get_batch(data_iterator):
     vocab_size = 50257
     tokens = torch.rand((args.micro_batch_size, args.seq_length), requires_grad=False, device=torch.cuda.current_device()).long() * vocab_size
     labels = torch.rand((args.micro_batch_size, args.seq_length), requires_grad=False, device=torch.cuda.current_device()).long() * vocab_size
-    loss_mask =  (torch.rand((args.micro_batch_size, args.seq_length), requires_grad=False, device=torch.cuda.current_device()) < 0.5).float()
+    loss_mask = torch.ones(tokens.size(), dtype=torch.float, device=torch.cuda.current_device())
     attention_mask = (torch.rand((args.micro_batch_size, 1, args.seq_length, args.seq_length), requires_grad=False, device=torch.cuda.current_device()) < 0.5)    
     position_ids = torch.rand((args.micro_batch_size, args.seq_length), requires_grad=False, device=torch.cuda.current_device()).long() * args.seq_length
 

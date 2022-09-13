@@ -23,7 +23,10 @@ GPT_ARGS="--num-layers 24 \
           --no-query-key-layer-scaling \
           --no-masked-softmax-fusion \
           --no-bias-gelu-fusion \
-          --no-bias-dropout-fusion"
+          --no-bias-dropout-fusion \
+          --no-async-tensor-model-parallel-allreduce \
+          --no-gradient-accumulation-fusion \
+          --num-workers 0"
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS \
                   --nnodes 1 \
@@ -39,5 +42,13 @@ OMP_NUM_THREADS=4 python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --tensor-model-parallel-size ${GPUS}\
        --pipeline-model-parallel-size 1 \
        --DDP-impl torch
+
+# OMP_NUM_THREADS=4 python -m torch.distributed.launch \
+#        --nproc_per_node 1 \
+#        --nnodes 1 \
+#        --node_rank 0 \
+#        --master_addr localhost \
+#        --master_port 6000 \
+#        pretrain_gpt_synthetic.py -h
 
 cd ..
