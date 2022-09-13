@@ -1,5 +1,5 @@
 import itertools
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Dict
 
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.gener.concurrent import ConcurrentGener
@@ -135,18 +135,83 @@ class IRAdapterGener:
 
     @staticmethod
     def gen_weight(graph: IRGraph) -> IRGraph:
-        weights = dict()
+        """
+        Generate gradient accumulation
+        
+        Only suuport cases that:
+
+        1) each sub-tensor weight is consumed by different node cids (no replica)
+        2) If the sub-tensor weight is consumed by same replicated node:
+             The consumers can be grouped by node cids and satisfy:
+                1. same number of nodes per cid group
+                2. same device set or no-overlapping device set per cid group
+        """
+        # collect subtensor and consumer
+        fweights: Dict[IRFullTensor, List[IRSubTensor]] = dict()
+        fgrads: Dict[IRFullTensor, List[IRSubTensor]] = dict()
+        consumers: Dict[IRFullTensor, List[IRFwOperation]] = dict()
         for fnode in graph.nodes(flatten=True):
             if not isinstance(fnode, IRFwOperation): continue
             assert len(fnode.device) == 1
             for wtensor in fnode.inputs():
                 if isinstance(wtensor, IRSubTensor) and wtensor.is_param():
                     if wtensor.grad is None: continue
-                    if wtensor.parent not in weights:
-                        weights[wtensor.parent] = dict()
-                    if wtensor not in weights[wtensor.parent]:
-                        weights[wtensor.parent][wtensor] = set()
-                    weights[wtensor.parent][wtensor].add(wtensor.device[0])
+                    fweight = wtensor.parent
+                    if fweight not in fweights:
+                        fweights[fweight] = []
+                        fgrads[fweight] = []
+                        consumers[fweight] = []
+                    fweights[fweight].append(wtensor)
+                    fgrads[fweight].append(wtensor.grad)
+                    consumers[fweight].append(fnode)
+        
+        # bucketing
+        weights: Dict[IRFullTensor, Dict[IRSubTensor, List[int]]] = dict()
+        for fweight in fweights.keys():
+            cids = set(fnode.cid for fnode in consumers[fweight])
+            nl = '\n'
+            # case 1: no replica
+            if len(cids) == len(consumers[fweight]):
+                weights[fweight] = dict()
+                for wtensor, consumer in zip(fweights[fweight], consumers[fweight]):
+                    if wtensor not in weights[fweight]:
+                        weights[fweight][wtensor] = set()
+                    weights[fweight][wtensor].add(consumer.device[0])
+            # case 2: replica but has same number of replicas and same/no-overlapping devices
+            else:
+                cid_fnodes = {cid : [n for n in consumers[fweight] if n.cid == cid] for cid in cids}
+                cid_nnodes = [len(ns) for ns in cid_fnodes.values()]
+                # same replica# for each cid
+                assert all(cid_nnodes[0] == ns for ns in cid_nnodes), (
+                    f"If one of the weight consumers are replicated, "
+                    f"other same-weight consumers should also replicated in same way."
+                    f"FullTensor Weight: {fweight}\n"
+                    f"Consumers:\n{nl.join([repr(node) for node in consumers[fweight]])}"
+                )
+                cid_devs = {cid: set(n.device[0] for n in consumers[fweight]) for cid in cids}
+                # case 2.1: same device sharing
+                first = list(cid_devs.keys())[0]
+                if all(cid_devs[first] == devs for devs in cid_devs.values()):
+                    #TODO: need to be more robust
+                    continue
+                # case 2.2: no-overlapping device sharing
+                all_devs = set()
+                for devs in cid_devs.values():
+                    all_devs.update(devs)
+                if sum(len(devs) for devs in cid_devs.values()) == len(all_devs):
+                    raise NotImplementedError(
+                        f"Weight is consumed by multiple different operators.\n"
+                        f"Replicating different operators on no-overlapping device group is not supported yet.\n"
+                        f"FullTensor Weight: {fweight}\n"
+                        f"Consumers:\n{nl.join([repr(node) for node in consumers[fweight]])}"
+                    )
+                else:
+                    raise NotImplementedError(
+                        f"Weight is consumed by multiple different operators.\n"
+                        f"Replicating different operators on partial-overlapping device group is not supported yet.\n"
+                        f"FullTensor Weight: {fweight}\n"
+                        f"Consumers:\n{nl.join([repr(node) for node in consumers[fweight]])}"
+                    )
 
         reducers: Dict[Tuple[int], List[IRSubTensor]] = dict()
         for ftensor, subtensors in weights.items():
