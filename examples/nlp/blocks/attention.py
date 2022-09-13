@@ -17,12 +17,24 @@ def self_attention(query: torch.Tensor,
     q = q.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     k = k.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     v = v.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    q = q.transpose(0, 1)  # L (N h) d -> (N h) L d
-    k = k.transpose(0, 1)  # L (N h) d -> (N h) L d
-    v = v.transpose(0, 1)  # L (N h) d -> (N h) L d
-    q = q * scale          # (N h) L d, 1 -> (N h) L d
-    k = k.transpose(1, 2)  # (N h) L d -> (N h) d L
-    attn = torch.bmm(q, k) # (N h) L d, (N h) d L -> (N h) L L
+    
+    # ======== replace the semantic into more efficient implementation ============
+    # q = q.transpose(0, 1)  # L (N h) d -> (N h) L d
+    # k = k.transpose(0, 1)  # L (N h) d -> (N h) L d
+    # q = q * scale          # (N h) L d, 1 -> (N h) L d
+    # k = k.transpose(1, 2)  # (N h) L d -> (N h) d L
+    # attn = torch.bmm(q, k) # (N h) L d, (N h) d L -> (N h) L L
+    
+    # preallocating input tensor: (N h) L L
+    matmul_input_buffer = torch.empty([N * h, L, L], dtype=query.dtype, device=query.device)
+    # L (N h) d, L (N h) d -> (N h) L L
+    attn = torch.baddbmm(
+        matmul_input_buffer,
+        q.transpose(0, 1),  # (N h) L d
+        k.transpose(0, 1).transpose(1, 2), # (N h) d L
+        beta=0.0, alpha=scale
+    )
+    # ======== replace the semantic into more efficient implementation ============
 
     # attention mask
     if mask: # (N h) L L -> (N h) L L
@@ -36,6 +48,7 @@ def self_attention(query: torch.Tensor,
 
     attn = torch.nn.functional.softmax(attn, dim=-1) # (N h) L L -> (N h) L L
     attn = torch.nn.functional.dropout(attn, dropout_p, True, False) # (N h) L L -> (N h) L L
+    v = v.transpose(0, 1)  # L (N h) d -> (N h) L d
     output = torch.bmm(attn, v) # (N h) L L, (N h) L d -> (N h) L d
     output = output.transpose(0, 1).contiguous()     # (N h) L d -> L (N h) d
     output = output.view(L, N, num_head * dim_head)  # (N h) L d -> L N (h d)
