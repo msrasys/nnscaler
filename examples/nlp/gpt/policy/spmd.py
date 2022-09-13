@@ -72,6 +72,15 @@ def PASMegatronTP(graph: IRGraph, resource):
     for ffn in ffns:
         _tp(graph, ffn, tp_devs, idx=1, dim=0)
 
+    # replicate embed
+    embeds = [node for node in fnodes if node.name == 'embedding']
+    for embed in embeds:
+        _tp(graph, embed, tp_devs, idx=1, dim=0)
+
+    # replicate last linear
+    linears = [node for node in fnodes if node.name == 'linear']
+    _tp(graph, linears[-1], tp_devs, idx=1, dim=0)
+
     # replicate other nodes
     for node in graph.nodes():
         if isinstance(node, (IRFwOperation, IRDataOperation)) and len(node.device) == 0:
