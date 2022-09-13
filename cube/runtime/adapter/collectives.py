@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import torch
 
 from cube.runtime.device import DeviceGroup
@@ -96,14 +96,13 @@ def all_reduce(itensor: torch.Tensor,
     """
     Allreduce
     """
-    CudaTimer().start(field_name='comm')
+    # CudaTimer().start(field_name='comm')
     if not itensor.is_contiguous():
         itensor = itensor.contiguous()
     itensor = itensor.detach()
     group = DeviceGroup().get_group(ranks)
     torch.distributed.all_reduce(itensor, group=group)
-    torch.cuda.synchronize()
-    CudaTimer().stop(field_name='comm')
+    # CudaTimer().stop(field_name='comm')
     return itensor
 
 
@@ -111,17 +110,16 @@ def all_gather(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tens
     """
     Allgather
     """
-    CudaTimer().start(field_name='comm')
+    # CudaTimer().start(field_name='comm')
     if not itensor.is_contiguous():
         itensor = itensor.contiguous()
     group = DeviceGroup().get_group(ranks)
     tensor_list = [torch.empty_like(itensor) for _ in ranks]
     tensor_list[torch.distributed.get_rank(group)] = itensor.data
     torch.distributed.all_gather(tensor_list, itensor, group=group)
-    torch.cuda.synchronize()
     # concat
     otensor = torch.concat(tuple(tensor_list), dim=dim)
-    CudaTimer().stop(field_name='comm')
+    # CudaTimer().stop(field_name='comm')
     return otensor
 
 
@@ -129,7 +127,7 @@ def reduce_scatter(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.
     """
     ReduceScatter
     """
-    CudaTimer().start(field_name='comm')
+    # CudaTimer().start(field_name='comm')
     itensors = list(itensor.chunk(len(ranks), dim))
     for idx, tensor in enumerate(itensors):
         if not tensor.is_contiguous():
@@ -137,8 +135,8 @@ def reduce_scatter(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.
     group = DeviceGroup().get_group(ranks)
     otensor = torch.empty_like(itensors[0], requires_grad=False)
     torch.distributed.reduce_scatter(otensor, itensors, group=group)
-    torch.cuda.synchronize()
-    CudaTimer().stop(field_name='comm')
+    # torch.cuda.synchronize()
+    # CudaTimer().stop(field_name='comm')
     return otensor
 
 
@@ -146,7 +144,7 @@ def all_to_all(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -
     """
     All-to-all
     """
-    CudaTimer().start(field_name='comm')
+    # CudaTimer().start(field_name='comm')
     itensors = list(itensor.chunk(len(ranks), dim=odim))
     for idx, tensor in enumerate(itensors):
         if not tensor.is_contiguous():
@@ -154,9 +152,9 @@ def all_to_all(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -
     otensors = [torch.empty_like(t) for t in itensors]
     group = DeviceGroup().get_group(ranks)
     torch.distributed.all_to_all(otensors, itensors, group=group)
-    torch.cuda.synchronize()
+    # torch.cuda.synchronize()
     otensor = torch.concat(tuple(otensors), dim=idim)
-    CudaTimer().stop(field_name='comm')
+    # CudaTimer().stop(field_name='comm')
     return otensor
 
 
@@ -184,7 +182,7 @@ def broadcast(input_tensors: List[torch.Tensor],
     """
     Broadcast. ranks[0] is the root
     """
-    CudaTimer().start(field_name='comm')
+    # CudaTimer().start(field_name='comm')
     assert len(input_tensors) == 1 or len(input_tensors) == 0
     if len(input_tensors) == 1:
         tensor: torch.Tensor = input_tensors[0]
@@ -198,7 +196,7 @@ def broadcast(input_tensors: List[torch.Tensor],
         tensor = torch.empty(shape, device=torch.cuda.current_device(), dtype=dtype)
     group = DeviceGroup().get_group(ranks)
     torch.distributed.broadcast(tensor, ranks[0], group=group)
-    CudaTimer().stop(field_name='comm')
+    # CudaTimer().stop(field_name='comm')
     return tensor
 
 
@@ -279,3 +277,4 @@ def scatter(input_tensors: List[torch.Tensor],
     torch.cuda.synchronize()
     CudaTimer().stop(field_name='comm')
     return output
+   
