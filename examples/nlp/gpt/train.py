@@ -2,13 +2,14 @@
 example:
 
 OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=4 \
+    --nproc_per_node=8 \
     --nnodes=1 \
-    examples/nlp/gpt/train.py --policy PASMeshShard --fp16
+    examples/nlp/gpt/train.py --policy PASMegatronTP --fp16
 """
 
 
 import torch
+import time
 
 from examples.nlp.gpt.model import GPT
 from examples.nlp.gpt.model import GPTDataLoader
@@ -71,25 +72,30 @@ def train():
     iter_num = 40
     warmup = 8
     for step in range(iter_num):
-        # if step == 0:
-        #     model_summary(model, next(dataloader))
+        if step == warmup:
+            torch.cuda.synchronize()
+            start = time.time()
+            # CudaTimer(enable=True).start('e2e')
 
-        if step >= warmup:
-            CudaTimer(enable=True).start('e2e')
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
-        if step >= warmup:
-            CudaTimer().stop('e2e')
 
         if step == 0:
             print_each_rank('passed first iteration')
         if (step + 1) % 10 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
-    print_each_rank('e2e time (ms) per iteration: {} ms'.format(
-          CudaTimer().duration(iter_num-warmup, field_name='e2e')))
-    CudaTimer().print_all(times=iter_num-warmup)
+    torch.cuda.synchronize()
+    stop = time.time()
+    span = (stop - start) / (iter_num - warmup) * 1000 # ms
+    print_each_rank(f'span time: {span} ms')
+
+    # CudaTimer(enable=True).stop('e2e')
+    # print_each_rank('e2e time (ms) per iteration: {} ms'.format(
+    #       CudaTimer().duration(iter_num-warmup, field_name='e2e')))
+    # CudaTimer().print_all(times=iter_num-warmup)
+
     memory_summary()
 
 
