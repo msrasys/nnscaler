@@ -1,39 +1,25 @@
 import itertools
-from typing import Dict, List, Optional, Tuple
-import copy
+from typing import Dict, List, Optional, Tuple, Dict
 
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.gener.concurrent import ConcurrentGener
-
 from cube.graph.graph import IRGraph
 from cube.graph.segment import IRSegment
+
 from cube.ir.cten import IRCell
 from cube.ir.tensor import IRFullTensor, IRSubTensor
-
-from cube.ir.operator import IRBpOperation, IRFwOperation
+from cube.ir.operator import IRFwOperation
 
 from cube.ir.adapter import IRAdapter, IRWeightReducer
 from cube.graph.function.function import Add, Cat, Identity, MultiRef
 
 
-def to_device(tensor: IRSubTensor, device: int) -> IRFwOperation:
-    """
-    This is used for changing tensor device
-    """
-    fwop = IRFwOperation('dummy', 'dummpy', 1, 0)
-    fwop.set_input(0, tensor)
-    fwop.device = device
-    otensor = fwop.input(0)
-    otensor.grad = copy.copy(tensor.grad)
-    if isinstance(otensor.grad, IRSubTensor):
-        otensor.grad.cell = fwop
-    return otensor
-
-
 class DummyInputOuput(IRFwOperation):
 
-    def __init__(self, tensor: IRSubTensor, device: int, is_input=False, is_output=False):
-        super().__init__('dummy', '',
+    def __init__(self, tensor: IRSubTensor, device: int, 
+                 is_input=False, is_output=False,
+                 name='dummy'):
+        super().__init__(name, name,
             1 if is_input else 0,
             1 if is_output else 0
         )
@@ -60,17 +46,46 @@ def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
     for devid in devices:
         for tensor in segment.inputs():
             if not isinstance(tensor, IRSubTensor): continue
-            assert tensor.valmap == (0, 1)
+            assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
             fwop = DummyInputOuput(tensor, devid, is_output=True)
             segment.insert(fwop, 0)
             fwops.append(fwop)
         for tensor in segment.outputs():
             if not isinstance(tensor, IRSubTensor): continue
-            assert tensor.valmap == (0, 1)
+            assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
             fwop = DummyInputOuput(tensor, devid, is_input=True)
             segment.insert(fwop, segment.nnodes)
             fwops.append(fwop)
     return fwops
+
+
+def expand_devices(tensors: List[IRSubTensor], 
+                   producer: bool = False, consumer: bool = False) -> List[IRSubTensor]:
+    """
+    Scatter a tensor if it is on multiple devices. It produces a tensor list where
+    each tensor is attached to one device, with tensor itself is replicated.
+
+    @param tensors List[IRSubTensor]: each tensor can be on multiple devices.
+    @param producer bool: if the tensor is producer role
+    @param consumer bool: if the tensor is consumer role
+
+    @return dtensors List[IRSubTensor]: each tensor is on one device
+    """
+    dtensors = []
+    for tensor in tensors:
+        if len(tensor.device) == 1:
+            dtensors.append(tensor)
+            continue
+        for devid in tensor.device:
+            if producer:
+                fwop = DummyInputOuput(tensor, devid, is_output=True, name=tensor.cell.name)
+                dtensors.append(fwop.output(0))
+            elif consumer:
+                fwop = DummyInputOuput(tensor, devid, is_input=True, name=tensor.cell.name)
+                dtensors.append(fwop.input(0))
+            else:
+                raise ValueError("At least one of producer or consumer")
+    return dtensors
 
 
 class IRAdapterGener:
@@ -120,18 +135,83 @@ class IRAdapterGener:
 
     @staticmethod
     def gen_weight(graph: IRGraph) -> IRGraph:
-        weights = dict()
+        """
+        Generate gradient accumulation
+        
+        Only suuport cases that:
+
+        1) each sub-tensor weight is consumed by different node cids (no replica)
+        2) If the sub-tensor weight is consumed by same replicated node:
+             The consumers can be grouped by node cids and satisfy:
+                1. same number of nodes per cid group
+                2. same device set or no-overlapping device set per cid group
+        """
+        # collect subtensor and consumer
+        fweights: Dict[IRFullTensor, List[IRSubTensor]] = dict()
+        fgrads: Dict[IRFullTensor, List[IRSubTensor]] = dict()
+        consumers: Dict[IRFullTensor, List[IRFwOperation]] = dict()
         for fnode in graph.nodes(flatten=True):
             if not isinstance(fnode, IRFwOperation): continue
             assert len(fnode.device) == 1
             for wtensor in fnode.inputs():
                 if isinstance(wtensor, IRSubTensor) and wtensor.is_param():
                     if wtensor.grad is None: continue
-                    if wtensor.parent not in weights:
-                        weights[wtensor.parent] = dict()
-                    if wtensor not in weights[wtensor.parent]:
-                        weights[wtensor.parent][wtensor] = set()
-                    weights[wtensor.parent][wtensor].add(wtensor.device[0])
+                    fweight = wtensor.parent
+                    if fweight not in fweights:
+                        fweights[fweight] = []
+                        fgrads[fweight] = []
+                        consumers[fweight] = []
+                    fweights[fweight].append(wtensor)
+                    fgrads[fweight].append(wtensor.grad)
+                    consumers[fweight].append(fnode)
+        
+        # bucketing
+        weights: Dict[IRFullTensor, Dict[IRSubTensor, List[int]]] = dict()
+        for fweight in fweights.keys():
+            cids = set(fnode.cid for fnode in consumers[fweight])
+            nl = '\n'
+            # case 1: no replica
+            if len(cids) == len(consumers[fweight]):
+                weights[fweight] = dict()
+                for wtensor, consumer in zip(fweights[fweight], consumers[fweight]):
+                    if wtensor not in weights[fweight]:
+                        weights[fweight][wtensor] = set()
+                    weights[fweight][wtensor].add(consumer.device[0])
+            # case 2: replica but has same number of replicas and same/no-overlapping devices
+            else:
+                cid_fnodes = {cid : [n for n in consumers[fweight] if n.cid == cid] for cid in cids}
+                cid_nnodes = [len(ns) for ns in cid_fnodes.values()]
+                # same replica# for each cid
+                assert all(cid_nnodes[0] == ns for ns in cid_nnodes), (
+                    f"If one of the weight consumers are replicated, "
+                    f"other same-weight consumers should also replicated in same way."
+                    f"FullTensor Weight: {fweight}\n"
+                    f"Consumers:\n{nl.join([repr(node) for node in consumers[fweight]])}"
+                )
+                cid_devs = {cid: set(n.device[0] for n in consumers[fweight]) for cid in cids}
+                # case 2.1: same device sharing
+                first = list(cid_devs.keys())[0]
+                if all(cid_devs[first] == devs for devs in cid_devs.values()):
+                    #TODO: need to be more robust
+                    continue
+                # case 2.2: no-overlapping device sharing
+                all_devs = set()
+                for devs in cid_devs.values():
+                    all_devs.update(devs)
+                if sum(len(devs) for devs in cid_devs.values()) == len(all_devs):
+                    raise NotImplementedError(
+                        f"Weight is consumed by multiple different operators.\n"
+                        f"Replicating different operators on no-overlapping device group is not supported yet.\n"
+                        f"FullTensor Weight: {fweight}\n"
+                        f"Consumers:\n{nl.join([repr(node) for node in consumers[fweight]])}"
+                    )
+                else:
+                    raise NotImplementedError(
+                        f"Weight is consumed by multiple different operators.\n"
+                        f"Replicating different operators on partial-overlapping device group is not supported yet.\n"
+                        f"FullTensor Weight: {fweight}\n"
+                        f"Consumers:\n{nl.join([repr(node) for node in consumers[fweight]])}"
+                    )
 
         reducers: Dict[Tuple[int], List[IRSubTensor]] = dict()
         for ftensor, subtensors in weights.items():
@@ -194,20 +274,24 @@ class IRAdapterGener:
 
             # producers can be operators and graph inputs
             fproducers, fptensors = graph.producers(ftensor), graph.ptensors(ftensor)
+            fptensors = expand_devices(fptensors, producer=True)
             assert all(len(ptensor.device) == 1 for ptensor in fptensors), "Not support for multi-device"
             fconsumers, fctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
+            fctensors = expand_devices(fctensors, consumer=True)
             assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
 
             bproducers, bptensors = [], []
             bconsumers, bctensors = [], []
             if (ftensor not in skip_grads) and isinstance(ftensor.grad, IRFullTensor):
-                bproducers, bptensors = graph.producers(ftensor.grad), graph.ptensors(ftensor.grad)
+                bproducers, bptensors = bgraph.producers(ftensor.grad), bgraph.ptensors(ftensor.grad)
+                bptensors = expand_devices(bptensors, producer=True)
                 assert all(len(ptensor.device) == 1 for ptensor in bptensors), (
                     f"Not support for multi-device:\n"
                     f"{[ptensor.device for ptensor in bptensors]}"
                     f"{[ptensor.cell for ptensor in bptensors]}"
                 )
-                bconsumers, bctensors = graph.consumers(ftensor.grad), graph.ctensors(ftensor.grad)    
+                bconsumers, bctensors = bgraph.consumers(ftensor.grad), bgraph.ctensors(ftensor.grad)    
+                bctensors = expand_devices(bctensors, consumer=True)
                 assert all(len(ctensor.device) == 1 for ctensor in bctensors), "Not support for multi-device"
 
             if skip(fptensors, fctensors) and skip(bptensors, bctensors):
@@ -216,6 +300,17 @@ class IRAdapterGener:
             fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors)
             if fadapter is None:
                 continue
+
+            if not isinstance(graph, IRGraph):
+                if not fadapter.differentiable:
+                    raise NotImplementedError(
+                        "Require adapter to be differentiable for nested IRAdapter."
+                        "Condition to be differentiable: prodcuers have same device set with consumers"
+                        f"Failed FullTensor: {ftensor}"
+                        f"{graph.debug_tensor_map_str(ftensor)}"
+                        f"Failed FullTensor.grad: {ftensor.grad}"
+                        f"{bgraph.debug_tensor_map_str(ftensor.grad) if ftensor.grad is not None else None}"
+                    )
 
             badapter: Optional[IRAdapter] = fadapter.mirror
 
@@ -281,15 +376,14 @@ class IRAdapterGener:
         tensor_map: Dict[int, Dict[IRSubTensor, IRSubTensor]] = dict()
 
         for tensor in graph.ptensors(ftensor):
-            assert len(tensor.device) == 1
-            devid = tensor.device[0]
-            if devid not in devtensors:
-                devtensors[devid] = []
-                fuse_tensors[devid] = dict()
-                tensor_map[devid] = dict()
-            devtensors[devid].append(tensor)
-            fuse_tensors[devid][tensor] = [tensor]
-            tensor_map[devid][tensor] = tensor
+            for devid in tensor.device:
+                if devid not in devtensors:
+                    devtensors[devid] = []
+                    fuse_tensors[devid] = dict()
+                    tensor_map[devid] = dict()
+                devtensors[devid].append(tensor)
+                fuse_tensors[devid][tensor] = [tensor]
+                tensor_map[devid][tensor] = tensor
 
         nodes: List[IRFwOperation] = []
         for devid, tensors in devtensors.items():
@@ -406,13 +500,12 @@ class IRAdapterGener:
         # collect to consumer tensors of each device
         devtensors: Dict[int, Dict[IRSubTensor, List[IRCell]]] = dict()
         for ctensor, consumer in zip(graph.ctensors(ftensor), graph.consumers(ftensor)):
-            assert len(ctensor.device) == 1
-            devid = ctensor.device[0]
-            if devid not in devtensors:
-                devtensors[devid] = dict()
-            if ctensor not in devtensors[devid]:
-                devtensors[devid][ctensor] = []
-            devtensors[devid][ctensor].append(consumer)
+            for devid in ctensor.device:
+                if devid not in devtensors:
+                    devtensors[devid] = dict()
+                if ctensor not in devtensors[devid]:
+                    devtensors[devid][ctensor] = []
+                devtensors[devid][ctensor].append(consumer)
         
         # restrict each device has same subtensor
         nl = '\n'

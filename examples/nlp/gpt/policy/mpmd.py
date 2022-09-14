@@ -2,6 +2,7 @@ from typing import List, Tuple
 import numpy as np
 
 from cube.graph import IRGraph
+from cube.graph.segment import IRSegment
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.ir.cten import IRCell
 from cube.ir.operator import IRDataOperation, IRFwOperation
@@ -98,29 +99,33 @@ def PAS1F1B(graph: IRGraph, resource):
     """
     1F1B scheduling
     """
-    num_stage = resource.ngpus
+    num_stages = resource.ngpus
     num_microbatch = resource.ngpus * 8
-    _, stage_mesh = _create_mesh(resource.ngpus, (num_stage, 1))
 
-    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
-    
     # group to transformer layers
+    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
     transformers = _group_to_transformers(fnodes)
 
     # staging
+    fstages = [[] for _ in range(num_stages)]
     nlayer_per_stage = (len(transformers) // resource.ngpus)
     for lid, fnodes in enumerate(transformers):
-        stage_id = min(lid // nlayer_per_stage, num_stage-1)
-        print(f'assigning {lid}-th transformer layter to stage {stage_id}')
-        for fnode in fnodes:
-            graph.assign(fnode, stage_id)
+        stage_id = min(lid // nlayer_per_stage, num_stages - 1)
+        fstages[stage_id] += fnodes  
+    graph.staging(tuple(stages[0] for stages in fstages))
+
+    # stage to device
+    fsegments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
+    assert len(fsegments) == num_stages
+    for devid, segment in enumerate(fsegments):
+        graph.assign(segment, devid)
     
     for node in graph.nodes():
         if isinstance(node, IRDataOperation):
             graph.assign(node, 0)
 
-    strategy = IRSchedule1F1B(graph, num_microbatch, stage_mesh)
-    graph.sched = strategy
+    strategy = IRSchedule1F1B(graph, num_microbatch)
+    graph.predef_sched(strategy)
     return graph
 
 
@@ -140,17 +145,23 @@ def PASMegatron(graph: IRGraph, resource):
     print(f'pp groups: {pp_groups}')
     print(f'tp groups: {tp_groups}')
 
-    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
-
     # group to transformer layers
+    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
     transformers = _group_to_transformers(fnodes)
 
-    # staging
-    nlayer_per_stage = (len(transformers) // pp_size)
+    # inter-staging: set each stage operators
+    fstages = [[] for _ in range(pp_size)]
+    nlayer_per_stage = (len(transformers) // resource.ngpus)
     for lid, fnodes in enumerate(transformers):
-        sid = min(lid // nlayer_per_stage, pp_size-1)
-        print(f'assigning {lid}-th transformer layer to stage {sid}: {tp_groups[sid]}')
-        for fnode in fnodes:
+        stage_id = min(lid // nlayer_per_stage, pp_size - 1)
+        fstages[stage_id] += fnodes  
+    graph.staging(tuple(stages[0] for stages in fstages))
+
+    # intra-stage: tp and dp parallelism on device group
+    fsegments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
+    assert len(fsegments) == pp_size
+    for sid, segment in enumerate(fsegments):
+        for fnode in segment.nodes():
             if fnode.name == 'self_attention':
                 _tp(graph, fnode, tp_groups[sid], idx=1, dim=0, num=tp_size)
             elif fnode.name == 'feedforward':
@@ -162,6 +173,6 @@ def PASMegatron(graph: IRGraph, resource):
         if isinstance(node, IRDataOperation):
             _replica(graph, node, tp_groups[0])
 
-    strategy = IRSchedule1F1B(graph, num_microbatch, tp_groups)
-    graph.sched = strategy
+    strategy = IRSchedule1F1B(graph, num_microbatch)
+    graph.predef_sched(strategy)
     return graph

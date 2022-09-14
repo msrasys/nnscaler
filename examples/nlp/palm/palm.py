@@ -419,7 +419,7 @@ def PASBranch3(graph: IRGraph, resource):
 
 
 def train():
-    bs, n, dim = 3, 2048, 4096
+    bs, n, dim = 8, 2048, 4096
     num_tokens, depth, heads, dim_head = 20000, 1, 16, 256
 
     model = PaLM(dim, num_tokens, depth, heads=heads, dim_head=dim_head)

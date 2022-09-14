@@ -174,9 +174,6 @@ class IRGraph(IRSegment):
                 f"Internal Error: backward nodes are not consecutive. maxbidx: {maxbidx}, minbidx: {minbidx}"
 
         fsegment = fgraph.create_segment(fnodes)
-        bsegment = bgraph.create_segment(bnodes) if len(bnodes) > 0 else None
-        IRCell.make_pair(fsegment, bsegment)
-
         # replace forward
         for fnode in fnodes:
             fidx = fgraph.remove(fnode)
@@ -184,6 +181,7 @@ class IRGraph(IRSegment):
 
         # replace backward
         if len(bnodes) > 0:
+            bsegment = fgraph.create_bwop(fsegment) if len(bnodes) > 0 else None
             for bnode in bnodes:
                 bidx = bgraph.remove(bnode)
             bgraph.insert(bsegment, bidx)
@@ -434,11 +432,9 @@ class IRGraph(IRSegment):
         """
         assert self.exist(node), f"{node} is not in the graph"
         if isinstance(node, IRSegment):
-            assert node.forward, "Only forward segment is allowed to assign devices"
+            assert node.isfw(), "Only forward segment is allowed to assign devices"
             for subnode in node.nodes():
-                subnode.device = device
-                if subnode.mirror is not None:
-                    subnode.mirror.device = device
+                self.assign(subnode, device)
         else:
             assert isinstance(node, (IRFwOperation, IRDataOperation)), \
                 "Only forward operators and dataloader operators are allowed to assign devices"
@@ -534,8 +530,7 @@ class IRGraph(IRSegment):
         """
         return self._sched
 
-    @sched.setter
-    def sched(self, strategy):
+    def predef_sched(self, strategy):
         """!
         Set schedule plan for the execution.
 

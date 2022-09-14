@@ -23,7 +23,8 @@ from cube.program import Program, SemanticDataLoader, SemanticModel
 
 
 def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
-            PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None, override = True):
+            PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None,
+            override = True, load_content = True) -> Callable:
     """
     AI Scientist calls like:
 
@@ -45,10 +46,16 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
         ...
 
-    Args:
-        model: AI Scientist specified SemanticModel
-        dataloader: dataloader used for training
-        policy: tuple of transformation policy and scheduling policy
+    @param model SemanticModel: AI Scientist specified SemanticModel
+    @param dataloader CubDataLoader: dataloader used for training
+    @param policy Callable: policy to transform and schedule graph
+    @param override bool: If true, the generated code will override exsisting
+        files (if they are already existed.), otherwise, use the already existed
+        generated code, i.e., the policy won't take effect. Default true.
+    @param load_content bool: If true, will load parameter from exsiting saved models.
+        Otherwise, will initial model parameters with empty tensor.
+
+    @return sched_fn Callable: the scheduling function loaded from generated code.
     """
     if not isinstance(model, SemanticModel):
         raise TypeError("Expect Semantic Model")
@@ -89,7 +96,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             print('warning: dataloader batch size stay as default.')
             # load module code
             print_each_rank(f'loading existed module from {filename} ...')
-            model.load_module(filename)
+            model.load_module(filename, load_content=load_content)
             # load schedule code
             print_each_rank(f'loading existed schedule from {filename} ...')
             return _load_tschedule_fn(filename)
@@ -210,7 +217,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
         # load module
         filename = filename.format(myrank)
         print_each_rank(f'loading generated module from {filename} ...')
-        model.load_module(filename)
+        model.load_module(filename, load_content=load_content)
         # load temporal schedule
         print_each_rank(f'loading generated schedule from {filename} ...')
         return _load_tschedule_fn(filename)

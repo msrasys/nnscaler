@@ -74,8 +74,6 @@ class IRSegment(IRCell):
         super().__init__(name, '', len(inputs), len(outputs), init_outputs=False)
 
         self._nodes: List[IRCell] = []
-        self._idevice = [t.device for t in inputs]
-        self._odevice = [t.device for t in outputs]
 
         for idx, val in enumerate(inputs):
             self.set_input(idx, val)
@@ -340,17 +338,21 @@ class IRSegment(IRCell):
                 dscp += f'\t{consumer}\n'
         return dscp
 
-    def create_bwop(self, fwop: IRFwOperation) -> IRBpOperation:
+    def create_bwop(self, fwop: IRFwOperation) -> Union[IRBpOperation, IRBpOperation]:
         """
         Create dummy backward operator for given forward operator
         """
-        assert isinstance(fwop, IRFwOperation), "Expected IRFwOperation"
+        assert isinstance(fwop, (IRFwOperation, IRSegment)), "Expected IRFwOperation"
         fsegment: IRSegment = self.segment(fwop)
         fins = [t for t in fwop.inputs() if isinstance(t, IRSubTensor)]
         fous = [t for t in fwop.outputs() if isinstance(t, IRSubTensor)]
         igrads = [fsegment.grad(t) if t.requires_grad else None for t in fins]
         ograds = [fsegment.grad(t) if t.requires_grad else None for t in fous]
-        bwop = IRBpOperation(ograds, igrads)
+        if isinstance(fwop, IRFwOperation):
+            bwop = IRBpOperation(ograds, igrads)
+        else:
+            bnodes = [fnode.mirror for fnode in fwop.nodes() if fnode.mirror is not None]
+            bwop = IRSegment(bnodes, ograds, igrads)
         IRCell.make_pair(fwop, bwop)
         return bwop
     
@@ -758,7 +760,6 @@ class IRSegment(IRCell):
         segment = IRSegment(nodes, tuple(inputs), tuple(outputs))
         return segment
 
-
     def dispatch(self, devid: int, mirror=True) -> Optional[IRCell]:
         """
         Instantiate the segement to a specific device.
@@ -782,15 +783,15 @@ class IRSegment(IRCell):
                     assert len(node.device) == 1
                     nodes.append(node)
                 for itensor in node.inputs():
-                    if itensor in self._inputs:
+                    if itensor in self._inputs and itensor not in inputs:
                         inputs.append(itensor)
                 for otensor in node.outputs():
-                    if otensor in self._outputs:
-                        otensor.append(otensor)
-                    outputs.append(otensor)
+                    if otensor in self._outputs and otensor not in outputs:
+                        outputs.append(otensor)
         segment = IRSegment(nodes, inputs, outputs, self.name)
-        if mirror and segment.mirror is not None:
-            msegment = segment.mirror.dispatch(devid, mirror=False)
+        segment._id = self.cid
+        if mirror and self.mirror is not None:
+            msegment = self.mirror.dispatch(devid, mirror=False)
             IRCell.make_pair(segment, msegment)
         return segment
 

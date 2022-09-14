@@ -6,33 +6,31 @@ from cube.runtime.device import DeviceGroup
 
 
 def _allreduce(itensor: torch.Tensor, ranks: Tuple[int]) -> torch.Tensor:
-    CudaTimer().start(field_name='comm')
+    # CudaTimer().start(field_name='comm')
     if not itensor.is_contiguous():
         itensor = itensor.contiguous()
     group = DeviceGroup().get_group(ranks)
     torch.distributed.all_reduce(itensor, group=group)
-    torch.cuda.synchronize()
-    CudaTimer().stop(field_name='comm')
+    # CudaTimer().stop(field_name='comm')
     return itensor
 
 
 def _allgather(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
-    CudaTimer().start(field_name='comm')
+    # CudaTimer().start(field_name='comm')
     if not itensor.is_contiguous():
         itensor = itensor.contiguous()
     group = DeviceGroup().get_group(ranks)
     tensor_list = [torch.empty_like(itensor) for _ in ranks]
     tensor_list[torch.distributed.get_rank(group)] = itensor.data
     torch.distributed.all_gather(tensor_list, itensor, group=group)
-    torch.cuda.synchronize()
     # concat
     otensor = torch.concat(tuple(tensor_list), dim=dim).requires_grad_()
-    CudaTimer().stop(field_name='comm')
+    # CudaTimer().stop(field_name='comm')
     return otensor
 
 
 def _reducescatter(itensor: torch.Tensor, dim:int, ranks: Tuple[int]) -> torch.Tensor:
-    CudaTimer().start(field_name='comm')
+    # CudaTimer().start(field_name='comm')
     itensors = list(itensor.chunk(len(ranks), dim))
     for idx, tensor in enumerate(itensors):
         if not tensor.is_contiguous():
@@ -40,14 +38,13 @@ def _reducescatter(itensor: torch.Tensor, dim:int, ranks: Tuple[int]) -> torch.T
     group = DeviceGroup().get_group(ranks)
     otensor = torch.empty_like(itensors[0])
     torch.distributed.reduce_scatter(otensor, itensors, group=group)
-    torch.cuda.synchronize()
-    CudaTimer().stop(field_name='comm')
+    # CudaTimer().stop(field_name='comm')
     return otensor
 
 
 def _alltoall(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -> torch.Tensor:
 
-    CudaTimer().start(field_name='comm')
+    # CudaTimer().start(field_name='comm')
     itensors = list(itensor.chunk(len(ranks), dim=odim))
     for idx, tensor in enumerate(itensors):
         if not tensor.is_contiguous():
@@ -57,7 +54,7 @@ def _alltoall(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) ->
     torch.distributed.all_to_all(otensors, itensors, group=group)
     torch.cuda.synchronize()
     otensor = torch.concat(tuple(otensors), dim=idim)
-    CudaTimer().stop(field_name='comm')
+    # CudaTimer().stop(field_name='comm')
     return otensor
 
 
