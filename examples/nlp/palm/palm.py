@@ -3,13 +3,15 @@
     OMP_NUM_THREADS=2 torchrun --nproc_per_node=2 --nnodes=1 palm.py
 """
 
+from typing import List
+
 import torch
 import torch.nn.functional as F
 from torch import nn, einsum
 
 from math import log2, floor
 
-from einops import rearrange, repeat
+# from einops import rearrange, repeat
 
 from cube.graph import IRGraph
 
@@ -140,17 +142,17 @@ def feedforward(x: torch.Tensor, proj1: torch.Tensor, proj2: torch.Tensor):
     return x
 
 
-@cube.graph.parser.register('N L^ E^, E^ F^ -> N L^ F^', name='feedforward1')
+@cube.graph.parser.register('N L^ E+, E+ F -> N L^ F', name='feedforward1')
 def feedforward1(x: torch.Tensor, proj: torch.Tensor):
     return torch.nn.functional.silu(torch.matmul(x, proj))
 
 
-@cube.graph.parser.register('N L^ E^, E^ F^ -> N L^ F^', name='feedforward2')
+@cube.graph.parser.register('N L^ E+, E+ F -> N L^ F', name='feedforward2')
 def feedforward2(x: torch.Tensor, proj: torch.Tensor):
     return torch.matmul(x, proj)
 
 
-@cube.graph.parser.register('N L^ E^, N L^ E^, E^ F -> N L^ F',
+@cube.graph.parser.register('N L^ E+, N L^ E+, E+ F -> N L^ F',
                             name='feedforward3')
 def feedforward3(x: torch.Tensor, y: torch.Tensor, proj: torch.Tensor):
     return torch.matmul(x * y, proj)
@@ -288,7 +290,7 @@ def PASData(graph: IRGraph, resource):
     '''
     2 way Data Parallel
     '''
-    assert resource.ngpus == 2
+    # assert resource.ngpus == 2
 
     for node in graph.nodes():
         if isinstance(node, IRDataOperation):
@@ -311,11 +313,9 @@ def PASData(graph: IRGraph, resource):
     return graph
 
 
-def PASBranch(graph: IRGraph, resource):
-    '''
-    2 way brach
-    '''
-    assert resource.ngpus == 2
+def PASMegatron(graph: IRGraph, resource):
+    tp_size = resource.ngpus
+    tp_devs = list(range(tp_size))
 
     for node in graph.nodes():
         if isinstance(node, IRDataOperation):
@@ -325,10 +325,28 @@ def PASBranch(graph: IRGraph, resource):
                 graph.assign(sub_node, idx)
             batch_dim = node.get_batch_dims()[0]
 
+    def _tp(graph: IRGraph, node: IRFwOperation, devs: List[int], idx: int, dim: int):
+        algo = node.algorithms('dim')
+        sub_nodes = graph.partition(node, algo, idx=idx, dim=dim, num=len(devs))
+        assert sub_nodes is not None
+        for devid, sub_node in zip(devs, sub_nodes):
+            graph.assign(sub_node, devid)
+        return sub_nodes
+
+    def _replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
+        sub_nodes = graph.replicate(node, times=len(devs))
+        for dev_id, sub_node in zip(devs, sub_nodes):
+            graph.assign(sub_node, dev_id)
+        return sub_nodes
+    
     for node in graph.nodes():
         if isinstance(node, IRFwOperation):
-            if node.name == 'embedding' or node.name == 'linear':
-                # data parallel
+            if node.name == 'embedding':
+                _tp(graph, node, tp_devs, idx=1, dim=0)
+            elif node.name == "linear":
+                _tp(graph, node, tp_devs, idx=1, dim=0)
+            elif node.name == 'multi_head_attention':
+                # TODO: data parallel current
                 algo = node.algorithms('dim')
                 sub_nodes = graph.partition(node,
                                             algo,
@@ -337,20 +355,17 @@ def PASBranch(graph: IRGraph, resource):
                                             num=resource.ngpus)
                 for idx, sub_node in enumerate(sub_nodes):
                     graph.assign(sub_node, idx)
-            elif node.name == 'layernorm' or node.name == 'multiref' or node.name == 'add' or node.name == 'mean':
-                # replicate
-                sub_nodes = graph.replicate(node, times=resource.ngpus)
-                for idx, sub_node in enumerate(sub_nodes):
-                    graph.assign(sub_node, idx)
-            elif node.name == 'feedforward':
-                graph.assign(node, 0)
-            elif node.name == 'multi_head_attention':
-                graph.assign(node, 1)
+            elif node.name == 'feedforward1':
+                _tp(graph, node, tp_devs, idx=1, dim=1)
+            elif node.name == 'feedforward2':
+                _tp(graph, node, tp_devs, idx=1, dim=1)
+            elif node.name == 'feedforward3':
+                _tp(graph, node, tp_devs, idx=2, dim=0)
+            elif node.name == 'mean':
+                _tp(graph, node, tp_devs, idx=0, dim=2)
             else:
-                assert False, node.name
-
+                _replica(graph, node, tp_devs)
     return graph
-
 
 def PASBranch3(graph: IRGraph, resource):
     '''
@@ -366,8 +381,10 @@ def PASBranch3(graph: IRGraph, resource):
                 graph.assign(sub_node, idx)
             batch_dim = node.get_batch_dims()[0]
 
+    fnodes = []
     for node in graph.nodes():
         if isinstance(node, IRFwOperation):
+            fnodes.append(node)
             if node.name == 'embedding' or node.name == 'linear':
                 # data parallel
                 algo = node.algorithms('dim')
@@ -389,7 +406,7 @@ def PASBranch3(graph: IRGraph, resource):
                 graph.assign(node, 1)
             elif node.name == 'feedforward3':
                 algo = node.algorithms('dim')
-                sub_nodes = graph.partition(node, algo, idx=2, dim=1, num=2)
+                sub_nodes = graph.partition(node, algo, idx=2, dim=0, num=2)
                 graph.assign(sub_nodes[0], 0)
                 graph.assign(sub_nodes[1], 1)
             elif node.name == 'multi_head_attention':
@@ -397,6 +414,7 @@ def PASBranch3(graph: IRGraph, resource):
             else:
                 assert False, node.name
 
+    # graph.recompute(fnodes)
     return graph
 
 
@@ -421,9 +439,10 @@ def train():
                                                     batch_dims=(0, ))
 
     # @cube.compile(model, dataloader, PAS=PASSingle)
-    # @cube.compile(model, dataloader, PAS=PASData)
     # @cube.compile(model, dataloader, PAS=PASBranch)
-    @cube.compile(model, dataloader, PAS=PASBranch3)
+    # @cube.compile(model, dataloader, PAS=PASData)
+    # @cube.compile(model, dataloader, PAS=PASBranch3)
+    @cube.compile(model, dataloader, PAS=PASMegatron)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
