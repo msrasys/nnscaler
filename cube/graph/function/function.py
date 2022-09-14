@@ -481,8 +481,11 @@ def Sum(signature, inputs):
 
 
 def Mean(signature, inputs):
-    tensor = inputs[0]
-    dim = inputs[1]
+    if len(inputs) >= 2:
+        tensor, dim = inputs[:2]
+    elif len(inputs) == 1:
+        tensor = inputs[0]
+        dim = None
     einput = ShapeAnno.create_shape_str(tensor.shape)
     eoutput = copy.copy(einput)
     if dim is not None:
