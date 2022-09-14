@@ -161,7 +161,7 @@ class ValueMap:
             weight = weight.weight
         assert len(weight) == 2 and all(isinstance(i, int) for i in weight), \
             "expected weight to be (idx, nchunks)"
-        self._weight = weight
+        self._weight = tuple(weight)
 
     @property
     def weight(self) -> IdxChunk:

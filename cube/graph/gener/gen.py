@@ -8,7 +8,7 @@ from cube.graph.gener.concurrent import ConcurrentGener
 from cube.graph.graph import IRGraph
 from cube.graph.segment import IRSegment
 from cube.ir.cten import IRCell
-from cube.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
+from cube.ir.tensor import IRFullTensor, IRSubTensor
 
 from cube.ir.operator import IRBpOperation, IRFwOperation
 
@@ -30,6 +30,49 @@ def to_device(tensor: IRSubTensor, device: int) -> IRFwOperation:
     return otensor
 
 
+class DummyInputOuput(IRFwOperation):
+
+    def __init__(self, tensor: IRSubTensor, device: int, is_input=False, is_output=False):
+        super().__init__('dummy', '',
+            1 if is_input else 0,
+            1 if is_output else 0
+        )
+        assert (is_input and not is_output) or (is_output and not is_input)
+        if is_input:
+            self.set_input(0, tensor)
+        if is_output:
+            self.set_output(0, tensor)
+        self.device = device
+
+
+def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
+    """
+    Create dummy operators that 
+    1) produce segment input tensors
+    2) consume segment output tensors
+
+    @param segment IRSegment: the target segment
+    
+    @return nodes List[IRCell]: the generated operation
+    """
+    devices = segment.device
+    fwops = []
+    for devid in devices:
+        for tensor in segment.inputs():
+            if not isinstance(tensor, IRSubTensor): continue
+            assert tensor.valmap == (0, 1)
+            fwop = DummyInputOuput(tensor, devid, is_output=True)
+            segment.insert(fwop, 0)
+            fwops.append(fwop)
+        for tensor in segment.outputs():
+            if not isinstance(tensor, IRSubTensor): continue
+            assert tensor.valmap == (0, 1)
+            fwop = DummyInputOuput(tensor, devid, is_input=True)
+            segment.insert(fwop, segment.nnodes)
+            fwops.append(fwop)
+    return fwops
+
+
 class IRAdapterGener:
 
     @staticmethod
@@ -49,6 +92,9 @@ class IRAdapterGener:
         graph = IRAdapterGener.gen_activation(graph)
         # generate weight reducer
         graph = IRAdapterGener.gen_weight(graph)
+        # fuse consecutive non-differentiable adapters into one
+        graph = IRAdapterGener.fusion(graph)
+        # print(graph.extra_repr())
         return graph
 
     @staticmethod
@@ -122,13 +168,16 @@ class IRAdapterGener:
             if len(ptensors) == 0 or len(ctensors) == 0:
                 return True
             # direct connection
-            if len(ptensors) == 1 and len(ctensors) == 1 and \
-                set(ptensors[0].device) == set(ctensors[0].device):
-               return True
-            return False
-        
-        devices = graph.device
+            for ctensor in ctensors:
+                if not any(t == ctensor and set(ctensor.device).issubset(set(t.device)) for t in ptensors):
+                    return False
+            return True
 
+        fdummies = create_dummy(graph)
+        bgraph: Optional[IRSegment] = graph.mirror
+        bdummies = create_dummy(bgraph) if isinstance(bgraph, IRSegment) else []
+
+        skip_grads = [t.parent for t in graph.inputs() + graph.outputs() if isinstance(t, IRSubTensor)]
         # generate adapter for inter-segments
         # FIXME: assume producers and consumers can run in parallel
         for ftensor in graph.full_tensors():
@@ -137,8 +186,11 @@ class IRAdapterGener:
                 continue
 
             # optimization: local fusion / multiref on producer / consumer
-            # ftensor = IRAdapterGener.local_producer_fusion(graph, ftensor)
-            # IRAdapterGener.local_consumer_multiref(graph, ftensor)
+            ftensor = IRAdapterGener.local_producer_fusion(graph, ftensor)
+            IRAdapterGener.local_consumer_multiref(graph, ftensor)
+
+            # print(graph.debug_tensor_map_str(ftensor))
+            # print(graph.debug_tensor_map_str(ftensor.grad))
 
             # producers can be operators and graph inputs
             fproducers, fptensors = graph.producers(ftensor), graph.ptensors(ftensor)
@@ -148,21 +200,19 @@ class IRAdapterGener:
 
             bproducers, bptensors = [], []
             bconsumers, bctensors = [], []
-            if isinstance(ftensor.grad, IRFullTensor):
+            if (ftensor not in skip_grads) and isinstance(ftensor.grad, IRFullTensor):
                 bproducers, bptensors = graph.producers(ftensor.grad), graph.ptensors(ftensor.grad)
-                assert all(len(ptensor.device) == 1 for ptensor in bptensors), "Not support for multi-device"
+                assert all(len(ptensor.device) == 1 for ptensor in bptensors), (
+                    f"Not support for multi-device:\n"
+                    f"{[ptensor.device for ptensor in bptensors]}"
+                    f"{[ptensor.cell for ptensor in bptensors]}"
+                )
                 bconsumers, bctensors = graph.consumers(ftensor.grad), graph.ctensors(ftensor.grad)    
                 assert all(len(ctensor.device) == 1 for ctensor in bctensors), "Not support for multi-device"
 
-            if skip(fptensors, fctensors) and skip(bptensors, bctensors): continue
-            
+            if skip(fptensors, fctensors) and skip(bptensors, bctensors):
+                continue
 
-            # print((f"generating for {ftensor}:\n"
-            #        f"fptensor device: {[t.device for t in fptensors]}\n"
-            #        f"fctensor device: {[t.device for t in fctensors]}\n"
-            #        f"bptensor device: {[t.device for t in bptensors]}\n"
-            #        f"bctensor device: {[t.device for t in bctensors]}\n"
-            # ))
             fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors)
             if fadapter is None:
                 continue
@@ -180,13 +230,19 @@ class IRAdapterGener:
             # insert backward adapter
             if badapter is not None:
                 assert isinstance(badapter, IRAdapter)
-                assert isinstance(graph.mirror, IRSegment)
+                assert isinstance(bgraph, IRSegment)
                 bproducers = [
-                    graph.mirror.index(consumer.mirror) + 1 for \
+                    bgraph.index(consumer.mirror) + 1 for \
                         consumer in graph.consumers(ftensor)
                 ]
                 bidx = max(bproducers) if len(bproducers) > 0 else 0
-                graph.mirror.insert(badapter, bidx)
+                bgraph.insert(badapter, bidx)
+
+        # remove dummy op
+        for dummy_op in fdummies:
+            graph.remove(dummy_op)
+        for dummy_op in bdummies:
+            bgraph.remove(dummy_op)
 
         # generate adapter for each segment
         segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
@@ -195,9 +251,8 @@ class IRAdapterGener:
 
         return graph
 
-
     @staticmethod
-    def local_producer_fusion(graph: IRGraph, ftensor: IRFullTensor) -> IRFullTensor:
+    def local_producer_fusion(graph: IRSegment, ftensor: IRFullTensor) -> IRFullTensor:
         """!
         Fuse the producer tensors using concat and add.
         This will add a new full tensor by chaging from:
@@ -292,7 +347,8 @@ class IRAdapterGener:
 
         new_ftensor = ftensor.like()
 
-        # update consumer 
+        # update consumer
+        min_idx = min(graph.index(consumer) for consumer in graph.consumers(ftensor))
         assert len(graph.ctensors(ftensor)) == len(graph.consumers(ftensor))
         for ctensor, consumer in zip(graph.ctensors(ftensor), graph.consumers(ftensor)):
             with graph.update(consumer) as consumer:
@@ -300,7 +356,6 @@ class IRAdapterGener:
                     consumer.inputs().index(ctensor),
                     new_ftensor.select(ctensor.indmap, ctensor.valmap)
                 )
-        min_idx = min(graph.index(consumer) for consumer in graph.consumers(ftensor))
 
         # insert new producer
         for devid, tensors in fuse_tensors.items():
@@ -319,26 +374,20 @@ class IRAdapterGener:
         for node in nodes[::-1]:
             assert node not in graph.nodes()
             assert len(node.outputs()) == 1
-            graph.insert(node, min_idx)
+            if graph.mirror is not None:
+                graph.finsert(node, min_idx)
+            else:
+                graph.insert(node, min_idx)
 
-        # insert and update backward node
-        bgraph: IRSegment = graph.mirror
-        # update backward node
-        for consumer in graph.consumers(new_ftensor):
-            assert isinstance(consumer.mirror, IRBpOperation)
-            bnode = consumer.mirror
-            bgraph.update_bwop(bnode)
-        # insert backward node
-        bnodes = [graph.bwop(node) for node in nodes]
-        bidx = min(bgraph.index(producer.mirror) for producer in bgraph.producers(ftensor))
-        for bnode in bnodes:
-            bnode.device = bnode.mirror.device
-            bgraph.insert(bnode, bidx)
+        # update backward
+        if isinstance(ftensor.grad, IRFullTensor):
+            graph.update_ftensor_bw(new_ftensor)
+            graph.update_ftensor_bw(ftensor)
 
         return new_ftensor
 
     @staticmethod
-    def local_consumer_multiref(graph: IRGraph, ftensor: IRFullTensor):
+    def local_consumer_multiref(graph: IRSegment, ftensor: IRFullTensor):
         """!
         If a device have a same sub-tensor to be consumed multiple times,
         then create a multiref forward node for it to make
@@ -392,29 +441,52 @@ class IRAdapterGener:
                     multiref.set_output(idx, itensor)
 
                 # update consumer
-                min_fidx = len(graph.nodes())
+                min_fidx = graph.nnodes
                 for itensor, consumer in zip(itensors, consumers):
                     with graph.update(consumer) as consumer:
                         idx = consumer.inputs().index(ctensor)
                         consumer.set_input(idx, itensor)
-                min_fidx = min(graph.nodes().index(consumer) for consumer in consumers)
-        
-                # insert forward multiref
-                graph.attach(multiref, min_fidx)
-                multirefs[multiref] = consumers
 
-        # insert / update backward
-        if graph.train:
-            for multiref, consumers in multirefs.items():
-                # update consumer backward
-                for consumer in consumers:
-                    assert isinstance(consumer.mirror, IRBpOperation)
-                    bnode: IRBpOperation = consumer.mirror
-                    with graph.update(bnode) as bnode:
-                        bnode.update()
-                # insert backward
-                bnode = multiref.gen_backward()
-                bnode.device = multiref.device
-                bidx = max(graph.nodes().index(consumer.mirror) for consumer in consumers)
-                bsid = graph.stage_id(graph.node(bidx))
-                graph.attach(bnode, bidx+1, stage_idx=bsid)
+                # insert forward multiref
+                min_fidx = min(graph.index(consumer) for consumer in consumers)
+                if graph.mirror is not None:
+                    graph.finsert(multiref, min_fidx)
+                else:
+                    graph.insert(multiref, min_fidx)
+                multirefs[multiref] = consumers
+        
+        if len(multirefs) > 0 and isinstance(ftensor.grad, IRFullTensor):
+            graph.update_ftensor_bw(ftensor)
+
+    @staticmethod
+    def fusion(graph: IRSegment) -> IRSegment:
+        """
+        Fuse consecutive adapters into one
+        """
+        fadapters, badapters = [], []
+        for adapter in graph.nodes():
+            if isinstance(adapter, IRAdapter) and adapter.forward and not adapter.differentiable:
+                fadapters.append(adapter)
+                if adapter.mirror is not None:
+                    badapters.insert(0, adapter.mirror)
+            else:
+                if len(fadapters) > 1:
+                    # insert fused fadapter
+                    fused_fadapter = IRAdapter.merge(fadapters)
+                    for adapter in fadapters:
+                        idx = graph.remove(adapter)
+                    graph.insert(fused_fadapter, idx)
+                    # insert fused badapter
+                    fused_badapter = IRAdapter.merge(badapters) if len(badapters) > 0 else None
+                    for adapter in badapters:
+                        idx = graph.remove(adapter)
+                    if fused_badapter is not None:
+                        graph.insert(fused_badapter, idx)
+                    IRCell.make_pair(fused_fadapter, fused_badapter)
+                fadapters, badapters = [], []
+
+        for segment in graph.nodes():
+            if isinstance(segment, IRSegment) and segment.isfw():
+                IRAdapterGener.fusion(segment)
+
+        return graph

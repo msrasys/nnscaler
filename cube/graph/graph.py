@@ -12,7 +12,7 @@ from typing import Union, Tuple, List, Optional, Dict
 from cube.ir.cten import IRTensor, IRCell
 from cube.ir.unique import IDGenerator
 from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
-from cube.ir.tensor import IRFullTensor, IRSubTensor
+from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
 from cube.ir.dtype import IRDType, DTypeInferRule
 
 from cube.graph.function.function import Identity, MultiRef
@@ -266,6 +266,35 @@ class IRGraph(IRSegment):
                 while ftensor in consumer.inputs():
                     idx = consumer.inputs().index(ftensor)
                     consumer.set_input(idx, ctensor)
+
+        # another version to generate multiref: one for all
+        # for node in nodes:
+        #     ftensors = set()
+        #     for ftensor in node.inputs():
+        #         # remove redundant tensors within an operator
+        #         if isinstance(ftensor, IRFullTensor) and ftensor._id not in ftensors:
+        #             ftensors.add(ftensor._id)
+        #             if ftensor not in consumers:
+        #                 consumers[ftensor] = []
+        #             consumers[ftensor].append(node)
+        #     for ftensor in node.outputs():
+        #         if isinstance(ftensor, IRFullTensor):
+        #             producers[ftensor] = node
+        # for ftensor, cnodes in consumers.items():
+        #     if len(cnodes) == 1 or ftensor.is_attr(): continue
+        #     itensors = [ftensor.like() for _ in range(len(cnodes))]
+        #     for itensor, consumer in zip(itensors, cnodes):
+        #         while ftensor in consumer.inputs():
+        #             idx = consumer.inputs().index(ftensor)
+        #             consumer.set_input(idx, itensor)
+        #     # create and insert multiref operation
+        #     multiref = MultiRef(None, [ftensor, len(cnodes)])
+        #     for idx, itensor in enumerate(itensors):
+        #         multiref.set_output(idx, itensor)
+        #     multiref.infer_shape()
+        #     idx = nodes.index(producers[ftensor]) + 1 if ftensor in producers else 0
+        #     # idx = nodes.index(cnodes[0])
+        #     nodes.insert(idx, multiref)
 
         # instantiate graph inputs / outputs
         for idx, tensor in enumerate(inputs):
@@ -692,7 +721,7 @@ class IRGraph(IRSegment):
 
     # ================= Other optimizations ==================
 
-    def recompute(self, nodes: Union[List[IRFwOperation], IRSegment]) -> bool:
+    def recompute(self, nodes: Union[IRSegment, List[IRFwOperation]]) -> bool:
         """!
         Recompute a set of nodes. The forward nodes will be assigned with a unique
         recompute group id. A forward not can not be recomputed in different recompute groups.
@@ -701,26 +730,85 @@ class IRGraph(IRSegment):
 
         @return success boolean: always success
         """
-        assert all(isinstance(nodes, IRFwOperation)) or isinstance(nodes, IRSegment), \
+        assert all(isinstance(node, IRFwOperation) for node in nodes) or isinstance(nodes, IRSegment), \
             "Require forward nodes or a single segment"
 
-        recompute_group_id: int = IDGenerator().gen_cell_id()
-
         if isinstance(nodes, IRSegment):
-            assert nodes.forward, "Can only apply recompute on segment node"
-            for fnode in nodes.node():
-                fnode.recompute = recompute_group_id
+            assert nodes.isfw() and (not nodes.isbw()), "Only forward IRSegment can recompute"
+            return self.recompute(nodes.nodes())
+        
         else:
-            indices = [self.index(node) for node in nodes]
-            if all(idx[1] is None for idx in indices):
-                assert all(idx[0] == indices[0][0] for idx in indices), \
-                    f"Cross-stage recompute is not allowed yet."
-            elif all(idx[1] is not None for idx in indices):
-                assert all(idx[0] == indices[0][0] for idx in indices), \
-                    f"Cross-stage recompute is not allowed yet."
-            else:
-                assert False, f"Cross-stage recompute is not allowed yet."
+            segments = [self.segment(node) for node in nodes]
+            assert all(segment == segments[0] for segment in segments), \
+                "Cross-segment recompute is not allowed yet"
+            recompute_group_id: int = IDGenerator().gen_cell_id()
             for fnode in nodes:
                 fnode.recompute = recompute_group_id
     
         return True
+
+    # =================== Helpers ====================
+
+    def auto_multiref(self):
+        """
+        Automatically partition and schedule multiref node.
+        This requires to call after all transformation and
+        scheduling.
+
+        The policy is to partition and assign multiref 
+        in the same way of its input producer
+        """
+        for node in self.nodes(flatten=True):
+            if node.name == 'multiref':
+                if len(node.device) != 0: continue
+                segment: IRSegment = self.segment(node)
+                ftensor = node.input(0).parent
+                ptensors = segment.ptensors(ftensor)
+
+                multirefs = []
+
+                # use downstream consumers
+                devtensors: Dict[int, List[IRSubTensor]] = dict()
+                for tensor in node.outputs():
+                    for ctensor in segment.ctensors(tensor.parent):
+                        for devid in ctensor.device:
+                            if devid not in devtensors:
+                                devtensors[devid] = []
+                            devtensors[devid].append(ctensor)
+                devids = list(devtensors.keys())
+                ctensors = [ts[0] for ts in devtensors.values()]
+                for devid, ctensor in zip(devids, ctensors):
+                    itensor = node.input(0).parent.select(ctensor.indmap, ctensor.valmap)
+                    otensors = []
+                    for otensor in node.outputs():
+                        otensors.append(otensor.parent.select(ctensor.indmap, ctensor.valmap))
+                    multiref = MultiRef('', [itensor, len(otensors)])
+                    for idx, otensor in enumerate(otensors):
+                        multiref.set_output(idx, otensor)
+                    multiref.device = devid
+                    multirefs.append(multiref)
+                
+                # if no downstream consumers, use upstream producers
+                if len(multirefs) == 0:
+                    for ptensor in ptensors:
+                        assert len(ptensor.device) > 0, \
+                            "Auto Multiref requires its producer nodes assigned to devices"
+                        for devid in ptensor.device:
+                            outputs = []
+                            for output in node.outputs():
+                                outputs.append(output.parent.select(ptensor.indmap, ptensor.valmap))
+                            multiref = MultiRef('', [ptensor, len(outputs)])
+                            for idx, otensor in enumerate(outputs):
+                                multiref.set_output(idx, otensor)
+                            multiref.device = devid
+                            multirefs.append(multiref)
+                
+                # replace into graph
+                fidx = self.remove(node)
+                if node.mirror is not None:
+                    self.remove(node.mirror)
+                for multiref in multirefs[::-1]:
+                    if node.mirror is not None:
+                        self.finsert(multiref, fidx)
+                    else:
+                        self.insert(multiref, fidx)

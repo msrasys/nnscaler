@@ -673,7 +673,7 @@ class ModelCodeGen(CodeGen):
 
             nodes : List[IRCell] = [node for i, node in i_nodes]
 
-            subseg = self.execplan.graph.segment(nodes)
+            subseg = self.execplan.graph.create_segment(nodes)
 
             inputs = [t for t in subseg.inputs() if not t.is_attr()]
             input_names = [self.tensor_naming(t) for t in inputs]
@@ -980,9 +980,9 @@ class ScheduleCodeGen(CodeGen):
         """
         Emit node / subgraph code
         """
-        fsign = '{outputs} = cube.runtime.executor.fexecute({model}, *{inputs}, requires_grad={req_grad})'
+        fsign = '{outputs} = cube.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
         asign = '{outputs} = cube.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
-        bsign = '{input_grads} = cube.runtime.executor.backward({input_tensors}, {output_tensors}, {output_grads})'
+        bsign = '{input_grads} = cube.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
         
         inputs = self.tuple_naming(node.inputs(), skip_attr=True, prefix_attr='model.')
         outputs = self.return_naming(node.outputs(), skip_attr=True, prefix_attr='model.')
@@ -993,6 +993,7 @@ class ScheduleCodeGen(CodeGen):
             if node.isfw():
                 code = fsign.format(
                     outputs = outputs,
+                    name = f"'{name}'",
                     model = f'model.{name}',
                     inputs = inputs,
                     req_grad = req_grad
@@ -1007,6 +1008,7 @@ class ScheduleCodeGen(CodeGen):
                         assert tensor == 1.0, "Loss gradient should be 1.0"
                         output_grads[idx] = None
                 code = bsign.format(
+                    name = f"'{self.node_naming(node.mirror)}'",
                     input_grads = self.return_naming(input_grads),
                     input_tensors = self.tuple_naming(input_tensors, skip_attr=True, prefix_attr='model.'),
                     output_tensors = self.tuple_naming(output_tensors, skip_attr=True, prefix_attr='model.'),
