@@ -6,17 +6,17 @@ from cube.runtime.device import DeviceGroup
 
 
 def _allreduce(itensor: torch.Tensor, ranks: Tuple[int]) -> torch.Tensor:
-    # CudaTimer().start(field_name='comm')
+    CudaTimer().start(field_name='comm', predefined=True)
     if not itensor.is_contiguous():
         itensor = itensor.contiguous()
     group = DeviceGroup().get_group(ranks)
     torch.distributed.all_reduce(itensor, group=group)
-    # CudaTimer().stop(field_name='comm')
+    CudaTimer().stop(field_name='comm', predefined=True)
     return itensor
 
 
 def _allgather(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
-    # CudaTimer().start(field_name='comm')
+    CudaTimer().start(field_name='comm', predefined=True)
     if not itensor.is_contiguous():
         itensor = itensor.contiguous()
     group = DeviceGroup().get_group(ranks)
@@ -25,12 +25,12 @@ def _allgather(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tens
     torch.distributed.all_gather(tensor_list, itensor, group=group)
     # concat
     otensor = torch.concat(tuple(tensor_list), dim=dim).requires_grad_()
-    # CudaTimer().stop(field_name='comm')
+    CudaTimer().stop(field_name='comm', predefined=True)
     return otensor
 
 
 def _reducescatter(itensor: torch.Tensor, dim:int, ranks: Tuple[int]) -> torch.Tensor:
-    # CudaTimer().start(field_name='comm')
+    CudaTimer().start(field_name='comm', predefined=True)
     itensors = list(itensor.chunk(len(ranks), dim))
     for idx, tensor in enumerate(itensors):
         if not tensor.is_contiguous():
@@ -38,13 +38,12 @@ def _reducescatter(itensor: torch.Tensor, dim:int, ranks: Tuple[int]) -> torch.T
     group = DeviceGroup().get_group(ranks)
     otensor = torch.empty_like(itensors[0])
     torch.distributed.reduce_scatter(otensor, itensors, group=group)
-    # CudaTimer().stop(field_name='comm')
+    CudaTimer().stop(field_name='comm', predefined=True)
     return otensor
 
 
 def _alltoall(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -> torch.Tensor:
-
-    # CudaTimer().start(field_name='comm')
+    CudaTimer().start(field_name='comm', predefined=True)
     itensors = list(itensor.chunk(len(ranks), dim=odim))
     for idx, tensor in enumerate(itensors):
         if not tensor.is_contiguous():
@@ -52,9 +51,8 @@ def _alltoall(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) ->
     otensors = [torch.empty_like(t) for t in itensors]
     group = DeviceGroup().get_group(ranks)
     torch.distributed.all_to_all(otensors, itensors, group=group)
-    torch.cuda.synchronize()
     otensor = torch.concat(tuple(otensors), dim=idim)
-    # CudaTimer().stop(field_name='comm')
+    CudaTimer().stop(field_name='comm', predefined=True)
     return otensor
 
 
@@ -234,10 +232,9 @@ class ReduceBroadcast(torch.autograd.Function):
         world_size = torch.distributed.get_world_size(group)
         if world_size == 1:
             return input_
-        CudaTimer().start(field_name='comm')
+        CudaTimer().start(field_name='comm', predefined=True)
         torch.distributed.reduce(input_, dst, group=group)
-        torch.cuda.synchronize()
-        CudaTimer().stop(field_name='comm')
+        CudaTimer().stop(field_name='comm', predefined=True)
         return input_
 
     @staticmethod
@@ -247,10 +244,9 @@ class ReduceBroadcast(torch.autograd.Function):
         world_size = torch.distributed.get_world_size(group)
         if world_size == 1:
             return grad_output, None, None
-        CudaTimer().start(field_name='comm')
+        CudaTimer().start(field_name='comm', predefined=True)
         torch.distributed.broadcast(grad_output, src, group=group)
-        torch.cuda.synchronize()
-        CudaTimer().stop(field_name='comm')
+        CudaTimer().stop(field_name='comm', predefined=True)
         return grad_output, None, None
 
 
@@ -264,10 +260,9 @@ class BroadcastReduce(torch.autograd.Function):
         world_size = torch.distributed.get_world_size(group)
         if world_size == 1:
             return input_
-        CudaTimer().start(field_name='comm')
+        CudaTimer().start(field_name='comm', predefined=True)
         torch.distributed.broadcast(input_, src, group=group)
-        torch.cuda.synchronize()
-        CudaTimer().stop(field_name='comm')
+        CudaTimer().stop(field_name='comm', predefined=True)
         return input_
 
     @staticmethod
@@ -277,10 +272,9 @@ class BroadcastReduce(torch.autograd.Function):
         world_size = torch.distributed.get_world_size(group)
         if world_size == 1:
             return grad_output, None, None
-        CudaTimer().start(field_name='comm')
+        CudaTimer().start(field_name='comm', predefined=True)
         if not grad_output.is_contiguous():
             grad_output = grad_output.contiguous()
         torch.distributed.reduce(grad_output, dst, group=group)
-        torch.cuda.synchronize()
-        CudaTimer().stop(field_name='comm')
+        CudaTimer().stop(field_name='comm', predefined=True)
         return grad_output, None, None
