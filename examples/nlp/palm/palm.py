@@ -272,7 +272,7 @@ class PaLM(nn.Module):
 
 
 def train():
-    bs, n, dim = 4, 2048, 4096
+    bs, n, dim = 5, 2048, 4096
     num_tokens, depth, heads, dim_head = 20000, 1, 16, 256
 
     model = PaLM(dim, num_tokens, depth, heads=heads, dim_head=dim_head)
@@ -295,7 +295,8 @@ def train():
     # @cube.compile(model, dataloader, PAS=PASBranch)
     # @cube.compile(model, dataloader, PAS=PASData)
     # @cube.compile(model, dataloader, PAS=PASBranch3)
-    @cube.compile(model, dataloader, PAS=spmd.PASMegatron)
+    # @cube.compile(model, dataloader, PAS=spmd.PASMegatron)
+    @cube.compile(model, dataloader, PAS=mpmd.PASBranch5)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
