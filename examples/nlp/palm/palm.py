@@ -1,8 +1,3 @@
-"""
-2 way branch:
-    OMP_NUM_THREADS=2 torchrun --nproc_per_node=2 --nnodes=1 palm.py
-"""
-
 from typing import List
 
 import torch
@@ -20,8 +15,8 @@ from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 from cube.ir.operator import IRDataOperation, IRFwOperation
 
-import examples.mlp.policy.spmd as spmd
-import examples.mlp.policy.mpmd as mpmd
+import examples.nlp.palm.policy.spmd as spmd
+import examples.nlp.palm.policy.mpmd as mpmd
 
 import argparse
 
@@ -276,150 +271,8 @@ class PaLM(nn.Module):
         return self.net(x).mean()
 
 
-def PASSingle(graph: IRGraph, resource):
-    assert resource.ngpus == 1
-
-    for node in graph.nodes():
-        if isinstance(node, (IRDataOperation, IRFwOperation)):
-            graph.assign(node, 0)
-
-    return graph
-
-
-def PASData(graph: IRGraph, resource):
-    '''
-    2 way Data Parallel
-    '''
-    # assert resource.ngpus == 2
-
-    for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            algo = node.algorithms('data')
-            sub_nodes = graph.partition(node, algo, num=resource.ngpus)
-            for idx, sub_node in enumerate(sub_nodes):
-                graph.assign(sub_node, idx)
-            batch_dim = node.get_batch_dims()[0]
-
-    for node in graph.nodes():
-        if isinstance(node, IRFwOperation):
-            algo = node.algorithms('dim')
-            sub_nodes = graph.partition(node,
-                                        algo,
-                                        idx=0,
-                                        dim=batch_dim,
-                                        num=resource.ngpus)
-            for idx, sub_node in enumerate(sub_nodes):
-                graph.assign(sub_node, idx)
-    return graph
-
-
-def PASMegatron(graph: IRGraph, resource):
-    tp_size = resource.ngpus
-    tp_devs = list(range(tp_size))
-
-    for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            algo = node.algorithms('data')
-            sub_nodes = graph.partition(node, algo, num=resource.ngpus)
-            for idx, sub_node in enumerate(sub_nodes):
-                graph.assign(sub_node, idx)
-            batch_dim = node.get_batch_dims()[0]
-
-    def _tp(graph: IRGraph, node: IRFwOperation, devs: List[int], idx: int, dim: int):
-        algo = node.algorithms('dim')
-        sub_nodes = graph.partition(node, algo, idx=idx, dim=dim, num=len(devs))
-        assert sub_nodes is not None
-        for devid, sub_node in zip(devs, sub_nodes):
-            graph.assign(sub_node, devid)
-        return sub_nodes
-
-    def _replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
-        sub_nodes = graph.replicate(node, times=len(devs))
-        for dev_id, sub_node in zip(devs, sub_nodes):
-            graph.assign(sub_node, dev_id)
-        return sub_nodes
-    
-    for node in graph.nodes():
-        if isinstance(node, IRFwOperation):
-            if node.name == 'embedding':
-                _tp(graph, node, tp_devs, idx=1, dim=0)
-            elif node.name == "linear":
-                _tp(graph, node, tp_devs, idx=1, dim=0)
-            elif node.name == 'multi_head_attention':
-                # TODO: data parallel current
-                algo = node.algorithms('dim')
-                sub_nodes = graph.partition(node,
-                                            algo,
-                                            idx=0,
-                                            dim=batch_dim,
-                                            num=resource.ngpus)
-                for idx, sub_node in enumerate(sub_nodes):
-                    graph.assign(sub_node, idx)
-            elif node.name == 'feedforward1':
-                _tp(graph, node, tp_devs, idx=1, dim=1)
-            elif node.name == 'feedforward2':
-                _tp(graph, node, tp_devs, idx=1, dim=1)
-            elif node.name == 'feedforward3':
-                _tp(graph, node, tp_devs, idx=2, dim=0)
-            elif node.name == 'mean':
-                _tp(graph, node, tp_devs, idx=0, dim=2)
-            else:
-                _replica(graph, node, tp_devs)
-    return graph
-
-def PASBranch3(graph: IRGraph, resource):
-    '''
-    3 way branch
-    '''
-    assert resource.ngpus == 3
-
-    for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            algo = node.algorithms('data')
-            sub_nodes = graph.partition(node, algo, num=resource.ngpus)
-            for idx, sub_node in enumerate(sub_nodes):
-                graph.assign(sub_node, idx)
-            batch_dim = node.get_batch_dims()[0]
-
-    fnodes = []
-    for node in graph.nodes():
-        if isinstance(node, IRFwOperation):
-            fnodes.append(node)
-            if node.name == 'embedding' or node.name == 'linear':
-                # data parallel
-                algo = node.algorithms('dim')
-                sub_nodes = graph.partition(node,
-                                            algo,
-                                            idx=0,
-                                            dim=batch_dim,
-                                            num=resource.ngpus)
-                for idx, sub_node in enumerate(sub_nodes):
-                    graph.assign(sub_node, idx)
-            elif node.name == 'layernorm' or node.name == 'multiref' or node.name == 'add' or node.name == 'mean':
-                # replicate
-                sub_nodes = graph.replicate(node, times=resource.ngpus)
-                for idx, sub_node in enumerate(sub_nodes):
-                    graph.assign(sub_node, idx)
-            elif node.name == 'feedforward1':
-                graph.assign(node, 0)
-            elif node.name == 'feedforward2':
-                graph.assign(node, 1)
-            elif node.name == 'feedforward3':
-                algo = node.algorithms('dim')
-                sub_nodes = graph.partition(node, algo, idx=2, dim=0, num=2)
-                graph.assign(sub_nodes[0], 0)
-                graph.assign(sub_nodes[1], 1)
-            elif node.name == 'multi_head_attention':
-                graph.assign(node, 2)
-            else:
-                assert False, node.name
-
-    # graph.recompute(fnodes)
-    return graph
-
-
 def train():
-    bs, n, dim = 8, 2048, 4096
+    bs, n, dim = 4, 2048, 4096
     num_tokens, depth, heads, dim_head = 20000, 1, 16, 256
 
     model = PaLM(dim, num_tokens, depth, heads=heads, dim_head=dim_head)
@@ -442,7 +295,7 @@ def train():
     # @cube.compile(model, dataloader, PAS=PASBranch)
     # @cube.compile(model, dataloader, PAS=PASData)
     # @cube.compile(model, dataloader, PAS=PASBranch3)
-    @cube.compile(model, dataloader, PAS=PASMegatron)
+    @cube.compile(model, dataloader, PAS=spmd.PASMegatron)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
