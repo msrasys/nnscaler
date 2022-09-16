@@ -854,25 +854,8 @@ def Embedding(signature, inputs: List):
         start, stop = weight.indmap[0]
     else:
         start, stop = 0, weight.shape[0]
-    letters = iter(string.ascii_lowercase)
-    ishapes = [
-        ShapeAnno.create_shape_str(itensor.shape, iterator=letters),
-        ShapeAnno.create_shape_str(weight.shape, iterator=letters)
-    ]
-    oshapes = [ishapes[0] + [ishapes[1][-1]]]
-    anno = OpAnno.create_op_str(ishapes, oshapes)
-
-    # def embed_modifer(kwargs: Dict, idx, dim, num):
-    #     import warnings
-    #     warnings.warn('FIXME: The semantic is error when split embedding, but the computation cost is same.')
-    #     kwargs = dict(**kwargs)
-    #     kwargs['stop'] = kwargs['stop'] // num
-    #     return kwargs
-    # rules = [TransformRule(
-    #     [DimopSplit.R(), DimopSplit.D(0)], [DimopSplit.V()], embed_modifer
-    # )]
-
-    return IRDimops(Embedding, 'embedding', signature, [anno], [itensor, weight],
+    annos = ['*, n+ e -> * e']
+    return IRDimops(Embedding, 'embedding', signature, annos, [itensor, weight],
                     padding_idx=padding_idx, start=start, stop=stop)
 
 
