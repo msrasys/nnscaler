@@ -1,6 +1,7 @@
 from typing import List
 from cube.graph import IRGraph
 from cube.ir.operator import IRDataOperation, IRFwOperation
+from cube.ir.tensor import IRSubTensor, IRFullTensor
 
 def PASBranch3(graph: IRGraph, resource):
     '''
@@ -66,6 +67,34 @@ def _replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
     return sub_nodes
 
 
+def convert_add_to_valmap(graph: IRGraph, add_node: IRFwOperation):
+    """
+    Remove add node by replacing with tensor valmap
+    """
+
+    segment: IRSegment = graph.segment(add_node)
+    assert add_node.name == 'add'
+    nchunks = 0
+    for itensor in add_node.inputs():
+        assert isinstance(itensor, IRSubTensor)
+        nchunks += len(segment.producers(itensor.parent))
+    ftensor: IRFullTensor = add_node.output(0).parent
+    vid = 0
+    for itensor in add_node.inputs():
+        parent = itensor.parent
+        for ptensor, producer in zip(segment.ptensors(parent), segment.producers(parent)):
+            idx = producer.outputs().index(ptensor)
+            new_ptensor = ftensor.select(ptensor.indmap, (vid, nchunks))
+            with segment.update(producer):
+                producer.set_output(idx, new_ptensor)
+            segment.update_bwop(producer.mirror)
+            vid += 1
+
+    segment.remove(add_node)
+    assert add_node.mirror is not None
+    segment.remove(add_node.mirror)
+
+
 def PASBranch5(graph: IRGraph, resource):
     '''
     5 way branch
@@ -86,7 +115,7 @@ def PASBranch5(graph: IRGraph, resource):
                 _tp(graph, node, devs, idx=1, dim=0)
             elif node.name == 'mean':
                 _tp(graph, node, devs, idx=0, dim=2)
-            elif node.name == 'layernorm' or node.name == 'multiref' or node.name == 'add':
+            elif node.name == 'layernorm' or node.name == 'multiref':
                 _replica(graph, node, devs)
             elif node.name == 'feedforward1':
                 algo = node.algorithms('dim')
@@ -107,7 +136,15 @@ def PASBranch5(graph: IRGraph, resource):
                 graph.assign(sub_nodes[3], 3)
             elif node.name == 'multi_head_attention':
                 graph.assign(node, 4)
+            elif node.name == 'add':
+                continue
             else:
                 assert False, node.name
+
+    # adjust add
+    adds = [node for node in graph.nodes() if node.name == 'add']
+    assert len(adds) == 2
+    graph.assign(adds[0], 4)
+    convert_add_to_valmap(graph, adds[1])
 
     return graph
