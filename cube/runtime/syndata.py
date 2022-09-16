@@ -46,7 +46,8 @@ class CubeDataLoader:
         self.batch_size = batch_size
         for shape, dim in zip(self.shapes, self.batch_dims):
             shape[dim] = batch_size
-        print(f'> data loader output shape change to: {self.shapes}')
+        rank = 0 if not torch.distributed.is_initialized() else torch.distributed.get_rank()
+        print(f'rank [{rank}]: > set batch size to {batch_size}. dataloader outputs change to: {self.shapes}')
 
 
 class SciLoopVariables(CubeDataLoader):

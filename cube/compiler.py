@@ -188,18 +188,6 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                     outfile = fname,
                     attach=True
                 )
-
-            # setup batch size
-            if not isinstance(dataloader, SciLoopVariables):
-                all_batch_size = set()
-                dnodes = [node for node in graph.nodes() if isinstance(node, IRDataOperation)]
-                for dnode in dnodes:
-                    bs = [out.shape[dim] for out, dim in zip(dnode.outputs(), dnode.get_batch_dims())]
-                    all_batch_size.update(bs)
-                if len(all_batch_size) != 1:
-                    raise NotImplementedError(f"Heterogenous batch size {bs} is not supported")
-                batch_size = torch.tensor(list(all_batch_size), dtype=torch.int).cuda()
-
             compile_end = time.time()
             compile_time = compile_end - compile_start
             print('> compile time: {:.2f} seconds'.format(compile_time))
@@ -207,17 +195,29 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-        # reset dataloader
-        if torch.distributed.is_initialized():
-            torch.distributed.broadcast(batch_size, src=0)
-        batch_size = batch_size.item()
-        print_each_rank(f'reseting dataloader batch size to {batch_size}')
-        dataloader.set_batch_size(batch_size)
-
         # load module
         filename = filename.format(myrank)
         print_each_rank(f'loading generated module from {filename} ...')
         model.load_module(filename, load_content=load_content)
+
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        # set dataloder batch size (serialize output)
+        bs = model.get_gen_module().get_batch_size()
+        if torch.distributed.is_initialized():
+            for rank in range(torch.distributed.get_world_size()):
+                if rank == torch.distributed.get_rank():
+                    if bs is not None and dataloader is not None:
+                        dataloader.set_batch_size(bs)
+                torch.distributed.barrier()
+        else:
+            if bs is not None and dataloader is not None:
+                dataloader.set_batch_size(bs)
+        
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
         # load temporal schedule
         print_each_rank(f'loading generated schedule from {filename} ...')
         return _load_tschedule_fn(filename)

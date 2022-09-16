@@ -9,6 +9,7 @@ from cube.graph import IRGraph
 from cube.graph import parser
 
 from cube.runtime.syndata import CubeDataLoader
+from cube.runtime.module import CubeModule
 from cube.profiler.timer import print_each_rank
 
 import torch
@@ -129,7 +130,7 @@ class SemanticModel:
             )
         else:
             self.ir_graph = None
-        self._loaded_module = None
+        self._loaded_module: CubeModule = None
 
     def get_graph(self):
         return self.ir_graph

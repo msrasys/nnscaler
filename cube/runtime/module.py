@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import torch
 from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.reducer import Reducer
@@ -14,6 +14,7 @@ class CubeModule(torch.nn.Module):
         super().__init__()
         self._reducers = list()
         self._fullmap : Dict[str, Tuple[int, Tuple[slice], int]] = dict()
+        self._batch_size: Optional[int] = None
 
     def add_reducer(self, reducer: Reducer):
         if not isinstance(reducer, Reducer):
@@ -37,6 +38,13 @@ class CubeModule(torch.nn.Module):
         """
         assert hasattr(self, attr), f"{attr} is not in the module"
         self._fullmap[attr] = (tid, slicers, val_chunks)
+
+    def set_batch_size(self, bs: Optional[int]):
+        assert (bs is None) or (isinstance(bs, int) and bs > 0)
+        self._batch_size = bs
+
+    def get_batch_size(self) -> Optional[int]:
+        return self._batch_size
 
     def load_attr_content(self, filename: str):
         with torch.no_grad():
