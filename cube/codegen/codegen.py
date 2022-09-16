@@ -3,6 +3,7 @@ Generate Pytorch code given the model DAG and the transformation config
 """
 import itertools
 from typing import Dict, Generator, Iterable, List, Any, Optional, Set, Tuple, Union
+import warnings
 import torch
 import copy
 from more_itertools import split_when
@@ -386,6 +387,8 @@ class ModelCodeGen(CodeGen):
         self.symbols = SymbolTable()
         # ref module to check shared variables
         self._ref_module = torch.nn.Module()
+        # batch size
+        self.batch_size = None
 
     def init_comm_groups(self):
         """
@@ -458,6 +461,7 @@ class ModelCodeGen(CodeGen):
             elif isinstance(node, IRBpOperation):
                 continue
             elif isinstance(node, IRDataOperation):
+                self.emit_batchsize_code(node)
                 continue
             else:
                 raise RuntimeError(f"Un-recognized IRCell type: {type(node)}")
@@ -894,6 +898,20 @@ class ModelCodeGen(CodeGen):
         code = f'{reducer_name}.allreduce()'
         return [code]
 
+    def emit_batchsize_code(self, node: IRDataOperation):
+        """
+        Emit batch size declare
+        """
+        signature = 'self.set_batch_size({bs})'
+        bs = [t.shape[dim] for t, dim in zip(node.outputs(), node.get_batch_dims())]
+        bs = set(bs)
+        if len(bs) > 1:
+            warnings.warn(f'Find Heterogenous batch size {bs}. Keep output to be same with semantic dataloder.')
+        bs = list(bs)[0] if len(bs) == 1 else None
+        assert self.batch_size is None or self.batch_size == bs, f"Not match for batch size: {self.batch_size} != {bs}"
+        self.model_init_statements.append(signature.format(bs=bs))
+        self.batch_size = bs
+
     def clear(self):
         """
         Clear buffer that used for generating code
@@ -904,6 +922,8 @@ class ModelCodeGen(CodeGen):
         self.model_methods_bodies: List[List[str]] = list()
         # module member name
         self.symbols = SymbolTable()
+        # batch size
+        self.batch_size = None
 
 
 class ScheduleCodeGen(CodeGen):
