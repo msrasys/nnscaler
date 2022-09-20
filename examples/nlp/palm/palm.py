@@ -227,8 +227,9 @@ class PaLMLayerV2(nn.Module):
         return mask
 
     def forward(self, in_x):
-        bs, n, device = in_x.shape[0], in_x.shape[1], in_x.device
 
+        in_x = cube.runtime.function.identity(in_x)
+        residual = in_x
         # pre layernorm
         x = self.norm(in_x)
 
@@ -239,8 +240,7 @@ class PaLMLayerV2(nn.Module):
         ff2 = feedforward2(x, self.ff_proj2)
         ff_out = feedforward3(ff1, ff2, self.ff_proj3)
 
-        return in_x + attn_out + ff_out
-
+        return attn_out + ff_out + residual
 
 class PaLM(nn.Module):
 

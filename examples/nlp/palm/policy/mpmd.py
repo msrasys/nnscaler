@@ -71,28 +71,43 @@ def convert_add_to_valmap(graph: IRGraph, add_node: IRFwOperation):
     """
     Remove add node by replacing with tensor valmap
     """
-
-    segment: IRSegment = graph.segment(add_node)
     assert add_node.name == 'add'
-    nchunks = 0
+    ptensors, producers = [], []
     for itensor in add_node.inputs():
-        assert isinstance(itensor, IRSubTensor)
-        nchunks += len(segment.producers(itensor.parent))
-    ftensor: IRFullTensor = add_node.output(0).parent
-    vid = 0
-    for itensor in add_node.inputs():
-        parent = itensor.parent
-        for ptensor, producer in zip(segment.ptensors(parent), segment.producers(parent)):
-            idx = producer.outputs().index(ptensor)
-            new_ptensor = ftensor.select(ptensor.indmap, (vid, nchunks))
-            with segment.update(producer):
-                producer.set_output(idx, new_ptensor)
-            segment.update_bwop(producer.mirror)
-            vid += 1
+        iptensors = graph.ptensors(itensor.parent)
+        assert len(set(t.valmap for t in iptensors)) == len(iptensors)
+        ptensors += iptensors
+        producers += graph.producers(itensor.parent)
+    ftensor = add_node.output(0).parent
+    for idx, (ptensor, producer) in enumerate(zip(ptensors, producers)):
+        fidx = producer.outputs().index(ptensor)
+        bidx = producer.mirror.inputs().index(ptensor.grad)
+        ptensor = ftensor.select(ptensor.indmap, (idx, len(producers)))
+        ptensor.grad = ftensor.grad.select(ptensor.indmap, (0,1))
+        with graph.update(producer):
+            producer.set_output(fidx, ptensor)
+        with graph.mirror.update(producer.mirror) as bnode:
+            bnode.set_input(bidx, ptensor.grad)
+    graph.remove(add_node)
+    graph.mirror.remove(add_node.mirror)
 
-    segment.remove(add_node)
-    assert add_node.mirror is not None
-    segment.remove(add_node.mirror)
+
+def flatten_branch_grad(graph: IRGraph, ftensor: IRFullTensor):
+    """
+    Flatten valmap for different branches.
+    """
+    assert ftensor.requires_grad
+    ctensors = graph.ctensors(ftensor)
+    consumers = graph.consumers(ftensor)
+    # same tinput ensor
+    assert all(ctensor == ctensors[0] for ctensor in ctensors)
+    # different gradient (no replicate)
+    assert len(set(ctensor.grad.valmap for ctensor in ctensors)) == len(ctensors)
+    for idx, (consumer, ctensor) in enumerate(zip(consumers, ctensors)):
+        with graph.mirror.update(consumer.mirror) as bnode:
+            tidx = bnode.outputs().index(ctensor.grad)
+            ctensor.grad = ftensor.grad.select(ctensor.indmap, (idx, len(ctensors)))
+            bnode.set_output(tidx, ctensor.grad)
 
 
 def PASBranch5(graph: IRGraph, resource):
@@ -100,51 +115,36 @@ def PASBranch5(graph: IRGraph, resource):
     5 way branch
     '''
     assert resource.ngpus == 5
-
     devs = list(range(resource.ngpus))
-
-    for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            _replica(graph, node, devs)
-
-    for node in graph.nodes():
-        if isinstance(node, IRFwOperation):
-            if node.name == 'embedding':
-                _tp(graph, node, devs, idx=1, dim=0)
-            elif node.name == 'linear':
-                _tp(graph, node, devs, idx=1, dim=0)
-            elif node.name == 'mean':
-                _tp(graph, node, devs, idx=0, dim=2)
-            elif node.name == 'layernorm' or node.name == 'multiref':
-                _replica(graph, node, devs)
-            elif node.name == 'feedforward1':
-                algo = node.algorithms('dim')
-                sub_nodes = graph.partition(node, algo, idx=1, dim=1, num=2)
-                graph.assign(sub_nodes[0], 0)
-                graph.assign(sub_nodes[1], 1)
-            elif node.name == 'feedforward2':
-                algo = node.algorithms('dim')
-                sub_nodes = graph.partition(node, algo, idx=1, dim=1, num=2)
-                graph.assign(sub_nodes[0], 2)
-                graph.assign(sub_nodes[1], 3)
-            elif node.name == 'feedforward3':
-                algo = node.algorithms('dim')
-                sub_nodes = graph.partition(node, algo, idx=2, dim=0, num=4)
-                graph.assign(sub_nodes[0], 0)
-                graph.assign(sub_nodes[1], 1)
-                graph.assign(sub_nodes[2], 2)
-                graph.assign(sub_nodes[3], 3)
-            elif node.name == 'multi_head_attention':
-                graph.assign(node, 4)
-            elif node.name == 'add':
-                continue
-            else:
-                assert False, node.name
-
-    # adjust add
-    adds = [node for node in graph.nodes() if node.name == 'add']
+    for node in graph.select(ntype=IRDataOperation):
+        _replica(graph, node, devs)
+    for node in graph.select(name='embedding'):
+        _tp(graph, node, devs, idx=1, dim=0)
+    for node in graph.select(name='linear'):
+        _tp(graph, node, devs, idx=1, dim=0)
+    for node in graph.select(name='mean'):
+        _tp(graph, node, devs, idx=0, dim=2)
+    for node in graph.select(name='layernorm'):
+        _replica(graph, node, devs)
+    for node in graph.select(name='feedforward1'):
+        _tp(graph, node, [0, 1], idx=1, dim=1)
+    for node in graph.select(name='feedforward2'):
+        _tp(graph, node, [2, 3], idx=1, dim=1)
+    for node in graph.select(name='feedforward3'):
+        _tp(graph, node, [0, 1, 2, 3], idx=2, dim=0)
+    for node in graph.select(name='multi_head_attention'):
+        graph.assign(node, 4)
+    for node in graph.select(name='identity'):
+        _replica(graph, node, devs)
+    adds = tuple(graph.select(name='add'))
     assert len(adds) == 2
-    graph.assign(adds[0], 4)
-    convert_add_to_valmap(graph, adds[1])
-
+    # graph.assign(adds[0], 4)
+    convert_add_to_valmap(graph, adds[0])
+    _replica(graph, adds[1], devs)
+    # convert_add_to_valmap(graph, adds[1])
+    for node in graph.select('feedforward1'):
+        ftensor = node.input(0).parent
+        break
+    flatten_branch_grad(graph, ftensor)
+    print(graph.extra_repr())
     return graph
