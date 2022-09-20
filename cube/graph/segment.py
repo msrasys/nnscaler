@@ -1,10 +1,12 @@
 from contextlib import contextmanager
 from typing import Dict, Union, List, Optional, Set, Tuple
 
-from cube.ir.tensor import IRFullTensor, IRSubTensor
+from cube.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 from cube.ir.cten import IRTensor, IRCell
-from cube.ir.operator import IRFwOperation, IRBpOperation
+from cube.ir.operator import IRDataOperation, IRFwOperation, IRBpOperation
 from cube.ir.adapter import IRAdapter
+
+from cube.graph.function.function import MultiRef
 
 
 class CellPosition:
@@ -283,47 +285,54 @@ class IRSegment(IRCell):
         assert ftensor in self._ctensors, f"{ftensor} is not in the graph"
         return tuple(self._ctensors[ftensor])
 
-    def grad(self, tensor: IRSubTensor, no_partial_overlap=False) -> IRSubTensor:
+    def infer_grad(self, ftensor: IRFullTensor) -> None:
         """
-        Get gradient of the tensor.
+        Set gradient on sub-tensors of a fulltensor
 
-        @param tensor IRSubTensor: IRSubTensor: the queried tensor
+        Note this can only be called when no operator transformation is
+        applied for this graph.
 
-        @return gradient IRSubTensor: the gradient
+        @param ftensor IRFullTensor: the full tensor.
+
+        @return None: gradient are set to producer/consumer tensor's .grad
         """
-        segment: IRSegment = self.segment(tensor.cell)
-        assert isinstance(tensor, IRSubTensor), "Only tensor has gradient"
-        fgrad = tensor.parent.grad
-        # None means no gradient requirement, flaot means its the loss
-        if fgrad is None or isinstance(fgrad, float):
-            tensor.grad = fgrad
-            return fgrad
-        ftensor = tensor.parent
-        # this tensor is consumed
-        if tensor in tensor.cell.inputs():
-            consumer_cids = []
-            for ctensor, consumer in zip(segment.ctensors(ftensor), segment.consumers(ftensor)):
-                if no_partial_overlap:
-                    assert not (ctensor != tensor and ctensor.overlap(tensor)), (
-                        f"parital overlapping is not supported for gradient\n"
-                        f"{self.debug_tensor_map_str(ctensor.parent)}"
-                    )
-                if ctensor == tensor and consumer.cid not in consumer_cids:
-                    consumer_cids.append(consumer.cid)
-            
-            valmap = (consumer_cids.index(tensor.cell.cid), len(consumer_cids))
-            grad = ftensor.grad.select(
-                indmap = tensor.indmap,
-                valmap = valmap
+        fgrad = ftensor.grad
+        # set for producer
+        assert len(self.producers(ftensor)) <= 1, (
+            f"grad can only be set when no transformation is applied but got:\n"
+            f"{self.debug_tensor_map_str(ftensor)}"
+        )
+        for ptensor, producer in zip(self.ptensors(ftensor), self.producers(ftensor)):
+            idx = producer.outputs().index(ptensor)
+            if fgrad is None:
+                grad = None
+            elif isinstance(fgrad, float):
+                assert fgrad == 1.0, "Detect a backward tensor, but gradient can only be 1.0"
+                grad = fgrad
+            else:
+                grad = fgrad.select(ptensor.indmap, (0, 1))
+            producer.output(idx).grad = grad
+        # set for consumers
+        ctensors = self.ctensors(ftensor)
+        if len(ctensors) > 0:
+            assert all(ctensor == ctensors[0] for ctensor in ctensors), (
+                f"grad can only be set when no transformation is applied but got:\n"
+                f"{self.debug_tensor_map_str(ftensor)}"
             )
-        # this tensor is produced
-        elif tensor in tensor.cell.outputs():
-            grad = ftensor.grad.select(
-                indmap = tensor.indmap,
-                valmap = (0, 1),
-            )
-        tensor.grad = grad
-        return grad
+        curr_valmap = ValueMap((0, 1))
+        nconsumers = len(self.consumers(ftensor))
+        for cidx, (ctensor, consumer) in enumerate(zip(self.ctensors(ftensor), self.consumers(ftensor))):
+            idx = consumer.inputs().index(ctensor)
+            if fgrad is None:
+                grad = None
+            elif isinstance(fgrad, float):
+                assert fgrad == 1.0, "Detect a backward tensor, but gradient can only be 1.0"
+                grad = fgrad
+            else:
+                valmap = curr_valmap.map((0, 2)) if cidx != nconsumers - 1 else curr_valmap
+                grad = fgrad.select(ctensor.indmap, valmap)
+                curr_valmap = curr_valmap.map((1, 2)) if cidx != nconsumers - 1 else curr_valmap
+            consumer.input(idx).grad = grad
 
     def debug_tensor_map_str(self, ftensor: Optional[IRFullTensor] = None) -> str:
         dscp : str = ''
@@ -343,11 +352,10 @@ class IRSegment(IRCell):
         Create dummy backward operator for given forward operator
         """
         assert isinstance(fwop, (IRFwOperation, IRSegment)), "Expected IRFwOperation"
-        fsegment: IRSegment = self.segment(fwop)
         fins = [t for t in fwop.inputs() if isinstance(t, IRSubTensor)]
         fous = [t for t in fwop.outputs() if isinstance(t, IRSubTensor)]
-        igrads = [fsegment.grad(t) if t.requires_grad else None for t in fins]
-        ograds = [fsegment.grad(t) if t.requires_grad else None for t in fous]
+        igrads = [t.grad if t.requires_grad else None for t in fins]
+        ograds = [t.grad if t.requires_grad else None for t in fous]
         if isinstance(fwop, IRFwOperation):
             bwop = IRBpOperation(ograds, igrads)
         else:
@@ -355,55 +363,6 @@ class IRSegment(IRCell):
             bwop = IRSegment(bnodes, ograds, igrads)
         IRCell.make_pair(fwop, bwop)
         return bwop
-    
-    def update_bwop(self, bwop: IRCell) -> IRBpOperation:
-        """
-        Update backward operator or a backward segment.
-
-        This is neccessary when fwop is partitioned and reference count is changed.
-        
-        @param bwop IRBpOperation or IRSegment: the backward operation.
-            It can be at any hierarchy of this segemtn
-
-        @return bwop IRBpOperation: the updated operation (inplace)
-        """
-        assert isinstance(bwop, (IRBpOperation, IRSegment))
-        if isinstance(bwop, IRSegment):
-            assert bwop.isbw() and (not bwop.isfw())
-        bsegment: IRSegment = self.segment(bwop)
-        fsegment = bsegment.mirror
-        with bsegment.update(bwop):
-            fwop: Union[IRFwOperation, IRSegment] = bwop.mirror
-            fins = [t for t in fwop.inputs() if isinstance(t, IRSubTensor)]
-            fous = [t for t in fwop.outputs() if isinstance(t, IRSubTensor)]
-            igrads = [fsegment.grad(t) if t.requires_grad else None for t in fins]
-            ograds = [fsegment.grad(t) if t.requires_grad else None for t in fous]
-            for idx, igrad in enumerate(igrads):
-                bwop.set_output(idx, igrad)
-            # Ad-hoc fix: remove float that could be caused by loss for segment
-            if isinstance(bwop, IRSegment):
-                ograds = [grad for grad in ograds if isinstance(grad, IRSubTensor)]
-            for idx, ograd in enumerate(ograds):
-                bwop.set_input(idx, ograd)
-        return bwop
-
-    def update_ftensor_bw(self, ftensor: IRFullTensor):
-        """
-        Update all backward operators for a full tensor.
-
-        @param ftensor IRFullTensor: the full tensor. If the full
-            tensor is not a gradient, will update backward operators
-            of ftensor.grad
-        
-        @return None
-        """
-        fgrad = ftensor.grad if not ftensor.is_grad() else ftensor
-        if fgrad is None:
-            return
-        for producer in self.producers(fgrad):
-            self.update_bwop(producer)
-        for consumer in self.consumers(fgrad):
-            self.update_bwop(consumer)
 
     # ====================== Basic Graph manipulations ======================
 
@@ -573,6 +532,27 @@ class IRSegment(IRCell):
                 return True
         return False
 
+    def select(self, name: Optional[str] = None, ntype: Optional[IRCell] = None) -> List[IRCell]:
+        """
+        Select all the nodes (including nodes in sub-segment) that
+        satisfy the condition.
+
+        @param name str: the node name
+        @param ntype Type: the node type
+
+        @return nodes List[IRCell]: the nodes that have the name.
+        """
+        nodes = []
+        for node in self.nodes(flatten=True):
+            if name is not None:
+                if node.name != name:
+                    continue
+            if ntype is not None:
+                if not isinstance(node, ntype):
+                    continue
+            nodes.append(node)
+        return nodes
+
     def finsert(self, fwop: IRFwOperation, index: Union[int, CellPosition]) -> IRFwOperation:
         """
         Insert a forward node and create its backward.
@@ -607,6 +587,185 @@ class IRSegment(IRCell):
                 break
         bsegment.insert(bwop, bidx)
         return fwop
+
+    # ===================== Advance Graph manipulations ==================
+
+    def multiref(self, tensor: IRSubTensor, node_groups: List[List[IRFwOperation]]) -> IRFwOperation:
+        """
+        Add multiref to separate nodes into different tensor alias.
+        Each other consumer that is not in the node_groups will be set as a group. 
+
+        @param tensor IRSubTensor: tensor.
+        @param node_groups List[List[IRFwOperation]]: operators that have tensor has input
+        """
+        assert tensor.parent in self._ftensors
+        # add remaining consumers
+        node_groups = tuple(node_groups)
+        for consumer in self.consumers(tensor.parent):
+            if not any(consumer in nodes for nodes in node_groups):
+                node_groups = node_groups + ([consumer],)
+        # create new full tensors
+        ftensors = [tensor.parent.like() for _ in node_groups]
+        otensors = [ft.select(tensor.indmap, tensor.valmap) for ft in ftensors]
+        # update consumer
+        insert_idx = CellPosition((self.nnodes,))
+        for fidx, nodes in enumerate(node_groups):
+            for node in nodes:
+                assert tensor in node.inputs()
+                idx = node.inputs().index(tensor)
+                with self.update(node):
+                    node.set_input(idx, multiref.output(fidx))
+                insert_idx = min(insert_idx, self.index(node))
+        # create multiref
+        multiref = MultiRef('cube.runtime.function.multiref', [tensor, len(node_groups)])
+        for idx, otensor in enumerate(otensors):
+            multiref.set_output(idx, otensor)
+        if len(tensor.device) > 0:
+            multiref.device = tensor.device
+        # set backward
+        if tensor.requires_grad:
+            # add multiref
+            multiref.input(0).grad = tensor.parent.grad.select(tensor.indmap, (0,1))
+            for idx, output in enumerate(multiref.outputs()):
+                output.grad = ftensors[idx].grad.select(tensor.indmap, (0,1))
+            self.finsert(multiref, insert_idx)
+            # update forward gradient
+            for ftensor in ftensors:
+                self.infer_grad(ftensor)
+            # update backward operator
+            for nodes in node_groups + ([multiref,]):
+                for fnode in nodes:
+                    bidx = self.remove(fnode.mirror)
+                    bnode = self.create_bwop(fnode)
+                    self.insert(bidx, bnode)
+        else:
+            self.insert(multiref, insert_idx)
+        return multiref
+
+
+    def single_consume(self, one_for_all: bool = True):
+        """
+        Transform graph to make each non-attribute tensor has up to
+        one consumer. Multiref nodes will be inserted. The API is useful 
+        for cases like inference, where different consumers are partitioned
+        with different tensor dimensions.
+
+        This should be called before any graph transformation.
+
+        e.g., original graph:
+
+            t = producer(xx)
+            ...
+            xx = consumer1(t)
+            ...
+            xx = consumer2(t)
+            ...
+            xx = consumer3(t)
+            ...
+
+        If one_for_all is True, will be:
+
+            t = producer(xx)
+            t1, t2, t3 = multiref(t)
+            ...
+            xx = consumer1(t1)
+            ...
+            xx = consumer2(t2)
+            ...
+            xx = consumer3(t3)
+
+        Otherwise:
+
+            t = producer(xx)
+            ...
+            t1, t2 = multiref(t)
+            xx = consumer1(t1)
+            ...
+            t3, t4 = multiref(t2)
+            xx = consumer2(t3)
+            ...
+            xx = consumer3(t4)
+
+
+        @param one_for_all bool: If True,
+        one single multiref node will be created for each fulltensor. Otherwise,
+        if a fulltensor has K consumers, then K-1 multiref nodes will be created.
+
+        @return None
+        """
+        consumers: Dict[IRFullTensor, List[IRCell]] = dict()
+        producers: Dict[IRFullTensor, IRCell] = dict()
+        if not one_for_all:
+            for node in self.nodes():
+                ftensors = set()
+                for ftensor in node.inputs():
+                    # remove redundant tensors within an operator
+                    if isinstance(ftensor, IRFullTensor) and ftensor.tid not in ftensors:
+                        ftensors.add(ftensor.tid)
+                        if ftensor not in consumers:
+                            consumers[ftensor] = []
+                        consumers[ftensor].append(node)
+                for ftensor in node.outputs():
+                    if isinstance(ftensor, IRFullTensor):
+                        producers[ftensor] = node
+            for ftensor, cnodes in consumers.items():
+                if len(cnodes) == 1 or ftensor.is_attr(): continue
+                reftensor = ftensor
+                ctensor = ftensor
+                while len(cnodes) > 0:
+                    consumer = cnodes.pop(0)
+                    if len(cnodes) > 0:
+                        itensors = [ftensor.like() for _ in range(2)]
+                        multiref = MultiRef(None, [reftensor, 2])
+                        for idx, itensor in enumerate(itensors):
+                            multiref.set_output(idx, itensor)
+                        multiref.infer_shape()
+                        # insert multiref right before the consumor
+                        idx = self.index(consumer)
+                        # require backward
+                        if any(itensor.requires_grad for itensor in node.inputs()):
+                            self.finsert(multiref, idx)
+                        else:
+                            self.insert(multiref, idx)
+                        ctensor, reftensor = itensors
+                    else:
+                        # the last consumer doesn't need multiref
+                        ctensor = reftensor
+                    # update consumer
+                    while ftensor in consumer.inputs():
+                        idx = consumer.inputs().index(ftensor)
+                        consumer.set_input(idx, ctensor)
+        else:
+            for node in self.nodes():
+                ftensors = set()
+                for ftensor in node.inputs():
+                    # remove redundant tensors within an operator
+                    if isinstance(ftensor, IRFullTensor) and ftensor._id not in ftensors:
+                        ftensors.add(ftensor._id)
+                        if ftensor not in consumers:
+                            consumers[ftensor] = []
+                        consumers[ftensor].append(node)
+                for ftensor in node.outputs():
+                    if isinstance(ftensor, IRFullTensor):
+                        producers[ftensor] = node
+            for ftensor, cnodes in consumers.items():
+                if len(cnodes) == 1 or ftensor.is_attr(): continue
+                itensors = [ftensor.like() for _ in range(len(cnodes))]
+                for itensor, consumer in zip(itensors, cnodes):
+                    while ftensor in consumer.inputs():
+                        idx = consumer.inputs().index(ftensor)
+                        consumer.set_input(idx, itensor)
+                # create and insert multiref operation
+                multiref = MultiRef(None, [ftensor, len(cnodes)])
+                for idx, itensor in enumerate(itensors):
+                    multiref.set_output(idx, itensor)
+                multiref.infer_shape()
+                idx = self.index(producers[ftensor]) + 1 if ftensor in producers else 0
+                # idx = nodes.index(cnodes[0])
+                if any(itensor.requires_grad for itensor in node.inputs()):
+                    self.finsert(multiref, idx)
+                else:
+                    self.insert(multiref, idx)
 
     # ====================== Graph Generations ============================
     

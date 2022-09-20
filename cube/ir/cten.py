@@ -51,7 +51,7 @@ class IRCell:
         self.name: str = name
         self.signature = signature
 
-        self._device = list()
+        self._device: Tuple[int] = ()
 
         # source tensors
         self._inputs: List[Optional[IRTensor]] = [None,] * input_length
@@ -83,8 +83,8 @@ class IRCell:
         return self._id
 
     @property
-    def device(self):
-        return copy.copy(self._device)
+    def device(self) -> Tuple[int]:
+        return self._device
 
     @device.setter
     def device(self, device_id: Union[int, List[int]]):
@@ -92,10 +92,10 @@ class IRCell:
         Set the operation device.
         """
         if isinstance(device_id, int):
-            device_id = [device_id]
+            device_id = (device_id,)
         if not all([isinstance(devid, int) for devid in device_id]):
             raise KeyError("Require device Union[int, List[int]]")
-        self._device = copy.copy(list(device_id))
+        self._device = tuple(device_id)
 
     @property
     def mirror(self):
@@ -450,7 +450,7 @@ class IRTensor:
         self._is_grad: bool = False
 
         # tensor gradient
-        self._requires_grad: bool = True
+        self._requires_grad: bool = False
         self._grad: Optional[Union[IRTensor, float]] = None
 
     @property
@@ -607,14 +607,17 @@ class IRTensor:
             cnt *= num
         return cnt
 
-    def backward(self) -> IRCell:
+    def backward(self) -> None:
         """
         Autograd backward on the tensor
 
-        @return graph IRGraph: the forward + backward graph
+        The backward will apply on the program graph
+
+        @return None
         """
-        return self.cell.backward(self)
-        
+        from cube.program import Program
+        graph = Program().get_graph()
+        return graph.backward(self)
 
     def __repr__(self):
         dscp = f'Tensor(id={self._id}, shape={self.shape}, device={self.device})'

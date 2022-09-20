@@ -154,6 +154,8 @@ class Sign2Op:
 
         __rtemplate('multiref'): function.MultiRef,
 
+        __rtemplate('accum'): function.Accum,
+
         #einops
         __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
 

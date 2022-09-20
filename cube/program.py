@@ -39,18 +39,7 @@ class Program:
         for node in nodes:
             self.add_node(node)
 
-    def get_graph(self):
-        has_bp = any(isinstance(node, IRBpOperation) for node in self.instance._graph.nodes())
-        if not has_bp:
-            for ftensor in self.instance._graph.full_tensors():
-                ftensor.requires_grad = False
-            for node in self.instance._graph.nodes(flatten=True):
-                for itensor in node.inputs():
-                    if isinstance(itensor, IRSubTensor):
-                        itensor.grad = None
-                for otensor in node.outputs():
-                    if isinstance(otensor, IRSubTensor):
-                        otensor.grad = None
+    def get_graph(self) -> IRGraph:
         return self.instance._graph
 
     def set_output(self, outputs: List[IRTensor]):

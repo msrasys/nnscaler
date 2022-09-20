@@ -26,7 +26,7 @@ can be
 
 from typing import List, Optional, Union, Tuple, NewType, Dict
 
-from cube.ir.cten import IRCell, IRTensor
+from cube.ir.cten import IRTensor
 from cube.ir.dtype import IRDType
 
 StartEnd = NewType('[start:end)', Tuple[int, int])
@@ -256,7 +256,7 @@ class IRFullTensor(IRTensor):
     the sequentail execution order by its graph.
     """
 
-    def __init__(self, shape=None, name=None, requires_grad=True, dtype=IRDType.unknown):
+    def __init__(self, shape=None, name=None, requires_grad=False, dtype=IRDType.unknown):
 
         super().__init__(shape, name, dtype)
 
@@ -301,7 +301,7 @@ class IRFullTensor(IRTensor):
                 assert val.shape == self.shape
                 assert val.is_attr() == self.is_attr()
         else:
-            assert val is None
+            assert val is None, "The FullTensor doesn't require grad but is assigned with a grad."
         self._grad = val
 
     @property
@@ -309,15 +309,17 @@ class IRFullTensor(IRTensor):
         return self._requires_grad
 
     @requires_grad.setter
-    def requires_grad(self, val: bool):
-        self._requires_grad = val
-        if val and self.grad is None:
-            grad = IRFullTensor(
-                self.shape, 'g' + self.name, 
-                requires_grad=False, dtype=self.dtype
-            ).as_grad(self.is_attr())
-            self._grad = grad
-        elif not val and self.grad is not None:
+    def requires_grad(self, req_grad: bool):
+        if req_grad:
+            self._requires_grad = True
+            if self._grad is None:
+                grad = IRFullTensor(
+                    self.shape, 'g' + self.name, 
+                    requires_grad=False, dtype=self.dtype
+                ).as_grad(self.is_attr())
+                self._grad = grad
+        else:
+            self._requires_grad = False
             self._grad = None
 
     @property
@@ -402,7 +404,11 @@ class IRFullTensor(IRTensor):
         return sub_tensor
 
     def __repr__(self):
-        dscp = f'FullTensor(id={self._id}, shape={self.shape}, device={self.device})'
+        dscp = f'FullTensor(id={self._id}, shape={self.shape})'
+        return dscp
+
+    def extra_repr(self) -> str:
+        dscp = f'FullTensor(id={self._id}, shape={self.shape}, req_grad={self.requires_grad}, is_param={self.is_param()}, is_buff={self.is_buffer()}, is_grad={self.is_grad()})'
         return dscp
 
 
@@ -554,7 +560,15 @@ class IRSubTensor(IRTensor):
             return False
         if any(t.valmap[1] != self.valmap[1] for t in tensors):
             return False
-        return self.valmap[1] % (len(tensors) + 1) == 0
+        if self.valmap[1] % (len(tensors) + 1) != 0:
+            return False
+        # consecutive
+        cids = tuple(t.valmap[0] for t in [self] + tensors)
+        if len(set(cids)) != len(cids) or max(cids) - min(cids) + 1 != len(cids):
+            return False
+        if min(cids) % len(cids) != 0:
+            return False
+        return True
 
     def accum(self, tensors: Union[IRTensor, List[IRTensor]]) -> IRTensor:
         """!
@@ -564,11 +578,10 @@ class IRSubTensor(IRTensor):
         @param: tensors Union[IRTensor, List[IRTensor]]
         @return tensor IRSubTensor: accumulated tensor
         """
+        # print(f'try accuming: {self.extra_repr()} and {tensors.extra_repr()}')
         tensors: List[IRSubTensor] = [tensors,] if isinstance(tensors, IRSubTensor) else tensors
         assert self.accumable(tensors), "Not accumable"
         nreduce = len(tensors) + 1
-        assert self.valmap[1] % nreduce == 0
-        # TODO: make accum more robust
         cid = min(t.valmap[0] for t in [self] + tensors) // nreduce
         valmap = (cid, self.valmap[1] // nreduce)
         indmap = self.indmap
