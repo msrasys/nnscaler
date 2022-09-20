@@ -762,6 +762,18 @@ def Pad(signature, inputs):
     return IRPad(signature, tensors, 'pad', pad=pad, mode=mode, value=value)
 
 
+def Accum(signature, inputs: Tuple[IRTensor]):
+    """
+    tensor = cube.runtime.function.accum(tensors)
+    """
+    assert all(isinstance(t, IRTensor) for t in inputs)
+    signature = 'cube.runtime.function.accum'
+    iannos = [ShapeAnno.create_shape_str(t.shape) for t in inputs]
+    oannos = [copy.copy(iannos[0])]
+    anno = OpAnno.create_op_str(iannos, oannos)
+    return IRDimops(Cat, 'accum', signature, [anno], inputs)
+
+
 def Cat(signature, inputs: Tuple[List[IRTensor], int]):
     """
     torch.cat(inputs: List[Tensor], dim: int) -> Tensor

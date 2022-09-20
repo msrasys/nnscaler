@@ -1,5 +1,5 @@
-import itertools
 from typing import Dict, List, Optional, Tuple, Dict
+import numpy as np
 
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.gener.concurrent import ConcurrentGener
@@ -11,7 +11,10 @@ from cube.ir.tensor import IRFullTensor, IRSubTensor
 from cube.ir.operator import IRFwOperation
 
 from cube.ir.adapter import IRAdapter, IRWeightReducer
-from cube.graph.function.function import Add, Cat, Identity, MultiRef
+from cube.graph.function.function import Accum, Cat, MultiRef
+
+
+DeviceID = int
 
 
 class DummyInputOuput(IRFwOperation):
@@ -101,8 +104,6 @@ class IRAdapterGener:
         """
         # remove anchor node
         graph = IRAdapterGener.remove_anchor(graph)
-        # update the gradient before generate adapter
-        graph = IRAdapterGener.update_grad(graph)
         # generate adapters for activation
         graph = IRAdapterGener.gen_activation(graph)
         # generate weight reducer
@@ -112,15 +113,6 @@ class IRAdapterGener:
         # print(graph.extra_repr())
         return graph
 
-    @staticmethod
-    def update_grad(graph: IRSegment):
-        for ftensor in graph.full_tensors():
-            if ftensor.is_grad():
-                graph.update_ftensor_bw(ftensor)
-        for node in graph.nodes():
-            if isinstance(node, IRSegment) and node.isbw():
-                IRAdapterGener.update_grad(node)
-        return graph
 
     @staticmethod
     def remove_anchor(graph: IRSegment):
@@ -270,7 +262,7 @@ class IRAdapterGener:
             IRAdapterGener.local_consumer_multiref(graph, ftensor)
 
             # print(graph.debug_tensor_map_str(ftensor))
-            # print(graph.debug_tensor_map_str(ftensor.grad))
+            # print(graph.mirror.debug_tensor_map_str(ftensor.grad))
 
             # producers can be operators and graph inputs
             fproducers, fptensors = graph.producers(ftensor), graph.ptensors(ftensor)
@@ -364,119 +356,129 @@ class IRAdapterGener:
         @return new_ftensor IRFullTensor: the new full tensor.
                                           If cannot fuse, the original ftensor.
         """
+        if not ftensor.requires_grad: return ftensor
 
-        def like(tensor: IRSubTensor, share: Optional[IRFullTensor] = None) -> IRSubTensor:
-            parent = tensor.parent.like() if share is None else share
-            return parent.select(tensor.indmap, tensor.valmap)
+        devtensors: Dict[DeviceID, List[IRSubTensor]] = dict()
+        devops: Dict[DeviceID, List[IRCell]] = dict()
 
-        # collect device tensors
-        devtensors: Dict[int, List[IRSubTensor]] = dict()
-        # devid: old tensor -> [nodes,]
-        fuse_tensors: Dict[int, Dict[IRSubTensor, List[IRSubTensor]]] = dict()
-        tensor_map: Dict[int, Dict[IRSubTensor, IRSubTensor]] = dict()
-
-        for tensor in graph.ptensors(ftensor):
-            for devid in tensor.device:
+        # collect producers for each device
+        for ptensor, producer in zip(graph.ptensors(ftensor), graph.producers(ftensor)):
+            for devid in ptensor.device:
                 if devid not in devtensors:
-                    devtensors[devid] = []
-                    fuse_tensors[devid] = dict()
-                    tensor_map[devid] = dict()
-                devtensors[devid].append(tensor)
-                fuse_tensors[devid][tensor] = [tensor]
-                tensor_map[devid][tensor] = tensor
+                    devtensors[devid], devops[devid] = [], []
+                devtensors[devid].append(ptensor)
+                devops[devid].append(producer)
 
-        nodes: List[IRFwOperation] = []
-        for devid, tensors in devtensors.items():
-            if len(tensors) == 1:
-                continue
-            
-            # repeatly search for combinable tensors
-            while True:
-                can_merge = False
-                out = None
-                node = None
-                for t1, t2 in itertools.combinations(tensors, 2):
-                    catdim = t1.catdim(t2)
-                    if catdim is not None:
-                        t1, t2 = [t1, t2] if t1.indmap[catdim][0] < t2.indmap[catdim][0] else [t2, t1]
-                        out = t1.concat(t2, dim=catdim)
-                        node = Cat(
-                            'torch.cat',
-                            ([tensor_map[devid][t1], tensor_map[devid][t2]], catdim)
-                        )
-                        can_merge = True
-                        break
-                    elif t1.accumable(t2):
-                        out = t1.accum(t2)
-                        node = Add(
-                            'torch.add',
-                            [tensor_map[devid][t1], tensor_map[devid][t2]]
-                        )
-                        can_merge = True
-                        break
-                # each time when creats a merge node, the output will be
-                # updated with a new full tensor. The corresponding input
-                # will be set according to the previous node output
-                if can_merge:
-                    tensor_map[devid][out] = like(out)
-                    node.set_output(0, tensor_map[devid][out])  # update output to a new full tensor
-                    tensors.remove(t1)
-                    tensors.remove(t2)
-                    tensors.append(out)
-                    nodes.append(node)
-                    node.device = devid
-                    fuse_tensors[devid][out] = fuse_tensors[devid][t1] + fuse_tensors[devid][t2]
-                    del fuse_tensors[devid][t1]
-                    del fuse_tensors[devid][t2]
-                else:
-                    break
-
-        if len(nodes) == 0: return ftensor
-
-        # recompute
-        rcid = set(producer.recompute for producer in graph.producers(ftensor))
-        rcid = list(rcid)[0] if len(rcid) == 1 else None
-        for node in nodes:
-            node.recompute = rcid
+        require_fusion = any(len(set(ts)) > 1 for ts in devtensors.values())
+        if not require_fusion: return ftensor
 
         new_ftensor = ftensor.like()
 
         # update consumer
-        min_idx = min(graph.index(consumer) for consumer in graph.consumers(ftensor))
-        assert len(graph.ctensors(ftensor)) == len(graph.consumers(ftensor))
         for ctensor, consumer in zip(graph.ctensors(ftensor), graph.consumers(ftensor)):
+            itensor = new_ftensor.select(ctensor.indmap, ctensor.valmap)
+            igrad = new_ftensor.grad.select(ctensor.grad.indmap, ctensor.grad.valmap)
             with graph.update(consumer) as consumer:
-                consumer.set_input(
-                    consumer.inputs().index(ctensor),
-                    new_ftensor.select(ctensor.indmap, ctensor.valmap)
-                )
+                idx = consumer.inputs().index(ctensor)
+                consumer.set_input(idx, itensor)
+            with graph.mirror.update(consumer.mirror) as bconsumer:
+                idx = bconsumer.outputs().index(ctensor.grad)
+                bconsumer.set_output(idx, igrad)
 
-        # insert new producer
-        for devid, tensors in fuse_tensors.items():
-            for ptensor in tensors:
-                new_tensor = like(ptensor, share=new_ftensor)
-                if len(tensors[ptensor]) == 1:
-                    node = Identity('', [ptensor])
-                    node.device = devid
-                    node.set_output(0, new_tensor)
-                    nodes.append(node)
-                else:
-                    for node in nodes:
-                        if node.output(0) == tensor_map[devid][ptensor]:
-                            node.set_output(0, new_tensor)
+        for devid in devtensors:
+            indmaps = [t.indmap for t in devtensors[devid]]
+            valmaps = [t.valmap for t in devtensors[devid]]
+            split_dim = len(set(indmaps)) > 1
+            split_val = len(set(valmaps)) > 1
+            assert not (split_dim and split_val), (
+                f"Not support for simutaneously partitioning tensor dimension and tensor value.\n"
+                f"{graph.debug_tensor_map_str(ftensor)}"
+            )
 
-        for node in nodes[::-1]:
-            assert node not in graph.nodes()
-            assert len(node.outputs()) == 1
-            if graph.mirror is not None:
-                graph.finsert(node, min_idx)
+            node = None
+
+            # split dimension case
+            if split_dim:
+                catdim: int = None
+                for dim in range(len(ftensor.shape)):
+                    dim_maps = [ind[dim] for ind in indmaps]
+                    if set(len(dim_maps)) != 1:
+                        assert catdim is None, (
+                            f"Not support for multi-dim partitioning on local producers.\n"
+                            f"{graph.debug_tensor_map_str(ftensor)}"
+                        )
+                        catdim = dim
+                assert catdim is not None
+                start_idx = np.array([ind[catdim][0] for ind in indmaps])
+                indices = np.argsort(start_idx)
+                ptensors = [devtensors[devid][idx] for idx in indices]
+                try:
+                    otensor = ptensors[0]
+                    for t in ptensors[1:]:
+                        otensor = otensor.concat(t, dim=catdim)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Device {devid}: Fail to concat local produced tensors on dimension: {catdim}\n"
+                        f"Users can try to adjust node ordering to meet with concat order.\n"
+                        f"{graph.debug_tensor_map_str(ftensor)}"
+                    )
+                # set concat input / output
+                node = Cat('torch.cat', (ptensors, catdim))
+                node.set_output(0, new_ftensor.select(otensor.indmap, otensor.valmap))
+                # set gradient
+                for idx, ptensor in enumerate(ptensors):
+                    node.input(idx).grad = ftensor.grad.select(ptensor.indmap, (0,1))
+                node.output(0).grad = new_ftensor.grad.select(otensor.indmap, (0,1))
+
+            # split value case
+            if split_val:
+                # reverse to meet with add order
+                ptensors = devtensors[devid]
+                try:
+                    nchunks = [t.valmap[1] for t in ptensors]
+                    if len(set(nchunks)) == 1:
+                        otensor = ptensors[0].accum(ptensors[1:])
+                    else:
+                        # the add order is to adapt with ordering valmap ordering: (3/4) (2/4) (0/2)
+                        ptensors = ptensors[::-1]
+                        otensor = ptensors[0]
+                        for t in ptensors[1:]:
+                            otensor = otensor.accum(t)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Device {devid}: Fail to accum local produced tensors\n"
+                        f"Users can try to adjust node ordering to meet with accum order\n"
+                        f"{graph.debug_tensor_map_str(ftensor)}"
+                    )
+                # set accum input / output
+                node = Accum('cube.runtime.accum', ptensors)
+                node.set_output(0, new_ftensor.select(otensor.indmap, otensor.valmap))
+                # set gradient
+                for idx, ptensor in enumerate(ptensors):
+                    node.input(idx).grad = ftensor.grad.select(ptensor.indmap, (0,1))
+                node.output(0).grad = new_ftensor.grad.select(otensor.indmap, (0,1))
+
+            # no need for fusion, change the producer output to new tensor
+            if node is None:
+                for ptensor, producer in zip(devtensors[devid], devops[devid]):
+                    otensor = new_ftensor.select(ptensor.indmap, ptensor.valmap)
+                    ograd = new_ftensor.grad.select(otensor.grad.indmap, otensor.grad.valmap)
+                    with graph.update(producer):
+                        idx = producer.outputs().index(ptensor)
+                        producer.set_input(idx, otensor)
+                        producer.input(idx).grad = ograd
+                    with graph.mirror.update(producer.mirror) as bproducer:
+                        idx = bproducer.inputs().index(otensor.grad)
+                        bproducer.set_input(idx, ograd)
             else:
-                graph.insert(node, min_idx)
-
-        # update backward
-        if isinstance(ftensor.grad, IRFullTensor):
-            graph.update_ftensor_bw(new_ftensor)
-            graph.update_ftensor_bw(ftensor)
+                node.device = devid
+                # set recompute
+                rcid = set(producer.recompute for producer in devops[devid])
+                rcid = list(rcid)[0] if len(rcid) == 1 else None
+                node.recompute = rcid
+                # insert
+                max_fid = max(graph.index(producer) for producer in devops[devid])
+                graph.finsert(node, max_fid + 1)
 
         return new_ftensor
 
@@ -496,60 +498,77 @@ class IRAdapterGener:
 
         @param graph IRGraph
         @param ftensor IRFullTensor: the forward full tensor
+
+        @return None
         """
-        # collect to consumer tensors of each device
-        devtensors: Dict[int, Dict[IRSubTensor, List[IRCell]]] = dict()
+        if not ftensor.requires_grad: return
+
+        devtensors : Dict[DeviceID, List[IRSubTensor]] = dict()
+        devops : Dict[DeviceID, List[IRCell]] = dict()
+
+        # collect consumer of each device
         for ctensor, consumer in zip(graph.ctensors(ftensor), graph.consumers(ftensor)):
             for devid in ctensor.device:
                 if devid not in devtensors:
-                    devtensors[devid] = dict()
-                if ctensor not in devtensors[devid]:
-                    devtensors[devid][ctensor] = []
-                devtensors[devid][ctensor].append(consumer)
-        
-        # restrict each device has same subtensor
-        nl = '\n'
+                    devtensors[devid], devops[devid] = [], []
+                assert len(devtensors[devid]) == 0 or devtensors[devid][0] == ctensor, (
+                    f"Detect that a full tensor is partitioned differently on a device.\n"
+                    f"To achieve this, need manually add multiref operator in model description.\n"
+                    f"{graph.debug_tensor_map_str(ftensor)}"
+                )
+                devtensors[devid].append(ctensor)
+                devops[devid].append(consumer)
+
+        require_multiref = any(len(ops) > 1 for ops in devops.values())
+        if not require_multiref: return
+
         for devid in devtensors:
-            assert len(devtensors[devid]) <= 1, (
-                "Detect that a full tensor is partitioned differently on a device.\n"
-                "To achieve this, need manually add multiref operator in model description.\n"
-                f"Full Tensor: {ftensor}\n"
-                f"Producers:\n{nl.join(repr(node) for node in graph.producers(ftensor))}\n"
-                f"Consumers:\n{nl.join(repr(node) for node in graph.consumers(ftensor))}"
-            )
-
-        # add multiref forward node
-        multirefs: Dict[MultiRef, List[IRFwOperation]] = dict()
-        for devid in devtensors:
-            for ctensor in devtensors[devid]:
-                consumers = devtensors[devid][ctensor]
-                if len(consumers) == 1:
-                    continue
-                multiref = MultiRef(None, [ctensor, len(consumers)])
-                multiref.infer_shape()
-                multiref.device = devid
-                ftensors = [ctensor.parent.like() for _ in range(len(consumers))]
-                itensors = [ft.select(ctensor.indmap, ctensor.valmap) for ft in ftensors]
-                for idx, itensor in enumerate(itensors):
-                    multiref.set_output(idx, itensor)
-
-                # update consumer
-                min_fidx = graph.nnodes
-                for itensor, consumer in zip(itensors, consumers):
-                    with graph.update(consumer) as consumer:
-                        idx = consumer.inputs().index(ctensor)
-                        consumer.set_input(idx, itensor)
-
-                # insert forward multiref
-                min_fidx = min(graph.index(consumer) for consumer in consumers)
-                if graph.mirror is not None:
-                    graph.finsert(multiref, min_fidx)
+            grads: List[IRSubTensor] = [t.grad for t in devtensors[devid]]
+            try:
+                nchunks = [grad.valmap[1] for grad in grads]
+                if len(set(nchunks)) == 1:
+                    accum_grad = grads[0].accum(grads[1:])
                 else:
-                    graph.insert(multiref, min_fidx)
-                multirefs[multiref] = consumers
-        
-        if len(multirefs) > 0 and isinstance(ftensor.grad, IRFullTensor):
-            graph.update_ftensor_bw(ftensor)
+                    # the add order is to adapt with ordering valmap ordering: (3/4) (2/4) (0/2)
+                    accum_grad = grads[0]
+                    for grad in grads[1:]:
+                        accum_grad = accum_grad.accum(grad)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Device {devid}: Fail to accumulate local gradient: {ftensor.grad}\n"
+                    f"Error information: {str(e)}\n"
+                    f"Users can try:\n"
+                    f"  1) Replicate all operators whose inputs have multi-consumed tensors\n"
+                    f"  2) Partition all operators whose inputs have multi-consumed tensors\n"
+                    f"  3) Mannually add cube.runtime.multiref in model description to divide replicated and partitioned groups\n"
+                    f"{graph.debug_tensor_map_str(ftensor)}"
+                    f"{graph.mirror.debug_tensor_map_str(ftensor.grad)}"
+                )
+
+            multiref = MultiRef(None, [devtensors[devid][0], len(grads)])
+            # set input gradient
+            multiref.input(0).grad = accum_grad
+            # set output and its gradient
+            for idx, ctensor in enumerate(devtensors[devid]):
+                new_ftensor = ctensor.parent.like()
+                otensor = new_ftensor.select(ctensor.indmap, (0,1))
+                multiref.set_output(idx, otensor)
+                multiref.output(idx).grad = new_ftensor.grad.select(ctensor.indmap, (0,1))
+                # set corresponding consumer input and its backward
+                consumer = devops[devid][idx]
+                with graph.update(consumer):
+                    while ctensor in consumer.inputs():
+                        fidx = consumer.inputs().index(ctensor)
+                        consumer.set_input(fidx, otensor)
+                        consumer.input(fidx).grad = new_ftensor.grad.select(ctensor.indmap, (0,1))
+                with graph.mirror.update(consumer.mirror) as bconsumer:
+                    while ctensor.grad in bconsumer.outputs():
+                        bidx = bconsumer.outputs().index(ctensor.grad)
+                        bconsumer.set_output(bidx, new_ftensor.grad.select(ctensor.indmap, (0,1)))
+            # insert multiref
+            multiref.device = devid
+            min_fidx = min(graph.index(consumer) for consumer in devops[devid])
+            graph.finsert(multiref, min_fidx)
 
     @staticmethod
     def fusion(graph: IRSegment) -> IRSegment:
