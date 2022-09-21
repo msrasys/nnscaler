@@ -1,5 +1,11 @@
 import torch
 import math
+
+from cube.profiler import CudaTimer
+
+from torch.utils.checkpoint import checkpoint
+
+
 """
 [bs, s, r, cm] -> [bs, s, r, cm]
 
@@ -253,13 +259,20 @@ class Evoformer(torch.nn.Module):
 
     def forward(self, msa_repr: torch.Tensor, pair_repr: torch.Tensor):
 
-        msa_repr = msa_repr + MSARowAttentionWithPairBias(
+        # msa_repr = msa_repr + MSARowAttentionWithPairBias(
+        #     self.row_norm_m(msa_repr), pair_repr, self.row_gate_proj,
+        #     self.row_qkv_proj, self.row_out_proj, self.row_bias_proj,
+        #     self.msa_head, self.c, self.scale)
+        msa_repr = msa_repr + checkpoint(MSARowAttentionWithPairBias,
             self.row_norm_m(msa_repr), pair_repr, self.row_gate_proj,
             self.row_qkv_proj, self.row_out_proj, self.row_bias_proj,
             self.msa_head, self.c, self.scale)
 
         msa_repr = msa_repr.transpose(-3, -2)
-        msa_repr = msa_repr + MSAAttention(
+        # msa_repr = msa_repr + MSAAttention(
+        #     self.col_norm(msa_repr), self.col_gate_proj, self.col_qkv_proj,
+        #     self.col_out_proj, None, self.msa_head, self.c, self.scale)
+        msa_repr = msa_repr + checkpoint(MSAAttention,
             self.col_norm(msa_repr), self.col_gate_proj, self.col_qkv_proj,
             self.col_out_proj, None, self.msa_head, self.c, self.scale)
         msa_repr = msa_repr.transpose(-3, -2)
@@ -306,15 +319,36 @@ class Evoformer(torch.nn.Module):
 
         return msa_repr, pair_repr
 
-
-def test():
-    bs, s, r, cm, cz = 1, 128, 256, 256, 128
-    model = Evoformer(s, cm, cz)
-
-    msa = torch.randn(bs, s, r, cm)
-    pair = torch.randn(bs, r, r, cz)
-
+def train_iter(model, msa, pair):
+    bs = msa.size()
     new_msa, new_pair = model(msa, pair)
+    loss = torch.sum(new_msa) + torch.sum(new_pair)
+    loss.backward()
+
+def test(dev):
+    bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    model = Evoformer(s, cm, cz).to(dev)
+
+    msa = torch.randn(bs, s, r, cm).to(dev)
+    pair = torch.randn(bs, r, r, cz).to(dev)
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+
+    warm_up = 20
+    iter_num = 64
+    CudaTimer(enable=False).warmup()
+
+    for i in range(iter_num):
+        if i >= warm_up:
+            CudaTimer(enable=True).start('e2e')
+        train_iter(model, msa, pair)
+        optimizer.step()
+        optimizer.zero_grad()
+        if i >= warm_up:
+            CudaTimer().stop('e2e')
+
+    print(CudaTimer().duration(iter_num - warm_up, field_name='e2e'), 'ms')
+    print(torch.cuda.memory_summary(dev))
 
 
-test()
+test(torch.device('cuda:0'))
