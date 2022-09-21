@@ -63,7 +63,7 @@ def register(anno: str, name: Optional[str] = None):
             kwargs = dict()
             for name, val in zip(kwarg_names, kwarg_vals):
                 kwargs[name] = val
-            return IRDimops(signature, [repr(manno)], tensors, **kwargs, name=op_name)
+            return IRDimops(udfop, op_name, signature, [repr(manno)], tensors, **kwargs)
 
         print(f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
         Sign2Op.register(fsig, udfop, code)

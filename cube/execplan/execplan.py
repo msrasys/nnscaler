@@ -17,7 +17,7 @@ class ExecutionPlan:
         self._inference_only = not any(
              isinstance(n, IRBpOperation) or \
             (isinstance(n, IRAdapter) and not n.forward) or \
-            (isinstance(n, IRSegment) and not n.forward) for n in graph.nodes()
+            (isinstance(n, IRSegment) and not n.isfw()) for n in graph.nodes()
         )
 
         # execution sequence for each device  
@@ -43,6 +43,7 @@ class ExecutionPlan:
                     bidx = self.at(devid).index(fnode.mirror)
                     nodes.remove(fnode.mirror)
                     self.at(devid)[bidx] = fnode_dev.mirror
+                    assert fnode_dev.mirror is not None, f"Find None:\n{fnode_dev}"
 
     @property
     def graph(self) -> IRGraph:
@@ -99,21 +100,19 @@ class ExecutionPlan:
             raise TypeError("Expected a list of Cell")
         self._seq[devid] = seq
 
-    def analyze(self,
+    def visualize(self,
                 map2time: Optional[Callable] = None,
                 map2mem: Optional[Callable] = None,
                 map2name: Optional[Callable] = None,
-                outfile = None):
+                outfile: Optional[str] = None):
         """
-        Draw the execution timeline.
+        Visualize the graph
 
-        Args:
-            span (List[int]): 
-                length equal to schedule unit num.
-                Each element stands for the time span for corresponding Cell
-
-            outfile:
-                the output file name
+        @param map2time Optional[Callable]: node to time (int) map.
+        @param map2mem Optional[Callable]: node to memory consumption (int) map
+        @param map2name Optional[Callable]: node to name (str) map
+        @param outfile Optional[str]: the output file name.
+            If given, will save the visualized execution plan in file.
         """
         ndevice = len(self.devices())
         # timeline [ [ (start_time, end_time), ... ], ... ]
@@ -124,10 +123,11 @@ class ExecutionPlan:
 
         if map2time is None:
             def map2time(node):
-                if isinstance(node, IRGraph):
+                if isinstance(node, IRSegment):
                     span = 0
                     for node in node.nodes():
                         span += map2time(node)
+                    return span
                 if isinstance(node, IRFwOperation):
                     return 1
                 if isinstance(node, IRBpOperation):
@@ -138,7 +138,7 @@ class ExecutionPlan:
         
         if map2mem is None:
             def map2mem(node):
-                if isinstance(node, IRGraph):
+                if isinstance(node, IRSegment):
                     peak_mem = 0
                     curr_mem = 0
                     for node in node.nodes():
@@ -152,20 +152,21 @@ class ExecutionPlan:
 
         if map2name is None:
             def map2name(node):
-                if isinstance(node, IRGraph):
-                    if all([isinstance(n, IRFwOperation) for n in node.nodes()]):
-                        return f'f{node._id}'
-                    if all([isinstance(n, IRBpOperation) for n in node.nodes()]):
-                        if node.mirror is not None:
-                            return f'b{node.mirror._id}'
+                if isinstance(node, IRSegment):
+                    if node.isfw():
+                        return f'f{node.cid}'
+                    elif node.isbw():
+                        return f'b{node.mirror.cid}'
                 if isinstance(node, IRFwOperation):
-                    return f'f{node._id}'
+                    return f'f{node.cid}'
                 if isinstance(node, IRBpOperation):
-                    return f'b{node.mirror._id}'
-                return str(node._id)
+                    return f'b{node.mirror.cid}'
+                if isinstance(node, IRAdapter):
+                    return f'a{node.cid}'
+                return f'?{node.cid}'
 
         def map2color(node):
-            if isinstance(node, IRGraph):
+            if isinstance(node, IRSegment):
                 return map2color(node.nodes(0))
             if isinstance(node, IRFwOperation):
                 return '#4472C4'  # excel blue
@@ -174,13 +175,12 @@ class ExecutionPlan:
             if isinstance(node, IRAdapter):
                 return '#70AD47'  # excel green
 
+        self.graph.reset_dependency()
         for node in self.graph.nodes():
             span, mem = map2time(node), map2mem(node)
+            # calculate time
+            start_times = []
             for device in node.device:
-                # memory
-                device_mem[device] += mem
-                if device_peak_mem[device] < device_mem[device]:
-                    device_peak_mem[device] = device_mem[device]
                 # tight execution if no dependency
                 if len(device_timeline[device]) == 0:
                     start_time = 1
@@ -196,8 +196,17 @@ class ExecutionPlan:
                         if other_node in node.predecessors():
                             start_time = max(start_time, end_time)
                             break
+                start_times.append(start_time)
+            
+            start_time = max(start_times)
+            for device in node.device:
+                # time
                 device_timeline[device].append((start_time, start_time + span))
                 device_nodes[device].append(node)
+                # memory
+                device_mem[device] += mem
+                if device_peak_mem[device] < device_mem[device]:
+                    device_peak_mem[device] = device_mem[device]
 
         max_time = max(
             [tline[-1][1] for tline in device_timeline if len(tline) != 0]

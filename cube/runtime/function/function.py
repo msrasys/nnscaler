@@ -11,7 +11,7 @@ def identity(tensor: torch.Tensor) -> torch.Tensor:
 
 def anchor(name: str):
     """
-    anchor operation for graph navigation 
+    anchor operation for graph navigation
     """
     return None
 
@@ -20,8 +20,14 @@ def multiref(tensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]:
     """
     identity forward. Create multiple same tensor.
     """
-    assert times > 1, "multiref can only be used for num of tensor >= 2"
-    return tuple([tensor] * times)
+    return tensor if times == 1 else tuple([tensor] * times)
+
+
+def accum(*tensors: Tuple[torch.Tensor]) -> torch.Tensor:
+    """
+    accumulate tensors in to one tensor
+    """
+    return torch.sum(torch.stack(tensors, dim=0), dim=0)
 
 
 def conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],

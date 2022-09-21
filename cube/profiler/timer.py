@@ -1,3 +1,4 @@
+from typing import Optional
 import time
 import sys
 
@@ -30,88 +31,118 @@ def print_each_rank(msg, rank_only=None, outfile=''):
 
 class CudaTimer:
     r"""
-    Singleton Timer
+    Singleton Cuda Timer
+
+    Note that frequently using timer may decrease the performance.
+
+    The runtime predefines the timer on each communication primitive.
+    By default, the timer on communications are disabled for higher performance.
+    For users who want to analyze communication overhead, turn on the timer
+    by using `CudaTimer(enable=True, predefined=True)`.
+
+    There are two switches to allow user to control the timer behaviour
+
+    * enable:
+        the overall controller to turn on/off the all profiling.
+    * predefined:
+        the controller to turn on/off the predefined timer (mostly are communications)
     """
     class __CudaTimer:
 
-        def __init__(self, **kwargs):
+        def __init__(self, enable = True, predefined = False):
             self.start_t = None
             self.stop_t = None
             self.field = dict()
             self.field_data = dict()
-            self.enabled = True
-            if 'enable' in kwargs:
-                self.enabled = kwargs['enable']
+            self.enabled = enable
+            self.predefined = predefined
     
     instance = None
 
-    def __init__(self, enable = None):
-        if not CudaTimer.instance:
-            kwargs = dict()
+    def __init__(self, enable: Optional[bool] = None, predefined: Optional[bool] = None):
+        # not have instance
+        if not self.instance:
+            enable = enable if enable is not None else True
+            predefined = predefined if predefined is not None else False
+            CudaTimer.instance = CudaTimer.__CudaTimer(enable, predefined)
+        # have instance
+        else:
             if enable is not None:
-                kwargs = dict(enable=enable)
-            CudaTimer.instance = CudaTimer.__CudaTimer(**kwargs)
-        elif enable is not None:
-            CudaTimer.instance.enabled = enable
-
+                self.instance.enabled = enable
+            if predefined is not None:
+                self.instance.predefined = predefined
     
-    def start(self, field_name='default'):
+    def start(self, field_name='default', predefined: bool = False):
         """
         Start recording time on the the field
 
         Note `start` and `stop` on the same field can be called nestly
         """
-        if not CudaTimer.instance.enabled:
+        if (not self.instance.enabled) or (predefined and not self.instance.predefined):
             return
         torch.cuda.synchronize()
-        if field_name not in CudaTimer.instance.field:
-            CudaTimer.instance.field[field_name] = list()
-            CudaTimer.instance.field_data[field_name] = 0
-        CudaTimer.instance.field[field_name].append(time.time())
+        start_time = time.time()
+        if field_name not in self.instance.field:
+            self.instance.field[field_name] = list()
+            self.instance.field_data[field_name] = 0
+        self.instance.field[field_name].append(start_time)
     
-    def stop(self, field_name='default'):
+    def stop(self, field_name='default', predefined: bool = False):
         """
         Return the time span from last `start` on the smae field name to now
 
         Returns:
             float (ms)
         """
-        if not CudaTimer.instance.enabled:
+        if (not self.instance.enabled) or (predefined and not self.instance.predefined):
             return
-        if field_name not in CudaTimer.instance.field:
+        if field_name not in self.instance.field:
             raise RuntimeError("Missing start on the field")
         torch.cuda.synchronize()
         stop_time = time.time()
-        start_time = CudaTimer.instance.field[field_name].pop(-1)
+        start_time = self.instance.field[field_name].pop(-1)
         span = stop_time - start_time # in seconds
-        CudaTimer.instance.field_data[field_name] += span
+        self.instance.field_data[field_name] += span
         return span
 
-    def duration(self, times, field_name='default'):
-        if field_name not in CudaTimer.instance.field:
+    def duration(self, times: int, field_name: str = 'default') -> float:
+        """
+        Get dthe total span (wall clock) of a field name. The span is divided by times.
+
+        @param times int: division factor
+        @param filed_name str: the field name
+
+        @return span float: wall clock in milliseconds.
+        """
+        if field_name not in self.instance.field:
             raise RuntimeError(f"Missing start on the field {field_name}")
-        if len(CudaTimer.instance.field[field_name]) != 0:
+        if len(self.instance.field[field_name]) != 0:
             raise RuntimeError(f"timer for field {field_name} not stopped")
-        return CudaTimer.instance.field_data[field_name] / times * 1000  # in ms
+        return self.instance.field_data[field_name] / times * 1000  # in ms
 
     def __getattr__(self, name):
         return getattr(self.instance, name)
 
     def clear(self):
-        CudaTimer.instance = CudaTimer.__CudaTimer()
+        self.instance = CudaTimer.__CudaTimer()
 
-    def print_all(self, times):
+    def print_all(self, times: int, rank_only: Optional[int] = None):
+        """
+        Print the total span of each recorded field divided by `times`
+
+        Note this should be called by each process
+
+        @param times int: division factor
+        @param rank_only Optional[int]: select only one rank for print
+
+        @return None
+        """
         msg = list()
-        comm_span = 0
-        for field_name in CudaTimer.instance.field_data:
+        for field_name in self.instance.field_data:
             span = self.duration(times, field_name)
-            if 'send' in field_name or 'recv' in field_name:
-                comm_span += span
             msg.append('{} : {:.2f} ms'.format(field_name, span))
-        # msg.append('{} : {:.2f} ms'.format('communication', comm_span))
         msg = ' | '.join(msg)
-
-        print_each_rank(msg)
+        print_each_rank(msg, rank_only)
 
     def warmup(self, seconds=1.0):
         """
@@ -123,9 +154,10 @@ class CudaTimer:
         # warm up 1s
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
+        torch.cuda.synchronize()
         start = time.time()
         while time.time() - start < seconds:
-            out = torch.matmul(data1, data2)
+            _ = torch.matmul(data1, data2)
             # if torch.distributed.is_initialized():
             #     torch.distributed.all_reduce(out)
             torch.cuda.synchronize()

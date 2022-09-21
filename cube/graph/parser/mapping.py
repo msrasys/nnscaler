@@ -2,17 +2,12 @@
 Mapping of
     Signature -> IROperator
 """
-from typing import Any, Callable, Dict, Union
-import torch
-
-import operator
+from typing import Callable, Dict, Union
 from functools import partial
 
 import cube.graph.function as function
 from cube.ir.operator import IRFwOperation
 
-# TODO this is a backwards-compatible alias
-from cube.graph.torch_dtype_mapping import DType2IRDType
 
 class Sign2Op:
 
@@ -70,6 +65,9 @@ class Sign2Op:
         __ftemplate('gelu') : function.GeLU,
         __ttemplate('gelu') : function.GeLU,
 
+        __ftemplate('silu') : function.SiLU,
+        __ttemplate('silu') : function.SiLU,
+
         __ftemplate('_pad'): function.Pad,
 
         __ftemplate('layer_norm'): function.LayerNorm,
@@ -99,10 +97,10 @@ class Sign2Op:
 
         __ttemplate('neg'): function.Neg,
 
-        __ttemplate('gt'): partial(function.comparison_einops, operator.gt, 'gt'),
-        __ttemplate('lt'): partial(function.comparison_einops, operator.lt, 'lt'),
-        __ttemplate('ge'): partial(function.comparison_einops, operator.ge, 'ge'),
-        __ttemplate('le'): partial(function.comparison_einops, operator.le, 'le'),
+        __ttemplate('gt'): function.CompareGT,
+        __ttemplate('lt'): function.CompareLT,
+        __ttemplate('ge'): function.CompareGE,
+        __ttemplate('le'): function.CompareLE,
 
         __ttemplate('pow'): function.Pow,
 
@@ -113,6 +111,7 @@ class Sign2Op:
         __ttemplate('bmm') : function.BatchLinear,
 
         __ttemplate('sum') : function.Sum,
+        __ttemplate('mean') : function.Mean,
 
         __ttemplate('transpose') : function.Transpose,
 
@@ -150,16 +149,16 @@ class Sign2Op:
 
         # runtime functions
         __rtemplate('anchor'): function.GraphAnchor,
-        
+
         __rtemplate('identity'): function.Identity,
+
+        __rtemplate('multiref'): function.MultiRef,
+
+        __rtemplate('accum'): function.Accum,
 
         #einops
         __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
 
-        #custom ops
-        __customops('strip_2_borders'): function.CustomOps,
-        __customops('update_diag_'): function.CustomOps,
-        __customops('update_geopotential_'): function.CustomOps,
     }
 
     # customized operator code: signature -> code

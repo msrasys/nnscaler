@@ -3,6 +3,7 @@ Generate Pytorch code given the model DAG and the transformation config
 """
 import itertools
 from typing import Dict, Generator, Iterable, List, Any, Optional, Set, Tuple, Union
+import warnings
 import torch
 import copy
 from more_itertools import split_when
@@ -35,14 +36,14 @@ def get_backward_callsite_io_tensors(bp_segment:IRSegment):
     #inputs to 'backward'                         outputs of 'backward'
     ```
     """
-    assert isinstance(bp_segment, IRSegment) and not bp_segment.forward
+    assert isinstance(bp_segment, IRSegment) and not bp_segment.isfw()
 
     input_tensors = [t for t in bp_segment.mirror.inputs() if \
         isinstance(t, IRSubTensor) and \
         t.requires_grad and \
         not t.is_attr()
     ]
-    output_tensors = [t for t in bp_segment.mirror.outputs() if isinstance(t, IRSubTensor)]
+    output_tensors = [t for t in bp_segment.mirror.outputs() if isinstance(t, IRSubTensor) and t.grad is not None]
     input_grads = [t.grad for t in input_tensors]
 
     # WARNING !!!
@@ -99,7 +100,7 @@ def calc_tenvars_lifetime(
         inputs : Iterable[IRTensor]
 
         if isinstance(node, IRSegment):
-            if node.forward:
+            if node.isfw():
                 outputs = node.outputs()
                 inputs = node.inputs()
             else:
@@ -386,6 +387,8 @@ class ModelCodeGen(CodeGen):
         self.symbols = SymbolTable()
         # ref module to check shared variables
         self._ref_module = torch.nn.Module()
+        # batch size
+        self.batch_size = None
 
     def init_comm_groups(self):
         """
@@ -409,7 +412,7 @@ class ModelCodeGen(CodeGen):
                 if ranks not in comm_groups:
                     comm_groups.append(ranks)
         # collect groups from p2p fusion
-        adapters = [n for n in graph.flatten() if isinstance(n, IRAdapter)]
+        adapters = [n for n in graph.nodes(flatten=True) if isinstance(n, IRAdapter)]
         for adapter in adapters:
             for prim in adapter.prims:
                 if isinstance(prim, CollectivePrim):
@@ -446,7 +449,7 @@ class ModelCodeGen(CodeGen):
         # parse graph body
         for node in self.execplan.seq(device):
             if isinstance(node, IRSegment):
-                if not node.forward: continue  # skip backward segment
+                if not node.isfw(): continue  # skip backward segment
                 codes = self.emit_segment_code(node)
             elif isinstance(node, IRFwOperation):
                 raise RuntimeError(f"Unexcepted global-level op call: {node}")
@@ -458,6 +461,7 @@ class ModelCodeGen(CodeGen):
             elif isinstance(node, IRBpOperation):
                 continue
             elif isinstance(node, IRDataOperation):
+                self.emit_batchsize_code(node)
                 continue
             else:
                 raise RuntimeError(f"Un-recognized IRCell type: {type(node)}")
@@ -535,33 +539,37 @@ class ModelCodeGen(CodeGen):
         psign = "self.register_parameter('{name}', torch.nn.Parameter(torch.empty({shape}, dtype={dtype})))"
         bsign = "self.register_buffer('{name}', torch.empty({shape}, dtype={dtype}))"
         map_sign = "self.add_full_map('{attr}', {tid}, {slicers}, {val_chunks})"
-        for itensor in node.inputs():
-            name = self.tensor_naming(itensor, prefix_attr='self.')
-            if isinstance(itensor, IRSubTensor):
-                if itensor.is_attr() and not self.symbols.exist(name):
-                    self.symbols.create(name)
-                    sign = psign if itensor.is_param() else bsign
-                    code = sign.format(
-                        name=self.tensor_naming(itensor),
-                        shape=tuple(itensor.shape),
-                        dtype=self.dtype_map(itensor.dtype)
-                    )
-                    self.model_init_statements.append(code)
-                    tid = itensor.parent.tid
-                    slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
-                    val_chunks = itensor.valmap[1]
-                    code = map_sign.format(
-                        attr=self.tensor_naming(itensor), tid=tid,
-                        slicers=str(slicers), val_chunks=val_chunks
-                    )
-                    self.model_init_statements.append(code)
-                    self.model_init_statements.append('')
-            if isinstance(itensor, str):
-                if name.startswith('self.'):
-                    if not hasattr(self._ref_module, name[5:]):
-                        raise NotImplementedError("member attribute is not added")
-        for output in node.outputs():
-            self.symbols.create(self.tensor_naming(output, prefix_attr='self.'))
+        if not isinstance(node, IRSegment):
+            for itensor in node.inputs():
+                name = self.tensor_naming(itensor, prefix_attr='self.')
+                if isinstance(itensor, IRSubTensor):
+                    if itensor.is_attr() and not self.symbols.exist(name):
+                        self.symbols.create(name)
+                        sign = psign if itensor.is_param() else bsign
+                        code = sign.format(
+                            name=self.tensor_naming(itensor),
+                            shape=tuple(itensor.shape),
+                            dtype=self.dtype_map(itensor.dtype)
+                        )
+                        self.model_init_statements.append(code)
+                        tid = itensor.parent.tid
+                        slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
+                        val_chunks = itensor.valmap[1]
+                        code = map_sign.format(
+                            attr=self.tensor_naming(itensor), tid=tid,
+                            slicers=str(slicers), val_chunks=val_chunks
+                        )
+                        self.model_init_statements.append(code)
+                        self.model_init_statements.append('')
+                if isinstance(itensor, str):
+                    if name.startswith('self.'):
+                        if not hasattr(self._ref_module, name[5:]):
+                            raise NotImplementedError("member attribute is not added")
+            for output in node.outputs():
+                self.symbols.create(self.tensor_naming(output, prefix_attr='self.'))
+        else:
+            for sub_node in node.nodes():
+                self.emit_node_tensors_declare(sub_node)
         return
 
     def emit_segment_code(self, segment: IRSegment) -> List[str]:
@@ -669,7 +677,7 @@ class ModelCodeGen(CodeGen):
 
             nodes : List[IRCell] = [node for i, node in i_nodes]
 
-            subseg = self.execplan.graph.segment(nodes)
+            subseg = self.execplan.graph.create_segment(nodes)
 
             inputs = [t for t in subseg.inputs() if not t.is_attr()]
             input_names = [self.tensor_naming(t) for t in inputs]
@@ -890,6 +898,20 @@ class ModelCodeGen(CodeGen):
         code = f'{reducer_name}.allreduce()'
         return [code]
 
+    def emit_batchsize_code(self, node: IRDataOperation):
+        """
+        Emit batch size declare
+        """
+        signature = 'self.set_batch_size({bs})'
+        bs = [t.shape[dim] for t, dim in zip(node.outputs(), node.get_batch_dims())]
+        bs = set(bs)
+        if len(bs) > 1:
+            warnings.warn(f'Find Heterogenous batch size {bs}. Keep output to be same with semantic dataloder.')
+        bs = list(bs)[0] if len(bs) == 1 else None
+        assert self.batch_size is None or self.batch_size == bs, f"Not match for batch size: {self.batch_size} != {bs}"
+        self.model_init_statements.append(signature.format(bs=bs))
+        self.batch_size = bs
+
     def clear(self):
         """
         Clear buffer that used for generating code
@@ -900,6 +922,8 @@ class ModelCodeGen(CodeGen):
         self.model_methods_bodies: List[List[str]] = list()
         # module member name
         self.symbols = SymbolTable()
+        # batch size
+        self.batch_size = None
 
 
 class ScheduleCodeGen(CodeGen):
@@ -976,8 +1000,9 @@ class ScheduleCodeGen(CodeGen):
         """
         Emit node / subgraph code
         """
-        fsign = '{outputs} = cube.runtime.executor.fexecute({model}, *{inputs}, requires_grad={req_grad})'
-        bsign = '{input_grads} = cube.runtime.executor.backward({input_tensors}, {output_tensors}, {output_grads})'
+        fsign = '{outputs} = cube.runtime.executor.fexecute({name}, {model}, *{inputs}, requires_grad={req_grad})'
+        asign = '{outputs} = cube.runtime.executor.aexecute({model}, *{inputs}, requires_grad={req_grad})'
+        bsign = '{input_grads} = cube.runtime.executor.backward({name}, {input_tensors}, {output_tensors}, {output_grads})'
         
         inputs = self.tuple_naming(node.inputs(), skip_attr=True, prefix_attr='model.')
         outputs = self.return_naming(node.outputs(), skip_attr=True, prefix_attr='model.')
@@ -985,9 +1010,10 @@ class ScheduleCodeGen(CodeGen):
 
         if isinstance(node, IRSegment):
             # emit forward
-            if node.forward:
+            if node.isfw():
                 code = fsign.format(
                     outputs = outputs,
+                    name = f"'{name}'",
                     model = f'model.{name}',
                     inputs = inputs,
                     req_grad = req_grad
@@ -1002,6 +1028,7 @@ class ScheduleCodeGen(CodeGen):
                         assert tensor == 1.0, "Loss gradient should be 1.0"
                         output_grads[idx] = None
                 code = bsign.format(
+                    name = f"'{self.node_naming(node.mirror)}'",
                     input_grads = self.return_naming(input_grads),
                     input_tensors = self.tuple_naming(input_tensors, skip_attr=True, prefix_attr='model.'),
                     output_tensors = self.tuple_naming(output_tensors, skip_attr=True, prefix_attr='model.'),
@@ -1016,7 +1043,7 @@ class ScheduleCodeGen(CodeGen):
             code = f'{outputs} = next(dataloader)'
 
         elif isinstance(node, IRAdapter):
-            code = fsign.format(
+            code = asign.format(
                 outputs = outputs,
                 model = f'model.{name}',
                 inputs = inputs,
@@ -1024,7 +1051,7 @@ class ScheduleCodeGen(CodeGen):
             )
 
         elif isinstance(node, IRWeightReducer):
-            code = fsign.format(
+            code = asign.format(
                 outputs = outputs,
                 model=f'model.{name}',
                 inputs='()',

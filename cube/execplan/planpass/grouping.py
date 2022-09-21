@@ -6,11 +6,13 @@ from typing import List, Dict, Tuple
 from cube.execplan import ExecutionPlan
 from cube.execplan.planpass.planpass import PlanPass
 from cube.ir.adapter import IRAdapter
+from cube.ir.adapter.prim import IdentityPrim
 from cube.ir.operator import IRFwOperation
 from cube.ir.cten import IRCell
         
 
 class Grouping(PlanPass):
+
     @staticmethod
     def apply(execplan: ExecutionPlan) -> ExecutionPlan:
         """
@@ -20,11 +22,11 @@ class Grouping(PlanPass):
         fgroups, bgroups = Grouping.group(execplan)
         for devid in execplan.devices():
             for fpieces, bpieces in zip(fgroups[devid], bgroups[devid]):
-                fsubgraph = graph.segment(fpieces)
+                fsubgraph = graph.create_segment(fpieces)
                 if bpieces is not None:
-                    bsubgraph = graph.segment(bpieces)
+                    bsubgraph = graph.create_segment(bpieces)
                     IRCell.make_pair(fsubgraph, bsubgraph)
-                subgraphs = [fsubgraph] if bpieces is None else [fsubgraph, bsubgraph]
+                subgraphs = [fsubgraph] if bpieces is None else [fsubgraph, fsubgraph.mirror]
                 for subgraph in subgraphs:
                     # update execution plan: replace the nodes with the subgraph
                     pieces = subgraph.nodes()
@@ -32,6 +34,11 @@ class Grouping(PlanPass):
                     execplan.at(devid).insert(idx, subgraph)
                     for node in pieces:
                         execplan.at(devid).remove(node)
+            # remove identity adapter
+            for adapter in execplan.seq(devid):
+                if isinstance(adapter, IRAdapter):
+                    if all(isinstance(prim, IdentityPrim) for prim in adapter.prims):
+                        execplan.at(devid).remove(adapter)
         return execplan
 
     @staticmethod

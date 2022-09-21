@@ -8,155 +8,33 @@ IRGraph:
 """
 
 from typing import Union, Tuple, List, Optional, Dict
-import copy
-from cube.graph.function.function import MultiRef
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.ir.unique import IDGenerator
 from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
-from cube.ir.adapter import IRAdapter
-from cube.ir.tensor import IRFullTensor, IRSubTensor
+from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
+from cube.ir.dtype import IRDType, DTypeInferRule
+
+from cube.graph.function.function import Identity, MultiRef
+from cube.graph.segment import IRSegment
 
 from cube.algorithm.generics import GenericDistAlgo
 
 
-class IRSegment(IRCell):
+class IRGraph(IRSegment):
     """
-    A distributed sub-graph representing a piece of workload in parent IRGraph
-    """
+    IRGraph.
 
-    def __init__(self, nodes: List[IRCell], inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
-        super().__init__('segment', '', len(inputs), len(outputs), init_outputs=False)
-
-        self._nodes = nodes
-        self._idevice = [t.device for t in inputs]
-        self._odevice = [t.device for t in outputs]
-
-        for idx, val in enumerate(inputs):
-            self.set_input(idx, val)
-        for idx, val in enumerate(outputs):
-            self.set_output(idx, val)
-        # setup device
-        device = set()
-        for node in nodes:
-            device.update(node.device)
-        self.device = list(device)
-        # setup whether forward
-        fnodes = any(isinstance(n, IRFwOperation) for n in nodes)
-        bnodes = any(isinstance(n, IRBpOperation) for n in nodes)
-        assert not (fnodes and bnodes), "An IRSegment cannot have both forward nodes and backward nodes"
-        self._forward = fnodes
-
-    @property
-    def forward(self) -> bool:
-        return self._forward
-
-    def nodes(self, idx: Optional[int] = None) -> Union[IRCell, List[IRCell]]:
-        if isinstance(idx, int):
-            return self._nodes[idx]
-        else:
-            return copy.copy(self._nodes)
-
-    def dispatch(self, devid: int, for_mirror=True) -> Optional[IRCell]:
-        """
-        Instantiate from distributed representation to a
-        device-specific sub-graph.
-        
-        The mirror will also be dispatched if it is not None.
-
-        Return the dispatched segment
-        """
-        if devid not in self.device:
-            return None
-        if len(self.device) == 1 and self.device == [devid]:
-            return self
-        itensors = [t for t, device in zip(self.inputs(), self._idevice) if devid in device]
-        otensors = [t for t, device in zip(self.outputs(), self._odevice) if devid in device]
-        nodes = [n for n in self.nodes() if devid in n.device]
-        for idx, adapter in enumerate(nodes):
-            if isinstance(adapter, IRAdapter):
-                nodes[idx] = adapter.dispatch(devid)
-        fseg = IRSegment(nodes, itensors, otensors)
-        fseg._id = self._id
-        # dispatch for mirror
-        if for_mirror and isinstance(self.mirror, IRSegment):
-            bseg = self.mirror.dispatch(devid, for_mirror=False)
-            IRCell.make_pair(fseg, bseg)
-        return fseg
-
-    def to_str(self, skip_attr: bool = False) -> str:
-        name = ('f' if self.forward else 'b') + 'Segment'
-        inputs = tuple(t for t in self.inputs() if not (t.is_attr() and skip_attr))
-        outputs = tuple(t for t in self.outputs() if not (t.is_attr() and skip_attr))
-        return f'{name}{self._id}-{self.device}(inputs={inputs}, outputs={outputs})'
-
-    def __repr__(self):
-        return self.to_str()
-
-    def extra_repr(self) -> str:
-        dscp = repr(self)
-        for node in self.nodes():
-            dscp += '\n\t' + repr(node)
-        return dscp
-
-
-class IRGraph(IRCell):
-    """
-    IR Graph. The hyperGraph for representing distributed
-    graph.
+    IRGraph is used for reprensting a distributed training iteration.
     """
 
-    def __init__(self, 
-                 nodes: List[IRCell],
-                 inputs: Optional[List[IRTensor]], 
-                 outputs: Optional[List[IRTensor]], 
+    def __init__(self, nodes: List[IRCell], inputs: List[IRTensor], outputs: List[IRTensor], 
                  module_name: str):
 
-        self._nodes: List[IRCell] = list()
-        self._attributes = list()
-        self._full_tensors: Dict[int, IRFullTensor] = dict()
-        self._train: bool = any(
-            isinstance(node, IRBpOperation) or
-            (isinstance(node, IRSegment) and node.forward) or
-            (isinstance(node, IRAdapter) and node.forward) for node in nodes
-        )
+        super().__init__(nodes, inputs, outputs, module_name)
 
         self._sched = None  # the schedule strategy
 
-        if inputs is None:
-            inputs = IRGraph.get_inputs(nodes)
-        if outputs is None:
-            outputs = IRGraph.get_outputs(nodes)
-
-        super().__init__(
-            name=module_name,
-            signature=module_name,
-            input_length=len(inputs),
-            output_length=len(outputs)
-        )
-
-        for idx, tensor in enumerate(inputs):
-            self.set_input(idx, tensor)
-        for idx, tensor in enumerate(outputs):
-            self.set_output(idx, tensor)
-
-        # set parameters / buffers and full tensors
-        for node in nodes:
-            for tensor in node.inputs() + node.outputs():
-                if isinstance(tensor, IRSubTensor):
-                    pid = tensor.parent._id
-                    self._full_tensors[pid] = tensor.parent
-                    if tensor.is_attr():
-                        self._attributes.append(tensor)
-
-        for ftensor in self._full_tensors.values():
-            ftensor.clear_producer_consumer()
-
-        # insert node from nodes
-        for idx, node in enumerate(nodes):
-            self.attach(node, idx)
-
-        self.reset_dependency()
 
     @property
     def train(self) -> bool:
@@ -165,59 +43,17 @@ class IRGraph(IRCell):
 
         @return train bool: True if backward is required, otherwise False (inference only).
         """
-        return self._train
+        return self._have_forward and self._have_backward
 
-    def reset_dependency(self):
-        """
-        Reset the node dataflow dependency
+    # ================ Deep Learning Interfalce ======================
 
-        Note all the predefined control dependencies will be removed.
+    def __call__(self, *args):
         """
-        for node in self._nodes:
-            node.clear_predecessor()
-            node.clear_successor()
-        # TODO: adapter dependency not set
-        for ftensor in self._full_tensors.values():
-            for ptensor, producer in zip(ftensor.ptensors, ftensor.producers):
-                for ctensor, consumer in zip(ftensor.ctensors, ftensor.consumers):
-                    if ptensor.overlap(ctensor):
-                        pidx = producer.outputs().index(ptensor)
-                        cidx = consumer.inputs().index(ctensor)
-                        producer.add_successor(pidx, consumer)
-                        consumer.add_predecessor(cidx, producer)
-                # set mirror as control dependency
-                if producer.mirror and isinstance(producer, IRFwOperation):
-                    producer.add_successor(-1, producer.mirror)
-                    producer.mirror.add_predecessor(-1, producer)
-
-    def attributes(self) -> Tuple[IRSubTensor]:
+        Register forward action
         """
-        Return parameter list
-        """
-        return tuple(self._attributes)
-
-    def full_tensors(self) -> List[IRSubTensor]:
-        """
-        Return full tensor list
-        """
-        return list(self._full_tensors.values())
-
-    def nodes(self, index: Optional[int] = None) -> Union[IRCell, List[IRCell]]:
-        """
-        Get node at position index
-        """
-        if isinstance(index, int):
-            if index >= len(self._nodes):
-                raise RuntimeError(
-                    f"Get node out of range ({index} >= {len(self._nodes)})"
-                )
-            return self._nodes[index]
-        elif index is None:
-            return copy.copy(self._nodes)
-        else:
-            raise TypeError("Expected index to be None or int")
-
-    def forward(self, *args) -> Union[IRTensor, Tuple[IRTensor]]:
+        return self.forward(*args)
+    
+    def forward(self, *args: Tuple[IRSubTensor]) -> Union[IRTensor, Tuple[IRTensor]]:
         """
         forward will divide the graph into Actions according to
         node device assignment
@@ -225,269 +61,178 @@ class IRGraph(IRCell):
         Currently each forward call will result in a new flow
         even if the input is same
 
-        Returns:
-            IRTensors
-        """
-        from cube.logics.translator import LogicTranslator
-        return LogicTranslator.forward(self, *args)
+        @param args Tuple[Any]
 
-    def __call__(self, *args):
+        @return outputs Union[IRSubTensor, Tuple[IRSubTensor]]
         """
-        Register forward action
-        """
-        return self.forward(*args)
-
-    def segment(self, nodes: List[IRCell]) -> IRSegment:
-        """!
-        Create a segment (sub-graph) with part of the nodes.
-        Nodes are allowed to be on different devices.
-        The grouped segement will not add into graph.nodes().
-
-        @param nodes List[IRCell]: the subset nodes of this graph
-
-        @return segment IRSegment: the grouped segment. 
-        """
-        inputs, outputs = [], []
-        itdevs, otdevs = dict(), dict()
-        for node in nodes:
-            assert not isinstance(node, IRSegment), 'A segment cannot be in other segments'
-            # update inputs
+        # align graph with input tensors
+        itensors: Tuple[IRSubTensor, ...] = self.inputs()
+        assert len(args) == len(itensors)
+        for idx, (itensor, arg) in enumerate(zip(itensors, args)):
+            self.set_input(idx, arg)
+            for producer in self.producers(itensor.parent):
+                with self.update(producer):
+                    while itensor in producer.outputs():
+                        oidx = producer.outputs().index(itensor)
+                        producer.set_output(oidx, arg)
+            for consumer in self.consumers(itensor.parent):
+                with self.update(consumer):
+                    while itensor in consumer.inputs():
+                        iidx = consumer.inputs().index(itensor)
+                        consumer.set_input(iidx, arg)
+            while itensor in self.outputs():
+                oidx = self.outputs().index(itensor)
+                self.set_output(oidx, arg)
+            while itensor in self.inputs():
+                iidx = self.inputs().index(itensor)
+                self.set_input(iidx, arg)
+        
+        # dtype inference
+        for node in self._nodes:
             itensors = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
+            # setup gradient
             for itensor in itensors:
-                producers = [p for p in itensor.parent.producers if set(p.device).issubset(set(node.device))]
-                # no producer means a weight or cross device-group
-                if len(producers) == 0 or any(p not in nodes for p in producers):
-                    if itensor not in itdevs:
-                        itdevs[itensor] = []
-                    devs = set(itensor.device)
-                    if devs not in itdevs[itensor]:
-                        inputs.append(itensor)
-                        itdevs[itensor].append(devs)
-            # update outputs
+                if itensor.parent.grad is not None:
+                    itensor.parent.dtype = itensor.dtype
+            if len(itensors) == 0: continue
+            odtype = DTypeInferRule.infer(node, [t.dtype for t in itensors])
+            assert odtype != IRDType.unknown, f"{node} : {[t.dtype for t in itensors]}"
             otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
-            for otensor in otensors:
-                consumers = [c for c in otensor.parent.consumers if set(c.device).issubset(set(node.device))]
-                # no consumer usually means the loss or cross device-group
-                if otensor in self.outputs() or len(consumers) == 0 or any(c not in nodes for c in consumers):
-                    devs = set(otensor.device)
-                    if otensor not in otdevs:
-                        otdevs[otensor] = []
-                    if devs not in otdevs[otensor]:
-                        outputs.append(otensor)
-                        otdevs[otensor].append(devs)
-        segment = IRSegment(nodes, inputs, outputs)
-        return segment
+            for tensor in otensors:
+                tensor.dtype = odtype
+                # setup graidient
+                if tensor.parent.grad is not None:
+                    tensor.parent.grad.dtype = odtype
 
-    def group(self, nodes: List[IRCell]) -> IRSegment:
+        from cube.program import Program
+        Program().add_nodes(self.nodes())
+
+        # return
+        if len(self.outputs()) == 1:
+            return self.output(0)
+        else:
+            return self.outputs()
+
+    def backward(self, loss: IRSubTensor):
+        """
+        Backward the graph from the entry tensor of loss.
+
+        @param loss IRSubTensor: the loss tensor, must be in the output
+            of current graph. The loss shape should be (1,)
+
+        @return self IRGraph: None
+        """
+        # set mirror as self
+        self._mirror = self
+
+        # infer gradient requirement
+        for node in self.nodes():
+            itensors = [t for t in node.inputs() if isinstance(t, IRTensor)]
+            require_grad = any(t.requires_grad for t in itensors)
+            for otensor in node.outputs():
+                if not isinstance(otensor, IRTensor): continue
+                if isinstance(otensor, IRSubTensor):
+                    otensor.parent.requires_grad = require_grad
+                else:
+                    otensor.requires_grad = require_grad
+        
+        # set loss gradient
+        assert tuple(loss.shape) == (1,), f"the loss should be of shape [1,] (got {loss.shape})"
+        loss.parent.grad = 1.0
+
+        # infer gradient
+        for ftensor in self._ftensors:
+            self.infer_grad(ftensor)
+        # create backward node
+        for fnode in self.nodes()[::-1]:
+            assert not isinstance(fnode, IRSegment), "Internal Error: Segment should not appear for now"
+            if not isinstance(fnode, IRFwOperation): continue
+            tensors = [t for t in fnode.inputs() + fnode.outputs() if isinstance(t, IRSubTensor)]
+            grads = [t.grad for t in tensors]
+            # no backward op generated for fnode
+            if all(grad is None for grad in grads): continue
+            # create backward op and insert to graph
+            bwop = self.create_bwop(fnode)
+            self.insert(bwop, self.nnodes)
+
+        return self
+
+
+    # ========================= Graph Manipulation ========================
+
+    def group(self, fnodes: List[IRCell]) -> IRSegment:
         """!
-        Group consecutive nodes into IRSegment. the grouped segment will
-        replace the nodes in the graph.
-
-        Note: Currently this interface will break the dependency,
-        it can only be used after user policy
+        Group consecutive forward nodes into IRSegment.
+        Note the fnodes should not apply any transformation.
+        TODO: update operator dependency
+        
+        The corresponding backward nodes will also be grouped.
 
         @param nodes List[IRCell]: the consecutive node subset of this graph
         
         @return segment IRSegment: the grouped segment
         """
-        allnodes = self.nodes()
-        indices = [allnodes.index(n) for n in nodes]
-        minidx, maxidx = min(indices), max(indices)
-        assert maxidx - minidx + 1 == len(nodes), "nodes are not consecutive"
-        segment = self.segment(nodes)
-        self._nodes = allnodes[:minidx] + [segment] + allnodes[maxidx+1:]
-        # FIXME: set segment dependnecy
-        return segment
+        assert any(not isinstance(node, (IRBpOperation, IRDataOperation)) for node in fnodes), \
+            "grouped nodes cannot be backward operation, segment or data operation"
+        
+        fgraphs = [self.segment(fnode) for fnode in fnodes]
+        assert len(set(fgraphs)) == 1, "Cross-segment grouping is not allowed yet."
+        
+        # get backward nodes
+        bnodes = [fnode.mirror for fnode in fnodes[::-1] if fnode.mirror is not None]
+        
+        fgraph: IRSegment = fgraphs[0]
+        bgraph: IRSegment = fgraph.mirror
 
-    def detach(self, node: IRCell, reset_dependency=False) -> int:
-        """
-        Detach (remove) a node from current graph.
+        findices: Tuple[int] = tuple(fgraph.index(fnode)[0] for fnode in fnodes)
+        bindices: Tuple[int] = tuple(bgraph.index(bnode)[0] for bnode in bnodes)
 
-        All the used input and output tensors inside the node
-        are removed from consumed and produced tensor list.
+        minfidx, maxfidx = min(findices), max(findices)
+        assert maxfidx - minfidx + 1 == len(fnodes), \
+            "Forward nodes are not consecutive"
 
-        Return:
-            index (int): index of the detached node in the graph
-        """
-        if node not in self.nodes():
-            raise KeyError(f"node {node} is not in graph.")
-        index = self._nodes.index(node)
-        self._nodes.pop(index)
-        if isinstance(node, IRAdapter):
-            return index
-        # update consumer
-        itensors: List[IRSubTensor] = []
-        for itensor in node.inputs():
-            if isinstance(itensor, IRSubTensor) and itensor not in itensors:
-                itensors.append(itensor)
-        for itensor in itensors:
-            itensor.parent.rm_consumer(node)
-        # update producer
-        otensors: List[IRSubTensor] = []
-        for otensor in node.outputs():
-            if isinstance(otensor, IRSubTensor) and otensor not in otensors:
-                otensors.append(otensor)
-        for otensor in otensors:
-            otensor.parent.rm_producer(node)
-            ftensor = otensor.parent
-            if len(ftensor.producers) == 0 and len(ftensor.consumers) == 0:
-                del self._full_tensors[otensor.parent.tid]
-        if reset_dependency:
-            self.reset_dependency()
-        return index
+        if len(bnodes) > 0:
+            minbidx, maxbidx = min(bindices), max(bindices)
+            assert maxbidx - minbidx + 1 == len(bnodes), \
+                f"Internal Error: backward nodes are not consecutive. maxbidx: {maxbidx}, minbidx: {minbidx}"
 
-    def attach(self, node: IRCell, index, reset_dependency=False):
-        """
-        Attach (insert) a node into current graph at node index.
+        # remove fnodes and insert fsegment
+        fsegment: IRSegment = fgraph.create_segment(fnodes)
+        for fnode in fnodes:
+            fidx = fgraph.remove(fnode)
+        fgraph.insert(fsegment, fidx)
 
-        All the used input and output tensors inside the node are 
-        recorded in consumed and produced tensor list. Adapter node
-        will not record the consumer and producer.
-        """
-        if node in self.nodes():
-            raise KeyError(f"node {node} is already in graph.")
-        self._nodes.insert(index, node)
-        if isinstance(node, IRAdapter):
-            return
-        # update consumer
-        itensors: List[IRSubTensor] = []
-        for itensor in node.inputs():
-            if isinstance(itensor, IRSubTensor) and itensor not in itensors:
-                itensors.append(itensor)
-        for itensor in itensors:
-            if itensor.parent.tid not in self._full_tensors:
-                self._full_tensors[itensor.parent.tid] = itensor.parent
-            idx = 0
-            for consumer in itensor.parent.consumers:
-                if self.nodes().index(consumer) < index:
-                    idx += 1
-                else:
-                    break
-            itensor.parent.add_consumer(node, itensor, idx)
-        # update producer
-        otensors: List[IRSubTensor] = []
-        for otensor in node.outputs():
-            if isinstance(otensor, IRSubTensor) and otensor not in otensors:
-                otensors.append(otensor)
-        for otensor in otensors:
-            if otensor.parent.tid not in self._full_tensors:
-                self._full_tensors[otensor.parent.tid] = otensor.parent
-            idx = 0
-            for producer in otensor.parent.producers:
-                if self.nodes().index(producer) < index:
-                    idx += 1
-                else:
-                    break
-            otensor.parent.add_producer(node, otensor, idx)
-        if reset_dependency:
-            self.reset_dependency()
-        return
+        # reset fsegment gradient
+        for itensor in fsegment.inputs():
+            fgraph.infer_grad(itensor.parent)
 
-    def flatten(self) -> List[IRCell]:
-        """
-        Flattent the graph by expanding nodes
-        """
-        nodes = []
-        for node in self.nodes():
-            if isinstance(node, IRSegment):
-                nodes += node.nodes()
-            else:
-                nodes.append(node)
-        return nodes
+        # update backward
+        if len(bnodes) > 0:
+            # remove backward nodes
+            for bnode in bnodes:
+                bidx = bgraph.remove(bnode)
+            # create new backward node
+            bnodes = [fsegment.create_bwop(fnode) for fnode in fnodes[::-1]]
+            # create and insert backward segment
+            bsegment = fgraph.create_bwop(fsegment)
+            bgraph.insert(bsegment, bidx)
 
-    @staticmethod
-    def get_inputs(nodes: List[IRCell]):
-        """
-        Get all the input tensors the is not generated by nodes
-
-        Inputs
-
-        Returns:
-            List[IRTensor]
-        """
-        all_outputs = list()
-        for node in nodes:
-            all_outputs.extend(node.outputs())
-        inputs = list()
-        for cell in nodes:
-            for input in cell.inputs():
-                if isinstance(input, IRTensor):
-                    if input not in all_outputs:
-                        if input not in inputs:
-                            inputs.append(input)
-        return inputs
-
-    @staticmethod
-    def get_outputs(nodes: List[IRCell]):
-        """
-        Get all the output tensors the is not used by nodes
-
-        Args:
-            This will also consider the successor forward nodes.
-            If it is required by other outside forward nodes,
-            put in the outputs list
-
-        Returns:
-            List[IRTensor]
-        """
-        all_inputs = list()
-        for node in nodes:
-            all_inputs.extend(node.inputs())
-        outputs = list()
-        for node in nodes:
-            for idx, output in enumerate(node.outputs()):
-                # not consumed tensor
-                if isinstance(output, IRSubTensor):
-                    if output not in all_inputs:
-                        if output not in outputs:
-                            outputs.append(output)
-                            continue
-                # consumed by other nodes
-                succs = node.successors(idx)
-                fsuccs = [
-                    fnode for fnode in succs if isinstance(fnode, IRFwOperation)
-                ]
-                for fsucc in fsuccs:
-                    if fsucc not in nodes:
-                        if output not in outputs:
-                            outputs.append(output)
-        return outputs
+    # ========================== Graph Creation ========================
 
     @staticmethod
     def from_logic_graph(nodes: List[IRCell],
                          inputs: List[IRFullTensor], outputs: List[IRFullTensor],
                          module_name: str):
-        # handle multi-consumed tensor
-        consumers: Dict[IRFullTensor, List[IRCell]] = dict()
-        producers: Dict[IRFullTensor, IRCell] = dict()
-        for node in nodes:
-            ftensors = set()
-            for ftensor in node.inputs():
-                # remove redundant tensors within an operator
-                if isinstance(ftensor, IRFullTensor) and ftensor._id not in ftensors:
-                    ftensors.add(ftensor._id)
-                    if ftensor not in consumers:
-                        consumers[ftensor] = []
-                    consumers[ftensor].append(node)
-            for ftensor in node.outputs():
-                if isinstance(ftensor, IRFullTensor):
-                    producers[ftensor] = node
-        for ftensor, cnodes in consumers.items():
-            if len(cnodes) == 1 or ftensor.is_attr(): continue
-            itensors = [ftensor.like() for _ in range(len(cnodes))]
-            for itensor, consumer in zip(itensors, cnodes):
-                while ftensor in consumer.inputs():
-                    idx = consumer.inputs().index(ftensor)
-                    consumer.set_input(idx, itensor)
-            # create and insert multiref operation
-            multiref = MultiRef(None, [ftensor, len(cnodes)])
-            for idx, itensor in enumerate(itensors):
-                multiref.set_output(idx, itensor)
-            multiref.infer_shape()
-            idx = nodes.index(producers[ftensor]) + 1 if ftensor in producers else 0
-            # idx = nodes.index(cnodes[0])
-            nodes.insert(idx, multiref)
-        
+        """
+        Generate IRGraph from logical graph (IRFullTensor)
+
+        @param nodes: nodes of the graph
+        @param inputs List[IRFullTensor]: graph inputs
+        @param outputs List[IRFullTensor]: graph outputs
+        @param module_name str: graph name
+
+        @return graph IRGraph
+        """
         # instantiate graph inputs / outputs
         for idx, tensor in enumerate(inputs):
             if isinstance(tensor, IRFullTensor):
@@ -501,7 +246,6 @@ class IRGraph(IRCell):
         # instantiate to subtensor
         for node in nodes:
             for idx, ftensor in enumerate(node.inputs()):
-                ftensors = set()
                 if isinstance(ftensor, IRFullTensor):
                     subtensor = ftensor.tosub()
                     node.set_input(idx, subtensor)
@@ -523,34 +267,43 @@ class IRGraph(IRCell):
 
         The backward of the forward operation will automatically be replicated.
 
-        @param: node: Union[IRFwOperation, IRDataOperation]
+        @param node Union[IRFwOperation, IRDataOperation]
+
+        @return ops List[IRCell]: the replicated operators
         """
         if not isinstance(node, (IRFwOperation, IRDataOperation)):
             raise TypeError("Expected op to be forward op or data op")
         if not isinstance(times, int) or times < 1:
             raise TypeError("Expected times to be int and >= 1")
 
-        if node not in self.nodes():
-            raise RuntimeError(f"Op {node} not exsits")
-
-        fidx = self.detach(node)
+        fsegment: IRSegment = self.segment(node)
+        # replicate
         fnodes = [node.replicate() for _ in range(times)]
+        # set gradient
+        for fnode in fnodes:
+            for rtensor, itensor in zip(fnode.inputs(), node.inputs()):
+                if isinstance(rtensor, IRSubTensor):
+                    rtensor.grad = itensor.grad
         # insert forward
-        for idx, fnode in enumerate(fnodes):
-            self.attach(fnode, fidx + idx) 
+        for fnode in fnodes:
+            if isinstance(node, IRFwOperation):
+                fnode.recompute = node.recompute
+            if isinstance(node.comment, str):
+                fnode.comment = node.comment
+            fnode.device = node.device
+        fsegment.replace(node, fnodes)
         # insert backward
-        if isinstance(node.mirror, IRBpOperation):
-            bidx = self.detach(node.mirror)
-            for fnode in fnodes:
-                fnode.gen_backward()
-            bnodes = [fnode.mirror for fnode in fnodes][::-1]
-            for idx, bnode in enumerate(bnodes):
-                self.attach(bnode, bidx + idx)
-        #TODO: dependency set
+        bsegment: IRSegment = fsegment.mirror
+        if isinstance(node.mirror, IRCell):
+            bnodes = [node.mirror.replicate() for _ in range(times)]
+            for bnode, fnode in zip(bnodes, fnodes[::-1]):
+                IRCell.make_pair(fnode, bnode)
+                bnode.device = fnode.device
+            bsegment.replace(node.mirror, bnodes)
         return fnodes
 
     def partition(self, node: Union[IRFwOperation, IRDataOperation],
-                  algo: GenericDistAlgo, **config) -> Optional[List[IRCell]]:
+                  algo: GenericDistAlgo, **config) -> List[IRCell]:
         """
         Partition Primitive:
             - partition: partition a forward or data operation using algorithms.
@@ -573,99 +326,103 @@ class IRGraph(IRCell):
         @param algo GenericDistAlgo: the partition algorithm related to the node
         @param config Dict[str, Any]: the algorithm configuration, e.g., partition number
 
-        @return Optional[IRCell]: partitioned sub-nodes or None (fail to partition)
+        @return ops List[IRCell]: partitioned sub-nodes
         """
         assert isinstance(algo, GenericDistAlgo) and node == algo.node, \
             "The partition algorithm is not initialized for this node"
-        if node not in self.nodes():
-            raise RuntimeError(f"Not Exist: {node}")
-        if not (isinstance(node, IRFwOperation) or isinstance(node, IRDataOperation)):
-            raise ValueError("Only allow op to be forward op or data op.")
+        assert isinstance(node, (IRFwOperation, IRDataOperation)), \
+            f"Only allow op to be forward op or data op, but got: {node}"
 
         # get partitioned sub-nodes
         fnodes = algo.instantiate(**config)
-        if fnodes is None: return fnodes
+        assert fnodes is not None, f"Fail to partition node: {node} use algorithm and config: {config}"
 
-        # update forward
-        findex = self.detach(node)
-        for idx, fnode in enumerate(fnodes):
-            self.attach(fnode, findex + idx)
-            if isinstance(node.comment, str):
-                fnode.comment = node.comment
+        # set gradient
+        valmaps: Dict[IRFullTensor, ValueMap] = dict()
+        for t in node.inputs():
+            if isinstance(t, IRSubTensor) and t.requires_grad:
+                valmaps[t.parent] = ValueMap(t.grad.valmap)
+        # set up consumers
+        ctensors: Dict[IRFullTensor, List[IRSubTensor]] = dict()
+        consumers: Dict[IRFullTensor, List[IRCell]] = dict()
+        for fnode in fnodes:
+            for itensor in fnode.inputs():
+                if not isinstance(itensor, IRSubTensor): continue
+                if not itensor.requires_grad: continue
+                if itensor.parent not in ctensors:
+                    ctensors[itensor.parent] = []
+                    consumers[itensor.parent] = []
+                ctensors[itensor.parent].append(itensor)
+                consumers[itensor.parent].append(fnode)
+        # set up gradient
+        for fnode in fnodes:
+            for itensor in fnode.inputs():
+                if not isinstance(itensor, IRSubTensor): continue
+                if not itensor.requires_grad: continue
+                ftensor = itensor.parent
+                # the [::-1] only makes the valuemap to grow with execution order
+                cs = [c for c, t in zip(consumers[ftensor], ctensors[ftensor]) if t == itensor][::-1]
+                valmap = valmaps[itensor.parent].map((cs.index(fnode), len(cs)))
+                grad = ftensor.grad.select(itensor.indmap, valmap)
+                itensor.grad = grad
+            for otensor in fnode.outputs():
+                if not isinstance(otensor, IRSubTensor): continue
+                if not otensor.requires_grad:
+                    grad = None
+                else:
+                    if isinstance(otensor.parent.grad, float):
+                        grad = otensor.parent.grad
+                    else:
+                        grad = otensor.parent.grad.select(otensor.indmap, (0,1))
+                otensor.grad = grad
+
+        # insert forward node
+        fsegment: IRSegment = self.segment(node)
+        for fnode in fnodes:
             if isinstance(node, IRFwOperation):
                 fnode.recompute = node.recompute
-        # update backward
-        if isinstance(node.mirror, IRBpOperation):
-            bindex = self.detach(node.mirror)
-            bnodes = [fnode.gen_backward() for fnode in fnodes][::-1]
-            for idx, bnode in enumerate(bnodes):
-                self.attach(bnode, bindex + idx)
-                if isinstance(node.mirror.comment, str):
-                    bnode.comment = node.mirror.comment
-        # update gradient
-        updated = set()
-        for itensor in [t for t in node.inputs() if isinstance(t, IRSubTensor)]:
-            for fnode in itensor.parent.consumers:
-                bnode = fnode.mirror
-                if isinstance(bnode, IRBpOperation) and fnode._id not in updated:
-                    idx = self.detach(bnode)
-                    bnode.update()
-                    self.attach(bnode, idx)
-                updated.add(fnode._id)
-        # update device
-        for fnode in fnodes:
+            if isinstance(node.comment, str):
+                fnode.comment = node.comment
             fnode.device = node.device
-            if isinstance(fnode.mirror, IRCell):
-                fnode.mirror.device = node.device
+        fsegment.replace(node, fnodes)
+
+        # insert backward node
+        if isinstance(node.mirror, IRCell):
+            bnodes = [fsegment.create_bwop(fnode) for fnode in fnodes[::-1]]
+            assert isinstance(node.mirror, IRBpOperation)
+            assert len(bnodes) == len(fnodes)
+            for bnode in bnodes:
+                bnode.device = node.device
+            bsegment: IRSegment = fsegment.mirror
+            bsegment.replace(node.mirror, bnodes)
+
         return fnodes
-
-    def replace(self, old_nodes: List[IRCell], new_nodes: List[IRCell]):
-        """!
-        Replace nodes with node.
-
-        Note we don't check semantic correctness for the replacement.
-
-        @param old_nodes List[IRCell]: nodes to be replaced
-        @param new_nodes List[IRCell]: nodes to replace in
-
-        @return True
-        """
-        idx = len(self._nodes)
-        for old_node in old_nodes:
-            oidx = self.detach(old_node)
-            idx = min(oidx, idx)
-        for new_node in new_nodes[::-1]:
-            self.attach(new_node, idx)
-        return True
 
     ## Spatial Primitives ##
 
-    def assign(self, node: Union[IRFwOperation, IRBpOperation],
-               ranks: Union[int, Tuple[int]]):
+    def assign(self, node: Union[IRFwOperation, IRDataOperation], device: int) -> bool:
         """
         Assign an operator (subgraph) to (multiple) rank(s).
 
-        If `ranks` has multiple integer, then the operator will be replicated
-        `len(ranks)` times and assigned to given device correspondingly.
+        Corresponding backward operators (if have) will also be 
+        assigned to the same device.
 
-        Corresponding backward operators (if have) will also be replicated
-        and assigned to the same device with it's forward operator
-
-        @param node Union[IRFwOperation, IRBpOperation]: operator
-        @param ranks Tuple[int, Tuple[int]]: assigned ranks
+        @param node Union[IRFwOperation, IRBpOperation, IRSegment]: operator
+        @param device int: assigned device id
 
         @return sucess bool: always true
         """
-        assert isinstance(node, (IRFwOperation, IRDataOperation)), f"Only forward and data operation can be assigned to device, but got {node}"
-        assert node in self._nodes, f"{node} is not in the graph"
-        ranks = (ranks,) if isinstance(ranks, int) else ranks
-        assert all([isinstance(rank, int) for rank in ranks]), "Expected rank to be int"
-        nodes = [node] if len(ranks) == 1 else self.replicate(node, times=len(ranks))
-        for node, rank in zip(nodes, ranks):
-            node.device = rank
-            if isinstance(node.mirror, IRBpOperation):
-                bnode = node.mirror
-                bnode.device = rank
+        assert self.exist(node), f"{node} is not in the graph"
+        if isinstance(node, IRSegment):
+            assert node.isfw(), "Only forward segment is allowed to assign devices"
+            for subnode in node.nodes():
+                self.assign(subnode, device)
+        else:
+            assert isinstance(node, (IRFwOperation, IRDataOperation)), \
+                "Only forward operators and dataloader operators are allowed to assign devices"
+            node.device = device
+            if node.mirror is not None:
+                node.mirror.device = device
         return True
 
     ## Schedule Policy Primitives ##
@@ -677,6 +434,7 @@ class IRGraph(IRCell):
         Returns:
             Boolean
         """
+        raise NotImplementedError("dependency is not supported yet")
         skip = list() if skip is None else skip
         if node1 in skip:
             return False
@@ -732,8 +490,8 @@ class IRGraph(IRCell):
             for idx in range(idx1+1, idx2+1):
                 if self.depends(node1, self._nodes[idx]):
                     return False
-            self.detach(node1)
-            self.attach(node1, idx2)
+            self.remove(node1)
+            self.insert(node1, idx2)
             return True
         # node1 -> node2
         if action  == 'before':
@@ -742,8 +500,8 @@ class IRGraph(IRCell):
             for idx in range(idx2, idx1):
                 if self.depends(self._nodes[idx], node1):
                     return False
-            self.detach(node1)
-            self.attach(node1, idx2)
+            self.remove(node1)
+            self.insert(node1, idx2)
             return True
         raise KeyError(f"Unknown scheduling action {action}")
 
@@ -754,8 +512,7 @@ class IRGraph(IRCell):
         """
         return self._sched
 
-    @sched.setter
-    def sched(self, strategy):
+    def predef_sched(self, strategy):
         """!
         Set schedule plan for the execution.
 
@@ -807,10 +564,175 @@ class IRGraph(IRCell):
             post.add_predecessor(input_index=-1, cell=prev)
         return True
 
+    # ================= staging primitives ==================
+
+    def staging(self, nodes: Tuple[IRFwOperation]):
+        """!
+        Group forward / dataloader operators into sequential stages.
+        The corresponding backward operators will also be grouped into stages
+        Cross-stage dataflow will be limited to neighbor stages.
+        This should be called before any operator partition.
+
+        The transformation and temporal scheduling can only be applied within each stage.
+        For example, after staging, user cannot schedule a (transformed) node 
+        from one stage to another stage.
+
+        The stage is a concept that is only about logical separation of nodes, 
+        it doesn't have additional constraints for device assignment.
+
+        This will keep each tensor to be only consumed once in
+        semantic representation.
+
+        Changes will be made:
+
+        1). Identity creation:
+            If a non-attribute tensor is produced / consumed not in
+            neighbor stages, 
+                e.g., 
+                    stage 1: t1 = producer()
+                    stage 2: ...
+                    stage 3: xx = consume(t1)
+                             xx = consume(t1)
+                    stage 4: ...
+                    stage 5: xx = consume(t1)
+            then Identity nodes will be created for every device in stage2:
+                    stage 1: t1 = producer()
+                    stage 2: t2 = identity(t1)
+                    stage 3: t3 = identity(t2)
+                             xx = consume(t3)
+                             xx = consume(t3)
+                    stage 4: t4 = identity(t3)
+                    stage 5: t5 = identity(t4)
+                             xx = consume(t5)
+
+        @param starts Tuple[IRFwOperations]: the start node of each stage
+        @return None
+        """
+        assert all(isinstance(node, IRFwOperation) for node in nodes), \
+            f"Find node is not IRFwOperation or IRDataOperation: {node}"
+        assert all(node in self._nodes for node in nodes), \
+            f"Exist node is not in graph nodes"
+        starts = tuple(self._nodes.index(node) for node in nodes)
+        assert len(starts) > 0
+        starts = (0,) + starts if starts[0] != 0 else starts
+
+        last_fidx = 0
+        for idx, node in enumerate(self._nodes):
+            if not isinstance(node, IRBpOperation):
+                last_fidx = idx
+        
+        fstages: List[List[IRCell]] = []
+        bstages: List[List[IRCell]] = []
+        for sid in range(len(starts)):
+            begin = starts[sid]
+            end = starts[sid+1] if sid != len(starts) - 1 else last_fidx + 1
+            while isinstance(self.node(begin), IRDataOperation):
+                begin += 1
+            while isinstance(self.node(end), IRDataOperation):
+                end -= 1
+            if begin == end: continue
+            assert begin < end
+            fnodes = self._nodes[begin:end]
+            bnodes = [fnode.mirror for fnode in fnodes[::-1] if fnode.mirror is not None]
+            fstages.append(fnodes)
+            bstages = [bnodes] + bstages
+
+        def get_sid(fnode: IRCell) -> Optional[int]:
+            for idx, fnodes in enumerate(fstages):
+                if fnode in fnodes:
+                    return idx
+            return None
+
+        def insert_identity(tensor: IRSubTensor, sid: int) -> IRFwOperation:
+            fwop = Identity('', [tensor])
+            fwop.infer_shape()
+            fwop.set_output(0, fwop.output(0).tosub())
+            if tensor.requires_grad:
+                fwop.output(0).parent.requires_grad = True
+                # set input grad
+                igrad = tensor.parent.grad.select(tensor.indmap, tensor.valmap)
+                fwop.input(0).grad = igrad
+                # set output grad
+                otensor = fwop.output(0).parent
+                ograd = otensor.grad.select(tensor.indmap, (0,1))
+                fwop.output(0).grad = ograd
+                # insert identity
+                fidx = self.index(fstages[sid][0])
+                self.finsert(fwop, fidx)
+            else:
+                self.insert(fwop, fidx)
+            # update stage op group
+            fstages[sid].insert(0, fwop)
+            if isinstance(fwop.mirror, IRCell):
+                bstages[sid].append(fwop.mirror)
+            return fwop
+
+        # create identity op for cross-stage dataflow
+        for ftensor in self.full_tensors():
+            if ftensor.is_grad() or ftensor.is_attr(): continue
+            if len(self.consumers(ftensor)) == 0: continue
+
+            assert len(self.producers(ftensor)) <= 1, \
+                "The staging interface should be called before any operator partition."
+            ctensors = self.ctensors(ftensor)
+            if len(self.ctensors(ftensor)) > 0:
+                assert all(ctensor == ctensors[0] for ctensor in ctensors), (
+                    "The staging interface should be called before any operator partition."
+                )
+
+            producer, ptensor = self.producers(ftensor)[0], self.ptensors(ftensor)[0]
+            psid = get_sid(producer)
+            # outside of stages, not consider
+            if psid is None: continue 
+
+            # group consumers into stages
+            consumers = self.consumers(ftensor)
+            csids = [get_sid(consumer) for consumer in consumers]
+            buckets = [[] for _ in range(len(fstages))]
+            for idx, csid in enumerate(csids):
+                buckets[csid].append(consumers[idx])
+
+            # go through each stage to generate identity operators
+            out = ptensor
+            end_sid = max(csids) + 1
+            for sid in range(psid + 1, end_sid):
+                # insert identity
+                op = insert_identity(out, sid)
+                out = op.output(0)
+                # calculate gradient
+                curr_valmap = ValueMap((0, 1))
+                nconsumers = len(buckets[sid])
+                fgrad = ftensor.grad
+                for cidx, consumer in enumerate(buckets[sid]):
+                    if fgrad is None:
+                        grad = None
+                    elif isinstance(fgrad, float):
+                        assert fgrad == 1.0, "Detect a backward tensor, but gradient can only be 1.0"
+                        grad = fgrad
+                    else:
+                        valmap = curr_valmap.map((0, 2)) if cidx != nconsumers - 1 else curr_valmap
+                        grad = fgrad.select(ptensor.indmap, valmap)
+                        curr_valmap = curr_valmap.map((1, 2)) if cidx != nconsumers - 1 else curr_valmap
+                    # update forward consumer
+                    idx = consumer.inputs().index(ptensor)
+                    ptensor = consumer.input(idx)
+                    with self.update(consumer) as consumer:
+                        consumer.set_input(idx, out)
+                        consumer.input(idx).grad = grad
+                    # update backward
+                    if isinstance(consumer.mirror, IRCell):
+                        with self.update(consumer.mirror) as bconsumer:
+                            idx = bconsumer.outputs().index(ptensor.grad)
+                            bconsumer.set_output(idx,grad )
+
+        # grouping into segment
+        for sid in range(len(fstages)):
+            self.group(fstages[sid])
+
 
     # ================= Other optimizations ==================
 
-    def recompute(self, nodes: List[IRFwOperation]) -> bool:
+    def recompute(self, nodes: Union[IRSegment, List[IRFwOperation]]) -> bool:
         """!
         Recompute a set of nodes. The forward nodes will be assigned with a unique
         recompute group id. A forward not can not be recomputed in different recompute groups.
@@ -819,34 +741,85 @@ class IRGraph(IRCell):
 
         @return success boolean: always success
         """
-        assert all(isinstance(fnode, IRFwOperation) for fnode in nodes), "require forward operations"
-        recompute_group_id = IDGenerator().gen_cell_id()
-        for fnode in nodes:
-            fnode.recompute = recompute_group_id
+        assert all(isinstance(node, IRFwOperation) for node in nodes) or isinstance(nodes, IRSegment), \
+            "Require forward nodes or a single segment"
+
+        if isinstance(nodes, IRSegment):
+            assert nodes.isfw() and (not nodes.isbw()), "Only forward IRSegment can recompute"
+            return self.recompute(nodes.nodes())
+        
+        else:
+            segments = [self.segment(node) for node in nodes]
+            assert all(segment == segments[0] for segment in segments), \
+                "Cross-segment recompute is not allowed yet"
+            recompute_group_id: int = IDGenerator().gen_cell_id()
+            for fnode in nodes:
+                fnode.recompute = recompute_group_id
+    
         return True
 
-    def __repr__(self):
-        dscp = f"Graph{self._id}-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})"
-        return dscp
+    # =================== Helpers ====================
 
-    def extra_repr(self):
-        dscp = f"\n{self.name}:\n{'=' * len(self.name)}\n"
-        # inputs
-        dscp += f"Inputs: {self.inputs()}\n"
-        # nodes
-        for node in self._nodes:
-            # succ_node_ids = [node._id for node in node.successors()]
-            # succ_node_ids = [None] * len(node.outputs())
-            # for out_idx in range(len(node.outputs())):
-            #     node_list = [snode._id for snode in node.successors(out_idx)]
-            #     succ_node_ids[out_idx] = node_list
-            # dscp += f"\n{node._id}: {node} -> node id {succ_node_ids}"
-            dscp += f"\n{node}"
-        # outputs
-        dscp += f"\nOutputs: {self.outputs()}\n{'=' * len(self.name)}\n"
-        return dscp
+    def auto_multiref(self):
+        """
+        Automatically partition and schedule multiref node.
+        This requires to call after all transformation and
+        scheduling.
 
-    def module_repr(self):
-        return repr(self)
+        The policy is to partition and assign multiref 
+        in the same way of its input producer
+        """
+        for node in self.nodes(flatten=True):
+            if node.name == 'multiref':
+                if len(node.device) != 0: continue
+                segment: IRSegment = self.segment(node)
+                ftensor = node.input(0).parent
+                ptensors = segment.ptensors(ftensor)
 
+                multirefs = []
 
+                # use downstream consumers
+                devtensors: Dict[int, List[IRSubTensor]] = dict()
+                for tensor in node.outputs():
+                    for ctensor in segment.ctensors(tensor.parent):
+                        for devid in ctensor.device:
+                            if devid not in devtensors:
+                                devtensors[devid] = []
+                            devtensors[devid].append(ctensor)
+                devids = list(devtensors.keys())
+                ctensors = [ts[0] for ts in devtensors.values()]
+                for devid, ctensor in zip(devids, ctensors):
+                    itensor = node.input(0).parent.select(ctensor.indmap, ctensor.valmap)
+                    otensors = []
+                    for otensor in node.outputs():
+                        otensors.append(otensor.parent.select(ctensor.indmap, ctensor.valmap))
+                    multiref = MultiRef('', [itensor, len(otensors)])
+                    for idx, otensor in enumerate(otensors):
+                        multiref.set_output(idx, otensor)
+                    multiref.device = devid
+                    multirefs.append(multiref)
+                
+                # if no downstream consumers, use upstream producers
+                if len(multirefs) == 0:
+                    for ptensor in ptensors:
+                        assert len(ptensor.device) > 0, \
+                            "Auto Multiref requires its producer nodes assigned to devices"
+                        for devid in ptensor.device:
+                            outputs = []
+                            for output in node.outputs():
+                                outputs.append(output.parent.select(ptensor.indmap, ptensor.valmap))
+                            multiref = MultiRef('', [ptensor, len(outputs)])
+                            for idx, otensor in enumerate(outputs):
+                                multiref.set_output(idx, otensor)
+                            multiref.device = devid
+                            multirefs.append(multiref)
+                
+                # replace into graph
+                fidx = self.remove(node)
+                if node.mirror is not None:
+                    self.remove(node.mirror)
+                for multiref in multirefs[::-1]:
+                    if node.mirror is not None:
+                        self.finsert(multiref, fidx)
+                    else:
+                        self.insert(multiref, fidx)
