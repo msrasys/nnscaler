@@ -3,6 +3,7 @@ import numpy as np
 
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.gener.concurrent import ConcurrentGener
+import cube.graph.gener.utils as utils
 from cube.graph.graph import IRGraph
 from cube.graph.segment import IRSegment
 
@@ -36,7 +37,9 @@ class DummyInputOuput(IRFwOperation):
 
 def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
     """
-    Create dummy operators that 
+    Create dummy operators segment inputs and outputs. 
+    The backward operator is also inserted.
+
     1) produce segment input tensors
     2) consume segment output tensors
 
@@ -46,19 +49,40 @@ def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
     """
     devices = segment.device
     fwops = []
-    for devid in devices:
-        for tensor in segment.inputs():
-            if not isinstance(tensor, IRSubTensor): continue
-            assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
-            fwop = DummyInputOuput(tensor, devid, is_output=True)
-            segment.insert(fwop, 0)
-            fwops.append(fwop)
-        for tensor in segment.outputs():
-            if not isinstance(tensor, IRSubTensor): continue
-            assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
-            fwop = DummyInputOuput(tensor, devid, is_input=True)
-            segment.insert(fwop, segment.nnodes)
-            fwops.append(fwop)
+
+    # create inputs
+    for tensor in segment.inputs():
+        if not isinstance(tensor, IRSubTensor): continue
+        assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
+        fwop = DummyInputOuput(tensor, 0, is_output=True)
+        for devid in devices:
+            fop = fwop.replicate()
+            fop.device = devid
+            if tensor.requires_grad:
+                fop.output(0).grad = tensor.grad.select(tensor.indmap, (0, 1))
+                segment.finsert(fop, 0)
+            else:
+                segment.insert(fop, 0)
+            fwops.append(fop)
+    
+    # create outputs
+    for tensor in segment.outputs():
+        if not isinstance(tensor, IRSubTensor): continue
+        assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
+        fwop = DummyInputOuput(tensor, 0, is_input=True)
+        for devid in devices:
+            fop = fwop.replicate()
+            fop.device = devid
+            if tensor.requires_grad and segment.mirror != segment:
+                if isinstance(tensor.grad, float):
+                    fop.input(0).grad = tensor.grad
+                else:
+                    fop.input(0).grad = tensor.grad.select(tensor.indmap, (0, 1))
+                segment.finsert(fop, segment.nnodes)
+            else:
+                segment.insert(fop, segment.nnodes)
+            fwops.append(fop)
+
     return fwops
 
 
@@ -246,16 +270,18 @@ class IRAdapterGener:
             return True
 
         fdummies = create_dummy(graph)
+        bdummies = [fwop.mirror for fwop in fdummies if fwop.mirror is not None]
         bgraph: Optional[IRSegment] = graph.mirror
-        bdummies = create_dummy(bgraph) if isinstance(bgraph, IRSegment) else []
 
-        skip_grads = [t.parent for t in graph.inputs() + graph.outputs() if isinstance(t, IRSubTensor)]
         # generate adapter for inter-segments
         # FIXME: assume producers and consumers can run in parallel
         for ftensor in graph.full_tensors():
             # backward will gen in forward
             if ftensor.is_param() or ftensor.is_grad():
                 continue
+
+            # flatten gradient
+            utils.flatten_grad(graph, ftensor)
 
             # optimization: local fusion / multiref on producer / consumer
             ftensor = IRAdapterGener.local_producer_fusion(graph, ftensor)
@@ -274,7 +300,7 @@ class IRAdapterGener:
 
             bproducers, bptensors = [], []
             bconsumers, bctensors = [], []
-            if (ftensor not in skip_grads) and isinstance(ftensor.grad, IRFullTensor):
+            if isinstance(ftensor.grad, IRFullTensor):
                 bproducers, bptensors = bgraph.producers(ftensor.grad), bgraph.ptensors(ftensor.grad)
                 bptensors = expand_devices(bptensors, producer=True)
                 assert all(len(ptensor.device) == 1 for ptensor in bptensors), (
@@ -523,7 +549,7 @@ class IRAdapterGener:
         if not require_multiref: return
 
         for devid in devtensors:
-            grads: List[IRSubTensor] = [t.grad for t in devtensors[devid]]
+            grads: List[IRSubTensor] = [t.grad for t in devtensors[devid]][::-1]
             try:
                 nchunks = [grad.valmap[1] for grad in grads]
                 if len(set(nchunks)) == 1:
