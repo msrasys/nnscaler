@@ -152,6 +152,10 @@ def feedforward2(x: torch.Tensor, proj: torch.Tensor):
 def feedforward3(x: torch.Tensor, y: torch.Tensor, proj: torch.Tensor):
     return torch.matmul(x * y, proj)
 
+@cube.graph.parser.register('* -> *, *', name='multi2ref')
+def multi2ref(x: torch.Tensor):
+    return (x, x)
+
 
 class PaLMLayer(nn.Module):
 
