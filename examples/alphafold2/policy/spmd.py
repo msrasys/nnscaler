@@ -3,6 +3,7 @@ from cube.graph import IRGraph
 from cube.ir.operator import IRDataOperation, IRFwOperation
 
 def PASData(graph: IRGraph, resource):
+    devs = list(range(resource.ngpus))
 
     for node in graph.nodes():
         if isinstance(node, IRDataOperation):
@@ -14,6 +15,11 @@ def PASData(graph: IRGraph, resource):
 
     for node in graph.nodes():
         if isinstance(node, IRFwOperation):
+            if node.name == 'mul':
+                sub_nodes = graph.replicate(node, times=resource.ngpus)
+                for devid, sub_node in zip(devs, sub_nodes):
+                    graph.assign(sub_node, devid)
+                continue
             algo = node.algorithms('dim')
             sub_nodes = graph.partition(node,
                                         algo,

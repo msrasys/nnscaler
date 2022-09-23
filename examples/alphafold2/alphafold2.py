@@ -296,17 +296,16 @@ class Evoformer(torch.nn.Module):
         self.pair_transition_proj2 = torch.nn.Parameter(
             torch.randn(ff_mult * cz, cz))
 
-    def forward(self, state):
-        msa_repr, pair_repr = state
+    def forward(self, msa_repr, pair_repr):
 
-        # msa_repr = msa_repr + MSARowAttentionWithPairBias(
-        #     self.row_norm_m(msa_repr), pair_repr, self.row_gate_proj,
-        #     self.row_qkv_proj, self.row_out_proj, self.row_bias_proj,
-        #     self.msa_head, self.c, self.scale)
-        msa_repr = msa_repr + checkpoint(MSARowAttentionWithPairBias,
+        msa_repr = msa_repr + MSARowAttentionWithPairBias(
             self.row_norm_m(msa_repr), pair_repr, self.row_gate_proj,
             self.row_qkv_proj, self.row_out_proj, self.row_bias_proj,
             self.msa_head, self.c, self.scale)
+        # msa_repr = msa_repr + checkpoint(MSARowAttentionWithPairBias,
+        #     self.row_norm_m(msa_repr), pair_repr, self.row_gate_proj,
+        #     self.row_qkv_proj, self.row_out_proj, self.row_bias_proj,
+        #     self.msa_head, self.c, self.scale)
 
         msa_repr = msa_repr.transpose(-3, -2)
         msa_repr = msa_repr + MSAAttention(
@@ -393,15 +392,14 @@ class Evoformer(torch.nn.Module):
 class AlphaFold2(nn.Module):
     def __init__(self, s: int, cm: int, cz: int, evo_num: int):
         super().__init__()
-
-        self.net = nn.Sequential(
-                *[Evoformer(s, cm, cz) for _ in range(evo_num)],
-                )
+        self.evo_num = evo_num
+        # self.evoformers: List[torch.nn.Module] = [Evoformer(s, cm, cz) for _ in range(evo_num)]
+        self.evoformer = Evoformer(s, cm, cz)
 
 
     def forward(self, msa, pair):
-        new_msa, new_pair = self.net((msa, pair))
-        loss = torch.sum(new_msa) + torch.sum(new_pair)
+        new_msa, new_pair = self.evoformer(msa, pair)
+        loss = torch.sum(new_msa) * torch.sum(new_pair)
         return loss
 
 
@@ -416,8 +414,8 @@ def test():
             )
 
     dataloader = cube.runtime.syndata.SynDataLoader(shapes=([bs, s, r, cm], [bs, r, r, cz],),
-                                                    dtypes=(torch.float32, ),
-                                                    batch_dims=(0, ))
+                                                    dtypes=(torch.float32, torch.float32, ),
+                                                    batch_dims=(0, 0, ))
 
     @cube.compile(model, dataloader, PAS=spmd.PASData)
     def train_iter(model, dataloader):
@@ -438,18 +436,18 @@ def test():
     for i in range(iter_num):
         if i >= warm_up:
             CudaTimer(enable=True).start('e2e')
-        train_iter(model, msa, pair)
+        train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
         if i >= warm_up:
             CudaTimer().stop('e2e')
         if i > 0 and (i + 1) % 20 == 0:
-            # print_each_rank(f'iter [{i + 1}/{iter_num}]', rank_only=0)
-            print(f'iter [{i + 1}/{iter_num}]')
+            print_each_rank(f'iter [{i + 1}/{iter_num}]', rank_only=0)
 
-    print(CudaTimer().duration(iter_num - warm_up, field_name='e2e'), 'ms')
-    # print(torch.cuda.memory_summary(dev))
-    print(torch.cuda.max_memory_allocated() / 1024 / 1024, ' MB')
+    print_each_rank('e2e time (ms) per iteration: {} ms'.format(
+        CudaTimer().duration(iter_num - warm_up, field_name='e2e')))
+    CudaTimer().print_all(times=iter_num - warm_up)
+    print_each_rank(torch.cuda.max_memory_allocated() / 1024 / 1024)
 
 
 test()
