@@ -1,9 +1,15 @@
 import torch
 import math
+import cube
 
 from cube.profiler import CudaTimer
-
+from cube.profiler.timer import print_each_rank
+from torch import nn
 from torch.utils.checkpoint import checkpoint
+
+import examples.alphafold2.policy.spmd as spmd
+
+cube.init()
 
 
 """
@@ -12,9 +18,9 @@ from torch.utils.checkpoint import checkpoint
 used as column-wise gated self-attention
 """
 
-
+@cube.graph.parser.register('N S R^ M^, M^ E^, M^ F^, E^ M^ -> N S R M', name='MSAAttention')
 def MSAAttention(x: torch.Tensor, gate_proj: torch.Tensor,
-                 qkv_proj: torch.Tensor, out_proj: torch.Tensor, bias,
+                 qkv_proj: torch.Tensor, out_proj: torch.Tensor,
                  head: int, c: int, scale: float):
     bs, s, r, cm = x.size()
 
@@ -34,9 +40,38 @@ def MSAAttention(x: torch.Tensor, gate_proj: torch.Tensor,
     sim = torch.bmm(q, k) * scale
     sim = torch.nn.functional.softmax(sim, dim=-1)
 
-    if isinstance(bias, torch.Tensor):
-        sim = sim.reshape(bs, s, head, r, r) + bias
-        sim = sim.reshape(bs * s * head, r, r)
+    attend = torch.bmm(sim, v) * gate
+
+    out = attend.reshape(bs, s, head, r, c).transpose(2,
+                                                      3).reshape(bs, s, r, cm)
+    out = torch.matmul(out, out_proj)
+    return out
+
+
+@cube.graph.parser.register('N S R M, M E, M F, E M, N 1 8 R R -> N S R M', name='MSAAttentionWithBias')
+def MSAAttentionWithBias(x: torch.Tensor, gate_proj: torch.Tensor,
+        qkv_proj: torch.Tensor, out_proj: torch.Tensor, bias: torch.Tensor,
+                 head: int, c: int, scale: float):
+    bs, s, r, cm = x.size()
+
+    gate = torch.sigmoid(torch.matmul(x, gate_proj))
+    q, k, v = torch.matmul(x, qkv_proj).chunk(3, dim=-1)
+
+    gate = gate.reshape(bs, s, r, head,
+                        c).transpose(2, 3).reshape(bs * s * head, r, c)
+    q = q.reshape(bs, s, r, head, c).transpose(2,
+                                               3).reshape(bs * s * head, r, c)
+    k = k.reshape(bs, s, r, head, c).transpose(2,
+                                               3).reshape(bs * s * head, r,
+                                                          c).transpose(1, 2)
+    v = v.reshape(bs, s, r, head, c).transpose(2,
+                                               3).reshape(bs * s * head, r, c)
+
+    sim = torch.bmm(q, k) * scale
+    sim = torch.nn.functional.softmax(sim, dim=-1)
+
+    sim = sim.reshape(bs, s, head, r, r) + bias
+    sim = sim.reshape(bs * s * head, r, r)
 
     attend = torch.bmm(sim, v) * gate
 
@@ -50,7 +85,8 @@ def MSAAttention(x: torch.Tensor, gate_proj: torch.Tensor,
 ([bs, s, r, cm], [bs, r, r, cz]) -> [bs, s, r, cm]
 """
 
-
+# note: code not reused constrained by cube's interface
+@cube.graph.parser.register('N S R M, N R R Z, M E, M F, E M, Z H -> N S R M', name='MSARowAttentionWithPairBias')
 def MSARowAttentionWithPairBias(msa_repr: torch.Tensor,
                                 pair_repr: torch.Tensor,
                                 gate_proj: torch.Tensor,
@@ -63,15 +99,14 @@ def MSARowAttentionWithPairBias(msa_repr: torch.Tensor,
                         bias_proj).permute(0, 3, 1,
                                            2).reshape(bs, 1, head, r, r)
 
-    return MSAAttention(msa_repr, gate_proj, qkv_proj, out_proj, bias, head, c,
-                        scale)
+    return MSAAttentionWithBias(msa_repr, gate_proj, qkv_proj, out_proj, bias, head, c, scale)
 
 
 """
 [bs, s, r, cm] -> [bs, s, r, cm]
 """
 
-
+@cube.graph.parser.register('N S R M, M E, E M -> N S R M', name='MSATransition')
 def MSATransition(msa_repr: torch.Tensor, proj1: torch.Tensor,
                   proj2: torch.Tensor):
     return torch.matmul(
@@ -79,10 +114,11 @@ def MSATransition(msa_repr: torch.Tensor, proj1: torch.Tensor,
 
 
 """
-[bs, s, r, cm] -> [r, r, cz]
+[bs, s, r, cm] -> [bs, r, r, cz]
 """
 
 
+@cube.graph.parser.register('N S R M, M C, M C, F Z -> N R R Z', name='OuterProductMean')
 def OuterProductMean(msa_repr: torch.Tensor, proj1: torch.Tensor,
                      proj2: torch.Tensor, out_proj: torch.Tensor):
     bs, s, r, cm = msa_repr.size()
@@ -97,6 +133,7 @@ def OuterProductMean(msa_repr: torch.Tensor, proj1: torch.Tensor,
     return outer
 
 
+@cube.graph.parser.register('N R R Z, Z, Z, E, E, Z E, Z E, Z E, Z E, E Z, Z Z -> N R R Z', name='TriangleMultiplication')
 def TriangleMultiplication(
         pair_repr: torch.Tensor, tri_mul_norm1_weight: torch.Tensor,
         tri_mul_norm1_bias: torch.Tensor, tri_mul_norm2_weight: torch.Tensor,
@@ -127,16 +164,18 @@ def TriangleMultiplication(
     return p * g
 
 
+@cube.graph.parser.register('N R R Z, Z E, Z F, E Z, Z G -> N R R Z', name='TriangleAttentionNode')
 def TriangleAttentionNode(pair_repr: torch.Tensor, gate_proj: torch.Tensor,
                           qkv_proj: torch.Tensor, out_proj: torch.Tensor,
                           bias_proj: torch.Tensor, head: int, c: int,
                           scale: float):
     bias = torch.matmul(pair_repr, bias_proj).permute(0, 3, 1, 2)
 
-    return MSAAttention(pair_repr, gate_proj, qkv_proj, out_proj, bias, head,
+    return MSAAttentionWithBias(pair_repr, gate_proj, qkv_proj, out_proj, bias, head,
                         c, scale)
 
 
+@cube.graph.parser.register('N R R Z, Z E, E Z -> N R R Z', name='PairTransition')
 def PairTransition(pair_repr: torch.Tensor, proj1: torch.Tensor,
                    proj2: torch.Tensor):
     return torch.matmul(
@@ -257,7 +296,8 @@ class Evoformer(torch.nn.Module):
         self.pair_transition_proj2 = torch.nn.Parameter(
             torch.randn(ff_mult * cz, cz))
 
-    def forward(self, msa_repr: torch.Tensor, pair_repr: torch.Tensor):
+    def forward(self, state):
+        msa_repr, pair_repr = state
 
         # msa_repr = msa_repr + MSARowAttentionWithPairBias(
         #     self.row_norm_m(msa_repr), pair_repr, self.row_gate_proj,
@@ -269,21 +309,27 @@ class Evoformer(torch.nn.Module):
             self.msa_head, self.c, self.scale)
 
         msa_repr = msa_repr.transpose(-3, -2)
-        # msa_repr = msa_repr + MSAAttention(
-        #     self.col_norm(msa_repr), self.col_gate_proj, self.col_qkv_proj,
-        #     self.col_out_proj, None, self.msa_head, self.c, self.scale)
-        msa_repr = msa_repr + checkpoint(MSAAttention,
+        msa_repr = msa_repr + MSAAttention(
             self.col_norm(msa_repr), self.col_gate_proj, self.col_qkv_proj,
-            self.col_out_proj, None, self.msa_head, self.c, self.scale)
+            self.col_out_proj, self.msa_head, self.c, self.scale)
+        # msa_repr = msa_repr + checkpoint(MSAAttention,
+        #     self.col_norm(msa_repr), self.col_gate_proj, self.col_qkv_proj,
+        #     self.col_out_proj, self.msa_head, self.c, self.scale)
         msa_repr = msa_repr.transpose(-3, -2)
 
         msa_repr = msa_repr + MSATransition(self.msa_transition_norm(msa_repr),
                                             self.msa_transition_proj1,
                                             self.msa_transition_proj2)
+        # msa_repr = msa_repr + checkpoint(MSATransition, self.msa_transition_norm(msa_repr),
+        #                                     self.msa_transition_proj1,
+        #                                     self.msa_transition_proj2)
 
         pair_repr = pair_repr + OuterProductMean(
             self.outer_norm(msa_repr), self.outer_proj1, self.outer_proj2,
             self.outer_out_proj)
+        # pair_repr = pair_repr + checkpoint(OuterProductMean,
+        #     self.outer_norm(msa_repr), self.outer_proj1, self.outer_proj2,
+        #     self.outer_out_proj)
 
         pair_repr = pair_repr + TriangleMultiplication(
             pair_repr, self.tri_mul_out_norm1_weight,
@@ -292,6 +338,13 @@ class Evoformer(torch.nn.Module):
             self.tri_mul_out_proj2, self.tri_mul_out_proj3,
             self.tri_mul_out_proj4, self.tri_mul_out_proj5,
             self.tri_mul_out_proj6, self.cz, True)
+        # pair_repr = pair_repr + checkpoint(TriangleMultiplication,
+        #     pair_repr, self.tri_mul_out_norm1_weight,
+        #     self.tri_mul_out_norm1_bias, self.tri_mul_out_norm2_weight,
+        #     self.tri_mul_out_norm2_bias, self.tri_mul_out_proj1,
+        #     self.tri_mul_out_proj2, self.tri_mul_out_proj3,
+        #     self.tri_mul_out_proj4, self.tri_mul_out_proj5,
+        #     self.tri_mul_out_proj6, self.cz, True)
 
         pair_repr = pair_repr + TriangleMultiplication(
             pair_repr, self.tri_mul_in_norm1_weight,
@@ -300,43 +353,87 @@ class Evoformer(torch.nn.Module):
             self.tri_mul_in_proj2, self.tri_mul_in_proj3,
             self.tri_mul_in_proj4, self.tri_mul_in_proj5,
             self.tri_mul_in_proj6, self.cz, False)
+        # pair_repr = pair_repr + checkpoint(TriangleMultiplication,
+        #     pair_repr, self.tri_mul_in_norm1_weight,
+        #     self.tri_mul_in_norm1_bias, self.tri_mul_in_norm2_weight,
+        #     self.tri_mul_in_norm2_bias, self.tri_mul_in_proj1,
+        #     self.tri_mul_in_proj2, self.tri_mul_in_proj3,
+        #     self.tri_mul_in_proj4, self.tri_mul_in_proj5,
+        #     self.tri_mul_in_proj6, self.cz, False)
 
         pair_repr = pair_repr + TriangleAttentionNode(
             self.tri_att_start_norm(pair_repr), self.tri_att_start_gate_proj,
             self.tri_att_start_qkv_proj, self.tri_att_start_out_proj,
             self.tri_att_start_bias_proj, self.pair_head, self.c, self.scale)
+        # pair_repr = pair_repr + checkpoint(TriangleAttentionNode,
+        #     self.tri_att_start_norm(pair_repr), self.tri_att_start_gate_proj,
+        #     self.tri_att_start_qkv_proj, self.tri_att_start_out_proj,
+        #     self.tri_att_start_bias_proj, self.pair_head, self.c, self.scale)
 
         pair_repr = pair_repr.transpose(-3, -2)
         pair_repr = pair_repr + TriangleAttentionNode(
             self.tri_att_end_norm(pair_repr), self.tri_att_end_gate_proj,
             self.tri_att_end_qkv_proj, self.tri_att_end_out_proj,
             self.tri_att_end_bias_proj, self.pair_head, self.c, self.scale)
+        # pair_repr = pair_repr + checkpoint(TriangleAttentionNode,
+        #     self.tri_att_end_norm(pair_repr), self.tri_att_end_gate_proj,
+        #     self.tri_att_end_qkv_proj, self.tri_att_end_out_proj,
+        #     self.tri_att_end_bias_proj, self.pair_head, self.c, self.scale)
         pair_repr = pair_repr.transpose(-3, -2)
 
         pair_repr = pair_repr + PairTransition(
             self.pair_transition_norm(pair_repr), self.pair_transition_proj1,
             self.pair_transition_proj2)
+        # pair_repr = pair_repr + checkpoint(PairTransition,
+        #     self.pair_transition_norm(pair_repr), self.pair_transition_proj1,
+        #     self.pair_transition_proj2)
 
-        return msa_repr, pair_repr
+        return (msa_repr, pair_repr)
 
-def train_iter(model, msa, pair):
-    bs = msa.size()
-    new_msa, new_pair = model(msa, pair)
-    loss = torch.sum(new_msa) + torch.sum(new_pair)
-    loss.backward()
+class AlphaFold2(nn.Module):
+    def __init__(self, s: int, cm: int, cz: int, evo_num: int):
+        super().__init__()
 
-def test(dev):
-    bs, s, r, cm, cz = 1, 128, 256, 256, 128
-    model = Evoformer(s, cm, cz).to(dev)
+        self.net = nn.Sequential(
+                *[Evoformer(s, cm, cz) for _ in range(evo_num)],
+                )
 
-    msa = torch.randn(bs, s, r, cm).to(dev)
-    pair = torch.randn(bs, r, r, cz).to(dev)
+
+    def forward(self, msa, pair):
+        new_msa, new_pair = self.net((msa, pair))
+        loss = torch.sum(new_msa) + torch.sum(new_pair)
+        return loss
+
+
+def test():
+    bs, s, r, cm, cz = 4, 128, 256, 256, 128
+
+    model = AlphaFold2(s, cm, cz, 1)
+
+    model = cube.SemanticModel(
+            model,
+            input_shapes=([bs, s, r, cm], [bs, r, r, cz], ),
+            )
+
+    dataloader = cube.runtime.syndata.SynDataLoader(shapes=([bs, s, r, cm], [bs, r, r, cz],),
+                                                    dtypes=(torch.float32, ),
+                                                    batch_dims=(0, ))
+
+    @cube.compile(model, dataloader, PAS=spmd.PASData)
+    def train_iter(model, dataloader):
+        msa_repr, pair_repr = next(dataloader)
+        loss = model(msa_repr, pair_repr)
+        loss.backward()
+
+    model = model.get_gen_module()
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
     warm_up = 20
     iter_num = 64
     CudaTimer(enable=False).warmup()
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
     for i in range(iter_num):
         if i >= warm_up:
@@ -346,9 +443,13 @@ def test(dev):
         optimizer.zero_grad()
         if i >= warm_up:
             CudaTimer().stop('e2e')
+        if i > 0 and (i + 1) % 20 == 0:
+            # print_each_rank(f'iter [{i + 1}/{iter_num}]', rank_only=0)
+            print(f'iter [{i + 1}/{iter_num}]')
 
     print(CudaTimer().duration(iter_num - warm_up, field_name='e2e'), 'ms')
-    print(torch.cuda.memory_summary(dev))
+    # print(torch.cuda.memory_summary(dev))
+    print(torch.cuda.max_memory_allocated() / 1024 / 1024, ' MB')
 
 
-test(torch.device('cuda:0'))
+test()
