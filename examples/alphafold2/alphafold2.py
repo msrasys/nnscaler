@@ -302,33 +302,20 @@ class Evoformer(torch.nn.Module):
             self.row_norm_m(msa_repr), pair_repr, self.row_gate_proj,
             self.row_qkv_proj, self.row_out_proj, self.row_bias_proj,
             self.msa_head, self.c, self.scale)
-        # msa_repr = msa_repr + checkpoint(MSARowAttentionWithPairBias,
-        #     self.row_norm_m(msa_repr), pair_repr, self.row_gate_proj,
-        #     self.row_qkv_proj, self.row_out_proj, self.row_bias_proj,
-        #     self.msa_head, self.c, self.scale)
 
         msa_repr = msa_repr.transpose(-3, -2)
         msa_repr = msa_repr + MSAAttention(
             self.col_norm(msa_repr), self.col_gate_proj, self.col_qkv_proj,
             self.col_out_proj, self.msa_head, self.c, self.scale)
-        # msa_repr = msa_repr + checkpoint(MSAAttention,
-        #     self.col_norm(msa_repr), self.col_gate_proj, self.col_qkv_proj,
-        #     self.col_out_proj, self.msa_head, self.c, self.scale)
         msa_repr = msa_repr.transpose(-3, -2)
 
         msa_repr = msa_repr + MSATransition(self.msa_transition_norm(msa_repr),
                                             self.msa_transition_proj1,
                                             self.msa_transition_proj2)
-        # msa_repr = msa_repr + checkpoint(MSATransition, self.msa_transition_norm(msa_repr),
-        #                                     self.msa_transition_proj1,
-        #                                     self.msa_transition_proj2)
 
         pair_repr = pair_repr + OuterProductMean(
             self.outer_norm(msa_repr), self.outer_proj1, self.outer_proj2,
             self.outer_out_proj)
-        # pair_repr = pair_repr + checkpoint(OuterProductMean,
-        #     self.outer_norm(msa_repr), self.outer_proj1, self.outer_proj2,
-        #     self.outer_out_proj)
 
         pair_repr = pair_repr + TriangleMultiplication(
             pair_repr, self.tri_mul_out_norm1_weight,
@@ -337,13 +324,6 @@ class Evoformer(torch.nn.Module):
             self.tri_mul_out_proj2, self.tri_mul_out_proj3,
             self.tri_mul_out_proj4, self.tri_mul_out_proj5,
             self.tri_mul_out_proj6, self.cz, True)
-        # pair_repr = pair_repr + checkpoint(TriangleMultiplication,
-        #     pair_repr, self.tri_mul_out_norm1_weight,
-        #     self.tri_mul_out_norm1_bias, self.tri_mul_out_norm2_weight,
-        #     self.tri_mul_out_norm2_bias, self.tri_mul_out_proj1,
-        #     self.tri_mul_out_proj2, self.tri_mul_out_proj3,
-        #     self.tri_mul_out_proj4, self.tri_mul_out_proj5,
-        #     self.tri_mul_out_proj6, self.cz, True)
 
         pair_repr = pair_repr + TriangleMultiplication(
             pair_repr, self.tri_mul_in_norm1_weight,
@@ -352,40 +332,22 @@ class Evoformer(torch.nn.Module):
             self.tri_mul_in_proj2, self.tri_mul_in_proj3,
             self.tri_mul_in_proj4, self.tri_mul_in_proj5,
             self.tri_mul_in_proj6, self.cz, False)
-        # pair_repr = pair_repr + checkpoint(TriangleMultiplication,
-        #     pair_repr, self.tri_mul_in_norm1_weight,
-        #     self.tri_mul_in_norm1_bias, self.tri_mul_in_norm2_weight,
-        #     self.tri_mul_in_norm2_bias, self.tri_mul_in_proj1,
-        #     self.tri_mul_in_proj2, self.tri_mul_in_proj3,
-        #     self.tri_mul_in_proj4, self.tri_mul_in_proj5,
-        #     self.tri_mul_in_proj6, self.cz, False)
 
         pair_repr = pair_repr + TriangleAttentionNode(
             self.tri_att_start_norm(pair_repr), self.tri_att_start_gate_proj,
             self.tri_att_start_qkv_proj, self.tri_att_start_out_proj,
             self.tri_att_start_bias_proj, self.pair_head, self.c, self.scale)
-        # pair_repr = pair_repr + checkpoint(TriangleAttentionNode,
-        #     self.tri_att_start_norm(pair_repr), self.tri_att_start_gate_proj,
-        #     self.tri_att_start_qkv_proj, self.tri_att_start_out_proj,
-        #     self.tri_att_start_bias_proj, self.pair_head, self.c, self.scale)
 
         pair_repr = pair_repr.transpose(-3, -2)
         pair_repr = pair_repr + TriangleAttentionNode(
             self.tri_att_end_norm(pair_repr), self.tri_att_end_gate_proj,
             self.tri_att_end_qkv_proj, self.tri_att_end_out_proj,
             self.tri_att_end_bias_proj, self.pair_head, self.c, self.scale)
-        # pair_repr = pair_repr + checkpoint(TriangleAttentionNode,
-        #     self.tri_att_end_norm(pair_repr), self.tri_att_end_gate_proj,
-        #     self.tri_att_end_qkv_proj, self.tri_att_end_out_proj,
-        #     self.tri_att_end_bias_proj, self.pair_head, self.c, self.scale)
         pair_repr = pair_repr.transpose(-3, -2)
 
         pair_repr = pair_repr + PairTransition(
             self.pair_transition_norm(pair_repr), self.pair_transition_proj1,
             self.pair_transition_proj2)
-        # pair_repr = pair_repr + checkpoint(PairTransition,
-        #     self.pair_transition_norm(pair_repr), self.pair_transition_proj1,
-        #     self.pair_transition_proj2)
 
         return (msa_repr, pair_repr)
 
@@ -393,7 +355,6 @@ class AlphaFold2(nn.Module):
     def __init__(self, s: int, cm: int, cz: int, evo_num: int):
         super().__init__()
         self.evo_num = evo_num
-        # self.evoformers: List[torch.nn.Module] = [Evoformer(s, cm, cz) for _ in range(evo_num)]
         self.evoformer = Evoformer(s, cm, cz)
 
 
@@ -447,7 +408,7 @@ def test():
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
         CudaTimer().duration(iter_num - warm_up, field_name='e2e')))
     CudaTimer().print_all(times=iter_num - warm_up)
-    print_each_rank(torch.cuda.max_memory_allocated() / 1024 / 1024)
+    print_each_rank('memory consumption: {} MB'.format(int(torch.cuda.max_memory_allocated() / 1024 / 1024)))
 
 
 test()
