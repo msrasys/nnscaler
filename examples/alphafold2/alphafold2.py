@@ -80,7 +80,6 @@ def MSAAttentionWithBias(x: torch.Tensor, gate_proj: torch.Tensor,
     out = torch.matmul(out, out_proj)
     return out
 
-
 """
 ([bs, s, r, cm], [bs, r, r, cz]) -> [bs, s, r, cm]
 """
@@ -101,6 +100,13 @@ def MSARowAttentionWithPairBias(msa_repr: torch.Tensor,
 
     return MSAAttentionWithBias(msa_repr, gate_proj, qkv_proj, out_proj, bias, head, c, scale)
 
+@cube.graph.parser.register('N S R M, M E, M F, E M -> N S R M', name='MSAColAttention')
+def MSAColAttention(msa_repr: torch.Tensor,
+                    gate_proj: torch.Tensor,
+                    qkv_proj: torch.Tensor, out_proj: torch.Tensor,
+                    head: int, c: int,
+                    scale: float):
+    return MSAAttention(msa_repr.permute(0, 2, 1, 3), gate_proj, qkv_proj, out_proj, head, c, scale).permute(0, 2, 1, 3)
 
 """
 [bs, s, r, cm] -> [bs, s, r, cm]
@@ -302,12 +308,17 @@ class Evoformer(torch.nn.Module):
             self.row_norm_m(msa_repr), pair_repr, self.row_gate_proj,
             self.row_qkv_proj, self.row_out_proj, self.row_bias_proj,
             self.msa_head, self.c, self.scale)
+        
+        # return (msa_repr, pair_repr)
 
-        msa_repr = msa_repr.transpose(-3, -2)
-        msa_repr = msa_repr + MSAAttention(
-            self.col_norm(msa_repr), self.col_gate_proj, self.col_qkv_proj,
-            self.col_out_proj, self.msa_head, self.c, self.scale)
-        msa_repr = msa_repr.transpose(-3, -2)
+        # msa_repr = msa_repr.transpose(-3, -2)
+        # msa_repr = msa_repr + MSAAttention(
+        #     self.col_norm(msa_repr), self.col_gate_proj, self.col_qkv_proj,
+        #     self.col_out_proj, self.msa_head, self.c, self.scale)
+        # msa_repr = msa_repr.transpose(-3, -2)
+        msa_repr = msa_repr + MSAColAttention(self.col_norm(msa_repr), self.col_gate_proj,
+        self.col_qkv_proj, self.col_out_proj, self.msa_head, self.c, self.scale)
+        # return (msa_repr, pair_repr)
 
         msa_repr = msa_repr + MSATransition(self.msa_transition_norm(msa_repr),
                                             self.msa_transition_proj1,
@@ -368,6 +379,10 @@ def test():
     bs, s, r, cm, cz = 4, 128, 256, 256, 128
 
     model = AlphaFold2(s, cm, cz, 1)
+
+    # msa_repr, pair_repr = torch.randn(bs, s, r, cm), torch.randn(bs, r, r, cz)
+    # x = model(msa_repr, pair_repr)
+    # return
 
     model = cube.SemanticModel(
             model,
