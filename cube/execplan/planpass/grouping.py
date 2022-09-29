@@ -23,10 +23,10 @@ class Grouping(PlanPass):
         for devid in execplan.devices():
             for fpieces, bpieces in zip(fgroups[devid], bgroups[devid]):
                 fsubgraph = graph.create_segment(fpieces)
-                if bpieces is not None:
+                if len(bpieces) > 0:
                     bsubgraph = graph.create_segment(bpieces)
                     IRCell.make_pair(fsubgraph, bsubgraph)
-                subgraphs = [fsubgraph] if bpieces is None else [fsubgraph, fsubgraph.mirror]
+                subgraphs = [fsubgraph] if len(bpieces) == 0 else [fsubgraph, fsubgraph.mirror]
                 for subgraph in subgraphs:
                     # update execution plan: replace the nodes with the subgraph
                     pieces = subgraph.nodes()
@@ -53,7 +53,7 @@ class Grouping(PlanPass):
         Returns:
             Tuple: (fgroups, bgroups)
         """
-        def is_forward_node(fnode):
+        def differentiable(fnode):
             if isinstance(fnode, IRFwOperation):
                 return True
             if isinstance(fnode, IRAdapter) and fnode.differentiable and fnode.forward:
@@ -63,27 +63,13 @@ class Grouping(PlanPass):
         fgroups, bgroups = dict(), dict()
         for devid in execplan.devices():
             fgroups[devid], bgroups[devid] = list(), list()
-            seq = execplan.seq(devid)
-            fnodes = [node for node in seq if is_forward_node(node)]
-            have_backward = all(fnode.mirror in seq for fnode in fnodes)
-            fpieces = []
-
-            for fnode in seq:
-                if is_forward_node(fnode):
-                    fpieces.append(fnode)
-                else:
-                    if len(fpieces) != 0:
-                        fgroups[devid].append(fpieces)
-                    fpieces = []
-
-            if len(fpieces) != 0:
-                fgroups[devid].append(fpieces)
-
-            for pieces in fgroups[devid]:
-                if have_backward:
-                    bpieces = [fnode.mirror for fnode in pieces[::-1] if fnode.mirror is not None]
-                    bgroups[devid].append(bpieces)
-                else:
-                    bgroups[devid].append(None)
+            nodes = execplan.seq(devid)
+            break_idx = [idx for idx, node in enumerate(nodes) if not differentiable(node)]
+            for start, end in zip([-1] + break_idx, break_idx + [len(nodes)]):
+                if start+1 == end: continue
+                fpieces = nodes[start+1:end]
+                bpieces = [node.mirror for node in fpieces[::-1] if node.mirror is not None]
+                fgroups[devid].append(nodes[start+1:end])
+                bgroups[devid].append(bpieces)
 
         return fgroups, bgroups

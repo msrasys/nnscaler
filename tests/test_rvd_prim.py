@@ -89,7 +89,7 @@ def prim_bw(prim: Callable, bandwidth: Callable, ranks, size, warmup=100, profil
         msg_size = len(ranks) * tensor.nelement() * 4 // 1024 // 1024 # MB
     algo_bw, bus_bw = bandwidth(tensor, ranks, span)
     print_each_rank(
-        '{} msg {} : MBwall-time(ms) algo-bw(GB/s) bus-bw(GB/s) {:.2f} {:.2f} {:.2f}'.format(
+        '{} msg {} MB | wall-time(ms) algo-bw(GB/s) bus-bw(GB/s) {:.2f} {:.2f} {:.2f}'.format(
             prim.__name__, msg_size, span*1000, algo_bw, bus_bw
         ), rank_only=0
     )
