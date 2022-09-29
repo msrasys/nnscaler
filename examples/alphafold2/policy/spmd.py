@@ -1,4 +1,6 @@
 from typing import List
+
+from numpy import TooHardError
 from cube.graph import IRGraph
 from cube.ir.operator import IRDataOperation, IRFwOperation
 
@@ -9,14 +11,17 @@ recompute_info = {
     'MSAColAttention': True,
     'MSATransition': True,
     'OuterProductMean': True,
-    'TriangleMultiplication': True,
-    'TriangleAttentionNode': True,
+    'TriangleMultiplicationOut': True,
+    'TriangleMultiplicationIn': True,
+    'TriangleAttentionNodeStart': True,
+    'TriangleAttentionNodeEnd': True,
     'PairTransition': True,
     'add': False,
     'sum': False,
     'layernorm': False,
     'transpose': False,
 }
+
 
 def PASData(graph: IRGraph, resource):
     devs = list(range(resource.ngpus))
@@ -44,17 +49,24 @@ def PASData(graph: IRGraph, resource):
                                         num=resource.ngpus)
             for idx, sub_node in enumerate(sub_nodes):
                 graph.assign(sub_node, idx)
-            if node.name in recompute_info and recompute_info[node.name] == True:
+            if node.name in recompute_info and recompute_info[
+                    node.name] == True:
                 graph.recompute(sub_nodes)
     return graph
+
 
 def PASMegatron(graph: IRGraph, resource):
     tp_size = resource.ngpus
     tp_devs = list(range(tp_size))
 
-    def _tp(graph: IRGraph, node: IRFwOperation, devs: List[int], idx: int, dim: int):
+    def _tp(graph: IRGraph, node: IRFwOperation, devs: List[int], idx: int,
+            dim: int):
         algo = node.algorithms('dim')
-        sub_nodes = graph.partition(node, algo, idx=idx, dim=dim, num=len(devs))
+        sub_nodes = graph.partition(node,
+                                    algo,
+                                    idx=idx,
+                                    dim=dim,
+                                    num=len(devs))
         assert sub_nodes is not None
         for devid, sub_node in zip(devs, sub_nodes):
             graph.assign(sub_node, devid)
@@ -68,8 +80,28 @@ def PASMegatron(graph: IRGraph, resource):
 
     for node in graph.nodes():
         if isinstance(node, IRDataOperation):
-            algo = node.algorithms('data')
-            sub_nodes = graph.partition(node, algo, num=resource.ngpus)
-            for idx, sub_node in enumerate(sub_nodes):
-                graph.assign(sub_node, idx)
-            batch_dim = node.get_batch_dims()[0]
+            _replica(graph, node, tp_devs)
+
+    for node in graph.nodes():
+        if isinstance(node, IRFwOperation):
+            if node.name == 'MSARowAttentionWithPairBias':
+                _tp(graph, node, tp_devs, 0, 1)
+            elif node.name == 'MSAColAttention':
+                _tp(graph, node, tp_devs, 0, 2)
+            elif node.name == 'MSATransition':
+                _tp(graph, node, tp_devs, 0, 1)
+            elif node.name == 'OuterProductMean':
+                _tp(graph, node, tp_devs, 0, 2)
+            elif node.name == 'TriangleMultiplicationOut':
+                _tp(graph, node, tp_devs, 0, 1)
+            elif node.name == 'TriangleMultiplicationIn':
+                _tp(graph, node, tp_devs, 0, 2)
+            elif node.name == 'TriangleAttentionNodeStart':
+                _tp(graph, node, tp_devs, 0, 1)
+            elif node.name == 'TriangleAttentionNodeEnd':
+                _tp(graph, node, tp_devs, 0, 2)
+            elif node.name == 'PairTransition':
+                _tp(graph, node, tp_devs, 0, 1)
+            else:
+                _replica(graph, node, tp_devs)
+    return graph
