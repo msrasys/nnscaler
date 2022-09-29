@@ -43,7 +43,7 @@ def _group_to_transformers(fnodes) -> List[List[IRCell]]:
     anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
     indices = [fnodes.index(anchor) for anchor in anchors]
     for lid, idx in enumerate(indices):
-        fnodes[idx-1].comment = f'===> start of transformer layer {lid}'
+        fnodes[idx+1].comment = f'===> start of transformer layer {lid}'
         start = idx if lid != 0 else 0
         end = indices[lid+1] if lid + 1 < len(anchors) else len(fnodes)
         transformers.append(fnodes[start:end])
@@ -133,10 +133,10 @@ def PASMegatron(graph: IRGraph, resource):
     """
     1F1B scheduling
     """
-    dp_size = 1
+    dp_size = 2
     tp_size = 2
     pp_size = resource.ngpus // (dp_size * tp_size)
-    num_microbatch = resource.ngpus
+    num_microbatch = pp_size * 2
 
     # device mesh
     dp_groups, pp_groups, tp_groups = \
@@ -145,33 +145,50 @@ def PASMegatron(graph: IRGraph, resource):
     print(f'pp groups: {pp_groups}')
     print(f'tp groups: {tp_groups}')
 
-    # group to transformer layers
-    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
-    transformers = _group_to_transformers(fnodes)
+    def get_device(dp_idx: int, pp_idx: int, tp_idx: int, ) -> int:
+        return tp_groups[dp_idx * pp_size + pp_idx][tp_idx]
 
-    # inter-staging: set each stage operators
+    # group to transformer layers
+    transformers = _group_to_transformers(graph.select(ntype=IRFwOperation))
+
+    # group to stage: set each stage operators
     fstages = [[] for _ in range(pp_size)]
-    nlayer_per_stage = (len(transformers) // resource.ngpus)
+    nlayer_per_stage = (len(transformers) // pp_size)
     for lid, fnodes in enumerate(transformers):
         stage_id = min(lid // nlayer_per_stage, pp_size - 1)
         fstages[stage_id] += fnodes  
     graph.staging(tuple(stages[0] for stages in fstages))
 
-    # intra-stage: tp and dp parallelism on device group
-    fsegments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
-    assert len(fsegments) == pp_size
-    for sid, segment in enumerate(fsegments):
-        for fnode in segment.nodes():
-            if fnode.name == 'self_attention':
-                _tp(graph, fnode, tp_groups[sid], idx=1, dim=0, num=tp_size)
-            elif fnode.name == 'feedforward':
-                _tp(graph, fnode, tp_groups[sid], idx=1, dim=0, num=tp_size)
-            else:
-                _replica(graph, fnode, tp_groups[sid])
+    dataloader = graph.select(ntype=IRDataOperation)[0]
+    bs = dataloader.output(0).shape[0]
+
+    # partition dataloader
+    dls = _replica(graph, dataloader, [0]*dp_size) # graph.partition(dataloader, dataloader.algorithms('data'), num=dp_size)
+    for dp_idx, dl in enumerate(dls):
+        # only stage 0 needs dataloader
+        devices = [get_device(dp_idx, 0, tp_idx) for tp_idx in range(tp_size)]
+        _replica(graph, dl, devices)
     
-    for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            _replica(graph, node, tp_groups[0])
+    fstages = [stage for stage in graph.select(ntype=IRSegment, flatten=False) if stage.isfw()]
+    assert len(fstages) > 0
+    for pp_idx, fstage in enumerate(fstages):
+        for fnode in fstage.nodes():
+            if len(fnode.inputs()) == 0: continue # anchor
+            # tensor parallel -- FIXME: current restriction needs replica happen before partition
+            if fnode.name == 'self_attention' or fnode.name == 'feedforward':
+                fnodes = _tp(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
+            elif fnode.name == 'embedding':
+                fnodes = _tp(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
+            elif fnode.name == 'linear': # the last embeding linear
+                fnodes = _tp(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
+            else:
+                fnodes = _replica(graph, fnode, [0]*tp_size)
+            # data parallel
+            for tp_idx, fnode in enumerate(fnodes):
+                dp_devices = [get_device(dp_idx, pp_idx, tp_idx) for dp_idx in range(dp_size)]
+                print(dp_devices)
+                batch_dim = fnode.input(0).shape.index(bs)
+                _tp(graph, fnode, devs=dp_devices, idx=0, dim=batch_dim, num=dp_size)
 
     strategy = IRSchedule1F1B(graph, num_microbatch)
     graph.predef_sched(strategy)
