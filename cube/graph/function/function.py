@@ -861,7 +861,7 @@ def Embedding(signature, inputs: List):
     """
     signature = 'cube.runtime.function.embedding'
     itensor, weight = inputs[:2]
-    padding_idx = inputs[3]
+    padding_idx = inputs[2]
     if isinstance(weight, IRSubTensor):
         start, stop = weight.indmap[0]
     else:
