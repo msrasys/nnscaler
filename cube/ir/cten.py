@@ -516,7 +516,7 @@ class IRTensor:
 
         @return is_param boolean: True if is parameter.
         """
-        return self._is_attr and self._requires_grad
+        return self._is_attr and self.requires_grad
 
     def is_buffer(self) -> bool:
         """!
@@ -524,7 +524,7 @@ class IRTensor:
 
         @return is_buffer boolean: True if is buffer.
         """
-        return self._is_attr and not self._requires_grad
+        return self._is_attr and not self.requires_grad
 
     def is_grad(self) -> bool:
         """!

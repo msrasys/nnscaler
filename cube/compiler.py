@@ -88,7 +88,6 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
     def decorator(fn: Callable) -> Callable:
         filename = 'gencode{}.py'
-        batch_size = torch.tensor([-1], dtype=torch.int).cuda()
 
         if not override and os.path.exists(filename.format(myrank)):
             filename = filename.format(myrank)
@@ -109,6 +108,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
             # run once to get model structure and tensor shape
             outputs = fn(model_graph, ir_dataloader)
+            Program().finalize()
             if outputs is None:
                 outputs = []
             elif not (isinstance(outputs, tuple) or isinstance(outputs, list)):

@@ -123,7 +123,7 @@ class IRSegment(IRCell):
 
         @return ftensors List[IRFullTensor]
         """
-        return Tuple(self._attributes)
+        return tuple(self._attributes)
 
     def reset_dependency(self):
         """

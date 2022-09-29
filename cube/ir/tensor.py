@@ -621,7 +621,8 @@ class IRSubTensor(IRTensor):
 
     @property
     def requires_grad(self) -> bool:
-        return self.parent._requires_grad
+        self._requires_grad = self.parent.requires_grad
+        return self.parent.requires_grad
 
     @property
     def grad(self) -> bool:
