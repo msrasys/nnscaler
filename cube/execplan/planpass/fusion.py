@@ -39,13 +39,13 @@ class DiffFusion(PlanPass):
         for node in segment.nodes():
             if isinstance(node, IRAdapter) and node.forward:
                 ret = DiffFusion.nnfuse(node)
-                if not ret and not node.differentiable:
-                    raise NotImplementedError(
-                        f"Adapter within IRSegment cannot fuse to differientiable adapter"
-                        f"\nforward: {node.extra_repr()}"
-                        f"\nbackward: {node.mirror.extra_repr()}"
-                    )
-                cnt = cnt + 1
+                # if not ret and not node.differentiable:
+                #     raise NotImplementedError(
+                #         f"Adapter within IRSegment cannot fuse to differientiable adapter"
+                #         f"\nforward: {node.extra_repr()}"
+                #         f"\nbackward: {node.mirror.extra_repr()}"
+                #     )
+                cnt = cnt + 1 if ret else cnt
             elif isinstance(node, IRSegment) and node.isfw():
                 cnt += DiffFusion._apply(node)
         return cnt

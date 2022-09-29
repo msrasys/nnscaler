@@ -47,11 +47,12 @@ def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
     
     @return nodes List[IRCell]: the generated operation
     """
-    devices = segment.device
+    # devices = segment.device
     fwops = []
 
     # create inputs
     for tensor in segment.inputs():
+        devices = [consumer.device for consumer in segment.consumers(tensor.parent)][::-1]
         if not isinstance(tensor, IRSubTensor): continue
         assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
         fwop = DummyInputOuput(tensor, 0, is_output=True)
@@ -67,6 +68,7 @@ def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
     
     # create outputs
     for tensor in segment.outputs():
+        devices = [producer.device for producer in segment.producers(tensor.parent)]
         if not isinstance(tensor, IRSubTensor): continue
         assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
         fwop = DummyInputOuput(tensor, 0, is_input=True)
@@ -74,10 +76,7 @@ def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
             fop = fwop.replicate()
             fop.device = devid
             if tensor.requires_grad and segment.mirror != segment:
-                if isinstance(tensor.grad, float):
-                    fop.input(0).grad = tensor.grad
-                else:
-                    fop.input(0).grad = tensor.grad.select(tensor.indmap, (0, 1))
+                fop.input(0).grad = tensor.grad.select(tensor.indmap, (0, 1))
                 segment.finsert(fop, segment.nnodes)
             else:
                 segment.insert(fop, segment.nnodes)
@@ -320,10 +319,10 @@ class IRAdapterGener:
                 continue
 
             if not isinstance(graph, IRGraph):
-                if not fadapter.differentiable:
+                if not (fadapter.differentiable or fadapter.mirror is None):
                     raise NotImplementedError(
-                        "Require adapter to be differentiable for nested IRAdapter."
-                        "Condition to be differentiable: prodcuers have same device set with consumers"
+                        "Require adapter to be differentiable for nested IRAdapter.\n"
+                        "Condition to be differentiable: prodcuers have same device set with consumers\n"
                         f"Failed FullTensor: {ftensor}"
                         f"{graph.debug_tensor_map_str(ftensor)}"
                         f"Failed FullTensor.grad: {ftensor.grad}"
