@@ -1,3 +1,4 @@
+from audioop import mul
 import torch
 import math
 import cube
@@ -380,6 +381,7 @@ class Evoformer(torch.nn.Module):
         msa_repr = msa_repr + MSATransition(self.msa_transition_norm(msa_repr),
                                             self.msa_transition_proj1,
                                             self.msa_transition_proj2)
+        succ_msa_repr, msa_repr = multi2ref(msa_repr)
 
         pair_msa_repr, dummy_pair_msa_repr = multi2ref(
             self.outer_norm(msa_repr))
@@ -388,7 +390,7 @@ class Evoformer(torch.nn.Module):
             self.outer_proj2, self.outer_out_proj)
 
         out_pair_repr, out_dummy_pair_repr = multi2ref(pair_repr)
-        pair_repr = pair_repr + TriangleMultiplicationOut(
+        pair_repr = out_pair_repr + TriangleMultiplicationOut(
             out_pair_repr, out_dummy_pair_repr, self.tri_mul_out_norm1_weight,
             self.tri_mul_out_norm1_bias, self.tri_mul_out_norm2_weight,
             self.tri_mul_out_norm2_bias, self.tri_mul_out_proj1,
@@ -397,7 +399,7 @@ class Evoformer(torch.nn.Module):
             self.tri_mul_out_proj6, self.cz)
 
         in_pair_repr, in_dummy_pair_repr = multi2ref(pair_repr)
-        pair_repr = pair_repr + TriangleMultiplicationIn(
+        pair_repr = in_pair_repr + TriangleMultiplicationIn(
             in_pair_repr, in_dummy_pair_repr, self.tri_mul_in_norm1_weight,
             self.tri_mul_in_norm1_bias, self.tri_mul_in_norm2_weight,
             self.tri_mul_in_norm2_bias, self.tri_mul_in_proj1,
@@ -419,7 +421,7 @@ class Evoformer(torch.nn.Module):
             self.pair_transition_norm(pair_repr), self.pair_transition_proj1,
             self.pair_transition_proj2)
 
-        return (msa_repr, pair_repr)
+        return (succ_msa_repr, pair_repr)
 
 
 class AlphaFold2(nn.Module):
@@ -436,7 +438,7 @@ class AlphaFold2(nn.Module):
 
 
 def test():
-    bs, s, r, cm, cz = 1, 128, 384, 256, 128
+    bs, s, r, cm, cz = 1, 128, 256, 256, 128
 
     model = AlphaFold2(s, cm, cz, 1)
 

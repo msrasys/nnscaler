@@ -78,30 +78,79 @@ def PASMegatron(graph: IRGraph, resource):
             graph.assign(sub_node, dev_id)
         return sub_nodes
 
+    pred_name = ''
     for node in graph.nodes():
         if isinstance(node, IRDataOperation):
+            # _tp(graph, node, tp_devs, 0, 1)
             _replica(graph, node, tp_devs)
-
-    for node in graph.nodes():
-        if isinstance(node, IRFwOperation):
+        elif isinstance(node, IRFwOperation):
             if node.name == 'MSARowAttentionWithPairBias':
                 _tp(graph, node, tp_devs, 0, 1)
+                pred_name = node.name
             elif node.name == 'MSAColAttention':
                 _tp(graph, node, tp_devs, 0, 2)
+                pred_name = node.name
             elif node.name == 'MSATransition':
-                _tp(graph, node, tp_devs, 0, 1)
+                _tp(graph, node, tp_devs, 0, 2)
+                pred_name = node.name
             elif node.name == 'OuterProductMean':
                 _tp(graph, node, tp_devs, 0, 2)
+                pred_name = node.name
             elif node.name == 'TriangleMultiplicationOut':
                 _tp(graph, node, tp_devs, 0, 1)
+                pred_name = node.name
             elif node.name == 'TriangleMultiplicationIn':
                 _tp(graph, node, tp_devs, 0, 2)
+                pred_name = node.name
             elif node.name == 'TriangleAttentionNodeStart':
                 _tp(graph, node, tp_devs, 0, 1)
+                pred_name = node.name
             elif node.name == 'TriangleAttentionNodeEnd':
                 _tp(graph, node, tp_devs, 0, 2)
+                pred_name = node.name
             elif node.name == 'PairTransition':
                 _tp(graph, node, tp_devs, 0, 1)
+                pred_name = node.name
             else:
-                _replica(graph, node, tp_devs)
+                if node.name == 'add':
+                    if pred_name == 'PairTransition':
+                        _tp(graph, node, tp_devs, 0, 1)
+                    elif pred_name == 'TriangleAttentionNodeEnd':
+                        _tp(graph, node, tp_devs, 0, 2)
+                    elif pred_name == 'TriangleAttentionNodeStart':
+                        _tp(graph, node, tp_devs, 0, 1)
+                    elif pred_name == 'TriangleMultiplicationIn':
+                        _tp(graph, node, tp_devs, 0, 2)
+                    elif pred_name == 'TriangleMultiplicationOut':
+                        _tp(graph, node, tp_devs, 0, 1)
+                    elif pred_name == 'OuterProductMean':
+                        _tp(graph, node, tp_devs, 0, 1)
+                    elif pred_name == 'MSATransition':
+                        _tp(graph, node, tp_devs, 0, 2)
+                    elif pred_name == 'MSAColAttention':
+                        _tp(graph, node, tp_devs, 0, 2)
+                    elif pred_name == 'MSARowAttentionWithPairBias':
+                        _tp(graph, node, tp_devs, 0, 1)
+                    else:
+                        assert False
+                elif node.name == 'layernorm':
+                    if pred_name == 'TriangleAttentionNodeEnd':
+                        _tp(graph, node, tp_devs, 0, 1)
+                    elif pred_name == 'TriangleAttentionNodeStart':
+                        _tp(graph, node, tp_devs, 0, 2)
+                    elif pred_name == 'TriangleMultiplicationIn':
+                        _tp(graph, node, tp_devs, 0, 1)
+                    elif pred_name == 'MSATransition':
+                        _tp(graph, node, tp_devs, 0, 2)
+                    elif pred_name == 'MSAColAttention':
+                        _tp(graph, node, tp_devs, 0, 2)
+                    elif pred_name == 'MSARowAttentionWithPairBias':
+                        _tp(graph, node, tp_devs, 0, 2)
+                    elif pred_name == '':
+                        _tp(graph, node, tp_devs, 0, 1)
+                    else:
+                        assert False
+                else:
+                    print('replica node:', node.name)
+                    _replica(graph, node, tp_devs)
     return graph
