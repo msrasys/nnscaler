@@ -2,7 +2,7 @@ from typing import List
 
 from numpy import TooHardError
 from cube.graph import IRGraph
-from cube.ir.operator import IRDataOperation, IRFwOperation
+from cube.ir.operator import IRDataOperation, IRFwOperation, IRBpOperation
 
 recompute_info = {
     'MSAAttention': True,
@@ -21,6 +21,14 @@ recompute_info = {
     'layernorm': False,
     'transpose': False,
 }
+
+
+def PASSingle(graph: IRGraph, resource):
+    assert resource.ngpus == 1
+    for node in graph.nodes():
+        if not isinstance(node, IRBpOperation):
+            graph.assign(node, 0)
+    return graph
 
 
 def PASData(graph: IRGraph, resource):

@@ -438,7 +438,8 @@ class AlphaFold2(nn.Module):
 
 
 def test():
-    bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    # bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    bs, s, r, cm, cz = 1, 512, 384, 256, 128
 
     model = AlphaFold2(s, cm, cz, 1)
 
@@ -467,6 +468,7 @@ def test():
                                                         0,
                                                     ))
 
+    # @cube.compile(model, dataloader, PAS=spmd.PASSingle)
     # @cube.compile(model, dataloader, PAS=spmd.PASData)
     @cube.compile(model, dataloader, PAS=spmd.PASMegatron, override=True)
     def train_iter(model, dataloader):
