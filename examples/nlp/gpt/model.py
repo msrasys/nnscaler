@@ -108,7 +108,7 @@ class GPT(torch.nn.Module):
 
 class GPTInfer(torch.nn.Module):
 
-    def __init__(self):
+    def __init__(self, batch_size: int = 1):
         super().__init__()
         cfg = Config()
 
@@ -121,6 +121,7 @@ class GPTInfer(torch.nn.Module):
             [EncoderInferLayer(
                 cfg.embed_dim, cfg.attention_heads,
                 cfg.attn_hidden_dim, cfg.ffn_hidden_dim, cfg.seqlen,
+                batch_size,
                 cfg.dropout, cfg.attn_dropout, cfg.activation_dropout
             ) for _ in range(cfg.layers)]
         )
@@ -205,12 +206,12 @@ class GPTInferDataLoader(cube.runtime.syndata.CubeDataLoader):
             0, self.cfg.num_embeddings,
             size=(self.bs, 1),
             dtype=torch.int64,
-            # device=torch.cuda.current_device()
+            device=torch.cuda.current_device()
         )
         position_ids = torch.arange(
             0, 1, dtype=torch.int64,
-            # device=torch.cuda.current_device()
-        ).repeat(self.bs)
+            device=torch.cuda.current_device()
+        ).repeat(self.bs).view(self.bs, -1)
         return (input_ids, position_ids)
 
     def __iter__(self):
