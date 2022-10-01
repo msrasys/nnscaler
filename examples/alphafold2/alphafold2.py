@@ -129,22 +129,30 @@ def MSATransition(msa_repr: torch.Tensor, proj1: torch.Tensor,
         torch.nn.functional.relu(torch.matmul(msa_repr, proj1)), proj2)
 
 
+@cube.graph.parser.register('N S R M, M C -> N S R C', name='OPMLeftProj')
+def OPMLeftProj(msa_repr: torch.Tensor, proj: torch.Tensor):
+    return torch.matmul(msa_repr, proj)
+
+
+@cube.graph.parser.register('N S R M, M C -> N S R C', name='OPMRightProj')
+def OPMRightProj(msa_repr: torch.Tensor, proj: torch.Tensor):
+    return torch.matmul(msa_repr, proj)
+
+
 """
 [bs, s, r, cm] -> [bs, r, r, cz]
 """
 
 
-@cube.graph.parser.register('N S R M, N S T M, M C, M C, F Z -> N R T Z',
+@cube.graph.parser.register('N S R M, N S T M, F Z -> N R T Z',
                             name='OuterProductMean')
-def OuterProductMean(msa_repr: torch.Tensor, dummy_msa_repr: torch.Tensor,
-                     proj1: torch.Tensor, proj2: torch.Tensor,
+def OuterProductMean(left_act: torch.Tensor, right_act: torch.Tensor,
                      out_proj: torch.Tensor):
-    bs, s, r, cm = msa_repr.size()
-    t = dummy_msa_repr.size(2)
-    c = proj1.size(-1)
+    bs, s, r, c = left_act.size()
+    t = right_act.size(2)
 
-    a = torch.matmul(msa_repr, proj1).transpose(-2, -3)
-    b = torch.matmul(dummy_msa_repr, proj2).transpose(-2, -3)
+    a = left_act.transpose(-2, -3)
+    b = right_act.transpose(-2, -3)
 
     outer = torch.einsum('...bac,...dae->...bdce', a,
                          b).reshape(bs, r, t, c * c)
@@ -152,27 +160,35 @@ def OuterProductMean(msa_repr: torch.Tensor, dummy_msa_repr: torch.Tensor,
     return outer
 
 
-@cube.graph.parser.register(
-    'N S R Z, N T R Z, Z, Z, E, E, Z E, Z E, Z E, Z E, E Z, Z Z -> N S T Z',
-    name='TriangleMultiplicationOut')
-def TriangleMultiplicationOut(
-        pair_repr: torch.Tensor, dummy_pair_repr: torch.Tensor,
-        tri_mul_norm1_weight: torch.Tensor, tri_mul_norm1_bias: torch.Tensor,
-        tri_mul_norm2_weight: torch.Tensor, tri_mul_norm2_bias: torch.Tensor,
-        tri_mul_proj1: torch.Tensor, tri_mul_proj2: torch.Tensor,
-        tri_mul_proj3: torch.Tensor, tri_mul_proj4: torch.Tensor,
-        tri_mul_proj5: torch.Tensor, tri_mul_proj6: torch.Tensor, cz: int):
-    pair_repr = torch.nn.functional.layer_norm(pair_repr, (cz, ),
-                                               tri_mul_norm1_weight,
-                                               tri_mul_norm1_bias)
-    dummy_pair_repr = torch.nn.functional.layer_norm(dummy_pair_repr, (cz, ),
-                                                     tri_mul_norm1_weight,
-                                                     tri_mul_norm1_bias)
-    a = torch.sigmoid(torch.matmul(pair_repr, tri_mul_proj1))
-    a = a * torch.matmul(pair_repr, tri_mul_proj2)
-    b = torch.sigmoid(torch.matmul(dummy_pair_repr, tri_mul_proj3))
-    b = b * torch.matmul(dummy_pair_repr, tri_mul_proj4)
+@cube.graph.parser.register('N S R Z, Z E, Z E -> N S R E', name='TMOLeftProj')
+def TMOLeftProj(pair_repr: torch.Tensor, proj1: torch.Tensor,
+                proj2: torch.Tensor):
+    a = torch.sigmoid(torch.matmul(pair_repr, proj1))
+    a = a * torch.matmul(pair_repr, proj2)
+    return a
 
+
+@cube.graph.parser.register('N S R Z, Z E, Z E -> N S R E',
+                            name='TMORightProj')
+def TMORightProj(pair_repr: torch.Tensor, proj1: torch.Tensor,
+                 proj2: torch.Tensor):
+    a = torch.sigmoid(torch.matmul(pair_repr, proj1))
+    a = a * torch.matmul(pair_repr, proj2)
+    return a
+
+
+@cube.graph.parser.register('N S T Z, Z Z -> N S T Z', name='TMOGate')
+def TMOGate(pair_repr: torch.Tensor, proj: torch.Tensor):
+    return torch.sigmoid(torch.matmul(pair_repr, proj))
+
+
+@cube.graph.parser.register('N S R E, N T R E, N S T Z, E, E, E Z -> N S T Z',
+                            name='TriangleMultiplicationOut')
+def TriangleMultiplicationOut(a: torch.Tensor, b: torch.Tensor,
+                              g: torch.Tensor,
+                              tri_mul_norm2_weight: torch.Tensor,
+                              tri_mul_norm2_bias: torch.Tensor,
+                              tri_mul_proj5: torch.Tensor, cz: int):
     a = a.permute(0, 3, 1, 2)
     b = b.permute(0, 3, 2, 1)
 
@@ -180,31 +196,37 @@ def TriangleMultiplicationOut(
     p = torch.nn.functional.layer_norm(p, (128, ), tri_mul_norm2_weight,
                                        tri_mul_norm2_bias)
     p = torch.matmul(p, tri_mul_proj5)
-    g = torch.sigmoid(torch.matmul(pair_repr, tri_mul_proj6))
     return p * g
 
 
-@cube.graph.parser.register(
-    'N R S Z, N R T Z, Z, Z, E, E, Z E, Z E, Z E, Z E, E Z, Z Z -> N S T Z',
-    name='TriangleMultiplicationIn')
-def TriangleMultiplicationIn(
-        pair_repr: torch.Tensor, dummy_pair_repr: torch.Tensor,
-        tri_mul_norm1_weight: torch.Tensor, tri_mul_norm1_bias: torch.Tensor,
-        tri_mul_norm2_weight: torch.Tensor, tri_mul_norm2_bias: torch.Tensor,
-        tri_mul_proj1: torch.Tensor, tri_mul_proj2: torch.Tensor,
-        tri_mul_proj3: torch.Tensor, tri_mul_proj4: torch.Tensor,
-        tri_mul_proj5: torch.Tensor, tri_mul_proj6: torch.Tensor, cz: int):
-    pair_repr = torch.nn.functional.layer_norm(pair_repr, (cz, ),
-                                               tri_mul_norm1_weight,
-                                               tri_mul_norm1_bias)
-    dummy_pair_repr = torch.nn.functional.layer_norm(dummy_pair_repr, (cz, ),
-                                                     tri_mul_norm1_weight,
-                                                     tri_mul_norm1_bias)
-    a = torch.sigmoid(torch.matmul(pair_repr, tri_mul_proj1))
-    a = a * torch.matmul(pair_repr, tri_mul_proj2)
-    b = torch.sigmoid(torch.matmul(dummy_pair_repr, tri_mul_proj3))
-    b = b * torch.matmul(dummy_pair_repr, tri_mul_proj4)
+@cube.graph.parser.register('N R S Z, Z E, Z E -> N R S E', name='TMILeftProj')
+def TMILeftProj(pair_repr: torch.Tensor, proj1: torch.Tensor,
+                proj2: torch.Tensor):
+    a = torch.sigmoid(torch.matmul(pair_repr, proj1))
+    a = a * torch.matmul(pair_repr, proj2)
+    return a
 
+
+@cube.graph.parser.register('N R T Z, Z E, Z E -> N R T E',
+                            name='TMIRightProj')
+def TMIRightProj(pair_repr: torch.Tensor, proj1: torch.Tensor,
+                 proj2: torch.Tensor):
+    a = torch.sigmoid(torch.matmul(pair_repr, proj1))
+    a = a * torch.matmul(pair_repr, proj2)
+    return a
+
+
+@cube.graph.parser.register('N S T Z, Z Z -> N S T Z', name='TMIGate')
+def TMIGate(pair_repr: torch.Tensor, proj: torch.Tensor):
+    return torch.sigmoid(torch.matmul(pair_repr, proj))
+
+
+@cube.graph.parser.register('N R S E, N R T E, N T S Z, E, E, E Z -> N T S Z',
+                            name='TriangleMultiplicationIn')
+def TriangleMultiplicationIn(a: torch.Tensor, b: torch.Tensor, g: torch.Tensor,
+                             tri_mul_norm2_weight: torch.Tensor,
+                             tri_mul_norm2_bias: torch.Tensor,
+                             tri_mul_proj5: torch.Tensor, cz: int):
     a = a.permute(0, 3, 2, 1)
     b = b.permute(0, 3, 1, 2)
 
@@ -212,8 +234,7 @@ def TriangleMultiplicationIn(
     p = torch.nn.functional.layer_norm(p, (128, ), tri_mul_norm2_weight,
                                        tri_mul_norm2_bias)
     p = torch.matmul(p, tri_mul_proj5)
-    g = torch.sigmoid(torch.matmul(pair_repr, tri_mul_proj6)).transpose(1, 2)
-    return p * g
+    return p.permute(0, 2, 1, 3) * g
 
 
 @cube.graph.parser.register('N S R Z, Z E, Z F, E Z, Z G -> N S R Z',
@@ -306,8 +327,7 @@ class Evoformer(torch.nn.Module):
         self.outer_out_proj = torch.nn.Parameter(torch.randn(c * c, cz))
 
         # Triangular multiplicative update using outgoing edges
-        self.tri_mul_out_norm1_weight = torch.nn.Parameter(torch.empty(cz))
-        self.tri_mul_out_norm1_bias = torch.nn.Parameter(torch.empty(cz))
+        self.tri_mul_out_norm1 = torch.nn.LayerNorm(cz)
         self.tri_mul_out_norm2_weight = torch.nn.Parameter(
             torch.empty(c_tri_mult))
         self.tri_mul_out_norm2_bias = torch.nn.Parameter(
@@ -325,8 +345,7 @@ class Evoformer(torch.nn.Module):
         self.tri_mul_out_proj6 = torch.nn.Parameter(torch.randn(cz, cz))
 
         # Triangular multiplicative update using incoming edges
-        self.tri_mul_in_norm1_weight = torch.nn.Parameter(torch.empty(cz))
-        self.tri_mul_in_norm1_bias = torch.nn.Parameter(torch.empty(cz))
+        self.tri_mul_in_norm1 = torch.nn.LayerNorm(cz)
         self.tri_mul_in_norm2_weight = torch.nn.Parameter(
             torch.empty(c_tri_mult))
         self.tri_mul_in_norm2_bias = torch.nn.Parameter(
@@ -383,29 +402,33 @@ class Evoformer(torch.nn.Module):
                                             self.msa_transition_proj2)
         succ_msa_repr, msa_repr = multi2ref(msa_repr)
 
-        pair_msa_repr, dummy_pair_msa_repr = multi2ref(
-            self.outer_norm(msa_repr))
-        pair_repr = pair_repr + OuterProductMean(
-            pair_msa_repr, dummy_pair_msa_repr, self.outer_proj1,
-            self.outer_proj2, self.outer_out_proj)
+        msa_repr = self.outer_norm(msa_repr)
+        opm_left, opm_right = OPMLeftProj(msa_repr,
+                                          self.outer_proj1), OPMRightProj(
+                                              msa_repr, self.outer_proj2)
+        pair_repr = pair_repr + OuterProductMean(opm_left, opm_right,
+                                                 self.outer_out_proj)
 
-        out_pair_repr, out_dummy_pair_repr = multi2ref(pair_repr)
-        pair_repr = out_pair_repr + TriangleMultiplicationOut(
-            out_pair_repr, out_dummy_pair_repr, self.tri_mul_out_norm1_weight,
-            self.tri_mul_out_norm1_bias, self.tri_mul_out_norm2_weight,
-            self.tri_mul_out_norm2_bias, self.tri_mul_out_proj1,
-            self.tri_mul_out_proj2, self.tri_mul_out_proj3,
-            self.tri_mul_out_proj4, self.tri_mul_out_proj5,
-            self.tri_mul_out_proj6, self.cz)
+        pair_repr = self.tri_mul_out_norm1(pair_repr)
+        tmo_left, tmo_right = TMOLeftProj(
+            pair_repr, self.tri_mul_out_proj1,
+            self.tri_mul_out_proj2), TMORightProj(pair_repr,
+                                                  self.tri_mul_out_proj3,
+                                                  self.tri_mul_out_proj4)
+        tmo_g = TMOGate(pair_repr, self.tri_mul_out_proj6)
+        pair_repr = pair_repr + TriangleMultiplicationOut(
+            tmo_left, tmo_right, tmo_g, self.tri_mul_out_norm2_weight,
+            self.tri_mul_out_norm2_bias, self.tri_mul_out_proj5, self.cz)
 
-        in_pair_repr, in_dummy_pair_repr = multi2ref(pair_repr)
-        pair_repr = in_pair_repr + TriangleMultiplicationIn(
-            in_pair_repr, in_dummy_pair_repr, self.tri_mul_in_norm1_weight,
-            self.tri_mul_in_norm1_bias, self.tri_mul_in_norm2_weight,
-            self.tri_mul_in_norm2_bias, self.tri_mul_in_proj1,
-            self.tri_mul_in_proj2, self.tri_mul_in_proj3,
-            self.tri_mul_in_proj4, self.tri_mul_in_proj5,
-            self.tri_mul_in_proj6, self.cz)
+        pair_repr = self.tri_mul_in_norm1(pair_repr)
+        tmi_left = TMILeftProj(pair_repr, self.tri_mul_in_proj1,
+                               self.tri_mul_in_proj2)
+        tmi_right = TMIRightProj(pair_repr, self.tri_mul_in_proj3,
+                                 self.tri_mul_in_proj4)
+        tmi_gate = TMIGate(pair_repr, self.tri_mul_in_proj6)
+        pair_repr = pair_repr + TriangleMultiplicationIn(
+            tmi_left, tmi_right, tmi_gate, self.tri_mul_in_norm2_weight,
+            self.tri_mul_in_norm2_bias, self.tri_mul_in_proj5, self.cz)
 
         pair_repr = pair_repr + TriangleAttentionNodeStart(
             self.tri_att_start_norm(pair_repr), self.tri_att_start_gate_proj,
@@ -438,10 +461,12 @@ class AlphaFold2(nn.Module):
 
 
 def test():
-    # bs, s, r, cm, cz = 1, 128, 256, 256, 128
-    bs, s, r, cm, cz = 1, 512, 384, 256, 128
+    bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    # bs, s, r, cm, cz = 1, 512, 384, 256, 128
 
-    model = AlphaFold2(s, cm, cz, 1)
+    dtype = torch.float16
+
+    model = AlphaFold2(s, cm, cz, 1).to(dtype)
 
     # msa_repr, pair_repr = torch.randn(bs, s, r, cm), torch.randn(bs, r, r, cz)
     # x = model(msa_repr, pair_repr)
@@ -460,8 +485,8 @@ def test():
         [bs, r, r, cz],
     ),
                                                     dtypes=(
-                                                        torch.float32,
-                                                        torch.float32,
+                                                        dtype,
+                                                        dtype,
                                                     ),
                                                     batch_dims=(
                                                         0,
@@ -469,8 +494,8 @@ def test():
                                                     ))
 
     # @cube.compile(model, dataloader, PAS=spmd.PASSingle)
-    # @cube.compile(model, dataloader, PAS=spmd.PASData)
-    @cube.compile(model, dataloader, PAS=spmd.PASMegatron, override=True)
+    # @cube.compile(model, dataloader, PAS=spmd.PASMegatron, override=True)
+    @cube.compile(model, dataloader, PAS=spmd.PASData)
     def train_iter(model, dataloader):
         msa_repr, pair_repr = next(dataloader)
         loss = model(msa_repr, pair_repr)

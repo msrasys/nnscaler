@@ -101,13 +101,19 @@ def PASMegatron(graph: IRGraph, resource):
             elif node.name == 'MSATransition':
                 _tp(graph, node, tp_devs, 0, 2)
                 pred_name = node.name
+            elif node.name == 'OPMLeftProj' or node.name == 'OPMRightProj':
+                _tp(graph, node, tp_devs, 0, 2)
+                pred_name = node.name
             elif node.name == 'OuterProductMean':
                 _tp(graph, node, tp_devs, 0, 2)
                 pred_name = node.name
-            elif node.name == 'TriangleMultiplicationOut':
+            elif node.name == 'TMOLeftProj' or node.name == 'TMORightProj' or node.name == 'TMOGate' or node.name == 'TriangleMultiplicationOut':
                 _tp(graph, node, tp_devs, 0, 1)
                 pred_name = node.name
-            elif node.name == 'TriangleMultiplicationIn':
+            elif node.name in {
+                    'TMILeftProj', 'TMIRightProj', 'TMIGate',
+                    'TriangleMultiplicationIn'
+            }:
                 _tp(graph, node, tp_devs, 0, 2)
                 pred_name = node.name
             elif node.name == 'TriangleAttentionNodeStart':
@@ -148,8 +154,12 @@ def PASMegatron(graph: IRGraph, resource):
                         _tp(graph, node, tp_devs, 0, 2)
                     elif pred_name == 'TriangleMultiplicationIn':
                         _tp(graph, node, tp_devs, 0, 1)
+                    elif pred_name == 'TriangleMultiplicationOut':
+                        _tp(graph, node, tp_devs, 0, 2)
                     elif pred_name == 'MSATransition':
                         _tp(graph, node, tp_devs, 0, 2)
+                    elif pred_name == 'OuterProductMean':
+                        _tp(graph, node, tp_devs, 0, 1)
                     elif pred_name == 'MSAColAttention':
                         _tp(graph, node, tp_devs, 0, 2)
                     elif pred_name == 'MSARowAttentionWithPairBias':
@@ -157,7 +167,7 @@ def PASMegatron(graph: IRGraph, resource):
                     elif pred_name == '':
                         _tp(graph, node, tp_devs, 0, 1)
                     else:
-                        assert False
+                        assert False, pred_name
                 else:
                     print('replica node:', node.name)
                     _replica(graph, node, tp_devs)
