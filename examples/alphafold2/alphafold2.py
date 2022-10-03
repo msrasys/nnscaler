@@ -461,8 +461,8 @@ class AlphaFold2(nn.Module):
 
 
 def test():
-    bs, s, r, cm, cz = 1, 128, 256, 256, 128
-    # bs, s, r, cm, cz = 1, 512, 384, 256, 128
+    # bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    bs, s, r, cm, cz = 1, 512, 384, 256, 128
 
     dtype = torch.float16
 
@@ -493,9 +493,9 @@ def test():
                                                         0,
                                                     ))
 
-    # @cube.compile(model, dataloader, PAS=spmd.PASSingle)
-    # @cube.compile(model, dataloader, PAS=spmd.PASMegatron, override=True)
-    @cube.compile(model, dataloader, PAS=spmd.PASData)
+    # @cube.compile(model, dataloader, PAS=spmd.PASData)
+    # @cube.compile(model, dataloader, PAS=spmd.PASDAP, override=True)
+    @cube.compile(model, dataloader, PAS=spmd.PASSingle)
     def train_iter(model, dataloader):
         msa_repr, pair_repr = next(dataloader)
         loss = model(msa_repr, pair_repr)

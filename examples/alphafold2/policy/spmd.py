@@ -5,13 +5,19 @@ from cube.graph import IRGraph
 from cube.ir.operator import IRDataOperation, IRFwOperation, IRBpOperation
 
 recompute_info = {
-    'MSAAttention': True,
-    'MSAAttentionWithBias': True,
     'MSARowAttentionWithPairBias': True,
     'MSAColAttention': True,
     'MSATransition': True,
+    'OPMLeftProj': False,
+    'OPMRightProj': False,
     'OuterProductMean': True,
+    'TMOLeftProj': True,
+    'TMORightProj': True,
+    'TMOGate': True,
     'TriangleMultiplicationOut': True,
+    'TMILeftProj': True,
+    'TMIRightProj': True,
+    'TMIGate': True,
     'TriangleMultiplicationIn': True,
     'TriangleAttentionNodeStart': True,
     'TriangleAttentionNodeEnd': True,
@@ -19,7 +25,7 @@ recompute_info = {
     'add': False,
     'sum': False,
     'layernorm': False,
-    'transpose': False,
+    'multi2ref': False,
 }
 
 
@@ -28,6 +34,9 @@ def PASSingle(graph: IRGraph, resource):
     for node in graph.nodes():
         if not isinstance(node, IRBpOperation):
             graph.assign(node, 0)
+            if node.name in recompute_info and recompute_info[
+                    node.name] == True:
+                graph.recompute([node])
     return graph
 
 
@@ -63,7 +72,7 @@ def PASData(graph: IRGraph, resource):
     return graph
 
 
-def PASMegatron(graph: IRGraph, resource):
+def PASDAP(graph: IRGraph, resource):
     tp_size = resource.ngpus
     tp_devs = list(range(tp_size))
 
@@ -92,83 +101,82 @@ def PASMegatron(graph: IRGraph, resource):
             # _tp(graph, node, tp_devs, 0, 1)
             _replica(graph, node, tp_devs)
         elif isinstance(node, IRFwOperation):
-            if node.name == 'MSARowAttentionWithPairBias':
-                _tp(graph, node, tp_devs, 0, 1)
-                pred_name = node.name
-            elif node.name == 'MSAColAttention':
-                _tp(graph, node, tp_devs, 0, 2)
-                pred_name = node.name
-            elif node.name == 'MSATransition':
-                _tp(graph, node, tp_devs, 0, 2)
-                pred_name = node.name
-            elif node.name == 'OPMLeftProj' or node.name == 'OPMRightProj':
-                _tp(graph, node, tp_devs, 0, 2)
-                pred_name = node.name
-            elif node.name == 'OuterProductMean':
-                _tp(graph, node, tp_devs, 0, 2)
-                pred_name = node.name
-            elif node.name == 'TMOLeftProj' or node.name == 'TMORightProj' or node.name == 'TMOGate' or node.name == 'TriangleMultiplicationOut':
-                _tp(graph, node, tp_devs, 0, 1)
-                pred_name = node.name
-            elif node.name in {
-                    'TMILeftProj', 'TMIRightProj', 'TMIGate',
-                    'TriangleMultiplicationIn'
-            }:
-                _tp(graph, node, tp_devs, 0, 2)
-                pred_name = node.name
-            elif node.name == 'TriangleAttentionNodeStart':
-                _tp(graph, node, tp_devs, 0, 1)
-                pred_name = node.name
-            elif node.name == 'TriangleAttentionNodeEnd':
-                _tp(graph, node, tp_devs, 0, 2)
-                pred_name = node.name
-            elif node.name == 'PairTransition':
-                _tp(graph, node, tp_devs, 0, 1)
-                pred_name = node.name
-            else:
-                if node.name == 'add':
-                    if pred_name == 'PairTransition':
-                        _tp(graph, node, tp_devs, 0, 1)
-                    elif pred_name == 'TriangleAttentionNodeEnd':
-                        _tp(graph, node, tp_devs, 0, 2)
-                    elif pred_name == 'TriangleAttentionNodeStart':
-                        _tp(graph, node, tp_devs, 0, 1)
-                    elif pred_name == 'TriangleMultiplicationIn':
-                        _tp(graph, node, tp_devs, 0, 2)
-                    elif pred_name == 'TriangleMultiplicationOut':
-                        _tp(graph, node, tp_devs, 0, 1)
-                    elif pred_name == 'OuterProductMean':
-                        _tp(graph, node, tp_devs, 0, 1)
-                    elif pred_name == 'MSATransition':
-                        _tp(graph, node, tp_devs, 0, 2)
-                    elif pred_name == 'MSAColAttention':
-                        _tp(graph, node, tp_devs, 0, 2)
-                    elif pred_name == 'MSARowAttentionWithPairBias':
-                        _tp(graph, node, tp_devs, 0, 1)
-                    else:
-                        assert False
-                elif node.name == 'layernorm':
-                    if pred_name == 'TriangleAttentionNodeEnd':
-                        _tp(graph, node, tp_devs, 0, 1)
-                    elif pred_name == 'TriangleAttentionNodeStart':
-                        _tp(graph, node, tp_devs, 0, 2)
-                    elif pred_name == 'TriangleMultiplicationIn':
-                        _tp(graph, node, tp_devs, 0, 1)
-                    elif pred_name == 'TriangleMultiplicationOut':
-                        _tp(graph, node, tp_devs, 0, 2)
-                    elif pred_name == 'MSATransition':
-                        _tp(graph, node, tp_devs, 0, 2)
-                    elif pred_name == 'OuterProductMean':
-                        _tp(graph, node, tp_devs, 0, 1)
-                    elif pred_name == 'MSAColAttention':
-                        _tp(graph, node, tp_devs, 0, 2)
-                    elif pred_name == 'MSARowAttentionWithPairBias':
-                        _tp(graph, node, tp_devs, 0, 2)
-                    elif pred_name == '':
-                        _tp(graph, node, tp_devs, 0, 1)
-                    else:
-                        assert False, pred_name
+            if node.name == 'add':
+                if pred_name == 'PairTransition':
+                    _tp(graph, node, tp_devs, 0, 1)
+                elif pred_name == 'TriangleAttentionNodeEnd':
+                    _tp(graph, node, tp_devs, 0, 2)
+                elif pred_name == 'TriangleAttentionNodeStart':
+                    _tp(graph, node, tp_devs, 0, 1)
+                elif pred_name == 'TriangleMultiplicationIn':
+                    _tp(graph, node, tp_devs, 0, 2)
+                elif pred_name == 'TriangleMultiplicationOut':
+                    _tp(graph, node, tp_devs, 0, 1)
+                elif pred_name == 'OuterProductMean':
+                    _tp(graph, node, tp_devs, 0, 1)
+                elif pred_name == 'MSATransition':
+                    _tp(graph, node, tp_devs, 0, 2)
+                elif pred_name == 'MSAColAttention':
+                    _tp(graph, node, tp_devs, 0, 2)
+                elif pred_name == 'MSARowAttentionWithPairBias':
+                    _tp(graph, node, tp_devs, 0, 1)
                 else:
-                    print('replica node:', node.name)
-                    _replica(graph, node, tp_devs)
+                    assert False, pred_name
+            elif node.name == 'layernorm':
+                if pred_name == 'TriangleAttentionNodeEnd':
+                    _tp(graph, node, tp_devs, 0, 1)
+                elif pred_name == 'TriangleAttentionNodeStart':
+                    _tp(graph, node, tp_devs, 0, 2)
+                elif pred_name == 'TriangleMultiplicationIn':
+                    _tp(graph, node, tp_devs, 0, 1)
+                elif pred_name == 'TriangleMultiplicationOut':
+                    _tp(graph, node, tp_devs, 0, 2)
+                elif pred_name == 'MSATransition':
+                    _tp(graph, node, tp_devs, 0, 2)
+                elif pred_name == 'OuterProductMean':
+                    _tp(graph, node, tp_devs, 0, 1)
+                elif pred_name == 'MSAColAttention':
+                    _tp(graph, node, tp_devs, 0, 2)
+                elif pred_name == 'MSARowAttentionWithPairBias':
+                    _tp(graph, node, tp_devs, 0, 2)
+                elif pred_name == '':
+                    _tp(graph, node, tp_devs, 0, 1)
+                else:
+                    assert False, pred_name
+            elif node.name in {'sum', 'mul', 'multi2ref'}:
+                _replica(graph, node, tp_devs)
+            else:
+                pred_name = node.name
+                if node.name == 'MSARowAttentionWithPairBias':
+                    sub_nodes = _tp(graph, node, tp_devs, 0, 1)
+                elif node.name == 'MSAColAttention':
+                    sub_nodes = _tp(graph, node, tp_devs, 0, 2)
+                elif node.name == 'MSATransition':
+                    sub_nodes = _tp(graph, node, tp_devs, 0, 2)
+                elif node.name in {
+                        'OPMLeftProj', 'OPMRightProj', 'OuterProductMean'
+                }:
+                    sub_nodes = _tp(graph, node, tp_devs, 0, 2)
+                elif node.name in {
+                        'TMOLeftProj', 'TMORightProj', 'TMOGate',
+                        'TriangleMultiplicationOut'
+                }:
+                    sub_nodes = _tp(graph, node, tp_devs, 0, 1)
+                elif node.name in {
+                        'TMILeftProj', 'TMIRightProj', 'TMIGate',
+                        'TriangleMultiplicationIn'
+                }:
+                    sub_nodes = _tp(graph, node, tp_devs, 0, 2)
+                elif node.name == 'TriangleAttentionNodeStart':
+                    sub_nodes = _tp(graph, node, tp_devs, 0, 1)
+                elif node.name == 'TriangleAttentionNodeEnd':
+                    sub_nodes = _tp(graph, node, tp_devs, 0, 2)
+                elif node.name == 'PairTransition':
+                    sub_nodes = _tp(graph, node, tp_devs, 0, 1)
+                else:
+                    assert False, node.name
+
+                if node.name in recompute_info and recompute_info[
+                        node.name] == True:
+                    graph.recompute(sub_nodes)
     return graph
