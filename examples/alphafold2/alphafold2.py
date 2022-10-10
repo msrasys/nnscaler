@@ -41,17 +41,18 @@ def MSAAttention(x: torch.Tensor, gate_proj: torch.Tensor,
                  c: int, scale: float):
     bs, s, r, cm = x.size()
 
+    q, k, v, gate = ckpt.checkpoint(calc_qkvg, x, qkv_proj, gate_proj, bs, s,
+                                    r, head, c)
 
-    q, k, v, gate = ckpt.checkpoint(calc_qkvg, x, qkv_proj,
-                                                      gate_proj, bs, s, r,
-                                                      head, c)
-
-    chunk_size = 1
+    import math
+    chunk_size = min(s, max(1, 2**int(math.log2(2048 * 2048 / r / r))))
+    print(chunk_size)
 
     assert s % chunk_size == 0
     out_chunks = []
 
-    def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate: torch.Tensor, start: int):
+    def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                  gate: torch.Tensor, start: int):
         cur_q = q[:, start:start + chunk_size, :, :, :].reshape(
             bs * chunk_size * head, r, c)
         cur_k = k[:, start:start + chunk_size, :, :, :].reshape(
@@ -63,12 +64,14 @@ def MSAAttention(x: torch.Tensor, gate_proj: torch.Tensor,
         sim = torch.bmm(cur_q, cur_k) * 0.125
         sim = torch.nn.functional.softmax(sim, dim=-1)
         attend = torch.bmm(sim, cur_v) * cur_gate
-        attend = attend.reshape(bs, chunk_size, head, r, c).transpose(2, 3).reshape(bs, chunk_size, r, cm)
+        attend = attend.reshape(bs, chunk_size, head, r,
+                                c).transpose(2,
+                                             3).reshape(bs, chunk_size, r, cm)
         return attend
 
     for start in range(0, s, chunk_size):
-        # attend = ckpt.checkpoint(attention, q, k, v, gate, start)
-        attend = attention(q, k, v, gate, start)
+        attend = ckpt.checkpoint(attention, q, k, v, gate, start)
+        # attend = attention(q, k, v, gate, start)
         out_chunks.append(attend)
 
     out = torch.matmul(torch.cat(out_chunks, dim=1), out_proj)
@@ -83,7 +86,8 @@ def MSAAttentionWithBias(x: torch.Tensor, gate_proj: torch.Tensor,
                          bias: torch.Tensor, head: int, c: int, scale: float):
     bs, s, r, cm = x.size()
 
-    chunk_size = 1
+    import math
+    chunk_size = min(s, max(1, 2**int(math.log2(2048 * 2048 / r / r))))
 
     if chunk_size == -1:
         gate = torch.sigmoid(torch.matmul(x, gate_proj))
@@ -111,14 +115,14 @@ def MSAAttentionWithBias(x: torch.Tensor, gate_proj: torch.Tensor,
                              c).transpose(2, 3).reshape(bs, s, r, cm)
         out = torch.matmul(out, out_proj)
     else:
-        q, k, v, gate = ckpt.checkpoint(calc_qkvg, x, qkv_proj,
-                                                          gate_proj, bs, s, r,
-                                                          head, c)
+        q, k, v, gate = ckpt.checkpoint(calc_qkvg, x, qkv_proj, gate_proj, bs,
+                                        s, r, head, c)
 
         assert s % chunk_size == 0
         out_chunks = []
-        def attention_bias(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate: torch.Tensor,
-                bias: torch.Tensor, start: int):
+
+        def attention_bias(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                           gate: torch.Tensor, bias: torch.Tensor, start: int):
             cur_q = q[:, start:start + chunk_size, :, :, :].reshape(
                 bs * chunk_size * head, r, c)
             cur_k = k[:, start:start + chunk_size, :, :, :].reshape(
@@ -134,16 +138,16 @@ def MSAAttentionWithBias(x: torch.Tensor, gate_proj: torch.Tensor,
             sim = sim.reshape(bs * chunk_size * head, r, r)
 
             attend = torch.bmm(sim, cur_v) * cur_gate
-            attend = attend.reshape(bs, chunk_size, head, r, c).transpose(2, 3).reshape(bs, chunk_size, r, cm)
+            attend = attend.reshape(bs, chunk_size, head, r, c).transpose(
+                2, 3).reshape(bs, chunk_size, r, cm)
             return attend
 
         for start in range(0, s, chunk_size):
-            # attend = ckpt.checkpoint(attention_bias, q, k, v, gate,
+            attend = ckpt.checkpoint(attention_bias, q, k, v, gate, bias,
+                                     start)
+            # attend = attention_bias(q, k, v, gate,
             #                                            bias,
             #                                            start)
-            attend = attention_bias(q, k, v, gate,
-                                                       bias,
-                                                       start)
 
             out_chunks.append(attend)
         out = torch.matmul(torch.cat(out_chunks, dim=1), out_proj)
@@ -205,11 +209,6 @@ def OPMLeftProj(msa_repr: torch.Tensor, proj: torch.Tensor):
 def OPMRightProj(msa_repr: torch.Tensor, proj: torch.Tensor):
     return torch.matmul(msa_repr, proj)
 
-@cube.graph.parser.register('TODO', name='opm')
-def opm(lhs: torch.Tensor, rhs: torch.Tensor, start: int, bs: int, chunk_size: int, t: int, c: int):
-    lhs_slice = lhs[:, start:start+chunk_size, :, :]
-    out = torch.einsum('...bac,...dae->...bdce', lhs_slice, rhs).reshape(bs, chunk_size, t, c * c)
-    return out
 
 """
 [bs, s, r, cm] -> [bs, r, r, cz]
@@ -218,6 +217,7 @@ def opm(lhs: torch.Tensor, rhs: torch.Tensor, start: int, bs: int, chunk_size: i
 
 @cube.graph.parser.register('N S R M, N S T M, F Z -> N R T Z',
                             name='OuterProductMean')
+@torch.jit.ignore
 def OuterProductMean(left_act: torch.Tensor, right_act: torch.Tensor,
                      out_proj: torch.Tensor):
     bs, s, r, c = left_act.size()
@@ -226,17 +226,27 @@ def OuterProductMean(left_act: torch.Tensor, right_act: torch.Tensor,
     a = left_act.transpose(-2, -3)
     b = right_act.transpose(-2, -3)
 
-    chunk_size = 1
+    import math
+    chunk_size = min(s, max(1, 2**int(math.log2(2048 * 2048 / r / r))))
 
     if chunk_size == -1:
         outer = torch.einsum('...bac,...dae->...bdce', a,
-                         b).reshape(bs, r, t, c * c)
+                             b).reshape(bs, r, t, c * c)
         outer = torch.matmul(outer, out_proj)
     else:
         out_chunks = []
+
+        def opm(lhs: torch.Tensor, rhs: torch.Tensor, start: int):
+            lhs_slice = lhs[:, start:start + chunk_size, :, :]
+            out = torch.einsum('...bac,...dae->...bdce', lhs_slice,
+                               rhs).reshape(bs, chunk_size, t, c * c)
+            out = torch.matmul(out, out_proj)
+            return out
+
         for start in range(0, r, chunk_size):
-            out_chunks.append(opm(a, b, start, bs, chunk_size, t, c))
-        outer = torch.matmul(torch.cat(out_chunks, dim=1), out_proj)
+            # out_chunks.append(opm(a, b, start))
+            out_chunks.append(ckpt.checkpoint(opm, a, b, start))
+        outer = torch.cat(out_chunks, dim=1)
     return outer
 
 
@@ -533,9 +543,11 @@ class AlphaFold2(nn.Module):
         super().__init__()
         self.evo_num = evo_num
         self.evoformer = Evoformer(s, cm, cz)
+        self.evoformer2 = Evoformer(s, cm, cz)
 
     def forward(self, msa, pair):
         new_msa, new_pair = self.evoformer(msa, pair)
+        new_msa, new_pair = self.evoformer2(new_msa, new_pair)
         loss = torch.sum(new_msa) * torch.sum(new_pair)
         return loss
 
@@ -545,8 +557,10 @@ def test():
     # bs, s, r, cm, cz = 1, 512, 384, 256, 128
     # bs, s, r, cm, cz = 1, 1024, 256, 256, 128
     # bs, s, r, cm, cz = 1, 5120, 384, 256, 128
-    bs, s, r, cm, cz = 1, 512, 2048, 256, 128
-    # bs, s, r, cm, cz = 1, 128, 2048, 256, 128
+    # bs, s, r, cm, cz = 1, 512, 2048, 256, 128
+    # bs, s, r, cm, cz = 1, 128, 1024, 256, 128
+    # bs, s, r, cm, cz = 1, 128, 768, 256, 128
+    bs, s, r, cm, cz = 1, 256, 768, 256, 128
 
     dtype = torch.float16
 
@@ -589,8 +603,8 @@ def test():
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
-    warm_up = 20
-    iter_num = 64
+    warm_up = 1
+    iter_num = 2
     CudaTimer(enable=False).warmup()
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
