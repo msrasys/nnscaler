@@ -28,6 +28,18 @@ recompute_info = {
     'multi2ref': False,
 }
 
+# coshard
+def _coshard(graph: IRGraph, node: IRFwOperation, devs: List[int], colocate: int,
+             idx: int, dim: int):
+    algo = node.algorithms('dim')
+    sub_nodes = graph.partition(node, algo, idx=idx, dim=dim, num=colocate*len(devs))
+    assert sub_nodes is not None
+    graph.recompute(sub_nodes)
+    for devid in devs:
+        for coid in range(colocate):
+            sub_node = sub_nodes[devid * colocate + coid]
+            graph.assign(sub_node, devid)
+    return sub_nodes
 
 def PASSingle(graph: IRGraph, resource):
     assert resource.ngpus == 1
