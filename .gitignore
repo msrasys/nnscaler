@@ -3,3 +3,8 @@ __pycache__
 
 .vs/
 .vscode/
+
+benchmark/megatron/Megatron-LM
+
+gencode*.py
+fullmodel.pt

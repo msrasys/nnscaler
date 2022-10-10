@@ -264,6 +264,7 @@ class IRFullTensor(IRTensor):
         self._segments : Dict[(ValueMap, IndexMap), int] = dict()
 
         self.requires_grad = requires_grad
+        self._is_loss = False
 
     def __hash__(self) -> int:
         return self._id
@@ -287,22 +288,38 @@ class IRFullTensor(IRTensor):
         return tensor
 
     @property
-    def grad(self) -> Optional[Union[IRTensor, float]]:
+    def grad(self) -> Optional[IRTensor]:
         return self._grad
 
     @grad.setter
-    def grad(self, val: Optional[Union[IRTensor, float]]):
+    def grad(self, val: Optional[IRTensor]):
         """
         int indicates the tensor is the loss tensor.
         """
         if self._requires_grad:
-            assert isinstance(val, (IRFullTensor, float))
-            if isinstance(val, IRFullTensor):
-                assert val.shape == self.shape
-                assert val.is_attr() == self.is_attr()
+            assert isinstance(val, IRFullTensor)
+            assert val.shape == self.shape
+            assert val.is_attr() == self.is_attr()
         else:
             assert val is None, "The FullTensor doesn't require grad but is assigned with a grad."
         self._grad = val
+
+    def is_loss(self) -> bool:
+        """
+        Check whether this tensor is a loss tensor
+
+        @return loss bool: True if the tensor is loss
+        """
+        return self._is_loss
+
+    def to_loss(self):
+        """
+        Set this tensor is loss tensor. The tensor shape must be [1,]
+        """
+        assert tuple(self.shape) == (1,), f"Loss tensor can only have shape [1,] but got {self.shape}"
+        assert self.requires_grad, f"The tensor doesn't require gradient. Cannot backward"
+        self._is_loss = True
+        self.grad._is_loss = True
 
     @property
     def requires_grad(self):
@@ -604,7 +621,8 @@ class IRSubTensor(IRTensor):
 
     @property
     def requires_grad(self) -> bool:
-        return self.parent._requires_grad
+        self._requires_grad = self.parent.requires_grad
+        return self.parent.requires_grad
 
     @property
     def grad(self) -> bool:
@@ -612,16 +630,22 @@ class IRSubTensor(IRTensor):
 
     @grad.setter
     def grad(self, val: Optional[IRTensor]):
-        if isinstance(val, (IRSubTensor, float)):
-            assert self.requires_grad
-            if isinstance(val, IRSubTensor):
-                val.shape == self.shape
+        if isinstance(val, IRSubTensor):
+            assert self.requires_grad and val.shape == self.shape
             self._grad = val
         elif val is None:
             assert not self.requires_grad
             self._grad = None
         else:
             raise ValueError(f"Expected grad to be None or IRSubTensor but got: {val}")
+
+    def is_loss(self) -> bool:
+        """
+        Check whether this tensor is loss tensor.
+
+        @return loss bool: True if the tensor is a loss tensor.
+        """
+        return self.parent.is_loss()
 
     # partition primitives
 

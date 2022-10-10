@@ -36,6 +36,7 @@ class EncoderInferLayer(torch.nn.Module):
 
     def __init__(self, embed_dim: int, num_heads: int,
                  attn_hidden_dim: int, ffn_hidden_dim: int, seqlen: int = -1,
+                 batch_size: int = 1,
                  dropout: float = 0.0, atten_dropout: float = 0.0, activation_dropout: float = 0.0):
         super().__init__()
         self.self_attn_partial = MultiHeadOneAttention(
@@ -47,7 +48,7 @@ class EncoderInferLayer(torch.nn.Module):
         self.final_layer_norm = torch.nn.LayerNorm(embed_dim)
 
         # id-embed + pos-embed
-        tmp_batch_size = 1
+        tmp_batch_size = batch_size
         self.past_embed_key = torch.nn.Parameter(torch.rand(seqlen, tmp_batch_size, embed_dim))
         self.past_embed_value = torch.nn.Parameter(torch.rand(seqlen, tmp_batch_size, embed_dim))
 

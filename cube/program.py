@@ -49,6 +49,17 @@ class Program:
         self.instance._graph.reset_outputs(len(outputs))
         for idx, otensor in enumerate(outputs):
             self.instance._graph.set_output(idx, otensor)
+    
+    def finalize(self):
+        """
+        Close the recording of program.
+        If the program doesn't do backward, set all tensors with requires_grad=False.
+        """
+        graph = self.get_graph()
+        if not any(isinstance(node, IRBpOperation) for node in graph.nodes()):
+            for ftensor in graph.full_tensors():
+                ftensor.requires_grad = False
+        
 
     def mirror_as_self(self):
         """

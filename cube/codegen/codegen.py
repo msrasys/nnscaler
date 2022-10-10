@@ -134,6 +134,8 @@ def calc_tenvars_lifetime(
 
                 fw_inputs, fw_outputs, output_grads, input_grads = \
                     get_backward_callsite_io_tensors(node)
+                # remove loss gradient
+                output_grads = [t for t in output_grads if not t.is_loss()]
 
                 outputs = input_grads
                 inputs = list(itertools.chain(fw_inputs, fw_outputs, output_grads))
@@ -1024,8 +1026,7 @@ class ScheduleCodeGen(CodeGen):
                     get_backward_callsite_io_tensors(node)
                 
                 for idx, tensor in enumerate(output_grads):
-                    if isinstance(tensor, float):
-                        assert tensor == 1.0, "Loss gradient should be 1.0"
+                    if isinstance(tensor, IRSubTensor) and tensor.is_loss():
                         output_grads[idx] = None
                 code = bsign.format(
                     name = f"'{self.node_naming(node.mirror)}'",

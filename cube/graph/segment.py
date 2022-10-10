@@ -123,7 +123,7 @@ class IRSegment(IRCell):
 
         @return ftensors List[IRFullTensor]
         """
-        return Tuple(self._attributes)
+        return tuple(self._attributes)
 
     def reset_dependency(self):
         """
@@ -306,9 +306,6 @@ class IRSegment(IRCell):
             idx = producer.outputs().index(ptensor)
             if fgrad is None:
                 grad = None
-            elif isinstance(fgrad, float):
-                assert fgrad == 1.0, "Detect a backward tensor, but gradient can only be 1.0"
-                grad = fgrad
             else:
                 grad = fgrad.select(ptensor.indmap, (0, 1))
             producer.output(idx).grad = grad
@@ -325,9 +322,6 @@ class IRSegment(IRCell):
             idx = consumer.inputs().index(ctensor)
             if fgrad is None:
                 grad = None
-            elif isinstance(fgrad, float):
-                assert fgrad == 1.0, "Detect a backward tensor, but gradient can only be 1.0"
-                grad = fgrad
             else:
                 valmap = curr_valmap.map((0, 2)) if cidx != nconsumers - 1 else curr_valmap
                 grad = fgrad.select(ctensor.indmap, valmap)
@@ -532,18 +526,19 @@ class IRSegment(IRCell):
                 return True
         return False
 
-    def select(self, name: Optional[str] = None, ntype: Optional[IRCell] = None) -> List[IRCell]:
+    def select(self, name: Optional[str] = None, ntype: Optional[IRCell] = None, flatten: bool = True) -> List[IRCell]:
         """
         Select all the nodes (including nodes in sub-segment) that
         satisfy the condition.
 
-        @param name str: the node name
-        @param ntype Type: the node type
+        @param name Optional[str]: the node name
+        @param ntype Optional[Type]: the node type
+        @param flatten bool: whether to flatten the segment to nodes. (Default True)
 
         @return nodes List[IRCell]: the nodes that have the name.
         """
         nodes = []
-        for node in self.nodes(flatten=True):
+        for node in self.nodes(flatten=flatten):
             if name is not None:
                 if node.name != name:
                     continue

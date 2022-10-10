@@ -137,8 +137,7 @@ class IRGraph(IRSegment):
                     otensor.requires_grad = require_grad
         
         # set loss gradient
-        assert tuple(loss.shape) == (1,), f"the loss should be of shape [1,] (got {loss.shape})"
-        loss.parent.grad = 1.0
+        loss.parent.to_loss()
 
         # infer gradient
         for ftensor in self._ftensors:
@@ -370,10 +369,7 @@ class IRGraph(IRSegment):
                 if not otensor.requires_grad:
                     grad = None
                 else:
-                    if isinstance(otensor.parent.grad, float):
-                        grad = otensor.parent.grad
-                    else:
-                        grad = otensor.parent.grad.select(otensor.indmap, (0,1))
+                    grad = otensor.parent.grad.select(otensor.indmap, (0,1))
                 otensor.grad = grad
 
         # insert forward node
