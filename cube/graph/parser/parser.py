@@ -693,8 +693,49 @@ class ScriptModuleParser:
 
     @staticmethod
     def parse_prim_python_op_node(node, module, frame):
-        raise NotImplementedError("Cannot support torch.jit.ignore")
-        print(dir(node))
+        """
+        parse node like:
+            %64 : Tensor = ^OuterProductMean()(%opm_left.1, %opm_right.1, %outer_out_proj)
+        """
+        # get inputs
+        input_vals = list()
+        for input in node.inputs():
+            var_name = input.debugName()
+            val = frame.get_var(var_name)
+            input_vals.append(val)
+        
+        fsig: str = str(node.pyname())
+
+        # map to IR operator
+        ir_node = Sign2Op.map(fsig)(inputs=input_vals)
+
+        # push output in the frame
+        # help: >>> a = torch._C.TupleType([torch._C.TensorType.getInferred()])
+        #     : >>> dir(a)
+        #     : >>> a.elements()  # [TensorType, TensorType]
+        cnt = 0
+        for output in node.outputs():
+            if isinstance(output.type(), torch._C.TupleType):
+                tuplen = len(output.type().elements())
+                ir_output = [ir_node.output(idx) for idx in range(cnt, cnt+tuplen)]
+                cnt += tuplen
+            else:
+                ir_output = ir_node.output(cnt)
+                cnt += 1
+            frame.add_var(output.debugName(), ir_output)
+
+        if cnt != len(ir_node.outputs()):
+            raise RuntimeError(
+                f"Parse fail: {fsig} has {cnt} outputs != pre-defined {len(ir_node.outputs())}"
+            )
+
+        # print(input_vals)
+        # print(node.pyname())
+        # print(dir(node))
+        # print(tuple(node.inputs()))
+        # print(tuple(node.outputs()))
+        # raise NotImplementedError("Cannot support torch.jit.ignore")
+        return [ir_node]
 
     @staticmethod
     def parse_value_erased_node(node, module, frame, erased_vals: List[Any]):
