@@ -19,7 +19,9 @@ recompute_info = {
     'TMIRightProj': True,
     'TMIGate': True,
     'TriangleMultiplicationIn': True,
+    'TANSBias': True,
     'TriangleAttentionNodeStart': True,
+    'TANEBias': True,
     'TriangleAttentionNodeEnd': True,
     'PairTransition': True,
     'add': False,
@@ -185,9 +187,9 @@ def PASDAP(graph: IRGraph, resource):
                         'TriangleMultiplicationIn'
                 }:
                     sub_nodes = _tp(graph, node, tp_devs, 0, 2)
-                elif node.name == 'TriangleAttentionNodeStart':
+                elif node.name in {'TANSBias', 'TriangleAttentionNodeStart'}:
                     sub_nodes = _tp(graph, node, tp_devs, 0, 1)
-                elif node.name == 'TriangleAttentionNodeEnd':
+                elif node.name in {'TANEBias', 'TriangleAttentionNodeEnd'}:
                     sub_nodes = _tp(graph, node, tp_devs, 0, 2)
                 elif node.name == 'PairTransition':
                     sub_nodes = _tp(graph, node, tp_devs, 0, 1)

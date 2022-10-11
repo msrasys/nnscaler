@@ -226,7 +226,7 @@ def OuterProductMean(left_act: torch.Tensor, right_act: torch.Tensor,
     b = right_act.transpose(-2, -3)
 
     import math
-    chunk_size = min(s, max(1, 2**int(math.log2(2048 * 2048 / r / r))))
+    chunk_size = min(r, max(1, 2**int(math.log2(2048 * 2048 / r / r))))
 
     if chunk_size == -1:
         outer = torch.einsum('...bac,...dae->...bdce', a,
@@ -325,28 +325,37 @@ def TriangleMultiplicationIn(a: torch.Tensor, b: torch.Tensor, g: torch.Tensor,
     p = torch.matmul(p, tri_mul_proj5)
     return p.permute(0, 2, 1, 3) * g
 
+@cube.graph.parser.register('N S R C, C D -> N S R D', name='TANSBias')
+def TANSBias(pair_repr: torch.Tensor, bias_proj: torch.Tensor):
+    return torch.matmul(pair_repr, bias_proj)
 
-@cube.graph.parser.register('N S R Z, Z E, Z F, E Z, Z G -> N S R Z',
+
+@cube.graph.parser.register('N S R Z, Z E, Z F, E Z, N T R G -> N S R Z',
                             name='TriangleAttentionNodeStart')
 def TriangleAttentionNodeStart(pair_repr: torch.Tensor,
                                gate_proj: torch.Tensor, qkv_proj: torch.Tensor,
-                               out_proj: torch.Tensor, bias_proj: torch.Tensor,
+                               out_proj: torch.Tensor, bias: torch.Tensor,
                                head: int, c: int, scale: float):
-    bias = torch.matmul(pair_repr, bias_proj).permute(0, 3, 1, 2).unsqueeze(1)
+    bias = bias.permute(0, 3, 1, 2).unsqueeze(1)
 
     return MSAAttentionWithBias(pair_repr, gate_proj, qkv_proj, out_proj, bias,
                                 head, c, scale)
 
+@cube.graph.parser.register('N S R C, C D -> N S R D', name='TANEBias')
+def TANEBias(pair_repr: torch.Tensor, bias_proj: torch.Tensor):
+    return torch.matmul(pair_repr, bias_proj)
 
-@cube.graph.parser.register('N S R Z, Z E, Z F, E Z, Z G -> N S R Z',
+
+@cube.graph.parser.register('N R S Z, Z E, Z F, E Z, N R T G -> N R S Z',
                             name='TriangleAttentionNodeEnd')
 def TriangleAttentionNodeEnd(pair_repr: torch.Tensor, gate_proj: torch.Tensor,
                              qkv_proj: torch.Tensor, out_proj: torch.Tensor,
-                             bias_proj: torch.Tensor, head: int, c: int,
+                             bias: torch.Tensor, head: int, c: int,
                              scale: float):
     pair_repr = pair_repr.permute(0, 2, 1, 3)
+    bias = bias.permute(0, 2, 1, 3)
     out = TriangleAttentionNodeStart(pair_repr, gate_proj, qkv_proj, out_proj,
-                                     bias_proj, head, c, scale)
+                                     bias, head, c, scale)
     return out.permute(0, 2, 1, 3)
 
 
@@ -519,15 +528,19 @@ class Evoformer(torch.nn.Module):
             tmi_left, tmi_right, tmi_gate, self.tri_mul_in_norm2_weight,
             self.tri_mul_in_norm2_bias, self.tri_mul_in_proj5, self.cz)
 
+        pair_repr = self.tri_att_start_norm(pair_repr)
+        bias = TANSBias(pair_repr, self.tri_att_start_bias_proj)
         pair_repr = pair_repr + TriangleAttentionNodeStart(
-            self.tri_att_start_norm(pair_repr), self.tri_att_start_gate_proj,
+            pair_repr, self.tri_att_start_gate_proj,
             self.tri_att_start_qkv_proj, self.tri_att_start_out_proj,
-            self.tri_att_start_bias_proj, self.pair_head, self.c, self.scale)
+            bias, self.pair_head, self.c, self.scale)
 
+        pair_repr = self.tri_att_end_norm(pair_repr)
+        bias = TANEBias(pair_repr, self.tri_att_end_bias_proj)
         pair_repr = pair_repr + TriangleAttentionNodeEnd(
-            self.tri_att_end_norm(pair_repr), self.tri_att_end_gate_proj,
+            pair_repr, self.tri_att_end_gate_proj,
             self.tri_att_end_qkv_proj, self.tri_att_end_out_proj,
-            self.tri_att_end_bias_proj, self.pair_head, self.c, self.scale)
+            bias, self.pair_head, self.c, self.scale)
 
         pair_repr = pair_repr + PairTransition(
             self.pair_transition_norm(pair_repr), self.pair_transition_proj1,
@@ -561,8 +574,8 @@ def test():
     # bs, s, r, cm, cz = 1, 1024, 256, 256, 128
     # second fine-tuning: extra sequence
     # bs, s, r, cm, cz = 1, 1024, 384, 256, 128
-    # OOM on RTX 2080 Ti
-    # bs, s, r, cm, cz = 1, 5120, 384, 256, 128
+    # OOM on RTX 2080 Ti & V100
+    bs, s, r, cm, cz = 1, 5120, 384, 256, 128
 
     # Inference
     # T1044: 2048 -> 2180
@@ -598,8 +611,8 @@ def test():
                                                     ))
 
     # @cube.compile(model, dataloader, PAS=spmd.PASData)
-    # @cube.compile(model, dataloader, PAS=spmd.PASDAP, override=True)
-    @cube.compile(model, dataloader, PAS=spmd.PASSingle, override=True)
+    # @cube.compile(model, dataloader, PAS=spmd.PASSingle, override=True)
+    @cube.compile(model, dataloader, PAS=spmd.PASDAP, override=True)
     def train_iter(model, dataloader):
         msa_repr, pair_repr = next(dataloader)
         loss = model(msa_repr, pair_repr)
