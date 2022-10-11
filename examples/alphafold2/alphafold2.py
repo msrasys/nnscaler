@@ -46,7 +46,6 @@ def MSAAttention(x: torch.Tensor, gate_proj: torch.Tensor,
 
     import math
     chunk_size = min(s, max(1, 2**int(math.log2(2048 * 2048 / r / r))))
-    print(chunk_size)
 
     assert s % chunk_size == 0
     out_chunks = []
@@ -543,24 +542,31 @@ class AlphaFold2(nn.Module):
         super().__init__()
         self.evo_num = evo_num
         self.evoformer = Evoformer(s, cm, cz)
-        self.evoformer2 = Evoformer(s, cm, cz)
 
     def forward(self, msa, pair):
         new_msa, new_pair = self.evoformer(msa, pair)
-        new_msa, new_pair = self.evoformer2(new_msa, new_pair)
         loss = torch.sum(new_msa) * torch.sum(new_pair)
         return loss
 
 
 def test():
+    # Training
+    # initial training: evoformer
     # bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    # first fine-tuning: evoformer
+    # bs, s, r, cm, cz = 1, 512, 256, 256, 128
+    # second fine-tuning: evoformer
     # bs, s, r, cm, cz = 1, 512, 384, 256, 128
+    # initial training: extra sequence
     # bs, s, r, cm, cz = 1, 1024, 256, 256, 128
+    # second fine-tuning: extra sequence
+    # bs, s, r, cm, cz = 1, 1024, 384, 256, 128
+    # OOM on RTX 2080 Ti
     # bs, s, r, cm, cz = 1, 5120, 384, 256, 128
-    # bs, s, r, cm, cz = 1, 512, 2048, 256, 128
-    # bs, s, r, cm, cz = 1, 128, 1024, 256, 128
-    # bs, s, r, cm, cz = 1, 128, 768, 256, 128
-    bs, s, r, cm, cz = 1, 256, 768, 256, 128
+
+    # Inference
+    # T1044: 2048 -> 2180
+    # bs, s, r, cm, cz = 1, 128, 2048, 256, 128
 
     dtype = torch.float16
 
