@@ -486,8 +486,10 @@ class Evoformer(torch.nn.Module):
 
     def forward(self, msa_repr, pair_repr):
 
+        pair_repr, dummy_pair_repr = multi2ref(pair_repr)
+
         msa_repr = msa_repr + MSARowAttentionWithPairBias(
-            self.row_norm_m(msa_repr), pair_repr, self.row_gate_proj,
+            self.row_norm_m(msa_repr), dummy_pair_repr, self.row_gate_proj,
             self.row_qkv_proj, self.row_out_proj, self.row_bias_proj,
             self.msa_head, self.c, self.scale)
 
@@ -554,15 +556,18 @@ class AlphaFold2(nn.Module):
     def __init__(self, s: int, cm: int, cz: int, evo_num: int):
         super().__init__()
         self.evo_num = evo_num
-        self.evoformer = Evoformer(s, cm, cz)
+        self.evoformers = torch.nn.ModuleList([Evoformer(s, cm, cz) for _ in range(evo_num)])
 
     def forward(self, msa, pair):
-        new_msa, new_pair = self.evoformer(msa, pair)
-        loss = torch.sum(new_msa) * torch.sum(new_pair)
+        for evoformer in self.evoformers:
+            msa, pair = evoformer(msa, pair)
+        loss = torch.sum(msa) * torch.sum(pair)
         return loss
 
 
 def test():
+    evo_num = 2
+
     # Training
     # initial training: evoformer
     # bs, s, r, cm, cz = 1, 128, 256, 256, 128
@@ -583,7 +588,7 @@ def test():
 
     dtype = torch.float16
 
-    model = AlphaFold2(s, cm, cz, 1).to(dtype)
+    model = AlphaFold2(s, cm, cz, evo_num).to(dtype)
 
     # msa_repr, pair_repr = torch.randn(bs, s, r, cm), torch.randn(bs, r, r, cz)
     # x = model(msa_repr, pair_repr)

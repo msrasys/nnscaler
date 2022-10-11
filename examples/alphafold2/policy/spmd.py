@@ -159,7 +159,7 @@ def PASDAP(graph: IRGraph, resource):
                     _tp(graph, node, tp_devs, 0, 2)
                 elif pred_name == 'MSARowAttentionWithPairBias':
                     _tp(graph, node, tp_devs, 0, 2)
-                elif pred_name == '':
+                elif pred_name == '' or pred_name == 'PairTransition':
                     _tp(graph, node, tp_devs, 0, 1)
                 else:
                     assert False, pred_name
