@@ -164,7 +164,12 @@ def PASDAP(graph: IRGraph, resource):
                 else:
                     assert False, pred_name
             elif node.name in {'sum', 'mul', 'multi2ref'}:
-                _replica(graph, node, tp_devs)
+                if node.name == 'multi2ref' and pred_name == 'PairTransition':
+                    _tp(graph, node, tp_devs, 0, 1)
+                elif node.name == 'multi2ref' and pred_name == 'MSATransition':
+                    _tp(graph, node, tp_devs, 0, 2)
+                else:
+                    _replica(graph, node, tp_devs)
             else:
                 pred_name = node.name
                 if node.name == 'MSARowAttentionWithPairBias':
