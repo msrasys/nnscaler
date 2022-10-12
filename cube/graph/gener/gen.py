@@ -1,5 +1,6 @@
 from typing import Dict, List, Optional, Tuple, Dict
 import numpy as np
+import itertools
 
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.gener.concurrent import ConcurrentGener
@@ -593,6 +594,8 @@ class IRAdapterGener:
             # insert multiref
             multiref.device = devid
             min_fidx = min(graph.index(consumer) for consumer in devops[devid])
+            # set recompute id
+            multiref.recompute = graph.node(min_fidx).recompute
             graph.finsert(multiref, min_fidx)
 
     @staticmethod
@@ -627,3 +630,50 @@ class IRAdapterGener:
                 IRAdapterGener.fusion(segment)
 
         return graph
+
+    @staticmethod
+    def tensor_merge(tensors: List[IRSubTensor], target: Optional[IRSubTensor] = None) -> List[Tuple[str, List, IRSubTensor]]:
+        """
+        Merge sub-tensors into one tensor or stop right after gets target tensor.
+
+        Merge primtiives:
+            "sum: output = sum(inputs)"
+            "cat: output = cat(inputs, dim: int)
+
+        @param tensors List[IRSubTensor]: list of tensors
+        @param target Optional[IRSubTensor]: the target tensor (default None).
+
+        @return primitives List[Tuple[str, List, IRSubTensor]]:
+            List primitives of in forms of (op, inputs, outputs)
+        """
+        prims = []
+        tensors = [t for t in tensors]
+        while len(tensors) > 1:
+            out = None
+            for t1, t2 in itertools.combinations(tensors, 2):
+                # try concat
+                catdim = t1.catdim(t2)
+                if catdim is not None:
+                    tensors = [t1, t2] if t1.indmap[catdim][0] < t2.indmap[catdim][0] else [t2, t1]
+                    out = tensors[0].concat(tensors[1], dim=catdim)
+                    prims.append(('cat', tensors + [catdim], out))
+                    break
+                # try summation
+                if t1.accumable(t2):
+                    out = t1.accum(t2)
+                    prims.append(('sum', [t1, t2], out))
+                    break
+            if out is not None:
+                tensors.remove(t1)
+                tensors.remove(t2)
+                tensors.append(out)
+                if target is not None and out == target: break
+            else:
+                remain = '\n\t'.join(t.extra_repr() for t in tensors)
+                sprims = '\n\t'.join(repr(p) for p in prims)
+                raise RuntimeError(
+                    f"Fail to merge tensors into one tensor or cannot match with target.\n"
+                    f"Remain Tensor:\n\t{remain}\n"
+                    f"Existing primitives:\n\t{sprims}\n"
+                )
+        return prims
