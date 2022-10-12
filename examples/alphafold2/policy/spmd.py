@@ -3,6 +3,7 @@ from typing import List
 from numpy import TooHardError
 from cube.graph import IRGraph
 from cube.ir.operator import IRDataOperation, IRFwOperation, IRBpOperation
+from cube.graph.function.anchor import IRGraphAnchor
 
 recompute_info = {
     'MSARowAttentionWithPairBias': True,
@@ -51,12 +52,21 @@ def _coshard(graph: IRGraph, node: IRFwOperation, devs: List[int],
 
 def PASSingle(graph: IRGraph, resource):
     assert resource.ngpus == 1
+    fnodes = graph.nodes()
+    anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
+    indices = [fnodes.index(anchor) for anchor in anchors]
     for node in graph.nodes():
         if not isinstance(node, IRBpOperation):
             graph.assign(node, 0)
-            if node.name in recompute_info and recompute_info[
-                    node.name] == True:
-                graph.recompute([node])
+    for i in range(len(indices) - 1):
+        # hack: first layernorm should not be recomputed
+        if i == 0:
+            u = fnodes[indices[i] + 2:indices[i + 1]]
+        else:
+            u = fnodes[indices[i] + 1:indices[i + 1]]
+        v = [item.name for item in u]
+        print(v)
+        graph.recompute(u)
     return graph
 
 
