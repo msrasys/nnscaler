@@ -602,7 +602,7 @@ class AlphaFold2(nn.Module):
 
 
 def test():
-    evo_num = 1
+    evo_num = 48
 
     # Training
     # initial training: evoformer
