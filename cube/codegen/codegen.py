@@ -27,6 +27,10 @@ from cube.codegen.frontend_mapping import Sign2EmitRule
 
 import os
 
+USE_NNFUSION = os.environ.get('USE_NNFUSION')
+USE_JIT = os.environ.get('USE_JIT')
+
+
 def get_backward_callsite_io_tensors(bp_segment:IRSegment):
     """
     Returns:
@@ -373,12 +377,12 @@ class ModelCodeGen(CodeGen):
             'import torch', 'import torch.utils.checkpoint as ckpt',
             'import cube', '', '']
 
-        use_nnfusion = os.environ.get('USE_NNFUSION')
-        if use_nnfusion:
+        if USE_NNFUSION:
             self.init_code.extend(['import nnfusion', ''])
 
         # customized op code
         for _, op_impl in Sign2Op.kOpCodeDef.items():
+            # self.init_code.append('@torch.jit.script')
             self.init_code.append(op_impl)
             self.init_code += ['']
         # module init code
@@ -485,8 +489,6 @@ class ModelCodeGen(CodeGen):
                 else:
                     args.append(self.tensor_naming(t))
             node_args.append(args)
-
-        use_nnfusion = os.environ.get('USE_NNFUSION')
         # generate full code
         with ClassBlock(class_name='GenModel', derived=['cube.runtime.module.CubeModule']) as cb:
             with FunctionBlock(func_name='__init__', args=['self']) as ib:
@@ -510,8 +512,10 @@ class ModelCodeGen(CodeGen):
                     return_code = f"return {', '.join(outputs)}"
                     fb.insert_body(return_code)
                 cb.insert_body('')
-                if use_nnfusion and name.startswith('segment'):
+                if USE_NNFUSION and name.startswith('segment'):
                     cb.insert_body('@nnfusion.jit')
+                if USE_JIT and name.startswith('segment'):
+                    cb.insert_body('@torch.jit.script_method')
                 cb.insert_body(fb.code)
 
 
@@ -712,14 +716,8 @@ class ModelCodeGen(CodeGen):
             return node_codes, inputs, outputs
 
         def get_equiv_recompute_gid(node:Union[IRFwOperation, IRAdapter]) -> Optional[int]:
-            if isinstance(node, IRAdapter):
-                # IRAdapter is equivalent to be non-recomputable. And it always terminates the
-                # nodes sequence of any recomputing group before it.
-                return None
-            elif isinstance(node, IRFwOperation):
-                return node.recompute
-            else:
-                raise ValueError(f'Unexcepted node type {type(node)}')
+            assert isinstance(node, (IRAdapter, IRFwOperation)), f"Invalid type: {type(node)}"
+            return node.recompute
 
         def should_start_new_recompute_group(i_prev, i_cur) -> bool:
             # i_prev, i_cur: Tuple[int, Union[IRFwOp,IRAdapter]]

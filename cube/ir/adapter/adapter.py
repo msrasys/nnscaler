@@ -121,6 +121,7 @@ class IRAdapter(IRCell):
         fadapter._id = self._id
         fadapter.differentiable = self.differentiable
         fadapter.custom = self.custom
+        fadapter.recompute = self.recompute
         # dispatch for mirror
         if for_mirror and isinstance(self.mirror, IRAdapter):
             badapter = self.mirror.dispatch(devid, for_mirror=False)

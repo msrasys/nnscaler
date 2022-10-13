@@ -344,7 +344,7 @@ class IRAdapterGener:
             # setup recompute
             if fadapter.differentiable and allow_recompute:
                 fadapter.recompute = graph.node(fidx).recompute
-            graph.insert(fadapter, min(graph.index(c) for c in fconsumers))
+            graph.insert(fadapter, fidx)
 
             # insert backward adapter
             if badapter is not None:
