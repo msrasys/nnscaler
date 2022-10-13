@@ -52,21 +52,32 @@ def _coshard(graph: IRGraph, node: IRFwOperation, devs: List[int],
 
 def PASSingle(graph: IRGraph, resource):
     assert resource.ngpus == 1
-    fnodes = graph.nodes()
-    anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
-    indices = [fnodes.index(anchor) for anchor in anchors]
+
     for node in graph.nodes():
         if not isinstance(node, IRBpOperation):
             graph.assign(node, 0)
-    for i in range(len(indices) - 1):
-        # hack: first layernorm should not be recomputed
-        if i == 0:
-            u = fnodes[indices[i] + 2:indices[i + 1]]
-        else:
-            u = fnodes[indices[i] + 1:indices[i + 1]]
-        v = [item.name for item in u]
-        print(v)
-        graph.recompute(u)
+
+    fnodes = graph.nodes()
+    anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
+
+    indices = [
+        fnodes.index(anchor) for anchor in anchors
+        if anchor.name == 'One Layer Evoformer Start'
+        or anchor.name == 'One Layer Evoformer End'
+    ]
+    assert len(indices) % 2 == 0
+    for i in range(len(indices) // 2):
+        lhs = indices[2 * i]
+        rhs = indices[2 * i + 1]
+        # graph.recompute(fnodes[lhs + 1:rhs])
+        sub_indices = []
+        for j in range(lhs + 1, rhs):
+            if isinstance(fnodes[j], IRGraphAnchor):
+                sub_indices.append(j)
+        sub_indices.append(rhs)
+        for j in range(len(sub_indices) - 1):
+            graph.recompute(fnodes[sub_indices[j] + 1:sub_indices[j + 1]])
+
     return graph
 
 

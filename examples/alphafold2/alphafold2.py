@@ -137,8 +137,9 @@ def MSAAttentionWithBias(x: torch.Tensor, gate_proj: torch.Tensor,
                              c).transpose(2, 3).reshape(bs, s, r, cm)
         out = torch.matmul(out, out_proj)
     else:
-        q, k, v, gate = ckpt.checkpoint(calc_qkvg, x, qkv_proj, gate_proj, bs,
-                                        s, r, head, c)
+        # q, k, v, gate = ckpt.checkpoint(calc_qkvg, x, qkv_proj, gate_proj, bs,
+        #                                 s, r, head, c)
+        q, k, v, gate = calc_qkvg(x, qkv_proj, gate_proj, bs, s, r, head, c)
 
         assert s % chunk_size == 0
         out_chunks = []
@@ -511,10 +512,9 @@ class Evoformer(torch.nn.Module):
             torch.randn(ff_mult * cz, cz))
 
     def forward(self, msa_repr, pair_repr):
+        cube.runtime.function.anchor('MSARow')
 
         pair_repr, dummy_pair_repr = multi2ref(pair_repr)
-
-        cube.runtime.function.anchor('MSARow')
         msa_repr = msa_repr + MSARowAttentionWithPairBias(
             self.row_norm_m(msa_repr), dummy_pair_repr, self.row_gate_proj,
             self.row_qkv_proj, self.row_out_proj, self.row_bias_proj,
@@ -583,7 +583,7 @@ class Evoformer(torch.nn.Module):
             self.pair_transition_norm(pair_repr), self.pair_transition_proj1,
             self.pair_transition_proj2)
 
-        return (succ_msa_repr, pair_repr)
+        return succ_msa_repr, pair_repr
 
 
 class AlphaFold2(nn.Module):
@@ -591,31 +591,44 @@ class AlphaFold2(nn.Module):
     def __init__(self, s: int, cm: int, cz: int, evo_num: int):
         super().__init__()
         self.evo_num = evo_num
+        # add norm to work with PyTorch's recompute mechanism
+        self.msa_norm = torch.nn.LayerNorm(cm)
+        self.pair_norm = torch.nn.LayerNorm(cz)
         self.evoformers = torch.nn.ModuleList(
             [Evoformer(s, cm, cz) for _ in range(evo_num)])
 
     def forward(self, msa, pair):
+        msa = self.msa_norm(msa)
+        pair = self.pair_norm(pair)
+
+        cube.runtime.function.anchor('Evoformer Stack Start')
         for evoformer in self.evoformers:
+            cube.runtime.function.anchor('One Layer Evoformer Start')
             msa, pair = evoformer(msa, pair)
+            cube.runtime.function.anchor('One Layer Evoformer End')
+        cube.runtime.function.anchor('Evoformer Stack End')
         loss = torch.sum(msa) * torch.sum(pair)
         return loss
 
 
 def test():
-    evo_num = 48
+    evo_num = 2
 
-    # Training
+    # Training evo_num = 48
     # initial training: evoformer
-    bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    # bs, s, r, cm, cz = 1, 128, 256, 256, 128
     # first fine-tuning: evoformer
     # bs, s, r, cm, cz = 1, 512, 256, 256, 128
     # second fine-tuning: evoformer
-    # bs, s, r, cm, cz = 1, 512, 384, 256, 128
-    # initial training: extra sequence
+    bs, s, r, cm, cz = 1, 512, 384, 256, 128
+
+    # Extra sequence evo_num = 4
+    # initial training
     # bs, s, r, cm, cz = 1, 1024, 256, 256, 128
-    # second fine-tuning: extra sequence
+    # first fine-tuning
+    # bs, s, r, cm, cz = 1, 1024, 512, 256, 128
+    # second fine-tuning
     # bs, s, r, cm, cz = 1, 1024, 384, 256, 128
-    # OOM on RTX 2080 Ti & V100
     # bs, s, r, cm, cz = 1, 5120, 384, 256, 128
 
     # Inference
