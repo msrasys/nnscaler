@@ -69,14 +69,18 @@ def PASSingle(graph: IRGraph, resource):
     for i in range(len(indices) // 2):
         lhs = indices[2 * i]
         rhs = indices[2 * i + 1]
-        # graph.recompute(fnodes[lhs + 1:rhs])
-        sub_indices = []
-        for j in range(lhs + 1, rhs):
-            if isinstance(fnodes[j], IRGraphAnchor):
-                sub_indices.append(j)
-        sub_indices.append(rhs)
-        for j in range(len(sub_indices) - 1):
-            graph.recompute(fnodes[sub_indices[j] + 1:sub_indices[j + 1]])
+
+        # deepmind's default recompute strategy
+        graph.recompute(fnodes[lhs + 1:rhs])
+
+        # another strategy
+        # sub_indices = []
+        # for j in range(lhs + 1, rhs):
+        #     if isinstance(fnodes[j], IRGraphAnchor):
+        #         sub_indices.append(j)
+        # sub_indices.append(rhs)
+        # for j in range(len(sub_indices) - 1):
+        #     graph.recompute(fnodes[sub_indices[j] + 1:sub_indices[j + 1]])
 
     return graph
 

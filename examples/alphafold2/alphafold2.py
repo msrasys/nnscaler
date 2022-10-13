@@ -612,15 +612,15 @@ class AlphaFold2(nn.Module):
 
 
 def test():
-    evo_num = 2
+    evo_num = 48
 
     # Training evo_num = 48
     # initial training: evoformer
-    # bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    bs, s, r, cm, cz = 1, 128, 256, 256, 128
     # first fine-tuning: evoformer
     # bs, s, r, cm, cz = 1, 512, 256, 256, 128
     # second fine-tuning: evoformer
-    bs, s, r, cm, cz = 1, 512, 384, 256, 128
+    # bs, s, r, cm, cz = 1, 512, 384, 256, 128
 
     # Extra sequence evo_num = 4
     # initial training
