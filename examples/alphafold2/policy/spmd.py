@@ -31,8 +31,32 @@ recompute_info = {
     'multi2ref': False,
 }
 
+def _replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
+    sub_nodes = graph.replicate(node, times=len(devs))
+    for dev_id, sub_node in zip(devs, sub_nodes):
+        graph.assign(sub_node, dev_id)
+    return sub_nodes
 
-# coshard
+def _tp(graph: IRGraph, node: IRFwOperation, devs: List[int], idx: int,
+        dim: int):
+    algo = node.algorithms('dim')
+    sub_nodes = graph.partition(node,
+                                algo,
+                                idx=idx,
+                                dim=dim,
+                                num=len(devs))
+    assert sub_nodes is not None
+    for devid, sub_node in zip(devs, sub_nodes):
+        graph.assign(sub_node, devid)
+    return sub_nodes
+
+def _tps(graph: IRGraph, nodes: List[IRFwOperation], devs: List[int], idx: int,
+        dim: int):
+    sub_nodes = []
+    for node in nodes:
+        sub_nodes = sub_nodes + _tp(graph, node, devs, idx, dim)
+    return sub_nodes
+
 def _coshard(graph: IRGraph, node: IRFwOperation, devs: List[int],
              colocate: int, idx: int, dim: int):
     algo = node.algorithms('dim')
@@ -121,112 +145,60 @@ def PASDAP(graph: IRGraph, resource):
     tp_size = resource.ngpus
     tp_devs = list(range(tp_size))
 
-    def _tp(graph: IRGraph, node: IRFwOperation, devs: List[int], idx: int,
-            dim: int):
-        algo = node.algorithms('dim')
-        sub_nodes = graph.partition(node,
-                                    algo,
-                                    idx=idx,
-                                    dim=dim,
-                                    num=len(devs))
-        assert sub_nodes is not None
-        for devid, sub_node in zip(devs, sub_nodes):
-            graph.assign(sub_node, devid)
-        return sub_nodes
+    fnodes = graph.nodes()
+    anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
 
-    def _replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
-        sub_nodes = graph.replicate(node, times=len(devs))
-        for dev_id, sub_node in zip(devs, sub_nodes):
-            graph.assign(sub_node, dev_id)
-        return sub_nodes
+    indices = [
+        fnodes.index(anchor) for anchor in anchors
+        if anchor.name == 'One Layer Evoformer Start'
+        or anchor.name == 'One Layer Evoformer End'
+    ]
+    assert len(indices) % 2 == 0
 
-    pred_name = ''
-    for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            # _tp(graph, node, tp_devs, 0, 1)
-            _replica(graph, node, tp_devs)
-        elif isinstance(node, IRFwOperation):
-            if node.name == 'add':
-                if pred_name == 'PairTransition':
-                    _tp(graph, node, tp_devs, 0, 1)
-                elif pred_name == 'TriangleAttentionNodeEnd':
-                    _tp(graph, node, tp_devs, 0, 2)
-                elif pred_name == 'TriangleAttentionNodeStart':
-                    _tp(graph, node, tp_devs, 0, 1)
-                elif pred_name == 'TriangleMultiplicationIn':
-                    _tp(graph, node, tp_devs, 0, 2)
-                elif pred_name == 'TriangleMultiplicationOut':
-                    _tp(graph, node, tp_devs, 0, 1)
-                elif pred_name == 'OuterProductMean':
-                    _tp(graph, node, tp_devs, 0, 1)
-                elif pred_name == 'MSATransition':
-                    _tp(graph, node, tp_devs, 0, 2)
-                elif pred_name == 'MSAColAttention':
-                    _tp(graph, node, tp_devs, 0, 2)
-                elif pred_name == 'MSARowAttentionWithPairBias':
-                    _tp(graph, node, tp_devs, 0, 1)
-                else:
-                    assert False, pred_name
-            elif node.name == 'layernorm':
-                if pred_name == 'TriangleAttentionNodeEnd':
-                    _tp(graph, node, tp_devs, 0, 1)
-                elif pred_name == 'TriangleAttentionNodeStart':
-                    _tp(graph, node, tp_devs, 0, 2)
-                elif pred_name == 'TriangleMultiplicationIn':
-                    _tp(graph, node, tp_devs, 0, 1)
-                elif pred_name == 'TriangleMultiplicationOut':
-                    _tp(graph, node, tp_devs, 0, 2)
-                elif pred_name == 'MSATransition':
-                    _tp(graph, node, tp_devs, 0, 2)
-                elif pred_name == 'OuterProductMean':
-                    _tp(graph, node, tp_devs, 0, 1)
-                elif pred_name == 'MSAColAttention':
-                    _tp(graph, node, tp_devs, 0, 2)
-                elif pred_name == 'MSARowAttentionWithPairBias':
-                    _tp(graph, node, tp_devs, 0, 2)
-                elif pred_name == '' or pred_name == 'PairTransition':
-                    _tp(graph, node, tp_devs, 0, 1)
-                else:
-                    assert False, pred_name
-            elif node.name in {'sum', 'mul', 'multi2ref'}:
-                if node.name == 'multi2ref' and pred_name == 'PairTransition':
-                    _tp(graph, node, tp_devs, 0, 1)
-                elif node.name == 'multi2ref' and pred_name == 'MSATransition':
-                    _tp(graph, node, tp_devs, 0, 2)
-                else:
-                    _replica(graph, node, tp_devs)
+    for i in range(indices[0]):
+        if isinstance(fnodes[i], IRDataOperation) or isinstance(fnodes[i], IRFwOperation):
+            _replica(graph, fnodes[i], tp_devs)
+    
+    for i in range(len(indices) // 2):
+        lhs, rhs = indices[2 * i], indices[2 * i + 1]
+        sub_indices = []
+        for j in range(lhs+1, rhs):
+            if isinstance(fnodes[j], IRGraphAnchor):
+                sub_indices.append(j)
+        sub_indices.append(rhs)
+        for j in range(len(sub_indices) - 1):
+            sub_l, sub_r = sub_indices[j], sub_indices[j + 1]
+            names = []
+            for k in range(sub_l+1, sub_r):
+                names.append(fnodes[k].name)
+            names = set(names)
+            nodes = fnodes[sub_l+1:sub_r]
+            graph.recompute(nodes)
+
+            if 'MSARowAttentionWithPairBias' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 1)
+            elif 'MSAColAttention' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 2)
+            elif 'MSATransition' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 2)
+            elif 'OuterProductMean' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 2)
+            elif 'TriangleMultiplicationOut' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 1)
+            elif 'TriangleMultiplicationIn' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 2)
+            elif 'TriangleAttentionNodeStart' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 1)
+            elif 'TriangleAttentionNodeEnd' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 2)
+            elif 'PairTransition' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 1)
             else:
-                pred_name = node.name
-                if node.name == 'MSARowAttentionWithPairBias':
-                    sub_nodes = _tp(graph, node, tp_devs, 0, 1)
-                elif node.name == 'MSAColAttention':
-                    sub_nodes = _tp(graph, node, tp_devs, 0, 2)
-                elif node.name == 'MSATransition':
-                    sub_nodes = _tp(graph, node, tp_devs, 0, 2)
-                elif node.name in {
-                        'OPMLeftProj', 'OPMRightProj', 'OuterProductMean'
-                }:
-                    sub_nodes = _tp(graph, node, tp_devs, 0, 2)
-                elif node.name in {
-                        'TMOLeftProj', 'TMORightProj', 'TMOGate',
-                        'TriangleMultiplicationOut'
-                }:
-                    sub_nodes = _tp(graph, node, tp_devs, 0, 1)
-                elif node.name in {
-                        'TMILeftProj', 'TMIRightProj', 'TMIGate',
-                        'TriangleMultiplicationIn'
-                }:
-                    sub_nodes = _tp(graph, node, tp_devs, 0, 2)
-                elif node.name in {'TANSBias', 'TriangleAttentionNodeStart'}:
-                    sub_nodes = _tp(graph, node, tp_devs, 0, 1)
-                elif node.name in {'TANEBias', 'TriangleAttentionNodeEnd'}:
-                    sub_nodes = _tp(graph, node, tp_devs, 0, 2)
-                elif node.name == 'PairTransition':
-                    sub_nodes = _tp(graph, node, tp_devs, 0, 1)
-                else:
-                    assert False, node.name
+                assert False, names
 
-                if node.name in recompute_info and recompute_info[
-                        node.name] == True:
-                    graph.recompute(sub_nodes)
+    
+    for i in range(indices[-1] + 1, len(fnodes)):
+        if isinstance(fnodes[i], IRDataOperation) or isinstance(fnodes[i], IRFwOperation):
+            _replica(graph, fnodes[i], tp_devs)
+    
     return graph
