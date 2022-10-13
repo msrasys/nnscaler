@@ -250,12 +250,14 @@ class IRAdapterGener:
         return graph
 
     @staticmethod
-    def gen_activation(graph: IRSegment) -> IRSegment:
+    def gen_activation(graph: IRSegment, allow_recompute: bool = True) -> IRSegment:
         """!
         Generate adapter for activation tensors.
         The forward/backward adapter is inserted before the first consumers of its full tensor.
 
         @param graph IRGraph: the graph the requires for adapter.
+        @param allow_recompute bool: Allow adapter recomputes. If this enables, all adapters will be
+            set to the same recompute group with its consumed node.
 
         @return graph IRGraph: the (inplace) modified graph with activation adapters. 
         """
@@ -338,6 +340,10 @@ class IRAdapterGener:
 
             # insert forward adapter
             # graph.insert(fadapter, max(producers) + 1)
+            fidx = min(graph.index(c) for c in fconsumers)
+            # setup recompute
+            if fadapter.differentiable and allow_recompute:
+                fadapter.recompute = graph.node(fidx).recompute
             graph.insert(fadapter, min(graph.index(c) for c in fconsumers))
 
             # insert backward adapter
