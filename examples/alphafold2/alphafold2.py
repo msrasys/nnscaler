@@ -101,6 +101,8 @@ def MSAAttentionWithBias(x: torch.Tensor, gate_proj: torch.Tensor,
                          bias: torch.Tensor, head: int, c: int, scale: float,
                          chunk_size: int):
     bs, s, r, cm = x.size()
+    assert cm % head == 0
+    c = cm // head
 
     if chunk_size == -1:
         gate = torch.sigmoid(torch.matmul(x, gate_proj))
@@ -214,7 +216,7 @@ def MSAColGlobalAttention(msa_repr: torch.Tensor, q_proj: torch.Tensor, k_proj: 
     a = torch.nn.functional.softmax(a, dim=-1)
     o = torch.matmul(a, v)
 
-    g = torch.nn.functional.sigmoid(torch.matmul(msa_repr, gate_proj))
+    g = torch.sigmoid(torch.matmul(msa_repr, gate_proj))
     g = g.view(g.shape[:-1] + (head, -1))
 
     o = o.unsqueeze(-3) * g
@@ -447,10 +449,10 @@ class Evoformer(torch.nn.Module):
         # MSA row-wise gated self-attention with pair bias
         self.row_norm_m = torch.nn.LayerNorm(cm)
         self.row_norm_z = torch.nn.LayerNorm(cz)
-        self.row_gate_proj = torch.nn.Parameter(torch.randn(cm, msa_head * c))
+        self.row_gate_proj = torch.nn.Parameter(torch.randn(cm, cm))
         self.row_qkv_proj = torch.nn.Parameter(
-            torch.randn(cm, 3 * msa_head * c))
-        self.row_out_proj = torch.nn.Parameter(torch.randn(msa_head * c, cm))
+            torch.randn(cm, 3 * cm))
+        self.row_out_proj = torch.nn.Parameter(torch.randn(cm, cm))
         self.row_bias_proj = torch.nn.Parameter(torch.randn(cz, msa_head))
 
         # MSA column-wise gated self-attention
@@ -723,9 +725,9 @@ def test_train():
 
     model = AlphaFold2(s, cm, cz, evo_num, is_extra=True).to(dtype)
 
-    msa, pair = torch.randn(bs, s, r, cm), torch.randn(bs, r, r, cz)
-    loss = model(msa, pair)
-    return loss
+    # msa, pair = torch.randn(bs, s, r, cm), torch.randn(bs, r, r, cz)
+    # loss = model(msa, pair)
+    # return loss
 
     model = cube.SemanticModel(model,
                                input_shapes=([bs, s, r, cm], [bs, r, r, cz]))
@@ -742,7 +744,6 @@ def test_train():
         msa_repr, pair_repr = next(dataloader)
         loss = model(msa_repr, pair_repr)
         loss.backward()
-        return loss
 
     model = model.get_gen_module()
 
