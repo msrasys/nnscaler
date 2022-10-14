@@ -69,7 +69,7 @@ def PASSingle(graph: IRGraph, resource):
         rhs = indices[2 * i + 1]
 
         # deepmind's default recompute strategy
-        graph.recompute(fnodes[lhs + 1:rhs])
+        # graph.recompute(fnodes[lhs + 1:rhs])
 
         # another strategy
         # sub_indices = []
@@ -138,7 +138,7 @@ def PASDAP(graph: IRGraph, resource):
             if isinstance(fnodes[j], IRGraphAnchor):
                 sub_indices.append(j)
         sub_indices.append(rhs)
-        graph.recompute(fnodes[lhs:rhs])
+        # graph.recompute(fnodes[lhs:rhs])
         for j in range(len(sub_indices) - 1):
             sub_l, sub_r = sub_indices[j], sub_indices[j + 1]
             names = []
@@ -146,6 +146,7 @@ def PASDAP(graph: IRGraph, resource):
                 names.append(fnodes[k].name)
             names = set(names)
             nodes = fnodes[sub_l + 1:sub_r]
+            # DO NOT USE THIS
             # graph.recompute(nodes)
 
             if 'MSARowAttentionWithPairBias' in names:
