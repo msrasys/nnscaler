@@ -196,6 +196,33 @@ def MSAColAttention(msa_repr: torch.Tensor, gate_proj: torch.Tensor,
                         head, c, scale, chunk_size).permute(0, 2, 1, 3)
 
 
+@cube.graph.parser.register('N S R M, M M, M E, M E, M M, M M -> N S R M',
+                            name='MSAColGlobalAttention')
+def MSAColGlobalAttention(msa_repr: torch.Tensor, q_proj: torch.Tensor, k_proj: torch.Tensor,
+                          v_proj: torch.Tensor, gate_proj: torch.Tensor, out_proj: torch.Tensor,
+                          head: int,
+                          c: int, scale: float):
+    msa_repr = msa_repr.transpose(-2, -3)
+    
+    q = torch.sum(msa_repr, dim=-2)
+    q = torch.matmul(q, q_proj) * scale
+    q = q.view(q.shape[:-1] + (head, -1))
+
+    k, v = torch.matmul(msa_repr, k_proj), torch.matmul(msa_repr, v_proj)
+
+    a = torch.matmul(q, k.transpose(-1, -2))
+    a = torch.nn.functional.softmax(a, dim=-1)
+    o = torch.matmul(a, v)
+
+    g = torch.nn.functional.sigmoid(torch.matmul(msa_repr, gate_proj))
+    g = g.view(g.shape[:-1] + (head, -1))
+
+    o = o.unsqueeze(-3) * g
+    o = o.reshape(o.shape[:-2] + (-1,))
+
+    return torch.matmul(o, out_proj).transpose(-2, -3)
+
+
 """
 [bs, s, r, cm] -> [bs, s, r, cm]
 """
@@ -395,6 +422,7 @@ class Evoformer(torch.nn.Module):
                  cm: int,
                  cz: int,
                  use_chunk=False,
+                 is_extra=False,
                  c=32,
                  msa_head=8,
                  pair_head=4,
@@ -406,6 +434,8 @@ class Evoformer(torch.nn.Module):
         self.msa_head, self.pair_head = msa_head, pair_head
         self.c_tri_mult, self.ff_mult = c_tri_mult, ff_mult
         self.scale = 1.0 / math.sqrt(c)
+
+        self.is_extra = is_extra
 
         if use_chunk:
             self.msa_row_chunk, self.msa_col_chunk = 4, 256
@@ -425,10 +455,14 @@ class Evoformer(torch.nn.Module):
 
         # MSA column-wise gated self-attention
         self.col_norm = torch.nn.LayerNorm(cm)
-        self.col_gate_proj = torch.nn.Parameter(torch.randn(cm, msa_head * c))
+        self.col_gate_proj = torch.nn.Parameter(torch.randn(cm, cm))
+        # TODO: fix me
+        self.col_q_proj = torch.nn.Parameter(torch.randn(cm, cm))
+        self.col_k_proj = torch.nn.Parameter(torch.randn(cm, 8))
+        self.col_v_proj = torch.nn.Parameter(torch.randn(cm, 8))
         self.col_qkv_proj = torch.nn.Parameter(
             torch.randn(cm, 3 * msa_head * c))
-        self.col_out_proj = torch.nn.Parameter(torch.randn(msa_head * c, cm))
+        self.col_out_proj = torch.nn.Parameter(torch.randn(cm, cm))
 
         # MSA transition
         self.msa_transition_norm = torch.nn.LayerNorm(cm)
@@ -513,10 +547,16 @@ class Evoformer(torch.nn.Module):
             self.msa_head, self.c, self.scale, self.msa_row_chunk)
 
         cube.runtime.function.anchor('MSACol')
-        msa_repr = msa_repr + MSAColAttention(
-            self.col_norm(msa_repr), self.col_gate_proj, self.col_qkv_proj,
-            self.col_out_proj, self.msa_head, self.c, self.scale,
-            self.msa_col_chunk)
+        if self.is_extra:
+            msa_repr = msa_repr + MSAColGlobalAttention(
+                self.col_norm(msa_repr), self.col_q_proj, self.col_k_proj, self.col_v_proj, self.col_gate_proj,
+                self.col_out_proj, self.msa_head, self.c, self.scale
+                )
+        else:
+            msa_repr = msa_repr + MSAColAttention(
+                self.col_norm(msa_repr), self.col_gate_proj, self.col_qkv_proj,
+                self.col_out_proj, self.msa_head, self.c, self.scale,
+                self.msa_col_chunk)
 
         cube.runtime.function.anchor('MSATrans')
         msa_repr = msa_repr + MSATransition(self.msa_transition_norm(msa_repr),
@@ -586,14 +626,15 @@ class AlphaFold2(nn.Module):
                  cm: int,
                  cz: int,
                  evo_num: int,
-                 use_chunk=False):
+                 use_chunk=False,
+                 is_extra=False):
         super().__init__()
         self.evo_num = evo_num
         # add norm to work with PyTorch's recompute mechanism
         self.msa_norm = torch.nn.LayerNorm(cm)
         self.pair_norm = torch.nn.LayerNorm(cz)
         self.evoformers = torch.nn.ModuleList([
-            Evoformer(s, cm, cz, use_chunk=use_chunk) for _ in range(evo_num)
+            Evoformer(s, cm, cz, use_chunk=use_chunk, is_extra=is_extra) for _ in range(evo_num)
         ])
 
     def forward(self, msa, pair):
@@ -661,7 +702,7 @@ def test_inference():
 
 
 def test_train():
-    evo_num = 48
+    evo_num = 1
 
     # Training evo_num = 48
     # initial training: evoformer
@@ -669,18 +710,22 @@ def test_train():
     # first fine-tuning: evoformer
     # bs, s, r, cm, cz = 1, 512, 256, 256, 128
     # second fine-tuning: evoformer
-    bs, s, r, cm, cz = 1, 512, 384, 256, 128
+    # bs, s, r, cm, cz = 1, 512, 384, 256, 128
 
     # Extra sequence evo_num = 4
     # initial training
-    # bs, s, r, cm, cz = 1, 1024, 256, 256, 128
+    bs, s, r, cm, cz = 1, 1024, 256, 64, 128
     # second fine-tuning
-    # bs, s, r, cm, cz = 1, 1024, 384, 256, 128
-    # bs, s, r, cm, cz = 1, 5120, 384, 256, 128
+    # bs, s, r, cm, cz = 1, 1024, 384, 64, 128
+    # bs, s, r, cm, cz = 1, 5120, 384, 64, 128
 
-    dtype = torch.float16
+    dtype = torch.float32
 
-    model = AlphaFold2(s, cm, cz, evo_num).to(dtype)
+    model = AlphaFold2(s, cm, cz, evo_num, is_extra=True).to(dtype)
+
+    msa, pair = torch.randn(bs, s, r, cm), torch.randn(bs, r, r, cz)
+    loss = model(msa, pair)
+    return loss
 
     model = cube.SemanticModel(model,
                                input_shapes=([bs, s, r, cm], [bs, r, r, cz]))
@@ -727,4 +772,4 @@ def test_train():
         int(torch.cuda.max_memory_allocated() / 1024 / 1024)))
 
 
-test_inference()
+test_train()
