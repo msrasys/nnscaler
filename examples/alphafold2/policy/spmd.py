@@ -48,6 +48,16 @@ def _coshard(graph: IRGraph, node: IRFwOperation, devs: List[int],
     return sub_nodes
 
 
+def PASSingleInference(graph: IRGraph, resource):
+    assert resource.ngpus == 1
+
+    for node in graph.nodes():
+        if not isinstance(node, IRBpOperation):
+            graph.assign(node, 0)
+
+    return graph
+
+
 def PASSingle(graph: IRGraph, resource):
     assert resource.ngpus == 1
 
@@ -69,7 +79,7 @@ def PASSingle(graph: IRGraph, resource):
         rhs = indices[2 * i + 1]
 
         # deepmind's default recompute strategy
-        # graph.recompute(fnodes[lhs + 1:rhs])
+        graph.recompute(fnodes[lhs + 1:rhs])
 
         # another strategy
         # sub_indices = []
@@ -80,6 +90,29 @@ def PASSingle(graph: IRGraph, resource):
         # for j in range(len(sub_indices) - 1):
         #     graph.recompute(fnodes[sub_indices[j] + 1:sub_indices[j + 1]])
 
+    return graph
+
+
+def PASExtraSingle(graph: IRGraph, resource):
+    assert resource.ngpus == 1
+
+    for node in graph.nodes():
+        if not isinstance(node, IRBpOperation):
+            graph.assign(node, 0)
+
+    fnodes = graph.nodes()
+    anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
+
+    indices = [
+        fnodes.index(anchor) for anchor in anchors
+        if anchor.name == 'MSACol' or anchor.name == 'One Layer Evoformer End'
+    ]
+    assert len(indices) % 2 == 0
+    for i in range(len(indices) // 2):
+        lhs = indices[2 * i]
+        rhs = indices[2 * i + 1]
+
+        graph.recompute(fnodes[lhs + 1:rhs])
     return graph
 
 
@@ -138,7 +171,7 @@ def PASDAP(graph: IRGraph, resource):
             if isinstance(fnodes[j], IRGraphAnchor):
                 sub_indices.append(j)
         sub_indices.append(rhs)
-        # graph.recompute(fnodes[lhs:rhs])
+        graph.recompute(fnodes[lhs:rhs])
         for j in range(len(sub_indices) - 1):
             sub_l, sub_r = sub_indices[j], sub_indices[j + 1]
             names = []
@@ -148,6 +181,69 @@ def PASDAP(graph: IRGraph, resource):
             nodes = fnodes[sub_l + 1:sub_r]
             # DO NOT USE THIS
             # graph.recompute(nodes)
+
+            if 'MSARowAttentionWithPairBias' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 1)
+            elif 'MSAColAttention' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 2)
+            elif 'MSATransition' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 2)
+            elif 'OuterProductMean' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 2)
+            elif 'TriangleMultiplicationOut' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 1)
+            elif 'TriangleMultiplicationIn' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 2)
+            elif 'TriangleAttentionNodeStart' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 1)
+            elif 'TriangleAttentionNodeEnd' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 2)
+            elif 'PairTransition' in names:
+                sub_nodes = _tps(graph, nodes, tp_devs, 0, 1)
+            else:
+                assert False, names
+
+    for i in range(indices[-1] + 1, len(fnodes)):
+        if isinstance(fnodes[i], IRDataOperation) or isinstance(
+                fnodes[i], IRFwOperation):
+            _replica(graph, fnodes[i], tp_devs)
+
+    return graph
+
+
+def PASDAPInference(graph: IRGraph, resource):
+    tp_size = resource.ngpus
+    tp_devs = list(range(tp_size))
+
+    fnodes = graph.nodes()
+    anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
+
+    indices = [
+        fnodes.index(anchor) for anchor in anchors
+        if anchor.name == 'One Layer Evoformer Start'
+        or anchor.name == 'One Layer Evoformer End'
+    ]
+    assert len(indices) % 2 == 0
+
+    for i in range(indices[0]):
+        if isinstance(fnodes[i], IRDataOperation) or isinstance(
+                fnodes[i], IRFwOperation):
+            _replica(graph, fnodes[i], tp_devs)
+
+    for i in range(len(indices) // 2):
+        lhs, rhs = indices[2 * i], indices[2 * i + 1]
+        sub_indices = []
+        for j in range(lhs + 1, rhs):
+            if isinstance(fnodes[j], IRGraphAnchor):
+                sub_indices.append(j)
+        sub_indices.append(rhs)
+        for j in range(len(sub_indices) - 1):
+            sub_l, sub_r = sub_indices[j], sub_indices[j + 1]
+            names = []
+            for k in range(sub_l + 1, sub_r):
+                names.append(fnodes[k].name)
+            names = set(names)
+            nodes = fnodes[sub_l + 1:sub_r]
 
             if 'MSARowAttentionWithPairBias' in names:
                 sub_nodes = _tps(graph, nodes, tp_devs, 0, 1)
