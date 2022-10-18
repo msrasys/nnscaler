@@ -211,22 +211,33 @@ def MSAColGlobalAttention(msa_repr: torch.Tensor, q_proj: torch.Tensor,
                           k_proj: torch.Tensor, v_proj: torch.Tensor,
                           gate_proj: torch.Tensor, out_proj: torch.Tensor,
                           head: int, c: int, scale: float):
+    # [N R S M]
     msa_repr = msa_repr.transpose(-2, -3)
 
+    # [N R M]
     q = torch.sum(msa_repr, dim=-2)
+    # [N R M]
     q = torch.matmul(q, q_proj) * scale
+    # [N R H E]
     q = q.view(q.shape[:-1] + (head, -1))
 
+    # [N R S E]
     k, v = torch.matmul(msa_repr, k_proj), torch.matmul(msa_repr, v_proj)
 
+    # [N R H S]
     a = torch.matmul(q, k.transpose(-1, -2))
     a = torch.nn.functional.softmax(a, dim=-1)
+    # [N R H E]
     o = torch.matmul(a, v)
 
+    # [N R S M]
     g = torch.sigmoid(torch.matmul(msa_repr, gate_proj))
+    # [N R S H E]
     g = g.view(g.shape[:-1] + (head, -1))
 
+    # [N R 1 H E]
     o = o.unsqueeze(-3) * g
+    # [N R S M]
     o = o.reshape(o.shape[:-2] + (-1, ))
 
     return torch.matmul(o, out_proj).transpose(-2, -3)

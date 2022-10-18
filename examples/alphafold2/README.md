@@ -2,13 +2,63 @@
 
 Benchmark different schedule plans of Alphafold2 based on MagicCube.
 
+# Model
+
+## Structure
+
+TODO
+
+## Challenge
+
+TODO
+
+## Problem Formulation
+
+TODO: try out del tensor in functions that to be recomputed -> offload problems to jit tensor compilers
+
+strategy: detect memory constrained parts then coshard them
+
+large enough size of input shapes already utilize accelerators
+
+should include coshard into the dp formulation
+
+## Memory Consumption
+
+notation
+- $s$: multiple sequence alignment (MSA) number
+- $r$: residue number
+- $c_{m}$: hidden dimension of MSA representation
+- $c_{z}$: hidden dimension of pair representation
+- $h$: head number. Different modules may differ
+
+activation
+- one Evoformer's output: $s \cdot r \cdot c_{m} + r^{2} \cdot c_{z}$
+- Modules' outputs inside a Evoformer block: $3 \cdot s \cdot r \cdot c_{m} + 6 \cdot s \cdot r^{2} \cdot c_{z}$
+
+peak memory
+- MSA Row Attention with Bias: $h \cdot s \cdot r^2$, where $h=8$
+- MSA Col Attention: $h \cdot s^2 \cdot r$, where $h=8$
+- MSA Transition: $4 \cdot s \cdot r \cdot c_{m}$
+- Outer Product Mean: $r^2 \cdot c^2$, where $c=32$
+- Triangular Multiplicative Update using Outgoing Edges: $r^2 \cdot c$, where $c=128$
+- Triangular Multiplicative Update using Ingoing Edges: $r^2 \cdot c$, where $c=128$
+- Triangular Gated Self-Attention around Starting Node: $h \cdot r^3$, where $h=4$
+- Triangular Gated Self-Attention around Ending Node: $h \cdot r^3$, where $h=4$
+- Pair Transition: $4 \cdot s \cdot r^2 \cdot c_{z}$
+
 # Results
 
 ## Training
 
+Computation in float16
+
 ### Evoformer Stack
 
+$48$ Evoformers in total
+
 **s, r = 128, 256**
+
+1 Evoformer output size: $16 + 16 = 32$MB
 
 | device num | policy | peak mem (MB) | activation mem (MB) | time (ms) |
 |:-----------|:-------|:--------------|:--------------------|:----------|
@@ -19,6 +69,8 @@ Benchmark different schedule plans of Alphafold2 based on MagicCube.
 
 **s, r = 512, 256**
 
+1 Evoformer output size: $64 + 16 = 80$MB
+
 | device num | policy | peak mem (MB) | activation mem (MB) | time (ms) |
 |:-----------|:-------|:--------------|:--------------------|:----------|
 | 1          | small  | 18952         | 14471               | 7949.96   |
@@ -27,6 +79,8 @@ Benchmark different schedule plans of Alphafold2 based on MagicCube.
 | 2          | large  | 5744          | 2543                | 4793.78   |
 
 **s, r = 512, 384**
+
+1 Evoformer output size: $96 + 36 = 132$MB
 
 | device num | policy | peak mem (MB) | activation mem (MB) | time (ms) |
 |:-----------|:-------|:--------------|:--------------------|:----------|
@@ -37,6 +91,8 @@ Benchmark different schedule plans of Alphafold2 based on MagicCube.
 
 ### Extra Msa Stack
 
+$4$ Extra-Evoformer, $c_{m} = 64$ and $c_{z} = 128$
+
 **device num = 1**
 
 | Config           | peak mem (MB) | activation mem (MB) | time (ms) |
@@ -46,6 +102,8 @@ Benchmark different schedule plans of Alphafold2 based on MagicCube.
 | s, r = 5120, 384 | 16168         | 8210                | 58393.83  |
 
 ## Inference
+
+Computation in float32
 
 ### T1044
 
