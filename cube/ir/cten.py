@@ -404,26 +404,15 @@ class IRCell:
         assert isinstance(info, str), "comment only allowed to be string"
         self._comment = info 
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """
         Cell string presentation
         """
-        inputs = list()
-        for tensor in self.inputs():
-            if isinstance(tensor, IRTensor):
-                inputs.append(f't{tensor._id}-dev{tensor.device}')
-            else:
-                inputs.append(tensor)
-
-        outputs = list()
-        for tensor in self.outputs():
-            if isinstance(tensor, IRTensor):
-                outputs.append(f't{tensor._id}-dev{tensor.device}')
-            else:
-                outputs.append(tensor)
-        dcsp = f'Cell-{self._id}({self.signature}, device={self.device})'\
-               f'({inputs}) -> {outputs}'
-        return dcsp
+        ins = [t for t in self.inputs() if isinstance(t, IRTensor)]
+        dscp = (f"Cell{self._id}-{self.device}(sign={self.signature}, "
+                f"inputs={ins}, "
+                f"outputs={self.outputs()})")
+        return dscp
 
 
 class IRTensor:
