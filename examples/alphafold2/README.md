@@ -44,7 +44,7 @@ peak memory
 - Triangular Multiplicative Update using Ingoing Edges: $r^2 \cdot c$, where $c=128$
 - Triangular Gated Self-Attention around Starting Node: $h \cdot r^3$, where $h=4$
 - Triangular Gated Self-Attention around Ending Node: $h \cdot r^3$, where $h=4$
-- Pair Transition: $4 \cdot s \cdot r^2 \cdot c_{z}$
+- Pair Transition: $4 \cdot r^2 \cdot c_{z}$
 
 # Results
 
