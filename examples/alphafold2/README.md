@@ -6,23 +6,20 @@ Benchmark different schedule plans of Alphafold2 based on MagicCube.
 
 ## Structure
 
-TODO
+An evoformer block is composed of 9 sub-modules.
 
-## Challenge
+- Row-wise gated self-attention with pair bias & Column-wise gated self-attention -> customized attention module
+- MSA transition -> feed forward network
+- Outer product mean
+- Triangle update using outgoing edges & Triangle update using incoming edges
+- Triangle self-attention around starting nodes & Triangle self-attention around ending node -> customized attention module
+- Pair transition -> feed forward network
 
-TODO
+<p align="center">
+  <img src="./images/evoformer.png" />
+</p>
 
-## Problem Formulation
-
-TODO: try out del tensor in functions that to be recomputed -> offload problems to jit tensor compilers
-
-strategy: detect memory constrained parts then coshard them
-
-large enough size of input shapes already utilize accelerators
-
-should include coshard into the dp formulation
-
-## Memory Consumption
+## Memory Estimation
 
 notation
 - $s$: multiple sequence alignment (MSA) number
@@ -46,7 +43,79 @@ peak memory
 - Triangular Gated Self-Attention around Ending Node: $h \cdot r^3$, where $h=4$
 - Pair Transition: $4 \cdot r^2 \cdot c_{z}$
 
-# Results
+parameter
+- less than 1M
+
+## Challenge
+
+The core problem is: the evoformer consumes large amount of memory and we need to find the minimal execution time under the accelerator's memory constraint.
+
+According to the estimation above, we find that the memory distribution of evoformer is different from the classical transformer. Using GPT as an example, batch size is 1 in both blocks.
+
+| Model                    | # Parameter | # Activation | # Output |
+|:-------------------------|:------------|:-------------|:---------|
+| Evoformer (Alphafold2)   | < 1 M       | 5120 M       | 66 M     |
+| Transformer (GPT-3 6.7 B)| 192 M       | 512 M        | 8 M      |
+
+Assume the data type is float32 in the following analysis.
+
+If recompute (checkpoint) is not used, the whole memory usage of $n$ evoformer blocks is around $10 \cdot n$ GB.
+
+## Problem Formulation
+
+TODO: try out del tensor in functions that to be recomputed -> offload problems to jit tensor compilers
+
+strategy: detect memory constrained parts then coshard them
+
+large enough size of input shapes already utilize accelerators
+
+should include coshard into the dp formulation
+
+# Experiment
+
+## Usage
+
+**Two steps**
+
+1. change var values in *alphafold2.py*
+2. run commands (add *torchrun* to **PATH**)
+
+**Training**
+
+1. Evoformer Stack
+    - shape config
+        - bs, s, r, cm, cz = 1, 128, 256, 256, 128
+        - bs, s, r, cm, cz = 1, 512, 256, 256, 128
+        - bs, s, r, cm, cz = 1, 512, 384, 256, 128
+    - other config: dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 4, False, True, False
+    - policy
+        - spmd.PASSingle
+        - spmd.PASDAP
+
+2. Extra Msa Stack
+    - shape config
+        - bs, s, r, cm, cz = 1, 1024, 256, 64, 128
+        - bs, s, r, cm, cz = 1, 1024, 384, 64, 128
+        - bs, s, r, cm, cz = 1, 5120, 384, 64, 128
+    - other config: dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 4, True, True, True
+    - policy
+        - spmd.PASExtraSingle
+
+**Inference**
+
+- shape config: bs, s, r, cm, cz = 1, 128, 2048, 256, 128
+- other config: dtype, evo_num, use_chunk, is_train, is_extra = torch.float32, 48, True, False, False
+- policy
+    - spmd.PASSingleInference
+    - spmd.PASDAPInference
+
+**Command**
+
+```bash
+torchrun --nproc_per_node=X alphafold2.py
+```
+
+X = 1 when *single* in policy. X = 2, 4, 8 when *DAP* in policy.
 
 ## Training
 
