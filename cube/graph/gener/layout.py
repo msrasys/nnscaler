@@ -1,6 +1,7 @@
 from typing import Callable, Dict, List, Tuple, Optional
 import copy
 import numpy as np
+from regex import R
 from cube.ir.cten import IRCell
 
 from cube.ir.tensor import IRFullTensor, IRSubTensor
@@ -17,6 +18,10 @@ from cube.ir.adapter.prim import MovePrim           # p2p
 from cube.ir.adapter.prim import BroadcastPrim
 from cube.ir.adapter.prim import RDScatterPrim, RVScatterPrim
 from cube.ir.adapter.prim import RDGatherPrim, RVGatherPrim
+
+
+TShape = Tuple[int, ...]
+TRVD = Tuple[int, ...]
 
 
 class GridLayout:
@@ -189,7 +194,7 @@ class GridLayout:
             #     prims.append(ChunkPrim(itensor, otensor, dim, ranks))
         return glayout, prims
 
-    def incr(self, chunks: int, devices: List[int]):
+    def incr(self, chunks: int, devices: Optional[np.ndarray] = None):
         """
         RVD+ Prmitive: increase replica
         collective: broadcast
@@ -198,6 +203,12 @@ class GridLayout:
         layout[0] = layout[0] * chunks
         glayout = GridLayout.grid(self.ftensor, layout[0], layout[1], layout[2:])
         # set device
+        if devices is not None:
+            assert devices.size == len(self.subtensors) * chunks
+            for tensor, devid in zip(glayout.mat.flatten(), devices.flatten()):
+                tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
+                tensor.cell.device = int(devid)
+        # setup prims
         imat = GridLayout.dims2last(self.mat, [0]).flatten()
         omat = GridLayout.dims2last(glayout.mat, [0]).reshape(-1, chunks)
         prims = []
@@ -205,8 +216,7 @@ class GridLayout:
             prims.append(BroadcastPrim(src, [src] + list(dsts)))
         return glayout, prims
 
-
-    def decr(self, chunks: int, devices: List[int]):
+    def decr(self, chunks: int, devices: Optional[np.ndarray] = None):
         """
         RVD+ Prmitive: decrease replica
         collective: move
@@ -216,6 +226,12 @@ class GridLayout:
         layout[0] = layout[0] // chunks
         glayout = GridLayout.grid(self.ftensor, layout[0], layout[1], layout[2:])
         # set device
+        if devices is not None:
+            assert devices.size == len(self.subtensors) // chunks
+            for tensor, devid in zip(glayout.mat.flatten(), devices.flatten()):
+                tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
+                tensor.cell.device = int(devid)
+        # setup prims
         imat = GridLayout.dims2last(self.mat, [0]).reshape(-1, chunks)
         omat = GridLayout.dims2last(glayout.mat, [0]).flatten()
         prims = []
@@ -223,8 +239,7 @@ class GridLayout:
             prims.append(MovePrim(srcs[0], dst))
         return glayout, prims
 
-
-    def incd(self, chunks: int, dim: int, devices: List[int]):
+    def incd(self, chunks: int, dim: int, devices: Optional[np.ndarray] = None):
         """
         RVD+ Prmitive: increase dimension
         collective: rdscatter
@@ -232,16 +247,21 @@ class GridLayout:
         layout = list(self.vec)
         layout[2+dim] = layout[2+dim] * chunks
         glayout = GridLayout.grid(self.ftensor, layout[0], layout[1], layout[2:])
-        # TODO: set device
-        imat = GridLayout.dims2last(glayout.mat, [2+dim]).flatten()
+        # set device
+        if devices is not None:
+            assert devices.size == len(self.subtensors) * chunks
+            for tensor, devid in zip(glayout.mat.flatten(), devices.flatten()):
+                tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
+                tensor.cell.device = int(devid)
+        # setup prims
+        imat = GridLayout.dims2last(self.mat, [2+dim]).flatten()
         omat = GridLayout.dims2last(glayout.mat, [2+dim]).reshape(-1, chunks)
         prims = []
         for src, dsts in zip(imat, omat):
             prims.append(RDScatterPrim(src, dsts, dim=dim))
         return glayout, prims
 
-
-    def decd(self, chunks: int, dim: int, devices: List[int]):
+    def decd(self, chunks: int, dim: int, devices: Optional[np.ndarray] = None):
         """
         RVD+ Prmitive: increase dimension
         collective: rdgather
@@ -251,6 +271,12 @@ class GridLayout:
         layout[2+dim] = layout[2+dim] // chunks
         glayout = GridLayout.grid(self.ftensor, layout[0], layout[1], layout[2:])
         # set device
+        if devices is not None:
+            assert devices.size == len(self.subtensors) // chunks
+            for tensor, devid in zip(glayout.mat.flatten(), devices.flatten()):
+                tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
+                tensor.cell.device = int(devid)
+        # setup prims
         imat = GridLayout.dims2last(self.mat, [2+dim]).reshape(-1, chunks)
         omat = GridLayout.dims2last(glayout.mat, [2+dim]).flatten()
         prims = []
@@ -258,8 +284,7 @@ class GridLayout:
             prims.append(RDGatherPrim(srcs, dst, dim=dim))
         return glayout, prims
 
-
-    def incv(self, chunks: int, devices: List[int]):
+    def incv(self, chunks: int, devices: Optional[np.ndarray] = None):
         """
         RVD+ Primitive: increase value partition
         collective: rvscatter
@@ -267,15 +292,21 @@ class GridLayout:
         layout = list(self.vec)
         layout[1] = layout[1] * chunks
         glayout = GridLayout.grid(self.ftensor, layout[0], layout[1], layout[2:])
-        # TODO: set device
-        imat = GridLayout.dims2last(glayout.mat, [1]).flatten()
+        # set device
+        if devices is not None:
+            assert devices.size == len(self.subtensors) * chunks
+            for tensor, devid in zip(glayout.mat.flatten(), devices.flatten()):
+                tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
+                tensor.cell.device = int(devid)
+        # setup prims
+        imat = GridLayout.dims2last(self.mat, [1]).flatten()
         omat = GridLayout.dims2last(glayout.mat, [1]).reshape(-1, chunks)
         prims = []
         for src, dsts in zip(imat, omat):
             prims.append(RVScatterPrim(src, dsts))
         return glayout, prims
 
-    def decv(self, chunks: int, devices: List[int]):
+    def decv(self, chunks: int, devices: Optional[np.ndarray] = None):
         """
         RVD+ Primitive: decrease value partition
         collective: rvgather
@@ -284,7 +315,13 @@ class GridLayout:
         assert layout[1] % chunks == 0, f"not divisable value split: {self.V} % {chunks} != 0"
         layout[1] = layout[1] * chunks
         glayout = GridLayout.grid(self.ftensor, layout[0], layout[1], layout[2:])
-        # TODO: set device
+        # set device
+        if devices is not None:
+            assert devices.size == len(self.subtensors) // chunks
+            for tensor, devid in zip(glayout.mat.flatten(), devices.flatten()):
+                tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
+                tensor.cell.device = int(devid)
+        # setup prims
         imat = GridLayout.dims2last(self.mat, [1]).reshape(-1, chunks)
         omat = GridLayout.dims2last(glayout.mat, [1]).flatten()
         prims = []
@@ -412,6 +449,35 @@ class GridLayout:
         return np.transpose(mat, axes)
 
     @staticmethod
+    def dims2orig(mat: np.ndarray, last_dims: List[int]) -> np.ndarray:
+        axes = list(range(len(mat.shape)))
+        for dim in last_dims:
+            axes.remove(dim)
+        axes += list(last_dims)
+        axes = np.argsort(np.array(axes))
+        return np.transpose(mat, axes)
+
+    @staticmethod
+    def changed_dims(src: TRVD, dst: TRVD) -> Tuple[List[int], List[int]]:
+        """
+        Get changed dimensions
+
+        @param src Tuple[int]: the source RVD layout
+        @param dst Tuple[int]: the destination RVD layout
+        
+        @return inc_dims Tuple[int]: the dimensions that need to increase
+        @return dec_dims Tuple[int]: the dimensions that need to decrease
+        """
+        assert len(src) == len(dst)
+        inc_dims, dec_dims = [], []
+        for dim, (slen, dlen) in enumerate(zip(src, dst)):
+            if slen < dlen:
+                inc_dims.append(dim)
+            elif slen > dlen:
+                dec_dims.append(dim)
+        return inc_dims, dec_dims
+
+    @staticmethod
     def grid(ftensor: IRFullTensor, r: int, v: int, dims: Tuple[int], devices: Optional[Tuple[int]] = None):
         """
         partition a ftensor using grid layout of <r, v, *dims>
@@ -450,8 +516,8 @@ class GridLayout:
         # devices
         if devices is not None:
             assert len(devices) == len(all_subtensors), f"devices number {len(devices)} not match with RVD number {len(all_subtensors)}"
-            for tensor, devid in zip(all_subtensors, devices):
-                dummy_assign(tensor, devid)
+            for tensor, devid in zip(mats.flatten(), devices):
+                dummy_assign(tensor, int(devid))
 
         return GridLayout(ftensor, all_subtensors, mats)
 
@@ -522,10 +588,6 @@ class GridLayout:
         return GridLayout(ftensor, subtensors, mats)
 
 
-TShape = Tuple[int, ...]
-TRVD = Tuple[int, ...]
-
-
 class PathFinder:
     """
     Pathfinder for generating communication plans for GridLayout
@@ -542,7 +604,7 @@ class PathFinder:
     _cached_inter_paths: Dict[Tuple[TShape, int, int], Dict[TRVD, List[List[int]]]] = {}
 
     @staticmethod
-    def intra_shard(ftensor: IRFullTensor, ilayout: GridLayout, olayout: GridLayout, cost_fn: Optional[Callable] = None) -> Tuple[List[GridLayout], List[IRAdapterPrim]]:
+    def intra_path(ftensor: IRFullTensor, ilayout: GridLayout, olayout: GridLayout, cost_fn: Optional[Callable] = None) -> Tuple[List[GridLayout], List[IRAdapterPrim]]:
         """
         Get primitive path of transforming ilayout into olayout.
         ilayout has the same device set with olayout
@@ -616,18 +678,8 @@ class PathFinder:
         curr_rvd = src
         for hop in path[1:]:
             hop_rvd = nodes[hop]
-            inc_dim, dec_dim = None, None
-            for dim, (ipnum, opnum) in enumerate(zip(curr_rvd, hop_rvd)):
-                if ipnum > opnum:
-                    assert dec_dim is None
-                    dec_dim = dim
-                    continue
-                if opnum > ipnum:
-                    assert inc_dim is None
-                    inc_dim = dim
-                    continue
-            nchunks = curr_rvd[dec_dim] // hop_rvd[dec_dim]
-            layout, prims = PathFinder.intra_step(layouts[-1], dec_dim, inc_dim, nchunks)
+            ret, layout, prims = PathFinder.intra_transform(ftensor, curr_rvd, hop_rvd, layouts[-1])
+            assert ret, "Internal Error."
             layouts.append(layout)
             all_prims += prims
             curr_rvd = hop_rvd
@@ -635,7 +687,7 @@ class PathFinder:
 
 
     @staticmethod
-    def inter_shard(ftensor: IRFullTensor, ilayout: GridLayout, olayout: GridLayout, cost_fn: Optional[Callable] = None) -> Tuple[List[GridLayout], List[IRAdapterPrim]]:
+    def inter_path(ftensor: IRFullTensor, ilayout: GridLayout, olayout: GridLayout, cost_fn: Optional[Callable] = None) -> Tuple[List[GridLayout], List[IRAdapterPrim]]:
         """
         Get primitives for transforming ilayout into olayout. ilayout has the different device set
         to olayout. And number of device of ilayout and olayout must be divisable by each other.
@@ -695,44 +747,148 @@ class PathFinder:
             PathFinder._cached_inter_paths[key][src] = paths
         
         # print for debug
-        for idx, path in enumerate(paths):
-            print(f"{src} -> {nodes[idx]}: {' -> '.join([str(nodes[i]) for i in path])} | cost: {cost[idx]}")
+        # for idx, path in enumerate(paths):
+        #     print(f"{src} -> {nodes[idx]}: {' -> '.join([str(nodes[i]) for i in path])} | cost: {cost[idx]}")
         
+        path = paths[nodes.index(dst)]
+        assert len(path) > 0, f"Un-reachable src RVD ({src}) -> dst RVD ({dst})"
+
+        # setup consumer begining devices
+        cpaths = tuple(idx for idx in path if nodes[idx][0] == 'c')
+        cdevs = np.array([t.device[0] for t in olayout.mat.flatten()]).reshape(dst[1:])
+        # print('result device map:', list(cdevs.flatten()))
+        for hop in cpaths[:-1][::-1]:
+            hop_rvd = nodes[hop][1:]
+            cdevs = PathFinder.intra_devmap(dst[1:], hop_rvd, cdevs)
+        # print('calculated consumer device map: ', list(cdevs.flatten()))
+        # setup primitives for communication
+        side, layouts, all_prims = 'p', [ilayout], []
+        curr_rvd = src[1:]
+        for hop in path[1:]:
+            use_inter_step = side != nodes[hop][0]
+            hop_rvd = nodes[hop][1:]
+            if not use_inter_step:
+                ret, layout, prims = PathFinder.intra_transform(ftensor, curr_rvd, hop_rvd, layouts[-1])
+                assert ret, "Internal Error"
+            else:
+                ret, layout, prims = PathFinder.inter_transform(ftensor, curr_rvd, hop_rvd, layouts[-1], cdevs)
+            layouts.append(layout)
+            all_prims += prims
+            curr_rvd = hop_rvd
+            side = nodes[hop][0]
+        return layouts, all_prims
 
     @staticmethod
-    def intra_step(ilayout: GridLayout, dec_idx: int, inc_idx: int, chunks: int) -> Tuple[GridLayout, List[IRAdapterPrim]]:
+    def intra_transform(ftensor: IRFullTensor, src_rvd: TRVD, dst_rvd: TRVD, ilayout: Optional[GridLayout] = None) -> Tuple[GridLayout, List[IRAdapterPrim]]:
+        """
+        Get output layout and transform primitives from a source rvd layout to dst_rvd layout, 
+        
+        @param ftensor IRFullTensor
+        @param src_rvd Tuple[int]
+        @param dst_rvd Tuple[int]
+        @param ilayout Optional[GridLayout]
+
+        @return ret bool: True if there is a primitive performed 
+        @return layout Optonal[GridLayout]: the RVD layout if ilayout is not None
+        @return prims Optional[List[IRAdapterPrim]]: the prmitives in transformation
+        """
+        if ilayout is not None:
+            assert src_rvd == tuple(ilayout.vec)
+        inc_dims, dec_dims = GridLayout.changed_dims(src_rvd, dst_rvd)
+        if len(inc_dims) != 1 or len(dec_dims) != 1:
+            return False, None, None
+        inc_idx, dec_idx = inc_dims[0], dec_dims[0]
+        if src_rvd[dec_idx] % dst_rvd[dec_idx] != 0:
+            return False, None, None
+        if inc_idx == 1:
+            return False, None, None
+        src = ilayout if ilayout is not None else GridLayout.grid(ftensor, src_rvd[0], src_rvd[1], list(src_rvd[2:]))
+        chunks = src_rvd[dec_idx] // dst_rvd[dec_idx]
         if dec_idx >= 2 and inc_idx == 0:  # d2r
-            return ilayout.d2r(dec_idx-2, chunks)
-        if dec_idx >= 2 and inc_idx >= 2:  # d2d
-            return ilayout.d2d(dec_idx-2, inc_idx-2, chunks)
-        if dec_idx == 1 and inc_idx == 0:  # v2r
-            return ilayout.v2r(chunks)
-        if dec_idx == 1 and inc_idx >= 2:  # v2d
-            return ilayout.v2d(inc_idx-2, chunks)
-        if dec_idx == 0 and inc_idx >= 2:  # r2d
-            return ilayout.r2d(inc_idx-2, chunks)
-        raise RuntimeError(f"Cannot find primitive. Report as a bug. dec-idx: {dec_idx}, inc-idx: {inc_idx}")
+            olayout, prims = src.d2r(dec_idx-2, chunks)
+        elif dec_idx >= 2 and inc_idx >= 2:  # d2d
+            olayout, prims = src.d2d(dec_idx-2, inc_idx-2, chunks)
+        elif dec_idx == 1 and inc_idx == 0:  # v2r
+            olayout, prims = src.v2r(chunks)
+        elif dec_idx == 1 and inc_idx >= 2:  # v2d
+            olayout, prims = src.v2d(inc_idx-2, chunks)
+        elif dec_idx == 0 and inc_idx >= 2:  # r2d
+            olayout, prims = src.r2d(inc_idx-2, chunks)
+        else:
+            raise RuntimeError(f"Cannot find primitive. Report as a bug. dec-idx: {dec_idx}, inc-idx: {inc_idx}")
+        return True, (olayout if ilayout is not None else None), prims
 
     @staticmethod
-    def inter_step(ilayout: GridLayout, dec_idx: Optional[int], inc_idx: Optional[int], chunks: int):
-        assert dec_idx is None or inc_idx is None
-        if isinstance(inc_idx, int):
-            if inc_idx == 0:
-                return ilayout.incr(chunks, [])
-            if inc_idx == 1:
-                return ilayout.incv(chunks, [])
-            if inc_idx > 1:
-                return ilayout.incd(chunks, inc_idx-2, [])
-            raise RuntimeError(f"Cannot find primitive. Report as a bug. dec-idx: {dec_idx}, inc-idx: {inc_idx}")
-        else:
-            if dec_idx == 0:
-                return ilayout.decr(chunks, [])
-            if dec_idx == 1:
-                return ilayout.decv(chunks, [])
-            if dec_idx > 1:
-                return ilayout.decd(chunks, dec_idx-2, [])
-            raise RuntimeError(f"Cannot find primitive. Report as a bug. dec-idx: {dec_idx}, inc-idx: {inc_idx}")
+    def intra_devmap(src_rvd: TRVD, dst_rvd: TRVD, src_devs: np.ndarray):
+        """
+        Infer device from source rvd to destination rvd
+        """
+        assert tuple(src_rvd) == tuple(src_devs.shape)
+        # get changed dimensions
+        inc_idx, dec_idx = GridLayout.changed_dims(src_rvd, dst_rvd)
+        assert len(inc_idx) == 1 and len(dec_idx) == 1
+        inc_idx, dec_idx = inc_idx[0], dec_idx[0]
+        assert src_rvd[dec_idx] % dst_rvd[dec_idx] == 0
+        chunks = src_rvd[dec_idx] // dst_rvd[dec_idx]
+        # reshape array to match devices
+        dst_devs = np.full(dst_rvd, -1, dtype=int)
+        src_devs = GridLayout.dims2last(src_devs, [inc_idx, dec_idx]).reshape(-1, chunks)
+        dst_devs = GridLayout.dims2last(dst_devs, [dec_idx, inc_idx])
+        dshape = dst_devs.shape
+        # set up device
+        dst_devs = dst_devs.reshape(-1, chunks)
+        for rid, devs in enumerate(src_devs):
+            dst_devs[rid] = devs
+        dst_devs = dst_devs.reshape(dshape)
+        # permute to original shape
+        dst_devs = GridLayout.dims2orig(dst_devs, [dec_idx, inc_idx])
+        return dst_devs
 
+    @staticmethod
+    def inter_transform(ftensor, src_rvd: TRVD, dst_rvd: TRVD, ilayout: Optional[GridLayout] = None, dst_devs: Optional[np.array] = None):
+        """
+        Get output layout and transform primitives from a source rvd layout to dst_rvd layout, 
+        
+        @param ftensor IRFullTensor
+        @param src_rvd Tuple[int]
+        @param dst_rvd Tuple[int]
+        @param ilayout Optional[GridLayout]
+
+        @return ret bool: True if there is a primitive performed 
+        @return layout Optonal[GridLayout]: the RVD layout if ilayout is not None
+        @return prims Optional[List[IRAdapterPrim]]: the prmitives in transformation
+        """
+        inc_dims, dec_dims = GridLayout.changed_dims(src_rvd, dst_rvd)
+        if not ((len(inc_dims) == 1 and len(dec_dims) == 0) or (len(inc_dims) == 0 and len(dec_dims) == 1)):
+            return False, None, None
+        inc_idx = inc_dims[0] if len(inc_dims) == 1 else None
+        dec_idx = dec_dims[0] if len(dec_dims) == 1 else None
+        src = ilayout if ilayout is not None else GridLayout.grid(ftensor, src_rvd[0], src_rvd[1], list(src_rvd[2:]))
+        if isinstance(inc_idx, int):
+            if not (dst_rvd[inc_idx] % src_rvd[inc_idx] == 0):
+                return False, None, None
+            chunks = dst_rvd[inc_idx] // src_rvd[inc_idx]
+            if inc_idx == 0:
+                olayout, prims = src.incr(chunks, dst_devs)
+            elif inc_idx == 1:
+                olayout, prims = src.incv(chunks, dst_devs)
+            elif inc_idx > 1:
+                olayout, prims = src.incd(chunks, inc_idx-2, dst_devs)
+            else:
+                raise RuntimeError(f"Cannot find primitive. Report as a bug. dec-idx: {dec_idx}, inc-idx: {inc_idx}")
+        else:
+            if not (src_rvd[dec_idx] % dst_rvd[dec_idx] == 0):
+                return False, None, None
+            chunks = src_rvd[dec_idx] // dst_rvd[dec_idx]
+            if dec_idx == 0:
+                olayout, prims = src.decr(chunks, dst_devs)
+            elif dec_idx == 1:
+                olayout, prims = src.decv(chunks, dst_devs)
+            elif dec_idx > 1:
+                olayout, prims = src.decd(chunks, dec_idx-2, dst_devs)
+            else:
+                raise RuntimeError(f"Cannot find primitive. Report as a bug. dec-idx: {dec_idx}, inc-idx: {inc_idx}")
+        return True, (olayout if ilayout is not None else None), prims
 
     @staticmethod
     def init_intra_graph(ftensor: IRFullTensor, ndevs: int, cost_fn: Optional[Callable]) -> Tuple[List[TRVD], np.ndarray]:
@@ -751,23 +907,9 @@ class PathFinder:
         for i in range(len(nodes)):
             for j in range(len(nodes)):
                 if i == j: continue
-                isrc, idst = nodes[i], nodes[j]
-                inc_dim, dec_dim = [], []
-                for dim, (pnum_src, pnum_dst) in enumerate(zip(isrc, idst)):
-                    if pnum_src > pnum_dst:
-                        dec_dim.append(dim)
-                    elif pnum_src < pnum_dst:
-                        inc_dim.append(dim)
-                if len(inc_dim) != 1 or len(dec_dim) != 1:
-                    continue  # not direct
-                inc_dim, dec_dim = inc_dim[0], dec_dim[0]
-                if idst[inc_dim] % isrc[inc_dim] != 0 or isrc[dec_dim] % idst[dec_dim] != 0:
-                    continue  # not direct
-                if inc_dim == 1:
-                    continue  # not consider increasing value partition
-                nchunks = isrc[dec_dim] // idst[dec_dim]
-                isrc_layout = GridLayout.grid(ftensor, isrc[0], isrc[1], list(isrc[2:]))
-                _, prims = PathFinder.intra_step(isrc_layout, dec_dim, inc_dim, nchunks)
+                src, dst = nodes[i], nodes[j]
+                ret, _, prims = PathFinder.intra_transform(ftensor, src, dst)
+                if not ret: continue
                 edges[i, j] = cost_fn(prims[0])
         return nodes, edges
 
@@ -804,8 +946,6 @@ class PathFinder:
             PathFinder._cached_intra_edges[(shape, odevs)] = dst_edges
             PathFinder._cached_intra_paths[(shape, odevs)] = {}
         nodes = tuple(('p',) + n for n in src_nodes ) + tuple(('c',) + n for n in dst_nodes)
-        for node in nodes:
-            print(node)
         edges = np.full((len(nodes), len(nodes)), np.inf)
         edges[:len(src_nodes), :len(src_nodes)] = src_edges
         edges[len(src_nodes):,len(src_nodes):] = dst_edges
@@ -814,28 +954,13 @@ class PathFinder:
         for i in range(len(src_nodes)):
             for j in range(len(dst_nodes)):
                 src, dst = src_nodes[i], dst_nodes[j]
-                diff_dim = []
-                for dim, (pnum_src, pnum_dst) in enumerate(zip(src, dst)):
-                    if pnum_src != pnum_dst:
-                        diff_dim.append(dim)
-                diff_dim = [0] if len(diff_dim) == 0 else diff_dim
-                if len(diff_dim) != 1:
-                    continue # not direct
-                diff_dim = diff_dim[0]
-                if (src[diff_dim] % dst[diff_dim] != 0) and (dst[diff_dim] % src[diff_dim] != 0):
-                   continue # not divisible -> not direct
-                nchunks = src[diff_dim] // dst[diff_dim] if src[diff_dim] > dst[diff_dim] else dst[diff_dim] // src[diff_dim]
                 # set for [i, len(src_nodes) + j]
-                src_layout = GridLayout.grid(ftensor, src[0], src[1], list(src[2:]))
-                dec_dim = diff_dim if src[diff_dim] > dst[diff_dim] else None
-                inc_dim = diff_dim if dec_dim is None else None
-                _, prims = PathFinder.inter_step(src_layout, dec_dim, inc_dim, nchunks)
+                ret, _, prims = PathFinder.inter_transform(ftensor, src, dst)
+                if not ret: continue
                 edges[i, len(src_nodes) + j] = cost_fn(prims[0]) * comm_factor
                 # set for [len(src_nodes) + j, i]
-                dst_layout = GridLayout.grid(ftensor, dst[0], dst[1], list(dst[2:]))
-                dec_dim, inc_dim = inc_dim, dec_dim
-                _, prims = PathFinder.inter_step(dst_layout, dec_dim, inc_dim, nchunks)
-                # NVLink: 300GBps Inter-node: 100Gbps
+                ret, _, prims = PathFinder.inter_transform(ftensor, dst, src)
+                assert ret
                 edges[len(src_nodes) + j, i] = cost_fn(prims[0]) * comm_factor
         return nodes, edges
 
