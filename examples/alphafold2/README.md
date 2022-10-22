@@ -1,6 +1,6 @@
 # Introduction
 
-Benchmark different schedule plans of Alphafold2 based on MagicCube.
+Benchmark and analysis different schedule plans of Alphafold2 based on MagicCube.
 
 # Model
 
@@ -57,19 +57,33 @@ According to the estimation above, we find that the memory distribution of evofo
 | Evoformer (Alphafold2)   | < 1 M       | 5120 M       | 66 M     |
 | Transformer (GPT-3 6.7 B)| 192 M       | 512 M        | 8 M      |
 
-Assume the data type is float32 in the following analysis.
+Assume the data type is float16 in the following analysis.
 
-If recompute (checkpoint) is not used, the whole memory usage of $n$ evoformer blocks is around $10 \cdot n$ GB.
+The memory usage of $n$ evoformer blocks is around $5 \cdot n$ GB without checkpoint (recompute). Since there are 48 evoformers in Alphafold2, checkpoint is inevitable during training. According to deepmind's nature paper, they store each evoformer's output tensors (*msa_repr* and *pair_repr*) and recompute all of the activations inside the evoformer when backward. The memory usage of this recompute policy is $2 * (48 * 66 + 5120) / 1024 \approx 16$ GB, which can be fit in accelerators like TPU, V100 and A100.
 
-## Problem Formulation
+However, this checkpoint policy cannot resolve all problems.
 
-TODO: try out del tensor in functions that to be recomputed -> offload problems to jit tensor compilers
+1. If the device's memory is less than 16 GB, can we execute the model successfully and efficiently? In other words, given a random device, can we find the optimal checkpoint plan to minimize the latency?
+2. In the *Extra MSA Stack*, $s$ can be a large number (1024 and 5120). As a result, the attention matrix in *Row-wise gated self-attention with pair bias* is very large, $2 * 8 * 5120 * 384 * 384 / 1024 / 1024 = 11520$ MB, which means activations are the bottle neck now.
+3. In inference, the setting is different from training. For example, the length of the protein (residue number) can be very large (around 2048). Activations in many sub-modules are extremely large and far beyond the device's memory capacity. For example, the attention matrix in the *Row-wise gated self-attention with pair bias* is about $4 * 4 * 2048^{3} / 1024^3 = 128$ GB (in inference float32 is used).
 
-strategy: detect memory constrained parts then coshard them
+## Possible Solution
 
-large enough size of input shapes already utilize accelerators
+To solve this problem, current dynamic programming formulation need to be updated.
 
-should include coshard into the dp formulation
+1. Instead of the activation memory size, we need to maintain the *peak memory*: the sum of preserved tensors and maximum intermediate variables.
+2. Different from the previous binary choice (recompute or not), there is a much larger space indeed, a list of tuples $(inter\_mem, preserved\_mem, time)$.
+    - k pass recompute policy: reduce peak memory, increase execution time
+    - coshard / chunk: split computation with extremly large output size into acceptable ones
+
+$f(i, max(p, r), q + s) = min (f(i, max(p, r), q + s), f(i-1, p, q) + t(r, s))$
+
+TODO
+
+- try out del tensor in functions that to be recomputed -> offload problems to jit tensor compilers
+- strategy: detect memory constrained parts then coshard them
+- large enough size of input shapes amay lready utilize accelerators
+- should include coshard into the dp formulation
 
 # Experiment
 
