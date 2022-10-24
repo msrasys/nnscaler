@@ -73,9 +73,10 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
     if torch.distributed.is_initialized():
         # multiple device
         myrank = torch.distributed.get_rank()
+        local_rank = cube.runtime.device.DeviceGroup().local_rank
     else:
         # single device
-        myrank = 0
+        myrank = local_rank = 0
 
     def _load_tschedule_fn(filename) -> Callable:
         import importlib.util
@@ -100,7 +101,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             print_each_rank(f'loading existed schedule from {filename} ...')
             return _load_tschedule_fn(filename)
 
-        if myrank == 0:
+        if local_rank == 0:
 
             compile_start = time.time()
 
