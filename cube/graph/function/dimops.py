@@ -527,7 +527,7 @@ class TransformRule:
     def __init__(self, irules: Tuple[DimopSplit], orules: Tuple[DimopSplit], kwarg_modifier: Optional[Callable] = None) -> None:
         self._inputs = tuple(irules)
         self._outputs = tuple(orules)
-        modifier = kwarg_modifier if kwarg_modifier is not None else lambda x : x
+        modifier = kwarg_modifier if kwarg_modifier is not None else TransformRule.default_modifier
         self._modifier = (modifier,)
 
     def inputs(self) -> Tuple[DimopSplit]:
@@ -549,6 +549,10 @@ class TransformRule:
         inputs = ', '.join(repr(split) for split in self._inputs)
         outputs = ', '.join(repr(split) for split in self._outputs)
         return f'{inputs} -> {outputs}'
+
+    @staticmethod
+    def default_modifier(kwargs: Dict, idx: int, dim: Union[int, str], num: int) -> Dict:
+        return kwargs
 
 
 class IRDimops(IRFwOperation):

@@ -1,4 +1,4 @@
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Union
 from cube.algorithm.generics import GenericDistAlgo
 
 from cube.graph.function.dimops import IRDimops, DimAnno, DimopSplit, TransformRule
@@ -41,53 +41,66 @@ class DimSplitEinops(GenericDistAlgo):
             raise TypeError(f"Expect IRDimops")
         super().__init__(node)
     
-    def satisfy(self, idx: int, dim: int, num: int) -> bool:
+    def satisfy(self, idx: int, dim: Union[int, str], num: int) -> bool:
         """
         Check whether the condition satisfies.
         
         @param idx int: input index
-        @param dim int: input dimension
+        @param dim Union[int, str]: input dimension or 'v', ie., partition at value dimension
         @param num int: chunks to partition the dimension
 
         @return satisfy bool: true if can be partitioned, elsewise false.
         """
-        assert all(isinstance(cond, int) for cond in [idx, dim, num]), "expect int condition"
+        assert all(isinstance(cond, int) for cond in [idx, num]), "expect int condition"
+        assert isinstance(dim, int) or dim == 'v', f"expect dim to be int or 'v'"
         node: IRDimops = self.node
         
         assert isinstance(node.input(idx), IRSubTensor), f"partitioning on a non-tensor input"
         ninputs = len(node.inputs())
         idx = idx if idx >= 0 else idx + ninputs
         assert idx < ninputs, f"index out of boundary: {idx} >= {ninputs}"
-        dim = dim if dim >= 0 else dim + node.input(idx).ndims
-        assert dim < node.input(idx).ndims, f"dimension output of boundary: {dim} >= {node.input(idx).ndims}"
-        
-        # we only partition the first non-1 annotated dimension for hidden-dimension cases.
-        for adim in node.anno.input(idx).dims[dim].identifiers:
-            if adim == '1^': continue
-            break
-        dimlen = node.anno.getlen(adim)
-        # check node special rules first
-        for rule in node.transform_rules:
-            if rule.input(idx) == DimopSplit.D(dim):
-                return dimlen >= num
-        # otherwise check for default rules
-        reduce = node.anno.input(idx).dims[dim].reduces[0]
-        if reduce == DimAnno.ReduceType.Freeze:
-            return False
-        return dimlen >= num
 
-    def instantiate(self, idx: int, dim: int, num: int) -> Optional[List[IRDimops]]:
+        if isinstance(dim, int):
+            dim = dim if dim >= 0 else dim + node.input(idx).ndims
+            assert dim < node.input(idx).ndims, f"dimension output of boundary: {dim} >= {node.input(idx).ndims}"
+        
+        # try split at tensor spatial dimension
+        if isinstance(dim, int):
+            for adim in node.anno.input(idx).dims[dim].identifiers:
+                if adim == '1^': continue
+                break
+            dimlen = node.anno.getlen(adim)
+            # first check node special rules first
+            for rule in node.transform_rules:
+                if rule.input(idx) == DimopSplit.D(dim):
+                    return dimlen >= num
+            # then check default rules
+            reduce = node.anno.input(idx).dims[dim].reduces[0]
+            if reduce == DimAnno.ReduceType.Freeze:
+                return False
+            return dimlen >= num
+        else:
+            for rule in node.transform_rules:
+                if rule.input(idx).isV():
+                    return True
+            return False
+        
+
+    def instantiate(self, idx: int, dim: Union[int, str], num: int) -> Optional[List[IRDimops]]:
 
         node: IRDimops = self.node
         satisfy = self.satisfy(idx, dim, num)
-        for adim in node.anno.input(idx).dims[dim].identifiers:
-            if adim == '1^': continue
-            break
-        reduce: DimAnno.ReduceType = node.anno.input(idx).dims[dim].reduces[0]
-        print(f'try split {node.name}: {node.anno} | dim: {adim} reduce: {reduce}')
-        if not satisfy:
-            print(f'Failed!')
-            return None
+
+        if isinstance(dim, int):
+            for adim in node.anno.input(idx).dims[dim].identifiers:
+                if adim == '1^': continue
+                break
+            reduce: DimAnno.ReduceType = node.anno.input(idx).dims[dim].reduces[0]
+        else:
+            adim, reduce = 'Value', None
+        color, default = '\033[32m' if satisfy else '\033[31m', '\033[0m'
+        print(f"try split {node.name}: {node.anno} | dim: {adim} reduce: {reduce} ... {color}{'Success' if satisfy else 'Failed!'}{default}")
+        if not satisfy: return None
 
         rule: TransformRule = self.infer(idx, dim, num)
     
@@ -121,7 +134,7 @@ class DimSplitEinops(GenericDistAlgo):
 
         return sub_nodes
 
-    def infer(self, idx: int, dim: int, num: int) -> Optional[TransformRule]:
+    def infer(self, idx: int, dim: Union[int, str], num: int) -> Optional[TransformRule]:
         """
         Given the partition choice on `dim` dimension of idx-th input,
         return the partitioning of the output tensor.
@@ -132,15 +145,21 @@ class DimSplitEinops(GenericDistAlgo):
         @return rule TransformRule: the transformation rule
         """
         node: IRDimops = self.node
+        assert isinstance(dim, int) or dim == 'v', f"expect dim to be int or 'v'"
+        # check node special rules first
+        for r in node.transform_rules:
+            if isinstance(dim, int):
+                if r.input(idx) == DimopSplit.D(dim):
+                    return r
+            else:
+                if r.input(idx).isV():
+                    return r
+        # otherwise use default rule
+        assert isinstance(dim, int), f"Error: expect dim to be int for default rules"
         adim: str = node.anno.input(idx).dims[dim].identifiers[0]
         reduce: DimAnno.ReduceType = node.anno.input(idx).dims[dim].reduces[0]
         if reduce == DimAnno.ReduceType.Freeze:
             return None
-        # check node special rules first
-        for r in node.transform_rules:
-            if r.input(idx) == DimopSplit.D(dim):
-                return r
-        # otherwise use default rule
         itransform, otransform = [], []
         # input
         for idx, idim in enumerate(node.anno.inputs()):

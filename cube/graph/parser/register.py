@@ -6,12 +6,12 @@ from typing import Any, Callable, List, Optional
 import inspect
 import torch
 
-from cube.graph.function.dimops import IRDimops, OpAnno
+from cube.graph.function.dimops import IRDimops, OpAnno, TransformRule
 
 from cube.graph.parser.mapping import Sign2Op
 
 
-def register(anno: str, name: Optional[str] = None):
+def register(anno: str, name: Optional[str] = None, rules: Optional[List[TransformRule]] = None):
     """
     Register a function with einop annotations.
 
@@ -63,7 +63,7 @@ def register(anno: str, name: Optional[str] = None):
             kwargs = dict()
             for name, val in zip(kwarg_names, kwarg_vals):
                 kwargs[name] = val
-            return IRDimops(udfop, op_name, signature, [repr(manno)], tensors, **kwargs)
+            return IRDimops(udfop, op_name, signature, [repr(manno)], tensors, transform_rules=rules, **kwargs)
 
         print(f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
         Sign2Op.register(fsig, udfop, code)
