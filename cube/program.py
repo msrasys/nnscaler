@@ -10,6 +10,7 @@ from cube.graph import parser
 
 from cube.runtime.syndata import CubeDataLoader
 from cube.runtime.module import CubeModule
+from cube.runtime.device import DeviceGroup
 from cube.profiler.timer import print_each_rank
 
 import torch
@@ -123,8 +124,10 @@ class SemanticModel:
         """
         Create semantic model based on AI Scientist description.
         """
-        dist = torch.distributed.is_initialized()
-        if (not dist) or (dist and torch.distributed.get_rank() == 0):
+        local_rank = 0
+        if torch.distributed.is_initialized():
+            local_rank = DeviceGroup().local_rank
+        if local_rank == 0:
             self.ir_graph = parser.convert_model(
                 model, input_shapes=input_shapes
             )
