@@ -2,7 +2,7 @@
 The primitive used for IRAdapter
 """
 
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 import copy
 
 from cube.ir.tensor import IRSubTensor, IndexMap, ValueMap
@@ -88,11 +88,18 @@ class CommPrim(IRAdapterPrim):
             devices += t.device
         self.device = list(set(devices))
 
-    def dispatch(self, devid: int):
+    def dispatch(self, devid: int) -> Optional[IRAdapterPrim]:
         """
         dispatch to a given device
         """
-        raise NotImplementedError
+        if devid not in self.device:
+            return None
+        assert devid in self.device, f"device {devid} not applied for this comm primitive"
+        itensors = [itensor for itensor in self.inputs() if devid in itensor.device]
+        otensors = [otensor for otensor in self.outputs() if devid in otensor.device]
+        prim = type(self)(itensors, otensors, **self.kwargs)
+        prim.signature = self.signature
+        return prim
 
     def __repr__(self) -> str:
         dscp = f'{self.outputs()} = {self.signature}({self.inputs()})'
@@ -167,148 +174,27 @@ class SumPrim(ValuePrim):
 
 # communication primitive
 
-class SendPrim(CommPrim):
-    """
-    P2P send prim
-    """
-    def __init__(self, tensor, dst: int):
-        super().__init__([tensor], [tensor], dst=dst)
-        self.signature = 'cube.runtime.adapter.send'
-
-    def volume(self) -> int:
-        return self.input(0).nelement()
-
-    def __repr__(self) -> str:
-        return f"{self.input(0)} = send[{self.device}]({self.input(0)}, dst={self.kwargs['dst']}"
-
-
-class RecvPrim(CommPrim):
-    """
-    P2P recv prim
-    """
-    def __init__(self, tensor: IRSubTensor, src: int):
-        super().__init__([], [tensor],
-                         shape=tensor.shape, dtype='torch.'+tensor.dtype.value, src=src)
-        self.signature = 'cube.runtime.adapter.recv'
-
-    def volume(self) -> int:
-        return self.input(0).nelement()
-
-    def __repr__(self) -> str:
-        return f"{self.output(0)} = recv[{self.device}](shape={self.kwargs['shape']}, dtype={self.kwargs['dtype']}, src={self.kwargs['src']}"
-
-
 class MovePrim(CommPrim):
     """
     P2P send/recv, non-differentiable
     """
-    def __init__(self, itensor: IRSubTensor, otensor: IRSubTensor):
-        src: int = itensor.device[0] if len(itensor.device) > 0 else None
-        dst: int = otensor.device[0] if len(otensor.device) > 0 else None
-        super().__init__([itensor], [otensor], src=src, dst=dst)
-
-    def dispatch(self, devid: int) -> Union[SendPrim, RecvPrim]:
-        if devid == self.kwargs['src']:
-            return SendPrim(self.input(0), self.kwargs['dst'])
-        if devid == self.kwargs['dst']:
-            return RecvPrim(self.output(0), self.kwargs['src'])
-        return None
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
+        if len(kwargs) == 0:
+            assert len(itensors) == 1 and len(otensors) == 1
+            kwargs['shape'] = itensors[0].shape
+            kwargs['dtype'] = 'torch.' + itensors[0].dtype.value
+            kwargs['src'] = itensors[0].device[0] if len(itensors[0].device) > 0 else None
+            kwargs['dst'] = otensors[0].device[0] if len(otensors[0].device) > 0 else None
+        shape, dtype, src, dst = kwargs['shape'], kwargs['dtype'], kwargs['src'], kwargs['dst']
+        super().__init__(itensors, otensors, shape=shape, dtype=dtype, src=src, dst=dst)
+        self.signature = 'cube.runtime.adapter.move'
 
     def volume(self) -> int:
         return self.input(0).nelement()
 
     def __repr__(self):
-        dscp = f"move[{self.device}]({self.input(0)}, src={self.kwargs['src']}, dst={self.kwargs['dst']})"
+        dscp = f"{self.outputs()} = move{self.device}({self.inputs()}, src={self.kwargs['src']}, dst={self.kwargs['dst']})"
         return dscp
-
-
-class RDScatterPrim(CommPrim):
-    """
-    P2P Cross-device dimension scatter, non-differentiable.
-
-    Tensor[Tile0, Tile1]: device 0 -> Tensor[Tile0]: device0, Tensor[Tile1]: device1
-    """
-    def __init__(self, itensor: IRSubTensor, otensors: List[IRSubTensor], dim: int):
-        """
-        @param itensors List[IRSubTensor]: one tensor at device of `src`.
-        @param otensors List[IRSubTensor]: each ran hosts one tenor partitioned by dim.
-        @param dim int: the dimension that itensor will be partitioned
-        """
-        src: int = itensor.device[0] if len(itensor.device) > 0 else None
-        dst: List[int] = [t.device[0] if len(t.device) > 0 else None for t in otensors]
-        super().__init__([itensor], otensors, dim=dim, src=src, dst=dst)
-        self.signature = 'cube.runtime.adapter.rdscatter'
-
-    def volume(self) -> int:
-        return self.input(0).nelement()
-
-    def __repr__(self) -> str:
-        return f"{self.outputs()} = rdscatter[{self.device}]({self.inputs()}, dim={self.kwargs['dim']})"
-
-
-class RVScatterPrim(CommPrim):
-    """
-    P2P Cross-device dimension scatter, non-differentiable.
-
-    Tensor[Tile0, Tile1]: device 0 -> Tensor[Tile0]: device0, Tensor[Tile1]: device1
-    """
-    def __init__(self, itensor: IRSubTensor, otensors: List[IRSubTensor]):
-        """
-        @param itensors List[IRSubTensor]: one tensor at device of `src`.
-        @param otensors List[IRSubTensor]: each ran hosts one tenor partitioned by dim.
-        @param dim int: the dimension that itensor will be partitioned
-        """
-        src: int = itensor.device[0] if len(itensor.device) > 0 else None
-        dst: List[int] = [t.device[0] if len(t.device) > 0 else None for t in otensors]
-        super().__init__([itensor], otensors, src=src, dst=dst)
-        self.signature = 'cube.runtime.adapter.rvscatter'
-
-    def volume(self) -> int:
-        return self.input(0).nelement() * len(self.outputs())
-
-    def __repr__(self) -> str:
-        return f"{self.outputs()} = rvscatter[{self.device}]({self.inputs()})"
-
-
-class RDGatherPrim(CommPrim):
-    """
-    Gather tensors from remote devices to a local device.
-    The local device doesn't have any tensor
-    """
-    def __init__(self, itensors: List[IRSubTensor], otensor: IRSubTensor, dim: int):
-        src = [t.device[0] if len(t.device) > 0 else None for t in itensors]
-        dst = otensor.device[0] if len(otensor.device) > 0 else None
-        super().__init__(itensors, [otensor], src=src, dst=dst, dim=dim)
-        self.signature = 'cube.runtime.adapter.rdgather'
-
-    def volume(self) -> int:
-        return self.output(0).nelement()
-    
-    def __repr__(self) -> str:
-        return (
-            f"rdgather[{self.device}]("
-            f"{self.inputs()}, dim={self.kwargs['dim']}, "
-            f"src={self.kwargs['src']}, dst={self.kwargs['dst']})"
-        )
-
-class RVGatherPrim(CommPrim):
-    """
-    Gather tensors from remote devices and sum in the local device.
-    The local device doesn't have any tensor
-    """
-    def __init__(self, itensors: List[IRSubTensor], otensor: IRSubTensor):
-        src = [t.device[0] if len(t.device) > 0 else None for t in itensors]
-        dst = otensor.device[0] if len(otensor.device) > 0 else None
-        super().__init__(itensors, [otensor], src=src, dst=dst)
-        self.signature = 'cube.runtime.adapter.rvgather'
-
-    def volume(self) -> int:
-        return self.output(0).nelement() * len(self.inputs())
-
-    def __repr__(self) -> str:
-        src = self.kwargs['src']
-        dst = self.kwargs['dst']
-        return f"{self.outputs()} = rvgather[{self.device}]({self.inputs()}, src={src}, dst={dst})"
 
 
 class CollectivePrim(CommPrim):
@@ -320,18 +206,139 @@ class CollectivePrim(CommPrim):
         if 'ranks' not in self.kwargs:
             self.kwargs['ranks'] = self.device
 
-    def dispatch(self, devid: int) -> Optional[CommPrim]:
+
+class RDScatterPrim(CommPrim):
+    """
+    P2P Cross-device dimension scatter, non-differentiable.
+
+    Tensor[Tile0, Tile1]: device 0 -> Tensor[Tile0]: device0, Tensor[Tile1]: device1
+    """
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
         """
-        dispatch to a given device
+        @param itensors List[IRSubTensor]: one tensor at device of `src`.
+        @param otensors List[IRSubTensor]: each ran hosts one tenor partitioned by dim.
+        @param dim int: the dimension that itensor will be partitioned
         """
-        if devid not in self.device:
-            return None
-        assert devid in self.device, f"device {devid} not applied for this comm primitive"
-        itensors = [itensor for itensor in self.inputs() if devid in itensor.device]
-        otensors = [otensor for otensor in self.outputs() if devid in otensor.device]
-        prim = type(self)(itensors, otensors, **self.kwargs)
-        prim.signature = self.signature
-        return prim
+        if len(kwargs) == 0:
+            assert len(itensors) == 1
+            kwargs['shape'] = tuple(itensors[0].shape)
+            kwargs['dtype'] = 'torch.' + itensors[0].dtype.value
+            kwargs['src'] = itensors[0].device[0] if len(itensors[0].device) > 0 else None
+            kwargs['dsts'] = tuple(otensor.device[0] if len(otensor.device) > 0 else None for otensor in otensors)
+        shape, dtype, src, dsts = kwargs['shape'], kwargs['dtype'], kwargs['src'], kwargs['dsts']
+        super().__init__(itensors, otensors, shape=shape, dtype=dtype, dim=dim, src=src, dsts=dsts)
+        self.signature = 'cube.runtime.adapter.rdscatter'
+
+    def volume(self) -> int:
+        return self.input(0).nelement()
+
+    def __repr__(self) -> str:
+        inputs = ', '.join(f'{t.name}{t.tid}{t.shape}{t.valmap}' for t in self.inputs())
+        outputs = ', '.join(f'{t.name}{t.tid}{t.shape}{t.valmap}' for t in self.outputs())
+        return f"{outputs} = rdscatter{self.device}({inputs}, dim={self.kwargs['dim']})"
+
+
+class RVScatterPrim(CollectivePrim):
+    """
+    P2P Cross-device dimension scatter, non-differentiable.
+
+    Tensor[Tile0, Tile1]: device 0 -> Tensor[Tile0]: device0, Tensor[Tile1]: device1
+    """
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
+        """
+        @param itensors List[IRSubTensor]: one tensor at device of `src`.
+        @param otensors List[IRSubTensor]: each ran hosts one tenor partitioned by dim.
+        @param dim int: the dimension that itensor will be partitioned
+        """
+        if len(kwargs) == 0:
+            assert len(itensors) == 1
+            kwargs['shape'] = tuple(itensors[0].shape)
+            kwargs['dtype'] = 'torch.' + itensors[0].dtype.value
+            kwargs['src'] = itensors[0].device[0] if len(itensors[0].device) > 0 else None
+            kwargs['dsts'] = tuple(otensor.device[0] if len(otensor.device) > 0 else None for otensor in otensors)
+        shape, dtype, src, dsts = kwargs['shape'], kwargs['dtype'], kwargs['src'], kwargs['dsts']
+        super().__init__(itensors, otensors, shape=shape, dtype=dtype, src=src, dst=dsts)
+        self.signature = 'cube.runtime.adapter.rvscatter'
+
+    def volume(self) -> int:
+        return self.input(0).nelement() * len(self.outputs())
+
+    def __repr__(self) -> str:
+        inputs = ', '.join(f'{t.name}{t.tid}{t.shape}{t.valmap}' for t in self.inputs())
+        outputs = ', '.join(f'{t.name}{t.tid}{t.shape}{t.valmap}' for t in self.outputs())
+        return f"{outputs} = rvscatter{self.device}({inputs})"
+
+
+class RDGatherPrim(CommPrim):
+    """
+    Gather tensors from remote devices to a local device.
+    The local device doesn't have any tensor
+    """
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        if len(kwargs) == 0:
+            assert len(otensors) == 1
+            kwargs['shape'] = tuple(itensors[0].shape)  # the input tensor shape
+            kwargs['dtype'] = 'torch.' + itensors[0].dtype.value
+            kwargs['srcs'] = tuple(itensor.device[0] if len(itensor.device) > 0 else None for itensor in itensors)
+            kwargs['dst'] = otensors[0].device[0] if len(otensors[0].device) > 0 else None
+        shape, dtype, srcs, dst = kwargs['shape'], kwargs['dtype'], kwargs['srcs'], kwargs['dst']
+        super().__init__(itensors, otensors, shape=shape, dtype=dtype, srcs=srcs, dst=dst, dim=dim)
+        self.signature = 'cube.runtime.adapter.rdgather'
+
+    def volume(self) -> int:
+        return self.output(0).nelement()
+    
+    def __repr__(self) -> str:
+        inputs = ', '.join(f'{t.name}{t.tid}{t.shape}{t.valmap}' for t in self.inputs())
+        outputs = ', '.join(f'{t.name}{t.tid}{t.shape}{t.valmap}' for t in self.outputs())
+        return f"{outputs} = rdgather{self.device}({inputs}, dim={self.kwargs['dim']})"
+
+
+class RVGatherPrim(CollectivePrim):
+    """
+    Gather tensors from remote devices and sum in the local device.
+    The local device doesn't have any tensor
+    """
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
+        if len(kwargs) == 0:
+            assert len(otensors) == 1
+            kwargs['shape'] = tuple(itensors[0].shape)
+            kwargs['dtype'] = 'torch.' + itensors[0].dtype.value
+            kwargs['srcs'] = tuple(otensor.device[0] if len(otensor.device) > 0 else None for otensor in otensors)
+            kwargs['dst'] = otensors[0].device[0] if len(otensors[0].device) > 0 else None
+        shape, dtype, srcs, dst = kwargs['shape'], kwargs['dtype'], kwargs['srcs'], kwargs['dst']
+        super().__init__(itensors, otensors, shape=shape, dtype=dtype, srcs=srcs, dst=dst)
+        self.signature = 'cube.runtime.adapter.rvgather'
+
+    def volume(self) -> int:
+        return self.output(0).nelement() * len(self.inputs())
+
+    def __repr__(self) -> str:
+        inputs = ', '.join(f'{t.name}{t.tid}{t.shape}{t.valmap}' for t in self.inputs())
+        outputs = ', '.join(f'{t.name}{t.tid}{t.shape}{t.valmap}' for t in self.outputs())
+        return f"{outputs} = rvgather{self.device}({inputs})"
+
+
+class BroadcastPrim(CollectivePrim):
+    """
+    non-differential reduce-scatter
+    """
+    def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
+        if len(kwargs) == 0:
+            assert len(itensors) == 1
+            kwargs['shape'] = tuple(itensors[0].shape)
+            kwargs['dtype'] = 'torch.' + itensors[0].dtype.value
+            kwargs['src'] = itensors[0].device[0] if len(itensors[0].device) > 0 else None
+        super().__init__(itensors, otensors, **kwargs)
+        self.signature = 'cube.runtime.adapter.broadcast'
+
+    def volume(self) -> int:
+        ndevs = len(self.outputs())
+        return self.input(0).nelement() * (ndevs-1)
+
+    def __repr__(self) -> str:
+        return f"{self.outputs()} = broadcast{self.device}({self.inputs()}, src={self.kwargs['src']})"
+
 
 
 class AllReducePrim(CollectivePrim):
@@ -389,23 +396,6 @@ class ReduceScatterPrim(CollectivePrim):
 
     def __repr__(self) -> str:
         return f'{self.outputs()} = reduce_scatter[{self.device}]({self.inputs()})'
-
-
-class BroadcastPrim(CollectivePrim):
-    """
-    non-differential reduce-scatter
-    """
-    def __init__(self, itensor: IRSubTensor, otensors: List[IRSubTensor], **kwargs):
-        src: int = itensor.device[0] if len(itensor.device) > 0 else None
-        super().__init__([itensor], otensors, src=src, **kwargs)
-        self.signature = 'cube.runtime.adapter.broadcast'
-
-    def volume(self) -> int:
-        ndevs = len(self.outputs())
-        return self.input(0).nelement() * (ndevs-1)
-
-    def __repr__(self) -> str:
-        return f"{self.outputs()} = broadcast[{self.device}]({self.inputs()}, src={self.kwargs['src']})"
 
 
 class ReducePrim(CollectivePrim):

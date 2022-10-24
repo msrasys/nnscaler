@@ -78,6 +78,7 @@ class AllReduceIdentity(torch.autograd.Function):
         return grad_output, None
 
 
+@torch.jit.ignore
 def allreduce_identity(tensor: torch.Tensor, ranks: List[int]):
     return AllReduceIdentity.apply(tensor, ranks)
 
@@ -95,7 +96,7 @@ class IdentityAllreduce(torch.autograd.Function):
         grad = _allreduce(grad, ranks)
         return grad, None
 
-
+@torch.jit.ignore
 def identity_allreduce(tensor: torch.Tensor, ranks: Tuple[int]) -> torch.Tensor:
     return IdentityAllreduce.apply(tensor, ranks)
 
@@ -115,6 +116,7 @@ class AllReduceAllReduce(torch.autograd.Function):
         return grad, None
 
 
+@torch.jit.ignore
 def allreduce_allreduce(tensor: torch.Tensor, ranks: Tuple[int]) -> torch.Tensor:
     return AllReduceAllReduce.apply(tensor, ranks)
 
@@ -135,6 +137,7 @@ class ReduceScatterAllGather(torch.autograd.Function):
         return grad, None, None
 
 
+@torch.jit.ignore
 def reducescatter_allgather(tensor: torch.Tensor, dim: int, ranks: List[int]):
     return ReduceScatterAllGather.apply(tensor, dim, ranks)
 
@@ -155,6 +158,7 @@ class AllGatherReduceScatter(torch.autograd.Function):
         return grad, None, None
 
 
+@torch.jit.ignore
 def allgather_reducescatter(tensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
     return AllGatherReduceScatter.apply(tensor, dim, ranks)
 
@@ -174,6 +178,7 @@ class AllGatherSplit(torch.autograd.Function):
         return _chunk(grad, dim, ranks), None, None
 
 
+@torch.jit.ignore
 def allgather_split(tensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
     return AllGatherSplit.apply(tensor, dim, ranks)
 
@@ -197,6 +202,7 @@ class SplitAllGather(torch.autograd.Function):
         return grad, None, None
 
 
+@torch.jit.ignore
 def split_allgather(tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
     return SplitAllGather.apply(tensor, dim, ranks)
 
@@ -218,6 +224,7 @@ class AllToAllAllToAll(torch.autograd.Function):
         return grad, None, None, None
 
 
+@torch.jit.ignore
 def alltoall_alltoall(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -> torch.Tensor:
     return AllToAllAllToAll.apply(itensor, idim, odim, ranks)
 

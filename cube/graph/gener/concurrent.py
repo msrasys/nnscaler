@@ -9,7 +9,7 @@ from cube.ir.adapter.prim import IRAdapterPrim
 from cube.ir.adapter import IRAdapter
 from cube.ir.adapter.prim import SelectPrim, MovePrim, SumPrim, MergeDimPrim
 
-from cube.graph.gener.layout import GridLayout
+from cube.graph.gener.layout import GridLayout, PathFinder
 
 
 class ConcurrentGener:
@@ -42,14 +42,23 @@ class ConcurrentGener:
             except Exception as e:
                 fadapter = None
                 print(
-                    f"full tensor: {fptensors[0].parent} cannot use grid generation.\n"
+                    f"full tensor: {fptensors[0].parent} cannot use intra-transformation generation.\n"
                     f"Reason: {str(e)}\n"
                     f"Switch to general P2P communication."
                 )
 
         # Case 2: sperating device (cross-shard)
         if len(set(pdevs).intersection(cdevs)) == 0:
-            pass
+            # fadapter = ConcurrentGener.gen_cross_shard(fptensors, fctensors, bptensors, bctensors)
+            try:
+                fadapter = ConcurrentGener.gen_cross_shard(fptensors, fctensors, bptensors, bctensors)
+            except Exception as e:
+                fadapter = None
+                print(
+                    f"full tensor: {fptensors[0].parent} cannot use inter-transformation generation.\n"
+                    f"Reason: {str(e)}\n"
+                    f"Switch to general P2P communication."
+                )
 
         # Case 3: General cases
         # warnings.warn('The adapter is generated using P2P communication')
@@ -126,8 +135,37 @@ class ConcurrentGener:
         return fadapter
 
     @staticmethod
-    def gen_cross_shard(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> IRAdapter:
-        pass
+    def gen_cross_shard(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor], 
+                        bptensors: List[IRSubTensor], bctensors: List[IRSubTensor],) -> IRAdapter:
+        """
+        This assumes ptensors and ctensors can be represented by RVD layout.
+        
+        pdevices: devices of ptensors
+        cdevices: devices of ctensors
+
+        @param fptensors List[IRSubTensor]: produced tensors
+        @param fctensors List[IRSubTensor]: consumed tensors
+        @param bptensors List[IRSubTensor]: produced tensors
+        @param bctensors List[IRSubTensor]: consumed tensors
+
+        @return fadapter IRAdapter
+        """
+        ftensor = fptensors[0].parent
+        ilayout = GridLayout.togrid(ftensor, fptensors)
+        olayout = GridLayout.togrid(ftensor, fctensors)
+        fpaths, fprims = PathFinder.inter_path(ftensor, ilayout, olayout)
+        fadapter = IRAdapter(fptensors, fctensors)
+        fadapter.prims = fprims
+
+        grad: IRFullTensor = ftensor.grad
+        if grad is not None and (len(bptensors) != 0 or len(bctensors) != 0):
+            ilayout = GridLayout.togrid(grad, bptensors)
+            olayout = GridLayout.togrid(grad, bctensors)
+            bpaths, bprims = PathFinder.inter_path(grad, ilayout, olayout)
+            badapter = IRAdapter(bptensors, bctensors)
+            badapter.prims = bprims
+            IRAdapter.make_pair(fadapter, badapter)
+        return fadapter
 
     @staticmethod
     def gen_general(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor],
@@ -207,7 +245,7 @@ class ConcurrentGener:
             if tensor.device != ctensor.device:
                 mtensor = copy.copy(tensor)
                 mtensor.cell = ctensor.cell
-                prims.append(MovePrim(tensor, mtensor))
+                prims.append(MovePrim([tensor], [mtensor]))
             tmoved.append(mtensor)
 
         # ===== merge ===== #

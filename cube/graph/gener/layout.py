@@ -213,7 +213,7 @@ class GridLayout:
         omat = GridLayout.dims2last(glayout.mat, [0]).reshape(-1, chunks)
         prims = []
         for src, dsts in zip(imat, omat):
-            prims.append(BroadcastPrim(src, [src] + list(dsts)))
+            prims.append(BroadcastPrim([src], [src] + list(dsts)))
         return glayout, prims
 
     def decr(self, chunks: int, devices: Optional[np.ndarray] = None):
@@ -236,7 +236,7 @@ class GridLayout:
         omat = GridLayout.dims2last(glayout.mat, [0]).flatten()
         prims = []
         for srcs, dst in zip(imat, omat):
-            prims.append(MovePrim(srcs[0], dst))
+            prims.append(MovePrim([srcs[0]], [dst]))
         return glayout, prims
 
     def incd(self, chunks: int, dim: int, devices: Optional[np.ndarray] = None):
@@ -258,7 +258,7 @@ class GridLayout:
         omat = GridLayout.dims2last(glayout.mat, [2+dim]).reshape(-1, chunks)
         prims = []
         for src, dsts in zip(imat, omat):
-            prims.append(RDScatterPrim(src, dsts, dim=dim))
+            prims.append(RDScatterPrim([src], dsts, dim=dim))
         return glayout, prims
 
     def decd(self, chunks: int, dim: int, devices: Optional[np.ndarray] = None):
@@ -281,7 +281,7 @@ class GridLayout:
         omat = GridLayout.dims2last(glayout.mat, [2+dim]).flatten()
         prims = []
         for srcs, dst in zip(imat, omat):
-            prims.append(RDGatherPrim(srcs, dst, dim=dim))
+            prims.append(RDGatherPrim(srcs, [dst], dim=dim))
         return glayout, prims
 
     def incv(self, chunks: int, devices: Optional[np.ndarray] = None):
@@ -303,7 +303,7 @@ class GridLayout:
         omat = GridLayout.dims2last(glayout.mat, [1]).reshape(-1, chunks)
         prims = []
         for src, dsts in zip(imat, omat):
-            prims.append(RVScatterPrim(src, dsts))
+            prims.append(RVScatterPrim([src], dsts))
         return glayout, prims
 
     def decv(self, chunks: int, devices: Optional[np.ndarray] = None):
@@ -326,7 +326,7 @@ class GridLayout:
         omat = GridLayout.dims2last(glayout.mat, [1]).flatten()
         prims = []
         for srcs, dst in zip(imat, omat):
-            prims.append(RVGatherPrim(srcs, dst))
+            prims.append(RVGatherPrim(srcs, [dst]))
         return glayout, prims
 
 

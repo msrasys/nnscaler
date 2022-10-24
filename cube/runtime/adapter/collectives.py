@@ -57,6 +57,16 @@ def recv(tensors: List[torch.Tensor], shape: List[int], dtype: torch.dtype, src:
     return tensor
 
 
+def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int):
+    rank = torch.distributed.get_rank()
+    if rank == src:
+        assert torch.is_tensor(tensor)
+        return send(tensor, dst)
+    else:
+        assert rank == dst
+        return recv(None, shape, dtype, src)
+
+
 def sendrecv(input_tensors: List[torch.Tensor],
              output_shapes: List[List[int]],
              output_dtypes: List[torch.dtype],
@@ -173,27 +183,137 @@ def chunk(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
     return otensor
 
 
-def broadcast(input_tensors: List[torch.Tensor],
-              output_shapes: List[List[int]],
-              output_dtypes: List[torch.dtype],
-              ranks: List[int]) -> List[torch.Tensor]:
+def rdscatter(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
+              dim: int, src: int, dsts: Tuple[int]):
     """
-    Broadcast. ranks[0] is the root
+    RDScatter: split itensor at rank `src` along dim into `len(dsts)` chunks,
+    and then send each chunk to `dst` devices.
     """
     CudaTimer().start(field_name='comm', predefined=True)
-    assert len(input_tensors) == 1 or len(input_tensors) == 0
-    if len(input_tensors) == 1:
-        tensor: torch.Tensor = input_tensors[0]
-        if not tensor.is_contiguous():
-            tensor = tensor.contiguous()
+    rank = torch.distributed.get_rank()
+    if rank == src:
+        with torch.no_grad():
+            otensors = itensor.chunk(len(dsts), dim)
+        send_ops = []
+        for dst, otensor in zip(dsts, otensors):
+            if not otensor.is_contiguous():
+                otensor = otensor.contiguous()
+            send_op = torch.distributed.P2POp(
+                torch.distributed.isend, otensor, dst
+            )
+            send_ops.append(send_op)
+        reqs = torch.distributed.batch_isend_irecv(send_ops)
+        for req in reqs:
+            req.wait()
+        torch.cuda.synchronize()
+        CudaTimer().stop(field_name='comm', predefined=True)
     else:
-        assert len(output_shapes) == 1
-        assert len(output_dtypes) == 1
-        shape = output_shapes[0]
-        dtype = output_dtypes[0]
-        tensor = torch.empty(shape, device=torch.cuda.current_device(), dtype=dtype)
+        assert rank in dsts
+        shape = list(shape)
+        shape[dim] = shape[dim] // len(dsts)
+        otensor = torch.empty(
+            shape, requires_grad=True, dtype=dtype,
+            device=torch.cuda.current_device()
+        )
+        recv_op = torch.distributed.P2POp(
+            torch.distributed.irecv, otensor, src
+        )
+        reqs = torch.distributed.batch_isend_irecv([recv_op])
+        for req in reqs:
+            req.wait()
+        torch.cuda.synchronize()
+        CudaTimer().stop(field_name='comm', predefined=True)
+        return otensor
+
+
+def rvscatter(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
+              dim: int, src: int, dsts: Tuple[int]):
+    """
+    src: global rank
+    """
+    CudaTimer().start(field_name='comm', predefined=True)
+    group = DeviceGroup().get_group((src,) + dsts)
+    rank = torch.distributed.get_rank()
+    tensor: torch.Tensor = itensor / len(dsts) if src == rank else \
+        torch.empty(shape, dtype=dtype, requires_grad = True)
+    tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
+    torch.distributed.broadcast(tensor, src, group=group)
+    CudaTimer().stop(field_name='comm', predefined=True)
+    return tensor
+
+
+def rdgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
+             dim: int, srcs: Tuple[int], dst: int):
+    """
+    @param srcs Tuple[int]: global rank of each source device
+    @param dst int: global rank of destination device
+    """
+    CudaTimer().start(field_name='comm', predefined=True)
+    rank = torch.distributed.get_rank()
+    if rank == dst:
+        recv_ops = []
+        recv_tensors = []
+        for src in srcs:
+            tensor = torch.empty(
+                shape, dtype=dtype,
+                device=torch.cuda.current_device()
+            )
+            recv_op = torch.distributed.P2POp(
+                torch.distributed.irecv, tensor, src
+            )
+            recv_ops.append(recv_op)
+            recv_tensors.append(tensor)
+        reqs = torch.distributed.batch_isend_irecv(recv_ops)
+        for req in reqs:
+            req.wait()
+        torch.cuda.synchronize()
+        with torch.no_grad():
+            otensor = torch.cat(tuple(recv_tensors), dim=dim)
+        otensor = otensor.requires_grad_()
+        CudaTimer().stop(field_name='comm', predefined=True)
+        return otensor
+    else:
+        assert rank in srcs
+        tensor = itensor.contiguous() if not itensor.is_contiguous() else itensor
+        send_ops = [torch.distributed.P2POp(torch.distributed.isend, tensor, dst)]
+        reqs = torch.distributed.batch_isend_irecv(send_ops)
+        for req in reqs:
+            req.wait()
+        torch.cuda.synchronize()
+        CudaTimer().stop(field_name='comm', predefined=True)
+        return itensor
+
+
+def rvgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
+             srcs: Tuple[int], dst: int):
+    """
+    @param srcs Tuple[int]: global rank of each source device
+    @param dst int: global rank of destination device
+    """
+    CudaTimer().start(field_name='comm', predefined=True)
+    rank = torch.distributed.get_rank()
+    group = DeviceGroup().get_group(srcs + (dst,))
+    tensor = torch.zeros(shape, dtype=dtype, requires_grad=True) if rank == dst else itensor
+    torch.distributed.reduce(tensor, dst, group=group)
+    CudaTimer().stop(field_name='comm', predefined=True)
+    return tensor
+
+
+def broadcast(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype, src: int, ranks: List[int]) -> torch.Tensor:
+    """
+    Broadcast
+    @param src: the global rank that holds tensor for broadcasting
+    """
+    CudaTimer().start(field_name='comm', predefined=True)
+    rank = torch.distributed.get_rank()
     group = DeviceGroup().get_group(ranks)
-    torch.distributed.broadcast(tensor, ranks[0], group=group)
+    if rank == src:
+        tensor = itensor.contiguous() if not itensor.is_contiguous() else itensor
+    else:
+        assert rank in ranks
+        tensor = torch.empty(shape, 
+            device=torch.cuda.current_device(), requires_grad=True, dtype=dtype)
+    torch.distributed.broadcast(tensor, src, group=group)
     CudaTimer().stop(field_name='comm', predefined=True)
     return tensor
 
