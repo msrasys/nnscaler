@@ -213,7 +213,10 @@ class GridLayout:
         omat = GridLayout.dims2last(glayout.mat, [0]).reshape(-1, chunks)
         prims = []
         for src, dsts in zip(imat, omat):
-            prims.append(BroadcastPrim([src], [src] + list(dsts)))
+            if chunks == 1:
+                prims.append(MovePrim([src], dsts))
+            else:
+                prims.append(BroadcastPrim([src], [src] + list(dsts)))
         return glayout, prims
 
     def decr(self, chunks: int, devices: Optional[np.ndarray] = None):
@@ -859,6 +862,8 @@ class PathFinder:
         @return prims Optional[List[IRAdapterPrim]]: the prmitives in transformation
         """
         inc_dims, dec_dims = GridLayout.changed_dims(src_rvd, dst_rvd)
+        if len(inc_dims) == 0 and len(dec_dims) == 0:
+            inc_dims = [0]
         if not ((len(inc_dims) == 1 and len(dec_dims) == 0) or (len(inc_dims) == 0 and len(dec_dims) == 1)):
             return False, None, None
         inc_idx = inc_dims[0] if len(inc_dims) == 1 else None
