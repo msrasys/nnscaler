@@ -76,14 +76,22 @@ To solve this problem, current dynamic programming formulation need to be update
     - k pass recompute policy: reduce peak memory, increase execution time
     - coshard / chunk: split computation with extremly large output size into acceptable ones
 
-$f(i, max(p, r), q + s) = min (f(i, max(p, r), q + s), f(i-1, p, q) + t(r, s))$
+**dynamic formulation**
+
+$f(i, max(p, r), q + s) = min (f(i, max(p, r), q + s), f(i-1, p, q) + t(i, r, s))$
+
+- $f(i, p, q)$: the minimal execution time from 1st to i-th operator when maximum temporary tensor size = $p$ and the sum size of checkpointed tensor = $q$
+- $t(i, r, s)$: the minimal time of plans that schedule i-th operator when max temporary size = $r$ and checkpointed size = $s$. The space spanned by different checkpoint policies and chunk sizes is described in $t$.
+- the optimal value in the end: ${min}_{p+q<c} f(n, p, q)$, $c$ in the device's memory capacity
 
 TODO
 
-- try out del tensor in functions that to be recomputed -> offload problems to jit tensor compilers
-- strategy: detect memory constrained parts then coshard them
-- large enough size of input shapes amay lready utilize accelerators
-- should include coshard into the dp formulation
+- given a computation graph and a memory constraint, generate the most efficient execution plan
+  - can we leverage the jit compiler or the *del* operand in PyTorch
+  - better options: *nnfusion*, *xla*?
+- chunk (coshard)
+  - how to choose the chunk size: large enough size of input shapes may already utilize accelerators
+  - a heuristic strategy: detect the most memory-intensive operator then coshard it
 
 # Experiment
 
