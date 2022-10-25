@@ -67,7 +67,8 @@ class ExecutionPlan:
 
         Note changing the list content will not change the execution plan.
         """
-        assert devid in self._seq, f"device id {devid} not exists"
+        if devid not in self._seq:
+            return []
         return copy.copy(self._seq[devid])
 
     def at(self, devid: int) -> List[IRCell]:
@@ -76,7 +77,8 @@ class ExecutionPlan:
 
         Note changing the list content will change the execution plan.
         """
-        assert devid in self._seq, f"device id {devid} not exists"
+        if devid not in self._seq:
+            return []
         return self._seq[devid]
 
     def flatten(self, devid: int) -> List[IRCell]:
