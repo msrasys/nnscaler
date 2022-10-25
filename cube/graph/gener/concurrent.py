@@ -1,8 +1,9 @@
 """
 Concurrent producer / consumer Adapter Generator
 """
-from typing import List, Optional
+from typing import List, Optional, Dict
 import copy
+import numpy as np
 
 from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
 from cube.ir.adapter.prim import IRAdapterPrim
@@ -177,22 +178,25 @@ class ConcurrentGener:
         @return adapter IRAdapter
         """
         fprims = []
+        fpdevs = set(t.device[0] for t in fptensors)
+        fcomm_workload = {t.device[0]: 0 for t in fptensors}
         for ctensor in fctensors:
-            fprims += ConcurrentGener.gen_subtensor(ctensor, fptensors)
+            fprims += ConcurrentGener.gen_subtensor(ctensor, fptensors, fcomm_workload)
         fadapter = IRAdapter(fptensors,fctensors)
         fadapter.prims = fprims
         # backward
         if len(bptensors) > 0 and len(bctensors) > 0:
             bprims = []
+            bcomm_workload = {t.device[0]: 0 for t in bptensors}
             for cgrad in bctensors:
-                bprims += ConcurrentGener.gen_subtensor(cgrad, bptensors)
+                bprims += ConcurrentGener.gen_subtensor(cgrad, bptensors, bcomm_workload)
             badapter = IRAdapter(bptensors, bctensors)
             badapter.prims = bprims
             IRAdapter.make_pair(fadapter, badapter)
         return fadapter
 
     @staticmethod
-    def gen_subtensor(ctensor: IRSubTensor, ptensors: List[IRSubTensor]) -> List[IRAdapterPrim]:
+    def gen_subtensor(ctensor: IRSubTensor, ptensors: List[IRSubTensor], workload: Dict[int, int]) -> List[IRAdapterPrim]:
         """
         Generate communiction primitives for ctensor
         
@@ -203,11 +207,20 @@ class ConcurrentGener:
         """
         # category to local tensor and remote tensor
         local = [t for t in ptensors if t.device == ctensor.device]
-        remote = [t for t in ptensors if t.device != ctensor.device]
+        # reorder remote devices: higher priority to use tensor with lower communication workload
+        devices = np.array([devid for devid in workload.keys()], dtype=int)
+        volume = np.array([workload[devid] for devid in workload.keys()])
+        indices = np.argsort(volume)
+        sorted_devices = devices[list(indices)]
+        remote: List[IRSubTensor] = []
+        for devid in sorted_devices:
+            if devid == ctensor.device[0]: continue
+            remote += [t for t in ptensors if t.device[0] == devid]
+
         prims = []
 
         # ==== select ==== #
-        intersections = []
+        intersections: List[IRSubTensor] = []
         # check local
         for itensor in local+remote:
             if itensor.device == ctensor.device and itensor == ctensor:
@@ -249,6 +262,7 @@ class ConcurrentGener:
                 mtensor = copy.copy(tensor)
                 mtensor.cell = ctensor.cell
                 prims.append(MovePrim([tensor], [mtensor]))
+                workload[tensor.device[0]] += tensor.nelement()
             tmoved.append(mtensor)
 
         # ===== merge ===== #
