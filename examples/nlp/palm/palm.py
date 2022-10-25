@@ -1,7 +1,4 @@
-"""
-2 way branch:
-    OMP_NUM_THREADS=2 torchrun --nproc_per_node=2 --nnodes=1 palm.py
-"""
+from typing import List
 
 import torch
 import torch.nn.functional as F
@@ -9,7 +6,7 @@ from torch import nn, einsum
 
 from math import log2, floor
 
-from einops import rearrange, repeat
+# from einops import rearrange, repeat
 
 from cube.graph import IRGraph
 
@@ -18,8 +15,8 @@ from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
 from cube.ir.operator import IRDataOperation, IRFwOperation
 
-import examples.mlp.policy.spmd as spmd
-import examples.mlp.policy.mpmd as mpmd
+import examples.nlp.palm.policy.spmd as spmd
+import examples.nlp.palm.policy.mpmd as mpmd
 
 import argparse
 
@@ -140,6 +137,26 @@ def feedforward(x: torch.Tensor, proj1: torch.Tensor, proj2: torch.Tensor):
     return x
 
 
+@cube.graph.parser.register('N L^ E+, E+ F -> N L^ F', name='feedforward1')
+def feedforward1(x: torch.Tensor, proj: torch.Tensor):
+    return torch.nn.functional.silu(torch.matmul(x, proj))
+
+
+@cube.graph.parser.register('N L^ E+, E+ F -> N L^ F', name='feedforward2')
+def feedforward2(x: torch.Tensor, proj: torch.Tensor):
+    return torch.matmul(x, proj)
+
+
+@cube.graph.parser.register('N L^ E+, N L^ E+, E+ F -> N L^ F',
+                            name='feedforward3')
+def feedforward3(x: torch.Tensor, y: torch.Tensor, proj: torch.Tensor):
+    return torch.matmul(x * y, proj)
+
+@cube.graph.parser.register('* -> *, *', name='multi2ref')
+def multi2ref(x: torch.Tensor):
+    return (x, x)
+
+
 class PaLMLayer(nn.Module):
 
     def __init__(self, dim, dim_head=64, heads=8, ff_mult=4):
@@ -183,6 +200,52 @@ class PaLMLayer(nn.Module):
         return in_x + attn_out + ff_out
 
 
+class PaLMLayerV2(nn.Module):
+
+    def __init__(self, dim, dim_head=64, heads=8, ff_mult=4):
+        super().__init__()
+
+        self.dim, self.dim_head, self.heads, self.scale = dim, dim_head, heads, dim_head**-0.5
+
+        # TODO
+        # self.alibi_pos_biases = AlibiPositionalBias(heads=self.heads)
+        # self.norm = RMSNorm(dim)
+        self.norm = torch.nn.LayerNorm(self.dim)
+
+        self.qkv_proj = torch.nn.Parameter(torch.randn(dim, dim + dim_head))
+        self.attn_out_proj = torch.nn.Parameter(torch.randn(dim, dim))
+
+        self.ff_proj1 = torch.nn.Parameter(torch.randn(dim, ff_mult * dim))
+        self.ff_proj2 = torch.nn.Parameter(torch.randn(dim, ff_mult * dim))
+        self.ff_proj3 = torch.nn.Parameter(torch.randn(ff_mult * dim, dim))
+
+        # self.register_buffer("mask", None, persistent=False)
+
+    def get_mask(self, n, device):
+        if self.mask is not None and self.mask.shape[-1] >= n:
+            return self.mask[:n, :n]
+
+        mask = torch.triu(torch.ones((n, n), device=device, dtype=torch.bool),
+                          1)
+        self.register_buffer("mask", mask, persistent=False)
+        return mask
+
+    def forward(self, in_x):
+
+        in_x = cube.runtime.function.identity(in_x)
+        residual = in_x
+        # pre layernorm
+        x = self.norm(in_x)
+
+        attn_out = multi_head_attention(x, self.qkv_proj, self.attn_out_proj,
+                                        self.heads, self.scale)
+
+        ff1 = feedforward1(x, self.ff_proj1)
+        ff2 = feedforward2(x, self.ff_proj2)
+        ff_out = feedforward3(ff1, ff2, self.ff_proj3)
+
+        return attn_out + ff_out + residual
+
 class PaLM(nn.Module):
 
     def __init__(self,
@@ -196,7 +259,11 @@ class PaLM(nn.Module):
 
         self.net = nn.Sequential(
             nn.Embedding(num_tokens, dim),
-            *[PaLMLayer(dim, dim_head, heads, ff_mult) for _ in range(depth)],
+            # *[PaLMLayer(dim, dim_head, heads, ff_mult) for _ in range(depth)],
+            *[
+                PaLMLayerV2(dim, dim_head, heads, ff_mult)
+                for _ in range(depth)
+            ],
             torch.nn.LayerNorm(dim),
             nn.Linear(dim, num_tokens, bias=False),
         )
@@ -208,88 +275,9 @@ class PaLM(nn.Module):
         return self.net(x).mean()
 
 
-def PASSingle(graph: IRGraph, resource):
-    assert resource.ngpus == 1
-
-    for node in graph.nodes():
-        if isinstance(node, (IRDataOperation, IRFwOperation)):
-            graph.assign(node, 0)
-
-    return graph
-
-
-def PASData(graph: IRGraph, resource):
-    '''
-    2 way Data Parallel
-    '''
-    assert resource.ngpus == 2
-
-    for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            algo = node.algorithms('data')
-            sub_nodes = graph.partition(node, algo, num=resource.ngpus)
-            for idx, sub_node in enumerate(sub_nodes):
-                graph.assign(sub_node, idx)
-            batch_dim = node.get_batch_dims()[0]
-
-    for node in graph.nodes():
-        if isinstance(node, IRFwOperation):
-            algo = node.algorithms('dim')
-            sub_nodes = graph.partition(node,
-                                        algo,
-                                        idx=0,
-                                        dim=batch_dim,
-                                        num=resource.ngpus)
-            for idx, sub_node in enumerate(sub_nodes):
-                graph.assign(sub_node, idx)
-    return graph
-
-
-def PASBranch(graph: IRGraph, resource):
-    '''
-    2 way brach
-    '''
-    assert resource.ngpus == 2
-
-    for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            algo = node.algorithms('data')
-            sub_nodes = graph.partition(node, algo, num=resource.ngpus)
-            for idx, sub_node in enumerate(sub_nodes):
-                graph.assign(sub_node, idx)
-            batch_dim = node.get_batch_dims()[0]
-
-    for node in graph.nodes():
-        if isinstance(node, IRFwOperation):
-            print(node)
-            if node.name == 'embedding' or node.name == 'linear':
-                # data parallel
-                algo = node.algorithms('dim')
-                sub_nodes = graph.partition(node,
-                                            algo,
-                                            idx=0,
-                                            dim=batch_dim,
-                                            num=resource.ngpus)
-                for idx, sub_node in enumerate(sub_nodes):
-                    graph.assign(sub_node, idx)
-            elif node.name == 'layernorm' or node.name == 'multiref' or node.name == 'add' or node.name == 'mean':
-                # replicate
-                sub_nodes = graph.replicate(node, times=resource.ngpus)
-                for idx, sub_node in enumerate(sub_nodes):
-                    graph.assign(sub_node, idx)
-            elif node.name == 'feedforward':
-                graph.assign(node, 0)
-            elif node.name == 'multi_head_attention':
-                graph.assign(node, 1)
-            else:
-                assert False, node.name
-
-    return graph
-
-
 def train():
-    bs, n, dim = 8, 1024, 512
-    num_tokens, depth, heads, dim_head = 20000, 1, 8, 64
+    bs, n, dim = 5, 2048, 4096
+    num_tokens, depth, heads, dim_head = 20000, 1, 16, 256
 
     model = PaLM(dim, num_tokens, depth, heads=heads, dim_head=dim_head)
 
@@ -308,8 +296,11 @@ def train():
                                                     batch_dims=(0, ))
 
     # @cube.compile(model, dataloader, PAS=PASSingle)
+    # @cube.compile(model, dataloader, PAS=PASBranch)
     # @cube.compile(model, dataloader, PAS=PASData)
-    @cube.compile(model, dataloader, PAS=PASBranch)
+    # @cube.compile(model, dataloader, PAS=PASBranch3)
+    # @cube.compile(model, dataloader, PAS=spmd.PASMegatron)
+    @cube.compile(model, dataloader, PAS=mpmd.PASBranch5)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
