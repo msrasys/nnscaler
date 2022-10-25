@@ -74,6 +74,7 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
     CudaTimer().start(field_name='comm', predefined=True)
     rank = torch.distributed.get_rank()
     if rank == src:
+        tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
         assert torch.is_tensor(tensor)
         torch.distributed.send(tensor, dst)
     else:
@@ -214,19 +215,10 @@ def rdscatter(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
     if rank == src:
         with torch.no_grad():
             otensors = itensor.chunk(len(dsts), dim)
-        send_ops = []
-        for dst, otensor in zip(dsts, otensors):
-            if not otensor.is_contiguous():
-                otensor = otensor.contiguous()
-            send_op = torch.distributed.P2POp(
-                torch.distributed.isend, otensor, dst
-            )
-            send_ops.append(send_op)
-        reqs = torch.distributed.batch_isend_irecv(send_ops)
-        for req in reqs:
-            req.wait()
-        torch.cuda.synchronize()
-        CudaTimer().stop(field_name='comm', predefined=True)
+            for dst, otensor in zip(dsts, otensors):
+                otensor = otensor.contiguous() if not otensor.is_contiguous() else otensor
+                torch.distributed.send(otensor, dst)
+        otensor = itensor
     else:
         assert rank in dsts
         shape = list(shape)
@@ -235,15 +227,9 @@ def rdscatter(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
             shape, requires_grad=True, dtype=dtype,
             device=torch.cuda.current_device()
         )
-        recv_op = torch.distributed.P2POp(
-            torch.distributed.irecv, otensor, src
-        )
-        reqs = torch.distributed.batch_isend_irecv([recv_op])
-        for req in reqs:
-            req.wait()
-        torch.cuda.synchronize()
-        CudaTimer().stop(field_name='comm', predefined=True)
-        return otensor
+        torch.distributed.recv(otensor, src)
+    CudaTimer().stop(field_name='comm', predefined=True)
+    return otensor
 
 
 def rvscatter(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
@@ -271,37 +257,19 @@ def rdgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
     CudaTimer().start(field_name='comm', predefined=True)
     rank = torch.distributed.get_rank()
     if rank == dst:
-        recv_ops = []
         recv_tensors = []
         for src in srcs:
-            tensor = torch.empty(
-                shape, dtype=dtype,
-                device=torch.cuda.current_device()
-            )
-            recv_op = torch.distributed.P2POp(
-                torch.distributed.irecv, tensor, src
-            )
-            recv_ops.append(recv_op)
+            tensor = torch.empty(shape, dtype=dtype, device=torch.cuda.current_device())
+            torch.distributed.recv(tensor, src)
             recv_tensors.append(tensor)
-        reqs = torch.distributed.batch_isend_irecv(recv_ops)
-        for req in reqs:
-            req.wait()
-        torch.cuda.synchronize()
-        with torch.no_grad():
-            otensor = torch.cat(tuple(recv_tensors), dim=dim)
+        otensor = torch.cat(tuple(recv_tensors), dim=dim)
         otensor = otensor.requires_grad_()
-        CudaTimer().stop(field_name='comm', predefined=True)
-        return otensor
     else:
         assert rank in srcs
-        tensor = itensor.contiguous() if not itensor.is_contiguous() else itensor
-        send_ops = [torch.distributed.P2POp(torch.distributed.isend, tensor, dst)]
-        reqs = torch.distributed.batch_isend_irecv(send_ops)
-        for req in reqs:
-            req.wait()
-        torch.cuda.synchronize()
-        CudaTimer().stop(field_name='comm', predefined=True)
-        return itensor
+        otensor = itensor.contiguous() if not itensor.is_contiguous() else itensor
+        torch.distributed.send(otensor, dst)
+    CudaTimer().stop(field_name='comm', predefined=True)
+    return otensor
 
 
 def rvgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
