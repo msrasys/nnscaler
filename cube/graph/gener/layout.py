@@ -18,6 +18,7 @@ from cube.ir.adapter.prim import MovePrim           # p2p
 from cube.ir.adapter.prim import BroadcastPrim
 from cube.ir.adapter.prim import RDScatterPrim, RVScatterPrim
 from cube.ir.adapter.prim import RDGatherPrim, RVGatherPrim
+from cube.runtime.device import DeviceGroup
 
 
 TShape = Tuple[int, ...]
@@ -754,15 +755,19 @@ class PathFinder:
         #     print(f"{src} -> {nodes[idx]}: {' -> '.join([str(nodes[i]) for i in path])} | cost: {cost[idx]}")
         
         path = paths[nodes.index(dst)]
+        # print(f"Find path: {' -> '.join(str(nodes[i]) for i in path)}")
         assert len(path) > 0, f"Un-reachable src RVD ({src}) -> dst RVD ({dst})"
 
         # setup consumer begining devices
         cpaths = tuple(idx for idx in path if nodes[idx][0] == 'c')
-        cdevs = np.array([t.device[0] for t in olayout.mat.flatten()]).reshape(dst[1:])
+        curr_devs = np.array([t.device[0] for t in olayout.mat.flatten()]).reshape(dst[1:])
+        curr_node = dst[1:]
         # print('result device map:', list(cdevs.flatten()))
         for hop in cpaths[:-1][::-1]:
             hop_rvd = nodes[hop][1:]
-            cdevs = PathFinder.intra_devmap(dst[1:], hop_rvd, cdevs)
+            curr_devs = PathFinder.intra_devmap(curr_node, hop_rvd, curr_devs)
+            curr_node = hop_rvd
+        consumer_entry_devs = curr_devs
         # print('calculated consumer device map: ', list(cdevs.flatten()))
         # setup primitives for communication
         side, layouts, all_prims = 'p', [ilayout], []
@@ -774,7 +779,7 @@ class PathFinder:
                 ret, layout, prims = PathFinder.intra_transform(ftensor, curr_rvd, hop_rvd, layouts[-1])
                 assert ret, "Internal Error"
             else:
-                ret, layout, prims = PathFinder.inter_transform(ftensor, curr_rvd, hop_rvd, layouts[-1], cdevs)
+                ret, layout, prims = PathFinder.inter_transform(ftensor, curr_rvd, hop_rvd, layouts[-1], consumer_entry_devs)
             layouts.append(layout)
             all_prims += prims
             curr_rvd = hop_rvd
@@ -826,7 +831,7 @@ class PathFinder:
         """
         Infer device from source rvd to destination rvd
         """
-        assert tuple(src_rvd) == tuple(src_devs.shape)
+        assert tuple(src_rvd) == tuple(src_devs.shape), f"RVD mis-matches with device shape, {src_rvd} != {src_devs.shape}"
         # get changed dimensions
         inc_idx, dec_idx = GridLayout.changed_dims(src_rvd, dst_rvd)
         assert len(inc_idx) == 1 and len(dec_idx) == 1

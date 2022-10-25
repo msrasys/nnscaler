@@ -226,8 +226,11 @@ class ConcurrentGener:
                     end = start + e2 - s2
                     indmap.append((start, end))
                 indmap = IndexMap(tuple(indmap))
-                assert itensor.valmap == common.valmap, "Value map not same"
-                valmap = ValueMap((0, 1))
+                if itensor.valmap == common.valmap:
+                    valmap = ValueMap((0, 1))
+                else:
+                    assert itensor.valmap == (0, 1)
+                    valmap = common.valmap
                 select_prim = SelectPrim(itensor, indmap, valmap, common)
                 prims.append(select_prim)
             if itensor.device == ctensor.device and common == ctensor:
