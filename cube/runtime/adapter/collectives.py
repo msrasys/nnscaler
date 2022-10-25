@@ -57,14 +57,34 @@ def recv(tensors: List[torch.Tensor], shape: List[int], dtype: torch.dtype, src:
     return tensor
 
 
+# def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int):
+#     rank = torch.distributed.get_rank()
+#     if rank == src:
+#         assert torch.is_tensor(tensor)
+#         return send(tensor, dst)
+#     else:
+#         assert rank == dst
+#         return recv(None, shape, dtype, src)
+
+
 def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, src: int, dst: int):
+    """
+    Move a tensor from source device to destination device.
+    """
+    CudaTimer().start(field_name='comm', predefined=True)
     rank = torch.distributed.get_rank()
     if rank == src:
         assert torch.is_tensor(tensor)
-        return send(tensor, dst)
+        torch.distributed.send(tensor, dst)
     else:
         assert rank == dst
-        return recv(None, shape, dtype, src)
+        tensor = torch.empty(shape, dtype=dtype, 
+            device=torch.cuda.current_device(), requires_grad=True
+        )
+        torch.distributed.recv(tensor, src)
+    CudaTimer().stop(field_name='comm', predefined=True)
+    return tensor
+
 
 
 def sendrecv(input_tensors: List[torch.Tensor],
