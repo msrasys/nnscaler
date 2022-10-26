@@ -506,7 +506,7 @@ class GridLayout:
             indmap = []
             shape = []
             for dim, (nchunk, index) in enumerate(zip(dims, indices[1:])):
-                assert ftensor.shape[dim] % nchunk == 0, f"not dividable for {nchunk} chunks over dim {dim}"
+                assert ftensor.shape[dim] % nchunk == 0, f"not dividable for {nchunk} chunks over dim {dim}. ftensor shape: {ftensor.shape}"
                 csize = ftensor.shape[dim] // nchunk
                 start = csize * index
                 indmap.append((start, start+csize))
@@ -1001,10 +1001,13 @@ class PathFinder:
                             yield [i] + res
         
         for rvd in factors(ndevs, 2+len(ftensor.shape)):
+            skip = False
             for dimlen, pnum in zip(ftensor.shape, rvd[2:]):
                 if dimlen % pnum != 0:
-                    continue
-            all_layouts.append(tuple(rvd))
+                    skip = True
+                    break
+            if not skip:
+                all_layouts.append(tuple(rvd))
         return all_layouts
 
     @staticmethod
