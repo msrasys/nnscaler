@@ -109,6 +109,7 @@ class IRFwOperation(IRCell):
         """
         cpy = copy.copy(self)
         cpy._device = list()
+        cpy._id = self.cid
         # reset input and output
         cpy.reset_inputs(len(self.inputs()))
         for idx, input in enumerate(self.inputs()):
@@ -165,7 +166,7 @@ class IRBpOperation(IRCell):
         """
         cpy = copy.copy(self)
         cpy._device = list()
-        cpy._id = IDGenerator().gen_cell_id()
+        cpy._id = self.cid
         # reset input and output
         cpy.reset_inputs(len(self.inputs()))
         for idx, input in enumerate(self.inputs()):
@@ -200,7 +201,7 @@ class IRDataOperation(IRCell):
         """
         cpy = copy.copy(self)
         cpy._device = list()
-        cpy._id = IDGenerator().gen_cell_id()
+        cpy._id = self.cid
         # reset input and output
         cpy.reset_inputs(len(self.inputs()))
         for idx, input in enumerate(self.inputs()):

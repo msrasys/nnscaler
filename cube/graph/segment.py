@@ -353,7 +353,7 @@ class IRSegment(IRCell):
         if isinstance(fwop, IRFwOperation):
             bwop = IRBpOperation(ograds, igrads)
         else:
-            bnodes = [fnode.mirror for fnode in fwop.nodes() if fnode.mirror is not None]
+            bnodes = [fnode.mirror for fnode in fwop.nodes() if fnode.mirror is not None][::-1]
             bwop = IRSegment(bnodes, ograds, igrads)
         IRCell.make_pair(fwop, bwop)
         return bwop

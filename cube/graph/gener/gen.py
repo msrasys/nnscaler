@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import itertools
 
@@ -56,7 +56,7 @@ def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
         devices = [consumer.device for consumer in segment.consumers(tensor.parent)][::-1]
         if not isinstance(tensor, IRSubTensor): continue
         assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
-        fwop = DummyInputOuput(tensor, 0, is_output=True)
+        fwop = DummyInputOuput(tensor, 0, is_output=True, name=f'segment{segment.cid}_input')
         for devid in devices:
             fop = fwop.replicate()
             fop.device = devid
@@ -72,7 +72,7 @@ def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
         devices = [producer.device for producer in segment.producers(tensor.parent)]
         if not isinstance(tensor, IRSubTensor): continue
         assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
-        fwop = DummyInputOuput(tensor, 0, is_input=True)
+        fwop = DummyInputOuput(tensor, 0, is_input=True, name=f'segment{segment.cid}_output')
         for devid in devices:
             fop = fwop.replicate()
             fop.device = devid
@@ -181,57 +181,45 @@ class IRAdapterGener:
                     fgrads[fweight].append(wtensor.grad)
                     consumers[fweight].append(fnode)
         
-        # bucketing
+        nl = '\n'
         weights: Dict[IRFullTensor, Dict[IRSubTensor, List[int]]] = dict()
         for fweight in fweights.keys():
-            cids = set(fnode.cid for fnode in consumers[fweight])
-            nl = '\n'
-            # case 1: no replica
-            if len(cids) == len(consumers[fweight]):
-                weights[fweight] = dict()
-                for wtensor, consumer in zip(fweights[fweight], consumers[fweight]):
-                    if wtensor not in weights[fweight]:
-                        weights[fweight][wtensor] = set()
-                    weights[fweight][wtensor].add(consumer.device[0])
-            # case 2: replica but has same number of replicas and same/no-overlapping devices
-            else:
-                cid_fnodes = {cid : [n for n in consumers[fweight] if n.cid == cid] for cid in cids}
-                cid_nnodes = [len(ns) for ns in cid_fnodes.values()]
-                # same replica# for each cid
-                assert all(cid_nnodes[0] == ns for ns in cid_nnodes), (
+            weights[fweight] = {}
+            weight_grads: Dict[IRSubTensor, Dict[IRSubTensor, List[IRFwOperation]]] = {}
+            for weight, grad, consumer in zip(fweights[fweight], fgrads[fweight], consumers[fweight]):
+                if weight not in weight_grads:
+                    weight_grads[weight] = {}
+                if grad not in weight_grads[weight]:
+                    weight_grads[weight][grad] = []
+                weight_grads[weight][grad].append(consumer)
+            
+            # TODO: check sub_weight is no-overlapping
+
+            # assert all(sw.valmap[1] == len(weight_grads) for sw in weight_grads.keys())
+            for sub_weight in weight_grads:
+                diff_grads = weight_grads[sub_weight]
+                diff_grads_len = [len(diff_grads[grads]) for grads in diff_grads]
+                assert all(n == diff_grads_len[0] for n in diff_grads_len), (
                     f"If one of the weight consumers are replicated, "
                     f"other same-weight consumers should also replicated in same way."
                     f"FullTensor Weight: {fweight}\n"
                     f"Consumers:\n{nl.join([repr(node) for node in consumers[fweight]])}"
                 )
-                cid_devs = {cid: set(n.device[0] for n in consumers[fweight]) for cid in cids}
-                # case 2.1: same device sharing
-                first = list(cid_devs.keys())[0]
-                if all(cid_devs[first] == devs for devs in cid_devs.values()):
-                    #TODO: need to be more robust
-                    continue
-                # case 2.2: no-overlapping device sharing
-                all_devs = set()
-                for devs in cid_devs.values():
-                    all_devs.update(devs)
-                if sum(len(devs) for devs in cid_devs.values()) == len(all_devs):
-                    raise NotImplementedError(
-                        f"Weight is consumed by multiple different operators.\n"
-                        f"Replicating different operators on no-overlapping device group is not supported yet.\n"
-                        f"FullTensor Weight: {fweight}\n"
-                        f"Consumers:\n{nl.join([repr(node) for node in consumers[fweight]])}"
-                    )
-                else:
-                    raise NotImplementedError(
-                        f"Weight is consumed by multiple different operators.\n"
-                        f"Replicating different operators on partial-overlapping device group is not supported yet.\n"
-                        f"FullTensor Weight: {fweight}\n"
-                        f"Consumers:\n{nl.join([repr(node) for node in consumers[fweight]])}"
-                    )
+                # get devices
+                devices = []
+                for sub_grad in diff_grads:
+                    sub_grad_devices = [node.device[0] for node in diff_grads[sub_grad]]
+                    sub_grad_devices.sort()
+                    devices.append(sub_grad_devices)
+                devices = np.array(devices, dtype=int).transpose((1, 0))
+                for group_devices in devices:
+                    group_devices = set(int(devid) for devid in group_devices)
+                    group_devices = list(group_devices)
+                    group_devices.sort()
+                    weights[fweight][sub_weight] = group_devices
 
         reducers: Dict[Tuple[int], List[IRSubTensor]] = dict()
-        for ftensor, subtensors in weights.items():
-            # TODO: check no overlapping (not same) weights on a device
+        for subtensors in weights.values():
             for subw in subtensors:
                 if len(subtensors[subw]) == 1:
                     continue
