@@ -138,7 +138,9 @@ class CudaTimer:
         @return None
         """
         msg = list()
-        for field_name in self.instance.field_data:
+        names = list(self.instance.field_data.keys())
+        names.sort()
+        for field_name in names:
             span = self.duration(times, field_name)
             msg.append('{} : {:.2f} ms'.format(field_name, span))
         msg = ' | '.join(msg)
