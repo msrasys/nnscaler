@@ -734,10 +734,9 @@ class IRSubTensor(IRTensor):
             indmap.append((0, nele))
         sub_tensors = list()
         for idx in range(num):
-            valmap = self._valmap.map((idx, num))
             sub_tensor = self.select(
                 indmap=tuple(indmap),
-                valmap=valmap,
+                valmap=(idx, num),
             )
             sub_tensors.append(sub_tensor)
         return sub_tensors
