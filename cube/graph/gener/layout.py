@@ -713,6 +713,7 @@ class PathFinder:
         dst = ('c',) + (olayout.R, olayout.V) + tuple(olayout.D)
 
         if key in PathFinder._cached_inter_nodes and src in PathFinder._cached_inter_paths[key]:
+            nodes = PathFinder._cached_inter_nodes[key]
             paths = PathFinder._cached_inter_paths[key][src]
         else:
             if key in PathFinder._cached_inter_nodes:
