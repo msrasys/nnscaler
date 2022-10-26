@@ -25,7 +25,7 @@ class Schedule1F1B(ScheduleABC):
         for _ in range(num_warmup_microbatches):
             # recv forward
             # print(f'rank[{torch.distributed.get_rank()}]: line26: recving forward')
-            inputs = Schedule1F1B.adapter_step(rfadapter)
+            inputs = Schedule1F1B.adapter_step(rfadapter, True)
             inputs = Schedule1F1B.dataloader_step(dataloader) if len(inputs) == 0 else inputs
             # forward
             Schedule1F1B.push_tail('inputs', inputs)
@@ -39,11 +39,11 @@ class Schedule1F1B(ScheduleABC):
                 Schedule1F1B.push_tail('outputs', outputs)
             # send forward
             # print(f'rank[{torch.distributed.get_rank()}]: line40 send forward')
-            Schedule1F1B.adapter_step(sfadapter, *outputs)
+            Schedule1F1B.adapter_step(sfadapter, True, *outputs)
 
         if num_warmup_remaining > 0:
             # print(f'rank[{torch.distributed.get_rank()}]: line44 recv forward')
-            inputs = Schedule1F1B.adapter_step(rfadapter)
+            inputs = Schedule1F1B.adapter_step(rfadapter, True)
             inputs = Schedule1F1B.dataloader_step(dataloader) if len(inputs) == 0 else inputs
 
         # steady
@@ -61,7 +61,7 @@ class Schedule1F1B(ScheduleABC):
     
             # send forward recv backward
             # print(f'rank[{torch.distributed.get_rank()}]: line62 send forward recv backward')
-            grads = Schedule1F1B.exchange(sfadapter, rbadapter, stage_id, *outputs)
+            grads = Schedule1F1B.exchange(sfadapter, rbadapter, stage_id, (True, False), *outputs)
             grads = (None,) if len(grads) == 0 else grads
     
             # backward
@@ -75,19 +75,19 @@ class Schedule1F1B(ScheduleABC):
             # send backward recv forward
             if i != num_warmup_remaining - 1:
                 # print(f'rank[{torch.distributed.get_rank()}]: line77 send backward recv forward')
-                inputs = Schedule1F1B.exchange(sbadapter, rfadapter, stage_id, *input_grads)
+                inputs = Schedule1F1B.exchange(sbadapter, rfadapter, stage_id, (False, True), *input_grads)
                 inputs = Schedule1F1B.dataloader_step(dataloader) if len(inputs) == 0 else inputs
             else:
                 # send backward
                 # print(f'rank[{torch.distributed.get_rank()}]: line82 send backward')
-                Schedule1F1B.adapter_step(sbadapter, *input_grads)
+                Schedule1F1B.adapter_step(sbadapter, False, *input_grads)
 
         # cooldown
         for i in range(num_warmup_microbatches):
             inputs, outputs = Schedule1F1B.pop_head('inputs'), Schedule1F1B.pop_head('outputs')
             # recv backward
             # print(f'rank[{torch.distributed.get_rank()}]: line89 recv backward')
-            grads = Schedule1F1B.adapter_step(rbadapter)
+            grads = Schedule1F1B.adapter_step(rbadapter, False)
             grads = (None,) if len(grads) == 0 else grads
             # backward
             if recompute:
@@ -97,7 +97,7 @@ class Schedule1F1B(ScheduleABC):
             input_grads = Schedule1F1B.backward_step(inputs, outputs, grads)
             # send backward
             # print(f'rank[{torch.distributed.get_rank()}]: line99 send backward') 
-            Schedule1F1B.adapter_step(sbadapter, *input_grads)
+            Schedule1F1B.adapter_step(sbadapter, False, *input_grads)
         
         Schedule1F1B.assert_empty()
         # print(f'rank[{torch.distributed.get_rank()}]: ok here')

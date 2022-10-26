@@ -49,7 +49,7 @@ class ScheduleABC:
         return data
 
     @staticmethod
-    def adapter_step(adapter: Callable, *args):
+    def adapter_step(adapter: Callable, require_grad : bool = True, *args):
         """
         adapter pass
         """
@@ -59,20 +59,22 @@ class ScheduleABC:
         CudaTimer().stop('adapter')
         if not isinstance(outputs, tuple):
             outputs = (outputs,)
+        if require_grad:
+            outputs = tuple(t.requires_grad_() if torch.is_tensor(t) else t for t in outputs)
         return outputs
 
     @staticmethod
-    def exchange(sadapter: Callable, radapter: Callable, stage_id: int, *args):
+    def exchange(sadapter: Callable, radapter: Callable, stage_id: int, require_grads: bool, *args):
         """
         send adapter and recv adapter
         """
         # TODO: optimize with batch operators
         if stage_id % 2 == 0:
-            ScheduleABC.adapter_step(sadapter, *args)
-            outs = ScheduleABC.adapter_step(radapter)
+            ScheduleABC.adapter_step(sadapter, require_grads[0], *args)
+            outs = ScheduleABC.adapter_step(radapter, require_grads[1])
         else:
-            outs = ScheduleABC.adapter_step(radapter)
-            ScheduleABC.adapter_step(sadapter, *args)
+            outs = ScheduleABC.adapter_step(radapter, require_grads[1])
+            ScheduleABC.adapter_step(sadapter, require_grads[0], *args)
         return outs
 
     @staticmethod
