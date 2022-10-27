@@ -1,11 +1,10 @@
 from typing import Callable, Dict, List, Tuple, Optional
 import copy
 import numpy as np
-from regex import R
-from cube.ir.cten import IRCell
 
+from cube.ir.cten import IRCell
 from cube.ir.tensor import IRFullTensor, IRSubTensor
-from cube.ir.tensor import IndexMap, ValueMap
+from cube.ir.tensor import ValueMap
 
 from cube.ir.adapter.prim import IRAdapterPrim
 from cube.ir.adapter.prim import AllGatherPrim      # d2r
@@ -18,7 +17,6 @@ from cube.ir.adapter.prim import MovePrim           # p2p
 from cube.ir.adapter.prim import BroadcastPrim
 from cube.ir.adapter.prim import RDScatterPrim, RVScatterPrim
 from cube.ir.adapter.prim import RDGatherPrim, RVGatherPrim
-from cube.runtime.device import DeviceGroup
 
 
 TShape = Tuple[int, ...]
