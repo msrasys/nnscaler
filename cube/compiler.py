@@ -17,6 +17,7 @@ from cube.execplan.planpass.grouping import Grouping
 from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
 from cube.profiler.timer import print_each_rank
+from cube.runtime.device import DeviceGroup
 from cube.runtime.syndata import CubeDataLoader, SciLoopVariables
 
 from cube.program import Program, SemanticDataLoader, SemanticModel
@@ -70,13 +71,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
     model_graph = model.get_graph()
     ir_dataloader = SemanticDataLoader(dataloader)
 
-    if torch.distributed.is_initialized():
-        # multiple device
-        myrank = torch.distributed.get_rank()
-        local_rank = cube.runtime.device.DeviceGroup().local_rank
-    else:
-        # single device
-        myrank = local_rank = 0
+    myrank = DeviceGroup().rank
 
     def _load_tschedule_fn(filename) -> Callable:
         import importlib.util
@@ -101,7 +96,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             print_each_rank(f'loading existed schedule from {filename} ...')
             return _load_tschedule_fn(filename)
 
-        if local_rank == 0:
+        if DeviceGroup().local_rank == 0:
 
             compile_start = time.time()
 
@@ -171,15 +166,12 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             # execplan.graph.reset_dependency()
             # execplan.analyze(outfile='execplan.png')
 
-            if torch.distributed.is_initialized():
-                world_size = torch.distributed.get_world_size()
-            else:
-                world_size = 1
-
+            local_world_size = DeviceGroup().local_world_size
             # code generation
             mgener = ModelCodeGen(execplan)
             sgener = ScheduleCodeGen(execplan)
-            for rank in range(world_size):
+            for local_rank in range(local_world_size):
+                rank = DeviceGroup().node_rank * local_world_size + local_rank
                 fname = filename.format(rank)
                 # generate spatial module code
                 mgener.gen(rank, outfile=fname, attach=False)

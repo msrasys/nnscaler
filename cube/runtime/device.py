@@ -18,8 +18,9 @@ class DeviceGroup:
                 print(f"DeviceGroup init using single device mode...")
                 self.rank = 0
                 self.world_size = 1
+                self.local_world_size = 1
                 self.local_rank = 0
-                self.node_id = 0
+                self.node_rank = 0
                 self.groups = dict()
                 torch.cuda.set_device(0)
             else:
@@ -29,8 +30,9 @@ class DeviceGroup:
                 self.rank = torch.distributed.get_rank()
                 self.world_size = torch.distributed.get_world_size()
                 # assume each node has the same device number
+                self.local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE'))
                 self.local_rank = int(os.environ.get('LOCAL_RANK'))
-                self.node_id = self.rank // torch.cuda.device_count()
+                self.node_rank = int(os.environ.get('GROUP_RANK'))
                 self.groups = dict()
                 torch.cuda.set_device(self.local_rank)
 
