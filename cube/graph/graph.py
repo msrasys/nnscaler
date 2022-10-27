@@ -8,6 +8,7 @@ IRGraph:
 """
 
 from typing import Union, Tuple, List, Optional, Dict
+from cube.graph.function.anchor import IRGraphAnchor
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.ir.unique import IDGenerator
@@ -750,6 +751,12 @@ class IRGraph(IRSegment):
                 "Cross-segment recompute is not allowed yet"
             recompute_group_id: int = IDGenerator().gen_cell_id()
             for fnode in nodes:
+                if isinstance(fnode, IRGraphAnchor):
+                    continue
+                # pytorch limitation
+                if all(not t.requires_grad for t in fnode.inputs() if isinstance(t, IRSubTensor) and (not t.is_attr())):
+                    print(f"skipping recompute node: {fnode}\n\tbecause all its input tensors doesn't require grad.")
+                    continue
                 fnode.recompute = recompute_group_id
     
         return True

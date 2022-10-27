@@ -99,7 +99,7 @@ class DimSplitEinops(GenericDistAlgo):
         else:
             adim, reduce = 'Value', None
         color, default = '\033[32m' if satisfy else '\033[31m', '\033[0m'
-        print(f"try split {node.name}: {node.anno} | dim: {adim} reduce: {reduce} ... {color}{'Success' if satisfy else 'Failed!'}{default}")
+        print(f"split {node.name}: {node.anno} | dim: {adim} num: {num} reduce: {reduce} ... {color}{'Success' if satisfy else 'Failed!'}{default}")
         if not satisfy: return None
 
         rule: TransformRule = self.infer(idx, dim, num)

@@ -124,9 +124,7 @@ class SemanticModel:
         """
         Create semantic model based on AI Scientist description.
         """
-        local_rank = 0
-        if torch.distributed.is_initialized():
-            local_rank = DeviceGroup().local_rank
+        local_rank = DeviceGroup().local_rank
         if local_rank == 0:
             self.ir_graph = parser.convert_model(
                 model, input_shapes=input_shapes
