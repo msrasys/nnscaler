@@ -34,6 +34,8 @@ class ScriptNodeKind(enum.Enum):
 
 class ScriptModuleParser:
 
+    save_content: bool = True
+
     @staticmethod
     def parse_module(module,
                      input_shapes: Optional[ Tuple[List[int],] ] = None,
@@ -95,7 +97,8 @@ class ScriptModuleParser:
 
         frame.pop_var()
         frame.pop_attr()
-        frame.save_attr_content()
+        if ScriptModuleParser.save_content:
+            frame.save_attr_content()
         return input_val, all_ir_nodes, output_val
 
     @staticmethod

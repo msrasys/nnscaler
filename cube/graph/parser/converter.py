@@ -7,7 +7,8 @@ from cube.graph import IRGraph
 import torch
 
 def convert_model(model: torch.nn.Module,
-            input_shapes: Optional[ List[List[int],] ] = None) -> IRGraph:
+                  input_shapes: Optional[ List[List[int],] ] = None,
+                  save_content: bool = True) -> IRGraph:
     """
     Convert toch.nn.Module based model into IRGraph
     """
@@ -17,6 +18,7 @@ def convert_model(model: torch.nn.Module,
         print(ex)
         raise RuntimeError("Cannot convert module into torchscript moudle.")
     module_name = smodule.original_name
+    ScriptModuleParser.save_content = save_content
     inputs, nodes, outputs = ScriptModuleParser.parse_module(smodule, input_shapes)
     for input in inputs:
         if isinstance(input, IRFullTensor):

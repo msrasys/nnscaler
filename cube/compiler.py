@@ -18,7 +18,7 @@ from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
 
 from cube.profiler.timer import print_each_rank
 from cube.runtime.device import DeviceGroup
-from cube.runtime.syndata import CubeDataLoader, SciLoopVariables
+from cube.runtime.syndata import CubeDataLoader
 
 from cube.program import Program, SemanticDataLoader, SemanticModel
 
@@ -68,7 +68,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
     if callable(PAS):
         PAS = (PAS,)
 
-    model_graph = model.get_graph()
+    model.save_content = load_content
     ir_dataloader = SemanticDataLoader(dataloader)
 
     myrank = DeviceGroup().rank
@@ -103,7 +103,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             resource = cube.runtime.resource.EnvResource()
 
             # run once to get model structure and tensor shape
-            outputs = fn(model_graph, ir_dataloader)
+            outputs = fn(model, ir_dataloader)
             Program().finalize()
             if outputs is None:
                 outputs = []
@@ -191,7 +191,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
         # load module
         filename = filename.format(myrank)
         print_each_rank(f'loading generated module from {filename} ...')
-        model.load_module(filename, load_content=load_content)
+        model.load_module(filename)
 
         if torch.distributed.is_initialized():
             torch.distributed.barrier()

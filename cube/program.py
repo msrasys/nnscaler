@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from cube.graph.torch_dtype_mapping import DType2IRDType
 
 from cube.ir.cten import IRCell, IRTensor
@@ -120,41 +120,66 @@ class SemanticDataLoader:
 
 class SemanticModel:
 
-    def __init__(self, model: torch.nn.Module, input_shapes):
+    def __init__(self, model: Optional[torch.nn.Module], input_shapes=None):
         """
         Create semantic model based on AI Scientist description.
+
+        @param model Optional[torch.nn.Module]: Model description. Each device of local_rank == 0 needs to provide.
+        @param input_shapes Any: to compatable with previous interface. No more need.
         """
-        local_rank = DeviceGroup().local_rank
-        if local_rank == 0:
-            self.ir_graph = parser.convert_model(
-                model, input_shapes=input_shapes
-            )
-        else:
-            self.ir_graph = None
+        if DeviceGroup().local_rank == 0:
+            assert isinstance(model, torch.nn.Module), f"device of local_rank == 0 must provide model"
+        self.model = model
+        self.input_shapes = None
+        self.ir_graph = None
         self._loaded_module: CubeModule = None
+        self._save_content = True
+
+    @property
+    def save_content(self) -> bool:
+        return self._save_content
+    
+    @save_content.setter
+    def save_content(self, val: bool):
+        self._save_content = val
 
     def get_graph(self):
         return self.ir_graph
 
-    def load_module(self, filename: str, load_content=True):
+    def load_module(self, filename: str):
         import importlib.util
         spec = importlib.util.spec_from_file_location("GenModel", filename)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self._loaded_module = module.GenModel().cuda()
-        if load_content:
+        if self.save_content:
             print_each_rank("> loading parameter content...")
             # TODO: make hardcode ./fullmodel.pt programmable
             self._loaded_module.load_attr_content('./fullmodel.pt')
 
-    def get_gen_module(self):
+    def get_gen_module(self) -> Optional[torch.nn.Module]:
         return self._loaded_module
 
     def clear_module(self):
         self._loaded_module = None
 
     def __call__(self, *args):
+        """
+        Forward the model.
+        This will trigger torch.jit.script to parse the model.
+        """
         if self._loaded_module:
             return self._loaded_module(*args)
         else:
+            assert all(isinstance(t, IRSubTensor) for t in args), f"Only support tensors as model inputs"
+            input_shapes = [tuple(t.shape) for t in args]
+            if DeviceGroup().local_rank == 0:
+                if self.ir_graph is None:
+                    self.ir_graph = parser.convert_model(
+                        self.model, input_shapes=input_shapes, save_content=self.save_content
+                    )
+                    self.input_shapes = input_shapes
+                else:
+                    assert tuple(self.input_shapes) == tuple(input_shapes), \
+                        f"Multiple forwarding of a same model, which require input shapes to be same."
             return self.ir_graph(*args)
