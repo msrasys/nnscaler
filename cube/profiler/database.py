@@ -7,11 +7,15 @@ import torch
 import time
 import os
 import json
+from collections import deque
 
 import cube
 from cube.ir.cten import IRTensor
 from cube.ir.operator import IRFwOperation
 from cube.graph.parser.mapping import Sign2Op, IRDType2TorchDType
+from cube.ir.tensor import IRSubTensor
+from cube.graph.function import DimAnno
+import copy
 
 
 Shapes = NewType('Shapes', Tuple[Tuple[int]])
@@ -298,3 +302,77 @@ class ProfileDataBase:
                 data.append(f'{signature}: shapes={shapes}, dtypes={dtypes}, fw span: {fw_span} ms, bw span: {bw_span} ms, mem {mem} bytes')
         data = '\n'.join(data)
         return data
+
+
+def collect_split_info(node: IRFwOperation):
+    # TODO(yizhu1): workaround
+    split_batch_ops = {}
+    
+    anno = node.anno
+
+    split_info = {}
+
+    for idx_shape, shape_anno in enumerate(anno.inputs()):
+        if not isinstance(node.inputs()[idx_shape], IRSubTensor):
+            continue
+        for idx_dim, dim_anno in enumerate(shape_anno.dims):
+            for idx_id, identifier in enumerate(dim_anno.identifiers):
+                if dim_anno.reduces[idx_id] == DimAnno.ReduceType.Freeze:
+                    continue
+                if identifier in split_info:
+                    split_info[identifier].append((idx_shape, idx_dim, idx_id))
+                else:
+                    split_info[identifier] = [(idx_shape, idx_dim, idx_id)]
+
+    if node.signature in split_batch_ops:
+        for key, val in split_info.items():
+            if (0, 0, 0) in val:
+                return {key: val}
+        assert False
+    else:
+        return split_info
+
+def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
+    split_info = collect_split_info(node)
+
+    def gen_hash(node: IRFwOperation) -> str:
+        ret = node.signature
+        for it in node.inputs():
+            ret = ret + '-' + str(it.shape)
+        return ret
+
+    dq = deque()
+    visited = set()
+    dq.append((node, ngpus))
+    visited.add(gen_hash(node))
+
+    gen_nodes = []
+
+    while dq:
+        cur_node, cur_ngpus = dq.popleft()
+        gen_nodes.append(cur_node)
+
+        for key, val in split_info.items():
+            idx_1st, dim_1st, _ = val[0]
+            dim_size = cur_node.inputs()[idx_1st].shape[dim_1st]
+
+            # TODO(yizhu1): only consider powers of 2 currently
+            split_deg = 2
+            while split_deg <= dim_size and split_deg <= cur_ngpus:
+                if dim_size % split_deg != 0:
+                    break
+
+                new_node = cur_node.algorithms('dim').instantiate(idx=idx_1st, dim=dim_1st, num=split_deg)[0]
+                new_ngpus = cur_ngpus // split_deg
+
+                cur_key = gen_hash(new_node)
+
+                split_deg = split_deg * 2
+
+                if cur_key in visited:
+                    continue
+                
+                dq.append((new_node, new_ngpus))
+                visited.add(cur_key)
+    
+    return gen_nodes 
