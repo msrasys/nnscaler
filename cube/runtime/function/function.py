@@ -86,6 +86,15 @@ def embedding(input: torch.Tensor, weight: torch.Tensor, padding_idx: Optional[i
     return output
 
 
+def layer_norm(input: torch.Tensor,
+               weight: Optional[torch.Tensor], bias: Optional[torch.Tensor],
+               normalized_shape: List[int], eps: float = 1e-05) -> torch.Tensor:
+    """
+    LayerNorm
+    """
+    return torch.nn.functional.layer_norm(input, normalized_shape, weight, bias, eps)
+
+
 # 'torch.select_scatter' isn't supported by Torch2ONNX yet.
 # Implement it with 'torch.masked_scatter' which is supported with ONNX opset=11.
 def select_scatter(input:torch.Tensor, src:torch.Tensor, dim:int, index:int):

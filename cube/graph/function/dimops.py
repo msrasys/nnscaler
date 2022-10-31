@@ -276,8 +276,8 @@ class ShapeAnno:
         e.g., ['a+', 'b+', 'c+']
 
         @param shape List[int]: tensor shape
+        @param reduction (str): reduction type must be in '', '+' or '^'
         @param iterator Optional[Iterable]: identity iterators. If None, use string.ascii_lowercase
-        @param reduce (str): reduction type must be in '', '+' or '^'
 
         @return strs List[str]: each element in strs represents a dimension
         """

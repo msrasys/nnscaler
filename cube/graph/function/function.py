@@ -431,15 +431,43 @@ def Dropout(signature, inputs):
 
 
 def LayerNorm(signature, inputs):
-    input, normalized_shape, weight, bias, eps = inputs
-    if len(normalized_shape) != 1:
-        raise NotImplementedError("Only support normalized_shape to be int")
-    annos = [
-        f'N *, ?, {normalized_shape[0]}, {normalized_shape[0]} -> N *',
-        f'N *, ?, ?, ? -> N *'
-    ]
-    return IRDimops(LayerNorm, 'layernorm', signature, annos, [input, normalized_shape, weight, bias],
-                    eps=eps)
+    """
+    torch.nn.functional.layer_norm(input, normliazed_shape, weight=None, bias=None, eps)
+    cube.runtime.function.layer_norm(input, weight, bias, normliazed_shape, eps)
+    """
+    if 'torch.' in signature:
+        tensor, normalized_shape, weight, bias, eps = inputs
+        assert isinstance(normalized_shape, list), f"normalized_shape for layer_norm can only be List[int]"
+    else:
+        tensor, weight, bias, normalized_shape, eps = inputs
+    letters = iter(string.ascii_lowercase)
+    einput = ShapeAnno.create_shape_str(tensor.shape, iterator=letters)
+    eoutput = copy.copy(einput)
+    ndims = len(tensor.shape)
+    for dim in range(len(normalized_shape)):
+        einput[ndims-1-dim] += '^'
+        eoutput[ndims-1-dim] += '^'
+    assert not (bias is None is weight is not None), f"Not support for None of weight and parameter of bias"
+    einputs, inputs = [einput], [tensor]
+    kwargs = {}
+    if weight is not None:
+        eweight = ShapeAnno.create_shape_str(weight.shape, reduction='^', iterator=letters)
+        einputs.append(eweight)
+        inputs.append(weight)
+    else:
+        kwargs['weight'] = weight
+    if bias is not None:
+        ebias = ShapeAnno.create_shape_str(bias.shape, reduction='^', iterator=letters)
+        einputs.append(ebias)
+        inputs.append(bias)
+    else:
+        kwargs['bias'] = bias
+    anno = OpAnno.create_op_str(einputs, [eoutput])
+    kwargs['normalized_shape'] = normalized_shape
+    kwargs['eps'] = eps
+    signature = 'cube.runtime.function.layer_norm'
+    print(anno)
+    return IRDimops(LayerNorm, 'layernorm', signature, [anno], inputs, **kwargs)
 
 
 def Sum(signature, inputs):
