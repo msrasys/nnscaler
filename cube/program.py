@@ -1,5 +1,4 @@
 from typing import List, Tuple, Optional
-from cube.graph.torch_dtype_mapping import DType2IRDType
 
 from cube.ir.cten import IRCell, IRTensor
 from cube.ir.tensor import IRFullTensor, IRSubTensor
@@ -7,6 +6,7 @@ from cube.ir.operator import IRBpOperation, IRDataOperation
 
 from cube.graph import IRGraph
 from cube.graph import parser
+from cube.graph.parser.mapping import DType2IRDType
 
 from cube.runtime.syndata import CubeDataLoader
 from cube.runtime.module import CubeModule

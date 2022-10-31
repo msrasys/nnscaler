@@ -2,18 +2,22 @@
 Usage:
     python -m cube.profiler.database --export ./profile.dat.json
 """
-
-from typing import Callable, Tuple, Union, Optional, Dict, NewType
+from typing import Callable, Tuple, Union, Optional, Dict, NewType, List
 import torch
 import time
 import os
 import json
 
+import cube
+from cube.ir.cten import IRTensor
+from cube.ir.operator import IRFwOperation
+from cube.graph.parser.mapping import Sign2Op, IRDType2TorchDType
+
 
 Shapes = NewType('Shapes', Tuple[Tuple[int]])
 DTypes = NewType('DTypes', Tuple[torch.dtype])
 ShapesDTypes = NewType('ShapesDTypes', Tuple[Shapes, DTypes])
-NameOrFunc = NewType('NameOrFunc', Union[str, Callable])
+NameOrFunc = Union[str, Callable]
 
 
 class CompProfiler:
@@ -99,31 +103,59 @@ class ProfileDataBase:
         Create a database for profiling result
         """
 
-        self._data: Dict[str, Dict[str, float]] = dict()
+        self._data: Dict[str, Dict[str, Tuple[float, float, int]]] = dict()
         if filename is not None:
             self.load(filename)
 
-    def profile(self, func: Callable, shapes: Shapes, dtypes: DTypes, **kwargs):
-        """!
-        Profile the function and log into the database
-
-        @param func Callable: the callable function, e.g., torch.nn.functional.linear
-        @param shapes Tuple[Tuple[int]]: the shapes of each input tensor
-        @param dtypes Optional[Tuple[torch.dtype]]: the dtype of each input tensor. Default will use torch.float32
-        @param backward bool: whether profile backward times. Default true.
-        @param kwargs Dict: other keyword argument for func call.
+    @staticmethod
+    def get_func(node: IRFwOperation) -> Tuple[Callable, Shapes, DTypes, Dict]:
         """
-        try:
-            assert callable(func), "func should be callable"
-            fw_span, bw_span, memory = CompProfiler.profile(func, shapes, dtypes, **kwargs)
-            name = func.__name__
-            key = self.serialize(shapes, dtypes)
-            self.log(name, key, fw_span, bw_span, memory)
-            print(f'profiled {func.__name__} | shapes: {shapes} | dtypes: {dtypes} => fw: {round(fw_span, 2)} ms | bw: {round(bw_span, 2)} | mem: {memory}')
-        except Exception as e:
-            print(f'fail to profile {func.__name__}: reason: {str(e)}')
+        Get function call and its arguments from a cude IRGraph node
+        """
+        assert isinstance(node, IRFwOperation), f"Only support profiling forward operation but got {type(node)}"
+        if node.signature in Sign2Op.kOpCodeDef:
+            code_impl: str = Sign2Op.kOpCodeDef[node.signature]
+            local = {}
+            exec(code_impl, globals(), local)
+            fn = list(local.values())[0]
+        else:
+            fn = eval(node.signature)
+        shapes, dtypes = [], []
+        for t in node.inputs():
+            assert isinstance(t, IRTensor), f"Only support node inputs with tensor shape"
+            shapes.append(t.shape)
+            dtypes.append(IRDType2TorchDType.map(t.dtype))
+        return fn, shapes, dtypes, node.kwargs
 
-    def log(self, name: str, key: str, fw_span: float, bw_span: float, memory: float):
+    def profile(self, node: IRFwOperation, device: Optional[int] = None):
+        """
+        Profile a forward node in IRGraph on a specific device (default current device)
+        
+        @param node IRFwOperation: node of IRGraph
+        @param device int: the node
+
+        @return fw_span float: forward span in milliseconds
+        @return bw_span float: backward span in milliseconds
+        @return mem int: peak memory consumpiton of forward + backward procedure.
+        """
+        fn, shapes, dtypes, kwargs = ProfileDataBase.get_func(node)
+
+        if isinstance(device, int):
+            orig_device = torch.cuda.current_device()
+            torch.cuda.set_device(device)
+        
+        # run profiling
+        fw_span, bw_span, memory = CompProfiler.profile(fn, shapes, dtypes, **kwargs)
+        # log to database
+        key = self._serialize(node)
+        self.insert(node.signature, key, fw_span, bw_span, memory)
+        print(f'profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} => fw: {round(fw_span, 2)} ms | bw: {round(bw_span, 2)} | mem: {memory}')
+
+        if isinstance(device, int):
+            torch.cuda.set_device(orig_device)
+        return fw_span, bw_span, memory
+
+    def insert(self, name: str, key: str, fw_span: float, bw_span: float, memory: float):
         """
         log the span of a function name with key 
         """
@@ -132,86 +164,94 @@ class ProfileDataBase:
             self._data[name] = dict()
         self._data[name][key] = (fw_span, bw_span, memory)
 
-    def query(self, func: NameOrFunc, shapes: Shapes, dtypes: DTypes) -> float:
-        """!
-        Get the performance number of the function name and its key
-
-        @param name str: function name
-        @param shapes Tuple[Tuple[int]]: the shape of each input tensor
-        @param dtypes Tuple[torch.dtype]: the dtype of each tensor
-
-        @return (fw_span, bw_span, mem) (float, float, int): the performance number
+    def exist(self, node: IRFwOperation) -> bool:
         """
-        name = func if isinstance(func, str) else func.__name__
-        key = self.serialize(shapes, dtypes)
-        return self._data[name][key]
+        Check if the node has the performance recorded in the database
 
-    def exist_item(self, func: NameOrFunc, shapes: Shapes, dtypes: DTypes) -> bool:
-        """!
-        Check if the required data exists
+        @param node IRFwOperation: forward operation
 
-        @param name Union[str, Callable]: function name
-        @param shapes Tuple[Tuple[int]]: the shape of each input tensor
-        @param dtypes Tuple[torch.dtype]: the dtype of each tensor
-
-        @return exist bool: True if the item exists else False
+        @return exist bool: True if the performance is recorded, else False
         """
-        name = func if isinstance(func, str) else func.__name__
-        if name not in self._data:
+        key = self._serialize(node)
+        if node.signature not in self._data:
             return False
-        key = self.serialize(self, shapes, dtypes)
-        if key not in self._data[key]:
+        if key not in self._data[node.signature]:
             return False
         return True
 
-    def exist_func(self, func: NameOrFunc) -> bool:
+    def query(self, node: IRFwOperation) -> float:
         """!
-        Check if the required function exists
+        Get the performance number of a node in IRGraph
 
-        @param name Union[str, Callable]: function name
+        @param node IRFwOperation: node in IRGraph
 
-        @return exist bool: True if the function exists else False
+        @return fw_span float: forward span in milliseconds
+        @return bw_span float: backward span in milliseconds
+        @return mem int: peak memory consumpiton of forward + backward procedure.
         """
-        name = func if isinstance(func, str) else func.__name__
-        return name in self._data
+        key = self._serialize(node)
+        if node.signature not in self._data:
+            return None
+        if key not in self._data[node.signature]:
+            return None
+        return self._data[node.signature][key]
 
-    def shapes_and_dtypes(self, func: NameOrFunc) -> Tuple[ShapesDTypes]:
+    def query_func(self, signature, shapes, dtypes):
         """
-        Get recorded shapes and dtypes of the func.
+        Get performance number of given name (signature), shapes and dtypes
+        
+        @param signature str: function signature
+        @param shapes Tuple[Tuple[int]]: the shape of each input tensor
+        @param dtypes Tuple[torch.dtype]: the dtype of each tensor
 
-        @param func UnShapesDTypesion[str, Callable]: function name
-
-        @return shapes_and_dtypes Tuple[ShapesDTyptes]
+        @return fw_span float: forward span in milliseconds
+        @return bw_span float: backward span in milliseconds
+        @return mem int: peak memory consumpiton of forward + backward procedure.
         """
-        name = func if isinstance(func, str) else func.__name__
-        rets = []
-        for shapes_dtypes_str in self._data[name].keys():
-            (shapes, dtypes) = self.deserialize(shapes_dtypes_str)
-            rets.append((shapes, dtypes))
-        return tuple(rets)
+        key = self._serialize(shapes, dtypes)
+        if signature not in self._data:
+            return None
+        if key not in self._data[signature]:
+            return None
+        return self._data[signature][key]
 
-    def serialize(self, shapes: Shapes, dtypes: DTypes) -> str:
+    def query_args(self, signature: str) -> Tuple[List[Shapes], List[DTypes]]:
+        """
+        Get the recorded shapes and dtypes of 
+        """
+        item_shapes, item_dtypes = [], []
+        if signature not in self._data:
+            return item_shapes, item_dtypes
+        for shapes_dtypes_str in self._data[torch.signature].keys():
+            shapes, dtypes = self._deserialize(shapes_dtypes_str)
+            item_shapes.append(shapes)
+            item_dtypes.append(dtypes)
+        return item_shapes, item_dtypes
+
+    def _serialize(self, node: IRFwOperation) -> str:
         """
         Serialize the shapes, dtypes and kwargs into a string
 
         e.g.,
             shapes: ((1024,), (1024,1024))
             dtypes: (torch.float32, torch.float32)
-        => (1024,)-(1024,1024)=torch.float32-torch.float32
+        => (1024,)-(1024,1024) : torch.float32-torch.float32
 
         @param shapes Tuple[Tuple[int]]: the shape of each tensor
         @param dtypes Tuple[torch.dtype]: the dtype of each tensor
 
         @return key str: the serialized string
         """
+        shapes, dtypes = [], []
+        for t in node.inputs():
+            assert isinstance(t, IRTensor), f"Only support node inputs with tensor shape"
+            shapes.append(t.shape)
+            dtypes.append(IRDType2TorchDType.map(t.dtype))
         shapes = '-'.join(str(tuple(shape)) for shape in shapes)
-        if dtypes is not None:
-            dtypes = '-'.join(str(dtype) for dtype in dtypes)
-        else:
-            dtypes = '-'.join([str(torch.float32)] * len(shapes))
-        return shapes + '=' + dtypes
+        dtypes = '-'.join(str(dtype) for dtype in dtypes)
+        return shapes + ' : ' + dtypes
 
-    def deserialize(self, key: str) -> ShapesDTypes:
+    def _deserialize(self, key: str) -> ShapesDTypes:
         """
         De-serialize the key string to shapes and dtypes
 
@@ -222,8 +262,7 @@ class ProfileDataBase:
         @param key str: the serialized string
         @return shapes_and_dtypes ShapesDTypes: shapes and dtypes
         """
-        shapes, dtypes = key.split('=')
-        print(shapes)
+        shapes, dtypes = key.split(' : ')
         shapes = tuple(eval(shape) for shape in shapes.split('-'))
         dtypes = tuple(eval(dtype) for dtype in dtypes.split('-'))
         return shapes, dtypes
@@ -250,45 +289,12 @@ class ProfileDataBase:
         with open(file, 'r') as f:
             self._data = json.load(f)
 
-
-if __name__ == '__main__':
-
-    import argparse
-    parser = argparse.ArgumentParser(description='database')
-    parser.add_argument('--export', type=str, default='./profile.dat.json',
-                        help='saved profiling database')
-    args = parser.parse_args()
-
-    db = ProfileDataBase()
-    
-    # profile
-    dtype = torch.float32
-    # func: [
-    #   [shapes, dtypes, kwargs],
-    # ]
-    funcs = {
-        torch.nn.functional.gelu: [
-            [((1024, 8, 2304),), (dtype,), {}]
-        ],
-
-        torch.nn.functional.linear: [
-            [([1024, 1, 2304], [2304, 2304]), (dtype, dtype), {}],
-            [([1024, 4, 2304], [2304, 2304]), (dtype, dtype), {}],
-            [([1024, 8, 2304], [2304, 2304]), (dtype, dtype), {}]
-        ],
-    
-        torch.nn.functional.softmax: [
-            [((1024, 8, 2304),), (dtype,), dict(dim=-1)]
-        ]
-    }
-    
-    for func, keys in funcs.items():
-        for shapes, dtypes, kwargs in keys:
-            db.profile(func, shapes, dtypes, **kwargs)
-    
-    db.dump(args.export, override=True)
-
-    # db = ProfileDataBase(args.export)
-    # for shapes, dtypes in db.shapes_and_dtypes(torch.nn.functional.linear):
-    #     span = db.query(torch.nn.functional.linear, shapes, dtypes)
-    #     print(f'logged shapes: {shapes}, dtypes: {dtypes} => span: {span} ms')
+    def __repr__(self) -> str:
+        data = []
+        for signature in self._data:
+            for key in self._data[signature]:
+                shapes, dtypes = self._deserialize(key)
+                fw_span, bw_span, mem = self._data[signature][key]
+                data.append(f'{signature}: shapes={shapes}, dtypes={dtypes}, fw span: {fw_span} ms, bw span: {bw_span} ms, mem {mem} bytes')
+        data = '\n'.join(data)
+        return data

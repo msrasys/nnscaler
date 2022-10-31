@@ -1,2 +1,2 @@
 from cube.profiler.timer import CudaTimer
-from cube.profiler.estimator import Estimator
+from cube.profiler.database import ProfileDataBase

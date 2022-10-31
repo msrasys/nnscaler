@@ -6,12 +6,11 @@ from typing import Any, Callable, List, Optional
 import inspect
 import torch
 
-from cube.graph.function.dimops import IRDimops, OpAnno, TransformRule
-
+from cube.graph.function.dimops import IRDimops, OpAnno
 from cube.graph.parser.mapping import Sign2Op
 
 
-def register(anno: str, name: Optional[str] = None, rules: Optional[List[TransformRule]] = None):
+def register(anno: str, name: Optional[str] = None, rules: Optional[List] = None):
     """
     Register a function with einop annotations.
 
@@ -30,6 +29,12 @@ def register(anno: str, name: Optional[str] = None, rules: Optional[List[Transfo
 
     Note: for Optional[torch.Tensor] type, user should annotate the
     dimension when the input is not None.
+
+    @param anno str: operator annotation
+    @param name str: operator name
+    @param rules Optional[List[TransformRule]]: additional transformation rules.
+    
+    @return fn Callable: the runtime function
     """
     def decorator(fn: Callable):
         if not callable(fn):

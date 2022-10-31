@@ -7,6 +7,7 @@ import operator
 
 from cube.ir.cten import IRTensor
 from cube.ir.tensor import IRSubTensor
+from cube.ir.dtype import IRDType
 from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
 from cube.graph.function.conv import IRConv2D
 from cube.graph.function.conv import IRConv3D
@@ -17,8 +18,9 @@ from cube.graph.function.select import IRSelect, IRSlice
 from cube.graph.function.scatter import IRSelectScatter
 from cube.graph.function.repeat import IRRepeat
 from cube.graph.function.anchor import IRGraphAnchor
-from cube.ir.dtype import IRDType
-from cube.graph.torch_dtype_mapping import DType2IRDType, TorchScalarTypeEnumMap
+
+
+ErasedDevice = 'str'
 
 
 def Identity(signature, inputs: List[IRTensor]):
@@ -50,11 +52,13 @@ def BatchLinear(signature, inputs):
 
 
 def Zeros(signature,
-          inputs: Tuple[ List[int], Optional[int], Optional[Any], 'ErasedDevice', Optional[bool] ]):
+          inputs: Tuple[ List[int], Optional[int], Optional[Any], ErasedDevice, Optional[bool] ]):
     # zeros(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
     #
     # REMARK: in the PyTorch-internal operator definition expression, an asterisk ("*") is merely a marker of
     #         the beginning of the sublist of _keyword arguments_, and does not result in an actual argument.
+
+    from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
 
     size, dtype_underlying, layout, _erased_device, pin_memory = inputs
 
@@ -77,7 +81,7 @@ def Zeros(signature,
     return IRZeros(signature, size, 'zeros', ir_dtype)
 
 def Ones(signature,
-         inputs: Tuple[ List[int], Optional[int], Optional[Any], 'ErasedDevice', Optional[bool] ]):
+         inputs: Tuple[ List[int], Optional[int], Optional[Any], ErasedDevice, Optional[bool] ]):
     # ones(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
 
     size, dtype_underlying, layout, _erased_device, pin_memory = inputs
@@ -85,6 +89,7 @@ def Ones(signature,
     # TODO parameters to support, currently they are all None
     assert layout is None
     assert pin_memory is None
+    from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
 
     if dtype_underlying is not None:
         # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
@@ -101,7 +106,7 @@ def Ones(signature,
     return IROnes(signature, size, 'ones', ir_dtype)
 
 def Rand(signature,
-         inputs: Tuple[ List[int], Optional[int], Optional[Any], 'ErasedDevice', Optional[bool] ]):
+         inputs: Tuple[ List[int], Optional[int], Optional[Any], ErasedDevice, Optional[bool] ]):
     # ones(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
 
     size, dtype_underlying, layout, _erased_device, pin_memory = inputs
@@ -109,6 +114,7 @@ def Rand(signature,
     # TODO parameters to support, currently they are all None
     assert layout is None
     assert pin_memory is None
+    from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
 
     if dtype_underlying is not None:
         # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
@@ -125,7 +131,7 @@ def Rand(signature,
     return IRRand(signature, size, 'rand', ir_dtype)
 
 def NewTensor(signature,
-              inputs: Tuple[ list, Optional[int], 'ErasedDevice', bool ]):
+              inputs: Tuple[ list, Optional[int], ErasedDevice, bool ]):
     # aten::tensor(t[] data, *, ScalarType? dtype=None, Device? device=None, bool requires_grad=False) -> Tensor
     #
     # REMARK: in the PyTorch-internal operator definition expression, an asterisk ("*") is merely a marker of
@@ -135,6 +141,7 @@ def NewTensor(signature,
 
     # TODO parameters to support, currently they are all None
     assert requires_grad == False
+    from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
 
     if dtype_underlying is not None:
         # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
@@ -184,6 +191,7 @@ def ToTensor(signature,
     opt_memory_format : Optional[int]
     tensor, dtype_underlying, non_blocking, copy, opt_memory_format = inputs
 
+    from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
     dtype : torch.dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
     ir_dtype : IRDType = DType2IRDType.map(dtype)
 
