@@ -466,7 +466,6 @@ def LayerNorm(signature, inputs):
     kwargs['normalized_shape'] = normalized_shape
     kwargs['eps'] = eps
     signature = 'cube.runtime.function.layer_norm'
-    print(anno)
     return IRDimops(LayerNorm, 'layernorm', signature, [anno], inputs, **kwargs)
 
 
