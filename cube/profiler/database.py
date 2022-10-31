@@ -38,7 +38,8 @@ class CompProfiler:
 
         @return fw_span float: the time in milliseconds for forward time
         @return bw_span float: the time in milliseconds for backward time
-        @return memory int: the peak memory in bytes after forward
+        @return infer_memory int: the peak memory in bytes after inference of the function
+        @return train_memory int: the peak memory in bytes after forward with autograd enabled
         """
         assert len(shapes) == len(dtypes), \
             f"func {func.__name__}: expected each shape has a corresponding dtype, but got {shapes} and {dtypes}"
@@ -60,10 +61,15 @@ class CompProfiler:
                 torch.autograd.backward(outputs, grads)
             return outputs
 
-        # warmup
-        tic = time.time()
-        while time.time() - tic < warmup_sec:
-            run_step(func, tensors, kwargs, backward=True)
+        # profile inference peak memory
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        mtic = torch.cuda.max_memory_allocated()  # in bytes
+        with torch.no_grad():
+            run_step(func, tensors, kwargs, backward=False)
+        mtoc = torch.cuda.max_memory_allocated()  # in bytes
+        infer_memory = mtoc - mtic
 
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -71,7 +77,12 @@ class CompProfiler:
         mtic = torch.cuda.max_memory_allocated()  # in bytes
         outs = run_step(func, tensors, kwargs, backward=False)
         mtoc = torch.cuda.max_memory_allocated()  # in bytes
-        memory = mtoc - mtic
+        train_memory = mtoc - mtic
+
+        # warmup
+        tic = time.time()
+        while time.time() - tic < warmup_sec:
+            run_step(func, tensors, kwargs, backward=True)
 
         # profile forward only
         torch.cuda.synchronize()
@@ -93,7 +104,7 @@ class CompProfiler:
         fwbw_span = (toc - tic) / prof_times * 1000 # in milliseconds
         bw_span = fwbw_span - fw_span
 
-        return fw_span, bw_span, memory
+        return fw_span, bw_span, infer_memory, train_memory
 
 
 class ProfileDataBase:
@@ -132,11 +143,12 @@ class ProfileDataBase:
         Profile a forward node in IRGraph on a specific device (default current device)
         
         @param node IRFwOperation: node of IRGraph
-        @param device int: the node
+        @param device int: the device that the node will execute on
 
-        @return fw_span float: forward span in milliseconds
-        @return bw_span float: backward span in milliseconds
-        @return mem int: peak memory consumpiton of forward + backward procedure.
+        @return fw_span float: the forward span time in milliseconds
+        @return bw_span float: the backward span time in milliseconds
+        @return infer_memory int: the peak memory in bytes after inference of the function
+        @return train_memory int: the peak memory in bytes after forward with autograd enabled
         """
         fn, shapes, dtypes, kwargs = ProfileDataBase.get_func(node)
 
@@ -145,24 +157,36 @@ class ProfileDataBase:
             torch.cuda.set_device(device)
         
         # run profiling
-        fw_span, bw_span, memory = CompProfiler.profile(fn, shapes, dtypes, **kwargs)
+        fw_span, bw_span, infer_memory, train_memory = \
+            CompProfiler.profile(fn, shapes, dtypes, **kwargs)
         # log to database
         key = self._serialize(node)
-        self.insert(node.signature, key, fw_span, bw_span, memory)
-        print(f'profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} => fw: {round(fw_span, 2)} ms | bw: {round(bw_span, 2)} | mem: {memory}')
+        self.insert(node.signature, key, fw_span, bw_span, infer_memory, train_memory)
+        print(
+            f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} "
+            f"=> fw: {round(fw_span, 2)} ms | bw: {round(bw_span, 2)} | "
+            f"infer mem: {infer_memory} | train mem: {train_memory}")
 
         if isinstance(device, int):
             torch.cuda.set_device(orig_device)
-        return fw_span, bw_span, memory
+        return fw_span, bw_span, infer_memory, train_memory
 
-    def insert(self, name: str, key: str, fw_span: float, bw_span: float, memory: float):
+    def insert(self, name: str, key: str, fw_span: float, bw_span: float,
+               infer_memory: int, train_memory: int):
         """
-        log the span of a function name with key 
+        log the span of a function name with key
+
+        @param name str: the function signature
+        @param key str: the encoded shapes and dtypes of node inputs
+        @param fw_span float: the forward span time in milliseconds
+        @param bw_span float: the backward span time in milliseconds
+        @param infer_memory int: the peak memory in bytes after inference of the function
+        @param train_memory int: the peak memory in bytes after forward with autograd enabled
         """
         assert isinstance(name, str) and isinstance(key, str)
         if name not in self._data:
             self._data[name] = dict()
-        self._data[name][key] = (fw_span, bw_span, memory)
+        self._data[name][key] = (fw_span, bw_span, infer_memory, train_memory)
 
     def exist(self, node: IRFwOperation) -> bool:
         """
@@ -179,15 +203,16 @@ class ProfileDataBase:
             return False
         return True
 
-    def query(self, node: IRFwOperation) -> float:
+    def query(self, node: IRFwOperation) -> Tuple[float, float, int, int]:
         """!
         Get the performance number of a node in IRGraph
 
         @param node IRFwOperation: node in IRGraph
 
-        @return fw_span float: forward span in milliseconds
-        @return bw_span float: backward span in milliseconds
-        @return mem int: peak memory consumpiton of forward + backward procedure.
+        @return fw_span float: the forward span time in milliseconds
+        @return bw_span float: the backward span time in milliseconds
+        @return infer_memory int: the peak memory in bytes after inference of the function
+        @return train_memory int: the peak memory in bytes after forward with autograd enabled
         """
         key = self._serialize(node)
         if node.signature not in self._data:
@@ -196,7 +221,7 @@ class ProfileDataBase:
             return None
         return self._data[node.signature][key]
 
-    def query_func(self, signature, shapes, dtypes):
+    def query_func(self, signature, shapes, dtypes) -> Tuple[float, float, int, int]:
         """
         Get performance number of given name (signature), shapes and dtypes
         
@@ -204,9 +229,10 @@ class ProfileDataBase:
         @param shapes Tuple[Tuple[int]]: the shape of each input tensor
         @param dtypes Tuple[torch.dtype]: the dtype of each tensor
 
-        @return fw_span float: forward span in milliseconds
-        @return bw_span float: backward span in milliseconds
-        @return mem int: peak memory consumpiton of forward + backward procedure.
+        @return fw_span float: the forward span time in milliseconds
+        @return bw_span float: the backward span time in milliseconds
+        @return infer_memory int: the peak memory in bytes after inference of the function
+        @return train_memory int: the peak memory in bytes after forward with autograd enabled
         """
         key = self._serialize(shapes, dtypes)
         if signature not in self._data:
