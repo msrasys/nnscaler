@@ -25,7 +25,7 @@ class CompProfiler:
     @staticmethod
     def profile(func: Callable, shapes: Shapes, dtypes: DTypes,
                 warmup_sec: float = 2, prof_times: int = 50,
-                **kwargs) -> Tuple[float, float, int]:
+                **kwargs) -> Tuple[float, float, int, int]:
         """
         Profile a function
 
