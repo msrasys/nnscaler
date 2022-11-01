@@ -58,6 +58,20 @@ def window_attn(x: torch.Tensor,
     return x
 
 
+def init_relative_position_index(window_size: int) -> torch.Tensor:
+    coords_h = torch.arange(window_size)
+    coords_w = torch.arange(window_size)
+    coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))  # 2, Wh, Ww
+    coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+    relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+    relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+    relative_coords[:, :, 0] += window_size - 1  # shift to start from 0
+    relative_coords[:, :, 1] += window_size - 1
+    relative_coords[:, :, 0] *= 2 * window_size - 1
+    relative_position_index = relative_coords.sum(-1)  # wh * ww, wh * ww
+    return relative_position_index
+
+
 class WindowAttention(torch.nn.Module):
     r""" Window based multi-head self attention (W-MSA) module with relative position bias.
     It supports both of shifted and non-shifted window.

@@ -4,10 +4,12 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/vision/swin/train.py --policy PASMeshShard --fp16
+    examples/vision/swin/train.py --policy PASMegatron --fp16
 """
 
+import math
 import torch
+from examples.vision.swin.blocks.attention import init_relative_position_index
 from examples.vision.swin.model import Config, SwinTransformer, ImageDataLoader
 
 import cube
@@ -42,7 +44,8 @@ else:
 
 def train():
 
-    batch_size = 4
+    batch_size = 1
+    load_content: bool = False
 
     cfg = Config()
     model = SwinTransformer()
@@ -51,14 +54,20 @@ def train():
     dtype = torch.float16 if args.fp16 else torch.float32
     dataloader = ImageDataLoader(batch_size, cfg.img_size, cfg.num_classes, dtype=dtype)
 
-    model = cube.SemanticModel(model, dataloader.shapes)
-    @cube.compile(model, dataloader, PAS=PAS, override=True)
+    model = cube.SemanticModel(model)
+    @cube.compile(model, dataloader, PAS=PAS, override=True, load_content=load_content)
     def train_iter(model, dataloader):
         imgs = next(dataloader)
         loss = model(imgs)
         loss.backward()
         # return loss
     model: torch.nn.Module = model.get_gen_module()
+
+    if not load_content:
+        for name, buffer in model.named_buffers():
+            if 'rp_index' in name:
+                window_size = int(math.sqrt(buffer.size(0)))
+                buffer.copy_(init_relative_position_index(window_size).cuda())
 
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999))
 
