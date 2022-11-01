@@ -25,7 +25,7 @@ class CompProfiler:
     @staticmethod
     def profile(func: Callable, shapes: Shapes, dtypes: DTypes,
                 warmup_sec: float = 2, prof_times: int = 50,
-                **kwargs) -> Tuple[float, float, int]:
+                **kwargs) -> Tuple[float, float, int, int]:
         """
         Profile a function
 
@@ -320,7 +320,7 @@ class ProfileDataBase:
         for signature in self._data:
             for key in self._data[signature]:
                 shapes, dtypes = self._deserialize(key)
-                fw_span, bw_span, mem = self._data[signature][key]
-                data.append(f'{signature}: shapes={shapes}, dtypes={dtypes}, fw span: {fw_span} ms, bw span: {bw_span} ms, mem {mem} bytes')
+                fw_span, bw_span, infer_mem, train_mem = self._data[signature][key]
+                data.append(f'{signature}: shapes={shapes}, dtypes={dtypes}, fw span: {fw_span} ms, bw span: {bw_span} ms, infer mem {infer_mem} bytes, train mem {train_mem} bytes')
         data = '\n'.join(data)
         return data

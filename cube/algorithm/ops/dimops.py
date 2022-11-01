@@ -3,6 +3,8 @@ from cube.algorithm.generics import GenericDistAlgo
 
 from cube.graph.function.dimops import IRDimops, DimAnno, DimopSplit, TransformRule
 from cube.ir.tensor import IRSubTensor
+from cube.ir.operator import IRFwOperation
+from collections import deque
 
 
 class DimSplitEinops(GenericDistAlgo):
@@ -292,3 +294,74 @@ class SimpleViewSplitEinops(GenericDistAlgo):
             sub_node.infer_shape()
             sub_nodes.append(sub_node)
         return sub_nodes
+
+def collect_split_info(node: IRFwOperation):
+    # TODO(yizhu1): workaround
+    split_batch_ops = {}
+    
+    anno = node.anno
+
+    split_info = {}
+
+    for idx_shape, shape_anno in enumerate(anno.inputs()):
+        if not isinstance(node.inputs()[idx_shape], IRSubTensor):
+            continue
+        for idx_dim, dim_anno in enumerate(shape_anno.dims):
+            for idx_id, identifier in enumerate(dim_anno.identifiers):
+                if dim_anno.reduces[idx_id] == DimAnno.ReduceType.Freeze:
+                    continue
+                if identifier not in split_info:
+                    split_info[identifier] = (idx_shape, idx_dim, idx_id)
+
+    if node.signature in split_batch_ops:
+        for key, val in split_info.items():
+            if val == (0, 0, 0):
+                return {key: val}
+        assert False
+    else:
+        return split_info
+
+def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
+    split_info = collect_split_info(node)
+
+    def gen_hash(node: IRFwOperation) -> str:
+        ret = node.signature
+        for it in node.inputs():
+            ret = ret + '-' + str(it.shape)
+        return ret
+
+    dq = deque()
+    visited = set()
+    dq.append((node, ngpus))
+    visited.add(gen_hash(node))
+
+    gen_nodes = []
+
+    while dq:
+        cur_node, cur_ngpus = dq.popleft()
+        gen_nodes.append(cur_node)
+
+        for key, val in split_info.items():
+            idx_1st, dim_1st, _ = val
+            dim_size = cur_node.inputs()[idx_1st].shape[dim_1st]
+
+            # TODO(yizhu1): only consider powers of 2 currently
+            split_deg = 2
+            while split_deg <= dim_size and split_deg <= cur_ngpus:
+                if dim_size % split_deg != 0:
+                    break
+
+                new_node = cur_node.algorithms('dim').instantiate(idx=idx_1st, dim=dim_1st, num=split_deg)[0]
+                new_ngpus = cur_ngpus // split_deg
+
+                cur_key = gen_hash(new_node)
+
+                split_deg = split_deg * 2
+
+                if cur_key in visited:
+                    continue
+                
+                dq.append((new_node, new_ngpus))
+                visited.add(cur_key)
+    
+    return gen_nodes 
