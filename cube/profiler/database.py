@@ -56,7 +56,7 @@ class CompProfiler:
         tensors = tuple(
             gen_torch_tensors(shape, dtype) for shape, dtype in zip(shapes, dtypes)
         )
-        # repalce kwargs starting with 'sekf.xxx'
+        # repalce kwargs starting with 'self.xxx'
         train_kwargs, eval_kwargs = {}, {}
         for name, value in kwargs.items():
             if isinstance(value, str) and value.startswith('self.'):
