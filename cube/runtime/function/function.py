@@ -27,7 +27,10 @@ def accum(*tensors: Tuple[torch.Tensor]) -> torch.Tensor:
     """
     accumulate tensors in to one tensor
     """
-    return torch.sum(torch.stack(tensors, dim=0), dim=0)
+    if len(tensors) == 2:
+        return tensors[0] + tensors[1]
+    else:
+        return torch.sum(torch.stack(tensors, dim=0), dim=0)
 
 
 def conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],

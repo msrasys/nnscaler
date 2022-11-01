@@ -416,6 +416,9 @@ class IRAdapterGener:
             )
 
             node = None
+            # get recomput group
+            rcid = set(producer.recompute for producer in devops[devid])
+            rcid = list(rcid)[0] if len(rcid) == 1 else None
 
             # split dimension case
             if split_dim:
@@ -470,12 +473,29 @@ class IRAdapterGener:
                         f"Users can try to adjust node ordering to meet with accum order\n"
                         f"{graph.debug_tensor_map_str(ftensor)}"
                     )
-                # set accum input / output
-                node = Accum('cube.runtime.accum', ptensors)
+                
+                # === Optimization: quick accumulation to early release tensor
+                lhs, rhs = ptensors[0], None
+                for ptensor in ptensors[1:]:
+                    rhs = ptensor
+                    output = ftensor.like().select(ptensors[0].indmap, (0,1))
+                    node = Accum('cube.runtime.accum', [lhs, rhs])
+                    node.set_output(0, output)
+                    node.device = devid
+                    node.recompute = rcid
+                    graph.insert(node, graph.index(ptensor.cell) + 1)
+                    lhs = output
+                # remove last node for adaptation
+                graph.remove(node)
+
+                # === Orignal way to at alst release tensor
+                # node = Accum('cube.runtime.accum', ptensors)
+                # # set gradient
+                # for idx, ptensor in enumerate(ptensors):
+                #     node.input(idx).grad = ftensor.grad.select(ptensor.indmap, (0,1))
+
+                # set output
                 node.set_output(0, new_ftensor.select(otensor.indmap, otensor.valmap))
-                # set gradient
-                for idx, ptensor in enumerate(ptensors):
-                    node.input(idx).grad = ftensor.grad.select(ptensor.indmap, (0,1))
                 node.output(0).grad = new_ftensor.grad.select(otensor.indmap, (0,1))
 
             # no need for fusion, change the producer output to new tensor
@@ -492,9 +512,6 @@ class IRAdapterGener:
                         bproducer.set_input(idx, ograd)
             else:
                 node.device = devid
-                # set recompute
-                rcid = set(producer.recompute for producer in devops[devid])
-                rcid = list(rcid)[0] if len(rcid) == 1 else None
                 node.recompute = rcid
                 # insert
                 max_fid = max(graph.index(producer) for producer in devops[devid])
