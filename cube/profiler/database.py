@@ -2,7 +2,7 @@
 Usage:
     python -m cube.profiler.database --export ./profile.dat.json
 """
-from typing import Callable, Tuple, Union, Optional, Dict, NewType, List
+from typing import Callable, Tuple, Union, Optional, Dict, NewType, List, Any
 import torch
 import time
 import os
@@ -18,6 +18,10 @@ Shapes = NewType('Shapes', Tuple[Tuple[int]])
 DTypes = NewType('DTypes', Tuple[torch.dtype])
 ShapesDTypes = NewType('ShapesDTypes', Tuple[Shapes, DTypes])
 NameOrFunc = Union[str, Callable]
+
+
+_train_module_ref: torch.nn.Module = torch.nn.Module().train()
+_eval_module_ref: torch.nn.Module = torch.nn.Module().eval()
 
 
 class CompProfiler:
@@ -49,7 +53,18 @@ class CompProfiler:
             torch.rand(tuple(shape), dtype=dtype, device=torch.cuda.current_device(), requires_grad=True) \
                 for shape, dtype in zip(shapes, dtypes)
         )
-        outputs = func(*tensors, **kwargs)
+        # repalce kwargs starting with 'sekf.xxx'
+        train_kwargs, eval_kwargs = {}, {}
+        for name, value in kwargs.items():
+            if isinstance(value, str) and value.startswith('self.'):
+                train_val = getattr(_train_module_ref, value[5:])
+                eval_val = getattr(_eval_module_ref, value[5:])
+            else:
+                train_val = eval_val = value
+            train_kwargs[name] = train_val
+            eval_kwargs[name] = eval_val
+        # run one sample
+        outputs = func(*tensors, **train_kwargs)
         outputs = (outputs,) if torch.is_tensor(outputs) else outputs
         assert all(torch.is_tensor(otensor) for otensor in outputs), \
             f"{func.__name__}: require all the outputs to be tensors"
@@ -67,7 +82,7 @@ class CompProfiler:
         torch.cuda.reset_peak_memory_stats()
         mtic = torch.cuda.max_memory_allocated()  # in bytes
         with torch.no_grad():
-            run_step(func, tensors, kwargs, backward=False)
+            run_step(func, tensors, eval_kwargs, backward=False)
         mtoc = torch.cuda.max_memory_allocated()  # in bytes
         infer_memory = mtoc - mtic
 
@@ -75,21 +90,21 @@ class CompProfiler:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         mtic = torch.cuda.max_memory_allocated()  # in bytes
-        outs = run_step(func, tensors, kwargs, backward=False)
+        outs = run_step(func, tensors, train_kwargs, backward=False)
         mtoc = torch.cuda.max_memory_allocated()  # in bytes
         train_memory = mtoc - mtic
 
         # warmup
         tic = time.time()
         while time.time() - tic < warmup_sec:
-            run_step(func, tensors, kwargs, backward=True)
+            run_step(func, tensors, train_kwargs, backward=True)
 
         # profile forward only
         torch.cuda.synchronize()
         tic = time.perf_counter()
         for _ in range(prof_times):
             with torch.no_grad():
-                run_step(func, tensors, kwargs, backward=False)
+                run_step(func, tensors, eval_kwargs, backward=False)
         torch.cuda.synchronize()
         toc = time.perf_counter()
         fw_span = (toc - tic) / prof_times * 1000 # in milliseconds
@@ -98,7 +113,7 @@ class CompProfiler:
         torch.cuda.synchronize()
         tic = time.perf_counter()
         for _ in range(prof_times):
-            run_step(func, tensors, kwargs, backward=True)
+            run_step(func, tensors, train_kwargs, backward=True)
         torch.cuda.synchronize()
         toc = time.perf_counter()
         fwbw_span = (toc - tic) / prof_times * 1000 # in milliseconds
