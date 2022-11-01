@@ -45,9 +45,12 @@ class CompProfiler:
             f"func {func.__name__}: expected each shape has a corresponding dtype, but got {shapes} and {dtypes}"
         # create data
         dtypes = [torch.float32] * len(shapes) if dtypes is None else dtypes
+        def gen_torch_tensors(shape, dtype):
+            constructor = torch.zeros if dtype == torch.int64 else torch.rand
+            requires_grad = False if dtype == torch.int64 else True
+            return constructor(tuple(shape), dtype=dtype, device=torch.cuda.current_device(), requires_grad=requires_grad)
         tensors = tuple(
-            torch.rand(tuple(shape), dtype=dtype, device=torch.cuda.current_device(), requires_grad=True) \
-                for shape, dtype in zip(shapes, dtypes)
+            gen_torch_tensors(shape, dtype) for shape, dtype in zip(shapes, dtypes)
         )
         outputs = func(*tensors, **kwargs)
         outputs = (outputs,) if torch.is_tensor(outputs) else outputs
@@ -152,6 +155,9 @@ class ProfileDataBase:
         """
         fn, shapes, dtypes, kwargs = ProfileDataBase.get_func(node)
 
+        if self.exist(node):
+            return self.query(node)
+
         if isinstance(device, int):
             orig_device = torch.cuda.current_device()
             torch.cuda.set_device(device)
@@ -164,7 +170,7 @@ class ProfileDataBase:
         self.insert(node.signature, key, fw_span, bw_span, infer_memory, train_memory)
         print(
             f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} "
-            f"=> fw: {round(fw_span, 2)} ms | bw: {round(bw_span, 2)} | "
+            f"=> fw: {round(fw_span, 2)} ms | bw: {round(bw_span, 2)} ms | "
             f"infer mem: {infer_memory} | train mem: {train_memory}")
 
         if isinstance(device, int):
