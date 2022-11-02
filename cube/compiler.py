@@ -91,7 +91,8 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             print('warning: dataloader batch size stay as default.')
             # load module code
             print_each_rank(f'loading existed module from {filename} ...')
-            model.load_module(filename, load_content=load_content)
+            # model.load_module(filename, load_content=load_content)
+            model.load_module(filename)
             # load schedule code
             print_each_rank(f'loading existed schedule from {filename} ...')
             return _load_tschedule_fn(filename)

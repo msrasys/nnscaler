@@ -14,7 +14,7 @@ def memory_summary():
     mem = torch.cuda.max_memory_allocated()
     # mem = torch.cuda.max_memory_reserved()
     print_each_rank(
-        '{:.2f}GB memory consumption'.format(mem / 1024 / 1024 / 1024),
+        '{:.2f} GB memory consumption'.format(mem / 1024 / 1024 / 1024),
     )
 
 
