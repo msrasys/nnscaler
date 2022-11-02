@@ -25,10 +25,7 @@ from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 from cube.codegen.frontend_mapping import Sign2EmitRule
 
-import os
-
-USE_NNFUSION = os.environ.get('USE_NNFUSION')
-USE_JIT = os.environ.get('USE_JIT')
+from cube.flags import CompileFlag
 
 
 def get_backward_callsite_io_tensors(bp_segment:IRSegment):
@@ -377,7 +374,7 @@ class ModelCodeGen(CodeGen):
             'import torch', 'import torch.utils.checkpoint as ckpt',
             'import cube', '', '']
 
-        if USE_NNFUSION:
+        if CompileFlag.use_nnfusion:
             self.init_code.extend(['import nnfusion', ''])
 
         # customized op code
@@ -512,9 +509,9 @@ class ModelCodeGen(CodeGen):
                     return_code = f"return {', '.join(outputs)}"
                     fb.insert_body(return_code)
                 cb.insert_body('')
-                if USE_NNFUSION and name.startswith('segment'):
+                if CompileFlag.use_nnfusion and name.startswith('segment'):
                     cb.insert_body('@nnfusion.jit')
-                if USE_JIT and name.startswith('segment'):
+                if CompileFlag.use_jit and name.startswith('segment'):
                     cb.insert_body('@torch.jit.script_method')
                 cb.insert_body(fb.code)
 

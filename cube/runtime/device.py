@@ -6,15 +6,15 @@ import numpy as np
 import torch
 import os
 
+from cube.flags import CompileFlag
+
 
 class DeviceGroup:
 
     class __DeviceGroup:
 
         def __init__(self):
-            single_device_mode = os.environ.get('SINGLE_DEV_MODE')
-            print(f'single_device_mode = {single_device_mode}')
-            if single_device_mode:
+            if CompileFlag.dev_mode:
                 print(f"DeviceGroup init using single device mode...")
                 self.rank = 0
                 self.world_size = 1
