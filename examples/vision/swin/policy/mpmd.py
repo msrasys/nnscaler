@@ -73,7 +73,7 @@ def _replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
 
 def _coshard(graph: IRGraph, node: IRFwOperation, devid: int, **configs):
     algo = node.algorithms('dim')
-    if node.recompute is not None:
+    if node.recompute is None:
         graph.recompute([node])
     sub_nodes = graph.partition(node, algo, **configs)
     assert sub_nodes is not None
