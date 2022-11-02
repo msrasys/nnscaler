@@ -18,6 +18,14 @@ class Schedule1F1B(ScheduleABC):
             num_microbatch: int,
             recompute=False):
 
+        # special case: num_stages == 1: use gradient accum
+        if num_stages == 1:
+            for _ in range(num_microbatch):
+                inputs = Schedule1F1B.dataloader_step(dataloader)
+                outputs = Schedule1F1B.forward_step(segment, *inputs)
+                input_grads = Schedule1F1B.backward_step(inputs, outputs, (None,))
+            return
+
         num_warmup_microbatches = num_stages - 1 - stage_id
         num_warmup_remaining = num_microbatch - num_warmup_microbatches
 
