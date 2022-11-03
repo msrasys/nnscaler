@@ -5,6 +5,7 @@ __pycache__
 .vscode/
 
 benchmark/megatron/Megatron-LM
+benchmark/deepspeed/Megatron-DeepSpeed
 
 gencode*.py
 fullmodel.pt
