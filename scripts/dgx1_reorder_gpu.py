@@ -89,9 +89,19 @@ def reorder(topology: np.ndarray) -> np.ndarray:
     print(f'Get ring: {ring}')
     # find fc
     for idx, src in enumerate(ring):
-        dst = ring[(src + 3) % len(ring)]
-        if topology[src, dst] == _kConnType['NV1']:
+        is_fc = True
+        pairs = [
+            (src, ring[(idx + 3) % len(ring)]),
+            (src, ring[(idx + 2) % len(ring)]),
+            (ring[(idx+1) % len(ring)], ring[(idx+3) % len(ring)])
+        ]
+        for src, dst in pairs:
+            if topology[src, dst] != _kConnType['NV1']:
+                is_fc = False
+                break
+        if is_fc:
             break
+    assert is_fc, f"Cannot find FC group."
     ring = np.roll(ring, 0-idx)
     return ring
 
