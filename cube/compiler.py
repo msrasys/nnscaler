@@ -21,6 +21,7 @@ from cube.runtime.device import DeviceGroup
 from cube.runtime.syndata import CubeDataLoader
 
 from cube.program import Program, SemanticDataLoader, SemanticModel
+from cube.flags import CompileFlag
 
 
 def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
@@ -186,6 +187,9 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             print('> compile time: {:.2f} seconds'.format(compile_time))
 
         if torch.distributed.is_initialized():
+            if DeviceGroup().local_rank != 0 and CompileFlag.worker_sleep > 0:
+                print(f'rank [{DeviceGroup().rank}] starts sleeping {CompileFlag.worker_sleep} seconds...')
+                time.sleep(CompileFlag.worker_sleep)
             torch.distributed.barrier()
 
         # load module

@@ -13,6 +13,11 @@ class CompileFlag:
     # ============= loggings ===================
     log_transform = os.environ.get('LOG_TRANSFORM')
 
+    
+    # ================ compiling ========================
+    # worker sleep in seconds
+    worker_sleep = int(os.environ.get('WORKER_SLEEP')) if os.environ.get('WORKER_SLEEP') is not None else 0
+
     # ============ code generation ===============
     use_nnfusion = os.environ.get('USE_NNFUSION')
     use_jit = os.environ.get('USE_JIT')
