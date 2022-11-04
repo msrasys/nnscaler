@@ -1,10 +1,5 @@
 """
-example:
-
-OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=8 \
-    --nnodes=1 \
-    examples/nlp/gpt/train.py --fp16
+torchrun --nproc_per_node=1 test/test_profile_gpt.py
 """
 
 

@@ -1,3 +1,5 @@
+# GPT-3 toy model memory profiling result
+
 | layer | end2end | activation | param | e2e - 3 * p - activation |
 |:------|:--------|:-----------|:------|:-------------------------|
 | 1     | 1.59    |  0.47      | 0.24  |  0.40                    |
