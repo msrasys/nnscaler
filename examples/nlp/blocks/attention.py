@@ -19,22 +19,22 @@ def self_attention(query: torch.Tensor,
     v = v.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     
     # ======== replace the semantic into more efficient implementation ============
-    q = q.transpose(0, 1)  # L (N h) d -> (N h) L d
-    k = k.transpose(0, 1)  # L (N h) d -> (N h) L d
-    q = q * scale          # (N h) L d, 1 -> (N h) L d
-    k = k.transpose(1, 2)  # (N h) L d -> (N h) d L
-    attn = torch.bmm(q, k) # (N h) L d, (N h) d L -> (N h) L L
+    # q = q.transpose(0, 1)  # L (N h) d -> (N h) L d
+    # k = k.transpose(0, 1)  # L (N h) d -> (N h) L d
+    # q = q * scale          # (N h) L d, 1 -> (N h) L d
+    # k = k.transpose(1, 2)  # (N h) L d -> (N h) d L
+    # attn = torch.bmm(q, k) # (N h) L d, (N h) d L -> (N h) L L
     
-    # # preallocating input tensor: (N h) L L
-    # matmul_input_buffer = torch.empty([N * h, L, L], dtype=query.dtype, device=query.device)
-    # # L (N h) d, L (N h) d -> (N h) L L
-    # attn = torch.baddbmm(
-    #     matmul_input_buffer,
-    #     q.transpose(0, 1),  # (N h) L d
-    #     k.transpose(0, 1).transpose(1, 2), # (N h) d L
-    #     beta=0.0, alpha=scale
-    # )
-    # # ======== replace the semantic into more efficient implementation ============
+    # preallocating input tensor: (N h) L L
+    matmul_input_buffer = torch.empty([N * h, L, L], dtype=query.dtype, device=query.device)
+    # L (N h) d, L (N h) d -> (N h) L L
+    attn = torch.baddbmm(
+        matmul_input_buffer,
+        q.transpose(0, 1),  # (N h) L d
+        k.transpose(0, 1).transpose(1, 2), # (N h) d L
+        beta=0.0, alpha=scale
+    )
+    # ======== replace the semantic into more efficient implementation ============
 
     # attention mask
     if mask: # (N h) L L -> (N h) L L
@@ -182,7 +182,7 @@ class MultiHeadSelfAttention(torch.nn.Module):
         attn = self_attention(
             query, self.qkv_proj, self.qkv_bias,
             self.out_proj,
-            self.num_heads, self.scaling, self.dropout_p, mask=False
+            self.num_heads, self.scaling, self.dropout_p, mask=True
         )
         attn = attn + self.out_bias
         return attn

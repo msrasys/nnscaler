@@ -86,11 +86,11 @@ def train():
             CudaTimer(enable=True).start('e2e')
 
         train_iter(model, dataloader)
-        memory_summary()
+        # memory_summary()
         optimizer.step()
-        memory_summary()
+        # memory_summary()
         optimizer.zero_grad()
-        memory_summary()
+        # memory_summary()
 
         if step == 0:
             print_each_rank('passed first iteration')

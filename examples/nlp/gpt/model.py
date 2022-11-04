@@ -12,7 +12,7 @@ class Config:
 
     # toy model
     embed_dim = 1024
-    layers = 4 # 96
+    layers = 8 # 96
     attention_heads = 16
 
     # # 1 layer of 175B model
@@ -37,7 +37,7 @@ class Config:
 
     # 6.7 B model
     # embed_dim = 4096
-    # layers = 1
+    # layers = 32
     # attention_heads = 32
 
     # 15 B model
