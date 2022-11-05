@@ -56,7 +56,7 @@ class CompProfiler:
         tensors = tuple(
             gen_torch_tensors(shape, dtype) for shape, dtype in zip(shapes, dtypes)
         )
-        # repalce kwargs starting with 'sekf.xxx'
+        # repalce kwargs starting with 'self.xxx'
         train_kwargs, eval_kwargs = {}, {}
         for name, value in kwargs.items():
             if isinstance(value, str) and value.startswith('self.'):
@@ -89,13 +89,24 @@ class CompProfiler:
         mtoc = torch.cuda.max_memory_allocated()  # in bytes
         infer_memory = mtoc - mtic
 
+        train_memory = 0
+        # ref torch/utils/checkpoint.py/_checkpoint_without_reentrant
+        def pack_hook(x):
+            nonlocal train_memory
+            byte_size = 1
+            for dim in list(x.size()):
+                byte_size = byte_size * dim
+            byte_size *= x.element_size()
+            train_memory= train_memory + byte_size
+            return x
+        
+        def unpack_hook(x):
+            return x
+
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        mtic = torch.cuda.max_memory_allocated()  # in bytes
-        outs = run_step(func, tensors, train_kwargs, backward=False)
-        mtoc = torch.cuda.max_memory_allocated()  # in bytes
-        train_memory = mtoc - mtic
+        with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
+            outs = run_step(func, tensors, train_kwargs, backward=False)
 
         # warmup
         tic = time.time()
