@@ -96,8 +96,8 @@ class CompProfiler:
             byte_size = 1
             for dim in list(x.size()):
                 byte_size = byte_size * dim
-            byte_size *= x.element_size()
-            train_memory= train_memory + byte_size
+            byte_size = byte_size * x.element_size()
+            train_memory = train_memory + byte_size
             return x
         
         def unpack_hook(x):
@@ -188,28 +188,37 @@ class ProfileDataBase:
             orig_device = torch.cuda.current_device()
             torch.cuda.set_device(device)
         
+        input_byte_size, param_byte_size = 0, 0
+        for t in node.inputs():
+            if t.is_param():
+                param_byte_size = param_byte_size + t.byte_size()
+            else:
+                input_byte_size = input_byte_size + t.byte_size()
+
         # run profiling
         fw_span, bw_span, infer_memory, train_memory = \
             CompProfiler.profile(fn, shapes, dtypes, **kwargs)
         # log to database
         key = self._serialize(node)
-        self.insert(node.signature, key, fw_span, bw_span, infer_memory, train_memory)
+        self.insert(node.signature, key, input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory)
         print(
             f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} "
-            f"=> fw: {round(fw_span, 2)} ms | bw: {round(bw_span, 2)} ms | "
-            f"infer mem: {infer_memory} | train mem: {train_memory}")
+            f"=> in mem {input_byte_size} | param mem: {param_byte_size} | fw: {round(fw_span, 2)} ms | "
+            f"bw: {round(bw_span, 2)} ms | infer mem: {infer_memory} | train mem: {train_memory}")
 
         if isinstance(device, int):
             torch.cuda.set_device(orig_device)
-        return fw_span, bw_span, infer_memory, train_memory
+        return input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory
 
-    def insert(self, name: str, key: str, fw_span: float, bw_span: float,
-               infer_memory: int, train_memory: int):
+    def insert(self, name: str, key: str, input_byte_size: int, param_byte_size: int,
+               fw_span: float, bw_span: float, infer_memory: int, train_memory: int):
         """
         log the span of a function name with key
 
         @param name str: the function signature
         @param key str: the encoded shapes and dtypes of node inputs
+        @param input_byte_size int: byte size of input tensors
+        @param param_byte_size int: byte size of param tensors
         @param fw_span float: the forward span time in milliseconds
         @param bw_span float: the backward span time in milliseconds
         @param infer_memory int: the peak memory in bytes after inference of the function
@@ -218,7 +227,7 @@ class ProfileDataBase:
         assert isinstance(name, str) and isinstance(key, str)
         if name not in self._data:
             self._data[name] = dict()
-        self._data[name][key] = (fw_span, bw_span, infer_memory, train_memory)
+        self._data[name][key] = (input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory)
 
     def exist(self, node: IRFwOperation) -> bool:
         """
@@ -235,12 +244,14 @@ class ProfileDataBase:
             return False
         return True
 
-    def query(self, node: IRFwOperation) -> Tuple[float, float, int, int]:
+    def query(self, node: IRFwOperation) -> Tuple[int, int, float, float, int, int]:
         """!
         Get the performance number of a node in IRGraph
 
         @param node IRFwOperation: node in IRGraph
 
+        @return input_byte_size int: byte size of input tensors
+        @return param_byte_size int: byte size of param tensors
         @return fw_span float: the forward span time in milliseconds
         @return bw_span float: the backward span time in milliseconds
         @return infer_memory int: the peak memory in bytes after inference of the function
@@ -253,7 +264,7 @@ class ProfileDataBase:
             return None
         return self._data[node.signature][key]
 
-    def query_func(self, signature, shapes, dtypes) -> Tuple[float, float, int, int]:
+    def query_func(self, signature, shapes, dtypes) -> Tuple[int, int, float, float, int, int]:
         """
         Get performance number of given name (signature), shapes and dtypes
         
@@ -261,6 +272,8 @@ class ProfileDataBase:
         @param shapes Tuple[Tuple[int]]: the shape of each input tensor
         @param dtypes Tuple[torch.dtype]: the dtype of each tensor
 
+        @return input_byte_size int: byte size of input tensors
+        @return param_byte_size int: byte size of param tensors
         @return fw_span float: the forward span time in milliseconds
         @return bw_span float: the backward span time in milliseconds
         @return infer_memory int: the peak memory in bytes after inference of the function
@@ -352,7 +365,7 @@ class ProfileDataBase:
         for signature in self._data:
             for key in self._data[signature]:
                 shapes, dtypes = self._deserialize(key)
-                fw_span, bw_span, infer_mem, train_mem = self._data[signature][key]
-                data.append(f'{signature}: shapes={shapes}, dtypes={dtypes}, fw span: {fw_span} ms, bw span: {bw_span} ms, infer mem {infer_mem} bytes, train mem {train_mem} bytes')
+                input_byte_size, param_byte_size, fw_span, bw_span, infer_mem, train_mem = self._data[signature][key]
+                data.append(f'{signature}: shapes={shapes}, dtypes={dtypes}, in mem {input_byte_size} bytes, param mem {param_byte_size} bytes, fw span: {fw_span} ms, bw span: {bw_span} ms, infer mem {infer_mem} bytes, train mem {train_mem} bytes')
         data = '\n'.join(data)
         return data

@@ -49,7 +49,8 @@ def train():
                 continue
             partition_nodes = gen_partitions(node, 1)
             for partition_node in partition_nodes:
-                fw_span, bw_span, infer_mem, train_mem = db.profile(partition_node)
+                in_mem, param_mem, fw_span, bw_span, infer_mem, train_mem = db.profile(partition_node)
+                print(node.signature, in_mem, param_mem)
                 mem_sum = mem_sum + train_mem
         db.dump('db.json', override=True)
         print('estimated train mem: ', mem_sum / 1024 / 1024 / 1024)

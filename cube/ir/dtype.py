@@ -15,6 +15,20 @@ class IRDType(Enum):
     unknown = 'unknown'
 
 
+def dtype2byte_size(dtype: IRDType) -> int:
+    return {
+        IRDType.float64: 8,
+        IRDType.float32: 4,
+        IRDType.float16: 2,
+        IRDType.int64: 8,
+        IRDType.int32: 4,
+        IRDType.int16: 2,
+        IRDType.int8: 1,
+        IRDType.uint8: 1,
+        IRDType.boolean: 1,
+    }.get(dtype, 0)
+
+
 class DTypeInferRule:
     """
     Infer the output shape according to given input shapes.
