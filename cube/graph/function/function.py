@@ -243,6 +243,18 @@ def _handle_broadcast(lhs: IRTensor, rhs: IRTensor) -> Tuple[List[str]]:
     return lhs_shape, rhs_shape, out_shape
 
 
+def Clone(signature, inputs):
+    """
+    torch.clone(input, *, memory_format=torch.preserve_format)
+    """
+    assert len(inputs) == 2, f"inputs: {inputs}"
+    tensor, memory_format = inputs
+    annos = ['* -> *']
+    tensor = inputs[0]
+    assert memory_format is None, f"Not supported for a specific memory format"
+    return IRDimops(Clone, 'clone', signature, annos, [tensor])
+
+
 def Add(signature, inputs):
     if len(inputs) == 2:
         kwargs = {}
@@ -375,6 +387,7 @@ def Neg(signature, inputs):
     annos = ['* -> *']
     return IRDimops(Neg, 'neg', signature, annos, inputs, **kwargs)
 
+
 def Sin(signature, inputs):
     annos = ['* -> *']
     tensor = inputs[0:1]
@@ -397,6 +410,16 @@ def Cos(signature, inputs):
                         approximate=approximate)
     else:
         return IRDimops(Cos, 'cos', signature, annos, tensor)
+
+
+def Tanh(signature, inputs):
+    """
+    torch.tanh(input, *, out=None)
+    """
+    assert len(inputs) == 1, f"inputs: {inputs}"
+    annos = ['* -> *']
+    tensor = inputs[0:1]
+    return IRDimops(Tanh, 'tanh', signature, annos, tensor)
 
 
 def GeLU(signature, inputs):

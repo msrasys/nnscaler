@@ -89,6 +89,7 @@ class Sign2Op:
         __ttemplate('tensor'): function.NewTensor,
         __ttemplate('to'): function.ToTensor,
         __ttemplate('rand'): function.Rand,
+        __ttemplate('clone'): function.Clone,
 
         __ttemplate('add') : function.Add,
 
@@ -112,6 +113,8 @@ class Sign2Op:
         __ttemplate('sin'): function.Sin,
 
         __ttemplate('cos'): function.Cos,
+
+        __ttemplate('tanh'): function.Tanh,
 
         __ttemplate('bmm') : function.BatchLinear,
 
