@@ -62,7 +62,7 @@ def cross_attention(query: torch.Tensor, key: torch.Tensor,
                     k_proj: torch.Tensor, k_bias: torch.Tensor,
                     v_proj: torch.Tensor, v_bias: torch.Tensor,
                     out_proj: torch.Tensor,
-                    h: int, scale: float, dropout_p: float, mask=True):
+                    h: int, scale: float, dropout_p: float, mask: bool = True):
     num_head = h
     L, N = query.size(0), query.size(1)
     dim_head = q_proj.size(0) // num_head
@@ -84,10 +84,10 @@ def cross_attention(query: torch.Tensor, key: torch.Tensor,
     if mask: # (N h) L L -> (N h) L L
         attn = attn.view(N, num_head, L, L)
         ones = torch.ones((N, L, L), device=attn.device)
-        mask = torch.tril(ones)
-        mask = mask.view(N, 1, L, L)
-        mask = (mask < 0.5)
-        attn = attn.masked_fill_(mask, -10000.0)
+        amask = torch.tril(ones)
+        amask = amask.view(N, 1, L, L)
+        amask = (amask < 0.5)
+        attn = attn.masked_fill_(amask, -10000.0)
         attn = attn.view((N * num_head), L, L)
 
     attn = torch.nn.functional.softmax(attn, dim=-1) # (N h) L L -> (N h) L L
@@ -216,7 +216,7 @@ class MultiHeadCrossAttention(torch.nn.Module):
             self.q_proj, self.q_bias,
             self.k_proj, self.k_bias,
             self.v_proj, self.v_bias,
-            self.out_proj, self.out_bias,
+            self.out_proj,
             self.num_heads, self.scaling, self.dropout_p, mask=True
         )
         attn = attn + self.out_bias
