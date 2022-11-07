@@ -54,7 +54,11 @@ class Executor:
                 outputs = subgraph(*input_tensors)
         else:
             outputs = subgraph(*input_tensors)
-            outputs = outputs.requires_grad_() if torch.is_tensor(outputs) else (t.requires_grad_() for t in outputs)
+            allow_grad_dtypes = (torch.float32, torch.float16)
+            if torch.is_tensor(outputs) and outputs.dtype in allow_grad_dtypes:
+                outputs = outputs.requires_grad_()
+            else:
+                outputs = (t.requires_grad_() if t.dtype in allow_grad_dtypes else t for t in outputs)
         return outputs
 
     @staticmethod

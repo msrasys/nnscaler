@@ -80,7 +80,7 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
     else:
         assert rank == dst
         tensor = torch.empty(shape, dtype=dtype, 
-            device=torch.cuda.current_device(), requires_grad=True
+            device=torch.cuda.current_device()
         )
         torch.distributed.recv(tensor, src)
     CudaTimer().stop(field_name='comm', predefined=True)
