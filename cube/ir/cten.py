@@ -19,7 +19,7 @@ from typing import Iterable, List, Tuple, Union, Optional, Any
 import copy
 
 from cube.ir.unique import IDGenerator
-from cube.ir.dtype import IRDType
+from cube.ir.dtype import IRDType, dtype2byte_size
 
 
 __all__ = ['IRCell', 'IRDType', 'IRTensor']
@@ -595,6 +595,9 @@ class IRTensor:
         for num in self.shape:
             cnt *= num
         return cnt
+
+    def byte_size(self) -> int:
+        return self.nelement() * dtype2byte_size(self.dtype)
 
     def backward(self) -> None:
         """
