@@ -174,6 +174,8 @@ class ProfileDataBase:
         @param node IRFwOperation: node of IRGraph
         @param device int: the device that the node will execute on
 
+        @param input_byte_size int: byte size of input tensors
+        @param param_byte_size int: byte size of param tensors
         @return fw_span float: the forward span time in milliseconds
         @return bw_span float: the backward span time in milliseconds
         @return infer_memory int: the peak memory in bytes after inference of the function
