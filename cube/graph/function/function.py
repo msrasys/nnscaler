@@ -900,7 +900,13 @@ def Select(signature, inputs: Tuple[IRTensor, int, int]):
     torch.select(self:Tensor, dim:int, index:int) -> Tensor
     """
     tensor, dim, index = inputs
-    return IRSelect(signature, [tensor], 'select', dim, index)
+    ianno = ShapeAnno.create_shape_str(tensor.shape)
+    oanno = copy.copy(ianno)
+    ianno[dim] += '^'
+    oanno[dim] = '1'
+    anno = OpAnno.create_op_str([ianno], [oanno])
+    return IRDimops(Select, 'select', signature, [anno], [tensor], dim=dim, index=index)
+    # return IRSelect(signature, [tensor], 'select', dim, index)
 
 def Slice(signature, inputs: Tuple[IRTensor, int, Optional[int], Optional[int], int]):
     """
