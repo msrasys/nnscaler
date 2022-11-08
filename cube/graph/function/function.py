@@ -903,7 +903,7 @@ def Select(signature, inputs: Tuple[IRTensor, int, int]):
     ianno = ShapeAnno.create_shape_str(tensor.shape)
     oanno = copy.copy(ianno)
     ianno[dim] += '^'
-    oanno[dim] = '1'
+    oanno.pop(dim)
     anno = OpAnno.create_op_str([ianno], [oanno])
     return IRDimops(Select, 'select', signature, [anno], [tensor], dim=dim, index=index)
     # return IRSelect(signature, [tensor], 'select', dim, index)
