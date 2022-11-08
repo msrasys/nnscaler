@@ -7,6 +7,11 @@ from examples.nlp.blocks.decoder import DecoderLayer
 import cube
 
 
+@cube.graph.parser.register('* -> *, *', name='multi2ref')
+def multi2ref(tensor: torch.Tensor):
+    return tensor, tensor
+
+
 class Config:
 
     TBD = None # to be decided
@@ -102,7 +107,8 @@ class MBartClassificationHead(torch.nn.Module):
     # def forward(self, dec: torch.Tensor, labels):
     def forward(self, dec: torch.Tensor):
         # sentence_represent = dec[eos_mask,:].view(dec.size(0), -1, hidden_states.size(-1))[:,-1,:]
-        dec = dec[:,-1,:]
+        dec = torch.select(dec, dim=1, index=-1)
+        # dec = dec[:,-1,:]
         sentence_represent = dec
         hidden_states = self.dropout(sentence_represent)
         hidden_states = self.dense(hidden_states)
@@ -116,9 +122,10 @@ class MBartClassificationHead(torch.nn.Module):
 
 class MBartForSentenceClassification(torch.nn.Module):
 
-    def __init__(self):
+    def __init__(self, batch_size: int):
         super().__init__()
         cfg = Config()
+        self.vocab_size = cfg.num_embeddings
         print("Model Arch:", cfg)
         # embedding
         self.vocab = torch.nn.Parameter(torch.empty(
@@ -155,9 +162,16 @@ class MBartForSentenceClassification(torch.nn.Module):
             ) for _ in range(cfg.decoder_layers)]
         )
         self.layer_norm_decoder = torch.nn.LayerNorm(cfg.decoder_embed_dim)
-
         self.head = MBartClassificationHead(cfg.decoder_embed_dim, 1024, cfg.num_classes, 0.0)
-    
+
+        # FIXME: cube now is not safe for multiple
+        # tensor transmissions between stages.
+        decoder_input_ids = torch.randint(
+            0, self.vocab_size, (batch_size, cfg.seqlen), dtype=torch.int64, device=torch.device('cpu'),
+        )
+        self.register_buffer('decoder_input_ids', decoder_input_ids)
+
+
     def forward(self, input_ids: torch.Tensor):
         """
         The forward is only for benchmark performance,
@@ -166,7 +180,7 @@ class MBartForSentenceClassification(torch.nn.Module):
 
         The loss computation is also simplified by using sum.
         """
-        decoder_input_ids = torch.clone(input_ids)
+        # decoder_input_ids = torch.clone(input_ids)
         # encoder embedding
         cube.runtime.function.anchor('encoder embedding')
         enc_emb = torch.nn.functional.embedding(input_ids, self.vocab)
@@ -184,17 +198,28 @@ class MBartForSentenceClassification(torch.nn.Module):
         
         # decoder embedding
         cube.runtime.function.anchor('decoder embedding')
-        dec_emb = torch.nn.functional.embedding(decoder_input_ids, self.vocab)
+        dec_emb = torch.nn.functional.embedding(self.decoder_input_ids, self.vocab)
         dec_emb = dec_emb * self.embed_scale_decoder
         dec_emb = dec_emb + self.decoder_position
         dec_emb = self.layernorm_embedding_decoder(dec_emb)
         dec_emb = torch.nn.functional.dropout(dec_emb, p=0.1)
         dec = dec_emb.transpose(0, 1)
 
+        # FIXME: need to cat and chunk because cube now is not safe
+        # for multiple tensor transformation between stages.
+        encdec = torch.cat((enc, dec), dim=-1)
+
         # decoder layers
         for layer in self.decoders:
             cube.runtime.function.anchor('decoder layer')
+            enc, dec = torch.chunk(encdec, 2, dim=-1)
+            
+            enc, next_enc = multi2ref(enc)
+            
             dec = layer(dec, enc)
+            encdec = torch.cat((next_enc, dec), dim=-1)
+        
+        enc, dec = torch.chunk(encdec, 2, dim=-1)
         dec = self.layer_norm_decoder(dec)
         dec = dec.transpose(0, 1)
         
