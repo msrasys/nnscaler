@@ -7,7 +7,7 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Union, Tuple, List, Optional, Dict
+from typing import Sequence, Set, Union, Tuple, List, Optional, Dict
 from cube.graph.function.anchor import IRGraphAnchor
 
 from cube.ir.cten import IRTensor, IRCell
@@ -20,6 +20,9 @@ from cube.graph.function.function import Identity, MultiRef
 from cube.graph.segment import IRSegment
 
 from cube.algorithm.generics import GenericDistAlgo
+
+
+FOp = Union[IRFwOperation, IRDataOperation]
 
 
 class IRGraph(IRSegment):
@@ -422,7 +425,60 @@ class IRGraph(IRSegment):
                 node.mirror.device = device
         return True
 
+    def reside(self, tensor: IRSubTensor, devices: Union[int, List[int]]):
+        """
+        Allocate an attribute tensor to devices.
+        """
+        assert tensor.is_attr(), f"Only support to set devices for graph attribute tensors"
+        raise NotImplementedError("Not supported yet")
+
     ## Schedule Policy Primitives ##
+
+    def sequential(self, nodes: Sequence[Union[FOp, Set[FOp]]]):
+        """
+        Scheduling Primitive: sequentially execute a list of nodes,
+        or a list of concurrent nodes.
+
+        Note there should be no dependency from a later node (set) to a previous node (set).
+
+        Note in current implementation we don't check correctness
+
+        Currently only support node (set) from a same device.
+
+        @param nodes Sequence[Set[FOp]]: a sequence of operators or
+            a sequence of concurrent operators. Note there should be no 
+        """
+        assert len(nodes) > 0
+        concurrent_groups = [[node] if isinstance(node, IRCell) else node for node in nodes]
+        segment: IRSegment = self.segment(concurrent_groups[0][0])
+        idx = segment.index(nodes[0])
+        for group in concurrent_groups[1:]:
+            for node in group:
+                assert segment.exist(node, flatten=False), "All nodes should in a same segment"
+                # TODO: should check every node to see if they can be gathered based on that node
+                segment.reorder(node, idx)
+
+    def concurrent(self, nodes: Set[Union[FOp, Sequence[FOp]]]):
+        """
+        Scheduling Primitive: concurrently execut a list of nodes,
+        or a list of sequential nodes.
+
+        Note there should be no dependency from a node (set) to another node (set).
+
+        Currently only suuport node (set) from different devices.
+
+        @param nodes Set[Sequence[Fop]]: a set of operators or
+            a set of sequential operators.
+        """
+        assert len(nodes) > 0
+        seq_groups = [[node] if isinstance(node, IRCell) else node for node in nodes]
+        segment: IRSegment = self.segment(seq_groups[0][0])
+        idx = segment.index(nodes[0])
+        for group in seq_groups[1:]:
+            for node in group:
+                assert segment.exist(node, flatten=False), "All nodes should in a same segment"
+                # TODO: should check every node to see if they can be gathered based on that node
+                segment.reorder(node, idx)
 
     def happen_before(self, node1: IRCell, node2: IRCell, skip=None) -> bool:
         """
@@ -657,6 +713,7 @@ class IRGraph(IRSegment):
                 fidx = self.index(fstages[sid][0])
                 self.finsert(fwop, fidx)
             else:
+                fidx = self.index(fstages[sid][0])
                 self.insert(fwop, fidx)
             # update stage op group
             fstages[sid].insert(0, fwop)

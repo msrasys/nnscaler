@@ -31,6 +31,8 @@ class ScheduleABC:
             if torch.is_tensor(tensor) and tensor.requires_grad:
                 tensor.retain_grad()
         CudaTimer().start("backward")
+        otensors = [t for t in otensors if t.requires_grad]
+        assert len(otensors) == len(otensor_grads), f"output tensor mismatches with gradient number"
         torch.autograd.backward(otensors, grad_tensors=otensor_grads)
         CudaTimer().stop("backward")
         itensor_grads = []
@@ -54,13 +56,15 @@ class ScheduleABC:
         adapter pass
         """
         if adapter is None: return ()
+        args = tuple(t for t in args if torch.is_tensor(t))
         CudaTimer().start('adapter')
         outputs = adapter(*args)
         CudaTimer().stop('adapter')
         if not isinstance(outputs, tuple):
             outputs = (outputs,)
         if require_grad:
-            outputs = tuple(t.requires_grad_() if torch.is_tensor(t) else t for t in outputs)
+            grad_dtypes = (torch.float16, torch.float32)
+            outputs = tuple(t.requires_grad_() if torch.is_tensor(t) and t.dtype in grad_dtypes else t for t in outputs)
         return outputs
 
     @staticmethod

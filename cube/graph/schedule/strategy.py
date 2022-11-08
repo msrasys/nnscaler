@@ -1,6 +1,5 @@
 from typing import Tuple, Dict, Any, List
 from cube.graph.graph import IRGraph, IRSegment
-from cube.graph.function import IRGraphAnchor
 from cube.ir.adapter.adapter import IRAdapter, IRWeightReducer
 from cube.ir.cten import IRCell
 
@@ -18,8 +17,8 @@ class IRScheduleStrategy:
         self.recvers: Dict[IRSegment, List[IRAdapter]] = dict()
         # the sender adapters for this segment
         self.senders: Dict[IRSegment, List[IRAdapter]] = dict()
-        # postprocess after segments
-        self.post_process: List[IRCell] = []
+        # postprocess of weight reducers
+        self.reducers: List[IRWeightReducer] = []
         self.signature: str = ''
 
     def apply(self, graph: IRGraph) -> IRGraph:
@@ -30,7 +29,8 @@ class IRScheduleStrategy:
 
     def mesh(self) -> List[List[int]]:
         """!
-        Group operators into segments corresponding to graph stage
+        Group operators into segments corresponding to graph stage.
+        Reorder adapter output to match with segment input order
         """
         for segment in self.graph.nodes():
             if isinstance(segment, IRSegment):
@@ -45,3 +45,5 @@ class IRScheduleStrategy:
                         self.recvers[segment].append(adapter)
                     elif self.graph.depends(segment, adapter):
                         self.senders[segment].append(adapter)
+            if isinstance(adapter, IRWeightReducer):
+                self.reducers.append(adapter)

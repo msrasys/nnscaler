@@ -430,13 +430,14 @@ class IRSegment(IRCell):
             pos = CellPosition(pos.indices[1:])
             segment.insert(node, pos)
 
-    def remove(self, node: IRCell, _pos: CellPosition = None) -> CellPosition:
+    def remove(self, node: IRCell, _pos: Union[int, CellPosition] = None) -> CellPosition:
         """
         Remove a node at index
 
         # TODO: check input and output
 
         @param node IRCell: the removed node
+        @param _pos Optional[Union[int, CellPosition]: help to save cost if provide node position.
         
         @return index CellPosition: the removed index
         """
@@ -491,6 +492,20 @@ class IRSegment(IRCell):
             self.insert(new_node, idx)
         return idx
 
+    def reorder(self, node: IRCell, index: int):
+        """
+        Reorder an existing node to the index.
+
+        @param node IRCell: the node in this segment, not considering inner segments.
+        @param index int: the index is under the view of nodes ordering before this call.
+
+        @return None
+        """
+        prev_index = self._nodes.index(node)
+        self.remove(node, prev_index)
+        index = index if prev_index >= index else index - 1
+        self.insert(index, node)
+
     @contextmanager
     def update(self, node):
         """
@@ -510,7 +525,7 @@ class IRSegment(IRCell):
         yield node
         self.insert(node, index)
 
-    def exist(self, node: IRCell) -> bool:
+    def exist(self, node: IRCell, flatten: bool = True) -> bool:
         """
         Check if the node is in this graph
 
@@ -520,10 +535,11 @@ class IRSegment(IRCell):
         """
         if node in self._nodes:
             return True
-        for segment in self._nodes:
-            if not isinstance(segment, IRSegment): continue
-            if segment.exist(node):
-                return True
+        if flatten:
+            for segment in self._nodes:
+                if not isinstance(segment, IRSegment): continue
+                if segment.exist(node, flatten):
+                    return True
         return False
 
     def select(self, name: Optional[str] = None, ntype: Optional[IRCell] = None, flatten: bool = True) -> List[IRCell]:
@@ -895,12 +911,15 @@ class IRSegment(IRCell):
                 if otensor in adapter_ins:
                     if len(node.device) > 0 and set(otensor.device).issubset(adapter_ins[otensor]):
                         continue
-                # loss doesn't have consumers
-                if len(segment.consumers(ftensor)) == 0:
-                    outputs.add(otensor)
                 # from segment outputs
                 if any(t.overlap(otensor) for t in segment.outputs() if isinstance(t, IRSubTensor)):
                     outputs.add(otensor)
+                    continue
+                # loss doesn't have consumers
+                if len(segment.consumers(ftensor)) == 0:
+                    # TODO: loss judgement should be more robust
+                    if ftensor.nelement() == 1:
+                        outputs.add(otensor)
                     continue
                 # for outside consumers
                 consumers, ctensors = segment.consumers(ftensor), segment.ctensors(ftensor)

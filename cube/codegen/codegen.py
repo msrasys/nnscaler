@@ -986,7 +986,14 @@ class ScheduleCodeGen(CodeGen):
         kwargs: Dict[str, Any] = schedplan.kwargs(devid)
         strkwargs = dict()
         for kwarg, val in kwargs.items():
-            name = str(val) if not isinstance(val, IRCell) else 'model.'+self.node_naming(val)
+            if isinstance(val, IRCell):
+                name = 'model.' + self.node_naming(val)
+            elif isinstance(val, (tuple, list)):
+                brackets = ')' if len(val) != 1 else ',)'
+                name = '(' + ', '.join('model.' + self.node_naming(n) \
+                    if isinstance(n, IRCell) else str(n) for n in val) + brackets
+            else:
+                name = str(val)        
             strkwargs[kwarg] = name
         code = ', '.join(f'{kwarg}={name}' for kwarg, name in strkwargs.items())
         code = f'{signature}({code})'

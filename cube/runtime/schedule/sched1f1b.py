@@ -1,4 +1,4 @@
-from typing import Callable, Iterable
+from typing import Callable, Iterable, List
 import torch
 
 from cube.runtime.schedule.strategy import ScheduleABC
@@ -16,6 +16,7 @@ class Schedule1F1B(ScheduleABC):
             stage_id: int,
             num_stages: int,
             num_microbatch: int,
+            reducers: List[Callable], # weight reducers
             recompute=False):
 
         # special case: num_stages == 1: use gradient accum
@@ -24,6 +25,8 @@ class Schedule1F1B(ScheduleABC):
                 inputs = Schedule1F1B.dataloader_step(dataloader)
                 outputs = Schedule1F1B.forward_step(segment, *inputs)
                 input_grads = Schedule1F1B.backward_step(inputs, outputs, (None,))
+            for reducer in reducers:
+                reducer()
             return
 
         num_warmup_microbatches = num_stages - 1 - stage_id
@@ -107,5 +110,9 @@ class Schedule1F1B(ScheduleABC):
             # print(f'rank[{torch.distributed.get_rank()}]: line99 send backward') 
             Schedule1F1B.adapter_step(sbadapter, False, *input_grads)
         
+        # allreduce gradient
+        for reducer in reducers:
+            reducer()
+
         Schedule1F1B.assert_empty()
         # print(f'rank[{torch.distributed.get_rank()}]: ok here')
