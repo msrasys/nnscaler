@@ -36,15 +36,14 @@ class DummyInputOuput(IRFwOperation):
         self.device = device
 
 
-def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
+def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) -> List[IRFwOperation]:
     """
     Create dummy operators segment inputs and outputs. 
     The backward operator is also inserted.
 
-    1) produce segment input tensors
-    2) consume segment output tensors
-
     @param segment IRSegment: the target segment
+    @param inputs bool: True for creating dummy operators to produce segement's inputs
+    @param outputs bool: True for creating dummpy operators to consume segment's outputs
     
     @return nodes List[IRCell]: the generated operation
     """
@@ -52,36 +51,38 @@ def create_dummy(segment: IRSegment) -> List[IRFwOperation]:
     fwops = []
 
     # create inputs
-    for tensor in segment.inputs():
-        devices = [consumer.device for consumer in segment.consumers(tensor.parent)][::-1]
-        if not isinstance(tensor, IRSubTensor): continue
-        assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
-        fwop = DummyInputOuput(tensor, 0, is_output=True, name=f'segment{segment.cid}_input')
-        for devid in devices:
-            fop = fwop.replicate()
-            fop.device = devid
-            if tensor.requires_grad:
-                fop.output(0).grad = tensor.grad.select(tensor.indmap, (0, 1))
-                segment.finsert(fop, 0)
-            else:
-                segment.insert(fop, 0)
-            fwops.append(fop)
+    if inputs:
+        for tensor in segment.inputs():
+            devices = [consumer.device for consumer in segment.consumers(tensor.parent)][::-1]
+            if not isinstance(tensor, IRSubTensor): continue
+            assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
+            fwop = DummyInputOuput(tensor, 0, is_output=True, name=f'segment{segment.cid}_input')
+            for devid in devices:
+                fop = fwop.replicate()
+                fop.device = devid
+                if tensor.requires_grad:
+                    fop.output(0).grad = tensor.grad.select(tensor.indmap, (0, 1))
+                    segment.finsert(fop, 0)
+                else:
+                    segment.insert(fop, 0)
+                fwops.append(fop)
     
     # create outputs
-    for tensor in segment.outputs():
-        devices = [producer.device for producer in segment.producers(tensor.parent)]
-        if not isinstance(tensor, IRSubTensor): continue
-        assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
-        fwop = DummyInputOuput(tensor, 0, is_input=True, name=f'segment{segment.cid}_output')
-        for devid in devices:
-            fop = fwop.replicate()
-            fop.device = devid
-            if tensor.requires_grad and segment.mirror != segment:
-                fop.input(0).grad = tensor.grad.select(tensor.indmap, (0, 1))
-                segment.finsert(fop, segment.nnodes)
-            else:
-                segment.insert(fop, segment.nnodes)
-            fwops.append(fop)
+    if outputs:
+        for tensor in segment.outputs():
+            devices = [producer.device for producer in segment.producers(tensor.parent)]
+            if not isinstance(tensor, IRSubTensor): continue
+            assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
+            fwop = DummyInputOuput(tensor, 0, is_input=True, name=f'segment{segment.cid}_output')
+            for devid in devices:
+                fop = fwop.replicate()
+                fop.device = devid
+                if tensor.requires_grad and segment.mirror != segment:
+                    fop.input(0).grad = tensor.grad.select(tensor.indmap, (0, 1))
+                    segment.finsert(fop, segment.nnodes)
+                else:
+                    segment.insert(fop, segment.nnodes)
+                fwops.append(fop)
 
     return fwops
 
@@ -259,7 +260,7 @@ class IRAdapterGener:
                     return False
             return True
 
-        fdummies = create_dummy(graph)
+        fdummies = create_dummy(graph, inputs=True, outputs=True)
         bdummies = [fwop.mirror for fwop in fdummies if fwop.mirror is not None]
         bgraph: Optional[IRSegment] = graph.mirror
 

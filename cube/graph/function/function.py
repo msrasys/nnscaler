@@ -879,6 +879,22 @@ def Stack(signature, inputs: Tuple[List[IRTensor], int]):
     return IRDimops(Stack, 'stack', signature, [anno], tensors, dim=dim)
 
 
+def Chunk(signature, inputs: Tuple[IRTensor, int, int]):
+    """
+    torch.chunk(input, chunks, dim=0)
+    """
+    assert len(inputs) == 3
+    tensor, chunks, dim = inputs
+    assert tensor.shape[dim] % chunks == 0
+    iannos = [ShapeAnno.create_shape_str(tensor.shape)]
+    oannos = [copy.copy(iannos[0]) for _ in range(chunks)]
+    iannos[0][dim] = str(tensor.shape[dim])
+    for oanno in oannos:
+        oanno[dim] = str(tensor.shape[dim] // chunks)
+    anno = OpAnno.create_op_str(iannos, oannos)
+    return IRDimops(Chunk, 'chunk', signature, [anno], [tensor], chunks=chunks, dim=dim)
+
+
 def Select(signature, inputs: Tuple[IRTensor, int, int]):
     """
     torch.select(self:Tensor, dim:int, index:int) -> Tensor

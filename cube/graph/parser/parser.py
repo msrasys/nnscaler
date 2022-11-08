@@ -309,13 +309,20 @@ class ScriptModuleParser:
 
             ir_node = result
             if len(ir_node.outputs()) != len(outputs):
-                raise RuntimeError(
-                    f"Parse fail: {fsig} has {len(outputs)} outputs != pre-defined {len(ir_node.outputs())}"
+                assert len(outputs) == 1, (
+                    f"Farse Fail: torchscript has different output number of IR node: {len(outputs)} != {len(ir_node.outputs())}\n"
+                    f"This can only be happend to have pre-defined output number of 1"
                 )
+                node_outputs = (ir_node.outputs(),)
+                # raise RuntimeError(
+                #     f"Parse fail: {fsig} has {len(outputs)} outputs != pre-defined {len(ir_node.outputs())}"
+                # )
+            else:
+                node_outputs = ir_node.outputs()
 
             # handle outputs
-            for index, output in enumerate(outputs):
-                frame.add_var(output.debugName(), ir_node.output(index))
+            for output, node_output in zip(outputs, node_outputs):
+                frame.add_var(output.debugName(), node_output)
 
             return [ir_node]
 

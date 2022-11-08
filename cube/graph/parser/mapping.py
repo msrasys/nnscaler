@@ -149,6 +149,8 @@ class Sign2Op:
 
         __ttemplate('stack'): function.Stack,
 
+        __ttemplate('chunk'): function.Chunk,
+
         __ttemplate('flatten'): function.Flatten,
 
         __ttemplate('roll'): function.Roll,
