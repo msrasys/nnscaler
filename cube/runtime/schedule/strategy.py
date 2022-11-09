@@ -53,9 +53,11 @@ class ScheduleABC:
     @staticmethod
     def adapter_step(adapter: Callable, require_grad : bool = True, *args):
         """
-        adapter pass
+        Adapter pass.
+        If the adapter is None, will return (None,)
         """
-        if adapter is None: return ()
+        if adapter is None: return (None,)
+        # if adapter is None: return ()
         args = tuple(t for t in args if torch.is_tensor(t))
         CudaTimer().start('adapter')
         outputs = adapter(*args)

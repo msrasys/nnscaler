@@ -479,11 +479,11 @@ class IRTensor:
         self._cell = val
 
     @property
-    def device(self) -> List[int]:
+    def device(self) -> Tuple[int]:
         if self._cell:
-            return self._cell.device
+            return tuple(self._cell.device)
         else:
-            return []
+            return ()
 
     @device.setter
     def device(self, val: Union[int, List[int]]):

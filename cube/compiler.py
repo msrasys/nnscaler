@@ -66,8 +66,6 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
         dataloader = cube.runtime.syndata.SynDataLoader(shapes=(),dtypes=())
     if not isinstance(dataloader, CubeDataLoader):
         raise TypeError("Expect dataloader derived from CubeDataLoader")
-    if callable(PAS):
-        PAS = (PAS,)
 
     model.save_content = load_content
     ir_dataloader = SemanticDataLoader(dataloader)
@@ -115,19 +113,14 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
             # run policy
             graph = Program().get_graph()
-            if len(PAS) == 1:
-                graph = PAS[0](graph, resource)
-            elif len(PAS) == 3:
-                P, A, S = PAS
-                graph = P(graph, resource)
-                graph = A(graph, resource)
-                graph = S(graph, resource)
+            assert callable(PAS), f"Policy PAS is not callable"
+            graph = PAS(graph, resource)
 
             if not isinstance(graph, IRGraph):
                 raise RuntimeError("Expected policy return IRGraph")
 
             # check assignment and remove anchor node
-            for node in graph.nodes():
+            for node in graph.nodes(flatten=True):
                 if isinstance(node, IRGraphAnchor) or isinstance(node.mirror, IRGraphAnchor):
                     continue
                 if len(node.device) == 0:
@@ -142,9 +135,10 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             if graph.sched is not None:
                 start = time.time()
                 graph.sched.apply()
+                if CompileFlag.log_schedule:
+                    print(graph.sched)
                 span = time.time() - start
                 print('> planpass on applying schedule strategy: {:.2f} s'.format(span))
-                print(graph.sched)
 
             # to execution plan
             execplan = ExecutionPlan(graph)

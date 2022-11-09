@@ -114,9 +114,9 @@ class IRSchedule1F1B(IRScheduleStrategy):
         dscp = ''
         for mesh in self.devmesh:
             devid = mesh[0]
-            segment = self.segment[devid].to_str(skip_attr=True) if self.segment[mesh[0]] else None
+            # segment = self.segments[devid].to_str(skip_attr=True) if self.segment[mesh[0]] else None
             dscp += (f"1F1B Schedule: Stage[{self.stage_id[mesh[0]]}](dev {mesh})(\n"
-                     f"  segment = {segment}\n"
+                     f"  segment = {self.segments[devid]}\n"
                      f"  send-fw = {self.sfadapter[mesh[0]]}\n"
                      f"  recv-fw = {self.rfadapter[mesh[0]]}\n"
                      f"  send-bw = {self.sbadapter[mesh[0]]}\n"

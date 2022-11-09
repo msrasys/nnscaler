@@ -1,1 +1,2 @@
 from cube.runtime.schedule.sched1f1b import Schedule1F1B
+from cube.runtime.schedule.schedmix import ScheduleMix

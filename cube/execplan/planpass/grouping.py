@@ -17,6 +17,9 @@ class Grouping(PlanPass):
     def apply(execplan: ExecutionPlan) -> ExecutionPlan:
         """
         Group contiguous differentiable operators segments
+
+        Note non-differentiable IRAdapter with all identity operators will be
+        removed from execution plan.
         """
         graph = execplan.graph
         fgroups, bgroups = Grouping.group(execplan)

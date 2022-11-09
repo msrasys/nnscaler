@@ -12,6 +12,7 @@ class CompileFlag:
 
     # ============= loggings ===================
     log_transform = os.environ.get('LOG_TRANSFORM')
+    log_schedule = os.environ.get('LOG_SCHEDULE')
 
     
     # ================ compiling ========================

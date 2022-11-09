@@ -35,6 +35,7 @@ class IRScheduleStrategy:
         for segment in self.graph.nodes():
             if isinstance(segment, IRSegment):
                 self.segments.append(segment)
+                self.devmesh.append(segment.device)
             self.recvers[segment] = []
             self.senders[segment] = []
         
