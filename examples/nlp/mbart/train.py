@@ -4,7 +4,7 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=8 \
     --nnodes=1 \
-    examples/nlp/mbart/train.py --policy PASMegatron
+    examples/nlp/mbart/train.py --policy PASMixPipe
 """
 
 
@@ -31,7 +31,7 @@ parser.add_argument('--mbs', type=int, default=2, help='micro batch size')
 # arch
 parser.add_argument('--vocab', type=int, default=2500,
                     help='used vocabulary size')
-parser.add_argument('--layers', type=int, default=4,
+parser.add_argument('--layers', type=int, default=8,
                     help='layer number of each encoder and decoder')
 parser.add_argument('--heads', type=int, default=16,
                     help='head number')

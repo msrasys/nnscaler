@@ -254,7 +254,8 @@ def PASMegatron(graph: IRGraph, resource):
 
 def PASMixPipe(graph: IRGraph, resource):
 
-    pp_size = resource.ngpus
+    tp_size = 2
+    pp_size = resource.ngpus // tp_size
 
     blocks = _group_to_blocks(graph.select(ntype=IRFwOperation))
     enc_emb, enc_layers = blocks[0], blocks[1:len(blocks)//2]
@@ -295,8 +296,15 @@ def PASMixPipe(graph: IRGraph, resource):
     pipe_stages = [stage for sid, stage in enumerate(fstages) if sid not in embed_sid]
     assert len(pipe_stages) == pp_size
     for sid, stage in enumerate(pipe_stages):
-        print(stage)
-        graph.assign(stage, sid)
+        tp_devs = [idx for idx in range(tp_size * sid, tp_size * sid + tp_size)]
+        for node in stage.nodes():
+            if len(node.inputs()) == 0: continue # anchor
+            if node.name == 'self_attention' or node.name == 'feedforward':
+                 _tp(graph, node, tp_devs, idx=1, dim=0)
+            elif node.name == 'cross_attention':
+                _tp(graph, node, tp_devs, idx=2, dim=0)
+            else:
+                _replica(graph, node, tp_devs)
 
     strategy = IRScheduleMix(graph, num_microbatch)
     graph.predef_sched(strategy)
