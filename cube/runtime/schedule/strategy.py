@@ -98,7 +98,7 @@ class ScheduleABC:
     @staticmethod
     def pop_head(name: str):
         assert name in ScheduleABC.status, f"{name} is empty"
-        out = ScheduleABC.status[name].pop(-1)
+        out = ScheduleABC.status[name].pop(0)
         if len(ScheduleABC.status[name]) == 0:
             del ScheduleABC.status[name]
         return out
@@ -106,7 +106,7 @@ class ScheduleABC:
     @staticmethod
     def pop_tail(name: str):
         assert name in ScheduleABC.status, f"{name} is empty"
-        out = ScheduleABC.status[name].pop(0)
+        out = ScheduleABC.status[name].pop(-1)
         if len(ScheduleABC.status[name]) == 0:
             del ScheduleABC.status
         return out

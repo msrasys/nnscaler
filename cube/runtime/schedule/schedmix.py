@@ -114,9 +114,9 @@ class ScheduleMix(ScheduleABC):
                         ScheduleMix.push_tail('segment_outputs', segment_outputs)
                     
                 # recompute
-                if recompute:
-                    inputs = ScheduleMix.pop_head('segment_inputs', inputs)
-                    ScheduleMix.pop_head('segment_outputs', outputs)
+                if recompute and do_backward:
+                    inputs = ScheduleMix.pop_head('segment_inputs')
+                    ScheduleMix.pop_head('segment_outputs')
                     outputs = ScheduleMix.forward_step(segment, *inputs)
                     ScheduleMix.push_head('segment_inputs', inputs)
                     ScheduleMix.push_head('segment_outputs', outputs)
@@ -172,9 +172,9 @@ class ScheduleMix(ScheduleABC):
                         ScheduleMix.push_tail('segment_outputs', segment_outputs)
 
                 # recompute
-                if recompute:
-                    inputs = ScheduleMix.pop_head('segment_inputs', inputs)
-                    ScheduleMix.pop_head('segment_outputs', outputs)
+                if recompute and (0 <= bmid + 1 and bmid + 1 < num_microbatch):
+                    inputs = ScheduleMix.pop_head('segment_inputs')
+                    ScheduleMix.pop_head('segment_outputs')
                     outputs = ScheduleMix.forward_step(segment, *inputs)
                     ScheduleMix.push_head('segment_inputs', inputs)
                     ScheduleMix.push_head('segment_outputs', outputs)
