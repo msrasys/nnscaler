@@ -1,7 +1,7 @@
 """
 Concurrent producer / consumer Adapter Generator
 """
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 import copy
 import numpy as np
 
@@ -9,6 +9,7 @@ from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
 from cube.ir.adapter.prim import IRAdapterPrim
 from cube.ir.adapter import IRAdapter
 from cube.ir.adapter.prim import SelectPrim, MovePrim, SumPrim, MergeDimPrim
+from cube.ir.adapter.prim import BroadcastPrim
 
 from cube.graph.gener.layout import GridLayout, PathFinder
 
@@ -180,20 +181,60 @@ class ConcurrentGener:
         fprims = []
         fpdevs = set(t.device[0] for t in fptensors)
         fcomm_workload = {t.device[0]: 0 for t in fptensors}
-        for ctensor in fctensors:
-            fprims += ConcurrentGener.gen_subtensor(ctensor, fptensors, fcomm_workload)
+        # first try collectives
+        ret, prims = ConcurrentGener.gen_subtensor_coll(fctensors, fptensors, fcomm_workload)
+        if ret:
+            fprims += prims
+        # otherwise use general p2p send recv
+        else:
+            for ctensor in fctensors:
+                fprims += ConcurrentGener.gen_subtensor(ctensor, fptensors, fcomm_workload)
         fadapter = IRAdapter(fptensors,fctensors)
         fadapter.prims = fprims
         # backward
         if len(bptensors) > 0 and len(bctensors) > 0:
             bprims = []
             bcomm_workload = {t.device[0]: 0 for t in bptensors}
-            for cgrad in bctensors:
-                bprims += ConcurrentGener.gen_subtensor(cgrad, bptensors, bcomm_workload)
+            # first try collectives
+            ret, prims = ConcurrentGener.gen_subtensor_coll(bctensors, bptensors, bcomm_workload)
+            if ret:
+                bprims += prims
+            # otherwise use general p2p send recv
+            else:
+                for cgrad in bctensors:
+                    bprims += ConcurrentGener.gen_subtensor(cgrad, bptensors, bcomm_workload)
             badapter = IRAdapter(bptensors, bctensors)
             badapter.prims = bprims
             IRAdapter.make_pair(fadapter, badapter)
         return fadapter
+
+    @staticmethod
+    def gen_subtensor_coll(ctensors: List[IRSubTensor], ptensors: List[IRSubTensor], workload: Dict[int, int]) -> Tuple[bool, List[IRAdapterPrim]]:
+        """
+        Generate communication primitives for a tensor using collectives of
+        broadcast, [reduce, gather and scatter]. => [...] Not supported yet.
+
+        @param ctensors List[IRSubTensor]: the consumed tensors as destination.
+        @param ptensors List[IRSubTensor]: the produced tensors as source
+
+        @return success bool: whether succeed in generate collective
+        @return prims List[IRAdapterPrim]: the primitives for adapter
+        """
+        ret = False
+        prims = []
+        # broadcast
+        if len(ptensors) == 1 and \
+           len(set(ctensor.device[0] for ctensor in ctensors)) > 2 and \
+           all(ptensors[0] == ctensor for ctensor in ctensors):
+            dev_ctensors = []
+            cdevs = set()
+            for ctensor in ctensors:
+                if ctensor.device[0] not in cdevs:
+                    cdevs.add(ctensor.device[0])
+                    dev_ctensors.append(ctensor)
+            prims.append(BroadcastPrim(ptensors, dev_ctensors)) 
+            ret = True
+        return ret, prims
 
     @staticmethod
     def gen_subtensor(ctensor: IRSubTensor, ptensors: List[IRSubTensor], workload: Dict[int, int]) -> List[IRAdapterPrim]:
