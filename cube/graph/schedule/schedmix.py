@@ -95,56 +95,55 @@ class IRScheduleMix(IRScheduleStrategy):
             self.dec_badapter[devid] = self.recvers[shard_dec.mirror][0]
         # pipeline stages
         for sid, stage in enumerate(pipe_stages):
-            assert len(stage.device) == 1
-            devid = stage.device[0]
-            # forward body
-            assert devid not in self.fsegments, f"Pipeline stage cannot be overlapped"
-            self.fsegments[devid] = stage
-            # forward recv
-            if sid in (shard_enc_sid, shard_dec_sid):
-                for adapter in self.recvers[stage]:
-                    assert all(isinstance(prim, IdentityPrim) for prim in adapter.prims), (
-                        f"stage {sid} got unexpected forward recv adapters: {self.recvers[stage]}"
-                    )
-                self.rfadapter[devid] = None
-            else:
-                assert len(self.recvers[stage]) == 1
-                self.rfadapter[devid] = self.recvers[stage][0]
-            # forward send
-            if sid == shard_dec_sid - 1: # decoder recv broadcast
-                assert len(self.senders[stage]) == 1
-                self.sfadapter[devid] = None
-            elif sid == self.num_stages - 1:
-                assert len(self.senders[stage]) == 0
-                self.sfadapter[devid] = None
-            else:
-                assert len(self.senders[stage]) == 1
-                self.sfadapter[devid] = self.senders[stage][0]
-            # backward recv
-            if sid in (shard_dec_sid - 1, self.num_stages - 1):
-                for adapter in self.recvers[stage.mirror]:
-                    assert all(isinstance(prim, IdentityPrim) for prim in adapter.prims), (
-                        f"stage {sid} got unexpected backward recv adapters: {self.recvers[stage]}"
-                    )
-                self.rbadapter[devid] = None
-            else:
-                assert len(self.recvers[stage.mirror]) == 1, \
-                    f"stage {sid} got unexpected backward recv adapters: {self.recvers[stage.mirror]}"
-                self.rbadapter[devid] = self.recvers[stage.mirror][0]
-            # backward send:
-            if sid == shard_dec_sid: # decoder broadcast
-                assert len(self.senders[stage.mirror]) == 1
-                self.sbadapter[devid] = None
-            elif sid == shard_enc_sid: # encoder broadcast
-                assert len(self.senders[stage.mirror]) == 1
-                self.sbadapter[devid] = None
-            else:
-                self.sbadapter[devid] = self.senders[stage.mirror][0]
-            
-            # weight reducer
-            self.dev_reducers[devid] = [reducer for reducer in self.reducers if devid in reducer.device]
-            # stage id
-            self.stage_id[devid] = sid
+            for devid in stage.device:
+                assert devid not in self.fsegments, f"Pipeline stage cannot be overlapped"
+                # forward body
+                self.fsegments[devid] = stage
+                # forward recv
+                if sid in (shard_enc_sid, shard_dec_sid):
+                    for adapter in self.recvers[stage]:
+                        assert all(isinstance(prim, IdentityPrim) for prim in adapter.prims), (
+                            f"stage {sid} got unexpected forward recv adapters: {self.recvers[stage]}"
+                        )
+                    self.rfadapter[devid] = None
+                else:
+                    assert len(self.recvers[stage]) == 1
+                    self.rfadapter[devid] = self.recvers[stage][0]
+                # forward send
+                if sid == shard_dec_sid - 1: # decoder recv broadcast
+                    assert len(self.senders[stage]) == 1
+                    self.sfadapter[devid] = None
+                elif sid == self.num_stages - 1:
+                    assert len(self.senders[stage]) == 0
+                    self.sfadapter[devid] = None
+                else:
+                    assert len(self.senders[stage]) == 1
+                    self.sfadapter[devid] = self.senders[stage][0]
+                # backward recv
+                if sid in (shard_dec_sid - 1, self.num_stages - 1):
+                    for adapter in self.recvers[stage.mirror]:
+                        assert all(isinstance(prim, IdentityPrim) for prim in adapter.prims), (
+                            f"stage {sid} got unexpected backward recv adapters: {self.recvers[stage]}"
+                        )
+                    self.rbadapter[devid] = None
+                else:
+                    assert len(self.recvers[stage.mirror]) == 1, \
+                        f"stage {sid} got unexpected backward recv adapters: {self.recvers[stage.mirror]}"
+                    self.rbadapter[devid] = self.recvers[stage.mirror][0]
+                # backward send:
+                if sid == shard_dec_sid: # decoder broadcast
+                    assert len(self.senders[stage.mirror]) == 1
+                    self.sbadapter[devid] = None
+                elif sid == shard_enc_sid: # encoder broadcast
+                    assert len(self.senders[stage.mirror]) == 1
+                    self.sbadapter[devid] = None
+                else:
+                    self.sbadapter[devid] = self.senders[stage.mirror][0]
+
+                # weight reducer
+                self.dev_reducers[devid] = [reducer for reducer in self.reducers if devid in reducer.device]
+                # stage id
+                self.stage_id[devid] = sid
         
         return self.graph
 
