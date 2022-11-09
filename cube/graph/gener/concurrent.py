@@ -222,17 +222,37 @@ class ConcurrentGener:
         """
         ret = False
         prims = []
-        # broadcast
-        if len(ptensors) == 1 and \
-           len(set(ctensor.device[0] for ctensor in ctensors)) > 2 and \
-           all(ptensors[0] == ctensor for ctensor in ctensors):
-            dev_ctensors = []
-            cdevs = set()
+        fuse_broadcast = True
+        # check broadcast
+        if len(ptensors) >= len(ctensors) or len(ptensors) == 0:
+            fuse_broadcast = False
+        else:
+            for ptensor in ptensors:
+                if not all(ptensor == ctensor for ctensor in ctensors):
+                    fuse_broadcast = False
+                    break
+        # fuse to broadcast
+        if fuse_broadcast:  
+            cdev_tensors, pdev_tensors = dict(), dict()
+            for ptensor in ptensors:
+                pdev_tensors.setdefault(ptensor.device[0], []).append(ptensor)
             for ctensor in ctensors:
-                if ctensor.device[0] not in cdevs:
-                    cdevs.add(ctensor.device[0])
-                    dev_ctensors.append(ctensor)
-            prims.append(BroadcastPrim(ptensors, dev_ctensors)) 
+                # not consider self-transmission
+                if ctensor.device[0] in pdev_tensors: continue
+                cdev_tensors.setdefault(ctensor.device[0], []).append(ctensor)
+            if len(cdev_tensors) // len(pdev_tensors) <= 1: # can simply use send recv
+                return False, []
+            pdevs = list(pdev_tensors.keys())
+            cdevs = list(cdev_tensors.keys())
+            broadcast_ndevs = len(cdevs) // len(pdevs)
+            start = 0
+            for idx, pdev in enumerate(pdevs):
+                addone = 1 if idx < (len(cdevs) % len(pdevs)) else 0
+                end = start + broadcast_ndevs + addone
+                pdev_ctensors = [cdev_tensors[devid][0] for devid in cdevs[start:end]]
+                pdev_ctensors += [pdev_tensors[pdev][0]]
+                prims.append(BroadcastPrim([pdev_tensors[pdev][0]], pdev_ctensors))
+                start = end
             ret = True
         return ret, prims
 
