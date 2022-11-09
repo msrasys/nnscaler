@@ -2,9 +2,9 @@
 example:
 
 OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=1 \
+    --nproc_per_node=8 \
     --nnodes=1 \
-    examples/nlp/mbart/train.py --policy PASSingle
+    examples/nlp/mbart/train.py --policy PASMegatron
 """
 
 
@@ -19,6 +19,7 @@ from cube.profiler.memory import memory_summary, model_summary
 import examples.nlp.mbart.policy.mpmd as mpmd
 
 import argparse
+import math
 
 parser = argparse.ArgumentParser(description='GPT Train')
 parser.add_argument('--policy', type=str, help='PAS policy choice, starting with PAS')
@@ -28,7 +29,7 @@ parser.add_argument('--fp16', action='store_true', default=False,
 parser.add_argument('--gbs', type=int, default=1, help='global batch size')
 parser.add_argument('--mbs', type=int, default=2, help='micro batch size')
 # arch
-parser.add_argument('--vocab', type=int, default=256,
+parser.add_argument('--vocab', type=int, default=2500,
                     help='used vocabulary size')
 parser.add_argument('--layers', type=int, default=4,
                     help='layer number of each encoder and decoder')
@@ -54,6 +55,20 @@ else:
     raise ValueError(f"policy {args.policy} not found. Candidates: {policies}")
 
 
+def trunc_normal_(tensor: torch.Tensor, mean=0., std=1., a=-2., b=2.):
+    def norm_cdf(x):
+        return (1. + math.erf(x / math.sqrt(2.))) / 2.
+
+    with torch.no_grad():
+        l = norm_cdf((a - mean) / std)
+        u = norm_cdf((b - mean) / std)
+        tensor.uniform_(2 * l - 1, 2 * u - 1)
+        # tensor.erfinv_()
+        tensor.mul_(std * math.sqrt(2.))
+        tensor.add_(mean)
+        tensor.clamp_(min=a, max=b)
+    return tensor
+
 
 def train():
 
@@ -64,9 +79,11 @@ def train():
     Config.heads = args.heads
     Config.seqlen = args.seqlen
 
-    model = MBartForSentenceClassification(batch_size).cuda()
+    if cube.runtime.device.DeviceGroup().local_rank == 0:
+        model = MBartForSentenceClassification(batch_size).cuda()
+    else:
+        model = None
     dataloader = MBartSyntheticDataLoader(batch_size)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
     print_each_rank('model weight consumpition:')
     memory_summary()
@@ -79,6 +96,8 @@ def train():
         loss.backward()
     model = model.get_gen_module()
 
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
+
     for name, buffer in model.named_buffers():
         torch.manual_seed(0)
         if name.startswith('decoder_input_ids'):
@@ -87,6 +106,10 @@ def train():
                 dtype=torch.int64, device=torch.cuda.current_device(),
             )
             buffer.copy_(inputs)
+    
+    torch.manual_seed(0)
+    for param in model.parameters():
+        trunc_normal_(param)
 
     CudaTimer(enable=False).warmup()
     iter_num, warmup = 5, 2

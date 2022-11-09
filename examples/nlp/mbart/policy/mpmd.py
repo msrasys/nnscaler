@@ -7,6 +7,7 @@ from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.segment import IRSegment
 from cube.ir.cten import IRCell
 from cube.graph.schedule.sched1f1b import IRSchedule1F1B
+from cube.graph.schedule.schedmix import IRScheduleMix
 
 
 def _create_mesh(ngpus: int, group_num: Tuple[int]) -> Tuple[Tuple[Tuple[int]]]:
@@ -248,4 +249,56 @@ def PASMegatron(graph: IRGraph, resource):
     
     strategy = IRSchedule1F1B(graph, num_microbatch)
     graph.predef_sched(strategy)
+    return graph
+
+
+def PASMixPipe(graph: IRGraph, resource):
+
+    pp_size = resource.ngpus
+
+    blocks = _group_to_blocks(graph.select(ntype=IRFwOperation))
+    enc_emb, enc_layers = blocks[0], blocks[1:len(blocks)//2]
+    dec_emb, dec_layers = blocks[len(blocks)//2], blocks[len(blocks)//2+1:]
+
+    num_microbatch = 4
+
+    # pipelien stage
+    embed_sid = [0, pp_size // 2 + 1]
+    fstages = [[] for _ in range(pp_size)]
+    nlayer_per_stage = (len(enc_layers) + len(dec_layers)) // pp_size
+    for lid, fnodes in enumerate(enc_layers + dec_layers):
+        stage_id = min(lid // nlayer_per_stage, pp_size - 1)
+        fstages[stage_id] += fnodes
+    fstages.insert(embed_sid[0], enc_emb)
+    fstages.insert(embed_sid[1], dec_emb)
+    graph.staging(tuple(stage[0] for stage in fstages))
+
+    fstages = [stage for stage in graph.select(ntype=IRSegment, flatten=False) if stage.isfw()]
+    assert len(fstages) == pp_size + 2
+    
+    # fully shard enmbedding
+    enc_emb, dec_emb = fstages[embed_sid[0]], fstages[embed_sid[1]]
+    tp_device = list(range(resource.ngpus))
+    for node in enc_emb.nodes() + dec_emb.nodes():
+        # skip anchor nodes
+        if isinstance(node, IRGraphAnchor): continue
+        # shard embedding layer to all devices
+        if node.name == 'embedding':
+            _tp(graph, node, tp_device, idx=1, dim=0)
+        else:
+            _replica(graph, node, tp_device)
+    
+    dataloader = graph.select(ntype=IRDataOperation)[0]
+    _replica(graph, dataloader, tp_device)
+    
+    # pipeline stage to devices
+    pipe_stages = [stage for sid, stage in enumerate(fstages) if sid not in embed_sid]
+    assert len(pipe_stages) == pp_size
+    for sid, stage in enumerate(pipe_stages):
+        print(stage)
+        graph.assign(stage, sid)
+
+    strategy = IRScheduleMix(graph, num_microbatch)
+    graph.predef_sched(strategy)
+
     return graph
