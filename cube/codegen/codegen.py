@@ -250,6 +250,9 @@ class CodeGen:
         """
         names = []
         for name, val in kwargs.items():
+            # TODO: Ad-hoc patch for amp
+            if CompileFlag.use_amp and val == 'torch.float32':
+                val = 'torch.float16'
             names.append(f'{name}={val}')
         name = ', '.join(names)
         return name
