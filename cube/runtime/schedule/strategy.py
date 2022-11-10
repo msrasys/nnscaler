@@ -3,6 +3,21 @@ import torch
 
 from cube.profiler.timer import CudaTimer
 
+from cube.flags import CompileFlag
+
+
+def convert_fp32_to_fp16(t: Any):
+    """
+    A tensor with float32 will be converted to float16.
+    A dtype of torch.float32 will be returned as torch.float16
+    """
+    if isinstance(t, torch.dtype) and t == torch.float32:
+        t = torch.float16
+    elif torch.is_tensor(t) and t.dtype == torch.float32:
+        with torch.no_grad():
+            t = t.half()
+    return t
+
 
 class ScheduleABC:
 
@@ -14,7 +29,8 @@ class ScheduleABC:
         forward pass
         """
         CudaTimer().start('forward')
-        outputs = segment(*args, **kwargs)
+        with torch.autocast('cuda', torch.float16, enabled=CompileFlag.use_amp):
+            outputs = segment(*args, **kwargs)
         CudaTimer().stop('forward')
         if not isinstance(outputs, tuple):
             outputs = (outputs,)
@@ -59,6 +75,8 @@ class ScheduleABC:
         if adapter is None: return (None,)
         # if adapter is None: return ()
         args = tuple(t for t in args if torch.is_tensor(t))
+        if CompileFlag.use_amp:
+            args = tuple(convert_fp32_to_fp16(t) for t in args)
         CudaTimer().start('adapter')
         outputs = adapter(*args)
         CudaTimer().stop('adapter')

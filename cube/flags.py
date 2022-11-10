@@ -25,7 +25,7 @@ class CompileFlag:
     dev_mode = os.environ.get('SINGLE_DEV_MODE')  # allow to use python xx.py
     
     # use automate mixture precision training, where weights, gradients
-    # and optimizer status are kept in its original type (can be float32),
-    # but the forward will be converted to float16 with torch.autocast API.
-    use_amp = os.environ.get('USE_AMP')
+    # and optimizer status are kept in its original data type (can be float32),
+    # but some of the forward operators will be converted to float16.
+    use_amp = True if os.environ.get('USE_AMP') else False
 
