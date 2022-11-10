@@ -4,6 +4,20 @@ Executor for runtime
 
 from typing import Tuple, Any, Callable, List, Dict
 import torch
+import warnings
+
+from cube.flags import CompileFlag
+
+
+if CompileFlag.use_amp:
+    warnings.warn(
+        "Detected auto mixed precision (AMP) is enabled. It's an "
+        "experimental feature that is only for benchmark. "
+        "torch.cdua.amp.GradScalerr is not enabled for loss "
+        "and optimizer, which may lead to gradient loss. The tensors "
+        "and dtypes arguments in adapter will be automatically converted to "
+        "torch.float16, if they are in float32 precision or torch.float32 dtype."
+    )
 
 
 def debug_id(tensors, msg: str, rank: int):
@@ -14,9 +28,26 @@ def debug_id(tensors, msg: str, rank: int):
             print(f'[{torch.distributed.get_rank()}] {msg}: {[id(t) for t in tensors]}')
 
 
+def convert_fp32_to_fp16(t: Any):
+    """
+    A tensor with float32 will be converted to float16.
+    A dtype of torch.float32 will be returned as torch.float16
+    """
+    if isinstance(t, torch.dtype) and t == torch.float32:
+        t = torch.float16
+    elif torch.is_tensor(t) and t.dtype == torch.float32:
+        with torch.no_grad():
+            t = t.half()
+    return t
+
+
 class Executor:
 
     _detach: Dict[str, Dict[torch.Tensor, torch.Tensor]] = dict()
+
+    # auto mixture precision loss scaler. $ TODO: support it.
+    _scaler = torch.cuda.amp.GradScaler(enabled=CompileFlag.use_amp)
+    
 
     @staticmethod
     def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
@@ -25,7 +56,11 @@ class Executor:
         """
         if not requires_grad:
             with torch.no_grad():
-                outputs = subgraph(*input_tensors)
+                if CompileFlag.use_amp:
+                    with torch.autocast('cuda', torch.float16):
+                        outputs = subgraph(*input_tensors)
+                else:
+                    outputs = subgraph(*input_tensors)
         else:
             # everytime forward a segment, detach the tensor from previous graph
             # debug_id(input_tensors, 'outside fexecute args', 0)
@@ -38,9 +73,11 @@ class Executor:
             input_tensors = tuple(
                 Executor._detach[name][t] if t in Executor._detach[name] else t for t in input_tensors
             )
-            # debug_id(input_tensors, 'inside fexecute args', 0)
-            outputs = subgraph(*input_tensors)
-            # debug_id(outputs, 'fexecute result', 0)
+            if CompileFlag.use_amp:
+                with torch.autocast('cuda', torch.float16):
+                    outputs = subgraph(*input_tensors)
+            else:
+                outputs = subgraph(*input_tensors)
         # print('forwarding... ')
         return outputs
 
@@ -49,6 +86,9 @@ class Executor:
         """
         execute adapter
         """
+        if CompileFlag.use_amp:
+            input_tensors = tuple(convert_fp32_to_fp16(t) for t in input_tensors)
+
         if not requires_grad:
             with torch.no_grad():
                 outputs = subgraph(*input_tensors)
