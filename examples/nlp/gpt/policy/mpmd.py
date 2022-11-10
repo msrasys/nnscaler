@@ -174,7 +174,6 @@ def PASMegatron(graph: IRGraph, resource):
     for pp_idx, fstage in enumerate(fstages):
         for fnode in fstage.nodes():
             if len(fnode.inputs()) == 0: continue # anchor
-            # tensor parallel -- FIXME: current restriction needs replica happen before partition
             if fnode.name == 'self_attention' or fnode.name == 'feedforward':
                 fnodes = _tp(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
             elif fnode.name == 'embedding':
@@ -193,7 +192,7 @@ def PASMegatron(graph: IRGraph, resource):
 
     strategy = IRSchedule1F1B(graph, num_microbatch)
     graph.predef_sched(strategy)
-    print(graph.extra_repr())
+    # print(graph.extra_repr())
     return graph
 
 

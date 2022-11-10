@@ -80,13 +80,11 @@ def train():
     Config.seqlen = args.seqlen
 
     if cube.runtime.device.DeviceGroup().local_rank == 0:
-        model = MBartForSentenceClassification(batch_size).cuda()
+        model = MBartForSentenceClassification(batch_size)
+        model = model.half() if args.fp16 else model
     else:
         model = None
     dataloader = MBartSyntheticDataLoader(batch_size)
-
-    print_each_rank('model weight consumpition:')
-    memory_summary()
 
     model = cube.SemanticModel(model)
     @cube.compile(model, dataloader, PAS=PAS, override=True, load_content=False)

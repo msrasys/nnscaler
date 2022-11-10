@@ -4,7 +4,7 @@ example:
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=8 \
     --nnodes=1 \
-    examples/nlp/gpt/train.py --policy PASMegatronTP --fp16
+    examples/nlp/gpt/train.py --policy PASMegatron --fp16
 """
 
 
@@ -48,14 +48,14 @@ else:
 
 def train():
 
-    batch_size = 1
+    batch_size = 2
 
     model = GPT()
     model = model if not args.fp16 else model.half()
     dataloader = GPTDataLoader(batch_size)
 
-    model = cube.SemanticModel(model, dataloader.shapes)
-    @cube.compile(model, dataloader, PAS=PAS, override=True)
+    model = cube.SemanticModel(model)
+    @cube.compile(model, dataloader, PAS=PAS, override=True, load_content=True)
     def train_iter(model, dataloader):
         input_ids, position_ids = next(dataloader)
         loss = model(input_ids, position_ids)
@@ -69,8 +69,7 @@ def train():
     memory_summary()
 
     CudaTimer(enable=False).warmup()
-    iter_num = 40
-    warmup = 8
+    iter_num, warmup = 5, 2
     for step in range(iter_num):
         if step == warmup:
             CudaTimer(enable=True).start('e2e')
@@ -81,7 +80,7 @@ def train():
 
         if step == 0:
             print_each_rank('passed first iteration')
-        if (step + 1) % 10 == 0:
+        if (step + 1) % 2 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
     CudaTimer().stop('e2e')

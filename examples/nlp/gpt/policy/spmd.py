@@ -9,8 +9,8 @@ from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 
 # tensor parallelism
 def _tp(graph: IRGraph, node: IRFwOperation, devs: List[int],
-        idx: int, dim: int):
-    algo = node.algorithms('dim')
+        idx: int, dim: int, tag='dim'):
+    algo = node.algorithms(tag)
     sub_nodes = graph.partition(node, algo, idx=idx, dim=dim, num=len(devs))
     assert sub_nodes is not None
     for devid, sub_node in zip(devs, sub_nodes):
@@ -47,6 +47,28 @@ def PASSingle(graph: IRGraph, resource):
     for node in graph.nodes():
         if not isinstance(node, IRBpOperation):
             graph.assign(node, 0)
+    return graph
+
+
+def PASDP(graph: IRGraph, resource):
+    dp_size = resource.ngpus
+    dp_devs = list(range(dp_size))
+
+    dataloader = graph.select(ntype=IRDataOperation)[0]
+    bs = dataloader.output(0).shape[0]
+
+    # partition dataloader
+    dls = graph.partition(dataloader, dataloader.algorithms('data'), num=dp_size)
+    for devid, dl in enumerate(dls):
+        graph.assign(dl, devid)
+
+    # partition forward operators
+    for node in graph.select(ntype=IRFwOperation):
+        if len(node.inputs()) == 0: continue
+        #FIXME: a workaround to find batch dimension
+        batch_dim = node.input(0).shape.index(bs)
+        _tp(graph, node, dp_devs, idx=0, dim=batch_dim)
+    
     return graph
 
 
