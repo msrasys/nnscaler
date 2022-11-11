@@ -90,14 +90,16 @@ class CompProfiler:
         infer_memory = mtoc - mtic
 
         train_memory = 0
+        used_tensor = set()
         # ref torch/utils/checkpoint.py/_checkpoint_without_reentrant
         def pack_hook(x):
-            nonlocal train_memory
-            byte_size = 1
-            for dim in list(x.size()):
-                byte_size = byte_size * dim
-            byte_size = byte_size * x.element_size()
-            train_memory = train_memory + byte_size
+            nonlocal train_memory, used_tensor
+            if x.storage().data_ptr() not in used_tensor:
+                used_tensor.add(x.storage().data_ptr())
+                byte_size = x.element_size()
+                for dim in list(x.size()):
+                    byte_size = byte_size * dim
+                train_memory = train_memory + byte_size
             return x
         
         def unpack_hook(x):
@@ -106,7 +108,7 @@ class CompProfiler:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
-            outs = run_step(func, tensors, train_kwargs, backward=False)
+            outs = run_step(func, tensors, train_kwargs, backward=True)
 
         # warmup
         tic = time.time()
@@ -153,8 +155,31 @@ class ProfileDataBase:
         Get function call and its arguments from a cude IRGraph node
         """
         assert isinstance(node, IRFwOperation), f"Only support profiling forward operation but got {type(node)}"
+
+        def get_dep_names(sign: str):
+            ret = []
+            code_impl = Sign2Op.kOpCodeDef[sign]
+            for code_line in code_impl.split('\n'):
+                idx = code_line.find('# call: ')
+                if idx != -1:
+                    dep_name = code_line[idx + 8:]
+                    assert dep_name in Sign2Op.kOpCodeDef, dep_name
+                    ret = ret + get_dep_names(dep_name)
+                    ret.append(dep_name)
+            return ret
+
         if node.signature in Sign2Op.kOpCodeDef:
+            dep_code_impl = ''
+            for dep_name in get_dep_names(node.signature):
+                dep_code_impl = dep_code_impl + Sign2Op.kOpCodeDef[dep_name]
             code_impl: str = Sign2Op.kOpCodeDef[node.signature]
+            def_end = code_impl.find(':\n')
+            assert def_end >= 0
+            prev_code_lines = code_impl[:def_end+2]
+            succ_code_lines = code_impl[def_end+2:]
+            for line in dep_code_impl.split('\n'):
+                prev_code_lines = prev_code_lines + '    ' + line + '\n'
+            code_impl = prev_code_lines + succ_code_lines
             local = {}
             exec(code_impl, globals(), local)
             fn = list(local.values())[0]
