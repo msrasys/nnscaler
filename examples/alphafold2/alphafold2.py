@@ -8,8 +8,10 @@ from cube.profiler.timer import print_each_rank
 from examples.alphafold2.model import *
 import examples.alphafold2.policy.spmd as spmd
 
-cube.init()
-
+from cube.ir.operator import IRFwOperation, IRBpOperation
+from cube.profiler.database import ProfileDataBase
+from cube.algorithm.ops.dimops import gen_partitions
+from cube.graph.function.anchor import IRGraphAnchor
 
 def run(size_config, other_config, policy):
     bs, s, r, cm, cz = size_config
@@ -72,16 +74,37 @@ def run(size_config, other_config, policy):
         int(torch.cuda.max_memory_allocated() / 1024 / 1024)))
 
 
+def profile(graph, resource):
+        db = ProfileDataBase()
+        mem_sum = 0
+        for node in graph.select(ntype=IRFwOperation):
+            if isinstance(node, IRGraphAnchor):
+                continue
+            partition_nodes = gen_partitions(node, 1)
+            for partition_node in partition_nodes:
+                in_mem, param_mem, fw_span, bw_span, infer_mem, train_mem = db.profile(partition_node)
+                mem_sum = mem_sum + train_mem
+                print(node.signature, train_mem)
+        db.dump('db.json', override=True)
+        print('estimated train mem: ', mem_sum / 1024 / 1024 / 1024)
+
+        for node in graph.nodes():
+            if not isinstance(node, IRBpOperation):
+                graph.assign(node, 0)
+
+        return graph
+
 def test_main():
     # Training && Evoformer Stack
     # initial training
-    # bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    bs, s, r, cm, cz = 1, 128, 256, 256, 128
     # first fine-tuning
     # bs, s, r, cm, cz = 1, 512, 256, 256, 128
     # second fine-tuning
     # bs, s, r, cm, cz = 1, 512, 384, 256, 128
 
-    # dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 48, False, True, False
+    dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 3, False, True, False
+    policy = profile
     # policy = spmd.PASDAP
 
     # Training && Extra Sequence
@@ -95,13 +118,15 @@ def test_main():
     # policy = spmd.PASExtraSingle
 
     # Inference
-    bs, s, r, cm, cz = 1, 128, 2048, 256, 128
-    dtype, evo_num, use_chunk, is_train, is_extra = torch.float32, 48, True, False, False
-    policy = spmd.PASSingleInference
-    policy = spmd.PASDAPInference
+    # bs, s, r, cm, cz = 1, 128, 2048, 256, 128
+    # dtype, evo_num, use_chunk, is_train, is_extra = torch.float32, 48, True, False, False
+    # policy = spmd.PASSingleInference
+    # policy = spmd.PASDAPInference
 
     run((bs, s, r, cm, cz), (dtype, evo_num, use_chunk, is_train, is_extra),
         policy)
 
 
-test_main()
+if __name__ == '__main__':
+    cube.init()
+    test_main()
