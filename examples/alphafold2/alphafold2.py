@@ -74,26 +74,6 @@ def run(size_config, other_config, policy):
         int(torch.cuda.max_memory_allocated() / 1024 / 1024)))
 
 
-def profile(graph, resource):
-        db = ProfileDataBase()
-        mem_sum = 0
-        for node in graph.select(ntype=IRFwOperation):
-            if isinstance(node, IRGraphAnchor):
-                continue
-            partition_nodes = gen_partitions(node, 1)
-            for partition_node in partition_nodes:
-                in_mem, param_mem, fw_span, bw_span, infer_mem, train_mem = db.profile(partition_node)
-                mem_sum = mem_sum + train_mem
-                print(node.signature, train_mem)
-        db.dump('db.json', override=True)
-        print('estimated train mem: ', mem_sum / 1024 / 1024 / 1024)
-
-        for node in graph.nodes():
-            if not isinstance(node, IRBpOperation):
-                graph.assign(node, 0)
-
-        return graph
-
 def test_main():
     # Training && Evoformer Stack
     # initial training
@@ -103,9 +83,8 @@ def test_main():
     # second fine-tuning
     # bs, s, r, cm, cz = 1, 512, 384, 256, 128
 
-    dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 3, False, True, False
-    policy = profile
-    # policy = spmd.PASDAP
+    dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 48, False, True, False
+    policy = spmd.PASDAP
 
     # Training && Extra Sequence
     # initial training
