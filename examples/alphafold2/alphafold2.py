@@ -8,8 +8,10 @@ from cube.profiler.timer import print_each_rank
 from examples.alphafold2.model import *
 import examples.alphafold2.policy.spmd as spmd
 
-cube.init()
-
+from cube.ir.operator import IRFwOperation, IRBpOperation
+from cube.profiler.database import ProfileDataBase
+from cube.algorithm.ops.dimops import gen_partitions
+from cube.graph.function.anchor import IRGraphAnchor
 
 def run(size_config, other_config, policy):
     bs, s, r, cm, cz = size_config
@@ -75,14 +77,14 @@ def run(size_config, other_config, policy):
 def test_main():
     # Training && Evoformer Stack
     # initial training
-    # bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    bs, s, r, cm, cz = 1, 128, 256, 256, 128
     # first fine-tuning
     # bs, s, r, cm, cz = 1, 512, 256, 256, 128
     # second fine-tuning
     # bs, s, r, cm, cz = 1, 512, 384, 256, 128
 
-    # dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 48, False, True, False
-    # policy = spmd.PASDAP
+    dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 48, False, True, False
+    policy = spmd.PASDAP
 
     # Training && Extra Sequence
     # initial training
@@ -95,13 +97,15 @@ def test_main():
     # policy = spmd.PASExtraSingle
 
     # Inference
-    bs, s, r, cm, cz = 1, 128, 2048, 256, 128
-    dtype, evo_num, use_chunk, is_train, is_extra = torch.float32, 48, True, False, False
-    policy = spmd.PASSingleInference
-    policy = spmd.PASDAPInference
+    # bs, s, r, cm, cz = 1, 128, 2048, 256, 128
+    # dtype, evo_num, use_chunk, is_train, is_extra = torch.float32, 48, True, False, False
+    # policy = spmd.PASSingleInference
+    # policy = spmd.PASDAPInference
 
     run((bs, s, r, cm, cz), (dtype, evo_num, use_chunk, is_train, is_extra),
         policy)
 
 
-test_main()
+if __name__ == '__main__':
+    cube.init()
+    test_main()

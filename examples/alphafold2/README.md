@@ -109,7 +109,7 @@ TODO
         - bs, s, r, cm, cz = 1, 128, 256, 256, 128
         - bs, s, r, cm, cz = 1, 512, 256, 256, 128
         - bs, s, r, cm, cz = 1, 512, 384, 256, 128
-    - other config: dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 4, False, True, False
+    - other config: dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 48, False, True, False
     - policy
         - spmd.PASSingle
         - spmd.PASDAP
