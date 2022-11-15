@@ -12,6 +12,16 @@ from cube.ir.adapter.prim import SelectPrim, MovePrim, SumPrim, MergeDimPrim
 from cube.ir.adapter.prim import BroadcastPrim
 
 from cube.graph.gener.layout import GridLayout, PathFinder
+from cube.flags import CompileFlag
+
+import warnings
+
+if CompileFlag.disable_intra_rvd:
+    warnings.warn('Detected disabling intra-RVD collective generation, which may have big impact on performance.')
+if CompileFlag.disable_inter_rvd:
+    warnings.warn('Detected disabling inter-RVD collective generation, which may have big impact on performance.')
+if CompileFlag.disable_inter_rvd:
+    warnings.warn('Detected disabling general communication fusion, which may have big impact on performance in certain cases.')
 
 
 class ConcurrentGener:
@@ -37,7 +47,7 @@ class ConcurrentGener:
 
         # case 1: sharing device (in-shard)
         inshard = (set(pdevs) == set(cdevs)) and (len(fptensors) == len(fctensors)) and (len(pdevs) == len(fptensors))
-        if inshard and len(pdevs) > 1:
+        if (not CompileFlag.disable_intra_rvd) and inshard and len(pdevs) > 1:
             # fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reorder=True)
             try:
                 fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reorder=True)
@@ -50,7 +60,7 @@ class ConcurrentGener:
                 )
 
         # Case 2: sperating device (cross-shard)
-        if len(set(pdevs).intersection(cdevs)) == 0:
+        if (not CompileFlag.disable_inter_rvd) and len(set(pdevs).intersection(cdevs)) == 0:
             # fadapter = ConcurrentGener.gen_cross_shard(fptensors, fctensors, bptensors, bctensors)
             try:
                 fadapter = ConcurrentGener.gen_cross_shard(fptensors, fctensors, bptensors, bctensors)
@@ -182,7 +192,9 @@ class ConcurrentGener:
         fpdevs = set(t.device[0] for t in fptensors)
         fcomm_workload = {t.device[0]: 0 for t in fptensors}
         # first try collectives
-        ret, prims = ConcurrentGener.gen_subtensor_coll(fctensors, fptensors, fcomm_workload)
+        ret = False
+        if not CompileFlag.disable_comm_fusion:
+            ret, prims = ConcurrentGener.gen_subtensor_coll(fctensors, fptensors, fcomm_workload)
         if ret:
             fprims += prims
         # otherwise use general p2p send recv
@@ -196,7 +208,8 @@ class ConcurrentGener:
             bprims = []
             bcomm_workload = {t.device[0]: 0 for t in bptensors}
             # first try collectives
-            ret, prims = ConcurrentGener.gen_subtensor_coll(bctensors, bptensors, bcomm_workload)
+            if not CompileFlag.disable_comm_fusion:
+                ret, prims = ConcurrentGener.gen_subtensor_coll(bctensors, bptensors, bcomm_workload)
             if ret:
                 bprims += prims
             # otherwise use general p2p send recv
