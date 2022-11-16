@@ -3,70 +3,47 @@ import torch
 
 from examples.nlp.blocks.encoder import EncoderLayer, EncoderInferLayer
 import cube
+from dataclasses import dataclass
 
 
+@dataclass
 class Config:
+    embed_dim: int = 1024
+    layers: int = 8
+    attention_heads: int = 16
+    attn_hidden_dim: int = 1024
+    ffn_hidden_dim: int = 4096
+    num_embeddings: int = 50432
+    seqlen: int = 1024
+    dropout: float = 0.2
+    attn_dropout: float = 0.2
+    activation_dropout: float = 0.2
 
-    num_embeddings = 50432
-    seqlen = 1024
 
-    # toy model
-    embed_dim = 1024
-    layers = 8 # 96
-    attention_heads = 16
-
-    # # 1 layer of 175B model
-    # embed_dim = 12288
-    # layers = 1 # 96
-    # attention_heads = 96
-    #
-    # # 350 M model (Medium)*
-    # embed_dim = 1024
-    # layers = 24
-    # attention_heads = 16
-
-    # 1.3 B model
-    # embed_dim = 2048
-    # layers = 24
-    # attention_heads = 32
-
-    # 2.6 B model
-    # embed_dim = 2560
-    # layers = 32
-    # attention_heads = 32
-
-    # 6.7 B model
-    # embed_dim = 4096
-    # layers = 32
-    # attention_heads = 32
-
-    # 15 B model
-    # embed_dim = 5120
-    # layers = 48
-    # attention_heads = 36
-
-    # 39 B model
-    # embed_dim = 8192
-    # layers = 48
-    # attention_heads = 64
-
-    # 175 B model*
-    # embed_dim = 12288
-    # layers = 96
-    # attention_heads = 96
-
-    attn_hidden_dim = embed_dim
-    ffn_hidden_dim  = embed_dim * 4
-    dropout = 0.2
-    attn_dropout = 0.2
-    activation_dropout = 0.2
+def build_gpt_config(name: str) -> Config:
+    if name == '350M':
+        embed_dim, layers, attention_heads = 1024, 24, 16
+    elif name == '1.3B':
+        embed_dim, layers, attention_heads = 2048, 24, 32
+    elif name == '2.6B':
+        embed_dim, layers, attention_heads = 2560, 32, 32
+    elif name == '6.7B':
+        embed_dim, layers, attention_heads = 4096, 32, 32
+    elif name == '13B':
+        embed_dim, layers, attention_heads = 5120, 48, 40 
+    elif name == '39B':
+        embed_dim, layers, attention_heads = 8192, 48, 64
+    elif name == '175B':
+        embed_dim, layers, attention_heads = 12288, 96, 96
+    else:
+        assert False, f'unrecognized name: {name}'
+    return Config(embed_dim, layers, attention_heads, embed_dim, 4 * embed_dim)
 
 
 class GPT(torch.nn.Module):
 
-    def __init__(self):
+    def __init__(self, cfg=Config()):
         super().__init__()
-        cfg = Config()
 
         # self.embed = torch.nn.Embedding(cfg.num_embeddings, cfg.embed_dim)
         self.embedw = torch.nn.Parameter(torch.empty(cfg.num_embeddings, cfg.embed_dim))
