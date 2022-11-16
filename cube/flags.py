@@ -16,7 +16,7 @@ class CompileFlag:
     # worker sleep in seconds
     worker_sleep = int(os.environ.get('WORKER_SLEEP')) if os.environ.get('WORKER_SLEEP') is not None else 0
     disable_intra_rvd = os.environ.get('DISABLE_INTRA_RVD')
-    disable_inter_rvd = os.environ.get('DISABLE_INTRA_RVD')
+    disable_inter_rvd = os.environ.get('DISABLE_INTER_RVD')
     disable_comm_fusion = os.environ.get('DISABLE_COMM_FUSION')
 
     # ============ code generation ===============

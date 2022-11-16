@@ -20,7 +20,7 @@ if CompileFlag.disable_intra_rvd:
     warnings.warn('Detected disabling intra-RVD collective generation, which may have big impact on performance.')
 if CompileFlag.disable_inter_rvd:
     warnings.warn('Detected disabling inter-RVD collective generation, which may have big impact on performance.')
-if CompileFlag.disable_inter_rvd:
+if CompileFlag.disable_comm_fusion:
     warnings.warn('Detected disabling general communication fusion, which may have big impact on performance in certain cases.')
 
 
