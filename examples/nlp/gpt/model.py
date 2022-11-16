@@ -85,10 +85,8 @@ class GPT(torch.nn.Module):
 
 class GPTInfer(torch.nn.Module):
 
-    def __init__(self, batch_size: int = 1):
+    def __init__(self, batch_size: int = 1, cfg: Config = Config()):
         super().__init__()
-        cfg = Config()
-
         # self.embed = torch.nn.Embedding(cfg.num_embeddings, cfg.embed_dim)
         self.embedw = torch.nn.Parameter(torch.rand(cfg.num_embeddings, cfg.embed_dim) / 128)
         self.position = torch.nn.Embedding(cfg.seqlen, cfg.embed_dim)
@@ -133,10 +131,10 @@ class GPTInfer(torch.nn.Module):
 
 class GPTDataLoader(cube.runtime.syndata.CubeDataLoader):
 
-    def __init__(self, batch_size: int):
+    def __init__(self, batch_size: int, cfg: Config = Config()):
 
         self.bs = batch_size
-        self.cfg = Config()
+        self.cfg = cfg
         super().__init__(
             shapes=([batch_size, self.cfg.seqlen],
                     [batch_size, self.cfg.seqlen],
@@ -163,12 +161,13 @@ class GPTDataLoader(cube.runtime.syndata.CubeDataLoader):
     def __next__(self):
         return self.samples[0]
 
+
 class GPTInferDataLoader(cube.runtime.syndata.CubeDataLoader):
 
-    def __init__(self, batch_size: int):
+    def __init__(self, batch_size: int, cfg: Config = Config()):
 
         self.bs = batch_size
-        self.cfg = Config()
+        self.cfg = cfg
         super().__init__(
             shapes=([batch_size, 1],
                     [batch_size, 1],
