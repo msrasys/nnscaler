@@ -129,6 +129,8 @@ class IRAdapterGener:
         """
         # remove anchor node
         graph = IRAdapterGener.remove_anchor(graph)
+        # reorder
+        graph._reorder_producer_consumer()
         # generate adapters for activation
         graph = IRAdapterGener.gen_activation(graph)
         # generate weight reducer

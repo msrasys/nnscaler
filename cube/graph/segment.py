@@ -388,6 +388,35 @@ class IRSegment(IRCell):
         if ftensor.is_attr() and ftensor in self._attributes:
             self._attributes.remove(ftensor)
 
+    def _reorder_producer_consumer(self):
+        """
+        Re-order producers and consumers for each full tensor to match
+        with the ordering of nodes.
+
+        Note sub-segment will also be reordered.
+        """
+        # clear up
+        self._ftensors, self._attributes = set(), set()
+        self._producers, self._ptensors = dict(), dict()
+        self._consumers, self._ctensors = dict(), dict()
+        # set producer and consumer
+        for node in self._nodes:
+            if isinstance(node, IRAdapter): continue
+            itensors = set(t for t in node.inputs() if isinstance(t, IRSubTensor))
+            for itensor in itensors:
+                ftensor = itensor.parent
+                self._add_ftensor(ftensor)
+                self._consumers[ftensor].append(node)
+                self._ctensors[ftensor].append(itensor)
+            otensors = set(t for t in node.outputs() if isinstance(t, IRSubTensor))
+            for otensor in otensors:
+                ftensor = otensor.parent
+                self._add_ftensor(ftensor)
+                self._producers[ftensor].append(node)
+                self._ptensors[ftensor].append(otensor)
+            if isinstance(node, IRSegment):
+                node._reorder_producer_consumer()
+
     def insert(self, node: IRCell, index: Union[int, CellPosition]):
         """
         Insert a node at index.
@@ -413,17 +442,21 @@ class IRSegment(IRCell):
             for itensor in itensors:
                 ftensor = itensor.parent
                 self._add_ftensor(ftensor)
-                idx = len([c for c in self._consumers[ftensor] if self._nodes.index(c) < index])
-                self._consumers[ftensor].insert(idx, node)
-                self._ctensors[ftensor].insert(idx, itensor)
+                # idx = len([c for c in self._consumers[ftensor] if self._nodes.index(c) < index])
+                # self._consumers[ftensor].insert(idx, node)
+                # self._ctensors[ftensor].insert(idx, itensor)
+                self._consumers[ftensor].append(node)
+                self._ctensors[ftensor].append(itensor)
             # producer
             otensors = set(t for t in node.outputs() if isinstance(t, IRSubTensor))
             for otensor in otensors:
                 ftensor = otensor.parent
                 self._add_ftensor(ftensor)
-                idx = len([c for c in self._producers[ftensor] if self._nodes.index(c) < index])
-                self._producers[ftensor].insert(idx, node)
-                self._ptensors[ftensor].insert(idx, otensor)
+                # idx = len([c for c in self._producers[ftensor] if self._nodes.index(c) < index])
+                # self._producers[ftensor].insert(idx, node)
+                # self._ptensors[ftensor].insert(idx, otensor)
+                self._producers[ftensor].append(node)
+                self._ptensors[ftensor].append(otensor)
         else:
             segment = self._nodes[pos[0]]
             assert isinstance(segment, IRSegment), "Expected IRSegment"
