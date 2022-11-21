@@ -129,8 +129,6 @@ class IRAdapterGener:
         """
         # remove anchor node
         graph = IRAdapterGener.remove_anchor(graph)
-        # reorder
-        graph._reorder_producer_consumer()
         # generate adapters for activation
         graph = IRAdapterGener.gen_activation(graph)
         # generate weight reducer
@@ -266,19 +264,28 @@ class IRAdapterGener:
         bdummies = [fwop.mirror for fwop in fdummies if fwop.mirror is not None]
         bgraph: Optional[IRSegment] = graph.mirror
 
-        # generate adapter for inter-segments
-        # FIXME: assume producers and consumers can run in parallel
+        # reorder producers and consumers
+        graph._reorder_producer_consumer()
+    
+        # local producer fusion and local consumer multiref
+        ftensors = []
         for ftensor in graph.full_tensors():
             # backward will gen in forward
             if ftensor.is_param() or ftensor.is_grad():
                 continue
-
-            # flatten gradient
+             # flatten gradient
             utils.flatten_grad(graph, ftensor)
-
             # optimization: local fusion / multiref on producer / consumer
             ftensor = IRAdapterGener.local_producer_fusion(graph, ftensor)
             IRAdapterGener.local_consumer_multiref(graph, ftensor)
+            ftensors.append(ftensor)
+        
+        # reorder again since inserted multiref could be mis-ordered
+        graph._reorder_producer_consumer()
+
+        # generate adapter for inter-segments
+        # FIXME: assume producers and consumers can run in parallel
+        for ftensor in ftensors:
 
             # print(graph.debug_tensor_map_str(ftensor))
             # print(graph.mirror.debug_tensor_map_str(ftensor.grad))

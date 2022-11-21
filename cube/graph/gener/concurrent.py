@@ -103,11 +103,15 @@ class ConcurrentGener:
         paths, fprims = ilayout.path(olayout)
 
         # re-assign the operator if miss-ordered
+        res_layout: GridLayout = paths[-1]
         names, from_dev, to_dev = [], [], []
-        for itensor, otensor in zip(paths[-1].mat.flatten(), olayout.mat.flatten()):
+        for itensor, otensor in zip(res_layout.mat.flatten(), olayout.mat.flatten()):
             assert len(itensor.device) == 1 and len(otensor.device) == 1, \
                 "Expect tensor only has one device. Report this as a bug"
             if itensor.device != otensor.device:
+                # TODO: need to be robust: multiref to a node type
+                if otensor.cell.name == 'multiref':
+                    raise RuntimeError("auto-inserted multiref cannot be re-ordered")
                 inode, onode = itensor.cell, otensor.cell
                 names.append(f'{onode.name}{onode.cid}')
                 from_dev.append(onode.device[0])
