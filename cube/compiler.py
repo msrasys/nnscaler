@@ -102,6 +102,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             resource = cube.runtime.resource.EnvResource()
 
             # run once to get model structure and tensor shape
+            start = time.time()
             outputs = fn(model, ir_dataloader)
             Program().finalize()
             if outputs is None:
@@ -110,11 +111,16 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                 outputs = [outputs]
             # setup program output
             Program().set_output(outputs)
+            span = time.time() - start
+            print('> finish parsing iteration: {:.2f} s'.format(span))
 
             # run policy
+            start = time.time()
             graph = Program().get_graph()
             assert callable(PAS), f"Policy PAS is not callable"
             graph = PAS(graph, resource)
+            span = time.time() - start
+            print('> finish policy expression: {:.2f} s'.format(span))
 
             if not isinstance(graph, IRGraph):
                 raise RuntimeError("Expected policy return IRGraph")
@@ -138,16 +144,19 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                 if CompileFlag.log_schedule:
                     print(graph.sched)
                 span = time.time() - start
-                print('> planpass on applying schedule strategy: {:.2f} s'.format(span))
+                print('> finish planpass on applying schedule strategy: {:.2f} s'.format(span))
 
             # to execution plan
+            start = time.time()
             execplan = ExecutionPlan(graph)
+            span = time.time() - start
+            print('> finish lowering to execution plan: {:.2f} s'.format(span))
 
             # plan pass for communication optimization
             start = time.time()
             execplan = DiffFusion.apply(execplan)
             span = time.time() - start
-            print('> planpass on diff-fusion operations: {:.2f} s'.format(span))
+            print('> finish planpass on diff-fusion operations: {:.2f} s'.format(span))
 
             # execplan.visualize(outfile='plan.png')
 
@@ -156,11 +165,12 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                 start = time.time()
                 execplan = Grouping.apply(execplan)
                 span = time.time() - start
-                print('> planpass on grouping operations: {:.2f} s'.format(span))
+                print('> finish planpass on grouping operations: {:.2f} s'.format(span))
 
             # execplan.graph.reset_dependency()
             # execplan.analyze(outfile='execplan.png')
 
+            start = time.time()
             local_world_size = DeviceGroup().local_world_size
             # code generation
             mgener = ModelCodeGen(execplan)
@@ -176,6 +186,9 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                     outfile = fname,
                     attach=True
                 )
+            span = time.time() - start
+            print('> finish generating code: {:.2f} seconds'.format(span))
+
             compile_end = time.time()
             compile_time = compile_end - compile_start
             print('> compile time: {:.2f} seconds'.format(compile_time))
