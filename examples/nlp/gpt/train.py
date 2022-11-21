@@ -48,7 +48,7 @@ else:
 
 def train():
 
-    batch_size = 2
+    batch_size = 4
 
     model = GPT()
     model = model if not args.fp16 else model.half()

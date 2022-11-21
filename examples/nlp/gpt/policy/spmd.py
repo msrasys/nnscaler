@@ -81,8 +81,7 @@ def PASMegatronTP(graph: IRGraph, resource):
     anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
     indices = [fnodes.index(anchor) for anchor in anchors]
     for lid, idx in enumerate(indices):
-        # why -1: multiref
-        fnodes[idx-1].comment = f'===> start of transformer layer {lid}'
+        fnodes[idx+1].comment = f'===> start of transformer layer {lid}'
 
     # attention
     attns = [node for node in fnodes if node.name == 'self_attention']
@@ -107,6 +106,30 @@ def PASMegatronTP(graph: IRGraph, resource):
     sums = [node for node in fnodes if node.name == 'sum']
     assert len(sums) == 1
     _tp(graph, sums[0], tp_devs, idx=0, dim=2)
+
+    # partition add
+    adds = [node for node in fnodes if node.name == 'add']
+    for add in adds:
+        # subnodes = _replica(graph, add, [0] * 2)
+        # for idx, sub_node in enumerate(subnodes):
+        #     _tp(graph, sub_node, [0,1] if idx == 0 else [2,3], idx=0, dim=1)
+        # _tp(graph, add, tp_devs, idx=0, dim=1)
+        subnodes = _tp(graph, add, [0] * 2, idx=0, dim=1)
+        for idx, sub_node in enumerate(subnodes):
+            _replica(graph, sub_node, [0,1] if idx == 0 else [2,3])
+
+    # partition layernorm
+    lns = [node for node in fnodes if node.name == 'layernorm']
+    assert len(lns) > 0
+    for ln in lns:
+        # _tp(graph, ln, tp_devs, idx=0, dim=1)
+        # subnodes = _replica(graph, ln, [0] * 2)
+        # for idx, sub_node in enumerate(subnodes):
+        #     _tp(graph, sub_node, [0,1] if idx == 0 else [2,3], idx=0, dim=1)
+        subnodes = _tp(graph, ln, [0] * 2, idx=0, dim=1)
+        for idx, sub_node in enumerate(subnodes):
+            _replica(graph, sub_node, [0,1] if idx == 0 else [2,3])
+
 
     # replicate other nodes
     for node in graph.nodes():
