@@ -108,27 +108,27 @@ def PASMegatronTP(graph: IRGraph, resource):
     _tp(graph, sums[0], tp_devs, idx=0, dim=2)
 
     # partition add
-    adds = [node for node in fnodes if node.name == 'add']
-    for add in adds:
-        # subnodes = _replica(graph, add, [0] * 2)
-        # for idx, sub_node in enumerate(subnodes):
-        #     _tp(graph, sub_node, [0,1] if idx == 0 else [2,3], idx=0, dim=1)
-        # _tp(graph, add, tp_devs, idx=0, dim=1)
-        subnodes = _tp(graph, add, [0] * 2, idx=0, dim=1)
-        for idx, sub_node in enumerate(subnodes):
-            _replica(graph, sub_node, [0,1] if idx == 0 else [2,3])
-
-    # partition layernorm
-    lns = [node for node in fnodes if node.name == 'layernorm']
-    assert len(lns) > 0
-    for ln in lns:
-        # _tp(graph, ln, tp_devs, idx=0, dim=1)
-        # subnodes = _replica(graph, ln, [0] * 2)
-        # for idx, sub_node in enumerate(subnodes):
-        #     _tp(graph, sub_node, [0,1] if idx == 0 else [2,3], idx=0, dim=1)
-        subnodes = _tp(graph, ln, [0] * 2, idx=0, dim=1)
-        for idx, sub_node in enumerate(subnodes):
-            _replica(graph, sub_node, [0,1] if idx == 0 else [2,3])
+    # adds = [node for node in fnodes if node.name == 'add']
+    # for add in adds:
+    #     # subnodes = _replica(graph, add, [0] * 2)
+    #     # for idx, sub_node in enumerate(subnodes):
+    #     #     _tp(graph, sub_node, [0,1] if idx == 0 else [2,3], idx=0, dim=1)
+    #     # _tp(graph, add, tp_devs, idx=0, dim=1)
+    #     subnodes = _tp(graph, add, [0] * 2, idx=0, dim=1)
+    #     for idx, sub_node in enumerate(subnodes):
+    #         _replica(graph, sub_node, [0,1] if idx == 0 else [2,3])
+    # 
+    # # partition layernorm
+    # lns = [node for node in fnodes if node.name == 'layernorm']
+    # assert len(lns) > 0
+    # for ln in lns:
+    #     # _tp(graph, ln, tp_devs, idx=0, dim=1)
+    #     # subnodes = _replica(graph, ln, [0] * 2)
+    #     # for idx, sub_node in enumerate(subnodes):
+    #     #     _tp(graph, sub_node, [0,1] if idx == 0 else [2,3], idx=0, dim=1)
+    #     subnodes = _tp(graph, ln, [0] * 2, idx=0, dim=1)
+    #     for idx, sub_node in enumerate(subnodes):
+    #         _replica(graph, sub_node, [0,1] if idx == 0 else [2,3])
 
 
     # replicate other nodes
