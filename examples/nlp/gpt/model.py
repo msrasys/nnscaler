@@ -23,8 +23,10 @@ class Config:
 def build_gpt_config(name: str) -> Config:
     if name == '350M':
         embed_dim, layers, attention_heads = 1024, 24, 16
+    elif name == '760M':
+        embed_dim, layers, attention_heads = 1536, 24, 16
     elif name == '1.3B':
-        embed_dim, layers, attention_heads = 2048, 24, 32
+        embed_dim, layers, attention_heads = 2048, 24, 24
     elif name == '2.6B':
         embed_dim, layers, attention_heads = 2560, 32, 32
     elif name == '6.7B':
