@@ -124,7 +124,9 @@ class CudaTimer:
         return getattr(self.instance, name)
 
     def clear(self):
-        self.instance = CudaTimer.__CudaTimer()
+        CudaTimer.instance = CudaTimer.__CudaTimer(
+            enable=self.enabled, predefined=self.predefined
+        )
 
     def print_all(self, times: int, rank_only: Optional[int] = None):
         """
