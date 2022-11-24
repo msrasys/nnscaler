@@ -16,6 +16,8 @@ def memory_summary():
     print_each_rank(
         '{:.2f} GB memory consumption'.format(mem / 1024 / 1024 / 1024),
     )
+    
+    return mem
 
 
 def model_summary(model: torch.nn.Module, inputs: List[Any], do_eval=False, max_depth=6):
