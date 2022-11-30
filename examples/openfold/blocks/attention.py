@@ -160,7 +160,7 @@ def col_attn(msa_repr: torch.Tensor, gate_proj: torch.Tensor,
     return out
 
 
-@cube.graph.parser.register('N S^ R^ M^, M^ (head+ dim^), M^ E^, M^ E^, M^ (head+ dim^), (head+ dim) M^ -> N S^ R^ M^', name='MSAColGlobalAttention')
+# @cube.graph.parser.register('N S^ R^ M^, M^ (head+ dim^), M^ E^, M^ E^, M^ (head+ dim^), (head+ dim) M^ -> N S^ R^ M^', name='MSAColGlobalAttention')
 def global_attn(msa_repr: torch.Tensor, q_proj: torch.Tensor,
                           k_proj: torch.Tensor, v_proj: torch.Tensor,
                           gate_proj: torch.Tensor, out_proj: torch.Tensor,

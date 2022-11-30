@@ -41,20 +41,6 @@ def _replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
         graph.assign(sub_node, devid)
     return sub_nodes
 
-# coshard
-def _coshard(graph: IRGraph, node: IRFwOperation, devs: List[int], colocate: int,
-             idx: int, dim: int):
-    algo = node.algorithms('dim')
-    sub_nodes = graph.partition(node, algo, idx=idx, dim=dim, num=colocate*len(devs))
-    assert sub_nodes is not None
-    graph.recompute(sub_nodes)
-    for devid in devs:
-        for coid in range(colocate):
-            sub_node = sub_nodes[devid * colocate + coid]
-            graph.assign(sub_node, devid)
-    return sub_nodes
-
-
 def PASSingle(graph: IRGraph, resource):
     assert resource.ngpus == 1
     # print(graph.extra_repr())
@@ -108,6 +94,12 @@ def PASTP(graph: IRGraph, resource):
         elif node.name == 'tri_attn_end':
             _tp(graph, node, tp_devs, idx=1, dim=1)
         elif node.name == 'outer_prod_mean':
+            _tp(graph, node, tp_devs, idx=0, dim=1)
+        elif node.name == 'tmi_projection':
+            _tp(graph, node, tp_devs, idx=0, dim=2)
+        elif node.name == 'tmi_projection':
+            _tp(graph, node, tp_devs, idx=0, dim=1)
+        elif node.name == 'tmi_gating' or node.name == 'tmo_gating':
             _tp(graph, node, tp_devs, idx=0, dim=1)
         else:
             _replica(graph, node, tp_devs)

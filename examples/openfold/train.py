@@ -18,10 +18,25 @@ import argparse
 cube.init()
 
 parser = argparse.ArgumentParser(description='AlphaFold Train')
-parser.add_argument('--policy', type=str, help='PAS policy choice, starting with PAS')
 parser.add_argument('--fp16', action='store_true', default=False,
                     help='use fp16 for the training')
+parser.add_argument('--layers', type=int, default=48,
+                    help='evoformer layer number')
+parser.add_argument('--msa-hidden', type=int, default=256,
+                    help='cm value')
+parser.add_argument('--pair-hidden', type=int, default=128,
+                    help='cz value')
+parser.add_argument('--head-dim', type=int, default=32,
+                    help='c value')
+parser.add_argument('--mbs', type=int, default=1,
+                    help='micro batch size')
+parser.add_argument('--gbs', type=int, default=1,
+                    help='global batch size')
+
 args = parser.parse_args()
+assert args.gbs % args.mbs == 0
+assert args.msa_hidden % args.head_dim == 0
+assert args.pair_hidden % args.head_dim == 0
 
 
 def nparams(model) -> int:
@@ -33,7 +48,11 @@ def nparams(model) -> int:
 
 def train():
 
-    cfg = Config()
+    cfg = Config(evoformer_cm=args.msa_hidden, evoformer_cz=args.pair_hidden,
+                 evoformer_c=args.head_dim, evoformer_nlayers=args.layers,
+                 bs=args.mbs)
+    print_each_rank(cfg, rank_only=0)
+
     model = AlphaFold(cfg)
     if args.fp16:
         model = model.half()
@@ -69,8 +88,8 @@ def train():
     for step in range(iter_num):
         if step == warmup:
             CudaTimer(enable=True, predefined=True).start('e2e')
-
-        train_iter(model, dataloader)
+        for _ in range(args.gbs // args.mbs):
+            train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
 

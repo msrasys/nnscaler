@@ -2,14 +2,11 @@ import torch
 from examples.openfold.blocks.attention import MSARowAttention, MSAColAttention, Transition, TriangleAttentionNodeStart, TriangleAttentionNodeEnd
 from examples.openfold.blocks.tmu import TriangleMultiplicativeUpdate
 from examples.openfold.blocks.opm import OuterProducterMean
+from examples.openfold.blocks.utils import multi2ref
 
 import math
 import cube
 
-
-@cube.graph.parser.register('* -> *, *', name='multi2ref')
-def multi2ref(x: torch.Tensor):
-    return (x, x)
 
 
 class Evoformer(torch.nn.Module):
