@@ -1,4 +1,5 @@
 from cube import runtime
+from cube import profiler
 
 from cube.compiler import SemanticModel, compile
 
