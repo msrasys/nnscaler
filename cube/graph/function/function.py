@@ -51,6 +51,21 @@ def BatchLinear(signature, inputs):
     return IRDimops(BatchLinear, 'bmm', signature, annos, inputs)
 
 
+def Matmul(signature, inputs: Tuple[IRTensor, IRTensor]):
+    assert len(inputs) == 2
+    annos = [
+        'm k+, k+ n -> m n',
+        'k+, k+ n -> n',
+        'm k+, k+ -> m',
+        '* m k+, k+ n -> * m n',
+        '* m k+, * k+ n -> * m n'  # TODO: broadcast
+    ]
+    lhs, rhs = inputs
+    if len(lhs.shape) > 2 and len(rhs.shape) > 2:
+        assert tuple(lhs.shape[:-2]) == tuple(rhs.shape[:-2]), "broadcast of matmul (bmm) is not supported"
+    return IRDimops(Matmul, 'matmul', signature, annos, inputs)
+
+
 def Zeros(signature,
           inputs: Tuple[ List[int], Optional[int], Optional[Any], ErasedDevice, Optional[bool] ]):
     # zeros(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor

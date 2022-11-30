@@ -63,6 +63,8 @@ class Sign2Op:
 
         __ftemplate('linear') : function.Linear,
 
+        __ttemplate('matmul'): function.Matmul,
+
         __ftemplate('softmax') : function.Softmax,
 
         __ftemplate('dropout') : function.Dropout,
