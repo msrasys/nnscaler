@@ -34,7 +34,7 @@ class DPDataLoader(GenericDistAlgo):
 
     def instantiate(self, num: int):
         if not self.satisfy(num):
-            return False
+            return None
         node: IRDataOperation = self.node
         dims: List[int] = node.get_batch_dims()
 
