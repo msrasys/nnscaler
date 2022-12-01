@@ -5,41 +5,53 @@ from cube.ir.cten import IRCell
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 
+import more_itertools
+import numpy as np
+
 
 def _group_to_evoformers(fnodes) -> List[List[IRCell]]:
     # group to evoformer layers
     evoformers: List[List[IRFwOperation]] = []
-    anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
+    anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor) and node.name == 'Evoformer Start']
     indices = [fnodes.index(anchor) for anchor in anchors]
     for lid, idx in enumerate(indices):
-        fnodes[idx+1].comment = f'===> start of transformer layer {lid}'
+        # get first forward op
+        for fnode in fnodes[idx+1:]:
+            if not isinstance(fnode, IRGraphAnchor): break
+        fnode.comment = f'===> start of evoformer layer {lid}'
         start = idx if lid != 0 else 0
         end = indices[lid+1] if lid + 1 < len(anchors) else len(fnodes)
         evoformers.append(fnodes[start:end])
-    for lid in range(len(evoformers) - 1):
-        if evoformers[lid][-1].name == 'multiref':
-            node = evoformers[lid].pop()
-            evoformers[lid+1].insert(0, node)
+    print(f'find {len(indices)} evoformer layers')
     return evoformers
 
 # ========================= parallelisms =================================
 
 # tensor parallelism
-def _tp(graph: IRGraph, node: IRFwOperation, devs: List[int],
-        idx: int, dim: int, tag='dim'):
-    algo = node.algorithms(tag)
-    sub_nodes = graph.partition(node, algo, idx=idx, dim=dim, num=len(devs))
-    assert sub_nodes is not None
+def _tp(graph: IRGraph, node: IRFwOperation, devs: List[int], tag='dim', **config):
+    if len(devs) == 1:
+        sub_nodes = [node]
+    else:
+        algo = node.algorithms(tag)
+        sub_nodes = graph.partition(node, algo, num=len(devs), **config)
+        assert sub_nodes is not None
     for devid, sub_node in zip(devs, sub_nodes):
-        graph.assign(sub_node, devid)
+        graph.assign(sub_node, int(devid))
     return sub_nodes
 
 # replicate
 def _replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
-    sub_nodes = graph.replicate(node, times=len(devs))
+    if len(devs) == 1:
+        sub_nodes = [node]
+    else:
+        sub_nodes = graph.replicate(node, times=len(devs))
     for devid, sub_node in zip(devs, sub_nodes):
-        graph.assign(sub_node, devid)
+        graph.assign(sub_node, int(devid))
     return sub_nodes
+
+
+# ========================= policies =================================
+
 
 def PASSingle(graph: IRGraph, resource):
     assert resource.ngpus == 1
@@ -72,35 +84,72 @@ def PASDP(graph: IRGraph, resource):
     return graph
 
 
-def PASTP(graph: IRGraph, resource):
-    tp_size = resource.ngpus
-    tp_devs = list(range(tp_size))
+def PASDAP(graph: IRGraph, resource, tp: int, dp: int):
+    assert tp * dp == resource.ngpus
+
+    devmesh = np.arange(resource.ngpus).reshape(dp, tp)
+    tp_devs = list(range(tp))
+
+    dataloader: IRDataOperation = graph.select(ntype=IRDataOperation)[0]
+    bs = dataloader.output(0).shape[dataloader.get_batch_dims()[0]]
+    print(f'> get batch size: {bs}')
+    dls: List[IRDataOperation] = _replica(graph, dataloader, tp_devs)
+    for tp_idx, dl in enumerate(dls):
+        dp_devs = devmesh[:,tp_idx]
+        _tp(graph, dl, dp_devs, 'data')
 
     # grouping
     evoformers = _group_to_evoformers(graph.select(ntype=IRFwOperation))
     for layer in evoformers:
         graph.recompute(layer)
 
-    for node in graph.select(ntype=(IRDataOperation, IRFwOperation)):
-        if isinstance(node, IRGraphAnchor): continue
-        if node.name == 'row_attn':
-            _tp(graph, node, tp_devs, idx=2, dim=1)
-        elif node.name == 'col_attn':
-            _tp(graph, node, tp_devs, idx=1, dim=1)
-        elif node.name == 'feedforward':
-            _tp(graph, node, tp_devs, idx=1, dim=1)
-        elif node.name == 'tri_attn_start':
-            _tp(graph, node, tp_devs, idx=1, dim=1)
-        elif node.name == 'tri_attn_end':
-            _tp(graph, node, tp_devs, idx=1, dim=1)
-        elif node.name == 'outer_prod_mean':
-            _tp(graph, node, tp_devs, idx=0, dim=1)
-        elif node.name == 'tmi_projection':
-            _tp(graph, node, tp_devs, idx=0, dim=2)
-        elif node.name == 'tmi_projection':
-            _tp(graph, node, tp_devs, idx=0, dim=1)
-        elif node.name == 'tmi_gating' or node.name == 'tmo_gating':
-            _tp(graph, node, tp_devs, idx=0, dim=1)
+    fnodes = graph.select(ntype=IRFwOperation)
+    fnodes = [fnode for fnode in fnodes if fnode.name != 'Evoformer Start']
+    
+    node_groups = more_itertools.split_at(fnodes, lambda n: isinstance(n, IRGraphAnchor))
+    
+    for nodes in node_groups:
+        # tensor parallelism
+        names = set(n.name for n in nodes)
+        subnodes = []
+        if len(names) == 1 or 'mul' in names:  # for first layer norm operators
+            for node in nodes:
+                subnodes.append(_replica(graph, node, tp_devs))
+        elif 'row_attn' in names:
+            for node in nodes:
+                subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=1))
+        elif 'col_attn' in names:
+            for node in nodes:
+                subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=2))
+        elif 'opm' in names:
+            for node in nodes:
+                subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=2))
+        elif 'tmo' in names:
+            for node in nodes:
+                subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=1))
+        elif 'tmi' in names:
+            for node in nodes:
+                subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=2))
+        elif 'tri_attn_start' in names:
+            for node in nodes:
+                subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=1))
+        elif 'tri_attn_end' in names:
+            for node in nodes:
+                subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=2))
+        elif 'feedforward' in names:
+            for node in nodes:
+                subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=1))
         else:
-            _replica(graph, node, tp_devs)
+            assert False, names
+        # data parallelism
+        for ns in subnodes:
+            for tp_idx, subnode in enumerate(ns):
+                dp_devs = devmesh[:,tp_idx]
+                if bs in subnode.input(0).shape:
+                    dim = subnode.input(0).shape.index(bs)
+                    _tp(graph, subnode, dp_devs, idx=0, dim=dim)
+                else:
+                    print(f'replicate op on data parallel group: {node.name}')
+                    _replica(graph, subnode, dp_devs)
+
     return graph

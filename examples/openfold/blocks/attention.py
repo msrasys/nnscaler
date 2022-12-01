@@ -147,7 +147,7 @@ def row_attn(msa_repr: torch.Tensor, pair_repr: torch.Tensor,
                         head, c, scale, chunk_size, is_train)
 
 
-@cube.graph.parser.register('N S R^ M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^ -> N S R^ M^', name='col_attn')
+@cube.graph.parser.register('N S^ R M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^ -> N S^ R M^', name='col_attn')
 def col_attn(msa_repr: torch.Tensor, gate_proj: torch.Tensor,
              qkv_proj: torch.Tensor, out_proj: torch.Tensor, head: int,
              c: int, scale: float, chunk_size: int, is_train: bool):
@@ -211,24 +211,26 @@ def feedforward(msa_repr: torch.Tensor, proj1: torch.Tensor, proj2: torch.Tensor
     return x
 
 
-@cube.graph.parser.register('N S R^ Z^, Z^ (head+ dim), Z^ (head+ dim 3), (head+ dim) Z^, Z^ head+ -> N S R^ Z^', name='tri_attn_start')
+@cube.graph.parser.register('N S R^ Z^, Z^ (head+ dim), Z^ (head+ dim 3), (head+ dim) Z^, N R^ R^ head+ -> N S R^ Z^', name='tri_attn_start')
 def tri_attn_start(pair_repr: torch.Tensor,
                    gate: torch.Tensor, qkv: torch.Tensor,
                    out: torch.Tensor, bias: torch.Tensor,
                    head: int, c: int, scale: float,
                    chunk_size: int, is_train: bool):
-    bias = torch.matmul(pair_repr, bias).permute(0, 3, 1, 2).unsqueeze(1)
+    # bias = torch.matmul(pair_repr, bias).permute(0, 3, 1, 2).unsqueeze(1)
+    bias = bias.permute(0, 3, 1, 2).unsqueeze(1)
     out = msa_attn_bias(pair_repr, gate, qkv, out, bias,
                         head, c, scale, chunk_size, is_train)
     return out
 
 
-@cube.graph.parser.register('N S R^ Z^, Z^ (head+ dim), Z^ (head+ dim 3), (head+ dim) Z^, Z head+ -> N S R^ Z^', name='tri_attn_end')
+@cube.graph.parser.register('N S^ R Z^, Z^ (head+ dim), Z^ (head+ dim 3), (head+ dim) Z^, N S^ S^ head+ -> N S^ R Z^', name='tri_attn_end')
 def tri_attn_end(pair_repr: torch.Tensor,
                  gate: torch.Tensor, qkv: torch.Tensor,
                  out: torch.Tensor, bias: torch.Tensor,
                  head: int, c: int, scale: float, chunk_size: int, is_train: bool):
-    bias = torch.matmul(pair_repr, bias).permute(0, 3, 2, 1).unsqueeze(1)
+    # bias = torch.matmul(pair_repr, bias).permute(0, 3, 2, 1).unsqueeze(1)
+    bias = bias.permute(0, 3, 2, 1).unsqueeze(1)
     pair_repr = pair_repr.permute(0, 2, 1, 3)
     out = msa_attn_bias(pair_repr, gate, qkv, out, bias,
                         head, c, scale, chunk_size, is_train)
@@ -321,9 +323,13 @@ class TriangleAttentionNodeStart(torch.nn.Module):
         self.bias = torch.nn.Parameter(torch.empty(cz, pair_head))
 
     def forward(self, pair_repr: torch.Tensor):
+        """
+        pair_repr: N R R cz
+        """
         pair_repr = self.layer_norm(pair_repr)
+        bias = torch.matmul(pair_repr, self.bias)
         pair_repr = tri_attn_start(
-            pair_repr, self.gate, self.qkv, self.out, self.bias,
+            pair_repr, self.gate, self.qkv, self.out, bias,
             self.heads, self.c, self.scale, self.chunk_size, self.training
         )
         return pair_repr
@@ -345,8 +351,9 @@ class TriangleAttentionNodeEnd(torch.nn.Module):
 
     def forward(self, pair_repr: torch.Tensor):
         pair_repr = self.layer_norm(pair_repr)
+        bias = torch.matmul(pair_repr, self.bias)
         pair_repr = tri_attn_end(
-            pair_repr, self.gate, self.qkv, self.out, self.bias,
+            pair_repr, self.gate, self.qkv, self.out, bias,
             self.heads, self.c, self.scale, self.chunk_size, self.training
         )
         return pair_repr

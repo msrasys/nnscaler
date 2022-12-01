@@ -3,119 +3,59 @@ import torch
 from examples.openfold.blocks.utils import multi2ref
 
 
-# @cube.graph.parser.register('N S R Z, Z E, Z E, Z E, Z E, Z Z, E, E, E Z -> N S R Z')
-@torch.jit.ignore
-def tmu(pair_repr: torch.Tensor, 
-        left1: torch.Tensor, left2: torch.Tensor,
-        right1: torch.Tensor, right2: torch.Tensor,
-        gate: torch.Tensor, 
-        norm_weight: torch.Tensor, norm_bias: torch.Tensor,
-        out: torch.Tensor, outgoing: bool) -> torch.Tensor:
-    # cube.profiler.CudaTimer().start('tmu')
-    # Note S == R
-    # left projection: N S R Z^, Z^ E, Z^ E -> N S R E
-    left = torch.matmul(pair_repr, left1)
-    left = torch.sigmoid(left)
-    left = left * torch.matmul(pair_repr, left2)
-    # right projection: N S R Z^, Z^ E, Z^ E -> N S R E
-    right = torch.matmul(pair_repr, right1)
-    right = torch.sigmoid(right)
-    right = right * torch.matmul(pair_repr, right2)
-    if outgoing:
-        # N S R E -> N E S R
-        left = left.permute(0, 3, 1, 2)
-        # N S R E -> N E R S
-        right = right.permute(0, 3, 2, 1)
-    else:
-        # N S R E -> N E R S
-        left = left.permute(0, 3, 2, 1)
-        # N S R E -> N E S R
-        right = right.permute(0, 3, 1, 2)
-    # N E S R+, N E R+ S -> N E S S -> N S S E (for out)
-    # N E R S+, N E S+ R -> N E R R -> N R R E (for in)
-    p = torch.matmul(left, right).permute(0, 2, 3, 1)
-    e = p.size(3)
-    # N S S E^ -> N S S E^
-    p = torch.nn.functional.layer_norm(p, (e,), norm_weight, norm_bias)
-    # N S S E+, E+ Z -> N S S Z
-    p = torch.matmul(p, out)
-    if not outgoing:
-        p = p.permute(0, 2, 1, 3)
-    # gate: N S R Z+, Z+ Z -> N S R Z
-    g = torch.matmul(pair_repr, gate)
-    g = torch.sigmoid(g)
-    # N S S Z, N S R Z -> N S R Z (broadcast R == S == 0)
-    p = p * g
-    # cube.profiler.CudaTimer().stop('tmu')
-    return p
+# @cube.graph.parser.register('N S R Z^, Z^ E, Z^ E -> N S R E')
+# def tmu_projection(pair_repr: torch.Tensor, proj1: torch.Tensor, proj2: torch.Tensor):
+#     x = torch.matmul(pair_repr, proj1)
+#     x = torch.sigmoid(x)
+#     x = x * torch.matmul(pair_repr, proj2)
+# 
+# 
+# @cube.graph.parser.register('N S R Z+, Z+ E-> N S R E')
+# def tmu_gate(pair_repr: torch.Tensor, proj: torch.Tensor):
+#     return torch.sigmoid(torch.matmul(pair_repr, proj))
 
 
-@cube.graph.parser.register('N S^ R+ Z^, Z^ E, Z^ E, Z^ E, Z^ E -> N S S E', name='tmi_projection')
-@torch.jit.ignore
-def tmi_projection(pair_repr: torch.Tensor, 
+@cube.graph.parser.register('N S R Z^, Z^ E^, Z^ E^, Z^ E, Z^ E^, Z^ Z^ -> N S R E, N S R E^, N S R Z^', name='tmu_projection')
+def tmu_projection(pair_repr: torch.Tensor, 
                    left1: torch.Tensor, left2: torch.Tensor,
-                   right1: torch.Tensor, right2: torch.Tensor) -> torch.Tensor:
-    # left projection: N S R Z^, Z^ E, Z^ E -> N S R E
+                   right1: torch.Tensor, right2: torch.Tensor,
+                   gate: torch.Tensor):
+    # left
     left = torch.matmul(pair_repr, left1)
     left = torch.sigmoid(left)
     left = left * torch.matmul(pair_repr, left2)
-    # right projection: N S R Z^, Z^ E, Z^ E -> N S R E
+    # right
     right = torch.matmul(pair_repr, right1)
     right = torch.sigmoid(right)
     right = right * torch.matmul(pair_repr, right2)
-    # N S R E -> N E S R
-    left = left.permute(0, 3, 1, 2)
-    # N S R E -> N E R S
-    right = right.permute(0, 3, 2, 1)
-    # N E S R+, N E R+ S -> N E S S -> N S S E
-    p = torch.matmul(left, right).permute(0, 2, 3, 1)
-    return p
+    # gate
+    gate = torch.sigmoid(torch.matmul(pair_repr, gate))
+
+    return left, right, gate
 
 
-
-@cube.graph.parser.register('N S R Z^, N R S E, E Z^, Z^ Z^ -> N S R Z^')
-@torch.jit.ignore
-def tmi_gating(pair_repr: torch.Tensor, p: torch.Tensor, out: torch.Tensor, gate: torch.Tensor):
-    # N S R Z+, Z+ Z -> N S R Z
-    g = torch.matmul(pair_repr, gate)
-    g = torch.sigmoid(g)
-    # N R S E+, E+ Z -> N R S Z -> N S R Z
-    p = torch.matmul(p, out).permute(0, 2, 1, 3)
-    p = p * g
-    return p
-
-
-@cube.graph.parser.register('N S+ R^ Z^, Z^ E, Z^ E, Z^ E, Z^ E -> N R R E', name='tmo_projection')
-def tmo_projection(pair_repr: torch.Tensor, 
-                   left1: torch.Tensor, left2: torch.Tensor,
-                   right1: torch.Tensor, right2: torch.Tensor) -> torch.Tensor:
-    # left projection: N S R Z^, Z^ E, Z^ E -> N S R E
-    left = torch.matmul(pair_repr, left1)
-    left = torch.sigmoid(left)
-    left = left * torch.matmul(pair_repr, left2)
-    # right projection: N S R Z^, Z^ E, Z^ E -> N S R E
-    right = torch.matmul(pair_repr, right1)
-    right = torch.sigmoid(right)
-    right = right * torch.matmul(pair_repr, right2)
-    # N S R E -> N E R S
-    left = left.permute(0, 3, 2, 1)
-    # N S R E -> N E S R
-    right = right.permute(0, 3, 1, 2)
-    # N E R S+, N E S+ R -> N E R R -> N R R E
-    p = torch.matmul(left, right).permute(0, 2, 3, 1)
-    return p
-
-
-@cube.graph.parser.register('N S R Z^, N S R E^, E^ Z^, Z^ Z^ -> N S R Z^')
-def tmo_gating(pair_repr: torch.Tensor, p: torch.Tensor, out: torch.Tensor, gate: torch.Tensor):
-    # N S R Z+, Z+ Z -> N S R Z
-    g = torch.matmul(pair_repr, gate)
-    g = torch.sigmoid(g)
-    # N S R E+, E+ Z -> N S R Z
+@cube.graph.parser.register('N S R^ E, N T^ R^ E^, N S^ T^ Z^, E^, E^, E^ Z^ -> N S T^ Z^', name='tmo')
+def tmo(left: torch.Tensor, right: torch.Tensor, gate: torch.Tensor,
+        norm_w: torch.Tensor, norm_b: torch.Tensor, out: torch.Tensor):
+    a = left.permute(0, 3, 1, 2)
+    b = right.permute(0, 3, 2, 1)
+    p = torch.matmul(a, b).permute(0, 2, 3, 1)
+    p = torch.nn.functional.layer_norm(p, (128, ), norm_w, norm_b)
     p = torch.matmul(p, out)
-    p = p * g
+    p = p * gate
     return p
 
+
+@cube.graph.parser.register('N R^ S E, N R^ T^ E^, N T^ S^ Z^, E^, E^, E^ Z^ -> N T^ S Z^', name='tmi')
+def tmi(left: torch.Tensor, right: torch.Tensor, gate: torch.Tensor,
+        norm_w: torch.Tensor, norm_b: torch.Tensor, out: torch.Tensor):
+    a = left.permute(0, 3, 2, 1)
+    b = right.permute(0, 3, 1, 2)
+    p = torch.matmul(a, b).permute(0, 2, 3, 1)
+    p = torch.nn.functional.layer_norm(p, (128, ), norm_w, norm_b)
+    p = torch.matmul(p, out)
+    p = p.permute(0, 2, 1, 3) * gate
+    return p
 
 
 class TriangleMultiplicativeUpdate(torch.nn.Module):
@@ -129,9 +69,10 @@ class TriangleMultiplicativeUpdate(torch.nn.Module):
         self.right1 = torch.nn.Parameter(torch.empty(cz, mult))
         self.right2 = torch.nn.Parameter(torch.empty(cz, mult))
         
-        self.norm = torch.nn.LayerNorm(mult)
-        # self.normw = torch.nn.Parameter(torch.empty(mult))
-        # self.normb = torch.nn.Parameter(torch.empty(mult))
+        # self.norm = torch.nn.LayerNorm(mult)
+        self.normw = torch.nn.Parameter(torch.empty(mult))
+        self.normb = torch.nn.Parameter(torch.empty(mult))
+
         self.out = torch.nn.Parameter(torch.empty(mult, cz))
         self.gate = torch.nn.Parameter(torch.empty(cz, cz))
         self.outgoing = outgoing
@@ -142,20 +83,16 @@ class TriangleMultiplicativeUpdate(torch.nn.Module):
         """
         residual = pair_repr
         pair_repr = self.layer_norm(pair_repr)
-        # ====================== break for tp =======================
-        pair_repr1, pair_repr2 = multi2ref(pair_repr)
+
+        left, right, gate = tmu_projection(pair_repr,
+            self.left1, self.left2, 
+            self.right1, self.right2, self.gate
+        )
+
         if self.outgoing:
-            p = tmi_projection(pair_repr1, self.left1, self.left2, self.right1, self.right2)
+            pair_repr = tmo(left, right, gate, self.normw, self.normb, self.out)
         else:
-            p = tmo_projection(pair_repr1, self.left1, self.left2, self.right1, self.right2)
-        p = self.norm(p)
-        if self.outgoing:
-            pair_repr = tmi_gating(pair_repr2, p, self.out, self.gate)
-        else:
-            pair_repr = tmo_gating(pair_repr2, p, self.out, self.gate)
-        # ======================= intergrate version ==================
-        # pair_repr = tmu(pair_repr, 
-        #     self.left1, self.left2, self.right1, self.right2,
-        #     self.gate, self.normw, self.normb, self.out, self.outgoing)
+            pair_repr = tmi(left, right, gate, self.normw, self.normb, self.out)
+
         pair_repr = residual + pair_repr
         return pair_repr

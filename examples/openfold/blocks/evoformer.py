@@ -68,47 +68,46 @@ class Evoformer(torch.nn.Module):
 
     def forward(self, msa_repr, pair_repr):
 
+        cube.runtime.function.anchor('MSARow')
         pair_repr, dummy_pair_repr = multi2ref(pair_repr)
-
-        # msa row attention
         residual = msa_repr
         msa_repr = self.row_norm_m(msa_repr)
         dummy_pair_repr = self.row_norm_z(dummy_pair_repr)
         msa_repr = residual + self.row_attn(msa_repr, dummy_pair_repr)
 
-        # msa column attention
+        cube.runtime.function.anchor('MSACol')
         residual = msa_repr
         msa_repr = self.col_norm(msa_repr)
         msa_repr = residual + self.col_attn(msa_repr)
 
-        # msa transition
+        # cube.runtime.function.anchor('MSATrans')
         residual = msa_repr
         msa_repr = self.msa_transition_norm(msa_repr)
         msa_repr = self.msa_transition(msa_repr)
         msa_repr = residual + msa_repr
-
         succ_msa_repr, msa_repr = multi2ref(msa_repr)
 
-        # out product mean
+        cube.runtime.function.anchor('OPM')
         msa_repr = self.outer_norm(msa_repr)
         pair_repr = pair_repr + self.outer_prod_mean(msa_repr)
 
-        # triangle multiplicative out-going edges
+        cube.runtime.function.anchor('TMO')
         pair_repr = self.tmo(pair_repr)
-        # triangle multiplicative in-going edges
+
+        cube.runtime.function.anchor('TMI')
         pair_repr = self.tmi(pair_repr)
 
-        # pair attention start
+        cube.runtime.function.anchor('TANS')
         residual = pair_repr
         pair_repr = self.tri_attn_node_start(pair_repr)
         pair_repr = residual + pair_repr
 
-        # pair attention end
+        cube.runtime.function.anchor('TANE')
         residual = pair_repr
         pair_repr = self.tri_attn_node_end(pair_repr)
         pair_repr = residual + pair_repr
 
-        # pair transition
+        cube.runtime.function.anchor('PairTrans')
         residual = pair_repr
         pair_repr = self.pair_transition_norm(pair_repr)
         pair_repr = self.pair_transition(pair_repr)
