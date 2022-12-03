@@ -1,3 +1,4 @@
+from typing import Tuple
 import torch
 from examples.openfold.blocks.attention import MSARowAttention, MSAColAttention, Transition, TriangleAttentionNodeStart, TriangleAttentionNodeEnd
 from examples.openfold.blocks.tmu import TriangleMultiplicativeUpdate
@@ -8,6 +9,22 @@ import math
 import cube
 
 
+# @cube.graph.parser.register('N S^ R^ cm^, N R^ R^ cz^ -> N out^')
+# @torch.jit.ignore
+# def input_packing(msa: torch.Tensor, pair: torch.Tensor, out: int) -> torch.Tensor:
+#     buffer = torch.cat((torch.flatten(msa, start_dim=1), torch.flatten(pair, start_dim=1)))
+#     return buffer
+# 
+# 
+# @cube.graph.parser.register('N out^ -> N S^ R^ cm^, N R^ R^ cz^', name='input_unflatten')
+# @torch.jit.ignore
+# def input_unpacking(buffer: torch.Tensor,
+#                     S: int, R: int, cm: int, cz: int) -> Tuple[torch.Tensor, torch.Tensor]:
+#     msa_nele = S * R * cm
+#     msa = buffer[:,:msa_nele].reshape(buffer.size(0), S, R, cm)
+#     pair = buffer[:,msa_nele:].reshape(buffer.size(0), R, R, cz)
+#     return msa, pair
+
 
 class Evoformer(torch.nn.Module):
     """
@@ -16,13 +33,14 @@ class Evoformer(torch.nn.Module):
     The mask and dropout is ommited for simplicity.
     """
 
-    def __init__(self, s: int, cm: int, cz: int,
+    def __init__(self, s: int, r: int, cm: int, cz: int,
                  use_chunk=False, is_train=True,
                  c=32, msa_head=8, pair_head=4,
                  c_tri_mult=128, ff_mult=4):
         super().__init__()
 
-        self.s, self.cm, self.cz, self.c = s, cm, cz, c
+        self.s, self.r, self.cm, self.cz, self.c = s, r, cm, cz, c
+        self.fout = self.s * self.r * self.cm + self.r * self.r * self.cz
         self.msa_head, self.pair_head = msa_head, pair_head
         self.c_tri_mult, self.ff_mult = c_tri_mult, ff_mult
         self.scale = 1.0 / math.sqrt(c)

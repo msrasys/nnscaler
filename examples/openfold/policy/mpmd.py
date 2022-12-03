@@ -3,7 +3,10 @@ from typing import List
 from cube.graph import IRGraph
 from cube.ir.cten import IRCell
 from cube.graph.function.anchor import IRGraphAnchor
+from cube.graph.segment import IRSegment
 from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
+from cube.graph.schedule.schednf1b import IRScheduleNF1B
+from cube.graph.schedule.sched1f1b import IRSchedule1F1B
 
 import more_itertools
 import numpy as np
@@ -84,11 +87,18 @@ def PASDP(graph: IRGraph, resource):
     return graph
 
 
-def PASDAP(graph: IRGraph, resource, tp: int, dp: int):
-    assert tp * dp == resource.ngpus
+def PASDAP(graph: IRGraph, resource, tp: int):
+
+    assert resource.ngpus % tp == 0
+    dp = resource.ngpus // tp
 
     devmesh = np.arange(resource.ngpus).reshape(dp, tp)
     tp_devs = list(range(tp))
+
+    # grouping
+    evoformers = _group_to_evoformers(graph.select(ntype=IRFwOperation))
+    for layer in evoformers:
+        graph.recompute(layer)
 
     dataloader: IRDataOperation = graph.select(ntype=IRDataOperation)[0]
     bs = dataloader.output(0).shape[dataloader.get_batch_dims()[0]]
@@ -98,10 +108,6 @@ def PASDAP(graph: IRGraph, resource, tp: int, dp: int):
         dp_devs = devmesh[:,tp_idx]
         _tp(graph, dl, dp_devs, 'data')
 
-    # grouping
-    evoformers = _group_to_evoformers(graph.select(ntype=IRFwOperation))
-    for layer in evoformers:
-        graph.recompute(layer)
 
     fnodes = graph.select(ntype=IRFwOperation)
     fnodes = [fnode for fnode in fnodes if fnode.name != 'Evoformer Start']
@@ -115,6 +121,9 @@ def PASDAP(graph: IRGraph, resource, tp: int, dp: int):
         if len(names) == 1 or 'mul' in names:  # for first layer norm operators
             for node in nodes:
                 subnodes.append(_replica(graph, node, tp_devs))
+        # elif 'input_packing' in names:
+        #     for node in nodes:
+        #         subnodes.append(_replica(graph, node, tp_devs))
         elif 'row_attn' in names:
             for node in nodes:
                 subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=1))
@@ -151,5 +160,154 @@ def PASDAP(graph: IRGraph, resource, tp: int, dp: int):
                 else:
                     print(f'replicate op on data parallel group: {node.name}')
                     _replica(graph, subnode, dp_devs)
+
+    return graph
+
+
+def PASRoundRobin(graph: IRGraph, resource):
+
+    pp_size = resource.ngpus
+
+    # grouping
+    evoformers = _group_to_evoformers(graph.select(ntype=IRFwOperation))
+    for layer in evoformers:
+        graph.recompute(layer)
+
+    
+    fstages = [[] for _ in range(pp_size)]
+    nlayer_per_stage = len(evoformers) // pp_size
+    for lid, fnodes in enumerate(evoformers):
+        sid = min(lid // nlayer_per_stage, pp_size - 1)
+        fstages[sid] += fnodes
+    graph.staging(tuple(stages[0] for stages in fstages))
+
+    dataloader: IRDataOperation = graph.select(ntype=IRDataOperation)[0]
+    graph.assign(dataloader, 0)
+
+    fstages = [stage for stage in graph.select(ntype=IRSegment, flatten=False) if stage.isfw()]
+    for sid, fstage in enumerate(fstages):
+        graph.assign(fstage, sid)
+
+    return graph
+
+
+def PASNF1B(graph: IRGraph, resource, mbs: int, gbs: int, recycle: int):
+
+    assert gbs % mbs == 0
+    nmbs = gbs // mbs
+    pp_size = resource.ngpus
+
+    # grouping
+    evoformers = _group_to_evoformers(graph.select(ntype=IRFwOperation))
+    assert len(evoformers) % pp_size == 0
+    for layer in evoformers:
+        graph.recompute(layer)
+
+    fstages = [[] for _ in range(pp_size)]
+    nlayer_per_stage = len(evoformers) // pp_size
+    for lid, fnodes in enumerate(evoformers):
+        sid = min(lid // nlayer_per_stage, pp_size - 1)
+        fstages[sid] += fnodes
+    graph.staging(tuple(stages[0] for stages in fstages))
+
+    dataloader: IRDataOperation = graph.select(ntype=IRDataOperation)[0]
+    graph.assign(dataloader, 0)
+
+    fstages = [stage for stage in graph.select(ntype=IRSegment, flatten=False) if stage.isfw()]
+    for sid, fstage in enumerate(fstages):
+        graph.assign(fstage, sid)
+
+    strategy = IRSchedule1F1B(graph, nmbs)
+    graph.predef_sched(strategy)
+
+    return graph
+
+
+def PASDAPPipe(graph: IRGraph, resource, mbs: int, gbs: int, tp: int, pp: int, recycle: int):
+
+    assert gbs % mbs == 0
+    assert resource.ngpus % (pp * tp) == 0
+    dp = resource.ngpus // (pp * tp)
+    nmbs = gbs // mbs
+    
+    devmesh = np.arange(resource.ngpus, dtype=int).reshape(dp, pp, tp)
+    tp_devs = [0] * tp  # dummy device, which will be reset at dp
+
+
+    # grouping
+    evoformers = _group_to_evoformers(graph.select(ntype=IRFwOperation))
+    assert len(evoformers) % pp == 0
+    for layer in evoformers:
+        graph.recompute(layer)
+
+    fstages = [[] for _ in range(pp)]
+    nlayer_per_stage = len(evoformers) // pp
+    for lid, fnodes in enumerate(evoformers):
+        sid = min(lid // nlayer_per_stage, pp - 1)
+        fstages[sid] += fnodes
+    graph.staging(tuple(stages[0] for stages in fstages))
+
+    # setup dataloader
+    dataloader: IRDataOperation = graph.select(ntype=IRDataOperation)[0]
+    bs = dataloader.output(0).shape[dataloader.get_batch_dims()[0]]
+    print(f'> get batch size: {bs}')
+    dls: List[IRDataOperation] = _replica(graph, dataloader, tp_devs)
+    for tp_idx, dl in enumerate(dls):
+        dp_devs = devmesh[:, 0, tp_idx]
+        _tp(graph, dl, dp_devs, 'data')
+
+    fstages = [stage for stage in graph.select(ntype=IRSegment, flatten=False) if stage.isfw()]
+    assert len(fstages) > 0
+    for sid, fstage in enumerate(fstages):
+        fnodes = fstage.select(ntype=IRFwOperation)
+        fnodes = [fnode for fnode in fnodes if fnode.name != 'Evoformer Start']
+        node_groups = more_itertools.split_at(fnodes, lambda n: isinstance(n, IRGraphAnchor))
+        for nodes in node_groups:
+            # tensor parallelism
+            names = set(n.name for n in nodes)
+            subnodes = []
+            if len(names) == 1 or 'mul' in names:  # for first layer norm operators
+                for node in nodes:
+                    subnodes.append(_replica(graph, node, tp_devs))
+            elif 'row_attn' in names:
+                for node in nodes:
+                    subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=1))
+            elif 'col_attn' in names:
+                for node in nodes:
+                    subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=2))
+            elif 'opm' in names:
+                for node in nodes:
+                    subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=2))
+            elif 'tmo' in names:
+                for node in nodes:
+                    subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=1))
+            elif 'tmi' in names:
+                for node in nodes:
+                    subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=2))
+            elif 'tri_attn_start' in names:
+                for node in nodes:
+                    subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=1))
+            elif 'tri_attn_end' in names:
+                for node in nodes:
+                    subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=2))
+            elif 'feedforward' in names:
+                for node in nodes:
+                    subnodes.append(_tp(graph, node, tp_devs, idx=0, dim=1))
+            else:
+                assert False, names
+            # data parallelism
+            for ns in subnodes:
+                for tp_idx, subnode in enumerate(ns):
+                    dp_devs = devmesh[:, sid, tp_idx]
+                    if bs in subnode.input(0).shape:
+                        dim = subnode.input(0).shape.index(bs)
+                        _tp(graph, subnode, dp_devs, idx=0, dim=dim)
+                    else:
+                        print(f'replicate op on data parallel group: {node.name}')
+                        _replica(graph, subnode, dp_devs)
+
+    strategy = IRScheduleNF1B(graph, nmbs, recycle)
+    # strategy = IRSchedule1F1B(graph, nmbs)
+    graph.predef_sched(strategy)
 
     return graph

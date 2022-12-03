@@ -1,12 +1,12 @@
 """
 Alphafold 2, using implementation similar with OpenFold.
 """
-
 import torch
 import torch.nn as nn
 
 # from examples.openfold.blocks.embedder import InputEmbedder, RecyclingEmbedder, TemplateAngleEmbedder
 from examples.openfold.blocks.evoformer import Evoformer
+# from examples.openfold.blocks.evoformer import input_packing, input_unpacking
 
 from dataclasses import dataclass
 
@@ -82,12 +82,12 @@ class Config:
     bs: int = 1
 
 
-
 class AlphaFold(nn.Module):
 
 
     def __init__(self, cfg: Config = Config()) -> None:
         super().__init__()
+        self.cfg = cfg
 
         # self.input_embedder = InputEmbedder(
         #     cfg.input_embedder_tf_dim, cfg.input_embedder_msa_dim,
@@ -120,12 +120,14 @@ class AlphaFold(nn.Module):
         self.extra_msa_stack = None # ExtraMSAStack()
 
         # evoformer
-        # self.evoformer = EvoformerStack()
+        self.s, self.r, self.cm, self.cz = cfg.evoformer_s, cfg.evoformer_r, cfg.evoformer_cm, cfg.evoformer_cz
+        self.fout = self.s * self.r * self.cm + self.r * self.r * self.cz 
+        
         self.msa_norm = torch.nn.LayerNorm(cfg.evoformer_cm)
         self.pair_norm = torch.nn.LayerNorm(cfg.evoformer_cz)
         self.evoformers = nn.ModuleList(
             [Evoformer(
-                cfg.evoformer_s, cfg.evoformer_cm, cfg.evoformer_cz,
+                self.s, self.r, self.cm, self.cz,
                 cfg.evoformer_use_chunk
             ) for _ in range(cfg.evoformer_nlayers)]
         )
@@ -134,10 +136,18 @@ class AlphaFold(nn.Module):
         self.aux_heads = None # AuxiliaryHeads()
 
     def forward(self, msa, pair):
+        """
+        msa: [N S R cm]
+        pair: [N R R cz]
+        """
         msa = self.msa_norm(msa)
         pair = self.pair_norm(pair)
+        # cube.runtime.function.anchor('PackingRegion')
+        # x = input_packing(msa, pair, self.fout)
         for evoformer in self.evoformers:
             cube.runtime.function.anchor('Evoformer Start')
             msa, pair = evoformer(msa, pair)
+            # x = evoformer(x)
+        # msa, pair = input_unpacking(x, self.s, self.r, self.cm, self.cz)
         loss = torch.sum(msa) * torch.sum(pair)
         return loss

@@ -1,7 +1,7 @@
 """
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
-    examples/openfold/train.py --fp16 --tp 4 --dp 1
+    examples/openfold/train.py --fp16 --tp 2 --pp 2 --gbs 4 --recycle 2
 """
 
 
@@ -11,7 +11,7 @@ from examples.openfold.model import AlphaFold, Config
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary
-from examples.openfold.policy.mpmd import PASDAP
+from examples.openfold.policy.mpmd import PASDAP, PASRoundRobin, PASNF1B, PASDAPPipe
 
 import argparse
 from functools import partial
@@ -36,17 +36,22 @@ parser.add_argument('--gbs', type=int, default=1,
                     help='global batch size')
 parser.add_argument('--tp', type=int, default=1,
                     help='tensor parallelism size')
-parser.add_argument('--dp', type=int, default=1,
+parser.add_argument('--pp', type=int, default=1,
+                    help='data parallelism size')
+parser.add_argument('--recycle', type=int, default=2,
                     help='data parallelism size')
 
 args = parser.parse_args()
+dp = cube.runtime.device.DeviceGroup().world_size // (args.tp * args.pp)
 assert args.gbs % args.mbs == 0
-assert args.mbs % args.dp == 0
+assert args.mbs % dp == 0
 assert args.msa_hidden % args.head_dim == 0
 assert args.pair_hidden % args.head_dim == 0
 
 
-PASDAP = partial(PASDAP, tp=args.tp, dp=args.dp)
+# PASDAP = partial(PASDAP, tp=args.tp)
+PASNF1B = partial(PASNF1B, mbs=args.mbs, gbs=args.gbs, recycle=1)
+PASDAPPipe = partial(PASDAPPipe, mbs=args.mbs, gbs=args.gbs, tp=args.tp, pp=args.pp, recycle=args.recycle)
 
 
 def nparams(model) -> int:
@@ -78,7 +83,7 @@ def train():
     print_each_rank(f'before partitioned model parameter: {nparams(model)}')
 
     model = cube.SemanticModel(model)
-    @cube.compile(model, dataloader, PAS=PASDAP, override=True, load_content=True)
+    @cube.compile(model, dataloader, PAS=PASDAPPipe, override=True, load_content=True)
     def train_iter(model, dataloader):
         input_ids, position_ids = next(dataloader)
         loss = model(input_ids, position_ids)
@@ -98,8 +103,7 @@ def train():
     for step in range(iter_num):
         if step == warmup:
             CudaTimer(enable=True, predefined=True).start('e2e')
-        for _ in range(args.gbs // args.mbs):
-            train_iter(model, dataloader)
+        train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
 
