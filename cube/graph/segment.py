@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from typing import Dict, Union, List, Optional, Set, Tuple
+import numpy as np
 
 from cube.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 from cube.ir.cten import IRTensor, IRCell
@@ -963,7 +964,15 @@ class IRSegment(IRCell):
                 if len(consumers) == 0 or any(c not in nodes for c in consumers):
                     outputs.add(otensor)
                     continue
-        segment = IRSegment(nodes, tuple(inputs), tuple(outputs))
+        
+        def order(tensors: Set[IRSubTensor]) -> Tuple[IRSubTensor]:
+            """Reorder by logical tensor id. Temporally necessary for pipeline scheduling"""
+            tensors = list(tensors)
+            tids = np.array([t.parent.tid for t in tensors])
+            indices = np.argsort(tids)
+            return tuple(tensors[idx] for idx in indices)
+
+        segment = IRSegment(nodes, order(inputs), order(outputs))
         return segment
 
     def dispatch(self, devid: int, mirror=True) -> Optional[IRCell]:
@@ -994,6 +1003,18 @@ class IRSegment(IRCell):
                 for otensor in node.outputs():
                     if otensor in self._outputs and otensor not in outputs:
                         outputs.append(otensor)
+
+        def order(tensors: Set[IRSubTensor]) -> Tuple[IRSubTensor]:
+            """Reorder by logical tensor id. Temporally necessary for pipeline scheduling"""
+            tensors = list(tensors)
+            print(tensors)
+            tids = np.array([t.parent.tid for t in tensors])
+            indices = np.argsort(tids)
+            return tuple(tensors[idx] for idx in indices)
+        
+        if self.isfw():
+            inputs, outputs = order(inputs), order(outputs)
+
         segment = IRSegment(nodes, inputs, outputs, self.name)
         segment._id = self.cid
         if mirror and self.mirror is not None:

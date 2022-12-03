@@ -629,9 +629,17 @@ class IRAdapterGener:
             if isinstance(adapter, IRAdapter) and adapter.forward and not adapter.differentiable:
                 fadapters.append(adapter)
                 if adapter.mirror is not None:
-                    badapters.insert(0, adapter.mirror)
+                    badapters.append(adapter.mirror)
+                    # badapters.insert(0, adapter.mirror)
             else:
                 if len(fadapters) > 1:
+                    # reorder adapter to match output of segment. This is temporally
+                    # necessary for pipeline scheduling with multiple output.
+                    ftids = np.array([fadapter.input(0).parent.tid for fadapter in fadapters])
+                    indices = np.argsort(ftids)
+                    fadapters = [fadapters[idx] for idx in indices]
+                    if len(badapters) > 0:
+                        badapters = [badapters[idx] for idx in indices]
                     # insert fused fadapter
                     fused_fadapter = IRAdapter.merge(fadapters)
                     for adapter in fadapters:
