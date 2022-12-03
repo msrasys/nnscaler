@@ -1007,7 +1007,6 @@ class IRSegment(IRCell):
         def order(tensors: Set[IRSubTensor]) -> Tuple[IRSubTensor]:
             """Reorder by logical tensor id. Temporally necessary for pipeline scheduling"""
             tensors = list(tensors)
-            print(tensors)
             tids = np.array([t.parent.tid for t in tensors])
             indices = np.argsort(tids)
             return tuple(tensors[idx] for idx in indices)
