@@ -151,3 +151,13 @@ class AlphaFold(nn.Module):
         # msa, pair = input_unpacking(x, self.s, self.r, self.cm, self.cz)
         loss = torch.sum(msa) * torch.sum(pair)
         return loss
+
+    
+    def tflops(self) -> float:
+        """
+        TFLOPs for one sample
+        """
+        tflops = 0.
+        for layer in self.evoformers:
+            tflops += layer.tflops(self.s, self.r)
+        return tflops

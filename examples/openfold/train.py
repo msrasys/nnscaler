@@ -1,7 +1,7 @@
 """
 OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=4 \
-    examples/openfold/train.py --fp16 --tp 2 --pp 2 --gbs 4 --recycle 2
+    --nproc_per_node=1 \
+    examples/openfold/train.py --fp16 --layers 24 --gbs 1 --recycle 2
 """
 
 
@@ -69,6 +69,7 @@ def train():
     print_each_rank(cfg, rank_only=0)
 
     model = AlphaFold(cfg)
+    print_each_rank(f'iteration total TFLOPs: {model.tflops() * (args.recycle + 1 + 2)}')
     if args.fp16:
         model = model.half()
 
