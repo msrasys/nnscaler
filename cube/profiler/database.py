@@ -216,18 +216,23 @@ class ProfileDataBase:
             torch.cuda.set_device(device)
         
         input_byte_size, param_byte_size = 0, 0
+        Residual_input_byte_size, input_count = 0, 0
         for t in node.inputs():
             if t.is_param():
                 param_byte_size = param_byte_size + t.byte_size()
             else:
+                input_count += 1
                 input_byte_size = input_byte_size + t.byte_size()
+                if input_count == 1:
+                    Residual_input_byte_size += t.byte_size()
 
+            
         # run profiling
         fw_span, bw_span, infer_memory, train_memory = \
             CompProfiler.profile(fn, shapes, dtypes, **kwargs)
         # log to database
         key = self._serialize(node)
-        self.insert(node.signature, key, input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory)
+        self.insert(node.signature, key, input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory, Residual_input_byte_size)
         print(
             f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} "
             f"=> in mem {input_byte_size} | param mem: {param_byte_size} | fw: {round(fw_span, 2)} ms | "
@@ -235,10 +240,11 @@ class ProfileDataBase:
 
         if isinstance(device, int):
             torch.cuda.set_device(orig_device)
-        return input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory
+        return input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory, Residual_input_byte_size
 
     def insert(self, name: str, key: str, input_byte_size: int, param_byte_size: int,
-               fw_span: float, bw_span: float, infer_memory: int, train_memory: int):
+               fw_span: float, bw_span: float, infer_memory: int, train_memory: int,
+               Residual_input_byte_size: int):
         """
         log the span of a function name with key
 
@@ -254,7 +260,7 @@ class ProfileDataBase:
         assert isinstance(name, str) and isinstance(key, str)
         if name not in self._data:
             self._data[name] = dict()
-        self._data[name][key] = (input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory)
+        self._data[name][key] = (input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory, Residual_input_byte_size)
 
     def exist(self, node: IRFwOperation) -> bool:
         """
