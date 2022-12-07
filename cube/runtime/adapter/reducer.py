@@ -20,10 +20,12 @@ class Reducer:
     def add_param(self, param: torch.nn.Parameter):
         self._params.append(param)
 
-    def allreduce(self):
+    def allreduce(self, run=False):
         """
         Reduce gradients across given group
         """
+        if not run:
+            return
         buckets = {}
         for param in self._params:
             if param.requires_grad and param.grad is not None:

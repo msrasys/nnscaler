@@ -182,7 +182,7 @@ class MultiHeadSelfAttention(torch.nn.Module):
         attn = self_attention(
             query, self.qkv_proj, self.qkv_bias,
             self.out_proj,
-            self.num_heads, self.scaling, self.dropout_p, mask=True
+            self.num_heads, self.scaling, self.dropout_p, mask=False
         )
         attn = attn + self.out_bias
         return attn
