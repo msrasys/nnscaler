@@ -132,3 +132,46 @@ class Evoformer(torch.nn.Module):
         pair_repr = residual + pair_repr
 
         return succ_msa_repr, pair_repr
+
+    def tflops(self, n_seq: int, n_res: int) -> float:
+        """
+        Single sample tflops
+        """
+        msa_size = n_seq * n_res * self.cm
+        pair_size = n_seq * n_res * self.cz
+        flops = 0
+
+        # msa layer norm
+        flops += 4 * (msa_size * 4)
+        # pair layer norm
+        flops += 2 * (pair_size * 4)
+        
+        # attention: gate + qkv + q@k (N S head r c, N S head c r) + k@v + dense
+        msa_attn = n_seq * n_res * self.cm * self.cm + \
+                   3 * n_seq * n_res * self.cm * self.cm + \
+                   n_seq * (self.cm // self.c) * n_res * n_res * self.c + \
+                   n_seq * (self.cm // self.c) * n_res * n_res * self.c + \
+                   n_seq * n_res * self.cm * self.cm
+        
+        pair_attn = n_res * n_res * self.cz * self.cz + \
+                    3 * n_res * n_res * self.cz * self.cz + \
+                    n_res * (self.cz // self.c) * n_res * n_res * self.c + \
+                    n_res * (self.cz // self.c) * n_res * n_res * self.c + \
+                    n_res * n_res * self.cz * self.cz
+        
+        # row and col end attention
+        flops += 2 * msa_attn
+        # tirangle start and triangle end
+        flops += 2 * pair_attn
+        # msa and pair transition flops
+        flops += 8 * n_seq * n_res * (self.cm ** 2) + \
+                 8 * n_res * n_res * (self.cz ** 2)
+        # pair_repr tmi and tmo: projection + gate + 2 matmul
+        flops += 2 * (n_res * n_res * self.cz * self.c_tri_mult) + \
+                 n_res * n_res * self.cz * self.cz + \
+                 self.c_tri_mult * n_res * n_res * n_res + n_res * n_res * self.c_tri_mult * self.cz
+        # opm: left + right + opm
+        flops += 2 * n_seq * n_res * self.cm * self.cz + \
+                 n_res * n_res * n_seq * self.c * self.c + \
+                 n_res * n_res * self.c * self.c * self.cz
+        return flops / 1e12

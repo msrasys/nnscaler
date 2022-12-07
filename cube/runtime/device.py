@@ -24,9 +24,8 @@ class DeviceGroup:
                 self.groups = dict()
                 torch.cuda.set_device(0)
             else:
-                torch.distributed.init_process_group(
-                    backend='nccl',
-                )
+                if not torch.distributed.is_initialized():
+                    torch.distributed.init_process_group(backend='nccl')
                 self.rank = torch.distributed.get_rank()
                 self.world_size = torch.distributed.get_world_size()
                 # assume each node has the same device number
