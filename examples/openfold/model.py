@@ -121,14 +121,15 @@ class AlphaFold(nn.Module):
 
         # evoformer
         self.s, self.r, self.cm, self.cz = cfg.evoformer_s, cfg.evoformer_r, cfg.evoformer_cm, cfg.evoformer_cz
-        self.fout = self.s * self.r * self.cm + self.r * self.r * self.cz 
-        
+        self.c = self.cfg.evoformer_c
+        assert self.cm % self.c == 0 and self.cz % self.c == 0
+
         self.msa_norm = torch.nn.LayerNorm(cfg.evoformer_cm)
         self.pair_norm = torch.nn.LayerNorm(cfg.evoformer_cz)
         self.evoformers = nn.ModuleList(
             [Evoformer(
                 self.s, self.r, self.cm, self.cz,
-                cfg.evoformer_use_chunk
+                c=self.c, msa_head=self.cm // self.c, pair_head=self.cz // self.c,
             ) for _ in range(cfg.evoformer_nlayers)]
         )
 
