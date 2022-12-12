@@ -185,7 +185,7 @@ def one_attention(hidden_states: torch.Tensor,
                   # v_proj: torch.Tensor, v_bias: torch.Tensor,
                   qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
                   out_proj: torch.Tensor, #out_bias: torch.Tensor,
-                  h: int, scale: float, dropout_p: float, is_training: bool = True, mask: bool = True):
+                  h: int, scale: float, dropout_p: float, is_training: bool = True, mask: bool = False):
     num_head = h
     l, N = hidden_states.size(0), hidden_states.size(1)
     # dim_head = q_proj.size(0) // num_head
