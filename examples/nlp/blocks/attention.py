@@ -6,7 +6,7 @@ import cube
 def self_attention(query: torch.Tensor, 
                    qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
                    out_proj: torch.Tensor,
-                   h: int, scale: float, dropout_p: float, mask: bool = True):
+                   h: int, scale: float, dropout_p: float, mask: bool = False):
     num_head = h
     L, N = query.size(0), query.size(1)
     dim_head = qkv_proj.size(0) // num_head // 3
@@ -60,7 +60,7 @@ def self_attention(query: torch.Tensor,
 def qvk_combined(query: torch.Tensor, 
                    qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
                    #out_proj: torch.Tensor,
-                   h: int, scale: float, dropout_p: float, mask: bool = True):
+                   h: int, scale: float, dropout_p: float, mask: bool = False):
     num_head = h
     L, N = query.size(0), query.size(1)
     dim_head = qkv_proj.size(0) // num_head // 3
@@ -78,7 +78,7 @@ def qvk_combined(query: torch.Tensor,
 @cube.graph.parser.register('L^ N (h d^) 3 -> L^ N (h d^)', name='attention_mask')
 def attention_mask(qkv: torch.Tensor, 
                 #    out_proj: torch.Tensor,
-                   h: int, scale: float, dropout_p: float, mask: bool = True):
+                   h: int, scale: float, dropout_p: float, mask: bool = False):
     
     L, N = qkv.size(0), qkv.size(1)
     num_head = h
@@ -125,7 +125,7 @@ def attention_mask(qkv: torch.Tensor,
 def lin(lin_input: torch.Tensor, 
                 #    qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
         out_proj: torch.Tensor,
-        h: int, scale: float, dropout_p: float, mask: bool = True):
+        h: int, scale: float, dropout_p: float, mask: bool = False):
     ###########split
     output = torch.nn.functional.linear(lin_input, out_proj) # L N (h d), E E  -> L N E
     # output = torch.nn.functional.linear(output, out_proj)
@@ -258,16 +258,16 @@ class MultiHeadSelfAttentionLrw(torch.nn.Module):
         qkv = qvk_combined(
               query, self.qkv_proj, self.qkv_bias,
               #.out_proj,
-              self.num_heads, self.scaling, self.dropout_p, mask=True            
+              self.num_heads, self.scaling, self.dropout_p, mask=False              
         )
         lin_input = attention_mask(
               qkv,
-              self.num_heads, self.scaling, self.dropout_p, mask=True 
+              self.num_heads, self.scaling, self.dropout_p, mask=False   
         )
         attn = lin(
               lin_input,
               self.out_proj,
-              self.num_heads, self.scaling, self.dropout_p, mask=True 
+              self.num_heads, self.scaling, self.dropout_p, mask=False   
         )
         attn = attn + self.out_bias
         return attn
