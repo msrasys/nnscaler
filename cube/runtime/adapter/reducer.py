@@ -10,12 +10,13 @@ from cube.profiler.timer import CudaTimer, print_each_rank
 
 class Reducer:
 
-    def __init__(self, ranks: List[int]):
+    def __init__(self, ranks: List[int], bucket_size=536870912):
 
         self._params: List[torch.nn.Parameter] = list()
         # note this need to be called for every device
         self.ranks = ranks
         self._group = DeviceGroup().get_group(ranks)
+        self.bucket_size = bucket_size
 
     def add_param(self, param: torch.nn.Parameter):
         self._params.append(param)
@@ -27,24 +28,36 @@ class Reducer:
         if not run:
             return
         buckets = {}
+        tp2size = {}
         for param in self._params:
             if param.requires_grad and param.grad is not None:
+                cur_byte_size = param.nelement() * param.element_size()
+                assert cur_byte_size <= self.bucket_size
+
                 tp = param.data.type()
-                if tp not in buckets:
-                    buckets[tp] = []
-                buckets[tp].append(param)
+                if tp not in self.buckets:
+                    buckets[tp] = [[param]]
+                    tp2size[tp] = cur_byte_size
+                else:
+                    if tp2size[tp] + cur_byte_size <= self.bucket_size:
+                        tp2size[tp] = tp2size[tp] + cur_byte_size
+                        buckets[tp][-1].append(param)
+                    else:
+                        tp2size[tp] = cur_byte_size
+                        buckets[tp].append([param])
+
         # for each bucket, do all-reduce
         for tp in buckets:
-            CudaTimer().start(field_name='comm', predefined=True)
-            bucket = buckets[tp]
-            grads = [param.grad.data for param in bucket]
-            coalesced = self._flatten_dense_tensors(grads)
-            # coalesced /= len(self.ranks)
-            torch.distributed.all_reduce(coalesced, group=self._group)
-            all_synced = self._unflatten_dense_tensors(coalesced, grads)
-            for grad, synced in zip(grads, all_synced):
-                grad.copy_(synced)
-            CudaTimer().stop(field_name='comm', predefined=True)
+            for bucket in buckets[tp]:
+                CudaTimer().start(field_name='comm', predefined=True)
+                grads = [param.grad.data for param in bucket]
+                coalesced = self._flatten_dense_tensors(grads)
+                # coalesced /= len(self.ranks)
+                torch.distributed.all_reduce(coalesced, group=self._group)
+                all_synced = self._unflatten_dense_tensors(coalesced, grads)
+                for grad, synced in zip(grads, all_synced):
+                    grad.copy_(synced)
+                CudaTimer().stop(field_name='comm', predefined=True)
 
     def sync(self):
         """
