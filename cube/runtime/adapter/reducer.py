@@ -35,7 +35,7 @@ class Reducer:
                 assert cur_byte_size <= self.bucket_size
 
                 tp = param.data.type()
-                if tp not in self.buckets:
+                if tp not in buckets:
                     buckets[tp] = [[param]]
                     tp2size[tp] = cur_byte_size
                 else:
