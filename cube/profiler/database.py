@@ -216,6 +216,7 @@ class ProfileDataBase:
             torch.cuda.set_device(device)
         
         input_byte_size, param_byte_size = 0, 0
+        # add residual_input_mem for the continous recompute
         Residual_input_byte_size, input_count = 0, 0
         for t in node.inputs():
             if t.is_param():
