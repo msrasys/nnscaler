@@ -11,7 +11,7 @@ OMP_NUM_THREADS=4 torchrun \
 import torch
 import time
 
-from examples.nlp.gpt.model import GPT
+from examples.nlp.gpt.model import GPT, GPTFineGrained, build_gpt_config
 from examples.nlp.gpt.model import GPTDataLoader
 
 import cube
@@ -28,6 +28,7 @@ parser = argparse.ArgumentParser(description='GPT Train')
 parser.add_argument('--policy', type=str, help='PAS policy choice, starting with PAS')
 parser.add_argument('--fp16', action='store_true', default=False,
                     help='use fp16 for the training')
+parser.add_argument('--lrw', action='store_true',help='use lrw\'s model')
 args = parser.parse_args()
 
 cube.init()
@@ -48,9 +49,11 @@ else:
 
 def train():
 
-    batch_size = 4
-
-    model = GPT()
+    batch_size = 8
+    if args.policy == 'PASMegatronWSRTP':
+        model = GPTFineGrained(build_gpt_config('760M'))
+    else:
+        model = GPT(build_gpt_config('test'))
     model = model if not args.fp16 else model.half()
     dataloader = GPTDataLoader(batch_size)
 

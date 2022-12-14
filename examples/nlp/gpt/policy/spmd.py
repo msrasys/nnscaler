@@ -222,3 +222,94 @@ def PASMeshShard(graph: IRGraph, resource):
 
     # print(graph.extra_repr())
     return graph
+
+def PASMegatronWSRTP(graph: IRGraph, resource):
+    tp_size = resource.ngpus
+    tp_devs = list(range(tp_size))
+    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
+
+    # annotating code structure -- not consider multiref on embedding weight
+    anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
+    indices = [fnodes.index(anchor) for anchor in anchors]
+    for lid, idx in enumerate(indices):
+        # why -1: multiref
+        fnodes[idx-1].comment = f'===> start of transformer layer {lid}'
+
+    # attention
+    
+    qkvs = [node for node in fnodes if node.name == 'qkv_combined']
+    #graph.recompute(qkvs)
+    for qkv in qkvs:
+        _tp(graph, qkv, tp_devs, idx=1, dim=0)
+        
+
+    attns = [node for node in fnodes if node.name == 'attention_mask']
+    graph.recompute(attns)
+    for attn in attns:
+        # graph.recompute(attn)
+        _tp(graph, attn, tp_devs, idx=0, dim=2)    
+    # attns = [node for node in fnodes if node.name == 'self_attention']
+    # for attn in attns:
+    #     _tp(graph, attn, tp_devs, idx=1, dim=0)
+    
+    lins = [node for node in fnodes if node.name == 'lin']
+    # graph.recompute(lins)
+    for lin in lins:
+         _tp(graph, lin, tp_devs, idx=1, dim=0)   
+
+    # feedforward
+    ffns = [node for node in fnodes if node.name == 'feedforward']
+    # graph.recompute(ffns)
+    for ffn in ffns:
+        _tp(graph, ffn, tp_devs, idx=1, dim=0)
+
+    # partition embed
+    embeds = [node for node in fnodes if node.name == 'embedding']
+    for embed in embeds:
+        _tp(graph, embed, tp_devs, idx=1, dim=0)
+
+    # partition last linear
+    linears = [node for node in fnodes if node.name == 'linear']
+    _tp(graph, linears[-1], tp_devs, idx=1, dim=0)
+
+    # partition loss
+    sums = [node for node in fnodes if node.name == 'sum']
+    assert len(sums) == 1
+    _tp(graph, sums[0], tp_devs, idx=0, dim=2)
+   
+    def GenerateNodesForSP(nodes):
+        output=[]
+        count = 0
+        for node in nodes:
+            if isinstance(node, (IRFwOperation)) and not isinstance(node, (IRGraphAnchor)):
+                # if len(node.device) == 0:
+                    sign = node.signature.split('.')[-1] 
+                    cid  = node.cid
+                    if len(output) == 0:
+                        if sign == 'layer_norm':
+                            output.append(node)
+                    elif sign == 'dropout':
+                        count = 0
+                        output.append(node)
+                        count += 1
+                    elif sign == 'add' and count == 1:
+                        output.append(node)
+                        count += 1
+                    elif sign == 'layer_norm' and count == 2:
+                        output.append(node)
+                    elif sign == 'add':
+                        output.append(node)
+        return output
+    
+    for node in GenerateNodesForSP(graph.nodes()):
+        _tp(graph, node, tp_devs, idx=0, dim=0)
+    
+    # replicate other nodes
+    for node in graph.nodes():
+        if isinstance(node, (IRFwOperation, IRDataOperation)) and len(node.device) == 0:
+            _replica(graph, node, tp_devs)
+            print(node)
+            # if isinstance(node, (IRFwOperation)) and not isinstance(node, (IRGraphAnchor)):
+            #     print(node.cid)
+
+    return graph
