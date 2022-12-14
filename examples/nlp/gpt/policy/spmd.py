@@ -235,31 +235,22 @@ def PASMegatronWSRTP(graph: IRGraph, resource):
         # why -1: multiref
         fnodes[idx-1].comment = f'===> start of transformer layer {lid}'
 
-    # attention
-    
     qkvs = [node for node in fnodes if node.name == 'qkv_combined']
-    #graph.recompute(qkvs)
     for qkv in qkvs:
         _tp(graph, qkv, tp_devs, idx=1, dim=0)
         
-
+    # implement selective recompute
     attns = [node for node in fnodes if node.name == 'attention_mask']
     graph.recompute(attns)
     for attn in attns:
-        # graph.recompute(attn)
         _tp(graph, attn, tp_devs, idx=0, dim=2)    
-    # attns = [node for node in fnodes if node.name == 'self_attention']
-    # for attn in attns:
-    #     _tp(graph, attn, tp_devs, idx=1, dim=0)
     
     lins = [node for node in fnodes if node.name == 'lin']
-    # graph.recompute(lins)
     for lin in lins:
          _tp(graph, lin, tp_devs, idx=1, dim=0)   
 
     # feedforward
     ffns = [node for node in fnodes if node.name == 'feedforward']
-    # graph.recompute(ffns)
     for ffn in ffns:
         _tp(graph, ffn, tp_devs, idx=1, dim=0)
 
@@ -277,12 +268,12 @@ def PASMegatronWSRTP(graph: IRGraph, resource):
     assert len(sums) == 1
     _tp(graph, sums[0], tp_devs, idx=0, dim=2)
    
+    # tp
     def GenerateNodesForSP(nodes):
         output=[]
         count = 0
         for node in nodes:
             if isinstance(node, (IRFwOperation)) and not isinstance(node, (IRGraphAnchor)):
-                # if len(node.device) == 0:
                     sign = node.signature.split('.')[-1] 
                     cid  = node.cid
                     if len(output) == 0:
@@ -308,8 +299,5 @@ def PASMegatronWSRTP(graph: IRGraph, resource):
     for node in graph.nodes():
         if isinstance(node, (IRFwOperation, IRDataOperation)) and len(node.device) == 0:
             _replica(graph, node, tp_devs)
-            print(node)
-            # if isinstance(node, (IRFwOperation)) and not isinstance(node, (IRGraphAnchor)):
-            #     print(node.cid)
 
     return graph

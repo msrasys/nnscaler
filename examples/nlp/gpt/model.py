@@ -46,7 +46,6 @@ class GPTFineGrained(torch.nn.Module):
     def __init__(self, cfg=Config()):
         super().__init__()
 
-        # self.embed = torch.nn.Embedding(cfg.num_embeddings, cfg.embed_dim)
         self.embedw = torch.nn.Parameter(torch.empty(cfg.num_embeddings, cfg.embed_dim))
         self.position = torch.nn.Embedding(cfg.seqlen, cfg.embed_dim)
         self.embed_dropout = torch.nn.Dropout()
@@ -61,7 +60,6 @@ class GPTFineGrained(torch.nn.Module):
         self.final_layernorm = torch.nn.LayerNorm(cfg.embed_dim)
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor):
-        # embed = self.embed(input_ids)
         embed = torch.nn.functional.embedding(
             input_ids, self.embedw, padding_idx=None,
             max_norm=None, norm_type=2., scale_grad_by_freq=False, sparse=False
@@ -76,7 +74,6 @@ class GPTFineGrained(torch.nn.Module):
             enc = layer(enc)
         enc = self.final_layernorm(enc)
 
-        # logits = torch.nn.functional.linear(enc, self.embed.weight)
         logits = torch.nn.functional.linear(enc, self.embedw)
         # simplified
         loss = torch.sum(logits)

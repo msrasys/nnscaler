@@ -28,7 +28,6 @@ parser = argparse.ArgumentParser(description='GPT Train')
 parser.add_argument('--policy', type=str, help='PAS policy choice, starting with PAS')
 parser.add_argument('--fp16', action='store_true', default=False,
                     help='use fp16 for the training')
-parser.add_argument('--lrw', action='store_true',help='use lrw\'s model')
 args = parser.parse_args()
 
 cube.init()
@@ -50,10 +49,11 @@ else:
 def train():
 
     batch_size = 8
+    Config=build_gpt_config('760M')
     if args.policy == 'PASMegatronWSRTP':
-        model = GPTFineGrained(build_gpt_config('760M'))
+        model = GPTFineGrained(Config)
     else:
-        model = GPT(build_gpt_config('test'))
+        model = GPT(Config)
     model = model if not args.fp16 else model.half()
     dataloader = GPTDataLoader(batch_size)
 
