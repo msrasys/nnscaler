@@ -226,7 +226,7 @@ def one_attention(hidden_states: torch.Tensor,
     output = torch.nn.functional.linear(output, out_proj, None) # l N (h d), E E  -> l N E
     return output
 
-class MultiHeadSelfAttentionLrw(torch.nn.Module):
+class MultiHeadSelfAttentionFineGrained(torch.nn.Module):
 
     def __init__(self, embed_dim: int, num_heads: int, inner_dim: int, dropout: float = 0.0):
         super().__init__()

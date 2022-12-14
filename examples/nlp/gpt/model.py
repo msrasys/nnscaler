@@ -1,6 +1,6 @@
 import torch
 
-from examples.nlp.blocks.encoder import EncoderLayer, EncoderLayerLrw, EncoderInferLayer
+from examples.nlp.blocks.encoder import EncoderLayer, EncoderLayerFineGrained, EncoderInferLayer
 import cube
 from dataclasses import dataclass
 
@@ -51,7 +51,7 @@ class GPTFineGrained(torch.nn.Module):
         self.embed_dropout = torch.nn.Dropout()
 
         self.layers = torch.nn.ModuleList(
-            [EncoderLayerLrw(
+            [EncoderLayerFineGrained(
                 cfg.embed_dim, cfg.attention_heads,
                 cfg.attn_hidden_dim, cfg.ffn_hidden_dim,
                 cfg.dropout, cfg.attn_dropout, cfg.activation_dropout

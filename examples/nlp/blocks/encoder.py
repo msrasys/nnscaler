@@ -1,14 +1,14 @@
 import torch
-from examples.nlp.blocks.attention import MultiHeadSelfAttention, MultiHeadOneAttention, MultiHeadSelfAttentionLrw
+from examples.nlp.blocks.attention import MultiHeadSelfAttention, MultiHeadOneAttention, MultiHeadSelfAttentionFineGrained
 from examples.nlp.blocks.mlp import MLP
 
-class EncoderLayerLrw(torch.nn.Module):
+class EncoderLayerFineGrained(torch.nn.Module):
 
     def __init__(self, embed_dim: int, num_heads: int,
                  attn_hidden_dim: int, ffn_hidden_dim: int,
                  dropout: float = 0.0, atten_dropout: float = 0.0, activation_dropout: float = 0.0):
         super().__init__()
-        self.self_attn = MultiHeadSelfAttentionLrw(
+        self.self_attn = MultiHeadSelfAttentionFineGrained(
             embed_dim, num_heads, attn_hidden_dim, atten_dropout
         )
         self.self_attn_layer_norm = torch.nn.LayerNorm(embed_dim)
