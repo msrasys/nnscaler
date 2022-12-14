@@ -55,7 +55,6 @@ def self_attention(query: torch.Tensor,
     output = torch.nn.functional.linear(output, out_proj) # L N (h d), E E  -> L N E
     return output
 
-# @cube.graph.parser.register('L^ N E^, (h d^ 3) E^, (h d^ 3) -> L^ N l^ 3', name='qkv_combined')
 @cube.graph.parser.register('L^ N E^, (h d^ 3) E^, (h d^ 3) -> L^ N (h d^) 3', name='qkv_combined')
 def qvk_combined(query: torch.Tensor, 
                    qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
@@ -67,17 +66,11 @@ def qvk_combined(query: torch.Tensor,
 
     qkv = torch.nn.functional.linear(query, qkv_proj, qkv_bias) # L N E, (h d 3) E -> L N (h d 3)
     output = qkv.view(L, N, num_head * dim_head, 3) # L N (h d 3) -> L N (h d) 3
-    # q, k, v = qkv.chunk(3, dim=-1)  # L N (h d) 3 -> L N (h d), L N (h d), L N (h d)
-    # q = q.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    # k = k.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    # v = v.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    
 
     return output
 
 @cube.graph.parser.register('L^ N (h d^) 3 -> L^ N (h d^)', name='attention_mask')
 def attention_mask(qkv: torch.Tensor, 
-                #    out_proj: torch.Tensor,
                    h: int, scale: float, dropout_p: float, mask: bool = False):
     
     L, N = qkv.size(0), qkv.size(1)
@@ -88,9 +81,6 @@ def attention_mask(qkv: torch.Tensor,
     q = q.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     k = k.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     v = v.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-
-    # #########split
-
 
     # preallocating input tensor: (N h) L L
     matmul_input_buffer = torch.empty([N * h, L, L], dtype=q.dtype, device=q.device)
@@ -126,9 +116,8 @@ def lin(lin_input: torch.Tensor,
                 #    qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
         out_proj: torch.Tensor,
         h: int, scale: float, dropout_p: float, mask: bool = False):
-    ###########split
+        
     output = torch.nn.functional.linear(lin_input, out_proj) # L N (h d), E E  -> L N E
-    # output = torch.nn.functional.linear(output, out_proj)
     return output
 
 
