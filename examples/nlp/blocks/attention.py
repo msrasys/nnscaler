@@ -6,7 +6,7 @@ import cube
 def self_attention(query: torch.Tensor, 
                    qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
                    out_proj: torch.Tensor,
-                   h: int, scale: float, dropout_p: float, mask: bool = True):
+                   h: int, scale: float, dropout_p: float, mask: bool = False):
     num_head = h
     L, N = query.size(0), query.size(1)
     dim_head = qkv_proj.size(0) // num_head // 3
@@ -55,6 +55,70 @@ def self_attention(query: torch.Tensor,
     output = torch.nn.functional.linear(output, out_proj) # L N (h d), E E  -> L N E
     return output
 
+@cube.graph.parser.register('L^ N E^, (h d^ 3) E^, (h d^ 3) -> L^ N (h d^) 3', name='qkv_combined')
+def qvk_combined(query: torch.Tensor, 
+                   qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
+                   #out_proj: torch.Tensor,
+                   h: int, scale: float, dropout_p: float, mask: bool = False):
+    num_head = h
+    L, N = query.size(0), query.size(1)
+    dim_head = qkv_proj.size(0) // num_head // 3
+
+    qkv = torch.nn.functional.linear(query, qkv_proj, qkv_bias) # L N E, (h d 3) E -> L N (h d 3)
+    output = qkv.view(L, N, num_head * dim_head, 3) # L N (h d 3) -> L N (h d) 3
+
+    return output
+
+@cube.graph.parser.register('L^ N (h d^) 3 -> L^ N (h d^)', name='attention_mask')
+def attention_mask(qkv: torch.Tensor, 
+                   h: int, scale: float, dropout_p: float, mask: bool = False):
+    
+    L, N = qkv.size(0), qkv.size(1)
+    num_head = h
+    dim_head = qkv.size(2) // num_head
+    
+    q, k, v = qkv.chunk(3, dim=-1)  # L N (h d) 3 -> L N (h d), L N (h d), L N (h d)
+    q = q.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
+    k = k.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
+    v = v.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
+
+    # preallocating input tensor: (N h) L L
+    matmul_input_buffer = torch.empty([N * h, L, L], dtype=q.dtype, device=q.device)
+    # L (N h) d, L (N h) d -> (N h) L L
+    attn = torch.baddbmm(
+        matmul_input_buffer,
+        q.transpose(0, 1),  # (N h) L d
+        k.transpose(0, 1).transpose(1, 2), # (N h) d L
+        beta=0.0, alpha=scale
+    )
+    # ======== replace the semantic into more efficient implementation ============
+
+    # attention mask
+    if mask: # (N h) L L -> (N h) L L
+        attn = attn.view(N, num_head, L, L)
+        ones = torch.ones((N, L, L), device=attn.device)
+        amask = torch.tril(ones)
+        amask = amask.view(N, 1, L, L)
+        amask = (amask < 0.5)
+        attn = attn.masked_fill_(amask, -10000.0)
+        attn = attn.view((N * num_head), L, L)
+
+    attn = torch.nn.functional.softmax(attn, dim=-1) # (N h) L L -> (N h) L L
+    attn = torch.nn.functional.dropout(attn, dropout_p, True, False) # (N h) L L -> (N h) L L
+    v = v.transpose(0, 1)  # L (N h) d -> (N h) L d
+    output = torch.bmm(attn, v) # (N h) L L, (N h) L d -> (N h) L d
+    output = output.transpose(0, 1).contiguous()     # (N h) L d -> L (N h) d
+    output = output.view(L, N, num_head * dim_head)  # (N h) L d -> L N (h d)
+    return output 
+    
+@cube.graph.parser.register('L^ N (h+ d^),  E^ (h+ d^) -> L^ N E^', name='attention_mask')
+def attention_out_linear(lin_input: torch.Tensor, 
+                         out_proj: torch.Tensor,
+                         h: int, scale: float, dropout_p: float, mask: bool = False):
+
+    output = torch.nn.functional.linear(lin_input, out_proj) # L N (h d), E E  -> L N E
+    return output
+
 
 @cube.graph.parser.register('L^ N E^, L^ N E^, (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), E^ (h+ d) -> L^ N E^', name='cross_attention')
 def cross_attention(query: torch.Tensor, key: torch.Tensor,
@@ -62,7 +126,7 @@ def cross_attention(query: torch.Tensor, key: torch.Tensor,
                     k_proj: torch.Tensor, k_bias: torch.Tensor,
                     v_proj: torch.Tensor, v_bias: torch.Tensor,
                     out_proj: torch.Tensor,
-                    h: int, scale: float, dropout_p: float, mask: bool = True):
+                    h: int, scale: float, dropout_p: float, mask: bool = False):
     num_head = h
     L, N = query.size(0), query.size(1)
     dim_head = q_proj.size(0) // num_head
@@ -109,7 +173,7 @@ def one_attention(hidden_states: torch.Tensor,
                   # v_proj: torch.Tensor, v_bias: torch.Tensor,
                   qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
                   out_proj: torch.Tensor, #out_bias: torch.Tensor,
-                  h: int, scale: float, dropout_p: float, is_training: bool = True, mask: bool = True):
+                  h: int, scale: float, dropout_p: float, is_training: bool = True, mask: bool = False):
     num_head = h
     l, N = hidden_states.size(0), hidden_states.size(1)
     # dim_head = q_proj.size(0) // num_head
@@ -161,6 +225,39 @@ def one_attention(hidden_states: torch.Tensor,
     output = torch.nn.functional.linear(output, out_proj, None) # l N (h d), E E  -> l N E
     return output
 
+class MultiHeadSelfAttentionFineGrained(torch.nn.Module):
+
+    def __init__(self, embed_dim: int, num_heads: int, inner_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.inner_dim = inner_dim
+        self.num_heads = num_heads
+        self.head_dim = inner_dim // num_heads
+        self.scaling = self.head_dim ** -0.5
+        self.dropout_p = dropout
+        # QKV [(h d 3), E]
+        self.qkv_proj = torch.nn.Parameter(torch.empty(3 * inner_dim, embed_dim))
+        self.qkv_bias = torch.nn.Parameter(torch.empty(3 * inner_dim))
+        # Out
+        self.out_proj = torch.nn.Parameter(torch.empty(embed_dim, inner_dim))
+        self.out_bias = torch.nn.Parameter(torch.empty(embed_dim))
+
+    def forward(self, query):
+
+        qkv = qvk_combined(
+              query, self.qkv_proj, self.qkv_bias,
+              self.num_heads, self.scaling, self.dropout_p, mask=False              
+        )
+        lin_input = attention_mask(
+              qkv,
+              self.num_heads, self.scaling, self.dropout_p, mask=False   
+        )
+        attn = attention_out_linear(
+              lin_input,
+              self.out_proj,
+              self.num_heads, self.scaling, self.dropout_p, mask=False   
+        )
+        attn = attn + self.out_bias
+        return attn
 
 class MultiHeadSelfAttention(torch.nn.Module):
 

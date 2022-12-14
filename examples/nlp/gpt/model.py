@@ -1,10 +1,8 @@
-
 import torch
 
-from examples.nlp.blocks.encoder import EncoderLayer, EncoderInferLayer
+from examples.nlp.blocks.encoder import EncoderLayer, EncoderLayerFineGrained, EncoderInferLayer
 import cube
 from dataclasses import dataclass
-
 
 @dataclass
 class Config:
@@ -41,6 +39,43 @@ def build_gpt_config(name: str) -> Config:
         assert False, f'unrecognized name: {name}'
     return Config(embed_dim, layers, attention_heads, embed_dim, 4 * embed_dim)
 
+class GPTFineGrained(torch.nn.Module):
+
+    def __init__(self, cfg=Config()):
+        super().__init__()
+
+        self.embedw = torch.nn.Parameter(torch.empty(cfg.num_embeddings, cfg.embed_dim))
+        self.position = torch.nn.Embedding(cfg.seqlen, cfg.embed_dim)
+        self.embed_dropout = torch.nn.Dropout()
+
+        self.layers = torch.nn.ModuleList(
+            [EncoderLayerFineGrained(
+                cfg.embed_dim, cfg.attention_heads,
+                cfg.attn_hidden_dim, cfg.ffn_hidden_dim,
+                cfg.dropout, cfg.attn_dropout, cfg.activation_dropout
+            ) for _ in range(cfg.layers)]
+        )
+        self.final_layernorm = torch.nn.LayerNorm(cfg.embed_dim)
+
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor):
+        embed = torch.nn.functional.embedding(
+            input_ids, self.embedw, padding_idx=None,
+            max_norm=None, norm_type=2., scale_grad_by_freq=False, sparse=False
+        )
+        pos_embed = self.position(position_ids)
+        embed = embed + pos_embed
+        embed = self.embed_dropout(embed)
+        enc = embed.transpose(0, 1)
+
+        for layer in self.layers:
+            cube.runtime.function.anchor('transformer start')
+            enc = layer(enc)
+        enc = self.final_layernorm(enc)
+
+        logits = torch.nn.functional.linear(enc, self.embedw)
+        # simplified
+        loss = torch.sum(logits)
+        return loss
 
 class GPT(torch.nn.Module):
 
