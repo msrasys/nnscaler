@@ -19,19 +19,14 @@ class EncoderLayerLrw(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         
         residual = x
-        ###
         x = self.self_attn_layer_norm(x)
-        ###
         x = self.self_attn(x)
-        #####
         x = self.dropout(x)
         x = x + residual
          
         residual = x
-        #####    
         x = self.final_layer_norm(x)
         x = self.mlp(x)
-        ###
         x = self.dropout(x)
         x = x + residual
         return x

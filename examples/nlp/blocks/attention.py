@@ -116,7 +116,7 @@ def lin(lin_input: torch.Tensor,
                 #    qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
         out_proj: torch.Tensor,
         h: int, scale: float, dropout_p: float, mask: bool = False):
-        
+
     output = torch.nn.functional.linear(lin_input, out_proj) # L N (h d), E E  -> L N E
     return output
 
@@ -246,7 +246,6 @@ class MultiHeadSelfAttentionLrw(torch.nn.Module):
 
         qkv = qvk_combined(
               query, self.qkv_proj, self.qkv_bias,
-              #.out_proj,
               self.num_heads, self.scaling, self.dropout_p, mask=False              
         )
         lin_input = attention_mask(
