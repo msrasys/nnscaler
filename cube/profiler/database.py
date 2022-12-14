@@ -192,7 +192,7 @@ class ProfileDataBase:
             dtypes.append(IRDType2TorchDType.map(t.dtype))
         return fn, shapes, dtypes, node.kwargs
 
-    def profile(self, node: IRFwOperation, device: Optional[int] = None):
+    def profile(self, node: IRFwOperation, device: Optional[int] = None, residual_mem: bool = False):
         """
         Profile a forward node in IRGraph on a specific device (default current device)
         
@@ -216,7 +216,7 @@ class ProfileDataBase:
             torch.cuda.set_device(device)
         
         input_byte_size, param_byte_size = 0, 0
-        # add residual_input_mem for the continous recompute
+        # add Residual_input_byte_size for the continous recompute
         Residual_input_byte_size, input_count = 0, 0
         for t in node.inputs():
             if t.is_param():
@@ -233,7 +233,7 @@ class ProfileDataBase:
             CompProfiler.profile(fn, shapes, dtypes, **kwargs)
         # log to database
         key = self._serialize(node)
-        self.insert(node.signature, key, input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory, Residual_input_byte_size)
+        self.insert(node.signature, key, input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory, Residual_input_byte_size, residual_mem)
         print(
             f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} "
             f"=> in mem {input_byte_size} | param mem: {param_byte_size} | fw: {round(fw_span, 2)} ms | "
@@ -241,11 +241,13 @@ class ProfileDataBase:
 
         if isinstance(device, int):
             torch.cuda.set_device(orig_device)
-        return input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory, Residual_input_byte_size
+        if residual_mem:
+            return input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory, Residual_input_byte_size
+        return input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory
 
     def insert(self, name: str, key: str, input_byte_size: int, param_byte_size: int,
                fw_span: float, bw_span: float, infer_memory: int, train_memory: int,
-               Residual_input_byte_size: int):
+               Residual_input_byte_size: int, residual_mem: bool = False):
         """
         log the span of a function name with key
 
@@ -261,7 +263,10 @@ class ProfileDataBase:
         assert isinstance(name, str) and isinstance(key, str)
         if name not in self._data:
             self._data[name] = dict()
-        self._data[name][key] = (input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory, Residual_input_byte_size)
+        if residual_mem:
+            self._data[name][key] = (input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory, Residual_input_byte_size)
+        else:
+            self._data[name][key] = (input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory)
 
     def exist(self, node: IRFwOperation) -> bool:
         """

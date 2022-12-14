@@ -112,10 +112,9 @@ def attention_mask(qkv: torch.Tensor,
     return output 
     
 @cube.graph.parser.register('L^ N (h+ d^),  E^ (h+ d^) -> L^ N E^', name='attention_mask')
-def lin(lin_input: torch.Tensor, 
-                #    qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
-        out_proj: torch.Tensor,
-        h: int, scale: float, dropout_p: float, mask: bool = False):
+def attention_out_linear(lin_input: torch.Tensor, 
+                         out_proj: torch.Tensor,
+                         h: int, scale: float, dropout_p: float, mask: bool = False):
 
     output = torch.nn.functional.linear(lin_input, out_proj) # L N (h d), E E  -> L N E
     return output
@@ -252,7 +251,7 @@ class MultiHeadSelfAttentionFineGrained(torch.nn.Module):
               qkv,
               self.num_heads, self.scaling, self.dropout_p, mask=False   
         )
-        attn = lin(
+        attn = attention_out_linear(
               lin_input,
               self.out_proj,
               self.num_heads, self.scaling, self.dropout_p, mask=False   
