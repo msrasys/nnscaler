@@ -21,6 +21,7 @@ from cube.runtime.device import DeviceGroup
 from cube.runtime.syndata import CubeDataLoader
 
 from cube.program import Program, SemanticDataLoader, SemanticModel
+from cube.ir.unique import IDGenerator
 from cube.flags import CompileFlag
 
 
@@ -59,6 +60,10 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
     @return sched_fn Callable: the scheduling function loaded from generated code.
     """
+    # clean global status
+    Program().clear()
+    IDGenerator().clear()
+
     if not isinstance(model, SemanticModel):
         raise TypeError("Expect Semantic Model")
     if dataloader is None:
