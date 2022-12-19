@@ -869,15 +869,16 @@ class ModelCodeGen(CodeGen):
         The fields storing intermediate codes that are populated by this method:
         -   `model_init_statements`
         """
+        max_nbytes = CompileFlag.max_reducer_bucket
         # reducer init interface
-        reducer_init = '{reducer} = cube.runtime.adapter.Reducer(ranks={ranks})'
+        reducer_init = '{reducer} = cube.runtime.adapter.Reducer(ranks={ranks}, max_bucket_size_bytes={max_nbytes})'
         reducer_add = 'self.add_reducer({reducer})'
         add_param = '{reducer}.add_param({weight})'
         # create reducer in declare region
         weights = node.inputs()
         reducer_name = f'self.wreducer{node._id}'
         self.model_init_statements.append('')
-        init_code = reducer_init.format(reducer=reducer_name, ranks=node.device)
+        init_code = reducer_init.format(reducer=reducer_name, ranks=node.device, max_nbytes=max_nbytes)
         self.model_init_statements.append(init_code)
         weights = [self.tensor_naming(t, prefix_attr='self.') for t in weights]
         for weight in weights:
