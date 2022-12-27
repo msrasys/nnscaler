@@ -4,9 +4,22 @@ Borrowed from Megatron Implementation
 
 from typing import List
 import torch
+import warnings
 
 from cube.runtime.device import DeviceGroup
 from cube.profiler.timer import CudaTimer, print_each_rank
+
+
+def get_nbytes(dtype: torch.dtype) -> int:
+    try:
+        if dtype.is_floating_point():
+            return torch.finfo(dtype).bits // 8
+        else:
+            return torch.iinfo(dtype).bits // 8
+    except Exception as e:
+        warnings.warn(f'Cannot figure out bytes of dtype: {dtype}, set default as 4.')
+        return 4
+
 
 class Reducer:
 
@@ -45,17 +58,17 @@ class Reducer:
                         buckets[tp].append([param])
 
         # for each bucket, do all-reduce
+        CudaTimer().start(field_name='comm', predefined=True)
         for tp in buckets:
             for bucket in buckets[tp]:
-                CudaTimer().start(field_name='comm', predefined=True)
                 grads = [param.grad.data for param in bucket]
                 coalesced = self._flatten_dense_tensors(grads)
-                # coalesced /= len(self.ranks)
                 torch.distributed.all_reduce(coalesced, group=self._group)
                 all_synced = self._unflatten_dense_tensors(coalesced, grads)
                 for grad, synced in zip(grads, all_synced):
-                    grad.copy_(synced)
-                CudaTimer().stop(field_name='comm', predefined=True)
+                    grad.copy_(synced, non_blocking=non_blocking)
+        torch.cuda.synchronize()
+        CudaTimer().stop(field_name='comm', predefined=True)
 
     def sync(self):
         """

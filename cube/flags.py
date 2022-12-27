@@ -26,6 +26,9 @@ class CompileFlag:
 
     # ============== runtime ====================
     dev_mode = os.environ.get('SINGLE_DEV_MODE')  # allow to use python xx.py
+
+    # maximal reducer weight bytes for one allreduce
+    max_reducer_bucket = int(os.environ.get('MAX_REDUCER_BUCKET', default=5e8))
     
     # use automate mixture precision training, where weights, gradients
     # and optimizer status are kept in its original data type (can be float32),

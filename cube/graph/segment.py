@@ -344,7 +344,12 @@ class IRSegment(IRCell):
 
     def create_bwop(self, fwop: IRFwOperation) -> Union[IRBpOperation, IRBpOperation]:
         """
-        Create dummy backward operator for given forward operator
+        Create dummy backward operator for given forward operator.
+        This assumes input/output tensors of fwop have been set by correct gradient tensors.
+
+        @param fwop IRFwOperation: forward operation
+
+        @return bwop IRBpOperation: the created backward operation
         """
         assert isinstance(fwop, (IRFwOperation, IRSegment)), "Expected IRFwOperation"
         fins = [t for t in fwop.inputs() if isinstance(t, IRSubTensor)]
@@ -605,6 +610,7 @@ class IRSegment(IRCell):
         the backward of fwop's previous forward node
 
         This requires the segment has its backward segment
+        This assumes inputs/outputs tensors of fwop have been set with correct gradient
 
         @param fwop IRFwOperation: forward node
         @param index Union[int, CellPosition]: inserted position
@@ -635,58 +641,64 @@ class IRSegment(IRCell):
 
     # ===================== Advance Graph manipulations ==================
 
-    def multiref(self, tensor: IRSubTensor, node_groups: List[List[IRFwOperation]]) -> IRFwOperation:
+    def multiref(self, ftensor: IRFullTensor, node_groups: List[List[IRFwOperation]]) -> IRFwOperation:
         """
-        Add multiref to separate nodes into different tensor alias.
-        Each other consumer that is not in the node_groups will be set as a group. 
+        Add multiref to separate forward nodes that consume a same tensor into different tensor alias.
+        This should be called before any graph transformation.
+
+        Operators in a group can only be partitioned by a same tensor split strategy.
+        The created multiref operator will be partitioned automatically when generating
+        tensor adapters.
 
         @param tensor IRSubTensor: tensor.
-        @param node_groups List[List[IRFwOperation]]: operators that have tensor has input
+        @param node_groups List[List[IRFwOperation]]:
+            operators that take the tensor as input.
+        
+        @return multiref IRFwOperation: the inserted multiref operator.
         """
-        assert tensor.parent in self._ftensors
-        # add remaining consumers
-        node_groups = tuple(node_groups)
-        for consumer in self.consumers(tensor.parent):
-            if not any(consumer in nodes for nodes in node_groups):
-                node_groups = node_groups + ([consumer],)
+        assert ftensor in self._ftensors, f"tensor: {ftensor} not in this graph."
+        # check no transformation
+        if len(self.consumers(ftensor)) <= 1: return
+        assert not ftensor.is_grad(), f"graph.multiref can only be applied on a non-gradient full tensor."
+        assert len(set(self.ctensors(ftensor))) == 1, \
+            f"Detected happened graph transformation. This interfacee should be called before graph transformation."
+        # check completeness
+        consumers = set()
+        for nodes in node_groups:
+            consumers.update(nodes)
+        assert consumers == set(self.consumers(ftensor)), f"some consumer(s) are not in node_groups"
         # create new full tensors
-        ftensors = [tensor.parent.like() for _ in node_groups]
-        otensors = [ft.select(tensor.indmap, tensor.valmap) for ft in ftensors]
-        # update consumer
-        insert_idx = CellPosition((self.nnodes,))
-        for fidx, nodes in enumerate(node_groups):
-            for node in nodes:
-                assert tensor in node.inputs()
+        tensor = self.ctensors(ftensor)[0]
+        ftensors: List[IRSubTensor] = [ftensor.like() for _ in node_groups]
+        otensors: List[IRSubTensor] = [ft.select(tensor.indmap, tensor.valmap) for ft in ftensors]
+        # update forward / backward consumer
+        for otensor, nodes in zip(otensors, node_groups):
+            for idx, node in enumerate(nodes):
                 idx = node.inputs().index(tensor)
+                grad = node.input(idx).grad
                 with self.update(node):
-                    node.set_input(idx, multiref.output(fidx))
-                insert_idx = min(insert_idx, self.index(node))
+                    node.set_input(idx, otensor)
+                if tensor.requires_grad:
+                    node.input(idx).grad = otensor.parent.grad.select(otensor.indmap, (idx, len(nodes)))
+                    with self.mirror.update(node.mirror) as bnode:
+                        idx = bnode.outputs().index(grad)
+                        bnode.set_output(idx, node.input(idx).grad)
         # create multiref
         multiref = MultiRef('cube.runtime.function.multiref', [tensor, len(node_groups)])
         for idx, otensor in enumerate(otensors):
             multiref.set_output(idx, otensor)
-        if len(tensor.device) > 0:
-            multiref.device = tensor.device
-        # set backward
+        # setup gradient
         if tensor.requires_grad:
-            # add multiref
-            multiref.input(0).grad = tensor.parent.grad.select(tensor.indmap, (0,1))
+            multiref.input(0).grad = tensor.parent.grad.select(tensor.indmap, (0, 1))
             for idx, output in enumerate(multiref.outputs()):
                 output.grad = ftensors[idx].grad.select(tensor.indmap, (0,1))
-            self.finsert(multiref, insert_idx)
-            # update forward gradient
-            for ftensor in ftensors:
-                self.infer_grad(ftensor)
-            # update backward operator
-            for nodes in node_groups + ([multiref,]):
-                for fnode in nodes:
-                    bidx = self.remove(fnode.mirror)
-                    bnode = self.create_bwop(fnode)
-                    self.insert(bidx, bnode)
+        # insert multiref
+        fidx = max(self.index(prod) for prod in self.producers(tensor.parent)) + 1
+        if ftensor.requires_grad:
+            self.finsert(multiref, fidx)
         else:
-            self.insert(multiref, insert_idx)
+            self.insert(multiref, fidx)
         return multiref
-
 
     def single_consume(self, one_for_all: bool = True):
         """

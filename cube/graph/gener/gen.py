@@ -129,6 +129,8 @@ class IRAdapterGener:
         """
         # remove anchor node
         graph = IRAdapterGener.remove_anchor(graph)
+        # automatic transform multiref
+        graph = IRAdapterGener.autoref(graph)
         # generate adapters for activation
         graph = IRAdapterGener.gen_activation(graph)
         # generate weight reducer
@@ -556,15 +558,13 @@ class IRAdapterGener:
         # collect consumer of each device
         for ctensor, consumer in zip(graph.ctensors(ftensor), graph.consumers(ftensor)):
             for devid in ctensor.device:
-                if devid not in devtensors:
-                    devtensors[devid], devops[devid] = [], []
-                assert len(devtensors[devid]) == 0 or devtensors[devid][0] == ctensor, (
+                devtensors.setdefault(devid, []).append(ctensor)
+                devops.setdefault(devid, []).append(consumer)
+                assert devtensors[devid][0] == ctensor, (
                     f"Detect that a full tensor is partitioned differently on a device.\n"
-                    f"To achieve this, need manually add multiref operator in model description.\n"
+                    f"To achieve this, need call graph.multiref before graph transformation.\n"
                     f"{graph.debug_tensor_map_str(ftensor)}"
                 )
-                devtensors[devid].append(ctensor)
-                devops[devid].append(consumer)
 
         require_multiref = any(len(ops) > 1 for ops in devops.values())
         if not require_multiref: return
@@ -587,7 +587,7 @@ class IRAdapterGener:
                     f"Users can try:\n"
                     f"  1) Replicate all operators whose inputs have multi-consumed tensors\n"
                     f"  2) Partition all operators whose inputs have multi-consumed tensors\n"
-                    f"  3) Mannually add cube.runtime.multiref in model description to divide replicated and partitioned groups\n"
+                    f"  3) Call graph.multiref to divide tensors with different partition strategies\n"
                     f"{graph.debug_tensor_map_str(ftensor)}"
                     f"{graph.mirror.debug_tensor_map_str(ftensor.grad)}"
                 )
@@ -618,6 +618,39 @@ class IRAdapterGener:
             # set recompute id
             multiref.recompute = graph.node(min_fidx).recompute
             graph.finsert(multiref, min_fidx)
+
+    @staticmethod
+    def autoref(graph: IRSegment) -> IRGraph:
+        """
+        Automatically transform inserted multiref.
+        Multiref is transformed to align with the output tensors on each device.
+
+        @param graph IRGraph
+
+        @return None
+        """
+        for multiref in graph.select(name='multiref'):
+            ftensor: IRFullTensor = multiref.input(0).parent
+            for otensor in graph.ptensors(ftensor):
+                mr = MultiRef(None, [otensor, len(multiref.outputs())])
+                for idx in range(len(multiref.outputs())):
+                    output = multiref.output(idx).parent.select(otensor.indmap, otensor.valmap)
+                    if otensor.requires_grad:
+                        output.grad = multiref.output(idx).grad.parent.select(otensor.indmap, (0,1))
+                    mr.set_output(idx, output)
+                mr.device = otensor.device
+                mr.recompute = otensor.cell.recompute
+                if otensor.requires_grad:
+                    graph.finsert(mr, graph.index(otensor.cell) + 1)
+                else:
+                    graph.insert(mr, graph.index(otensor.cell) + 1)
+            # remove original multiref
+            graph.remove(multiref)
+            if multiref.mirror is not None:
+                graph.mirror.remove(multiref.mirror)
+        for segment in graph.select(ntype=IRSegment):
+            IRAdapterGener.autoref(segment)
+        return graph
 
     @staticmethod
     def fusion(graph: IRSegment) -> IRSegment:
