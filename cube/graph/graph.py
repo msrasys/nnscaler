@@ -8,7 +8,7 @@ IRGraph:
 """
 
 from typing import Sequence, Set, Union, Tuple, List, Optional, Dict
-from cube.graph.function.anchor import IRGraphAnchor
+import warnings
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.ir.unique import IDGenerator
@@ -17,6 +17,7 @@ from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
 from cube.ir.dtype import IRDType, DTypeInferRule
 
 from cube.graph.function.function import Identity, MultiRef
+from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.segment import IRSegment
 
 from cube.algorithm.generics import GenericDistAlgo
@@ -278,6 +279,10 @@ class IRGraph(IRSegment):
             raise TypeError("Expected op to be forward op or data op")
         if not isinstance(times, int) or times < 1:
             raise TypeError("Expected times to be int and >= 1")
+        if node.name == 'multiref':
+            warnings.warn(
+                'Detected partition a multiref node. This will be skipped as system will automatically handle it.')
+            return [node]
 
         fsegment: IRSegment = self.segment(node)
         # replicate
@@ -335,6 +340,10 @@ class IRGraph(IRSegment):
             "The partition algorithm is not initialized for this node"
         assert isinstance(node, (IRFwOperation, IRDataOperation)), \
             f"Only allow op to be forward op or data op, but got: {node}"
+        if node.name == 'multiref':
+            warnings.warn(
+                'Detected partition a multiref node. This will be skipped as system will automatically handle it.')
+            return [node]
 
         # get partitioned sub-nodes
         fnodes = algo.instantiate(**config)
