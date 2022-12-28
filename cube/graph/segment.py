@@ -630,7 +630,7 @@ class IRSegment(IRCell):
         # insert backward
         assert fsegment.mirror is not None, "Missing backward segment"
         bsegment: IRSegment = fsegment.mirror
-        bidx = 0
+        bidx = CellPosition((bsegment.nnodes,))
         for idx in range(index - 1, -1, -1):
             prev_fnode = fsegment.node(idx)
             if prev_fnode.mirror is not None:
@@ -671,18 +671,6 @@ class IRSegment(IRCell):
         tensor = self.ctensors(ftensor)[0]
         ftensors: List[IRSubTensor] = [ftensor.like() for _ in node_groups]
         otensors: List[IRSubTensor] = [ft.select(tensor.indmap, tensor.valmap) for ft in ftensors]
-        # update forward / backward consumer
-        for otensor, nodes in zip(otensors, node_groups):
-            for idx, node in enumerate(nodes):
-                idx = node.inputs().index(tensor)
-                grad = node.input(idx).grad
-                with self.update(node):
-                    node.set_input(idx, otensor)
-                if tensor.requires_grad:
-                    node.input(idx).grad = otensor.parent.grad.select(otensor.indmap, (idx, len(nodes)))
-                    with self.mirror.update(node.mirror) as bnode:
-                        idx = bnode.outputs().index(grad)
-                        bnode.set_output(idx, node.input(idx).grad)
         # create multiref
         multiref = MultiRef('cube.runtime.function.multiref', [tensor, len(node_groups)])
         for idx, otensor in enumerate(otensors):
@@ -693,11 +681,26 @@ class IRSegment(IRCell):
             for idx, output in enumerate(multiref.outputs()):
                 output.grad = ftensors[idx].grad.select(tensor.indmap, (0,1))
         # insert multiref
-        fidx = max(self.index(prod) for prod in self.producers(tensor.parent)) + 1
+        if len(self.producers(ftensor)) == 0:
+            fidx = min(self.index(consumer) for consumer in self.consumers(ftensor))
+        else:
+            fidx = max(self.index(prod) for prod in self.producers(ftensor)) + 1
         if ftensor.requires_grad:
             self.finsert(multiref, fidx)
         else:
             self.insert(multiref, fidx)
+        # update forward / backward consumer
+        for otensor, nodes in zip(otensors, node_groups):
+            for idx, node in enumerate(nodes):
+                fidx = node.inputs().index(tensor)
+                grad = node.input(fidx).grad
+                with self.update(node):
+                    node.set_input(fidx, otensor)
+                if tensor.requires_grad:
+                    node.input(fidx).grad = otensor.parent.grad.select(otensor.indmap, (idx, len(nodes)))
+                    with self.mirror.update(node.mirror) as bnode:
+                        bidx = bnode.outputs().index(grad)
+                        bnode.set_output(bidx, node.input(bidx).grad)
         return multiref
 
     def single_consume(self, one_for_all: bool = True):

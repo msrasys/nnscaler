@@ -629,7 +629,7 @@ class IRAdapterGener:
 
         @return None
         """
-        for multiref in graph.select(name='multiref'):
+        for multiref in graph.select(name='multiref', flatten=False):
             ftensor: IRFullTensor = multiref.input(0).parent
             for otensor in graph.ptensors(ftensor):
                 mr = MultiRef(None, [otensor, len(multiref.outputs())])
@@ -648,7 +648,8 @@ class IRAdapterGener:
             graph.remove(multiref)
             if multiref.mirror is not None:
                 graph.mirror.remove(multiref.mirror)
-        for segment in graph.select(ntype=IRSegment):
+        for segment in graph.select(ntype=IRSegment, flatten=False):
+            if not segment.isfw(): continue
             IRAdapterGener.autoref(segment)
         return graph
 

@@ -132,8 +132,9 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
             # check assignment and remove anchor node
             for node in graph.nodes(flatten=True):
-                if isinstance(node, IRGraphAnchor) or isinstance(node.mirror, IRGraphAnchor):
-                    continue
+                # skip graph anchor and multiref: they will be removed or replaced by system
+                if isinstance(node, IRGraphAnchor) or node.name == 'multiref':
+                    graph.assign(node, 0)
                 if len(node.device) == 0:
                     raise RuntimeError(f"Node {node} device is not set")
 
