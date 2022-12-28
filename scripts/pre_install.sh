@@ -1,2 +1,2 @@
 pip install -r requirements.txt
-sudo /opt/conda/bin/python setup.py develop
+python setup.py develop --user
