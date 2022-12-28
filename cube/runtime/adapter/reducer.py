@@ -23,13 +23,13 @@ def get_nbytes(dtype: torch.dtype) -> int:
 
 class Reducer:
 
-    def __init__(self, ranks: List[int], bucket_size=536870912):
+    def __init__(self, ranks: List[int], max_bucket_size_bytes=536870912):
 
         self._params: List[torch.nn.Parameter] = list()
         # note this need to be called for every device
         self.ranks = ranks
         self._group = DeviceGroup().get_group(ranks)
-        self.bucket_size = bucket_size
+        self.bucket_size = max_bucket_size_bytes
 
     def add_param(self, param: torch.nn.Parameter):
         self._params.append(param)
@@ -66,7 +66,7 @@ class Reducer:
                 torch.distributed.all_reduce(coalesced, group=self._group)
                 all_synced = self._unflatten_dense_tensors(coalesced, grads)
                 for grad, synced in zip(grads, all_synced):
-                    grad.copy_(synced, non_blocking=non_blocking)
+                    grad.copy_(synced, non_blocking=True)
         torch.cuda.synchronize()
         CudaTimer().stop(field_name='comm', predefined=True)
 
