@@ -61,8 +61,6 @@ class Schedule1F1B(ScheduleABC):
 
         # steady
         for i in range(num_warmup_remaining):
-            if torch.distributed.get_rank() == 0:
-                print(torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024, torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024)
             # forward
             Schedule1F1B.push_tail('inputs', inputs)
             if recompute:
