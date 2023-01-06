@@ -4,6 +4,7 @@ Concurrent producer / consumer Adapter Generator
 from typing import List, Optional, Dict, Tuple
 import copy
 import numpy as np
+import sys
 
 from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
 from cube.ir.adapter.prim import IRAdapterPrim
@@ -53,10 +54,13 @@ class ConcurrentGener:
                 fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reorder=True)
             except Exception as e:
                 fadapter = None
+                color, default = '\033[33m' , '\033[0m'
                 print(
-                    f"full tensor: {fptensors[0].parent} cannot use intra-transformation generation.\n"
+                    f"{color}========== Fail to use intra-RVD ==========\n"
+                    f"full tensor: {fptensors[0].parent}\n"
                     f"Reason: {str(e)}\n"
-                    f"Switch to general P2P communication."
+                    f"Switch to general P2P communication.\n"
+                    f"===========================================\n{default}", file=sys.stderr
                 )
 
         # Case 2: sperating device (cross-shard)
@@ -66,12 +70,14 @@ class ConcurrentGener:
                 fadapter = ConcurrentGener.gen_cross_shard(fptensors, fctensors, bptensors, bctensors)
             except Exception as e:
                 fadapter = None
+                color, default = '\033[33m' , '\033[0m'
                 print(
-                    f"full tensor: {fptensors[0].parent} cannot use inter-transformation generation.\n"
+                    f"{color}========== Fail to use inter-RVD ==========\n"
+                    f"full tensor: {fptensors[0].parent}\n"
                     f"Reason: {str(e)}\n"
-                    f"Switch to general P2P communication."
+                    f"Switch to general P2P communication.\n"
+                    f"===========================================\n{default}", file=sys.stderr
                 )
-
         # Case 3: General cases
         # warnings.warn('The adapter is generated using P2P communication')
         if fadapter is None:
@@ -100,30 +106,7 @@ class ConcurrentGener:
         # consumer grid layout
         olayout = GridLayout.togrid(ftensor, ctensors)
         # find path
-        paths, fprims = ilayout.path(olayout)
-
-        # re-assign the operator if miss-ordered
-        res_layout: GridLayout = paths[-1]
-        names, from_dev, to_dev = [], [], []
-        for itensor, otensor in zip(res_layout.mat.flatten(), olayout.mat.flatten()):
-            assert len(itensor.device) == 1 and len(otensor.device) == 1, \
-                "Expect tensor only has one device. Report this as a bug"
-            if itensor.device != otensor.device:
-                # TODO: need to be robust: multiref to a node type
-                if otensor.cell.name == 'multiref':
-                    raise RuntimeError("auto-inserted multiref cannot be re-ordered")
-                inode, onode = itensor.cell, otensor.cell
-                names.append(f'{onode.name}{onode.cid}')
-                from_dev.append(onode.device[0])
-                to_dev.append(inode.device[0])
-                if allow_reorder:
-                    onode.device = inode.device
-                    if onode.mirror is not None:
-                        onode.mirror.device = inode.device
-                else:
-                    raise RuntimeError("device mismatch. Try to enable reorder")
-        if len(names) > 0:
-            print(f'UserWarning: a better device placement is found and set for op {names}: {from_dev} -> {to_dev}')
+        paths, fprims = PathFinder.intra_path(ftensor, ilayout, olayout)
 
         fadapter = IRAdapter(fptensors, fctensors)
         fadapter.prims = fprims
@@ -140,10 +123,16 @@ class ConcurrentGener:
                 ptensors[idx] = bptensor
             ilayout = GridLayout.togrid(grad, ptensors)
             olayout = GridLayout.togrid(grad, bctensors)
-            paths, bprims = ilayout.path(olayout)
+            # paths, bprims = ilayout.path(olayout)
+            paths, bprims = PathFinder.intra_path(grad, ilayout, olayout)
             # check the device order
-            for itensor, otensor in zip(paths[-1].mat.flatten(), olayout.mat.flatten()):
-                assert len(itensor.device) == len(otensor.device), "backward device not match"
+            same_device = True
+            for t in paths[-1].mat.flatten():
+                if not any(t == c and set(t.device) == set(c.device) for c in bctensors):
+                    same_device = False
+                    break
+            assert same_device, "backward device not match"
+            # generate backward adapter
             badapter = IRAdapter(bptensors, bctensors)
             badapter.prims = bprims
             IRAdapter.make_pair(fadapter, badapter)

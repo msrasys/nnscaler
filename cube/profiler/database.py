@@ -29,7 +29,7 @@ class CompProfiler:
     @staticmethod
     def profile(func: Callable, shapes: Shapes, dtypes: DTypes,
                 warmup_sec: float = 2, prof_times: int = 50,
-                **kwargs) -> Tuple[float, float, int, int]:
+                **kwargs) -> Tuple[float, float, int, Tuple[int]]:
         """
         Profile a function
 
@@ -42,8 +42,8 @@ class CompProfiler:
 
         @return fw_span float: the time in milliseconds for forward time
         @return bw_span float: the time in milliseconds for backward time
-        @return infer_memory int: the peak memory in bytes after inference of the function
-        @return train_memory int: the peak memory in bytes after forward with autograd enabled
+        @return infer_mem int: the peak memory in bytes after inference of the function
+        @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
         """
         assert len(shapes) == len(dtypes), \
             f"func {func.__name__}: expected each shape has a corresponding dtype, but got {shapes} and {dtypes}"
@@ -89,17 +89,17 @@ class CompProfiler:
         mtoc = torch.cuda.max_memory_allocated()  # in bytes
         infer_memory = mtoc - mtic
 
-        train_memory = 0
+        train_mem_info = []
         used_tensor = set()
         # ref torch/utils/checkpoint.py/_checkpoint_without_reentrant
         def pack_hook(x):
-            nonlocal train_memory, used_tensor
+            nonlocal train_mem_info, used_tensor
             if x.storage().data_ptr() not in used_tensor:
                 used_tensor.add(x.storage().data_ptr())
                 byte_size = x.element_size()
                 for dim in list(x.size()):
                     byte_size = byte_size * dim
-                train_memory = train_memory + byte_size
+                train_mem_info.append(byte_size)
             return x
         
         def unpack_hook(x):
@@ -135,7 +135,7 @@ class CompProfiler:
         fwbw_span = (toc - tic) / prof_times * 1000 # in milliseconds
         bw_span = fwbw_span - fw_span
 
-        return fw_span, bw_span, infer_memory, train_memory
+        return fw_span, bw_span, infer_memory, tuple(train_mem_info)
 
 
 class ProfileDataBase:
@@ -192,19 +192,19 @@ class ProfileDataBase:
             dtypes.append(IRDType2TorchDType.map(t.dtype))
         return fn, shapes, dtypes, node.kwargs
 
-    def profile(self, node: IRFwOperation, device: Optional[int] = None, residual_mem: bool = False):
+    def profile(self, node: IRFwOperation, device: Optional[int] = None):
         """
         Profile a forward node in IRGraph on a specific device (default current device)
         
         @param node IRFwOperation: node of IRGraph
         @param device int: the device that the node will execute on
 
-        @param input_byte_size int: byte size of input tensors
-        @param param_byte_size int: byte size of param tensors
+        @return in_mem_info Tuple[int]: byte sizes of input tensors
+        @return param_mem_info Tuple[int]: byte sizes of param tensors
         @return fw_span float: the forward span time in milliseconds
         @return bw_span float: the backward span time in milliseconds
         @return infer_memory int: the peak memory in bytes after inference of the function
-        @return train_memory int: the peak memory in bytes after forward with autograd enabled
+        @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
         """
         fn, shapes, dtypes, kwargs = ProfileDataBase.get_func(node)
 
@@ -215,58 +215,52 @@ class ProfileDataBase:
             orig_device = torch.cuda.current_device()
             torch.cuda.set_device(device)
         
-        input_byte_size, param_byte_size = 0, 0
-        # add Residual_input_byte_size for the continous recompute
-        Residual_input_byte_size, input_count = 0, 0
+        in_mem_info, param_mem_info = [], []
+        Residual_mem, input_count = 0, 0
         for t in node.inputs():
             if t.is_param():
-                param_byte_size = param_byte_size + t.byte_size()
+                param_mem_info.append(t.byte_size())
             else:
                 input_count += 1
-                input_byte_size = input_byte_size + t.byte_size()
                 if input_count == 1:
-                    Residual_input_byte_size += t.byte_size()
+                    Residual_mem += t.byte_size()
+                in_mem_info.append(t.byte_size())
 
             
         # run profiling
-        fw_span, bw_span, infer_memory, train_memory = \
+        fw_span, bw_span, infer_memory, train_mem_info = \
             CompProfiler.profile(fn, shapes, dtypes, **kwargs)
         # log to database
         key = self._serialize(node)
-        self.insert(node.signature, key, input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory, Residual_input_byte_size, residual_mem)
+        self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, Residual_mem)
         print(
             f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} "
-            f"=> in mem {input_byte_size} | param mem: {param_byte_size} | fw: {round(fw_span, 2)} ms | "
-            f"bw: {round(bw_span, 2)} ms | infer mem: {infer_memory} | train mem: {train_memory}")
+            f"=> in mem info: {in_mem_info} | param mem info: {param_mem_info} | fw: {round(fw_span, 2)} ms | "
+            f"bw: {round(bw_span, 2)} ms | infer mem: {infer_memory} | train mem info: {train_mem_info}")
 
         if isinstance(device, int):
             torch.cuda.set_device(orig_device)
-        if residual_mem:
-            return input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory, Residual_input_byte_size
-        return input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory
+        return tuple(in_mem_info), tuple(param_mem_info), fw_span, bw_span, infer_memory, train_mem_info, Residual_mem
 
-    def insert(self, name: str, key: str, input_byte_size: int, param_byte_size: int,
-               fw_span: float, bw_span: float, infer_memory: int, train_memory: int,
-               Residual_input_byte_size: int, residual_mem: bool = False):
+    def insert(self, name: str, key: str, in_mem_info: Tuple[int], param_mem_info: Tuple[int],
+               fw_span: float, bw_span: float, infer_memory: int, train_mem_info: Tuple[int],
+               Residual_mem: int):
         """
         log the span of a function name with key
 
         @param name str: the function signature
         @param key str: the encoded shapes and dtypes of node inputs
-        @param input_byte_size int: byte size of input tensors
-        @param param_byte_size int: byte size of param tensors
+        @param in_mem_info Tuple[int]: byte sizes of input tensors
+        @param param_mem_info Tuple[int]: byte sizes of param tensors
         @param fw_span float: the forward span time in milliseconds
         @param bw_span float: the backward span time in milliseconds
         @param infer_memory int: the peak memory in bytes after inference of the function
-        @param train_memory int: the peak memory in bytes after forward with autograd enabled
+        @param train_mem_info Tuple[int]: byte sizes of tensors saved for backward
         """
         assert isinstance(name, str) and isinstance(key, str)
         if name not in self._data:
             self._data[name] = dict()
-        if residual_mem:
-            self._data[name][key] = (input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory, Residual_input_byte_size)
-        else:
-            self._data[name][key] = (input_byte_size, param_byte_size, fw_span, bw_span, infer_memory, train_memory)
+        self._data[name][key] = (in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, Residual_mem)
 
     def exist(self, node: IRFwOperation) -> bool:
         """
@@ -283,18 +277,18 @@ class ProfileDataBase:
             return False
         return True
 
-    def query(self, node: IRFwOperation) -> Tuple[int, int, float, float, int, int]:
+    def query(self, node: IRFwOperation) -> Tuple[Tuple[int], Tuple[int], float, float, int, Tuple[int]]:
         """!
         Get the performance number of a node in IRGraph
 
         @param node IRFwOperation: node in IRGraph
 
-        @return input_byte_size int: byte size of input tensors
-        @return param_byte_size int: byte size of param tensors
+        @return in_mem_info Tuple[int]: byte sizes of input tensors
+        @return param_mem_info Tuple[int]: byte sizes of param tensors
         @return fw_span float: the forward span time in milliseconds
         @return bw_span float: the backward span time in milliseconds
         @return infer_memory int: the peak memory in bytes after inference of the function
-        @return train_memory int: the peak memory in bytes after forward with autograd enabled
+        @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
         """
         key = self._serialize(node)
         if node.signature not in self._data:
@@ -303,7 +297,7 @@ class ProfileDataBase:
             return None
         return self._data[node.signature][key]
 
-    def query_func(self, signature, shapes, dtypes) -> Tuple[int, int, float, float, int, int]:
+    def query_func(self, signature, shapes, dtypes) -> Tuple[Tuple[int], Tuple[int], float, float, int, Tuple[int]]:
         """
         Get performance number of given name (signature), shapes and dtypes
         
@@ -311,12 +305,12 @@ class ProfileDataBase:
         @param shapes Tuple[Tuple[int]]: the shape of each input tensor
         @param dtypes Tuple[torch.dtype]: the dtype of each tensor
 
-        @return input_byte_size int: byte size of input tensors
-        @return param_byte_size int: byte size of param tensors
+        @return in_mem_info Tuple[int]: byte sizes of input tensors
+        @return param_mem_info Tuple[int]: byte sizes of param tensors
         @return fw_span float: the forward span time in milliseconds
         @return bw_span float: the backward span time in milliseconds
         @return infer_memory int: the peak memory in bytes after inference of the function
-        @return train_memory int: the peak memory in bytes after forward with autograd enabled
+        @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
         """
         key = self._serialize(shapes, dtypes)
         if signature not in self._data:
@@ -404,7 +398,7 @@ class ProfileDataBase:
         for signature in self._data:
             for key in self._data[signature]:
                 shapes, dtypes = self._deserialize(key)
-                input_byte_size, param_byte_size, fw_span, bw_span, infer_mem, train_mem = self._data[signature][key]
-                data.append(f'{signature}: shapes={shapes}, dtypes={dtypes}, in mem {input_byte_size} bytes, param mem {param_byte_size} bytes, fw span: {fw_span} ms, bw span: {bw_span} ms, infer mem {infer_mem} bytes, train mem {train_mem} bytes')
+                in_mem_info, param_mem_info, fw_span, bw_span, infer_mem, train_mem = self._data[signature][key]
+                data.append(f'{signature}: shapes={shapes}, dtypes={dtypes}, in mem {in_mem_info} bytes, param mem {param_mem_info} bytes, fw span: {fw_span} ms, bw span: {bw_span} ms, infer mem {infer_mem} bytes, train mem {train_mem} bytes')
         data = '\n'.join(data)
         return data

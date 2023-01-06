@@ -1,6 +1,7 @@
 from typing import Callable, Dict, List, Tuple, Optional
 import copy
 import numpy as np
+import sys
 
 from cube.ir.cten import IRCell
 from cube.ir.tensor import IRFullTensor, IRSubTensor
@@ -83,331 +84,353 @@ class GridLayout:
         dscp = f'T{self.ftensor._id}<R({self.R}),V({self.V}),D({self.D})>'
         return dscp
 
-    # ====== inshard transformation primitives ===== #
+    # ====== intra-RVD transition primitives ====== #
 
-    def d2r(self, dim: int, chunks: int):
+    def d2r(self, dim: int, chunks: int) -> Tuple:
         """
-        RVD Primitive: dimension to replica
-        collective: allgather
+        intra-RVD primitive D->R: allgather
+        
+        @param dim int: tensor dimension
+        @param chunks int: the number of chunks to transfer
+        
+        @return ret List[Tuple[GridLayout, List[IRAdapterPrim]], ...]:
+            tuple of pairs of <layout, [prims]> with each has a different device mapping.
         """
-        layout = list(self.vec)
-        assert layout[2+dim] % chunks == 0, f"not dividable dim: {layout[2+dim]} // {chunks}"
-        layout[0] = layout[0] * chunks
-        layout[2+dim] = layout[2+dim] // chunks
-        glayout = GridLayout.grid(self.ftensor,
-                       r=layout[0], v=layout[1], dims=layout[2:])
-        # set device
-        imat = GridLayout.transpose(self.mat, 0, 2+dim)
-        omat = GridLayout.transpose(glayout.mat, 2+dim, 0)
-        for itensor, otensor in zip(imat.flatten(), omat.flatten()):
-            otensor._cell = itensor._cell
-        prims = []
-        for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
-            prims.append(AllGatherPrim(itensors, otensors, dim))
-        return glayout, prims
+        assert self.D[dim] % chunks == 0, f"not dividable dim: {self.D[dim]} // {chunks}"
+        rvd = list(self.vec)
+        rvd[0], rvd[2+dim] = rvd[0] * chunks, rvd[2+dim] // chunks
 
-    def d2d(self, from_dim: int, to_dim: int, chunks: int):
+        ret: List[Tuple[GridLayout, List[IRAdapterPrim]]] = []
+        # collect all possible layouts
+        olayouts: List[GridLayout] = [GridLayout.grid(self.ftensor, r=rvd[0], v=rvd[1], dims=rvd[2:])]
+        if self.R != 1:
+            olayout = GridLayout.grid(self.ftensor, r=rvd[0], v=rvd[1], dims=rvd[2:])
+            olayout.inner_transpose(0, chunks)
+            olayouts.append(olayout)
+        # generate primitives for all possible cases
+        for olayout in olayouts:
+            imat = GridLayout.transpose(self.mat,   0, 2+dim)
+            omat = GridLayout.transpose(olayout.mat, 2+dim, 0)
+            for itensor, otensor in zip(imat.flatten(), omat.flatten()):
+                otensor.cell = itensor.cell
+            prims = []
+            for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
+                prims.append(AllGatherPrim(itensors, otensors, dim))
+            ret.append((olayout, prims))
+        return ret
+
+    def d2d(self, from_dim: int, to_dim: int, chunks: int) -> Tuple:
         """
-        RVD Primitive: dimension to dimension
-        collective: all-to-all
+        intra-RVD primitive D(...,i,..)->D(..,j,...): alltoall
+        
+        @param from_dim int: source tensor axis
+        @param to_dim int: destination tensor axis
+        @param chunks int: the number of chunks to transfer
+        
+        @return ret List[Tuple[GridLayout, List[IRAdapterPrim]], ...]:
+            tuple of pairs of <layout, [prims]> with each has a different device mapping.
         """
-        layout = list(self.vec)
-        assert layout[2+from_dim] % chunks == 0, f"not dividable dim: {layout[2+from_dim]} // {chunks}"
-        layout[2+from_dim] = layout[2+from_dim] // chunks
-        layout[2+to_dim] = layout[2+to_dim] * chunks
-        glayout = GridLayout.grid(self.ftensor,
-                       r=layout[0], v=layout[1], dims=layout[2:])
-        # set device
-        imat = GridLayout.transpose(self.mat, 2+to_dim, 2+from_dim)
-        omat = GridLayout.transpose(glayout.mat, 2+from_dim, 2+to_dim)
+        assert self.D[from_dim] % chunks == 0, f"not dividable dim: {self.D[from_dim]} // {chunks}"
+        rvd = list(self.vec)
+        rvd[2+from_dim], rvd[2+to_dim] = rvd[2+from_dim] // chunks, rvd[2+to_dim] * chunks
+        layout = GridLayout.grid(self.ftensor, r=rvd[0], v=rvd[1], dims=rvd[2:])
+        # d2d has no ambiguity on device mapping
+        imat = GridLayout.transpose(self.mat,   2+to_dim, 2+from_dim)
+        omat = GridLayout.transpose(layout.mat, 2+from_dim, 2+to_dim)
         for itensor, otensor in zip(imat.flatten(), omat.flatten()):
-            otensor._cell = itensor._cell
+            otensor.cell = itensor.cell
         prims = []
         for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
             prims.append(AllToAllPrim(itensors, otensors, from_dim, to_dim))
-        return glayout, prims
+        return [(layout, prims)]
 
-    def v2r(self, chunks: int):
+    def v2r(self, chunks: int) -> Tuple:
         """
-        RVD Prmitive: value to replica
-        collective: all-reduce
+        intra-RVD primitive V->R: allreduce
+        
+        @param dim int: tensor dimension
+        @param chunks int: the number of chunks to transfer
+        
+        @return ret List[Tuple[GridLayout, List[IRAdapterPrim]], ...]:
+            tuple of pairs of <layout, [prims]> with each has a different device mapping.
         """
-        layout = list(self.vec)
-        assert layout[1] % chunks == 0, f"not dividable value chunks: {layout[1]} // {chunks}"
-        layout[1] = layout[1] // chunks
-        layout[0] = layout[0] * chunks
-        glayout = GridLayout.grid(self.ftensor,
-                       r=layout[0], v=layout[1], dims=layout[2:])
-        # set device
-        imat = GridLayout.transpose(self.mat, 0, 1)
-        omat = GridLayout.transpose(glayout.mat, 1, 0)
-        for itensor, otensor in zip(imat.flatten(), omat.flatten()):
-            otensor._cell = itensor._cell
-        prims = []
-        for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
-            prims.append(AllReducePrim(itensors, otensors))
-        return glayout, prims
+        assert self.V % chunks == 0, f"not dividable value chunks: {self.V} // {chunks}"
+        rvd = list(self.vec)
+        rvd[1], rvd[0] = rvd[1] // chunks, rvd[0] * chunks
 
-    def v2d(self, dim: int, chunks: int):
-        """
-        RVD Primitive: value to dimension
-        collective: reduce-scatter 
-        """
-        layout = list(self.vec)
-        assert layout[1] % chunks == 0, f"not dividable value chunks: {layout[0]} // {chunks}"
-        layout[1] = layout[1] // chunks
-        layout[2+dim] = layout[2+dim] * chunks
-        glayout = GridLayout.grid(self.ftensor,
-                       r=layout[0], v=layout[1], dims=layout[2:])
-        # set device
-        imat = GridLayout.transpose(self.mat, 2+dim, 1)
-        omat = GridLayout.transpose(glayout.mat, 1, 2+dim)
-        for itensor, otensor in zip(imat.flatten(), omat.flatten()):
-            otensor._cell = itensor._cell
-        prims = []
-        for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
-            prims.append(ReduceScatterPrim(itensors, otensors, dim))
-        return glayout, prims
+        ret: List[Tuple[GridLayout, List[IRAdapterPrim]]] = []
+        # collect all possible layouts
+        ilayouts: List[GridLayout] = [self]
+        if self.V != chunks:
+            ilayout = GridLayout.grid(self.ftensor, r=self.R, v=self.V, dims=self.D)
+            for t1, t2 in zip(self.mat.flatten(), ilayout.mat.flatten()):
+                t2.cell = t1.cell
+            ilayout.inner_transpose(1, chunks)
+            ilayouts.append(ilayout)
+        olayouts: List[GridLayout] = [GridLayout.grid(self.ftensor, r=rvd[0], v=rvd[1], dims=rvd[2:])]
+        if self.R != 1:
+            olayout = GridLayout.grid(self.ftensor, r=rvd[0], v=rvd[1], dims=rvd[2:])
+            olayout.inner_transpose(0, chunks)
+            olayouts.append(olayout)
+        # generate primitives for all possible cases
+        for ilayout in ilayouts:
+            for olayout in olayouts:
+                imat = GridLayout.transpose(ilayout.mat, 0, 1)
+                omat = GridLayout.transpose(olayout.mat, 1, 0)
+                for itensor, otensor in zip(imat.flatten(), omat.flatten()):
+                    otensor.cell = itensor.cell
+                prims = []
+                for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
+                    prims.append(AllReducePrim(itensors, otensors))
+                ret.append((olayout, prims))
+        return ret
 
-    def r2d(self, dim: int, chunks: int):
+    def v2d(self, dim: int, chunks: int) -> Tuple:
         """
-        RVD Primitive: replica to dimension
-        collective: split
+        intra-RVD primitive V->D: reduce-scatter
+        
+        @param dim int: tensor dimension
+        @param chunks int: the number of chunks to transfer
+        
+        @return ret List[Tuple[GridLayout, List[IRAdapterPrim]], ...]:
+            tuple of pairs of <layout, [prims]> with each has a different device mapping.
         """
-        layout = list(self.vec)
-        assert layout[0] % chunks == 0, f"not dividable replica: {layout[0]} // {chunks}"
-        layout[0] = layout[0] // chunks
-        layout[2+dim] = layout[2+dim] * chunks
-        glayout = GridLayout.grid(self.ftensor,
-                       r=layout[0], v=layout[1], dims=layout[2:])
-        # set device
-        imat = GridLayout.transpose(self.mat, 2+dim, 0)
-        omat = GridLayout.transpose(glayout.mat, 0, 2+dim)
-        for itensor, otensor in zip(imat.flatten(), omat.flatten()):
-            otensor._cell = itensor._cell
-        prims = []
-        for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
-            prims.append(ChunkPrim(itensors, otensors, dim))
-            # ranks = tuple(t.device[0] for t in itensors)
-            # for idx, (itensor, otensor) in enumerate(zip(itensors, otensors)):
-            #     prims.append(ChunkPrim(itensor, otensor, dim, ranks))
-        return glayout, prims
+        assert self.V % chunks == 0, f"not dividable value chunks: {self.V} // {chunks}"
+        rvd = list(self.vec)
+        rvd[1], rvd[2+dim] = rvd[1] // chunks, rvd[2+dim] * chunks
 
-    def incr(self, chunks: int, devices: Optional[np.ndarray] = None):
+        ret: List[Tuple[GridLayout, List[IRAdapterPrim]]] = []
+        # collect all possible layouts
+        ilayouts = [self]
+        if self.V != chunks:
+            ilayout = GridLayout.grid(self.ftensor, r=self.R, v=self.V, dims=self.D)
+            for t1, t2 in zip(self.mat.flatten(), ilayout.mat.flatten()):
+                t2.cell = t1.cell
+            ilayout.inner_transpose(1, chunks)
+            ilayouts.append(ilayout)
+        # generate primitives for all possible cases
+        for ilayout in ilayouts:
+            olayout = GridLayout.grid(self.ftensor, r=rvd[0], v=rvd[1], dims=rvd[2:])
+            imat = GridLayout.transpose(self.mat, 2+dim, 1)
+            omat = GridLayout.transpose(olayout.mat, 1, 2+dim)
+            for itensor, otensor in zip(imat.flatten(), omat.flatten()):
+                otensor.cell = itensor.cell
+            prims = []
+            for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
+                prims.append(ReduceScatterPrim(itensors, otensors, dim))
+            ret.append((olayout, prims))
+        return ret
+
+    def r2d(self, dim: int, chunks: int) -> Tuple:
         """
-        RVD+ Prmitive: increase replica
-        collective: broadcast
+        intra-RVD primitive V->D: schunk
+        
+        @param dim int: tensor axis
+        @param chunks int: the number of chunks to transfer
+        
+        @return ret List[Tuple[GridLayout, List[IRAdapterPrim]], ...]:
+            tuple of pairs of <layout, [prims]> with each has a different device mapping.
         """
-        layout = list(self.vec)
-        layout[0] = layout[0] * chunks
-        glayout = GridLayout.grid(self.ftensor, layout[0], layout[1], layout[2:])
+        assert self.R % chunks == 0, f"not dividable replica: {self.R} // {chunks}"
+        rvd = list(self.vec)
+        rvd[0], rvd[2+dim] = rvd[0] // chunks, rvd[2+dim] * chunks
+        
+        ret: List[Tuple[GridLayout, List[IRAdapterPrim]]] = []
+        # collect all possible layouts
+        ilayouts = [self]
+        # print(f'r->d({dim})[{chunks}]: ilayout-self       : {[(t, t.device) for t in self.mat.flatten()]}')
+        if self.R != chunks:
+            ilayout = GridLayout.grid(self.ftensor, r=self.R, v=self.V, dims=self.D)
+            for t1, t2 in zip(self.mat.flatten(), ilayout.mat.flatten()):
+                t2.cell = t1.cell
+            ilayout.inner_transpose(0, chunks)
+            ilayouts.append(ilayout)
+            # print(f'r->d({dim})[{chunks}]: ilayout-transformed: {[(t, t.device) for t in ilayout.mat.flatten()]}')
+        # generate primitives for all possible cases
+        for ilayout in ilayouts:
+            olayout = GridLayout.grid(self.ftensor, r=rvd[0], v=rvd[1], dims=rvd[2:])
+            imat = GridLayout.transpose(ilayout.mat, 2+dim, 0)
+            omat = GridLayout.transpose(olayout.mat, 0, 2+dim)
+            for itensor, otensor in zip(imat.flatten(), omat.flatten()):
+                otensor.cell = itensor.cell
+            prims = []
+            for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
+                prims.append(ChunkPrim(itensors, otensors, dim))
+            ret.append((olayout, prims))
+        return ret
+
+    def incr(self, chunks: int, devices: Optional[np.ndarray] = None) -> Tuple:
+        """
+        inter-RVD primitive +R: broadcast
+
+        @param chunks int: the number of chunks to transfer
+        @param devices numpy.ndarray: the desired output device
+        
+        @return ret List[Tuple[GridLayout, List[IRAdapterPrim]], ...]:
+            tuple of pairs of <layout, [prims]> with each has a different device mapping.
+        """
+        rvd = list(self.vec)
+        rvd[0] = rvd[0] * chunks
+        olayout = GridLayout.grid(self.ftensor, rvd[0], rvd[1], rvd[2:])
         # set device
         if devices is not None:
             assert devices.size == len(self.subtensors) * chunks
-            for tensor, devid in zip(glayout.mat.flatten(), devices.flatten()):
+            for tensor, devid in zip(olayout.mat.flatten(), devices.flatten()):
                 tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
                 tensor.cell.device = int(devid)
         # setup prims
         imat = GridLayout.dims2last(self.mat, [0]).flatten()
-        omat = GridLayout.dims2last(glayout.mat, [0]).reshape(-1, chunks)
+        omat = GridLayout.dims2last(olayout.mat, [0]).reshape(-1, chunks)
         prims = []
         for src, dsts in zip(imat, omat):
             if chunks == 1:
                 prims.append(MovePrim([src], dsts))
             else:
                 prims.append(BroadcastPrim([src], [src] + list(dsts)))
-        return glayout, prims
+        return [(olayout, prims),]
 
-    def decr(self, chunks: int, devices: Optional[np.ndarray] = None):
+    def decr(self, chunks: int, devices: Optional[np.ndarray] = None) -> Tuple:
         """
-        RVD+ Prmitive: decrease replica
-        collective: move
+        inter-RVD primitive -R: move
+        
+        @param chunks int: the number of chunks to transfer
+        @param devices numpy.ndarray: the desired output device
+        
+        @return ret List[Tuple[GridLayout, List[IRAdapterPrim]], ...]:
+            tuple of pairs of <layout, [prims]> with each has a different device mapping.
         """
-        layout = list(self.vec)
-        assert layout[0] % chunks == 0, f"not divisible replica: {layout[0]} // {chunks}"
-        layout[0] = layout[0] // chunks
-        glayout = GridLayout.grid(self.ftensor, layout[0], layout[1], layout[2:])
+        assert self.R % chunks == 0, f"not divisible replica {self.R} // {chunks}"
+        rvd = list(self.vec)
+        rvd[0] = rvd[0] // chunks
+        olayout = GridLayout.grid(self.ftensor, rvd[0], rvd[1], rvd[2:])
         # set device
         if devices is not None:
             assert devices.size == len(self.subtensors) // chunks
-            for tensor, devid in zip(glayout.mat.flatten(), devices.flatten()):
+            for tensor, devid in zip(olayout.mat.flatten(), devices.flatten()):
                 tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
                 tensor.cell.device = int(devid)
         # setup prims
         imat = GridLayout.dims2last(self.mat, [0]).reshape(-1, chunks)
-        omat = GridLayout.dims2last(glayout.mat, [0]).flatten()
+        omat = GridLayout.dims2last(olayout.mat, [0]).flatten()
         prims = []
         for srcs, dst in zip(imat, omat):
             prims.append(MovePrim([srcs[0]], [dst]))
-        return glayout, prims
+        return [(olayout, prims),]
 
-    def incd(self, chunks: int, dim: int, devices: Optional[np.ndarray] = None):
+    def incd(self, chunks: int, dim: int, devices: Optional[np.ndarray] = None) -> Tuple:
         """
-        RVD+ Prmitive: increase dimension
-        collective: rdscatter
+        inter-RVD primitive +D: RD-Scatter
+        
+        @param chunks int: the number of chunks to transfer
+        @param dim int: tensor axis
+        @param devices numpy.ndarray: the desired output device
+
+        @return ret List[Tuple[GridLayout, List[IRAdapterPrim]], ...]:
+            tuple of pairs of <layout, [prims]> with each has a different device mapping.
         """
-        layout = list(self.vec)
-        layout[2+dim] = layout[2+dim] * chunks
-        glayout = GridLayout.grid(self.ftensor, layout[0], layout[1], layout[2:])
+        rvd = list(self.vec)
+        rvd[2+dim] = rvd[2+dim] * chunks
+        olayout = GridLayout.grid(self.ftensor, rvd[0], rvd[1], rvd[2:])
         # set device
         if devices is not None:
             assert devices.size == len(self.subtensors) * chunks
-            for tensor, devid in zip(glayout.mat.flatten(), devices.flatten()):
+            for tensor, devid in zip(olayout.mat.flatten(), devices.flatten()):
                 tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
                 tensor.cell.device = int(devid)
         # setup prims
         imat = GridLayout.dims2last(self.mat, [2+dim]).flatten()
-        omat = GridLayout.dims2last(glayout.mat, [2+dim]).reshape(-1, chunks)
+        omat = GridLayout.dims2last(olayout.mat, [2+dim]).reshape(-1, chunks)
         prims = []
         for src, dsts in zip(imat, omat):
             prims.append(RDScatterPrim([src], dsts, dim=dim))
-        return glayout, prims
+        return olayout, prims
 
-    def decd(self, chunks: int, dim: int, devices: Optional[np.ndarray] = None):
+    def decd(self, chunks: int, dim: int, devices: Optional[np.ndarray] = None) -> Tuple:
         """
-        RVD+ Prmitive: increase dimension
-        collective: rdgather
+        inter-RVD primitive +D: RD-Gather
+        
+        @param chunks int: the number of chunks to transfer
+        @param dim int: tensor axis
+        @param devices numpy.ndarray: the desired output device
+
+        @return ret List[Tuple[GridLayout, List[IRAdapterPrim]], ...]:
+            tuple of pairs of <layout, [prims]> with each has a different device mapping.
         """
-        layout = list(self.vec)
-        assert layout[2+dim] % chunks == 0, f"not divisible dim: {self.D[dim]} % {chunks} != 0"
-        layout[2+dim] = layout[2+dim] // chunks
-        glayout = GridLayout.grid(self.ftensor, layout[0], layout[1], layout[2:])
+        assert self.D[dim] % chunks == 0, f"not divisible dim: {self.D[dim]} % {chunks} != 0"
+        rvd = list(self.vec)
+        rvd[2+dim] = rvd[2+dim] // chunks
+        olayout = GridLayout.grid(self.ftensor, rvd[0], rvd[1], rvd[2:])
         # set device
         if devices is not None:
             assert devices.size == len(self.subtensors) // chunks
-            for tensor, devid in zip(glayout.mat.flatten(), devices.flatten()):
+            for tensor, devid in zip(olayout.mat.flatten(), devices.flatten()):
                 tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
                 tensor.cell.device = int(devid)
         # setup prims
         imat = GridLayout.dims2last(self.mat, [2+dim]).reshape(-1, chunks)
-        omat = GridLayout.dims2last(glayout.mat, [2+dim]).flatten()
+        omat = GridLayout.dims2last(olayout.mat, [2+dim]).flatten()
         prims = []
         for srcs, dst in zip(imat, omat):
             prims.append(RDGatherPrim(srcs, [dst], dim=dim))
-        return glayout, prims
+        return [(olayout, prims),]
 
-    def incv(self, chunks: int, devices: Optional[np.ndarray] = None):
+    def incv(self, chunks: int, devices: Optional[np.ndarray] = None) -> Tuple:
         """
-        RVD+ Primitive: increase value partition
-        collective: rvscatter
+        inter-RVD primitive +V: RV-Scatter
+        
+        @param chunks int: the number of chunks to transfer
+        @param devices numpy.ndarray: the desired output device
+        
+        @return ret List[Tuple[GridLayout, List[IRAdapterPrim]], ...]:
+            tuple of pairs of <layout, [prims]> with each has a different device mapping.
         """
-        layout = list(self.vec)
-        layout[1] = layout[1] * chunks
-        glayout = GridLayout.grid(self.ftensor, layout[0], layout[1], layout[2:])
+        rvd = list(self.vec)
+        rvd[1] = rvd[1] * chunks
+        olayout = GridLayout.grid(self.ftensor, rvd[0], rvd[1], rvd[2:])
         # set device
         if devices is not None:
             assert devices.size == len(self.subtensors) * chunks
-            for tensor, devid in zip(glayout.mat.flatten(), devices.flatten()):
+            for tensor, devid in zip(olayout.mat.flatten(), devices.flatten()):
                 tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
                 tensor.cell.device = int(devid)
         # setup prims
         imat = GridLayout.dims2last(self.mat, [1]).flatten()
-        omat = GridLayout.dims2last(glayout.mat, [1]).reshape(-1, chunks)
+        omat = GridLayout.dims2last(olayout.mat, [1]).reshape(-1, chunks)
         prims = []
         for src, dsts in zip(imat, omat):
             prims.append(RVScatterPrim([src], dsts))
-        return glayout, prims
+        return [(olayout, prims),]
 
-    def decv(self, chunks: int, devices: Optional[np.ndarray] = None):
+    def decv(self, chunks: int, devices: Optional[np.ndarray] = None) -> Tuple:
         """
-        RVD+ Primitive: decrease value partition
-        collective: rvgather
+        inter-RVD primitive -V: RV-Gather
+        
+        @param chunks int: the number of chunks to transfer
+        @param devices numpy.ndarray: the desired output device
+        
+        @return ret List[Tuple[GridLayout, List[IRAdapterPrim]], ...]:
+            tuple of pairs of <layout, [prims]> with each has a different device mapping.
         """
-        layout = list(self.vec)
-        assert layout[1] % chunks == 0, f"not divisable value split: {self.V} % {chunks} != 0"
-        layout[1] = layout[1] * chunks
-        glayout = GridLayout.grid(self.ftensor, layout[0], layout[1], layout[2:])
+        assert self.V % chunks == 0, f"not divisable value split: {self.V} % {chunks} != 0"
+        rvd = list(self.vec)
+        rvd[1] = rvd[1] // chunks
+        olayout = GridLayout.grid(self.ftensor, rvd[0], rvd[1], rvd[2:])
         # set device
         if devices is not None:
             assert devices.size == len(self.subtensors) // chunks
-            for tensor, devid in zip(glayout.mat.flatten(), devices.flatten()):
+            for tensor, devid in zip(olayout.mat.flatten(), devices.flatten()):
                 tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
                 tensor.cell.device = int(devid)
         # setup prims
         imat = GridLayout.dims2last(self.mat, [1]).reshape(-1, chunks)
-        omat = GridLayout.dims2last(glayout.mat, [1]).flatten()
+        omat = GridLayout.dims2last(olayout.mat, [1]).flatten()
         prims = []
         for srcs, dst in zip(imat, omat):
             prims.append(RVGatherPrim(srcs, [dst]))
-        return glayout, prims
+        return [(olayout, prims),]
 
 
     # ================ solution ============= #
-
-    def path(self, dst) -> Tuple:
-        """
-        Find a path from self to destination GridLayout using
-        primitivies. This implementation uses search order of
-        R -> V -> S.
-
-        Args:
-            dst: GridLayout
-            auto_replace: bool
-                If true, the consumer operator may be replaced
-                to match the device assignment.
-
-        Return:
-            paths: List[GridLayout]
-                the search path from source GridLayout (self)
-                to destination GridLayout (self)
-            comm_prims: List[IRAdapterPrim]
-                communication primitives for translation
-        """
-        def step(ilayout: GridLayout, dec_idx: int, inc_idx: int, chunks: int) -> GridLayout:
-            if dec_idx >= 2 and inc_idx == 0:  # d2r
-                return ilayout.d2r(dec_idx-2, chunks)
-            if dec_idx >= 2 and inc_idx >= 2:  # d2d
-                return ilayout.d2d(dec_idx-2, inc_idx-2, chunks)
-            if dec_idx == 1 and inc_idx == 0:  # v2r
-                return ilayout.v2r(chunks)
-            if dec_idx == 1 and inc_idx >= 2:  # v2d
-                return ilayout.v2d(inc_idx-2, chunks)
-            if dec_idx == 0 and inc_idx >= 2:  # r2d
-                return ilayout.r2d(inc_idx-2, chunks)
-            raise RuntimeError("Cannot find primitive. Report as a bug")
-        
-        comm_prims = []
-        paths: List[GridLayout] = [self]
-        dst: GridLayout = dst
-        while paths[-1].vec != dst.vec:
-            src: GridLayout = paths[-1]
-            inc_idx, dec_idx = None, None
-            for idx, (schunk, dchunk) in enumerate(zip(src.vec, dst.vec)):
-                if schunk != dchunk:
-                    # print(f'src: {src.vec}, dst: {dst.vec}')
-                    if schunk < dchunk:
-                        inc_idx = idx  # src should increase chunks on idx-dim
-                        need_chunks = dchunk // schunk if dchunk % schunk == 0 else dchunk
-                        for dec_idx in range(inc_idx+1, self.ndims):
-                            # print(f'{dec_idx}/{self.ndims}')
-                            if src.vec[dec_idx] > dst.vec[dec_idx]:
-                                if src.vec[dec_idx] % dst.vec[dec_idx] != 0:
-                                    available_chunks = dst.vec[dec_idx]
-                                else:
-                                    available_chunks = src.vec[dec_idx] // dst.vec[dec_idx]
-                                chunks = min(available_chunks, need_chunks)
-                                break
-                        else:
-                            raise RuntimeError("Cannot find feassible dimension. Report this as a bug.")
-                    else:
-                        dec_idx = idx
-                        need_chunks = schunk // dchunk if schunk % dchunk == 0 else schunk
-                        for inc_idx in range(dec_idx+1, self.ndims):
-                            if src.vec[inc_idx] < dst.vec[inc_idx]:
-                                if dst.vec[inc_idx] % src.vec[inc_idx] != 0:
-                                    available_chunks = dst.vec[inc_idx]
-                                else:
-                                    available_chunks = dst.vec[inc_idx] // src.vec[inc_idx]
-                                chunks = min(available_chunks, need_chunks)
-                                break
-                        else:
-                            raise RuntimeError("Cannot find feassible dimension. Report this as a bug.")
-                    # print(chunks, need_chunks)
-                    olayout, oprims = step(src, dec_idx, inc_idx, chunks)
-                    paths.append(olayout)
-                    comm_prims += oprims
-                    break
-        return paths, comm_prims
 
     def print_dev_tensors(self):
         """
@@ -425,6 +448,22 @@ class GridLayout:
             print(f'dev{dev}:')
             for tensor in devices[dev]:
                 print(f'\t{tensor.extra_repr()}')
+
+    def inner_transpose(self, dim: int, chunks: int):
+        """
+        transpose ordering of tensor within a dimension.
+        """
+        assert 0 <= dim and dim < len(self._mats.shape)
+        assert self.vec[dim] % chunks == 0
+        ori_shape = list(self.vec)
+        new_shape = list(self.vec)
+        new_shape.insert(dim, self.vec[dim] // chunks)
+        new_shape[dim+1] = chunks
+        self._mats = self._mats.reshape(new_shape)
+        axes = list(range(len(new_shape)))
+        axes[dim], axes[dim+1] = axes[dim+1], axes[dim]
+        self._mats = self._mats.transpose(axes)
+        self._mats = self._mats.reshape(ori_shape)
 
     @staticmethod
     def transpose(mat: np.ndarray, dim0: int, dim1: int):
@@ -484,11 +523,12 @@ class GridLayout:
         """
         partition a ftensor using grid layout of <r, v, *dims>
         """
+        dims = tuple(dims)
         def dummy_assign(tensor: IRSubTensor, devid: int):
             tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
             tensor.cell.device = devid
 
-        mats = np.empty([r, v] + dims, dtype=IRSubTensor)
+        mats = np.empty((r, v) + dims, dtype=IRSubTensor)
         all_subtensors = []
 
         def iter_idx(dims: List[int]) -> Tuple[int]:
@@ -499,7 +539,7 @@ class GridLayout:
                     for indices in iter_idx(dims[1:]):
                         yield (i,) + indices
         # generate tensor for each index
-        for indices in iter_idx([v,]+dims):
+        for indices in iter_idx((v,)+dims):
             valmap = ValueMap((indices[0], v))
             indmap = []
             shape = []
@@ -606,7 +646,9 @@ class PathFinder:
     _cached_inter_paths: Dict[Tuple[TShape, int, int], Dict[TRVD, List[List[int]]]] = {}
 
     @staticmethod
-    def intra_path(ftensor: IRFullTensor, ilayout: GridLayout, olayout: GridLayout, cost_fn: Optional[Callable] = None) -> Tuple[List[GridLayout], List[IRAdapterPrim]]:
+    def intra_path(ftensor: IRFullTensor,
+                   ilayout: GridLayout, olayout: GridLayout,
+                   cost_fn: Optional[Callable] = None, allow_fallback: bool = True) -> Tuple[List[GridLayout], List[IRAdapterPrim]]:
         """
         Get primitive path of transforming ilayout into olayout.
         ilayout has the same device set with olayout
@@ -616,6 +658,7 @@ class PathFinder:
         @param olayout GridLayout: output tensor layout
         @param cost_fn Optional[Callable]: cost function of each primitive.
             Default (None) will use transmission volume as metrics
+        @param allow_fallback bool: allow to use a fixed backup plan to make sure correct device mapping. (default True)
 
         @return layouts List[GridLayout]: each transformation.
         @return prims List[IRAdapterPrim]: the primitives to perform transformation.
@@ -625,7 +668,7 @@ class PathFinder:
         key = (shape, ilayout.ndevs)
         src = (ilayout.R, ilayout.V) + tuple(ilayout.D)
         dst = (olayout.R, olayout.V) + tuple(olayout.D)
-        if src == dst: return [], []
+        if src == dst: return [ilayout], []
         
         # get paths using dijkstra algorithm or cached
         if key in PathFinder._cached_intra_paths and src in PathFinder._cached_intra_paths[key]:
@@ -654,39 +697,63 @@ class PathFinder:
                     if cost[idx] < min_cost:
                         min_cost = idx
                         visit = idx
-                if visit is None: break
+                if visit is None: break  # for remaining states that cannot reach
                 for neighbor in np.where(edges[visit] != np.inf)[0]:
-                    if neighbor in visited: continue
                     new_cost = cost[visit] + edges[visit, neighbor]
                     if cost[neighbor] == np.inf or new_cost < cost[neighbor]:
                         cost[neighbor] = new_cost
                         paths[neighbor] = paths[visit] + [neighbor]
-                    cost[neighbor] = min(cost[neighbor], cost[visit] + edges[visit, neighbor])
                 unvisited.remove(visit)
                 visited.add(visit)
             PathFinder._cached_intra_paths[key][src] = paths
 
         # print for debug
-        for idx, path in enumerate(paths):
-            print(f"{src} -> {nodes[idx]}: {' -> '.join([str(nodes[i]) for i in path])} | cost: {cost[idx]}")
+        # for idx, path in enumerate(paths):
+        #     print(f"{src} -> {nodes[idx]}: {' -> '.join([str(nodes[i]) for i in path])} | cost: {cost[idx]}")
         
         # get layout
         nodes = PathFinder._cached_intra_nodes[key]
-        path = paths[nodes.index(dst)]
+        path: List[int] = paths[nodes.index(dst)]
+        rvds: List[Tuple[int]] = [nodes[idx] for idx in path]
         assert len(path) > 0, f"Un-reachable src RVD ({src}) -> dst RVD ({dst})"
+        # print(f'path: {rvds}')
 
-        layouts = [ilayout]
-        all_prims = []
-        curr_rvd = src
-        for hop in path[1:]:
-            hop_rvd = nodes[hop]
-            ret, layout, prims = PathFinder.intra_transform(ftensor, curr_rvd, hop_rvd, layouts[-1])
-            assert ret, "Internal Error."
-            layouts.append(layout)
-            all_prims += prims
-            curr_rvd = hop_rvd
+        # search for correct device mapping
+        success, layouts, all_prims = PathFinder.intra_dev_align(ftensor, rvds[1:], [ilayout], [], olayout)
+        if not success:
+            ptensors_str = 'ptensors: '
+            for ptensor in ilayout.mat.flatten():
+                ptensors_str += " " + repr(ptensor) + f' dev{ptensor.device}'
+            ctensors_str = 'ctensors: '
+            for ctensor in olayout.mat.flatten():
+                ctensors_str += " " + repr(ctensor) + f' dev{ctensor.device}'
+            error_msg = (
+                f"Fail to align intra-RVD devices. {ftensor}\n"
+                # f"{ptensors_str}\n"
+                # f"{ctensors_str}\n"
+                f"Switch to a fixed plan: ilayout -> FullReplica -> olayout"
+            )
+            color, default = '\033[33m' , '\033[0m'
+            print(color+error_msg+default, file=sys.stderr)
+            if allow_fallback:
+                # switch to a fixed plan ilayout -> R(n)V(1)D(1*) -> olayout
+                rlayout = GridLayout.grid(ftensor, r=ilayout.ndevs, v=1, dims=tuple(1 for _ in range(ilayout.ndims-2)))
+                for t1, t2 in zip(ilayout.mat.flatten(), rlayout.mat.flatten()):
+                    t2.cell = t1.cell
+                # find left
+                left: List[int] = paths[nodes.index(tuple(rlayout.vec))]
+                left = [nodes[idx] for idx in left]
+                lsuccess, llayouts, lprims = PathFinder.intra_dev_align(ftensor, left[1:], [ilayout], [], rlayout)
+                assert lsuccess, f"Switch fail to generate left-half intra-RVD plans for all-replica"
+                # find right
+                rlayouts, rprims = PathFinder.intra_path(ftensor, rlayout, olayout, cost_fn, allow_fallback=False)
+                layouts  = llayouts + rlayouts
+                all_prims = lprims + rprims
+            else:
+                # allow_fallback is False only for generating right-half intra-RVD
+                assert False, f"Switch fail to generate right-half intra-RVD plans from all-replica"
+
         return layouts, all_prims
-
 
     @staticmethod
     def inter_path(ftensor: IRFullTensor, ilayout: GridLayout, olayout: GridLayout, cost_fn: Optional[Callable] = None) -> Tuple[List[GridLayout], List[IRAdapterPrim]]:
@@ -739,12 +806,10 @@ class PathFinder:
                         visit = idx
                 if visit is None: break
                 for neighbor in np.where(edges[visit] != np.inf)[0]:
-                    if neighbor in visited: continue
                     new_cost = cost[visit] + edges[visit, neighbor]
                     if cost[neighbor] == np.inf or new_cost < cost[neighbor]:
                         cost[neighbor] = new_cost
                         paths[neighbor] = paths[visit] + [neighbor]
-                    cost[neighbor] = min(cost[neighbor], cost[visit] + edges[visit, neighbor])
                 unvisited.remove(visit)
                 visited.add(visit)
             PathFinder._cached_inter_paths[key][src] = paths
@@ -764,7 +829,7 @@ class PathFinder:
         # print('result device map:', list(cdevs.flatten()))
         for hop in cpaths[:-1][::-1]:
             hop_rvd = nodes[hop][1:]
-            curr_devs = PathFinder.intra_devmap(curr_node, hop_rvd, curr_devs)
+            curr_devs = PathFinder.inter_devmap(curr_node, hop_rvd, curr_devs)
             curr_node = hop_rvd
         consumer_entry_devs = curr_devs
         # print('calculated consumer device map: ', list(cdevs.flatten()))
@@ -775,8 +840,9 @@ class PathFinder:
             use_inter_step = side != nodes[hop][0]
             hop_rvd = nodes[hop][1:]
             if not use_inter_step:
-                ret, layout, prims = PathFinder.intra_transform(ftensor, curr_rvd, hop_rvd, layouts[-1])
-                assert ret, "Internal Error"
+                ret, layout_prims = PathFinder.intra_transition(ftensor, curr_rvd, hop_rvd, layouts[-1])
+                assert ret, "Internal Error: intra-RVD transition failed"
+                layout, prims = layout_prims[0] # the first only is enough for inter-rvd
             else:
                 ret, layout, prims = PathFinder.inter_transform(ftensor, curr_rvd, hop_rvd, layouts[-1], consumer_entry_devs)
             layouts.append(layout)
@@ -786,7 +852,8 @@ class PathFinder:
         return layouts, all_prims
 
     @staticmethod
-    def intra_transform(ftensor: IRFullTensor, src_rvd: TRVD, dst_rvd: TRVD, ilayout: Optional[GridLayout] = None) -> Tuple[GridLayout, List[IRAdapterPrim]]:
+    def intra_transition(ftensor: IRFullTensor, src_rvd: TRVD, dst_rvd: TRVD,
+                         ilayout: Optional[GridLayout] = None) -> Tuple[bool, List[Tuple[GridLayout, List[IRAdapterPrim]]]]:
         """
         Get output layout and transform primitives from a source rvd layout to dst_rvd layout, 
         
@@ -795,7 +862,7 @@ class PathFinder:
         @param dst_rvd Tuple[int]
         @param ilayout Optional[GridLayout]
 
-        @return ret bool: True if there is a primitive performed 
+        @return ret bool: True if trainsition is successful. Otherwise False.
         @return layout Optonal[GridLayout]: the RVD layout if ilayout is not None
         @return prims Optional[List[IRAdapterPrim]]: the prmitives in transformation
         """
@@ -803,30 +870,76 @@ class PathFinder:
             assert src_rvd == tuple(ilayout.vec)
         inc_dims, dec_dims = GridLayout.changed_dims(src_rvd, dst_rvd)
         if len(inc_dims) != 1 or len(dec_dims) != 1:
-            return False, None, None
+            return False, [(None, [])]
         inc_idx, dec_idx = inc_dims[0], dec_dims[0]
         if src_rvd[dec_idx] % dst_rvd[dec_idx] != 0:
-            return False, None, None
+            return False, [(None, [])]
         if inc_idx == 1:
-            return False, None, None
+            return False, [(None, [])]
         src = ilayout if ilayout is not None else GridLayout.grid(ftensor, src_rvd[0], src_rvd[1], list(src_rvd[2:]))
         chunks = src_rvd[dec_idx] // dst_rvd[dec_idx]
         if dec_idx >= 2 and inc_idx == 0:  # d2r
-            olayout, prims = src.d2r(dec_idx-2, chunks)
+            ret = src.d2r(dec_idx-2, chunks)
         elif dec_idx >= 2 and inc_idx >= 2:  # d2d
-            olayout, prims = src.d2d(dec_idx-2, inc_idx-2, chunks)
+            ret = src.d2d(dec_idx-2, inc_idx-2, chunks)
         elif dec_idx == 1 and inc_idx == 0:  # v2r
-            olayout, prims = src.v2r(chunks)
+            ret = src.v2r(chunks)
         elif dec_idx == 1 and inc_idx >= 2:  # v2d
-            olayout, prims = src.v2d(inc_idx-2, chunks)
+            ret = src.v2d(inc_idx-2, chunks)
         elif dec_idx == 0 and inc_idx >= 2:  # r2d
-            olayout, prims = src.r2d(inc_idx-2, chunks)
+            ret = src.r2d(inc_idx-2, chunks)
         else:
             raise RuntimeError(f"Cannot find primitive. Report as a bug. dec-idx: {dec_idx}, inc-idx: {inc_idx}")
-        return True, (olayout if ilayout is not None else None), prims
+        return True, ret
 
     @staticmethod
-    def intra_devmap(src_rvd: TRVD, dst_rvd: TRVD, src_devs: np.ndarray):
+    def intra_dev_align(ftensor: IRFullTensor, remain_states: List[Tuple[int]],
+                        ilayouts: List[GridLayout], all_prims: List[IRAdapterPrim],
+                        olayout: GridLayout) -> Tuple[bool, List[GridLayout], List[IRAdapterPrim]]:
+        """
+        Align devices for intra-RVD
+
+        @param ftensor IRFullTensor
+        @param remain_states List[TRVD]: RVD representations
+        @param ilayouts List[GridLayout]: searched layouts
+        @param all_prims List[IRAdapterPrim]: searched primitives
+        @param olayout GridLayout: target layout with correct device mapping
+
+        @return success bool: True if found device, else False.
+        @return layouts List[GridLayout]: the searched layouts with device match
+        @return primitives List[IRAdapterPrim]: the correspoinding primitives
+        """
+        ilayout = ilayouts[-1]
+        if len(remain_states) == 0:
+            # print(f'transformed tensors: {[(t, t.device) for t in ilayout.mat.flatten()]}')
+            # print(f'destination tensors: {[(t, t.device) for t in olayout.mat.flatten()]}')
+            # check device mapping
+            otensors: List[IRSubTensor] = olayout.mat.flatten().tolist()
+            for itensor in ilayout.mat.flatten():
+                dev_match = False
+                for idx in range(len(otensors)):
+                    otensor = otensors[idx]
+                    if otensor == itensor and set(otensor.device) == set(itensor.device):
+                        otensors.pop(idx)
+                        dev_match = True
+                        break
+                if not dev_match: return False, [], []
+            return True, ilayouts, all_prims
+        else:
+            success, layout_prims = PathFinder.intra_transition(
+                ftensor, (ilayout.R, ilayout.V) + ilayout.D, remain_states[0], ilayout)
+            assert success, "Internal Error at intra-RVD transition"
+            for (hop_layout, hop_prims) in layout_prims:
+                # print(f'hop layout: {[(t, t.device) for t in hop_layout.mat.flatten()]}')
+                # print(f'dst layout: {[(t, t.device) for t in olayout.mat.flatten()]}')
+                ret, ret_layouts, ret_prims = PathFinder.intra_dev_align(
+                    ftensor, remain_states[1:], ilayouts + [hop_layout], all_prims + hop_prims, olayout)
+                if ret:
+                    return True, ret_layouts, ret_prims
+            return False, [], []
+
+    @staticmethod
+    def inter_devmap(src_rvd: TRVD, dst_rvd: TRVD, src_devs: np.ndarray):
         """
         Infer device from source rvd to destination rvd
         """
@@ -878,11 +991,11 @@ class PathFinder:
                 return False, None, None
             chunks = dst_rvd[inc_idx] // src_rvd[inc_idx]
             if inc_idx == 0:
-                olayout, prims = src.incr(chunks, dst_devs)
+                olayout, prims = src.incr(chunks, dst_devs)[0]
             elif inc_idx == 1:
-                olayout, prims = src.incv(chunks, dst_devs)
+                olayout, prims = src.incv(chunks, dst_devs)[0]
             elif inc_idx > 1:
-                olayout, prims = src.incd(chunks, inc_idx-2, dst_devs)
+                olayout, prims = src.incd(chunks, inc_idx-2, dst_devs)[0]
             else:
                 raise RuntimeError(f"Cannot find primitive. Report as a bug. dec-idx: {dec_idx}, inc-idx: {inc_idx}")
         else:
@@ -890,11 +1003,11 @@ class PathFinder:
                 return False, None, None
             chunks = src_rvd[dec_idx] // dst_rvd[dec_idx]
             if dec_idx == 0:
-                olayout, prims = src.decr(chunks, dst_devs)
+                olayout, prims = src.decr(chunks, dst_devs)[0]
             elif dec_idx == 1:
-                olayout, prims = src.decv(chunks, dst_devs)
+                olayout, prims = src.decv(chunks, dst_devs)[0]
             elif dec_idx > 1:
-                olayout, prims = src.decd(chunks, dec_idx-2, dst_devs)
+                olayout, prims = src.decd(chunks, dec_idx-2, dst_devs)[0]
             else:
                 raise RuntimeError(f"Cannot find primitive. Report as a bug. dec-idx: {dec_idx}, inc-idx: {inc_idx}")
         return True, (olayout if ilayout is not None else None), prims
@@ -917,8 +1030,9 @@ class PathFinder:
             for j in range(len(nodes)):
                 if i == j: continue
                 src, dst = nodes[i], nodes[j]
-                ret, _, prims = PathFinder.intra_transform(ftensor, src, dst)
+                ret, layout_and_prims = PathFinder.intra_transition(ftensor, src, dst)
                 if not ret: continue
+                prims = layout_and_prims[0][1]
                 edges[i, j] = cost_fn(prims[0])
         return nodes, edges
 

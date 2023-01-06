@@ -127,6 +127,8 @@ class IRAdapterGener:
         @param graph IRGraph: the graph without adapter
         @return graph IRGraph: the graph with adapter inserted
         """
+        # reorder producer and consumer ordering
+        graph._reorder_producer_consumer()
         # remove anchor node
         graph = IRAdapterGener.remove_anchor(graph)
         # automatic transform multiref
@@ -265,9 +267,6 @@ class IRAdapterGener:
         fdummies = create_dummy(graph, inputs=True, outputs=True)
         bdummies = [fwop.mirror for fwop in fdummies if fwop.mirror is not None]
         bgraph: Optional[IRSegment] = graph.mirror
-
-        # reorder producers and consumers
-        graph._reorder_producer_consumer()
     
         # local producer fusion and local consumer multiref
         ftensors = []
@@ -631,6 +630,7 @@ class IRAdapterGener:
         """
         for multiref in graph.select(name='multiref', flatten=False):
             ftensor: IRFullTensor = multiref.input(0).parent
+            multirefs = []
             for otensor in graph.ptensors(ftensor):
                 mr = MultiRef(None, [otensor, len(multiref.outputs())])
                 for idx in range(len(multiref.outputs())):
@@ -640,14 +640,17 @@ class IRAdapterGener:
                     mr.set_output(idx, output)
                 mr.device = otensor.device
                 mr.recompute = otensor.cell.recompute
-                if otensor.requires_grad:
-                    graph.finsert(mr, graph.index(otensor.cell) + 1)
-                else:
-                    graph.insert(mr, graph.index(otensor.cell) + 1)
+                multirefs.append(mr)
             # remove original multiref
-            graph.remove(multiref)
+            fidx = graph.remove(multiref)
             if multiref.mirror is not None:
                 graph.mirror.remove(multiref.mirror)
+            # insert multirefs
+            for ofst, multiref in enumerate(multirefs):
+                if ftensor.requires_grad:
+                    graph.finsert(multiref, fidx + ofst)
+                else:
+                    graph.insert(multiref, fidx + ofst)
         for segment in graph.select(ntype=IRSegment, flatten=False):
             if not segment.isfw(): continue
             IRAdapterGener.autoref(segment)
