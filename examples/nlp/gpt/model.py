@@ -11,7 +11,7 @@ class Config:
     attention_heads: int = 16
     attn_hidden_dim: int = 1024
     ffn_hidden_dim: int = 4096
-    num_embeddings: int = 50432
+    num_embeddings: int = 51200
     seqlen: int = 1024
     dropout: float = 0.2
     attn_dropout: float = 0.2
@@ -29,8 +29,8 @@ def build_gpt_config(name: str) -> Config:
         embed_dim, layers, attention_heads = 2560, 32, 32
     elif name == '6.7B':
         embed_dim, layers, attention_heads = 4096, 32, 32
-    elif name == '13B':
-        embed_dim, layers, attention_heads = 5120, 48, 40 
+    elif name == '15B':
+        embed_dim, layers, attention_heads = 5120, 48, 32
     elif name == '39B':
         embed_dim, layers, attention_heads = 8192, 48, 64
     elif name == '175B':
