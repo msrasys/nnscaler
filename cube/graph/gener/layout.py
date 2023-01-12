@@ -729,8 +729,8 @@ class PathFinder:
                 ctensors_str += " " + repr(ctensor) + f' dev{ctensor.device}'
             error_msg = (
                 f"Fail to align intra-RVD devices. {ftensor}\n"
-                # f"{ptensors_str}\n"
-                # f"{ctensors_str}\n"
+                f"{ptensors_str}\n"
+                f"{ctensors_str}\n"
                 f"Switch to a fixed plan: ilayout -> FullReplica -> olayout"
             )
             color, default = '\033[33m' , '\033[0m'
@@ -738,8 +738,12 @@ class PathFinder:
             if allow_fallback:
                 # switch to a fixed plan ilayout -> R(n)V(1)D(1*) -> olayout
                 rlayout = GridLayout.grid(ftensor, r=ilayout.ndevs, v=1, dims=tuple(1 for _ in range(ilayout.ndims-2)))
-                for t1, t2 in zip(ilayout.mat.flatten(), rlayout.mat.flatten()):
-                    t2.cell = t1.cell
+                # assign devices
+                itensors = ilayout.mat.flatten()
+                idevs = np.array([t.device[0] for t in itensors])
+                itensors = [itensors[idx] for idx in np.argsort(idevs)]
+                for it, rt in zip(itensors, rlayout.mat.flatten()):
+                    rt.cell = it.cell
                 # find left
                 left: List[int] = paths[nodes.index(tuple(rlayout.vec))]
                 left = [nodes[idx] for idx in left]
