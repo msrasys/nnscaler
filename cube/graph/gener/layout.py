@@ -739,11 +739,13 @@ class PathFinder:
                 # switch to a fixed plan ilayout -> R(n)V(1)D(1*) -> olayout
                 rlayout = GridLayout.grid(ftensor, r=ilayout.ndevs, v=1, dims=tuple(1 for _ in range(ilayout.ndims-2)))
                 # assign devices
-                itensors = ilayout.mat.flatten()
-                idevs = np.array([t.device[0] for t in itensors])
-                itensors = [itensors[idx] for idx in np.argsort(idevs)]
-                for it, rt in zip(itensors, rlayout.mat.flatten()):
-                    rt.cell = it.cell
+                # itensors = ilayout.mat.flatten()
+                # idevs = np.array([t.device[0] for t in itensors])
+                # itensors = [itensors[idx] for idx in np.argsort(idevs)]
+                # for it, rt in zip(itensors, rlayout.mat.flatten()):
+                #     rt.cell = it.cell
+                for rt, ot in zip(rlayout.mat.flatten(), olayout.mat.flatten()):
+                    rt.cell = ot.cell
                 # find left
                 left: List[int] = paths[nodes.index(tuple(rlayout.vec))]
                 left = [nodes[idx] for idx in left]
