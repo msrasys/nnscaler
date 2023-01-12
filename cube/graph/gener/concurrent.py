@@ -93,6 +93,14 @@ class ConcurrentGener:
     def gen_in_shard(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor], 
                      bptensors: List[IRSubTensor], bctensors: List[IRSubTensor],
                      allow_reorder=False):
+        """
+        Generate forward and backward adapter for concurrent produced tensors and consumed tensors.
+
+        @param fptensors List[IRSubTensor]: forward produced tensors
+        @param fctensors List[IRSubTensor]: forward consumed tensors
+        @param bptensors List[IRSubTensor]: backward produced tensors
+        @param bctensors List[IRSubTensor]: backward consumed tensors
+        """
         ftensor = fptensors[0].parent
         # producer grid layout
         ilayout = GridLayout.togrid(ftensor, fptensors)
