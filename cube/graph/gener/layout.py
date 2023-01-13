@@ -24,6 +24,21 @@ TShape = Tuple[int, ...]
 TRVD = Tuple[int, ...]
 
 
+def tensor_vd_repr(t: IRSubTensor) -> str:
+    """
+    Tensor index-value partition representation
+    """
+    assert isinstance(t, IRSubTensor), f"expect IRSubTensor"
+    identifier = 't' if not t.is_grad() else 'g'
+    dchunks, dpos = [], []
+    for dim in range(t.ndims):
+        dchunks.append(t.parent.shape[dim] // t.shape[dim])
+        dpos.append(t.indmap[dim][0] // t.shape[dim])
+    indmap = ','.join(f'{idx}/{nchunks}' for idx, nchunks in zip(dpos, dchunks))
+    dscp = f'{identifier}{t.tid}-{t.device}(p{t.parent.tid}, shape={t.shape}, D({indmap}), V({t.valmap[0]}/{t.valmap[1]})'
+    return dscp
+
+
 class GridLayout:
     """
     This class assumes a full-tensor can only be
@@ -648,7 +663,9 @@ class PathFinder:
     @staticmethod
     def intra_path(ftensor: IRFullTensor,
                    ilayout: GridLayout, olayout: GridLayout,
-                   cost_fn: Optional[Callable] = None, allow_fallback: bool = True) -> Tuple[List[GridLayout], List[IRAdapterPrim]]:
+                   cost_fn: Optional[Callable] = None,
+                   allow_fallback: bool = True,
+                   allow_misalign: bool = False) -> Tuple[List[GridLayout], List[IRAdapterPrim]]:
         """
         Get primitive path of transforming ilayout into olayout.
         ilayout has the same device set with olayout
@@ -659,6 +676,7 @@ class PathFinder:
         @param cost_fn Optional[Callable]: cost function of each primitive.
             Default (None) will use transmission volume as metrics
         @param allow_fallback bool: allow to use a fixed backup plan to make sure correct device mapping. (default True)
+        @param allow_misalign bool: allow to have a different device mapping. (default False)
 
         @return layouts List[GridLayout]: each transformation.
         @return prims List[IRAdapterPrim]: the primitives to perform transformation.
@@ -720,17 +738,22 @@ class PathFinder:
 
         # search for correct device mapping
         success, layouts, all_prims = PathFinder.intra_dev_align(ftensor, rvds[1:], [ilayout], [], olayout)
-        if not success:
-            ptensors_str = 'ptensors: '
-            for ptensor in ilayout.mat.flatten():
-                ptensors_str += " " + repr(ptensor) + f' dev{ptensor.device}'
-            ctensors_str = 'ctensors: '
-            for ctensor in olayout.mat.flatten():
-                ctensors_str += " " + repr(ctensor) + f' dev{ctensor.device}'
+        if not success and allow_misalign:
+            layouts, all_prims = [], []
+            curr_rvd, curr_layout = rvds[0], ilayout
+            for hop_rvd in rvds[1:]:
+                ret, layout_prims = PathFinder.intra_transition(ftensor, curr_rvd, hop_rvd, curr_layout)
+                assert ret, "Internal Error: intra-transition failed"
+                layout, prims = layout_prims[0]
+                layouts.append(layout)
+                all_prims += prims
+                curr_rvd, curr_layout = hop_rvd, layout
+
+        elif not success:
             error_msg = (
                 f"Fail to align intra-RVD devices. {ftensor}\n"
-                f"{ptensors_str}\n"
-                f"{ctensors_str}\n"
+                f"ptensors:\n\t" + "\n\t".join(tensor_vd_repr(ptensor) for ptensor in ilayout.mat.flatten()) + "\n"
+                f"ctensors:\n\t" + "\n\t".join(tensor_vd_repr(ctensor) for ctensor in olayout.mat.flatten()) + "\n"
                 f"Switch to a fixed plan: ilayout -> FullReplica -> olayout"
             )
             color, default = '\033[33m' , '\033[0m'
@@ -739,11 +762,6 @@ class PathFinder:
                 # switch to a fixed plan ilayout -> R(n)V(1)D(1*) -> olayout
                 rlayout = GridLayout.grid(ftensor, r=ilayout.ndevs, v=1, dims=tuple(1 for _ in range(ilayout.ndims-2)))
                 # assign devices
-                # itensors = ilayout.mat.flatten()
-                # idevs = np.array([t.device[0] for t in itensors])
-                # itensors = [itensors[idx] for idx in np.argsort(idevs)]
-                # for it, rt in zip(itensors, rlayout.mat.flatten()):
-                #     rt.cell = it.cell
                 for rt, ot in zip(rlayout.mat.flatten(), olayout.mat.flatten()):
                     rt.cell = ot.cell
                 # find left

@@ -13,6 +13,7 @@ from cube.ir.adapter.prim import SelectPrim, MovePrim, SumPrim, MergeDimPrim
 from cube.ir.adapter.prim import BroadcastPrim
 
 from cube.graph.gener.layout import GridLayout, PathFinder
+from cube.graph.gener.utils import DummyInputOuput
 from cube.flags import CompileFlag
 
 import warnings
@@ -51,7 +52,7 @@ class ConcurrentGener:
         if (not CompileFlag.disable_intra_rvd) and inshard and len(pdevs) > 1:
             # fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reorder=True)
             try:
-                fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reorder=True)
+                fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reassign=True)
             except Exception as e:
                 fadapter = None
                 color, default = '\033[33m' , '\033[0m'
@@ -92,7 +93,7 @@ class ConcurrentGener:
     @staticmethod
     def gen_in_shard(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor], 
                      bptensors: List[IRSubTensor], bctensors: List[IRSubTensor],
-                     allow_reorder=False):
+                     allow_reassign=False):
         """
         Generate forward and backward adapter for concurrent produced tensors and consumed tensors.
 
@@ -100,21 +101,31 @@ class ConcurrentGener:
         @param fctensors List[IRSubTensor]: forward consumed tensors
         @param bptensors List[IRSubTensor]: backward produced tensors
         @param bctensors List[IRSubTensor]: backward consumed tensors
+        @param allow_reassign bool: Allow to change placement of forward consumer tensors to better align deivce placement
         """
+        allow_reassign = allow_reassign and \
+            all(not isinstance(t.cell, DummyInputOuput) for t in fptensors + fctensors + bptensors + bctensors) and \
+            all(t.cell.name != 'multiref' for t in fctensors)
+        # assert allow_reassign
         ftensor = fptensors[0].parent
         # producer grid layout
         ilayout = GridLayout.togrid(ftensor, fptensors)
-        # reorder ctensors to match with ptensors
         devs = [ptensor.device for ptensor in ilayout.mat.flatten()]
+        # re-order ctensors to match with ptensors
         ctensors = [None] * len(devs)
         for ctensor in fctensors:
             idx = devs.index(ctensor.device)
             ctensors[idx] = ctensor
         assert all(t is not None for t in ctensors), f"empty device slot {ctensors}"
-        # consumer grid layout
         olayout = GridLayout.togrid(ftensor, ctensors)
         # find path
-        paths, fprims = PathFinder.intra_path(ftensor, ilayout, olayout)
+        paths, fprims = PathFinder.intra_path(ftensor, ilayout, olayout, allow_misalign=allow_reassign)
+        # re-assign tensors
+        if allow_reassign:
+            for t, ot in zip(paths[-1].mat.flatten(), olayout.mat.flatten()):
+                ot.cell.device = t.device
+                if len(bptensors) != 0:
+                    ot.cell.mirror.device = t.device
 
         fadapter = IRAdapter(fptensors, fctensors)
         fadapter.prims = fprims

@@ -8,6 +8,25 @@ from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 
 
+class DummyInputOuput(IRFwOperation):
+
+    def __init__(self, tensor: IRSubTensor, device: int, 
+                 is_input=False, is_output=False,
+                 name='dummy'):
+        super().__init__(name, name,
+            1 if is_input else 0,
+            1 if is_output else 0
+        )
+        assert (is_input and not is_output) or (is_output and not is_input)
+        if is_input:
+            self.set_input(0, tensor)
+        if is_output:
+            self.set_output(0, tensor)
+        self.device = device
+    
+    def __repr__(self) -> str:
+        return f'DummyInputOutput-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
+
 
 def convert_add_to_valmap(graph: IRGraph, add_node: IRFwOperation):
     """
