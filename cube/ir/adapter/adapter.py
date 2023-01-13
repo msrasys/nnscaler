@@ -152,9 +152,9 @@ class IRAdapter(IRCell):
         return f'Adapter-{self._id}{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
 
     def extra_repr(self) -> str:
-        dscp = f'Adapter-{self._id}[{self.device}](inputs={self.inputs()}, outputs={self.outputs()})\n'
+        dscp = f'Adapter-{self._id}{self.device}(\n\tinputs={self.inputs()},\n\toutputs={self.outputs()}\n):'
         for prim in self.prims:
-            dscp += repr(prim) + '\n'
+            dscp += '\n\t' + repr(prim)
         return dscp
 
 

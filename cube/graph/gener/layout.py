@@ -665,7 +665,7 @@ class PathFinder:
                    ilayout: GridLayout, olayout: GridLayout,
                    cost_fn: Optional[Callable] = None,
                    allow_fallback: bool = True,
-                   allow_misalign: bool = False) -> Tuple[List[GridLayout], List[IRAdapterPrim]]:
+                   allow_misalign: bool = False) -> Tuple[bool, List[GridLayout], List[IRAdapterPrim]]:
         """
         Get primitive path of transforming ilayout into olayout.
         ilayout has the same device set with olayout
@@ -678,6 +678,7 @@ class PathFinder:
         @param allow_fallback bool: allow to use a fixed backup plan to make sure correct device mapping. (default True)
         @param allow_misalign bool: allow to have a different device mapping. (default False)
 
+        @return align bool: whether correctly align the device placement
         @return layouts List[GridLayout]: each transformation.
         @return prims List[IRAdapterPrim]: the primitives to perform transformation.
         """
@@ -686,7 +687,8 @@ class PathFinder:
         key = (shape, ilayout.ndevs)
         src = (ilayout.R, ilayout.V) + tuple(ilayout.D)
         dst = (olayout.R, olayout.V) + tuple(olayout.D)
-        if src == dst: return [ilayout], []
+        # TODO: FIXME: may not align
+        if src == dst: return True, [ilayout], []
         
         # get paths using dijkstra algorithm or cached
         if key in PathFinder._cached_intra_paths and src in PathFinder._cached_intra_paths[key]:
@@ -737,8 +739,8 @@ class PathFinder:
         # print(f'path: {rvds}')
 
         # search for correct device mapping
-        success, layouts, all_prims = PathFinder.intra_dev_align(ftensor, rvds[1:], [ilayout], [], olayout)
-        if not success and allow_misalign:
+        align, layouts, all_prims = PathFinder.intra_dev_align(ftensor, rvds[1:], [ilayout], [], olayout)
+        if not align and allow_misalign:
             layouts, all_prims = [], []
             curr_rvd, curr_layout = rvds[0], ilayout
             for hop_rvd in rvds[1:]:
@@ -749,7 +751,7 @@ class PathFinder:
                 all_prims += prims
                 curr_rvd, curr_layout = hop_rvd, layout
 
-        elif not success:
+        elif not align:
             error_msg = (
                 f"Fail to align intra-RVD devices. {ftensor}\n"
                 f"ptensors:\n\t" + "\n\t".join(tensor_vd_repr(ptensor) for ptensor in ilayout.mat.flatten()) + "\n"
@@ -770,14 +772,15 @@ class PathFinder:
                 lsuccess, llayouts, lprims = PathFinder.intra_dev_align(ftensor, left[1:], [ilayout], [], rlayout)
                 assert lsuccess, f"Switch fail to generate left-half intra-RVD plans for all-replica"
                 # find right
-                rlayouts, rprims = PathFinder.intra_path(ftensor, rlayout, olayout, cost_fn, allow_fallback=False)
+                _, rlayouts, rprims = PathFinder.intra_path(ftensor, rlayout, olayout, cost_fn, allow_fallback=False)
                 layouts  = llayouts + rlayouts
                 all_prims = lprims + rprims
             else:
                 # allow_fallback is False only for generating right-half intra-RVD
                 assert False, f"Switch fail to generate right-half intra-RVD plans from all-replica"
+            align = True
 
-        return layouts, all_prims
+        return align, layouts, all_prims
 
     @staticmethod
     def inter_path(ftensor: IRFullTensor, ilayout: GridLayout, olayout: GridLayout, cost_fn: Optional[Callable] = None) -> Tuple[List[GridLayout], List[IRAdapterPrim]]:

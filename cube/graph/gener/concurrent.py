@@ -50,7 +50,7 @@ class ConcurrentGener:
         # case 1: sharing device (in-shard)
         inshard = (set(pdevs) == set(cdevs)) and (len(fptensors) == len(fctensors)) and (len(pdevs) == len(fptensors))
         if (not CompileFlag.disable_intra_rvd) and inshard and len(pdevs) > 1:
-            # fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reorder=True)
+            fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reassign=True)
             try:
                 fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reassign=True)
             except Exception as e:
@@ -103,11 +103,15 @@ class ConcurrentGener:
         @param bctensors List[IRSubTensor]: backward consumed tensors
         @param allow_reassign bool: Allow to change placement of forward consumer tensors to better align deivce placement
         """
+        ftensor = fptensors[0].parent
         allow_reassign = allow_reassign and \
             all(not isinstance(t.cell, DummyInputOuput) for t in fptensors + fctensors + bptensors + bctensors) and \
             all(t.cell.name != 'multiref' for t in fctensors)
-        # assert allow_reassign
-        ftensor = fptensors[0].parent
+        # each consumer can only be re-assigned once
+        for t in fctensors[0].cell.inputs():
+            if isinstance(t, IRSubTensor):
+                allow_reassign = allow_reassign and (t.parent == ftensor)
+                break
         # producer grid layout
         ilayout = GridLayout.togrid(ftensor, fptensors)
         devs = [ptensor.device for ptensor in ilayout.mat.flatten()]
@@ -119,9 +123,9 @@ class ConcurrentGener:
         assert all(t is not None for t in ctensors), f"empty device slot {ctensors}"
         olayout = GridLayout.togrid(ftensor, ctensors)
         # find path
-        paths, fprims = PathFinder.intra_path(ftensor, ilayout, olayout, allow_misalign=allow_reassign)
+        align, paths, fprims = PathFinder.intra_path(ftensor, ilayout, olayout, allow_misalign=allow_reassign)
         # re-assign tensors
-        if allow_reassign:
+        if (not align) and allow_reassign:
             for t, ot in zip(paths[-1].mat.flatten(), olayout.mat.flatten()):
                 ot.cell.device = t.device
                 if len(bptensors) != 0:
@@ -143,14 +147,7 @@ class ConcurrentGener:
             ilayout = GridLayout.togrid(grad, ptensors)
             olayout = GridLayout.togrid(grad, bctensors)
             # paths, bprims = ilayout.path(olayout)
-            paths, bprims = PathFinder.intra_path(grad, ilayout, olayout)
-            # check the device order
-            same_device = True
-            for t in paths[-1].mat.flatten():
-                if not any(t == c and set(t.device) == set(c.device) for c in bctensors):
-                    same_device = False
-                    break
-            assert same_device, "backward device not match"
+            _, paths, bprims = PathFinder.intra_path(grad, ilayout, olayout)
             # generate backward adapter
             badapter = IRAdapter(bptensors, bctensors)
             badapter.prims = bprims
