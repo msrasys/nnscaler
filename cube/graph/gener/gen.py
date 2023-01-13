@@ -19,23 +19,6 @@ from cube.graph.function.function import Accum, Cat, MultiRef
 DeviceID = int
 
 
-class DummyInputOuput(IRFwOperation):
-
-    def __init__(self, tensor: IRSubTensor, device: int, 
-                 is_input=False, is_output=False,
-                 name='dummy'):
-        super().__init__(name, name,
-            1 if is_input else 0,
-            1 if is_output else 0
-        )
-        assert (is_input and not is_output) or (is_output and not is_input)
-        if is_input:
-            self.set_input(0, tensor)
-        if is_output:
-            self.set_output(0, tensor)
-        self.device = device
-
-
 def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) -> List[IRFwOperation]:
     """
     Create dummy operators segment inputs and outputs. 
@@ -56,7 +39,7 @@ def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) 
             devices = [consumer.device for consumer in segment.consumers(tensor.parent)][::-1]
             if not isinstance(tensor, IRSubTensor): continue
             assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
-            fwop = DummyInputOuput(tensor, 0, is_output=True, name=f'segment{segment.cid}_input')
+            fwop = utils.DummyInputOuput(tensor, 0, is_output=True, name=f'segment{segment.cid}_input')
             for devid in devices:
                 fop = fwop.replicate()
                 fop.device = devid
@@ -73,7 +56,7 @@ def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) 
             devices = [producer.device for producer in segment.producers(tensor.parent)]
             if not isinstance(tensor, IRSubTensor): continue
             assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
-            fwop = DummyInputOuput(tensor, 0, is_input=True, name=f'segment{segment.cid}_output')
+            fwop = utils.DummyInputOuput(tensor, 0, is_input=True, name=f'segment{segment.cid}_output')
             for devid in devices:
                 fop = fwop.replicate()
                 fop.device = devid
@@ -106,10 +89,10 @@ def expand_devices(tensors: List[IRSubTensor],
             continue
         for devid in tensor.device:
             if producer:
-                fwop = DummyInputOuput(tensor, devid, is_output=True, name=tensor.cell.name)
+                fwop = utils.DummyInputOuput(tensor, devid, is_output=True, name=tensor.cell.name)
                 dtensors.append(fwop.output(0))
             elif consumer:
-                fwop = DummyInputOuput(tensor, devid, is_input=True, name=tensor.cell.name)
+                fwop = utils.DummyInputOuput(tensor, devid, is_input=True, name=tensor.cell.name)
                 dtensors.append(fwop.input(0))
             else:
                 raise ValueError("At least one of producer or consumer")
