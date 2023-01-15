@@ -444,8 +444,29 @@ class GridLayout:
             prims.append(RVGatherPrim(srcs, [dst]))
         return [(olayout, prims),]
 
+    def align(self, layout) -> bool:
+        """
+        Check whether the layout is same with self.
 
-    # ================ solution ============= #
+        The same means 1) sub-tenosrs are same 2) device are aligned
+
+        @param layout GridLayout
+
+        @return same bool: 
+        """
+        if not isinstance(layout, GridLayout):
+            return False
+        tensors: List[IRSubTensor] = list(self.mat.flatten())
+        for t in layout.mat.flatten():
+            dev_match = False
+            for idx in range(len(tensors)):
+                t2 = tensors[idx]
+                if t == t2 and set(t.device) == set(t2.device):
+                    tensors.pop(idx)
+                    dev_match = True
+                    break
+            if not dev_match: return False
+        return True
 
     def print_dev_tensors(self):
         """
@@ -687,8 +708,16 @@ class PathFinder:
         key = (shape, ilayout.ndevs)
         src = (ilayout.R, ilayout.V) + tuple(ilayout.D)
         dst = (olayout.R, olayout.V) + tuple(olayout.D)
-        # TODO: FIXME: may not align
-        if src == dst: return True, [ilayout], []
+
+        # cases for same source and destination RVD
+        if src == dst:
+            if ilayout.align(olayout):
+                return True, [ilayout], []
+            else:
+                if allow_misalign:
+                    return False, [ilayout], []
+                else:
+                    assert False, "Same source and destination rvd but got mis-aligned devices"
         
         # get paths using dijkstra algorithm or cached
         if key in PathFinder._cached_intra_paths and src in PathFinder._cached_intra_paths[key]:
@@ -938,27 +967,14 @@ class PathFinder:
         """
         ilayout = ilayouts[-1]
         if len(remain_states) == 0:
-            # print(f'transformed tensors: {[(t, t.device) for t in ilayout.mat.flatten()]}')
-            # print(f'destination tensors: {[(t, t.device) for t in olayout.mat.flatten()]}')
-            # check device mapping
-            otensors: List[IRSubTensor] = olayout.mat.flatten().tolist()
-            for itensor in ilayout.mat.flatten():
-                dev_match = False
-                for idx in range(len(otensors)):
-                    otensor = otensors[idx]
-                    if otensor == itensor and set(otensor.device) == set(itensor.device):
-                        otensors.pop(idx)
-                        dev_match = True
-                        break
-                if not dev_match: return False, [], []
+            if not ilayout.align(olayout):
+                return False, [], []
             return True, ilayouts, all_prims
         else:
             success, layout_prims = PathFinder.intra_transition(
                 ftensor, (ilayout.R, ilayout.V) + ilayout.D, remain_states[0], ilayout)
             assert success, "Internal Error at intra-RVD transition"
             for (hop_layout, hop_prims) in layout_prims:
-                # print(f'hop layout: {[(t, t.device) for t in hop_layout.mat.flatten()]}')
-                # print(f'dst layout: {[(t, t.device) for t in olayout.mat.flatten()]}')
                 ret, ret_layouts, ret_prims = PathFinder.intra_dev_align(
                     ftensor, remain_states[1:], ilayouts + [hop_layout], all_prims + hop_prims, olayout)
                 if ret:

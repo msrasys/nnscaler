@@ -50,7 +50,7 @@ class ConcurrentGener:
         # case 1: sharing device (in-shard)
         inshard = (set(pdevs) == set(cdevs)) and (len(fptensors) == len(fctensors)) and (len(pdevs) == len(fptensors))
         if (not CompileFlag.disable_intra_rvd) and inshard and len(pdevs) > 1:
-            fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reassign=True)
+            # fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reassign=True)
             try:
                 fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reassign=True)
             except Exception as e:
