@@ -58,7 +58,7 @@ class ConcurrentGener:
                 color, default = '\033[33m' , '\033[0m'
                 print(
                     f"{color}========== Fail to use intra-RVD ==========\n"
-                    f"full tensor: {fptensors[0].parent}\n"
+                    f"full tensor: {fptensors[0].parent} | is grad: {fptensors[0].parent.is_grad()}\n"
                     f"Reason: {str(e)}\n"
                     f"Switch to general P2P communication.\n"
                     f"===========================================\n{default}", file=sys.stderr

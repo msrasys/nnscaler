@@ -19,24 +19,10 @@ from cube.ir.adapter.prim import BroadcastPrim
 from cube.ir.adapter.prim import RDScatterPrim, RVScatterPrim
 from cube.ir.adapter.prim import RDGatherPrim, RVGatherPrim
 
+from cube.graph.gener.utils import tensor_vd_repr
 
 TShape = Tuple[int, ...]
 TRVD = Tuple[int, ...]
-
-
-def tensor_vd_repr(t: IRSubTensor) -> str:
-    """
-    Tensor index-value partition representation
-    """
-    assert isinstance(t, IRSubTensor), f"expect IRSubTensor"
-    identifier = 't' if not t.is_grad() else 'g'
-    dchunks, dpos = [], []
-    for dim in range(t.ndims):
-        dchunks.append(t.parent.shape[dim] // t.shape[dim])
-        dpos.append(t.indmap[dim][0] // t.shape[dim])
-    indmap = ','.join(f'{idx}/{nchunks}' for idx, nchunks in zip(dpos, dchunks))
-    dscp = f'{identifier}{t.tid}-{t.device}(p{t.parent.tid}, shape={t.shape}, D({indmap}), V({t.valmap[0]}/{t.valmap[1]})'
-    return dscp
 
 
 class GridLayout:
