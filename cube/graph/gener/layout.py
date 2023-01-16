@@ -769,6 +769,7 @@ class PathFinder:
         elif not align:
             error_msg = (
                 f"Fail to align intra-RVD devices. {ftensor}\n"
+                f"Path: {' -> '.join(str(rvd) for rvd in rvds)}\n"
                 f"ptensors:\n\t" + "\n\t".join(tensor_vd_repr(ptensor) for ptensor in ilayout.mat.flatten()) + "\n"
                 f"ctensors:\n\t" + "\n\t".join(tensor_vd_repr(ctensor) for ctensor in olayout.mat.flatten()) + "\n"
                 f"Switch to a fixed plan: ilayout -> FullReplica -> olayout"
