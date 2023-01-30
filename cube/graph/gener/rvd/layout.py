@@ -462,7 +462,7 @@ class RVDInspector:
             
             suby_nchunks = t.parent.shape[0] // t.shape[0]
             subh = recflen / suby_nchunks
-            suby = y + subh * (t.indmap[0][0] // t.shape[1])
+            suby = y + subh * (t.indmap[0][0] // t.shape[0])
 
             # if t.valmap != (0, 1):
             ax.text(x=x+recflen/2, y=y+recflen+recflen/2, s=f'val({t.valmap[0]}/{t.valmap[1]})',
