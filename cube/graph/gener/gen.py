@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
 import numpy as np
 import itertools
 
@@ -102,12 +102,15 @@ def expand_devices(tensors: List[IRSubTensor],
 class IRAdapterGener:
 
     @staticmethod
-    def gen(graph: IRGraph) -> IRGraph:
+    def gen(graph: IRGraph, cost_fn: Optional[Callable] = None) -> IRGraph:
         """
         Generate tensor adapter for both activations and weights
         Note weight reducers are always append to the last.
 
         @param graph IRGraph: the graph without adapter
+        @param cost_fn Optional[Callable]: takes an IRAdapterPrim and outputs a cost in float.
+            default to be None, which will use communication volume.
+    
         @return graph IRGraph: the graph with adapter inserted
         """
         # reorder producer and consumer ordering
@@ -117,7 +120,7 @@ class IRAdapterGener:
         # automatic transform multiref
         graph = IRAdapterGener.autoref(graph)
         # generate adapters for activation
-        graph = IRAdapterGener.gen_activation(graph)
+        graph = IRAdapterGener.gen_activation(graph, cost_fn=cost_fn)
         # generate weight reducer
         graph = IRAdapterGener.gen_weight(graph)
         # fuse consecutive non-differentiable adapters into one
@@ -226,7 +229,7 @@ class IRAdapterGener:
         return graph
 
     @staticmethod
-    def gen_activation(graph: IRSegment, allow_recompute: bool = True) -> IRSegment:
+    def gen_activation(graph: IRSegment, allow_recompute: bool = True, cost_fn: Optional[Callable] = None) -> IRSegment:
         """!
         Generate adapter for activation tensors.
         The forward/backward adapter is inserted before the first consumers of its full tensor.
@@ -299,7 +302,7 @@ class IRAdapterGener:
             if skip(fptensors, fctensors) and skip(bptensors, bctensors):
                 continue
 
-            fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors)
+            fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors, cost_fn)
             if fadapter is None:
                 continue
 
