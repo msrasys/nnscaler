@@ -239,7 +239,7 @@ class IntraPathFinder:
         @param ilayout RVDLayout: input tensor layout
         @param olayout RVDLayout: output tensor layout
         @param cost_fn Optional[Callable]: cost function of each primitive.
-            Default (None) will use transmission volume as metrics
+            Default (None) will use communication volume as metrics
 
         @return all_primitives List[IRAdapterPrims]: all primitives for communication path
         """
@@ -308,8 +308,8 @@ class IntraPathFinder:
 
         @param ilayouts RVDLayout: source layout
         @param olayout RVDLayout: target layout with correct device mapping
-        @param rvd_hops: Tuple[TRVD]: the hops from ilayout to olayout
-            (not contains ilayout at beginning, but contains olayout at last)
+        @param rvd_hops: Tuple[TRVD]: the hops from ilayout to olayout, which
+            contains ilayout and olayout at beginning and last, respectively.
 
         @return success bool: True if found device, else False.
         @return primitives List[IRAdapterPrim]: the correspoinding primitives
@@ -534,7 +534,7 @@ class IntraAutoPlacer:
                    fw_src_rvd: TRVD, fw_dst_rvd: TRVD,
                    bw_src_rvd: Optional[TRVD], bw_dst_rvd: Optional[TRVD],
                    src_placement: List[int],
-                   cost_fn: Optional[Callable] = None):
+                   cost_fn: Optional[Callable] = None) -> Tuple[Tuple[int], float]:
         """
         Search for a good device placement for 
         source and destination RVD partition
@@ -544,8 +544,10 @@ class IntraAutoPlacer:
         @param fw_dst_rvd Tuple[int]: forward consumer RVD layout vector
         @param bw_src_rvd Optional[Tuple[int]]: backward producer RVD layout vector
         @param bw_dst_rvd Optional[Tuple[int]]: backward consumer RVD layout vector
+        @param cost_fn Optional[Callable]: cost function of each primitive.
+            Default (None) will use communication volume as metrics
         
-        @return devices List[int]: device sequence for RVD tensors
+        @return devices Tuple[int]: device sequence for RVD tensors
         @return cost float: Cost of communication plan
         """
         src_placement = tuple(src_placement)
@@ -579,7 +581,7 @@ class IntraAutoPlacer:
         # - if find, choose one
         if len(devices) > 0:
             placement = list(devices)[0]
-        # - if not find, change forward one while use backup plan for backward one
+        # - if not find, keep forward one as optimal and adopt backup plan for backward one
         else:
             placement = list(fw_consumer_devices)[0]
             print(f"================ forward-backward mis-aligned! ============== \n"
