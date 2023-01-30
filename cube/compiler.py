@@ -27,7 +27,7 @@ from cube.flags import CompileFlag
 
 def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None,
-            override = True, load_content = True) -> Callable:
+            comm_cost_fn: Optional[Callable] = None, override = True, load_content = True) -> Callable:
     """
     AI Scientist calls like:
 
@@ -51,7 +51,10 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
     @param model SemanticModel: AI Scientist specified SemanticModel
     @param dataloader CubDataLoader: dataloader used for training
-    @param policy Callable: policy to transform and schedule graph
+    @param PAS Callable: policy to transform and schedule graph
+    @param comm_cost_fn: Optional[Callable]: communication cost function, which
+        takes in an IRAdapterPrim, and outputs a cost in float. By default (None) use
+        communication volume.
     @param override bool: If true, the generated code will override exsisting
         files (if they are already existed.), otherwise, use the already existed
         generated code, i.e., the policy won't take effect. Default true.
@@ -140,7 +143,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
             # generate adapter
             start = time.time()
-            graph = IRAdapterGener.gen(graph)
+            graph = IRAdapterGener.gen(graph, cost_fn=comm_cost_fn)
             span = time.time() - start
             print('> finish generating adapters: {:.2f} s'.format(span))
 

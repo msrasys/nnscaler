@@ -246,7 +246,7 @@ class IntraPathFinder:
         assert ilayout.ftensor == olayout.ftensor, f"ilayout and olayout should have a same full tensor"
         ftensor = ilayout.ftensor
         src, dst = tuple(ilayout.vec), tuple(olayout.vec)
-        rvds = IntraPathFinder.get_optimal_path(ftensor, src, dst)
+        rvds = IntraPathFinder.get_optimal_path(ftensor, src, dst, cost_fn)
 
         # search for correct device mapping
         align, all_prims = IntraPathFinder.device_align(ilayout, olayout, rvds)
