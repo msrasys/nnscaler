@@ -690,7 +690,7 @@ class IRGraph(IRSegment):
             end = starts[sid+1] if sid != len(starts) - 1 else last_fidx + 1
             while isinstance(self.node(begin), IRDataOperation):
                 begin += 1
-            while isinstance(self.node(end), IRDataOperation):
+            while end < len(self._nodes) and isinstance(self.node(end), IRDataOperation):
                 end -= 1
             if begin == end: continue
             assert begin < end
