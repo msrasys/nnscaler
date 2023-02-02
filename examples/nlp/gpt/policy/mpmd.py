@@ -7,6 +7,7 @@ from cube.graph.function.anchor import IRGraphAnchor
 from cube.ir.cten import IRCell
 from cube.ir.operator import IRDataOperation, IRFwOperation
 from cube.graph.schedule.sched1f1b import IRSchedule1F1B
+from cube.graph.schedule.schedinfer import IRScheduleInfer
 
 
 def _create_mesh(ngpus: int, group_num: Tuple[int]) -> Tuple[Tuple[Tuple[int]]]:
@@ -125,6 +126,40 @@ def PAS1F1B(graph: IRGraph, resource):
             graph.assign(node, 0)
 
     strategy = IRSchedule1F1B(graph, num_microbatch)
+    graph.predef_sched(strategy)
+    return graph
+
+
+def PAS1F(graph: IRGraph, resource):
+    """
+    1F1B scheduling
+    """
+    num_stages = resource.ngpus
+    num_microbatch = 16
+
+    # group to transformer layers
+    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
+    transformers = _group_to_transformers(fnodes)
+
+    # staging
+    fstages = [[] for _ in range(num_stages)]
+    nlayer_per_stage = (len(transformers) // resource.ngpus)
+    for lid, fnodes in enumerate(transformers):
+        stage_id = min(lid // nlayer_per_stage, num_stages - 1)
+        fstages[stage_id] += fnodes
+    graph.staging(tuple(stages[0] for stages in fstages))
+
+    # stage to device
+    fsegments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
+    assert len(fsegments) == num_stages
+    for devid, segment in enumerate(fsegments):
+        graph.assign(segment, devid)
+
+    for node in graph.nodes():
+        if isinstance(node, IRDataOperation):
+            graph.assign(node, 0)
+
+    strategy = IRScheduleInfer(graph, num_microbatch)
     graph.predef_sched(strategy)
     return graph
 
