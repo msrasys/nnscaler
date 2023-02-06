@@ -3,9 +3,11 @@ from functools import partial
 import numpy as np
 import sys
 import copy
+import warnings
 
 from cube.ir.dtype import IRDType
-from cube.ir.tensor import IRFullTensor
+from cube.ir.cten import IRCell
+from cube.ir.tensor import IRFullTensor, IRSubTensor
 
 from cube.ir.adapter.prim import IRAdapterPrim
 from cube.ir.adapter.prim import AllGatherPrim      # d2r
@@ -15,6 +17,7 @@ from cube.ir.adapter.prim import ReduceScatterPrim  # v2d
 from cube.ir.adapter.prim import ChunkPrim          # r2d
 from cube.ir.adapter.prim import VChunkPrim         # r2v
 
+from cube.graph.segment import IRSegment
 from cube.graph.gener.rvd.layout import RVDLayout
 
 from cube.graph.gener.utils import tensor_vd_repr
@@ -530,11 +533,81 @@ class IntraPathFinder:
 class IntraAutoPlacer:
 
     @staticmethod
-    def auto_place(shape: TShape,
-                   fw_src_rvd: TRVD, fw_dst_rvd: TRVD,
-                   bw_src_rvd: Optional[TRVD], bw_dst_rvd: Optional[TRVD],
-                   src_placement: List[int],
-                   cost_fn: Optional[Callable] = None) -> Tuple[Tuple[int], float]:
+    def auto_place(graph: IRSegment, ftensor: IRFullTensor,
+                   producers: List[IRCell], consumers: List[IRCell],
+                   cost_fn: Optional[Callable] = None) -> List[int]:
+        """
+        Automatically find good device placement for consumers given the producer placement
+        The backward will also be considered.
+        
+        @param ftensor IRFullTensor
+        @param producers List[IRCell]: producers that must be assigned to devices
+        @param consumers List[IRCell]: consumers that are about to be assigned
+
+        @return cost float: the cost after the placement.
+        """
+        assert all(len(p.device) > 0 for p in producers), f"Expect all producers have been assigned to a device"
+        
+        devices = [p.device[0] for p in producers]
+        assert len(set(devices)) == len(producers),f"Expect each producer is on a different device"
+        
+        assert len(producers) == len(consumers), \
+            f"Expect same number of producer and consumer, but got {len(producers)} producers and {len(consumers)} consumers"
+
+        if any(len(consumer.device) > 0 for consumer in consumers):
+            warnings.warn('Detected at least one consumer has been assigned to a device, which will be overrided by a new device placement.')
+        
+        # reorder producer to match with device order
+        producers = sorted(producers, key=lambda n: n.device[0])
+
+        # get forward produced tensors
+        fptensors: List[IRSubTensor] = []
+        fctensors: List[IRSubTensor] = []
+        for producer in producers:
+            assert producer in graph.producers(ftensor), f"Producer {producer} doesn't generate ftensor: {ftensor}"
+            pidx = graph.producers(ftensor).index(producer)
+            fptensors.append(graph.ptensors(ftensor)[pidx])
+        for consumer in consumers:
+            assert consumer in graph.consumers(ftensor), f"Consumer {producer} doesn't take ftensor: {ftensor}"
+            cidx = graph.consumers(ftensor).index(consumer)
+            fctensors.append(graph.ctensors(ftensor)[cidx])
+
+        # get backward producer and consumer tensors
+        bptensors, bctensors = None, None
+        if ftensor.grad is not None:
+            bptensors = [t.grad for t in fctensors]
+            bctensors = [t.grad for t in fptensors]
+        # get RVD representation
+        fw_src = RVDLayout.togrid(ftensor, fptensors)
+        fw_src_rvd = fw_src.vec
+        fw_dst = RVDLayout.togrid(ftensor, fctensors)
+        fw_dst_rvd = fw_dst.vec
+        bw_src_rvd, bw_dst_rvd = None, None
+        if ftensor.grad is not None:
+            bw_src_rvd = RVDLayout.togrid(ftensor.grad, bptensors).vec
+            bw_dst_rvd = RVDLayout.togrid(ftensor.grad, bctensors).vec
+        
+        # get placement advice
+        devices = [t.device[0] for t in fw_src.mat.flatten()]
+        placement, _ = IntraAutoPlacer.advice(
+            ftensor.shape, 
+            fw_src_rvd, fw_dst_rvd, bw_src_rvd, bw_dst_rvd,
+            devices, cost_fn)
+        
+        # assign to device
+        ordered_placement = [None] * len(consumers)
+        for devid, t in zip(placement, fw_dst.mat.flatten()):
+            ordered_placement[consumers.index(t.cell)] = devid
+        assert all(devid is not None for devid in ordered_placement), f"Internal Error"
+
+        return ordered_placement
+
+    @staticmethod
+    def advice(shape: TShape,
+               fw_src_rvd: TRVD, fw_dst_rvd: TRVD,
+               bw_src_rvd: Optional[TRVD], bw_dst_rvd: Optional[TRVD],
+               src_placement: List[int],
+               cost_fn: Optional[Callable] = None) -> Tuple[Tuple[int], float]:
         """
         Search for a good device placement for 
         source and destination RVD partition
