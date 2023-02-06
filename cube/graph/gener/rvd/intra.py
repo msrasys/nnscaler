@@ -17,6 +17,7 @@ from cube.ir.adapter.prim import ReduceScatterPrim  # v2d
 from cube.ir.adapter.prim import ChunkPrim          # r2d
 from cube.ir.adapter.prim import VChunkPrim         # r2v
 
+from cube.graph import IRGraph
 from cube.graph.segment import IRSegment
 from cube.graph.gener.rvd.layout import RVDLayout
 
@@ -533,7 +534,7 @@ class IntraPathFinder:
 class IntraAutoPlacer:
 
     @staticmethod
-    def auto_place(graph: IRSegment, ftensor: IRFullTensor,
+    def auto_place(graph: IRGraph, ftensor: IRFullTensor,
                    producers: List[IRCell], consumers: List[IRCell],
                    cost_fn: Optional[Callable] = None) -> List[int]:
         """
@@ -544,8 +545,10 @@ class IntraAutoPlacer:
         @param producers List[IRCell]: producers that must be assigned to devices
         @param consumers List[IRCell]: consumers that are about to be assigned
 
-        @return cost float: the cost after the placement.
+        @return placement List[int]: the adviced placement
+            corresponding to each consumer in consumers.
         """
+        assert not ftensor.is_param(), f"Cannot automatically assign device given weight tensor"
         assert all(len(p.device) > 0 for p in producers), f"Expect all producers have been assigned to a device"
         
         devices = [p.device[0] for p in producers]
@@ -557,9 +560,12 @@ class IntraAutoPlacer:
         if any(len(consumer.device) > 0 for consumer in consumers):
             warnings.warn('Detected at least one consumer has been assigned to a device, which will be overrided by a new device placement.')
         
+        if len(producers) == 1:
+            graph.assign(consumers[0], producers[0].device)
+            return [producers[0].device]
+
         # reorder producer to match with device order
         producers = sorted(producers, key=lambda n: n.device[0])
-
         # get forward produced tensors
         fptensors: List[IRSubTensor] = []
         fctensors: List[IRSubTensor] = []
