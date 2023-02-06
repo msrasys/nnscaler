@@ -233,7 +233,7 @@ def test_all_fb_cases_fix_placement():
             bprims = IntraPathFinder.path(bp, bc)
 
 
-def test_all_fb_cases_auto_placement():
+def test_all_fb_cases_advisor():
 
     fshape = [128, 256, 512]
     ndevs = 8
@@ -255,7 +255,7 @@ def test_all_fb_cases_auto_placement():
             bc_rvd = (fp_rvd[0] * fp_rvd[1], 1) + fp_rvd[2:]
             print(f'test generating | fp rvd: {fp_rvd}, fc rvd: {fc_rvd}, bp rvd: {bp_rvd}, bc rvd: {bc_rvd}')
             
-            placement, cost = IntraAutoPlacer.auto_place(
+            placement, cost = IntraAutoPlacer.advice(
                 fshape, fp_rvd, fc_rvd, bp_rvd, bc_rvd, fdevs)
 
             fc = RVDLayout.grid(ftensor, r=fc_rvd[0], v=fc_rvd[1], dims=fc_rvd[2:], devices=placement)
@@ -270,7 +270,7 @@ def test_all_fb_cases_auto_placement():
             bc_rvd = (fp_rvd[0] * fp_rvd[1], 1) + fp_rvd[2:]
             print(f'test generating | fp rvd: {fp_rvd}, fc rvd: {fc_rvd}, bp rvd: {bp_rvd}, bc rvd: {bc_rvd}')
 
-            placement, cost = IntraAutoPlacer.auto_place(
+            placement, cost = IntraAutoPlacer.advice(
                 fshape, fp_rvd, fc_rvd, bp_rvd, bc_rvd, fdevs)
 
             fc = RVDLayout.grid(ftensor, r=fc_rvd[0], v=fc_rvd[1], dims=fc_rvd[2:], devices=placement)
@@ -289,4 +289,4 @@ if __name__ == '__main__':
     # test_all_f_cases_auto_placement()
     # test_one_fb_case()
     # test_all_fb_cases_fix_placement()
-    test_all_fb_cases_auto_placement()
+    test_all_fb_cases_advisor()
