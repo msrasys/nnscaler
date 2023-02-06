@@ -65,7 +65,7 @@ def inter():
     def train_iter(model, dataloader):
         input_ids, position_ids = next(dataloader)
         loss = model(input_ids, position_ids)
-        return loss
+        # return loss
     model = model.get_gen_module()
 
     torch.distributed.barrier()
