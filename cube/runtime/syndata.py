@@ -157,12 +157,7 @@ class SynDataLoader(CubeDataLoader):
                     device=torch.cuda.current_device(),
                     requires_grad=False)
             )
-        datas 
-        if len(datas) == 0:
-            self.buffer = None
-        else:
-            datas = tuple(datas) if len(datas) > 1 else datas[0]
-        return tuple(datas) if len(datas) > 0 else datas
+        return tuple(datas)
     
     def set_output(self, datas: Union[torch.Tensor, Tuple[torch.Tensor]]):
         datas = (datas,) if torch.is_tensor(datas) else tuple(datas)
