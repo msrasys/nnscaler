@@ -9,6 +9,7 @@ from cube.graph.gener.gen import IRAdapterGener
 from cube.graph.graph import IRGraph
 from cube.ir.operator import IRDataOperation
 from cube.graph.function.anchor import IRGraphAnchor
+from cube.graph.function.pyfunc import IRPyFunc
 
 from cube.execplan import ExecutionPlan
 from cube.execplan.planpass.fusion import DiffFusion
@@ -137,6 +138,8 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             for node in graph.nodes(flatten=True):
                 # skip graph anchor and multiref: they will be removed or replaced by system
                 if isinstance(node, IRGraphAnchor) or node.name == 'multiref':
+                    graph.assign(node, 0)
+                if isinstance(node, IRPyFunc):
                     graph.assign(node, 0)
                 if len(node.device) == 0:
                     raise RuntimeError(f"Node {node} device is not set")
