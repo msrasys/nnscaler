@@ -131,11 +131,10 @@ class GPTInfer(torch.nn.Module):
         return loss
 
 
-class GPTDataLoader(cube.runtime.syndata.CubeDataLoader):
+class GPTDataLoader(cube.runtime.syndata.SynDataLoader):
 
     def __init__(self, batch_size: int, cfg: Config = Config()):
 
-        self.bs = batch_size
         self.cfg = cfg
         super().__init__(
             shapes=([batch_size, self.cfg.seqlen],
@@ -144,31 +143,23 @@ class GPTDataLoader(cube.runtime.syndata.CubeDataLoader):
             dtypes=(torch.int64, torch.int64),
             batch_dims=(0, 0)
         )
-        self.samples = [self.random_sample()]
 
     def random_sample(self):
         input_ids = torch.randint(
             0, self.cfg.num_embeddings,
-            size=(self.bs, self.cfg.seqlen),
+            size=(self.batch_size, self.cfg.seqlen),
             dtype=torch.int64, device=torch.cuda.current_device()
         )
         position_ids = torch.arange(
             0, self.cfg.seqlen, dtype=torch.int64, device=torch.cuda.current_device()
-        ).repeat(self.bs).view(self.bs, -1)
-        return (input_ids, position_ids)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.samples[0]
+        ).repeat(self.batch_size).view(self.batch_size, -1)
+        return input_ids, position_ids
 
 
-class GPTInferDataLoader(cube.runtime.syndata.CubeDataLoader):
+class GPTInferDataLoader(cube.runtime.syndata.SynDataLoader):
 
     def __init__(self, batch_size: int, cfg: Config = Config()):
 
-        self.bs = batch_size
         self.cfg = cfg
         super().__init__(
             shapes=([batch_size, 1],
@@ -177,23 +168,16 @@ class GPTInferDataLoader(cube.runtime.syndata.CubeDataLoader):
             dtypes=(torch.int64, torch.int64),
             batch_dims=(0, 0)
         )
-        self.samples = [self.random_sample()]
 
     def random_sample(self):
         input_ids = torch.randint(
             0, self.cfg.num_embeddings,
-            size=(self.bs, 1),
+            size=(self.batch_size, 1),
             dtype=torch.int64,
             device=torch.cuda.current_device()
         )
         position_ids = torch.arange(
             0, 1, dtype=torch.int64,
             device=torch.cuda.current_device()
-        ).repeat(self.bs).view(self.bs, -1)
-        return (input_ids, position_ids)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.samples[0]
+        ).repeat(self.batch_size).view(self.batch_size, -1)
+        return input_ids, position_ids
