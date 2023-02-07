@@ -7,6 +7,7 @@ from cube.graph.gener.concurrent import ConcurrentGener
 import cube.graph.gener.utils as utils
 from cube.graph.graph import IRGraph
 from cube.graph.segment import IRSegment
+from cube.graph.function.pyfunc import IRPyFunc
 
 from cube.ir.cten import IRCell
 from cube.ir.tensor import IRFullTensor, IRSubTensor
@@ -117,6 +118,8 @@ class IRAdapterGener:
         graph._reorder_producer_consumer()
         # remove anchor node
         graph = IRAdapterGener.remove_anchor(graph)
+        # automatic replace pyfunc
+        graph = IRAdapterGener.auto_pyfunc(graph)
         # automatic transform multiref
         graph = IRAdapterGener.autoref(graph)
         # generate adapters for activation
@@ -138,6 +141,46 @@ class IRAdapterGener:
                     graph.mirror.remove(anchor.mirror)
             elif isinstance(anchor, IRSegment):
                 IRAdapterGener.remove_anchor(anchor)
+        return graph
+    
+    @staticmethod
+    def auto_pyfunc(graph: IRSegment):
+        """
+        Make pyfunc to be local
+        """
+        for func in graph.select(ntype=IRPyFunc, flatten=False):
+            assert func.mirror is None, "PyFunc is only supported by inference"
+            assert all(not isinstance(t, IRSubTensor) for t in func.outputs()), \
+                "PyFunc doesn't support tensor outputs"
+            # get devices it will lowered to
+            devices = set()
+            for t in func.inputs():
+                if not isinstance(t, IRSubTensor): continue
+                producers = graph.producers(t.parent)
+                for p in producers:
+                    devices.update(p.device)
+            pyfuncs = []
+            # lower to each device
+            for devid in devices:
+                inputs = []
+                for t in func.inputs():
+                    if isinstance(t, IRSubTensor):
+                        if t.is_attr():
+                            tensors = set(tensor for tensor in graph.ctensors(t.parent) if devid in tensor.device and tensor.cell != func)
+                        else:
+                            tensors = set(tensor for tensor in graph.ptensors(t.parent) if devid in tensor.device)
+                        assert len(tensors) == 1, \
+                            f"Find {len(tensors)} != 1 versions of tensor {t} on a same device."
+                        t = list(tensors)[0]
+                    inputs.append(t)
+                lower_func = IRPyFunc(func.signature, inputs, func.outputs(), **func.kwargs)
+                lower_func.device = devid
+                pyfuncs.append(lower_func)
+            position = graph.remove(func)
+            for pyfunc in pyfuncs:
+                graph.insert(pyfunc, position)
+        for segment in graph.select(ntype=IRSegment, flatten=False):
+            IRAdapterGener.auto_pyfunc(segment)
         return graph
 
     @staticmethod
