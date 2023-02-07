@@ -163,6 +163,13 @@ def emit_to(node, arg_vars:list, kw_pairs:dict) -> str:
 
     return _common_rule_join_all(node, arg_vars, kw_pairs)
 
+def emit_setattr(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
+
+    assert arg_vars[1].startswith('self.')
+    member = f'"{arg_vars[1][5:]}"'
+    return f"{node.signature}({arg_vars[0]}, {member}, {arg_vars[2]})"
+
+
 class Sign2EmitRule:
 
     @staticmethod
@@ -192,7 +199,9 @@ class Sign2EmitRule:
         'torch.ones': emit_ones,
         'torch.Tensor.to': emit_to,
         'torch.rand': emit_rand,
-        'torch.tensor': emit_new_tensor
+        'torch.tensor': emit_new_tensor,
+
+        'setattr': emit_setattr,
     }
 
 

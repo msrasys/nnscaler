@@ -18,6 +18,7 @@ from cube.ir.dtype import IRDType, DTypeInferRule
 
 from cube.graph.function.function import Identity, MultiRef
 from cube.graph.function.anchor import IRGraphAnchor
+from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.segment import IRSegment
 
 from cube.algorithm.generics import GenericDistAlgo
@@ -283,6 +284,10 @@ class IRGraph(IRSegment):
             warnings.warn(
                 'Detected partition a multiref node. This will be skipped as system will automatically handle it.')
             return [node]
+        if isinstance(node, IRPyFunc):
+            warnings.warn(
+                'Detected partition a python runtime function. This will be skipped as system will automatically handle it')
+            return [node]
 
         fsegment: IRSegment = self.segment(node)
         # replicate
@@ -343,6 +348,10 @@ class IRGraph(IRSegment):
         if node.name == 'multiref':
             warnings.warn(
                 'Detected partition a multiref node. This will be skipped as system will automatically handle it.')
+            return [node]
+        if isinstance(node, IRPyFunc):
+            warnings.warn(
+                'Detected partition a python runtime function. This will be skipped as system will automatically handle it')
             return [node]
 
         # get partitioned sub-nodes
