@@ -1,5 +1,5 @@
 import torch
-from examples.nlp.blocks.attention import MultiHeadSelfAttention, MultiHeadOneAttention
+from examples.nlp.blocks.attention import MultiHeadSelfAttention, MultiHeadOneAttention, func_print_shape
 from examples.nlp.blocks.mlp import MLP
 
 
@@ -56,7 +56,9 @@ class EncoderInferLayer(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.self_attn_layer_norm(x)
-        x = self.self_attn_partial(x, self.past_embed_key, self.past_embed_value)
+        x, past_k, past_v = self.self_attn_partial(x, self.past_embed_key, self.past_embed_value)
+        self.past_embed_key = past_k
+        self.past_embed_value = past_v
         x = self.dropout(x)
         x = x + residual
 
@@ -65,4 +67,6 @@ class EncoderInferLayer(torch.nn.Module):
         x = self.mlp(x)
         x = self.dropout(x)
         x = x + residual
+        # func_print_shape(self.past_embed_key, 'past_k: ')
+        # func_print_shape(self.past_embed_value, 'past_v: ')
         return x
