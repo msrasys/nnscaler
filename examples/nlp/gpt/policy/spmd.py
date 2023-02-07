@@ -160,6 +160,11 @@ def PASMegatronInferTP(graph: IRGraph, resource):
     ffns = [node for node in fnodes if node.name == 'feedforward']
     for ffn in ffns:
         _tp(graph, ffn, tp_devs, idx=1, dim=0)
+    
+    # func_print_shape
+    prts = [node for node in fnodes if node.name == 'func_print_shape']
+    for prt in prts:
+        _tp(graph, prt, tp_devs, idx=0, dim=2)
 
     # first embedding linear
     first_emb_anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor) and node.name == 'first_embed']

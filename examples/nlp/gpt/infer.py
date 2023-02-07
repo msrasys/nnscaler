@@ -16,6 +16,7 @@ import torch
 
 from examples.nlp.gpt.model import GPTInfer, GPTInferDataLoader
 from examples.nlp.gpt.model import GPTDataLoader
+from examples.nlp.gpt.model import build_gpt_config
 
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
@@ -51,9 +52,9 @@ else:
 def inter():
     print(f'torch.cuda.is_available() = {torch.cuda.is_available()}')
 
-    batch_size = 1
+    batch_size = 8
 
-    model = GPTInfer()
+    model = GPTInfer(batch_size=batch_size, cfg=build_gpt_config('350M'))
     model = model if not args.fp16 else model.half()
     # model = model.cuda() #only for PyTorch run
     model.eval()
