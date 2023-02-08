@@ -692,7 +692,7 @@ class IRAdapterGener:
         """
         fadapters, badapters = [], []
         for adapter in graph.nodes():
-            if isinstance(adapter, IRAdapter) and adapter.forward and not adapter.differentiable:
+            if isinstance(adapter, IRAdapter) and adapter.isfw() and not adapter.differentiable:
                 fadapters.append(adapter)
                 if adapter.mirror is not None:
                     badapters.append(adapter.mirror)

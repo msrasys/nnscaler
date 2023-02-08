@@ -1,6 +1,7 @@
 r"""
 Executor for runtime
 """
+import atexit
 
 from typing import Tuple, Any, Callable, List, Dict
 import torch
@@ -41,13 +42,17 @@ def convert_fp32_to_fp16(t: Any):
     return t
 
 
+TensorPairs = List[Tuple[int, torch.Tensor]]
+
+
 class Executor:
 
-    _detach: Dict[str, Dict[torch.Tensor, torch.Tensor]] = dict()
-
-    # auto mixture precision loss scaler. $ TODO: support it.
-    _scaler = torch.cuda.amp.GradScaler(enabled=CompileFlag.use_amp)
-    
+    # We consider each segment as an isolated graph. By
+    # executing the forward of graph, the input tensors will be detached
+    # from previous graph and saved for backward.
+    # Each graph has its name, and multiple call for the graph will append
+    # (instant id -> detached) input tensor pairs for backward reference.
+    _detach: Dict[str, List[TensorPairs]] = dict()
 
     @staticmethod
     def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
@@ -56,29 +61,20 @@ class Executor:
         """
         if not requires_grad:
             with torch.no_grad():
-                if CompileFlag.use_amp:
-                    with torch.autocast('cuda', torch.float16):
-                        outputs = subgraph(*input_tensors)
-                else:
-                    outputs = subgraph(*input_tensors)
-        else:
-            # everytime forward a segment, detach the tensor from previous graph
-            # debug_id(input_tensors, 'outside fexecute args', 0)
-            assert name not in Executor._detach
-            Executor._detach[name] = dict()
-            for itensor in input_tensors:
-                if torch.is_tensor(itensor) and itensor.requires_grad:
-                    if itensor not in Executor._detach[name]:
-                        Executor._detach[name][itensor] = itensor.detach().requires_grad_()
-            input_tensors = tuple(
-                Executor._detach[name][t] if t in Executor._detach[name] else t for t in input_tensors
-            )
-            if CompileFlag.use_amp:
-                with torch.autocast('cuda', torch.float16):
-                    outputs = subgraph(*input_tensors)
-            else:
                 outputs = subgraph(*input_tensors)
-        # print('forwarding... ')
+            return outputs
+
+        # everytime forward a segment, detach the tensor from previous graph
+        mapping: Dict[int, torch.Tensor] = dict()
+        for itensor in input_tensors:
+            if torch.is_tensor(itensor) and itensor.requires_grad:
+                mapping[id(itensor)] = itensor.detach().requires_grad_()
+        input_dtensors = tuple(mapping[id(t)] if id(t) in mapping else t for t in input_tensors)
+        
+        saved_pairs = [(id(itensor), dtensor) for itensor, dtensor in zip(input_tensors, input_dtensors)]
+        Executor._detach.setdefault(name, []).append(saved_pairs)  
+        
+        outputs = subgraph(*input_dtensors)
         return outputs
 
     @staticmethod
@@ -109,40 +105,45 @@ class Executor:
         """
         Backward Procedure.
 
-        input_tensors: List[torch.Tensor]:
+        @param input_tensors List[torch.Tensor]
             tensors that their gradient need to be computed, including parameters.
             Correspoinding forward input tensors.
 
-        output_tensors:
+        @param output_tensors List[torch.Tensor]
             tensors that start for gradient backward computation.
             Corresponding to forward output tensors.
 
-        output_tensor_grads:
+        @param output_tensor_grads List[torch.Tensor]:
             gradient tensors corresponding to output_tensors.
 
-        Returns:
-            gradient in order of non-parameter tensors in input_tensors.
-            (Note parameter tnesors already have gradient accumulated at .grad attribute)
+        @return gradients List[torch.Tensor]:
+            gradient tensors corresponding to input_tensors.
         """
-        if len(output_tensors) == 0:
-            return None
+        if len(output_tensors) == 0: return None
 
-        assert name in Executor._detach, f"forward graph: {name} not run before"
-        input_tensors = [t for t in input_tensors if torch.is_tensor(t) and not isinstance(t, torch.nn.Parameter)]
-        input_tensors = [t for t in input_tensors if t.requires_grad]
-        input_tensors = [Executor._detach[name][t] if t in Executor._detach[name] else t for t in input_tensors]
+        saved_pairs = Executor._detach[name].pop(0)
+        tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
+        dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
         for t in input_tensors:
-            t.retain_grad()
+            if id(t) not in tensor_ids:
+                warnings.warn("input doesn't match. Make sure in scheduling that earlier forward perform earlier backward")
+
+        input_tensors = []
+        for t in dtensors:
+            if torch.is_tensor(t) and t.requires_grad:
+                t.retain_grad()
+                input_tensors.append(t)
+
         torch.autograd.backward(
             output_tensors,
             grad_tensors=output_tensor_grads,
         )
         grads = tuple(t.grad for t in input_tensors)
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
-        del Executor._detach[name]
+
         if    len(grads) == 0: return None
         elif  len(grads) == 1: return grads[0]
-        else: return tuple(grads)
+        else: return grads
 
     @staticmethod
     def clear():
@@ -150,56 +151,17 @@ class Executor:
 
     @staticmethod
     def check_clear():
-        assert len(Executor._detach) == 0, \
-            f"Find remain not consumed sub-graph: {tuple(Executor._detach.keys())}"
+        for name, npairs in Executor._detach.items():
+            assert len(npairs) == 0, \
+                f"Fine remaining segment needs backward: {name}, remaining times: {len(npairs)}"
 
 
 fexecute = Executor.fexecute
 aexecute = Executor.aexecute
 backward = Executor.backward
 
-
-# def backward(input_tensors : List[torch.Tensor],
-#              output_tensors: List[torch.Tensor],
-#              output_tensor_grads: List[torch.Tensor]):
-#     """
-#     Backward Procedure.
-# 
-#     input_tensors: List[torch.Tensor]:
-#         tensors that their gradient need to be computed, including parameters.
-#         Correspoinding forward input tensors.
-#     
-#     output_tensors:
-#         tensors that start for gradient backward computation.
-#         Corresponding to forward output tensors.
-# 
-#     output_tensor_grads:
-#         gradient tensors corresponding to output_tensors.
-# 
-#     Returns:
-#         gradient in order of non-parameter tensors in input_tensors.
-#         (Note parameter tnesors already have gradient accumulated at .grad attribute)
-#     """
-#     if len(input_tensors) == 0:
-#         return None
-#     grads = list()
-#     in_grads = torch.autograd.grad(
-#         outputs = output_tensors,
-#         inputs  = input_tensors,
-#         grad_outputs = output_tensor_grads,
-#         allow_unused=True
-#     )
-#     for tensor, grad in zip(input_tensors, in_grads):
-#         if isinstance(tensor, torch.nn.Parameter):
-#             if tensor.grad is not None:
-#                 tensor.grad += grad
-#             else:
-#                 tensor.grad = grad
-#         else:
-#             grads.append(grad)
-#     if    len(grads) == 0: return None
-#     elif  len(grads) == 1: return grads[0]
-#     else: return tuple(grads)
+# register checking for normal exit
+atexit.register(Executor.check_clear)
 
 
 ### =================== Experimental Feature =======================

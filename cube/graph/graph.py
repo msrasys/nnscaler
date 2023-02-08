@@ -41,7 +41,6 @@ class IRGraph(IRSegment):
 
         self._sched = None  # the schedule strategy
 
-
     @property
     def train(self) -> bool:
         """!
@@ -49,7 +48,7 @@ class IRGraph(IRSegment):
 
         @return train bool: True if backward is required, otherwise False (inference only).
         """
-        return self._have_forward and self._have_backward
+        return any(not n.isfw() for n in reversed(self._nodes))
 
     # ================ Deep Learning Interfalce ======================
 
@@ -590,6 +589,15 @@ class IRGraph(IRSegment):
         @param strategy IRScheduleStrategy: the schedule strategy instance
         """
         self._sched = strategy
+
+    def _bind_schedule(self, schedplan):
+        """
+        Set schedule plan for the execution
+
+        @param schedplan SchedulePlan
+        """
+        assert self._sched is None, "The graph is already binded with one schedule plan."
+        self._sched = schedplan
 
     @staticmethod
     def legal_schedule(seq: List[IRCell], integrity_check=False):

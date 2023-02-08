@@ -160,6 +160,9 @@ class IRBpOperation(IRCell):
         for idx, igrad in enumerate(igrads):
             self.set_output(idx, igrad)
 
+    def isfw(self) -> bool:
+        return False
+
     def replicate(self):
         """
         Replicate the backward op

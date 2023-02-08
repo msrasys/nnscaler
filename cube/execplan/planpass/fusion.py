@@ -1,9 +1,10 @@
-from typing import List
+from typing import List, Union, Set
 from cube.graph.graph import IRSegment
 
 from cube.ir.adapter import IRAdapter
 
 from cube.execplan import ExecutionPlan
+from cube.execplan.execplan import ExeRepetend, ExeReuseCell
 from cube.execplan.planpass.planpass import PlanPass
 
 from cube.ir.adapter.prim import IRAdapterPrim
@@ -24,20 +25,33 @@ class DiffFusion(PlanPass):
         """
         cnt = 0
         for devid in execplan.devices():
+            # fadapters: Set[IRAdapter] = set()
+            visited = set()
             for node in execplan.seq(devid):
-                if isinstance(node, IRAdapter) and node.forward:
+                if isinstance(node, ExeReuseCell):
+                    node = node.cell
+                if node in visited:
+                    continue
+                if isinstance(node, IRAdapter) and node.isfw():
                     ret = DiffFusion.nnfuse(node)
                     cnt = cnt+1 if ret else cnt
                 elif isinstance(node, IRSegment) and node.isfw():
-                    cnt += DiffFusion._apply(node)
+                    for fadapter in node.select(ntype=IRAdapter):
+                        ret = DiffFusion.nnfuse(fadapter)
+                        cnt = cnt+1 if ret else cnt
+                elif isinstance(node, ExeRepetend) and node.isfw():
+                    for fadapter in [n for n in node.nodes() if isinstance(n, IRAdapter)]:
+                        ret = DiffFusion.nnfuse(fadapter)
+                        cnt = cnt+1 if ret else cnt
+                visited.add(node)
         print(f'successfully generate {cnt} differentiable adapters')
         return execplan
 
     @staticmethod
-    def _apply(segment: IRSegment) -> int:
+    def _apply(cell: Union[IRSegment, ExeRepetend]) -> int:
         cnt = 0
-        for node in segment.nodes():
-            if isinstance(node, IRAdapter) and node.forward:
+        for node in cell.nodes():
+            if isinstance(node, IRAdapter) and node.isfw():
                 ret = DiffFusion.nnfuse(node)
                 # if not ret and not node.differentiable:
                 #     raise NotImplementedError(

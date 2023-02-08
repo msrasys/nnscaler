@@ -285,6 +285,8 @@ class IRFullTensor(IRTensor):
         @return tensor IRFullTensor: the created tensor
         """
         tensor = IRFullTensor(self.shape, self.name, self.requires_grad, self.dtype)
+        if self.is_loss():
+            tensor.to_loss()
         return tensor
 
     @property
@@ -314,12 +316,12 @@ class IRFullTensor(IRTensor):
 
     def to_loss(self):
         """
-        Set this tensor is loss tensor. The tensor shape must be [1,]
+        Set this tensor as loss tensor. The tensor shape must be [1,]
         """
         assert tuple(self.shape) == (1,), f"Loss tensor can only have shape [1,] but got {self.shape}"
-        assert self.requires_grad, f"The tensor doesn't require gradient. Cannot backward"
         self._is_loss = True
-        self.grad._is_loss = True
+        if isinstance(self.grad, IRFullTensor):
+            self.grad._is_loss = True
 
     @property
     def requires_grad(self):

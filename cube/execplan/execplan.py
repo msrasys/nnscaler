@@ -1,49 +1,240 @@
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 import copy
 import numpy as np
+import sys
 
 from cube.ir.cten import IRCell
-from cube.ir.adapter import IRAdapter
-from cube.ir.operator import IRBpOperation, IRFwOperation
+from cube.ir.tensor import IRSubTensor, IRFullTensor
+from cube.ir.adapter import IRAdapter, IRWeightReducer
+from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from cube.graph.graph import IRGraph, IRSegment
+from cube.graph.schedule.schedplan import SchedulePlan, Block, Repetend
+
+
+class ExeReuseCell(IRCell):
+    """
+    A cell that reuses a cell with new inputs and outputs
+    This is designed for code shrinking of repeatedly executing
+    same operator-sequences, e.g., different micro-batches
+    execute on a same code piece.
+    """
+
+    def __init__(self, cell: IRCell,
+                 inputs: List[IRSubTensor], outputs: List[IRCell]):
+        assert len(inputs) == len(cell.inputs())
+        assert len(outputs) == len(cell.outputs()), (
+            f"output length mismatch: {cell}\n"
+            f"cell outputs: {cell.outputs()}\noutputs: {outputs}")
+        super().__init__(cell.name, cell.signature,
+                         len(inputs), len(outputs), init_outputs=False)
+        for idx, t in enumerate(inputs):
+            self.set_input(idx, t)
+        for idx, t in enumerate(outputs):
+            self.set_output(idx, t)
+        self._cell: IRCell = cell
+        self._cached_dispatched: Dict[int, ExeReuseCell] = {}
+
+    @property
+    def device(self) -> int:
+        return self._cell.device
+    
+    @property
+    def cell(self) -> IRCell:
+        return self._cell
+    
+    def isfw(self) -> bool:
+        return self._cell.isfw()
+    
+    def dispatch(self, devid: int, _mirror = True):
+        assert len(self.device) > 0 and devid in self.device, f"Cannot dispatch of ReuseCell {self} to device {devid}"
+        if devid in self._cached_dispatched:
+            return self._cached_dispatched[devid]
+        
+        inputs = []
+        for t, cell_t in zip(self._inputs, self._cell.inputs()):
+            if isinstance(cell_t, IRSubTensor) and devid not in cell_t.device:
+                continue
+            inputs.append(t)
+        outputs = []
+        for t, cell_t in zip(self._outputs, self._cell.outputs()):
+            if isinstance(cell_t, IRSubTensor) and devid not in cell_t.device:
+                continue
+            outputs.append(t)
+        reuse = ExeReuseCell(self._cell.dispatch(devid), inputs, outputs)
+        reuse._id = self._id
+        if _mirror and self.mirror is not None:
+            mreuse = self.mirror.dispatch(devid, _mirror=False)
+            IRCell.make_pair(reuse, mreuse)
+        self._cached_dispatched[devid] = reuse
+        return reuse
+    
+    def __repr__(self) -> str:
+        return f'ReuseCell-{self.device}(name={self._cell.name}{self._cell.cid}, inputs={self.inputs()}, outputs={self.outputs()})'
+
+
+class ExeRepetend(IRCell):
+    """
+    A cell that will be repeatedly executed for multiple times
+    on a sequence of nodes
+    """
+
+    def __init__(self, nodes: List[IRCell], repeat: int = 1):
+        super().__init__('repetend', 'None', 0, 0, init_outputs=False)
+        self._nodes: List[IRCell] = nodes
+        self._repeat = repeat
+    
+    @property
+    def repeat(self) -> int:
+        return self._repeat
+    
+    @property
+    def device(self) -> Tuple[int]:
+        device = set()
+        for node in self._nodes:
+            device.update(node.device)
+        return tuple(device)
+    
+    def nodes(self) -> Tuple[IRCell]:
+        return tuple(self._nodes)
+    
+    def isfw(self) -> bool:
+        return all(n.isfw() for n in self._nodes)
+    
+    def dispatch(self, devid: int) -> IRCell:
+        nodes = []
+        for n in self._nodes:
+            if devid in n.device:
+                nodes.append(n.dispatch(devid))
+        repetend = ExeRepetend(nodes, self.repeat)
+        repetend._id = self._id
+    
+    def add(self, node: IRCell):
+        """
+        Append a node
+        """
+        self._nodes.append(node)
+
+    def pop(self, index: int) -> IRCell:
+        return self._nodes.pop(index)
+    
+    def remove(self, node: IRCell):
+        return self._nodes.remove(node)
+
+    def __repr__(self) -> str:
+        dscp = f'Repetend{self.cid}-{self.device}(repeat={self.repeat}\n'
+        for n in self._nodes:
+            dscp += '  ' + str(n) + '\n'
+        dscp += ')'
+        return dscp
 
 
 class ExecutionPlan:
+    """
+    Execution plan for runtime execution.
+    Each device will be assigned by its execution sequence
+    """
 
-    def __init__(self, graph: IRGraph):
+    @staticmethod
+    def from_graph(graph: IRGraph):
+        """
+        Create execution plan from IRGraph
+        """
+        return ExecutionPlan(graph, graph.nodes())
+
+    @staticmethod
+    def from_schedplan(schedplan: SchedulePlan):
+        """
+        Create execution plan from SchedulePlan
+        """
+        micro_ftensors: Dict[int, Dict[IRFullTensor, IRFullTensor]] = {}
+        def get(tensor: IRSubTensor, micro_idx: int) -> IRSubTensor:
+            """Get a same-shape tensor for micro-batch index"""
+            if not isinstance(tensor, IRSubTensor): return tensor
+            if micro_idx == 0: return tensor
+            ftensor = micro_ftensors.setdefault(micro_idx, {}).setdefault(tensor.parent, tensor.parent.like())
+            t = ftensor.select(tensor.indmap, tensor.valmap)
+            if tensor.grad is not None:
+                fgrad: IRFullTensor = ftensor.grad
+                micro_ftensors.setdefault(micro_idx, {}).setdefault(tensor.parent.grad, fgrad)
+                t.grad = fgrad.select(tensor.grad.indmap, tensor.grad.valmap)
+            return t
+        
+        micro_fcells: Dict[(int, IRCell), ExeReuseCell] = {}
+        def block2reuse(node: Block) -> ExeReuseCell:
+            if node.blk.isfw():
+                key = (node.mid, node.blk)
+                if key in micro_fcells:
+                    return micro_fcells[key]
+                inputs = [get(t, node.mid) for t in node.blk.inputs()]
+                outputs = [get(t, node.mid) for t in node.blk.outputs()]
+                cell = ExeReuseCell(node.blk, inputs, outputs)
+                if isinstance(node.blk.mirror, IRCell):
+                    minputs = [get(t, node.mid) for t in node.blk.mirror.inputs()]
+                    moutputs = [get(t, node.mid) for t in node.blk.mirror.outputs()]
+                    mcell = ExeReuseCell(node.blk.mirror, minputs, moutputs)
+                    IRCell.make_pair(cell, mcell)
+                micro_fcells[key] = cell
+                return cell
+            else:
+                mcell = block2reuse(Block(node.blk.mirror, node.mid))
+                return mcell.mirror
+            
+        topo_seqs: List[IRCell] = []
+        for block in schedplan.nodes():
+            # convert repetends and blocks
+            if isinstance(block, Repetend):
+                nodes: List[ExeReuseCell] = []
+                for node in block.nodes():
+                    if isinstance(node, Block):
+                        node = block2reuse(node)
+                    nodes.append(node)
+                block = ExeRepetend(nodes, repeat=block.span)
+            elif isinstance(block, Block):
+                block = block2reuse(block)
+            assert isinstance(block, IRCell)
+            topo_seqs.append(block)
+        return ExecutionPlan(schedplan.graph, topo_seqs)
+
+    def __init__(self, graph: IRGraph, topo_seqs: List[IRCell]):
+
         assert isinstance(graph, IRGraph), "Expected an IRGraph"
         self._graph = graph
-        self._seq: Dict[int, List[IRCell]] = dict()
-        self._inference_only = not any(
-             isinstance(n, IRBpOperation) or \
-            (isinstance(n, IRAdapter) and not n.forward) or \
-            (isinstance(n, IRSegment) and not n.isfw()) for n in graph.nodes()
-        )
+        self._topo_seqs = topo_seqs
+        self._seq: Dict[int, List[IRCell]] = {}
 
-        # execution sequence for each device  
-        for node in graph.nodes():
-            if len(node.device) == 0:
-                raise RuntimeError(f"Node device not set: {node}")
+        for node in self._topo_seqs:
+            assert len(node.device) > 0, f"Node device not set: {node}"
             for device in node.device:
-                if device not in self._seq:
-                    self._seq[device] = []
-                self._seq[device].append(node)
+                self._seq.setdefault(device, []).append(node)
 
-        # adapter/segment dispatch
-        for devid in self.devices():
-            nodes = [node for node in self.at(devid) if isinstance(node, (IRAdapter, IRSegment))]
-            while len(nodes) > 0:
-                # dispatch
-                fnode = nodes[0]
-                fidx = self.at(devid).index(fnode)
-                fnode_dev = fnode.dispatch(devid)
-                self.at(devid)[fidx] = fnode_dev
-                nodes.pop(0)
-                if fnode.mirror is not None:
-                    bidx = self.at(devid).index(fnode.mirror)
-                    nodes.remove(fnode.mirror)
-                    self.at(devid)[bidx] = fnode_dev.mirror
-                    assert fnode_dev.mirror is not None, f"Find None:\n{fnode_dev}"
+        # due to repetends, a same node could appear multiple times
+        # in the execution sequence. For this case, all of them
+        # will be replaced by a same dispatched one.
+        def cached_dispatch(node: IRCell, devid: int,
+                            dispatched: Dict[IRCell, IRCell]) -> IRCell:
+            """Cached dispatch"""
+            if node.isfw() or isinstance(node, IRWeightReducer):
+                return dispatched.setdefault(node, node.dispatch(devid))
+            fnode = node.mirror
+            assert isinstance(fnode, IRCell), "Expected forward node as mirror"
+            assert fnode.isfw()
+            # return dispatched[fnode].mirror
+            return dispatched.setdefault(fnode, fnode.dispatch(devid)).mirror
+
+        # dispatch for a node that is executed on multiple devices
+        for devid, nodes in self._seq.items():
+            dispatched : Dict[IRCell, IRCell] = {}
+            for idx in range(len(nodes)):
+                node = nodes[idx]
+                # print(f'handling {node}')
+                if len(node.device) == 1: continue  # no need for dispatch
+                if isinstance(node, ExeRepetend):
+                    rnodes = [cached_dispatch(n, devid, dispatched) \
+                              for n in node.nodes() if devid in n.device]
+                    dnode = ExeRepetend(rnodes, node.repeat)
+                else:
+                    dnode = cached_dispatch(node, devid, dispatched)
+                nodes[idx] = dnode
 
     @property
     def graph(self) -> IRGraph:
@@ -51,7 +242,7 @@ class ExecutionPlan:
 
     @property
     def inference(self) -> bool:
-        return self._inference_only
+        return not self._graph.train
 
     def devices(self) -> List[int]:
         """
@@ -102,11 +293,10 @@ class ExecutionPlan:
             raise TypeError("Expected a list of Cell")
         self._seq[devid] = seq
 
-    def visualize(self,
-                map2time: Optional[Callable] = None,
-                map2mem: Optional[Callable] = None,
-                map2name: Optional[Callable] = None,
-                outfile: Optional[str] = None):
+    def visualize(self, outfile: str,
+                  map2time: Optional[Callable] = None,
+                  map2mem: Optional[Callable] = None,
+                  map2name: Optional[Callable] = None):
         """
         Visualize the graph
 
@@ -125,18 +315,9 @@ class ExecutionPlan:
 
         if map2time is None:
             def map2time(node):
-                if isinstance(node, IRSegment):
-                    span = 0
-                    for node in node.nodes():
-                        span += map2time(node)
-                    return span
-                if isinstance(node, IRFwOperation):
-                    return 1
-                if isinstance(node, IRBpOperation):
-                    return 2
-                if isinstance(node, IRAdapter):
-                    return 0.5
-                return 0
+                if isinstance(node, IRDataOperation): return 0
+                if isinstance(node, IRAdapter): return 0.25
+                return 1 if node.isfw() else 2
         
         if map2mem is None:
             def map2mem(node):
@@ -154,32 +335,39 @@ class ExecutionPlan:
 
         if map2name is None:
             def map2name(node):
-                if isinstance(node, IRSegment):
-                    if node.isfw():
-                        return f'f{node.cid}'
-                    elif node.isbw():
-                        return f'b{node.mirror.cid}'
-                if isinstance(node, IRFwOperation):
-                    return f'f{node.cid}'
-                if isinstance(node, IRBpOperation):
-                    return f'b{node.mirror.cid}'
                 if isinstance(node, IRAdapter):
-                    return f'a{node.cid}'
-                return f'?{node.cid}'
+                    return ''
+                else:
+                    return f'f{node.cid}' if node.isfw() else f'b{node.cid}'
 
         def map2color(node):
-            if isinstance(node, IRSegment):
-                return map2color(node.nodes(0))
-            if isinstance(node, IRFwOperation):
-                return '#4472C4'  # excel blue
-            if isinstance(node, IRBpOperation):
-                return '#ED7D31'  # excel orange
+            node = node.cell if isinstance(node, ExeReuseCell) else node
             if isinstance(node, IRAdapter):
                 return '#70AD47'  # excel green
+            if node.isfw():
+                return '#4472C4'  # excel blue
+            else:
+                return '#ED7D31'  # excel orange
 
-        self.graph.reset_dependency()
-        for node in self.graph.nodes():
-            span, mem = map2time(node), map2mem(node)
+
+        # analyze device timeline
+
+        def depends(prev: IRCell, next: IRCell) -> bool:
+            for to in prev.outputs():
+                if not isinstance(to, IRSubTensor): continue
+                for ti in next.inputs():
+                    if not isinstance(ti, IRSubTensor): continue
+                    if to.overlap(ti): return True
+            return False
+
+        device_timeline: List[Tuple[int, int]] = [list() for _ in range(ndevice)]
+        device_nodes: List[IRCell] = [list() for _ in range(ndevice)]
+        device_mem = [0] * ndevice
+        device_peak_mem = [0] * ndevice
+
+        for node in self._topo_seqs:
+            unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
+            span, mem = map2time(unwrap_node), map2mem(unwrap_node)
             # calculate time
             start_times = []
             for device in node.device:
@@ -191,11 +379,10 @@ class ExecutionPlan:
                 # check dependency
                 for devid, timeline in enumerate(device_timeline):
                     dev_seq = device_nodes[devid]
-                    if devid == device:
-                        continue
+                    if devid == device: continue
                     for nid, (_, end_time) in enumerate(timeline[::-1]):
                         other_node = dev_seq[::-1][nid]
-                        if other_node in node.predecessors():
+                        if depends(other_node, node):
                             start_time = max(start_time, end_time)
                             break
                 start_times.append(start_time)
@@ -217,75 +404,74 @@ class ExecutionPlan:
         # max_mem = sum(device_peak_mem)
 
         # draw the timeline
-        if outfile is not None:
-            import matplotlib.pyplot as plt
-            from matplotlib.patches import Rectangle
-            from matplotlib.ticker import AutoMinorLocator
-            plt.close('all')
-            plt.rcParams['figure.figsize'] = (4.0 * max_time // ndevice, 4.0)
-            fig, ax = plt.subplots()
-            renderer = fig.canvas.get_renderer()
 
-            # xaxis
-            ax.set_xlim((1, max_time))
-            plt.xticks(
-                ticks=np.arange(1.5, max_time+0.5, 1.0, dtype=float),
-                labels=np.arange(1, max_time, 1, dtype=int)
-            )
-            minor_locator = AutoMinorLocator(2)
-            plt.gca().xaxis.set_minor_locator(minor_locator)
-            ax.xaxis.grid(which='minor', linestyle='--')
-            # yaxis
-            ax.set_ylim((0.5, len(self.devices())+0.5))
-            plt.yticks(list(range(1, len(self.devices())+1, 1)))
-            ax.invert_yaxis()
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+        from matplotlib.ticker import AutoMinorLocator
+        plt.close('all')
+        plt.rcParams['figure.figsize'] = (4.0 * max_time // ndevice, 4.0)
+        fig, ax = plt.subplots()
+        renderer = fig.canvas.get_renderer()
 
-            fontsize = 40
-            txts = list()
-            for devid in range(ndevice):
-                timeline = device_timeline[devid]
-                nodes = device_nodes[devid]
-                for node, (start, end) in zip(nodes, timeline):
-                    if end - start == 0:
-                        continue
-                    # draw 
-                    color = map2color(node)
-                    rec = Rectangle((start, devid + 0.5), end-start, 1,
-                                    color=color, ec='black', lw=1.5)
-                    ax.add_artist(rec)
-                    rx, ry = rec.get_xy()
-                    cx = rx + rec.get_width() / 2.0
-                    cy = ry + rec.get_height() / 2.0
-                    anno = map2name(node)
-                    txt = ax.text(x=cx, y=cy, s=anno, fontsize=40, ha='center', va='center', color='w')
+        # xaxis
+        ax.set_xlim((1, max_time))
+        plt.xticks(
+            ticks=np.arange(1.5, max_time+0.5, 1.0, dtype=float),
+            labels=np.arange(1, max_time, 1, dtype=int)
+        )
+        minor_locator = AutoMinorLocator(2)
+        plt.gca().xaxis.set_minor_locator(minor_locator)
+        ax.xaxis.grid(which='minor', linestyle='--')
+        # yaxis
+        ax.set_ylim((0.5, len(self.devices())+0.5))
+        plt.yticks(list(range(1, len(self.devices())+1, 1)))
+        ax.invert_yaxis()
 
-                    rbox = rec.get_window_extent(renderer)
-                    for fs in range(fontsize, 1, -2):
-                        txt.set_fontsize(fs)
-                        tbox = txt.get_window_extent(renderer)
-                        if tbox.x0 > rbox.x0 and tbox.x1 < rbox.x1 and tbox.y0 > rbox.y0 and tbox.y1 < rbox.y1:
-                            break
-                    fontsize = min(fontsize, fs)
-                    txts.append(txt)
+        fontsize = [40]
+        txts = list()
+        for devid in range(ndevice):
+            timeline = device_timeline[devid]
+            nodes = device_nodes[devid]
+            for node, (start, end) in zip(nodes, timeline):
+                unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
+                if end - start == 0:
+                    continue
+                # draw 
+                color = map2color(unwrap_node)
+                rec = Rectangle((start, devid + 0.5), end-start, 1,
+                                color=color, ec='black', lw=1.5)
+                ax.add_artist(rec)
+                rx, ry = rec.get_xy()
+                cx = rx + rec.get_width() / 2.0
+                cy = ry + rec.get_height() / 2.0
+                anno = map2name(unwrap_node)
+                if anno == '': continue
+                txt = ax.text(x=cx, y=cy, s=anno, fontsize=40, ha='center', va='center', color='w')
+                rbox = rec.get_window_extent(renderer)
+                for fs in range(fontsize[0], 1, -2):
+                    txt.set_fontsize(fs)
+                    tbox = txt.get_window_extent(renderer)
+                    if tbox.x0 > rbox.x0 and tbox.x1 < rbox.x1 and tbox.y0 > rbox.y0 and tbox.y1 < rbox.y1:
+                        break
+                fontsize[0] = min(fontsize[0], fs)
+                txts.append(txt)
             
-            # set font size to same
-            for txt in txts:
-                txt.set_fontsize(fontsize)
-            for tick in ax.xaxis.get_major_ticks():
-                tick.label.set_fontsize(fontsize)
-            for tick in ax.yaxis.get_major_ticks():
-                tick.label.set_fontsize(fontsize)
-            plt.xlabel('Time Step', fontsize=fontsize)
-            plt.ylabel('Device ID', fontsize=fontsize)
-
-            # plt.grid()
-            plt.tight_layout()
-            plt.savefig(outfile)
+        # set font size to same
+        for txt in txts:
+            txt.set_fontsize(fontsize[0])
+        for tick in ax.xaxis.get_major_ticks():
+            tick.label.set_fontsize(fontsize[0])
+        for tick in ax.yaxis.get_major_ticks():
+            tick.label.set_fontsize(fontsize[0])
+        plt.xlabel('Time Step', fontsize=fontsize[0])
+        plt.ylabel('Device ID', fontsize=fontsize[0])
+        plt.tight_layout()
+        plt.savefig(outfile)
 
         return max_time, max_mem
 
     def __repr__(self):
-        dscp = f'Execution Plan ({self.graph.name}):\n'
+        dscp = f'Execution Plan ({self.graph.name}) (inference: {self.inference}):\n'
         for devid in self.devices():
             dscp += f'====> Device {devid}:\n'
             for node in self._seq[devid]:

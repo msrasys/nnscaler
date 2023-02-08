@@ -19,6 +19,8 @@ class CompileFlag:
     disable_inter_rvd = os.environ.get('DISABLE_INTER_RVD')
     disable_comm_fusion = os.environ.get('DISABLE_COMM_FUSION')
 
+    visualize_plan = bool(os.environ.get('VISUALIZE_PLAN'))
+
     # ============ code generation ===============
     use_nnfusion = os.environ.get('USE_NNFUSION')
     use_jit = os.environ.get('USE_JIT')

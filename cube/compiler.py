@@ -9,13 +9,14 @@ from cube.graph.gener.gen import IRAdapterGener
 from cube.graph.graph import IRGraph
 from cube.ir.operator import IRDataOperation
 from cube.graph.function.anchor import IRGraphAnchor
+from cube.graph.schedule.schedplan import SchedulePlan
 from cube.graph.function.pyfunc import IRPyFunc
 
 from cube.execplan import ExecutionPlan
 from cube.execplan.planpass.fusion import DiffFusion
 from cube.execplan.planpass.grouping import Grouping
 
-from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
+from cube.codegen import ModuleCodeGen, ScheduleCodeGen
 
 from cube.profiler.timer import print_each_rank
 from cube.runtime.device import DeviceGroup
@@ -153,6 +154,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             if graph.sched is not None:
                 start = time.time()
                 graph.sched.apply()
+                # print(graph.sched)qq
                 if CompileFlag.log_schedule:
                     print(graph.sched)
                 span = time.time() - start
@@ -160,7 +162,12 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
             # to execution plan
             start = time.time()
-            execplan = ExecutionPlan(graph)
+            if isinstance(graph.sched, SchedulePlan):
+                execplan = ExecutionPlan.from_schedplan(graph.sched)
+            else:
+                execplan = ExecutionPlan.from_graph(graph)
+            if CompileFlag.visualize_plan:
+                execplan.visualize('plan.png')
             span = time.time() - start
             print('> finish lowering to execution plan: {:.2f} s'.format(span))
 
@@ -185,7 +192,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             start = time.time()
             local_world_size = DeviceGroup().local_world_size
             # code generation
-            mgener = ModelCodeGen(execplan)
+            mgener = ModuleCodeGen(execplan)
             sgener = ScheduleCodeGen(execplan)
             for local_rank in range(local_world_size):
                 rank = DeviceGroup().node_rank * local_world_size + local_rank

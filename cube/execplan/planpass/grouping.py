@@ -59,7 +59,7 @@ class Grouping(PlanPass):
         def differentiable(fnode):
             if isinstance(fnode, IRFwOperation):
                 return True
-            if isinstance(fnode, IRAdapter) and fnode.differentiable and fnode.forward:
+            if isinstance(fnode, IRAdapter) and fnode.differentiable and fnode.isfw():
                 return True
             return False
 
