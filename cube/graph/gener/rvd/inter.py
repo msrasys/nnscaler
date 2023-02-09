@@ -203,6 +203,8 @@ class InterTransition:
         else:
             for srcs, dst in zip(imat.reshape(-1, chunks), omat.flatten()):
                 srcs = srcs.tolist()
+                if primitive is MovePrim:
+                    srcs = [srcs[0]]
                 prims.append(primitive(srcs, [dst]))
         return dst_layout, prims
 
