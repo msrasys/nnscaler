@@ -66,7 +66,7 @@ class IntraTransition:
         assert rvd[2+from_dim] % chunks == 0, f"not dividable dim: {rvd[2+from_dim]} // {chunks}"
         rvd = list(rvd)
         rvd[2+from_dim], rvd[2+to_dim] = rvd[2+from_dim] // chunks, rvd[2+to_dim] * chunks
-        return rvd, partial(AllToAllPrim, idim=from_dim, odim=from_dim)
+        return rvd, partial(AllToAllPrim, idim=from_dim, odim=to_dim)
 
     @staticmethod
     def v2r(rvd: TRVD, chunks: int) -> Tuple[TRVD, Callable]:
