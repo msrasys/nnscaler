@@ -30,7 +30,7 @@ def build_gpt_config(name: str) -> Config:
     elif name == '6.7B':
         embed_dim, layers, attention_heads = 4096, 32, 32
     elif name == '15B':
-        embed_dim, layers, attention_heads = 5120, 48, 32
+        embed_dim, layers, attention_heads = 5120, 48, 40
     elif name == '39B':
         embed_dim, layers, attention_heads = 8192, 48, 64
     elif name == '175B':
