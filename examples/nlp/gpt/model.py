@@ -18,10 +18,13 @@ class Config:
     dropout: float = 0.2
     attn_dropout: float = 0.2
     activation_dropout: float = 0.2
+    moe_size: int = 1
 
 
 def build_gpt_config(name: str) -> Config:
-    if name == '350M':
+    if name == 'toy':
+        embed_dim, layers, attention_heads = 32, 4, 16
+    elif name == '350M':
         embed_dim, layers, attention_heads = 1024, 24, 16
     elif name == '760M':
         embed_dim, layers, attention_heads = 1536, 24, 16
@@ -90,18 +93,33 @@ class GPTInfer(torch.nn.Module):
     def __init__(self, batch_size: int = 1, cfg: Config = Config()):
         super().__init__()
         # self.embed = torch.nn.Embedding(cfg.num_embeddings, cfg.embed_dim)
-        self.embedw = torch.nn.Parameter(torch.rand(cfg.num_embeddings, cfg.embed_dim) / 128)
+        self.embedw = torch.nn.Parameter(torch.rand(cfg.num_embeddings, cfg.embed_dim))
         self.position = torch.nn.Embedding(cfg.seqlen, cfg.embed_dim)
         self.embed_dropout = torch.nn.Dropout()
 
-        self.layers = torch.nn.ModuleList(
-            [EncoderInferLayer(
-                cfg.embed_dim, cfg.attention_heads,
-                cfg.attn_hidden_dim, cfg.ffn_hidden_dim, cfg.seqlen,
-                batch_size,
-                cfg.dropout, cfg.attn_dropout, cfg.activation_dropout
-            ) for _ in range(cfg.layers)]
-        )
+        if cfg.moe_size == 1:
+            self.layers = torch.nn.ModuleList(
+                [EncoderInferLayer(
+                    cfg.embed_dim, cfg.attention_heads,
+                    cfg.attn_hidden_dim, cfg.ffn_hidden_dim, cfg.seqlen,
+                    batch_size,
+                    cfg.dropout, cfg.attn_dropout, cfg.activation_dropout
+                ) for _ in range(cfg.layers)]
+            )
+        else:
+            assert cfg.moe_size > 1
+            self.layers = torch.nn.ModuleList()
+            for layer_id in range(cfg.layers):
+                self.layers.append(
+                    EncoderInferLayer(
+                        cfg.embed_dim, cfg.attention_heads,
+                        cfg.attn_hidden_dim, cfg.ffn_hidden_dim, cfg.seqlen,
+                        batch_size,
+                        cfg.dropout, cfg.attn_dropout, cfg.activation_dropout,
+                        1 if (layer_id % 2) == 0 else cfg.moe_size
+                    )
+                )
+
         self.final_layernorm = torch.nn.LayerNorm(cfg.embed_dim)
 
 
@@ -127,8 +145,8 @@ class GPTInfer(torch.nn.Module):
         cube.runtime.function.anchor('last_embed')
         logits = torch.nn.functional.linear(enc, self.embedw)
         # simplified
-        loss = torch.sum(logits)
-        return loss
+        # loss = torch.sum(logits)
+        return logits
 
 
 class GPTDataLoader(cube.runtime.syndata.SynDataLoader):

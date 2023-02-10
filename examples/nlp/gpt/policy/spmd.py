@@ -2,6 +2,7 @@ from typing import List
 
 from cube.graph import IRGraph
 from cube.graph.function.anchor import IRGraphAnchor
+from cube.graph.function.pyfunc import IRPyFunc
 from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 
 
@@ -64,6 +65,9 @@ def PASDP(graph: IRGraph, resource):
 
     # partition forward operators
     for node in graph.select(ntype=IRFwOperation):
+        if isinstance(node, IRPyFunc):
+            graph.assign(node, 0)
+            continue
         if len(node.inputs()) == 0: continue
         #FIXME: a workaround to find batch dimension
         batch_dim = node.input(0).shape.index(bs)
