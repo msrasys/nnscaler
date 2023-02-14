@@ -647,20 +647,14 @@ class IRGraph(IRSegment):
 
     def staging(self, nodes: Tuple[IRFwOperation]):
         """!
-        Group forward / dataloader operators into sequential stages.
-        The corresponding backward operators will also be grouped into stages
+        Group forward operators into sequential stages.
+        The corresponding backward operators (if have) will also be grouped into stages
         Cross-stage dataflow will be limited to neighbor stages.
         This should be called before any operator partition.
 
         The transformation and temporal scheduling can only be applied within each stage.
         For example, after staging, user cannot schedule a (transformed) node 
         from one stage to another stage.
-
-        The stage is a concept that is only about logical separation of nodes, 
-        it doesn't have additional constraints for device assignment.
-
-        This will keep each tensor to be only consumed once in
-        semantic representation.
 
         Changes will be made:
 
@@ -684,7 +678,7 @@ class IRGraph(IRSegment):
                     stage 5: t5 = identity(t4)
                              xx = consume(t5)
 
-        @param starts Tuple[IRFwOperations]: the start node of each stage
+        @param nodes Tuple[IRFwOperations]: the start forward node of each stage.
         @return None
         """
         assert all(isinstance(node, IRFwOperation) for node in nodes), \
@@ -693,7 +687,20 @@ class IRGraph(IRSegment):
             f"Exist node is not in graph nodes"
         starts = tuple(self._nodes.index(node) for node in nodes)
         assert len(starts) > 0
-        starts = (0,) + starts if starts[0] != 0 else starts
+
+        # adjust the start of the first stage to involve beginning operators
+        for idx in range(starts[0]):
+            node = self.node(idx)
+            if isinstance(node, IRDataOperation):
+                continue
+            assert isinstance(node, IRFwOperation), \
+                f"Expected nodes previous from the first stage are all IRFwOperation, but got {type(node)}"
+            if node.name == 'multiref' or isinstance(node, IRPyFunc):
+                pass
+            else:
+                warnings.warn(f'Detect a node: {node} that is previous from the first stage. Will be included inside the first stage')
+            starts[0] = idx
+            break
 
         last_fidx = 0
         for idx, node in enumerate(self._nodes):
@@ -705,13 +712,12 @@ class IRGraph(IRSegment):
         for sid in range(len(starts)):
             begin = starts[sid]
             end = starts[sid+1] if sid != len(starts) - 1 else last_fidx + 1
-            while isinstance(self.node(begin), IRDataOperation):
-                begin += 1
-            while end < len(self._nodes) and isinstance(self.node(end), IRDataOperation):
-                end -= 1
-            if begin == end: continue
-            assert begin < end
+            if begin >= end:
+                warnings.warn(f"Detected stage {sid} doesn't have operators: [begin({begin}): end({end})). Skipped")
+                continue
             fnodes = self._nodes[begin:end]
+            assert all(isinstance(node, IRFwOperation) for node in fnodes), \
+                f"find at least one nodes are not of IRFwOperation in the stage {sid}. They should be moved to the front"
             bnodes = [fnode.mirror for fnode in fnodes[::-1] if fnode.mirror is not None]
             fstages.append(fnodes)
             bstages = [bnodes] + bstages
