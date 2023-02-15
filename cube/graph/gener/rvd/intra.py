@@ -534,13 +534,14 @@ class IntraPathFinder:
 class IntraAutoPlacer:
 
     @staticmethod
-    def auto_place(graph: IRGraph, ftensor: IRFullTensor,
+    def auto_place(graph: IRSegment, ftensor: IRFullTensor,
                    producers: List[IRCell], consumers: List[IRCell],
                    cost_fn: Optional[Callable] = None) -> List[int]:
         """
         Automatically find good device placement for consumers given the producer placement
         The backward will also be considered.
         
+        @param graph IRSegment
         @param ftensor IRFullTensor
         @param producers List[IRCell]: producers that must be assigned to devices
         @param consumers List[IRCell]: consumers that are about to be assigned
@@ -561,8 +562,7 @@ class IntraAutoPlacer:
             warnings.warn('Detected at least one consumer has been assigned to a device, which will be overrided by a new device placement.')
         
         if len(producers) == 1:
-            graph.assign(consumers[0], producers[0].device)
-            return [producers[0].device]
+            return [producers[0].device[0]]
 
         # reorder producer to match with device order
         producers = sorted(producers, key=lambda n: n.device[0])
