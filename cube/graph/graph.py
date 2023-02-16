@@ -9,6 +9,7 @@ IRGraph:
 
 from typing import Sequence, Set, Union, Tuple, List, Optional, Dict
 import warnings
+import copy
 
 from cube.ir.cten import IRTensor, IRCell
 from cube.ir.unique import IDGenerator
@@ -295,7 +296,10 @@ class IRGraph(IRSegment):
         for fnode in fnodes:
             for rtensor, itensor in zip(fnode.inputs(), node.inputs()):
                 if isinstance(rtensor, IRSubTensor):
-                    rtensor.grad = itensor.grad
+                    rtensor.grad = copy.copy(itensor.grad)
+            for rtensor, itensor in zip(fnode.outputs(), node.outputs()):
+                if isinstance(rtensor, IRSubTensor):
+                    rtensor.grad = copy.copy(itensor.grad)
         # insert forward
         for fnode in fnodes:
             if isinstance(node, IRFwOperation):
