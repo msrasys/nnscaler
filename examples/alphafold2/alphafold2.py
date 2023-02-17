@@ -13,6 +13,23 @@ from cube.profiler.database import ProfileDataBase
 from cube.algorithm.ops.dimops import gen_partitions
 from cube.graph.function.anchor import IRGraphAnchor
 
+
+    
+def build_alphafold_config(setting:int):
+    assert setting in [1, 2, 3], "setting should be in [1, 2, 3]."
+    # dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 48, False, True, False
+    if setting == 1:
+        bs, s, r = 1, 128, 256
+    elif setting == 2:
+        bs, s, r = 1, 512, 256
+    elif setting == 3:
+        bs, s, r = 1, 512, 384
+    else:
+        assert False, f"unrecognized setting {setting}"
+
+    config = Config(bs, s, r)
+    return config
+
 def run(size_config, other_config, policy):
     bs, s, r, cm, cz = size_config
     dtype, evo_num, use_chunk, is_train, is_extra = other_config
@@ -77,13 +94,13 @@ def run(size_config, other_config, policy):
 def test_main():
     # Training && Evoformer Stack
     # initial training
-    bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    # bs, s, r, cm, cz = 1, 128, 256, 256, 128
     # first fine-tuning
     # bs, s, r, cm, cz = 1, 512, 256, 256, 128
     # second fine-tuning
-    # bs, s, r, cm, cz = 1, 512, 384, 256, 128
+    bs, s, r, cm, cz = 1, 512, 384, 256, 128
 
-    dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 48, False, True, False
+    dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 4, False, True, False
     policy = spmd.PASDAP
 
     # Training && Extra Sequence
@@ -109,3 +126,4 @@ def test_main():
 if __name__ == '__main__':
     cube.init()
     test_main()
+    # build_alphafold_config(1)

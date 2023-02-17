@@ -4,12 +4,24 @@ import math
 from torch import nn
 
 from examples.alphafold2.module import *
+from dataclasses import dataclass
 """
 a simplified version for evoformer in alphafold2
   - dropout layers are omitted
   - masks are omitted
 """
-
+@dataclass
+class Config:
+    bs: int = 1
+    s: int = 128
+    r: int = 256
+    cm: int = 256
+    cz: int = 128
+    dtype = torch.float16
+    evo_num: int = 4
+    use_chunk: bool = False
+    is_train : bool = True
+    is_extra : bool = False
 
 class Evoformer(torch.nn.Module):
 
@@ -244,6 +256,36 @@ class AlphaFold2(nn.Module):
                       use_chunk=use_chunk,
                       is_extra=is_extra,
                       is_train=is_train) for _ in range(evo_num)
+        ])
+
+    def forward(self, msa, pair):
+        msa = self.msa_norm(msa)
+        pair = self.pair_norm(pair)
+
+        cube.runtime.function.anchor('Evoformer Stack Start')
+        for evoformer in self.evoformers:
+            cube.runtime.function.anchor('One Layer Evoformer Start')
+            msa, pair = evoformer(msa, pair)
+            cube.runtime.function.anchor('One Layer Evoformer End')
+        cube.runtime.function.anchor('Evoformer Stack End')
+        loss = torch.sum(msa) * torch.sum(pair)
+        return loss
+
+class AlphaFoldlrw(nn.Module):
+
+    def __init__(self, cfg=Config()):
+        super().__init__()
+        self.evo_num = cfg.evo_num
+        # add norm to work with PyTorch's recompute mechanism
+        self.msa_norm = torch.nn.LayerNorm(cfg.cm)
+        self.pair_norm = torch.nn.LayerNorm(cfg.cz)
+        self.evoformers = torch.nn.ModuleList([
+            Evoformer(cfg.s,
+                      cfg.cm,
+                      cfg.cz,
+                      use_chunk=cfg.use_chunk,
+                      is_extra=cfg.is_extra,
+                      is_train=cfg.is_train) for _ in range(cfg.evo_num)
         ])
 
     def forward(self, msa, pair):

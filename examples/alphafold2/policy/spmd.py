@@ -171,7 +171,7 @@ def PASDAP(graph: IRGraph, resource):
             if isinstance(fnodes[j], IRGraphAnchor):
                 sub_indices.append(j)
         sub_indices.append(rhs)
-        graph.recompute(fnodes[lhs:rhs])
+        # graph.recompute(fnodes[lhs:rhs])
         for j in range(len(sub_indices) - 1):
             sub_l, sub_r = sub_indices[j], sub_indices[j + 1]
             names = []
