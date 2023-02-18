@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Dict
 import copy
 
 from cube.ir.adapter.prim import IRAdapterPrim, IdentityPrim
@@ -39,6 +39,8 @@ class IRAdapter(IRCell):
         assert not (is_fw and is_bw), "An IRAdapter cannot serve for both forward and backward stage"
         self._forward = is_fw
 
+        self._cached_dispatch: Dict[int, IRAdapter] = {}
+
     @property
     def prims(self) -> List[IRAdapterPrim]:
         return copy.copy(self._prims)
@@ -58,6 +60,9 @@ class IRAdapter(IRCell):
     @differentiable.setter
     def differentiable(self, val: bool):
         self._differentiable = val
+
+    def isfw(self) -> bool:
+        return self._forward
 
     @property
     def forward(self) -> bool:
@@ -89,14 +94,17 @@ class IRAdapter(IRCell):
             assert self._recompute == group_id, "The operator is set to recompute in another recompute group."
         self._recompute = group_id
 
-    def dispatch(self, devid: int, for_mirror=True):
+    def dispatch(self, devid: int, _mirror: bool = True):
         """
-        Get Adapter for a specific rank
+        Instantiate the adapter to a specific rank.
 
-        Returns:
-            IRAdapter
+        @param devid int: device id
+
+        @param adapter IRAdapter: the dispatched adapter
         """
         assert isinstance(devid, int), f"Expect devid to be int but got {devid}"
+        if devid in self._cached_dispatch:
+            return self._cached_dispatch[devid]
         prims = [prim.dispatch(devid) for prim in self.prims]
         prims = [prim for prim in prims if prim is not None]
         # get inputs
@@ -123,9 +131,10 @@ class IRAdapter(IRCell):
         fadapter.custom = self.custom
         fadapter.recompute = self.recompute
         # dispatch for mirror
-        if for_mirror and isinstance(self.mirror, IRAdapter):
-            badapter = self.mirror.dispatch(devid, for_mirror=False)
+        if _mirror and isinstance(self.mirror, IRAdapter):
+            badapter = self.mirror.dispatch(devid, _mirror=False)
             IRCell.make_pair(fadapter, badapter)
+        self._cached_dispatch[devid] = fadapter
         return fadapter
 
     @staticmethod
@@ -167,6 +176,12 @@ class IRWeightReducer(IRCell):
         super().__init__(name, signature, len(weights), 0)
         for idx, weight in enumerate(weights):
             self.set_input(idx, weight)
+
+    def isfw(self) -> bool:
+        return False
+    
+    def dispatch(self, device: int):
+        return self
 
     def __repr__(self):
         dscp = f'WReducer{self._id}-{self.device}(inputs={self.inputs()})'

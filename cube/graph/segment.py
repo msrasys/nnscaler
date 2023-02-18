@@ -96,17 +96,13 @@ class IRSegment(IRCell):
         for node in nodes:
             self.insert(node, self.nnodes)
 
+        self._dispatch_cached: Dict[int, IRSegment] = {}
+
         # self.reset_dependency()
 
-        # FIXME: update when manipulating
-        self._have_forward = any(isinstance(n, IRFwOperation) for n in nodes)
-        self._have_backward = any(isinstance(n, IRBpOperation) for n in nodes)
-
     def isfw(self) -> bool:
-        return self._have_forward
-
-    def isbw(self) -> bool:
-        return self._have_backward
+        return all(n.isfw() for n in self._nodes)
+        # return self._have_forward
 
     def full_tensors(self) -> Tuple[IRFullTensor]:
         """
@@ -990,7 +986,7 @@ class IRSegment(IRCell):
         segment = IRSegment(nodes, order(inputs), order(outputs))
         return segment
 
-    def dispatch(self, devid: int, mirror=True) -> Optional[IRCell]:
+    def dispatch(self, devid: int, _gen_mirror: bool = True) -> Optional[IRCell]:
         """
         Instantiate the segement to a specific device.
 
@@ -1002,22 +998,19 @@ class IRSegment(IRCell):
             return None
         if len(self.device) == 1 and self.device == [devid]:
             return self
-        inputs, outputs, nodes = [], [], []
+        if devid in self._dispatch_cached:
+            return self._dispatch_cached[devid]
+        # inputs, outputs, nodes = [], [], []
+        inputs, outputs, nodes = self.inputs(), self.outputs(), []
         for node in self._nodes:
             if devid in node.device:
-                if isinstance(node, IRAdapter):
-                    nodes.append(node.dispatch(devid))
-                elif isinstance(node, IRSegment):
-                    nodes.append(node.dispatch(devid))
-                else:
-                    assert len(node.device) == 1
-                    nodes.append(node)
-                for itensor in node.inputs():
-                    if itensor in self._inputs and itensor not in inputs:
-                        inputs.append(itensor)
-                for otensor in node.outputs():
-                    if otensor in self._outputs and otensor not in outputs:
-                        outputs.append(otensor)
+                nodes.append(node.dispatch(devid))
+                # for itensor in node.inputs():
+                #     if itensor in self._inputs and itensor not in inputs:
+                #         inputs.append(itensor)
+                # for otensor in node.outputs():
+                #     if otensor in self._outputs and otensor not in outputs:
+                #         outputs.append(otensor)
 
         def order(tensors: Set[IRSubTensor]) -> Tuple[IRSubTensor]:
             """Reorder by logical tensor id. Temporally necessary for pipeline scheduling"""
@@ -1031,9 +1024,10 @@ class IRSegment(IRCell):
 
         segment = IRSegment(nodes, inputs, outputs, self.name)
         segment._id = self.cid
-        if mirror and self.mirror is not None:
-            msegment = self.mirror.dispatch(devid, mirror=False)
+        if _gen_mirror and self.mirror is not None:
+            msegment = self.mirror.dispatch(devid, _gen_mirror=False)
             IRCell.make_pair(segment, msegment)
+        self._dispatch_cached[devid] = segment
         return segment
 
 

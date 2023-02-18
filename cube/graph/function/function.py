@@ -688,24 +688,31 @@ def View(signature, inputs):
                 bracket[subdim] = str(shape_map[edim])
 
     # find out the axis that can be partitioned
-    ispatial = set()
-    ifirst = []
+    ispatial, ifirst = set(), []
     for bracket in in_anno:
+        sdim = None
         for hdim in range(len(bracket)):
-            if bracket[hdim] == '1':
-                continue
-            ispatial.add(bracket[hdim])
-            ifirst.append(bracket[hdim])
+            if bracket[hdim] == '1': continue
+            sdim = bracket[hdim]
             break
-    ospatial = set()
-    ofirst = []
+        if sdim is not None:
+            ispatial.add(sdim)
+        ifirst.append(sdim)
+
+    ospatial, ofirst = set(), []
     for bracket in ou_anno:
+        sdim = None
         for hdim in range(len(bracket)):
-            if bracket[hdim] == '1':
-                continue
+            if bracket[hdim] == '1': continue
+            sdim = bracket[hdim]
             ospatial.add(bracket[hdim])
             ofirst.append(bracket[hdim])
             break
+        if sdim is not None:
+            ospatial.add(sdim)
+        ofirst.append(sdim)
+    
+    # intersection for spatial partitioned dimensions
     spatial = ispatial.intersection(ospatial)
 
     # set dimension cannot be partitioned

@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 class Block:
 
@@ -72,3 +72,12 @@ class ClassBlock(Block):
             derived = f'({derived})'
         title = f'class {self.class_name}{derived}:'
         super().__init__(title)
+
+
+class ForBlock(Block):
+    """
+    Create a for-loop block with function definition
+    """
+    def __init__(self, var: Optional[str], iters: str):
+        var = '_' if var is None else var
+        super().__init__(f'for {var} in {iters}:')

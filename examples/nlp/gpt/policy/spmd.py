@@ -2,6 +2,7 @@ from typing import List
 
 from cube.graph import IRGraph
 from cube.graph.function.anchor import IRGraphAnchor
+from cube.graph.function.pyfunc import IRPyFunc
 from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 
 
@@ -64,6 +65,9 @@ def PASDP(graph: IRGraph, resource):
 
     # partition forward operators
     for node in graph.select(ntype=IRFwOperation):
+        if isinstance(node, IRPyFunc):
+            graph.assign(node, 0)
+            continue
         if len(node.inputs()) == 0: continue
         #FIXME: a workaround to find batch dimension
         batch_dim = node.input(0).shape.index(bs)
@@ -160,6 +164,11 @@ def PASMegatronInferTP(graph: IRGraph, resource):
     ffns = [node for node in fnodes if node.name == 'feedforward']
     for ffn in ffns:
         _tp(graph, ffn, tp_devs, idx=1, dim=0)
+    
+    # func_print_shape
+    prts = [node for node in fnodes if node.name == 'func_print_shape']
+    for prt in prts:
+        _tp(graph, prt, tp_devs, idx=0, dim=2)
 
     # first embedding linear
     first_emb_anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor) and node.name == 'first_embed']

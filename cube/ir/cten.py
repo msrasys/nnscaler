@@ -68,7 +68,7 @@ class IRCell:
         # source cells. [-1] for control dependency
         self._predecessors: List[List[IRCell]] = [list() for _ in range(input_length+1)]
 
-        self._mirror = None
+        self._mirror: Optional[IRCell] = None
 
         # the comment for code generation
         self._comment: Optional[str] = None
@@ -97,6 +97,26 @@ class IRCell:
             raise KeyError("Require device Union[int, List[int]]")
         self._device = tuple(device_id)
 
+    def dispatch(self, device: int):
+        """
+        Instantiate this node to a specified device. Its mirror node will also
+        be dispatched and paired with this node.
+
+        For single operators, the mirror node will be reserved.
+        For nodes that cover multiple devices, e.g., IRSegment and IRAdapter,
+        the mirror node will be removed and require additional `make_pair` elsewhere.
+        
+        @param device int: device id
+        @return dispatched_node IRCell: the node that only has one device placement.
+        """
+        assert len(self.device) == 1, \
+            f"Require dispatch implementation for node type: {type(self)}"
+        if isinstance(self.mirror, IRCell):
+            assert len(self.mirror.device) == 1, \
+                f"IRCell got unexpected mirro node that has multiple device placement.\n{self.mirror}"
+        assert device in self.device, f"Fail to dispatch to device {device}. node: {self}"
+        return self
+
     @property
     def mirror(self):
         """
@@ -119,16 +139,12 @@ class IRCell:
         elif cell2 is not None:
             raise TypeError("Expected cell2 to be IRCell or None")
 
-    def on_device(self, device_id: int):
+    def isfw(self) -> bool:
         """
-        Check whether the operation is on device_id
-
-        Returns:
-            Boolean
+        Return if the IRCell is executed fully in forward phase.
+        This needs to be overrided by derived classes
         """
-        if not isinstance(device_id, int):
-            raise TypeError(f"Expected device id to be int but got {type(device_id)}")
-        return device_id in self.device
+        return True
 
     def input(self, index:int):
         # type: (int) -> Optional[IRTensor]

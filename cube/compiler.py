@@ -9,12 +9,14 @@ from cube.graph.gener.gen import IRAdapterGener
 from cube.graph.graph import IRGraph
 from cube.ir.operator import IRDataOperation
 from cube.graph.function.anchor import IRGraphAnchor
+from cube.graph.schedule.schedplan import SchedulePlan
+from cube.graph.function.pyfunc import IRPyFunc
 
 from cube.execplan import ExecutionPlan
 from cube.execplan.planpass.fusion import DiffFusion
 from cube.execplan.planpass.grouping import Grouping
 
-from cube.codegen.codegen import ModelCodeGen, ScheduleCodeGen
+from cube.codegen import ModuleCodeGen, ScheduleCodeGen
 
 from cube.profiler.timer import print_each_rank
 from cube.runtime.device import DeviceGroup
@@ -27,7 +29,7 @@ from cube.flags import CompileFlag
 
 def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None,
-            override = True, load_content = True) -> Callable:
+            comm_cost_fn: Optional[Callable] = None, override = True, load_content = True) -> Callable:
     """
     AI Scientist calls like:
 
@@ -51,7 +53,10 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
     @param model SemanticModel: AI Scientist specified SemanticModel
     @param dataloader CubDataLoader: dataloader used for training
-    @param policy Callable: policy to transform and schedule graph
+    @param PAS Callable: policy to transform and schedule graph
+    @param comm_cost_fn: Optional[Callable]: communication cost function, which
+        takes in an IRAdapterPrim, and outputs a cost in float. By default (None) use
+        communication volume.
     @param override bool: If true, the generated code will override exsisting
         files (if they are already existed.), otherwise, use the already existed
         generated code, i.e., the policy won't take effect. Default true.
@@ -135,18 +140,21 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
                 # skip graph anchor and multiref: they will be removed or replaced by system
                 if isinstance(node, IRGraphAnchor) or node.name == 'multiref':
                     graph.assign(node, 0)
+                if isinstance(node, IRPyFunc):
+                    graph.assign(node, 0)
                 if len(node.device) == 0:
                     raise RuntimeError(f"Node {node} device is not set")
 
             # generate adapter
             start = time.time()
-            graph = IRAdapterGener.gen(graph)
+            graph = IRAdapterGener.gen(graph, cost_fn=comm_cost_fn)
             span = time.time() - start
             print('> finish generating adapters: {:.2f} s'.format(span))
 
             if graph.sched is not None:
                 start = time.time()
                 graph.sched.apply()
+                # print(graph.sched)qq
                 if CompileFlag.log_schedule:
                     print(graph.sched)
                 span = time.time() - start
@@ -154,7 +162,12 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
             # to execution plan
             start = time.time()
-            execplan = ExecutionPlan(graph)
+            if isinstance(graph.sched, SchedulePlan):
+                execplan = ExecutionPlan.from_schedplan(graph.sched)
+            else:
+                execplan = ExecutionPlan.from_graph(graph)
+            if CompileFlag.visualize_plan:
+                execplan.visualize('plan.png')
             span = time.time() - start
             print('> finish lowering to execution plan: {:.2f} s'.format(span))
 
@@ -179,7 +192,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             start = time.time()
             local_world_size = DeviceGroup().local_world_size
             # code generation
-            mgener = ModelCodeGen(execplan)
+            mgener = ModuleCodeGen(execplan)
             sgener = ScheduleCodeGen(execplan)
             for local_rank in range(local_world_size):
                 rank = DeviceGroup().node_rank * local_world_size + local_rank

@@ -1,6 +1,11 @@
 import torch
 import cube
 
+@cube.graph.parser.register('* -> *')
+@torch.jit.ignore
+def func_print_shape(x: torch.Tensor, msg: str):
+    print(msg, x.size())
+    return x
 
 @cube.graph.parser.register('L^ N E^, (h+ d^ 3) E^, (h+ d^ 3), E^ (h+ d^) -> L^ N E^', name='self_attention')
 def self_attention(query: torch.Tensor, 
@@ -163,8 +168,7 @@ def cross_attention(query: torch.Tensor, key: torch.Tensor,
     return output
 
 
-# @cube.graph.parser.register('l N E^, L^ N (h+ d), L^ N (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), E^ (h+ d) -> l N E^', name='one_attention')
-@cube.graph.parser.register('l N E^, L^ N (h+ d), L^ N (h+ d), (h+ d 3) E^, (h+ d 3), E^ (h+ d) -> l N E^', name='one_attention')
+@cube.graph.parser.register('l N E^, L^ N (h+ d), L^ N (h+ d), (h+ d 3) E^, (h+ d 3), E^ (h+ d) -> l N E^, L^ N (h+ d), L^ N (h+ d)', name='one_attention')
 def one_attention(hidden_states: torch.Tensor,
                   past_embed_key: torch.Tensor,
                   past_embed_value: torch.Tensor,
@@ -218,12 +222,12 @@ def one_attention(hidden_states: torch.Tensor,
     attn = torch.nn.functional.softmax(attn, dim=-1) # (N h) l (L+l) -> (N h) l (L+l)
     #no dropout in inference attn
     attn = torch.nn.functional.dropout(attn, dropout_p, is_training, False)    # (N h) l (L+l) -> (N h) l (L+l)
-    v = v.transpose(0, 1)
-    output = torch.bmm(attn, v) # (N h) l (L+l), (N h) (L+l) d -> (N h) l d
+    v_t = v.transpose(0, 1)
+    output = torch.bmm(attn, v_t) # (N h) l (L+l), (N h) (L+l) d -> (N h) l d
     output = output.transpose(0, 1).contiguous()     # (N h) l d -> l (N h) d
     output = output.view(l, N, num_head * dim_head)  # l (N h) d -> l N (h d)
     output = torch.nn.functional.linear(output, out_proj, None) # l N (h d), E E  -> l N E
-    return output
+    return output, k.view(k_L, N, -1), v.view(v_L, N, -1)
 
 class MultiHeadSelfAttentionFineGrained(torch.nn.Module):
 
@@ -347,7 +351,7 @@ class MultiHeadOneAttention(torch.nn.Module):
 
 
     def forward(self, query: torch.Tensor, past_embed_key: torch.Tensor, past_embed_value: torch.Tensor):
-        attn = one_attention(
+        attn, past_k, past_v = one_attention(
             query, past_embed_key, past_embed_value,
             # self.q_proj, self.q_bias,
             # self.k_proj, self.k_bias,
@@ -357,4 +361,4 @@ class MultiHeadOneAttention(torch.nn.Module):
             self.num_heads, self.scaling, self.dropout_p, self.training, mask=True
         )
         attn = attn + self.out_bias
-        return attn
+        return attn, past_k, past_v

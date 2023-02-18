@@ -28,6 +28,21 @@ class DummyInputOuput(IRFwOperation):
         return f'DummyInputOutput-{self.device}(inputs={self.inputs()}, outputs={self.outputs()})'
 
 
+def tensor_vd_repr(t: IRSubTensor) -> str:
+    """
+    Tensor index-value partition representation
+    """
+    assert isinstance(t, IRSubTensor), f"expect IRSubTensor"
+    identifier = 't' if not t.is_grad() else 'g'
+    dchunks, dpos = [], []
+    for dim in range(t.ndims):
+        dchunks.append(t.parent.shape[dim] // t.shape[dim])
+        dpos.append(t.indmap[dim][0] // t.shape[dim])
+    indmap = ','.join(f'{idx}/{nchunks}' for idx, nchunks in zip(dpos, dchunks))
+    dscp = f'{identifier}{t.tid}-{t.device}(p{t.parent.tid}, shape={t.shape}, D({indmap}), V({t.valmap[0]}/{t.valmap[1]})'
+    return dscp
+
+
 def convert_add_to_valmap(graph: IRGraph, add_node: IRFwOperation):
     """
     Remove add node by replacing with tensor valmap

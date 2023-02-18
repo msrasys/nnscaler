@@ -9,6 +9,8 @@ OMP_NUM_THREADS=4 torchrun \
 PYTHONPATH=.:..:$PYTHONPATH python -m torch.distributed.launch --nproc_per_node=1  examples/nlp/gpt/infer.py --policy PASSingle --fp16
 
 PYTHONPATH=.:..:$PYTHONPATH python -m torch.distributed.launch --nproc_per_node=2  examples/nlp/gpt/infer.py --policy PASMegatronInferTP --fp16
+
+PYTHONPATH=.:..:$PYTHONPATH python -m torch.distributed.launch --nproc_per_node=2  examples/nlp/gpt/infer.py --policy PASDP --fp16 --moe_size 2
 """
 
 
@@ -16,6 +18,7 @@ import torch
 
 from examples.nlp.gpt.model import GPTInfer, GPTInferDataLoader
 from examples.nlp.gpt.model import GPTDataLoader
+from examples.nlp.gpt.model import build_gpt_config
 
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
@@ -27,11 +30,13 @@ import examples.nlp.gpt.policy.mpmd as mpmd
 
 import argparse
 
-parser = argparse.ArgumentParser(description='GPT Train')
+parser = argparse.ArgumentParser(description='GPT Inference')
 parser.add_argument('--policy', type=str, help='PAS policy choice, starting with PAS')
 parser.add_argument('--fp16', action='store_true', default=False,
-                    help='use fp16 for the training')
+                    help='use fp16 for the inference')
 parser.add_argument('--local_rank', type=int, default=0)
+parser.add_argument('--moe_size', type=int, default=1,
+                    help='number of experts, use MoE for the inference if moe_size > 1')
 args = parser.parse_args()
 
 cube.init()
@@ -51,9 +56,11 @@ else:
 def inter():
     print(f'torch.cuda.is_available() = {torch.cuda.is_available()}')
 
-    batch_size = 1
+    batch_size = 8
 
-    model = GPTInfer()
+    cfg = build_gpt_config('toy')
+    cfg.moe_size = args.moe_size
+    model = GPTInfer(batch_size=batch_size, cfg=cfg)
     model = model if not args.fp16 else model.half()
     # model = model.cuda() #only for PyTorch run
     model.eval()
@@ -69,7 +76,7 @@ def inter():
     model = model.get_gen_module()
 
     torch.distributed.barrier()
-    print_each_rank('model weight consumpition:', rank_only=0)
+    print_each_rank('model weight consumption:', rank_only=0)
     memory_summary()
 
     CudaTimer(enable=False).warmup()

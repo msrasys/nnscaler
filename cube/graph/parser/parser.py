@@ -4,6 +4,7 @@ import re
 from typing import Any, List, Tuple, Optional
 
 from cube.ir.operator import IRFwOperation
+from cube.graph.function.pyfunc import IRPyFunc
 from cube.ir.tensor import IRFullTensor
 import cube.ir as ir
 from cube.graph.parser.frame import Frame
@@ -29,6 +30,7 @@ class ScriptNodeKind(enum.Enum):
     PrimPythonOp = 10
     PrimDevice = 11       # erased
     PrimLoop = 12
+    PrimSetAttr = 13
 
 
 class ScriptModuleParser:
@@ -144,6 +146,8 @@ class ScriptModuleParser:
     def ntype(node: torch._C.Node):
         if node.kind() == 'prim::GetAttr':
             return ScriptNodeKind.PrimGetAttr
+        if node.kind() == 'prim::SetAttr':
+            return ScriptNodeKind.PrimSetAttr
         if node.kind() == 'prim::CallMethod':
             return ScriptNodeKind.PrimCallMethod
         if node.kind() == 'prim::CallFunction': # the op call
@@ -186,6 +190,8 @@ class ScriptModuleParser:
                 return ScriptModuleParser.parse_prim_method_node(node, module, frame)
             if node_type == ScriptNodeKind.PrimGetAttr:
                 return ScriptModuleParser.parse_prim_attr_node(node, module, frame)
+            if node_type == ScriptNodeKind.PrimSetAttr:
+                return ScriptModuleParser.parse_prim_setattr_node(node, module, frame)
             if node_type == ScriptNodeKind.PrimConstant:
                 return ScriptModuleParser.parse_prim_constant_node(node, module, frame)
             if node_type == ScriptNodeKind.PrimListConstruct:
@@ -451,6 +457,29 @@ class ScriptModuleParser:
                 val = getattr(module, label)
             frame.add_var(var_name, val)
         return list()
+
+    @staticmethod
+    def parse_prim_setattr_node(node, module, frame) -> List[IRFwOperation]:
+        """
+         = prim::SetAttr[name="past_k"](%self, %k.1)
+        """
+        signature = 'setattr'
+        target = node.s('name')  # past_k
+        module_name = node.inputsAt(0).debugName()
+        module = module if module_name == 'self' else frame.get_var(module_name)
+        
+        var = node.inputsAt(1).debugName()    # %k.1
+        dtype = node.inputsAt(1).type().str() # torch.Tensor
+        assert dtype == 'Tensor', "Only tensor can be set inside module"
+        var_tensor = frame.get_var(var)
+        # make sure of having same attribute name in graph
+        assert frame.has_attr(target), f"SetAttr currently only supports replace an existing tensor attribute"
+        target_tensor = frame.get_attr(target)  # IRFullTensor
+        # target_name = f"{target_tensor.name}_{target_tensor.tid}"
+        func = IRPyFunc(signature, ('self', target_tensor, var_tensor), ())
+        # setattr(module, target, var) -> This will have error
+        return [func]
+
 
     @staticmethod
     def parse_prim_constant_node(node, module, frame) -> List[None]:

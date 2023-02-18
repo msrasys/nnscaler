@@ -1,6 +1,7 @@
 from typing import Optional
 import time
 import sys
+import warnings
 
 import torch
 
@@ -115,7 +116,8 @@ class CudaTimer:
         @return span float: wall clock in milliseconds.
         """
         if field_name not in self.instance.field:
-            raise RuntimeError(f"Missing start on the field {field_name}")
+            warnings.warn(f"CudaTimer: {field_name} doesn't record.")
+            return 0.0
         if len(self.instance.field[field_name]) != 0:
             raise RuntimeError(f"timer for field {field_name} not stopped")
         return self.instance.field_data[field_name] / times * 1000  # in ms

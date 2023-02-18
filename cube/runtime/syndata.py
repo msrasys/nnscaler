@@ -4,9 +4,7 @@ Synthetic Data Loader
 
 from typing import Any, List, Optional, Tuple, Union
 import torch
-
-
-__all__ = ['CubeDataLoader', 'SynDataLoader']
+import warnings
 
 
 class CubeDataLoader:
@@ -29,6 +27,9 @@ class CubeDataLoader:
         self.shapes = tuple([list(shape) for shape in shapes])
         self.dtypes = dtypes
         self.batch_dims = (0,) * len(self.shapes) if batch_dims is None else batch_dims
+        bs = [shape[dim] for shape, dim in zip(self.shapes, self.batch_dims)]
+        assert len(set(bs)) == 1, f"Expect batch size same in each data shapes"
+        self.batch_size = bs[0]
 
     def get_batch_size(self) -> int:
         """
@@ -137,8 +138,8 @@ class SynDataLoader(CubeDataLoader):
             dtypes = tuple([torch.float] * len(shapes))
 
         super().__init__(shapes, dtypes, batch_dims)
-        self.buffer: Union[torch.Tensor, Tuple[torch.Tensor]] = None
-        self.set_random_sample()
+        datas = self.random_sample()
+        self.set_output(datas)
 
     def __iter__(self):
         return self
@@ -146,7 +147,7 @@ class SynDataLoader(CubeDataLoader):
     def __next__(self):
         return self.buffer
 
-    def set_random_sample(self):
+    def random_sample(self) -> Tuple[torch.Tensor]:
         torch.manual_seed(0)
         datas = []
         for shape, dtype in zip(self.shapes, self.dtypes):
@@ -156,13 +157,17 @@ class SynDataLoader(CubeDataLoader):
                     device=torch.cuda.current_device(),
                     requires_grad=False)
             )
+        return tuple(datas)
+    
+    def set_output(self, datas: Union[torch.Tensor, Tuple[torch.Tensor]]):
+        datas = (datas,) if torch.is_tensor(datas) else tuple(datas)
         if len(datas) == 0:
             self.buffer = None
         else:
-            datas = tuple(datas) if len(datas) > 1 else datas[0]
-            self.buffer = datas
+            self.buffer = datas[0] if len(datas) == 1 else datas
 
     def set_batch_size(self, batch_size: int):
         super().set_batch_size(batch_size)
-        self.set_random_sample()
+        datas = self.random_sample()
+        self.set_output(datas)
 

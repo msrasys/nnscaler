@@ -1,7 +1,7 @@
 """
 Concurrent producer / consumer Adapter Generator
 """
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Callable
 import copy
 import numpy as np
 import sys
@@ -12,11 +12,14 @@ from cube.ir.adapter import IRAdapter
 from cube.ir.adapter.prim import SelectPrim, MovePrim, SumPrim, MergeDimPrim
 from cube.ir.adapter.prim import BroadcastPrim
 
-from cube.graph.gener.layout import GridLayout, PathFinder
+from cube.graph.gener.rvd.layout import RVDLayout
+from cube.graph.gener.rvd.intra import IntraPathFinder
+from cube.graph.gener.rvd.inter import InterPathFinder
 from cube.graph.gener.utils import DummyInputOuput
 from cube.flags import CompileFlag
 
 import warnings
+
 
 if CompileFlag.disable_intra_rvd:
     warnings.warn('Detected disabling intra-RVD collective generation, which may have big impact on performance.')
@@ -30,7 +33,8 @@ class ConcurrentGener:
 
     @staticmethod
     def gen(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor], 
-            bptensors: List[IRSubTensor], bctensors: List[IRSubTensor]) -> Optional[IRAdapter]:
+            bptensors: List[IRSubTensor], bctensors: List[IRSubTensor],
+            cost_fn: Optional[Callable] = None) -> Optional[IRAdapter]:
         """
         Generate forward adapter and backward adapter
 
@@ -38,37 +42,37 @@ class ConcurrentGener:
         @param fctensors List[IRSubTensor]: forward consumer tensors
         @param bptensors List[IRSubTensor]: backward producer tensors
         @param bctensors List[IRSubTensor]: backward consumer tensors
+        @param cost_fn Optional[Callable]: takes in an IRAdapterPrim and outputs a cost in float
 
-        @return fadapter Optional[IRAdapter]: forward adapter
-            None indicate no adapter required.
+        @return fadapter IRAdapter: forward adapter
         """
         pdevs = tuple(t.device[0] for t in fptensors)
         cdevs = tuple(t.device[0] for t in fctensors)
 
         fadapter: IRAdapter = None
 
-        # case 1: sharing device (in-shard)
+        # case 1: sharing device (intra-rvd)
         inshard = (set(pdevs) == set(cdevs)) and (len(fptensors) == len(fctensors)) and (len(pdevs) == len(fptensors))
         if (not CompileFlag.disable_intra_rvd) and inshard and len(pdevs) > 1:
-            fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reassign=True)
+            # fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reassign=True)
             try:
-                fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reassign=True)
+                fadapter = ConcurrentGener.gen_intra_rvd(fptensors, fctensors, bptensors, bctensors, cost_fn)
             except Exception as e:
                 fadapter = None
                 color, default = '\033[33m' , '\033[0m'
                 print(
                     f"{color}========== Fail to use intra-RVD ==========\n"
-                    f"full tensor: {fptensors[0].parent}\n"
+                    f"full tensor: {fptensors[0].parent} | is grad: {fptensors[0].parent.is_grad()}\n"
                     f"Reason: {str(e)}\n"
                     f"Switch to general P2P communication.\n"
                     f"===========================================\n{default}", file=sys.stderr
                 )
 
-        # Case 2: sperating device (cross-shard)
+        # Case 2: sperating device (inter-rvd)
         if (not CompileFlag.disable_inter_rvd) and len(set(pdevs).intersection(cdevs)) == 0:
             # fadapter = ConcurrentGener.gen_cross_shard(fptensors, fctensors, bptensors, bctensors)
             try:
-                fadapter = ConcurrentGener.gen_cross_shard(fptensors, fctensors, bptensors, bctensors)
+                fadapter = ConcurrentGener.gen_inter_rvd(fptensors, fctensors, bptensors, bctensors, cost_fn)
             except Exception as e:
                 fadapter = None
                 color, default = '\033[33m' , '\033[0m'
@@ -79,6 +83,7 @@ class ConcurrentGener:
                     f"Switch to general P2P communication.\n"
                     f"===========================================\n{default}", file=sys.stderr
                 )
+
         # Case 3: General cases
         # warnings.warn('The adapter is generated using P2P communication')
         if fadapter is None:
@@ -91,9 +96,9 @@ class ConcurrentGener:
         return fadapter
 
     @staticmethod
-    def gen_in_shard(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor], 
-                     bptensors: List[IRSubTensor], bctensors: List[IRSubTensor],
-                     allow_reassign=False):
+    def gen_intra_rvd(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor], 
+                      bptensors: List[IRSubTensor], bctensors: List[IRSubTensor],
+                      cost_fn: Optional[Callable] = None) -> IRAdapter:
         """
         Generate forward and backward adapter for concurrent produced tensors and consumed tensors.
 
@@ -101,35 +106,23 @@ class ConcurrentGener:
         @param fctensors List[IRSubTensor]: forward consumed tensors
         @param bptensors List[IRSubTensor]: backward produced tensors
         @param bctensors List[IRSubTensor]: backward consumed tensors
-        @param allow_reassign bool: Allow to change placement of forward consumer tensors to better align deivce placement
+        @param cost_fn Optional[Callable]: takes in an IRAdapterPrim and outputs a cost in float
+        
+        @return adapter IRAdapter: forward IRAdapter with backward (if has) in its .mirror attribute.
         """
         ftensor = fptensors[0].parent
-        allow_reassign = allow_reassign and \
-            all(not isinstance(t.cell, DummyInputOuput) for t in fptensors + fctensors + bptensors + bctensors) and \
-            all(t.cell.name != 'multiref' for t in fctensors)
-        # each consumer can only be re-assigned once
-        for t in fctensors[0].cell.inputs():
-            if isinstance(t, IRSubTensor):
-                allow_reassign = allow_reassign and (t.parent == ftensor)
-                break
         # producer grid layout
-        ilayout = GridLayout.togrid(ftensor, fptensors)
+        ilayout = RVDLayout.togrid(ftensor, fptensors)
         devs = [ptensor.device for ptensor in ilayout.mat.flatten()]
-        # re-order ctensors to match with ptensors
+        # re-order ctensors to match with placement of ptensors
         ctensors = [None] * len(devs)
         for ctensor in fctensors:
             idx = devs.index(ctensor.device)
             ctensors[idx] = ctensor
         assert all(t is not None for t in ctensors), f"empty device slot {ctensors}"
-        olayout = GridLayout.togrid(ftensor, ctensors)
-        # find path
-        align, paths, fprims = PathFinder.intra_path(ftensor, ilayout, olayout, allow_misalign=allow_reassign)
-        # re-assign tensors
-        if (not align) and allow_reassign:
-            for t, ot in zip(paths[-1].mat.flatten(), olayout.mat.flatten()):
-                ot.cell.device = t.device
-                if len(bptensors) != 0:
-                    ot.cell.mirror.device = t.device
+        olayout = RVDLayout.togrid(ftensor, ctensors)
+        # get forward primitives
+        fprims = IntraPathFinder.path(ilayout, olayout, cost_fn)
 
         fadapter = IRAdapter(fptensors, fctensors)
         fadapter.prims = fprims
@@ -144,10 +137,10 @@ class ConcurrentGener:
                 idx = devs.index(bptensor.device)
                 assert ptensors[idx] is None, "same device of different tensors"
                 ptensors[idx] = bptensor
-            ilayout = GridLayout.togrid(grad, ptensors)
-            olayout = GridLayout.togrid(grad, bctensors)
+            ilayout = RVDLayout.togrid(grad, ptensors)
+            olayout = RVDLayout.togrid(grad, bctensors)
             # paths, bprims = ilayout.path(olayout)
-            _, paths, bprims = PathFinder.intra_path(grad, ilayout, olayout)
+            bprims = IntraPathFinder.path(ilayout, olayout, cost_fn)
             # generate backward adapter
             badapter = IRAdapter(bptensors, bctensors)
             badapter.prims = bprims
@@ -156,33 +149,33 @@ class ConcurrentGener:
         return fadapter
 
     @staticmethod
-    def gen_cross_shard(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor], 
-                        bptensors: List[IRSubTensor], bctensors: List[IRSubTensor],) -> IRAdapter:
+    def gen_inter_rvd(fptensors: List[IRSubTensor], fctensors: List[IRSubTensor], 
+                      bptensors: List[IRSubTensor], bctensors: List[IRSubTensor],
+                      cost_fn: Optional[Callable] = None) -> IRAdapter:
         """
+        Generate communication adapters for inter-RVD scenarios.
         This assumes ptensors and ctensors can be represented by RVD layout.
-        
-        pdevices: devices of ptensors
-        cdevices: devices of ctensors
 
         @param fptensors List[IRSubTensor]: produced tensors
         @param fctensors List[IRSubTensor]: consumed tensors
         @param bptensors List[IRSubTensor]: produced tensors
         @param bctensors List[IRSubTensor]: consumed tensors
+        @param cost_fn Optional[Callable]: takes in an IRAdapterPrim and outputs a cost in float
 
         @return fadapter IRAdapter
         """
         ftensor = fptensors[0].parent
-        ilayout = GridLayout.togrid(ftensor, fptensors)
-        olayout = GridLayout.togrid(ftensor, fctensors)
-        fpaths, fprims = PathFinder.inter_path(ftensor, ilayout, olayout)
+        ilayout = RVDLayout.togrid(ftensor, fptensors)
+        olayout = RVDLayout.togrid(ftensor, fctensors)
+        fprims = InterPathFinder.path(ilayout, olayout, cost_fn)
         fadapter = IRAdapter(fptensors, fctensors)
         fadapter.prims = fprims
 
         grad: IRFullTensor = ftensor.grad
         if grad is not None and (len(bptensors) != 0 or len(bctensors) != 0):
-            ilayout = GridLayout.togrid(grad, bptensors)
-            olayout = GridLayout.togrid(grad, bctensors)
-            bpaths, bprims = PathFinder.inter_path(grad, ilayout, olayout)
+            ilayout = RVDLayout.togrid(grad, bptensors)
+            olayout = RVDLayout.togrid(grad, bctensors)
+            bprims = InterPathFinder.path(ilayout, olayout, cost_fn)
             badapter = IRAdapter(bptensors, bctensors)
             badapter.prims = bprims
             IRAdapter.make_pair(fadapter, badapter)

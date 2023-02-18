@@ -1,5 +1,5 @@
 import torch
-from examples.nlp.blocks.attention import MultiHeadSelfAttention, MultiHeadOneAttention, MultiHeadSelfAttentionFineGrained
+from examples.nlp.blocks.attention import MultiHeadSelfAttention, MultiHeadOneAttention, func_print_shape, MultiHeadSelfAttentionFineGrained
 from examples.nlp.blocks.mlp import MLP
 
 class EncoderLayerFineGrained(torch.nn.Module):
@@ -65,14 +65,15 @@ class EncoderInferLayer(torch.nn.Module):
     def __init__(self, embed_dim: int, num_heads: int,
                  attn_hidden_dim: int, ffn_hidden_dim: int, seqlen: int = -1,
                  batch_size: int = 1,
-                 dropout: float = 0.0, atten_dropout: float = 0.0, activation_dropout: float = 0.0):
+                 dropout: float = 0.0, atten_dropout: float = 0.0, activation_dropout: float = 0.0,
+                 moe_size: int = 1):
         super().__init__()
         self.self_attn_partial = MultiHeadOneAttention(
             embed_dim, num_heads, attn_hidden_dim, atten_dropout
         )
         self.self_attn_layer_norm = torch.nn.LayerNorm(embed_dim)
         self.dropout = torch.nn.Dropout(p=dropout)
-        self.mlp = MLP(embed_dim, ffn_hidden_dim, activation_dropout)
+        self.mlp = MLP(embed_dim, ffn_hidden_dim, activation_dropout) if moe_size == 1 else MoEMLP(embed_dim, ffn_hidden_dim, activation_dropout, moe_size)
         self.final_layer_norm = torch.nn.LayerNorm(embed_dim)
 
         # id-embed + pos-embed
@@ -84,7 +85,9 @@ class EncoderInferLayer(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.self_attn_layer_norm(x)
-        x = self.self_attn_partial(x, self.past_embed_key, self.past_embed_value)
+        x, past_k, past_v = self.self_attn_partial(x, self.past_embed_key, self.past_embed_value)
+        self.past_embed_key = past_k
+        self.past_embed_value = past_v
         x = self.dropout(x)
         x = x + residual
 
@@ -93,4 +96,6 @@ class EncoderInferLayer(torch.nn.Module):
         x = self.mlp(x)
         x = self.dropout(x)
         x = x + residual
+        # func_print_shape(self.past_embed_key, 'past_k: ')
+        # func_print_shape(self.past_embed_value, 'past_v: ')
         return x

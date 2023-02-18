@@ -16,10 +16,13 @@ class Config:
     dropout: float = 0.2
     attn_dropout: float = 0.2
     activation_dropout: float = 0.2
+    moe_size: int = 1
 
 
 def build_gpt_config(name: str) -> Config:
-    if name == '350M':
+    if name == 'toy':
+        embed_dim, layers, attention_heads = 32, 4, 16
+    elif name == '350M':
         embed_dim, layers, attention_heads = 1024, 24, 16
     elif name == '760M':
         embed_dim, layers, attention_heads = 1536, 24, 16
@@ -125,18 +128,33 @@ class GPTInfer(torch.nn.Module):
     def __init__(self, batch_size: int = 1, cfg: Config = Config()):
         super().__init__()
         # self.embed = torch.nn.Embedding(cfg.num_embeddings, cfg.embed_dim)
-        self.embedw = torch.nn.Parameter(torch.rand(cfg.num_embeddings, cfg.embed_dim) / 128)
+        self.embedw = torch.nn.Parameter(torch.rand(cfg.num_embeddings, cfg.embed_dim))
         self.position = torch.nn.Embedding(cfg.seqlen, cfg.embed_dim)
         self.embed_dropout = torch.nn.Dropout()
 
-        self.layers = torch.nn.ModuleList(
-            [EncoderInferLayer(
-                cfg.embed_dim, cfg.attention_heads,
-                cfg.attn_hidden_dim, cfg.ffn_hidden_dim, cfg.seqlen,
-                batch_size,
-                cfg.dropout, cfg.attn_dropout, cfg.activation_dropout
-            ) for _ in range(cfg.layers)]
-        )
+        if cfg.moe_size == 1:
+            self.layers = torch.nn.ModuleList(
+                [EncoderInferLayer(
+                    cfg.embed_dim, cfg.attention_heads,
+                    cfg.attn_hidden_dim, cfg.ffn_hidden_dim, cfg.seqlen,
+                    batch_size,
+                    cfg.dropout, cfg.attn_dropout, cfg.activation_dropout
+                ) for _ in range(cfg.layers)]
+            )
+        else:
+            assert cfg.moe_size > 1
+            self.layers = torch.nn.ModuleList()
+            for layer_id in range(cfg.layers):
+                self.layers.append(
+                    EncoderInferLayer(
+                        cfg.embed_dim, cfg.attention_heads,
+                        cfg.attn_hidden_dim, cfg.ffn_hidden_dim, cfg.seqlen,
+                        batch_size,
+                        cfg.dropout, cfg.attn_dropout, cfg.activation_dropout,
+                        1 if (layer_id % 2) == 0 else cfg.moe_size
+                    )
+                )
+
         self.final_layernorm = torch.nn.LayerNorm(cfg.embed_dim)
 
 
@@ -162,15 +180,14 @@ class GPTInfer(torch.nn.Module):
         cube.runtime.function.anchor('last_embed')
         logits = torch.nn.functional.linear(enc, self.embedw)
         # simplified
-        loss = torch.sum(logits)
-        return loss
+        # loss = torch.sum(logits)
+        return logits
 
 
-class GPTDataLoader(cube.runtime.syndata.CubeDataLoader):
+class GPTDataLoader(cube.runtime.syndata.SynDataLoader):
 
     def __init__(self, batch_size: int, cfg: Config = Config()):
 
-        self.bs = batch_size
         self.cfg = cfg
         super().__init__(
             shapes=([batch_size, self.cfg.seqlen],
@@ -179,31 +196,23 @@ class GPTDataLoader(cube.runtime.syndata.CubeDataLoader):
             dtypes=(torch.int64, torch.int64),
             batch_dims=(0, 0)
         )
-        self.samples = [self.random_sample()]
 
     def random_sample(self):
         input_ids = torch.randint(
             0, self.cfg.num_embeddings,
-            size=(self.bs, self.cfg.seqlen),
+            size=(self.batch_size, self.cfg.seqlen),
             dtype=torch.int64, device=torch.cuda.current_device()
         )
         position_ids = torch.arange(
             0, self.cfg.seqlen, dtype=torch.int64, device=torch.cuda.current_device()
-        ).repeat(self.bs).view(self.bs, -1)
-        return (input_ids, position_ids)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.samples[0]
+        ).repeat(self.batch_size).view(self.batch_size, -1)
+        return input_ids, position_ids
 
 
-class GPTInferDataLoader(cube.runtime.syndata.CubeDataLoader):
+class GPTInferDataLoader(cube.runtime.syndata.SynDataLoader):
 
     def __init__(self, batch_size: int, cfg: Config = Config()):
 
-        self.bs = batch_size
         self.cfg = cfg
         super().__init__(
             shapes=([batch_size, 1],
@@ -212,23 +221,19 @@ class GPTInferDataLoader(cube.runtime.syndata.CubeDataLoader):
             dtypes=(torch.int64, torch.int64),
             batch_dims=(0, 0)
         )
-        self.samples = [self.random_sample()]
 
     def random_sample(self):
         input_ids = torch.randint(
             0, self.cfg.num_embeddings,
-            size=(self.bs, 1),
+            size=(self.batch_size, 1),
             dtype=torch.int64,
             device=torch.cuda.current_device()
         )
         position_ids = torch.arange(
             0, 1, dtype=torch.int64,
             device=torch.cuda.current_device()
-        ).repeat(self.bs).view(self.bs, -1)
-        return (input_ids, position_ids)
-
-    def __iter__(self):
-        return self
+        ).repeat(self.batch_size).view(self.batch_size, -1)
+        return input_ids, position_ids
 
     def __next__(self):
         return self.samples[0]
