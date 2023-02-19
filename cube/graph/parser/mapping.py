@@ -51,11 +51,6 @@ class Sign2Op:
     # runtime template
     __rtemplate = lambda name: f'cube.runtime.function.function.{name}'
 
-    # einops
-    __einopsize = lambda name: f'einops._torch_specific.{name}'
-
-    # custom ops
-    __customops = lambda name: f'examples.custom_ops.{name}'
 
     kOpMap = {
 
@@ -167,9 +162,6 @@ class Sign2Op:
         __rtemplate('multiref'): function.MultiRef,
 
         __rtemplate('accum'): function.Accum,
-
-        #einops
-        __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
 
     }
 

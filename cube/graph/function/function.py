@@ -9,14 +9,8 @@ from cube.ir.cten import IRTensor
 from cube.ir.tensor import IRSubTensor
 from cube.ir.dtype import IRDType
 from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
-from cube.graph.function.conv import IRConv2D
-from cube.graph.function.conv import IRConv3D
-from cube.graph.function.pad import IRPad
-from cube.graph.function.scripteinops import IRScriptEinOps
+from cube.graph.function.conv import IRPad, IRConv2D, IRConv3D
 from cube.graph.function.creators import IROnes, IRToTensor, IRZeros, IRRand, IRNewTensor
-from cube.graph.function.select import IRSelect, IRSlice
-from cube.graph.function.scatter import IRSelectScatter
-from cube.graph.function.repeat import IRRepeat
 from cube.graph.function.anchor import IRGraphAnchor
 
 
@@ -761,6 +755,46 @@ def Reshape(signature, inputs):
     return View(signature, inputs)
 
 
+# def Pad(signature, inputs):
+#     """
+#     torch.nn.functional.pad(input: torch.Tensor, pad: List[int], mode='constant', value=0.0)
+#     """
+#     signature = 'torch.nn.functional.pad'
+#     tensor, pad, mode, value = inputs
+#     ianno = ShapeAnno.create_shape_str(tensor.shape)
+#     oanno = []
+#     ndims = len(pad) // 2
+#     for dim in range(ndims):
+#         pad_left, pad_right = pad[2 * dim], pad[2 * dim + 1]
+#         if pad_left == 0 and pad_right == 0:
+#             oanno.insert(0, ianno[-1-dim])
+#         else:
+#             ianno[-1-dim] = str(tensor.shape[-1-dim])
+#             oanno.insert(0, str(tensor.shape[-1-dim] + pad_left + pad_right))
+#     oanno = copy.copy(ianno[:len(tensor.shape) - ndims]) + oanno
+#     anno = OpAnno.create_op_str([ianno], [oanno])
+#     return IRDimops(Pad, 'pad', signature, [anno], [tensor], pad=pad, mode=mode, value=value)
+
+
+def Pad(signature, inputs):
+    """
+    torch.nn.functional.pad(input, pad, mode='constant', value=0.0)
+    https://pytorch.org/docs/stable/generated/torch.nn.functional.pad.html#torch.nn.functional.pad
+    :param signature:
+    :param inputs:
+    :return:
+    """
+    # print("#Pad::inputs.len: {}".format(len(inputs)))
+    # idx = 0
+    # for input in inputs:
+    #     if idx >= 0:
+    #         print("#Pad::input[{}]: {}".format(idx, input))
+    #     idx += 1
+    tensors = inputs[0:1]
+    pad, mode, value = inputs[1:]
+    return IRPad(signature, tensors, 'pad', pad=pad, mode=mode, value=value)
+
+
 # def Conv2D(signature, inputs):
 #     """
 #     torch.conv2d(input, weight, bias, stride, padding, dialation, groups)
@@ -822,24 +856,6 @@ def Conv3D(signature, inputs):
         padding = [padH, padH, padW, padW]
     return IRConv3D(signature, tensors, 'conv3d',
                     stride=stride, padding=padding, dilation=dilation, groups=groups)
-
-def Pad(signature, inputs):
-    """
-    torch.nn.functional.pad(input, pad, mode='constant', value=0.0)
-    https://pytorch.org/docs/stable/generated/torch.nn.functional.pad.html#torch.nn.functional.pad
-    :param signature:
-    :param inputs:
-    :return:
-    """
-    # print("#Pad::inputs.len: {}".format(len(inputs)))
-    # idx = 0
-    # for input in inputs:
-    #     if idx >= 0:
-    #         print("#Pad::input[{}]: {}".format(idx, input))
-    #     idx += 1
-    tensors = inputs[0:1]
-    pad, mode, value = inputs[1:]
-    return IRPad(signature, tensors, 'pad', pad=pad, mode=mode, value=value)
 
 
 def Accum(signature, inputs: Tuple[IRTensor]):
@@ -928,33 +944,77 @@ def Select(signature, inputs: Tuple[IRTensor, int, int]):
     oanno.pop(dim)
     anno = OpAnno.create_op_str([ianno], [oanno])
     return IRDimops(Select, 'select', signature, [anno], [tensor], dim=dim, index=index)
-    # return IRSelect(signature, [tensor], 'select', dim, index)
 
-def Slice(signature, inputs: Tuple[IRTensor, int, Optional[int], Optional[int], int]):
+
+def Slice(signature, inputs):
     """
     aten::slice(input:Tensor, dim:int, start:Optional[int], end:Optional[int], step:int) -> Tensor
     """
+    signature = 'torch.ops.aten.slice'
     tensor, dim, start, end, step = inputs
-    return IRSlice(signature, [tensor], 'slice', dim, start, end, step)
+    ianno = ShapeAnno.create_shape_str(tensor.shape)
+    oanno = copy.copy(ianno)
+    ianno[dim] = str(tensor.shape[dim])
+    
+    def clip(ofst):
+        ofst = ofst + tensor.shape[dim] if ofst < 0 else ofst
+        return min(tensor.shape[dim], max(0, ofst))
 
-def SelectScatter(signature, inputs:Tuple[IRTensor, IRTensor, int, int]):
+    # set start and end to possitive itegers
+    start = 0 if start is None else start
+    end = tensor.shape[dim] if end is None else end
+    start, end = clip(start), clip(end)
+
+    oanno[dim] = str(len(range(start, end, step)))
+    anno = OpAnno.create_op_str([ianno], [oanno])
+    return IRDimops(Slice, 'slice', signature, [anno], [tensor], dim=dim, start=start, end=end, step=step)
+
+
+def SelectScatter(signature, inputs: Tuple[IRTensor, IRTensor, int, int]):
     """
     torch.select_scatter(self:Tensor, input:Tensor, dim:int, index:int) -> Tensor
     """
+    # 'torch.select_scatter' isn't supported by Torch2ONNX yet.
+    signature = 'cube.runtime.function.select_scatter'
     self, input, dim, index = inputs
-    return IRSelectScatter(signature, [self, input], 'scatter_select', dim, index)
+    # shape check
+    self_shape, input_shape = self.shape, input.shape
+    self_shape.pop(dim)
+    assert tuple(self_shape) == tuple(input_shape)
+    in1_anno = ShapeAnno.create_shape_str(self.shape)
+    in2_anno = in1_anno.copy()
+    in2_anno.pop(dim)
+    in1_anno[dim] = str(self.shape[dim])
+    out_anno = in1_anno.copy()
+    anno = OpAnno.create_op_str([in1_anno, in2_anno], [out_anno])
+    return IRDimops(SelectScatter, 'select_scatter', signature, 
+                    [anno], [self, input], dim=dim, index=index)
 
 
-def Repeat(signature, inputs:Tuple[IRTensor, List[int]]):
+def Repeat(signature, inputs: Tuple[IRTensor, List[int]]):
     """
     torch.repeat(tensor:Tensor, repeats: List[int]) -> Tensor
     """
+    signature = 'torch.ops.aten.repeat'
     tensor, repeats = inputs
-
-    assert signature == 'torch.repeat' # this is the API in TorchScript
-    signature = 'torch.Tensor.repeat'  # this is the API in Python frontend and is not a Tensor member method
-
-    return IRRepeat(signature, [tensor], 'repeat', repeats)
+    in_shape = tensor.shape
+    assert len(in_shape) <= len(repeats), "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor"
+    expand = len(repeats) - len(tensor.shape)
+    in_shape += [1] * expand
+    ou_shape = [dimlen * repeat for dimlen, repeat in zip(in_shape, repeats)]
+    ianno, oanno = ShapeAnno.create_shape_str(in_shape), []
+    for dim, dimlen in enumerate(ou_shape):
+        if dim < expand:
+            oanno.append(str(dimlen))
+        else:
+            if repeats[dim] != 1:
+                ianno[dim] += '^'
+                dim_anno = [str(repeats[dim]), ianno[dim]]
+            else:
+                dim_anno = ianno[dim]
+            oanno.append(dim_anno)
+    anno = OpAnno.create_op_str([ianno[expand:]], [oanno])
+    return IRDimops(Repeat, 'repeat', signature, [anno], [tensor], repeats=repeats)
 
 
 def Embedding(signature, inputs: List):
@@ -1047,22 +1107,6 @@ def GraphAnchor(signature, inputs: List[IRSubTensor]):
     name: str = inputs[0]
     node = IRGraphAnchor(signature, name)
     return node
-
-
-def ScriptEinOps(signature, inputs):
-    """
-    apply_for_scriptable_torch(recipe: TransformRecipe, tensor: torch.Tensor, reduction_type: str) -> torch.Tensor:
-    https://github.com/arogozhnikov/einops/blob/master/einops/_torch_specific.py
-    :param signature:
-    :param inputs:
-    :return:
-    """
-    recipe = inputs[0]
-    tensors = inputs[1:2]
-    reduction_type = inputs[2]
-    import pickle
-    recipe_str = pickle.dumps(recipe)
-    return IRScriptEinOps(signature, tensors, 'scripteinops', recipe_str=recipe_str, reduction_type=reduction_type)
 
 
 def _comparison(creator: Callable, f: Callable, name: str, signature: str, inputs):
