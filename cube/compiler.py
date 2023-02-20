@@ -33,15 +33,11 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
     """
     AI Scientist calls like:
 
-        @cube.compile(model, dataloader, policy=(trans_policy, schedule_policy))
+        @cube.compile(model, dataloader, PAS=policy)
         def train_step(model, dataloader):
-            # do a 4-time gradient accumulation
-            for acc_step, (data, label) in enumerate(dataloader):
-                if acc_step < 4:
-                    loss = model(data, label)
-                    loss.backward()
-                else:
-                    break
+            data = next(dataloader)
+            loss = model(data)
+            loss.backward()
         ...
         
         for epoch in range(100):
