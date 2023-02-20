@@ -9,7 +9,7 @@ AI System Compiler to map a semantic (single-device) model into distributed exec
 > Install Python 3.7 in the development environment for widest compatibility.
 
 Install dependent packages
-```shell
+```sh
 pip install -r requirements.txt
 
 # require pytorch version >= 1.11
