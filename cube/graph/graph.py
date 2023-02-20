@@ -345,7 +345,7 @@ class IRGraph(IRSegment):
         @return ops List[IRCell]: partitioned sub-nodes
         """
         assert isinstance(algo, GenericDistAlgo) and node == algo.node, \
-            "The partition algorithm is not initialized for this node"
+            f"The partition algorithm ({algo}) is not initialized for this node"
         assert isinstance(node, (IRFwOperation, IRDataOperation)), \
             f"Only allow op to be forward op or data op, but got: {node}"
         if node.name == 'multiref':

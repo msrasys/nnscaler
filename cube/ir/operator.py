@@ -1,9 +1,10 @@
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, Union
 import copy
 
 from cube.ir.cten import IRCell, IRTensor
-from cube.ir.tensor import IRFullTensor, IRSubTensor
+from cube.ir.tensor import IRFullTensor
 from cube.algorithm.factory import DistAlgorithmFactory
+from cube.algorithm.generics import GenericDistAlgo
 from cube.ir.unique import IDGenerator
 from cube.ir.dtype import IRDType, DTypeInferRule
 
@@ -78,12 +79,15 @@ class IRFwOperation(IRCell):
             assert self._recompute == group_id, "The operator is set to recompute in another recompute group."
         self._recompute = group_id
 
-    def algorithms(self, tag: Optional[str] = None):
+    def algorithms(self, tag: Optional[str] = None) -> Union[Tuple[GenericDistAlgo], GenericDistAlgo]:
         """
         get algorithm from algorithm factory
 
-        Args:
-            tag: str or None. If None, return all 
+        @param tag Optional[str]: the queried tag (default None for all)
+
+        @return algorithm(s) Union[Tuple[GenericDistAlgo], GenericDistAlgo]:
+            If None (default), return all possible algorithms.
+            Otherwise, return the specified one.
         """
         factory = DistAlgorithmFactory()
         if tag is None:
@@ -95,8 +99,7 @@ class IRFwOperation(IRCell):
                 algos.append(template(self))
             return algos
         else:
-            if not factory.exist(type(self), tag):
-                return None
+            assert factory.exist(type(self), tag), f"Node {self} doesn't have transformation algorithm tag: {tag}"
             template = factory.algorithms(type(self), tag)
             return template(self)
 
@@ -226,12 +229,15 @@ class IRDataOperation(IRCell):
         """
         return True
 
-    def algorithms(self, tag: Optional[str] = None):
+    def algorithms(self, tag: Optional[str] = None) -> Union[Tuple[GenericDistAlgo], GenericDistAlgo]:
         """
-        get algorithm from algorithm factory
+        Get algorithm from algorithm factory
 
-        Args:
-            tag: str or None. If None, return all 
+        @param tag Optional[str]: the queried tag (default None for all)
+
+        @return algorithm(s) Union[Tuple[GenericDistAlgo], GenericDistAlgo]:
+            If None (default), return all possible algorithms.
+            Otherwise, return the specified one.
         """
         factory = DistAlgorithmFactory()
         if tag is None:
@@ -243,8 +249,7 @@ class IRDataOperation(IRCell):
                 algos.append(template(self))
             return algos
         else:
-            if not factory.exist(type(self), tag):
-                return None
+            assert factory.exist(type(self), tag), f"Node {self} doesn't have transformation algorithm tag: {tag}"
             template = factory.algorithms(type(self), tag)
             return template(self)
     
