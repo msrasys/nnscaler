@@ -8,7 +8,10 @@ from cube.execplan.planpass.planpass import PlanPass
 from cube.ir.adapter import IRAdapter
 from cube.ir.adapter.prim import IdentityPrim
 from cube.ir.operator import IRFwOperation
+from cube.graph.function.pyfunc import IRPyFunc
 from cube.ir.cten import IRCell
+
+from cube.flags import CompileFlag
         
 
 class Grouping(PlanPass):
@@ -57,6 +60,9 @@ class Grouping(PlanPass):
             Tuple: (fgroups, bgroups)
         """
         def differentiable(fnode):
+            # nnfusion special handle: break IRAdapter and IRPyFunc
+            if CompileFlag.use_nnfusion:
+                if isinstance(fnode, IRAdapter): return False
             if isinstance(fnode, IRFwOperation):
                 return True
             if isinstance(fnode, IRAdapter) and fnode.differentiable and fnode.isfw():
