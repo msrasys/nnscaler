@@ -23,7 +23,7 @@ def build_alphafold_config(setting:int):
     elif setting == 2:
         bs, s, r = 1, 512, 256
     elif setting == 3:
-        bs, s, r = 1, 512, 384
+        bs, s, r = 1, 512, 512
     else:
         assert False, f"unrecognized setting {setting}"
 
@@ -98,7 +98,8 @@ def test_main():
     # first fine-tuning
     # bs, s, r, cm, cz = 1, 512, 256, 256, 128
     # second fine-tuning
-    bs, s, r, cm, cz = 1, 512, 384, 256, 128
+    # bs, s, r, cm, cz = 1, 512, 384, 256, 128
+    bs, s, r, cm, cz = 1, 512, 512, 256, 128
 
     dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 4, False, True, False
     policy = spmd.PASDAP
