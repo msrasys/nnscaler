@@ -1,5 +1,53 @@
+from typing import List
 from cube.graph import IRGraph
+from cube.graph.segment import IRSegment
 from cube.ir.operator import IRDataOperation, IRFwOperation
+from cube.graph.gener.rvd.intra import IntraAutoPlacer
+
+
+# tensor parallelism with auto-placer
+# This is an implementation example of SPMD auto placer usage
+def _tp_autoplace(graph: IRGraph, node: IRFwOperation, devs: List[int], **configs):
+
+    if len(devs) == 1:
+        graph.assign(node, devs[0])
+        return [node]
+
+    segment: IRSegment = graph.segment(node)
+    ftensor = node.input(configs['idx']).parent
+
+    algo = node.algorithms('dim')
+    sub_nodes = graph.partition(node, algo, **configs)
+    assert sub_nodes is not None
+    producers = segment.producers(ftensor)
+    if ftensor.is_param() or len(producers) != len(sub_nodes):
+        print(f"> skip auto placer due to condition not matched: "
+              f"nproducers: {len(producers)}, nconsumers: {len(sub_nodes)}, "              f"producer name: {producers[0].name if len(producers) > 0 else None}")
+        devs = sorted(list(devs))
+        for devid, node in zip(devs, sub_nodes):
+            graph.assign(node, devid)
+    else:
+        devices = IntraAutoPlacer.auto_place(
+            segment, ftensor, producers, sub_nodes)
+        for devid, subnode in zip(devices, sub_nodes):
+            graph.assign(subnode, devid)
+    return sub_nodes
+
+# tensor parallelism
+def _tp(graph: IRGraph, node: IRFwOperation, devs: List[int], **configs):
+    algo = node.algorithms('dim')
+    sub_nodes = graph.partition(node, algo, **configs)
+    assert sub_nodes is not None
+    for devid, sub_node in zip(devs, sub_nodes):
+        graph.assign(sub_node, devid)
+    return sub_nodes
+
+# replicate
+def _replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
+    sub_nodes = graph.replicate(node, times=len(devs))
+    for devid, sub_node in zip(devs, sub_nodes):
+        graph.assign(sub_node, devid)
+    return sub_nodes
 
 
 def PASSingle(graph: IRGraph, resource):
@@ -59,20 +107,19 @@ def PASRow(graph: IRGraph, resource):
     """
     Linear Column Parallel
     """
-    linears = [node for node in graph.nodes() if node.name == 'linear']
-    for idx, node in enumerate(linears):
-        algo = node.algorithms('dim')
-        sub_nodes = graph.partition(
-            node, algo, idx=1, dim=1, num=resource.ngpus
-        )
+    devs = list(range(resource.ngpus))
+
+    for dl in graph.select(ntype=IRDataOperation):
+        sub_nodes = graph.replicate(dl, resource.ngpus)
         for idx, node in enumerate(sub_nodes):
             graph.assign(node, idx)
-    for node in graph.nodes():
-        if isinstance(node, (IRFwOperation, IRDataOperation)):
-            if len(node.device) == 0:
-                sub_nodes = graph.replicate(node, resource.ngpus)
-                for idx, node in enumerate(sub_nodes):
-                    graph.assign(node, idx)
+
+    for node in graph.select(ntype=IRFwOperation):
+        if node.name == 'linear':
+            _tp(graph, node, devs, idx=0, dim=1, num=len(devs))
+        else:
+            _replica(graph, node, devs)
+
     return graph
 
 

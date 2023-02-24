@@ -4,7 +4,7 @@ import numpy as np
 
 from cube.graph.graph import IRGraph
 from cube.ir.operator import IRDataOperation, IRFwOperation
-from cube.graph.schedule.sched1f1b import IRSchedule1F1B
+from cube.graph.schedule.predefined import PredefinedSched
 
 
 def _create_mesh(ngpus: int, group_num: Tuple[int]) -> Tuple[Tuple[Tuple[int]]]:
@@ -86,6 +86,7 @@ def PAS1F1B(graph: IRGraph, resource):
             for devid, rnode in zip(mesh, rnodes):
                 graph.assign(rnode, devid)
     # setup schedule to 1F1B
-    schedule = IRSchedule1F1B(num_microbatch, tp_mesh, recompute=False)
-    graph.schedule_plan = schedule
+    # schedule = IRSchedule1F1B(num_microbatch, tp_mesh, recompute=False)
+    # graph.schedule_plan = schedule
+    schedule = PredefinedSched.sched_1f1b(graph, num_microbatch, num_stage)
     return graph
