@@ -1,15 +1,11 @@
-from typing import Dict, Generator, Iterable, List, Any, Optional, Set, Tuple, Union
-from more_itertools import split_when
-
+from typing import Generator, Iterable, List, Any, Optional, Tuple
 
 from cube.ir.cten import IRCell, IRTensor
 from cube.ir.dtype import IRDType
 from cube.ir.tensor import IRSubTensor
-from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
+from cube.ir.operator import IRDataOperation, IRFwOperation
 from cube.ir.adapter import IRWeightReducer, IRAdapter
-
-from cube.graph.graph import IRSegment
-from cube.execplan.execplan import ExeReuseCell
+from cube.ir.adapter.prim import IRAdapterPrim
 
 from cube.codegen.frontend_mapping import Sign2EmitRule
 
@@ -159,12 +155,24 @@ class FuncEmission(CodeEmission):
         assert len(node.device) == 1, f"Expected adapter to be dispatched:\n{node.extra_repr()}"
         prims = [node] if node.differentiable and node.custom else [prim for prim in node.prims]
 
+        # only adapter that is non-differentiable can be executed as async
+        async_op = CompileFlag.async_comm and (not node.differentiable)
+        for idx, prim in enumerate(prims):
+            if isinstance(prim, IRAdapterPrim) and prim.volume() == 0:
+                continue
+            break
+        #TODO: support more general cases: independent same-group primitives
+        async_op = False if len(prims[idx:]) != 1 else async_op
+
         for prim in prims:
             if len(prim.inputs()) == 1:
                 itensors = FuncEmission.tensor_name(prim.inputs()[0], prefix_attr=prefix_attr)
             else:
                 itensors = FuncEmission.tuple_name(prim.inputs(), prefix_attr=prefix_attr)
-            kwargs = FuncEmission.kwargs_name(**prim.kwargs)
+            prim_kwargs = dict(prim.kwargs)
+            if async_op:
+                prim_kwargs['async_op'] = True
+            kwargs = FuncEmission.kwargs_name(**prim_kwargs)
             outputs = FuncEmission.return_name(prim.outputs())
             code = f'{outputs} = {prim.signature}({itensors}, {kwargs})'
             codes.append(code)

@@ -19,7 +19,7 @@ import examples.mlp.policy.mpmd as mpmd
 
 import argparse
 
-parser = argparse.ArgumentParser(description='comm primitive')
+parser = argparse.ArgumentParser(description='MLP example')
 parser.add_argument('--policy', type=str, help='PAS policy choice, starting with "PAS"')
 args = parser.parse_args()
 
@@ -60,7 +60,7 @@ class MLP(nn.Module):
 
 def train():
     batch_size = 128
-    dim = 8192
+    dim = 4096
 
     model = MLP(dim=dim)
     model = cube.SemanticModel(
@@ -85,8 +85,8 @@ def train():
     CudaTimer(enable=False).warmup()
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
-    iter_num = 32
-    warmup = 8
+    iter_num = 16
+    warmup = 4
     for step in range(iter_num):
         if step >= warmup:
             CudaTimer(enable=True).start('e2e')

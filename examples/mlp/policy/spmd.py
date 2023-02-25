@@ -143,7 +143,7 @@ def PASHybrid(graph: IRGraph, resource):
     return graph
 
 
-def PASMegatron(graph: IRGraph, resource):
+def PASMegatronTP(graph: IRGraph, resource):
     """
     Tensor + Data Parallelism
     """

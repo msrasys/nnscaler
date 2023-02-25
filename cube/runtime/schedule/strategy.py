@@ -1,22 +1,9 @@
 from typing import Any, Callable, Dict, Iterable, List
 import torch
 
-from cube.profiler.timer import CudaTimer
-
+from cube.runtime.executor import AsyncCommHandler
 from cube.flags import CompileFlag
-
-
-def convert_fp32_to_fp16(t: Any):
-    """
-    A tensor with float32 will be converted to float16.
-    A dtype of torch.float32 will be returned as torch.float16
-    """
-    if isinstance(t, torch.dtype) and t == torch.float32:
-        t = torch.float16
-    elif torch.is_tensor(t) and t.dtype == torch.float32:
-        with torch.no_grad():
-            t = t.half()
-    return t
+from cube.profiler.timer import CudaTimer
 
 
 class ScheduleABC:
@@ -28,10 +15,12 @@ class ScheduleABC:
         """
         forward pass
         """
-        CudaTimer().start('forward')
-        with torch.autocast('cuda', torch.float16, enabled=CompileFlag.use_amp):
-            outputs = segment(*args, **kwargs)
-        CudaTimer().stop('forward')
+        args = ScheduleABC.sync_tensors(args)
+        if not CompileFlag.async_comm:
+            CudaTimer().start('forward')
+        outputs = segment(*args, **kwargs)
+        if not CompileFlag.async_comm:
+            CudaTimer().stop('forward')
         if not isinstance(outputs, tuple):
             outputs = (outputs,)
         return outputs
@@ -43,14 +32,17 @@ class ScheduleABC:
         """
         backward pass
         """
+        otensor_grads = ScheduleABC.sync_tensors(otensor_grads)
         for tensor in itensors:
             if torch.is_tensor(tensor) and tensor.requires_grad:
                 tensor.retain_grad()
-        CudaTimer().start("backward")
+        if not CompileFlag.async_comm:
+            CudaTimer().start("backward")
         otensors = [t for t in otensors if t.requires_grad]
         assert len(otensors) == len(otensor_grads), f"output tensor mismatches with gradient number"
         torch.autograd.backward(otensors, grad_tensors=otensor_grads)
-        CudaTimer().stop("backward")
+        if not CompileFlag.async_comm:
+            CudaTimer().stop("backward")
         itensor_grads = []
         for tensor in itensors:
             if torch.is_tensor(tensor) and tensor.requires_grad:
@@ -75,11 +67,11 @@ class ScheduleABC:
         if adapter is None: return (None,)
         # if adapter is None: return ()
         args = tuple(t for t in args if torch.is_tensor(t))
-        if CompileFlag.use_amp:
-            args = tuple(convert_fp32_to_fp16(t) for t in args)
-        CudaTimer().start('adapter')
+        if not CompileFlag.async_comm:
+            CudaTimer().start('adapter')
         outputs = adapter(*args)
-        CudaTimer().stop('adapter')
+        if not CompileFlag.async_comm:
+            CudaTimer().stop('adapter')
         if not isinstance(outputs, tuple):
             outputs = (outputs,)
         if require_grad:
@@ -128,6 +120,13 @@ class ScheduleABC:
         if len(ScheduleABC.status[name]) == 0:
             del ScheduleABC.status
         return out
+    
+    @staticmethod
+    def sync_tensors(tensors: List[Any]) -> List[Any]:
+        """
+        Wait until the finish of synchornized tensors
+        """
+        return [AsyncCommHandler().wait(t) if torch.is_tensor(t) else t for t in tensors]
 
     @staticmethod
     def assert_empty():

@@ -65,6 +65,9 @@ class SpatialPrim(IRAdapterPrim):
         super().__init__(inputs, outputs, **kwargs)
         self.device = list(set(t.device[0] for t in inputs))
 
+    def volume(self) -> int:
+        return 0
+
 
 # numerical abstract primitive
 class ValuePrim(IRAdapterPrim):
@@ -74,6 +77,9 @@ class ValuePrim(IRAdapterPrim):
     def __init__(self, inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
         super().__init__(inputs, outputs)
         self.device = list(set(t.device[0] for t in inputs))
+
+    def volume(self) -> int:
+        return 0
 
 
 # communication abstract primitive
@@ -117,9 +123,6 @@ class IdentityPrim(SpatialPrim):
         dscp = f"{self.output(0)} = identity({self.input(0)})"
         return dscp
 
-    def volume(self) -> int:
-        return 0
-
 
 class SelectPrim(SpatialPrim):
 
@@ -137,9 +140,6 @@ class SelectPrim(SpatialPrim):
         dscp = f"{self.output(0)} = select({self.input(0)}, indmap={self.kwargs['indmap']}, valmap={self.kwargs['valmap']})"
         return dscp
 
-    def volume(self) -> int:
-        return 0
-
 
 class MergeDimPrim(SpatialPrim):
     """
@@ -153,9 +153,6 @@ class MergeDimPrim(SpatialPrim):
     def __repr__(self) -> str:
         return f"dev{self.device}: {self.output(0)} = concat({self.inputs()}, dim={self.kwargs['dim']})"
 
-    def volume(self) -> int:
-        return 0
-
 # numerical primitive
 
 class SumPrim(ValuePrim):
@@ -164,9 +161,6 @@ class SumPrim(ValuePrim):
         assert all(itensor.device == itensors[0].device for itensor in itensors), "device not same"
         super().__init__(itensors, [otensor])
         self.signature = 'cube.runtime.adapter.vmerge'
-
-    def volume(self) -> int:
-        return 0
 
     def __repr__(self) -> str:
         return f"dev{self.device}: {self.output(0)} = add({self.inputs()})"
@@ -190,7 +184,9 @@ class MovePrim(CommPrim):
         self.signature = 'cube.runtime.adapter.move'
 
     def volume(self) -> int:
-        return self.input(0).nelement()
+        if len(self._inputs) > 0:
+            return self.input(0).nelement()
+        return self.output(0).nelement()
 
     def __repr__(self):
         dscp = f"{self.outputs()} = move{self.device}({self.inputs()}, src={self.kwargs['src']}, dst={self.kwargs['dst']})"

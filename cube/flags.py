@@ -36,6 +36,7 @@ class CompileFlag:
 
     # ============== runtime ====================
     dev_mode = _to_bool('SINGLE_DEV_MODE')  # allow to use python xx.py
+    async_comm = _to_bool('ASYNC_COMM')
 
     # maximal reducer weight bytes for one allreduce
     max_reducer_bucket = _to_int('MAX_REDUCER_BUCKET', default=5e8)

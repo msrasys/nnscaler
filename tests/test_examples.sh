@@ -5,37 +5,42 @@
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=1 \
     --nnodes=1 \
-    examples/mlp/linears.py --policy PASSingle
+    examples/mlp/train.py --policy PASSingle
 
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/mlp/linears.py --policy PASData
+    examples/mlp/train.py --policy PASData
 
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/mlp/linears.py --policy PASCol
+    examples/mlp/train.py --policy PASCol
 
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/mlp/linears.py --policy PASRow
+    examples/mlp/train.py --policy PASRow
 
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/mlp/linears.py --policy PASHybrid
+    examples/mlp/train.py --policy PASHybrid
 
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/mlp/linears.py --policy PASMegatron
+    examples/mlp/train.py --policy PASMegatronTP
 
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/mlp/linears.py --policy PASOptimal
+    examples/mlp/train.py --policy PASOptimal
+
+ASYNC_COMM=1 OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    examples/mlp/infer.py --policy PASMegatron
 
 
 # test GPT model

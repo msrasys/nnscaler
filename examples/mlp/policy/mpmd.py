@@ -3,6 +3,7 @@ from typing import Tuple
 import numpy as np
 
 from cube.graph.graph import IRGraph
+from cube.graph.segment import IRSegment
 from cube.ir.operator import IRDataOperation, IRFwOperation
 from cube.graph.schedule.predefined import PredefinedSched
 
@@ -51,42 +52,52 @@ def PASRandom(graph, resource):
     return graph
 
 
-def PAS1F1B(graph: IRGraph, resource):
+def PASMegatron(graph: IRGraph, resource):
 
     # assert resource.ngpus == 8, "should apply on 8 gpus"
     num_stage = 4
     num_tp = resource.ngpus // num_stage
-    num_microbatch = resource.ngpus
+    num_microbatch = resource.ngpus * 8
 
     _, tp_mesh = _create_mesh(resource.ngpus, (num_stage, num_tp))
     print(f'> pipeline-tensor parallel group: {tp_mesh}')
     assert len(tp_mesh) == num_stage
 
-    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
-    node2stage = lambda node: min(fnodes.index(node) // (len(fnodes) // num_stage), num_stage-1)
+    linears = graph.select('linear')
+    stage_start_nodes = linears[::len(linears) // num_stage]
+    stage_start_nodes = stage_start_nodes[:num_stage]
+    assert len(stage_start_nodes) == num_stage, f"{len(stage_start_nodes)} != {num_stage}"
+    graph.staging(stage_start_nodes)
 
-    for idx, node in enumerate(fnodes):
+    segments = graph.select(ntype=IRSegment, flatten=False)
+    fsegs = [seg for seg in segments if seg.isfw()]
+    assert len(fsegs) == num_stage
+
+    for sid, segment in enumerate(fsegs):
         # get tensor parallel group
-        sid = node2stage(node)
         tp_group = tp_mesh[sid]
-        # partition
-        if node.name == 'linear':
-            algo = node.algorithms('dim')
-            tp_nodes = graph.partition(node, algo, idx=1, dim=idx%2, num=num_tp)
-        else:
-            tp_nodes = graph.replicate(node, times=num_tp)
-        # assign
-        for devid, node in zip(tp_group, tp_nodes):
-            graph.assign(node, devid)
+        for idx, node in enumerate(segment.nodes()):
+            # partition
+            if node.name == 'linear':
+                algo = node.algorithms('dim')
+                tp_nodes = graph.partition(node, algo, idx=1, dim=idx % 2, num=num_tp)
+            else:
+                tp_nodes = graph.replicate(node, times=num_tp)
+            # assign
+            for devid, node in zip(tp_group, tp_nodes):
+                graph.assign(node, devid)
     
-    for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            mesh = tp_mesh[0]
-            rnodes = graph.replicate(node, times=num_tp)
-            for devid, rnode in zip(mesh, rnodes):
-                graph.assign(rnode, devid)
+    for dl in graph.select(ntype=IRDataOperation):
+        mesh = tp_mesh[0]
+        dls = graph.replicate(dl, times=num_tp)
+        for devid, dl in zip(mesh, dls):
+            graph.assign(dl, devid)
+
     # setup schedule to 1F1B
     # schedule = IRSchedule1F1B(num_microbatch, tp_mesh, recompute=False)
     # graph.schedule_plan = schedule
-    schedule = PredefinedSched.sched_1f1b(graph, num_microbatch, num_stage)
+    if graph.train:
+        schedule = PredefinedSched.sched_1f1b(graph, num_microbatch, num_stage)
+    else:
+        schedule = PredefinedSched.sched_infer_pipe(graph, num_microbatch, num_stage)
     return graph
