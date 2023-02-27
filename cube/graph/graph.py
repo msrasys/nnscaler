@@ -692,6 +692,14 @@ class IRGraph(IRSegment):
         starts = tuple(self._nodes.index(node) for node in nodes)
         assert len(starts) > 0
 
+        # multiref (created by graph.auto_multiref) will be moved to the next stage (if possible) for optimization
+        for sid in range(len(starts)):
+            while starts[sid] > 0:
+                if self.node(starts[sid]-1).name == 'multiref':
+                    starts[sid] -= 1
+                    continue
+                break
+
         # adjust the start of the first stage to involve beginning operators
         for idx in range(starts[0]):
             node = self.node(idx)
