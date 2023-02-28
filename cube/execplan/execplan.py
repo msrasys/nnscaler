@@ -176,7 +176,7 @@ class ExecutionPlan:
                 micro_fcells[key] = cell
                 return cell
             else:
-                mcell = block2reuse(Block(node.content.mirror, node.mid))
+                mcell = block2reuse(Block(node.content.mirror, node.mid, node.span))
                 return mcell.mirror
             
         topo_seqs: List[IRCell] = []

@@ -16,12 +16,14 @@ class Block:
     that is executed with input data of a given micro-batch index.
     """
 
-    def __init__(self, cell: IRCell, micro_batch_id: int) -> None:
-        """
+    def __init__(self, cell: IRCell, micro_batch_id: int, span: int) -> None:
+        """Create an execution block with IRCell on microbatch index. The 
+        block will take `span` steps to finish execution.
         """
         assert isinstance(cell, IRCell), f"Expected IRCell, but got {type(cell)}: {cell}"
         self._content: IRCell = cell
         self._micro_batch_id: int = micro_batch_id
+        self._span = span
 
     def __eq__(self, other):
         if isinstance(other, Block):
@@ -42,6 +44,10 @@ class Block:
     @property
     def content(self) -> IRCell:
         return self._content
+    
+    @property
+    def span(self) -> int:
+        return self._span
     
     def dispatch(self, devid: int):
         return Block(self._content.dispatch(devid), self._micro_batch_id)
@@ -126,18 +132,19 @@ class PlanBase:
     def nodes(self) -> Tuple[Block]:
         return tuple(self._seqs)
 
-    def add_segment(self, seg: IRSegment, micro_batch_id: int, step: int) -> Block:
+    def add_segment(self, seg: IRSegment, micro_batch_id: int, step: int, span: Optional[int] = 1) -> Block:
         """
         Add a segment `seg` to be executed with `micro-batch-id` data at step `step`.
         """
-        self._extend_step(step)
+        self._extend_step(step + span - 1)
         if len(self._step_segments[step]) == 1 and isinstance(self._step_segments[0], PlanBase):
             assert False, "Cannot add an IRSegment into a step that already has Repetend."
         assert all(devid not in self._step_devices for devid in seg.device), \
             f"A device cannot execute multiple segments on a same step"
-        block = Block(seg, micro_batch_id)
-        self._step_segments[step].append(block)
-        self._step_devices[step].update(seg.device)
+        block = Block(seg, micro_batch_id, span)
+        for t in range(span):
+            self._step_segments[step+t].append(block)
+            self._step_devices[step+t].update(seg.device)
         self._block_step[block] = step
         self._segments.append(block)
         return block
@@ -147,7 +154,9 @@ class PlanBase:
         Get segment blocks at step
         """
         assert step < self.nsteps
-        return tuple(self._step_segments[step])
+        blocks = self._step_segments[step]
+        blocks = tuple(blk for blk in blocks if self.step(blk) == step)
+        return blocks
     
     def step(self, block: Block) -> int:
         """Get the step of the block
@@ -177,13 +186,15 @@ class PlanBase:
         # FIXME: this may not work for multiple segments in a same 
         # micro-batch require for the data 
         for dl in self._dependency.dataloaders:
-            for step, blocks in enumerate(self._step_segments):
+            for step in range(self.nsteps):
+                blocks = self.segments(step)
                 for block in blocks:
-                    if isinstance(block, Block):
-                        segment, mid = block.content, block.mid
-                        if self.graph.depends(dl, segment):
-                            self._step_segments[step].insert(0, Block(dl, mid))
-                            break
+                    segment, mid = block.content, block.mid
+                    if self.graph.depends(dl, segment):
+                        dl_block = Block(dl, mid, 1)
+                        self._step_segments[step+block.span-1].insert(0, dl_block)
+                        self._block_step[dl_block] = step+block.span-1
+                        break
 
     def topo_sort(self):
         """
@@ -192,7 +203,7 @@ class PlanBase:
         """
         self._seqs = []
         for step in range(self.nsteps):
-            self._seqs += self._step_segments[step]
+            self._seqs += self.segments(step)
             self._seqs += self._step_adapters[step]
 
 
@@ -248,7 +259,7 @@ class Repetend(PlanBase):
         extended_blocks = []
         for step in range(self.nsteps):
             for blk in self.segments(step):
-                extend_blk = Block(blk.content, blk.mid + cnts[blk.content])
+                extend_blk = Block(blk.content, blk.mid + cnts[blk.content], blk.span)
                 extended_blocks.append(extend_blk)
         # step2: generate adapters for each step
         all_blocks = self.all_segments()
@@ -262,14 +273,14 @@ class Repetend(PlanBase):
                     #       - we don't allow send and recver in un-neighbored repetend
                     # 3) its recver are outside the repetend
                     recver = self._dependency.recvers[adapter]
-                    rblock = Block(recver, block.mid)
-                    ablock = Block(adapter, block.mid)
+                    rblock = Block(recver, block.mid, block.span)
+                    ablock = Block(adapter, block.mid, 1)
                     # case 1)
                     if rblock in all_blocks:
-                        self._step_adapters[step].append(ablock)
+                        self._step_adapters[step+block.span-1].append(ablock)
                     # case 2)
                     elif rblock in extended_blocks:
-                        self._step_adapters[self.nsteps-1].append(Block(adapter, block.mid - cnts[blk.content]))
+                        self._step_adapters[self.nsteps-1].append(Block(adapter, block.mid - cnts[blk.content], 1))
                         self._post_adapters.append(ablock)
                     # case 3)
                     else:
@@ -394,8 +405,8 @@ class SchedulePlan(PlanBase):
         for adapter in self._dependency.adapters:
             sender: IRSegment = self._dependency.senders[adapter]
             # find sender step and insert adapter
-            for step, blocks in enumerate(self._step_segments):
-                if len(blocks) == 0: continue
+            for step in range(self.nsteps):
+                blocks = self.segments(step)
                 if len(blocks) == 1 and isinstance(blocks[0], Repetend):
                     self._step_adapters[step] += list(blocks[0].get_post_adapters())
                 else:
@@ -403,8 +414,9 @@ class SchedulePlan(PlanBase):
                     segments = [block.content for block in blocks]
                     mids = [block.mid for block in blocks]
                     if sender in segments:
+                        span = blocks[segments.index(sender)].span
                         mid = mids[segments.index(sender)]
-                        self._step_adapters[step].append(Block(adapter, mid))
+                        self._step_adapters[step+span-1].append(Block(adapter, mid, 1))
 
     def topo_sort(self):
         super().topo_sort()
@@ -428,7 +440,8 @@ class SchedulePlan(PlanBase):
 
         for devid in sorted(self.device):
             timeline = '\n'
-            for step in range(self.nsteps):
+            step = 0
+            while step < self.nsteps:
                 # segment
                 have_block = False
                 for block in self._step_segments[step]:
@@ -437,9 +450,11 @@ class SchedulePlan(PlanBase):
                         break
                 if have_block:
                     blk_repr = f"{sids[block.content]}{'f' if block.content.isfw() else 'b'}{block.mid}"
-                    timeline += f" {blk_repr}"
+                    timeline += f" {'-'.join([blk_repr] * block.span)}"
+                    step += block.span
                 else:
                     timeline += f" ---"
+                    step += 1
                 # adapter
                 # have_block = False
                 # for block in self._step_adapters[step]:
