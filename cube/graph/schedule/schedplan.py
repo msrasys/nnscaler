@@ -20,34 +20,34 @@ class Block:
         """
         """
         assert isinstance(cell, IRCell), f"Expected IRCell, but got {type(cell)}: {cell}"
-        self._block: IRCell = cell
+        self._content: IRCell = cell
         self._micro_batch_id: int = micro_batch_id
 
     def __eq__(self, other):
         if isinstance(other, Block):
-            return other.blk == self.blk and other.mid == self.mid
+            return other.content == self.content and other.mid == self.mid
         return False
     
     def __hash__(self) -> int:
-        return hash((self._block, self._micro_batch_id))
+        return hash((self._content, self._micro_batch_id))
 
     @property
     def device(self) -> Tuple[int]:
-        return tuple(self._block.device)
+        return tuple(self._content.device)
 
     @property
     def mid(self) -> int:
         return self._micro_batch_id
     
     @property
-    def blk(self) -> IRCell:
-        return self._block
+    def content(self) -> IRCell:
+        return self._content
     
     def dispatch(self, devid: int):
-        return Block(self._block.dispatch(devid), self._micro_batch_id)
+        return Block(self._content.dispatch(devid), self._micro_batch_id)
 
     def __repr__(self) -> str:
-        return f'Block({self._micro_batch_id})-{self.device} : {self._block}'
+        return f"{self._content.cid}{'f' if self.content.isfw() else 'b'}{self._micro_batch_id}"
 
 
 class ScheduleDependency:
@@ -88,17 +88,19 @@ class ScheduleDependency:
         self.reducers = self.graph.select(ntype=IRWeightReducer, flatten=False)
     
     def depend(self, prev: Block, next: Block) -> bool:
-        return prev.mid == next.mid and self.graph.depends(prev.blk, next.blk)
+        return prev.mid == next.mid and self.graph.depends(prev.content, next.content)
 
 
 class PlanBase:
 
     def __init__(self, graph: IRGraph, _dependency: Optional[ScheduleDependency] = None):
         self._graph: IRGraph = graph
-        self._step_devs: List[Set[int]] = []
+        self._segments: List[Block] = []
         self._step_segments: List[List[Block]] = []
+        self._step_devices: List[Set[int]] = []
         # adapters executed *after* the segments on that step
         self._step_adapters: List[List[Block]] = []
+        self._block_step: Dict[Block, int] = {}
 
         self._dependency = _dependency if _dependency is not None \
             else ScheduleDependency(graph)
@@ -114,6 +116,13 @@ class PlanBase:
     def graph(self) -> IRGraph:
         return self._graph
     
+    @property
+    def device(self) -> Tuple[int]:
+        device = set()
+        for devs in self._step_devices:
+            device.update(devs)
+        return tuple(device)
+
     def nodes(self) -> Tuple[Block]:
         return tuple(self._seqs)
 
@@ -124,11 +133,13 @@ class PlanBase:
         self._extend_step(step)
         if len(self._step_segments[step]) == 1 and isinstance(self._step_segments[0], PlanBase):
             assert False, "Cannot add an IRSegment into a step that already has Repetend."
-        assert all(devid not in self._step_devs[step] for devid in seg.device), \
-            f"A step cannot execute multiple segments on a same device"
+        assert all(devid not in self._step_devices for devid in seg.device), \
+            f"A device cannot execute multiple segments on a same step"
         block = Block(seg, micro_batch_id)
         self._step_segments[step].append(block)
-        self._step_devs[step].update(seg.device)
+        self._step_devices[step].update(seg.device)
+        self._block_step[block] = step
+        self._segments.append(block)
         return block
     
     def segments(self, step: int) -> Tuple[Block]:
@@ -138,14 +149,16 @@ class PlanBase:
         assert step < self.nsteps
         return tuple(self._step_segments[step])
     
+    def step(self, block: Block) -> int:
+        """Get the step of the block
+        """
+        return self._block_step[block]
+    
     def all_segments(self) -> Tuple[Block]:
         """
         Get all segment blocks
         """
-        blocks = []
-        for step in range(self.nsteps):
-            blocks += self._step_segments[step]
-        return tuple(blocks)
+        return tuple(self._segments)
     
     def _extend_step(self, step: int):
         """
@@ -154,7 +167,7 @@ class PlanBase:
         if len(self._step_segments) <= step:
             nextend = step - len(self._step_segments) + 1
             self._step_segments += [[] for _ in range(nextend)]
-            self._step_devs += [set() for _ in range(nextend)]
+            self._step_devices += [set() for _ in range(nextend)]
             self._step_adapters += [[] for _ in range(nextend)]
 
     def _place_dataloader(self):
@@ -167,7 +180,7 @@ class PlanBase:
             for step, blocks in enumerate(self._step_segments):
                 for block in blocks:
                     if isinstance(block, Block):
-                        segment, mid = block.blk, block.mid
+                        segment, mid = block.content, block.mid
                         if self.graph.depends(dl, segment):
                             self._step_segments[step].insert(0, Block(dl, mid))
                             break
@@ -206,16 +219,9 @@ class Repetend(PlanBase):
             devices = set()
             for block in blocks:
                 devices.update(block.device)
-            self._step_devs[step] = devices
+            self._step_devices[step] = devices
         # the adapters that will be performed outside the repetend
         self._post_adapters: List[Block] = []
-
-    @property
-    def device(self) -> Tuple[int]:
-        device = set()
-        for devs in self._step_devs:
-            device.update(devs)
-        return tuple(device)
 
     @property
     def span(self) -> int:
@@ -237,19 +243,19 @@ class Repetend(PlanBase):
         cnts: Dict[IRSegment, int] = {}
         for step in range(self.nsteps):
             for blk in self.segments(step):
-                cnts.setdefault(blk.blk, 0)
-                cnts[blk.blk] += 1
+                cnts.setdefault(blk.content, 0)
+                cnts[blk.content] += 1
         extended_blocks = []
         for step in range(self.nsteps):
             for blk in self.segments(step):
-                extend_blk = Block(blk.blk, blk.mid + cnts[blk.blk])
+                extend_blk = Block(blk.content, blk.mid + cnts[blk.content])
                 extended_blocks.append(extend_blk)
         # step2: generate adapters for each step
         all_blocks = self.all_segments()
         for adapter, sender in self._dependency.senders.items():
             for step in range(self.nsteps):
                 for block in self.segments(step):
-                    if block.blk != sender: continue
+                    if block.content != sender: continue
                     # sender adapter can be classified into three categories
                     # 1) its recver are in the same repetend
                     # 2) its recver are in neighbored repetend
@@ -263,7 +269,7 @@ class Repetend(PlanBase):
                         self._step_adapters[step].append(ablock)
                     # case 2)
                     elif rblock in extended_blocks:
-                        self._step_adapters[self.nsteps-1].append(Block(adapter, block.mid - cnts[blk.blk]))
+                        self._step_adapters[self.nsteps-1].append(Block(adapter, block.mid - cnts[blk.content]))
                         self._post_adapters.append(ablock)
                     # case 3)
                     else:
@@ -311,13 +317,6 @@ class SchedulePlan(PlanBase):
         Get number of micro-batches
         """
         return self._num_microbatches
-
-    @property
-    def device(self) -> Tuple[int]:
-        devs = set()
-        for node in self._seqs:
-            devs.update(node.device)
-        return tuple(devs)
     
     @property
     def graph(self) -> IRGraph:
@@ -353,7 +352,7 @@ class SchedulePlan(PlanBase):
         """
         Check whether the description contains full micro-batches
         """
-        pass
+        assert self.validate(), f"The schedule plan is not valid."
 
     def apply(self):
         """
@@ -373,6 +372,19 @@ class SchedulePlan(PlanBase):
         # step 4: generate topological sequence
         self.topo_sort()
 
+    def validate(self) -> bool:
+        """
+        Validate the plan to check if it satisfies data dependency
+
+        @return valid bool
+        """
+        for block1 in self._segments:
+            for block2 in self._segments:
+                if self._dependency.depend(block1, block2):
+                    if self.step(block1) >= self.step(block2):
+                        return False
+        return True
+
     def _place_adapters(self):
         """
         Place adapters to make sure the communication happens
@@ -381,7 +393,6 @@ class SchedulePlan(PlanBase):
         assert len(self._dependency.adapters) > 0
         for adapter in self._dependency.adapters:
             sender: IRSegment = self._dependency.senders[adapter]
-            print(f'place sender: {sender}')
             # find sender step and insert adapter
             for step, blocks in enumerate(self._step_segments):
                 if len(blocks) == 0: continue
@@ -389,7 +400,7 @@ class SchedulePlan(PlanBase):
                     self._step_adapters[step] += list(blocks[0].get_post_adapters())
                 else:
                     assert all(isinstance(blk, Block) for blk in blocks)
-                    segments = [block.blk for block in blocks]
+                    segments = [block.content for block in blocks]
                     mids = [block.mid for block in blocks]
                     if sender in segments:
                         mid = mids[segments.index(sender)]
@@ -402,10 +413,42 @@ class SchedulePlan(PlanBase):
 
     def __repr__(self) -> str:
         dscp = f"SchedulePlan:\n"
-        for step in range(self.nsteps):
-            dscp += f'\nStep {step}:\n'
-            for segment in self._step_segments[step]:
-                dscp += repr(segment) + '\n'
-            for adapter in self._step_adapters[step]:
-                dscp += repr(adapter) + '\n'
+
+        sids: Dict[IRCell, int] = {}
+        for block in self._segments:
+            if block.content not in sids:
+                sids[block.content] = len(sids)
+        
+        for idx, (cell, sid) in enumerate(sids.items()):
+            dscp += f'{cell.name}{cell.cid:<3} = {sid}; '
+            if (idx + 1) % 3 == 0:
+                dscp += '\n'
+        
+        dscp += '\nAnnotation: i(f/b)j = segment i on executing (forward/backward) microbatch j'
+
+        for devid in sorted(self.device):
+            timeline = '\n'
+            for step in range(self.nsteps):
+                # segment
+                have_block = False
+                for block in self._step_segments[step]:
+                    if devid in block.device:
+                        have_block = True
+                        break
+                if have_block:
+                    blk_repr = f"{sids[block.content]}{'f' if block.content.isfw() else 'b'}{block.mid}"
+                    timeline += f" {blk_repr}"
+                else:
+                    timeline += f" ---"
+                # adapter
+                # have_block = False
+                # for block in self._step_adapters[step]:
+                #     if devid in block.device:
+                #         have_block = True
+                #         break
+                # if have_block:
+                #     timeline += ' {0: <5}'.format('adapt')
+                # else:
+                #     timeline += ' {0: <5}'.format('')
+            dscp += timeline
         return dscp
