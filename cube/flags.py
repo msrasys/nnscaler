@@ -22,6 +22,7 @@ class CompileFlag:
     log_schedule = _to_bool('LOG_SCHEDULE')
 
     # ================ compiling ========================
+    use_torchfx = _to_bool('USE_TORCHFX')  # using torch.fx or torchscript as frontend to capture dataflow graph
     # worker sleep in seconds
     worker_sleep = _to_int('WORKER_SLEEP')
     disable_intra_rvd = _to_bool('DISABLE_INTRA_RVD')

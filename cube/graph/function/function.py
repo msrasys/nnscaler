@@ -462,7 +462,9 @@ def Softmax(signature, inputs):
 
 
 def Dropout(signature, inputs):
-    assert len(inputs) == 4
+    assert len(inputs) <= 4, f'but the length is {len(inputs)}'
+    default_inputs = [None, 0.5, True, False]
+    inputs = inputs + default_inputs[len(inputs):]
     annos = ['* -> *']
     tensor = inputs[0:1]
     p, training, inplace = inputs[1], inputs[2], inputs[3]
@@ -514,11 +516,18 @@ def Sum(signature, inputs):
     torch.sum(input, *, dtype=None) -> Tensor
     torch.sum(input, dim, keepdim=False, *, dtype=None) -> Tensor
     """
-    assert len(inputs) == 2 or len(inputs) == 4, f"{inputs}"
+    assert len(inputs) == 1 or len(inputs) == 2 or len(inputs) == 4, f"{inputs}"
     tensor = inputs[0]
     einput = ShapeAnno.create_shape_str(tensor.shape)
     eoutput = copy.copy(einput)
-    if len(inputs) == 2:
+    if len(inputs) == 1:
+        inputs = [tensor]
+        eoutput = ['1']
+        # every dimension can be reduced
+        einput = [edim + '+' for edim in einput]
+        anno = OpAnno.create_op_str([einput], [eoutput])
+        return IRDimops(Sum, 'sum', signature, [anno], [tensor])
+    elif len(inputs) == 2:
         dtype = inputs[1]
         assert dtype is None, "Currently Sum only support dtype=None"
         # torch.sum(input)
