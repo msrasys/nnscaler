@@ -90,7 +90,7 @@ class Frame:
         # first check whether we have variable in this frame
         if var_name in self._vars[-1]:
             return self._vars[-1][var_name]
-        raise KeyError(f"Cannot find var name {var_name}")
+        raise KeyError(f"Cannot find var name {var_name} in {self._vars}")
 
     def push_attr(self):
         """

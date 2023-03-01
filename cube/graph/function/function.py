@@ -763,6 +763,38 @@ def Reshape(signature, inputs):
 
     return View(signature, inputs)
 
+def Squeeze(signature, inputs):
+    """
+    out = torch.squeeze(tensor)
+    """
+    assert len(inputs) == 1
+    input = inputs[0]
+
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    assert len(edim_in) == len(input.shape)
+    edim_ou = []
+    for dim_anno, dim_size in zip(edim_in, input.shape):
+        if dim_size > 1:
+            edim_ou.append(copy.copy(dim_anno))
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+
+    return IRDimops(Squeeze, 'squeeze', signature, [anno], [input])
+
+def Unsqueeze(signature, inputs):
+    """
+    out = torch.unsqueeze(tensor, dim)
+    """
+    assert len(inputs) == 2
+    input, dim = inputs
+
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = copy.copy(edim_in)
+    edim_ou.insert(dim, '1')
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+
+    return IRDimops(Unsqueeze, 'unsqueeze', signature, [anno], [input],
+                    dim=dim)
+
 
 # def Pad(signature, inputs):
 #     """
