@@ -62,7 +62,7 @@ class FxModuleParser:
 
     @staticmethod
     def parse(module: torch.fx.GraphModule,
-              input_shapes: Optional[Tuple[List[int],]] = None,
+              dummy_inputs: Optional[Any] = None,
               frame: Frame = None) \
             -> Tuple[List[IRFullTensor], List[IRFwOperation], List[IRFullTensor]]:
         """
@@ -74,22 +74,37 @@ class FxModuleParser:
 
         inputs = [node for node in module.graph.nodes if node.op == 'placeholder']
         print(f'inputs = {inputs}')
-        if input_shapes is not None and len(input_shapes) != len(inputs):
-            raise RuntimeError(f"Module {module.original_name} input shape mismatch (got {len(input_shapes)} != {len(inputs)})")
 
         ## shape propagation
+        from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp
+        KwargsShapeProp(module).propagate(dummy_inputs)
+        for node in module.graph.nodes:
+            if 'tensor_meta' in node.meta:
+                if node.meta['type'] is type(tuple()):
+                    print(f'{node.name} is tuple type')
+                elif node.meta['type'] is type(torch.fx.immutable_collections.immutable_dict()):
+                    print(f'{node.name} is immutable_dict type')
+                    assert isinstance(node.meta['tensor_meta'], dict)
+                else:
+                    assert node.meta['type'] is type(torch.Tensor()) or node.meta['type'] is type(torch.nn.parameter.Parameter())
+                    print(node.name, node.meta['tensor_meta'].dtype, node.meta['tensor_meta'].shape)
+            else:
+                print(f'{node.name} does not has tensor_meta')
+
+        # handle graph input -- some inputs could be None or not tensor
         default_dtype = torch.get_default_dtype()
         kDefaultType = DType2IRDType.map(default_dtype) # TODO specify dtype
-        sample_inputs = [torch.ones(shape, dtype=default_dtype) for shape in input_shapes]
-        from torch.fx.passes.shape_prop import ShapeProp
-        ShapeProp(module).propagate(*sample_inputs)
-        for node in module.graph.nodes:
-            print(node.name, node.meta['tensor_meta'].dtype, node.meta['tensor_meta'].shape)
-
-        # handle graph input -- Assuming all the inputs are tensors
+        # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding, extend to other input types
         for idx, input in enumerate(inputs):
             assert isinstance(input, torch.fx.Node)
-            shape = None if input_shapes is None else input_shapes[idx]
+            if hasattr(dummy_inputs, input.name):
+                print(f'dummy_inputs has {input.name}')
+                shape = getattr(dummy_inputs, input.name).size()# None if dummy_inputs is None else dummy_inputs[idx].size()
+            else:
+                # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is aligned with input.name
+                print(f'dummy_inputs does not have {input.name}')
+                shape = None
+            # FIXME: use the input's real dtype
             dtype = kDefaultType
             val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
             frame.add_var(input.name, val, graph_arg=idx)
