@@ -809,6 +809,19 @@ def TypeAs(signature, inputs):
 
     return IRDimops(TypeAs, 'type_as', signature, [anno], [input0, input1])
 
+def Triu(signature, inputs):
+    """
+    out = torch.triu(tensor, diagonal)
+    """
+    assert len(inputs) == 2
+    input, diagonal = inputs
+
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+
+    return IRDimops(Triu, 'triu', signature, [anno], [input],
+                    diagonal=diagonal)
 
 # def Pad(signature, inputs):
 #     """

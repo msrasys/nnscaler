@@ -67,6 +67,7 @@ class MLP(nn.Module):
         x = x.unsqueeze(1)
         x = self.drop_out(x)
         x = x.squeeze()
+        x = torch.triu(x, 1)
         # x = torch.nn.functional.dropout(x, self.p)
         # x = x * self.y
         loss = torch.sum(x)

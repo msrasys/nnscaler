@@ -62,6 +62,7 @@ class SignFx2Op:
         __ttemplate('squeeze'): function.Squeeze,
         __ttemplate('unsqueeze'): function.Unsqueeze,
         __tttemplate('type_as'): function.TypeAs,
+        __ttemplate('triu'): function.Triu,
 
         # # torch nn functional
         #
