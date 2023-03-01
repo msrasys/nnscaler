@@ -19,6 +19,8 @@ class IRAdapterPrim:
         for arg, val in kwargs.items():
             self.kwargs[arg] = val
         self.signature = None
+        # whether the primitive is happened locally
+        self.local: bool = False
 
     def input(self, idx:int):
         return self._inputs[idx]
@@ -64,6 +66,7 @@ class SpatialPrim(IRAdapterPrim):
     def __init__(self, inputs: List[IRSubTensor], outputs: List[IRSubTensor], **kwargs):
         super().__init__(inputs, outputs, **kwargs)
         self.device = list(set(t.device[0] for t in inputs))
+        self.local = True
 
     def volume(self) -> int:
         return 0
@@ -77,6 +80,7 @@ class ValuePrim(IRAdapterPrim):
     def __init__(self, inputs: List[IRSubTensor], outputs: List[IRSubTensor]):
         super().__init__(inputs, outputs)
         self.device = list(set(t.device[0] for t in inputs))
+        self.local = True
 
     def volume(self) -> int:
         return 0
@@ -93,6 +97,7 @@ class CommPrim(IRAdapterPrim):
         for t in list(itensors) + list(otensors):
             devices += t.device
         self.device = list(set(devices))
+        self.local = False
 
     def dispatch(self, devid: int) -> Optional[IRAdapterPrim]:
         """
