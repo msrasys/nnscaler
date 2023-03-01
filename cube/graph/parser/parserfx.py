@@ -309,7 +309,6 @@ class FxModuleParser:
         """
         # get signature
         fsig = FxModuleParser._get_qualified_name(node.target)
-        print(node.target, type(node.target))
         print(f'parse_prim_function_node: {fsig}')
 
         # get inputs
