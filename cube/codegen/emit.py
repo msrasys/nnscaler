@@ -157,12 +157,13 @@ class FuncEmission(CodeEmission):
 
         # only adapter that is non-differentiable can be executed as async
         async_op = CompileFlag.async_comm and (not node.differentiable)
-        for idx, prim in enumerate(prims):
-            if isinstance(prim, IRAdapterPrim) and prim.volume() == 0:
-                continue
-            break
-        #TODO: support more general cases: independent same-group primitives
-        async_op = False if len(prims[idx:]) != 1 else async_op
+        if async_op:
+            for idx, prim in enumerate(prims):
+                if isinstance(prim, IRAdapterPrim) and prim.volume() == 0:
+                    continue
+                break
+            #TODO: support more general cases: independent same-group primitives
+            async_op = False if len(prims[idx:]) != 1 else async_op
 
         for prim in prims:
             if len(prim.inputs()) == 1:
