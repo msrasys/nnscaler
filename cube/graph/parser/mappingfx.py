@@ -56,6 +56,8 @@ class SignFx2Op:
         __fcntemplate('linear'): function.Linear,
         __ftemplate('dropout') : function.Dropout,
         __ttemplate('sum'): function.Sum,
+        __ttemplate('squeeze'): function.Squeeze,
+        __ttemplate('unsqueeze'): function.Unsqueeze,
 
         # # torch nn functional
         #
