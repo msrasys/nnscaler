@@ -795,6 +795,20 @@ def Unsqueeze(signature, inputs):
     return IRDimops(Unsqueeze, 'unsqueeze', signature, [anno], [input],
                     dim=dim)
 
+def TypeAs(signature, inputs):
+    """
+    out = torch.Tensor.type_as(tensor0, tensor1)
+    """
+    assert len(inputs) == 2
+    input0, input1 = inputs
+
+    edim_in0 = ShapeAnno.create_shape_str(input0.shape)
+    edim_in1 = ShapeAnno.create_shape_str(input1.shape)
+    edim_ou = copy.copy(edim_in0)
+    anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
+
+    return IRDimops(TypeAs, 'type_as', signature, [anno], [input0, input1])
+
 
 # def Pad(signature, inputs):
 #     """

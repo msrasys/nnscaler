@@ -43,6 +43,9 @@ class SignFx2Op:
     # tensor template
     __ttemplate = lambda name: f'torch.{name}'
 
+    # torch.Tensor template
+    __tttemplate = lambda name: f'torch.Tensor.{name}'
+
     # runtime template
     __rtemplate = lambda name: f'cube.runtime.function.function.{name}'
 
@@ -58,6 +61,7 @@ class SignFx2Op:
         __ttemplate('sum'): function.Sum,
         __ttemplate('squeeze'): function.Squeeze,
         __ttemplate('unsqueeze'): function.Unsqueeze,
+        __tttemplate('type_as'): function.TypeAs,
 
         # # torch nn functional
         #

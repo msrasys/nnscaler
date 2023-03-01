@@ -63,6 +63,7 @@ class MLP(nn.Module):
         for layer in self.layers:
             x = layer(x)
         # x = self.layer_norm(x)
+        x = x.type_as(data)
         x = x.unsqueeze(1)
         x = self.drop_out(x)
         x = x.squeeze()
