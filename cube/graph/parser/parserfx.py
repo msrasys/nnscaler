@@ -319,7 +319,7 @@ class FxModuleParser:
                 var_name = input_node.name
                 val = frame.get_var(var_name)
                 input_vals.append(val)
-            elif isinstance(input_node, int):
+            elif isinstance(input_node, (int, float)):
                 input_vals.append(input_node)
             else:
                 input_vals.append(None)
@@ -368,7 +368,7 @@ class FxModuleParser:
                 var_name = input_node.name
                 val = frame.get_var(var_name)
                 input_vals.append(val)
-            elif isinstance(input_node, int):
+            elif isinstance(input_node, (int, float)):
                 input_vals.append(input_node)
             else:
                 input_vals.append(None)

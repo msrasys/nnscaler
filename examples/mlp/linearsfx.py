@@ -62,12 +62,15 @@ class MLP(nn.Module):
         x = data
         for layer in self.layers:
             x = layer(x)
+            x = torch.nn.functional.relu(x)
         # x = self.layer_norm(x)
         x = x.type_as(data)
         x = x.unsqueeze(1)
         x = self.drop_out(x)
         x = x.squeeze()
         x = torch.triu(x, 1)
+        # ne cannot backward
+        # x = torch.ne(x, 1.0)
         # x = torch.nn.functional.dropout(x, self.p)
         # x = x * self.y
         loss = torch.sum(x)

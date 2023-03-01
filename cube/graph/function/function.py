@@ -452,6 +452,14 @@ def SiLU(signature, inputs):
     return IRDimops(SiLU, 'silu', signature, annos, tensor)
 
 
+def ReLU(signature, inputs):
+    assert len(inputs) == 1
+    annos = ['* -> *']
+    signature = 'torch.nn.functional.relu'
+    tensor = inputs[0:1]
+    return IRDimops(ReLU, 'relu', signature, annos, tensor)
+
+
 def Softmax(signature, inputs):
     assert len(inputs) == 4
     annos = ['* -> *']
@@ -470,6 +478,21 @@ def Dropout(signature, inputs):
     p, training, inplace = inputs[1], inputs[2], inputs[3]
     return IRDimops(Dropout, 'dropout', signature, annos, tensor,
                     p=p, training=training, inplace=inplace)
+
+
+def NE(signature, inputs):
+    assert len(inputs) == 2
+    input0, input1 = inputs
+
+    edim_in0 = ShapeAnno.create_shape_str(input0.shape)
+    edim_ou = copy.copy(edim_in0)
+    if isinstance(input1, float):
+        anno = OpAnno.create_op_str([edim_in0], [edim_ou])
+        return IRDimops(NE, 'ne', signature, [anno], [input0], other=input1)
+    else:
+        edim_in1 = copy.copy(edim_in0)
+        anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
+        return IRDimops(NE, 'ne', signature, [anno], [input0], other=input1)
 
 
 def LayerNorm(signature, inputs):
