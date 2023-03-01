@@ -495,6 +495,31 @@ def NE(signature, inputs):
         return IRDimops(NE, 'ne', signature, [anno], [input0], other=input1)
 
 
+def NanToNum(signature, inputs):
+    assert len(inputs) == 1
+    annos = ['* -> *']
+    tensor = inputs[0:1]
+    return IRDimops(NanToNum, 'nan_to_num', signature, annos, tensor)
+
+
+def Long(signature, inputs):
+    assert len(inputs) == 1
+    annos = ['* -> *']
+    tensor = inputs[0:1]
+    return IRDimops(Long, 'long', signature, annos, tensor)
+
+
+def MaskedFill(signature, inputs):
+    assert len(inputs) == 3
+    input0, input1, value = inputs
+
+    edim_in0 = ShapeAnno.create_shape_str(input0.shape)
+    edim_in1 = ShapeAnno.create_shape_str(input1.shape)
+    edim_ou = copy.copy(edim_in0)
+    anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
+    return IRDimops(MaskedFill, 'masked_fill', signature, [anno], [input0, input1], value=value)
+
+
 def LayerNorm(signature, inputs):
     """
     torch.nn.functional.layer_norm(input, normliazed_shape, weight=None, bias=None, eps)

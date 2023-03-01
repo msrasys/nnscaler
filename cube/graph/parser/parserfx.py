@@ -408,12 +408,11 @@ class FxModuleParser:
         #     return func.__name__
         # TODO(yizhu1): find a general solution
         if isinstance(func, str):
-            if getattr(torch, func, None) is not None:
-                return f'torch.{func}'
-            elif getattr(torch.Tensor, func, None) is not None:
-                return f'torch.Tensor.{func}'
-            else:
-                raise RuntimeError(f'cannot find module for {func}')
+            for module, module_name in [(torch, 'torch'), (torch.Tensor, 'torch.Tensor')]:
+                lib_func = getattr(module, func, None)
+                if lib_func is not None and callable(lib_func):
+                    return f'{module_name}.{func}'
+            raise RuntimeError(f'cannot find module for {func}')
         name = func.__name__
         module = FxModuleParser._find_module_of_method(func)
         module = module.replace('torch._ops', 'torch.ops')  # WAR for bug in how torch.ops assigns module

@@ -49,6 +49,8 @@ class DTypeInferRule:
         # TODO(yizhu1): hack
         if node.signature == 'torch.ne':
             return IRDType.boolean
+        elif node.signature == 'torch.Tensor.long':
+            return IRDType.int64
         # in priority: fp32 > fp16 > bool > int64 > int16 >
         priority = [
             IRDType.float64, IRDType.float32, IRDType.float16,
