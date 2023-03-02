@@ -64,10 +64,12 @@ class SignFx2Op:
         __tttemplate('type_as'): function.TypeAs,
         __ttemplate('triu'): function.Triu,
         __ftemplate('relu') : function.ReLU,
+        __ttemplate('eq') : function.EQ,
         __ttemplate('ne') : function.NE,
         __ttemplate('nan_to_num') : function.NanToNum,
         __tttemplate('long'): function.Long,
         __ttemplate('masked_fill'): function.MaskedFill,
+        __ttemplate('cumsum'): function.CumSum,
 
         # # torch nn functional
         #

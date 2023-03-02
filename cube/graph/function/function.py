@@ -480,6 +480,21 @@ def Dropout(signature, inputs):
                     p=p, training=training, inplace=inplace)
 
 
+def EQ(signature, inputs):
+    assert len(inputs) == 2
+    input0, input1 = inputs
+
+    edim_in0 = ShapeAnno.create_shape_str(input0.shape)
+    edim_ou = copy.copy(edim_in0)
+    if isinstance(input1, float):
+        anno = OpAnno.create_op_str([edim_in0], [edim_ou])
+        return IRDimops(EQ, 'eq', signature, [anno], [input0], other=input1)
+    else:
+        edim_in1 = copy.copy(edim_in0)
+        anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
+        return IRDimops(EQ, 'eq', signature, [anno], [input0], other=input1)
+
+
 def NE(signature, inputs):
     assert len(inputs) == 2
     input0, input1 = inputs
@@ -843,6 +858,7 @@ def Unsqueeze(signature, inputs):
     return IRDimops(Unsqueeze, 'unsqueeze', signature, [anno], [input],
                     dim=dim)
 
+
 def TypeAs(signature, inputs):
     """
     out = torch.Tensor.type_as(tensor0, tensor1)
@@ -856,6 +872,7 @@ def TypeAs(signature, inputs):
     anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
 
     return IRDimops(TypeAs, 'type_as', signature, [anno], [input0, input1])
+
 
 def Triu(signature, inputs):
     """
@@ -873,6 +890,24 @@ def Triu(signature, inputs):
 
     return IRDimops(Triu, 'triu', signature, [anno], [input],
                     diagonal=diagonal)
+
+
+def CumSum(signature, inputs):
+    """
+    out = torch.cumsum(tensor, dim)
+    """
+    assert len(inputs) == 2
+    input, dim = inputs
+    assert isinstance(dim, int)
+
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_in[dim] += '^'
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+
+    return IRDimops(CumSum, 'cumsum', signature, [anno], [input],
+                    dim=dim)
+
 
 # def Pad(signature, inputs):
 #     """

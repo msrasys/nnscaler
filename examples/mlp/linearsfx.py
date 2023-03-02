@@ -74,6 +74,8 @@ class MLP(nn.Module):
         # x = torch.ne(x, 1.0)
         # x = torch.nn.functional.dropout(x, self.p)
         # x = x * self.y
+        x = torch.cumsum(x, -1)
+        # y = torch.eq(x, 1.0)
         loss = torch.sum(x)
         # long cannot backward
         # loss = loss.long()
