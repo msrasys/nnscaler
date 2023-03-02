@@ -452,6 +452,14 @@ def SiLU(signature, inputs):
     return IRDimops(SiLU, 'silu', signature, annos, tensor)
 
 
+def ReLU(signature, inputs):
+    assert len(inputs) == 1
+    annos = ['* -> *']
+    signature = 'torch.nn.functional.relu'
+    tensor = inputs[0:1]
+    return IRDimops(ReLU, 'relu', signature, annos, tensor)
+
+
 def Softmax(signature, inputs):
     assert len(inputs) == 4
     annos = ['* -> *']
@@ -470,6 +478,46 @@ def Dropout(signature, inputs):
     p, training, inplace = inputs[1], inputs[2], inputs[3]
     return IRDimops(Dropout, 'dropout', signature, annos, tensor,
                     p=p, training=training, inplace=inplace)
+
+
+def NE(signature, inputs):
+    assert len(inputs) == 2
+    input0, input1 = inputs
+
+    edim_in0 = ShapeAnno.create_shape_str(input0.shape)
+    edim_ou = copy.copy(edim_in0)
+    if isinstance(input1, float):
+        anno = OpAnno.create_op_str([edim_in0], [edim_ou])
+        return IRDimops(NE, 'ne', signature, [anno], [input0], other=input1)
+    else:
+        edim_in1 = copy.copy(edim_in0)
+        anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
+        return IRDimops(NE, 'ne', signature, [anno], [input0], other=input1)
+
+
+def NanToNum(signature, inputs):
+    assert len(inputs) == 1
+    annos = ['* -> *']
+    tensor = inputs[0:1]
+    return IRDimops(NanToNum, 'nan_to_num', signature, annos, tensor)
+
+
+def Long(signature, inputs):
+    assert len(inputs) == 1
+    annos = ['* -> *']
+    tensor = inputs[0:1]
+    return IRDimops(Long, 'long', signature, annos, tensor)
+
+
+def MaskedFill(signature, inputs):
+    assert len(inputs) == 3
+    input0, input1, value = inputs
+
+    edim_in0 = ShapeAnno.create_shape_str(input0.shape)
+    edim_in1 = ShapeAnno.create_shape_str(input1.shape)
+    edim_ou = copy.copy(edim_in0)
+    anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
+    return IRDimops(MaskedFill, 'masked_fill', signature, [anno], [input0, input1], value=value)
 
 
 def LayerNorm(signature, inputs):
@@ -795,6 +843,36 @@ def Unsqueeze(signature, inputs):
     return IRDimops(Unsqueeze, 'unsqueeze', signature, [anno], [input],
                     dim=dim)
 
+def TypeAs(signature, inputs):
+    """
+    out = torch.Tensor.type_as(tensor0, tensor1)
+    """
+    assert len(inputs) == 2
+    input0, input1 = inputs
+
+    edim_in0 = ShapeAnno.create_shape_str(input0.shape)
+    edim_in1 = ShapeAnno.create_shape_str(input1.shape)
+    edim_ou = copy.copy(edim_in0)
+    anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
+
+    return IRDimops(TypeAs, 'type_as', signature, [anno], [input0, input1])
+
+def Triu(signature, inputs):
+    """
+    out = torch.triu(tensor, diagonal)
+    """
+    assert len(inputs) == 2
+    input, diagonal = inputs
+
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    assert len(edim_in) >= 2
+    edim_in[-1] += '^'
+    edim_in[-2] += '^'
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+
+    return IRDimops(Triu, 'triu', signature, [anno], [input],
+                    diagonal=diagonal)
 
 # def Pad(signature, inputs):
 #     """
