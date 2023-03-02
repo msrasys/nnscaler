@@ -81,16 +81,16 @@ class MLP(nn.Module):
 
 
 def train():
-    batch_size = 128
-    dim = 8192
+    batch_size = 32
+    dim = 1024
 
     model = MLP(dim=dim)
     model = cube.SemanticModel(
-        model, input_shapes=([batch_size, dim], [batch_size, dim]),
+        model, input_shapes=([batch_size, dim, dim], [batch_size, dim, dim]),
     )
 
     dataloader = cube.runtime.syndata.SynDataLoader(
-        shapes=([batch_size, dim], [batch_size, dim],),
+        shapes=([batch_size, dim, dim], [batch_size, dim, dim],),
         dtypes=(torch.float32, torch.bool,),
         batch_dims=(0, 0,)
     )

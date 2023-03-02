@@ -689,13 +689,14 @@ class IRGraph(IRSegment):
             f"Find node is not IRFwOperation or IRDataOperation: {node}"
         assert all(node in self._nodes for node in nodes), \
             f"Exist node is not in graph nodes"
-        starts = tuple(self._nodes.index(node) for node in nodes)
+        starts = list(self._nodes.index(node) for node in nodes)
         assert len(starts) > 0
 
         # multiref (created by graph.auto_multiref) will be moved to the next stage (if possible) for optimization
         for sid in range(len(starts)):
             while starts[sid] > 0:
-                if self.node(starts[sid]-1).name == 'multiref':
+                node = self.node(starts[sid]-1)
+                if node.name == 'multiref' or isinstance(node, IRGraphAnchor):
                     starts[sid] -= 1
                     continue
                 break

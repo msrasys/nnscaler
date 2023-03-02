@@ -865,6 +865,9 @@ def Triu(signature, inputs):
     input, diagonal = inputs
 
     edim_in = ShapeAnno.create_shape_str(input.shape)
+    assert len(edim_in) >= 2
+    edim_in[-1] += '^'
+    edim_in[-2] += '^'
     edim_ou = copy.copy(edim_in)
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
 
