@@ -91,6 +91,8 @@ class FxModuleParser:
             else:
                 print(f'{node.name} does not has tensor_meta')
 
+        # return
+
         # handle graph input -- some inputs could be None or not tensor
         default_dtype = torch.get_default_dtype()
         kDefaultType = DType2IRDType.map(default_dtype) # TODO specify dtype
@@ -129,6 +131,7 @@ class FxModuleParser:
         # handle nodes
         all_ir_nodes: List[IRFwOperation] = list()
         for node in module.graph.nodes:
+            print('zql handle node: ', node, node.op, node.meta)
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
             all_ir_nodes += ir_nodes
 
@@ -376,6 +379,10 @@ class FxModuleParser:
 
     @staticmethod
     def parse_prim_method_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
+        print('zql: ', node, node.__dir__())
+        print('zql: ', node.args, node.kwargs)
+        print('zql: ', type(node.args[0]))
+        print('zql: ', node.args[0].name, node.args[0].op, node.args[0].meta)
         # get signature
         fsig = FxModuleParser._get_qualified_name(node.target)
         print(f'parse_prim_method_node: {fsig}')
