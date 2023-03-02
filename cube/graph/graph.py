@@ -7,11 +7,11 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Sequence, Set, Union, Tuple, List, Optional, Dict
+from typing import Sequence, Set, Union, Tuple, List, Optional, Dict, Any
 import warnings
 import copy
 
-from cube.ir.cten import IRTensor, IRCell
+from cube.ir.cten import IRTensor, IRCell, IRObject
 from cube.ir.unique import IDGenerator
 from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
@@ -59,7 +59,7 @@ class IRGraph(IRSegment):
         """
         return self.forward(*args)
     
-    def forward(self, *args: Tuple[IRSubTensor]) -> Union[IRTensor, Tuple[IRTensor]]:
+    def forward(self, *args: Tuple[Any]) -> Union[IRTensor, Tuple[IRTensor]]:
         """
         forward will divide the graph into Actions according to
         node device assignment
@@ -72,7 +72,7 @@ class IRGraph(IRSegment):
         @return outputs Union[IRSubTensor, Tuple[IRSubTensor]]
         """
         # align graph with input tensors
-        itensors: Tuple[IRSubTensor, ...] = self.inputs()
+        itensors: Tuple[IRObject, ...] = self.inputs()
         assert len(args) == len(itensors)
         for idx, (itensor, arg) in enumerate(zip(itensors, args)):
             self.set_input(idx, arg)
@@ -226,7 +226,7 @@ class IRGraph(IRSegment):
 
     @staticmethod
     def from_logic_graph(nodes: List[IRCell],
-                         inputs: List[IRFullTensor], outputs: List[IRFullTensor],
+                         inputs: List[IRObject], outputs: List[IRObject],
                          module_name: str):
         """
         Generate IRGraph from logical graph (IRFullTensor)

@@ -3,6 +3,7 @@ import enum
 import re
 from typing import Any, List, Tuple, Optional
 
+from cube.ir.cten import IRObject
 from cube.ir.operator import IRFwOperation
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.ir.tensor import IRFullTensor
@@ -61,7 +62,7 @@ class ScriptModuleParser:
                 dtype = ir.IRDType.unknown # kDefaultType
                 val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.debugName())
             else:
-                raise NotImplementedError("Graph inputs only accepts Tensor")
+                val = IRObject(name=input.debugName())
             frame.add_var(input.debugName(), val, graph_arg=idx)
         input_val = [frame.get_var(input.debugName()) for input in inputs]
 

@@ -369,7 +369,7 @@ class ModuleCodeGen(FuncEmission):
         Emit batch size declare
         """
         signature = 'self.set_batch_size({bs})'
-        bs = [t.shape[dim] for t, dim in zip(node.outputs(), node.get_batch_dims())]
+        bs = [t.shape[dim] for t, dim in zip(node.outputs(), node.get_batch_dims()) if dim is not None]
         bs = set(bs)
         if len(bs) > 1:
             warnings.warn(f'Find Heterogenous batch size {bs}. Keep output to be same with semantic dataloder.')

@@ -9,46 +9,46 @@ import warnings
 
 class CubeDataLoader:
     r"""
-    Cube Dataloader
+    Cube Dataloader.
+    User should provide a dataloader to runtime with at least these functionalities:
+
+    1) `__iter__()`: get the dataloder iterator
+    2) `__next__()` get the next batch of data
+    3) `get_batch_size()` return the batch size (int)
+    4) `set_batch_size(bs)` reset the batch size (int)
+    5) `get_batch_dims(self)` get the batch dimension of each output data
     """
-    def __init__(self, shapes: Tuple[List[int]], dtypes: Tuple[torch.dtype], batch_dims: Tuple[int] = None):
+    def __init__(self, batch_size: int, batch_dims: Tuple[Optional[int]]):
         """
-        shapes Tuple[Tuple[int]]:
-            The shape for each data
-        dtypes Tuple[torch.dtype]:
-            The dtype for each data
-        batch_dims Tuple[int]:
-            The batch dimension of each data
+        Create a dataloader for cube runtime
+
+        @param batch_size int: dataloader batch size
+        @param batch_dims Tuple[Optional[int]]: the batch dimension of each output data,
+            None indicates the output (tensor or non-tensor) doesn't have the batch dimension.
         """
-        if not all(isinstance(shape, list) for shape in shapes):
-            raise TypeError("Expected each shape in shapes to be a list")
-        if len(shapes) != len(batch_dims) or len(shapes) != len(dtypes):
-            raise TypeError("Expected number batch dim and dtypes to len(shapes)")
-        self.shapes = tuple([list(shape) for shape in shapes])
-        self.dtypes = dtypes
-        self.batch_dims = (0,) * len(self.shapes) if batch_dims is None else batch_dims
-        bs = [shape[dim] for shape, dim in zip(self.shapes, self.batch_dims)]
-        assert len(set(bs)) == 1, f"Expect batch size same in each data shapes"
-        self.batch_size = bs[0]
+        self.batch_size: int = batch_size
+        self.batch_dims: Tuple[Optional[int]] = batch_dims
+
+    def __iter__(self):
+        raise NotImplementedError("Required implementation for derived class")
+
+    def __next__(self):
+        return NotImplementedError("Required implementation for derived class")
 
     def get_batch_size(self) -> int:
         """
         get batch size
         """
-        all_batch_size = set([shape[dim] for shape, dim in zip(self.shapes, self.batch_dims)])
-        if len(all_batch_size) != 1:
-            raise ValueError("Heterogenous batch size in dataloader")
-        return list(all_batch_size)[0]
+        return self.batch_size
 
     def set_batch_size(self, batch_size: int):
         """
         set batch size
         """
-        self.batch_size = batch_size
-        for shape, dim in zip(self.shapes, self.batch_dims):
-            shape[dim] = batch_size
-        rank = 0 if not torch.distributed.is_initialized() else torch.distributed.get_rank()
-        print(f'rank [{rank}]: > set batch size to {batch_size}. dataloader outputs change to: {self.shapes}')
+        return NotImplementedError("Required implementation for derived class")
+    
+    def get_batch_dims(self) -> Tuple[Optional[int]]:
+        return tuple(self.batch_dims)
 
 
 class SciLoopVariables(CubeDataLoader):
@@ -64,8 +64,7 @@ class SciLoopVariables(CubeDataLoader):
             else:
                 shapes.append([1,])
                 dtypes.append(type(var))
-        batch_dims = [-1] * (len(variables) + len(constants))
-        super().__init__(shapes, dtypes, batch_dims)
+        super().__init__(0, [None] * len(shapes))
         self.variables = list()
         self.constants = list()
         for var in variables:
@@ -136,8 +135,10 @@ class SynDataLoader(CubeDataLoader):
             batch_dims = tuple([0] * len(shapes))
         if dtypes is None:
             dtypes = tuple([torch.float] * len(shapes))
-
-        super().__init__(shapes, dtypes, batch_dims)
+        self.shapes = tuple([list(shape) for shape in shapes])
+        self.dtypes = dtypes
+        batch_size = shapes[0][batch_dims[0]]
+        super().__init__(batch_size, batch_dims)
         self.names = names
         self.append_args=append_args
         self.device = device if device else torch.cuda.current_device()
@@ -151,7 +152,6 @@ class SynDataLoader(CubeDataLoader):
     def __next__(self):
         if self.names:
             assert len(self.names) == len(self.buffer)
-            print(f'### named_syn_data')
             return dict(zip(self.names, self.buffer)).update(self.append_args)
         else:
             return self.buffer
@@ -182,7 +182,10 @@ class SynDataLoader(CubeDataLoader):
             self.buffer = datas[0] if len(datas) == 1 else datas
 
     def set_batch_size(self, batch_size: int):
-        super().set_batch_size(batch_size)
+        self.batch_size = batch_size
+        for shape, dim in zip(self.shapes, self.batch_dims):
+            shape[dim] = batch_size
+        rank = 0 if not torch.distributed.is_initialized() else torch.distributed.get_rank()
+        print(f'rank [{rank}]: > set batch size to {batch_size}. dataloader outputs change to: {self.shapes}')
         datas = self.random_sample()
         self.set_output(datas)
-
