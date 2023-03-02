@@ -58,15 +58,25 @@ class MLP(nn.Module):
         self.drop_out = nn.Dropout()
         # self.y = torch.nn.Parameter(torch.empty(128, last_dim))
 
-    def forward(self, data):
-        x = data
+    def forward(self, data, mask):
+        x = data.masked_fill(mask, 0.0)
         for layer in self.layers:
             x = layer(x)
+            x = torch.nn.functional.relu(x)
         # x = self.layer_norm(x)
+        x = x.type_as(data)
+        x = x.unsqueeze(1)
         x = self.drop_out(x)
+        x = x.squeeze()
+        x = torch.triu(x, 1)
+        x = torch.nan_to_num(x)
+        # ne cannot backward
+        # x = torch.ne(x, 1.0)
         # x = torch.nn.functional.dropout(x, self.p)
         # x = x * self.y
         loss = torch.sum(x)
+        # long cannot backward
+        # loss = loss.long()
         return loss
 
 
@@ -76,19 +86,19 @@ def train():
 
     model = MLP(dim=dim)
     model = cube.SemanticModel(
-        model, input_shapes=([batch_size, dim],),
+        model, input_shapes=([batch_size, dim], [batch_size, dim]),
     )
 
     dataloader = cube.runtime.syndata.SynDataLoader(
-        shapes=([batch_size, dim],),
-        dtypes=(torch.float32,),
-        batch_dims=(0,)
+        shapes=([batch_size, dim], [batch_size, dim],),
+        dtypes=(torch.float32, torch.bool,),
+        batch_dims=(0, 0,)
     )
 
     @cube.compile(model, dataloader, PAS=PAS, load_content=False)
     def train_iter(model, dataloader):
-        data = next(dataloader)
-        loss = model(data)
+        data, mask = next(dataloader)
+        loss = model(data, mask)
         loss.backward()
 
     model = model.get_gen_module()
