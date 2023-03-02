@@ -123,7 +123,7 @@ class SynDataLoader(CubeDataLoader):
     for given shapes, dtypes.
     """
     def __init__(self, shapes: Tuple[List[int]], dtypes: Tuple[torch.dtype] = None,
-                 batch_dims: Tuple[int] = None, names: Tuple[str] = None, append_args=None, device=torch.cuda.current_device()):
+                 batch_dims: Tuple[int] = None, names: Tuple[str] = None, append_args=None, device=None):
         """
         shapes Tuple[Tuple[int]]:
             The shape for each data
@@ -139,9 +139,8 @@ class SynDataLoader(CubeDataLoader):
 
         super().__init__(shapes, dtypes, batch_dims)
         self.names = names
-        print(f'### SynDataLoader.names = {names}')
         self.append_args=append_args
-        self.device = device
+        self.device = device if device else torch.cuda.current_device()
         self.buffer: Union[torch.Tensor, Tuple[torch.Tensor]] = None
         datas = self.random_sample()
         self.set_output(datas)
