@@ -123,7 +123,7 @@ class SynDataLoader(CubeDataLoader):
     for given shapes, dtypes.
     """
     def __init__(self, shapes: Tuple[List[int]], dtypes: Tuple[torch.dtype] = None,
-                 batch_dims: Tuple[int] = None):
+                 batch_dims: Tuple[int] = None, names: Tuple[str] = None, append_args=None, device=torch.cuda.current_device()):
         """
         shapes Tuple[Tuple[int]]:
             The shape for each data
@@ -138,6 +138,11 @@ class SynDataLoader(CubeDataLoader):
             dtypes = tuple([torch.float] * len(shapes))
 
         super().__init__(shapes, dtypes, batch_dims)
+        self.names = names
+        print(f'### SynDataLoader.names = {names}')
+        self.append_args=append_args
+        self.device = device
+        self.buffer: Union[torch.Tensor, Tuple[torch.Tensor]] = None
         datas = self.random_sample()
         self.set_output(datas)
 
@@ -145,7 +150,12 @@ class SynDataLoader(CubeDataLoader):
         return self
 
     def __next__(self):
-        return self.buffer
+        if self.names:
+            assert len(self.names) == len(self.buffer)
+            print(f'### named_syn_data')
+            return dict(zip(self.names, self.buffer)).update(self.append_args)
+        else:
+            return self.buffer
 
     def random_sample(self) -> Tuple[torch.Tensor]:
         torch.manual_seed(0)
@@ -154,8 +164,14 @@ class SynDataLoader(CubeDataLoader):
             datas.append(
                 torch.rand(
                     shape,
-                    device=torch.cuda.current_device(),
+                    device=self.device,
                     requires_grad=False).to(dtype)
+                if torch.is_floating_point(torch.zeros([1], dtype=dtype)) else
+                torch.ones(
+                    shape,
+                    device=self.device,
+                    requires_grad=False
+                ).to(dtype)
             )
         return tuple(datas)
     

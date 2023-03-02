@@ -63,6 +63,7 @@ class FxModuleParser:
     @staticmethod
     def parse(module: torch.fx.GraphModule,
               input_shapes: Optional[Tuple[List[int],]] = None,
+              dummy_input = None,
               frame: Frame = None) \
             -> Tuple[List[IRFullTensor], List[IRFwOperation], List[IRFullTensor]]:
         """
@@ -75,21 +76,41 @@ class FxModuleParser:
         inputs = [node for node in module.graph.nodes if node.op == 'placeholder']
         print(f'inputs = {inputs}')
         if input_shapes is not None and len(input_shapes) != len(inputs):
-            raise RuntimeError(f"Module {module.original_name} input shape mismatch (got {len(input_shapes)} != {len(inputs)})")
+            print(f'module(type = {type(module)}.__dict__.keys() = {module.__dict__.keys()}')
+            print(f'input shape mismatch (got {len(input_shapes)} != {len(inputs)})')
+            # TODO fixme raise RuntimeError(f"Module {module.original_name} input shape mismatch (got {len(input_shapes)} != {len(inputs)})")
 
         ## shape propagation
         default_dtype = torch.get_default_dtype()
         kDefaultType = DType2IRDType.map(default_dtype) # TODO specify dtype
-        sample_inputs = [torch.ones(shape, dtype=default_dtype) for shape in input_shapes]
+        sample_inputs = dummy_input if dummy_input else [torch.ones(shape, dtype=default_dtype) for shape in input_shapes]
+        sample_input_tensors = [sample_inputs[input] for input in sample_inputs] if type(sample_inputs) is dict else sample_inputs
+
         from torch.fx.passes.shape_prop import ShapeProp
-        ShapeProp(module).propagate(*sample_inputs)
+        ShapeProp(module).propagate(*sample_input_tensors)  # TODO fixme ShapeProp(module).propagate(*sample_inputs)
+
+        # for node in module.graph.nodes:
+        #     print(node.name, node.meta['tensor_meta'].dtype, node.meta['tensor_meta'].shape)
         for node in module.graph.nodes:
-            print(node.name, node.meta['tensor_meta'].dtype, node.meta['tensor_meta'].shape)
+            print(f'node.name = {node.name}')
+            if hasattr(node, 'meta') and node.meta.get('tensor_meta') is not None:
+                if node.name == 'output':
+                    print('pause here')
+                if not hasattr(node.meta['tensor_meta'], 'dtype'):
+                    for per_output_meta in node.meta['tensor_meta']:
+                        if isinstance(per_output_meta, torch.fx.passes.shape_prop.TensorMetadata):
+                            print(node.name, '-sub-output', per_output_meta.dtype, per_output_meta.shape)
+                        else:
+                            print(f'ERROR: skip {node.name}\'s non TensorMetadata sub-output')
+                else:
+                    print(node.name, node.meta['tensor_meta'].dtype, node.meta['tensor_meta'].shape)
+            else:
+                print(f'ERROR: none tensor_meta of Node {node.name}')
 
         # handle graph input -- Assuming all the inputs are tensors
         for idx, input in enumerate(inputs):
             assert isinstance(input, torch.fx.Node)
-            shape = None if input_shapes is None else input_shapes[idx]
+            shape = None if (input_shapes is None or len(input_shapes) <= idx) else input_shapes[idx]
             dtype = kDefaultType
             val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
             frame.add_var(input.name, val, graph_arg=idx)
@@ -99,12 +120,16 @@ class FxModuleParser:
         activation_op_strs = {'call_function', 'output', 'call_method'}
         activation_nodes = [node for node in module.graph.nodes if node.op in activation_op_strs]
         for node in activation_nodes:
-            assert isinstance(node, torch.fx.Node)
-            shape = node.meta['tensor_meta'].shape
-            shape = FxModuleParser.shape_refine(shape)
-            dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
-            val = IRFullTensor(shape=shape, requires_grad=True, dtype=dtype, name=node.name)
-            frame.add_var(node.name, val)
+            if hasattr(node, 'meta') and node.meta.get('tensor_meta') and hasattr(node.meta['tensor_meta'], 'dtype'):
+                shape = node.meta['tensor_meta'].shape
+                shape = FxModuleParser.shape_refine(shape)
+                dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
+                val = IRFullTensor(shape=shape, requires_grad=True, dtype=dtype, name=node.name)
+                frame.add_var(node.name, val)
+            else:
+                print(f'WARNING: creation of no-shaped activation for {node.name}')
+                val = IRFullTensor(shape=[1], requires_grad=True, dtype=ir.int32, name=node.name)  # TODO fixme
+                frame.add_var(node.name, val)
 
         # handle nodes
         all_ir_nodes: List[IRFwOperation] = list()

@@ -120,7 +120,7 @@ class SemanticDataLoader:
 
 class SemanticModel:
 
-    def __init__(self, model: Optional[torch.nn.Module], input_shapes=None):
+    def __init__(self, model: Optional[torch.nn.Module], input_shapes=None, dummy_input=None):
         """
         Create semantic model based on AI Scientist description.
 
@@ -131,6 +131,7 @@ class SemanticModel:
             assert isinstance(model, torch.nn.Module), f"device of local_rank == 0 must provide model"
         self.model = model
         self.input_shapes = None
+        self.dummy_input = dummy_input
         self.ir_graph = None
         self._loaded_module: CubeModule = None
         self._save_content = True
@@ -176,7 +177,7 @@ class SemanticModel:
             if DeviceGroup().local_rank == 0:
                 if self.ir_graph is None:
                     self.ir_graph = parser.convert_model(
-                        self.model, input_shapes=input_shapes, save_content=self.save_content
+                        self.model, input_shapes=input_shapes, dummy_input=self.dummy_input, save_content=self.save_content
                     )
                     self.input_shapes = input_shapes
                 else:
