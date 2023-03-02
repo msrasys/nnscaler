@@ -27,10 +27,13 @@ def convert_model(model: torch.nn.Module,
                 smodule: torch.fx.GraphModule = torch.fx.GraphModule(model, traced_graph)
                 smodule.graph.print_tabular()
             else:
-                print(f'input_shapes = {input_shapes}, {type(input_shapes)}')
-                print(f'dummy_input = {dummy_input}, {type(dummy_input)}')
                 with torch.no_grad():
-                    output_origin = model(**dummy_input)
+                    if isinstance(dummy_input, tuple):
+                        output_origin = model(*dummy_input)
+                    elif isinstance(dummy_input, dict):
+                        output_origin = model(**dummy_input)
+                    else:
+                        raise RuntimeError(f'Unknown dummy_input = {dummy_input}')
                 traced_model, _ = concrete_trace(
                     model,
                     dummy_input,
