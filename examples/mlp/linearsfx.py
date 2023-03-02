@@ -60,6 +60,7 @@ class MLP(nn.Module):
 
     def forward(self, data, mask):
         x = data.masked_fill(mask, 0.0)
+        x = x.fill_(0.0)
         for layer in self.layers:
             x = layer(x)
             x = torch.nn.functional.relu(x)

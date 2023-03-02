@@ -68,6 +68,7 @@ class SignFx2Op:
         __ttemplate('ne') : function.NE,
         __ttemplate('nan_to_num') : function.NanToNum,
         __tttemplate('long'): function.Long,
+        __ttemplate('fill_'): function.Fill,
         __ttemplate('masked_fill'): function.MaskedFill,
         __ttemplate('cumsum'): function.CumSum,
 

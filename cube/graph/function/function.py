@@ -524,6 +524,16 @@ def Long(signature, inputs):
     return IRDimops(Long, 'long', signature, annos, tensor)
 
 
+def Fill(signature, inputs):
+    assert len(inputs) == 2
+    input, value = inputs
+
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(Fill, 'fill', signature, [anno], [input], value=value)
+
+
 def MaskedFill(signature, inputs):
     assert len(inputs) == 3
     input0, input1, value = inputs
