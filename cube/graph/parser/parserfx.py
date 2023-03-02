@@ -101,7 +101,7 @@ class FxModuleParser:
                 print(f'dummy_inputs has {input.name}')
                 shape = getattr(dummy_inputs, input.name).size()# None if dummy_inputs is None else dummy_inputs[idx].size()
             else:
-                # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is aligned with input.name
+                # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
                 print(f'dummy_inputs does not have {input.name}')
                 shape = None
             # FIXME: use the input's real dtype
@@ -110,15 +110,21 @@ class FxModuleParser:
             frame.add_var(input.name, val, graph_arg=idx)
         input_val = [frame.get_var(input.name) for input in inputs]
 
-        # add activations to frame, including call_func output and final output
-        activation_nodes = [node for node in module.graph.nodes if (node.op == 'call_function' or node.op == 'output')]
+        # add activations to frame, including call_func/call_method output and final output
+        activation_op_strs = {'call_function', 'output', 'call_method'}
+        activation_nodes = [node for node in module.graph.nodes if node.op in activation_op_strs]
         for node in activation_nodes:
-            assert isinstance(node, torch.fx.Node)
-            shape = node.meta['tensor_meta'].shape
-            shape = FxModuleParser.shape_refine(shape)
-            dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
-            val = IRFullTensor(shape=shape, requires_grad=True, dtype=dtype, name=node.name)
-            frame.add_var(node.name, val)
+            if hasattr(node, 'meta') and node.meta.get('tensor_meta') and hasattr(node.meta['tensor_meta'], 'dtype'):
+                assert isinstance(node, torch.fx.Node)
+                shape = node.meta['tensor_meta'].shape
+                shape = FxModuleParser.shape_refine(shape)
+                dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
+                val = IRFullTensor(shape=shape, requires_grad=True, dtype=dtype, name=node.name)
+                frame.add_var(node.name, val)
+            else:
+                print(f'WARNING: creation of no-shaped activation for {node.name}')
+                val = IRFullTensor(shape=[1], requires_grad=True, dtype=ir.int32, name=node.name)  # TODO fixme
+                frame.add_var(node.name, val)
 
         # handle nodes
         all_ir_nodes: List[IRFwOperation] = list()
@@ -367,6 +373,34 @@ class FxModuleParser:
         return [ir_node]
 
     @staticmethod
+    def parse_prim_method_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
+        # get signature
+        fsig = FxModuleParser._get_qualified_name(node.target)
+        print(f'parse_prim_method_node: {fsig}')
+
+        # get inputs
+        input_nodes = [input_node for input_node in node.args]
+        input_vals = list()
+        for index, input_node in enumerate(input_nodes):
+            if isinstance(input_node, torch.fx.Node):
+                var_name = input_node.name
+                val = frame.get_var(var_name)
+                input_vals.append(val)
+            elif isinstance(input_node, int):
+                input_vals.append(input_node)
+            else:
+                input_vals.append(None)
+
+        # map to IR operator
+        ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
+
+        output_name = node.name
+        output_val = frame.get_var(output_name)
+        ir_node.set_output(0, output_val)
+
+        return [ir_node]
+
+    @staticmethod
     def parse_prim_attr_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
         assert node is not None
         tensor_name = node.name
@@ -390,6 +424,9 @@ class FxModuleParser:
         # # things like getattr just appear in builtins
         # if getattr(builtins, func.__name__, None) is func:
         #     return func.__name__
+        if isinstance(func, str):
+            # TODO(yizhu1): find a general solution
+            return f'torch.{func}'
         name = func.__name__
         module = FxModuleParser._find_module_of_method(func)
         module = module.replace('torch._ops', 'torch.ops')  # WAR for bug in how torch.ops assigns module
