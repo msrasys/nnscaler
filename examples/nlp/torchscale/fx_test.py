@@ -74,49 +74,50 @@ print(f'device = {device}')
 for key in dummy_input.keys():
     dummy_input[key] = dummy_input[key].to(device)
 print("creating dummy input succeed")
-print(f'dummy_input = {dummy_input}, {type(dummy_input)}')
 dummy_input['features_only'] = False
 dummy_input['return_all_hiddens'] = False
 print(f'dummy_input = {dummy_input}, {type(dummy_input)}')
 
+# create input as list of tensors/objects
+dummy_input_list = [val for key, val in dict(dummy_input).items()]
+print(f'dummy_input_list = {dummy_input_list}')
+
 with torch.no_grad():
-    output_origin = model(**dummy_input)
+    # output_origin = model(**dummy_input)
+    output_origin = model(*dummy_input_list)
+    # print(f'output_origin = {output_origin}')
 
 
 input_shapes = [list(dummy_input[input].size()) for input in dummy_input if isinstance(dummy_input[input], torch.Tensor)]
 input_dtypes = [dummy_input[input].dtype for input in dummy_input if isinstance(dummy_input[input], torch.Tensor)]
 input_names = tuple([input for input in dummy_input if isinstance(dummy_input[input], torch.Tensor)])
-print(f'input_shapes(out) = {input_shapes}, {type(input_shapes)}, {type(input_shapes[0])}')
+
+input_shapes += [[None], [None]]
+input_dtypes += [bool, bool]
+
+print(f'input_shapes = {input_shapes}')
 print(f'input_dtypes = {input_dtypes}')
-kwargs_keys = [input for input in dummy_input if not isinstance(dummy_input[input], torch.Tensor)]
-kwargs = dict()
-for key in kwargs_keys:
-    kwargs[key] = dummy_input[key]
-print(f'kwargs = {kwargs}')
-# model = cube.SemanticModel(
-#     model, input_shapes=(input_shapes,),
-# )
-model = cube.SemanticModel(
-     model, dummy_input=dummy_input,
-)
 
 dataloader = cube.runtime.syndata.SynDataLoader(
     shapes=(input_shapes),
     dtypes=input_dtypes,
-    batch_dims=(0,0,0),
-    names=input_names,
-    append_args=kwargs
+    batch_dims=(0,0,0, None, None),
 )
-print(f'next(dataloader) = {next(dataloader)}')
+sample_input = next(dataloader)
+print(f'next(dataloader) = {sample_input}')
+sample_input_cpu = tuple([val.to(device) if isinstance(val, torch.Tensor) else val for val in sample_input])
+
+model = cube.SemanticModel(
+     model, dummy_input=sample_input_cpu,
+)
 
 @cube.compile(model, dataloader, PAS=PAS, load_content=False)
 def train_iter(model, dataloader):
     data = next(dataloader)
-    # loss = model({'src_tokens':data[0],'src_lengths':data[1],'prev_output_tokens':data[2], })
     loss = model(*data)
     loss.backward()
 
-
+train_iter(model, dataloader)
 
 # Conduct concrete trace below
 # sys.path.append('/home/v-junliang/torchscaletest/nni')

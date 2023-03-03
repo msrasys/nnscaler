@@ -20,6 +20,7 @@ def convert_model(model: torch.nn.Module,
     try:
         if CompileFlag.use_torchfx:
             if not dummy_input:
+                print('using torch.fx tracer')
                 from torch.fx import symbolic_trace
                 # Symbolic tracing frontend - captures the semantics of the module
                 tracer = FxFuncOpTracer()
@@ -27,13 +28,14 @@ def convert_model(model: torch.nn.Module,
                 smodule: torch.fx.GraphModule = torch.fx.GraphModule(model, traced_graph)
                 smodule.graph.print_tabular()
             else:
+                print('using concrete tracer')
                 with torch.no_grad():
                     if isinstance(dummy_input, tuple):
                         output_origin = model(*dummy_input)
-                    elif isinstance(dummy_input, dict):
-                        output_origin = model(**dummy_input)
+                    elif isinstance(dummy_input, torch.Tensor):
+                        output_origin = model(dummy_input)
                     else:
-                        raise RuntimeError(f'Unknown dummy_input = {dummy_input}')
+                        raise RuntimeError(f'dummy_input should be a tuple = {dummy_input}')
                 traced_model, _ = concrete_trace(
                     model,
                     dummy_input,
@@ -43,9 +45,9 @@ def convert_model(model: torch.nn.Module,
                         type(output_origin): ((), False),
                     },
                 )
-                print(f'type(traced_model = {type(traced_model)}')
                 traced_model.graph.print_tabular()
         else:
+            print('using torchscript tracer')
             smodule = torch.jit.script(model)
 
     except Exception as ex:
