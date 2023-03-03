@@ -71,6 +71,7 @@ class SignFx2Op:
         __ttemplate('fill_'): function.Fill,
         __ttemplate('masked_fill'): function.MaskedFill,
         __ttemplate('cumsum'): function.CumSum,
+        __ftemplate('layer_norm'): function.LayerNorm,
 
         # # torch nn functional
         #
@@ -89,8 +90,6 @@ class SignFx2Op:
         # __ttemplate('silu') : function.SiLU,
         #
         # __ftemplate('_pad'): function.Pad,
-        #
-        # __ftemplate('layer_norm'): function.LayerNorm,
         #
         # __ftemplate('embedding'): function.Embedding,
         #

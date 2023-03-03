@@ -551,6 +551,7 @@ def LayerNorm(signature, inputs):
     cube.runtime.function.layer_norm(input, weight, bias, normliazed_shape, eps)
     """
     if 'torch.' in signature:
+        print(inputs)
         tensor, normalized_shape, weight, bias, eps = inputs
         assert isinstance(normalized_shape, list), f"normalized_shape for layer_norm can only be List[int]"
     else:

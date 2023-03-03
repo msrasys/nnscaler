@@ -320,9 +320,14 @@ class FxModuleParser:
                 val = frame.get_var(var_name)
                 input_vals.append(val)
             elif isinstance(input_node, (int, float)):
+                # kw scalar args
                 input_vals.append(input_node)
             else:
                 input_vals.append(None)
+
+        if 'layer_norm' in fsig:
+            print(input_nodes)
+            print(frame._vars)
 
         # map to IR operator
         ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
