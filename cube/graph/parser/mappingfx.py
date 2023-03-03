@@ -25,6 +25,12 @@ class SignFx2Op:
             # return partial(function.UnkownOperator, signature=signature)
 
     @staticmethod
+    def exist(signature: str) -> bool:
+        if 'torch.' not in signature and 'cube.runtime.' not in signature:
+            signature = signature.split('.')[-1]
+        return signature in SignFx2Op.kOpMap
+
+    @staticmethod
     def register(signature: str, op: Callable[..., Union[IRFwOperation, int, float]], code):
         """
         Register an operator
@@ -68,6 +74,7 @@ class SignFx2Op:
         __ttemplate('nan_to_num') : function.NanToNum,
         __tttemplate('long'): function.Long,
         __ttemplate('masked_fill'): function.MaskedFill,
+        __ftemplate('embedding'): function.Embedding,
 
         # # torch nn functional
         #
@@ -103,7 +110,8 @@ class SignFx2Op:
         # __ttemplate('rand'): function.Rand,
         # __ttemplate('clone'): function.Clone,
         #
-        # __ttemplate('add') : function.Add,
+        __ttemplate('add') : function.Add,
+        'add': function.Add,
         #
         # __ttemplate('sub') : function.Sub,
         #

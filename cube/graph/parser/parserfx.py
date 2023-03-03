@@ -5,14 +5,14 @@ from typing import Any, List, Tuple, Optional, Callable
 
 from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor
+from cube.ir.cten import IRObject
 import cube.ir as ir
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.mapping import DType2IRDType
 from cube.graph.parser.mappingfx import SignFx2Op
+from cube.graph.function.pyfunc import IRPyFunc
 
 import torch.fx
-
-global_not_supported = set()
 
 class ErasedDevice:
     pass
@@ -132,19 +132,15 @@ class FxModuleParser:
                 val = IRFullTensor(shape=shape, requires_grad=True, dtype=dtype, name=node.name)
                 frame.add_var(node.name, val)
             else:
-                print(f'WARNING: creation of no-shaped activation for {node.name}')
-                val = IRFullTensor(shape=[1], requires_grad=True, dtype=ir.int32, name=node.name)  # TODO fixme
-                frame.add_var(node.name, val)
+                frame.add_var(node.name, IRObject())
 
         # handle nodes
         all_ir_nodes: List[IRFwOperation] = list()
         for node in module.graph.nodes:
-            # print('zql handle node: ', node, node.op, node.meta)
+            print('zql handle node: ', node, node.op, node.meta)
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
             all_ir_nodes += ir_nodes
-        
-        print(global_not_supported)
-        return
+
         # handle outputs
         output_nodes = [node.all_input_nodes for node in module.graph.nodes if node.op == 'output']
         print(f'outputs = {output_nodes}')
@@ -210,7 +206,6 @@ class FxModuleParser:
 
     @staticmethod
     def parse_node(node: torch.fx.Node, module, frame: Frame) -> List[IRFwOperation]:
-        # print("### parse_node {}".format(node))
         """
         Parse the node and return the IRFwOperation nodes
         """
@@ -342,34 +337,33 @@ class FxModuleParser:
         """
         # get signature
         fsig = FxModuleParser._get_qualified_name_of_call_function(node.target)
-        # print(f'parse_prim_function_node: {fsig}')
+        print(f'parse_prim_function_node: {fsig}')
 
-        # # get inputs
-        # input_nodes = [input_node for input_node in node.args]
-        # input_vals = list()
-        # for index, input_node in enumerate(input_nodes):
-        #     if isinstance(input_node, torch.fx.Node):
-        #         var_name = input_node.name
-        #         val = frame.get_var(var_name)
-        #         input_vals.append(val)
-        #     elif isinstance(input_node, (int, float)):
-        #         input_vals.append(input_node)
-        #     else:
-        #         input_vals.append(None)
+        # get inputs
+        assert len(node.kwargs) == 0
+        input_nodes = [input_node for input_node in node.args]
+        input_vals = list()
+        for _, input_node in enumerate(input_nodes):
+            if isinstance(input_node, torch.fx.Node):
+                var_name = input_node.name
+                val = frame.get_var(var_name)
+                input_vals.append(val)
+            elif isinstance(input_node, (int, float, str)) or input_node is None:
+                input_vals.append(input_node)
+            else:
+                raise RuntimeError(f'Unsupported input node {input_node}, {type(input_node)} in parse function!')
 
         # map to IR operator
-        if fsig in SignFx2Op.kOpMap:
-            # ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
-            ir_node = None
+        if SignFx2Op.exist(fsig):
+            ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
         else:
-            print(f'Function {fsig} has not been supported yet!')
-            global_not_supported.add(fsig)
-            ir_node = None
+            assert 'torch.' not in fsig, f'{fsig} is not supported'
+            ir_node = IRPyFunc(fsig, input_vals, [None])
 
         # TODO gracefully set output
         output_name = node.name
         output_val = frame.get_var(output_name)
-        # ir_node.set_output(0, output_val)
+        ir_node.set_output(0, output_val)
 
         # # push output in the frame
         # # help: >>> a = torch._C.TupleType([torch._C.TensorType.getInferred()])
@@ -401,7 +395,7 @@ class FxModuleParser:
         # print('zql: ', node.args[0].name, node.args[0].op, node.args[0].meta)
         # get signature
         fsig = FxModuleParser._get_qualified_name_of_call_method(node.target, node)
-        # print(f'parse_prim_method_node: {fsig}')
+        print(f'parse_prim_method_node: {fsig}')
 
         # get inputs
         input_nodes = [input_node for input_node in node.args]
@@ -417,16 +411,15 @@ class FxModuleParser:
                 input_vals.append(None)
 
         # map to IR operator
-        if fsig in SignFx2Op.kOpMap:
+        if SignFx2Op.exist(fsig):
             ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
         else:
-            print(f'Method {fsig} has not been supported yet!')
-            global_not_supported.add(fsig)
-            ir_node = None
+            assert 'torch.' not in fsig, f'{fsig} is not supported'
+            ir_node = IRPyFunc(fsig, input_vals, [None])
 
         output_name = node.name
         output_val = frame.get_var(output_name)
-        # ir_node.set_output(0, output_val)
+        ir_node.set_output(0, output_val)
 
         return [ir_node]
 
@@ -444,8 +437,10 @@ class FxModuleParser:
             ir_tensor.as_param()
             frame.add_var(tensor_name, ir_tensor)
         else:
-            print(f'attr {node.op} has not been supported yet!')
-            global_not_supported.add(node.op)
+            # FIXME: why no need to record the constant value of this var?
+            # the value can be obtained below:
+            # var = FxModuleParser.fetch_attr(module, node.target)
+            frame.add_var(tensor_name, IRObject())
 
         return list()
 
