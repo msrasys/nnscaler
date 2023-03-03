@@ -5,10 +5,12 @@ from typing import Any, List, Tuple, Optional
 
 from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor
+from cube.ir.cten import IRObject
 import cube.ir as ir
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.mapping import DType2IRDType
 from cube.graph.parser.mappingfx import SignFx2Op
+from cube.graph.function.pyfunc import IRPyFunc
 
 import torch.fx
 
@@ -127,9 +129,7 @@ class FxModuleParser:
                 val = IRFullTensor(shape=shape, requires_grad=True, dtype=dtype, name=node.name)
                 frame.add_var(node.name, val)
             else:
-                print(f'WARNING: creation of no-shaped activation for {node.name}')
-                val = IRFullTensor(shape=[1], requires_grad=True, dtype=ir.int32, name=node.name)  # TODO fixme
-                frame.add_var(node.name, val)
+                frame.add_var(node.name, IRObject())
 
         # handle nodes
         all_ir_nodes: List[IRFwOperation] = list()
@@ -328,9 +328,7 @@ class FxModuleParser:
     def parse_prim_function_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
         """
         parse node like:
-            Tensor = prim::CallFunction(%5, %input.1, %3, %4)
-            %5 : Function = prim::Constant[name="linear"]()
-            %12 : (Tensor, Tensor) = prim::CallFunction(%5, %x1.1, %x2.1)
+            %add : [#users=2] = call_function[target=operator.add](args = (%x, %x), kwargs = {})
         """
         # get signature
         fsig = FxModuleParser._get_qualified_name(node.target)
@@ -350,7 +348,20 @@ class FxModuleParser:
                 input_vals.append(None)
 
         # map to IR operator
-        ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
+        if SignFx2Op.exist(fsig):
+            ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
+        else:
+            # case1: unknown torch operator
+            if FxModuleParser._is_torch_autograd_op(node, frame):
+                print(f'>>> Find unkown pytorch operation: {fsig}')
+                fname = fsig.split('.')[-1] if '.' in fsig else fname
+                ir_node = IRFwOperation(fname, fsig, len(input_vals), 1)
+                for idx, t in enumerate(input_vals):
+                    ir_node.set_input(idx, t)
+            # case2: python runtime function
+            else:
+                print(f'>>> Set python runtime function: {fsig}')
+                ir_node = IRPyFunc(fsig, input_vals, [None])
 
         # TODO gracefully set output
         output_name = node.name
@@ -399,7 +410,20 @@ class FxModuleParser:
                 input_vals.append(None)
 
         # map to IR operator
-        ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
+        if SignFx2Op.exist(fsig):
+            ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
+        else:
+            # case1: unknown torch operator
+            if FxModuleParser._is_torch_autograd_op(node, frame):
+                print(f'>>> Find unkown pytorch operation: {fsig}')
+                fname = fsig.split('.')[-1] if '.' in fsig else fname
+                ir_node = IRFwOperation(fname, fsig, len(input_vals), 1)
+                for idx, t in enumerate(input_vals):
+                    ir_node.set_input(idx, t)
+            # case2: python runtime function
+            else:
+                print(f'>>> Set python runtime function: {fsig}')
+                ir_node = IRPyFunc(fsig, input_vals, [None])
 
         output_name = node.name
         output_val = frame.get_var(output_name)
@@ -454,3 +478,12 @@ class FxModuleParser:
             if getattr(guess, name, None) is orig_method:
                 return guess.__name__
         raise RuntimeError(f'cannot find module for {orig_method}')
+    
+    @staticmethod
+    def _is_torch_autograd_op(node: torch.fx.Node, frame: Frame) -> bool:
+        """Check whether the node is of a pytorch autograd operation."""
+        signature: str = FxModuleParser._get_qualified_name(node.target)
+        # note: some python operations like torch.Tensor.size() doesn't return
+        # an IRTensor, thus cannot be considered as a pytorch autograd operator.
+        return signature.startswith('torch.') and \
+               isinstance(frame.get_var(node.name), IRFullTensor)
