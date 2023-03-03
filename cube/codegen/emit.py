@@ -1,6 +1,6 @@
 from typing import Generator, Iterable, List, Any, Optional, Tuple
 
-from cube.ir.cten import IRCell, IRTensor
+from cube.ir.cten import IRCell, IRTensor, IRObject
 from cube.ir.dtype import IRDType
 from cube.ir.tensor import IRSubTensor
 from cube.ir.operator import IRDataOperation, IRFwOperation
@@ -39,7 +39,7 @@ class CodeEmission:
 
         @return str
         """
-        if isinstance(tensor, IRTensor):
+        if isinstance(tensor, IRObject):
             tensor_name = tensor.name
             if '.' in tensor_name:
                 tensor_name = tensor_name.split('.')[0]

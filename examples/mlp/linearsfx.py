@@ -87,15 +87,25 @@ def train():
     batch_size = 32
     dim = 1024
 
-    model = MLP(dim=dim)
-    model = cube.SemanticModel(
-        model, input_shapes=([batch_size, dim, dim], [batch_size, dim, dim]),
-    )
-
     dataloader = cube.runtime.syndata.SynDataLoader(
         shapes=([batch_size, dim, dim], [batch_size, dim, dim],),
         dtypes=(torch.float32, torch.bool,),
         batch_dims=(0, 0,)
+    )
+
+    model = MLP(dim=dim)
+
+    # shape based input (will trigger standard torch.fx.Tracer)
+    # model = cube.SemanticModel(
+    #     model, input_shapes=([batch_size, dim, dim], [batch_size, dim, dim]),
+    # )
+
+    # dummy based input (will trigger concrete Tracer)
+    device = next(model.parameters()).device
+    dummy_input = next(dataloader)
+    dummy_input = tuple([input.to(device) for input in dummy_input])
+    model = cube.SemanticModel(
+        model, dummy_input=dummy_input,
     )
 
     @cube.compile(model, dataloader, PAS=PAS, load_content=False)
