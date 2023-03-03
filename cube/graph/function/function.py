@@ -45,6 +45,14 @@ def BatchLinear(signature, inputs):
     return IRDimops(BatchLinear, 'bmm', signature, annos, inputs)
 
 
+def BMMAdd(signature, inputs):
+    assert len(inputs) == 3
+    annos = [
+        'b m n, b m k^, b k^ n -> b m n'
+    ]
+    return IRDimops(BMMAdd, 'baddbmm', signature, annos, inputs)
+
+
 def Matmul(signature, inputs: Tuple[IRTensor, IRTensor]):
     assert len(inputs) == 2
     annos = [
@@ -461,12 +469,22 @@ def ReLU(signature, inputs):
 
 
 def Softmax(signature, inputs):
-    assert len(inputs) == 4
+    assert len(inputs) >= 1
     annos = ['* -> *']
     tensor = inputs[0:1]
-    dim, _stacklevel, dtype = inputs[1], inputs[2], inputs[3]
-    return IRDimops(Softmax, 'softmax', signature, annos, tensor,
-                    dim=dim, _stacklevel=_stacklevel, dtype=dtype)
+    if len(inputs) == 2:
+        if isinstance(inputs[1], dict):
+            return IRDimops(Softmax, 'softmax', signature, annos, tensor, **inputs[1])
+        elif isinstance(inputs[1], int):
+            return IRDimops(Softmax, 'softmax', signature, annos, tensor, dim=inputs[1])
+        else:
+            raise RuntimeError(f'Unexpect intput type {inputs[1]}, {type(inputs[1])}')
+    elif len(inputs) == 4:
+        dim, _stacklevel, dtype = inputs[1], inputs[2], inputs[3]
+        return IRDimops(Softmax, 'softmax', signature, annos, tensor,
+                        dim=dim, _stacklevel=_stacklevel, dtype=dtype)
+    else:
+        raise RuntimeError('Unexpected input num {inputs}')
 
 
 def Dropout(signature, inputs):
@@ -836,6 +854,25 @@ def Reshape(signature, inputs):
     ArgumentMissing error may be raised during codegen.""")
 
     return View(signature, inputs)
+
+
+def Permute(signature, inputs):
+    if isinstance(inputs[1], list):
+        in_tensor, dims = inputs[0], inputs[1]
+    else:
+        in_tensor, dims = inputs[0], inputs[1:]
+    edim_in = ShapeAnno.create_shape_str(in_tensor.shape)
+    for idx, dim in enumerate(dims):
+        if idx != dim:
+            edim_in[idx] += '^'
+    assert len(edim_in) == len(dims), f'{len(edim_in)} vs {len(dims)}'
+    edim_ou = []
+    for dim in dims:
+        assert isinstance(dim, int)
+        edim_ou.append(copy.copy(edim_in[dim]))
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(Permute, 'permute', signature, [anno], [in_tensor], dims=dims)
+
 
 def Squeeze(signature, inputs):
     """

@@ -337,22 +337,26 @@ class FxModuleParser:
         print(f'parse_prim_function_node: {fsig}')
 
         # get inputs
-        input_nodes = [input_node for input_node in node.args]
-        input_vals = list()
-        for index, input_node in enumerate(input_nodes):
-            if isinstance(input_node, torch.fx.Node):
-                var_name = input_node.name
-                val = frame.get_var(var_name)
-                input_vals.append(val)
-            elif isinstance(input_node, (int, float)):
-                # kw scalar args
-                input_vals.append(input_node)
+        def extract_val(fx_node):
+            if isinstance(fx_node, torch.fx.Node):
+                var_name = fx_node.name
+                return frame.get_var(var_name)
+            elif isinstance(fx_node, (int, float)):
+                # scalar args
+                return fx_node
+            elif fx_node is None:
+                return None
             else:
-                input_vals.append(None)
+                raise RuntimeError(f'Unsupported input node {fx_node}, {type(fx_node)}')
 
-        if 'layer_norm' in fsig:
-            print(input_nodes)
-            print(frame._vars)
+        input_vals = list()
+        for item in node.args:
+            input_vals.append(extract_val(item))
+        if node.kwargs:
+            input_kwvals = {}
+            for k, v in node.kwargs.items():
+                input_kwvals[k] = extract_val(v)
+            input_vals.append(input_kwvals)
 
         # map to IR operator
         ir_node = SignFx2Op.map(fsig)(inputs=input_vals)

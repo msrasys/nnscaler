@@ -71,6 +71,15 @@ class SignFx2Op:
         __ttemplate('fill_'): function.Fill,
         __ttemplate('masked_fill'): function.MaskedFill,
         __ttemplate('cumsum'): function.CumSum,
+        __ttemplate('tanh'): function.Tanh,
+        __ftemplate('softmax') : function.Softmax,
+        __ttemplate('bmm') : function.BatchLinear,
+        __ttemplate('pow'): function.Pow,
+        __ttemplate('baddbmm'): function.BMMAdd,
+        __ttemplate('permute'): function.Permute,
+        __ttemplate('transpose'): function.Transpose,
+
+        # TODO
         __ftemplate('layer_norm'): function.LayerNorm,
 
         # # torch nn functional
@@ -78,10 +87,6 @@ class SignFx2Op:
         # __ftemplate('linear') : function.Linear,
         #
         # __ttemplate('matmul'): function.Matmul,
-        #
-        # __ftemplate('softmax') : function.Softmax,
-        #
-        # __ftemplate('dropout') : function.Dropout,
         #
         # __ftemplate('gelu') : function.GeLU,
         # __ttemplate('gelu') : function.GeLU,
@@ -122,20 +127,12 @@ class SignFx2Op:
         # __ttemplate('ge'): function.CompareGE,
         # __ttemplate('le'): function.CompareLE,
         #
-        # __ttemplate('pow'): function.Pow,
-        #
         # __ttemplate('sin'): function.Sin,
         #
         # __ttemplate('cos'): function.Cos,
         #
-        # __ttemplate('tanh'): function.Tanh,
-        #
-        # __ttemplate('bmm') : function.BatchLinear,
-        #
         # __ttemplate('sum') : function.Sum,
         # __ttemplate('mean') : function.Mean,
-        #
-        # __ttemplate('transpose') : function.Transpose,
         #
         # __ttemplate('view'): function.View,
         #
