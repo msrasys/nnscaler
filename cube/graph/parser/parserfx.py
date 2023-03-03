@@ -64,7 +64,8 @@ class FxModuleParser:
 
     @staticmethod
     def parse(module: torch.fx.GraphModule,
-              dummy_inputs: Optional[Any] = None,
+              input_shapes: Optional[Tuple[List[int],]] = None,
+              dummy_inputs = None,
               frame: Frame = None) \
             -> Tuple[List[IRFullTensor], List[IRFwOperation], List[IRFullTensor]]:
         """
@@ -80,9 +81,11 @@ class FxModuleParser:
         # remove dead nodes
         from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
         DCEHandler(module).eliminate_dead_code()
+
         # shape propagation
         from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp
         KwargsShapeProp(module).propagate(dummy_inputs)
+
         for node in module.graph.nodes:
             if 'tensor_meta' in node.meta:
                 if node.meta['type'] is type(tuple()):

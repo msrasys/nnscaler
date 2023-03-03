@@ -665,7 +665,7 @@ def View(signature, inputs):
     if -1 in ou_shape:
         idx = ou_shape.index(-1)
         ou_shape[idx] = cnt // (-nele(ou_shape))
-    assert nele(in_shape) == nele(ou_shape), "shape mismatch"
+    assert nele(in_shape) == nele(ou_shape), f"shape mismatch: {in_shape}, {ou_shape}"
 
     # generate annotation
     rest_inshape = [dimlen for dimlen in in_shape]
@@ -778,7 +778,7 @@ def View(signature, inputs):
     def view_modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
         kwargs = dict(**kwargs)
         ofirst = [bracket[0] for bracket in ou_anno]
-        identifier = in_anno[idx][0]
+        identifier = in_anno[dim][0]
         oidx = ofirst.index(identifier)
         size = list(kwargs['size'])
         size[oidx] = size[oidx] // num

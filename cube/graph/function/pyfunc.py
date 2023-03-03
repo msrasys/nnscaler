@@ -1,8 +1,7 @@
-from typing import List, Optional, Tuple, Any
-import itertools
+from typing import Tuple
 
 from cube.ir.operator import IRFwOperation
-from cube.ir.cten import IRTensor
+from cube.ir.cten import IRObject
 
 
 class IRPyFunc(IRFwOperation):
@@ -11,7 +10,7 @@ class IRPyFunc(IRFwOperation):
     """
 
     def __init__(self, signature: str, 
-                 inputs: Tuple[Any], outputs: Tuple[Any], **kwargs):
+                 inputs: Tuple[IRObject], outputs: Tuple[IRObject], **kwargs):
         name = signature.split('.')[-1]
         super().__init__(name, signature, len(inputs), len(outputs))
         for idx, t in enumerate(inputs):

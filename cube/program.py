@@ -1,6 +1,6 @@
 from typing import List, Tuple, Optional
 
-from cube.ir.cten import IRCell, IRTensor
+from cube.ir.cten import IRCell, IRTensor, IRObject
 from cube.ir.tensor import IRFullTensor, IRSubTensor
 from cube.ir.operator import IRBpOperation, IRDataOperation
 
@@ -82,11 +82,14 @@ class SemanticDataLoader:
             raise TypeError("Expected data loader derived from CubeDataLoader")
         self.dataloader: CubeDataLoader = iter(dataloader)
         dtype_map = DType2IRDType
-        self.dtypes = [dtype_map.map(dtype) for dtype in dataloader.dtypes]
-        self.shapes = [list(shape) for shape in dataloader.shapes]
+        sample = next(dataloader)
+        if not isinstance(sample, tuple):
+            sample = (sample,)
+        self.dtypes = [dtype_map.map(t.dtype) if torch.is_tensor(t) else None for t in sample]
+        self.shapes = [list(t.shape) if torch.is_tensor(t) else None for t in sample]
 
-    def get_batch_dims(self) -> Tuple[int]:
-        return tuple(self.dataloader.batch_dims)
+    def get_batch_dims(self) -> Tuple[Optional[int]]:
+        return tuple(self.dataloader.get_batch_dims())
 
     def get_batch_size(self) -> int:
         return self.dataloader.get_batch_size()
@@ -101,9 +104,12 @@ class SemanticDataLoader:
     def __next__(self):
         outputs = list()
         for dtype, shape in zip(self.dtypes, self.shapes):
-            data = IRFullTensor(
-                shape, 'data', requires_grad=False, dtype=dtype
-            ).tosub()
+            if shape is not None:
+                data = IRFullTensor(
+                    shape, 'data', requires_grad=False, dtype=dtype
+                ).tosub()
+            else:
+                data = IRObject('data')
             outputs.append(data)
 
         data_op = IRDataOperation(
@@ -120,7 +126,7 @@ class SemanticDataLoader:
 
 class SemanticModel:
 
-    def __init__(self, model: Optional[torch.nn.Module], input_shapes=None):
+    def __init__(self, model: Optional[torch.nn.Module], input_shapes=None, dummy_input=None):
         """
         Create semantic model based on AI Scientist description.
 
@@ -131,6 +137,7 @@ class SemanticModel:
             assert isinstance(model, torch.nn.Module), f"device of local_rank == 0 must provide model"
         self.model = model
         self.input_shapes = None
+        self.dummy_input = dummy_input
         self.ir_graph = None
         self._loaded_module: CubeModule = None
         self._save_content = True
@@ -171,12 +178,12 @@ class SemanticModel:
         if self._loaded_module:
             return self._loaded_module(*args)
         else:
-            assert all(isinstance(t, IRSubTensor) for t in args), f"Only support tensors as model inputs"
-            input_shapes = [tuple(t.shape) for t in args]
+            # assert all(isinstance(t, IRSubTensor) for t in args), f"Only support tensors as model inputs"
+            input_shapes = [tuple(t.shape) if isinstance(t, IRTensor) else None for t in args]
             if DeviceGroup().local_rank == 0:
                 if self.ir_graph is None:
                     self.ir_graph = parser.convert_model(
-                        self.model, input_shapes=input_shapes, save_content=self.save_content
+                        self.model, input_shapes=input_shapes, dummy_input=self.dummy_input, save_content=self.save_content
                     )
                     self.input_shapes = input_shapes
                 else:
