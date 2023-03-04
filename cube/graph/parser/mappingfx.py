@@ -73,7 +73,8 @@ class SignFx2Op:
         __ttemplate('ne') : function.NE,
         __ttemplate('nan_to_num') : function.NanToNum,
         __tttemplate('long'): function.Long,
-        __ttemplate('masked_fill'): function.MaskedFill,
+        # __ttemplate('masked_fill'): function.MaskedFill,
+        __ftemplate('embedding'): function.Embedding,
 
         # # torch nn functional
         #
@@ -110,7 +111,6 @@ class SignFx2Op:
         # __ttemplate('clone'): function.Clone,
         #
         __ttemplate('add') : function.Add,
-        'add': function.Add,
         #
         # __ttemplate('sub') : function.Sub,
         #
