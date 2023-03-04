@@ -1,11 +1,11 @@
 import torch
 import enum
 import re
-from typing import Any, List, Tuple, Optional, Callable
+from typing import Any, List, Tuple, Optional, Callable, Union
 
 from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor
-from cube.ir.cten import IRObject
+from cube.ir.cten import IRObject, IRCell
 import cube.ir as ir
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.mapping import DType2IRDType
@@ -153,20 +153,7 @@ class FxModuleParser:
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
             all_ir_nodes += ir_nodes
 
-        # handle outputs
-        output_nodes = [node.all_input_nodes for node in module.graph.nodes if node.op == 'output']
-        print(f'outputs = {output_nodes}')
-        output_var_name = [output.name for output in [item for sublist in output_nodes for item in sublist]]
-        output_val = [frame.get_var(var_name) for var_name in output_var_name]
-
-        # flatten output_val
-        outputs = list()
-        for val in output_val:
-            if isinstance(val, list):
-                outputs += val
-            else:
-                outputs.append(val)
-        output_val = outputs
+        output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
 
         frame.pop_var()
         frame.pop_attr()
@@ -202,7 +189,7 @@ class FxModuleParser:
             if node_type == FxNodeKind.Placeholder:
                 return []
             if node_type == FxNodeKind.Output:
-                return []
+                return FxModuleParser.parse_prim_output_node(node, module, frame)
 
             if node_type in (FxNodeKind.PrimCallFunction, FxNodeKind.PrimCallMethod):
                 return FxModuleParser.parse_prim_function_method(node, module, frame)
@@ -274,17 +261,20 @@ class FxModuleParser:
         if SignFx2Op.exist(fsig):
             ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
         else:
+            input_vals = [extract_val(v) for v in node.args]
+            kwargs = {key: extract_val(v) for key, v in node.kwargs.items()}
             # case1: unknown torch operator
             if FxModuleParser._is_torch_autograd_op(node, frame, fsig):
                 print(f'>>> Find unkown pytorch operation: {fsig}')
                 fname = fsig.split('.')[-1] if '.' in fsig else fname
                 ir_node = IRFwOperation(fname, fsig, len(input_vals), 1)
+                ir_node.kwargs = kwargs
                 for idx, t in enumerate(input_vals):
                     ir_node.set_input(idx, t)
             # case2: python runtime function
             else:
                 print(f'>>> Set python runtime function: {fsig}')
-                ir_node = IRPyFunc(fsig, input_vals, [None])
+                ir_node = IRPyFunc(fsig, input_vals, [None], **kwargs)
 
         # TODO gracefully set output
         output_name = node.name
@@ -315,6 +305,40 @@ class FxModuleParser:
 
         return list()
 
+    @staticmethod
+    def parse_prim_output_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRCell]:
+        assert len(node.args) == 1 and len(node.kwargs) == 0
+        ir_nodes = []
+
+        # handle complex outputs
+        def generate_outputs(val: Any, _ops: List) -> IRObject:
+            """Support complex data type of List, Tuple, Dict, Tensor/Object"""
+            if isinstance(val, list):
+                inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
+                output = IRObject()
+                _ops.append(IRPyFunc('(lambda *args: list(args))', inputs, [output]))
+                return output
+            if isinstance(val, tuple):
+                inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
+                output = IRObject()
+                _ops.append(IRPyFunc('(lambda *args: args)', inputs, [output]))
+                return output
+            if isinstance(val, dict):
+                output = IRObject()
+                assert all(not isinstance(key, torch.fx.Node) for key in val.keys()), f"output dict cannot have torch.fx.Node is key"
+                keys = tuple(str(key) for key in val.keys())
+                values = generate_outputs(tuple(generate_outputs(value, _ops) for value in val.values()), _ops)
+                _ops.append(IRPyFunc('(lambda vals, keys: {key:val for key,val in zip(keys,vals)})', [values], [output], keys=keys))
+                return output
+            if isinstance(val, torch.fx.Node):
+                return frame.get_var(val.name)
+            return val
+
+        generate_outputs(node.args[0], ir_nodes)
+        if len(ir_nodes) > 0:
+            ir_nodes[-1].set_output(0, frame.get_var(node.name))
+        return ir_nodes
+
     # # NOTE: this is a function in torch.fx
     # @staticmethod
     # def _get_qualified_name(func: Callable[..., Any]) -> str:
@@ -333,7 +357,7 @@ class FxModuleParser:
     #     return f'{module}.{name}'
 
     @staticmethod
-    def _get_qualified_name(node_target: str | Callable[..., Any], node: torch.fx.Node = None) -> str:
+    def _get_qualified_name(node_target: Union[str, Callable[..., Any]], node: torch.fx.Node = None) -> str:
         if isinstance(node_target, str):
             assert node is not None
             return FxModuleParser._get_qualified_name_of_call_method(node_target, node)
