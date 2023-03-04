@@ -756,8 +756,6 @@ def View(signature, inputs):
         for hdim in range(len(bracket)):
             if bracket[hdim] == '1': continue
             sdim = bracket[hdim]
-            ospatial.add(bracket[hdim])
-            ofirst.append(bracket[hdim])
             break
         if sdim is not None:
             ospatial.add(sdim)

@@ -44,7 +44,7 @@ print("parsing fx graph to cube graph...")
 from cube.graph.parser import FxModuleParser
 # dummy_inputs = [inputs.input_ids, None, inputs.attention_mask, None, None, None, None, None, None, None, {}]
 # FxModuleParser.parse(traced_graph, dummy_inputs)
-FxModuleParser.parse(traced_graph, inputs)
+FxModuleParser.parse(traced_graph, dummy_inputs=inputs)
 print("parsing done.")
 
 # AutoDist
