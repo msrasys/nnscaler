@@ -470,18 +470,28 @@ def ReLU(signature, inputs):
 
 def Softmax(signature, inputs):
     assert len(inputs) >= 1
-    annos = ['* -> *']
-    tensor = inputs[0:1]
+    tensor = inputs[0]
+    edim_in = ShapeAnno.create_shape_str(tensor.shape)
     if len(inputs) == 2:
         if isinstance(inputs[1], dict):
-            return IRDimops(Softmax, 'softmax', signature, annos, tensor, **inputs[1])
+            edim_in[inputs[1]['dim']] += '^'
+            edim_ou = copy.copy(edim_in)
+            anno = OpAnno.create_op_str([edim_in], [edim_ou])
+            return IRDimops(Softmax, 'softmax', signature, [anno], [tensor], **inputs[1])
         elif isinstance(inputs[1], int):
-            return IRDimops(Softmax, 'softmax', signature, annos, tensor, dim=inputs[1])
+            dim = inputs[1]
+            edim_in[dim] += '^'
+            edim_ou = copy.copy(edim_in)
+            anno = OpAnno.create_op_str([edim_in], [edim_ou])
+            return IRDimops(Softmax, 'softmax', signature, [anno], [tensor], dim=inputs[1])
         else:
             raise RuntimeError(f'Unexpect intput type {inputs[1]}, {type(inputs[1])}')
     elif len(inputs) == 4:
         dim, _stacklevel, dtype = inputs[1], inputs[2], inputs[3]
-        return IRDimops(Softmax, 'softmax', signature, annos, tensor,
+        dim = inputs[1]
+        edim_in[dim] += '^'
+        anno = OpAnno.create_op_str([edim_in], [edim_ou])
+        return IRDimops(Softmax, 'softmax', signature, [anno], [tensor],
                         dim=dim, _stacklevel=_stacklevel, dtype=dtype)
     else:
         raise RuntimeError('Unexpected input num {inputs}')
@@ -504,7 +514,7 @@ def EQ(signature, inputs):
 
     edim_in0 = ShapeAnno.create_shape_str(input0.shape)
     edim_ou = copy.copy(edim_in0)
-    if isinstance(input1, float):
+    if isinstance(input1, (int, float)):
         anno = OpAnno.create_op_str([edim_in0], [edim_ou])
         return IRDimops(EQ, 'eq', signature, [anno], [input0], other=input1)
     else:
@@ -519,7 +529,7 @@ def NE(signature, inputs):
 
     edim_in0 = ShapeAnno.create_shape_str(input0.shape)
     edim_ou = copy.copy(edim_in0)
-    if isinstance(input1, float):
+    if isinstance(input1, (int, float)):
         anno = OpAnno.create_op_str([edim_in0], [edim_ou])
         return IRDimops(NE, 'ne', signature, [anno], [input0], other=input1)
     else:
@@ -569,7 +579,6 @@ def LayerNorm(signature, inputs):
     cube.runtime.function.layer_norm(input, weight, bias, normliazed_shape, eps)
     """
     if 'torch.' in signature:
-        print(inputs)
         tensor, normalized_shape, weight, bias, eps = inputs
         assert isinstance(normalized_shape, list), f"normalized_shape for layer_norm can only be List[int]"
     else:
