@@ -78,13 +78,28 @@ class FxModuleParser:
         inputs = [node for node in module.graph.nodes if node.op == 'placeholder']
         print(f'inputs = {inputs}')
 
-        # remove dead nodes
-        from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
-        DCEHandler(module).eliminate_dead_code()
+        if input_shapes is not None and len(input_shapes) != len(inputs):
+            print(f'module(type = {type(module)}.__dict__.keys() = {module.__dict__.keys()}')
+            print(f'input shape mismatch (got {len(input_shapes)} != {len(inputs)})')
+            # TODO fixme raise RuntimeError(f"Module {module.original_name} input shape mismatch (got {len(input_shapes)} != {len(inputs)})")
+        
+        if input_shapes is not None:
+            ## shape propagation
+            default_dtype = torch.get_default_dtype()
+            kDefaultType = DType2IRDType.map(default_dtype) # TODO specify dtype
+            sample_inputs = dummy_inputs if dummy_inputs else [torch.ones(shape, dtype=default_dtype) for shape in input_shapes]
+            sample_input_tensors = [sample_inputs[input] for input in sample_inputs] if type(sample_inputs) is dict else sample_inputs
+            from torch.fx.passes.shape_prop import ShapeProp
+            ShapeProp(module).propagate(*sample_input_tensors)  # TODO fixme ShapeProp(module).propagate(*sample_inputs)
+        else:
+            assert dummy_inputs is not None, 'input_shapes and dummy_inputs cannot be None at the same time.'
+            # remove dead nodes
+            from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
+            DCEHandler(module).eliminate_dead_code()
 
-        # shape propagation
-        from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp
-        KwargsShapeProp(module).propagate(dummy_inputs)
+            # shape propagation
+            from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp
+            KwargsShapeProp(module).propagate(dummy_inputs)
 
         for node in module.graph.nodes:
             if 'tensor_meta' in node.meta:
@@ -98,8 +113,6 @@ class FxModuleParser:
                     print(node.name, node.meta['tensor_meta'].dtype, node.meta['tensor_meta'].shape)
             else:
                 print(f'{node.name} does not has tensor_meta')
-
-        # return
 
         # handle graph input -- some inputs could be None or not tensor
         default_dtype = torch.get_default_dtype()
