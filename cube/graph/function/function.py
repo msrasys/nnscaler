@@ -260,6 +260,21 @@ def _handle_broadcast(lhs: IRTensor, rhs: IRTensor) -> Tuple[List[str]]:
     return lhs_shape, rhs_shape, out_shape
 
 
+def Expand(signature, inputs):
+    input = inputs[0]
+    sizes = inputs[1:]
+
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    assert len(input.shape) == len(sizes)
+    for idx, (dim, expand_dim) in enumerate(zip(input.shape, sizes)):
+        if dim == 1 and dim != expand_dim:
+            edim_in[idx] += '^'
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+
+    return IRDimops(Expand, 'expand', signature, [anno], [input], sizes=sizes)
+
+
 def Clone(signature, inputs):
     """
     torch.clone(input, *, memory_format=torch.preserve_format)
@@ -899,6 +914,7 @@ def Squeeze(signature, inputs):
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
 
     return IRDimops(Squeeze, 'squeeze', signature, [anno], [input])
+
 
 def Unsqueeze(signature, inputs):
     """

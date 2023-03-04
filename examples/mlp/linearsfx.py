@@ -83,6 +83,8 @@ class MLP(nn.Module):
         x = x.permute(0, 2, 1)
         x = x.transpose(1, 2)
         loss = torch.sum(x)
+        # loss = loss.expand(2)
+        # loss = torch.sum(loss)
         # long cannot backward
         # loss = loss.long()
         return loss

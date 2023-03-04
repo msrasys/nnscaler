@@ -78,6 +78,7 @@ class SignFx2Op:
         __ttemplate('baddbmm'): function.BMMAdd,
         __ttemplate('permute'): function.Permute,
         __ttemplate('transpose'): function.Transpose,
+        __tttemplate('expand'): function.Expand,
 
         # TODO
         __ftemplate('layer_norm'): function.LayerNorm,
