@@ -156,7 +156,7 @@ class FxModuleParser:
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
             all_ir_nodes += ir_nodes
 
-        # output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
+        #output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
         # handle outputs
         output_nodes = [node.all_input_nodes for node in module.graph.nodes if node.op == 'output']
         print(f'outputs = {output_nodes}')
@@ -171,8 +171,6 @@ class FxModuleParser:
             else:
                 outputs.append(val)
         output_val = outputs
-        print(f'zql: {output_val}')
-        # exit(1)
 
         frame.pop_var()
         frame.pop_attr()
