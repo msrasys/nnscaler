@@ -277,7 +277,6 @@ class FxModuleParser:
 
         # map to IR operator
         if SignFx2Op.exist(fsig):
-            print(f'zql input_vals: {input_vals}')
             ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
         else:
             #input_vals = [extract_val(v) for v in node.args]
@@ -317,12 +316,8 @@ class FxModuleParser:
             ir_tensor.as_param()
             frame.add_var(tensor_name, ir_tensor)
         else:
-            # FIXME: why no need to record the constant value of this var?
-            # the value can be obtained below:
             var = FxModuleParser.fetch_attr(module, node.target)
             frame.add_var(tensor_name, var)
-            # print(f'WARNING: {node.name} {node.meta} in attr node uses empty IRObject!')
-            # frame.add_var(tensor_name, IRObject())
 
         return None
 

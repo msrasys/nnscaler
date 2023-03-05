@@ -612,7 +612,6 @@ def LayerNorm(signature, inputs):
     """
     if 'torch.' in signature:
         tensor, normalized_shape, weight, bias, eps = inputs
-        # FIXME: uncomment the assert
         assert isinstance(normalized_shape, (list, tuple, torch.Size)), \
             f"normalized_shape for layer_norm can only be tuple or list or torch.Size, NOT {type(normalized_shape)}"
     else:
