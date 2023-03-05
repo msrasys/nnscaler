@@ -30,12 +30,15 @@ def convert_model(model: torch.nn.Module,
             else:
                 print('using concrete tracer')
                 with torch.no_grad():
-                    if isinstance(dummy_input, tuple):
+                    if isinstance(dummy_input, tuple) or isinstance(dummy_input, list):
                         output_origin = model(*dummy_input)
                     elif isinstance(dummy_input, torch.Tensor):
                         output_origin = model(dummy_input)
+                    elif isinstance(dummy_input, dict):
+                        print(f'WARNING dict dummy_input')
+                        output_origin = model(**dummy_input)
                     else:
-                        raise RuntimeError(f'dummy_input should be a tuple = {dummy_input}')
+                        raise RuntimeError(f'dummy_input should be a tuple (not a {type(dummy_input)}) = {dummy_input}')
                 traced_model, _ = concrete_trace(
                     model,
                     dummy_input,
