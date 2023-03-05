@@ -206,8 +206,7 @@ class FxModuleParser:
             if node_type == FxNodeKind.Placeholder:
                 return []
             if node_type == FxNodeKind.Output:
-                #return FxModuleParser.parse_prim_output_node(node, module, frame)
-                return []
+                return FxModuleParser.parse_prim_output_node(node, module, frame)
 
             if node_type in (FxNodeKind.PrimCallFunction, FxNodeKind.PrimCallMethod):
                 return FxModuleParser.parse_prim_function_method(node, module, frame)
@@ -324,7 +323,7 @@ class FxModuleParser:
 
         return list()
 
-    '''@staticmethod
+    @staticmethod
     def parse_prim_output_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRCell]:
         assert len(node.args) == 1 and len(node.kwargs) == 0
         ir_nodes = []
@@ -356,7 +355,7 @@ class FxModuleParser:
         generate_outputs(node.args[0], ir_nodes)
         if len(ir_nodes) > 0:
             ir_nodes[-1].set_output(0, frame.get_var(node.name))
-        return ir_nodes'''
+        return ir_nodes
 
     # # NOTE: this is a function in torch.fx
     # @staticmethod
