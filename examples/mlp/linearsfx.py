@@ -60,6 +60,8 @@ class MLP(nn.Module):
 
     def forward(self, data, mask):
         x = data.masked_fill(mask, 0.0)
+        y = torch._shape_as_tensor(x)
+        z = torch.gt(x, x)
         x = x.fill_(0.0)
         x = torch.nn.functional.softmax(x, dim=-1)
         x = torch.bmm(x, x)
@@ -69,6 +71,7 @@ class MLP(nn.Module):
         for layer in self.layers:
             x = layer(x)
             x = torch.nn.functional.relu(x)
+            x = torch.nn.functional.gelu(x)
         # x = self.layer_norm(x)
         x = x.type_as(data)
         x = x.unsqueeze(1)
@@ -76,17 +79,30 @@ class MLP(nn.Module):
         x = x.squeeze()
         x = torch.triu(x, 1)
         x = torch.nan_to_num(x)
-        # ne and eq cannot backward
-        # x = torch.ne(x, 1.0)
-        # y = torch.eq(x, 1.0)
+        ne_var = x.detach()
+        ne_var = torch.ne(ne_var, 1.0)
+        eq_var = x.detach()
+        eq_var = torch.eq(eq_var, 1.0)
+        long_var = x.detach()
+        long_var = long_var.long()
+        floor_div_var = x.detach()
+        floor_div_var = torch.floor_divide(floor_div_var, 2.0)
+        x = torch.true_divide(x, 1.0)
         x = torch.cumsum(x, -1)
         x = x.permute(0, 2, 1)
         x = x.transpose(1, 2)
+        x = torch.div(x, 1.0)
+        # concrete_trace not support
+        # x = torch.Tensor.view(x, [32 * 1024, 1024])
+        x = x.view(32 * 1024, 1024)
+        x = x.reshape(32, 1024, 1024)
+        # indices = torch.arange(4, dtype=torch.int64)
+        # x = torch.index_select(x, 1, indices)
+        p = torch.div(x, 2.0)
+        x = torch.stack((x, p), dim=1)
+        x = torch.flatten(x, 2, 3)
         loss = torch.sum(x)
-        # loss = loss.expand(2)
-        # loss = torch.sum(loss)
-        # long cannot backward
-        # loss = loss.long()
+        loss = torch.neg(loss)
         return loss
 
 

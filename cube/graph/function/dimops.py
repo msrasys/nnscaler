@@ -438,6 +438,9 @@ class OpAnno:
         ou_annos = list()
         for shape in ins:
             flatten = list()
+            if isinstance(shape, str):
+                in_annos.append(shape)
+                continue
             for edim in shape:
                 if isinstance(edim, str):
                     flatten.append(edim)

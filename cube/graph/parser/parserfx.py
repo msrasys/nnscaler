@@ -351,7 +351,11 @@ class FxModuleParser:
 
         input_vals = list()
         for item in node.args:
-            input_vals.append(extract_val(item))
+            if isinstance(item, tuple):
+                for _ in item:
+                    input_vals.append(extract_val(_))
+            else:
+                input_vals.append(extract_val(item))
         if node.kwargs:
             input_kwvals = {}
             for k, v in node.kwargs.items():
