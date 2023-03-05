@@ -612,28 +612,32 @@ def LayerNorm(signature, inputs):
     """
     if 'torch.' in signature:
         tensor, normalized_shape, weight, bias, eps = inputs
-        assert isinstance(normalized_shape, list), f"normalized_shape for layer_norm can only be List[int]"
+        # FIXME: uncomment the assert
+        assert isinstance(normalized_shape, (list, tuple, torch.Size)), \
+            f"normalized_shape for layer_norm can only be tuple or list or torch.Size, NOT {type(normalized_shape)}"
     else:
+        assert 'cube.runtime.function.layer_norm' == signature, f'{signature} of LayerNorm is not supported.'
         tensor, weight, bias, normalized_shape, eps = inputs
     letters = iter(string.ascii_lowercase)
     einput = ShapeAnno.create_shape_str(tensor.shape, iterator=letters)
     eoutput = copy.copy(einput)
     ndims = len(tensor.shape)
-    for dim in range(len(normalized_shape)):
+    ndims_normshape = len(normalized_shape)
+    for dim in range(ndims_normshape):
+        # though these dimensions can be partitioned,
+        # such partition induces additional communication and complexity
         einput[ndims-1-dim] += '^'
         eoutput[ndims-1-dim] += '^'
-    assert not (bias is None is weight is not None), f"Not support for None of weight and parameter of bias"
+    assert not (bias is not None and weight is None), f"Not support for None of weight and parameter of bias"
     einputs, inputs = [einput], [tensor]
     kwargs = {}
     if weight is not None:
-        eweight = ShapeAnno.create_shape_str(weight.shape, reduction='^', iterator=letters)
-        einputs.append(eweight)
+        einputs.append(einput[ndims-ndims_normshape:])
         inputs.append(weight)
     else:
         kwargs['weight'] = weight
     if bias is not None:
-        ebias = ShapeAnno.create_shape_str(bias.shape, reduction='^', iterator=letters)
-        einputs.append(ebias)
+        einputs.append(einput[ndims-ndims_normshape:])
         inputs.append(bias)
     else:
         kwargs['bias'] = bias

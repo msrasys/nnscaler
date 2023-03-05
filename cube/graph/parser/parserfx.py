@@ -154,7 +154,8 @@ class FxModuleParser:
         all_ir_nodes: List[IRFwOperation] = list()
         for node in module.graph.nodes:
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
-            all_ir_nodes += ir_nodes
+            if ir_nodes is not None:
+                all_ir_nodes += ir_nodes
 
         #output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
         # handle outputs
@@ -318,11 +319,12 @@ class FxModuleParser:
         else:
             # FIXME: why no need to record the constant value of this var?
             # the value can be obtained below:
-            # var = FxModuleParser.fetch_attr(module, node.target)
-            print(f'WARNING: {node.name} {node.meta} in attr node uses empty IRObject!')
-            frame.add_var(tensor_name, IRObject())
+            var = FxModuleParser.fetch_attr(module, node.target)
+            frame.add_var(tensor_name, var)
+            # print(f'WARNING: {node.name} {node.meta} in attr node uses empty IRObject!')
+            # frame.add_var(tensor_name, IRObject())
 
-        return list()
+        return None
 
     @staticmethod
     def parse_prim_output_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRCell]:

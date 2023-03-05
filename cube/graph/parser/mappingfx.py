@@ -76,21 +76,19 @@ class SignFx2Op:
         __ttemplate('nan_to_num') : function.NanToNum,
         __tttemplate('long'): function.Long,
         __ttemplate('fill_'): function.Fill,
-        __ttemplate('masked_fill'): function.MaskedFill,
+        # __ttemplate('masked_fill'): function.MaskedFill,
         __ttemplate('cumsum'): function.CumSum,
         __ttemplate('tanh'): function.Tanh,
         __ftemplate('softmax') : function.Softmax,
         __ttemplate('bmm') : function.BatchLinear,
         __ttemplate('pow'): function.Pow,
-        __ttemplate('baddbmm'): function.BMMAdd,
+        # __ttemplate('baddbmm'): function.BMMAdd,
         __ttemplate('permute'): function.Permute,
         __ttemplate('transpose'): function.Transpose,
         __tttemplate('expand'): function.Expand,
         __ttemplate('detach'): function.Detach,
         __ttemplate('_shape_as_tensor'): function.ShapeAsTensor,
         __ttemplate('index_select'): function.IndexSelect,
-
-        # TODO
         __ftemplate('layer_norm'): function.LayerNorm,
 
         # # torch nn functional
@@ -148,9 +146,9 @@ class SignFx2Op:
         # __ttemplate('mean') : function.Mean,
         #
         # __ttemplate('view'): function.View,
-        __tttemplate('view'): function.View,
+        # __tttemplate('view'): function.View,
         
-        __ttemplate('reshape'): function.Reshape,
+        # __ttemplate('reshape'): function.Reshape,
         #
         # __ttemplate('conv2d'): function.Conv2D,
         #
