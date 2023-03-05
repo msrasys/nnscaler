@@ -101,8 +101,8 @@ class MLP(nn.Module):
         p = torch.div(x, 2.0)
         x = torch.stack((x, p), dim=1)
         x = torch.flatten(x, 2, 3)
+        x = torch.neg(x)
         loss = torch.sum(x)
-        loss = torch.neg(loss)
         return loss
 
 

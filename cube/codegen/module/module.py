@@ -82,7 +82,7 @@ class ModuleCodeGen(FuncEmission):
             '\n\n########## Generated Model Code ###########',
             'from typing import *',
             'import torch', 'import torch.utils.checkpoint as ckpt',
-            'import cube', '', '']
+            'import cube', 'import _operator', '', '']
         
         if CompileFlag.use_nnfusion:
             self.init_code.extend(['import nnfusion', ''])

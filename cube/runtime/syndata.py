@@ -138,6 +138,7 @@ class SynDataLoader(CubeDataLoader):
         self.shapes = tuple([list(shape) for shape in shapes])
         self.dtypes = dtypes
         batch_size = shapes[0][batch_dims[0]]
+        assert not names
         super().__init__(batch_size, batch_dims)
         self.names = names
         self.append_args=append_args
@@ -160,18 +161,21 @@ class SynDataLoader(CubeDataLoader):
         torch.manual_seed(0)
         datas = []
         for shape, dtype in zip(self.shapes, self.dtypes):
-            datas.append(
-                torch.rand(
-                    shape,
-                    device=self.device,
-                    requires_grad=False).to(dtype)
-                if torch.is_floating_point(torch.zeros([1], dtype=dtype)) else
-                torch.ones(
-                    shape,
-                    device=self.device,
-                    requires_grad=False
-                ).to(dtype)
-            )
+            if shape and all(isinstance(dim, int) for dim in list(shape)):
+                datas.append(
+                    torch.rand(
+                        shape,
+                        device=self.device,
+                        requires_grad=False).to(dtype)
+                    if torch.is_floating_point(torch.zeros([1], dtype=dtype)) else
+                    torch.ones(
+                        shape,
+                        device=self.device,
+                        requires_grad=False
+                    ).to(dtype)
+                )
+            else:
+                datas.append(dtype())
         return tuple(datas)
     
     def set_output(self, datas: Union[torch.Tensor, Tuple[torch.Tensor]]):

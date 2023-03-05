@@ -834,8 +834,6 @@ def View(signature, inputs):
         for hdim in range(len(bracket)):
             if bracket[hdim] == '1': continue
             sdim = bracket[hdim]
-            ospatial.add(bracket[hdim])
-            ofirst.append(bracket[hdim])
             break
         if sdim is not None:
             ospatial.add(sdim)
@@ -1149,7 +1147,7 @@ def Stack(signature, inputs: Tuple[List[IRTensor], int]):
     if isinstance(dim, dict):
         assert 'dim' in dim
         dim = dim['dim']
-    assert all(isinstance(tensor, IRTensor) for tensor in tensors)
+    assert all(isinstance(tensor, IRTensor) for tensor in tensors), f'{tensors}'
     iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
     oannos = [copy.copy(iannos[-1])]
     oannos[0].insert(dim, str(len(tensors)))
