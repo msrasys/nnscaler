@@ -92,6 +92,7 @@ class FxModuleParser:
             from torch.fx.passes.shape_prop import ShapeProp
             ShapeProp(module).propagate(*sample_input_tensors)  # TODO fixme ShapeProp(module).propagate(*sample_inputs)
         else:
+            assert False
             assert dummy_inputs is not None, 'input_shapes and dummy_inputs cannot be None at the same time.'
             # remove dead nodes
             from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
@@ -128,6 +129,7 @@ class FxModuleParser:
                 print(f'dummy_inputs does not have {input.name}')
                 shape = None
             # FIXME: use the input's real dtype
+            #shape = None if (input_shapes is None or len(input_shapes) <= idx) else input_shapes[idx]
             dtype = kDefaultType
             val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
             frame.add_var(input.name, val, graph_arg=idx)
