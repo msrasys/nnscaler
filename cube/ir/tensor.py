@@ -633,7 +633,7 @@ class IRSubTensor(IRTensor):
     @grad.setter
     def grad(self, val: Optional[IRTensor]):
         if isinstance(val, IRSubTensor):
-            assert self.requires_grad and val.shape == self.shape
+            assert self.requires_grad and val.shape == self.shape, f'info: {self.requires_grad} {val.shape == self.shape}'
             self._grad = val
         elif val is None:
             assert not self.requires_grad

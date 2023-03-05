@@ -409,7 +409,7 @@ class OpAnno:
         """
         # to inputs and outputs
         if '->' not in anno:
-            raise ValueError("Syntax Error: Expected -> in operator anno")
+            raise ValueError(f"Syntax Error: Expected -> in operator anno: {anno}")
         inputs, outputs = anno.split('->')
         inputs = inputs.split(',')
         outputs = outputs.split(',')
@@ -438,6 +438,9 @@ class OpAnno:
         ou_annos = list()
         for shape in ins:
             flatten = list()
+            if isinstance(shape, str):
+                in_annos.append(shape)
+                continue
             for edim in shape:
                 if isinstance(edim, str):
                     flatten.append(edim)
