@@ -276,6 +276,7 @@ class FxModuleParser:
 
         # map to IR operator
         if SignFx2Op.exist(fsig):
+            print(f'zql input_vals: {input_vals}')
             ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
         else:
             #input_vals = [extract_val(v) for v in node.args]
