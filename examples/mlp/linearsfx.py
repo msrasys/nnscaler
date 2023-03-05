@@ -65,7 +65,7 @@ class MLP(nn.Module):
         x = x.fill_(0.0)
         x = torch.nn.functional.softmax(x, dim=-1)
         x = torch.bmm(x, x)
-        x = torch.baddbmm(x, x, x)
+        x = torch.baddbmm(x, x, x, alpha=0.125, beta=1.0)
         x = torch.tanh(x)
         x = torch.pow(x, x)
         for layer in self.layers:
@@ -88,7 +88,7 @@ class MLP(nn.Module):
         floor_div_var = x.detach()
         floor_div_var = torch.floor_divide(floor_div_var, 2.0)
         x = torch.true_divide(x, 1.0)
-        x = torch.cumsum(x, -1)
+        x = torch.cumsum(x, dim=-1)
         x = x.permute(0, 2, 1)
         x = x.transpose(1, 2)
         x = torch.div(x, 1.0)

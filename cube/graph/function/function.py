@@ -46,11 +46,18 @@ def BatchLinear(signature, inputs):
 
 
 def BMMAdd(signature, inputs):
-    assert len(inputs) == 3
+    assert len(inputs) >= 3, f'{inputs}'
+    alpha, beta = 1, 1
+    if len(inputs) == 4:
+        assert isinstance(inputs[3], dict)
+        alpha = inputs[3]['alpha']
+        beta = inputs[3]['beta']
+    elif len(inputs) == 5:
+        alpha, beta = inputs[3:]
     annos = [
         'b m n, b m k^, b k^ n -> b m n'
     ]
-    return IRDimops(BMMAdd, 'baddbmm', signature, annos, inputs)
+    return IRDimops(BMMAdd, 'baddbmm', signature, annos, inputs[:3], alpha=alpha, beta=beta)
 
 
 def Matmul(signature, inputs: Tuple[IRTensor, IRTensor]):
@@ -591,6 +598,9 @@ def MaskedFill(signature, inputs):
     edim_in0 = ShapeAnno.create_shape_str(input0.shape)
     edim_in1 = ShapeAnno.create_shape_str(input1.shape)
     edim_ou = copy.copy(edim_in0)
+    for idx, (lhs, rhs) in enumerate(zip(input0.shape, input1.shape)):
+        if lhs != rhs and rhs == 1:
+            edim_ou[idx] = '1'
     anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
     return IRDimops(MaskedFill, 'masked_fill', signature, [anno], [input0, input1], value=value)
 
@@ -948,9 +958,8 @@ def TypeAs(signature, inputs):
     input0, input1 = inputs
 
     edim_in0 = ShapeAnno.create_shape_str(input0.shape)
-    edim_in1 = ShapeAnno.create_shape_str(input1.shape)
     edim_ou = copy.copy(edim_in0)
-    anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
+    anno = OpAnno.create_op_str([edim_in0, '*'], [edim_ou])
 
     return IRDimops(TypeAs, 'type_as', signature, [anno], [input0, input1])
 
@@ -979,7 +988,10 @@ def CumSum(signature, inputs):
     """
     assert len(inputs) == 2
     input, dim = inputs
-    assert isinstance(dim, int)
+    if isinstance(dim, dict):
+        dim = dim['dim']
+    else:
+        assert isinstance(dim, int)
 
     edim_in = ShapeAnno.create_shape_str(input.shape)
     edim_in[dim] += '^'
