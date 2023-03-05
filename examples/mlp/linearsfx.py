@@ -73,7 +73,8 @@ class MLP(nn.Module):
             x = torch.nn.functional.relu(x)
             x = torch.nn.functional.gelu(x)
         # x = self.layer_norm(x)
-        x = x.type_as(data)
+        type_x = torch.pow(x, 1.0)
+        x = x.type_as(type_x)
         x = x.unsqueeze(1)
         x = self.drop_out(x)
         x = x.squeeze()
@@ -96,12 +97,16 @@ class MLP(nn.Module):
         # x = torch.Tensor.view(x, [32 * 1024, 1024])
         x = x.view(32 * 1024, 1024)
         x = x.reshape(32, 1024, 1024)
-        # indices = torch.arange(4, dtype=torch.int64)
+        neg_x = torch.neg(x)
+        x = torch.einsum('a b c, a c d -> a b d', x, neg_x)
+        # TODO(yizhu1): uncomment and check
+        # bs = x.size(1)
+        # indices = torch.arange(bs, dtype=torch.int64)
         # x = torch.index_select(x, 1, indices)
         p = torch.div(x, 2.0)
         x = torch.stack((x, p), dim=1)
         x = torch.flatten(x, 2, 3)
-        x = torch.neg(x)
+        x = x.repeat(1, 2, 1)
         loss = torch.sum(x)
         return loss
 
