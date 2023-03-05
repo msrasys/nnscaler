@@ -116,20 +116,20 @@ class FxModuleParser:
                 print(f'{node.name} does not has tensor_meta')
 
         # handle graph input -- some inputs could be None or not tensor
-        default_dtype = torch.get_default_dtype()
-        kDefaultType = DType2IRDType.map(default_dtype) # TODO specify dtype
+        #default_dtype = torch.get_default_dtype()
+        #kDefaultType = DType2IRDType.map(default_dtype) # TODO specify dtype
         # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding, extend to other input types
         for idx, input in enumerate(inputs):
             assert isinstance(input, torch.fx.Node)
-            if hasattr(dummy_inputs, input.name):
+            '''if hasattr(dummy_inputs, input.name):
                 print(f'dummy_inputs has {input.name}')
                 shape = getattr(dummy_inputs, input.name).size()# None if dummy_inputs is None else dummy_inputs[idx].size()
             else:
                 # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
                 print(f'dummy_inputs does not have {input.name}')
                 shape = None
-            # FIXME: use the input's real dtype
-            #shape = None if (input_shapes is None or len(input_shapes) <= idx) else input_shapes[idx]
+            # FIXME: use the input's real dtype'''
+            shape = None if (input_shapes is None or len(input_shapes) <= idx) else input_shapes[idx]
             dtype = kDefaultType
             val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
             frame.add_var(input.name, val, graph_arg=idx)
