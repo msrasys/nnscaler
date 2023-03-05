@@ -60,6 +60,21 @@ def BMMAdd(signature, inputs):
     return IRDimops(BMMAdd, 'baddbmm', signature, annos, inputs[:3], alpha=alpha, beta=beta)
 
 
+def EinSum(signature, inputs):
+    if isinstance(inputs[0], str):
+        equation, tensors = inputs[0], inputs[1:]
+    else:
+        tensors, equation = inputs[:-1], inputs[-1]
+    lhs, rhs = equation.split('->')
+    assert ',' not in rhs
+    lhs_dims = set(lhs.replace(',', ' ').split(' '))
+    for dim in lhs_dims:
+        if dim not in rhs:
+            lhs = lhs.replace(dim, f'{dim}+')
+    anno = f'{lhs} -> {rhs}'
+    return IRDimops(EinSum, 'einsum', signature, [anno], tensors, equation=equation)
+
+
 def Matmul(signature, inputs: Tuple[IRTensor, IRTensor]):
     assert len(inputs) == 2
     annos = [
@@ -1265,7 +1280,11 @@ def Repeat(signature, inputs: Tuple[IRTensor, List[int]]):
     torch.repeat(tensor:Tensor, repeats: List[int]) -> Tensor
     """
     signature = 'torch.ops.aten.repeat'
-    tensor, repeats = inputs
+    tensor = inputs[0]
+    if isinstance(inputs[1], list):
+        repeats = inputs[1]
+    else:
+        repeats = inputs[1:]
     in_shape = tensor.shape
     assert len(in_shape) <= len(repeats), "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor"
     expand = len(repeats) - len(tensor.shape)

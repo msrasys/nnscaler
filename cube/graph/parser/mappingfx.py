@@ -89,10 +89,11 @@ class SignFx2Op:
         __ttemplate('detach'): function.Detach,
         __ttemplate('_shape_as_tensor'): function.ShapeAsTensor,
         __ttemplate('index_select'): function.IndexSelect,
+        __ftemplate('embedding'): function.Embedding,
+        'torch.functional.einsum': function.EinSum,
 
         # TODO
         __ftemplate('layer_norm'): function.LayerNorm,
-        __ftemplate('embedding'): function.Embedding,
 
         # # torch nn functional
         #
@@ -166,7 +167,7 @@ class SignFx2Op:
         # #pytorch1.11
         # __ttemplate('select_scatter'): function.SelectScatter,
         #
-        # __ttemplate('repeat'): function.Repeat,
+        __tttemplate('repeat'): function.Repeat,
         #
         # #pytorch1.11
         # __ttemplate('linear'): function.Linear,
