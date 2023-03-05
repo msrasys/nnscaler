@@ -46,11 +46,18 @@ def BatchLinear(signature, inputs):
 
 
 def BMMAdd(signature, inputs):
-    assert len(inputs) == 3
+    assert len(inputs) >= 3, f'{inputs}'
+    alpha, beta = 1, 1
+    if len(inputs) == 4:
+        assert isinstance(inputs[3], dict)
+        alpha = inputs[3]['alpha']
+        beta = inputs[3]['beta']
+    elif len(inputs) == 5:
+        alpha, beta = inputs[3:]
     annos = [
         'b m n, b m k^, b k^ n -> b m n'
     ]
-    return IRDimops(BMMAdd, 'baddbmm', signature, annos, inputs)
+    return IRDimops(BMMAdd, 'baddbmm', signature, annos, inputs[:3], alpha=alpha, beta=beta)
 
 
 def Matmul(signature, inputs: Tuple[IRTensor, IRTensor]):
@@ -258,6 +265,21 @@ def _handle_broadcast(lhs: IRTensor, rhs: IRTensor) -> Tuple[List[str]]:
             raise ValueError(f"cannot broadcast lhs: {lhs.shape} and rhs: {rhs.shape}")
     # print(lhs.shape, rhs.shape, lhs_shape, rhs_shape, out_shape)
     return lhs_shape, rhs_shape, out_shape
+
+
+def Expand(signature, inputs):
+    input = inputs[0]
+    sizes = inputs[1:]
+
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    assert len(input.shape) == len(sizes)
+    for idx, (dim, expand_dim) in enumerate(zip(input.shape, sizes)):
+        if dim == 1 and dim != expand_dim:
+            edim_in[idx] += '^'
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+
+    return IRDimops(Expand, 'expand', signature, [anno], [input], sizes=sizes)
 
 
 def Clone(signature, inputs):
@@ -508,6 +530,13 @@ def Dropout(signature, inputs):
                     p=p, training=training, inplace=inplace)
 
 
+def Detach(signature, inputs):
+    assert len(inputs) == 1
+    annos = ['* -> *']
+    tensor = inputs[0:1]
+    return IRDimops(Detach, 'detach', signature, annos, tensor)
+
+
 def EQ(signature, inputs):
     assert len(inputs) == 2
     input0, input1 = inputs
@@ -569,6 +598,9 @@ def MaskedFill(signature, inputs):
     edim_in0 = ShapeAnno.create_shape_str(input0.shape)
     edim_in1 = ShapeAnno.create_shape_str(input1.shape)
     edim_ou = copy.copy(edim_in0)
+    for idx, (lhs, rhs) in enumerate(zip(input0.shape, input1.shape)):
+        if lhs != rhs and rhs == 1:
+            edim_ou[idx] = '1'
     anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
     return IRDimops(MaskedFill, 'masked_fill', signature, [anno], [input0, input1], value=value)
 
@@ -703,8 +735,11 @@ def View(signature, inputs):
     """
     out = torch.Tensor.view(tensor: torch.Tensor, size: List[int])
     """
-    assert len(inputs) == 2
-    input, shape = inputs
+    if len(inputs) == 2:
+        input, shape = inputs
+    else:
+        input = inputs[0]
+        shape = inputs[1:]
     if not all([isinstance(dim, int) for dim in shape]):
         raise TypeError("Expected tensor.view has static int shape")
     in_shape, ou_shape = list(input.shape), shape
@@ -898,6 +933,7 @@ def Squeeze(signature, inputs):
 
     return IRDimops(Squeeze, 'squeeze', signature, [anno], [input])
 
+
 def Unsqueeze(signature, inputs):
     """
     out = torch.unsqueeze(tensor, dim)
@@ -922,9 +958,8 @@ def TypeAs(signature, inputs):
     input0, input1 = inputs
 
     edim_in0 = ShapeAnno.create_shape_str(input0.shape)
-    edim_in1 = ShapeAnno.create_shape_str(input1.shape)
     edim_ou = copy.copy(edim_in0)
-    anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
+    anno = OpAnno.create_op_str([edim_in0, '*'], [edim_ou])
 
     return IRDimops(TypeAs, 'type_as', signature, [anno], [input0, input1])
 
@@ -953,7 +988,10 @@ def CumSum(signature, inputs):
     """
     assert len(inputs) == 2
     input, dim = inputs
-    assert isinstance(dim, int)
+    if isinstance(dim, dict):
+        dim = dim['dim']
+    else:
+        assert isinstance(dim, int)
 
     edim_in = ShapeAnno.create_shape_str(input.shape)
     edim_in[dim] += '^'
@@ -1118,7 +1156,10 @@ def Stack(signature, inputs: Tuple[List[IRTensor], int]):
         tensors, dim = inputs
     else:
         tensors, dim = inputs[:-1], inputs[-1]
-    assert all(isinstance(tensor, IRTensor) for tensor in tensors)
+    if isinstance(dim, dict):
+        assert 'dim' in dim
+        dim = dim['dim']
+    assert all(isinstance(tensor, IRTensor) for tensor in tensors), f'{tensors}'
     iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
     oannos = [copy.copy(iannos[-1])]
     oannos[0].insert(dim, str(len(tensors)))
@@ -1153,6 +1194,25 @@ def Select(signature, inputs: Tuple[IRTensor, int, int]):
     oanno.pop(dim)
     anno = OpAnno.create_op_str([ianno], [oanno])
     return IRDimops(Select, 'select', signature, [anno], [tensor], dim=dim, index=index)
+
+
+def IndexSelect(signature, inputs):
+    assert len(inputs) == 3
+    # hack
+    if isinstance(inputs[1], int):
+        tensor, dim, idx = inputs
+    else:
+        assert isinstance(inputs[2], int)
+        tensor, idx, dim = inputs
+
+    edim_in = ShapeAnno.create_shape_str(tensor.shape)
+    edim_in[dim] += '^'
+    idx_anno = chr(ord(edim_in[-1]) + 1) + '^'
+    edim_ou = copy.copy(edim_in)
+    edim_ou[dim] = copy.copy(idx_anno)
+    anno = OpAnno.create_op_str([edim_in, idx_anno], [edim_ou])
+
+    return IRDimops(IndexSelect, 'index_select', signature, [anno], [tensor, idx], dim=dim)
 
 
 def Slice(signature, inputs):
@@ -1244,7 +1304,10 @@ def Embedding(signature, inputs: List):
 
 def Flatten(signature, inputs: List):
     tensor: IRTensor = inputs[0]
-    start_dim, end_dim = inputs[1:]
+    if len(inputs) == 1:
+        start_dim, end_dim = 0, len(tensor.shape) - 1
+    else:
+        start_dim, end_dim = inputs[1:]
     end_dim = len(tensor.shape) + end_dim if end_dim < 0 else end_dim
     ishape = ShapeAnno.create_shape_str(tensor.shape)
     for dim in range(start_dim, end_dim+1):
@@ -1367,3 +1430,14 @@ def CompareLE(signature, inputs):
     torch.gt(input, other, *, out=None) -> Tensor
     """
     return _comparison(CompareLE, operator.le, 'le', signature, inputs)
+
+
+def ShapeAsTensor(signature, inputs):
+    assert len(inputs) == 1
+    input = inputs[0]
+
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = [str(len(input.shape))]
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+
+    return IRDimops(ShapeAsTensor, '_shape_as_tensor', signature, [anno], [input])

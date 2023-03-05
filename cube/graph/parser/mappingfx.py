@@ -69,22 +69,26 @@ class SignFx2Op:
         __ttemplate('unsqueeze'): function.Unsqueeze,
         __tttemplate('type_as'): function.TypeAs,
         __ttemplate('triu'): function.Triu,
-        __ftemplate('relu') : function.ReLU,
+        __ftemplate('relu'): function.ReLU,
+        __fcntemplate('gelu'): function.GeLU,
         __ttemplate('eq') : function.EQ,
         __ttemplate('ne') : function.NE,
         __ttemplate('nan_to_num') : function.NanToNum,
         __tttemplate('long'): function.Long,
         __ttemplate('fill_'): function.Fill,
-        # __ttemplate('masked_fill'): function.MaskedFill,
-        __ftemplate('embedding'): function.Embedding,
-        # __ttemplate('cumsum'): function.CumSum,
+        __ttemplate('masked_fill'): function.MaskedFill,
+        __ttemplate('cumsum'): function.CumSum,
         __ttemplate('tanh'): function.Tanh,
         __ftemplate('softmax') : function.Softmax,
         __ttemplate('bmm') : function.BatchLinear,
         __ttemplate('pow'): function.Pow,
-        # __ttemplate('baddbmm'): function.BMMAdd,
+        __ttemplate('baddbmm'): function.BMMAdd,
         __ttemplate('permute'): function.Permute,
         __ttemplate('transpose'): function.Transpose,
+        __tttemplate('expand'): function.Expand,
+        __ttemplate('detach'): function.Detach,
+        __ttemplate('_shape_as_tensor'): function.ShapeAsTensor,
+        __ttemplate('index_select'): function.IndexSelect,
 
         # TODO
         __ftemplate('layer_norm'): function.LayerNorm,
@@ -122,17 +126,19 @@ class SignFx2Op:
         # __ttemplate('sub') : function.Sub,
         #
         # __ttemplate('mul') : function.Mul,
+        
+        __ttemplate('div') : function.Div,
+        __ttemplate('truediv'): function.Div,
+        __ttemplate('true_divide'): function.Div,
+        __ttemplate('floordiv') : function.FloorDiv,
+        __ttemplate('floor_divide') : function.FloorDiv,
+        
+        __ttemplate('neg'): function.Neg,
         #
-        # __ttemplate('div') : function.Div,
-        #
-        # __ttemplate('floordiv') : function.FloorDiv,
-        #
-        # __ttemplate('neg'): function.Neg,
-        #
-        # __ttemplate('gt'): function.CompareGT,
-        # __ttemplate('lt'): function.CompareLT,
-        # __ttemplate('ge'): function.CompareGE,
-        # __ttemplate('le'): function.CompareLE,
+        __ttemplate('gt'): function.CompareGT,
+        __ttemplate('lt'): function.CompareLT,
+        __ttemplate('ge'): function.CompareGE,
+        __ttemplate('le'): function.CompareLE,
         #
         # __ttemplate('sin'): function.Sin,
         #
@@ -142,8 +148,9 @@ class SignFx2Op:
         # __ttemplate('mean') : function.Mean,
         #
         # __ttemplate('view'): function.View,
-        #
-        # __ttemplate('reshape'): function.Reshape,
+        __tttemplate('view'): function.View,
+        
+        __ttemplate('reshape'): function.Reshape,
         #
         # __ttemplate('conv2d'): function.Conv2D,
         #
@@ -164,12 +171,12 @@ class SignFx2Op:
         # __ttemplate('linear'): function.Linear,
         #
         # __ttemplate('cat'): function.Cat,
-        #
-        # __ttemplate('stack'): function.Stack,
+        
+        __ttemplate('stack'): function.Stack,
         #
         # __ttemplate('chunk'): function.Chunk,
-        #
-        # __ttemplate('flatten'): function.Flatten,
+        
+        __ttemplate('flatten'): function.Flatten,
         #
         # __ttemplate('roll'): function.Roll,
         #
