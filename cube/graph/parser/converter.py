@@ -61,7 +61,7 @@ def convert_model(model: torch.nn.Module,
             module_name = model.__class__.__name__
         else:
             FxModuleParser.save_content = save_content
-            inputs, nodes, outputs = FxModuleParser.parse(traced_model, input_shapes=input_shapes, dummy_input=dummy_input)
+            inputs, nodes, outputs = FxModuleParser.parse(traced_model, input_shapes=input_shapes, dummy_inputs=dummy_input)
             module_name = model.__class__.__name__
     else:
         ScriptModuleParser.save_content = save_content
