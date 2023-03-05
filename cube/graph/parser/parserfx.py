@@ -1,11 +1,7 @@
 import torch
 import enum
 import re
-<<<<<<< HEAD
-from typing import Any, List, Tuple, Optional, Callable
-=======
 from typing import Any, List, Tuple, Optional, Callable, Union
->>>>>>> 8635f2beb07e5036bb1e086e383f2afb66c6d3e2
 
 from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor
@@ -96,10 +92,6 @@ class FxModuleParser:
             from torch.fx.passes.shape_prop import ShapeProp
             ShapeProp(module).propagate(*sample_input_tensors)  # TODO fixme ShapeProp(module).propagate(*sample_inputs)
         else:
-<<<<<<< HEAD
-            assert False
-=======
->>>>>>> 8635f2beb07e5036bb1e086e383f2afb66c6d3e2
             assert dummy_inputs is not None, 'input_shapes and dummy_inputs cannot be None at the same time.'
             # remove dead nodes
             from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
@@ -162,7 +154,21 @@ class FxModuleParser:
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
             all_ir_nodes += ir_nodes
 
-        output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
+        #output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
+        # handle outputs
+        output_nodes = [node.all_input_nodes for node in module.graph.nodes if node.op == 'output']
+        print(f'outputs = {output_nodes}')
+        output_var_name = [output.name for output in [item for sublist in output_nodes for item in sublist]]
+        output_val = [frame.get_var(var_name) for var_name in output_var_name]
+
+        # flatten output_val
+        outputs = list()
+        for val in output_val:
+            if isinstance(val, list):
+                outputs += val
+            else:
+                outputs.append(val)
+        output_val = outputs
 
         frame.pop_var()
         frame.pop_attr()
@@ -198,7 +204,8 @@ class FxModuleParser:
             if node_type == FxNodeKind.Placeholder:
                 return []
             if node_type == FxNodeKind.Output:
-                return FxModuleParser.parse_prim_output_node(node, module, frame)
+                #return FxModuleParser.parse_prim_output_node(node, module, frame)
+                return []
 
             if node_type in (FxNodeKind.PrimCallFunction, FxNodeKind.PrimCallMethod):
                 return FxModuleParser.parse_prim_function_method(node, module, frame)
@@ -270,20 +277,21 @@ class FxModuleParser:
         if SignFx2Op.exist(fsig):
             ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
         else:
-            input_vals = [extract_val(v) for v in node.args]
-            kwargs = {key: extract_val(v) for key, v in node.kwargs.items()}
+            #input_vals = [extract_val(v) for v in node.args]
+            #kwargs = {key: extract_val(v) for key, v in node.kwargs.items()}
             # case1: unknown torch operator
             if FxModuleParser._is_torch_autograd_op(node, frame, fsig):
                 print(f'>>> Find unkown pytorch operation: {fsig}')
                 fname = fsig.split('.')[-1] if '.' in fsig else fname
                 ir_node = IRFwOperation(fname, fsig, len(input_vals), 1)
-                ir_node.kwargs = kwargs
+                #ir_node.kwargs = kwargs
                 for idx, t in enumerate(input_vals):
                     ir_node.set_input(idx, t)
             # case2: python runtime function
             else:
                 print(f'>>> Set python runtime function: {fsig}')
-                ir_node = IRPyFunc(fsig, input_vals, [None], **kwargs)
+                #ir_node = IRPyFunc(fsig, input_vals, [None], **kwargs)
+                ir_node = IRPyFunc(fsig, input_vals, [None])
 
         # TODO gracefully set output
         output_name = node.name
@@ -314,9 +322,7 @@ class FxModuleParser:
 
         return list()
 
-<<<<<<< HEAD
-=======
-    @staticmethod
+    '''@staticmethod
     def parse_prim_output_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRCell]:
         assert len(node.args) == 1 and len(node.kwargs) == 0
         ir_nodes = []
@@ -348,9 +354,8 @@ class FxModuleParser:
         generate_outputs(node.args[0], ir_nodes)
         if len(ir_nodes) > 0:
             ir_nodes[-1].set_output(0, frame.get_var(node.name))
-        return ir_nodes
+        return ir_nodes'''
 
->>>>>>> 8635f2beb07e5036bb1e086e383f2afb66c6d3e2
     # # NOTE: this is a function in torch.fx
     # @staticmethod
     # def _get_qualified_name(func: Callable[..., Any]) -> str:
@@ -367,18 +372,6 @@ class FxModuleParser:
     #     if module == "torch" and name == "segment_reduce":
     #         name = "_" + name
     #     return f'{module}.{name}'
-<<<<<<< HEAD
-
-    @staticmethod
-    def _get_qualified_name(node_target: str | Callable[..., Any], node: torch.fx.Node = None) -> str:
-        if isinstance(node_target, str):
-            assert node is not None
-            return FxModuleParser._get_qualified_name_of_call_method(node_target, node)
-        else:
-            return FxModuleParser._get_qualified_name_of_call_function(node_target)
-
-    @staticmethod
-=======
 
     @staticmethod
     def _get_qualified_name(node_target: Union[str, Callable[..., Any]], node: torch.fx.Node = None) -> str:
@@ -389,7 +382,6 @@ class FxModuleParser:
             return FxModuleParser._get_qualified_name_of_call_function(node_target)
 
     @staticmethod
->>>>>>> 8635f2beb07e5036bb1e086e383f2afb66c6d3e2
     def _get_qualified_name_of_call_function(node_target: Callable[..., Any]) -> str:
         """
         The target field of call_function node must be an callable object.
