@@ -83,23 +83,45 @@ class FxModuleParser:
             print(f'input shape mismatch (got {len(input_shapes)} != {len(inputs)})')
             # TODO fixme raise RuntimeError(f"Module {module.original_name} input shape mismatch (got {len(input_shapes)} != {len(inputs)})")
         
+        default_dtype = torch.get_default_dtype()
+        kDefaultType = DType2IRDType.map(default_dtype) # TODO specify dtype
         if input_shapes is not None:
-            ## shape propagation
-            default_dtype = torch.get_default_dtype()
-            kDefaultType = DType2IRDType.map(default_dtype) # TODO specify dtype
+            # shape propagation
             sample_inputs = dummy_inputs if dummy_inputs else [torch.ones(shape, dtype=default_dtype) for shape in input_shapes]
             sample_input_tensors = [sample_inputs[input] for input in sample_inputs] if type(sample_inputs) is dict else sample_inputs
             from torch.fx.passes.shape_prop import ShapeProp
             ShapeProp(module).propagate(*sample_input_tensors)  # TODO fixme ShapeProp(module).propagate(*sample_inputs)
+            # handle graph inputs
+            for idx, input in enumerate(inputs):
+                assert isinstance(input, torch.fx.Node)
+                shape = None if (input_shapes is None or len(input_shapes) <= idx) else input_shapes[idx]
+                dtype = kDefaultType
+                val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
+                frame.add_var(input.name, val, graph_arg=idx)
         else:
             assert dummy_inputs is not None, 'input_shapes and dummy_inputs cannot be None at the same time.'
             # remove dead nodes
             from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
             DCEHandler(module).eliminate_dead_code()
-
             # shape propagation
             from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp
             KwargsShapeProp(module).propagate(dummy_inputs)
+            # handle graph inputs
+            for idx, input in enumerate(inputs):
+                assert isinstance(input, torch.fx.Node)
+                # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding,
+                # extend to other input types
+                if hasattr(dummy_inputs, input.name):
+                    print(f'dummy_inputs has {input.name}')
+                    shape = getattr(dummy_inputs, input.name).size()
+                else:
+                    # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
+                    print(f'dummy_inputs does not have {input.name}')
+                    shape = None
+                dtype = kDefaultType
+                val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
+                frame.add_var(input.name, val, graph_arg=idx)
+        input_val = [frame.get_var(input.name) for input in inputs]
 
         for node in module.graph.nodes:
             if 'tensor_meta' in node.meta:
@@ -113,26 +135,6 @@ class FxModuleParser:
                     print(node.name, node.meta['tensor_meta'].dtype, node.meta['tensor_meta'].shape)
             else:
                 print(f'{node.name} does not has tensor_meta')
-
-        # handle graph input -- some inputs could be None or not tensor
-        #default_dtype = torch.get_default_dtype()
-        #kDefaultType = DType2IRDType.map(default_dtype) # TODO specify dtype
-        # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding, extend to other input types
-        for idx, input in enumerate(inputs):
-            assert isinstance(input, torch.fx.Node)
-            '''if hasattr(dummy_inputs, input.name):
-                print(f'dummy_inputs has {input.name}')
-                shape = getattr(dummy_inputs, input.name).size()# None if dummy_inputs is None else dummy_inputs[idx].size()
-            else:
-                # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
-                print(f'dummy_inputs does not have {input.name}')
-                shape = None
-            # FIXME: use the input's real dtype'''
-            shape = None if (input_shapes is None or len(input_shapes) <= idx) else input_shapes[idx]
-            dtype = kDefaultType
-            val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
-            frame.add_var(input.name, val, graph_arg=idx)
-        input_val = [frame.get_var(input.name) for input in inputs]
 
         # add activations to frame, including call_func/call_method output and final output
         activation_op_strs = {'call_function', 'output', 'call_method'}
