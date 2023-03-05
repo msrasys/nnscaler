@@ -1,4 +1,12 @@
+# NOTE: This test should run in the root directory.
+# Before running this test, you should run `export PYTHONPATH=.:$PYTHONPATH` first.
 
+# test torch.fx
+# working path <repo_root>
+OMP_NUM_THREADS=12 USE_TORCHFX=1 PYTHONPATH=.:$PYTHONPATH \
+    python -m torch.distributed.launch \
+    --nproc_per_node=1 \
+    examples/mlp/linearsfx.py --policy PASData
 
 # test MLP
 
