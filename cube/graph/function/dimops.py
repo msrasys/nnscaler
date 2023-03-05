@@ -409,7 +409,7 @@ class OpAnno:
         """
         # to inputs and outputs
         if '->' not in anno:
-            raise ValueError("Syntax Error: Expected -> in operator anno")
+            raise ValueError(f"Syntax Error: Expected -> in operator anno: {anno}")
         inputs, outputs = anno.split('->')
         inputs = inputs.split(',')
         outputs = outputs.split(',')

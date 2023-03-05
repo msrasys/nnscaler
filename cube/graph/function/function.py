@@ -45,6 +45,14 @@ def BatchLinear(signature, inputs):
     return IRDimops(BatchLinear, 'bmm', signature, annos, inputs)
 
 
+def BMMAdd(signature, inputs):
+    assert len(inputs) == 3
+    annos = [
+        'b m n, b m k^, b k^ n -> b m n'
+    ]
+    return IRDimops(BMMAdd, 'baddbmm', signature, annos, inputs)
+
+
 def Matmul(signature, inputs: Tuple[IRTensor, IRTensor]):
     assert len(inputs) == 2
     annos = [
@@ -461,12 +469,32 @@ def ReLU(signature, inputs):
 
 
 def Softmax(signature, inputs):
-    assert len(inputs) == 4
-    annos = ['* -> *']
-    tensor = inputs[0:1]
-    dim, _stacklevel, dtype = inputs[1], inputs[2], inputs[3]
-    return IRDimops(Softmax, 'softmax', signature, annos, tensor,
-                    dim=dim, _stacklevel=_stacklevel, dtype=dtype)
+    assert len(inputs) >= 1
+    tensor = inputs[0]
+    edim_in = ShapeAnno.create_shape_str(tensor.shape)
+    if len(inputs) == 2:
+        if isinstance(inputs[1], dict):
+            edim_in[inputs[1]['dim']] += '^'
+            edim_ou = copy.copy(edim_in)
+            anno = OpAnno.create_op_str([edim_in], [edim_ou])
+            return IRDimops(Softmax, 'softmax', signature, [anno], [tensor], **inputs[1])
+        elif isinstance(inputs[1], int):
+            dim = inputs[1]
+            edim_in[dim] += '^'
+            edim_ou = copy.copy(edim_in)
+            anno = OpAnno.create_op_str([edim_in], [edim_ou])
+            return IRDimops(Softmax, 'softmax', signature, [anno], [tensor], dim=inputs[1])
+        else:
+            raise RuntimeError(f'Unexpect intput type {inputs[1]}, {type(inputs[1])}')
+    elif len(inputs) == 4:
+        dim, _stacklevel, dtype = inputs[1], inputs[2], inputs[3]
+        dim = inputs[1]
+        edim_in[dim] += '^'
+        anno = OpAnno.create_op_str([edim_in], [edim_ou])
+        return IRDimops(Softmax, 'softmax', signature, [anno], [tensor],
+                        dim=dim, _stacklevel=_stacklevel, dtype=dtype)
+    else:
+        raise RuntimeError('Unexpected input num {inputs}')
 
 
 def Dropout(signature, inputs):
@@ -480,13 +508,28 @@ def Dropout(signature, inputs):
                     p=p, training=training, inplace=inplace)
 
 
+def EQ(signature, inputs):
+    assert len(inputs) == 2
+    input0, input1 = inputs
+
+    edim_in0 = ShapeAnno.create_shape_str(input0.shape)
+    edim_ou = copy.copy(edim_in0)
+    if isinstance(input1, (int, float)):
+        anno = OpAnno.create_op_str([edim_in0], [edim_ou])
+        return IRDimops(EQ, 'eq', signature, [anno], [input0], other=input1)
+    else:
+        edim_in1 = copy.copy(edim_in0)
+        anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
+        return IRDimops(EQ, 'eq', signature, [anno], [input0], other=input1)
+
+
 def NE(signature, inputs):
     assert len(inputs) == 2
     input0, input1 = inputs
 
     edim_in0 = ShapeAnno.create_shape_str(input0.shape)
     edim_ou = copy.copy(edim_in0)
-    if isinstance(input1, float):
+    if isinstance(input1, (int, float)):
         anno = OpAnno.create_op_str([edim_in0], [edim_ou])
         return IRDimops(NE, 'ne', signature, [anno], [input0], other=input1)
     else:
@@ -507,6 +550,16 @@ def Long(signature, inputs):
     annos = ['* -> *']
     tensor = inputs[0:1]
     return IRDimops(Long, 'long', signature, annos, tensor)
+
+
+def Fill(signature, inputs):
+    assert len(inputs) == 2
+    input, value = inputs
+
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(Fill, 'fill', signature, [anno], [input], value=value)
 
 
 def MaskedFill(signature, inputs):
@@ -809,6 +862,25 @@ def Reshape(signature, inputs):
 
     return View(signature, inputs)
 
+
+def Permute(signature, inputs):
+    if isinstance(inputs[1], list):
+        in_tensor, dims = inputs[0], inputs[1]
+    else:
+        in_tensor, dims = inputs[0], inputs[1:]
+    edim_in = ShapeAnno.create_shape_str(in_tensor.shape)
+    for idx, dim in enumerate(dims):
+        if idx != dim:
+            edim_in[idx] += '^'
+    assert len(edim_in) == len(dims), f'{len(edim_in)} vs {len(dims)}'
+    edim_ou = []
+    for dim in dims:
+        assert isinstance(dim, int)
+        edim_ou.append(copy.copy(edim_in[dim]))
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(Permute, 'permute', signature, [anno], [in_tensor], dims=dims)
+
+
 def Squeeze(signature, inputs):
     """
     out = torch.squeeze(tensor)
@@ -841,6 +913,7 @@ def Unsqueeze(signature, inputs):
     return IRDimops(Unsqueeze, 'unsqueeze', signature, [anno], [input],
                     dim=dim)
 
+
 def TypeAs(signature, inputs):
     """
     out = torch.Tensor.type_as(tensor0, tensor1)
@@ -854,6 +927,7 @@ def TypeAs(signature, inputs):
     anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
 
     return IRDimops(TypeAs, 'type_as', signature, [anno], [input0, input1])
+
 
 def Triu(signature, inputs):
     """
@@ -871,6 +945,24 @@ def Triu(signature, inputs):
 
     return IRDimops(Triu, 'triu', signature, [anno], [input],
                     diagonal=diagonal)
+
+
+def CumSum(signature, inputs):
+    """
+    out = torch.cumsum(tensor, dim)
+    """
+    assert len(inputs) == 2
+    input, dim = inputs
+    assert isinstance(dim, int)
+
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_in[dim] += '^'
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+
+    return IRDimops(CumSum, 'cumsum', signature, [anno], [input],
+                    dim=dim)
+
 
 # def Pad(signature, inputs):
 #     """

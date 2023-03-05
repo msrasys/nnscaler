@@ -60,6 +60,12 @@ class MLP(nn.Module):
 
     def forward(self, data, mask):
         x = data.masked_fill(mask, 0.0)
+        x = x.fill_(0.0)
+        x = torch.nn.functional.softmax(x, dim=-1)
+        x = torch.bmm(x, x)
+        x = torch.baddbmm(x, x, x)
+        x = torch.tanh(x)
+        x = torch.pow(x, x)
         for layer in self.layers:
             x = layer(x)
             x = torch.nn.functional.relu(x)
@@ -70,10 +76,12 @@ class MLP(nn.Module):
         x = x.squeeze()
         x = torch.triu(x, 1)
         x = torch.nan_to_num(x)
-        # ne cannot backward
+        # ne and eq cannot backward
         # x = torch.ne(x, 1.0)
-        # x = torch.nn.functional.dropout(x, self.p)
-        # x = x * self.y
+        # y = torch.eq(x, 1.0)
+        x = torch.cumsum(x, -1)
+        x = x.permute(0, 2, 1)
+        x = x.transpose(1, 2)
         loss = torch.sum(x)
         # long cannot backward
         # loss = loss.long()

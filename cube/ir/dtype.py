@@ -47,7 +47,7 @@ class DTypeInferRule:
         if IRDType.float32 in dtypes and IRDType.float16 in dtypes:
             raise RuntimeError(f"Find node has both fp32 and fp16 inputs {node}")
         # TODO(yizhu1): hack
-        if node.signature == 'torch.ne':
+        if node.signature in ['torch.ne', 'torch.eq']:
             return IRDType.boolean
         elif node.signature == 'torch.Tensor.long':
             return IRDType.int64
