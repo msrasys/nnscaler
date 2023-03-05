@@ -156,7 +156,7 @@ class FxModuleParser:
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
             all_ir_nodes += ir_nodes
 
-        #output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
+        # output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
         # handle outputs
         output_nodes = [node.all_input_nodes for node in module.graph.nodes if node.op == 'output']
         print(f'outputs = {output_nodes}')
@@ -171,6 +171,8 @@ class FxModuleParser:
             else:
                 outputs.append(val)
         output_val = outputs
+        print(f'zql: {output_val}')
+        # exit(1)
 
         frame.pop_var()
         frame.pop_attr()
@@ -206,8 +208,7 @@ class FxModuleParser:
             if node_type == FxNodeKind.Placeholder:
                 return []
             if node_type == FxNodeKind.Output:
-                #return FxModuleParser.parse_prim_output_node(node, module, frame)
-                return []
+                return FxModuleParser.parse_prim_output_node(node, module, frame)
 
             if node_type in (FxNodeKind.PrimCallFunction, FxNodeKind.PrimCallMethod):
                 return FxModuleParser.parse_prim_function_method(node, module, frame)
@@ -324,7 +325,7 @@ class FxModuleParser:
 
         return list()
 
-    '''@staticmethod
+    @staticmethod
     def parse_prim_output_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRCell]:
         assert len(node.args) == 1 and len(node.kwargs) == 0
         ir_nodes = []
@@ -356,7 +357,7 @@ class FxModuleParser:
         generate_outputs(node.args[0], ir_nodes)
         if len(ir_nodes) > 0:
             ir_nodes[-1].set_output(0, frame.get_var(node.name))
-        return ir_nodes'''
+        return ir_nodes
 
     # # NOTE: this is a function in torch.fx
     # @staticmethod
