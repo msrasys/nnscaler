@@ -264,7 +264,6 @@ class FxModuleParser:
 
         # map to IR operator
         if SignFx2Op.exist(fsig):
-            print('zql: ', fsig, input_vals, node.meta, node.args, node.kwargs)
             ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
         else:
             input_vals = [extract_val(v) for v in node.args]
@@ -281,12 +280,7 @@ class FxModuleParser:
             # case2: python runtime function
             else:
                 print(f'>>> Set python runtime function: {fsig}')
-                # if fsig == 'builtins.getattr':
-                #     print('zql func getattr: ', FxModuleParser.ntype(node), node.name, node.target, node.meta, node.args, node.kwargs)
                 ir_node = IRPyFunc(fsig, input_vals, [None], **kwargs)
-        # if fsig == 'builtins.getattr':
-        #     print('zql ir_node: ', ir_node)
-        #     exit(1)
 
         if isinstance(ir_node, IRCell):
             # TODO gracefully set output

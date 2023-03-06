@@ -86,7 +86,7 @@ class SignFx2Op:
         __ftemplate('softmax') : function.Softmax,
         __ttemplate('bmm') : function.BatchLinear,
         __ttemplate('pow'): function.Pow,
-        # __ttemplate('baddbmm'): function.BMMAdd,
+        __ttemplate('baddbmm'): function.BMMAdd,
         __ttemplate('permute'): function.Permute,
         __ttemplate('transpose'): function.Transpose,
         __tttemplate('expand'): function.Expand,
