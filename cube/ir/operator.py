@@ -1,7 +1,7 @@
 from typing import Optional, Tuple, Any, Union
 import copy
 
-from cube.ir.cten import IRCell, IRTensor
+from cube.ir.cten import IRCell, IRTensor, IRObject
 from cube.ir.tensor import IRFullTensor
 from cube.algorithm.factory import DistAlgorithmFactory
 from cube.algorithm.generics import GenericDistAlgo
@@ -128,17 +128,16 @@ class IRFwOperation(IRCell):
 
     def __repr__(self) -> str:
         sign = self.signature.split('.')[-1]
-        ins = [t for t in self.inputs() if isinstance(t, IRTensor) and not t.is_attr()]
         dscp = (f"FwOp{self._id}-{self.device}(sign={sign}, "
-                f"inputs={ins}, "
+                f"inputs={self.inputs()}, "
                 f"outputs={self.outputs()})")
         return dscp
 
     def extra_repr(self) -> str:
         sign = self.signature.split('.')[-1]
-        ins = [t for t in self.inputs()]
+        # ins = [t for t in self.inputs()]
         dscp = (f"FwOp{self._id}-{self.device}(sign={sign}, "
-                f"inputs={ins}, "
+                f"inputs={self.inputs()}, "
                 f"outputs={self.outputs()})")
         return dscp
 

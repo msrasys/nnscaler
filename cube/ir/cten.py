@@ -265,7 +265,7 @@ class IRCell:
             raise RuntimeError(
                 f"Set the input out of range ({input_index} >= {c} or {input_index} < {-c})"
             )
-        if isinstance(val, IRTensor):
+        if isinstance(val, IRObject):
             # copy the val
             val = copy.copy(val)
             # set tensor dst
@@ -298,7 +298,7 @@ class IRCell:
             raise RuntimeError(
                 f"Set the input out of range ({output_index} >= {c} or {output_index} < {-c})"
             )
-        if isinstance(val, IRTensor):
+        if isinstance(val, IRObject):
             val = copy.copy(val)
             val.cell = self
 
@@ -430,7 +430,7 @@ class IRCell:
 
 class IRObject:
     """
-    IRObject serves as non-tensor inputs/outputs for IRCell.
+    IRObject serves as general data of IRGraph edge
     """
 
     def __init__(self, name: Optional[str] = None, tid: Optional[int] = None):
@@ -439,7 +439,7 @@ class IRObject:
         @param tid int: object unique id
         """
         self._id: int = tid if isinstance(tid, int) else IDGenerator().gen_tensor_id()
-        self.name: str = name if name else 'tensor'
+        self.name: str = name if name else 'obj'
         self._cell: Optional[IRCell] = None
         self._is_attr: bool = False
 
@@ -522,7 +522,7 @@ class IRObject:
 
 class IRTensor(IRObject):
     """
-    IRTensor serves as IRGraph edge
+    IRTensor serves as tensor data of IRGraph edge
 
     Note by setting IRTensor name to "None" indicates this tensor holds nothing
     and will be translated to None in code generation. 

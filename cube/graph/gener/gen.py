@@ -9,7 +9,7 @@ from cube.graph.graph import IRGraph
 from cube.graph.segment import IRSegment
 from cube.graph.function.pyfunc import IRPyFunc
 
-from cube.ir.cten import IRCell
+from cube.ir.cten import IRCell, IRObject
 from cube.ir.tensor import IRFullTensor, IRSubTensor
 from cube.ir.operator import IRFwOperation
 
@@ -147,15 +147,14 @@ class IRAdapterGener:
     def auto_pyfunc(graph: IRSegment):
         """
         Make pyfunc to be local
+        IRPyFunc will be replicated to devices with its producers output
         """
         for func in graph.select(ntype=IRPyFunc, flatten=False):
             assert func.mirror is None, "PyFunc is only supported by inference"
-            assert all(not isinstance(t, IRSubTensor) for t in func.outputs()), \
-                "PyFunc doesn't support tensor outputs"
             # get devices it will lowered to
             devices = set()
             for t in func.inputs():
-                if not isinstance(t, IRSubTensor): continue
+                if not isinstance(t, IRObject): continue
                 producers = graph.producers(t.parent)
                 for p in producers:
                     devices.update(p.device)
@@ -164,13 +163,13 @@ class IRAdapterGener:
             for devid in devices:
                 inputs = []
                 for t in func.inputs():
-                    if isinstance(t, IRSubTensor):
+                    if isinstance(t, IRObject):
                         if t.is_attr():
                             tensors = set(tensor for tensor in graph.ctensors(t.parent) if devid in tensor.device and tensor.cell != func)
                         else:
                             tensors = set(tensor for tensor in graph.ptensors(t.parent) if devid in tensor.device)
                         assert len(tensors) == 1, \
-                            f"Find {len(tensors)} != 1 versions of tensor {t} on a same device."
+                            f"Find {len(tensors)} != 1: {tensors} versions of tensor {t} on a same device."
                         t = list(tensors)[0]
                     inputs.append(t)
                 lower_func = IRPyFunc(func.signature, inputs, func.outputs(), **func.kwargs)

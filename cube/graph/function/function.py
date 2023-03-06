@@ -5,9 +5,10 @@ import torch
 import warnings
 import operator
 
-from cube.ir.cten import IRTensor
+from cube.ir.cten import IRTensor, IRObject
 from cube.ir.tensor import IRSubTensor
 from cube.ir.dtype import IRDType
+from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
 from cube.graph.function.conv import IRPad, IRConv2D, IRConv3D
 from cube.graph.function.creators import IROnes, IRToTensor, IRZeros, IRRand, IRNewTensor
@@ -1460,3 +1461,32 @@ def ShapeAsTensor(signature, inputs):
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
 
     return IRDimops(ShapeAsTensor, '_shape_as_tensor', signature, [anno], [input])
+
+
+
+# ================== Non-autograd Function Space =================
+
+def Size(signature, inputs) -> Union[List[int], IRPyFunc]:
+    """
+    torch.Tensor.size(tensor, dim=None)
+    """
+    assert len(inputs) == 2 or len(inputs) == 1, f"but got {len(inputs)}, {inputs}"
+    tensor, dim = inputs if len(inputs) == 2 else (inputs[0], None)
+    assert isinstance(tensor, IRTensor)
+    # constant
+    if all(isinstance(dimlen, int) for dimlen in tensor.shape) and not isinstance(dim, IRObject):
+        return tensor.shape[dim] if isinstance(dim, int) else list(tensor.shape)
+    return IRPyFunc(signature, inputs, [IRObject()])
+
+
+def GetItem(signature, inputs) -> Union[Any, IRPyFunc]:
+    """
+    _operator.getitem(obj, index: int)
+    """
+    assert len(inputs) == 2, f"but got {inputs}"
+    obj, index = inputs
+    if (not isinstance(obj, IRObject)) and isinstance(index, int):
+        return obj[index]
+    else:
+        return IRPyFunc(signature, inputs, [IRObject()])
+    

@@ -957,8 +957,7 @@ class IRSegment(IRCell):
                     continue
                 # loss doesn't have consumers
                 if len(segment.consumers(ftensor)) == 0:
-                    # TODO: loss judgement should be more robust
-                    if ftensor.nelement() == 1:
+                    if isinstance(ftensor, IRFullTensor) and ftensor.is_loss():
                         outputs.add(otensor)
                     continue
                 # for outside consumers
@@ -1030,7 +1029,7 @@ class IRSegment(IRCell):
 
     def __repr__(self):
         fw = 'f' if self.isfw() else 'b'
-        inputs = tuple(t for t in self.inputs() if isinstance(t, IRObject) and not t.is_param())
+        inputs = tuple(t for t in self.inputs() if isinstance(t, IRObject) and not t.is_attr())
         if self.isfw():
             dscp = f"{fw}Graph{self.cid}-{self.device}(inputs={inputs}, outputs={self.outputs()})"
         else:
