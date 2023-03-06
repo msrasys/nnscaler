@@ -139,9 +139,7 @@ class SignFx2Op:
         '_operator.mul': function.Mul,
         
         __ttemplate('div') : function.Div,
-        __ttemplate('truediv'): function.Div,
         __ttemplate('true_divide'): function.Div,
-        __ttemplate('floordiv') : function.FloorDiv,
         __ttemplate('floor_divide') : function.FloorDiv,
         '_operator.floordiv': function.FloorDiv,
 
