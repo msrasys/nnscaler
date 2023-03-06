@@ -264,6 +264,7 @@ class FxModuleParser:
 
         # map to IR operator
         if SignFx2Op.exist(fsig):
+            print('zql: ', fsig, input_vals, node.meta, node.args, node.kwargs)
             ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
         else:
             input_vals = [extract_val(v) for v in node.args]
@@ -280,7 +281,12 @@ class FxModuleParser:
             # case2: python runtime function
             else:
                 print(f'>>> Set python runtime function: {fsig}')
+                # if fsig == 'builtins.getattr':
+                #     print('zql func getattr: ', FxModuleParser.ntype(node), node.name, node.target, node.meta, node.args, node.kwargs)
                 ir_node = IRPyFunc(fsig, input_vals, [None], **kwargs)
+        # if fsig == 'builtins.getattr':
+        #     print('zql ir_node: ', ir_node)
+        #     exit(1)
 
         if isinstance(ir_node, IRCell):
             # TODO gracefully set output
@@ -294,6 +300,11 @@ class FxModuleParser:
 
     @staticmethod
     def parse_prim_attr_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
+        """
+        There are two types of get_attr, one is `FxNodeKind.PrimGetAttr` which is dealt with in this function.
+        The other is `FxNodeKind.PrimCallFunction ` (i.e., <built-in function getattr>)
+        which is dealt with by parse_prim_function_method.
+        """
         assert node is not None
         tensor_name = node.name
         if 'tensor_meta' in node.meta:

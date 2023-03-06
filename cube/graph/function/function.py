@@ -6,7 +6,7 @@ import warnings
 import operator
 
 from cube.ir.cten import IRTensor, IRObject
-from cube.ir.tensor import IRSubTensor
+from cube.ir.tensor import IRSubTensor, IRFullTensor
 from cube.ir.dtype import IRDType
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
@@ -616,7 +616,7 @@ def MaskedFill(signature, inputs):
     edim_ou = copy.copy(edim_in0)
     for idx, (lhs, rhs) in enumerate(zip(input0.shape, input1.shape)):
         if lhs != rhs and rhs == 1:
-            edim_ou[idx] = '1'
+            edim_in1[idx] = '1'
     anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
     return IRDimops(MaskedFill, 'masked_fill', signature, [anno], [input0, input1], value=value)
 
@@ -1493,3 +1493,18 @@ def GetItem(signature, inputs) -> Union[Any, IRPyFunc]:
     else:
         return IRPyFunc(signature, inputs, [IRObject()])
     
+def GetAttr(signature, inputs) -> Union[List[int], IRPyFunc]:
+    """
+    builtins.getattr(object, name[, default])
+    NOTE: only deal with the attr "shape" of IRFullTensor, because other type of object may not
+    have instantiated object or the attr is not simple value.
+    """
+    assert len(inputs) == 2, f"but got {inputs}"
+    obj, name = inputs
+    if name == 'shape':
+        assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
+        assert hasattr(obj, name), f"attr {name} is not existed in {obj}"
+        return getattr(obj, name)
+    else:
+        # FIXME: is it right?
+        return IRPyFunc(signature, inputs, [IRObject()])

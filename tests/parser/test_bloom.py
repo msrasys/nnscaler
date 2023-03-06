@@ -28,5 +28,15 @@ print("tracing model done.")
 
 print("parsing fx graph to cube graph...")
 from cube.graph.parser import FxModuleParser
-FxModuleParser.parse(traced_graph, dummy_inputs=inputs)
+cube_graph = FxModuleParser.parse(traced_graph, dummy_inputs=inputs)
 print("parsing done.")
+
+# # AutoDist
+# # profile communication cost
+# import os
+# comm_gpu_num = (2, 4)
+# for gpu_num in comm_gpu_num:
+#     os.system(f'torchrun --nproc_per_node={gpu_num} /home/quzha/AutoDist/comm_profile.py --comm_profile_dir=./ --connect_type=NV')
+# # find the best partition plan
+# from autodist.apis import compile
+# compile(cube_graph, ...)
