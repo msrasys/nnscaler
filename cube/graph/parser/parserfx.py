@@ -246,7 +246,7 @@ class FxModuleParser:
                 return frame.get_var(var_name)
             elif isinstance(fx_node, (int, float, str, torch.dtype)) or fx_node is None:
                 return fx_node
-            elif isinstance(fx_node, tuple):
+            elif isinstance(fx_node, (tuple, list)):
                 return handle_tuple(fx_node)
             else:
                 raise RuntimeError(f'Unsupported input node {fx_node}, {type(fx_node)} in parse function!')
