@@ -1,4 +1,4 @@
-# USE_TORCHFX=1 SINGLE_DEV_MODE=1 PYTHONPATH=.:$PYTHONPATH:torchscaletest/torchscale python examples/nlp/torchscale/lm_fx_test.py  examples/nlp/torchscale/lm_input  --activation-fn gelu --share-decoder-input-output-embed --validate-interval-updates 1000 --save-interval-updates 1000 --no-epoch-checkpoints --memory-efficient-fp16 --fp16-init-scale 4 --arch lm_base --task language_modeling --sample-break-mode none --tokens-per-sample 128 --optimizer adam --adam-betas "(0.9, 0.98)" --adam-eps 1e-08 --clip-norm 0.0 --lr 5e-4 --lr-scheduler polynomial_decay --warmup-updates 750 --dropout 0.1 --attention-dropout 0.1 --weight-decay 0.01 --batch-size 4 --update-freq 1 --required-batch-size-multiple 1 --total-num-update 50000 --max-update 50000 --seed 1 --ddp-backend=c10d --subln --xpos-rel-pos --fp16 --policy PASData
+# USE_TORCHFX=1 SINGLE_DEV_MODE=1 PYTHONPATH=.:$PYTHONPATH:torchscaletest/torchscale python examples/nlp/torchscale/run_torchscale_tl.py    examples/nlp/torchscale/input  --arch mt_base --share-decoder-input-output-embed     --optimizer adam --adam-betas '(0.9, 0.98)' --clip-norm 0.0     --lr 5e-4 --lr-scheduler inverse_sqrt --warmup-updates 4000     --dropout 0.3 --weight-decay 0.0001     --max-tokens 4096 --fp16 --policy PASData
 
 import torch
 import pickle
@@ -67,22 +67,24 @@ model.eval()
 print("building model succeed: ", type(model))
 
 # create dummy input
-with open('examples/nlp/torchscale/input_lm.bak', 'rb') as f:
-# with open('examples/nlp/torchscale/lm_input_v2.pkl', 'rb') as f:
+with open('examples/nlp/torchscale/input_tl', 'rb') as f:
     dummy_input = pickle.load(f)
 device = next(model.parameters()).device
 print(f'device = {device}')
 for key in dummy_input.keys():
     dummy_input[key] = dummy_input[key].to(device)
-print(f'dummy_input <{type(dummy_input)}> = {dummy_input}')
+print("creating dummy input succeed")
+dummy_input['features_only'] = False
+dummy_input['return_all_hiddens'] = False
+print(f'dummy_input = {dummy_input}, {type(dummy_input)}')
 
 # create input as list of tensors/objects
 dummy_input_list = [val for key, val in dict(dummy_input).items()]
-# print(f'dummy_input_list = {dummy_input_list}, len = {len(dummy_input_list)}')
+print(f'dummy_input_list = {dummy_input_list}')
 
 with torch.no_grad():
-    output_origin = model(**dummy_input)
-    # output_origin = model(*dummy_input_list)
+    # output_origin = model(**dummy_input)
+    output_origin = model(*dummy_input_list)
     # print(f'output_origin = {output_origin}')
 
 
@@ -90,8 +92,8 @@ input_shapes = [list(dummy_input[input].size()) for input in dummy_input if isin
 input_dtypes = [dummy_input[input].dtype for input in dummy_input if isinstance(dummy_input[input], torch.Tensor)]
 input_names = tuple([input for input in dummy_input if isinstance(dummy_input[input], torch.Tensor)])
 
-# input_shapes += [[None], [None]]
-# input_dtypes += [bool, bool]
+input_shapes += [[None], [None]]
+input_dtypes += [bool, bool]
 
 print(f'input_shapes = {input_shapes}')
 print(f'input_dtypes = {input_dtypes}')
@@ -99,16 +101,14 @@ print(f'input_dtypes = {input_dtypes}')
 dataloader = cube.runtime.syndata.SynDataLoader(
     shapes=(input_shapes),
     dtypes=input_dtypes,
-    batch_dims=(0,0),
+    batch_dims=(0,0,0, None, None),
 )
 sample_input = next(dataloader)
 print(f'next(dataloader) = {sample_input}')
 sample_input_cpu = tuple([val.to(device) if isinstance(val, torch.Tensor) else val for val in sample_input])
 
 model = cube.SemanticModel(
-     #TODO fix me model, dummy_input=sample_input_cpu,
-    # model, dummy_input=dummy_input_list,
-    model, dummy_input=dummy_input,
+     model, dummy_input=sample_input_cpu,
 )
 
 @cube.compile(model, dataloader, PAS=PAS, load_content=False)
