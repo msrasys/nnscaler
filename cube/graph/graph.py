@@ -251,12 +251,12 @@ class IRGraph(IRSegment):
         # instantiate to subtensor
         for node in nodes:
             for idx, ftensor in enumerate(node.inputs()):
-                if isinstance(ftensor, IRFullTensor):
-                    subtensor = ftensor.tosub()
+                if isinstance(ftensor, IRObject):
+                    subtensor = ftensor.tosub() if isinstance(ftensor, IRFullTensor) else ftensor
                     node.set_input(idx, subtensor)
             for idx, ftensor in enumerate(node.outputs()):
-                if isinstance(ftensor, IRFullTensor):
-                    subtensor = ftensor.tosub()
+                if isinstance(ftensor, IRObject):
+                    subtensor = ftensor.tosub() if isinstance(ftensor, IRFullTensor) else ftensor
                     node.set_output(idx, subtensor)
         graph = IRGraph(nodes, inputs, outputs, module_name)
         return graph

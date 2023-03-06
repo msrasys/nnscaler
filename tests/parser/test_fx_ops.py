@@ -21,6 +21,7 @@ class TestOpModule(torch.nn.Module):
         # matmul: [256, 512], [512, 256] -> [256, 256]
         x1 = torch.matmul(x, self.param1)
         x1 = torch.matmul(x, self.param1)
+        x1 = x1 + x1.size(0) + x1.size()[0]
         x2 = torch.chunk(x, 2, dim=1)
         x3 = x2[0]
         x = x + x.size(0)

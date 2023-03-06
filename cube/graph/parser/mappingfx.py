@@ -14,7 +14,9 @@ class SignFx2Op:
         """
         Map the signature to GenericLogicalOp
         """
-        if 'torch.' not in signature and 'cube.runtime.' not in signature:
+        bultin_regions = ['torch.', 'cube.runtime.', '_operator.']
+        # customized function
+        if all(not signature.startswith(region) for region in bultin_regions):
             signature = signature.split('.')[-1]
         if signature in SignFx2Op.kOpMap:
             function = SignFx2Op.kOpMap[signature]
@@ -26,7 +28,9 @@ class SignFx2Op:
 
     @staticmethod
     def exist(signature: str) -> bool:
-        if 'torch.' not in signature and 'cube.runtime.' not in signature:
+        bultin_regions = ['torch.', 'cube.runtime.', '_operator.']
+        # customized function
+        if all(not signature.startswith(region) for region in bultin_regions):
             signature = signature.split('.')[-1]
         return signature in SignFx2Op.kOpMap
 
@@ -93,6 +97,10 @@ class SignFx2Op:
         'torch.functional.einsum': function.EinSum,
 
         __ftemplate('layer_norm'): function.LayerNorm,
+
+        # ============== runtime function =================
+        __tttemplate('size'): function.Size,
+        '_operator.getitem': function.GetItem,
 
         # # torch nn functional
         #

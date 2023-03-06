@@ -11,6 +11,7 @@ from cube.graph.parser.frame import Frame
 from cube.graph.parser.mapping import DType2IRDType
 from cube.graph.parser.mappingfx import SignFx2Op
 from cube.graph.function.pyfunc import IRPyFunc
+from cube.graph.function import Identity
 
 import torch.fx
 
@@ -157,22 +158,8 @@ class FxModuleParser:
             if ir_nodes is not None:
                 all_ir_nodes += ir_nodes
 
-        #output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
-        # handle outputs
-        output_nodes = [node.all_input_nodes for node in module.graph.nodes if node.op == 'output']
-        print(f'outputs = {output_nodes}')
-        output_var_name = [output.name for output in [item for sublist in output_nodes for item in sublist]]
-        output_val = [frame.get_var(var_name) for var_name in output_var_name]
-
-        # flatten output_val
-        outputs = list()
-        for val in output_val:
-            if isinstance(val, list):
-                outputs += val
-            else:
-                outputs.append(val)
-        output_val = outputs
-
+        output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
+    
         frame.pop_var()
         frame.pop_attr()
         if FxModuleParser.save_content:
@@ -260,7 +247,7 @@ class FxModuleParser:
                 return frame.get_var(var_name)
             elif isinstance(fx_node, (int, float, str, torch.dtype)) or fx_node is None:
                 return fx_node
-            elif isinstance(fx_node, tuple):
+            elif isinstance(fx_node, (tuple, list)):
                 return handle_tuple(fx_node)
             else:
                 raise RuntimeError(f'Unsupported input node {fx_node}, {type(fx_node)} in parse function!')
@@ -279,28 +266,31 @@ class FxModuleParser:
         if SignFx2Op.exist(fsig):
             ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
         else:
-            #input_vals = [extract_val(v) for v in node.args]
-            #kwargs = {key: extract_val(v) for key, v in node.kwargs.items()}
+            input_vals = [extract_val(v) for v in node.args]
+            # FIXME: handle cases for IRObject in kwargs
+            kwargs = {key: extract_val(v) for key, v in node.kwargs.items()}
             # case1: unknown torch operator
             if FxModuleParser._is_torch_autograd_op(node, frame, fsig):
                 print(f'>>> Find unkown pytorch operation: {fsig}')
                 fname = fsig.split('.')[-1] if '.' in fsig else fname
                 ir_node = IRFwOperation(fname, fsig, len(input_vals), 1)
-                #ir_node.kwargs = kwargs
+                ir_node.kwargs = kwargs
                 for idx, t in enumerate(input_vals):
                     ir_node.set_input(idx, t)
             # case2: python runtime function
             else:
                 print(f'>>> Set python runtime function: {fsig}')
-                #ir_node = IRPyFunc(fsig, input_vals, [None], **kwargs)
-                ir_node = IRPyFunc(fsig, input_vals, [None])
+                ir_node = IRPyFunc(fsig, input_vals, [None], **kwargs)
 
-        # TODO gracefully set output
-        output_name = node.name
-        output_val = frame.get_var(output_name)
-        ir_node.set_output(0, output_val)
-
-        return [ir_node]
+        if isinstance(ir_node, IRCell):
+            # TODO gracefully set output
+            output_name = node.name
+            output_val = frame.get_var(output_name)
+            ir_node.set_output(0, output_val)
+            return [ir_node]
+        else:
+            frame.set_var(node.name, ir_node)
+            return []
 
     @staticmethod
     def parse_prim_attr_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
@@ -349,10 +339,9 @@ class FxModuleParser:
             if isinstance(val, torch.fx.Node):
                 return frame.get_var(val.name)
             return val
-
-        generate_outputs(node.args[0], ir_nodes)
-        if len(ir_nodes) > 0:
-            ir_nodes[-1].set_output(0, frame.get_var(node.name))
+        
+        output = generate_outputs(node.args[0], ir_nodes)
+        frame.set_var(node.name, output)
         return ir_nodes
 
     # # NOTE: this is a function in torch.fx
