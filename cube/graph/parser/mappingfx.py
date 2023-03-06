@@ -14,7 +14,7 @@ class SignFx2Op:
         """
         Map the signature to GenericLogicalOp
         """
-        bultin_regions = ['torch.', 'cube.runtime.', '_operator.']
+        bultin_regions = ['torch.', 'cube.runtime.', '_operator.', 'builtins.']
         # customized function
         if all(not signature.startswith(region) for region in bultin_regions):
             signature = signature.split('.')[-1]
@@ -28,7 +28,7 @@ class SignFx2Op:
 
     @staticmethod
     def exist(signature: str) -> bool:
-        bultin_regions = ['torch.', 'cube.runtime.', '_operator.']
+        bultin_regions = ['torch.', 'cube.runtime.', '_operator.', 'builtins.']
         # customized function
         if all(not signature.startswith(region) for region in bultin_regions):
             signature = signature.split('.')[-1]
@@ -96,12 +96,12 @@ class SignFx2Op:
         __ftemplate('embedding'): function.Embedding,
         'torch.functional.einsum': function.EinSum,
 
-        # TODO
         __ftemplate('layer_norm'): function.LayerNorm,
 
         # ============== runtime function =================
         __tttemplate('size'): function.Size,
         '_operator.getitem': function.GetItem,
+        'builtins.getattr': function.GetAttr,
 
         # # torch nn functional
         #
@@ -136,13 +136,13 @@ class SignFx2Op:
         # __ttemplate('sub') : function.Sub,
         #
         # __ttemplate('mul') : function.Mul,
+        '_operator.mul': function.Mul,
         
         __ttemplate('div') : function.Div,
-        __ttemplate('truediv'): function.Div,
         __ttemplate('true_divide'): function.Div,
-        __ttemplate('floordiv') : function.FloorDiv,
         __ttemplate('floor_divide') : function.FloorDiv,
-        
+        '_operator.floordiv': function.FloorDiv,
+
         __ttemplate('neg'): function.Neg,
         #
         __ttemplate('gt'): function.CompareGT,

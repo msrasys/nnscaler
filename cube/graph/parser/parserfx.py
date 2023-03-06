@@ -155,7 +155,8 @@ class FxModuleParser:
         all_ir_nodes: List[IRFwOperation] = list()
         for node in module.graph.nodes:
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
-            all_ir_nodes += ir_nodes
+            if ir_nodes is not None:
+                all_ir_nodes += ir_nodes
 
         output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
     
@@ -293,6 +294,11 @@ class FxModuleParser:
 
     @staticmethod
     def parse_prim_attr_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
+        """
+        There are two types of get_attr, one is `FxNodeKind.PrimGetAttr` which is dealt with in this function.
+        The other is `FxNodeKind.PrimCallFunction ` (i.e., <built-in function getattr>)
+        which is dealt with by parse_prim_function_method.
+        """
         assert node is not None
         tensor_name = node.name
         if 'tensor_meta' in node.meta:
@@ -305,13 +311,10 @@ class FxModuleParser:
             ir_tensor.as_param()
             frame.add_var(tensor_name, ir_tensor)
         else:
-            # FIXME: why no need to record the constant value of this var?
-            # the value can be obtained below:
-            # var = FxModuleParser.fetch_attr(module, node.target)
-            print(f'WARNING: {node.name} {node.meta} in attr node uses empty IRObject!')
-            frame.add_var(tensor_name, IRObject())
+            var = FxModuleParser.fetch_attr(module, node.target)
+            frame.add_var(tensor_name, var)
 
-        return list()
+        return None
 
     @staticmethod
     def parse_prim_output_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRCell]:

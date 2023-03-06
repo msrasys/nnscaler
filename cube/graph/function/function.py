@@ -6,7 +6,7 @@ import warnings
 import operator
 
 from cube.ir.cten import IRTensor, IRObject
-from cube.ir.tensor import IRSubTensor
+from cube.ir.tensor import IRSubTensor, IRFullTensor
 from cube.ir.dtype import IRDType
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
@@ -616,7 +616,7 @@ def MaskedFill(signature, inputs):
     edim_ou = copy.copy(edim_in0)
     for idx, (lhs, rhs) in enumerate(zip(input0.shape, input1.shape)):
         if lhs != rhs and rhs == 1:
-            edim_ou[idx] = '1'
+            edim_in1[idx] = '1'
     anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
     return IRDimops(MaskedFill, 'masked_fill', signature, [anno], [input0, input1], value=value)
 
@@ -628,28 +628,31 @@ def LayerNorm(signature, inputs):
     """
     if 'torch.' in signature:
         tensor, normalized_shape, weight, bias, eps = inputs
-        assert isinstance(normalized_shape, list), f"normalized_shape for layer_norm can only be List[int]"
+        assert isinstance(normalized_shape, (list, tuple, torch.Size)), \
+            f"normalized_shape for layer_norm can only be tuple or list or torch.Size, NOT {type(normalized_shape)}"
     else:
+        assert 'cube.runtime.function.layer_norm' == signature, f'{signature} of LayerNorm is not supported.'
         tensor, weight, bias, normalized_shape, eps = inputs
     letters = iter(string.ascii_lowercase)
     einput = ShapeAnno.create_shape_str(tensor.shape, iterator=letters)
     eoutput = copy.copy(einput)
     ndims = len(tensor.shape)
-    for dim in range(len(normalized_shape)):
+    ndims_normshape = len(normalized_shape)
+    for dim in range(ndims_normshape):
+        # though these dimensions can be partitioned,
+        # such partition induces additional communication and complexity
         einput[ndims-1-dim] += '^'
         eoutput[ndims-1-dim] += '^'
-    assert not (bias is None is weight is not None), f"Not support for None of weight and parameter of bias"
+    assert not (bias is not None and weight is None), f"Not support for None of weight and parameter of bias"
     einputs, inputs = [einput], [tensor]
     kwargs = {}
     if weight is not None:
-        eweight = ShapeAnno.create_shape_str(weight.shape, reduction='^', iterator=letters)
-        einputs.append(eweight)
+        einputs.append(einput[ndims-ndims_normshape:])
         inputs.append(weight)
     else:
         kwargs['weight'] = weight
     if bias is not None:
-        ebias = ShapeAnno.create_shape_str(bias.shape, reduction='^', iterator=letters)
-        einputs.append(ebias)
+        einputs.append(einput[ndims-ndims_normshape:])
         inputs.append(bias)
     else:
         kwargs['bias'] = bias
@@ -1490,3 +1493,18 @@ def GetItem(signature, inputs) -> Union[Any, IRPyFunc]:
     else:
         return IRPyFunc(signature, inputs, [IRObject()])
     
+def GetAttr(signature, inputs) -> Union[List[int], IRPyFunc]:
+    """
+    builtins.getattr(object, name[, default])
+    NOTE: only deal with the attr "shape" of IRFullTensor, because other type of object may not
+    have instantiated object or the attr is not simple value.
+    """
+    assert len(inputs) == 2, f"but got {inputs}"
+    obj, name = inputs
+    if name == 'shape':
+        assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
+        assert hasattr(obj, name), f"attr {name} is not existed in {obj}"
+        return getattr(obj, name)
+    else:
+        # FIXME: is it right?
+        return IRPyFunc(signature, inputs, [IRObject()])

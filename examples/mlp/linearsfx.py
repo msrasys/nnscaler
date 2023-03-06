@@ -53,7 +53,7 @@ class MLP(nn.Module):
                 self.layers.append(nn.Linear(dim * mult, dim, bias=False))
                 last_dim = dim
 
-        # self.layer_norm = nn.LayerNorm(last_dim) #TODO CHECK torch.fx ignores LayerNorm
+        self.layer_norm = nn.LayerNorm(last_dim) #TODO CHECK torch.fx ignores LayerNorm
         # self.p = 0.5
         self.drop_out = nn.Dropout()
         # self.y = torch.nn.Parameter(torch.empty(128, last_dim))
@@ -72,7 +72,7 @@ class MLP(nn.Module):
             x = layer(x)
             x = torch.nn.functional.relu(x)
             x = torch.nn.functional.gelu(x)
-        # x = self.layer_norm(x)
+        x = self.layer_norm(x)
         type_x = torch.pow(x, 1.0)
         x = x.type_as(type_x)
         x = x.unsqueeze(1)
