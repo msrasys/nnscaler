@@ -234,6 +234,3 @@ class GPTInferDataLoader(cube.runtime.syndata.SynDataLoader):
             device=torch.cuda.current_device()
         ).repeat(self.batch_size).view(self.batch_size, -1)
         return input_ids, position_ids
-
-    def __next__(self):
-        return self.samples[0]

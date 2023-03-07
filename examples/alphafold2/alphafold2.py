@@ -94,14 +94,14 @@ def run(size_config, other_config, policy):
 def test_main():
     # Training && Evoformer Stack
     # initial training
-    # bs, s, r, cm, cz = 1, 128, 256, 256, 128
+    bs, s, r, cm, cz = 1, 128, 256, 256, 128
     # first fine-tuning
     # bs, s, r, cm, cz = 1, 512, 256, 256, 128
     # second fine-tuning
     # bs, s, r, cm, cz = 1, 512, 384, 256, 128
-    bs, s, r, cm, cz = 1, 512, 512, 256, 128
+    # bs, s, r, cm, cz = 1, 512, 512, 256, 128
 
-    dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 4, False, True, False
+    dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 48, False, True, False
     policy = spmd.PASDAP
 
     # Training && Extra Sequence
@@ -127,4 +127,3 @@ def test_main():
 if __name__ == '__main__':
     cube.init()
     test_main()
-    # build_alphafold_config(1)

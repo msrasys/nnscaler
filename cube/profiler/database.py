@@ -216,14 +216,14 @@ class ProfileDataBase:
             torch.cuda.set_device(device)
         
         in_mem_info, param_mem_info = [], []
-        Residual_mem, input_count = 0, 0
+        residual_mem, input_count = 0, 0
         for t in node.inputs():
             if t.is_param():
                 param_mem_info.append(t.byte_size())
             else:
                 input_count += 1
                 if input_count == 1:
-                    Residual_mem += t.byte_size()
+                    residual_mem += t.byte_size()
                 in_mem_info.append(t.byte_size())
 
             
@@ -232,7 +232,7 @@ class ProfileDataBase:
             CompProfiler.profile(fn, shapes, dtypes, **kwargs)
         # log to database
         key = self._serialize(node)
-        self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, Residual_mem)
+        self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, residual_mem)
         print(
             f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} "
             f"=> in mem info: {in_mem_info} | param mem info: {param_mem_info} | fw: {round(fw_span, 2)} ms | "
@@ -240,11 +240,11 @@ class ProfileDataBase:
 
         if isinstance(device, int):
             torch.cuda.set_device(orig_device)
-        return tuple(in_mem_info), tuple(param_mem_info), fw_span, bw_span, infer_memory, train_mem_info, Residual_mem
+        return tuple(in_mem_info), tuple(param_mem_info), fw_span, bw_span, infer_memory, train_mem_info, residual_mem
 
     def insert(self, name: str, key: str, in_mem_info: Tuple[int], param_mem_info: Tuple[int],
                fw_span: float, bw_span: float, infer_memory: int, train_mem_info: Tuple[int],
-               Residual_mem: int):
+               residual_mem: int):
         """
         log the span of a function name with key
 
@@ -260,7 +260,7 @@ class ProfileDataBase:
         assert isinstance(name, str) and isinstance(key, str)
         if name not in self._data:
             self._data[name] = dict()
-        self._data[name][key] = (in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, Residual_mem)
+        self._data[name][key] = (in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, residual_mem)
 
     def exist(self, node: IRFwOperation) -> bool:
         """

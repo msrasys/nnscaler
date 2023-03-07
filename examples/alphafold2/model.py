@@ -5,11 +5,15 @@ from torch import nn
 
 from examples.alphafold2.module import *
 from dataclasses import dataclass
+
+
 """
 a simplified version for evoformer in alphafold2
   - dropout layers are omitted
   - masks are omitted
 """
+
+
 @dataclass
 class Config:
     bs: int = 1
