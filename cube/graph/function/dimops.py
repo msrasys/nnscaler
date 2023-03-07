@@ -676,8 +676,7 @@ class IRDimops(IRFwOperation):
 
         @return op IRDimop: the new constructed operator
         """
-        inputs = inputs + [kwargs[key] for key in kwargs.keys()]
-        op = self._create_fn[0](self.signature, inputs)
+        op = self._create_fn[0](*inputs, **kwargs, signature=self.signature)
         # annos = self._annos_candidates
         # rules = self._trans_rules
         # op = IRDimops(self.signature, annos, inputs, self.name, rules, **kwargs)

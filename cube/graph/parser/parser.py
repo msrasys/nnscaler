@@ -238,7 +238,7 @@ class ScriptModuleParser:
             input_vals.append(val)
 
         # map to IR operator
-        ir_node = Sign2Op.map(fsig)(inputs=input_vals)
+        ir_node = Sign2Op.map(fsig)(*input_vals)
         
         # push output in the frame
         # help: >>> a = torch._C.TupleType([torch._C.TensorType.getInferred()])
@@ -309,7 +309,7 @@ class ScriptModuleParser:
 
         # May be a symbolic object i.e. IRFwOperation,
         # or, occasionally this node can be statically evaluated, therefore a concrete value
-        result = Sign2Op.map(fsig)(inputs=input_val)
+        result = Sign2Op.map(fsig)(*input_val)
 
         if isinstance(result, IRFwOperation):
             # to create IR node
