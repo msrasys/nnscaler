@@ -742,7 +742,7 @@ class IRGraph(IRSegment):
             return None
 
         def insert_identity(tensor: IRSubTensor, sid: int) -> IRFwOperation:
-            fwop = Identity('', [tensor])
+            fwop = Identity(tensor)
             fwop.infer_shape()
             fwop.set_output(0, fwop.output(0).tosub())
             if tensor.requires_grad:
@@ -898,7 +898,7 @@ class IRGraph(IRSegment):
                     otensors = []
                     for otensor in node.outputs():
                         otensors.append(otensor.parent.select(ctensor.indmap, ctensor.valmap))
-                    multiref = MultiRef('', [itensor, len(otensors)])
+                    multiref = MultiRef(itensor, len(otensors))
                     for idx, otensor in enumerate(otensors):
                         multiref.set_output(idx, otensor)
                     multiref.device = devid
@@ -913,7 +913,7 @@ class IRGraph(IRSegment):
                             outputs = []
                             for output in node.outputs():
                                 outputs.append(output.parent.select(ptensor.indmap, ptensor.valmap))
-                            multiref = MultiRef('', [ptensor, len(outputs)])
+                            multiref = MultiRef(ptensor, len(outputs))
                             for idx, otensor in enumerate(outputs):
                                 multiref.set_output(idx, otensor)
                             multiref.device = devid

@@ -58,14 +58,13 @@ def register(anno: str, name: Optional[str] = None, rules: Optional[List] = None
         code = inspect.getsource(fn)
         code = code[code.index('def'):]
 
-        def udfop(signature: str, inputs: List[Any]):
+        def udfop(*args, signature=None, **kwargs):
             manno = OpAnno(anno)
-            tensors = inputs[:ninputs]
+            tensors = args[:ninputs]
             for idx in range(ninputs):
                 if arg_kinds[idx] == Optional[torch.Tensor] and tensors[idx] is None:
                     manno.set_input(idx, '?')
-            kwarg_vals = inputs[ninputs:]
-            kwargs = dict()
+            kwarg_vals = args[ninputs:]
             for name, val in zip(kwarg_names, kwarg_vals):
                 kwargs[name] = val
             return IRDimops(udfop, op_name, signature, [repr(manno)], tensors, transform_rules=rules, **kwargs)

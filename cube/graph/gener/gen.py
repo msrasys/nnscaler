@@ -485,7 +485,7 @@ class IRAdapterGener:
                         f"{graph.debug_tensor_map_str(ftensor)}"
                     )
                 # set concat input / output
-                node = Cat('torch.cat', (ptensors, catdim))
+                node = Cat(ptensors, dim=catdim)
                 node.set_output(0, new_ftensor.select(otensor.indmap, otensor.valmap))
                 # set gradient
                 for idx, ptensor in enumerate(ptensors):
@@ -518,7 +518,7 @@ class IRAdapterGener:
                 for ptensor in ptensors[1:]:
                     rhs = ptensor
                     output = ftensor.like().select(ptensors[0].indmap, (0,1))
-                    node = Accum('cube.runtime.accum', [lhs, rhs])
+                    node = Accum(lhs, rhs)
                     node.set_output(0, output)
                     node.device = devid
                     node.recompute = rcid
@@ -528,7 +528,7 @@ class IRAdapterGener:
                 graph.remove(node)
 
                 # === Orignal way to at alst release tensor
-                # node = Accum('cube.runtime.accum', ptensors)
+                # node = Accum(*ptensors)
                 # # set gradient
                 # for idx, ptensor in enumerate(ptensors):
                 #     node.input(idx).grad = ftensor.grad.select(ptensor.indmap, (0,1))
@@ -619,7 +619,7 @@ class IRAdapterGener:
                     f"{graph.mirror.debug_tensor_map_str(ftensor.grad)}"
                 )
 
-            multiref = MultiRef(None, [devtensors[devid][0], len(grads)])
+            multiref = MultiRef(devtensors[devid][0], len(grads))
             # set input gradient
             multiref.input(0).grad = accum_grad
             # set output and its gradient
@@ -660,7 +660,7 @@ class IRAdapterGener:
             ftensor: IRFullTensor = multiref.input(0).parent
             multirefs = []
             for otensor in graph.ptensors(ftensor):
-                mr = MultiRef(None, [otensor, len(multiref.outputs())])
+                mr = MultiRef(otensor, len(multiref.outputs()))
                 for idx in range(len(multiref.outputs())):
                     output = multiref.output(idx).parent.select(otensor.indmap, otensor.valmap)
                     if otensor.requires_grad:

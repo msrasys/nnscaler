@@ -6,12 +6,10 @@ from typing import Any, List, Tuple, Optional, Callable, Union
 from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor
 from cube.ir.cten import IRObject, IRCell
-import cube.ir as ir
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.mapping import DType2IRDType
 from cube.graph.parser.mappingfx import SignFx2Op
 from cube.graph.function.pyfunc import IRPyFunc
-from cube.graph.function import Identity
 
 import torch.fx
 
@@ -229,46 +227,25 @@ class FxModuleParser:
         else:
             print(f'parse_prim_function_node: {fsig}')
 
-        def handle_tuple(fx_node: tuple) -> tuple:
-            vals = []
-            for ele in fx_node:
-                if isinstance(ele, torch.fx.Node):
-                    vals.append(frame.get_var(ele.name))
-                elif isinstance(ele, tuple):
-                    vals.append(handle_tuple(ele))
-                else:
-                    assert not isinstance(ele, (list, dict))
-                    vals.append(ele)
-            return tuple(vals)
-
-        def extract_val(fx_node):
-            if isinstance(fx_node, torch.fx.Node):
-                var_name = fx_node.name
-                return frame.get_var(var_name)
-            elif isinstance(fx_node, (int, float, str, torch.dtype)) or fx_node is None:
-                return fx_node
-            elif isinstance(fx_node, (tuple, list)):
-                return handle_tuple(fx_node)
-            else:
-                raise RuntimeError(f'Unsupported input node {fx_node}, {type(fx_node)} in parse function!')
-
+        def get_complex_data(val: Any) -> Any:
+            """Change inner fx.Node into IRObject"""
+            if isinstance(val, tuple):
+                return tuple(get_complex_data(t) for t in val)
+            if isinstance(val, list):
+                return list(get_complex_data(t) for t in val)
+            if isinstance(val, torch.fx.Node):
+                return frame.get_var(val.name)
+            return val
+    
         # get inputs
-        input_vals = list()
-        for item in node.args:
-            input_vals.append(extract_val(item))
-        if node.kwargs:
-            input_kwvals = {}
-            for k, v in node.kwargs.items():
-                input_kwvals[k] = extract_val(v)
-            input_vals.append(input_kwvals)
+        input_vals = [get_complex_data(val) for val in node.args]
+        kwargs = {key: get_complex_data(val) for key, val in node.kwargs.items()}
 
         # map to IR operator
         if SignFx2Op.exist(fsig):
-            ir_node = SignFx2Op.map(fsig)(inputs=input_vals)
+            ir_node = SignFx2Op.map(fsig)(*input_vals, **kwargs)
         else:
-            input_vals = [extract_val(v) for v in node.args]
             # FIXME: handle cases for IRObject in kwargs
-            kwargs = {key: extract_val(v) for key, v in node.kwargs.items()}
             # case1: unknown torch operator
             if FxModuleParser._is_torch_autograd_op(node, frame, fsig):
                 print(f'>>> Find unkown pytorch operation: {fsig}')

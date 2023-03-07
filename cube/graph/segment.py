@@ -663,7 +663,7 @@ class IRSegment(IRCell):
         ftensors: List[IRSubTensor] = [ftensor.like() for _ in node_groups]
         otensors: List[IRSubTensor] = [ft.select(tensor.indmap, tensor.valmap) for ft in ftensors]
         # create multiref
-        multiref = MultiRef('cube.runtime.function.multiref', [tensor, len(node_groups)])
+        multiref = MultiRef(tensor, len(node_groups))
         for idx, otensor in enumerate(otensors):
             multiref.set_output(idx, otensor)
         # setup gradient
@@ -767,7 +767,7 @@ class IRSegment(IRCell):
                     consumer = cnodes.pop(0)
                     if len(cnodes) > 0:
                         itensors = [ftensor.like() for _ in range(2)]
-                        multiref = MultiRef(None, [reftensor, 2])
+                        multiref = MultiRef(reftensor, 2)
                         for idx, itensor in enumerate(itensors):
                             multiref.set_output(idx, itensor)
                         multiref.infer_shape()
@@ -807,7 +807,7 @@ class IRSegment(IRCell):
                         idx = consumer.inputs().index(ftensor)
                         consumer.set_input(idx, itensor)
                 # create and insert multiref operation
-                multiref = MultiRef(None, [ftensor, len(cnodes)])
+                multiref = MultiRef(ftensor, len(cnodes))
                 for idx, itensor in enumerate(itensors):
                     multiref.set_output(idx, itensor)
                 multiref.infer_shape()

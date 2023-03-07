@@ -65,7 +65,8 @@ class MLP(nn.Module):
         x = x.fill_(0.0)
         x = torch.nn.functional.softmax(x, dim=-1)
         x = torch.bmm(x, x)
-        x = torch.baddbmm(x, x, x, alpha=0.125, beta=1.0)
+        adder = torch.sum(x, dim=2, keepdim=True)
+        x = torch.baddbmm(adder, batch1=x, batch2=x, alpha=0.125, beta=1.0)
         x = torch.tanh(x)
         x = torch.pow(x, x)
         for layer in self.layers:
