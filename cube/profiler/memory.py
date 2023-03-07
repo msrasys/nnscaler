@@ -2,14 +2,9 @@ from typing import Any, List
 import torch
 from cube.profiler.timer import print_each_rank
 
-def memory_summary():
-    import os
-    single_device_mode = os.environ.get('SINGLE_DEV_MODE')
-    if single_device_mode:
-        rank = 0
-    else:
-        rank = torch.distributed.get_rank()
 
+def memory_summary():
+    torch.cuda.synchronize()
     # memory measurement
     mem = torch.cuda.max_memory_allocated()
     # mem = torch.cuda.max_memory_reserved()

@@ -7,11 +7,11 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Sequence, Set, Union, Tuple, List, Optional, Dict
+from typing import Sequence, Set, Union, Tuple, List, Optional, Dict, Any
 import warnings
 import copy
 
-from cube.ir.cten import IRTensor, IRCell
+from cube.ir.cten import IRTensor, IRCell, IRObject
 from cube.ir.unique import IDGenerator
 from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
@@ -59,7 +59,7 @@ class IRGraph(IRSegment):
         """
         return self.forward(*args)
     
-    def forward(self, *args: Tuple[IRSubTensor]) -> Union[IRTensor, Tuple[IRTensor]]:
+    def forward(self, *args: Tuple[Any]) -> Union[IRTensor, Tuple[IRTensor]]:
         """
         forward will divide the graph into Actions according to
         node device assignment
@@ -72,7 +72,7 @@ class IRGraph(IRSegment):
         @return outputs Union[IRSubTensor, Tuple[IRSubTensor]]
         """
         # align graph with input tensors
-        itensors: Tuple[IRSubTensor, ...] = self.inputs()
+        itensors: Tuple[IRObject, ...] = self.inputs()
         assert len(args) == len(itensors)
         for idx, (itensor, arg) in enumerate(zip(itensors, args)):
             self.set_input(idx, arg)
@@ -226,7 +226,7 @@ class IRGraph(IRSegment):
 
     @staticmethod
     def from_logic_graph(nodes: List[IRCell],
-                         inputs: List[IRFullTensor], outputs: List[IRFullTensor],
+                         inputs: List[IRObject], outputs: List[IRObject],
                          module_name: str):
         """
         Generate IRGraph from logical graph (IRFullTensor)
@@ -251,12 +251,12 @@ class IRGraph(IRSegment):
         # instantiate to subtensor
         for node in nodes:
             for idx, ftensor in enumerate(node.inputs()):
-                if isinstance(ftensor, IRFullTensor):
-                    subtensor = ftensor.tosub()
+                if isinstance(ftensor, IRObject):
+                    subtensor = ftensor.tosub() if isinstance(ftensor, IRFullTensor) else ftensor
                     node.set_input(idx, subtensor)
             for idx, ftensor in enumerate(node.outputs()):
-                if isinstance(ftensor, IRFullTensor):
-                    subtensor = ftensor.tosub()
+                if isinstance(ftensor, IRObject):
+                    subtensor = ftensor.tosub() if isinstance(ftensor, IRFullTensor) else ftensor
                     node.set_output(idx, subtensor)
         graph = IRGraph(nodes, inputs, outputs, module_name)
         return graph
@@ -345,7 +345,7 @@ class IRGraph(IRSegment):
         @return ops List[IRCell]: partitioned sub-nodes
         """
         assert isinstance(algo, GenericDistAlgo) and node == algo.node, \
-            "The partition algorithm is not initialized for this node"
+            f"The partition algorithm ({algo}) is not initialized for this node"
         assert isinstance(node, (IRFwOperation, IRDataOperation)), \
             f"Only allow op to be forward op or data op, but got: {node}"
         if node.name == 'multiref':
@@ -689,8 +689,17 @@ class IRGraph(IRSegment):
             f"Find node is not IRFwOperation or IRDataOperation: {node}"
         assert all(node in self._nodes for node in nodes), \
             f"Exist node is not in graph nodes"
-        starts = tuple(self._nodes.index(node) for node in nodes)
+        starts = list(self._nodes.index(node) for node in nodes)
         assert len(starts) > 0
+
+        # multiref (created by graph.auto_multiref) will be moved to the next stage (if possible) for optimization
+        for sid in range(len(starts)):
+            while starts[sid] > 0:
+                node = self.node(starts[sid]-1)
+                if node.name == 'multiref' or isinstance(node, IRGraphAnchor):
+                    starts[sid] -= 1
+                    continue
+                break
 
         # adjust the start of the first stage to involve beginning operators
         for idx in range(starts[0]):
@@ -733,7 +742,7 @@ class IRGraph(IRSegment):
             return None
 
         def insert_identity(tensor: IRSubTensor, sid: int) -> IRFwOperation:
-            fwop = Identity('', [tensor])
+            fwop = Identity(tensor)
             fwop.infer_shape()
             fwop.set_output(0, fwop.output(0).tosub())
             if tensor.requires_grad:
@@ -889,7 +898,7 @@ class IRGraph(IRSegment):
                     otensors = []
                     for otensor in node.outputs():
                         otensors.append(otensor.parent.select(ctensor.indmap, ctensor.valmap))
-                    multiref = MultiRef('', [itensor, len(otensors)])
+                    multiref = MultiRef(itensor, len(otensors))
                     for idx, otensor in enumerate(otensors):
                         multiref.set_output(idx, otensor)
                     multiref.device = devid
@@ -904,7 +913,7 @@ class IRGraph(IRSegment):
                             outputs = []
                             for output in node.outputs():
                                 outputs.append(output.parent.select(ptensor.indmap, ptensor.valmap))
-                            multiref = MultiRef('', [ptensor, len(outputs)])
+                            multiref = MultiRef(ptensor, len(outputs))
                             for idx, otensor in enumerate(outputs):
                                 multiref.set_output(idx, otensor)
                             multiref.device = devid

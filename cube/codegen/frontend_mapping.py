@@ -169,6 +169,17 @@ def emit_setattr(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
     member = f'"{arg_vars[1][5:]}"'
     return f"{node.signature}({arg_vars[0]}, {member}, {arg_vars[2]})"
 
+def emit_index_select(node, arg_vars:list, kw_pairs:dict) -> str:
+    assert 'dim' in kw_pairs
+    dim = kw_pairs['dim']
+    return f'{node.signature}({arg_vars[0]}, {dim}, {arg_vars[1]})'
+
+def emit_einsum(node, arg_vars:list, kw_pairs:dict) -> str:
+    assert 'equation' in kw_pairs
+    equation = kw_pairs['equation']
+    args_str = ', '.join(arg_vars)
+    return f'{node.signature}({equation}, {args_str})'
+
 
 class Sign2EmitRule:
 
@@ -200,6 +211,8 @@ class Sign2EmitRule:
         'torch.Tensor.to': emit_to,
         'torch.rand': emit_rand,
         'torch.tensor': emit_new_tensor,
+        'torch.index_select': emit_index_select,
+        'torch.functional.einsum': emit_einsum,
 
         'setattr': emit_setattr,
     }

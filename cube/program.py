@@ -1,6 +1,6 @@
 from typing import List, Tuple, Optional
 
-from cube.ir.cten import IRCell, IRTensor
+from cube.ir.cten import IRCell, IRTensor, IRObject
 from cube.ir.tensor import IRFullTensor, IRSubTensor
 from cube.ir.operator import IRBpOperation, IRDataOperation
 
@@ -43,10 +43,8 @@ class Program:
     def get_graph(self) -> IRGraph:
         return self.instance._graph
 
-    def set_output(self, outputs: List[IRTensor]):
-        for otensor in outputs:
-            if not isinstance(otensor, IRTensor):
-                raise NotImplementedError("Not support for non-tensor graph output")
+    def set_output(self, outputs: List[IRObject]):
+        assert all(isinstance(t, IRObject) for t in outputs)
         self.instance._graph.reset_outputs(len(outputs))
         for idx, otensor in enumerate(outputs):
             self.instance._graph.set_output(idx, otensor)
@@ -60,7 +58,6 @@ class Program:
         if not any(isinstance(node, IRBpOperation) for node in graph.nodes()):
             for ftensor in graph.full_tensors():
                 ftensor.requires_grad = False
-        
 
     def mirror_as_self(self):
         """
@@ -81,12 +78,9 @@ class SemanticDataLoader:
         if not isinstance(dataloader, CubeDataLoader):
             raise TypeError("Expected data loader derived from CubeDataLoader")
         self.dataloader: CubeDataLoader = iter(dataloader)
-        dtype_map = DType2IRDType
-        self.dtypes = [dtype_map.map(dtype) for dtype in dataloader.dtypes]
-        self.shapes = [list(shape) for shape in dataloader.shapes]
 
-    def get_batch_dims(self) -> Tuple[int]:
-        return tuple(self.dataloader.batch_dims)
+    def get_batch_dims(self) -> Tuple[Optional[int]]:
+        return tuple(self.dataloader.get_batch_dims())
 
     def get_batch_size(self) -> int:
         return self.dataloader.get_batch_size()
@@ -94,33 +88,50 @@ class SemanticDataLoader:
     def set_batch_size(self, bs: int):
         self.dataloader.set_batch_size(bs)
         return
+    
+    def get_runtime_sample(self):
+        return next(self.dataloader)
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        outputs = list()
-        for dtype, shape in zip(self.dtypes, self.shapes):
-            data = IRFullTensor(
-                shape, 'data', requires_grad=False, dtype=dtype
-            ).tosub()
-            outputs.append(data)
+        dtype_map = DType2IRDType
+        def generate_output(sample):
+            """Support complex of types: List, Tuple, torch.Tensor, object"""
+            if isinstance(sample, tuple):
+                return tuple(generate_output(t) for t in sample)
+            if isinstance(sample, list):
+                return list(generate_output(t) for t in sample)
+            # if isinstance(sample, dict):
+            #     assert all(isinstance(key, (str, int)) for key in sample.keys())
+            #     return {key:generate_output(val) for key, val in sample.items()}
+            # if isinstance(sample, set):
+            #     return {generate_output(t) for t in sample}
+            if isinstance(sample, torch.Tensor):
+                shape, dtype = list(sample.shape), dtype_map.map(sample.dtype)
+                return IRFullTensor(shape, 'data', dtype=dtype).tosub()
+            else:
+                return IRObject('data')
 
-        data_op = IRDataOperation(
-            data_num=len(outputs), batch_dims=self.get_batch_dims(),
-        )
-        for idx, output in enumerate(outputs):
-            data_op.set_output(idx, output)
+        sample = next(self.dataloader)
+        outputs = generate_output(sample)
 
+        # create dataloader
+        data_num = len(outputs) if isinstance(outputs, tuple) else 1
+        data_op = IRDataOperation(data_num=data_num, batch_dims=self.get_batch_dims())
+        if not isinstance(outputs, tuple):
+            data_op.set_output(0, outputs)
+        else:
+            for idx, t in enumerate(outputs):
+                data_op.set_output(idx, t)
         Program().add_node(data_op)
-        if    len(outputs) == 0: return
-        elif  len(outputs) == 1: return outputs[0]
-        else: return tuple(outputs)
+        return outputs
 
 
 class SemanticModel:
 
-    def __init__(self, model: Optional[torch.nn.Module], input_shapes=None):
+    def __init__(self, model: Optional[torch.nn.Module], input_shapes=None, dummy_input=None):
         """
         Create semantic model based on AI Scientist description.
 
@@ -131,6 +142,7 @@ class SemanticModel:
             assert isinstance(model, torch.nn.Module), f"device of local_rank == 0 must provide model"
         self.model = model
         self.input_shapes = None
+        self.dummy_input = dummy_input
         self.ir_graph = None
         self._loaded_module: CubeModule = None
         self._save_content = True
@@ -171,12 +183,12 @@ class SemanticModel:
         if self._loaded_module:
             return self._loaded_module(*args)
         else:
-            assert all(isinstance(t, IRSubTensor) for t in args), f"Only support tensors as model inputs"
-            input_shapes = [tuple(t.shape) for t in args]
+            # assert all(isinstance(t, IRSubTensor) for t in args), f"Only support tensors as model inputs"
+            input_shapes = [tuple(t.shape) if isinstance(t, IRTensor) else None for t in args]
             if DeviceGroup().local_rank == 0:
                 if self.ir_graph is None:
                     self.ir_graph = parser.convert_model(
-                        self.model, input_shapes=input_shapes, save_content=self.save_content
+                        self.model, input_shapes=input_shapes, dummy_input=self.dummy_input, save_content=self.save_content
                     )
                     self.input_shapes = input_shapes
                 else:

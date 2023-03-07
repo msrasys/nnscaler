@@ -409,7 +409,7 @@ class OpAnno:
         """
         # to inputs and outputs
         if '->' not in anno:
-            raise ValueError("Syntax Error: Expected -> in operator anno")
+            raise ValueError(f"Syntax Error: Expected -> in operator anno: {anno}")
         inputs, outputs = anno.split('->')
         inputs = inputs.split(',')
         outputs = outputs.split(',')
@@ -438,6 +438,9 @@ class OpAnno:
         ou_annos = list()
         for shape in ins:
             flatten = list()
+            if isinstance(shape, str):
+                in_annos.append(shape)
+                continue
             for edim in shape:
                 if isinstance(edim, str):
                     flatten.append(edim)
@@ -673,8 +676,7 @@ class IRDimops(IRFwOperation):
 
         @return op IRDimop: the new constructed operator
         """
-        inputs = inputs + [kwargs[key] for key in kwargs.keys()]
-        op = self._create_fn[0](self.signature, inputs)
+        op = self._create_fn[0](*inputs, **kwargs, signature=self.signature)
         # annos = self._annos_candidates
         # rules = self._trans_rules
         # op = IRDimops(self.signature, annos, inputs, self.name, rules, **kwargs)

@@ -22,9 +22,6 @@ from cube.ir.unique import IDGenerator
 from cube.ir.dtype import IRDType, dtype2byte_size
 
 
-__all__ = ['IRCell', 'IRDType', 'IRTensor']
-
-
 class IRCell:
     r"""
     IRCell serves as a general node for different purpose
@@ -268,7 +265,7 @@ class IRCell:
             raise RuntimeError(
                 f"Set the input out of range ({input_index} >= {c} or {input_index} < {-c})"
             )
-        if isinstance(val, IRTensor):
+        if isinstance(val, IRObject):
             # copy the val
             val = copy.copy(val)
             # set tensor dst
@@ -301,7 +298,7 @@ class IRCell:
             raise RuntimeError(
                 f"Set the input out of range ({output_index} >= {c} or {output_index} < {-c})"
             )
-        if isinstance(val, IRTensor):
+        if isinstance(val, IRObject):
             val = copy.copy(val)
             val.cell = self
 
@@ -431,9 +428,101 @@ class IRCell:
         return dscp
 
 
-class IRTensor:
+class IRObject:
     """
-    IRTensor serves as IRGraph edge
+    IRObject serves as general data of IRGraph edge
+    """
+
+    def __init__(self, name: Optional[str] = None, tid: Optional[int] = None):
+        """
+        @param name str: object name
+        @param tid int: object unique id
+        """
+        self._id: int = tid if isinstance(tid, int) else IDGenerator().gen_tensor_id()
+        self.name: str = name if name else 'obj'
+        self._cell: Optional[IRCell] = None
+        self._is_attr: bool = False
+
+    def __eq__(self, obj):
+        if not isinstance(obj, IRObject):
+            return False
+        return self._id == obj.tid
+
+    def __hash__(self) -> int:
+        return self._id
+
+    @property
+    def tid(self) -> int:
+        """Get object id"""
+        return self._id
+
+    @property
+    def cell(self) -> IRCell:
+        return self._cell
+    
+    @cell.setter
+    def cell(self, val: Optional[IRCell]):
+        assert isinstance(val, IRCell) or val is None, "Expected cell to be Optional[IRCell]"
+        self._cell = val
+
+    @property
+    def device(self) -> Tuple[int]:
+        if self._cell:
+            return tuple(self._cell.device)
+        else:
+            return ()
+
+    @device.setter
+    def device(self, val: Union[int, List[int]]):
+        raise RuntimeError(
+            "IRObject placement is not allowed to set manually"
+        )
+    
+    @property
+    def parent(self):
+        """Get parent"""
+        return self
+
+    def __eq__(self, obj) -> bool:
+        if not isinstance(obj, IRObject):
+            return False
+        return self._id == obj.tid
+
+    def __copy__(self):
+        """Copy this object but remove the cell information"""
+        return IRObject(self.name, self._id)
+
+    def as_attr(self):
+        """
+        Set the obj as graph attributes
+        """
+        self._is_attr = True
+        return self
+
+    def is_attr(self) -> bool:
+        """!
+        Check if the object is graph attribute.
+
+        @return is_attr boolean: True if is graph attribute (buffer or parameter or gradient of parameter)
+        """
+        return self._is_attr
+
+    def overlap(self, other: Any) -> bool:
+        """!
+        Check whether two object can be overlapped
+        """
+        if isinstance(other, IRObject):
+            return other.tid == self._id
+        else:
+            return False
+
+    def __repr__(self):
+        return f'Object({self.name}{self.tid})'
+
+
+class IRTensor(IRObject):
+    """
+    IRTensor serves as tensor data of IRGraph edge
 
     Note by setting IRTensor name to "None" indicates this tensor holds nothing
     and will be translated to None in code generation. 
@@ -443,29 +532,14 @@ class IRTensor:
 
     def __init__(self, shape=None, name='tensor', dtype=IRDType.unknown, tid=None):
 
-        self._id: int = tid if isinstance(tid, int) else IDGenerator().gen_tensor_id()
+        super().__init__(name, tid)
         self._shape: Tuple[int] = () if shape is None else tuple(shape)
-        self.name: str = name if name else 'tensor'
-
-        # device
         self._cell: Optional[IRCell] = None
-
         self._dtype: IRDType = dtype
-        self._is_attr: bool = False
-        self._is_grad: bool = False
-
         # tensor gradient
+        self._is_grad: bool = False
         self._requires_grad: bool = False
         self._grad: Optional[Union[IRTensor, float]] = None
-
-    @property
-    def tid(self) -> int:
-        """
-        Get tensor id
-
-        @return cid int: the tensor id.
-        """
-        return self._id
 
     @property
     def dtype(self) -> IRDType:
@@ -484,36 +558,6 @@ class IRTensor:
         self._dtype = val
         if isinstance(self._grad, IRTensor):
             self._dtype = val
-
-    @property
-    def cell(self) -> Optional[IRCell]:
-        return self._cell
-
-    @cell.setter
-    def cell(self, val: Optional[IRCell]):
-        assert isinstance(val, IRCell) or val is None, "Expected cell to be Optional[IRCell]"
-        self._cell = val
-
-    @property
-    def device(self) -> Tuple[int]:
-        if self._cell:
-            return tuple(self._cell.device)
-        else:
-            return ()
-
-    @device.setter
-    def device(self, val: Union[int, List[int]]):
-        raise RuntimeError(
-            "tensor placement is not allowed to set manually"
-        )
-
-    def is_attr(self) -> bool:
-        """!
-        Check if the tensor is graph attribute.
-
-        @return is_attr boolean: True if is graph attribute (buffer or parameter or gradient of parameter)
-        """
-        return self._is_attr
 
     def is_param(self) -> bool:
         """!
@@ -585,11 +629,6 @@ class IRTensor:
         # clear attached cells
         tensor.cell = None
         return tensor
-
-    def __eq__(self, tensor):
-        if not isinstance(tensor, IRTensor):
-            return False
-        return self._id == tensor._id
 
     @property
     def shape(self) -> Tuple[int]:

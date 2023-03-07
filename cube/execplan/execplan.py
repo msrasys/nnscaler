@@ -161,22 +161,22 @@ class ExecutionPlan:
         
         micro_fcells: Dict[(int, IRCell), ExeReuseCell] = {}
         def block2reuse(node: Block) -> ExeReuseCell:
-            if node.blk.isfw():
-                key = (node.mid, node.blk)
+            if node.content.isfw():
+                key = (node.mid, node.content)
                 if key in micro_fcells:
                     return micro_fcells[key]
-                inputs = [get(t, node.mid) for t in node.blk.inputs()]
-                outputs = [get(t, node.mid) for t in node.blk.outputs()]
-                cell = ExeReuseCell(node.blk, inputs, outputs)
-                if isinstance(node.blk.mirror, IRCell):
-                    minputs = [get(t, node.mid) for t in node.blk.mirror.inputs()]
-                    moutputs = [get(t, node.mid) for t in node.blk.mirror.outputs()]
-                    mcell = ExeReuseCell(node.blk.mirror, minputs, moutputs)
+                inputs = [get(t, node.mid) for t in node.content.inputs()]
+                outputs = [get(t, node.mid) for t in node.content.outputs()]
+                cell = ExeReuseCell(node.content, inputs, outputs)
+                if isinstance(node.content.mirror, IRCell):
+                    minputs = [get(t, node.mid) for t in node.content.mirror.inputs()]
+                    moutputs = [get(t, node.mid) for t in node.content.mirror.outputs()]
+                    mcell = ExeReuseCell(node.content.mirror, minputs, moutputs)
                     IRCell.make_pair(cell, mcell)
                 micro_fcells[key] = cell
                 return cell
             else:
-                mcell = block2reuse(Block(node.blk.mirror, node.mid))
+                mcell = block2reuse(Block(node.content.mirror, node.mid, node.span))
                 return mcell.mirror
             
         topo_seqs: List[IRCell] = []

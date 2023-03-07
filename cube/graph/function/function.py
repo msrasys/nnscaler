@@ -5,54 +5,101 @@ import torch
 import warnings
 import operator
 
-from cube.ir.cten import IRTensor
-from cube.ir.tensor import IRSubTensor
+from cube.ir.cten import IRTensor, IRObject
+from cube.ir.tensor import IRSubTensor, IRFullTensor
 from cube.ir.dtype import IRDType
+from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
-from cube.graph.function.conv import IRConv2D
-from cube.graph.function.conv import IRConv3D
-from cube.graph.function.pad import IRPad
-from cube.graph.function.scripteinops import IRScriptEinOps
+from cube.graph.function.conv import IRPad, IRConv2D, IRConv3D
 from cube.graph.function.creators import IROnes, IRToTensor, IRZeros, IRRand, IRNewTensor
-from cube.graph.function.select import IRSelect, IRSlice
-from cube.graph.function.scatter import IRSelectScatter
-from cube.graph.function.repeat import IRRepeat
 from cube.graph.function.anchor import IRGraphAnchor
 
 
 ErasedDevice = 'str'
 
 
-def Identity(signature, inputs: List[IRTensor]):
+def Identity(tensor: IRObject, signature = None):
     signature = 'cube.runtime.function.identity'
-    eshape = ShapeAnno.create_shape_str(inputs[0].shape)
+    eshape = ShapeAnno.create_shape_str(tensor.shape)
     anno = OpAnno.create_op_str([eshape], [eshape])
-    return IRDimops(Identity, 'identity', signature, [anno], inputs)
+    return IRDimops(Identity, 'identity', signature, [anno], [tensor])
 
 
-def Linear(signature, inputs):
-    assert len(inputs) == 3
+def MultiRef(tensor: IRTensor, times: int, signature = None):
+    """
+    cube.runtime.function.multiref(itensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]
+    """
+    signature = 'cube.runtime.function.multiref'
+    assert isinstance(tensor, IRTensor), "require all inputs to be IRSubTensor"
+    assert isinstance(times, int), "require int for second input"
+    anno = '* -> ' + ', '.join('*' for _ in range(times))
+    node = IRDimops(MultiRef, 'multiref', signature, [anno], [tensor], times=times)
+    return node
+
+
+def Accum(*inputs, signature = None):
+    """
+    tensor = cube.runtime.function.accum(tensors)
+    """
+    assert all(isinstance(t, IRTensor) for t in inputs)
+    signature = 'cube.runtime.function.accum'
+    iannos = [ShapeAnno.create_shape_str(t.shape) for t in inputs]
+    oannos = [copy.copy(iannos[0])]
+    anno = OpAnno.create_op_str(iannos, oannos)
+    return IRDimops(Cat, 'accum', signature, [anno], inputs)
+
+
+def Linear(input, weight, bias=None, signature = None):
     signature = 'torch.nn.functional.linear'
-    if inputs[2] is None:
+    if bias is None:
         annos = ['b * k+, n k+ -> b * n']
-        return IRDimops(Linear, 'linear', signature, annos, inputs[:2], bias=None)
+        return IRDimops(Linear, 'linear', signature, annos, [input, weight], bias=None)
     else:
         annos = ['b * k+, n k+, n -> b * n']
         rules = [TransformRule(
             [DimopSplit.D(-1), DimopSplit.D(1), DimopSplit.V()], [DimopSplit.V()]
         )]
-        return IRDimops(Linear, 'linear', signature, annos, inputs, rules)
+        return IRDimops(Linear, 'linear', signature, annos, [input, weight, bias], rules)
 
 
-def BatchLinear(signature, inputs):
-    annos = [
-        'b m k+, b k+ n -> b m n'
-    ]
-    return IRDimops(BatchLinear, 'bmm', signature, annos, inputs)
+def BatchLinear(input, mat2, *, out=None, signature = None):
+    assert out is None
+    annos = ['b m k+, b k+ n -> b m n']
+    return IRDimops(BatchLinear, 'bmm', signature, annos, [input, mat2])
 
 
-def Matmul(signature, inputs: Tuple[IRTensor, IRTensor]):
-    assert len(inputs) == 2
+def BMMAdd(input, batch1, batch2, *, beta=1, alpha=1, out=None, signature = None):
+    """
+    torch.baddbmm(input, batch1, batch2, *, beta=1, alpha=1, out=None)
+    """
+    assert out is None
+    in_dims = ['b', 'm', 'n']
+    assert len(input.shape) == 3
+    for i, size in enumerate(input.shape):
+        if size == 1:
+            in_dims[i] = '1'
+    in_anno = ' '.join(in_dims)
+    anno = f'{in_anno}, b m k^, b k^ n -> b m n'
+    return IRDimops(BMMAdd, 'baddbmm', signature, [anno], [input, batch1, batch2], alpha=alpha, beta=beta)
+
+
+def CubeEinSum(*operands, equation=None, signature = None):
+    assert isinstance(equation, str)
+    lhs, rhs = equation.split('->')
+    assert ',' not in rhs
+    lhs_dims = set(lhs.replace(',', ' ').split(' '))
+    for dim in lhs_dims:
+        if dim not in rhs:
+            lhs = lhs.replace(dim, f'{dim}+')
+    anno = f'{lhs} -> {rhs}'
+    return IRDimops(CubeEinSum, 'einsum', signature, [anno], operands, equation=equation)
+
+def EinSum(equation: str, *operands, signature = None):
+    return CubeEinSum(*operands, equation=equation, signature=signature)
+
+
+def Matmul(signature, input, other, *, out=None):
+    assert out is None
     annos = [
         'm k+, k+ n -> m n',
         'k+, k+ n -> n',
@@ -60,10 +107,9 @@ def Matmul(signature, inputs: Tuple[IRTensor, IRTensor]):
         '* m k+, k+ n -> * m n',
         '* m k+, * k+ n -> * m n'  # TODO: broadcast
     ]
-    lhs, rhs = inputs
-    if len(lhs.shape) > 2 and len(rhs.shape) > 2:
-        assert tuple(lhs.shape[:-2]) == tuple(rhs.shape[:-2]), "broadcast of matmul (bmm) is not supported"
-    return IRDimops(Matmul, 'matmul', signature, annos, inputs)
+    if len(input.shape) > 2 and len(other.shape) > 2:
+        assert tuple(input.shape[:-2]) == tuple(other.shape[:-2]), "broadcast of matmul (bmm) is not supported"
+    return IRDimops(Matmul, 'matmul', signature, annos, [input, other])
 
 
 def Zeros(signature,
@@ -258,243 +304,224 @@ def _handle_broadcast(lhs: IRTensor, rhs: IRTensor) -> Tuple[List[str]]:
     return lhs_shape, rhs_shape, out_shape
 
 
-def Clone(signature, inputs):
+def Expand(input, *sizes, signature = None):
+    """
+    torch.Tensor.expand(*sizes)
+    """
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    assert len(input.shape) == len(sizes)
+    for idx, (dim, expand_dim) in enumerate(zip(input.shape, sizes)):
+        if dim == 1 and dim != expand_dim:
+            edim_in[idx] += '^'
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(Expand, 'expand', signature, [anno], [input], sizes=sizes)
+
+
+def Clone(input, *, memory_format=None, signature = None):
     """
     torch.clone(input, *, memory_format=torch.preserve_format)
     """
-    assert len(inputs) == 2, f"inputs: {inputs}"
-    tensor, memory_format = inputs
-    annos = ['* -> *']
-    tensor = inputs[0]
     assert memory_format is None, f"Not supported for a specific memory format"
-    return IRDimops(Clone, 'clone', signature, annos, [tensor])
-
-
-def Add(signature, inputs):
-    if len(inputs) == 2:
-        kwargs = {}
-    elif len(inputs) == 3:
-        alpha = inputs[2]
-        kwargs = {'alpha': alpha}
-        inputs = inputs[0:2]
-    else:
-        raise RuntimeError("The number of inputs must be 2 or 3")
-
-    lhs, rhs = inputs
-
-    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
-        # In this case there won't be an 'alpha' parameter.
-        assert not('alpha' in kwargs)
-        return lhs + rhs
-
-    annos = [
-        '*, ? -> *',
-        '?, * -> *',
-    ]
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
-        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(Add, 'add', signature, annos, inputs, **kwargs)
-
-
-def Sub(signature, inputs):
-    if len(inputs) == 2:
-        alpha = 1
-        kwargs = {}
-    elif len(inputs) == 3:
-        alpha = inputs[2]
-        kwargs = {'alpha': alpha}
-        inputs = inputs[0:2]
-    else:
-        raise RuntimeError("The number of inputs must be 2 or 3")
-
-    lhs, rhs = inputs
-
-    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
-        # In this case there won't be an 'alpha' parameter.
-        assert not('alpha' in kwargs)
-        return lhs - rhs
-
-    annos = [
-        '*, ? -> *',
-        '?, * -> *',
-    ]
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
-        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(Sub, 'sub', signature, annos, inputs, **kwargs)
-
-
-def Mul(signature, inputs):
-    lhs, rhs = inputs
-
-    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
-        return lhs * rhs
-
-    annos = [
-        '*, ? -> *',
-        '?, * -> *',
-    ]
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
-        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(Mul, 'mul', signature, annos, inputs)
-
-
-def Div(signature, inputs):
-    lhs, rhs = inputs
-    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
-        # For `aten::div` we always do floating division, even operands are both ints.
-        # TorchScript would dispatch frontend `a // b` to another op `aten::floordiv`.
-        return lhs / rhs
-
-    annos = [
-        '*, ? -> *',
-        '?, * -> *',
-    ]
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
-        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(Div, 'div', signature, annos, inputs)
-
-
-def FloorDiv(signature, inputs):
-    lhs, rhs = inputs
-
-    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
-        return lhs // rhs
-
-    annos = [
-        '*, ? -> *',
-        '?, * -> *',
-    ]
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
-        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(FloorDiv, 'floordiv', signature, annos, inputs)
-
-
-def Pow(signature, inputs):
-    lhs, rhs = inputs
-
-    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
-        return lhs ** rhs
-
-    annos = [
-        '*, ? -> *',
-        '?, * -> *',
-    ]
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
-        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(Pow, 'pow', signature, annos, inputs)
-
-
-def Neg(signature, inputs):
-    assert len(inputs) == 1 or len(inputs) == 2
-    kwargs = {} if len(inputs) == 1 else {'approximate': inputs[1]}
-    tensors = inputs[0:1]
-
-    if isinstance(tensors[0], (int, float)):
-        assert not('approximate' in kwargs)
-        return -tensors[0]
-
     annos = ['* -> *']
-    return IRDimops(Neg, 'neg', signature, annos, inputs, **kwargs)
+    return IRDimops(Clone, 'clone', signature, annos, [input])
 
 
-def Sin(signature, inputs):
+def Add(input, other, alpha=1, *, out=None, signature = None):
+    assert out is None
+    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
+        return input + alpha * other
+    annos = ['*, ? -> *', '?, * -> *',]
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+    return IRDimops(Add, 'add', signature, annos, [input, other], alpha=alpha)
+
+
+def Sub(input, other, alpha=1, *, out=None, signature = None):
+    assert out is None
+    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
+        return input - alpha * other
+    annos = ['*, ? -> *', '?, * -> *',]
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+    return IRDimops(Sub, 'sub', signature, annos, [input, other], alpha=1)
+
+
+def Mul(input, other, *, out=None, signature = None):
+    assert out is None
+    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
+        return input * other
+    annos = ['*, ? -> *', '?, * -> *',]
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+    return IRDimops(Mul, 'mul', signature, annos, [input, other])
+
+
+def Div(input, other, *, rounding_mode=None, out=None, signature = None):
+    assert rounding_mode is None and out is None
+    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
+        return input / other
+    annos = ['*, ? -> *', '?, * -> *',]
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+    return IRDimops(Div, 'div', signature, annos, [input, other])
+
+
+def FloorDiv(input, other, *, out=None, signature = None):
+    assert out is None
+    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
+        return input // other
+    if (not isinstance(input, IRTensor)) and (not isinstance(other, IRTensor)):
+        return IRPyFunc(signature, [input, other], [IRObject()])
+    annos = ['*, ? -> *', '?, * -> *',]
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+    return IRDimops(FloorDiv, 'floordiv', signature, annos, [input, other])
+
+
+def Pow(input, exponent, *, out=None, signature = None):
+    assert out is None
+    if (not isinstance(input, IRObject)) and (not isinstance(exponent, IRObject)):
+        return input ** exponent
+    annos = ['*, ? -> *', '?, * -> *',]
+    if isinstance(input, IRTensor) and isinstance(exponent, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, exponent)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+    return IRDimops(Pow, 'pow', signature, annos, [input, exponent])
+
+
+def Neg(input, *, out=None, signature = None):
+    assert out is None
+    if not isinstance(input, IRObject): return -1 * input
     annos = ['* -> *']
-    tensor = inputs[0:1]
-    if len(inputs) == 2:
-        # adapt for newest pytorch version
-        approximate = inputs[1]
-        return IRDimops(Sin, 'sin', signature, annos, tensor,
-                        approximate=approximate)
-    else:
-        return IRDimops(Sin, 'sin', signature, annos, tensor)
+    return IRDimops(Neg, 'neg', signature, annos, [input])
 
 
-def Cos(signature, inputs):
+def Sin(input, *, out=None, signature = None):
+    assert out is None
     annos = ['* -> *']
-    tensor = inputs[0:1]
-    if len(inputs) == 2:
-        # adapt for newest pytorch version
-        approximate = inputs[1]
-        return IRDimops(Cos, 'cos', signature, annos, tensor,
-                        approximate=approximate)
-    else:
-        return IRDimops(Cos, 'cos', signature, annos, tensor)
+    return IRDimops(Sin, 'sin', signature, annos, [input])
 
 
-def Tanh(signature, inputs):
-    """
-    torch.tanh(input, *, out=None)
-    """
-    assert len(inputs) == 1, f"inputs: {inputs}"
+def Cos(input, *, out=None, signature = None):
+    assert out is None
     annos = ['* -> *']
-    tensor = inputs[0:1]
-    return IRDimops(Tanh, 'tanh', signature, annos, tensor)
+    return IRDimops(Cos, 'cos', signature, annos, [input])
 
 
-def GeLU(signature, inputs):
+def Tanh(input, *, out=None, signature = None):
+    assert out is None
+    annos = ['* -> *']
+    return IRDimops(Tanh, 'tanh', signature, annos, [input])
+
+
+def GeLU(input, approximate='none', signature = None):
     annos = ['* -> *']
     signature = 'torch.nn.functional.gelu'
-    tensor = inputs[0:1]
-    if len(inputs) == 2:
-        # adapt for newest pytorch version
-        approximate = inputs[1]
-        return IRDimops(GeLU, 'gelu', signature, annos, tensor,
-                        approximate=approximate)
-    else:
-        return IRDimops(GeLU, 'gelu', signature, annos, tensor)
+    return IRDimops(GeLU, 'gelu', signature, annos, [input], approximate=approximate)
 
 
-def SiLU(signature, inputs):
-    assert len(inputs) == 1
+def SiLU(input, inplace=False, signature = None):
     annos = ['* -> *']
     signature = 'torch.nn.functional.silu'
-    tensor = inputs[0:1]
-    return IRDimops(SiLU, 'silu', signature, annos, tensor)
+    return IRDimops(SiLU, 'silu', signature, annos, [input], inplace=inplace)
 
 
-def Softmax(signature, inputs):
-    assert len(inputs) == 4
+def ReLU(input, inplace=False, signature = None):
     annos = ['* -> *']
-    tensor = inputs[0:1]
-    dim, _stacklevel, dtype = inputs[1], inputs[2], inputs[3]
-    return IRDimops(Softmax, 'softmax', signature, annos, tensor,
+    signature = 'torch.nn.functional.relu'
+    return IRDimops(ReLU, 'relu', signature, annos, [input], inplace=inplace)
+
+
+def Softmax(input, dim=None, _stacklevel=3, dtype=None, signature = None):
+    """
+    torch.nn.functional.softmax(input, dim=None, _stacklevel=3, dtype=None)
+    """
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = copy.copy(edim_in)
+    if dim is not None:
+        edim_in[dim] += '^'
+        edim_ou[dim] += '^'
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(Softmax, 'softmax', signature, [anno], [input],
                     dim=dim, _stacklevel=_stacklevel, dtype=dtype)
 
-
-def Dropout(signature, inputs):
-    assert len(inputs) == 4
+def Dropout(input, p=0.5, training=True, inplace=False, signature = None):
+    """
+    torch.nn.functional.dropout(input, p=0.5, training=True, inplace=False)
+    """
     annos = ['* -> *']
-    tensor = inputs[0:1]
-    p, training, inplace = inputs[1], inputs[2], inputs[3]
-    return IRDimops(Dropout, 'dropout', signature, annos, tensor,
+    return IRDimops(Dropout, 'dropout', signature, annos, [input],
                     p=p, training=training, inplace=inplace)
 
 
-def LayerNorm(signature, inputs):
+def Detach(input, signature = None):
     """
-    torch.nn.functional.layer_norm(input, normliazed_shape, weight=None, bias=None, eps)
+    torch.Tensor.detach(input)
+    """
+    annos = ['* -> *']
+    return IRDimops(Detach, 'detach', signature, annos, [input])
+
+
+def NanToNum(input, nan=0.0, posinf=None, neginf=None, *, out=None, signature = None):
+    assert out is None
+    annos = ['* -> *']
+    return IRDimops(NanToNum, 'nan_to_num', signature, annos, [input], nan=nan, posinf=posinf, neginf=neginf)
+
+
+def Long(input, memory_format=None, signature = None):
+    """
+    torch.Tensor.long(memory_format=torch.preserve_format)
+    """
+    assert memory_format is None
+    annos = ['* -> *']
+    return IRDimops(Long, 'long', signature, annos, [input])
+
+
+def Fill(input, value, signature = None):
+    """
+    torch.Tensor.fill_(value)
+    """
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(Fill, 'fill', signature, [anno], [input], value=value)
+
+
+def MaskedFill(input, mask, value, signature = None):
+    """
+    torch.Tensor.masked_fill_(mask, value)
+    """
+    edim_in0 = ShapeAnno.create_shape_str(input.shape)
+    edim_in1 = ShapeAnno.create_shape_str(mask.shape)
+    edim_ou = copy.copy(edim_in0)
+    #TODO: add broadcast rule
+    for idx, (lhs, rhs) in enumerate(zip(input.shape, mask.shape)):
+        if lhs != rhs and rhs == 1:
+            edim_in1[idx] = '1'
+    anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
+    return IRDimops(MaskedFill, 'masked_fill', signature, [anno], [input, mask], value=value)
+
+
+def CubeLayerNorm(input, weight=None, bias=None, normalized_shape=None, eps=1e-05, signature = None):
+    """
     cube.runtime.function.layer_norm(input, weight, bias, normliazed_shape, eps)
     """
-    if 'torch.' in signature:
-        tensor, normalized_shape, weight, bias, eps = inputs
-        assert isinstance(normalized_shape, list), f"normalized_shape for layer_norm can only be List[int]"
-    else:
-        tensor, weight, bias, normalized_shape, eps = inputs
+    signature = 'cube.runtime.function.layer_norm'
+    assert not (weight is None and bias is not None), f"Not support for None of weight and parameter of bias"
     letters = iter(string.ascii_lowercase)
-    einput = ShapeAnno.create_shape_str(tensor.shape, iterator=letters)
+    einput = ShapeAnno.create_shape_str(input.shape, iterator=letters)
     eoutput = copy.copy(einput)
-    ndims = len(tensor.shape)
+    ndims = len(input.shape)
     for dim in range(len(normalized_shape)):
         einput[ndims-1-dim] += '^'
         eoutput[ndims-1-dim] += '^'
-    assert not (bias is None is weight is not None), f"Not support for None of weight and parameter of bias"
-    einputs, inputs = [einput], [tensor]
+    einputs, inputs = [einput], [input]
     kwargs = {}
     if weight is not None:
         eweight = ShapeAnno.create_shape_str(weight.shape, reduction='^', iterator=letters)
@@ -511,34 +538,33 @@ def LayerNorm(signature, inputs):
     anno = OpAnno.create_op_str(einputs, [eoutput])
     kwargs['normalized_shape'] = normalized_shape
     kwargs['eps'] = eps
-    signature = 'cube.runtime.function.layer_norm'
-    return IRDimops(LayerNorm, 'layernorm', signature, [anno], inputs, **kwargs)
+    return IRDimops(CubeLayerNorm, 'layernorm', signature, [anno], inputs, **kwargs)
 
 
-def Sum(signature, inputs):
+def LayerNorm(input, normalized_shape, weight=None, bias=None, eps=1e-05, signature = None):
+    """
+    torch.nn.functional.layer_norm(input, normliazed_shape, weight=None, bias=None, eps)
+    """
+    return CubeLayerNorm(input, weight, bias, normalized_shape, eps, signature=signature)
+
+
+def Sum(input, dim=None, keepdim=False, *, dtype=None, signature = None):
     """
     torch.sum(input, *, dtype=None) -> Tensor
     torch.sum(input, dim, keepdim=False, *, dtype=None) -> Tensor
+
+    @note troch.sum is overrided by two signatures, which may lead mismatch in torch.jit.script:
+        may get (input, dtype) as input
     """
-    assert len(inputs) == 2 or len(inputs) == 4, f"{inputs}"
-    tensor = inputs[0]
-    einput = ShapeAnno.create_shape_str(tensor.shape)
+    assert dtype is None, "Currently Sum only support dtype=None"
+    einput = ShapeAnno.create_shape_str(input.shape)
     eoutput = copy.copy(einput)
-    if len(inputs) == 2:
-        dtype = inputs[1]
-        assert dtype is None, "Currently Sum only support dtype=None"
-        # torch.sum(input)
-        inputs = [tensor]
-        eoutput = ['1']
-        # every dimension can be reduced
+    if dim is None:
         einput = [edim + '+' for edim in einput]
-        anno = OpAnno.create_op_str([einput], [eoutput])
-        return IRDimops(Sum, 'sum', signature, [anno], [tensor], dtype=dtype)
+        anno = OpAnno.create_op_str([einput], ['1'])
+        return IRDimops(Sum, 'sum', signature, [anno], [input])
     else:
-        # torch.sum(input, dim, keepdim, *, dtype)
-        dim, keepdim, dtype = inputs[1:4]
-        assert dtype is None, "Currently Sum only support dtype=None"
-        assert isinstance(dim, list), f"Expect dim to be list but got: {dim}"
+        dim = (dim,) if isinstance(dim, int) else dim
         for dimidx in dim:
             einput[dimidx] += '+'
         if keepdim:
@@ -550,60 +576,53 @@ def Sum(signature, inputs):
             for dimidx in sort_dim[::-1]:
                 eoutput.pop(dimidx)
         anno = OpAnno.create_op_str([einput], [eoutput])
-        return IRDimops(Sum, 'sum', signature, [anno], [tensor], dim=dim, keepdim=keepdim, dtype=dtype)
+        return IRDimops(Sum, 'sum', signature, [anno], [input], dim=dim, keepdim=keepdim)
 
-
-def Mean(signature, inputs):
-    if len(inputs) >= 2:
-        tensor, dim = inputs[:2]
-    elif len(inputs) == 1:
-        tensor = inputs[0]
-        dim = None
-    einput = ShapeAnno.create_shape_str(tensor.shape)
+def Mean(input, dim=None, keepdim=False, *, dtype=None, signature = None):
+    """
+    torch.mean(input, *, dtype=None) -> Tensor
+    torch.mean(input, dim, keepdim=False, *, dtype=None) -> Tensor
+    """
+    assert dtype is None
+    einput = ShapeAnno.create_shape_str(input.shape)
     eoutput = copy.copy(einput)
+    dim = (dim,) if isinstance(dim, int) else dim
     if dim is not None:
-        keepdim = inputs[2]
-        sort_dim = list(dim)
-        sort_dim.sort()
+        sort_dim = sorted(dim)
         for dimidx in sort_dim[::-1]:
             eoutput.pop(dimidx)
-            einput[dimidx] = einput[dimidx] + '+'
+            einput[dimidx] = einput[dimidx] + '^'
     else:
         eoutput = ['1']
-        # every dimension is reduced
-        einput = [edim + '+' for edim in einput]
+        einput = [edim + '^' for edim in einput]
     anno = OpAnno.create_op_str([einput], [eoutput])
     if dim is not None:
-        return IRDimops(Mean, 'mean', signature, [anno], [tensor], dim=dim, keepdim=keepdim)
+        return IRDimops(Mean, 'mean', signature, [anno], [input], dim=dim, keepdim=keepdim)
     else:
-        return IRDimops(Mean, 'mean', signature, [anno], [tensor])
+        return IRDimops(Mean, 'mean', signature, [anno], [input])
 
 
-def Transpose(signature, inputs):
+def Transpose(input, dim0, dim1, signature = None):
     """
     out = torch.transpose(tensor, dim0, dim1)
     """
-    assert len(inputs) == 3
-    input, dim0, dim1 = inputs
-
     edim_in = ShapeAnno.create_shape_str(input.shape)
     edim_ou = copy.copy(edim_in)
     edim_ou[dim0], edim_ou[dim1] = edim_ou[dim1], edim_ou[dim0]
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
-
     return IRDimops(Transpose, 'transpose', signature, [anno], [input],
                     dim0=dim0, dim1=dim1)
 
 
-def View(signature, inputs):
+def View(input, size: Tuple[int], *arg_size, signature = None):
     """
-    out = torch.Tensor.view(tensor: torch.Tensor, size: List[int])
+    out = torch.Tensor.view(tensor: torch.Tensor, *size)
     """
-    assert len(inputs) == 2
-    input, shape = inputs
-    if not all([isinstance(dim, int) for dim in shape]):
-        raise TypeError("Expected tensor.view has static int shape")
-    in_shape, ou_shape = list(input.shape), shape
+    size = (size,) if isinstance(size, int) else tuple(size)
+    size = size + arg_size
+    assert all([isinstance(dim, int) for dim in size]), \
+        f"Expected tensor.view has static int shape but got: {size}"
+    in_shape, ou_shape = list(input.shape), list(size)
 
     # infer -1
     def nele(shape, nele=1):
@@ -614,7 +633,7 @@ def View(signature, inputs):
     if -1 in ou_shape:
         idx = ou_shape.index(-1)
         ou_shape[idx] = cnt // (-nele(ou_shape))
-    assert nele(in_shape) == nele(ou_shape), "shape mismatch"
+    assert nele(in_shape) == nele(ou_shape), f"shape mismatch: {in_shape}, {ou_shape}"
 
     # generate annotation
     rest_inshape = [dimlen for dimlen in in_shape]
@@ -705,8 +724,6 @@ def View(signature, inputs):
         for hdim in range(len(bracket)):
             if bracket[hdim] == '1': continue
             sdim = bracket[hdim]
-            ospatial.add(bracket[hdim])
-            ofirst.append(bracket[hdim])
             break
         if sdim is not None:
             ospatial.add(sdim)
@@ -727,7 +744,7 @@ def View(signature, inputs):
     def view_modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
         kwargs = dict(**kwargs)
         ofirst = [bracket[0] for bracket in ou_anno]
-        identifier = in_anno[idx][0]
+        identifier = in_anno[dim][0]
         oidx = ofirst.index(identifier)
         size = list(kwargs['size'])
         size[oidx] = size[oidx] // num
@@ -745,10 +762,10 @@ def View(signature, inputs):
 
     anno = OpAnno.create_op_str([in_anno], [ou_anno])
     signature = 'torch.Tensor.view'
-    return IRDimops(View, 'view', signature, [anno], [input], rules, size=tuple(shape))
+    return IRDimops(View, 'view', signature, [anno], [input], rules, size=tuple(size))
 
 
-def Reshape(signature, inputs):
+def Reshape(input, *shape, signature = None):
     """
     torch.reshape(Tensor self, int[] shape) -> Tensor
     """
@@ -758,7 +775,108 @@ def Reshape(signature, inputs):
     but 'reshape' has keyword parameter 'shape' while 'view' has 'size'.
     ArgumentMissing error may be raised during codegen.""")
 
-    return View(signature, inputs)
+    return View(input, *shape, signature='torch.Tensor.view')
+
+
+def Permute(input, dims: Tuple[int], *arg_dims, signature = None):
+    """
+    torch.Tensor.permute(input, *dims)
+    torch.permute(input, dims: Tuple[int])
+    """
+    dims = (dims,) if isinstance(dims, int) else tuple(dims)
+    dims = dims + arg_dims
+    assert all(isinstance(dim, int) for dim in dims), f"but got {dims}"
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = [copy.copy(edim_in[dim]) for dim in dims]
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(Permute, 'permute', signature, [anno], [input], dims=dims)
+
+
+def Squeeze(input, dim=None, signature = None):
+    """
+    out = torch.squeeze(tensor)
+    """
+    assert dim is None, "got dim: {dim} != None, which is not supported"
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    assert len(edim_in) == len(input.shape)
+    edim_ou = []
+    for dim_anno, dim_size in zip(edim_in, input.shape):
+        if dim_size > 1:
+            edim_ou.append(copy.copy(dim_anno))
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(Squeeze, 'squeeze', signature, [anno], [input])
+
+
+def Unsqueeze(input, dim, signature = None):
+    """
+    out = torch.unsqueeze(tensor, dim)
+    """
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = copy.copy(edim_in)
+    edim_ou.insert(dim, '1')
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(Unsqueeze, 'unsqueeze', signature, [anno], [input],dim=dim)
+
+
+def TypeAs(input, tensor, signature = None):
+    """
+    out = torch.Tensor.type_as(tensor0, tensor1)
+    """
+    edim_in0 = ShapeAnno.create_shape_str(tensor.shape)
+    anno = OpAnno.create_op_str(['*', edim_in0], ['*'])
+    return IRDimops(TypeAs, 'type_as', signature, [anno], [input, tensor])
+
+
+def Triu(input, diagonal=0, *, out=None, signature = None):
+    """
+    out = torch.triu(tensor, diagonal)
+    """
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    assert len(edim_in) >= 2
+    edim_in[-1] += '^'
+    edim_in[-2] += '^'
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(Triu, 'triu', signature, [anno], [input], diagonal=diagonal)
+
+
+def CumSum(tensor, dim, signature = None):
+    """
+    out = torch.cumsum(tensor, dim)
+    """
+    edim_in = ShapeAnno.create_shape_str(tensor.shape)
+    edim_in[dim] += '^'
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(CumSum, 'cumsum', signature, [anno], [tensor], dim=dim)
+
+
+# def Pad(signature, inputs):
+#     """
+#     torch.nn.functional.pad(input: torch.Tensor, pad: List[int], mode='constant', value=0.0)
+#     """
+#     signature = 'torch.nn.functional.pad'
+#     tensor, pad, mode, value = inputs
+#     ianno = ShapeAnno.create_shape_str(tensor.shape)
+#     oanno = []
+#     ndims = len(pad) // 2
+#     for dim in range(ndims):
+#         pad_left, pad_right = pad[2 * dim], pad[2 * dim + 1]
+#         if pad_left == 0 and pad_right == 0:
+#             oanno.insert(0, ianno[-1-dim])
+#         else:
+#             ianno[-1-dim] = str(tensor.shape[-1-dim])
+#             oanno.insert(0, str(tensor.shape[-1-dim] + pad_left + pad_right))
+#     oanno = copy.copy(ianno[:len(tensor.shape) - ndims]) + oanno
+#     anno = OpAnno.create_op_str([ianno], [oanno])
+#     return IRDimops(Pad, 'pad', signature, [anno], [tensor], pad=pad, mode=mode, value=value)
+
+
+def Pad(input, pad, mode='constant', value=0.0, signature = None):
+    """
+    torch.nn.functional.pad(input, pad, mode='constant', value=0.0)
+    """
+    return IRPad(signature, [input], 'pad', pad=pad, mode=mode, value=value)
 
 
 # def Conv2D(signature, inputs):
@@ -790,83 +908,41 @@ def Reshape(signature, inputs):
 #                     stride=stride, padding=padding, dilation=dilation, groups=groups)
 
 
-def Conv2D(signature, inputs):
+def Conv2D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, signature = None):
     """
-    torch.conv2d(input, weight, bias, stride, padding, dialation, groups)
-    https://pytorch.org/docs/stable/generated/torch.nn.functional.conv2d.html?highlight=torch%20conv2d#torch.nn.functional.conv2d
+    torch.nn.functional.conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1)
     """
-    assert len(inputs) == 7, f"Expected 7 inputs but only got {len(inputs)}"
-    tensors = inputs[0:3]
-    stride, padding, dilation, groups = inputs[3:]
     if isinstance(padding, int):
         padding = [padding] * 4
     elif len(padding) == 2:
         padH, padW = padding
         padding = [padH, padH, padW, padW]
-    return IRConv2D(signature, tensors, 'conv2d',
+    return IRConv2D(signature, [input, weight, bias], 'conv2d',
                     stride=stride, padding=padding, dilation=dilation, groups=groups)
 
 
-def Conv3D(signature, inputs):
+def Conv3D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, signature = None):
     """
-    conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1) → Tensor
-    https://pytorch.org/docs/stable/generated/torch.nn.functional.conv3d.html?highlight=conv3d#torch.nn.functional.conv3d
+    torch.nn.functional.conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1)
     """
-    assert len(inputs) == 7, f"Expected 7 inputs but only got {len(inputs)}"
-    tensors = inputs[0:3]
-    stride, padding, dilation, groups = inputs[3:]
     if isinstance(padding, int):
         padding = [padding] * 4
     elif len(padding) == 2:
         padH, padW = padding
         padding = [padH, padH, padW, padW]
-    return IRConv3D(signature, tensors, 'conv3d',
+    return IRConv3D(signature, [input, weight, bias], 'conv3d',
                     stride=stride, padding=padding, dilation=dilation, groups=groups)
 
-def Pad(signature, inputs):
-    """
-    torch.nn.functional.pad(input, pad, mode='constant', value=0.0)
-    https://pytorch.org/docs/stable/generated/torch.nn.functional.pad.html#torch.nn.functional.pad
-    :param signature:
-    :param inputs:
-    :return:
-    """
-    # print("#Pad::inputs.len: {}".format(len(inputs)))
-    # idx = 0
-    # for input in inputs:
-    #     if idx >= 0:
-    #         print("#Pad::input[{}]: {}".format(idx, input))
-    #     idx += 1
-    tensors = inputs[0:1]
-    pad, mode, value = inputs[1:]
-    return IRPad(signature, tensors, 'pad', pad=pad, mode=mode, value=value)
 
-
-def Accum(signature, inputs: Tuple[IRTensor]):
+def CubeCat(*tensors, dim: int, signature = None):
     """
-    tensor = cube.runtime.function.accum(tensors)
+    torch.cat(tensors, dim=0, *, out=None)
     """
-    assert all(isinstance(t, IRTensor) for t in inputs)
-    signature = 'cube.runtime.function.accum'
-    iannos = [ShapeAnno.create_shape_str(t.shape) for t in inputs]
-    oannos = [copy.copy(iannos[0])]
-    anno = OpAnno.create_op_str(iannos, oannos)
-    return IRDimops(Cat, 'accum', signature, [anno], inputs)
-
-
-def Cat(signature, inputs: Tuple[List[IRTensor], int]):
-    """
-    torch.cat(inputs: List[Tensor], dim: int) -> Tensor
-    torch.cat(tensor1: Tensor, tensor2: Tensor, ..., dim: int)
-
-    e.g. cat(tensor([2,3]), tensor([2,3])).shape == [4,3]
-    """
-    assert len(inputs) >= 2
-    if len(inputs) == 2:
-        tensors, dim = inputs
-    else:
-        tensors, dim = inputs[:-1], inputs[-1]
+    # REMARK: IRFwOperation doesn't support taking a list of IRTensors.
+    # Therefore, the argument interface is adapted to take unpacked tensors
+    # with dimension. dim=None is for the support of kwarg inputs from torchfx
     assert all(isinstance(tensor, IRTensor) for tensor in tensors)
+    assert isinstance(dim, int)
     iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
     dimlens = [t.shape[dim] for t in tensors]
     for ashape, dimlen in zip(iannos, dimlens):
@@ -874,145 +950,227 @@ def Cat(signature, inputs: Tuple[List[IRTensor], int]):
     oannos = [copy.copy(iannos[-1])]
     oannos[0][dim] = str(sum(dimlens))
     anno = OpAnno.create_op_str(iannos, oannos)
-    return IRDimops(Cat, 'cat', signature, [anno], tensors, dim=dim)
+    return IRDimops(CubeCat, 'cat', signature, [anno], tensors, dim=dim)
 
 
-def Stack(signature, inputs: Tuple[List[IRTensor], int]):
+def Cat(*tensors_and_dim, dim=0, out=None, signature=None):
     """
-    torch.stack(inputs: List[Tensor], dim: int) -> Tensor
-    torch.stack(tensor1: Tensor, tensor2: Tensor, ..., dim: int) -> Tensor
-
-    inputs:
-        tensors: List[Tensor]: all tensors need to have same size
-        dim: the new inserted dim
-
-    e.g. stack(tensor([2,3]), tensor([2,3])).shape == [2,2,3]
+    torch.cat(tensors, dim=0, *, out=None)
     """
-    assert len(inputs) >= 2
-    if len(inputs) == 2:
-        tensors, dim = inputs
+    assert out is None
+    if len(tensors_and_dim) == 2:
+        tensors, dim = tensors_and_dim[0], tensors_and_dim[1]
     else:
-        tensors, dim = inputs[:-1], inputs[-1]
-    assert all(isinstance(tensor, IRTensor) for tensor in tensors)
+        tensors = tensors_and_dim[0]
+    return CubeCat(*tensors, dim=dim, signature=signature)
+
+
+def CubeStack(*tensors, dim: int, signature=None):
+    """
+    torch.stack(tensors, dim=0, *, out=None)
+    """
+    # REMARK: IRFwOperation doesn't support taking a list of IRTensors.
+    # Therefore, the argument interface is adapted to take unpacked tensors
+    # with dimension.
+    assert all(isinstance(tensor, IRTensor) for tensor in tensors), f'but got {tensors}'
+    assert isinstance(dim, int), f"but not {dim}"
     iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
     oannos = [copy.copy(iannos[-1])]
     oannos[0].insert(dim, str(len(tensors)))
     anno = OpAnno.create_op_str(iannos, oannos)
-    return IRDimops(Stack, 'stack', signature, [anno], tensors, dim=dim)
+    return IRDimops(CubeStack, 'stack', signature, [anno], tensors, dim=dim)
 
 
-def Chunk(signature, inputs: Tuple[IRTensor, int, int]):
+def Stack(*tensors_and_dim, dim=0, out=None, signature = None):
+    """
+    torch.stack(tensors, dim=0, *, out=None)
+    """
+    if len(tensors_and_dim) == 2:
+        tensors, dim = tensors_and_dim[0], tensors_and_dim[1]
+    else:
+        tensors, dim = tensors_and_dim[0], dim
+    return CubeStack(*tensors, dim=dim, signature=signature)
+
+
+def Chunk(input, chunks, dim=0, signature = None):
     """
     torch.chunk(input, chunks, dim=0)
     """
-    assert len(inputs) == 3
-    tensor, chunks, dim = inputs
-    assert tensor.shape[dim] % chunks == 0
-    iannos = [ShapeAnno.create_shape_str(tensor.shape)]
+    assert input.shape[dim] % chunks == 0
+    iannos = [ShapeAnno.create_shape_str(input.shape)]
     oannos = [copy.copy(iannos[0]) for _ in range(chunks)]
-    iannos[0][dim] = str(tensor.shape[dim])
+    iannos[0][dim] = str(input.shape[dim])
     for oanno in oannos:
-        oanno[dim] = str(tensor.shape[dim] // chunks)
+        oanno[dim] = str(input.shape[dim] // chunks)
     anno = OpAnno.create_op_str(iannos, oannos)
-    return IRDimops(Chunk, 'chunk', signature, [anno], [tensor], chunks=chunks, dim=dim)
+    return IRDimops(Chunk, 'chunk', signature, [anno], [input], chunks=chunks, dim=dim)
 
 
-def Select(signature, inputs: Tuple[IRTensor, int, int]):
+def Select(input, dim, index, signature = None):
     """
     torch.select(self:Tensor, dim:int, index:int) -> Tensor
     """
-    tensor, dim, index = inputs
-    ianno = ShapeAnno.create_shape_str(tensor.shape)
+    ianno = ShapeAnno.create_shape_str(input.shape)
     oanno = copy.copy(ianno)
     ianno[dim] += '^'
     oanno.pop(dim)
     anno = OpAnno.create_op_str([ianno], [oanno])
-    return IRDimops(Select, 'select', signature, [anno], [tensor], dim=dim, index=index)
-    # return IRSelect(signature, [tensor], 'select', dim, index)
+    return IRDimops(Select, 'select', signature, [anno], [input], dim=dim, index=index)
 
-def Slice(signature, inputs: Tuple[IRTensor, int, Optional[int], Optional[int], int]):
+
+def CubeIndexSelect(input: torch.Tensor, index: torch.Tensor, dim: int, signature = None):
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_in[dim] += '^'
+    idx_anno = chr(ord(edim_in[-1]) + 1) + '^'
+    edim_ou = copy.copy(edim_in)
+    edim_ou[dim] = copy.copy(idx_anno)
+    anno = OpAnno.create_op_str([edim_in, idx_anno], [edim_ou])
+    # FIXME: runtime function support
+    return IRDimops(CubeIndexSelect, 'index_select', signature, [anno], [input, index], dim=dim)
+
+
+def IndexSelect(input: torch.Tensor, dim: int, index: torch.Tensor, *, out=None, signature = None):
+    assert out is None
+    return CubeIndexSelect(input, index, dim, signature=signature)
+
+
+def Slice(tensor: torch.Tensor, dim, start, end, step, signature = None):
     """
     aten::slice(input:Tensor, dim:int, start:Optional[int], end:Optional[int], step:int) -> Tensor
     """
-    tensor, dim, start, end, step = inputs
-    return IRSlice(signature, [tensor], 'slice', dim, start, end, step)
+    signature = 'torch.ops.aten.slice'
+    ianno = ShapeAnno.create_shape_str(tensor.shape)
+    oanno = copy.copy(ianno)
+    ianno[dim] = str(tensor.shape[dim])
+    
+    def clip(ofst):
+        ofst = ofst + tensor.shape[dim] if ofst < 0 else ofst
+        return min(tensor.shape[dim], max(0, ofst))
 
-def SelectScatter(signature, inputs:Tuple[IRTensor, IRTensor, int, int]):
+    # set start and end to possitive itegers
+    start = 0 if start is None else start
+    end = tensor.shape[dim] if end is None else end
+    start, end = clip(start), clip(end)
+
+    oanno[dim] = str(len(range(start, end, step)))
+    anno = OpAnno.create_op_str([ianno], [oanno])
+    return IRDimops(Slice, 'slice', signature, [anno], [tensor], dim=dim, start=start, end=end, step=step)
+
+
+def SelectScatter(self: torch.Tensor, input: torch.Tensor, dim: int, index: int, signature = None):
     """
     torch.select_scatter(self:Tensor, input:Tensor, dim:int, index:int) -> Tensor
     """
-    self, input, dim, index = inputs
-    return IRSelectScatter(signature, [self, input], 'scatter_select', dim, index)
+    # 'torch.select_scatter' isn't supported by Torch2ONNX yet.
+    signature = 'cube.runtime.function.select_scatter'
+    # shape check
+    self_shape, input_shape = self.shape, input.shape
+    self_shape.pop(dim)
+    assert tuple(self_shape) == tuple(input_shape)
+    in1_anno = ShapeAnno.create_shape_str(self.shape)
+    in2_anno = in1_anno.copy()
+    in2_anno.pop(dim)
+    in1_anno[dim] = str(self.shape[dim])
+    out_anno = in1_anno.copy()
+    anno = OpAnno.create_op_str([in1_anno, in2_anno], [out_anno])
+    return IRDimops(SelectScatter, 'select_scatter', signature, 
+                    [anno], [self, input], dim=dim, index=index)
 
 
-def Repeat(signature, inputs:Tuple[IRTensor, List[int]]):
+def Repeat(tensor, repeats: Tuple[int], *arg_repeats, signature = None):
     """
-    torch.repeat(tensor:Tensor, repeats: List[int]) -> Tensor
+    torch.Tensor.repeat(*sizes)
     """
-    tensor, repeats = inputs
+    signature = 'torch.ops.aten.repeat'
+    repeats = (repeats,) if isinstance(repeats, int) else tuple(repeats)
+    repeats = repeats + arg_repeats
+    in_shape = tensor.shape
+    assert len(in_shape) <= len(repeats), "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor"
+    expand = len(repeats) - len(tensor.shape)
+    in_shape += [1] * expand
+    ou_shape = [dimlen * repeat for dimlen, repeat in zip(in_shape, repeats)]
+    ianno, oanno = ShapeAnno.create_shape_str(in_shape), []
+    for dim, dimlen in enumerate(ou_shape):
+        if dim < expand:
+            oanno.append(str(dimlen))
+        else:
+            if repeats[dim] != 1:
+                ianno[dim] += '^'
+                dim_anno = [str(repeats[dim]), ianno[dim]]
+            else:
+                dim_anno = ianno[dim]
+            oanno.append(dim_anno)
+    anno = OpAnno.create_op_str([ianno[expand:]], [oanno])
+    return IRDimops(Repeat, 'repeat', signature, [anno], [tensor], repeats=repeats)
 
-    assert signature == 'torch.repeat' # this is the API in TorchScript
-    signature = 'torch.Tensor.repeat'  # this is the API in Python frontend and is not a Tensor member method
 
-    return IRRepeat(signature, [tensor], 'repeat', repeats)
-
-
-def Embedding(signature, inputs: List):
+def CubeEmbedding(input, weight, padding_idx, signature = None, **kwargs):
     """
-    torch.nn.functional.embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False)
+    cube.runtime.function.embedding(input, weight, padding_idx, start, stop)
     """
     signature = 'cube.runtime.function.embedding'
-    itensor, weight = inputs[:2]
-    padding_idx = inputs[2]
     if isinstance(weight, IRSubTensor):
         start, stop = weight.indmap[0]
     else:
         start, stop = 0, weight.shape[0]
     annos = ['*, n+ e -> * e']
-    return IRDimops(Embedding, 'embedding', signature, annos, [itensor, weight],
+    return IRDimops(CubeEmbedding, 'embedding', signature, annos, [input, weight],
                     padding_idx=padding_idx, start=start, stop=stop)
 
 
-def Flatten(signature, inputs: List):
-    tensor: IRTensor = inputs[0]
-    start_dim, end_dim = inputs[1:]
-    end_dim = len(tensor.shape) + end_dim if end_dim < 0 else end_dim
-    ishape = ShapeAnno.create_shape_str(tensor.shape)
+def Embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0,
+              scale_grad_by_freq=False, sparse=False, signature = None):
+    """
+    torch.nn.functional.embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False)
+    """
+    assert max_norm is None and norm_type == 2.0 and (not scale_grad_by_freq) and (not sparse)
+    return CubeEmbedding(input, weight, padding_idx, signature=signature)
+
+
+def Flatten(input, start_dim=0, end_dim=-1, signature = None):
+    end_dim = len(input.shape) + end_dim if end_dim < 0 else end_dim
+    ishape = ShapeAnno.create_shape_str(input.shape)
     for dim in range(start_dim, end_dim+1):
         ishape[dim] += '^'
     oshape = ishape[:start_dim]
     oshape.append(ishape[start_dim:end_dim+1])
     anno = OpAnno.create_op_str([ishape], [oshape])
-    return IRDimops(Flatten, 'flatten', signature, [anno], [tensor], start_dim=start_dim, end_dim=end_dim)
+    return IRDimops(Flatten, 'flatten', signature, [anno], [input],
+                    start_dim=start_dim, end_dim=end_dim)
 
 
-def Roll(signature, inputs: Tuple[IRTensor, Union[int, Tuple[int]], Union[int, Tuple[int]]]):
-    tensor = inputs[0]
-    shifts, dims = inputs[1:]
-    ishape = ShapeAnno.create_shape_str(tensor.shape)
+def Roll(input, shifts: Union[int, Tuple[int]], dims=None, signature = None):
+    shifts = (shifts,) if isinstance(shifts, int) else shifts
+    ishape = ShapeAnno.create_shape_str(input.shape)
     for dim in range(len(ishape)):
         if dims is None or dim in dims:
             ishape[dim] += '^'
     anno = OpAnno.create_op_str([ishape], [ishape])
-    return IRDimops(Roll, 'roll', signature, [anno], [tensor], shifts=shifts, dims=dims)
+    return IRDimops(Roll, 'roll', signature, [anno], [input], shifts=shifts, dims=dims)
 
 
-def AdaptiveAvgPool1d(signature, inputs: Tuple[IRTensor, Tuple[int]]):
-    tensor = inputs[0]
-    out_size = inputs[1]
-    ishape = ShapeAnno.create_shape_str(tensor.shape)
+def AdaptiveAvgPool1d(input, output_size, signature = None):
+    """
+    torch.nn.functional.adaptive_avg_pool2d(input, output_size)
+    """
+    ishape = ShapeAnno.create_shape_str(input.shape)
     ishape[-1] += '^'
-    oshape = ishape[:-1] + [str(size) for size in out_size]
+    oshape = ishape[:-1] + [str(size) for size in output_size]
     anno = OpAnno.create_op_str([ishape], [oshape])
-    return IRDimops(AdaptiveAvgPool1d, 'adaptive_avg_pool1d', signature, [anno], [tensor], output_size=out_size)
+    return IRDimops(AdaptiveAvgPool1d, 'adaptive_avg_pool1d', signature, [anno], [input], output_size=output_size)
 
 
-def CrossEntropy(signature, inputs):
+def CrossEntropy(input, target, weight=None, 
+                 size_average=None, ignore_index=- 100, reduce=None,
+                 reduction='mean', label_smoothing=0.0, signature = None):
+    """
+    torch.nn.functional.cross_entropy(
+        input, target, weight=None, 
+        size_average=None, ignore_index=- 100, reduce=None,
+        reduction='mean', label_smoothing=0.0)
+    """
     # FIXME: reduction is by default 'mean', in this way it cannot be partitioned
     # no N dimension.
-    tensor, target, weight = inputs[0:3]
-    assert weight is None, "weight not supported for cross entropy"
-    size_average, ignore_index, reduce, reduction, label_smoothing = inputs[3:]
     annos = [
         'C^, N -> 1',
         'N+ C, N+ -> 1',
@@ -1020,52 +1178,22 @@ def CrossEntropy(signature, inputs):
     ]
     return IRDimops(
         CrossEntropy, 'cross_entropy',
-        signature, annos, [tensor, target],
+        signature, annos, [input, target],
         weight=weight, size_average=size_average, ignore_index=ignore_index,
         reduce=reduce, reduction=reduction, label_smoothing=label_smoothing
     )
 
 
-
-def MultiRef(signature, inputs: List[IRTensor]):
-    """
-    cube.runtime.function.multiref(itensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]
-    """
-    signature = 'cube.runtime.function.multiref'
-    itensor, times = inputs
-    assert isinstance(itensor, IRTensor), "require all inputs to be IRSubTensor"
-    assert isinstance(times, int), "require int for second input"
-    anno = '* -> ' + ', '.join('*' for _ in range(times))
-    node = IRDimops(MultiRef, 'multiref', signature, [anno], [itensor], times=times)
-    return node
-
-
-def GraphAnchor(signature, inputs: List[IRSubTensor]):
+def GraphAnchor(name: str, signature = None):
     """
     cube.runtime.function.anchor() -> None
     """
-    name: str = inputs[0]
     node = IRGraphAnchor(signature, name)
     return node
 
 
-def ScriptEinOps(signature, inputs):
-    """
-    apply_for_scriptable_torch(recipe: TransformRecipe, tensor: torch.Tensor, reduction_type: str) -> torch.Tensor:
-    https://github.com/arogozhnikov/einops/blob/master/einops/_torch_specific.py
-    :param signature:
-    :param inputs:
-    :return:
-    """
-    recipe = inputs[0]
-    tensors = inputs[1:2]
-    reduction_type = inputs[2]
-    import pickle
-    recipe_str = pickle.dumps(recipe)
-    return IRScriptEinOps(signature, tensors, 'scripteinops', recipe_str=recipe_str, reduction_type=reduction_type)
-
-
-def _comparison(creator: Callable, f: Callable, name: str, signature: str, inputs):
+def _comparison(creator: Callable, f: Callable, name: str, signature: str, 
+                input, other):
     """
     if both operands are scalars, returns bool.
     if one operand is a tensor, returns a broadcasted tensor with dtype being bool.
@@ -1073,44 +1201,111 @@ def _comparison(creator: Callable, f: Callable, name: str, signature: str, input
     @param creator Callable: the outside creation function
     @param f Callable: (Scalar, Scalar) -> bools
     """
-    assert len(inputs) == 2
-    lhs, rhs = inputs
-
-    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
-        return f(lhs, rhs)
-
-    annos = [
-        '*, ? -> *',
-        '?, * -> *',
-    ]
-    if isinstance(lhs, IRTensor) and isinstance(rhs, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(lhs, rhs)
+    # case 0: return constant
+    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
+        return f(input, other)
+    # case1: torch.equal(tensor1, tensor2)
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(creator, name, signature, annos, inputs)
+        return IRDimops(creator, name, signature, annos, [input, other])
+    # case2: torch.equal(tensor1, obj2) / torch.equal(obj1, tensor2)
+    if isinstance(input, IRTensor) or isinstance(other, IRTensor):
+        annos = ['*, ? -> *', '?, * -> *',]
+        return IRDimops(creator, name, signature, annos, [input, other])
+    # case3: torch.equal(obj1, obj2)
+    else:
+        return IRPyFunc(signature, [input, other], [IRObject()])
 
 
-def CompareGT(signature, inputs):
+def CompareGT(input, other, *, out=None, signature = None):
     """
     torch.gt(input, other, *, out=None) -> Tensor
     """
-    return _comparison(CompareGT, operator.gt, 'gt', signature, inputs)
+    return _comparison(CompareGT, operator.gt, 'gt', signature, input, other)
 
 
-def CompareLT(signature, inputs):
+def CompareLT(input, other, *, out=None, signature = None):
     """
     torch.lt(input, other, *, out=None) -> Tensor
     """
-    return _comparison(CompareLT, operator.lt, 'lt', signature, inputs)
+    return _comparison(CompareLT, operator.lt, 'lt', signature, input, other)
 
 
-def CompareGE(signature, inputs):
+def CompareGE(input, other, *, out=None, signature = None):
     """
     torch.ge(input, other, *, out=None) -> Tensor
     """
-    return _comparison(CompareGE, operator.ge, 'ge', signature, inputs)
+    return _comparison(CompareGE, operator.ge, 'ge', signature, input, other)
 
-def CompareLE(signature, inputs):
+
+def CompareLE(input, other, *, out=None, signature = None):
     """
     torch.gt(input, other, *, out=None) -> Tensor
     """
-    return _comparison(CompareLE, operator.le, 'le', signature, inputs)
+    return _comparison(CompareLE, operator.le, 'le', signature, input, other)
+
+
+def CompareEQ(input, other, *, out=None, signature = None):
+    """
+    torch.eq(input, other, *, out=None)
+    """
+    return _comparison(CompareEQ, operator.eq, 'eq', signature, input, other)
+
+
+def CompareNE(input, other, *, out=None, signature = None):
+    """
+    torch.ne(input, other, *, out=None)
+    """
+    return _comparison(CompareNE, operator.eq, 'ne', signature, input, other)
+
+
+def ShapeAsTensor(input: IRTensor, signature = None):
+    """
+    torch._shape_as_tensor
+    """
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = [str(len(input.shape))]
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(ShapeAsTensor, '_shape_as_tensor', signature, [anno], [input])
+
+
+
+# ================== Non-autograd Function Space =================
+
+def Size(tensor, dim=None, signature = None) -> Union[List[int], IRPyFunc]:
+    """
+    torch.Tensor.size(tensor, dim=None)
+    """
+    assert isinstance(tensor, IRTensor)
+    # constant
+    if all(isinstance(dimlen, int) for dimlen in tensor.shape) and not isinstance(dim, IRObject):
+        return tensor.shape[dim] if isinstance(dim, int) else list(tensor.shape)
+    return IRPyFunc(signature, [tensor, dim], [IRObject()])
+
+
+def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
+    """
+    _operator.getitem(obj, index: int)
+    """
+    obj, index = a, b
+    if (not isinstance(obj, IRObject)) and isinstance(index, int):
+        return obj[index]
+    else:
+        return IRPyFunc(signature, [obj, index], [IRObject()])
+
+    
+def GetAttr(instance: object, field: str, signature=None) -> Union[List[int], IRPyFunc]:
+    """
+    builtins.getattr(object, name[, default])
+    NOTE: only deal with the attr "shape" of IRFullTensor, because other type of object may not
+    have instantiated object or the attr is not simple value.
+    """
+    obj, name = instance, field
+    if name == 'shape':
+        assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
+        assert hasattr(obj, name), f"attr {name} is not existed in {obj}"
+        return getattr(obj, name)
+    else:
+        # FIXME: is it right?
+        return IRPyFunc(signature, [instance, field], [IRObject()])

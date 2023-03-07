@@ -75,6 +75,16 @@ class Frame:
                 self._vars[-1][var_name] = val
         else:
             raise ValueError("graph_arg (int) must be >= 0")
+        
+    def set_var(self, var_name: str, val: Any):
+        """
+        Reset a variable with arbitrary value.
+        If `var_name` doesn't exist, will create a new one
+        
+        @param var_name str: variable name
+        @param val Any
+        """
+        self._vars[-1][var_name] = val
 
     def get_var(self, var_name: str) -> Any:
         """
@@ -90,7 +100,7 @@ class Frame:
         # first check whether we have variable in this frame
         if var_name in self._vars[-1]:
             return self._vars[-1][var_name]
-        raise KeyError(f"Cannot find var name {var_name}")
+        raise KeyError(f"Cannot find var name {var_name} in {self._vars}")
 
     def push_attr(self):
         """

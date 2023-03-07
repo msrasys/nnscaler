@@ -3,22 +3,9 @@ Executor for runtime
 """
 import atexit
 
-from typing import Tuple, Any, Callable, List, Dict
+from typing import Tuple, Any, Callable, List, Dict, Optional
 import torch
 import warnings
-
-from cube.flags import CompileFlag
-
-
-if CompileFlag.use_amp:
-    warnings.warn(
-        "Detected auto mixed precision (AMP) is enabled. It's an "
-        "experimental feature that is only for benchmark. "
-        "torch.cdua.amp.GradScalerr is not enabled for loss "
-        "and optimizer, which may lead to gradient loss. The tensors "
-        "and dtypes arguments in adapter will be automatically converted to "
-        "torch.float16, if they are in float32 precision or torch.float32 dtype."
-    )
 
 
 def debug_id(tensors, msg: str, rank: int):
@@ -29,17 +16,51 @@ def debug_id(tensors, msg: str, rank: int):
             print(f'[{torch.distributed.get_rank()}] {msg}: {[id(t) for t in tensors]}')
 
 
-def convert_fp32_to_fp16(t: Any):
-    """
-    A tensor with float32 will be converted to float16.
-    A dtype of torch.float32 will be returned as torch.float16
-    """
-    if isinstance(t, torch.dtype) and t == torch.float32:
-        t = torch.float16
-    elif torch.is_tensor(t) and t.dtype == torch.float32:
-        with torch.no_grad():
-            t = t.half()
-    return t
+class AsyncCommHandler:
+
+    class __AsyncCommHandler:
+        def __init__(self):
+            self._works: Dict[int, List] = {}
+            self._callbacks: Dict[int, Callable] = {}
+
+    instance = None
+
+    def __init__(self) -> None:
+        if not AsyncCommHandler.instance:
+            AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
+
+    def __getattr__(self, name):
+        return getattr(self.instance, name)
+
+    def wait(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Wait until the finish of the communication
+
+        @param tensor torch.Tensor
+        @return tensor torch.Tensor
+        """
+        if id(tensor) not in self._works:
+            return tensor
+        works = self._works.pop(id(tensor))
+        for work in works:
+            work.wait()
+        callback = self._callbacks.pop(id(tensor))
+        if callback is not None:
+            tensor = callback(tensor)
+        return tensor
+    
+    def submit(self, tensor: torch.Tensor, works: List, callback: Optional[Callable] = None):
+        """
+        Submit an async communication
+        """
+        self._works[id(tensor)] = works
+        self._callbacks[id(tensor)] = callback
+
+    def clear(self):
+        AsyncCommHandler.instance = AsyncCommHandler.__AsyncCommHandler()
+
+    def check_clear(self):
+        assert len(self._works) == 0 and len(self._callbacks) == 0
 
 
 TensorPairs = List[Tuple[int, torch.Tensor]]
@@ -59,6 +80,8 @@ class Executor:
         """
         forward the sub-graph.
         """
+        input_tensors = Executor.sync_tensors(input_tensors)
+
         if not requires_grad:
             with torch.no_grad():
                 outputs = subgraph(*input_tensors)
@@ -82,9 +105,6 @@ class Executor:
         """
         execute adapter
         """
-        if CompileFlag.use_amp:
-            input_tensors = tuple(convert_fp32_to_fp16(t) for t in input_tensors)
-
         if not requires_grad:
             with torch.no_grad():
                 outputs = subgraph(*input_tensors)
@@ -119,6 +139,8 @@ class Executor:
         @return gradients List[torch.Tensor]:
             gradient tensors corresponding to input_tensors.
         """
+        output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
+
         if len(output_tensors) == 0: return None
 
         saved_pairs = Executor._detach[name].pop(0)
@@ -146,6 +168,13 @@ class Executor:
         else: return grads
 
     @staticmethod
+    def sync_tensors(tensors: List[Any]) -> List[Any]:
+        """
+        Wait until the finish of synchornized tensors
+        """
+        return [AsyncCommHandler().wait(t) if torch.is_tensor(t) else t for t in tensors]
+
+    @staticmethod
     def clear():
         Executor._detach = dict()
 
@@ -160,35 +189,7 @@ fexecute = Executor.fexecute
 aexecute = Executor.aexecute
 backward = Executor.backward
 
+
 # register checking for normal exit
 atexit.register(Executor.check_clear)
-
-
-### =================== Experimental Feature =======================
-
-# import queue
-# 
-# 
-# class MessageManager:
-#     """
-#     message manager to make send as async calls.
-#     """
-# 
-#     class __MessageManager:
-#         def __init__(self):
-#             self._reqs = queue.Queue(maxsize=128)
-# 
-#     instance = None
-# 
-#     def __init__(self):
-#         if not MessageManager.instance:
-#             MessageManager.instance = MessageManager.__MessageManager()
-# 
-#     def __getattr__(self, name):
-#         return getattr(self.instance, name)
-#     
-#     def push(self, req):
-#         self.instance._reqs.put(req, block=True, timeout=None)
-#     
-#     def pull(self):
-#         return self.instance._reqs.get(block=True, timeout=None)
+atexit.register(AsyncCommHandler().check_clear)

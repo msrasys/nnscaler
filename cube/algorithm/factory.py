@@ -67,39 +67,13 @@ class DistAlgorithmFactory:
         self.register(dimops.IRDimops, dimops.SimpleViewSplitEinops, tag='view_simp')
 
         import cube.algorithm.ops.conv as conv
+        self.register(conv.IRPad, conv.DimSplitPad, tag='dim')
         self.register(conv.IRConv2D, conv.DimSplitConv2D, tag='dim')
         self.register(conv.IRConv2D, conv.HaloSplitConv2D, tag='halo')
         self.register(conv.IRConv3D, conv.HaloSplitConv3D, tag='halo')
-
-        import cube.algorithm.ops.pad as pad
-        self.register(pad.IRPad, pad.DimSplitPad, tag='dim')
-        
-        import cube.algorithm.ops.select as select
-        self.register(select.IRSelect, select.DimSplitSelect, tag='dim')
-        self.register(select.IRSlice, select.DimSplitSlice, tag='dim')
-        
-        import cube.algorithm.ops.scatter as scatter
-        self.register(scatter.IRSelectScatter, scatter.DimSplitScatter, tag='dim')
         
         import cube.algorithm.ops.creators as creators
         self.register(creators.IRToTensor, creators.DimSplitTo, tag='dim')
         self.register(creators.IRZeros, creators.DimSplitZeros, tag='dim')
         self.register(creators.IROnes, creators.DimSplitOnes, tag='dim')
         self.register(creators.IRRand, creators.DimSplitRand, tag='dim')
-        # import cube.algorithm.ops.elementwise as elew
-        # self.register(elew.ElementWise, elew.ElementWiseDimParallel, tag='dim')
-        # self.register(elew.Add, elew.AddDimParallel, tag='dim')
-
-        # import cube.algorithm.ops.layernorm as ln
-        # self.register(ln.LayerNorm, ln.LayerNormDimParallel, tag='dim')
-
-        # import cube.algorithm.ops.activation as activation
-        # self.register(activation.Activation, activation.ActivationDimParallel, tag='dim')
-        # self.register(activation.Dropout, activation.DropoutDimParallel, tag='dim')
-        # self.register(activation.Softmax, activation.SoftmaxDimParallel, tag ='dim')
-
-        # import cube.algorithm.ops.reduce as reduce
-        # self.register(reduce.Sum, reduce.SumDimParallel, tag='dim')
-
-        # import cube.algorithm.ops.memory as mem
-        # self.register(mem.Transpose, mem.TransposeDimParallel, tag='dim')

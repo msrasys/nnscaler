@@ -73,33 +73,54 @@ class CudaTimer:
             if predefined is not None:
                 self.instance.predefined = predefined
     
-    def start(self, field_name='default', predefined: bool = False):
+    def start(self, field_name='default', predefined: bool = False, stream: Optional[torch.cuda.Stream] = None):
         """
         Start recording time on the the field
 
         Note `start` and `stop` on the same field can be called nestly
+
+        @param field_name str
+        @param is_predefined bool: whether the field is a predefined field
+        @param stream Optional[torch.cuda.Stream]:
+            if None (default), will synchronize all streams on the device before
+            recording time. Otherwise, only synchronize the specified stream.
+
+        @return None
         """
         if (not self.instance.enabled) or (predefined and not self.instance.predefined):
             return
-        torch.cuda.synchronize()
+        if stream is None:
+            torch.cuda.synchronize()
+        else:
+            stream.synchronize()
+        # torch.cuda.default_stream().synchronize()
         start_time = time.time()
         if field_name not in self.instance.field:
             self.instance.field[field_name] = list()
             self.instance.field_data[field_name] = 0
         self.instance.field[field_name].append(start_time)
     
-    def stop(self, field_name='default', predefined: bool = False):
+    def stop(self, field_name='default', predefined: bool = False, stream: Optional[torch.cuda.Stream] = None) -> float:
         """
-        Return the time span from last `start` on the smae field name to now
+        Record the time span from last `start` on the same field_name to now
 
-        Returns:
-            float (ms)
+        @param field_name str
+        @param is_predefined bool: whether the field is a predefined field
+        @param stream Optional[torch.cuda.Stream]:
+            if None (default), will synchronize all streams on the device before
+            recording time. Otherwise, only synchronize the specified stream.
+
+        @return None
         """
         if (not self.instance.enabled) or (predefined and not self.instance.predefined):
             return
         if field_name not in self.instance.field:
             raise RuntimeError("Missing start on the field")
-        torch.cuda.synchronize()
+        if stream is None:
+            torch.cuda.synchronize()
+        else:
+            stream.synchronize()
+        # torch.cuda.default_stream().synchronize()
         stop_time = time.time()
         start_time = self.instance.field[field_name].pop(-1)
         span = stop_time - start_time # in seconds

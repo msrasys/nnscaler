@@ -3,11 +3,12 @@ from typing import Dict, Union, List, Optional, Set, Tuple
 import numpy as np
 
 from cube.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
-from cube.ir.cten import IRTensor, IRCell
+from cube.ir.cten import IRTensor, IRCell, IRObject
 from cube.ir.operator import IRDataOperation, IRFwOperation, IRBpOperation
 from cube.ir.adapter import IRAdapter
 
 from cube.graph.function.function import MultiRef
+from cube.graph.function.pyfunc import IRPyFunc
 
 
 class CellPosition:
@@ -111,7 +112,7 @@ class IRSegment(IRCell):
 
         @return ftensors List[IRFullTensor]
         """
-        return tuple(self._ftensors)
+        return tuple(t for t in self._ftensors if isinstance(t, IRFullTensor))
 
     def attributes(self) -> Tuple[IRFullTensor]:
         """
@@ -362,11 +363,11 @@ class IRSegment(IRCell):
 
     # ====================== Basic Graph manipulations ======================
 
-    def _add_ftensor(self, ftensor: IRFullTensor):
+    def _add_ftensor(self, ftensor: IRObject):
         """
         Add a full tensor in segment if the segment doesn't have the tensor.
         """
-        assert isinstance(ftensor, IRFullTensor)
+        assert isinstance(ftensor, IRObject)
         if ftensor not in self._ftensors:
             self._ftensors.add(ftensor)
             self._producers[ftensor] = []
@@ -376,11 +377,11 @@ class IRSegment(IRCell):
         if ftensor.is_attr():
             self._attributes.add(ftensor)
     
-    def _remove_ftensor(self, ftensor: IRFullTensor):
+    def _remove_ftensor(self, ftensor: IRObject):
         """
         Remove a full tensor in segment
         """
-        assert isinstance(ftensor, IRFullTensor)
+        assert isinstance(ftensor, IRObject)
         if ftensor in self._ftensors:
             self._ftensors.remove(ftensor)
             del self._producers[ftensor]
@@ -404,13 +405,13 @@ class IRSegment(IRCell):
         # set producer and consumer
         for node in self._nodes:
             if isinstance(node, IRAdapter): continue
-            itensors = set(t for t in node.inputs() if isinstance(t, IRSubTensor))
+            itensors = set(t for t in node.inputs() if isinstance(t, IRObject))
             for itensor in itensors:
                 ftensor = itensor.parent
                 self._add_ftensor(ftensor)
                 self._consumers[ftensor].append(node)
                 self._ctensors[ftensor].append(itensor)
-            otensors = set(t for t in node.outputs() if isinstance(t, IRSubTensor))
+            otensors = set(t for t in node.outputs() if isinstance(t, IRObject))
             for otensor in otensors:
                 ftensor = otensor.parent
                 self._add_ftensor(ftensor)
@@ -440,23 +441,17 @@ class IRSegment(IRCell):
             # update producer and consumer
             if isinstance(node, IRAdapter): return
             # consumer
-            itensors = set(t for t in node.inputs() if isinstance(t, IRSubTensor))
+            itensors = set(t for t in node.inputs() if isinstance(t, IRObject))
             for itensor in itensors:
                 ftensor = itensor.parent
                 self._add_ftensor(ftensor)
-                # idx = len([c for c in self._consumers[ftensor] if self._nodes.index(c) < index])
-                # self._consumers[ftensor].insert(idx, node)
-                # self._ctensors[ftensor].insert(idx, itensor)
                 self._consumers[ftensor].append(node)
                 self._ctensors[ftensor].append(itensor)
             # producer
-            otensors = set(t for t in node.outputs() if isinstance(t, IRSubTensor))
+            otensors = set(t for t in node.outputs() if isinstance(t, IRObject))
             for otensor in otensors:
                 ftensor = otensor.parent
                 self._add_ftensor(ftensor)
-                # idx = len([c for c in self._producers[ftensor] if self._nodes.index(c) < index])
-                # self._producers[ftensor].insert(idx, node)
-                # self._ptensors[ftensor].insert(idx, otensor)
                 self._producers[ftensor].append(node)
                 self._ptensors[ftensor].append(otensor)
         else:
@@ -487,7 +482,7 @@ class IRSegment(IRCell):
             # update producer and consumer
             if isinstance(node, IRAdapter): return pos
             # consumer
-            itensors = set(t for t in node.inputs() if isinstance(t, IRSubTensor))
+            itensors = set(t for t in node.inputs() if isinstance(t, IRObject))
             for itensor in itensors:
                 ftensor = itensor.parent
                 idx = self._consumers[ftensor].index(node)
@@ -496,7 +491,7 @@ class IRSegment(IRCell):
                 if len(self._consumers[ftensor]) == 0 and len(self._producers[ftensor]) == 0:
                     self._remove_ftensor(ftensor)
             # producer
-            otensors = set(t for t in node.outputs() if isinstance(t, IRSubTensor))
+            otensors = set(t for t in node.outputs() if isinstance(t, IRObject))
             for otensor in otensors:
                 ftensor = otensor.parent
                 idx = self._producers[ftensor].index(node)
@@ -668,7 +663,7 @@ class IRSegment(IRCell):
         ftensors: List[IRSubTensor] = [ftensor.like() for _ in node_groups]
         otensors: List[IRSubTensor] = [ft.select(tensor.indmap, tensor.valmap) for ft in ftensors]
         # create multiref
-        multiref = MultiRef('cube.runtime.function.multiref', [tensor, len(node_groups)])
+        multiref = MultiRef(tensor, len(node_groups))
         for idx, otensor in enumerate(otensors):
             multiref.set_output(idx, otensor)
         # setup gradient
@@ -772,7 +767,7 @@ class IRSegment(IRCell):
                     consumer = cnodes.pop(0)
                     if len(cnodes) > 0:
                         itensors = [ftensor.like() for _ in range(2)]
-                        multiref = MultiRef(None, [reftensor, 2])
+                        multiref = MultiRef(reftensor, 2)
                         for idx, itensor in enumerate(itensors):
                             multiref.set_output(idx, itensor)
                         multiref.infer_shape()
@@ -812,7 +807,7 @@ class IRSegment(IRCell):
                         idx = consumer.inputs().index(ftensor)
                         consumer.set_input(idx, itensor)
                 # create and insert multiref operation
-                multiref = MultiRef(None, [ftensor, len(cnodes)])
+                multiref = MultiRef(ftensor, len(cnodes))
                 for idx, itensor in enumerate(itensors):
                     multiref.set_output(idx, itensor)
                 multiref.infer_shape()
@@ -926,7 +921,7 @@ class IRSegment(IRCell):
                     "Non-differentiable IRAdapter is not allowed to be grouped"
                 continue
             # update inputs
-            itensors = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
+            itensors = [t for t in node.inputs() if isinstance(t, IRObject)]
             for itensor in itensors:
                 ftensor = itensor.parent
                 if itensor.is_attr(): continue
@@ -935,7 +930,7 @@ class IRSegment(IRCell):
                     if len(node.device) > 0 and set(itensor.device).issubset(adapter_ous[itensor]):
                         continue
                 # from segment inputs
-                if any(t.overlap(itensor) for t in segment.inputs() if isinstance(t, IRSubTensor)):
+                if any(t.overlap(itensor) for t in segment.inputs() if isinstance(t, IRObject)):
                     inputs.add(itensor)
                     continue
                 # from outside producers
@@ -948,7 +943,7 @@ class IRSegment(IRCell):
                     inputs.add(itensor)
                     continue
             # update outputs
-            otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
+            otensors = [t for t in node.outputs() if isinstance(t, IRObject)]
             for otensor in otensors:
                 ftensor = otensor.parent
                 if otensor.is_attr(): continue
@@ -957,13 +952,12 @@ class IRSegment(IRCell):
                     if len(node.device) > 0 and set(otensor.device).issubset(adapter_ins[otensor]):
                         continue
                 # from segment outputs
-                if any(t.overlap(otensor) for t in segment.outputs() if isinstance(t, IRSubTensor)):
+                if any(t.overlap(otensor) for t in segment.outputs() if isinstance(t, IRObject)):
                     outputs.add(otensor)
                     continue
                 # loss doesn't have consumers
                 if len(segment.consumers(ftensor)) == 0:
-                    # TODO: loss judgement should be more robust
-                    if ftensor.nelement() == 1:
+                    if isinstance(ftensor, IRFullTensor) and ftensor.is_loss():
                         outputs.add(otensor)
                     continue
                 # for outside consumers
@@ -976,7 +970,7 @@ class IRSegment(IRCell):
                     outputs.add(otensor)
                     continue
         
-        def order(tensors: Set[IRSubTensor]) -> Tuple[IRSubTensor]:
+        def order(tensors: Set[IRObject]) -> Tuple[IRObject]:
             """Reorder by logical tensor id. Temporally necessary for pipeline scheduling"""
             tensors = list(tensors)
             tids = np.array([t.parent.tid for t in tensors])
@@ -1012,7 +1006,7 @@ class IRSegment(IRCell):
                 #     if otensor in self._outputs and otensor not in outputs:
                 #         outputs.append(otensor)
 
-        def order(tensors: Set[IRSubTensor]) -> Tuple[IRSubTensor]:
+        def order(tensors: Set[IRObject]) -> Tuple[IRObject]:
             """Reorder by logical tensor id. Temporally necessary for pipeline scheduling"""
             tensors = list(tensors)
             tids = np.array([t.parent.tid for t in tensors])
@@ -1035,7 +1029,7 @@ class IRSegment(IRCell):
 
     def __repr__(self):
         fw = 'f' if self.isfw() else 'b'
-        inputs = tuple(t for t in self.inputs() if isinstance(t, IRTensor) and not t.is_param())
+        inputs = tuple(t for t in self.inputs() if isinstance(t, IRObject) and not t.is_attr())
         if self.isfw():
             dscp = f"{fw}Graph{self.cid}-{self.device}(inputs={inputs}, outputs={self.outputs()})"
         else:

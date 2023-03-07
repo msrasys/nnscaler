@@ -36,3 +36,6 @@ class GenericDistAlgo:
         @return sub_nodes Optional[List[IRCell]]: if sucess, the partitioned sub nodes, else None
         """
         raise NotImplementedError
+    
+    def __repr__(self) -> str:
+        return f'TransAlgo(node{self._node.cid})'
