@@ -1,4 +1,4 @@
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 import torch
 import torch.nn.functional as TorchF
 
@@ -32,6 +32,8 @@ def accum(*tensors: Tuple[torch.Tensor]) -> torch.Tensor:
     else:
         return torch.sum(torch.stack(tensors, dim=0), dim=0)
 
+def mul(input: torch.Tensor, other: Union[float, torch.Tensor]) -> torch.Tensor:
+    return torch.mul(input, other)
 
 def conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
            stride: int, padding: List[int], dilation, groups: int = 1):

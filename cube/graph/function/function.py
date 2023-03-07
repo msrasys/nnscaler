@@ -349,15 +349,25 @@ def Sub(input, other, alpha=1, *, out=None, signature = None):
     return IRDimops(Sub, 'sub', signature, annos, [input, other], alpha=1)
 
 
+def CubeMul(input, other, *, out=None, signature = None):
+    signature = 'cube.runtime.function.mul'
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+        return IRDimops(CubeMul, 'mul', signature, annos, [input, other])
+    else:
+        annos = ['* -> *']
+        if isinstance(input, IRTensor):
+            return IRDimops(CubeMul, 'mul', signature, annos, [input], other=other)
+        else:
+            return IRDimops(CubeMul, 'mul', signature, annos, [other], other=input)
+
+
 def Mul(input, other, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input * other
-    annos = ['*, ? -> *', '?, * -> *',]
-    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(input, other)
-        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(Mul, 'mul', signature, annos, [input, other])
+    return CubeMul(input, other, out=out, signature=signature)
 
 
 def Div(input, other, *, rounding_mode=None, out=None, signature = None):

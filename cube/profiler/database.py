@@ -213,15 +213,14 @@ class ProfileDataBase:
         @return infer_memory int: the peak memory in bytes after inference of the function
         @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
         """
-        if node.name in ('mul',):
+        if node.name in ('mul', 'expand'):
             key = self._serialize(node)
             self.insert(node.signature, key, (0,), (0,), 0, 0, 0, (0,), 0)
             return (0,), (0,), 0, 0, 0, (0,), 0
         fn, shapes, dtypes, kwargs = ProfileDataBase.get_func(node)
 
         if self.exist(node):
-            ret = list(self.query(node))
-            return ret + [0]
+            return self.query(node)
 
         if isinstance(device, int):
             orig_device = torch.cuda.current_device()
@@ -360,9 +359,9 @@ class ProfileDataBase:
         """
         shapes, dtypes = [], []
         for t in node.inputs():
-            assert isinstance(t, IRTensor), f"Only support node inputs with tensor shape"
-            shapes.append(t.shape)
-            dtypes.append(IRDType2TorchDType.map(t.dtype))
+            if isinstance(t, IRTensor):#, f"Only support node inputs with tensor shape"
+                shapes.append(t.shape)
+                dtypes.append(IRDType2TorchDType.map(t.dtype))
         shapes = '-'.join(str(tuple(shape)) for shape in shapes)
         dtypes = '-'.join(str(dtype) for dtype in dtypes)
         return shapes + ' : ' + dtypes
