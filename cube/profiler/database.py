@@ -11,7 +11,8 @@ import json
 import cube
 from cube.ir.cten import IRTensor
 from cube.ir.operator import IRFwOperation
-from cube.graph.parser.mapping import Sign2Op, IRDType2TorchDType
+from cube.graph.parser.mapping import IRDType2TorchDType
+from cube.graph.parser.mappingfx import SignFx2Op as Sign2Op
 
 
 Shapes = NewType('Shapes', Tuple[Tuple[int]])
@@ -50,12 +51,13 @@ class CompProfiler:
         # create data
         dtypes = [torch.float32] * len(shapes) if dtypes is None else dtypes
         def gen_torch_tensors(shape, dtype):
-            constructor = torch.zeros if dtype == torch.int64 else torch.rand
-            requires_grad = False if dtype == torch.int64 else True
+            constructor = torch.zeros if dtype in (torch.int64, torch.int32, torch.bool) else torch.rand
+            requires_grad = False if dtype in (torch.int64, torch.int32, torch.bool) else True
             return constructor(tuple(shape), dtype=dtype, device=torch.cuda.current_device(), requires_grad=requires_grad)
         tensors = tuple(
             gen_torch_tensors(shape, dtype) for shape, dtype in zip(shapes, dtypes)
         )
+        require_backward = any([t.requires_grad for t in tensors])
         # repalce kwargs starting with 'self.xxx'
         train_kwargs, eval_kwargs = {}, {}
         for name, value in kwargs.items():
@@ -108,12 +110,12 @@ class CompProfiler:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
-            outs = run_step(func, tensors, train_kwargs, backward=True)
+            outs = run_step(func, tensors, train_kwargs, backward=require_backward)
 
         # warmup
         tic = time.time()
         while time.time() - tic < warmup_sec:
-            run_step(func, tensors, train_kwargs, backward=True)
+            run_step(func, tensors, train_kwargs, backward=require_backward)
 
         # profile forward only
         torch.cuda.synchronize()
@@ -129,7 +131,7 @@ class CompProfiler:
         torch.cuda.synchronize()
         tic = time.perf_counter()
         for _ in range(prof_times):
-            run_step(func, tensors, train_kwargs, backward=True)
+            run_step(func, tensors, train_kwargs, backward=require_backward)
         torch.cuda.synchronize()
         toc = time.perf_counter()
         fwbw_span = (toc - tic) / prof_times * 1000 # in milliseconds
@@ -169,6 +171,8 @@ class ProfileDataBase:
             return ret
 
         if node.signature in Sign2Op.kOpCodeDef:
+            # FIXME: ...
+            assert False, 'Sing2Op.kOpCodeDef is not empty'
             dep_code_impl = ''
             for dep_name in get_dep_names(node.signature):
                 dep_code_impl = dep_code_impl + Sign2Op.kOpCodeDef[dep_name]
@@ -184,7 +188,10 @@ class ProfileDataBase:
             exec(code_impl, globals(), local)
             fn = list(local.values())[0]
         else:
-            fn = eval(node.signature)
+            if '_operator.' in node.signature:
+                fn = eval(node.signature.replace('_operator.', 'torch.'))
+            else:
+                fn = eval(node.signature)
         shapes, dtypes = [], []
         for t in node.inputs():
             assert isinstance(t, IRTensor), f"Only support node inputs with tensor shape"
@@ -206,10 +213,15 @@ class ProfileDataBase:
         @return infer_memory int: the peak memory in bytes after inference of the function
         @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
         """
+        if node.name in ('mul',):
+            key = self._serialize(node)
+            self.insert(node.signature, key, (0,), (0,), 0, 0, 0, (0,), 0)
+            return (0,), (0,), 0, 0, 0, (0,), 0
         fn, shapes, dtypes, kwargs = ProfileDataBase.get_func(node)
 
         if self.exist(node):
-            return self.query(node)
+            ret = list(self.query(node))
+            return ret + [0]
 
         if isinstance(device, int):
             orig_device = torch.cuda.current_device()
@@ -227,7 +239,7 @@ class ProfileDataBase:
             CompProfiler.profile(fn, shapes, dtypes, **kwargs)
         # log to database
         key = self._serialize(node)
-        self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info)
+        self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, 0)
         print(
             f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} "
             f"=> in mem info: {in_mem_info} | param mem info: {param_mem_info} | fw: {round(fw_span, 2)} ms | "
@@ -235,7 +247,7 @@ class ProfileDataBase:
 
         if isinstance(device, int):
             torch.cuda.set_device(orig_device)
-        return tuple(in_mem_info), tuple(param_mem_info), fw_span, bw_span, infer_memory, train_mem_info
+        return tuple(in_mem_info), tuple(param_mem_info), fw_span, bw_span, infer_memory, train_mem_info, 0
 
     def insert(self, name: str, key: str, in_mem_info: Tuple[int], param_mem_info: Tuple[int],
                fw_span: float, bw_span: float, infer_memory: int, train_mem_info: Tuple[int]):

@@ -1295,7 +1295,7 @@ def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
         return IRPyFunc(signature, [obj, index], [IRObject()])
 
     
-def GetAttr(instance: object, field: str, signature=None) -> Union[List[int], IRPyFunc]:
+def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], IRPyFunc]:
     """
     builtins.getattr(object, name[, default])
     NOTE: only deal with the attr "shape" of IRFullTensor, because other type of object may not
@@ -1306,6 +1306,16 @@ def GetAttr(instance: object, field: str, signature=None) -> Union[List[int], IR
         assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
         assert hasattr(obj, name), f"attr {name} is not existed in {obj}"
         return getattr(obj, name)
+    elif name == 'dtype':
+        assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
+        assert hasattr(obj, name), f"attr {name} is not existed in {obj}"
+        return getattr(obj, name)
+    elif isinstance(obj, torch.finfo):
+        return getattr(obj, name)
     else:
         # FIXME: is it right?
         return IRPyFunc(signature, [instance, field], [IRObject()])
+
+def FInfo(dtype: IRDType, signature = None) -> torch.finfo:
+    assert isinstance(dtype, IRDType)
+    return torch.finfo(eval('torch.' + dtype.value))

@@ -93,6 +93,7 @@ class SignFx2Op:
         __ttemplate('detach'): function.Detach,
         __ttemplate('_shape_as_tensor'): function.ShapeAsTensor,
         __ttemplate('index_select'): function.IndexSelect,
+        __ttemplate('finfo'): function.FInfo,
         __ftemplate('embedding'): function.Embedding,
         'torch.functional.einsum': function.EinSum,
 

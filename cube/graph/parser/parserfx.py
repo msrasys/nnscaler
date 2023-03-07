@@ -243,6 +243,7 @@ class FxModuleParser:
 
         # map to IR operator
         if SignFx2Op.exist(fsig):
+            print('zql: ', input_vals, kwargs)
             ir_node = SignFx2Op.map(fsig)(*input_vals, **kwargs)
         else:
             # FIXME: handle cases for IRObject in kwargs

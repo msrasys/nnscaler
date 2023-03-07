@@ -331,7 +331,11 @@ def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
     def gen_hash(node: IRFwOperation) -> str:
         ret = node.signature
         for it in node.inputs():
-            ret = ret + '-' + str(it.shape)
+            # FIXME: this is hack
+            if isinstance(it, float):
+                ret = ret + '-' + str(it)
+            else:
+                ret = ret + '-' + str(it.shape)
         return ret
 
     dq = deque()
