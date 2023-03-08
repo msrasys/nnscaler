@@ -308,6 +308,7 @@ def Expand(input, *sizes, signature = None):
     """
     torch.Tensor.expand(*sizes)
     """
+    signature = 'cube.runtime.function.expand'
     edim_in = ShapeAnno.create_shape_str(input.shape)
     assert len(input.shape) == len(sizes)
     for idx, (dim, expand_dim) in enumerate(zip(input.shape, sizes)):
@@ -327,26 +328,55 @@ def Clone(input, *, memory_format=None, signature = None):
     return IRDimops(Clone, 'clone', signature, annos, [input])
 
 
+def BitwiseOr(input, other, *, out=None, signature=None):
+    """
+    torch.bitwise_or(input, other, *, out=None) → Tensor
+    """
+    assert isinstance(input, IRTensor) and isinstance(other, IRTensor)
+    annos = ['*, * -> *']
+    return IRDimops(BitwiseOr, 'bitwise_or', signature, annos, [input, other])
+
+
+def CubeAdd(input, other, alpha=1, *, out=None, signature = None):
+    signature = 'cube.runtime.function.add'
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+        return IRDimops(Add, 'add', signature, annos, [input, other], alpha=alpha)
+    else:
+        annos = ['* -> *']
+        if isinstance(input, IRTensor):
+            return IRDimops(CubeAdd, 'add', signature, annos, [input], other=other, alpha=alpha)
+        else:
+            return IRDimops(CubeAdd, 'add', signature, annos, [other], other=input, alpha=alpha)
+
+
 def Add(input, other, alpha=1, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input + alpha * other
-    annos = ['*, ? -> *', '?, * -> *',]
+    return CubeAdd(input, other, alpha, out=out, signature=signature)
+
+
+def CubeSub(input, other, alpha=1, *, out=None, signature = None):
+    signature = 'cube.runtime.function.sub'
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(Add, 'add', signature, annos, [input, other], alpha=alpha)
+        return IRDimops(Sub, 'sub', signature, annos, [input, other], alpha=alpha)
+    else:
+        annos = ['* -> *']
+        if isinstance(input, IRTensor):
+            return IRDimops(CubeAdd, 'sub', signature, annos, [input], other=other, alpha=alpha)
+        else:
+            return IRDimops(CubeAdd, 'sub', signature, annos, [other], other=input, alpha=alpha)
 
 
 def Sub(input, other, alpha=1, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input - alpha * other
-    annos = ['*, ? -> *', '?, * -> *',]
-    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(input, other)
-        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(Sub, 'sub', signature, annos, [input, other], alpha=1)
+    return CubeSub(input, other, alpha, out=out, signature=signature)
 
 
 def CubeMul(input, other, *, out=None, signature = None):
@@ -1159,6 +1189,17 @@ def Roll(input, shifts: Union[int, Tuple[int]], dims=None, signature = None):
     return IRDimops(Roll, 'roll', signature, [anno], [input], shifts=shifts, dims=dims)
 
 
+def Inverse(input, *, out=None, signature=None):
+    """
+    torch.inverse(input, *, out=None) → Tensor
+    """
+    ishape = ShapeAnno.create_shape_str(input.shape)
+    ishape = [i + '^' for i in ishape]
+    oshape = copy.copy(ishape)
+    anno = OpAnno.create_op_str([ishape], [oshape])
+    return IRDimops(Inverse, 'inverse', signature, [anno], [input])
+
+
 def AdaptiveAvgPool1d(input, output_size, signature = None):
     """
     torch.nn.functional.adaptive_avg_pool2d(input, output_size)
@@ -1294,6 +1335,23 @@ def Size(tensor, dim=None, signature = None) -> Union[List[int], IRPyFunc]:
     return IRPyFunc(signature, [tensor, dim], [IRObject()])
 
 
+def To(tensor: IRTensor, dtype_or_device, *, out=None, signature = None):
+    """
+    torch.Tensor.to(*args, **kwargs) → Tensor
+    """
+    assert out is None
+    # FIXME: support full version of torch.Tensor.to
+    # create "to" in cube runtime functions because dtype if not kwarg in torch.Tensor.to
+    signature = 'cube.runtime.function.to'
+    annos = ['* -> *']
+    if isinstance(dtype_or_device, torch.device):
+        return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype_or_device)
+    else:
+        assert isinstance(dtype_or_device, (IRDType, torch.dtype))
+        dtype = dtype_or_device if isinstance(dtype_or_device, torch.dtype) else eval('torch.'+dtype_or_device.value)
+        return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype)
+
+
 def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
     """
     _operator.getitem(obj, index: int)
@@ -1346,7 +1404,7 @@ def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
     else:
         return IRPyFunc(signature, [obj, index], [IRObject()])
 
-    
+
 def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], IRPyFunc]:
     """
     builtins.getattr(object, name[, default])
@@ -1354,14 +1412,14 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
     have instantiated object or the attr is not simple value.
     """
     obj, name = instance, field
-    if name == 'shape':
+    if name in ('shape', 'dtype'):
         assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
         assert hasattr(obj, name), f"attr {name} is not existed in {obj}"
         return getattr(obj, name)
-    elif name == 'dtype':
+    elif name == 'device':
         assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
-        assert hasattr(obj, name), f"attr {name} is not existed in {obj}"
-        return getattr(obj, name)
+        # FIXME: this is hack, IRFullTensor does not have attribute "device"
+        return torch.device('cpu')
     elif isinstance(obj, torch.finfo):
         return getattr(obj, name)
     else:
