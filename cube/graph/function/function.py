@@ -1299,7 +1299,49 @@ def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
     _operator.getitem(obj, index: int)
     """
     obj, index = a, b
-    if (not isinstance(obj, IRObject)) and isinstance(index, int):
+
+    def try_reshape(tensor, expr):
+        if expr[0] == Ellipsis and expr[1] == None:
+            return True, copy.copy(tensor.shape) + [1]
+        dim_cnt = 0
+        idx = 0
+        dst_shape = []
+        for item in expr:
+            if item == slice(None, None, None):
+                dst_shape.append(tensor.shape[idx])
+                idx += 1
+            elif item == None:
+                dst_shape.append(1)
+            else:
+                return False, []
+        if idx != len(tensor.shape):
+            return False, []
+        return True, dst_shape
+
+    def try_select(tensor, expr):
+        int_cnt = 0
+        dim = -1
+        val = -1
+        for i, item in enumerate(expr):
+            if isinstance(item, int):
+                int_cnt += 1
+                dim = i
+                val = item
+        if int_cnt != 1:
+            return False, -1, -1
+        if expr[0] == Ellipsis:
+            dim = dim - len(expr)
+        return True, dim, val
+
+    if isinstance(obj, IRTensor):
+        is_reshape, dst_shape = try_reshape(obj, index)
+        if is_reshape:
+            return Reshape(obj, dst_shape, signature='torch.reshape')
+        is_select, dim, val = try_select(obj, index)
+        if is_select:
+            return Select(obj, dim, val, 'torch.select')
+        assert False, f'{obj}, {index}'
+    elif (not isinstance(obj, IRObject)) and isinstance(index, int):
         return obj[index]
     else:
         return IRPyFunc(signature, [obj, index], [IRObject()])
