@@ -333,7 +333,7 @@ def BitwiseOr(input, other, *, out=None, signature=None):
     torch.bitwise_or(input, other, *, out=None) → Tensor
     """
     assert isinstance(input, IRTensor) and isinstance(other, IRTensor)
-    annos = ['* -> *']
+    annos = ['*, * -> *']
     return IRDimops(BitwiseOr, 'bitwise_or', signature, annos, [input, other])
 
 
