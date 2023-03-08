@@ -213,10 +213,6 @@ class ProfileDataBase:
         @return infer_memory int: the peak memory in bytes after inference of the function
         @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
         """
-        if node.name in ('mul', 'expand'):
-            key = self._serialize(node)
-            self.insert(node.signature, key, (0,), (0,), 0, 0, 0, (0,), 0)
-            return (0,), (0,), 0, 0, 0, (0,), 0
         fn, shapes, dtypes, kwargs = ProfileDataBase.get_func(node)
 
         if self.exist(node):

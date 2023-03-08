@@ -94,6 +94,8 @@ class SignFx2Op:
         __ttemplate('_shape_as_tensor'): function.ShapeAsTensor,
         __ttemplate('index_select'): function.IndexSelect,
         __ttemplate('finfo'): function.FInfo,
+        __ttemplate('inverse'): function.Inverse,
+        __ttemplate('bitwise_or'): function.BitwiseOr,
         __ftemplate('embedding'): function.Embedding,
         'torch.functional.einsum': function.EinSum,
 
@@ -101,6 +103,7 @@ class SignFx2Op:
 
         # ============== runtime function =================
         __tttemplate('size'): function.Size,
+        __tttemplate('to'): function.To,
         '_operator.getitem': function.GetItem,
         'builtins.getattr': function.GetAttr,
 
@@ -133,9 +136,9 @@ class SignFx2Op:
         # __ttemplate('clone'): function.Clone,
         #
         __ttemplate('add') : function.Add,
-        #
+        '_operator.add': function.Add,
         # __ttemplate('sub') : function.Sub,
-        #
+        '_operator.sub': function.Sub,
         # __ttemplate('mul') : function.Mul,
         '_operator.mul': function.Mul,
         
