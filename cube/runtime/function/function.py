@@ -1,4 +1,4 @@
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 import torch
 import torch.nn.functional as TorchF
 
@@ -22,6 +22,8 @@ def multiref(tensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]:
     """
     return tensor if times == 1 else tuple([tensor] * times)
 
+def to(tensor: torch.Tensor, dtype_or_device: Union[torch.device, torch.dtype]) -> torch.Tensor:
+    return tensor.to(dtype_or_device)
 
 def accum(*tensors: Tuple[torch.Tensor]) -> torch.Tensor:
     """
@@ -32,6 +34,14 @@ def accum(*tensors: Tuple[torch.Tensor]) -> torch.Tensor:
     else:
         return torch.sum(torch.stack(tensors, dim=0), dim=0)
 
+def sub(input: torch.Tensor, other: Union[int, float, torch.Tensor], alpha: Union[int, float], swap_operands: bool) -> torch.Tensor:
+    if swap_operands:
+        return torch.sub(other, input, alpha=alpha)
+    else:
+        return torch.sub(input, other, alpha=alpha)
+
+def expand(input: torch.Tensor, sizes: Union[torch.Size, List[int]]) -> torch.Tensor:
+    return input.expand(*sizes)
 
 def conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
            stride: int, padding: List[int], dilation, groups: int = 1):

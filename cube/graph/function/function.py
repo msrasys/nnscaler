@@ -11,7 +11,7 @@ from cube.ir.dtype import IRDType
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
 from cube.graph.function.conv import IRPad, IRConv2D, IRConv3D
-from cube.graph.function.creators import IROnes, IRToTensor, IRZeros, IRRand, IRNewTensor
+from cube.graph.function.creators import IRArange, IREmpty, IROnes, IRToTensor, IRZeros, IRRand, IRNewTensor
 from cube.graph.function.anchor import IRGraphAnchor
 
 
@@ -112,6 +112,50 @@ def Matmul(signature, input, other, *, out=None):
     return IRDimops(Matmul, 'matmul', signature, annos, [input, other])
 
 
+def Arange(*args, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False, signature=None):
+    """
+    torch.arange(start=0, end, step=1, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False) → Tensor
+    """
+    if len(args) == 1:
+        start, end, step = 0, args[0], 1
+    elif len(args) == 2:
+        start, end, step = args[0], args[1], 1
+    elif len(args) == 3:
+        start, end, step = args
+    else:
+        raise RuntimeError(f'Invalid number {len(args)} of args in Arange.')
+    assert isinstance(start, int) and isinstance(end, int) and isinstance(step, int)
+    from cube.graph.parser.mapping import DType2IRDType
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    ir_dtype : IRDType = DType2IRDType.map(dtype)
+    import math
+    size = (math.ceil((end-start)/step),)
+    kwargs = {'start': start, 'end': end, 'step': step, 'out': out, 'dtype': ir_dtype,
+              'layout': layout, 'device': device, 'requires_grad': requires_grad}
+    return IRArange(signature, size, 'arange', **kwargs)
+
+
+def Empty(*size, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False,
+          pin_memory=False, memory_format=torch.contiguous_format, signature=None):
+    """
+    torch.empty(*size, *, out=None, dtype=None, layout=torch.strided, device=None,
+    requires_grad=False, pin_memory=False, memory_format=torch.contiguous_format) → Tensor
+    """
+    from cube.graph.parser.mapping import DType2IRDType
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    ir_dtype : IRDType = DType2IRDType.map(dtype)
+    # example size: ((17, 17),)
+    assert isinstance(size, tuple) and isinstance(size[0], tuple)
+    for dim, i in enumerate(size[0]):
+        if not isinstance(dim, int) and not dim >= 0:
+            raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
+    kwargs = {'dtype': ir_dtype, 'layout': layout, 'device': device, 'requires_grad': requires_grad,
+              'pin_memory': pin_memory, 'memory_format': memory_format}
+    return IREmpty(signature, size[0], 'empty', **kwargs)
+
+
 def Zeros(signature,
           inputs: Tuple[ List[int], Optional[int], Optional[Any], ErasedDevice, Optional[bool] ]):
     # zeros(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
@@ -191,39 +235,50 @@ def Rand(signature,
             raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
     return IRRand(signature, size, 'rand', ir_dtype)
 
-def NewTensor(signature,
-              inputs: Tuple[ list, Optional[int], ErasedDevice, bool ]):
-    # aten::tensor(t[] data, *, ScalarType? dtype=None, Device? device=None, bool requires_grad=False) -> Tensor
-    #
-    # REMARK: in the PyTorch-internal operator definition expression, an asterisk ("*") is merely a marker of
-    #         the beginning of the sublist of _keyword arguments_, and does not result in an actual argument.
-
-    data, dtype_underlying, _erased_device, requires_grad = inputs
-
-    # TODO parameters to support, currently they are all None
+def NewTensor(data: Union[int, float, list], dtype=None, device=None, requires_grad=False, pin_memory=False, signature=None):
+    # NOTE: not sure all the keys of torch.tensor
     assert requires_grad == False
-    from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
-
-    if dtype_underlying is not None:
-        # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
-        # which is the underlying type of PyTorch C++ enum 'ScalarType'.
-        dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
-    else:
+    from cube.graph.parser.mapping import DType2IRDType
+    if dtype is None:
         dtype = torch.get_default_dtype()
-
     ir_dtype : IRDType = DType2IRDType.map(dtype)
+    kwargs = {'dtype': ir_dtype, 'device': device, 'requires_grad': requires_grad, 'pin_memory': pin_memory}
+    return IRNewTensor(signature, data, 'tensor', **kwargs)
 
-    # if 'data' is not:
-    # 1) ints or floats of any precision, e.g. i8, i64, f16, f32
-    # 2) non-ragged
-    # ... then this call will throw.
-    arr = torch.tensor(data, dtype=dtype)
 
-    # TODO temporarily fake creation with Zeros
-    # and remark that originally aten::tensor should be able to infer the dtype from the specified 'data',
-    # but since we have omitted the 'data', we must do type inferrence ourselves,
-    # only in this way we get correct dtype e.g. ints or bools.
-    return IRNewTensor(signature, data, 'tensor', ir_dtype=ir_dtype)
+# def NewTensor(signature,
+#               inputs: Tuple[ list, Optional[int], ErasedDevice, bool ]):
+#     # aten::tensor(t[] data, *, ScalarType? dtype=None, Device? device=None, bool requires_grad=False) -> Tensor
+#     #
+#     # REMARK: in the PyTorch-internal operator definition expression, an asterisk ("*") is merely a marker of
+#     #         the beginning of the sublist of _keyword arguments_, and does not result in an actual argument.
+
+#     data, dtype_underlying, _erased_device, requires_grad = inputs
+
+#     # TODO parameters to support, currently they are all None
+#     assert requires_grad == False
+#     from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
+
+#     if dtype_underlying is not None:
+#         # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
+#         # which is the underlying type of PyTorch C++ enum 'ScalarType'.
+#         dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
+#     else:
+#         dtype = torch.get_default_dtype()
+
+#     ir_dtype : IRDType = DType2IRDType.map(dtype)
+
+#     # if 'data' is not:
+#     # 1) ints or floats of any precision, e.g. i8, i64, f16, f32
+#     # 2) non-ragged
+#     # ... then this call will throw.
+#     arr = torch.tensor(data, dtype=dtype)
+
+#     # TODO temporarily fake creation with Zeros
+#     # and remark that originally aten::tensor should be able to infer the dtype from the specified 'data',
+#     # but since we have omitted the 'data', we must do type inferrence ourselves,
+#     # only in this way we get correct dtype e.g. ints or bools.
+#     return IRNewTensor(signature, data, 'tensor', ir_dtype=ir_dtype)
 
 def ToTensor(signature,
              inputs: Tuple[ IRTensor, ... ]):
@@ -308,6 +363,7 @@ def Expand(input, *sizes, signature = None):
     """
     torch.Tensor.expand(*sizes)
     """
+    signature = 'cube.runtime.function.expand'
     edim_in = ShapeAnno.create_shape_str(input.shape)
     assert len(input.shape) == len(sizes)
     for idx, (dim, expand_dim) in enumerate(zip(input.shape, sizes)):
@@ -327,37 +383,78 @@ def Clone(input, *, memory_format=None, signature = None):
     return IRDimops(Clone, 'clone', signature, annos, [input])
 
 
+def BitwiseOr(input, other, *, out=None, signature=None):
+    """
+    torch.bitwise_or(input, other, *, out=None) → Tensor
+    """
+    assert out is None
+    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
+        return input | other
+    assert isinstance(input, IRTensor) and isinstance(other, IRTensor)
+    annos = ['*, * -> *']
+    return IRDimops(BitwiseOr, 'bitwise_or', signature, annos, [input, other])
+
+
+def BitwiseNot(input, *, out=None, signature=None):
+    assert out is None
+    if not isinstance(input, IRObject):
+        return ~input
+    assert isinstance(input, IRTensor)
+    annos = ['* -> *']
+    return IRDimops(BitwiseNot, 'bitwise_not', signature, annos, [input])
+
+
 def Add(input, other, alpha=1, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input + alpha * other
-    annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(Add, 'add', signature, annos, [input, other], alpha=alpha)
+        return IRDimops(Add, 'add', signature, annos, [input, other], alpha=alpha)
+    else:
+        annos = ['* -> *']
+        if isinstance(input, IRTensor):
+            return IRDimops(Add, 'add', signature, annos, [input], other=other, alpha=alpha)
+        else:
+            return IRDimops(Add, 'add', signature, annos, [other], other=input, alpha=alpha)
+
+
+def CubeSub(input, other, alpha=1, *, out=None, signature = None):
+    signature = 'cube.runtime.function.sub'
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+        return IRDimops(CubeSub, 'sub', signature, annos, [input, other], alpha=alpha, swap_operands=False)
+    else:
+        annos = ['* -> *']
+        if isinstance(input, IRTensor):
+            return IRDimops(CubeSub, 'sub', signature, annos, [input], other=other, alpha=alpha, swap_operands=False)
+        else:
+            return IRDimops(CubeSub, 'sub', signature, annos, [other], other=input, alpha=alpha, swap_operands=True)
 
 
 def Sub(input, other, alpha=1, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input - alpha * other
-    annos = ['*, ? -> *', '?, * -> *',]
-    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(input, other)
-        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(Sub, 'sub', signature, annos, [input, other], alpha=1)
+    return CubeSub(input, other, alpha, out=out, signature=signature)
 
 
 def Mul(input, other, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input * other
-    annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(Mul, 'mul', signature, annos, [input, other])
+        return IRDimops(Mul, 'mul', signature, annos, [input, other])
+    else:
+        annos = ['* -> *']
+        if isinstance(input, IRTensor):
+            return IRDimops(Mul, 'mul', signature, annos, [input], other=other)
+        else:
+            return IRDimops(Mul, 'mul', signature, annos, [other], other=input)
 
 
 def Div(input, other, *, rounding_mode=None, out=None, signature = None):
@@ -1149,6 +1246,17 @@ def Roll(input, shifts: Union[int, Tuple[int]], dims=None, signature = None):
     return IRDimops(Roll, 'roll', signature, [anno], [input], shifts=shifts, dims=dims)
 
 
+def Inverse(input, *, out=None, signature=None):
+    """
+    torch.inverse(input, *, out=None) → Tensor
+    """
+    ishape = ShapeAnno.create_shape_str(input.shape)
+    ishape = [i + '^' for i in ishape]
+    oshape = copy.copy(ishape)
+    anno = OpAnno.create_op_str([ishape], [oshape])
+    return IRDimops(Inverse, 'inverse', signature, [anno], [input])
+
+
 def AdaptiveAvgPool1d(input, output_size, signature = None):
     """
     torch.nn.functional.adaptive_avg_pool2d(input, output_size)
@@ -1284,6 +1392,23 @@ def Size(tensor, dim=None, signature = None) -> Union[List[int], IRPyFunc]:
     return IRPyFunc(signature, [tensor, dim], [IRObject()])
 
 
+def To(tensor: IRTensor, dtype_or_device, *, out=None, signature = None):
+    """
+    torch.Tensor.to(*args, **kwargs) → Tensor
+    """
+    assert out is None
+    # FIXME: support full version of torch.Tensor.to
+    # create "to" in cube runtime functions because dtype if not kwarg in torch.Tensor.to
+    signature = 'cube.runtime.function.to'
+    annos = ['* -> *']
+    if isinstance(dtype_or_device, torch.device):
+        return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype_or_device)
+    else:
+        assert isinstance(dtype_or_device, (IRDType, torch.dtype))
+        dtype = dtype_or_device if isinstance(dtype_or_device, torch.dtype) else eval('torch.'+dtype_or_device.value)
+        return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype)
+
+
 def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
     """
     _operator.getitem(obj, index: int)
@@ -1294,18 +1419,28 @@ def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
     else:
         return IRPyFunc(signature, [obj, index], [IRObject()])
 
-    
-def GetAttr(instance: object, field: str, signature=None) -> Union[List[int], IRPyFunc]:
+
+def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], IRPyFunc]:
     """
     builtins.getattr(object, name[, default])
     NOTE: only deal with the attr "shape" of IRFullTensor, because other type of object may not
     have instantiated object or the attr is not simple value.
     """
     obj, name = instance, field
-    if name == 'shape':
+    if name in ('shape', 'dtype'):
         assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
         assert hasattr(obj, name), f"attr {name} is not existed in {obj}"
+        return getattr(obj, name)
+    elif name == 'device':
+        assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
+        # FIXME: this is hack, IRFullTensor does not have attribute "device"
+        return torch.device('cpu')
+    elif isinstance(obj, torch.finfo):
         return getattr(obj, name)
     else:
         # FIXME: is it right?
         return IRPyFunc(signature, [instance, field], [IRObject()])
+
+def FInfo(dtype: IRDType, signature = None) -> torch.finfo:
+    assert isinstance(dtype, IRDType)
+    return torch.finfo(eval('torch.' + dtype.value))

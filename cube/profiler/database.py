@@ -11,7 +11,8 @@ import json
 import cube
 from cube.ir.cten import IRTensor
 from cube.ir.operator import IRFwOperation
-from cube.graph.parser.mapping import Sign2Op, IRDType2TorchDType
+from cube.graph.parser.mapping import IRDType2TorchDType
+from cube.graph.parser.mappingfx import SignFx2Op as Sign2Op
 
 
 Shapes = NewType('Shapes', Tuple[Tuple[int]])
@@ -50,12 +51,13 @@ class CompProfiler:
         # create data
         dtypes = [torch.float32] * len(shapes) if dtypes is None else dtypes
         def gen_torch_tensors(shape, dtype):
-            constructor = torch.zeros if dtype == torch.int64 else torch.rand
-            requires_grad = False if dtype == torch.int64 else True
+            constructor = torch.zeros if dtype in (torch.int64, torch.int32, torch.bool) else torch.rand
+            requires_grad = False if dtype in (torch.int64, torch.int32, torch.bool) else True
             return constructor(tuple(shape), dtype=dtype, device=torch.cuda.current_device(), requires_grad=requires_grad)
         tensors = tuple(
             gen_torch_tensors(shape, dtype) for shape, dtype in zip(shapes, dtypes)
         )
+        require_backward = any([t.requires_grad for t in tensors])
         # repalce kwargs starting with 'self.xxx'
         train_kwargs, eval_kwargs = {}, {}
         for name, value in kwargs.items():
@@ -108,12 +110,12 @@ class CompProfiler:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
-            outs = run_step(func, tensors, train_kwargs, backward=True)
+            outs = run_step(func, tensors, train_kwargs, backward=require_backward)
 
         # warmup
         tic = time.time()
         while time.time() - tic < warmup_sec:
-            run_step(func, tensors, train_kwargs, backward=True)
+            run_step(func, tensors, train_kwargs, backward=require_backward)
 
         # profile forward only
         torch.cuda.synchronize()
@@ -129,7 +131,7 @@ class CompProfiler:
         torch.cuda.synchronize()
         tic = time.perf_counter()
         for _ in range(prof_times):
-            run_step(func, tensors, train_kwargs, backward=True)
+            run_step(func, tensors, train_kwargs, backward=require_backward)
         torch.cuda.synchronize()
         toc = time.perf_counter()
         fwbw_span = (toc - tic) / prof_times * 1000 # in milliseconds
@@ -184,7 +186,15 @@ class ProfileDataBase:
             exec(code_impl, globals(), local)
             fn = list(local.values())[0]
         else:
-            fn = eval(node.signature)
+            if '_operator.' in node.signature:
+                if '_operator.or_' == node.signature:
+                    fn = torch.bitwise_or
+                elif '_operator.invert' == node.signature:
+                    fn = torch.bitwise_not
+                else:
+                    fn = eval(node.signature.replace('_operator.', 'torch.'))
+            else:
+                fn = eval(node.signature)
         shapes, dtypes = [], []
         for t in node.inputs():
             assert isinstance(t, IRTensor), f"Only support node inputs with tensor shape"
