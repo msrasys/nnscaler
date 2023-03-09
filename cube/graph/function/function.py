@@ -11,7 +11,7 @@ from cube.ir.dtype import IRDType
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
 from cube.graph.function.conv import IRPad, IRConv2D, IRConv3D
-from cube.graph.function.creators import IROnes, IRToTensor, IRZeros, IRRand, IRNewTensor
+from cube.graph.function.creators import IRArange, IREmpty, IROnes, IRToTensor, IRZeros, IRRand, IRNewTensor
 from cube.graph.function.anchor import IRGraphAnchor
 
 
@@ -110,6 +110,46 @@ def Matmul(signature, input, other, *, out=None):
     if len(input.shape) > 2 and len(other.shape) > 2:
         assert tuple(input.shape[:-2]) == tuple(other.shape[:-2]), "broadcast of matmul (bmm) is not supported"
     return IRDimops(Matmul, 'matmul', signature, annos, [input, other])
+
+
+def Arange(*args, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False, signature=None):
+    """
+    torch.arange(start=0, end, step=1, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False) → Tensor
+    """
+    if len(args) == 1:
+        start, end, step = 0, args[0], 1
+    elif len(args) == 2:
+        start, end, step = args[0], args[1], 1
+    elif len(args) == 3:
+        start, end, step = args
+    else:
+        raise RuntimeError(f'Invalid number {len(args)} of args in Arange.')
+    assert isinstance(start, int) and isinstance(end, int) and isinstance(step, int)
+    from cube.graph.parser.mapping import DType2IRDType
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    ir_dtype : IRDType = DType2IRDType.map(dtype)
+    import math
+    size = (math.ceil((end-start)/step),)
+    kwargs = {'start': start, 'end': end, 'step': step, 'out': out, 'dtype': ir_dtype,
+              'layout': layout, 'device': device, 'requires_grad': requires_grad}
+    return IRArange(signature, size, 'arange', **kwargs)
+
+
+def Empty(*size, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False,
+          pin_memory=False, memory_format=torch.contiguous_format, signature=None):
+    from cube.graph.parser.mapping import DType2IRDType
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    ir_dtype : IRDType = DType2IRDType.map(dtype)
+    # example size: ((17, 17),)
+    assert isinstance(size, tuple) and isinstance(size[0], tuple)
+    for dim, i in enumerate(size[0]):
+        if not isinstance(dim, int) and not dim >= 0:
+            raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
+    kwargs = {'dtype': ir_dtype, 'layout': layout, 'device': device, 'requires_grad': requires_grad,
+              'pin_memory': pin_memory, 'memory_format': memory_format}
+    return IREmpty(signature, size[0], 'empty', **kwargs)
 
 
 def Zeros(signature,
@@ -332,9 +372,21 @@ def BitwiseOr(input, other, *, out=None, signature=None):
     """
     torch.bitwise_or(input, other, *, out=None) → Tensor
     """
+    assert out is None
+    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
+        return input | other
     assert isinstance(input, IRTensor) and isinstance(other, IRTensor)
     annos = ['*, * -> *']
     return IRDimops(BitwiseOr, 'bitwise_or', signature, annos, [input, other])
+
+
+def BitwiseNot(input, *, out=None, signature=None):
+    assert out is None
+    if not isinstance(input, IRObject):
+        return ~input
+    assert isinstance(input, IRTensor)
+    annos = ['* -> *']
+    return IRDimops(BitwiseNot, 'bitwise_not', signature, annos, [input])
 
 
 def CubeAdd(input, other, alpha=1, *, out=None, signature = None):

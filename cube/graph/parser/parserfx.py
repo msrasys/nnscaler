@@ -241,9 +241,14 @@ class FxModuleParser:
         input_vals = [get_complex_data(val) for val in node.args]
         kwargs = {key: get_complex_data(val) for key, val in node.kwargs.items()}
 
+        # if 'invert' in fsig:
+        #     print('zql find invert: ', fsig, node.name, node.target, node.meta, node.args, node.kwargs, input_vals, kwargs)
+        #     exit(1)
         # map to IR operator
         if SignFx2Op.exist(fsig):
+            print('zql: ', input_vals, kwargs)
             ir_node = SignFx2Op.map(fsig)(*input_vals, **kwargs)
+            print('zql ir_node: ', ir_node)
         else:
             # FIXME: handle cases for IRObject in kwargs
             # case1: unknown torch operator

@@ -189,6 +189,8 @@ class ProfileDataBase:
             if '_operator.' in node.signature:
                 if '_operator.or_' == node.signature:
                     fn = torch.bitwise_or
+                elif '_operator.invert' == node.signature:
+                    fn = torch.bitwise_not
                 else:
                     fn = eval(node.signature.replace('_operator.', 'torch.'))
             else:

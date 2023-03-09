@@ -90,6 +90,7 @@ class SignFx2Op:
         __ttemplate('permute'): function.Permute,
         __ttemplate('transpose'): function.Transpose,
         __tttemplate('expand'): function.Expand,
+        __ttemplate('arange'): function.Arange,
         __ttemplate('detach'): function.Detach,
         __ttemplate('_shape_as_tensor'): function.ShapeAsTensor,
         __ttemplate('index_select'): function.IndexSelect,
@@ -97,6 +98,8 @@ class SignFx2Op:
         __ttemplate('inverse'): function.Inverse,
         __ttemplate('bitwise_or'): function.BitwiseOr,
         '_operator.or_': function.BitwiseOr,
+        __ttemplate('bitwise_not'): function.BitwiseOr,
+        '_operator.invert': function.BitwiseNot,
         __ftemplate('embedding'): function.Embedding,
         'torch.functional.einsum': function.EinSum,
 
@@ -129,6 +132,7 @@ class SignFx2Op:
         # # torch aten
         #
         # # creators
+        __ttemplate('empty'): function.Empty,
         # __ttemplate('zeros'): function.Zeros,
         # __ttemplate('ones'): function.Ones,
         # __ttemplate('tensor'): function.NewTensor,
