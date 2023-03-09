@@ -1,4 +1,4 @@
-from typing import List, Optional, Any, Dict, Union
+from typing import List, Optional, Any, Dict, Union, Tuple
 from cube.algorithm.generics import GenericDistAlgo
 
 from cube.graph.function.dimops import IRDimops, DimAnno, DimopSplit, TransformRule
@@ -44,7 +44,30 @@ class DimSplitEinops(GenericDistAlgo):
         if not isinstance(node, IRDimops):
             raise TypeError(f"Expect IRDimops")
         super().__init__(node)
-    
+
+    def get_identifier_reduce(self, idx: int, dim: int, num: int) -> Tuple[str, DimAnno.ReduceType]:
+        """
+        Get the partitioned identifier and reduction type.
+        If the partitioned number is 1, return the first hidden identitifer
+        Otherwise, return the first hidden identifier whose length > 1 
+
+        @param idx int: input index
+        @param dim int: input dimension
+
+        @return identifier Optional[str]: annotated dimension identifier
+        @return reduction Optional[DimAnno.ReduceType]
+        """
+        node: IRDimops = self.node
+        hidx = None
+        for hidx, adim in enumerate(node.anno.input(idx).dims[dim].identifiers):
+            if num == 1: break
+            dimlen = node.anno.getlen(adim)
+            if adim == '1^' or dimlen == 1: continue
+            break
+        if hidx is None: return (None, None)
+        reduce = node.anno.input(idx).dims[dim].reduces[hidx]
+        return adim, reduce
+
     def satisfy(self, idx: int, dim: Union[int, str], num: int) -> bool:
         """
         Check whether the condition satisfies.
@@ -70,16 +93,14 @@ class DimSplitEinops(GenericDistAlgo):
         
         # try split at tensor spatial dimension
         if isinstance(dim, int):
-            for adim in node.anno.input(idx).dims[dim].identifiers:
-                if adim == '1^': continue
-                break
+            adim, reduce = self.get_identifier_reduce(idx, dim, num)
+            if adim is None: return False
             dimlen = node.anno.getlen(adim)
             # first check node special rules first
             for rule in node.transform_rules:
                 if rule.input(idx) == DimopSplit.D(dim):
                     return dimlen >= num
             # then check default rules
-            reduce = node.anno.input(idx).dims[dim].reduces[0]
             if reduce == DimAnno.ReduceType.Freeze:
                 return False
             return dimlen >= num
@@ -96,10 +117,7 @@ class DimSplitEinops(GenericDistAlgo):
         satisfy = self.satisfy(idx, dim, num)
 
         if isinstance(dim, int):
-            for adim in node.anno.input(idx).dims[dim].identifiers:
-                if adim == '1^': continue
-                break
-            reduce: DimAnno.ReduceType = node.anno.input(idx).dims[dim].reduces[0]
+            adim, reduce = self.get_identifier_reduce(idx, dim, num)
         else:
             adim, reduce = 'Value', None
         
@@ -162,15 +180,14 @@ class DimSplitEinops(GenericDistAlgo):
                     return r
         # otherwise use default rule
         assert isinstance(dim, int), f"Error: expect dim to be int for default rules"
-        adim: str = node.anno.input(idx).dims[dim].identifiers[0]
-        reduce: DimAnno.ReduceType = node.anno.input(idx).dims[dim].reduces[0]
+        adim, reduce = self.get_identifier_reduce(idx, dim, num)
         if reduce == DimAnno.ReduceType.Freeze:
             return None
         itransform, otransform = [], []
         # input
         for idx, idim in enumerate(node.anno.inputs()):
             dims = idim.getdims(adim)
-            assert len(dims) <= 1, "Cannot split on multple same tensors"
+            assert len(dims) <= 1, "Cannot split on multiple same tensors"
             if len(dims) == 1:
                 itransform.append(DimopSplit.D(dims[0]))
             else:

@@ -808,7 +808,7 @@ def View(input, size: Tuple[int], *arg_size, signature = None):
     for bracket in in_anno:
         sdim = None
         for hdim in range(len(bracket)):
-            if bracket[hdim] == '1': continue
+            if bracket[hdim] == '1' or shape_map[bracket[hdim]] == 1: continue
             sdim = bracket[hdim]
             break
         if sdim is not None:
@@ -819,7 +819,7 @@ def View(input, size: Tuple[int], *arg_size, signature = None):
     for bracket in ou_anno:
         sdim = None
         for hdim in range(len(bracket)):
-            if bracket[hdim] == '1': continue
+            if bracket[hdim] == '1' or shape_map[bracket[hdim]] == 1: continue
             sdim = bracket[hdim]
             break
         if sdim is not None:
@@ -840,8 +840,7 @@ def View(input, size: Tuple[int], *arg_size, signature = None):
     # the last one.
     def view_modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
         kwargs = dict(**kwargs)
-        ofirst = [bracket[0] for bracket in ou_anno]
-        identifier = in_anno[dim][0]
+        identifier = ifirst[dim]
         oidx = ofirst.index(identifier)
         size = list(kwargs['size'])
         size[oidx] = size[oidx] // num
