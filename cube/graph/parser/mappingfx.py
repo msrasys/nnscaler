@@ -135,7 +135,7 @@ class SignFx2Op:
         __ttemplate('empty'): function.Empty,
         # __ttemplate('zeros'): function.Zeros,
         # __ttemplate('ones'): function.Ones,
-        # __ttemplate('tensor'): function.NewTensor,
+        __ttemplate('tensor'): function.NewTensor,
         # __ttemplate('to'): function.ToTensor,
         # __ttemplate('rand'): function.Rand,
         # __ttemplate('clone'): function.Clone,
