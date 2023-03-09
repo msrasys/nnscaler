@@ -96,6 +96,7 @@ class SignFx2Op:
         __ttemplate('finfo'): function.FInfo,
         __ttemplate('inverse'): function.Inverse,
         __ttemplate('bitwise_or'): function.BitwiseOr,
+        '_operator.or_': function.BitwiseOr,
         __ftemplate('embedding'): function.Embedding,
         'torch.functional.einsum': function.EinSum,
 

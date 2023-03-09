@@ -171,8 +171,6 @@ class ProfileDataBase:
             return ret
 
         if node.signature in Sign2Op.kOpCodeDef:
-            # FIXME: ...
-            assert False, 'Sing2Op.kOpCodeDef is not empty'
             dep_code_impl = ''
             for dep_name in get_dep_names(node.signature):
                 dep_code_impl = dep_code_impl + Sign2Op.kOpCodeDef[dep_name]
@@ -189,7 +187,10 @@ class ProfileDataBase:
             fn = list(local.values())[0]
         else:
             if '_operator.' in node.signature:
-                fn = eval(node.signature.replace('_operator.', 'torch.'))
+                if '_operator.or_' == node.signature:
+                    fn = torch.bitwise_or
+                else:
+                    fn = eval(node.signature.replace('_operator.', 'torch.'))
             else:
                 fn = eval(node.signature)
         shapes, dtypes = [], []
@@ -355,9 +356,9 @@ class ProfileDataBase:
         """
         shapes, dtypes = [], []
         for t in node.inputs():
-            if isinstance(t, IRTensor):#, f"Only support node inputs with tensor shape"
-                shapes.append(t.shape)
-                dtypes.append(IRDType2TorchDType.map(t.dtype))
+            assert isinstance(t, IRTensor), f"Only support node inputs with tensor shape"
+            shapes.append(t.shape)
+            dtypes.append(IRDType2TorchDType.map(t.dtype))
         shapes = '-'.join(str(tuple(shape)) for shape in shapes)
         dtypes = '-'.join(str(dtype) for dtype in dtypes)
         return shapes + ' : ' + dtypes
