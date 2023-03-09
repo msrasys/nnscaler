@@ -34,14 +34,8 @@ def accum(*tensors: Tuple[torch.Tensor]) -> torch.Tensor:
     else:
         return torch.sum(torch.stack(tensors, dim=0), dim=0)
 
-def add(input: torch.Tensor, other: Union[int, float, torch.Tensor], alpha: Union[int, float]) -> torch.Tensor:
-    return torch.add(input, other, alpha=alpha)
-
 def sub(input: torch.Tensor, other: Union[int, float, torch.Tensor], alpha: Union[int, float]) -> torch.Tensor:
     return torch.sub(input, other, alpha=alpha)
-
-def mul(input: torch.Tensor, other: Union[float, torch.Tensor]) -> torch.Tensor:
-    return torch.mul(input, other)
 
 def expand(input: torch.Tensor, sizes: Union[torch.Size, List[int]]) -> torch.Tensor:
     return input.expand(*sizes)

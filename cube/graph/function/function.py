@@ -138,6 +138,10 @@ def Arange(*args, out=None, dtype=None, layout=torch.strided, device=None, requi
 
 def Empty(*size, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False,
           pin_memory=False, memory_format=torch.contiguous_format, signature=None):
+    """
+    torch.empty(*size, *, out=None, dtype=None, layout=torch.strided, device=None,
+    requires_grad=False, pin_memory=False, memory_format=torch.contiguous_format) → Tensor
+    """
     from cube.graph.parser.mapping import DType2IRDType
     if dtype is None:
         dtype = torch.get_default_dtype()
@@ -389,8 +393,10 @@ def BitwiseNot(input, *, out=None, signature=None):
     return IRDimops(BitwiseNot, 'bitwise_not', signature, annos, [input])
 
 
-def CubeAdd(input, other, alpha=1, *, out=None, signature = None):
-    signature = 'cube.runtime.function.add'
+def Add(input, other, alpha=1, *, out=None, signature = None):
+    assert out is None
+    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
+        return input + alpha * other
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
@@ -398,16 +404,9 @@ def CubeAdd(input, other, alpha=1, *, out=None, signature = None):
     else:
         annos = ['* -> *']
         if isinstance(input, IRTensor):
-            return IRDimops(CubeAdd, 'add', signature, annos, [input], other=other, alpha=alpha)
+            return IRDimops(Add, 'add', signature, annos, [input], other=other, alpha=alpha)
         else:
-            return IRDimops(CubeAdd, 'add', signature, annos, [other], other=input, alpha=alpha)
-
-
-def Add(input, other, alpha=1, *, out=None, signature = None):
-    assert out is None
-    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
-        return input + alpha * other
-    return CubeAdd(input, other, alpha, out=out, signature=signature)
+            return IRDimops(Add, 'add', signature, annos, [other], other=input, alpha=alpha)
 
 
 def CubeSub(input, other, alpha=1, *, out=None, signature = None):
@@ -419,9 +418,9 @@ def CubeSub(input, other, alpha=1, *, out=None, signature = None):
     else:
         annos = ['* -> *']
         if isinstance(input, IRTensor):
-            return IRDimops(CubeAdd, 'sub', signature, annos, [input], other=other, alpha=alpha)
+            return IRDimops(CubeSub, 'sub', signature, annos, [input], other=other, alpha=alpha)
         else:
-            return IRDimops(CubeAdd, 'sub', signature, annos, [other], other=input, alpha=alpha)
+            return IRDimops(CubeSub, 'sub', signature, annos, [other], other=input, alpha=alpha)
 
 
 def Sub(input, other, alpha=1, *, out=None, signature = None):
@@ -431,25 +430,20 @@ def Sub(input, other, alpha=1, *, out=None, signature = None):
     return CubeSub(input, other, alpha, out=out, signature=signature)
 
 
-def CubeMul(input, other, *, out=None, signature = None):
-    signature = 'cube.runtime.function.mul'
-    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(input, other)
-        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-        return IRDimops(CubeMul, 'mul', signature, annos, [input, other])
-    else:
-        annos = ['* -> *']
-        if isinstance(input, IRTensor):
-            return IRDimops(CubeMul, 'mul', signature, annos, [input], other=other)
-        else:
-            return IRDimops(CubeMul, 'mul', signature, annos, [other], other=input)
-
-
 def Mul(input, other, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input * other
-    return CubeMul(input, other, out=out, signature=signature)
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+        return IRDimops(Mul, 'mul', signature, annos, [input, other])
+    else:
+        annos = ['* -> *']
+        if isinstance(input, IRTensor):
+            return IRDimops(Mul, 'mul', signature, annos, [input], other=other)
+        else:
+            return IRDimops(Mul, 'mul', signature, annos, [other], other=input)
 
 
 def Div(input, other, *, rounding_mode=None, out=None, signature = None):
