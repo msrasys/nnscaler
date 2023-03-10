@@ -40,7 +40,7 @@ def convert_model(model: torch.nn.Module,
                         output_origin = model(**dummy_input)
                     else:
                         raise RuntimeError(f'dummy_input should be a tuple (not a {type(dummy_input)}) = {dummy_input}')
-                traced_model, _ = concrete_trace(
+                traced_model = concrete_trace(
                     model,
                     dummy_input,
                     use_operator_patch=True,

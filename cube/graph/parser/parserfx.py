@@ -88,8 +88,12 @@ class FxModuleParser:
             # shape propagation
             sample_inputs = dummy_inputs if dummy_inputs else [torch.ones(shape, dtype=default_dtype) for shape in input_shapes]
             sample_input_tensors = [sample_inputs[input] for input in sample_inputs] if type(sample_inputs) is dict else sample_inputs
-            from torch.fx.passes.shape_prop import ShapeProp
-            ShapeProp(module).propagate(*sample_input_tensors)  # TODO fixme ShapeProp(module).propagate(*sample_inputs)
+
+            # from torch.fx.passes.shape_prop import ShapeProp
+            # ShapeProp(module).propagate(*sample_input_tensors)  # TODO fixme ShapeProp(module).propagate(*sample_inputs)
+            from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
+            ShapeProp(module).propagate(sample_inputs)
+
             # handle graph inputs
             for idx, input in enumerate(inputs):
                 assert isinstance(input, torch.fx.Node)

@@ -19,7 +19,6 @@ import torch
 from torch._C import ScriptObject
 from torch.nn.modules.container import Sequential, ModuleList, ModuleDict, ParameterList, ParameterDict
 
-import torch.fx
 from torch.fx import GraphModule
 from torch.fx._compatibility import compatibility
 from torch.fx._symbolic_trace import _Patcher, _proxyable_classes
@@ -164,10 +163,6 @@ class ConcreteTracer(TracerBase):
         _orig_frozenset:            ([], True),
         _orig_dict:                 ([], True),
     }
-
-    current_module_qualified_name : str = ''
-    node_to_originating_module : Dict[torch.fx.Node, str] = {}
-
     @compatibility(is_backward_compatible=True)
     def __init__(self):
         """
@@ -289,10 +284,7 @@ class ConcreteTracer(TracerBase):
         assert isinstance(kwargs_noded, dict)
 
         node = self.create_node(kind, target, args_noded, kwargs_noded, name, type_expr)
-        # return self.proxy(value_unwrapped, node)
-        proxy = self.proxy(value_unwrapped, node)
-        self.node_to_originating_module[proxy.node] = self.current_module_qualified_name
-        return proxy
+        return self.proxy(value_unwrapped, node)
 
     @compatibility(is_backward_compatible=True)
     def create_arg(self, a: Any) -> Union[Node, Any]:
@@ -384,7 +376,6 @@ class ConcreteTracer(TracerBase):
         similar to _symbolic_trace.Tracer.is_leaf_module
         """
         # return (m.__module__.startswith('torch.nn') and not _orig_isinstance(m, (Sequential, ModuleList, ModuleDict)))\
-            # or _orig_isinstance(m, self.leaf_module)
         return (m.__module__.startswith('torch.nn.functional') and not _orig_isinstance(m, (Sequential, ModuleList, ModuleDict)))\
             or _orig_isinstance(m, self.leaf_module)
 
@@ -640,19 +631,13 @@ class ConcreteTracer(TracerBase):
             if self.temp_disable_call:
                 return _orig_module_call(mod, *args, **kwargs)
             else:
-                # corresponding to call_module
-                old_qualname = self.current_module_qualified_name
-                try:
-                    self.current_module_qualified_name = self.path_of_module(mod)
-                    module_qualified_name = self.path_of_module(mod)
-                    if not self.is_leaf_module(mod, module_qualified_name):
-                        _autowrap_check(self, mod.forward.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
-                        _autowrap_check(self, mod.__dict__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
-                        return _orig_module_call(mod, *args, **kwargs)
-                    else:
-                        return self.create_proxy('call_module', module_qualified_name, args, kwargs)
-                finally:
-                    self.current_module_qualified_name = old_qualname
+                module_qualified_name = self.path_of_module(mod)
+                if not self.is_leaf_module(mod, module_qualified_name):
+                    _autowrap_check(self, mod.forward.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
+                    _autowrap_check(self, mod.__dict__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
+                    return _orig_module_call(mod, *args, **kwargs)
+                else:
+                    return self.create_proxy('call_module', module_qualified_name, args, kwargs)
 
         class map_wrapper_clz:
             @functools.wraps(_orig_map)
@@ -1413,4 +1398,4 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
     # # assert root(**concrete_args) == traced(**concrete_args)
     if check_args is not None:
         assert root(**check_args) == traced(**check_args)
-    return traced, tracer
+    return traced
