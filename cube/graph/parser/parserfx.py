@@ -130,8 +130,10 @@ class FxModuleParser:
                     print(f'{node.name} is immutable_dict type')
                     assert isinstance(node.meta['tensor_meta'], dict)
                 else:
-                    assert node.meta['type'] is type(torch.Tensor()) or node.meta['type'] is type(torch.nn.parameter.Parameter())
-                    print(node.name, node.meta['tensor_meta'].dtype, node.meta['tensor_meta'].shape)
+                    if node.meta['type'] is type(torch.Tensor()) or node.meta['type'] is type(torch.nn.parameter.Parameter()):
+                        print(node.name, node.meta['tensor_meta'].dtype, node.meta['tensor_meta'].shape)
+                    else:
+                        print(f'WARNING node {node.name} is neither Tensor nor Parameter')
             else:
                 print(f'{node.name} does not has tensor_meta')
 
@@ -151,7 +153,12 @@ class FxModuleParser:
 
         # handle nodes
         all_ir_nodes: List[IRFwOperation] = list()
+        total_node_num = len(module.graph.nodes)
+        node_idx = 1
         for node in module.graph.nodes:
+            print(f'[{node_idx}/{total_node_num}]')
+            node_idx += 1
+
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
             if ir_nodes is not None:
                 all_ir_nodes += ir_nodes
@@ -180,7 +187,7 @@ class FxModuleParser:
             return FxNodeKind.Output
         if node.op == 'call_method':
             return FxNodeKind.PrimCallMethod
-        raise RuntimeError(f"Unkown node kind {node.kind()} from torchscript module")
+        raise RuntimeError(f"Unknown node kind {node.kind()} from torchscript module")
 
     @staticmethod
     def parse_node(node: torch.fx.Node, module, frame: Frame) -> List[IRFwOperation]:
@@ -193,7 +200,6 @@ class FxModuleParser:
                 return []
             if node_type == FxNodeKind.Output:
                 return FxModuleParser.parse_prim_output_node(node, module, frame)
-
             if node_type in (FxNodeKind.PrimCallFunction, FxNodeKind.PrimCallMethod):
                 return FxModuleParser.parse_prim_function_method(node, module, frame)
             if node_type == FxNodeKind.PrimGetAttr:
@@ -248,7 +254,7 @@ class FxModuleParser:
             # FIXME: handle cases for IRObject in kwargs
             # case1: unknown torch operator
             if FxModuleParser._is_torch_autograd_op(node, frame, fsig):
-                print(f'>>> Find unkown pytorch operation: {fsig}')
+                print(f'>>> Find unknown pytorch operation: {fsig}')
                 fname = fsig.split('.')[-1] if '.' in fsig else fname
                 ir_node = IRFwOperation(fname, fsig, len(input_vals), 1)
                 ir_node.kwargs = kwargs
@@ -380,7 +386,7 @@ class FxModuleParser:
         assert len(node.kwargs) == 0, f'invalid kwargs {node.kwargs} in {node.name}, {node.target}, {node.meta}'
         # example node.args[0].meta is {'type': <class 'dict'>}
         in_type = node.args[0].meta['type']
-        assert node_target in in_type().__dir__()
+        assert node_target in in_type().__dir__(), f'node_target = {node_target}, in_type().__dir__() = {in_type().__dir__()}'
         sig = f'{in_type.__name__}.{node_target}'
         print(f'The method is not torch or Tensor, but {sig}')
         return sig

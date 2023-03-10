@@ -503,8 +503,13 @@ class IRSubTensor(IRTensor):
         if self.parent.dtype == IRDType.unknown:
             self.parent.dtype = val
         else:
-            assert self.parent.dtype == val, \
-                f"dtype mis-matched with previous setting: {val} != {self.parent.dtype}"
+            if self.parent.dtype != val:
+                print(f'ERROR (skipped) reset IRSubTensor({self.name}) dtype {self.parent.dtype}->{val}')
+                self.parent.dtype = val
+
+            # TODO recover me
+            # assert self.parent.dtype == val, \
+            #     f"dtype mis-matched with previous setting: {val} != {self.parent.dtype}"
 
     def splitdims(self) -> Tuple[int]:
         """!

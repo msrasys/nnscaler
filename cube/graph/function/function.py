@@ -1224,6 +1224,7 @@ def Embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0,
 
 
 def Flatten(input, start_dim=0, end_dim=-1, signature = None):
+    start_dim = len(input.shape) + start_dim if start_dim < 0 else start_dim
     end_dim = len(input.shape) + end_dim if end_dim < 0 else end_dim
     ishape = ShapeAnno.create_shape_str(input.shape)
     for dim in range(start_dim, end_dim+1):
@@ -1371,6 +1372,9 @@ def ShapeAsTensor(input: IRTensor, signature = None):
     """
     torch._shape_as_tensor
     """
+    if isinstance(input.shape, list) and all(isinstance(dim, int) for dim in input.shape):
+        return input.shape
+
     edim_in = ShapeAnno.create_shape_str(input.shape)
     edim_ou = [str(len(input.shape))]
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
@@ -1402,10 +1406,14 @@ def To(tensor: IRTensor, dtype_or_device, *, out=None, signature = None):
     annos = ['* -> *']
     if isinstance(dtype_or_device, torch.device):
         return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype_or_device)
-    else:
-        assert isinstance(dtype_or_device, (IRDType, torch.dtype))
+    elif isinstance(dtype_or_device, (IRDType, torch.dtype)):
         dtype = dtype_or_device if isinstance(dtype_or_device, torch.dtype) else eval('torch.'+dtype_or_device.value)
         return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype)
+    elif isinstance(dtype_or_device, IRFullTensor):
+        return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype_or_device.dtype)
+    else:
+        raise RuntimeError(f'function.To with unknown arg: {dtype_or_device}')
+
 
 
 def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
