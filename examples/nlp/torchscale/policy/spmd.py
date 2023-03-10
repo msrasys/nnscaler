@@ -74,9 +74,21 @@ def PASData(graph: IRGraph, resource):
             batch_dim = node.get_batch_dims()[0]
     for node in graph.nodes():
         if isinstance(node, IRFwOperation):
-            algo = node.algorithms('dim')
-            sub_nodes = graph.partition(
-                node, algo, idx=0, dim=batch_dim, num=resource.ngpus)
+            # if not isinstance(node, IRPyFunc): # and node.signature in ('torch.arange', 'torch.sin'):
+            #     algo = node.algorithms('dim')
+            #     sub_nodes = graph.partition(
+            #         node, algo, idx=0, dim=batch_dim, num=resource.ngpus)
+            # else:
+            #     print(f'WARNING: {node} cannot find dim algo, using replicate instead')
+            #     sub_nodes = graph.replicate(node, resource.ngpus)
+            try:
+                algo = node.algorithms('dim')
+                sub_nodes = graph.partition(
+                    node, algo, idx=0, dim=batch_dim, num=resource.ngpus)
+            except AssertionError:
+                print(f'WARNING: {node} cannot find dim algo, using replicate instead')
+                sub_nodes = graph.replicate(node, resource.ngpus)
+
             for idx, node in enumerate(sub_nodes):
                 graph.assign(node, idx)
     return graph

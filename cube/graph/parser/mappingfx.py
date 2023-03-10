@@ -153,6 +153,7 @@ class SignFx2Op:
         '_operator.floordiv': function.FloorDiv,
 
         __ttemplate('neg'): function.Neg,
+        '_operator.neg': function.Neg,
         #
         __ttemplate('gt'): function.CompareGT,
         __ttemplate('lt'): function.CompareLT,

@@ -115,9 +115,13 @@ model = cube.SemanticModel(
 def train_iter(model, dataloader):
     data = next(dataloader)
     loss = model(*data)
-    loss.backward()
+    # loss.backward()
+    return loss
 
-train_iter(model, dataloader)
+model = model.get_gen_module()
+
+iter_ret = train_iter(model, dataloader)
+print(f'iter_ret = {iter_ret}')
 
 # Conduct concrete trace below
 # sys.path.append('/home/v-junliang/torchscaletest/nni')
