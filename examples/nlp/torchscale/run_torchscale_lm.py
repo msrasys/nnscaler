@@ -67,7 +67,7 @@ model.eval()
 print("building model succeed: ", type(model))
 
 # create dummy input
-with open('examples/nlp/torchscale/input_lm.bak', 'rb') as f:
+with open('examples/nlp/torchscale/input_lm', 'rb') as f:
 # with open('examples/nlp/torchscale/lm_input_v2.pkl', 'rb') as f:
     dummy_input = pickle.load(f)
 device = next(model.parameters()).device
