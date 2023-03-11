@@ -59,8 +59,6 @@ class CompProfiler:
             gen_torch_tensors(shape, dtype, requires_grad) for shape, dtype, requires_grad in zip(shapes, dtypes, requires_grads)
         )
         require_backward = any([t.requires_grad for t in tensors])
-        # require_backward = True
-        print('zql: ', func.__name__, [t.requires_grad for t in tensors])
         # FIXME: reconsidering requires_grad
         if func.__name__ in ('type_as'):
             require_backward = False
@@ -75,7 +73,6 @@ class CompProfiler:
             train_kwargs[name] = train_val
             eval_kwargs[name] = eval_val
         # run one sample
-        # print(func, func.__name__,  tensors, train_kwargs)
         outputs = func(*tensors, **train_kwargs)
         outputs = (outputs,) if torch.is_tensor(outputs) else outputs
         assert all(torch.is_tensor(otensor) for otensor in outputs), \

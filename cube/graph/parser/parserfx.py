@@ -112,13 +112,6 @@ class FxModuleParser:
             # KwargsShapeProp(module).propagate(dummy_inputs)
             from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
             ShapeProp(module).propagate(dummy_inputs)
-            # print('zql dummy inputs: ', dummy_inputs)
-            # print('zql graph inputs: ', inputs)
-            # print(inputs[0].__dir__())
-            # print(inputs[0].meta, inputs[0].name)
-            # print(inputs[1].meta, inputs[1].name, inputs[1].target, inputs[1].args, inputs[1].kwargs)
-            # # print(inputs[1]['src_lengths'].meta, inputs[1].name)
-            # exit(1)
             # handle graph inputs
             for idx, input in enumerate(inputs):
                 assert isinstance(input, torch.fx.Node)
