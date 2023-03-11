@@ -104,23 +104,39 @@ class FxModuleParser:
         else:
             assert dummy_inputs is not None, 'input_shapes and dummy_inputs cannot be None at the same time.'
             # remove dead nodes
-            from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
+            # from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
+            from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
             DCEHandler(module).eliminate_dead_code()
             # shape propagation
-            from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp
-            KwargsShapeProp(module).propagate(dummy_inputs)
+            # from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp
+            # KwargsShapeProp(module).propagate(dummy_inputs)
+            from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
+            ShapeProp(module).propagate(dummy_inputs)
+            # print('zql dummy inputs: ', dummy_inputs)
+            # print('zql graph inputs: ', inputs)
+            # print(inputs[0].__dir__())
+            # print(inputs[0].meta, inputs[0].name)
+            # print(inputs[1].meta, inputs[1].name, inputs[1].target, inputs[1].args, inputs[1].kwargs)
+            # # print(inputs[1]['src_lengths'].meta, inputs[1].name)
+            # exit(1)
             # handle graph inputs
             for idx, input in enumerate(inputs):
                 assert isinstance(input, torch.fx.Node)
-                # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding,
-                # extend to other input types
-                if hasattr(dummy_inputs, input.name):
-                    print(f'dummy_inputs has {input.name}')
-                    shape = getattr(dummy_inputs, input.name).size()
+                if isinstance(dummy_inputs, dict):
+                    if input.name in dummy_inputs:
+                        shape = input.meta['tensor_meta'].shape
+                    else:
+                        shape = None
                 else:
-                    # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
-                    print(f'dummy_inputs does not have {input.name}')
-                    shape = None
+                    # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding,
+                    # extend to other input types
+                    if hasattr(dummy_inputs, input.name):
+                        print(f'dummy_inputs has {input.name}')
+                        shape = getattr(dummy_inputs, input.name).size()
+                    else:
+                        # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
+                        print(f'dummy_inputs does not have {input.name}')
+                        shape = None
                 dtype = kDefaultType
                 val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
                 frame.add_var(input.name, val, graph_arg=idx)
@@ -150,7 +166,8 @@ class FxModuleParser:
                 shape = node.meta['tensor_meta'].shape
                 shape = FxModuleParser.shape_refine(shape)
                 dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
-                val = IRFullTensor(shape=shape, requires_grad=True, dtype=dtype, name=node.name)
+                requires_grad = node.meta['tensor_meta'].requires_grad
+                val = IRFullTensor(shape=shape, requires_grad=requires_grad, dtype=dtype, name=node.name)
                 frame.add_var(node.name, val)
             else:
                 frame.add_var(node.name, IRObject())

@@ -3,6 +3,7 @@ from cube.algorithm.generics import GenericDistAlgo
 
 from cube.graph.function.dimops import IRDimops, DimAnno, DimopSplit, TransformRule
 from cube.ir.tensor import IRSubTensor
+from cube.ir.cten import IRTensor
 from cube.ir.operator import IRFwOperation
 from collections import deque
 
@@ -348,6 +349,7 @@ def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
     def gen_hash(node: IRFwOperation) -> str:
         ret = node.signature
         for it in node.inputs():
+            if not isinstance(it, IRTensor): continue
             ret = ret + '-' + str(it.shape)
         return ret
 
