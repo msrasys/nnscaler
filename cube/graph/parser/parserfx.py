@@ -166,8 +166,10 @@ class FxModuleParser:
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
             if ir_nodes is not None:
                 all_ir_nodes += ir_nodes
-
-        output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
+        
+        output_nodes = [node for node in module.graph.nodes if node.op == 'output']
+        assert len(output_nodes) == 1, f"get mutiple {len(all_ir_nodes)} output nodes"
+        output_val = frame.get_var(output_nodes[0].name)
     
         frame.pop_var()
         frame.pop_attr()
@@ -253,6 +255,7 @@ class FxModuleParser:
 
         # map to IR operator
         if SignFx2Op.exist(fsig):
+            print(input_vals)
             ir_node = SignFx2Op.map(fsig)(*input_vals, **kwargs)
         else:
             # FIXME: handle cases for IRObject in kwargs
@@ -271,9 +274,17 @@ class FxModuleParser:
 
         if isinstance(ir_node, IRCell):
             # TODO gracefully set output
-            output_name = node.name
-            output_val = frame.get_var(output_name)
-            ir_node.set_output(0, output_val)
+            if len(ir_node.outputs()) > 1:
+                # REMARK: some nodes will return multiple outputs, e.g., torch.chunk,
+                # while torch.fx always return one output. This will cause
+                # getitem or unpacking operation on the output, which can be folded by
+                # setting the list of the output tensor
+                print('>> parsing {ir_node}')
+                ir_node.infer_shape()
+                frame.set_var(node.name, ir_node.outputs())
+            else:
+                output_val = frame.get_var(node.name)
+                ir_node.set_output(0, output_val)
             return [ir_node]
         else:
             frame.set_var(node.name, ir_node)
@@ -309,30 +320,49 @@ class FxModuleParser:
         ir_nodes = []
 
         # handle complex outputs
-        def generate_outputs(val: Any, _ops: List) -> IRObject:
-            """Support complex data type of List, Tuple, Dict, Tensor/Object"""
-            if isinstance(val, list):
-                inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
-                output = IRObject()
-                _ops.append(IRPyFunc('(lambda *args: list(args))', inputs, [output]))
-                return output
-            if isinstance(val, tuple):
-                inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
-                output = IRObject()
-                _ops.append(IRPyFunc('(lambda *args: args)', inputs, [output]))
-                return output
-            if isinstance(val, dict):
-                output = IRObject()
-                assert all(not isinstance(key, torch.fx.Node) for key in val.keys()), f"output dict cannot have torch.fx.Node is key"
-                keys = tuple(str(key) for key in val.keys())
-                values = generate_outputs(tuple(generate_outputs(value, _ops) for value in val.values()), _ops)
-                _ops.append(IRPyFunc('(lambda vals, keys: {key:val for key,val in zip(keys,vals)})', [values], [output], keys=keys))
-                return output
-            if isinstance(val, torch.fx.Node):
-                return frame.get_var(val.name)
-            return val
+        # def generate_outputs(val: Any, _ops: List) -> IRObject:
+        #     """Support complex data type of List, Tuple, Dict, Tensor/Object"""
+        #     if isinstance(val, list):
+        #         inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
+        #         output = IRObject()
+        #         _ops.append(IRPyFunc('(lambda *args: list(args))', inputs, [output]))
+        #         return output
+        #     if isinstance(val, tuple):
+        #         inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
+        #         output = IRObject()
+        #         _ops.append(IRPyFunc('(lambda *args: args)', inputs, [output]))
+        #         return output
+        #     if isinstance(val, dict):
+        #         output = IRObject()
+        #         assert all(not isinstance(key, torch.fx.Node) for key in val.keys()), f"output dict cannot have torch.fx.Node is key"
+        #         keys = tuple(str(key) for key in val.keys())
+        #         values = generate_outputs(tuple(generate_outputs(value, _ops) for value in val.values()), _ops)
+        #         _ops.append(IRPyFunc('(lambda vals, keys: {key:val for key,val in zip(keys,vals)})', [values], [output], keys=keys))
+        #         return output
+        #     if isinstance(val, torch.fx.Node):
+        #         return frame.get_var(val.name)
+        #     return val
+        # output = generate_outputs(node.args[0], ir_nodes)
         
-        output = generate_outputs(node.args[0], ir_nodes)
+        # def generate_outputs(val: Any) -> Any:
+        #     """Support complex data type of List, Tuple, Dict, Tensor/Object"""
+        #     if isinstance(val, list):
+        #         return list(generate_outputs(item) for item in val)
+        #     if isinstance(val, tuple):
+        #         return tuple(generate_outputs(item) for item in val)
+        #     if isinstance(val, dict):
+        #         return {generate_outputs(key) : generate_outputs(value) for key, value in val.items()}
+        #     if isinstance(val, torch.fx.Node):
+        #         return frame.get_var(val.name)
+        #     # for other types like int, float, ...
+        #     return val
+        # output = generate_outputs(node.args[0])
+
+        # TODO: support more complex data type
+        outs = (node.args[0],) if isinstance(node.args[0], torch.fx.Node) else node.args[0]
+        assert all(isinstance(t, torch.fx.Node) for t in outs), "Only support model return with tuple of "
+        output = [frame.get_var(t.name) for t in outs]
+
         frame.set_var(node.name, output)
         return ir_nodes
 

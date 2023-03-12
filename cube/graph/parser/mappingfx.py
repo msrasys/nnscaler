@@ -110,12 +110,14 @@ class SignFx2Op:
         __tttemplate('to'): function.To,
         '_operator.getitem': function.GetItem,
         'builtins.getattr': function.GetAttr,
+        'builtins.tuple': function.MakeTuple,
+        'builtins.list': function.MakeList,
 
         # # torch nn functional
         #
         # __ftemplate('linear') : function.Linear,
         #
-        # __ttemplate('matmul'): function.Matmul,
+        __ttemplate('matmul'): function.Matmul,
         #
         # __ftemplate('gelu') : function.GeLU,
         # __ttemplate('gelu') : function.GeLU,
@@ -190,11 +192,11 @@ class SignFx2Op:
         # #pytorch1.11
         # __ttemplate('linear'): function.Linear,
         #
-        # __ttemplate('cat'): function.Cat,
+        __ttemplate('cat'): function.Cat,
         
         __ttemplate('stack'): function.Stack,
         #
-        # __ttemplate('chunk'): function.Chunk,
+        __ttemplate('chunk'): function.Chunk,
         
         __ttemplate('flatten'): function.Flatten,
         #
