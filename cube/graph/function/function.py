@@ -554,6 +554,21 @@ def Softmax(input, dim=None, _stacklevel=3, dtype=None, signature = None):
     return IRDimops(Softmax, 'softmax', signature, [anno], [input],
                     dim=dim, _stacklevel=_stacklevel, dtype=dtype)
 
+
+def LogSoftmax(input, dim=None, _stacklevel=3, dtype=None, signature=None):
+    """
+    torch.nn.functional.log_softmax(input, dim=None, _stacklevel=3, dtype=None)
+    """
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = copy.copy(edim_in)
+    if dim is not None:
+        edim_in[dim] += '^'
+        edim_ou[dim] += '^'
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(LogSoftmax, 'log_softmax', signature, [anno], [input],
+                    dim=dim, _stacklevel=_stacklevel, dtype=dtype)
+
+
 def Dropout(input, p=0.5, training=True, inplace=False, signature = None):
     """
     torch.nn.functional.dropout(input, p=0.5, training=True, inplace=False)
@@ -1523,3 +1538,23 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
 def FInfo(dtype: IRDType, signature = None) -> torch.finfo:
     assert isinstance(dtype, IRDType)
     return torch.finfo(eval('torch.' + dtype.value))
+
+
+def NLLLoss(input, target, weight=None, size_average=None,
+            ignore_index=-100, reduce=None, reduction='mean',
+            signature=None):
+    """
+    torch.nn.functional.nll_loss(input, target, weight=None, size_average=None,
+                                 ignore_index=-100, reduce=None, reduction='mean')
+    """
+    assert weight is None
+    annos = [
+        'C^, N -> 1',
+        'N+ C, N+ -> 1',
+        'N+ C *, N+ * -> 1'
+    ]
+    return IRDimops(
+        NLLLoss, 'nll_loss',
+        signature, annos, [input, target],
+        weight=weight, size_average=size_average, ignore_index=ignore_index,
+        reduce=reduce, reduction=reduction)
