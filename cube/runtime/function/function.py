@@ -122,3 +122,11 @@ def select_scatter(input:torch.Tensor, src:torch.Tensor, dim:int, index:int):
 
     return torch.masked_scatter(input, mask, src)
 
+def index_select(input: torch.Tensor, index: torch.Tensor, dim: int) -> torch.Tensor:
+    return torch.index_select(input, dim, index)
+
+def einsum(*operands, equation=None) -> torch.Tensor:
+    return torch.einsum(equation, *operands)
+
+def stack(*tensors, dim=0) -> torch.Tensor:
+    return torch.stack(tensors, dim)

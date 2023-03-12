@@ -29,6 +29,7 @@ class CompProfiler:
 
     @staticmethod
     def profile(func: Callable, shapes: Shapes, dtypes: DTypes,
+                requires_grads: Tuple[bool],
                 warmup_sec: float = 2, prof_times: int = 50,
                 **kwargs) -> Tuple[float, float, int, Tuple[int]]:
         """
@@ -50,14 +51,17 @@ class CompProfiler:
             f"func {func.__name__}: expected each shape has a corresponding dtype, but got {shapes} and {dtypes}"
         # create data
         dtypes = [torch.float32] * len(shapes) if dtypes is None else dtypes
-        def gen_torch_tensors(shape, dtype):
+        def gen_torch_tensors(shape, dtype, requires_grad):
             constructor = torch.zeros if dtype in (torch.int64, torch.int32, torch.bool) else torch.rand
-            requires_grad = False if dtype in (torch.int64, torch.int32, torch.bool) else True
+            # requires_grad = False if dtype in (torch.int64, torch.int32, torch.bool) else True
             return constructor(tuple(shape), dtype=dtype, device=torch.cuda.current_device(), requires_grad=requires_grad)
         tensors = tuple(
-            gen_torch_tensors(shape, dtype) for shape, dtype in zip(shapes, dtypes)
+            gen_torch_tensors(shape, dtype, requires_grad) for shape, dtype, requires_grad in zip(shapes, dtypes, requires_grads)
         )
         require_backward = any([t.requires_grad for t in tensors])
+        # FIXME: reconsidering requires_grad
+        if func.__name__ in ('type_as'):
+            require_backward = False
         # repalce kwargs starting with 'self.xxx'
         train_kwargs, eval_kwargs = {}, {}
         for name, value in kwargs.items():
@@ -171,8 +175,6 @@ class ProfileDataBase:
             return ret
 
         if node.signature in Sign2Op.kOpCodeDef:
-            # FIXME: ...
-            assert False, 'Sing2Op.kOpCodeDef is not empty'
             dep_code_impl = ''
             for dep_name in get_dep_names(node.signature):
                 dep_code_impl = dep_code_impl + Sign2Op.kOpCodeDef[dep_name]
@@ -197,12 +199,13 @@ class ProfileDataBase:
                     fn = eval(node.signature.replace('_operator.', 'torch.'))
             else:
                 fn = eval(node.signature)
-        shapes, dtypes = [], []
+        shapes, dtypes, requires_grads = [], [], []
         for t in node.inputs():
             assert isinstance(t, IRTensor), f"Only support node inputs with tensor shape"
             shapes.append(t.shape)
             dtypes.append(IRDType2TorchDType.map(t.dtype))
-        return fn, shapes, dtypes, node.kwargs
+            requires_grads.append(t.requires_grad)
+        return fn, shapes, dtypes, requires_grads, node.kwargs
 
     def profile(self, node: IRFwOperation, device: Optional[int] = None):
         """
@@ -218,7 +221,7 @@ class ProfileDataBase:
         @return infer_memory int: the peak memory in bytes after inference of the function
         @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
         """
-        fn, shapes, dtypes, kwargs = ProfileDataBase.get_func(node)
+        fn, shapes, dtypes, requires_grads, kwargs = ProfileDataBase.get_func(node)
 
         if self.exist(node):
             return self.query(node)
@@ -241,7 +244,7 @@ class ProfileDataBase:
             
         # run profiling
         fw_span, bw_span, infer_memory, train_mem_info = \
-            CompProfiler.profile(fn, shapes, dtypes, **kwargs)
+            CompProfiler.profile(fn, shapes, dtypes, requires_grads, **kwargs)
         # log to database
         key = self._serialize(node)
         self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, residual_mem)
@@ -360,9 +363,9 @@ class ProfileDataBase:
         """
         shapes, dtypes = [], []
         for t in node.inputs():
-            if isinstance(t, IRTensor):#, f"Only support node inputs with tensor shape"
-                shapes.append(t.shape)
-                dtypes.append(IRDType2TorchDType.map(t.dtype))
+            assert isinstance(t, IRTensor), f"Only support node inputs with tensor shape"
+            shapes.append(t.shape)
+            dtypes.append(IRDType2TorchDType.map(t.dtype))
         shapes = '-'.join(str(tuple(shape)) for shape in shapes)
         dtypes = '-'.join(str(dtype) for dtype in dtypes)
         return shapes + ' : ' + dtypes

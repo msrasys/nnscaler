@@ -88,8 +88,12 @@ class FxModuleParser:
             # shape propagation
             sample_inputs = dummy_inputs if dummy_inputs else [torch.ones(shape, dtype=default_dtype) for shape in input_shapes]
             sample_input_tensors = [sample_inputs[input] for input in sample_inputs] if type(sample_inputs) is dict else sample_inputs
-            from torch.fx.passes.shape_prop import ShapeProp
-            ShapeProp(module).propagate(*sample_input_tensors)  # TODO fixme ShapeProp(module).propagate(*sample_inputs)
+
+            # from torch.fx.passes.shape_prop import ShapeProp
+            # ShapeProp(module).propagate(*sample_input_tensors)  # TODO fixme ShapeProp(module).propagate(*sample_inputs)
+            from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
+            ShapeProp(module).propagate(sample_inputs)
+
             # handle graph inputs
             for idx, input in enumerate(inputs):
                 assert isinstance(input, torch.fx.Node)
@@ -100,23 +104,32 @@ class FxModuleParser:
         else:
             assert dummy_inputs is not None, 'input_shapes and dummy_inputs cannot be None at the same time.'
             # remove dead nodes
-            from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
+            # from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
+            from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
             DCEHandler(module).eliminate_dead_code()
             # shape propagation
-            from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp
-            KwargsShapeProp(module).propagate(dummy_inputs)
+            # from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp
+            # KwargsShapeProp(module).propagate(dummy_inputs)
+            from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
+            ShapeProp(module).propagate(dummy_inputs)
             # handle graph inputs
             for idx, input in enumerate(inputs):
                 assert isinstance(input, torch.fx.Node)
-                # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding,
-                # extend to other input types
-                if hasattr(dummy_inputs, input.name):
-                    print(f'dummy_inputs has {input.name}')
-                    shape = getattr(dummy_inputs, input.name).size()
+                if isinstance(dummy_inputs, dict):
+                    if input.name in dummy_inputs:
+                        shape = input.meta['tensor_meta'].shape
+                    else:
+                        shape = None
                 else:
-                    # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
-                    print(f'dummy_inputs does not have {input.name}')
-                    shape = None
+                    # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding,
+                    # extend to other input types
+                    if hasattr(dummy_inputs, input.name):
+                        print(f'dummy_inputs has {input.name}')
+                        shape = getattr(dummy_inputs, input.name).size()
+                    else:
+                        # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
+                        print(f'dummy_inputs does not have {input.name}')
+                        shape = None
                 dtype = kDefaultType
                 val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
                 frame.add_var(input.name, val, graph_arg=idx)
@@ -130,8 +143,10 @@ class FxModuleParser:
                     print(f'{node.name} is immutable_dict type')
                     assert isinstance(node.meta['tensor_meta'], dict)
                 else:
-                    assert node.meta['type'] is type(torch.Tensor()) or node.meta['type'] is type(torch.nn.parameter.Parameter())
-                    print(node.name, node.meta['tensor_meta'].dtype, node.meta['tensor_meta'].shape)
+                    if node.meta['type'] is type(torch.Tensor()) or node.meta['type'] is type(torch.nn.parameter.Parameter()):
+                        print(node.name, node.meta['tensor_meta'].dtype, node.meta['tensor_meta'].shape)
+                    else:
+                        print(f'WARNING node {node.name} is neither Tensor nor Parameter')
             else:
                 print(f'{node.name} does not has tensor_meta')
 
@@ -144,14 +159,20 @@ class FxModuleParser:
                 shape = node.meta['tensor_meta'].shape
                 shape = FxModuleParser.shape_refine(shape)
                 dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
-                val = IRFullTensor(shape=shape, requires_grad=True, dtype=dtype, name=node.name)
+                requires_grad = node.meta['tensor_meta'].requires_grad
+                val = IRFullTensor(shape=shape, requires_grad=requires_grad, dtype=dtype, name=node.name)
                 frame.add_var(node.name, val)
             else:
                 frame.add_var(node.name, IRObject())
 
         # handle nodes
         all_ir_nodes: List[IRFwOperation] = list()
+        total_node_num = len(module.graph.nodes)
+        node_idx = 1
         for node in module.graph.nodes:
+            print(f'[{node_idx}/{total_node_num}]')
+            node_idx += 1
+
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
             if ir_nodes is not None:
                 all_ir_nodes += ir_nodes
@@ -180,7 +201,7 @@ class FxModuleParser:
             return FxNodeKind.Output
         if node.op == 'call_method':
             return FxNodeKind.PrimCallMethod
-        raise RuntimeError(f"Unkown node kind {node.kind()} from torchscript module")
+        raise RuntimeError(f"Unknown node kind {node.kind()} from torchscript module")
 
     @staticmethod
     def parse_node(node: torch.fx.Node, module, frame: Frame) -> List[IRFwOperation]:
@@ -193,7 +214,6 @@ class FxModuleParser:
                 return []
             if node_type == FxNodeKind.Output:
                 return FxModuleParser.parse_prim_output_node(node, module, frame)
-
             if node_type in (FxNodeKind.PrimCallFunction, FxNodeKind.PrimCallMethod):
                 return FxModuleParser.parse_prim_function_method(node, module, frame)
             if node_type == FxNodeKind.PrimGetAttr:
@@ -241,19 +261,14 @@ class FxModuleParser:
         input_vals = [get_complex_data(val) for val in node.args]
         kwargs = {key: get_complex_data(val) for key, val in node.kwargs.items()}
 
-        if '.or' in fsig:
-            print('zql find to: ', fsig, node.name, node.target, node.meta, node.args, node.kwargs, input_vals, kwargs)
-            # exit(1)
         # map to IR operator
         if SignFx2Op.exist(fsig):
-            print('zql: ', input_vals, kwargs)
             ir_node = SignFx2Op.map(fsig)(*input_vals, **kwargs)
-            print('zql ir_node: ', ir_node)
         else:
             # FIXME: handle cases for IRObject in kwargs
             # case1: unknown torch operator
             if FxModuleParser._is_torch_autograd_op(node, frame, fsig):
-                print(f'>>> Find unkown pytorch operation: {fsig}')
+                print(f'>>> Find unknown pytorch operation: {fsig}')
                 fname = fsig.split('.')[-1] if '.' in fsig else fname
                 ir_node = IRFwOperation(fname, fsig, len(input_vals), 1)
                 ir_node.kwargs = kwargs
@@ -385,7 +400,7 @@ class FxModuleParser:
         assert len(node.kwargs) == 0, f'invalid kwargs {node.kwargs} in {node.name}, {node.target}, {node.meta}'
         # example node.args[0].meta is {'type': <class 'dict'>}
         in_type = node.args[0].meta['type']
-        assert node_target in in_type().__dir__()
+        assert node_target in in_type().__dir__(), f'node_target = {node_target}, in_type().__dir__() = {in_type().__dir__()}'
         sig = f'{in_type.__name__}.{node_target}'
         print(f'The method is not torch or Tensor, but {sig}')
         return sig

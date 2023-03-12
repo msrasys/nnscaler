@@ -85,6 +85,7 @@ def BMMAdd(input, batch1, batch2, *, beta=1, alpha=1, out=None, signature = None
 
 def CubeEinSum(*operands, equation=None, signature = None):
     assert isinstance(equation, str)
+    signature = 'cube.runtime.function.einsum'
     lhs, rhs = equation.split('->')
     assert ',' not in rhs
     lhs_dims = set(lhs.replace(',', ' ').split(' '))
@@ -462,11 +463,15 @@ def Div(input, other, *, rounding_mode=None, out=None, signature = None):
     assert rounding_mode is None and out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input / other
-    annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(Div, 'div', signature, annos, [input, other])
+        return IRDimops(Div, 'div', signature, annos, [input, other])
+    else:
+        # if not all tensors, the second must not be IRObject
+        assert isinstance(input, IRTensor) and not isinstance(other, IRObject)
+        annos = ['* -> *']
+        return IRDimops(Div, 'div', signature, annos, [input], other=other)
 
 
 def FloorDiv(input, other, *, out=None, signature = None):
@@ -1062,15 +1067,13 @@ def Cat(*tensors_and_dim, dim=0, out=None, signature=None):
     return CubeCat(*tensors, dim=dim, signature=signature)
 
 
-def CubeStack(*tensors, dim: int, signature=None):
-    """
-    torch.stack(tensors, dim=0, *, out=None)
-    """
+def CubeStack(*tensors, dim=0, signature=None):
     # REMARK: IRFwOperation doesn't support taking a list of IRTensors.
     # Therefore, the argument interface is adapted to take unpacked tensors
     # with dimension.
     assert all(isinstance(tensor, IRTensor) for tensor in tensors), f'but got {tensors}'
     assert isinstance(dim, int), f"but not {dim}"
+    signature = 'cube.runtime.function.stack'
     iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
     oannos = [copy.copy(iannos[-1])]
     oannos[0].insert(dim, str(len(tensors)))
@@ -1078,14 +1081,10 @@ def CubeStack(*tensors, dim: int, signature=None):
     return IRDimops(CubeStack, 'stack', signature, [anno], tensors, dim=dim)
 
 
-def Stack(*tensors_and_dim, dim=0, out=None, signature = None):
+def Stack(tensors, dim=0, out=None, signature = None):
     """
     torch.stack(tensors, dim=0, *, out=None)
     """
-    if len(tensors_and_dim) == 2:
-        tensors, dim = tensors_and_dim[0], tensors_and_dim[1]
-    else:
-        tensors, dim = tensors_and_dim[0], dim
     return CubeStack(*tensors, dim=dim, signature=signature)
 
 
@@ -1116,6 +1115,7 @@ def Select(input, dim, index, signature = None):
 
 
 def CubeIndexSelect(input: torch.Tensor, index: torch.Tensor, dim: int, signature = None):
+    signature = 'cube.runtime.function.index_select'
     edim_in = ShapeAnno.create_shape_str(input.shape)
     edim_in[dim] += '^'
     idx_anno = chr(ord(edim_in[-1]) + 1) + '^'
@@ -1225,6 +1225,7 @@ def Embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0,
 
 
 def Flatten(input, start_dim=0, end_dim=-1, signature = None):
+    start_dim = len(input.shape) + start_dim if start_dim < 0 else start_dim
     end_dim = len(input.shape) + end_dim if end_dim < 0 else end_dim
     ishape = ShapeAnno.create_shape_str(input.shape)
     for dim in range(start_dim, end_dim+1):
@@ -1325,6 +1326,34 @@ def _comparison(creator: Callable, f: Callable, name: str, signature: str,
     else:
         return IRPyFunc(signature, [input, other], [IRObject()])
 
+def _comparison_hack(creator: Callable, f: Callable, name: str, signature: str, 
+                input, other):
+    """
+    if both operands are scalars, returns bool.
+    if one operand is a tensor, returns a broadcasted tensor with dtype being bool.
+    
+    @param creator Callable: the outside creation function
+    @param f Callable: (Scalar, Scalar) -> bools
+    """
+    # case 0: return constant
+    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
+        return f(input, other)
+    # case1: torch.equal(tensor1, tensor2)
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+        return IRDimops(creator, name, signature, annos, [input, other])
+    # case2: torch.equal(tensor1, obj2) / torch.equal(obj1, tensor2)
+    if isinstance(input, IRTensor) or isinstance(other, IRTensor):
+        annos = ['* -> *']
+        if isinstance(input, IRTensor):
+            return IRDimops(creator, name, signature, annos, [input], other=other)
+        else:
+            return IRDimops(creator, name, signature, annos, [other], other=input)
+    # case3: torch.equal(obj1, obj2)
+    else:
+        return IRPyFunc(signature, [input, other], [IRObject()])
+
 
 def CompareGT(input, other, *, out=None, signature = None):
     """
@@ -1358,20 +1387,23 @@ def CompareEQ(input, other, *, out=None, signature = None):
     """
     torch.eq(input, other, *, out=None)
     """
-    return _comparison(CompareEQ, operator.eq, 'eq', signature, input, other)
+    return _comparison_hack(CompareEQ, operator.eq, 'eq', signature, input, other)
 
 
 def CompareNE(input, other, *, out=None, signature = None):
     """
     torch.ne(input, other, *, out=None)
     """
-    return _comparison(CompareNE, operator.eq, 'ne', signature, input, other)
+    return _comparison_hack(CompareNE, operator.eq, 'ne', signature, input, other)
 
 
 def ShapeAsTensor(input: IRTensor, signature = None):
     """
     torch._shape_as_tensor
     """
+    if isinstance(input.shape, list) and all(isinstance(dim, int) for dim in input.shape):
+        return input.shape
+
     edim_in = ShapeAnno.create_shape_str(input.shape)
     edim_ou = [str(len(input.shape))]
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
@@ -1403,10 +1435,15 @@ def To(tensor: IRTensor, dtype_or_device, *, out=None, signature = None):
     annos = ['* -> *']
     if isinstance(dtype_or_device, torch.device):
         return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype_or_device)
-    else:
-        assert isinstance(dtype_or_device, (IRDType, torch.dtype))
+    elif isinstance(dtype_or_device, (IRDType, torch.dtype)):
         dtype = dtype_or_device if isinstance(dtype_or_device, torch.dtype) else eval('torch.'+dtype_or_device.value)
         return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype)
+    elif isinstance(dtype_or_device, IRFullTensor):
+        dtype = eval('torch.'+dtype_or_device.dtype.value)
+        return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype)
+    else:
+        raise RuntimeError(f'function.To with unknown arg: {dtype_or_device}')
+
 
 
 def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
