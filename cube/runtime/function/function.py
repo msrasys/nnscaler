@@ -43,6 +43,9 @@ def sub(input: torch.Tensor, other: Union[int, float, torch.Tensor], alpha: Unio
 def expand(input: torch.Tensor, sizes: Union[torch.Size, List[int]]) -> torch.Tensor:
     return input.expand(*sizes)
 
+def fullslice(input: torch.Tensor, slicers: Tuple[Union[None, slice]]):
+    return input[slicers]
+
 def conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
            stride: int, padding: List[int], dilation, groups: int = 1):
     """
@@ -72,7 +75,6 @@ def conv3d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tenso
     pad_padding = [padding[-1 - (i // 2)] for i in range(len(padding) * 2)]
     input = TorchF.pad(input, pad_padding, 'constant', 0)
     return TorchF.conv3d(input, weight, bias, stride=stride, dilation=dilation, groups=groups)
-
 
 def embedding(input: torch.Tensor, weight: torch.Tensor, padding_idx: Optional[int], start: int, stop: int):
     """

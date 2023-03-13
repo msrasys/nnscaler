@@ -25,5 +25,16 @@ class IRPyFunc(IRFwOperation):
         """
         return True
     
-    
+    def __repr__(self) -> str:
+        sign = self.signature.split('.')[-1]
+        dscp = (f"PyOp{self._id}-{self.device}(sign={sign}, "
+                f"inputs={self.inputs()}, "
+                f"outputs={self.outputs()})")
+        return dscp
 
+    def extra_repr(self) -> str:
+        sign = self.signature.split('.')[-1]
+        dscp = (f"PyOp{self._id}-{self.device}(sign={sign}, "
+                f"inputs={self.inputs()}, "
+                f"outputs={self.outputs()})")
+        return dscp

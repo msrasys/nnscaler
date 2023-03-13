@@ -256,7 +256,7 @@ class IRFullTensor(IRTensor):
     the sequentail execution order by its graph.
     """
 
-    def __init__(self, shape=None, name=None, requires_grad=False, dtype=IRDType.unknown):
+    def __init__(self, shape=None, name='tensor', requires_grad=False, dtype=IRDType.unknown):
 
         super().__init__(shape, name, dtype)
 

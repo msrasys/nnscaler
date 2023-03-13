@@ -1,4 +1,4 @@
-from typing import Any, Callable, List, Optional, Tuple, Dict, Union
+from typing import Any, Callable, List, Optional, Tuple, Dict, Union, Iterable
 import string
 import copy
 import torch
@@ -99,7 +99,7 @@ def EinSum(equation: str, *operands, signature = None):
     return CubeEinSum(*operands, equation=equation, signature=signature)
 
 
-def Matmul(signature, input, other, *, out=None):
+def Matmul(input, other, *, out=None, signature=None):
     assert out is None
     annos = [
         'm k+, k+ n -> m n',
@@ -409,6 +409,7 @@ def Add(input, other, alpha=1, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input + alpha * other
+    signature = 'torch.add'
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
@@ -447,6 +448,7 @@ def Mul(input, other, *, out=None, signature = None):
     signature = 'torch.mul'
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input * other
+    signature = 'torch.mul'
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
@@ -1146,6 +1148,40 @@ def IndexSelect(input: torch.Tensor, dim: int, index: torch.Tensor, *, out=None,
     return CubeIndexSelect(input, index, dim, signature=signature)
 
 
+def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice]], signature=None):
+    """
+    subtensor = tensor[:,128:]
+    subtensor = tensor[0,128:]
+    subtensor = tensor[0]
+    """
+    signature = 'cube.runtime.function.fullslice'
+    slicers = tuple(slicers) + (None,) * (len(tensor.shape) - len(slicers))
+    edim_in = ShapeAnno.create_shape_str(tensor.shape)
+    edim_ou = []
+    for dim, slicer in enumerate(slicers):
+        if slicer is None:
+            if dim < len(edim_in):
+                edim_ou.append(edim_in[dim])
+            else:
+                # expand the dimension
+                edim_ou.append('1')
+        else:
+            edim_in[dim] += '^'
+            if isinstance(slicer, slice):
+                stop = tensor.shape[dim] if slicer.stop is None else slicer.stop
+                start = 0 if slicer.start is None else slicer.start
+                step = 1 if slicer.step is None else slicer.step
+                dimlen = len(range(start, stop, step))
+                edim_ou.append(str(dimlen))
+            else:
+                pass  # no shape for int
+    # special case for loss = torch.Tensor([1,2,3])[0]
+    if len(edim_ou) == 0:
+        edim_ou = ['1^']
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(FullSlice, 'fullslice', signature, [anno], [tensor], slicers=slicers)
+
+
 def Slice(tensor: torch.Tensor, dim, start, end, step, signature = None):
     """
     aten::slice(input:Tensor, dim:int, start:Optional[int], end:Optional[int], step:int) -> Tensor
@@ -1510,8 +1546,10 @@ def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
         assert False, f'{obj}, {index}'
     elif (not isinstance(obj, IRObject)) and isinstance(index, int):
         return obj[index]
-    else:
-        return IRPyFunc(signature, [obj, index], [IRObject()])
+    # case: subtensor = tensor[1,:2]
+    if isinstance(obj, IRTensor):
+        return FullSlice(obj, b)
+    return IRPyFunc(signature, [obj, index], [IRObject()])
 
 
 def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], IRPyFunc]:
@@ -1558,3 +1596,11 @@ def NLLLoss(input, target, weight=None, size_average=None,
         signature, annos, [input, target],
         weight=weight, size_average=size_average, ignore_index=ignore_index,
         reduce=reduce, reduction=reduction)
+
+
+def MakeTuple(inputs: Iterable, signature=None):
+    return tuple(inputs)
+
+
+def MakeList(inputs: Iterable, signature=None):
+    return list(inputs)
