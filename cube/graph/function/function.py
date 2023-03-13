@@ -444,6 +444,7 @@ def Div(input, other, *, rounding_mode=None, out=None, signature = None):
     assert rounding_mode is None and out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input / other
+    signature = 'torch.div'
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)

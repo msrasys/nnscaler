@@ -179,6 +179,7 @@ config.autodist_config = dotdict({'ngpus': 2})
 # NOTE add SINGLE_DEV_MODE=1 before the running command
 from autodist.cost_model.cost_database import CostDatabase
 cost_database = CostDatabase(cube_graph, config)
+
 # find the best partition plan
 from autodist.task_config import TaskConfig
 class TorchscaleTaskConfig(TaskConfig):
@@ -194,112 +195,14 @@ class TorchscaleTaskConfig(TaskConfig):
             self.task_name)
         self.allow_recom_ops = []
         self.del_dim = []
-# if __name__ == '__main__':
-#     import argparse
-#     parser = argparse.ArgumentParser(description='Torchscale benchmark')
-#     parser.add_argument('--fp16',
-#                         action='store_true',
-#                         help='use fp16 for the training')
-#     parser.add_argument('--fine_grained_GPT',
-#                         action='store_true',
-#                         help='model = GPTFineGrained')
-#     parser.add_argument('--GPT_setting',
-#                         type=str,
-#                         default='6.7B',
-#                         help='set GPT model type')
-#     parser.add_argument('--save_folder',
-#                         type=str,
-#                         default='exp_data',
-#                         help='set the save folder for experiment data')
-#     parser.add_argument('--micro_batch_size',
-#                         type=int,
-#                         default=8,
-#                         help='set micro batch size')
-#     parser.add_argument('--global_batch_size',
-#                         type=int,
-#                         default=8,
-#                         help='set the global batch size')
-#     parser.add_argument('--iter_num',
-#                         type=int,
-#                         default=2,
-#                         help='set the number of all iterations')
-#     parser.add_argument('--warm_num',
-#                         type=int,
-#                         default=1,
-#                         help='set the number of warmup iterations')
-#     parser.add_argument('--recompute',
-#                         action='store_true',
-#                         help='set recompute flag')
-#     parser.add_argument('--memory_constraint',
-#                         type=float,
-#                         default=32,
-#                         help='memory constraint for program')
-#     parser.add_argument('--memory_granularity',
-#                         type=int,
-#                         default=1,
-#                         help='memory granularity in byte')
-#     parser.add_argument('--profile_dir',
-#                         type=str,
-#                         default=str(Path.home()) + '/.autodist',
-#                         help='profile dir')
-#     parser.add_argument('--connect_type',
-#                         type=str,
-#                         default='NV2',
-#                         help='connect type from nvidia-smi topo -m')
-#     parser.add_argument('--use_prev_plan',
-#                         action='store_true',
-#                         help='run from previous plan')
-#     parser.add_argument('--is_train',
-#                         action='store_true',
-#                         help='True: train, False: inference')
-#     parser.add_argument('--topk',
-#                         type=int,
-#                         default=20,
-#                         help='generate multiple plans for robustness')
-#     parser.add_argument('--mesh_row', type=int, default=1, help='node num')
-#     parser.add_argument('--mesh_col',
-#                         type=int,
-#                         default=2,
-#                         help='dev num in a node')
-#     parser.add_argument('--compile',
-#                         action='store_true',
-#                         help='compile stage: true, runtime stage: false')
-#     parser.add_argument('--pipeline',
-#                         action='store_true',
-#                         help='pipeline: true, tensor parallel: false')
-#     parser.add_argument('--nproc',
-#                         type=int,
-#                         default=12,
-#                         help='multiprocess deg in pipeline')
-#     parser.add_argument('--adaptive_recom',
-#                         action='store_true',
-#                         help='allow adaptive recompute')
-#     parser.add_argument('--plan_idx',
-#                         type=int,
-#                         default=0,
-#                         help='runtime plan idx')
-#     parser.add_argument('--verbose', action='store_true', help='verbose mode')
-#     parser.add_argument('--ignore_small_tensor_threshold',
-#                         type=int,
-#                         default=0,
-#                         help='set the tensor size threshold to ignore')
-#     parser.add_argument('--parse_plan',
-#                         action='store_true',
-#                         help='parse plan to user-friendly format')
-#     parser.add_argument('--alphafold',
-#                         action='store_true',
-#                         help='use alphafold2')
-#     parser.add_argument('--alphafold_setting',
-#                         type=int,
-#                         default=1,
-#                         help='1: bs, s, r = 1, 128, 256'\
-#                              '2: bs, s, r = 1, 512, 256'\
-#                              '3: bs, s, r = 1, 512, 384')
-#     args = parser.parse_args()
 
-#     # if args.compile:
-#     #     assert args.ignore_small_tensor_threshold >= 64, 'suggest ignore_small_tensor_threshold >= 64'
+kwargs = {'save_folder': 'exp_data', 'micro_batch_size': 8, 'global_batch_size': 8, 'iter_num': 2,
+          'warm_num': 1, 'recompute': False, 'memory_constraint': 32, 'memory_granularity': 1,
+          'profile_dir': str(Path.home())+'/.autodist/', 'connect_type': 'NV2', 'use_prev_plan': False,
+          'is_train': True, 'topk': 20, 'mesh_row': 1, 'mesh_col': 2, 'compile': True, 'pipeline': False,
+          'nproc': 12, 'adaptive_recom': False, 'plan_idx': 0, 'verbose': True, 'ignore_small_tensor_threshold': 0,
+          'parse_plan': True}
 
-#     task_config = TorchscaleTaskConfig(**vars(args))
-#     from autodist.apis import calc_parallel_plan
-#     topk_plans = calc_parallel_plan(cube_graph, cost_database, task_config)
+task_config = TorchscaleTaskConfig(**kwargs)
+from autodist.apis import calc_parallel_plan
+topk_plans = calc_parallel_plan(cube_graph, cost_database, task_config)
