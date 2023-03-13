@@ -1662,12 +1662,11 @@ def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
         is_select, dim, val = try_select(obj, index)
         if is_select:
             return Select(obj, dim, val, 'torch.select')
-        assert False, f'{obj}, {index}'
+        # case: subtensor = tensor[1,:2]
+        return FullSlice(obj, b)
+        # assert False, f'{obj}, {index}'
     elif (not isinstance(obj, IRObject)) and isinstance(index, int):
         return obj[index]
-    # case: subtensor = tensor[1,:2]
-    if isinstance(obj, IRTensor):
-        return FullSlice(obj, b)
     return IRPyFunc(signature, [obj, index], [IRObject()])
 
 
