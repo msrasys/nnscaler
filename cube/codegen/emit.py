@@ -7,9 +7,20 @@ from cube.ir.operator import IRDataOperation, IRFwOperation
 from cube.ir.adapter import IRWeightReducer, IRAdapter
 from cube.ir.adapter.prim import IRAdapterPrim
 
+from cube.graph.segment import IRSegment
+
 from cube.codegen.frontend_mapping import Sign2EmitRule
 
 from cube.flags import CompileFlag
+
+
+class IRValue:
+
+    def __init__(self, name: str):
+        self.name = name
+    
+    def __repr__(self):
+        return self.name
 
 
 class CodeEmission:
@@ -49,7 +60,17 @@ class CodeEmission:
         else:
             name = str(tensor)
         return name
-    
+
+    @staticmethod
+    def complex_name(val: Any, prefix_attr: Optional[str]=None) -> str:
+        """
+        Return the val name with complex data type over IRObject
+        Currently support complex data type of Dict, List, Tuple, IRObject
+        """
+        modifier = lambda t: IRValue(CodeEmission.tensor_name(t, prefix_attr))
+        val = IRSegment.modify_objects_of_complex(val, modifier)
+        return str(val)
+
     @staticmethod
     def tuple_name(tensors: List[Any],
                    skip_attr: bool = False, prefix_attr: Optional[str] = None) -> str:
@@ -78,6 +99,17 @@ class CodeEmission:
             if isinstance(t, IRTensor) and skip_attr and t.is_attr():
                 continue
             names.append(CodeEmission.tensor_name(t, prefix_attr))
+        names = '_' if len(names) == 0 else ', '.join(names)
+        return names
+    
+    @staticmethod
+    def return_name_complex(vals: List[Any],
+                            skip_attr: bool = False, prefix_attr: Optional[str] = None) -> str:
+        names = []
+        for t in vals:
+            if isinstance(t, IRObject) and skip_attr and t.is_attr():
+                continue
+            names.append(CodeEmission.complex_name(t, prefix_attr))
         names = '_' if len(names) == 0 else ', '.join(names)
         return names
     

@@ -36,7 +36,8 @@ def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) 
 
     # create inputs
     if inputs:
-        for tensor in segment.inputs():
+        input_objects = IRGraph.get_objects_from_complex(segment.inputs())
+        for tensor in input_objects:
             devices = [consumer.device for consumer in segment.consumers(tensor.parent)][::-1]
             if not isinstance(tensor, IRSubTensor): continue
             assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
@@ -53,7 +54,8 @@ def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) 
     
     # create outputs
     if outputs:
-        for tensor in segment.outputs():
+        output_objects = IRGraph.get_objects_from_complex(segment.outputs())
+        for tensor in output_objects:
             devices = [producer.device for producer in segment.producers(tensor.parent)]
             if not isinstance(tensor, IRSubTensor): continue
             assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
@@ -155,23 +157,30 @@ class IRAdapterGener:
             devices = set()
             for t in func.inputs():
                 if not isinstance(t, IRObject): continue
-                producers = graph.producers(t.parent)
-                for p in producers:
-                    devices.update(p.device)
+                if t.is_attr():
+                    cells = graph.consumers(t.parent)
+                else:
+                    cells = graph.producers(t.parent)
+                for cell in cells:
+                    devices.update(cell.device)
             pyfuncs = []
             # lower to each device
             for devid in devices:
                 inputs = []
+                # automatic partition to align with consumer (attr) or producer (activation)
                 for t in func.inputs():
-                    if isinstance(t, IRObject):
-                        if t.is_attr():
-                            tensors = set(tensor for tensor in graph.ctensors(t.parent) if devid in tensor.device)
-                        else:
-                            tensors = set(tensor for tensor in graph.ptensors(t.parent) if devid in tensor.device)
-                        assert len(tensors) == 1, \
-                            f"Find {len(tensors)} != 1: {tensors} versions of tensor {t} on a same device."
-                        t = list(tensors)[0]
-                    inputs.append(t)
+                    sub_ts = set()
+                    if not isinstance(t, IRSubTensor):
+                        sub_ts.add(t)  # replica for non-tensor
+                    elif t.is_attr():
+                        # get local consumers except func itself
+                        sub_ts = set(tensor for tensor in graph.ctensors(t.parent) \
+                                     if devid in tensor.device and tensor.cell != func)
+                    else:
+                        # get local producers
+                        sub_ts = set(tensor for tensor in graph.ptensors(t.parent) \
+                                     if devid in tensor.device)
+                    inputs.append(t if len(sub_ts) == 0 else list(sub_ts)[0])
                 lower_func = IRPyFunc(func.signature, inputs, func.outputs(), **func.kwargs)
                 lower_func.device = devid
                 pyfuncs.append(lower_func)

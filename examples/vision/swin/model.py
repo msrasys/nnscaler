@@ -221,16 +221,27 @@ class SwinTransformer(nn.Module):
 
 # =========================== Data Loader =======================
 
-
-class ImageDataLoader(cube.runtime.syndata.SynDataLoader):
+class ImageDataLoader(cube.runtime.syndata.CubeDataLoader):
 
     def __init__(self, batch_size: int, img_size: int, num_classes: int, dtype=torch.float32):
-
-        self.bs = batch_size
+        super().__init__(batch_size, [0])
         self.img_size = img_size
         self.num_classes = num_classes
-        super().__init__(
-            shapes=([batch_size, 3, img_size, img_size,],),
-            dtypes=(dtype,),
-            batch_dims=(0,)
+        self.dtype = dtype
+
+        self.sample = None
+        self.set_batch_size(batch_size)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.sample
+    
+    def set_batch_size(self, batch_size: int):
+        self.batch_size = batch_size
+        input_ids = torch.rand(
+            [self.batch_size, 3, self.img_size, self.img_size],
+            dtype=self.dtype, device=torch.cuda.current_device()
         )
+        self.sample = input_ids

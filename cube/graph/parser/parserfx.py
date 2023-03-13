@@ -341,43 +341,43 @@ class FxModuleParser:
         ir_nodes = []
 
         # handle complex outputs
-        def generate_outputs(val: Any, _ops: List) -> IRObject:
-            """Support complex data type of List, Tuple, Dict, Tensor/Object"""
-            if isinstance(val, list):
-                inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
-                output = IRObject()
-                _ops.append(IRPyFunc('(lambda *args: list(args))', inputs, [output]))
-                return output
-            if isinstance(val, tuple):
-                inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
-                output = IRObject()
-                _ops.append(IRPyFunc('(lambda *args: args)', inputs, [output]))
-                return output
-            if isinstance(val, dict):
-                output = IRObject()
-                assert all(not isinstance(key, torch.fx.Node) for key in val.keys()), f"output dict cannot have torch.fx.Node is key"
-                keys = tuple(str(key) for key in val.keys())
-                values = generate_outputs(tuple(generate_outputs(value, _ops) for value in val.values()), _ops)
-                _ops.append(IRPyFunc('(lambda vals, keys: {key:val for key,val in zip(keys,vals)})', [values], [output], keys=keys))
-                return output
-            if isinstance(val, torch.fx.Node):
-                return frame.get_var(val.name)
-            return val
-        output = generate_outputs(node.args[0], ir_nodes)
-        
-        # def generate_outputs(val: Any) -> Any:
+        # def generate_outputs(val: Any, _ops: List) -> IRObject:
         #     """Support complex data type of List, Tuple, Dict, Tensor/Object"""
         #     if isinstance(val, list):
-        #         return list(generate_outputs(item) for item in val)
+        #         inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
+        #         output = IRObject()
+        #         _ops.append(IRPyFunc('(lambda *args: list(args))', inputs, [output]))
+        #         return output
         #     if isinstance(val, tuple):
-        #         return tuple(generate_outputs(item) for item in val)
+        #         inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
+        #         output = IRObject()
+        #         _ops.append(IRPyFunc('(lambda *args: args)', inputs, [output]))
+        #         return output
         #     if isinstance(val, dict):
-        #         return {generate_outputs(key) : generate_outputs(value) for key, value in val.items()}
+        #         output = IRObject()
+        #         assert all(not isinstance(key, torch.fx.Node) for key in val.keys()), f"output dict cannot have torch.fx.Node is key"
+        #         keys = tuple(str(key) for key in val.keys())
+        #         values = generate_outputs(tuple(generate_outputs(value, _ops) for value in val.values()), _ops)
+        #         _ops.append(IRPyFunc('(lambda vals, keys: {key:val for key,val in zip(keys,vals)})', [values], [output], keys=keys))
+        #         return output
         #     if isinstance(val, torch.fx.Node):
         #         return frame.get_var(val.name)
-        #     # for other types like int, float, ...
         #     return val
-        # output = generate_outputs(node.args[0])
+        # output = generate_outputs(node.args[0], ir_nodes)
+        
+        def generate_outputs(val: Any) -> Any:
+            """Support complex data type of List, Tuple, Dict, Tensor/Object"""
+            if isinstance(val, list):
+                return list(generate_outputs(item) for item in val)
+            if isinstance(val, tuple):
+                return tuple(generate_outputs(item) for item in val)
+            if isinstance(val, dict):
+                return {generate_outputs(key) : generate_outputs(value) for key, value in val.items()}
+            if isinstance(val, torch.fx.Node):
+                return frame.get_var(val.name)
+            # for other types like int, float, ...
+            return val
+        output = generate_outputs(node.args[0])
 
         # # TODO: support more complex data type
         # outs = (node.args[0],) if isinstance(node.args[0], torch.fx.Node) else node.args[0]

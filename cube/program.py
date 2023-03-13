@@ -1,4 +1,5 @@
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
+import warnings
 
 from cube.ir.cten import IRCell, IRTensor, IRObject
 from cube.ir.tensor import IRFullTensor, IRSubTensor
@@ -43,8 +44,7 @@ class Program:
     def get_graph(self) -> IRGraph:
         return self.instance._graph
 
-    def set_output(self, outputs: List[IRObject]):
-        assert all(isinstance(t, IRObject) for t in outputs)
+    def set_output(self, outputs: Tuple[Any]):
         self.instance._graph.reset_outputs(len(outputs))
         for idx, otensor in enumerate(outputs):
             self.instance._graph.set_output(idx, otensor)
@@ -106,8 +106,8 @@ class SemanticDataLoader:
             if isinstance(sample, dict):
                 assert all(isinstance(key, (str, int)) for key in sample.keys())
                 return {key:generate_output(val) for key, val in sample.items()}
-            # if isinstance(sample, set):
-            #     return {generate_output(t) for t in sample}
+            if isinstance(sample, set):
+                return {generate_output(t) for t in sample}
             if isinstance(sample, torch.Tensor):
                 shape, dtype = list(sample.shape), dtype_map.map(sample.dtype)
                 return IRFullTensor(shape, 'data', dtype=dtype).tosub()
@@ -148,7 +148,7 @@ class SemanticModel:
             assert isinstance(model, torch.nn.Module), f"device of local_rank == 0 must provide model"
         self.model = model
         self.input_shapes = None
-        self.dummy_input = dummy_input
+        self._dummy_input = dummy_input
         self.ir_graph = None
         self._loaded_module: CubeModule = None
         self._save_content = True
@@ -160,6 +160,32 @@ class SemanticModel:
     @save_content.setter
     def save_content(self, val: bool):
         self._save_content = val
+
+    @property
+    def dummy_input(self) -> Any:
+        """
+        Get dummy real-tensor input from on CPU
+        """
+        return self._dummy_input
+    
+    @dummy_input.setter
+    def dummy_input(self, val):
+        
+        def complex(val: Any):
+            """Complex to CPU"""
+            if isinstance(val, tuple):
+                return tuple(complex(t) for t in val)
+            if isinstance(val, list):
+                return list(complex(t) for t in val)
+            if isinstance(val, dict):
+                return {complex(key):complex(val) for key, val in val.items()}
+            if isinstance(val, set):
+                return {complex(t) for t in val}
+            if isinstance(val, torch.Tensor):
+                return val.cpu()
+            return val
+
+        self._dummy_input = complex(val)
 
     def get_graph(self):
         return self.ir_graph

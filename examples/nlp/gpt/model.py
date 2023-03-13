@@ -184,20 +184,22 @@ class GPTInfer(torch.nn.Module):
         return logits
 
 
-class GPTDataLoader(cube.runtime.syndata.SynDataLoader):
+class GPTDataLoader(cube.runtime.syndata.CubeDataLoader):
 
-    def __init__(self, batch_size: int, cfg: Config = Config()):
+    def __init__(self, bs: int, cfg: Config = None):
+        self.cfg = Config() if cfg is None else cfg
+        super().__init__(bs, [0, 0])
+        self.sample = None
+        self.set_batch_size(bs)
 
-        self.cfg = cfg
-        super().__init__(
-            shapes=([batch_size, self.cfg.seqlen],
-                    [batch_size, self.cfg.seqlen],
-            ),
-            dtypes=(torch.int64, torch.int64),
-            batch_dims=(0, 0)
-        )
+    def __iter__(self):
+        return self
 
-    def random_sample(self):
+    def __next__(self):
+        return self.sample
+    
+    def set_batch_size(self, batch_size: int):
+        self.batch_size = batch_size
         input_ids = torch.randint(
             0, self.cfg.num_embeddings,
             size=(self.batch_size, self.cfg.seqlen),
@@ -206,23 +208,25 @@ class GPTDataLoader(cube.runtime.syndata.SynDataLoader):
         position_ids = torch.arange(
             0, self.cfg.seqlen, dtype=torch.int64, device=torch.cuda.current_device()
         ).repeat(self.batch_size).view(self.batch_size, -1)
-        return input_ids, position_ids
+        self.sample = (input_ids, position_ids)
 
 
-class GPTInferDataLoader(cube.runtime.syndata.SynDataLoader):
+class GPTInferDataLoader(cube.runtime.syndata.CubeDataLoader):
 
-    def __init__(self, batch_size: int, cfg: Config = Config()):
+    def __init__(self, bs: int, cfg: Config = None):
+        self.cfg = Config() if cfg is None else cfg
+        super().__init__(bs, [0, 0])
+        self.sample = None
+        self.set_batch_size(bs)
 
-        self.cfg = cfg
-        super().__init__(
-            shapes=([batch_size, 1],
-                    [batch_size, 1],
-            ),
-            dtypes=(torch.int64, torch.int64),
-            batch_dims=(0, 0)
-        )
+    def __iter__(self):
+        return self
 
-    def random_sample(self):
+    def __next__(self):
+        return self.sample
+    
+    def set_batch_size(self, batch_size: int):
+        self.batch_size = batch_size
         input_ids = torch.randint(
             0, self.cfg.num_embeddings,
             size=(self.batch_size, 1),
@@ -233,4 +237,4 @@ class GPTInferDataLoader(cube.runtime.syndata.SynDataLoader):
             0, 1, dtype=torch.int64,
             device=torch.cuda.current_device()
         ).repeat(self.batch_size).view(self.batch_size, -1)
-        return input_ids, position_ids
+        self.sample = (input_ids, position_ids)

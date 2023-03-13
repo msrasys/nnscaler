@@ -1,7 +1,7 @@
-from typing import Iterable, Dict, List
+from typing import Iterable, Dict, List, Any
 import itertools
 
-from cube.ir.cten import IRCell, IRTensor
+from cube.ir.cten import IRCell, IRTensor, IRObject
 from cube.ir.tensor import IRSubTensor
 from cube.graph.segment import IRSegment
 from cube.execplan.execplan import ExeReuseCell
@@ -11,22 +11,25 @@ from cube.codegen.emit import FuncEmission
 
 class LifeCycle:
 
-    def __init__(self, nodes: List[IRCell], graph_inputs: List[IRSubTensor], graph_outputs: List[IRSubTensor]):
+    def __init__(self, nodes: List[IRCell], graph_inputs: List[Any], graph_outputs: List[Any]):
+
+        graph_inputs = IRSegment.get_objects_from_complex(graph_inputs)
+        graph_outputs = IRSegment.get_objects_from_complex(graph_outputs)
 
         self.nodes: Dict[int] = {node: lid for lid, node in enumerate(nodes)}
         # the last line id of consuming or producing a tensor
-        self.lifetime: Dict[IRSubTensor, int] = {}
+        self.lifetime: Dict[IRObject, int] = {}
         # the tensors can be released given the finish of line id
-        self.release: Dict[int, List[IRSubTensor]] = {}
+        self.release: Dict[int, List[IRObject]] = {}
 
-        is_activation = lambda t: isinstance(t, IRSubTensor) and not t.is_attr()
+        is_activation = lambda t: isinstance(t, IRObject) and not t.is_attr()
         
         self.lifetime.update((tsin, 0) for tsin in graph_inputs if is_activation(tsin))
         
         for i, node in enumerate(nodes):
 
-            outputs : Iterable[IRTensor]
-            inputs : Iterable[IRTensor]
+            outputs : Iterable[IRObject]
+            inputs : Iterable[IRObject]
 
             if isinstance(node, (IRSegment, ExeReuseCell)):
                 # forward segment

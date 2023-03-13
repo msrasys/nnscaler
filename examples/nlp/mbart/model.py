@@ -231,30 +231,26 @@ class MBartForSentenceClassification(torch.nn.Module):
 
 class MBartSyntheticDataLoader(cube.runtime.syndata.CubeDataLoader):
 
-    def __init__(self, batch_size: int):
+    def __init__(self, bs: int, cfg: Config = None):
+        self.cfg = Config() if cfg is None else cfg
+        super().__init__(bs, [0, 0])
+        self.sample = None
+        self.set_batch_size(bs)
 
-        self.bs = batch_size
-        self.cfg = Config()
-        super().__init__(
-            shapes=([batch_size, self.cfg.max_source_positions,],),
-            dtypes=(torch.int64,),
-            batch_dims=(0,)
-        )
-        self.samples = [self.random_sample()]
-        
-    def random_sample(self):
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.sample
+    
+    def set_batch_size(self, batch_size: int):
+        self.batch_size = batch_size
         input_ids = torch.randint(
             0, self.cfg.num_embeddings,
             size=(self.bs, self.cfg.max_source_positions),
             dtype=torch.int64, device=torch.cuda.current_device()
         )
-        return input_ids
-    
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.samples[0]
+        self.sample = input_ids
 
 
 class MBartDataLoader(cube.runtime.syndata.CubeDataLoader):
