@@ -73,7 +73,14 @@ class IRGraph(IRSegment):
         """
         # align graph with input tensors
         itensors: Tuple[IRObject, ...] = self.inputs()
-        assert len(args) == len(itensors)
+        if len(args) != len(itensors):
+            print(f'ERROR(skipping) len(args) != len(itensors): {len(args)} != {len(itensors)}')
+            if len(args) > len(itensors):
+                args = args[:len(itensors)]
+                print(f'WARNING: args shrinked into {args}')
+            else:
+                raise RuntimeError('len(args) < len(itensors)')
+
         for idx, (itensor, arg) in enumerate(zip(itensors, args)):
             self.set_input(idx, arg)
             for producer in self.producers(itensor.parent):

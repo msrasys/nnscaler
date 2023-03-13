@@ -165,7 +165,7 @@ class IRAdapterGener:
                 for t in func.inputs():
                     if isinstance(t, IRObject):
                         if t.is_attr():
-                            tensors = set(tensor for tensor in graph.ctensors(t.parent) if devid in tensor.device and tensor.cell != func)
+                            tensors = set(tensor for tensor in graph.ctensors(t.parent) if devid in tensor.device)
                         else:
                             tensors = set(tensor for tensor in graph.ptensors(t.parent) if devid in tensor.device)
                         assert len(tensors) == 1, \

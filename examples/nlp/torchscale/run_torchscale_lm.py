@@ -101,13 +101,23 @@ print(f'input_shapes = {input_shapes}')
 print(f'input_dtypes = {input_dtypes}')
 
 dataloader = cube.runtime.syndata.SynDataLoader(
+    # names=('src_tokens',),
     shapes=(input_shapes),
     dtypes=input_dtypes,
-    batch_dims=(0,0),
+    batch_dims=(0, 0),
 )
+
 sample_input = next(dataloader)
 print(f'next(dataloader) = {sample_input}')
-sample_input_cpu = tuple([val.to(device) if isinstance(val, torch.Tensor) else val for val in sample_input])
+if isinstance(sample_input, tuple):
+    sample_input_cpu = tuple([val.to(device) if isinstance(val, torch.Tensor) else val for val in sample_input])
+elif isinstance(sample_input, dict):
+    sample_input_cpu = sample_input
+    for key in sample_input_cpu.keys():
+        sample_input_cpu[key] = sample_input_cpu[key].to(device)
+else:
+    raise RuntimeError(f'To fix sample_input with type{type(sample_input)}')
+
 
 # model = cube.SemanticModel(
 #      #TODO fix me model, dummy_input=sample_input_cpu,
