@@ -573,6 +573,15 @@ def Int(input, memory_format=None, signature = None):
     return IRDimops(Int, 'int', signature, annos, [input])
 
 
+def Float(input, memory_format=None, signature = None):
+    """
+    Tensor.float(memory_format=torch.preserve_format) → Tensor
+    """
+    assert memory_format is None
+    annos = ['* -> *']
+    return IRDimops(Float, 'float', signature, annos, [input])
+
+
 def Fill(input, value, signature = None):
     """
     torch.Tensor.fill_(value)

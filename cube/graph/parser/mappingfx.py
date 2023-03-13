@@ -81,6 +81,7 @@ class SignFx2Op:
         __ttemplate('nan_to_num') : function.NanToNum,
         __tttemplate('long'): function.Long,
         __tttemplate('int'): function.Int,
+        __tttemplate('float'): function.Float,
         __ttemplate('fill_'): function.Fill,
         __ttemplate('masked_fill'): function.MaskedFill,
         __ttemplate('cumsum'): function.CumSum,
