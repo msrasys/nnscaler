@@ -82,10 +82,13 @@ def emit_zeros(node, arg_vars:list, kw_pairs:dict) -> str:
             kw_pairs['dtype'] = IRDType2DType.map(ir_dtype)
     
     # TODO make all intermediately created tensors CUDA, to fit with other parts of the system, like SynDataLoader.
-    assert 'device' not in kw_pairs
+    if 'device' in kw_pairs:
+        print(f'WARNING: overload device info. of {node}')
     kw_pairs['device'] = 'torch.cuda.current_device()' # str will get directly dumped as it's.
 
-    assert len(arg_vars) == 0
+    if len(arg_vars) != 0:
+        print(f'WARNING: emit_zero with len(arg_vars) {len(arg_vars)} != 0')
+    
     return _common_rule_join_all(node, arg_vars, kw_pairs)
 
 def emit_ones(node, arg_vars:list, kw_pairs:dict) -> str:

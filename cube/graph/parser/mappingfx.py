@@ -76,6 +76,7 @@ class SignFx2Op:
         __ftemplate('relu'): function.ReLU,
         __fcntemplate('gelu'): function.GeLU,
         __ttemplate('eq') : function.CompareEQ,
+        '_operator.eq': function.CompareEQ,
         __ttemplate('ne') : function.CompareNE,
         __ttemplate('nan_to_num') : function.NanToNum,
         __tttemplate('long'): function.Long,
@@ -86,6 +87,7 @@ class SignFx2Op:
         __ftemplate('softmax') : function.Softmax,
         __ttemplate('bmm') : function.BatchLinear,
         __ttemplate('pow'): function.Pow,
+        '_operator.pow': function.Pow,
         __ttemplate('baddbmm'): function.BMMAdd,
         __ttemplate('permute'): function.Permute,
         __ttemplate('transpose'): function.Transpose,
@@ -151,6 +153,7 @@ class SignFx2Op:
         
         __ttemplate('div') : function.Div,
         __ttemplate('true_divide'): function.Div,
+        '_operator.truediv': function.Div,
         __ttemplate('floor_divide') : function.FloorDiv,
         '_operator.floordiv': function.FloorDiv,
 
@@ -158,6 +161,7 @@ class SignFx2Op:
         '_operator.neg': function.Neg,
         #
         __ttemplate('gt'): function.CompareGT,
+        '_operator.gt': function.CompareGT,
         __ttemplate('lt'): function.CompareLT,
         __ttemplate('ge'): function.CompareGE,
         __ttemplate('le'): function.CompareLE,

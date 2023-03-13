@@ -138,7 +138,6 @@ class SynDataLoader(CubeDataLoader):
         self.shapes = tuple([list(shape) for shape in shapes])
         self.dtypes = dtypes
         batch_size = shapes[0][batch_dims[0]]
-        assert not names
         super().__init__(batch_size, batch_dims)
         self.names = names
         self.append_args=append_args
@@ -151,9 +150,12 @@ class SynDataLoader(CubeDataLoader):
         return self
 
     def __next__(self):
-        if self.names:
+        if self.names is not None:
             assert len(self.names) == len(self.buffer)
-            return dict(zip(self.names, self.buffer)).update(self.append_args)
+            ret_dict = dict(zip(self.names, self.buffer))
+            if self.append_args is not None:
+                ret_dict = ret_dict.update(self.append_args)
+            return ret_dict
         else:
             return self.buffer
 
@@ -183,7 +185,7 @@ class SynDataLoader(CubeDataLoader):
         if len(datas) == 0:
             self.buffer = None
         else:
-            self.buffer = datas[0] if len(datas) == 1 else datas
+            self.buffer = datas  #will not convert like: datas[0] if len(datas) == 1 else datas
 
     def set_batch_size(self, batch_size: int):
         self.batch_size = batch_size

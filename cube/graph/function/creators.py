@@ -13,14 +13,19 @@ class IRArange(IRFwOperation):
         # The shape information must be statically known integer values
         assert all(isinstance(dim, int) for dim in shape)
         assert 'dtype' in kwargs
-        assert isinstance(kwargs['dtype'], IRDType)
+        dtype = kwargs['dtype']
+        assert not isinstance(dtype, IRDType)
+
+        from cube.graph.parser.mapping import DType2IRDType
+        ir_dtype: IRDType = DType2IRDType.map(dtype)
 
         super().__init__(name, signature, input_length=0, output_length=1)
 
         # Customize output's dtype only after 'super().__init__' and 'self.set_input',
         # otherwise it gets overwritten.
-        self.output(0).dtype = kwargs['dtype']
+        self.output(0).dtype = ir_dtype
         self.shape = shape
+        kwargs.update({'dtype': dtype, 'device': 'cuda'}) #TODO check me and fix more, e.g., ones, zeros, empty
         self.kwargs = kwargs
 
     def infer_shape(self) -> bool:

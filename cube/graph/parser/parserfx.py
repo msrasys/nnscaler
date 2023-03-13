@@ -67,6 +67,10 @@ class FxModuleParser:
               dummy_inputs = None,
               frame: Frame = None) \
             -> Tuple[List[IRFullTensor], List[IRFwOperation], List[IRFullTensor]]:
+        from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
+        dce_module = DCEHandler(module).eliminate_dead_code()
+        model = dce_module
+
         """
         The overall entry to parse a torch.fx graph module
         """
@@ -78,9 +82,12 @@ class FxModuleParser:
         print(f'inputs = {inputs}')
 
         if input_shapes is not None and len(input_shapes) != len(inputs):
-            print(f'module(type = {type(module)}.__dict__.keys() = {module.__dict__.keys()}')
-            print(f'input shape mismatch (got {len(input_shapes)} != {len(inputs)})')
-            # TODO fixme raise RuntimeError(f"Module {module.original_name} input shape mismatch (got {len(input_shapes)} != {len(inputs)})")
+            print(f'WARNING input shape mismatch (got {len(input_shapes)} != {len(inputs)})')
+            if len(input_shapes) < len(inputs):
+                raise RuntimeError(f"Module {module.original_name} input shape mismatch (got {len(input_shapes)} != {len(inputs)})")
+            else:
+                input_shapes = input_shapes[:len(inputs)]
+                print(f'WARNING input_shapes shrinked to {input_shapes})')
         
         default_dtype = torch.get_default_dtype()
         kDefaultType = DType2IRDType.map(default_dtype) # TODO specify dtype
@@ -167,9 +174,12 @@ class FxModuleParser:
             if ir_nodes is not None:
                 all_ir_nodes += ir_nodes
         
-        output_nodes = [node for node in module.graph.nodes if node.op == 'output']
-        assert len(output_nodes) == 1, f"get mutiple {len(all_ir_nodes)} output nodes"
-        output_val = frame.get_var(output_nodes[0].name)
+        # output_nodes = [node for node in module.graph.nodes if node.op == 'output']
+        # assert len(output_nodes) == 1, f"get mutiple {len(all_ir_nodes)} output nodes"
+        # output_val = frame.get_var(output_nodes[0].name)
+        output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
+
+
     
         frame.pop_var()
         frame.pop_attr()
@@ -320,29 +330,29 @@ class FxModuleParser:
         ir_nodes = []
 
         # handle complex outputs
-        # def generate_outputs(val: Any, _ops: List) -> IRObject:
-        #     """Support complex data type of List, Tuple, Dict, Tensor/Object"""
-        #     if isinstance(val, list):
-        #         inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
-        #         output = IRObject()
-        #         _ops.append(IRPyFunc('(lambda *args: list(args))', inputs, [output]))
-        #         return output
-        #     if isinstance(val, tuple):
-        #         inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
-        #         output = IRObject()
-        #         _ops.append(IRPyFunc('(lambda *args: args)', inputs, [output]))
-        #         return output
-        #     if isinstance(val, dict):
-        #         output = IRObject()
-        #         assert all(not isinstance(key, torch.fx.Node) for key in val.keys()), f"output dict cannot have torch.fx.Node is key"
-        #         keys = tuple(str(key) for key in val.keys())
-        #         values = generate_outputs(tuple(generate_outputs(value, _ops) for value in val.values()), _ops)
-        #         _ops.append(IRPyFunc('(lambda vals, keys: {key:val for key,val in zip(keys,vals)})', [values], [output], keys=keys))
-        #         return output
-        #     if isinstance(val, torch.fx.Node):
-        #         return frame.get_var(val.name)
-        #     return val
-        # output = generate_outputs(node.args[0], ir_nodes)
+        def generate_outputs(val: Any, _ops: List) -> IRObject:
+            """Support complex data type of List, Tuple, Dict, Tensor/Object"""
+            if isinstance(val, list):
+                inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
+                output = IRObject()
+                _ops.append(IRPyFunc('(lambda *args: list(args))', inputs, [output]))
+                return output
+            if isinstance(val, tuple):
+                inputs = tuple(generate_outputs(sub_node, _ops) for sub_node in val)
+                output = IRObject()
+                _ops.append(IRPyFunc('(lambda *args: args)', inputs, [output]))
+                return output
+            if isinstance(val, dict):
+                output = IRObject()
+                assert all(not isinstance(key, torch.fx.Node) for key in val.keys()), f"output dict cannot have torch.fx.Node is key"
+                keys = tuple(str(key) for key in val.keys())
+                values = generate_outputs(tuple(generate_outputs(value, _ops) for value in val.values()), _ops)
+                _ops.append(IRPyFunc('(lambda vals, keys: {key:val for key,val in zip(keys,vals)})', [values], [output], keys=keys))
+                return output
+            if isinstance(val, torch.fx.Node):
+                return frame.get_var(val.name)
+            return val
+        output = generate_outputs(node.args[0], ir_nodes)
         
         # def generate_outputs(val: Any) -> Any:
         #     """Support complex data type of List, Tuple, Dict, Tensor/Object"""
@@ -358,10 +368,10 @@ class FxModuleParser:
         #     return val
         # output = generate_outputs(node.args[0])
 
-        # TODO: support more complex data type
-        outs = (node.args[0],) if isinstance(node.args[0], torch.fx.Node) else node.args[0]
-        assert all(isinstance(t, torch.fx.Node) for t in outs), "Only support model return with tuple of "
-        output = [frame.get_var(t.name) for t in outs]
+        # # TODO: support more complex data type
+        # outs = (node.args[0],) if isinstance(node.args[0], torch.fx.Node) else node.args[0]
+        # assert all(isinstance(t, torch.fx.Node) for t in outs), "Only support model return with tuple of "
+        # output = [frame.get_var(t.name) for t in outs]
 
         frame.set_var(node.name, output)
         return ir_nodes

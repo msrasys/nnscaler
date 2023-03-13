@@ -67,8 +67,7 @@ model.eval()
 print("building model succeed: ", type(model))
 
 # create dummy input
-with open('examples/nlp/torchscale/input_lm.bak', 'rb') as f:
-# with open('examples/nlp/torchscale/lm_input_v2.pkl', 'rb') as f:
+with open('examples/nlp/torchscale/input_lm', 'rb') as f:
     dummy_input = pickle.load(f)
 device = next(model.parameters()).device
 print(f'device = {device}')
@@ -97,21 +96,29 @@ print(f'input_shapes = {input_shapes}')
 print(f'input_dtypes = {input_dtypes}')
 
 dataloader = cube.runtime.syndata.SynDataLoader(
+    # names=('src_tokens',),
     shapes=(input_shapes),
     dtypes=input_dtypes,
-    batch_dims=(0,0),
+    batch_dims=(0, 0),
 )
+
 sample_input = next(dataloader)
 print(f'next(dataloader) = {sample_input}')
-sample_input_cpu = tuple([val.to(device) if isinstance(val, torch.Tensor) else val for val in sample_input])
+if isinstance(sample_input, tuple):
+    sample_input_cpu = tuple([val.to(device) if isinstance(val, torch.Tensor) else val for val in sample_input])
+elif isinstance(sample_input, dict):
+    sample_input_cpu = sample_input
+    for key in sample_input_cpu.keys():
+        sample_input_cpu[key] = sample_input_cpu[key].to(device)
+else:
+    raise RuntimeError(f'To fix sample_input with type{type(sample_input)}')
+
 
 model = cube.SemanticModel(
-     #TODO fix me model, dummy_input=sample_input_cpu,
-    # model, dummy_input=dummy_input_list,
     model, dummy_input=dummy_input,
 )
 
-@cube.compile(model, dataloader, PAS=PAS, load_content=False)
+@cube.compile(model, dataloader, PAS=PAS, load_content=False, override=True)
 def train_iter(model, dataloader):
     data = next(dataloader)
     loss = model(*data)
@@ -123,86 +130,5 @@ model = model.get_gen_module()
 iter_ret = train_iter(model, dataloader)
 print(f'iter_ret = {iter_ret}')
 
-# Conduct concrete trace below
-# sys.path.append('/home/v-junliang/torchscaletest/nni')
-# sys.path.append('./torchscaletest/nni')
-# from nni.common.concrete_trace_utils import concrete_trace
-# from concrete_trace_utils import concrete_trace
-from examples.nlp.torchscale.concrete_trace_utils import concrete_trace
-import examples.nlp.torchscale.torchscaletest.torchscale
-
-
-def check_equal(a, b):
-    if type(a) != type(b):
-        return False
-    if isinstance(a, (list, tuple, set)):
-        if len(a) != len(b):
-            return False
-        for sub_a, sub_b in zip(a, b):
-            if not check_equal(sub_a, sub_b):
-                return False
-        return True
-    elif isinstance(a, dict):
-        keys_a, kes_b = set(a.keys()), set(b.keys())
-        if keys_a != kes_b:
-            return False
-        for key in keys_a:
-            if not check_equal(a[key], b[key]):
-                return False
-        return True
-    elif isinstance(a, torch.Tensor):
-        return torch.equal(a, b)
-    else:
-        return a == b
-
-
-print("start tracing...")
-traced_model, _ = concrete_trace(
-    model,
-    dummy_input,
-    use_operator_patch=True,
-    autowrap_leaf_class={
-        torch.finfo: ((), False),
-        type(output_origin): ((), False),
-    },
-)
-print("trace succeed")
-print("checking equal...")
-with torch.no_grad():
-    output_traced = traced_model(**dummy_input)
-assert check_equal(output_origin, output_traced), "check equal failed"
-print("checked")
-
-# check graph
-traced_model.graph.print_tabular()
-
-# with open('input_tl', 'wb') as f:
-#     pickle.dump(dummy_input, f)
-
-# try to save traced model with pickle
-# from concrete_trace_utils.concrete_tracer import MagicMethodPatcher
-# from pickle import _Pickler, _Unpickler
-
-# with open("save/through_nn_Module/tl_traced_v2.model", "wb") as f:
-#     # pickle.dump(traced_model, f)
-#     with MagicMethodPatcher():
-#         _Pickler(f).dump(traced_model)
-
-# with open("save/through_nn_Module/tl_traced.model", "rb") as f:
-#     with MagicMethodPatcher():
-#         reload_model = _Unpickler(f).load()
-
-
-# with torch.no_grad():
-#     output_reload = reload_model(**dummy_input)
-# assert check_equal(output_origin, output_reload), "reload check equal failed"
-# print("reload is good!")
-
-# with open("save/through_nn_Module/tl_origin_v2.model", "wb") as f:
-#     with MagicMethodPatcher():
-#         _Pickler(f).dump(model)
-
-# with open("save/through_nn_Module/tl_input_v2.pkl", "wb") as f:
-#     with MagicMethodPatcher():
-#         _Pickler(f).dump(dummy_input)
-
+import sys
+sys.exit(0)

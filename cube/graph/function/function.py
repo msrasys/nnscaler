@@ -128,11 +128,11 @@ def Arange(*args, out=None, dtype=None, layout=torch.strided, device=None, requi
     from cube.graph.parser.mapping import DType2IRDType
     if dtype is None:
         dtype = torch.get_default_dtype()
-    ir_dtype : IRDType = DType2IRDType.map(dtype)
+
     import math
     size = (math.ceil((end-start)/step),)
-    kwargs = {'start': start, 'end': end, 'step': step, 'out': out, 'dtype': ir_dtype,
-              'layout': layout, 'device': device, 'requires_grad': requires_grad}
+    kwargs = {'start': start, 'end': end, 'step': step, 'out': out, 'dtype': dtype,
+              'layout': layout, 'requires_grad': requires_grad}
     return IRArange(signature, size, 'arange', **kwargs)
 
 
@@ -863,17 +863,156 @@ def View(input, size: Tuple[int], *arg_size, signature = None):
     return IRDimops(View, 'view', signature, [anno], [input], rules, size=tuple(size))
 
 
-def Reshape(input, *shape, signature = None):
+def Reshape(input, shape: Tuple[int], *arg_shape, signature = None):
     """
     torch.reshape(Tensor self, int[] shape) -> Tensor
     """
 
-    warnings.warn("""
-    'torch.reshape' is currently dispatched to 'torch.Tensor.view',
-    but 'reshape' has keyword parameter 'shape' while 'view' has 'size'.
-    ArgumentMissing error may be raised during codegen.""")
+    size = (shape,) if isinstance(shape, int) else tuple(shape)
+    size = size + arg_shape
+    assert all([isinstance(dim, int) for dim in size]), \
+        f"Expected tensor.view has static int shape but got: {size}"
+    in_shape, ou_shape = list(input.shape), list(size)
 
-    return View(input, *shape, signature='torch.Tensor.view')
+    # infer -1
+    def nele(shape, nele=1):
+        for dimlen in shape: nele *= dimlen
+        return nele
+
+    cnt = nele(in_shape)
+    if -1 in ou_shape:
+        idx = ou_shape.index(-1)
+        ou_shape[idx] = cnt // (-nele(ou_shape))
+    assert nele(in_shape) == nele(ou_shape), f"shape mismatch: {in_shape}, {ou_shape}"
+
+    # generate annotation
+    rest_inshape = [dimlen for dimlen in in_shape]
+    rest_oushape = [dimlen for dimlen in ou_shape]
+    chain = []
+    can_bucket = True
+    while len(rest_inshape) != 0 or len(rest_oushape) != 0:
+        if len(rest_inshape) == 0:
+            chain = chain + rest_oushape
+            rest_oushape = []
+        elif len(rest_oushape) == 0:
+            chain = chain + rest_inshape
+            rest_inshape = []
+        else:
+            dimlen = min(rest_inshape[0], rest_oushape[0])
+            if max(rest_inshape[0], rest_oushape[0]) % dimlen == 0:
+                chain.append(dimlen)
+                if dimlen == rest_inshape[0]:
+                    rest_inshape.pop(0)
+                else:
+                    rest_inshape[0] = rest_inshape[0] // dimlen
+                if dimlen == rest_oushape[0]:
+                    rest_oushape.pop(0)
+                else:
+                    rest_oushape[0] = rest_oushape[0] // dimlen
+            else:
+                can_bucket = False
+                break
+
+    letters = iter(string.ascii_lowercase)
+    if can_bucket:
+        inchain = ouchain = chain
+        inedims = ouedims = edims = [next(letters) for _ in chain]
+    else:
+        inchain, ouchain = in_shape, ou_shape
+        inedims = [str(dimlen) for dimlen in in_shape]
+        ouedims = [str(dimlen) for dimlen in ou_shape]
+        chain = inchain + ouchain
+        edims = inedims + ouedims
+    shape_map: Dict[str, int] = {edim: eshape for (edim, eshape) in zip(edims, chain)}
+
+    # generate input and output shape annotations
+    def buckets(shape: List[int], chain: List[int], edims: List[int]) -> List[List[str]]:
+        anno = []
+        dimidx = 0
+        for idx, dimlen in enumerate(shape):
+            elements, bracket = 1, []
+            maxele = len(chain) - dimidx - (len(shape) - 1 - idx)
+            while True:
+                if len(bracket) == maxele:
+                    assert elements == dimlen, f"internal match error1: {bracket}"
+                    break
+                if dimidx >= len(chain) or elements * chain[dimidx] > dimlen:
+                    assert elements == dimlen, f"internal match error2: {bracket}"
+                    break
+                else:
+                    elements *= chain[dimidx]
+                    bracket.append(edims[dimidx])
+                    dimidx += 1
+            anno.append(bracket)
+        return anno
+
+    in_anno = buckets(in_shape, inchain, inedims)
+    ou_anno = buckets(ou_shape, ouchain, ouedims)
+
+    # postprocess on dimlen == 1
+    shape_map['1'] = 1
+    for bracket in in_anno + ou_anno:
+        for subdim, edim in enumerate(bracket):
+            if shape_map[edim] == 1:
+                bracket[subdim] = str(shape_map[edim])
+
+    # find out the axis that can be partitioned
+    ispatial, ifirst = set(), []
+    for bracket in in_anno:
+        sdim = None
+        for hdim in range(len(bracket)):
+            if bracket[hdim] == '1' or shape_map[bracket[hdim]] == 1: continue
+            sdim = bracket[hdim]
+            break
+        if sdim is not None:
+            ispatial.add(sdim)
+        ifirst.append(sdim)
+
+    ospatial, ofirst = set(), []
+    for bracket in ou_anno:
+        sdim = None
+        for hdim in range(len(bracket)):
+            if bracket[hdim] == '1' or shape_map[bracket[hdim]] == 1: continue
+            sdim = bracket[hdim]
+            break
+        if sdim is not None:
+            ospatial.add(sdim)
+        ofirst.append(sdim)
+
+    # intersection for spatial partitioned dimensions
+    spatial = ispatial.intersection(ospatial)
+
+    # set dimension cannot be partitioned
+    for bracket in in_anno + ou_anno:
+        for hdim in range(len(bracket)):
+            if bracket[hdim] not in spatial:
+                bracket[hdim] = str(shape_map[bracket[hdim]])
+
+    # TODO: strange behaviour if every identitifer creates own
+    # modifier, seems all previous modifiers will be overrided by
+    # the last one.
+    def view_modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
+        kwargs = dict(**kwargs)
+        identifier = ifirst[dim]
+        oidx = ofirst.index(identifier)
+        size = list(kwargs['shape'])
+        size[oidx] = size[oidx] // num
+        kwargs['shape'] = tuple(size)
+        return kwargs
+
+    # special rules: to change output size argument
+    rules = []
+    for identifier in spatial:
+        iidx = ifirst.index(identifier)
+        oidx = ofirst.index(identifier)
+        rules.append(
+            TransformRule([DimopSplit.D(iidx)], [DimopSplit.D(oidx)], view_modifier)
+        )
+
+    anno = OpAnno.create_op_str([in_anno], [ou_anno])
+
+    new_signature = 'torch.Tensor.reshape'
+    return IRDimops(Reshape, 'shape', new_signature, [anno], [input], rules, shape=tuple(size))
 
 
 def Permute(input, dims: Tuple[int], *arg_dims, signature = None):

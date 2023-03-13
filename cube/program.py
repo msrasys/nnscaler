@@ -103,9 +103,9 @@ class SemanticDataLoader:
                 return tuple(generate_output(t) for t in sample)
             if isinstance(sample, list):
                 return list(generate_output(t) for t in sample)
-            # if isinstance(sample, dict):
-            #     assert all(isinstance(key, (str, int)) for key in sample.keys())
-            #     return {key:generate_output(val) for key, val in sample.items()}
+            if isinstance(sample, dict):
+                assert all(isinstance(key, (str, int)) for key in sample.keys())
+                return {key:generate_output(val) for key, val in sample.items()}
             # if isinstance(sample, set):
             #     return {generate_output(t) for t in sample}
             if isinstance(sample, torch.Tensor):
@@ -118,7 +118,13 @@ class SemanticDataLoader:
         outputs = generate_output(sample)
 
         # create dataloader
-        data_num = len(outputs) if isinstance(outputs, tuple) else 1
+        if isinstance(outputs, (tuple, list)):
+            data_num = len(outputs)
+        elif isinstance(outputs, dict):
+            data_num = len(outputs.keys())
+        else:
+            data_num = 1
+
         data_op = IRDataOperation(data_num=data_num, batch_dims=self.get_batch_dims())
         if not isinstance(outputs, tuple):
             data_op.set_output(0, outputs)
