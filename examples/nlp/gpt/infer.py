@@ -67,7 +67,7 @@ def inter():
     dataloader = GPTInferDataLoader(batch_size)
 
     ################## SuperScaler run
-    model = cube.SemanticModel(model, dataloader.shapes)
+    model = cube.SemanticModel(model)
     @cube.compile(model, dataloader, PAS=PAS, override=True)
     def train_iter(model, dataloader):
         input_ids, position_ids = next(dataloader)

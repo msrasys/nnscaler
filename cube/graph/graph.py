@@ -7,7 +7,7 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Sequence, Set, Union, Tuple, List, Optional, Dict, Any
+from typing import Sequence, Set, Union, Tuple, List, Optional, Dict, Any, Callable
 import warnings
 import copy
 
@@ -153,7 +153,7 @@ class IRGraph(IRSegment):
         loss.parent.to_loss()
 
         # infer gradient
-        for ftensor in self._ftensors:
+        for ftensor in self.full_tensors():
             self.infer_grad(ftensor)
         # create backward node
         for fnode in self.nodes()[::-1]:
@@ -216,7 +216,8 @@ class IRGraph(IRSegment):
 
         # reset fsegment gradient
         for itensor in fsegment.inputs():
-            fgraph.infer_grad(itensor.parent)
+            if isinstance(itensor, IRTensor):
+                fgraph.infer_grad(itensor.parent)
 
         # update backward
         if len(bnodes) > 0:
@@ -233,29 +234,23 @@ class IRGraph(IRSegment):
 
     @staticmethod
     def from_logic_graph(nodes: List[IRCell],
-                         inputs: List[IRObject], outputs: List[IRObject],
+                         inputs: List[Any], outputs: List[Any],
                          module_name: str):
         """
         Generate IRGraph from logical graph (IRFullTensor)
 
         @param nodes: nodes of the graph
-        @param inputs List[IRFullTensor]: graph inputs
-        @param outputs List[IRFullTensor]: graph outputs
+        @param inputs List[Any]: graph inputs
+        @param outputs List[Any]: graph outputs
         @param module_name str: graph name
 
         @return graph IRGraph
         """
-        # instantiate graph inputs / outputs
-        for idx, tensor in enumerate(inputs):
-            if isinstance(tensor, IRFullTensor):
-                tensor = tensor.tosub()
-            inputs[idx] = tensor
-        for idx, tensor in enumerate(outputs):
-            if isinstance(tensor, IRFullTensor):
-                tensor = tensor.tosub()
-            outputs[idx] = tensor
-
-        # instantiate to subtensor
+        modifier = lambda t: t.tosub() if isinstance(t, IRFullTensor) else t
+        # input / output
+        inputs = [IRGraph.modify_objects_of_complex(t, modifier) for t in inputs]
+        outputs = [IRGraph.modify_objects_of_complex(t, modifier) for t in outputs]
+        # nodes
         for node in nodes:
             for idx, ftensor in enumerate(node.inputs()):
                 if isinstance(ftensor, IRObject):

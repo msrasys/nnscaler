@@ -44,7 +44,7 @@ else:
 
 def train():
 
-    batch_size = 1
+    batch_size = 4
     load_content: bool = False
 
     cfg = Config()
@@ -80,7 +80,7 @@ def train():
     print_each_rank(f'model parameter: {nparams}')
 
     CudaTimer(enable=False).warmup()
-    iter_num, warmup = 10, 2
+    iter_num, warmup = 5, 2
     for step in range(iter_num):
 
         if step >= warmup:

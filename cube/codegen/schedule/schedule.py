@@ -65,7 +65,7 @@ class ScheduleCodeGen(FuncEmission):
                         fb.insert_body(ScheduleCodeGen.emit_release(tensors))
 
             # return code
-            outputs = ScheduleCodeGen.return_name(self.execplan.graph.outputs())
+            outputs = ScheduleCodeGen.return_name_complex(self.execplan.graph.outputs())
             code = f'return {outputs}'
             fb.insert_body(code)
         gencode += fb.code

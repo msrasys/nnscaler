@@ -9,38 +9,36 @@ from cube.ir.operator import IRFwOperation, IRDataOperation
 from cube.graph.function.dimops import IRDimops
 
 
+def _param(size, dtype=torch.float32):
+    return torch.nn.Parameter(torch.empty(size, dtype=dtype))
+
+
 class TestOpModule(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.param1 = torch.nn.Parameter(torch.empty([512, 256], dtype=torch.float32))
-        self.param2 = torch.nn.Parameter(torch.empty([512, 256], dtype=torch.float32))
+        self.param1 = _param([512, 256])
+        self.param2 = _param([512, 256])
         self.ints = [1, 2, 3]
 
     def forward(self, x: torch.Tensor):
-        # matmul: [256, 512], [512, 256] -> [256, 256]
+        # matmul: [bs, 512], [512, 256] -> [bs, 256]
         x1 = torch.matmul(x, self.param1)
-        x1 = torch.matmul(x, self.param1)
+        # [bs, 256] -> [bs, 256]
         x1 = x1 + x1.size(0) + x1.size()[0]
-        x2 = torch.chunk(x, 2, dim=1)
-        x3 = x2[0]
-        x = x + x.size(0)
-        x = x + self.ints[0]
-        return {'x': x}, [x3,]
+        # [bs, 256] -> [bs, 128], [bs, 128]
+        x2 = torch.chunk(x1, 2, dim=1)[0]
+        # [bs, 128] -> [bs, 128]
+        x3 = x2 + x2.size(0)
+        x4 = x3 + self.ints[0]
+        # [bs, 128] -> [1]
+        loss = torch.sum(x4)
+        return {'x': x4, 'loss': loss} # , [x3,]
 
 
 class TestDataLoader(cube.runtime.syndata.CubeDataLoader):
 
     def __init__(self, batch_size: int = 256) -> None:
-        # self.sample = (
-        #     torch.rand(
-        #         [batch_size, 512],
-        #         dtype=torch.float32,
-        #         device=torch.cuda.current_device()
-        #     ),
-        #     [torch.tensor([1], dtype=torch.float32),]
-        # )
-        # super().__init__(batch_size, (0, None))
         self.sample = torch.rand(
             [batch_size, 512],
             dtype=torch.float32,
@@ -84,7 +82,8 @@ def test_parse_ops():
     def eval_iter(model, dataloader):
         data = next(dataloader)
         out = model(data)
-        return out
+        out['loss'].backward()
+        # return out
 
     model = model.get_gen_module()
 
