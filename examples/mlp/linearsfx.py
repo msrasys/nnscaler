@@ -123,19 +123,7 @@ def train():
     )
 
     model = MLP(dim=dim)
-
-    # shape based input (will trigger standard torch.fx.Tracer)
-    # model = cube.SemanticModel(
-    #     model, input_shapes=([batch_size, dim, dim], [batch_size, dim, dim]),
-    # )
-
-    # dummy based input (will trigger concrete Tracer)
-    device = next(model.parameters()).device
-    dummy_input = next(dataloader)
-    dummy_input = tuple([input.to(device) for input in dummy_input])
-    model = cube.SemanticModel(
-        model, dummy_input=dummy_input,
-    )
+    model = cube.SemanticModel(model)
 
     @cube.compile(model, dataloader, PAS=PAS, load_content=False)
     def train_iter(model, dataloader):

@@ -59,20 +59,35 @@ class MLP(nn.Module):
         return loss
 
 
+class MLPDataLoader(cube.runtime.syndata.CubeDataLoader):
+
+    def __init__(self, bs: int, dim: int):
+        super().__init__(bs, [0])
+        self.sample = None
+        self.dim = dim
+        self.set_batch_size(bs)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.sample
+    
+    def set_batch_size(self, batch_size: int):
+        self.batch_size = batch_size
+        self.sample = torch.rand(
+            [batch_size, self.dim], dtype=torch.float32,
+            device=torch.cuda.current_device()
+        )
+
+
 def infer():
     batch_size = 128
     dim = 4096
 
     model = MLP(dim=dim)
-    model = cube.SemanticModel(
-        model, input_shapes=([batch_size, dim],),
-    )
-
-    dataloader = cube.runtime.syndata.SynDataLoader(
-        shapes=([batch_size, dim],),
-        dtypes=(torch.float32,),
-        batch_dims=(0,)
-    )
+    model = cube.SemanticModel(model)
+    dataloader = MLPDataLoader(batch_size, dim)
 
     @cube.compile(model, dataloader, PAS=PAS)
     def infer_iter(model, dataloader):

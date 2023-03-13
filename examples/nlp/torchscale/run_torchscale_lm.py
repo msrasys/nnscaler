@@ -162,6 +162,9 @@ module_name = model.__class__.__name__
 cube_graph = IRGraph.from_logic_graph(nodes, inputs, outputs, module_name)
 print("generating cube ir graph done.")
 
+# move simple type inputs to kwargs
+# for node in cube_graph.nodes
+
 # AutoDist
 # # profile communication cost
 # import os

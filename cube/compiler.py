@@ -74,6 +74,8 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
         raise TypeError("Expect dataloader derived from CubeDataLoader")
 
     model.save_content = load_content
+    if model.dummy_input is None:
+        model.dummy_input = next(dataloader)
     ir_dataloader = SemanticDataLoader(dataloader)
 
     myrank = DeviceGroup().rank
@@ -104,7 +106,6 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
         if DeviceGroup().local_rank == 0:
 
             compile_start = time.time()
-
             resource = cube.runtime.resource.EnvResource()
 
             # run once to get model structure and tensor shape
@@ -222,8 +223,10 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
+        model.dummy_input = None
         # set dataloder batch size (serialize output)
         bs = model.get_gen_module().get_batch_size()
+        print_each_rank(f'> setting batch size to: {bs}')
         if torch.distributed.is_initialized():
             for rank in range(torch.distributed.get_world_size()):
                 if rank == torch.distributed.get_rank():

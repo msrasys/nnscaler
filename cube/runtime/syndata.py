@@ -33,7 +33,7 @@ class CubeDataLoader:
         raise NotImplementedError("Required implementation for derived class")
 
     def __next__(self):
-        return NotImplementedError("Required implementation for derived class")
+        raise NotImplementedError("Required implementation for derived class")
 
     def get_batch_size(self) -> int:
         """
@@ -45,7 +45,7 @@ class CubeDataLoader:
         """
         set batch size
         """
-        return NotImplementedError("Required implementation for derived class")
+        raise NotImplementedError("Required implementation for derived class")
     
     def get_batch_dims(self) -> Tuple[Optional[int]]:
         return tuple(self.batch_dims)

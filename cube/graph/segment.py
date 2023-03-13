@@ -1,10 +1,10 @@
 from contextlib import contextmanager
-from typing import Dict, Union, List, Optional, Set, Tuple
+from typing import Dict, Union, List, Optional, Set, Tuple, Any, Callable
 import numpy as np
 
 from cube.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 from cube.ir.cten import IRTensor, IRCell, IRObject
-from cube.ir.operator import IRDataOperation, IRFwOperation, IRBpOperation
+from cube.ir.operator import IRFwOperation, IRBpOperation
 from cube.ir.adapter import IRAdapter
 
 from cube.graph.function.function import MultiRef
@@ -69,6 +69,8 @@ class CellPosition:
 class IRSegment(IRCell):
     """
     A distributed sub-graph representing a piece of workload in parent IRGraph
+
+    Input/output can be complex data type of Dict, List, Tuple on IRObjects
 
     Once the segment is generated, its input and output will be fixed.
     Inserting and removing nodes that could change input/output are not allowed.
@@ -301,6 +303,8 @@ class IRSegment(IRCell):
             f"{self.debug_tensor_map_str(ftensor)}"
         )
         for ptensor, producer in zip(self.ptensors(ftensor), self.producers(ftensor)):
+            # filter out non-autograd operators of IRPyFunc
+            if isinstance(producer, IRPyFunc): continue
             idx = producer.outputs().index(ptensor)
             if fgrad is None:
                 grad = None
@@ -315,8 +319,16 @@ class IRSegment(IRCell):
                 f"{self.debug_tensor_map_str(ftensor)}"
             )
         curr_valmap = ValueMap((0, 1))
-        nconsumers = len(self.consumers(ftensor))
-        for cidx, (ctensor, consumer) in enumerate(zip(self.ctensors(ftensor), self.consumers(ftensor))):
+
+        # filter out non-autograd operators of IRPyFunc
+        consumers, ctensors = [], []
+        for ctensor, consumer in zip(self.ctensors(ftensor), self.consumers(ftensor)):
+            if isinstance(consumer, IRPyFunc): continue
+            consumers.append(consumer)
+            ctensors.append(ctensor)
+
+        nconsumers = len(consumers)
+        for cidx, (ctensor, consumer) in enumerate(zip(ctensors, consumers)):
             idx = consumer.inputs().index(ctensor)
             if fgrad is None:
                 grad = None
@@ -878,6 +890,9 @@ class IRSegment(IRCell):
         @return segment IRSegment: the grouped segment. 
         """
         segment = self
+        segment_inputs = IRSegment.get_objects_from_complex(segment.inputs())
+        segment_outputs = IRSegment.get_objects_from_complex(segment.outputs())
+
         # segments: List[IRSegment] = [self.segment(node) for node in nodes]
         # assert len(set(segments)) == 1, "Cross segment hierarchy grouping is not allowed"
         # segment = segments[0]
@@ -930,7 +945,7 @@ class IRSegment(IRCell):
                     if len(node.device) > 0 and set(itensor.device).issubset(adapter_ous[itensor]):
                         continue
                 # from segment inputs
-                if any(t.overlap(itensor) for t in segment.inputs() if isinstance(t, IRObject)):
+                if any(t.overlap(itensor) for t in segment_inputs if isinstance(t, IRObject)):
                     inputs.add(itensor)
                     continue
                 # from outside producers
@@ -952,7 +967,7 @@ class IRSegment(IRCell):
                     if len(node.device) > 0 and set(otensor.device).issubset(adapter_ins[otensor]):
                         continue
                 # from segment outputs
-                if any(t.overlap(otensor) for t in segment.outputs() if isinstance(t, IRObject)):
+                if any(t.overlap(otensor) for t in segment_outputs if isinstance(t, IRObject)):
                     outputs.add(otensor)
                     continue
                 # loss doesn't have consumers
@@ -1048,3 +1063,47 @@ class IRSegment(IRCell):
         # outputs
         dscp += f"\nOutputs: {self.outputs()}\n{'=' * len(self.name)}\n"
         return dscp
+
+    @staticmethod
+    def get_objects_from_complex(val: Any, _objects: List[IRObject] = None) -> List[IRObject]:
+        """
+        Get objects from val of complex data type
+        Support complex of types: List, Tuple, Dict, torch.Tensor, object
+        
+        @param val Any
+
+        @return _objects List[IRObject]: all IRObject
+        """
+        _objects = [] if _objects is None else _objects
+        if isinstance(val, (tuple, list)):
+            for item in val:
+                IRSegment.get_objects_from_complex(item, _objects)
+        if isinstance(val, dict):
+            for key, value in val.items():
+                IRSegment.get_objects_from_complex(key, _objects)
+                IRSegment.get_objects_from_complex(value, _objects)
+        if isinstance(val, IRObject):
+            _objects.append(val)
+        return _objects
+
+    @staticmethod
+    def modify_objects_of_complex(val: Any, modifier: Callable) -> Any:
+        """
+        Get objects from val of complex data type
+        Support complex of types: List, Tuple, Dict, torch.Tensor, object
+        
+        @param val Any
+        @param modifier Callable: modify IRObject to another one
+
+        @return new_val List[IRObject]: all IRObject
+        """
+        rcall = IRSegment.modify_objects_of_complex
+        if isinstance(val, tuple):
+            return tuple(rcall(item, modifier) for item in val)
+        if isinstance(val, list):
+            return list(rcall(item, modifier) for item in val)
+        if isinstance(val, dict):
+            return {rcall(key, modifier):rcall(value, modifier) for key, value in val.items()}
+        if isinstance(val, IRObject):
+            return modifier(val)
+        return val
