@@ -17,53 +17,18 @@ from fairseq.data import iterators
 
 import sys
 
-import os
-print(f'os.getcwd() = {os.getcwd()}')
-
-
 # https://github.com/microsoft/torchscale/tree/main/examples/fairseq
-# sys.path.append('/home/v-junliang/torchscaletest/torchscale/examples/fairseq')
-# sys.path.append('./torchscaletest/torchscale/examples/fairseq')
-sys.path.append('/home/quzha/MagicCube/examples/nlp/torchscale/torchscaletest/torchscale/examples/fairseq')
-sys.path.append('/home/quzha/MagicCube/examples/nlp/torchscale/torchscaletest/torchscale')
+# sys.path.append('/home/quzha/quzha/MagicCube/examples/nlp/torchscale/torchscaletest/torchscale/examples/fairseq')
+# sys.path.append('/home/quzha/quzha/MagicCube/examples/nlp/torchscale/torchscaletest/torchscale')
+sys.path.append('/home/quzha/quzha/torchscale/examples/fairseq')
 print(f'sys.path = {sys.path}')
 import models
 
-#:torchscaletest/torchscale
 import cube
-from cube.profiler import CudaTimer
-from cube.profiler.timer import print_each_rank
-sys.path.append('.')
-from policy import mpmd, spmd
-# import examples.nlp.torchscale.policy.spmd as spmd
 
-# import argparse
-
-# parser = argparse.ArgumentParser(description='comm primitive')
-# parser.add_argument('--policy', type=str, help='PAS policy choice, starting with "PAS"')
-# parser.add_argument('--local_rank', type=int, default=0)
-# args = parser.parse_args()
-
-# build model
+# # build model
 parser = options.get_training_parser()
-parser.add_argument('--policy', type=str, help='PAS policy choice, starting with "PAS"')
-# parser.add_argument('--local_rank', type=int, default=0)
-
 args = options.parse_args_and_arch(parser)
-
-cube.init()
-# set up policy
-PAS = None
-policies = list(spmd.__dict__.keys()) + list(mpmd.__dict__.keys())
-if args.policy in spmd.__dict__:
-    PAS = spmd.__dict__[args.policy]
-    print_each_rank(f'using policy from spmd.{args.policy}')
-elif args.policy in mpmd.__dict__:
-    PAS = mpmd.__dict__[args.policy]
-    print_each_rank(f'using policy from mpmd.{args.policy}')
-else:
-    raise ValueError(f"policy {args.policy} not found. Candidates: {policies}")
-
 cfg = convert_namespace_to_omegaconf(args)
 task = tasks.setup_task(cfg.task)
 model = task.build_model(cfg.model)
@@ -71,8 +36,7 @@ model.eval()
 print("building model succeed: ", type(model))
 
 # create dummy input
-with open('/home/quzha/MagicCube/examples/nlp/torchscale/input_lm', 'rb') as f:
-# with open('examples/nlp/torchscale/lm_input_v2.pkl', 'rb') as f:
+with open('/home/quzha/quzha/MagicCube/examples/nlp/torchscale/input_lm', 'rb') as f:
     dummy_input = pickle.load(f)
 device = next(model.parameters()).device
 print(f'device = {device}')
@@ -101,13 +65,23 @@ print(f'input_shapes = {input_shapes}')
 print(f'input_dtypes = {input_dtypes}')
 
 dataloader = cube.runtime.syndata.SynDataLoader(
+    # names=('src_tokens',),
     shapes=(input_shapes),
     dtypes=input_dtypes,
-    batch_dims=(0,0),
+    batch_dims=(0, 0),
 )
+
 sample_input = next(dataloader)
 print(f'next(dataloader) = {sample_input}')
-sample_input_cpu = tuple([val.to(device) if isinstance(val, torch.Tensor) else val for val in sample_input])
+if isinstance(sample_input, tuple):
+    sample_input_cpu = tuple([val.to(device) if isinstance(val, torch.Tensor) else val for val in sample_input])
+elif isinstance(sample_input, dict):
+    sample_input_cpu = sample_input
+    for key in sample_input_cpu.keys():
+        sample_input_cpu[key] = sample_input_cpu[key].to(device)
+else:
+    raise RuntimeError(f'To fix sample_input with type{type(sample_input)}')
+
 
 # model = cube.SemanticModel(
 #      #TODO fix me model, dummy_input=sample_input_cpu,
@@ -205,6 +179,7 @@ config.autodist_config = dotdict({'ngpus': 2})
 # NOTE add SINGLE_DEV_MODE=1 before the running command
 from autodist.cost_model.cost_database import CostDatabase
 cost_database = CostDatabase(cube_graph, config)
+
 # find the best partition plan
 from autodist.task_config import TaskConfig
 class TorchscaleTaskConfig(TaskConfig):
@@ -220,112 +195,14 @@ class TorchscaleTaskConfig(TaskConfig):
             self.task_name)
         self.allow_recom_ops = []
         self.del_dim = []
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='Torchscale benchmark')
-    parser.add_argument('--fp16',
-                        action='store_true',
-                        help='use fp16 for the training')
-    parser.add_argument('--fine_grained_GPT',
-                        action='store_true',
-                        help='model = GPTFineGrained')
-    parser.add_argument('--GPT_setting',
-                        type=str,
-                        default='6.7B',
-                        help='set GPT model type')
-    parser.add_argument('--save_folder',
-                        type=str,
-                        default='exp_data',
-                        help='set the save folder for experiment data')
-    parser.add_argument('--micro_batch_size',
-                        type=int,
-                        default=8,
-                        help='set micro batch size')
-    parser.add_argument('--global_batch_size',
-                        type=int,
-                        default=8,
-                        help='set the global batch size')
-    parser.add_argument('--iter_num',
-                        type=int,
-                        default=2,
-                        help='set the number of all iterations')
-    parser.add_argument('--warm_num',
-                        type=int,
-                        default=1,
-                        help='set the number of warmup iterations')
-    parser.add_argument('--recompute',
-                        action='store_true',
-                        help='set recompute flag')
-    parser.add_argument('--memory_constraint',
-                        type=float,
-                        default=32,
-                        help='memory constraint for program')
-    parser.add_argument('--memory_granularity',
-                        type=int,
-                        default=1,
-                        help='memory granularity in byte')
-    parser.add_argument('--profile_dir',
-                        type=str,
-                        default=str(Path.home()) + '/.autodist',
-                        help='profile dir')
-    parser.add_argument('--connect_type',
-                        type=str,
-                        default='NV2',
-                        help='connect type from nvidia-smi topo -m')
-    parser.add_argument('--use_prev_plan',
-                        action='store_true',
-                        help='run from previous plan')
-    parser.add_argument('--is_train',
-                        action='store_true',
-                        help='True: train, False: inference')
-    parser.add_argument('--topk',
-                        type=int,
-                        default=20,
-                        help='generate multiple plans for robustness')
-    parser.add_argument('--mesh_row', type=int, default=1, help='node num')
-    parser.add_argument('--mesh_col',
-                        type=int,
-                        default=2,
-                        help='dev num in a node')
-    parser.add_argument('--compile',
-                        action='store_true',
-                        help='compile stage: true, runtime stage: false')
-    parser.add_argument('--pipeline',
-                        action='store_true',
-                        help='pipeline: true, tensor parallel: false')
-    parser.add_argument('--nproc',
-                        type=int,
-                        default=12,
-                        help='multiprocess deg in pipeline')
-    parser.add_argument('--adaptive_recom',
-                        action='store_true',
-                        help='allow adaptive recompute')
-    parser.add_argument('--plan_idx',
-                        type=int,
-                        default=0,
-                        help='runtime plan idx')
-    parser.add_argument('--verbose', action='store_true', help='verbose mode')
-    parser.add_argument('--ignore_small_tensor_threshold',
-                        type=int,
-                        default=0,
-                        help='set the tensor size threshold to ignore')
-    parser.add_argument('--parse_plan',
-                        action='store_true',
-                        help='parse plan to user-friendly format')
-    parser.add_argument('--alphafold',
-                        action='store_true',
-                        help='use alphafold2')
-    parser.add_argument('--alphafold_setting',
-                        type=int,
-                        default=1,
-                        help='1: bs, s, r = 1, 128, 256'\
-                             '2: bs, s, r = 1, 512, 256'\
-                             '3: bs, s, r = 1, 512, 384')
-    args = parser.parse_args()
 
-    # if args.compile:
-    #     assert args.ignore_small_tensor_threshold >= 64, 'suggest ignore_small_tensor_threshold >= 64'
+kwargs = {'save_folder': 'exp_data', 'micro_batch_size': 8, 'global_batch_size': 8, 'iter_num': 2,
+          'warm_num': 1, 'recompute': False, 'memory_constraint': 32, 'memory_granularity': 1,
+          'profile_dir': str(Path.home())+'/.autodist/', 'connect_type': 'NV2', 'use_prev_plan': False,
+          'is_train': True, 'topk': 20, 'mesh_row': 1, 'mesh_col': 2, 'compile': True, 'pipeline': False,
+          'nproc': 12, 'adaptive_recom': False, 'plan_idx': 0, 'verbose': True, 'ignore_small_tensor_threshold': 0,
+          'parse_plan': True}
 
-    task_config = TorchscaleTaskConfig(**vars(args))
-    from autodist.apis import calc_parallel_plan
-    topk_plans = calc_parallel_plan(cube_graph, cost_database, task_config)
+task_config = TorchscaleTaskConfig(**kwargs)
+from autodist.apis import calc_parallel_plan
+topk_plans = calc_parallel_plan(cube_graph, cost_database, task_config)

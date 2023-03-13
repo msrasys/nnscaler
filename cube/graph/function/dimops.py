@@ -658,9 +658,9 @@ class IRDimops(IRFwOperation):
                 shape.append(accum)
             otensor.shape = shape
             # set output shape
-            if isinstance(otensor, IRSubTensor):
-                otensor.parent.dtype = odtype
-            otensor.dtype = odtype
+            # if isinstance(otensor, IRSubTensor):
+            #     otensor.parent.dtype = odtype
+            # otensor.dtype = odtype
         # print(f'=> sign: {self.signature} anno: {self.anno}\n'
         #       f'=> inputs: {self.inputs()}\n'
         #       f'=> outputs: {self.outputs()}')
