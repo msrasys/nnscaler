@@ -90,7 +90,6 @@ class FxModuleParser:
                 print(f'WARNING input_shapes shrinked to {input_shapes})')
         
         default_dtype = torch.get_default_dtype()
-        kDefaultType = DType2IRDType.map(default_dtype) # TODO specify dtype
         if input_shapes is not None:
             # shape propagation
             sample_inputs = dummy_inputs if dummy_inputs else [torch.ones(shape, dtype=default_dtype) for shape in input_shapes]
@@ -105,7 +104,7 @@ class FxModuleParser:
             for idx, input in enumerate(inputs):
                 assert isinstance(input, torch.fx.Node)
                 shape = None if (input_shapes is None or len(input_shapes) <= idx) else input_shapes[idx]
-                dtype = kDefaultType
+                dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
                 val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
                 frame.add_var(input.name, val, graph_arg=idx)
         else:
@@ -137,7 +136,7 @@ class FxModuleParser:
                         # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
                         print(f'dummy_inputs does not have {input.name}')
                         shape = None
-                dtype = kDefaultType
+                dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
                 val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
                 frame.add_var(input.name, val, graph_arg=idx)
         input_val = [frame.get_var(input.name) for input in inputs]
@@ -321,11 +320,9 @@ class FxModuleParser:
         tensor_name = node.name
         if 'tensor_meta' in node.meta:
             tensor_shape = node.meta['tensor_meta'].shape
-            # tensor_dtype = node.meta['tensor_meta'].dtype
             #TODO assume it is weight
-            default_dtype = torch.get_default_dtype()
-            kDefaultType = DType2IRDType.map(default_dtype)  # TODO specify dtype
-            ir_tensor = IRFullTensor(tensor_shape, tensor_name, requires_grad=True, dtype=kDefaultType)
+            dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
+            ir_tensor = IRFullTensor(tensor_shape, tensor_name, requires_grad=True, dtype=dtype)
             ir_tensor.as_param()
             frame.add_var(tensor_name, ir_tensor)
         else:
