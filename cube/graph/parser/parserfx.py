@@ -272,6 +272,10 @@ class FxModuleParser:
         input_vals = [get_complex_data(val) for val in node.args]
         kwargs = {key: get_complex_data(val) for key, val in node.kwargs.items()}
 
+        if 'int' in fsig:
+            print(fsig)
+            exit(1)
+
         # map to IR operator
         if SignFx2Op.exist(fsig):
             print(input_vals)

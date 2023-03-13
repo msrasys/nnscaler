@@ -425,7 +425,7 @@ def Sub(input, other, alpha=1, *, out=None, signature = None):
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-    return IRDimops(CubeSub, 'sub', signature, annos, [input, other], alpha=alpha)
+    return IRDimops(Sub, 'sub', signature, annos, [input, other], alpha=alpha)
 
 
 def Mul(input, other, *, out=None, signature = None):
@@ -562,6 +562,15 @@ def Long(input, memory_format=None, signature = None):
     assert memory_format is None
     annos = ['* -> *']
     return IRDimops(Long, 'long', signature, annos, [input])
+
+
+def Int(input, memory_format=None, signature = None):
+    """
+    Tensor.int(memory_format=torch.preserve_format) → Tensor
+    """
+    assert memory_format is None
+    annos = ['* -> *']
+    return IRDimops(Int, 'int', signature, annos, [input])
 
 
 def Fill(input, value, signature = None):
