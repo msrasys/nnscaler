@@ -205,17 +205,12 @@ class Sign2EmitRule:
 
 
     _signMap = {
-        'torch.cat': _common_rule_input_as_list,
-        'torch.stack': _common_rule_input_as_list,
-
         'torch.slice': emit_slice,
         'torch.zeros': emit_zeros,
         'torch.ones': emit_ones,
         'torch.Tensor.to': emit_to,
         'torch.rand': emit_rand,
         'torch.tensor': emit_new_tensor,
-        'torch.index_select': emit_index_select,
-        'torch.functional.einsum': emit_einsum,
 
         'setattr': emit_setattr,
     }

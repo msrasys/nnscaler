@@ -80,6 +80,8 @@ class SignFx2Op:
         __ttemplate('ne') : function.CompareNE,
         __ttemplate('nan_to_num') : function.NanToNum,
         __tttemplate('long'): function.Long,
+        __tttemplate('int'): function.Int,
+        __tttemplate('float'): function.Float,
         __ttemplate('fill_'): function.Fill,
         __ttemplate('masked_fill'): function.MaskedFill,
         __ttemplate('cumsum'): function.CumSum,
@@ -146,10 +148,12 @@ class SignFx2Op:
         #
         __ttemplate('add') : function.Add,
         '_operator.add': function.Add,
-        # __ttemplate('sub') : function.Sub,
+        '_operator.iadd': function.Add, # FIXME: may waste memory
+        __ttemplate('sub') : function.Sub,
         '_operator.sub': function.Sub,
-        # __ttemplate('mul') : function.Mul,
+        __ttemplate('mul') : function.Mul,
         '_operator.mul': function.Mul,
+        '_operator.imul': function.Mul, # FIXME: may waste memory
         
         __ttemplate('div') : function.Div,
         __ttemplate('true_divide'): function.Div,
@@ -166,9 +170,9 @@ class SignFx2Op:
         __ttemplate('ge'): function.CompareGE,
         __ttemplate('le'): function.CompareLE,
         #
-        # __ttemplate('sin'): function.Sin,
+        __ttemplate('sin'): function.Sin,
         #
-        # __ttemplate('cos'): function.Cos,
+        __ttemplate('cos'): function.Cos,
         #
         # __ttemplate('sum') : function.Sum,
         # __ttemplate('mean') : function.Mean,

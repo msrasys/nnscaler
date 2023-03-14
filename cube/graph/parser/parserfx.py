@@ -90,7 +90,6 @@ class FxModuleParser:
                 print(f'WARNING input_shapes shrinked to {input_shapes})')
         
         default_dtype = torch.get_default_dtype()
-        kDefaultType = DType2IRDType.map(default_dtype) # TODO specify dtype
         if input_shapes is not None:
             # shape propagation
             sample_inputs = dummy_inputs if dummy_inputs else [torch.ones(shape, dtype=default_dtype) for shape in input_shapes]
@@ -105,30 +104,36 @@ class FxModuleParser:
             for idx, input in enumerate(inputs):
                 assert isinstance(input, torch.fx.Node)
                 shape = None if (input_shapes is None or len(input_shapes) <= idx) else input_shapes[idx]
-                dtype = kDefaultType
+                dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
                 val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
                 frame.add_var(input.name, val, graph_arg=idx)
         else:
             assert dummy_inputs is not None, 'input_shapes and dummy_inputs cannot be None at the same time.'
             # remove dead nodes
-            from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
+            from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
             DCEHandler(module).eliminate_dead_code()
             # shape propagation
-            from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp
-            KwargsShapeProp(module).propagate(dummy_inputs)
+            from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
+            ShapeProp(module).propagate(dummy_inputs)
             # handle graph inputs
             for idx, input in enumerate(inputs):
                 assert isinstance(input, torch.fx.Node)
-                # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding,
-                # extend to other input types
-                if hasattr(dummy_inputs, input.name):
-                    print(f'dummy_inputs has {input.name}')
-                    shape = getattr(dummy_inputs, input.name).size()
+                if isinstance(dummy_inputs, dict):
+                    if input.name in dummy_inputs:
+                        shape = input.meta['tensor_meta'].shape
+                    else:
+                        shape = None
                 else:
-                    # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
-                    print(f'dummy_inputs does not have {input.name}')
-                    shape = None
-                dtype = kDefaultType
+                    # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding,
+                    # extend to other input types
+                    if hasattr(dummy_inputs, input.name):
+                        print(f'dummy_inputs has {input.name}')
+                        shape = getattr(dummy_inputs, input.name).size()
+                    else:
+                        # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
+                        print(f'dummy_inputs does not have {input.name}')
+                        shape = None
+                dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
                 val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
                 frame.add_var(input.name, val, graph_arg=idx)
         input_val = [frame.get_var(input.name) for input in inputs]
@@ -157,7 +162,8 @@ class FxModuleParser:
                 shape = node.meta['tensor_meta'].shape
                 shape = FxModuleParser.shape_refine(shape)
                 dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
-                val = IRFullTensor(shape=shape, requires_grad=True, dtype=dtype, name=node.name)
+                requires_grad = node.meta['tensor_meta'].requires_grad
+                val = IRFullTensor(shape=shape, requires_grad=requires_grad, dtype=dtype, name=node.name)
                 frame.add_var(node.name, val)
             else:
                 frame.add_var(node.name, IRObject())
@@ -265,7 +271,6 @@ class FxModuleParser:
 
         # map to IR operator
         if SignFx2Op.exist(fsig):
-            print(input_vals)
             ir_node = SignFx2Op.map(fsig)(*input_vals, **kwargs)
         else:
             # FIXME: handle cases for IRObject in kwargs
@@ -311,11 +316,9 @@ class FxModuleParser:
         tensor_name = node.name
         if 'tensor_meta' in node.meta:
             tensor_shape = node.meta['tensor_meta'].shape
-            # tensor_dtype = node.meta['tensor_meta'].dtype
             #TODO assume it is weight
-            default_dtype = torch.get_default_dtype()
-            kDefaultType = DType2IRDType.map(default_dtype)  # TODO specify dtype
-            ir_tensor = IRFullTensor(tensor_shape, tensor_name, requires_grad=True, dtype=kDefaultType)
+            dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
+            ir_tensor = IRFullTensor(tensor_shape, tensor_name, requires_grad=True, dtype=dtype)
             ir_tensor.as_param()
             frame.add_var(tensor_name, ir_tensor)
         else:
