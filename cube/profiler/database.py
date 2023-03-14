@@ -378,9 +378,9 @@ class ProfileDataBase:
                 dtypes.append(IRDType2TorchDType.map(t.dtype))
             elif isinstance(t, IRObject):
                 raise RuntimeError('IRObject has not been supported in _serialize')
-            else:
-                shapes.append(None)
-                dtypes.append(type(t))
+            # else:
+            #     shapes.append(None)
+            #     dtypes.append(type(t))
         shapes = '-'.join(str(tuple(shape)) if shape is not None else str(None) for shape in shapes)
         dtypes = '-'.join(str(dtype) for dtype in dtypes)
         return shapes + ' : ' + dtypes
