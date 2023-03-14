@@ -74,6 +74,3 @@ class DistAlgorithmFactory:
         
         import cube.algorithm.ops.creators as creators
         self.register(creators.IRToTensor, creators.DimSplitTo, tag='dim')
-        self.register(creators.IRZeros, creators.DimSplitZeros, tag='dim')
-        self.register(creators.IROnes, creators.DimSplitOnes, tag='dim')
-        self.register(creators.IRRand, creators.DimSplitRand, tag='dim')

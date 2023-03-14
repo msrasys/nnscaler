@@ -102,20 +102,18 @@ class IRGraph(IRSegment):
         
         # dtype inference
         for node in self._nodes:
-            itensors = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
-            # setup gradient
+            # reset input
+            itensors: List[IRTensor] = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
             for itensor in itensors:
-                if itensor.parent.grad is not None:
-                    itensor.parent.dtype = itensor.dtype
+                itensor.parent.dtype = itensor.dtype
+            # infer output dtype with default dtype promotion rules
             if len(itensors) == 0: continue
-            odtype = DTypeInferRule.infer(node, [t.dtype for t in itensors])
-            assert odtype != IRDType.unknown, f"{node} : {[t.dtype for t in itensors]}"
+            default_dtype = DTypeInferRule.infer(node, [t.dtype for t in itensors])
+            # set output tensors if it has unkown tensor dtype
             otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
-            for tensor in otensors:
-                tensor.dtype = odtype
-                # setup graidient
-                if tensor.parent.grad is not None:
-                    tensor.parent.grad.dtype = odtype
+            for otensor in otensors:
+                if otensor.dtype == IRDType.unknown:
+                    otensor.parent.dtype = default_dtype
 
         from cube.program import Program
         Program().add_nodes(self.nodes())

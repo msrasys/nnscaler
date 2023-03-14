@@ -52,29 +52,30 @@ class DimSplitEinops(GenericDistAlgo):
         If the partitioned number is 1, return the first hidden identitifer
         Otherwise, return the first hidden identifier whose length > 1 
 
-        @param idx int: input index
+        @param idx int: input/output index. Take the idx-th input tensor or (idx-ninputs)-th output
         @param dim int: input dimension
 
         @return identifier Optional[str]: annotated dimension identifier
         @return reduction Optional[DimAnno.ReduceType]
         """
         node: IRDimops = self.node
+        eshapes = node.anno.inputs() + node.anno.outputs()
         hidx = None
-        for hidx, adim in enumerate(node.anno.input(idx).dims[dim].identifiers):
+        for hidx, adim in enumerate(eshapes[idx].dims[dim].identifiers):
             if num == 1: break
             dimlen = node.anno.getlen(adim)
             if adim == '1^' or dimlen == 1: continue
             break
         if hidx is None: return (None, None)
-        reduce = node.anno.input(idx).dims[dim].reduces[hidx]
+        reduce = eshapes[idx].dims[dim].reduces[hidx]
         return adim, reduce
 
     def satisfy(self, idx: int, dim: Union[int, str], num: int) -> bool:
         """
         Check whether the condition satisfies.
         
-        @param idx int: input index
-        @param dim Union[int, str]: input dimension or 'v', ie., partition at value dimension
+        @param idx int: input/output index. Take the idx-th input tensor or (idx-ninputs)-th output tensor
+        @param dim Union[int, str]: tensor dimension or 'v', i.e., partition at value dimension.
         @param num int: chunks to partition the dimension
 
         @return satisfy bool: true if can be partitioned, elsewise false.
@@ -83,14 +84,14 @@ class DimSplitEinops(GenericDistAlgo):
         assert isinstance(dim, int) or dim == 'v', f"expect dim to be int or 'v'"
         node: IRDimops = self.node
         
-        assert isinstance(node.input(idx), IRSubTensor), f"partitioning on a non-tensor input"
-        ninputs = len(node.inputs())
-        idx = idx if idx >= 0 else idx + ninputs
-        assert idx < ninputs, f"index out of boundary: {idx} >= {ninputs}"
+        tensors = node.inputs() + node.outputs()
+        assert isinstance(tensors[idx], IRSubTensor), f"partition on a non-tensor input/output"
+        assert 0 <= idx and idx < len(tensors), f"index out of boundary: {idx} >= {len(tensors)}"
 
+        tensors = node.inputs() + node.outputs()
         if isinstance(dim, int):
-            dim = dim if dim >= 0 else dim + node.input(idx).ndims
-            assert dim < node.input(idx).ndims, f"dimension output of boundary: {dim} >= {node.input(idx).ndims}"
+            dim = dim if dim >= 0 else dim + tensors[idx].ndims
+            assert dim < tensors[idx].ndims, f"dimension output of boundary: {dim} >= {node.input(idx).ndims}"
         
         # try split at tensor spatial dimension
         if isinstance(dim, int):
@@ -99,7 +100,8 @@ class DimSplitEinops(GenericDistAlgo):
             dimlen = node.anno.getlen(adim)
             # first check node special rules first
             for rule in node.transform_rules:
-                if rule.input(idx) == DimopSplit.D(dim):
+                splits = rule.inputs() + rule.outputs()
+                if splits[idx] == DimopSplit.D(dim):
                     return dimlen >= num
             # then check default rules
             if reduce == DimAnno.ReduceType.Freeze:
@@ -107,7 +109,8 @@ class DimSplitEinops(GenericDistAlgo):
             return dimlen >= num
         else:
             for rule in node.transform_rules:
-                if rule.input(idx).isV():
+                splits = rule.inputs() + rule.outputs()
+                if splits[idx].isV():
                     return True
             return False
         
@@ -173,11 +176,12 @@ class DimSplitEinops(GenericDistAlgo):
         assert isinstance(dim, int) or dim == 'v', f"expect dim to be int or 'v'"
         # check node special rules first
         for r in node.transform_rules:
+            splits = r.inputs() + r.outputs()
             if isinstance(dim, int):
-                if r.input(idx) == DimopSplit.D(dim):
+                if splits[idx] == DimopSplit.D(dim):
                     return r
             else:
-                if r.input(idx).isV():
+                if splits[idx].isV():
                     return r
         # otherwise use default rule
         assert isinstance(dim, int), f"Error: expect dim to be int for default rules"

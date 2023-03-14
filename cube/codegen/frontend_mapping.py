@@ -65,96 +65,6 @@ def emit_slice(node, arg_vars:list, kw_pairs:dict) -> str:
     return f"{in_tensor_var}[{', '.join(subscript_components)}]"
 
 
-# TODO consider making the IR-Torch conversion like IRDType2TorchDType intrinsic to codegen,
-# so that we don't need to ad hoc do the conversion as in these emission functions.
-# Also, we'd better limit the complexity of the values in 'kw_pairs' so we know for sure we have
-# done all necessary conversion.
-#
-# Basically to convert internal 'IRDType' to frontend 'torch.dtype'
-def emit_zeros(node, arg_vars:list, kw_pairs:dict) -> str:
-    """
-    zeros(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
-    """
-    kw_pairs = kw_pairs.copy()
-    if 'dtype' in kw_pairs:
-        ir_dtype : IRDType = kw_pairs['dtype']
-        if ir_dtype is not None:
-            kw_pairs['dtype'] = IRDType2DType.map(ir_dtype)
-    
-    # TODO make all intermediately created tensors CUDA, to fit with other parts of the system, like SynDataLoader.
-    if 'device' in kw_pairs:
-        print(f'WARNING: overload device info. of {node}')
-    kw_pairs['device'] = 'torch.cuda.current_device()' # str will get directly dumped as it's.
-
-    if len(arg_vars) != 0:
-        print(f'WARNING: emit_zero with len(arg_vars) {len(arg_vars)} != 0')
-    
-    return _common_rule_join_all(node, arg_vars, kw_pairs)
-
-def emit_ones(node, arg_vars:list, kw_pairs:dict) -> str:
-    """
-    ones(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
-    """
-    kw_pairs = kw_pairs.copy()
-    if 'dtype' in kw_pairs:
-        ir_dtype : IRDType = kw_pairs['dtype']
-        if ir_dtype is not None:
-            kw_pairs['dtype'] = IRDType2DType.map(ir_dtype)
-    
-    # TODO make all intermediately created tensors CUDA, to fit with other parts of the system, like SynDataLoader.
-    assert 'device' not in kw_pairs
-    kw_pairs['device'] = 'torch.cuda.current_device()' # str will get directly dumped as it's.
-
-    assert len(arg_vars) == 0
-    return _common_rule_join_all(node, arg_vars, kw_pairs)
-
-def emit_rand(node, arg_vars:list, kw_pairs:dict) -> str:
-    """
-    rand(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
-    """
-    kw_pairs = kw_pairs.copy()
-    if 'dtype' in kw_pairs:
-        ir_dtype : IRDType = kw_pairs['dtype']
-        if ir_dtype is not None:
-            kw_pairs['dtype'] = IRDType2DType.map(ir_dtype)
-    
-    # TODO make all intermediately created tensors CUDA, to fit with other parts of the system, like SynDataLoader.
-    assert 'device' not in kw_pairs
-    kw_pairs['device'] = 'torch.cuda.current_device()' # str will get directly dumped as it's.
-
-    assert len(arg_vars) == 0
-    return _common_rule_join_all(node, arg_vars, kw_pairs)
-
-
-def emit_new_tensor(node, arg_vars:list, kw_pairs:dict) -> str:
-    """
-    rand(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
-    """
-    kw_pairs = kw_pairs.copy()
-    if 'dtype' in kw_pairs:
-        ir_dtype : IRDType = kw_pairs['dtype']
-        if ir_dtype is not None:
-            kw_pairs['dtype'] = IRDType2DType.map(ir_dtype)
-    
-    # TODO make all intermediately created tensors CUDA, to fit with other parts of the system, like SynDataLoader.
-    assert 'device' not in kw_pairs
-    kw_pairs['device'] = 'torch.cuda.current_device()' # str will get directly dumped as it's.
-    
-    assert len(arg_vars) == 0
-    assert 'data' in kw_pairs
-    assert 'shape' in kw_pairs
-    data_str = str(kw_pairs['data'])
-    _ = kw_pairs.pop('data')
-    _ = kw_pairs.pop('shape')
-    
-    kw_assigns = list()
-    for key, val in kw_pairs.items():
-        assert key != 'data'
-        code = f'{key}={val}'
-        kw_assigns.append(code)
-    args = data_str + ', ' + ', '.join(kw_assigns)
-    return f'{node.signature}({args})'
-
 # Basically to convert internal 'IRDType' to frontend 'torch.dtype'
 def emit_to(node, arg_vars:list, kw_pairs:dict) -> str:
     kw_pairs = kw_pairs.copy()
@@ -171,17 +81,6 @@ def emit_setattr(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
     assert arg_vars[1].startswith('self.')
     member = f'"{arg_vars[1][5:]}"'
     return f"{node.signature}({arg_vars[0]}, {member}, {arg_vars[2]})"
-
-def emit_index_select(node, arg_vars:list, kw_pairs:dict) -> str:
-    assert 'dim' in kw_pairs
-    dim = kw_pairs['dim']
-    return f'{node.signature}({arg_vars[0]}, {dim}, {arg_vars[1]})'
-
-def emit_einsum(node, arg_vars:list, kw_pairs:dict) -> str:
-    assert 'equation' in kw_pairs
-    equation = kw_pairs['equation']
-    args_str = ', '.join(arg_vars)
-    return f'{node.signature}({equation}, {args_str})'
 
 
 class Sign2EmitRule:
@@ -206,12 +105,7 @@ class Sign2EmitRule:
 
     _signMap = {
         'torch.slice': emit_slice,
-        'torch.zeros': emit_zeros,
-        'torch.ones': emit_ones,
         'torch.Tensor.to': emit_to,
-        'torch.rand': emit_rand,
-        'torch.tensor': emit_new_tensor,
-
         'setattr': emit_setattr,
     }
 
