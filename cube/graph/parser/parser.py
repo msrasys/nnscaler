@@ -746,7 +746,7 @@ class ScriptModuleParser:
         fsig: str = str(node.pyname())
 
         # map to IR operator
-        ir_node = Sign2Op.map(fsig)(inputs=input_vals)
+        ir_node = Sign2Op.map(fsig)(*input_vals)
 
         # push output in the frame
         # help: >>> a = torch._C.TupleType([torch._C.TensorType.getInferred()])
