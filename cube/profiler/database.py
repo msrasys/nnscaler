@@ -13,6 +13,7 @@ import cube
 from cube.ir.cten import IRTensor, IRObject
 from cube.ir.operator import IRFwOperation
 from cube.graph.parser.mapping import IRDType2TorchDType
+# from cube.graph.parser.mapping import Sign2Op
 from cube.graph.parser.mappingfx import SignFx2Op as Sign2Op
 
 
@@ -53,11 +54,13 @@ class CompProfiler:
         # create data
         assert dtypes is not None
         def gen_torch_tensors(shape, dtype, requires_grad):
+            """Generate dummy input tenosrs"""
             constructor = torch.zeros if dtype in (torch.int64, torch.int32, torch.bool) else torch.rand
-            # requires_grad = False if dtype in (torch.int64, torch.int32, torch.bool) else True
             return constructor(tuple(shape), dtype=dtype, device=torch.cuda.current_device(), requires_grad=requires_grad)
+
         tensors = tuple(
-            gen_torch_tensors(shape, dtype, requires_grad) if value is None else value for shape, dtype, requires_grad, value in zip(shapes, dtypes, requires_grads, values)
+            gen_torch_tensors(shape, dtype, requires_grad) if isinstance(value, IRTensor) else value \
+                for shape, dtype, requires_grad, value in zip(shapes, dtypes, requires_grads, values)
         )
         require_backward = any([t.requires_grad for t in tensors if hasattr(t, 'requires_grad')])
         # FIXME: reconsidering requires_grad
@@ -198,7 +201,7 @@ class ProfileDataBase:
                 shapes.append(t.shape)
                 dtypes.append(IRDType2TorchDType.map(t.dtype))
                 requires_grads.append(t.requires_grad)
-                values.append(None)
+                values.append(t)
             elif isinstance(t, IRObject):
                 raise RuntimeError('IRObject has not been supported in profiling.')
             else:
@@ -221,6 +224,7 @@ class ProfileDataBase:
         @return bw_span float: the backward span time in milliseconds
         @return infer_memory int: the peak memory in bytes after inference of the function
         @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
+        @return residual_mem: ??
         """
         fn, shapes, dtypes, requires_grads, values, kwargs = ProfileDataBase.get_func(node)
 
@@ -234,7 +238,7 @@ class ProfileDataBase:
         in_mem_info, param_mem_info = [], []
         residual_mem, input_count = 0, 0
         for t in node.inputs():
-            if hasattr(t, 'is_param') and t.is_param():
+            if isinstance(t, IRTensor) and t.is_param():
                 param_mem_info.append(t.byte_size())
             elif hasattr(t, 'byte_size'):
                 input_count += 1

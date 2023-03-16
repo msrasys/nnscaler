@@ -1,109 +1,55 @@
+from typing import Union, Tuple
+import sys
+import os
 
-from cube.ir.operator import IRBpOperation, IRFwOperation
-from cube.ir.tensor import IRSubTensor, ValueMap
-from cube.ir.adapter import IRAdapter
-from cube.graph import IRGraph
-from cube.ir.cten import IRCell, IRTensor
+from cube.ir.operator import IRFwOperation
+from cube.graph.segment import IRSegment
+from cube.graph.function import IRGraphAnchor
+from cube.profiler.database import ProfileDataBase
 
 
 class Estimator:
+    """
+    Estimator to measture the computation / memory cost of a subgraph
+    """
 
-    def __init__(self, graph: IRGraph):
-        """
-        Estimator for policy use
-        """
+    def __init__(self, cache='./profile_database.json'):
 
-        self.graph = graph
+        self.cache_file = cache
+        reload = cache if os.path.exists(cache) else None
+        self.database = ProfileDataBase(reload)
 
-    def comm_volume(self, device: int) -> int:
+    def __call__(self, nodes_or_segment: Union[Tuple[IRFwOperation], IRSegment], 
+                 train: bool=False):
         """
-        Estimate message recv volume of device id.
-        This has no requirement for generating adapters in graph.
+        Profile the computation cost of a subgraph
 
-        Node that is not assigned to a particular device will not
-        be considered.
+        @param nodes_or_segment Tuple[IRFwOperation] | IRSegment
+
+        @return latency float: latency in ms
+        @return memory int: memory in bytes
         """
-        volume = 0
-        for node in self.graph.nodes():
-            if isinstance(node, IRAdapter):
+        nodes = nodes_or_segment.nodes() if isinstance(nodes_or_segment, IRSegment) else nodes_or_segment
+        memory, latency = 0.0, 0.0
+        for node in nodes:
+            if node.name == 'multiref' or isinstance(node, IRGraphAnchor):
                 continue
-            if device in node.device:
-                volume += self.comm_volume_node(node)
-        return volume
+            # _, _, fw_span, bw_span, infer_mem, train_mem_info, _ = self.database.profile(node)
+            try:
+                _, _, fw_span, bw_span, infer_mem, train_mem_info, _ = self.database.profile(node)
+            except Exception as e:
+                color, default = '\033[31m', '\033[0m'
+                error_msg = f'fail to run node: {node}\nerror: {e}'
+                print(f'{color}{error_msg}{default}', file=sys.stderr)
+                fw_span, bw_span, infer_mem, train_mem_info = 0, 0, 0, [0]
 
-    def comm_volume_node(self, node: IRCell) -> int:
-        """
-        Estimate node message recv volume.
-        This has no requirement for generating adapters in graph.
+            if train:
+                memory += sum(train_mem_info)
+                latency += fw_span + bw_span
+            else:
+                memory = max(memory, infer_mem)
+                latency += fw_span
+        return latency, memory
 
-        Note for intermediate tensor communication, the estimated
-        communication volume is:
-            Volume = 0 if local produced tensor can covor all the needed region.
-                       else N#(remote produced overlapping region)
-        """
-        if node not in self.graph.nodes():
-            raise KeyError(f"node {node} not in graph")
-        if len(node.device) == 0:
-            raise RuntimeError(f"node {node} device is not assigned")
-        volume = 0
-        for input in node.inputs():
-            if isinstance(input, IRSubTensor):
-                # reducer
-                if input.is_param():
-                    if input.grad.valmap != ValueMap(0, 1):
-                        volume += input.nele() * (input.grad.valmap.chunk_num - 1)
-                # adapter
-                else:
-                    local, remote = list(), list()
-                    for ptensor in input.parent.ptensors:
-                        if ptensor.device != input.device:
-                            remote.append(ptensor)
-                        else:
-                            local.append(ptensor)
-                    # check local producer
-                    local_cover = False
-                    for ptensor in local:
-                        if input.overlap(ptensor):
-                            intersection = input.common(ptensor)
-                            if intersection == input:
-                                local_cover = True
-                                break
-                    if local_cover:
-                        continue
-                    # check remote producer
-                    remote_producer_volume = 0
-                    for ptensor in remote:
-                        if input.overlap(ptensor):
-                            intersection = input.common(ptensor)
-                            remote_producer_volume += intersection.nele()
-                    # check remote consumer
-                    # TODO: need to check if all consumers can be
-                    # merged to input
-                    remote_consumer_volume = None
-                    index = input.parent.consumers.index(node)
-                    for ctensor in input.parent.ctensors[:index]:
-                        if input.overlap(ctensor):
-                            if remote_consumer_volume is None:
-                                remote_consumer_volume = 0
-                            intersection = input.common(ctensor)
-                            remote_consumer_volume += intersection.nele()
-                        if intersection == input:
-                            break
-                    if remote_consumer_volume is None:
-                        volume += remote_producer_volume
-                    else:
-                        volume += min(remote_consumer_volume, remote_producer_volume)
-        # debug info
-        # if isinstance(node, IRFwOperation):
-        #     print(f'fw{node._id}-{node.device}-{node.name}: {volume}')
-        # elif isinstance(node, IRBpOperation):
-        #     print(f'bw{node._id}(fw{node.mirror._id}): {volume}')
-        # else:
-        #     print(f'cell{node._id}-{node.device}-{node.name}: {volume}')
-        return volume
-
-    def flops(self) -> int:
-        raise NotImplementedError
-
-    def flops_node(self, node: IRCell) -> int:
-        raise NotImplementedError
+    def save(self):
+        self.database.dump(self.cache_file, override=True)
