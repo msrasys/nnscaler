@@ -11,6 +11,7 @@ from typing import Sequence, Set, Union, Tuple, List, Optional, Dict, Any, Calla
 import warnings
 import copy
 
+import cube.flags
 from cube.ir.cten import IRTensor, IRCell, IRObject
 from cube.ir.unique import IDGenerator
 from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
@@ -136,16 +137,20 @@ class IRGraph(IRSegment):
         # set mirror as self
         self._mirror = self
 
-        # infer gradient requirement
-        for node in self.nodes():
-            itensors = [t for t in node.inputs() if isinstance(t, IRTensor)]
-            require_grad = any(t.requires_grad for t in itensors)
-            for otensor in node.outputs():
-                if not isinstance(otensor, IRTensor): continue
-                if isinstance(otensor, IRSubTensor):
-                    otensor.parent.requires_grad = require_grad
+        if not cube.flags.CompileFlag.use_torchfx:
+            # infer gradient requirement
+            for node in self.nodes():
+                itensors = [t for t in node.inputs() if isinstance(t, IRTensor)]
+                if node.name == 'type_as':
+                    require_grad = itensors[0].requires_grad
                 else:
-                    otensor.requires_grad = require_grad
+                    require_grad = any(t.requires_grad for t in itensors)
+                for otensor in node.outputs():
+                    if not isinstance(otensor, IRTensor): continue
+                    if isinstance(otensor, IRSubTensor):
+                        otensor.parent.requires_grad = require_grad
+                    else:
+                        otensor.requires_grad = require_grad
         
         # set loss gradient
         loss.parent.to_loss()

@@ -1,4 +1,11 @@
+# single GPU inference debug
 # USE_TORCHFX=1 SINGLE_DEV_MODE=1 PYTHONPATH=.:$PYTHONPATH:torchscaletest/torchscale python examples/nlp/torchscale/run_torchscale_lm.py  examples/nlp/torchscale/lm_input  --activation-fn gelu --share-decoder-input-output-embed --validate-interval-updates 1000 --save-interval-updates 1000 --no-epoch-checkpoints --memory-efficient-fp16 --fp16-init-scale 4 --arch lm_base --task language_modeling --sample-break-mode none --tokens-per-sample 128 --optimizer adam --adam-betas "(0.9, 0.98)" --adam-eps 1e-08 --clip-norm 0.0 --lr 5e-4 --lr-scheduler polynomial_decay --warmup-updates 750 --dropout 0.1 --attention-dropout 0.1 --weight-decay 0.01 --batch-size 4 --update-freq 1 --required-batch-size-multiple 1 --total-num-update 50000 --max-update 50000 --seed 1 --ddp-backend=c10d --subln --xpos-rel-pos --fp16 --policy PASData
+# multi-GPU inference test
+# OMP_NUM_THREADS=12 USE_TORCHFX=1 PYTHONPATH=.:..:$PYTHONPATH python -m torch.distributed.launch --nproc_per_node=2 --master_port=25642 examples/nlp/torchscale/run_torchscale_lm.py examples/nlp/torchscale/lm_input  --activation-fn gelu --share-decoder-input-output-embed --validate-interval-updates 1000 --save-interval-updates 1000 --no-epoch-checkpoints --memory-efficient-fp16 --fp16-init-scale 4 --arch lm_base --task language_modeling --sample-break-mode none --tokens-per-sample 128 --optimizer adam --adam-betas "(0.9, 0.98)" --adam-eps 1e-08 --clip-norm 0.0 --lr 5e-4 --lr-scheduler polynomial_decay --warmup-updates 750 --dropout 0.1 --attention-dropout 0.1 --weight-decay 0.01 --batch-size 4 --update-freq 1 --required-batch-size-multiple 1 --total-num-update 50000 --max-update 50000 --seed 1 --subln --xpos-rel-pos --fp16 --policy PASData
+# single-GPU training test
+# OMP_NUM_THREADS=12 USE_TORCHFX=1 PYTHONPATH=.:..:$PYTHONPATH python -m torch.distributed.launch --nproc_per_node=1 --master_port=25642 examples/nlp/torchscale/run_torchscale_lm.py examples/nlp/torchscale/lm_input  --activation-fn gelu --share-decoder-input-output-embed --validate-interval-updates 1000 --save-interval-updates 1000 --no-epoch-checkpoints --memory-efficient-fp16 --fp16-init-scale 4 --arch lm_base --task language_modeling --sample-break-mode none --tokens-per-sample 128 --optimizer adam --adam-betas "(0.9, 0.98)" --adam-eps 1e-08 --clip-norm 0.0 --lr 5e-4 --lr-scheduler polynomial_decay --warmup-updates 750 --dropout 0.1 --attention-dropout 0.1 --weight-decay 0.01 --batch-size 4 --update-freq 1 --required-batch-size-multiple 1 --total-num-update 50000 --max-update 50000 --seed 1 --subln --xpos-rel-pos --fp16 --policy PASData --do_train
+# multi-GPU training test
+# OMP_NUM_THREADS=12 USE_TORCHFX=1 PYTHONPATH=.:..:$PYTHONPATH python -m torch.distributed.launch --nproc_per_node=2 --master_port=25642 examples/nlp/torchscale/run_torchscale_lm.py examples/nlp/torchscale/lm_input  --activation-fn gelu --share-decoder-input-output-embed --validate-interval-updates 1000 --save-interval-updates 1000 --no-epoch-checkpoints --memory-efficient-fp16 --fp16-init-scale 4 --arch lm_base --task language_modeling --sample-break-mode none --tokens-per-sample 128 --optimizer adam --adam-betas "(0.9, 0.98)" --adam-eps 1e-08 --clip-norm 0.0 --lr 5e-4 --lr-scheduler polynomial_decay --warmup-updates 750 --dropout 0.1 --attention-dropout 0.1 --weight-decay 0.01 --batch-size 4 --update-freq 1 --required-batch-size-multiple 1 --total-num-update 50000 --max-update 50000 --seed 1 --subln --xpos-rel-pos --fp16 --policy PASData --do_train
 
 import torch
 import pickle
@@ -12,14 +19,9 @@ from fairseq.trainer import Trainer
 from fairseq.data import iterators
 
 import sys
-
 import os
-print(f'os.getcwd() = {os.getcwd()}')
-
 
 # https://github.com/microsoft/torchscale/tree/main/examples/fairseq
-# sys.path.append('/home/v-junliang/torchscaletest/torchscale/examples/fairseq')
-# sys.path.append('./torchscaletest/torchscale/examples/fairseq')
 sys.path.append('examples/nlp/torchscale/torchscaletest/torchscale/examples/fairseq')
 sys.path.append('examples/nlp/torchscale/torchscaletest/torchscale')
 print(f'sys.path = {sys.path}')
@@ -43,9 +45,11 @@ from policy import mpmd, spmd
 # build model
 parser = options.get_training_parser()
 parser.add_argument('--policy', type=str, help='PAS policy choice, starting with "PAS"')
+parser.add_argument('--do_train', action='store_true', default=False)
 # parser.add_argument('--local_rank', type=int, default=0)
 
 args = options.parse_args_and_arch(parser)
+print(f"Running mode: {'TRAIN' if args.do_train else 'EVAL'}")
 
 cube.init()
 # set up policy
@@ -63,7 +67,10 @@ else:
 cfg = convert_namespace_to_omegaconf(args)
 task = tasks.setup_task(cfg.task)
 model = task.build_model(cfg.model)
-model.eval()
+if args.do_train:
+    model.train()
+else:
+    model.eval()
 print("building model succeed: ", type(model))
 
 # create dummy input
@@ -118,17 +125,25 @@ model = cube.SemanticModel(
     model, dummy_input=dummy_input,
 )
 
-@cube.compile(model, dataloader, PAS=PAS, load_content=False, override=True)
-def train_iter(model, dataloader):
-    data = next(dataloader)
-    loss = model(*data)
-    # loss.backward()
-    return loss
+if args.do_train:
+    @cube.compile(model, dataloader, PAS=PAS, load_content=False, override=True)
+    def train_iter(model, dataloader):
+        data = next(dataloader)
+        loss = model(*data)
+        loss.backward()
+        # TODO fix loss.mirror DummyInputOutput issue
 
-model = model.get_gen_module()
+    model = model.get_gen_module()
+    train_iter(model, dataloader)
+else:  # do_eval
+    @cube.compile(model, dataloader, PAS=PAS, load_content=False, override=True)
+    def train_iter(model, dataloader):
+        data = next(dataloader)
+        loss = model(*data)
+        return loss
 
-iter_ret = train_iter(model, dataloader)
-print(f'iter_ret = {iter_ret}')
+    model = model.get_gen_module()
+    iter_ret = train_iter(model, dataloader)
+    print(f'iter_ret = {iter_ret}')
 
-import sys
-sys.exit(0)
+print('DONE')

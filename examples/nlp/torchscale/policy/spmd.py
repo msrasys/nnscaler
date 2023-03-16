@@ -3,6 +3,7 @@ from cube.graph import IRGraph
 from cube.graph.segment import IRSegment
 from cube.ir.operator import IRDataOperation, IRFwOperation
 from cube.graph.gener.rvd.intra import IntraAutoPlacer
+from cube.graph.function import IRTensor
 
 
 # tensor parallelism with auto-placer
@@ -74,17 +75,32 @@ def PASData(graph: IRGraph, resource):
             batch_dim = node.get_batch_dims()[0]
     for node in graph.nodes():
         if isinstance(node, IRFwOperation):
-            # if not isinstance(node, IRPyFunc): # and node.signature in ('torch.arange', 'torch.sin'):
-            #     algo = node.algorithms('dim')
-            #     sub_nodes = graph.partition(
-            #         node, algo, idx=0, dim=batch_dim, num=resource.ngpus)
-            # else:
-            #     print(f'WARNING: {node} cannot find dim algo, using replicate instead')
-            #     sub_nodes = graph.replicate(node, resource.ngpus)
             try:
                 algo = node.algorithms('dim')
-                sub_nodes = graph.partition(
-                    node, algo, idx=0, dim=batch_dim, num=resource.ngpus)
+
+                must_replicate = False
+                for itensor in node.inputs():
+                    if not isinstance(itensor, IRTensor):
+                        continue
+
+                    print(f'itersor = {itensor}')
+                    for consumer in graph.consumers(itensor.parent):
+                        if consumer.name == 'fullslice':
+                            must_replicate = True
+                            break
+                    if must_replicate == True:
+                        break
+
+                if must_replicate:
+                    print(f'##### must_replicate {node.name}')
+                    sub_nodes = graph.replicate(node, resource.ngpus)
+                else:
+                    idx = 0
+                    if node.name in {'type_as'}:
+                        print(f"###### {node.name}")
+                        idx = 1
+                    sub_nodes = graph.partition(
+                        node, algo, idx=idx, dim=batch_dim, num=resource.ngpus)
             except AssertionError:
                 print(f'WARNING: {node} cannot find dim algo, using replicate instead')
                 sub_nodes = graph.replicate(node, resource.ngpus)
@@ -141,10 +157,17 @@ def PASHybrid(graph: IRGraph, resource):
     """
     linears = [node for node in graph.nodes() if node.name == 'linear']
     for idx, node in enumerate(linears):
-        algo = node.algorithms('dim')
-        tp_nodes = graph.partition(node, algo, idx=1, dim=idx%2, num=resource.ngpus)
-        for idx, node in enumerate(tp_nodes):
-            graph.assign(node, idx)
+        try:
+            algo = node.algorithms('dim')
+            tp_nodes = graph.partition(node, algo, idx=1, dim=idx%2, num=resource.ngpus)
+            for idx, node in enumerate(tp_nodes):
+                graph.assign(node, idx)
+        except AssertionError:
+            print(f'WARNING: {node} cannot find dim algo, using replicate instead')
+            sub_nodes = graph.replicate(node, resource.ngpus)
+            for idx, node in enumerate(sub_nodes):
+                graph.assign(node, idx)
+
     for node in graph.nodes():
         if isinstance(node, (IRFwOperation, IRDataOperation)):
             if len(node.device) == 0:
