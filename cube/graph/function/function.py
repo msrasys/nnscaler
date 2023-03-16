@@ -1198,9 +1198,14 @@ def CubeStack(*tensors, dim=0, signature=None):
     assert isinstance(dim, int), f"but not {dim}"
     signature = 'cube.runtime.function.stack'
     iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
-    oannos = [copy.copy(iannos[-1])]
-    oannos[0].insert(dim, str(len(tensors)))
-    anno = OpAnno.create_op_str(iannos, oannos)
+    oanno = [None for i in range(len(tensors[0].shape) + 1)]
+    oanno[dim] = f'{len(tensors)}^'
+    offset = 0
+    for i in range(len(oanno)):
+        if oanno[i] is None:
+            oanno[i] = copy.copy(iannos[-1][offset])
+            offset += 1
+    anno = OpAnno.create_op_str(iannos, [oanno])
     return IRDimops(CubeStack, 'stack', signature, [anno], tensors, dim=dim)
 
 
