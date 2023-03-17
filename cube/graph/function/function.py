@@ -727,6 +727,7 @@ def View(input, size: Tuple[int], *arg_size, signature = None):
     shape_map: Dict[str, int] = {edim: eshape for (edim, eshape) in zip(edims, chain)}
 
     # generate input and output shape annotations
+    # greedy fuse suffix number
     def buckets(shape: List[int], chain: List[int], edims: List[int]) -> List[List[str]]:
         anno = []
         dimidx = 0
@@ -744,6 +745,18 @@ def View(input, size: Tuple[int], *arg_size, signature = None):
                     elements *= chain[dimidx]
                     bracket.append(edims[dimidx])
                     dimidx += 1
+            # fetch as many 1^ as possible from tail of the previous bracket
+            if len(bracket) == 0:
+                assert dimlen == 1, f"internal match error3: dimlen={dimlen}"
+                back = 0
+                for edim in anno[-1][1:][::-1]:
+                    if chain[edims.index(edim)] != 1:
+                        break
+                    back += 1
+                assert back > 0, f"internal match error4: dimlen={dimlen}"
+                bracket = anno[-1][-back:]
+                anno[-1] = anno[-1][:-back]
+            assert len(bracket) > 0, f"got a dimension with no edim"
             anno.append(bracket)
         return anno
 
@@ -895,6 +908,18 @@ def Reshape(input, shape: Tuple[int], *arg_shape, signature = None):
                     elements *= chain[dimidx]
                     bracket.append(edims[dimidx])
                     dimidx += 1
+            # fetch as many 1^ as possible from tail of the previous bracket
+            if len(bracket) == 0:
+                assert dimlen == 1, f"internal match error3: dimlen={dimlen}"
+                back = 0
+                for edim in anno[-1][1:][::-1]:
+                    if chain[edims.index(edim)] != 1:
+                        break
+                    back += 1
+                assert back > 0, f"internal match error4: dimlen={dimlen}"
+                bracket = anno[-1][-back:]
+                anno[-1] = anno[-1][:-back]
+            assert len(bracket) > 0, f"got a dimension with no edim"
             anno.append(bracket)
         return anno
 
