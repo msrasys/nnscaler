@@ -1,11 +1,11 @@
-import torch
 
-from typing import Callable, Dict, Union
+from typing import Callable, Union
 from functools import partial
 
 import cube.graph.function as function
-import cube.ir as ir
 from cube.ir.operator import IRFwOperation
+from cube.graph.parser.register import CustomizedOps
+
 
 class SignFx2Op:
 
@@ -14,37 +14,20 @@ class SignFx2Op:
         """
         Map the signature to GenericLogicalOp
         """
-        bultin_regions = ['torch.', 'cube.runtime.', '_operator.', 'builtins.']
-        # customized function
-        if all(not signature.startswith(region) for region in bultin_regions):
-            signature = signature.split('.')[-1]
         if signature in SignFx2Op.kOpMap:
             function = SignFx2Op.kOpMap[signature]
-            # signature = 'torch.sum' if signature == 'sum' else signature #TODO fixme
             return partial(function, signature=signature)
-        else:
-            raise KeyError(f"{signature} is not supported yet")
-            # return partial(function.UnkownOperator, signature=signature)
+        if CustomizedOps.exist(signature):
+            return CustomizedOps.map(signature)
+        raise KeyError(f"{signature} is not supported yet")
 
     @staticmethod
     def exist(signature: str) -> bool:
-        bultin_regions = ['torch.', 'cube.runtime.', '_operator.', 'builtins.']
-        # customized function
-        if all(not signature.startswith(region) for region in bultin_regions):
-            signature = signature.split('.')[-1]
-        return signature in SignFx2Op.kOpMap
-
-    @staticmethod
-    def register(signature: str, op: Callable[..., Union[IRFwOperation, int, float]], code):
-        """
-        Register an operator
-        """
-        if not isinstance(signature, str):
-            raise TypeError(f"Expected signature to be str but got {type(signature)}")
         if signature in SignFx2Op.kOpMap:
-            raise KeyError(f"function {signature} is already registered")
-        SignFx2Op.kOpMap[signature] = op
-        SignFx2Op.kOpCodeDef[signature] = code
+            return True
+        if CustomizedOps.exist(signature):
+            return True
+        return False
 
     # functional templates
     __ftemplate = lambda name: f'torch.nn.functional.{name}'
@@ -223,6 +206,3 @@ class SignFx2Op:
         # __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
 
     }
-
-    # customized operator code: signature -> code
-    kOpCodeDef: Dict[str, str] = {}

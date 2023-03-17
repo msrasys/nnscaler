@@ -9,7 +9,8 @@ from cube.graph.function.pyfunc import IRPyFunc
 from cube.ir.tensor import IRFullTensor
 import cube.ir as ir
 from cube.graph.parser.frame import Frame
-from cube.graph.parser.mapping import Sign2Op, DType2IRDType
+from cube.graph.parser.mapping import Sign2Op
+from cube.graph.parser.dtype import DType2IRDType
 
 
 _refmodule = torch.nn.Module()

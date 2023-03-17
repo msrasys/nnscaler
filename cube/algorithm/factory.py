@@ -71,6 +71,3 @@ class DistAlgorithmFactory:
         self.register(conv.IRConv2D, conv.DimSplitConv2D, tag='dim')
         self.register(conv.IRConv2D, conv.HaloSplitConv2D, tag='halo')
         self.register(conv.IRConv3D, conv.HaloSplitConv3D, tag='halo')
-        
-        import cube.algorithm.ops.creators as creators
-        self.register(creators.IRToTensor, creators.DimSplitTo, tag='dim')

@@ -65,17 +65,6 @@ def emit_slice(node, arg_vars:list, kw_pairs:dict) -> str:
     return f"{in_tensor_var}[{', '.join(subscript_components)}]"
 
 
-# Basically to convert internal 'IRDType' to frontend 'torch.dtype'
-def emit_to(node, arg_vars:list, kw_pairs:dict) -> str:
-    kw_pairs = kw_pairs.copy()
-
-    # Unlike 'zeros' who has 'ScalarType? dtype', 'to' has a non-nullable 'dtype'.
-    ir_dtype : IRDType = kw_pairs['dtype']
-    assert ir_dtype is not None
-    kw_pairs['dtype'] = IRDType2DType.map(ir_dtype)
-
-    return _common_rule_join_all(node, arg_vars, kw_pairs)
-
 def emit_setattr(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
 
     assert arg_vars[1].startswith('self.')
@@ -105,7 +94,6 @@ class Sign2EmitRule:
 
     _signMap = {
         'torch.slice': emit_slice,
-        'torch.Tensor.to': emit_to,
         'setattr': emit_setattr,
     }
 

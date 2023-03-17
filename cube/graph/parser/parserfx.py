@@ -7,7 +7,7 @@ from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor
 from cube.ir.cten import IRObject, IRCell
 from cube.graph.parser.frame import Frame
-from cube.graph.parser.mapping import DType2IRDType
+from cube.graph.parser.dtype import DType2IRDType
 from cube.graph.parser.mappingfx import SignFx2Op
 from cube.graph.function.pyfunc import IRPyFunc
 
@@ -278,10 +278,7 @@ class FxModuleParser:
             if FxModuleParser._is_torch_autograd_op(node, frame, fsig):
                 print(f'>>> Find unknown pytorch operation: {fsig}')
                 fname = fsig.split('.')[-1] if '.' in fsig else fname
-                ir_node = IRFwOperation(fname, fsig, len(input_vals), 1)
-                ir_node.kwargs = kwargs
-                for idx, t in enumerate(input_vals):
-                    ir_node.set_input(idx, t)
+                ir_node = IRFwOperation(fname, fsig, input_vals, 1, **kwargs)
             # case2: python runtime function
             else:
                 print(f'>>> Set python runtime function: {fsig}')
@@ -296,6 +293,7 @@ class FxModuleParser:
                 # setting the list of the output tensor
                 print('>> parsing {ir_node}')
                 ir_node.infer_shape()
+                ir_node.infer_dtype()
                 frame.set_var(node.name, ir_node.outputs())
             else:
                 output_val = frame.get_var(node.name)

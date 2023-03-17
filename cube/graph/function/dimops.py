@@ -67,7 +67,7 @@ import enum
 import re
 import string
 
-from cube.ir.cten import IRTensor
+from cube.ir.cten import IRTensor, IRObject
 from cube.ir.dtype import DTypeInferRule
 from cube.ir.operator import IRFwOperation
 from cube.algorithm.factory import DistAlgorithmFactory
@@ -567,7 +567,7 @@ class IRDimops(IRFwOperation):
     """
     def __init__(self, create_fn: Callable, name: str,
                  signature: str, annos: Tuple[str],
-                 inputs: List[IRTensor],
+                 inputs: List[Union[IRTensor, IRObject]],
                  transform_rules: Optional[Tuple[TransformRule]] = None,
                  **kwargs):
         """!
@@ -606,12 +606,7 @@ class IRDimops(IRFwOperation):
             )
 
         n_outputs = len(self._oannos)
-        super().__init__(name, signature, len(inputs), n_outputs)
-        # set input
-        for idx, input in enumerate(inputs):
-            self.set_input(idx, input)
-        for name in kwargs:
-            self.kwargs[name] = kwargs[name]
+        super().__init__(name, signature, inputs, n_outputs, **kwargs)
 
     @property
     def anno(self) -> OpAnno:
@@ -649,7 +644,6 @@ class IRDimops(IRFwOperation):
 
         @return sucess: True if successfully inferred shape
         """
-        idtypes = [t.dtype for t in self._inputs if isinstance(t, IRTensor)]
         for oidx, otensor in enumerate(self.outputs()):
             shape_anno = self.oanno(oidx)
             shape = []

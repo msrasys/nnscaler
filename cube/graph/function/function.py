@@ -12,11 +12,7 @@ from cube.ir.dtype import IRDType
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
 from cube.graph.function.conv import IRPad, IRConv2D, IRConv3D
-from cube.graph.function.creators import IRToTensor
 from cube.graph.function.anchor import IRGraphAnchor
-
-
-ErasedDevice = 'str'
 
 
 def Identity(tensor: IRObject, signature = None):
@@ -149,7 +145,7 @@ def CubeArange(start: int, end: int, step: int, dtype=None,
               'dtype': dtype, 'requires_grad': requires_grad}
     anno, rules = _get_creator_anno_rules(size, False)
     dimop = IRDimops(CubeArange, 'arange', signature, [anno], [], rules, **kwargs)
-    from cube.graph.parser.mapping import DType2IRDType
+    from cube.graph.parser.dtype import DType2IRDType
     dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
     return dimop
 
@@ -187,7 +183,7 @@ def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requi
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(size, True)
     dimop = IRDimops(Empty, 'empty', signature, [anno], [], rules, **kwargs)
-    from cube.graph.parser.mapping import DType2IRDType
+    from cube.graph.parser.dtype import DType2IRDType
     dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
     return dimop
 
@@ -207,7 +203,7 @@ def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
     kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
     anno, rules = _get_creator_anno_rules(size, True)
     dimop = IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs)
-    from cube.graph.parser.mapping import DType2IRDType
+    from cube.graph.parser.dtype import DType2IRDType
     dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
     return dimop
 
@@ -227,7 +223,7 @@ def Ones(size, *arg_size, out=None, dtype=None, layout=None,
     kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
     anno, rules = _get_creator_anno_rules(size, True)
     dimop = IRDimops(Ones, 'ones', signature, [anno], [], rules, **kwargs)
-    from cube.graph.parser.mapping import DType2IRDType
+    from cube.graph.parser.dtype import DType2IRDType
     dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
     return dimop
 
@@ -248,7 +244,7 @@ def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requir
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(size, True)
     dimop = IRDimops(Rand, 'rand', signature, [anno], [], rules, **kwargs)
-    from cube.graph.parser.mapping import DType2IRDType
+    from cube.graph.parser.dtype import DType2IRDType
     dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
     return dimop
 
@@ -267,44 +263,9 @@ def NewTensor(data, *, dtype=None, device=None,
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(size, True)
     dimop = IRDimops(NewTensor, 'tensor', signature, [anno], [], rules, **kwargs)
-    from cube.graph.parser.mapping import DType2IRDType
+    from cube.graph.parser.dtype import DType2IRDType
     dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
     return dimop
-
-
-def ToTensor(signature,
-             inputs: Tuple[ IRTensor, ... ]):
-    """
-    'aten::to' has many overloadings that need resolution,
-    they differ by both the arity and the type of the argument (possibly at the same position):
-
-    ```
-    aten::to.device(Tensor self, Device device, int dtype, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor):
-    aten::to.dtype(Tensor self, int dtype, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor):
-    aten::to.dtype_layout(Tensor self, *, int dtype, int layout, Device device, bool pin_memory=False, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor):
-    aten::to.other(Tensor self, Tensor other, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor):
-    aten::to.prim_Device(Tensor(a) self, Device? device, int? dtype=None, bool non_blocking=False, bool copy=False) -> (Tensor(b|a)):
-    aten::to.prim_dtype(Tensor(a) self, int? dtype=None, bool non_blocking=False, bool copy=False) -> (Tensor(b|a)):
-    aten::to.prim_other(Tensor(a) self, bool non_blocking=False, bool copy=False) -> (Tensor(b|a)):
-    ```
-    ... where the 'int? dtype' is the underlying type for the enum 'ScalarType'.
-    """
-
-    # in our case we only care the overloading 'to.dtype' (arity=5)
-    assert len(inputs) == 5
-    tensor : IRTensor
-    dtype_underlying : int
-    non_blocking : bool
-    copy : bool
-    opt_memory_format : Optional[int]
-    tensor, dtype_underlying, non_blocking, copy, opt_memory_format = inputs
-
-    from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
-    dtype : torch.dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
-    ir_dtype : IRDType = DType2IRDType.map(dtype)
-
-    signature = 'torch.Tensor.to'
-    return IRToTensor(signature, [tensor], 'to', ir_dtype=ir_dtype)
 
 
 def _handle_broadcast(lhs: IRTensor, rhs: IRTensor) -> Tuple[List[str]]:
@@ -1046,13 +1007,15 @@ def Unsqueeze(input, dim, signature = None):
     return IRDimops(Unsqueeze, 'unsqueeze', signature, [anno], [input],dim=dim)
 
 
-def TypeAs(input, tensor, signature = None):
+def TypeAs(input: IRTensor, tensor: IRTensor, signature = None):
     """
     out = torch.Tensor.type_as(tensor0, tensor1)
     """
     edim_in0 = ShapeAnno.create_shape_str(tensor.shape)
     anno = OpAnno.create_op_str(['*', edim_in0], ['*'])
-    return IRDimops(TypeAs, 'type_as', signature, [anno], [input, tensor])
+    dimop = IRDimops(TypeAs, 'type_as', signature, [anno], [input, tensor])
+    dimop.output(0).requires_grad = input.requires_grad
+    return dimop
 
 
 def Triu(input, diagonal=0, *, out=None, signature = None):

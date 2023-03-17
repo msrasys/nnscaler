@@ -12,9 +12,8 @@ import _operator
 import cube
 from cube.ir.cten import IRTensor, IRObject
 from cube.ir.operator import IRFwOperation
-from cube.graph.parser.mapping import IRDType2TorchDType
-# from cube.graph.parser.mapping import Sign2Op
-from cube.graph.parser.mappingfx import SignFx2Op as Sign2Op
+from cube.graph.parser.dtype import IRDType2TorchDType
+from cube.graph.parser.register import CustomizedOps
 
 
 Shapes = NewType('Shapes', Tuple[Tuple[int]])
@@ -168,21 +167,21 @@ class ProfileDataBase:
 
         def get_dep_names(sign: str):
             ret = []
-            code_impl = Sign2Op.kOpCodeDef[sign]
+            code_impl = CustomizedOps.kOpCodeDef[sign]
             for code_line in code_impl.split('\n'):
                 idx = code_line.find('# call: ')
                 if idx != -1:
                     dep_name = code_line[idx + 8:]
-                    assert dep_name in Sign2Op.kOpCodeDef, dep_name
+                    assert dep_name in CustomizedOps.kOpCodeDef, dep_name
                     ret = ret + get_dep_names(dep_name)
                     ret.append(dep_name)
             return ret
 
-        if node.signature in Sign2Op.kOpCodeDef:
+        if node.signature in CustomizedOps.kOpCodeDef:
             dep_code_impl = ''
             for dep_name in get_dep_names(node.signature):
-                dep_code_impl = dep_code_impl + Sign2Op.kOpCodeDef[dep_name]
-            code_impl: str = Sign2Op.kOpCodeDef[node.signature]
+                dep_code_impl = dep_code_impl + CustomizedOps.kOpCodeDef[dep_name]
+            code_impl: str = CustomizedOps.kOpCodeDef[node.signature]
             def_end = code_impl.find(':\n')
             assert def_end >= 0
             prev_code_lines = code_impl[:def_end+2]

@@ -2,12 +2,45 @@
 Register cutomized function
 """
 
-from typing import Any, Callable, List, Optional
+from typing import Dict, Callable, List, Optional
+from functools import partial
 import inspect
 import torch
 
 from cube.graph.function.dimops import IRDimops, OpAnno
-from cube.graph.parser.mapping import Sign2Op
+
+
+class CustomizedOps:
+
+    kOpMap: Dict[str, Callable] = {}
+    # customized operator code: signature -> code
+    kOpCodeDef: Dict[str, str] = {}
+
+    @staticmethod
+    def map(signature: str) -> Callable:
+        signature = signature.split('.')[-1]
+        if signature in CustomizedOps.kOpMap:
+            return partial(CustomizedOps.kOpMap[signature], signature=signature)
+        else:
+            raise KeyError(f"{signature} is not found in registered ops")
+
+    @staticmethod
+    def exist(signature: str) -> bool:
+        signature = signature.split('.')[-1]
+        return signature in CustomizedOps.kOpMap
+
+    @staticmethod
+    def register(signature: str, op: Callable, code: str):
+        """
+        Register an operator
+        """
+        builtins = ['_operator', 'torch', 'cube.runtime.function']
+        if any(signature.startswith(builtin) for builtin in builtins):
+            raise RuntimeError(f"Cannot register operators with signature starting from any of {builtins}")
+        signature = signature.split('.')[-1]
+        assert signature not in CustomizedOps.kOpMap, f"function {signature} is already registered"
+        CustomizedOps.kOpMap[signature] = op
+        CustomizedOps.kOpCodeDef[signature] = code
 
 
 def register(anno: str, name: Optional[str] = None, rules: Optional[List] = None):
@@ -70,7 +103,7 @@ def register(anno: str, name: Optional[str] = None, rules: Optional[List] = None
             return IRDimops(udfop, op_name, signature, [repr(manno)], tensors, transform_rules=rules, **kwargs)
 
         print(f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
-        Sign2Op.register(fsig, udfop, code)
+        CustomizedOps.register(fsig, udfop, code)
         return fn
 
     return decorator

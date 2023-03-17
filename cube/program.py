@@ -7,7 +7,7 @@ from cube.ir.operator import IRBpOperation, IRDataOperation
 
 from cube.graph import IRGraph
 from cube.graph import parser
-from cube.graph.parser.mapping import DType2IRDType
+from cube.graph.parser.dtype import DType2IRDType
 
 from cube.runtime.syndata import CubeDataLoader
 from cube.runtime.module import CubeModule
