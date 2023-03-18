@@ -26,6 +26,8 @@ import models
 
 import cube
 
+bs, seql, ngpu = 2, 2048, 4
+
 # # build model
 parser = options.get_training_parser()
 args = options.parse_args_and_arch(parser)
@@ -36,8 +38,10 @@ model.eval()
 print("building model succeed: ", type(model))
 
 # create dummy input
-with open('/home/quzha/quzha/MagicCube/examples/nlp/torchscale/input_lm', 'rb') as f:
+# with open('/home/quzha/quzha/MagicCube/examples/nlp/torchscale/input_lm', 'rb') as f:
+with open(f'/home/quzha/torchscale_{bs}_{seql}.pkl', 'rb') as f:
     dummy_input = pickle.load(f)
+dummy_input = dummy_input['net_input']
 device = next(model.parameters()).device
 print(f'device = {device}')
 for key in dummy_input.keys():
@@ -177,8 +181,9 @@ class dotdict(dict):
     __getattr__ = dict.get
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
-config = dotdict({'profile_dir': str(Path.home())+'/.autodist/', 'task_name': 'torchscale'})
-config.autodist_config = dotdict({'ngpus': 2})
+
+config = dotdict({'profile_dir': str(Path.home())+'/.autodist/', 'task_name': f'torchscale_{bs}_{seql}_{ngpu}'})
+config.autodist_config = dotdict({'ngpus': ngpu})
 # NOTE add SINGLE_DEV_MODE=1 before the running command
 from autodist.cost_model.cost_database import CostDatabase
 cost_database = CostDatabase(cube_graph, config)
@@ -199,13 +204,23 @@ class TorchscaleTaskConfig(TaskConfig):
         self.allow_recom_ops = []
         self.del_dim = []
 
-kwargs = {'save_folder': 'exp_data', 'micro_batch_size': 8, 'global_batch_size': 8, 'iter_num': 2,
-          'warm_num': 1, 'recompute': False, 'memory_constraint': 32, 'memory_granularity': 1,
+kwargs = {'consider_mem': False, 'save_folder': 'exp_data', 'micro_batch_size': bs, 'global_batch_size': bs, 'iter_num': 2,
+          'warm_num': 1, 'recompute': False, 'memory_constraint': 40, 'memory_granularity': 1,
           'profile_dir': str(Path.home())+'/.autodist/', 'connect_type': 'NV2', 'use_prev_plan': False,
-          'is_train': True, 'topk': 20, 'mesh_row': 1, 'mesh_col': 2, 'compile': True, 'pipeline': False,
+          'is_train': True, 'topk': 20, 'mesh_row': 1, 'mesh_col': ngpu, 'compile': True, 'pipeline': False,
           'nproc': 12, 'adaptive_recom': False, 'plan_idx': 0, 'verbose': True, 'ignore_small_tensor_threshold': 0,
           'parse_plan': True}
 
 task_config = TorchscaleTaskConfig(**kwargs)
 from autodist.apis import calc_parallel_plan
 topk_plans = calc_parallel_plan(cube_graph, cost_database, task_config)
+
+best_plan = topk_plans[0][0].partition_descs
+
+from cube.ir.operator import IRDataOperation, IRFwOperation, IRBpOperation
+
+for node in cube_graph.select(ntype=IRFwOperation):
+    if node.cid in best_plan:
+        print(f'{node}, {node.anno}, autodist ret: {best_plan[node.cid]}')
+    else:
+        print(f'{node}, switch to default replica')

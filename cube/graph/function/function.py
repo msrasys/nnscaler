@@ -808,6 +808,18 @@ def View(input, size: Tuple[int], *arg_size, signature = None):
                     elements *= chain[dimidx]
                     bracket.append(edims[dimidx])
                     dimidx += 1
+            # fetch as many 1^ as possible from tail of the previous bracket
+            if len(bracket) == 0:
+                assert dimlen == 1, f"internal match error3: dimlen={dimlen}"
+                back = 0
+                for edim in anno[-1][1:][::-1]:
+                    if chain[edims.index(edim)] != 1:
+                        break
+                    back += 1
+                assert back > 0, f"internal match error4: dimlen={dimlen}"
+                bracket = anno[-1][-back:]
+                anno[-1] = anno[-1][:-back]
+            assert len(bracket) > 0, f"got a dimension with no edim"
             anno.append(bracket)
         return anno
 
@@ -959,6 +971,18 @@ def Reshape(input, shape: Tuple[int], *arg_shape, signature = None):
                     elements *= chain[dimidx]
                     bracket.append(edims[dimidx])
                     dimidx += 1
+                    # fetch as many 1^ as possible from tail of the previous bracket
+            if len(bracket) == 0:
+                assert dimlen == 1, f"internal match error3: dimlen={dimlen}"
+                back = 0
+                for edim in anno[-1][1:][::-1]:
+                    if chain[edims.index(edim)] != 1:
+                        break
+                    back += 1
+                assert back > 0, f"internal match error4: dimlen={dimlen}"
+                bracket = anno[-1][-back:]
+                anno[-1] = anno[-1][:-back]
+            assert len(bracket) > 0, f"got a dimension with no edim"
             anno.append(bracket)
         return anno
 
@@ -1223,9 +1247,14 @@ def CubeStack(*tensors, dim=0, signature=None):
     assert isinstance(dim, int), f"but not {dim}"
     signature = 'cube.runtime.function.stack'
     iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
-    oannos = [copy.copy(iannos[-1])]
-    oannos[0].insert(dim, str(len(tensors)))
-    anno = OpAnno.create_op_str(iannos, oannos)
+    oanno = [None for i in range(len(tensors[0].shape) + 1)]
+    oanno[dim] = f'{len(tensors)}^'
+    offset = 0
+    for i in range(len(oanno)):
+        if oanno[i] is None:
+            oanno[i] = copy.copy(iannos[-1][offset])
+            offset += 1
+    anno = OpAnno.create_op_str(iannos, [oanno])
     return IRDimops(CubeStack, 'stack', signature, [anno], tensors, dim=dim)
 
 
@@ -1303,7 +1332,8 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice]], signature=No
                 # expand the dimension
                 edim_ou.append('1')
         else:
-            edim_in[dim] += '^'
+            if slicer != slice(None, None, None):
+                edim_in[dim] += '^'
             if isinstance(slicer, slice):
                 stop = tensor.shape[dim] if slicer.stop is None else slicer.stop
                 start = 0 if slicer.start is None else slicer.start
