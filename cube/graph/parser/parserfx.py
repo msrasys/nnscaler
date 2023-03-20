@@ -314,11 +314,16 @@ class FxModuleParser:
         tensor_name = node.name
         if 'tensor_meta' in node.meta:
             tensor_shape = node.meta['tensor_meta'].shape
-            #TODO assume it is weight
             dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
-            ir_tensor = IRFullTensor(tensor_shape, tensor_name, requires_grad=True, dtype=dtype)
-            ir_tensor.as_param()
+            requires_grad = node.meta['tensor_meta'].requires_grad
+            ir_tensor = IRFullTensor(tensor_shape, tensor_name, requires_grad=requires_grad, dtype=dtype)
+            if requires_grad:  # case for registered parameters
+                ir_tensor.as_param()
+            else:  # case for registered buffers
+                ir_tensor.as_buffer()
             frame.add_var(tensor_name, ir_tensor)
+            value = FxModuleParser.fetch_attr(module, node.target)
+            frame.add_attr_content(ir_tensor.tid, value)
         else:
             var = FxModuleParser.fetch_attr(module, node.target)
             frame.add_var(tensor_name, var)
