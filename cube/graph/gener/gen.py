@@ -676,7 +676,9 @@ class IRAdapterGener:
                         output.grad = multiref.output(idx).grad.parent.select(otensor.indmap, (0,1))
                     mr.set_output(idx, output)
                 mr.device = otensor.device
-                mr.recompute = otensor.cell.recompute
+                # Dataloader has no recompute
+                if hasattr(otensor.cell, 'recompute'):
+                    mr.recompute = otensor.cell.recompute
                 multirefs.append(mr)
             # remove original multiref
             fidx = graph.remove(multiref)

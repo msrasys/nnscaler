@@ -66,6 +66,13 @@ def PASData(graph: IRGraph, resource):
     """
     Data Parallel
     """
+    # auto multi-ref
+    for ftensor in graph.full_tensors():
+        if len(graph.consumers(ftensor)) > 1:
+            if ftensor.is_attr():
+                continue
+        graph.multiref(ftensor, [[n] for n in graph.consumers(ftensor)])
+
     for node in graph.nodes():
         if isinstance(node, IRDataOperation):
             algo = node.algorithms('data')
@@ -77,30 +84,9 @@ def PASData(graph: IRGraph, resource):
         if isinstance(node, IRFwOperation):
             try:
                 algo = node.algorithms('dim')
-
-                must_replicate = False
-                for itensor in node.inputs():
-                    if not isinstance(itensor, IRTensor):
-                        continue
-
-                    print(f'itersor = {itensor}')
-                    for consumer in graph.consumers(itensor.parent):
-                        if consumer.name == 'fullslice':
-                            must_replicate = True
-                            break
-                    if must_replicate == True:
-                        break
-
-                if must_replicate:
-                    print(f'##### must_replicate {node.name}')
-                    sub_nodes = graph.replicate(node, resource.ngpus)
-                else:
-                    idx = 0
-                    if node.name in {'type_as'}:
-                        print(f"###### {node.name}")
-                        idx = 1
-                    sub_nodes = graph.partition(
-                        node, algo, idx=idx, dim=batch_dim, num=resource.ngpus)
+                idx = 0
+                sub_nodes = graph.partition(
+                    node, algo, idx=idx, dim=batch_dim, num=resource.ngpus)
             except AssertionError:
                 print(f'WARNING: {node} cannot find dim algo, using replicate instead')
                 sub_nodes = graph.replicate(node, resource.ngpus)
