@@ -81,8 +81,14 @@ class IRGraph(IRSegment):
             else:
                 raise RuntimeError('len(args) < len(itensors)')
 
+        arg_objs = IRGraph.get_objects_from_complex(args)
+        graph_objs = IRGraph.get_objects_from_complex(self.inputs())
+        assert len(arg_objs) == len(graph_objs), f"input object number not match: {len(arg_objs)} != {len(graph_objs)}"
+
         for idx, (itensor, arg) in enumerate(zip(itensors, args)):
             self.set_input(idx, arg)
+
+        for arg, itensor in zip(arg_objs, graph_objs):
             for producer in self.producers(itensor.parent):
                 with self.update(producer):
                     while itensor in producer.outputs():
@@ -93,13 +99,12 @@ class IRGraph(IRSegment):
                     while itensor in consumer.inputs():
                         iidx = consumer.inputs().index(itensor)
                         consumer.set_input(iidx, arg)
-            while itensor in self.outputs():
-                oidx = self.outputs().index(itensor)
-                self.set_output(oidx, arg)
-            while itensor in self.inputs():
-                iidx = self.inputs().index(itensor)
-                self.set_input(iidx, arg)
-        
+            # reset output
+            for oidx, output in enumerate(self.outputs()):
+                output = IRGraph.modify_objects_of_complex(
+                    self.output(oidx), lambda t: t if t != itensor else arg)
+                self.set_output(oidx, output)
+
         # dtype inference
         for node in self._nodes:
             # reset input

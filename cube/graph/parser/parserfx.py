@@ -103,9 +103,14 @@ class FxModuleParser:
             # handle graph inputs
             for idx, input in enumerate(inputs):
                 assert isinstance(input, torch.fx.Node)
-                shape = None if (input_shapes is None or len(input_shapes) <= idx) else input_shapes[idx]
-                dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
-                val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
+                if 'tensor_meta' in input.meta:  # tensor type
+                    shape = None if len(input_shapes) <= idx else input_shapes[idx]
+                    if shape is not None and len(shape) == 0:
+                        shape = [1]
+                    dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
+                    val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
+                else:
+                    val = IRObject(input.name)
                 frame.add_var(input.name, val, graph_arg=idx)
         else:
             assert dummy_inputs is not None, 'input_shapes and dummy_inputs cannot be None at the same time.'

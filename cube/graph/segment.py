@@ -76,15 +76,10 @@ class IRSegment(IRCell):
     Inserting and removing nodes that could change input/output are not allowed.
     """
 
-    def __init__(self, nodes: List[IRCell], inputs: List[IRTensor], outputs: List[IRSubTensor], name='segment'):
+    def __init__(self, nodes: List[IRCell], inputs: List[Any], outputs: List[Any], name='segment'):
         super().__init__(name, '', len(inputs), len(outputs), init_outputs=False)
 
         self._nodes: List[IRCell] = []
-
-        for idx, val in enumerate(inputs):
-            self.set_input(idx, val)
-        for idx, val in enumerate(outputs):
-            self.set_output(idx, val)
 
         # full-tensor / sub-tensor mapping
         self._ftensors: Set[IRFullTensor] = set()
@@ -96,12 +91,30 @@ class IRSegment(IRCell):
         # attributes
         self._attributes: Set[IRFullTensor] = set()
 
+        for idx, val in enumerate(inputs):
+            self.set_input(idx, val)
+        for idx, val in enumerate(outputs):
+            self.set_output(idx, val)
+
+        for t in IRSegment.get_objects_from_complex(list(inputs) + list(outputs)):
+            self._add_ftensor(t.parent)
+
         for node in nodes:
             self.insert(node, self.nnodes)
 
         self._dispatch_cached: Dict[int, IRSegment] = {}
 
         # self.reset_dependency()
+
+    def set_input(self, idx: int, val: Any):
+        for t in IRSegment.get_objects_from_complex(val):
+            self._add_ftensor(t.parent)
+        return super().set_input(idx, val)
+
+    def set_output(self, idx: int, val: Any):
+        for t in IRSegment.get_objects_from_complex(val):
+            self._add_ftensor(t.parent)
+        return super().set_output(idx, val)
 
     def isfw(self) -> bool:
         return all(n.isfw() for n in self._nodes)
@@ -414,6 +427,13 @@ class IRSegment(IRCell):
         self._ftensors, self._attributes = set(), set()
         self._producers, self._ptensors = dict(), dict()
         self._consumers, self._ctensors = dict(), dict()
+
+        # set input and output
+        for obj in IRSegment.get_objects_from_complex(self.inputs()):
+            self._add_ftensor(obj.parent)
+        for obj in IRSegment.get_objects_from_complex(self.outputs()):
+            self._add_ftensor(obj.parent)
+
         # set producer and consumer
         for node in self._nodes:
             if isinstance(node, IRAdapter): continue
@@ -833,7 +853,7 @@ class IRSegment(IRCell):
     # ====================== Graph Generations ============================
     
     @staticmethod
-    def get_inputs(nodes: List[IRCell]):
+    def get_inputs(nodes: List[IRCell], exclude_attr: bool = True):
         """
         Get all the input tensors that are required by nodes.
 
@@ -848,13 +868,15 @@ class IRSegment(IRCell):
         for node in nodes:
             for input in node.inputs():
                 if isinstance(input, IRTensor):
+                    if exclude_attr and input.is_attr():
+                        continue
                     if input not in all_outputs:
                         if input not in inputs:
                             inputs.append(input)
         return inputs
 
     @staticmethod
-    def get_outputs(nodes: List[IRCell]):
+    def get_outputs(nodes: List[IRCell], exclude_attr: bool = True):
         """
         Get tensors that are produced but not consumed by nodes
 
@@ -874,6 +896,8 @@ class IRSegment(IRCell):
             for output in node.outputs():
                 # not consumed tensor
                 if isinstance(output, IRTensor):
+                    if exclude_attr and output.is_attr():
+                        continue
                     if output not in all_inputs:
                         if output not in outputs:
                             outputs.append(output)
