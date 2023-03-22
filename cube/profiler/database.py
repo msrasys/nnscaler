@@ -409,7 +409,7 @@ class ProfileDataBase:
             json.dump(self._data, f)
 
         
-    def dump_fine_grained(self, file: str, override=False):
+    def dump_nodes(self, file: str, override=False):
         if os.path.exists(file):
             assert override, f"File {file} exists. Set override = True to force dump."
         for signature in self._data.keys():
@@ -417,7 +417,7 @@ class ProfileDataBase:
             with open(file_n, 'w') as f:
                 json.dump(self._data[signature],f)   
 
-    def dump_single(self, file: str, signature ,override=False): 
+    def dump_node(self, file: str, signature ,override=False): 
         assert signature in self._data.keys(), f'this node not be profiled'
         file_n = os.path.join(file, signature +'.json')
         with open(file_n, 'w') as f:
@@ -433,13 +433,13 @@ class ProfileDataBase:
         with open(file, 'r') as f:
             self._data = json.load(f)
 
-    def load_fine_grained(self, file: str):
+    def load_nodes(self, file: str):
         for filename in os.listdir(file):
             if filename.endswith('.json'):
                 with open(os.path.join(file, filename)) as f:
                     signature = filename[:-len('.json')]
                     self._data[signature] = json.load(f)
-                    
+
     def __repr__(self) -> str:
         data = []
         for signature in self._data:
