@@ -26,7 +26,8 @@ import models
 
 import cube
 
-bs, seql, ngpu = 2, 2048, 4
+# bs, seql, ngpu = 2, 2048, 4
+bs, seql, hidden_dim, ngpu = 2, 2048, 2048, 8
 
 # # build model
 parser = options.get_training_parser()
@@ -182,7 +183,7 @@ class dotdict(dict):
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
 
-config = dotdict({'profile_dir': str(Path.home())+'/.autodist/', 'task_name': f'torchscale_{bs}_{seql}_{ngpu}'})
+config = dotdict({'profile_dir': str(Path.home())+'/.autodist/', 'task_name': f'torchscale_{bs}_{seql}_{hidden_dim}_{ngpu}'})
 config.autodist_config = dotdict({'ngpus': ngpu})
 # NOTE add SINGLE_DEV_MODE=1 before the running command
 from autodist.cost_model.cost_database import CostDatabase
