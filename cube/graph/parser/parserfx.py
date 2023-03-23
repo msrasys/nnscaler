@@ -7,7 +7,7 @@ from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor
 from cube.ir.cten import IRObject, IRCell
 from cube.graph.parser.frame import Frame
-from cube.graph.parser.mapping import DType2IRDType
+from cube.graph.parser.dtype import DType2IRDType
 from cube.graph.parser.mappingfx import SignFx2Op
 from cube.graph.function.pyfunc import IRPyFunc
 
@@ -103,19 +103,21 @@ class FxModuleParser:
             # handle graph inputs
             for idx, input in enumerate(inputs):
                 assert isinstance(input, torch.fx.Node)
-                shape = None if (input_shapes is None or len(input_shapes) <= idx) else input_shapes[idx]
-                dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
-                val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
+                if 'tensor_meta' in input.meta:  # tensor type
+                    shape = None if len(input_shapes) <= idx else input_shapes[idx]
+                    if shape is not None and len(shape) == 0:
+                        shape = [1]
+                    dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
+                    val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
+                else:
+                    val = IRObject(input.name)
                 frame.add_var(input.name, val, graph_arg=idx)
         else:
             assert dummy_inputs is not None, 'input_shapes and dummy_inputs cannot be None at the same time.'
             # remove dead nodes
-            # from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
             from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
             DCEHandler(module).eliminate_dead_code()
             # shape propagation
-            # from nni.common.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp
-            # KwargsShapeProp(module).propagate(dummy_inputs)
             from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
             ShapeProp(module).propagate(dummy_inputs)
             # handle graph inputs
@@ -278,7 +280,6 @@ class FxModuleParser:
 
         # map to IR operator
         if SignFx2Op.exist(fsig):
-            print(input_vals)
             ir_node = SignFx2Op.map(fsig)(*input_vals, **kwargs)
         else:
             # FIXME: handle cases for IRObject in kwargs
@@ -286,10 +287,7 @@ class FxModuleParser:
             if FxModuleParser._is_torch_autograd_op(node, frame, fsig):
                 print(f'>>> Find unknown pytorch operation: {fsig}')
                 fname = fsig.split('.')[-1] if '.' in fsig else fname
-                ir_node = IRFwOperation(fname, fsig, len(input_vals), 1)
-                ir_node.kwargs = kwargs
-                for idx, t in enumerate(input_vals):
-                    ir_node.set_input(idx, t)
+                ir_node = IRFwOperation(fname, fsig, input_vals, 1, **kwargs)
             # case2: python runtime function
             else:
                 print(f'>>> Set python runtime function: {fsig}')
@@ -304,6 +302,7 @@ class FxModuleParser:
                 # setting the list of the output tensor
                 print('>> parsing {ir_node}')
                 ir_node.infer_shape()
+                ir_node.infer_dtype()
                 frame.set_var(node.name, ir_node.outputs())
             else:
                 output_val = frame.get_var(node.name)
@@ -324,11 +323,16 @@ class FxModuleParser:
         tensor_name = node.name
         if 'tensor_meta' in node.meta:
             tensor_shape = node.meta['tensor_meta'].shape
-            #TODO assume it is weight
             dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
-            ir_tensor = IRFullTensor(tensor_shape, tensor_name, requires_grad=True, dtype=dtype)
-            ir_tensor.as_param()
+            requires_grad = node.meta['tensor_meta'].requires_grad
+            ir_tensor = IRFullTensor(tensor_shape, tensor_name, requires_grad=requires_grad, dtype=dtype)
+            if requires_grad:  # case for registered parameters
+                ir_tensor.as_param()
+            else:  # case for registered buffers
+                ir_tensor.as_buffer()
             frame.add_var(tensor_name, ir_tensor)
+            value = FxModuleParser.fetch_attr(module, node.target)
+            frame.add_attr_content(ir_tensor.tid, value)
         else:
             var = FxModuleParser.fetch_attr(module, node.target)
             frame.add_var(tensor_name, var)

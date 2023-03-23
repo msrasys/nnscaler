@@ -2,8 +2,9 @@ from typing import Any, Callable, List, Optional, Tuple, Dict, Union, Iterable
 import string
 import copy
 import torch
-import warnings
 import operator
+import numpy as np
+import math
 
 from cube.ir.cten import IRTensor, IRObject
 from cube.ir.tensor import IRSubTensor, IRFullTensor
@@ -11,11 +12,7 @@ from cube.ir.dtype import IRDType
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
 from cube.graph.function.conv import IRPad, IRConv2D, IRConv3D
-from cube.graph.function.creators import IRArange, IREmpty, IROnes, IRToTensor, IRZeros, IRRand, IRNewTensor
 from cube.graph.function.anchor import IRGraphAnchor
-
-
-ErasedDevice = 'str'
 
 
 def Identity(tensor: IRObject, signature = None):
@@ -113,10 +110,52 @@ def Matmul(input, other, *, out=None, signature=None):
     return IRDimops(Matmul, 'matmul', signature, annos, [input, other])
 
 
-def Arange(*args, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False, signature=None):
+# =============================================== creators ==========================================
+
+def _get_creator_anno_rules(size: Tuple[int], partitionable: bool) -> str:
+    """
+    Create annotation and transformation rules for creator
+    """
+    eshape = [str(dimlen) + ('' if partitionable else '^') for dimlen in size]
+    anno = OpAnno.create_op_str([], [eshape])
+    rules = []
+    if partitionable:
+        for dim in range(len(size)):
+            def creator_modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
+                kwargs = dict(**kwargs)
+                size = list(kwargs['size'])
+                size[dim] = size[dim] // num
+                kwargs['size'] = tuple(size)
+                return kwargs
+
+            rules.append(TransformRule([], [DimopSplit.D(dim)], creator_modifier))
+
+    return anno, rules
+
+
+def CubeArange(start: int, end: int, step: int, dtype=None, 
+               requires_grad=False, signature=None):
+    signature = 'cube.runtime.function.arange'
+    size = (math.ceil((end-start)/step),)
+    # FIXME: torch.jit.script has dtype with int
+    # from cube.graph.parser.mapping import TorchScalarTypeEnumMap
+    # dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    kwargs = {'start': start, 'end': end, 'step': step,
+              'dtype': dtype, 'requires_grad': requires_grad}
+    anno, rules = _get_creator_anno_rules(size, False)
+    dimop = IRDimops(CubeArange, 'arange', signature, [anno], [], rules, **kwargs)
+    from cube.graph.parser.dtype import DType2IRDType
+    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    return dimop
+
+
+def Arange(*args, out=None, dtype=None, layout=None, 
+           device=None, requires_grad=False, signature=None):
     """
     torch.arange(start=0, end, step=1, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False) → Tensor
     """
+    assert layout is None
     if len(args) == 1:
         start, end, step = 0, args[0], 1
     elif len(args) == 2:
@@ -125,195 +164,108 @@ def Arange(*args, out=None, dtype=None, layout=torch.strided, device=None, requi
         start, end, step = args
     else:
         raise RuntimeError(f'Invalid number {len(args)} of args in Arange.')
-    assert isinstance(start, int) and isinstance(end, int) and isinstance(step, int)
-    from cube.graph.parser.mapping import DType2IRDType
-    if dtype is None:
-        dtype = torch.get_default_dtype()
-
-    import math
-    size = (math.ceil((end-start)/step),)
-    kwargs = {'start': start, 'end': end, 'step': step, 'out': out, 'dtype': dtype,
-              'layout': layout, 'requires_grad': requires_grad}
-    return IRArange(signature, size, 'arange', **kwargs)
+    return CubeArange(start, end, step, dtype, requires_grad=requires_grad)
 
 
-def Empty(*size, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False,
-          pin_memory=False, memory_format=torch.contiguous_format, signature=None):
-    """
-    torch.empty(*size, *, out=None, dtype=None, layout=torch.strided, device=None,
-    requires_grad=False, pin_memory=False, memory_format=torch.contiguous_format) → Tensor
-    """
-    from cube.graph.parser.mapping import DType2IRDType
-    if dtype is None:
-        dtype = torch.get_default_dtype()
-    ir_dtype : IRDType = DType2IRDType.map(dtype)
-    # example size: ((17, 17),)
-    assert isinstance(size, tuple) and isinstance(size[0], tuple)
-    for dim, i in enumerate(size[0]):
-        if not isinstance(dim, int) and not dim >= 0:
-            raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
-    kwargs = {'dtype': ir_dtype, 'layout': layout, 'device': device, 'requires_grad': requires_grad,
-              'pin_memory': pin_memory, 'memory_format': memory_format}
-    return IREmpty(signature, size[0], 'empty', **kwargs)
+def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
+          pin_memory=False, memory_format=None, signature=None):
+    # note: device is ignored
+    signature = 'cube.runtime.function.empty'
+    size = (size,) if isinstance(size, int) else tuple(size)
+    size: Tuple[int] = size + arg_size
+    assert all(isinstance(dimlen, int) for dimlen in size), f"Empty only supports static size but got {size}"
+    assert layout is None and memory_format is None, f"Not support for non-default memory_format and layout"
+    # FIXME: torch.jit.script has dtype with int
+    # from cube.graph.parser.mapping import TorchScalarTypeEnumMap
+    # dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    kwargs = {'size': size, 'requires_grad': requires_grad,
+              'dtype': dtype, 'pin_memory': pin_memory}
+    anno, rules = _get_creator_anno_rules(size, True)
+    dimop = IRDimops(Empty, 'empty', signature, [anno], [], rules, **kwargs)
+    from cube.graph.parser.dtype import DType2IRDType
+    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    return dimop
 
 
-def Zeros(signature,
-          inputs: Tuple[ List[int], Optional[int], Optional[Any], ErasedDevice, Optional[bool] ]):
-    # zeros(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
-    #
-    # REMARK: in the PyTorch-internal operator definition expression, an asterisk ("*") is merely a marker of
-    #         the beginning of the sublist of _keyword arguments_, and does not result in an actual argument.
-
-    from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
-
-    size, dtype_underlying, layout, _erased_device, pin_memory = inputs
-
-    # TODO parameters to support, currently they are all None
-    assert layout is None
-    assert pin_memory is None
-
-    if dtype_underlying is not None:
-        # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
-        # which is the underlying type of PyTorch C++ enum 'ScalarType'.
-        dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
-    else:
-        dtype = torch.get_default_dtype()
-
-    ir_dtype : IRDType = DType2IRDType.map(dtype)
-
-    for dim, i in enumerate(size):
-        if not isinstance(dim, int) and not dim >= 0:
-            raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
-    return IRZeros(signature, size, 'zeros', ir_dtype)
-
-def Ones(signature,
-         inputs: Tuple[ List[int], Optional[int], Optional[Any], ErasedDevice, Optional[bool] ]):
-    # ones(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
-
-    size, dtype_underlying, layout, _erased_device, pin_memory = inputs
-
-    # TODO parameters to support, currently they are all None
-    assert layout is None
-    assert pin_memory is None
-    from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
-
-    if dtype_underlying is not None:
-        # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
-        # which is the underlying type of PyTorch C++ enum 'ScalarType'.
-        dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
-    else:
-        dtype = torch.get_default_dtype()
-
-    ir_dtype : IRDType = DType2IRDType.map(dtype)
-
-    for dim, i in enumerate(size):
-        if not isinstance(dim, int) and not dim >= 0:
-            raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
-    return IROnes(signature, size, 'ones', ir_dtype)
-
-def Rand(signature,
-         inputs: Tuple[ List[int], Optional[int], Optional[Any], ErasedDevice, Optional[bool] ]):
-    # ones(int[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
-
-    size, dtype_underlying, layout, _erased_device, pin_memory = inputs
-
-    # TODO parameters to support, currently they are all None
-    assert layout is None
-    assert pin_memory is None
-    from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
-
-    if dtype_underlying is not None:
-        # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
-        # which is the underlying type of PyTorch C++ enum 'ScalarType'.
-        dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
-    else:
-        dtype = torch.get_default_dtype()
-
-    ir_dtype : IRDType = DType2IRDType.map(dtype)
-
-    for dim, i in enumerate(size):
-        if not isinstance(dim, int) and not dim >= 0:
-            raise RuntimeWarning(f"The {i}-th component of the size must be non-negative integer")
-    return IRRand(signature, size, 'rand', ir_dtype)
-
-def NewTensor(data: Union[int, float, list], dtype=None, device=None, requires_grad=False, pin_memory=False, signature=None):
-    # NOTE: not sure all the keys of torch.tensor
-    assert requires_grad == False
-    from cube.graph.parser.mapping import DType2IRDType
-    if dtype is None:
-        dtype = torch.get_default_dtype()
-    ir_dtype : IRDType = DType2IRDType.map(dtype)
-    kwargs = {'dtype': ir_dtype, 'device': device, 'requires_grad': requires_grad, 'pin_memory': pin_memory}
-    return IRNewTensor(signature, data, 'tensor', **kwargs)
+def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
+          device=None, requires_grad=False, signature=None):
+    # note: device is ignored
+    signature = 'cube.runtime.function.zeros'
+    size = (size,) if isinstance(size, int) else tuple(size)
+    size: Tuple[int] = size + arg_size
+    assert all(isinstance(dimlen, int) for dimlen in size), f"Zeros only supports static size but got {size}"
+    assert layout is None, f"Not support for non-default layout"
+    # FIXME: torch.jit.script has dtype with int
+    # from cube.graph.parser.mapping import TorchScalarTypeEnumMap
+    # dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
+    anno, rules = _get_creator_anno_rules(size, True)
+    dimop = IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs)
+    from cube.graph.parser.dtype import DType2IRDType
+    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    return dimop
 
 
-# def NewTensor(signature,
-#               inputs: Tuple[ list, Optional[int], ErasedDevice, bool ]):
-#     # aten::tensor(t[] data, *, ScalarType? dtype=None, Device? device=None, bool requires_grad=False) -> Tensor
-#     #
-#     # REMARK: in the PyTorch-internal operator definition expression, an asterisk ("*") is merely a marker of
-#     #         the beginning of the sublist of _keyword arguments_, and does not result in an actual argument.
+def Ones(size, *arg_size, out=None, dtype=None, layout=None,
+         device=None, requires_grad=False, signature=None):
+    # note: device is ignored
+    signature = 'cube.runtime.function.ones'
+    size = (size,) if isinstance(size, int) else tuple(size)
+    size: Tuple[int] = size + arg_size
+    assert all(isinstance(dimlen, int) for dimlen in size), f"Ones only supports static size but got {size}"
+    assert layout is None, f"Not support for non-default layout"
+    # FIXME: torch.jit.script has dtype with int
+    # from cube.graph.parser.mapping import TorchScalarTypeEnumMap
+    # dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
+    anno, rules = _get_creator_anno_rules(size, True)
+    dimop = IRDimops(Ones, 'ones', signature, [anno], [], rules, **kwargs)
+    from cube.graph.parser.dtype import DType2IRDType
+    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    return dimop
 
-#     data, dtype_underlying, _erased_device, requires_grad = inputs
 
-#     # TODO parameters to support, currently they are all None
-#     assert requires_grad == False
-#     from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
+def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
+         pin_memory=False, memory_format=None, signature=None):
+    # note: device is ignored
+    signature = 'cube.runtime.function.rand'
+    size = (size,) if isinstance(size, int) else tuple(size)
+    size: Tuple[int] = size + arg_size
+    assert all(isinstance(dimlen, int) for dimlen in size), f"Rand only supports static size but got {size}"
+    assert layout is None and memory_format is None, f"Not support for non-default memory_format and layout"
+    # FIXME: torch.jit.script has dtype with int
+    # from cube.graph.parser.mapping import TorchScalarTypeEnumMap
+    # dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    kwargs = {'size': size, 'requires_grad': requires_grad,
+              'dtype': dtype, 'pin_memory': pin_memory}
+    anno, rules = _get_creator_anno_rules(size, True)
+    dimop = IRDimops(Rand, 'rand', signature, [anno], [], rules, **kwargs)
+    from cube.graph.parser.dtype import DType2IRDType
+    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    return dimop
 
-#     if dtype_underlying is not None:
-#         # If some torch.dtype is specified at the frontend, in TorchScript it becomes an int,
-#         # which is the underlying type of PyTorch C++ enum 'ScalarType'.
-#         dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
-#     else:
-#         dtype = torch.get_default_dtype()
 
-#     ir_dtype : IRDType = DType2IRDType.map(dtype)
-
-#     # if 'data' is not:
-#     # 1) ints or floats of any precision, e.g. i8, i64, f16, f32
-#     # 2) non-ragged
-#     # ... then this call will throw.
-#     arr = torch.tensor(data, dtype=dtype)
-
-#     # TODO temporarily fake creation with Zeros
-#     # and remark that originally aten::tensor should be able to infer the dtype from the specified 'data',
-#     # but since we have omitted the 'data', we must do type inferrence ourselves,
-#     # only in this way we get correct dtype e.g. ints or bools.
-#     return IRNewTensor(signature, data, 'tensor', ir_dtype=ir_dtype)
-
-def ToTensor(signature,
-             inputs: Tuple[ IRTensor, ... ]):
-    """
-    'aten::to' has many overloadings that need resolution,
-    they differ by both the arity and the type of the argument (possibly at the same position):
-
-    ```
-    aten::to.device(Tensor self, Device device, int dtype, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor):
-    aten::to.dtype(Tensor self, int dtype, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor):
-    aten::to.dtype_layout(Tensor self, *, int dtype, int layout, Device device, bool pin_memory=False, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor):
-    aten::to.other(Tensor self, Tensor other, bool non_blocking=False, bool copy=False, int? memory_format=None) -> (Tensor):
-    aten::to.prim_Device(Tensor(a) self, Device? device, int? dtype=None, bool non_blocking=False, bool copy=False) -> (Tensor(b|a)):
-    aten::to.prim_dtype(Tensor(a) self, int? dtype=None, bool non_blocking=False, bool copy=False) -> (Tensor(b|a)):
-    aten::to.prim_other(Tensor(a) self, bool non_blocking=False, bool copy=False) -> (Tensor(b|a)):
-    ```
-    ... where the 'int? dtype' is the underlying type for the enum 'ScalarType'.
-    """
-
-    # in our case we only care the overloading 'to.dtype' (arity=5)
-    assert len(inputs) == 5
-    tensor : IRTensor
-    dtype_underlying : int
-    non_blocking : bool
-    copy : bool
-    opt_memory_format : Optional[int]
-    tensor, dtype_underlying, non_blocking, copy, opt_memory_format = inputs
-
-    from cube.graph.parser.mapping import DType2IRDType, TorchScalarTypeEnumMap
-    dtype : torch.dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
-    ir_dtype : IRDType = DType2IRDType.map(dtype)
-
-    signature = 'torch.Tensor.to'
-    return IRToTensor(signature, [tensor], 'to', ir_dtype=ir_dtype)
+def NewTensor(data, *, dtype=None, device=None, 
+              requires_grad=False, pin_memory=False, signature=None):
+    # note: device is ignored
+    signature = 'cube.runtime.function.tensor'
+    size = tuple(np.array(data).shape)
+    assert all(isinstance(dimlen, int) for dimlen in size), f"Ones only supports static size but got {size}"
+    # FIXME: torch.jit.script has dtype with int
+    # from cube.graph.parser.mapping import TorchScalarTypeEnumMap
+    # dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    kwargs = {'size': size, 'requires_grad': requires_grad, 
+              'dtype': dtype, 'pin_memory': pin_memory}
+    anno, rules = _get_creator_anno_rules(size, True)
+    dimop = IRDimops(NewTensor, 'tensor', signature, [anno], [], rules, **kwargs)
+    from cube.graph.parser.dtype import DType2IRDType
+    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    return dimop
 
 
 def _handle_broadcast(lhs: IRTensor, rhs: IRTensor) -> Tuple[List[str]]:
@@ -791,6 +743,7 @@ def View(input, size: Tuple[int], *arg_size, signature = None):
     shape_map: Dict[str, int] = {edim: eshape for (edim, eshape) in zip(edims, chain)}
 
     # generate input and output shape annotations
+    # greedy fuse suffix number
     def buckets(shape: List[int], chain: List[int], edims: List[int]) -> List[List[str]]:
         anno = []
         dimidx = 0
@@ -971,7 +924,7 @@ def Reshape(input, shape: Tuple[int], *arg_shape, signature = None):
                     elements *= chain[dimidx]
                     bracket.append(edims[dimidx])
                     dimidx += 1
-                    # fetch as many 1^ as possible from tail of the previous bracket
+            # fetch as many 1^ as possible from tail of the previous bracket
             if len(bracket) == 0:
                 assert dimlen == 1, f"internal match error3: dimlen={dimlen}"
                 back = 0
@@ -1095,13 +1048,15 @@ def Unsqueeze(input, dim, signature = None):
     return IRDimops(Unsqueeze, 'unsqueeze', signature, [anno], [input],dim=dim)
 
 
-def TypeAs(input, tensor, signature = None):
+def TypeAs(input: IRTensor, tensor: IRTensor, signature = None):
     """
     out = torch.Tensor.type_as(tensor0, tensor1)
     """
     edim_in0 = ShapeAnno.create_shape_str(tensor.shape)
     anno = OpAnno.create_op_str(['*', edim_in0], ['*'])
-    return IRDimops(TypeAs, 'type_as', signature, [anno], [input, tensor])
+    dimop = IRDimops(TypeAs, 'type_as', signature, [anno], [input, tensor])
+    dimop.output(0).requires_grad = input.requires_grad
+    return dimop
 
 
 def Triu(input, diagonal=0, *, out=None, signature = None):
@@ -1535,11 +1490,15 @@ def _comparison(creator: Callable, f: Callable, name: str, signature: str,
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-        return IRDimops(creator, name, signature, annos, [input, other])
+        dimop = IRDimops(creator, name, signature, annos, [input, other])
+        dimop.output(0).parent.dtype = IRDType.boolean
+        return dimop
     # case2: torch.equal(tensor1, obj2) / torch.equal(obj1, tensor2)
     if isinstance(input, IRTensor) or isinstance(other, IRTensor):
         annos = ['*, ? -> *', '?, * -> *',]
-        return IRDimops(creator, name, signature, annos, [input, other])
+        dimop = IRDimops(creator, name, signature, annos, [input, other])
+        dimop.output(0).parent.dtype = IRDType.boolean
+        return dimop
     # case3: torch.equal(obj1, obj2)
     else:
         return IRPyFunc(signature, [input, other], [IRObject()])

@@ -2,6 +2,12 @@
 
 
 # USE_TORCHFX=1 SINGLE_DEV_MODE=1 PYTHONPATH=.:$PYTHONPATH:torchscaletest/torchscale python examples/nlp/torchscale/run_torchscale_lm.py  examples/nlp/torchscale/lm_input  --activation-fn gelu --share-decoder-input-output-embed --validate-interval-updates 1000 --save-interval-updates 1000 --no-epoch-checkpoints --memory-efficient-fp16 --fp16-init-scale 4 --arch lm_base --task language_modeling --sample-break-mode none --tokens-per-sample 128 --optimizer adam --adam-betas "(0.9, 0.98)" --adam-eps 1e-08 --clip-norm 0.0 --lr 5e-4 --lr-scheduler polynomial_decay --warmup-updates 750 --dropout 0.1 --attention-dropout 0.1 --weight-decay 0.01 --batch-size 4 --update-freq 1 --required-batch-size-multiple 1 --total-num-update 50000 --max-update 50000 --seed 1 --ddp-backend=c10d --subln --xpos-rel-pos --fp16 --policy PASData
+# multi-GPU inference test
+# OMP_NUM_THREADS=12 USE_TORCHFX=1 PYTHONPATH=.:..:$PYTHONPATH python -m torch.distributed.launch --nproc_per_node=2 --master_port=25642 examples/nlp/torchscale/run_torchscale_lm.py examples/nlp/torchscale/lm_input  --activation-fn gelu --share-decoder-input-output-embed --validate-interval-updates 1000 --save-interval-updates 1000 --no-epoch-checkpoints --memory-efficient-fp16 --fp16-init-scale 4 --arch lm_base --task language_modeling --sample-break-mode none --tokens-per-sample 128 --optimizer adam --adam-betas "(0.9, 0.98)" --adam-eps 1e-08 --clip-norm 0.0 --lr 5e-4 --lr-scheduler polynomial_decay --warmup-updates 750 --dropout 0.1 --attention-dropout 0.1 --weight-decay 0.01 --batch-size 4 --update-freq 1 --required-batch-size-multiple 1 --total-num-update 50000 --max-update 50000 --seed 1 --subln --xpos-rel-pos --fp16 --policy PASData
+# single-GPU training test
+# OMP_NUM_THREADS=12 USE_TORCHFX=1 PYTHONPATH=.:..:$PYTHONPATH python -m torch.distributed.launch --nproc_per_node=1 --master_port=25642 examples/nlp/torchscale/run_torchscale_lm.py examples/nlp/torchscale/lm_input  --activation-fn gelu --share-decoder-input-output-embed --validate-interval-updates 1000 --save-interval-updates 1000 --no-epoch-checkpoints --memory-efficient-fp16 --fp16-init-scale 4 --arch lm_base --task language_modeling --sample-break-mode none --tokens-per-sample 128 --optimizer adam --adam-betas "(0.9, 0.98)" --adam-eps 1e-08 --clip-norm 0.0 --lr 5e-4 --lr-scheduler polynomial_decay --warmup-updates 750 --dropout 0.1 --attention-dropout 0.1 --weight-decay 0.01 --batch-size 4 --update-freq 1 --required-batch-size-multiple 1 --total-num-update 50000 --max-update 50000 --seed 1 --subln --xpos-rel-pos --fp16 --policy PASData --do_train
+# multi-GPU training test
+# OMP_NUM_THREADS=12 USE_TORCHFX=1 PYTHONPATH=.:..:$PYTHONPATH python -m torch.distributed.launch --nproc_per_node=2 --master_port=25642 examples/nlp/torchscale/run_torchscale_lm.py examples/nlp/torchscale/lm_input  --activation-fn gelu --share-decoder-input-output-embed --validate-interval-updates 1000 --save-interval-updates 1000 --no-epoch-checkpoints --memory-efficient-fp16 --fp16-init-scale 4 --arch lm_base --task language_modeling --sample-break-mode none --tokens-per-sample 128 --optimizer adam --adam-betas "(0.9, 0.98)" --adam-eps 1e-08 --clip-norm 0.0 --lr 5e-4 --lr-scheduler polynomial_decay --warmup-updates 750 --dropout 0.1 --attention-dropout 0.1 --weight-decay 0.01 --batch-size 4 --update-freq 1 --required-batch-size-multiple 1 --total-num-update 50000 --max-update 50000 --seed 1 --subln --xpos-rel-pos --fp16 --policy PASData --do_train
 
 from pathlib import Path
 import torch
@@ -35,7 +41,7 @@ args = options.parse_args_and_arch(parser)
 cfg = convert_namespace_to_omegaconf(args)
 task = tasks.setup_task(cfg.task)
 model = task.build_model(cfg.model)
-model.eval()
+model.train()
 print("building model succeed: ", type(model))
 
 # create dummy input
@@ -152,7 +158,7 @@ print("trace succeed")
 print("checking equal...")
 with torch.no_grad():
     output_traced = traced_graph(**dummy_input)
-assert check_equal(output_origin, output_traced), "check equal failed"
+# assert check_equal(output_origin, output_traced), "check equal failed"
 print("checked")
 
 # check graph
@@ -183,6 +189,7 @@ class dotdict(dict):
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
 
+# config = dotdict({'profile_dir': str(Path.home())+'/.autodist/', 'task_name': f'torchscale_{bs}_{seql}_{ngpu}'})
 config = dotdict({'profile_dir': str(Path.home())+'/.autodist/', 'task_name': f'torchscale_{bs}_{seql}_{hidden_dim}_{ngpu}'})
 config.autodist_config = dotdict({'ngpus': ngpu})
 # NOTE add SINGLE_DEV_MODE=1 before the running command

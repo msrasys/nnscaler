@@ -67,7 +67,7 @@ import enum
 import re
 import string
 
-from cube.ir.cten import IRTensor
+from cube.ir.cten import IRTensor, IRObject
 from cube.ir.dtype import DTypeInferRule
 from cube.ir.operator import IRFwOperation
 from cube.algorithm.factory import DistAlgorithmFactory
@@ -411,8 +411,11 @@ class OpAnno:
         if '->' not in anno:
             raise ValueError(f"Syntax Error: Expected -> in operator anno: {anno}")
         inputs, outputs = anno.split('->')
-        inputs = inputs.split(',')
-        outputs = outputs.split(',')
+
+        inputs = inputs.strip()
+        inputs = [] if len(inputs) == 0 else inputs.split(',')
+        outputs = outputs.strip()
+        outputs = [] if len(outputs) == 0 else outputs.split(',')
         # to ShapeAnnos
         inputs: Tuple[ShapeAnno] = tuple(ShapeAnno(shape) for shape in inputs)
         outputs: Tuple[ShapeAnno] = tuple(ShapeAnno(shape) for shape in outputs)
@@ -564,7 +567,7 @@ class IRDimops(IRFwOperation):
     """
     def __init__(self, create_fn: Callable, name: str,
                  signature: str, annos: Tuple[str],
-                 inputs: List[IRTensor],
+                 inputs: List[Union[IRTensor, IRObject]],
                  transform_rules: Optional[Tuple[TransformRule]] = None,
                  **kwargs):
         """!
@@ -603,12 +606,7 @@ class IRDimops(IRFwOperation):
             )
 
         n_outputs = len(self._oannos)
-        super().__init__(name, signature, len(inputs), n_outputs)
-        # set input
-        for idx, input in enumerate(inputs):
-            self.set_input(idx, input)
-        for name in kwargs:
-            self.kwargs[name] = kwargs[name]
+        super().__init__(name, signature, inputs, n_outputs, **kwargs)
 
     @property
     def anno(self) -> OpAnno:
@@ -646,8 +644,6 @@ class IRDimops(IRFwOperation):
 
         @return sucess: True if successfully inferred shape
         """
-        idtypes = [t.dtype for t in self._inputs if isinstance(t, IRTensor)]
-        odtype = DTypeInferRule.infer(self, idtypes)
         for oidx, otensor in enumerate(self.outputs()):
             shape_anno = self.oanno(oidx)
             shape = []
@@ -657,10 +653,6 @@ class IRDimops(IRFwOperation):
                     accum *= self.anno.getlen(identifier)
                 shape.append(accum)
             otensor.shape = shape
-            # set output shape
-            # if isinstance(otensor, IRSubTensor):
-            #     otensor.parent.dtype = odtype
-            # otensor.dtype = odtype
         # print(f'=> sign: {self.signature} anno: {self.anno}\n'
         #       f'=> inputs: {self.inputs()}\n'
         #       f'=> outputs: {self.outputs()}')

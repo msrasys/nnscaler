@@ -9,7 +9,8 @@ from cube.graph.function.pyfunc import IRPyFunc
 from cube.ir.tensor import IRFullTensor
 import cube.ir as ir
 from cube.graph.parser.frame import Frame
-from cube.graph.parser.mapping import Sign2Op, DType2IRDType
+from cube.graph.parser.mapping import Sign2Op
+from cube.graph.parser.dtype import DType2IRDType
 
 
 _refmodule = torch.nn.Module()
@@ -746,7 +747,7 @@ class ScriptModuleParser:
         fsig: str = str(node.pyname())
 
         # map to IR operator
-        ir_node = Sign2Op.map(fsig)(inputs=input_vals)
+        ir_node = Sign2Op.map(fsig)(*input_vals)
 
         # push output in the frame
         # help: >>> a = torch._C.TupleType([torch._C.TensorType.getInferred()])

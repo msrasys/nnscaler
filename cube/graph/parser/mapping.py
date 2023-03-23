@@ -1,17 +1,12 @@
-"""
-Mapping of
-    signature -> IROperator
-    torch.dtype -> cube.ir.IRDType
-    cube.ir.IRDType -> torch.dtype
-"""
+
 import torch
 
-from typing import Callable, Dict, Union
+from typing import Callable, Union
 from functools import partial
 
 import cube.graph.function as function
-import cube.ir as ir
 from cube.ir.operator import IRFwOperation
+from cube.graph.parser.register import CustomizedOps
 
 
 class Sign2Op:
@@ -21,26 +16,19 @@ class Sign2Op:
         """
         Map the signature to GenericLogicalOp
         """
-        if 'torch.' not in signature and 'cube.runtime.' not in signature:
-            signature = signature.split('.')[-1]
         if signature in Sign2Op.kOpMap:
             return partial(Sign2Op.kOpMap[signature], signature=signature)
-        else:
-            raise KeyError(f"{signature} is not supported yet")
-            # print(f'warning: {signature} is not recognized')
-            # return partial(function.UnkownOperator, signature=signature)
+        if CustomizedOps.exist(signature):
+            return CustomizedOps.map(signature)
+        raise KeyError(f"{signature} is not supported yet")
 
     @staticmethod
-    def register(signature: str, op: Callable[..., Union[IRFwOperation, int, float]], code):
-        """
-        Register an operator
-        """
-        if not isinstance(signature, str):
-            raise TypeError(f"Expected signature to be str but got {type(signature)}")
+    def exist(signature: str) -> bool:
         if signature in Sign2Op.kOpMap:
-            raise KeyError(f"function {signature} is already registered")
-        Sign2Op.kOpMap[signature] = op
-        Sign2Op.kOpCodeDef[signature] = code
+            return True
+        if CustomizedOps.exist(signature):
+            return True
+        return False
 
     # functional templates
     __ftemplate = lambda name: f'torch.nn.functional.{name}'
@@ -84,7 +72,6 @@ class Sign2Op:
         __ttemplate('zeros'): function.Zeros,
         __ttemplate('ones'): function.Ones,
         __ttemplate('tensor'): function.NewTensor,
-        __ttemplate('to'): function.ToTensor,
         __ttemplate('rand'): function.Rand,
         __ttemplate('clone'): function.Clone,
 
@@ -164,49 +151,6 @@ class Sign2Op:
         __rtemplate('accum'): function.Accum,
 
     }
-
-    # customized operator code: signature -> code
-    kOpCodeDef: Dict[str, str] = {}
-
-
-class DType2IRDType:
-
-    @staticmethod
-    def map(dtype: torch.dtype):
-        """
-        Map the torch dtype to IRDType
-        """
-        return DType2IRDType.kDtypeMap[dtype]
-
-    kDtypeMap = {
-        torch.double:  ir.float64,
-        torch.float64: ir.float64,
-        torch.float32: ir.float32,
-        torch.float  : ir.float32,
-        torch.float16: ir.float16,
-        torch.half   : ir.float16,
-        torch.uint8  : ir.uint8,
-        torch.int8   : ir.int8,
-        torch.int16  : ir.int16,
-        torch.short  : ir.int16,
-        torch.int32  : ir.int32,
-        torch.int    : ir.int32,
-        torch.int64  : ir.int64,
-        torch.long   : ir.int64,
-        torch.bool   : ir.boolean
-    }
-
-
-class IRDType2TorchDType:
-
-    @staticmethod
-    def map(ir_dtype: ir.IRDType):
-        """
-        Map the IRDtype to torch dtype
-        """
-        return IRDType2TorchDType.kDtypeMap[ir_dtype]
-    
-    kDtypeMap = {val: key for key, val in DType2IRDType.kDtypeMap.items()}
 
 
 # see https://github.com/pytorch/pytorch/blob/master/c10/core/ScalarType.h

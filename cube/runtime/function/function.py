@@ -9,6 +9,7 @@ def identity(tensor: torch.Tensor) -> torch.Tensor:
     """
     return tensor
 
+
 def anchor(name: str):
     """
     anchor operation for graph navigation
@@ -22,8 +23,10 @@ def multiref(tensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]:
     """
     return tensor if times == 1 else tuple([tensor] * times)
 
+
 def to(tensor: torch.Tensor, dtype_or_device: Union[torch.device, torch.dtype]) -> torch.Tensor:
     return tensor.to(dtype_or_device)
+
 
 def accum(*tensors: Tuple[torch.Tensor]) -> torch.Tensor:
     """
@@ -37,8 +40,10 @@ def accum(*tensors: Tuple[torch.Tensor]) -> torch.Tensor:
 def expand(input: torch.Tensor, sizes: Union[torch.Size, List[int]]) -> torch.Tensor:
     return input.expand(*sizes)
 
+
 def fullslice(input: torch.Tensor, slicers: Tuple[Union[None, slice]]):
     return input[slicers]
+
 
 def conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
            stride: int, padding: List[int], dilation, groups: int = 1):
@@ -53,6 +58,7 @@ def conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tenso
     padding = padding[len(padding) // 2:] + padding[0:len(padding) // 2]
     input = TorchF.pad(input, padding, 'constant', 0)
     return TorchF.conv2d(input, weight, bias, stride=stride, dilation=dilation, groups=groups)
+
 
 def conv3d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
            stride: int, padding: List[int], dilation, groups: int = 1):
@@ -69,6 +75,7 @@ def conv3d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tenso
     pad_padding = [padding[-1 - (i // 2)] for i in range(len(padding) * 2)]
     input = TorchF.pad(input, pad_padding, 'constant', 0)
     return TorchF.conv3d(input, weight, bias, stride=stride, dilation=dilation, groups=groups)
+
 
 def embedding(input: torch.Tensor, weight: torch.Tensor, padding_idx: Optional[int], start: int, stop: int):
     """
@@ -118,14 +125,55 @@ def select_scatter(input:torch.Tensor, src:torch.Tensor, dim:int, index:int):
 
     return torch.masked_scatter(input, mask, src)
 
+
+def empty(size: Tuple[int], dtype=None, requires_grad=False, pin_memory=False):
+    return torch.empty(
+        size, dtype=torch.get_default_dtype() if dtype is None else dtype,
+        device=torch.cuda.current_device(),
+        requires_grad=requires_grad, pin_memory=pin_memory
+    )
+
+
+def zeros(size: Tuple[int], dtype=None, requires_grad=False):
+    return torch.zeros(
+        size, dtype=torch.get_default_dtype() if dtype is None else dtype,
+        device=torch.cuda.current_device(),
+        requires_grad=requires_grad
+    )
+
+
+def ones(size: Tuple[int], dtype=None, requires_grad=False):
+    return torch.ones(
+        size, dtype=torch.get_default_dtype() if dtype is None else dtype,
+        device=torch.cuda.current_device(),
+        requires_grad=requires_grad
+    )
+
+
+def rand(size: Tuple[int], dtype=None, requires_grad=False):
+    return torch.rand(
+        size, dtype=torch.get_default_dtype() if dtype is None else dtype,
+        device=torch.cuda.current_device(),
+        requires_grad=requires_grad
+    )
+
+def arange(start: int, end: int, step: int, dtype: torch.dtype, requires_grad=False):
+    return torch.arange(start=start, end=end, step=step, 
+                        dtype=dtype, requires_grad=requires_grad,
+                        device=torch.cuda.current_device())
+
+
 def index_select(input: torch.Tensor, index: torch.Tensor, dim: int) -> torch.Tensor:
     return torch.index_select(input, dim, index)
+
 
 def einsum(*operands, equation=None) -> torch.Tensor:
     return torch.einsum(equation, *operands)
 
+
 def stack(*tensors, dim=0) -> torch.Tensor:
     return torch.stack(tensors, dim)
+
 
 def cat(*tensors, dim=0) -> torch.Tensor:
     return torch.cat(tensors, dim)

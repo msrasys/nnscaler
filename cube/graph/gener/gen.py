@@ -6,7 +6,7 @@ from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.gener.concurrent import ConcurrentGener
 import cube.graph.gener.utils as utils
 from cube.graph.graph import IRGraph
-from cube.graph.segment import IRSegment
+from cube.graph.segment import IRSegment, CellPosition
 from cube.graph.function.pyfunc import IRPyFunc
 
 from cube.ir.cten import IRCell, IRObject
@@ -23,7 +23,6 @@ DeviceID = int
 def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) -> List[IRFwOperation]:
     """
     Create dummy operators segment inputs and outputs. 
-    The backward operator is also inserted.
 
     @param segment IRSegment: the target segment
     @param inputs bool: True for creating dummy operators to produce segement's inputs
@@ -32,8 +31,8 @@ def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) 
     @return nodes List[IRCell]: the generated operation
     """
     # devices = segment.device
-    fwops = []
-
+    input_producers: Dict[IRFullTensor, List[IRCell]] = {}
+    output_consumers: Dict[IRFullTensor, List[IRCell]] = {}
     # create inputs
     if inputs:
         input_objects = IRGraph.get_objects_from_complex(segment.inputs())
@@ -46,12 +45,9 @@ def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) 
                 fop = fwop.replicate()
                 fop.device = devid
                 if tensor.requires_grad:
-                    fop.output(0).grad = tensor.grad.select(tensor.indmap, (0, 1))
-                    segment.finsert(fop, 0)
-                else:
-                    segment.insert(fop, 0)
-                fwops.append(fop)
-    
+                    fop.output(0).grad = tensor.parent.grad.select(tensor.indmap, (0, 1))
+                    fop.output(0).grad.cell = fop
+                input_producers.setdefault(tensor.parent, []).append(fop)
     # create outputs
     if outputs:
         output_objects = IRGraph.get_objects_from_complex(segment.outputs())
@@ -63,17 +59,14 @@ def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) 
             for devid in devices:
                 fop = fwop.replicate()
                 fop.device = devid
-                if tensor.requires_grad and segment.mirror != segment:
-                    fop.input(0).grad = tensor.grad.select(tensor.indmap, (0, 1))
-                    segment.finsert(fop, segment.nnodes)
-                else:
-                    segment.insert(fop, segment.nnodes)
-                fwops.append(fop)
-
-    return fwops
+                if tensor.requires_grad:
+                    fop.input(0).grad = tensor.parent.grad.select(tensor.indmap, (0, 1))
+                    fop.input(0).grad.cell = fop
+                output_consumers.setdefault(tensor.parent, []).append(fop)
+    return input_producers, output_consumers
 
 
-def expand_devices(tensors: List[IRSubTensor], 
+def expand_devices(tensors: List[Optional[IRSubTensor]], 
                    producer: bool = False, consumer: bool = False) -> List[IRSubTensor]:
     """
     Scatter a tensor if it is on multiple devices. It produces a tensor list where
@@ -87,6 +80,7 @@ def expand_devices(tensors: List[IRSubTensor],
     """
     dtensors = []
     for tensor in tensors:
+        if tensor is None: continue
         if len(tensor.device) == 1:
             dtensors.append(tensor)
             continue
@@ -301,8 +295,7 @@ class IRAdapterGener:
                     return False
             return True
 
-        fdummies = create_dummy(graph, inputs=True, outputs=True)
-        bdummies = [fwop.mirror for fwop in fdummies if fwop.mirror is not None]
+        input_producer, output_consumer = create_dummy(graph, inputs=True, outputs=True)
         bgraph: Optional[IRSegment] = graph.mirror
     
         # local producer fusion and local consumer multiref
@@ -321,7 +314,7 @@ class IRAdapterGener:
         # reorder again since inserted multiref could be mis-ordered
         graph._reorder_producer_consumer()
 
-        # generate adapter for inter-segments
+        # generate adapter for intra-segments
         # FIXME: assume producers and consumers can run in parallel
         for ftensor in ftensors:
 
@@ -330,9 +323,15 @@ class IRAdapterGener:
 
             # producers can be operators and graph inputs
             fproducers, fptensors = graph.producers(ftensor), graph.ptensors(ftensor)
+            if ftensor in input_producer:
+                fptensors = fptensors + tuple(fop.output(0) for fop in input_producer[ftensor])
             fptensors = expand_devices(fptensors, producer=True)
             assert all(len(ptensor.device) == 1 for ptensor in fptensors), "Not support for multi-device"
+
+            # consumers can be operators and graph outputs
             fconsumers, fctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
+            if ftensor in output_consumer:
+                fctensors = fctensors + tuple(fwop.input(0) for fwop in output_consumer[ftensor])
             fctensors = expand_devices(fctensors, consumer=True)
             assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
 
@@ -340,13 +339,17 @@ class IRAdapterGener:
             bconsumers, bctensors = [], []
             if isinstance(ftensor.grad, IRFullTensor):
                 bproducers, bptensors = bgraph.producers(ftensor.grad), bgraph.ptensors(ftensor.grad)
+                if ftensor in output_consumer:
+                    bptensors = bptensors + tuple(fwop.input(0).grad for fwop in output_consumer[ftensor])
                 bptensors = expand_devices(bptensors, producer=True)
                 assert all(len(ptensor.device) == 1 for ptensor in bptensors), (
                     f"Not support for multi-device:\n"
                     f"{[ptensor.device for ptensor in bptensors]}"
                     f"{[ptensor.cell for ptensor in bptensors]}"
                 )
-                bconsumers, bctensors = bgraph.consumers(ftensor.grad), bgraph.ctensors(ftensor.grad)    
+                bconsumers, bctensors = bgraph.consumers(ftensor.grad), bgraph.ctensors(ftensor.grad)
+                if ftensor in input_producer:
+                    bctensors = bctensors + tuple(fwop.output(0).grad for fwop in input_producer[ftensor]) 
                 bctensors = expand_devices(bctensors, consumer=True)
                 assert all(len(ctensor.device) == 1 for ctensor in bctensors), "Not support for multi-device"
 
@@ -376,28 +379,21 @@ class IRAdapterGener:
 
             # insert forward adapter
             # graph.insert(fadapter, max(producers) + 1)
-            fidx = min(graph.index(c) for c in fconsumers)
+            tail = CellPosition((graph.nnodes,))
+            fconsumer_idx = [tail] + [graph.index(c) for c in fconsumers]
+            fidx = min(fconsumer_idx)
             # setup recompute
             if fadapter.differentiable and allow_recompute:
-                fadapter.recompute = graph.node(fidx).recompute
+                fadapter.recompute = graph.node(fidx if fidx != tail else fidx-1).recompute
             graph.insert(fadapter, fidx)
 
             # insert backward adapter
             if badapter is not None:
                 assert isinstance(badapter, IRAdapter)
                 assert isinstance(bgraph, IRSegment)
-                bproducers = [
-                    bgraph.index(consumer.mirror) + 1 for \
-                        consumer in graph.consumers(ftensor)
-                ]
-                bidx = max(bproducers) if len(bproducers) > 0 else 0
+                bproducer_idx = [CellPosition((0,))] + [bgraph.index(consumer.mirror) + 1 for consumer in fconsumers]
+                bidx = max(bproducer_idx)
                 bgraph.insert(badapter, bidx)
-
-        # remove dummy op
-        for dummy_op in fdummies:
-            graph.remove(dummy_op)
-        for dummy_op in bdummies:
-            bgraph.remove(dummy_op)
 
         # generate adapter for each segment
         segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
@@ -676,7 +672,9 @@ class IRAdapterGener:
                         output.grad = multiref.output(idx).grad.parent.select(otensor.indmap, (0,1))
                     mr.set_output(idx, output)
                 mr.device = otensor.device
-                mr.recompute = otensor.cell.recompute
+                # Dataloader has no recompute
+                if hasattr(otensor.cell, 'recompute'):
+                    mr.recompute = otensor.cell.recompute
                 multirefs.append(mr)
             # remove original multiref
             fidx = graph.remove(multiref)

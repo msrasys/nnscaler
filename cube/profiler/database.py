@@ -12,8 +12,8 @@ import _operator
 import cube
 from cube.ir.cten import IRTensor, IRObject
 from cube.ir.operator import IRFwOperation
-from cube.graph.parser.mapping import IRDType2TorchDType
-from cube.graph.parser.mappingfx import SignFx2Op as Sign2Op
+from cube.graph.parser.dtype import IRDType2TorchDType
+from cube.graph.parser.register import CustomizedOps
 
 
 Shapes = NewType('Shapes', Tuple[Tuple[int]])
@@ -53,11 +53,13 @@ class CompProfiler:
         # create data
         assert dtypes is not None
         def gen_torch_tensors(shape, dtype, requires_grad):
+            """Generate dummy input tenosrs"""
             constructor = torch.zeros if dtype in (torch.int64, torch.int32, torch.bool) else torch.rand
-            # requires_grad = False if dtype in (torch.int64, torch.int32, torch.bool) else True
             return constructor(tuple(shape), dtype=dtype, device=torch.cuda.current_device(), requires_grad=requires_grad)
+
         tensors = tuple(
-            gen_torch_tensors(shape, dtype, requires_grad) if value is None else value for shape, dtype, requires_grad, value in zip(shapes, dtypes, requires_grads, values)
+            gen_torch_tensors(shape, dtype, requires_grad) if isinstance(value, IRTensor) else value \
+                for shape, dtype, requires_grad, value in zip(shapes, dtypes, requires_grads, values)
         )
         require_backward = any([t.requires_grad for t in tensors if hasattr(t, 'requires_grad')])
         # FIXME: reconsidering requires_grad
@@ -165,21 +167,21 @@ class ProfileDataBase:
 
         def get_dep_names(sign: str):
             ret = []
-            code_impl = Sign2Op.kOpCodeDef[sign]
+            code_impl = CustomizedOps.kOpCodeDef[sign]
             for code_line in code_impl.split('\n'):
                 idx = code_line.find('# call: ')
                 if idx != -1:
                     dep_name = code_line[idx + 8:]
-                    assert dep_name in Sign2Op.kOpCodeDef, dep_name
+                    assert dep_name in CustomizedOps.kOpCodeDef, dep_name
                     ret = ret + get_dep_names(dep_name)
                     ret.append(dep_name)
             return ret
 
-        if node.signature in Sign2Op.kOpCodeDef:
+        if node.signature in CustomizedOps.kOpCodeDef:
             dep_code_impl = ''
             for dep_name in get_dep_names(node.signature):
-                dep_code_impl = dep_code_impl + Sign2Op.kOpCodeDef[dep_name]
-            code_impl: str = Sign2Op.kOpCodeDef[node.signature]
+                dep_code_impl = dep_code_impl + CustomizedOps.kOpCodeDef[dep_name]
+            code_impl: str = CustomizedOps.kOpCodeDef[node.signature]
             def_end = code_impl.find(':\n')
             assert def_end >= 0
             prev_code_lines = code_impl[:def_end+2]
@@ -191,14 +193,6 @@ class ProfileDataBase:
             exec(code_impl, globals(), local)
             fn = list(local.values())[0]
         else:
-            # if '_operator.' in node.signature:
-            #     if '_operator.or_' == node.signature:
-            #         fn = torch.bitwise_or
-            #     elif '_operator.invert' == node.signature:
-            #         fn = torch.bitwise_not
-            #     else:
-            #         fn = eval(node.signature.replace('_operator.', 'torch.'))
-            # else:
             fn = eval(node.signature)
         shapes, dtypes, requires_grads, values = [], [], [], []
         for t in node.inputs():
@@ -206,7 +200,7 @@ class ProfileDataBase:
                 shapes.append(t.shape)
                 dtypes.append(IRDType2TorchDType.map(t.dtype))
                 requires_grads.append(t.requires_grad)
-                values.append(None)
+                values.append(t)
             elif isinstance(t, IRObject):
                 raise RuntimeError('IRObject has not been supported in profiling.')
             else:
@@ -229,6 +223,7 @@ class ProfileDataBase:
         @return bw_span float: the backward span time in milliseconds
         @return infer_memory int: the peak memory in bytes after inference of the function
         @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
+        @return residual_mem: ??
         """
         fn, shapes, dtypes, requires_grads, values, kwargs = ProfileDataBase.get_func(node)
 
@@ -242,7 +237,7 @@ class ProfileDataBase:
         in_mem_info, param_mem_info = [], []
         residual_mem, input_count = 0, 0
         for t in node.inputs():
-            if hasattr(t, 'is_param') and t.is_param():
+            if isinstance(t, IRTensor) and t.is_param():
                 param_mem_info.append(t.byte_size())
             elif hasattr(t, 'byte_size'):
                 input_count += 1
@@ -416,6 +411,21 @@ class ProfileDataBase:
         with open(file, 'w') as f:
             json.dump(self._data, f)
 
+        
+    def dump_nodes(self, file: str, override=False):
+        if os.path.exists(file):
+            assert override, f"File {file} exists. Set override = True to force dump."
+        for signature in self._data.keys():
+            file_n = os.path.join(file, signature +'.json')
+            with open(file_n, 'w') as f:
+                json.dump(self._data[signature],f)   
+
+    def dump_node(self, file: str, signature ,override=False): 
+        assert signature in self._data.keys(), f'this node not be profiled'
+        file_n = os.path.join(file, signature +'.json')
+        with open(file_n, 'w') as f:
+            json.dump(self._data[signature],f)
+
     def load(self, file: str):
         """!
         load the profiled data into data base. The original existed one will be
@@ -425,6 +435,13 @@ class ProfileDataBase:
         """
         with open(file, 'r') as f:
             self._data = json.load(f)
+
+    def load_nodes(self, file: str):
+        for filename in os.listdir(file):
+            if filename.endswith('.json'):
+                with open(os.path.join(file, filename)) as f:
+                    signature = filename[:-len('.json')]
+                    self._data[signature] = json.load(f)
 
     def __repr__(self) -> str:
         data = []

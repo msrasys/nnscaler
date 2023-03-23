@@ -12,10 +12,7 @@ class IRPad(IRFwOperation):
         signature = 'torch.nn.functional.pad'
         assert len(inputs) == 1, "Expected only input, weight, bias as inputs"
         assert len(kwargs) == 3, "Expected 2 kwargs: mode, value"
-        super().__init__(name, signature, 1, 1)
-        for idx, input in enumerate(inputs):
-            self.set_input(idx, input)
-        self.kwargs.update(kwargs)
+        super().__init__(name, signature, inputs, 1, **kwargs)
 
     def infer_shape(self) -> bool:
         """
@@ -58,10 +55,7 @@ class IRConv2D(IRFwOperation):
         signature = 'cube.runtime.function.conv2d'
         assert len(inputs) == 3, "Expected only input, weight, bias as inputs"
         assert len(kwargs) == 4, "Expected 4 kwargs: stride, padding, dialation, groups"
-        super().__init__(name, signature, 3, 1)
-        for idx, input in enumerate(inputs):
-            self.set_input(idx, input)
-        self.kwargs.update(kwargs)
+        super().__init__(name, signature, inputs, 1, **kwargs)
 
     def infer_shape(self) -> bool:
         """
@@ -107,10 +101,7 @@ class IRConv3D(IRFwOperation):
         signature = 'cube.runtime.function.conv3d'
         assert len(inputs) == 3, "Expected only input, weight, bias as inputs"
         assert len(kwargs) == 4, "Expected 4 kwargs: stride, padding, dialation, groups"
-        super().__init__(name, signature, 3, 1)
-        for idx, input in enumerate(inputs):
-            self.set_input(idx, input)
-        self.kwargs.update(kwargs)
+        super().__init__(name, signature, inputs, 1, **kwargs)
 
     def infer_shape(self) -> bool:
         """

@@ -12,7 +12,7 @@ class IRGraphAnchor(IRFwOperation):
     user doesn't need to manipulate it.
     """
     def __init__(self, signature: str, name: str):
-        super().__init__(name, signature, 0, 1)
+        super().__init__(name, signature, [], 1)
         self.kwargs['name'] = name
         self.set_output(0, None)
     

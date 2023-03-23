@@ -43,7 +43,7 @@ class Reducer:
         for param in self._params:
             if param.requires_grad and param.grad is not None:
                 cur_byte_size = param.nelement() * param.element_size()
-                assert cur_byte_size <= self.bucket_size
+                assert cur_byte_size <= self.bucket_size, f'cur_byte_size = {cur_byte_size}'
 
                 tp = param.data.type()
                 if tp not in buckets:

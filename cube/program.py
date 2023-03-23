@@ -7,7 +7,7 @@ from cube.ir.operator import IRBpOperation, IRDataOperation
 
 from cube.graph import IRGraph
 from cube.graph import parser
-from cube.graph.parser.mapping import DType2IRDType
+from cube.graph.parser.dtype import DType2IRDType
 
 from cube.runtime.syndata import CubeDataLoader
 from cube.runtime.module import CubeModule
@@ -43,6 +43,11 @@ class Program:
 
     def get_graph(self) -> IRGraph:
         return self.instance._graph
+
+    def set_input(self, inputs: Tuple[Any]):
+        self.instance._graph.reset_inputs(len(inputs))
+        for idx, obj in enumerate(inputs):
+            self.instance._graph.set_input(idx, obj)
 
     def set_output(self, outputs: Tuple[Any]):
         self.instance._graph.reset_outputs(len(outputs))

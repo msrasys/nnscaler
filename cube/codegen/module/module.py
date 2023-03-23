@@ -11,7 +11,7 @@ from cube.ir.adapter import IRWeightReducer, IRAdapter
 from cube.ir.adapter.prim import CollectivePrim
 
 from cube.graph.graph import IRSegment
-from cube.graph.parser.mapping import Sign2Op
+from cube.graph.parser.register import CustomizedOps
 
 from cube.execplan import ExecutionPlan
 from cube.execplan.execplan import ExeRepetend, ExeReuseCell
@@ -88,7 +88,7 @@ class ModuleCodeGen(FuncEmission):
             self.init_code.extend(['import nnfusion', ''])
 
         # customized op code
-        for _, op_impl in Sign2Op.kOpCodeDef.items():
+        for _, op_impl in CustomizedOps.kOpCodeDef.items():
             # self.init_code.append('@torch.jit.script')
             self.init_code.append(op_impl)
             self.init_code += ['']

@@ -1,11 +1,10 @@
-from typing import Optional, Tuple, Any, Union
+from typing import Optional, Tuple, Any, Union, List
 import copy
 
 from cube.ir.cten import IRCell, IRTensor, IRObject
 from cube.ir.tensor import IRFullTensor
 from cube.algorithm.factory import DistAlgorithmFactory
 from cube.algorithm.generics import GenericDistAlgo
-from cube.ir.unique import IDGenerator
 from cube.ir.dtype import IRDType, DTypeInferRule
 
 
@@ -14,11 +13,8 @@ class IRFwOperation(IRCell):
     Forward operation
     """
 
-    def __init__(self,
-                 name: str, 
-                 signature: str,
-                 input_length: int,
-                 output_length: int):
+    def __init__(self, name: str, signature: str,
+                 inputs: List[IRObject], num_outputs: int, **kwargs):
         """!
         Create a forward operation.
 
@@ -27,28 +23,42 @@ class IRFwOperation(IRCell):
         @param input_length int: number of inputs
         @param output_length int: number of outputs
         """
-        # additional argument
-        self.kwargs = dict()
         # recompute schedule
         self._recompute = None
-        super().__init__(name, signature, input_length, output_length, init_outputs=False)
-        outputs = [IRFullTensor() for _ in range(output_length)]
+        super().__init__(name, signature, len(inputs), 
+                         num_outputs, init_outputs=False)
+
+        # setup input
+        for idx, input in enumerate(inputs):
+            self.set_input(idx, input)
+        
+        # additional argument
+        self.kwargs = kwargs
+
+        # default infer rule
+        requires_grad = any(
+            t.requires_grad for t in inputs if isinstance(t, IRTensor))
+        
+        # setup output
+        outputs = [IRFullTensor(requires_grad=requires_grad) for _ in range(num_outputs)]
         for idx, output in enumerate(outputs):
             self.set_output(idx, output)
 
     def infer_dtype(self):
         """
         Infer output value dtype.
-
         By default will follow the same dtype promotion rule with PyTorch.
         """
         itensors = [t for t in self.inputs() if isinstance(t, IRTensor)]
-        assert len(itensors) > 0, "Missing input tensors, need to customize the infer rule"
-        odtype = DTypeInferRule.infer(self, [t.dtype for t in itensors])
-        assert odtype != IRDType.unknown, f"{self} : {[t.dtype for t in itensors]}"
         otensors = [t for t in self.outputs() if isinstance(t, IRTensor)]
+        odtype = DTypeInferRule.infer(self, [t.dtype for t in itensors])
         for tensor in otensors:
-            tensor.dtype = odtype
+            # in case of setting manually due to special rules
+            if tensor.dtype == IRDType.unknown:
+                if isinstance(tensor, IRFullTensor):
+                    tensor.dtype = odtype
+                else:
+                    tensor.parent.dtype = odtype
 
     def infer_shape(self):
         """

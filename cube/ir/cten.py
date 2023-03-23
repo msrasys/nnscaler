@@ -557,7 +557,7 @@ class IRTensor(IRObject):
             raise TypeError(f"Expected IRDType but got {val}")
         self._dtype = val
         if isinstance(self._grad, IRTensor):
-            self._dtype = val
+            self._grad._dtype = val
 
     def is_param(self) -> bool:
         """!

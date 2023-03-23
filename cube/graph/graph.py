@@ -7,7 +7,7 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Sequence, Set, Union, Tuple, List, Optional, Dict, Any, Callable
+from typing import Sequence, Set, Union, Tuple, List, Optional, Dict, Any
 import warnings
 import copy
 
@@ -81,8 +81,14 @@ class IRGraph(IRSegment):
             else:
                 raise RuntimeError('len(args) < len(itensors)')
 
+        arg_objs = IRGraph.get_objects_from_complex(args)
+        graph_objs = IRGraph.get_objects_from_complex(self.inputs())
+        assert len(arg_objs) == len(graph_objs), f"input object number not match: {len(arg_objs)} != {len(graph_objs)}"
+
         for idx, (itensor, arg) in enumerate(zip(itensors, args)):
             self.set_input(idx, arg)
+
+        for arg, itensor in zip(arg_objs, graph_objs):
             for producer in self.producers(itensor.parent):
                 with self.update(producer):
                     while itensor in producer.outputs():
@@ -93,29 +99,26 @@ class IRGraph(IRSegment):
                     while itensor in consumer.inputs():
                         iidx = consumer.inputs().index(itensor)
                         consumer.set_input(iidx, arg)
-            while itensor in self.outputs():
-                oidx = self.outputs().index(itensor)
-                self.set_output(oidx, arg)
-            while itensor in self.inputs():
-                iidx = self.inputs().index(itensor)
-                self.set_input(iidx, arg)
-        
+            # reset output
+            for oidx, output in enumerate(self.outputs()):
+                output = IRGraph.modify_objects_of_complex(
+                    self.output(oidx), lambda t: t if t != itensor else arg)
+                self.set_output(oidx, output)
+
         # dtype inference
         for node in self._nodes:
-            itensors = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
-            # setup gradient
+            # reset input
+            itensors: List[IRTensor] = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
             for itensor in itensors:
-                if itensor.parent.grad is not None:
-                    itensor.parent.dtype = itensor.dtype
+                itensor.parent.dtype = itensor.dtype
+            # infer output dtype with default dtype promotion rules
             if len(itensors) == 0: continue
-            odtype = DTypeInferRule.infer(node, [t.dtype for t in itensors])
-            assert odtype != IRDType.unknown, f"{node} : {[t.dtype for t in itensors]}"
+            default_dtype = DTypeInferRule.infer(node, [t.dtype for t in itensors])
+            # set output tensors if it has unkown tensor dtype
             otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
-            for tensor in otensors:
-                tensor.dtype = odtype
-                # setup graidient
-                if tensor.parent.grad is not None:
-                    tensor.parent.grad.dtype = odtype
+            for otensor in otensors:
+                if otensor.dtype == IRDType.unknown:
+                    otensor.parent.dtype = default_dtype
 
         from cube.program import Program
         Program().add_nodes(self.nodes())
@@ -137,18 +140,6 @@ class IRGraph(IRSegment):
         """
         # set mirror as self
         self._mirror = self
-
-        # infer gradient requirement
-        for node in self.nodes():
-            itensors = [t for t in node.inputs() if isinstance(t, IRTensor)]
-            require_grad = any(t.requires_grad for t in itensors)
-            for otensor in node.outputs():
-                if not isinstance(otensor, IRTensor): continue
-                if isinstance(otensor, IRSubTensor):
-                    otensor.parent.requires_grad = require_grad
-                else:
-                    otensor.requires_grad = require_grad
-        
         # set loss gradient
         loss.parent.to_loss()
 

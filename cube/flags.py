@@ -41,7 +41,7 @@ class CompileFlag:
     async_comm = _to_bool('ASYNC_COMM')
 
     # maximal reducer weight bytes for one allreduce
-    max_reducer_bucket = _to_int('MAX_REDUCER_BUCKET', default=5e8)
+    max_reducer_bucket = _to_int('MAX_REDUCER_BUCKET', default=6e8)
     
     # use automate mixture precision training, where weights, gradients
     # and optimizer status are kept in its original data type (can be float32),
