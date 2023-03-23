@@ -382,7 +382,6 @@ def Sub(input, other, alpha=1, *, out=None, signature = None):
 
 def Mul(input, other, *, out=None, signature = None):
     assert out is None
-    signature = 'torch.mul'
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input * other
     signature = 'torch.mul'

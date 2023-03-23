@@ -37,6 +37,7 @@ def accum(*tensors: Tuple[torch.Tensor]) -> torch.Tensor:
     else:
         return torch.sum(torch.stack(tensors, dim=0), dim=0)
 
+
 def expand(input: torch.Tensor, sizes: Union[torch.Size, List[int]]) -> torch.Tensor:
     return input.expand(*sizes)
 
