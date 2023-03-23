@@ -1049,13 +1049,9 @@ def Unsqueeze(input, dim, signature = None):
 
 def TypeAs(input: IRTensor, tensor: IRTensor, signature = None):
     """
-    out = torch.Tensor.type_as(tensor0, tensor1)
+    translate to To
     """
-    edim_in0 = ShapeAnno.create_shape_str(tensor.shape)
-    anno = OpAnno.create_op_str(['*', edim_in0], ['*'])
-    dimop = IRDimops(TypeAs, 'type_as', signature, [anno], [input, tensor])
-    dimop.output(0).requires_grad = input.requires_grad
-    return dimop
+    return To(input, tensor)
 
 
 def Triu(input, diagonal=0, *, out=None, signature = None):
