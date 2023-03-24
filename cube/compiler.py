@@ -80,15 +80,6 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
     myrank = DeviceGroup().rank
 
-    def _load_tschedule_fn(filename) -> Callable:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "_train_step", filename
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module._train_step
-
     def decorator(fn: Callable) -> Callable:
         filename = 'gencode{}.py'
 
@@ -101,7 +92,7 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
             model.load_module(filename)
             # load schedule code
             print_each_rank(f'loading existed schedule from {filename} ...')
-            return _load_tschedule_fn(filename)
+            return cube.load_default_schedule(filename)
 
         if DeviceGroup().local_rank == 0:
 
@@ -242,6 +233,6 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
         # load temporal schedule
         print_each_rank(f'loading generated schedule from {filename} ...')
-        return _load_tschedule_fn(filename)
+        return cube.load_default_schedule(filename)
 
     return decorator

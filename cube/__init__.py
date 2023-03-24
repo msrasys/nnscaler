@@ -3,6 +3,7 @@ from cube import runtime
 from cube import profiler
 
 from cube.compiler import SemanticModel, compile
+from cube.utils import load_model, load_default_schedule, load_eval_schedule
 
 
 def _check_torch_version():
