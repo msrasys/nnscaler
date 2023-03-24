@@ -1498,34 +1498,6 @@ def _comparison(creator: Callable, f: Callable, name: str, signature: str,
     else:
         return IRPyFunc(signature, [input, other], [IRObject()])
 
-def _comparison_hack(creator: Callable, f: Callable, name: str, signature: str, 
-                input, other):
-    """
-    if both operands are scalars, returns bool.
-    if one operand is a tensor, returns a broadcasted tensor with dtype being bool.
-    
-    @param creator Callable: the outside creation function
-    @param f Callable: (Scalar, Scalar) -> bools
-    """
-    # case 0: return constant
-    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
-        return f(input, other)
-    # case1: torch.equal(tensor1, tensor2)
-    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(input, other)
-        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-        return IRDimops(creator, name, signature, annos, [input, other])
-    # case2: torch.equal(tensor1, obj2) / torch.equal(obj1, tensor2)
-    if isinstance(input, IRTensor) or isinstance(other, IRTensor):
-        annos = ['* -> *']
-        if isinstance(input, IRTensor):
-            return IRDimops(creator, name, signature, annos, [input], other=other)
-        else:
-            return IRDimops(creator, name, signature, annos, [other], other=input)
-    # case3: torch.equal(obj1, obj2)
-    else:
-        return IRPyFunc(signature, [input, other], [IRObject()])
-
 
 def CompareGT(input, other, *, out=None, signature = None):
     """
@@ -1559,14 +1531,14 @@ def CompareEQ(input, other, *, out=None, signature = None):
     """
     torch.eq(input, other, *, out=None)
     """
-    return _comparison_hack(CompareEQ, operator.eq, 'eq', signature, input, other)
+    return _comparison(CompareEQ, operator.eq, 'eq', signature, input, other)
 
 
 def CompareNE(input, other, *, out=None, signature = None):
     """
     torch.ne(input, other, *, out=None)
     """
-    return _comparison_hack(CompareNE, operator.eq, 'ne', signature, input, other)
+    return _comparison(CompareNE, operator.eq, 'ne', signature, input, other)
 
 
 def ShapeAsTensor(input: IRTensor, signature = None):
