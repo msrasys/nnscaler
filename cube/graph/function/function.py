@@ -1289,7 +1289,10 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice]], signature=No
                 start = 0 if slicer.start is None else slicer.start
                 step = 1 if slicer.step is None else slicer.step
                 dimlen = len(range(start, stop, step))
-                edim_ou.append(str(dimlen))
+                if dimlen == tensor.shape[dim]:
+                    edim_ou.append(edim_in[dim])
+                else:
+                    edim_ou.append(str(dimlen))
             else:
                 pass  # no shape for int
     # special case for loss = torch.Tensor([1,2,3])[0]
