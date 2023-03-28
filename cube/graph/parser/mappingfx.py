@@ -70,6 +70,7 @@ class SignFx2Op:
         __ttemplate('cumsum'): function.CumSum,
         __ttemplate('tanh'): function.Tanh,
         __ftemplate('softmax') : function.Softmax,
+        __ftemplate('log_softmax') : function.LogSoftmax,
         __ttemplate('bmm') : function.BatchLinear,
         __ttemplate('pow'): function.Pow,
         '_operator.pow': function.Pow,
@@ -89,6 +90,7 @@ class SignFx2Op:
         '_operator.invert': function.BitwiseNot,
         __ftemplate('embedding'): function.Embedding,
         'torch.functional.einsum': function.EinSum,
+        __ftemplate('nll_loss') : function.NLLLoss,
 
         __ftemplate('layer_norm'): function.LayerNorm,
 

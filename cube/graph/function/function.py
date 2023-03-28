@@ -484,6 +484,21 @@ def Softmax(input, dim=None, _stacklevel=3, dtype=None, signature = None):
     return IRDimops(Softmax, 'softmax', signature, [anno], [input],
                     dim=dim, _stacklevel=_stacklevel, dtype=dtype)
 
+
+def LogSoftmax(input, dim=None, _stacklevel=3, dtype=None, signature=None):
+    """
+    torch.nn.functional.log_softmax(input, dim=None, _stacklevel=3, dtype=None)
+    """
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = copy.copy(edim_in)
+    if dim is not None:
+        edim_in[dim] += '^'
+        edim_ou[dim] += '^'
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(LogSoftmax, 'log_softmax', signature, [anno], [input],
+                    dim=dim, _stacklevel=_stacklevel, dtype=dtype)
+
+
 def Dropout(input, p=0.5, training=True, inplace=False, signature = None):
     """
     torch.nn.functional.dropout(input, p=0.5, training=True, inplace=False)
@@ -1267,7 +1282,8 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice]], signature=No
                 # expand the dimension
                 edim_ou.append('1')
         else:
-            edim_in[dim] += '^'
+            if slicer != slice(None, None, None):
+                edim_in[dim] += '^'
             if isinstance(slicer, slice):
                 stop = tensor.shape[dim] if slicer.stop is None else slicer.stop
                 start = 0 if slicer.start is None else slicer.start
@@ -1579,11 +1595,52 @@ def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
     _operator.getitem(obj, index: int)
     """
     obj, index = a, b
-    if (not isinstance(obj, IRObject)) and isinstance(index, int):
-        return obj[index]
-    # case: subtensor = tensor[1,:2]
+
+    def try_reshape(tensor, expr):
+        if expr[0] == Ellipsis and expr[1] == None:
+            return True, copy.copy(tensor.shape) + [1]
+        dim_cnt = 0
+        idx = 0
+        dst_shape = []
+        for item in expr:
+            if item == slice(None, None, None):
+                dst_shape.append(tensor.shape[idx])
+                idx += 1
+            elif item == None:
+                dst_shape.append(1)
+            else:
+                return False, []
+        if idx != len(tensor.shape):
+            return False, []
+        return True, dst_shape
+
+    def try_select(tensor, expr):
+        int_cnt = 0
+        dim = -1
+        val = -1
+        for i, item in enumerate(expr):
+            if isinstance(item, int):
+                int_cnt += 1
+                dim = i
+                val = item
+        if int_cnt != 1:
+            return False, -1, -1
+        if expr[0] == Ellipsis:
+            dim = dim - len(expr)
+        return True, dim, val
+
     if isinstance(obj, IRTensor):
+        is_reshape, dst_shape = try_reshape(obj, index)
+        if is_reshape:
+            return Reshape(obj, dst_shape, signature='torch.reshape')
+        is_select, dim, val = try_select(obj, index)
+        if is_select:
+            return Select(obj, dim, val, 'torch.select')
+        # case: subtensor = tensor[1,:2]
         return FullSlice(obj, b)
+        # assert False, f'{obj}, {index}'
+    elif (not isinstance(obj, IRObject)) and isinstance(index, int):
+        return obj[index]
     return IRPyFunc(signature, [obj, index], [IRObject()])
 
 
@@ -1611,6 +1668,26 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
 def FInfo(dtype: IRDType, signature = None) -> torch.finfo:
     assert isinstance(dtype, IRDType)
     return torch.finfo(eval('torch.' + dtype.value))
+
+
+def NLLLoss(input, target, weight=None, size_average=None,
+            ignore_index=-100, reduce=None, reduction='mean',
+            signature=None):
+    """
+    torch.nn.functional.nll_loss(input, target, weight=None, size_average=None,
+                                 ignore_index=-100, reduce=None, reduction='mean')
+    """
+    assert weight is None
+    annos = [
+        'C^, N -> 1',
+        'N+ C, N+ -> 1',
+        'N+ C *, N+ * -> 1'
+    ]
+    return IRDimops(
+        NLLLoss, 'nll_loss',
+        signature, annos, [input, target],
+        weight=weight, size_average=size_average, ignore_index=ignore_index,
+        reduce=reduce, reduction=reduction)
 
 
 def MakeTuple(inputs: Iterable, signature=None):

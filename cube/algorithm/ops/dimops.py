@@ -348,7 +348,6 @@ def collect_split_info(node: IRFwOperation):
         return split_info
 
 def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
-    split_info = collect_split_info(node)
 
     def gen_hash(node: IRFwOperation) -> str:
         ret = node.signature
@@ -367,10 +366,11 @@ def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
     while dq:
         cur_node, cur_ngpus = dq.popleft()
         gen_nodes.append(cur_node)
+        split_info = collect_split_info(cur_node)
 
         for key, val in split_info.items():
             idx_1st, dim_1st, _ = val
-            dim_size = cur_node.inputs()[idx_1st].shape[dim_1st]
+            dim_size = cur_node.anno.getlen(key)
 
             # TODO(yizhu1): only consider powers of 2 currently
             split_deg = 2
@@ -378,7 +378,8 @@ def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
                 if dim_size % split_deg != 0:
                     break
 
-                new_node = cur_node.algorithms('dim').instantiate(idx=idx_1st, dim=dim_1st, num=split_deg)[0]
+                new_nodes = cur_node.algorithms('dim').instantiate(idx=idx_1st, dim=dim_1st, num=split_deg)
+                new_node = new_nodes[0]
                 new_ngpus = cur_ngpus // split_deg
 
                 cur_key = gen_hash(new_node)

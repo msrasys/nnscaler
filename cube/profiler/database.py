@@ -142,7 +142,7 @@ class CompProfiler:
         torch.cuda.synchronize()
         toc = time.perf_counter()
         fwbw_span = (toc - tic) / prof_times * 1000 # in milliseconds
-        bw_span = fwbw_span - fw_span
+        bw_span = max(fwbw_span - fw_span, 0.0)
 
         return fw_span, bw_span, infer_memory, tuple(train_mem_info)
 
@@ -248,8 +248,11 @@ class ProfileDataBase:
                 print(f'WARNING: input {t} is skipped.')
 
         # run profiling
-        fw_span, bw_span, infer_memory, train_mem_info = \
-            CompProfiler.profile(fn, shapes, dtypes, requires_grads, values, **kwargs)
+        try:
+            fw_span, bw_span, infer_memory, train_mem_info = \
+                CompProfiler.profile(fn, shapes, dtypes, requires_grads, values, **kwargs)
+        except:
+            fw_span, bw_span, infer_memory, train_mem_info = float('inf'), float('inf'), 0, [0]
         # log to database
         key = self._serialize(node)
         self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, residual_mem)
@@ -373,9 +376,9 @@ class ProfileDataBase:
                 dtypes.append(IRDType2TorchDType.map(t.dtype))
             elif isinstance(t, IRObject):
                 raise RuntimeError('IRObject has not been supported in _serialize')
-            else:
-                shapes.append(None)
-                dtypes.append(type(t))
+            # else:
+            #     shapes.append(None)
+            #     dtypes.append(type(t))
         shapes = '-'.join(str(tuple(shape)) if shape is not None else str(None) for shape in shapes)
         dtypes = '-'.join(str(dtype) for dtype in dtypes)
         return shapes + ' : ' + dtypes
