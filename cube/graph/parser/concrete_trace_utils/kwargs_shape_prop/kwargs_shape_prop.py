@@ -1,5 +1,8 @@
+import builtins
+import operator
 import torch
 import traceback
+from torch.fx import GraphModule
 from torch.fx.node import Node, map_aggregate
 from typing import Optional, Union, NamedTuple, Tuple, Any, Dict
 from .kwargs_interpreter import KwargsInterpreter
@@ -100,27 +103,32 @@ class KwargsShapeProp(KwargsInterpreter):
 
 
 class DCEHandler:
+    dont_delete = [operator.setitem, builtins.next]
+
     def __init__(self, gm: torch.fx.GraphModule):
         self.gm = gm
         
     def eliminate_dead_code(self):
-        # set a loop to make sure clean all dead nodes
-        # because some nodes may be used by some dead nodes are also dead nodes
-        # !pay attention that the `output` node should be ignored for users checking
+        to_check = set()
+        for node in self.gm.graph.nodes:
+            to_check.add(node)
         while True:
-            removed = False
-            for node in self.gm.graph.nodes:
+            deleted = False
+            modified = set()
+            for node in to_check:
                 if node.op == 'output':
                     continue
-                users = list(node.users)
-                if not users:
-                    # make input nodes pop this node out of their users list
-                    # before the node is removed
-                    input_nodes = node.all_input_nodes
-                    for input_node in input_nodes:
+                if not node.users and node.op != 'placeholder' and node.target not in DCEHandler.dont_delete:
+                    for input_node in node.all_input_nodes:
                         input_node.users.pop(node)
+                        modified.add(input_node)
                     node._remove_from_list()
-                    removed = True
-            if not removed:
+                    if node in modified:
+                        modified.remove(node)
+                    deleted = True
+            if deleted is False:
                 break
-        self.gm.recompile()
+            else:
+                to_check = modified
+        name = self.gm.__class__.__name__
+        return GraphModule(self.gm, self.gm.graph, name)

@@ -42,8 +42,11 @@ class ScheduleCodeGen(FuncEmission):
 
         lifetime = LifeCycle(device_nodes, [], self.execplan.graph.outputs())
 
+        model_inputs = ['{}_{}'.format(_input.name, _input.tid) for _input in self.execplan.graph.inputs()]
+        args = ['model'] + model_inputs
+
         with FunctionBlock(func_name='_train_step', 
-                           args=['model', 'dataloader']) as fb:
+                           args=args) as fb:
             fb.insert_body('_ = None')
             # body code
             if len(device_nodes) == 0:
@@ -79,7 +82,7 @@ class ScheduleCodeGen(FuncEmission):
                 warnings.warn('using legacy IRScheduleStrategy cannot generate inference code. '
                               'Switch to use scheduling without strategy')
             with FunctionBlock(func_name='_infer_step', 
-                               args=['model', 'dataloader']) as fb:
+                               args=args) as fb:
                 fb.insert_body('_ = None')
                 # body code
                 if len(device_nodes) == 0:

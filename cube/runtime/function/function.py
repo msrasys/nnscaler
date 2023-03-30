@@ -178,3 +178,6 @@ def stack(*tensors, dim=0) -> torch.Tensor:
 
 def cat(*tensors, dim=0) -> torch.Tensor:
     return torch.cat(tensors, dim)
+
+def nndropout(input: torch.Tensor, p=0.5, inplace=False):
+    return torch.nn.Dropout(0.0, inplace)(input)

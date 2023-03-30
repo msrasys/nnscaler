@@ -508,6 +508,16 @@ def Dropout(input, p=0.5, training=True, inplace=False, signature = None):
                     p=p, training=training, inplace=inplace)
 
 
+def nnDropout(input, p=0.5, inplace=False, signature=None):
+    """
+    torch.nn.Dropout(p=0.5, inplace=False)
+    """
+    signature = 'cube.runtime.function.nndropout'
+    annos = ['* -> *']
+    return IRDimops(nnDropout, 'Dropout', signature, annos, [input],
+                    p=p, inplace=inplace)
+
+
 def Detach(input, signature = None):
     """
     torch.Tensor.detach(input)

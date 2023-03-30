@@ -68,8 +68,7 @@ class FxModuleParser:
               frame: Frame = None) \
             -> Tuple[List[IRFullTensor], List[IRFwOperation], List[IRFullTensor]]:
         from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
-        dce_module = DCEHandler(module).eliminate_dead_code()
-        model = dce_module
+        DCEHandler(module).eliminate_dead_code()
 
         """
         The overall entry to parse a torch.fx graph module
@@ -114,20 +113,25 @@ class FxModuleParser:
                 frame.add_var(input.name, val, graph_arg=idx)
         else:
             assert dummy_inputs is not None, 'input_shapes and dummy_inputs cannot be None at the same time.'
-            # remove dead nodes
-            from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
-            DCEHandler(module).eliminate_dead_code()
             # shape propagation
             from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
             ShapeProp(module).propagate(dummy_inputs)
             # handle graph inputs
             for idx, input in enumerate(inputs):
                 assert isinstance(input, torch.fx.Node)
+                # dealing with different types of dummy_inputs
                 if isinstance(dummy_inputs, dict):
-                    if input.name in dummy_inputs:
-                        shape = input.meta['tensor_meta'].shape
+                    if input.name not in dummy_inputs:
+                        val = IRObject(input.name)
                     else:
-                        shape = None
+                        if 'tensor_meta' in input.meta:
+                            shape = input.meta['tensor_meta'].shape
+                            if len(shape) == 0:
+                                shape = [1]
+                            dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
+                            val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
+                        else:
+                            val = IRObject(input.name)
                 else:
                     # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding,
                     # extend to other input types
@@ -138,8 +142,8 @@ class FxModuleParser:
                         # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
                         print(f'dummy_inputs does not have {input.name}')
                         shape = None
-                dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
-                val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
+                    dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
+                    val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
                 frame.add_var(input.name, val, graph_arg=idx)
         input_val = [frame.get_var(input.name) for input in inputs]
 
@@ -159,7 +163,8 @@ class FxModuleParser:
                 print(f'{node.name} does not has tensor_meta')
 
         # add activations to frame, including call_func/call_method output and final output
-        activation_op_strs = {'call_function', 'output', 'call_method'}
+        # call_module corresponds to leaf torch.nn.module
+        activation_op_strs = {'call_function', 'output', 'call_method', 'call_module'}
         activation_nodes = [node for node in module.graph.nodes if node.op in activation_op_strs]
         for node in activation_nodes:
             if hasattr(node, 'meta') and node.meta.get('tensor_meta') and hasattr(node.meta['tensor_meta'], 'dtype'):
@@ -232,7 +237,7 @@ class FxModuleParser:
             if node_type == FxNodeKind.PrimGetAttr:
                 return FxModuleParser.parse_prim_attr_node(node, module, frame)
             if node_type == FxNodeKind.PrimCallModule:
-                raise RuntimeError(f"parse_prim_module is not supported.")
+                return FxModuleParser.parse_prim_module(node, module, frame)
 
             # TODO bother assigning all ignored prim functions new NodeKinds?
             if node_type == FxNodeKind.PrimDevice:
@@ -252,6 +257,13 @@ class FxModuleParser:
         return attr_itr
 
     @staticmethod
+    def parse_prim_module(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
+        prim_module = FxModuleParser.fetch_attr(module, node.target)
+        assert prim_module.__class__.__module__.startswith('torch.nn.modules'), f'{module.__class__.__module__}'
+        fsig = 'torch.nn.{}'.format(prim_module.__class__.__name__)
+        return FxModuleParser._parse_node(fsig, node, module, frame)
+
+    @staticmethod
     def parse_prim_function_method(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
         # get signature
         fsig = FxModuleParser._get_qualified_name(node.target, node)
@@ -259,7 +271,11 @@ class FxModuleParser:
             print(f'parse_prim_method_node: {fsig}')
         else:
             print(f'parse_prim_function_node: {fsig}')
+        return FxModuleParser._parse_node(fsig, node, module, frame)
 
+    @staticmethod
+    def _parse_node(fsig: str, node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
+        
         def get_complex_data(val: Any) -> Any:
             """Change inner fx.Node into IRObject"""
             if isinstance(val, tuple):
@@ -269,7 +285,7 @@ class FxModuleParser:
             if isinstance(val, torch.fx.Node):
                 return frame.get_var(val.name)
             return val
-    
+
         # get inputs
         input_vals = [get_complex_data(val) for val in node.args]
         kwargs = {key: get_complex_data(val) for key, val in node.kwargs.items()}

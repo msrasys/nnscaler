@@ -140,49 +140,33 @@ class IRAdapterGener:
         return graph
     
     @staticmethod
-    def auto_pyfunc(graph: IRSegment):
+    def auto_pyfunc(graph: IRGraph):
         """
         Make pyfunc to be local
         IRPyFunc will be replicated to devices with its producers output
         """
-        for func in graph.select(ntype=IRPyFunc, flatten=False):
-            assert func.mirror is None, "PyFunc is only supported by inference"
+        for func in graph.select(ntype=IRPyFunc, flatten=True):
             # get devices it will lowered to
+            segment: IRSegment = graph.segment(func)
+            segment_outputs = IRSegment.get_objects_from_complex(segment.outputs())
             devices = set()
             for t in func.inputs():
                 if not isinstance(t, IRObject): continue
-                if t.is_attr():
-                    cells = graph.consumers(t.parent)
-                else:
-                    cells = graph.producers(t.parent)
+                cells = segment.consumers(t.parent) if t.is_attr() else segment.producers(t.parent)
                 for cell in cells:
                     devices.update(cell.device)
-            pyfuncs = []
-            # lower to each device
-            for devid in devices:
-                inputs = []
-                # automatic partition to align with consumer (attr) or producer (activation)
-                for t in func.inputs():
-                    sub_ts = set()
-                    if not isinstance(t, IRSubTensor):
-                        sub_ts.add(t)  # replica for non-tensor
-                    elif t.is_attr():
-                        # get local consumers except func itself
-                        sub_ts = set(tensor for tensor in graph.ctensors(t.parent) \
-                                     if devid in tensor.device and tensor.cell != func)
-                    else:
-                        # get local producers
-                        sub_ts = set(tensor for tensor in graph.ptensors(t.parent) \
-                                     if devid in tensor.device)
-                    inputs.append(t if len(sub_ts) == 0 else list(sub_ts)[0])
-                lower_func = IRPyFunc(func.signature, inputs, func.outputs(), **func.kwargs)
-                lower_func.device = devid
-                pyfuncs.append(lower_func)
-            position = graph.remove(func)
-            for pyfunc in pyfuncs:
-                graph.insert(pyfunc, position)
-        for segment in graph.select(ntype=IRSegment, flatten=False):
-            IRAdapterGener.auto_pyfunc(segment)
+            for t in func.outputs():
+                if not isinstance(t, IRObject): continue
+                if t in segment_outputs:
+                    devices.update(segment.device)
+            # replicate
+            pyfuncs = [func.replicate() for _ in devices]
+            for devid, pyfunc in zip(sorted(devices), pyfuncs):
+                pyfunc.device = devid
+            # insert
+            position = segment.remove(func)
+            for pyfunc in pyfuncs[::-1]:
+                segment.insert(pyfunc, position)
         return graph
 
     @staticmethod
@@ -331,7 +315,7 @@ class IRAdapterGener:
             # consumers can be operators and graph outputs
             fconsumers, fctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
             if ftensor in output_consumer:
-                fctensors = fctensors + tuple(fwop.input(0) for fwop in output_consumer[ftensor])
+                fctensors = fctensors + tuple(fwop.input(0) for fwop in output_consumer[ftensor] if fwop.input(0) not in fctensors)
             fctensors = expand_devices(fctensors, consumer=True)
             assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
 
@@ -379,20 +363,32 @@ class IRAdapterGener:
 
             # insert forward adapter
             # graph.insert(fadapter, max(producers) + 1)
-            tail = CellPosition((graph.nnodes,))
-            fconsumer_idx = [tail] + [graph.index(c) for c in fconsumers]
-            fidx = min(fconsumer_idx)
+            if len(fconsumers) > 0:
+                fidx = min(graph.nodes().index(c) for c in fconsumers)
+            else:
+                # no consumer: find the last forward node
+                for fidx, node in enumerate(graph.nodes()[::-1]):
+                    if node.isfw():
+                        fidx = graph.nnodes - fidx
+                        break
+            graph.insert(fadapter, fidx)
             # setup recompute
             if fadapter.differentiable and allow_recompute:
-                fadapter.recompute = graph.node(fidx if fidx != tail else fidx-1).recompute
-            graph.insert(fadapter, fidx)
+                if fidx > 0:
+                    prev_node = graph.node(fidx-1)
+                    if isinstance(prev_node, IRFwOperation):
+                        fadapter.recompute = prev_node.recompute
 
             # insert backward adapter
             if badapter is not None:
                 assert isinstance(badapter, IRAdapter)
                 assert isinstance(bgraph, IRSegment)
-                bproducer_idx = [CellPosition((0,))] + [bgraph.index(consumer.mirror) + 1 for consumer in fconsumers]
-                bidx = max(bproducer_idx)
+                if len(bproducers) > 0:
+                    bidx = max(bgraph.nodes().index(p) for p in bproducers) + 1
+                else:
+                    # no producer: find the first backward node
+                    for bidx, node in enumerate(bgraph.nodes()):
+                        if not node.isfw(): break
                 bgraph.insert(badapter, bidx)
 
         # generate adapter for each segment
@@ -664,7 +660,8 @@ class IRAdapterGener:
         for multiref in graph.select(name='multiref', flatten=False):
             ftensor: IRFullTensor = multiref.input(0).parent
             multirefs = []
-            for otensor in graph.ptensors(ftensor):
+            tensors = graph.ptensors(ftensor) if len(graph.ptensors(ftensor)) > 0 else graph.ctensors(ftensor)
+            for otensor in tensors:
                 mr = MultiRef(otensor, len(multiref.outputs()))
                 for idx in range(len(multiref.outputs())):
                     output = multiref.output(idx).parent.select(otensor.indmap, otensor.valmap)
@@ -672,8 +669,7 @@ class IRAdapterGener:
                         output.grad = multiref.output(idx).grad.parent.select(otensor.indmap, (0,1))
                     mr.set_output(idx, output)
                 mr.device = otensor.device
-                # Dataloader has no recompute
-                if hasattr(otensor.cell, 'recompute'):
+                if isinstance(otensor.cell, IRFwOperation):
                     mr.recompute = otensor.cell.recompute
                 multirefs.append(mr)
             # remove original multiref

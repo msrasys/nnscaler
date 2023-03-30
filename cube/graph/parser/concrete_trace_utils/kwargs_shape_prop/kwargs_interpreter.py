@@ -3,6 +3,7 @@ import torch.fx
 import torch.fx.traceback as fx_traceback
 from torch.fx import Interpreter, Node
 from typing import Optional, Union, Tuple, Dict, List, Any, Iterator, Callable, MutableMapping, Mapping
+from torch.utils._pytree import tree_map
 
 Target = Union[Callable[..., Any], str]
 
@@ -145,3 +146,28 @@ class KwargsInterpreter(Interpreter):
                     else:
                         raise RuntimeError(
                             f'Expected positional argument for parameter {target}, but one was not passed in!')
+
+    def call_function(self, target: 'Target', args: Tuple[Argument, ...], kwargs: Dict[str, Any]) -> Any:
+        to_cuda = lambda t: t.cuda() if isinstance(t, torch.Tensor) else t
+        args = tree_map(to_cuda, args)
+        kwargs = tree_map(to_cuda, kwargs)
+        result = super().call_function(target, args, kwargs)
+        if isinstance(result, torch.Tensor):
+            return result.cpu()
+        else:
+            to_cpu = lambda t: t.cpu() if isinstance(t, torch.Tensor) else t
+            return tree_map(to_cpu, result)
+
+    def call_module(self, target: 'Target', args: Tuple[Argument, ...], kwargs: Dict[str, Any]) -> Any:
+        assert isinstance(target, str)
+        mod = self.fetch_attr(target)
+        mod = mod.cuda()
+        to_cuda = lambda t: t.cuda() if isinstance(t, torch.Tensor) else t
+        args = tree_map(to_cuda, args)
+        kwargs = tree_map(to_cuda, kwargs)
+        result = mod(*args, **kwargs)
+        if isinstance(result, torch.Tensor):
+            return result.cpu()
+        else:
+            to_cpu = lambda t: t.cpu() if isinstance(t, torch.Tensor) else t
+            return tree_map(to_cpu, result)

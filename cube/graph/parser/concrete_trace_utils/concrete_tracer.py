@@ -18,6 +18,7 @@ from contextlib import contextmanager
 import torch
 from torch._C import ScriptObject
 from torch.nn.modules.container import Sequential, ModuleList, ModuleDict, ParameterList, ParameterDict
+from torch.utils._pytree import tree_map
 
 from torch.fx import GraphModule
 from torch.fx._compatibility import compatibility
@@ -228,7 +229,33 @@ class ConcreteTracer(TracerBase):
             if _orig_getattr(fn, '__module__', None) != 'nni.common.concrete_trace_utils.concrete_tracer' and hasattr(fn, '__globals__'):
                 _autowrap_check(self, fn.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
             with self.do_temp_disable(call=True):
-                return OperatorPatcherContext.patch_run(fn, *args, **kwargs)
+                to_cuda = lambda t: t.cuda() if _orig_isinstance(t, torch.Tensor) else t
+                args = tree_map(to_cuda, args)
+                kwargs = tree_map(to_cuda, kwargs)
+                result = OperatorPatcherContext.patch_run(fn, *args, **kwargs)
+                for arg in args:
+                    if _orig_isinstance(arg, torch.Tensor):
+                        del arg
+                del args
+                for key, value in kwargs.items():
+                    if _orig_isinstance(value, torch.Tensor):
+                        del value
+                del kwargs
+                if _orig_isinstance(result, torch.Tensor):
+                    result_cpu = result.cpu()
+                    del result
+                    torch.cuda.empty_cache()
+                    return result_cpu
+                if not isinstance(result, (tuple, list, dict)):
+                    torch.cuda.empty_cache()
+                    return result
+                to_cpu = lambda t: t.cpu() if _orig_isinstance(t, torch.Tensor) else t
+                result_cpu = tree_map(to_cpu, result)
+                for ret in result:
+                    if _orig_isinstance(ret, torch.Tensor):
+                        del ret
+                torch.cuda.empty_cache()
+                return result_cpu
         elif kind == 'call_method':
             self_obj, *args_tail = args
             fn = _orig_getattr(self_obj, target)
@@ -239,10 +266,38 @@ class ConcreteTracer(TracerBase):
         elif kind == 'call_module':
             assert isinstance(target, str)
             mod = self.fetch_attr(target)
+            mod.cuda()
             if _orig_getattr(mod, '__module__', None) != 'nni.common.concrete_trace_utils.concrete_tracer' and hasattr(mod, '__globals__'):
                 _autowrap_check(self, mod.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
             with self.do_temp_disable(call=True):
-                return OperatorPatcherContext.patch_run(mod, *args, **kwargs)
+                to_cuda = lambda t: t.cuda() if _orig_isinstance(t, torch.Tensor) else t
+                args = tree_map(to_cuda, args)
+                kwargs = tree_map(to_cuda, kwargs)
+                result = OperatorPatcherContext.patch_run(mod, *args, **kwargs)
+                for arg in args:
+                    if _orig_isinstance(arg, torch.Tensor):
+                        del arg
+                del args
+                for key, value in kwargs.items():
+                    if _orig_isinstance(value, torch.Tensor):
+                        del value
+                del kwargs
+                mod.cpu()
+                if _orig_isinstance(result, torch.Tensor):
+                    result_cpu = result.cpu()
+                    del result
+                    torch.cuda.empty_cache()
+                    return result_cpu
+                if not isinstance(result, (tuple, list, dict)):
+                    torch.cuda.empty_cache()
+                    return result
+                to_cpu = lambda t: t.cpu() if _orig_isinstance(t, torch.Tensor) else t
+                result_cpu = tree_map(to_cpu, result)
+                for ret in result:
+                    if _orig_isinstance(ret, torch.Tensor):
+                        del ret
+                torch.cuda.empty_cache()
+                return result_cpu
         elif kind == 'get_attr':
             assert isinstance(target, str)
             return self.fetch_attr(target)

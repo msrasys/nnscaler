@@ -36,6 +36,9 @@ class SignFx2Op:
     # tensor template
     __ttemplate = lambda name: f'torch.{name}'
 
+    # torch nn module
+    __tnmtemplate = lambda name: f'torch.nn.{name}'
+
     # torch.Tensor template
     __tttemplate = lambda name: f'torch.Tensor.{name}'
 
@@ -49,6 +52,7 @@ class SignFx2Op:
     __customops = lambda name: f'examples.custom_ops.{name}'
 
     kOpMap = {
+        __tnmtemplate('Dropout'): function.nnDropout,
         __fcntemplate('linear'): function.Linear,
         __ftemplate('dropout') : function.Dropout,
         __ttemplate('sum'): function.Sum,

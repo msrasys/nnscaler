@@ -72,6 +72,9 @@ def emit_setattr(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
     return f"{node.signature}({arg_vars[0]}, {member}, {arg_vars[2]})"
 
 
+def emit_getattr(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
+    return f"{node.signature}({arg_vars[0]}, '{arg_vars[1]}')"
+
 class Sign2EmitRule:
 
     @staticmethod
@@ -95,6 +98,7 @@ class Sign2EmitRule:
     _signMap = {
         'torch.slice': emit_slice,
         'setattr': emit_setattr,
+        'builtins.getattr': emit_getattr,
     }
 
 
