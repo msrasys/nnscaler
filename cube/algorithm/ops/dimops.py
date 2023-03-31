@@ -322,9 +322,6 @@ class SimpleViewSplitEinops(GenericDistAlgo):
         return sub_nodes
 
 def collect_split_info(node: IRFwOperation):
-    # TODO(yizhu1): workaround
-    split_batch_ops = {}
-    
     anno = node.anno
 
     split_info = {}
@@ -339,13 +336,7 @@ def collect_split_info(node: IRFwOperation):
                 if identifier not in split_info:
                     split_info[identifier] = (idx_shape, idx_dim, idx_id)
 
-    if node.signature in split_batch_ops:
-        for key, val in split_info.items():
-            if val == (0, 0, 0):
-                return {key: val}
-        assert False
-    else:
-        return split_info
+    return split_info
 
 def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
 

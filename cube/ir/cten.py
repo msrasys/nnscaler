@@ -535,6 +535,7 @@ class IRTensor(IRObject):
         super().__init__(name, tid)
         self._shape: Tuple[int] = () if shape is None else tuple(shape)
         self._cell: Optional[IRCell] = None
+        assert isinstance(dtype, IRDType), f'expect IRDType, get {dtype} with type {type(dtype)}'
         self._dtype: IRDType = dtype
         # tensor gradient
         self._is_grad: bool = False

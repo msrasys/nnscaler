@@ -37,6 +37,7 @@ class IRDType2TorchDType:
         """
         Map the IRDtype to torch dtype
         """
+        assert ir_dtype in IRDType2TorchDType.kDtypeMap, f'unexpected ir_dtype {ir_dtype}'
         return IRDType2TorchDType.kDtypeMap[ir_dtype]
     
     kDtypeMap = {val: key for key, val in DType2IRDType.kDtypeMap.items()}
