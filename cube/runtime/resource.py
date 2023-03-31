@@ -1,9 +1,17 @@
 r"""
 Runtime information
 """
+from typing import Tuple
 
 import torch
-import os
+from cube.flags import CompileFlag
+from dataclasses import dataclass
+
+
+@dataclass
+class DeviceInfo:
+    # memory in btypes
+    memory: int = None
 
 
 class EnvResource:
@@ -12,13 +20,24 @@ class EnvResource:
 
         def __init__(self):
             # number of gpus
-            single_device_mode = os.environ.get('SINGLE_DEV_MODE')
-            if single_device_mode:
-                self.ngpus = 1
-            else:
-                self.ngpus = torch.distributed.get_world_size()
+            self.ngpus = 1 if CompileFlag.dev_mode else torch.distributed.get_world_size()
             # device topology
             self.topo = None
+            self.gpus: Tuple[DeviceInfo] = self.get_device_capability()
+
+        def get_device_capability(self) -> Tuple[DeviceInfo]:
+            if CompileFlag.dev_mode:
+                memory = [torch.cuda.get_device_properties(0).total_memory]
+            else:
+                rank = torch.distributed.get_rank()
+                memory = torch.tensor(torch.cuda.get_device_properties(0).total_memory, 
+                                      dtype=torch.int64, device=torch.cuda.current_device())
+                all_device_mem = [torch.empty_like(memory) for _ in range(self.ngpus)]
+                all_device_mem[rank] = memory.data
+                torch.distributed.all_gather(all_device_mem, memory)
+                torch.cuda.synchronize()
+                memory = [t.item() for t in all_device_mem]
+            return tuple(DeviceInfo(memory=mem) for mem in memory)
 
     instance = None
 

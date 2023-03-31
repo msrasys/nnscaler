@@ -304,11 +304,12 @@ class OpAnno:
         inputs, outputs = anno
         self._inputs: Tuple[ShapeAnno] = tuple(inputs)
         self._outputs: Tuple[ShapeAnno] = tuple(outputs)
-        self._identifiers: Dict[str, int] = dict()
+        self._identifiers: Dict[str, int] = dict()   # identifier -> dimension length
+        self._reduces: Dict[str, DimAnno.ReduceType] = dict()  # identifier -> reducer
         self.reset_identifiers()
 
     @property
-    def identifiers(self) -> Set[str]:
+    def identifiers(self) -> Tuple[str]:
         """!
         Get all identifier set
 
@@ -360,7 +361,10 @@ class OpAnno:
         shape_annos = list(self._inputs) + list(self._outputs)
         for ashape in shape_annos:
             for adim in ashape.dims:
-                self._identifiers.update({identifier: None for identifier in adim.identifiers})
+                for identifier, reduce in zip(adim.identifiers, adim.reduces):
+                    self._identifiers[identifier] = None
+                    # TODO: check consistency
+                    self._reduces[identifier] = reduce
         for identifier in self._identifiers.keys():
             if str.isdecimal(identifier):
                 self._identifiers[identifier] = int(identifier)
@@ -391,8 +395,19 @@ class OpAnno:
         
         @return length Optional[int]: the length of identifier
         """
-        assert identifier in self._identifiers, f"{identifier} not int identifier set {self._identifiers}"
+        assert identifier in self._identifiers, f"{identifier} not exists {set(self._identifiers.keys())}"
         return self._identifiers[identifier]
+
+    def get_reduce(self, identifier: str) -> DimAnno.ReduceType:
+        """
+        Get identifier reduce type
+
+        @param identifier str: identifier name
+
+        @return reduce DimAnno.ReduceType
+        """
+        assert identifier in self._reduces, f"{identifier} not exists {set(self._reduces.keys())}"
+        return self._reduces[identifier]
 
     def __repr__(self) -> str:
         inputs = ', '.join(repr(input) for input in self.inputs())
@@ -790,3 +805,25 @@ class IRDimops(IRFwOperation):
                 template = factory.algorithms(IRDimops, tag)
                 return template(self)
             return None
+
+    def transform_space(self) -> List[Tuple[int, int]]:
+        """
+        Get transformation space of the operator
+
+        @return List[Tuple[int, int]]: list of (idx, dim)
+        """
+        visited : Set[str] = set()
+        configs = []
+        ashapes = self.anno.inputs() + self.anno.outputs()
+        for idx, eshape in enumerate(ashapes):
+            if idx < len(self.inputs()):
+                if not isinstance(self.input(idx), IRTensor): continue
+            for dim, edim in enumerate(eshape.dims):
+                for identifier, reduce in zip(edim.identifiers, edim.reduces):
+                    if identifier in visited: continue
+                    visited.add(identifier)
+                    if identifier == '1' or self.anno.getlen(identifier) == 1: continue
+                    if reduce == DimAnno.ReduceType.Freeze: break
+                    configs.append((idx, dim))
+                    break
+        return configs

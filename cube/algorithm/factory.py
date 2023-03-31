@@ -64,7 +64,6 @@ class DistAlgorithmFactory:
 
         import cube.algorithm.ops.dimops as dimops
         self.register(dimops.IRDimops, dimops.DimSplitEinops, tag='dim')
-        self.register(dimops.IRDimops, dimops.SimpleViewSplitEinops, tag='view_simp')
 
         import cube.algorithm.ops.conv as conv
         self.register(conv.IRPad, conv.DimSplitPad, tag='dim')

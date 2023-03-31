@@ -43,14 +43,15 @@ class Reducer:
         for param in self._params:
             if param.requires_grad and param.grad is not None:
                 cur_byte_size = param.nelement() * param.element_size()
-                assert cur_byte_size <= self.bucket_size, f'cur_byte_size = {cur_byte_size}'
-
                 tp = param.data.type()
                 if tp not in buckets:
                     buckets[tp] = [[param]]
                     tp2size[tp] = cur_byte_size
                 else:
-                    if tp2size[tp] + cur_byte_size <= self.bucket_size:
+                    if cur_byte_size > self.bucket_size:
+                        warnings.warn(f'find one parameter {param.shape} ({cur_byte_size} bytes) larger than bucket size {self.bucket_size}')
+                        buckets[tp].insert(0, [param])
+                    elif tp2size[tp] + cur_byte_size <= self.bucket_size:
                         tp2size[tp] = tp2size[tp] + cur_byte_size
                         buckets[tp][-1].append(param)
                     else:
