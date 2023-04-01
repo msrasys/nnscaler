@@ -15,6 +15,7 @@ class Frame:
         # module attributes
         self._attributes: List[dict[str, Any]] = list()
         self._attr_vals: Dict[int, Any] = dict()  # tensor tid to real value mapping
+        self._name_map: Dict[Any, Any] = dict()  # tensor name to real tensor name
 
     def push_var(self, inherit_from_top=False):
         """
@@ -152,6 +153,30 @@ class Frame:
         Save attribute content into file.
         """
         torch.save(self._attr_vals, save_file)
+
+    def add_attr_map(self, key, value):
+        """
+        Add names map to connect internal parameter name and original parameter
+        """
+        self._name_map[str(key)] = value
+
+    def has_attr_value(self, value):
+        return value in self._name_map.values()
+
+    def get_attr_key(self, value):
+        ret = None
+        for key, val in self._name_map.items():
+            if val == value:
+                ret = key
+                break
+        return ret
+
+    def save_attr_map(self, save_file: str = 'dist_param_map.pt'):
+        """
+        Save local_param -> origin_param name map.
+        """
+        torch.save(self._name_map, save_file)
+
 
     def push_param(self, var_name):
         """

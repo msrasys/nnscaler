@@ -298,7 +298,7 @@ class FxModuleParser:
             # case1: unknown torch operator
             if FxModuleParser._is_torch_autograd_op(node, frame, fsig):
                 print(f'>>> Find unknown pytorch operation: {fsig}')
-                fname = fsig.split('.')[-1] if '.' in fsig else fname
+                fname = fsig.split('.')[-1] if '.' in fsig else fsig
                 ir_node = IRFwOperation(fname, fsig, input_vals, 1, **kwargs)
             # case2: python runtime function
             else:
@@ -337,14 +337,22 @@ class FxModuleParser:
             tensor_shape = node.meta['tensor_meta'].shape
             dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
             requires_grad = node.meta['tensor_meta'].requires_grad
-            ir_tensor = IRFullTensor(tensor_shape, tensor_name, requires_grad=requires_grad, dtype=dtype)
-            if requires_grad:  # case for registered parameters
-                ir_tensor.as_param()
-            else:  # case for registered buffers
-                ir_tensor.as_buffer()
-            frame.add_var(tensor_name, ir_tensor)
-            value = FxModuleParser.fetch_attr(module, node.target)
-            frame.add_attr_content(ir_tensor.tid, value)
+
+            # check if existing param
+            if requires_grad and frame.has_attr_value(node.target):  # existing param
+                prev_tensor_name = frame.get_attr_key(node.target)
+                print(f'INFO: link {tensor_name} to existing param {prev_tensor_name}')
+                frame.add_var(tensor_name, frame.get_var(prev_tensor_name))
+            else:  # new param / activation
+                ir_tensor = IRFullTensor(tensor_shape, tensor_name, requires_grad=requires_grad, dtype=dtype)
+                if requires_grad:  # case for registered parameters
+                    ir_tensor.as_param()
+                else:  # case for registered buffers
+                    ir_tensor.as_buffer()
+                frame.add_var(tensor_name, ir_tensor)
+                value = FxModuleParser.fetch_attr(module, node.target)
+                frame.add_attr_content(ir_tensor.tid, value)
+                frame.add_attr_map(ir_tensor.name, node.target)
         else:
             var = FxModuleParser.fetch_attr(module, node.target)
             frame.add_var(tensor_name, var)
