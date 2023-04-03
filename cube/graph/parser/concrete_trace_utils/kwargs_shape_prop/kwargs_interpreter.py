@@ -102,9 +102,8 @@ class KwargsInterpreter(Interpreter):
         Returns:
             Any: The result of executing ``n``
         """
-        with fx_traceback.append_stack_trace(n.stack_trace):
-            args, kwargs = self.fetch_args_kwargs_from_env(n)
-            return getattr(self, n.op)(n.target, args, kwargs)
+        args, kwargs = self.fetch_args_kwargs_from_env(n)
+        return getattr(self, n.op)(n.target, args, kwargs)
 
     def placeholder(self, target: Target, args: Tuple[Argument, ...], kwargs: Dict[str, Any]) -> Any:
         """

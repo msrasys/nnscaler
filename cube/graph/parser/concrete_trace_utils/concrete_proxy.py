@@ -40,7 +40,7 @@ _logger = logging.getLogger(__name__)
 class ConcreteProxy(Proxy):
     """
     `ConcreteProxy` is a wrapped proxy carried the real intermediate value.
-    We can use it to trace a more compatibal model, and pass the branches.
+    We can use it to trace a more compatible model, and pass the branches.
     """
 
     # TODO: python bytecode changes a lot in version 3.11. these ops should be updated.
@@ -58,6 +58,7 @@ class ConcreteProxy(Proxy):
     op_call_ex = dis.opmap['CALL_FUNCTION_EX']
     op_not = dis.opmap['UNARY_NOT']
     op_unpack_sequence = dis.opmap['UNPACK_SEQUENCE']
+    op_dict_merge = dis.opmap.get('DICT_MERGE', None)  # DICT_MERGE is new in python 3.9
     jump_before_opcodes = (op_compare, op_not)
 
     # occurred in different python versions
@@ -73,11 +74,7 @@ class ConcreteProxy(Proxy):
         self.node = node
 
     def __repr__(self) -> str:
-        # to detect if in debugging or in code
-        calling_frame_name = inspect.stack()[1][1]
-        if calling_frame_name.endswith('pydevd_exe2.py') or calling_frame_name.endswith('pydevd_safe_repr.py'):
-            return f'ConcreteProxy({self.node.name})'
-        return repr(self.value)
+        return f'ConcreteProxy({self.node.name}, {self.value})'
 
     def __getattr__(self, k) -> ConcreteProxy:
         return ConcreteAttrProxy(self, k)
@@ -201,7 +198,7 @@ class ConcreteProxy(Proxy):
         while insts[cur].opcode == self.op_extended_arg:
             cur += 1
 
-        if insts[cur].opcode == self.op_call_ex:
+        if insts[cur].opcode == self.op_call_ex or insts[cur].opcode == self.op_dict_merge:
             # in executing `**proxy`
             return self.value.keys()
         else:
