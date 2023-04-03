@@ -1,4 +1,4 @@
-from typing import Callable, Tuple, Union, Optional
+from typing import Callable, Tuple, Union, Optional, Any
 import torch
 import time
 import os
@@ -7,7 +7,9 @@ import cube
 
 from cube.graph.gener.gen import IRAdapterGener
 from cube.graph.graph import IRGraph
-from cube.ir.operator import IRDataOperation
+from cube.ir.cten import IRObject
+from cube.graph.parser.dtype import DType2IRDType
+from cube.ir.tensor import IRFullTensor
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.schedule.schedplan import SchedulePlan
 from cube.graph.function.pyfunc import IRPyFunc
@@ -27,8 +29,9 @@ from cube.ir.unique import IDGenerator
 from cube.flags import CompileFlag
 
 
-def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
+def compile(model: SemanticModel, *args,
             PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None,
+            model_dummy_inputs: Tuple[Any] = None,
             comm_cost_fn: Optional[Callable] = None, override = True, load_content = True) -> Callable:
     """
     AI Scientist calls like:
@@ -48,8 +51,9 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
         ...
 
     @param model SemanticModel: AI Scientist specified SemanticModel
-    @param dataloader CubDataLoader: dataloader used for training
+    @param args: compile function example inputs
     @param PAS Callable: policy to transform and schedule graph
+    @param model_dummy_inputs Tuple[Any]: model example inputs when using torch.fx parser
     @param comm_cost_fn: Optional[Callable]: communication cost function, which
         takes in an IRAdapterPrim, and outputs a cost in float. By default (None) use
         communication volume.
@@ -64,19 +68,28 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
     # clean global status
     Program().clear()
     IDGenerator().clear()
+    assert PAS is not None, f'PAS should be callable function'
 
-    if not isinstance(model, SemanticModel):
-        raise TypeError("Expect Semantic Model")
-    if dataloader is None:
-        # create empty dataloader
-        dataloader = cube.runtime.syndata.SynDataLoader(shapes=(),dtypes=())
-    if not isinstance(dataloader, CubeDataLoader):
-        raise TypeError("Expect dataloader derived from CubeDataLoader")
-
+    model = SemanticModel(model) if isinstance(model, torch.nn.Module) else model
+    assert isinstance(model, SemanticModel), f'Require cube.SemanticModel or torch.nn.Module, but got model: {type(model)}'
     model.save_content = load_content
-    if model.dummy_input is None:
-        model.dummy_input = next(dataloader)
-    ir_dataloader = SemanticDataLoader(dataloader)
+    model.dummy_input = model_dummy_inputs
+
+    dataloader = None
+    inputs = [model]
+    for arg in args:
+        assert not isinstance(arg, (torch.nn.Module, SemanticModel)), f"Only one model can be input for compile"
+        if isinstance(arg, (torch.utils.data.Dataset, CubeDataLoader)):
+            assert dataloader is None
+            dataloader = arg
+            arg = SemanticDataLoader(dataloader)
+        elif isinstance(arg, torch.Tensor):
+            arg = IRFullTensor(arg.shape, name='tensor', 
+                               requires_grad=arg.requires_grad,
+                               dtype=DType2IRDType.map(arg.dtype)).tosub()
+        else:
+            arg= IRObject('obj')
+        inputs.append(arg)
 
     myrank = DeviceGroup().rank
 
@@ -101,12 +114,22 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
             # run once to get model structure and tensor shape
             start = time.time()
-            outputs = fn(model, ir_dataloader)
+            outputs = fn(*inputs)
             Program().finalize()
             if outputs is None:
                 outputs = []
             elif not (isinstance(outputs, tuple) or isinstance(outputs, list)):
                 outputs = [outputs]
+            # setup program input
+            pinputs = []
+            for input in inputs[1:]: # we don't consider `model` as inputs
+                if isinstance(input, SemanticModel):
+                    pinputs.append('model')
+                elif isinstance(input, SemanticDataLoader):
+                    pinputs.append('dataloader')
+                else:
+                    pinputs.append(input)
+            Program().set_input(pinputs)
             # setup program output
             Program().set_output(outputs)
             span = time.time() - start
@@ -216,17 +239,18 @@ def compile(model: SemanticModel, dataloader: Optional[CubeDataLoader] = None,
 
         model.dummy_input = None
         # set dataloder batch size (serialize output)
-        bs = model.get_gen_module().get_batch_size()
-        print_each_rank(f'> setting batch size to: {bs}')
-        if torch.distributed.is_initialized():
-            for rank in range(torch.distributed.get_world_size()):
-                if rank == torch.distributed.get_rank():
-                    if bs is not None and dataloader is not None:
-                        dataloader.set_batch_size(bs)
-                torch.distributed.barrier()
-        else:
-            if bs is not None and dataloader is not None:
-                dataloader.set_batch_size(bs)
+        if dataloader is not None:
+            bs = model.get_gen_module().get_batch_size()
+            print_each_rank(f'> setting batch size to: {bs}')
+            if torch.distributed.is_initialized():
+                for rank in range(torch.distributed.get_world_size()):
+                    if rank == torch.distributed.get_rank():
+                        if bs is not None and dataloader is not None:
+                            dataloader.set_batch_size(bs)
+                    torch.distributed.barrier()
+            else:
+                if bs is not None and dataloader is not None:
+                    dataloader.set_batch_size(bs)
         
         if torch.distributed.is_initialized():
             torch.distributed.barrier()

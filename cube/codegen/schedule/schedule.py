@@ -42,8 +42,7 @@ class ScheduleCodeGen(FuncEmission):
 
         lifetime = LifeCycle(device_nodes, [], self.execplan.graph.outputs())
 
-        model_inputs = ['{}_{}'.format(_input.name, _input.tid) for _input in self.execplan.graph.inputs()]
-        args = ['model'] + model_inputs
+        args = ['model'] + [ScheduleCodeGen.tensor_name(t) for t in self.execplan.graph.inputs()]
 
         with FunctionBlock(func_name='_train_step', 
                            args=args) as fb:
@@ -94,7 +93,7 @@ class ScheduleCodeGen(FuncEmission):
                     fb.insert_body(codes)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
-                    tensors = [t for t in tensors if not t.is_grad()]
+                    tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         fb.insert_body(ScheduleCodeGen.emit_release(tensors))
                 # return code

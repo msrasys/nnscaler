@@ -125,7 +125,9 @@ def train():
     model = MLP(dim=dim)
     model = cube.SemanticModel(model)
 
-    @cube.compile(model, dataloader, PAS=PAS, load_content=False)
+    data, mask = next(dataloader)
+    @cube.compile(model, dataloader, PAS=PAS, load_content=False,
+                  model_dummy_inputs={'data': data, 'mask': mask})
     def train_iter(model, dataloader):
         data, mask = next(dataloader)
         loss = model(data, mask)
