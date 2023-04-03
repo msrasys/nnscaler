@@ -10,6 +10,8 @@ IRGraph:
 from typing import Sequence, Set, Union, Tuple, List, Optional, Dict, Any
 import warnings
 import copy
+import pickle
+import dill
 
 from cube.ir.cten import IRTensor, IRCell, IRObject
 from cube.ir.unique import IDGenerator
@@ -20,6 +22,7 @@ from cube.ir.dtype import IRDType, DTypeInferRule
 from cube.graph.function.function import Identity, MultiRef
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.function.pyfunc import IRPyFunc
+from cube.graph.function.dimops import IRDimops
 from cube.graph.segment import IRSegment
 
 from cube.algorithm.generics import GenericDistAlgo
@@ -921,3 +924,57 @@ class IRGraph(IRSegment):
                         self.finsert(multiref, fidx)
                     else:
                         self.insert(multiref, fidx)
+
+    def dump(self, filename: str) -> None:
+        """
+        Dump the graph into pickled format
+
+        @param filename str
+        """
+        # FIXME: dump doesn't support customized op
+        class PicklingContextSave:
+            def __enter__(self):
+                IRObject.__getstate__ = IRObject.getstate_for_dump
+            def __exit__(self, exc_type, exc_value, traceback):
+                IRObject.__getstate__ = lambda self: self.__dict__.copy()
+
+        with PicklingContextSave():
+            with open(filename, 'wb') as f:
+                save = (IDGenerator().get_states(), self)
+                dill.dump(save, f)
+
+    @staticmethod
+    def load(filename: str):
+        """
+        Load the graph from pickled file.
+        Note IDGenerator will also be reset to match with graph status
+
+        @param filename str
+
+        @return graph IRGraph
+        """
+        with open(filename, 'rb') as f:
+            id_state, graph = dill.load(f)
+        
+        # recover IRGenerator
+        IDGenerator().load_states(id_state)
+        # recover cell
+        def reset_node(segment: IRSegment):
+            # input
+            for t in segment.inputs():
+                if isinstance(t, IRObject):
+                    t.cell = segment
+            # nodes
+            for node in segment.nodes():
+                for t in node.inputs() + node.outputs():
+                    if isinstance(t, IRObject): 
+                        t.cell = node
+                # recursively recover segments
+                if isinstance(node, IRSegment):
+                    reset_node(node)
+            # output
+            for t in IRSegment.get_objects_from_complex(segment.outputs()):
+                t.cell = segment
+        
+        reset_node(graph)
+        return graph

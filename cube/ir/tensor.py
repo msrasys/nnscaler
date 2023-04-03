@@ -261,7 +261,7 @@ class IRFullTensor(IRTensor):
         super().__init__(shape, name, dtype)
 
         # record all created sub_tensors
-        self._segments : Dict[(ValueMap, IndexMap), int] = dict()
+        self._subtensors : Dict[(ValueMap, IndexMap), int] = dict()
 
         self.requires_grad = requires_grad
         self._is_loss = False
@@ -397,12 +397,12 @@ class IRFullTensor(IRTensor):
         keys = (indmap, valmap)
         # print(f'key: {keys}, hash {hash(keys)}')
         # return tensor to keep id same for same sub tensor
-        if keys in self._segments:
-            tid = self._segments[keys]
+        if keys in self._subtensors:
+            tid = self._subtensors[keys]
             sub_tensor = IRSubTensor(self, indmap, valmap, tid=tid)
         else:
             sub_tensor = IRSubTensor(self, indmap, valmap)
-            self._segments[keys] = sub_tensor.tid
+            self._subtensors[keys] = sub_tensor.tid
         return sub_tensor
 
     def tosub(self):

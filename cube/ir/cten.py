@@ -451,6 +451,17 @@ class IRObject:
     def __hash__(self) -> int:
         return self._id
 
+    def getstate_for_dump(self):
+        """
+        __getstate__ method for pickle dump
+
+        @warning: dump an IRObject will disconnect the tensor to its cell
+        """
+        state = self.__dict__.copy()
+        # this will decouple the interconnected object and cell during dump.
+        state['_cell'] = None
+        return state
+
     @property
     def tid(self) -> int:
         """Get object id"""

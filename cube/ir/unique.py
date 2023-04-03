@@ -29,6 +29,13 @@ class IDGenerator:
         self.instance._cell_id += 1
         return self.instance._cell_id
 
+    def get_states(self):
+        return (self._tensor_id, self._cell_id)
+    
+    def load_states(self, states: tuple):
+        IDGenerator.instance._tensor_id = states[0]
+        IDGenerator.instance._cell_id = states[1]
+
     def clear(self):
         self.instance._tensor_id = 0
         self.instance._cell_id = 0

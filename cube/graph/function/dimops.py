@@ -632,19 +632,6 @@ class IRDimops(IRFwOperation):
     def transform_rules(self) -> Tuple[TransformRule]:
         return self._trans_rules
 
-    def getstate_for_dump(self):
-        state = self.__dict__.copy()
-        state['_create_fn'] = {
-            'name': self._create_fn[0].__name__,
-            'module': self._create_fn[0].__module__,
-        }
-        return state
-
-    def setstate_for_load(self, state):
-        module = importlib.import_module(state['_create_fn']['module'])
-        state['_create_fn'] = (getattr(module, state['_create_fn']['name']),)
-        self.__dict__.update(state)
-
     def ianno(self, index: int) -> Tuple[DimAnno]:
         """!
         Get index-th input tensor shape annotation
