@@ -196,11 +196,12 @@ class FxModuleParser:
         output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
 
 
-    
-        frame.pop_var()
-        frame.pop_attr()
         if FxModuleParser.save_content:
             frame.save_attr_content()
+            frame.save_attr_map()
+
+        frame.pop_var()
+        frame.pop_attr()
 
         return input_val, all_ir_nodes, output_val
 
