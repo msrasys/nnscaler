@@ -10,19 +10,18 @@ IRGraph:
 from typing import Sequence, Set, Union, Tuple, List, Optional, Dict, Any
 import warnings
 import copy
-import pickle
 import dill
+import sys
 
 from cube.ir.cten import IRTensor, IRCell, IRObject
 from cube.ir.unique import IDGenerator
 from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
-from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
+from cube.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 from cube.ir.dtype import IRDType, DTypeInferRule
 
-from cube.graph.function.function import Identity, MultiRef
+from cube.graph.function.function import Identity
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.function.pyfunc import IRPyFunc
-from cube.graph.function.dimops import IRDimops
 from cube.graph.segment import IRSegment
 
 from cube.algorithm.generics import GenericDistAlgo
@@ -135,6 +134,15 @@ class IRGraph(IRSegment):
     def backward(self, loss: IRSubTensor):
         """
         Backward the graph from the entry tensor of loss.
+        
+        This will infer tensors' gradients by following rules:
+
+        Conditions must satisfy for an forward op having its backward op:
+            * one of its output tensors requires gradient
+            * one of its output tensors is consumed by other forward ops
+
+        For operators that doesn't need backward, all gradients of their
+        input/output tensors will make to None (despite require_grad is True) 
 
         @param loss IRSubTensor: the loss tensor, must be in the output
             of current graph. The loss shape should be (1,)
@@ -146,17 +154,27 @@ class IRGraph(IRSegment):
         # set loss gradient
         loss.parent.to_loss()
 
+        # update require gradient: for tensors that have no consumers,
+        # make their gradient to be False
+        for ftensor in self.full_tensors():
+            if ftensor.is_loss(): continue
+            consumers = [n for n in self.consumers(ftensor) if isinstance(n, IRFwOperation)]
+            if len(consumers) == 0 and ftensor.requires_grad:
+                print(f"warning: detected a dead ftensor which is not consumed by any nodes:\n\t{ftensor.name}: {ftensor}", file=sys.stderr)
+                ftensor.requires_grad = False
+
         # infer gradient
         for ftensor in self.full_tensors():
             self.infer_grad(ftensor)
+
         # create backward node
         for fnode in self.nodes()[::-1]:
             assert not isinstance(fnode, IRSegment), "Internal Error: Segment should not appear for now"
             if not isinstance(fnode, IRFwOperation): continue
-            tensors = [t for t in fnode.inputs() + fnode.outputs() if isinstance(t, IRSubTensor)]
-            grads = [t.grad for t in tensors]
+            outputs = [t for t in fnode.outputs() if isinstance(t, IRSubTensor)]
             # no backward op generated for fnode
-            if all(grad is None for grad in grads): continue
+            if all(t.grad is None for t in outputs):
+                continue
             # create backward op and insert to graph
             bwop = self.create_bwop(fnode)
             self.insert(bwop, self.nnodes)
@@ -166,63 +184,61 @@ class IRGraph(IRSegment):
 
     # ========================= Graph Manipulation ========================
 
-    def group(self, fnodes: List[IRCell]) -> IRSegment:
+    def group(self, nodes: List[IRCell]) -> IRSegment:
         """!
-        Group consecutive forward nodes into IRSegment.
-        Note the fnodes should not apply any transformation.
-        TODO: update operator dependency
-        
-        The corresponding backward nodes will also be grouped.
+        Group consecutive nodes into IRSegment.
+        Note nodes should not have applied by any transformation.
 
-        @param nodes List[IRCell]: the consecutive node subset of this graph
+        @param nodes List[IRCell]: consecutive nodes in forward procedure
         
         @return segment IRSegment: the grouped segment
         """
-        assert any(not isinstance(node, (IRBpOperation, IRDataOperation)) for node in fnodes), \
-            "grouped nodes cannot be backward operation, segment or data operation"
-        
-        fgraphs = [self.segment(fnode) for fnode in fnodes]
-        assert len(set(fgraphs)) == 1, "Cross-segment grouping is not allowed yet."
-        
-        # get backward nodes
-        bnodes = [fnode.mirror for fnode in fnodes[::-1] if fnode.mirror is not None]
-        
+        assert all(node.isfw() for node in nodes), f"Expected all nodes in forward procedure"
+        fgraphs = [self.segment(fnode) for fnode in nodes]
+        assert len(set(fgraphs)) == 1, "cross-segment grouping is not allowed yet."
+
         fgraph: IRSegment = fgraphs[0]
+        findices: Tuple[int] = tuple(fgraph.index(node)[0] for node in nodes)
+        min_fidx, max_fidx = min(findices), max(findices)
+        assert max_fidx - min_fidx + 1 == len(nodes), "nodes should be in consecutive order"
+
+        fsegment: IRSegment = fgraph.create_segment(nodes)
+        for node in nodes:
+            idx = fgraph.remove(node)
+        fgraph.insert(fsegment, idx)
+
+        # group for mirror nodes
+        bnodes = [node.mirror for node in nodes if node.mirror is not None]
+        if len(bnodes) == 0: return fsegment
+
+        # check consecutive
         bgraph: IRSegment = fgraph.mirror
+        bindices = [bgraph.index(bnode)[0] for bnode in bnodes]
+        min_bidx, max_bidx = min(bindices), max(bindices)
+        assert max_bidx - min_bidx + 1 == len(bnodes), \
+            f"backward nodes are not consecutive. minbidx: {min_bidx}, maxbidx: {max_bidx}"
 
-        findices: Tuple[int] = tuple(fgraph.index(fnode)[0] for fnode in fnodes)
-        bindices: Tuple[int] = tuple(bgraph.index(bnode)[0] for bnode in bnodes)
-
-        minfidx, maxfidx = min(findices), max(findices)
-        assert maxfidx - minfidx + 1 == len(fnodes), \
-            "Forward nodes are not consecutive"
-
-        if len(bnodes) > 0:
-            minbidx, maxbidx = min(bindices), max(bindices)
-            assert maxbidx - minbidx + 1 == len(bnodes), \
-                f"Internal Error: backward nodes are not consecutive. maxbidx: {maxbidx}, minbidx: {minbidx}"
-
-        # remove fnodes and insert fsegment
-        fsegment: IRSegment = fgraph.create_segment(fnodes)
-        for fnode in fnodes:
-            fidx = fgraph.remove(fnode)
-        fgraph.insert(fsegment, fidx)
-
-        # reset fsegment gradient
+        # update gradient for fgraph
         for itensor in fsegment.inputs():
-            if isinstance(itensor, IRTensor):
-                fgraph.infer_grad(itensor.parent)
+            fgraph.infer_grad(itensor.parent)
+        # update gradient inside segment
+        for ftensor in fsegment.full_tensors():
+            fsegment.infer_grad(ftensor)
 
-        # update backward
-        if len(bnodes) > 0:
-            # remove backward nodes
-            for bnode in bnodes:
-                bidx = bgraph.remove(bnode)
-            # create new backward node
-            bnodes = [fsegment.create_bwop(fnode) for fnode in fnodes[::-1]]
-            # create and insert backward segment
-            bsegment = fgraph.create_bwop(fsegment)
-            bgraph.insert(bsegment, bidx)
+        # create backward segment
+        for bnode in bnodes:
+            bidx = bgraph.remove(bnode)
+        bnodes = [fsegment.create_bwop(fnode) for fnode in nodes[::-1] if fnode.mirror is not None]
+        # get backward graph inputs
+        output_grads = [t.grad for t in fsegment.outputs() if isinstance(t, IRSubTensor) and t.grad is not None]
+        # get backward graph outputs
+        input_grads = [t.grad for t in fsegment.inputs() if \
+                       isinstance(t, IRSubTensor) and t.grad is not None]
+        bsegment = IRSegment(bnodes, output_grads, input_grads)
+
+        bgraph.insert(bsegment, bidx)
+        IRCell.make_pair(fsegment, bsegment)
+        return fsegment
 
     # ========================== Graph Creation ========================
 
@@ -357,42 +373,6 @@ class IRGraph(IRSegment):
         fnodes = algo.instantiate(**config)
         assert fnodes is not None, f"Fail to partition node: {node} use algorithm and config: {config}"
 
-        # set gradient
-        valmaps: Dict[IRFullTensor, ValueMap] = dict()
-        for t in node.inputs():
-            if isinstance(t, IRSubTensor) and t.requires_grad:
-                valmaps[t.parent] = ValueMap(t.grad.valmap)
-        # set up consumers
-        ctensors: Dict[IRFullTensor, List[IRSubTensor]] = dict()
-        consumers: Dict[IRFullTensor, List[IRCell]] = dict()
-        for fnode in fnodes:
-            for itensor in fnode.inputs():
-                if not isinstance(itensor, IRSubTensor): continue
-                if not itensor.requires_grad: continue
-                if itensor.parent not in ctensors:
-                    ctensors[itensor.parent] = []
-                    consumers[itensor.parent] = []
-                ctensors[itensor.parent].append(itensor)
-                consumers[itensor.parent].append(fnode)
-        # set up gradient
-        for fnode in fnodes:
-            for itensor in fnode.inputs():
-                if not isinstance(itensor, IRSubTensor): continue
-                if not itensor.requires_grad: continue
-                ftensor = itensor.parent
-                # the [::-1] only makes the valuemap to grow with execution order
-                cs = [c for c, t in zip(consumers[ftensor], ctensors[ftensor]) if t == itensor][::-1]
-                valmap = valmaps[itensor.parent].map((cs.index(fnode), len(cs)))
-                grad = ftensor.grad.select(itensor.indmap, valmap)
-                itensor.grad = grad
-            for otensor in fnode.outputs():
-                if not isinstance(otensor, IRSubTensor): continue
-                if not otensor.requires_grad:
-                    grad = None
-                else:
-                    grad = otensor.parent.grad.select(otensor.indmap, (0,1))
-                otensor.grad = grad
-
         # insert forward node
         fsegment: IRSegment = self.segment(node)
         for fnode in fnodes:
@@ -403,15 +383,51 @@ class IRGraph(IRSegment):
             fnode.device = node.device
         fsegment.replace(node, fnodes)
 
+        if node.mirror is None: return fnodes
+
+        valmaps: Dict[IRFullTensor, Optional[ValueMap]] = dict()
+        for t in node.inputs() + node.outputs():
+            if isinstance(t, IRSubTensor):
+                valmaps[t.parent] = None if t.grad is None else ValueMap(t.grad.valmap)
+        
+        # gather consumers
+        ctensors: Dict[IRFullTensor, List[IRSubTensor]] = dict()
+        consumers: Dict[IRFullTensor, List[IRCell]] = dict()
+        for fnode in fnodes:
+            for itensor in set(fnode.inputs()):
+                if not isinstance(itensor, IRSubTensor): continue
+                ctensors.setdefault(itensor.parent, []).append(itensor)
+                consumers.setdefault(itensor.parent, []).append(fnode)
+        # set up gradient
+        for fnode in fnodes:
+            for itensor in fnode.inputs():
+                if not isinstance(itensor, IRSubTensor): continue
+                ftensor = itensor.parent
+                itensor.grad = None
+                if valmaps[ftensor] is None: continue
+                # collect consumers that consume the same sub_tensor
+                consumers_of_same_tensor = []
+                for idx, t in enumerate(ctensors[ftensor]):
+                    if t == itensor:
+                        consumers_of_same_tensor.append(consumers[ftensor][idx])
+                consumers_of_same_tensor = consumers_of_same_tensor[::-1]  # make valmap grow with exec order
+                # calculate value map
+                valmap = valmaps[ftensor].map(
+                    (consumers_of_same_tensor.index(fnode), len(consumers_of_same_tensor))
+                )
+                grad = ftensor.grad.select(itensor.indmap, valmap)
+                itensor.grad = grad
+            for otensor in fnode.outputs():
+                if not isinstance(otensor, IRSubTensor): continue
+                otensor.grad = None if valmaps[otensor.parent] is None else \
+                    otensor.parent.grad.select(otensor.indmap, (0,1))
+
         # insert backward node
-        if isinstance(node.mirror, IRCell):
-            bnodes = [fsegment.create_bwop(fnode) for fnode in fnodes[::-1]]
-            assert isinstance(node.mirror, IRBpOperation)
-            assert len(bnodes) == len(fnodes)
-            for bnode in bnodes:
-                bnode.device = node.device
-            bsegment: IRSegment = fsegment.mirror
-            bsegment.replace(node.mirror, bnodes)
+        bnodes = [fsegment.create_bwop(fnode) for fnode in fnodes[::-1]]
+        for bnode in bnodes:
+            bnode.device = node.device
+        bsegment: IRSegment = fsegment.mirror
+        bsegment.replace(node.mirror, bnodes)
 
         return fnodes
 
@@ -860,70 +876,6 @@ class IRGraph(IRSegment):
         return True
 
     # =================== Helpers ====================
-
-    def auto_multiref(self):
-        """
-        Automatically partition and schedule multiref node.
-        This requires to call after all transformation and
-        scheduling.
-
-        The policy is to partition and assign multiref 
-        in the same way of its input producer
-        """
-        for node in self.nodes(flatten=True):
-            if node.name == 'multiref':
-                if len(node.device) != 0: continue
-                segment: IRSegment = self.segment(node)
-                ftensor = node.input(0).parent
-                ptensors = segment.ptensors(ftensor)
-
-                multirefs = []
-
-                # use downstream consumers
-                devtensors: Dict[int, List[IRSubTensor]] = dict()
-                for tensor in node.outputs():
-                    for ctensor in segment.ctensors(tensor.parent):
-                        for devid in ctensor.device:
-                            if devid not in devtensors:
-                                devtensors[devid] = []
-                            devtensors[devid].append(ctensor)
-                devids = list(devtensors.keys())
-                ctensors = [ts[0] for ts in devtensors.values()]
-                for devid, ctensor in zip(devids, ctensors):
-                    itensor = node.input(0).parent.select(ctensor.indmap, ctensor.valmap)
-                    otensors = []
-                    for otensor in node.outputs():
-                        otensors.append(otensor.parent.select(ctensor.indmap, ctensor.valmap))
-                    multiref = MultiRef(itensor, len(otensors))
-                    for idx, otensor in enumerate(otensors):
-                        multiref.set_output(idx, otensor)
-                    multiref.device = devid
-                    multirefs.append(multiref)
-                
-                # if no downstream consumers, use upstream producers
-                if len(multirefs) == 0:
-                    for ptensor in ptensors:
-                        assert len(ptensor.device) > 0, \
-                            "Auto Multiref requires its producer nodes assigned to devices"
-                        for devid in ptensor.device:
-                            outputs = []
-                            for output in node.outputs():
-                                outputs.append(output.parent.select(ptensor.indmap, ptensor.valmap))
-                            multiref = MultiRef(ptensor, len(outputs))
-                            for idx, otensor in enumerate(outputs):
-                                multiref.set_output(idx, otensor)
-                            multiref.device = devid
-                            multirefs.append(multiref)
-                
-                # replace into graph
-                fidx = self.remove(node)
-                if node.mirror is not None:
-                    self.remove(node.mirror)
-                for multiref in multirefs[::-1]:
-                    if node.mirror is not None:
-                        self.finsert(multiref, fidx)
-                    else:
-                        self.insert(multiref, fidx)
 
     def dump(self, filename: str) -> None:
         """

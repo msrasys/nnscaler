@@ -1,7 +1,7 @@
 """
 Utilities for gradient modification
 """
-from typing import Dict, List
+from typing import Dict, List, Union, Tuple
 from cube.graph import IRGraph
 from cube.graph.segment import IRSegment
 from cube.ir.operator import IRFwOperation
@@ -10,7 +10,7 @@ from cube.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 
 class DummyInputOuput(IRFwOperation):
 
-    def __init__(self, tensor: IRSubTensor, device: int, 
+    def __init__(self, tensor: IRSubTensor, device: Union[int, Tuple[int]], 
                  is_input=False, is_output=False,
                  name='dummy'):
         assert (is_input and not is_output) or (is_output and not is_input)
@@ -71,7 +71,7 @@ def convert_add_to_valmap(graph: IRGraph, add_node: IRFwOperation):
 def flatten_grad(graph: IRSegment, ftensor: IRFullTensor):
     """
     Reset gradient for consumers that are different (no replica)
-    Gradient valuemap will be flatten iter-devices, e.g.,(0,3), (1,3), (2,3)
+    Gradient valuemap will be flatten inter-devices, e.g.,(0,3), (1,3), (2,3)
     Gradient valuemap will be exponent intra-devices, e.g., (0,2), (2,4), (3,4)
 
     @param graph IRGraph: the graph
@@ -93,6 +93,7 @@ def flatten_grad(graph: IRSegment, ftensor: IRFullTensor):
         if len(ctensor.device) > 1: return
         devtensors[ctensor][ctensor.device[0]] = []
     for ctensor, consumer in zip(graph.ctensors(ftensor), graph.consumers(ftensor)):
+        if consumer.mirror is None: continue
         devid = ctensor.device[0]
         devtensors[ctensor][devid].append(consumer)
     

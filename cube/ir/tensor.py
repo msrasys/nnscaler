@@ -296,14 +296,13 @@ class IRFullTensor(IRTensor):
     @grad.setter
     def grad(self, val: Optional[IRTensor]):
         """
-        int indicates the tensor is the loss tensor.
+        Setup gradient for the tensor.
         """
-        if self._requires_grad:
-            assert isinstance(val, IRFullTensor)
+        assert val is None or isinstance(val, IRFullTensor)
+        if val is not None:
+            assert self._requires_grad, f"Cannot assign {val} to no grad-required tensor"
             assert val.shape == self.shape
             assert val.is_attr() == self.is_attr()
-        else:
-            assert val is None, "The FullTensor doesn't require grad but is assigned with a grad."
         self._grad = val
 
     def is_loss(self) -> bool:
@@ -631,14 +630,15 @@ class IRSubTensor(IRTensor):
 
     @grad.setter
     def grad(self, val: Optional[IRTensor]):
-        if isinstance(val, IRSubTensor):
-            assert self.requires_grad and val.shape == self.shape, f'info: {self.requires_grad} {val.shape == self.shape}'
-            self._grad = val
-        elif val is None:
-            assert not self.requires_grad
-            self._grad = None
-        else:
-            raise ValueError(f"Expected grad to be None or IRSubTensor but got: {val}")
+        """
+        Setup gradient for the tensor.
+        """
+        assert val is None or isinstance(val, IRSubTensor)
+        if val is not None:
+            assert self._requires_grad, f"Cannot assign {val} to no grad-required tensor"
+            assert val.shape == self.shape
+            assert val.is_attr() == self.is_attr()
+        self._grad = val
 
     def is_loss(self) -> bool:
         """

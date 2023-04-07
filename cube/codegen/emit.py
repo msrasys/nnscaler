@@ -229,7 +229,7 @@ class FuncEmission(CodeEmission):
         return 'del ' + ', '.join(tnames)
     
     @staticmethod
-    def get_backward_callsite_io_tensors(bw_cell: IRCell) -> Tuple:
+    def get_backward_callsite_io_tensors(bwop: IRCell) -> Tuple:
         """
         Get backward inputs and outputs
         ```
@@ -245,19 +245,17 @@ class FuncEmission(CodeEmission):
         @return input_grads List[IRSubTensor]: gradient of forward input tensors
             (backward output)
         """
-        assert not bw_cell.isfw()
+        assert not bwop.isfw()
+        fwop: IRCell = bwop.mirror
 
-        input_tensors = [t for t in bw_cell.mirror.inputs() if \
-            isinstance(t, IRSubTensor) and \
-            t.requires_grad and \
-            not t.is_attr()
-        ]
-        output_tensors = [t for t in bw_cell.mirror.outputs() if isinstance(t, IRSubTensor) and t.grad is not None]
-        input_grads = [t.grad for t in input_tensors]
+        grad2tensor = {}
+        for t in fwop.inputs() + fwop.outputs():
+            if isinstance(t, IRSubTensor) and t.grad is not None:
+                grad2tensor[t.grad] = t
 
-        # WARNING !!!
-        # non-tensor gradients like scalar '1.0f' are removed in 'bpSeg.inputs()'
-        # so the items of 'bpSeg.inputs()' are generally disaligned with 'output_grads' here.
-        output_grads = [t.grad for t in output_tensors]
+        input_grads = [t for t in bwop.outputs() if isinstance(t, IRSubTensor)]
+        output_grads = [t for t in bwop.inputs() if isinstance(t, IRSubTensor)]
+        input_tensors = [grad2tensor[g] for g in input_grads]
+        output_tensors = [grad2tensor[g] for g in output_grads]
 
         return input_tensors, output_tensors, output_grads, input_grads

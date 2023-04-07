@@ -1,12 +1,13 @@
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Dict, List, Optional, Tuple, Callable, Set
 import numpy as np
 import itertools
+import warnings
 
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.gener.concurrent import ConcurrentGener
 import cube.graph.gener.utils as utils
 from cube.graph.graph import IRGraph
-from cube.graph.segment import IRSegment, CellPosition
+from cube.graph.segment import IRSegment
 from cube.graph.function.pyfunc import IRPyFunc
 
 from cube.ir.cten import IRCell, IRObject
@@ -33,36 +34,29 @@ def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) 
     # devices = segment.device
     input_producers: Dict[IRFullTensor, List[IRCell]] = {}
     output_consumers: Dict[IRFullTensor, List[IRCell]] = {}
+    devices = segment.device
     # create inputs
     if inputs:
         input_objects = IRGraph.get_objects_from_complex(segment.inputs())
         for tensor in input_objects:
-            devices = [consumer.device for consumer in segment.consumers(tensor.parent)][::-1]
             if not isinstance(tensor, IRSubTensor): continue
             assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
-            fwop = utils.DummyInputOuput(tensor, 0, is_output=True, name=f'segment{segment.cid}_input')
-            for devid in devices:
-                fop = fwop.replicate()
-                fop.device = devid
-                if tensor.requires_grad:
-                    fop.output(0).grad = tensor.parent.grad.select(tensor.indmap, (0, 1))
-                    fop.output(0).grad.cell = fop
-                input_producers.setdefault(tensor.parent, []).append(fop)
+            fwop = utils.DummyInputOuput(tensor, devices, is_output=True, name=f'segment{segment.cid}_input')
+            if tensor.grad is not None:
+                fwop.output(0).grad = tensor.parent.grad.select(tensor.indmap, (0, 1))
+                fwop.output(0).grad.cell = fwop
+            input_producers.setdefault(tensor.parent, []).append(fwop)
     # create outputs
     if outputs:
         output_objects = IRGraph.get_objects_from_complex(segment.outputs())
         for tensor in output_objects:
-            devices = [producer.device for producer in segment.producers(tensor.parent)]
             if not isinstance(tensor, IRSubTensor): continue
             assert tensor.valmap == (0, 1), f"valmap != (0, 1):\n{segment.extra_repr()}"
-            fwop = utils.DummyInputOuput(tensor, 0, is_input=True, name=f'segment{segment.cid}_output')
-            for devid in devices:
-                fop = fwop.replicate()
-                fop.device = devid
-                if tensor.requires_grad:
-                    fop.input(0).grad = tensor.parent.grad.select(tensor.indmap, (0, 1))
-                    fop.input(0).grad.cell = fop
-                output_consumers.setdefault(tensor.parent, []).append(fop)
+            fwop = utils.DummyInputOuput(tensor, devices, is_input=True, name=f'segment{segment.cid}_output')
+            if tensor.grad is not None:
+                fwop.input(0).grad = tensor.parent.grad.select(tensor.indmap, (0, 1))
+                fwop.input(0).grad.cell = fwop
+            output_consumers.setdefault(tensor.parent, []).append(fwop)
     return input_producers, output_consumers
 
 
@@ -78,22 +72,24 @@ def expand_devices(tensors: List[Optional[IRSubTensor]],
 
     @return dtensors List[IRSubTensor]: each tensor is on one device
     """
-    dtensors = []
+    dtensors: Dict[int, List[IRSubTensor]] = {}
     for tensor in tensors:
         if tensor is None: continue
-        if len(tensor.device) == 1:
-            dtensors.append(tensor)
-            continue
         for devid in tensor.device:
+            if tensor in dtensors.setdefault(devid, []):
+                continue
             if producer:
                 fwop = utils.DummyInputOuput(tensor, devid, is_output=True, name=tensor.cell.name)
-                dtensors.append(fwop.output(0))
+                dtensors[devid].append(fwop.output(0))
             elif consumer:
                 fwop = utils.DummyInputOuput(tensor, devid, is_input=True, name=tensor.cell.name)
-                dtensors.append(fwop.input(0))
+                dtensors[devid].append(fwop.input(0))
             else:
                 raise ValueError("At least one of producer or consumer")
-    return dtensors
+    all_tensors = []
+    for device_tensors in dtensors.values():
+        all_tensors += device_tensors
+    return all_tensors
 
 
 class IRAdapterGener:
@@ -182,6 +178,27 @@ class IRAdapterGener:
                 1. same number of nodes per cid group
                 2. same device set or no-overlapping device set per cid group
         """
+        def check_consistent_local_partition(graph: IRSegment):
+            """each weight full tensor inside one device should in same format."""
+            for ftensor in graph.full_tensors():
+                if not ftensor.is_attr(): continue
+                device_tensors: Dict[int, Set[IRSubTensor]] = {}
+                for ctensor in graph.ctensors(ftensor):
+                    for devid in ctensor.device:
+                        local_tensors = device_tensors.setdefault(devid, set())
+                        for t in local_tensors:
+                            assert t == ctensor or not t.overlap(ctensor), (
+                                    f"Detected graph attribute is partitioned with shared part on device {devid}.\n"
+                                    f"To achieve this, need call graph.multiref at the front of sProgram.\n"
+                                    f"{graph.debug_tensor_map_str(ftensor)}"
+                                )
+                        local_tensors.add(ctensor)
+            for segment in graph.select(ntype=IRSegment, flatten=False):
+                if segment.isfw():
+                    check_consistent_local_partition(segment)
+        
+        check_consistent_local_partition(graph)
+
         # collect subtensor and consumer
         fweights: Dict[IRFullTensor, List[IRSubTensor]] = dict()
         fgrads: Dict[IRFullTensor, List[IRSubTensor]] = dict()
@@ -212,8 +229,6 @@ class IRAdapterGener:
                 if grad not in weight_grads[weight]:
                     weight_grads[weight][grad] = []
                 weight_grads[weight][grad].append(consumer)
-            
-            # TODO: check sub_weight is no-overlapping
 
             # assert all(sw.valmap[1] == len(weight_grads) for sw in weight_grads.keys())
             for sub_weight in weight_grads:
@@ -315,7 +330,7 @@ class IRAdapterGener:
             # consumers can be operators and graph outputs
             fconsumers, fctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
             if ftensor in output_consumer:
-                fctensors = fctensors + tuple(fwop.input(0) for fwop in output_consumer[ftensor] if fwop.input(0) not in fctensors)
+                fctensors = fctensors + tuple(fwop.input(0) for fwop in output_consumer[ftensor])
             fctensors = expand_devices(fctensors, consumer=True)
             assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
 
@@ -585,6 +600,7 @@ class IRAdapterGener:
 
         # collect consumer of each device
         for ctensor, consumer in zip(graph.ctensors(ftensor), graph.consumers(ftensor)):
+            if consumer.mirror is None: continue
             for devid in ctensor.device:
                 devtensors.setdefault(devid, []).append(ctensor)
                 devops.setdefault(devid, []).append(consumer)
@@ -658,27 +674,51 @@ class IRAdapterGener:
         @return None
         """
         for multiref in graph.select(name='multiref', flatten=False):
+            # setup recompute
+            idx = graph.index(multiref).indices[0]
+            recompute = None
+            neighbor = graph.node(idx-1) if idx > 0 else graph.node(idx+1)
+            if isinstance(neighbor, IRFwOperation):
+                recompute = neighbor.recompute
+
             ftensor: IRFullTensor = multiref.input(0).parent
             multirefs = []
-            tensors = graph.ptensors(ftensor) if len(graph.ptensors(ftensor)) > 0 else graph.ctensors(ftensor)
-            for otensor in tensors:
-                mr = MultiRef(otensor, len(multiref.outputs()))
-                for idx in range(len(multiref.outputs())):
-                    output = multiref.output(idx).parent.select(otensor.indmap, otensor.valmap)
-                    if otensor.requires_grad:
-                        output.grad = multiref.output(idx).grad.parent.select(otensor.indmap, (0,1))
-                    mr.set_output(idx, output)
-                mr.device = otensor.device
-                if isinstance(otensor.cell, IRFwOperation):
-                    mr.recompute = otensor.cell.recompute
-                multirefs.append(mr)
+            # by default follow producer transformation strategy
+            ptensors = graph.ptensors(ftensor)
+            if len(ptensors) > 0:
+                for tensor in ptensors:
+                    mr = MultiRef(tensor, len(multiref.outputs()))
+                    mr.input(0).grad = tensor.grad
+                    for idx, out in enumerate(multiref.outputs()):
+                        output = out.parent.select(tensor.indmap, tensor.valmap)
+                        if out.grad is not None:
+                            output.grad = out.grad.parent.select(tensor.indmap, (0,1))
+                        mr.set_output(idx, output)
+                    mr.device = tensor.device
+                    mr.recompute = recompute
+                    multirefs.append(mr)
+            # otherwise replicate: usually for weight / graph inputs
+            else:
+                devices = set()
+                for otensor in multiref.outputs():
+                    ftensor = otensor.parent
+                    for consumer in graph.consumers(ftensor):
+                        devices.update(consumer.device)
+                devices = sorted(devices)
+                for devid in devices:
+                    mr = multiref.replicate()
+                    mr.device = devid
+                    mr.recompute = recompute
+                    multirefs.append(mr)
+            assert len(multirefs) > 0
             # remove original multiref
             fidx = graph.remove(multiref)
             if multiref.mirror is not None:
                 graph.mirror.remove(multiref.mirror)
             # insert multirefs
+            req_bw = multiref.mirror is not None
             for ofst, multiref in enumerate(multirefs):
-                if ftensor.requires_grad:
+                if req_bw:
                     graph.finsert(multiref, fidx + ofst)
                 else:
                     graph.insert(multiref, fidx + ofst)
