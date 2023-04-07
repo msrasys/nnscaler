@@ -148,7 +148,14 @@ class Executor:
         dtensors: List[torch.Tensor] = [pair[1] for pair in saved_pairs]
         for t in input_tensors:
             if id(t) not in tensor_ids:
-                warnings.warn("input doesn't match. Make sure in scheduling that earlier forward perform earlier backward")
+                import traceback
+                warnings.warn(
+                    f"rank {torch.distributed.get_rank()}: input {name} doesn't match. "
+                    f"Make sure in scheduling, earlier forward perform earlier backward. "
+                    f"Remain {len(Executor._detach[name])} segments.\n"
+                    f"{''.join(traceback.format_stack())}"
+                )
+
 
         input_tensors = []
         for t in dtensors:
@@ -156,9 +163,18 @@ class Executor:
                 t.retain_grad()
                 input_tensors.append(t)
 
+        visited = set()
+        dedup_output_tensors = []
+        dedup_output_tensor_grads = []
+        for t, g in zip(output_tensors, output_tensor_grads):
+            if id(t) not in visited:
+                visited.add(id(t))
+                dedup_output_tensors.append(t)
+                dedup_output_tensor_grads.append(g)
+
         torch.autograd.backward(
-            output_tensors,
-            grad_tensors=output_tensor_grads,
+            dedup_output_tensors,
+            grad_tensors=dedup_output_tensor_grads,
         )
         grads = tuple(t.grad for t in input_tensors)
         assert all(grad is not None for grad in grads), "RuntimeError: got gradient None"
