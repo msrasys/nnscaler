@@ -167,8 +167,10 @@ class Executor:
         dedup_output_tensors = []
         dedup_output_tensor_grads = []
         for t, g in zip(output_tensors, output_tensor_grads):
-            if id(t) not in visited:
-                visited.add(id(t))
+            # filter out duplicated output tensor and its grad.
+            pair = (id(t), id(g))
+            if pair not in visited:
+                visited.add(pair)
                 dedup_output_tensors.append(t)
                 dedup_output_tensor_grads.append(g)
 
