@@ -54,7 +54,6 @@ class ConcurrentGener:
         # case 1: sharing device (intra-rvd)
         inshard = (set(pdevs) == set(cdevs)) and (len(fptensors) == len(fctensors)) and (len(pdevs) == len(fptensors))
         if (not CompileFlag.disable_intra_rvd) and inshard and len(pdevs) > 1:
-            # fadapter = ConcurrentGener.gen_in_shard(fptensors, fctensors, bptensors, bctensors, allow_reassign=True)
             try:
                 fadapter = ConcurrentGener.gen_intra_rvd(fptensors, fctensors, bptensors, bctensors, cost_fn)
             except Exception as e:
@@ -70,7 +69,6 @@ class ConcurrentGener:
 
         # Case 2: sperating device (inter-rvd)
         if (not CompileFlag.disable_inter_rvd) and len(set(pdevs).intersection(cdevs)) == 0:
-            # fadapter = ConcurrentGener.gen_cross_shard(fptensors, fctensors, bptensors, bctensors)
             try:
                 fadapter = ConcurrentGener.gen_inter_rvd(fptensors, fctensors, bptensors, bctensors, cost_fn)
             except Exception as e:
@@ -130,13 +128,14 @@ class ConcurrentGener:
         # generate backward
         grad: IRFullTensor = ftensor.grad
         bprims = []
-        if grad is not None and (len(bptensors) != 0 or len(bctensors) != 0):
+        if len(bptensors) > 0 and len(bctensors) > 0:
             # reorder ptensors to match with forward
             ptensors = [None] * len(devs)
             for bptensor in bptensors:
                 idx = devs.index(bptensor.device)
                 assert ptensors[idx] is None, "same device of different tensors"
                 ptensors[idx] = bptensor
+            assert all(t is not None for t in ptensors), f"empty device slot from {bptensors}"
             ilayout = RVDLayout.togrid(grad, ptensors)
             olayout = RVDLayout.togrid(grad, bctensors)
             # paths, bprims = ilayout.path(olayout)
@@ -172,7 +171,7 @@ class ConcurrentGener:
         fadapter.prims = fprims
 
         grad: IRFullTensor = ftensor.grad
-        if grad is not None and (len(bptensors) != 0 or len(bctensors) != 0):
+        if len(bptensors) > 0 or len(bctensors) > 0:
             ilayout = RVDLayout.togrid(grad, bptensors)
             olayout = RVDLayout.togrid(grad, bctensors)
             bprims = InterPathFinder.path(ilayout, olayout, cost_fn)

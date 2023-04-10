@@ -134,12 +134,9 @@ def chunk(itensor: torch.Tensor, dim: int, ranks: Tuple[int], async_op=False) ->
     """
     group = DeviceGroup().get_group(ranks)
     idx = torch.distributed.get_rank(group)
-    require_grad = itensor.requires_grad
     with torch.no_grad():
         otensor = itensor.chunk(len(ranks), dim)[idx]
         otensor = otensor.detach()
-    if require_grad:
-        otensor = otensor.requires_grad_()
     return otensor
 
 
@@ -167,7 +164,7 @@ def rdscatter(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
         shape = list(shape)
         shape[dim] = shape[dim] // len(dsts)
         otensor = torch.empty(
-            shape, requires_grad=True, dtype=dtype,
+            shape, requires_grad=False, dtype=dtype,
             device=torch.cuda.current_device()
         )
         if async_op:
@@ -190,7 +187,7 @@ def rvscatter(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
     group = DeviceGroup().get_group((src,) + dsts)
     rank = torch.distributed.get_rank()
     tensor: torch.Tensor = itensor / len(dsts) if src == rank else \
-        torch.empty(shape, dtype=dtype, requires_grad = True)
+        torch.empty(shape, dtype=dtype, requires_grad=False)
     tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
     work = torch.distributed.broadcast(tensor, src, group=group, async_op=async_op)
     if work:
@@ -226,7 +223,6 @@ def rdgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
             otensor = itensor
         else:
             otensor = torch.cat(tuple(recv_tensors), dim=dim)
-            otensor = otensor.requires_grad_()
     else:
         assert rank in srcs
         otensor = itensor.contiguous() if not itensor.is_contiguous() else itensor
@@ -249,7 +245,7 @@ def rvgather(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype,
         CudaTimer().start(field_name='comm', predefined=True)
     rank = torch.distributed.get_rank()
     group = DeviceGroup().get_group(srcs + (dst,))
-    tensor = torch.zeros(shape, dtype=dtype, requires_grad=True) if rank == dst else itensor
+    tensor = torch.zeros(shape, dtype=dtype, requires_grad=False) if rank == dst else itensor
     work = torch.distributed.reduce(tensor, dst, group=group, async_op=async_op)
     if work and rank == dst:
         AsyncCommHandler().submit(tensor, [work])
@@ -272,7 +268,7 @@ def broadcast(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype, src:
     else:
         assert rank in ranks
         tensor = torch.empty(shape, 
-            device=torch.cuda.current_device(), requires_grad=True, dtype=dtype)
+            device=torch.cuda.current_device(), requires_grad=False, dtype=dtype)
     work = torch.distributed.broadcast(tensor, src, group=group, async_op=async_op)
     if work and rank != src:
         AsyncCommHandler().submit(tensor, [work])
