@@ -1,7 +1,7 @@
 import torch
 import torch.fx
 import torch.fx.traceback as fx_traceback
-from torch.fx import Interpreter, Node
+from torch.fx import Interpreter, Node, GraphModule
 from typing import Optional, Union, Tuple, Dict, List, Any, Iterator, Callable, MutableMapping, Mapping
 from torch.utils._pytree import tree_map
 
@@ -21,6 +21,11 @@ Argument = Optional[Union[
 
 
 class KwargsInterpreter(Interpreter):
+    def __init__(self, module : GraphModule, garbage_collect_values : bool = True, fake_device_type='cpu'):
+        super().__init__(module, garbage_collect_values)
+        assert fake_device_type in ('cpu', 'cuda')
+        self.fake_device_type = fake_device_type
+
     def run(self,
             concrete_args: Union[Dict[str, Any], Tuple, MutableMapping[str, Any], Mapping[str, Any]] = None,
             initial_env: Optional[Dict[Node, Any]] = None,
@@ -147,26 +152,52 @@ class KwargsInterpreter(Interpreter):
                             f'Expected positional argument for parameter {target}, but one was not passed in!')
 
     def call_function(self, target: 'Target', args: Tuple[Argument, ...], kwargs: Dict[str, Any]) -> Any:
-        to_cuda = lambda t: t.cuda() if isinstance(t, torch.Tensor) else t
-        args = tree_map(to_cuda, args)
-        kwargs = tree_map(to_cuda, kwargs)
-        result = super().call_function(target, args, kwargs)
-        if isinstance(result, torch.Tensor):
-            return result.cpu()
+        assert not isinstance(target, str)
+        if self.fake_device_type == 'cpu':
+            to_cuda = lambda t: t.cuda() if isinstance(t, torch.Tensor) else t
+            args = tree_map(to_cuda, args)
+            kwargs = tree_map(to_cuda, kwargs)
+            result = target(*args, **kwargs)
+            if isinstance(result, torch.Tensor):
+                return result.cpu()
+            else:
+                to_cpu = lambda t: t.cpu() if isinstance(t, torch.Tensor) else t
+                return tree_map(to_cpu, result)
         else:
-            to_cpu = lambda t: t.cpu() if isinstance(t, torch.Tensor) else t
-            return tree_map(to_cpu, result)
+            return target(*args, **kwargs)
+
+    def call_method(self, target : 'Target', args : Tuple[Argument, ...], kwargs : Dict[str, Any]) -> Any:
+        # args[0] is the `self` object for this method call
+        self_obj, *args_tail = args
+        assert isinstance(target, str)
+        if self.fake_device_type == 'cpu':
+            self_obj = self_obj.cuda()
+            to_cuda = lambda t: t.cuda() if isinstance(t, torch.Tensor) else t
+            args_tail = tree_map(to_cuda, args_tail)
+            kwargs = tree_map(to_cuda, kwargs)
+            result = getattr(self_obj, target)(*args_tail, **kwargs)
+            self_obj = self_obj.cpu()
+            if isinstance(result, torch.Tensor):
+                return result.cpu()
+            else:
+                to_cpu = lambda t: t.cpu() if isinstance(t, torch.Tensor) else t
+                return tree_map(to_cpu, result)
+        else:
+            return getattr(self_obj, target)(*args_tail, **kwargs)
 
     def call_module(self, target: 'Target', args: Tuple[Argument, ...], kwargs: Dict[str, Any]) -> Any:
         assert isinstance(target, str)
         mod = self.fetch_attr(target)
-        mod = mod.cuda()
-        to_cuda = lambda t: t.cuda() if isinstance(t, torch.Tensor) else t
-        args = tree_map(to_cuda, args)
-        kwargs = tree_map(to_cuda, kwargs)
-        result = mod(*args, **kwargs)
-        if isinstance(result, torch.Tensor):
-            return result.cpu()
+        if self.fake_device_type == 'cpu':
+            mod = mod.cuda()
+            to_cuda = lambda t: t.cuda() if isinstance(t, torch.Tensor) else t
+            args = tree_map(to_cuda, args)
+            kwargs = tree_map(to_cuda, kwargs)
+            result = mod(*args, **kwargs)
+            if isinstance(result, torch.Tensor):
+                return result.cpu()
+            else:
+                to_cpu = lambda t: t.cpu() if isinstance(t, torch.Tensor) else t
+                return tree_map(to_cpu, result)
         else:
-            to_cpu = lambda t: t.cpu() if isinstance(t, torch.Tensor) else t
-            return tree_map(to_cpu, result)
+            return mod(*args, **kwargs)

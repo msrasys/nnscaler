@@ -74,6 +74,7 @@ class Executor:
     # Each graph has its name, and multiple call for the graph will append
     # (instant id -> detached) input tensor pairs for backward reference.
     _detach: Dict[str, List[TensorPairs]] = dict()
+    _fn: Callable = None
 
     @staticmethod
     def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
@@ -140,6 +141,10 @@ class Executor:
             gradient tensors corresponding to input_tensors.
         """
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
+        if Executor._fn is not None and output_tensor_grads[0] is None:
+            assert len(output_tensor_grads) == 1
+            assert len(output_tensors) == 1
+            output_tensors = (Executor._fn(output_tensors[0]), )
 
         if len(output_tensors) == 0: return None
 

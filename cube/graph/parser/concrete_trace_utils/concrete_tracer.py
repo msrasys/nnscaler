@@ -212,7 +212,7 @@ class ConcreteTracer(TracerBase):
     node_to_originating_module : Dict[torch.fx.Node, str] = {}
 
     @compatibility(is_backward_compatible=True)
-    def __init__(self):
+    def __init__(self, fake_device_type='cpu'):
         """
         similar to _symbolic_trace.Tracer.__init__.
         remove the 'param_shapes_constant' because we can get real shape when executing.
@@ -221,6 +221,8 @@ class ConcreteTracer(TracerBase):
         self.scope = Scope("", None)
         self.module_stack = collections.OrderedDict()
         self.node_name_to_scope = {}
+        assert fake_device_type in ('cuda', 'cpu')
+        self.fake_device_type = fake_device_type
 
     @contextmanager
     def do_temp_disable(self, call=False, attr=False, agfunc_apply=False):
@@ -279,75 +281,107 @@ class ConcreteTracer(TracerBase):
             if _orig_getattr(fn, '__module__', None) != 'nni.common.concrete_trace_utils.concrete_tracer' and hasattr(fn, '__globals__'):
                 _autowrap_check(self, fn.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
             with self.do_temp_disable(call=True):
-                to_cuda = lambda t: t.cuda() if _orig_isinstance(t, torch.Tensor) else t
-                args = tree_map(to_cuda, args)
-                kwargs = tree_map(to_cuda, kwargs)
-                result = OperatorPatcherContext.patch_run(fn, *args, **kwargs)
-                for arg in args:
-                    if _orig_isinstance(arg, torch.Tensor):
-                        del arg
-                del args
-                for key, value in kwargs.items():
-                    if _orig_isinstance(value, torch.Tensor):
-                        del value
-                del kwargs
-                if _orig_isinstance(result, torch.Tensor):
-                    result_cpu = result.cpu()
-                    del result
+                if self.fake_device_type == 'cpu':
+                    to_cuda = lambda t: t.cuda() if _orig_isinstance(t, torch.Tensor) else t
+                    args = tree_map(to_cuda, args)
+                    kwargs = tree_map(to_cuda, kwargs)
+                    result = OperatorPatcherContext.patch_run(fn, *args, **kwargs)
+                    for arg in args:
+                        if _orig_isinstance(arg, torch.Tensor):
+                            del arg
+                    del args
+                    for key, value in kwargs.items():
+                        if _orig_isinstance(value, torch.Tensor):
+                            del value
+                    del kwargs
+                    if _orig_isinstance(result, torch.Tensor):
+                        result_cpu = result.cpu()
+                        del result
+                        torch.cuda.empty_cache()
+                        return result_cpu
+                    if not isinstance(result, (tuple, list, dict)):
+                        torch.cuda.empty_cache()
+                        return result
+                    to_cpu = lambda t: t.cpu() if _orig_isinstance(t, torch.Tensor) else t
+                    result_cpu = tree_map(to_cpu, result)
+                    for ret in result:
+                        if _orig_isinstance(ret, torch.Tensor):
+                            del ret
                     torch.cuda.empty_cache()
                     return result_cpu
-                if not isinstance(result, (tuple, list, dict)):
-                    torch.cuda.empty_cache()
-                    return result
-                to_cpu = lambda t: t.cpu() if _orig_isinstance(t, torch.Tensor) else t
-                result_cpu = tree_map(to_cpu, result)
-                for ret in result:
-                    if _orig_isinstance(ret, torch.Tensor):
-                        del ret
-                torch.cuda.empty_cache()
-                return result_cpu
+                else:
+                    return OperatorPatcherContext.patch_run(fn, *args, **kwargs)
         elif kind == 'call_method':
-            self_obj, *args_tail = args
-            fn = _orig_getattr(self_obj, target)
-            if _orig_getattr(fn, '__module__', None) != 'nni.common.concrete_trace_utils.concrete_tracer' and hasattr(fn, '__globals__'):
-                _autowrap_check(self, fn.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
             with self.do_temp_disable(call=True):
-                return OperatorPatcherContext.patch_run(fn, *args_tail, **kwargs)
+                if self.fake_device_type == 'cpu':
+                    to_cuda = lambda t: t.cuda() if _orig_isinstance(t, torch.Tensor) else t
+                    args = tree_map(to_cuda, args)
+                    kwargs = tree_map(to_cuda, kwargs)
+                    self_obj, *args_tail = args
+                    fn = _orig_getattr(self_obj, target)
+                    if _orig_getattr(fn, '__module__', None) != 'nni.common.concrete_trace_utils.concrete_tracer' and hasattr(fn, '__globals__'):
+                        _autowrap_check(self, fn.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
+                    result = OperatorPatcherContext.patch_run(fn, *args_tail, **kwargs)
+                    if _orig_isinstance(result, torch.Tensor):
+                        result_cpu = result.cpu()
+                        del result
+                        torch.cuda.empty_cache()
+                        return result_cpu
+                    if not isinstance(result, (tuple, list, dict)):
+                        torch.cuda.empty_cache()
+                        return result
+                    to_cpu = lambda t: t.cpu() if _orig_isinstance(t, torch.Tensor) else t
+                    result_cpu = tree_map(to_cpu, result)
+                    for ret in result:
+                        if _orig_isinstance(ret, torch.Tensor):
+                            del ret
+                    torch.cuda.empty_cache()
+                    return result_cpu
+                else:
+                    self_obj, *args_tail = args
+                    fn = _orig_getattr(self_obj, target)
+                    if _orig_getattr(fn, '__module__', None) != 'nni.common.concrete_trace_utils.concrete_tracer' and hasattr(fn, '__globals__'):
+                        _autowrap_check(self, fn.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
+                    return OperatorPatcherContext.patch_run(fn, *args_tail, **kwargs)
         elif kind == 'call_module':
             assert isinstance(target, str)
             mod = self.fetch_attr(target)
-            mod.cuda()
+            if self.fake_device_type == 'cpu':
+                mod.cuda()
             if _orig_getattr(mod, '__module__', None) != 'nni.common.concrete_trace_utils.concrete_tracer' and hasattr(mod, '__globals__'):
                 _autowrap_check(self, mod.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
             with self.do_temp_disable(call=True):
-                to_cuda = lambda t: t.cuda() if _orig_isinstance(t, torch.Tensor) else t
-                args = tree_map(to_cuda, args)
-                kwargs = tree_map(to_cuda, kwargs)
-                result = OperatorPatcherContext.patch_run(mod, *args, **kwargs)
-                for arg in args:
-                    if _orig_isinstance(arg, torch.Tensor):
-                        del arg
-                del args
-                for key, value in kwargs.items():
-                    if _orig_isinstance(value, torch.Tensor):
-                        del value
-                del kwargs
-                mod.cpu()
-                if _orig_isinstance(result, torch.Tensor):
-                    result_cpu = result.cpu()
-                    del result
+                if self.fake_device_type == 'cpu':
+                    to_cuda = lambda t: t.cuda() if _orig_isinstance(t, torch.Tensor) else t
+                    args = tree_map(to_cuda, args)
+                    kwargs = tree_map(to_cuda, kwargs)
+                    result = OperatorPatcherContext.patch_run(mod, *args, **kwargs)
+                    for arg in args:
+                        if _orig_isinstance(arg, torch.Tensor):
+                            del arg
+                    del args
+                    for key, value in kwargs.items():
+                        if _orig_isinstance(value, torch.Tensor):
+                            del value
+                    del kwargs
+                    mod.cpu()
+                    if _orig_isinstance(result, torch.Tensor):
+                        result_cpu = result.cpu()
+                        del result
+                        torch.cuda.empty_cache()
+                        return result_cpu
+                    if not isinstance(result, (tuple, list, dict)):
+                        torch.cuda.empty_cache()
+                        return result
+                    to_cpu = lambda t: t.cpu() if _orig_isinstance(t, torch.Tensor) else t
+                    result_cpu = tree_map(to_cpu, result)
+                    for ret in result:
+                        if _orig_isinstance(ret, torch.Tensor):
+                            del ret
                     torch.cuda.empty_cache()
                     return result_cpu
-                if not isinstance(result, (tuple, list, dict)):
-                    torch.cuda.empty_cache()
-                    return result
-                to_cpu = lambda t: t.cpu() if _orig_isinstance(t, torch.Tensor) else t
-                result_cpu = tree_map(to_cpu, result)
-                for ret in result:
-                    if _orig_isinstance(ret, torch.Tensor):
-                        del ret
-                torch.cuda.empty_cache()
-                return result_cpu
+                else:
+                    return OperatorPatcherContext.patch_run(mod, *args, **kwargs)
         elif kind == 'get_attr':
             assert isinstance(target, str)
             return self.fetch_attr(target)
@@ -1390,7 +1424,8 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
                    autowrap_leaf_function = None,
                    autowrap_leaf_class = None,
                    leaf_module: Tuple | None = None,
-                   fake_middle_class = None,) -> GraphModule:
+                   fake_middle_class = None,
+                   fake_device_type='cpu') -> GraphModule:
     """
     Concrete tracing API
 
@@ -1516,8 +1551,18 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
     Returns:
         fx.GraphModule: a Module created from the recorded operations from ``root``.
     """
-    tracer = ConcreteTracer()
+    tracer = ConcreteTracer(fake_device_type=fake_device_type)
 
+    graph = tracer.trace(root,
+        autowrap_leaf_function = autowrap_leaf_function,
+        autowrap_leaf_class = autowrap_leaf_class,
+        leaf_module = leaf_module,
+        fake_middle_class = fake_middle_class,
+        concrete_args=concrete_args,
+        use_operator_patch=use_operator_patch,
+        operator_patch_backlist=operator_patch_backlist,
+        forward_function_name=forward_function_name,
+    )
     graph = tracer.trace(root,
         autowrap_leaf_function = autowrap_leaf_function,
         autowrap_leaf_class = autowrap_leaf_class,
@@ -1539,7 +1584,7 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
         forward_function_name=forward_function_name,
     )
     # compare to check equal
-    assert len(graph.nodes) == len(graph_check.nodes)
+    assert len(graph.nodes) == len(graph_check.nodes), f'number nodes: {len(graph.nodes)} vs {len(graph_check.nodes)}'
     for node_a, node_b in zip(graph.nodes, graph_check.nodes):
         node_a: Node
         node_b: Node
@@ -1553,7 +1598,7 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
             assert node_b.op == 'call_function' and isinstance(target_b, Callable) and target_b.__name__ == 'apply' and\
             hasattr(target_b, '__self__') and issubclass(target_b.__self__, torch.autograd.Function)
         else:
-            assert node_a.op == node_b.op and target_a == target_b
+            assert node_a.op == node_b.op and target_a == target_b, f'op: {node_a.op} vs {node_b.op}, target: {target_a} vs {target_b}'
 
     with MagicMethodPatcher():
         name = root.__class__.__name__ if isinstance(root, torch.nn.Module) else root.__name__

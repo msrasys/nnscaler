@@ -97,6 +97,7 @@ class SignFx2Op:
         __ftemplate('nll_loss') : function.NLLLoss,
 
         __ftemplate('layer_norm'): function.LayerNorm,
+        'apex.normalization.fused_layer_norm.FusedLayerNorm': function.FusedLayerNorm,
 
         # ============== runtime function =================
         __tttemplate('size'): function.Size,

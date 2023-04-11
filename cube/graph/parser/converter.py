@@ -10,6 +10,12 @@ from cube.flags import CompileFlag
 import torch
 import torch.fx
 
+try: 
+    import apex
+    HAS_APEX = True
+except:
+    HAS_APEX = False
+
 def convert_model(model: torch.nn.Module,
                   input_shapes: Optional[ List[List[int],] ] = None,
                   dummy_input = None,
@@ -29,19 +35,20 @@ def convert_model(model: torch.nn.Module,
                 smodule.graph.print_tabular()
             else:
                 print('INFO: using concrete tracer')
-                # NOTE: remove this part because when model is too large to fit in one GPU,
-                # this model forward cannot be successfully done, thus remove it.
-                # with torch.no_grad():
-                #     if isinstance(dummy_input, torch.Tensor):
-                #         output_origin = model(dummy_input)
-                #         dummy_input = (dummy_input, )
-                #     elif isinstance(dummy_input, tuple) or isinstance(dummy_input, list):
-                #         output_origin = model(*dummy_input)
-                #     elif isinstance(dummy_input, dict):
-                #         print(f'WARNING dict dummy_input')
-                #         output_origin = model(**dummy_input)
-                #     else:
-                #         raise RuntimeError(f'dummy_input should be a tuple (not a {type(dummy_input)}) = {dummy_input}')
+                if HAS_APEX:
+                    leaf_module = (
+                        torch.nn.Dropout, #torch.nn.Dropout1d, torch.nn.Dropout2d, torch.nn.Dropout3d,
+                        apex.normalization.FusedLayerNorm,
+                        # NOTE: the following modules also have different behavior depending on self.training. but currently in used.
+                        # torch.nn.AlphaDropout, torch.nn.FeatureAlphaDropout,
+                        # torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d,
+                        # torch.nn.LazyBatchNorm1d, torch.nn.LazyBatchNorm2d, torch.nn.LazyBatchNorm3d, torch.nn.SyncBatchNorm,
+                        # torch.nn.InstanceNorm1d, torch.nn.InstanceNorm2d, torch.nn.InstanceNorm3d,
+                        # torch.nn.LazyInstanceNorm1d, torch.nn.LazyInstanceNorm2d, torch.nn.LazyInstanceNorm3d,
+                        )
+                else:
+                    print('WARNING: apex package is not installed')
+                    leaf_module = (torch.nn.Dropout, )
                 traced_model = concrete_trace(
                     model,
                     dummy_input,
@@ -52,15 +59,8 @@ def convert_model(model: torch.nn.Module,
                     },
                     # FIXME: check if dropout is not included in it, can self.training be handled properly in the new version of 
                     # concrete_trace
-                    leaf_module=(
-                        torch.nn.Dropout, torch.nn.Dropout1d, torch.nn.Dropout2d, torch.nn.Dropout3d,
-                        # NOTE: the following modules also have different behavior depending on self.training. but currently in used.
-                        # torch.nn.AlphaDropout, torch.nn.FeatureAlphaDropout,
-                        # torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d,
-                        # torch.nn.LazyBatchNorm1d, torch.nn.LazyBatchNorm2d, torch.nn.LazyBatchNorm3d, torch.nn.SyncBatchNorm,
-                        # torch.nn.InstanceNorm1d, torch.nn.InstanceNorm2d, torch.nn.InstanceNorm3d,
-                        # torch.nn.LazyInstanceNorm1d, torch.nn.LazyInstanceNorm2d, torch.nn.LazyInstanceNorm3d,
-                        ),
+                    leaf_module=leaf_module,
+                    fake_device_type='cpu',
                 )
         else:
             print('using torchscript tracer')

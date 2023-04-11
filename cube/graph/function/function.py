@@ -624,6 +624,39 @@ def LayerNorm(input, normalized_shape, weight=None, bias=None, eps=1e-05, signat
     return CubeLayerNorm(input, weight, bias, normalized_shape, eps, signature=signature)
 
 
+def FusedLayerNorm(input, weight, bias, normalized_shape, eps=1e-5, signature = None):
+    """
+    apex.normalization.fused_layer_norm.FusedLayerNorm
+    """
+    signature = 'cube.runtime.function.fused_layer_norm'
+    assert not (weight is None and bias is not None), f"Not support for None of weight and parameter of bias"
+    letters = iter(string.ascii_lowercase)
+    einput = ShapeAnno.create_shape_str(input.shape, iterator=letters)
+    eoutput = copy.copy(einput)
+    ndims = len(input.shape)
+    for dim in range(len(normalized_shape)):
+        einput[ndims-1-dim] += '^'
+        eoutput[ndims-1-dim] += '^'
+    einputs, inputs = [einput], [input]
+    kwargs = {}
+    if weight is not None:
+        eweight = ShapeAnno.create_shape_str(weight.shape, reduction='^', iterator=letters)
+        einputs.append(eweight)
+        inputs.append(weight)
+    else:
+        kwargs['weight'] = weight
+    if bias is not None:
+        ebias = ShapeAnno.create_shape_str(bias.shape, reduction='^', iterator=letters)
+        einputs.append(ebias)
+        inputs.append(bias)
+    else:
+        kwargs['bias'] = bias
+    anno = OpAnno.create_op_str(einputs, [eoutput])
+    kwargs['normalized_shape'] = normalized_shape
+    kwargs['eps'] = eps
+    return IRDimops(FusedLayerNorm, 'fusedlayernorm', signature, [anno], inputs, **kwargs)
+
+
 def Sum(input, dim=None, keepdim=False, *, dtype=None, signature = None):
     """
     torch.sum(input, *, dtype=None) -> Tensor
@@ -653,6 +686,7 @@ def Sum(input, dim=None, keepdim=False, *, dtype=None, signature = None):
                 eoutput.pop(dimidx)
         anno = OpAnno.create_op_str([einput], [eoutput])
         return IRDimops(Sum, 'sum', signature, [anno], [input], dim=dim, keepdim=keepdim)
+
 
 def Mean(input, dim=None, keepdim=False, *, dtype=None, signature = None):
     """

@@ -47,6 +47,17 @@ class FxFuncOpTracer(torch.fx.Tracer):
         return m.__module__.startswith('torch.nn.functional') and not isinstance(m, torch.nn.Sequential)
 
 
+def get_complex_data(val: Any, frame: Frame) -> Any:
+    """Change inner fx.Node into IRObject"""
+    if isinstance(val, tuple):
+        return tuple(get_complex_data(t, frame) for t in val)
+    if isinstance(val, list):
+        return list(get_complex_data(t, frame) for t in val)
+    if isinstance(val, torch.fx.Node):
+        return frame.get_var(val.name)
+    return val
+
+
 class FxModuleParser:
     save_content: bool = True
 
@@ -195,7 +206,6 @@ class FxModuleParser:
         # output_val = frame.get_var(output_nodes[0].name)
         output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
 
-
         if FxModuleParser.save_content:
             frame.save_attr_content()
             frame.save_attr_map()
@@ -260,9 +270,47 @@ class FxModuleParser:
     @staticmethod
     def parse_prim_module(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
         prim_module = FxModuleParser.fetch_attr(module, node.target)
-        assert prim_module.__class__.__module__.startswith('torch.nn.modules'), f'{module.__class__.__module__}'
-        fsig = 'torch.nn.{}'.format(prim_module.__class__.__name__)
-        return FxModuleParser._parse_node(fsig, node, module, frame)
+        input_vals = [get_complex_data(val, frame) for val in node.args]
+        kwargs = {key: get_complex_data(val, frame) for key, val in node.kwargs.items()}
+        if prim_module.__class__.__module__.startswith('torch.nn.modules'):
+            fsig = 'torch.nn.{}'.format(prim_module.__class__.__name__)
+            # specifically deal with torch.nn.Dropout, because some inputs of nn.module are passed
+            # in module instantiating phase, besides during forward
+            assert prim_module.__class__.__name__ == 'Dropout', f'{prim_module.__class__.__name__}, {fsig}'
+            kwargs.update({'p': prim_module.p, 'inplace': prim_module.inplace})
+            return FxModuleParser._parse_node(fsig, node, input_vals, kwargs, frame)
+        elif prim_module.__class__.__module__ == 'apex.normalization.fused_layer_norm':
+            fsig = '{}.{}'.format(prim_module.__class__.__module__, prim_module.__class__.__name__)
+            assert prim_module.elementwise_affine is True
+            assert SignFx2Op.exist(fsig)
+            assert len(kwargs) == 0
+            # add var of weight and bias into frame
+            shape = FxModuleParser.shape_refine(prim_module.weight.size())
+            dtype = DType2IRDType.map(prim_module.weight.dtype)
+            requires_grad = prim_module.weight.requires_grad
+            ir_weight_val = IRFullTensor(shape=shape, requires_grad=requires_grad, dtype=dtype, name=f'{node.name}_weight')
+            ir_weight_val.as_param()
+            frame.add_var(ir_weight_val.name, ir_weight_val)
+            frame.add_attr_content(ir_weight_val.tid, prim_module.weight)
+            frame.add_attr_map(ir_weight_val.name, node.target+'.weight')
+            shape = FxModuleParser.shape_refine(prim_module.bias.size())
+            dtype = DType2IRDType.map(prim_module.bias.dtype)
+            requires_grad = prim_module.bias.requires_grad
+            ir_bias_val = IRFullTensor(shape=shape, requires_grad=requires_grad, dtype=dtype, name=f'{node.name}_bias')
+            ir_bias_val.as_param()
+            frame.add_var(ir_bias_val.name, ir_bias_val)
+            frame.add_attr_content(ir_bias_val.tid, prim_module.bias)
+            frame.add_attr_map(ir_bias_val.name, node.target+'.bias')
+            input_vals.extend([ir_weight_val, ir_bias_val])
+            kwargs.update({'normalized_shape': prim_module.normalized_shape, 'eps': prim_module.eps})
+            ir_node = SignFx2Op.map(fsig)(*input_vals, **kwargs)
+            assert isinstance(ir_node, IRCell)
+            assert len(ir_node.outputs()) == 1
+            output_val = frame.get_var(node.name)
+            ir_node.set_output(0, output_val)
+            return [ir_node]
+        else:
+            raise RuntimeError(f'unknown module: {prim_module.__class__.__module__}')
 
     @staticmethod
     def parse_prim_function_method(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
@@ -272,25 +320,15 @@ class FxModuleParser:
             print(f'parse_prim_method_node: {fsig}')
         else:
             print(f'parse_prim_function_node: {fsig}')
-        return FxModuleParser._parse_node(fsig, node, module, frame)
-
-    @staticmethod
-    def _parse_node(fsig: str, node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
-        
-        def get_complex_data(val: Any) -> Any:
-            """Change inner fx.Node into IRObject"""
-            if isinstance(val, tuple):
-                return tuple(get_complex_data(t) for t in val)
-            if isinstance(val, list):
-                return list(get_complex_data(t) for t in val)
-            if isinstance(val, torch.fx.Node):
-                return frame.get_var(val.name)
-            return val
 
         # get inputs
-        input_vals = [get_complex_data(val) for val in node.args]
-        kwargs = {key: get_complex_data(val) for key, val in node.kwargs.items()}
+        input_vals = [get_complex_data(val, frame) for val in node.args]
+        kwargs = {key: get_complex_data(val, frame) for key, val in node.kwargs.items()}
 
+        return FxModuleParser._parse_node(fsig, node, input_vals, kwargs, frame)
+
+    @staticmethod
+    def _parse_node(fsig: str, node: torch.fx.Node, input_vals: list, kwargs: dict, frame: Frame) -> List[IRFwOperation]:
         # map to IR operator
         if SignFx2Op.exist(fsig):
             ir_node = SignFx2Op.map(fsig)(*input_vals, **kwargs)

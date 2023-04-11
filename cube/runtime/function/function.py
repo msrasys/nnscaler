@@ -2,6 +2,11 @@ from typing import Optional, List, Tuple, Union
 import torch
 import torch.nn.functional as TorchF
 
+try:
+    from apex.normalization.fused_layer_norm import fused_layer_norm_affine
+except:
+    print('WARNING: apex is not installed, skip it.')
+
 
 def identity(tensor: torch.Tensor) -> torch.Tensor:
     """
@@ -112,6 +117,12 @@ def layer_norm(input: torch.Tensor,
     return torch.nn.functional.layer_norm(input, normalized_shape, weight, bias, eps)
 
 
+def fused_layer_norm(input: torch.Tensor,
+               weight: torch.Tensor, bias: torch.Tensor,
+               normalized_shape: List[int], eps: float = 1e-05) -> torch.Tensor:
+    return fused_layer_norm_affine(input, weight, bias, normalized_shape, eps)
+
+
 # 'torch.select_scatter' isn't supported by Torch2ONNX yet.
 # Implement it with 'torch.masked_scatter' which is supported with ONNX opset=11.
 def select_scatter(input:torch.Tensor, src:torch.Tensor, dim:int, index:int):
@@ -179,5 +190,6 @@ def stack(*tensors, dim=0) -> torch.Tensor:
 def cat(*tensors, dim=0) -> torch.Tensor:
     return torch.cat(tensors, dim)
 
+
 def nndropout(input: torch.Tensor, p=0.5, inplace=False):
-    return torch.nn.Dropout(0.0, inplace)(input)
+    return torch.nn.Dropout(p, inplace)(input)
