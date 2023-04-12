@@ -1295,7 +1295,7 @@ def CubeIndexSelect(input: torch.Tensor, index: torch.Tensor, dim: int, signatur
     signature = 'cube.runtime.function.index_select'
     edim_in = ShapeAnno.create_shape_str(input.shape)
     edim_in[dim] += '^'
-    idx_anno = chr(ord(edim_in[-1]) + 1) + '^'
+    idx_anno = chr(ord(edim_in[-1]) + 1)
     edim_ou = copy.copy(edim_in)
     edim_ou[dim] = copy.copy(idx_anno)
     anno = OpAnno.create_op_str([edim_in, idx_anno], [edim_ou])
