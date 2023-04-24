@@ -505,7 +505,7 @@ def Dropout(input, p=0.5, training=True, inplace=False, signature = None):
     """
     annos = ['* -> *']
     return IRDimops(Dropout, 'dropout', signature, annos, [input],
-                    p=p, training=training, inplace=inplace)
+                    p=p, training='self.training', inplace=inplace)
 
 
 def nnDropout(input, p=0.5, inplace=False, signature=None):

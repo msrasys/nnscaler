@@ -37,7 +37,7 @@ def convert_model(model: torch.nn.Module,
                 print('INFO: using concrete tracer')
                 if HAS_APEX:
                     leaf_module = (
-                        torch.nn.Dropout, #torch.nn.Dropout1d, torch.nn.Dropout2d, torch.nn.Dropout3d,
+                        # torch.nn.Dropout, #torch.nn.Dropout1d, torch.nn.Dropout2d, torch.nn.Dropout3d,
                         apex.normalization.FusedLayerNorm,
                         # NOTE: the following modules also have different behavior depending on self.training. but currently in used.
                         # torch.nn.AlphaDropout, torch.nn.FeatureAlphaDropout,
@@ -48,7 +48,7 @@ def convert_model(model: torch.nn.Module,
                         )
                 else:
                     print('WARNING: apex package is not installed')
-                    leaf_module = (torch.nn.Dropout, )
+                    leaf_module = None
                 traced_model = concrete_trace(
                     model,
                     dummy_input,
@@ -57,8 +57,6 @@ def convert_model(model: torch.nn.Module,
                         torch.finfo: ((), False),
                         # type(output_origin): ((), False),
                     },
-                    # FIXME: check if dropout is not included in it, can self.training be handled properly in the new version of 
-                    # concrete_trace
                     leaf_module=leaf_module,
                     fake_device_type='cpu',
                 )

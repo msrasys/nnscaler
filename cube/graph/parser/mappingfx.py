@@ -52,7 +52,7 @@ class SignFx2Op:
     __customops = lambda name: f'examples.custom_ops.{name}'
 
     kOpMap = {
-        __tnmtemplate('Dropout'): function.nnDropout,
+        # __tnmtemplate('Dropout'): function.nnDropout,
         __fcntemplate('linear'): function.Linear,
         __ftemplate('dropout') : function.Dropout,
         __ttemplate('sum'): function.Sum,

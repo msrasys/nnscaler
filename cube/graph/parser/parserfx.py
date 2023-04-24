@@ -273,6 +273,7 @@ class FxModuleParser:
         input_vals = [get_complex_data(val, frame) for val in node.args]
         kwargs = {key: get_complex_data(val, frame) for key, val in node.kwargs.items()}
         if prim_module.__class__.__module__.startswith('torch.nn.modules'):
+            assert False, 'Dropout is not supposed to be treated as module.'
             fsig = 'torch.nn.{}'.format(prim_module.__class__.__name__)
             # specifically deal with torch.nn.Dropout, because some inputs of nn.module are passed
             # in module instantiating phase, besides during forward
