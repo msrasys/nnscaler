@@ -210,7 +210,7 @@ class ProfileDataBase:
                 values.append(t)
         return fn, shapes, dtypes, requires_grads, values, node.kwargs
 
-    def profile(self, node: IRFwOperation, device: Optional[int] = None):
+    def profile(self, node: IRFwOperation, device: Optional[int] = None, override: bool = False):
         """
         Profile a forward node in IRGraph on a specific device (default current device)
         
@@ -227,7 +227,7 @@ class ProfileDataBase:
         """
         fn, shapes, dtypes, requires_grads, values, kwargs = ProfileDataBase.get_func(node)
 
-        if self.exist(node):
+        if not override and self.exist(node):
             return self.query(node)
 
         if isinstance(device, int):
@@ -252,7 +252,7 @@ class ProfileDataBase:
             fw_span, bw_span, infer_memory, train_mem_info = \
                 CompProfiler.profile(fn, shapes, dtypes, requires_grads, values, **kwargs)
         except:
-            fw_span, bw_span, infer_memory, train_mem_info = float('inf'), float('inf'), 0, [0]
+            fw_span, bw_span, infer_memory, train_mem_info = float('inf'), float('inf'), 0, []
         # log to database
         key = self._serialize(node)
         self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, residual_mem)
