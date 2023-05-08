@@ -409,7 +409,7 @@ class IRAdapterGener:
         # generate adapter for each segment
         segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
         for segment in segments:
-            IRAdapterGener.gen_activation(segment)
+            IRAdapterGener.gen_activation(segment, allow_recompute=allow_recompute, cost_fn=cost_fn)
 
         return graph
 
