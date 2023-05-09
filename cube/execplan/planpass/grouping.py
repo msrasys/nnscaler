@@ -65,8 +65,9 @@ class Grouping(PlanPass):
                 if isinstance(fnode, IRAdapter): return False
             if isinstance(fnode, IRFwOperation):
                 return True
-            if isinstance(fnode, IRAdapter) and fnode.differentiable and fnode.isfw():
-                return True
+            if isinstance(fnode, IRAdapter) and fnode.isfw():
+                if fnode.differentiable: return True
+                if fnode.mirror is None: return True  # not require backward
             return False
 
         fgroups, bgroups = dict(), dict()

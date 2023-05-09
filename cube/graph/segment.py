@@ -920,107 +920,59 @@ class IRSegment(IRCell):
         Create a segment with part of the nodes. 
         This only return the created segment wihout modifying the graph.
 
+        Calling this requires that the dependencies are already materialized,
+        i.e., every input IRSubTensor should have a corresponding producer.
+
         @param nodes List[IRCell]: the subset nodes of this graph
 
         @return segment IRSegment: the grouped segment. 
         """
         segment = self
-        segment_inputs = IRSegment.get_objects_from_complex(segment.inputs())
         segment_outputs = IRSegment.get_objects_from_complex(segment.outputs())
 
-        # segments: List[IRSegment] = [self.segment(node) for node in nodes]
-        # assert len(set(segments)) == 1, "Cross segment hierarchy grouping is not allowed"
-        # segment = segments[0]
-
-        inputs, outputs = set(), set()
-
-        # go through adapters
-        adapter_ins: Dict[IRSubTensor, Set[int]] = dict()
-        adapter_ous: Dict[IRSubTensor, Set[int]] = dict()
-        for adapter in nodes:
-            if not isinstance(adapter, IRAdapter):
-                continue
+        # setup adapter dependency
+        ad_consumers: Dict[Tuple[IRSubTensor,int], Set[int]] = dict()
+        ad_producers: Dict[Tuple[IRSubTensor,int], Set[int]] = dict()
+        for adapter in self.select(ntype=IRAdapter):
             for itensor in adapter.inputs():
                 if not isinstance(itensor, IRSubTensor): continue
-                if itensor not in adapter_ins:
-                    adapter_ins[itensor] = set()
-                adapter_ins[itensor].update(itensor.device)
-                # producers can from out side node
-                producers = []
-                for ptensor, prod in zip(segment.ptensors(itensor.parent), segment.producers(itensor.parent)):
-                    if ptensor == itensor and set(itensor.device).issubset(set(prod.device)):
-                        producers.append(prod)
-                if not any(p in nodes for p in producers):
-                    inputs.add(itensor)
+                ad_consumers.setdefault((itensor, itensor.device[0]), set()).add(adapter.cid)
             for otensor in adapter.outputs():
                 if not isinstance(otensor, IRSubTensor): continue
-                if otensor not in adapter_ous:
-                    adapter_ous[otensor] = set()
-                adapter_ous[otensor].update(otensor.device)
-                consumers = []
-                for ctensor, cons in zip(segment.ctensors(otensor.parent), segment.consumers(otensor.parent)):
-                    if ctensor == otensor and set(otensor.device).issubset(set(cons.device)):
-                        consumers.append(cons)
-                if not any(c in nodes for c in consumers):
+                ad_producers.setdefault((otensor, otensor.device[0]), set()).add(adapter.cid)
+
+        # tensor and its device match
+        dmatch = lambda t1, t2: t1 == t2 and t1.device == t2.device
+        
+        inputs, outputs = set(), set()
+        sub_cids = set(node.cid for node in nodes)
+        for node in nodes:
+            for itensor in node.inputs():
+                if not isinstance(itensor, IRTensor): continue
+                if itensor.is_attr(): continue
+                producers, ptensors = self.producers(itensor.parent), self.ptensors(itensor.parent)
+                pids = set(p.cid for p, t in zip(producers, ptensors) if dmatch(t, itensor))
+                if len(itensor.device) > 0:
+                    assert len(itensor.device) == 1
+                    pids.update(cid for cid in ad_producers.get((itensor, itensor.device[0]), []))
+                # if no producers inside the nodes can produce data, set as input
+                if all(pid not in sub_cids for pid in pids):
+                    inputs.add(itensor)
+            for otensor in node.outputs():
+                if not isinstance(otensor, IRTensor): continue
+                # if the tensor is required by segment outputs or is loss during train, set as output
+                if otensor.is_loss() or otensor in segment_outputs:
+                    outputs.add(otensor)
+                    continue
+                consumers, ctensors = self.consumers(otensor.parent), self.ctensors(otensor.parent)
+                cids = set(c.cid for c, t in zip(consumers, ctensors) if dmatch(t, otensor))
+                if len(otensor.device) > 0:
+                    assert len(otensor.device) == 1
+                    cids.update(cid for cid in ad_consumers.get((otensor, otensor.device[0]), []))
+                # if the tensor is required by other nodes outside the nodes, set as output
+                if any(cid not in sub_cids for cid in cids):
                     outputs.add(otensor)
 
-        # go through non-adapter nodes
-        for node in nodes:
-            if isinstance(node, IRAdapter):
-                assert node.differentiable, \
-                    "Non-differentiable IRAdapter is not allowed to be grouped"
-                continue
-            # update inputs
-            itensors = [t for t in node.inputs() if isinstance(t, IRObject)]
-            for itensor in itensors:
-                ftensor = itensor.parent
-                if itensor.is_attr(): continue
-                # from inside adapters
-                if itensor in adapter_ous:
-                    if len(node.device) > 0 and set(itensor.device).issubset(adapter_ous[itensor]):
-                        continue
-                # from segment inputs
-                if any(t.overlap(itensor) for t in segment_inputs if isinstance(t, IRObject)):
-                    inputs.add(itensor)
-                    continue
-                # from outside producers
-                producers, ptensors = segment.producers(ftensor), segment.ptensors(ftensor)
-                producers = [p for p, t in zip(producers, ptensors) if t == itensor]
-                if len(itensor.device) > 0:
-                    producers = [p for p in producers if set(itensor.device).issubset(set(p.device))]
-                # from graph inputs or outside adapter (no producer)
-                if len(producers) == 0 or any(p not in nodes for p in producers):
-                    inputs.add(itensor)
-                    continue
-            # update outputs
-            otensors = [t for t in node.outputs() if isinstance(t, IRObject)]
-            for otensor in otensors:
-                ftensor = otensor.parent
-                if otensor.is_attr(): continue
-                # from inside adapters
-                if otensor in adapter_ins:
-                    if len(node.device) > 0 and set(otensor.device).issubset(adapter_ins[otensor]):
-                        continue
-                # from segment outputs
-                if any(t.overlap(otensor) for t in segment_outputs if isinstance(t, IRObject)):
-                    outputs.add(otensor)
-                    continue
-                # loss must be returned
-                if isinstance(ftensor, IRFullTensor) and ftensor.is_loss():
-                    outputs.add(otensor)
-                    continue
-                if len(segment.consumers(ftensor)) == 0:
-                    continue
-                # for outside consumers
-                consumers, ctensors = segment.consumers(ftensor), segment.ctensors(ftensor)
-                consumers = [c for c, t in zip(consumers, ctensors) if t == otensor]
-                if len(otensor.device) > 0:
-                    consumers = [c for c in consumers if set(otensor.device).issubset(set(c.device))]
-                # for adapter (no consumer)
-                if len(consumers) == 0 or any(c not in nodes for c in consumers):
-                    outputs.add(otensor)
-                    continue
-        
         def order(tensors: Set[IRObject]) -> Tuple[IRObject]:
             """Reorder by logical tensor id. Temporally necessary for pipeline scheduling"""
             tensors = list(tensors)

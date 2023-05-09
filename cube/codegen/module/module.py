@@ -417,8 +417,9 @@ class ModuleCodeGen(FuncEmission):
             else:
                 # get recompute excution code
                 rc_segment = segment.create_segment(rc_group)
+                rc_lifetime = LifeCycle(rc_group, rc_segment.inputs(), rc_segment.outputs())
                 rc_codes = ModuleCodeGen._emit_recompute(rc_group,
-                    rc_segment.inputs(), rc_segment.outputs(), lifetime)
+                    rc_segment.inputs(), rc_segment.outputs(), rc_lifetime)
                 codes += rc_codes
                 # release input tensors after exiting a RC group:
                 last_node = rc_group[-1]
