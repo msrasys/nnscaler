@@ -864,15 +864,29 @@ class IRGraph(IRSegment):
             assert all(segment == segments[0] for segment in segments), \
                 "Cross-segment recompute is not allowed yet"
             recompute_group_id: int = IDGenerator().gen_cell_id()
+            start = 0
             for fnode in nodes:
-                if isinstance(fnode, IRGraphAnchor):
+                tensors = [t for t in fnode.inputs() if isinstance(t, IRSubTensor) and (not t.is_attr())]
+                if all(t.grad is None for t in tensors):
+                    start += 1
                     continue
-                # pytorch limitation
-                if all(not t.requires_grad for t in fnode.inputs() if isinstance(t, IRSubTensor) and (not t.is_attr())):
-                    print(f"skipping recompute node: {fnode}\n\tbecause all its input tensors doesn't require grad.")
+                break
+            skip = nodes[:start]
+            nodes = nodes[start:]
+            end = len(nodes)
+            for fnode in nodes[::-1]:
+                tensors = [t for t in fnode.inputs() if isinstance(t, IRSubTensor) and (not t.is_attr())]
+                if all(t.grad is None for t in tensors):
+                    end -= 1
                     continue
+                break
+            skip += nodes[end:]
+            for node in skip:
+                if isinstance(node, IRGraphAnchor): continue
+                print(f"skip recompute node: {node.name} ({node.cid}) as it doesn't require gradient and appears at head or tail.")
+            nodes = nodes[:end]
+            for fnode in nodes:
                 fnode.recompute = recompute_group_id
-    
         return True
 
     # =================== Helpers ====================

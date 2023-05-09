@@ -388,10 +388,10 @@ class IRAdapterGener:
                         break
             graph.insert(fadapter, fidx)
             # setup recompute
-            if fadapter.differentiable and allow_recompute:
+            if allow_recompute:
                 if fidx > 0:
                     prev_node = graph.node(fidx-1)
-                    if isinstance(prev_node, IRFwOperation):
+                    if isinstance(prev_node, (IRFwOperation, IRAdapter)):
                         fadapter.recompute = prev_node.recompute
 
             # insert backward adapter
