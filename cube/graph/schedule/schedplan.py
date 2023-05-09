@@ -84,11 +84,11 @@ class ScheduleDependency:
             for segment in segments:
                 if self.graph.depends(adapter, segment):
                     assert adapter not in self.recvers, \
-                        f"Detected more than one segments to recv data from a same adapter"
+                        f"Detected one adapter receives data from more than one segments"
                     self.recvers[adapter] = segment
                 elif self.graph.depends(segment, adapter):
                     assert adapter not in self.senders, \
-                        f"Detected more than one segments to send data from a same adapter"
+                        f"Detected one adapter {adapter} sends data to more than one segments"
                     self.senders[adapter] = segment
         # get all weight reducers
         self.reducers = self.graph.select(ntype=IRWeightReducer, flatten=False)
@@ -183,17 +183,21 @@ class PlanBase:
         """
         Place dataloaders together with segments
         """
-        # FIXME: this may not work for multiple segments in a same 
-        # micro-batch require for the data 
+        # insert dataloaders to its devices before the first required segment
         for dl in self._dependency.dataloaders:
+            inserted_mids = set()
             for step in range(self.nsteps):
                 blocks = self.segments(step)
                 for block in blocks:
                     segment, mid = block.content, block.mid
+                    if mid in inserted_mids: continue
+                    if dl.device[0] not in segment.device: continue
                     if self.graph.depends(dl, segment):
                         dl_block = Block(dl, mid, 1)
+                        # print(f'inserting microbatch {mid} at step {step} before {segment.name}{segment.cid}')
                         self._step_segments[step+block.span-1].insert(0, dl_block)
                         self._block_step[dl_block] = step+block.span-1
+                        inserted_mids.add(mid)
                         break
 
     def topo_sort(self):
@@ -401,8 +405,11 @@ class SchedulePlan(PlanBase):
         Place adapters to make sure the communication happens
         correctly and efficiently.
         """
-        assert len(self._dependency.adapters) > 0
         for adapter in self._dependency.adapters:
+            assert adapter in self._dependency.senders, (
+                f"Detected an adapter\n\t{adapter}\ndoesn't have a sender segment. "
+                f"This usually happens when its sender is dataloader or graph inputs."
+                f"Please replicate dataloader to remove this adapter.")
             sender: IRSegment = self._dependency.senders[adapter]
             # find sender step and insert adapter
             for step in range(self.nsteps):

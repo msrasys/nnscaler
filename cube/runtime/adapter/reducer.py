@@ -8,6 +8,7 @@ import warnings
 
 from cube.runtime.device import DeviceGroup
 from cube.profiler.timer import CudaTimer, print_each_rank
+from cube.flags import RuntimeFlag
 
 
 def get_nbytes(dtype: torch.dtype) -> int:
@@ -38,6 +39,7 @@ class Reducer:
         """
         Reduce gradients across given group
         """
+        if RuntimeFlag.accum_mode: return
         buckets = {}
         tp2size = {}
         for param in self._params:

@@ -111,34 +111,27 @@ class ModuleCodeGen(FuncEmission):
         node_args: List[List[str]] = list()
         gen_nodes: List[IRCell] = list()
 
+        unrolled_seqs = []
+        for node in self.execplan.seq(device):
+            # unwrap from ExeReuseCell
+            node = node.cell if isinstance(node, ExeReuseCell) else node
+            unrolled_seqs.append(node)
+        # we use ordered dict as ordered set
+        sequence = tuple(dict.fromkeys(unrolled_seqs))
+
         # init customized adapter
-        for seg in [seg for seg in self.execplan.seq(device) if isinstance(seg, IRSegment)]:
-            for adapter in [n for n in seg.nodes() if isinstance(n, IRAdapter)]:
-                if adapter.isfw() and adapter.differentiable and adapter.custom:
+        fsegments = [node for node in sequence if isinstance(node, IRSegment) and node.isfw()]
+        for seg in fsegments:
+            for adapter in seg.select(ntype=IRAdapter):
+                if adapter.differentiable and adapter.custom:
                     gencode += AutogradAdapterCodeGen().gen(adapter) + ['', '']
                     adapter.signature = AutogradAdapterCodeGen.name(adapter) + '.apply'
 
         # initialize communication groups
         self.init_comm_groups()
 
-        # parse graph body
-        unrolled_seqs = []
-
-        for node in self.execplan.seq(device):
-            # unwrap from ExeReuseCell and ExeRepetend
-            if isinstance(node, ExeReuseCell):
-                node = node.cell
-            if isinstance(node, ExeRepetend):
-                for node in node.nodes():
-                    if isinstance(node, ExeReuseCell):
-                        node = node.cell
-                    unrolled_seqs.append(node)
-            else:
-                unrolled_seqs.append(node)
-        # we use ordered dict as ordered set
-        unrolled_seqs = tuple(dict.fromkeys(unrolled_seqs))
         # emit code
-        for node in unrolled_seqs:
+        for node in sequence:
             if isinstance(node, IRSegment):
                 if not node.isfw(): continue  # skip backward segment
                 codes = self.emit_segment(node)

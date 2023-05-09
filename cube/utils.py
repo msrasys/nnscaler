@@ -2,6 +2,8 @@ from typing import Optional
 from cube.profiler.timer import print_each_rank
 from cube.runtime.device import DeviceGroup
 
+from cube.flags import RuntimeFlag
+
 
 def _load_module_attr(filename: str, name: str):
     import importlib.util
@@ -32,3 +34,23 @@ def load_eval_schedule(filename: Optional[str] = None):
     module = _load_module_attr(filename, '_infer_step')
     return module._infer_step
 
+
+class accum_mode:
+    """
+    Make cube execution in accumulation mode, where weight
+    gradient allreduce will be skipped.
+
+    need manually call `model.reduce_grads()` to reduce gradients 
+    after finish accumulation, or make `enable=False` for the last
+    accumulation step.
+    """
+    def __init__(self, enable: bool = True):
+        self.enable = enable
+        self.old = None
+    
+    def __enter__(self):
+        self.old = RuntimeFlag.accum_mode
+        RuntimeFlag.accum_mode = self.enable
+
+    def __exit__(self, *args):
+        RuntimeFlag.accum_mode = self.old

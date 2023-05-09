@@ -47,3 +47,10 @@ class CompileFlag:
     # and optimizer status are kept in its original data type (can be float32),
     # but some of the forward operators will be converted to float16.
     use_amp = _to_bool('USE_AMP')
+
+
+class RuntimeFlag:
+
+    # turn execution in accumulation mode
+    # where reducers will not allpy allreduce on gradients
+    accum_mode: bool = False

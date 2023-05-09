@@ -13,7 +13,7 @@ class CubeModule(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self._reducers = list()
+        self._reducers: List[Reducer] = list()
         self._fullmap : Dict[str, Tuple[int, Tuple[slice], int]] = dict()
         self._batch_size: Optional[int] = None
 
@@ -22,9 +22,12 @@ class CubeModule(torch.nn.Module):
             raise RuntimeError(f"Expected a Reducer but got {type(reducer)}")
         self._reducers.append(reducer)
 
-    def sync_params(self):
+    def reduce_grads(self):
+        """
+        Mannually allreduce gradients on the weight
+        """
         for reducer in self._reducers:
-            reducer.sync()
+            reducer.allreduce()
 
     def add_full_map(self, attr: str, tid: int, slicers: Tuple[slice], val_chunks: int):
         """

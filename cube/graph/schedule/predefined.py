@@ -12,6 +12,22 @@ from cube.graph.segment import IRSegment
 class PredefinedSched:
 
     @staticmethod
+    def grad_accum(graph: IRGraph, num_microbatches: int) -> SchedulePlan:
+        """
+        Gradient accumulation for SPMD scenario.
+        """
+        segments: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
+        # describe schedule
+        sched = SchedulePlan(graph, num_microbatches)
+        step = 0
+        for midx in range(num_microbatches):
+            for seg in segments:
+                sched.add_segment(seg, midx, step)
+                step += 1
+        sched.finish()
+        return sched
+
+    @staticmethod
     def sched_1f1b(graph: IRGraph, num_microbatches: int, num_stages: int) -> SchedulePlan:
         """
         1F1B scheduling. The graph should be staged into segments.
