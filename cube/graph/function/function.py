@@ -5,6 +5,7 @@ import torch
 import operator
 import numpy as np
 import math
+import warnings
 
 from cube.ir.cten import IRTensor, IRObject
 from cube.ir.tensor import IRSubTensor, IRFullTensor
@@ -52,11 +53,12 @@ def Linear(input, weight, bias=None, signature = None):
         annos = ['b * k+, n k+ -> b * n']
         return IRDimops(Linear, 'linear', signature, annos, [input, weight], bias=None)
     else:
-        annos = ['b * k+, n k+, n -> b * n']
-        rules = [TransformRule(
-            [DimopSplit.D(-1), DimopSplit.D(1), DimopSplit.V()], [DimopSplit.V()]
-        )]
-        return IRDimops(Linear, 'linear', signature, annos, [input, weight, bias], rules)
+        annos = ['b * k^, n k^, n -> b * n']
+        # rules = [TransformRule(
+        #     [DimopSplit.D(-1), DimopSplit.D(1), DimopSplit.V()], [DimopSplit.V()]
+        # )]
+        warnings.warn('detected a linear operator has bias, the partition on reduction dimension is disabled.')
+        return IRDimops(Linear, 'linear', signature, annos, [input, weight, bias])
 
 
 def BatchLinear(input, mat2, *, out=None, signature = None):

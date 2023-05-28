@@ -113,7 +113,6 @@ class DimSplitEinops(GenericDistAlgo):
                 if splits[idx].isV():
                     return True
             return False
-        
 
     def instantiate(self, idx: int, dim: Union[int, str], num: int) -> Optional[List[IRDimops]]:
 
@@ -178,8 +177,12 @@ class DimSplitEinops(GenericDistAlgo):
         for r in node.transform_rules:
             splits = r.inputs() + r.outputs()
             if isinstance(dim, int):
-                if splits[idx] == DimopSplit.D(dim):
-                    return r
+                if splits[idx].isD():
+                    # make negative offset to be possitive
+                    ndims = len(node.input(idx).shape)
+                    rdim = (splits[idx].dim + ndims) % ndims
+                    if rdim == dim:
+                        return r
             else:
                 if splits[idx].isV():
                     return r
