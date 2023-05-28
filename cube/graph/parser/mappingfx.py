@@ -56,10 +56,12 @@ class SignFx2Op:
         __fcntemplate('linear'): function.Linear,
         __ftemplate('dropout') : function.Dropout,
         __ttemplate('sum'): function.Sum,
+        __ttemplate('exp'): function.Exp,
         __ttemplate('squeeze'): function.Squeeze,
         __ttemplate('unsqueeze'): function.Unsqueeze,
         __tttemplate('type_as'): function.TypeAs,
         __ttemplate('triu'): function.Triu,
+        __ttemplate('tril'): function.Tril,
         __ftemplate('relu'): function.ReLU,
         __fcntemplate('gelu'): function.GeLU,
         __ttemplate('eq') : function.CompareEQ,
@@ -69,6 +71,7 @@ class SignFx2Op:
         __tttemplate('long'): function.Long,
         __tttemplate('int'): function.Int,
         __tttemplate('float'): function.Float,
+        __tttemplate('bool'): function.Bool,
         __ttemplate('fill_'): function.Fill,
         __ttemplate('masked_fill'): function.MaskedFill,
         __ttemplate('cumsum'): function.CumSum,
@@ -108,9 +111,7 @@ class SignFx2Op:
         'builtins.list': function.MakeList,
 
         # # torch nn functional
-        #
-        # __ftemplate('linear') : function.Linear,
-        #
+        '_operator.matmul': function.Matmul,
         __ttemplate('matmul'): function.Matmul,
         #
         # __ftemplate('gelu') : function.GeLU,

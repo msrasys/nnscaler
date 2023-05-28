@@ -99,6 +99,11 @@ def EinSum(equation: str, *operands, signature = None):
 
 
 def Matmul(input, other, *, out=None, signature=None):
+    """
+    torch.matmul
+    _operator.matmul
+    """
+    signature = 'torch.matmul'
     assert out is None
     annos = [
         'm k+, k+ n -> m n',
@@ -406,6 +411,18 @@ def Div(input, other, *, rounding_mode=None, out=None, signature = None):
     return IRDimops(Div, 'div', signature, annos, [input, other], rounding_mode=rounding_mode)
 
 
+def Exp(input, *, out=None, signature=None):
+    """
+    torch.exp(input, *, out=None)
+    """
+    assert out is None
+    if not isinstance(input, IRTensor):
+        return torch.exp(input)
+    shape = ShapeAnno.create_shape_str(input.shape)
+    annos = [OpAnno.create_op_str([shape], [shape])]
+    return IRDimops(Exp, 'exp', signature, annos, [input])
+
+
 def FloorDiv(input, other, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
@@ -559,6 +576,15 @@ def Float(input, memory_format=None, signature = None):
     assert memory_format is None
     annos = ['* -> *']
     return IRDimops(Float, 'float', signature, annos, [input])
+
+
+def Bool(input, memory_format=None, signature = None):
+    """
+    torch.Tensor.bool(memory_format=torch.preserve_format)
+    """
+    assert memory_format is None
+    annos = ['* -> *']
+    return IRDimops(Bool, 'bool', signature, annos, [input])
 
 
 def Fill(input, value, signature = None):
@@ -1111,6 +1137,22 @@ def Triu(input, diagonal=0, *, out=None, signature = None):
     edim_ou = copy.copy(edim_in)
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
     return IRDimops(Triu, 'triu', signature, [anno], [input], diagonal=diagonal)
+
+
+def Tril(input, diagonal=0, *, out=None, signature=None):
+    """
+    torch.tril(input, diagonal=0, *, out=None)
+    """
+    assert out is None
+    assert isinstance(input, IRTensor)
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    assert len(edim_in) >= 2
+    edim_in[-1] += '^'
+    edim_in[-2] += '^'
+    edim_ou = copy.copy(edim_in)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(Tril, 'tril', signature, [anno], [input],
+                    diagonal=diagonal)
 
 
 def CumSum(tensor, dim, signature = None):
