@@ -61,7 +61,7 @@ class LifeCycle:
         # Generally we don't manually release those tensors since the enclosing function is about to
         # return, all local variables are automatically released.
         # But we do need to update the lifetime of all outputs, to avoid early releasing.
-        self.lifetime.update((tsout, i+1) for tsout in graph_outputs if is_activation(tsout))
+        self.lifetime.update((tsout, len(nodes)) for tsout in graph_outputs if is_activation(tsout))
 
         for tensor, line_id in self.lifetime.items():
             self.release.setdefault(line_id, []).append(tensor)

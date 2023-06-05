@@ -3,6 +3,7 @@ from more_itertools import split_when
 import warnings
 import copy
 import torch
+import numpy as np
 
 from cube.ir.cten import IRCell
 from cube.ir.tensor import IRSubTensor
@@ -74,9 +75,17 @@ class ModuleCodeGen(FuncEmission):
         ```
     """
 
-    def __init__(self, execplan: ExecutionPlan) -> None:
+    def __init__(self, execplan: ExecutionPlan, scale_ndevs: Optional[int] = None) -> None:
+        """
+        Create Module code generator
+
+        @param execplan ExecutionPlan
+        @param scale_ndevs Optional[int]: scale to number of devices
+        """
+
         super().__init__()
         self.execplan: ExecutionPlan = execplan
+        self.devices: Tuple[int] = tuple(sorted(execplan.graph.device))
 
         self.init_code: List[str] = [
             '\n\n########## Generated Model Code ###########',
@@ -102,6 +111,89 @@ class ModuleCodeGen(FuncEmission):
         self._ref_module = torch.nn.Module()
         # batch size
         self.batch_size = None
+        # communication groups
+        self.comm_groups: List[Tuple[int]] = self.get_comm_groups(scale_ndevs)
+        # whether to scale (with data parallelism)
+        self._scale_to_ndevs = scale_ndevs
+        self._scale_reducers = []
+
+    def get_comm_groups(self, scale_ndevs: Optional[int] = None):
+        """
+        Scale the communication groups to multiple devices 
+        using data parallelism.
+
+        @warn this requires user side to setup dataloader
+            for different GPUs
+        
+        @param scale_ndevs Optional[int]: scale to number of devices
+        """
+        scale_ndevs = scale_ndevs if scale_ndevs is not None else len(self.devices)
+        assert len(self.devices) == max(self.devices) + 1, f'device must be consecutive'
+        assert scale_ndevs % len(self.devices) == 0, f'ngpus must be a multiple of {len(self.devices)}'
+        nreplica = scale_ndevs // len(self.devices)
+        # scale communication groups
+        graph = self.execplan.graph
+        comm_groups = []
+        reducers: List[IRWeightReducer] = graph.select(ntype=IRWeightReducer)
+        for reducer in reducers:
+            ranks = np.array(tuple(sorted(reducer.device)), dtype=int)
+            for i in range(nreplica):
+                shifted_ranks = tuple(ranks + i * len(self.devices))
+                shifted_ranks = tuple(int(rank) for rank in shifted_ranks)
+                if shifted_ranks not in comm_groups:
+                    comm_groups.append(shifted_ranks)
+        adapters = graph.select(ntype=IRAdapter)
+        for adapter in adapters:
+            for prim in adapter.prims:
+                if isinstance(prim, CollectivePrim):
+                    ranks = np.array(tuple(sorted(prim.kwargs['ranks'])), dtype=int)
+                    for i in range(nreplica):
+                        shifted_ranks = tuple(ranks + i * len(self.devices))
+                        shifted_ranks = tuple(int(rank) for rank in shifted_ranks)
+                        if shifted_ranks not in comm_groups:
+                            comm_groups.append(shifted_ranks)
+        # allreduce all gradients
+        if nreplica > 1:
+            for rank in self.devices:
+                ranks = tuple(range(rank, scale_ndevs, len(self.devices)))
+                if ranks not in comm_groups:
+                    comm_groups.append(ranks)
+        return comm_groups
+
+    def scale(self, node: IRCell, ndevs: int, device: int) -> List[IRCell]:
+        assert len(self.devices) == max(self.devices) + 1, f'device must be consecutive'
+        assert ndevs % len(self.devices) == 0, f'ngpus must be a multiple of {len(self.devices)}'
+        shift = (device // len(self.devices)) * len(self.devices)
+        if isinstance(node, IRAdapter):
+            adapter = copy.copy(node)
+            adapter._id = node.cid
+            adapter.kwargs = dict(**node.kwargs)
+            prims = []
+            for prim in adapter.prims:
+                p = copy.copy(prim)
+                p.kwargs = dict(**prim.kwargs)
+                if 'ranks' in prim.kwargs:
+                    p.kwargs['ranks'] = [rank + shift for rank in prim.kwargs['ranks']]
+                if 'src' in prim.kwargs:
+                    p.kwargs['src'] = prim.kwargs['src'] + shift
+                if 'srcs' in prim.kwargs:
+                    p.kwargs['srcs'] = [src + shift for src in prim.kwargs['srcs']]
+                if 'dst' in prim.kwargs:
+                    p.kwargs['dst'] = prim.kwargs['dst'] + shift
+                if 'dsts' in prim.kwargs:
+                    p.kwargs['dsts'] = [dst + shift for dst in prim.kwargs['dsts']]
+                prims.append(p)
+            adapter.prims = prims
+            if node.isfw() and node.differentiable and node.custom:
+                badapter = self.scale(node.mirror, ndevs, device)
+                IRCell.make_pair(adapter, badapter)
+            return adapter
+        if isinstance(node, IRSegment) and node.isfw():
+            nodes = [self.scale(n, ndevs, device) for n in node.nodes()]
+            segment = IRSegment(nodes, node.inputs(), node.outputs(), node.name)
+            segment._id = node.cid
+            return segment
+        return node
 
     def gen(self, device: int, outfile=None, attach=False) -> str:
         """
@@ -111,13 +203,21 @@ class ModuleCodeGen(FuncEmission):
         node_args: List[List[str]] = list()
         gen_nodes: List[IRCell] = list()
 
+        device_map = device if self._scale_to_ndevs is None else \
+            device % len(self.devices)
+        sequence = self.execplan.seq(device_map)
         unrolled_seqs = []
-        for node in self.execplan.seq(device):
+        for node in sequence:
             # unwrap from ExeReuseCell
             node = node.cell if isinstance(node, ExeReuseCell) else node
             unrolled_seqs.append(node)
         # we use ordered dict as ordered set
         sequence = tuple(dict.fromkeys(unrolled_seqs))
+        
+        # scale to multiple devices
+        if self._scale_to_ndevs is not None:
+            sequence = [self.scale(node, self._scale_to_ndevs, device) \
+                        for node in sequence]
 
         # init customized adapter
         fsegments = [node for node in sequence if isinstance(node, IRSegment) and node.isfw()]
@@ -128,7 +228,7 @@ class ModuleCodeGen(FuncEmission):
                     adapter.signature = AutogradAdapterCodeGen.name(adapter) + '.apply'
 
         # initialize communication groups
-        self.init_comm_groups()
+        self.emit_comm_groups()
 
         # emit code
         for node in sequence:
@@ -140,7 +240,7 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRAdapter):
                 codes = self.emit_adapter(node, prefix_attr='self.')
             elif isinstance(node, IRWeightReducer):
-                self.init_reducer(node)
+                self.init_reducer(node, device)
                 codes = self.emit_reducer(node)
             elif isinstance(node, IRBpOperation):
                 continue
@@ -210,78 +310,18 @@ class ModuleCodeGen(FuncEmission):
         self.clear()
         return code
 
-    def init_comm_groups(self):
+    def emit_comm_groups(self):
         """
-        Get all communication groups.
-
         Creating communication group requires all the devices
         enter the same call.
 
         The fields storing intermediate codes that are populated by this method:
         - `model_init_statements`
         """
-        graph = self.execplan.graph
         sign = 'self.init_group(ranks={ranks})'
-        # collect groups from weight reducer
-        comm_groups: Dict[Tuple[int]] = list()
-        for node in graph.nodes():
-            if isinstance(node, IRWeightReducer):
-                ranks = list(node.device)
-                ranks.sort()
-                ranks = tuple(ranks)
-                if ranks not in comm_groups:
-                    comm_groups.append(ranks)
-        # collect groups from p2p fusion
-        adapters = [n for n in graph.nodes(flatten=True) if isinstance(n, IRAdapter)]
-        for adapter in adapters:
-            for prim in adapter.prims:
-                if isinstance(prim, CollectivePrim):
-                    ranks = list(prim.kwargs['ranks'])
-                    ranks.sort()
-                    ranks = tuple(ranks)
-                    if ranks not in comm_groups:
-                        comm_groups.append(ranks)
         # create communication group
         self.model_init_statements.append('# communication groups')
-        for ranks in comm_groups:
-            code = sign.format(ranks=list(ranks))
-            self.model_init_statements.append(code)
-        self.model_init_statements.append(' ')
-
-    def init_comm_groups(self):
-        """
-        Get all communication groups.
-
-        Creating communication group requires all the devices
-        enter the same call.
-
-        The fields storing intermediate codes that are populated by this method:
-        - `model_init_statements`
-        """
-        graph = self.execplan.graph
-        sign = 'self.init_group(ranks={ranks})'
-        # collect groups from weight reducer
-        comm_groups: Dict[Tuple[int]] = list()
-        for node in graph.nodes():
-            if isinstance(node, IRWeightReducer):
-                ranks = list(node.device)
-                ranks.sort()
-                ranks = tuple(ranks)
-                if ranks not in comm_groups:
-                    comm_groups.append(ranks)
-        # collect groups from p2p fusion
-        adapters = [n for n in graph.nodes(flatten=True) if isinstance(n, IRAdapter)]
-        for adapter in adapters:
-            for prim in adapter.prims:
-                if isinstance(prim, CollectivePrim):
-                    ranks = list(prim.kwargs['ranks'])
-                    ranks.sort()
-                    ranks = tuple(ranks)
-                    if ranks not in comm_groups:
-                        comm_groups.append(ranks)
-        # create communication group
-        self.model_init_statements.append('# communication groups')
-        for ranks in comm_groups:
+        for ranks in self.comm_groups:
             code = sign.format(ranks=list(ranks))
             self.model_init_statements.append(code)
         self.model_init_statements.append(' ')
@@ -332,7 +372,7 @@ class ModuleCodeGen(FuncEmission):
                 self.init_attributes(sub_node)
         return
 
-    def init_reducer(self, node: IRWeightReducer) -> None:
+    def init_reducer(self, node: IRWeightReducer, device: int) -> None:
         """
         Emit code to initialize involved reducer objects in `__init__`.
 
@@ -348,7 +388,10 @@ class ModuleCodeGen(FuncEmission):
         weights = node.inputs()
         reducer_name = f'self.wreducer{node._id}'
         self.model_init_statements.append('')
-        init_code = reducer_init.format(reducer=reducer_name, ranks=node.device, max_nbytes=max_nbytes)
+        ranks = list(sorted(node.device))
+        shift = (device // len(self.devices)) * len(self.devices)
+        ranks = [r + shift for r in ranks]
+        init_code = reducer_init.format(reducer=reducer_name, ranks=ranks, max_nbytes=max_nbytes)
         self.model_init_statements.append(init_code)
         weights = [ModuleCodeGen.tensor_name(t, prefix_attr='self.') for t in weights]
         for weight in weights:

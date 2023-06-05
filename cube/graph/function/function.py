@@ -378,6 +378,7 @@ def Add(input, other, alpha=1, *, out=None, signature = None):
 
 def Sub(input, other, alpha=1, *, out=None, signature = None):
     assert out is None
+    signature = 'torch.sub'
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input - alpha * other
     annos = ['*, ? -> *', '?, * -> *',]
@@ -436,6 +437,18 @@ def FloorDiv(input, other, *, out=None, signature = None):
     return IRDimops(FloorDiv, 'floordiv', signature, annos, [input, other])
 
 
+def Exp(input, *, out=None, signature=None):
+    """
+    torch.exp(input, *, out=None)
+    """
+    assert out is None
+    if not isinstance(input, IRTensor):
+        return torch.exp(input)
+    shape = ShapeAnno.create_shape_str(input.shape)
+    annos = [OpAnno.create_op_str([shape], [shape])]
+    return IRDimops(Exp, 'exp', signature, annos, [input])
+
+
 def Pow(input, exponent, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(exponent, IRObject)):
@@ -488,6 +501,18 @@ def ReLU(input, inplace=False, signature = None):
     annos = ['* -> *']
     signature = 'torch.nn.functional.relu'
     return IRDimops(ReLU, 'relu', signature, annos, [input], inplace=inplace)
+
+
+def Abs(input, *, out=None, signature = None):
+    assert out is None
+    annos = ['* -> *']
+    return IRDimops(Abs, 'abs', signature, annos, [input])
+
+
+def Clamp(input, min=None, max=None, *, out=None, signature = None):
+    assert out is None
+    annos = ['* -> *']
+    return IRDimops(Clamp, 'clamp', signature, annos, [input], min=min, max=max)
 
 
 def Softmax(input, dim=None, _stacklevel=3, dtype=None, signature = None):
@@ -1114,6 +1139,8 @@ def Unsqueeze(input, dim, signature = None):
     """
     edim_in = ShapeAnno.create_shape_str(input.shape)
     edim_ou = copy.copy(edim_in)
+    if dim == -1:
+        dim = len(edim_ou)
     edim_ou.insert(dim, '1')
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
     return IRDimops(Unsqueeze, 'unsqueeze', signature, [anno], [input],dim=dim)

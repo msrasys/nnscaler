@@ -1,5 +1,5 @@
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 import copy
 import warnings
 
@@ -21,22 +21,32 @@ from cube.codegen.syntax.blocks import FunctionBlock, ForBlock
 
 class ScheduleCodeGen(FuncEmission):
 
-    def __init__(self, execplan: ExecutionPlan):
+    def __init__(self, execplan: ExecutionPlan, scale_ndevs: Optional[int] = None):
+        """
+        Create Module code generator
 
+        @param execplan ExecutionPlan
+        @param scale_ndevs Optional[int]: scale to number of devices
+        """
         self.execplan = execplan
+        self.devices: Tuple[int] = tuple(sorted(execplan.graph.device))
         # model full code
         self.init_code: List[str] = [
             '\n\n########## Generated Schedule Code ###########',
             'import torch', 'import cube', '']
         # module member name
         self.symbols = SymbolTable()
+        self._scale_to_ndevs = scale_ndevs
 
     def gen(self, device: int, outfile=None, attach=None) -> str:
         """
         Generate scheduling code on device
         """
         gencode = copy.copy(self.init_code)
-        device_nodes: List[IRCell] = self.execplan.seq(device)
+        device_map = device if self._scale_to_ndevs is None else \
+            device % len(self.devices)
+        device_nodes = self.execplan.seq(device_map)
+
         assert all(not isinstance(n, IRFwOperation) for n in device_nodes), \
             "Expected all forward operators have been grouped into IRSegment"
 
@@ -63,7 +73,11 @@ class ScheduleCodeGen(FuncEmission):
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         fb.insert_body(ScheduleCodeGen.emit_release(tensors))
-
+            # scale sync gradients
+            if self.execplan.graph.train and self._scale_to_ndevs is not None:
+                ranks = tuple(range(device_map, self._scale_to_ndevs, len(self.devices)))
+                if len(ranks) > 1:
+                    fb.insert_body(f'model.reduce_all_gradients({ranks})')
             # return code
             outputs = ScheduleCodeGen.return_name_complex(self.execplan.graph.outputs())
             code = f'return {outputs}'

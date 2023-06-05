@@ -32,7 +32,10 @@ from cube.flags import CompileFlag
 def compile(model: SemanticModel, *args,
             PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None,
             model_dummy_inputs: Tuple[Any] = None,
-            comm_cost_fn: Optional[Callable] = None, override = True, load_content = True) -> Callable:
+            comm_cost_fn: Optional[Callable] = None,
+            override = True,
+            load_content = True,
+            scale_ndevs: Optional[int] = None) -> Callable:
     """
     AI Scientist calls like:
 
@@ -203,8 +206,8 @@ def compile(model: SemanticModel, *args,
             start = time.time()
             local_world_size = DeviceGroup().local_world_size
             # code generation
-            mgener = ModuleCodeGen(execplan)
-            sgener = ScheduleCodeGen(execplan)
+            mgener = ModuleCodeGen(execplan, scale_ndevs=scale_ndevs)
+            sgener = ScheduleCodeGen(execplan, scale_ndevs=scale_ndevs)
             for local_rank in range(local_world_size):
                 rank = DeviceGroup().node_rank * local_world_size + local_rank
                 fname = filename.format(rank)

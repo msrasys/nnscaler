@@ -252,7 +252,8 @@ class ProfileDataBase:
             fw_span, bw_span, infer_memory, train_mem_info = \
                 CompProfiler.profile(fn, shapes, dtypes, requires_grads, values, **kwargs)
         except:
-            fw_span, bw_span, infer_memory, train_mem_info = float('inf'), float('inf'), 0, []
+            print(f'WARNING: fail to profile {node}')
+            fw_span, bw_span, infer_memory, train_mem_info = 0, 0, 0, []
         # log to database
         key = self._serialize(node)
         self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, residual_mem)

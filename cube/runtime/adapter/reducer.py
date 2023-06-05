@@ -24,13 +24,18 @@ def get_nbytes(dtype: torch.dtype) -> int:
 
 class Reducer:
 
-    def __init__(self, ranks: List[int], max_bucket_size_bytes=536870912):
+    def __init__(self, ranks: List[int], max_bucket_size_bytes=536870912, use_mean=False):
 
         self._params: List[torch.nn.Parameter] = list()
         # note this need to be called for every device
         self.ranks = ranks
         self._group = DeviceGroup().get_group(ranks)
         self.bucket_size = max_bucket_size_bytes
+        self.use_mean = use_mean
+
+    @property
+    def params(self):
+        return self._params
 
     def add_param(self, param: torch.nn.Parameter):
         self._params.append(param)
@@ -66,7 +71,10 @@ class Reducer:
             for bucket in buckets[tp]:
                 grads = [param.grad.data for param in bucket]
                 coalesced = self._flatten_dense_tensors(grads)
-                torch.distributed.all_reduce(coalesced, group=self._group)
+                torch.distributed.all_reduce(
+                    coalesced,
+                    op=torch.distributed.ReduceOp.AVG if self.use_mean else torch.distributed.ReduceOp.SUM,
+                    group=self._group)
                 all_synced = self._unflatten_dense_tensors(coalesced, grads)
                 for grad, synced in zip(grads, all_synced):
                     grad.copy_(synced, non_blocking=True)

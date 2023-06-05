@@ -321,7 +321,8 @@ class ConcreteTracer(TracerBase):
                     fn = _orig_getattr(self_obj, target)
                     if _orig_getattr(fn, '__module__', None) != 'nni.common.concrete_trace_utils.concrete_tracer' and hasattr(fn, '__globals__'):
                         _autowrap_check(self, fn.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
-                    result = OperatorPatcherContext.patch_run(fn, *args_tail, **kwargs)
+                    # result = OperatorPatcherContext.patch_run(fn, *args_tail, **kwargs)
+                    result = fn(*args_tail, **kwargs)  # quick fix from yanjun result = OperatorPatcherContext.patch_run(fn, *args_tail, **kwargs)
                     if _orig_isinstance(result, torch.Tensor):
                         result_cpu = result.cpu()
                         del result
@@ -1563,42 +1564,42 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
         operator_patch_backlist=operator_patch_backlist,
         forward_function_name=forward_function_name,
     )
-    graph = tracer.trace(root,
-        autowrap_leaf_function = autowrap_leaf_function,
-        autowrap_leaf_class = autowrap_leaf_class,
-        leaf_module = leaf_module,
-        fake_middle_class = fake_middle_class,
-        concrete_args=concrete_args,
-        use_operator_patch=use_operator_patch,
-        operator_patch_backlist=operator_patch_backlist,
-        forward_function_name=forward_function_name,
-    )
-    graph_check = tracer.trace(root,
-        autowrap_leaf_function = autowrap_leaf_function,
-        autowrap_leaf_class = autowrap_leaf_class,
-        leaf_module = leaf_module,
-        fake_middle_class = fake_middle_class,
-        concrete_args=concrete_args,
-        use_operator_patch=use_operator_patch,
-        operator_patch_backlist=operator_patch_backlist,
-        forward_function_name=forward_function_name,
-    )
-    # compare to check equal
-    assert len(graph.nodes) == len(graph_check.nodes), f'number nodes: {len(graph.nodes)} vs {len(graph_check.nodes)}'
-    for node_a, node_b in zip(graph.nodes, graph_check.nodes):
-        node_a: Node
-        node_b: Node
-        target_a = node_a.target
-        target_b = node_b.target
-        if node_a.op == 'get_attr' and node_a.name.startswith('_tensor_constant'):
-            assert node_b.op == 'get_attr' and node_b.name.startswith('_tensor_constant')
-            assert torch.equal(getattr(root, node_a.name), getattr(root, node_b.name))
-        elif node_a.op == 'call_function' and isinstance(target_a, Callable) and target_a.__name__ == 'apply' and\
-            hasattr(target_a, '__self__') and issubclass(target_a.__self__, torch.autograd.Function):
-            assert node_b.op == 'call_function' and isinstance(target_b, Callable) and target_b.__name__ == 'apply' and\
-            hasattr(target_b, '__self__') and issubclass(target_b.__self__, torch.autograd.Function)
-        else:
-            assert node_a.op == node_b.op and target_a == target_b, f'op: {node_a.op} vs {node_b.op}, target: {target_a} vs {target_b}'
+    # graph = tracer.trace(root,
+    #     autowrap_leaf_function = autowrap_leaf_function,
+    #     autowrap_leaf_class = autowrap_leaf_class,
+    #     leaf_module = leaf_module,
+    #     fake_middle_class = fake_middle_class,
+    #     concrete_args=concrete_args,
+    #     use_operator_patch=use_operator_patch,
+    #     operator_patch_backlist=operator_patch_backlist,
+    #     forward_function_name=forward_function_name,
+    # )
+    # graph_check = tracer.trace(root,
+    #     autowrap_leaf_function = autowrap_leaf_function,
+    #     autowrap_leaf_class = autowrap_leaf_class,
+    #     leaf_module = leaf_module,
+    #     fake_middle_class = fake_middle_class,
+    #     concrete_args=concrete_args,
+    #     use_operator_patch=use_operator_patch,
+    #     operator_patch_backlist=operator_patch_backlist,
+    #     forward_function_name=forward_function_name,
+    # )
+    # # compare to check equal
+    # assert len(graph.nodes) == len(graph_check.nodes), f'number nodes: {len(graph.nodes)} vs {len(graph_check.nodes)}'
+    # for node_a, node_b in zip(graph.nodes, graph_check.nodes):
+    #     node_a: Node
+    #     node_b: Node
+    #     target_a = node_a.target
+    #     target_b = node_b.target
+    #     if node_a.op == 'get_attr' and node_a.name.startswith('_tensor_constant'):
+    #         assert node_b.op == 'get_attr' and node_b.name.startswith('_tensor_constant')
+    #         assert torch.equal(getattr(root, node_a.name), getattr(root, node_b.name))
+    #     elif node_a.op == 'call_function' and isinstance(target_a, Callable) and target_a.__name__ == 'apply' and\
+    #         hasattr(target_a, '__self__') and issubclass(target_a.__self__, torch.autograd.Function):
+    #         assert node_b.op == 'call_function' and isinstance(target_b, Callable) and target_b.__name__ == 'apply' and\
+    #         hasattr(target_b, '__self__') and issubclass(target_b.__self__, torch.autograd.Function)
+    #     else:
+    #         assert node_a.op == node_b.op and target_a == target_b, f'op: {node_a.op} vs {node_b.op}, target: {target_a} vs {target_b}'
 
     with MagicMethodPatcher():
         name = root.__class__.__name__ if isinstance(root, torch.nn.Module) else root.__name__

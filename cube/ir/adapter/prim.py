@@ -393,7 +393,9 @@ class ReduceScatterPrim(CollectivePrim):
         Use ring-based communication cost
         """
         ndevs = len(self.inputs())
-        return (ndevs - 1) * self.input(0).nelement() // ndevs
+        # FIXME: temporally disable reduce scatter in code generation
+        # which has parity issues for now.
+        return 100 * (ndevs - 1) * self.input(0).nelement() // ndevs
 
     def __repr__(self) -> str:
         return f'{self.outputs()} = reduce_scatter[{self.device}]({self.inputs()})'

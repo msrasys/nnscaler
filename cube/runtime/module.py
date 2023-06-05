@@ -17,6 +17,10 @@ class CubeModule(torch.nn.Module):
         self._fullmap : Dict[str, Tuple[int, Tuple[slice], int]] = dict()
         self._batch_size: Optional[int] = None
 
+    @property
+    def reducers(self):
+        return self._reducers
+
     def add_reducer(self, reducer: Reducer):
         if not isinstance(reducer, Reducer):
             raise RuntimeError(f"Expected a Reducer but got {type(reducer)}")
@@ -42,6 +46,16 @@ class CubeModule(torch.nn.Module):
         """
         assert hasattr(self, attr), f"{attr} is not in the module"
         self._fullmap[attr] = (tid, slicers, val_chunks)
+
+    def reduce_all_gradients(self, ranks: Tuple[int]):
+        """
+        reduce gradients for the whole model.
+        This can only be used for data parallel
+        """
+        reducer = Reducer(ranks, use_mean=True)
+        for parameter in self.parameters():
+            reducer.add_param(parameter)
+        reducer.allreduce()
 
     def get_full_map(self):
         return self._fullmap
@@ -89,7 +103,7 @@ class CubeModule(torch.nn.Module):
         }, filename)
 
     @staticmethod
-    def merge_partial_states(state_dicts):
+    def merge_partial_states(state_dicts, zero_idx_maps=None):
         """
         :param state_dicts: list of state_dict from different ranks
         state_dict(model_state_dict, optimizer_state_dict, dist_param_map, param_area_map)
@@ -98,6 +112,48 @@ class CubeModule(torch.nn.Module):
         assert len(state_dicts) > 0
         if len(state_dicts) == 1:
             return state_dicts[0][0], state_dicts[0][1]
+
+        # at first, merge the partitioned optimizer states due to zero to the zero-disabled format
+        if zero_idx_maps is not None:
+            def _check_opt_state(opt_state):
+                cnt = 0
+                sorted_opt_state = {}
+                for idx in sorted(opt_state.keys()):
+                    assert cnt == idx, f'opt state error: {idx} vs {cnt}, in {opt_state.keys()}'
+                    sorted_opt_state[idx] = opt_state[idx]
+                    cnt += 1
+                return sorted_opt_state
+            optimizer_state_dict = {}
+            worker_cnt = len(state_dicts)
+            opt_state_list = []
+            for work_idx in range(worker_cnt):
+                zero_idx2model_idx, model_idx2zero_idx, zero_rank_groups = zero_idx_maps[work_idx]
+                opt_state = {}
+                # first place local opt state to right index
+                if len(zero_idx2model_idx) == 0:
+                    assert len(state_dicts[work_idx][1]['state']) == 0
+                for local_idx, val in state_dicts[work_idx][1]['state'].items(): # worker / last_optimizer_state / state
+                    print(f'{work_idx}, {local_idx}')
+                    global_idx = zero_idx2model_idx[local_idx]
+                    assert global_idx not in opt_state
+                    opt_state[global_idx] = val
+                # for each rank group, copy opt state from other buckets
+                for rank_group, param_idx_buckets in zero_rank_groups.items():
+                    for bucket_idx, rank in enumerate(rank_group):
+                        if rank == work_idx: continue
+                        for global_idx in param_idx_buckets[bucket_idx]:
+                            other_local_idx = zero_idx_maps[rank][1][global_idx] # rank / model_idx2zero_idx / global_idx
+                            assert global_idx not in opt_state
+                            opt_state[global_idx] = state_dicts[rank][1]['state'][other_local_idx] # worker / last_optimizer_state / state / local idx
+                opt_state = _check_opt_state(opt_state)
+                opt_state_list.append(opt_state)
+                assert len(state_dicts[work_idx][1]['param_groups']) == 1, 'only support param_groups to be one group'
+            # assign opt_state to state_dicts, cannot be assigned in the above loop
+            opt_state_len = len(opt_state_list[0])
+            for work_idx in range(worker_cnt):
+                state_dicts[work_idx][1]['state'] = opt_state_list[work_idx]
+                state_dicts[work_idx][1]['param_groups'][0]['params'] = sorted(opt_state_list[work_idx].keys())
+                assert len(opt_state_list[work_idx]) == opt_state_len
 
         # find tensor full shape
         param_max_dimsize = {}

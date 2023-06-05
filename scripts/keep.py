@@ -6,9 +6,17 @@ import subprocess
 import re
 
 def get_gpu_util(rank):
+    from shutil import which
+    smi = None
+    if which('nvidia-smi') is not None:
+        smi = 'nvidia-smi'
+    elif which('rocm-smi') is not None:
+        smi = 'rocm-smi'
+    else:
+        raise Exception('Cannot find either nvidia-smi or rocm-smi!')
 
     cmds = [
-        'nvidia-smi',
+        smi,
         '-i',
         str(rank),
     ]
