@@ -99,6 +99,7 @@ class CompProfiler:
         infer_memory = mtoc - mtic
 
         train_mem_info = []
+        train_mem2in_idx = []
         used_tensor = set()
         # ref torch/utils/checkpoint.py/_checkpoint_without_reentrant
         def pack_hook(x):
@@ -109,6 +110,12 @@ class CompProfiler:
                 for dim in list(x.size()):
                     byte_size = byte_size * dim
                 train_mem_info.append(byte_size)
+                idx = -1
+                for i, t in enumerate(tensors):
+                    if t.storage().data_ptr() == x.storage().data_ptr():
+                        idx = i
+                        break
+                train_mem2in_idx.append(idx)
             return x
         
         def unpack_hook(x):
@@ -144,7 +151,7 @@ class CompProfiler:
         fwbw_span = (toc - tic) / prof_times * 1000 # in milliseconds
         bw_span = max(fwbw_span - fw_span, 0.0)
 
-        return fw_span, bw_span, infer_memory, tuple(train_mem_info)
+        return fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx
 
 
 class ProfileDataBase:
@@ -249,26 +256,28 @@ class ProfileDataBase:
 
         # run profiling
         try:
-            fw_span, bw_span, infer_memory, train_mem_info = \
+            fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx = \
                 CompProfiler.profile(fn, shapes, dtypes, requires_grads, values, **kwargs)
         except:
             print(f'WARNING: fail to profile {node}')
-            fw_span, bw_span, infer_memory, train_mem_info = 0, 0, 0, []
+            fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx = 0, 0, 0, [], []
         # log to database
         key = self._serialize(node)
-        self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, residual_mem)
+        self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span,\
+            infer_memory, train_mem_info, residual_mem, train_mem2in_idx)
         print(
             f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} "
             f"=> in mem info: {in_mem_info} | param mem info: {param_mem_info} | fw: {round(fw_span, 2)} ms | "
-            f"bw: {round(bw_span, 2)} ms | infer mem: {infer_memory} | train mem info: {train_mem_info}")
+            f"bw: {round(bw_span, 2)} ms | infer mem: {infer_memory} | train mem info: {train_mem_info} | idx: {train_mem2in_idx}")
 
         if isinstance(device, int):
             torch.cuda.set_device(orig_device)
-        return tuple(in_mem_info), tuple(param_mem_info), fw_span, bw_span, infer_memory, train_mem_info, residual_mem
+        return tuple(in_mem_info), tuple(param_mem_info), fw_span, bw_span, infer_memory, \
+            tuple(train_mem_info), residual_mem, tuple(train_mem2in_idx)
 
     def insert(self, name: str, key: str, in_mem_info: Tuple[int], param_mem_info: Tuple[int],
                fw_span: float, bw_span: float, infer_memory: int, train_mem_info: Tuple[int],
-               residual_mem: int):
+               residual_mem: int, train_mem2in_idx: Tuple[int]):
         """
         log the span of a function name with key
 
@@ -284,7 +293,7 @@ class ProfileDataBase:
         assert isinstance(name, str) and isinstance(key, str)
         if name not in self._data:
             self._data[name] = dict()
-        self._data[name][key] = (in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, residual_mem)
+        self._data[name][key] = (in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, residual_mem, train_mem2in_idx)
 
     def exist(self, node: IRFwOperation) -> bool:
         """
@@ -301,7 +310,7 @@ class ProfileDataBase:
             return False
         return True
 
-    def query(self, node: IRFwOperation) -> Tuple[Tuple[int], Tuple[int], float, float, int, Tuple[int]]:
+    def query(self, node: IRFwOperation) -> Tuple[Tuple[int], Tuple[int], float, float, int, Tuple[int], int, Tuple[int]]:
         """!
         Get the performance number of a node in IRGraph
 
@@ -321,7 +330,7 @@ class ProfileDataBase:
             return None
         return self._data[node.signature][key]
 
-    def query_func(self, signature, shapes, dtypes) -> Tuple[Tuple[int], Tuple[int], float, float, int, Tuple[int]]:
+    def query_func(self, signature, shapes, dtypes) -> Tuple[Tuple[int], Tuple[int], float, float, int, Tuple[int], int, Tuple[int]]:
         """
         Get performance number of given name (signature), shapes and dtypes
         
