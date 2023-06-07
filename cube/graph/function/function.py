@@ -424,6 +424,18 @@ def Exp(input, *, out=None, signature=None):
     return IRDimops(Exp, 'exp', signature, annos, [input])
 
 
+def Sqrt(input, *, out=None, signature=None):
+    """
+    torch.sqrt(input, *, out=None)
+    """
+    assert out is None
+    if not isinstance(input, IRTensor):
+        return torch.sqrt(input)
+    shape = ShapeAnno.create_shape_str(input.shape)
+    annos = [OpAnno.create_op_str([shape], [shape])]
+    return IRDimops(Sqrt, 'sqrt', signature, annos, [input])
+
+
 def FloorDiv(input, other, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):

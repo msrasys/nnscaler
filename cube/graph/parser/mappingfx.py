@@ -58,6 +58,7 @@ class SignFx2Op:
         __ttemplate('sum'): function.Sum,
         __ttemplate('abs'): function.Abs,
         __ttemplate('exp'): function.Exp,
+        __ttemplate('sqrt'): function.Sqrt,
         __ttemplate('clamp'): function.Clamp,
         __ttemplate('squeeze'): function.Squeeze,
         __ttemplate('unsqueeze'): function.Unsqueeze,
