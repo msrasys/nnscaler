@@ -200,11 +200,14 @@ class SemanticModel:
         spec = importlib.util.spec_from_file_location("GenModel", filename)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        self._loaded_module = module.GenModel().cuda()
+        self._loaded_module: CubeModule = module.GenModel().cuda()
+        # load parameter content
         if self.save_content:
             print_each_rank("> loading parameter content...")
-            # TODO: make hardcode ./fullmodel.pt programmable
             self._loaded_module.load_attr_content('./fullmodel.pt')
+        # initialize reducer
+        for reducer in self._loaded_module.reducers:
+            reducer.build_buckets()
 
     def get_gen_module(self) -> Optional[torch.nn.Module]:
         return self._loaded_module

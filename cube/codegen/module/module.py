@@ -1,5 +1,5 @@
 from typing import Dict, List, Optional, Tuple
-from more_itertools import split_when
+import more_itertools
 import warnings
 import copy
 import torch
@@ -115,7 +115,40 @@ class ModuleCodeGen(FuncEmission):
         self.comm_groups: List[Tuple[int]] = self.get_comm_groups(scale_ndevs)
         # whether to scale (with data parallelism)
         self._scale_to_ndevs = scale_ndevs
-        self._scale_reducers = []
+        if scale_ndevs is not None:
+            self.add_scale_reducers()
+
+    def add_scale_reducers(self):
+        """
+        Insert reducers to for scale scenario
+        """
+        if self._scale_to_ndevs is None:
+            return
+        graph = self.execplan.graph
+        # for each device, collect parameters in the all reducers and create a reducer for the rest
+        for device in self.devices:
+            # collect parameters in the all reducers belonging to this device
+            all_params = set()
+            for reducer in graph.select(ntype=IRWeightReducer):
+                if device not in reducer.device: continue
+                for param in reducer.inputs():
+                    assert param not in all_params, \
+                        f'detected a parameter {param} in multiple reducers on device {device}'
+                all_params.update(reducer.inputs())
+            # create a reducer for the rest parameters used for this device
+            rest_params = []
+            for param in self.execplan.graph.attributes():
+                if not param.is_param(): continue
+                for ctensor in graph.ctensors(param):
+                    if device not in ctensor.device: continue
+                    if ctensor not in all_params and ctensor not in rest_params:
+                        rest_params.append(ctensor)
+            if len(rest_params) == 0:
+                continue
+            # create reducer and append to the execution
+            reducer = IRWeightReducer(rest_params)
+            reducer.device = device  # will be scaled in `self.scale`
+            self.execplan.at(device).append(reducer)
 
     def get_comm_groups(self, scale_ndevs: Optional[int] = None):
         """
@@ -134,14 +167,19 @@ class ModuleCodeGen(FuncEmission):
         # scale communication groups
         graph = self.execplan.graph
         comm_groups = []
+        # communication groups for parameters that are in reducers
         reducers: List[IRWeightReducer] = graph.select(ntype=IRWeightReducer)
         for reducer in reducers:
-            ranks = np.array(tuple(sorted(reducer.device)), dtype=int)
-            for i in range(nreplica):
-                shifted_ranks = tuple(ranks + i * len(self.devices))
-                shifted_ranks = tuple(int(rank) for rank in shifted_ranks)
-                if shifted_ranks not in comm_groups:
-                    comm_groups.append(shifted_ranks)
+            ranks = more_itertools.flatten(list(range(device, scale_ndevs, len(self.devices))) \
+                                           for device in reducer.device)
+            ranks = tuple(sorted(ranks))
+            comm_groups.append(ranks)
+        # communication groups for parameters that are outside reducers
+        for device in self.devices:
+            ranks = list(range(device, scale_ndevs, len(self.devices)))
+            if len(ranks) > 1:
+                comm_groups.append(ranks)
+        # communication groups for activations
         adapters = graph.select(ntype=IRAdapter)
         for adapter in adapters:
             for prim in adapter.prims:
@@ -152,12 +190,6 @@ class ModuleCodeGen(FuncEmission):
                         shifted_ranks = tuple(int(rank) for rank in shifted_ranks)
                         if shifted_ranks not in comm_groups:
                             comm_groups.append(shifted_ranks)
-        # allreduce all gradients
-        if nreplica > 1:
-            for rank in self.devices:
-                ranks = tuple(range(rank, scale_ndevs, len(self.devices)))
-                if ranks not in comm_groups:
-                    comm_groups.append(ranks)
         return comm_groups
 
     def scale(self, node: IRCell, ndevs: int, device: int) -> List[IRCell]:
@@ -188,6 +220,15 @@ class ModuleCodeGen(FuncEmission):
                 badapter = self.scale(node.mirror, ndevs, device)
                 IRCell.make_pair(adapter, badapter)
             return adapter
+        if isinstance(node, IRWeightReducer):
+            reducer = IRWeightReducer(node.inputs(), name=node.name)
+            reducer._id = node.cid
+            ranks = list(node.device)
+            scale_ranks = []
+            for rank in ranks:
+                scale_ranks += list(range(rank, ndevs, len(self.devices)))
+            reducer.device = sorted(scale_ranks)
+            return reducer
         if isinstance(node, IRSegment) and node.isfw():
             nodes = [self.scale(n, ndevs, device) for n in node.nodes()]
             segment = IRSegment(nodes, node.inputs(), node.outputs(), node.name)
@@ -380,8 +421,15 @@ class ModuleCodeGen(FuncEmission):
         -   `model_init_statements`
         """
         max_nbytes = CompileFlag.max_reducer_bucket
+        async_op = CompileFlag.async_reducer
+        zero = CompileFlag.use_zero
+        reduce_op = f"'{CompileFlag.reducer_op}'"
         # reducer init interface
-        reducer_init = '{reducer} = cube.runtime.adapter.Reducer(ranks={ranks}, max_bucket_size_bytes={max_nbytes})'
+        reducer_init = (
+            "{reducer} = cube.runtime.adapter.Reducer("
+            "ranks={ranks}, reduce_op={reduce_op}, "
+            "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes})"
+        )
         reducer_add = 'self.add_reducer({reducer})'
         add_param = '{reducer}.add_param({weight})'
         # create reducer in declare region
@@ -389,9 +437,9 @@ class ModuleCodeGen(FuncEmission):
         reducer_name = f'self.wreducer{node._id}'
         self.model_init_statements.append('')
         ranks = list(sorted(node.device))
-        shift = (device // len(self.devices)) * len(self.devices)
-        ranks = [r + shift for r in ranks]
-        init_code = reducer_init.format(reducer=reducer_name, ranks=ranks, max_nbytes=max_nbytes)
+        init_code = reducer_init.format(
+            reducer=reducer_name, ranks=ranks, reduce_op=reduce_op, 
+            async_op=async_op, zero=zero, max_nbytes=max_nbytes)
         self.model_init_statements.append(init_code)
         weights = [ModuleCodeGen.tensor_name(t, prefix_attr='self.') for t in weights]
         for weight in weights:
@@ -449,7 +497,7 @@ class ModuleCodeGen(FuncEmission):
         nodes : List[IRCell] = segment.nodes()
         lifetime = LifeCycle(nodes, segment.inputs(), segment.outputs())
         rc_groups: List[List[IRCell]] = list(
-            split_when(nodes, lambda prev, curr: prev.recompute != curr.recompute))
+            more_itertools.split_when(nodes, lambda prev, curr: prev.recompute != curr.recompute))
 
         codes: List[str] = []
         for rc_group in rc_groups:
@@ -460,9 +508,8 @@ class ModuleCodeGen(FuncEmission):
             else:
                 # get recompute excution code
                 rc_segment = segment.create_segment(rc_group)
-                rc_lifetime = LifeCycle(rc_group, rc_segment.inputs(), rc_segment.outputs())
                 rc_codes = ModuleCodeGen._emit_recompute(rc_group,
-                    rc_segment.inputs(), rc_segment.outputs(), rc_lifetime)
+                    rc_segment.inputs(), rc_segment.outputs(), lifetime)
                 codes += rc_codes
                 # release input tensors after exiting a RC group:
                 last_node = rc_group[-1]

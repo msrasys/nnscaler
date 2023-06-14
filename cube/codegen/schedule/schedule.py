@@ -73,11 +73,6 @@ class ScheduleCodeGen(FuncEmission):
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         fb.insert_body(ScheduleCodeGen.emit_release(tensors))
-            # scale sync gradients
-            if self.execplan.graph.train and self._scale_to_ndevs is not None:
-                ranks = tuple(range(device_map, self._scale_to_ndevs, len(self.devices)))
-                if len(ranks) > 1:
-                    fb.insert_body(f'model.reduce_all_gradients({ranks})')
             # return code
             outputs = ScheduleCodeGen.return_name_complex(self.execplan.graph.outputs())
             code = f'return {outputs}'

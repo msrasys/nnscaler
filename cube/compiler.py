@@ -35,7 +35,7 @@ def compile(model: SemanticModel, *args,
             comm_cost_fn: Optional[Callable] = None,
             override = True,
             load_content = True,
-            scale_ndevs: Optional[int] = None) -> Callable:
+            scale: Union[bool, int] = False) -> Callable:
     """
     AI Scientist calls like:
 
@@ -65,6 +65,9 @@ def compile(model: SemanticModel, *args,
         generated code, i.e., the policy won't take effect. Default true.
     @param load_content bool: If true, will load parameter from exsiting saved models.
         Otherwise, will initial model parameters with empty tensor.
+    @param scale Union[bool, int]: If true, will scale the generated code to the
+        total launched number of GPUs. If int, will scale to the specified number.
+        Default False, no scaling.
 
     @return sched_fn Callable: the scheduling function loaded from generated code.
     """
@@ -206,6 +209,9 @@ def compile(model: SemanticModel, *args,
             start = time.time()
             local_world_size = DeviceGroup().local_world_size
             # code generation
+            scale_ndevs = None
+            if scale:
+                scale_ndevs = resource.ngpus if isinstance(scale, bool) else scale
             mgener = ModuleCodeGen(execplan, scale_ndevs=scale_ndevs)
             sgener = ScheduleCodeGen(execplan, scale_ndevs=scale_ndevs)
             for local_rank in range(local_world_size):

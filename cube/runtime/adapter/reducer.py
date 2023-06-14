@@ -1,122 +1,480 @@
-"""
-Borrowed from Megatron Implementation
-"""
-
-from typing import List
-import torch
+from typing import List, Dict, Tuple, Any, Callable, Optional
+from functools import partial
 import warnings
+import torch
+from torch.utils.hooks import RemovableHandle
 
 from cube.runtime.device import DeviceGroup
-from cube.profiler.timer import CudaTimer, print_each_rank
+from cube.profiler.timer import CudaTimer
 from cube.flags import RuntimeFlag
 
 
-def get_nbytes(dtype: torch.dtype) -> int:
-    try:
-        if dtype.is_floating_point():
-            return torch.finfo(dtype).bits // 8
+def _get_reduce_op(reduce_op: str) -> torch.distributed.ReduceOp:
+    """
+    Get reduce op from string
+    """
+    reduce_op = reduce_op.lower()  # to lower case
+    supported = ['sum', 'avg', 'mean', 'min', 'max']
+    if reduce_op == 'sum':
+        return torch.distributed.ReduceOp.SUM
+    elif reduce_op == 'avg' or reduce_op == 'mean':
+        return torch.distributed.ReduceOp.AVG
+    elif reduce_op == 'min':
+        return torch.distributed.ReduceOp.MIN
+    elif reduce_op == 'max':
+        return torch.distributed.ReduceOp.MAX
+    raise KeyError(f"Unsupported reduce op {reduce_op}. Supported reduce op: {supported}")
+
+
+class Bucket:
+
+    # config: whether to use allreduce for zero (default: reduce-scatter)
+    use_allreduce_for_zero: bool = False
+
+    def __init__(self, params: List[torch.nn.Parameter],
+                 param_buffer: torch.Tensor, grad_buffer: torch.Tensor,
+                 reduce_op: torch.distributed.ReduceOp, 
+                 group, async_op: bool, zero: bool):
+        """
+        Create a communication unit for parameter allreduce.
+        
+        One allreduce will be called for all gradients associated to the parameters.
+        The parameters are assumed to participate in backward and generate gradient.
+
+        @param params List[torch.nn.Parameter]: the parameters
+        @param param_buffer torch.Tensor: Paramter contiguous buffer
+        @param grad_buffer torch.Tensor: gradient contiguous buffer
+        @param reduce_op torch.distributed.ReduceOp: the reduce op used by collectives
+        @param group: communication group
+        @param async_op bool: whether to use asynchronous operation
+        @param zero bool: whether to use zero optimization on gradients
+        """
+
+        self._params: List[torch.nn.Parameter] = params
+        self._pofset: Dict[torch.nn.Parameter, int] = {}
+        self._reduce_op = reduce_op
+        self._group = group
+        self._wsz: int = torch.distributed.get_world_size(group=self._group)
+        self._cnt = 0
+        self._work = None  # communication handle
+        self._hooks: List[Tuple[Any, RemovableHandle]] = []
+
+        self._async: bool = async_op
+        self._zero: bool = zero
+        self._contiguous_params = param_buffer
+        self._contiguous_grads = grad_buffer
+        assert grad_buffer.size() == param_buffer.size()
+        assert grad_buffer.size(0) % self._wsz == 0, "internal error: buffer size not chunkable"
+        # the parameter exposed for optimizer
+        self._param_for_optimizer: torch.nn.Parameter = None
+        # total number of parameters
+        self._numel: int = sum(p.numel() for p in self._params)
+        self._padding: int = self._contiguous_grads.size(0) - self._numel
+
+        # only async will enable contiguous gradient
+        self.build()
+        self.register_hooks()
+
+    @property
+    def numel(self) -> int:
+        """total number of parameters in the bucket"""
+        return self._numel
+
+    @property
+    def params(self) -> Tuple:
+        """Parameter list"""
+        return self._params
+
+    @property
+    def zero(self) -> bool:
+        """Whether enable zero for this bucket"""
+        return self._zero
+    
+    def build(self):
+        """
+        Build offset for each parameter
+        This should only be called once during the construction of bucket.
+        """
+        self._numel = sum(p.numel() for p in self._params)
+        ofst = 0
+        for param in self._params:
+            self._pofset[param] = ofst
+            ofst += param.numel()
+        # build parameter for optimizer (shared storage).
+        # Its gradient will be updated everytime calling `self.sync_grads()`
+        if not self._zero:
+            opt = self._contiguous_params[:self._numel]
         else:
-            return torch.iinfo(dtype).bits // 8
-    except Exception as e:
-        warnings.warn(f'Cannot figure out bytes of dtype: {dtype}, set default as 4.')
-        return 4
+            rank = torch.distributed.get_rank(group=self._group)
+            opt = self._contiguous_params.chunk(self._wsz)[rank]
+            if rank == self._wsz - 1 and self._padding != 0:
+                opt = opt[:-self._padding]
+        self._param_for_optimizer = torch.nn.Parameter(opt)
+
+    def register_hooks(self):
+        """
+        Register post-backward hook to each paramter
+
+        The post-backward will change the generated gradient from `.grad` to `self._contiguous_grads`.
+        The `.grad` will always keep as None until the finish of allreduce sync.
+        After allreduce sync, each parameter will be reset by its `.grad` attribute, which
+        shares the same storage from `self._contiguous_grads`.
+
+        This should only be called once during the construction of bucket.
+        """
+
+        @torch.no_grad()
+        def post_grad_hook(param: torch.nn.Parameter, *unused):
+            # stream = DeviceGroup().get_stream('reducer')
+            ofst = self._pofset[param]
+            # due to **unknown** reasons, multi-stream computation has incorrect results
+            # with torch.cuda.stream(stream):  # async update to overlap backward computation
+            # TODO: need to handle sparse gradients in torch.nn.Embedding
+            # print('yizhu1', param.requires_grad, param.size(), param.data_ptr)
+            self._contiguous_grads[ofst:ofst+param.numel()].add_(param.grad.data.view(-1))
+            param.grad = None
+
+            if RuntimeFlag.accum_mode: return
+
+            self._cnt += 1
+            assert self._cnt <= len(self._params), \
+                "detected double backward for a weight (not supported), or not use `model.zero_grad()` after optimizer"
+
+            # perform all-reduce
+            if self._async and self._cnt == len(self._params):
+                # wait until all gradients are accumulated in the gradient buffer
+                # stream.synchronize()
+                if self._zero:  # zero will use reduce-scatter (default) or allreduce on gradient shards
+                    if Bucket.use_allreduce_for_zero:
+                        self._work = torch.distributed.all_reduce(
+                            self._contiguous_grads, op=self._reduce_op,
+                            group=self._group, async_op=True)
+                    else:
+                        rank = torch.distributed.get_rank(group=self._group)
+                        shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
+                        self._work = torch.distributed.reduce_scatter(
+                            shards[rank], shards, op=self._reduce_op,
+                            group=self._group, async_op=True)
+                else:
+                    self._work = torch.distributed.all_reduce(
+                        self._contiguous_grads, op=self._reduce_op,
+                        group=self._group, async_op=True)
+
+        for param in self._params:
+            # same trick with FSDP and Megatron
+            # reference: https://github.com/pytorch/pytorch/blob/v1.13.1/torch/distributed/fsdp/fully_sharded_data_parallel.py#L3177-L3188
+            param_tmp = param.expand_as(param)
+            # gets its AccumulateGrad object.
+            grad_acc = param_tmp.grad_fn.next_functions[0][0]
+            hook = grad_acc.register_hook(partial(post_grad_hook, param))
+            # grad_acc must keep, otherwise the hook won't take effect
+            self._hooks.append((grad_acc, hook))
+
+    def sync_grads(self):
+        """
+        Wait until allreduce finished (async), or perform allreduce (sync).
+        
+        The `.grad` attribute for each parameter will also be set after 
+        the completion of allreduce.
+        """
+        rank = torch.distributed.get_rank(group=self._group)
+        # async
+        if self._async:
+            if CudaTimer().enabled and CudaTimer().predefined:
+                warnings.warn(f'CudaTimer: the communication time of async '
+                              f'reducer will not be recorded in `comm`')
+            assert self._work is not None
+            self._work.wait()
+        else:
+            if self._reduce_op == torch.distributed.ReduceOp.SUM:
+                self._contiguous_grads.div_(torch.distributed.get_world_size(group=self._group))
+            CudaTimer().start('comm', predefined=True)
+            if self._zero:
+                if Bucket.use_allreduce_for_zero:
+                    torch.distributed.all_reduce(
+                        self._contiguous_grads, op=self._reduce_op, group=self._group)
+                else:
+                    shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
+                    torch.distributed.reduce_scatter(
+                        shards[rank], shards, op=self._reduce_op, group=self._group)
+            else:
+                torch.distributed.all_reduce(
+                    self._contiguous_grads, op=self._reduce_op, group=self._group)
+            CudaTimer().stop('comm', predefined=True)
+        # grads = self._contiguous_grads.clone()
+        for param in self._params:
+            assert param.grad is None
+            pofst = self._pofset[param]
+            param.grad = self._contiguous_grads[pofst:pofst+param.numel()].view(param.size())
+            # the following two methods can make `.grad` isolate with `self._contiguous_grads`,
+            # thereby enabling torch.zero_ inside the reducer without requiring user to modify.
+            # param.grad = grads[pofst:pofst+param.numel()].view(param.size())
+            # param.grad = self._contiguous_grads[pofst:pofst+param.numel()].clone().view(param.size())
+        
+        # setup gradient for optimizer parameters
+        if self._zero:
+            grad = self._contiguous_grads.chunk(self._wsz, dim=0)[rank]
+            if rank == self._wsz - 1 and self._padding != 0:
+                grad = grad[:-self._padding]
+            self._param_for_optimizer.grad = grad
+        else:
+            self._param_for_optimizer.grad = self._contiguous_grads[:self._numel]
+
+    def gather_params(self):
+        """
+        All-gather parameters
+        """
+        assert self._zero, "gathering paramters is only for zero optimization."
+        rank = torch.distributed.get_rank(group=self._group)
+        shards = list(self._contiguous_params.chunk(self._wsz, dim=0))
+        torch.distributed.all_gather(shards, shards[rank], group=self._group)
+
+    def reset(self):
+        """Reset status."""
+        self._cnt = 0
+        self._work = None
 
 
 class Reducer:
 
-    def __init__(self, ranks: List[int], max_bucket_size_bytes=536870912, use_mean=False):
+    def __init__(self, ranks: List[int], max_bucket_size_bytes=536870912,
+                 reduce_op: str = 'sum', async_op: bool = False, zero: bool = False):
+        """
+        Create a reducer applied on a set of weights for weight reduction
 
+        This assumes the communication group is already created by every rank.
+
+        @param ranks List[int]: reducer communication group
+        @param max_bucket_size_bytes int: largest bucket size for one-time communication,
+            only work for asynchronous reducer.
+        @param reduce_op str: reduce operation, can be 'sum', 'avg', 'max' or 'min' (default 'sum')
+        @param async_op bool: whether to overlap with backward computation (default False)
+        @param zero bool: whether to apply zero optimization on gradients
+        """
         self._params: List[torch.nn.Parameter] = list()
-        # note this need to be called for every device
-        self.ranks = ranks
+        self._numel: int = 0
+        self._ranks = ranks
         self._group = DeviceGroup().get_group(ranks)
-        self.bucket_size = max_bucket_size_bytes
-        self.use_mean = use_mean
+        self._bucket_size: Optional[int] = max_bucket_size_bytes if async_op else None
+        self._reduce_op = _get_reduce_op(reduce_op)
+        # buckets stands for a transission unit
+        self._buckets: List[Bucket] = list()
+        self._async: bool = async_op
+        self._zero: bool = zero
+        # contiguous parameter buffer and gradient buffer
+        self._contiguous_params: torch.Tensor = None
+        self._contiguous_grads: torch.Tensor = None
+        # hooks
+        self._hooks: List[Callable] = []
 
     @property
-    def params(self):
-        return self._params
+    def params(self) -> Tuple[torch.nn.Parameter]:
+        return tuple(self._params)
+
+    @property
+    def ranks(self) -> Tuple[int]:
+        return tuple(self._ranks)
+
+    @property
+    def numel(self) -> int:
+        """Total number of parameters"""
+        return self._numel
+
+    @property
+    def zero(self) -> bool:
+        """Whether to apply zero optimization on gradients"""
+        return self._zero
+
+    @property
+    def buckets(self) -> Tuple[Bucket]:
+        return tuple(self._buckets)
 
     def add_param(self, param: torch.nn.Parameter):
-        self._params.append(param)
+        """
+        Add a parameter to the reducer
 
-    def allreduce(self):
+        The reducer assumes the ordering of added parameter
+        is consistent with forward order. Otherwise, the overlapping
+        will show less benefits.
+
+        @param param torch.nn.Parameter: the added parameter
         """
-        Reduce gradients across given group
+        self._params.append(param)
+        self._numel += param.numel()
+
+    def build_buckets(self):
         """
-        if RuntimeFlag.accum_mode: return
+        Build buckets the reducer.
+
+        The parameters in each bucket have consistent data types,
+        and each bucket contains at least one parameter.
+        If the bucket contains more than 2 parameters, than the total size is samller
+        than the max_bucket_size_bytes.
+        """
+        # step 1: build bucket for overlapping gradient synchronization
+        bucket_size = self._numel * 8 + 1 if self._bucket_size is None else self._bucket_size
         buckets = {}
-        tp2size = {}
+        dtype2size = {}
         for param in self._params:
-            if param.requires_grad and param.grad is not None:
+            if param.requires_grad:
                 cur_byte_size = param.nelement() * param.element_size()
                 tp = param.data.type()
                 if tp not in buckets:
                     buckets[tp] = [[param]]
-                    tp2size[tp] = cur_byte_size
+                    dtype2size[tp] = cur_byte_size
                 else:
-                    if cur_byte_size > self.bucket_size:
-                        warnings.warn(f'find one parameter {param.shape} ({cur_byte_size} bytes) larger than bucket size {self.bucket_size}')
+                    if cur_byte_size > bucket_size:
+                        warnings.warn(f'find one parameter {param.shape} ({cur_byte_size} bytes) larger than bucket size {self._bucket_size}')
                         buckets[tp].insert(0, [param])
-                    elif tp2size[tp] + cur_byte_size <= self.bucket_size:
-                        tp2size[tp] = tp2size[tp] + cur_byte_size
+                    elif dtype2size[tp] + cur_byte_size <= bucket_size:
+                        dtype2size[tp] = dtype2size[tp] + cur_byte_size
                         buckets[tp][-1].append(param)
                     else:
-                        tp2size[tp] = cur_byte_size
+                        dtype2size[tp] = cur_byte_size
                         buckets[tp].append([param])
+        seq_buckets: List[List[torch.nn.Parameter]] = []
+        for dtype in buckets:
+            if not self._async:
+                assert len(buckets[dtype]) == 1, \
+                    f"internal error: synchronized reducer only needs one bucket, but got {len(buckets[dtype])}"
+            for bucket in buckets[dtype]:
+                seq_buckets.append(bucket)
 
-        # for each bucket, do all-reduce
-        CudaTimer().start(field_name='comm', predefined=True)
-        for tp in buckets:
-            for bucket in buckets[tp]:
-                grads = [param.grad.data for param in bucket]
-                coalesced = self._flatten_dense_tensors(grads)
-                torch.distributed.all_reduce(
-                    coalesced,
-                    op=torch.distributed.ReduceOp.AVG if self.use_mean else torch.distributed.ReduceOp.SUM,
-                    group=self._group)
-                all_synced = self._unflatten_dense_tensors(coalesced, grads)
-                for grad, synced in zip(grads, all_synced):
-                    grad.copy_(synced, non_blocking=True)
-        torch.cuda.synchronize()
-        CudaTimer().stop(field_name='comm', predefined=True)
+        # step 2: build meta data for the offset of each bucket
+        # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
+        buffer_length: int = 0
+        starts, stops = [], []
+        for params in seq_buckets:
+            starts.append(buffer_length)
+            numel = sum(p.numel() for p in params)
+            padding = len(self._ranks) - numel % len(self._ranks)
+            buffer_length += numel + padding
+            stops.append(buffer_length)
+        
+        # step3: allocate memory
+        # gradient buffer
+        self._contiguous_grads: torch.Tensor = torch.zeros(
+            (buffer_length,), dtype=self._params[0].dtype,
+            device=torch.cuda.current_device(), requires_grad=False)
+        # parameter buffer
+        self._contiguous_params: torch.Tensor = torch.empty(
+            (buffer_length,), dtype=self._params[0].dtype,
+            device=torch.cuda.current_device(), requires_grad=False)
 
-    def sync(self):
+        # step 4: build buckets
+        buckets: List[Bucket] = []
+        for params, start, stop in zip(seq_buckets, starts, stops):
+            # replace underlying parameter content using shared storage from parameter
+            ofst = start
+            for param in params:
+                with torch.no_grad():
+                    self._contiguous_params[ofst:ofst+param.numel()].copy_(param.data.view(-1))
+                    param.data = self._contiguous_params[ofst:ofst+param.numel()].view(param.size())
+                ofst += param.numel()
+            # initialize buckets
+            bucket = Bucket(
+                params, 
+                self._contiguous_params[start:stop], 
+                self._contiguous_grads[start:stop],
+                self._reduce_op,
+                self._group,
+                self._async,
+                self._zero,
+            )
+            buckets.append(bucket)
+        torch.cuda.empty_cache()
+        # make it in reverse order as the backward happens from tail to head
+        self._buckets: List[Bucket] = list(reversed(buckets))
+        assert len(self._buckets) > 0, (
+            f"Find {len(self._params)} parameters in the reducer. "
+            f"Make sure adding all parameters before building buckets")
+
+    def sync_grads(self):
         """
-        Sync parameters before training
+        synchronize gradients using allreuce (non-zero) or reduce-scatter (zero)
+        """
+        if RuntimeFlag.accum_mode: return
+        for bucket in self._buckets:
+            bucket.sync_grads()
+        self._apply_post_hooks()
+
+    def gather_params(self):
+        """
+        Gather parameters
+        """
+        if RuntimeFlag.accum_mode: return
+        assert self._zero, "gathering paramters is only for zero optimization."
+        for bucket in self._buckets:
+            bucket.gather_params()
+
+    def zero_grad(self):
+        """
+        Make gradient to be zero. This needs to be called
+        after `optimizer.step()` if `optmizer.zero_grad(set_to_none=True)`.
+        """
+        if RuntimeFlag.accum_mode: return
+        torch.cuda.synchronize()
+        self._contiguous_grads.zero_()
+        for bucket in self._buckets:
+            bucket.reset()
+            bucket._param_for_optimizer.grad = None
+        for param in self.params:
+            param.grad = None
+
+    def parameters_for_optimizer(self) -> List[torch.nn.Parameter]:
+        """
+        Get parameters for optimizers
+        """
+        params = []
+        for bucket in self._buckets:
+            params.append(bucket._param_for_optimizer)
+        return params
+
+    def broadcast_params(self):
+        """
+        broadcast parameters before training
         """
         for param in self._params:
             torch.distributed.broadcast(param, self.ranks[0], group=self._group)
         torch.cuda.synchronize()
 
-    def _flatten_dense_tensors(self, tensors):
+    def register_post_hook(self, fn: Callable):
         """
-        Flatten dense tensors into a contiguous 1D buffer. Assume tensors are of
-        same dense type.
+        Register a post hook function after gradient update.
 
-        Since inputs are dense, the resulting tensor will be a concatenated 1D
-        buffer. Element-wise operation on this buffer will be equivalent to
-        operating individually.
+        A reducer can be registered by multiple hooks and the hooks will be
+        applied in the order of registration.
+        
+        The hook function takes a contiguous buffer of updated gradients
+        and can only apply in-place operations on it.
 
-        Args:
-            tensors (Iterable[Tensor]): dense tensors to flatten.
-        Returns:
-            A contiguous 1D buffer containing input tensors.
+        Example:
+
+        ```
+        hook = lambda grad: grad.clamp_(min=-1, max=1)
+        reducer.register_post_hook(hook)
+        ```
+
+        @param fn Callable: hook function that takes a gradient buffer as input
         """
-        return torch._utils._flatten_dense_tensors(tensors)
+        assert callable(fn), f"post hook function must be callable, but got {type(fn)}"
+        self._hooks.append(fn)
 
-    def _unflatten_dense_tensors(self, flat, tensors):
+    def _apply_post_hooks(self):
         """
-        View a flat buffer using the sizes of tensors. Assume that tensors are of
-        same dense type, and that flat is given by _flatten_dense_tensors.
-
-        Args:
-            flat (Tensor): flattened dense tensors to unflatten.
-            tensors (Iterable[Tensor]): dense tensors whose sizes will be used to
-              unflatten flat.
-
-        Returns:
-            Unflattened dense tensors with sizes same as tensors and values from
-            flat.
+        Apply registered post hooks one by one after gradient update
         """
-        return torch._utils._unflatten_dense_tensors(flat, tensors)
+        if len(self._hooks) == 0: return
+        # get updated gradients
+        grads = tuple(bucket._param_for_optimizer.grad for bucket in self._buckets)
+        assert all(grad is not None for grad in grads)
+        # apply hooks
+        for grad in grads:
+            for hook in self._hooks:
+                hook(grad)
+
+    def clear_post_hooks(self):
+        """
+        Clear all post hooks
+        """
+        self._hooks = []

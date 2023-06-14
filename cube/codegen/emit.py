@@ -220,7 +220,7 @@ class FuncEmission(CodeEmission):
         -   NONE
         """
         reducer_name = f'self.wreducer{node._id}'
-        code = f'{reducer_name}.allreduce()'
+        code = f'{reducer_name}.sync_grads()'
         return [code]
 
     @staticmethod

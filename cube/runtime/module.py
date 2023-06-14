@@ -26,12 +26,35 @@ class CubeModule(torch.nn.Module):
             raise RuntimeError(f"Expected a Reducer but got {type(reducer)}")
         self._reducers.append(reducer)
 
-    def reduce_grads(self):
+    def zero_grad(self):
         """
-        Mannually allreduce gradients on the weight
+        Make zero for gradients caused by async weight reducer
         """
         for reducer in self._reducers:
-            reducer.allreduce()
+            reducer.zero_grad()
+
+    def parameters_for_optimizer(self) -> List[torch.nn.Parameter]:
+        """Get parameter list for optimizer"""
+        params = []
+        reducer_pids = set()
+        for reducer in self._reducers:
+            params += reducer.parameters_for_optimizer()
+            reducer_pids.update(id(p) for p in reducer.params)
+        for param in self.parameters():
+            if id(param) not in reducer_pids:
+                params.append(param)
+        # print(f'> get out parameters: {sum(p.numel() for p in params)}')
+        return params
+
+    def gather_params(self):
+        """
+        Gather parameters
+
+        This won't take effect when zero is not enabled.
+        """
+        for reducer in self._reducers:
+            if reducer.zero:
+                reducer.gather_params()
 
     def add_full_map(self, attr: str, tid: int, slicers: Tuple[slice], val_chunks: int):
         """
@@ -46,16 +69,6 @@ class CubeModule(torch.nn.Module):
         """
         assert hasattr(self, attr), f"{attr} is not in the module"
         self._fullmap[attr] = (tid, slicers, val_chunks)
-
-    def reduce_all_gradients(self, ranks: Tuple[int]):
-        """
-        reduce gradients for the whole model.
-        This can only be used for data parallel
-        """
-        reducer = Reducer(ranks, use_mean=True)
-        for parameter in self.parameters():
-            reducer.add_param(parameter)
-        reducer.allreduce()
 
     def get_full_map(self):
         return self._fullmap
@@ -115,39 +128,108 @@ class CubeModule(torch.nn.Module):
 
         # at first, merge the partitioned optimizer states due to zero to the zero-disabled format
         if zero_idx_maps is not None:
-            def _check_opt_state(opt_state):
-                cnt = 0
-                sorted_opt_state = {}
-                for idx in sorted(opt_state.keys()):
-                    assert cnt == idx, f'opt state error: {idx} vs {cnt}, in {opt_state.keys()}'
-                    sorted_opt_state[idx] = opt_state[idx]
-                    cnt += 1
-                return sorted_opt_state
-            optimizer_state_dict = {}
-            worker_cnt = len(state_dicts)
-            opt_state_list = []
-            for work_idx in range(worker_cnt):
-                zero_idx2model_idx, model_idx2zero_idx, zero_rank_groups = zero_idx_maps[work_idx]
-                opt_state = {}
-                # first place local opt state to right index
-                if len(zero_idx2model_idx) == 0:
-                    assert len(state_dicts[work_idx][1]['state']) == 0
-                for local_idx, val in state_dicts[work_idx][1]['state'].items(): # worker / last_optimizer_state / state
-                    print(f'{work_idx}, {local_idx}')
-                    global_idx = zero_idx2model_idx[local_idx]
-                    assert global_idx not in opt_state
-                    opt_state[global_idx] = val
-                # for each rank group, copy opt state from other buckets
-                for rank_group, param_idx_buckets in zero_rank_groups.items():
-                    for bucket_idx, rank in enumerate(rank_group):
-                        if rank == work_idx: continue
-                        for global_idx in param_idx_buckets[bucket_idx]:
-                            other_local_idx = zero_idx_maps[rank][1][global_idx] # rank / model_idx2zero_idx / global_idx
-                            assert global_idx not in opt_state
-                            opt_state[global_idx] = state_dicts[rank][1]['state'][other_local_idx] # worker / last_optimizer_state / state / local idx
-                opt_state = _check_opt_state(opt_state)
-                opt_state_list.append(opt_state)
-                assert len(state_dicts[work_idx][1]['param_groups']) == 1, 'only support param_groups to be one group'
+            if bool(int(os.environ.get('USE_ZERO', default=0))):
+                def _check_state_size(opt_state_keys, bucket_state):
+                    if len(opt_state_keys) <= 1:
+                        return True
+                    return all(bucket_state[key].shape == bucket_state[opt_state_keys[0]].shape
+                               for key in opt_state_keys)
+
+                def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size):
+                    assert bucket_size % len(bucket_states) == 0
+                    opt_state_keys = list(bucket_states[0].keys())
+                    print(bucket_states[0], opt_state_keys)
+                    if 'step' in bucket_states[0]:
+                        opt_state_keys.remove('step')
+                    assert _check_state_size(opt_state_keys, bucket_states[0]), f'the keys {opt_state_keys} have different shape'
+                    # NOTE: only support adam for now
+                    assert 'exp_avg' in opt_state_keys
+                    assert 'exp_avg_sq' in opt_state_keys
+                    chunk_size = bucket_size // len(bucket_states)
+                    start_rank_id, start_offset = pstart // chunk_size, pstart % chunk_size
+                    end_rank_id, end_offset = pend // chunk_size, pend % chunk_size
+                    opt_states, opt_states_1d = {}, {}
+                    for key in opt_state_keys:
+                        opt_states[key] = torch.zeros(pshape, dtype=bucket_states[0][key].dtype,
+                                                      device=bucket_states[0][key].device, requires_grad=False)
+                        opt_states_1d[key] = opt_states[key].view(-1)
+
+                    if start_rank_id == end_rank_id:
+                        for key in opt_state_keys:
+                            opt_states_1d[key][:] = bucket_states[start_rank_id][key][start_offset:end_offset]
+                    else:
+                        offset = chunk_size-start_offset
+                        for key in opt_state_keys:
+                            opt_states_1d[key][:offset] = bucket_states[start_rank_id][key][start_offset:]
+                        for i in range(start_rank_id+1, end_rank_id):
+                            for key in opt_state_keys:
+                                opt_states_1d[key][offset:offset+chunk_size] = bucket_states[i][key][:]
+                            offset += chunk_size
+                        for key in opt_state_keys:
+                            opt_states_1d[key][offset:] = bucket_states[end_rank_id][key][:end_offset]
+
+                    if 'step' in bucket_states[0]:
+                        opt_states['step'] = bucket_states[0]['step']
+                    return opt_states
+
+                opt_state_list = []
+                worker_cnt = len(state_dicts)
+                for work_idx in range(worker_cnt):
+                    model_idx2opt_idx, opt_idx2ranks = zero_idx_maps[work_idx]
+                    opt_state = {}
+                    for model_idx, opt_idx in model_idx2opt_idx.items():
+                        if isinstance(opt_idx, int):
+                            # the param without reducer
+                            assert opt_idx2ranks[opt_idx] is None
+                            # state_dicts [worker idx][opt state]['state'][param idx]
+                            opt_state[model_idx] = state_dicts[work_idx][1]['state'][opt_idx]
+                        else:
+                            # the param in reducer bucket
+                            opt_idx, pstart, pend, pshape = opt_idx
+                            ranks, bucket_size = opt_idx2ranks[opt_idx]
+                            bucket_states = [state_dicts[rank][1]['state'][opt_idx] for rank in ranks]
+                            opt_state[model_idx] = _retrieve_param_opt_state(
+                                bucket_states,
+                                pstart,
+                                pend,
+                                pshape,
+                                bucket_size)
+                    opt_state_list.append(opt_state)
+                    assert len(state_dicts[work_idx][1]['param_groups']) == 1, 'only support param_groups to be one group'
+            else:
+                def _check_opt_state(opt_state):
+                    cnt = 0
+                    sorted_opt_state = {}
+                    for idx in sorted(opt_state.keys()):
+                        assert cnt == idx, f'opt state error: {idx} vs {cnt}, in {opt_state.keys()}'
+                        sorted_opt_state[idx] = opt_state[idx]
+                        cnt += 1
+                    return sorted_opt_state
+                optimizer_state_dict = {}
+                worker_cnt = len(state_dicts)
+                opt_state_list = []
+                for work_idx in range(worker_cnt):
+                    zero_idx2model_idx, model_idx2zero_idx, zero_rank_groups = zero_idx_maps[work_idx]
+                    opt_state = {}
+                    # first place local opt state to right index
+                    if len(zero_idx2model_idx) == 0:
+                        assert len(state_dicts[work_idx][1]['state']) == 0
+                    for local_idx, val in state_dicts[work_idx][1]['state'].items(): # worker / last_optimizer_state / state
+                        print(f'{work_idx}, {local_idx}')
+                        global_idx = zero_idx2model_idx[local_idx]
+                        assert global_idx not in opt_state
+                        opt_state[global_idx] = val
+                    # for each rank group, copy opt state from other buckets
+                    for rank_group, param_idx_buckets in zero_rank_groups.items():
+                        for bucket_idx, rank in enumerate(rank_group):
+                            if rank == work_idx: continue
+                            for global_idx in param_idx_buckets[bucket_idx]:
+                                other_local_idx = zero_idx_maps[rank][1][global_idx] # rank / model_idx2zero_idx / global_idx
+                                assert global_idx not in opt_state
+                                opt_state[global_idx] = state_dicts[rank][1]['state'][other_local_idx] # worker / last_optimizer_state / state / local idx
+                    opt_state = _check_opt_state(opt_state)
+                    opt_state_list.append(opt_state)
+                    assert len(state_dicts[work_idx][1]['param_groups']) == 1, 'only support param_groups to be one group'
             # assign opt_state to state_dicts, cannot be assigned in the above loop
             opt_state_len = len(opt_state_list[0])
             for work_idx in range(worker_cnt):

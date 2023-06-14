@@ -40,8 +40,17 @@ class CompileFlag:
     dev_mode = _to_bool('SINGLE_DEV_MODE')  # allow to use python xx.py
     async_comm = _to_bool('ASYNC_COMM')
 
-    # maximal reducer weight bytes for one allreduce
-    max_reducer_bucket = _to_int('MAX_REDUCER_BUCKET', default=6e8)
+    # ============== reducer ==================
+    # use zero optimization on optimizer status.
+    # to cooperate with zero, user needs to call `model.parameters_for_optimizer()`
+    # to get parameters for optimizer, and `model.gather_params()` after `optimizer.step()`
+    use_zero = _to_bool('USE_ZERO')
+    # use async communication to overlap gradient synchronization and backward computation
+    async_reducer = _to_bool('ASYNC_REDUCER')  # use async reducer
+    # maximal reducer weight bytes for one allreduce (only effective for async): default 128MB
+    max_reducer_bucket = _to_int('MAX_REDUCER_BUCKET', default=137217728)
+    # perform reducer op on gradients, can be sum, avg, mean, max, min. Default is sum
+    reducer_op = os.environ.get('REDUCER_OP', default='sum')
     
     # use automate mixture precision training, where weights, gradients
     # and optimizer status are kept in its original data type (can be float32),

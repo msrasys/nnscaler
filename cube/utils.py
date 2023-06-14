@@ -1,6 +1,9 @@
 from typing import Optional
+
+import cube
 from cube.profiler.timer import print_each_rank
 from cube.runtime.device import DeviceGroup
+from cube.flags import RuntimeFlag
 
 from cube.flags import RuntimeFlag
 
@@ -16,10 +19,14 @@ def _load_module_attr(filename: str, name: str):
 def load_model(filename: Optional[str] = None, load_content: bool = True):
     filename = f'gencode{DeviceGroup().rank}.py' if filename is None else filename
     module = _load_module_attr(filename, 'GenModel')
-    loaded_module = module.GenModel().cuda()
+    loaded_module: cube.runtime.module.CubeModule = module.GenModel().cuda()
+    # load parameter content
     if load_content:
         print_each_rank("> loading parameter content...")
         loaded_module.load_attr_content('./fullmodel.pt')
+    # initialize reducer
+    for reducer in loaded_module.reducers:
+        reducer.build_buckets()
     return loaded_module
 
 

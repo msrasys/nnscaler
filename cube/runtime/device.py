@@ -1,7 +1,7 @@
 """
 Communication group settings among devices
 """
-from typing import List
+from typing import List, Dict
 import numpy as np
 import torch
 import os
@@ -21,8 +21,6 @@ class DeviceGroup:
                 self.local_world_size = 1
                 self.local_rank = 0
                 self.node_rank = 0
-                self.groups = dict()
-                torch.cuda.set_device(0)
             else:
                 if not torch.distributed.is_initialized():
                     torch.distributed.init_process_group(backend='nccl')
@@ -32,8 +30,11 @@ class DeviceGroup:
                 self.local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE'))
                 self.local_rank = int(os.environ.get('LOCAL_RANK'))
                 self.node_rank = int(os.environ.get('GROUP_RANK'))
-                self.groups = dict()
-                torch.cuda.set_device(self.local_rank)
+
+            torch.cuda.set_device(self.local_rank)
+            self.groups: Dict = dict()
+            self.streams: Dict[str, torch.cuda.Stream] = {
+                'default': torch.cuda.default_stream()}
 
     instance = None
 
@@ -62,6 +63,14 @@ class DeviceGroup:
         if rank_bits not in self.instance.groups:
             self.groups[rank_bits] = torch.distributed.new_group(list(ranks))
         return self.groups[rank_bits]
+
+    def get_stream(self, name: str) -> torch.cuda.Stream:
+        """
+        Get stream by name. If name doesn't exist,
+        will create a new one.
+        """
+        return DeviceGroup.instance.streams.setdefault(
+            name, torch.cuda.Stream())
 
     def create_hybrid(self, group_num: List[int]) -> List[List[int]]:
         """
