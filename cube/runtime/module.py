@@ -1,3 +1,4 @@
+import logging
 from typing import List, Dict, Tuple, Optional
 import torch
 from cube.runtime.device import DeviceGroup
@@ -126,6 +127,14 @@ class CubeModule(torch.nn.Module):
         if len(state_dicts) == 1:
             return state_dicts[0][0], state_dicts[0][1]
 
+        plan_ngpus = -1
+        if 'PLAN_NGPUS' in os.environ:
+            plan_ngpus = int(os.environ['PLAN_NGPUS'])
+            assert plan_ngpus >= 1, plan_ngpus
+            assert plan_ngpus <= len(state_dicts), f'plan_ngpus = {plan_ngpus}, len(state_dicts) = {len(state_dicts)}'
+            assert len(state_dicts) % plan_ngpus == 0, f'plan_ngpus = {plan_ngpus}, len(state_dicts) = {len(state_dicts)}'
+            logging.info(f'plan_ngpus = {plan_ngpus}')
+
         # at first, merge the partitioned optimizer states due to zero to the zero-disabled format
         if zero_idx_maps is not None:
             if bool(int(os.environ.get('USE_ZERO', default=0))):
@@ -174,7 +183,7 @@ class CubeModule(torch.nn.Module):
 
                 opt_state_list = []
                 worker_cnt = len(state_dicts)
-                for work_idx in range(worker_cnt):
+                for work_idx in (range(worker_cnt) if plan_ngpus < 0 else range(plan_ngpus)):
                     model_idx2opt_idx, opt_idx2ranks = zero_idx_maps[work_idx]
                     opt_state = {}
                     for model_idx, opt_idx in model_idx2opt_idx.items():
@@ -197,6 +206,8 @@ class CubeModule(torch.nn.Module):
                     opt_state_list.append(opt_state)
                     assert len(state_dicts[work_idx][1]['param_groups']) == 1, 'only support param_groups to be one group'
             else:
+                if plan_ngpus > 0:
+                    logging.warning(f'plan_ngpus {plan_ngpus} not handled USE_ZERO == False')
                 def _check_opt_state(opt_state):
                     cnt = 0
                     sorted_opt_state = {}
@@ -232,13 +243,15 @@ class CubeModule(torch.nn.Module):
                     assert len(state_dicts[work_idx][1]['param_groups']) == 1, 'only support param_groups to be one group'
             # assign opt_state to state_dicts, cannot be assigned in the above loop
             opt_state_len = len(opt_state_list[0])
-            for work_idx in range(worker_cnt):
+            for work_idx in (range(worker_cnt) if plan_ngpus < 0 else range(plan_ngpus)):
                 state_dicts[work_idx][1]['state'] = opt_state_list[work_idx]
                 state_dicts[work_idx][1]['param_groups'][0]['params'] = sorted(opt_state_list[work_idx].keys())
                 assert len(opt_state_list[work_idx]) == opt_state_len
 
         # find tensor full shape
         param_max_dimsize = {}
+        if plan_ngpus > 0:
+            state_dicts = state_dicts[0:plan_ngpus]
         for model_state_dict, optimizer_state_dict, dist_param_map, param_area_map in state_dicts:
             for param_area in param_area_map.items():
                 local_name = param_area[0][0:param_area[0].rfind('_')]
