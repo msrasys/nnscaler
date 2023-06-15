@@ -54,3 +54,44 @@ OMP_NUM_THREADS=4 torchrun \
     --nnodes=1 \
     examples/mlp/linears.py --policy PASCol
 ```
+
+
+## Development Docstring
+
+We follow [Google Style Python Docstring](https://google.github.io/styleguide/pyguide.html) for development.
+
+Following is an typical example:
+
+```python
+class SampleClass:
+    """Summary of class here.
+
+    Longer class information...
+    Longer class information...
+
+    """
+
+    def __init__(self, likes_spam: bool = False):
+        """Initializes the instance based on spam preference.
+
+        Args:
+          likes_spam: Defines if instance exhibits this preference.
+        """
+        self.likes_spam = likes_spam
+        self.eggs = 0
+
+    def public_method(self, a, b):
+        """Performs operation blah.
+        
+        Long description here.
+
+        Args:
+            a (int): xxx
+            b (int/str): xxx
+
+        Returns:
+            t (bool): xxx
+            k (int): xxx
+        """
+        # function implementation goes here
+```
