@@ -60,6 +60,17 @@ class CompileFlag:
 
 class RuntimeFlag:
 
-    # turn execution in accumulation mode
-    # where reducers will not allpy allreduce on gradients
-    accum_mode: bool = False
+    # if True, skip model.zero_grad().
+    # when applying gradient accumulation,
+    # this flag should be set to True at the first accumulation step,
+    # and set to False at other accumulation steps.
+    # By default False, which means the gradients of parameters in the reducers
+    # will be zeroed at the beginning of every iteration.
+    skip_zero_grad: bool = False
+
+    # if True, skip reducer.sync_grads().
+    # when applying gradient accumulation,
+    # this flag should be set to True at the last accumulation step,
+    # .and set to False at other accumulation steps.
+    # By default False, which means the gradients will be reduced at the end of every iteration.
+    skip_reducer: bool = False

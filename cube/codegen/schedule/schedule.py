@@ -57,6 +57,7 @@ class ScheduleCodeGen(FuncEmission):
         with FunctionBlock(func_name='_train_step', 
                            args=args) as fb:
             fb.insert_body('_ = None')
+            fb.insert_body('model.zero_grad()')
             # body code
             if len(device_nodes) == 0:
                 fb.insert_body('pass')

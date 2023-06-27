@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import cube
 from cube.profiler.timer import print_each_rank
@@ -43,21 +43,97 @@ def load_eval_schedule(filename: Optional[str] = None):
 
 
 class accum_mode:
-    """
-    Make cube execution in accumulation mode, where weight
-    gradient allreduce will be skipped.
+    """Make cube execution in gradient accumulation mode.
 
-    need manually call `model.reduce_grads()` to reduce gradients 
-    after finish accumulation, or make `enable=False` for the last
-    accumulation step.
+    A typical usage is:
+
+    ```
+    for _ in range(num_iters):
+        for step in range(accum_steps):
+            datas = next(dataloader)
+            with cube.accum_mode(begin=(step == 0), end=(step == accum_steps - 1)):
+                train_iter(model, *datas)
+        optimizer.step()
+        optimizer.zero_grad()
+    ```
+
+    Or, 
+
+    ```
+    for _ in range(num_iters):
+        for step in cube.accum_mode.steps(accum_steps):
+            datas = next(dataloader)
+            train_iter(model, *datas)
+        optimizer.step()
+        optimizer.zero_grad()
+    ```
     """
-    def __init__(self, enable: bool = True):
-        self.enable = enable
-        self.old = None
+    def __init__(self, begin: bool = True, end: bool = True):
+        """Turn on/off accumulation mode.
+
+        Args:
+            begin (bool): Whether the iteration is the first accumulation step.
+                If True, the `model.zero_grad()` will be enabled to zero out gradients
+                of the parameters in the reducer.
+            end (bool): Whether the iteration is the last accumulation step.
+                If True, the `model.reduce_grad()` will be enabled to reduce gradients at
+                the end of the iteration. 
+        """
+        self.begin: bool = begin
+        self.end: bool = end
+        self.old: Tuple[bool, bool] = None
     
     def __enter__(self):
-        self.old = RuntimeFlag.accum_mode
-        RuntimeFlag.accum_mode = self.enable
+        """Enter the accumulation mode.
+
+        Example usage:
+        
+        ```
+        for _ in range(num_iters):
+            for step in range(accum_steps):
+                datas = next(dataloader)
+                with cube.accum_mode(begin=(step == 0), end=(step == accum_steps - 1)):
+                    train_iter(model, *datas)
+            optimizer.step()
+            optimizer.zero_grad()
+        ```
+        
+        """
+        self.old = (RuntimeFlag.skip_zero_grad, RuntimeFlag.skip_reducer)
+        RuntimeFlag.skip_zero_grad = (not self.begin)
+        RuntimeFlag.skip_reducer = (not self.end)
 
     def __exit__(self, *args):
-        RuntimeFlag.accum_mode = self.old
+        RuntimeFlag.skip_zero_grad, RuntimeFlag.skip_reducer = self.old
+        self.old = None
+
+    @staticmethod
+    def steps(nsteps: int):
+        """Perform the accumulation in `nsteps` steps.
+
+        This interface doesn't require to set the `begin` and `end` flags
+        during the initilization of `accum_mode`.
+
+        Example usage:
+
+        ```
+        for _ in range(num_iters):
+            for step in cube.accum_mode.steps(accum_steps):
+                datas = next(dataloader)
+                train_iter(model, *datas)
+            optimizer.step()
+            optimizer.zero_grad()
+        ```
+        
+        Args:
+            nsteps (int): The number of accumulation steps.
+        
+        Yield:
+            int: The current step index.
+        """
+        old = (RuntimeFlag.skip_zero_grad, RuntimeFlag.skip_reducer)
+        for step in range(nsteps):
+            RuntimeFlag.skip_zero_grad = (not (step == 0))
+            RuntimeFlag.skip_reducer = (not (step == nsteps - 1))
+            yield step
+        RuntimeFlag.skip_zero_grad, RuntimeFlag.skip_reducer = old

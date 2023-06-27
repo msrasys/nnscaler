@@ -15,7 +15,7 @@ from cube.graph.graph import IRSegment
 from cube.graph.parser.register import CustomizedOps
 
 from cube.execplan import ExecutionPlan
-from cube.execplan.execplan import ExeRepetend, ExeReuseCell
+from cube.execplan.execplan import ExeReuseCell
 
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
@@ -141,8 +141,10 @@ class ModuleCodeGen(FuncEmission):
                 if not param.is_param(): continue
                 for ctensor in graph.ctensors(param):
                     if device not in ctensor.device: continue
-                    if ctensor not in all_params and ctensor not in rest_params:
-                        rest_params.append(ctensor)
+                    if ctensor not in all_params:
+                        # a same parameter can be consumed multiple times by different operators
+                        if ctensor not in rest_params: 
+                            rest_params.append(ctensor)
             if len(rest_params) == 0:
                 continue
             # create reducer and append to the execution

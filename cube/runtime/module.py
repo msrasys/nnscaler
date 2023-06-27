@@ -28,8 +28,14 @@ class CubeModule(torch.nn.Module):
         self._reducers.append(reducer)
 
     def zero_grad(self):
-        """
-        Make zero for gradients caused by async weight reducer
+        """Make zero for gradients in weight reducer
+
+        This only applies on the gradients of the parameters in each reducer.
+        This function will be automatically inserted inside the generated code
+        at the beginning of each iteration.
+
+        If the function is under the context of `with cube.accum_mode()`, the zero of gradients
+        will be skipped.
         """
         for reducer in self._reducers:
             reducer.zero_grad()

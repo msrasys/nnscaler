@@ -2,18 +2,11 @@
 example:
 
 ASYNC_REDUCER=0 USE_ZERO=1 OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 \
-    tests/runtime/test_reducer.py
-
-ASYNC_REDUCER=0 USE_ZERO=0 OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 \
-    tests/runtime/test_reducer.py
-
-ASYNC_REDUCER=1 USE_ZERO=1 OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 \
-    tests/runtime/test_reducer.py
-
-ASYNC_REDUCER=1 USE_ZERO=0 OMP_NUM_THREADS=4 torchrun --nproc_per_node=4 \
-    tests/runtime/test_reducer.py
+    tests/runtime/test_runtime_flag.py
 """
+
 from typing import List
+from functools import partial
 
 import torch
 import random
@@ -23,6 +16,7 @@ import cube
 from cube.graph import IRGraph
 from cube.ir.operator import IRDataOperation, IRFwOperation
 from cube.profiler.timer import print_each_rank
+# from cube.tools.debug import DebugTool
 
 cube.init()
 
@@ -108,48 +102,43 @@ def policy(graph: IRGraph, resource):
     return graph
 
 
-def cal_gnorms(model):
-    """Calculate gradient normalization for gradients"""
-    gnorms = []
-    for p in model.parameters():
-        if p.grad is None:
-            continue
-        gnorms.append(p.grad.norm().item())
-    return sum(gnorms)
-
-
 def get_baseline():
 
     model, dataloader = init_model_dataloader()
     model = model.cuda()
+    # optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+    # optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
-    # optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
 
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
         loss.backward()
         return loss
+    
+    wsz = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+
+    accum_steps = 4
 
     niters = 4
-    losses, gnorms = [], []
-    for _ in range(niters):
-        loss = train_iter(model, dataloader)
-        gnorms.append(cal_gnorms(model))
+    losses = []
+    for idx in range(niters):
+        for _ in range(accum_steps):
+            loss = train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         losses.append(loss.item())
-    return losses, gnorms
+    
+    for idx, loss in enumerate(losses):
+        print_each_rank(f'baseline loss[{idx}]: {loss}', rank_only=0)
 
 
-def test_reducer():
-
-    losses, gnorms = get_baseline()
-    for idx, (loss, gnorm) in enumerate(zip(losses, gnorms)):
-        print_each_rank(f'baseline step [{idx}]: loss: {loss} | gnorm: {gnorm}', rank_only=0)
+def test_runtime_accum_mode_v1():
 
     model, dataloader = init_model_dataloader()
-
+    model = model.cuda()
+    
     @cube.compile(model, dataloader, PAS=policy)
     def train_iter(model, dataloader):
         data = next(dataloader)
@@ -158,30 +147,32 @@ def test_reducer():
         return loss
     
     model = cube.load_model()
+    # optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+    # optimizer = torch.optim.SGD(model.parameters_for_optimizer(), lr=1e-4)
     optimizer = torch.optim.Adam(model.parameters_for_optimizer(), lr=1e-5)
 
+    accum_steps = 4
+
     niters = 4
-    losses, gnorms = [], []
+    losses = []
     for idx in range(niters):
-        loss = train_iter(model, dataloader)
-        gnorms.append(cal_gnorms(model))
+        for step in cube.accum_mode.steps(accum_steps):
+            # print(f'enter step {step}')
+            loss = train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
         model.gather_params()
         losses.append(loss.item())
+    
+    for idx, loss in enumerate(losses):
+        print_each_rank(f'reducer loss[{idx}]: {loss}', rank_only=0)
 
-    for idx, (loss, gnorm) in enumerate(zip(losses, gnorms)):
-        print_each_rank(f'reducer step [{idx}]: loss: {loss} | gnorm: {gnorm}', rank_only=0)
 
-
-def test_reducer_hooks():
-
-    losses, gnorms = get_baseline()
-    for idx, (loss, gnorm) in enumerate(zip(losses, gnorms)):
-        print_each_rank(f'baseline step [{idx}]: loss: {loss} | gnorm: {gnorm}', rank_only=0)
+def test_runtime_accum_mode_v2():
 
     model, dataloader = init_model_dataloader()
-
+    model = model.cuda()
+    
     @cube.compile(model, dataloader, PAS=policy)
     def train_iter(model, dataloader):
         data = next(dataloader)
@@ -190,29 +181,30 @@ def test_reducer_hooks():
         return loss
     
     model = cube.load_model()
+    # optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+    # optimizer = torch.optim.SGD(model.parameters_for_optimizer(), lr=1e-4)
     optimizer = torch.optim.Adam(model.parameters_for_optimizer(), lr=1e-5)
 
-    for reducer in model.reducers:
-        pre_hook = lambda grad: grad.div_(len(reducer.ranks))
-        post_hook = lambda grad: grad.mul_(len(reducer.ranks))
-        reducer.register_pre_hook(pre_hook)
-        reducer.register_post_hook(post_hook)
+    accum_steps = 4
 
     niters = 4
-    losses, gnorms = [], []
+    losses = []
     for idx in range(niters):
-        loss = train_iter(model, dataloader)
-        gnorms.append(cal_gnorms(model))
+        for step in range(accum_steps):
+            # print(f'enter step {step}')
+            with cube.accum_mode(start=(step==0), end=(step==accum_steps-1)):
+                loss = train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
         model.gather_params()
         losses.append(loss.item())
-
-    for idx, (loss, gnorm) in enumerate(zip(losses, gnorms)):
-        print_each_rank(f'reducer step [{idx}]: loss: {loss} | gnorm: {gnorm}', rank_only=0)
+    
+    for idx, loss in enumerate(losses):
+        print_each_rank(f'reducer loss[{idx}]: {loss}', rank_only=0)
 
 
 if __name__ == '__main__':
 
-    # test_reducer()
-    test_reducer_hooks()
+    get_baseline()
+    test_runtime_accum_mode_v1()
+    # test_runtime_accum_mode_v2()

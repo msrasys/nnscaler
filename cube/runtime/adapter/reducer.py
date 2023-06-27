@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple, Any, Callable, Optional
+from typing import List, Dict, Tuple, Any, Callable, Optional, Set
 from functools import partial
 import warnings
 import torch
@@ -28,8 +28,12 @@ def _get_reduce_op(reduce_op: str) -> torch.distributed.ReduceOp:
 
 class Bucket:
 
-    # config: whether to use allreduce for zero (default: reduce-scatter)
-    use_allreduce_for_zero: bool = False
+    # config: whether to use reduce scatter for zero (default False).
+    # By default we use `allreduce` for zero, which is due to
+    # 1) `reduce_scatter` will make some parameters have stale gradient after synchronization,
+    #    hence break the consistency of `.data` and `.grad` of parameters. Need to be careful when using optimizer.
+    # 2) `reduce_scatter`` doesn't significantly improve performance comparing with `allreduce`.
+    use_reduce_scatter_for_zero: bool = False
 
     def __init__(self, params: List[torch.nn.Parameter],
                  param_buffer: torch.Tensor, grad_buffer: torch.Tensor,
@@ -70,6 +74,10 @@ class Bucket:
         # total number of parameters
         self._numel: int = sum(p.numel() for p in self._params)
         self._padding: int = self._contiguous_grads.size(0) - self._numel
+
+        # pre and post hooks for gradient synchronization
+        self._pre_hooks: List[Callable] = []
+        self._post_hooks: List[Callable] = []
 
         # only async will enable contiguous gradient
         self.build()
@@ -127,14 +135,11 @@ class Bucket:
         def post_grad_hook(param: torch.nn.Parameter, *unused):
             # stream = DeviceGroup().get_stream('reducer')
             ofst = self._pofset[param]
-            # due to **unknown** reasons, multi-stream computation has incorrect results
-            # with torch.cuda.stream(stream):  # async update to overlap backward computation
             # TODO: need to handle sparse gradients in torch.nn.Embedding
-            # print('yizhu1', param.requires_grad, param.size(), param.data_ptr)
             self._contiguous_grads[ofst:ofst+param.numel()].add_(param.grad.data.view(-1))
             param.grad = None
 
-            if RuntimeFlag.accum_mode: return
+            if RuntimeFlag.skip_reducer: return
 
             self._cnt += 1
             assert self._cnt <= len(self._params), \
@@ -142,19 +147,15 @@ class Bucket:
 
             # perform all-reduce
             if self._async and self._cnt == len(self._params):
-                # wait until all gradients are accumulated in the gradient buffer
-                # stream.synchronize()
-                if self._zero:  # zero will use reduce-scatter (default) or allreduce on gradient shards
-                    if Bucket.use_allreduce_for_zero:
-                        self._work = torch.distributed.all_reduce(
-                            self._contiguous_grads, op=self._reduce_op,
-                            group=self._group, async_op=True)
-                    else:
-                        rank = torch.distributed.get_rank(group=self._group)
-                        shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
-                        self._work = torch.distributed.reduce_scatter(
-                            shards[rank], shards, op=self._reduce_op,
-                            group=self._group, async_op=True)
+                # apply pre hooks
+                self._apply_pre_hooks()
+                # communication
+                if self._zero and Bucket.use_reduce_scatter_for_zero:
+                    rank = torch.distributed.get_rank(group=self._group)
+                    shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
+                    self._work = torch.distributed.reduce_scatter(
+                        shards[rank], shards, op=self._reduce_op,
+                        group=self._group, async_op=True)
                 else:
                     self._work = torch.distributed.all_reduce(
                         self._contiguous_grads, op=self._reduce_op,
@@ -186,17 +187,14 @@ class Bucket:
             assert self._work is not None
             self._work.wait()
         else:
-            if self._reduce_op == torch.distributed.ReduceOp.SUM:
-                self._contiguous_grads.div_(torch.distributed.get_world_size(group=self._group))
             CudaTimer().start('comm', predefined=True)
-            if self._zero:
-                if Bucket.use_allreduce_for_zero:
-                    torch.distributed.all_reduce(
-                        self._contiguous_grads, op=self._reduce_op, group=self._group)
-                else:
-                    shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
-                    torch.distributed.reduce_scatter(
-                        shards[rank], shards, op=self._reduce_op, group=self._group)
+            # apply pre-hooks
+            self._apply_pre_hooks()
+            # synchrnoize gradients
+            if self._zero and Bucket.use_reduce_scatter_for_zero:
+                shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
+                torch.distributed.reduce_scatter(
+                    shards[rank], shards, op=self._reduce_op, group=self._group)
             else:
                 torch.distributed.all_reduce(
                     self._contiguous_grads, op=self._reduce_op, group=self._group)
@@ -206,11 +204,7 @@ class Bucket:
             assert param.grad is None
             pofst = self._pofset[param]
             param.grad = self._contiguous_grads[pofst:pofst+param.numel()].view(param.size())
-            # the following two methods can make `.grad` isolate with `self._contiguous_grads`,
-            # thereby enabling torch.zero_ inside the reducer without requiring user to modify.
-            # param.grad = grads[pofst:pofst+param.numel()].view(param.size())
-            # param.grad = self._contiguous_grads[pofst:pofst+param.numel()].clone().view(param.size())
-        
+
         # setup gradient for optimizer parameters
         if self._zero:
             grad = self._contiguous_grads.chunk(self._wsz, dim=0)[rank]
@@ -220,6 +214,9 @@ class Bucket:
         else:
             self._param_for_optimizer.grad = self._contiguous_grads[:self._numel]
 
+        # apply post-hooks
+        self._apply_post_hooks()
+
     def gather_params(self):
         """
         All-gather parameters
@@ -228,6 +225,56 @@ class Bucket:
         rank = torch.distributed.get_rank(group=self._group)
         shards = list(self._contiguous_params.chunk(self._wsz, dim=0))
         torch.distributed.all_gather(shards, shards[rank], group=self._group)
+
+    def register_pre_hook(self, fn: Callable):
+        """Register pre hooks to be applied before gradient synchronization.
+
+        The pre-hooks will be applied one by one following the order of registration.
+
+        Args:
+            fn (Callable): a callable function that takes a gradient as input and optionally updates the gradient.
+        """
+        assert callable(fn), f"fn must be callable for pre hooks, but got {type(fn)}"
+        self._pre_hooks.append(fn)
+
+    def register_post_hook(self, fn: Callable):
+        """Register post hooks to be applied after gradient synchronization.
+
+        The post-hooks will be applied one by one following the order of registration.
+
+        Args:
+            fn (Callable): a callable function that takes a gradient as input and optionally updates the gradient.
+        """
+        assert callable(fn), f"fn must be callable for post hooks, but got {type(fn)}"
+        self._post_hooks.append(fn)
+
+    def _apply_pre_hooks(self):
+        """Apply pre hooks before gradient synchronization.
+
+        The pre-hooks will be applied one by one following the order of registration.
+        """
+        if len(self._pre_hooks) == 0: return
+        grads = self._contiguous_grads[:self._numel]
+        for hook in self._pre_hooks:
+            hook(grads)
+
+    def _apply_post_hooks(self):
+        """Apply post hooks after gradient synchronization.
+        
+        The post-hooks will be applied one by one following the order of registration.
+        """
+        if len(self._post_hooks) == 0: return
+        grads = self._contiguous_grads[:self._numel]
+        for hook in self._post_hooks:
+            hook(grads)
+
+    def clear_pre_hooks(self):
+        """Clear all pre hooks."""
+        self._pre_hooks = []
+    
+    def clear_post_hooks(self):
+        """Clear all post hooks."""
+        self._post_hooks = []
 
     def reset(self):
         """Reset status."""
@@ -252,6 +299,7 @@ class Reducer:
         @param zero bool: whether to apply zero optimization on gradients
         """
         self._params: List[torch.nn.Parameter] = list()
+        self._param_ids: Set[int] = set()
         self._numel: int = 0
         self._ranks = ranks
         self._group = DeviceGroup().get_group(ranks)
@@ -264,8 +312,6 @@ class Reducer:
         # contiguous parameter buffer and gradient buffer
         self._contiguous_params: torch.Tensor = None
         self._contiguous_grads: torch.Tensor = None
-        # hooks
-        self._hooks: List[Callable] = []
 
     @property
     def params(self) -> Tuple[torch.nn.Parameter]:
@@ -289,6 +335,11 @@ class Reducer:
     def buckets(self) -> Tuple[Bucket]:
         return tuple(self._buckets)
 
+    @property
+    def reduce_op(self) -> torch.distributed.ReduceOp:
+        """Get reduce operation"""
+        return self._reduce_op
+
     def add_param(self, param: torch.nn.Parameter):
         """
         Add a parameter to the reducer
@@ -299,7 +350,13 @@ class Reducer:
 
         @param param torch.nn.Parameter: the added parameter
         """
+        if param.data.data_ptr() in self._param_ids:
+            warnings.warn(
+                f'rank [{torch.distributed.get_rank()}]: detected duplicated or shared parameters, ignored.',
+                category=RuntimeWarning)
+            return
         self._params.append(param)
+        self._param_ids.add(param.data.data_ptr())
         self._numel += param.numel()
 
     def build_buckets(self):
@@ -393,26 +450,25 @@ class Reducer:
         """
         synchronize gradients using allreuce (non-zero) or reduce-scatter (zero)
         """
-        if RuntimeFlag.accum_mode: return
+        if RuntimeFlag.skip_reducer: return
         for bucket in self._buckets:
             bucket.sync_grads()
-        self._apply_post_hooks()
 
     def gather_params(self):
+        """Gather parameters with Zero optimizations after `optimizer.step()`.
+
+        This is required when zero optimization is turned on.
         """
-        Gather parameters
-        """
-        if RuntimeFlag.accum_mode: return
-        assert self._zero, "gathering paramters is only for zero optimization."
+        if not self._zero: return
         for bucket in self._buckets:
             bucket.gather_params()
 
     def zero_grad(self):
+        """Make gradient to be zero.
+        
+        This needs to be called at the beginning of every training iteration.
         """
-        Make gradient to be zero. This needs to be called
-        after `optimizer.step()` if `optmizer.zero_grad(set_to_none=True)`.
-        """
-        if RuntimeFlag.accum_mode: return
+        if RuntimeFlag.skip_zero_grad: return
         torch.cuda.synchronize()
         self._contiguous_grads.zero_()
         for bucket in self._buckets:
@@ -438,6 +494,30 @@ class Reducer:
             torch.distributed.broadcast(param, self.ranks[0], group=self._group)
         torch.cuda.synchronize()
 
+    def register_pre_hook(self, fn: Callable):
+        """Register a pre hook function before gradient update.
+
+        A reducer can be registered by multiple hooks and the hooks will be
+        applied in the order of registration.
+        
+        The hook function takes a contiguous buffer of local computed gradient
+        and can optionally apply in-place operations on it.
+
+        Example:
+
+        ```
+        hook = lambda grad: grad.div_(4)
+        reducer.register_pre_hook(hook)
+        ```
+
+        Args:
+            fn Callable:
+                hook function that takes a gradient as input and optionally inplacemently updates it
+        """
+        assert callable(fn), f"pre hook function must be callable, but got {type(fn)}"
+        for bucket in self._buckets:
+            bucket.register_pre_hook(fn)
+
     def register_post_hook(self, fn: Callable):
         """
         Register a post hook function after gradient update.
@@ -445,7 +525,7 @@ class Reducer:
         A reducer can be registered by multiple hooks and the hooks will be
         applied in the order of registration.
         
-        The hook function takes a contiguous buffer of updated gradients
+        The hook function takes a contiguous buffer of updated gradient
         and can only apply in-place operations on it.
 
         Example:
@@ -455,26 +535,20 @@ class Reducer:
         reducer.register_post_hook(hook)
         ```
 
-        @param fn Callable: hook function that takes a gradient buffer as input
+        Args:
+            fn Callable:
+                hook function that takes a gradient as input and optionally inplacemently updates it
         """
         assert callable(fn), f"post hook function must be callable, but got {type(fn)}"
-        self._hooks.append(fn)
+        for bucket in self._buckets:
+            bucket.register_post_hook(fn)
 
-    def _apply_post_hooks(self):
-        """
-        Apply registered post hooks one by one after gradient update
-        """
-        if len(self._hooks) == 0: return
-        # get updated gradients
-        grads = tuple(bucket._param_for_optimizer.grad for bucket in self._buckets)
-        assert all(grad is not None for grad in grads)
-        # apply hooks
-        for grad in grads:
-            for hook in self._hooks:
-                hook(grad)
+    def clear_pre_hooks(self):
+        """Clear all pre hooks."""
+        for bucket in self._buckets:
+            bucket.clear_pre_hooks()
 
     def clear_post_hooks(self):
-        """
-        Clear all post hooks
-        """
-        self._hooks = []
+        """Clear all post hooks."""
+        for bucket in self._buckets:
+            bucket.clear_post_hooks()
