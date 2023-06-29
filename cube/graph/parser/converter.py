@@ -53,12 +53,8 @@ def convert_model(model: torch.nn.Module,
                     model,
                     dummy_input,
                     use_operator_patch=True,
-                    autowrap_leaf_class={
-                        torch.finfo: ((), False),
-                        # type(output_origin): ((), False),
-                    },
                     leaf_module=leaf_module,
-                    fake_device_type='cpu',
+                    cpu_offload=True,
                 )
         else:
             print('using torchscript tracer')
