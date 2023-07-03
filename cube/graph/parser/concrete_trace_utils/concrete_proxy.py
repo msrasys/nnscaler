@@ -188,6 +188,10 @@ class ConcreteProxy(Proxy):
         # should only be in dict getitem
         return hash(self.value)
 
+    def __contains__(self, item) -> bool:
+        # should only be in iterable
+        return self.value.__contains__(item)
+
     @compatibility(is_backward_compatible=True)
     def keys(self):
         # to detect if in executing `**proxy`

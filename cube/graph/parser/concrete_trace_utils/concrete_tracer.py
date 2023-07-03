@@ -11,6 +11,7 @@ import logging
 import operator
 import functools
 import builtins
+from packaging import version 
 
 from itertools import chain
 from types import BuiltinMethodType, FunctionType, MethodDescriptorType, MethodType, MethodWrapperType, ModuleType
@@ -134,6 +135,17 @@ _side_effectful_functions = _side_effectful_functions.union(extra_side_effectful
 # pyright: reportGeneralTypeIssues=false
 _logger = logging.getLogger(__name__)
 HAS_VARSTUFF = inspect.CO_VARARGS | inspect.CO_VARKEYWORDS
+
+
+def is_autograd_apply(func) -> bool:
+    # FIXME: version need check
+    if version.parse(torch.__version__) >= version.parse('2.0'):
+        return getattr(func, '__name__', None) == 'apply' \
+            and _orig_isinstance(getattr(func, '__self__', None), Type) and issubclass(func.__self__, torch.autograd.Function)
+    else:
+        return _orig_isinstance(func, BuiltinMethodType) and getattr(func, '__name__', None) == 'apply'\
+            and _orig_isinstance(getattr(func, '__self__', None), Type) and issubclass(func.__self__, torch.autograd.Function)
+
 
 @compatibility(is_backward_compatible=True)
 class ConcreteTracer(TracerBase):
@@ -773,19 +785,24 @@ class ConcreteTracer(TracerBase):
                     attr_val = _orig_module_getattribute(mod, attr)
                 except AttributeError:
                     attr_val = _orig_module_getattr(mod, attr)
-            if callable(attr_val):
+            if _orig_isinstance(attr_val, ep.ConcreteProxy):
+                warn_msg = f'Detected {self.the_path_of_middle_class[id(mod)]}.{attr} is a ConcreteProxy, ' + \
+                    'this is usually caused by directly assigning the return value of some leaf function to the attribute of the module. ' + \
+                    'Please note that this writing method may cause some trace errors.'
+                _logger.warning(warn_msg)
+            if callable(attr_val) and not _orig_isinstance(attr_val, ep.ConcreteProxy):
                 if attr_val in self.wrapped_leaf:
                     return self.wrapped_leaf[attr_val][1]
                 return attr_val
-            elif attr in self.default_module_getattr:
-                path = self.the_path_of_middle_class[id(mod)]
-                path = path + '.' if path else ''
-                return self.create_proxy('get_attr', f'{path + attr}', (), {})
-            elif _orig_isinstance(attr_val, (_orig_tuple, _orig_list)):
+            # using isinstance instead of _orig_isinstance to judge whether
+            # the ConcreteProxy.value is the following three types if the attr_val is a ConcreteProxy
+            elif isinstance(attr_val, (_orig_tuple, _orig_list)):
                 if self.the_path_of_middle_class[id(mod)] == '':
                     return self.create_proxy('get_attr', f'{attr}', (), {})
                 else:
                     return self.create_proxy('get_attr', f'{self.the_path_of_middle_class[id(mod)]}.{attr}', (), {})
+            elif attr in self.default_module_getattr:
+                return self.create_proxy('get_attr', f'{self.the_path_of_middle_class[id(mod)]}.{attr}', (), {})
             elif id(attr_val) in self.the_path_of_parameter:
                 return self.create_proxy('get_attr', self.the_path_of_parameter[id(attr_val)], (), {})
             elif id(attr_val) in self.the_path_of_buffer:
@@ -932,8 +949,7 @@ class ConcreteTracer(TracerBase):
         self.wrapped_leaf = dict()
 
         for func, (positions, is_force_trace, to_func) in self.autowrap_leaf_function.items():
-            if _orig_isinstance(func, BuiltinMethodType) and getattr(func, '__name__', None) == 'apply'\
-                and _orig_isinstance(getattr(func, '__self__', None), Type) and issubclass(func.__self__, torch.autograd.Function):
+            if is_autograd_apply(func):
                 # torch.autograd.function
                 assert to_func == None, '<subclass of torch.autograd.Function>.apply should set to_func to None!'
                 if func.__self__ not in self.agfunc_dict:
@@ -953,7 +969,8 @@ class ConcreteTracer(TracerBase):
                         wrapped = _create_wrapped_leaf_func(self, func, to_func)
                 elif _orig_isinstance(func, (MethodDescriptorType, MethodWrapperType)):
                     wrapped = _create_wrapped_leaf_method(self, func, func.__name__, to_func)
-                elif func.__name__ != func.__qualname__ and func.__qualname__ != 'boolean_dispatch.<locals>.fn':
+                elif func.__name__ != func.__qualname__ and func.__qualname__ != 'boolean_dispatch.<locals>.fn' \
+                    and not func.__qualname__.startswith('PyCapsule'):
                     # method
                     if func.__module__.startswith('_') and func.__module__ != '__main__':
                         path = sys.modules[func.__module__[1:]]
@@ -1165,8 +1182,7 @@ def _autowrap_check(tracer: ConcreteTracer, frame_dict : Dict[str, Any], functio
                     patcher.patch(frame_dict, name, _create_wrapped_func(value))
                 elif id(value) in function_pairs:
                     patcher.patch(frame_dict, name, function_pairs[id(value)])
-                elif _orig_isinstance(value, BuiltinMethodType) and getattr(value, '__name__', None) == 'apply'\
-                    and _orig_isinstance(getattr(value, '__self__', None), Type) and issubclass(value.__self__, torch.autograd.Function):
+                elif is_autograd_apply(value):
                     # torch.autograd.function
                     if value.__self__ not in agfunc_dict:
                         agfunc_dict[value.__self__] = _create_wrapped_leaf_func(tracer, value, value)
@@ -1248,15 +1264,14 @@ class MagicMethodPatcher:
     def find_module_of_method_new(orig_method: Callable[..., Any]) -> str:
         name = orig_method.__name__
         module = orig_method.__module__
+        if is_autograd_apply(orig_method):
+            # for torch.autograd.Function
+            return f'{orig_method.__self__.__module__}.{orig_method.__self__.__name__}'
         if module is not None:
             return module
         elif hasattr(orig_method, '__qualname__')\
             and isinstance(orig_method.__qualname__, str) and orig_method.__qualname__.startswith('_VariableFunctionsClass.'):
             return 'torch._C._VariableFunctions'
-        elif hasattr(orig_method, '__self__')\
-            and isinstance(orig_method.__self__, Type) and issubclass(orig_method.__self__, torch.autograd.Function):
-            # for torch.autograd.Function
-            return f'{orig_method.__self__.__module__}.{orig_method.__self__.__name__}'
         for guess in [torch, getattr(torch.nn, 'functional')]:
             if getattr(guess, name, None) is orig_method:
                 return guess.__name__
@@ -1264,8 +1279,7 @@ class MagicMethodPatcher:
 
     @staticmethod
     def format_import_statement_new(name: str, obj: Any, importer) -> str:
-        if isinstance(obj, BuiltinMethodType) and getattr(obj, '__name__', None) == 'apply'\
-            and isinstance(getattr(obj, '__self__', None), Type) and issubclass(obj.__self__, torch.autograd.Function):  # type: ignore
+        if is_autograd_apply(obj):  # type: ignore
             # torch.autograd.function
             return MagicMethodPatcher.format_import_statement_ori(name, obj.__self__, importer) + f'\n{name} = {name}.apply'
         return MagicMethodPatcher.format_import_statement_ori(name, obj, importer)
@@ -1635,10 +1649,8 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
             if node_a.op == 'get_attr' and node_a.name.startswith('_tensor_constant'):
                 assert node_b.op == 'get_attr' and node_b.name.startswith('_tensor_constant')
                 assert torch.equal(getattr(root, node_a.name), getattr(root, node_b.name))
-            elif node_a.op == 'call_function' and isinstance(target_a, Callable) and target_a.__name__ == 'apply' and\
-                hasattr(target_a, '__self__') and issubclass(target_a.__self__, torch.autograd.Function):
-                assert node_b.op == 'call_function' and isinstance(target_b, Callable) and target_b.__name__ == 'apply' and\
-                hasattr(target_b, '__self__') and issubclass(target_b.__self__, torch.autograd.Function)
+            elif node_a.op == 'call_function' and is_autograd_apply(target_a):
+                assert node_b.op == 'call_function' and is_autograd_apply(target_b)
             else:
                 assert node_a.op == node_b.op and target_a == target_b, f'op: {node_a.op} vs {node_b.op}, target: {target_a} vs {target_b}'
 
