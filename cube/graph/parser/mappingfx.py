@@ -60,6 +60,7 @@ class SignFx2Op:
         __ttemplate('exp'): function.Exp,
         __ttemplate('sqrt'): function.Sqrt,
         __ttemplate('clamp'): function.Clamp,
+        __ttemplate('clamp_min'): function.ClampMin,
         __ttemplate('squeeze'): function.Squeeze,
         __ttemplate('unsqueeze'): function.Unsqueeze,
         __tttemplate('type_as'): function.TypeAs,
@@ -89,6 +90,7 @@ class SignFx2Op:
         __ttemplate('permute'): function.Permute,
         __ttemplate('transpose'): function.Transpose,
         __tttemplate('expand'): function.Expand,
+        __tttemplate('expand_as'): function.ExpandAs,
         __ttemplate('arange'): function.Arange,
         __ttemplate('detach'): function.Detach,
         __ttemplate('_shape_as_tensor'): function.ShapeAsTensor,
@@ -102,7 +104,7 @@ class SignFx2Op:
         __ftemplate('embedding'): function.Embedding,
         'torch.functional.einsum': function.EinSum,
         __ftemplate('nll_loss') : function.NLLLoss,
-
+        'torch.functional.norm': function.Norm,
         __ftemplate('layer_norm'): function.LayerNorm,
         'apex.normalization.fused_layer_norm.FusedLayerNorm': function.FusedLayerNorm,
 
@@ -116,6 +118,7 @@ class SignFx2Op:
 
         # # torch nn functional
         '_operator.matmul': function.Matmul,
+        'torch.mm': function.Matmul,
         __ttemplate('matmul'): function.Matmul,
         #
         # __ftemplate('gelu') : function.GeLU,

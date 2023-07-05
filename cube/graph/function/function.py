@@ -11,7 +11,7 @@ from cube.ir.cten import IRTensor, IRObject
 from cube.ir.tensor import IRSubTensor, IRFullTensor
 from cube.ir.dtype import IRDType
 from cube.graph.function.pyfunc import IRPyFunc
-from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
+from cube.graph.function.dimops import DimAnno, DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
 from cube.graph.function.conv import IRPad, IRConv2D, IRConv3D
 from cube.graph.function.anchor import IRGraphAnchor
 
@@ -211,7 +211,7 @@ def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
     anno, rules = _get_creator_anno_rules(size, True)
     dimop = IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs)
     from cube.graph.parser.dtype import DType2IRDType
-    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    dimop.output(0).parent.dtype = dtype if isinstance(dtype, IRDType) else DType2IRDType.map(dtype)
     return dimop
 
 
@@ -332,6 +332,10 @@ def Expand(input, *sizes, signature = None):
     edim_ou = copy.copy(edim_in)
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
     return IRDimops(Expand, 'expand', signature, [anno], [input], sizes=sizes)
+
+
+def ExpandAs(input, other, signature = None):
+    return Expand(input, *other.shape, signature = signature)
 
 
 def Clone(input, *, memory_format=None, signature = None):
@@ -527,6 +531,10 @@ def Clamp(input, min=None, max=None, *, out=None, signature = None):
     return IRDimops(Clamp, 'clamp', signature, annos, [input], min=min, max=max)
 
 
+def ClampMin(input, min, *, out=None, signature = None):
+    return Clamp(input, min=min, out=out, signature='torch.clamp')
+
+
 def Softmax(input, dim=None, _stacklevel=3, dtype=None, signature = None):
     """
     torch.nn.functional.softmax(input, dim=None, _stacklevel=3, dtype=None)
@@ -720,6 +728,37 @@ def FusedLayerNorm(input, weight, bias, normalized_shape, eps=1e-5, signature = 
     kwargs['normalized_shape'] = normalized_shape
     kwargs['eps'] = eps
     return IRDimops(FusedLayerNorm, 'fusedlayernorm', signature, [anno], inputs, **kwargs)
+
+
+def Norm(input, p='fro', dim=None, keepdim=False, out=None, dtype=None, signature=None):
+    assert dtype is None, "Currently Norm only support dtype=None"
+    einput = ShapeAnno.create_shape_str(input.shape)
+    eoutput = copy.copy(einput)
+    kwargs = {
+        'p': p,
+        'dim': dim,
+        'keepdim': keepdim,
+        'out': out,
+        'dtype': dtype,
+    }
+    if dim is None:
+        einput = [edim + '^' for edim in einput]
+        anno = OpAnno.create_op_str([einput], ['1'])
+        return IRDimops(Norm, 'norm', signature, [anno], [input], **kwargs)
+    else:
+        dim = (dim,) if isinstance(dim, int) else dim
+        for dimidx in dim:
+            einput[dimidx] += '^'
+        if keepdim:
+            for dimidx in dim:
+                eoutput[dimidx] = '1'
+        else:
+            sort_dim = list(dim)
+            sort_dim.sort()
+            for dimidx in sort_dim[::-1]:
+                eoutput.pop(dimidx)
+        anno = OpAnno.create_op_str([einput], [eoutput])
+        return IRDimops(Norm, 'norm', signature, [anno], [input], **kwargs)
 
 
 def Sum(input, dim=None, keepdim=False, *, dtype=None, signature = None):
@@ -1717,7 +1756,6 @@ def To(tensor: IRTensor, dtype_or_device, *, out=None, signature = None):
         return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype)
     else:
         raise RuntimeError(f'function.To with unknown arg: {dtype_or_device}')
-
 
 
 def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
