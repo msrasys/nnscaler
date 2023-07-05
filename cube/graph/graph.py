@@ -22,6 +22,7 @@ from cube.ir.dtype import IRDType, DTypeInferRule
 from cube.graph.function.function import Identity
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.function.pyfunc import IRPyFunc
+from cube.graph.function.dimops import IRDimops, OpAnno
 from cube.graph.segment import IRSegment
 
 from cube.algorithm.generics import GenericDistAlgo
@@ -430,6 +431,83 @@ class IRGraph(IRSegment):
         bsegment.replace(node.mirror, bnodes)
 
         return fnodes
+
+    def fuse(self, nodes: List[IRFwOperation],
+             signature: Optional[str] = None,
+             args: Optional[List[IRObject]] = None, kwargs: Optional[Dict[str, Any]] = None) -> IRDimops:
+        """Fuse primitive.
+
+        Fuse a list of forward operators into a single operator.
+        The backward operators will be fused automatically.
+
+        Note:
+            1) fusion can by applied for consecutive operators on the same device (developer-level call).
+            2) fusion can be applied before any node paritioning or after generation of adapters (system-level call).
+
+        Args:
+            nodes (List[IRFwOperation]): the operators to fuse.
+            signature (Optional[str], optional):
+                the signature of the fused operator. If not provided, the fusion will perform a simple grouping of operators,
+                where the underlying runtime still call the unfused kernel one by one. If the signature is provided,
+                the fusion will generate an IRDimops calling `signature`, which is expected to be a function signature
+                of the fused operator. Defaults to None.
+            args (Optional[List[IRObject]], optional): the arguments of the fused operator. Defaults to None.
+            kwargs (Optional[Dict[str, Any]], optional): the keyword arguments of the fused operator. Defaults to None.
+
+        Returns:
+            IRDimops: the fused operator.
+        """
+        assert len(nodes) > 0, "Cannot fuse empty list of nodes"
+        assert all([isinstance(node, IRFwOperation) for node in nodes]), \
+            "Only forward operators are allowed to fuse"
+        indices = [self.index(node) for node in nodes]
+        assert max(indices) - min(indices) + 1 == len(nodes), \
+            "Only consecutive operators can be fused"
+
+        segment: IRSegment = self.create_segment(nodes)
+        # get inputs where tensors should appear in the front.
+        inputs = list(segment.inputs())
+        attributes = [segment.ctensors(attr)[0] for attr in segment.attributes()]
+        inputs += attributes
+        inputs = [t for t in inputs if isinstance(t, IRTensor)] + [t for t in inputs if not isinstance(t, IRTensor)]
+        # get outputs
+        outputs = list(segment.outputs())
+
+        if args is not None:
+            assert len(inputs) == len(args) and set(inputs) == set(args), \
+                "inputs don't match"
+            inputs = args
+        kwargs = {} if kwargs is None else kwargs
+
+        # create annotation. TODO: support partition
+        in_shapes = [[str(dimlen) for dimlen in t.shape] for t in inputs if isinstance(t, IRTensor)]
+        ou_shapes = [[str(dimlen) for dimlen in t.shape] for t in outputs if isinstance(t, IRTensor)]
+        anno: str = OpAnno.create_op_str(in_shapes, ou_shapes)
+
+        if signature is None:
+            assert False, "TODO: register function"
+        
+        if len(nodes) < 4:
+            name = '_'.join(['fused'] + [node.name for node in nodes])
+        else:
+            name = '_'.join(['fused'] + [node.name for node in nodes[:3]] + ['etc'])
+
+        def fuse_ops(*args, **kwargs) -> IRDimops:
+            return IRDimops(fuse_ops, name, signature, [anno], args, **kwargs)
+        
+        fuse_op = fuse_ops(*inputs, **kwargs)
+        for idx, output in enumerate(outputs):
+            fuse_op.set_output(idx, output)
+        
+        # setup device
+        if len(nodes[0].device) != 0:
+            fuse_op.device = nodes[0].device
+        
+        # replace
+        segment = self.segment(nodes[0])
+        segment.replace(nodes, [fuse_op])
+
+        return fuse_op
 
     ## Spatial Primitives ##
 
