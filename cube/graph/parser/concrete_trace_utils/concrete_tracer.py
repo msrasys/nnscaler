@@ -138,13 +138,8 @@ HAS_VARSTUFF = inspect.CO_VARARGS | inspect.CO_VARKEYWORDS
 
 
 def is_autograd_apply(func) -> bool:
-    # FIXME: version need check
-    if version.parse(torch.__version__) >= version.parse('2.0'):
-        return getattr(func, '__name__', None) == 'apply' \
-            and _orig_isinstance(getattr(func, '__self__', None), Type) and issubclass(func.__self__, torch.autograd.Function)
-    else:
-        return _orig_isinstance(func, BuiltinMethodType) and getattr(func, '__name__', None) == 'apply'\
-            and _orig_isinstance(getattr(func, '__self__', None), Type) and issubclass(func.__self__, torch.autograd.Function)
+    return getattr(func, '__name__', None) == 'apply' \
+        and _orig_isinstance(getattr(func, '__self__', None), Type) and issubclass(func.__self__, torch.autograd.Function)
 
 
 @compatibility(is_backward_compatible=True)
@@ -346,14 +341,14 @@ class ConcreteTracer(TracerBase):
             if kind == 'call_function':
                 assert isinstance(target, Callable)
                 fn = target
-                if _orig_getattr(fn, '__module__', None) != 'nni.common.concrete_trace_utils.concrete_tracer' \
+                if _orig_getattr(fn, '__module__', None) != 'cube.graph.parser.concrete_trace_utils.concrete_tracer' \
                     and hasattr(fn, '__globals__'):
                     _autowrap_check(self, fn.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
                 return OperatorPatcherContext.patch_run(fn, *args, **kwargs)
             elif kind == 'call_method':
                 self_obj, *args_tail = args
                 fn = _orig_getattr(self_obj, target)
-                if _orig_getattr(fn, '__module__', None) != 'nni.common.concrete_trace_utils.concrete_tracer' \
+                if _orig_getattr(fn, '__module__', None) != 'cube.graph.parser.concrete_trace_utils.concrete_tracer' \
                     and hasattr(fn, '__globals__'):
                     _autowrap_check(self, fn.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
                 result = fn(*args_tail, **kwargs)
@@ -362,7 +357,7 @@ class ConcreteTracer(TracerBase):
                 mod = self.fetch_attr(target)
                 if self.cpu_offload:
                     mod.cuda()  # how it works in ddp?
-                if _orig_getattr(mod, '__module__', None) != 'nni.common.concrete_trace_utils.concrete_tracer' \
+                if _orig_getattr(mod, '__module__', None) != 'cube.graph.parser.concrete_trace_utils.concrete_tracer' \
                     and hasattr(mod, '__globals__'):
                     _autowrap_check(self, mod.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
                 result = OperatorPatcherContext.patch_run(mod, *args, **kwargs)
@@ -1606,10 +1601,14 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
             The struct of dict is: leaf_class: ([(module_path, module_name)], is_iterator_class).
                 is_iterator_class: Is the class init from an iterator. Only 'tuple', 'list', 'set' or 'dict' needs to set it to True.
 
+        dce (bool): If set to True, dead code eliminatation will be applied on the graph.
+                
         cpu_offload (bool): Whether to offload the module to CPU during tracing. If set to True, the traced code will be executed on GPU,
             but is offloaded to CPU afterward. This is useful for reducing memory usage during tracing, but may cause performance issues.
             If set to False, there will be no offloading during tracing, but the traced code will be executed on default device.
 
+        trace_twice (bool): If set to True, a second trace will be performed, and the two obtained graphs will be checked for consistency.
+            
     Returns:
         fx.GraphModule: a Module created from the recorded operations from ``root``.
     """
