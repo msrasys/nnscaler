@@ -948,7 +948,7 @@ class IRSegment(IRCell):
         sub_cids = set(node.cid for node in nodes)
         for node in nodes:
             for itensor in node.inputs():
-                if not isinstance(itensor, IRTensor): continue
+                if not isinstance(itensor, IRObject): continue
                 if itensor.is_attr(): continue
                 producers, ptensors = self.producers(itensor.parent), self.ptensors(itensor.parent)
                 pids = set(p.cid for p, t in zip(producers, ptensors) if dmatch(t, itensor))
@@ -959,9 +959,9 @@ class IRSegment(IRCell):
                 if all(pid not in sub_cids for pid in pids):
                     inputs.add(itensor)
             for otensor in node.outputs():
-                if not isinstance(otensor, IRTensor): continue
+                if not isinstance(otensor, IRObject): continue
                 # if the tensor is required by segment outputs or is loss during train, set as output
-                if otensor.is_loss() or otensor in segment_outputs:
+                if (isinstance(otensor, IRSubTensor) and otensor.is_loss()) or otensor in segment_outputs:
                     outputs.add(otensor)
                     continue
                 consumers, ctensors = self.consumers(otensor.parent), self.ctensors(otensor.parent)

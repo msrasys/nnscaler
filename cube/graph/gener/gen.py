@@ -110,10 +110,10 @@ class IRAdapterGener:
         graph._reorder_producer_consumer()
         # remove anchor node
         graph = IRAdapterGener.remove_anchor(graph)
-        # automatic replace pyfunc
-        graph = IRAdapterGener.auto_pyfunc(graph)
         # automatic transform multiref
         graph = IRAdapterGener.autoref(graph)
+        # automatic replace pyfunc
+        graph = IRAdapterGener.auto_pyfunc(graph)
         # generate adapters for activation
         graph = IRAdapterGener.gen_activation(graph, cost_fn=cost_fn)
         # generate weight reducer

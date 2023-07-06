@@ -115,11 +115,16 @@ class CodeEmission:
     
     @staticmethod
     def kwargs_name(**kwargs) -> str:
+        """Get kwarg name"""
         names = []
+        # FIXME make the str include `""`
+        # for name, val in kwargs.items():
+        #     if isinstance(val, str) and not val.startswith('self.'):
+        #         kwargs[name] = '"' + val + '"'
+        # turn object into name
+        modifier = lambda t: IRValue(CodeEmission.tensor_name(t))
+        kwargs = IRSegment.modify_objects_of_complex(kwargs, modifier)
         for name, val in kwargs.items():
-            # TODO: Ad-hoc patch for amp
-            if CompileFlag.use_amp and val == 'torch.float32':
-                val = 'torch.float16'
             names.append(f'{name}={val}')
         name = ', '.join(names)
         return name
@@ -133,12 +138,11 @@ class FuncEmission(CodeEmission):
     
     @staticmethod
     def emit_fnode(node: IRFwOperation, prefix_attr: str = None) -> List[str]:
-        """
-        Emit the statement to call the op in the forward code
-        (e.g. in Segments, Adapter or CodeGen.Main)
+        """Emit forward node code
 
         The result will look like (the lines are split into `List[str]`)
         ```
+        # comment if have
         tensor_3333 = torch.view(tensor_2222, [1,2,3,4,5])
         ```
 
@@ -150,14 +154,18 @@ class FuncEmission(CodeEmission):
         # insert comment
         if node.comment is not None:
             codes.append(f'# {node.comment}')
+    
         signature = node.signature
+        # setup arg string
         inputs = [FuncEmission.tensor_name(t, prefix_attr=prefix_attr) for t in node.inputs()]
-        kwargs = {}
-        for key in node.kwargs:
-            val = node.kwargs[key]
-            if isinstance(val, str) and 'self.' not in val:
-                val = '"' + val + '"'
-            kwargs[key] = val
+        # setup kwarg string
+        kwargs = dict(**node.kwargs)
+        for name, val in kwargs.items():
+            if isinstance(val, str) and not val.startswith('self.'):
+                kwargs[name] = '"' + val + '"'
+        # turn IRObject into name
+        modifier = lambda t: IRValue(CodeEmission.tensor_name(t))
+        kwargs = IRSegment.modify_objects_of_complex(kwargs, modifier)
 
         emit_rule = Sign2EmitRule.map(signature)
         body = emit_rule(node, inputs, kwargs)

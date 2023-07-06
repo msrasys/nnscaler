@@ -1,4 +1,5 @@
 from typing import Optional, List
+import warnings
 
 from cube.ir.tensor import IRFullTensor
 from cube.graph.parser import ScriptModuleParser
@@ -19,22 +20,25 @@ except:
 def convert_model(model: torch.nn.Module,
                   input_shapes: Optional[ List[List[int],] ] = None,
                   dummy_input = None,
-                  save_content: bool = True) -> IRGraph:
+                  save_content: bool = True,
+                  dynamic_shape: bool = False) -> IRGraph:
     """
     Convert torch.nn.Module based model into IRGraph
     """
     try:
         if CompileFlag.use_torchfx:
             if CompileFlag.use_default_fx_tracer:
-                print('INFO: using torch.fx tracer')
-                from torch.fx import symbolic_trace
+                if CompileFlag.log_parser:
+                    print('> use default torch.fx tracer')
                 # Symbolic tracing frontend - captures the semantics of the module
                 tracer = FxFuncOpTracer()
                 traced_graph: torch.fx.Graph = tracer.trace(model)
-                smodule: torch.fx.GraphModule = torch.fx.GraphModule(model, traced_graph)
-                smodule.graph.print_tabular()
+                traced_model: torch.fx.GraphModule = torch.fx.GraphModule(model, traced_graph)
+                if CompileFlag.log_parser:
+                    traced_model.graph.print_tabular()
             else:
-                print('INFO: using concrete tracer')
+                if CompileFlag.log_parser:
+                    print('> use concrete torch.fx tracer')
                 if HAS_APEX:
                     leaf_module = (
                         # torch.nn.Dropout, #torch.nn.Dropout1d, torch.nn.Dropout2d, torch.nn.Dropout3d,
@@ -61,26 +65,28 @@ def convert_model(model: torch.nn.Module,
                     fake_device_type='cpu',
                 )
         else:
-            print('using torchscript tracer')
-            smodule = torch.jit.script(model)
+            if CompileFlag.log_parser:
+                print('> use default torch.jit.script tracer')
+            traced_model = torch.jit.script(model)
 
     except Exception as ex:
         print(ex)
         raise RuntimeError("Cannot convert module into torchscript/torch.fx module.")
 
     if CompileFlag.use_torchfx:
-        if not dummy_input:
-            FxModuleParser.save_content = save_content
-            inputs, nodes, outputs = FxModuleParser.parse(smodule, input_shapes)
-            module_name = model.__class__.__name__
-        else:
-            FxModuleParser.save_content = save_content
-            inputs, nodes, outputs = FxModuleParser.parse(traced_model, input_shapes=None, dummy_inputs=dummy_input)
-            module_name = model.__class__.__name__
+        FxModuleParser.save_content = save_content
+        FxModuleParser.dynamic_shape = dynamic_shape
+        if CompileFlag.log_parser:
+            print(f"> use {'dynamic' if dynamic_shape else 'static'} shape to parse graph")
+        inputs, nodes, outputs = FxModuleParser.parse(traced_model, dummy_input)
+        module_name = model.__class__.__name__
     else:
+        if dynamic_shape:
+            warnings.warn('dynamic shape is not supported in torch.jit.script',
+                          category=RuntimeWarning)
         ScriptModuleParser.save_content = save_content
-        inputs, nodes, outputs = ScriptModuleParser.parse_module(smodule, input_shapes)
-        module_name = smodule.original_name
+        inputs, nodes, outputs = ScriptModuleParser.parse_module(traced_model, input_shapes)
+        module_name = traced_model.original_name
 
     for input in inputs:
         if isinstance(input, IRFullTensor):

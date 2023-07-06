@@ -1,7 +1,7 @@
 # Some operators should be specially handled during codegen to the frontend code,
 # here we define the customized rule for code emisson.
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from cube import ir
 from cube.ir.cten import IRTensor
@@ -10,100 +10,96 @@ from cube.ir.operator import IRFwOperation
 
 import torch
 
-# By default, we flatten all args and join them by ","
-# this includes ops with a fixed number of parameters like 'add(x,y)',
-# or ops allowing multiple parameters at the frontend like 'block_diag(t1,t2'
-def _common_rule_join_all(node:IRFwOperation, arg_vars:List[str], kw_pairs:dict) -> str:
-    signature = node.signature
-
-    kw_assigns = list()
-    for key, val in kw_pairs.items():
-        code = f'{key}={val}'
-        kw_assigns.append(code)
-
-    args = ", ".join(arg_vars + kw_assigns)
-    return f"{signature}({args})"
-
-def _common_rule_input_as_list(node:IRFwOperation, arg_vars:List[str], kw_pairs:dict) -> str:
-    signature = node.signature
-
-    kw_assigns = list()
-    for key, val in kw_pairs.items():
-        code = f'{key}={val}'
-        kw_assigns.append(code)
-    
-    args = ", ".join(arg_vars)
-    kwargs = ", ".join(kw_assigns)
-    return f"{signature}([{args}], {kwargs})"
-
-def emit_slice(node, arg_vars:list, kw_pairs:dict) -> str:
-    """
-    The op is:
-        aten::slice(input:Tensor, dim:int=0, start:Optional[int]=None, end:Optional[int]=None, step:int=1) -> Tensor
-    
-    but at the frontend such an invocation must be rewritten as 'x[:, l:h:s, :, :]'
-    depending on the 'input's rank and the 'dim' value.
-    """
-    out_tensors : tuple = node.outputs()
-    assert len(out_tensors) == 1
-    out_tensor : IRTensor = out_tensors[0]
-
-    assert len(arg_vars) == 1
-    in_tensor_var : str = arg_vars[0]
-
-    dim : int = kw_pairs["dim"]
-    start : Optional[int] = kw_pairs["start"]
-    end : Optional[int] = kw_pairs["end"]
-    step : int = kw_pairs["step"]
-    
-    rank = len(out_tensor.shape)
-    subscript_components = [":"] * rank
-
-    slice_str = f"{start or ''}:{end or ''}:{step}"
-    subscript_components[dim] = slice_str
-
-    return f"{in_tensor_var}[{', '.join(subscript_components)}]"
-
-
-def emit_setattr(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
-
-    assert arg_vars[1].startswith('self.')
-    member = f'"{arg_vars[1][5:]}"'
-    return f"{node.signature}({arg_vars[0]}, {member}, {arg_vars[2]})"
-
-
-def emit_getattr(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
-    return f"{node.signature}({arg_vars[0]}, '{arg_vars[1]}')"
 
 class Sign2EmitRule:
+    """Emit rule for frontend PyTorch codegen"""
+
+    _sign2rule = {}
 
     @staticmethod
-    def map(signature:str) -> Callable[[IRFwOperation, List[str], Dict[str, Any]], str]:
-        """
-        The definition of the emit rule is like:
+    def map(signature: str) -> Callable:
+        """Get the emit rule for the given signature
         
-        ```
-        def emit_for_lstm_cell(node, arg_vars, kw_pairs) -> str:
-            x_var, h_var, c_var = arg_vars
-            return f"lstm({x_var}, [{h_var}, {c_var}], OTHER_ARG_VARS)"
-        ```
+        Args:
+            signature (str): signature of the operator
 
-        'arg_vars' are inputs (all are Tensor-typed) variable names as string, e.g., ["x", "y"]
-        'kw_pairs' are dict whose values has been preprocessed and can be directly stringified, 
-            e.g., {"dim":1, "layout"="nchw"}
+        Returns:
+            Callable: emit rule that takes the node, args (List[str]) and kwargs (Dict[str, str]) as input
         """
-        return Sign2EmitRule._signMap.get(signature) or _common_rule_join_all
+        return Sign2EmitRule._sign2rule.get(signature, Sign2EmitRule.emit_common)
+
+    @staticmethod
+    def emit_common(node: IRFwOperation, args: List[str], kwargs: Dict[str, str]) -> str:
+        """Default rule to join all args and kwargs"""
+
+        signature = node.signature
+
+        kw_pairs = list()
+        for key, val in kwargs.items():
+            code = f'{key}={val}'
+            kw_pairs.append(code)
+
+        args = ", ".join(list(args) + kw_pairs)
+        return f"{signature}({args})"
+
+    @staticmethod
+    def emit_slice(node: IRFwOperation, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
+        """Special rule for generating slice node
+
+        The op is:
+            aten::slice(input:Tensor, dim:int=0, start:Optional[int]=None, end:Optional[int]=None, step:int=1) -> Tensor
+
+        but at the frontend such an invocation must be rewritten as 'x[:, l:h:s, :, :]'
+        depending on the 'input's rank and the 'dim' value.
+        """
+        out_tensors : tuple = node.outputs()
+        assert len(out_tensors) == 1
+        out_tensor : IRTensor = out_tensors[0]
+
+        assert len(arg_vars) == 1
+        in_tensor_var : str = arg_vars[0]
+
+        dim : int = kw_pairs["dim"]
+        start : Optional[int] = kw_pairs["start"]
+        end : Optional[int] = kw_pairs["end"]
+        step : int = kw_pairs["step"]
+
+        rank = len(out_tensor.shape)
+        subscript_components = [":"] * rank
+
+        slice_str = f"{start or ''}:{end or ''}:{step}"
+        subscript_components[dim] = slice_str
+
+        return f"{in_tensor_var}[{', '.join(subscript_components)}]"
+
+    @staticmethod
+    def emit_setattr(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
+        """Special rule for generating setattr node
+        """
+
+        assert arg_vars[1].startswith('self.')
+        member = f'"{arg_vars[1][5:]}"'
+        return f"{node.signature}({arg_vars[0]}, {member}, {arg_vars[2]})"
+
+    @staticmethod
+    def emit_getattr(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
+        """Special rule for generating getattr node
+        """
+        return f"{node.signature}({arg_vars[0]}, '{arg_vars[1]}')"
 
 
-    _signMap = {
-        'torch.slice': emit_slice,
-        'setattr': emit_setattr,
-        'builtins.getattr': emit_getattr,
-    }
+# the registered emit rules
+Sign2EmitRule._sign2rule = {
+    'torch.slice': Sign2EmitRule.emit_slice,
+    'setattr': Sign2EmitRule.emit_setattr,
+    'builtins.getattr': Sign2EmitRule.emit_getattr,
+}
 
 
-# The reverse mapping of DType2IRDType in /graph/parser/mapping.py
 class IRDType2DType:
+    """
+    The reverse mapping of DType2IRDType in /graph/parser/mapping.py
+    """
     
     @staticmethod
     def map(ir_dtype:IRDType) -> torch.dtype:

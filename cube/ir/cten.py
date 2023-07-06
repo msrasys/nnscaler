@@ -433,7 +433,7 @@ class IRObject:
     IRObject serves as general data of IRGraph edge
     """
 
-    def __init__(self, name: Optional[str] = None, tid: Optional[int] = None):
+    def __init__(self, name: Optional[str] = None, tid: Optional[int] = None, value: Optional[None] = None):
         """
         @param name str: object name
         @param tid int: object unique id
@@ -442,6 +442,7 @@ class IRObject:
         self.name: str = name if name else 'obj'
         self._cell: Optional[IRCell] = None
         self._is_attr: bool = False
+        self._value: Optional[Any] = value
 
     def __eq__(self, obj):
         if not isinstance(obj, IRObject):
@@ -494,6 +495,11 @@ class IRObject:
         """Get parent"""
         return self
 
+    @property
+    def value(self) -> Any:
+        """Get example value"""
+        return self._value
+
     def __eq__(self, obj) -> bool:
         if not isinstance(obj, IRObject):
             return False
@@ -501,7 +507,7 @@ class IRObject:
 
     def __copy__(self):
         """Copy this object but remove the cell information"""
-        return IRObject(self.name, self._id)
+        return IRObject(self.name, self._id, self._value)
 
     def as_attr(self):
         """
@@ -528,7 +534,7 @@ class IRObject:
             return False
 
     def __repr__(self):
-        return f'Object({self.name}{self.tid})'
+        return f'Object({self.name}{self.tid}, val={self.value})'
 
 
 class IRTensor(IRObject):

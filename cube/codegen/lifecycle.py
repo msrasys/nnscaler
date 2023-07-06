@@ -22,7 +22,9 @@ class LifeCycle:
         # the tensors can be released given the finish of line id
         self.release: Dict[int, List[IRObject]] = {}
 
-        is_activation = lambda t: isinstance(t, IRObject) and not t.is_attr()
+        # FIXME: consider the case of IRObject in the kwargs of IRFwOperation
+        # is_activation = lambda t: isinstance(t, IRObject) and not t.is_attr()
+        is_activation = lambda t: isinstance(t, IRSubTensor) and not t.is_attr()
         
         self.lifetime.update((tsin, 0) for tsin in graph_inputs if is_activation(tsin))
         

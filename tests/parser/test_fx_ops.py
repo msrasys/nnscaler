@@ -78,7 +78,8 @@ def test_parse_ops():
 
     model = cube.SemanticModel(model)
 
-    @cube.compile(model, dataloader, policy, load_content=False)
+    @cube.compile(model, dataloader, PAS=policy, load_content=False,
+                  model_dummy_inputs={'x': next(dataloader)})
     def eval_iter(model, dataloader):
         data = next(dataloader)
         out = model(data)

@@ -142,35 +142,33 @@ class SemanticDataLoader:
 
 class SemanticModel:
 
-    def __init__(self, model: Optional[torch.nn.Module], input_shapes=None, dummy_input=None):
+    def __init__(self, model: Optional[torch.nn.Module],
+                 save_content: bool = True,
+                 dynamic_shape: bool = False):
         """
         Create semantic model based on AI Scientist description.
 
-        @param model Optional[torch.nn.Module]: Model description. Each device of local_rank == 0 needs to provide.
-        @param input_shapes Any: to compatable with previous interface. No more need.
+        Args:
+            model (Optional[torch.nn.Module]):
+                single-device model description, only required for rank 0
+            save_content (bool): 
+                whether to save the content of model and load it into generated model. Default True.
+            dynamic_shape (bool):
+                whether to use dynamic shape. Default False.
         """
         if DeviceGroup().local_rank == 0:
             assert isinstance(model, torch.nn.Module), f"device of local_rank == 0 must provide model"
         self.model = model
-        self.input_shapes = None
-        self._dummy_input = dummy_input
-        self.ir_graph = None
+        self._dummy_input = None
+        self._ir_graph = None
         self._loaded_module: CubeModule = None
-        self._save_content = True
-
-    @property
-    def save_content(self) -> bool:
-        return self._save_content
-    
-    @save_content.setter
-    def save_content(self, val: bool):
-        self._save_content = val
+        # parser configuration
+        self.save_content: bool = save_content
+        self.dynamic_shape: bool = dynamic_shape
 
     @property
     def dummy_input(self) -> Any:
-        """
-        Get dummy real-tensor input from on CPU
-        """
+        """Get dummy real-tensor input from on CPU"""
         return self._dummy_input
     
     @dummy_input.setter
@@ -216,22 +214,22 @@ class SemanticModel:
         self._loaded_module = None
 
     def __call__(self, *args):
-        """
-        Forward the model.
+        """Forward the semantic model.
+
         This will trigger torch.jit.script to parse the model.
+
+        Args:
+            *args: input IRObjects
         """
-        if self._loaded_module:
-            return self._loaded_module(*args)
-        else:
-            # assert all(isinstance(t, IRSubTensor) for t in args), f"Only support tensors as model inputs"
+        assert self._ir_graph is None, \
+            f"multiple forward on a semantic model is not allowed"
+        if DeviceGroup().local_rank == 0:
             input_shapes = [tuple(t.shape) if isinstance(t, IRTensor) else None for t in args]
-            if DeviceGroup().local_rank == 0:
-                if self.ir_graph is None:
-                    self.ir_graph = parser.convert_model(
-                        self.model, input_shapes=input_shapes, dummy_input=self.dummy_input, save_content=self.save_content
-                    )
-                    self.input_shapes = input_shapes
-                else:
-                    assert tuple(self.input_shapes) == tuple(input_shapes), \
-                        f"Multiple forwarding of a same model, which require input shapes to be same."
-            return self.ir_graph(*args)
+            self._ir_graph = parser.convert_model(
+                self.model,
+                input_shapes=input_shapes,
+                dummy_input=self.dummy_input,
+                save_content=self.save_content,
+                dynamic_shape=self.dynamic_shape
+            )
+            return self._ir_graph(*args)

@@ -6,6 +6,7 @@ import operator
 import numpy as np
 import math
 import warnings
+import functools
 
 from cube.ir.cten import IRTensor, IRObject
 from cube.ir.tensor import IRSubTensor, IRFullTensor
@@ -134,23 +135,23 @@ def _get_creator_anno_rules(size: Tuple[int], partitionable: bool) -> str:
                 size[dim] = size[dim] // num
                 kwargs['size'] = tuple(size)
                 return kwargs
-
             rules.append(TransformRule([], [DimopSplit.D(dim)], creator_modifier))
-
     return anno, rules
 
 
-def CubeArange(start: int, end: int, step: int, dtype=None, 
-               requires_grad=False, signature=None):
-    signature = 'cube.runtime.function.arange'
-    size = (math.ceil((end-start)/step),)
-    # FIXME: torch.jit.script has dtype with int
-    # from cube.graph.parser.mapping import TorchScalarTypeEnumMap
-    # dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
+def CubeArange(start: Union[int, IRObject], end: Union[int, IRObject], step: Union[int, IRObject],
+               dtype=None, requires_grad=False, signature=None):
     dtype = dtype if dtype is not None else torch.get_default_dtype()
+    assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
+    signature = 'cube.runtime.function.arange'
     kwargs = {'start': start, 'end': end, 'step': step,
               'dtype': dtype, 'requires_grad': requires_grad}
-    anno, rules = _get_creator_anno_rules(size, False)
+    start_val = start.value if isinstance(start, IRObject) else start
+    end_val = end.value if isinstance(end, IRObject) else end
+    step_val = step.value if isinstance(step, IRObject) else step
+    size = (math.ceil((end_val-start_val)/step_val),)
+    anno, rules = _get_creator_anno_rules(
+        tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), False)
     dimop = IRDimops(CubeArange, 'arange', signature, [anno], [], rules, **kwargs)
     from cube.graph.parser.dtype import DType2IRDType
     dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
@@ -177,18 +178,16 @@ def Arange(*args, out=None, dtype=None, layout=None,
 def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
           pin_memory=False, memory_format=None, signature=None):
     # note: device is ignored
-    signature = 'cube.runtime.function.empty'
-    size = (size,) if isinstance(size, int) else tuple(size)
-    size: Tuple[int] = size + arg_size
-    assert all(isinstance(dimlen, int) for dimlen in size), f"Empty only supports static size but got {size}"
     assert layout is None and memory_format is None, f"Not support for non-default memory_format and layout"
-    # FIXME: torch.jit.script has dtype with int
-    # from cube.graph.parser.mapping import TorchScalarTypeEnumMap
-    # dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
     dtype = dtype if dtype is not None else torch.get_default_dtype()
+    assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
+    signature = 'cube.runtime.function.empty'
+    size = (size,) if isinstance(size, (int, IRObject)) else tuple(size)
+    size: Tuple[Union[int, IRObject]] = size + arg_size
     kwargs = {'size': size, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
-    anno, rules = _get_creator_anno_rules(size, True)
+    anno, rules = _get_creator_anno_rules(
+        tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
     dimop = IRDimops(Empty, 'empty', signature, [anno], [], rules, **kwargs)
     from cube.graph.parser.dtype import DType2IRDType
     dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
@@ -198,17 +197,15 @@ def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requi
 def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
           device=None, requires_grad=False, signature=None):
     # note: device is ignored
-    signature = 'cube.runtime.function.zeros'
-    size = (size,) if isinstance(size, int) else tuple(size)
-    size: Tuple[int] = size + arg_size
-    assert all(isinstance(dimlen, int) for dimlen in size), f"Zeros only supports static size but got {size}"
     assert layout is None, f"Not support for non-default layout"
-    # FIXME: torch.jit.script has dtype with int
-    # from cube.graph.parser.mapping import TorchScalarTypeEnumMap
-    # dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
     dtype = dtype if dtype is not None else torch.get_default_dtype()
+    assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
+    signature = 'cube.runtime.function.zeros'
+    size = (size,) if isinstance(size, (int, IRObject)) else tuple(size)
+    size: Tuple[Union[int, IRObject]] = size + arg_size
     kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
-    anno, rules = _get_creator_anno_rules(size, True)
+    anno, rules = _get_creator_anno_rules(
+        tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
     dimop = IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs)
     from cube.graph.parser.dtype import DType2IRDType
     dimop.output(0).parent.dtype = dtype if isinstance(dtype, IRDType) else DType2IRDType.map(dtype)
@@ -218,17 +215,15 @@ def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
 def Ones(size, *arg_size, out=None, dtype=None, layout=None,
          device=None, requires_grad=False, signature=None):
     # note: device is ignored
-    signature = 'cube.runtime.function.ones'
-    size = (size,) if isinstance(size, int) else tuple(size)
-    size: Tuple[int] = size + arg_size
-    assert all(isinstance(dimlen, int) for dimlen in size), f"Ones only supports static size but got {size}"
     assert layout is None, f"Not support for non-default layout"
-    # FIXME: torch.jit.script has dtype with int
-    # from cube.graph.parser.mapping import TorchScalarTypeEnumMap
-    # dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
     dtype = dtype if dtype is not None else torch.get_default_dtype()
+    assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
+    signature = 'cube.runtime.function.ones'
+    size = (size,) if isinstance(size, (int, IRObject)) else tuple(size)
+    size: Tuple[Union[int, IRObject]] = size + arg_size
     kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
-    anno, rules = _get_creator_anno_rules(size, True)
+    anno, rules = _get_creator_anno_rules(
+        tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
     dimop = IRDimops(Ones, 'ones', signature, [anno], [], rules, **kwargs)
     from cube.graph.parser.dtype import DType2IRDType
     dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
@@ -238,18 +233,16 @@ def Ones(size, *arg_size, out=None, dtype=None, layout=None,
 def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
          pin_memory=False, memory_format=None, signature=None):
     # note: device is ignored
-    signature = 'cube.runtime.function.rand'
-    size = (size,) if isinstance(size, int) else tuple(size)
-    size: Tuple[int] = size + arg_size
-    assert all(isinstance(dimlen, int) for dimlen in size), f"Rand only supports static size but got {size}"
     assert layout is None and memory_format is None, f"Not support for non-default memory_format and layout"
-    # FIXME: torch.jit.script has dtype with int
-    # from cube.graph.parser.mapping import TorchScalarTypeEnumMap
-    # dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
     dtype = dtype if dtype is not None else torch.get_default_dtype()
+    assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
+    signature = 'cube.runtime.function.rand'
+    size = (size,) if isinstance(size, (int, IRObject)) else tuple(size)
+    size: Tuple[Union[int, IRObject]] = size + arg_size
     kwargs = {'size': size, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
-    anno, rules = _get_creator_anno_rules(size, True)
+    anno, rules = _get_creator_anno_rules(
+        tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
     dimop = IRDimops(Rand, 'rand', signature, [anno], [], rules, **kwargs)
     from cube.graph.parser.dtype import DType2IRDType
     dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
@@ -259,13 +252,10 @@ def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requir
 def NewTensor(data, *, dtype=None, device=None, 
               requires_grad=False, pin_memory=False, signature=None):
     # note: device is ignored
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
     signature = 'cube.runtime.function.tensor'
     size = tuple(np.array(data).shape)
-    assert all(isinstance(dimlen, int) for dimlen in size), f"Ones only supports static size but got {size}"
-    # FIXME: torch.jit.script has dtype with int
-    # from cube.graph.parser.mapping import TorchScalarTypeEnumMap
-    # dtype = TorchScalarTypeEnumMap.map(dtype_underlying)
-    dtype = dtype if dtype is not None else torch.get_default_dtype()
     kwargs = {'size': size, 'requires_grad': requires_grad, 
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(size, True)
@@ -372,6 +362,10 @@ def Add(input, other, alpha=1, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input + alpha * other
+    if (not isinstance(input, IRTensor)) and (not isinstance(other, IRTensor)):
+        iv = input.value if isinstance(input, IRObject) else input
+        ov = other.value if isinstance(other, IRObject) else other
+        return IRPyFunc(signature, [input, other], [IRObject(name='add', value=iv+ov)])
     signature = 'torch.add'
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
@@ -385,6 +379,10 @@ def Sub(input, other, alpha=1, *, out=None, signature = None):
     signature = 'torch.sub'
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input - alpha * other
+    if (not isinstance(input, IRTensor)) and (not isinstance(other, IRTensor)):
+        iv = input.value if isinstance(input, IRObject) else input
+        ov = other.value if isinstance(other, IRObject) else other
+        return IRPyFunc(signature, [input, other], [IRObject(name='sub', value=iv-ov)])
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
@@ -396,6 +394,10 @@ def Mul(input, other, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input * other
+    if (not isinstance(input, IRTensor)) and (not isinstance(other, IRTensor)):
+        iv = input.value if isinstance(input, IRObject) else input
+        ov = other.value if isinstance(other, IRObject) else other
+        return IRPyFunc(signature, [input, other], [IRObject(name='mul', value=iv*ov)])
     signature = 'torch.mul'
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
@@ -408,6 +410,10 @@ def Div(input, other, *, rounding_mode=None, out=None, signature = None):
     assert rounding_mode is None and out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input / other
+    if (not isinstance(input, IRTensor)) and (not isinstance(other, IRTensor)):
+        iv = input.value if isinstance(input, IRObject) else input
+        ov = other.value if isinstance(other, IRObject) else other
+        return IRPyFunc(signature, [input, other], [IRObject(name='div', value=iv/ov)])
     signature = 'torch.div'
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
@@ -421,8 +427,11 @@ def Exp(input, *, out=None, signature=None):
     torch.exp(input, *, out=None)
     """
     assert out is None
-    if not isinstance(input, IRTensor):
+    if not isinstance(input, IRObject):
         return torch.exp(input)
+    if not isinstance(input, IRTensor):
+        assert input.value is not None
+        return IRPyFunc(signature, [input], [IRObject(name='exp', value=torch.exp(input.value))])
     shape = ShapeAnno.create_shape_str(input.shape)
     annos = [OpAnno.create_op_str([shape], [shape])]
     return IRDimops(Exp, 'exp', signature, annos, [input])
@@ -435,6 +444,9 @@ def Sqrt(input, *, out=None, signature=None):
     assert out is None
     if not isinstance(input, IRTensor):
         return torch.sqrt(input)
+    if not isinstance(input, IRTensor):
+        iv = input.value if isinstance(input, IRObject) else input
+        return IRPyFunc(signature, [input], [IRObject(name='sqrt', value=torch.sqrt(iv))])
     shape = ShapeAnno.create_shape_str(input.shape)
     annos = [OpAnno.create_op_str([shape], [shape])]
     return IRDimops(Sqrt, 'sqrt', signature, annos, [input])
@@ -445,7 +457,9 @@ def FloorDiv(input, other, *, out=None, signature = None):
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input // other
     if (not isinstance(input, IRTensor)) and (not isinstance(other, IRTensor)):
-        return IRPyFunc(signature, [input, other], [IRObject()])
+        iv = input.value if isinstance(input, IRObject) else input
+        ov = other.value if isinstance(other, IRObject) else other
+        return IRPyFunc(signature, [input, other], [IRObject(name='fdiv', value=iv//ov)])
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
@@ -453,22 +467,14 @@ def FloorDiv(input, other, *, out=None, signature = None):
     return IRDimops(FloorDiv, 'floordiv', signature, annos, [input, other])
 
 
-def Exp(input, *, out=None, signature=None):
-    """
-    torch.exp(input, *, out=None)
-    """
-    assert out is None
-    if not isinstance(input, IRTensor):
-        return torch.exp(input)
-    shape = ShapeAnno.create_shape_str(input.shape)
-    annos = [OpAnno.create_op_str([shape], [shape])]
-    return IRDimops(Exp, 'exp', signature, annos, [input])
-
-
 def Pow(input, exponent, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(exponent, IRObject)):
         return input ** exponent
+    if (not isinstance(input, IRTensor)) and (not isinstance(exponent, IRTensor)):
+        iv = input.value if isinstance(input, IRObject) else input
+        ev = exponent.value if isinstance(exponent, IRObject) else exponent
+        return IRPyFunc(signature, [input, exponent], [IRObject(name='pow', value=iv**ev)])
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(exponent, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, exponent)
@@ -479,6 +485,9 @@ def Pow(input, exponent, *, out=None, signature = None):
 def Neg(input, *, out=None, signature = None):
     assert out is None
     if not isinstance(input, IRObject): return -1 * input
+    if not isinstance(input, IRTensor):
+        iv = input.value if isinstance(input, IRObject) else input
+        return IRPyFunc(signature, [input], [IRObject(name='neg', value=-iv)])
     annos = ['* -> *']
     return IRDimops(Neg, 'neg', signature, annos, [input])
 
@@ -828,21 +837,24 @@ def Transpose(input, dim0, dim1, signature = None):
                     dim0=dim0, dim1=dim1)
 
 
-def View(input, size: Tuple[int], *arg_size, signature = None):
+def _reshape_anno(in_shape: List[int], ou_shape: List[int], kwarg_name: str) -> Tuple[str, List[TransformRule]]:
     """
-    out = torch.Tensor.view(tensor: torch.Tensor, *size)
-    """
-    size = (size,) if isinstance(size, int) else tuple(size)
-    size = size + arg_size
-    assert all([isinstance(dim, int) for dim in size]), \
-        f"Expected tensor.view has static int shape but got: {size}"
-    in_shape, ou_shape = list(input.shape), list(size)
+    reshape / view annotation and transformation rule generator
 
-    # infer -1
+    Args:
+        in_shape List[int]: input shape
+        ou_shape List[int]: output shape
+        kwarg_name str: kwarg name of reshape / view op
+    
+    Returns:
+        str: annotation string
+        List[TransformRule]: transformation rules
+    """
     def nele(shape, nele=1):
         for dimlen in shape: nele *= dimlen
         return nele
 
+    # infer -1
     cnt = nele(in_shape)
     if -1 in ou_shape:
         idx = ou_shape.index(-1)
@@ -965,194 +977,74 @@ def View(input, size: Tuple[int], *arg_size, signature = None):
             if bracket[hdim] not in spatial:
                 bracket[hdim] = str(shape_map[bracket[hdim]])
 
-    # TODO: strange behaviour if every identitifer creates own
-    # modifier, seems all previous modifiers will be overrided by
-    # the last one.
-    def view_modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
+    def modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
         kwargs = dict(**kwargs)
         identifier = ifirst[dim]
         oidx = ofirst.index(identifier)
-        size = list(kwargs['size'])
+        size = list(kwargs[kwarg_name])
+        assert isinstance(size[oidx], int), \
+            f'dynamic size cannot be partitioned but got: {size}'
         size[oidx] = size[oidx] // num
-        kwargs['size'] = tuple(size)
+        kwargs[kwarg_name] = tuple(size)
         return kwargs
 
     # special rules: to change output size argument
-    rules = []
+    rules: TransformRule = []
     for identifier in spatial:
         iidx = ifirst.index(identifier)
         oidx = ofirst.index(identifier)
         rules.append(
-            TransformRule([DimopSplit.D(iidx)], [DimopSplit.D(oidx)], view_modifier)
+            TransformRule([DimopSplit.D(iidx)], [DimopSplit.D(oidx)], modifier)
         )
 
     anno = OpAnno.create_op_str([in_anno], [ou_anno])
+    return anno, rules
+
+
+def View(input, size: Tuple[int], *arg_size, signature = None):
+    """
+    out = torch.Tensor.view(tensor: torch.Tensor, *size)
+    """
+    in_shape = list(input.shape)
+    if isinstance(size, IRObject):
+        assert size.value is not None, f"shape should have a reference value but got: {size}"
+        if isinstance(size.value, int):
+            size = (size,) + arg_size
+            ou_shape = [d.value if isinstance(d, IRObject) else d for d in size]
+        else:  # tuple[int] / list[int]
+            assert len(arg_size) == 0, f"already got a tuple of int shape"
+            ou_shape = list(size.value)
+    else:  # int / tuple[int]
+        size = ((size,) if isinstance(size, int) else tuple(size)) + arg_size
+        ou_shape = [d.value if isinstance(d, IRObject) else d for d in size]
+    assert all(isinstance(d, int) for d in ou_shape), f"but got {ou_shape}"
+
+    anno, rules = _reshape_anno(in_shape, ou_shape, kwarg_name='size')
     signature = 'torch.Tensor.view'
-    return IRDimops(View, 'view', signature, [anno], [input], rules, size=tuple(size))
+    return IRDimops(View, 'view', signature, [anno], [input], rules, size=size)
 
 
 def Reshape(input, shape: Tuple[int], *arg_shape, signature = None):
     """
     torch.reshape(Tensor self, int[] shape) -> Tensor
     """
+    in_shape = list(input.shape)
+    if isinstance(shape, IRObject):
+        assert shape.value is not None, f"shape should have a reference value but got: {shape}"
+        if isinstance(shape.value, int):
+            shape = (shape,) + arg_shape
+            ou_shape = [d.value if isinstance(d, IRObject) else d for d in shape]
+        else:  # tuple[int] / list[int]
+            assert len(arg_shape) == 0, f"already got a tuple of int shape"
+            ou_shape = list(shape.value)
+    else:  # int / tuple[int]
+        shape = ((shape,) if isinstance(shape, int) else tuple(shape)) + arg_shape
+        ou_shape = [d.value if isinstance(d, IRObject) else d for d in shape]
+    assert all(isinstance(d, int) for d in ou_shape), f"but got {ou_shape}"
 
-    size = (shape,) if isinstance(shape, int) else tuple(shape)
-    size = size + arg_shape
-    assert all([isinstance(dim, int) for dim in size]), \
-        f"Expected tensor.view has static int shape but got: {size}"
-    in_shape, ou_shape = list(input.shape), list(size)
-
-    # infer -1
-    def nele(shape, nele=1):
-        for dimlen in shape: nele *= dimlen
-        return nele
-
-    cnt = nele(in_shape)
-    if -1 in ou_shape:
-        idx = ou_shape.index(-1)
-        ou_shape[idx] = cnt // (-nele(ou_shape))
-    assert nele(in_shape) == nele(ou_shape), f"shape mismatch: {in_shape}, {ou_shape}"
-
-    # generate annotation
-    rest_inshape = [dimlen for dimlen in in_shape]
-    rest_oushape = [dimlen for dimlen in ou_shape]
-    chain = []
-    can_bucket = True
-    while len(rest_inshape) != 0 or len(rest_oushape) != 0:
-        if len(rest_inshape) == 0:
-            chain = chain + rest_oushape
-            rest_oushape = []
-        elif len(rest_oushape) == 0:
-            chain = chain + rest_inshape
-            rest_inshape = []
-        else:
-            dimlen = min(rest_inshape[0], rest_oushape[0])
-            if max(rest_inshape[0], rest_oushape[0]) % dimlen == 0:
-                chain.append(dimlen)
-                if dimlen == rest_inshape[0]:
-                    rest_inshape.pop(0)
-                else:
-                    rest_inshape[0] = rest_inshape[0] // dimlen
-                if dimlen == rest_oushape[0]:
-                    rest_oushape.pop(0)
-                else:
-                    rest_oushape[0] = rest_oushape[0] // dimlen
-            else:
-                can_bucket = False
-                break
-
-    letters = iter(string.ascii_lowercase)
-    if can_bucket:
-        inchain = ouchain = chain
-        inedims = ouedims = edims = [next(letters) for _ in chain]
-    else:
-        inchain, ouchain = in_shape, ou_shape
-        inedims = [str(dimlen) for dimlen in in_shape]
-        ouedims = [str(dimlen) for dimlen in ou_shape]
-        chain = inchain + ouchain
-        edims = inedims + ouedims
-    shape_map: Dict[str, int] = {edim: eshape for (edim, eshape) in zip(edims, chain)}
-
-    # generate input and output shape annotations
-    def buckets(shape: List[int], chain: List[int], edims: List[int]) -> List[List[str]]:
-        anno = []
-        dimidx = 0
-        for idx, dimlen in enumerate(shape):
-            elements, bracket = 1, []
-            maxele = len(chain) - dimidx - (len(shape) - 1 - idx)
-            while True:
-                if len(bracket) == maxele:
-                    assert elements == dimlen, f"internal match error1: {bracket}"
-                    break
-                if dimidx >= len(chain) or elements * chain[dimidx] > dimlen:
-                    assert elements == dimlen, f"internal match error2: {bracket}"
-                    break
-                else:
-                    elements *= chain[dimidx]
-                    bracket.append(edims[dimidx])
-                    dimidx += 1
-            # fetch as many 1^ as possible from tail of the previous bracket
-            if len(bracket) == 0:
-                assert dimlen == 1, f"internal match error3: dimlen={dimlen}"
-                back = 0
-                for edim in anno[-1][1:][::-1]:
-                    if chain[edims.index(edim)] != 1:
-                        break
-                    back += 1
-                assert back > 0, f"internal match error4: dimlen={dimlen}"
-                bracket = anno[-1][-back:]
-                anno[-1] = anno[-1][:-back]
-            assert len(bracket) > 0, f"got a dimension with no edim"
-            anno.append(bracket)
-        return anno
-
-    in_anno = buckets(in_shape, inchain, inedims)
-    ou_anno = buckets(ou_shape, ouchain, ouedims)
-
-    # postprocess on dimlen == 1
-    shape_map['1'] = 1
-    for bracket in in_anno + ou_anno:
-        for subdim, edim in enumerate(bracket):
-            if shape_map[edim] == 1:
-                bracket[subdim] = str(shape_map[edim])
-
-    # find out the axis that can be partitioned
-    ispatial, ifirst = set(), []
-    for bracket in in_anno:
-        sdim = None
-        for hdim in range(len(bracket)):
-            if bracket[hdim] == '1' or shape_map[bracket[hdim]] == 1: continue
-            sdim = bracket[hdim]
-            break
-        if sdim is not None:
-            ispatial.add(sdim)
-        ifirst.append(sdim)
-
-    ospatial, ofirst = set(), []
-    for bracket in ou_anno:
-        sdim = None
-        for hdim in range(len(bracket)):
-            if bracket[hdim] == '1' or shape_map[bracket[hdim]] == 1: continue
-            sdim = bracket[hdim]
-            break
-        if sdim is not None:
-            ospatial.add(sdim)
-        ofirst.append(sdim)
-
-    # intersection for spatial partitioned dimensions
-    spatial = ispatial.intersection(ospatial)
-
-    # set dimension cannot be partitioned
-    for bracket in in_anno + ou_anno:
-        for hdim in range(len(bracket)):
-            if bracket[hdim] not in spatial:
-                bracket[hdim] = str(shape_map[bracket[hdim]])
-
-    # TODO: strange behaviour if every identitifer creates own
-    # modifier, seems all previous modifiers will be overrided by
-    # the last one.
-    def view_modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
-        kwargs = dict(**kwargs)
-        identifier = ifirst[dim]
-        oidx = ofirst.index(identifier)
-        size = list(kwargs['shape'])
-        size[oidx] = size[oidx] // num
-        kwargs['shape'] = tuple(size)
-        return kwargs
-
-    # special rules: to change output size argument
-    rules = []
-    for identifier in spatial:
-        iidx = ifirst.index(identifier)
-        oidx = ofirst.index(identifier)
-        rules.append(
-            TransformRule([DimopSplit.D(iidx)], [DimopSplit.D(oidx)], view_modifier)
-        )
-
-    anno = OpAnno.create_op_str([in_anno], [ou_anno])
-
-    new_signature = 'torch.Tensor.reshape'
-    return IRDimops(Reshape, 'shape', new_signature, [anno], [input], rules, shape=tuple(size))
+    anno, rules = _reshape_anno(in_shape, ou_shape, kwarg_name='shape')
+    signature = 'torch.Tensor.reshape'
+    return IRDimops(Reshape, 'reshape', signature, [anno], [input], rules, shape=shape)
 
 
 def Permute(input, dims: Tuple[int], *arg_dims, signature = None):
@@ -1430,40 +1322,46 @@ def IndexSelect(input: torch.Tensor, dim: int, index: torch.Tensor, *, out=None,
     return CubeIndexSelect(input, index, dim, signature=signature)
 
 
-def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice]], signature=None):
+def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice, int]], signature=None):
     """
-    subtensor = tensor[:,128:]
-    subtensor = tensor[0,128:]
-    subtensor = tensor[0]
+    Examples:
+        >>> a = torch.randn((4,2))
+        >>> a[(2,)], a[2]                          # shape [2]
+        >>> a[2:3], a[2:3,:]                       # shape [1,2]
+        >>> a[(2, slice(None, None, None))]        # shape [2]
+        >>> a[(2, None)]                           # shape [1,2]
+        >>> a[(2, slice(None, None, None)), None]  # shape [2,1]
+        >>> a[(2, None, slice(None, None, None))]  # shape [1,2]
     """
     signature = 'cube.runtime.function.fullslice'
-    slicers = tuple(slicers) + (None,) * (len(tensor.shape) - len(slicers))
+    slicers = tuple(slicers)
     edim_in = ShapeAnno.create_shape_str(tensor.shape)
     edim_ou = []
-    for dim, slicer in enumerate(slicers):
+    in_idx = 0
+    for slicer in slicers:
         if slicer is None:
-            if dim < len(edim_in):
-                edim_ou.append(edim_in[dim])
-            else:
-                # expand the dimension
-                edim_ou.append('1')
-        else:
+            edim_ou.append('1')
+        elif isinstance(slicer, int):
+            edim_in[in_idx] += '^'
+            in_idx += 1
+        elif isinstance(slicer, slice):
             if slicer != slice(None, None, None):
-                edim_in[dim] += '^'
-            if isinstance(slicer, slice):
-                stop = tensor.shape[dim] if slicer.stop is None else slicer.stop
-                start = 0 if slicer.start is None else slicer.start
-                step = 1 if slicer.step is None else slicer.step
-                dimlen = len(range(start, stop, step))
-                if dimlen == tensor.shape[dim]:
-                    edim_ou.append(edim_in[dim])
-                else:
-                    edim_ou.append(str(dimlen))
+                edim_in[in_idx] += '^'
+            start = 0 if slicer.start is None else slicer.start
+            stop = tensor.shape[in_idx] if slicer.stop is None else slicer.stop
+            step = 1 if slicer.step is None else slicer.step
+            dimlen = len(range(start, stop, step))
+            if dimlen == tensor.shape[in_idx]:
+                edim_ou.append(edim_in[in_idx])
             else:
-                pass  # no shape for int
-    # special case for loss = torch.Tensor([1,2,3])[0]
+                edim_ou.append(str(dimlen))
+            in_idx += 1
+        else:
+            raise RuntimeError(f"Unsupported slicer {slicer}")
+    edim_ou += edim_in[in_idx:]
+    # special case for scalar = torch.Tensor([1,2,3])[0]
     if len(edim_ou) == 0:
-        edim_ou = ['1^']
+        edim_ou.append('1')
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
     return IRDimops(FullSlice, 'fullslice', signature, [anno], [tensor], slicers=slicers)
 
@@ -1714,14 +1612,14 @@ def ShapeAsTensor(input: IRTensor, signature = None):
     """
     torch._shape_as_tensor
     """
-    if isinstance(input.shape, list) and all(isinstance(dim, int) for dim in input.shape):
-        return input.shape
-
+    warnings.warn('shape_as_tensor is interpreted as an IRPyFunc'
+                  ' and generate an IRObject instead of IRTensor')
+    signature = 'torch._shape_as_tensor'
+    return IRPyFunc(signature, [input], [IRObject(name='shape', value=input.shape)])
     edim_in = ShapeAnno.create_shape_str(input.shape)
     edim_ou = [str(len(input.shape))]
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
     return IRDimops(ShapeAsTensor, '_shape_as_tensor', signature, [anno], [input])
-
 
 
 # ================== Non-autograd Function Space =================
@@ -1731,10 +1629,12 @@ def Size(tensor, dim=None, signature = None) -> Union[List[int], IRPyFunc]:
     torch.Tensor.size(tensor, dim=None)
     """
     assert isinstance(tensor, IRTensor)
-    # constant
-    if all(isinstance(dimlen, int) for dimlen in tensor.shape) and not isinstance(dim, IRObject):
-        return tensor.shape[dim] if isinstance(dim, int) else list(tensor.shape)
-    return IRPyFunc(signature, [tensor, dim], [IRObject()])
+    val = tensor.shape[dim] if isinstance(dim, int) else list(tensor.shape)
+    assert val is not None
+    if dim is None:
+        return IRPyFunc(signature, [tensor], [IRObject(name='size', value=val)])
+    else:
+        return IRPyFunc(signature, [tensor], [IRObject(name='size', value=val)], dim=dim)
 
 
 def To(tensor: IRTensor, dtype_or_device, *, out=None, signature = None):
@@ -1763,53 +1663,17 @@ def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
     _operator.getitem(obj, index: int)
     """
     obj, index = a, b
-
-    def try_reshape(tensor, expr):
-        if expr[0] == Ellipsis and expr[1] == None:
-            return True, copy.copy(tensor.shape) + [1]
-        dim_cnt = 0
-        idx = 0
-        dst_shape = []
-        for item in expr:
-            if item == slice(None, None, None):
-                dst_shape.append(tensor.shape[idx])
-                idx += 1
-            elif item == None:
-                dst_shape.append(1)
-            else:
-                return False, []
-        if idx != len(tensor.shape):
-            return False, []
-        return True, dst_shape
-
-    def try_select(tensor, expr):
-        int_cnt = 0
-        dim = -1
-        val = -1
-        for i, item in enumerate(expr):
-            if isinstance(item, int):
-                int_cnt += 1
-                dim = i
-                val = item
-        if int_cnt != 1:
-            return False, -1, -1
-        if expr[0] == Ellipsis:
-            dim = dim - len(expr)
-        return True, dim, val
-
+    # tensor slice
     if isinstance(obj, IRTensor):
-        is_reshape, dst_shape = try_reshape(obj, index)
-        if is_reshape:
-            return Reshape(obj, dst_shape, signature='torch.reshape')
-        is_select, dim, val = try_select(obj, index)
-        if is_select:
-            return Select(obj, dim, val, 'torch.select')
-        # case: subtensor = tensor[1,:2]
-        return FullSlice(obj, b)
-        # assert False, f'{obj}, {index}'
-    elif (not isinstance(obj, IRObject)) and isinstance(index, int):
-        return obj[index]
-    return IRPyFunc(signature, [obj, index], [IRObject()])
+        # note `None` will always
+        index = (index,) if isinstance(index, int) else tuple(index)
+        return FullSlice(obj, index)
+    # object slice
+    if isinstance(obj, IRObject):
+        assert obj.value is not None
+        out = IRObject(name='getitem', value=obj.value[index])
+        return IRPyFunc(signature, [obj, index], [out])
+    return obj[index]
 
 
 def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], IRPyFunc]:
@@ -1819,19 +1683,23 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
     have instantiated object or the attr is not simple value.
     """
     obj, name = instance, field
-    if name in ('shape', 'dtype'):
-        assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
-        assert hasattr(obj, name), f"attr {name} is not existed in {obj}"
+    if isinstance(obj, IRTensor):
+        if name == 'shape':
+            assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
+            shape = IRObject('shape', value=obj.shape)
+            return IRPyFunc(signature, [instance, field], [shape])
+        if name == 'dtype':
+            assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
+            assert hasattr(obj, name), f"attr {name} is not existed in {obj}"
+            return getattr(obj, name)
+        if name == 'device':
+            assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
+            # FIXME: this is hack, IRFullTensor does not have attribute "device"
+            return torch.device('cpu')
+    if isinstance(obj, torch.finfo):
         return getattr(obj, name)
-    elif name == 'device':
-        assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
-        # FIXME: this is hack, IRFullTensor does not have attribute "device"
-        return torch.device('cpu')
-    elif isinstance(obj, torch.finfo):
-        return getattr(obj, name)
-    else:
-        # FIXME: is it right?
-        return IRPyFunc(signature, [instance, field], [IRObject()])
+    return IRPyFunc(signature, [instance, field], [IRObject()])
+
 
 def FInfo(dtype: IRDType, signature = None) -> torch.finfo:
     assert isinstance(dtype, IRDType)

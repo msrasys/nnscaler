@@ -47,7 +47,22 @@ def expand(input: torch.Tensor, sizes: Union[torch.Size, List[int]]) -> torch.Te
     return input.expand(*sizes)
 
 
-def fullslice(input: torch.Tensor, slicers: Tuple[Union[None, slice]]):
+def fullslice(input: torch.Tensor, slicers: Tuple[Union[None, slice, int]]):
+    """Slice tensors
+
+    Note:
+    1) `None` will always extend a dimension at current position.
+    2) `slice(None, None, None)` equals to `:`,
+        meaning select every element at its dimension.
+    
+    Args:
+        input (torch.Tensor): input tensor
+        slicers (Tuple[None | slicer | int]): slicer tuple
+
+
+    Returns:
+        torch.Tensor: sliced tensor
+    """
     return input[slicers]
 
 

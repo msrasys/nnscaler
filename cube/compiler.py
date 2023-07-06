@@ -32,53 +32,55 @@ from cube.flags import CompileFlag
 def compile(model: SemanticModel, *args,
             PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None,
             model_dummy_inputs: Tuple[Any] = None,
+            model_dynamic_shape: bool = False,
             comm_cost_fn: Optional[Callable] = None,
             override = True,
             load_content = True,
             scale: Union[bool, int] = False) -> Callable:
+    """Cube compile entry
+
+    Examples:
+
+    ```
+    @cube.compile(model, data, PAS=policy)
+    def train_iter(model, dataloader):
+        data = next(dataloader)
+        loss = model(data)
+        loss.backward()
+    ```
+
+    Args:
+        model (SemanticModel | torch.nn.Module): single-device model
+        args (Tuple[Any]): compile function example inputs
+        PAS (Callable | Tuple[Callable, Callable, Callable]): policy to transform and schedule graph
+        model_dummy_inputs (Tuple[Any]): model example inputs when using torch.fx parser
+        model_dynamic_shape (bool): whether to compile model with dynamic shape
+        comm_cost_fn (Optional[Callable]): communication cost function, which
+            takes in an IRAdapterPrim, and outputs a cost in float. By default (None) use
+            communication volume.
+        override (bool): If true, the generated code will override exsisting
+            files (if they are already existed.), otherwise, use the already existed
+            generated code, i.e., the policy won't take effect. Default true.
+        load_content (bool): If true, will load parameter from exsiting saved models.
+            Otherwise, will initial model parameters with empty tensor.
+        scale (Union[bool, int]): If true, will scale the generated code to the
+            total launched number of GPUs. If int, will scale to the specified number.
+            Default False, no scaling.
+
+    Returns:
+        Callable: compiled training iteration
     """
-    AI Scientist calls like:
 
-        @cube.compile(model, dataloader, PAS=policy)
-        def train_step(model, dataloader):
-            data = next(dataloader)
-            loss = model(data)
-            loss.backward()
-        ...
-        
-        for epoch in range(100):
-            train_step(model, data_loader)
-            optimizer.step()
-            optimizer.zero_grad()
-
-        ...
-
-    @param model SemanticModel: AI Scientist specified SemanticModel
-    @param args: compile function example inputs
-    @param PAS Callable: policy to transform and schedule graph
-    @param model_dummy_inputs Tuple[Any]: model example inputs when using torch.fx parser
-    @param comm_cost_fn: Optional[Callable]: communication cost function, which
-        takes in an IRAdapterPrim, and outputs a cost in float. By default (None) use
-        communication volume.
-    @param override bool: If true, the generated code will override exsisting
-        files (if they are already existed.), otherwise, use the already existed
-        generated code, i.e., the policy won't take effect. Default true.
-    @param load_content bool: If true, will load parameter from exsiting saved models.
-        Otherwise, will initial model parameters with empty tensor.
-    @param scale Union[bool, int]: If true, will scale the generated code to the
-        total launched number of GPUs. If int, will scale to the specified number.
-        Default False, no scaling.
-
-    @return sched_fn Callable: the scheduling function loaded from generated code.
-    """
     # clean global status
     Program().clear()
     IDGenerator().clear()
     assert PAS is not None, f'PAS should be callable function'
 
-    model = SemanticModel(model) if isinstance(model, torch.nn.Module) else model
+    if isinstance(model, torch.nn.Module):
+        model = SemanticModel(model)
     assert isinstance(model, SemanticModel), f'Require cube.SemanticModel or torch.nn.Module, but got model: {type(model)}'
     model.save_content = load_content
+    model.dynamic_shape = model_dynamic_shape
     model.dummy_input = model_dummy_inputs
 
     dataloader = None

@@ -20,6 +20,7 @@ class CompileFlag:
     # ============= loggings ===================
     log_transform = _to_bool('LOG_TRANSFORM')
     log_schedule = _to_bool('LOG_SCHEDULE')
+    log_parser = _to_bool('LOG_PARSER')
 
     # ================ compiling ========================
     use_torchfx = _to_bool('USE_TORCHFX')  # using torch.fx or torchscript as frontend to capture dataflow graph
