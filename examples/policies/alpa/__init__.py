@@ -4,10 +4,11 @@ import warnings
 import torch
 
 from cube.graph.function.anchor import IRGraphAnchor
-from cube.graph.function.dimops import IRDimops
+from cube.graph.function.dimops import IRDimops, TransformRule, DimopSplit
 from cube.graph.graph import IRGraph
 from cube.graph.segment import IRSegment
 from cube.ir.operator import IRFwOperation, IRDataOperation
+from cube.ir.tensor import IRFullTensor
 from cube.graph.schedule.predefined import PredefinedSched
 from cube.runtime.device import DeviceGroup
 
@@ -36,13 +37,42 @@ def _tp(graph: IRGraph, node: IRDimops, devs: List[int], **configs) -> List[IRDi
     return sub_nodes
 
 
+def _auto_multiref(graph: IRGraph, plan: ParallelSpec):
+    """
+    Apply automated multiref on tensors that are partitioned differently by different nodes
+    """
+    # get parallel strategy
+    specs = dict()
+    for stage in plan.stages:
+        for cid, spec in stage.tp_spec.items():
+            specs[cid] = spec
+
+    for ftensor in graph.full_tensors():
+        if ftensor.is_grad(): continue
+        if len(graph.consumers(ftensor)) <= 1: continue
+        consumers, ctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
+        splits = set()
+        for consumer, ctensor in zip(consumers, ctensors):
+            spec = specs[consumer.cid]
+            if spec is None:
+                splits.add(DimopSplit.R())
+            else:
+                idx, dim = spec
+                rule: TransformRule = consumer.algorithms('dim').infer(idx, dim, 1)
+                split = rule.inputs()[consumer.inputs().index(ctensor)]
+                splits.add(split)
+        if len(splits) > 1:
+            print(f"> detected a(n) {'activation' if not ftensor.is_attr() else 'parameter'}: "
+                  f"{ftensor.name}({ftensor.tid}) is partitioned differently. Apply multierf...")
+            graph.multiref(ftensor)
+
+
 def PASAlpa(graph: IRGraph, resource, 
             recompute: bool = False,
             nmicros: int = 1,
             db_cache: str = 'db_train.json',
             load_spec_file: Optional[str] = None,
             save_spec_file: Optional[str] = None,
-            use_multiref: bool = False,
             max_pp_size: Optional[int] = None,
             max_tp_size: Optional[int] = None,
             max_layer_number: int = 12) -> IRGraph:
@@ -53,7 +83,7 @@ def PASAlpa(graph: IRGraph, resource,
     for AutoLayer partition position
 
     @param graph IRGraph: model graph
-    @param rresource Resource: resource
+    @param resource Resource: resource
     @param recompute bool: whether to enable recompute on each layer
     @param nmicros int: number of micro-batches
     @param db_cache str: database cache file
@@ -63,13 +93,6 @@ def PASAlpa(graph: IRGraph, resource,
     @param max_tp_size Optional[int]: limit the maximum number of tensor parallelism size
     @param max_layer_number Optional[int]: maximum number of layers to search
     """
-    # enable this for multiref
-    if use_multiref:
-        for ftensor in graph.full_tensors():
-            if ftensor.is_grad() or ftensor.is_attr(): continue
-            if len(graph.consumers(ftensor)) > 1:
-                graph.multiref(ftensor)
-
     # recompute granularity will follow original anchor scope
     layers = annotate_structure(graph)
     if recompute:
@@ -150,6 +173,9 @@ def PASAlpa(graph: IRGraph, resource,
 
     print(f'> instantiate plan...')
     # print(graph.extra_repr())
+
+    #  auto-multiref
+    _auto_multiref(graph, config)
 
     # staging
     cid2node = {n.cid : n for n in nodes}

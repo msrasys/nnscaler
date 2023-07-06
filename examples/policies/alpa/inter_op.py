@@ -103,6 +103,8 @@ def DP(nodes: Tuple[IRLayerOp], k: int, s: int, intra_solver: Callable,
                 if not is_of_power2(t * d): continue
                 # guarantee sub-problem searchable
                 if k - d * t < s - 1: continue
+                # constraints: every device must be used
+                if s - 1 > 0 and len(sub2) == 0: continue
                 # sub2 cost
                 DP(sub2, k-d*t, s-1, intra_solver, mbs, max_d, max_t,
                    _cost, _config, _intra_cache)
