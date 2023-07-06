@@ -54,7 +54,6 @@ class ConcreteProxy(Proxy):
     jump_opcodes = _orig_tuple(dis.opmap[name] for name in jump_opnames if name in dis.opmap)
     op_compare = dis.opmap['COMPARE_OP']
     op_extended_arg = dis.opmap['EXTENDED_ARG']
-    op_call = dis.opmap['CALL_FUNCTION']
     op_call_ex = dis.opmap['CALL_FUNCTION_EX']
     op_not = dis.opmap['UNARY_NOT']
     op_unpack_sequence = dis.opmap['UNPACK_SEQUENCE']
@@ -170,6 +169,9 @@ class ConcreteProxy(Proxy):
         elif insts[cur].opname == 'CONTAINS_OP':
             # in executing 'in'
             return _orig_bool(self.value)
+        elif insts[cur].opcode == self.op_call_ex:
+            # in executing func(..., *proxy)
+            return _orig_bool(self.value)
         elif insts[cur].opcode == self.op_not:
             # We cannot return a proxy because 'UNARY_NOT' op will check the type.
             _logger.warning('please use the function patcher, or use "x = operator.not_(y)" instead of "x = not y",'
@@ -185,6 +187,10 @@ class ConcreteProxy(Proxy):
     def __hash__(self) -> Union[int, ConcreteProxy]:
         # should only be in dict getitem
         return hash(self.value)
+
+    def __contains__(self, item) -> bool:
+        # should only be in iterable
+        return self.value.__contains__(item)
 
     @compatibility(is_backward_compatible=True)
     def keys(self):
