@@ -5,6 +5,7 @@ Register cutomized function
 from typing import Dict, Callable, List, Optional, Any
 from functools import partial
 import inspect
+import warnings
 import torch
 
 from cube.graph.function.dimops import IRDimops, OpAnno
@@ -67,7 +68,8 @@ class CustomizedOps:
 
 def register(anno: str, name: Optional[str] = None,
              rules: Optional[List] = None,
-             input_type_annos: Optional[List[Any]] = None) -> Callable:
+             input_type_annos: Optional[List[Any]] = None,
+             code_impl_pattern: str = 'import') -> Callable:
     """
     Register a function with einop annotations.
 
@@ -95,7 +97,11 @@ def register(anno: str, name: Optional[str] = None,
         input_type_annos (Optional[List[Any]]):
             type annotations for inputs. If not provided, the function 
             should be annotated with types.
-    
+        code_impl_pattern (str):
+            can only be 'import' or 'source'. If 'import', will generate code with
+            import statement. If 'source', will take the source code directly.
+            Default: 'import'.
+
     Returns:
         fn (Callable): the runtime function
     """
@@ -122,9 +128,23 @@ def register(anno: str, name: Optional[str] = None,
             break
         nkwargs = len(arg_names) - ninputs
         kwarg_names = [name for name in arg_names[ninputs:]]
+
         # get customized op code
-        code = inspect.getsource(fn)
-        code = code[code.index('def'):]
+        if code_impl_pattern == 'import':
+            import_path = inspect.getmodule(fn).__name__
+            if import_path == '__main__':
+                warnings.warn(f'Find the function {fsig} is defined in __main__ module, will take the source code directly. '
+                              f'This may cause error when the function has inner functions from other modules. '
+                              f'To solve this, define the function in another module and import into main', stacklevel=0)
+                code = inspect.getsource(fn)
+                code = code[code.index('def'):]
+            else:
+                code = f'from {import_path} import {fsig}'
+        elif code_impl_pattern == 'source':
+            code = inspect.getsource(fn)
+            code = code[code.index('def'):]
+        else:
+            raise ValueError(f'code_impl_pattern should be either "import" or "source", got {code_impl_pattern}')
 
         def udfop(*args, signature=None, **kwargs):
             manno = OpAnno(anno)
