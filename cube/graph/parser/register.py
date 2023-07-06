@@ -2,7 +2,7 @@
 Register cutomized function
 """
 
-from typing import Dict, Callable, List, Optional
+from typing import Dict, Callable, List, Optional, Any
 from functools import partial
 import inspect
 import torch
@@ -11,13 +11,25 @@ from cube.graph.function.dimops import IRDimops, OpAnno
 
 
 class CustomizedOps:
+    """Customized op registry."""
 
+    # signature -> IRDimop creation function
     kOpMap: Dict[str, Callable] = {}
-    # customized operator code: signature -> code
+    # singature -> runtime function 
+    kOpRuntime: Dict[str, Callable] = {}
+    # signature -> runtime function implementation code
     kOpCodeDef: Dict[str, str] = {}
 
     @staticmethod
     def map(signature: str) -> Callable:
+        """Get IRDimop creation function by signature
+        
+        Args:
+            signature (str): operator signature
+
+        Returns:
+            Callable: IRDimop creation function
+        """
         signature = signature.split('.')[-1]
         if signature in CustomizedOps.kOpMap:
             return partial(CustomizedOps.kOpMap[signature], signature=signature)
@@ -26,13 +38,22 @@ class CustomizedOps:
 
     @staticmethod
     def exist(signature: str) -> bool:
+        """Check if the signature is registered"""
         signature = signature.split('.')[-1]
         return signature in CustomizedOps.kOpMap
 
     @staticmethod
-    def register(signature: str, op: Callable, code: str):
-        """
-        Register an operator
+    def register(signature: str, op: Callable, code: str, runtime_fn: Callable):
+        """Register an operator
+
+        Args:
+            signature (str): operator signature
+            op (Callable): IRDimop creation function
+            code (str): runtime function implementation code
+            runtime_fn (Callable): runtime function
+
+        Returns:
+            None
         """
         builtins = ['_operator', 'torch', 'cube.runtime.function']
         if any(signature.startswith(builtin) for builtin in builtins):
@@ -40,14 +61,17 @@ class CustomizedOps:
         signature = signature.split('.')[-1]
         assert signature not in CustomizedOps.kOpMap, f"function {signature} is already registered"
         CustomizedOps.kOpMap[signature] = op
+        CustomizedOps.kOpRuntime[signature] = runtime_fn
         CustomizedOps.kOpCodeDef[signature] = code
 
 
-def register(anno: str, name: Optional[str] = None, rules: Optional[List] = None):
+def register(anno: str, name: Optional[str] = None,
+             rules: Optional[List] = None,
+             input_type_annos: Optional[List[Any]] = None) -> Callable:
     """
     Register a function with einop annotations.
 
-    This function is cooperated with IREinOp.
+    This function is cooperated with IRDimops.
     User needs to define a python function that satisfies
         1). Has type annotations for each input
         2). Tensor inputs goes first then other inputs
@@ -63,11 +87,17 @@ def register(anno: str, name: Optional[str] = None, rules: Optional[List] = None
     Note: for Optional[torch.Tensor] type, user should annotate the
     dimension when the input is not None.
 
-    @param anno str: operator annotation
-    @param name str: operator name
-    @param rules Optional[List[TransformRule]]: additional transformation rules.
+    Args:
+        anno (str): operator annotation
+        name (str): operator name
+        rules (Optional[List[TransformRule]]):
+            additional transformation rules.
+        input_type_annos (Optional[List[Any]]):
+            type annotations for inputs. If not provided, the function 
+            should be annotated with types.
     
-    @return fn Callable: the runtime function
+    Returns:
+        fn (Callable): the runtime function
     """
     def decorator(fn: Callable):
         if not callable(fn):
@@ -76,7 +106,12 @@ def register(anno: str, name: Optional[str] = None, rules: Optional[List] = None
         op_name = name if name is not None else fsig
         args = inspect.signature(fn)
         arg_names = list(args.parameters.keys())
-        arg_kinds = [args.parameters[name].annotation for name in arg_names]
+        # get argument types
+        arg_kinds = input_type_annos if input_type_annos is not None else \
+            [args.parameters[name].annotation for name in arg_names]
+        assert len(arg_kinds) == len(arg_names), \
+            "Number of annotations should match with number of arguments"
+        # parse for number of inputs and kwargs
         allow_types = (torch.Tensor, Optional[torch.Tensor])
         for ninputs, kind in enumerate(arg_kinds):
             if kind in allow_types:
@@ -103,7 +138,7 @@ def register(anno: str, name: Optional[str] = None, rules: Optional[List] = None
             return IRDimops(udfop, op_name, signature, [repr(manno)], tensors, transform_rules=rules, **kwargs)
 
         print(f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
-        CustomizedOps.register(fsig, udfop, code)
+        CustomizedOps.register(fsig, udfop, code, fn)
         return fn
 
     return decorator

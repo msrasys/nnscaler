@@ -5,6 +5,7 @@ from cube.ir.tensor import IRFullTensor
 from cube.graph.parser import ScriptModuleParser
 from cube.graph.parser import FxModuleParser, FxFuncOpTracer
 from cube.graph.parser.concrete_trace_utils import concrete_trace
+from cube.graph.parser.register import CustomizedOps
 from cube.graph import IRGraph
 from cube.flags import CompileFlag
 
@@ -25,6 +26,10 @@ def convert_model(model: torch.nn.Module,
     """
     Convert torch.nn.Module based model into IRGraph
     """
+    # get registered leaf function
+    customized_funcs = CustomizedOps.kOpRuntime.values()
+    leaf_functions = {func: ([], False, None) for func in customized_funcs}
+
     try:
         if CompileFlag.use_torchfx:
             if CompileFlag.use_default_fx_tracer:
@@ -58,6 +63,7 @@ def convert_model(model: torch.nn.Module,
                     dummy_input,
                     use_operator_patch=True,
                     leaf_module=leaf_module,
+                    autowrap_leaf_function=leaf_functions,
                     cpu_offload=True,
                 )
         else:
