@@ -915,30 +915,38 @@ class IRSegment(IRCell):
                             continue
         return outputs
 
-    def create_segment(self, nodes: List[IRCell]) -> IRCell:
-        """!
-        Create a segment with part of the nodes. 
+    def create_segment(self, nodes: List[IRCell], attr_as_inputs: bool = False) -> IRCell:
+        """Create a segment (sub-graph) with part of the nodes.
+
         This only return the created segment wihout modifying the graph.
 
         Calling this requires that the dependencies are already materialized,
-        i.e., every input IRSubTensor should have a corresponding producer.
+        i.e., every input IRSubTensor should have a corresponding producer. Two scenarios
+        satisfy this condition:
 
-        @param nodes List[IRCell]: the subset nodes of this graph
+        1) the node in the graph is not partitioned;
 
-        @return segment IRSegment: the grouped segment. 
+        2) the adapters (communication) are generated.
+
+        Args:
+            nodes (List[IRCell]): the subset nodes of this graph
+            attr_as_inputs (bool): whether to treat attributes as segment inputs
+
+        Returns:
+            segment (IRSegment): the grouped segment. 
         """
         segment = self
         segment_outputs = IRSegment.get_objects_from_complex(segment.outputs())
 
         # setup adapter dependency
-        ad_consumers: Dict[Tuple[IRSubTensor,int], Set[int]] = dict()
-        ad_producers: Dict[Tuple[IRSubTensor,int], Set[int]] = dict()
+        ad_consumers: Dict[Tuple[IRObject,int], Set[int]] = dict()
+        ad_producers: Dict[Tuple[IRObject,int], Set[int]] = dict()
         for adapter in self.select(ntype=IRAdapter):
             for itensor in adapter.inputs():
-                if not isinstance(itensor, IRSubTensor): continue
+                if not isinstance(itensor, IRObject): continue
                 ad_consumers.setdefault((itensor, itensor.device[0]), set()).add(adapter.cid)
             for otensor in adapter.outputs():
-                if not isinstance(otensor, IRSubTensor): continue
+                if not isinstance(otensor, IRObject): continue
                 ad_producers.setdefault((otensor, otensor.device[0]), set()).add(adapter.cid)
 
         # tensor and its device match
@@ -949,7 +957,10 @@ class IRSegment(IRCell):
         for node in nodes:
             for itensor in node.inputs():
                 if not isinstance(itensor, IRObject): continue
-                if itensor.is_attr(): continue
+                if itensor.is_attr():
+                    if attr_as_inputs:
+                        inputs.add(itensor)
+                    continue
                 producers, ptensors = self.producers(itensor.parent), self.ptensors(itensor.parent)
                 pids = set(p.cid for p, t in zip(producers, ptensors) if dmatch(t, itensor))
                 if len(itensor.device) > 0:

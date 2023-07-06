@@ -220,6 +220,7 @@ class IRGraph(IRSegment):
 
         # update gradient for fgraph
         for itensor in fsegment.inputs():
+            if not isinstance(itensor, IRTensor): continue
             fgraph.infer_grad(itensor.parent)
         # update gradient inside segment
         for ftensor in fsegment.full_tensors():
