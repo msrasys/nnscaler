@@ -1103,6 +1103,8 @@ class IRSegment(IRCell):
             return list(rcall(item, modifier) for item in val)
         if isinstance(val, dict):
             return {rcall(key, modifier):rcall(value, modifier) for key, value in val.items()}
+        if isinstance(val, slice):
+            return slice(rcall(val.start, modifier), rcall(val.stop, modifier), rcall(val.step, modifier))
         if isinstance(val, IRObject):
             return modifier(val)
         return val

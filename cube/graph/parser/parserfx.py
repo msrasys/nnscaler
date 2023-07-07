@@ -144,17 +144,43 @@ class FxModuleParser:
 
         # add activations to frame, including call_func/call_method output and final output
         # call_module corresponds to leaf torch.nn.module
+        from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import TensorMetadata
         activation_op_strs = {'call_function', 'output', 'call_method', 'call_module'}
         activation_nodes = [node for node in module.graph.nodes if node.op in activation_op_strs]
+        def parse_complex_out(meta_out):
+            if isinstance(meta_out, TensorMetadata):
+                shape = meta_out.shape
+                assert shape == torch.Size([]), f'{meta_out}'
+                return torch.zeros(shape, dtype=meta_out.dtype, requires_grad=meta_out.requires_grad)
+            elif isinstance(meta_out, dict):
+                ret = {}
+                for k, v in meta_out.items():
+                    ret[k] = parse_complex_out(v)
+                return ret
+            else:
+                return meta_out
         for node in activation_nodes:
-            if hasattr(node, 'meta') and node.meta.get('tensor_meta') and hasattr(node.meta['tensor_meta'], 'dtype'):
+            if hasattr(node, 'meta') and node.meta.get('tensor_meta'):
                 assert isinstance(node, torch.fx.Node)
-                shape = node.meta['tensor_meta'].shape
-                shape = FxModuleParser.shape_refine(shape)
-                dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
-                requires_grad = node.meta['tensor_meta'].requires_grad
-                val = IRFullTensor(shape=shape, requires_grad=requires_grad, dtype=dtype, name=node.name)
-                frame.add_var(node.name, val)
+                if isinstance(node.meta['tensor_meta'], TensorMetadata):
+                    meta_outs = (node.meta['tensor_meta'],)
+                else:
+                    meta_outs = node.meta['tensor_meta']
+                vals = list()
+                for meta_out in meta_outs:
+                    if isinstance(meta_out, TensorMetadata):
+                        shape = meta_out.shape
+                        shape = FxModuleParser.shape_refine(shape)
+                        dtype = DType2IRDType.map(meta_out.dtype)
+                        requires_grad = meta_out.requires_grad
+                        val = IRFullTensor(shape=shape, requires_grad=requires_grad, dtype=dtype, name=node.name)
+                    else:
+                        val = IRObject(value=parse_complex_out(meta_out))
+                    vals.append(val)
+                if len(vals) == 1:
+                    frame.add_var(node.name, vals[0])
+                else:
+                    frame.add_var(node.name, vals)
             else:
                 frame.add_var(node.name, IRObject())
 
@@ -308,12 +334,10 @@ class FxModuleParser:
         if isinstance(ir_node, IRCell):
             ir_nodes.append(ir_node)
             if len(ir_node.outputs()) > 1:
-                # REMARK: some nodes will return multiple outputs, e.g., torch.chunk, while torch.fx always 
-                # return one output. This will cause `getitem`` or `unpacking`` operation on the output, 
-                # which can be folded by setting the list of the output tensor
-                ir_node.infer_shape()
-                ir_node.infer_dtype()
-                frame.set_var(node.name, ir_node.outputs())
+                vals = frame.get_var(node.name)
+                assert len(vals) == len(ir_node.outputs()), f'{vals}, {ir_node.outputs()}'
+                for i in range(len(vals)):
+                    ir_node.set_output(i, vals[i])
             elif ir_node.output(0).value is not None:
                 if FxModuleParser.dynamic_shape:
                     frame.set_var(node.name, ir_node.output(0))

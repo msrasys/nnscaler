@@ -58,7 +58,7 @@ class CodeEmission:
             if prefix_attr is not None and tensor.is_attr():
                 name = prefix_attr + name
         else:
-            name = str(tensor)
+            name = str(IRSegment.modify_objects_of_complex(tensor, CodeEmission.tensor_name)).replace('\'', '')
         return name
 
     @staticmethod

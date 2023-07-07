@@ -87,12 +87,22 @@ class Sign2EmitRule:
         """
         return f"{node.signature}({arg_vars[0]}, '{arg_vars[1]}')"
 
+    @staticmethod
+    def emit_getitem(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
+        """Special rule for generating getitem node
+        """
+        if len(arg_vars) == 2 and len(kw_pairs) == 0 and not arg_vars[1].replace('_', '').isdigit():
+            return f"{node.signature}({arg_vars[0]}, '{arg_vars[1]}')"
+        else:
+            return Sign2EmitRule.emit_common(node, arg_vars, kw_pairs)
+
 
 # the registered emit rules
 Sign2EmitRule._sign2rule = {
     'torch.slice': Sign2EmitRule.emit_slice,
     'setattr': Sign2EmitRule.emit_setattr,
     'builtins.getattr': Sign2EmitRule.emit_getattr,
+    '_operator.getitem': Sign2EmitRule.emit_getitem,
 }
 
 

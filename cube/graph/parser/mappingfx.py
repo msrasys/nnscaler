@@ -115,6 +115,7 @@ class SignFx2Op:
         'builtins.getattr': function.GetAttr,
         'builtins.tuple': function.MakeTuple,
         'builtins.list': function.MakeList,
+        'builtins.slice': function.MakeSlice,
 
         # # torch nn functional
         '_operator.matmul': function.Matmul,

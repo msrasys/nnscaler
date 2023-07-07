@@ -7,6 +7,7 @@ import numpy as np
 import math
 import warnings
 import functools
+from collections.abc import Iterable
 
 from cube.ir.cten import IRTensor, IRObject
 from cube.ir.tensor import IRSubTensor, IRFullTensor
@@ -178,7 +179,7 @@ def Arange(*args, out=None, dtype=None, layout=None,
 def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
           pin_memory=False, memory_format=None, signature=None):
     # note: device is ignored
-    assert layout is None and memory_format is None, f"Not support for non-default memory_format and layout"
+    assert layout in (None, torch.strided) and memory_format is None, f"Not support for non-default memory_format and layout"
     dtype = dtype if dtype is not None else torch.get_default_dtype()
     assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
     signature = 'cube.runtime.function.empty'
@@ -197,7 +198,7 @@ def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requi
 def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
           device=None, requires_grad=False, signature=None):
     # note: device is ignored
-    assert layout is None, f"Not support for non-default layout"
+    assert layout in (None, torch.strided), f"Not support for non-strided layout, get {layout}"
     dtype = dtype if dtype is not None else torch.get_default_dtype()
     assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
     signature = 'cube.runtime.function.zeros'
@@ -208,14 +209,14 @@ def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
     dimop = IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs)
     from cube.graph.parser.dtype import DType2IRDType
-    dimop.output(0).parent.dtype = dtype if isinstance(dtype, IRDType) else DType2IRDType.map(dtype)
+    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
     return dimop
 
 
 def Ones(size, *arg_size, out=None, dtype=None, layout=None,
          device=None, requires_grad=False, signature=None):
     # note: device is ignored
-    assert layout is None, f"Not support for non-default layout"
+    assert layout in (None, torch.strided), f"Not support for non-strided layout, get {layout}"
     dtype = dtype if dtype is not None else torch.get_default_dtype()
     assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
     signature = 'cube.runtime.function.ones'
@@ -233,7 +234,7 @@ def Ones(size, *arg_size, out=None, dtype=None, layout=None,
 def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
          pin_memory=False, memory_format=None, signature=None):
     # note: device is ignored
-    assert layout is None and memory_format is None, f"Not support for non-default memory_format and layout"
+    assert layout in (None, torch.strided) and memory_format is None, f"Not support for non-default memory_format and layout"
     dtype = dtype if dtype is not None else torch.get_default_dtype()
     assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
     signature = 'cube.runtime.function.rand'
@@ -316,10 +317,11 @@ def Expand(input, *sizes, signature = None):
     signature = 'cube.runtime.function.expand'
     edim_in = ShapeAnno.create_shape_str(input.shape)
     assert len(input.shape) == len(sizes)
+    edim_ou = copy.copy(edim_in)
     for idx, (dim, expand_dim) in enumerate(zip(input.shape, sizes)):
         if dim == 1 and dim != expand_dim:
             edim_in[idx] += '^'
-    edim_ou = copy.copy(edim_in)
+            edim_ou[idx] = str(expand_dim)
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
     return IRDimops(Expand, 'expand', signature, [anno], [input], sizes=sizes)
 
@@ -1338,6 +1340,11 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice, int]], signatu
     edim_in = ShapeAnno.create_shape_str(tensor.shape)
     edim_ou = []
     in_idx = 0
+    def obj_helper(obj):
+        if isinstance(obj, IRObject):
+            return obj.value
+        else:
+            return obj
     for slicer in slicers:
         if slicer is None:
             edim_ou.append('1')
@@ -1347,9 +1354,10 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice, int]], signatu
         elif isinstance(slicer, slice):
             if slicer != slice(None, None, None):
                 edim_in[in_idx] += '^'
-            start = 0 if slicer.start is None else slicer.start
-            stop = tensor.shape[in_idx] if slicer.stop is None else slicer.stop
-            step = 1 if slicer.step is None else slicer.step
+            _start, _stop, _step = obj_helper(slicer.start), obj_helper(slicer.stop), obj_helper(slicer.step)
+            start = 0 if _start is None else _start
+            stop = tensor.shape[in_idx] if _stop is None else _stop
+            step = 1 if _step is None else _step
             dimlen = len(range(start, stop, step))
             if dimlen == tensor.shape[in_idx]:
                 edim_ou.append(edim_in[in_idx])
@@ -1658,10 +1666,9 @@ def To(tensor: IRTensor, dtype_or_device, *, out=None, signature = None):
         raise RuntimeError(f'function.To with unknown arg: {dtype_or_device}')
 
 
-def GetItem(a, b, signature = None) -> Union[Any, IRPyFunc]:
-    """
-    _operator.getitem(obj, index: int)
-    """
+def GetItem(a: Any, b: Any, signature = None) -> Union[Any, IRPyFunc]:
+    """_operator.getitem(a, b): return a[b]"""
+    assert not isinstance(b, IRObject)
     obj, index = a, b
     # tensor slice
     if isinstance(obj, IRTensor):
@@ -1689,13 +1696,18 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
             shape = IRObject('shape', value=obj.shape)
             return IRPyFunc(signature, [instance, field], [shape])
         if name == 'dtype':
+            from cube.graph.parser.dtype import IRDType2TorchDType
             assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
             assert hasattr(obj, name), f"attr {name} is not existed in {obj}"
-            return getattr(obj, name)
+            return IRDType2TorchDType.map(getattr(obj, name))
         if name == 'device':
             assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
             # FIXME: this is hack, IRFullTensor does not have attribute "device"
             return torch.device('cpu')
+        if name == 'layout':
+            assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
+            warnings.warn('hack currently, please ensure the input tensor is in torch.strided layout')
+            return torch.strided
     if isinstance(obj, torch.finfo):
         return getattr(obj, name)
     return IRPyFunc(signature, [instance, field], [IRObject()])
@@ -1731,4 +1743,11 @@ def MakeTuple(inputs: Iterable, signature=None):
 
 
 def MakeList(inputs: Iterable, signature=None):
-    return list(inputs)
+    if isinstance(inputs, Iterable):
+        return list(inputs)
+    else:
+        return IRPyFunc(signature, [inputs], [IRObject(value=list(inputs.value))])
+
+
+def MakeSlice(*inputs: Iterable, signature=None):
+    return slice(*inputs)

@@ -67,6 +67,7 @@ import enum
 import importlib
 import re
 import string
+import warnings
 
 from cube.ir.cten import IRTensor, IRObject
 from cube.ir.dtype import DTypeInferRule
@@ -662,6 +663,11 @@ class IRDimops(IRFwOperation):
         """
         for oidx, otensor in enumerate(self.outputs()):
             shape_anno = self.oanno(oidx)
+            if str(shape_anno) == '?':
+                assert isinstance(otensor, IRObject), f"expect IRObject for unknown shape, get {otensor}"
+                warnings.warn('detect IRObject output in a IRDimops, please ensure the annotation is'
+                              'correct w.r.t the partition policy.')
+                continue
             shape = []
             for odim in range(shape_anno.ndims):
                 accum = 1
