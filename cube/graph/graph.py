@@ -22,6 +22,7 @@ from cube.ir.dtype import IRDType, DTypeInferRule
 from cube.graph.function.function import Identity
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.function.pyfunc import IRPyFunc
+from cube.graph.function.dimops import IRDimops, OpAnno
 from cube.graph.segment import IRSegment
 
 from cube.algorithm.generics import GenericDistAlgo
@@ -431,6 +432,147 @@ class IRGraph(IRSegment):
         bsegment.replace(node.mirror, bnodes)
 
         return fnodes
+
+    def fuse(self, nodes: List[IRFwOperation],
+             signature: Optional[str] = None,
+             fuse_op_args: Optional[List[IRObject]] = None,
+             fuse_op_kwargs: Optional[Dict[str, Any]] = None,
+             fuse_op_outputs: Optional[List[IRObject]] = None,
+             fuse_op_anno: str = None,
+             fuse_op_name: str = None) -> IRDimops:
+        """Fuse primitive.
+
+        Fuse a list of forward operators into a single operator.
+        The backward operators will be fused automatically.
+
+        Note:
+            1) fusion can by applied for consecutive operators on the same device (developer-level call).
+            2) fusion can be applied before any node paritioning or after generation of adapters (system-level call).
+
+        Args:
+            nodes (List[IRFwOperation]): the operators to fuse.
+            signature (Optional[str], optional):
+                the signature of the fused operator. If not provided, the fusion will perform a simple grouping of operators,
+                where the underlying runtime still call the unfused kernel one by one. If the signature is provided,
+                the fusion will generate an IRDimops calling `signature`, which is expected to be a function signature
+                of the fused operator. Defaults to None.
+            fuse_op_args (Optional[List[IRObject]], optional):
+                the arguments of the fused operator. Defaults to None.
+            fuse_op_kwargs (Optional[Dict[str, Any]], optional):
+                the keyword arguments of the fused operator. Defaults to None.
+            fuse_op_outputs (Optional[List[IRObject]], optional):
+                the outputs of the fused operator. Defaults to None.
+            fuse_op_anno (str, optional):
+                the annotation of the fused operator. Defaults to None.
+            fuse_op_name (str, optional):
+                the name of the fused operator. Defaults to None.
+
+        Returns:
+            IRDimops: the fused operator.
+        """
+        assert len(nodes) > 0, "Cannot fuse empty list of nodes"
+        assert all([isinstance(node, IRFwOperation) for node in nodes]), \
+            "Only forward operators are allowed to fuse"
+        indices: List[int] = [self.index(node).indices[-1] for node in nodes]
+        assert max(indices) - min(indices) + 1 == len(nodes), \
+            "Only consecutive operators can be fused"
+
+        segment: IRSegment = self.create_segment(nodes)
+        # get inputs where tensors should appear in the front.
+        inputs = list(segment.inputs())
+        attributes = [segment.ctensors(attr)[0] for attr in segment.attributes()]
+        inputs += attributes
+        inputs = [t for t in inputs if isinstance(t, IRTensor)] + [t for t in inputs if not isinstance(t, IRTensor)]
+        # get outputs
+        outputs = list(segment.outputs())
+
+        # reorder and check op inputs and outputs
+        if fuse_op_args is not None:
+            assert len(inputs) == len(fuse_op_args) and set(inputs) == set(fuse_op_args), \
+                "inputs don't match"
+            inputs = fuse_op_args
+        kwargs = {} if fuse_op_kwargs is None else fuse_op_kwargs
+        if fuse_op_kwargs is not None:
+            assert len(outputs) == len(fuse_op_outputs) and set(outputs) == set(fuse_op_outputs), \
+                "outputs don't match"
+            outputs = fuse_op_outputs
+
+        # create annotation. TODO: support partition
+        if fuse_op_anno is None:
+            in_shapes = [[str(dimlen) for dimlen in t.shape] for t in inputs if isinstance(t, IRTensor)]
+            ou_shapes = [[str(dimlen) for dimlen in t.shape] for t in outputs if isinstance(t, IRTensor)]
+            fuse_op_anno: str = OpAnno.create_op_str(in_shapes, ou_shapes)
+
+        if fuse_op_name is None:
+            if len(nodes) < 4:
+                fuse_op_name = '_'.join(['fused'] + [node.name for node in nodes])
+            else:
+                fuse_op_name = '_'.join(['fused'] + [node.name for node in nodes[:3]] + ['etc'])
+
+        # if signature is not provided, register the fused function by
+        # grouping the node implementations together inside a function.
+        # This doesn't make real fusion but can help reduce partition
+        # search space for the policy.
+        make_customized_op: bool = signature is None
+        if signature is None:
+            signature = f'{fuse_op_name}_{nodes[0].cid}_to_{nodes[-1].cid}'
+
+        def fuse_op_fn(*args, **kwargs) -> IRDimops:
+            return IRDimops(fuse_op_fn, fuse_op_name, signature, [fuse_op_anno], args, **kwargs)
+        
+        if make_customized_op:
+            from cube.graph.parser.register import CustomizedOps
+
+            def to_name(t: Any) -> str:
+                """Convert an object to its name."""
+                if isinstance(t, IRObject):
+                    return '_'.join([t.name, str(t.tid)])
+                elif isinstance(t, str) and not t.startswith('self.'):
+                    return f"'{t}'"
+                return str(t)
+            # function inputs / outputs
+            func_inputs = ','.join(to_name(t) for t in inputs)
+            func_kwargs = ','.join(f'{k}={to_name(v)}' for k, v in kwargs.items())
+            func_outputs = ','.join([to_name(t) for t in outputs])
+            # generate code
+            code = [f'def {signature}({func_inputs}, {func_kwargs}):']
+            for node in nodes:
+                node_inputs = ','.join(to_name(t) for t in node.inputs())
+                node_kwargs = ','.join(f'{k}={to_name(v)}' for k, v in node.kwargs.items())
+                node_outputs = ','.join(to_name(t) for t in node.outputs()) if len(outputs) > 0 else '_'
+                code += [f'\t{node_outputs} = {node.signature}({node_inputs}, {node_kwargs})']
+            code.append(f'\treturn {func_outputs}')
+            code = '\n'.join(code)
+            CustomizedOps.register(
+                signature, fuse_op_fn, code, 
+                lambda *args : NotImplementedError("a fused operator doesn't have runtime call")
+            )
+        
+        fuse_op = fuse_op_fn(*inputs, **kwargs)
+        for idx, output in enumerate(outputs):
+            fuse_op.set_output(idx, output)
+        
+        # setup device
+        if len(nodes[0].device) != 0:
+            fuse_op.device = nodes[0].device
+        
+        # replace nodes with the fused operator
+        # remove forward operators
+        segment = self.segment(nodes[0])
+        indices = [segment.remove(node).indices[-1] for node in nodes]
+        idx = min(indices)
+        # remove backward operators
+        have_backward = any(node.mirror is not None for node in nodes)
+        for node in nodes:
+            if node.mirror is not None:
+                segment.mirror.remove(node.mirror)
+        # insert forward/backward operators
+        if have_backward:
+            segment.finsert(fuse_op, idx)
+        else:
+            segment.insert(fuse_op, idx)
+
+        return fuse_op
 
     ## Spatial Primitives ##
 
