@@ -22,7 +22,7 @@ Special identifier:
 
 A `reduction` can be a set of {'', '+', '^'}:
   '' indicates this dimension can be partitioned, and each output should have this dimension.
-  '+' indicates this dimension can be partitioned, and each ouutput doesn't have this and need to do sum-reduction.
+  '+' indicates this dimension can be partitioned, and each output doesn't have this and need to do sum-reduction.
   '^' means this dimension cannot be partitioned.
 
 A dimension can also be annotated with inner-dimensions using brackets, i.e., '(' and ')'.

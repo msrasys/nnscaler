@@ -1,7 +1,7 @@
 import torch
 import enum
 import warnings
-from typing import Any, List, Tuple, Optional, Callable, Union, Dict
+from typing import Any, List, Tuple, Callable, Union, Dict, Type
 
 from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor
@@ -479,18 +479,24 @@ class FxModuleParser:
         print(f'The method is not torch or Tensor, but {sig}')
         return sig
 
-    # this is fixed on master, WAR for 1.5
     @staticmethod
     def _find_module_of_method(orig_method: Callable[..., Any]) -> str:
         name = orig_method.__name__
         module = orig_method.__module__
-        if module is not None:
+        if getattr(orig_method, '__name__', None) == 'apply' and isinstance(getattr(orig_method, '__self__', None), Type) \
+            and issubclass(orig_method.__self__, torch.autograd.Function):
+            # for torch.autograd.Function
+            return f'{orig_method.__self__.__module__}.{orig_method.__self__.__name__}'
+        elif module is not None:
             return module
-        for guess in [torch, torch.nn.functional]:
+        elif hasattr(orig_method, '__qualname__')\
+            and isinstance(orig_method.__qualname__, str) and orig_method.__qualname__.startswith('_VariableFunctionsClass.'):
+            return 'torch._C._VariableFunctions'
+        for guess in [torch, getattr(torch.nn, 'functional')]:
             if getattr(guess, name, None) is orig_method:
                 return guess.__name__
         raise RuntimeError(f'cannot find module for {orig_method}')
-    
+
     @staticmethod
     def _is_torch_autograd_op(node: torch.fx.Node, frame: Frame, signature: str) -> bool:
         """Check whether the node is of a pytorch autograd operation."""

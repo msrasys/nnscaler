@@ -254,9 +254,8 @@ def NewTensor(data, *, dtype=None, device=None,
               requires_grad=False, pin_memory=False, signature=None):
     # note: device is ignored
     dtype = dtype if dtype is not None else torch.get_default_dtype()
-    assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
     signature = 'cube.runtime.function.tensor'
-    size = tuple(np.array(data).shape)
+    size = tuple(np.array(data).shape) if np.array(data).shape else (1,)  # (1,) means it is a scalar
     kwargs = {'size': size, 'requires_grad': requires_grad, 
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(size, True)
@@ -315,13 +314,17 @@ def Expand(input, *sizes, signature = None):
     torch.Tensor.expand(*sizes)
     """
     signature = 'cube.runtime.function.expand'
-    edim_in = ShapeAnno.create_shape_str(input.shape)
-    assert len(input.shape) == len(sizes)
-    edim_ou = copy.copy(edim_in)
-    for idx, (dim, expand_dim) in enumerate(zip(input.shape, sizes)):
-        if dim == 1 and dim != expand_dim:
+    ori_len, exp_len = len(input.shape), len(sizes)
+    assert ori_len <= exp_len
+    assert all(dim == expand_dim or dim == 1 or expand_dim == -1 for dim, expand_dim in zip(input.shape, sizes[-ori_len:]))
+    edim_ou = ShapeAnno.create_shape_str(sizes)
+    edim_in = copy.copy(edim_ou[-ori_len:])
+    for idx, (dim, expand_dim) in enumerate(zip(input.shape, sizes[-len(input.shape):])):
+        if dim == 1 and dim != expand_dim and expand_dim != -1:
             edim_in[idx] += '^'
-            edim_ou[idx] = str(expand_dim)
+            edim_ou[exp_len - ori_len + idx] = str(expand_dim)
+    for idx in range(exp_len - ori_len):
+        edim_ou[idx] = str(sizes[idx])
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
     return IRDimops(Expand, 'expand', signature, [anno], [input], sizes=sizes)
 
@@ -406,6 +409,18 @@ def Mul(input, other, *, out=None, signature = None):
         lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
     return IRDimops(Mul, 'mul', signature, annos, [input, other])
+
+
+def Mod(input, other, *, out = None, signature = None):
+    assert out is None
+    if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
+        return input % other
+    signature = 'torch.fmod'
+    annos = ['*, ? -> *']
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+    return IRDimops(Mod, 'mod', signature, annos, [input, other])
 
 
 def Div(input, other, *, rounding_mode=None, out=None, signature = None):
@@ -837,6 +852,36 @@ def Transpose(input, dim0, dim1, signature = None):
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
     return IRDimops(Transpose, 'transpose', signature, [anno], [input],
                     dim0=dim0, dim1=dim1)
+
+
+def Split(tensor, split_size_or_sections, dim = 0, signature = None):
+    """
+    torch.functional.split(tensor, split_size_or_sections, dim=0) -> List[Tensor]
+    """
+    if isinstance(split_size_or_sections, int):
+        sections = [split_size_or_sections for _ in range(tensor.shape[dim] // split_size_or_sections)]
+        if tensor.shape[dim] % split_size_or_sections != 0:
+            sections.append(tensor.shape[dim] % split_size_or_sections)
+    else:
+        sections = split_size_or_sections
+    assert sum(sections) == tensor.shape[dim]
+    edim_in = ShapeAnno.create_shape_str(tensor.shape)
+    edim_ous = [copy.copy(edim_in) for _ in sections]
+    edim_in[dim] = str(tensor.shape[dim])
+    for edim_ou, dimlen in zip(edim_ous, sections):
+        edim_ou[dim] = str(dimlen)
+    anno = OpAnno.create_op_str([edim_in], edim_ous)
+    return IRDimops(Split, 'split', signature, [anno], [tensor], split_size_or_sections=split_size_or_sections, dim=dim)
+
+
+def Contiguous(input, memory_format = None, signature = None):
+    """
+    torch.Tensor.contiguous(Tensor self) -> Tensor
+    """
+    assert memory_format is None
+    anno = ['* -> *']
+    signature = 'torch.Tensor.contiguous'
+    return IRDimops(Contiguous, 'contiguous', signature, anno, [input])
 
 
 def _reshape_anno(in_shape: List[int], ou_shape: List[int], kwarg_name: str) -> Tuple[str, List[TransformRule]]:
@@ -1424,7 +1469,7 @@ def Repeat(tensor, repeats: Tuple[int], *arg_repeats, signature = None):
     signature = 'torch.ops.aten.repeat'
     repeats = (repeats,) if isinstance(repeats, int) else tuple(repeats)
     repeats = repeats + arg_repeats
-    in_shape = tensor.shape
+    in_shape = list(tensor.shape)
     assert len(in_shape) <= len(repeats), "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor"
     expand = len(repeats) - len(tensor.shape)
     in_shape += [1] * expand
@@ -1637,12 +1682,21 @@ def Size(tensor, dim=None, signature = None) -> Union[List[int], IRPyFunc]:
     torch.Tensor.size(tensor, dim=None)
     """
     assert isinstance(tensor, IRTensor)
-    val = tensor.shape[dim] if isinstance(dim, int) else list(tensor.shape)
+    val = tensor.shape[dim] if isinstance(dim, int) else tensor.shape
     assert val is not None
     if dim is None:
         return IRPyFunc(signature, [tensor], [IRObject(name='size', value=val)])
     else:
         return IRPyFunc(signature, [tensor], [IRObject(name='size', value=val)], dim=dim)
+
+
+def Dim(tensor, signature=None) -> Union[List[int], IRPyFunc]:
+    """
+    torch.Tensor.dim(tensor)
+    """
+    assert isinstance(tensor, IRTensor)
+    # constant
+    return len(tensor.shape)
 
 
 def To(tensor: IRTensor, dtype_or_device, *, out=None, signature = None):
@@ -1751,3 +1805,13 @@ def MakeList(inputs: Iterable, signature=None):
 
 def MakeSlice(*inputs: Iterable, signature=None):
     return slice(*inputs)
+
+
+def Is(input, other, signature=None):
+    assert not isinstance(input, IRObject) and not isinstance(other, IRObject)
+    return input is other
+
+
+def IsNot(input, other, signature=None):
+    assert not isinstance(input, IRObject) and not isinstance(other, IRObject)
+    return input is not other

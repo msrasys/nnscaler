@@ -650,7 +650,10 @@ class IRTensor(IRObject):
 
     @property
     def shape(self) -> Tuple[int]:
-        return list(self._shape)
+        # NOTE: here return a tuple but not a real torch.Size obj may have risk, here is an example:
+        # (torch.Size + tuple -> torch.Size) will change to (tuple + tuple -> tuple), is ok.
+        # (torch.Size + list -> torch.Size) will change to (tuple + list -> error), is wrong.
+        return self._shape
 
     @shape.setter
     def shape(self, val: Tuple[int]):

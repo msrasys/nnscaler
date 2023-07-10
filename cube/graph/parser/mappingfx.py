@@ -79,6 +79,7 @@ class SignFx2Op:
         __tttemplate('bool'): function.Bool,
         __ttemplate('fill_'): function.Fill,
         __ttemplate('masked_fill'): function.MaskedFill,
+        __tttemplate('masked_fill_'): function.MaskedFill,
         __ttemplate('cumsum'): function.CumSum,
         __ttemplate('tanh'): function.Tanh,
         __ftemplate('softmax') : function.Softmax,
@@ -111,6 +112,7 @@ class SignFx2Op:
         # ============== runtime function =================
         __tttemplate('size'): function.Size,
         __tttemplate('to'): function.To,
+        __tttemplate('dim'): function.Dim,
         '_operator.getitem': function.GetItem,
         'builtins.getattr': function.GetAttr,
         'builtins.tuple': function.MakeTuple,
@@ -142,7 +144,9 @@ class SignFx2Op:
         # __ttemplate('to'): function.ToTensor,
         __ttemplate('rand'): function.Rand,
         # __ttemplate('clone'): function.Clone,
-        #
+
+        '_operator.is_': function.Is,
+        '_operator.is_not': function.IsNot,
         __ttemplate('add') : function.Add,
         '_operator.add': function.Add,
         '_operator.iadd': function.Add, # FIXME: may waste memory
@@ -151,6 +155,7 @@ class SignFx2Op:
         __ttemplate('mul') : function.Mul,
         '_operator.mul': function.Mul,
         '_operator.imul': function.Mul, # FIXME: may waste memory
+        '_operator.mod': function.Mod,
         
         __ttemplate('div') : function.Div,
         __ttemplate('true_divide'): function.Div,
@@ -166,6 +171,7 @@ class SignFx2Op:
         __ttemplate('lt'): function.CompareLT,
         __ttemplate('ge'): function.CompareGE,
         __ttemplate('le'): function.CompareLE,
+        '_operator.le': function.CompareLE,
         #
         __ttemplate('sin'): function.Sin,
         #
@@ -176,6 +182,7 @@ class SignFx2Op:
         #
         # __ttemplate('view'): function.View,
         __tttemplate('view'): function.View,
+        __tttemplate('contiguous'): function.Contiguous,
         
         __ttemplate('reshape'): function.Reshape,
         #
@@ -221,4 +228,5 @@ class SignFx2Op:
         # #einops
         # __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
 
+        'torch.functional.split': function.Split
     }
