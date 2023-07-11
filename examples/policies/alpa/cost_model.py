@@ -181,7 +181,7 @@ class CostModel:
                            CommCost.allgather_cost(tensor, num_devices) + CommCost.reducescatter_cost(tensor, num_devices)
                 # all2all-all2all or identity-identity
                 if dst_split.isD():
-                    return 0.0 if src_split.dim == dst_split.dim else 2 * CommCost.alltoall_cost(tensor, num_devices)
+                    return 0.0 if src_split == dst_split else 2 * CommCost.alltoall_cost(tensor, num_devices)
             raise NotImplementedError(f"Unknown split type: {src_split} -> {dst_split}")
 
         # FIXME: need consider cases that an operator has multiple **same** inputs
