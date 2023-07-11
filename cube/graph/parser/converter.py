@@ -4,7 +4,7 @@ import warnings
 from cube.ir.tensor import IRFullTensor
 from cube.graph.parser import ScriptModuleParser
 from cube.graph.parser import FxModuleParser, FxFuncOpTracer
-from cube.graph.parser.concrete_trace_utils import concrete_trace
+from cube.graph.parser.concrete_trace_utils import concrete_trace, ExtraSEFPatcher
 from cube.graph.parser.register import CustomizedOps
 from cube.graph import IRGraph
 from cube.flags import CompileFlag
@@ -38,6 +38,8 @@ def convert_model(model: torch.nn.Module,
                 # Symbolic tracing frontend - captures the semantics of the module
                 tracer = FxFuncOpTracer()
                 traced_graph: torch.fx.Graph = tracer.trace(model)
+                with ExtraSEFPatcher():
+                    traced_graph.eliminate_dead_code()
                 traced_model: torch.fx.GraphModule = torch.fx.GraphModule(model, traced_graph)
                 if CompileFlag.log_parser:
                     traced_model.graph.print_tabular()

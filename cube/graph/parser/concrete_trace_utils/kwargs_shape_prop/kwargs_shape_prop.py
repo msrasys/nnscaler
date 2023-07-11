@@ -1,14 +1,11 @@
-import builtins
-import operator
 import torch
 import traceback
-from torch.fx import GraphModule
 from torch.fx.node import Node, map_aggregate
 from typing import Optional, Union, NamedTuple, Tuple, Any, Dict
 from .kwargs_interpreter import KwargsInterpreter
 
 
-__all__ = ['TensorMetadata', 'KwargsShapeProp', 'DCEHandler']
+__all__ = ['TensorMetadata', 'KwargsShapeProp']
 
 
 class TensorMetadata(NamedTuple):
@@ -100,35 +97,3 @@ class KwargsShapeProp(KwargsInterpreter):
     
     def propagate(self, concrete_args: Union[Dict[str, Any], Tuple]):
         return super().run(concrete_args)
-
-
-class DCEHandler:
-    dont_delete = [operator.setitem, builtins.next]
-
-    def __init__(self, gm: torch.fx.GraphModule):
-        self.gm = gm
-        
-    def eliminate_dead_code(self):
-        to_check = set()
-        for node in self.gm.graph.nodes:
-            to_check.add(node)
-        while True:
-            deleted = False
-            modified = set()
-            for node in to_check:
-                if node.op == 'output':
-                    continue
-                if not node.users and node.op != 'placeholder' and node.target not in DCEHandler.dont_delete:
-                    for input_node in node.all_input_nodes:
-                        input_node.users.pop(node)
-                        modified.add(input_node)
-                    node._remove_from_list()
-                    if node in modified:
-                        modified.remove(node)
-                    deleted = True
-            if deleted is False:
-                break
-            else:
-                to_check = modified
-        name = self.gm.__class__.__name__
-        return GraphModule(self.gm, self.gm.graph, name)

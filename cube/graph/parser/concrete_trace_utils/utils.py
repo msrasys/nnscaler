@@ -108,3 +108,16 @@ def map_recursive_zip(fn: Callable, arg0, *args) -> Any:
     else:
         # assert not _orig_isinstance(arg0, slice)
         return fn(arg0, *args)
+
+
+class ExtraSEFPatcher:
+    from torch.fx.node import _side_effectful_functions
+    # some side effectful functions that should not be deleted during dead code elimination
+    # there may be more than listed here
+    extra_funcs = {operator.setitem, builtins.next} - _side_effectful_functions
+
+    def __enter__(self):
+        self._side_effectful_functions.update(self.extra_funcs)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._side_effectful_functions.difference_update(self.extra_funcs)

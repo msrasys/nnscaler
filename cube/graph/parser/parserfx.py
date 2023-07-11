@@ -94,9 +94,7 @@ class FxModuleParser:
 
         The overall entry to parse a torch.fx graph module
         """
-        from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import DCEHandler
         from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
-        DCEHandler(module).eliminate_dead_code()
 
         frame = frame if frame is not None else Frame()
         frame.push_var()
