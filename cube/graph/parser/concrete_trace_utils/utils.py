@@ -2,6 +2,7 @@
 # Licensed under the MIT license.
 
 import builtins
+from dataclasses import dataclass
 import operator
 from typing import Any, Callable, Type
 import functools
@@ -109,6 +110,19 @@ def map_recursive_zip(fn: Callable, arg0, *args) -> Any:
         # assert not _orig_isinstance(arg0, slice)
         return fn(arg0, *args)
 
+
+@dataclass
+class FrameRecord:
+    filename: str
+    lineno: str
+    line: str
+    name: str
+
+    def __repr__(self) -> str:
+        if self.filename:
+            return f'File "{self.filename}", line {self.lineno}, in {self.name},  {self.line}'
+        else:
+            return ''
 
 class ExtraSEFPatcher:
     from torch.fx.node import _side_effectful_functions

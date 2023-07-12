@@ -11,12 +11,14 @@ import logging
 import operator
 import functools
 import builtins
-from packaging import version 
+import traceback
+import importlib.util
 
 from itertools import chain
 from types import BuiltinMethodType, FunctionType, MethodDescriptorType, MethodType, MethodWrapperType, ModuleType
 from typing import Any, Dict, Iterable, Iterator, Optional, Set, Tuple, Type, List, Callable, Union
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 from torch._C import ScriptObject
@@ -122,6 +124,8 @@ from .utils import (
     _orig_max,
 
     _orig_node_is_impure,
+
+    FrameRecord,
 )
 
 # some side effectful functions that should not be deleted during dead code elimination
@@ -442,6 +446,21 @@ class ConcreteTracer(TracerBase):
         assert isinstance(kwargs_, dict)
 
         node = self.create_node(kind, target, args_, kwargs_, name, type_expr)
+
+        # record code frame, include filename, line number, and function name
+        frame_record = FrameRecord(None, None, None, None)
+        cube_cct_path = str(Path(__file__).parent) + '/'  # the cube concrete tracer path
+        torch_path = str(Path(importlib.util.find_spec('torch').origin).parent) + '/'  # the torch path
+        ignore_dirs = [cube_cct_path, torch_path]
+        for frame in traceback.extract_stack()[-2::-1]:
+            if any(p in frame.filename for p in ignore_dirs):
+                continue
+            frame_record.filename = frame.filename
+            frame_record.lineno = frame.lineno
+            frame_record.line = frame.line
+            frame_record.name = frame.name
+            break
+        node.meta['frame_record'] = frame_record
 
         proxy = self.proxy(value_unwrapped, node)
         return proxy

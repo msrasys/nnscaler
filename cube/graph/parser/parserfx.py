@@ -294,6 +294,9 @@ class FxModuleParser:
             assert len(ir_node.outputs()) == 1
             output_val = frame.get_var(node.name)
             ir_node.set_output(0, output_val)
+            comment = str(node.meta.get('frame_record', ''))
+            if comment:
+                ir_node.comment = comment
             return [ir_node]
         else:
             raise RuntimeError(f'unknown module: {prim_module.__class__.__module__}')
@@ -327,6 +330,11 @@ class FxModuleParser:
                 warnings.warn(f'Set python runtime function: {fsig}',
                               category=RuntimeWarning)
                 ir_node = IRPyFunc(fsig, input_vals, [IRObject()], **kwargs)
+
+        if isinstance(ir_node, IRCell):
+            comment = str(node.meta.get('frame_record', ''))
+            if comment:
+                ir_node.comment = comment
 
         ir_nodes = []
         if isinstance(ir_node, IRCell):
