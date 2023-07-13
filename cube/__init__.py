@@ -35,7 +35,7 @@ def _init_logger():
         level(CompileFlag.log_parser)
     )
     logging.getLogger('cube.prim').setLevel(
-        level(CompileFlag.log_transform)
+        level(CompileFlag.log_prim)
     )
     logging.getLogger('cube.adapter').setLevel(
         level(CompileFlag.log_adapter)
