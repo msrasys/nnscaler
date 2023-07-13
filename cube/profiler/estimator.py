@@ -1,6 +1,7 @@
 from typing import Union, Tuple
 import sys
 import os
+import logging
 
 from cube.ir.operator import IRFwOperation
 from cube.graph.segment import IRSegment
@@ -40,7 +41,7 @@ class Estimator:
             except Exception as e:
                 color, default = '\033[31m', '\033[0m'
                 error_msg = f'fail to run node: {node}\nerror: {e}'
-                print(f'{color}{error_msg}{default}', file=sys.stderr)
+                logging.getLogger('cube.profiler').error(f'{color}{error_msg}{default}')
                 fw_span, bw_span, infer_mem, train_mem_info = 0, 0, 0, [0]
 
             if train:

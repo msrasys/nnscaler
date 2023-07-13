@@ -1,6 +1,7 @@
 from typing import Any, List
+import logging
+from cube.utils import print_each_rank
 import torch
-from cube.profiler.timer import print_each_rank
 
 
 def memory_summary():
@@ -10,6 +11,7 @@ def memory_summary():
     # mem = torch.cuda.max_memory_reserved()
     print_each_rank(
         '{:.2f} GB memory consumption'.format(mem / 1024 / 1024 / 1024),
+        logger_fn=logging.getLogger('cube.profiler').info
     )
     
     return mem
@@ -28,6 +30,7 @@ def model_summary(model: torch.nn.Module, inputs: List[Any], do_eval=False, max_
 
     Make sure all of these attributes are not used in modules.
     """
+    logger = logging.getLogger('cube.profiler')
     torch.cuda.empty_cache()
     static_memory = torch.cuda.memory_allocated()
     print_each_rank(
@@ -45,7 +48,8 @@ def model_summary(model: torch.nn.Module, inputs: List[Any], do_eval=False, max_
                 name = module.__class__.__name__
                 module._summary_begin_end = True
                 prefix = '   ' * module._summary_depth + '[Begin] > '
-                print_each_rank(prefix + '{}:'.format(name), rank_only=0)
+                print_each_rank(prefix + '{}:'.format(name), rank_only=0, 
+                                logger_fn=logger.info)
         if module._summary_depth < max_depth:
             module._summary_memory_state = torch.cuda.memory_allocated()
         stat['depth'] += 1
@@ -67,7 +71,8 @@ def model_summary(model: torch.nn.Module, inputs: List[Any], do_eval=False, max_
         prefix += '[End] > ' if module._summary_begin_end else '> '
         print_each_rank(
             prefix + '{}: Mem {:,.2f} MB, Params: {:,} ({:,.2f} MB if fp32)'.format(
-                name, mem_consumption, n_params, n_params / 1024 / 1024 * 4), rank_only=0)
+                name, mem_consumption, n_params, n_params / 1024 / 1024 * 4),
+            rank_only=0, logger_fn=logger.info)
 
     handle_pre = torch.nn.modules.module.register_module_forward_pre_hook(before_forward)
     handle_after = torch.nn.modules.module.register_module_forward_hook(after_forward)

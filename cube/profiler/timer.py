@@ -113,7 +113,7 @@ class CudaTimer:
         @return span float: wall clock in milliseconds.
         """
         if field_name not in self.instance.field:
-            logging.getLogger('profiler').warning(f"CudaTimer: {field_name} doesn't record.")
+            logging.getLogger('cube.profiler').warn(f"CudaTimer: {field_name} doesn't record.")
             return 0.0
         if len(self.instance.field[field_name]) != 0:
             raise RuntimeError(f"timer for field {field_name} not stopped")

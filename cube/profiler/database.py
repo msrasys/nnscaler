@@ -7,6 +7,7 @@ import torch
 import time
 import os
 import json
+import logging
 import _operator
 
 import cube
@@ -252,20 +253,20 @@ class ProfileDataBase:
                     residual_mem += t.byte_size()
                 in_mem_info.append(t.byte_size())
             else:
-                print(f'WARNING: input {t} is skipped.')
+                logging.getLogger('cube.profiler').warn('skip input {t}')
 
         # run profiling
         try:
             fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx = \
                 CompProfiler.profile(fn, shapes, dtypes, requires_grads, values, **kwargs)
         except:
-            print(f'WARNING: fail to profile {node}')
+            logging.getLogger('cube.profiler').error('fail to profile {node}')
             fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx = 0, 0, 0, [], []
         # log to database
         key = self._serialize(node)
         self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span,\
             infer_memory, train_mem_info, residual_mem, train_mem2in_idx)
-        print(
+        logging.getLogger('cube.profiler').info(
             f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} "
             f"=> in mem info: {in_mem_info} | param mem info: {param_mem_info} | fw: {round(fw_span, 2)} ms | "
             f"bw: {round(bw_span, 2)} ms | infer mem: {infer_memory} | train mem info: {train_mem_info} | idx: {train_mem2in_idx}")
