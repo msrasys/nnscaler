@@ -142,7 +142,7 @@ def compile(model: SemanticModel, *args,
             # setup program output
             Program().set_output(outputs)
             span = time.time() - start
-            logger.info('> finish parsing iteration: {:.2f} s'.format(span))
+            logger.info('finish parsing iteration: {:.2f} s'.format(span))
 
             # run policy
             start = time.time()
@@ -150,7 +150,7 @@ def compile(model: SemanticModel, *args,
             assert callable(PAS), f"Policy PAS is not callable"
             graph = PAS(graph, resource)
             span = time.time() - start
-            logger.info('> finish policy expression: {:.2f} s'.format(span))
+            logger.info('finish policy expression: {:.2f} s'.format(span))
 
             if not isinstance(graph, IRGraph):
                 raise RuntimeError("Expected policy return IRGraph")
@@ -169,14 +169,14 @@ def compile(model: SemanticModel, *args,
             start = time.time()
             graph = IRAdapterGener.gen(graph, cost_fn=comm_cost_fn)
             span = time.time() - start
-            logger.info('> finish generating adapters: {:.2f} s'.format(span))
+            logger.info('finish generating adapters: {:.2f} s'.format(span))
 
             if graph.sched is not None:
                 start = time.time()
                 graph.sched.apply()
                 logging.getLogger('cube.schedule').info(f'schedule:\n{graph.sched}')
                 span = time.time() - start
-                logger.info('> finish planpass on applying schedule strategy: {:.2f} s'.format(span))
+                logger.info('finish planpass on applying schedule strategy: {:.2f} s'.format(span))
 
             # to execution plan
             start = time.time()
@@ -187,13 +187,13 @@ def compile(model: SemanticModel, *args,
             if CompileFlag.visualize_plan:
                 execplan.visualize('plan.png')
             span = time.time() - start
-            logger.info('> finish lowering to execution plan: {:.2f} s'.format(span))
+            logger.info('finish lowering to execution plan: {:.2f} s'.format(span))
 
             # plan pass for communication optimization
             start = time.time()
             execplan = DiffFusion.apply(execplan)
             span = time.time() - start
-            logger.info('> finish planpass on diff-fusion operations: {:.2f} s'.format(span))
+            logger.info('finish planpass on diff-fusion operations: {:.2f} s'.format(span))
 
             # execplan.visualize(outfile='plan.png')
 
@@ -202,7 +202,7 @@ def compile(model: SemanticModel, *args,
                 start = time.time()
                 execplan = Grouping.apply(execplan)
                 span = time.time() - start
-                logger.info('> finish planpass on grouping operations: {:.2f} s'.format(span))
+                logger.info('finish planpass on grouping operations: {:.2f} s'.format(span))
 
             # execplan.graph.reset_dependency()
             # execplan.analyze(outfile='execplan.png')
@@ -227,11 +227,11 @@ def compile(model: SemanticModel, *args,
                     attach=True
                 )
             span = time.time() - start
-            logger.info('> finish generating code: {:.2f} seconds'.format(span))
+            logger.info('finish generating code: {:.2f} seconds'.format(span))
 
             compile_end = time.time()
             compile_time = compile_end - compile_start
-            logger.info('> compile time: {:.2f} seconds'.format(compile_time))
+            logger.info('compile time: {:.2f} seconds'.format(compile_time))
 
         if torch.distributed.is_initialized():
             if DeviceGroup().local_rank != 0 and CompileFlag.worker_sleep > 0:
@@ -251,7 +251,7 @@ def compile(model: SemanticModel, *args,
         # set dataloder batch size (serialize output)
         if dataloader is not None:
             bs = model.get_gen_module().get_batch_size()
-            print_each_rank(f'> setting batch size to: {bs}', logger_fn=logger.info)
+            print_each_rank(f'setting batch size to: {bs}', logger_fn=logger.info)
             if torch.distributed.is_initialized():
                 for rank in range(torch.distributed.get_world_size()):
                     if rank == torch.distributed.get_rank():

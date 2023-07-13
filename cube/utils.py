@@ -29,10 +29,10 @@ def print_each_rank(msg: str, rank_only: Optional[int] = None, logger_fn: Callab
     for rank in range(torch.distributed.get_world_size()):
         if rank_only is None:
             if myrank == rank:
-                logger_fn('rank [{}]: {}\n'.format(rank, msg))
+                logger_fn('rank [{}]: {}'.format(rank, msg))
         else:
             if myrank == rank_only and rank_only == rank:
-                logger_fn('rank [{}]: {}\n'.format(rank, msg))
+                logger_fn('rank [{}]: {}'.format(rank, msg))
         torch.distributed.barrier()
 
 
