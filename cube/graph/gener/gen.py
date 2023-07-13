@@ -137,9 +137,21 @@ class IRAdapterGener:
     
     @staticmethod
     def auto_pyfunc(graph: IRGraph):
-        """
-        Make pyfunc to be local
+        """Transform and assign IRPyFunc.
+
         IRPyFunc will be replicated to devices with its producers output
+        
+        Note if an IRPyFunc has no input, indicating its device can not
+        be indicated from any other operators. In this case, the pyfunc
+        will be replicated to all devices in its segment. To restrict
+        the replicaed devices in pipeline-like scenarios, use `graph.staging`
+        to group the operators into segments.
+    
+        Args:
+            graph (IRGraph): the graph to be transformed
+        
+        Returns:
+            graph (IRGraph): the transformed graph
         """
         for func in graph.select(ntype=IRPyFunc, flatten=True):
             # get devices it will lowered to
@@ -155,6 +167,10 @@ class IRAdapterGener:
                 if not isinstance(t, IRObject): continue
                 if t in segment_outputs:
                     devices.update(segment.device)
+            # if a pyfunc doesn't have input, it will be replicated
+            # to all devices in its segment.
+            if len(devices) == 0:
+                devices = set(segment.device)
             # replicate
             pyfuncs = [func.replicate() for _ in devices]
             for devid, pyfunc in zip(sorted(devices), pyfuncs):
