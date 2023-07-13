@@ -1,4 +1,5 @@
 from typing import List, Optional, Any, Dict, Union, Tuple
+import logging
 from cube.algorithm.generics import GenericDistAlgo
 
 from cube.graph.function.dimops import IRDimops, DimAnno, DimopSplit, TransformRule
@@ -6,8 +7,6 @@ from cube.ir.tensor import IRSubTensor
 from cube.ir.cten import IRTensor
 from cube.ir.operator import IRFwOperation
 from collections import deque
-
-from cube.flags import CompileFlag
 
 
 class DimSplitEinops(GenericDistAlgo):
@@ -124,9 +123,9 @@ class DimSplitEinops(GenericDistAlgo):
         else:
             adim, reduce = 'Value', None
         
-        if CompileFlag.log_transform:
-            color, default = '\033[32m' if satisfy else '\033[31m', '\033[0m'
-            print(f"split {node.name}: {node.anno} | dim: {adim} num: {num} reduce: {reduce} ... {color}{'Success' if satisfy else 'Failed!'}{default}")
+        logger = logging.getLogger('cube.prim')
+        color, default = '\033[32m' if satisfy else '\033[31m', '\033[0m'
+        logger.info(f"split {node.name}: {node.anno} | dim: {adim} num: {num} reduce: {reduce} ... {color}{'Success' if satisfy else 'Failed!'}{default}")
 
         if not satisfy: return None
         rule: TransformRule = self.infer(idx, dim, num)
