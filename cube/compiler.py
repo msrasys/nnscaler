@@ -174,7 +174,7 @@ def compile(model: SemanticModel, *args,
             if graph.sched is not None:
                 start = time.time()
                 graph.sched.apply()
-                logging.getLogger('cube.schedule').info(f'schedule:\n{graph.sched}')
+                logging.getLogger('cube.execplan').info(f'schedule:\n{graph.sched}')
                 span = time.time() - start
                 logger.info('finish planpass on applying schedule strategy: {:.2f} s'.format(span))
 

@@ -1,4 +1,5 @@
 from typing import List, Union, Set
+import logging
 from cube.graph.graph import IRSegment
 
 from cube.ir.adapter import IRAdapter
@@ -44,7 +45,8 @@ class DiffFusion(PlanPass):
                         ret = DiffFusion.nnfuse(fadapter)
                         cnt = cnt+1 if ret else cnt
                 visited.add(node)
-        print(f'successfully generate {cnt} differentiable adapters')
+        logging.getLogger('cube.execplan').info(
+            f'adapter fusion: successfully fuse {cnt} differentiable adapters')
         return execplan
 
     @staticmethod
