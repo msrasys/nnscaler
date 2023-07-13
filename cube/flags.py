@@ -18,9 +18,20 @@ def _to_int(s: str, default=0) -> int:
 class CompileFlag:
 
     # ============= loggings ===================
-    log_transform = _to_bool('LOG_TRANSFORM')
-    log_schedule = _to_bool('LOG_SCHEDULE')
+    # log the parser information
     log_parser = _to_bool('LOG_PARSER')
+    # log the primitives applied on the cube graph
+    log_prim = _to_bool('LOG_PRIM')
+    # log the adapter information during communication generation
+    log_adapter = _to_bool('LOG_ADAPTER')
+    # log the execution plan
+    log_execplan = _to_bool('LOG_EXECPLAN')
+    # log the code generation information
+    log_codegen = _to_bool('LOG_CODEGEN')
+    # log the runtime information
+    log_runtime = _to_bool('LOG_RUNTIME')
+    # log the profiling information
+    log_profiler = _to_bool('LOG_PROFILER')
 
     # ================ compiling ========================
     use_torchfx = _to_bool('USE_TORCHFX')  # using torch.fx or torchscript as frontend to capture dataflow graph
