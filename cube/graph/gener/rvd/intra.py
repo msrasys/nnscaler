@@ -3,7 +3,7 @@ from functools import partial
 import numpy as np
 import sys
 import copy
-import warnings
+import logging
 
 from cube.ir.dtype import IRDType
 from cube.ir.cten import IRCell
@@ -211,7 +211,6 @@ class IntraTransition:
             for olayout in olayouts:
                 if len(ilayouts) > 1: olayout = copy.copy(olayout)
                 if len(olayouts) > 1: ilayout = copy.copy(ilayout)
-                # print(f'transition: {ilayout}{tuple(t.device[0] for t in ilayout.mat.flatten())} -> {olayout}')
                 imat = RVDLayout.dim2last(ilayout.mat, decd, chunks)
                 omat = RVDLayout.dim2last(olayout.mat, incd, chunks)
                 for itensor, otensor in zip(imat.flatten(), omat.flatten()):
@@ -264,7 +263,7 @@ class IntraPathFinder:
                 f"Switch to a fixed plan: ilayout -> FullReplica -> olayout"
             )
             color, default = '\033[33m' , '\033[0m'
-            print(color+warn_msg+default, file=sys.stderr)
+            logging.getLogger('cube.adapter').warn(f'intra-RVD:\n{color+warn_msg+default}')
             all_prims = IntraPathFinder.backup_path(ilayout, olayout, cost_fn)
 
         return all_prims
@@ -391,7 +390,6 @@ class IntraPathFinder:
                 visited.add(visit)
             IntraPathFinder._cached_intra_paths[key][src_rvd] = paths
         
-        # print for debug
         # for idx, path in enumerate(paths):
         #     print(f"{src} -> {nodes[idx]}: {' -> '.join([str(nodes[i]) for i in path])} | cost: {cost[idx]}")
         
@@ -558,9 +556,6 @@ class IntraAutoPlacer:
         assert len(producers) == len(consumers), \
             f"Expect same number of producer and consumer, but got {len(producers)} producers and {len(consumers)} consumers"
 
-        if any(len(consumer.device) > 0 for consumer in consumers):
-            warnings.warn('Detected at least one consumer has been assigned to a device, which will be overrided by a new device placement.')
-        
         if len(producers) == 1:
             return [producers[0].device[0]]
 
@@ -663,11 +658,12 @@ class IntraAutoPlacer:
         # - if not find, keep forward one as optimal and adopt backup plan for backward one
         else:
             placement = list(fw_consumer_devices)[0]
-            print(f"================ forward-backward mis-aligned! ============== \n"
+            msg = (f"================ forward-backward mis-aligned! ============== \n"
                   f"fw device choices: {fw_consumer_devices} | hops: {'->'.join(str(rvd) for rvd in fw_rvd_hops)}\n"
                   f"bw hops: {'->'.join(str(rvd) for rvd in bw_rvd_hops)}\n"
                   f"using placement: {placement}\n"
                   f"=============================================================")
+            logging.getLogger('cube.adapter').warn(f'intra-RVD:\n{msg}')
             bw_rvd_hops = IntraPathFinder.get_backup_path(ftensor, bw_src_rvd, bw_dst_rvd, cost_fn)
 
         # estimate cost

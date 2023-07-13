@@ -4,7 +4,7 @@ Concurrent producer / consumer Adapter Generator
 from typing import List, Optional, Dict, Tuple, Callable
 import copy
 import numpy as np
-import sys
+import logging
 
 from cube.ir.tensor import IRFullTensor, IRSubTensor, IndexMap, ValueMap
 from cube.ir.adapter.prim import IRAdapterPrim
@@ -59,13 +59,14 @@ class ConcurrentGener:
             except Exception as e:
                 fadapter = None
                 color, default = '\033[33m' , '\033[0m'
-                print(
+                msg = (
                     f"{color}========== Fail to use intra-RVD ==========\n"
                     f"full tensor: {fptensors[0].parent} | is grad: {fptensors[0].parent.is_grad()}\n"
                     f"Reason: {str(e)}\n"
                     f"Switch to general P2P communication.\n"
-                    f"===========================================\n{default}", file=sys.stderr
+                    f"===========================================\n{default}"
                 )
+                logging.getLogger('cube.adapter').warn(f'intra-RVD:\n{msg}')
 
         # Case 2: sperating device (inter-rvd)
         if (not CompileFlag.disable_inter_rvd) and len(set(pdevs).intersection(cdevs)) == 0:
@@ -74,13 +75,14 @@ class ConcurrentGener:
             except Exception as e:
                 fadapter = None
                 color, default = '\033[33m' , '\033[0m'
-                print(
+                msg = (
                     f"{color}========== Fail to use inter-RVD ==========\n"
                     f"full tensor: {fptensors[0].parent}\n"
                     f"Reason: {str(e)}\n"
                     f"Switch to general P2P communication.\n"
-                    f"===========================================\n{default}", file=sys.stderr
+                    f"===========================================\n{default}"
                 )
+                logging.getLogger('cube.adapter').warn(f'inter-RVD:\n{msg}')
 
         # Case 3: General cases
         # warnings.warn('The adapter is generated using P2P communication')

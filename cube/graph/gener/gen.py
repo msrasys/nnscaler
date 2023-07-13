@@ -1,7 +1,7 @@
 from typing import Dict, List, Optional, Tuple, Callable, Set
 import numpy as np
 import itertools
-import warnings
+import logging
 
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.gener.concurrent import ConcurrentGener
@@ -317,8 +317,13 @@ class IRAdapterGener:
         # FIXME: assume producers and consumers can run in parallel
         for ftensor in ftensors:
 
-            # print(graph.debug_tensor_map_str(ftensor))
-            # print(graph.mirror.debug_tensor_map_str(ftensor.grad))
+            logging.getLogger('cube.adapter').debug(
+                f'generate adapter for forward tenosrs:\n'
+                f'{graph.debug_tensor_map_str(ftensor)}')
+            if ftensor.grad is not None:
+                logging.getLogger('cube.adapter').debug(
+                    f'generate adapter for backward tenosrs:\n'
+                    f'{graph.mirror.debug_tensor_map_str(ftensor.grad)}')
 
             # producers can be operators and graph inputs
             fproducers, fptensors = graph.producers(ftensor), graph.ptensors(ftensor)
