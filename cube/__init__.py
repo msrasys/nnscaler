@@ -27,7 +27,12 @@ def init():
 
 
 def _init_logger():
-    logging.basicConfig(level=logging.WARN)
+
+    logging.basicConfig(
+        level=logging.WARN,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
 
     level = lambda flag: logging.INFO if flag else logging.WARN
 

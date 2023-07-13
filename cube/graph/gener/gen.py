@@ -317,13 +317,9 @@ class IRAdapterGener:
         # FIXME: assume producers and consumers can run in parallel
         for ftensor in ftensors:
 
-            logging.getLogger('cube.adapter').debug(
-                f'generate adapter for forward tenosrs:\n'
-                f'{graph.debug_tensor_map_str(ftensor)}')
-            if ftensor.grad is not None:
-                logging.getLogger('cube.adapter').debug(
-                    f'generate adapter for backward tenosrs:\n'
-                    f'{graph.mirror.debug_tensor_map_str(ftensor.grad)}')
+            # debug
+            # print(f'forward:\n{graph.debug_tensor_map_str(ftensor)}')
+            # print(f'backward:\n{graph.mirror.debug_tensor_map_str(ftensor.grad)}')
 
             # producers can be operators and graph inputs
             fproducers, fptensors = graph.producers(ftensor), graph.ptensors(ftensor)
