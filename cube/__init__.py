@@ -50,7 +50,7 @@ def _init_logger():
         level(CompileFlag.log_runtime)
     )
     logging.getLogger('cube.profiler').setLevel(
-        level(CompileFlag.log_profiler)
+        logging.INFO
     )
     logging.getLogger('cube.compiler').setLevel(
         logging.INFO

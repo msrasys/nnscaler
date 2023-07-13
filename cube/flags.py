@@ -30,8 +30,6 @@ class CompileFlag:
     log_codegen = _to_bool('LOG_CODEGEN')
     # log the runtime information
     log_runtime = _to_bool('LOG_RUNTIME')
-    # log the profiling information
-    log_profiler = _to_bool('LOG_PROFILER')
 
     # ================ compiling ========================
     use_torchfx = _to_bool('USE_TORCHFX')  # using torch.fx or torchscript as frontend to capture dataflow graph
