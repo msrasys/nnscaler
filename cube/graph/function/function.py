@@ -5,15 +5,14 @@ import torch
 import operator
 import numpy as np
 import math
-import warnings
-import functools
+import logging
 from collections.abc import Iterable
 
 from cube.ir.cten import IRTensor, IRObject
 from cube.ir.tensor import IRSubTensor, IRFullTensor
 from cube.ir.dtype import IRDType
 from cube.graph.function.pyfunc import IRPyFunc
-from cube.graph.function.dimops import DimAnno, DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
+from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
 from cube.graph.function.conv import IRPad, IRConv2D, IRConv3D
 from cube.graph.function.anchor import IRGraphAnchor
 
@@ -56,10 +55,8 @@ def Linear(input, weight, bias=None, signature = None):
         return IRDimops(Linear, 'linear', signature, annos, [input, weight], bias=None)
     else:
         annos = ['b * k^, n k^, n -> b * n']
-        # rules = [TransformRule(
-        #     [DimopSplit.D(-1), DimopSplit.D(1), DimopSplit.V()], [DimopSplit.V()]
-        # )]
-        warnings.warn('detected a linear operator has bias, the partition on reduction dimension is disabled.')
+        logging.getLogger('cube.parser').warn(
+            'detected a linear operator has bias, the partition on reduction dimension is disabled.')
         return IRDimops(Linear, 'linear', signature, annos, [input, weight, bias])
 
 
@@ -305,7 +302,6 @@ def _handle_broadcast(lhs: IRTensor, rhs: IRTensor) -> Tuple[List[str]]:
                 rhs_shape[dim-rofst] = '1'
         else:
             raise ValueError(f"cannot broadcast lhs: {lhs.shape} and rhs: {rhs.shape}")
-    # print(lhs.shape, rhs.shape, lhs_shape, rhs_shape, out_shape)
     return lhs_shape, rhs_shape, out_shape
 
 
@@ -1665,8 +1661,9 @@ def ShapeAsTensor(input: IRTensor, signature = None):
     """
     torch._shape_as_tensor
     """
-    warnings.warn('shape_as_tensor is interpreted as an IRPyFunc'
-                  ' and generate an IRObject instead of IRTensor')
+    logging.getLogger('cube.parser').warn(
+        'shape_as_tensor is interpreted as an IRPyFunc '
+        'and generate an IRObject instead of IRTensor')
     signature = 'torch._shape_as_tensor'
     return IRPyFunc(signature, [input], [IRObject(name='shape', value=input.shape)])
     edim_in = ShapeAnno.create_shape_str(input.shape)
@@ -1760,7 +1757,8 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
             return torch.device('cpu')
         if name == 'layout':
             assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
-            warnings.warn('hack currently, please ensure the input tensor is in torch.strided layout')
+            logging.getLogger('cube.parser').warn(
+                "getattr of 'layout' will always return torch.strided")
             return torch.strided
     if isinstance(obj, torch.finfo):
         return getattr(obj, name)
