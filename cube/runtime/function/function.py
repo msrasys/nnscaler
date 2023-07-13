@@ -1,11 +1,14 @@
 from typing import Optional, List, Tuple, Union
 import torch
 import torch.nn.functional as TorchF
+import logging
 
+
+# TODO: move to registered function
 try:
     from apex.normalization.fused_layer_norm import fused_layer_norm_affine
 except:
-    print('WARNING: apex is not installed, skip it.')
+    logging.getLogger('cube.runtime').warn('skip apex ops as it is not installed.')
 
 
 def identity(tensor: torch.Tensor) -> torch.Tensor:

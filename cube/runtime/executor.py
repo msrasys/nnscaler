@@ -5,7 +5,7 @@ import atexit
 
 from typing import Tuple, Any, Callable, List, Dict, Optional
 import torch
-import warnings
+import logging
 
 
 def debug_id(tensors, msg: str, rank: int):
@@ -154,7 +154,7 @@ class Executor:
         for t in input_tensors:
             if id(t) not in tensor_ids:
                 import traceback
-                warnings.warn(
+                logging.getLogger('cube.runtime').warn(
                     f"rank {torch.distributed.get_rank()}: input {name} doesn't match. "
                     f"Make sure in scheduling, earlier forward perform earlier backward. "
                     f"Remain {len(Executor._detach[name])} segments.\n"
