@@ -17,6 +17,9 @@ from cube.ir.adapter.prim import SplitAllGatherPrim, AllGatherSplitPrim
 from cube.ir.adapter.prim import AllToAllAllToAllPrim
 
 
+_logger = logging.getLogger(__name__)
+
+
 class DiffFusion(PlanPass):
 
     @staticmethod
@@ -45,8 +48,7 @@ class DiffFusion(PlanPass):
                         ret = DiffFusion.nnfuse(fadapter)
                         cnt = cnt+1 if ret else cnt
                 visited.add(node)
-        logging.getLogger('cube.execplan').info(
-            f'adapter fusion: successfully fuse {cnt} differentiable adapters')
+        _logger.info(f'adapter fusion: successfully fuse {cnt} differentiable adapters')
         return execplan
 
     @staticmethod

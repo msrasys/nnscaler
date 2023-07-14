@@ -8,6 +8,8 @@ from cube.ir.cten import IRTensor
 from cube.ir.operator import IRFwOperation
 from collections import deque
 
+_logger = logging.getLogger(__name__)
+
 
 class DimSplitEinops(GenericDistAlgo):
     """!
@@ -123,9 +125,8 @@ class DimSplitEinops(GenericDistAlgo):
         else:
             adim, reduce = 'Value', None
         
-        logger = logging.getLogger('cube.prim')
         color, default = '\033[32m' if satisfy else '\033[31m', '\033[0m'
-        logger.info(f"split {node.name}: {node.anno} | dim: {adim} num: {num} reduce: {reduce} ... {color}{'Success' if satisfy else 'Failed!'}{default}")
+        _logger.info(f"split {node.name}: {node.anno} | dim: {adim} num: {num} reduce: {reduce} ... {color}{'Success' if satisfy else 'Failed!'}{default}")
 
         if not satisfy: return None
         rule: TransformRule = self.infer(idx, dim, num)

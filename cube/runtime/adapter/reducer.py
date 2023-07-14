@@ -6,11 +6,9 @@ from torch.utils.hooks import RemovableHandle
 
 from cube.runtime.device import DeviceGroup
 from cube.profiler.timer import CudaTimer
-from cube.flags import RuntimeFlag, CompileFlag
-
+from cube.flags import RuntimeFlag
 
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO if CompileFlag.log_runtime else logging.WARNING)
 
 
 def _get_reduce_op(reduce_op: str) -> torch.distributed.ReduceOp:

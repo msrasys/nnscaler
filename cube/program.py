@@ -1,5 +1,4 @@
 from typing import List, Tuple, Optional, Any
-import logging
 
 from cube.ir.cten import IRCell, IRTensor, IRObject
 from cube.ir.tensor import IRFullTensor, IRSubTensor
@@ -12,9 +11,8 @@ from cube.graph.parser.dtype import DType2IRDType
 from cube.runtime.syndata import CubeDataLoader
 from cube.runtime.module import CubeModule
 from cube.runtime.device import DeviceGroup
-from cube.profiler.timer import print_each_rank
 
-from cube.utils import load_model, load_default_schedule
+from cube.utils import load_model
 
 import torch
 

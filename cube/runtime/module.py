@@ -6,10 +6,8 @@ import torch
 
 from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.reducer import Reducer
-from cube.flags import CompileFlag
 
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO if CompileFlag.log_runtime else logging.WARNING)
 
 
 class CubeModule(torch.nn.Module):

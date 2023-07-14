@@ -16,10 +16,7 @@ from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, 
 from cube.graph.function.conv import IRPad, IRConv2D, IRConv3D
 from cube.graph.function.anchor import IRGraphAnchor
 
-from cube.flags import CompileFlag
-
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO if CompileFlag.log_parser else logging.WARN)
 
 
 def Identity(tensor: IRObject, signature = None):
@@ -1762,7 +1759,7 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
             return torch.device('cpu')
         if name == 'layout':
             assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
-            _logger.warn("getattr of 'layout' will always return torch.strided")
+            _logger.warning("getattr of 'layout' will always return torch.strided")
             return torch.strided
     if isinstance(obj, torch.finfo):
         return getattr(obj, name)

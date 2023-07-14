@@ -26,35 +26,17 @@ def init():
     _ = runtime.resource.EnvResource()
 
 
-def _init_logger():
-
+def set_logger_level(level):
+    """Set the logger level with predefined logging format.
+    
+    Args:
+        level (int): the level of the logger.
+    """
     logging.basicConfig(
-        level=logging.WARN,
+        level=level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
 
-def set_logger_level(name: Optional[str], level):
-    """Set the logger level of cube.
-    
-    Args:
-        name (Optional[str]): the name of the logger, can be one of
-            'cube.parser', 'cube.policy', 'cube.adapter',
-            'cube.execplan', 'cube.compiler'. Or None to set all.
-        level (int): the level of the logger, can be one of
-            logging.DEBUG, logging.INFO, logging.WARN, logging.ERROR.
-    """
-
-    if name is None:
-        logger_names = list(logging.root.manager.loggerDict.keys())
-        logger_names = [name for name in logger_names if name.startswith('cube')]
-        loggers = [logging.getLogger(name) for name in logger_names]
-        for logger in loggers:
-            logger.setLevel(level)
-    elif name in logging.root.manager.loggerDict:
-        logging.getLogger(name).setLevel(level)
-
-
 _check_torch_version()
-_init_logger()

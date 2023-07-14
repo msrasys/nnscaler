@@ -25,13 +25,9 @@ from cube.graph.function.dimops import IRDimops, OpAnno
 from cube.graph.segment import IRSegment
 
 from cube.algorithm.generics import GenericDistAlgo
-from cube.flags import CompileFlag
 
 
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO if CompileFlag.log_prim else logging.WARNING)
-
-
 FOp = Union[IRFwOperation, IRDataOperation]
 
 

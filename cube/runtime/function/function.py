@@ -3,10 +3,8 @@ import torch
 import torch.nn.functional as TorchF
 import logging
 
-from cube.flags import CompileFlag
 
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO if CompileFlag.log_runtime else logging.WARNING)
 
 
 # TODO: move to registered function

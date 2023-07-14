@@ -1,7 +1,6 @@
 from typing import Callable, Dict, List, Tuple, Optional, Set
 from functools import partial
 import numpy as np
-import sys
 import copy
 import logging
 
@@ -23,7 +22,7 @@ from cube.graph.gener.rvd.layout import RVDLayout
 
 from cube.graph.gener.utils import tensor_vd_repr
 
-
+_logger = logging.getLogger(__name__)
 TShape = Tuple[int, ...]
 TRVD = Tuple[int, ...]
 
@@ -263,7 +262,7 @@ class IntraPathFinder:
                 f"Switch to a fixed plan: ilayout -> FullReplica -> olayout"
             )
             color, default = '\033[33m' , '\033[0m'
-            logging.getLogger('cube.adapter').warn(f'intra-RVD:\n{color+warn_msg+default}')
+            _logger.warning(f'intra-RVD:\n{color+warn_msg+default}')
             all_prims = IntraPathFinder.backup_path(ilayout, olayout, cost_fn)
 
         return all_prims
@@ -663,7 +662,7 @@ class IntraAutoPlacer:
                   f"bw hops: {'->'.join(str(rvd) for rvd in bw_rvd_hops)}\n"
                   f"using placement: {placement}\n"
                   f"=============================================================")
-            logging.getLogger('cube.adapter').warn(f'intra-RVD:\n{msg}')
+            _logger.warning(f'intra-RVD:\n{msg}')
             bw_rvd_hops = IntraPathFinder.get_backup_path(ftensor, bw_src_rvd, bw_dst_rvd, cost_fn)
 
         # estimate cost

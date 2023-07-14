@@ -7,10 +7,7 @@ import logging
 
 import torch
 
-from cube.flags import CompileFlag
-
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO if CompileFlag.log_runtime else logging.WARNING)
 
 
 class CubeDataLoader:

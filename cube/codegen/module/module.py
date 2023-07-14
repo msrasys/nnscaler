@@ -28,7 +28,6 @@ from cube.flags import CompileFlag
 
 
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO if CompileFlag.log_codegen else logging.WARN)
 
 
 class ModuleCodeGen(FuncEmission):
@@ -462,7 +461,7 @@ class ModuleCodeGen(FuncEmission):
         bs = [t.shape[dim] for t, dim in zip(node.outputs(), node.get_batch_dims()) if dim is not None]
         bs = set(bs)
         if len(bs) > 1:
-            _logger.warn(f'Find Heterogenous batch size {bs}. Keep output to be same with semantic dataloder.')
+            _logger.warning(f'Find Heterogenous batch size {bs}. Keep output to be same with semantic dataloder.')
         bs = list(bs)[0] if len(bs) == 1 else None
         assert self.batch_size is None or self.batch_size == bs, f"Not match for batch size: {self.batch_size} != {bs}"
         self.model_init_statements.append(signature.format(bs=bs))

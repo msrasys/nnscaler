@@ -14,6 +14,7 @@ from cube.graph.parser.script.mapping import Sign2Op
 from cube.graph.parser.dtype import DType2IRDType
 
 
+_logger = logging.getLogger(__name__)
 _refmodule = torch.nn.Module()
 
 class ErasedDevice:
@@ -76,7 +77,7 @@ class ScriptModuleParser:
                 try:
                     ret = ir_node.infer_shape()
                     if not ret:
-                        logging.getLogger('cube.parser').error(f'{ir_node} cannot infer shape')
+                        _logger.error(f'{ir_node} cannot infer shape')
                 except Exception:
                     raise RuntimeError(
                         f"====== Shape Infer Error ====\n\n\n"
@@ -127,7 +128,7 @@ class ScriptModuleParser:
                 try:
                     ret = ir_node.infer_shape()
                     if not ret:
-                        logging.getLogger('cube.parser').error(f'{ir_node} cannot infer shape')
+                        _logger.error(f'{ir_node} cannot infer shape')
                 except Exception:
                     raise RuntimeError(
                         f"====== Shape Infer Error ====\n\n\n"
@@ -553,7 +554,7 @@ class ScriptModuleParser:
                 try:
                     ret = ir_node.infer_shape()
                     if not ret:
-                        logging.getLogger('cube.parser').error(f'{ir_node} cannot infer shape')
+                        _logger.error(f'{ir_node} cannot infer shape')
                 except Exception:
                     raise RuntimeError(
                         f"====== Shape Infer Error ====\n\n\n"
@@ -667,7 +668,7 @@ class ScriptModuleParser:
                     try:
                         ret = ir_node.infer_shape()
                         if not ret:
-                            logging.getLogger('cube.parser').error(f'{ir_node} cannot infer shape')
+                            _logger.error(f'{ir_node} cannot infer shape')
                     except Exception:
                         raise RuntimeError(
                             f"====== Shape Infer Error ====\n\n\n"

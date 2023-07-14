@@ -14,6 +14,9 @@ from cube.graph.function.dimops import IRDimops
 
 import torch.fx
 
+_logger = logging.getLogger(__name__)
+
+
 class ErasedDevice:
     pass
 
@@ -101,8 +104,7 @@ class FxModuleParser:
         assert isinstance(dummy_inputs, dict), "Expected dummy inputs to parse module"
 
         inputs = [node for node in module.graph.nodes if node.op == 'placeholder']
-        logging.getLogger('cube.parser').info(
-            f'> torch.fx parser: graph inputs: {inputs}')
+        _logger.info(f'> torch.fx parser: graph inputs: {inputs}')
         
         # shape propagation
         ShapeProp(module).propagate(dummy_inputs)
@@ -182,8 +184,7 @@ class FxModuleParser:
         all_ir_nodes: List[IRFwOperation] = list()
         total_node_num = len(module.graph.nodes)
         for nidx, node in enumerate(module.graph.nodes):
-            logging.getLogger('cube.parser').info(
-                f'[{nidx}/{total_node_num}] parsing node {node}...')
+            _logger.info(f'[{nidx}/{total_node_num}] parsing node {node}...')
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
             if ir_nodes is not None:
                 all_ir_nodes += ir_nodes
@@ -317,12 +318,12 @@ class FxModuleParser:
             # FIXME: handle cases for IRObject in kwargs
             # case1: unknown torch operator
             if FxModuleParser._is_torch_autograd_op(node, frame, fsig):
-                logging.getLogger('cube.parser').warn(f'Find unknown pytorch operation: {fsig}')
+                _logger.warning(f'Find unknown pytorch operation: {fsig}')
                 fname = fsig.split('.')[-1] if '.' in fsig else fsig
                 ir_node = IRFwOperation(fname, fsig, input_vals, 1, **kwargs)
             # case2: python runtime function
             else:
-                logging.getLogger('cube.parser').warn(f'Set python runtime function: {fsig}')
+                _logger.warning(f'Set python runtime function: {fsig}')
                 ir_node = IRPyFunc(fsig, input_vals, [IRObject()], **kwargs)
 
         if isinstance(ir_node, IRCell):
@@ -359,7 +360,7 @@ class FxModuleParser:
         else:
             frame.set_var(node.name, ir_node)
         
-        logging.getLogger('cube.parser').info(f'parsing result: {ir_node}')
+        _logger.info(f'parsing result: {ir_node}')
         return ir_nodes
 
     @staticmethod

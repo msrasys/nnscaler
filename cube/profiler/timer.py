@@ -6,7 +6,6 @@ import torch
 from cube.utils import print_each_rank
 
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO)
 
 
 class CudaTimer:

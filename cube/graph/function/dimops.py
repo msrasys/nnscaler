@@ -74,6 +74,7 @@ from cube.algorithm.factory import DistAlgorithmFactory
 
 
 _kSpecialIdentifiers = ('*', '?')
+_logger = logging.getLogger(__name__)
 
 
 class DimAnno:
@@ -662,7 +663,7 @@ class IRDimops(IRFwOperation):
             shape_anno = self.oanno(oidx)
             if str(shape_anno) == '?':
                 assert isinstance(otensor, IRObject), f"expect IRObject for unknown shape, get {otensor}"
-                logging.getLogger('cube.parser').warn(
+                _logger.warning(
                     'detect IRObject output in a IRDimops, please ensure the annotation is '
                     'correct w.r.t the partition policy.')
                 continue

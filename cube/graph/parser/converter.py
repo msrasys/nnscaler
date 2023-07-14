@@ -10,6 +10,8 @@ from cube.flags import CompileFlag
 import torch
 import torch.fx
 
+_logger = logging.getLogger(__name__)
+
 try: 
     import apex
     HAS_APEX = True
@@ -41,11 +43,10 @@ def convert_model(model: torch.nn.Module,
     customized_funcs = CustomizedOps.kOpRuntime.values()
     leaf_functions = {func: ([], False, None) for func in customized_funcs}
 
-    logger = logging.getLogger('cube.parser')
 
     # step 1: trace model
     if CompileFlag.use_torchfx:
-        logger.info('use concrete torch.fx tracer')
+        _logger.info('use concrete torch.fx tracer')
         from cube.graph.parser.fx.concrete_trace_utils import concrete_trace
         from cube.graph.parser.fx.parser import FxModuleParser
         if HAS_APEX:
@@ -60,7 +61,7 @@ def convert_model(model: torch.nn.Module,
                 # torch.nn.LazyInstanceNorm1d, torch.nn.LazyInstanceNorm2d, torch.nn.LazyInstanceNorm3d,
                 )
         else:
-            logger.warn('apex package is not installed')
+            _logger.warning('apex package is not installed')
             leaf_module = None
         traced_model = concrete_trace(
             model,
@@ -71,19 +72,19 @@ def convert_model(model: torch.nn.Module,
             cpu_offload=True,
         )
     else:
-        logger.info('use torch.jit.script tracer')
+        _logger.info('use torch.jit.script tracer')
         traced_model = torch.jit.script(model)
 
     # step 2: convert traced model into IRGraph
     if CompileFlag.use_torchfx:
         FxModuleParser.save_content = save_content
         FxModuleParser.dynamic_shape = dynamic_shape
-        logger.info(f"use {'dynamic' if dynamic_shape else 'static'} shape to parse graph")
+        _logger.info(f"use {'dynamic' if dynamic_shape else 'static'} shape to parse graph")
         inputs, nodes, outputs = FxModuleParser.parse(traced_model, dummy_input)
         module_name = model.__class__.__name__
     else:
         if dynamic_shape:
-            logger.warn('dynamic shape is not supported in torch.jit.script')
+            _logger.warning('dynamic shape is not supported in torch.jit.script')
         ScriptModuleParser.save_content = save_content
         inputs, nodes, outputs = ScriptModuleParser.parse_module(traced_model, input_shapes)
         module_name = traced_model.original_name

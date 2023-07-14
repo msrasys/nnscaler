@@ -19,14 +19,13 @@ from cube.flags import CompileFlag
 
 
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO if CompileFlag.log_adapter else logging.WARNING)
 
 if CompileFlag.disable_intra_rvd:
-    _logger.warn('Detected disabling intra-RVD collective generation, which may have big impact on performance.')
+    _logger.warning('Detected disabling intra-RVD collective generation, which may have big impact on performance.')
 if CompileFlag.disable_inter_rvd:
-    _logger.warn('Detected disabling inter-RVD collective generation, which may have big impact on performance.')
+    _logger.warning('Detected disabling inter-RVD collective generation, which may have big impact on performance.')
 if CompileFlag.disable_comm_fusion:
-    _logger.warn('Detected disabling general communication fusion, which may have big impact on performance in certain cases.')
+    _logger.warning('Detected disabling general communication fusion, which may have big impact on performance in certain cases.')
 
 
 class ConcurrentGener:

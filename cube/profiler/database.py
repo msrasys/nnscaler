@@ -15,8 +15,8 @@ from cube.ir.cten import IRTensor, IRObject
 from cube.ir.operator import IRFwOperation
 from cube.graph.parser.dtype import IRDType2TorchDType
 from cube.graph.parser.register import CustomizedOps
-from cube.flags import CompileFlag
 
+_logger = logging.getLogger(__name__)
 
 Shapes = NewType('Shapes', Tuple[Tuple[int]])
 DTypes = NewType('DTypes', Tuple[torch.dtype])
@@ -26,9 +26,6 @@ NameOrFunc = Union[str, Callable]
 
 _train_module_ref: torch.nn.Module = torch.nn.Module().train()
 _eval_module_ref: torch.nn.Module = torch.nn.Module().eval()
-
-_logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO)
 
 
 class CompProfiler:

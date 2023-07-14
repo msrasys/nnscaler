@@ -11,6 +11,8 @@ import torch
 
 from cube.graph.function.dimops import IRDimops, OpAnno
 
+_logger = logging.getLogger(__name__)
+
 
 class CustomizedOps:
     """Customized op registry."""
@@ -134,8 +136,7 @@ def register(anno: str, name: Optional[str] = None,
         if code_impl_pattern == 'import':
             import_path = inspect.getmodule(fn).__name__
             if import_path == '__main__':
-                logger = logging.getLogger('cube.parser')
-                logger.warn(f'Find the function {fsig} is defined in __main__ module, will take the source code directly. '
+                _logger.warning(f'Find the function {fsig} is defined in __main__ module, will take the source code directly. '
                             f'This may cause error when the function has inner functions from other modules. '
                             f'To solve this, define the function in another module and import into main', stacklevel=0)
                 code = inspect.getsource(fn)
@@ -159,8 +160,7 @@ def register(anno: str, name: Optional[str] = None,
                 kwargs[name] = val
             return IRDimops(udfop, op_name, signature, [repr(manno)], tensors, transform_rules=rules, **kwargs)
 
-        logging.getLogger('cube.parser').info(
-            f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
+        _logger.info(f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
         CustomizedOps.register(fsig, udfop, code, fn)
         return fn
 

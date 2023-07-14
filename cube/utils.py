@@ -7,6 +7,8 @@ from cube.flags import RuntimeFlag, CompileFlag
 
 import torch
 
+_logger = logging.getLogger(__name__)
+
 
 def print_each_rank(msg: str, rank_only: Optional[int] = None, logger_fn: Callable = print):
     """Logging the message.
@@ -51,7 +53,7 @@ def load_model(filename: Optional[str] = None, load_content: bool = True):
     # load parameter content
     if load_content:
         print_each_rank("> loading parameter content...",
-                        logger_fn=logging.getLogger('cube.codegen').info)
+                        logger_fn=_logger.info)
         loaded_module.load_attr_content('./fullmodel.pt')
     # initialize reducer
     for reducer in loaded_module.reducers:
