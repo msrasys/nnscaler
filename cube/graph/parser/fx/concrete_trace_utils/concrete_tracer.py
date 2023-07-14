@@ -267,7 +267,7 @@ class ConcreteTracer(TracerBase):
     }
 
     @compatibility(is_backward_compatible=True)
-    def __init__(self, cpu_offload = False):
+    def __init__(self, cpu_offload = False, record_frames = False):
         """
         similar to _symbolic_trace.Tracer.__init__.
         remove the 'param_shapes_constant' because we can get real shape when executing.
@@ -277,6 +277,7 @@ class ConcreteTracer(TracerBase):
         self.module_stack = collections.OrderedDict()
         self.node_name_to_scope = {}
         self.cpu_offload = cpu_offload
+        self.record_frames = record_frames
 
     @contextmanager
     def do_temp_disable(self, call=False, attr=False, agfunc_apply=False):
@@ -381,6 +382,9 @@ class ConcreteTracer(TracerBase):
                     result = result.cpu()
                 elif isinstance(result, (list, dict, tuple)):
                     result = tree_map(to_cpu, result)
+                elif isinstance(result, (int, bool, torch.device, torch.dtype)):
+                    # avoid too noisy warning
+                    pass
                 else:
                     _logger.warning(f"result of target {target} is {type(result)}, which is not a common behavior.")
 
@@ -447,20 +451,21 @@ class ConcreteTracer(TracerBase):
 
         node = self.create_node(kind, target, args_, kwargs_, name, type_expr)
 
-        # record code frame, include filename, line number, and function name
-        frame_record = FrameRecord(None, None, None, None)
-        cube_cct_path = str(Path(__file__).parent) + '/'  # the cube concrete tracer path
-        torch_path = str(Path(importlib.util.find_spec('torch').origin).parent) + '/'  # the torch path
-        ignore_dirs = [cube_cct_path, torch_path]
-        for frame in traceback.extract_stack()[-2::-1]:
-            if any(p in frame.filename for p in ignore_dirs):
-                continue
-            frame_record.filename = frame.filename
-            frame_record.lineno = frame.lineno
-            frame_record.line = frame.line
-            frame_record.name = frame.name
-            break
-        node.meta['frame_record'] = frame_record
+        if self.record_frames:
+            # record code frame, include filename, line number, and function name
+            frame_record = FrameRecord(None, None, None, None)
+            cube_cct_path = str(Path(__file__).parent) + '/'  # the cube concrete tracer path
+            torch_path = str(Path(importlib.util.find_spec('torch').origin).parent) + '/'  # the torch path
+            ignore_dirs = [cube_cct_path, torch_path]
+            for frame in traceback.extract_stack()[-2::-1]:
+                if any(p in frame.filename for p in ignore_dirs):
+                    continue
+                frame_record.filename = frame.filename
+                frame_record.lineno = frame.lineno
+                frame_record.line = frame.line
+                frame_record.name = frame.name
+                break
+            node.meta['frame_record'] = frame_record
 
         proxy = self.proxy(value_unwrapped, node)
         return proxy
@@ -1497,6 +1502,7 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
                    dce = True,
                    cpu_offload = False,
                    trace_twice = False,
+                   record_frames = False,
                    ) -> GraphModule:
     """
     Concrete tracing API
@@ -1627,11 +1633,13 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
             If set to False, there will be no offloading during tracing, but the traced code will be executed on default device.
 
         trace_twice (bool): If set to True, a second trace will be performed, and the two obtained graphs will be checked for consistency.
-            
+
+        record_frames(bool): If set to True, will add frame information to node.meta['frame_record']. Note this will cost additional trace time.
+
     Returns:
         fx.GraphModule: a Module created from the recorded operations from ``root``.
     """
-    tracer = ConcreteTracer(cpu_offload = cpu_offload)
+    tracer = ConcreteTracer(cpu_offload = cpu_offload, record_frames = record_frames)
     is_training = root.training
     root.eval()
 

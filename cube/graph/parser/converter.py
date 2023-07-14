@@ -70,6 +70,7 @@ def convert_model(model: torch.nn.Module,
             leaf_module=leaf_module,
             autowrap_leaf_function=leaf_functions,
             cpu_offload=True,
+            record_frames=not CompileFlag.disable_code_line_info,
         )
     else:
         _logger.info('use torch.jit.script tracer')

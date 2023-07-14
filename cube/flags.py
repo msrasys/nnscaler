@@ -31,6 +31,7 @@ class CompileFlag:
     # ============ code generation ===============
     use_nnfusion = _to_bool('USE_NNFUSION')
     use_jit = _to_bool('USE_JIT')
+    disable_code_line_info = _to_bool('DISABLE_CODE_LINE_INFO')  # will add original code information in generated code, note that this will make trace slow
 
     # ============== runtime ====================
     dev_mode = _to_bool('SINGLE_DEV_MODE')  # allow to use python xx.py
