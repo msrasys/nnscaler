@@ -1,7 +1,6 @@
 from typing import Dict, List, Optional, Tuple, Callable, Set
 import numpy as np
 import itertools
-import warnings
 
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.gener.concurrent import ConcurrentGener
@@ -333,8 +332,9 @@ class IRAdapterGener:
         # FIXME: assume producers and consumers can run in parallel
         for ftensor in ftensors:
 
-            # print(graph.debug_tensor_map_str(ftensor))
-            # print(graph.mirror.debug_tensor_map_str(ftensor.grad))
+            # debug
+            # print(f'forward:\n{graph.debug_tensor_map_str(ftensor)}')
+            # print(f'backward:\n{graph.mirror.debug_tensor_map_str(ftensor.grad)}')
 
             # producers can be operators and graph inputs
             fproducers, fptensors = graph.producers(ftensor), graph.ptensors(ftensor)

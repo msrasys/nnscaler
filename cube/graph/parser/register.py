@@ -5,10 +5,13 @@ Register cutomized function
 from typing import Dict, Callable, List, Optional, Any
 from functools import partial
 import inspect
-import warnings
+import logging
+
 import torch
 
 from cube.graph.function.dimops import IRDimops, OpAnno
+
+_logger = logging.getLogger(__name__)
 
 
 class CustomizedOps:
@@ -133,9 +136,9 @@ def register(anno: str, name: Optional[str] = None,
         if code_impl_pattern == 'import':
             import_path = inspect.getmodule(fn).__name__
             if import_path == '__main__':
-                warnings.warn(f'Find the function {fsig} is defined in __main__ module, will take the source code directly. '
-                              f'This may cause error when the function has inner functions from other modules. '
-                              f'To solve this, define the function in another module and import into main', stacklevel=0)
+                _logger.warning(f'Find the function {fsig} is defined in __main__ module, will take the source code directly. '
+                            f'This may cause error when the function has inner functions from other modules. '
+                            f'To solve this, define the function in another module and import into main', stacklevel=0)
                 code = inspect.getsource(fn)
                 code = code[code.index('def'):]
             else:
@@ -157,7 +160,7 @@ def register(anno: str, name: Optional[str] = None,
                 kwargs[name] = val
             return IRDimops(udfop, op_name, signature, [repr(manno)], tensors, transform_rules=rules, **kwargs)
 
-        print(f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
+        _logger.info(f'registering op {fsig} with {ninputs} inputs and {nkwargs} kwargs...')
         CustomizedOps.register(fsig, udfop, code, fn)
         return fn
 

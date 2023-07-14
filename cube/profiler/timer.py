@@ -1,33 +1,11 @@
 from typing import Optional
 import time
-import sys
-import warnings
+import logging
 
 import torch
+from cube.utils import print_each_rank
 
-
-def print_each_rank(msg, rank_only=None, outfile=''):
-    import os
-    single_device_mode = os.environ.get('SINGLE_DEV_MODE')
-    if single_device_mode:
-        return
-
-    myrank = torch.distributed.get_rank()
-    outfile = sys.stdout if outfile == '' else outfile
-    for rank in range(torch.distributed.get_world_size()):
-        if rank_only is None:
-            if myrank == rank:
-                f = open(outfile, 'a') if outfile != sys.stdout else sys.stdout
-                f.write('rank [{}]: {}\n'.format(rank, msg))
-                if outfile != sys.stdout:
-                    f.close()
-        else:
-            if myrank == rank_only and rank_only == rank:
-                f = open(outfile, 'a') if outfile != sys.stdout else sys.stdout
-                f.write('rank [{}]: {}\n'.format(rank, msg))
-                if outfile != sys.stdout:
-                    f.close()
-        torch.distributed.barrier()
+_logger = logging.getLogger(__name__)
 
 
 class CudaTimer:
@@ -137,7 +115,7 @@ class CudaTimer:
         @return span float: wall clock in milliseconds.
         """
         if field_name not in self.instance.field:
-            warnings.warn(f"CudaTimer: {field_name} doesn't record.")
+            _logger.warning(f"CudaTimer: {field_name} doesn't record.")
             return 0.0
         if len(self.instance.field[field_name]) != 0:
             raise RuntimeError(f"timer for field {field_name} not stopped")

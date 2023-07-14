@@ -17,11 +17,6 @@ def _to_int(s: str, default=0) -> int:
 
 class CompileFlag:
 
-    # ============= loggings ===================
-    log_transform = _to_bool('LOG_TRANSFORM')
-    log_schedule = _to_bool('LOG_SCHEDULE')
-    log_parser = _to_bool('LOG_PARSER')
-
     # ================ compiling ========================
     use_torchfx = _to_bool('USE_TORCHFX')  # using torch.fx or torchscript as frontend to capture dataflow graph
     use_default_fx_tracer = _to_bool('USE_DEFAULT_FX_TRACER')  # using default fx tracer or more powerful concrete_tracer

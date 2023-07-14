@@ -1,6 +1,6 @@
 import torch
 import enum
-import warnings
+import logging
 from typing import Any, List, Tuple, Callable, Union, Dict, Type
 
 from cube.ir.operator import IRFwOperation
@@ -8,13 +8,14 @@ from cube.ir.tensor import IRFullTensor
 from cube.ir.cten import IRObject, IRCell
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.dtype import DType2IRDType
-from cube.graph.parser.mappingfx import SignFx2Op
+from cube.graph.parser.fx.mapping import SignFx2Op
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import IRDimops
 
-from cube.flags import CompileFlag
-
 import torch.fx
+
+_logger = logging.getLogger(__name__)
+
 
 class ErasedDevice:
     pass
@@ -94,7 +95,7 @@ class FxModuleParser:
 
         The overall entry to parse a torch.fx graph module
         """
-        from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
+        from cube.graph.parser.fx.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
 
         frame = frame if frame is not None else Frame()
         frame.push_var()
@@ -103,8 +104,7 @@ class FxModuleParser:
         assert isinstance(dummy_inputs, dict), "Expected dummy inputs to parse module"
 
         inputs = [node for node in module.graph.nodes if node.op == 'placeholder']
-        if CompileFlag.log_parser:
-            print(f'> torch.fx parser: graph inputs: {inputs}')
+        _logger.info(f'> torch.fx parser: graph inputs: {inputs}')
         
         # shape propagation
         ShapeProp(module).propagate(dummy_inputs)
@@ -128,11 +128,9 @@ class FxModuleParser:
                 # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding,
                 # extend to other input types
                 if hasattr(dummy_inputs, input.name):
-                    # print(f'dummy_inputs has {input.name}')
                     shape = getattr(dummy_inputs, input.name).size()
                 else:
                     # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
-                    # print(f'dummy_inputs does not have {input.name}')
                     shape = None
                 dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
                 val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
@@ -142,7 +140,7 @@ class FxModuleParser:
 
         # add activations to frame, including call_func/call_method output and final output
         # call_module corresponds to leaf torch.nn.module
-        from cube.graph.parser.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import TensorMetadata
+        from cube.graph.parser.fx.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import TensorMetadata
         activation_op_strs = {'call_function', 'output', 'call_method', 'call_module'}
         activation_nodes = [node for node in module.graph.nodes if node.op in activation_op_strs]
         def parse_complex_out(meta_out):
@@ -186,8 +184,7 @@ class FxModuleParser:
         all_ir_nodes: List[IRFwOperation] = list()
         total_node_num = len(module.graph.nodes)
         for nidx, node in enumerate(module.graph.nodes):
-            if CompileFlag.log_parser:
-                print(f'> torch.fx parser: [{nidx}/{total_node_num}] parsing node {node}...', flush=True)
+            _logger.info(f'[{nidx}/{total_node_num}] parsing node {node}...')
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
             if ir_nodes is not None:
                 all_ir_nodes += ir_nodes
@@ -321,14 +318,12 @@ class FxModuleParser:
             # FIXME: handle cases for IRObject in kwargs
             # case1: unknown torch operator
             if FxModuleParser._is_torch_autograd_op(node, frame, fsig):
-                warnings.warn(f'Find unknown pytorch operation: {fsig}',
-                              category=RuntimeWarning)
+                _logger.warning(f'Find unknown pytorch operation: {fsig}')
                 fname = fsig.split('.')[-1] if '.' in fsig else fsig
                 ir_node = IRFwOperation(fname, fsig, input_vals, 1, **kwargs)
             # case2: python runtime function
             else:
-                warnings.warn(f'Set python runtime function: {fsig}',
-                              category=RuntimeWarning)
+                _logger.warning(f'Set python runtime function: {fsig}')
                 ir_node = IRPyFunc(fsig, input_vals, [IRObject()], **kwargs)
 
         if isinstance(ir_node, IRCell):
@@ -365,9 +360,7 @@ class FxModuleParser:
         else:
             frame.set_var(node.name, ir_node)
         
-        if CompileFlag.log_parser:
-            print(f'parsing result: {ir_node}', flush=True)
-
+        _logger.info(f'parsing result: {ir_node}')
         return ir_nodes
 
     @staticmethod
@@ -482,7 +475,6 @@ class FxModuleParser:
         in_type = node.args[0].meta['type']
         assert node_target in in_type().__dir__(), f'node_target = {node_target}, in_type().__dir__() = {in_type().__dir__()}'
         sig = f'{in_type.__name__}.{node_target}'
-        print(f'The method is not torch or Tensor, but {sig}')
         return sig
 
     @staticmethod

@@ -1,4 +1,5 @@
 from typing import List, Union, Set
+import logging
 from cube.graph.graph import IRSegment
 
 from cube.ir.adapter import IRAdapter
@@ -14,6 +15,9 @@ from cube.ir.adapter.prim import IdentityAllreducePrim, AllReduceIdentityPrim, A
 from cube.ir.adapter.prim import AllGatherReduceScatterPrim, ReduceScatterAllGatherPrim
 from cube.ir.adapter.prim import SplitAllGatherPrim, AllGatherSplitPrim
 from cube.ir.adapter.prim import AllToAllAllToAllPrim
+
+
+_logger = logging.getLogger(__name__)
 
 
 class DiffFusion(PlanPass):
@@ -44,7 +48,7 @@ class DiffFusion(PlanPass):
                         ret = DiffFusion.nnfuse(fadapter)
                         cnt = cnt+1 if ret else cnt
                 visited.add(node)
-        print(f'successfully generate {cnt} differentiable adapters')
+        _logger.info(f'adapter fusion: successfully fuse {cnt} differentiable adapters')
         return execplan
 
     @staticmethod

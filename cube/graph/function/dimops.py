@@ -64,19 +64,17 @@ A shape annotation consists of dimension annotation separated by (multiple) spac
 
 from typing import Callable, Dict, Iterable, List, Union, Set, Tuple, Optional
 import enum
-import importlib
 import re
 import string
-import warnings
+import logging
 
 from cube.ir.cten import IRTensor, IRObject
-from cube.ir.dtype import DTypeInferRule
 from cube.ir.operator import IRFwOperation
 from cube.algorithm.factory import DistAlgorithmFactory
-from cube.ir.tensor import IRSubTensor
 
 
 _kSpecialIdentifiers = ('*', '?')
+_logger = logging.getLogger(__name__)
 
 
 class DimAnno:
@@ -665,8 +663,9 @@ class IRDimops(IRFwOperation):
             shape_anno = self.oanno(oidx)
             if str(shape_anno) == '?':
                 assert isinstance(otensor, IRObject), f"expect IRObject for unknown shape, get {otensor}"
-                warnings.warn('detect IRObject output in a IRDimops, please ensure the annotation is'
-                              'correct w.r.t the partition policy.')
+                _logger.warning(
+                    'detect IRObject output in a IRDimops, please ensure the annotation is '
+                    'correct w.r.t the partition policy.')
                 continue
             shape = []
             for odim in range(shape_anno.ndims):

@@ -2,17 +2,19 @@ from typing import Callable, Tuple, Union, Optional, Any
 import torch
 import time
 import os
+import logging
 
 import cube
 
+from cube.ir.cten import IRObject
+from cube.ir.tensor import IRFullTensor
+from cube.ir.unique import IDGenerator
 from cube.graph.gener.gen import IRAdapterGener
 from cube.graph.graph import IRGraph
-from cube.ir.cten import IRObject
 from cube.graph.parser.dtype import DType2IRDType
-from cube.ir.tensor import IRFullTensor
 from cube.graph.function.anchor import IRGraphAnchor
-from cube.graph.schedule.schedplan import SchedulePlan
 from cube.graph.function.pyfunc import IRPyFunc
+from cube.graph.schedule.schedplan import SchedulePlan
 
 from cube.execplan import ExecutionPlan
 from cube.execplan.planpass.fusion import DiffFusion
@@ -20,13 +22,16 @@ from cube.execplan.planpass.grouping import Grouping
 
 from cube.codegen import ModuleCodeGen, ScheduleCodeGen
 
-from cube.profiler.timer import print_each_rank
 from cube.runtime.device import DeviceGroup
 from cube.runtime.syndata import CubeDataLoader
 
 from cube.program import Program, SemanticDataLoader, SemanticModel
-from cube.ir.unique import IDGenerator
 from cube.flags import CompileFlag
+from cube.utils import print_each_rank
+
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.INFO)
 
 
 def compile(model: SemanticModel, *args,
@@ -70,7 +75,6 @@ def compile(model: SemanticModel, *args,
     Returns:
         Callable: compiled training iteration
     """
-
     # clean global status
     Program().clear()
     IDGenerator().clear()
@@ -107,12 +111,12 @@ def compile(model: SemanticModel, *args,
         if not override and os.path.exists(filename.format(myrank)):
             filename = filename.format(myrank)
             # TODO: set batch size
-            print('warning: dataloader batch size stay as default.')
+            _logger.warning('dataloader batch size stay as default.')
             # load module code
-            print_each_rank(f'loading existed module from {filename} ...')
+            _logger.info(f'loading existed module from {filename} ...')
             model.load_module(filename)
             # load schedule code
-            print_each_rank(f'loading existed schedule from {filename} ...')
+            _logger.info(f'loading existed schedule from {filename} ...')
             return cube.load_default_schedule(filename)
 
         if DeviceGroup().local_rank == 0:
@@ -141,7 +145,7 @@ def compile(model: SemanticModel, *args,
             # setup program output
             Program().set_output(outputs)
             span = time.time() - start
-            print('> finish parsing iteration: {:.2f} s'.format(span))
+            _logger.info('finish parsing iteration: {:.2f} s'.format(span))
 
             # run policy
             start = time.time()
@@ -149,7 +153,7 @@ def compile(model: SemanticModel, *args,
             assert callable(PAS), f"Policy PAS is not callable"
             graph = PAS(graph, resource)
             span = time.time() - start
-            print('> finish policy expression: {:.2f} s'.format(span))
+            _logger.info('finish policy expression: {:.2f} s'.format(span))
 
             if not isinstance(graph, IRGraph):
                 raise RuntimeError("Expected policy return IRGraph")
@@ -168,16 +172,14 @@ def compile(model: SemanticModel, *args,
             start = time.time()
             graph = IRAdapterGener.gen(graph, cost_fn=comm_cost_fn)
             span = time.time() - start
-            print('> finish generating adapters: {:.2f} s'.format(span))
+            _logger.info('finish generating adapters: {:.2f} s'.format(span))
 
             if graph.sched is not None:
                 start = time.time()
                 graph.sched.apply()
-                # print(graph.sched)qq
-                if CompileFlag.log_schedule:
-                    print(graph.sched)
+                _logger.debug(f'schedule:\n{graph.sched}')
                 span = time.time() - start
-                print('> finish planpass on applying schedule strategy: {:.2f} s'.format(span))
+                _logger.info('finish planpass on applying schedule strategy: {:.2f} s'.format(span))
 
             # to execution plan
             start = time.time()
@@ -188,13 +190,13 @@ def compile(model: SemanticModel, *args,
             if CompileFlag.visualize_plan:
                 execplan.visualize('plan.png')
             span = time.time() - start
-            print('> finish lowering to execution plan: {:.2f} s'.format(span))
+            _logger.info('finish lowering to execution plan: {:.2f} s'.format(span))
 
             # plan pass for communication optimization
             start = time.time()
             execplan = DiffFusion.apply(execplan)
             span = time.time() - start
-            print('> finish planpass on diff-fusion operations: {:.2f} s'.format(span))
+            _logger.info('finish planpass on diff-fusion operations: {:.2f} s'.format(span))
 
             # execplan.visualize(outfile='plan.png')
 
@@ -203,7 +205,7 @@ def compile(model: SemanticModel, *args,
                 start = time.time()
                 execplan = Grouping.apply(execplan)
                 span = time.time() - start
-                print('> finish planpass on grouping operations: {:.2f} s'.format(span))
+                _logger.info('finish planpass on grouping operations: {:.2f} s'.format(span))
 
             # execplan.graph.reset_dependency()
             # execplan.analyze(outfile='execplan.png')
@@ -228,21 +230,21 @@ def compile(model: SemanticModel, *args,
                     attach=True
                 )
             span = time.time() - start
-            print('> finish generating code: {:.2f} seconds'.format(span))
+            _logger.info('finish generating code: {:.2f} seconds'.format(span))
 
             compile_end = time.time()
             compile_time = compile_end - compile_start
-            print('> compile time: {:.2f} seconds'.format(compile_time))
+            _logger.info('compile time: {:.2f} seconds'.format(compile_time))
 
         if torch.distributed.is_initialized():
             if DeviceGroup().local_rank != 0 and CompileFlag.worker_sleep > 0:
-                print(f'rank [{DeviceGroup().rank}] starts sleeping {CompileFlag.worker_sleep} seconds...')
+                _logger.info(f'rank [{DeviceGroup().rank}] starts sleeping {CompileFlag.worker_sleep} seconds...')
                 time.sleep(CompileFlag.worker_sleep)
             torch.distributed.barrier()
 
         # load module
         filename = filename.format(myrank)
-        print_each_rank(f'loading generated module from {filename} ...')
+        print_each_rank(f'loading generated module from {filename} ...', logger=_logger)
         model.load_module(filename)
 
         if torch.distributed.is_initialized():
@@ -252,7 +254,7 @@ def compile(model: SemanticModel, *args,
         # set dataloder batch size (serialize output)
         if dataloader is not None:
             bs = model.get_gen_module().get_batch_size()
-            print_each_rank(f'> setting batch size to: {bs}')
+            print_each_rank(f'setting batch size to: {bs}', logger=_logger)
             if torch.distributed.is_initialized():
                 for rank in range(torch.distributed.get_world_size()):
                     if rank == torch.distributed.get_rank():
@@ -267,7 +269,7 @@ def compile(model: SemanticModel, *args,
             torch.distributed.barrier()
 
         # load temporal schedule
-        print_each_rank(f'loading generated schedule from {filename} ...')
+        print_each_rank(f'loading generated schedule from {filename} ...', logger=_logger)
         return cube.load_default_schedule(filename)
 
     return decorator

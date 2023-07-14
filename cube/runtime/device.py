@@ -5,8 +5,11 @@ from typing import List, Dict
 import numpy as np
 import torch
 import os
+import logging
 
 from cube.flags import CompileFlag
+
+_logger = logging.getLogger(__name__)
 
 
 class DeviceGroup:
@@ -15,7 +18,6 @@ class DeviceGroup:
 
         def __init__(self):
             if CompileFlag.dev_mode:
-                print(f"DeviceGroup init using single device mode...")
                 self.rank = 0
                 self.world_size = 1
                 self.local_world_size = 1
