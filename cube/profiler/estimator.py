@@ -8,6 +8,8 @@ from cube.graph.segment import IRSegment
 from cube.graph.function import IRGraphAnchor
 from cube.profiler.database import ProfileDataBase
 
+_logger = logging.getLogger(__name__)
+
 
 class Estimator:
     """
@@ -41,7 +43,7 @@ class Estimator:
             except Exception as e:
                 color, default = '\033[31m', '\033[0m'
                 error_msg = f'fail to run node: {node}\nerror: {e}'
-                logging.getLogger('cube.profiler').error(f'{color}{error_msg}{default}')
+                _logger.error(f'{color}{error_msg}{default}')
                 fw_span, bw_span, infer_mem, train_mem_info = 0, 0, 0, [0]
 
             if train:

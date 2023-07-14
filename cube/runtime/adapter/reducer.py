@@ -6,7 +6,11 @@ from torch.utils.hooks import RemovableHandle
 
 from cube.runtime.device import DeviceGroup
 from cube.profiler.timer import CudaTimer
-from cube.flags import RuntimeFlag
+from cube.flags import RuntimeFlag, CompileFlag
+
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.INFO if CompileFlag.log_runtime else logging.WARNING)
 
 
 def _get_reduce_op(reduce_op: str) -> torch.distributed.ReduceOp:
@@ -182,7 +186,7 @@ class Bucket:
         # async
         if self._async:
             if CudaTimer().enabled and CudaTimer().predefined:
-                logging.getLogger('cube.runtime').warn(
+                _logger.warning(
                     f'CudaTimer: the communication time of async reducer will not be recorded in `comm`')
             assert self._work is not None
             self._work.wait()
@@ -351,7 +355,7 @@ class Reducer:
         @param param torch.nn.Parameter: the added parameter
         """
         if param.data.data_ptr() in self._param_ids:
-            logging.getLogger('cube.runtime').warn(
+            _logger.warning(
                 f'rank [{torch.distributed.get_rank()}]: detected duplicated or shared parameters, ignored.')
             return
         self._params.append(param)
@@ -380,7 +384,7 @@ class Reducer:
                     dtype2size[tp] = cur_byte_size
                 else:
                     if cur_byte_size > bucket_size:
-                        logging.getLogger('cube.runtime').warn(f'find one parameter {param.shape} ({cur_byte_size} bytes) larger than bucket size {self._bucket_size}')
+                        _logger.warning(f'find one parameter {param.shape} ({cur_byte_size} bytes) larger than bucket size {self._bucket_size}')
                         buckets[tp].insert(0, [param])
                     elif dtype2size[tp] + cur_byte_size <= bucket_size:
                         dtype2size[tp] = dtype2size[tp] + cur_byte_size

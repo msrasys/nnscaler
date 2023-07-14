@@ -1,7 +1,7 @@
 
 from typing import List, Dict, Any, Optional, Tuple
 import copy
-import warnings
+import logging
 
 from cube.ir.cten import IRCell, IRTensor
 from cube.ir.operator import IRDataOperation, IRFwOperation
@@ -17,6 +17,12 @@ from cube.codegen.emit import FuncEmission
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.lifecycle import LifeCycle
 from cube.codegen.syntax.blocks import FunctionBlock, ForBlock
+
+from cube.flags import CompileFlag
+
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.INFO if CompileFlag.log_codegen else logging.WARN)
 
 
 class ScheduleCodeGen(FuncEmission):
@@ -88,8 +94,8 @@ class ScheduleCodeGen(FuncEmission):
         else:
             # legacy hardcode strategy
             if isinstance(self.execplan.graph.sched, IRScheduleStrategy):
-                warnings.warn('using legacy IRScheduleStrategy cannot generate inference code. '
-                              'Switch to use scheduling without strategy')
+                _logger.warn('using legacy IRScheduleStrategy cannot generate inference code. '
+                             'Switch to use scheduling without strategy')
             with FunctionBlock(func_name='_infer_step', 
                                args=args) as fb:
                 fb.insert_body('_ = None')

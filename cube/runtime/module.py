@@ -1,9 +1,15 @@
-import logging
 from typing import List, Dict, Tuple, Optional
+import logging
+import os
+
 import torch
+
 from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.reducer import Reducer
-import os
+from cube.flags import CompileFlag
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.INFO if CompileFlag.log_runtime else logging.WARNING)
 
 
 class CubeModule(torch.nn.Module):
@@ -115,7 +121,7 @@ class CubeModule(torch.nn.Module):
         filename = f"{filename_prefix}-{DeviceGroup().rank}.ckpt"
         state_dict, dist_param_map, param_area_map, optimizer_state_dict = self.get_checkpoint(optimizer)
         
-        logging.getLogger('cube.runtime').info(f'saving distributed checkpoint to {filename}')
+        _logger.info(f'saving distributed checkpoint to {filename}')
         torch.save({
             'state_dict': state_dict,
             'dist_param_map': dist_param_map,
@@ -141,7 +147,7 @@ class CubeModule(torch.nn.Module):
             assert plan_ngpus >= 1, plan_ngpus
             assert plan_ngpus <= len(state_dicts), f'plan_ngpus = {plan_ngpus}, len(state_dicts) = {len(state_dicts)}'
             assert len(state_dicts) % plan_ngpus == 0, f'plan_ngpus = {plan_ngpus}, len(state_dicts) = {len(state_dicts)}'
-            logging.getLogger('cube.runtime').info(f'plan_ngpus = {plan_ngpus}')
+            _logger.info(f'plan_ngpus = {plan_ngpus}')
 
         # at first, merge the partitioned optimizer states due to zero to the zero-disabled format
         if zero_idx_maps is not None:
@@ -214,7 +220,7 @@ class CubeModule(torch.nn.Module):
                     assert len(state_dicts[work_idx][1]['param_groups']) == 1, 'only support param_groups to be one group'
             else:
                 if plan_ngpus > 0:
-                    logging.getLogger('cube.runtime').warn(f'plan_ngpus {plan_ngpus} not handled USE_ZERO == False')
+                    _logger.warning(f'plan_ngpus {plan_ngpus} not handled USE_ZERO == False')
                 def _check_opt_state(opt_state):
                     cnt = 0
                     sorted_opt_state = {}
@@ -265,7 +271,7 @@ class CubeModule(torch.nn.Module):
                 raw_name = dist_param_map[local_name]
                 slices = param_area[1][1]
                 if param_area[1][2] != 1:
-                    logging.getLogger('cube.runtime').error(f'value-split on {raw_name} is not supported')
+                    _logger.error(f'value-split on {raw_name} is not supported')
                 if raw_name in param_max_dimsize:
                     param_max_dimsize[raw_name] = max(param_max_dimsize[raw_name], slices)
                 else:
@@ -278,11 +284,11 @@ class CubeModule(torch.nn.Module):
         for model_state_dict, optimizer_state_dict, dist_param_map, param_area_map in state_dicts:
             if len(optimizer_state_dict['state'].items()) > 0:
                 optimizer_state_names = list(optimizer_state_dict['state'][0].keys())
-                logging.getLogger('cube.runtime').info(f'optimizer_state_names = {optimizer_state_names}')
+                _logger.info(f'optimizer_state_names = {optimizer_state_names}')
                 if 'step' in optimizer_state_names:
                     sample_step = optimizer_state_dict['state'][0]['step']
                     optimizer_state_names.remove('step')
-                logging.getLogger('cube.runtime').info(f'optimizer_state_names (without step) = {optimizer_state_names}')
+                _logger.info(f'optimizer_state_names (without step) = {optimizer_state_names}')
             else:
                 optimizer_state_names = []
 
@@ -311,7 +317,7 @@ class CubeModule(torch.nn.Module):
                             optim_full_tensors[index] = {}
                         optim_full_tensors[index][state_name] = torch.zeros(tuple(tensor_size))
                 else:
-                    logging.getLogger('cube.runtime').info(f'merge_checkpoint skips {local_name_with_id}\'s optimizer state')
+                    _logger.info(f'merge_checkpoint skips {local_name_with_id}\'s optimizer state')
             break  # only create once
 
         # assign value
@@ -347,7 +353,7 @@ class CubeModule(torch.nn.Module):
         for rank in range(DeviceGroup().world_size):
             filename = f"{filename_prefix}-{rank}.ckpt"
             ckpts[rank] = torch.load(filename)
-        logging.getLogger('cube.runtime').info(f'checkpoints = {ckpts}')
+        _logger.info(f'checkpoints = {ckpts}')
 
         state_dicts = []
         for ckpt in ckpts.values():

@@ -1,7 +1,6 @@
 from typing import Dict, List, Optional, Tuple, Callable, Set
 import numpy as np
 import itertools
-import logging
 
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.gener.concurrent import ConcurrentGener

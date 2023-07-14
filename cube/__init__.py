@@ -34,33 +34,6 @@ def _init_logger():
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    level = lambda flag: logging.INFO if flag else logging.WARN
-
-    logging.getLogger('cube.parser').setLevel(
-        level(CompileFlag.log_parser)
-    )
-    logging.getLogger('cube.prim').setLevel(
-        level(CompileFlag.log_prim)
-    )
-    logging.getLogger('cube.adapter').setLevel(
-        level(CompileFlag.log_adapter)
-    )
-    logging.getLogger('cube.execplan').setLevel(
-        level(CompileFlag.log_execplan)
-    )
-    logging.getLogger('cube.codegen').setLevel(
-        level(CompileFlag.log_codegen)
-    )
-    logging.getLogger('cube.runtime').setLevel(
-        level(CompileFlag.log_runtime)
-    )
-    logging.getLogger('cube.profiler').setLevel(
-        logging.INFO
-    )
-    logging.getLogger('cube.compiler').setLevel(
-        logging.INFO
-    )
-
 
 def set_logger_level(name: Optional[str], level):
     """Set the logger level of cube.

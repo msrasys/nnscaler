@@ -15,18 +15,18 @@ from cube.ir.adapter.prim import BroadcastPrim
 from cube.graph.gener.rvd.layout import RVDLayout
 from cube.graph.gener.rvd.intra import IntraPathFinder
 from cube.graph.gener.rvd.inter import InterPathFinder
-from cube.graph.gener.utils import DummyInputOuput
 from cube.flags import CompileFlag
 
-import warnings
 
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.INFO if CompileFlag.log_adapter else logging.WARNING)
 
 if CompileFlag.disable_intra_rvd:
-    warnings.warn('Detected disabling intra-RVD collective generation, which may have big impact on performance.')
+    _logger.warn('Detected disabling intra-RVD collective generation, which may have big impact on performance.')
 if CompileFlag.disable_inter_rvd:
-    warnings.warn('Detected disabling inter-RVD collective generation, which may have big impact on performance.')
+    _logger.warn('Detected disabling inter-RVD collective generation, which may have big impact on performance.')
 if CompileFlag.disable_comm_fusion:
-    warnings.warn('Detected disabling general communication fusion, which may have big impact on performance in certain cases.')
+    _logger.warn('Detected disabling general communication fusion, which may have big impact on performance in certain cases.')
 
 
 class ConcurrentGener:
@@ -66,7 +66,7 @@ class ConcurrentGener:
                     f"Switch to general P2P communication.\n"
                     f"===========================================\n{default}"
                 )
-                logging.getLogger('cube.adapter').warn(f'intra-RVD:\n{msg}')
+                _logger.warning(f'intra-RVD:\n{msg}')
 
         # Case 2: sperating device (inter-rvd)
         if (not CompileFlag.disable_inter_rvd) and len(set(pdevs).intersection(cdevs)) == 0:
@@ -82,7 +82,7 @@ class ConcurrentGener:
                     f"Switch to general P2P communication.\n"
                     f"===========================================\n{default}"
                 )
-                logging.getLogger('cube.adapter').warn(f'inter-RVD:\n{msg}')
+                _logger.warning(f'inter-RVD:\n{msg}')
 
         # Case 3: General cases
         # warnings.warn('The adapter is generated using P2P communication')

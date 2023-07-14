@@ -15,6 +15,7 @@ from cube.ir.cten import IRTensor, IRObject
 from cube.ir.operator import IRFwOperation
 from cube.graph.parser.dtype import IRDType2TorchDType
 from cube.graph.parser.register import CustomizedOps
+from cube.flags import CompileFlag
 
 
 Shapes = NewType('Shapes', Tuple[Tuple[int]])
@@ -25,6 +26,9 @@ NameOrFunc = Union[str, Callable]
 
 _train_module_ref: torch.nn.Module = torch.nn.Module().train()
 _eval_module_ref: torch.nn.Module = torch.nn.Module().eval()
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.INFO)
 
 
 class CompProfiler:
@@ -253,20 +257,20 @@ class ProfileDataBase:
                     residual_mem += t.byte_size()
                 in_mem_info.append(t.byte_size())
             else:
-                logging.getLogger('cube.profiler').warn('skip input {t}')
+                _logger.warning('node {node}: skip input {t}')
 
         # run profiling
         try:
             fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx = \
                 CompProfiler.profile(fn, shapes, dtypes, requires_grads, values, **kwargs)
         except:
-            logging.getLogger('cube.profiler').error('fail to profile {node}')
+            _logger.error('fail to profile {node}')
             fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx = 0, 0, 0, [], []
         # log to database
         key = self._serialize(node)
         self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span,\
             infer_memory, train_mem_info, residual_mem, train_mem2in_idx)
-        logging.getLogger('cube.profiler').info(
+        _logger.info(
             f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} "
             f"=> in mem info: {in_mem_info} | param mem info: {param_mem_info} | fw: {round(fw_span, 2)} ms | "
             f"bw: {round(bw_span, 2)} ms | infer mem: {infer_memory} | train mem info: {train_mem_info} | idx: {train_mem2in_idx}")

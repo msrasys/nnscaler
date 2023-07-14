@@ -11,7 +11,6 @@ from typing import Sequence, Set, Union, Tuple, List, Optional, Dict, Any
 import logging
 import copy
 import dill
-import sys
 
 from cube.ir.cten import IRTensor, IRCell, IRObject
 from cube.ir.unique import IDGenerator
@@ -26,6 +25,11 @@ from cube.graph.function.dimops import IRDimops, OpAnno
 from cube.graph.segment import IRSegment
 
 from cube.algorithm.generics import GenericDistAlgo
+from cube.flags import CompileFlag
+
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.INFO if CompileFlag.log_prim else logging.WARNING)
 
 
 FOp = Union[IRFwOperation, IRDataOperation]
@@ -77,14 +81,13 @@ class IRGraph(IRSegment):
         # align graph with input tensors
         itensors: Tuple[IRObject, ...] = self.inputs()
         if len(args) != len(itensors):
-            logger = logging.getLogger('cube.parser')
-            logger.error(
+            _logger.error(
                 f'cube graph forward: skipping arguments due to len(args) != len(itensors): '
                 f'{len(args)} != {len(itensors)}'
             )
             if len(args) > len(itensors):
                 args = args[:len(itensors)]
-                logger.warn(f'cube graph forward: args shrinked into {args}')
+                _logger.warning(f'cube graph forward: args shrinked into {args}')
             else:
                 raise RuntimeError('len(args) < len(itensors)')
 
@@ -165,7 +168,7 @@ class IRGraph(IRSegment):
             if ftensor.is_loss(): continue
             consumers = [n for n in self.consumers(ftensor) if isinstance(n, IRFwOperation)]
             if len(consumers) == 0 and ftensor.requires_grad:
-                logging.getLogger('cube.parser').warn(
+                _logger.warning(
                     f"detected a dead ftensor which is not consumed by any nodes:\n\t{ftensor.name}: {ftensor}")
                 ftensor.requires_grad = False
 
@@ -299,12 +302,11 @@ class IRGraph(IRSegment):
             raise TypeError("Expected op to be forward op or data op")
         if not isinstance(times, int) or times < 1:
             raise TypeError("Expected times to be int and >= 1")
-        logger = logging.getLogger('cube.prim')
         if node.name == 'multiref':  
-            logger.warn(f'skip replicating multiref ({node.cid}), which will be handled by system.')
+            _logger.warning(f'skip replicating multiref ({node.cid}), which will be handled by system.')
             return [node]
         if isinstance(node, IRPyFunc):
-            logger.warn(f'skip replicating pyfunc ({node.cid}), which will be handled by system.')
+            _logger.warning(f'skip replicating pyfunc ({node.cid}), which will be handled by system.')
             return [node]
 
         fsegment: IRSegment = self.segment(node)
@@ -366,12 +368,11 @@ class IRGraph(IRSegment):
             f"The partition algorithm ({algo}) is not initialized for this node"
         assert isinstance(node, (IRFwOperation, IRDataOperation)), \
             f"Only allow op to be forward op or data op, but got: {node}"
-        logger = logging.getLogger('cube.prim')
         if node.name == 'multiref':
-            logger.warn(f'skip partitioning multiref ({node.cid}), which will be handled by system.')
+            _logger.warning(f'skip partitioning multiref ({node.cid}), which will be handled by system.')
             return [node]
         if isinstance(node, IRPyFunc):
-            logger.warn(f'skip partitioning pyfunc ({node.cid}), which will be handled by system.')
+            _logger.warning(f'skip partitioning pyfunc ({node.cid}), which will be handled by system.')
             return [node]
 
         # get partitioned sub-nodes
@@ -868,7 +869,7 @@ class IRGraph(IRSegment):
             if node.name == 'multiref' or isinstance(node, IRPyFunc):
                 pass
             else:
-                logging.getLogger('cube.prim').info(f'involve node {node.name}({node.cid}) into the first stage')     
+                _logger.info(f'involve node {node.name}({node.cid}) into the first stage')     
             starts[0] = idx
             break
 
@@ -883,7 +884,7 @@ class IRGraph(IRSegment):
             begin = starts[sid]
             end = starts[sid+1] if sid != len(starts) - 1 else last_fidx + 1
             if begin >= end:
-                logging.getLogger('cube.prim').warn(
+                _logger.warning(
                     f"skip stage {sid} which doesn't have operators: [begin({begin}): end({end})).")
                 continue
             fnodes = self._nodes[begin:end]
@@ -1029,7 +1030,7 @@ class IRGraph(IRSegment):
             skip += nodes[end:]
             for node in skip:
                 if isinstance(node, IRGraphAnchor): continue
-                logging.getLogger('cube.prim').info(
+                _logger.info(
                     f"skip recompute node: {node.name} ({node.cid}) as "
                     f"it doesn't require gradient and appears at head or tail."
                 )

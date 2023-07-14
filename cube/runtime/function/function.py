@@ -3,12 +3,17 @@ import torch
 import torch.nn.functional as TorchF
 import logging
 
+from cube.flags import CompileFlag
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.INFO if CompileFlag.log_runtime else logging.WARNING)
+
 
 # TODO: move to registered function
 try:
     from apex.normalization.fused_layer_norm import fused_layer_norm_affine
 except:
-    logging.getLogger('cube.runtime').warn('skip apex ops as it is not installed.')
+    _logger.warning('skip apex ops as it is not installed.')
 
 
 def identity(tensor: torch.Tensor) -> torch.Tensor:

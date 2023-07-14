@@ -16,6 +16,11 @@ from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, 
 from cube.graph.function.conv import IRPad, IRConv2D, IRConv3D
 from cube.graph.function.anchor import IRGraphAnchor
 
+from cube.flags import CompileFlag
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.INFO if CompileFlag.log_parser else logging.WARN)
+
 
 def Identity(tensor: IRObject, signature = None):
     signature = 'cube.runtime.function.identity'
@@ -55,7 +60,7 @@ def Linear(input, weight, bias=None, signature = None):
         return IRDimops(Linear, 'linear', signature, annos, [input, weight], bias=None)
     else:
         annos = ['b * k^, n k^, n -> b * n']
-        logging.getLogger('cube.parser').warn(
+        _logger.warning(
             'detected a linear operator has bias, the partition on reduction dimension is disabled.')
         return IRDimops(Linear, 'linear', signature, annos, [input, weight, bias])
 
@@ -1661,7 +1666,7 @@ def ShapeAsTensor(input: IRTensor, signature = None):
     """
     torch._shape_as_tensor
     """
-    logging.getLogger('cube.parser').warn(
+    _logger.warning(
         'shape_as_tensor is interpreted as an IRPyFunc '
         'and generate an IRObject instead of IRTensor')
     signature = 'torch._shape_as_tensor'
@@ -1757,8 +1762,7 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
             return torch.device('cpu')
         if name == 'layout':
             assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
-            logging.getLogger('cube.parser').warn(
-                "getattr of 'layout' will always return torch.strided")
+            _logger.warn("getattr of 'layout' will always return torch.strided")
             return torch.strided
     if isinstance(obj, torch.finfo):
         return getattr(obj, name)
