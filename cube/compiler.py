@@ -244,7 +244,7 @@ def compile(model: SemanticModel, *args,
 
         # load module
         filename = filename.format(myrank)
-        print_each_rank(f'loading generated module from {filename} ...', logger_fn=_logger.info)
+        print_each_rank(f'loading generated module from {filename} ...', logger=_logger)
         model.load_module(filename)
 
         if torch.distributed.is_initialized():
@@ -254,7 +254,7 @@ def compile(model: SemanticModel, *args,
         # set dataloder batch size (serialize output)
         if dataloader is not None:
             bs = model.get_gen_module().get_batch_size()
-            print_each_rank(f'setting batch size to: {bs}', logger_fn=_logger.info)
+            print_each_rank(f'setting batch size to: {bs}', logger=_logger)
             if torch.distributed.is_initialized():
                 for rank in range(torch.distributed.get_world_size()):
                     if rank == torch.distributed.get_rank():
@@ -269,7 +269,7 @@ def compile(model: SemanticModel, *args,
             torch.distributed.barrier()
 
         # load temporal schedule
-        print_each_rank(f'loading generated schedule from {filename} ...', logger_fn=_logger.info)
+        print_each_rank(f'loading generated schedule from {filename} ...', logger=_logger)
         return cube.load_default_schedule(filename)
 
     return decorator

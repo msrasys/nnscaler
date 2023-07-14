@@ -10,19 +10,20 @@ import torch
 _logger = logging.getLogger(__name__)
 
 
-def print_each_rank(msg: str, rank_only: Optional[int] = None, logger_fn: Callable = print):
+def print_each_rank(msg: str, rank_only: Optional[int] = None, logger: Optional[logging.Logger] = None):
     """Logging the message.
     
     Args:
         msg (str): message to be logged.
         rank_only (int, optional):
             the rank to be logged. Defaults to None, which means all ranks.
-        logger_fn (Callable, optional):
-            the logger function. Defaults to print.
+        logger (logging.Logger, optional):
+            the logger to use. Defaults to print.
 
     Returns:
         None
     """
+    logger_fn = print if logger is None else logger.info
     if CompileFlag.dev_mode:
         logger_fn(msg)
         return
@@ -53,7 +54,7 @@ def load_model(filename: Optional[str] = None, load_content: bool = True):
     # load parameter content
     if load_content:
         print_each_rank("> loading parameter content...",
-                        logger_fn=_logger.info)
+                        logger=_logger)
         loaded_module.load_attr_content('./fullmodel.pt')
     # initialize reducer
     for reducer in loaded_module.reducers:
