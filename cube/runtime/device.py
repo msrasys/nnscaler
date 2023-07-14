@@ -51,6 +51,13 @@ class DeviceGroup:
     def __len__(self, name):
         return DeviceGroup.instance.world_size
 
+    def group_exists(self, ranks):
+        """
+        Check if group exists
+        """
+        rank_bits = DeviceGroup.bitmap(ranks)
+        return rank_bits in self.instance.groups
+
     def get_group(self, ranks):
         """
         Create and return rank groups on-demand

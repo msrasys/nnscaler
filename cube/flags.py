@@ -52,7 +52,12 @@ class CompileFlag:
     max_reducer_bucket = _to_int('MAX_REDUCER_BUCKET', default=137217728)
     # perform reducer op on gradients, can be sum, avg, mean, max, min. Default is sum
     reducer_op = os.environ.get('REDUCER_OP', default='sum')
-    
+    # zero_ngroups is the number of subgroups in each original ZeRO gruop (e.g., weights reducer)
+    # ZeRO subgroup is obtained by dividing the original ZeRO group by zero_ngroups
+    # it helps reduce communication cost of allgather weights in ZeRO, but increase the weights'
+    # optimization states on each GPU.
+    zero_ngroups = _to_int('ZERO_NUM_GROUPS', default=1)
+
     # use automate mixture precision training, where weights, gradients
     # and optimizer status are kept in its original data type (can be float32),
     # but some of the forward operators will be converted to float16.

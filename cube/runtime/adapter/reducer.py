@@ -38,7 +38,8 @@ class Bucket:
     def __init__(self, params: List[torch.nn.Parameter],
                  param_buffer: torch.Tensor, grad_buffer: torch.Tensor,
                  reduce_op: torch.distributed.ReduceOp, 
-                 group, async_op: bool, zero: bool):
+                 group, async_op: bool, zero: bool,
+                 zero_subgroup: torch.distributed.ProcessGroup = None):
         """
         Create a communication unit for parameter allreduce.
         
@@ -52,6 +53,7 @@ class Bucket:
         @param group: communication group
         @param async_op bool: whether to use asynchronous operation
         @param zero bool: whether to use zero optimization on gradients
+        @param zero_subgroup: the subgroup for zero optimization the current rank belongs to
         """
 
         self._params: List[torch.nn.Parameter] = params
@@ -74,6 +76,9 @@ class Bucket:
         # total number of parameters
         self._numel: int = sum(p.numel() for p in self._params)
         self._padding: int = self._contiguous_grads.size(0) - self._numel
+
+        self._zero_subgroup = self._group if zero_subgroup is None else zero_subgroup
+        self._zgroup_sz: int = torch.distributed.get_world_size(group=self._zero_subgroup)
 
         # pre and post hooks for gradient synchronization
         self._pre_hooks: List[Callable] = []
@@ -113,9 +118,9 @@ class Bucket:
         if not self._zero:
             opt = self._contiguous_params[:self._numel]
         else:
-            rank = torch.distributed.get_rank(group=self._group)
-            opt = self._contiguous_params.chunk(self._wsz)[rank]
-            if rank == self._wsz - 1 and self._padding != 0:
+            rank = torch.distributed.get_rank(group=self._zero_subgroup)
+            opt = self._contiguous_params.chunk(self._zgroup_sz)[rank]
+            if rank == self._zgroup_sz - 1 and self._padding != 0:
                 opt = opt[:-self._padding]
         self._param_for_optimizer = torch.nn.Parameter(opt)
 
@@ -207,8 +212,9 @@ class Bucket:
 
         # setup gradient for optimizer parameters
         if self._zero:
-            grad = self._contiguous_grads.chunk(self._wsz, dim=0)[rank]
-            if rank == self._wsz - 1 and self._padding != 0:
+            rank = torch.distributed.get_rank(group=self._zero_subgroup)
+            grad = self._contiguous_grads.chunk(self._zgroup_sz, dim=0)[rank]
+            if rank == self._zgroup_sz - 1 and self._padding != 0:
                 grad = grad[:-self._padding]
             self._param_for_optimizer.grad = grad
         else:
@@ -222,9 +228,9 @@ class Bucket:
         All-gather parameters
         """
         assert self._zero, "gathering paramters is only for zero optimization."
-        rank = torch.distributed.get_rank(group=self._group)
-        shards = list(self._contiguous_params.chunk(self._wsz, dim=0))
-        torch.distributed.all_gather(shards, shards[rank], group=self._group)
+        rank = torch.distributed.get_rank(group=self._zero_subgroup)
+        shards = list(self._contiguous_params.chunk(self._zgroup_sz, dim=0))
+        torch.distributed.all_gather(shards, shards[rank], group=self._zero_subgroup)
 
     def register_pre_hook(self, fn: Callable):
         """Register pre hooks to be applied before gradient synchronization.
@@ -285,7 +291,8 @@ class Bucket:
 class Reducer:
 
     def __init__(self, ranks: List[int], max_bucket_size_bytes=536870912,
-                 reduce_op: str = 'sum', async_op: bool = False, zero: bool = False):
+                 reduce_op: str = 'sum', async_op: bool = False,
+                 zero: bool = False, zero_ngroups: int = 1):
         """
         Create a reducer applied on a set of weights for weight reduction
 
@@ -296,7 +303,8 @@ class Reducer:
             only work for asynchronous reducer.
         @param reduce_op str: reduce operation, can be 'sum', 'avg', 'max' or 'min' (default 'sum')
         @param async_op bool: whether to overlap with backward computation (default False)
-        @param zero bool: whether to apply zero optimization on gradients
+        @param zero bool: whether to apply ZeRO optimization on gradients
+        @param zero_ngroups int: number of ZeRO subgroups in the original ZeRO group
         """
         self._params: List[torch.nn.Parameter] = list()
         self._param_ids: Set[int] = set()
@@ -312,6 +320,30 @@ class Reducer:
         # contiguous parameter buffer and gradient buffer
         self._contiguous_params: torch.Tensor = None
         self._contiguous_grads: torch.Tensor = None
+
+        # build the subgroup of zero the current rank belongs to.
+        # When zero_ngroups is larger than 1, the number of ranks
+        # will be divided by zero_ngroups into sub rank groups,
+        # allgather of weights will be done within each subgroup.
+        # For example, if the ranks are [0, 1, 2, 3, 4, 5, 6, 7] and zero_ngroups=2,
+        # the ranks will be divided into [0, 1, 2, 3] and [4, 5, 6, 7].
+        # If the ranks are [0, 2, 4, 6], zero_ngroups=2, then the ranks
+        # will be divided into [0, 2] and [4, 6].
+        if self._zero and Bucket.use_reduce_scatter_for_zero:
+            assert zero_ngroups == 1, f"zero_ngroups {zero_ngroups}, which is >1, does not support reduce scatter"
+        if zero_ngroups > 1:
+            assert self._zero, f"USE_ZERO must be set when ZERO_NUM_GROUPS is larger than 1"
+            assert len(ranks) % zero_ngroups == 0, f"length of ranks {ranks} must be divisible by zero factor {zero_ngroups}"
+            curr_rank = torch.distributed.get_rank(group=self._group)
+            zgroup_sz = len(ranks) // zero_ngroups
+            group_idx = curr_rank // zgroup_sz
+            sub_ranks = ranks[group_idx * zgroup_sz : (group_idx + 1) * zgroup_sz]
+            if len(sub_ranks) > 1:
+                assert DeviceGroup().group_exists(sub_ranks), f"zero subgroup {sub_ranks} does not exist in comm groups"
+            self._zero_subgroup = DeviceGroup().get_group(sub_ranks)
+        else:
+            assert zero_ngroups == 1, f"zero factor must be 1, but got {zero_ngroups}"
+            self._zero_subgroup = self._group
 
     @property
     def params(self) -> Tuple[torch.nn.Parameter]:
@@ -437,6 +469,7 @@ class Reducer:
                 self._group,
                 self._async,
                 self._zero,
+                self._zero_subgroup,
             )
             buckets.append(bucket)
         torch.cuda.empty_cache()
