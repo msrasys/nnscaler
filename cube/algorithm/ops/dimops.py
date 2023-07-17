@@ -138,11 +138,9 @@ class DimSplitEinops(GenericDistAlgo):
             if not isinstance(tensor, IRSubTensor):
                 return [tensor] * num
             if split.isD():
-                sub_tensors = [tensor]
-                for dim in split.dims:
-                    for _ in range(len(sub_tensors)):
-                        sub_tensor = sub_tensors.pop(0)
-                        sub_tensors += sub_tensor.split_dim(dim, num)
+                # get sub-tensors with nested partition on dims
+                sub_tensors = tensor.split_dims(split.dims, (num,) * len(split.dims))
+                # reshape to (num, num, ...) and select [i, i, ..., i] sub-tensor, i = 0 to num-1
                 sub_tensors = np.array(sub_tensors, dtype=IRSubTensor).reshape((num,) * len(split.dims))
                 sub_tensors = [sub_tensors[(i,) * len(split.dims)] for i in range(num)]
                 return sub_tensors
@@ -189,9 +187,6 @@ class DimSplitEinops(GenericDistAlgo):
                 if splits[idx].isD():
                     # make negative offset to be possitive
                     ndims = len(node.input(idx).shape)
-                    # rdim = (splits[idx].dims + ndims) % ndims
-                    # if rdim == dim:
-                    #     return r
                     rdims = tuple((d + ndims) % ndims for d in splits[idx].dims)
                     if dim in rdims:
                         return r
