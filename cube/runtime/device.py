@@ -34,7 +34,7 @@ class DeviceGroup:
                 self.node_rank = int(os.environ.get('GROUP_RANK'))
 
             torch.cuda.set_device(self.local_rank)
-            self.groups: Dict = dict()
+            self.groups: Dict = { '1'*self.world_size: None }
             self.streams: Dict[str, torch.cuda.Stream] = {
                 'default': torch.cuda.default_stream()}
 
