@@ -6,6 +6,7 @@ class IRDType(Enum):
     float64 = 'float64'
     float16 = 'float16'
     float32 = 'float32'
+    bfloat16 = 'bfloat16'
     int64   = 'int64'
     int32   = 'int32'
     int16   = 'int16'
@@ -20,6 +21,7 @@ def dtype2byte_size(dtype: IRDType) -> int:
         IRDType.float64: 8,
         IRDType.float32: 4,
         IRDType.float16: 2,
+        IRDType.bfloat16: 2,
         IRDType.int64: 8,
         IRDType.int32: 4,
         IRDType.int16: 2,
@@ -61,6 +63,7 @@ class DTypeInferRule:
 float64 = IRDType.float64
 float16 = IRDType.float16
 float32 = IRDType.float32
+bfloat16 = IRDType.bfloat16
 int64   = IRDType.int64
 int32   = IRDType.int32
 int16   = IRDType.int16

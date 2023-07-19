@@ -18,6 +18,7 @@ class DType2IRDType:
         torch.float  : ir.float32,
         torch.float16: ir.float16,
         torch.half   : ir.float16,
+        torch.bfloat16: ir.bfloat16,
         torch.uint8  : ir.uint8,
         torch.int8   : ir.int8,
         torch.int16  : ir.int16,
