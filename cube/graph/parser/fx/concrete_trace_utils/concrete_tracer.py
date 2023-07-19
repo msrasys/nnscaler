@@ -251,7 +251,8 @@ class ConcreteTracer(TracerBase):
     default_autowrap_leaf_class: Dict[Type, Tuple[List[Tuple[Union[ModuleType, Type], str]], bool]] = {
         # class
         _orig_bool:                 ([], False),
-        _orig_zip:                  ([], False),
+        # we don't want zip appear as a node in the graph
+        # _orig_zip:                  ([], False),
         _orig_int:                  ([], False),
 
         # iterable class

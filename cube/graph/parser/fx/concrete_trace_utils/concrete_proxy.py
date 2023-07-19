@@ -79,6 +79,11 @@ class ConcreteProxy(Proxy):
         return ConcreteAttrProxy(self, k)
 
     def __call__(self, *args, **kwargs) -> ConcreteProxy:
+        # If it is a module proxy, we should not create a `call_method` node for this case.
+        # What we need is to trace this module or the internals of this module,
+        # so here we directly call the `__call__` to trigger `create_proxy` inner the `__call__`.
+        if isinstance(self.value, torch.nn.Module):
+            return self.value.__call__(*args, **kwargs)
         return self.tracer.create_proxy('call_method', '__call__', (self,) + args, kwargs)
 
     def __iter__(self) -> Union[Iterable, ConcreteProxy]:
