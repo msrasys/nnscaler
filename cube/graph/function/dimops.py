@@ -486,16 +486,25 @@ class DimopSplit:
     """
     Partition status of a tensor
     """
-    def __init__(self, dim: Optional[int] = None, r = False, v = False) -> None:
-        self.dim = dim
-        self.rep = r
-        self.val = v
+    def __init__(self, dims: Optional[Union[int, List[int]]] = None, r = False, v = False) -> None:
+        """Dimension split config
+        
+        Args:
+            dims (Optional[Union[int, List[int]]], optional): [description]. Defaults to None.
+        """
+        if isinstance(dims, int):
+            dims = (dims,)
+        elif isinstance(dims, Iterable):
+            dims = tuple(sorted(dims))
+        self.dims: Optional[Tuple[int]] = dims
+        self.rep: bool = r
+        self.val: bool = v
 
     def isR(self) -> bool:
         return self.rep
 
     def isD(self) -> bool:
-        return self.dim is not None
+        return self.dims is not None
 
     def isV(self) -> bool:
         return self.val
@@ -505,7 +514,7 @@ class DimopSplit:
             return False
         if other.isR() and self.isR():
             return True
-        if other.isD() and self.isD() and other.dim == self.dim:
+        if other.isD() and self.isD() and other.dims == self.dims:
             return True
         if other.isV() and self.isV():
             return True
@@ -517,11 +526,11 @@ class DimopSplit:
         elif self.isR():
             return -2
         else:
-            return self.dim
+            return self.dims
 
     def __repr__(self) -> str:
         if self.isD():
-            return f'D({self.dim})'
+            return f'D({self.dims})'
         if self.isR():
             return f'R'
         if self.isV():
@@ -537,8 +546,8 @@ class DimopSplit:
         return DimopSplit(v=True)
 
     @staticmethod
-    def D(dim: int):
-        return DimopSplit(dim=dim)
+    def D(dims: Union[int, List[int]]):
+        return DimopSplit(dims=dims)
 
 
 class TransformRule:

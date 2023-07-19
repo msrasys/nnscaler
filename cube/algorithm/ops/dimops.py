@@ -1,4 +1,5 @@
 from typing import List, Optional, Any, Dict, Union, Tuple
+import numpy as np
 import logging
 from cube.algorithm.generics import GenericDistAlgo
 
@@ -136,7 +137,12 @@ class DimSplitEinops(GenericDistAlgo):
             if not isinstance(tensor, IRSubTensor):
                 return [tensor] * num
             if split.isD():
-                return tensor.split_dim(split.dim, num)
+                # get sub-tensors with nested partition on dims
+                sub_tensors = tensor.split_dims(split.dims, (num,) * len(split.dims))
+                # reshape to (num, num, ...) and select [i, i, ..., i] sub-tensor, i = 0 to num-1
+                sub_tensors = np.array(sub_tensors, dtype=IRSubTensor).reshape((num,) * len(split.dims))
+                sub_tensors = [sub_tensors[(i,) * len(split.dims)] for i in range(num)]
+                return sub_tensors
             if split.isR():
                 return tensor.replicate(num)
             if split.isV():
@@ -180,8 +186,8 @@ class DimSplitEinops(GenericDistAlgo):
                 if splits[idx].isD():
                     # make negative offset to be possitive
                     ndims = len(node.input(idx).shape)
-                    rdim = (splits[idx].dim + ndims) % ndims
-                    if rdim == dim:
+                    rdims = tuple((d + ndims) % ndims for d in splits[idx].dims)
+                    if dim in rdims:
                         return r
             else:
                 if splits[idx].isV():
@@ -195,20 +201,31 @@ class DimSplitEinops(GenericDistAlgo):
         # input
         for idx, idim in enumerate(node.anno.inputs()):
             dims = idim.getdims(adim)
-            assert len(dims) <= 1, "Cannot split on multiple same tensors"
-            if len(dims) == 1:
-                itransform.append(DimopSplit.D(dims[0]))
-            else:
+            if len(dims) == 0:
                 itransform.append(DimopSplit.R())
+            else:
+                if len(dims) > 1:
+                    _logger.warning(
+                        f'node ({self.node.name}-{self.node.cid}): detected an input tensor '
+                        f'is split on {len(dims)} dimensions, this will cause data loss.',
+                        category=RuntimeWarning, stacklevel=0,
+                    )
+                itransform.append(DimopSplit.D(dims))
         # output
         for idx, odim in enumerate(node.anno.outputs()):
             dims = odim.getdims(adim)
-            if len(dims) == 1:
-                otransform.append(DimopSplit.D(dims[0]))
-            else:
+            if len(dims) == 0:
                 otransform.append(
                     DimopSplit.R() if reduce == DimAnno.ReduceType.Dim else DimopSplit.V()
                 )
+            else:
+                if len(dims) > 1:
+                    _logger.warning(
+                        f'node ({self.node.name}-{self.node.cid}): detected an output tensor '
+                        f'is split on {len(dims)} dimensions, this will cause data loss.',
+                        category=RuntimeWarning, stacklevel=0,
+                    )
+                otransform.append(DimopSplit.D(dims))
         # modifier
         def modify(kwargs: Dict, idx: int, dim: int, num: int):
             updated_kwargs = dict(**kwargs)

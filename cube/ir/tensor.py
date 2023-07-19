@@ -720,6 +720,23 @@ class IRSubTensor(IRTensor):
             sub_tensors.append(sub_tensor)
         return sub_tensors
 
+    def split_dims(self, dims: Tuple[int], nums: Tuple[int] ) -> List[IRTensor]:
+        """Uniformly and nestedly partition tensors alongside multiple dimensions.
+        
+        Args:
+            dims (Tuple[int]): the dimensions to get partitioned
+            nums (Tuple[int]): the number of sub-tensor generated
+        
+        Returns:
+            List[IRTensor]: the generated `\prod nums` sub-tensors
+        """
+        sub_tensors = [self]
+        for dim, num in zip(dims, nums):
+            for _ in range(len(sub_tensors)):
+                sub_tensor = sub_tensors.pop(0)
+                sub_tensors += sub_tensor.split_dim(dim, num)
+        return sub_tensors
+
     def split_val(self, num: int) -> List[IRTensor]:
         """!
         Partition primitive:
