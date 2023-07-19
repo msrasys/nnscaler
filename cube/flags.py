@@ -17,11 +17,6 @@ def _to_int(s: str, default=0) -> int:
 
 class CompileFlag:
 
-    # ============= loggings ===================
-    log_transform = _to_bool('LOG_TRANSFORM')
-    log_schedule = _to_bool('LOG_SCHEDULE')
-    log_parser = _to_bool('LOG_PARSER')
-
     # ================ compiling ========================
     use_torchfx = _to_bool('USE_TORCHFX')  # using torch.fx or torchscript as frontend to capture dataflow graph
     use_default_fx_tracer = _to_bool('USE_DEFAULT_FX_TRACER')  # using default fx tracer or more powerful concrete_tracer
@@ -36,6 +31,7 @@ class CompileFlag:
     # ============ code generation ===============
     use_nnfusion = _to_bool('USE_NNFUSION')
     use_jit = _to_bool('USE_JIT')
+    disable_code_line_info = _to_bool('DISABLE_CODE_LINE_INFO')  # will add original code information in generated code, note that this will make trace slow
 
     # ============== runtime ====================
     dev_mode = _to_bool('SINGLE_DEV_MODE')  # allow to use python xx.py
@@ -52,7 +48,12 @@ class CompileFlag:
     max_reducer_bucket = _to_int('MAX_REDUCER_BUCKET', default=137217728)
     # perform reducer op on gradients, can be sum, avg, mean, max, min. Default is sum
     reducer_op = os.environ.get('REDUCER_OP', default='sum')
-    
+    # zero_ngroups is the number of subgroups in each original ZeRO gruop (e.g., weights reducer)
+    # ZeRO subgroup is obtained by dividing the original ZeRO group by zero_ngroups
+    # it helps reduce communication cost of allgather weights in ZeRO, but increase the weights'
+    # optimization states on each GPU.
+    zero_ngroups = _to_int('ZERO_NUM_GROUPS', default=1)
+
     # use automate mixture precision training, where weights, gradients
     # and optimizer status are kept in its original data type (can be float32),
     # but some of the forward operators will be converted to float16.

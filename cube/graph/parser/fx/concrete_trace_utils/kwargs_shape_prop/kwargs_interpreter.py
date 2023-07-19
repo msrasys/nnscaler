@@ -1,6 +1,5 @@
 import torch
 import torch.fx
-import torch.fx.traceback as fx_traceback
 from torch.fx import Interpreter, Node, GraphModule
 from typing import Optional, Union, Tuple, Dict, List, Any, Iterator, Callable, MutableMapping, Mapping
 from torch.utils._pytree import tree_map

@@ -1,5 +1,4 @@
 from typing import List, Tuple, Optional, Any
-import warnings
 
 from cube.ir.cten import IRCell, IRTensor, IRObject
 from cube.ir.tensor import IRFullTensor, IRSubTensor
@@ -12,7 +11,8 @@ from cube.graph.parser.dtype import DType2IRDType
 from cube.runtime.syndata import CubeDataLoader
 from cube.runtime.module import CubeModule
 from cube.runtime.device import DeviceGroup
-from cube.profiler.timer import print_each_rank
+
+from cube.utils import load_model
 
 import torch
 
@@ -194,18 +194,8 @@ class SemanticModel:
         return self.ir_graph
 
     def load_module(self, filename: str):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("GenModel", filename)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        self._loaded_module: CubeModule = module.GenModel().cuda()
-        # load parameter content
-        if self.save_content:
-            print_each_rank("> loading parameter content...")
-            self._loaded_module.load_attr_content('./fullmodel.pt')
-        # initialize reducer
-        for reducer in self._loaded_module.reducers:
-            reducer.build_buckets()
+        """Load module from file."""
+        self._loaded_module = load_model(filename, self.save_content)
 
     def get_gen_module(self) -> Optional[torch.nn.Module]:
         return self._loaded_module

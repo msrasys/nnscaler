@@ -1,11 +1,42 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
+import logging
 
 import cube
-from cube.profiler.timer import print_each_rank
 from cube.runtime.device import DeviceGroup
-from cube.flags import RuntimeFlag
+from cube.flags import RuntimeFlag, CompileFlag
 
-from cube.flags import RuntimeFlag
+import torch
+
+_logger = logging.getLogger(__name__)
+
+
+def print_each_rank(msg: str, rank_only: Optional[int] = None, logger: Optional[logging.Logger] = None):
+    """Logging the message.
+    
+    Args:
+        msg (str): message to be logged.
+        rank_only (int, optional):
+            the rank to be logged. Defaults to None, which means all ranks.
+        logger (logging.Logger, optional):
+            the logger to use. Defaults to print.
+
+    Returns:
+        None
+    """
+    logger_fn = print if logger is None else logger.info
+    if CompileFlag.dev_mode:
+        logger_fn(msg)
+        return
+
+    myrank = torch.distributed.get_rank()
+    for rank in range(torch.distributed.get_world_size()):
+        if rank_only is None:
+            if myrank == rank:
+                logger_fn('rank [{}]: {}'.format(rank, msg))
+        else:
+            if myrank == rank_only and rank_only == rank:
+                logger_fn('rank [{}]: {}'.format(rank, msg))
+        torch.distributed.barrier()
 
 
 def _load_module_attr(filename: str, name: str):
@@ -22,7 +53,8 @@ def load_model(filename: Optional[str] = None, load_content: bool = True):
     loaded_module: cube.runtime.module.CubeModule = module.GenModel().cuda()
     # load parameter content
     if load_content:
-        print_each_rank("> loading parameter content...")
+        print_each_rank("> loading parameter content...",
+                        logger=_logger)
         loaded_module.load_attr_content('./fullmodel.pt')
     # initialize reducer
     for reducer in loaded_module.reducers:

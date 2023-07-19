@@ -8,10 +8,9 @@ IRGraph:
 """
 
 from typing import Sequence, Set, Union, Tuple, List, Optional, Dict, Any
-import warnings
+import logging
 import copy
 import dill
-import sys
 
 from cube.ir.cten import IRTensor, IRCell, IRObject
 from cube.ir.unique import IDGenerator
@@ -28,6 +27,7 @@ from cube.graph.segment import IRSegment
 from cube.algorithm.generics import GenericDistAlgo
 
 
+_logger = logging.getLogger(__name__)
 FOp = Union[IRFwOperation, IRDataOperation]
 
 
@@ -77,10 +77,13 @@ class IRGraph(IRSegment):
         # align graph with input tensors
         itensors: Tuple[IRObject, ...] = self.inputs()
         if len(args) != len(itensors):
-            print(f'ERROR(skipping) len(args) != len(itensors): {len(args)} != {len(itensors)}')
+            _logger.error(
+                f'cube graph forward: skipping arguments due to len(args) != len(itensors): '
+                f'{len(args)} != {len(itensors)}'
+            )
             if len(args) > len(itensors):
                 args = args[:len(itensors)]
-                print(f'WARNING: args shrinked into {args}')
+                _logger.warning(f'cube graph forward: args shrinked into {args}')
             else:
                 raise RuntimeError('len(args) < len(itensors)')
 
@@ -161,7 +164,8 @@ class IRGraph(IRSegment):
             if ftensor.is_loss(): continue
             consumers = [n for n in self.consumers(ftensor) if isinstance(n, IRFwOperation)]
             if len(consumers) == 0 and ftensor.requires_grad:
-                print(f"warning: detected a dead ftensor which is not consumed by any nodes:\n\t{ftensor.name}: {ftensor}", file=sys.stderr)
+                _logger.warning(
+                    f"detected a dead ftensor which is not consumed by any nodes:\n\t{ftensor.name}: {ftensor}")
                 ftensor.requires_grad = False
 
         # infer gradient
@@ -294,13 +298,11 @@ class IRGraph(IRSegment):
             raise TypeError("Expected op to be forward op or data op")
         if not isinstance(times, int) or times < 1:
             raise TypeError("Expected times to be int and >= 1")
-        if node.name == 'multiref':
-            warnings.warn(
-                'Detected partition a multiref node. This will be skipped as system will automatically handle it.')
+        if node.name == 'multiref':  
+            _logger.warning(f'skip replicating multiref ({node.cid}), which will be handled by system.')
             return [node]
         if isinstance(node, IRPyFunc):
-            warnings.warn(
-                'Detected partition a python runtime function. This will be skipped as system will automatically handle it')
+            _logger.warning(f'skip replicating pyfunc ({node.cid}), which will be handled by system.')
             return [node]
 
         fsegment: IRSegment = self.segment(node)
@@ -363,12 +365,10 @@ class IRGraph(IRSegment):
         assert isinstance(node, (IRFwOperation, IRDataOperation)), \
             f"Only allow op to be forward op or data op, but got: {node}"
         if node.name == 'multiref':
-            warnings.warn(
-                'Detected partition a multiref node. This will be skipped as system will automatically handle it.')
+            _logger.warning(f'skip partitioning multiref ({node.cid}), which will be handled by system.')
             return [node]
         if isinstance(node, IRPyFunc):
-            warnings.warn(
-                'Detected partition a python runtime function. This will be skipped as system will automatically handle it')
+            _logger.warning(f'skip partitioning pyfunc ({node.cid}), which will be handled by system.')
             return [node]
 
         # get partitioned sub-nodes
@@ -859,14 +859,13 @@ class IRGraph(IRSegment):
         # adjust the start of the first stage to involve beginning operators
         for idx in range(starts[0]):
             node = self.node(idx)
-            if isinstance(node, IRDataOperation):
-                continue
+            if isinstance(node, IRDataOperation): continue
             assert isinstance(node, IRFwOperation), \
                 f"Expected nodes previous from the first stage are all IRFwOperation, but got {type(node)}"
             if node.name == 'multiref' or isinstance(node, IRPyFunc):
                 pass
             else:
-                warnings.warn(f'Detect a node: {node} that is previous from the first stage. Will be included inside the first stage')
+                _logger.info(f'involve node {node.name}({node.cid}) into the first stage')     
             starts[0] = idx
             break
 
@@ -881,7 +880,8 @@ class IRGraph(IRSegment):
             begin = starts[sid]
             end = starts[sid+1] if sid != len(starts) - 1 else last_fidx + 1
             if begin >= end:
-                warnings.warn(f"Detected stage {sid} doesn't have operators: [begin({begin}): end({end})). Skipped")
+                _logger.warning(
+                    f"skip stage {sid} which doesn't have operators: [begin({begin}): end({end})).")
                 continue
             fnodes = self._nodes[begin:end]
             assert all(isinstance(node, IRFwOperation) for node in fnodes), \
@@ -1026,7 +1026,10 @@ class IRGraph(IRSegment):
             skip += nodes[end:]
             for node in skip:
                 if isinstance(node, IRGraphAnchor): continue
-                print(f"skip recompute node: {node.name} ({node.cid}) as it doesn't require gradient and appears at head or tail.")
+                _logger.info(
+                    f"skip recompute node: {node.name} ({node.cid}) as "
+                    f"it doesn't require gradient and appears at head or tail."
+                )
             nodes = nodes[:end]
             for fnode in nodes:
                 fnode.recompute = recompute_group_id

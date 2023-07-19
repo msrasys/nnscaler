@@ -1,6 +1,6 @@
 from typing import Dict, List, Optional, Tuple
 import more_itertools
-import warnings
+import logging
 import copy
 import torch
 import numpy as np
@@ -25,6 +25,9 @@ from cube.codegen.module.autograd import AutogradAdapterCodeGen
 from cube.codegen.lifecycle import LifeCycle
 
 from cube.flags import CompileFlag
+
+
+_logger = logging.getLogger(__name__)
 
 
 class ModuleCodeGen(FuncEmission):
@@ -162,6 +165,15 @@ class ModuleCodeGen(FuncEmission):
         
         @param scale_ndevs Optional[int]: scale to number of devices
         """
+        def _add_comm_for_group_zero(ranks):
+            zero_comm_groups = []
+            for i in range(CompileFlag.zero_ngroups):
+                assert len(ranks) % CompileFlag.zero_ngroups == 0
+                ranks_per_group = len(ranks) // CompileFlag.zero_ngroups
+                zero_subgroup = tuple(ranks[i * ranks_per_group : (i + 1) * ranks_per_group])
+                if len(zero_subgroup) > 1 and len(zero_subgroup) < len(ranks):
+                    zero_comm_groups.append(zero_subgroup)
+            return zero_comm_groups
         scale_ndevs = scale_ndevs if scale_ndevs is not None else len(self.devices)
         assert len(self.devices) == max(self.devices) + 1, f'device must be consecutive'
         assert scale_ndevs % len(self.devices) == 0, f'ngpus must be a multiple of {len(self.devices)}'
@@ -176,11 +188,15 @@ class ModuleCodeGen(FuncEmission):
                                            for device in reducer.device)
             ranks = tuple(sorted(ranks))
             comm_groups.append(ranks)
+            # add comm groups for group ZeRO
+            comm_groups.extend(_add_comm_for_group_zero(ranks))
         # communication groups for parameters that are outside reducers
         for device in self.devices:
             ranks = list(range(device, scale_ndevs, len(self.devices)))
             if len(ranks) > 1:
                 comm_groups.append(ranks)
+                # add comm groups for group ZeRO
+                comm_groups.extend(_add_comm_for_group_zero(ranks))
         # communication groups for activations
         adapters = graph.select(ntype=IRAdapter)
         for adapter in adapters:
@@ -425,12 +441,14 @@ class ModuleCodeGen(FuncEmission):
         max_nbytes = CompileFlag.max_reducer_bucket
         async_op = CompileFlag.async_reducer
         zero = CompileFlag.use_zero
+        zero_ngroups = CompileFlag.zero_ngroups
         reduce_op = f"'{CompileFlag.reducer_op}'"
         # reducer init interface
         reducer_init = (
             "{reducer} = cube.runtime.adapter.Reducer("
             "ranks={ranks}, reduce_op={reduce_op}, "
-            "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes})"
+            "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes}, "
+            "zero_ngroups={zero_ngroups})"
         )
         reducer_add = 'self.add_reducer({reducer})'
         add_param = '{reducer}.add_param({weight})'
@@ -440,8 +458,8 @@ class ModuleCodeGen(FuncEmission):
         self.model_init_statements.append('')
         ranks = list(sorted(node.device))
         init_code = reducer_init.format(
-            reducer=reducer_name, ranks=ranks, reduce_op=reduce_op, 
-            async_op=async_op, zero=zero, max_nbytes=max_nbytes)
+            reducer=reducer_name, ranks=ranks, reduce_op=reduce_op,
+            async_op=async_op, zero=zero, max_nbytes=max_nbytes, zero_ngroups=zero_ngroups)
         self.model_init_statements.append(init_code)
         weights = [ModuleCodeGen.tensor_name(t, prefix_attr='self.') for t in weights]
         for weight in weights:
@@ -458,7 +476,7 @@ class ModuleCodeGen(FuncEmission):
         bs = [t.shape[dim] for t, dim in zip(node.outputs(), node.get_batch_dims()) if dim is not None]
         bs = set(bs)
         if len(bs) > 1:
-            warnings.warn(f'Find Heterogenous batch size {bs}. Keep output to be same with semantic dataloder.')
+            _logger.warning(f'Find Heterogenous batch size {bs}. Keep output to be same with semantic dataloder.')
         bs = list(bs)[0] if len(bs) == 1 else None
         assert self.batch_size is None or self.batch_size == bs, f"Not match for batch size: {self.batch_size} != {bs}"
         self.model_init_statements.append(signature.format(bs=bs))

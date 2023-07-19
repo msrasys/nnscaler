@@ -3,8 +3,11 @@ Synthetic Data Loader
 """
 
 from typing import Any, List, Optional, Tuple, Union
+import logging
+
 import torch
-import warnings
+
+_logger = logging.getLogger(__name__)
 
 
 class CubeDataLoader:
@@ -192,6 +195,6 @@ class SynDataLoader(CubeDataLoader):
         for shape, dim in zip(self.shapes, self.batch_dims):
             shape[dim] = batch_size
         rank = 0 if not torch.distributed.is_initialized() else torch.distributed.get_rank()
-        print(f'rank [{rank}]: > set batch size to {batch_size}. dataloader outputs change to: {self.shapes}')
+        _logger.info(f'rank [{rank}]: set batch size to {batch_size}. dataloader outputs change to: {self.shapes}')
         datas = self.random_sample()
         self.set_output(datas)

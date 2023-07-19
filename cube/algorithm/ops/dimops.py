@@ -1,6 +1,6 @@
 from typing import List, Optional, Any, Dict, Union, Tuple
-import warnings
 import numpy as np
+import logging
 from cube.algorithm.generics import GenericDistAlgo
 
 from cube.graph.function.dimops import IRDimops, DimAnno, DimopSplit, TransformRule
@@ -9,7 +9,7 @@ from cube.ir.cten import IRTensor
 from cube.ir.operator import IRFwOperation
 from collections import deque
 
-from cube.flags import CompileFlag
+_logger = logging.getLogger(__name__)
 
 
 class DimSplitEinops(GenericDistAlgo):
@@ -126,9 +126,8 @@ class DimSplitEinops(GenericDistAlgo):
         else:
             adim, reduce = 'Value', None
         
-        if CompileFlag.log_transform:
-            color, default = '\033[32m' if satisfy else '\033[31m', '\033[0m'
-            print(f"split {node.name}: {node.anno} | dim: {adim} num: {num} reduce: {reduce} ... {color}{'Success' if satisfy else 'Failed!'}{default}")
+        color, default = '\033[32m' if satisfy else '\033[31m', '\033[0m'
+        _logger.info(f"split {node.name}: {node.anno} | dim: {adim} num: {num} reduce: {reduce} ... {color}{'Success' if satisfy else 'Failed!'}{default}")
 
         if not satisfy: return None
         rule: TransformRule = self.infer(idx, dim, num)
@@ -206,7 +205,7 @@ class DimSplitEinops(GenericDistAlgo):
                 itransform.append(DimopSplit.R())
             else:
                 if len(dims) > 1:
-                    warnings.warn(
+                    _logger.warning(
                         f'node ({self.node.name}-{self.node.cid}): detected an input tensor '
                         f'is split on {len(dims)} dimensions, this will cause data loss.',
                         category=RuntimeWarning, stacklevel=0,
@@ -221,7 +220,7 @@ class DimSplitEinops(GenericDistAlgo):
                 )
             else:
                 if len(dims) > 1:
-                    warnings.warn(
+                    _logger.warning(
                         f'node ({self.node.name}-{self.node.cid}): detected an output tensor '
                         f'is split on {len(dims)} dimensions, this will cause data loss.',
                         category=RuntimeWarning, stacklevel=0,

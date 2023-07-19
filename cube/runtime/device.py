@@ -5,8 +5,11 @@ from typing import List, Dict
 import numpy as np
 import torch
 import os
+import logging
 
 from cube.flags import CompileFlag
+
+_logger = logging.getLogger(__name__)
 
 
 class DeviceGroup:
@@ -15,7 +18,6 @@ class DeviceGroup:
 
         def __init__(self):
             if CompileFlag.dev_mode:
-                print(f"DeviceGroup init using single device mode...")
                 self.rank = 0
                 self.world_size = 1
                 self.local_world_size = 1
@@ -32,7 +34,7 @@ class DeviceGroup:
                 self.node_rank = int(os.environ.get('GROUP_RANK'))
 
             torch.cuda.set_device(self.local_rank)
-            self.groups: Dict = dict()
+            self.groups: Dict = { '1'*self.world_size: None }
             self.streams: Dict[str, torch.cuda.Stream] = {
                 'default': torch.cuda.default_stream()}
 
@@ -50,6 +52,13 @@ class DeviceGroup:
 
     def __len__(self, name):
         return DeviceGroup.instance.world_size
+
+    def group_exists(self, ranks):
+        """
+        Check if group exists
+        """
+        rank_bits = DeviceGroup.bitmap(ranks)
+        return rank_bits in self.instance.groups
 
     def get_group(self, ranks):
         """

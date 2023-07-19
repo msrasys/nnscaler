@@ -1,6 +1,7 @@
 import torch
 import enum
 import re
+import logging
 from typing import Any, List, Tuple, Optional
 
 from cube.ir.cten import IRObject
@@ -9,10 +10,11 @@ from cube.graph.function.pyfunc import IRPyFunc
 from cube.ir.tensor import IRFullTensor
 import cube.ir as ir
 from cube.graph.parser.frame import Frame
-from cube.graph.parser.mapping import Sign2Op
+from cube.graph.parser.script.mapping import Sign2Op
 from cube.graph.parser.dtype import DType2IRDType
 
 
+_logger = logging.getLogger(__name__)
 _refmodule = torch.nn.Module()
 
 class ErasedDevice:
@@ -75,7 +77,7 @@ class ScriptModuleParser:
                 try:
                     ret = ir_node.infer_shape()
                     if not ret:
-                        print(f'warning: {ir_node} cannot infer shape')
+                        _logger.error(f'{ir_node} cannot infer shape')
                 except Exception:
                     raise RuntimeError(
                         f"====== Shape Infer Error ====\n\n\n"
@@ -126,7 +128,7 @@ class ScriptModuleParser:
                 try:
                     ret = ir_node.infer_shape()
                     if not ret:
-                        print(f'warning: {ir_node} cannot infer shape')
+                        _logger.error(f'{ir_node} cannot infer shape')
                 except Exception:
                     raise RuntimeError(
                         f"====== Shape Infer Error ====\n\n\n"
@@ -552,7 +554,7 @@ class ScriptModuleParser:
                 try:
                     ret = ir_node.infer_shape()
                     if not ret:
-                        print(f'warning: {ir_node} cannot infer shape')
+                        _logger.error(f'{ir_node} cannot infer shape')
                 except Exception:
                     raise RuntimeError(
                         f"====== Shape Infer Error ====\n\n\n"
@@ -666,7 +668,7 @@ class ScriptModuleParser:
                     try:
                         ret = ir_node.infer_shape()
                         if not ret:
-                            print(f'warning: {ir_node} cannot infer shape')
+                            _logger.error(f'{ir_node} cannot infer shape')
                     except Exception:
                         raise RuntimeError(
                             f"====== Shape Infer Error ====\n\n\n"
