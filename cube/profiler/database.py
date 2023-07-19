@@ -79,13 +79,22 @@ class CompProfiler:
             eval_kwargs[name] = eval_val
         # run one sample
         outputs = func(*tensors, **train_kwargs)
+        # omit non-tensor outputs
+        '''
+        only profile IRDimops currently, which has at least one tensor output and
+        may have non-tensor outputs (like list, tuple, dict, etc.). In additional,
+        we assume that non-tensor outputs will not be used in backward.
+        '''
         outputs = (outputs,) if torch.is_tensor(outputs) else outputs
+        outputs = tuple(filter(lambda x: torch.is_tensor(x) and x.requires_grad, outputs))
         assert all(torch.is_tensor(otensor) for otensor in outputs), \
             f"{func.__name__}: require all the outputs to be tensors"
         grads = tuple(torch.zeros_like(otensor) for otensor in outputs)
 
         def run_step(func, tensors, kwargs, backward: bool):
             outputs = func(*tensors, **kwargs)
+            outputs = (outputs,) if torch.is_tensor(outputs) else outputs
+            outputs = tuple(filter(lambda x: torch.is_tensor(x) and x.requires_grad, outputs))
             if backward:
                 torch.autograd.backward(outputs, grads)
             return outputs
@@ -114,6 +123,8 @@ class CompProfiler:
                 train_mem_info.append(byte_size)
                 idx = -1
                 for i, t in enumerate(tensors):
+                    if not isinstance(t, torch.Tensor):
+                        continue
                     if t.storage().data_ptr() == x.storage().data_ptr():
                         idx = i
                         break
@@ -187,37 +198,38 @@ class ProfileDataBase:
             return ret
 
         if node.signature in CustomizedOps.kOpCodeDef:
-            dep_code_impl = ''
-            for dep_name in get_dep_names(node.signature):
-                dep_code_impl = dep_code_impl + CustomizedOps.kOpCodeDef[dep_name]
             code_impl: str = CustomizedOps.kOpCodeDef[node.signature]
-            def_end = code_impl.find(':\n')
-            assert def_end >= 0
-            prev_code_lines = code_impl[:def_end+2]
-            succ_code_lines = code_impl[def_end+2:]
-            for line in dep_code_impl.split('\n'):
-                prev_code_lines = prev_code_lines + '    ' + line + '\n'
-            code_impl = prev_code_lines + succ_code_lines
             local = {}
             exec(code_impl, globals(), local)
             fn = list(local.values())[0]
         else:
             fn = eval(node.signature)
         shapes, dtypes, requires_grads, values = [], [], [], []
+
+        def extract_val(val: Union[IRObject, Any]) -> Any:
+            if isinstance(val, IRObject):
+                return extract_val(val.value)
+            elif isinstance(val, tuple):
+                return tuple([extract_val(v) for v in val])
+            elif isinstance(val, dict):
+                return {k: extract_val(v) for k, v in val.items()}
+            elif isinstance(val, slice):
+                return slice(extract_val(val.start), extract_val(val.stop), extract_val(val.step))
+            else:
+                return val
+
         for t in node.inputs():
             if isinstance(t, IRTensor):
                 shapes.append(t.shape)
                 dtypes.append(IRDType2TorchDType.map(t.dtype))
                 requires_grads.append(t.requires_grad)
                 values.append(t)
-            elif isinstance(t, IRObject):
-                raise RuntimeError('IRObject has not been supported in profiling.')
             else:
                 shapes.append(None)
-                dtypes.append(type(t).__name__)
+                dtypes.append(None)
                 requires_grads.append(None)
-                values.append(t)
-        return fn, shapes, dtypes, requires_grads, values, node.kwargs
+                values.append(extract_val(t))
+        return fn, shapes, dtypes, requires_grads, values, extract_val(node.kwargs)
 
     def profile(self, node: IRFwOperation, device: Optional[int] = None, override: bool = False):
         """
@@ -254,14 +266,14 @@ class ProfileDataBase:
                     residual_mem += t.byte_size()
                 in_mem_info.append(t.byte_size())
             else:
-                _logger.warning('node {node}: skip input {t}')
+                _logger.warning(f'node {node}: skip input {t}')
 
         # run profiling
         try:
             fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx = \
                 CompProfiler.profile(fn, shapes, dtypes, requires_grads, values, **kwargs)
-        except:
-            _logger.error('fail to profile {node}')
+        except Exception:
+            _logger.exception(f'fail to profile {node}, use default values')
             fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx = 0, 0, 0, [], []
         # log to database
         key = self._serialize(node)
@@ -386,8 +398,6 @@ class ProfileDataBase:
             if isinstance(t, IRTensor):
                 shapes.append(t.shape)
                 dtypes.append(IRDType2TorchDType.map(t.dtype))
-            elif isinstance(t, IRObject):
-                raise RuntimeError('IRObject has not been supported in _serialize')
             # else:
             #     shapes.append(None)
             #     dtypes.append(type(t))
