@@ -99,6 +99,7 @@ def compile(model: SemanticModel, *args,
             arg = IRFullTensor(arg.shape, name='tensor', 
                                requires_grad=arg.requires_grad,
                                dtype=DType2IRDType.map(arg.dtype)).tosub()
+            arg.grad = arg.parent.grad.tosub() if arg.requires_grad else None
         else:
             arg= IRObject('obj')
         inputs.append(arg)
