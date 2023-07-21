@@ -96,8 +96,12 @@ def compile(model: SemanticModel, *args,
             dataloader = arg
             arg = SemanticDataLoader(dataloader)
         elif isinstance(arg, torch.Tensor):
+            # note: we will always set tensor to require gradient, which may 
+            # generate backward communications in adapter. However, as long as 
+            # the data doesn't require gradient in real runtime, the backward
+            # communication will not be triggered.
             arg = IRFullTensor(arg.shape, name='tensor', 
-                               requires_grad=arg.requires_grad,
+                               requires_grad=True,
                                dtype=DType2IRDType.map(arg.dtype)).tosub()
             arg.grad = arg.parent.grad.tosub() if arg.requires_grad else None
         else:
