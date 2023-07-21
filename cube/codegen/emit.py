@@ -1,4 +1,5 @@
 from typing import Generator, Iterable, List, Any, Optional, Tuple
+import logging
 
 from cube.ir.cten import IRCell, IRTensor, IRObject
 from cube.ir.dtype import IRDType
@@ -12,6 +13,8 @@ from cube.graph.segment import IRSegment
 from cube.codegen.frontend_mapping import Sign2EmitRule
 
 from cube.flags import CompileFlag
+
+_logger = logging.getLogger(__name__)
 
 
 class IRValue:
@@ -263,7 +266,7 @@ class FuncEmission(CodeEmission):
 
         input_grads = [t for t in bwop.outputs() if isinstance(t, IRSubTensor)]
         output_grads = [t for t in bwop.inputs() if isinstance(t, IRSubTensor)]
-        input_tensors = [grad2tensor[g] for g in input_grads]
-        output_tensors = [grad2tensor[g] for g in output_grads]
+        input_tensors = [grad2tensor[g] for g in input_grads if g in grad2tensor]
+        output_tensors = [grad2tensor[g] for g in output_grads if g in grad2tensor]
 
         return input_tensors, output_tensors, output_grads, input_grads
