@@ -479,15 +479,31 @@ class FxModuleParser:
 
     @staticmethod
     def _find_module_of_method(orig_method: Callable[..., Any]) -> str:
-        name = orig_method.__name__
-        module = orig_method.__module__
         if getattr(orig_method, '__name__', None) == 'apply' and isinstance(getattr(orig_method, '__self__', None), Type) \
             and issubclass(orig_method.__self__, torch.autograd.Function):
             # for torch.autograd.Function
             return f'{orig_method.__self__.__module__}.{orig_method.__self__.__name__}'
-        elif module is not None:
+
+        name = orig_method.__name__
+        module = orig_method.__module__
+        # if hasattr(orig_method, '__qualname__') and isinstance(orig_method.__qualname__, str):
+        #     # if there has '.' in '__qualname__', it means this function is in a nested structure,
+        #     #
+        #     # for example, it is a method / function in a class:
+        #     # torch.nn.Linear.forward.__module__ = torch.nn
+        #     # torch.nn.Linear.forward.__name__ = forward
+        #     # torch.nn.Linear.forward.__qualname__ = Linear.forward
+        #     #
+        #     # And in fx.node qualified name creating rule, the module also should include the class name,
+        #     # in this example, the returned module should be `torch.nn.Linear`.
+        #     splited_names = orig_method.__qualname__.split('.')
+        #     class_name, name = splited_names[:-1], splited_names[-1]
+        #     module = '.'.join([module] + class_name)
+        if module == 'torch.autograd.grad_mode' and name in ['__enter__', '__exit__']:
+            return 'torch.autograd.grad_mode.no_grad'
+        if module is not None:
             return module
-        elif hasattr(orig_method, '__qualname__')\
+        if hasattr(orig_method, '__qualname__')\
             and isinstance(orig_method.__qualname__, str) and orig_method.__qualname__.startswith('_VariableFunctionsClass.'):
             return 'torch._C._VariableFunctions'
         for guess in [torch, getattr(torch.nn, 'functional')]:

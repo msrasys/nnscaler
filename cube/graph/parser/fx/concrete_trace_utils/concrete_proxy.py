@@ -197,6 +197,18 @@ class ConcreteProxy(Proxy):
         # should only be in iterable
         return self.value.__contains__(item)
 
+    def __enter__(self):
+        if getattr(self.value.__class__.__enter__, "__fx_already_patched", False):
+            return self.value.__enter__()
+        else:
+            return self.value.__class__.__enter__(self)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if getattr(self.value.__class__.__exit__, "__fx_already_patched", False):
+            return self.value.__exit__(exc_type, exc_value, traceback)
+        else:
+            return self.value.__class__.__exit__(self, exc_type, exc_value, traceback)
+
     @compatibility(is_backward_compatible=True)
     def keys(self):
         # to detect if in executing `**proxy`

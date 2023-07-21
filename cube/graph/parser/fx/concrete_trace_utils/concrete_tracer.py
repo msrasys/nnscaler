@@ -89,6 +89,9 @@ from .utils import (
 
     _orig_agfunc_apply,
     _orig_torch_assert,
+    _orig_torch_no_grad,
+    _orig_torch_no_grad_enter,
+    _orig_torch_no_grad_exit,
 
     _orig_type,
     _orig_isinstance,
@@ -133,6 +136,9 @@ from .utils import (
 extra_side_effectful_functions = {
     operator.setitem,
     builtins.next,
+    _orig_torch_no_grad,
+    _orig_torch_no_grad_enter,
+    _orig_torch_no_grad_exit,
 }
 _side_effectful_functions = _side_effectful_functions.union(extra_side_effectful_functions)
 
@@ -962,6 +968,18 @@ class ConcreteTracer(TracerBase):
                 condition = condition.value
             return _orig_torch_assert(condition, message)
 
+        @functools.wraps(_orig_torch_no_grad)
+        def torch_no_grad_wrapper():
+            return self.create_proxy('call_function', _orig_torch_no_grad, (), {})
+
+        @functools.wraps(_orig_torch_no_grad_enter)
+        def torch_no_grad_enter_wrapper(no_grad):
+            return self.create_proxy('call_function', _orig_torch_no_grad_enter, (no_grad,), {})
+
+        @functools.wraps(_orig_torch_no_grad_exit)
+        def torch_no_grad_exit_wrapper(no_grad, exc_type, exc_value, traceback):
+            return self.create_proxy('call_function', _orig_torch_no_grad_exit, (no_grad, exc_type, exc_value, traceback,), {})
+
         self.agfunc_dict: dict[Type, Any] = {}
         self.autowrap_leaf_pairs = {
             id(_orig_torch_assert): torch_assert_wrapper,
@@ -1099,6 +1117,11 @@ class ConcreteTracer(TracerBase):
                 self.patcher.patch_method(torch.nn.Module, "__call__", module_call_wrapper, deduplicate=False)
                 self.patcher.patch_method(torch.autograd.Function, "apply", agfunc_apply_wrapper, deduplicate=False)
                 self.patcher.patch_method(torch, "_assert", torch_assert_wrapper, deduplicate=False)
+                # if class member functions and the class need to be wrapped together,
+                # wrap the member functions before wrap the class.
+                self.patcher.patch_method(_orig_torch_no_grad, "__enter__", torch_no_grad_enter_wrapper, deduplicate=False)
+                self.patcher.patch_method(_orig_torch_no_grad, "__exit__", torch_no_grad_exit_wrapper, deduplicate=False)
+                self.patcher.patch_method(torch, "no_grad", torch_no_grad_wrapper, deduplicate=False)
 
                 self.patcher.patch_method(builtins, "map", map_wrapper, deduplicate=False)
                 self.patcher.patch_method(builtins, "enumerate", enumerate_wrapper, deduplicate=False)
@@ -1282,14 +1305,31 @@ class MagicMethodPatcher:
 
     @staticmethod
     def find_module_of_method_new(orig_method: Callable[..., Any]) -> str:
-        name = orig_method.__name__
-        module = orig_method.__module__
         if is_autograd_apply(orig_method):
             # for torch.autograd.Function
             return f'{orig_method.__self__.__module__}.{orig_method.__self__.__name__}'
+
+        name = orig_method.__name__
+        module = orig_method.__module__
+        # if hasattr(orig_method, '__qualname__') and isinstance(orig_method.__qualname__, str):
+        #     # if there has '.' in '__qualname__', it means this function is in a nested structure,
+        #     #
+        #     # for example, it is a method / function in a class:
+        #     # torch.nn.Linear.forward.__module__ = torch.nn
+        #     # torch.nn.Linear.forward.__name__ = forward
+        #     # torch.nn.Linear.forward.__qualname__ = Linear.forward
+        #     #
+        #     # And in fx.node qualified name creating rule, the module also should include the class name,
+        #     # in this example, the returned module should be `torch.nn.Linear`.
+        #     # It is not the original meaning of a obj's module, but we need this workaround to reuse fx node.
+        #     splited_names = orig_method.__qualname__.split('.')
+        #     class_name, name = splited_names[:-1], splited_names[-1]
+        #     module = '.'.join([module] + class_name)
+        if module == 'torch.autograd.grad_mode' and name in ['__enter__', '__exit__']:
+            return 'torch.autograd.grad_mode.no_grad'
         if module is not None:
             return module
-        elif hasattr(orig_method, '__qualname__')\
+        if hasattr(orig_method, '__qualname__')\
             and isinstance(orig_method.__qualname__, str) and orig_method.__qualname__.startswith('_VariableFunctionsClass.'):
             return 'torch._C._VariableFunctions'
         for guess in [torch, getattr(torch.nn, 'functional')]:
@@ -1468,6 +1508,9 @@ def _retain_weight_consistency(root: torch.nn.Module):
 
 @functools.wraps(_orig_node_is_impure)
 def node_is_impure_wrapper(node):
+    if is_useless_no_grad_node(node):
+        return False
+
     if node.op in {"placeholder", "output"}:
         return True
 
@@ -1487,6 +1530,18 @@ def node_is_impure_wrapper(node):
         ), f"Did not find expected submodule target {node.target}"
         return getattr(target_mod, "_is_impure", False)
 
+    return False
+
+def is_useless_no_grad_node(node: Node):
+    # keep the no_gard related nodes, but except useless situation: no node between __enter__ and __exit__
+    if node.op == 'call_function':
+        if node.target is _orig_torch_no_grad_exit:
+            if node.prev.target is _orig_torch_no_grad_enter and node.prev.prev.target is _orig_torch_no_grad:
+                setattr(node.prev, '_is_impure', False)
+                setattr(node.prev.prev, '_is_impure', False)
+                return True
+        if node.target is _orig_torch_no_grad_enter or node.target is _orig_torch_no_grad:
+            return not getattr(node, '_is_impure', True)
     return False
 
 def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
