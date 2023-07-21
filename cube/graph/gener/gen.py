@@ -376,10 +376,10 @@ class IRAdapterGener:
                 if isinstance(ftensor.grad, IRFullTensor):
                     bptensors = tuple(fwop.input(0).grad for fwop in output_consumer[ftensor])
                     bptensors = expand_devices(bptensors, producer=True)
-                
-                fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors, cost_fn)
-                if fadapter is not None:
-                    fadapters.append(fadapter)
+                if (not skip(fptensors, fctensors)) or (not skip(bptensors, bctensors)):
+                    fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors, cost_fn)
+                    if fadapter is not None:
+                        fadapters.append(fadapter)
 
             # insert adapters
             for fadapter in fadapters:
