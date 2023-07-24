@@ -40,8 +40,8 @@ def convert_model(model: torch.nn.Module,
         IRGraph: IRGraph of model
     """
     # get registered leaf function
-    customized_funcs = CustomizedOps.kOpRuntime.values()
-    leaf_functions = {func: ([], False, None) for func in customized_funcs}
+    autowrap_funcs = [CustomizedOps.kOpRuntime.get(sign, None) for sign in CustomizedOps.kOpAutowrap]
+    leaf_functions = {func: ([], True, None) for func in autowrap_funcs if func is not None}
 
 
     # step 1: trace model

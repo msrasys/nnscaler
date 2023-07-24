@@ -134,7 +134,7 @@ class SignFx2Op:
         #
         # __ftemplate('embedding'): function.Embedding,
         #
-        # __ftemplate('cross_entropy'): function.CrossEntropy,
+        __ftemplate('cross_entropy'): function.CrossEntropy,
         #
         # # creators
         __ttemplate('empty'): function.Empty,
