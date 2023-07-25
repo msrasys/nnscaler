@@ -25,7 +25,7 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
             torch.distributed.send(tensor, dst)
     else:
         assert rank == dst
-        tensor = torch.empty(shape, dtype=dtype, 
+        tensor = torch.empty(shape, dtype=dtype,
             device=torch.cuda.current_device()
         )
         if async_op:
@@ -55,7 +55,7 @@ def all_reduce(tensor: torch.Tensor,
     else:
         torch.distributed.all_reduce(tensor, group=group)
     if not async_op:
-        CudaTimer().stop(field_name='comm', predefined=True)    
+        CudaTimer().stop(field_name='comm', predefined=True)
     return tensor
 
 
@@ -82,7 +82,7 @@ def all_gather(tensor: torch.Tensor, dim: int,
     return otensor
 
 
-def reduce_scatter(tensor: torch.Tensor, dim: int, 
+def reduce_scatter(tensor: torch.Tensor, dim: int,
                    ranks: Tuple[int], async_op=False) -> torch.Tensor:
     """
     ReduceScatter
@@ -267,7 +267,7 @@ def broadcast(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype, src:
         tensor = itensor.contiguous() if not itensor.is_contiguous() else itensor
     else:
         assert rank in ranks
-        tensor = torch.empty(shape, 
+        tensor = torch.empty(shape,
             device=torch.cuda.current_device(), requires_grad=False, dtype=dtype)
     work = torch.distributed.broadcast(tensor, src, group=group, async_op=async_op)
     if work and rank != src:
@@ -281,10 +281,10 @@ def exchange(tensor: torch.Tensor, ranks: List[int], async_op=False) -> torch.Te
     """
     Exchange a same-shaped tensor between two ranks
     """
-    
+
     if not async_op:
         CudaTimer().start(field_name='comm', predefined=True)
-    
+
     assert len(ranks) == 2
     group = DeviceGroup().get_group(ranks)
     myrank = torch.distributed.get_rank(group)

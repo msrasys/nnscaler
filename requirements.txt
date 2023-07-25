@@ -1,5 +1,5 @@
 matplotlib
-pytest
 setuptools==60.7.0
 more-itertools
 dill
+torch

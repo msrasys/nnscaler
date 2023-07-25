@@ -129,7 +129,8 @@ class KwargsInterpreter(Interpreter):
             remaining_keys = [key for key in self.concrete_kwargs if key not in self.used_concrete_kwargs]
             return {key: self.concrete_kwargs[key] for key in remaining_keys}
         elif target.startswith('*'):
-            assert self.concrete_kwargs is None, 'unexpected positional args in kwargs mode'
+            if self.concrete_kwargs is not None:
+                raise RuntimeError('unexpected positional args in kwargs mode')
             return list(self.args_iter)
         else:
             if self.concrete_kwargs is not None:

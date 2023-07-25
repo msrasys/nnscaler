@@ -16,10 +16,7 @@ def _to_int(s: str, default=0) -> int:
 
 
 class CompileFlag:
-
     # ================ compiling ========================
-    use_torchfx = _to_bool('USE_TORCHFX')  # using torch.fx or torchscript as frontend to capture dataflow graph
-    use_default_fx_tracer = _to_bool('USE_DEFAULT_FX_TRACER')  # using default fx tracer or more powerful concrete_tracer
     # worker sleep in seconds
     worker_sleep = _to_int('WORKER_SLEEP')
     disable_intra_rvd = _to_bool('DISABLE_INTRA_RVD')

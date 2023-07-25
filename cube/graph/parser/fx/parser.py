@@ -1,6 +1,7 @@
 import torch
 import enum
 import logging
+from pathlib import Path
 from typing import Any, List, Tuple, Callable, Union, Dict, Type
 
 from cube.ir.operator import IRFwOperation
@@ -64,22 +65,23 @@ def get_complex_data(val: Any, frame: Frame) -> Any:
 
 class FxModuleParser:
     """torch.fx module parser
-    
+
     Attributes:
         save_content (bool): whether to save the content of the module
         dynamic_shape (bool): whether to parse the module with dynamic shape
     """
     save_content: bool = True
     dynamic_shape: bool = False
-
+    ATTR_CONTENT_FILE = 'fullmodel.pt'
+    ATTR_MAP_FILE = 'dist_param_map.pt'
 
     @staticmethod
     def shape_refine(shape: torch.Size) -> torch.Size:
         """Replacing scale shape [] to [1]
-        
+
         Args:
             shape (torch.Size): tensor shape
-        
+
         Returns:
             torch.Size: refined shape
         """
@@ -89,7 +91,8 @@ class FxModuleParser:
     @staticmethod
     def parse(module: torch.fx.GraphModule,
               dummy_inputs: Dict[str, Any],
-              frame: Frame = None) \
+              frame: Frame = None,
+              attr_save_dir='./') \
             -> Tuple[List[IRFullTensor], List[IRFwOperation], List[IRFullTensor]]:
         """Parse torch.fx module into cube IR
 
@@ -105,7 +108,7 @@ class FxModuleParser:
 
         inputs = [node for node in module.graph.nodes if node.op == 'placeholder']
         _logger.info(f'> torch.fx parser: graph inputs: {inputs}')
-        
+
         # shape propagation
         ShapeProp(module).propagate(dummy_inputs)
         # handle graph inputs
@@ -188,15 +191,16 @@ class FxModuleParser:
             ir_nodes = FxModuleParser.parse_node(node, module, frame)
             if ir_nodes is not None:
                 all_ir_nodes += ir_nodes
-        
+
         # output_nodes = [node for node in module.graph.nodes if node.op == 'output']
         # assert len(output_nodes) == 1, f"get mutiple {len(all_ir_nodes)} output nodes"
         # output_val = frame.get_var(output_nodes[0].name)
         output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
 
         if FxModuleParser.save_content:
-            frame.save_attr_content()
-            frame.save_attr_map()
+            attr_save_dir = Path(attr_save_dir)
+            frame.save_attr_content(attr_save_dir / FxModuleParser.ATTR_CONTENT_FILE)
+            frame.save_attr_map(attr_save_dir / FxModuleParser.ATTR_MAP_FILE)
 
         frame.pop_var()
         frame.pop_attr()
@@ -359,7 +363,7 @@ class FxModuleParser:
                 ir_node.set_output(0, output_val)
         else:
             frame.set_var(node.name, ir_node)
-        
+
         _logger.info(f'parsing result: {ir_node}')
         return ir_nodes
 
@@ -401,7 +405,7 @@ class FxModuleParser:
     def parse_prim_output_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRCell]:
         assert len(node.args) == 1 and len(node.kwargs) == 0
         ir_nodes = []
-        
+
         def generate_outputs(val: Any) -> Any:
             """Support complex data type of List, Tuple, Dict, Tensor/Object"""
             if isinstance(val, list):

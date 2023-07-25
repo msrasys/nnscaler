@@ -53,7 +53,7 @@ class Program:
         self.instance._graph.reset_outputs(len(outputs))
         for idx, otensor in enumerate(outputs):
             self.instance._graph.set_output(idx, otensor)
-    
+
     def finalize(self):
         """
         Close the recording of program.
@@ -93,7 +93,7 @@ class SemanticDataLoader:
     def set_batch_size(self, bs: int):
         self.dataloader.set_batch_size(bs)
         return
-    
+
     def get_runtime_sample(self):
         return next(self.dataloader)
 
@@ -151,7 +151,7 @@ class SemanticModel:
         Args:
             model (Optional[torch.nn.Module]):
                 single-device model description, only required for rank 0
-            save_content (bool): 
+            save_content (bool):
                 whether to save the content of model and load it into generated model. Default True.
             dynamic_shape (bool):
                 whether to use dynamic shape. Default False.
@@ -170,10 +170,10 @@ class SemanticModel:
     def dummy_input(self) -> Any:
         """Get dummy real-tensor input from on CPU"""
         return self._dummy_input
-    
+
     @dummy_input.setter
     def dummy_input(self, val):
-        
+
         def complex(val: Any):
             """Complex to CPU"""
             if isinstance(val, tuple):
@@ -191,7 +191,7 @@ class SemanticModel:
         self._dummy_input = complex(val)
 
     def get_graph(self):
-        return self.ir_graph
+        return self._ir_graph
 
     def load_module(self, filename: str):
         """Load module from file."""
@@ -214,12 +214,10 @@ class SemanticModel:
         assert self._ir_graph is None, \
             f"multiple forward on a semantic model is not allowed"
         if DeviceGroup().local_rank == 0:
-            input_shapes = [tuple(t.shape) if isinstance(t, IRTensor) else None for t in args]
             self._ir_graph = parser.convert_model(
                 self.model,
-                input_shapes=input_shapes,
                 dummy_input=self.dummy_input,
-                save_content=self.save_content,
+                attr_save_dir='./',
                 dynamic_shape=self.dynamic_shape
             )
             return self._ir_graph(*args)
