@@ -150,7 +150,7 @@ class FxModuleParser:
             if isinstance(meta_out, TensorMetadata):
                 shape = meta_out.shape
                 assert shape == torch.Size([]), f'{meta_out}'
-                return torch.zeros(shape, dtype=meta_out.dtype, requires_grad=meta_out.requires_grad)
+                return IRFullTensor(shape=shape, requires_grad=meta_out.requires_grad, dtype=DType2IRDType.map(meta_out.dtype))
             elif isinstance(meta_out, dict):
                 ret = {}
                 for k, v in meta_out.items():

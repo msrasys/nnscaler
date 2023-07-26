@@ -1026,9 +1026,13 @@ def _reshape_anno(in_shape: List[int], ou_shape: List[int], kwarg_name: str) -> 
         kwargs = dict(**kwargs)
         identifier = ifirst[dim]
         oidx = ofirst.index(identifier)
-        size = list(kwargs[kwarg_name])
-        assert isinstance(size[oidx], int), \
-            f'dynamic size cannot be partitioned but got: {size}'
+        if isinstance(kwargs[kwarg_name], IRObject):
+            size = list(kwargs[kwarg_name].value)
+        else:
+            size = list(kwargs[kwarg_name])
+        if isinstance(size[oidx], IRObject):
+            _logger.warning(f'partition dim size in IRObject: {size[oidx]}')
+            size[oidx] = size[oidx].value
         size[oidx] = size[oidx] // num
         kwargs[kwarg_name] = tuple(size)
         return kwargs
@@ -1731,7 +1735,10 @@ def GetItem(a: Any, b: Any, signature = None) -> Union[Any, IRPyFunc]:
     # object slice
     if isinstance(obj, IRObject):
         assert obj.value is not None
-        out = IRObject(name='getitem', value=obj.value[index])
+        if isinstance(obj.value[index], IRTensor):
+            out = obj.value[index]
+        else:
+            out = IRObject(name='getitem', value=obj.value[index])
         return IRPyFunc(signature, [obj, index], [out])
     return obj[index]
 

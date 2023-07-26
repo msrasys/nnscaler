@@ -79,7 +79,6 @@ class CompProfiler:
             eval_kwargs[name] = eval_val
         # run one sample
         outputs = func(*tensors, **train_kwargs)
-        # omit non-tensor outputs
         '''
         only profile IRDimops currently, which has at least one tensor output and
         may have non-tensor outputs (like list, tuple, dict, etc.). In additional,

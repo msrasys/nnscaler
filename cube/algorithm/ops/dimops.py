@@ -208,7 +208,7 @@ class DimSplitEinops(GenericDistAlgo):
                     _logger.warning(
                         f'node ({self.node.name}-{self.node.cid}): detected an input tensor '
                         f'is split on {len(dims)} dimensions, this will cause data loss.',
-                        category=RuntimeWarning, stacklevel=0,
+                        stacklevel=0,
                     )
                 itransform.append(DimopSplit.D(dims))
         # output
@@ -223,7 +223,7 @@ class DimSplitEinops(GenericDistAlgo):
                     _logger.warning(
                         f'node ({self.node.name}-{self.node.cid}): detected an output tensor '
                         f'is split on {len(dims)} dimensions, this will cause data loss.',
-                        category=RuntimeWarning, stacklevel=0,
+                        stacklevel=0,
                     )
                 otransform.append(DimopSplit.D(dims))
         # modifier
