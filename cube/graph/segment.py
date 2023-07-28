@@ -1065,11 +1065,14 @@ class IRSegment(IRCell):
 
     @staticmethod
     def get_objects_from_complex(val: Any, _objects: List[IRObject] = None) -> List[IRObject]:
-        """
-        Get objects from val of complex data type
-        Support complex of types: List, Tuple, Dict, torch.Tensor, object
+        """Get all IRObjects from a complex data structure
+
+        Supported complex of types: List, Tuple, Dict, IRTensor, IRObject
         
-        @param val Any
+        Args:
+            val (Any): the complex data structure to be modified
+            _objects (List[IRObject] | None):
+                if provided, the objects will be appened into this
 
         @return _objects List[IRObject]: all IRObject
         """
@@ -1087,14 +1090,16 @@ class IRSegment(IRCell):
 
     @staticmethod
     def modify_objects_of_complex(val: Any, modifier: Callable) -> Any:
-        """
-        Get objects from val of complex data type
-        Support complex of types: List, Tuple, Dict, torch.Tensor, object
-        
-        @param val Any
-        @param modifier Callable: modify IRObject to another one
+        """Return a complex data structure where its IRObjects are in-placemently modified
 
-        @return new_val List[IRObject]: all IRObject
+        Supported complex of types: List, Tuple, Dict, IRTensor, IRObject
+
+        Args:
+            val (Any): the complex data structure to be modified
+            modifier (Callable): an inplacement modifier that takes an IRObject and return None
+
+        Return:
+            new_val (Any): complex data structure with modified IRObjects
         """
         rcall = IRSegment.modify_objects_of_complex
         if isinstance(val, tuple):

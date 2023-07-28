@@ -345,8 +345,6 @@ class IRAdapterGener:
 
             # consumers can be operators and graph outputs
             fconsumers, fctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
-            if ftensor in output_consumer:
-                fctensors = fctensors + tuple(fwop.input(0) for fwop in output_consumer[ftensor])
             fctensors = expand_devices(fctensors, consumer=True)
             assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
 
@@ -354,73 +352,83 @@ class IRAdapterGener:
             bconsumers, bctensors = [], []
             if isinstance(ftensor.grad, IRFullTensor):
                 bproducers, bptensors = bgraph.producers(ftensor.grad), bgraph.ptensors(ftensor.grad)
-                if ftensor in output_consumer:
-                    bptensors = bptensors + tuple(fwop.input(0).grad for fwop in output_consumer[ftensor])
                 bptensors = expand_devices(bptensors, producer=True)
-                assert all(len(ptensor.device) == 1 for ptensor in bptensors), (
-                    f"Not support for multi-device:\n"
-                    f"{[ptensor.device for ptensor in bptensors]}"
-                    f"{[ptensor.cell for ptensor in bptensors]}"
-                )
                 bconsumers, bctensors = bgraph.consumers(ftensor.grad), bgraph.ctensors(ftensor.grad)
                 if ftensor in input_producer:
                     bctensors = bctensors + tuple(fwop.output(0).grad for fwop in input_producer[ftensor]) 
                 bctensors = expand_devices(bctensors, consumer=True)
                 assert all(len(ctensor.device) == 1 for ctensor in bctensors), "Not support for multi-device"
 
-            if skip(fptensors, fctensors) and skip(bptensors, bctensors):
-                continue
+            fadapters = []
 
-            fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors, cost_fn)
-            if fadapter is None:
-                continue
+            # activation -> activation generation
+            if (not skip(fptensors, fctensors)) or (not skip(bptensors, bctensors)):
+                fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors, cost_fn)
+                if fadapter is not None:
+                    fadapters.append(fadapter)
 
-            if not isinstance(graph, IRGraph):
-                if not (fadapter.differentiable or fadapter.mirror is None):
-                    raise NotImplementedError(
-                        "Require adapter to be differentiable for nested IRAdapter.\n"
-                        "Condition to be differentiable: prodcuers have same device set with consumers\n"
-                        f"Failed FullTensor: {ftensor}"
-                        f"{graph.debug_tensor_map_str(ftensor)}"
-                        f"Failed FullTensor.grad: {ftensor.grad}"
-                        f"{bgraph.debug_tensor_map_str(ftensor.grad) if ftensor.grad is not None else None}"
-                    )
+            # activation -> output generation
+            if ftensor in output_consumer:
+                # TODO: dedup adapter if the output is same with activation
+                fctensors = tuple(fwop.input(0) for fwop in output_consumer[ftensor])
+                fctensors = expand_devices(fctensors, consumer=True)
+                bptensors = []
+                if isinstance(ftensor.grad, IRFullTensor):
+                    bptensors = tuple(fwop.input(0).grad for fwop in output_consumer[ftensor])
+                    bptensors = expand_devices(bptensors, producer=True)
+                if (not skip(fptensors, fctensors)) or (not skip(bptensors, bctensors)):
+                    fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors, cost_fn)
+                    if fadapter is not None:
+                        fadapters.append(fadapter)
 
-            badapter: Optional[IRAdapter] = fadapter.mirror
+            # insert adapters
+            for fadapter in fadapters:
+                if not isinstance(graph, IRGraph):
+                    if not (fadapter.differentiable or fadapter.mirror is None):
+                        raise NotImplementedError(
+                            "Require adapter to be differentiable for nested IRAdapter.\n"
+                            "Condition to be differentiable: prodcuers have same device set with consumers\n"
+                            f"Failed FullTensor: {ftensor}"
+                            f"{graph.debug_tensor_map_str(ftensor)}"
+                            f"Failed FullTensor.grad: {ftensor.grad}"
+                            f"{bgraph.debug_tensor_map_str(ftensor.grad) if ftensor.grad is not None else None}"
+                        )
 
-            if (badapter is not None and len(fadapter.prims) == 0 and len(badapter.prims) == 0) or \
-               (badapter is None and len(fadapter.prims) == 0):
-                continue
+                badapter: Optional[IRAdapter] = fadapter.mirror
 
-            # insert forward adapter
-            # graph.insert(fadapter, max(producers) + 1)
-            if len(fconsumers) > 0:
-                fidx = min(graph.nodes().index(c) for c in fconsumers)
-            else:
-                # no consumer: find the last forward node
-                for fidx, node in enumerate(graph.nodes()[::-1]):
-                    if node.isfw():
-                        fidx = graph.nnodes - fidx
-                        break
-            graph.insert(fadapter, fidx)
-            # setup recompute
-            if allow_recompute:
-                if fidx > 0:
-                    prev_node = graph.node(fidx-1)
-                    if isinstance(prev_node, (IRFwOperation, IRAdapter)):
-                        fadapter.recompute = prev_node.recompute
+                if (badapter is not None and len(fadapter.prims) == 0 and len(badapter.prims) == 0) or \
+                   (badapter is None and len(fadapter.prims) == 0):
+                    continue
 
-            # insert backward adapter
-            if badapter is not None:
-                assert isinstance(badapter, IRAdapter)
-                assert isinstance(bgraph, IRSegment)
-                if len(bproducers) > 0:
-                    bidx = max(bgraph.nodes().index(p) for p in bproducers) + 1
+                # insert forward adapter
+                # graph.insert(fadapter, max(producers) + 1)
+                if len(fconsumers) > 0:
+                    fidx = min(graph.nodes().index(c) for c in fconsumers)
                 else:
-                    # no producer: find the first backward node
-                    for bidx, node in enumerate(bgraph.nodes()):
-                        if not node.isfw(): break
-                bgraph.insert(badapter, bidx)
+                    # no consumer: find the last forward node
+                    for fidx, node in enumerate(graph.nodes()[::-1]):
+                        if node.isfw():
+                            fidx = graph.nnodes - fidx
+                            break
+                graph.insert(fadapter, fidx)
+                # setup recompute
+                if allow_recompute:
+                    if fidx > 0:
+                        prev_node = graph.node(fidx-1)
+                        if isinstance(prev_node, (IRFwOperation, IRAdapter)):
+                            fadapter.recompute = prev_node.recompute
+
+                # insert backward adapter
+                if badapter is not None:
+                    assert isinstance(badapter, IRAdapter)
+                    assert isinstance(bgraph, IRSegment)
+                    if len(bproducers) > 0:
+                        bidx = max(bgraph.nodes().index(p) for p in bproducers) + 1
+                    else:
+                        # no producer: find the first backward node
+                        for bidx, node in enumerate(bgraph.nodes()):
+                            if not node.isfw(): break
+                    bgraph.insert(badapter, bidx)
 
         # generate adapter for each segment
         segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
