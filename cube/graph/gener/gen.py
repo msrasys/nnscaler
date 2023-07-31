@@ -74,6 +74,7 @@ def expand_devices(tensors: List[Optional[IRSubTensor]],
     dtensors: Dict[int, List[IRSubTensor]] = {}
     for tensor in tensors:
         if tensor is None: continue
+        assert len(tensor.device) > 0, f"find the tensor {tensor} is not assigned by devices"
         for devid in tensor.device:
             if tensor in dtensors.setdefault(devid, []):
                 continue
@@ -293,11 +294,15 @@ class IRAdapterGener:
         Generate adapter for activation tensors.
         The forward/backward adapter is inserted before the first consumers of its full tensor.
 
-        @param graph IRGraph: the graph the requires for adapter.
-        @param allow_recompute bool: Allow adapter recomputes. If this enables, all adapters will be
-            set to the same recompute group with its consumed node.
+        Args:
+            graph (IRGraph): the graph the requires for adapter.
+            allow_recompute (bool): Allow adapter recomputes. If this enables, all adapters will be
+                set to the same recompute group with its consumed node.
+            cost_fn (Callable | None): takes an IRAdapterPrim and outputs a cost in float.
+                default to be None, which will use communication volume.
 
-        @return graph IRGraph: the (inplace) modified graph with activation adapters. 
+        Returns:
+            graph (IRGraph): the (inplace) modified graph with activation adapters. 
         """
         def skip(ptensors: List[IRSubTensor], ctensors: List[IRSubTensor]) -> bool:
             # e.g., loss or parameter/buffer
@@ -361,25 +366,34 @@ class IRAdapterGener:
 
             fadapters = []
 
-            # activation -> activation generation
+            # (activation -> activation) generation: generate communication adapters between producer operators
+            # and consumer adapters.
             if (not skip(fptensors, fctensors)) or (not skip(bptensors, bctensors)):
                 fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors, cost_fn)
                 if fadapter is not None:
                     fadapters.append(fadapter)
 
-            # activation -> output generation
+            # (activation -> graph/segment output) generation: generate communication adapters between
+            # producer operatiors and graph/segment output tensors. Note graph/segment output tensors
+            # always require for full-shape/value for output, while consumers may partition them. Therefore,
+            # we need to additionally generate adapters for this case.
             if ftensor in output_consumer:
-                # TODO: dedup adapter if the output is same with activation
-                fctensors = tuple(fwop.input(0) for fwop in output_consumer[ftensor])
-                fctensors = expand_devices(fctensors, consumer=True)
-                bptensors = []
-                if isinstance(ftensor.grad, IRFullTensor):
-                    bptensors = tuple(fwop.input(0).grad for fwop in output_consumer[ftensor])
-                    bptensors = expand_devices(bptensors, producer=True)
-                if (not skip(fptensors, fctensors)) or (not skip(bptensors, bctensors)):
-                    fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors, cost_fn)
-                    if fadapter is not None:
-                        fadapters.append(fadapter)
+                out_fctensors = tuple(fwop.input(0) for fwop in output_consumer[ftensor])
+                out_fctensors = expand_devices(out_fctensors, consumer=True)
+                # dedup adapter if the output is same with activation tensor
+                if set(out_fctensors) == set(fctensors) and \
+                   set(t.device[0] for t in out_fctensors) == set(t.device[0] for t in fctensors):
+                    pass
+                else:
+                    fctensors = out_fctensors
+                    bptensors = []
+                    if isinstance(ftensor.grad, IRFullTensor):
+                        bptensors = tuple(fwop.input(0).grad for fwop in output_consumer[ftensor])
+                        bptensors = expand_devices(bptensors, producer=True)
+                    if (not skip(fptensors, fctensors)) or (not skip(bptensors, bctensors)):
+                        fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors, cost_fn)
+                        if fadapter is not None:
+                            fadapters.append(fadapter)
 
             # insert adapters
             for fadapter in fadapters:
