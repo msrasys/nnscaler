@@ -38,7 +38,7 @@ class IRGraph(IRSegment):
     IRGraph is used for reprensting a distributed training iteration.
     """
 
-    def __init__(self, nodes: List[IRCell], inputs: List[IRTensor], outputs: List[IRTensor], 
+    def __init__(self, nodes: List[IRCell], inputs: List[IRTensor], outputs: List[IRTensor],
                  module_name: str):
 
         super().__init__(nodes, inputs, outputs, module_name)
@@ -61,7 +61,7 @@ class IRGraph(IRSegment):
         Register forward action
         """
         return self.forward(*args)
-    
+
     def forward(self, *args: Tuple[Any]) -> Union[IRTensor, Tuple[IRTensor]]:
         """
         forward will divide the graph into Actions according to
@@ -135,10 +135,10 @@ class IRGraph(IRSegment):
         else:
             return self.outputs()
 
-    def backward(self, loss: IRSubTensor):
+    def backward(self, loss: Optional[IRSubTensor] = None):
         """
-        Backward the graph from the entry tensor of loss.
-        
+        Backward the graph from the entry tensor of loss to complete the graph with backward operators.
+
         This will infer tensors' gradients by following rules:
 
         Conditions must satisfy for an forward op having its backward op:
@@ -146,7 +146,7 @@ class IRGraph(IRSegment):
             * one of its output tensors is consumed by other forward ops
 
         For operators that doesn't need backward, all gradients of their
-        input/output tensors will make to None (despite require_grad is True) 
+        input/output tensors will make to None (despite require_grad is True)
 
         @param loss IRSubTensor: the loss tensor, must be in the output
             of current graph. The loss shape should be (1,)
@@ -155,18 +155,20 @@ class IRGraph(IRSegment):
         """
         # set mirror as self
         self._mirror = self
-        # set loss gradient
-        loss.parent.to_loss()
 
-        # update require gradient: for tensors that have no consumers,
-        # make their gradient to be False
-        for ftensor in self.full_tensors():
-            if ftensor.is_loss(): continue
-            consumers = [n for n in self.consumers(ftensor) if isinstance(n, IRFwOperation)]
-            if len(consumers) == 0 and ftensor.requires_grad:
-                _logger.warning(
-                    f"detected a dead ftensor which is not consumed by any nodes:\n\t{ftensor.name}: {ftensor}")
-                ftensor.requires_grad = False
+        if loss is not None:  # optimize graph with loss
+            # set loss gradient
+            loss.parent.to_loss()
+
+            # update require gradient: for tensors that have no consumers,
+            # make their gradient to be False
+            for ftensor in self.full_tensors():
+                if ftensor.is_loss(): continue
+                consumers = [n for n in self.consumers(ftensor) if isinstance(n, IRFwOperation)]
+                if len(consumers) == 0 and ftensor.requires_grad:
+                    _logger.warning(
+                        f"detected a dead ftensor which is not consumed by any nodes:\n\t{ftensor.name}: {ftensor}")
+                    ftensor.requires_grad = False
 
         # infer gradient
         for ftensor in self.full_tensors():
@@ -195,7 +197,7 @@ class IRGraph(IRSegment):
         Note nodes should not have applied by any transformation.
 
         @param nodes List[IRCell]: consecutive nodes in forward procedure
-        
+
         @return segment IRSegment: the grouped segment
         """
         assert all(node.isfw() for node in nodes), f"Expected all nodes in forward procedure"
@@ -285,7 +287,7 @@ class IRGraph(IRSegment):
         """
         Partition Primitive:
             - replicate: replicate a forward or data operation multiple times.
-        
+
         Each input and output will be replicated with no gradient accumulation.
 
         The backward of the forward operation will automatically be replicated.
@@ -298,7 +300,7 @@ class IRGraph(IRSegment):
             raise TypeError("Expected op to be forward op or data op")
         if not isinstance(times, int) or times < 1:
             raise TypeError("Expected times to be int and >= 1")
-        if node.name == 'multiref':  
+        if node.name == 'multiref':
             _logger.warning(f'skip replicating multiref ({node.cid}), which will be handled by system.')
             return [node]
         if isinstance(node, IRPyFunc):
@@ -339,7 +341,7 @@ class IRGraph(IRSegment):
         """
         Partition Primitive:
             - partition: partition a forward or data operation using algorithms.
-        
+
         The comment in the node will be inherited to partitioned nodes.
         The backward of the forward operation will be automatically partitioned.
 
@@ -353,7 +355,7 @@ class IRGraph(IRSegment):
           Both primitive may replicate the tensors, but `replicate` will not do gradient
           accumulation while `partition` will always require gradient accumulation on
           replicated tensors.
-        
+
         @param node Union[IRFwOperation, IRDataOperation]: the node to partition
         @param algo GenericDistAlgo: the partition algorithm related to the node
         @param config Dict[str, Any]: the algorithm configuration, e.g., partition number
@@ -391,7 +393,7 @@ class IRGraph(IRSegment):
         for t in node.inputs() + node.outputs():
             if isinstance(t, IRSubTensor):
                 valmaps[t.parent] = None if t.grad is None else ValueMap(t.grad.valmap)
-        
+
         # gather consumers
         ctensors: Dict[IRFullTensor, List[IRSubTensor]] = dict()
         consumers: Dict[IRFullTensor, List[IRCell]] = dict()
@@ -519,7 +521,7 @@ class IRGraph(IRSegment):
 
         def fuse_op_fn(*args, **kwargs) -> IRDimops:
             return IRDimops(fuse_op_fn, fuse_op_name, signature, [fuse_op_anno], args, **kwargs)
-        
+
         if make_customized_op:
             from cube.graph.parser.register import CustomizedOps
 
@@ -544,18 +546,18 @@ class IRGraph(IRSegment):
             code.append(f'\treturn {func_outputs}')
             code = '\n'.join(code)
             CustomizedOps.register(
-                signature, fuse_op_fn, code, 
+                signature, fuse_op_fn, code,
                 lambda *args : NotImplementedError("a fused operator doesn't have runtime call")
             )
-        
+
         fuse_op = fuse_op_fn(*inputs, **kwargs)
         for idx, output in enumerate(outputs):
             fuse_op.set_output(idx, output)
-        
+
         # setup device
         if len(nodes[0].device) != 0:
             fuse_op.device = nodes[0].device
-        
+
         # replace nodes with the fused operator
         # remove forward operators
         segment = self.segment(nodes[0])
@@ -580,7 +582,7 @@ class IRGraph(IRSegment):
         """
         Assign an operator (subgraph) to (multiple) rank(s).
 
-        Corresponding backward operators (if have) will also be 
+        Corresponding backward operators (if have) will also be
         assigned to the same device.
 
         @param node Union[IRFwOperation, IRBpOperation, IRSegment]: operator
@@ -622,7 +624,7 @@ class IRGraph(IRSegment):
         Currently only support node (set) from a same device.
 
         @param nodes Sequence[Set[FOp]]: a sequence of operators or
-            a sequence of concurrent operators. Note there should be no 
+            a sequence of concurrent operators. Note there should be no
         """
         assert len(nodes) > 0
         concurrent_groups = [[node] if isinstance(node, IRCell) else node for node in nodes]
@@ -707,7 +709,7 @@ class IRGraph(IRSegment):
         @param action str:
             'after': fixed node2 and schedule node1 after node2 in the sequence.
             'before': fixed node2 and schedule node1 before node2 in the sequence.
-        
+
         @return success bool: True if the scheduling success otherwise False.
         """
         idx1 = self._nodes.index(node1)
@@ -765,13 +767,13 @@ class IRGraph(IRSegment):
 
         @note: this functionality is not enabled due to predecessor and succesor
         functionality.
-        
+
         @param seq List[IRCell]: the nodes in scheudled order
         @param integrity_check bool:
                 If true, performs additional integrity check that requires
                 all the nodes in predecessor and successor of a node should
                 appear in the sequence.
-        
+
         @return valid bool: True for satisfying topo order, otherwise False.
         """
         for index, node in enumerate(seq):
@@ -812,15 +814,15 @@ class IRGraph(IRSegment):
         This should be called before any operator partition.
 
         The transformation and temporal scheduling can only be applied within each stage.
-        For example, after staging, user cannot schedule a (transformed) node 
+        For example, after staging, user cannot schedule a (transformed) node
         from one stage to another stage.
 
         Changes will be made:
 
         1). Identity creation:
             If a non-attribute tensor is produced / consumed not in
-            neighbor stages, 
-                e.g., 
+            neighbor stages,
+                e.g.,
                     stage 1: t1 = producer()
                     stage 2: ...
                     stage 3: xx = consume(t1)
@@ -865,7 +867,7 @@ class IRGraph(IRSegment):
             if node.name == 'multiref' or isinstance(node, IRPyFunc):
                 pass
             else:
-                _logger.info(f'involve node {node.name}({node.cid}) into the first stage')     
+                _logger.info(f'involve node {node.name}({node.cid}) into the first stage')
             starts[0] = idx
             break
 
@@ -873,7 +875,7 @@ class IRGraph(IRSegment):
         for idx, node in enumerate(self._nodes):
             if not isinstance(node, IRBpOperation):
                 last_fidx = idx
-        
+
         fstages: List[List[IRCell]] = []
         bstages: List[List[IRCell]] = []
         for sid in range(len(starts)):
@@ -937,7 +939,7 @@ class IRGraph(IRSegment):
             producer, ptensor = self.producers(ftensor)[0], self.ptensors(ftensor)[0]
             psid = get_sid(producer)
             # outside of stages, not consider
-            if psid is None: continue 
+            if psid is None: continue
 
             # group consumers into stages
             consumers = self.consumers(ftensor)
@@ -1001,7 +1003,7 @@ class IRGraph(IRSegment):
         if isinstance(nodes, IRSegment):
             assert nodes.isfw() and (not nodes.isbw()), "Only forward IRSegment can recompute"
             return self.recompute(nodes.nodes())
-        
+
         else:
             segments = [self.segment(node) for node in nodes]
             assert all(segment == segments[0] for segment in segments), \
@@ -1067,7 +1069,7 @@ class IRGraph(IRSegment):
         """
         with open(filename, 'rb') as f:
             id_state, graph = dill.load(f)
-        
+
         # recover IRGenerator
         IDGenerator().load_states(id_state)
         # recover cell
@@ -1079,7 +1081,7 @@ class IRGraph(IRSegment):
             # nodes
             for node in segment.nodes():
                 for t in node.inputs() + node.outputs():
-                    if isinstance(t, IRObject): 
+                    if isinstance(t, IRObject):
                         t.cell = node
                 # recursively recover segments
                 if isinstance(node, IRSegment):
@@ -1087,6 +1089,6 @@ class IRGraph(IRSegment):
             # output
             for t in IRSegment.get_objects_from_complex(segment.outputs()):
                 t.cell = segment
-        
+
         reset_node(graph)
         return graph

@@ -13,12 +13,14 @@ from cube.ir.adapter.prim import CollectivePrim
 
 from cube.graph.graph import IRSegment
 from cube.graph.parser.register import CustomizedOps
+from cube.graph.parser.fx.parser import FxModuleParser
 
 from cube.execplan import ExecutionPlan
 from cube.execplan.execplan import ExeReuseCell
 
 from cube.codegen.syntax.symtable import SymbolTable
-from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
+from cube.codegen.syntax.blocks import ClassBlock, ForBlock, FunctionBlock
+from cube.codegen.schedule.schedule import ScheduleCodeGen
 
 from cube.codegen.emit import FuncEmission
 from cube.codegen.module.autograd import AutogradAdapterCodeGen
@@ -35,11 +37,11 @@ class ModuleCodeGen(FuncEmission):
     Generate module code
 
     `ModuleCodeGen` traverses all IR nodes and categorizes their intermediately generated
-    codes into different parts, 
+    codes into different parts,
     then reorders and concatenates these parts into the final code for PyTorch to run.
 
     These parts are progressively stored into fields of `ModelCodeGen`
-    
+
     - `init_code : List[str]`
         Statements like `import torch`
 
@@ -69,7 +71,7 @@ class ModuleCodeGen(FuncEmission):
             [
                 'tensor_3333 = torch.view(tensor_2222, [1,2,3,4])'
             ]
-            
+
             # intermediate codes for 'adapter456(self, tensor_4444)'
             [
                 'tensor_5555 = cube.runtime.adapter.all_reduce(tensor_4444, ranks=[0,1,2,3])'
@@ -93,9 +95,10 @@ class ModuleCodeGen(FuncEmission):
         self.init_code: List[str] = [
             '\n\n########## Generated Model Code ###########',
             'from typing import *',
+            'from pathlib import Path',
             'import torch', 'import torch.utils.checkpoint as ckpt',
             'import cube', 'import _operator', 'from numpy import inf', 'import builtins', '', '']
-        
+
         if CompileFlag.use_nnfusion:
             self.init_code.extend(['import nnfusion', ''])
 
@@ -146,7 +149,7 @@ class ModuleCodeGen(FuncEmission):
                     if device not in ctensor.device: continue
                     if ctensor not in all_params:
                         # a same parameter can be consumed multiple times by different operators
-                        if ctensor not in rest_params: 
+                        if ctensor not in rest_params:
                             rest_params.append(ctensor)
             if len(rest_params) == 0:
                 continue
@@ -157,12 +160,12 @@ class ModuleCodeGen(FuncEmission):
 
     def get_comm_groups(self, scale_ndevs: Optional[int] = None):
         """
-        Scale the communication groups to multiple devices 
+        Scale the communication groups to multiple devices
         using data parallelism.
 
         @warn this requires user side to setup dataloader
             for different GPUs
-        
+
         @param scale_ndevs Optional[int]: scale to number of devices
         """
         def _add_comm_for_group_zero(ranks):
@@ -254,9 +257,31 @@ class ModuleCodeGen(FuncEmission):
             return segment
         return node
 
-    def gen(self, device: int, outfile=None, attach=False) -> str:
+    def gen(
+        self,
+        device: int,
+        outfile=None,
+        attach=False,
+        *,
+        as_parallel_module=False,
+        forward_arg_names=None
+    ) -> str:
         """
         Generate model implementation code based on the given graph.
+
+        Args:
+            device (int): device id
+            outfile (str): output file path
+            attach (bool): whether to append to the file
+            as_parallel_module (bool): whether to generate parallel module, which will
+                1. Inherit from ParallelModule
+                2. Has forward method
+                3. Add more content to constructor
+            forward_arg_names (List[str]): argument names of forward function, if None, use node inputs.
+                This is used only in parallel module
+
+        Returns:
+            generated code
         """
         gencode = copy.copy(self.init_code)
         node_args: List[List[str]] = list()
@@ -272,7 +297,7 @@ class ModuleCodeGen(FuncEmission):
             unrolled_seqs.append(node)
         # we use ordered dict as ordered set
         sequence = tuple(dict.fromkeys(unrolled_seqs))
-        
+
         # scale to multiple devices
         if self._scale_to_ndevs is not None:
             sequence = [self.scale(node, self._scale_to_ndevs, device) \
@@ -328,20 +353,36 @@ class ModuleCodeGen(FuncEmission):
             node_args.append(args)
 
         # generate full code
-        with ClassBlock(class_name='GenModel', derived=['cube.runtime.module.CubeModule']) as cb:
+        with ClassBlock(
+            class_name='GenModel',
+            derived=[f'cube.runtime.module.{"ParallelModule" if as_parallel_module else "CubeModule"}']
+        ) as cb:
             with FunctionBlock(func_name='__init__', args=['self']) as ib:
                 ib.insert_body(self.model_init_statements)
-                # switch to training or inference mode
-                if self.execplan.inference:
-                    ib.insert_body('self.eval()')
+                if as_parallel_module:
+                    ib.insert_body('')
+                    ib.insert_body(f'self.load_attr_content(Path(__file__).with_name("{FxModuleParser.ATTR_CONTENT_FILE}"))')
+                    ib.insert_body(f'self.load_dist_param_map(Path(__file__).with_name("{FxModuleParser.ATTR_MAP_FILE}"))')
+                    ib.insert_body('')
+                    with ForBlock('reducer', f'self.reducers') as for_block:
+                        for_block.insert_body(f'reducer.build_buckets()')
+                    ib.insert_body('')
+                    ib.insert_body(for_block.code)
                 else:
-                    ib.insert_body('self.train()')
+                    # switch to training or inference mode
+                    if self.execplan.inference:
+                        ib.insert_body('self.eval()')
+                    else:
+                        ib.insert_body('self.train()')
             cb.insert_body('')
             cb.insert_body(ib.code)
+            segment_idxs =[]
             for idx, node in enumerate(gen_nodes):
                 name = ModuleCodeGen.node_name(node)
                 input_args = ['self'] + node_args[idx]
                 forward_code = self.model_methods_bodies[idx]
+                if isinstance(node, IRSegment):
+                    segment_idxs.append(idx)
 
                 with FunctionBlock(func_name=name, args=input_args) as fb:
                     fb.insert_body(forward_code)
@@ -356,6 +397,33 @@ class ModuleCodeGen(FuncEmission):
                     cb.insert_body('@torch.jit.script_method')
                 cb.insert_body(fb.code)
 
+            if as_parallel_module:
+                if len(segment_idxs) > 1:
+                        raise RuntimeError("The graph has more than one segment, forward code cannot be generated.")
+                elif not segment_idxs:
+                    raise RuntimeError("The graph has no segment, forward code cannot be generated.")
+                segment_idx = segment_idxs[0]
+                node = gen_nodes[segment_idx]
+                # will use the orignal names of inputs
+                inputs = [t.name for t in node.inputs() if not isinstance(t, IRSubTensor) or not t.is_attr()]
+                # ensure forward args are valid
+                if forward_arg_names:
+                    for i in range(len(inputs)):
+                        if inputs[i] != forward_arg_names[i]:
+                            raise ValueError(f"Forward args mismatch: {inputs[i]} != {forward_arg_names[i]}")
+                    for i in range(len(inputs), len(forward_arg_names)):
+                        if not forward_arg_names[i].startswith('*'):
+                            raise ValueError(f"Invalid extra forward args: only *args & **kwargs are allowed")
+
+                with FunctionBlock(func_name='_forward_impl', args=['self'] + (forward_arg_names or inputs)) as fb:
+                    outputs = ScheduleCodeGen.return_name(node.outputs(), skip_attr=True)
+                    call_code = f'{outputs} = self.{ScheduleCodeGen.node_name(node)}({", ".join(inputs)})'
+                    fb.insert_body(call_code)
+                    return_code = f'return {ScheduleCodeGen.return_name_complex(self.execplan.graph.outputs())}'
+                    fb.insert_body(return_code)
+                cb.insert_body('')
+                cb.insert_body(fb.code)
+
         gencode += cb.code
         gencode += ['']
 
@@ -364,7 +432,7 @@ class ModuleCodeGen(FuncEmission):
         if outfile:
             with open(outfile, 'a' if attach else 'w') as f:
                 f.write(code)
-        
+
         # clear used buffer
         self.clear()
         return code
@@ -545,7 +613,7 @@ class ModuleCodeGen(FuncEmission):
     @staticmethod
     def _emit_nodes(nodes: List[IRCell], lifecycle: LifeCycle) -> List[str]:
         """
-        Emit code to invoke operations and adapter, 
+        Emit code to invoke operations and adapter,
         e.g. (the lines are split into `List[str]`)
 
         ```
@@ -589,7 +657,7 @@ class ModuleCodeGen(FuncEmission):
             tensor_2222 = None      # no more reference
             return tensor_3333
         # in the beginning we have `import torch.utils.checkpoint as ckpt`
-        tensor_4444 = ckpt.checkpoint(recompute, tensor_1111)            
+        tensor_4444 = ckpt.checkpoint(recompute, tensor_1111)
         ```
 
         REMARK:
@@ -613,7 +681,7 @@ class ModuleCodeGen(FuncEmission):
         output_names = [FuncEmission.tensor_name(t) for t in outputs]
         output_names_tuple = ', '.join(output_names)
 
-        # 'graph.segment(nodes)' ensures that if a tensor is no longer used (in RC group or in later code), 
+        # 'graph.segment(nodes)' ensures that if a tensor is no longer used (in RC group or in later code),
         # it's not included in 'outputs'.
         # And we will not generate 'return' statement for it, since it will cause the error
         # that the variable is not defined (because it has been 'del'-ed).
@@ -623,7 +691,7 @@ class ModuleCodeGen(FuncEmission):
             # e.g. those ids in subgraphs are not 0-based, and incremented after the preceding non-rc nodes and so on.
             #
             # So within the recomputing subgraph, tensors can be released if they are no longer used
-            # i.e. not returned by the 'def recompute(...)' 
+            # i.e. not returned by the 'def recompute(...)'
             # since 'execplan.graph.segment(nodes)' will make all "free variables" as explicit inputs/outputs
             # to that subgraph.
 

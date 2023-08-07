@@ -1,6 +1,7 @@
 from typing import List, Dict, Tuple, Optional
 import logging
 import os
+import sys
 
 import torch
 
@@ -72,7 +73,7 @@ class CubeModule(torch.nn.Module):
         Add an attribute map.
         The mapping includes current attribute name (str) to logical tensor id,
         and the mapping of logical tensor id including spatial (slice) and val chunks
-        
+
         @param attr str: attribute name of this moudle
         @param tid int: full tensor id
         @param slicers Tuple[slice]: indexing from full tensor
@@ -108,8 +109,13 @@ class CubeModule(torch.nn.Module):
 
     def get_checkpoint(self, optimizer: torch.optim.Optimizer = None):
         state_dict = super().state_dict()
-        assert os.path.isfile('dist_param_map.pt'), 'Cannot open distributed parameter mapping file: dist_param_map.pt'
-        dist_param_map = torch.load('dist_param_map.pt')
+        # backward compatibility
+        # in old version, dist_param_map is not loaded in constructor
+        # so we will try to load it from file on the fly.
+        dist_param_map = getattr(self, '_dist_param_map', None)
+        if not dist_param_map:
+            assert os.path.isfile('dist_param_map.pt'), 'Cannot open distributed parameter mapping file: dist_param_map.pt'
+            dist_param_map = torch.load('dist_param_map.pt')
         param_area_map = self._fullmap
         optimizer_state_dict = optimizer.state_dict() if optimizer is not None else None
         return state_dict, dist_param_map, param_area_map, optimizer_state_dict
@@ -118,7 +124,7 @@ class CubeModule(torch.nn.Module):
         filename_prefix = 'dist_checkpoint' if filename_prefix is None else filename_prefix
         filename = f"{filename_prefix}-{DeviceGroup().rank}.ckpt"
         state_dict, dist_param_map, param_area_map, optimizer_state_dict = self.get_checkpoint(optimizer)
-        
+
         _logger.info(f'saving distributed checkpoint to {filename}')
         torch.save({
             'state_dict': state_dict,
@@ -367,3 +373,69 @@ class CubeModule(torch.nn.Module):
         torch.save({'state_dict': merged_model_state_dict,
                     'optim_state_dict': merged_optimizer_state_dict
                     }, filename_prefix + '.full.ckpt')
+
+
+class _AddGradModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, *args):
+        new_args = []
+        found_tensor = False
+        for arg in args:
+            if isinstance(arg, torch.Tensor):
+                found_tensor = True
+                new_arg = arg
+                if not arg.requires_grad:
+                    new_arg = arg.clone().requires_grad_(True)
+                new_args.append(new_arg)
+            else:
+                new_args.append(arg)
+        if not found_tensor:
+            raise RuntimeError("Failed to setup module backward hook: no input Tensors.")
+        return tuple(new_args)
+
+
+class ParallelModule(CubeModule):
+    def __init__(self):
+        super().__init__()
+        self._dist_param_map = None  # should fill in sub classes.
+
+        # register_full_backward_pre_hook requires the input tensor to be requires_grad
+        # so we add a module to make sure the input tensor requires grad
+        self._add_grad_module = _AddGradModule()
+        self._add_grad_module.register_full_backward_pre_hook(self.backward_hook)
+
+        # if _grad_sentry.grad becomes None or zero
+        # we should zero grad in the next forward
+        # NOTE: this is a hacky way to detect whether the backward is called
+        # And it will add an extra parameter to the module
+        self._grad_sentry = torch.nn.Parameter(torch.tensor([0.0], requires_grad=True))
+        self._grad_sentry.grad = torch.tensor([1e-7])
+
+    def forward(self, *args, **kwargs):
+        if self._grad_sentry.grad is None or self._grad_sentry.grad.item() == 0:
+            self.zero_grad()
+            self._grad_sentry.grad = torch.tensor([1.0])
+
+        new_args = self._add_grad_module(*args)
+        return self._forward_impl(*new_args, **kwargs)
+
+    def _forward_impl(self, *args, **kwargs):
+        """
+        forward implementation. Should be implemented by subclass
+        """
+        raise NotImplementedError
+
+    def backward_hook(self, module, grad_output):
+        """
+        backward hook for gradient synchronization
+        """
+        for reducer in self.reducers:
+            reducer.sync_grads()
+
+    def get_dist_param_map(self):
+        return self._dist_param_map
+
+    def load_dist_param_map(self, filename: str):
+        self._dist_param_map = torch.load(filename)

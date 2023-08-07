@@ -226,16 +226,16 @@ class ShapeAnno:
             a (b+ dim)  d^
 
         @param shape str: shape annotation
-        
+
         @return dim_annos Tuple[DimAnno]: tuple of dimension annotations
         """
         # => ['a', '(', 'b+', 'dim', ')', 'd^']
         shapes = list()
-        for group in re.split('\ +', shape_anno):
+        for group in re.split(r'\ +', shape_anno):
             if len(group) == 0:
                 continue
             if '(' in group or ')' in group:
-                for group in re.split('([\(\)])', group):
+                for group in re.split(r'([\(\)])', group):
                     if len(group) != 0:
                         shapes.append(group)
             else:
@@ -391,7 +391,7 @@ class OpAnno:
         Get identifier length
 
         @param identifier str: identifier name
-        
+
         @return length Optional[int]: the length of identifier
         """
         assert identifier in self._identifiers, f"{identifier} not exists {set(self._identifiers.keys())}"
@@ -441,7 +441,7 @@ class OpAnno:
                       ous: Tuple[Tuple[Union[str, Tuple[str]]]]) -> str:
         """!
         Create operator annotation string
-        e.g., 
+        e.g.,
             ins = [ ['a', 'b', 'c+'], ['c+', ['d', 'e']] ]
             ous = [ ['a', 'b', 'd', 'e'] ]
         =>
@@ -449,7 +449,7 @@ class OpAnno:
 
         @param ins Tuple[Tuple[Union[str, Tuple[str]]]: input identifier list
         @param ous Tuple[Tuple[Union[str, Tuple[str]]]: output identifier list
-        
+
         @return anno str: operator annotation
         """
         in_annos = list()
@@ -488,7 +488,7 @@ class DimopSplit:
     """
     def __init__(self, dims: Optional[Union[int, List[int]]] = None, r = False, v = False) -> None:
         """Dimension split config
-        
+
         Args:
             dims (Optional[Union[int, List[int]]], optional): [description]. Defaults to None.
         """
@@ -571,7 +571,7 @@ class TransformRule:
 
     def output(self, idx: int) -> DimopSplit:
         return self._outputs[idx]
-    
+
     def modifier(self) -> Optional[Callable]:
         return self._modifier[0]
 
@@ -604,7 +604,7 @@ class IRDimops(IRFwOperation):
         @param transform_rules: the special rules to partition the operator. Default None.
         @param kwargs: the kwarg non-tensor parameters
         """
-        assert all(isinstance(anno, str) for anno in annos), "Expect annos to be List[str]"      
+        assert all(isinstance(anno, str) for anno in annos), "Expect annos to be List[str]"
         self._annos_candidates: List[str] = tuple(annos)
         self._anno: OpAnno = None
         self._iannos: List[ShapeAnno] = None

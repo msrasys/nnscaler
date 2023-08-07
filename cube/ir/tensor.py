@@ -2,7 +2,7 @@ r"""
 SubTensor Gradient rule:
 
 SubTensor's logical grad = SubTensor.parent.grad.select(
-    indmap = SubTensor.indmap, 
+    indmap = SubTensor.indmap,
     valmap = SubTensor.valmap,
     shape   = SubTensor.shape
 )
@@ -18,7 +18,7 @@ FwOperation -> BpOperation rule:
     val is always (0/1)
 
 Tensor can be graph attributes. In deep learning, these graph attribute tensors
-can be 
+can be
     1) parameters (require gradient),
     2) buffers (not require gradient)
     3) gradient of parameters
@@ -40,7 +40,7 @@ class IndexMap:
         Create an index map.
 
         @param indmap Union[Tuple[StartEnd], IndexMap]: index range [start, end) for each dimension
-        
+
         @return indmap IndexMap: the created new instance of index map.
         """
         if isinstance(indmap, IndexMap):
@@ -110,7 +110,7 @@ class IndexMap:
         """
         if not isinstance(other, IndexMap):
             raise TypeError("Expected IndexMap")
-        
+
         if other.ndims != self.ndims:
             raise TypeError("Expected same dimension")
 
@@ -126,7 +126,7 @@ class IndexMap:
         Get the common part
 
         @param other IndexMap: the other one
-        
+
         @return indexmap IndexMap: index map for the common part
         """
         if not self.overlap(other):
@@ -175,11 +175,11 @@ class ValueMap:
         Get value partitioned chunks in tha accumulcated group
         """
         return self._weight
-    
+
     def overlap(self, other) -> bool:
         """!
         Check on value overlapping.
-        Note the overlap can only be within a same accumulation group and 
+        Note the overlap can only be within a same accumulation group and
         a same replication group.
         """
         if not isinstance(other, ValueMap):
@@ -332,7 +332,7 @@ class IRFullTensor(IRTensor):
             self._requires_grad = True
             if self._grad is None:
                 grad = IRFullTensor(
-                    self.shape, 'g' + self.name, 
+                    self.shape, 'g' + self.name,
                     requires_grad=False, dtype=self.dtype
                 ).as_grad(self.is_attr())
                 self._grad = grad
@@ -445,7 +445,7 @@ class IRSubTensor(IRTensor):
         """
         indmap, valmap = IndexMap(indmap), ValueMap(valmap)
         assert isinstance(ftensor, IRFullTensor), "Expcted ftensor to be IRFullTensor"
-        assert 'dtype' not in kwargs, "IRSubTensor is not allowed to initialize with a dtype" 
+        assert 'dtype' not in kwargs, "IRSubTensor is not allowed to initialize with a dtype"
         super().__init__(shape=indmap.shape, name=ftensor.name, **kwargs)
         for attr in IRFullTensor._meta:
             setattr(self, attr, getattr(ftensor, attr))
@@ -537,7 +537,7 @@ class IRSubTensor(IRTensor):
                 else:
                     return None
         return cat_dim
-    
+
     def concat(self, other: IRTensor, dim: int) -> IRTensor:
         """!
         concat dimension with other IRSubTensor. The concatenate
@@ -590,7 +590,7 @@ class IRSubTensor(IRTensor):
     def accum(self, tensors: Union[IRTensor, List[IRTensor]]) -> IRTensor:
         """!
         Accumulate tensor on value dimension.
-        The replica id will be 
+        The replica id will be
 
         @param: tensors Union[IRTensor, List[IRTensor]]
         @return tensor IRSubTensor: accumulated tensor
@@ -721,12 +721,12 @@ class IRSubTensor(IRTensor):
         return sub_tensors
 
     def split_dims(self, dims: Tuple[int], nums: Tuple[int] ) -> List[IRTensor]:
-        """Uniformly and nestedly partition tensors alongside multiple dimensions.
-        
+        r"""Uniformly and nestedly partition tensors alongside multiple dimensions.
+
         Args:
             dims (Tuple[int]): the dimensions to get partitioned
             nums (Tuple[int]): the number of sub-tensor generated
-        
+
         Returns:
             List[IRTensor]: the generated `\prod nums` sub-tensors
         """
