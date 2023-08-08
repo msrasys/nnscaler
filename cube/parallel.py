@@ -1,4 +1,4 @@
-from typing import Callable, Any, Optional, Type, Union
+from typing import Callable, Any, Dict, Optional, Type, Union
 from pathlib import Path
 import inspect
 import sys
@@ -361,41 +361,3 @@ def parallelize(
         instance_name=instance_name,
     )
     return cube_module_class if is_module_class else cube_module_class()
-
-
-def parallel_module(
-        dummy_input: dict,
-        pas_policy: Callable[[IRGraph, ComputeConfig], IRGraph],
-        compute_config: ComputeConfig,
-        *,
-        dynamic_shape: bool = True,
-        cube_savedir: Union[str, Path] = './.cube'
-) -> Callable[[Union[torch.nn.Module, Type[torch.nn.Module]]], Union[CubeModule, Type[CubeModule]]]:
-    """
-    Work as a class decorator to convert a torch.nn.Module to CubeModule.
-
-    Please make sure the Module's __init__ is paremeter-free.
-    Please note that
-    1. Returned CubeModule will replace the torch.nn.Module in-place.
-    And all member functions/variables of original torch.nn.Module will be gone.
-    2. The parameters of CubeModule will be fixed,
-    which means all instances of CubeModule will use the same parameters (which are from the tracing).
-
-    Args:
-        dummy_input (dict): the dummy input for the module
-        pas_policy (Callable[[IRGraph, ComputeConfig], IRGraph]): the pas policy
-        compute_config (ComputeConfig): the environment resource
-        dynamic_shape (bool): whether to use dynamic shape
-        cube_savedir (Union[str, Path]): the directory to save generated code
-    """
-    def wrap(module_or_module_class: Union[torch.nn.Module, Type[torch.nn.Module]]) -> Union[CubeModule, Type[CubeModule]]:
-        return parallelize(
-                module_or_module_class,
-                dummy_input,
-                pas_policy,
-                compute_config,
-                dynamic_shape=dynamic_shape,
-                override=False,
-                cube_savedir=cube_savedir
-        )
-    return wrap
