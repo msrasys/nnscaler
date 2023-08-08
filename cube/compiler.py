@@ -1,4 +1,4 @@
-from typing import Callable, Tuple, Union, Optional, Any
+from typing import Callable, Tuple, Union, Optional
 import torch
 import time
 import os
@@ -36,7 +36,6 @@ _logger.setLevel(logging.INFO)
 
 def compile(model: SemanticModel, *args,
             PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None,
-            model_dummy_inputs: Tuple[Any] = None,
             model_dynamic_shape: bool = False,
             comm_cost_fn: Optional[Callable] = None,
             override = True,
@@ -85,7 +84,6 @@ def compile(model: SemanticModel, *args,
     assert isinstance(model, SemanticModel), f'Require cube.SemanticModel or torch.nn.Module, but got model: {type(model)}'
     model.save_content = load_content
     model.dynamic_shape = model_dynamic_shape
-    model.dummy_input = model_dummy_inputs
 
     dataloader = None
     inputs = [model]
@@ -100,12 +98,14 @@ def compile(model: SemanticModel, *args,
             # generate backward communications in adapter. However, as long as 
             # the data doesn't require gradient in real runtime, the backward
             # communication will not be triggered.
+            tensor = arg
             arg = IRFullTensor(arg.shape, name='tensor', 
                                requires_grad=True,
                                dtype=DType2IRDType.map(arg.dtype)).tosub()
+            arg._value = tensor
             arg.grad = arg.parent.grad.tosub() if arg.requires_grad else None
         else:
-            arg= IRObject('obj')
+            arg = IRObject('obj', value=arg)
         inputs.append(arg)
 
     myrank = DeviceGroup().rank

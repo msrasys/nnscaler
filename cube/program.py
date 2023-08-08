@@ -1,7 +1,8 @@
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional, Any, Dict
+import inspect
 
-from cube.ir.cten import IRCell, IRTensor, IRObject
-from cube.ir.tensor import IRFullTensor, IRSubTensor
+from cube.ir.cten import IRCell, IRObject
+from cube.ir.tensor import IRFullTensor
 from cube.ir.operator import IRBpOperation, IRDataOperation
 
 from cube.graph import IRGraph
@@ -22,7 +23,6 @@ class Program:
     class __Program:
 
         def __init__(self):
-
             self._graph = IRGraph([], [], [], 'program')
 
     instance = None
@@ -64,14 +64,8 @@ class Program:
             for ftensor in graph.full_tensors():
                 ftensor.requires_grad = False
 
-    def mirror_as_self(self):
-        """
-        Set mirror as self. This is called when a backward is triggered.
-        """
-        IRCell.make_pair(self.instance._graph, self.instance._graph)
-
     def clear(self):
-        self.instance._graph = IRGraph([], [], [], 'program')
+        Program.instance._graph = IRGraph([], [], [], 'program')
 
     def __repr__(self):
         return repr(self.instance._graph)
@@ -115,9 +109,11 @@ class SemanticDataLoader:
                 return {generate_output(t) for t in sample}
             if isinstance(sample, torch.Tensor):
                 shape, dtype = list(sample.shape), dtype_map.map(sample.dtype)
-                return IRFullTensor(shape, 'data', dtype=dtype).tosub()
+                tensor = IRFullTensor(shape, 'data', dtype=dtype).tosub()
+                tensor._value = sample
+                return tensor
             else:
-                return IRObject('data')
+                return IRObject('data', value=sample)
 
         sample = next(self.dataloader)
         outputs = generate_output(sample)
@@ -159,7 +155,7 @@ class SemanticModel:
         if DeviceGroup().local_rank == 0:
             assert isinstance(model, torch.nn.Module), f"device of local_rank == 0 must provide model"
         self.model = model
-        self._dummy_input = None
+        self._dummy_input: Dict[str, Any] = None
         self._ir_graph = None
         self._loaded_module: CubeModule = None
         # parser configuration
@@ -206,14 +202,32 @@ class SemanticModel:
     def __call__(self, *args):
         """Forward the semantic model.
 
-        This will trigger torch.jit.script to parse the model.
+        This will parse the model into cube graph.
 
         Args:
             *args: input IRObjects
+
+        Returns:
+            graph outputs with IRObjects
         """
         assert self._ir_graph is None, \
             f"multiple forward on a semantic model is not allowed"
         if DeviceGroup().local_rank == 0:
+            # collect dummy input
+            if self.dummy_input is None:
+                dummy_input = {}
+                sig = inspect.signature(self.model.forward)
+                # note: we don't support model forward arguments having complex data stucture
+                # that contains tensor
+                for name, arg in zip(sig.parameters.keys(), args):
+                    if isinstance(arg, IRObject):
+                        value = arg.value
+                        arg._value = None  # remove tensor reference to release memory
+                    else:
+                        value = arg
+                    dummy_input[str(name)] = value
+                self.dummy_input = dummy_input
+            # parse graph
             self._ir_graph = parser.convert_model(
                 self.model,
                 dummy_input=self.dummy_input,
