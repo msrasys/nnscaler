@@ -7,7 +7,7 @@ import torch
 from torch import nn
 import numpy as np
 
-from cube.cube import ComputeConfig
+from cube.parallel import ComputeConfig
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.function.dimops import IRDimops
 from cube.graph.graph import IRGraph

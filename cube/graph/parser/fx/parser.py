@@ -64,14 +64,10 @@ def get_complex_data(val: Any, frame: Frame) -> Any:
 
 
 class FxModuleParser:
-    """torch.fx module parser
-
-    Attributes:
-        save_content (bool): whether to save the content of the module
-        dynamic_shape (bool): whether to parse the module with dynamic shape
     """
-    save_content: bool = True
-    dynamic_shape: bool = False
+    torch.fx module parser
+    """
+
     ATTR_CONTENT_FILE = 'fullmodel.pt'
     ATTR_MAP_FILE = 'dist_param_map.pt'
 
@@ -92,11 +88,18 @@ class FxModuleParser:
     def parse(module: torch.fx.GraphModule,
               dummy_inputs: Dict[str, Any],
               frame: Frame = None,
-              attr_save_dir='./') \
-            -> Tuple[List[IRFullTensor], List[IRFwOperation], List[IRFullTensor]]:
+              attr_savedir='./',
+              *,
+              save_content: bool = True,
+              dynamic_shape: bool = True
+        ) -> Tuple[List[IRFullTensor], List[IRFwOperation], List[IRFullTensor]]:
         """Parse torch.fx module into cube IR
 
         The overall entry to parse a torch.fx graph module
+
+        Args:
+            save_content (bool): whether to save the content of the module
+            dynamic_shape (bool): whether to parse the module with dynamic shape
         """
         from cube.graph.parser.fx.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
 
@@ -188,7 +191,7 @@ class FxModuleParser:
         total_node_num = len(module.graph.nodes)
         for nidx, node in enumerate(module.graph.nodes):
             _logger.info(f'[{nidx}/{total_node_num}] parsing node {node}...')
-            ir_nodes = FxModuleParser.parse_node(node, module, frame)
+            ir_nodes = FxModuleParser.parse_node(node, module, dynamic_shape, frame)
             if ir_nodes is not None:
                 all_ir_nodes += ir_nodes
 
@@ -197,10 +200,10 @@ class FxModuleParser:
         # output_val = frame.get_var(output_nodes[0].name)
         output_val = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
 
-        if FxModuleParser.save_content:
-            attr_save_dir = Path(attr_save_dir)
-            frame.save_attr_content(attr_save_dir / FxModuleParser.ATTR_CONTENT_FILE)
-            frame.save_attr_map(attr_save_dir / FxModuleParser.ATTR_MAP_FILE)
+        if save_content:
+            attr_savedir = Path(attr_savedir)
+            frame.save_attr_content(attr_savedir / FxModuleParser.ATTR_CONTENT_FILE)
+            frame.save_attr_map(attr_savedir / FxModuleParser.ATTR_MAP_FILE)
 
         frame.pop_var()
         frame.pop_attr()
@@ -225,7 +228,7 @@ class FxModuleParser:
         raise RuntimeError(f"Unknown node kind {node.kind()} from torchscript module")
 
     @staticmethod
-    def parse_node(node: torch.fx.Node, module, frame: Frame) -> List[IRFwOperation]:
+    def parse_node(node: torch.fx.Node, module, dynamic_shape: bool, frame: Frame) -> List[IRFwOperation]:
         """
         Parse the node and return the IRFwOperation nodes
         """
@@ -236,7 +239,7 @@ class FxModuleParser:
             if node_type == FxNodeKind.Output:
                 return FxModuleParser.parse_prim_output_node(node, module, frame)
             if node_type in (FxNodeKind.PrimCallFunction, FxNodeKind.PrimCallMethod):
-                return FxModuleParser.parse_prim_function_method(node, module, frame)
+                return FxModuleParser.parse_prim_function_method(node, module, dynamic_shape, frame)
             if node_type == FxNodeKind.PrimGetAttr:
                 return FxModuleParser.parse_prim_attr_node(node, module, frame)
             if node_type == FxNodeKind.PrimCallModule:
@@ -303,7 +306,7 @@ class FxModuleParser:
             raise RuntimeError(f'unknown module: {prim_module.__class__.__module__}')
 
     @staticmethod
-    def parse_prim_function_method(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
+    def parse_prim_function_method(node: torch.fx.Node, module: torch.fx.GraphModule, dynamic_shape: bool, frame: Frame) -> List[IRFwOperation]:
         # get signature
         fsig = FxModuleParser._get_qualified_name(node.target, node)
 
@@ -311,10 +314,10 @@ class FxModuleParser:
         input_vals = [get_complex_data(val, frame) for val in node.args]
         kwargs = {key: get_complex_data(val, frame) for key, val in node.kwargs.items()}
 
-        return FxModuleParser._parse_node(fsig, node, input_vals, kwargs, frame)
+        return FxModuleParser._parse_node(fsig, node, input_vals, kwargs, dynamic_shape, frame)
 
     @staticmethod
-    def _parse_node(fsig: str, node: torch.fx.Node, input_vals: list, kwargs: dict, frame: Frame) -> List[IRFwOperation]:
+    def _parse_node(fsig: str, node: torch.fx.Node, input_vals: list, kwargs: dict, dynamic_shape: bool, frame: Frame) -> List[IRFwOperation]:
         # map to IR operator
         if SignFx2Op.exist(fsig):
             ir_node = SignFx2Op.map(fsig)(*input_vals, **kwargs)
@@ -344,7 +347,7 @@ class FxModuleParser:
                 for i in range(len(vals)):
                     ir_node.set_output(i, vals[i])
             elif ir_node.output(0).value is not None:
-                if FxModuleParser.dynamic_shape:
+                if dynamic_shape:
                     frame.set_var(node.name, ir_node.output(0))
                     ir_node.output(0).name = node.name
                 else:

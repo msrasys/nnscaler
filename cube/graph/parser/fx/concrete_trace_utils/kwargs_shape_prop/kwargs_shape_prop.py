@@ -70,13 +70,12 @@ class KwargsShapeProp(KwargsInterpreter):
     def run_node(self, n: Node):
         try:
             result = super().run_node(n)
-        except Exception:
-            traceback.print_exc()
+        except Exception as e:
             raise RuntimeError(
                 f"ShapeProp error for: node={n.format_node()} with "
                 f"meta={n.meta}"
-            )
-        
+            ) from e
+
         found_tensor = False
 
         def extract_tensor_meta(obj):
@@ -86,7 +85,7 @@ class KwargsShapeProp(KwargsInterpreter):
                 return _extract_tensor_metadata(obj)
             else:
                 return obj
-            
+
         # if the obj is a tensor, then wrap it into a TensorMetaData
         # else recursively descend and wrap
         meta = map_aggregate(result, extract_tensor_meta)
@@ -94,6 +93,6 @@ class KwargsShapeProp(KwargsInterpreter):
             n.meta['tensor_meta'] = meta
         n.meta['type'] = type(result)
         return result
-    
+
     def propagate(self, concrete_args: Union[Dict[str, Any], Tuple]):
         return super().run(concrete_args)

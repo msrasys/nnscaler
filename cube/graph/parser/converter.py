@@ -66,7 +66,7 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
 def to_ir_graph(
     traced_model: torch.fx.GraphModule,
     dummy_input: Dict[str, Any],
-    attr_save_dir: Union[str, Path],
+    attr_savedir: Union[str, Path],
     dynamic_shape: bool = False,
 ) -> IRGraph:
     """Convert torch.fx.GraphModule based model into IRGraph
@@ -77,18 +77,18 @@ def to_ir_graph(
             dummy input of model, the keys are the names of forward arguments.
         dynamic_shape (bool):
             whether to use dynamic shape. Default False.
-        attr_save_dir (Union[str, Path]): directory to save content (attribtes)
+        attr_savedir (Union[str, Path]): directory to save content (attribtes)
 
     Returns:
         IRGraph: IRGraph of model
     """
-    FxModuleParser.save_content = True
-    FxModuleParser.dynamic_shape = dynamic_shape
     _logger.info(f"use {'dynamic' if dynamic_shape else 'static'} shape to parse graph")
 
     inputs, nodes, outputs = FxModuleParser.parse(
         traced_model, dummy_input,
-        attr_save_dir=attr_save_dir
+        attr_savedir=attr_savedir,
+        dynamic_shape=dynamic_shape,
+        save_content=True,
     )
     module_name = traced_model.__class__.__name__
 
@@ -103,7 +103,7 @@ def to_ir_graph(
 def convert_model(
     model: torch.nn.Module,
     dummy_input: Dict[str, Any],
-    attr_save_dir: Union[str, Path],
+    attr_savedir: Union[str, Path],
     dynamic_shape: bool = False
 ) -> IRGraph:
     """Convert torch.nn.Module based model into IRGraph
@@ -120,5 +120,5 @@ def convert_model(
         IRGraph: IRGraph of model
     """
     traced_model = to_fx_graph(model, dummy_input)
-    graph = to_ir_graph(traced_model, dummy_input, attr_save_dir, dynamic_shape)
+    graph = to_ir_graph(traced_model, dummy_input, attr_savedir, dynamic_shape)
     return graph

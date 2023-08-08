@@ -397,6 +397,7 @@ class _AddGradModule(torch.nn.Module):
 
 
 class ParallelModule(CubeModule):
+    _EPSILON = 1e-7  # A small constant that can be represented by fp16
     def __init__(self):
         super().__init__()
         self._dist_param_map = None  # should fill in sub classes.
@@ -411,12 +412,12 @@ class ParallelModule(CubeModule):
         # NOTE: this is a hacky way to detect whether the backward is called
         # And it will add an extra parameter to the module
         self._grad_sentry = torch.nn.Parameter(torch.tensor([0.0], requires_grad=True))
-        self._grad_sentry.grad = torch.tensor([1e-7])
+        self._grad_sentry.grad = torch.tensor([self._EPSILON])
 
     def forward(self, *args, **kwargs):
         if self._grad_sentry.grad is None or self._grad_sentry.grad.item() == 0:
             self.zero_grad()
-            self._grad_sentry.grad = torch.tensor([1.0])
+            self._grad_sentry.grad = torch.tensor([self._EPSILON])
 
         new_args = self._add_grad_module(*args)
         return self._forward_impl(*new_args, **kwargs)

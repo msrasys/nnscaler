@@ -217,7 +217,7 @@ class SemanticModel:
             self._ir_graph = parser.convert_model(
                 self.model,
                 dummy_input=self.dummy_input,
-                attr_save_dir='./',
+                attr_savedir='./',
                 dynamic_shape=self.dynamic_shape
             )
             return self._ir_graph(*args)

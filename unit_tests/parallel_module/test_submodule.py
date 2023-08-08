@@ -8,7 +8,7 @@ import torch
 from torch import nn
 import numpy as np
 
-from cube.cube import ComputeConfig, as_cube
+from cube.parallel import ComputeConfig, parallelize
 from cube.runtime.module import ParallelModule
 
 from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed
@@ -36,7 +36,7 @@ class FcRelu_4_4(FcRelu):
 
 
 def _to_cube_model(module, pas, compute_config, cube_savedir, instance_name):
-    return as_cube(
+    return parallelize(
         module,
         {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},
         pas,

@@ -25,7 +25,7 @@ from cube.execplan.planpass.grouping import Grouping
 from cube.execplan.planpass.fusion import DiffFusion
 from cube.ir.unique import IDGenerator
 from cube.program import Program
-from cube.runtime.module import CubeModule
+from cube.runtime.module import CubeModule, ParallelModule
 
 
 @dataclass
@@ -285,7 +285,7 @@ def _load_cube_module_class(
     return cube_module_class
 
 
-def as_cube(
+def parallelize(
     module_or_module_class: Union[torch.nn.Module, Type[torch.nn.Module]],
     dummy_input: dict,
     pas_policy: Callable[[IRGraph, ComputeConfig], IRGraph],
@@ -364,7 +364,7 @@ def as_cube(
     return cube_module_class if is_module_class else cube_module_class()
 
 
-def cube(
+def parallel_module(
         dummy_input: dict,
         pas_policy: Callable[[IRGraph, ComputeConfig], IRGraph],
         compute_config: ComputeConfig,
@@ -390,7 +390,7 @@ def cube(
         cube_savedir (Union[str, Path]): the directory to save generated code
     """
     def wrap(module_or_module_class: Union[torch.nn.Module, Type[torch.nn.Module]]) -> Union[CubeModule, Type[CubeModule]]:
-        return as_cube(
+        return parallelize(
                 module_or_module_class,
                 dummy_input,
                 pas_policy,

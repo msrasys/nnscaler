@@ -5,14 +5,14 @@ import pytest
 import torch
 import shutil
 
-from cube.cube import as_cube, ComputeConfig
+from cube.parallel import parallelize, ComputeConfig
 
 from .common import PASData, init_distributed
 from ..launch_torchrun import launch_torchrun
 
 
 def _to_cube_model(module, compute_config, cube_savedir, override, instance_name):
-    return as_cube(
+    return parallelize(
         module,
         {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
         PASData,

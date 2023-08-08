@@ -37,8 +37,8 @@ def test_to_graph():
     assert any(node.op == 'call_function' and node.target == torch.nn.functional.linear for node in nodes)
 
     with tempfile.TemporaryDirectory() as tempdir:
-        to_ir_graph(fx_graph, dummy_input, attr_save_dir=tempdir, dynamic_shape=True)
-        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_save_dir=tempdir, dynamic_shape=True)
+        to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
+        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
         assert ir_graph is not None
         assert (Path(tempdir) / FxModuleParser.ATTR_MAP_FILE).exists()
         assert (Path(tempdir) / FxModuleParser.ATTR_CONTENT_FILE).exists()
@@ -72,4 +72,4 @@ def test_to_ir_graph_args():
     with tempfile.TemporaryDirectory() as tempdir:
         # currently we don't support *args
         with pytest.raises(RuntimeError):
-            to_ir_graph(fx_graph, dummy_input, attr_save_dir=tempdir, dynamic_shape=True)
+            to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
