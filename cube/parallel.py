@@ -13,7 +13,6 @@ from cube.ir.tensor import IRFullTensor
 
 from cube.graph import IRGraph
 from cube.graph import parser
-from cube.graph.parser.dtype import DType2IRDType
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.schedule.schedplan import SchedulePlan
@@ -198,7 +197,7 @@ def _gencode(
                 shape=ir_dummy_inputs[i].size(),
                 name=fx_input_nodes[i].target,
                 requires_grad=True,
-                dtype=DType2IRDType.map(ir_dummy_inputs[i].dtype)).tosub()
+                dtype=ir_dummy_inputs[i].dtype).tosub()
             ir_dummy_inputs[i].grad = ir_dummy_inputs[i].parent.grad.tosub()
         else:
             ir_dummy_inputs[i] = IRObject(

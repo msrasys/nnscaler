@@ -16,7 +16,6 @@ from cube.ir.cten import IRTensor, IRCell, IRObject
 from cube.ir.unique import IDGenerator
 from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from cube.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
-from cube.ir.dtype import IRDType, DTypeInferRule
 
 from cube.graph.function.function import Identity
 from cube.graph.function.anchor import IRGraphAnchor
@@ -110,21 +109,6 @@ class IRGraph(IRSegment):
                 output = IRGraph.modify_objects_of_complex(
                     self.output(oidx), lambda t: t if t != itensor else arg)
                 self.set_output(oidx, output)
-
-        # dtype inference
-        for node in self._nodes:
-            # reset input
-            itensors: List[IRTensor] = [t for t in node.inputs() if isinstance(t, IRSubTensor)]
-            for itensor in itensors:
-                itensor.parent.dtype = itensor.dtype
-            # infer output dtype with default dtype promotion rules
-            if len(itensors) == 0: continue
-            default_dtype = DTypeInferRule.infer(node, [t.dtype for t in itensors])
-            # set output tensors if it has unkown tensor dtype
-            otensors = [t for t in node.outputs() if isinstance(t, IRSubTensor)]
-            for otensor in otensors:
-                if otensor.dtype == IRDType.unknown:
-                    otensor.parent.dtype = default_dtype
 
         from cube.program import Program
         Program().add_nodes(self.nodes())

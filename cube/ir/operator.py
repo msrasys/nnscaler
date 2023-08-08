@@ -5,7 +5,7 @@ from cube.ir.cten import IRCell, IRTensor, IRObject
 from cube.ir.tensor import IRFullTensor
 from cube.algorithm.factory import DistAlgorithmFactory
 from cube.algorithm.generics import GenericDistAlgo
-from cube.ir.dtype import IRDType, DTypeInferRule
+from cube.ir.dtype import DTypeInfo
 
 
 class IRFwOperation(IRCell):
@@ -51,10 +51,10 @@ class IRFwOperation(IRCell):
         """
         itensors = [t for t in self.inputs() if isinstance(t, IRTensor)]
         otensors = [t for t in self.outputs() if isinstance(t, IRTensor)]
-        odtype = DTypeInferRule.infer(self, [t.dtype for t in itensors])
+        odtype = DTypeInfo.promote([t.dtype for t in itensors])
         for tensor in otensors:
             # in case of setting manually due to special rules
-            if tensor.dtype == IRDType.unknown:
+            if tensor.dtype is None:
                 if isinstance(tensor, IRFullTensor):
                     tensor.dtype = odtype
                 else:

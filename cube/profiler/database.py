@@ -13,7 +13,6 @@ import _operator
 import cube
 from cube.ir.cten import IRTensor, IRObject
 from cube.ir.operator import IRFwOperation
-from cube.graph.parser.dtype import IRDType2TorchDType
 from cube.graph.parser.register import CustomizedOps
 
 _logger = logging.getLogger(__name__)
@@ -220,7 +219,7 @@ class ProfileDataBase:
         for t in node.inputs():
             if isinstance(t, IRTensor):
                 shapes.append(t.shape)
-                dtypes.append(IRDType2TorchDType.map(t.dtype))
+                dtypes.append(t.dtype)
                 requires_grads.append(t.requires_grad)
                 values.append(t)
             else:
@@ -396,7 +395,7 @@ class ProfileDataBase:
         for t in node.inputs():
             if isinstance(t, IRTensor):
                 shapes.append(t.shape)
-                dtypes.append(IRDType2TorchDType.map(t.dtype))
+                dtypes.append(t.dtype)
             # else:
             #     shapes.append(None)
             #     dtypes.append(type(t))

@@ -7,7 +7,6 @@ from cube.ir.operator import IRBpOperation, IRDataOperation
 
 from cube.graph import IRGraph
 from cube.graph import parser
-from cube.graph.parser.dtype import DType2IRDType
 
 from cube.runtime.syndata import CubeDataLoader
 from cube.runtime.module import CubeModule
@@ -95,7 +94,6 @@ class SemanticDataLoader:
         return self
 
     def __next__(self):
-        dtype_map = DType2IRDType
         def generate_output(sample):
             """Support complex of types: List, Tuple, torch.Tensor, object"""
             if isinstance(sample, tuple):
@@ -108,8 +106,7 @@ class SemanticDataLoader:
             if isinstance(sample, set):
                 return {generate_output(t) for t in sample}
             if isinstance(sample, torch.Tensor):
-                shape, dtype = list(sample.shape), dtype_map.map(sample.dtype)
-                tensor = IRFullTensor(shape, 'data', dtype=dtype).tosub()
+                tensor = IRFullTensor(list(sample.shape), 'data', dtype=sample.dtype).tosub()
                 tensor._value = sample
                 return tensor
             else:

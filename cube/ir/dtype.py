@@ -1,72 +1,65 @@
-from typing import List
-from enum import Enum
+from typing import List, Any
+import torch
 
 
-class IRDType(Enum):
-    float64 = 'float64'
-    float16 = 'float16'
-    float32 = 'float32'
-    bfloat16 = 'bfloat16'
-    int64   = 'int64'
-    int32   = 'int32'
-    int16   = 'int16'
-    int8    = 'int8'
-    uint8   = 'uint8'
-    boolean = 'bool'
-    unknown = 'unknown'
+class DTypeInfo:
+    """Tensor dtype information
 
-
-def dtype2byte_size(dtype: IRDType) -> int:
-    return {
-        IRDType.float64: 8,
-        IRDType.float32: 4,
-        IRDType.float16: 2,
-        IRDType.bfloat16: 2,
-        IRDType.int64: 8,
-        IRDType.int32: 4,
-        IRDType.int16: 2,
-        IRDType.int8: 1,
-        IRDType.uint8: 1,
-        IRDType.boolean: 1,
-    }.get(dtype, 0)
-
-
-class DTypeInferRule:
+    Attributes:
+        bytes (Dict[Any, int]): data type -> btye size.
+        priority (List[torch.dtype]): the priority of dtypes for promotion
     """
-    Infer the output shape according to given input shapes.
-    This will follow the dtype promotion rule, which is same with PyTorch.
+    bytes = {
+        torch.complex128: 128,
+        torch.complex64: 64,
+        torch.complex32: 32,
+        torch.float64: 8,
+        torch.float32: 4,
+        torch.bfloat16: 2,
+        torch.float16: 2,
+        torch.int64: 8,
+        torch.int32: 4,
+        torch.int16: 2,
+        torch.int8: 1,
+        torch.uint8: 1,
+        torch.bool: 1,
+    }
 
-    Reference:
-    https://pytorch.org/docs/stable/tensor_attributes.html#type-promotion-doc
+    priority = [
+        torch.float64, torch.float32, torch.bfloat16, torch.float16,
+        torch.int64, torch.int32, torch.int16, torch.int8, torch.bool
+    ]
 
-    complex > floating > integral > boolean
-    """
     @staticmethod
-    def infer(node, dtypes: List[IRDType]) -> IRDType:
-        dtypes = [dtype for dtype in dtypes if dtype != IRDType.unknown]
-        if IRDType.unknown in dtypes:
-            raise RuntimeError(f"Find an unkown dtype")
-        if IRDType.float32 in dtypes and IRDType.float16 in dtypes:
-            raise RuntimeError(f"Find node has both fp32 and fp16 inputs {node}")
-        # in priority: fp32 > fp16 > bool > int64 > int16 >
-        priority = [
-            IRDType.float64, IRDType.float32, IRDType.float16,
-            IRDType.int64, IRDType.int32, IRDType.int16, IRDType.int8,
-            IRDType.boolean
-        ]
-        for dtype in priority:
-            if dtype in dtypes:
-                return dtype
-        return IRDType.unknown
+    def get_byte_size(dtype: Any) -> int:
+        """Get dtype btye size"""
+        if dtype not in DTypeInfo.bytes:
+            raise NotImplementedError(f'Unknown dtype {dtype}')
+        return DTypeInfo.bytes[dtype]
+    
+    @staticmethod
+    def promote(dtypes: List[torch.dtype]) -> torch.dtype:
+        """Infer the promoted dtype according to dtypes.
 
+        This will follow the dtype promotion rule, which is same with PyTorch.
 
-float64 = IRDType.float64
-float16 = IRDType.float16
-float32 = IRDType.float32
-bfloat16 = IRDType.bfloat16
-int64   = IRDType.int64
-int32   = IRDType.int32
-int16   = IRDType.int16
-int8    = IRDType.int8
-uint8   = IRDType.uint8
-boolean = IRDType.boolean
+        Reference:
+        https://pytorch.org/docs/stable/tensor_attributes.html#type-promotion-doc
+
+        priority: torch.float64 > torch.float32 > torch.bfloat16 > torch.float16 >
+                  torch.int64 > torch.int32 > torch.int16 > torch.int8 > torch.bool
+
+        Args:
+            dtypes List[torch.dtype]: a list of dtypes
+
+        Returns:
+            the promoted dtype
+        """
+        if not all(dtype in DTypeInfo.priority for dtype in dtypes):
+            raise NotImplementedError(
+                f"Fail to promote dtypes because one dtype "
+                f"in {dtypes} doesn't appear in priority list.")
+        dtype = None
+        for dtype in DTypeInfo.priority:
+            if dtype in dtypes: break
+        return dtype

@@ -17,9 +17,10 @@ If an IRTensor is the output of Cell, then Cell.device == IRTensor.device
 from functools import lru_cache
 from typing import Iterable, List, Tuple, Union, Optional, Any
 import copy
+import torch
 
 from cube.ir.unique import IDGenerator
-from cube.ir.dtype import IRDType, dtype2byte_size
+from cube.ir.dtype import DTypeInfo
 
 
 class IRCell:
@@ -547,32 +548,28 @@ class IRTensor(IRObject):
 
     _meta = ['name', '_is_attr', '_is_grad', '_requires_grad', '_dtype']
 
-    def __init__(self, shape=None, name='tensor', dtype=IRDType.unknown, tid=None):
+    def __init__(self, shape=None, name='tensor', dtype=None, tid=None):
 
         super().__init__(name, tid)
         self._shape: Tuple[int] = () if shape is None else tuple(shape)
         self._cell: Optional[IRCell] = None
-        assert isinstance(dtype, IRDType), f'expect IRDType, get {dtype} with type {type(dtype)}'
-        self._dtype: IRDType = dtype
+        self._dtype: Optional[torch.dtype] = dtype
         # tensor gradient
         self._is_grad: bool = False
         self._requires_grad: bool = False
         self._grad: Optional[Union[IRTensor, float]] = None
 
     @property
-    def dtype(self) -> IRDType:
-        """
-        Tensor data type
-        """
+    def dtype(self) -> Optional[torch.dtype]:
+        """Tensor data type"""
         return self._dtype
 
     @dtype.setter
-    def dtype(self, val: IRDType):
-        """
-        Set data type
-        """
-        if not isinstance(val, IRDType):
-            raise TypeError(f"Expected IRDType but got {val}")
+    def dtype(self, val: Optional[torch.dtype]):
+        """Set data type"""
+        if not isinstance(val, torch.dtype):
+            raise NotImplementedError(
+                "Only support setting IRTensor with dtype of torch.dtype")
         self._dtype = val
         if isinstance(self._grad, IRTensor):
             self._grad._dtype = val
@@ -673,7 +670,7 @@ class IRTensor(IRObject):
         return cnt
 
     def byte_size(self) -> int:
-        return self.nelement() * dtype2byte_size(self.dtype)
+        return self.nelement() * DTypeInfo.get_byte_size(self.dtype)
 
     def backward(self) -> None:
         """

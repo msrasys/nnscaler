@@ -10,7 +10,6 @@ from collections.abc import Iterable
 
 from cube.ir.cten import IRTensor, IRObject
 from cube.ir.tensor import IRSubTensor, IRFullTensor
-from cube.ir.dtype import IRDType
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
 from cube.graph.function.conv import IRPad, IRConv2D, IRConv3D
@@ -153,8 +152,7 @@ def CubeArange(start: Union[int, IRObject], end: Union[int, IRObject], step: Uni
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), False)
     dimop = IRDimops(CubeArange, 'arange', signature, [anno], [], rules, **kwargs)
-    from cube.graph.parser.dtype import DType2IRDType
-    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    dimop.output(0).parent.dtype = dtype
     return dimop
 
 
@@ -189,8 +187,7 @@ def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requi
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
     dimop = IRDimops(Empty, 'empty', signature, [anno], [], rules, **kwargs)
-    from cube.graph.parser.dtype import DType2IRDType
-    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    dimop.output(0).parent.dtype = dtype
     return dimop
 
 
@@ -207,8 +204,7 @@ def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
     dimop = IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs)
-    from cube.graph.parser.dtype import DType2IRDType
-    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    dimop.output(0).parent.dtype = dtype
     return dimop
 
 
@@ -225,8 +221,7 @@ def Ones(size, *arg_size, out=None, dtype=None, layout=None,
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
     dimop = IRDimops(Ones, 'ones', signature, [anno], [], rules, **kwargs)
-    from cube.graph.parser.dtype import DType2IRDType
-    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    dimop.output(0).parent.dtype = dtype
     return dimop
 
 
@@ -244,8 +239,7 @@ def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requir
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
     dimop = IRDimops(Rand, 'rand', signature, [anno], [], rules, **kwargs)
-    from cube.graph.parser.dtype import DType2IRDType
-    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    dimop.output(0).parent.dtype = dtype
     return dimop
 
 
@@ -259,8 +253,7 @@ def NewTensor(data, *, dtype=None, device=None,
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(size, True)
     dimop = IRDimops(NewTensor, 'tensor', signature, [anno], [], rules, **kwargs)
-    from cube.graph.parser.dtype import DType2IRDType
-    dimop.output(0).parent.dtype = DType2IRDType.map(dtype)
+    dimop.output(0).parent.dtype = dtype
     return dimop
 
 
@@ -1608,13 +1601,13 @@ def _comparison(creator: Callable, f: Callable, name: str, signature: str,
         lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
         dimop = IRDimops(creator, name, signature, annos, [input, other])
-        dimop.output(0).parent.dtype = IRDType.boolean
+        dimop.output(0).parent.dtype = torch.bool
         return dimop
     # case2: torch.equal(tensor1, obj2) / torch.equal(obj1, tensor2)
     if isinstance(input, IRTensor) or isinstance(other, IRTensor):
         annos = ['*, ? -> *', '?, * -> *',]
         dimop = IRDimops(creator, name, signature, annos, [input, other])
-        dimop.output(0).parent.dtype = IRDType.boolean
+        dimop.output(0).parent.dtype = torch.bool
         return dimop
     # case3: torch.equal(obj1, obj2)
     else:
@@ -1713,11 +1706,10 @@ def To(tensor: IRTensor, dtype_or_device, *, out=None, signature = None):
     annos = ['* -> *']
     if isinstance(dtype_or_device, torch.device):
         return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype_or_device)
-    elif isinstance(dtype_or_device, (IRDType, torch.dtype)):
-        dtype = dtype_or_device if isinstance(dtype_or_device, torch.dtype) else eval('torch.'+dtype_or_device.value)
-        return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype)
-    elif isinstance(dtype_or_device, IRFullTensor):
-        dtype = eval('torch.'+dtype_or_device.dtype.value)
+    elif isinstance(dtype_or_device, torch.dtype):
+        return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype_or_device)
+    elif isinstance(dtype_or_device, IRTensor):
+        dtype = dtype_or_device.dtype
         return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype)
     else:
         raise RuntimeError(f'function.To with unknown arg: {dtype_or_device}')
@@ -1756,10 +1748,9 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
             shape = IRObject('shape', value=obj.shape)
             return IRPyFunc(signature, [instance, field], [shape])
         if name == 'dtype':
-            from cube.graph.parser.dtype import IRDType2TorchDType
             assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
             assert hasattr(obj, name), f"attr {name} is not existed in {obj}"
-            return IRDType2TorchDType.map(getattr(obj, name))
+            return getattr(obj, name)
         if name == 'device':
             assert isinstance(obj, IRFullTensor), f"type {type(obj)} is not supported"
             # FIXME: this is hack, IRFullTensor does not have attribute "device"
@@ -1773,9 +1764,9 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
     return IRPyFunc(signature, [instance, field], [IRObject()])
 
 
-def FInfo(dtype: IRDType, signature = None) -> torch.finfo:
-    assert isinstance(dtype, IRDType)
-    return torch.finfo(eval('torch.' + dtype.value))
+def FInfo(dtype: torch.dtype, signature = None) -> torch.finfo:
+    assert isinstance(dtype, torch.dtype)
+    return torch.finfo(dtype)
 
 
 def NLLLoss(input, target, weight=None, size_average=None,

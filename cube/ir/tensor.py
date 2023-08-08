@@ -24,10 +24,9 @@ can be
     3) gradient of parameters
 """
 
-from typing import List, Optional, Union, Tuple, NewType, Dict
+from typing import List, Optional, Union, Tuple, NewType, Dict, Any
 
 from cube.ir.cten import IRTensor
-from cube.ir.dtype import IRDType
 
 StartEnd = NewType('[start:end)', Tuple[int, int])
 IdxChunk = NewType('(index, chunks)', Tuple[int, int])
@@ -256,7 +255,7 @@ class IRFullTensor(IRTensor):
     the sequentail execution order by its graph.
     """
 
-    def __init__(self, shape=None, name='tensor', requires_grad=False, dtype=IRDType.unknown):
+    def __init__(self, shape=None, name='tensor', requires_grad=False, dtype=None):
 
         super().__init__(shape, name, dtype)
 
@@ -339,25 +338,6 @@ class IRFullTensor(IRTensor):
         else:
             self._requires_grad = False
             self._grad = None
-
-    @property
-    def dtype(self) -> IRDType:
-        """
-        Tensor data type
-        """
-        return self._dtype
-
-    @dtype.setter
-    def dtype(self, val: IRDType):
-        """
-        Set data type.
-        It's gradient data type will also be set.
-        """
-        if not isinstance(val, IRDType):
-            raise TypeError(f"Expected IRDType but got {val}")
-        self._dtype = val
-        if isinstance(self.grad, IRTensor):
-            self.grad.dtype = val
 
     def as_param(self):
         """
@@ -494,11 +474,11 @@ class IRSubTensor(IRTensor):
         return len(self.shape)
 
     @property
-    def dtype(self) -> IRDType:
+    def dtype(self) -> Any:
         return self.parent.dtype
 
     @dtype.setter
-    def dtype(self, val: IRDType):
+    def dtype(self, val):
         raise RuntimeError(
             f"IRSubTensor dtype must follow IRFullTensor dtype. "
             f"Please set it by subtensor.parent.dtype = {val}"

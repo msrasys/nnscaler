@@ -10,7 +10,6 @@ import torch
 
 from cube.ir.cten import IRTensor, IRObject, IRCell
 from cube.ir.operator import IRFwOperation
-from cube.graph.parser.dtype import IRDType2TorchDType
 from cube.graph.parser.register import CustomizedOps
 from cube.graph.segment import IRSegment
 from cube.graph.function.dimops import IRDimops
@@ -115,7 +114,7 @@ class CompProfiler:
         # create data
         def dummy_torch_tensor(tensor: IRTensor):
             """Generate dummy input tenosrs"""
-            dtype = IRDType2TorchDType.map(tensor.dtype)
+            dtype = tensor.dtype
             constructor = torch.zeros if dtype in (torch.int64, torch.int32, torch.bool) else torch.rand
             return constructor(tuple(tensor.shape), dtype=dtype, device=torch.cuda.current_device(), requires_grad=tensor.requires_grad)
 
@@ -208,7 +207,7 @@ class ProfileDataBase:
             latency, memory = e, e
         
         shapes = tuple(t.shape if isinstance(t, IRTensor) else None for t in node.inputs())
-        dtypes = tuple(IRDType2TorchDType.map(t.dtype) if isinstance(t, IRTensor) else None for t in node.inputs())
+        dtypes = tuple(t.dtype if isinstance(t, IRTensor) else None for t in node.inputs())
         error = f'{color}None{default}'
         print(
             f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} | train {train} => "
@@ -285,7 +284,7 @@ class ProfileDataBase:
         for t in node.inputs():
             if isinstance(t, IRTensor):
                 shapes.append(t.shape)
-                dtypes.append(IRDType2TorchDType.map(t.dtype))
+                dtypes.append(t.dtype)
             elif isinstance(t, IRObject):
                 raise RuntimeError('IRObject has not been supported in _serialize')
             else:

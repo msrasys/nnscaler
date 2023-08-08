@@ -8,7 +8,6 @@ from cube.ir.operator import IRFwOperation
 from cube.ir.tensor import IRFullTensor
 from cube.ir.cten import IRObject, IRCell
 from cube.graph.parser.frame import Frame
-from cube.graph.parser.dtype import DType2IRDType
 from cube.graph.parser.fx.mapping import SignFx2Op
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import IRDimops
@@ -126,7 +125,7 @@ class FxModuleParser:
                         shape = input.meta['tensor_meta'].shape
                         if len(shape) == 0:
                             shape = [1]
-                        dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
+                        dtype = input.meta['tensor_meta'].dtype
                         val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
                     else:
                         val = IRObject(input.name)
@@ -138,7 +137,7 @@ class FxModuleParser:
                 else:
                     # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
                     shape = None
-                dtype = DType2IRDType.map(input.meta['tensor_meta'].dtype)
+                dtype = input.meta['tensor_meta'].dtype
                 val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
             frame.add_var(input.name, val, graph_arg=idx)
 
@@ -153,7 +152,7 @@ class FxModuleParser:
             if isinstance(meta_out, TensorMetadata):
                 shape = meta_out.shape
                 assert shape == torch.Size([]), f'{meta_out}'
-                return IRFullTensor(shape=shape, requires_grad=meta_out.requires_grad, dtype=DType2IRDType.map(meta_out.dtype))
+                return IRFullTensor(shape=shape, requires_grad=meta_out.requires_grad, dtype=meta_out.dtype)
             elif isinstance(meta_out, dict):
                 ret = {}
                 for k, v in meta_out.items():
@@ -173,7 +172,7 @@ class FxModuleParser:
                     if isinstance(meta_out, TensorMetadata):
                         shape = meta_out.shape
                         shape = FxModuleParser.shape_refine(shape)
-                        dtype = DType2IRDType.map(meta_out.dtype)
+                        dtype = meta_out.dtype
                         requires_grad = meta_out.requires_grad
                         val = IRFullTensor(shape=shape, requires_grad=requires_grad, dtype=dtype, name=node.name)
                     else:
@@ -276,7 +275,7 @@ class FxModuleParser:
             assert len(kwargs) == 0
             # add var of weight and bias into frame
             shape = FxModuleParser.shape_refine(prim_module.weight.size())
-            dtype = DType2IRDType.map(prim_module.weight.dtype)
+            dtype = prim_module.weight.dtype
             requires_grad = prim_module.weight.requires_grad
             ir_weight_val = IRFullTensor(shape=shape, requires_grad=requires_grad, dtype=dtype, name=f'{node.name}_weight')
             ir_weight_val.as_param()
@@ -284,7 +283,7 @@ class FxModuleParser:
             frame.add_attr_content(ir_weight_val.tid, prim_module.weight)
             frame.add_attr_map(ir_weight_val.name, node.target+'.weight')
             shape = FxModuleParser.shape_refine(prim_module.bias.size())
-            dtype = DType2IRDType.map(prim_module.bias.dtype)
+            dtype = prim_module.bias.dtype
             requires_grad = prim_module.bias.requires_grad
             ir_bias_val = IRFullTensor(shape=shape, requires_grad=requires_grad, dtype=dtype, name=f'{node.name}_bias')
             ir_bias_val.as_param()
@@ -381,7 +380,7 @@ class FxModuleParser:
         tensor_name = node.name
         if 'tensor_meta' in node.meta:
             tensor_shape = node.meta['tensor_meta'].shape
-            dtype = DType2IRDType.map(node.meta['tensor_meta'].dtype)
+            dtype = node.meta['tensor_meta'].dtype
             requires_grad = node.meta['tensor_meta'].requires_grad
 
             # check if existing param

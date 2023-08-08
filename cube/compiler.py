@@ -11,7 +11,8 @@ from cube.ir.tensor import IRFullTensor
 from cube.ir.unique import IDGenerator
 from cube.graph.gener.gen import IRAdapterGener
 from cube.graph.graph import IRGraph
-from cube.graph.parser.dtype import DType2IRDType
+from cube.ir.cten import IRObject
+from cube.ir.tensor import IRFullTensor
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.schedule.schedplan import SchedulePlan
@@ -101,7 +102,7 @@ def compile(model: SemanticModel, *args,
             tensor = arg
             arg = IRFullTensor(arg.shape, name='tensor', 
                                requires_grad=True,
-                               dtype=DType2IRDType.map(arg.dtype)).tosub()
+                               dtype=arg.dtype).tosub()
             arg._value = tensor
             arg.grad = arg.parent.grad.tosub() if arg.requires_grad else None
         else:

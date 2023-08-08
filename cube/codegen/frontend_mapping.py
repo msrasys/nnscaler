@@ -5,7 +5,6 @@ from typing import Callable, Dict, List, Optional
 
 from cube import ir
 from cube.ir.cten import IRTensor
-from cube.ir.dtype import IRDType
 from cube.ir.operator import IRFwOperation
 
 import torch
@@ -105,24 +104,3 @@ Sign2EmitRule._sign2rule = {
     '_operator.getitem': Sign2EmitRule.emit_getitem,
 }
 
-
-class IRDType2DType:
-    """
-    The reverse mapping of DType2IRDType in /graph/parser/mapping.py
-    """
-    
-    @staticmethod
-    def map(ir_dtype:IRDType) -> torch.dtype:
-        return IRDType2DType._map[ir_dtype] # subscript/[]-access will throw if not found
-
-    _map = {
-        ir.float64: torch.float64,
-        ir.float32: torch.float32,
-        ir.float16: torch.float16,
-        ir.uint8:   torch.uint8,
-        ir.int8:    torch.int8,
-        ir.int16:   torch.int16,
-        ir.int32:   torch.int32,
-        ir.int64:   torch.int64,
-        ir.boolean: torch.bool
-    }

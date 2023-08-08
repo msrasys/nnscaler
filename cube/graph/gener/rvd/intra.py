@@ -3,8 +3,8 @@ from functools import partial
 import numpy as np
 import copy
 import logging
+import torch
 
-from cube.ir.dtype import IRDType
 from cube.ir.cten import IRCell
 from cube.ir.tensor import IRFullTensor, IRSubTensor
 
@@ -624,7 +624,7 @@ class IntraAutoPlacer:
         @return cost float: Cost of communication plan
         """
         src_placement = tuple(src_placement)
-        ftensor = IRFullTensor(shape, dtype=IRDType.float16)
+        ftensor = IRFullTensor(shape, dtype=torch.float16)
         cost_fn = IntraPathFinder.default_cost_fn if cost_fn is None else cost_fn
 
         # forward pass

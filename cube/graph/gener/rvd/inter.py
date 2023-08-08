@@ -4,7 +4,6 @@ import numpy as np
 import sys
 import copy
 
-from cube.ir.dtype import IRDType
 from cube.ir.tensor import IRFullTensor
 
 from cube.ir.adapter.prim import IRAdapterPrim

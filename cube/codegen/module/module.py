@@ -476,7 +476,7 @@ class ModuleCodeGen(FuncEmission):
                         code = sign.format(
                             name=ModuleCodeGen.tensor_name(itensor),
                             shape=tuple(itensor.shape),
-                            dtype=self.dtype_map(itensor.dtype)
+                            dtype=itensor.dtype
                         )
                         self.model_init_statements.append(code)
                         tid = itensor.parent.tid

@@ -2,7 +2,6 @@ from typing import Generator, Iterable, List, Any, Optional, Tuple
 import logging
 
 from cube.ir.cten import IRCell, IRTensor, IRObject
-from cube.ir.dtype import IRDType
 from cube.ir.tensor import IRSubTensor
 from cube.ir.operator import IRDataOperation, IRFwOperation
 from cube.ir.adapter import IRWeightReducer, IRAdapter
@@ -30,12 +29,6 @@ class CodeEmission:
     """
     Basic emission
     """
-
-    @staticmethod
-    def dtype_map(dtype: IRDType) -> str:
-        if not isinstance(dtype, IRDType):
-            raise TypeError("Expected IRDType")
-        return 'torch.' + dtype.value
 
     @staticmethod
     def node_name(node: IRCell) -> str:
