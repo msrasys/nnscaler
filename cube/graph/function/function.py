@@ -1705,7 +1705,8 @@ def To(tensor: IRTensor, dtype_or_device, *, out=None, signature = None):
     signature = 'cube.runtime.function.to'
     annos = ['* -> *']
     if isinstance(dtype_or_device, torch.device):
-        return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype_or_device)
+        # skip device movement as policy can determine device for the tensor.
+        return Identity(tensor)
     elif isinstance(dtype_or_device, torch.dtype):
         return IRDimops(To, 'to', signature, annos, [tensor], dtype_or_device=dtype_or_device)
     elif isinstance(dtype_or_device, IRTensor):
