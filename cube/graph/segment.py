@@ -943,11 +943,13 @@ class IRSegment(IRCell):
         ad_producers: Dict[Tuple[IRObject,int], Set[int]] = dict()
         for adapter in self.select(ntype=IRAdapter):
             for itensor in adapter.inputs():
-                if not isinstance(itensor, IRObject): continue
+                assert len(itensor.device) == 1
                 ad_consumers.setdefault((itensor, itensor.device[0]), set()).add(adapter.cid)
             for otensor in adapter.outputs():
-                if not isinstance(otensor, IRObject): continue
-                ad_producers.setdefault((otensor, otensor.device[0]), set()).add(adapter.cid)
+                assert len(otensor.device) == 1
+                # for identity adapters, we remove it from producer side
+                if (otensor, otensor.device[0]) not in ad_consumers:
+                    ad_producers.setdefault((otensor, otensor.device[0]), set()).add(adapter.cid)
 
         # tensor and its device match
         dmatch = lambda t1, t2: t1 == t2 and t1.device == t2.device
