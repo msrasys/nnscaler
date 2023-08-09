@@ -339,6 +339,9 @@ def parallelize(
         else:
             module = module_or_module_class
 
+        if any(isinstance(m, CubeModule) for m in module.modules()):
+            raise RuntimeError('CubeModule can not be nested.')
+
         # TODO: copy generated files to other nodes
         # Currently you must use a shared file system to share the generated files (like mounted Azure Blob)
         # Or you can manually copy the generated files to other nodes
