@@ -108,6 +108,7 @@ class SignFx2Op:
         'torch.functional.norm': function.Norm,
         __ftemplate('layer_norm'): function.LayerNorm,
         'apex.normalization.fused_layer_norm.FusedLayerNorm': function.FusedLayerNorm,
+        'apex.normalization.fused_layer_norm.FusedLayerNormAffineFunction.apply': function.FusedLayerNorm,
 
         # ============== runtime function =================
         __tttemplate('size'): function.Size,

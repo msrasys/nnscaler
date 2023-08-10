@@ -353,14 +353,14 @@ class ConcreteTracer(TracerBase):
             if kind == 'call_function':
                 assert isinstance(target, Callable)
                 fn = target
-                if _orig_getattr(fn, '__module__', None) != 'cube.graph.parser.concrete_trace_utils.concrete_tracer' \
+                if _orig_getattr(fn, '__module__', None) != self.__module__ \
                     and hasattr(fn, '__globals__'):
                     _autowrap_check(self, fn.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
                 return OperatorPatcherContext.patch_run(fn, *args, **kwargs)
             elif kind == 'call_method':
                 self_obj, *args_tail = args
                 fn = _orig_getattr(self_obj, target)
-                if _orig_getattr(fn, '__module__', None) != 'cube.graph.parser.concrete_trace_utils.concrete_tracer' \
+                if _orig_getattr(fn, '__module__', None) != self.__module__ \
                     and hasattr(fn, '__globals__'):
                     _autowrap_check(self, fn.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
                 result = fn(*args_tail, **kwargs)
@@ -369,7 +369,7 @@ class ConcreteTracer(TracerBase):
                 mod = self.fetch_attr(target)
                 if self.cpu_offload:
                     mod.cuda()  # how it works in ddp?
-                if _orig_getattr(mod, '__module__', None) != 'cube.graph.parser.concrete_trace_utils.concrete_tracer' \
+                if _orig_getattr(mod, '__module__', None) != self.__module__ \
                     and hasattr(mod, '__globals__'):
                     _autowrap_check(self, mod.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
                 result = OperatorPatcherContext.patch_run(mod, *args, **kwargs)
@@ -458,21 +458,22 @@ class ConcreteTracer(TracerBase):
 
         node = self.create_node(kind, target, args_, kwargs_, name, type_expr)
 
-        if self.record_frames:
-            # record code frame, include filename, line number, and function name
-            frame_record = FrameRecord(None, None, None, None)
-            cube_cct_path = str(Path(__file__).parent) + '/'  # the cube concrete tracer path
-            torch_path = str(Path(importlib.util.find_spec('torch').origin).parent) + '/'  # the torch path
-            ignore_dirs = [cube_cct_path, torch_path]
-            for frame in traceback.extract_stack()[-2::-1]:
-                if any(p in frame.filename for p in ignore_dirs):
-                    continue
-                frame_record.filename = frame.filename
-                frame_record.lineno = frame.lineno
-                frame_record.line = frame.line
-                frame_record.name = frame.name
-                break
-            node.meta['frame_record'] = frame_record
+        if self.record_frames and kind != 'placeholder':
+            with self.do_temp_disable(True, True, True):
+                # record code frame, include filename, line number, and function name
+                frame_record = FrameRecord(None, None, None, None)
+                cube_path = str(Path(importlib.util.find_spec('cube').origin).parent) + '/'  # the cube path
+                torch_path = str(Path(importlib.util.find_spec('torch').origin).parent) + '/'  # the torch path
+                ignore_dirs = [cube_path, torch_path]
+                for frame in traceback.extract_stack()[-2::-1]:
+                    if any(p in frame.filename for p in ignore_dirs):
+                        continue
+                    frame_record.filename = frame.filename
+                    frame_record.lineno = frame.lineno
+                    frame_record.line = frame.line
+                    frame_record.name = frame.name
+                    break
+                node.meta['frame_record'] = frame_record
 
         proxy = self.proxy(value_unwrapped, node)
         return proxy

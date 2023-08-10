@@ -1723,7 +1723,7 @@ def GetItem(a: Any, b: Any, signature = None) -> Union[Any, IRPyFunc]:
     # tensor slice
     if isinstance(obj, IRTensor):
         # note `None` will always
-        index = (index,) if isinstance(index, int) else tuple(index)
+        index = (index,) if isinstance(index, (int, slice)) else tuple(index)
         return FullSlice(obj, index)
     # object slice
     if isinstance(obj, IRObject):
