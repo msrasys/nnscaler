@@ -367,12 +367,6 @@ class ModuleCodeGen(FuncEmission):
                         for_block.insert_body(f'reducer.build_buckets()')
                     ib.insert_body('')
                     ib.insert_body(for_block.code)
-                else:
-                    # switch to training or inference mode
-                    if self.execplan.inference:
-                        ib.insert_body('self.eval()')
-                    else:
-                        ib.insert_body('self.train()')
             cb.insert_body('')
             cb.insert_body(ib.code)
             segment_idxs =[]

@@ -95,13 +95,9 @@ def compile(model: SemanticModel, *args,
             dataloader = arg
             arg = SemanticDataLoader(dataloader)
         elif isinstance(arg, torch.Tensor):
-            # note: we will always set tensor to require gradient, which may 
-            # generate backward communications in adapter. However, as long as 
-            # the data doesn't require gradient in real runtime, the backward
-            # communication will not be triggered.
             tensor = arg
             arg = IRFullTensor(arg.shape, name='tensor', 
-                               requires_grad=True,
+                               requires_grad=arg.requires_grad,
                                dtype=arg.dtype).tosub()
             arg._value = tensor
             arg.grad = arg.parent.grad.tosub() if arg.requires_grad else None
@@ -133,7 +129,6 @@ def compile(model: SemanticModel, *args,
             # run once to get model structure and tensor shape
             start = time.time()
             outputs = fn(*inputs)
-            Program().finalize()
             if outputs is None:
                 outputs = []
             elif not (isinstance(outputs, tuple) or isinstance(outputs, list)):
@@ -150,6 +145,7 @@ def compile(model: SemanticModel, *args,
             Program().set_input(pinputs)
             # setup program output
             Program().set_output(outputs)
+            Program().finalize()
             span = time.time() - start
             _logger.info('finish parsing iteration: {:.2f} s'.format(span))
 

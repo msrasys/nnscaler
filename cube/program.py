@@ -59,7 +59,9 @@ class Program:
         If the program doesn't do backward, set all tensors with requires_grad=False.
         """
         graph = self.get_graph()
+        # inference scenario, set all gradients to none.
         if not any(isinstance(node, IRBpOperation) for node in graph.nodes()):
+            # set gradients of activation tensors to none
             for ftensor in graph.full_tensors():
                 ftensor.requires_grad = False
 
