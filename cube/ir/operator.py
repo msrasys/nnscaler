@@ -202,13 +202,21 @@ class IRBpOperation(IRCell):
 
 
 class IRDataOperation(IRCell):
+    """Dataloader operator
+    
+    The output of a dataloader operator is a tuple of (IRObject,).
+    """
 
-    def __init__(self, data_num: int, batch_dims: Tuple[int], name='dataloader'):
-        if len(batch_dims) != data_num:
-            raise RuntimeError("Expected each output data has a specified batch dim")
-        signature = 'dataloader.__next__'
-        super().__init__(name, signature, 0, data_num)
-        self.batch_dims = tuple(batch_dims)
+    def __init__(self, input: IRObject, outputs: Tuple[IRObject], name='dataloader'):
+        signature = 'next'
+        super().__init__(name, signature, 1, len(outputs))
+        if not isinstance(input, IRObject):
+            raise TypeError(f"input should be an IRObject, but got {type(output)}")
+        self.set_input(0, input)
+        for idx, output in enumerate(outputs):
+            if not isinstance(output, IRObject):
+                raise TypeError(f"output should be an IRObject, but got {type(output)}")
+            self.set_output(idx, output)
 
     def replicate(self):
         """
@@ -229,38 +237,11 @@ class IRDataOperation(IRCell):
         cpy.clear_successor()
         return cpy
 
-    def get_batch_dims(self):
-        return copy.copy(self.batch_dims)
-
     def infer_shape(self):
         """
         Infer output value shape
         """
         return True
-
-    def algorithms(self, tag: Optional[str] = None) -> Union[Tuple[GenericDistAlgo], GenericDistAlgo]:
-        """
-        Get algorithm from algorithm factory
-
-        @param tag Optional[str]: the queried tag (default None for all)
-
-        @return algorithm(s) Union[Tuple[GenericDistAlgo], GenericDistAlgo]:
-            If None (default), return all possible algorithms.
-            Otherwise, return the specified one.
-        """
-        factory = DistAlgorithmFactory()
-        if tag is None:
-            templates = list()
-            if factory.exist(type(self)):
-                templates = factory.algorithms(type(self))
-            algos = list()
-            for template in templates:
-                algos.append(template(self))
-            return algos
-        else:
-            assert factory.exist(type(self), tag), f"Node {self} doesn't have transformation algorithm tag: {tag}"
-            template = factory.algorithms(type(self), tag)
-            return template(self)
     
     def __repr__(self):
         dscp = (f"DataLoader{self._id}-{self.device}(outputs={self.outputs()})")

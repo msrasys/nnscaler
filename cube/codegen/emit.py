@@ -130,7 +130,8 @@ class FuncEmission(CodeEmission):
 
     @staticmethod
     def emit_dataloader(node: IRDataOperation) -> List[str]:
-        return ['next(dataloader)']
+        outputs = FuncEmission.return_name(node.outputs())
+        return [f'{outputs} = next({FuncEmission.tensor_name(node.input(0))})']
     
     @staticmethod
     def emit_fnode(node: IRFwOperation, prefix_attr: str = None) -> List[str]:

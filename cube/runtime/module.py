@@ -21,7 +21,6 @@ class CubeModule(torch.nn.Module):
         super().__init__()
         self._reducers: List[Reducer] = list()
         self._fullmap : Dict[str, Tuple[int, Tuple[slice], int]] = dict()
-        self._batch_size: Optional[int] = None
 
     @property
     def reducers(self):
@@ -84,13 +83,6 @@ class CubeModule(torch.nn.Module):
 
     def get_full_map(self):
         return self._fullmap
-
-    def set_batch_size(self, bs: Optional[int]):
-        assert (bs is None) or (isinstance(bs, int) and bs > 0)
-        self._batch_size = bs
-
-    def get_batch_size(self) -> Optional[int]:
-        return self._batch_size
 
     def load_attr_content(self, filename: str):
         with torch.no_grad():

@@ -8,13 +8,13 @@ from cube.ir.operator import IRBpOperation, IRDataOperation
 from cube.graph import IRGraph
 from cube.graph import parser
 
-from cube.runtime.syndata import CubeDataLoader
 from cube.runtime.module import CubeModule
 from cube.runtime.device import DeviceGroup
 
 from cube.utils import load_model
 
 import torch
+import torch.utils.data as data
 
 
 class Program:
@@ -74,23 +74,18 @@ class Program:
 
 class SemanticDataLoader:
 
-    def __init__(self, dataloader: CubeDataLoader):
-        if not isinstance(dataloader, CubeDataLoader):
-            raise TypeError("Expected data loader derived from CubeDataLoader")
-        self.dataloader: CubeDataLoader = iter(dataloader)
+    def __init__(self, dataloader: data.DataLoader):
+        """
+        Create semantic dataloader which will produces IRDataOperation
+        when calling `next`.
 
-    def get_batch_dims(self) -> Tuple[Optional[int]]:
-        return tuple(self.dataloader.get_batch_dims())
-
-    def get_batch_size(self) -> int:
-        return self.dataloader.get_batch_size()
-
-    def set_batch_size(self, bs: int):
-        self.dataloader.set_batch_size(bs)
-        return
-
-    def get_runtime_sample(self):
-        return next(self.dataloader)
+        Args:
+            dataloader (torch.utils.data.DataLoader): torch dataloader
+        """
+        if not isinstance(dataloader, data.DataLoader):
+            raise TypeError("Expected data loader derived from torch.utils.data.DataLoader")
+        self.dataloader: data.DataLoader = iter(dataloader)
+        self.object = IRObject(name='dataloader', value=self.dataloader)
 
     def __iter__(self):
         return self
@@ -102,35 +97,18 @@ class SemanticDataLoader:
                 return tuple(generate_output(t) for t in sample)
             if isinstance(sample, list):
                 return list(generate_output(t) for t in sample)
-            if isinstance(sample, dict):
-                assert all(isinstance(key, (str, int)) for key in sample.keys())
-                return {key:generate_output(val) for key, val in sample.items()}
-            if isinstance(sample, set):
-                return {generate_output(t) for t in sample}
             if isinstance(sample, torch.Tensor):
                 tensor = IRFullTensor(list(sample.shape), 'data', dtype=sample.dtype).tosub()
                 tensor._value = sample
                 return tensor
-            else:
-                return IRObject('data', value=sample)
-
+            return IRObject('data', value=sample)
+        # get dataloader sample
         sample = next(self.dataloader)
+        # turn sample into IRObjects
         outputs = generate_output(sample)
-
-        # create dataloader
-        if isinstance(outputs, (tuple, list)):
-            data_num = len(outputs)
-        elif isinstance(outputs, dict):
-            data_num = len(outputs.keys())
-        else:
-            data_num = 1
-
-        data_op = IRDataOperation(data_num=data_num, batch_dims=self.get_batch_dims())
-        if not isinstance(outputs, tuple):
-            data_op.set_output(0, outputs)
-        else:
-            for idx, t in enumerate(outputs):
-                data_op.set_output(idx, t)
+        # create dataloader operation
+        outputs = outputs if isinstance(outputs, (tuple, list)) else (outputs,)
+        data_op = IRDataOperation(self.object, outputs)
         Program().add_node(data_op)
         return outputs
 

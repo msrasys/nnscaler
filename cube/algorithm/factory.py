@@ -59,9 +59,6 @@ class DistAlgorithmFactory:
 
     def _load_predefined_algos(self):
 
-        import cube.algorithm.ops.dataloader as dataloader
-        self.register(dataloader.IRDataOperation, dataloader.DPDataLoader, tag='data')
-
         import cube.algorithm.ops.dimops as dimops
         self.register(dimops.IRDimops, dimops.DimSplitEinops, tag='dim')
 

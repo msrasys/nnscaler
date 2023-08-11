@@ -24,7 +24,6 @@ from cube.execplan.planpass.grouping import Grouping
 from cube.codegen import ModuleCodeGen, ScheduleCodeGen
 
 from cube.runtime.device import DeviceGroup
-from cube.runtime.syndata import CubeDataLoader
 
 from cube.program import Program, SemanticDataLoader, SemanticModel
 from cube.flags import CompileFlag
@@ -86,14 +85,11 @@ def compile(model: SemanticModel, *args,
     model.save_content = load_content
     model.dynamic_shape = model_dynamic_shape
 
-    dataloader = None
     inputs = [model]
     for arg in args:
         assert not isinstance(arg, (torch.nn.Module, SemanticModel)), f"Only one model can be input for compile"
-        if isinstance(arg, (torch.utils.data.Dataset, CubeDataLoader)):
-            assert dataloader is None
-            dataloader = arg
-            arg = SemanticDataLoader(dataloader)
+        if isinstance(arg, torch.utils.data.DataLoader):
+            arg = SemanticDataLoader(arg)
         elif isinstance(arg, torch.Tensor):
             tensor = arg
             arg = IRFullTensor(arg.shape, name='tensor', 
@@ -112,8 +108,6 @@ def compile(model: SemanticModel, *args,
 
         if not override and os.path.exists(filename.format(myrank)):
             filename = filename.format(myrank)
-            # TODO: set batch size
-            _logger.warning('dataloader batch size stay as default.')
             # load module code
             _logger.info(f'loading existed module from {filename} ...')
             model.load_module(filename)
@@ -139,7 +133,7 @@ def compile(model: SemanticModel, *args,
                 if isinstance(input, SemanticModel):
                     pinputs.append('model')
                 elif isinstance(input, SemanticDataLoader):
-                    pinputs.append('dataloader')
+                    pinputs.append(input.object)
                 else:
                     pinputs.append(input)
             Program().set_input(pinputs)
@@ -253,23 +247,6 @@ def compile(model: SemanticModel, *args,
             torch.distributed.barrier()
 
         model.dummy_input = None
-        # set dataloder batch size (serialize output)
-        if dataloader is not None:
-            bs = model.get_gen_module().get_batch_size()
-            print_each_rank(f'setting batch size to: {bs}', logger=_logger)
-            if torch.distributed.is_initialized():
-                for rank in range(torch.distributed.get_world_size()):
-                    if rank == torch.distributed.get_rank():
-                        if bs is not None and dataloader is not None:
-                            dataloader.set_batch_size(bs)
-                    torch.distributed.barrier()
-            else:
-                if bs is not None and dataloader is not None:
-                    dataloader.set_batch_size(bs)
-        
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-
         # load temporal schedule
         print_each_rank(f'loading generated schedule from {filename} ...', logger=_logger)
         return cube.load_default_schedule(filename)

@@ -170,7 +170,7 @@ class ScheduleCodeGen(FuncEmission):
                 )
 
         elif isinstance(unwrap_node, IRDataOperation):
-            code = f'{outputs} = next(dataloader)'
+            code = ScheduleCodeGen.emit_dataloader(unwrap_node)[0]
 
         elif isinstance(unwrap_node, IRAdapter):
             code = asign.format(

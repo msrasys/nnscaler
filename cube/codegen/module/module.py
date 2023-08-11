@@ -329,7 +329,6 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRBpOperation):
                 continue
             elif isinstance(node, IRDataOperation):
-                self.init_batchsize(node)
                 continue
             else:
                 raise RuntimeError(f"Un-recognized IRCell type: {type(node)}")
@@ -528,21 +527,6 @@ class ModuleCodeGen(FuncEmission):
             self.model_init_statements.append(add_param_code)
         add_code = reducer_add.format(reducer=reducer_name)
         self.model_init_statements.append(add_code)
-
-    def init_batchsize(self, node: IRDataOperation):
-        """
-        Emit batch size declare
-        """
-        signature = 'self.set_batch_size({bs})'
-        bs = [t.shape[dim] for t, dim in zip(node.outputs(), node.get_batch_dims()) if dim is not None]
-        bs = set(bs)
-        if len(bs) > 1:
-            _logger.warning(f'Find Heterogenous batch size {bs}. Keep output to be same with semantic dataloder.')
-        bs = list(bs)[0] if len(bs) == 1 else None
-        assert self.batch_size is None or self.batch_size == bs, f"Not match for batch size: {self.batch_size} != {bs}"
-        self.model_init_statements.append(signature.format(bs=bs))
-        self.model_init_statements.append('')
-        self.batch_size = bs
 
     @staticmethod
     def emit_segment(segment: IRSegment) -> List[str]:
