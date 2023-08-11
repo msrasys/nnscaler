@@ -190,6 +190,13 @@ def rand(size: Tuple[int], dtype=None, requires_grad=False):
         requires_grad=requires_grad
     )
 
+def full(size: Tuple[int], fill_value, dtype=None, requires_grad=False):
+    return torch.full(
+        size, fill_value, dtype=dtype, requires_grad=requires_grad, 
+        device=torch.cuda.current_device()
+    )
+
+
 def arange(start: int, end: int, step: int, dtype: torch.dtype, requires_grad=False):
     return torch.arange(start=start, end=end, step=step, 
                         dtype=dtype, requires_grad=requires_grad,

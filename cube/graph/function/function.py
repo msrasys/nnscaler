@@ -243,6 +243,23 @@ def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requir
     return dimop
 
 
+def Full(size, fill_value, *, out=None, dtype=None, layout=None,
+         device=None, requires_grad=False, signature=None):
+    """
+    torch.full(size, fill_value, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False)
+    """
+    assert layout in (None, torch.strided), f"Not support for non-default layout"
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    signature = 'cube.runtime.function.full'
+    size = tuple(size)
+    anno, rules = _get_creator_anno_rules(
+        tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
+    dimop = IRDimops(Full, 'full', signature, [anno], [], rules,
+                     size=size, fill_value=fill_value, dtype=dtype, requires_grad=requires_grad)
+    dimop.output(0).parent.dtype = dtype
+    return dimop
+
+
 def NewTensor(data, *, dtype=None, device=None, 
               requires_grad=False, pin_memory=False, signature=None):
     # note: device is ignored
@@ -450,7 +467,7 @@ def Sqrt(input, *, out=None, signature=None):
     torch.sqrt(input, *, out=None)
     """
     assert out is None
-    if not isinstance(input, IRTensor):
+    if not isinstance(input, IRObject):
         return torch.sqrt(input)
     if not isinstance(input, IRTensor):
         iv = input.value if isinstance(input, IRObject) else input
@@ -458,6 +475,18 @@ def Sqrt(input, *, out=None, signature=None):
     shape = ShapeAnno.create_shape_str(input.shape)
     annos = [OpAnno.create_op_str([shape], [shape])]
     return IRDimops(Sqrt, 'sqrt', signature, annos, [input])
+
+
+def RSqrt(input, *, out=None, signature=None):
+    assert out is None
+    if not isinstance(input, IRObject):
+        return torch.rsqrt(input)
+    if not isinstance(input, IRTensor):
+        iv = input.value if isinstance(input, IRObject) else input
+        return IRPyFunc(signature, [input], [IRObject(name='rsqrt', value=torch.rsqrt(iv))])
+    shape = ShapeAnno.create_shape_str(input.shape)
+    annos = [OpAnno.create_op_str([shape], [shape])]
+    return IRDimops(RSqrt, 'rsqrt', signature, annos, [input])
 
 
 def FloorDiv(input, other, *, out=None, signature = None):
@@ -811,18 +840,23 @@ def Sum(input, dim=None, keepdim=False, *, dtype=None, signature = None):
 
 def Mean(input, dim=None, keepdim=False, *, dtype=None, signature = None):
     """
-    torch.mean(input, *, dtype=None) -> Tensor
-    torch.mean(input, dim, keepdim=False, *, dtype=None) -> Tensor
+    torch.mean(input, *, dtype=None)
+    torch.mean(input, dim=None, keepdim=False, *, dtype=None)
+    torch.Tensor.mean(input, dim=None, keepdim=False, *, dtype=None)
     """
     assert dtype is None
     einput = ShapeAnno.create_shape_str(input.shape)
     eoutput = copy.copy(einput)
-    dim = (dim,) if isinstance(dim, int) else dim
     if dim is not None:
-        sort_dim = sorted(dim)
-        for dimidx in sort_dim[::-1]:
-            eoutput.pop(dimidx)
-            einput[dimidx] = einput[dimidx] + '^'
+        dims = (dim,) if isinstance(dim, int) else tuple(dim)
+        dims = tuple(dim % len(input.shape) for dim in dims)
+        for dim in sorted(dims, reverse=True):
+            einput[dim] += '^'
+            if keepdim:
+                eoutput[dim] = '1'
+            else:
+                eoutput.pop(dim)
+        dim = dims
     else:
         eoutput = ['1']
         einput = [edim + '^' for edim in einput]

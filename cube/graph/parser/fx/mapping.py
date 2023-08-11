@@ -56,9 +56,11 @@ class SignFx2Op:
         __fcntemplate('linear'): function.Linear,
         __ftemplate('dropout') : function.Dropout,
         __ttemplate('sum'): function.Sum,
+        __ttemplate('mean') : function.Mean,
         __ttemplate('abs'): function.Abs,
         __ttemplate('exp'): function.Exp,
         __ttemplate('sqrt'): function.Sqrt,
+        __ttemplate('rsqrt'): function.RSqrt,
         __ttemplate('clamp'): function.Clamp,
         __ttemplate('clamp_min'): function.ClampMin,
         __ttemplate('squeeze'): function.Squeeze,
@@ -142,7 +144,7 @@ class SignFx2Op:
         __ttemplate('zeros'): function.Zeros,
         __ttemplate('ones'): function.Ones,
         __ttemplate('tensor'): function.NewTensor,
-        # __ttemplate('to'): function.ToTensor,
+        __ttemplate('full'): function.Full,
         __ttemplate('rand'): function.Rand,
         # __ttemplate('clone'): function.Clone,
 
@@ -178,10 +180,6 @@ class SignFx2Op:
         #
         __ttemplate('cos'): function.Cos,
         #
-        # __ttemplate('sum') : function.Sum,
-        # __ttemplate('mean') : function.Mean,
-        #
-        # __ttemplate('view'): function.View,
         __tttemplate('view'): function.View,
         __tttemplate('contiguous'): function.Contiguous,
         
