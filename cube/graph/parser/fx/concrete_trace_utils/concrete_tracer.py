@@ -385,6 +385,9 @@ class ConcreteTracer(TracerBase):
         with self.do_temp_disable(call=True):
             result = run(kind, target, args, kwargs)
             if self.cpu_offload:
+                # move back arguments to cpu if cpu_offload
+                args = tree_map(to_cpu, args)
+                kwargs = tree_map(to_cpu, kwargs)
                 if isinstance(result, torch.Tensor):
                     result = result.cpu()
                 elif isinstance(result, (list, dict, tuple)):
