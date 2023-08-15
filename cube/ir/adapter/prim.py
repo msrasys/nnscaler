@@ -181,7 +181,7 @@ class MovePrim(CommPrim):
         if len(kwargs) == 0:
             assert len(itensors) == 1 and len(otensors) == 1
             kwargs['shape'] = itensors[0].shape
-            kwargs['dtype'] = 'torch.' + itensors[0].dtype.value
+            kwargs['dtype'] = str(itensors[0].dtype)
             kwargs['src'] = itensors[0].device[0] if len(itensors[0].device) > 0 else None
             kwargs['dst'] = otensors[0].device[0] if len(otensors[0].device) > 0 else None
         shape, dtype, src, dst = kwargs['shape'], kwargs['dtype'], kwargs['src'], kwargs['dst']
@@ -223,7 +223,7 @@ class RDScatterPrim(CommPrim):
         if len(kwargs) == 0:
             assert len(itensors) == 1
             kwargs['shape'] = tuple(itensors[0].shape)
-            kwargs['dtype'] = 'torch.' + itensors[0].dtype.value
+            kwargs['dtype'] = str(itensors[0].dtype)
             kwargs['src'] = itensors[0].device[0] if len(itensors[0].device) > 0 else None
             kwargs['dsts'] = tuple(otensor.device[0] if len(otensor.device) > 0 else None for otensor in otensors)
         shape, dtype, src, dsts = kwargs['shape'], kwargs['dtype'], kwargs['src'], kwargs['dsts']
@@ -254,7 +254,7 @@ class RVScatterPrim(CollectivePrim):
         if len(kwargs) == 0:
             assert len(itensors) == 1
             kwargs['shape'] = tuple(itensors[0].shape)
-            kwargs['dtype'] = 'torch.' + itensors[0].dtype.value
+            kwargs['dtype'] = str(itensors[0].dtype)
             kwargs['src'] = itensors[0].device[0] if len(itensors[0].device) > 0 else None
             kwargs['dsts'] = tuple(otensor.device[0] if len(otensor.device) > 0 else None for otensor in otensors)
         shape, dtype, src, dsts = kwargs['shape'], kwargs['dtype'], kwargs['src'], kwargs['dsts']
@@ -279,7 +279,7 @@ class RDGatherPrim(CommPrim):
         if len(kwargs) == 0:
             assert len(otensors) == 1
             kwargs['shape'] = tuple(itensors[0].shape)  # the input tensor shape
-            kwargs['dtype'] = 'torch.' + itensors[0].dtype.value
+            kwargs['dtype'] = str(itensors[0].dtype)
             kwargs['srcs'] = tuple(itensor.device[0] if len(itensor.device) > 0 else None for itensor in itensors)
             kwargs['dst'] = otensors[0].device[0] if len(otensors[0].device) > 0 else None
         shape, dtype, srcs, dst = kwargs['shape'], kwargs['dtype'], kwargs['srcs'], kwargs['dst']
@@ -304,7 +304,7 @@ class RVGatherPrim(CollectivePrim):
         if len(kwargs) == 0:
             assert len(otensors) == 1
             kwargs['shape'] = tuple(itensors[0].shape)
-            kwargs['dtype'] = 'torch.' + itensors[0].dtype.value
+            kwargs['dtype'] = str(itensors[0].dtype)
             kwargs['srcs'] = tuple(otensor.device[0] if len(otensor.device) > 0 else None for otensor in otensors)
             kwargs['dst'] = otensors[0].device[0] if len(otensors[0].device) > 0 else None
         shape, dtype, srcs, dst = kwargs['shape'], kwargs['dtype'], kwargs['srcs'], kwargs['dst']
@@ -328,7 +328,7 @@ class BroadcastPrim(CollectivePrim):
         if len(kwargs) == 0:
             assert len(itensors) == 1
             kwargs['shape'] = tuple(itensors[0].shape)
-            kwargs['dtype'] = 'torch.' + itensors[0].dtype.value
+            kwargs['dtype'] = str(itensors[0].dtype)
             kwargs['src'] = itensors[0].device[0] if len(itensors[0].device) > 0 else None
         super().__init__(itensors, otensors, **kwargs)
         self.signature = 'cube.runtime.adapter.broadcast'
