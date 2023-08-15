@@ -4,11 +4,12 @@
 import builtins
 from dataclasses import dataclass
 import operator
-from typing import Any, Callable, Type
+from typing import Any, Callable, Set, Type
 import functools
 
 import torch
 from torch.fx import Node
+from torch.fx.node import _side_effectful_functions
 
 # These need to run in global scope to handle nested calls correctly
 _orig_module_call: Callable = torch.nn.Module.__call__
@@ -128,13 +129,13 @@ class FrameRecord:
             return ''
 
 class ExtraSEFPatcher:
-    from torch.fx.node import _side_effectful_functions
-    # some side effectful functions that should not be deleted during dead code elimination
-    # there may be more than listed here
-    extra_funcs = {operator.setitem, builtins.next} - _side_effectful_functions
+    def __init__(self, extra_side_effectful_functions: Set[Callable]):
+        self.extra_side_effectful_functions = extra_side_effectful_functions
+        self.incontext_funcs = set()
 
     def __enter__(self):
-        self._side_effectful_functions.update(self.extra_funcs)
+        self.incontext_funcs = self.extra_side_effectful_functions - _side_effectful_functions
+        _side_effectful_functions.update(self.incontext_funcs)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._side_effectful_functions.difference_update(self.extra_funcs)
+        _side_effectful_functions.difference_update(self.incontext_funcs)

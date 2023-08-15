@@ -1,7 +1,8 @@
-from typing import Any, Dict, Optional, List, Union
+import inspect
 import logging
 from pathlib import Path
-import os
+from typing import Any, Dict, Union
+
 
 from cube.ir.tensor import IRFullTensor
 from cube.graph.parser.register import CustomizedOps
@@ -10,6 +11,8 @@ from cube.flags import CompileFlag
 
 from cube.graph.parser.fx.parser import FxModuleParser
 from cube.graph.parser.fx.concrete_trace_utils import concrete_trace
+
+import cube.runtime.function as cube_rt_function
 
 import torch
 import torch.fx
@@ -36,6 +39,11 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     # get registered leaf function
     autowrap_funcs = [CustomizedOps.kOpRuntime.get(sign, None) for sign in CustomizedOps.kOpAutowrap]
     leaf_functions = {func: ([], True, None) for func in autowrap_funcs if func is not None}
+    
+    # get cube runtime functions
+    cube_rt_funcs = [func for _, func in inspect.getmembers(cube_rt_function, inspect.isfunction)]
+    leaf_functions.update({func: ([], True, None) for func in cube_rt_funcs})
+    dce_ignored_funcs = set(cube_rt_funcs)
 
     if HAS_APEX:
         leaf_module = (
@@ -57,6 +65,7 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
         use_operator_patch=True,
         leaf_module=leaf_module,
         autowrap_leaf_function=leaf_functions,
+        dce_ignored_function=dce_ignored_funcs,
         cpu_offload=True,
         record_frames=not CompileFlag.disable_code_line_info,
     )

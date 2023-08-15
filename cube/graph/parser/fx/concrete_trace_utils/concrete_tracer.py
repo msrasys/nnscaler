@@ -15,7 +15,7 @@ import traceback
 import importlib.util
 
 from itertools import chain
-from types import BuiltinMethodType, FunctionType, MethodDescriptorType, MethodType, MethodWrapperType, ModuleType
+from types import FunctionType, MethodDescriptorType, MethodType, MethodWrapperType, ModuleType
 from typing import Any, Dict, Iterable, Iterator, Optional, Set, Tuple, Type, List, Callable, Union
 from contextlib import contextmanager
 from pathlib import Path
@@ -127,20 +127,8 @@ from .utils import (
     _orig_max,
 
     _orig_node_is_impure,
-
-    FrameRecord,
 )
-
-# some side effectful functions that should not be deleted during dead code elimination
-# there may be more than listed here
-extra_side_effectful_functions = {
-    operator.setitem,
-    builtins.next,
-    _orig_torch_no_grad,
-    _orig_torch_no_grad_enter,
-    _orig_torch_no_grad_exit,
-}
-_side_effectful_functions = _side_effectful_functions.union(extra_side_effectful_functions)
+from .utils import FrameRecord, ExtraSEFPatcher
 
 # pyright: reportGeneralTypeIssues=false
 _logger = logging.getLogger(__name__)
@@ -1558,11 +1546,12 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
                    autowrap_leaf_function = None,
                    autowrap_leaf_class = None,
                    leaf_module: Tuple | None = None,
-                   fake_middle_class = None,
-                   dce = True,
-                   cpu_offload = False,
-                   trace_twice = False,
-                   record_frames = False,
+                   fake_middle_class: Tuple | None = None,
+                   dce: bool = True,
+                   dce_ignored_function: Set[Callable] | None = None,
+                   cpu_offload: bool = False,
+                   trace_twice: bool = False,
+                   record_frames: bool = False,
                    ) -> GraphModule:
     """
     Concrete tracing API
@@ -1687,18 +1676,23 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
                 is_iterator_class: Is the class init from an iterator. Only 'tuple', 'list', 'set' or 'dict' needs to set it to True.
 
         dce (bool): If set to True, dead code eliminatation will be applied on the graph.
-                
+
+        dce_ignored_function (Set[Callable]): The node that its target in this set will not be removed from the graph during dce.
+
         cpu_offload (bool): Whether to offload the module to CPU during tracing. If set to True, the traced code will be executed on GPU,
             but is offloaded to CPU afterward. This is useful for reducing memory usage during tracing, but may cause performance issues.
             If set to False, there will be no offloading during tracing, but the traced code will be executed on default device.
 
         trace_twice (bool): If set to True, a second trace will be performed, and the two obtained graphs will be checked for consistency.
 
-        record_frames(bool): If set to True, will add frame information to node.meta['frame_record']. Note this will cost additional trace time.
+        record_frames (bool): If set to True, will add frame information to node.meta['frame_record']. Note this will cost additional trace time.
 
     Returns:
         fx.GraphModule: a Module created from the recorded operations from ``root``.
     """
+    dce_ignored_function = dce_ignored_function if isinstance(dce_ignored_function, set) else set()
+    assert all(callable(ignore_func) for ignore_func in dce_ignored_function)
+
     tracer = ConcreteTracer(cpu_offload = cpu_offload, record_frames = record_frames)
     is_training = root.training
     root.eval()
@@ -1745,7 +1739,17 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
         traced = GraphModule(tracer.root, graph, name)
 
         if dce:
-            with _Patcher() as patcher:
+            # some side effectful functions that should not be deleted during dead code elimination
+            # there may be more than listed here
+            default_extra_side_effectful_functions = {
+                operator.setitem,
+                builtins.next,
+                _orig_torch_no_grad,
+                _orig_torch_no_grad_enter,
+                _orig_torch_no_grad_exit,
+            }
+            extra_side_effectful_functions = default_extra_side_effectful_functions | dce_ignored_function
+            with _Patcher() as patcher, ExtraSEFPatcher(extra_side_effectful_functions):
                 patcher.patch_method(Node, 'is_impure', node_is_impure_wrapper, deduplicate=False)
                 traced.graph.eliminate_dead_code()
             traced.recompile()  # this need to be done in MagicMethodPatcher context
