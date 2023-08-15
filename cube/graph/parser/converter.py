@@ -1,4 +1,3 @@
-import inspect
 import logging
 from pathlib import Path
 from typing import Any, Dict, Union
@@ -39,9 +38,9 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     # get registered leaf function
     autowrap_funcs = [CustomizedOps.kOpRuntime.get(sign, None) for sign in CustomizedOps.kOpAutowrap]
     leaf_functions = {func: ([], True, None) for func in autowrap_funcs if func is not None}
-    
+
     # get cube runtime functions
-    cube_rt_funcs = [func for _, func in inspect.getmembers(cube_rt_function, inspect.isfunction)]
+    cube_rt_funcs = [cube_rt_function.anchor]
     leaf_functions.update({func: ([], True, None) for func in cube_rt_funcs})
     dce_ignored_funcs = set(cube_rt_funcs)
 
