@@ -231,8 +231,10 @@ class Bucket:
         """
         assert self._zero, "gathering paramters is only for zero optimization."
         rank = torch.distributed.get_rank(group=self._zero_subgroup)
-        shards = list(self._contiguous_params.chunk(self._zgroup_sz, dim=0))
-        torch.distributed.all_gather(shards, shards[rank], group=self._zero_subgroup)
+        CudaTimer().start(field_name='comm', predefined=True)
+        src_tensor = self._contiguous_params.chunk(self._zgroup_sz, dim=0)[rank]
+        torch.distributed.all_gather_into_tensor(self._contiguous_params, src_tensor, group=self._zero_subgroup)
+        CudaTimer().stop(field_name='comm', predefined=True)
 
     def register_pre_hook(self, fn: Callable):
         """Register pre hooks to be applied before gradient synchronization.

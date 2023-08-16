@@ -56,6 +56,22 @@ def _alltoall(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) ->
     return otensor
 
 
+def _alltoallsingle(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -> torch.Tensor:
+    CudaTimer().start(field_name='comm', predefined=True)
+    if odim != 0:
+        itensor = itensor.transpose(0, odim)
+    if not itensor.is_contiguous():
+        itensor = itensor.contiguous()
+    group = DeviceGroup().get_group(ranks)
+    otensor = torch.empty_like(itensor)
+    torch.distributed.all_to_all_single(otensor, itensor, group=group)
+    if odim != 0:
+        otensor = otensor.transpose(0, odim)
+    otensor = torch.concat(tuple(otensor.chunk(len(ranks), dim=odim)), dim=idim)
+    CudaTimer().stop(field_name='comm', predefined=True)
+    return otensor
+
+
 def _chunk(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
     """
     split dimension in n chunks and take idx-th chunk
@@ -224,9 +240,26 @@ class AllToAllAllToAll(torch.autograd.Function):
         return grad, None, None, None
 
 
+class AllToAllAllToAllSingle(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]):
+        ctx._ranks = ranks
+        ctx._idim = idim
+        ctx._odim = odim
+        return _alltoallsingle(itensor, idim, odim, ranks)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        ranks = ctx._ranks
+        idim, odim = ctx._idim, ctx._odim
+        grad = _alltoallsingle(grad, odim, idim, ranks)
+        return grad, None, None, None
+
+
 @torch.jit.ignore
 def alltoall_alltoall(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -> torch.Tensor:
-    return AllToAllAllToAll.apply(itensor, idim, odim, ranks)
+    return AllToAllAllToAllSingle.apply(itensor, idim, odim, ranks)
 
 
 class ReduceBroadcast(torch.autograd.Function):
