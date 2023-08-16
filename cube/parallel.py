@@ -294,12 +294,17 @@ def parallelize(
     cube_savedir: Union[str, Path] = './.cube',
     override: bool = False,
     instance_name: Optional[str] = None,
-) -> Union[CubeModule, Type[CubeModule]]:
+    load_module: bool = True,
+) -> Union[None, CubeModule, Type[CubeModule]]:
     """
     Convert a torch.nn.Module object or class to CubeModule object or class.
 
     If you want to save multiple instances of the same module,
     you can specify the instance_name to distingish them.
+
+    Currently you must use a shared file system to share the generated files (like mounted Azure Blob)
+    Or you can unset load_module flag, and manually copy the generated files to other nodes.
+    After all nodes have the generated files, you can call parallelize() again with load_module flag set.
 
     Args:
         module_or_module_class (Union[torch.nn.Module, Type[torch.nn.Module]]): the module or module class to be compiled
@@ -310,24 +315,25 @@ def parallelize(
         override (bool): If true, source code will be regenerated even if generated code exists.
         cube_savedir (Union[str, Path]): the directory to save generated code
         instance_name (Optional[str]): the instance name of the generated module.
+        load_module (bool): whether to load the generated module after done.
 
     Returns:
-        Union[CubeModule, Type[CubeModule]]: the converted CubeModule object or class
+        Union[CubeModule, Type[CubeModule], None]:
+            if load_module flag is set, return the converted CubeModule object or class
+            if load_module flag is not set, return None
     """
     if (
         isinstance(module_or_module_class, CubeModule) or
         (inspect.isclass(module_or_module_class) and issubclass(module_or_module_class, CubeModule))
     ):
-        return module_or_module_class
+        return module_or_module_class if load_module else None
 
-    if not torch.distributed.is_initialized(): # we only support distributed training
-        raise RuntimeError("Distributed training is not initialized.")
-
-    rank = torch.distributed.get_rank()
     is_module_class = inspect.isclass(module_or_module_class)
     module_class = module_or_module_class if is_module_class else module_or_module_class.__class__
 
-    if rank == 0:
+    # genereate code only in node0
+    # if it is not in a torchrun environment, just generate.
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         if is_module_class:
             # it should only have 1 `self` parameter
             if len(inspect.signature(module_or_module_class.__init__).parameters) > 1:
@@ -342,9 +348,6 @@ def parallelize(
         if any(isinstance(m, CubeModule) for m in module.modules()):
             raise RuntimeError('CubeModule can not be nested.')
 
-        # TODO: copy generated files to other nodes
-        # Currently you must use a shared file system to share the generated files (like mounted Azure Blob)
-        # Or you can manually copy the generated files to other nodes
         _gencode(
             module,
             dummy_input,
@@ -357,10 +360,14 @@ def parallelize(
         )
         if is_module_class:
             del module
-    torch.distributed.barrier()
-    cube_module_class = _load_cube_module_class(
-        module_class,
-        cube_savedir=cube_savedir,
-        instance_name=instance_name,
-    )
-    return cube_module_class if is_module_class else cube_module_class()
+
+    if load_module:
+        if not torch.distributed.is_initialized(): # we only support distributed training
+            raise RuntimeError("Load CubeModule failed: torch.distributed is not initialized.")
+        torch.distributed.barrier()
+        cube_module_class = _load_cube_module_class(
+            module_class,
+            cube_savedir=cube_savedir,
+            instance_name=instance_name,
+        )
+        return cube_module_class if is_module_class else cube_module_class()
