@@ -107,8 +107,8 @@ class SemanticDataLoader:
         # turn sample into IRObjects
         outputs = generate_output(sample)
         # create dataloader operation
-        outputs = outputs if isinstance(outputs, (tuple, list)) else (outputs,)
-        data_op = IRDataOperation(self.object, outputs)
+        node_outputs = outputs if isinstance(outputs, (tuple, list)) else (outputs,)
+        data_op = IRDataOperation(self.object, node_outputs)
         Program().add_node(data_op)
         return outputs
 
