@@ -1,7 +1,9 @@
 """
+Note this is not for test.
+
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=1 \
-    tests/adapter/test_intra_rvd.py
+    unit_test/graph/gener/test_intra_rvd.py
 """
 
 from typing import List, Tuple

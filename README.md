@@ -115,6 +115,12 @@ Please note tox will reuse the same virtual environment which is initialized by 
 tox -r
 ```
 
+To run a single unit test task during development, you can run
+
+```
+pytest unit_tests/your_test_file.py
+```
+
 ### Run unit tests in vscode
 
 VS Code has a great support to unit tests. You can run/debug every tests easily in VS Code. Please refer to this document to set up your environment https://code.visualstudio.com/docs/python/testing

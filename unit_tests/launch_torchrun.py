@@ -1,7 +1,13 @@
+from typing import Callable
 import uuid
 import torch
+import logging
+import time
+import random
 
 from torch.distributed.run import elastic_launch, LaunchConfig
+
+_logger = logging.getLogger(__name__)
 
 
 def launch_torchrun(nproc_per_node, worker_fn, *args, **kwargs):
@@ -17,6 +23,32 @@ def launch_torchrun(nproc_per_node, worker_fn, *args, **kwargs):
     )
     outputs = elastic_launch(launch_config, worker_fn)(*args, **kwargs)
     return outputs
+
+
+def torchrun(nproc_per_node: int, test_fn: Callable, *args, **kwargs):
+    """Test utility for torchrun
+    
+    Example usage:
+
+    ```python
+    from functools import partial
+    test_function_name = partial(torchrun, 2, function_to_test)
+    ```
+
+    Args:
+        nproc_per_node (int): number of gpus
+        test_fn (function): test function, which should return None
+        *args: args for worker_fn
+        **kwargs: kwargs for worker_fn
+
+    Returns:
+        None
+    """
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < nproc_per_node:
+        _logger.warning(f"skip test on {nproc_per_node} gpus due to lack of cuda devices")
+        return
+    launch_torchrun(nproc_per_node, test_fn, *args, **kwargs)
 
 
 def clone_to_cpu(tensor: torch.Tensor):

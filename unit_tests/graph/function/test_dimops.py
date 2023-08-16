@@ -1,18 +1,13 @@
 """
-python tests/algorithm/test_op_algorithm.py
-pytest tests/algorithm/test_op_algorithm.py
+pytest unit_tests/graph/function/test_dimops.py
 """
 
 from typing import Callable, Tuple, List
 from functools import partial
 
-import cube
 import cube.graph.function as F
 from cube.graph.function.dimops import IRDimops
 from cube.ir.tensor import IRFullTensor
-
-
-Shape=Tuple[int]
 
 
 def create_op(creator: Callable,
@@ -49,8 +44,3 @@ test_multi_dim_partition = partial(partitionable,
     create_op(create_udf_op1, [(2048, 8, 4096), (2048, 4096)]),
     idx=0, dim=0, num=2,
 )
-
-if __name__ == '__main__':
-    test_view1()
-    test_view2()
-    test_multi_dim_partition()

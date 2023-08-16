@@ -1,9 +1,12 @@
 """
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=8 \
-    --nnodes=1 \
-    tests/test_rvd_prim.py --prims all
+    utility/test_rvd_prim.py --prims allreduce
 
+OMP_NUM_THREADS=4 torchrun \
+    --nnode=2 --node_rank=$NODE_RANK --master_addr=node-0 \
+    --nproc_per_node=8 \
+    utility/test_rvd_prim.py --prims all
 """
 
 from typing import Callable
@@ -110,7 +113,7 @@ if __name__ == '__main__':
     args.prims = args.prims[0]
 
     prims, bws = [], []
-    if 'allrecuce' in args.prims or 'all' in args.prims:
+    if 'allreduce' in args.prims or 'all' in args.prims:
         prims.append(prim_allreduce)
         bws.append(bw_allreduce)
     if 'allgather' in args.prims or 'all' in args.prims:

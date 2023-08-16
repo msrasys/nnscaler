@@ -96,15 +96,10 @@ def PASData(graph: IRGraph, env_resource: ComputeConfig):
         if len(graph.consumers(ftensor)) > 1:
             graph.multiref(ftensor, [[n] for n in graph.consumers(ftensor)])
 
-    batch_dim = None
-    for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            algo = node.algorithms('data')
-            sub_nodes = graph.partition(node, algo, num=ngpus)
-            for idx, subnode in enumerate(sub_nodes):
-                graph.assign(subnode, idx)
-            batch_dim = node.get_batch_dims()[0]
-    if batch_dim is None: batch_dim = 0
+    batch_dim = 0
+    for dl in graph.select(ntype=IRDataOperation):
+        _replica(dl, list(range(ngpus)))
+
     graph_inputs = IRSegment.get_objects_from_complex(graph.inputs())
     graph_outputs = IRSegment.get_objects_from_complex(graph.outputs())
     for node in graph.nodes():
