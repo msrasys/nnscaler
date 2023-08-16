@@ -128,7 +128,7 @@ class FxModuleParser:
                         dtype = input.meta['tensor_meta'].dtype
                         val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
                     else:
-                        val = IRObject(input.name)
+                        val = IRObject(input.name, value=dummy_inputs[input.name])
             else:
                 # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding,
                 # extend to other input types
