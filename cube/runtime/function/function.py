@@ -1,17 +1,6 @@
 from typing import Optional, List, Tuple, Union
 import torch
 import torch.nn.functional as TorchF
-import logging
-
-
-_logger = logging.getLogger(__name__)
-
-
-# TODO: move to registered function
-try:
-    from apex.normalization.fused_layer_norm import fused_layer_norm_affine
-except:
-    _logger.warning('skip apex ops as it is not installed.')
 
 
 def identity(tensor: torch.Tensor) -> torch.Tensor:
@@ -136,12 +125,6 @@ def layer_norm(input: torch.Tensor,
     LayerNorm
     """
     return torch.nn.functional.layer_norm(input, normalized_shape, weight, bias, eps)
-
-
-def fused_layer_norm(input: torch.Tensor,
-               weight: torch.Tensor, bias: torch.Tensor,
-               normalized_shape: List[int], eps: float = 1e-05) -> torch.Tensor:
-    return fused_layer_norm_affine(input, weight, bias, normalized_shape, eps)
 
 
 # 'torch.select_scatter' isn't supported by Torch2ONNX yet.

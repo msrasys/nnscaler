@@ -279,7 +279,10 @@ class ConcreteAttrProxy(ConcreteProxy):
         self.attr = attr
         self.tracer = root.tracer
         self._node: Optional[Node] = None
-        self.value = _orig_getattr(root.value, attr)
+        if _orig_isinstance(root.value, torch.Tensor) and attr == 'is_cuda' and self.tracer.cpu_offload:
+            self.value = True
+        else:
+            self.value = _orig_getattr(root.value, attr)
 
     def __repr__(self) -> str:
         calling_frame_name = inspect.stack()[1][1]

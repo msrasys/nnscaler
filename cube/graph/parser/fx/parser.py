@@ -264,43 +264,8 @@ class FxModuleParser:
     @staticmethod
     def parse_prim_module(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRFwOperation]:
         prim_module = FxModuleParser.fetch_attr(module, node.target)
-        input_vals = [get_complex_data(val, frame) for val in node.args]
-        kwargs = {key: get_complex_data(val, frame) for key, val in node.kwargs.items()}
         if prim_module.__class__.__module__.startswith('torch.nn.modules'):
-            assert False, 'torch.nn.modules can not be parsed as leaf nodes'
-        elif prim_module.__class__.__module__ == 'apex.normalization.fused_layer_norm':
-            fsig = '{}.{}'.format(prim_module.__class__.__module__, prim_module.__class__.__name__)
-            assert prim_module.elementwise_affine is True
-            assert SignFx2Op.exist(fsig)
-            assert len(kwargs) == 0
-            # add var of weight and bias into frame
-            shape = FxModuleParser.shape_refine(prim_module.weight.size())
-            dtype = prim_module.weight.dtype
-            requires_grad = prim_module.weight.requires_grad
-            ir_weight_val = IRFullTensor(shape=shape, requires_grad=requires_grad, dtype=dtype, name=f'{node.name}_weight')
-            ir_weight_val.as_param()
-            frame.add_var(ir_weight_val.name, ir_weight_val)
-            frame.add_attr_content(ir_weight_val.tid, prim_module.weight)
-            frame.add_attr_map(ir_weight_val.name, node.target+'.weight')
-            shape = FxModuleParser.shape_refine(prim_module.bias.size())
-            dtype = prim_module.bias.dtype
-            requires_grad = prim_module.bias.requires_grad
-            ir_bias_val = IRFullTensor(shape=shape, requires_grad=requires_grad, dtype=dtype, name=f'{node.name}_bias')
-            ir_bias_val.as_param()
-            frame.add_var(ir_bias_val.name, ir_bias_val)
-            frame.add_attr_content(ir_bias_val.tid, prim_module.bias)
-            frame.add_attr_map(ir_bias_val.name, node.target+'.bias')
-            input_vals.extend([ir_weight_val, ir_bias_val])
-            kwargs.update({'normalized_shape': prim_module.normalized_shape, 'eps': prim_module.eps})
-            ir_node = SignFx2Op.map(fsig)(*input_vals, **kwargs)
-            assert isinstance(ir_node, IRCell)
-            assert len(ir_node.outputs()) == 1
-            output_val = frame.get_var(node.name)
-            ir_node.set_output(0, output_val)
-            comment = str(node.meta.get('frame_record', ''))
-            if comment:
-                ir_node.comment = comment
-            return [ir_node]
+            raise RuntimeError(f'{prim_module.__class__.__module__} can not be parsed as leaf nodes')
         else:
             raise RuntimeError(f'unknown module: {prim_module.__class__.__module__}')
 

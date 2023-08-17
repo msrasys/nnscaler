@@ -1,7 +1,6 @@
+from typing import Any, Dict, Union
 import logging
 from pathlib import Path
-from typing import Any, Dict, Union
-
 
 from cube.ir.tensor import IRFullTensor
 from cube.graph.parser.register import CustomizedOps
@@ -17,12 +16,6 @@ import torch
 import torch.fx
 
 _logger = logging.getLogger(__name__)
-
-try:
-    import apex
-    HAS_APEX = True
-except:
-    HAS_APEX = False
 
 
 def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
@@ -44,25 +37,10 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     leaf_functions.update({func: ([(cube_rt_function, func.__name__)], True, None) for func in cube_rt_funcs})
     dce_ignored_funcs = set(cube_rt_funcs)
 
-    if HAS_APEX:
-        leaf_module = (
-            # torch.nn.Dropout, #torch.nn.Dropout1d, torch.nn.Dropout2d, torch.nn.Dropout3d,
-            apex.normalization.FusedLayerNorm,
-            # NOTE: the following modules also have different behavior depending on self.training. but currently in used.
-            # torch.nn.AlphaDropout, torch.nn.FeatureAlphaDropout,
-            # torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d,
-            # torch.nn.LazyBatchNorm1d, torch.nn.LazyBatchNorm2d, torch.nn.LazyBatchNorm3d, torch.nn.SyncBatchNorm,
-            # torch.nn.InstanceNorm1d, torch.nn.InstanceNorm2d, torch.nn.InstanceNorm3d,
-            # torch.nn.LazyInstanceNorm1d, torch.nn.LazyInstanceNorm2d, torch.nn.LazyInstanceNorm3d,
-            )
-    else:
-        _logger.warning('apex package is not installed')
-        leaf_module = None
     traced_model = concrete_trace(
         model,
         dummy_input,
         use_operator_patch=True,
-        leaf_module=leaf_module,
         autowrap_leaf_function=leaf_functions,
         dce_ignored_function=dce_ignored_funcs,
         cpu_offload=True,
