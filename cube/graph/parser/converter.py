@@ -41,7 +41,7 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
 
     # get cube runtime functions
     cube_rt_funcs = [cube_rt_function.anchor]
-    leaf_functions.update({func: ([], True, None) for func in cube_rt_funcs})
+    leaf_functions.update({func: ([(cube_rt_function, func.__name__)], True, None) for func in cube_rt_funcs})
     dce_ignored_funcs = set(cube_rt_funcs)
 
     if HAS_APEX:

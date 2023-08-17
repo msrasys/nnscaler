@@ -127,16 +127,7 @@ class SignFx2Op:
         'torch.mm': function.Matmul,
         __ttemplate('matmul'): function.Matmul,
         #
-        # __ftemplate('gelu') : function.GeLU,
-        # __ttemplate('gelu') : function.GeLU,
-        #
-        # __ftemplate('silu') : function.SiLU,
-        # __ttemplate('silu') : function.SiLU,
-        #
         # __ftemplate('_pad'): function.Pad,
-        #
-        # __ftemplate('embedding'): function.Embedding,
-        #
         __ftemplate('cross_entropy'): function.CrossEntropy,
         #
         # # creators
@@ -199,31 +190,20 @@ class SignFx2Op:
         # __ttemplate('select_scatter'): function.SelectScatter,
         #
         __tttemplate('repeat'): function.Repeat,
-        #
-        # #pytorch1.11
-        # __ttemplate('linear'): function.Linear,
-        #
         __ttemplate('cat'): function.Cat,
-        
         __ttemplate('stack'): function.Stack,
-        #
         __ttemplate('chunk'): function.Chunk,
-        
         __ttemplate('flatten'): function.Flatten,
-        #
         # __ttemplate('roll'): function.Roll,
         #
         # __ttemplate('adaptive_avg_pool1d'): function.AdaptiveAvgPool1d,
         #
-        # # runtime functions
-        # __rtemplate('anchor'): function.GraphAnchor,
-        #
-        # __rtemplate('identity'): function.Identity,
-        #
-        # __rtemplate('multiref'): function.MultiRef,
-        #
-        # __rtemplate('accum'): function.Accum,
-        #
+        # runtime functions
+        __rtemplate('anchor'): function.GraphAnchor,
+        __rtemplate('identity'): function.Identity,
+        __rtemplate('multiref'): function.MultiRef,
+        __rtemplate('accum'): function.Accum,
+
         # #einops
         # __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
 
