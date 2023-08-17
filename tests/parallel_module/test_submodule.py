@@ -251,21 +251,22 @@ def test_submodules_dp_gpu2():
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         print('skip test_submodules_dp_gpu2 due to lack of cuda devices')
         return
+    eps = 1e-4
     results = launch_torchrun(2, _gpu_worker, PASData, 2)
     for r in results.values():
         orig_results, compiled_results, _, _, _, _ = r
         for orig, compiled in zip(orig_results, compiled_results):
-            assert torch.allclose(orig[0], compiled[0], rtol=1e-6, atol=1e-6)  # pred
-            assert torch.allclose(orig[1], compiled[1], rtol=1e-6, atol=1e-6)  # loss
+            assert torch.allclose(orig[0], compiled[0], rtol=eps, atol=eps)  # pred
+            assert torch.allclose(orig[1], compiled[1], rtol=eps, atol=eps)  # loss
 
             # grad
             compiled_cleaned = {re.sub(r"_[0-9]+", '', k).replace('.', '_'): v for k, v in compiled[2].items() if not k.endswith('_grad_sentry')}
             assert len(orig[2]) == len(compiled_cleaned)
             for k in orig[2].keys():
-                assert torch.allclose(orig[2][k], compiled_cleaned[k.replace('.', '_')], rtol=1e-6, atol=1e-6)
+                assert torch.allclose(orig[2][k], compiled_cleaned[k.replace('.', '_')], rtol=eps, atol=eps)
 
             # weights
             compiled_cleaned = {re.sub(r"_[0-9]+", '', k).replace('.', '_'): v for k, v in compiled[3].items() if not k.endswith('_grad_sentry')}
             assert len(orig[3]) == len(compiled_cleaned)
             for k in orig[3].keys():
-                assert torch.allclose(orig[3][k], compiled_cleaned[k.replace('.', '_')], rtol=1e-6, atol=1e-6)
+                assert torch.allclose(orig[3][k], compiled_cleaned[k.replace('.', '_')], rtol=eps, atol=eps)

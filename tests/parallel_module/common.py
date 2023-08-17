@@ -57,8 +57,8 @@ def PASRandomSPMD(graph: IRGraph, env_resource: ComputeConfig):
         # workaround for now
         # will fix later.
         if any(output in graph_outputs for output in node.outputs()) \
-            or any(input in graph_outputs for input in node.inputs()) \
-            or any(input in graph_inputs for input in node.inputs()):
+            or any(input in graph_outputs for input in node.inputs()):
+            # or any(input in graph_inputs for input in node.inputs()):
             _replica(graph, node, devs)
             continue
         if isinstance(node, IRDimops):
@@ -109,8 +109,8 @@ def PASData(graph: IRGraph, env_resource: ComputeConfig):
             # workaround for now
             # will fix later.
             if any(output in graph_outputs for output in node.outputs()) \
-                or any(input in graph_outputs for input in node.inputs()) \
-                or any(input in graph_inputs for input in node.inputs()):
+                or any(input in graph_outputs for input in node.inputs()):
+                # or any(input in graph_inputs for input in node.inputs()):
                 sub_nodes = graph.replicate(node, ngpus)
             else:
                 try:
