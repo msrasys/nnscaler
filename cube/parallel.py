@@ -159,8 +159,7 @@ def _gencode(
     program.clear()
     IDGenerator().clear()
 
-    module = module.to(device=torch.device("cpu"))
-    module.train()
+    module.cpu()
 
     # generate fx graph
     dummy_input = _complex(dummy_input)
@@ -257,7 +256,7 @@ def _load_cube_module_class(
     *,
     cube_savedir: Union[str, Path] = './.cube',
     instance_name: Optional[str] = None,
-):
+) -> Type[ParallelModule]:
     """
     Load the generated cube module class.
 
@@ -305,6 +304,10 @@ def parallelize(
     Currently you must use a shared file system to share the generated files (like mounted Azure Blob)
     Or you can unset load_module flag, and manually copy the generated files to other nodes.
     After all nodes have the generated files, you can call parallelize() again with load_module flag set.
+
+    if the input is a module object.
+        The module object will be copied to cpu to handle possible insufficient gpu memory.
+        The training flag will be the same as the original module
 
     Args:
         module_or_module_class (Union[torch.nn.Module, Type[torch.nn.Module]]): the module or module class to be compiled
@@ -362,7 +365,7 @@ def parallelize(
             del module
 
     if load_module:
-        if not torch.distributed.is_initialized(): # we only support distributed training
+        if not torch.distributed.is_initialized(): # we only support loading in torchrun environment
             raise RuntimeError("Load CubeModule failed: torch.distributed is not initialized.")
         torch.distributed.barrier()
         cube_module_class = _load_cube_module_class(
@@ -370,4 +373,9 @@ def parallelize(
             cube_savedir=cube_savedir,
             instance_name=instance_name,
         )
-        return cube_module_class if is_module_class else cube_module_class()
+        if is_module_class:
+            return cube_module_class
+        else:
+            cube_module = cube_module_class()
+            cube_module.train(module_or_module_class.training)  # set training state to the same as original module
+            return cube_module

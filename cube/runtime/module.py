@@ -372,6 +372,9 @@ class _AddGradModule(torch.nn.Module):
         super().__init__()
 
     def forward(self, *args):
+        if not self.training:
+            return args
+
         new_args = []
         found_tensor = False
         for arg in args:
@@ -407,11 +410,13 @@ class ParallelModule(CubeModule):
         self._grad_sentry.grad = torch.tensor([self._EPSILON])
 
     def forward(self, *args, **kwargs):
-        if self._grad_sentry.grad is None or self._grad_sentry.grad.item() == 0:
-            self.zero_grad()
-            self._grad_sentry.grad = torch.tensor([self._EPSILON])
-
-        new_args = self._add_grad_module(*args)
+        if self.training:
+            if self._grad_sentry.grad is None or self._grad_sentry.grad.item() == 0:
+                self.zero_grad()
+                self._grad_sentry.grad = torch.tensor([self._EPSILON])
+            new_args = self._add_grad_module(*args)
+        else:
+            new_args = args
         return self._forward_impl(*new_args, **kwargs)
 
     def _forward_impl(self, *args, **kwargs):

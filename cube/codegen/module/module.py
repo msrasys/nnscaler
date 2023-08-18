@@ -359,12 +359,12 @@ class ModuleCodeGen(FuncEmission):
             with FunctionBlock(func_name='__init__', args=['self']) as ib:
                 ib.insert_body(self.model_init_statements)
                 if as_parallel_module:
+                    ib.insert_body('')
                     ib.insert_body(f'self.load_attr_content(Path(__file__).with_name("{FxModuleParser.ATTR_CONTENT_FILE}"))')
                     ib.insert_body(f'self.load_dist_param_map(Path(__file__).with_name("{FxModuleParser.ATTR_MAP_FILE}"))')
                     ib.insert_body('')
                     with ForBlock('reducer', f'self.reducers') as for_block:
                         for_block.insert_body(f'reducer.build_buckets()')
-                    ib.insert_body('')
                     ib.insert_body(for_block.code)
             cb.insert_body('')
             cb.insert_body(ib.code)
