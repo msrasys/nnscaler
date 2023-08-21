@@ -136,10 +136,12 @@ def _gencode(
         expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.plan_ngpus)]
         expected_output_files.append(outdir / FxModuleParser.ATTR_CONTENT_FILE)
         expected_output_files.append(outdir / FxModuleParser.ATTR_MAP_FILE)
+        expected_output_files.append(outdir / ParallelModule.COMPUTE_CONFIG_FILE)
         existing_output_files = [f for f in outdir.glob('*') if f.is_file()]
         if existing_output_files:
             if all([output_file.exists() for output_file in expected_output_files]) \
-                and len(existing_output_files) == len(expected_output_files):
+                and len(existing_output_files) == len(expected_output_files) \
+                and torch.load(outdir / ParallelModule.COMPUTE_CONFIG_FILE) == compute_config:
                 return
             else:
                 raise RuntimeError(f'Output directory {outdir} is not empty. '
@@ -243,6 +245,7 @@ def _gencode(
         execplan = Grouping.apply(execplan)
 
     # code generation
+    torch.save(compute_config, outdir / ParallelModule.COMPUTE_CONFIG_FILE)
     runtime_ngpus = None if compute_config.plan_ngpus == compute_config.runtime_ngpus else compute_config.runtime_ngpus
     assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
     mgener = ModuleCodeGen(execplan, scale_ndevs=runtime_ngpus)

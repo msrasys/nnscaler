@@ -2,8 +2,10 @@ from typing import List, Dict, Tuple, Optional
 import logging
 import os
 import sys
+from pathlib import Path
 
 import torch
+from cube.graph.parser.fx.parser import FxModuleParser
 
 from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.reducer import Reducer
@@ -393,9 +395,13 @@ class _AddGradModule(torch.nn.Module):
 
 class ParallelModule(CubeModule):
     _EPSILON = 1e-7  # A small constant that can be represented by fp16
+    COMPUTE_CONFIG_FILE = 'compute_config.pt'
+
     def __init__(self):
+        if self.__class__  == ParallelModule:  # not init via super().__init__()
+            raise RuntimeError(f"ParallelModule should not be initialized directly. Please derive it first")
+
         super().__init__()
-        self._dist_param_map = None  # should fill in sub classes.
 
         # register_full_backward_pre_hook requires the input tensor to be requires_grad
         # so we add a module to make sure the input tensor requires grad
@@ -408,6 +414,15 @@ class ParallelModule(CubeModule):
         # And it will add an extra parameter to the module
         self._grad_sentry = torch.nn.Parameter(torch.tensor([0.0], requires_grad=True))
         self._grad_sentry.grad = torch.tensor([self._EPSILON])
+
+    def _post_init(self):
+        module_file = Path(sys.modules[self.__module__].__file__)
+        self.load_attr_content(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE}"))
+        self._dist_param_map = torch.load(module_file.with_name(f"{FxModuleParser.ATTR_MAP_FILE}"))
+        self._compute_config = torch.load(module_file.with_name(f"{self.COMPUTE_CONFIG_FILE}"))
+
+        for reducer in self.reducers:
+            reducer.build_buckets()
 
     def forward(self, *args, **kwargs):
         if self.training:
@@ -435,5 +450,5 @@ class ParallelModule(CubeModule):
     def get_dist_param_map(self):
         return self._dist_param_map
 
-    def load_dist_param_map(self, filename: str):
-        self._dist_param_map = torch.load(filename)
+    def get_compute_config(self):
+        return self._compute_config
