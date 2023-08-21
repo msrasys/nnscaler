@@ -11,7 +11,7 @@ import numpy as np
 from cube.parallel import ComputeConfig, parallelize
 from cube.runtime.module import ParallelModule
 
-from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed
+from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 
 
@@ -111,21 +111,18 @@ def _train(model):
 
 def _gpu_worker(pas, ngpus):
     init_distributed()
-    tempdir = Path(tempfile.gettempdir()) / 'cube_test'
-    if torch.distributed.get_rank() == 0 and tempdir.exists():
-        shutil.rmtree(tempdir)
-    torch.distributed.barrier()
-    orig_module, compiled_module = _create_modules(pas, ComputeConfig(ngpus, ngpus), tempdir)
-    orig_results = _train(orig_module)
-    compiled_results = _train(compiled_module)
-    return (
-        orig_results,
-        compiled_results,
-        compiled_module.fc_relu1.get_full_map(),
-        compiled_module.fc_relu1.get_dist_param_map(),
-        compiled_module.fc_relu2.get_full_map(),
-        compiled_module.fc_relu2.get_dist_param_map(),
-    )
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test') as tempdir:
+        orig_module, compiled_module = _create_modules(pas, ComputeConfig(ngpus, ngpus), tempdir)
+        orig_results = _train(orig_module)
+        compiled_results = _train(compiled_module)
+        return (
+            orig_results,
+            compiled_results,
+            compiled_module.fc_relu1.get_full_map(),
+            compiled_module.fc_relu1.get_dist_param_map(),
+            compiled_module.fc_relu2.get_full_map(),
+            compiled_module.fc_relu2.get_dist_param_map(),
+        )
 
 
 def test_submodules_tp_gpu1():

@@ -1,7 +1,9 @@
 from datetime import datetime
 import math
 import random
+import shutil
 from typing import List, Optional
+import contextlib
 
 import torch
 from torch import nn
@@ -165,3 +167,13 @@ def init_random():
     torch.manual_seed(1)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1)
+
+
+
+@contextlib.contextmanager
+def clear_dir_on_rank0(tempdir):
+    if torch.distributed.get_rank() == 0 and tempdir.exists():
+        shutil.rmtree(tempdir)
+    yield tempdir
+    if torch.distributed.get_rank() == 0 and tempdir.exists():
+        shutil.rmtree(tempdir)

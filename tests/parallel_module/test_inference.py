@@ -6,7 +6,7 @@ from torch import nn
 
 from cube.parallel import ComputeConfig, parallelize
 
-from .common import CubeLinear, init_distributed, init_random, PASRandomSPMD
+from .common import CubeLinear, init_distributed, init_random, PASRandomSPMD, clear_dir_on_rank0
 from ..launch_torchrun import torchrun
 
 
@@ -57,24 +57,20 @@ def _inference_worker(ngpus):
     init_distributed()
     init_random()
 
-    tempdir = Path(tempfile.gettempdir()) / 'cube_inference_test'
-    if torch.distributed.get_rank() == 0 and tempdir.exists():
-        shutil.rmtree(tempdir)
-    torch.distributed.barrier()
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_inference_test') as tempdir:
+        model = Module()
+        model.eval()
+        cube_model = _to_cube_model(model, PASRandomSPMD, ComputeConfig(ngpus, ngpus), tempdir, 'test_inference')
 
-    model = Module()
-    model.eval()
-    cube_model = _to_cube_model(model, PASRandomSPMD, ComputeConfig(ngpus, ngpus), tempdir, 'test_inference')
+        data = torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])
+        assert not model.training
+        assert not cube_model.training
+        model.cuda()
 
-    data = torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])
-    assert not model.training
-    assert not cube_model.training
-    model.cuda()
-
-    with torch.inference_mode():
-        result = model(data)
-        cube_result = cube_model(data)
-        assert torch.allclose(result, cube_result, atol=1e-4)
+        with torch.inference_mode():
+            result = model(data)
+            cube_result = cube_model(data)
+            assert torch.allclose(result, cube_result, atol=1e-4)
 
 def test_inference1():
     torchrun(1, _inference_worker, 1)

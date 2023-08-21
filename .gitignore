@@ -14,3 +14,4 @@ benchmark/deepspeed/Megatron-DeepSpeed
 
 gencode*.py
 fullmodel.pt
+dist_param_map.pt
