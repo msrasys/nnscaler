@@ -148,17 +148,7 @@ class CompProfiler:
             return ret
 
         if node.signature in CustomizedOps.kOpCodeDef:
-            dep_code_impl = ''
-            for dep_name in get_dep_names(node.signature):
-                dep_code_impl = dep_code_impl + CustomizedOps.kOpCodeDef[dep_name]
             code_impl: str = CustomizedOps.kOpCodeDef[node.signature]
-            def_end = code_impl.find(':\n')
-            assert def_end >= 0
-            prev_code_lines = code_impl[:def_end+2]
-            succ_code_lines = code_impl[def_end+2:]
-            for line in dep_code_impl.split('\n'):
-                prev_code_lines = prev_code_lines + '    ' + line + '\n'
-            code_impl = prev_code_lines + succ_code_lines
             local = {}
             exec(code_impl, globals(), local)
             fn = list(local.values())[0]

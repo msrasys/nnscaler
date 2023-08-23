@@ -1,54 +1,47 @@
 """
-example:
-
-OMP_NUM_THREADS=4 torchrun \
+PYTHONPATH=.:$PYTHONPATH torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/mlp/train.py --policy PASMegatron
+    examples/mlp/train.py --policy PASMegatronTP
 """
 
 import torch
 from torch import nn
+from functools import partial
 
 import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
+from cube.runtime.utils import create_dummy_dataloader
 
-import examples.mlp.policy.spmd as spmd
-import examples.mlp.policy.mpmd as mpmd
+import examples.mlp.policy.gallery as gallery
+from examples.utils import get_policy
 
 import argparse
 
 parser = argparse.ArgumentParser(description='MLP example')
-parser.add_argument('--policy', type=str, help='PAS policy choice, starting with "PAS"')
+parser.add_argument('--policy', type=str, help='policy choice, starting with "PAS"')
+parser.add_argument('--dim', type=int, default=1024, help='model hidden size')
+parser.add_argument('--layers', type=int, default=16, help='number of linear layers')
+parser.add_argument('--gbs', type=int, default=64, help='global batch size')
+parser.add_argument('--mbs', type=int, default=64, help='micro batch size')
+parser.add_argument('--tp-size', type=int, default=2, help='tensor parallelism size only for Megatron policy')
 args = parser.parse_args()
 
 cube.init()
 
-# set up policy
-PAS = None
-policies = list(spmd.__dict__.keys()) + list(mpmd.__dict__.keys())
-if args.policy in spmd.__dict__:
-    PAS = spmd.__dict__[args.policy]
-    print_each_rank(f'using policy from spmd.{args.policy}')
-elif args.policy in mpmd.__dict__:
-    PAS = mpmd.__dict__[args.policy]
-    print_each_rank(f'using policy from mpmd.{args.policy}')
-else:
-    raise ValueError(f"policy {args.policy} not found. Candidates: {policies}")
-
+# get policy
+policy = get_policy([gallery], args.policy)
+policy = partial(policy, nmicros=args.gbs//args.mbs, tp_size=args.tp_size)
 
 # =================== Semantic Model Description ====================
 
 class MLP(nn.Module):
-    def __init__(self, dim, mult=1, nlayers=4):
+    def __init__(self, dim: int, nlayers: int):
         super().__init__()
         self.layers = torch.nn.ModuleList([])
-        for lid in range(nlayers):
-            if lid % 2 == 0:
-                self.layers.append(nn.Linear(dim, dim * mult, bias=False))
-            else:
-                self.layers.append(nn.Linear(dim * mult, dim, bias=False))
+        for _ in range(nlayers):
+            self.layers.append(nn.Linear(dim, dim, bias=False))
 
     def forward(self, data):
         x = data
@@ -58,64 +51,42 @@ class MLP(nn.Module):
         return loss
 
 
-class MLPDataLoader(cube.runtime.syndata.CubeDataLoader):
-
-    def __init__(self, bs: int, dim: int):
-        super().__init__(bs, [0])
-        self.sample = None
-        self.dim = dim
-        self.set_batch_size(bs)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.sample
-    
-    def set_batch_size(self, batch_size: int):
-        self.batch_size = batch_size
-        self.sample = torch.rand(
-            [batch_size, self.dim], dtype=torch.float32,
-            device=torch.cuda.current_device()
-        )
-
-
 def train():
-    batch_size = 128
-    dim = 4096
 
-    model = MLP(dim=dim)
-    model = cube.SemanticModel(model)
-    dataloader = MLPDataLoader(batch_size, dim)
+    model = MLP(dim=args.dim, nlayers=args.layers)
+    dataloader = create_dummy_dataloader(
+        torch.randn(args.dim, device=torch.cuda.current_device()),
+        args.mbs,
+    )
 
-    @cube.compile(model, dataloader, PAS=PAS)
+    # compile a training iteration
+    @cube.compile(model, dataloader, PAS=policy)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
         loss.backward()
-    model = model.get_gen_module()
+    # load generated model
+    model = cube.utils.load_model()
     
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
     CudaTimer(enable=False).warmup()
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    iter_num = 16
-    warmup = 4
+    dataloader = iter(dataloader)
+    iter_num, warmup = 5, 2
     for step in range(iter_num):
-        if step >= warmup:
+        if step == warmup:
             CudaTimer(enable=True).start('e2e')
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
-        if step >= warmup:
-            CudaTimer().stop('e2e')
-        if (step + 1) % 20 == 0:
+        if (step + 1) % 2 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
+    CudaTimer().stop('e2e')
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
           CudaTimer().duration(iter_num-warmup, field_name='e2e')))
     CudaTimer().print_all(times=iter_num-warmup)
 
 
-train()
+if __name__ == '__main__':
+    train()

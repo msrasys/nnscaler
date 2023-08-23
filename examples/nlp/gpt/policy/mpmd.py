@@ -1,87 +1,20 @@
-from typing import List, Tuple
-import numpy as np
-
+"""GPT policy gallery for MPMD Parallelism"""
 from cube.graph import IRGraph
 from cube.graph.segment import IRSegment
-from cube.graph.function.anchor import IRGraphAnchor
-from cube.ir.cten import IRCell
 from cube.ir.operator import IRDataOperation, IRFwOperation
-from cube.graph.schedule.sched1f1b import IRSchedule1F1B
-from cube.graph.schedule.schedinfer import IRScheduleInfer
+from cube.graph.schedule.predefined import PredefinedSched
+
+from examples.utils import create_mesh, tensor_parallelism, replica, group_to_layers
 
 
-def _create_mesh(ngpus: int, group_num: Tuple[int]) -> Tuple[Tuple[Tuple[int]]]:
-    """
-    Create hybrid (nested) groups given the each group number.
-
-    The product of group_num should be same with total devices.
-
-    e.g., 6 device to 2 x 3 mesh will results [dim][group_id] = tuple[int]:
-        ( 
-            ( (0,1,2), (3,4,5) ),
-            ( (0,3), (2,5), (3,6) ),
-        )
-    """
-    group_num = np.array(group_num)
-    cnt = np.prod(group_num)
-    assert cnt == ngpus, 'total device not match'
-    grid = np.arange(cnt).reshape(tuple(group_num))
-    dims = list(range(len(group_num)))
-    outputs = []
-    for dim, num in enumerate(group_num):
-        remain = ngpus // num
-        order = tuple(dims[:dim] + dims[dim+1:] + [dim])
-        grid_dim = np.transpose(grid, order).reshape((remain,num))
-        grid_dim = grid_dim.tolist()
-        outputs.append(tuple(tuple(ranks) for ranks in grid_dim))
-    assert len(outputs) == len(group_num)
-    return tuple(outputs)
-
-
-def _group_to_transformers(fnodes) -> List[List[IRCell]]:
-    # group to transformer layers
-    transformers: List[List[IRFwOperation]] = []
-    anchors = [node for node in fnodes if isinstance(node, IRGraphAnchor)]
-    indices = [fnodes.index(anchor) for anchor in anchors]
-    for lid, idx in enumerate(indices):
-        fnodes[idx+1].comment = f'===> start of transformer layer {lid}'
-        start = idx if lid != 0 else 0
-        end = indices[lid+1] if lid + 1 < len(anchors) else len(fnodes)
-        transformers.append(fnodes[start:end])
-    for lid in range(len(transformers) - 1):
-        if transformers[lid][-1].name == 'multiref':
-            node = transformers[lid].pop()
-            transformers[lid+1].insert(0, node)
-    return transformers
-
-# ========================= parallelisms =================================
-
-# tensor parallelism
-def _tp(graph: IRGraph, node: IRFwOperation, devs: List[int], **configs):
-    algo = node.algorithms('dim')
-    sub_nodes = graph.partition(node, algo, **configs)
-    assert sub_nodes is not None
-    for devid, sub_node in zip(devs, sub_nodes):
-        graph.assign(sub_node, devid)
-    return sub_nodes
-
-# replicate
-def _replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):
-    sub_nodes = graph.replicate(node, times=len(devs))
-    for devid, sub_node in zip(devs, sub_nodes):
-        graph.assign(sub_node, devid)
-    return sub_nodes
-
-# ========================= parallelisms =================================
-
-def PASRoundRobin(graph: IRGraph, resource):
+def PASRoundRobin(graph: IRGraph, resource, **kwargs):
     """
     roundrobin scheduling
     """
     fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
     
     # group to transformer layers
-    transformers = _group_to_transformers(fnodes)
+    transformers = group_to_layers(fnodes)
     
     for lid, transformer in enumerate(transformers):
         stage_id = lid % resource.ngpus
@@ -96,16 +29,15 @@ def PASRoundRobin(graph: IRGraph, resource):
     return graph
 
 
-def PAS1F1B(graph: IRGraph, resource):
-    """
-    1F1B scheduling
-    """
+def PAS1F1B(graph: IRGraph, resource, nmicros: int = 16, **kwargs):
+    """1F1B schedule"""
     num_stages = resource.ngpus
-    num_microbatch = 16
+    num_microbatch = nmicros
 
     # group to transformer layers
     fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
-    transformers = _group_to_transformers(fnodes)
+    transformers = group_to_layers(fnodes)
+    assert len(transformers) >= num_stages
 
     # staging
     fstages = [[] for _ in range(num_stages)]
@@ -125,57 +57,23 @@ def PAS1F1B(graph: IRGraph, resource):
         if isinstance(node, IRDataOperation):
             graph.assign(node, 0)
 
-    strategy = IRSchedule1F1B(graph, num_microbatch)
-    graph.predef_sched(strategy)
+    if graph.train():
+        PredefinedSched.sched_1f1b(graph, num_microbatch, num_stages)
+    else:
+        PredefinedSched.sched_infer_pipe(graph, num_microbatch, num_stages)
     return graph
 
 
-def PAS1F(graph: IRGraph, resource):
-    """
-    1F1B scheduling
-    """
-    num_stages = resource.ngpus
-    num_microbatch = 16
-
-    # group to transformer layers
-    fnodes = [node for node in graph.nodes() if isinstance(node, IRFwOperation)]
-    transformers = _group_to_transformers(fnodes)
-
-    # staging
-    fstages = [[] for _ in range(num_stages)]
-    nlayer_per_stage = (len(transformers) // resource.ngpus)
-    for lid, fnodes in enumerate(transformers):
-        stage_id = min(lid // nlayer_per_stage, num_stages - 1)
-        fstages[stage_id] += fnodes
-    graph.staging(tuple(stages[0] for stages in fstages))
-
-    # stage to device
-    fsegments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]
-    assert len(fsegments) == num_stages
-    for devid, segment in enumerate(fsegments):
-        graph.assign(segment, devid)
-
-    for node in graph.nodes():
-        if isinstance(node, IRDataOperation):
-            graph.assign(node, 0)
-
-    strategy = IRScheduleInfer(graph, num_microbatch)
-    graph.predef_sched(strategy)
-    return graph
-
-
-def PASMegatron(graph: IRGraph, resource):
-    """
-    1F1B scheduling
-    """
-    dp_size = 1
-    tp_size = 2
+def PASMegatron(graph: IRGraph, resource,
+                tp_size: int = 2, dp_size: int = 1,
+                nmicros: int = 16, **kwargs ):
+    """Megatron policy for hybrid data-tensor-pipeline parallelism"""
     pp_size = resource.ngpus // (dp_size * tp_size)
-    num_microbatch = 16
+    num_microbatch = nmicros
 
     # device mesh
     dp_groups, pp_groups, tp_groups = \
-        _create_mesh(resource.ngpus, (dp_size, pp_size, tp_size))
+        create_mesh(resource.ngpus, (dp_size, pp_size, tp_size))
     print(f'dp groups: {dp_groups}')
     print(f'pp groups: {pp_groups}')
     print(f'tp groups: {tp_groups}')
@@ -184,7 +82,7 @@ def PASMegatron(graph: IRGraph, resource):
         return tp_groups[dp_idx * pp_size + pp_idx][tp_idx]
 
     # group to transformer layers
-    transformers = _group_to_transformers(graph.select(ntype=IRFwOperation))
+    transformers = group_to_layers(graph.select(ntype=IRFwOperation))
 
     # group to stage: set each stage operators
     fstages = [[] for _ in range(pp_size)]
@@ -198,11 +96,11 @@ def PASMegatron(graph: IRGraph, resource):
     bs = dataloader.output(0).shape[0]
 
     # partition dataloader
-    dls = _replica(graph, dataloader, [0]*dp_size) # graph.partition(dataloader, dataloader.algorithms('data'), num=dp_size)
+    dls = replica(graph, dataloader, [0]*dp_size) # graph.partition(dataloader, dataloader.algorithms('data'), num=dp_size)
     for dp_idx, dl in enumerate(dls):
         # only stage 0 needs dataloader
         devices = [get_device(dp_idx, 0, tp_idx) for tp_idx in range(tp_size)]
-        _replica(graph, dl, devices)
+        replica(graph, dl, devices)
     
     fstages = [stage for stage in graph.select(ntype=IRSegment, flatten=False) if stage.isfw()]
     assert len(fstages) > 0
@@ -210,105 +108,19 @@ def PASMegatron(graph: IRGraph, resource):
         for fnode in fstage.nodes():
             if len(fnode.inputs()) == 0: continue # anchor
             if fnode.name == 'self_attention' or fnode.name == 'feedforward':
-                fnodes = _tp(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
+                fnodes = tensor_parallelism(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
             elif fnode.name == 'embedding':
-                fnodes = _tp(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
+                fnodes = tensor_parallelism(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
             elif fnode.name == 'linear': # the last embeding linear
-                fnodes = _tp(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
+                fnodes = tensor_parallelism(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
             elif fnode.name == 'sum':
-                fnodes = _tp(graph, fnode, [0]*tp_size, idx=0, dim=2, num=tp_size)
+                fnodes = tensor_parallelism(graph, fnode, [0]*tp_size, idx=0, dim=2, num=tp_size)
             else:
-                fnodes = _replica(graph, fnode, [0]*tp_size)
+                fnodes = replica(graph, fnode, [0]*tp_size)
             # data parallel
             for tp_idx, fnode in enumerate(fnodes):
                 dp_devices = [get_device(dp_idx, pp_idx, tp_idx) for dp_idx in range(dp_size)]
                 batch_dim = fnode.input(0).shape.index(bs)
-                _tp(graph, fnode, devs=dp_devices, idx=0, dim=batch_dim, num=dp_size)
-
-    strategy = IRSchedule1F1B(graph, num_microbatch)
-    graph.predef_sched(strategy)
-    # print(graph.extra_repr())
-    return graph
-
-
-def PASPiperSpace(graph: IRGraph, resource):
-
-    # ================= Policy hyper parameter ===================
-    num_microbatch = 16
-    # num_stages = 3
-    # sub_meshes = [(1,4), (1,4), (1,8)]    # (dp_size, tp_size)
-    # stage_layers = [(0,6), (6,12), (12,24)] # (start, end)
-    assert resource.ngpus == 8
-    num_stages = 3
-    sub_meshes = [(1,2), (1,2), (1,4)]      # (dp_size, tp_size)
-    stage_layers = [(0,6), (6,12), (12,24)] # (start, end)
-    # ============================================================
-
-    # checking
-    transformers = _group_to_transformers(graph.select(ntype=IRFwOperation))
-    assert len(stage_layers) == num_stages, f"Expect {num_stages} pipeline stages but got {len(stage_layers)} stage layer assignment."
-    nlayers = 0
-    for sid, (start, end) in enumerate(stage_layers):
-        prev_end = stage_layers[sid-1][1] if sid > 0 else 0
-        assert start == prev_end, f"Layers are not contiguous"
-        nlayers += end-start
-    assert nlayers == len(transformers), f"Total layer number {nlayers} != model layers {len(transformers)}"
-    # check gpus allocation
-    device_allocation = []
-    devices = 0
-    for mesh in sub_meshes:
-        dp_size, tp_size = mesh
-        assert dp_size >= 1 and tp_size >= 1
-        stage_ngpus = dp_size * tp_size
-        device_allocation.append(stage_ngpus)
-        devices += stage_ngpus
-    assert devices <= resource.ngpus, f"Total GPUs in policy ({devices}) > resource capacity ({resource.ngpus})"
-
-    # pipeline staging
-    fstages = [[] for _ in range(num_stages)]
-    for sid, (start, end) in enumerate(stage_layers):
-        for lid in range(start, end):
-            fstages[sid] += transformers[lid]
-    graph.staging(tuple(stages[0] for stages in fstages))
-    fstages = [stage for stage in graph.select(ntype=IRSegment, flatten=False) if stage.isfw()]
-
-    # setup data loader
-    dataloader = graph.select(ntype=IRDataOperation)[0]
-    bs = dataloader.output(0).shape[0]
-    
-
-    # sub mesh of (dp_size, tp_size)
-    for sid, fstage in enumerate(fstages):
-        dp_size, tp_size = sub_meshes[sid]
-        devices = np.arange(dp_size * tp_size, dtype=int) + sum(device_allocation[:sid])
-        devices = devices.reshape((dp_size, tp_size))
-        # setup dataloader
-        if sid == 0:
-            dls = _replica(graph, dataloader, [0] * tp_size)
-            for tp_idx, dl in enumerate(dls):
-                dp_devices = list(int(devid) for devid in devices[:,tp_idx].flatten())
-                dp_dls = graph.partition(dl, dl.algorithms('data'), num=dp_size)
-                for devid, dp_dl in zip(dp_devices, dp_dls):
-                    graph.assign(dp_dl, devid)
-        for fnode in fstage.nodes():
-            if len(fnode.inputs()) == 0: continue # anchor
-            # tensor parallel -- FIXME: current restriction needs replica happen before partition
-            if fnode.name == 'self_attention' or fnode.name == 'feedforward':
-                fnodes = _tp(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
-            elif fnode.name == 'embedding':
-                fnodes = _tp(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
-            elif fnode.name == 'linear': # the last embeding linear
-                fnodes = _tp(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
-            elif fnode.name == 'sum':
-                fnodes = _tp(graph, fnode, [0]*tp_size, idx=0, dim=2, num=tp_size)
-            else:
-                fnodes = _replica(graph, fnode, [0]*tp_size)
-            # data parallel
-            for tp_idx, fnode in enumerate(fnodes):
-                dp_devices = list(int(devid) for devid in devices[:,tp_idx].flatten())
-                batch_dim = fnode.input(0).shape.index(bs)
-                _tp(graph, fnode, devs=dp_devices, idx=0, dim=batch_dim, num=dp_size)
-
-    strategy = IRSchedule1F1B(graph, num_microbatch)
-    graph.predef_sched(strategy)
+                tensor_parallelism(graph, fnode, idx=0, dim=batch_dim, num=dp_size, devs=dp_devices)
+    PredefinedSched.sched_1f1b(graph, num_microbatch, pp_size)
     return graph

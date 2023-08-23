@@ -1,23 +1,23 @@
 """
 example:
 
-OMP_NUM_THREADS=4 torchrun \
+PYTHONPATH=.:$PYTHONPATH OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=4 \
-    --nnodes=1 \
-    examples/vision/swin/train.py --policy PASMegatron --fp16
+    examples/vision/swin/train.py --policy PASMegatronTP --fp16
 """
 
 import math
 import torch
+from functools import partial
 from examples.vision.swin.blocks.attention import init_relative_position_index
-from examples.vision.swin.model import Config, SwinTransformer, ImageDataLoader
+from examples.vision.swin.model import Config, SwinTransformer, get_swin_dummy_dataloader
 
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
-from cube.profiler.memory import memory_summary, model_summary
+from cube.profiler.memory import memory_summary
 
-import examples.vision.swin.policy.spmd as spmd
-import examples.vision.swin.policy.mpmd as mpmd
+import examples.vision.swin.policy.gallery as gallery
+from examples.utils import get_policy
 
 import argparse
 
@@ -25,26 +25,30 @@ parser = argparse.ArgumentParser(description='GPT Train')
 parser.add_argument('--policy', type=str, help='PAS policy choice, starting with PAS')
 parser.add_argument('--fp16', action='store_true', default=False,
                     help='use fp16 for the training')
+parser.add_argument('--dp', type=int, default=1, 
+                    help='data parallel size, only for megatron')
+parser.add_argument('--tp', type=int, default=1,
+                    help='tensor parallel size, only for megatron')
+# training
+parser.add_argument('--gbs', type=int, default=4, help='global batch size')
+parser.add_argument('--mbs', type=int, default=4, help='micro batch size')
+
 args = parser.parse_args()
 cube.init()
 
 
-PAS = None
-policies = list(spmd.__dict__.keys()) + list(mpmd.__dict__.keys())
-policies = [policy for policy in policies if policy.startswith('PAS')]
-if args.policy in spmd.__dict__:
-    PAS = spmd.__dict__[args.policy]
-    print_each_rank(f'using policy from spmd.{args.policy}')
-elif args.policy in mpmd.__dict__:
-    PAS = mpmd.__dict__[args.policy]
-    print_each_rank(f'using policy from mpmd.{args.policy}')
-else:
-    raise ValueError(f"policy {args.policy} not found. Candidates: {policies}")
+# get policy
+policy = get_policy([gallery], args.policy)
+policy = partial(policy, 
+    nmicros=args.gbs//args.mbs, 
+    dp_size=args.dp,
+    tp_size=args.tp
+)
 
 
 def train():
 
-    batch_size = 4
+    batch_size = args.mbs
     load_content: bool = False
 
     cfg = Config()
@@ -52,16 +56,14 @@ def train():
     model = model.half() if args.fp16 else model
 
     dtype = torch.float16 if args.fp16 else torch.float32
-    dataloader = ImageDataLoader(batch_size, cfg.img_size, cfg.num_classes, dtype=dtype)
+    dataloader = get_swin_dummy_dataloader(batch_size, dtype, cfg)
 
-    model = cube.SemanticModel(model)
-    @cube.compile(model, dataloader, PAS=PAS, override=True, load_content=load_content)
+    @cube.compile(model, dataloader, PAS=policy, load_content=load_content)
     def train_iter(model, dataloader):
         imgs = next(dataloader)
         loss = model(imgs)
         loss.backward()
-        # return loss
-    model: torch.nn.Module = model.get_gen_module()
+    model = cube.utils.load_model()
 
     if not load_content:
         for name, buffer in model.named_buffers():
@@ -79,27 +81,23 @@ def train():
         nparams += param.nelement()
     print_each_rank(f'model parameter: {nparams}')
 
-    CudaTimer(enable=False).warmup()
+    CudaTimer().warmup()
+    dataloader = iter(dataloader)
     iter_num, warmup = 5, 2
     for step in range(iter_num):
-
-        if step >= warmup:
+        if step == warmup:
             CudaTimer(enable=True).start('e2e')
 
-        # training
-        loss = train_iter(model, dataloader)
-        # print(loss)
+        train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()
 
-        if step >= warmup:
-            CudaTimer().stop('e2e')
-
         if step == 0:
             print_each_rank('passed first iteration')
-        if (step + 1) % 4 == 0:
+        if (step + 1) % 2 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 
+    CudaTimer().stop('e2e')
     print_each_rank('e2e time (ms) per iteration: {} ms'.format(
           CudaTimer().duration(iter_num-warmup, field_name='e2e')))
     CudaTimer().print_all(times=iter_num-warmup)

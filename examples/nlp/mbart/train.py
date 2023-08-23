@@ -1,33 +1,39 @@
 """
 example:
 
-OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=8 \
-    --nnodes=1 \
-    examples/nlp/mbart/train.py --policy PASMixPipe
+PYTHONPATH=.:$PYTHONPATH OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=4 \
+    examples/nlp/mbart/train.py --policy PASMegatronTP --fp16
 """
 
 
 import torch
+import logging
+import argparse
+import math
+from functools import partial
 
 from examples.nlp.mbart.model import MBartForSentenceClassification, Config
-from examples.nlp.mbart.model import MBartSyntheticDataLoader
+from examples.nlp.mbart.model import get_mbart_dummy_dataloader
 
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
-from cube.profiler.memory import memory_summary, model_summary
-import examples.nlp.mbart.policy.mpmd as mpmd
+from cube.profiler.memory import memory_summary
+import examples.nlp.mbart.policy.gallery as gallery
 
-import argparse
-import math
+from examples.utils import get_policy
 
 parser = argparse.ArgumentParser(description='GPT Train')
 parser.add_argument('--policy', type=str, help='PAS policy choice, starting with PAS')
 parser.add_argument('--fp16', action='store_true', default=False,
                     help='use fp16 for the training')
+parser.add_argument('--dp', type=int, default=1, 
+                    help='data parallel size, only for megatron')
+parser.add_argument('--tp', type=int, default=1,
+                    help='tensor parallel size, only for megatron')
 # training
-parser.add_argument('--gbs', type=int, default=1, help='global batch size')
-parser.add_argument('--mbs', type=int, default=2, help='micro batch size')
+parser.add_argument('--gbs', type=int, default=4, help='global batch size')
+parser.add_argument('--mbs', type=int, default=4, help='micro batch size')
 # arch
 parser.add_argument('--vocab', type=int, default=2500,
                     help='used vocabulary size')
@@ -45,14 +51,18 @@ args = parser.parse_args()
 cube.init()
 print(args)
 
-PAS = None
-policies = list(mpmd.__dict__.keys())
-policies = [policy for policy in policies if policy.startswith('PAS')]
-if args.policy in mpmd.__dict__:
-    PAS = mpmd.__dict__[args.policy]
-    print_each_rank(f'using policy from mpmd.{args.policy}')
-else:
-    raise ValueError(f"policy {args.policy} not found. Candidates: {policies}")
+
+cube.init()
+cube.set_logger_level(logging.WARN)
+logging.getLogger('cube.compiler').setLevel(logging.INFO)
+
+# get policy
+policy = get_policy([gallery], args.policy)
+policy = partial(policy, 
+    nmicros=args.gbs//args.mbs, 
+    dp_size=args.dp,
+    tp_size=args.tp
+)
 
 
 def trunc_normal_(tensor: torch.Tensor, mean=0., std=1., a=-2., b=2.):
@@ -73,46 +83,39 @@ def trunc_normal_(tensor: torch.Tensor, mean=0., std=1., a=-2., b=2.):
 def train():
 
     batch_size = args.mbs
-    Config.num_embeddings = args.vocab
-    Config.layers = args.layers
-    Config.hidden = args.hidden
-    Config.heads = args.heads
-    Config.seqlen = args.seqlen
 
-    if cube.runtime.device.DeviceGroup().local_rank == 0:
-        model = MBartForSentenceClassification(batch_size)
-        model = model.half() if args.fp16 else model
-    else:
-        model = None
-    dataloader = MBartSyntheticDataLoader(batch_size)
+    config = Config(
+        hidden=args.hidden,
+        heads=args.heads,
+        layers=args.layers,
+        seqlen=args.seqlen,
+        ffn_hidden_dim=args.hidden * 4,
+        vocab=args.vocab,
+    )
+    print_each_rank(config)
 
-    model = cube.SemanticModel(model)
-    @cube.compile(model, dataloader, PAS=PAS, override=True, load_content=False)
-    def train_iter(model, dataloader):
-        input_ids = next(dataloader)
-        loss = model(input_ids)
-        loss.backward()
-    model = model.get_gen_module()
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
-
-    for name, buffer in model.named_buffers():
-        torch.manual_seed(0)
-        if name.startswith('decoder_input_ids'):
-            inputs = torch.randint(
-                0, args.vocab, buffer.size(),
-                dtype=torch.int64, device=torch.cuda.current_device(),
-            )
-            buffer.copy_(inputs)
-    
+    model = MBartForSentenceClassification(batch_size, config)
     torch.manual_seed(0)
     for param in model.parameters():
         trunc_normal_(param)
+    model = model.half() if args.fp16 else model
 
-    CudaTimer(enable=False).warmup()
+    dataloader = get_mbart_dummy_dataloader(batch_size, config)
+
+    @cube.compile(model, dataloader, PAS=policy)
+    def train_iter(model, dataloader):
+        input_ids, decoder_input_ids = next(dataloader)
+        loss = model(input_ids, decoder_input_ids)
+        loss.backward()
+    model = cube.load_model()
+
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=3e-05, betas=(0.9, 0.98))
+
+    CudaTimer().warmup()
+    dataloader = iter(dataloader)
     iter_num, warmup = 5, 2
     for step in range(iter_num):
-
         if step == warmup:
             CudaTimer(enable=True).start('e2e')
 
@@ -123,7 +126,6 @@ def train():
 
         if step == 0:
             print_each_rank('passed first iteration')
-        
         if (step + 1) % 2 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 

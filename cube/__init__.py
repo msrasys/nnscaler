@@ -1,6 +1,7 @@
 from typing import Optional
 import logging
 from cube import runtime
+from cube import utils
 
 from cube import profiler
 from cube.profiler.timer import CudaTimer

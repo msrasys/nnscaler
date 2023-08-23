@@ -1,69 +1,89 @@
 """
 example:
 
-OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=8 \
-    --nnodes=1 \
-    examples/nlp/gpt/train.py --policy PASMegatron --fp16
+PYTHONPATH=.:$PYTHONPATH OMP_NUM_THREADS=4 torchrun \
+    --nproc_per_node=4 \
+    examples/nlp/gpt/train.py --policy PASMegatronTP --fp16
 """
 
 
 import torch
-import time
+import logging
+from functools import partial
 
-from examples.nlp.gpt.model import GPT, GPTFineGrained, build_gpt_config
-from examples.nlp.gpt.model import GPTDataLoader
+from model import GPT, Config
+from model import get_gpt_dummy_dataloader
 
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
-from cube.profiler.memory import memory_summary, model_summary
+from cube.profiler.memory import memory_summary
 
-from examples.nlp.gpt.policy.mpmd import PASMegatron as PAS
 import examples.nlp.gpt.policy.spmd as spmd
 import examples.nlp.gpt.policy.mpmd as mpmd
+
+from examples.utils import get_policy
 
 import argparse
 
 parser = argparse.ArgumentParser(description='GPT Train')
+
 parser.add_argument('--policy', type=str, help='PAS policy choice, starting with PAS')
 parser.add_argument('--fp16', action='store_true', default=False,
                     help='use fp16 for the training')
+parser.add_argument('--mbs', type=int, default=8,
+                    help='micro-batch size')
+parser.add_argument('--gbs', type=int, default=8,
+                    help='global batch size')
+parser.add_argument('--dp', type=int, default=1, 
+                    help='data parallel size, only for megatron')
+parser.add_argument('--tp', type=int, default=1,
+                    help='tensor parallel size, only for megatron')
+
+# arch
+parser.add_argument('--layers', type=int, default=4,
+                    help='number of transformer layers')
+parser.add_argument('--hidden', type=int, default=1024,
+                    help='hidden size')
+parser.add_argument('--heads', type=int, default=16,
+                    help='number of attention heads')
+parser.add_argument('--seqlen', type=int, default=1024,
+                    help='sequence length')
 args = parser.parse_args()
 
+
 cube.init()
+cube.set_logger_level(logging.WARN)
+logging.getLogger('cube.compiler').setLevel(logging.INFO)
 
-PAS = None
-policies = list(spmd.__dict__.keys()) + list(mpmd.__dict__.keys())
-policies = [policy for policy in policies if policy.startswith('PAS')]
-if args.policy in spmd.__dict__:
-    PAS = spmd.__dict__[args.policy]
-    print_each_rank(f'using policy from spmd.{args.policy}')
-elif args.policy in mpmd.__dict__:
-    PAS = mpmd.__dict__[args.policy]
-    print_each_rank(f'using policy from mpmd.{args.policy}')
-else:
-    raise ValueError(f"policy {args.policy} not found. Candidates: {policies}")
-
+# get policy
+policy = get_policy([spmd, mpmd], args.policy)
+policy = partial(policy, 
+    nmicros=args.gbs//args.mbs, 
+    dp_size=args.dp,
+    tp_size=args.tp
+)
 
 
 def train():
 
-    batch_size = 8
-    Config=build_gpt_config('760M')
-    if args.policy == 'PASMegatronWSRTP':
-        model = GPTFineGrained(Config)
-    else:
-        model = GPT(Config)
+    config = Config(
+        hidden=args.hidden,
+        layers=args.layers,
+        heads=args.heads,
+        ffn_hidden_dim=4*args.hidden,
+        num_embeddings=51200,
+        seqlen=args.seqlen,   
+    )
+    model = GPT(config)
     model = model if not args.fp16 else model.half()
-    dataloader = GPTDataLoader(batch_size)
+    dataloader = get_gpt_dummy_dataloader(args.mbs, Config)
 
-    model = cube.SemanticModel(model)
-    @cube.compile(model, dataloader, PAS=PAS, override=True, load_content=True)
+    @cube.compile(model, dataloader, PAS=policy)
     def train_iter(model, dataloader):
         input_ids, position_ids = next(dataloader)
         loss = model(input_ids, position_ids)
         loss.backward()
-    model = model.get_gen_module()
+    model = cube.utils.load_model()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
@@ -71,7 +91,8 @@ def train():
     print_each_rank('model weight consumpition:', rank_only=0)
     memory_summary()
 
-    CudaTimer(enable=False).warmup()
+    CudaTimer().warmup()
+    dataloader = iter(dataloader)
     iter_num, warmup = 5, 2
     for step in range(iter_num):
         if step == warmup:
