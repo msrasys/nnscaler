@@ -1,3 +1,4 @@
+import types
 from typing import Callable, Any, Dict, Optional, Type, Union
 from pathlib import Path
 import inspect
@@ -297,7 +298,7 @@ def parallelize(
     override: bool = False,
     instance_name: Optional[str] = None,
     load_module: bool = True,
-) -> Union[None, CubeModule, Type[CubeModule]]:
+) -> Union[None, ParallelModule, Type[ParallelModule]]:
     """
     Convert a torch.nn.Module object or class to CubeModule object or class.
 
@@ -382,3 +383,66 @@ def parallelize(
             cube_module = cube_module_class()
             cube_module.train(module_or_module_class.training)  # set training state to the same as original module
             return cube_module
+
+
+def build_optimizer(
+    module: torch.nn.Module,
+    optimizer_fn: Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]],
+    *args,
+    **kwargs,
+) -> torch.optim.Optimizer:
+    """
+    Build an optimizer for a module.
+
+    To support parallelized module (CubeModule), we need to hook 4 places:
+    1. optimizer constructor:
+        the parameters of optimizer will not be the same with the parameters of the module if we use zero
+        so we need to replace the parameters of optimizer with CubeModule.parameters_for_optimizer
+        It is impossible to make this change transparent to end users.
+    2. optimizer.step():
+        In zero mode, we have to call CubeModule.gather_params() after optimizer.step()
+    3. optimizer.zero_grad():
+        We need to call CubeModule.zero_grad() after optimizer.zero_grad()
+    4. backward():
+        we need to call CubeModule.sync_grads() after each CubeModule backward.
+        This is done with _AddGradModule and its hook in ParallelModule.
+
+    Please note this DOES NOT work in end2end mode.
+
+    Args:
+        module (torch.nn.Module): the module to be optimized
+        optimizer_fn (Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]]):
+            It can be the optimizer class or optimizer factory function.
+            If it is a factory function, the signature should be the same with optimizer class constructor.
+        *args: the args for optimizer constructor
+        **kwargs: the kwargs for optimizer constructor
+
+    Returns:
+        torch.optim.Optimizer: the optimizer you should use to train the module
+    """
+
+    if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
+        raise RuntimeError("End2End mode is not supported")
+
+    def _local_parameters(module: torch.nn.Module):
+        gen = module._named_members(lambda m: m._parameters.items())
+        for _, param in gen:
+            yield param
+
+    optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), *args, **kwargs)
+
+    def _step_hook(opt, *args, **kwargs):
+        for m in module.modules():
+            if isinstance(m, CubeModule):
+                m.gather_params()
+    optimizer.register_step_post_hook(_step_hook)
+
+    orig_zero_grad = optimizer.zero_grad
+    def _patched_zero_grad_hook(self, set_to_none: bool = True):
+        orig_zero_grad(set_to_none)
+        for m in module.modules():
+            if isinstance(m, CubeModule):
+                m.zero_grad()
+    optimizer.zero_grad = types.MethodType(_patched_zero_grad_hook, optimizer)
+
+    return optimizer

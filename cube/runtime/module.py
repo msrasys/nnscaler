@@ -5,8 +5,8 @@ import sys
 from pathlib import Path
 
 import torch
-from cube.graph.parser.fx.parser import FxModuleParser
 
+from cube.graph.parser.fx.parser import FxModuleParser
 from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.reducer import Reducer
 
@@ -394,7 +394,6 @@ class _AddGradModule(torch.nn.Module):
 
 
 class ParallelModule(CubeModule):
-    _EPSILON = 1e-7  # A small constant that can be represented by fp16
     COMPUTE_CONFIG_FILE = 'compute_config.pt'
 
     def __init__(self):
@@ -408,13 +407,6 @@ class ParallelModule(CubeModule):
         self._add_grad_module = _AddGradModule()
         self._add_grad_module.register_full_backward_pre_hook(self.backward_hook)
 
-        # if _grad_sentry.grad becomes None or zero
-        # we should zero grad in the next forward
-        # NOTE: this is a hacky way to detect whether the backward is called
-        # And it will add an extra parameter to the module
-        self._grad_sentry = torch.nn.Parameter(torch.tensor([0.0], requires_grad=True))
-        self._grad_sentry.grad = torch.tensor([self._EPSILON])
-
     def _post_init(self):
         module_file = Path(sys.modules[self.__module__].__file__)
         self.load_attr_content(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE}"))
@@ -426,9 +418,6 @@ class ParallelModule(CubeModule):
 
     def forward(self, *args, **kwargs):
         if self.training:
-            if self._grad_sentry.grad is None or self._grad_sentry.grad.item() == 0:
-                self.zero_grad()
-                self._grad_sentry.grad = torch.tensor([self._EPSILON])
             new_args = self._add_grad_module(*args)
         else:
             new_args = args
