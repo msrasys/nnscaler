@@ -1,5 +1,5 @@
+numpy>=1.23.0
 matplotlib
-setuptools==60.7.0
 more-itertools
 dill
-torch
+torch>=1.13

@@ -4,55 +4,27 @@ AI System Compiler to map a semantic (single-device) model into distributed exec
 
 ## Prerequisite
 
-* Python >= 3.7
+Install the following packages before the installation of cube:
 
-> Install Python 3.7 in the development environment for widest compatibility.
+* Python >= 3.8
 
-Install dependent packages
-```sh
-pip install -r requirements.txt
+* PyTorch >= 1.13
 
-# require pytorch version >= 1.11
-pip install torch==1.12.0+cu116 -f https://download.pytorch.org/whl/torch/
-# pip install torch==1.11.0+cu115 -f https://download.pytorch.org/whl/torch_stable.html
+## Install
+
+```bash
+pip install -e .
 ```
 
-## Option 1: Quick Start without Installation
+## Run Example
 
-* ### Run on repo root path:
-```sh
-PYTHONPATH=.:$PYTHONPATH OMP_NUM_THREADS=4 torchrun \
-    --nproc_per_node=4  \
-    --nnodes=1  \
-    examples/mlp/linears.py --policy PASCol
-```
-
-[comment]: <> (UDA_VISIBLE_DEVICES=7 PYTHONPATH=.:$PYTHONPATH python3 -m torch.distributed.launch --nproc_per_node=1 --master_port=12345 ./examples/wrf/wrf2.py)
-
-* ### Debug for model parsing check on single Device
-```shell
-PYTHONPATH=.:$PYTHONPATH SINGLE_DEV_MODE=1 python examples/mlp/linears.py
-```
-
-
----
-
-## Option 2: Install for Run
-
-* ### Install
-
-```python
-python setup.py develop
-```
-
-* ### Run Example
-[Micro Benchmark] Run a mutiple MLP Model
+Run an MLP Model on 4 GPUs:
 
 ```sh
-OMP_NUM_THREADS=4 torchrun \
+PYTHONPATH=:.$PYTHONPATH torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
-    examples/mlp/linears.py --policy PASCol
+    examples/mlp/train.py --policy PASCol
 ```
 
 
@@ -118,7 +90,7 @@ tox -r
 To run a single unit test task during development, you can run
 
 ```
-pytest unit_tests/your_test_file.py
+pytest tests/your_test_file.py
 ```
 
 ### Run unit tests in vscode
