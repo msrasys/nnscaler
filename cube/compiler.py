@@ -34,9 +34,11 @@ _logger = logging.getLogger(__name__)
 _logger.setLevel(logging.INFO)
 
 
-def compile(model: SemanticModel, *args,
+def compile(model: Union[torch.nn.Module, SemanticModel], *args,
             PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None,
             model_dynamic_shape: bool = False,
+            load_graph_file: Optional[str] = None,
+            save_graph_file: Optional[str] = None,
             comm_cost_fn: Optional[Callable] = None,
             override = True,
             load_content = True,
@@ -57,8 +59,11 @@ def compile(model: SemanticModel, *args,
         model (SemanticModel | torch.nn.Module): single-device model
         args (Tuple[Any]): compile function example inputs
         PAS (Callable | Tuple[Callable, Callable, Callable]): policy to transform and schedule graph
-        model_dummy_inputs (Tuple[Any]): model example inputs when using torch.fx parser
         model_dynamic_shape (bool): whether to compile model with dynamic shape
+        load_graph_file (str | None): 
+            load cached graph. This will skip parsing the function and model.
+            Note the user should keep correct `fullmodel.pt` if load_content is True.
+        save_graph_file (str | None): save parsed graph before applying policy.
         comm_cost_fn (Optional[Callable]): communication cost function, which
             takes in an IRAdapterPrim, and outputs a cost in float. By default (None) use
             communication volume.
@@ -104,6 +109,7 @@ def compile(model: SemanticModel, *args,
     myrank = DeviceGroup().rank
 
     def decorator(fn: Callable) -> Callable:
+
         filename = 'gencode{}.py'
 
         if not override and os.path.exists(filename.format(myrank)):
@@ -121,31 +127,43 @@ def compile(model: SemanticModel, *args,
             resource = cube.runtime.resource.EnvResource()
 
             # run once to get model structure and tensor shape
-            start = time.time()
-            outputs = fn(*inputs)
-            if outputs is None:
-                outputs = []
-            elif not (isinstance(outputs, tuple) or isinstance(outputs, list)):
-                outputs = [outputs]
-            # setup program input
-            pinputs = []
-            for input in inputs[1:]: # we don't consider `model` as inputs
-                if isinstance(input, SemanticModel):
-                    pinputs.append('model')
-                elif isinstance(input, SemanticDataLoader):
-                    pinputs.append(input.object)
-                else:
-                    pinputs.append(input)
-            Program().set_input(pinputs)
-            # setup program output
-            Program().set_output(outputs)
-            Program().finalize()
-            span = time.time() - start
-            _logger.info('finish parsing iteration: {:.2f} s'.format(span))
+            graph = None
+            if load_graph_file is None:
+                start = time.time()
+                outputs = fn(*inputs)
+                if outputs is None:
+                    outputs = []
+                elif not isinstance(outputs, (tuple, list)):
+                    outputs = [outputs]
+                # setup program input
+                pinputs = []
+                for input in inputs[1:]: # we don't consider `model` as inputs
+                    if isinstance(input, SemanticModel):
+                        pinputs.append('model')
+                    elif isinstance(input, SemanticDataLoader):
+                        pinputs.append(input.object)
+                    else:
+                        pinputs.append(input)
+                Program().set_input(pinputs)
+                # setup program output
+                Program().set_output(outputs)
+                Program().finalize()
+                span = time.time() - start
+                graph = Program().get_graph()
+                _logger.info('finish parsing iteration: {:.2f} s'.format(span))
+            else:
+                # get cube graph of a iteration from tracer or cached file
+                start = time.time()
+                graph = IRGraph.load(load_graph_file)
+                span = time.time() - start
+                _logger.info('finish loading graph from {}: {:.2f} s'.format(load_graph_file, span))
+
+            if save_graph_file is not None and save_graph_file != load_graph_file:
+                _logger.info(f'saving graph to {save_graph_file}')
+                graph.dump(save_graph_file)
 
             # run policy
             start = time.time()
-            graph = Program().get_graph()
             assert callable(PAS), f"Policy PAS is not callable"
             graph = PAS(graph, resource)
             span = time.time() - start

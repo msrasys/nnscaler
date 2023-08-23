@@ -84,8 +84,8 @@ class SemanticDataLoader:
         """
         if not isinstance(dataloader, data.DataLoader):
             raise TypeError("Expected data loader derived from torch.utils.data.DataLoader")
-        self.dataloader: data.DataLoader = iter(dataloader)
-        self.object = IRObject(name='dataloader', value=self.dataloader)
+        self.dataloader: data.DataLoader = dataloader
+        self.object = IRObject(name='dataloader', value=None)
 
     def __iter__(self):
         return self
@@ -103,7 +103,7 @@ class SemanticDataLoader:
                 return tensor
             return IRObject('data', value=sample)
         # get dataloader sample
-        sample = next(self.dataloader)
+        sample = next(iter(self.dataloader))
         # turn sample into IRObjects
         outputs = generate_output(sample)
         # create dataloader operation
