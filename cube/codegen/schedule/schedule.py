@@ -55,9 +55,9 @@ class ScheduleCodeGen(FuncEmission):
 
         lifetime = LifeCycle(device_nodes, [], self.execplan.graph.outputs())
 
-        args = ['model'] + [ScheduleCodeGen.tensor_name(t) for t in self.execplan.graph.inputs()]
+        args = ['model'] + [self.tensor_name(t) for t in self.execplan.graph.inputs()]
 
-        with FunctionBlock(func_name='_train_step', 
+        with FunctionBlock(func_name='_train_step',
                            args=args) as fb:
             fb.insert_body('_ = None')
             fb.insert_body('model.zero_grad()')
@@ -71,14 +71,14 @@ class ScheduleCodeGen(FuncEmission):
             else:
                 for line, node in enumerate(device_nodes):
                     # execute
-                    codes = ScheduleCodeGen.emit_node(node)
+                    codes = self.emit_node(node)
                     fb.insert_body(codes)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
-                        fb.insert_body(ScheduleCodeGen.emit_release(tensors))
+                        fb.insert_body(self.emit_release(tensors))
             # return code
-            outputs = ScheduleCodeGen.return_name_complex(self.execplan.graph.outputs())
+            outputs = self.return_name_complex(self.execplan.graph.outputs())
             code = f'return {outputs}'
             fb.insert_body(code)
         gencode += fb.code
@@ -93,7 +93,7 @@ class ScheduleCodeGen(FuncEmission):
             if isinstance(self.execplan.graph.sched, IRScheduleStrategy):
                 _logger.warning('using legacy IRScheduleStrategy cannot generate inference code. '
                                 'Switch to use scheduling without strategy')
-            with FunctionBlock(func_name='_infer_step', 
+            with FunctionBlock(func_name='_infer_step',
                                args=args) as fb:
                 fb.insert_body('_ = None')
                 # body code
@@ -102,15 +102,15 @@ class ScheduleCodeGen(FuncEmission):
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
                     # execute
-                    codes = ScheduleCodeGen.emit_node(node, force_no_grad=True)
+                    codes = self.emit_node(node, force_no_grad=True)
                     fb.insert_body(codes)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     tensors = [t for t in tensors if isinstance(t, IRTensor) and not t.is_grad()]
                     if len(tensors) > 0 : # not necessarily to have one after each line
-                        fb.insert_body(ScheduleCodeGen.emit_release(tensors))
+                        fb.insert_body(self.emit_release(tensors))
                 # return code
-                outputs = ScheduleCodeGen.return_name_complex(self.execplan.graph.outputs())
+                outputs = self.return_name_complex(self.execplan.graph.outputs())
                 code = f'return {outputs}'
                 fb.insert_body(code)
             gencode += fb.code
@@ -123,8 +123,7 @@ class ScheduleCodeGen(FuncEmission):
                 f.write(code)
         return code
 
-    @staticmethod
-    def emit_node(node: IRCell, force_no_grad: bool = False) -> List[str]:
+    def emit_node(self, node: IRCell, force_no_grad: bool = False) -> List[str]:
         """
         Emit node / subgraph code
         """
@@ -137,12 +136,12 @@ class ScheduleCodeGen(FuncEmission):
         req_grad = False if force_no_grad else req_grad
 
         # handle for forward
-        inputs = ScheduleCodeGen.tuple_name(node_inputs, skip_attr=True, prefix_attr='model.')
-        outputs = ScheduleCodeGen.return_name(node_outputs, skip_attr=True, prefix_attr='model.')
-        
+        inputs = self.tuple_name(node_inputs, skip_attr=True, prefix_attr='model.')
+        outputs = self.return_name(node_outputs, skip_attr=True, prefix_attr='model.')
+
         unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
-        name = ScheduleCodeGen.node_name(unwrap_node)
-        
+        name = self.node_name(unwrap_node)
+
         if isinstance(unwrap_node, IRSegment):
             # emit forward segment
             if node.isfw():
@@ -156,21 +155,21 @@ class ScheduleCodeGen(FuncEmission):
             else:
                 # get gradient computation arguments
                 input_tensors, output_tensors, output_grads, input_grads = \
-                        ScheduleCodeGen.get_backward_callsite_io_tensors(node)
+                        self.get_backward_callsite_io_tensors(node)
                 # special handle for loss
                 for idx, tensor in enumerate(output_grads):
                     if isinstance(tensor, IRSubTensor) and tensor.is_loss():
                         output_grads[idx] = None
                 code = bsign.format(
-                    name = f"'{ScheduleCodeGen.node_name(unwrap_node.mirror)}'",
-                    input_grads = ScheduleCodeGen.return_name(input_grads),
-                    input_tensors = ScheduleCodeGen.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.'),
-                    output_tensors = ScheduleCodeGen.tuple_name(output_tensors, skip_attr=True, prefix_attr='model.'),
-                    output_grads = ScheduleCodeGen.tuple_name(output_grads, skip_attr=True, prefix_attr='model.')
+                    name = f"'{self.node_name(unwrap_node.mirror)}'",
+                    input_grads = self.return_name(input_grads),
+                    input_tensors = self.tuple_name(input_tensors, skip_attr=True, prefix_attr='model.'),
+                    output_tensors = self.tuple_name(output_tensors, skip_attr=True, prefix_attr='model.'),
+                    output_grads = self.tuple_name(output_grads, skip_attr=True, prefix_attr='model.')
                 )
 
         elif isinstance(unwrap_node, IRDataOperation):
-            code = ScheduleCodeGen.emit_dataloader(unwrap_node)[0]
+            code = self.emit_dataloader(unwrap_node)[0]
 
         elif isinstance(unwrap_node, IRAdapter):
             code = asign.format(
@@ -190,22 +189,20 @@ class ScheduleCodeGen(FuncEmission):
 
         else:
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
-        
+
         return [code]
-    
-    @staticmethod
-    def emit_repetend(repetend: ExeRepetend) -> List[str]:
+
+    def emit_repetend(self, repetend: ExeRepetend) -> List[str]:
         """
         Emit code for executing a repetend
         """
         with ForBlock(var=None, iters=f'range({repetend.repeat})') as fb:
             for node in repetend.nodes():
-                ncode = ScheduleCodeGen.emit_node(node)
+                ncode = self.emit_node(node)
                 fb.insert_body(ncode)
         return fb.code
 
-    @staticmethod
-    def emit_legacy_schedplan(schedplan: IRScheduleStrategy, devid: int) -> List[str]:
+    def emit_legacy_schedplan(self, schedplan: IRScheduleStrategy, devid: int) -> List[str]:
         """
         Lagecy code
         """
@@ -214,13 +211,13 @@ class ScheduleCodeGen(FuncEmission):
         strkwargs = dict()
         for kwarg, val in kwargs.items():
             if isinstance(val, IRCell):
-                name = 'model.' + ScheduleCodeGen.node_name(val)
+                name = 'model.' + self.node_name(val)
             elif isinstance(val, (tuple, list)):
                 brackets = ')' if len(val) != 1 else ',)'
-                name = '(' + ', '.join('model.' + ScheduleCodeGen.node_name(n) \
+                name = '(' + ', '.join('model.' + self.node_name(n) \
                     if isinstance(n, IRCell) else str(n) for n in val) + brackets
             else:
-                name = str(val)        
+                name = str(val)
             strkwargs[kwarg] = name
         code = ', '.join(f'{kwarg}={name}' for kwarg, name in strkwargs.items())
         code = f'{signature}({code})'

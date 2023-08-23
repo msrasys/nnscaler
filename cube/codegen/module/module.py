@@ -305,11 +305,12 @@ class ModuleCodeGen(FuncEmission):
 
         # init customized adapter
         fsegments = [node for node in sequence if isinstance(node, IRSegment) and node.isfw()]
+        autograd_adapter_gen = AutogradAdapterCodeGen()
         for seg in fsegments:
             for adapter in seg.select(ntype=IRAdapter):
                 if adapter.differentiable and adapter.custom:
-                    gencode += AutogradAdapterCodeGen().gen(adapter) + ['', '']
-                    adapter.signature = AutogradAdapterCodeGen.name(adapter) + '.apply'
+                    gencode += autograd_adapter_gen.gen(adapter) + ['', '']
+                    adapter.signature = autograd_adapter_gen.name(adapter) + '.apply'
 
         # initialize communication groups
         self.emit_comm_groups()
@@ -346,9 +347,9 @@ class ModuleCodeGen(FuncEmission):
             for t in node.inputs():
                 if isinstance(t, IRSubTensor):
                     if not t.is_attr():
-                        args.append(ModuleCodeGen.tensor_name(t))
+                        args.append(self.tensor_name(t))
                 else:
-                    args.append(ModuleCodeGen.tensor_name(t))
+                    args.append(self.tensor_name(t))
             node_args.append(args)
 
         # generate full code
@@ -365,7 +366,7 @@ class ModuleCodeGen(FuncEmission):
             cb.insert_body(ib.code)
             segment_idxs =[]
             for idx, node in enumerate(gen_nodes):
-                name = ModuleCodeGen.node_name(node)
+                name = self.node_name(node)
                 input_args = ['self'] + node_args[idx]
                 forward_code = self.model_methods_bodies[idx]
                 if isinstance(node, IRSegment):
@@ -374,7 +375,7 @@ class ModuleCodeGen(FuncEmission):
                 with FunctionBlock(func_name=name, args=input_args) as fb:
                     fb.insert_body(forward_code)
                     # generate output
-                    outputs = [ModuleCodeGen.tensor_name(t) for t in node.outputs()]
+                    outputs = [self.tensor_name(t) for t in node.outputs()]
                     return_code = f"return {', '.join(outputs)}"
                     fb.insert_body(return_code)
                 cb.insert_body('')
@@ -403,10 +404,10 @@ class ModuleCodeGen(FuncEmission):
                             raise ValueError(f"Invalid extra forward args: only *args & **kwargs are allowed")
 
                 with FunctionBlock(func_name='_forward_impl', args=['self'] + (forward_arg_names or inputs)) as fb:
-                    outputs = ScheduleCodeGen.return_name(node.outputs(), skip_attr=True)
-                    call_code = f'{outputs} = self.{ScheduleCodeGen.node_name(node)}({", ".join(inputs)})'
+                    outputs = self.return_name(node.outputs(), skip_attr=True)
+                    call_code = f'{outputs} = self.{self.node_name(node)}({", ".join(inputs)})'
                     fb.insert_body(call_code)
-                    return_code = f'return {ScheduleCodeGen.return_name_complex(self.execplan.graph.outputs())}'
+                    return_code = f'return {self.return_name_complex(self.execplan.graph.outputs())}'
                     fb.insert_body(return_code)
                 cb.insert_body('')
                 cb.insert_body(fb.code)
@@ -455,13 +456,13 @@ class ModuleCodeGen(FuncEmission):
         map_sign = "self.add_full_map('{attr}', {tid}, {slicers}, {val_chunks})"
         if not isinstance(node, IRSegment):
             for itensor in node.inputs():
-                name = ModuleCodeGen.tensor_name(itensor, prefix_attr='self.')
+                name = self.tensor_name(itensor, prefix_attr='self.')
                 if isinstance(itensor, IRSubTensor):
                     if itensor.is_attr() and not self.symbols.exist(name):
                         self.symbols.create(name)
                         sign = psign if itensor.is_param() else bsign
                         code = sign.format(
-                            name=ModuleCodeGen.tensor_name(itensor),
+                            name=self.tensor_name(itensor),
                             shape=tuple(itensor.shape),
                             dtype=itensor.dtype
                         )
@@ -470,7 +471,7 @@ class ModuleCodeGen(FuncEmission):
                         slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
                         val_chunks = itensor.valmap[1]
                         code = map_sign.format(
-                            attr=ModuleCodeGen.tensor_name(itensor), tid=tid,
+                            attr=self.tensor_name(itensor), tid=tid,
                             slicers=str(slicers), val_chunks=val_chunks
                         )
                         self.model_init_statements.append(code)
@@ -480,7 +481,7 @@ class ModuleCodeGen(FuncEmission):
                         if not hasattr(self._ref_module, name[5:]):
                             raise NotImplementedError("member attribute is not added")
             for output in node.outputs():
-                self.symbols.create(ModuleCodeGen.tensor_name(output, prefix_attr='self.'))
+                self.symbols.create(self.tensor_name(output, prefix_attr='self.'))
         else:
             for sub_node in node.nodes():
                 self.init_attributes(sub_node)
@@ -516,15 +517,14 @@ class ModuleCodeGen(FuncEmission):
             reducer=reducer_name, ranks=ranks, reduce_op=reduce_op,
             async_op=async_op, zero=zero, max_nbytes=max_nbytes, zero_ngroups=zero_ngroups)
         self.model_init_statements.append(init_code)
-        weights = [ModuleCodeGen.tensor_name(t, prefix_attr='self.') for t in weights]
+        weights = [self.tensor_name(t, prefix_attr='self.') for t in weights]
         for weight in weights:
             add_param_code = add_param.format(reducer=reducer_name, weight=weight)
             self.model_init_statements.append(add_param_code)
         add_code = reducer_add.format(reducer=reducer_name)
         self.model_init_statements.append(add_code)
 
-    @staticmethod
-    def emit_segment(segment: IRSegment) -> List[str]:
+    def emit_segment(self, segment: IRSegment) -> List[str]:
         """
         Emit IRSegment code.
 
@@ -564,11 +564,11 @@ class ModuleCodeGen(FuncEmission):
             assert len(rc_group) > 0
             gid: Optional[int] = rc_group[0].recompute
             if gid is None:
-                codes += ModuleCodeGen._emit_nodes(rc_group, lifetime)
+                codes += self._emit_nodes(rc_group, lifetime)
             else:
                 # get recompute excution code
                 rc_segment = segment.create_segment(rc_group)
-                rc_codes = ModuleCodeGen._emit_recompute(rc_group,
+                rc_codes = self._emit_recompute(rc_group,
                     rc_segment.inputs(), rc_segment.outputs(), lifetime)
                 codes += rc_codes
                 # release input tensors after exiting a RC group:
@@ -577,13 +577,12 @@ class ModuleCodeGen(FuncEmission):
                 if last_node != nodes[-1]: # skip if it is the last node
                     inputs_to_rel = [t for t in rc_segment.inputs() if lifetime.releasable_after_line(t, line)]
                     if len(inputs_to_rel) > 0:
-                        del_stmt = ModuleCodeGen.emit_release(inputs_to_rel)
+                        del_stmt = self.emit_release(inputs_to_rel)
                         codes.append(del_stmt)
 
         return codes
 
-    @staticmethod
-    def _emit_nodes(nodes: List[IRCell], lifecycle: LifeCycle) -> List[str]:
+    def _emit_nodes(self, nodes: List[IRCell], lifecycle: LifeCycle) -> List[str]:
         """
         Emit code to invoke operations and adapter,
         e.g. (the lines are split into `List[str]`)
@@ -602,22 +601,21 @@ class ModuleCodeGen(FuncEmission):
         for node in nodes:
             # execute
             if isinstance(node, IRFwOperation):
-                code = ModuleCodeGen.emit_fnode(node, prefix_attr='self.')
+                code = self.emit_fnode(node, prefix_attr='self.')
                 node_codes += code
             elif isinstance(node, IRAdapter):
-                code = ModuleCodeGen.emit_adapter(node)
+                code = self.emit_adapter(node)
                 node_codes += code
             else:
                 raise RuntimeError(f"unexpected type {type(node)} in IRSegment")
             # release
             tensors_to_del = lifecycle.release_tensors_after_node(node)
             if len(tensors_to_del) > 0:
-                node_codes.append(FuncEmission.emit_release(tensors_to_del))
+                node_codes.append(self.emit_release(tensors_to_del))
 
         return node_codes
 
-    @staticmethod
-    def _emit_recompute(nodes: Tuple[IRCell], inputs: List[IRSubTensor], outputs: List[IRSubTensor],
+    def _emit_recompute(self, nodes: Tuple[IRCell], inputs: List[IRSubTensor], outputs: List[IRSubTensor],
                         lifecycle: LifeCycle) -> List[str]:
         """
         Emit code to define a Python function for Recomputing and invoke it
@@ -648,9 +646,9 @@ class ModuleCodeGen(FuncEmission):
         assert len(nodes) > 0
 
         inputs = [t for t in inputs if not t.is_attr()]
-        input_names = [FuncEmission.tensor_name(t) for t in inputs]
+        input_names = [self.tensor_name(t) for t in inputs]
         input_names_tuple = ', '.join(input_names)
-        output_names = [FuncEmission.tensor_name(t) for t in outputs]
+        output_names = [self.tensor_name(t) for t in outputs]
         output_names_tuple = ', '.join(output_names)
 
         # 'graph.segment(nodes)' ensures that if a tensor is no longer used (in RC group or in later code),
@@ -669,7 +667,7 @@ class ModuleCodeGen(FuncEmission):
 
             # for ncode in ModuleCodeGen._emit_nodes(nodes, lifecycle):
             #     fb.insert_body(ncode)
-            fb.insert_body(ModuleCodeGen._emit_nodes(nodes, lifecycle))
+            fb.insert_body(self._emit_nodes(nodes, lifecycle))
             fb.insert_body(f'return {output_names_tuple}')
         codes = [''] + fb.code + ['']
         codes.append(

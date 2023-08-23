@@ -7,28 +7,31 @@ from cube import ir
 from cube.ir.cten import IRTensor
 from cube.ir.operator import IRFwOperation
 
-import torch
-
 
 class Sign2EmitRule:
     """Emit rule for frontend PyTorch codegen"""
 
-    _sign2rule = {}
+    def __init__(self) -> None:
+        # the registered emit rules
+        self._sign2rule = {
+            'torch.slice': self.emit_slice,
+            'setattr': self.emit_setattr,
+            'builtins.getattr': self.emit_getattr,
+            '_operator.getitem': self.emit_getitem,
+        }
 
-    @staticmethod
-    def map(signature: str) -> Callable:
+    def map(self, signature: str) -> Callable:
         """Get the emit rule for the given signature
-        
+
         Args:
             signature (str): signature of the operator
 
         Returns:
             Callable: emit rule that takes the node, args (List[str]) and kwargs (Dict[str, str]) as input
         """
-        return Sign2EmitRule._sign2rule.get(signature, Sign2EmitRule.emit_common)
+        return self._sign2rule.get(signature, self.emit_common)
 
-    @staticmethod
-    def emit_common(node: IRFwOperation, args: List[str], kwargs: Dict[str, str]) -> str:
+    def emit_common(self, node: IRFwOperation, args: List[str], kwargs: Dict[str, str]) -> str:
         """Default rule to join all args and kwargs"""
 
         signature = node.signature
@@ -41,8 +44,7 @@ class Sign2EmitRule:
         args = ", ".join(list(args) + kw_pairs)
         return f"{signature}({args})"
 
-    @staticmethod
-    def emit_slice(node: IRFwOperation, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
+    def emit_slice(self, node: IRFwOperation, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
         """Special rule for generating slice node
 
         The op is:
@@ -71,8 +73,7 @@ class Sign2EmitRule:
 
         return f"{in_tensor_var}[{', '.join(subscript_components)}]"
 
-    @staticmethod
-    def emit_setattr(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
+    def emit_setattr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
         """Special rule for generating setattr node
         """
 
@@ -80,27 +81,15 @@ class Sign2EmitRule:
         member = f'"{arg_vars[1][5:]}"'
         return f"{node.signature}({arg_vars[0]}, {member}, {arg_vars[2]})"
 
-    @staticmethod
-    def emit_getattr(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
+    def emit_getattr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
         """Special rule for generating getattr node
         """
         return f"{node.signature}({arg_vars[0]}, '{arg_vars[1]}')"
 
-    @staticmethod
-    def emit_getitem(node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
+    def emit_getitem(self, node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
         """Special rule for generating getitem node
         """
         if len(arg_vars) == 2 and len(kw_pairs) == 0 and not arg_vars[1].replace('_', '').isdigit():
             return f"{node.signature}({arg_vars[0]}, '{arg_vars[1]}')"
         else:
-            return Sign2EmitRule.emit_common(node, arg_vars, kw_pairs)
-
-
-# the registered emit rules
-Sign2EmitRule._sign2rule = {
-    'torch.slice': Sign2EmitRule.emit_slice,
-    'setattr': Sign2EmitRule.emit_setattr,
-    'builtins.getattr': Sign2EmitRule.emit_getattr,
-    '_operator.getitem': Sign2EmitRule.emit_getitem,
-}
-
+            return self.emit_common(node, arg_vars, kw_pairs)

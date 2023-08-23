@@ -15,6 +15,7 @@ class LifeCycle:
 
         graph_inputs = IRSegment.get_objects_from_complex(graph_inputs)
         graph_outputs = IRSegment.get_objects_from_complex(graph_outputs)
+        func_emission = FuncEmission()
 
         self.nodes: Dict[int] = {node: lid for lid, node in enumerate(nodes)}
         # the last line id of consuming or producing a tensor
@@ -25,9 +26,9 @@ class LifeCycle:
         # FIXME: consider the case of IRObject in the kwargs of IRFwOperation
         # is_activation = lambda t: isinstance(t, IRObject) and not t.is_attr()
         is_activation = lambda t: isinstance(t, IRSubTensor) and not t.is_attr()
-        
+
         self.lifetime.update((tsin, 0) for tsin in graph_inputs if is_activation(tsin))
-        
+
         for i, node in enumerate(nodes):
 
             outputs : Iterable[IRObject]
@@ -41,7 +42,7 @@ class LifeCycle:
                 # backward segment
                 else:
                     fw_inputs, fw_outputs, output_grads, input_grads = \
-                        FuncEmission.get_backward_callsite_io_tensors(node)
+                        func_emission.get_backward_callsite_io_tensors(node)
                     # remove loss gradient
                     output_grads = [t for t in output_grads if not t.is_loss()]
 
@@ -73,23 +74,23 @@ class LifeCycle:
         Get the releasable IRSubTensors after finish of executing of `line_id`.
 
         @param line_id int
-        
+
         @return tensors List[IRSubTensors]: tensors that can be released.
         """
         return self.release.get(line_id, [])
-    
+
     def release_tensors_after_node(self, node: IRCell) -> List[IRSubTensor]:
         """
         Get the releasable IRSubTensors after finish of executing of the node.
 
         @param line_id int
-        
+
         @return tensors List[IRSubTensors]: tensors that can be released.
         """
         assert node in self.nodes
         line_id = self.nodes[node]
         return self.release.get(line_id, [])
-    
+
     def releasable_after_node(self, tensor: IRSubTensor, node: IRCell) -> bool:
         """
         Check if the tensor is releasable after executing the node
@@ -103,7 +104,7 @@ class LifeCycle:
         assert tensor in self.lifetime[tensor]
         line_id = self.nodes[node]
         return self.lifetime[tensor] < line_id
-    
+
     def releasable_after_line(self, tensor: IRSubTensor, line: int) -> bool:
         """
         Check if the tensor is releasable after executing the node

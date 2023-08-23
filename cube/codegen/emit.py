@@ -20,7 +20,7 @@ class IRValue:
 
     def __init__(self, name: str):
         self.name = name
-    
+
     def __repr__(self):
         return self.name
 
@@ -29,13 +29,10 @@ class CodeEmission:
     """
     Basic emission
     """
-
-    @staticmethod
-    def node_name(node: IRCell) -> str:
+    def node_name(self, node: IRCell) -> str:
         return f"{node.name}{node.cid}"
-    
-    @staticmethod
-    def tensor_name(tensor: Any, prefix_attr: Optional[str] = None) -> str:
+
+    def tensor_name(self, tensor: Any, prefix_attr: Optional[str] = None) -> str:
         """
         Return the var name.
         For tensor, return the {prefix}{tensor.name}_{tensor.tid}
@@ -54,21 +51,19 @@ class CodeEmission:
             if prefix_attr is not None and tensor.is_attr():
                 name = prefix_attr + name
         else:
-            name = str(IRSegment.modify_objects_of_complex(tensor, CodeEmission.tensor_name)).replace('\'', '')
+            name = str(IRSegment.modify_objects_of_complex(tensor, self.tensor_name)).replace('\'', '')
         return name
 
-    @staticmethod
-    def complex_name(val: Any, prefix_attr: Optional[str]=None) -> str:
+    def complex_name(self, val: Any, prefix_attr: Optional[str]=None) -> str:
         """
         Return the val name with complex data type over IRObject
         Currently support complex data type of Dict, List, Tuple, IRObject
         """
-        modifier = lambda t: IRValue(CodeEmission.tensor_name(t, prefix_attr))
+        modifier = lambda t: IRValue(self.tensor_name(t, prefix_attr))
         val = IRSegment.modify_objects_of_complex(val, modifier)
         return str(val)
 
-    @staticmethod
-    def tuple_name(tensors: List[Any],
+    def tuple_name(self, tensors: List[Any],
                    skip_attr: bool = False, prefix_attr: Optional[str] = None) -> str:
         """
         Return the tupled tensor name.
@@ -83,34 +78,31 @@ class CodeEmission:
         for t in tensors:
             if isinstance(t, IRTensor) and skip_attr and t.is_attr():
                 continue
-            names.append(CodeEmission.tensor_name(t, prefix_attr))
+            names.append(self.tensor_name(t, prefix_attr))
         name = '(' + ', '.join(names + ['']) + ')'
         return name
-    
-    @staticmethod
-    def return_name(tensors: List[Any],
+
+    def return_name(self, tensors: List[Any],
                     skip_attr: bool = False, prefix_attr: Optional[str] = None) -> str:
         names = []
         for t in tensors:
             if isinstance(t, IRTensor) and skip_attr and t.is_attr():
                 continue
-            names.append(CodeEmission.tensor_name(t, prefix_attr))
+            names.append(self.tensor_name(t, prefix_attr))
         names = '_' if len(names) == 0 else ', '.join(names)
         return names
-    
-    @staticmethod
-    def return_name_complex(vals: List[Any],
+
+    def return_name_complex(self, vals: List[Any],
                             skip_attr: bool = False, prefix_attr: Optional[str] = None) -> str:
         names = []
         for t in vals:
             if isinstance(t, IRObject) and skip_attr and t.is_attr():
                 continue
-            names.append(CodeEmission.complex_name(t, prefix_attr))
+            names.append(self.complex_name(t, prefix_attr))
         names = '_' if len(names) == 0 else ', '.join(names)
         return names
-    
-    @staticmethod
-    def kwargs_name(**kwargs) -> str:
+
+    def kwargs_name(self, **kwargs) -> str:
         """Get kwarg name"""
         names = []
         # FIXME make the str include `""`
@@ -118,23 +110,24 @@ class CodeEmission:
         #     if isinstance(val, str) and not val.startswith('self.'):
         #         kwargs[name] = '"' + val + '"'
         # turn object into name
-        modifier = lambda t: IRValue(CodeEmission.tensor_name(t))
+        modifier = lambda t: IRValue(self.tensor_name(t))
         kwargs = IRSegment.modify_objects_of_complex(kwargs, modifier)
         for name, val in kwargs.items():
             names.append(f'{name}={val}')
         name = ', '.join(names)
         return name
-    
+
 
 class FuncEmission(CodeEmission):
+    def __init__(self):
+        super().__init__()
+        self._emit_rules = Sign2EmitRule()
 
-    @staticmethod
-    def emit_dataloader(node: IRDataOperation) -> List[str]:
-        outputs = FuncEmission.return_name(node.outputs())
-        return [f'{outputs} = next({FuncEmission.tensor_name(node.input(0))})']
-    
-    @staticmethod
-    def emit_fnode(node: IRFwOperation, prefix_attr: str = None) -> List[str]:
+    def emit_dataloader(self, node: IRDataOperation) -> List[str]:
+        outputs = self.return_name(node.outputs())
+        return [f'{outputs} = next({self.tensor_name(node.input(0))})']
+
+    def emit_fnode(self, node: IRFwOperation, prefix_attr: str = None) -> List[str]:
         """Emit forward node code
 
         The result will look like (the lines are split into `List[str]`)
@@ -151,38 +144,37 @@ class FuncEmission(CodeEmission):
         # insert comment
         if node.comment is not None:
             codes.append(f'# {node.comment}')
-    
+
         signature = node.signature
         # setup arg string
-        inputs = [FuncEmission.tensor_name(t, prefix_attr=prefix_attr) for t in node.inputs()]
+        inputs = [self.tensor_name(t, prefix_attr=prefix_attr) for t in node.inputs()]
         # setup kwarg string
         kwargs = dict(**node.kwargs)
         for name, val in kwargs.items():
             if isinstance(val, str) and not val.startswith('self.'):
                 kwargs[name] = '"' + val + '"'
         # turn IRObject into name
-        modifier = lambda t: IRValue(CodeEmission.tensor_name(t))
+        modifier = lambda t: IRValue(self.tensor_name(t))
         kwargs = IRSegment.modify_objects_of_complex(kwargs, modifier)
 
-        emit_rule = Sign2EmitRule.map(signature)
+        emit_rule = self._emit_rules.map(signature)
         body = emit_rule(node, inputs, kwargs)
 
         if len(node.outputs()) == 0:
             code = body
         else:
-            outputs = [FuncEmission.tensor_name(t) for t in node.outputs()]
+            outputs = [self.tensor_name(t) for t in node.outputs()]
             outputs = ', '.join(outputs)
             code = f'{outputs} = {body}'
         codes.append(code)
         return codes
-    
-    @staticmethod
-    def emit_adapter(node: IRAdapter, prefix_attr: Optional[str] = None) -> List[str]:
+
+    def emit_adapter(self, node: IRAdapter, prefix_attr: Optional[str] = None) -> List[str]:
         """
         Emit the statment of the adapter call
-        
+
         The resultant `List[str]` will be lines of the statements of the final
-        Python method for the targeted Segment, 
+        Python method for the targeted Segment,
         without the method signature and the return statement.
 
         The fields storing intermediate codes that are populated by this method:
@@ -204,23 +196,22 @@ class FuncEmission(CodeEmission):
 
         for prim in prims:
             if len(prim.inputs()) == 1:
-                itensors = FuncEmission.tensor_name(prim.inputs()[0], prefix_attr=prefix_attr)
+                itensors = self.tensor_name(prim.inputs()[0], prefix_attr=prefix_attr)
             else:
-                itensors = FuncEmission.tuple_name(prim.inputs(), prefix_attr=prefix_attr)
+                itensors = self.tuple_name(prim.inputs(), prefix_attr=prefix_attr)
             prim_kwargs = dict(prim.kwargs)
             if async_op:
                 prim_kwargs['async_op'] = True
-            kwargs = FuncEmission.kwargs_name(**prim_kwargs)
-            outputs = FuncEmission.return_name(prim.outputs())
+            kwargs = self.kwargs_name(**prim_kwargs)
+            outputs = self.return_name(prim.outputs())
             code = f'{outputs} = {prim.signature}({itensors}, {kwargs})'
             codes.append(code)
         return codes
-    
-    @staticmethod
-    def emit_reducer(node: IRWeightReducer) -> List[str]:
+
+    def emit_reducer(self, node: IRWeightReducer) -> List[str]:
         """
         Emit the statment to invoke a reducer object.
-        
+
         The fields storing intermediate codes that are populated by this method:
         -   NONE
         """
@@ -228,13 +219,11 @@ class FuncEmission(CodeEmission):
         code = f'{reducer_name}.sync_grads()'
         return [code]
 
-    @staticmethod
-    def emit_release(tensors: Iterable[IRTensor]) -> str:
-        tnames : Generator = (FuncEmission.tensor_name(t) for t in tensors)
+    def emit_release(self, tensors: Iterable[IRTensor]) -> str:
+        tnames : Generator = (self.tensor_name(t) for t in tensors)
         return 'del ' + ', '.join(tnames)
-    
-    @staticmethod
-    def get_backward_callsite_io_tensors(bwop: IRCell) -> Tuple:
+
+    def get_backward_callsite_io_tensors(self, bwop: IRCell) -> Tuple:
         """
         Get backward inputs and outputs
         ```
@@ -242,7 +231,7 @@ class FuncEmission(CodeEmission):
         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  ~~~~~~~~~~~
         #inputs to 'backward'                         outputs of 'backward'
         ```
-        
+
         @return input_tensors List[IRSubTensor]: forward input tensors (backward input)
         @return output_tensors List[IRSubTensor]: forward output tensors (backward output)
         @return output_grads List[IRSubTensor]: gradient of forward output tensors
