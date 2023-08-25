@@ -199,7 +199,7 @@ class ProfileDataBase:
             code_impl: str = CustomizedOps.kOpCodeDef[node.signature]
             local = {}
             exec(code_impl, globals(), local)
-            fn = list(local.values())[0]
+            fn = list(local.values())[-1]
         else:
             fn = eval(node.signature)
         shapes, dtypes, requires_grads, values = [], [], [], []
