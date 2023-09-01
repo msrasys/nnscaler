@@ -28,7 +28,7 @@ class MockAGF(torch.autograd.Function):
 cube.graph.parser.register('*, * -> *')(MockAGF.apply)
 
 
-class TestModel(torch.nn.Module):
+class MockModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.fc = torch.nn.Linear(10, 10)
@@ -37,7 +37,7 @@ class TestModel(torch.nn.Module):
         x, y = self.fc(x), self.fc(y)
         return mock_add(x, y)
 
-class TestModel2(torch.nn.Module):
+class MockModel2(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.fc = torch.nn.Linear(10, 10)
@@ -46,7 +46,7 @@ class TestModel2(torch.nn.Module):
         x, y = self.fc(x), self.fc(y)
         return mock_add2(x, y)
 
-class TestModel3(torch.nn.Module):
+class MockModel3(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.fc = torch.nn.Linear(10, 10)
@@ -58,7 +58,7 @@ class TestModel3(torch.nn.Module):
 
 # passed test
 def test_common_register():
-    model = TestModel()
+    model = MockModel()
     with tempfile.TemporaryDirectory() as tempdir:
         ir_graph = convert_model(model, {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)}, tempdir, False)
 
@@ -69,7 +69,7 @@ def test_common_register():
 
 
 def test_common_register2():
-    model = TestModel2()
+    model = MockModel2()
     with tempfile.TemporaryDirectory() as tempdir:
         ir_graph = convert_model(model, {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)}, tempdir, False)
 
@@ -80,11 +80,11 @@ def test_common_register2():
 
 
 def test_autograd_register():
-    model = TestModel3()
+    model = MockModel3()
     with tempfile.TemporaryDirectory() as tempdir:
         ir_graph = convert_model(model, {'x': torch.rand(10, 10), 'y': torch.rand(10, 10)}, tempdir, False)
         
         # test profiler.database
-        for node, p_name in zip(ir_graph.nodes(), ['linear', 'linear', 'MockAGF.apply']):
+        for node, p_name in zip(ir_graph.nodes(), ['linear', 'linear', 'Function.apply']):
             profile_name = ProfileDataBase.get_func(node)[0].__qualname__
             assert profile_name == p_name, f'{profile_name} should be {p_name}'

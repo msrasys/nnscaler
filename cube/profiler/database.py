@@ -183,23 +183,8 @@ class ProfileDataBase:
         """
         assert isinstance(node, IRFwOperation), f"Only support profiling forward operation but got {type(node)}"
 
-        def get_dep_names(sign: str):
-            ret = []
-            code_impl = CustomizedOps.kOpCodeDef[sign]
-            for code_line in code_impl.split('\n'):
-                idx = code_line.find('# call: ')
-                if idx != -1:
-                    dep_name = code_line[idx + 8:]
-                    assert dep_name in CustomizedOps.kOpCodeDef, dep_name
-                    ret = ret + get_dep_names(dep_name)
-                    ret.append(dep_name)
-            return ret
-
-        if node.signature in CustomizedOps.kOpCodeDef:
-            code_impl: str = CustomizedOps.kOpCodeDef[node.signature]
-            local = {}
-            exec(code_impl, globals(), local)
-            fn = list(local.values())[-1]
+        if node.signature in CustomizedOps.kOpRuntime:
+            fn = CustomizedOps.kOpRuntime[node.signature]
         else:
             fn = eval(node.signature)
         shapes, dtypes, requires_grads, values = [], [], [], []

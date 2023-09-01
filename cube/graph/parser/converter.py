@@ -9,6 +9,7 @@ from cube.flags import CompileFlag
 
 from cube.graph.parser.fx.parser import FxModuleParser
 from cube.graph.parser.fx.concrete_trace_utils import concrete_trace
+from cube.graph.parser.fx.concrete_trace_utils.concrete_tracer import is_autograd_apply
 
 import cube.runtime.function as cube_rt_function
 
@@ -29,7 +30,9 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
         torch.fx.GraphModule representation of model
     """
     # get registered leaf function
-    autowrap_funcs = [CustomizedOps.kOpRuntime.get(sign, None) for sign in CustomizedOps.kOpAutowrap]
+    autowrap_funcs = [CustomizedOps.kOpRuntime[sign] for sign in CustomizedOps.kOpMap]
+    # filter out torch.autograd.Function.apply as concrete trace already treats them as leaf function
+    autowrap_funcs = [fn for fn in autowrap_funcs if not is_autograd_apply(fn)]
     leaf_functions = {func: ([], True, None) for func in autowrap_funcs if func is not None}
 
     # get cube runtime functions

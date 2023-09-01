@@ -137,16 +137,14 @@ class IRFwOperation(IRCell):
         return cpy
 
     def __repr__(self) -> str:
-        sign = self.signature.split('.')[-1]
-        dscp = (f"FwOp{self._id}-{self.device}(sign={sign}, "
+        dscp = (f"FwOp{self._id}-{self.device}(name={self.name}, "
                 f"inputs={self.inputs()}, "
                 f"outputs={self.outputs()})")
         return dscp
 
     def extra_repr(self) -> str:
-        sign = self.signature.split('.')[-1]
-        # ins = [t for t in self.inputs()]
-        dscp = (f"FwOp{self._id}-{self.device}(sign={sign}, "
+        dscp = (f"FwOp{self._id}-{self.device}(name={self.name}, "
+                f"sign={self.signature}, "
                 f"inputs={self.inputs()}, "
                 f"outputs={self.outputs()})")
         return dscp
