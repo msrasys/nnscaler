@@ -3,6 +3,7 @@ import itertools
 import re
 from pathlib import Path
 import shutil
+import pytest
 
 import torch
 from torch import nn
@@ -80,14 +81,14 @@ def _create_modules(pas, compute_config, cube_savedir):
     return orig_module, compiled_module
 
 
-def _train(model):
+def _train(model, update_freq):
     init_random()
 
     loss_fn = nn.BCELoss()
     optimizer = build_optimizer(model, torch.optim.Adam, lr=0.1)
     data = []
     DATA_SIZE = 20
-    UPDATE_FREQ = 1  # TODO: update_freq support
+    UPDATE_FREQ = update_freq
     for _ in range(DATA_SIZE):
         data.append((
             torch.randn((2, 4), device='cuda', dtype=torch.float32),
@@ -100,21 +101,21 @@ def _train(model):
         loss = loss_fn(y_pred, y)
         loss.backward()
         if i % UPDATE_FREQ == UPDATE_FREQ - 1:
+            optimizer.step()
             grads = {n: p.grad for n, p in model.named_parameters()}
             results.append(clone_to_cpu_recursively([y_pred, loss, grads]))
-            optimizer.step()
             optimizer.zero_grad()
             weights = {n: p.data for n, p in model.named_parameters()}
             results[-1].append(clone_to_cpu_recursively(weights))
     return results
 
 
-def _gpu_worker(pas, ngpus):
+def _gpu_worker(pas, ngpus, update_freq):
     init_distributed()
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test') as tempdir:
         orig_module, compiled_module = _create_modules(pas, ComputeConfig(ngpus, ngpus), tempdir)
-        orig_results = _train(orig_module)
-        compiled_results = _train(compiled_module)
+        orig_results = _train(orig_module, update_freq)
+        compiled_results = _train(compiled_module, update_freq)
         return (
             orig_results,
             compiled_results,
@@ -125,11 +126,12 @@ def _gpu_worker(pas, ngpus):
         )
 
 
-def test_submodules_tp_gpu1():
+@pytest.mark.parametrize('update_freq', [1, 2, 4])
+def test_submodules_tp_gpu1(update_freq):
     if not torch.cuda.is_available():
         print('skip test_submodules_tp_gpu1 due to lack of cuda devices')
         return
-    results = launch_torchrun(1, _gpu_worker, PASRandomSPMD, 1)
+    results = launch_torchrun(1, _gpu_worker, PASRandomSPMD, 1, update_freq)
     orig_results, compiled_results, _, _, _, _ = results[0]
     for orig, compiled in zip(orig_results, compiled_results):
         assert torch.allclose(orig[0], compiled[0], rtol=1e-6, atol=1e-6)  # pred
@@ -185,11 +187,12 @@ def _compare_weights(orig0, orig1, compiled0, compiled1, fc1_fullmap, fc2_fullma
         assert torch.allclose(v, orig0[k], rtol=1e-4, atol=1e-4)
 
 
-def test_submodules_tp_gpu2():
+@pytest.mark.parametrize('update_freq', [1, 2, 4])
+def test_submodules_tp_gpu2(update_freq):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         print('skip test_submodules_tp_gpu2 due to lack of cuda devices')
         return
-    results = launch_torchrun(2, _gpu_worker, PASRandomSPMD, 2)
+    results = launch_torchrun(2, _gpu_worker, PASRandomSPMD, 2, update_freq)
     results0, results1 = results[0], results[1]
     eps = 1e-4
 
@@ -219,11 +222,12 @@ def test_submodules_tp_gpu2():
         _compare_weights(orig0[3], orig1[3], compiled0[3], compiled1[3], fc1_fullmap, fc2_fullmap, fc1_dist_param_map, fc2_dist_param_map)
 
 
-def test_submodules_dp_gpu1():
+@pytest.mark.parametrize('update_freq', [1, 2, 4])
+def test_submodules_dp_gpu1(update_freq):
     if not torch.cuda.is_available():
         print('skip test_submodules_dp_gpu1 due to lack of cuda devices')
         return
-    results = launch_torchrun(1, _gpu_worker, PASData, 1)
+    results = launch_torchrun(1, _gpu_worker, PASData, 1, update_freq)
     orig_results, compiled_results, _, _, _, _ = results[0]
     for orig, compiled in zip(orig_results, compiled_results):
         assert torch.allclose(orig[0], compiled[0], rtol=1e-6, atol=1e-6)  # pred
@@ -242,12 +246,13 @@ def test_submodules_dp_gpu1():
             assert torch.allclose(orig[3][k], compiled_cleaned[k.replace('.', '_')], rtol=1e-6, atol=1e-6)
 
 
-def test_submodules_dp_gpu2():
+@pytest.mark.parametrize('update_freq', [1, 2, 4])
+def test_submodules_dp_gpu2(update_freq):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         print('skip test_submodules_dp_gpu2 due to lack of cuda devices')
         return
     eps = 1e-4
-    results = launch_torchrun(2, _gpu_worker, PASData, 2)
+    results = launch_torchrun(2, _gpu_worker, PASData, 2, update_freq)
     for r in results.values():
         orig_results, compiled_results, _, _, _, _ = r
         for orig, compiled in zip(orig_results, compiled_results):

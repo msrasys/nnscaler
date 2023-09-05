@@ -369,30 +369,6 @@ class CubeModule(torch.nn.Module):
                     }, filename_prefix + '.full.ckpt')
 
 
-class _AddGradModule(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, *args):
-        if not self.training:
-            return args
-
-        new_args = []
-        found_tensor = False
-        for arg in args:
-            if isinstance(arg, torch.Tensor):
-                found_tensor = True
-                new_arg = arg
-                if not arg.requires_grad:
-                    new_arg = arg.clone().requires_grad_(True)
-                new_args.append(new_arg)
-            else:
-                new_args.append(arg)
-        if not found_tensor:
-            raise RuntimeError("Failed to setup module backward hook: no input Tensors.")
-        return tuple(new_args)
-
-
 class ParallelModule(CubeModule):
     COMPUTE_CONFIG_FILE = 'compute_config.pt'
 
@@ -401,11 +377,8 @@ class ParallelModule(CubeModule):
             raise RuntimeError(f"ParallelModule should not be initialized directly. Please derive it first")
 
         super().__init__()
-
-        # register_full_backward_pre_hook requires the input tensor to be requires_grad
-        # so we add a module to make sure the input tensor requires grad
-        self._add_grad_module = _AddGradModule()
-        self._add_grad_module.register_full_backward_pre_hook(self.backward_hook)
+        # this is used to allow multiple sync_grad() calls
+        self._sync_grad_required = False
 
     def _post_init(self):
         module_file = Path(sys.modules[self.__module__].__file__)
@@ -418,10 +391,8 @@ class ParallelModule(CubeModule):
 
     def forward(self, *args, **kwargs):
         if self.training:
-            new_args = self._add_grad_module(*args)
-        else:
-            new_args = args
-        return self._forward_impl(*new_args, **kwargs)
+            self._sync_grad_required = True  # mark sync_grad() can be called again
+        return self._forward_impl(*args, **kwargs)
 
     def _forward_impl(self, *args, **kwargs):
         """
@@ -429,12 +400,14 @@ class ParallelModule(CubeModule):
         """
         raise NotImplementedError
 
-    def backward_hook(self, module, grad_output):
+    def sync_grad(self):
         """
-        backward hook for gradient synchronization
+        synchronize gradients using allreduce (non-zero) or reduce-scatter (zero)
         """
-        for reducer in self.reducers:
-            reducer.sync_grads()
+        if self._sync_grad_required:
+            self._sync_grad_required = False  # mark sync_grad() has been called
+            for reducer in self._reducers:
+                reducer.sync_grads()
 
     def get_dist_param_map(self):
         return self._dist_param_map

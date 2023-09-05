@@ -39,12 +39,12 @@ class Bucket:
 
     def __init__(self, params: List[torch.nn.Parameter],
                  param_buffer: torch.Tensor, grad_buffer: torch.Tensor,
-                 reduce_op: torch.distributed.ReduceOp, 
+                 reduce_op: torch.distributed.ReduceOp,
                  group, async_op: bool, zero: bool,
                  zero_subgroup: torch.distributed.ProcessGroup = None):
         """
         Create a communication unit for parameter allreduce.
-        
+
         One allreduce will be called for all gradients associated to the parameters.
         The parameters are assumed to participate in backward and generate gradient.
 
@@ -104,7 +104,7 @@ class Bucket:
     def zero(self) -> bool:
         """Whether enable zero for this bucket"""
         return self._zero
-    
+
     def build(self):
         """
         Build offset for each parameter
@@ -181,8 +181,8 @@ class Bucket:
     def sync_grads(self):
         """
         Wait until allreduce finished (async), or perform allreduce (sync).
-        
-        The `.grad` attribute for each parameter will also be set after 
+
+        The `.grad` attribute for each parameter will also be set after
         the completion of allreduce.
         """
         rank = torch.distributed.get_rank(group=self._group)
@@ -270,7 +270,7 @@ class Bucket:
 
     def _apply_post_hooks(self):
         """Apply post hooks after gradient synchronization.
-        
+
         The post-hooks will be applied one by one following the order of registration.
         """
         if len(self._post_hooks) == 0: return
@@ -281,7 +281,7 @@ class Bucket:
     def clear_pre_hooks(self):
         """Clear all pre hooks."""
         self._pre_hooks = []
-    
+
     def clear_post_hooks(self):
         """Clear all post hooks."""
         self._post_hooks = []
@@ -442,7 +442,7 @@ class Reducer:
             padding = len(self._ranks) - numel % len(self._ranks)
             buffer_length += numel + padding
             stops.append(buffer_length)
-        
+
         # step3: allocate memory
         # gradient buffer
         self._contiguous_grads: torch.Tensor = torch.zeros(
@@ -465,8 +465,8 @@ class Reducer:
                 ofst += param.numel()
             # initialize buckets
             bucket = Bucket(
-                params, 
-                self._contiguous_params[start:stop], 
+                params,
+                self._contiguous_params[start:stop],
                 self._contiguous_grads[start:stop],
                 self._reduce_op,
                 self._group,
@@ -484,7 +484,7 @@ class Reducer:
 
     def sync_grads(self):
         """
-        synchronize gradients using allreuce (non-zero) or reduce-scatter (zero)
+        synchronize gradients using allreduce (non-zero) or reduce-scatter (zero)
         """
         if RuntimeFlag.skip_reducer: return
         for bucket in self._buckets:
@@ -501,7 +501,7 @@ class Reducer:
 
     def zero_grad(self):
         """Make gradient to be zero.
-        
+
         This needs to be called at the beginning of every training iteration.
         """
         if RuntimeFlag.skip_zero_grad: return
@@ -535,7 +535,7 @@ class Reducer:
 
         A reducer can be registered by multiple hooks and the hooks will be
         applied in the order of registration.
-        
+
         The hook function takes a contiguous buffer of local computed gradient
         and can optionally apply in-place operations on it.
 
@@ -560,7 +560,7 @@ class Reducer:
 
         A reducer can be registered by multiple hooks and the hooks will be
         applied in the order of registration.
-        
+
         The hook function takes a contiguous buffer of updated gradient
         and can only apply in-place operations on it.
 

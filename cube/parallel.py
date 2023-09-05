@@ -1,16 +1,21 @@
+from functools import partial
 import types
-from typing import Callable, Any, Dict, Optional, Type, Union
+from typing import Callable, Any, Dict, Optional, Type, Union, TypeVar
 from pathlib import Path
 import inspect
 import sys
 import importlib
 from dataclasses import dataclass
+from contextlib import contextmanager
+import logging
 
 import torch
 from cube.graph.parser.fx.parser import FxModuleParser
 
 from cube.ir.cten import IRObject
 from cube.ir.tensor import IRFullTensor
+
+from cube.flags import CompileFlag, RuntimeFlag
 
 from cube.graph import IRGraph
 from cube.graph import parser
@@ -25,13 +30,41 @@ from cube.execplan.planpass.grouping import Grouping
 from cube.execplan.planpass.fusion import DiffFusion
 from cube.ir.unique import IDGenerator
 from cube.program import Program
+from cube.runtime.adapter.reducer import Reducer
 from cube.runtime.module import CubeModule, ParallelModule
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ComputeConfig:
     plan_ngpus: int
     runtime_ngpus: int
+
+
+@contextmanager
+def _flags(flags, warning_on_override=True, **kwargs):
+    old_flags = {}
+    for k, v in kwargs.items():
+        old_flags[k] = getattr(flags, k)
+        if old_flags[k] != v:
+            if warning_on_override:
+                logger.warning(f"{flags}.{k}={old_flags[k]} is not supported. Changed to {v}.")
+        setattr(flags, k, v)
+    try:
+        yield
+    finally:
+        for k, v in old_flags.items():
+            setattr(flags, k, v)
+
+
+def _compile_flags():
+    return _flags(CompileFlag, use_zero=False, async_reducer=False, reducer_op='sum', async_comm=False)
+
+
+def _runtime_flags(**kwargs):
+    return _flags(RuntimeFlag, warning_on_override=False, **kwargs)
 
 
 def _complex(val: Any):
@@ -250,7 +283,7 @@ def _gencode(
     runtime_ngpus = None if compute_config.plan_ngpus == compute_config.runtime_ngpus else compute_config.runtime_ngpus
     assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
     mgener = ModuleCodeGen(execplan, scale_ndevs=runtime_ngpus)
-    for rank in range(compute_config.plan_ngpus):
+    for rank in range(compute_config.runtime_ngpus):
         filename = _GENCODE_FILE_TEMPLATE.format(rank)
         mgener.gen(rank, forward_arg_names=forward_args, outfile=outdir / filename, attach=False, as_parallel_module=True)
 
@@ -354,17 +387,17 @@ def parallelize(
 
         if any(isinstance(m, CubeModule) for m in module.modules()):
             raise RuntimeError('CubeModule can not be nested.')
-
-        _gencode(
-            module,
-            dummy_input,
-            pas_policy,
-            compute_config,
-            dynamic_shape=dynamic_shape,
-            override=override,
-            cube_savedir=cube_savedir,
-            instance_name=instance_name,
-        )
+        with _compile_flags():
+            _gencode(
+                module,
+                dummy_input,
+                pas_policy,
+                compute_config,
+                dynamic_shape=dynamic_shape,
+                override=override,
+                cube_savedir=cube_savedir,
+                instance_name=instance_name,
+            )
         if is_module_class:
             del module
 
@@ -385,12 +418,51 @@ def parallelize(
             return cube_module
 
 
+class ParallelOptimizer(torch.optim.Optimizer):
+    """
+    A optimizer stub to support parallelized module.
+    The returned optimizer of build_optimizer() will have the same methods in this class.
+    """
+    def sync_shard_grad(self):
+        """
+        Sync the shard gradients of the module from nodes with same shard to the optimizer.
+        Please note this is called automatically in optimizer.step().
+        But If you want to access the gradients before optimizer.step(),
+        you need to call this function manually.
+        """
+        ...
+
+    def register_reducer_pre_hook(self, fn: Callable[[Reducer, torch.Tensor], None]):
+        """
+        Register pre hooks to reducers which will be applied before gradient synchronization.
+
+        The pre-hooks will be applied one by one following the order of registration.
+
+        Args:
+            fn (Callable[[Reducer, torch.Tensor], None]): a callable function that takes a reducer and a gradient as input and optionally updates the gradient.
+        """
+        ...
+
+    def register_reducer_post_hook(self, fn: Callable[[Reducer, torch.Tensor], None]):
+        """
+        Register post hooks to reducers which will be applied after gradient synchronization.
+
+        The post-hooks will be applied one by one following the order of registration.
+
+        Args:
+            fn (Callable[[Reducer, torch.Tensor], None]): a callable function that takes a reducer and a gradient as input and optionally updates the gradient.
+        """
+        ...
+
+OptimizerT = TypeVar('OptimizerT', bound=torch.optim.Optimizer)
+
+
 def build_optimizer(
     module: torch.nn.Module,
-    optimizer_fn: Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]],
+    optimizer_fn: Union[Type[OptimizerT], Callable[..., OptimizerT]],
     *args,
     **kwargs,
-) -> torch.optim.Optimizer:
+) -> OptimizerT:
     """
     Build an optimizer for a module.
 
@@ -400,12 +472,12 @@ def build_optimizer(
         so we need to replace the parameters of optimizer with CubeModule.parameters_for_optimizer
         It is impossible to make this change transparent to end users.
     2. optimizer.step():
+        we need to call optimier.sync_shard_grad() to sync the gradients of the module before optimizer.step().
         In zero mode, we have to call CubeModule.gather_params() after optimizer.step()
     3. optimizer.zero_grad():
         We need to call CubeModule.zero_grad() after optimizer.zero_grad()
     4. backward():
-        we need to call CubeModule.sync_grads() after each CubeModule backward.
-        This is done with _AddGradModule and its hook in ParallelModule.
+        you need to call optimizer.sync_shard_grad() manually if you want to read the gradients of the module before optimizer.step().
 
     Please note this DOES NOT work in end2end mode.
 
@@ -419,10 +491,15 @@ def build_optimizer(
 
     Returns:
         torch.optim.Optimizer: the optimizer you should use to train the module
+        The optimizer is created by optimizer_fn,
+        and will be patched with the methods in ParallelModule class to support parallelized module.
     """
 
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
         raise RuntimeError("End2End mode is not supported")
+
+    RuntimeFlag.skip_reducer = True
+    RuntimeFlag.skip_zero_grad = False
 
     def _local_parameters(module: torch.nn.Module):
         gen = module._named_members(lambda m: m._parameters.items())
@@ -431,18 +508,53 @@ def build_optimizer(
 
     optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), *args, **kwargs)
 
-    def _step_hook(opt, *args, **kwargs):
+    def _step_pre_hook(opt, *args, **kwargs):
+        opt.sync_shard_grad()
+    def _step_post_hook(opt, *args, **kwargs):
         for m in module.modules():
-            if isinstance(m, CubeModule):
+            if isinstance(m, ParallelModule):
                 m.gather_params()
-    optimizer.register_step_post_hook(_step_hook)
+            else:
+                assert not isinstance(m, CubeModule), "Only ParallelModule is supported in this mode"
+    optimizer.register_step_pre_hook(_step_pre_hook)
+    optimizer.register_step_post_hook(_step_post_hook)
 
     orig_zero_grad = optimizer.zero_grad
     def _patched_zero_grad_hook(self, set_to_none: bool = True):
         orig_zero_grad(set_to_none)
         for m in module.modules():
-            if isinstance(m, CubeModule):
+            if isinstance(m, ParallelModule):
                 m.zero_grad()
+            else:
+                assert not isinstance(m, CubeModule), "Only ParallelModule is supported in this mode"
     optimizer.zero_grad = types.MethodType(_patched_zero_grad_hook, optimizer)
+
+    def _sync_shard_grad(self):
+        with _runtime_flags(skip_reducer=False):
+            for m in module.modules():
+                if isinstance(m, ParallelModule):
+                    m.sync_grad()
+                else:
+                    assert not isinstance(m, CubeModule), "Only ParallelModule is supported in this mode"
+    optimizer.sync_shard_grad = types.MethodType(_sync_shard_grad, optimizer)
+
+    def _register_reducer_pre_hook(self, fn: Callable[[Reducer, torch.Tensor], None]):
+        for m in module.modules():
+            if isinstance(m, ParallelModule):
+                for reducer in m.reducers:
+                    reducer.register_pre_hook(partial(fn, reducer))
+            else:
+                assert not isinstance(m, CubeModule), "Only ParallelModule is supported in this mode"
+
+    def _register_reducer_post_hook(self, fn: Callable[[Reducer, torch.Tensor], None]):
+        for m in module.modules():
+            if isinstance(m, ParallelModule):
+                for reducer in m.reducers:
+                    reducer.register_post_hook(partial(fn, reducer))
+            else:
+                assert not isinstance(m, CubeModule), "Only ParallelModule is supported in this mode"
+
+    optimizer.register_reducer_pre_hook = types.MethodType(_register_reducer_pre_hook, optimizer)
+    optimizer.register_reducer_post_hook = types.MethodType(_register_reducer_post_hook, optimizer)
 
     return optimizer

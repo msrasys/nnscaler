@@ -88,9 +88,9 @@ def _train(model):
         loss = loss_fn(y_pred, y)
         loss.backward()
         if i % UPDATE_FREQ == UPDATE_FREQ - 1:
+            optimizer.step()
             grads = {n: p.grad for n, p in model.named_parameters()}
             results.append(clone_to_cpu_recursively([y_pred, loss, grads]))
-            optimizer.step()
             optimizer.zero_grad()
             weights = {n: p.data for n, p in model.named_parameters()}
             results[-1].append(clone_to_cpu_recursively(weights))
