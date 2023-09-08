@@ -1,6 +1,6 @@
 import os
 plan_ngpus = int(os.environ['PLAN_NGPUS'])
-runtime_ngpus = int(os.environ['CUBE_SCALING_FACTOR'])
+runtime_ngpus = int(os.environ['CUBE_SCALING_FACTOR']) * plan_ngpus
 
 # 1. load graph
 from cube.graph import IRGraph
