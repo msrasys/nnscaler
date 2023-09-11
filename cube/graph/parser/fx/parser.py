@@ -101,6 +101,7 @@ class FxModuleParser:
             dynamic_shape (bool): whether to parse the module with dynamic shape
         """
         from cube.graph.parser.fx.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
+        from cube.graph.parser.fx.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import TensorMetadata
 
         frame = frame if frame is not None else Frame()
         frame.push_var()
@@ -117,35 +118,25 @@ class FxModuleParser:
         for idx, input in enumerate(inputs):
             assert isinstance(input, torch.fx.Node)
             # dealing with different types of dummy_inputs
-            if isinstance(dummy_inputs, dict):
-                if input.name not in dummy_inputs:
-                    val = IRObject(input.name)
-                else:
-                    if 'tensor_meta' in input.meta:
-                        shape = input.meta['tensor_meta'].shape
-                        if len(shape) == 0:
-                            shape = [1]
-                        dtype = input.meta['tensor_meta'].dtype
-                        val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
-                    else:
-                        val = IRObject(input.name, value=dummy_inputs[input.name])
+            if not isinstance(dummy_inputs, dict):
+                raise RuntimeError('dummy_inputs should be a dict.')
+            if input.name not in dummy_inputs:
+                val = IRObject(input.name)
             else:
-                # FIXME: this part is only for transformers.tokenization_utils_base.BatchEncoding,
-                # extend to other input types
-                if hasattr(dummy_inputs, input.name):
-                    shape = getattr(dummy_inputs, input.name).size()
+                if 'tensor_meta' in input.meta and isinstance(input.meta['tensor_meta'], TensorMetadata):
+                    shape = input.meta['tensor_meta'].shape
+                    if len(shape) == 0:
+                        shape = [1]
+                    dtype = input.meta['tensor_meta'].dtype
+                    val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
                 else:
-                    # FIXME: seems the kwargs name (e.g., _deprecated_arguments) is not aligned with input.name
-                    shape = None
-                dtype = input.meta['tensor_meta'].dtype
-                val = IRFullTensor(shape=shape, requires_grad=False, dtype=dtype, name=input.name)
+                    val = IRObject(input.name, value=dummy_inputs[input.name])
             frame.add_var(input.name, val, graph_arg=idx)
 
         input_val = [frame.get_var(input.name) for input in inputs]
 
         # add activations to frame, including call_func/call_method output and final output
         # call_module corresponds to leaf torch.nn.module
-        from cube.graph.parser.fx.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import TensorMetadata
         activation_op_strs = {'call_function', 'output', 'call_method', 'call_module'}
         activation_nodes = [node for node in module.graph.nodes if node.op in activation_op_strs]
         def parse_complex_out(meta_out):
