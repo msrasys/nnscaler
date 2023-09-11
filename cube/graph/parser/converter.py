@@ -15,6 +15,7 @@ import cube.runtime.function as cube_rt_function
 
 import torch
 import torch.fx
+from torch.autograd.graph import saved_tensors_hooks
 
 _logger = logging.getLogger(__name__)
 
@@ -40,15 +41,25 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     leaf_functions.update({func: ([(cube_rt_function, func.__name__)], True, None) for func in cube_rt_funcs})
     dce_ignored_funcs = set(cube_rt_funcs)
 
-    traced_model = concrete_trace(
-        model,
-        dummy_input,
-        use_operator_patch=True,
-        autowrap_leaf_function=leaf_functions,
-        dce_ignored_function=dce_ignored_funcs,
-        cpu_offload=True,
-        record_frames=not CompileFlag.disable_code_line_info,
-    )
+    class no_save_tensor_hook(saved_tensors_hooks):
+        """skip saving tensors for backward since tracer only traces forward"""
+        def __init__(self):
+            def pack(x):
+                return None
+            def unpack(x):
+                raise RuntimeError("not expecting backward to be called on this tensor")
+            super().__init__(pack, unpack)
+
+    with no_save_tensor_hook():
+        traced_model = concrete_trace(
+            model,
+            dummy_input,
+            use_operator_patch=True,
+            autowrap_leaf_function=leaf_functions,
+            dce_ignored_function=dce_ignored_funcs,
+            cpu_offload=True,
+            record_frames=not CompileFlag.disable_code_line_info,
+        )
     return traced_model
 
 
