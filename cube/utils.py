@@ -77,6 +77,8 @@ def load_eval_schedule(filename: Optional[str] = None):
 class accum_mode:
     """Make cube execution in gradient accumulation mode.
 
+    This is only required when `ASYNC_REDUCER=1`.
+
     A typical usage is:
 
     ```

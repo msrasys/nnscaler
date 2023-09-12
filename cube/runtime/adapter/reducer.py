@@ -63,8 +63,8 @@ class Bucket:
         self._reduce_op = reduce_op
         self._group = group
         self._wsz: int = torch.distributed.get_world_size(group=self._group)
-        self._cnt = 0
-        self._work = None  # communication handle
+        self._async_param_cnt: int = 0  # flag for triggering async communication
+        self._async_handle = None  # asynchrounous communication handler
         self._hooks: List[Tuple[Any, RemovableHandle]] = []
 
         self._async: bool = async_op
@@ -147,26 +147,28 @@ class Bucket:
             param.grad = None
 
             if RuntimeFlag.skip_reducer: return
-
-            self._cnt += 1
-            assert self._cnt <= len(self._params), \
-                "detected double backward for a weight (not supported), or not use `model.zero_grad()` after optimizer"
+            self._async_param_cnt += 1
 
             # perform all-reduce
-            if self._async and self._cnt == len(self._params):
-                # apply pre hooks
-                self._apply_pre_hooks()
-                # communication
-                if self._zero and Bucket.use_reduce_scatter_for_zero:
-                    rank = torch.distributed.get_rank(group=self._group)
-                    shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
-                    self._work = torch.distributed.reduce_scatter(
-                        shards[rank], shards, op=self._reduce_op,
-                        group=self._group, async_op=True)
-                else:
-                    self._work = torch.distributed.all_reduce(
-                        self._contiguous_grads, op=self._reduce_op,
-                        group=self._group, async_op=True)
+            if self._async:
+                if self._async_param_cnt > len(self._params):
+                    raise RuntimeError(
+                        "Detected gradient accumulation with asynchronous Reducer. "
+                        "Users should run with `cube.accum_mode` to manage gradient synchronization.")
+                if self._async_param_cnt == len(self._params):
+                    # apply pre hooks
+                    self._apply_pre_hooks()
+                    # communication
+                    if self._zero and Bucket.use_reduce_scatter_for_zero:
+                        rank = torch.distributed.get_rank(group=self._group)
+                        shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
+                        self._async_handle = torch.distributed.reduce_scatter(
+                            shards[rank], shards, op=self._reduce_op,
+                            group=self._group, async_op=True)
+                    else:
+                        self._async_handle = torch.distributed.all_reduce(
+                            self._contiguous_grads, op=self._reduce_op,
+                            group=self._group, async_op=True)
 
         for param in self._params:
             # same trick with FSDP and Megatron
@@ -191,8 +193,8 @@ class Bucket:
             if CudaTimer().enabled and CudaTimer().predefined:
                 _logger.warning(
                     f'CudaTimer: the communication time of async reducer will not be recorded in `comm`')
-            assert self._work is not None
-            self._work.wait()
+            assert self._async_handle is not None
+            self._async_handle.wait()
         else:
             CudaTimer().start('comm', predefined=True)
             # apply pre-hooks
@@ -288,8 +290,8 @@ class Bucket:
 
     def reset(self):
         """Reset status."""
-        self._cnt = 0
-        self._work = None
+        self._async_param_cnt = 0
+        self._async_handle = None
 
 
 class Reducer:
