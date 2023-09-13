@@ -1021,6 +1021,7 @@ def _reshape_anno(in_shape: List[int], ou_shape: List[int], kwarg_name: str) -> 
         identifier = ifirst[dim]
         oidx = ofirst.index(identifier)
         if isinstance(kwargs[kwarg_name], IRObject):
+            _logger.warning(f'partition size in IRObject: {kwargs[kwarg_name]}')
             size = list(kwargs[kwarg_name].value)
         else:
             size = list(kwargs[kwarg_name])

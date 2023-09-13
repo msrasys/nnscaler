@@ -135,8 +135,6 @@ class CubeModule(torch.nn.Module):
         :return: merged state_dict(model_state_dict, optimizer_state_dict,)
         """
         assert len(state_dicts) > 0
-        if len(state_dicts) == 1:
-            return state_dicts[0][0], state_dicts[0][1]
 
         plan_ngpus = -1
         # TODO: remove this flag
@@ -306,7 +304,8 @@ class CubeModule(torch.nn.Module):
                 tensor_size = []
                 for dim_slice in tensor_size_slice:
                     tensor_size.append(dim_slice.stop)
-                param_full_tensors[raw_name] = torch.zeros(tuple(tensor_size))
+                partial_tensor = model_state_dict[local_name_with_id]
+                param_full_tensors[raw_name] = torch.zeros(tuple(tensor_size), dtype=partial_tensor.dtype)
 
                 index = model_state_dict_keys.index(local_name_with_id)
                 if index in optimizer_state_dict['state']:
