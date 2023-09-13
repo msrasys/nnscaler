@@ -9,6 +9,8 @@ def _allreduce(itensor: torch.Tensor, ranks: Tuple[int]) -> torch.Tensor:
     CudaTimer().start(field_name='comm', predefined=True)
     if not itensor.is_contiguous():
         itensor = itensor.contiguous()
+    # force allreduce not to be in-place
+    itensor = itensor.detach().clone()
     group = DeviceGroup().get_group(ranks)
     torch.distributed.all_reduce(itensor, group=group)
     CudaTimer().stop(field_name='comm', predefined=True)
