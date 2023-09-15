@@ -82,18 +82,6 @@ def _all2all_worker(async_op):
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
 
-def _exchange_worker(async_op):
-    shape = [128, 256]
-
-    tensor = _get_tensor(shape)
-    otensor = cube.runtime.adapter.exchange(tensor, [0, 1], async_op=async_op)
-
-    if async_op:
-        otensor = cube.runtime.executor.AsyncCommHandler().wait(otensor)
-
-    return (clone_to_cpu(tensor), clone_to_cpu(otensor))
-
-
 def _2gpu_worker():
     _init_distributed(2)
     result = {}
@@ -107,8 +95,6 @@ def _2gpu_worker():
     result['reduce_scatter_async'] = _reduce_scatter_worker(True)
     result['all2all'] = _all2all_worker(False)
     result['all2all_async'] = _all2all_worker(True)
-    result['exchange'] = _exchange_worker(False)
-    result['exchange_async'] = _exchange_worker(True)
 
     return result
 
@@ -149,11 +135,6 @@ def test_2gpu():
         out1 = torch.concat([in0[1], in1[1]], dim=0)
         assert torch.equal(outputs[0][1], out0)
         assert torch.equal(outputs[1][1], out1)
-
-        # check exchange
-        outputs = results[0][f'exchange{op}'], results[1][f'exchange{op}']
-        assert torch.equal(outputs[0][1], outputs[1][0])
-        assert torch.equal(outputs[1][1], outputs[0][0])
 
 
 def _rdscatter_worker(async_op):

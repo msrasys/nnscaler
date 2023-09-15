@@ -1,1 +1,1 @@
-from cube.graph.schedule.strategy import IRScheduleStrategy
+from cube.graph.schedule.schedplan import SchedulePlan

@@ -8,7 +8,7 @@ from cube.ir.tensor import IRSubTensor, IRFullTensor
 from cube.ir.adapter import IRAdapter, IRWeightReducer
 from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from cube.graph.graph import IRGraph, IRSegment
-from cube.graph.schedule.schedplan import SchedulePlan, Block, Repetend
+from cube.graph.schedule.schedplan import SchedulePlan, Block
 
 
 class ExeReuseCell(IRCell):
@@ -72,61 +72,6 @@ class ExeReuseCell(IRCell):
         return f'ReuseCell-{self.device}(name={self._cell.name}{self._cell.cid}, inputs={self.inputs()}, outputs={self.outputs()})'
 
 
-class ExeRepetend(IRCell):
-    """
-    A cell that will be repeatedly executed for multiple times
-    on a sequence of nodes
-    """
-
-    def __init__(self, nodes: List[IRCell], repeat: int = 1):
-        super().__init__('repetend', 'None', 0, 0, init_outputs=False)
-        self._nodes: List[IRCell] = nodes
-        self._repeat = repeat
-    
-    @property
-    def repeat(self) -> int:
-        return self._repeat
-    
-    @property
-    def device(self) -> Tuple[int]:
-        device = set()
-        for node in self._nodes:
-            device.update(node.device)
-        return tuple(device)
-    
-    def nodes(self) -> Tuple[IRCell]:
-        return tuple(self._nodes)
-    
-    def isfw(self) -> bool:
-        return all(n.isfw() for n in self._nodes)
-    
-    def dispatch(self, devid: int) -> IRCell:
-        nodes = []
-        for n in self._nodes:
-            if devid in n.device:
-                nodes.append(n.dispatch(devid))
-        repetend = ExeRepetend(nodes, self.repeat)
-        repetend._id = self._id
-    
-    def add(self, node: IRCell):
-        """
-        Append a node
-        """
-        self._nodes.append(node)
-
-    def pop(self, index: int) -> IRCell:
-        return self._nodes.pop(index)
-    
-    def remove(self, node: IRCell):
-        return self._nodes.remove(node)
-
-    def __repr__(self) -> str:
-        dscp = f'Repetend{self.cid}-{self.device}(repeat={self.repeat}\n'
-        for n in self._nodes:
-            dscp += '  ' + str(n) + '\n'
-        dscp += ')'
-        return dscp
-
 
 class ExecutionPlan:
     """
@@ -181,15 +126,7 @@ class ExecutionPlan:
             
         topo_seqs: List[IRCell] = []
         for block in schedplan.nodes():
-            # convert repetends and blocks
-            if isinstance(block, Repetend):
-                nodes: List[ExeReuseCell] = []
-                for node in block.nodes():
-                    if isinstance(node, Block):
-                        node = block2reuse(node)
-                    nodes.append(node)
-                block = ExeRepetend(nodes, repeat=block.span)
-            elif isinstance(block, Block):
+            if isinstance(block, Block):
                 block = block2reuse(block)
             assert isinstance(block, IRCell)
             topo_seqs.append(block)
@@ -207,9 +144,6 @@ class ExecutionPlan:
             for device in node.device:
                 self._seq.setdefault(device, []).append(node)
 
-        # due to repetends, a same node could appear multiple times
-        # in the execution sequence. For this case, all of them
-        # will be replaced by a same dispatched one.
         def cached_dispatch(node: IRCell, devid: int,
                             dispatched: Dict[IRCell, IRCell]) -> IRCell:
             """Cached dispatch"""
@@ -228,12 +162,7 @@ class ExecutionPlan:
                 node = nodes[idx]
                 # print(f'handling {node}')
                 if len(node.device) == 1: continue  # no need for dispatch
-                if isinstance(node, ExeRepetend):
-                    rnodes = [cached_dispatch(n, devid, dispatched) \
-                              for n in node.nodes() if devid in n.device]
-                    dnode = ExeRepetend(rnodes, node.repeat)
-                else:
-                    dnode = cached_dispatch(node, devid, dispatched)
+                dnode = cached_dispatch(node, devid, dispatched)
                 nodes[idx] = dnode
 
     @property

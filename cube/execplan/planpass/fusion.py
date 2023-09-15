@@ -5,7 +5,7 @@ from cube.graph.graph import IRSegment
 from cube.ir.adapter import IRAdapter
 
 from cube.execplan import ExecutionPlan
-from cube.execplan.execplan import ExeRepetend, ExeReuseCell
+from cube.execplan.execplan import ExeReuseCell
 from cube.execplan.planpass.planpass import PlanPass
 
 from cube.ir.adapter.prim import IRAdapterPrim
@@ -43,16 +43,12 @@ class DiffFusion(PlanPass):
                     for fadapter in node.select(ntype=IRAdapter):
                         ret = DiffFusion.nnfuse(fadapter)
                         cnt = cnt+1 if ret else cnt
-                elif isinstance(node, ExeRepetend) and node.isfw():
-                    for fadapter in [n for n in node.nodes() if isinstance(n, IRAdapter)]:
-                        ret = DiffFusion.nnfuse(fadapter)
-                        cnt = cnt+1 if ret else cnt
                 visited.add(node)
         _logger.info(f'adapter fusion: successfully fuse {cnt} differentiable adapters')
         return execplan
 
     @staticmethod
-    def _apply(cell: Union[IRSegment, ExeRepetend]) -> int:
+    def _apply(cell: IRSegment) -> int:
         cnt = 0
         for node in cell.nodes():
             if isinstance(node, IRAdapter) and node.isfw():

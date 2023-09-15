@@ -5,7 +5,7 @@ from cube.ir.cten import IRCell, IRTensor, IRObject
 from cube.ir.tensor import IRSubTensor
 from cube.ir.operator import IRDataOperation, IRFwOperation
 from cube.ir.adapter import IRWeightReducer, IRAdapter
-from cube.ir.adapter.prim import IRAdapterPrim
+from cube.ir.adapter.prim import CommPrim
 
 from cube.graph.segment import IRSegment
 
@@ -169,7 +169,8 @@ class FuncEmission(CodeEmission):
         codes.append(code)
         return codes
 
-    def emit_adapter(self, node: IRAdapter, prefix_attr: Optional[str] = None) -> List[str]:
+    def emit_adapter(self, node: IRAdapter, prefix_attr: Optional[str] = None,
+                     async_op: bool = False) -> List[str]:
         """
         Emit the statment of the adapter call
 
@@ -177,22 +178,29 @@ class FuncEmission(CodeEmission):
         Python method for the targeted Segment,
         without the method signature and the return statement.
 
-        The fields storing intermediate codes that are populated by this method:
-        -   NONE
+        Args:
+            node (IRAdapter)
+            prefix_attr (str | None): prefix to the tensor name
+            async_op (bool): whether to enable async communication
         """
         codes = []
         assert len(node.device) == 1, f"Expected adapter to be dispatched:\n{node.extra_repr()}"
         prims = [node] if node.differentiable and node.custom else [prim for prim in node.prims]
 
-        # only adapter that is non-differentiable can be executed as async
-        async_op = CompileFlag.async_comm and (not node.differentiable)
         if async_op:
-            for idx, prim in enumerate(prims):
-                if isinstance(prim, IRAdapterPrim) and prim.volume() == 0:
-                    continue
-                break
-            #TODO: support more general cases: independent same-group primitives
-            async_op = False if len(prims[idx:]) != 1 else async_op
+            # note async_op can only be applied when primitives satisfy:
+            #   1) non-collective primitives perform before collective primitives.
+            #   2) collectives running on same nccl stream (i.e., same device group)
+            non_colls = [p for p in prims if not isinstance(p, CommPrim)]
+            colls = [p for p in prims if isinstance(p, CommPrim)]
+            # check condition 1)
+            if len(non_colls) > 1:
+                if max(prims.index(p) for p in non_colls) + 1 != len(non_colls):
+                    async_op = False
+            # check condition 2)
+            devices = [set(p.device) for p in colls]
+            if len(colls) > 1 and not all(devs == devices[0] for devs in devices[1:]):
+                async_op = False
 
         for prim in prims:
             if len(prim.inputs()) == 1:
@@ -200,7 +208,7 @@ class FuncEmission(CodeEmission):
             else:
                 itensors = self.tuple_name(prim.inputs(), prefix_attr=prefix_attr)
             prim_kwargs = dict(prim.kwargs)
-            if async_op:
+            if async_op and isinstance(prim, CommPrim):
                 prim_kwargs['async_op'] = True
             kwargs = self.kwargs_name(**prim_kwargs)
             outputs = self.return_name(prim.outputs())

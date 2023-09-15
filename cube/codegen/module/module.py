@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 import more_itertools
 import logging
 import copy
@@ -13,14 +13,12 @@ from cube.ir.adapter.prim import CollectivePrim
 
 from cube.graph.graph import IRSegment
 from cube.graph.parser.register import CustomizedOps
-from cube.graph.parser.fx.parser import FxModuleParser
 
 from cube.execplan import ExecutionPlan
 from cube.execplan.execplan import ExeReuseCell
 
 from cube.codegen.syntax.symtable import SymbolTable
-from cube.codegen.syntax.blocks import ClassBlock, ForBlock, FunctionBlock
-from cube.codegen.schedule.schedule import ScheduleCodeGen
+from cube.codegen.syntax.blocks import ClassBlock, FunctionBlock
 
 from cube.codegen.emit import FuncEmission
 from cube.codegen.module.autograd import AutogradAdapterCodeGen
@@ -323,7 +321,7 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRFwOperation):
                 raise RuntimeError(f"Unexcepted global-level op call: {node}")
             elif isinstance(node, IRAdapter):
-                codes = self.emit_adapter(node, prefix_attr='self.')
+                codes = self.emit_adapter(node, prefix_attr='self.', async_op=CompileFlag.async_comm)
             elif isinstance(node, IRWeightReducer):
                 self.init_reducer(node, device)
                 codes = self.emit_reducer(node)
@@ -604,7 +602,9 @@ class ModuleCodeGen(FuncEmission):
                 code = self.emit_fnode(node, prefix_attr='self.')
                 node_codes += code
             elif isinstance(node, IRAdapter):
-                code = self.emit_adapter(node)
+                # for adapters inside an IRSegment, we don't apply async communication to it
+                # as it is mostly in critical path.
+                code = self.emit_adapter(node, async_op=False)
                 node_codes += code
             else:
                 raise RuntimeError(f"unexpected type {type(node)} in IRSegment")

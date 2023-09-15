@@ -2,7 +2,7 @@ from typing import List, Tuple, Optional
 import torch
 
 from cube.runtime.device import DeviceGroup
-from cube.profiler.timer import CudaTimer, print_each_rank
+from cube.profiler.timer import CudaTimer
 
 from cube.runtime.executor import AsyncCommHandler
 
@@ -275,32 +275,3 @@ def broadcast(itensor: torch.Tensor, shape: Tuple[int], dtype: torch.dtype, src:
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
     return tensor
-
-
-def exchange(tensor: torch.Tensor, ranks: List[int], async_op=False) -> torch.Tensor:
-    """
-    Exchange a same-shaped tensor between two ranks
-    """
-
-    if not async_op:
-        CudaTimer().start(field_name='comm', predefined=True)
-
-    assert len(ranks) == 2
-    group = DeviceGroup().get_group(ranks)
-    myrank = torch.distributed.get_rank(group)
-
-    tensor_list = [tensor, torch.empty_like(tensor)] if myrank == 0 \
-        else [torch.empty_like(tensor), tensor.data]
-
-    work = torch.distributed.all_gather(tensor_list, tensor, group=group, async_op=async_op)
-    if work:
-        exchange_callback = lambda t: tensor_list[(myrank + 1) % 2]
-        AsyncCommHandler().submit(tensor, [work], exchange_callback)
-        otensor = tensor
-    else:
-        otensor = tensor_list[(myrank + 1) % 2]
-
-    if not async_op:
-        CudaTimer().stop(field_name='comm', predefined=True)
-
-    return otensor

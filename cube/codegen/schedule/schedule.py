@@ -1,5 +1,5 @@
 
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Optional, Tuple
 import copy
 import logging
 
@@ -9,14 +9,12 @@ from cube.ir.tensor import IRSubTensor
 from cube.ir.adapter import IRWeightReducer, IRAdapter
 from cube.graph.graph import IRSegment
 
-from cube.graph.schedule import IRScheduleStrategy
-
-from cube.execplan.execplan import ExecutionPlan, ExeRepetend, ExeReuseCell
+from cube.execplan.execplan import ExecutionPlan, ExeReuseCell
 
 from cube.codegen.emit import FuncEmission
 from cube.codegen.syntax.symtable import SymbolTable
 from cube.codegen.lifecycle import LifeCycle
-from cube.codegen.syntax.blocks import FunctionBlock, ForBlock
+from cube.codegen.syntax.blocks import FunctionBlock
 
 
 _logger = logging.getLogger(__name__)
@@ -64,10 +62,6 @@ class ScheduleCodeGen(FuncEmission):
             # body code
             if len(device_nodes) == 0:
                 fb.insert_body('pass')
-            # legacy hardcode strategy
-            elif isinstance(self.execplan.graph.sched, IRScheduleStrategy):
-                code = self.emit_legacy_schedplan(self.execplan.graph.sched, device)
-                fb.insert_body(code)
             else:
                 for line, node in enumerate(device_nodes):
                     # execute
@@ -89,12 +83,7 @@ class ScheduleCodeGen(FuncEmission):
         if not any(not node.isfw() for node in device_nodes):
             gencode += ['_infer_step = _train_step']
         else:
-            # legacy hardcode strategy
-            if isinstance(self.execplan.graph.sched, IRScheduleStrategy):
-                _logger.warning('using legacy IRScheduleStrategy cannot generate inference code. '
-                                'Switch to use scheduling without strategy')
-            with FunctionBlock(func_name='_infer_step',
-                               args=args) as fb:
+            with FunctionBlock(func_name='_infer_step', args=args) as fb:
                 fb.insert_body('_ = None')
                 # body code
                 if len(device_nodes) == 0:
@@ -169,7 +158,7 @@ class ScheduleCodeGen(FuncEmission):
                 )
 
         elif isinstance(unwrap_node, IRDataOperation):
-            code = self.emit_dataloader(unwrap_node)[0]
+            code = f'{outputs} = {unwrap_node.signature}(*{inputs})'
 
         elif isinstance(unwrap_node, IRAdapter):
             code = asign.format(
@@ -190,35 +179,4 @@ class ScheduleCodeGen(FuncEmission):
         else:
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
 
-        return [code]
-
-    def emit_repetend(self, repetend: ExeRepetend) -> List[str]:
-        """
-        Emit code for executing a repetend
-        """
-        with ForBlock(var=None, iters=f'range({repetend.repeat})') as fb:
-            for node in repetend.nodes():
-                ncode = self.emit_node(node)
-                fb.insert_body(ncode)
-        return fb.code
-
-    def emit_legacy_schedplan(self, schedplan: IRScheduleStrategy, devid: int) -> List[str]:
-        """
-        Lagecy code
-        """
-        signature = schedplan.signature
-        kwargs: Dict[str, Any] = schedplan.kwargs(devid)
-        strkwargs = dict()
-        for kwarg, val in kwargs.items():
-            if isinstance(val, IRCell):
-                name = 'model.' + self.node_name(val)
-            elif isinstance(val, (tuple, list)):
-                brackets = ')' if len(val) != 1 else ',)'
-                name = '(' + ', '.join('model.' + self.node_name(n) \
-                    if isinstance(n, IRCell) else str(n) for n in val) + brackets
-            else:
-                name = str(val)
-            strkwargs[kwarg] = name
-        code = ', '.join(f'{kwarg}={name}' for kwarg, name in strkwargs.items())
-        code = f'{signature}({code})'
         return [code]

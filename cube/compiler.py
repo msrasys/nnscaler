@@ -191,7 +191,6 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
             if graph.sched is not None:
                 start = time.time()
                 graph.sched.apply()
-                _logger.debug(f'schedule:\n{graph.sched}')
                 span = time.time() - start
                 _logger.info('finish planpass on applying schedule strategy: {:.2f} s'.format(span))
 

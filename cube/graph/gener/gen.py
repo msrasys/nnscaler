@@ -119,7 +119,7 @@ class IRAdapterGener:
         # generate weight reducer
         graph = IRAdapterGener.gen_weight(graph)
         # fuse consecutive non-differentiable adapters into one
-        graph = IRAdapterGener.fusion(graph)
+        # graph = IRAdapterGener.fusion(graph)
         # print(graph.extra_repr())
         return graph
 

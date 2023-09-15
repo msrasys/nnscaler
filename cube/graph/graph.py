@@ -7,7 +7,7 @@ IRGraph:
     will be inserted at scheduling time.
 """
 
-from typing import Sequence, Set, Union, Tuple, List, Optional, Dict, Any
+from typing import Union, Tuple, List, Optional, Dict, Any
 import logging
 import copy
 import dill
@@ -171,66 +171,6 @@ class IRGraph(IRSegment):
             self.insert(bwop, self.nnodes)
 
         return self
-
-
-    # ========================= Graph Manipulation ========================
-
-    def group(self, nodes: List[IRCell]) -> IRSegment:
-        """!
-        Group consecutive nodes into IRSegment.
-        Note nodes should not have applied by any transformation.
-
-        @param nodes List[IRCell]: consecutive nodes in forward procedure
-
-        @return segment IRSegment: the grouped segment
-        """
-        assert all(node.isfw() for node in nodes), f"Expected all nodes in forward procedure"
-        fgraphs = [self.segment(fnode) for fnode in nodes]
-        assert len(set(fgraphs)) == 1, "cross-segment grouping is not allowed yet."
-
-        fgraph: IRSegment = fgraphs[0]
-        findices: Tuple[int] = tuple(fgraph.index(node)[0] for node in nodes)
-        min_fidx, max_fidx = min(findices), max(findices)
-        assert max_fidx - min_fidx + 1 == len(nodes), "nodes should be in consecutive order"
-
-        fsegment: IRSegment = fgraph.create_segment(nodes)
-        for node in nodes:
-            idx = fgraph.remove(node)
-        fgraph.insert(fsegment, idx)
-
-        # group for mirror nodes
-        bnodes = [node.mirror for node in nodes if node.mirror is not None]
-        if len(bnodes) == 0: return fsegment
-
-        # check consecutive
-        bgraph: IRSegment = fgraph.mirror
-        bindices = [bgraph.index(bnode)[0] for bnode in bnodes]
-        min_bidx, max_bidx = min(bindices), max(bindices)
-        assert max_bidx - min_bidx + 1 == len(bnodes), \
-            f"backward nodes are not consecutive. minbidx: {min_bidx}, maxbidx: {max_bidx}"
-
-        # update gradient for fgraph
-        for itensor in fsegment.inputs():
-            if not isinstance(itensor, IRTensor): continue
-            fgraph.infer_grad(itensor.parent)
-        # update gradient inside segment
-        for ftensor in fsegment.full_tensors():
-            fsegment.infer_grad(ftensor)
-
-        # create backward segment
-        for bnode in bnodes:
-            bidx = bgraph.remove(bnode)
-        bnodes = [fsegment.create_bwop(fnode) for fnode in nodes[::-1] if fnode.mirror is not None]
-        # get backward graph inputs
-        output_grads = [t.grad for t in fsegment.outputs() if isinstance(t, IRSubTensor) and t.grad is not None]
-        # get backward graph outputs
-        input_grads = [t.grad for t in fsegment.inputs() if \
-                       isinstance(t, IRSubTensor) and t.grad is not None]
-        bsegment = IRSegment(bnodes, output_grads, input_grads)
-
-        bgraph.insert(bsegment, bidx)
-        IRCell.make_pair(fsegment, bsegment)
-        return fsegment
 
     # ========================== Graph Creation ========================
 
@@ -596,84 +536,95 @@ class IRGraph(IRSegment):
 
     ## Schedule Policy Primitives ##
 
-    def sequential(self, nodes: Sequence[Union[FOp, Set[FOp]]]):
-        """
-        Scheduling Primitive: sequentially execute a list of nodes,
-        or a list of concurrent nodes.
+    def sequential(self, prev_nodes: Tuple[IRFwOperation], succ_nodes: Tuple[IRFwOperation]):
+        """Schedule primitive: schedule prev_nodes right before the succ_nodes
+        
+        The position of `succ_nodes` will keep unchanged in the sequence
+        while the `prev_nodes` will be scheduled right before the `succ_nodes`.
+        Corresponding backward operators will also be re-ordered.
 
-        Note there should be no dependency from a later node (set) to a previous node (set).
+        The `prev_nodes` should be consecutive in the sequence.
+        The `succ_nodes` should be consecutive in the sequence.
 
-        Note in current implementation we don't check correctness
-
-        Currently only support node (set) from a same device.
-
-        @param nodes Sequence[Set[FOp]]: a sequence of operators or
-            a sequence of concurrent operators. Note there should be no
-        """
-        assert len(nodes) > 0
-        concurrent_groups = [[node] if isinstance(node, IRCell) else node for node in nodes]
-        segment: IRSegment = self.segment(concurrent_groups[0][0])
-        idx = segment.index(nodes[0])
-        for group in concurrent_groups[1:]:
-            for node in group:
-                assert segment.exist(node, flatten=False), "All nodes should in a same segment"
-                # TODO: should check every node to see if they can be gathered based on that node
-                segment.reorder(node, idx)
-
-    def concurrent(self, nodes: Set[Union[FOp, Sequence[FOp]]]):
-        """
-        Scheduling Primitive: concurrently execut a list of nodes,
-        or a list of sequential nodes.
-
-        Note there should be no dependency from a node (set) to another node (set).
-
-        Currently only suuport node (set) from different devices.
-
-        @param nodes Set[Sequence[Fop]]: a set of operators or
-            a set of sequential operators.
-        """
-        assert len(nodes) > 0
-        seq_groups = [[node] if isinstance(node, IRCell) else node for node in nodes]
-        segment: IRSegment = self.segment(seq_groups[0][0])
-        idx = segment.index(nodes[0])
-        for group in seq_groups[1:]:
-            for node in group:
-                assert segment.exist(node, flatten=False), "All nodes should in a same segment"
-                # TODO: should check every node to see if they can be gathered based on that node
-                segment.reorder(node, idx)
-
-    def happen_before(self, node1: IRCell, node2: IRCell, skip=None) -> bool:
-        """
-        Check node1 -> (happen before) node2
+        Args:
+            prev_nodes (Tuple[IRFwOperation]): the nodes to be scheduled right before `succ_nodes`
+            succ_nodes (Tuple[IRFwOperation]): the nodes to be executed right after `prev_nodes`
 
         Returns:
-            Boolean
+            None
         """
-        raise NotImplementedError("dependency is not supported yet")
-        skip = list() if skip is None else skip
-        if node1 in skip:
-            return False
-        if not isinstance(node1, IRCell) or not isinstance(node2, IRCell):
-            raise TypeError("Expected node to be IRCell")
-        if node2 in node1.successors():
-            return True
-        else:
-            for succ_node in node1.successors():
-                if self.happen_before(succ_node, node2, skip):
-                    return True
-            return False
+        prev_indices = [self._nodes.index(n) for n in prev_nodes]
+        succ_indices = [self._nodes.index(n) for n in succ_nodes]
+        if len(prev_nodes) != max(prev_indices) - min(prev_indices) + 1:
+            raise ValueError(
+                f'prev_nodes are expected to be consecutive in node sequence: '
+                f'{len(prev_nodes)} != {max(prev_indices) - min(prev_indices) + 1}'
+            )
+        if len(succ_nodes) != max(succ_indices) - min(succ_indices) + 1:
+            raise ValueError(
+                f'succ_nodes are expected to be consecutive in node sequence: '
+                f'{len(succ_nodes)} != {max(succ_indices) - min(succ_indices) + 1}'
+            )
+        # check duplication
+        if len(set(prev_indices)) != len(prev_indices):
+            raise ValueError(f'find duplicated node in prev nodes')
+        if len(set(succ_indices)) != len(succ_indices):
+            raise ValueError(f'find duplicated node in succ nodes')
+        if len(set(prev_indices).intersection(set(succ_indices))) != 0:
+            raise ValueError(f'find duplicated node in both succ_nodes and prev_nodes')
+        # TODO: check dependency
+        
+        seq = list(self._nodes)
+        # cut out prev_nodes
+        fstart, fend = min(prev_indices), max(prev_indices) + 1
+        fnodes = seq[fstart:fend]
+        seq = seq[:fstart] + seq[fend:]
+        # insert prev_nodes
+        ofst = min(succ_indices)
+        if max(prev_indices) < min(succ_indices):
+            ofst = ofst - len(fnodes)
+        seq = seq[:ofst] + fnodes + seq[ofst:]
 
-    def depends(self, pre_node: IRCell, post_node: IRCell) -> bool:
-        """!
-        Check whether pre_node has dataflow dependency on post_node:
-            pre_node -> post_node
+        # update order of backward node
+        prev_bnodes = [n.mirror for n in prev_nodes[::-1] if n.mirror is not None]
+        succ_bnodes = [n.mirror for n in succ_nodes[::-1] if n.mirror is not None]
+        prev_bindx = [seq.index(n) for n in prev_bnodes]
+        succ_bindx = [seq.index(n) for n in succ_bnodes]
+        if len(prev_bnodes) > 0:
+            # TODO: extend succ_nodes to find at least one forward op that has backward
+            if len(succ_bnodes) == 0:
+                raise NotImplementedError(f'backward of succ_nodes are expected')
+            # cut out prev_backward_nodes
+            bstart, bend = min(prev_bindx), max(prev_bindx) + 1
+            bnodes = seq[bstart:bend]
+            seq = seq[:bstart] + seq[bend:]
+            # insert prev_backward_nodes
+            ofst = max(succ_bindx) + 1
+            if max(prev_bindx) < min(succ_bindx):
+                ofst = ofst - len(bnodes)
+            seq = seq[:ofst] + bnodes + seq[ofst:]
+        # update sequence
+        self._nodes = seq
 
-        @param pre_node: the happen before node
-        @param post_node: the happen after node
+    def depends(self, pre_node: IRCell, succ_node: IRCell) -> bool:
+        """Check direct data dependency between two nodes.
 
-        @return ret bool: True if post_node depends on pre_node on dataflow, otherwise False.
+        Check dependency of pre_node -> post_node.
+
+        Note this function only checks direct data dependency that whether
+        the outputs in `prev_node` and inputs in `post_node` have data dependency.
+        
+        The function cannot detect data dependency in graph like:
+            pre_node -> (some nodes) ... -> post_node
+
+        Args:
+            pre_node (IRCell): the happen before node
+            post_node (IRCell): the happen after node
+
+        Returns:
+            ret (bool): True if post_node depends on pre_node on dataflow, otherwise False.
         """
-        itensors = [t for t in post_node.inputs() if isinstance(t, IRSubTensor)]
+        itensors = [t for t in succ_node.inputs() if isinstance(t, IRSubTensor)]
         for otensor in pre_node.outputs():
             if not isinstance(otensor, IRSubTensor): continue
             for itensor in itensors:
@@ -681,118 +632,160 @@ class IRGraph(IRSegment):
                     return True
         return False
 
-    def schedule(self, node1: IRCell, action: str, node2: IRCell) -> bool:
-        """!
-        Schedule node1 and node2 based on the action
-
-        The node2 will keep unchanged in the sequence and schedule will perform
-        on node1.
-
-        @param node1 IRCell
-        @param node2 IRCell
-        @param action str:
-            'after': fixed node2 and schedule node1 after node2 in the sequence.
-            'before': fixed node2 and schedule node1 before node2 in the sequence.
-
-        @return success bool: True if the scheduling success otherwise False.
-        """
-        idx1 = self._nodes.index(node1)
-        idx2 = self._nodes.index(node2)
-        # node2 -> node1
-        if action == 'after':
-            if idx2 < idx1:
-                return True
-            for idx in range(idx1+1, idx2+1):
-                if self.depends(node1, self._nodes[idx]):
-                    return False
-            self.remove(node1)
-            self.insert(node1, idx2)
-            return True
-        # node1 -> node2
-        if action  == 'before':
-            if idx1 < idx2:
-                return True
-            for idx in range(idx2, idx1):
-                if self.depends(self._nodes[idx], node1):
-                    return False
-            self.remove(node1)
-            self.insert(node1, idx2)
-            return True
-        raise KeyError(f"Unknown scheduling action {action}")
-
     @property
     def sched(self):
-        """!
-        Return schedule plan for the execution.
+        """ Get bound schedule plan
+
+        Returns:
+            sched (SchedulePlan | None): bound schedule plan
         """
         return self._sched
 
-    def predef_sched(self, strategy):
-        """!
-        Set schedule plan for the execution.
-
-        @param strategy IRScheduleStrategy: the schedule strategy instance
-        """
-        self._sched = strategy
-
     def _bind_schedule(self, schedplan):
-        """
-        Set schedule plan for the execution
+        """Set schedule plan for the execution
 
-        @param schedplan SchedulePlan
+        This will be called when initiating a schedule plan for the graph.
+
+        Args:
+            schedplan (SchedulePlan)
+
+        Returns:
+            None
         """
-        assert self._sched is None, "The graph is already binded with one schedule plan."
+        from cube.graph.schedule import SchedulePlan
+        if not isinstance(schedplan, SchedulePlan):
+            raise TypeError(f"Expect a SchedulePlan but got: {type(schedplan)}")
+        assert self._sched is None, "The graph is already bound with one schedule plan."
         self._sched = schedplan
-
-    @staticmethod
-    def legal_schedule(seq: List[IRCell], integrity_check=False):
-        """
-        Check whether seq satisfies topological order.
-
-        @note: this functionality is not enabled due to predecessor and succesor
-        functionality.
-
-        @param seq List[IRCell]: the nodes in scheudled order
-        @param integrity_check bool:
-                If true, performs additional integrity check that requires
-                all the nodes in predecessor and successor of a node should
-                appear in the sequence.
-
-        @return valid bool: True for satisfying topo order, otherwise False.
-        """
-        for index, node in enumerate(seq):
-            for pre in node.predecessors():
-                if pre in seq:
-                    pre_idx = seq.index(pre)
-                    if pre_idx >= index:
-                        return False
-                elif integrity_check:
-                    return False
-        return True
-
-    def add_schedule(self, nodes: List[IRCell]) -> bool:
-        """
-        Add node happen before dependencies according to nodes list order
-        """
-        if not all([isinstance(node, IRCell) for node in nodes]):
-            raise TypeError("Expected List[IRCell")
-        for idx in range(len(nodes) - 1):
-            prev = nodes[idx]
-            post = nodes[idx + 1]
-            if self.happen_before(post, prev):
-                return False
-        for idx in range(len(nodes) - 1):
-            prev = nodes[idx]
-            post = nodes[idx + 1]
-            prev.add_successor(output_index=-1, cell=post)
-            post.add_predecessor(input_index=-1, cell=prev)
-        return True
 
     # ================= staging primitives ==================
 
+    def group(self, nodes: List[IRCell]) -> IRSegment:
+        """Group consecutive nodes into IRSegment.
+
+        Note nodes should not have applied by any transformation.
+
+        Args:
+            nodes List[IRCell]: consecutive nodes in forward procedure
+
+        Returns:
+            segment IRSegment: the grouped segment
+        """
+        assert all(node.isfw() for node in nodes), f"Expected all nodes in forward procedure"
+        fgraphs = [self.segment(fnode) for fnode in nodes]
+        assert len(set(fgraphs)) == 1, "cross-segment grouping is not allowed yet."
+
+        fgraph: IRSegment = fgraphs[0]
+        findices: Tuple[int] = tuple(fgraph.index(node)[0] for node in nodes)
+        min_fidx, max_fidx = min(findices), max(findices)
+        assert max_fidx - min_fidx + 1 == len(nodes), "nodes should be in consecutive order"
+
+        fsegment: IRSegment = fgraph.create_segment(nodes)
+        for node in nodes:
+            idx = fgraph.remove(node)
+        fgraph.insert(fsegment, idx)
+
+        # group for mirror nodes
+        bnodes = [node.mirror for node in nodes if node.mirror is not None]
+        if len(bnodes) == 0: return fsegment
+
+        # check consecutive
+        bgraph: IRSegment = fgraph.mirror
+        bindices = [bgraph.index(bnode)[0] for bnode in bnodes]
+        min_bidx, max_bidx = min(bindices), max(bindices)
+        assert max_bidx - min_bidx + 1 == len(bnodes), \
+            f"backward nodes are not consecutive. minbidx: {min_bidx}, maxbidx: {max_bidx}"
+
+        # update gradient for fgraph
+        for itensor in fsegment.inputs():
+            if not isinstance(itensor, IRTensor): continue
+            fgraph.infer_grad(itensor.parent)
+        # update gradient inside segment
+        for ftensor in fsegment.full_tensors():
+            fsegment.infer_grad(ftensor)
+
+        # create backward segment
+        for bnode in bnodes:
+            bidx = bgraph.remove(bnode)
+        bnodes = [fsegment.create_bwop(fnode) for fnode in nodes[::-1] if fnode.mirror is not None]
+        # get backward graph inputs
+        output_grads = [t.grad for t in fsegment.outputs() if isinstance(t, IRSubTensor) and t.grad is not None]
+        # get backward graph outputs
+        input_grads = [t.grad for t in fsegment.inputs() if \
+                       isinstance(t, IRSubTensor) and t.grad is not None]
+        bsegment = IRSegment(bnodes, output_grads, input_grads)
+
+        bgraph.insert(bsegment, bidx)
+        IRCell.make_pair(fsegment, bsegment)
+        return fsegment
+
+    def blocking(self, nodes: Tuple[IRFwOperation]):
+        """Group forward operators into blocks.
+
+        The corresponding backward operators (if have) will also be grouped into stages
+        Cross-stage dataflow will be limited to neighbor stages.
+        This should be called before any operator partition.
+
+        Args:
+            nodes Tuple[IRFwOperations]: the start forward node of each stage.
+        
+        Returns:
+            None
+        """
+        assert all(isinstance(node, IRFwOperation) for node in nodes), \
+            f"Find node is not IRFwOperation or IRDataOperation: {node}"
+        assert all(node in self._nodes for node in nodes), \
+            f"Exist node is not in graph nodes"
+        starts = list(self._nodes.index(node) for node in nodes)
+        assert len(starts) > 0
+
+        # multiref (created by graph.multiref) will be moved to the next stage (if possible) for optimization
+        for sid in range(len(starts)):
+            while starts[sid] > 0:
+                node = self.node(starts[sid]-1)
+                if node.name == 'multiref' or isinstance(node, IRGraphAnchor):
+                    starts[sid] -= 1
+                    continue
+                break
+
+        # adjust the start of the first stage to involve beginning operators
+        for idx in range(starts[0]):
+            node = self.node(idx)
+            if isinstance(node, IRDataOperation):
+                continue
+            assert isinstance(node, IRFwOperation), \
+                f"Expected nodes previous from the first stage are all IRFwOperation, but got {type(node)}"
+            if node.name == 'multiref' or isinstance(node, IRPyFunc):
+                pass
+            else:
+                _logger.warning(f'Detect a node: {node} that is previous from the first stage. Will be included inside the first stage')
+            starts[0] = idx
+            break
+
+        last_fidx = 0
+        for idx, node in enumerate(self._nodes):
+            if not isinstance(node, IRBpOperation):
+                last_fidx = idx
+
+        fstages: List[List[IRCell]] = []
+        for sid in range(len(starts)):
+            begin = starts[sid]
+            end = starts[sid+1] if sid != len(starts) - 1 else last_fidx + 1
+            if begin >= end:
+                _logger.warning(f"Detected stage {sid} doesn't have operators: [begin({begin}): end({end})). Skipped")
+                continue
+            fnodes = self._nodes[begin:end]
+            assert all(isinstance(node, IRFwOperation) for node in fnodes), \
+                f"find at least one nodes are not of IRFwOperation in the stage {sid}. They should be moved to the front"
+            fstages.append(fnodes)
+        
+        # grouping into segment
+        for sid in range(len(fstages)):
+            self.group(fstages[sid])
+
     def staging(self, nodes: Tuple[IRFwOperation]):
-        """!
-        Group forward operators into sequential stages.
+        """Group forward operators into sequential stages.
+
         The corresponding backward operators (if have) will also be grouped into stages
         Cross-stage dataflow will be limited to neighbor stages.
         This should be called before any operator partition.
@@ -823,8 +816,11 @@ class IRGraph(IRSegment):
                     stage 5: t5 = identity(t4)
                              xx = consume(t5)
 
-        @param nodes Tuple[IRFwOperations]: the start forward node of each stage.
-        @return None
+        Args:
+            nodes Tuple[IRFwOperations]: the start forward node of each stage.
+
+        Returns:
+            None
         """
         assert all(isinstance(node, IRFwOperation) for node in nodes), \
             f"Find node is not IRFwOperation or IRDataOperation: {node}"
@@ -885,6 +881,7 @@ class IRGraph(IRSegment):
         def insert_identity(tensor: IRSubTensor, sid: int) -> IRFwOperation:
             fwop = Identity(tensor)
             fwop.infer_shape()
+            fwop.output(0).parent.dtype = tensor.dtype
             fwop.set_output(0, fwop.output(0).tosub())
             if tensor.requires_grad:
                 fwop.output(0).parent.requires_grad = True
