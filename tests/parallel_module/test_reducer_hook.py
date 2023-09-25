@@ -119,27 +119,27 @@ def _gpu_worker(pas, ngpus):
 
 def test_hook_tp_gpu1():
     if not torch.cuda.is_available():
-        print('skip test_submodules_tp_gpu1 due to lack of cuda devices')
+        print('skip test_hook_tp_gpu1 due to lack of cuda devices')
         return
     launch_torchrun(1, _gpu_worker, PASRandomSPMD, 1)
 
 
 def test_hook_tp_gpu2():
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        print('skip test_submodules_tp_gpu2 due to lack of cuda devices')
+        print('skip test_hook_tp_gpu2 due to lack of cuda devices')
         return
     launch_torchrun(2, _gpu_worker, PASRandomSPMD, 2)
 
 
-def test_submodules_dp_gpu1():
+def test_hook_dp_gpu1():
     if not torch.cuda.is_available():
-        print('skip test_submodules_dp_gpu1 due to lack of cuda devices')
+        print('skip test_hook_dp_gpu1 due to lack of cuda devices')
         return
     launch_torchrun(1, _gpu_worker, PASData, 1)
 
 
-def test_submodules_dp_gpu2():
+def test_hook_dp_gpu2():
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        print('skip test_submodules_dp_gpu2 due to lack of cuda devices')
+        print('skip test_hook_dp_gpu2 due to lack of cuda devices')
         return
     launch_torchrun(2, _gpu_worker, PASData, 2)

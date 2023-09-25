@@ -5,11 +5,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .concrete_tracer import ConcreteTracer
 
+import sys
 import ast
 import builtins
 import inspect
 import logging
-import platform
 
 from textwrap import dedent
 from types import MethodType, FunctionType
@@ -27,6 +27,7 @@ from .utils import (
 )
 
 _logger = logging.getLogger(__name__)
+
 
 class TransformerOp(ast.NodeTransformer):
     """
@@ -242,7 +243,7 @@ class OperatorPatcher:
 
             tuple_wrapped = tuple
             try:
-                if platform.python_version_tuple() < ('3', '9'):
+                if sys.version_info < (3, 9):
                     setattr(builtins, 'tuple', _orig_tuple)
                 var_dict = {}
                 exec(
@@ -259,8 +260,9 @@ class OperatorPatcher:
                 else:
                     return var_dict['new_func']
             finally:
-                if platform.python_version_tuple() < ('3', '9'):
+                if sys.version_info < (3, 9):
                     setattr(builtins, 'tuple', tuple_wrapped)
+
 
 class OperatorPatcherContext:
     ctx_tracer: Optional['ConcreteTracer'] = None

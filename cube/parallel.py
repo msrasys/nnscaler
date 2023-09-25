@@ -44,7 +44,7 @@ class ComputeConfig:
 
 
 @contextmanager
-def _flags(flags, warning_on_override=True, **kwargs):
+def _flags(flags, warning_on_override=True, /, **kwargs):
     old_flags = {}
     for k, v in kwargs.items():
         old_flags[k] = getattr(flags, k)
@@ -64,7 +64,7 @@ def _compile_flags():
 
 
 def _runtime_flags(**kwargs):
-    return _flags(RuntimeFlag, warning_on_override=False, **kwargs)
+    return _flags(RuntimeFlag, False, **kwargs)
 
 
 def _complex(val: Any):
