@@ -57,7 +57,7 @@ def PAS1F1B(graph: IRGraph, resource, nmicros: int = 16, **kwargs):
         if isinstance(node, IRDataOperation):
             graph.assign(node, 0)
 
-    if graph.train():
+    if graph.train:
         PredefinedSched.sched_1f1b(graph, num_microbatch, num_stages)
     else:
         PredefinedSched.sched_infer_pipe(graph, num_microbatch, num_stages)
@@ -108,19 +108,19 @@ def PASMegatron(graph: IRGraph, resource,
         for fnode in fstage.nodes():
             if len(fnode.inputs()) == 0: continue # anchor
             if fnode.name == 'self_attention' or fnode.name == 'feedforward':
-                fnodes = tensor_parallelism(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
+                fnodes = tensor_parallelism(graph, fnode, idx=1, dim=0, devs=[0]*tp_size)
             elif fnode.name == 'embedding':
-                fnodes = tensor_parallelism(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
+                fnodes = tensor_parallelism(graph, fnode, idx=1, dim=0, devs=[0]*tp_size)
             elif fnode.name == 'linear': # the last embeding linear
-                fnodes = tensor_parallelism(graph, fnode, [0]*tp_size, idx=1, dim=0, num=tp_size)
+                fnodes = tensor_parallelism(graph, fnode, idx=1, dim=0, devs=[0]*tp_size)
             elif fnode.name == 'sum':
-                fnodes = tensor_parallelism(graph, fnode, [0]*tp_size, idx=0, dim=2, num=tp_size)
+                fnodes = tensor_parallelism(graph, fnode, idx=0, dim=2, devs=[0]*tp_size)
             else:
                 fnodes = replica(graph, fnode, [0]*tp_size)
             # data parallel
             for tp_idx, fnode in enumerate(fnodes):
                 dp_devices = [get_device(dp_idx, pp_idx, tp_idx) for dp_idx in range(dp_size)]
                 batch_dim = fnode.input(0).shape.index(bs)
-                tensor_parallelism(graph, fnode, idx=0, dim=batch_dim, num=dp_size, devs=dp_devices)
+                tensor_parallelism(graph, fnode, idx=0, dim=batch_dim, devs=dp_devices)
     PredefinedSched.sched_1f1b(graph, num_microbatch, pp_size)
     return graph
