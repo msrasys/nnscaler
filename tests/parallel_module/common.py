@@ -50,18 +50,8 @@ def PASRandomSPMD(graph: IRGraph, env_resource: ComputeConfig):
         if len(graph.consumers(ftensor)) > 1:
             graph.multiref(ftensor)
 
-    graph_inputs = IRSegment.get_objects_from_complex(graph.inputs())
-    graph_outputs = IRSegment.get_objects_from_complex(graph.outputs())
     for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
         if node.name == 'multiref' or isinstance(node, IRGraphAnchor):
-            continue
-        # Currently cube only support replicate if node's input or input is part of the graph output
-        # workaround for now
-        # will fix later.
-        if any(output in graph_outputs for output in node.outputs()) \
-            or any(input in graph_outputs for input in node.inputs()):
-            # or any(input in graph_inputs for input in node.inputs()):
-            _replica(graph, node, devs)
             continue
         if isinstance(node, IRDimops):
             configs = node.transform_space()

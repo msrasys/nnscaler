@@ -2,7 +2,7 @@ from typing import List, Tuple, Optional, Any, Dict
 import inspect
 
 from cube.ir.cten import IRCell, IRObject
-from cube.ir.tensor import IRFullTensor
+from cube.ir.tensor import IRFullTensor, IRSubTensor
 from cube.ir.operator import IRBpOperation, IRDataOperation
 
 from cube.graph import IRGraph
@@ -47,11 +47,19 @@ class Program:
         self.instance._graph.reset_inputs(len(inputs))
         for idx, obj in enumerate(inputs):
             self.instance._graph.set_input(idx, obj)
+        # update gradient
+        for t in IRGraph.get_objects_from_complex(self.instance._graph.inputs()):
+            if isinstance(t, IRSubTensor) and t.requires_grad:
+                t.grad = t.parent.grad.tosub()
 
     def set_output(self, outputs: Tuple[Any]):
         self.instance._graph.reset_outputs(len(outputs))
         for idx, otensor in enumerate(outputs):
             self.instance._graph.set_output(idx, otensor)
+        # update gradient
+        for t in IRGraph.get_objects_from_complex(self.instance._graph.outputs()):
+            if isinstance(t, IRSubTensor) and t.requires_grad:
+                t.grad = t.parent.grad.tosub()
 
     def finalize(self):
         """

@@ -101,7 +101,6 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
                                requires_grad=arg.requires_grad,
                                dtype=arg.dtype).tosub()
             arg._value = tensor
-            arg.grad = arg.parent.grad.tosub() if arg.requires_grad else None
         else:
             arg = IRObject('obj', value=arg)
         inputs.append(arg)

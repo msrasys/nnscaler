@@ -244,12 +244,12 @@ def _gencode(
 
     graph = program.get_graph()
     graph.backward()
-    program.finalize()
     program.set_input(ir_dummy_inputs)
     if ir_dummy_outputs is None: ir_dummy_outputs = []
     elif not (isinstance(ir_dummy_outputs, tuple) or isinstance(ir_dummy_outputs, list)):
         ir_dummy_outputs = [ir_dummy_outputs]
     program.set_output(ir_dummy_outputs)
+    program.finalize()
 
     graph = pas_policy(graph, compute_config)
     if not isinstance(graph, IRGraph):
