@@ -44,3 +44,27 @@ def test_codegen():
         m_new = _to_cube_model(m, ComputeConfig(2, 4), cube_savedir=tempdir, load_module=False)
         assert m_new is None
         launch_torchrun(1, _gencode_worker, tempdir)
+
+
+class SliceModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return x[:2]
+
+def test_codegen_slice():
+    if not torch.cuda.is_available():
+        print('skip test_codegen_slice due to lack of cuda devices')
+        return
+    with tempfile.TemporaryDirectory() as tempdir:
+        m_new = parallelize(
+            SliceModule(),
+            {'x': torch.tensor([1.0, 2.0, 3.0, 6.0])},
+            PASData,
+            ComputeConfig(1, 1),
+            dynamic_shape=True,
+            cube_savedir=tempdir,
+            load_module=False
+        )
+        assert m_new is None

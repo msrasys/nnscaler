@@ -606,6 +606,12 @@ class IRSubTensor(IRTensor):
 
     @property
     def grad(self) -> bool:
+        """Get the gradient of this tensor.
+        
+        The gradient is kept aligned with its parent IRFullTensor.
+        """
+        if not self.requires_grad:
+            self._grad = None
         return self._grad
 
     @grad.setter
