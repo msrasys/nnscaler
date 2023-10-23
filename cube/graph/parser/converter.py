@@ -20,6 +20,16 @@ from torch.autograd.graph import saved_tensors_hooks
 _logger = logging.getLogger(__name__)
 
 
+class no_save_tensor_hook(saved_tensors_hooks):
+    """skip saving tensors for backward since tracer only traces forward"""
+    def __init__(self):
+        def pack(x):
+            return None
+        def unpack(x):
+            raise RuntimeError("not expecting backward to be called on this tensor")
+        super().__init__(pack, unpack)
+
+
 def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     """
     Convert torch.nn.Module based model into torch.fx.GraphModule
@@ -40,15 +50,6 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     cube_rt_funcs = [cube_rt_function.anchor]
     leaf_functions.update({func: ([(cube_rt_function, func.__name__)], True, None) for func in cube_rt_funcs})
     dce_ignored_funcs = set(cube_rt_funcs)
-
-    class no_save_tensor_hook(saved_tensors_hooks):
-        """skip saving tensors for backward since tracer only traces forward"""
-        def __init__(self):
-            def pack(x):
-                return None
-            def unpack(x):
-                raise RuntimeError("not expecting backward to be called on this tensor")
-            super().__init__(pack, unpack)
 
     with no_save_tensor_hook():
         traced_model = concrete_trace(
@@ -84,12 +85,13 @@ def to_ir_graph(
     """
     _logger.info(f"use {'dynamic' if dynamic_shape else 'static'} shape to parse graph")
 
-    inputs, nodes, outputs = FxModuleParser.parse(
-        traced_model, dummy_input,
-        attr_savedir=attr_savedir,
-        dynamic_shape=dynamic_shape,
-        save_content=True,
-    )
+    with no_save_tensor_hook():
+        inputs, nodes, outputs = FxModuleParser.parse(
+            traced_model, dummy_input,
+            attr_savedir=attr_savedir,
+            dynamic_shape=dynamic_shape,
+            save_content=True,
+        )
     module_name = traced_model.__class__.__name__
 
     for input in inputs:
