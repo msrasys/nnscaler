@@ -74,6 +74,9 @@ class SignFx2Op:
         __ttemplate('eq') : function.CompareEQ,
         '_operator.eq': function.CompareEQ,
         __ttemplate('ne') : function.CompareNE,
+        '_operator.ne': function.CompareNE,
+        __ttemplate('max'): function.Max,
+        __ttemplate('where'): function.Where,
         __ttemplate('nan_to_num') : function.NanToNum,
         __tttemplate('long'): function.Long,
         __tttemplate('int'): function.Int,
@@ -161,7 +164,9 @@ class SignFx2Op:
         __ttemplate('gt'): function.CompareGT,
         '_operator.gt': function.CompareGT,
         __ttemplate('lt'): function.CompareLT,
+        '_operator.lt': function.CompareLT,
         __ttemplate('ge'): function.CompareGE,
+        '_operator.ge': function.CompareGE,
         __ttemplate('le'): function.CompareLE,
         '_operator.le': function.CompareLE,
         #
@@ -205,5 +210,7 @@ class SignFx2Op:
         # #einops
         # __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,
 
-        'torch.functional.split': function.Split
+        'torch.functional.split': function.Split,
+        __ttemplate('split'): function.Split,
+        __tttemplate('split'): function.Split,
     }

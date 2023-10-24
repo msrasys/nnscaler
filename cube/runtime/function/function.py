@@ -28,6 +28,16 @@ def to(tensor: torch.Tensor, dtype_or_device: Union[torch.device, torch.dtype]) 
     return tensor.to(dtype_or_device)
 
 
+def max_(input: torch.Tensor, other_or_dim: Union[torch.Tensor, int, None]=None, out_or_keepdim: Optional[bool]=None) -> torch.Tensor:
+    if other_or_dim is None:
+        return torch.max(input)
+    elif isinstance(other_or_dim, int):
+        return torch.max(input, other_or_dim, out_or_keepdim)
+    else:
+        assert isinstance(other_or_dim, torch.Tensor)
+        return torch.max(input, other_or_dim)
+
+
 def accum(*tensors: Tuple[torch.Tensor]) -> torch.Tensor:
     """
     accumulate tensors in to one tensor
@@ -36,10 +46,6 @@ def accum(*tensors: Tuple[torch.Tensor]) -> torch.Tensor:
         return tensors[0] + tensors[1]
     else:
         return torch.sum(torch.stack(tensors, dim=0), dim=0)
-
-
-def expand(input: torch.Tensor, sizes: Union[torch.Size, List[int]]) -> torch.Tensor:
-    return input.expand(*sizes)
 
 
 def fullslice(input: torch.Tensor, slicers: Tuple[Union[None, slice, int]]):

@@ -227,10 +227,12 @@ class OperatorPatcher:
             ]
             body0.name = 'new_func'
             # for deleting some annotations like 'add_start_docstrings_to_model_forward' or 'add_code_sample_docstrings'
+            # these decorators are used for tranformers model docstrings generation, can be removed in trace
+            transform_useless_decorators = ('add_start_docstrings_to_model_forward', 'add_code_sample_docstrings', 'replace_return_docstrings')
             body0.decorator_list = [i for i in body0.decorator_list
                 if isinstance(i, ast.Call) and isinstance(i.func, ast.Name) and i.func.id == 'patch_run' and
                     isinstance(i.args[0], ast.Name) and
-                    i.args[0].id not in ('add_start_docstrings_to_model_forward', 'add_code_sample_docstrings')]
+                    i.args[0].id not in transform_useless_decorators]
             ast.fix_missing_locations(new_tree)
 
             # closure info

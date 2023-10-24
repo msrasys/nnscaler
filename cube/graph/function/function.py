@@ -251,7 +251,8 @@ def Full(size, fill_value, *, out=None, dtype=None, layout=None,
     assert layout in (None, torch.strided), f"Not support for non-default layout"
     dtype = dtype if dtype is not None else torch.get_default_dtype()
     signature = 'cube.runtime.function.full'
-    size = tuple(size)
+    # cube treat scalar as size (1,) tensor now, scalar support will in another pr if necessary
+    size = tuple(size) if size else (1,)
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
     dimop = IRDimops(Full, 'full', signature, [anno], [], rules,
@@ -275,66 +276,100 @@ def NewTensor(data, *, dtype=None, device=None,
 
 
 def _handle_broadcast(lhs: IRTensor, rhs: IRTensor) -> Tuple[List[str]]:
-    """!
+    """Create shape annotations for element wise operator following broadcastable rules:
+    https://pytorch.org/docs/stable/notes/broadcasting.html
+
+    Args:
+        lhs IRTensor: the lhs input tensor
+        rhs IRTensor: the rhs input tensor
+
+    Returns:
+        lhs_anno List[str]: lhs shape annotation
+        rhs_anno List[str]: rhs shape annotation
+        out_anno List[str]: output shape annotation
+    """
+    ins_anno, out_anno = _handle_broadcast_multi([lhs, rhs])
+    assert len(ins_anno) == 2
+    return ins_anno[0], ins_anno[1], out_anno
+
+
+def _handle_broadcast_multi(ins_list: List[IRTensor]) -> Tuple[Tuple[List[str]], List[str]]:
+    """Similar to ``_handle_broadcast``, handle broadcast for more than two input tensors.
+
     Create shape annotations for element wise operator following broadcastable rules:
     https://pytorch.org/docs/stable/notes/broadcasting.html
 
-    @param lhs IRTensor: the lhs input tensor
-    @param rhs IRTensor: the rhs input tensor
+    Args:
+        ins_list List[IRTensor]: the list of input tensors
 
-    @return lhs_shape, rhs_shape, out_shape: the lhs, rhs and output shape annotation
+    Returns:
+        ins_anno (Tuple[List[str]]): a list of input tensors annotation
+        out_anno (List[str]): output shape annotation
     """
-    lndims, rndims = len(lhs.shape), len(rhs.shape)
-    # init lhs_shape and rhs_shape annotation string
-    shape_anno = ShapeAnno.create_shape_str(lhs.shape if lndims > rndims else rhs.shape)
-    lhs_shape = shape_anno[0-lndims:]
-    rhs_shape = shape_anno[0-rndims:]
+    assert len(ins_list) >= 2, 'at least two tensor require for broadcast'
+    ins_ndims = [len(inp.shape) for inp in ins_list]
+    # init annotation string
+    maxlen_shape = ins_list[ins_ndims.index(max(ins_ndims))].shape
+    shape_anno = ShapeAnno.create_shape_str(maxlen_shape)
+    ins_anno = [shape_anno[-ndims:] for ndims in ins_ndims]
     # expand dimensions for empty dimensions
-    lofst = max(lndims, rndims) - lndims
-    lshape = [1] * lofst + list(lhs.shape)
-    rofst = max(lndims, rndims) - rndims
-    rshape = [1] * rofst + list(rhs.shape)
+    ins_ofst = [max(ins_ndims) - ndims for ndims in ins_ndims]
+    ins_shape = [[1] * ins_ofst[idx] + list(inp.shape) for idx, inp in enumerate(ins_list)]
     # init out_shape
-    out_shape = []
-    for dim in range(len(lshape)):
-        ldim_anno = None if dim - lofst < 0 else lhs_shape[dim-lofst]
-        rdim_anno = None if dim - rofst < 0 else rhs_shape[dim-rofst]
-        if lshape[dim] == rshape[dim]:
-            assert rdim_anno is not None or ldim_anno is not None
-            out_shape.append(rdim_anno if rdim_anno is not None else ldim_anno)
-        elif lshape[dim] == 1:
-            assert rdim_anno is not None
-            out_shape.append(rdim_anno)
-            if ldim_anno is not None:
-                lhs_shape[dim-lofst] = '1'
-        elif rshape[dim] == 1:
-            assert ldim_anno is not None
-            out_shape.append(ldim_anno)
-            if rdim_anno is not None:
-                rhs_shape[dim-rofst] = '1'
+    out_anno = []
+    for dim in range(len(maxlen_shape)):
+        dim_annos = [None if dim - ins_ofst[idx] < 0 else anno[dim-ins_ofst[idx]] for idx, anno in enumerate(ins_anno)]
+        not_none_annos = [anno for anno in dim_annos if anno is not None]
+        assert len(not_none_annos) > 0
+        not_none_anno = not_none_annos[0]
+        if all(x[dim] == ins_shape[0][dim] for x in ins_shape):
+            out_anno.append(not_none_anno)
         else:
-            raise ValueError(f"cannot broadcast lhs: {lhs.shape} and rhs: {rhs.shape}")
-    return lhs_shape, rhs_shape, out_shape
+            not_one_shape = [shape[dim] for shape in ins_shape if shape[dim] != 1]
+            if len(not_one_shape) > 0 and not all(s == not_one_shape[0] for s in not_one_shape):
+                raise ValueError(f"cannot broadcast tensor list: {ins_list}")
+            else:
+                out_anno.append(not_none_anno)
+                for idx, anno in enumerate(dim_annos):
+                    if anno is not None and ins_shape[idx][dim] == 1:
+                        ins_anno[idx][dim-ins_ofst[idx]] = '1'
+    return ins_anno, out_anno
 
 
-def Expand(input, *sizes, signature = None):
+def Expand(input, *sizes, size = None, signature = None):
     """
     torch.Tensor.expand(*sizes)
+    
+    The reason of add ``size`` to this function argument is:
+    1. ``sizes`` need to reuse in IRDimops.new(), but it is a ``non-keyword arguments``,
+    and can not put it into keyword arguments (something like Expand(input, sizes=[1, 2, 3])) is not work,
+    to support IRDimops.new API, here add a ``size`` to workaround.
+    
+    2. in torch._C.expand API, it has:
+        def expand(self, size: Sequence[Union[_int, SymInt]], *, implicit: _bool=False) -> Tensor: ...
+      so add ``size`` can also solve user using something like:
+        torch.rand(3, 1).expand(size=(3, 3))
     """
-    signature = 'cube.runtime.function.expand'
+    signature = 'torch.Tensor.expand'
+    if size is not None:
+        assert len(sizes) == 0
+        sizes = size
     ori_len, exp_len = len(input.shape), len(sizes)
     assert ori_len <= exp_len
     assert all(dim == expand_dim or dim == 1 or expand_dim == -1 for dim, expand_dim in zip(input.shape, sizes[-ori_len:]))
     edim_ou = ShapeAnno.create_shape_str(sizes)
     edim_in = copy.copy(edim_ou[-ori_len:])
+    new_size = [-1] * len(sizes)
     for idx, (dim, expand_dim) in enumerate(zip(input.shape, sizes[-len(input.shape):])):
         if dim == 1 and dim != expand_dim and expand_dim != -1:
             edim_in[idx] += '^'
             edim_ou[exp_len - ori_len + idx] = str(expand_dim)
+            new_size[exp_len - ori_len + idx] = expand_dim
     for idx in range(exp_len - ori_len):
         edim_ou[idx] = str(sizes[idx])
+        new_size[idx] = sizes[idx]
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
-    return IRDimops(Expand, 'expand', signature, [anno], [input], sizes=sizes)
+    return IRDimops(Expand, 'expand', signature, [anno], [input], size=new_size)
 
 
 def ExpandAs(input, other, signature = None):
@@ -702,6 +737,28 @@ def MaskedFill(input, mask, value, signature = None):
     anno = OpAnno.create_op_str([edim_in0, edim_in1], [edim_ou])
     return IRDimops(MaskedFill, 'masked_fill', signature, [anno], [input, mask], value=value)
 
+
+def Where(condition, input, other, *, out=None, signature = None):
+    """
+    torch.where
+    """
+    assert isinstance(condition, IRTensor)
+    if isinstance(input, IRTensor) and isinstance(other, IRTensor):
+        (edim_in0, edim_in1, edim_in2), edim_out = _handle_broadcast_multi([condition, input, other])
+    elif isinstance(input, IRTensor) and len(input.shape) > 0 and not (len(input.shape) == 1 and input.shape[0] == 1):
+        edim_in0, edim_in1, edim_out = _handle_broadcast(condition, input)
+        edim_in2 = ['?']
+    elif isinstance(other, IRTensor) and len(other.shape) > 0 and not (len(other.shape) == 1 and other.shape[0] == 1):
+        edim_in0, edim_in2, edim_out = _handle_broadcast(condition, other)
+        edim_in1 = ['?']
+    else:
+        edim_in0 = ShapeAnno.create_shape_str(condition.shape)
+        edim_in1, edim_in2 = ['?'], ['?']
+        edim_out = copy.copy(edim_in0)
+
+    annos = [OpAnno.create_op_str([edim_in0, edim_in1, edim_in2], [edim_out])]
+    dimop = IRDimops(Where, 'where', signature, annos, [condition, input, other])
+    return dimop
 
 def CubeLayerNorm(input, weight=None, bias=None, normalized_shape=None, eps=1e-05, signature = None):
     """
@@ -1109,12 +1166,12 @@ def Squeeze(input, dim=None, signature = None):
     """
     out = torch.squeeze(tensor)
     """
-    assert dim is None, "got dim: {dim} != None, which is not supported"
+    dim = (dim,) if isinstance(dim, int) else dim
     edim_in = ShapeAnno.create_shape_str(input.shape)
     assert len(edim_in) == len(input.shape)
     edim_ou = []
-    for dim_anno, dim_size in zip(edim_in, input.shape):
-        if dim_size > 1:
+    for idx, (dim_anno, dim_size) in enumerate(zip(edim_in, input.shape)):
+        if dim_size > 1 or (dim is not None and idx not in dim):
             edim_ou.append(copy.copy(dim_anno))
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
     return IRDimops(Squeeze, 'squeeze', signature, [anno], [input])
@@ -1379,6 +1436,21 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice, int]], signatu
     """
     signature = 'cube.runtime.function.fullslice'
     slicers = tuple(slicers)
+
+    # deal with ... in slice
+    if any(slicer is Ellipsis for slicer in slicers):
+        front_slicers, back_slicers, ellipsis_flag = [], [], False
+        for slicer in slicers:
+            if not slicer is Ellipsis:
+                front_slicers.append(slicer) if not ellipsis_flag else back_slicers.append(slicer)
+            else:
+                ellipsis_flag = True
+        front_count = len([slicer for slicer in front_slicers if slicer is not None])
+        back_count = len([slicer for slicer in back_slicers if slicer is not None])
+        assert front_count + back_count <= len(tensor.shape)
+        mid_slicers = [slice(None, None, None) for _ in range(len(tensor.shape) - front_count - back_count)]
+        slicers = tuple(front_slicers + mid_slicers + back_slicers)
+
     edim_in = ShapeAnno.create_shape_str(tensor.shape)
     edim_ou = []
     in_idx = 0
@@ -1397,8 +1469,9 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice, int]], signatu
             if slicer != slice(None, None, None):
                 edim_in[in_idx] += '^'
             _start, _stop, _step = obj_helper(slicer.start), obj_helper(slicer.stop), obj_helper(slicer.step)
-            start = 0 if _start is None else _start
-            stop = tensor.shape[in_idx] if _stop is None else _stop
+            start = 0 if _start is None else _start + tensor.shape[in_idx] if _start < 0 else _start
+            stop = tensor.shape[in_idx] if _stop is None else _stop + tensor.shape[in_idx] if _stop < 0 else _stop
+            start, stop = min(start, tensor.shape[in_idx]), min(stop, tensor.shape[in_idx])
             step = 1 if _step is None else _step
             dimlen = len(range(start, stop, step))
             if dimlen == tensor.shape[in_idx]:
@@ -1563,13 +1636,18 @@ def CrossEntropy(input, target, weight=None,
         size_average=None, ignore_index=- 100, reduce=None,
         reduction='mean', label_smoothing=0.0)
     """
-    # FIXME: reduction is by default 'mean', in this way it cannot be partitioned
-    # no N dimension.
-    annos = [
-        'C^, N -> 1',
-        'N+ C, N+ -> 1',
-        'N+ C *, N+ * -> 1'
-    ]
+    if reduction == 'sum':
+        annos = [
+            'C^, N -> 1',
+            'N+ C^, N+ -> 1',
+            'N+ C^ *, N+ * -> 1'
+        ]
+    else:
+        annos = [
+            'C^, N -> 1',
+            'N^ C^, N^ -> 1',
+            'N^ C^ *, N^ * -> 1'
+        ]
     return IRDimops(
         CrossEntropy, 'cross_entropy',
         signature, annos, [input, target],
@@ -1658,6 +1736,34 @@ def CompareNE(input, other, *, out=None, signature = None):
     return _comparison(CompareNE, operator.eq, 'ne', signature, input, other)
 
 
+def Max(input, other_or_dim=None, out_or_keepdim=None, *, out=None, signature = None):
+    """
+    torch.max(input)
+    torch.max(input, dim, keepdim=False, *, out=None)
+    torch.max(input, other, *, out=None)
+    """
+    signature = 'cube.runtime.function.max_'
+    if other_or_dim is None:
+        edim_in = [s + '^' for s in ShapeAnno.create_shape_str(input.shape)]
+        annos = [OpAnno.create_op_str([edim_in], ['1'])]
+        return IRDimops(Max, 'max', signature, annos, [input])
+    elif isinstance(other_or_dim, IRTensor):
+        lshape, rshape, oshape = _handle_broadcast(input, other_or_dim)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+        return IRDimops(Max, 'max', signature, annos, [input, other_or_dim])
+    else:
+        assert isinstance(other_or_dim, int) and isinstance(out_or_keepdim, bool)
+        edim_in = ShapeAnno.create_shape_str(input.shape)
+        edim_in[other_or_dim] += '^'
+        edim_out = copy.copy(edim_in)
+        if out_or_keepdim:
+            edim_out[other_or_dim] = '1'
+        else:
+            edim_out.pop(other_or_dim)
+        annos = [OpAnno.create_op_str([edim_in], [edim_out, edim_out])]
+        return IRDimops(Max, 'max', signature, annos, [input], other_or_dim=other_or_dim, out_or_keepdim=out_or_keepdim)
+
+
 def ShapeAsTensor(input: IRTensor, signature = None):
     """
     torch._shape_as_tensor
@@ -1697,12 +1803,14 @@ def Dim(tensor, signature=None) -> Union[List[int], IRPyFunc]:
     return len(tensor.shape)
 
 
-def To(tensor: IRTensor, dtype_or_device, *, out=None, signature = None):
+def To(tensor: IRTensor, dtype_or_device=None, *, device=None, dtype=None, out=None, signature = None):
     """
     torch.Tensor.to(*args, **kwargs) → Tensor
     """
     assert out is None
     # FIXME: support full version of torch.Tensor.to
+    dtype_or_device = dtype if dtype is not None else dtype_or_device
+    dtype_or_device = device if dtype_or_device is None else dtype_or_device
     # create "to" in cube runtime functions because dtype if not kwarg in torch.Tensor.to
     signature = 'cube.runtime.function.to'
     annos = ['* -> *']
