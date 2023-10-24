@@ -607,6 +607,7 @@ class ConcreteTracer(TracerBase):
         # defined via ``functools.wraps``. In this case, the outer code object
         # will likely not contain the actual parameters we care about, so unwrap
         # the function to get to the innermost callable.
+        # TODO: keyward-only arguments are not supported now
         fn_for_analysis = inspect.unwrap(root_fn)
         default_value_list = fn_for_analysis.__defaults__
         if default_value_list is None:

@@ -167,7 +167,7 @@ def _gencode(
     #   False  | imported | doesn't matter
     if not override:
         # check if the module is already generated
-        expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.plan_ngpus)]
+        expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
         expected_output_files.append(outdir / FxModuleParser.ATTR_CONTENT_FILE)
         expected_output_files.append(outdir / FxModuleParser.ATTR_MAP_FILE)
         expected_output_files.append(outdir / ParallelModule.COMPUTE_CONFIG_FILE)
@@ -177,6 +177,11 @@ def _gencode(
                 and len(existing_output_files) == len(expected_output_files) \
                 and torch.load(outdir / ParallelModule.COMPUTE_CONFIG_FILE) == compute_config:
                 return
+            elif all(f.suffix != '.py'  for f in existing_output_files):
+                # No python source code is generated.
+                # which means its last generation failed.
+                # in this case, we can reuse the same directory safely.
+                pass
             else:
                 raise RuntimeError(f'Output directory {outdir} is not empty. '
                                    f'And the existing files do not match with current config.')

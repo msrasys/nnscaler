@@ -393,17 +393,39 @@ class ModuleCodeGen(FuncEmission):
                 # will use the orignal names of inputs
                 inputs = [t.name for t in node.inputs() if not isinstance(t, IRSubTensor) or not t.is_attr()]
                 # ensure forward args are valid
+                unused_args = []
                 if forward_arg_names:
                     for i in range(len(inputs)):
-                        if inputs[i] != forward_arg_names[i]:
-                            raise ValueError(f"Forward args mismatch: {inputs[i]} != {forward_arg_names[i]}")
-                    for i in range(len(inputs), len(forward_arg_names)):
-                        if not forward_arg_names[i].startswith('*'):
-                            raise ValueError(f"Invalid extra forward args: only *args & **kwargs are allowed")
+                        if inputs[i] not in forward_arg_names:
+                            raise ValueError(f"Forward args mismatch: {inputs[i]} arg needed")
 
-                with FunctionBlock(func_name='_forward_impl', args=['self'] + (forward_arg_names or inputs)) as fb:
+                    forward_args = []
+                    # find the first mismatch
+                    for i in range(len(inputs)):
+                        if inputs[i] == forward_arg_names[i]:
+                            forward_args.append(inputs[i])
+                        else:
+                            break
+
+                    for i in range(len(forward_args), len(forward_arg_names)):
+                        if not forward_arg_names[i].startswith('*'):
+                            forward_args.append(f'{forward_arg_names[i]}=None')
+                            if forward_arg_names[i] not in inputs:
+                                unused_args.append(forward_arg_names[i])
+                                _logger.warning(f'Unused forward argument `{forward_arg_names[i]}`.'
+                                                f'The argument value will be ignored when you call module forward')
+                        else:
+                            forward_args.append(forward_arg_names[i])
+                    forward_arg_names = forward_args
+                else:
+                    forward_arg_names = inputs
+
+                with FunctionBlock(func_name='_forward_impl', args=['self'] + forward_arg_names) as fb:
                     outputs = self.return_name(node.outputs(), skip_attr=True)
                     call_code = f'{outputs} = self.{self.node_name(node)}({", ".join(inputs)})'
+                    # be sure the user doesn't specify unused args.
+                    for unused_arg in unused_args:
+                        fb.insert_body(f'if {unused_arg} is not None: raise ValueError("{unused_arg} is not used in graph tracing, so it must be None when running forward.")')
                     fb.insert_body(call_code)
                     return_code = f'return {self.return_name_complex(self.execplan.graph.outputs())}'
                     fb.insert_body(return_code)

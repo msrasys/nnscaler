@@ -1,3 +1,4 @@
+import inspect
 import tempfile
 
 import torch
@@ -54,6 +55,9 @@ class SliceModule(torch.nn.Module):
         return x[:2]
 
 def test_codegen_slice():
+    """
+    Test it can support modules without parameters
+    """
     if not torch.cuda.is_available():
         print('skip test_codegen_slice due to lack of cuda devices')
         return
@@ -68,3 +72,61 @@ def test_codegen_slice():
             load_module=False
         )
         assert m_new is None
+
+
+class UnusedArgsModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(3, 5)
+
+    def forward(self, x, y, z=None, m=None, n=None, **kwargs):
+        return self.linear(x) + m
+
+
+def _gencode_unused_args_worker(tempdir):
+    init_distributed()
+    m_new = parallelize(
+        UnusedArgsModule(),
+        {
+            'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            'y': torch.tensor([1, 2, 3]),
+            'z': None,
+            'm': 0,
+            'n': None
+         },
+        PASData,
+        ComputeConfig(1, 1),
+        dynamic_shape=True,
+        cube_savedir=tempdir,
+        load_module=True
+    )
+    assert m_new is not None
+    args = inspect.signature(m_new._forward_impl)
+    assert len(args.parameters) == 6
+    assert args.parameters['x'].default is inspect.Parameter.empty
+    assert args.parameters['y'].default is None
+    assert args.parameters['z'].default is None
+    assert args.parameters['m'].default is None
+    assert args.parameters['n'].default is None
+
+    with pytest.raises(TypeError):
+        # m can't be None
+        # TypeError is raised by torch.add
+        m_new(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+
+    m_new(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), m=1)
+
+    with pytest.raises(ValueError):
+        # y must be None
+        m_new(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), 1)
+
+def test_codegen_unused_args():
+    """
+    Verify that unused args are supported by parallalize
+    """
+    if not torch.cuda.is_available():
+        print('skip test_unused_input due to lack of cuda devices')
+        return
+
+    with tempfile.TemporaryDirectory() as tempdir:
+        launch_torchrun(1, _gencode_unused_args_worker, tempdir)

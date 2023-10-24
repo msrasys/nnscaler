@@ -165,5 +165,6 @@ def clear_dir_on_rank0(tempdir):
     if torch.distributed.get_rank() == 0 and tempdir.exists():
         shutil.rmtree(tempdir)
     yield tempdir
+    torch.distributed.barrier()
     if torch.distributed.get_rank() == 0 and tempdir.exists():
         shutil.rmtree(tempdir)
