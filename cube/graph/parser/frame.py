@@ -1,5 +1,6 @@
 from collections import OrderedDict
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Tuple, Optional
+from cube.ir.cten import IRTensor
 import torch
 
 
@@ -12,10 +13,8 @@ class Frame:
         # var name -> value (IRTesnor, deterministic)
         self._vars: List[dict[str, Any]] = list()
         self._var_stack: List[str] = list()
-        # module attributes
-        self._attributes: List[dict[str, Any]] = list()
-        self._attr_vals: Dict[int, Any] = dict()  # tensor tid to real value mapping
-        self._name_map: Dict[Any, Any] = dict()  # tensor name to real tensor name
+        # IRTensor -> (module param name, concrete value)
+        self._attr_map: Dict[IRTensor, Tuple[str, torch.Tensor]] = dict()
 
     def push_var(self, inherit_from_top=False):
         """
@@ -104,79 +103,41 @@ class Frame:
             return self._vars[-1][var_name]
         raise KeyError(f"Cannot find var name {var_name} in {self._vars}")
 
-    def push_attr(self):
-        """
-        Push a new module attribut frame as current frame.
-        This should only be called when stepping in the graph.
-        """
-        self._attributes.append(OrderedDict())
+    def add_attr(self, tensor: IRTensor, concrete_value: torch.Tensor, name: str):
+        """Add module attribute content
 
-    def pop_attr(self):
+        Args:
+            tensor (IRTensor): the tensor represents the value
+            value (torch.Tensor or Any): concrete value
+            name (str): attributed name of its original module
         """
-        Pop the current module attribute frame.
-        This should only be called when stepping out the graph.
-        """
-        self._attributes.pop()
+        assert isinstance(concrete_value, torch.Tensor)
+        self._attr_map[tensor] = (name, concrete_value)
 
-    def add_attr(self, name: str, val: Any):
-        """
-        Add module attribute <name: val>
-        """
-        if name in self._attributes[-1]:
-            raise KeyError("Try to add an already existed attributed")
-        self._attributes[-1][name] = val
+    def get_attr_var(self, concrete_value: torch.Tensor) -> Optional[IRTensor]:
+        """Get IRTensor from attribute concrete value
 
-    def get_attr(self, name: str) -> Any:
+        If the concrete value is not found, return None
         """
-        Get module attribute by name
-        """
-        if name not in self._attributes[-1]:
-            raise KeyError(f"Cannot find var name {name}")
-        return self._attributes[-1][name]
-
-    def has_attr(self, name: str) -> bool:
-        """
-        Return if `name` exists in current attributes
-        """
-        return name in self._attributes[-1]
-
-    def add_attr_content(self, tid: int, val: torch.Tensor):
-        """
-        Add module attribute content
-        """
-        if torch.is_tensor(val):
-            val = val.cpu()
-        self._attr_vals[tid] = val
+        assert isinstance(concrete_value, torch.Tensor)
+        for tensor, (_, value) in self._attr_map.items():
+            if value is concrete_value:
+                return tensor
+        return None
 
     def save_attr_content(self, save_file: str = 'fullmodel.pt'):
         """
         Save attribute content into file.
         """
-        torch.save(self._attr_vals, save_file)
-
-    def add_attr_map(self, key, value):
-        """
-        Add names map to connect internal parameter name and original parameter
-        """
-        self._name_map[str(key)] = value
-
-    def has_attr_value(self, value):
-        return value in self._name_map.values()
-
-    def get_attr_key(self, value):
-        ret = None
-        for key, val in self._name_map.items():
-            if val == value:
-                ret = key
-                break
-        return ret
+        tid2value = {t.tid: val.cpu() for t, (_, val) in self._attr_map.items()}
+        torch.save(tid2value, save_file)
 
     def save_attr_map(self, save_file: str = 'dist_param_map.pt'):
         """
         Save local_param -> origin_param name map.
         """
-        torch.save(self._name_map, save_file)
-
+        ir_name_to_orig_name = {str(t.name): name for t, (name, _) in self._attr_map.items()}
+        torch.save(ir_name_to_orig_name, save_file)
 
     def push_param(self, var_name):
         """
