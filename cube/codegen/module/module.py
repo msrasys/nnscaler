@@ -1,9 +1,10 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 import more_itertools
 import logging
 import copy
 import torch
 import numpy as np
+import inspect
 
 from cube.ir.cten import IRCell
 from cube.ir.tensor import IRSubTensor
@@ -258,15 +259,85 @@ class ModuleCodeGen(FuncEmission):
     def gen(
         self,
         device: int,
-        outfile=None,
-        attach=False,
+        outfile: str = None,
+        attach: bool = False,
         *,
-        as_parallel_module=False,
-        forward_arg_names=None
+        as_parallel_module: bool = False,
+        forward_args: Optional[Dict[str, Any]] = None
     ) -> str:
         """
         Generate model implementation code based on the given graph.
-
+        if as_parallel_module is True, we will create a forward method for the module.
+        The arguments of the forward method will be same with original forward method with some exceptions:
+        1. No positional only argument/keyword only argument support.
+            For example
+            ```python
+            def forward(self, x, y, /, z=None, *, m=1, n=2):
+                ...
+            ```
+            the bevaior of the forward method will be undefined, and should be avoided.
+            Also the generated forward method will not have positional only argument/keyword only argument.
+        2. *args is not supported, and will trigger runtime error.
+           For example:
+            ```python
+            def forward(self, x, y, *args):
+                ...
+            ```
+            will fail to generate forward method.
+        3. **kwargs will be kept as it is.
+            For example:
+            ```python
+            def forward(self, x, y, **kwargs):
+                ...
+            ```
+            the generated forward method will be:
+            ```python
+            def forward(self, x, y, **kwargs):
+                ...
+            ```
+            But you should not specify any argument in **kwargs when tracing the forward method.
+            The behavior will be undefined if you rely on the argument in **kwargs.
+        4. If an argument is found not in the traced graph,
+            it will have default value None(no matter what the default value is in the original forward method),
+            And when calling the generated forward method, you should not specify the argument.
+            Otherwise, ValueError will be raised.
+            For example:
+            ```python
+            def forward(self, x, y, z=1):
+                ...
+            ```
+            If y and z are not in the traced graph, the generated forward method will be:
+            ```python
+            def forward(self, x, y=None, z=None):
+                if y is not None: raise ValueError
+                if z is not None: raise ValueError
+                ...
+            ```
+        5. If an argument is used in the traced graph, the default value will be kept as it is.
+            For example:
+            ```python
+            def forward(self, x, y, z=1):
+                ...
+            ```
+            if z is used in the traced graph, the generated forward method will be:
+            ```python
+            def forward(self, x, y, z=1):
+                ...
+            ```
+        6. A special case is, if an argument is after an unused argument, but doesn't have a default value.
+           To make python happy, we have to give it a default value None.
+            For example:
+            ```python
+            def forward(self, x, y, z):
+                ...
+            ```
+            if y is not used in the traced graph, the generated forward method will be:
+            ```python
+            def forward(self, x, y=None, z=None):
+                if y is not None: raise ValueError
+                ...
+            ```
+            Please note z has to have default value None, otherwise, python will complain.
         Args:
             device (int): device id
             outfile (str): output file path
@@ -275,8 +346,8 @@ class ModuleCodeGen(FuncEmission):
                 1. Inherit from ParallelModule
                 2. Has forward method
                 3. Add more content to constructor
-            forward_arg_names (List[str]): argument names of forward function, if None, use node inputs.
-                This is used only in parallel module
+            forward_args (Dict[str, Any]): argument names and their default values of forward function, if None, use node inputs.
+                This is used only in parallel module.
 
         Returns:
             generated code
@@ -390,47 +461,9 @@ class ModuleCodeGen(FuncEmission):
                     raise RuntimeError("The graph has no segment, forward code cannot be generated.")
                 segment_idx = segment_idxs[0]
                 node = gen_nodes[segment_idx]
-                # will use the orignal names of inputs
-                inputs = [t.name for t in node.inputs() if not isinstance(t, IRSubTensor) or not t.is_attr()]
-                # ensure forward args are valid
-                unused_args = []
-                if forward_arg_names:
-                    for i in range(len(inputs)):
-                        if inputs[i] not in forward_arg_names:
-                            raise ValueError(f"Forward args mismatch: {inputs[i]} arg needed")
 
-                    forward_args = []
-                    # find the first mismatch
-                    for i in range(len(inputs)):
-                        if inputs[i] == forward_arg_names[i]:
-                            forward_args.append(inputs[i])
-                        else:
-                            break
-
-                    for i in range(len(forward_args), len(forward_arg_names)):
-                        if not forward_arg_names[i].startswith('*'):
-                            forward_args.append(f'{forward_arg_names[i]}=None')
-                            if forward_arg_names[i] not in inputs:
-                                unused_args.append(forward_arg_names[i])
-                                _logger.warning(f'Unused forward argument `{forward_arg_names[i]}`.'
-                                                f'The argument value will be ignored when you call module forward')
-                        else:
-                            forward_args.append(forward_arg_names[i])
-                    forward_arg_names = forward_args
-                else:
-                    forward_arg_names = inputs
-
-                with FunctionBlock(func_name='_forward_impl', args=['self'] + forward_arg_names) as fb:
-                    outputs = self.return_name(node.outputs(), skip_attr=True)
-                    call_code = f'{outputs} = self.{self.node_name(node)}({", ".join(inputs)})'
-                    # be sure the user doesn't specify unused args.
-                    for unused_arg in unused_args:
-                        fb.insert_body(f'if {unused_arg} is not None: raise ValueError("{unused_arg} is not used in graph tracing, so it must be None when running forward.")')
-                    fb.insert_body(call_code)
-                    return_code = f'return {self.return_name_complex(self.execplan.graph.outputs())}'
-                    fb.insert_body(return_code)
                 cb.insert_body('')
-                cb.insert_body(fb.code)
+                cb.insert_body(self._generate_forward(node, forward_args))
 
         gencode += cb.code
         gencode += ['']
@@ -444,6 +477,71 @@ class ModuleCodeGen(FuncEmission):
         # clear used buffer
         self.clear()
         return code
+
+    def _generate_forward(self, node, forward_args):
+        # the orignal names of inputs
+        inputs = [t.name for t in node.inputs() if not isinstance(t, IRSubTensor) or not t.is_attr()]
+
+        unused_args = []
+        forward_arg_resolved = []
+        if forward_args:
+            # check all inputs are in forward args
+            for i in range(len(inputs)):
+                if inputs[i] not in forward_args:
+                    raise ValueError(f"Forward args mismatch: {inputs[i]} arg needed")
+
+            forward_arg_names = list(forward_args.keys())
+            def _get_resolved_arg(arg_name, default_value):
+                if default_value is inspect.Parameter.empty:
+                    return arg_name
+                else:
+                    return f'{arg_name}={repr(default_value)}'
+
+            # find the first mismatch
+            # here, we will keep the default values of the forward args
+            for i in range(len(inputs)):
+                if inputs[i] == forward_arg_names[i]:
+                    default_value = forward_args[inputs[i]]
+                    forward_arg_resolved.append(_get_resolved_arg(inputs[i], default_value))
+                else:
+                    break
+
+            # check the rest of the forward args
+            # if the arg is not in inputs, we will set the default value to None
+            #     in runtime, we will make sure the user doesn't specify it.
+            # if the arg is in inputs, we will keep the default value
+            # Also *args and **kwargs are kept as it is.
+            for i in range(len(forward_arg_resolved), len(forward_arg_names)):
+                if not forward_arg_names[i].startswith('*'):
+                    default_value = forward_args[forward_arg_names[i]]
+                    if forward_arg_names[i] not in inputs:
+                        unused_args.append(forward_arg_names[i])
+                        forward_arg_resolved.append(f'{forward_arg_names[i]}=None')
+                        _logger.warning(f'Unused forward argument `{forward_arg_names[i]}`.'
+                                        f'The argument value will be ignored when you call module forward')
+                    else:
+                        forward_arg_resolved.append(
+                            _get_resolved_arg(
+                                forward_arg_names[i],
+                                None if default_value is inspect.Parameter.empty else default_value
+                            )
+                        )
+                else:
+                    forward_arg_resolved.append(forward_arg_names[i])
+        else:
+            forward_arg_resolved = inputs
+
+        with FunctionBlock(func_name='_forward_impl', args=['self'] + forward_arg_resolved) as fb:
+            outputs = self.return_name(node.outputs(), skip_attr=True)
+            call_code = f'{outputs} = self.{self.node_name(node)}({", ".join(inputs)})'
+            # be sure the user doesn't specify unused args.
+            for unused_arg in unused_args:
+                fb.insert_body(f'if {unused_arg} is not None: raise ValueError("{unused_arg} is not used in graph tracing, so it must be None when running forward.")')
+            fb.insert_body(call_code)
+            return_code = f'return {self.return_name_complex(self.execplan.graph.outputs())}'
+            fb.insert_body(return_code)
+
+        return fb.code
 
     def emit_comm_groups(self):
         """

@@ -105,6 +105,11 @@ def _is_any_gencode_loaded(namespace: str) -> bool:
     return False
 
 
+def _get_arg_default_values(fn) -> Dict[str, Any]:
+    args = inspect.signature(inspect.unwrap(fn))
+    return {k: v.default for k, v in args.parameters.items()}
+
+
 _GENCODE_FILE_PREFIX = 'gencode'
 _GENCODE_FILE_TEMPLATE = _GENCODE_FILE_PREFIX + '{}.py'  # 'gencode{}.py'
 _CUBE_MODULE_NAMESPACE = '_cube_modules'
@@ -201,6 +206,10 @@ def _gencode(
     IDGenerator().clear()
 
     module.cpu()
+    forward_args_default = _get_arg_default_values(module.forward)
+    for v in forward_args_default.values():
+        if v is not inspect.Parameter.empty and not isinstance(v, (int, str, float, bool, type(None))):
+            raise ValueError(f"Default value type {type(v)} of forward args is not supported.")
 
     # generate fx graph
     dummy_input = _complex(dummy_input)
@@ -216,7 +225,10 @@ def _gencode(
     fx_input_nodes = [node for node in fx_graph.graph.nodes if node.op == 'placeholder']
     # the inputs of graph is different with original forward args
     # so we get the real forward args from fx inputs
-    forward_args = [node.target for node in fx_input_nodes]
+    forward_args = {
+        node.target: forward_args_default.get(node.target, inspect.Parameter.empty)
+        for node in fx_input_nodes
+    }
     ir_dummy_inputs = []
     for node in fx_input_nodes:
         if node.target.startswith('*'):  # *args or **kwargs
@@ -290,7 +302,7 @@ def _gencode(
     mgener = ModuleCodeGen(execplan, scale_ndevs=runtime_ngpus)
     for rank in range(compute_config.runtime_ngpus):
         filename = _GENCODE_FILE_TEMPLATE.format(rank)
-        mgener.gen(rank, forward_arg_names=forward_args, outfile=outdir / filename, attach=False, as_parallel_module=True)
+        mgener.gen(rank, forward_args=forward_args, outfile=outdir / filename, attach=False, as_parallel_module=True)
 
 
 def _load_cube_module_class(
