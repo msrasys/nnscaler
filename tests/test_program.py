@@ -1,0 +1,40 @@
+
+import torch
+from cube.program import SemanticModel, Program
+from cube.flags import CompileFlag
+from cube.ir.cten import IRObject
+
+
+def test_program_model_nested_input():
+
+    class MyModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.param1 = torch.nn.Parameter(torch.empty(4, 4))
+            self.param2 = torch.nn.Parameter(torch.empty(4, 4))
+
+        def forward(self, x: dict):
+            shortcut = x['data']
+            x = torch.matmul(x['data'], self.param1)
+            x = x + self.param2
+            x = x + shortcut
+            x = x + self.param1
+            return {'loss': torch.sum(x)}
+
+    CompileFlag.dev_mode = True
+    Program().clear()    
+
+    dummy_input = {'x': {'data': torch.randn(4, 4)}}
+    module = MyModule()
+    model = SemanticModel(module, save_content=False, dynamic_shape=False)
+
+    obj = IRObject(value=dummy_input['x'])
+    model(obj)
+    graph = model.get_graph()
+    print(graph.extra_repr())
+
+    assert graph.input(0) == obj
+    # getitem
+    assert graph.node(0).input(0) == obj
+    # getitem
+    assert graph.node(1).input(0) == obj

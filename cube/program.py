@@ -163,8 +163,6 @@ class SemanticModel:
                 return list(complex(t) for t in val)
             if isinstance(val, dict):
                 return {complex(key):complex(val) for key, val in val.items()}
-            if isinstance(val, set):
-                return {complex(t) for t in val}
             if isinstance(val, torch.Tensor):
                 return val.cpu()
             return val
@@ -202,12 +200,10 @@ class SemanticModel:
             if self.dummy_input is None:
                 dummy_input = {}
                 sig = inspect.signature(self.model.forward)
-                # note: we don't support model forward arguments having complex data stucture
-                # that contains tensor
                 for name, arg in zip(sig.parameters.keys(), args):
                     if isinstance(arg, IRObject):
                         value = arg.value
-                        arg._value = None  # remove tensor reference to release memory
+                        arg._value = None  # remove value to release memory
                     else:
                         value = arg
                     dummy_input[str(name)] = value

@@ -12,6 +12,7 @@ from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import IRDimops
 
 import torch.fx
+from .concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
 
 _logger = logging.getLogger(__name__)
 
@@ -48,9 +49,6 @@ class FxModuleParser:
             all_ir_nodes (List[IRFwOperation]): the IRFwOperation nodes
             outputs (List[IRObject]): the output IRObjects
         """
-        from cube.graph.parser.fx.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
-        from cube.graph.parser.fx.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import TensorMetadata
-
         frame = Frame()
         frame.push_var()
 
@@ -64,7 +62,15 @@ class FxModuleParser:
             FxModuleParser.init_objects(node, module, frame, concrete_value)
 
         # get graph inputs
-        inputs = [frame.get_var(n.name) for n in module.graph.nodes if n.op == 'placeholder']
+        placeholders = [n for n in module.graph.nodes if n.op == 'placeholder']
+        inputs = [frame.get_var(n.name) for n in placeholders]
+        # - if the graph inputs contain nested strcuture,
+        #   it should be wrapped into an IRObject
+        for idx, placeholder in enumerate(placeholders):
+            if not isinstance(inputs[idx], IRObject):
+                obj = IRObject(name=placeholder.name, value=inputs[idx])
+                inputs[idx] = obj
+                frame.set_var(placeholder.name, obj)
 
         # parse graph nodes
         all_ir_nodes = []
@@ -254,7 +260,7 @@ class FxModuleParser:
             assert isinstance(concrete_value, torch.Tensor), \
                 f"GetAttrPrim: expect tensor but got {type(concrete_value)}"
             exist_tensor = frame.get_attr_var(concrete_value)
-            # the cath that the parameter is the first time used by getattr
+            # the case that the parameter is the first time used by getattr
             if not exist_tensor:
                 tensor = frame.get_var(node.name)
                 if tensor.requires_grad:

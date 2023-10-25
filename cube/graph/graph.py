@@ -61,53 +61,49 @@ class IRGraph(IRSegment):
         """
         return self.forward(*args)
 
-    def forward(self, *args: Tuple[Any]) -> Union[IRTensor, Tuple[IRTensor]]:
+    def forward(self, *args: Tuple[IRObject]) -> Union[IRTensor, Tuple[IRTensor]]:
+        """Forward the IRGraph to add model nodes into program.
+
+        Args:
+            args (Tuple[IRObject]): input IRObjects
+
+        Returns:
+            Any: output that can be nested structure of IRObjects
         """
-        forward will divide the graph into Actions according to
-        node device assignment
-
-        Currently each forward call will result in a new flow
-        even if the input is same
-
-        @param args Tuple[Any]
-
-        @return outputs Union[IRSubTensor, Tuple[IRSubTensor]]
-        """
+        if not all(isinstance(arg, IRObject) for arg in args):
+            raise TypeError("Expected input arguments to be IRObject")
+        
         # align graph with input tensors
-        itensors: Tuple[IRObject, ...] = self.inputs()
-        if len(args) != len(itensors):
+        iobjs: Tuple[IRObject, ...] = self.inputs()
+        if len(args) != len(iobjs):
             _logger.error(
                 f'cube graph forward: skipping arguments due to len(args) != len(itensors): '
-                f'{len(args)} != {len(itensors)}'
+                f'{len(args)} != {len(iobjs)}'
             )
-            if len(args) > len(itensors):
-                args = args[:len(itensors)]
+            if len(args) > len(iobjs):
+                args = args[:len(iobjs)]
                 _logger.warning(f'cube graph forward: args shrinked into {args}')
             else:
                 raise RuntimeError('len(args) < len(itensors)')
 
-        arg_objs = IRGraph.get_objects_from_complex(args)
-        graph_objs = IRGraph.get_objects_from_complex(self.inputs())
-        assert len(arg_objs) == len(graph_objs), f"input object number not match: {len(arg_objs)} != {len(graph_objs)}"
-
-        for idx, (itensor, arg) in enumerate(zip(itensors, args)):
+        for idx, (iobj, arg) in enumerate(zip(iobjs, args)):
+            # reset input
             self.set_input(idx, arg)
-
-        for arg, itensor in zip(arg_objs, graph_objs):
-            for producer in self.producers(itensor.parent):
+            # replace node inputs
+            for producer in self.producers(iobj.parent):
                 with self.update(producer):
-                    while itensor in producer.outputs():
-                        oidx = producer.outputs().index(itensor)
+                    while iobj in producer.outputs():
+                        oidx = producer.outputs().index(iobj)
                         producer.set_output(oidx, arg)
-            for consumer in self.consumers(itensor.parent):
+            for consumer in self.consumers(iobj.parent):
                 with self.update(consumer):
-                    while itensor in consumer.inputs():
-                        iidx = consumer.inputs().index(itensor)
+                    while iobj in consumer.inputs():
+                        iidx = consumer.inputs().index(iobj)
                         consumer.set_input(iidx, arg)
             # reset output
             for oidx, output in enumerate(self.outputs()):
                 output = IRGraph.modify_objects_of_complex(
-                    self.output(oidx), lambda t: t if t != itensor else arg)
+                    self.output(oidx), lambda t: t if t != iobj else arg)
                 self.set_output(oidx, output)
 
         from cube.program import Program
