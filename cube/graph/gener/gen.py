@@ -139,13 +139,11 @@ class IRAdapterGener:
     def auto_pyfunc(graph: IRGraph):
         """Transform and assign IRPyFunc.
 
-        IRPyFunc will be replicated to devices with its producers output
-        
-        Note if an IRPyFunc has no input, indicating its device can not
-        be indicated from any other operators. In this case, the pyfunc
-        will be replicated to all devices in its segment. To restrict
-        the replicaed devices in pipeline-like scenarios, use `graph.staging`
-        to group the operators into segments.
+        Warning:
+            Each IRPyFunc will be replicated to all devices of its segment.
+
+            To restrict the replicaed devices in pipeline-like scenarios, use `graph.staging`
+            to group the operators into segments.
     
         Args:
             graph (IRGraph): the graph to be transformed
@@ -156,17 +154,21 @@ class IRAdapterGener:
         for func in graph.select(ntype=IRPyFunc, flatten=True):
             # get devices it will lowered to
             segment: IRSegment = graph.segment(func)
-            segment_outputs = IRSegment.get_objects_from_complex(segment.outputs())
             devices = set()
-            for t in func.inputs():
-                if not isinstance(t, IRObject): continue
-                cells = segment.consumers(t.parent) if t.is_attr() else segment.producers(t.parent)
-                for cell in cells:
-                    devices.update(cell.device)
-            for t in func.outputs():
-                if not isinstance(t, IRObject): continue
-                if t in segment_outputs:
-                    devices.update(segment.device)
+
+            # FIXME: this is temporally disabled as we don't track data dependencies inside
+            # operator kwargs. This will be fixed in the future.
+            # segment_outputs = IRSegment.get_objects_from_complex(segment.outputs())
+            # for t in func.inputs():
+            #     if not isinstance(t, IRObject): continue
+            #     cells = segment.consumers(t.parent) if t.is_attr() else segment.producers(t.parent)
+            #     for cell in cells:
+            #         devices.update(cell.device)
+            # for t in func.outputs():
+            #     if not isinstance(t, IRObject): continue
+            #     if t in segment_outputs:
+            #         devices.update(segment.device)
+
             # if a pyfunc doesn't have input, it will be replicated
             # to all devices in its segment.
             if len(devices) == 0:
