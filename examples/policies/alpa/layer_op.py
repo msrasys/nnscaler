@@ -10,7 +10,7 @@ from cube.graph.function.anchor import IRGraphAnchor
 class IRLayerOp(IRCell):
 
     def __init__(self, nodes: List[IRCell], layer_id: int = None):
-        super().__init__('layer_op', 'layer_op', 0, 0, init_outputs=False)
+        super().__init__('layer_op', 'layer_op', 0, 0)
         self.nodes = nodes
         self.layer_id : int = layer_id
 

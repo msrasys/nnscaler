@@ -13,14 +13,18 @@ The output of IRCell are IRTensors or any deterministic values (e.g., int)
 If an IRTensor is the output of Cell, then Cell.device == IRTensor.device
 """
 
+from __future__ import annotations
 
 from functools import lru_cache
-from typing import Iterable, List, Tuple, Union, Optional, Any
+from typing import List, Tuple, Union, Optional, Any, Dict
 import copy
 import torch
 
 from cube.ir.unique import IDGenerator
 from cube.ir.dtype import DTypeInfo
+
+
+NestedVarOrStatic = Any
 
 
 class IRCell:
@@ -32,8 +36,7 @@ class IRCell:
                  name: str,
                  signature: str,
                  input_length: int,
-                 output_length: int,
-                 init_outputs = True):
+                 output_length: int):
         """
         Create a node with name (variable name) and module type (module_name)
 
@@ -51,23 +54,13 @@ class IRCell:
 
         self._device: Tuple[int] = ()
 
-        # source tensors
-        self._inputs: List[Optional[IRTensor]] = [None,] * input_length
-        
-        # destination tensors
-        self._outputs: List[Optional[IRTensor]] = [None,] * output_length
-        if init_outputs:
-            self._outputs = [IRTensor() for _ in range(output_length)]
-            for tensor in self._outputs:
-                tensor.cell = self
-
-        # destination cells. [-1] for control dependency
-        self._successors: List[List[IRCell]] = [list() for _ in range(output_length+1)]
-        # source cells. [-1] for control dependency
-        self._predecessors: List[List[IRCell]] = [list() for _ in range(input_length+1)]
+        # input tensors
+        self._inputs: List[NestedVarOrStatic] = [None,] * input_length
+        self._kwargs: Dict[str, NestedVarOrStatic] = {}
+        # output tensors
+        self._outputs: List[NestedVarOrStatic] = [None,] * output_length
 
         self._mirror: Optional[IRCell] = None
-
         # the comment for code generation
         self._comment: Optional[str] = None
 
@@ -144,104 +137,51 @@ class IRCell:
         """
         return True
 
-    def input(self, index:int):
-        # type: (int) -> Optional[IRTensor]
-        """
-        Get the input tensor at input index
+    @property
+    def kwargs(self) -> Dict[str, NestedVarOrStatic]:
+        return self._kwargs
+
+    def input(self, index: int) -> NestedVarOrStatic:
+        """Get the index-th input
 
         Args:
-            index (int): 
-                index of the inputs
+            index (int): index of the inputs
 
         Returns:
-            values: Optional[IRTensor]
+            NestedVarOrStatic: (nested) IRObject or any static value (int, bool, str, etc)
         """
         return self._inputs[index]
 
     # 'maxsize=None' set no limit on cache growth, but it's ok since we have no args
     @lru_cache(maxsize=None)
-    def inputs(self):
-        # type: () -> Tuple[Optional[IRTensor], ...]
-        """
-        Get all input tensors
+    def inputs(self) -> Tuple[NestedVarOrStatic]:
+        """Get all input values
 
         Returns:
-            values: Tuple[Optional[IRTensor], ...]
+            Tuple[NestedVarOrStatic]
         """
-
         return tuple(self._inputs)
 
-    def predecessors(self, index: Optional[int] = None) -> List:
-        """
-        Get input operator at input index
-        (or index = -1 for control dependency)
-
-        Returns:
-            cell(s): Union[List[IRCell], IRCell]
-        """
-        if isinstance(index, int):
-            if index >= len(self._inputs):
-                raise RuntimeError(
-                    f"Get the input out of range ({index} >= {len(self._inputs)}"
-                )
-            return copy.copy(self._predecessors[index])
-        elif index is None:
-            predecessors = list()
-            for pre_cells in self._predecessors:
-                predecessors += pre_cells
-            return predecessors
-        else:
-            raise TypeError("Expected index to be None or int")
-
-    def output(self, index:int):
-        # type: (int) -> Optional[IRTensor]
-        """
-        Get the output tensor at output index
+    def output(self, index: int) -> NestedVarOrStatic:
+        """Get the index-th output value
 
         Args:
-            index (int): 
-                index of the outputs
+            index (int): index of the outputs
 
         Returns:
-            values: Optional[IRTensor]
+            NestedVarOrStatic: (nested) IRObject or any static value (int, bool, str, etc)
         """
         return self._outputs[index]
 
     # 'maxsize=None' set no limit on cache growth, but it's ok since we have no args
     @lru_cache(maxsize=None)
-    def outputs(self):
-        # type: () -> Tuple[Optional[IRTensor], ...]
-        """
-        Get all output tensors
+    def outputs(self) -> Tuple[NestedVarOrStatic]:
+        """Get all output values
 
         Returns:
-            values: Tuple[Optional[IRTensor], ...]
+            Tuple[NestedVarOrStatic]
         """
-
         return tuple(self._outputs)
-
-    def successors(self, index: Optional[int] = None) -> List:
-        """
-        Get output operator at output index
-
-        Args:
-            index (int or None): 
-                index of the outputs (or -1 for control dependency),
-                None will return the nodes for all the outputs
-        """
-        if isinstance(index, int):
-            if index >= len(self._outputs):
-                raise RuntimeError(
-                    f"Get the output out of range ({index} >= {len(self._outputs)}"
-                )
-            return copy.copy(self._successors[index])
-        elif index is None:
-            successors = list()
-            for post_cells in self._successors:
-                successors += post_cells
-            return successors
-        else:
-            raise TypeError("Expected index to be None or int")
 
     def reset_inputs(self, length:int) -> None:
         """
@@ -250,32 +190,21 @@ class IRCell:
         self._inputs = [None] * length
         self.inputs.cache_clear()
 
-    def set_input(self, input_index: int, val):
-        # type: (int, Optional[IRTensor]) -> Optional[IRTensor]
-        """
-        Set the node inputs[input_index] with the tensor
+    def set_input(self, index: int, val: NestedVarOrStatic) -> NestedVarOrStatic:
+        """Set the index-th input
 
         Args:
-            val: Optional[IRTensor]
+            val (NestedVarOrStatic): (nested) IRObject or any deterministic value (int, bool, str, etc)
 
-        Return:
-            the set tensor
+        Returns:
+            NestedVarOrStatic: copied value
         """
-        c = len(self._inputs)
-        if input_index >= c or input_index < -c:
-            raise RuntimeError(
-                f"Set the input out of range ({input_index} >= {c} or {input_index} < {-c})"
-            )
         if isinstance(val, IRObject):
             # copy the val
             val = copy.copy(val)
-            # set tensor dst
             val.cell = self
-
-        self._inputs[input_index] = val
-
+        self._inputs[index] = val
         self.inputs.cache_clear()
-
         return val
 
     def reset_outputs(self, length:int) -> None:
@@ -285,129 +214,25 @@ class IRCell:
         self._outputs = [None] * length
         self.outputs.cache_clear()
 
-    def set_output(self, output_index: int, val):
-        # type: (int, Optional[IRTensor]) -> Optional[IRTensor]
+    def set_output(self, index: int, val: NestedVarOrStatic):
         """
         Set the node inputs[output_index] with the tensor
 
         Args:
-            val: Optional[IRTensor]
-                IRTensor or any deterministic value (int, bool, str, etc)
+            val (NestedVarOrStatic): (nested) IRObject or any deterministic value (int, bool, str, etc)
+
+        Returns:
+            NestedVarOrStatic: copied value
         """
-        c = len(self._outputs)
-        if output_index >= c or output_index < -c:
-            raise RuntimeError(
-                f"Set the input out of range ({output_index} >= {c} or {output_index} < {-c})"
-            )
         if isinstance(val, IRObject):
             val = copy.copy(val)
             val.cell = self
-
-        self._outputs[output_index] = val
+        self._outputs[index] = val
         self.outputs.cache_clear()
-
         return val
 
-    def add_predecessor(self, input_index: int, cell):
-        """
-        Add a predecessor cell in the input_index slot. 
-        
-        Note this won't add successor if caller cell to the node
-
-        To add control dependency, use `input_index=-1`
-        """
-        if not isinstance(cell, IRCell):
-            raise TypeError("Expected node to be IRCell")
-        if input_index >= len(self.inputs()):
-            raise RuntimeError(
-                f"Set the input out of range ({input_index} >= {len(self._inputs)})"
-            )
-        if cell not in self._predecessors[input_index]:
-            self._predecessors[input_index].append(cell)
-
-    def clear_predecessor(self):
-        """
-        Clear all predecessors
-        """
-        self._predecessors = [
-            list() for _ in range(len(self.inputs()) + 1)
-        ]
-
-    def add_successor(self, output_index: int, cell):
-        """
-        Set self node the output index node. 
-        `node` will take the self.output(index) as the input
-
-        To add control dependency, use `output_index=-1`
-        """
-        if not isinstance(cell, IRCell):
-            raise TypeError("Expected node to be IRCell")
-        if cell not in self._successors[output_index]:
-            self._successors[output_index].append(cell)
-
-    def clear_successor(self):
-        """
-        Clear all successors
-        """
-        self._successors = [
-            list() for _ in range(len(self.outputs()) + 1)
-        ]
-
-    def make_empty(self):
-        """
-        Clear all inputs, outputs of this Cell
-        """
-        for idx in range(len(self.inputs())):
-            self.set_input(idx, None)
-        for idx in range(len(self.outputs())):
-            self.set_output(idx, None)
-
-    @staticmethod
-    def get_inputs(cells):
-        # type: (Iterable[IRCell]) -> list[IRCell]
-        """
-        Get all the input tensors the is not generated by nodes
-
-        Inputs
-
-        Returns:
-            List[IRTensor]
-        """
-        all_outputs = list()
-        for cell in cells:
-            all_outputs.extend(cell.outputs())
-        inputs = list()
-        for cell in cells:
-            for input in cell.inputs():
-                if isinstance(input, IRTensor):
-                    if input not in all_outputs:
-                        if input not in inputs:
-                            inputs.append(input)
-        return inputs
-
-    @staticmethod
-    def get_outputs(cells):
-        # type: (Iterable[IRCell]) -> list[IRCell]
-        """
-        Get all the input tensors the is not generated by nodes
-
-        Returns:
-            List[IRTensor]
-        """
-        all_inputs = list()
-        for node in cells:
-            all_inputs.extend(node.inputs())
-        outputs = list()
-        for node in cells:
-            for output in node.outputs():
-                if isinstance(output, IRTensor):
-                    if output not in all_inputs:
-                        if output not in outputs:
-                            outputs.append(output)
-        return outputs
-
     @property
-    def comment(self) -> Any:
+    def comment(self) -> Optional[str]:
         return self._comment
 
     @comment.setter

@@ -138,7 +138,7 @@ class RVDLayout:
         """
         dims = tuple(dims)
         def dummy_assign(tensor: IRSubTensor, devid: int):
-            tensor.cell = IRCell('dummy', '', 0, 0, init_outputs=False)
+            tensor.cell = IRCell('dummy', '', 0, 0)
             tensor.cell.device = devid
 
         mats = np.empty((r, v) + dims, dtype=IRSubTensor)

@@ -77,7 +77,7 @@ class IRSegment(IRCell):
     """
 
     def __init__(self, nodes: List[IRCell], inputs: List[IRObject], outputs: List[Any], name='segment'):
-        super().__init__(name, '', len(inputs), len(outputs), init_outputs=False)
+        super().__init__(name, '', len(inputs), len(outputs))
 
         self._nodes: List[IRCell] = []
 
@@ -103,8 +103,6 @@ class IRSegment(IRCell):
             self.insert(node, self.nnodes)
 
         self._dispatch_cached: Dict[int, IRSegment] = {}
-
-        # self.reset_dependency()
 
     def set_input(self, idx: int, val: Any):
         for t in IRSegment.get_objects_from_complex(val):
@@ -137,34 +135,6 @@ class IRSegment(IRCell):
         @return ftensors List[IRFullTensor]
         """
         return tuple(self._attributes)
-
-    def reset_dependency(self):
-        """
-        Reset the node dataflow dependency
-        
-        Note all the predefined control dependencies will be removed.
-        TODO: adapter dependency is not set
-        """
-        for node in self._nodes:
-            node.clear_predecessor()
-            node.clear_successor()
-        # TODO: adapter dependency not set
-        for ftensor in self._ftensors:
-            for ptensor, producer in zip(self.ptensors(ftensor), self.producers(ftensor)):
-                for ctensor, consumer in zip(self.ctensors(ftensor), self.consumers(ftensor)):
-                    if ptensor.overlap(ctensor):
-                        pidx = producer.outputs().index(ptensor)
-                        cidx = consumer.inputs().index(ctensor)
-                        producer.add_successor(pidx, consumer)
-                        consumer.add_predecessor(cidx, producer)
-                # set mirror as control dependency
-                if producer.mirror is not None and isinstance(producer, IRFwOperation):
-                    producer.add_successor(-1, producer.mirror)
-                    producer.mirror.add_predecessor(-1, producer)
-        # sub segments
-        for segment in self._nodes:
-            if isinstance(segment, IRSegment):
-                segment.reset_dependency()
 
     # ========================= Basic Graph access =======================
 

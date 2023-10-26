@@ -13,9 +13,7 @@ class IRAdapter(IRCell):
             name='adapter', signature='adapter',
             input_length=len(inputs),
             output_length=len(outputs),
-            init_outputs=False
         )
-        self.kwargs = dict()
         # we don't use input and output setter as this will
         # change tensor device info
         self._inputs = inputs

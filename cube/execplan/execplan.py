@@ -26,7 +26,7 @@ class ExeReuseCell(IRCell):
             f"output length mismatch: {cell}\n"
             f"cell outputs: {cell.outputs()}\noutputs: {outputs}")
         super().__init__(cell.name, cell.signature,
-                         len(inputs), len(outputs), init_outputs=False)
+                         len(inputs), len(outputs))
         for idx, t in enumerate(inputs):
             self.set_input(idx, t)
         for idx, t in enumerate(outputs):

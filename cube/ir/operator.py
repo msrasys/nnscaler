@@ -25,15 +25,14 @@ class IRFwOperation(IRCell):
         """
         # recompute schedule
         self._recompute = None
-        super().__init__(name, signature, len(inputs), 
-                         num_outputs, init_outputs=False)
+        super().__init__(name, signature, len(inputs), num_outputs)
 
         # setup input
         for idx, input in enumerate(inputs):
             self.set_input(idx, input)
         
         # additional argument
-        self.kwargs = kwargs
+        self.kwargs.update(kwargs)
 
         # default infer rule
         requires_grad = any(
@@ -132,8 +131,6 @@ class IRFwOperation(IRCell):
             cpy.set_output(idx, output)
         cpy._mirror = None
         cpy.recompute = self.recompute
-        cpy.clear_predecessor()
-        cpy.clear_successor()
         return cpy
 
     def __repr__(self) -> str:
@@ -163,7 +160,7 @@ class IRBpOperation(IRCell):
         """
         super().__init__(
             'backward', 'torch.autograd.grad',
-            len(ograds), len(igrads), init_outputs=False
+            len(ograds), len(igrads)
         )
         for idx, ograd in enumerate(ograds):
             self.set_input(idx, ograd)
@@ -188,8 +185,6 @@ class IRBpOperation(IRCell):
         for idx, output in enumerate(self.outputs()):
             cpy.set_output(idx, output)
         cpy._mirror = None
-        cpy.clear_predecessor()
-        cpy.clear_successor()
         return cpy
 
     def __repr__(self) -> str:
@@ -231,8 +226,6 @@ class IRDataOperation(IRCell):
         for idx, output in enumerate(self.outputs()):
             cpy.set_output(idx, output)
         cpy._mirror = None
-        cpy.clear_predecessor()
-        cpy.clear_successor()
         return cpy
 
     def infer_shape(self):
