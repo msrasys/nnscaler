@@ -1,7 +1,9 @@
 ### Only test the anno creation in these tests
 
 import cube.graph.function.function as F
-from cube.ir.cten import IRTensor
+from cube.ir.cten import IRObject, IRTensor
+
+import pytest
 
 
 def test_handle_broadcast_multi():
@@ -32,6 +34,100 @@ def test_Expand():
 
     op.new([inp], [out], size=[10, 2])
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ -> a 2'
+
+
+def test_variadic_extraction():
+    def o(value):
+        return IRObject(value=value)
+    assert F.extract_variadic([]) == ([], [])
+    assert F.extract_variadic(1) == ([1], [False])
+    assert F.extract_variadic([1]) == ([1], [False])
+    assert F.extract_variadic((1,)) == ([1], [False])
+    assert F.extract_variadic([1, 2]) == ([1, 2], [False, False])
+
+    assert F.extract_variadic(o([])) == ([], [])
+    assert F.extract_variadic(o(1)) == ([1], [True])
+    assert F.extract_variadic(o([1])) == ([1], [True])
+    assert F.extract_variadic(o((1,))) == ([1], [True])
+    assert F.extract_variadic(o([1, 2])) == ([1, 2], [True, True])
+
+    assert F.extract_variadic([1, o(2)]) == ([1, 2], [False, True])
+    assert F.extract_variadic([1, o(2), 3, o(4)]) == ([1, 2, 3, 4], [False, True, False, True])
+
+    with pytest.raises(ValueError, match='.*nested.*'):
+        F.extract_variadic([1, o([2, 3])])
+    with pytest.raises(ValueError, match='.*nested.*'):
+        F.extract_variadic([1, [2, 3]])
+    with pytest.raises(ValueError, match='Unsupported type.*'):
+        F.extract_variadic(True)
+    with pytest.raises(ValueError, match='Unsupported type.*'):
+        F.extract_variadic([1, True])
+    with pytest.raises(ValueError, match='Unsupported type.*'):
+        F.extract_variadic(o([1, True]))
+
+
+def test_Repeat():
+    def o(value):
+        return IRObject(value=value)
+    inp = IRTensor([3])
+    op = F.Repeat(inp, (4, 2))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'b^ -> 4 (2 b^)'
+
+    inp = IRTensor([3])
+    op = F.Repeat(inp, (4, 1))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'b -> 4 b'
+
+    inp = IRTensor([3])
+    op = F.Repeat(inp, 4, 1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'b -> 4 b'
+
+    inp = IRTensor([3, 2])
+    op = F.Repeat(inp, (4, 2))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ -> (4 a^) (2 b^)'
+
+    inp = IRTensor([3, 2])
+    op = F.Repeat(inp, 4, 2, 1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'b^ c -> 4 (2 b^) c'
+
+    inp = IRTensor([3, 2])
+    op = F.Repeat(inp, (4, 2), 1)  # the args(1) is ignored
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ -> (4 a^) (2 b^)'
+
+    inp = IRTensor([3, 2])
+    op = F.Repeat(inp, (4, 1))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b -> (4 a^) b'
+
+    inp = IRTensor([3, 2])
+    with pytest.raises(ValueError):
+        op = F.Repeat(inp, (2))
+
+    with pytest.raises(ValueError, match='.*nested.*'):
+        op = F.Repeat(inp, 4, (4, 2))
+
+    inp = IRTensor([3])
+    op = F.Repeat(inp, o((4, 2)))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'b^ -> 4 (2 b^)'
+
+    inp = IRTensor([3])
+    op = F.Repeat(inp, (4, o(1)))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'b^ -> 4 b^'
+
+    inp = IRTensor([3, 2])
+    op = F.Repeat(inp, (4, o(2)))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ -> (4 a^) (2 b^)'
+
+    inp = IRTensor([3, 2])
+    op = F.Repeat(inp, (o(4), 1))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b -> (4 a^) b'
+
+    inp = IRTensor([3, 2])
+    op = F.Repeat(inp, 4, 2, o(1), 2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'c^ d^ -> 4 2 c^ (2 d^)'
+
+    inp = IRTensor([3, 2])
+    with pytest.raises(ValueError):
+        op = F.Repeat(inp, o(2))
+
 
 def test_Where():
     op = F.Where(IRTensor([3, 4]), IRTensor([3, 4]), IRTensor([3, 4]))

@@ -17,12 +17,51 @@ _logger = logging.getLogger(__name__)
 
 
 class IRValue:
-
+    """
+    A wrapper of the tensor name (as a variable name).
+    This is used to avoid the tensor name to be quoted in repr.
+    repr('name') => "'name'"
+    repr(IRValue('name')) => "name"
+    """
     def __init__(self, name: str):
         self.name = name
 
     def __repr__(self):
         return self.name
+
+
+def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None) -> Any:
+    """
+    Return repr-able value of a tensor or value.
+    For tensor, return IRValue({prefix}{tensor.name}_{tensor.tid})
+    For non-tensor, return as it is
+
+    Args:
+        val (Any): tensor or non-tensor value
+        prefix_attr (str): prefix to the tensor name if the tensor is an attribute
+    Returns:
+        the val that can be repr safely
+    """
+    if isinstance(val, IRObject):
+        tensor_name = val.name
+        if '.' in tensor_name:
+            tensor_name = tensor_name.split('.')[0]
+        name = '_'.join([tensor_name, str(val.tid)])
+        if prefix_attr is not None and val.is_attr():
+            name = prefix_attr + name
+        return IRValue(name)
+    elif isinstance(val, slice):
+        return slice(_safe_repr_value(val.start, prefix_attr), _safe_repr_value(val.stop, prefix_attr), _safe_repr_value(val.step, prefix_attr))
+    elif isinstance(val, dict):
+        return {_safe_repr_value(k, prefix_attr): _safe_repr_value(v, prefix_attr) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [_safe_repr_value(v, prefix_attr) for v in val]
+    elif isinstance(val, tuple):
+        # TODO: support subclasses of tuple, like torch.Size?
+        return tuple(_safe_repr_value(v, prefix_attr) for v in val)
+    elif isinstance(val, (int, str, bool, float, type(None), bytes)): # only primitive type supported
+        return val
+    raise ValueError(f'Unsupported data type: {type(val)}')
 
 
 class CodeEmission:
@@ -32,27 +71,19 @@ class CodeEmission:
     def node_name(self, node: IRCell) -> str:
         return f"{node.name}{node.cid}"
 
-    def tensor_name(self, tensor: Any, prefix_attr: Optional[str] = None) -> str:
+    def tensor_name(self, val: Any, prefix_attr: Optional[str] = None) -> str:
         """
-        Return the var name.
+        Return representation of a value or a tensor.
         For tensor, return the {prefix}{tensor.name}_{tensor.tid}
-        For non-tensor, return its string
+        For non-tensor, return its repr
 
-        @param tensor Any: any value
-        @attr_prefix Optional[str]: prefix for a attributed tensor
-
-        @return str
+        Args:
+            val (Any): tensor or non-tensor value
+            prefix_attr (Optional[str]): prefix to the tensor name if the tensor is an attribute
+        Returns:
+            representation of the val in str
         """
-        if isinstance(tensor, IRObject):
-            tensor_name = tensor.name
-            if '.' in tensor_name:
-                tensor_name = tensor_name.split('.')[0]
-            name = '_'.join([tensor_name, str(tensor.tid)])
-            if prefix_attr is not None and tensor.is_attr():
-                name = prefix_attr + name
-        else:
-            name = str(IRSegment.modify_objects_of_complex(tensor, self.tensor_name)).replace('\'', '')
-        return name
+        return repr(_safe_repr_value(val, prefix_attr))
 
     def complex_name(self, val: Any, prefix_attr: Optional[str]=None) -> str:
         """

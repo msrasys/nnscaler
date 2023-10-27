@@ -156,7 +156,7 @@ def CubeArange(start: Union[int, IRObject], end: Union[int, IRObject], step: Uni
     return dimop
 
 
-def Arange(*args, out=None, dtype=None, layout=None, 
+def Arange(*args, out=None, dtype=None, layout=None,
            device=None, requires_grad=False, signature=None):
     """
     torch.arange(start=0, end, step=1, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False) → Tensor
@@ -261,13 +261,13 @@ def Full(size, fill_value, *, out=None, dtype=None, layout=None,
     return dimop
 
 
-def NewTensor(data, *, dtype=None, device=None, 
+def NewTensor(data, *, dtype=None, device=None,
               requires_grad=False, pin_memory=False, signature=None):
     # note: device is ignored
     dtype = dtype if dtype is not None else torch.get_default_dtype()
     signature = 'cube.runtime.function.tensor'
     size = tuple(np.array(data).shape) if np.array(data).shape else (1,)  # (1,) means it is a scalar
-    kwargs = {'size': size, 'requires_grad': requires_grad, 
+    kwargs = {'size': size, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(size, True)
     dimop = IRDimops(NewTensor, 'tensor', signature, [anno], [], rules, **kwargs)
@@ -339,12 +339,12 @@ def _handle_broadcast_multi(ins_list: List[IRTensor]) -> Tuple[Tuple[List[str]],
 def Expand(input, *sizes, size = None, signature = None):
     """
     torch.Tensor.expand(*sizes)
-    
+
     The reason of add ``size`` to this function argument is:
     1. ``sizes`` need to reuse in IRDimops.new(), but it is a ``non-keyword arguments``,
     and can not put it into keyword arguments (something like Expand(input, sizes=[1, 2, 3])) is not work,
     to support IRDimops.new API, here add a ``size`` to workaround.
-    
+
     2. in torch._C.expand API, it has:
         def expand(self, size: Sequence[Union[_int, SymInt]], *, implicit: _bool=False) -> Tensor: ...
       so add ``size`` can also solve user using something like:
@@ -941,7 +941,7 @@ def _reshape_anno(in_shape: List[int], ou_shape: List[int], kwarg_name: str) -> 
         in_shape List[int]: input shape
         ou_shape List[int]: output shape
         kwarg_name str: kwarg name of reshape / view op
-    
+
     Returns:
         str: annotation string
         List[TransformRule]: transformation rules
@@ -1063,7 +1063,7 @@ def _reshape_anno(in_shape: List[int], ou_shape: List[int], kwarg_name: str) -> 
         if sdim is not None:
             ospatial.add(sdim)
         ofirst.append(sdim)
-    
+
     # intersection for spatial partitioned dimensions
     spatial = ispatial.intersection(ospatial)
 
@@ -1497,7 +1497,7 @@ def Slice(tensor: torch.Tensor, dim, start, end, step, signature = None):
     ianno = ShapeAnno.create_shape_str(tensor.shape)
     oanno = copy.copy(ianno)
     ianno[dim] = str(tensor.shape[dim])
-    
+
     def clip(ofst):
         ofst = ofst + tensor.shape[dim] if ofst < 0 else ofst
         return min(tensor.shape[dim], max(0, ofst))
@@ -1528,21 +1528,51 @@ def SelectScatter(self: torch.Tensor, input: torch.Tensor, dim: int, index: int,
     in1_anno[dim] = str(self.shape[dim])
     out_anno = in1_anno.copy()
     anno = OpAnno.create_op_str([in1_anno, in2_anno], [out_anno])
-    return IRDimops(SelectScatter, 'select_scatter', signature, 
+    return IRDimops(SelectScatter, 'select_scatter', signature,
                     [anno], [self, input], dim=dim, index=index)
 
 
-def Repeat(tensor, repeats: Tuple[int], *arg_repeats, signature = None):
+# If the type is IROject, then value should be type of int, Tuple[int], List[int]
+# If the type is Tuple[IROject] or List[IRObject], then the value of each element should be type of int
+_VariadicInt = Union[int, Tuple[int, ...], List[int], IRObject, Tuple[IRObject, ...], List[IRObject]]
+
+def extract_variadic(v: _VariadicInt) -> Tuple[List[int], List[bool]]:
+    if isinstance(v, int):
+        if isinstance(v, bool):
+            raise ValueError("Unsupported type: bool")
+        return [v], [False]
+    elif isinstance(v, IRObject):
+        r = extract_variadic(v.value)
+        return r[0], [True] * len(r[0]) # because all elements are from IRObject
+    elif isinstance(v, (tuple, list)):
+        r = [extract_variadic(e) for e in v]
+        if any(len(x[0]) != 1 for x in r):
+            raise ValueError("tuple/list can't be nested")
+        return [x[0][0] for x in r], [x[1][0] for x in r]
+    else:
+        raise ValueError(f"Unsupported type: {type(v)}")
+
+
+def Repeat(tensor, repeats: _VariadicInt, *arg_repeats, signature = None):
     """
     torch.Tensor.repeat(*sizes)
     """
     signature = 'torch.ops.aten.repeat'
-    repeats = (repeats,) if isinstance(repeats, int) else tuple(repeats)
-    repeats = repeats + arg_repeats
+    if isinstance(repeats, (list, tuple)) or (
+        isinstance(repeats, IRObject) and isinstance(repeats.value, (list, tuple))
+    ):
+        # follow the behavior of torch.Tensor.repeat,
+        # ignore arg_repeats in this case
+        complete_repeats = repeats
+    else:
+        complete_repeats = (repeats,) + arg_repeats
+    repeats, repeats_is_ir = extract_variadic(complete_repeats)
+
     in_shape = list(tensor.shape)
-    assert len(in_shape) <= len(repeats), "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor"
+    if len(in_shape) > len(repeats):
+        raise ValueError("Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor")
     expand = len(repeats) - len(tensor.shape)
-    in_shape += [1] * expand
+    in_shape = [1] * expand + in_shape
     ou_shape = [dimlen * repeat for dimlen, repeat in zip(in_shape, repeats)]
     ianno, oanno = ShapeAnno.create_shape_str(in_shape), []
     for dim, dimlen in enumerate(ou_shape):
@@ -1552,11 +1582,14 @@ def Repeat(tensor, repeats: Tuple[int], *arg_repeats, signature = None):
             if repeats[dim] != 1:
                 ianno[dim] += '^'
                 dim_anno = [str(repeats[dim]), ianno[dim]]
+            elif repeats_is_ir[dim]:  # for dynamic repeat, don't split the dimension
+                ianno[dim] += '^'
+                dim_anno = ianno[dim]
             else:
                 dim_anno = ianno[dim]
             oanno.append(dim_anno)
     anno = OpAnno.create_op_str([ianno[expand:]], [oanno])
-    return IRDimops(Repeat, 'repeat', signature, [anno], [tensor], repeats=repeats)
+    return IRDimops(Repeat, 'repeat', signature, [anno], [tensor], repeats=complete_repeats)
 
 
 def CubeEmbedding(input, weight, padding_idx, signature = None, **kwargs):
@@ -1627,12 +1660,12 @@ def AdaptiveAvgPool1d(input, output_size, signature = None):
     return IRDimops(AdaptiveAvgPool1d, 'adaptive_avg_pool1d', signature, [anno], [input], output_size=output_size)
 
 
-def CrossEntropy(input, target, weight=None, 
+def CrossEntropy(input, target, weight=None,
                  size_average=None, ignore_index=- 100, reduce=None,
                  reduction='mean', label_smoothing=0.0, signature = None):
     """
     torch.nn.functional.cross_entropy(
-        input, target, weight=None, 
+        input, target, weight=None,
         size_average=None, ignore_index=- 100, reduce=None,
         reduction='mean', label_smoothing=0.0)
     """
@@ -1664,12 +1697,12 @@ def GraphAnchor(name: str, signature = None):
     return node
 
 
-def _comparison(creator: Callable, f: Callable, name: str, signature: str, 
+def _comparison(creator: Callable, f: Callable, name: str, signature: str,
                 input, other):
     """
     if both operands are scalars, returns bool.
     if one operand is a tensor, returns a broadcasted tensor with dtype being bool.
-    
+
     @param creator Callable: the outside creation function
     @param f Callable: (Scalar, Scalar) -> bools
     """

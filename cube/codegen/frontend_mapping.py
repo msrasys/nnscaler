@@ -16,8 +16,6 @@ class Sign2EmitRule:
         self._sign2rule = {
             'torch.slice': self.emit_slice,
             'setattr': self.emit_setattr,
-            'builtins.getattr': self.emit_getattr,
-            '_operator.getitem': self.emit_getitem,
         }
 
     def map(self, signature: str) -> Callable:
@@ -76,20 +74,4 @@ class Sign2EmitRule:
     def emit_setattr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
         """Special rule for generating setattr node
         """
-
-        assert arg_vars[1].startswith('self.')
-        member = f'"{arg_vars[1][5:]}"'
-        return f"{node.signature}({arg_vars[0]}, {member}, {arg_vars[2]})"
-
-    def emit_getattr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
-        """Special rule for generating getattr node
-        """
-        return f"{node.signature}({arg_vars[0]}, '{arg_vars[1]}')"
-
-    def emit_getitem(self, node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
-        """Special rule for generating getitem node
-        """
-        if len(arg_vars) == 2 and len(kw_pairs) == 0 and not arg_vars[1].replace('_', '').isdigit():
-            return f"{node.signature}({arg_vars[0]}, '{arg_vars[1]}')"
-        else:
-            return self.emit_common(node, arg_vars, kw_pairs)
+        assert False, f"This emit rule is deprecated, please report if you reach here"

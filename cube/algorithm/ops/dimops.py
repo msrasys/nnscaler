@@ -34,9 +34,9 @@ class DimSplitEinops(GenericDistAlgo):
 
         If the identifier appears as the same name in argument name, the
         argument will also be uniformly partitioned.
-        
+
         Non-tensor will always be replicated.
-    
+
     Note the default rule isn't always expressive for all possible partition algorithms.
     E.g., linear xw + b to partition on reduction dimension,
     whitch requires b to be value split but actually according to the default rule, will be replicated.
@@ -52,7 +52,7 @@ class DimSplitEinops(GenericDistAlgo):
         """
         Get the partitioned identifier and reduction type.
         If the partitioned number is 1, return the first hidden identitifer
-        Otherwise, return the first hidden identifier whose length > 1 
+        Otherwise, return the first hidden identifier whose length > 1
 
         @param idx int: input/output index. Take the idx-th input tensor or (idx-ninputs)-th output
         @param dim int: input dimension
@@ -75,7 +75,7 @@ class DimSplitEinops(GenericDistAlgo):
     def satisfy(self, idx: int, dim: Union[int, str], num: int) -> bool:
         """
         Check whether the condition satisfies.
-        
+
         @param idx int: input/output index. Take the idx-th input tensor or (idx-ninputs)-th output tensor
         @param dim Union[int, str]: tensor dimension or 'v', i.e., partition at value dimension.
         @param num int: chunks to partition the dimension
@@ -85,7 +85,7 @@ class DimSplitEinops(GenericDistAlgo):
         assert all(isinstance(cond, int) for cond in [idx, num]), "expect int condition"
         assert isinstance(dim, int) or dim == 'v', f"expect dim to be int or 'v'"
         node: IRDimops = self.node
-        
+
         tensors = node.inputs() + node.outputs()
         assert isinstance(tensors[idx], IRSubTensor), f"partition on a non-tensor input/output"
         assert 0 <= idx and idx < len(tensors), f"index out of boundary: {idx} >= {len(tensors)}"
@@ -94,7 +94,7 @@ class DimSplitEinops(GenericDistAlgo):
         if isinstance(dim, int):
             dim = dim if dim >= 0 else dim + tensors[idx].ndims
             assert dim < tensors[idx].ndims, f"dimension output of boundary: {dim} >= {node.input(idx).ndims}"
-        
+
         # try split at tensor spatial dimension
         if isinstance(dim, int):
             adim, reduce = self.get_identifier_reduce(idx, dim, num)
@@ -104,11 +104,11 @@ class DimSplitEinops(GenericDistAlgo):
             for rule in node.transform_rules:
                 splits = rule.inputs() + rule.outputs()
                 if splits[idx] == DimopSplit.D(dim):
-                    return dimlen >= num
+                    return dimlen % num == 0
             # then check default rules
             if reduce == DimAnno.ReduceType.Freeze:
                 return False
-            return dimlen >= num
+            return dimlen % num == 0
         else:
             for rule in node.transform_rules:
                 splits = rule.inputs() + rule.outputs()
@@ -125,13 +125,13 @@ class DimSplitEinops(GenericDistAlgo):
             adim, reduce = self.get_identifier_reduce(idx, dim, num)
         else:
             adim, reduce = 'Value', None
-        
+
         color, default = '\033[32m' if satisfy else '\033[31m', '\033[0m'
         _logger.info(f"split {node.name}: {node.anno} | dim: {adim} num: {num} reduce: {reduce} ... {color}{'Success' if satisfy else 'Failed!'}{default}")
 
         if not satisfy: return None
         rule: TransformRule = self.infer(idx, dim, num)
-    
+
         # transform
         def transform(tensor: Any, split: DimopSplit) -> List[Any]:
             if not isinstance(tensor, IRSubTensor):
@@ -296,8 +296,8 @@ def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
 
                 if cur_key in visited:
                     continue
-                
+
                 dq.append((new_node, new_ngpus))
                 visited.add(cur_key)
-    
-    return gen_nodes 
+
+    return gen_nodes

@@ -6,7 +6,7 @@ import pytest
 
 from cube.parallel import parallelize, ComputeConfig, CubeModule
 
-from .common import PASData, init_distributed
+from .common import PASData, init_distributed, PASRandomSPMD
 from ..launch_torchrun import launch_torchrun
 
 def _to_cube_model(module, compute_config, cube_savedir, load_module):
@@ -214,3 +214,116 @@ def test_codegen_unused_args2():
 
     with tempfile.TemporaryDirectory() as tempdir:
         launch_torchrun(1, _gencode_unused_args_worker2, tempdir)
+
+
+class AttrModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, attr):
+        return x + getattr(attr, 'a')
+
+
+def _gencode_contains(cubesave_dir, module_class, index, search_re):
+    from cube.parallel import _CUBE_MODULE_NAMESPACE, _get_full_qualified_name
+    from pathlib import Path
+    import re
+    namespace = f'{_CUBE_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}'
+    outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
+    filecontent = (outdir /f'gencode{index}.py').read_text()
+    matches = re.findall(search_re, filecontent)
+    return bool(matches)
+
+
+def test_codegen_attr():
+    if not torch.cuda.is_available():
+        print('skip test_codegen_attr due to lack of cuda devices')
+        return
+    class AttrHelper:
+        def __init__(self) -> None:
+            self.a = 2.0
+
+    with tempfile.TemporaryDirectory() as tempdir:
+        m_new = parallelize(
+            AttrModule(),
+            {'x': torch.tensor([1.0, 2.0, 3.0, 6.0]), 'attr': AttrHelper()},
+            PASData,
+            ComputeConfig(1, 1),
+            dynamic_shape=True,
+            cube_savedir=tempdir,
+            load_module=False
+        )
+        assert _gencode_contains(tempdir, AttrModule, 0, r'builtins.getattr\(.*, \'a\'\)')
+        assert m_new is None
+
+
+class GetItemModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, batched_data):
+        data_x = batched_data["x"]
+        n_graph, n_node = data_x.size()[:2]
+        padding_mask = (data_x[:, :, 0]).eq(0)  # B x T x 1
+        padding_mask_cls = torch.zeros(
+            n_graph, 1, device=padding_mask.device, dtype=padding_mask.dtype
+        )
+        padding_mask = torch.cat((padding_mask_cls, padding_mask), dim=1)
+        return padding_mask
+
+
+def test_codegen_getitem():
+    if not torch.cuda.is_available():
+        print('skip test_codegen_getitem due to lack of cuda devices')
+        return
+
+    with tempfile.TemporaryDirectory() as tempdir:
+        m_new = parallelize(
+            GetItemModule(),
+            {'batched_data': {'x': torch.tensor([[[1.0], [2.0], [3.0], [6.0]]])}},
+            PASRandomSPMD,
+            ComputeConfig(2, 2),
+            dynamic_shape=True,
+            cube_savedir=tempdir,
+            load_module=False,
+            override=True,
+        )
+        assert _gencode_contains(tempdir, GetItemModule, 0, r'_operator.getitem\(.*, slice\(None, 2, None\)\)')
+        assert _gencode_contains(tempdir, GetItemModule, 1, r'_operator.getitem\(.*, slice\(None, 2, None\)\)')
+        assert m_new is None
+
+
+class TrainingModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(3, 5)
+
+    def forward(self, x):
+        if self.training:
+            return self.linear(x)
+        else:
+            return self.linear(x) + 1
+
+
+def test_codegen_training_flag():
+    """
+    Test it can support modules without parameters
+    """
+    if not torch.cuda.is_available():
+        print('skip test_codegen_training_flag due to lack of cuda devices')
+        return
+    with tempfile.TemporaryDirectory() as tempdir:
+        m = TrainingModule()
+        m.train()
+
+        # self.training isn't supported in concrete_trace
+        with pytest.raises(RuntimeError, match='Node referenced nonexistent target.*'):
+            parallelize(
+                m,
+                {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+                PASData,
+                ComputeConfig(1, 1),
+                dynamic_shape=True,
+                cube_savedir=tempdir,
+                load_module=False
+            )
