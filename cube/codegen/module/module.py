@@ -219,7 +219,7 @@ class ModuleCodeGen(FuncEmission):
         if isinstance(node, IRAdapter):
             adapter = copy.copy(node)
             adapter._id = node.cid
-            adapter.kwargs = dict(**node.kwargs)
+            adapter.kwargs.update(node.kwargs)
             prims = []
             for prim in adapter.prims:
                 p = copy.copy(prim)
