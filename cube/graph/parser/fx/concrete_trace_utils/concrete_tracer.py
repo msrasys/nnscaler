@@ -128,7 +128,7 @@ from .utils import (
 
     _orig_node_is_impure,
 )
-from .utils import FrameRecord, ExtraSEFPatcher
+from .utils import FrameRecord, ExtraSEFPatcher, extract_results_metadata, EmptyResult
 
 # pyright: reportGeneralTypeIssues=false
 _logger = logging.getLogger(__name__)
@@ -394,7 +394,7 @@ class ConcreteTracer(TracerBase):
     @compatibility(is_backward_compatible=True)
     def create_node(self, kind : str, target : Target,
                     args : Tuple[Argument, ...], kwargs : Dict[str, Argument], name : Optional[str] = None,
-                    type_expr : Optional[Any] = None) -> Node:
+                    type_expr : Optional[Any] = None, node_result: Any = EmptyResult) -> Node:
         """
         This method is almost the same as the one in `TracerBase` class of Pytorch2.0.
         Add it here because this method of Pytorch1.13 and older version
@@ -415,6 +415,7 @@ class ConcreteTracer(TracerBase):
             node.meta['nn_module_stack'] = copy.copy(self.module_stack)
         else:
             node.meta['nn_module_stack'] = collections.OrderedDict()
+        extract_results_metadata(node_result, node)
         return node
 
     @compatibility(is_backward_compatible=True)
@@ -447,7 +448,7 @@ class ConcreteTracer(TracerBase):
         assert isinstance(args_, tuple)
         assert isinstance(kwargs_, dict)
 
-        node = self.create_node(kind, target, args_, kwargs_, name, type_expr)
+        node = self.create_node(kind, target, args_, kwargs_, name, type_expr, value_unwrapped)
 
         if self.record_frames and kind != 'placeholder':
             with self.do_temp_disable(True, True, True):
@@ -482,16 +483,16 @@ class ConcreteTracer(TracerBase):
         if isinstance(a, torch.nn.Parameter):
             for n, p in self.root.named_parameters():
                 if a is p:
-                    return self.create_node('get_attr', n, (), {})
+                    return self.create_node('get_attr', n, (), {}, node_result=a)
             raise NameError('parameter is not a member of this module')
         elif isinstance(a, torch.Tensor):
             for n_, p_ in self.root.named_buffers():
                 if a is p_:
-                    return self.create_node('get_attr', n_, (), {})
+                    return self.create_node('get_attr', n_, (), {}, node_result=a)
         elif isinstance(a, torch.nn.Module):
             for n_, p_ in self.root.named_modules():
                 if a is p_:
-                    return self.create_node('get_attr', n_, (), {})
+                    return self.create_node('get_attr', n_, (), {}, node_result=a)
         # for slice
         if isinstance(a, slice):
             start = self.create_arg(a.start)
@@ -500,14 +501,14 @@ class ConcreteTracer(TracerBase):
             if _orig_isinstance(start, Node)\
                 or _orig_isinstance(stop, Node)\
                 or _orig_isinstance(step, Node):
-                return self.create_node('call_function', _orig_slice, (start, stop, step), {})
+                return self.create_node('call_function', _orig_slice, (start, stop, step), {}, node_result=a)
             else:
                 return a
         # For NamedTuple instances that appear literally as args, we emit
         # a node to construct the NamedTuple and use that Node as the argument.
         if isinstance(a, tuple) and hasattr(a, '_fields'):
             args = tuple(self.create_arg(elem) for elem in a)
-            return self.create_node('call_function', a.__class__, args, {})
+            return self.create_node('call_function', a.__class__, args, {}, node_result=a)
 
         # Tensors do not have a reliable string repr() from which they can be
         # constructed (and we probably don't want to rely on that, either), so
@@ -531,7 +532,7 @@ class ConcreteTracer(TracerBase):
                 self.tensor_attrs[a] = qualname
                 setattr(self.root, qualname, a)
 
-            return self.create_node('get_attr', qualname, (), {})
+            return self.create_node('get_attr', qualname, (), {}, node_result=a)
 
         if _orig_type(a) in _proxyable_classes:
             # This is an instance of a proxyable class for which we did not
@@ -546,7 +547,7 @@ class ConcreteTracer(TracerBase):
                 i += 1
             setattr(self.root, qualname, a)
 
-            return self.create_node('get_attr', qualname, (), {})
+            return self.create_node('get_attr', qualname, (), {}, node_result=a)
 
         if isinstance(a, (torch.autograd.function.Function, torch.autograd.function.FunctionMeta)):
             return a
@@ -1134,9 +1135,9 @@ class ConcreteTracer(TracerBase):
                 for module in self._autowrap_search:
                     _autowrap_check(self, module.__dict__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
                 with OperatorPatcherContext(self, use_operator_patch, operator_patch_backlist):
-                    self.create_node('output', 'output',
-                                    (self.create_arg(OperatorPatcherContext.patch_run(fn, *args, *more_args, **kwargs)),),
-                                    {}, type_expr=fn.__annotations__.get('return', None))
+                    results = OperatorPatcherContext.patch_run(fn, *args, *more_args, **kwargs)
+                    self.create_node('output', 'output', (self.create_arg(results),),
+                                     {}, type_expr=fn.__annotations__.get('return', None), node_result=results)
         finally:
             # for cuda versions of pytorch, autograd.Function.apply should be reverted manually
             delattr(torch.autograd.Function, 'apply')
@@ -1695,8 +1696,6 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
     assert all(callable(ignore_func) for ignore_func in dce_ignored_function)
 
     tracer = ConcreteTracer(cpu_offload = cpu_offload, record_frames = record_frames)
-    is_training = root.training
-    root.eval()
 
     graph = tracer.trace(root,
         autowrap_leaf_function = autowrap_leaf_function,
@@ -1758,8 +1757,5 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
     # TODO: better infomation
     if check_args is not None:
         assert root(**check_args) == traced(**check_args)
-
-    if is_training:
-        root.train()
 
     return traced

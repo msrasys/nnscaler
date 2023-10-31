@@ -12,7 +12,7 @@ from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import IRDimops
 
 import torch.fx
-from .concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import KwargsShapeProp as ShapeProp
+from .concrete_trace_utils import TensorMetadata
 
 _logger = logging.getLogger(__name__)
 
@@ -54,7 +54,6 @@ class FxModuleParser:
 
         # shape propagation
         assert isinstance(dummy_inputs, dict), "Expected dummy inputs to parse module"
-        ShapeProp(module).propagate(dummy_inputs)
 
         # create IRObjects and IRTensors
         for node in module.graph.nodes:
@@ -110,8 +109,6 @@ class FxModuleParser:
     @staticmethod
     def init_objects(node: torch.fx.Node, module: torch.fx.GraphModule,
                      frame: Frame, concrete_value: Optional[Any] = None):
-
-        from cube.graph.parser.fx.concrete_trace_utils.kwargs_shape_prop.kwargs_shape_prop import TensorMetadata
         assert isinstance(node, torch.fx.Node)
 
         def meta2var(meta: Any) -> Any:

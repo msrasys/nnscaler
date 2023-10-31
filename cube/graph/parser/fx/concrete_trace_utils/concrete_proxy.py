@@ -281,6 +281,11 @@ class ConcreteAttrProxy(ConcreteProxy):
         self._node: Optional[Node] = None
         if _orig_isinstance(root.value, torch.Tensor) and attr == 'is_cuda' and self.tracer.cpu_offload:
             self.value = True
+        elif _orig_isinstance(root.value, torch.Tensor) and attr == 'device' and self.tracer.cpu_offload:
+            self.value = torch.device('cuda')
+            warning_msg = "operation <tensor>.device is detected, it will always return torch.device('cuda') during trace, " + \
+                          "please make sure don't manually change the tensor device in the code."
+            _logger.warning(warning_msg)
         else:
             self.value = _orig_getattr(root.value, attr)
 
