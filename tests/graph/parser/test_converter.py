@@ -94,3 +94,30 @@ def test_record_codeline():
         if 'frame_record' in node.meta and cube_path in str(node.meta['frame_record']):
             err_msg = f"Cube root path should not in node comment {node.meta['frame_record']}"
             raise RuntimeError(err_msg)
+
+
+def test_record_metadata():
+    class MyModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(3, 5)
+
+        def forward(self, x):
+            return self.linear(x)
+    dummy_input = {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])}
+    module = MyModule()
+    fx_graph = to_fx_graph(module, dummy_input)
+
+    from cube.graph.parser.fx.concrete_trace_utils.concrete_proxy import ConcreteProxy
+    from cube.graph.parser.fx.concrete_trace_utils import TensorMetadata
+
+    for node in fx_graph.graph.nodes:
+        # this assert is only for this simple model, all node should have TensorMetadata type 'tensor_meta'
+        # other complex model nodes may not have 'tensor_meta' or a TensorMetadata type 'tensor_meta'
+        assert 'tensor_meta' in node.meta and isinstance(node.meta['tensor_meta'], TensorMetadata)
+        tm = node.meta['tensor_meta']
+        assert not isinstance(tm.shape, ConcreteProxy)
+        assert not isinstance(tm.dtype, ConcreteProxy)
+        assert not isinstance(tm.requires_grad, ConcreteProxy)
+        assert not isinstance(tm.stride, ConcreteProxy)
+        assert not isinstance(tm.memory_format, ConcreteProxy)

@@ -433,12 +433,12 @@ class ConcreteTracer(TracerBase):
         similar to _symbolic_trace.Tracer.create_proxy.
         use the 'run_target' to actually execute the code, and store the value in 'value' field.
         """
-        def upwrapper(obj: Any):
+        def unwrap(obj: Any):
             while _orig_isinstance(obj, ep.ConcreteProxy):
                 obj = obj.value
             return obj
-        args_unwrapped = ep.map_aggregate_not_proxy(args, upwrapper)
-        kwargs_unwrapped = ep.map_aggregate_not_proxy(kwargs, upwrapper)
+        args_unwrapped = ep.map_aggregate_not_proxy(args, unwrap)
+        kwargs_unwrapped = ep.map_aggregate_not_proxy(kwargs, unwrap)
 
         # real value by execution
         value_unwrapped = self.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
@@ -1136,8 +1136,13 @@ class ConcreteTracer(TracerBase):
                     _autowrap_check(self, module.__dict__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
                 with OperatorPatcherContext(self, use_operator_patch, operator_patch_backlist):
                     results = OperatorPatcherContext.patch_run(fn, *args, *more_args, **kwargs)
+                    # we should unwrap proxy to the original value in the results when we record it to node.meta['tensor_meta']
+                    def unwrap(obj: Any):
+                        while _orig_isinstance(obj, ep.ConcreteProxy):
+                            obj = obj.value
+                        return obj
                     self.create_node('output', 'output', (self.create_arg(results),),
-                                     {}, type_expr=fn.__annotations__.get('return', None), node_result=results)
+                                     {}, type_expr=fn.__annotations__.get('return', None), node_result=ep.map_aggregate_not_proxy(results, unwrap))
         finally:
             # for cuda versions of pytorch, autograd.Function.apply should be reverted manually
             delattr(torch.autograd.Function, 'apply')
