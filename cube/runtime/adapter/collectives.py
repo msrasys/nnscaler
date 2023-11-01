@@ -1,3 +1,11 @@
+"""
+This module offers the wrap of communication primitives
+based on `torch.distributed`. The use of these primitives standalone is typically
+for non-autograd (e.g., inference) scenarios.
+
+Every collective is implemented using out-of-place semantics.
+"""
+
 from typing import List, Tuple, Optional
 import torch
 
@@ -40,13 +48,11 @@ def move(tensor: Optional[torch.Tensor], shape: Tuple[int], dtype: torch.dtype, 
 
 def all_reduce(tensor: torch.Tensor,
                ranks: List[int], async_op=False) -> torch.Tensor:
-    """
-    Allreduce
-    """
+    """Allreduce"""
     if not async_op:
         CudaTimer().start(field_name='comm', predefined=True)
     tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
-    tensor = tensor.detach()
+    tensor = tensor.detach().clone()
     group = DeviceGroup().get_group(ranks)
 
     if async_op:
@@ -61,9 +67,7 @@ def all_reduce(tensor: torch.Tensor,
 
 def all_gather(tensor: torch.Tensor, dim: int,
                ranks: Tuple[int], async_op=False) -> torch.Tensor:
-    """
-    Allgather
-    """
+    """Allgather"""
     if not async_op:
         CudaTimer().start(field_name='comm', predefined=True)
     tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
@@ -84,9 +88,7 @@ def all_gather(tensor: torch.Tensor, dim: int,
 
 def reduce_scatter(tensor: torch.Tensor, dim: int,
                    ranks: Tuple[int], async_op=False) -> torch.Tensor:
-    """
-    ReduceScatter
-    """
+    """ReduceScatter"""
     if not async_op:
         CudaTimer().start(field_name='comm', predefined=True)
     itensors = list(tensor.chunk(len(ranks), dim))
@@ -104,9 +106,7 @@ def reduce_scatter(tensor: torch.Tensor, dim: int,
 
 def all_to_all(tensor: torch.Tensor, idim: int, odim: int,
                ranks: Tuple[int], async_op=False) -> torch.Tensor:
-    """
-    All-to-all
-    """
+    """All-to-all"""
     if not async_op:
         CudaTimer().start(field_name='comm', predefined=True)
     itensors = list(tensor.chunk(len(ranks), dim=odim))
@@ -121,6 +121,31 @@ def all_to_all(tensor: torch.Tensor, idim: int, odim: int,
         otensor = tensor
     else:
         otensor = torch.concat(tuple(otensors), dim=idim)
+    if not async_op:
+        CudaTimer().stop(field_name='comm', predefined=True)
+    return otensor
+
+
+def all_to_all_single(tensor: torch.Tensor, idim: int, odim: int,
+                      ranks: Tuple[int], async_op: bool = False) -> torch.Tensor:
+    """All-to-all for single tensor"""
+    if not async_op:
+        CudaTimer().start(field_name='comm', predefined=True)
+    tensor = tensor.transpose(0, odim) if odim != 0 else tensor
+    tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
+    group = DeviceGroup().get_group(ranks)
+    otensor = torch.empty_like(tensor)
+    work = torch.distributed.all_to_all_single(otensor, tensor, group=group, async_op=async_op)
+    
+    def all2all_callback(t):
+        t = t.transpose(0, odim) if odim != 0 else t
+        return torch.concat(tuple(t.chunk(len(ranks), dim=odim)), dim=idim)
+    
+    if work:
+        AsyncCommHandler().submit(tensor, [work], all2all_callback)
+    else:
+        otensor = all2all_callback(otensor)
+
     if not async_op:
         CudaTimer().stop(field_name='comm', predefined=True)
     return otensor

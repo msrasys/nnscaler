@@ -1,102 +1,35 @@
+"""
+This module offers autograd functions for communication
+primitives. This is typically used in the training with tensor 
+parallelism scenario.
+"""
+
 from typing import List, Tuple
 import torch
 
 from cube.profiler.timer import CudaTimer
 from cube.runtime.device import DeviceGroup
-
-
-def _allreduce(itensor: torch.Tensor, ranks: Tuple[int]) -> torch.Tensor:
-    CudaTimer().start(field_name='comm', predefined=True)
-    if not itensor.is_contiguous():
-        itensor = itensor.contiguous()
-    # force allreduce not to be in-place
-    itensor = itensor.detach().clone()
-    group = DeviceGroup().get_group(ranks)
-    torch.distributed.all_reduce(itensor, group=group)
-    CudaTimer().stop(field_name='comm', predefined=True)
-    return itensor
-
-
-def _allgather(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
-    CudaTimer().start(field_name='comm', predefined=True)
-    if not itensor.is_contiguous():
-        itensor = itensor.contiguous()
-    group = DeviceGroup().get_group(ranks)
-    tensor_list = [torch.empty_like(itensor) for _ in ranks]
-    tensor_list[torch.distributed.get_rank(group)] = itensor.data
-    torch.distributed.all_gather(tensor_list, itensor, group=group)
-    # concat
-    otensor = torch.concat(tuple(tensor_list), dim=dim).requires_grad_()
-    CudaTimer().stop(field_name='comm', predefined=True)
-    return otensor
-
-
-def _reducescatter(itensor: torch.Tensor, dim:int, ranks: Tuple[int]) -> torch.Tensor:
-    CudaTimer().start(field_name='comm', predefined=True)
-    itensors = list(itensor.chunk(len(ranks), dim))
-    for idx, tensor in enumerate(itensors):
-        if not tensor.is_contiguous():
-            itensors[idx] = tensor.contiguous()
-    group = DeviceGroup().get_group(ranks)
-    otensor = torch.empty_like(itensors[0])
-    torch.distributed.reduce_scatter(otensor, itensors, group=group)
-    CudaTimer().stop(field_name='comm', predefined=True)
-    return otensor
-
-
-def _alltoall(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -> torch.Tensor:
-    CudaTimer().start(field_name='comm', predefined=True)
-    itensors = list(itensor.chunk(len(ranks), dim=odim))
-    for idx, tensor in enumerate(itensors):
-        if not tensor.is_contiguous():
-            itensors[idx] = tensor.contiguous()
-    otensors = [torch.empty_like(t) for t in itensors]
-    group = DeviceGroup().get_group(ranks)
-    torch.distributed.all_to_all(otensors, itensors, group=group)
-    otensor = torch.concat(tuple(otensors), dim=idim)
-    CudaTimer().stop(field_name='comm', predefined=True)
-    return otensor
-
-
-def _alltoallsingle(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -> torch.Tensor:
-    CudaTimer().start(field_name='comm', predefined=True)
-    if odim != 0:
-        itensor = itensor.transpose(0, odim)
-    if not itensor.is_contiguous():
-        itensor = itensor.contiguous()
-    group = DeviceGroup().get_group(ranks)
-    otensor = torch.empty_like(itensor)
-    torch.distributed.all_to_all_single(otensor, itensor, group=group)
-    if odim != 0:
-        otensor = otensor.transpose(0, odim)
-    otensor = torch.concat(tuple(otensor.chunk(len(ranks), dim=odim)), dim=idim)
-    CudaTimer().stop(field_name='comm', predefined=True)
-    return otensor
-
-
-def _chunk(itensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
-    """
-    split dimension in n chunks and take idx-th chunk
-
-    ranks (Tuple[int]): the order of split tensor.
-    """
-    group = DeviceGroup().get_group(ranks)
-    idx = torch.distributed.get_rank(group)
-    return itensor.chunk(len(ranks), dim)[idx]
+from .collectives import (
+    all_reduce,
+    all_gather,
+    reduce_scatter,
+    all_to_all,
+    all_to_all_single,
+    chunk
+)
 
 
 class AllReduceIdentity(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, itensor: torch.Tensor, ranks: Tuple[int]):
-        return _allreduce(itensor, ranks)
+        return all_reduce(itensor, ranks)
 
     @staticmethod
     def backward(ctx, grad_output):
         return grad_output, None
 
 
-@torch.jit.ignore
 def allreduce_identity(tensor: torch.Tensor, ranks: List[int]):
     return AllReduceIdentity.apply(tensor, ranks)
 
@@ -111,10 +44,10 @@ class IdentityAllreduce(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         ranks = ctx._ranks
-        grad = _allreduce(grad, ranks)
+        grad = all_reduce(grad, ranks)
         return grad, None
 
-@torch.jit.ignore
+
 def identity_allreduce(tensor: torch.Tensor, ranks: Tuple[int]) -> torch.Tensor:
     return IdentityAllreduce.apply(tensor, ranks)
 
@@ -124,17 +57,16 @@ class AllReduceAllReduce(torch.autograd.Function):
     @staticmethod
     def forward(ctx, itensor: torch.Tensor, ranks: Tuple[int]):
         ctx._ranks = ranks
-        otensor = _allreduce(itensor, ranks)
+        otensor = all_reduce(itensor, ranks)
         return otensor
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         ranks = ctx._ranks
-        grad = _allreduce(grad, ranks)
+        grad = all_reduce(grad, ranks)
         return grad, None
 
 
-@torch.jit.ignore
 def allreduce_allreduce(tensor: torch.Tensor, ranks: Tuple[int]) -> torch.Tensor:
     return AllReduceAllReduce.apply(tensor, ranks)
 
@@ -145,17 +77,16 @@ class ReduceScatterAllGather(torch.autograd.Function):
     def forward(ctx, itensor: torch.Tensor, dim: int, ranks: Tuple[int]):
         ctx._ranks = ranks
         ctx._dim = dim
-        return _reducescatter(itensor, dim, ranks)
+        return reduce_scatter(itensor, dim, ranks)
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         ranks = ctx._ranks
         dim = ctx._dim
-        grad = _allgather(grad, dim, ranks)
+        grad = all_gather(grad, dim, ranks)
         return grad, None, None
 
 
-@torch.jit.ignore
 def reducescatter_allgather(tensor: torch.Tensor, dim: int, ranks: List[int]):
     return ReduceScatterAllGather.apply(tensor, dim, ranks)
 
@@ -166,17 +97,16 @@ class AllGatherReduceScatter(torch.autograd.Function):
     def forward(ctx, itensor: torch.Tensor, dim: int, ranks: Tuple[int]):
         ctx._ranks = ranks
         ctx._dim = dim
-        return _allgather(itensor, dim, ranks)
+        return all_gather(itensor, dim, ranks)
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         ranks = ctx._ranks
         dim = ctx._dim
-        grad = _reducescatter(grad, dim, ranks)
+        grad = reduce_scatter(grad, dim, ranks)
         return grad, None, None
 
 
-@torch.jit.ignore
 def allgather_reducescatter(tensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
     return AllGatherReduceScatter.apply(tensor, dim, ranks)
 
@@ -187,16 +117,15 @@ class AllGatherSplit(torch.autograd.Function):
     def forward(ctx, itensor: torch.Tensor, dim: int, ranks: Tuple[int]):
         ctx._ranks = ranks
         ctx._dim = dim
-        return _allgather(itensor, dim, ranks)      
+        return all_gather(itensor, dim, ranks)      
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         ranks = ctx._ranks
         dim = ctx._dim
-        return _chunk(grad, dim, ranks), None, None
+        return chunk(grad, dim, ranks), None, None
 
 
-@torch.jit.ignore
 def allgather_split(tensor: torch.Tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
     return AllGatherSplit.apply(tensor, dim, ranks)
 
@@ -210,17 +139,16 @@ class SplitAllGather(torch.autograd.Function):
         """
         ctx._ranks = ranks
         ctx._dim = dim
-        return _chunk(itensor, dim, ranks)
+        return chunk(itensor, dim, ranks)
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         ranks = ctx._ranks
         dim = ctx._dim
-        grad = _allgather(grad, dim, ranks)
+        grad = all_gather(grad, dim, ranks)
         return grad, None, None
 
 
-@torch.jit.ignore
 def split_allgather(tensor, dim: int, ranks: Tuple[int]) -> torch.Tensor:
     return SplitAllGather.apply(tensor, dim, ranks)
 
@@ -232,13 +160,13 @@ class AllToAllAllToAll(torch.autograd.Function):
         ctx._ranks = ranks
         ctx._idim = idim
         ctx._odim = odim
-        return _alltoall(itensor, idim, odim, ranks)
+        return all_to_all(itensor, idim, odim, ranks)
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         ranks = ctx._ranks
         idim, odim = ctx._idim, ctx._odim
-        grad = _alltoall(grad, odim, idim, ranks)
+        grad = all_to_all(grad, odim, idim, ranks)
         return grad, None, None, None
 
 
@@ -249,17 +177,16 @@ class AllToAllAllToAllSingle(torch.autograd.Function):
         ctx._ranks = ranks
         ctx._idim = idim
         ctx._odim = odim
-        return _alltoallsingle(itensor, idim, odim, ranks)
+        return all_to_all_single(itensor, idim, odim, ranks)
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         ranks = ctx._ranks
         idim, odim = ctx._idim, ctx._odim
-        grad = _alltoallsingle(grad, odim, idim, ranks)
+        grad = all_to_all_single(grad, odim, idim, ranks)
         return grad, None, None, None
 
 
-@torch.jit.ignore
 def alltoall_alltoall(itensor: torch.Tensor, idim: int, odim: int, ranks: Tuple[int]) -> torch.Tensor:
     return AllToAllAllToAllSingle.apply(itensor, idim, odim, ranks)
 
