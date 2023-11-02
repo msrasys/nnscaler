@@ -172,9 +172,19 @@ class SemanticModel:
     def get_graph(self):
         return self._ir_graph
 
-    def load_module(self, filename: str):
-        """Load module from file."""
-        self._loaded_module = load_model(filename, self.save_content)
+    def load_module(self, filename: str, load_fullmodelpt: Optional[bool] = None):
+        """Load module from file.
+
+        Args:
+            filename (str): file path
+            load_fullmodelpt (Optional[bool]): controls whether to load full model checkpoint.
+                If None, use the default value of the semantic model.
+        """
+        if load_fullmodelpt is not None:
+            load_content = load_fullmodelpt
+        else:
+            load_content = self.save_content
+        self._loaded_module = load_model(filename, load_content)
 
     def get_gen_module(self) -> Optional[torch.nn.Module]:
         return self._loaded_module

@@ -77,6 +77,21 @@ class CubeModule(torch.nn.Module):
         # print(f'> get out parameters: {sum(p.numel() for p in params)}')
         return params
 
+    def parameters_for_broadcast(self) -> List[torch.nn.Parameter]:
+        """
+        This function is for broadcasting loaded weights from one scale unit to
+        all other scale units to resume from sharded checkpoints globally.
+        """
+        params = []
+        reducer_pids = set()
+        for reducer in self._reducers:
+            params.append(reducer._contiguous_params)
+            reducer_pids.update(id(p) for p in reducer.params)
+        for param in self.parameters():
+            if id(param) not in reducer_pids:
+                params.append(param)
+        return params
+
     def parameters_for_calc_gnorm(self) -> List[ParamsInfo]:
         """Return the necessary information for calculating the gradient norm.
         

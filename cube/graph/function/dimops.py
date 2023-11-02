@@ -755,6 +755,8 @@ class IRDimops(IRFwOperation):
 
         # check dimension consistency
         for ashape, itensor in zip(op_anno.inputs(), inputs):
+            if itensor is None:
+                continue
             if not (isinstance(itensor, IRTensor) ^ ashape.ignore):
                 return False
             if not isinstance(itensor, IRTensor):
