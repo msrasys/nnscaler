@@ -11,6 +11,7 @@ from typing import Union, Tuple, List, Optional, Dict, Any
 import logging
 import copy
 import dill
+import hashlib
 
 from cube.ir.cten import IRTensor, IRCell, IRObject
 from cube.ir.unique import IDGenerator
@@ -1069,3 +1070,33 @@ class IRGraph(IRSegment):
 
         reset_node(graph)
         return graph
+
+    def checksum(self, strict: bool = True) -> str:
+        """Get the MD5 checksum of the graph.
+        
+        This is used to guarantee the consistency of the graph between
+        multiple nodes.
+
+        Note:
+            The checksum considers the IDGenerator status. If the user modifies
+            the IDGenerator status (i.e., creating tensors or nodes), it will
+            have a different checksum.
+        
+        Args:
+            strict (bool): If True (by default), get the checksum of the whole graph status,
+                including tensor shapes, tensor ids and node ids;
+                Otherwise (i.e., False), only check the graph structure of node ids,
+                node signatures without tensor ids.
+
+        Returns:
+            str: MD5 checksum (32-bit) of the graph status
+        """
+        max_tensor_id, max_cell_id = IDGenerator().get_states()
+        if not strict:
+            node_ids = tuple(n.cid for n in self.nodes())
+            signatures = tuple(n.signature for n in self.nodes())
+            checksum = hashlib.md5(str((max_tensor_id, max_cell_id, signatures, node_ids)).encode()).hexdigest()
+        else:
+            states = str((max_tensor_id, max_cell_id, self.extra_repr()))
+            checksum = hashlib.md5(states.encode()).hexdigest()
+        return checksum

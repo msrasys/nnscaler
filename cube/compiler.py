@@ -120,6 +120,13 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
             _logger.info(f'loading existed schedule from {filename} ...')
             return cube.load_default_schedule(filename)
 
+        ndevices = DeviceGroup().world_size
+        local_ndevs = DeviceGroup().local_world_size
+        nnodes = ndevices // local_ndevs
+        if nnodes > 1:
+            compile_ranks = list(range(0, ndevices, local_ndevs))
+            compile_group = DeviceGroup().get_group(compile_ranks)
+
         if DeviceGroup().local_rank == 0:
 
             compile_start = time.time()
@@ -160,6 +167,27 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
             if save_graph_file is not None and save_graph_file != load_graph_file:
                 _logger.info(f'saving graph to {save_graph_file}')
                 graph.dump(save_graph_file)
+
+            # checking graph consistency between multiple nodes
+            if nnodes > 1:
+                checksum = graph.checksum(strict=True)
+                _logger.debug(f'checking graph consistency (local md5: {checksum}) ...')
+                state = torch.tensor([ord(c) for c in checksum], dtype=torch.int,
+                                     device=torch.cuda.current_device())
+                gather_list = None
+                if DeviceGroup().node_rank == 0:
+                    gather_list = [torch.empty_like(state) for _ in range(nnodes)]
+                torch.distributed.gather(state, gather_list, dst=0, group=compile_group)
+                if DeviceGroup().node_rank == 0:
+                    inconsistent_nodes = []
+                    for node_rank, checksum in enumerate(gather_list):
+                        if state.ne(checksum).any():
+                            inconsistent_nodes.append(node_rank)
+                    if len(inconsistent_nodes) > 0:
+                        raise RuntimeError(
+                            f'graph status is inconsistent on node ranks: {inconsistent_nodes}. '
+                            f'Please check pytorch version or re-run the compilation.'
+                        )
 
             # run policy
             start = time.time()
