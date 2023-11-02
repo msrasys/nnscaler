@@ -141,16 +141,6 @@ class IRGraph(IRSegment):
             # set loss gradient
             loss.parent.to_loss()
 
-            # update require gradient: for tensors that have no consumers,
-            # make their gradient to be False
-            for ftensor in self.full_tensors():
-                if ftensor.is_loss(): continue
-                consumers = [n for n in self.consumers(ftensor) if isinstance(n, IRFwOperation)]
-                if len(consumers) == 0 and ftensor.requires_grad:
-                    _logger.warning(
-                        f"detected a dead ftensor which is not consumed by any nodes:\n\t{ftensor.name}: {ftensor}")
-                    ftensor.requires_grad = False
-
         # infer gradient
         for ftensor in self.full_tensors():
             self.infer_grad(ftensor)
@@ -175,15 +165,16 @@ class IRGraph(IRSegment):
     def from_logic_graph(nodes: List[IRCell],
                          inputs: List[Any], outputs: List[Any],
                          module_name: str):
-        """
-        Generate IRGraph from logical graph (IRFullTensor)
+        """Generate IRGraph from logical graph (IRFullTensor)
 
-        @param nodes: nodes of the graph
-        @param inputs List[Any]: graph inputs
-        @param outputs List[Any]: graph outputs
-        @param module_name str: graph name
+        Args:
+            nodes (List[IRCell]): nodes of the graph
+            inputs (List[Any]): graph inputs
+            outputs (List[Any]): graph outputs
+            module_name (str): graph name
 
-        @return graph IRGraph
+        Returns:
+            IRGraph: the graph with each tensor is IRSubTensor.
         """
         modifier = lambda t: t.tosub() if isinstance(t, IRFullTensor) else t
         # input / output
@@ -200,6 +191,32 @@ class IRGraph(IRSegment):
                     subtensor = ftensor.tosub() if isinstance(ftensor, IRFullTensor) else ftensor
                     node.set_output(idx, subtensor)
         graph = IRGraph(nodes, inputs, outputs, module_name)
+
+        # check unused outputs
+        unused_obj_nodes: Dict[IRObject, List[IRCell]] = {}
+        graph_output_objects = [
+            obj.parent for obj in IRSegment.get_objects_from_complex(graph.outputs())]
+        for obj in graph.full_objects():
+            # loss tensor will always not used
+            if isinstance(obj, IRFullTensor) and obj.is_loss(): continue
+            # we don't need to show unused backward ops
+            if isinstance(obj, IRFullTensor) and obj.is_grad(): continue
+            consumers = graph.consumers(obj)
+            if len(consumers) == 0 and obj not in graph_output_objects:
+                if len(graph.producers(obj)) > 0:
+                    unused_obj_nodes.setdefault(obj, []).extend(graph.producers(obj))
+        if len(unused_obj_nodes) > 0:
+            dscp = (f'Following returns of nodes are not used by any other nodes.\n'
+                    f'Please consider to remove them in the user defined model.\n')
+            for obj, unused_nodes in unused_obj_nodes.items():
+                dscp += f'{obj}:\n'
+                for node in unused_nodes:
+                    if node.comment is not None:
+                        dscp += f'\t{node.comment}\n\t{node.name} (cid={node.cid})\n'
+                    else:
+                        dscp += f'\t{node.name} (cid={node.cid})\n'
+            _logger.warning(dscp)
+
         return graph
 
     ##### Transformation Primitives #####

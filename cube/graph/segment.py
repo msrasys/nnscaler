@@ -81,8 +81,8 @@ class IRSegment(IRCell):
 
         self._nodes: List[IRCell] = []
 
-        # full-tensor / sub-tensor mapping
-        self._ftensors: Set[IRFullTensor] = set()
+        # full objects
+        self._fobjects: Set[IRObject] = set()
         self._producers: Dict[IRFullTensor, List[IRCell]] = dict()
         self._consumers: Dict[IRFullTensor, List[IRCell]] = dict()
         self._ptensors: Dict[IRFullTensor, List[IRSubTensor]] = dict()
@@ -118,6 +118,17 @@ class IRSegment(IRCell):
         return all(n.isfw() for n in self._nodes)
         # return self._have_forward
 
+    def full_objects(self) -> Tuple[IRObject]:
+        """Get all full objects of this graph.
+
+        Note:
+            The full tensor inside the node (e.g., IRSegment) will not be returned.
+
+        Returns:
+            fobjects List[IRObject]
+        """
+        return tuple(self._fobjects)
+
     def full_tensors(self) -> Tuple[IRFullTensor]:
         """
         Get all full tensors of this graph.
@@ -125,7 +136,7 @@ class IRSegment(IRCell):
 
         @return ftensors List[IRFullTensor]
         """
-        return tuple(t for t in self._ftensors if isinstance(t, IRFullTensor))
+        return tuple(t for t in self._fobjects if isinstance(t, IRFullTensor))
 
     def attributes(self) -> Tuple[IRFullTensor]:
         """
@@ -332,7 +343,7 @@ class IRSegment(IRCell):
 
     def debug_tensor_map_str(self, ftensor: Optional[IRFullTensor] = None) -> str:
         dscp : str = ''
-        ftensors = [ftensor] if ftensor is not None else self._ftensors
+        ftensors = [ftensor] if ftensor is not None else self._fobjects
         for ftensor in ftensors:
             dscp += f'====\nFull Tensor: {ftensor}\n'
             dscp += f'Producers:\n'
@@ -373,8 +384,8 @@ class IRSegment(IRCell):
         Add a full tensor in segment if the segment doesn't have the tensor.
         """
         assert isinstance(ftensor, IRObject)
-        if ftensor not in self._ftensors:
-            self._ftensors.add(ftensor)
+        if ftensor not in self._fobjects:
+            self._fobjects.add(ftensor)
             self._producers[ftensor] = []
             self._consumers[ftensor] = []
             self._ptensors[ftensor] = []
@@ -387,8 +398,8 @@ class IRSegment(IRCell):
         Remove a full tensor in segment
         """
         assert isinstance(ftensor, IRObject)
-        if ftensor in self._ftensors:
-            self._ftensors.remove(ftensor)
+        if ftensor in self._fobjects:
+            self._fobjects.remove(ftensor)
             del self._producers[ftensor]
             del self._consumers[ftensor]
             del self._ptensors[ftensor]
@@ -404,7 +415,7 @@ class IRSegment(IRCell):
         Note sub-segment will also be reordered.
         """
         # clear up
-        self._ftensors, self._attributes = set(), set()
+        self._fobjects, self._attributes = set(), set()
         self._producers, self._ptensors = dict(), dict()
         self._consumers, self._ctensors = dict(), dict()
 
@@ -656,7 +667,7 @@ class IRSegment(IRCell):
         @param tensor IRSubTensor: tensor.
         @return multiref IRFwOperation: the inserted multiref operator.
         """
-        assert ftensor in self._ftensors, f"tensor: {ftensor} not in this graph."
+        assert ftensor in self._fobjects, f"tensor: {ftensor} not in this graph."
         if len(self.consumers(ftensor)) <= 1: return
         assert not ftensor.is_grad(), f"graph.multiref can only be applied on a non-gradient full tensor."
         # check no transformation
