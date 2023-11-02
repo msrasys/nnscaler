@@ -169,12 +169,22 @@ class ModuleCodeGen(FuncEmission):
         """
         def _add_comm_for_group_zero(ranks):
             zero_comm_groups = []
+            # Create communication group for each zero subgroup
             for i in range(CompileFlag.zero_ngroups):
                 assert len(ranks) % CompileFlag.zero_ngroups == 0
                 ranks_per_group = len(ranks) // CompileFlag.zero_ngroups
                 zero_subgroup = tuple(ranks[i * ranks_per_group : (i + 1) * ranks_per_group])
                 if len(zero_subgroup) > 1 and len(zero_subgroup) < len(ranks):
                     zero_comm_groups.append(zero_subgroup)
+            # Create communication groups for cross group allreduce.
+            # Note that this is only for the enabled reduce scatter of ZeRO.
+            # For example, there are two ZeRO groups [0,1,2,3] and [4,5,6,7],
+            # then we will create communication groups (0,4), (1,5), (2,6), (3,7).
+            ranks_per_group = len(ranks) // CompileFlag.zero_ngroups
+            for i in range(ranks_per_group):
+                zero_crossgroup = tuple(ranks[i::ranks_per_group])
+                if len(zero_crossgroup) > 1 and len(zero_crossgroup) < len(ranks):
+                    zero_comm_groups.append(zero_crossgroup)
             return zero_comm_groups
         scale_ndevs = scale_ndevs if scale_ndevs is not None else len(self.devices)
         assert len(self.devices) == max(self.devices) + 1, f'device must be consecutive'

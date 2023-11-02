@@ -1,14 +1,16 @@
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 import logging
 import os
 import sys
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 
 from cube.graph.parser.fx.parser import FxModuleParser
 from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.reducer import Reducer
+from cube.runtime.gnorm import ParamsInfo
 
 _logger = logging.getLogger(__name__)
 
@@ -22,11 +24,27 @@ class CubeModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self._reducers: List[Reducer] = list()
+        # Key: str, parameter name (from named_parameters)
+        # Value: Tuple[int, Tuple[slice], int]: 
+        # full tensor tid, 
+        # position of sub tensor in full tensor, 
+        # position of value in value partition.
         self._fullmap : Dict[str, Tuple[int, Tuple[slice], int]] = dict()
 
     @property
     def reducers(self):
         return self._reducers
+    
+    @property
+    def fullmap(self):
+        return self._fullmap
+
+    def tid_of_param_name(self, name: str) -> int:
+        # Return the tid of sub tensor with the parameter name
+        # It is the last field of the parameter name, which is hacky
+        if name not in self._fullmap:
+            raise RuntimeError(f"Cannot find {name} in fullmap")
+        return int(name.split('_')[-1])
 
     def add_reducer(self, reducer: Reducer):
         if not isinstance(reducer, Reducer):
@@ -59,6 +77,36 @@ class CubeModule(torch.nn.Module):
         # print(f'> get out parameters: {sum(p.numel() for p in params)}')
         return params
 
+    def parameters_for_calc_gnorm(self) -> List[ParamsInfo]:
+        """Return the necessary information for calculating the gradient norm.
+        
+        Returns:
+            List[Tuple[Tuple[int], List[torch.nn.Parameter], List[str], int]]: 
+                A list of tuples, each tuple contains the following information:
+                    Tuple[int]: the ranks spanned by the parameters in the tuple
+                    List[torch.nn.Parameter]: the contiguous parameters in the tuple
+                    List[str]: the names of the original parameters in the tuple
+                    int: the number of the ZeRO groups for the parameters
+        """
+        paramid2name = {}
+        for name, param in self.named_parameters():
+            paramid2name[id(param)] = name
+
+        params_info_for_gnorm = []
+        reducer_pids = set()
+        for reducer in self._reducers:
+            param_names = [paramid2name[id(p)] for p in reducer.params]
+            params_info = ParamsInfo(reducer.ranks, reducer.parameters_for_optimizer(),
+                                     param_names, reducer.zero_ngroups)
+            params_info_for_gnorm.append(params_info)
+            reducer_pids.update(id(p) for p in reducer.params)
+        for param in self.parameters():
+            if id(param) not in reducer_pids:
+                # zero_ngroups is 1, since there is no reducer for it and multiplying 1 does not change the result.
+                params_info = ParamsInfo((dist.get_rank(),), [param], [paramid2name[id(param)]], 1)
+                params_info_for_gnorm.append(params_info)
+        return params_info_for_gnorm
+
     def gather_params(self):
         """
         Gather parameters
@@ -83,6 +131,7 @@ class CubeModule(torch.nn.Module):
         assert hasattr(self, attr), f"{attr} is not in the module"
         self._fullmap[attr] = (tid, slicers, val_chunks)
 
+    # TODO: remove this function, use the property instead
     def get_full_map(self):
         return self._fullmap
 

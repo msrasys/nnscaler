@@ -41,21 +41,24 @@ class Bucket:
                  param_buffer: torch.Tensor, grad_buffer: torch.Tensor,
                  reduce_op: torch.distributed.ReduceOp,
                  group, async_op: bool, zero: bool,
-                 zero_subgroup: torch.distributed.ProcessGroup = None):
+                 zero_subgroup: torch.distributed.ProcessGroup = None,
+                 zero_crossgroup: torch.distributed.ProcessGroup = None):
         """
         Create a communication unit for parameter allreduce.
 
         One allreduce will be called for all gradients associated to the parameters.
         The parameters are assumed to participate in backward and generate gradient.
 
-        @param params List[torch.nn.Parameter]: the parameters
-        @param param_buffer torch.Tensor: Paramter contiguous buffer
-        @param grad_buffer torch.Tensor: gradient contiguous buffer
-        @param reduce_op torch.distributed.ReduceOp: the reduce op used by collectives
-        @param group: communication group
-        @param async_op bool: whether to use asynchronous operation
-        @param zero bool: whether to use zero optimization on gradients
-        @param zero_subgroup: the subgroup for zero optimization the current rank belongs to
+        Args:
+            params List[torch.nn.Parameter]: the parameters
+            param_buffer torch.Tensor: Paramter contiguous buffer
+            grad_buffer torch.Tensor: gradient contiguous buffer
+            reduce_op torch.distributed.ReduceOp: the reduce op used by collectives
+            group: communication group
+            async_op bool: whether to use asynchronous operation
+            zero bool: whether to use zero optimization on gradients
+            zero_subgroup: the subgroup for zero optimization the current rank belongs to
+            zero_crossgroup: the communication group for cross zero group allreduce when reduce scatter is enabled
         """
 
         self._params: List[torch.nn.Parameter] = params
@@ -81,6 +84,7 @@ class Bucket:
 
         self._zero_subgroup = self._group if zero_subgroup is None else zero_subgroup
         self._zgroup_sz: int = torch.distributed.get_world_size(group=self._zero_subgroup)
+        self._zero_crossgroup = zero_crossgroup
 
         # pre and post hooks for gradient synchronization
         self._pre_hooks: List[Callable] = []
@@ -104,6 +108,26 @@ class Bucket:
     def zero(self) -> bool:
         """Whether enable zero for this bucket"""
         return self._zero
+
+    def _group_reduce_scatter(self):
+        """currently this function is only used in synchronous mode"""
+        rank = torch.distributed.get_rank(group=self._zero_subgroup)
+        partial_tensor = self._contiguous_grads.chunk(self._zgroup_sz, dim=0)[rank]
+        if self._zgroup_sz == self._wsz:
+            # number of zero groups is 1, thus only reduce scatter is enough
+            # in this case, self._group == self._zero_subgroup
+            torch.distributed.reduce_scatter_tensor(
+                partial_tensor, self._contiguous_grads,
+                op=self._reduce_op, group=self._zero_subgroup)
+        else:
+            # two steps for group reduce scatter
+            # step #1, allreduce across corresponding GPUs across groups
+            torch.distributed.all_reduce(
+                self._contiguous_grads, op=self._reduce_op, group=self._zero_crossgroup)
+            # step #2, reduce scatter within each group
+            torch.distributed.reduce_scatter_tensor(
+                partial_tensor, self._contiguous_grads,
+                op=self._reduce_op, group=self._zero_subgroup)
 
     def build(self):
         """
@@ -160,11 +184,17 @@ class Bucket:
                     self._apply_pre_hooks()
                     # communication
                     if self._zero and Bucket.use_reduce_scatter_for_zero:
-                        rank = torch.distributed.get_rank(group=self._group)
-                        shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
-                        self._async_handle = torch.distributed.reduce_scatter(
-                            shards[rank], shards, op=self._reduce_op,
-                            group=self._group, async_op=True)
+                        if self._zgroup_sz == self._wsz:
+                            rank = torch.distributed.get_rank(group=self._group)
+                            shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
+                            self._async_handle = torch.distributed.reduce_scatter(
+                                shards[rank], shards, op=self._reduce_op,
+                                group=self._group, async_op=True)
+                        else:
+                            assert False, "reducescatter is not supported in async mode, " \
+                                          "because the two steps (allreduce, reducescatter) use " \
+                                          "two communication groups, which may induce deadlock."
+                            self._group_reduce_scatter()
                     else:
                         self._async_handle = torch.distributed.all_reduce(
                             self._contiguous_grads, op=self._reduce_op,
@@ -201,9 +231,7 @@ class Bucket:
             self._apply_pre_hooks()
             # synchrnoize gradients
             if self._zero and Bucket.use_reduce_scatter_for_zero:
-                shards = list(self._contiguous_grads.chunk(self._wsz, dim=0))
-                torch.distributed.reduce_scatter(
-                    shards[rank], shards, op=self._reduce_op, group=self._group)
+                self._group_reduce_scatter()
             else:
                 torch.distributed.all_reduce(
                     self._contiguous_grads, op=self._reduce_op, group=self._group)
@@ -336,7 +364,7 @@ class Reducer:
         # If the ranks are [0, 2, 4, 6], zero_ngroups=2, then the ranks
         # will be divided into [0, 2] and [4, 6].
         if self._zero and Bucket.use_reduce_scatter_for_zero:
-            assert zero_ngroups == 1, f"zero_ngroups {zero_ngroups}, which is >1, does not support reduce scatter"
+            _logger.info(f"Using reduce scatter for ZeRO optimization")
         if zero_ngroups > 1:
             assert self._zero, f"USE_ZERO must be set when ZERO_NUM_GROUPS is larger than 1"
             assert len(ranks) % zero_ngroups == 0, f"length of ranks {ranks} must be divisible by zero factor {zero_ngroups}"
@@ -347,9 +375,21 @@ class Reducer:
             if len(sub_ranks) > 1:
                 assert DeviceGroup().group_exists(sub_ranks), f"zero subgroup {sub_ranks} does not exist in comm groups"
             self._zero_subgroup = DeviceGroup().get_group(sub_ranks)
+            # crossgroup is for the allreduce across zero subgroups, it is only used when
+            # reduce scatter is enabled and the number of zero subgroups is larger than 1.
+            start_rank = curr_rank % zgroup_sz
+            cross_ranks = ranks[start_rank::zgroup_sz]
+            assert len(cross_ranks) == zero_ngroups
+            self._zero_crossgroup = DeviceGroup().get_group(cross_ranks)
         else:
-            assert zero_ngroups == 1, f"zero factor must be 1, but got {zero_ngroups}"
+            assert zero_ngroups == 1, f"ZeRO number of groups must be 1, but got {zero_ngroups}"
             self._zero_subgroup = self._group
+            self._zero_crossgroup = None
+        self._zero_ngroups = zero_ngroups
+
+    @property
+    def zero_ngroups(self) -> int:
+        return self._zero_ngroups
 
     @property
     def params(self) -> Tuple[torch.nn.Parameter]:
@@ -475,6 +515,7 @@ class Reducer:
                 self._async,
                 self._zero,
                 self._zero_subgroup,
+                self._zero_crossgroup,
             )
             buckets.append(bucket)
         torch.cuda.empty_cache()
