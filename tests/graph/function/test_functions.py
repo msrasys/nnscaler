@@ -169,6 +169,36 @@ def test_Max():
 
 def test_Squeeze():
     op = F.Squeeze(IRTensor([2, 1, 4, 1]))
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c d -> a c'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c^ d -> a^ c^'
     op = F.Squeeze(IRTensor([2, 1, 4, 1]), 1)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c d -> a c d'
+    op = F.Squeeze(IRTensor([2, 1, 4, 1]), 0)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c d -> a^ b c d'
+    op = F.Squeeze(IRTensor([2, 1, 4, 1]), -1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c d -> a b c'
+    op = F.Squeeze(IRTensor([2, 1, 4, 1]), -2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ d -> a b c^ d'
+
+    op = F.Squeeze(IRTensor([2, 1, 4, 1]), (-1, -2))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ d -> a b c^'
+    op = F.Squeeze(IRTensor([2, 1, 4, 1]), (1, -1))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c d -> a c'
+    op = F.Squeeze(IRTensor([2, 1, 4, 1]), (1, -2))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ d -> a c^ d'
+    op = F.Squeeze(IRTensor([2, 1, 4, 1]), (0, -2))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c^ d -> a^ b c^ d'
+
+
+def test_Unsqueeze():
+    op = F.Unsqueeze(IRTensor([2, 4]), 0)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> 1 a b'
+    op = F.Unsqueeze(IRTensor([2, 4]), 1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> a 1 b'
+    op = F.Unsqueeze(IRTensor([2, 4]), 2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> a b 1'
+    op = F.Unsqueeze(IRTensor([2, 4]), -3)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> 1 a b'
+    op = F.Unsqueeze(IRTensor([2, 4]), -2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> a 1 b'
+    op = F.Unsqueeze(IRTensor([2, 4]), -1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> a b 1'

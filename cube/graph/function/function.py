@@ -1166,25 +1166,43 @@ def Squeeze(input, dim=None, signature = None):
     """
     out = torch.squeeze(tensor)
     """
-    dim = (dim,) if isinstance(dim, int) else dim
+    if isinstance(dim, int):
+        dim = (dim,)
+    if dim is not None:
+        dim = tuple(d if d >= 0 else d + len(input.shape) for d in dim)
     edim_in = ShapeAnno.create_shape_str(input.shape)
     assert len(edim_in) == len(input.shape)
     edim_ou = []
-    for idx, (dim_anno, dim_size) in enumerate(zip(edim_in, input.shape)):
-        if dim_size > 1 or (dim is not None and idx not in dim):
-            edim_ou.append(copy.copy(dim_anno))
+    for idx in range(len(input.shape)):
+        if dim is None or idx in dim:
+            if input.shape[idx] != 1:
+                # If this dimension is not 1, then we should never partation it
+                # Otherwise, it could be squeezed mistakenly if the dimension after partition is 1
+                # For example, a tensor with shape（2，4）
+                # 1. for single gpu，
+                # after calling squeeze(t, 0) the shape is still (2， 4）
+                # 2. for 2 gpus, if we partition dim 0, then the tensor shape in each gpu will be (1,4)
+                # after calling squeeze(t, 0), the shape becomes (4,) in each gpu
+                # which is not correct
+                edim_in[idx] += '^'
+                edim_ou.append(edim_in[idx])
+            # else remove this dimension in edim_out
+        else:
+            edim_ou.append(edim_in[idx])
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
-    return IRDimops(Squeeze, 'squeeze', signature, [anno], [input])
+    return IRDimops(Squeeze, 'squeeze', signature, [anno], [input], dim=dim)
 
 
 def Unsqueeze(input, dim, signature = None):
     """
     out = torch.unsqueeze(tensor, dim)
+    A dim value within the range [-input.dim() - 1, input.dim() + 1) can be used.
+    Negative dim will correspond to unsqueeze() applied at dim = dim + input.dim() + 1.
     """
     edim_in = ShapeAnno.create_shape_str(input.shape)
     edim_ou = copy.copy(edim_in)
-    if dim == -1:
-        dim = len(edim_ou)
+    if dim < 0:
+        dim += len(edim_ou) + 1
     edim_ou.insert(dim, '1')
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
     return IRDimops(Unsqueeze, 'unsqueeze', signature, [anno], [input],dim=dim)

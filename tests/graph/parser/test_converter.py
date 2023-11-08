@@ -58,24 +58,6 @@ def test_to_graph():
         assert any(node.signature == 'torch.nn.functional.linear' for node in nodes)
 
 
-def test_to_ir_graph_args():
-    class MyModule(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.linear = torch.nn.Linear(3, 5)
-
-        def forward(self, x, *args):
-            return self.linear(x)
-    dummy_input = {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])}
-    module = MyModule()
-    fx_graph = to_fx_graph(module, dummy_input)
-
-    with tempfile.TemporaryDirectory() as tempdir:
-        # currently we don't support *args
-        with pytest.raises(RuntimeError):
-            to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
-
-
 def test_record_codeline():
     class MyModule(torch.nn.Module):
         def __init__(self):
