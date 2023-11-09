@@ -822,7 +822,10 @@ class ConcreteTracer(TracerBase):
                 else:
                     return self.create_proxy('get_attr', f'{self.the_path_of_middle_class[id(mod)]}.{attr}', (), {})
             elif attr in self.default_module_getattr:
-                return self.create_proxy('get_attr', f'{self.the_path_of_middle_class[id(mod)]}.{attr}', (), {})
+                if self.the_path_of_middle_class[id(mod)] == '':
+                    return self.create_proxy('get_attr', f'{attr}', (), {})
+                else:
+                    return self.create_proxy('get_attr', f'{self.the_path_of_middle_class[id(mod)]}.{attr}', (), {})
             elif id(attr_val) in self.the_path_of_parameter:
                 return self.create_proxy('get_attr', self.the_path_of_parameter[id(attr_val)], (), {})
             elif id(attr_val) in self.the_path_of_buffer:
