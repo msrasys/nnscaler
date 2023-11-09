@@ -423,13 +423,13 @@ class ProfileDataBase:
         for signature in self._data.keys():
             file_n = os.path.join(file, signature +'.json')
             with open(file_n, 'w') as f:
-                json.dump(self._data[signature],f)   
+                json.dump(self._data[signature], f, indent=2)   
 
     def dump_op(self, file: str, signature, override=False): 
         assert signature in self._data.keys(), f'this node not be profiled'
         file_n = os.path.join(file, signature +'.json')
         with open(file_n, 'w') as f:
-            json.dump(self._data[signature],f)
+            json.dump(self._data[signature], f, indent=2)
 
     def load(self, file: str):
         """!

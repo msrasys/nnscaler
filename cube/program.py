@@ -137,7 +137,7 @@ class SemanticModel:
             dynamic_shape (bool):
                 whether to use dynamic shape. Default False.
         """
-        if DeviceGroup().local_rank == 0:
+        if DeviceGroup().local_rank == 0 and model is not None:
             assert isinstance(model, torch.nn.Module), f"device of local_rank == 0 must provide model"
         self.model = model
         self._dummy_input: Dict[str, Any] = None

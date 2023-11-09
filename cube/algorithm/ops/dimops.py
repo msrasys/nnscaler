@@ -126,10 +126,10 @@ class DimSplitEinops(GenericDistAlgo):
         else:
             adim, reduce = 'Value', None
 
-        color, default = '\033[32m' if satisfy else '\033[31m', '\033[0m'
-        _logger.info(f"split {node.name}: {node.anno} | dim: {adim} num: {num} reduce: {reduce} ... {color}{'Success' if satisfy else 'Failed!'}{default}")
-
-        if not satisfy: return None
+        if not satisfy:
+            color, default = '\033[31m', '\033[0m'
+            _logger.info(f"split {node.name}: {node.anno} | dim: {adim} num: {num} reduce: {reduce} ... {color}{'Failed!'}{default}")
+            return None
         rule: TransformRule = self.infer(idx, dim, num)
 
         # transform

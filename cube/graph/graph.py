@@ -1053,17 +1053,18 @@ class IRGraph(IRSegment):
                 dill.dump(save, f)
 
     @staticmethod
-    def load(filename: str):
+    def from_dill(id_state, graph):
         """
-        Load the graph from pickled file.
+        build instance from id_state and graph
         Note IDGenerator will also be reset to match with graph status
 
-        @param filename str
+        Args:
+            id_state : read from dill
+            graph (IRGraph): read from dill
 
-        @return graph IRGraph
+        Returns:
+            IRGraph: the build graph
         """
-        with open(filename, 'rb') as f:
-            id_state, graph = dill.load(f)
 
         # recover IRGenerator
         IDGenerator().load_states(id_state)
@@ -1087,6 +1088,23 @@ class IRGraph(IRSegment):
 
         reset_node(graph)
         return graph
+
+    @staticmethod
+    def load(filename: str):
+        """
+        Load the graph from pickled file.
+        Note IDGenerator will also be reset to match with graph status
+
+        Args:
+            filename (str): the file to load
+
+        Returns:
+            IRGraph: the built graph
+        """
+        with open(filename, 'rb') as f:
+            id_state, graph = dill.load(f)
+
+        return IRGraph.from_dill(id_state, graph)
 
     def checksum(self, strict: bool = True) -> str:
         """Get the MD5 checksum of the graph.
