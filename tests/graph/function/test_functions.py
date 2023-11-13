@@ -4,6 +4,7 @@ import cube.graph.function.function as F
 from cube.ir.cten import IRObject, IRTensor
 
 import pytest
+import torch
 
 
 def test_handle_broadcast_multi():
@@ -156,6 +157,16 @@ def test_FullSlice():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> 2'
     op = F.FullSlice(IRTensor([2, 3, 4]), (1, 2, slice(1, 10, 1)))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> 3'
+
+def test_GetItem():
+    op = F.GetItem(IRTensor([4, 2]), IRTensor([3, 5], dtype=torch.int64))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b, c d -> c d b'
+    op = F.GetItem(IRTensor([4, 2]), IRTensor([3], dtype=torch.int64))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b, c -> c b'
+    op = F.GetItem(IRTensor([3, 4, 2]), IRTensor([3], dtype=torch.int64))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c, d -> d b c'
+    op = F.GetItem(IRTensor([3, 4, 2]), IRTensor([3, 5], dtype=torch.int64))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c, d e -> d e b c'
 
 def test_Max():
     op = F.Max(IRTensor([2, 3, 4]))

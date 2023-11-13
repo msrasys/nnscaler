@@ -1879,11 +1879,28 @@ def To(tensor: IRTensor, dtype_or_device=None, *, device=None, dtype=None, out=N
 
 def GetItem(a: Any, b: Any, signature = None) -> Union[Any, IRPyFunc]:
     """_operator.getitem(a, b): return a[b]"""
-    assert not isinstance(b, IRObject)
     obj, index = a, b
     # tensor slice
     if isinstance(obj, IRTensor):
         # note `None` will always
+        if isinstance(index, IRTensor):
+        # TODO: support general tensor slicing: https://pytorch.org/cppdocs/notes/tensor_indexing.html
+        # move to FullSlice when ready
+            """
+            Examples:
+                >>> a = torch.randn((4,2))
+                >>> b = torch.randn((3,5)).to(torch.int64)
+                >>> a[b]    # shape [3,5,2]
+            """
+            if index.dtype not in (torch.int64, torch.int32):
+                raise RuntimeError(f"index should be int64 or int32, but got {index.dtype}")
+            gener = iter(string.ascii_lowercase)
+            obj_shape = ShapeAnno.create_shape_str(obj.shape, iterator=gener)
+            obj_shape[0] = obj_shape[0] + '^'
+            index_shape = ShapeAnno.create_shape_str(index.shape, iterator=gener)
+            out_shape = index_shape + obj_shape[1:]
+            anno = OpAnno.create_op_str([obj_shape, index_shape], [out_shape])
+            return IRDimops(GetItem, 'getitem', signature, [anno], [obj, index])
         index = (index,) if isinstance(index, (int, slice)) else tuple(index)
         return FullSlice(obj, index)
     # object slice
