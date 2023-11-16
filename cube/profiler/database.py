@@ -8,9 +8,10 @@ import time
 import os
 import json
 import logging
-import _operator
+from dataclasses import dataclass, asdict
 
-import cube
+import _operator # required by eval()
+import cube      # required by eval()
 from cube.ir.cten import IRTensor, IRObject
 from cube.ir.operator import IRFwOperation
 from cube.graph.parser.register import CustomizedOps
@@ -19,35 +20,64 @@ _logger = logging.getLogger(__name__)
 
 Shapes = NewType('Shapes', Tuple[Tuple[int]])
 DTypes = NewType('DTypes', Tuple[torch.dtype])
+RequiresGrad = NewType('RequiresGrad', Tuple[bool])
 ShapesDTypes = NewType('ShapesDTypes', Tuple[Shapes, DTypes])
 NameOrFunc = Union[str, Callable]
-
 
 _train_module_ref: torch.nn.Module = torch.nn.Module().train()
 _eval_module_ref: torch.nn.Module = torch.nn.Module().eval()
 
 
+@dataclass
+class ProfiledMetrics:
+    """!
+    The profiling data of a function
+    """
+    # the bytes of each input tensors (i.e., activation tensors)
+    # excluding parameter and buffer tensors for `node`, no matter the activation
+    # tensor requires gradient or not
+    in_mem_info: Tuple[int]
+    # the bytes of every parameter and buffer tensor of `node`
+    param_mem_info: Tuple[int]
+    buffer_mem_info: Tuple[int]
+    # the forward span time in milliseconds
+    fw_span: float
+    # the backward span time in milliseconds
+    bw_span: float
+    # the peak memory in bytes during inference of `node`
+    infer_memory: int
+    # the bytes of each activation tensor that is saved for backward
+    train_mem_info: Tuple[int]
+    # the index of the tensor saved for backward in `node.inputs()` list
+    train_mem2in_idx: Tuple[int]
+
+
 class CompProfiler:
 
     @staticmethod
-    def profile(func: Callable, shapes: Shapes, dtypes: DTypes,
+    def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
                 requires_grads: Tuple[bool], values: Tuple[Any],
                 warmup_sec: float = 2, prof_times: int = 50,
                 **kwargs) -> Tuple[float, float, int, Tuple[int]]:
         """
         Profile a function
 
-        @param func Callable: the callable function, e.g., torch.nn.functional.linear
-        @param shapes Tuple[Tuple[int]]: the shapes of each input tensor
-        @param dtypes Optional[Tuple[torch.dtype]]: the dtype of each input tensor. Default will use torch.float32
-        @param warmup_sec float: warmup seconds
-        @param prof_times int: profile times
-        @param kwargs Dict: other keyword argument for func call.
+        Args:
+            node IRFwOperation: the node in IRGraph
+            func Callable: the callable function, e.g., torch.nn.functional.linear
+            shapes Tuple[Tuple[int]]: the shapes of each input tensor
+            dtypes Optional[Tuple[torch.dtype]]: the dtype of each input tensor. Default will use torch.float32
+            requires_grads Tuple[bool]: whether the input tensor requires gradient
+            values Tuple[Any]: the values of the inputs that are not IRTensor
+            warmup_sec float: warmup seconds
+            prof_times int: profile times
+            kwargs Dict: other keyword argument for func call.
 
-        @return fw_span float: the time in milliseconds for forward time
-        @return bw_span float: the time in milliseconds for backward time
-        @return infer_mem int: the peak memory in bytes after inference of the function
-        @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
+        Returns:
+            fw_span float: the time in milliseconds for forward time
+            bw_span float: the time in milliseconds for backward time
+            infer_mem int: the peak memory in bytes after inference of the function
+            train_mem_info Tuple[int]: byte sizes of activation tensors saved for backward
         """
         assert len(shapes) == len(dtypes), \
             f"func {func.__name__}: expected each shape has a corresponding dtype, but got {shapes} and {dtypes}"
@@ -76,13 +106,12 @@ class CompProfiler:
                 train_val = eval_val = value
             train_kwargs[name] = train_val
             eval_kwargs[name] = eval_val
+
         # run one sample
         outputs = func(*tensors, **train_kwargs)
-        '''
-        only profile IRDimops currently, which has at least one tensor output and
-        may have non-tensor outputs (like list, tuple, dict, etc.). In additional,
-        we assume that non-tensor outputs will not be used in backward.
-        '''
+        # only profile IRDimops currently, which has at least one tensor output and
+        # may have non-tensor outputs (like list, tuple, dict, etc.). In addition,
+        # we assume that non-tensor outputs will not be used in backward.
         outputs = (outputs,) if torch.is_tensor(outputs) else outputs
         outputs = tuple(filter(lambda x: torch.is_tensor(x) and x.requires_grad, outputs))
         assert all(torch.is_tensor(otensor) for otensor in outputs), \
@@ -118,17 +147,21 @@ class CompProfiler:
                 byte_size = x.element_size()
                 for dim in list(x.size()):
                     byte_size = byte_size * dim
-                train_mem_info.append(byte_size)
                 idx = -1
+                is_attr = False
                 for i, t in enumerate(tensors):
                     if not isinstance(t, torch.Tensor):
                         continue
                     if t.storage().data_ptr() == x.storage().data_ptr():
+                        if node.inputs()[i].is_attr():
+                            is_attr = True
                         idx = i
                         break
-                train_mem2in_idx.append(idx)
+                if not is_attr:
+                    train_mem_info.append(byte_size)
+                    train_mem2in_idx.append(idx)
             return x
-        
+
         def unpack_hook(x):
             return x
 
@@ -214,20 +247,17 @@ class ProfileDataBase:
                 values.append(extract_val(t))
         return fn, shapes, dtypes, requires_grads, values, extract_val(node.kwargs)
 
-    def profile(self, node: IRFwOperation, device: Optional[int] = None, override: bool = False):
+    def profile(self, node: IRFwOperation, device: Optional[int] = None, override: bool = False) -> ProfiledMetrics:
         """
         Profile a forward node in IRGraph on a specific device (default current device)
-        
-        @param node IRFwOperation: node of IRGraph
-        @param device int: the device that the node will execute on
 
-        @return in_mem_info Tuple[int]: byte sizes of input tensors
-        @return param_mem_info Tuple[int]: byte sizes of param tensors
-        @return fw_span float: the forward span time in milliseconds
-        @return bw_span float: the backward span time in milliseconds
-        @return infer_memory int: the peak memory in bytes after inference of the function
-        @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
-        @return residual_mem: ??
+        Args:
+            node IRFwOperation: node of IRGraph
+            device int: the device that the node will execute on
+            override bool: True if the existed can be overrided else False
+
+        Returns:
+            profiled_metrics ProfiledMetrics: the profiling data
         """
         fn, shapes, dtypes, requires_grads, values, kwargs = ProfileDataBase.get_func(node)
 
@@ -238,15 +268,13 @@ class ProfileDataBase:
             orig_device = torch.cuda.current_device()
             torch.cuda.set_device(device)
         
-        in_mem_info, param_mem_info = [], []
-        residual_mem, input_count = 0, 0
+        in_mem_info, param_mem_info, buffer_mem_info = [], [], []
         for t in node.inputs():
             if isinstance(t, IRTensor) and t.is_param():
                 param_mem_info.append(t.byte_size())
+            elif isinstance(t, IRTensor) and t.is_buffer():
+                buffer_mem_info.append(t.byte_size())
             elif hasattr(t, 'byte_size'):
-                input_count += 1
-                if input_count == 1:
-                    residual_mem += t.byte_size()
                 in_mem_info.append(t.byte_size())
             else:
                 _logger.warning(f'node {node}: skip input {t}')
@@ -254,43 +282,39 @@ class ProfileDataBase:
         # run profiling
         try:
             fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx = \
-                CompProfiler.profile(fn, shapes, dtypes, requires_grads, values, **kwargs)
+                CompProfiler.profile(node, fn, shapes, dtypes, requires_grads, values, **kwargs)
         except Exception:
             _logger.exception(f'fail to profile {node}, use default values')
             fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx = 0, 0, 0, [], []
         # log to database
         key = self._serialize(node)
-        self.insert(node.signature, key, in_mem_info, param_mem_info, fw_span, bw_span,\
-            infer_memory, train_mem_info, residual_mem, train_mem2in_idx)
+        profiled_metrics = ProfiledMetrics(in_mem_info, param_mem_info, buffer_mem_info,
+                                           fw_span, bw_span, infer_memory,
+                                           train_mem_info, train_mem2in_idx)
+        self.insert(node.signature, key, profiled_metrics)
         _logger.info(
-            f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} "
-            f"=> in mem info: {in_mem_info} | param mem info: {param_mem_info} | fw: {round(fw_span, 2)} ms | "
-            f"bw: {round(bw_span, 2)} ms | infer mem: {infer_memory} | train mem info: {train_mem_info} | idx: {train_mem2in_idx}")
+            f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} | requires_grads: {requires_grads} | "
+            f"=> in mem info: {in_mem_info} | param mem info: {param_mem_info} | "
+            f"buffer mem info: {buffer_mem_info} | fw: {round(fw_span, 2)} ms | bw: {round(bw_span, 2)} ms | "
+            f"infer mem: {infer_memory} | train mem info: {train_mem_info} | idx: {train_mem2in_idx}")
 
         if isinstance(device, int):
             torch.cuda.set_device(orig_device)
-        return tuple(in_mem_info), tuple(param_mem_info), fw_span, bw_span, infer_memory, \
-            tuple(train_mem_info), residual_mem, tuple(train_mem2in_idx)
+        return profiled_metrics
 
-    def insert(self, name: str, key: str, in_mem_info: Tuple[int], param_mem_info: Tuple[int],
-               fw_span: float, bw_span: float, infer_memory: int, train_mem_info: Tuple[int],
-               residual_mem: int, train_mem2in_idx: Tuple[int]):
+    def insert(self, name: str, key: str, profiled_metrics: ProfiledMetrics):
         """
-        log the span of a function name with key
+        Log the profiling numbers of a function name with key
 
-        @param name str: the function signature
-        @param key str: the encoded shapes and dtypes of node inputs
-        @param in_mem_info Tuple[int]: byte sizes of input tensors
-        @param param_mem_info Tuple[int]: byte sizes of param tensors
-        @param fw_span float: the forward span time in milliseconds
-        @param bw_span float: the backward span time in milliseconds
-        @param infer_memory int: the peak memory in bytes after inference of the function
-        @param train_mem_info Tuple[int]: byte sizes of tensors saved for backward
+        Args:
+            name str: the function signature
+            key str: the encoded shapes and dtypes of node inputs
+            profiled_metrics ProfiledMetrics: the profiling data
         """
         assert isinstance(name, str) and isinstance(key, str)
         if name not in self._data:
             self._data[name] = dict()
-        self._data[name][key] = (in_mem_info, param_mem_info, fw_span, bw_span, infer_memory, train_mem_info, residual_mem, train_mem2in_idx)
+        self._data[name][key] = profiled_metrics
 
     def exist(self, node: IRFwOperation) -> bool:
         """
@@ -307,18 +331,15 @@ class ProfileDataBase:
             return False
         return True
 
-    def query(self, node: IRFwOperation) -> Tuple[Tuple[int], Tuple[int], float, float, int, Tuple[int], int, Tuple[int]]:
+    def query(self, node: IRFwOperation) -> Optional[ProfiledMetrics]:
         """!
         Get the performance number of a node in IRGraph
 
-        @param node IRFwOperation: node in IRGraph
+        Args:
+            node IRFwOperation: node in IRGraph
 
-        @return in_mem_info Tuple[int]: byte sizes of input tensors
-        @return param_mem_info Tuple[int]: byte sizes of param tensors
-        @return fw_span float: the forward span time in milliseconds
-        @return bw_span float: the backward span time in milliseconds
-        @return infer_memory int: the peak memory in bytes after inference of the function
-        @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
+        Returns:
+            profiled_metrics ProfiledMetrics: the profiling data
         """
         key = self._serialize(node)
         if node.signature not in self._data:
@@ -327,41 +348,6 @@ class ProfileDataBase:
             return None
         return self._data[node.signature][key]
 
-    def query_func(self, signature, shapes, dtypes) -> Tuple[Tuple[int], Tuple[int], float, float, int, Tuple[int], int, Tuple[int]]:
-        """
-        Get performance number of given name (signature), shapes and dtypes
-        
-        @param signature str: function signature
-        @param shapes Tuple[Tuple[int]]: the shape of each input tensor
-        @param dtypes Tuple[torch.dtype]: the dtype of each tensor
-
-        @return in_mem_info Tuple[int]: byte sizes of input tensors
-        @return param_mem_info Tuple[int]: byte sizes of param tensors
-        @return fw_span float: the forward span time in milliseconds
-        @return bw_span float: the backward span time in milliseconds
-        @return infer_memory int: the peak memory in bytes after inference of the function
-        @return train_mem_info Tuple[int]: byte sizes of tensors saved for backward
-        """
-        key = self._serialize(shapes, dtypes)
-        if signature not in self._data:
-            return None
-        if key not in self._data[signature]:
-            return None
-        return self._data[signature][key]
-
-    def query_args(self, signature: str) -> Tuple[List[Shapes], List[DTypes]]:
-        """
-        Get the recorded shapes and dtypes of 
-        """
-        item_shapes, item_dtypes = [], []
-        if signature not in self._data:
-            return item_shapes, item_dtypes
-        for shapes_dtypes_str in self._data[torch.signature].keys():
-            shapes, dtypes = self._deserialize(shapes_dtypes_str)
-            item_shapes.append(shapes)
-            item_dtypes.append(dtypes)
-        return item_shapes, item_dtypes
-
     def _serialize(self, node: IRFwOperation) -> str:
         """
         Serialize the shapes, dtypes and kwargs into a string
@@ -369,40 +355,51 @@ class ProfileDataBase:
         e.g.,
             shapes: ((1024,), (1024,1024))
             dtypes: (torch.float32, torch.float32)
-        => (1024,)-(1024,1024) : torch.float32-torch.float32
+            requires_grads: (True, False)
+        => (1024,)-(1024,1024) : torch.float32-torch.float32 : True-False
 
-        @param shapes Tuple[Tuple[int]]: the shape of each tensor
-        @param dtypes Tuple[torch.dtype]: the dtype of each tensor
+        Args:
+            node IRFwOperation: node in IRGraph
 
-        @return key str: the serialized string
+        Returns:
+            key str: the serialized string
         """
-        shapes, dtypes = [], []
+        shapes, dtypes, requires_grads = [], [], []
         for t in node.inputs():
             if isinstance(t, IRTensor):
                 shapes.append(t.shape)
                 dtypes.append(t.dtype)
+                requires_grads.append(t.requires_grad)
             # else:
             #     shapes.append(None)
             #     dtypes.append(type(t))
         shapes = '-'.join(str(tuple(shape)) if shape is not None else str(None) for shape in shapes)
         dtypes = '-'.join(str(dtype) for dtype in dtypes)
-        return shapes + ' : ' + dtypes
+        requires_grads = '-'.join(str(require_grad) for require_grad in requires_grads)
+        return shapes + ' : ' + dtypes + ' : ' + requires_grads
 
-    def _deserialize(self, key: str) -> ShapesDTypes:
+    def _deserialize(self, key: str) -> Tuple[Shapes, DTypes, RequiresGrad]:
         """
         De-serialize the key string to shapes and dtypes
 
-        e.g., (1024,)-(1024,1024)=torch.float32-torch.float32
+        e.g., (1024,)-(1024,1024) : torch.float32-torch.float32 : True-False
         =>  shapes: ((1024,), (1024,1024))
             dtypes: (torch.float32, torch.float32)
+            requires_grads: (True, False)
 
-        @param key str: the serialized string
-        @return shapes_and_dtypes ShapesDTypes: shapes and dtypes
+        Args:
+            key str: the serialized string
+
+        Returns:
+            shapes Shapes: the shapes of each input tensor
+            dtypes DTypes: the dtypes of each input tensor
+            requires_grads RequiresGrad: whether the input tensor requires gradient
         """
-        shapes, dtypes = key.split(' : ')
+        shapes, dtypes, requires_grads = key.split(' : ')
         shapes = tuple(eval(shape) for shape in shapes.split('-'))
         dtypes = tuple(eval(dtype) for dtype in dtypes.split('-'))
-        return shapes, dtypes
+        requires_grads = tuple(eval(require_grad) for require_grad in requires_grads.split('-'))
+        return shapes, dtypes, requires_grads
 
     def dump(self, file: str, override=False):
         """!
@@ -416,20 +413,12 @@ class ProfileDataBase:
         with open(file, 'w') as f:
             json.dump(self._data, f)
 
-        
-    def dump_ops(self, file: str, override=False):
-        if os.path.exists(file):
-            assert override, f"File {file} exists. Set override = True to force dump."
-        for signature in self._data.keys():
-            file_n = os.path.join(file, signature +'.json')
-            with open(file_n, 'w') as f:
-                json.dump(self._data[signature], f, indent=2)   
-
-    def dump_op(self, file: str, signature, override=False): 
+    def dump_op(self, file: str, signature, override=False):
         assert signature in self._data.keys(), f'this node not be profiled'
         file_n = os.path.join(file, signature +'.json')
         with open(file_n, 'w') as f:
-            json.dump(self._data[signature], f, indent=2)
+            to_dump = {key: asdict(value) for key, value in self._data[signature].items()}
+            json.dump(to_dump, f, indent=2)
 
     def load(self, file: str):
         """!
@@ -446,14 +435,15 @@ class ProfileDataBase:
             if filename.endswith('.json'):
                 with open(os.path.join(file, filename)) as f:
                     signature = filename[:-len('.json')]
-                    self._data[signature] = json.load(f)
+                    loaded_json = json.load(f)
+                    self._data[signature] = {key: ProfiledMetrics(**value) for key, value in loaded_json.items()}
 
     def __repr__(self) -> str:
         data = []
         for signature in self._data:
             for key in self._data[signature]:
-                shapes, dtypes = self._deserialize(key)
-                in_mem_info, param_mem_info, fw_span, bw_span, infer_mem, train_mem = self._data[signature][key]
-                data.append(f'{signature}: shapes={shapes}, dtypes={dtypes}, in mem {in_mem_info} bytes, param mem {param_mem_info} bytes, fw span: {fw_span} ms, bw span: {bw_span} ms, infer mem {infer_mem} bytes, train mem {train_mem} bytes')
+                shapes, dtypes, requires_grads = self._deserialize(key)
+                pmetrics = self._data[signature][key]
+                data.append(f'{signature}: shapes={shapes}, dtypes={dtypes}, requires_grads={requires_grads}, profiled numbers: {pmetrics}.')
         data = '\n'.join(data)
         return data

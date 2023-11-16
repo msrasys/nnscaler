@@ -172,10 +172,13 @@ class DimSplitEinops(GenericDistAlgo):
         Given the partition choice on `dim` dimension of idx-th input,
         return the partitioning of the output tensor.
 
-        @param idx int: the input index
-        @param dim int: the dimension to partition
+        Args:
+            idx int: the input index
+            dim int: the dimension to partition
+            num int: the number of partitions
 
-        @return rule TransformRule: the transformation rule
+        Returns:
+            rule TransformRule: the transformation rule
         """
         node: IRDimops = self.node
         assert isinstance(dim, int) or dim == 'v', f"expect dim to be int or 'v'"
@@ -239,6 +242,17 @@ class DimSplitEinops(GenericDistAlgo):
 
 
 def collect_split_info(node: IRFwOperation):
+    """
+    Collect the split information of the node.
+    Args:
+        node (IRFwOperation): the node to be analyzed
+    Returns:
+        split_info (Dict[str, Tuple[int, int, int]]): the split information.
+            The key is the identifier name, and the value is a tuple of (idx_shape, idx_dim, idx_id).
+            idx_shape: the index of the input (shape)
+            idx_dim: the index of the dimension in the input's shape
+            idx_id: the index of the identifier in the dimension
+    """
     anno = node.anno
 
     split_info = {}
@@ -256,6 +270,11 @@ def collect_split_info(node: IRFwOperation):
     return split_info
 
 def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
+    """
+    Returns:
+        List[IRFwOperation]: the partitioned nodes. Each element of the list represents the (identical) sub-operator
+            of one partition option.
+    """
 
     def gen_hash(node: IRFwOperation) -> str:
         ret = node.signature
