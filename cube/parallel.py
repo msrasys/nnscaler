@@ -1,6 +1,7 @@
+from enum import Enum
 from functools import partial
 import types
-from typing import Callable, Any, Dict, Optional, Type, Union, TypeVar
+from typing import Callable, Any, Dict, Optional, Tuple, Type, Union, TypeVar
 from pathlib import Path
 import inspect
 import sys
@@ -42,6 +43,9 @@ class ComputeConfig:
     plan_ngpus: int
     runtime_ngpus: int
 
+    use_zero: bool = False
+    zero_ngroups: int = 1
+
 
 @contextmanager
 def _flags(flags, warning_on_override=True, /, **kwargs):
@@ -59,8 +63,13 @@ def _flags(flags, warning_on_override=True, /, **kwargs):
             setattr(flags, k, v)
 
 
-def _compile_flags():
-    return _flags(CompileFlag, use_zero=False, async_reducer=False, reducer_op='sum', async_comm=False)
+def _compile_flags(compute_config: ComputeConfig):
+    return _flags(
+        CompileFlag,
+        async_reducer=False, reducer_op='sum', async_comm=False,
+        use_zero=compute_config.use_zero,
+        zero_ngroups=compute_config.zero_ngroups,
+    )
 
 
 def _runtime_flags(**kwargs):
@@ -100,7 +109,8 @@ def _add_cube_savedir_to_syspath(cube_savedir: str) -> Path:
 def _is_any_gencode_loaded(namespace: str) -> bool:
     """Check if a module is loaded"""
     for m in sys.modules.values():
-        if m.__name__.startswith(namespace + '.' + _GENCODE_FILE_PREFIX):
+        # m.__name__ doesn't always work as some module doesn't have __name__ attribute.
+        if getattr(m, '__name__', '').startswith(namespace + '.' + _GENCODE_FILE_PREFIX):
             return True
     return False
 
@@ -113,93 +123,119 @@ def _get_arg_default_values(fn) -> Dict[str, Any]:
 _GENCODE_FILE_PREFIX = 'gencode'
 _GENCODE_FILE_TEMPLATE = _GENCODE_FILE_PREFIX + '{}.py'  # 'gencode{}.py'
 _CUBE_MODULE_NAMESPACE = '_cube_modules'
+_GRAPH_DUMP_FILE = 'graph.ckp'
+_FORWARD_ARGS_DUMP_FILE = 'forward_args.pkl'
 
 
-def _gencode(
-        module: torch.nn.Module,
-        dummy_input: dict,
-        pas_policy: Callable[[IRGraph, ComputeConfig], IRGraph],
-        compute_config: ComputeConfig,
-        *,
-        dynamic_shape: bool = True,
-        cube_savedir: Union[str, Path] = './.cube',
-        override: bool = False,
-        instance_name: Optional[str] = None
-    ) -> None:
+class ReuseType(Enum):
+    """The reuse type"""
+    NONE = 'none'    # no reuse, everything will be regenerated.
+    ALL = 'all'      # try to reuse everything if possible
+    GRAPH = 'graph'  # only graph will be reused (so we don't need to trace the graph again)
+
+
+def _prepare_and_check_reusable(
+        cube_savedir,
+        module_or_module_class: Union[Type[torch.nn.Module], torch.nn.Module],
+        compute_config,
+        instance_name,
+        reuse: ReuseType = ReuseType.ALL,
+    ) -> Tuple[str, bool]:
     """
-    Generate cube module source code from a torch module, and save it to file.
-    Generated module will be save according to its full qualified name.
-
-    If you want to save multiple instances of the same module,
-    you can specify the instance_name to distingish them.
-
-    For example, if the module is `torchscale.x.y`, then the generated module will be save to
-    `cube_savedir/_cube_modules/torchscale/x/y/instance_name`.
+    Prepare the output directory for code generation, and also check if the existing code is reusable.
 
     Args:
-        module (torch.nn.Module): the module to be compiled
-        dummy_input (dict): the dummy input for the module
-        pas_policy (Callable[[IRGraph, ComputeConfig], IRGraph]): the pas policy
+        cube_savedir (str): the directory to save generated code
+        module_or_module_class (Union[Type[torch.nn.Module], torch.nn.Module]): the original module or module class
         compute_config (ComputeConfig): the environment resource
-        dynamic_shape (bool): whether to use dynamic shape
-        override (bool): If true, source code will be regenerated even if generated code exists.
-        cube_savedir (Union[str, Path]): the directory to save generated code
         instance_name (Optional[str]): the instance name of the generated module.
+        reuse (ReuseType): specify which part can be reused.
 
     Returns:
-        None
+        Tuple[str, bool]: the output directory and whether the existing code is reusable.
+
+    Raises:
+        RuntimeError: if the existing code is not reusable,
+            will raise RuntimeError if the code is not reusable but the module is already loaded.
     """
-    # put cube_savedir into sys.path
-    # so we can import the generated module with its namespace later
+
     cube_savedir = _add_cube_savedir_to_syspath(cube_savedir)
 
     instance_name = instance_name.strip('.') if instance_name else ''
     instance_namespace = f'.{instance_name}' if instance_name else ''
-    namespace = f'{_CUBE_MODULE_NAMESPACE}.{_get_full_qualified_name(module)}{instance_namespace}'
+    namespace = f'{_CUBE_MODULE_NAMESPACE}.{_get_full_qualified_name(module_or_module_class)}{instance_namespace}'
     outdir = cube_savedir / Path(namespace.replace('.', '/').strip('/'))
     outdir.mkdir(parents=True, exist_ok=True)
 
     # decision matrix for code generation
-    # override flag | dir condition(imported, empty, match, unmatched) | action
+    # reuse flag | dir condition(imported, empty, match, unmatched) | action
     # ---------------------------------------------------------
-    #   True   | empty | generate
-    #   True   | imported | raise error
-    #   True   | match | generate
-    #   True   | unmatch | generate
-    #   False  | empty | generate
-    #   False  | match | do nothing
-    #   False  | unmatch | raise error
-    #   False  | imported | doesn't matter
-    if not override:
+    #   NONE/GRAPH   | empty | generate
+    #   NONE/GRAPH   | imported | raise error
+    #   NONE/GRAPH   | match | generate
+    #   NONE/GRAPH   | unmatch | generate
+    #   ALL  | empty | generate
+    #   ALL  | match | do nothing
+    #   ALL  | unmatch | raise error
+    #   ALL  | imported | doesn't matter
+    reusable = False
+    if reuse == ReuseType.ALL:
+        module_meta_files = [
+            outdir / FxModuleParser.ATTR_CONTENT_FILE,
+            outdir / FxModuleParser.ATTR_MAP_FILE,
+        ]
         # check if the module is already generated
         expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
-        expected_output_files.append(outdir / FxModuleParser.ATTR_CONTENT_FILE)
-        expected_output_files.append(outdir / FxModuleParser.ATTR_MAP_FILE)
+        expected_output_files.extend(module_meta_files)
         expected_output_files.append(outdir / ParallelModule.COMPUTE_CONFIG_FILE)
+        expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
+        expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         existing_output_files = [f for f in outdir.glob('*') if f.is_file()]
         if existing_output_files:
             if all([output_file.exists() for output_file in expected_output_files]) \
                 and len(existing_output_files) == len(expected_output_files) \
                 and torch.load(outdir / ParallelModule.COMPUTE_CONFIG_FILE) == compute_config:
-                return
+                reusable = True  # everything is matched.
             elif all(f.suffix != '.py'  for f in existing_output_files):
                 # No python source code is generated.
                 # which means its last generation failed.
                 # in this case, we can reuse the same directory safely.
-                pass
+                logger.info(f'Output directory {outdir} is not empty. '
+                            f'But no python source code is present. '
+                            f'Will reuse the directory and the graph dump if present.')
+                # we have to trace the graph again if not all meta files are present.
+                if not all([meta_file.exists() for meta_file in module_meta_files]):
+                    for f in outdir.glob('*'):
+                        if f.is_file():
+                            f.unlink()
             else:
                 raise RuntimeError(f'Output directory {outdir} is not empty. '
-                                   f'And the existing files do not match with current config.')
+                                   f'And the existing files do not match with current config. '
+                                   f'You can remove the directory and try again, '
+                                   f'or set reuse to ReuseType.NONE to regenerate the code.')
     else:
         # check if the module is already loaded
         if _is_any_gencode_loaded(namespace):
             raise RuntimeError(f'Output directory {outdir} is already loaded. '
                                f'You can not override a loaded module.')
         # clear existing generated files
-        for f in outdir.glob('*'):
+        if reuse == ReuseType.NONE:
+            glob_pattern = '*'
+        else:
+            glob_pattern = '*.py'  # so we can keep graph dumps.
+        for f in outdir.glob(glob_pattern):
             if f.is_file():
                 f.unlink()
 
+    return outdir, reusable
+
+
+def _gen_graph(
+    module: torch.nn.Module,
+    dummy_input: dict,
+    outdir: Path,
+    dynamic_shape: bool,
+):
     # reset environment
     program = Program()
     program.clear()
@@ -267,6 +303,79 @@ def _gencode(
         ir_dummy_outputs = [ir_dummy_outputs]
     program.set_output(ir_dummy_outputs)
     program.finalize()
+
+    return graph, forward_args
+
+
+def _gencode(
+        module_or_module_class: torch.nn.Module,
+        dummy_input: dict,
+        pas_policy: Callable[[IRGraph, ComputeConfig], IRGraph],
+        compute_config: ComputeConfig,
+        outdir: Path,
+        *,
+        dynamic_shape: bool = True,
+        module_dtype:  Optional[torch.dtype] = None,
+        module_fn: Optional[Callable[[], torch.nn.Module]] = None,
+    ) -> None:
+    """
+    Generate cube module source code from a torch module, and save it to file.
+    Generated module will be save according to its full qualified name.
+
+    If you want to save multiple instances of the same module,
+    you can specify the instance_name to distingish them.
+
+    For example, if the module is `torchscale.x.y`, then the generated module will be save to
+    `cube_savedir/_cube_modules/torchscale/x/y/instance_name`.
+
+    Args:
+        module (torch.nn.Module): the module to be compiled
+        dummy_input (dict): the dummy input for the module
+        pas_policy (Callable[[IRGraph, ComputeConfig], IRGraph]): the pas policy
+        compute_config (ComputeConfig): the environment resource
+        outdir (Path): the directory to save generated code
+        dynamic_shape (bool): whether to use dynamic shape
+        module_dtype (Optional[torch.dtype]): the dtype of the module. Keep as it is when it is None.
+        module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
+
+    Returns:
+        None
+    """
+    graph_ckp = outdir / _GRAPH_DUMP_FILE
+    forward_args_ckp = outdir / _FORWARD_ARGS_DUMP_FILE
+    if not graph_ckp.exists() or not forward_args_ckp.exists():
+        is_module_class = inspect.isclass(module_or_module_class)
+        if is_module_class:
+            try:
+                if module_fn is None:
+                    # it should only have 1 `self` parameter
+                    if len(inspect.signature(module_or_module_class.__init__).parameters) > 1:
+                        raise ValueError("Module class __init__ should be parameter-free.")
+                    module = module_or_module_class()
+                else:
+                    module = module_fn()
+                    if type(module) != module_or_module_class:
+                        raise ValueError(f"module_fn should return a {module_or_module_class} instance.")
+            except Exception as e:
+                raise RuntimeError(f"Error when creating module instance.") from e
+        else:
+            module = module_or_module_class
+
+        if module_dtype is not None:
+            module = module.to(dtype=module_dtype)
+
+        if any(isinstance(m, CubeModule) for m in module.modules()):
+            raise RuntimeError('CubeModule can not be nested.')
+
+        graph, forward_args = _gen_graph(module, dummy_input, outdir, dynamic_shape)
+        graph.dump(graph_ckp)
+        torch.save(forward_args, forward_args_ckp)
+
+        if is_module_class:
+            del module
+    else:
+        graph = IRGraph.load(graph_ckp)
+        forward_args = torch.load(forward_args_ckp)
 
     graph = pas_policy(graph, compute_config)
     if not isinstance(graph, IRGraph):
@@ -345,9 +454,11 @@ def parallelize(
     *,
     dynamic_shape: bool = True,
     cube_savedir: Union[str, Path] = './.cube',
-    override: bool = False,
+    reuse: Union[ReuseType, str] = ReuseType.ALL,
     instance_name: Optional[str] = None,
     load_module: bool = True,
+    module_dtype:  Optional[torch.dtype] = None,
+    module_fn: Optional[Callable[[], torch.nn.Module]] = None,
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
     """
     Convert a torch.nn.Module object or class to CubeModule object or class.
@@ -359,6 +470,9 @@ def parallelize(
     Or you can unset load_module flag, and manually copy the generated files to other nodes.
     After all nodes have the generated files, you can call parallelize() again with load_module flag set.
 
+    Note: if reuse is not set to ReuseType.ALL,
+    the generated code in outdir will be removed EVEN IF the code generetion fails in this call.
+
     if the input is a module object.
         The module object will be copied to cpu to handle possible insufficient gpu memory.
         The training flag will be the same as the original module
@@ -369,10 +483,12 @@ def parallelize(
         pas_policy (Callable[[IRGraph, ComputeConfig], IRGraph]): the pas policy
         compute_config (ComputeConfig): the environment resource
         dynamic_shape (bool): whether to use dynamic shape
-        override (bool): If true, source code will be regenerated even if generated code exists.
+        reuse (ReuseType): specify which part can be reused.
         cube_savedir (Union[str, Path]): the directory to save generated code
         instance_name (Optional[str]): the instance name of the generated module.
         load_module (bool): whether to load the generated module after done.
+        module_dtype (Optional[torch.dtype]): the dtype of the module. Keep the module as it is if it is None.
+        module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
 
     Returns:
         Union[CubeModule, Type[CubeModule], None]:
@@ -387,36 +503,24 @@ def parallelize(
 
     is_module_class = inspect.isclass(module_or_module_class)
     module_class = module_or_module_class if is_module_class else module_or_module_class.__class__
+    reuse = ReuseType(reuse) if isinstance(reuse, str) else reuse
 
     # genereate code only in node0
     # if it is not in a torchrun environment, just generate.
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        if is_module_class:
-            # it should only have 1 `self` parameter
-            if len(inspect.signature(module_or_module_class.__init__).parameters) > 1:
-                raise ValueError("Module class __init__ should be parameter-free.")
-            try:
-                module = module_or_module_class()
-            except Exception as e:
-                raise RuntimeError(f"Error when create module instance.") from e
-        else:
-            module = module_or_module_class
-
-        if any(isinstance(m, CubeModule) for m in module.modules()):
-            raise RuntimeError('CubeModule can not be nested.')
-        with _compile_flags():
-            _gencode(
-                module,
-                dummy_input,
-                pas_policy,
-                compute_config,
-                dynamic_shape=dynamic_shape,
-                override=override,
-                cube_savedir=cube_savedir,
-                instance_name=instance_name,
-            )
-        if is_module_class:
-            del module
+        outdir, reusable = _prepare_and_check_reusable(cube_savedir, module_class, compute_config, instance_name, reuse)
+        if not reusable:
+            with _compile_flags(compute_config):
+                _gencode(
+                    module_or_module_class,
+                    dummy_input,
+                    pas_policy,
+                    compute_config,
+                    outdir,
+                    dynamic_shape=dynamic_shape,
+                    module_dtype=module_dtype,
+                    module_fn=module_fn,
+                )
 
     if load_module:
         if not torch.distributed.is_initialized(): # we only support loading in torchrun environment
