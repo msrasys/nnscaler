@@ -53,8 +53,7 @@ def load_model(filename: Optional[str] = None, load_content: bool = True):
     loaded_module: cube.runtime.module.CubeModule = module.GenModel().cuda()
     # load parameter content
     if load_content:
-        print_each_rank("> loading parameter content...",
-                        logger=_logger)
+        _logger.info("loading parameter content...")
         loaded_module.load_attr_content('./fullmodel.pt')
     # initialize reducer
     for reducer in loaded_module.reducers:
