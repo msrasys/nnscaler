@@ -151,14 +151,28 @@ class CubeModule(torch.nn.Module):
         return self._fullmap
 
     def load_attr_content(self, filename: str):
+        partitioned_model_pt = 0
+        while os.path.isfile(filename + f'.{partitioned_model_pt}'):
+            partitioned_model_pt += 1
+        if partitioned_model_pt == 0:
+            raise RuntimeError(f"Cannot find file {filename}.0 in load_attr_content")
         with torch.no_grad():
-            full = torch.load(filename)
-            for attr in self._fullmap.keys():
-                tensor: torch.Tensor = getattr(self, attr)
-                tid, slicers, nchunks = self._fullmap[attr]
-                content = full[tid][slicers] / nchunks
-                tensor.copy_(content)
-                # print(f'attr {attr}:\n{getattr(self, attr)}')
+            _logger.info(f'load partitioned model from {filename}, partitioned_model_pt={partitioned_model_pt}')
+            fullmap2 = {tid: (attr, slicer, nchunks) for attr, (tid, slicer, nchunks) in self._fullmap.items()}
+            for file_idx in range(partitioned_model_pt):
+                full = torch.load(filename + f'.{file_idx}')
+                for tid in full.keys():
+                    if tid not in fullmap2:
+                        _logger.warning(f'cannot find tid {tid} in fullmap2')
+                        continue
+                    fm = fullmap2[tid]
+                    tensor: torch.Tensor = getattr(self, fm[0])
+                    content = full[tid][fm[1]] / fm[2]
+                    tensor.copy_(content)
+                    fullmap2.pop(tid, None)
+
+            if len(fullmap2) != 0:
+                raise RuntimeError(f'cannot find tid {list(fullmap2.keys())} in partitioned model files')
 
     def init_group(self, ranks: List[int]):
         if not all([isinstance(rank, int) for rank in ranks]):

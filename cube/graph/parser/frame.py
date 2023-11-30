@@ -125,12 +125,28 @@ class Frame:
                 return tensor
         return None
 
-    def save_attr_content(self, save_file: str = 'fullmodel.pt'):
+    def save_attr_content(self, save_file: str):
         """
         Save attribute content into file.
         """
+        params_per_part = 1024 * 1024 * 1024 # 1 billion per part
+        total_size = sum([val.numel() for _, (_, val) in self._attr_map.items()])
+        model_pt_part_num = (total_size + params_per_part - 1) // params_per_part
+
         tid2value = {t.tid: val.cpu() for t, (_, val) in self._attr_map.items()}
-        torch.save(tid2value, save_file)
+        if model_pt_part_num == 1:
+            torch.save(tid2value, f'{save_file}.0')
+        else:
+            assert model_pt_part_num > 1
+            sorted_keys = sorted(list(tid2value.keys()))
+            assert len(sorted_keys) > 0, "Empty attr map"
+            chunk_size = (len(sorted_keys) + model_pt_part_num - 1) // model_pt_part_num
+            chunks = [sorted_keys[i:min(i + chunk_size, len(sorted_keys))] for i in
+                      range(0, len(sorted_keys), chunk_size)]
+            for idx, chunk in enumerate(chunks):
+                assert len(chunk) > 0, f"Empty chunk {idx}"
+                part = {k: tid2value[k] for k in chunk}
+                torch.save(part, f'{save_file}.{idx}')
 
     def save_attr_map(self, save_file: str = 'dist_param_map.pt'):
         """
