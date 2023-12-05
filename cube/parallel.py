@@ -38,13 +38,39 @@ from cube.runtime.module import CubeModule, ParallelModule
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ComputeConfig:
     plan_ngpus: int
     runtime_ngpus: int
 
     use_zero: bool = False
     zero_ngroups: int = 1
+
+    # which torch.distributed.ReduceOp is used when reduce gradients
+    # by torch.distributed.all_reduce or torch.distributed.reduce_scatter
+    # a special case for mean op
+    # In some cases, you may want to firstly divide the local gradients, and then use torch.distributed.ReduceOp.SUM
+    # to get the final the gradients
+    # example code to divide the local gradients:
+    #```python
+    # def _mean_hook(reducer, grad):
+    #   if reducer.reduce_op == torch.distributed.ReduceOp.SUM:
+    #     grad.div_(reducer.ranks)
+    # optimizer.register_reducer_pre_hook(_mean_hook)
+    # ```
+    reducer_op: str = 'sum'
+
+    def __post_init__(self):
+        if self.plan_ngpus <= 0:
+            raise ValueError(f"plan_ngpus {self.plan_ngpus} must be > 0")
+        if self.runtime_ngpus <= 0:
+            raise ValueError(f"runtime_ngpus {self.runtime_ngpus} must be > 0")
+        if self.runtime_ngpus % self.plan_ngpus != 0:
+            raise ValueError(f"runtime_ngpus {self.runtime_ngpus} must be a multiple of plan_ngpus {self.plan_ngpus}")
+        if self.use_zero and self.zero_ngroups < 0:
+                raise ValueError(f"zero_ngroups {self.zero_ngroups} must be >= 0")
+        if self.reducer_op not in ['sum', 'avg', 'mean', 'max', 'min']:
+            raise ValueError(f"reducer_op {self.reducer_op} is not supported.")
 
 
 @contextmanager
@@ -66,7 +92,7 @@ def _flags(flags, warning_on_override=True, /, **kwargs):
 def _compile_flags(compute_config: ComputeConfig):
     return _flags(
         CompileFlag,
-        async_reducer=False, reducer_op='sum', async_comm=False,
+        async_reducer=False, reducer_op=compute_config.reducer_op, async_comm=False,
         use_zero=compute_config.use_zero,
         zero_ngroups=compute_config.zero_ngroups,
     )
@@ -180,13 +206,13 @@ def _prepare_and_check_reusable(
     #   ALL  | imported | doesn't matter
     reusable = False
     if reuse == ReuseType.ALL:
-        module_meta_files = [
+        trace_meta_files = [
             outdir / FxModuleParser.ATTR_CONTENT_FILE,
             outdir / FxModuleParser.ATTR_MAP_FILE,
         ]
         # check if the module is already generated
         expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
-        expected_output_files.extend(module_meta_files)
+        expected_output_files.extend(trace_meta_files)
         expected_output_files.append(outdir / ParallelModule.COMPUTE_CONFIG_FILE)
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
@@ -204,7 +230,7 @@ def _prepare_and_check_reusable(
                             f'But no python source code is present. '
                             f'Will reuse the directory and the graph dump if present.')
                 # we have to trace the graph again if not all meta files are present.
-                if not all([meta_file.exists() for meta_file in module_meta_files]):
+                if not all([meta_file.exists() for meta_file in trace_meta_files]):
                     for f in outdir.glob('*'):
                         if f.is_file():
                             f.unlink()
@@ -410,8 +436,12 @@ def _gencode(
     assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
     mgener = ModuleCodeGen(execplan, scale_ndevs=runtime_ngpus)
     for rank in range(compute_config.runtime_ngpus):
-        filename = _GENCODE_FILE_TEMPLATE.format(rank)
-        mgener.gen(rank, forward_args=forward_args, outfile=outdir / filename, attach=False, as_parallel_module=True)
+        mgener.gen(rank,
+            forward_args=forward_args,
+            outfile=outdir / _GENCODE_FILE_TEMPLATE.format(rank),
+            attach=False,
+            as_parallel_module=True,
+        )
 
 
 def _load_cube_module_class(
@@ -419,6 +449,7 @@ def _load_cube_module_class(
     *,
     cube_savedir: Union[str, Path] = './.cube',
     instance_name: Optional[str] = None,
+    rank: Optional[int] = None,
 ) -> Type[ParallelModule]:
     """
     Load the generated cube module class.
@@ -429,9 +460,12 @@ def _load_cube_module_class(
         module_class (Type[torch.nn.Module]): the original module class
         cube_savedir (Union[str, Path]): the directory to load generated code
         instance_name (Optional[str]): the instance name of the generated module.
+        rank (Optional[int]): the rank of the module. If it is None, will get the rank from torch.distributed.get_rank().
+            This option is only useful for debugging or writing pre/post-processing tools.
+            when you need to load the generated module in a non-torchrun environment.
     """
     _add_cube_savedir_to_syspath(cube_savedir)
-    rank = torch.distributed.get_rank()
+    rank = torch.distributed.get_rank() if rank is None else rank
     instance_name = instance_name.strip('.') if instance_name else ''
     instance_namespace = f'.{instance_name}' if instance_name else ''
     gen_imported = importlib.import_module(
@@ -459,6 +493,7 @@ def parallelize(
     load_module: bool = True,
     module_dtype:  Optional[torch.dtype] = None,
     module_fn: Optional[Callable[[], torch.nn.Module]] = None,
+    init_module_params: bool = True,
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
     """
     Convert a torch.nn.Module object or class to CubeModule object or class.
@@ -477,6 +512,38 @@ def parallelize(
         The module object will be copied to cpu to handle possible insufficient gpu memory.
         The training flag will be the same as the original module
 
+    This function can be used to convert both module object and module class to cube module or cube module class.
+    Among key-value arguments,
+    module_fn and module_dtype control how to create the module object.
+    whereas init_module_params controls how to load cube module object after conversion is done.
+
+    1. If the input is a module object, it will return a CubeModule object if load_module is True.
+        This is useful when the module is created by a factory function.
+        a. module_fn is ignored.
+        b. module_dtype is used to control the dtype of the input module.
+        c. init_module_params is used to control whether to initialize the cube module parameters when load it.
+
+    2. If the input is a module class, it will return a CubeModule class if load_module is True.
+        a. module_fn is used to create the module object, or module's__init__ if not prent.
+        b. module_dtype is used to control the dtype of the created module (by constructor or module_fn).
+            Of cousre, it can be merged into module_fn.
+        c. init_module_params is ignored.
+
+    After the module is converted, you can use it to create module object by calling it like a module class.
+    The module class is defined like:
+    ```
+    class GenModule(cube.runtime.module.ParallelModule):
+        def __init__(self, init_params=True):
+            super().__init__()
+            ...
+        ...
+    ```
+    So you can use `init_params` in `__init__` to control whether to initialize the module parameters.
+    For example, if you don't want to intialize module params:
+    ```
+    module = GenModule(init_params=False)
+        ```
+
     Args:
         module_or_module_class (Union[torch.nn.Module, Type[torch.nn.Module]]): the module or module class to be compiled
         dummy_input (dict): the dummy input for the module
@@ -486,7 +553,11 @@ def parallelize(
         reuse (ReuseType): specify which part can be reused.
         cube_savedir (Union[str, Path]): the directory to save generated code
         instance_name (Optional[str]): the instance name of the generated module.
-        load_module (bool): whether to load the generated module after done.
+        load_module (bool): whether to load the generated module or module class after conversion is done.
+        init_module_params (bool): If true, when we construct the module, all its parameters are initialized with the same value with when we traced.
+            Otherwise, they will be empty tensor.
+            This parameter will be passed to the module constructor,
+            so it is only used when module_or_module_class is a module object, and load_module is true.
         module_dtype (Optional[torch.dtype]): the dtype of the module. Keep the module as it is if it is None.
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
 
@@ -534,7 +605,7 @@ def parallelize(
         if is_module_class:
             return cube_module_class
         else:
-            cube_module = cube_module_class()
+            cube_module = cube_module_class(init_module_params)
             cube_module.train(module_or_module_class.training)  # set training state to the same as original module
             return cube_module
 

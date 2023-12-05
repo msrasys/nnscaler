@@ -436,11 +436,15 @@ class ModuleCodeGen(FuncEmission):
             class_name='GenModel',
             derived=[f'cube.runtime.module.{"ParallelModule" if as_parallel_module else "CubeModule"}']
         ) as cb:
-            with FunctionBlock(func_name='__init__', args=['self']) as ib:
-                ib.insert_body(self.model_init_statements)
-                if as_parallel_module:
-                    cb.insert_body('')
-                    ib.insert_body('self._post_init()')
+            if as_parallel_module:
+                cb.insert_body(f'rank = {device}')  # save rank in class level
+                with FunctionBlock(func_name='__init__', args=['self', 'init_params=True']) as ib:
+                    ib.insert_body(self.model_init_statements)
+                    ib.insert_body('')
+                    ib.insert_body('self._post_init(init_params)')
+            else:
+                with FunctionBlock(func_name='__init__', args=['self']) as ib:
+                    ib.insert_body(self.model_init_statements)
             cb.insert_body('')
             cb.insert_body(ib.code)
             segment_idxs =[]

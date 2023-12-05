@@ -25,16 +25,16 @@ class CubeModule(torch.nn.Module):
         super().__init__()
         self._reducers: List[Reducer] = list()
         # Key: str, parameter name (from named_parameters)
-        # Value: Tuple[int, Tuple[slice], int]: 
-        # full tensor tid, 
-        # position of sub tensor in full tensor, 
+        # Value: Tuple[int, Tuple[slice], int]:
+        # full tensor tid,
+        # position of sub tensor in full tensor,
         # position of value in value partition.
         self._fullmap : Dict[str, Tuple[int, Tuple[slice], int]] = dict()
 
     @property
     def reducers(self):
         return self._reducers
-    
+
     @property
     def fullmap(self):
         return self._fullmap
@@ -94,9 +94,9 @@ class CubeModule(torch.nn.Module):
 
     def parameters_for_calc_gnorm(self) -> List[ParamsInfo]:
         """Return the necessary information for calculating the gradient norm.
-        
+
         Returns:
-            List[Tuple[Tuple[int], List[torch.nn.Parameter], List[str], int]]: 
+            List[Tuple[Tuple[int], List[torch.nn.Parameter], List[str], int]]:
                 A list of tuples, each tuple contains the following information:
                     Tuple[int]: the ranks spanned by the parameters in the tuple
                     List[torch.nn.Parameter]: the contiguous parameters in the tuple
@@ -457,9 +457,23 @@ class ParallelModule(CubeModule):
         # this is used to allow multiple sync_grad() calls
         self._sync_grad_required = False
 
-    def _post_init(self):
+    def _post_init(self, init_params=True):
+        """
+        This is post init function to further initialize the model. Should be called by subclass's __init__().
+
+        Args:
+            init_params (bool): whether to load model init parameters. Default True.
+        """
+        # Here we check the rank to load the module file name
+        # Current we don't check rank when we are not in distributed mode
+        # to facilitate local debugging
+        # TODO: re-enable this check
+        # if dist.is_initialized() and self.rank != dist.get_rank():
+        #     raise RuntimeError(f"The rank to load this module file name is expected to be {self._rank}, but got {dist.get_rank()}")
+
         module_file = Path(sys.modules[self.__module__].__file__)
-        self.load_attr_content(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE}"))
+        if init_params:
+            self.load_attr_content(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE}"))
         self._dist_param_map = torch.load(module_file.with_name(f"{FxModuleParser.ATTR_MAP_FILE}"))
         self._compute_config = torch.load(module_file.with_name(f"{self.COMPUTE_CONFIG_FILE}"))
 
@@ -491,3 +505,6 @@ class ParallelModule(CubeModule):
 
     def get_compute_config(self):
         return self._compute_config
+
+    def get_rank(self):
+        return self.rank  # rank is a class varible defined in gencode
