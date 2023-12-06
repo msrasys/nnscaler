@@ -23,7 +23,9 @@ class FxModuleParser:
     torch.fx module parser
     """
 
-    ATTR_CONTENT_FILE = 'fullmodel.pt'
+    ATTR_CONTENT_FILE_STEM = 'fullmodel.pt'
+    ATTR_CONTENT_FILE_0 = 'fullmodel.pt.0'
+    ATTR_CONTENT_FILE_FORMAT = '{stem}.{idx}'
     ATTR_MAP_FILE = 'dist_param_map.pt'
 
     @staticmethod
@@ -77,13 +79,13 @@ class FxModuleParser:
         for node in module.graph.nodes:
             ir_nodes = FxModuleParser.parse_node(node, module, dynamic_shape, frame)
             all_ir_nodes += ir_nodes
-        
+
         # get graph outputs
         outputs = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
 
         if save_content:
             attr_savedir = Path(attr_savedir)
-            frame.save_attr_content(attr_savedir / FxModuleParser.ATTR_CONTENT_FILE)
+            frame.save_attr_content(attr_savedir / FxModuleParser.ATTR_CONTENT_FILE_STEM)
             frame.save_attr_map(attr_savedir / FxModuleParser.ATTR_MAP_FILE)
 
         frame.pop_var()
@@ -140,13 +142,13 @@ class FxModuleParser:
             # FIXME: double check: there should be a concrete value as example,
             # otherwise, it may fail in parsing node like getattr
             val = IRObject(name=node.name, value=concrete_value)
-        
+
         frame.add_var(node.name, val)
 
     @staticmethod
     def parse_complex(val: Any, frame: Frame) -> Any:
         """parse complex fx.Node into IRObject
-        
+
         The val is usually from a node's input or output, can be fx.Node nested
         by tuple/list/dict type, or a fx.Node itself.
 
@@ -268,7 +270,7 @@ class FxModuleParser:
                 frame.add_attr(tensor, concrete_value, node.target)
             # the case that the parameter is consumed multiple times and regisetered previously
             else:
-                frame.set_var(node.name, exist_tensor)            
+                frame.set_var(node.name, exist_tensor)
         else:
             assert not isinstance(concrete_value, torch.Tensor), f"GetAttrPrim: unexpected parameter"
             frame.set_var(node.name, concrete_value)

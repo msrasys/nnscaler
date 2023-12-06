@@ -207,7 +207,7 @@ def _prepare_and_check_reusable(
     reusable = False
     if reuse == ReuseType.ALL:
         trace_meta_files = [
-            outdir / FxModuleParser.ATTR_CONTENT_FILE,
+            outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
             outdir / FxModuleParser.ATTR_MAP_FILE,
         ]
         # check if the module is already generated
@@ -216,7 +216,13 @@ def _prepare_and_check_reusable(
         expected_output_files.append(outdir / ParallelModule.COMPUTE_CONFIG_FILE)
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
-        existing_output_files = [f for f in outdir.glob('*') if f.is_file()]
+        existing_output_files = [
+            f for f in outdir.glob('*')
+            if f.is_file() and (  # just take fullmap.pt.0 to compare
+                not f.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
+                or f.name == FxModuleParser.ATTR_CONTENT_FILE_0
+            )
+        ]
         if existing_output_files:
             if all([output_file.exists() for output_file in expected_output_files]) \
                 and len(existing_output_files) == len(expected_output_files) \

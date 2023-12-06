@@ -22,8 +22,8 @@ class Frame:
         This should only be called when stepping in a module or method.
 
         Args:
-            inherit_from_top (bool): 
-                whether to make all already defined variables in the top frame 
+            inherit_from_top (bool):
+                whether to make all already defined variables in the top frame
                 accessible to the evaluation procedure
                 (e.g. references to such variables won't cause VarNotFound exception).
         """
@@ -55,7 +55,7 @@ class Frame:
                 and link the name of the argument name from the callee function
                 to the names of the argument passed-in.
         """
-        
+
         if not isinstance(var_name, str):
             raise RuntimeError("Expected var_name is str")
         if var_name in self._vars[-1]:
@@ -76,12 +76,12 @@ class Frame:
                 self._vars[-1][var_name] = val
         else:
             raise ValueError("graph_arg (int) must be >= 0")
-        
+
     def set_var(self, var_name: str, val: Any):
         """
         Reset a variable with arbitrary value.
         If `var_name` doesn't exist, will create a new one
-        
+
         @param var_name str: variable name
         @param val Any
         """
@@ -129,15 +129,16 @@ class Frame:
         """
         Save attribute content into file.
         """
+        #TODO: use FxModuleParser.ATTR_CONTENT_FILE_FORMAT to name the files.
         params_per_part = 1024 * 1024 * 1024 # 1 billion per part
         total_size = sum([val.numel() for _, (_, val) in self._attr_map.items()])
         model_pt_part_num = (total_size + params_per_part - 1) // params_per_part
 
         tid2value = {t.tid: val.cpu() for t, (_, val) in self._attr_map.items()}
-        if model_pt_part_num == 1:
+        # it can be zero if there is no param in the module (self._attr_map is empty)
+        if model_pt_part_num <= 1:
             torch.save(tid2value, f'{save_file}.0')
         else:
-            assert model_pt_part_num > 1
             sorted_keys = sorted(list(tid2value.keys()))
             assert len(sorted_keys) > 0, "Empty attr map"
             chunk_size = (len(sorted_keys) + model_pt_part_num - 1) // model_pt_part_num

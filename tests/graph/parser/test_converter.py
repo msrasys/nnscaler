@@ -42,7 +42,7 @@ def test_to_graph():
         ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
         assert ir_graph is not None
         assert (Path(tempdir) / FxModuleParser.ATTR_MAP_FILE).exists()
-        assert (Path(tempdir) / FxModuleParser.ATTR_CONTENT_FILE).exists()
+        assert (Path(tempdir) / FxModuleParser.ATTR_CONTENT_FILE_0).exists()
         assert ir_graph.name == 'MyModule'
         inputs = ir_graph.inputs()
         assert len(inputs) == 2

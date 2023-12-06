@@ -9,7 +9,7 @@ def clean_generated_files():
     yield
     # try to clean generated files after each test run.
     basedir = Path('./').resolve()
-    generated_files = [FxModuleParser.ATTR_CONTENT_FILE, FxModuleParser.ATTR_MAP_FILE]
+    generated_files = [FxModuleParser.ATTR_CONTENT_FILE_0, FxModuleParser.ATTR_MAP_FILE]
     for f in generated_files:
         f = basedir / f
         if f.exists():

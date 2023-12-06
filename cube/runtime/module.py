@@ -473,7 +473,7 @@ class ParallelModule(CubeModule):
 
         module_file = Path(sys.modules[self.__module__].__file__)
         if init_params:
-            self.load_attr_content(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE}"))
+            self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
         self._dist_param_map = torch.load(module_file.with_name(f"{FxModuleParser.ATTR_MAP_FILE}"))
         self._compute_config = torch.load(module_file.with_name(f"{self.COMPUTE_CONFIG_FILE}"))
 
