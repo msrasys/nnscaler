@@ -112,6 +112,8 @@ class SignFx2Op:
         __ftemplate('nll_loss') : function.NLLLoss,
         'torch.functional.norm': function.Norm,
         __ftemplate('layer_norm'): function.LayerNorm,
+        __ftemplate('scaled_dot_product_attention'): function.ScaledDotProductAttention,
+        __fcntemplate('scaled_dot_product_attention'): function.ScaledDotProductAttention,
 
         # ============== runtime function =================
         __tttemplate('size'): function.Size,

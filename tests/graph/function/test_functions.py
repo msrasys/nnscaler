@@ -213,3 +213,8 @@ def test_Unsqueeze():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> a 1 b'
     op = F.Unsqueeze(IRTensor([2, 4]), -1)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> a b 1'
+
+
+def test_ScaledDotProductAttention():
+    op = F.ScaledDotProductAttention(IRTensor([8, 128, 64]), IRTensor([8, 256, 64]), IRTensor([8, 256, 32]), None, 0.05)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a e d^, a b^ d^, a b^ c -> a e c'

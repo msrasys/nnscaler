@@ -1991,3 +1991,29 @@ def Is(input, other, signature=None):
 def IsNot(input, other, signature=None):
     assert not isinstance(input, IRObject) and not isinstance(other, IRObject)
     return input is not other
+
+
+def ScaledDotProductAttention(query, key, value, attn_mask=None, dropout_p=0.0,
+                              is_causal=False, signature = None, **kwargs):
+    """
+    torch.nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False)
+
+    For a common attention, the generated anno is like (a e d^, a b^ d^, a b^ c -> a e c).
+    """
+    if not isinstance(query, IRTensor) or not isinstance(key, IRTensor) or not isinstance(value, IRTensor):
+        raise RuntimeError(f'query: {query}, key: {key}, value: {value} should be IRTensor, something went wrong.')
+    if attn_mask is not None:
+        raise RuntimeError(f'Only support attn_mask is None in scaled_dot_product_attention now.')
+    gener = iter(string.ascii_lowercase)
+    value_anno = ShapeAnno.create_shape_str(value.shape, iterator=gener)
+    value_anno[-2] += '^'
+    key_anno = copy.copy(value_anno)
+    key_anno[-1] = next(gener) + '^'
+    query_anno = copy.copy(key_anno)
+    query_anno[-2] = next(gener)
+    out_anno = copy.copy(query_anno)
+    out_anno[-1] = value_anno[-1]
+
+    anno = OpAnno.create_op_str([query_anno, key_anno, value_anno], [out_anno])
+    return IRDimops(ScaledDotProductAttention, 'scaled_dot_product_attention', signature, [anno], [query, key, value],
+                    attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, **kwargs)
