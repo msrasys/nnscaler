@@ -170,16 +170,9 @@ class OperatorPatcher:
     def __init__(self, use_operator_patch: bool, operator_patch_backlist: List[str]):
         self.use_operator_patch = use_operator_patch
         self.operator_patch_backlist = operator_patch_backlist
-        self.function_cache: Dict[int, Callable] = {}
-        self.function_cache_orig: Dict[int, Callable] = {}
 
     def patch_inner(self, func):
-        if _orig_isinstance(func, torch.nn.Module):
-            return self.patch_inner_helper(func)    # better not cache this
-        if id(func) not in self.function_cache:
-            self.function_cache[id(func)] = self.patch_inner_helper(func)
-            self.function_cache_orig[id(func)] = func
-        return self.function_cache[id(func)]
+        return self.patch_inner_helper(func)
 
     def patch_inner_helper(self, func):
         if not hasattr(func, '__module__') or func.__module__ is None or func.__module__.startswith('torch'):
