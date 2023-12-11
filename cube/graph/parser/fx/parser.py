@@ -133,7 +133,7 @@ class FxModuleParser:
                     raise TypeError(f"only support dict type with str key, but got {meta.keys()}.\n{node}")
                 return {key : meta2var(value) for key, value in meta.items()}
             # TODO: data type check, with cases like {'a': 1.2, 'b': torch.Tensor}
-            return meta
+            return IRObject(name=node.name, value=meta)
 
         if hasattr(node, 'meta') and node.meta.get('tensor_meta'):
             meta = node.meta['tensor_meta']

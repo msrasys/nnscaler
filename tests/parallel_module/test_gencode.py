@@ -356,34 +356,68 @@ def test_codegen_training_flag():
 #         assert False
 
 
-# class IterModule(torch.nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.linear = torch.nn.Linear(3, 5)
+class IterModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(3, 5)
 
-#     def forward(self, x):
-#         x = self.linear(x)
-#         assert list(x.shape) == [2, 5]  # will generate iter here.
-#         return x
+    def forward(self, x):
+        x = self.linear(x)
+        assert list(x.shape) == [2, 5]  # will generate iter here.
+        return x
 
 
-# def test_codegen_iter():
-#     """
-#     Test it can support modules without parameters
-#     """
-#     if not torch.cuda.is_available():
-#         print('skip test_codegen_iter due to lack of cuda devices')
-#         return
-#     with tempfile.TemporaryDirectory() as tempdir:
-#         m = IterModule()
-#         m.train()
-#         parallelize(
-#             m,
-#             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
-#             PASData,
-#             ComputeConfig(1, 1),
-#             dynamic_shape=True,
-#             cube_savedir=tempdir,
-#             load_module=False
-#         )
-#         assert False
+def test_codegen_iter():
+    """
+    Test it can support modules without parameters
+    """
+    if not torch.cuda.is_available():
+        print('skip test_codegen_iter due to lack of cuda devices')
+        return
+    with tempfile.TemporaryDirectory() as tempdir:
+        m = IterModule()
+        m.train()
+        # assert no exception raised below
+        parallelize(
+            m,
+            {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+            PASData,
+            ComputeConfig(1, 1),
+            dynamic_shape=True,
+            cube_savedir=tempdir,
+            load_module=False
+        )
+
+
+class ConstantModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(3, 5)
+
+    def forward(self, x):
+        x = self.linear(x)
+        y = int(x.shape[-1])
+        x = x[:, :y]
+        return x
+
+
+def test_codegen_const():
+    """
+    Test it can support modules without parameters
+    """
+    if not torch.cuda.is_available():
+        print('skip test_codegen_iter due to lack of cuda devices')
+        return
+    with tempfile.TemporaryDirectory() as tempdir:
+        m = ConstantModule()
+        m.train()
+        parallelize(
+            m,
+            {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+            PASData,
+            ComputeConfig(1, 1),
+            dynamic_shape=True,
+            cube_savedir=tempdir,
+            load_module=False
+        )
+        assert not _gencode_contains(tempdir, ConstantModule, 0, r'\s+5 = builtins.int')
