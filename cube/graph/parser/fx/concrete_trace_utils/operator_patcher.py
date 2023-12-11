@@ -193,6 +193,7 @@ class OperatorPatcher:
             return func
 
         lines, lnum = inspect.findsource(func_inner)
+        func_name = getattr(func, '__name__', 'new_func')
         # align with original source code
         source = ''.join(('\n' * lnum, *inspect.getblock(lines[lnum:])))
         dedent_src = dedent(source)
@@ -218,7 +219,7 @@ class OperatorPatcher:
                 ),
                 *body0.body
             ]
-            body0.name = 'new_func'
+            body0.name = func_name
             # for deleting some annotations like 'add_start_docstrings_to_model_forward' or 'add_code_sample_docstrings'
             # these decorators are used for tranformers model docstrings generation, can be removed in trace
             transform_useless_decorators = ('add_start_docstrings_to_model_forward', 'add_code_sample_docstrings', 'replace_return_docstrings')
@@ -251,9 +252,9 @@ class OperatorPatcher:
                     },
                     var_dict)
                 if the_self is not None:
-                    return var_dict['new_func'].__get__(the_self)
+                    return var_dict[func_name].__get__(the_self)
                 else:
-                    return var_dict['new_func']
+                    return var_dict[func_name]
             finally:
                 if sys.version_info < (3, 9):
                     setattr(builtins, 'tuple', tuple_wrapped)

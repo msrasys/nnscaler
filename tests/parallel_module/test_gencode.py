@@ -254,6 +254,8 @@ def test_codegen_attr():
             cube_savedir=tempdir,
             load_module=False
         )
+        # in old version, all 'forward' functions will patched to a function named 'new_func'
+        assert not _gencode_contains(tempdir, AttrModule, 0, r'new_func')
         assert _gencode_contains(tempdir, AttrModule, 0, r'builtins.getattr\(.*, \'a\'\)')
         assert m_new is None
 
@@ -406,7 +408,7 @@ def test_codegen_const():
     Test it can support modules without parameters
     """
     if not torch.cuda.is_available():
-        print('skip test_codegen_iter due to lack of cuda devices')
+        print('skip test_codegen_const due to lack of cuda devices')
         return
     with tempfile.TemporaryDirectory() as tempdir:
         m = ConstantModule()
