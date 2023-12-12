@@ -1787,13 +1787,21 @@ def CompareNE(input, other, *, out=None, signature = None):
     return _comparison(CompareNE, operator.eq, 'ne', signature, input, other)
 
 
-def Max(input, other_or_dim=None, out_or_keepdim=None, *, out=None, signature = None):
+def Max(input, other_or_dim=None, out_or_keepdim=None, *, out=None, signature = None, **kwargs):
     """
     torch.max(input)
     torch.max(input, dim, keepdim=False, *, out=None)
     torch.max(input, other, *, out=None)
     """
     signature = 'cube.runtime.function.max_'
+    if 'dim' in kwargs:
+        other_or_dim = kwargs['dim']
+    if 'keepdim' in kwargs:
+        assert 'out' not in kwargs, f'out and keepdim cannot be both specified, get {kwargs}'
+        out_or_keepdim = kwargs['keepdim']
+    if 'out' in kwargs:
+        assert 'keepdim' not in kwargs, f'out and keepdim cannot be both specified, get {kwargs}'
+        out_or_keepdim = kwargs['out']
     if other_or_dim is None:
         edim_in = [s + '^' for s in ShapeAnno.create_shape_str(input.shape)]
         annos = [OpAnno.create_op_str([edim_in], ['1'])]

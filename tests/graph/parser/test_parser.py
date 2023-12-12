@@ -66,3 +66,25 @@ def test_parser_nested_inputs():
     assert len(ir_graph.outputs()) == 1
     assert isinstance(ir_graph.output(0), dict)
     assert isinstance(ir_graph.output(0)['loss'], IRTensor)
+
+
+def test_max():
+
+    class MyModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, x):
+            return torch.max(x, dim=1, keepdim=True)[0]
+
+    dummy_input = {'x': torch.randn(4, 1024)}
+    module = MyModule()
+    fx_graph = to_fx_graph(module, dummy_input)
+
+    print(fx_graph.graph)
+    with tempfile.TemporaryDirectory() as tempdir:
+        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
+        print(ir_graph.extra_repr())
+
+    assert isinstance(ir_graph.output(0), IRTensor)
+    assert ir_graph.output(0).shape == (4, 1)
