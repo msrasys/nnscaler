@@ -269,12 +269,31 @@ def collect_split_info(node: IRFwOperation):
 
     return split_info
 
-def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
+def gen_partitions(node: IRFwOperation, ngpus: int, base: int = 2, depth: int = -1) -> List[IRFwOperation]:
     """
+    Generate the partitioned nodes of the given node. Each node in the returned list is an
+    partition instance of a policy. For example, if the input node is a matmul with shape
+    (1024, 4096), (4096, 2048) -> (1024, 2048), the ngpus is 2, base is 2, then the returned
+    list will contain 4 instances:
+        1. matmul with shape (1024, 4096), (4096, 2048) -> (1024, 2048)
+        2. matmul with shape (1024, 2048), (2048, 2048) -> (1024, 2048)
+        3. matmul with shape ( 512, 4096), (4096, 2048) -> ( 512, 2048)
+        4. matmul with shape (1024, 4096), (4096, 1024) -> (1024, 1024)
+
+    Args:
+        node (IRFwOperation): the node to be partitioned
+        ngpus (int): the number of gpus
+        base (int): the base of the division for the partitioning
+        depth (int): the maximum depth of the search process, -1 for no limit
+
     Returns:
         List[IRFwOperation]: the partitioned nodes. Each element of the list represents the (identical) sub-operator
             of one partition option.
     """
+    if base < 1:
+        raise ValueError(f"base must be positive, got {base}")
+    if base == 1:
+        return [node]
 
     def gen_hash(node: IRFwOperation) -> str:
         ret = node.signature
@@ -285,38 +304,44 @@ def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
 
     dq = deque()
     visited = set()
-    dq.append((node, ngpus))
+    dq.append((node, ngpus, 0))
     visited.add(gen_hash(node))
 
     gen_nodes = []
 
     while dq:
-        cur_node, cur_ngpus = dq.popleft()
+        cur_node, cur_ngpus, cur_depth = dq.popleft()
         gen_nodes.append(cur_node)
+        if depth != -1 and cur_depth >= depth:
+            continue
         split_info = collect_split_info(cur_node)
 
         for key, val in split_info.items():
             idx_1st, dim_1st, _ = val
             dim_size = cur_node.anno.getlen(key)
 
-            # TODO(yizhu1): only consider powers of 2 currently
-            split_deg = 2
+            split_deg = base
             while split_deg <= dim_size and split_deg <= cur_ngpus:
                 if dim_size % split_deg != 0:
                     break
+                if cur_ngpus % split_deg != 0:
+                    break
 
                 new_nodes = cur_node.algorithms('dim').instantiate(idx=idx_1st, dim=dim_1st, num=split_deg)
+                # instantiate may return None if the partition is not possible
+                if new_nodes is None:
+                    break
                 new_node = new_nodes[0]
                 new_ngpus = cur_ngpus // split_deg
 
                 cur_key = gen_hash(new_node)
 
-                split_deg = split_deg * 2
+                split_deg = split_deg * base
 
                 if cur_key in visited:
                     continue
 
-                dq.append((new_node, new_ngpus))
+                dq.append((new_node, new_ngpus, cur_depth + 1))
                 visited.add(cur_key)
 
     return gen_nodes
