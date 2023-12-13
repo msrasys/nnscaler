@@ -17,9 +17,6 @@ _orig_module_getattribute: Callable = torch.nn.Module.__getattribute__
 
 _orig_agfunc_apply: Callable = torch.autograd.function.Function.apply
 _orig_torch_assert: Callable = torch._assert
-_orig_torch_no_grad: Callable = torch.no_grad
-_orig_torch_no_grad_enter: Callable = torch.no_grad.__enter__
-_orig_torch_no_grad_exit: Callable = torch.no_grad.__exit__
 
 _orig_type: Callable = builtins.type
 _orig_isinstance: Callable = builtins.isinstance

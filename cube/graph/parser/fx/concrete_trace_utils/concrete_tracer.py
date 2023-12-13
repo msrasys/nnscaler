@@ -89,9 +89,6 @@ from .utils import (
 
     _orig_agfunc_apply,
     _orig_torch_assert,
-    _orig_torch_no_grad,
-    _orig_torch_no_grad_enter,
-    _orig_torch_no_grad_exit,
 
     _orig_type,
     _orig_isinstance,
@@ -380,7 +377,7 @@ class ConcreteTracer(TracerBase):
                     result = result.cpu()
                 elif isinstance(result, (list, dict, tuple)):
                     result = tree_map(to_cpu, result)
-                elif isinstance(result, (int, bool, torch.device, torch.dtype, _orig_torch_no_grad)) or result is None:
+                elif isinstance(result, (int, bool, torch.device, torch.dtype)) or result is None:
                     # avoid too noisy warning
                     pass
                 else:
@@ -965,18 +962,6 @@ class ConcreteTracer(TracerBase):
                 condition = condition.value
             return _orig_torch_assert(condition, message)
 
-        @functools.wraps(_orig_torch_no_grad)
-        def torch_no_grad_wrapper():
-            return self.create_proxy('call_function', _orig_torch_no_grad, (), {})
-
-        @functools.wraps(_orig_torch_no_grad_enter)
-        def torch_no_grad_enter_wrapper(no_grad):
-            return self.create_proxy('call_function', _orig_torch_no_grad_enter, (no_grad,), {})
-
-        @functools.wraps(_orig_torch_no_grad_exit)
-        def torch_no_grad_exit_wrapper(no_grad, exc_type, exc_value, traceback):
-            return self.create_proxy('call_function', _orig_torch_no_grad_exit, (no_grad, exc_type, exc_value, traceback,), {})
-
         self.agfunc_dict: dict[Type, Any] = {}
         self.autowrap_leaf_pairs = {
             id(_orig_torch_assert): torch_assert_wrapper,
@@ -1114,11 +1099,6 @@ class ConcreteTracer(TracerBase):
                 self.patcher.patch_method(torch.nn.Module, "__call__", module_call_wrapper, deduplicate=False)
                 self.patcher.patch_method(torch.autograd.Function, "apply", agfunc_apply_wrapper, deduplicate=False)
                 self.patcher.patch_method(torch, "_assert", torch_assert_wrapper, deduplicate=False)
-                # if class member functions and the class need to be wrapped together,
-                # wrap the member functions before wrap the class.
-                self.patcher.patch_method(_orig_torch_no_grad, "__enter__", torch_no_grad_enter_wrapper, deduplicate=False)
-                self.patcher.patch_method(_orig_torch_no_grad, "__exit__", torch_no_grad_exit_wrapper, deduplicate=False)
-                self.patcher.patch_method(torch, "no_grad", torch_no_grad_wrapper, deduplicate=False)
 
                 self.patcher.patch_method(builtins, "map", map_wrapper, deduplicate=False)
                 self.patcher.patch_method(builtins, "enumerate", enumerate_wrapper, deduplicate=False)
@@ -1510,9 +1490,6 @@ def _retain_weight_consistency(root: torch.nn.Module):
 
 @functools.wraps(_orig_node_is_impure)
 def node_is_impure_wrapper(node):
-    if is_useless_no_grad_node(node):
-        return False
-
     if node.op in {"placeholder", "output"}:
         return True
 
@@ -1532,18 +1509,6 @@ def node_is_impure_wrapper(node):
         ), f"Did not find expected submodule target {node.target}"
         return getattr(target_mod, "_is_impure", False)
 
-    return False
-
-def is_useless_no_grad_node(node: Node):
-    # keep the no_gard related nodes, but except useless situation: no node between __enter__ and __exit__
-    if node.op == 'call_function':
-        if node.target is _orig_torch_no_grad_exit:
-            if node.prev.target is _orig_torch_no_grad_enter and node.prev.prev.target is _orig_torch_no_grad:
-                setattr(node.prev, '_is_impure', False)
-                setattr(node.prev.prev, '_is_impure', False)
-                return True
-        if node.target is _orig_torch_no_grad_enter or node.target is _orig_torch_no_grad:
-            return not getattr(node, '_is_impure', True)
     return False
 
 def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
@@ -1752,9 +1717,6 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
             default_extra_side_effectful_functions = {
                 operator.setitem,
                 builtins.next,
-                _orig_torch_no_grad,
-                _orig_torch_no_grad_enter,
-                _orig_torch_no_grad_exit,
             }
             extra_side_effectful_functions = default_extra_side_effectful_functions | dce_ignored_function
             with _Patcher() as patcher, ExtraSEFPatcher(extra_side_effectful_functions):

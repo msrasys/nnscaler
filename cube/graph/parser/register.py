@@ -56,7 +56,7 @@ class CustomizedOps:
         Returns:
             None
         """
-        builtins = ['_operator', 'torch', 'cube.runtime.function']
+        builtins = ['_operator.', 'torch.', 'cube.runtime.function.']
         if any(signature.startswith(builtin) for builtin in builtins):
             raise RuntimeError(f"Cannot register operators with signature starting from any of {builtins}")
         assert signature not in CustomizedOps.kOpMap, f"function {signature} is already registered"
