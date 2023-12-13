@@ -20,12 +20,14 @@ def test_handle_broadcast_multi():
     assert ins_anno[2] == ['a', 'b', 'c']
     assert out_anno == ['a', 'b', 'c']
 
+
 def test_Full():
     op = F.Full([1, 2, 3], 1.)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 1 2 3'
 
     op = F.Full([], 1.)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 1'
+
 
 def test_Expand():
     inp = IRTensor([10, 1])
@@ -148,6 +150,7 @@ def test_Where():
     op = F.Where(IRTensor([3, 4]), 1, 2)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b, ?, ? -> a b'
 
+
 def test_FullSlice():
     op = F.FullSlice(IRTensor([2, 3, 4]), (1, 2, 3))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> 1'
@@ -157,6 +160,11 @@ def test_FullSlice():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> 2'
     op = F.FullSlice(IRTensor([2, 3, 4]), (1, 2, slice(1, 10, 1)))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> 3'
+    with pytest.raises(RuntimeError):
+        op = F.FullSlice(IRTensor([2, 3, 4]), (IRTensor([1, 2, 3]),))
+    with pytest.raises(RuntimeError):
+        op = F.FullSlice(IRTensor([2, 3, 4]),(slice(1, IRTensor([2]), 3),))
+
 
 def test_GetItem():
     op = F.GetItem(IRTensor([4, 2]), IRTensor([3, 5], dtype=torch.int64))
@@ -168,6 +176,7 @@ def test_GetItem():
     op = F.GetItem(IRTensor([3, 4, 2]), IRTensor([3, 5], dtype=torch.int64))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c, d e -> d e b c'
 
+
 def test_Max():
     op = F.Max(IRTensor([2, 3, 4]))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> 1'
@@ -177,6 +186,7 @@ def test_Max():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c -> a 1 c, a 1 c'
     op = F.Max(IRTensor([2, 3, 4]), 1, False)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c -> a c, a c'
+
 
 def test_Squeeze():
     op = F.Squeeze(IRTensor([2, 1, 4, 1]))

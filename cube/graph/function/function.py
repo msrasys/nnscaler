@@ -1472,7 +1472,13 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice, int]], signatu
     edim_in = ShapeAnno.create_shape_str(tensor.shape)
     edim_ou = []
     in_idx = 0
+    tensor_error_msg = ("Tensor is not supported in slice. "
+        + "If the tensor is scalar type, you can conver it to int by tensor.item() or int(), then use it to index. "
+        + "If the tensor is not scalar type, you may need to wrap related logic in a Customized Op."
+    )
     def obj_helper(obj):
+        if isinstance(obj, IRTensor):
+            raise RuntimeError(tensor_error_msg)
         if isinstance(obj, IRObject):
             return obj.value
         else:
@@ -1497,8 +1503,10 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice, int]], signatu
             else:
                 edim_ou.append(str(dimlen))
             in_idx += 1
+        elif isinstance(slicer, IRTensor):
+            raise RuntimeError(tensor_error_msg)
         else:
-            raise RuntimeError(f"Unsupported slicer {slicer}")
+            raise RuntimeError(f"Unsupported slicer {slicer}. you may need to wrap related logic in a Customized Op.")
     edim_ou += edim_in[in_idx:]
     # special case for scalar = torch.Tensor([1,2,3])[0]
     if len(edim_ou) == 0:

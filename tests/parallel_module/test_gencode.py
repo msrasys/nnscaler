@@ -423,3 +423,57 @@ def test_codegen_const():
             load_module=False
         )
         assert not _gencode_contains(tempdir, ConstantModule, 0, r'\s+5 = builtins.int')
+
+
+class TensorSliceModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(3, 5)
+
+    def forward(self, x):
+        x = self.linear(x)
+        padding = torch.count_nonzero(x)
+        return x[:, :padding]
+
+
+class TensorSliceFixedModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(3, 5)
+
+    def forward(self, x):
+        x = self.linear(x)
+        padding = torch.count_nonzero(x).item()
+        return x[:, :padding]
+
+
+def test_codegen_tensor_slice():
+    if not torch.cuda.is_available():
+        print('skip test_codegen_tensor_slice due to lack of cuda devices')
+        return
+    with tempfile.TemporaryDirectory() as tempdir:
+        m = TensorSliceModule()
+        m.train()
+        with pytest.raises(RuntimeError, match='Tensor is not supported in slice.'):
+            parallelize(
+                m,
+                {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+                PASData,
+                ComputeConfig(1, 1),
+                dynamic_shape=True,
+                cube_savedir=tempdir,
+                load_module=False,
+                reuse='none',
+            )
+        m = TensorSliceFixedModule()
+        m.train()
+        parallelize(
+            m,
+            {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+            PASData,
+            ComputeConfig(1, 1),
+            dynamic_shape=True,
+            cube_savedir=tempdir,
+            load_module=False,
+            reuse='none',
+        )
