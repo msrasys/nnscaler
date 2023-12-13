@@ -726,6 +726,10 @@ class IRAdapterGener:
             # by default follow producer transformation strategy
             ptensors = graph.ptensors(ftensor)
             if len(ptensors) > 0:
+                # In order to generate correct adapters for multiref, we need to
+                # ensure Multirefs below is ordered by devices, which is aligned
+                # with consumer operators. As a result, we sort the ptensors here.
+                ptensors = sorted(ptensors, key=lambda t: t.device[0])
                 for tensor in ptensors:
                     mr = MultiRef(tensor, len(multiref.outputs()))
                     mr.input(0).grad = tensor.grad
