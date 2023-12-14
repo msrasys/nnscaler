@@ -22,30 +22,51 @@ _logger = logging.getLogger(__name__)
 
 class ScheduleCodeGen(FuncEmission):
 
-    def __init__(self, execplan: ExecutionPlan, scale_ndevs: Optional[int] = None):
+    def __init__(
+        self,
+        execplan: ExecutionPlan,
+        runtime_ndevs: Optional[int] = None,
+        *,
+        scale_ndevs: Optional[int] = None,
+    ):
         """
-        Create Module code generator
+        Create a schedule code generator
 
-        @param execplan ExecutionPlan
-        @param scale_ndevs Optional[int]: scale to number of devices
+        Args:
+            execplan (ExecutionPlan): execution plan
+            runtime_ndevs (Optional[int]): the number of devices in runtime
+            scale_ndevs (Optional[int]): Deprecated. Use `runtime_ndevs` instead
         """
         self.execplan = execplan
         self.devices: Tuple[int] = tuple(sorted(execplan.graph.device))
+        if self.devices != tuple(range(len(self.devices))):
+            raise ValueError(f'device must be consecutive')
+
+        if scale_ndevs is not None:
+            _logger.warning("scale_ndevs is deprecated, please use runtime_ndevs instead")
+            if runtime_ndevs is not None:
+                raise ValueError("You cannot use runtime_ndevs and scale_ndevs at the same time")
+        self.runtime_ndevs: int = runtime_ndevs or scale_ndevs or len(self.devices)
+        # we will scale the graph as data parallelism
+        # when we have more devices than the number of devices used in the graph
+        # here we don't need to do anything as things are already done in ModuleCodeGen.
+        if self.runtime_ndevs % len(self.devices) != 0:
+            raise ValueError(f'runtime_ndevs must be a multiple of {len(self.devices)}')
+        self.enable_dp = self.runtime_ndevs > len(self.devices)
+
         # model full code
         self.init_code: List[str] = [
             '\n\n########## Generated Schedule Code ###########',
             'import torch', 'import cube', '']
         # module member name
         self.symbols = SymbolTable()
-        self._scale_to_ndevs = scale_ndevs
 
     def gen(self, device: int, outfile=None, attach=None) -> str:
         """
         Generate scheduling code on device
         """
         gencode = copy.copy(self.init_code)
-        device_map = device if self._scale_to_ndevs is None else \
-            device % len(self.devices)
+        device_map = device % len(self.devices)
         device_nodes = self.execplan.seq(device_map)
 
         assert all(not isinstance(n, IRFwOperation) for n in device_nodes), \

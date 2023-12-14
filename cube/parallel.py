@@ -438,9 +438,8 @@ def _gencode(
 
     # code generation
     torch.save(compute_config, outdir / ParallelModule.COMPUTE_CONFIG_FILE)
-    runtime_ngpus = None if compute_config.plan_ngpus == compute_config.runtime_ngpus else compute_config.runtime_ngpus
     assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
-    mgener = ModuleCodeGen(execplan, scale_ndevs=runtime_ngpus)
+    mgener = ModuleCodeGen(execplan, compute_config.runtime_ngpus)
     for rank in range(compute_config.runtime_ngpus):
         mgener.gen(rank,
             forward_args=forward_args,

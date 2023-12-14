@@ -79,17 +79,40 @@ class ModuleCodeGen(FuncEmission):
         ```
     """
 
-    def __init__(self, execplan: ExecutionPlan, scale_ndevs: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        execplan: ExecutionPlan,
+        runtime_ndevs: Optional[int] = None,
+        *,
+        scale_ndevs: Optional[int] = None
+    ) -> None:
         """
         Create Module code generator
 
-        @param execplan ExecutionPlan
-        @param scale_ndevs Optional[int]: scale to number of devices
+        Args:
+            execplan (ExecutionPlan): execution plan
+            runtime_ndevs (Optional[int]): the number of devices in runtime
+            scale_ndevs (Optional[int]): Deprecated. Use `runtime_ndevs` instead
         """
-
         super().__init__()
         self.execplan: ExecutionPlan = execplan
         self.devices: Tuple[int] = tuple(sorted(execplan.graph.device))
+        if self.devices != tuple(range(len(self.devices))):
+            raise ValueError(f'device must be consecutive')
+
+        if scale_ndevs is not None:
+            _logger.warning("scale_ndevs is deprecated, please use runtime_ndevs instead")
+            if runtime_ndevs is not None:
+                raise ValueError("You cannot use runtime_ndevs and scale_ndevs at the same time")
+        self.runtime_ndevs: int = runtime_ndevs or scale_ndevs or len(self.devices)
+        # we will scale the graph as data parallelism
+        # when we have more devices than the number of devices used in the graph
+        # we need to do two things:
+        # 1. update execplan with dp reducers (via add_scale_reducers)
+        # 2. update node devices when emitting code (via scale)
+        if self.runtime_ndevs % len(self.devices) != 0:
+            raise ValueError(f'runtime_ndevs must be a multiple of {len(self.devices)}')
+        self.enable_dp = self.runtime_ndevs > len(self.devices)
 
         self.init_code: List[str] = [
             '\n\n########## Generated Model Code ###########',
@@ -117,17 +140,14 @@ class ModuleCodeGen(FuncEmission):
         # batch size
         self.batch_size = None
         # communication groups
-        self.comm_groups: List[Tuple[int]] = self.get_comm_groups(scale_ndevs)
-        # whether to scale (with data parallelism)
-        self._scale_to_ndevs = scale_ndevs
-        if scale_ndevs is not None:
-            self.add_scale_reducers()
+        self.comm_groups: List[Tuple[int]] = self.get_comm_groups()
+        self.add_scale_reducers()
 
     def add_scale_reducers(self):
         """
         Insert reducers to for scale scenario
         """
-        if self._scale_to_ndevs is None:
+        if not self.enable_dp:
             return
         graph = self.execplan.graph
         # for each device, collect parameters in the all reducers and create a reducer for the rest
@@ -157,15 +177,13 @@ class ModuleCodeGen(FuncEmission):
             reducer.device = device  # will be scaled in `self.scale`
             self.execplan.at(device).append(reducer)
 
-    def get_comm_groups(self, scale_ndevs: Optional[int] = None):
+    def get_comm_groups(self):
         """
         Scale the communication groups to multiple devices
         using data parallelism.
 
         @warn this requires user side to setup dataloader
             for different GPUs
-
-        @param scale_ndevs Optional[int]: scale to number of devices
         """
         def _add_comm_for_group_zero(ranks):
             zero_comm_groups = []
@@ -186,17 +204,15 @@ class ModuleCodeGen(FuncEmission):
                 if len(zero_crossgroup) > 1 and len(zero_crossgroup) < len(ranks):
                     zero_comm_groups.append(zero_crossgroup)
             return zero_comm_groups
-        scale_ndevs = scale_ndevs if scale_ndevs is not None else len(self.devices)
-        assert len(self.devices) == max(self.devices) + 1, f'device must be consecutive'
-        assert scale_ndevs % len(self.devices) == 0, f'ngpus must be a multiple of {len(self.devices)}'
-        nreplica = scale_ndevs // len(self.devices)
+
+        nreplica = self.runtime_ndevs // len(self.devices)
         # scale communication groups
         graph = self.execplan.graph
         comm_groups = []
         # communication groups for parameters that are in reducers
         reducers: List[IRWeightReducer] = graph.select(ntype=IRWeightReducer)
         for reducer in reducers:
-            ranks = more_itertools.flatten(list(range(device, scale_ndevs, len(self.devices))) \
+            ranks = more_itertools.flatten(list(range(device, self.runtime_ndevs, len(self.devices))) \
                                            for device in reducer.device)
             ranks = tuple(sorted(ranks))
             comm_groups.append(ranks)
@@ -204,7 +220,7 @@ class ModuleCodeGen(FuncEmission):
             comm_groups.extend(_add_comm_for_group_zero(ranks))
         # communication groups for parameters that are outside reducers
         for device in self.devices:
-            ranks = list(range(device, scale_ndevs, len(self.devices)))
+            ranks = list(range(device, self.runtime_ndevs, len(self.devices)))
             if len(ranks) > 1:
                 comm_groups.append(ranks)
                 # add comm groups for group ZeRO
@@ -222,9 +238,9 @@ class ModuleCodeGen(FuncEmission):
                             comm_groups.append(shifted_ranks)
         return comm_groups
 
-    def scale(self, node: IRCell, ndevs: int, device: int) -> List[IRCell]:
-        assert len(self.devices) == max(self.devices) + 1, f'device must be consecutive'
-        assert ndevs % len(self.devices) == 0, f'ngpus must be a multiple of {len(self.devices)}'
+    def scale(self, node: IRCell, device: int) -> IRCell:
+        if not self.enable_dp:
+            return node
         shift = (device // len(self.devices)) * len(self.devices)
         if isinstance(node, IRAdapter):
             adapter = copy.copy(node)
@@ -247,7 +263,7 @@ class ModuleCodeGen(FuncEmission):
                 prims.append(p)
             adapter.prims = prims
             if node.isfw() and node.differentiable and node.custom:
-                badapter = self.scale(node.mirror, ndevs, device)
+                badapter = self.scale(node.mirror, device)
                 IRCell.make_pair(adapter, badapter)
             return adapter
         if isinstance(node, IRWeightReducer):
@@ -256,11 +272,11 @@ class ModuleCodeGen(FuncEmission):
             ranks = list(node.device)
             scale_ranks = []
             for rank in ranks:
-                scale_ranks += list(range(rank, ndevs, len(self.devices)))
+                scale_ranks += list(range(rank, self.runtime_ndevs, len(self.devices)))
             reducer.device = sorted(scale_ranks)
             return reducer
         if isinstance(node, IRSegment) and node.isfw():
-            nodes = [self.scale(n, ndevs, device) for n in node.nodes()]
+            nodes = [self.scale(n, device) for n in node.nodes()]
             segment = IRSegment(nodes, node.inputs(), node.outputs(), node.name)
             segment._id = node.cid
             return segment
@@ -366,8 +382,7 @@ class ModuleCodeGen(FuncEmission):
         node_args: List[List[str]] = list()
         gen_nodes: List[IRCell] = list()
 
-        device_map = device if self._scale_to_ndevs is None else \
-            device % len(self.devices)
+        device_map = device % len(self.devices)
         sequence = self.execplan.seq(device_map)
         unrolled_seqs = []
         for node in sequence:
@@ -378,9 +393,7 @@ class ModuleCodeGen(FuncEmission):
         sequence = tuple(dict.fromkeys(unrolled_seqs))
 
         # scale to multiple devices
-        if self._scale_to_ndevs is not None:
-            sequence = [self.scale(node, self._scale_to_ndevs, device) \
-                        for node in sequence]
+        sequence = [self.scale(node, device) for node in sequence]
 
         # init customized adapter
         fsegments = [node for node in sequence if isinstance(node, IRSegment) and node.isfw()]
