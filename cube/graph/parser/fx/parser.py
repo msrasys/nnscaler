@@ -311,13 +311,14 @@ class FxModuleParser:
         """
         The target field of call_method node must be a string.
         """
-        assert isinstance(node_target, str)
+        if not isinstance(node_target, str):
+            raise ValueError(f'node_target must be a string, but got {type(node_target)} with value {node_target}')
         for module, module_name in [(torch, 'torch'), (torch.Tensor, 'torch.Tensor')]:
             lib_func = getattr(module, node_target, None)
             if lib_func is not None and callable(lib_func):
                 return f'{module_name}.{node_target}'
-        assert len(node.args) == 1, f'invalid args {node.args} in {node.name}, {node.target}, {node.meta}'
-        assert len(node.kwargs) == 0, f'invalid kwargs {node.kwargs} in {node.name}, {node.target}, {node.meta}'
+
+        assert len(node.args) > 0, 'Expect an object as the first argument of call_method'
         # example node.args[0].meta is {'type': <class 'dict'>}
         in_type = node.args[0].meta['type']
         assert node_target in in_type().__dir__(), f'node_target = {node_target}, in_type().__dir__() = {in_type().__dir__()}'

@@ -4,7 +4,8 @@ import tempfile
 import torch
 import pytest
 
-from cube.parallel import parallelize, ComputeConfig, CubeModule
+import cube.graph.function.dimops
+from cube.parallel import parallelize, ComputeConfig, CubeModule, _gen_graph
 
 from .common import PASData, init_distributed, PASRandomSPMD
 from ..launch_torchrun import launch_torchrun
@@ -477,3 +478,59 @@ def test_codegen_tensor_slice():
             load_module=False,
             reuse='none',
         )
+
+
+class DictGetModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, batched_data: dict):
+        data_x = batched_data["x"]
+        data_y = batched_data.get("y", batched_data['z'])
+        return data_x + data_y
+
+
+def test_codegen_dictget():
+    if not torch.cuda.is_available():
+        print('skip test_codegen_dictget due to lack of cuda devices')
+        return
+
+    with tempfile.TemporaryDirectory() as tempdir:
+        m_new = parallelize(
+            DictGetModule(),
+            {'batched_data': {
+                'x': torch.tensor([[[1.0], [2.0], [3.0], [6.0]]]),
+                'z': torch.tensor([[[1.0], [2.0], [3.0], [6.0]]])
+            }},
+            PASRandomSPMD,
+            ComputeConfig(2, 2),
+            dynamic_shape=True,
+            cube_savedir=tempdir,
+            load_module=False,
+        )
+        assert _gencode_contains(tempdir, DictGetModule, 0, r"dict.get\(\w+, 'y', \w+\)")
+        assert _gencode_contains(tempdir, DictGetModule, 1, r"dict.get\(\w+, 'y', \w+\)")
+        assert m_new is None
+
+
+class CloneModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return x.clone()
+
+
+def test_codegen_clone():
+    if not torch.cuda.is_available():
+        print('skip test_codegen_clone due to lack of cuda devices')
+        return
+
+    with tempfile.TemporaryDirectory() as tempdir:
+        g, _ = _gen_graph(
+            CloneModule(),
+            {'x': torch.tensor([1.0, 2.0, 3.0, 6.0])},
+            tempdir,
+            True
+        )
+        assert isinstance(g.nodes()[0], cube.graph.function.dimops.IRDimops)

@@ -140,7 +140,7 @@ class SignFx2Op:
         __ttemplate('tensor'): function.NewTensor,
         __ttemplate('full'): function.Full,
         __ttemplate('rand'): function.Rand,
-        # __ttemplate('clone'): function.Clone,
+        __ttemplate('clone'): function.Clone,
 
         '_operator.is_': function.Is,
         '_operator.is_not': function.IsNot,
@@ -153,7 +153,7 @@ class SignFx2Op:
         '_operator.mul': function.Mul,
         '_operator.imul': function.Mul, # FIXME: may waste memory
         '_operator.mod': function.Mod,
-        
+
         __ttemplate('div') : function.Div,
         __ttemplate('true_divide'): function.Div,
         '_operator.truediv': function.Div,
@@ -178,7 +178,7 @@ class SignFx2Op:
         #
         __tttemplate('view'): function.View,
         __tttemplate('contiguous'): function.Contiguous,
-        
+
         __ttemplate('reshape'): function.Reshape,
         #
         # __ttemplate('conv2d'): function.Conv2D,
