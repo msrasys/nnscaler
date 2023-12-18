@@ -1,12 +1,13 @@
 from typing import Dict, List, Optional, Tuple, Callable, Set
 import numpy as np
 import itertools
+import logging
 
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.gener.concurrent import ConcurrentGener
 import cube.graph.gener.utils as utils
 from cube.graph.graph import IRGraph
-from cube.graph.segment import IRSegment
+from cube.graph.segment import IRSegment, CellPosition
 from cube.graph.function.pyfunc import IRPyFunc
 
 from cube.ir.cten import IRCell, IRObject
@@ -18,6 +19,8 @@ from cube.graph.function.function import Accum, Cat, MultiRef
 
 
 DeviceID = int
+
+_logger = logging.getLogger(__name__)
 
 
 def create_dummy(segment: IRSegment, inputs: bool = True, outputs: bool = True) -> List[IRFwOperation]:
@@ -108,12 +111,16 @@ class IRAdapterGener:
         """
         # reorder producer and consumer ordering
         graph._reorder_producer_consumer()
+        _logger.info("finish reordering producer and consumer")
         # remove anchor node
         graph = IRAdapterGener.remove_anchor(graph)
+        _logger.info("finish removing anchor nodes")
         # automatic replace pyfunc
         graph = IRAdapterGener.auto_pyfunc(graph)
+        _logger.info("finish replacing auto pyfunc")
         # automatic transform multiref
         graph = IRAdapterGener.autoref(graph)
+        _logger.info("finish transforming multiref nodes")
         # generate adapters for activation
         graph = IRAdapterGener.gen_activation(graph, cost_fn=cost_fn)
         # generate weight reducer
@@ -321,22 +328,29 @@ class IRAdapterGener:
     
         # local producer fusion and local consumer multiref
         ftensors = []
+        _cnt = 0
         for ftensor in graph.full_tensors():
             # backward will gen in forward
             if ftensor.is_param() or ftensor.is_grad():
                 continue
-             # flatten gradient
+            # flatten gradient
             utils.flatten_grad(graph, ftensor)
             # optimization: local fusion / multiref on producer / consumer
             ftensor = IRAdapterGener.local_producer_fusion(graph, ftensor)
             IRAdapterGener.local_consumer_multiref(graph, ftensor)
             ftensors.append(ftensor)
+            _cnt = _cnt + 1
+            if _cnt % 100 == 0:
+                _logger.info(f'processed local fusion & multiref for {_cnt} tensors')
+        _logger.info(f'finish local fusion & multiref for {_cnt} tensors')
         
         # reorder again since inserted multiref could be mis-ordered
         graph._reorder_producer_consumer()
+        _logger.info("finish reordering producer and consumer")
 
         # generate adapter for intra-segments
         # FIXME: assume producers and consumers can run in parallel
+        _cnt = 0
         for ftensor in ftensors:
 
             # debug
@@ -419,17 +433,17 @@ class IRAdapterGener:
                 # insert forward adapter
                 # graph.insert(fadapter, max(producers) + 1)
                 if len(fconsumers) > 0:
-                    fidx = min(graph.nodes().index(c) for c in fconsumers)
+                    fidx = min(graph.multi_index(fconsumers))
                 else:
                     # no consumer: find the last forward node
                     for fidx, node in enumerate(graph.nodes()[::-1]):
                         if node.isfw():
-                            fidx = graph.nnodes - fidx
+                            fidx = CellPosition(tuple([graph.nnodes - fidx]))
                             break
                 graph.insert(fadapter, fidx)
                 # setup recompute
                 if allow_recompute:
-                    if fidx > 0:
+                    if fidx > CellPosition(tuple([0])):
                         prev_node = graph.node(fidx-1)
                         if isinstance(prev_node, (IRFwOperation, IRAdapter)):
                             fadapter.recompute = prev_node.recompute
@@ -439,12 +453,16 @@ class IRAdapterGener:
                     assert isinstance(badapter, IRAdapter)
                     assert isinstance(bgraph, IRSegment)
                     if len(bproducers) > 0:
-                        bidx = max(bgraph.nodes().index(p) for p in bproducers) + 1
+                        bidx = max(bgraph.multi_index(bproducers)) + 1
                     else:
                         # no producer: find the first backward node
                         for bidx, node in enumerate(bgraph.nodes()):
                             if not node.isfw(): break
                     bgraph.insert(badapter, bidx)
+            _cnt = _cnt + 1
+            if _cnt % 100 == 0:
+                _logger.info(f'generated {_cnt} activation adapters')
+        _logger.info(f'finish generating {_cnt} activation adapters')
 
         # generate adapter for each segment
         segments = [seg for seg in graph.nodes() if isinstance(seg, IRSegment) and seg.isfw()]

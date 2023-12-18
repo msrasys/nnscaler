@@ -239,10 +239,8 @@ class IRGraph(IRSegment):
         if not isinstance(times, int) or times < 1:
             raise TypeError("Expected times to be int and >= 1")
         if node.name == 'multiref':
-            _logger.warning(f'skip replicating multiref ({node.cid}), which will be handled by system.')
             return [node]
         if isinstance(node, IRPyFunc):
-            _logger.warning(f'skip replicating pyfunc ({node.cid}), which will be handled by system.')
             return [node]
 
         fsegment: IRSegment = self.segment(node)

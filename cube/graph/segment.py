@@ -220,6 +220,38 @@ class IRSegment(IRCell):
                     return CellPosition((idx,) + index.indices)
         raise KeyError(f"The queried node: {node} not in the graph")
 
+    def multi_index(self, nodes: List[IRCell]) -> List[CellPosition]:
+        """
+        Get multiple node indices, traversing the graph only once
+        to save time.
+
+        Args:
+            nodes (List[IRCell]): nodes to be indexed
+
+        Returns:
+            List[CellPosition]: indices of nodes
+        """
+        visited = 0
+        indices = [None] * len(nodes)
+        def dfs(seg: IRSegment, path: List[int]):
+            nonlocal visited, indices
+            for idx, node in enumerate(seg._nodes):
+                if isinstance(node, IRSegment):
+                    dfs(node, path + [idx])
+                elif node in nodes:
+                    indices[nodes.index(node)] = CellPosition(tuple(path + [idx]))
+                    visited += 1
+                if visited == len(nodes):
+                    return
+        dfs(self, [])
+        if visited != len(nodes):
+            unvisited = []
+            for idx, node in zip(indices, nodes):
+                if idx is None:
+                    unvisited.append(node)
+            raise RuntimeError(f"Some of the queried nodes: {unvisited} not in the graph")
+        return indices
+
     def segment(self, node: IRCell) -> IRCell:
         """
         Get the lowest segment that constains the node
