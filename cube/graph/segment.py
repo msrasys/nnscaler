@@ -288,22 +288,36 @@ class IRSegment(IRCell):
         return tuple(self._consumers.get(ftensor, ()))
 
     def ptensors(self, ftensor: IRFullTensor) -> Tuple[IRSubTensor]:
-        """
-        Get consumed sub-tensors of ftensor in execution order in this graph
+        """Get produced sub-tensors of a full tensor (ftensor).
 
-        @param ftensor IRFullTensor: the queried full tensor.
+        A full tensor (ftensor) is originally produced by some operator(s).
+        These operators can be further partitioned into multiple sub-operators.
+        Each sub-operator potentially produces a smaller part of the ftensor (a.k.a. sub-tensor).
+        This function returns all the sub-tensors that are produced by operators 
+        inside the segment.
 
-        @return subtensors Tuple[IRSubTensor]: the consumed subtensors.
+        Args:
+            ftensor (IRFullTensor): the queried full tensor.
+
+        Returns:
+            Tuple[IRSubTensor]: the produced sub-tensors.
         """
         return tuple(self._ptensors.get(ftensor, ()))
 
     def ctensors(self, ftensor: IRFullTensor) -> Tuple[IRSubTensor]:
-        """
-        Get consumed sub-tensors of ftensor in execution order in this graph
+        """Get consumed sub-tensors of a full tensor (ftensor)
 
-        @param ftensor IRFullTensor: the queried full tensor.
+        A full tensor (ftensor) is originally consumed by some operator(s).
+        These operators can be further partitioned into multiple sub-operators.
+        Each sub-operator potentially consumes a smaller part of the ftensor (a.k.a. sub-tensor).
+        This function returns all the sub-tensors that are consumed by operators 
+        inside the segment.
 
-        @return subtensors Tuple[IRSubTensor]: the consumed subtensors.
+        Args:
+            ftensor (IRFullTensor): the queried full tensor.
+
+        Returns:
+            Tuple[IRSubTensor]: the consumed sub-tensors.
         """
         return tuple(self._ctensors.get(ftensor, ()))
 

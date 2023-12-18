@@ -192,109 +192,111 @@ class IRAdapterGener:
 
     @staticmethod
     def gen_weight(graph: IRGraph) -> IRGraph:
-        """
-        Generate gradient accumulation
-        
-        Only suuport cases that:
+        """Generate cross-device weight reducers for gradient accumulation.
 
-        1) each sub-tensor weight is consumed by different node cids (no replica)
-        2) If the sub-tensor weight is consumed by same replicated node:
-             The consumers can be grouped by node cids and satisfy:
-                1. same number of nodes per cid group
-                2. same device set or no-overlapping device set per cid group
+        If a weight tensor is replicated across multiple devices by different / partitioned operators, 
+        the weight tensor is required to accumulate gradients according to chain rules.
+
+        However, if the weight tensor is replicated across devices by replicated operators,
+        the weight tensor doesn't need to accumulate gradients.
+
+        Warning:
+            1) Each weight tensor's consumers can only be ALL partitioned or ALL replicated.
+            2) Weight partitions cannot be partially overlapped.
+            3) Limited support for shared weight of multiple operators:
+                - If operators are on different device group (e.g. pipeline),
+                  operators can only be partitioned.
+                - If operators are on same device group,
+                  operators can either be all partitioned or all replicated.
         """
-        def check_consistent_local_partition(graph: IRSegment):
-            """each weight full tensor inside one device should in same format."""
-            for ftensor in graph.full_tensors():
-                if not ftensor.is_attr(): continue
-                device_tensors: Dict[int, Set[IRSubTensor]] = {}
-                for ctensor in graph.ctensors(ftensor):
-                    for devid in ctensor.device:
-                        local_tensors = device_tensors.setdefault(devid, set())
-                        for t in local_tensors:
-                            assert t == ctensor or not t.overlap(ctensor), (
-                                    f"Detected graph attribute is partitioned with shared part on device {devid}.\n"
-                                    f"To achieve this, need call graph.multiref at the front of sProgram.\n"
-                                    f"{graph.debug_tensor_map_str(ftensor)}"
-                                )
-                        local_tensors.add(ctensor)
+        sub_weights : Dict[IRFullTensor, List[IRSubTensor]] = dict()
+        sub_weight_consumers: Dict[IRSubTensor, List[IRFwOperation]] = dict()
+
+        def collect_sub_weight(graph: IRSegment):
+            nonlocal sub_weights, sub_weight_consumers
+            for ftensor in graph.attributes():
+                if not ftensor.is_param(): continue
+                for ctensor, consumer in zip(graph.ctensors(ftensor), graph.consumers(ftensor)):
+                    if ctensor.grad is None: continue
+                    sub_weight_consumers.setdefault(ctensor, []).append(consumer)
+                    sub_weights.setdefault(ftensor, []).append(ctensor)
             for segment in graph.select(ntype=IRSegment, flatten=False):
                 if segment.isfw():
-                    check_consistent_local_partition(segment)
-        
-        check_consistent_local_partition(graph)
+                    collect_sub_weight(segment)
 
-        # collect subtensor and consumer
-        fweights: Dict[IRFullTensor, List[IRSubTensor]] = dict()
-        fgrads: Dict[IRFullTensor, List[IRSubTensor]] = dict()
-        consumers: Dict[IRFullTensor, List[IRFwOperation]] = dict()
-        for fnode in graph.nodes(flatten=True):
-            if not isinstance(fnode, IRFwOperation): continue
-            assert len(fnode.device) == 1
-            for wtensor in fnode.inputs():
-                if isinstance(wtensor, IRSubTensor) and wtensor.is_param():
-                    if wtensor.grad is None: continue
-                    fweight = wtensor.parent
-                    if fweight not in fweights:
-                        fweights[fweight] = []
-                        fgrads[fweight] = []
-                        consumers[fweight] = []
-                    fweights[fweight].append(wtensor)
-                    fgrads[fweight].append(wtensor.grad)
-                    consumers[fweight].append(fnode)
-        
-        nl = '\n'
-        weights: Dict[IRFullTensor, Dict[IRSubTensor, List[int]]] = dict()
-        for fweight in fweights.keys():
-            weights[fweight] = {}
-            weight_grads: Dict[IRSubTensor, Dict[IRSubTensor, List[IRFwOperation]]] = {}
-            for weight, grad, consumer in zip(fweights[fweight], fgrads[fweight], consumers[fweight]):
-                if weight not in weight_grads:
-                    weight_grads[weight] = {}
-                if grad not in weight_grads[weight]:
-                    weight_grads[weight][grad] = []
-                weight_grads[weight][grad].append(consumer)
+        collect_sub_weight(graph)
 
-            # assert all(sw.valmap[1] == len(weight_grads) for sw in weight_grads.keys())
-            for sub_weight in weight_grads:
-                diff_grads = weight_grads[sub_weight]
-                diff_grads_len = [len(diff_grads[grads]) for grads in diff_grads]
-                assert all(n == diff_grads_len[0] for n in diff_grads_len), (
-                    f"If one of the weight consumers are replicated, "
-                    f"other same-weight consumers should also replicated in same way."
-                    f"FullTensor Weight: {fweight}\n"
-                    f"Consumers:\n{nl.join([repr(node) for node in consumers[fweight]])}"
+        # check consistency in node replicate or node partition
+        replicated = []
+        for sub_weight, consumers in sub_weight_consumers.items():
+            # suppose a weight is originally shared by 2 operators op1 and op2,
+            # each operator is replicated on a same device group (e.g., rank 0 and rank 1).
+            # then the device 0 has (op1, op2) and device 1 also has (op1, op2).
+            # we don't need to accumulate gradients for the weight in this case.
+            # this case can be checked by whether each device has same consumer set.
+            dev_cids = dict()
+            for consumer in consumers:
+                dev_cids.setdefault(consumer.device[0], []).append(consumer.cid)
+            dev_cids = [tuple(sorted(cids)) for cids in dev_cids.values()]
+            cross_device_replicated = all(cids == dev_cids[0] for cids in dev_cids)
+
+            # otherwise, we only support fully partitioned consumers, 
+            # the weight's gradient should be accumulated.
+            fully_partitioned = len(set(c.cid for c in consumers)) == len(consumers)
+
+            if not (cross_device_replicated or fully_partitioned):
+                nl = '\n'
+                raise RuntimeError(
+                    f"The weight consumers can either be ALL replicated or ALL partitioned. "
+                    f"Detected some consumers are replicated and some are partitioned.\n"
+                    f"FullTensor weight: {sub_weight.parent}\n"
+                    f"Consumers:\n{nl.join([repr(n) for n in consumers])}\n"
                 )
-                # get devices
-                devices = []
-                for sub_grad in diff_grads:
-                    sub_grad_devices = [node.device[0] for node in diff_grads[sub_grad]]
-                    sub_grad_devices.sort()
-                    devices.append(sub_grad_devices)
-                devices = np.array(devices, dtype=int).transpose((1, 0))
-                for group_devices in devices:
-                    group_devices = set(int(devid) for devid in group_devices)
-                    group_devices = list(group_devices)
-                    group_devices.sort()
-                    weights[fweight][sub_weight] = group_devices
+            if cross_device_replicated == 1:  # replicated weights
+                replicated.append(sub_weight)
+        # check consistency in weight partition
+        # note we don't support sub-weight tensors with partially shared part.
+        # This is because the shared part may require reducer to accumulate gradients only for the
+        # shared part, requiring a more fine-grained tensor granularity.
+        # However, we don't support such fine-grained accumulation for now, and we only support
+        # to either accumulate same sub-weight tensors or not accumulate non-overlapped sub-weight tensors.
+        for ftensor, sub_ws in sub_weights.items():
+            # all the sub weights can only be 
+            # 1) replicated (sw1 == sw2) or,
+            # 2) partitioned without overlapping (not sw1.overlap(sw2))
+            for sw1, sw2 in itertools.combinations(sub_ws, 2):
+                if not (sw1 == sw2 or not sw1.overlap(sw2)):
+                    nl = '\n'
+                    raise RuntimeError(
+                        f"Detected a weight is partitioned with partially shared part among its sub-tensors.\n"
+                        f"To achieve this, users need to call `graph.multiref(weight)` inside the policy.\n"
+                        f"FullTensor weight: {ftensor}\n"
+                        f"Consumers:\n{nl.join([repr(w.cell) for w in sub_ws])}\n"
+                    )
+            
+        # only record sub-weight that is consumed by multiple devices
+        sub_weight_devices: Dict[IRSubTensor, Tuple[int,]] = dict()
+        # - pop out replicated sub weights as they will have full gradients,
+        # no need for reducer.
+        for sub_weight in replicated:
+            del sub_weight_consumers[sub_weight]
+        # - gather sub weights that are consumed by same device groups
+        for sub_weight, consumers in sub_weight_consumers.items():
+            devices = set(consumer.device[0] for consumer in consumers)
+            if len(devices) > 1:
+                devices = tuple(sorted(devices))
+                sub_weight_devices[sub_weight] = devices
+        
+        # create reducer
+        reducers: Dict[Tuple[int,], List[IRSubTensor]] = dict()
+        for subw, devices in sub_weight_devices.items():
+            reducers.setdefault(devices, []).append(subw)
+        for devices, subws in reducers.items():
+            reducer = IRWeightReducer(subws)
+            reducer.device = devices
+            # insert reducer to as the last node.
+            graph.insert(reducer, graph.nnodes)
 
-        reducers: Dict[Tuple[int], List[IRSubTensor]] = dict()
-        for subtensors in weights.values():
-            for subw in subtensors:
-                if len(subtensors[subw]) == 1:
-                    continue
-                devices = list(subtensors[subw])
-                devices.sort()
-                devices = tuple(devices)
-                if devices not in reducers:
-                    reducers[devices] = []
-                reducers[devices].append(subw)
-        # generate reducer for each rank
-        for devices in reducers:
-            weights = reducers[devices]
-            opt_op = IRWeightReducer(weights)
-            opt_op.device = list(devices)
-            graph.insert(opt_op, graph.nnodes)
         return graph
 
     @staticmethod
