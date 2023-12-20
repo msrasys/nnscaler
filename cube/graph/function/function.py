@@ -18,6 +18,33 @@ from cube.graph.function.anchor import IRGraphAnchor
 _logger = logging.getLogger(__name__)
 
 
+# If the type is IROject, then value should be type of int, Tuple[int], List[int]
+# If the type is Tuple[IROject] or List[IRObject], then the value of each element should be type of int
+_VariadicInt = Union[int, Tuple[int, ...], List[int], IRObject, Tuple[IRObject, ...], List[IRObject]]
+
+def extract_variadic(v: _VariadicInt) -> Tuple[List[int], List[bool]]:
+    if isinstance(v, int):
+        if isinstance(v, bool):
+            raise ValueError("Unsupported type: bool")
+        return [v], [False]
+    elif isinstance(v, IRObject):
+        r = extract_variadic(v.value)
+        return r[0], [True] * len(r[0]) # because all elements are from IRObject
+    elif isinstance(v, (tuple, list)):
+        r = [extract_variadic(e) for e in v]
+        if any(len(x[0]) != 1 for x in r):
+            raise ValueError("tuple/list can't be nested")
+        return [x[0][0] for x in r], [x[1][0] for x in r]
+    else:
+        raise ValueError(f"Unsupported type: {type(v)}")
+
+
+def is_list_or_tuple(v: Any) -> bool:
+    return isinstance(v, (list, tuple)) or (
+        isinstance(v, IRObject) and isinstance(v.value, (list, tuple))
+    )
+
+
 def Identity(tensor: IRObject, signature = None):
     signature = 'cube.runtime.function.identity'
     eshape = ShapeAnno.create_shape_str(tensor.shape)
@@ -336,38 +363,60 @@ def _handle_broadcast_multi(ins_list: List[IRTensor]) -> Tuple[Tuple[List[str]],
     return ins_anno, out_anno
 
 
-def Expand(input, *sizes, size = None, signature = None):
+def Expand(input, size, *arg_size, signature = None):
     """
     torch.Tensor.expand(*sizes)
-
-    The reason of add ``size`` to this function argument is:
-    1. ``sizes`` need to reuse in IRDimops.new(), but it is a ``non-keyword arguments``,
-    and can not put it into keyword arguments (something like Expand(input, sizes=[1, 2, 3])) is not work,
-    to support IRDimops.new API, here add a ``size`` to workaround.
-
-    2. in torch._C.expand API, it has:
-        def expand(self, size: Sequence[Union[_int, SymInt]], *, implicit: _bool=False) -> Tensor: ...
-      so add ``size`` can also solve user using something like:
-        torch.rand(3, 1).expand(size=(3, 3))
     """
     signature = 'torch.Tensor.expand'
-    if size is not None:
-        assert len(sizes) == 0
-        sizes = size
-    ori_len, exp_len = len(input.shape), len(sizes)
-    assert ori_len <= exp_len
-    assert all(dim == expand_dim or dim == 1 or expand_dim == -1 for dim, expand_dim in zip(input.shape, sizes[-ori_len:]))
-    edim_ou = ShapeAnno.create_shape_str(sizes)
+    if is_list_or_tuple(size):
+        # follow the behavior of torch.Tensor.Expand,
+        if arg_size:
+            raise ValueError(f"arg_size should not be provided when size is a list or tuple")
+        complete_size = size
+    else:
+        # follow the behavior of torch.Tensor.Expand,
+        if any(is_list_or_tuple(s) for s in arg_size):
+            raise ValueError(f"list or tuple should not be provided in arg_size")
+        complete_size = (size,) + arg_size
+
+    size, size_is_ir = extract_variadic(complete_size)
+
+    ori_len, exp_len = len(input.shape), len(size)
+    if ori_len > exp_len:
+        raise ValueError(f"Less dimensions than input is provided. input dims: {ori_len}, sizes: {exp_len}")
+    if not all(dim == expand_dim or dim == 1 or expand_dim == -1 for dim, expand_dim in zip(input.shape, size[-ori_len:])):
+        raise ValueError(f"The expanded size of the tensor ({size}) must match the existing size ({input.shape})")
+    edim_ou = ShapeAnno.create_shape_str(size)
     edim_in = copy.copy(edim_ou[-ori_len:])
-    new_size = [-1] * len(sizes)
-    for idx, (dim, expand_dim) in enumerate(zip(input.shape, sizes[-len(input.shape):])):
-        if dim == 1 and dim != expand_dim and expand_dim != -1:
+    # we must use -1 to represent the dimension that will not be expanded
+    # Otherwise, splitting on that dimension will be wrong
+    new_size = [-1] * len(size)
+    for idx, (dim, expand_dim, expand_dim_is_ir) in enumerate(zip(input.shape, size[-ori_len:], size_is_ir[-ori_len:])):
+        # when dynamic shape is enable, the dim may change in runtime
+        # so we can't assume the dim is 1 for sure even if it is 1 in tracing
+        # If we assume the user code is correct
+        # 1. if expand_dim is from IRObject, for safety, we don't allow partition
+        # 2. if expand_dim is not from IRObject, and dim > 1,  dimension is partitionable.
+        # 3. If it is 1 in tracing and exapnd_dim is not from IRObject
+        #   3.1 if expand_dim is -1, we allow partition on this dimension
+        #       For example, in runtime, (dim, expand_dim) can be (2, -1) or (3, -1) or (4,-1), will not trigger error on partition
+        #   3.2 if expand_dim is fixed 1, then dim must be 1 to make it valid op.
+        #       partition on this dimension is not useful (both is OK, here we disable partition for this case)
+        #   3.3 if expand_dim is fixed x > 1, then in runtime dim can be 1 or x
+        #       For example, in runtime, (dim, expand_dim) can be (1, x) or (x, x), will trigger error on partition
+        if expand_dim_is_ir or (dim == 1 and expand_dim != -1):
+            new_dim = dim if expand_dim == -1 else expand_dim
             edim_in[idx] += '^'
-            edim_ou[exp_len - ori_len + idx] = str(expand_dim)
-            new_size[exp_len - ori_len + idx] = expand_dim
+            # keep anno id only if expand_dim == -1
+            if expand_dim == -1:
+                edim_ou[exp_len - ori_len + idx] = edim_in[idx]
+            else:
+                edim_ou[exp_len - ori_len + idx] = str(new_dim)
+            # explicit set tid to -1 to avoid changing IDGenerator state.
+            new_size[exp_len - ori_len + idx] = IRObject(tid=-1, value=expand_dim) if expand_dim_is_ir else new_dim
     for idx in range(exp_len - ori_len):
-        edim_ou[idx] = str(sizes[idx])
-        new_size[idx] = sizes[idx]
+        edim_ou[idx] = str(size[idx])
+        new_size[idx] = size[idx]
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
     return IRDimops(Expand, 'expand', signature, [anno], [input], size=new_size)
 
@@ -1556,27 +1605,6 @@ def SelectScatter(self: torch.Tensor, input: torch.Tensor, dim: int, index: int,
     anno = OpAnno.create_op_str([in1_anno, in2_anno], [out_anno])
     return IRDimops(SelectScatter, 'select_scatter', signature,
                     [anno], [self, input], dim=dim, index=index)
-
-
-# If the type is IROject, then value should be type of int, Tuple[int], List[int]
-# If the type is Tuple[IROject] or List[IRObject], then the value of each element should be type of int
-_VariadicInt = Union[int, Tuple[int, ...], List[int], IRObject, Tuple[IRObject, ...], List[IRObject]]
-
-def extract_variadic(v: _VariadicInt) -> Tuple[List[int], List[bool]]:
-    if isinstance(v, int):
-        if isinstance(v, bool):
-            raise ValueError("Unsupported type: bool")
-        return [v], [False]
-    elif isinstance(v, IRObject):
-        r = extract_variadic(v.value)
-        return r[0], [True] * len(r[0]) # because all elements are from IRObject
-    elif isinstance(v, (tuple, list)):
-        r = [extract_variadic(e) for e in v]
-        if any(len(x[0]) != 1 for x in r):
-            raise ValueError("tuple/list can't be nested")
-        return [x[0][0] for x in r], [x[1][0] for x in r]
-    else:
-        raise ValueError(f"Unsupported type: {type(v)}")
 
 
 def Repeat(tensor, repeats: _VariadicInt, *arg_repeats, signature = None):

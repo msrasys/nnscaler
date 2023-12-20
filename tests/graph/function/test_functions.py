@@ -7,6 +7,14 @@ import pytest
 import torch
 
 
+def o(value):
+    return IRObject(value=value)
+
+
+def assert_anno(op, expected):
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected
+
+
 def test_handle_broadcast_multi():
     ins_anno, out_anno = F._handle_broadcast_multi([IRTensor([4]), IRTensor([3, 4]), IRTensor([2, 3, 4])])
     assert ins_anno[0] == ['c']
@@ -34,9 +42,48 @@ def test_Expand():
     out = IRTensor([10, 2])
     op = F.Expand(inp, 10, 2)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ -> a 2'
+    assert op.kwargs['size'] == [-1, 2]
 
     op.new([inp], [out], size=[10, 2])
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ -> a 2'
+
+    with pytest.raises(ValueError):
+        F.Expand(inp, (10, 2), 1)
+
+    with pytest.raises(ValueError):
+        F.Expand(inp, 1, (10, 2))
+
+    with pytest.raises(ValueError):
+        F.Expand(inp, 1)
+
+    with pytest.raises(ValueError):
+        F.Expand(inp, (5, 2))
+
+    op = F.Expand(inp, -1, o(1))
+    assert_anno(op,  'a b^ -> a 1')
+    assert op.kwargs['size'][0] == -1
+    assert op.kwargs['size'][1].value == 1
+
+    op = F.Expand(inp, -1, 1)
+    assert_anno(op,  'a b^ -> a 1')
+    assert op.kwargs['size'] == [-1, 1]
+
+    assert_anno(F.Expand(inp, -1, o(2)),  'a b^ -> a 2')
+    assert_anno(F.Expand(inp, o((10, 2))),  'a^ b^ -> 10 2')
+
+    op = F.Expand(inp, o(10), o(2))
+    assert_anno(op,  'a^ b^ -> 10 2')
+    assert op.kwargs['size'][0].value == 10
+    assert op.kwargs['size'][1].value == 2
+
+    op = F.Expand(inp, o(10), o(-1))
+    assert_anno(op,  'a^ b^ -> 10 b^')
+    assert op.kwargs['size'][0].value == 10
+    assert op.kwargs['size'][1].value == -1
+
+    op = F.Expand(inp, 10, 10, 2)
+    assert_anno(op, 'b c^ -> 10 b 2')
+    assert op.kwargs['size'] == [10, -1, 2]
 
 
 def test_variadic_extraction():
@@ -70,8 +117,6 @@ def test_variadic_extraction():
 
 
 def test_Repeat():
-    def o(value):
-        return IRObject(value=value)
     inp = IRTensor([3])
     op = F.Repeat(inp, (4, 2))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'b^ -> 4 (2 b^)'
