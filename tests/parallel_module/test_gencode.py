@@ -9,6 +9,7 @@ from cube.parallel import parallelize, ComputeConfig, CubeModule, _gen_graph
 
 from .common import PASData, init_distributed, PASRandomSPMD
 from ..launch_torchrun import launch_torchrun
+from ..utils import replace_all_device_with
 
 def _to_cube_model(module, compute_config, cube_savedir, load_module):
     return parallelize(
@@ -55,13 +56,8 @@ class SliceModule(torch.nn.Module):
     def forward(self, x):
         return x[:2]
 
+@replace_all_device_with('meta')
 def test_codegen_slice():
-    """
-    Test it can support modules without parameters
-    """
-    if not torch.cuda.is_available():
-        print('skip test_codegen_slice due to lack of cuda devices')
-        return
     with tempfile.TemporaryDirectory() as tempdir:
         m_new = parallelize(
             SliceModule(),
@@ -83,14 +79,9 @@ class ArgsModule(torch.nn.Module):
     def forward(self, x, y, *args):
         return self.linear(x) + y
 
-def test_codegen_args():
-    """
-    Verify that unused args are supported by parallalize
-    """
-    if not torch.cuda.is_available():
-        print('skip test_codegen_args due to lack of cuda devices')
-        return
 
+@replace_all_device_with('meta')
+def test_codegen_args():
     with tempfile.TemporaryDirectory() as tempdir:
         # *args is not supported.
         with pytest.raises(RuntimeError):
@@ -240,11 +231,8 @@ class AttrHelper:
         self.a = 2.0
 
 
+@replace_all_device_with('meta')
 def test_codegen_attr():
-    if not torch.cuda.is_available():
-        print('skip test_codegen_attr due to lack of cuda devices')
-        return
-
     with tempfile.TemporaryDirectory() as tempdir:
         m_new = parallelize(
             AttrModule(),
@@ -276,11 +264,8 @@ class GetItemModule(torch.nn.Module):
         return padding_mask
 
 
+@replace_all_device_with('meta')
 def test_codegen_getitem():
-    if not torch.cuda.is_available():
-        print('skip test_codegen_getitem due to lack of cuda devices')
-        return
-
     with tempfile.TemporaryDirectory() as tempdir:
         m_new = parallelize(
             GetItemModule(),
@@ -308,13 +293,8 @@ class TrainingModule(torch.nn.Module):
             return self.linear(x) + 1
 
 
+@replace_all_device_with('meta')
 def test_codegen_training_flag():
-    """
-    Test it can support modules without parameters
-    """
-    if not torch.cuda.is_available():
-        print('skip test_codegen_training_flag due to lack of cuda devices')
-        return
     with tempfile.TemporaryDirectory() as tempdir:
         m = TrainingModule()
         m.train()
@@ -370,13 +350,11 @@ class IterModule(torch.nn.Module):
         return x
 
 
+@replace_all_device_with('meta')
 def test_codegen_iter():
     """
     Test it can support modules without parameters
     """
-    if not torch.cuda.is_available():
-        print('skip test_codegen_iter due to lack of cuda devices')
-        return
     with tempfile.TemporaryDirectory() as tempdir:
         m = IterModule()
         m.train()
@@ -404,13 +382,11 @@ class ConstantModule(torch.nn.Module):
         return x
 
 
+@replace_all_device_with('meta')
 def test_codegen_const():
     """
     Test it can support modules without parameters
     """
-    if not torch.cuda.is_available():
-        print('skip test_codegen_const due to lack of cuda devices')
-        return
     with tempfile.TemporaryDirectory() as tempdir:
         m = ConstantModule()
         m.train()
@@ -448,10 +424,9 @@ class TensorSliceFixedModule(torch.nn.Module):
         return x[:, :padding]
 
 
+# torch.count_nonzero is not supported on meta
+@replace_all_device_with('cpu')
 def test_codegen_tensor_slice():
-    if not torch.cuda.is_available():
-        print('skip test_codegen_tensor_slice due to lack of cuda devices')
-        return
     with tempfile.TemporaryDirectory() as tempdir:
         m = TensorSliceModule()
         m.train()
@@ -490,11 +465,8 @@ class DictGetModule(torch.nn.Module):
         return data_x + data_y
 
 
+@replace_all_device_with('meta')
 def test_codegen_dictget():
-    if not torch.cuda.is_available():
-        print('skip test_codegen_dictget due to lack of cuda devices')
-        return
-
     with tempfile.TemporaryDirectory() as tempdir:
         m_new = parallelize(
             DictGetModule(),
@@ -521,11 +493,8 @@ class CloneModule(torch.nn.Module):
         return x.clone()
 
 
+@replace_all_device_with('meta')
 def test_codegen_clone():
-    if not torch.cuda.is_available():
-        print('skip test_codegen_clone due to lack of cuda devices')
-        return
-
     with tempfile.TemporaryDirectory() as tempdir:
         g, _ = _gen_graph(
             CloneModule(),
