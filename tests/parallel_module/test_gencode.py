@@ -56,7 +56,7 @@ class SliceModule(torch.nn.Module):
     def forward(self, x):
         return x[:2]
 
-@replace_all_device_with('meta')
+@replace_all_device_with('cpu')
 def test_codegen_slice():
     with tempfile.TemporaryDirectory() as tempdir:
         m_new = parallelize(
@@ -80,7 +80,7 @@ class ArgsModule(torch.nn.Module):
         return self.linear(x) + y
 
 
-@replace_all_device_with('meta')
+@replace_all_device_with('cpu')
 def test_codegen_args():
     with tempfile.TemporaryDirectory() as tempdir:
         # *args is not supported.
@@ -231,7 +231,7 @@ class AttrHelper:
         self.a = 2.0
 
 
-@replace_all_device_with('meta')
+@replace_all_device_with('cpu')
 def test_codegen_attr():
     with tempfile.TemporaryDirectory() as tempdir:
         m_new = parallelize(
@@ -264,7 +264,7 @@ class GetItemModule(torch.nn.Module):
         return padding_mask
 
 
-@replace_all_device_with('meta')
+@replace_all_device_with('cpu')
 def test_codegen_getitem():
     with tempfile.TemporaryDirectory() as tempdir:
         m_new = parallelize(
@@ -293,7 +293,7 @@ class TrainingModule(torch.nn.Module):
             return self.linear(x) + 1
 
 
-@replace_all_device_with('meta')
+@replace_all_device_with('cpu')
 def test_codegen_training_flag():
     with tempfile.TemporaryDirectory() as tempdir:
         m = TrainingModule()
@@ -350,7 +350,7 @@ class IterModule(torch.nn.Module):
         return x
 
 
-@replace_all_device_with('meta')
+@replace_all_device_with('cpu')
 def test_codegen_iter():
     """
     Test it can support modules without parameters
@@ -382,7 +382,7 @@ class ConstantModule(torch.nn.Module):
         return x
 
 
-@replace_all_device_with('meta')
+@replace_all_device_with('cpu')
 def test_codegen_const():
     """
     Test it can support modules without parameters
@@ -424,7 +424,6 @@ class TensorSliceFixedModule(torch.nn.Module):
         return x[:, :padding]
 
 
-# torch.count_nonzero is not supported on meta
 @replace_all_device_with('cpu')
 def test_codegen_tensor_slice():
     with tempfile.TemporaryDirectory() as tempdir:
@@ -465,7 +464,7 @@ class DictGetModule(torch.nn.Module):
         return data_x + data_y
 
 
-@replace_all_device_with('meta')
+@replace_all_device_with('cpu')
 def test_codegen_dictget():
     with tempfile.TemporaryDirectory() as tempdir:
         m_new = parallelize(
@@ -493,7 +492,7 @@ class CloneModule(torch.nn.Module):
         return x.clone()
 
 
-@replace_all_device_with('meta')
+@replace_all_device_with('cpu')
 def test_codegen_clone():
     with tempfile.TemporaryDirectory() as tempdir:
         g, _ = _gen_graph(
