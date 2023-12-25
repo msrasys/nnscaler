@@ -1,4 +1,4 @@
-from typing import List, Tuple, Optional, Any, Dict
+from typing import List, Tuple, Optional, Any, Dict, Union
 import inspect
 
 from cube.ir.cten import IRCell, IRObject
@@ -10,6 +10,7 @@ from cube.graph import parser
 
 from cube.runtime.module import CubeModule
 from cube.runtime.device import DeviceGroup
+from cube.runtime.utils import MicroBatchDataLoader
 
 from cube.utils import load_model
 
@@ -82,16 +83,16 @@ class Program:
 
 class SemanticDataLoader:
 
-    def __init__(self, dataloader: data.DataLoader):
+    def __init__(self, dataloader: MicroBatchDataLoader):
         """
         Create semantic dataloader which will produces IRDataOperation
         when calling `next`.
 
         Args:
-            dataloader (torch.utils.data.DataLoader): torch dataloader
+            dataloader (MicroBatchDataLoader): torch dataloader
         """
-        if not isinstance(dataloader, data.DataLoader):
-            raise TypeError("Expected data loader derived from torch.utils.data.DataLoader")
+        if not isinstance(dataloader, MicroBatchDataLoader):
+            raise TypeError("Expected data loader to be MicroBatchDataLoader")
         self.dataloader: data.DataLoader = dataloader
         self.object = IRObject(name='dataloader', value=None)
 

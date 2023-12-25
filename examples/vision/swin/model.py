@@ -6,7 +6,6 @@ from examples.vision.swin.blocks.transformer import SwinTransformerBlock
 from examples.vision.swin.blocks.patch import PatchEmbed, PatchMerging
 
 import cube
-from cube.runtime.utils import create_dummy_dataloader
 
 
 class Config:
@@ -222,10 +221,10 @@ class SwinTransformer(nn.Module):
 
 # =========================== Data Loader =======================
 
-def get_swin_dummy_dataloader(batch_size: int, 
-                              dtype: torch.dtype, cfg: Config):
+def dummy_data(batch_size: int, 
+               dtype: torch.dtype, cfg: Config):
     input_ids = torch.randn(
-        [3, cfg.img_size, cfg.img_size],
+        [batch_size, 3, cfg.img_size, cfg.img_size],
         dtype=dtype, device=torch.cuda.current_device()
     )
-    return create_dummy_dataloader(input_ids, batch_size)
+    return input_ids

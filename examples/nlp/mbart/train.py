@@ -14,11 +14,13 @@ import math
 from functools import partial
 
 from examples.nlp.mbart.model import MBartForSentenceClassification, Config
-from examples.nlp.mbart.model import get_mbart_dummy_dataloader
+from examples.nlp.mbart.model import dummy_data
 
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary
+from cube.runtime.utils import microbatches
+
 import examples.nlp.mbart.policy.gallery as gallery
 
 from examples.utils import get_policy
@@ -100,7 +102,8 @@ def train():
         trunc_normal_(param)
     model = model.half() if args.fp16 else model
 
-    dataloader = get_mbart_dummy_dataloader(batch_size, config)
+    gen_data = partial(dummy_data, batch_size, config)
+    dataloader = microbatches((gen_data(),), cycle=True)
 
     @cube.compile(model, dataloader, PAS=policy)
     def train_iter(model, dataloader):
@@ -113,11 +116,13 @@ def train():
         model.parameters(), lr=3e-05, betas=(0.9, 0.98))
 
     CudaTimer().warmup()
-    dataloader = iter(dataloader)
     iter_num, warmup = 5, 2
     for step in range(iter_num):
         if step == warmup:
             CudaTimer(enable=True).start('e2e')
+        # prepare input data
+        samples = [gen_data() for _ in range(args.gbs // args.mbs)]
+        dataloader = microbatches(samples)
 
         # training
         train_iter(model, dataloader)

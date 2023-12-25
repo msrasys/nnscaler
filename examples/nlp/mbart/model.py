@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from examples.nlp.blocks.transformer import TransformerLayer
 
 import cube
-from cube.runtime.utils import create_dummy_dataloader
 
 
 @dataclass
@@ -163,22 +162,22 @@ class MBartForSentenceClassification(torch.nn.Module):
         return loss
 
 
-def get_mbart_dummy_dataloader(batch_size: int, config: Config):
+def dummy_data(batch_size: int, config: Config):
 
     input_ids = torch.randint(
         0, config.vocab,
-        size=(config.seqlen,),
+        size=(batch_size, config.seqlen,),
         dtype=torch.int64, device=torch.cuda.current_device()
     )
     decoder_input_ids = torch.randint(
         0, config.vocab,
-        size=(config.seqlen,),
+        size=(batch_size, config.seqlen,),
         dtype=torch.int64, device=torch.cuda.current_device()
     )
     labels = torch.randint(
         0, config.num_classes,
-        size=(), # scalar
+        size=(batch_size, ), # scalar
         dtype=torch.int64,
         device=torch.cuda.current_device()
     )
-    return create_dummy_dataloader((input_ids, decoder_input_ids,), batch_size)
+    return input_ids, decoder_input_ids

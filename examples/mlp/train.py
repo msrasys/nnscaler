@@ -12,7 +12,8 @@ from functools import partial
 import cube
 from cube.profiler import CudaTimer
 from cube.profiler.timer import print_each_rank
-from cube.runtime.utils import create_dummy_dataloader
+from cube.runtime.utils import microbatches
+
 
 import examples.mlp.policy.gallery as gallery
 from examples.utils import get_policy
@@ -50,14 +51,16 @@ class MLP(nn.Module):
         loss = torch.sum(x)
         return loss
 
+def dummy_data():
+    return torch.randn(
+        args.mbs, args.dim, device=torch.cuda.current_device())
+
 
 def train():
 
     model = MLP(dim=args.dim, nlayers=args.layers)
-    dataloader = create_dummy_dataloader(
-        torch.randn(args.dim, device=torch.cuda.current_device()),
-        args.mbs,
-    )
+    # create dummy data
+    dataloader = microbatches((dummy_data(),))
 
     # compile a training iteration
     @cube.compile(model, dataloader, PAS=policy)
@@ -71,12 +74,17 @@ def train():
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
     CudaTimer(enable=False).warmup()
-    dataloader = iter(dataloader)
     iter_num, warmup = 5, 2
     for step in range(iter_num):
         if step == warmup:
             CudaTimer(enable=True).start('e2e')
+
+        # get data samples
+        samples = [dummy_data() for _ in range(args.gbs // args.mbs)]
+        dataloader = microbatches(samples)
+        # run training iteration
         train_iter(model, dataloader)
+
         optimizer.step()
         optimizer.zero_grad()
         if (step + 1) % 2 == 0:

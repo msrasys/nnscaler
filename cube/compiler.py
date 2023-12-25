@@ -24,6 +24,7 @@ from cube.execplan.planpass.grouping import Grouping
 from cube.codegen import ModuleCodeGen, ScheduleCodeGen
 
 from cube.runtime.device import DeviceGroup
+from cube.runtime.utils import MicroBatchDataLoader
 
 from cube.program import Program, SemanticDataLoader, SemanticModel
 from cube.flags import CompileFlag
@@ -93,7 +94,7 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
     inputs = [model]
     for arg in args:
         assert not isinstance(arg, (torch.nn.Module, SemanticModel)), f"Only one model can be input for compile"
-        if isinstance(arg, torch.utils.data.DataLoader):
+        if isinstance(arg, MicroBatchDataLoader):
             arg = SemanticDataLoader(arg)
         elif isinstance(arg, torch.Tensor):
             tensor = arg

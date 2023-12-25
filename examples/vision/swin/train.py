@@ -10,11 +10,12 @@ import math
 import torch
 from functools import partial
 from examples.vision.swin.blocks.attention import init_relative_position_index
-from examples.vision.swin.model import Config, SwinTransformer, get_swin_dummy_dataloader
+from examples.vision.swin.model import Config, SwinTransformer, dummy_data
 
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary
+from cube.runtime.utils import microbatches
 
 import examples.vision.swin.policy.gallery as gallery
 from examples.utils import get_policy
@@ -56,7 +57,10 @@ def train():
     model = model.half() if args.fp16 else model
 
     dtype = torch.float16 if args.fp16 else torch.float32
-    dataloader = get_swin_dummy_dataloader(batch_size, dtype, cfg)
+
+
+    gen_data = partial(dummy_data, args.mbs, torch.float16, cfg)
+    dataloader = microbatches((gen_data(),))
 
     @cube.compile(model, dataloader, PAS=policy, load_content=load_content)
     def train_iter(model, dataloader):
@@ -82,12 +86,15 @@ def train():
     print_each_rank(f'model parameter: {nparams}')
 
     CudaTimer().warmup()
-    dataloader = iter(dataloader)
     iter_num, warmup = 5, 2
     for step in range(iter_num):
         if step == warmup:
             CudaTimer(enable=True).start('e2e')
 
+        # collect data
+        samples = [gen_data() for _ in range(args.gbs // args.mbs)]
+        dataloader = microbatches(samples, dtype=dtype)
+        # train iteration
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()

@@ -2,7 +2,6 @@ import torch
 from dataclasses import dataclass
 
 import cube
-from cube.runtime.utils import create_dummy_dataloader
 
 from examples.nlp.blocks.transformer import TransformerLayer
 
@@ -88,18 +87,17 @@ class GPT(torch.nn.Module):
         return loss
 
 
-def get_gpt_dummy_dataloader(batch_size: int, cfg: Config):
+def dummy_data(batch_size: int, cfg: Config):
 
     input_ids = torch.randint(
         0, cfg.num_embeddings,
-        size=(cfg.seqlen,),
+        size=(batch_size, cfg.seqlen,),
         dtype=torch.int64,
         device=torch.cuda.current_device()
     )
     position_ids = torch.arange(
         0, cfg.seqlen, dtype=torch.int64,
         device=torch.cuda.current_device()
-    ).view(cfg.seqlen,)
+    ).repeat(batch_size, 1).view(batch_size, cfg.seqlen,)
 
-    return create_dummy_dataloader(
-        (input_ids, position_ids), batch_size)
+    return input_ids, position_ids

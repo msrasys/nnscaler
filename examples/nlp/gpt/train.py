@@ -11,12 +11,12 @@ import torch
 import logging
 from functools import partial
 
-from model import GPT, Config
-from model import get_gpt_dummy_dataloader
+from model import GPT, Config, dummy_data
 
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary
+from cube.runtime.utils import microbatches
 
 import examples.nlp.gpt.policy.spmd as spmd
 import examples.nlp.gpt.policy.mpmd as mpmd
@@ -76,7 +76,9 @@ def train():
     )
     model = GPT(config)
     model = model if not args.fp16 else model.half()
-    dataloader = get_gpt_dummy_dataloader(args.mbs, Config)
+
+    gen_data = partial(dummy_data, args.mbs, config)
+    dataloader = microbatches((gen_data(),), cycle=True)
 
     @cube.compile(model, dataloader, PAS=policy)
     def train_iter(model, dataloader):
@@ -92,12 +94,16 @@ def train():
     memory_summary()
 
     CudaTimer().warmup()
-    dataloader = iter(dataloader)
     iter_num, warmup = 5, 2
     for step in range(iter_num):
         if step == warmup:
             CudaTimer(enable=True).start('e2e')
 
+        # collect dummy data
+        samples = [gen_data() for _ in range(args.gbs // args.mbs)]
+        dataloader = microbatches(samples)
+
+        # train
         train_iter(model, dataloader)
         optimizer.step()
         optimizer.zero_grad()

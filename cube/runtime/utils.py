@@ -1,46 +1,103 @@
 r"""Runtime Utilities"""
 
-from typing import Any
+from typing import Any, List
 import logging
-
-import torch.utils.data as data
 
 _logger = logging.getLogger(__name__)
 
 
-def create_dummy_dataloader(sample: Any, 
-                            batch_size: int, drop_last=True, 
-                            **dataloader_config) -> data.DataLoader:
-    """Create a dummy dataloader
+class MicroBatchDataLoader:
+    """
+    MicroBatchDataLoader is used for scenarios of gradient accumulation,
+    where a training iteration will have multiple data samples and perform
+    multiple forward and backward on each sample (i.e., each refers to 
+    as a micro-batch).
 
-    The function is mainly used for performance test.
+    To support more flexible training patterns, e.g., pipeline parallelism,
+    MicroBatchDataLoader supports wrapping all data samples of a training iteration
+    into a light dataloader and passed as input for compilation.
+
+    e.g.,
+
+    ```python
+    # compilation phase
+    dataloader = MicroBatchDataLoader([(input1,),]) # only need one micro-batch
     
-    Args:
-        sample (Any): a data sample without batch size dimension.
-            The sample can be a single tensor/object or tuple/list of tensors/objects
-        batch_size (int): batch size
-        drop_last (bool): whether to drop last batch to make batch size consistent.
-        dataloader_config (dict): kwargs for dataloader initialization.
+    @cube.compile(model, dataloader, ...)
+    def train_iter(model, dataloader):
+        input1 = next(dataloader)
+        loss = model(input1)
+        loss.backward()
+        return loss
 
-    Returns:
-        dataloader (torch.utils.data.DataLoader):
-            returns 
+    ...
+
+    # runtime phase
+    
+    for mini_batch_samples in iter(dataloader):
+        # mini_batch_samples are sample list for 
+        # all micro-batches in one iteration.
+        dl = MicroBatchDataLoader(mini_batch_samples)
+        loss =train_iter(model, dl)
+        ...
+    ```
     """
 
-    class DummyDataset(data.Dataset):
+    def __init__(self, samples: List[Any], cycle: bool = False):
+        """Create a micro-batch data loader for a mini-batch.
 
-        def __init__(self, sample: Any):
+        Args:
+            samples (List[Any]): a list of micro-batch samples. Each element
+                in the list is a micro-batch sample.
+            cycle (bool): whether to cycle the micro-batch samples. If True,
+                the micro-batch samples will be cycled infinitely. Note this
+                is only needed when the number of micro-batch samples is less
+                than expected micro-batch number during runtime.
+        """
 
-            self.sample = sample
+        if not isinstance(samples, (tuple, list)):
+            raise TypeError("Samples must be a tuple or list of samples.")
+        self.samples = samples
+        self.nmicros = len(samples)
+        self.cycle = cycle
+        self._idx = 0
 
-        def __len__(self):
-            return 1024000
-        
-        def __getitem__(self, key: int):
-            return self.sample
+    def __iter__(self):
+        self._idx = 0
+        return self
+    
+    def __next__(self):
+        if self._idx == self.nmicros:
+            raise StopIteration
+        batch = self.samples[self._idx]
+        self._idx += 1
+        if self.cycle:
+            self._idx = self._idx % self.nmicros
+        return batch
+    
+    def __len__(self):
+        return self.nmicros
+    
+    def get_micro_batch(self, idx: int):
+        idx = idx % self.nmicros if self.cycle else idx
+        return self.samples[idx]
 
-    dataset = DummyDataset(sample)
-    dataloader = data.DataLoader(
-        dataset, batch_size=batch_size, drop_last=drop_last, 
-        **dataloader_config)
-    return dataloader
+
+def microbatches(samples: List[Any], cycle: bool = False) -> MicroBatchDataLoader:
+    """Create a micro-batch data loader for a mini-batch.
+
+    This is for gradient accumulation scenarios. More details refer to
+    documents of MicroBatchDataLoader.
+
+    Args:
+        samples (List[Any]): a list of micro-batch samples. Each element
+            in the list is a micro-batch sample.
+        cycle (bool): whether to cycle the micro-batch samples. If True,
+            the micro-batch samples will be cycled infinitely. Note this
+            is only needed when the number of micro-batch samples is less
+            than expected micro-batch number during runtime.
+
+    Returns:
+        MicroBatchDataLoader: a micro-batch data loader.
+    """
+    return MicroBatchDataLoader(samples, cycle=cycle)
