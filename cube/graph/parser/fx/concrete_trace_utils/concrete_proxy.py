@@ -76,6 +76,9 @@ class ConcreteProxy(Proxy):
         return f'ConcreteProxy({self.node.name}, {self.value})'
 
     def __getattr__(self, k) -> ConcreteProxy:
+        # if the proxy is a wrapped module, forward this call to the torch.nn.Module.__getattribute__
+        if _orig_isinstance(self.value, torch.nn.Module):
+            return torch.nn.Module.__getattribute__(self.value, k)
         return ConcreteAttrProxy(self, k)
 
     def __call__(self, *args, **kwargs) -> ConcreteProxy:
@@ -173,6 +176,9 @@ class ConcreteProxy(Proxy):
             return _orig_bool(self.value)
         elif insts[cur].opname == 'CONTAINS_OP':
             # in executing 'in'
+            return _orig_bool(self.value)
+        elif insts[cur].opname == 'BINARY_SUBSCR':
+            # in executing slice or index, my_list[index] or my_dict[key]
             return _orig_bool(self.value)
         elif insts[cur].opcode == self.op_call_ex:
             # in executing func(..., *proxy)

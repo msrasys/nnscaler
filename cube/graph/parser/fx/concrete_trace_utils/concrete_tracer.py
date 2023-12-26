@@ -34,6 +34,8 @@ from torch.fx.node import Target, Node, Argument, _side_effectful_functions
 from torch.fx.proxy import TracerBase
 from torch.fx.operator_schemas import check_for_mutable_operation
 
+dict_keys_type = type(dict().keys())
+
 try:
     # Scope is a new class to record module path in pytorch 2.0
     from torch.fx.proxy import Scope
@@ -240,6 +242,12 @@ class ConcreteTracer(TracerBase):
                 to_func = getattr(torch.Tensor, name, None)
                 to_func = None if to_func == attr else to_func
                 default_autowrap_leaf_function[attr] = ([], False, to_func)
+    # find the multi position for default_autowrap_leaf_function in torch.__dir__()
+    for name in dir(torch):
+        attr = getattr(torch, name)
+        if callable(attr) and not _orig_isinstance(attr, Type) and not name.startswith('__') \
+            and attr in default_autowrap_leaf_function:
+            default_autowrap_leaf_function[attr][0].append((torch, name))
 
     default_autowrap_leaf_class: Dict[Type, Tuple[List[Tuple[Union[ModuleType, Type], str]], bool]] = {
         # class
@@ -549,6 +557,9 @@ class ConcreteTracer(TracerBase):
             return self.create_node('get_attr', qualname, (), {}, node_result=a)
 
         if isinstance(a, (torch.autograd.function.Function, torch.autograd.function.FunctionMeta)):
+            return a
+
+        if isinstance(a, dict_keys_type):
             return a
 
         return super().create_arg(a)
@@ -982,7 +993,7 @@ class ConcreteTracer(TracerBase):
                     positions = (*positions, (torch.Tensor, func.__name__))
                     wrapped = _create_wrapped_leaf_method(self, getattr(torch.Tensor, func.__name__), func.__name__, to_func)
                 elif func.__qualname__.startswith('_VariableFunctionsClass'):
-                    if hasattr(torch, func.__name__):
+                    if hasattr(torch, func.__name__) and getattr(torch, func.__name__) == func:
                         # avoid bad attr like 'unique_dim'
                         positions = (*positions, (torch, func.__name__))
                     if is_force_trace:
@@ -1492,6 +1503,9 @@ def _retain_weight_consistency(root: torch.nn.Module):
 
 @functools.wraps(_orig_node_is_impure)
 def node_is_impure_wrapper(node):
+    if is_useless_iter(node):
+        return False
+
     if node.op in {"placeholder", "output"}:
         return True
 
@@ -1512,6 +1526,31 @@ def node_is_impure_wrapper(node):
         return getattr(target_mod, "_is_impure", False)
 
     return False
+
+def is_useless_iter(node: Node):
+    if node.op == 'call_function' and node.target is iter:
+        node_is_impure = False
+        for iter_user in node.users:
+            if not is_useless_next(iter_user):
+                node_is_impure = True
+                break
+        if not node_is_impure:
+            for iter_user in list(node.users.keys()):
+                setattr(iter_user, '_is_impure', False)
+                iter_user.graph.erase_node(iter_user)
+            if len(node.users) > 0:
+                raise RuntimeError('The user node of iter is not empty, something goning wrong.')
+            setattr(node, '_is_impure', False)
+            return True
+    else:
+        return False
+
+def is_useless_next(node: Node):
+    if node.op == "call_function" and node.target is next:
+        if len(node.users) == 0:
+            return True
+    else:
+        return False
 
 def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
                    concrete_args: Union[Dict[str, Any], Tuple],
