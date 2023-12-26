@@ -236,13 +236,13 @@ class IRSegment(IRCell):
         def dfs(seg: IRSegment, path: List[int]):
             nonlocal visited, indices
             for idx, node in enumerate(seg._nodes):
-                if isinstance(node, IRSegment):
-                    dfs(node, path + [idx])
-                elif node in nodes:
+                if node in nodes:
                     indices[nodes.index(node)] = CellPosition(tuple(path + [idx]))
                     visited += 1
                 if visited == len(nodes):
                     return
+                if isinstance(node, IRSegment):
+                    dfs(node, path + [idx])
         dfs(self, [])
         if visited != len(nodes):
             unvisited = []
