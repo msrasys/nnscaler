@@ -1,6 +1,7 @@
 from typing import Any, Dict, Union
 import logging
 from pathlib import Path
+import operator
 
 from cube.ir.tensor import IRFullTensor
 from cube.graph.parser.register import CustomizedOps
@@ -10,6 +11,7 @@ from cube.flags import CompileFlag
 from cube.graph.parser.fx.parser import FxModuleParser
 from cube.graph.parser.fx.concrete_trace_utils import concrete_trace
 from cube.graph.parser.fx.concrete_trace_utils.concrete_tracer import is_autograd_apply
+from cube.graph.parser.fx.concrete_trace_utils.utils import side_effectful_inplace_ops
 
 import cube.runtime.function as cube_rt_function
 
@@ -28,6 +30,31 @@ class no_save_tensor_hook(saved_tensors_hooks):
         def unpack(x):
             raise RuntimeError("not expecting backward to be called on this tensor")
         super().__init__(pack, unpack)
+
+
+def _rewrite_inplace_ops(traced_model: torch.fx.GraphModule):
+    """Rewrite inplace ops to use its outputs so we can track them in IRGraph
+
+    x.add_(y)           =>  x = x.add_(y)
+    operator.iadd(x, y) =>  x = operator.iadd(x, y)
+    x += y              =>  x += y # no change
+
+    Args:
+        traced_model (torch.fx.GraphModule): fx graph to be modified
+    """
+    done_nodes = set()
+    for n in traced_model.graph.nodes:
+        done_nodes.add(n)
+        if (
+            (n.op == "call_method" and n.target.endswith("_") and not n.target.endswith("__"))
+            or (n.op == "call_function" and n.target in side_effectful_inplace_ops)
+        ) and n.args[0].meta.get('type', None) == torch.Tensor:
+            n.args[0].replace_all_uses_with(n, delete_user_cb=lambda node: not node in done_nodes)
+    # we can't recompile
+    # it will raise error if we have autograd, customized op, etc.
+    # The good part is we don't need to generate python code
+    # we will use the fx graph directly
+    # traced_model.recompile()
 
 
 def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
@@ -61,6 +88,7 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
             cpu_offload=True,
             record_frames=not CompileFlag.disable_code_line_info,
         )
+    _rewrite_inplace_ops(traced_model)
     return traced_model
 
 

@@ -124,6 +124,8 @@ from .utils import (
     _orig_max,
 
     _orig_node_is_impure,
+
+    side_effectful_inplace_ops,
 )
 from .utils import FrameRecord, ExtraSEFPatcher, extract_results_metadata, EmptyResult
 
@@ -1717,6 +1719,7 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
             default_extra_side_effectful_functions = {
                 operator.setitem,
                 builtins.next,
+                *side_effectful_inplace_ops
             }
             extra_side_effectful_functions = default_extra_side_effectful_functions | dce_ignored_function
             with _Patcher() as patcher, ExtraSEFPatcher(extra_side_effectful_functions):

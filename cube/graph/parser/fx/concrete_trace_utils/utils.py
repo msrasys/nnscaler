@@ -53,6 +53,14 @@ _orig_max: Callable = builtins.max
 
 _orig_node_is_impure: Callable = Node.is_impure
 
+side_effectful_inplace_ops = {
+    operator.iadd, operator.isub, operator.imul, operator.itruediv, operator.ifloordiv,
+    operator.iand, operator.ior, operator.ixor, operator.ilshift, operator.irshift,
+    operator.imod, operator.ipow,
+    # operator.imatmul is not implemented in torch
+    # so let's ignore it now
+}
+
 
 def run_onlyif_instance(cond_type: Type[Any], return_orig: bool = True, return_const: Any = None):
     def helper(fn):
