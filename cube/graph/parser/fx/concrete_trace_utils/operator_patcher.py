@@ -13,7 +13,7 @@ import logging
 
 from textwrap import dedent
 from types import MethodType, FunctionType
-from typing import List, Optional, Callable, Dict
+from typing import List, Optional, Callable, Dict, Tuple
 
 import torch
 
@@ -29,31 +29,73 @@ from .utils import (
 _logger = logging.getLogger(__name__)
 
 
-class TransformerOp(ast.NodeTransformer):
+class TrackedTransformer(ast.NodeTransformer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.modified = False
+
+
+class OperatorTransformer(TrackedTransformer):
+    func_map = {
+            ast.Not: 'not_',     # operator.not_
+            ast.Is: 'is_',       # operator.is_
+            ast.IsNot: 'is_not', # operator.is_not
+            ast.In: 'contains',  # operator.contains
+    }
+    def visit_UnaryOp(self, node: ast.UnaryOp):
+        if _orig_isinstance(node.op, ast.Not):
+            self.modified = True
+            return self.generic_visit(ast.Call(
+                func=ast.Name(id=self.func_map[ast.Not], ctx=ast.Load()),
+                args=[node.operand],
+                keywords=[]
+            ))
+        else:
+            return self.generic_visit(node)
+
+    def visit_Compare(self, node: ast.Compare):
+        if not any(_orig_isinstance(op, (ast.Is, ast.IsNot, ast.In, ast.NotIn)) for op in node.ops):
+            return self.generic_visit(node)
+        if _orig_len(node.ops) != 1:
+            raise RuntimeError('Chained Comparison is not supported')
+        self.modified = True
+        if _orig_isinstance(node.ops[0], (ast.In, ast.NotIn)):
+            args = [node.comparators[0], node.left]
+        else:
+            args = [node.left, node.comparators[0]]
+
+        if not _orig_isinstance(node.ops[0], ast.NotIn):
+            ret_node = ast.Call(
+                    func=ast.Name(id=self.func_map[type(node.ops[0])], ctx=ast.Load()),
+                    args=args,
+                    keywords=[],
+            )
+        else:
+            # not in => operator.not_(operator.contains())
+            in_node = ast.Call(
+                    func=ast.Name(id=self.func_map[ast.In], ctx=ast.Load()),
+                    args=args,
+                    keywords=[],
+            )
+            ret_node = ast.Call(
+                func=ast.Name(id=self.func_map[ast.Not], ctx=ast.Load()),
+                args=[in_node],
+                keywords=[]
+            )
+
+        return self.generic_visit(ret_node)
+
+
+class SuperTransformer(TrackedTransformer):
     """
-    An ast transformer, to check and replace the python ops 'not/is/is not/in/not in' to functions in 'operator' module.
+    Convert super() to super(self.__class__, self)
+    Because in Patcher, we only patch funtions (instead of class).
+    super() is not supported for a standalone function.
     """
-
-    def visit_start(self, node):
-        # to mark if the ast is changed
-        self.is_transformed = False
-
-        # detect the expr now is in a branch test expr
-        # 0: not in a branch test expr.
-        # 1: in propagate if not in func 'visit', or not in a branch test expr in func 'visit'
-        # 2: in a branch test expr
-        self.is_incond_status = 0
-        ret = super().visit(node)
-        return self.is_transformed, ret
-
-    def visit(self, node):
-        if self.is_incond_status != 0:
-            # if the status is 'in branch test',
-            self.is_incond_status -= 1
-        return super().visit(node)
-
     def visit_Call(self, node: ast.Call):
-        if isinstance(node.func, ast.Name) and node.func.id == 'super' and _orig_len(node.args) == 0:
+        if _orig_isinstance(node.func, ast.Name) and node.func.id == 'super' and _orig_len(node.args) == 0:
+            self.modified = True
+            # convert super() to super(self.__class__, self)
             return self.generic_visit(ast.Call(
                 func=ast.Name(id='super', ctx=ast.Load()),
                 args=[
@@ -62,102 +104,47 @@ class TransformerOp(ast.NodeTransformer):
                 ],
                 keywords=node.keywords,
             ))
-        elif not isinstance(node.func, ast.Name) or node.func.id != 'patch_run':
-            self.is_transformed = True
+        else:
+            return self.generic_visit(node)
+
+
+class ProxyCallTransformer(TrackedTransformer):
+    def __init__(self, proxy_call_name: str, ignore_funcs: Optional[List[str]] = None) -> None:
+        """
+        Args:
+            proxy_call_name: the name of the proxy function
+            ignore_funcs: a list of function names that should not be transformed
+        """
+        super().__init__()
+        self.proxy_call_name = proxy_call_name
+        self.ignore_funcs = ignore_funcs or []
+
+    def visit_Call(self, node: ast.Call):
+        # will transform all function call to `proxy_call_name(func_name, *args, **kwargs)`
+        # node.func can be expression, in that case, node.func.id is undefined.
+        if not _orig_isinstance(node.func, ast.Name) or (
+            node.func.id != self.proxy_call_name and node.func.id not in self.ignore_funcs
+        ):
+            self.modified = True
             return self.generic_visit(ast.Call(
-                func=ast.Name(id='patch_run', ctx=ast.Load()),
+                func=ast.Name(id=self.proxy_call_name, ctx=ast.Load()),
                 args=[node.func, *node.args],
                 keywords=node.keywords,
             ))
         else:
             return self.generic_visit(node)
 
-    def visit_While(self, node: ast.While):
-        self.is_incond_status = 2
-        node.test = self.visit(node.test)
-        self.is_incond_status = 0
-        node.body = [self.visit(item) for item in node.body]
-        node.orelse = [self.visit(item) for item in node.orelse]
-        return node
 
-    def visit_If(self, node: ast.If):
-        self.is_incond_status = 2
-        node.test = self.visit(node.test)
-        self.is_incond_status = 0
-        node.body = [self.visit(item) for item in node.body]
-        node.orelse = [self.visit(item) for item in node.orelse]
-        return node
+def transform(node: ast.AST, transformers: List[TrackedTransformer]) -> Tuple[bool, ast.AST]:
+    modified = False
+    for transformer in transformers:
+        node = transformer.visit(node)
+        modified = modified or transformer.modified
 
-    def visit_IfExp(self, node: ast.IfExp):
-        node.body = self.visit(node.body)
-        self.visit(node.body)
-        self.is_incond_status = 2
-        node.test = self.visit(node.test)
-        self.is_incond_status = 0
-        node.orelse = self.visit(node.orelse)
-        return node
-
-    def visit_UnaryOp(self, node: ast.UnaryOp):
-        if self.is_incond_status != 0:
-            # in branch cond test expr, need no replacement
-            self.is_incond_status = 2
-            return self.generic_visit(node)
-        elif _orig_isinstance(node.op, ast.Not):
-            self.is_transformed = True
-            return self.generic_visit(ast.Call(
-                func=ast.Name(id='not_', ctx=ast.Load()),
-                args=[node.operand],
-                keywords=[],
-            ))
-        else:
-            return self.generic_visit(node)
-
-    def visit_BoolOp(self, node: ast.BoolOp):
-        if self.is_incond_status != 0:
-            # in branch cond test expr, need no replacement
-            self.is_incond_status = 2
-            return self.generic_visit(node)
-        else:
-            if not _orig_isinstance(node.values[1], (ast.Call, ast.BoolOp)):
-                _logger.warning('warning: "and/or" will generate branch expr. The 2nd arg can\'t be traced if the 1st arg returns a True.'
-                                ' Don\'t mix up "and/or" and "&/|"!')
-            return self.generic_visit(node)
-
-    def visit_Compare(self, node: ast.Compare):
-        should_replace = False
-        for op in node.ops:
-            if _orig_type(op) in (ast.Is, ast.IsNot, ast.In, ast.NotIn):
-                should_replace = True
-                break
-        if should_replace:
-            if _orig_len(node.ops) != 1:
-                raise RuntimeError(
-                    'not supported in "{} cmp_op {} cmp_op {}" when cmp_op contains "is/is not/in/not in"')
-            self.is_transformed = True
-            func_id = {
-                ast.Is: 'is_',
-                ast.IsNot: 'is_not',
-                ast.In: 'contains',
-                ast.NotIn: 'contains',
-            }[_orig_type(node.ops[0])]
-            if _orig_isinstance(node.ops[0], (ast.In, ast.NotIn)):
-                args = [node.comparators[0], node.left]
-            else:
-                args = [node.left, node.comparators[0]]
-            ret_node = ast.Call(
-                func=ast.Name(id=func_id, ctx=ast.Load()),
-                args=args,
-                keywords=[],
-            )
-            if _orig_isinstance(node.ops[0], ast.NotIn):
-                ret_node = ast.Call(
-                    func=ast.Name(id='not_', ctx=ast.Load()),
-                    args=[ret_node],
-                    keywords=[],
-                )
-            return self.generic_visit(ret_node)
-        else:
-            return self.generic_visit(node)
+    if modified:
+        return True, ast.fix_missing_locations(node)
+    else:
+        return False, node
 
 
 class OperatorPatcher:
@@ -165,11 +152,10 @@ class OperatorPatcher:
     An function patcher, to patch the un-wrappable operator 'not/is/is not/in/not in' to wrappable functions.
     """
 
-    transformer_op = TransformerOp()
-
     def __init__(self, use_operator_patch: bool, operator_patch_backlist: List[str]):
         self.use_operator_patch = use_operator_patch
         self.operator_patch_backlist = operator_patch_backlist
+        self.proxy_call_name = OperatorPatcherContext.patch_run.__name__
 
     def patch_inner(self, func):
         return self.patch_inner_helper(func)
@@ -199,7 +185,12 @@ class OperatorPatcher:
         dedent_src = dedent(source)
         tree = ast.parse(dedent_src)
 
-        is_transformed, new_tree = OperatorPatcher.transformer_op.visit_start(tree)
+        # transformers have states, so we can't reuse them.
+        is_transformed, new_tree = transform(tree, [
+            OperatorTransformer(),
+            SuperTransformer(),
+            ProxyCallTransformer(self.proxy_call_name)
+        ])
         if not is_transformed:
             return func
         else:
@@ -224,7 +215,7 @@ class OperatorPatcher:
             # these decorators are used for tranformers model docstrings generation, can be removed in trace
             transform_useless_decorators = ('add_start_docstrings_to_model_forward', 'add_code_sample_docstrings', 'replace_return_docstrings')
             body0.decorator_list = [i for i in body0.decorator_list
-                if isinstance(i, ast.Call) and isinstance(i.func, ast.Name) and i.func.id == 'patch_run' and
+                if isinstance(i, ast.Call) and isinstance(i.func, ast.Name) and i.func.id == self.proxy_call_name and
                     isinstance(i.args[0], ast.Name) and
                     i.args[0].id not in transform_useless_decorators]
             ast.fix_missing_locations(new_tree)
@@ -246,7 +237,7 @@ class OperatorPatcher:
                     # use func.__code__.co_filename to make the new function easily debuggable.
                     compile(new_tree, func_inner.__code__.co_filename, 'exec'),
                     {
-                        'patch_run': OperatorPatcherContext.patch_run,
+                        self.proxy_call_name: OperatorPatcherContext.patch_run,
                         **func_inner.__globals__,
                         **closure_dict,
                     },
