@@ -14,7 +14,6 @@ def _to_cube_model(module, pas, compute_config, cube_savedir):
         {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
         pas,
         compute_config,
-        dynamic_shape=True,
         cube_savedir=cube_savedir
     )
 

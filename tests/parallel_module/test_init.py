@@ -24,7 +24,6 @@ def _init_params_worker():
             {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},
             PASRandomSPMD,
             ComputeConfig(1, 1),
-            dynamic_shape=True,
             cube_savedir=tempdir,
             reuse='all',
         )

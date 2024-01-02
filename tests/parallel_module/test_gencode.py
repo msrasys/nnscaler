@@ -17,7 +17,6 @@ def _to_cube_model(module, compute_config, cube_savedir, load_module):
         {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
         PASData,
         compute_config,
-        dynamic_shape=True,
         cube_savedir=cube_savedir,
         load_module=load_module
     )
@@ -64,7 +63,6 @@ def test_codegen_slice():
             {'x': torch.tensor([1.0, 2.0, 3.0, 6.0])},
             PASData,
             ComputeConfig(1, 1),
-            dynamic_shape=True,
             cube_savedir=tempdir,
             load_module=False
         )
@@ -93,7 +91,6 @@ def test_codegen_args():
                 },
                 PASData,
                 ComputeConfig(1, 1),
-                dynamic_shape=True,
                 cube_savedir=tempdir,
                 load_module=True
             )
@@ -121,7 +118,6 @@ def _gencode_unused_args_worker(tempdir):
          },
         PASData,
         ComputeConfig(1, 1),
-        dynamic_shape=True,
         cube_savedir=tempdir,
         load_module=True
     )
@@ -176,7 +172,6 @@ def _gencode_unused_args_worker2(tempdir):
          },
         PASData,
         ComputeConfig(1, 1),
-        dynamic_shape=True,
         cube_savedir=tempdir,
         load_module=True
     )
@@ -239,7 +234,6 @@ def test_codegen_attr():
             {'x': torch.tensor([1.0, 2.0, 3.0, 6.0]), 'attr': AttrHelper()},
             PASData,
             ComputeConfig(1, 1),
-            dynamic_shape=True,
             cube_savedir=tempdir,
             load_module=False
         )
@@ -272,7 +266,6 @@ def test_codegen_getitem():
             {'batched_data': {'x': torch.tensor([[[1.0], [2.0], [3.0], [6.0]]])}},
             PASRandomSPMD,
             ComputeConfig(2, 2),
-            dynamic_shape=True,
             cube_savedir=tempdir,
             load_module=False,
         )
@@ -303,7 +296,6 @@ def test_codegen_training_flag():
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
             PASData,
             ComputeConfig(1, 1),
-            dynamic_shape=True,
             cube_savedir=tempdir,
             load_module=False
         )
@@ -332,7 +324,6 @@ def test_codegen_training_flag():
 #             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
 #             PASData,
 #             ComputeConfig(1, 2),
-#             dynamic_shape=True,
 #             cube_savedir=tempdir,
 #             load_module=False
 #         )
@@ -364,7 +355,6 @@ def test_codegen_iter():
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
             PASData,
             ComputeConfig(1, 1),
-            dynamic_shape=True,
             cube_savedir=tempdir,
             load_module=False
         )
@@ -395,7 +385,6 @@ def test_codegen_const():
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
             PASData,
             ComputeConfig(1, 1),
-            dynamic_shape=True,
             cube_savedir=tempdir,
             load_module=False
         )
@@ -435,7 +424,6 @@ def test_codegen_tensor_slice():
                 {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
                 PASData,
                 ComputeConfig(1, 1),
-                dynamic_shape=True,
                 cube_savedir=tempdir,
                 load_module=False,
                 reuse='none',
@@ -447,7 +435,6 @@ def test_codegen_tensor_slice():
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
             PASData,
             ComputeConfig(1, 1),
-            dynamic_shape=True,
             cube_savedir=tempdir,
             load_module=False,
             reuse='none',
@@ -475,7 +462,6 @@ def test_codegen_dictget():
             }},
             PASRandomSPMD,
             ComputeConfig(2, 2),
-            dynamic_shape=True,
             cube_savedir=tempdir,
             load_module=False,
         )

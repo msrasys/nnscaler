@@ -43,6 +43,9 @@ class ComputeConfig:
     plan_ngpus: int
     runtime_ngpus: int
 
+    # whether to use dynamic shape to generate code
+    dynamic_shape: bool = True
+
     use_zero: bool = False
     zero_ngroups: int = 1
 
@@ -346,7 +349,6 @@ def _gencode(
         compute_config: ComputeConfig,
         outdir: Path,
         *,
-        dynamic_shape: bool = True,
         module_dtype:  Optional[torch.dtype] = None,
         module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     ) -> None:
@@ -366,7 +368,6 @@ def _gencode(
         pas_policy (Callable[[IRGraph, ComputeConfig], IRGraph]): the pas policy
         compute_config (ComputeConfig): the environment resource
         outdir (Path): the directory to save generated code
-        dynamic_shape (bool): whether to use dynamic shape
         module_dtype (Optional[torch.dtype]): the dtype of the module. Keep as it is when it is None.
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
 
@@ -399,7 +400,7 @@ def _gencode(
         if any(isinstance(m, CubeModule) for m in module.modules()):
             raise RuntimeError('CubeModule can not be nested.')
 
-        graph, forward_args = _gen_graph(module, dummy_input, outdir, dynamic_shape)
+        graph, forward_args = _gen_graph(module, dummy_input, outdir, compute_config.dynamic_shape)
         graph.dump(graph_ckp)
         torch.save(forward_args, forward_args_ckp)
 
@@ -491,7 +492,6 @@ def parallelize(
     pas_policy: Callable[[IRGraph, ComputeConfig], IRGraph],
     compute_config: ComputeConfig,
     *,
-    dynamic_shape: bool = True,
     cube_savedir: Union[str, Path] = './.cube',
     reuse: Union[ReuseType, str] = ReuseType.ALL,
     instance_name: Optional[str] = None,
@@ -554,7 +554,6 @@ def parallelize(
         dummy_input (dict): the dummy input for the module
         pas_policy (Callable[[IRGraph, ComputeConfig], IRGraph]): the pas policy
         compute_config (ComputeConfig): the environment resource
-        dynamic_shape (bool): whether to use dynamic shape
         reuse (ReuseType): specify which part can be reused.
         cube_savedir (Union[str, Path]): the directory to save generated code
         instance_name (Optional[str]): the instance name of the generated module.
@@ -593,7 +592,6 @@ def parallelize(
                     pas_policy,
                     compute_config,
                     outdir,
-                    dynamic_shape=dynamic_shape,
                     module_dtype=module_dtype,
                     module_fn=module_fn,
                 )
