@@ -1,8 +1,19 @@
+import os
+import sys
+from typing import Type
 from contextlib import contextmanager
 from typing import Callable
-import torch
 import math
 import random
+from datetime import timedelta
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+import torch.distributed.distributed_c10d as c10d
+
+from cube.runtime.module import ParallelModule
+from cube.runtime.device import DeviceGroup, CompileFlag
 
 
 def init_parameter(model: torch.nn.Module, seed: int = 0):
@@ -83,14 +94,16 @@ def replace_all_device_with(device='cpu'):
     orig_cpu = torch.Tensor.cpu
 
     def patch_tensor_constructor(fn):
+        orig_func = getattr(fn, '__cube_orig_func__', fn)  # to support nested patching
         def wrapper(*args, **kwargs):
             kwargs["device"] =device
-            return fn(*args, **kwargs)
-        wrapper.__name__ = fn.__name__
-        wrapper.__qualname__ = fn.__qualname__
+            return orig_func(*args, **kwargs)
+        wrapper.__name__ = orig_func.__name__
+        wrapper.__qualname__ = orig_func.__qualname__
+        wrapper.__cube_orig_func__ = orig_func
         return wrapper
     # these constructors are enough for most cases
-    patched_tensor_constructors = [
+    patched_tensor_constructor_names = [
         'empty', 'zeros', 'ones', 'full', 'eye',
         'linspace', 'logspace', 'arange',
         'rand', 'randn', 'randint', 'randperm',
@@ -99,11 +112,23 @@ def replace_all_device_with(device='cpu'):
     ]
     old_tensor_constructors = {
         tf_name: getattr(torch, tf_name)
-        for tf_name in patched_tensor_constructors
+        for tf_name in patched_tensor_constructor_names
     }
     patched_tensor_constructors = {
         tf_name: patch_tensor_constructor(fn)
         for tf_name, fn in old_tensor_constructors.items()
+    }
+
+    patched_tensor_member_constructor_names = [
+        'new_empty', 'new_zeros', 'new_ones', 'new_full', 'new_tensor'
+    ]
+    old_tensor_member_constructors = {
+        tf_name: getattr(torch.Tensor, tf_name)
+        for tf_name in patched_tensor_member_constructor_names
+    }
+    patched_tensor_member_constructors = {
+        tf_name: patch_tensor_constructor(fn)
+        for tf_name, fn in old_tensor_member_constructors.items()
     }
 
     def patched_to(self, *args, **kwargs):
@@ -129,6 +154,10 @@ def replace_all_device_with(device='cpu'):
         for tf_name, fn in old_tensor_constructors.items():
             setattr(torch, tf_name, patched_tensor_constructors[tf_name])
 
+        # patch tensor member constructors
+        for tf_name, fn in old_tensor_member_constructors.items():
+            setattr(torch.Tensor, tf_name, patched_tensor_member_constructors[tf_name])
+
         # patch concrete tracer's autowrap leaf function
         for tf_name, fn in old_tensor_constructors.items():
             leaf_info = ConcreteTracer.default_autowrap_leaf_function.pop(fn, None)
@@ -144,8 +173,106 @@ def replace_all_device_with(device='cpu'):
                 ConcreteTracer.default_autowrap_leaf_function[
                     old_tensor_constructors[tf_name]
                 ] = leaf_info
+        for tf_name, fn in old_tensor_member_constructors.items():
+            setattr(torch.Tensor, tf_name, fn)
         for tf_name, fn in old_tensor_constructors.items():
             setattr(torch, tf_name, fn)
         torch.Tensor.to = orig_to
         torch.Tensor.cuda = orig_cuda
         torch.Tensor.cpu = orig_cpu
+
+
+# mock process group is from pytorch testing code
+# import torch.testing._internal.distributed.distributed_utils
+
+class MockProcessGroup(dist.ProcessGroup):
+    def __init__(self, rank, world):
+        super().__init__(rank, world)
+
+    def getBackendName(self):
+        return "cube_mock_pg"
+
+
+def create_mock_pg(prefix_store, rank, world_size, timeout):
+    return MockProcessGroup(rank, world_size)
+
+
+dist.Backend.register_backend('cube_mock_pg', create_mock_pg)
+
+
+def mock_init_dist(rank, world_size):
+    if dist.is_initialized():
+        raise ValueError("dist is already initialized, cannot mock init")
+
+    store = dist.HashStore()
+
+    dist.init_process_group(
+        backend="cube_mock_pg",
+        rank=rank,
+        world_size=world_size,
+        store=store,
+        group_name="cube_fake",
+        timeout=timedelta(seconds=1))
+
+
+@contextmanager
+def mock_dist(rank, world_size):
+    """
+    Mock dist.init_process_group for testing
+    """
+
+    old_store_based_barrier = c10d._store_based_barrier
+    try:
+        c10d._store_based_barrier = lambda *args, **kwargs: None
+        mock_init_dist(rank, world_size)
+        yield
+    finally:
+        dist.destroy_process_group()
+        c10d._store_based_barrier = old_store_based_barrier
+
+
+@contextmanager
+def mock_cube_env(cube_module_cls: Type[ParallelModule], compute_config):
+    old_device_group = DeviceGroup.instance
+    old_dev_mode = CompileFlag.dev_mode
+    used_cuda_fns = ['set_device', 'current_device', 'default_stream']
+    old_cuda_fns = {
+        fname: getattr(torch.cuda, fname)
+        for fname in used_cuda_fns
+    }
+    torchrun_envs = ['RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'LOCAL_WORLD_SIZE', 'GROUP_RANK']
+    old_envs = {
+        env: os.environ.get(env, None)
+        for env in torchrun_envs
+    }
+    try:
+        DeviceGroup.instance = None
+        CompileFlag.dev_mode = False
+        for fname, fn in old_cuda_fns.items():
+            setattr(torch.cuda, fname, lambda *args, **kwargs: None)
+        os.environ['RANK'] = os.environ['LOCAL_RANK'] = str(cube_module_cls.rank)
+        os.environ['WORLD_SIZE'] = os.environ['LOCAL_WORLD_SIZE'] = str(compute_config.runtime_ngpus)
+        os.environ['GROUP_RANK'] = '0'
+        yield
+    finally:
+        for env, val in old_envs.items():
+            if val is None:
+                del os.environ[env]
+            else:
+                os.environ[env] = val
+        for fname, fn in old_cuda_fns.items():
+            setattr(torch.cuda, fname, fn)
+        CompileFlag.dev_mode = old_dev_mode
+        DeviceGroup.instance = old_device_group
+
+
+def new_empty(cube_module_cls: Type[ParallelModule]):
+    """
+    Create a new instance with empty weights.
+
+    This is useful when you want to get model information (e.g. fullmap/zero) without allocating memory.
+    """
+    module_file = Path(sys.modules[cube_module_cls.__module__].__file__)
+    compute_config = torch.load(module_file.with_name(f"{cube_module_cls.COMPUTE_CONFIG_FILE}"))
+    with replace_all_device_with('meta'), mock_cube_env(cube_module_cls, compute_config), mock_dist(cube_module_cls.rank, compute_config.runtime_ngpus):
+        return cube_module_cls(init_params=False)

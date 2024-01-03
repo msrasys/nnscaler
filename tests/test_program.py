@@ -21,20 +21,24 @@ def test_program_model_nested_input():
             x = x + self.param1
             return {'loss': torch.sum(x)}
 
-    CompileFlag.dev_mode = True
-    Program().clear()    
+    old_dev_mode = CompileFlag.dev_mode
+    try:
+        CompileFlag.dev_mode = True
+        Program().clear()
 
-    dummy_input = {'x': {'data': torch.randn(4, 4)}}
-    module = MyModule()
-    model = SemanticModel(module, save_content=False, dynamic_shape=False)
+        dummy_input = {'x': {'data': torch.randn(4, 4)}}
+        module = MyModule()
+        model = SemanticModel(module, save_content=False, dynamic_shape=False)
 
-    obj = IRObject(value=dummy_input['x'])
-    model(obj)
-    graph = model.get_graph()
-    print(graph.extra_repr())
+        obj = IRObject(value=dummy_input['x'])
+        model(obj)
+        graph = model.get_graph()
+        print(graph.extra_repr())
 
-    assert graph.input(0) == obj
-    # getitem
-    assert graph.node(0).input(0) == obj
-    # getitem
-    assert graph.node(1).input(0) == obj
+        assert graph.input(0) == obj
+        # getitem
+        assert graph.node(0).input(0) == obj
+        # getitem
+        assert graph.node(1).input(0) == obj
+    finally:
+        CompileFlag.dev_mode = old_dev_mode

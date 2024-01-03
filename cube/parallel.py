@@ -77,13 +77,10 @@ class ComputeConfig:
 
 
 @contextmanager
-def _flags(flags, warning_on_override=True, /, **kwargs):
+def _flags(flags, /, **kwargs):
     old_flags = {}
     for k, v in kwargs.items():
         old_flags[k] = getattr(flags, k)
-        if old_flags[k] != v:
-            if warning_on_override:
-                logger.warning(f"{flags}.{k}={old_flags[k]} is not supported. Changed to {v}.")
         setattr(flags, k, v)
     try:
         yield
@@ -102,7 +99,7 @@ def _compile_flags(compute_config: ComputeConfig):
 
 
 def _runtime_flags(**kwargs):
-    return _flags(RuntimeFlag, False, **kwargs)
+    return _flags(RuntimeFlag, **kwargs)
 
 
 def _complex(val: Any):
