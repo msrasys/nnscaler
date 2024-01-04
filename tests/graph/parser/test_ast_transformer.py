@@ -1,5 +1,8 @@
 import ast
 from textwrap import dedent
+import sys
+
+import pytest
 
 from cube.graph.parser.fx.concrete_trace_utils.operator_patcher import (
     OperatorTransformer,
@@ -8,6 +11,7 @@ from cube.graph.parser.fx.concrete_trace_utils.operator_patcher import (
     transform
 )
 
+@pytest.mark.skipif(sys.version_info < (3, 9), reason='ast.unparse is not available in python3.8')
 def test_op_transfomer():
     tree = ast.parse(dedent('''
         x = True
@@ -44,6 +48,7 @@ def test_op_transfomer():
         ''').strip()
 
 
+@pytest.mark.skipif(sys.version_info < (3, 9), reason='ast.unparse is not available in python3.8')
 def test_super_transform():
     tree = ast.parse(dedent('''
         class A:
@@ -81,6 +86,7 @@ def test_super_transform():
         ''').strip()
 
 
+@pytest.mark.skipif(sys.version_info < (3, 9), reason='ast.unparse is not available in python3.8')
 def test_proxy_call_transform():
     # the `(x+y)(a, b)` statement below just demonstrates
     # AST doesn't care about the real meaning of the expression.
@@ -110,6 +116,7 @@ def test_proxy_call_transform():
         ''').strip()
 
 
+@pytest.mark.skipif(sys.version_info < (3, 9), reason='ast.unparse is not available in python3.8')
 def test_transform_combine():
     tree = ast.parse(dedent('''
         x = not True
