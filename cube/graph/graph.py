@@ -203,7 +203,8 @@ class IRGraph(IRSegment):
             if isinstance(obj, IRFullTensor) and obj.is_grad(): continue
             consumers = graph.consumers(obj)
             if len(consumers) == 0 and obj not in graph_output_objects:
-                if len(graph.producers(obj)) > 0:
+                producers = [n for n in graph.producers(obj) if not isinstance(n, IRGraphAnchor)]
+                if len(producers) > 0:
                     unused_obj_nodes.setdefault(obj, []).extend(graph.producers(obj))
         if len(unused_obj_nodes) > 0:
             dscp = (f'Following returns of nodes are not used by any other nodes.\n'
