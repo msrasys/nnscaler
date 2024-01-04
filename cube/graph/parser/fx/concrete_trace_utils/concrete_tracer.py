@@ -99,6 +99,7 @@ from .utils import (
 
     _orig_range,
     _orig_int,
+    _orig_float,
     _orig_bool,
     _orig_tuple,
     _orig_list,
@@ -255,6 +256,7 @@ class ConcreteTracer(TracerBase):
         # we don't want zip appear as a node in the graph
         # _orig_zip:                  ([], False),
         _orig_int:                  ([], False),
+        _orig_float:                ([], False),
 
         # iterable class
         _orig_tuple:                ([], True),
@@ -1401,6 +1403,16 @@ def _create_wrapped_leaf_method(tracer: ConcreteTracer, method, name: str, to_fu
     return method_wrapper
 
 def _create_wrapped_leaf_class(tracer: ConcreteTracer, clz):
+    """
+    Wrap a class as a tracable class, we usually wrap some classes that can be seen as creation functions.
+    For example, we can prevent the trace be interrupted by wrap ```tuple``` in the following case:
+
+        ...
+        # x is a scalar
+        x_value = int(x)
+        new_x = torch.tensor([x_value, x_value])
+        ...
+    """
     class clz_wrapper_clz:
         @functools.wraps(clz)
         def __call__(self, *args, **kwargs):
@@ -1422,9 +1434,26 @@ def _create_wrapped_leaf_class(tracer: ConcreteTracer, clz):
             return id(__o) in (id(self), id(clz))
         def __hash__(self):
             return id(self)
-    return clz_wrapper_clz()
+    clz_wrapper = clz_wrapper_clz()
+    for name in dir(clz):
+        attr = _orig_getattr(clz, name)
+        if not name.startswith('_'):
+            if _orig_isinstance(attr, Callable):
+                setattr(clz_wrapper, name, _create_wrapped_leaf_method(tracer, attr, name, None))
+            else:
+                setattr(clz_wrapper, name, attr)
+    return clz_wrapper
 
 def _create_wrapped_leaf_iterable_class(tracer: ConcreteTracer, clz):
+    """
+    Wrap a class as a tracable class, we usually wrap some classes that can be seen as creation functions.
+    For example, we can prevent the trace be interrupted by wrap ```tuple``` in the following case:
+
+        ...
+        # x is a tensor
+        x_1st = tuple(x)[0]
+        ...
+    """
     class clz_wrapper_clz:
         @functools.wraps(clz)
         def __call__(self, *args, **kwargs):

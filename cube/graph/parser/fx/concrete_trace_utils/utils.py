@@ -25,6 +25,7 @@ _orig_getattr: Callable = builtins.getattr
 
 _orig_range: Type[Any] = builtins.range
 _orig_int: Type[Any] = builtins.int
+_orig_float: Type[Any] = builtins.float
 _orig_bool: Type[Any] = builtins.bool
 _orig_tuple: Type[Any] = builtins.tuple
 _orig_list: Type[Any] = builtins.list
