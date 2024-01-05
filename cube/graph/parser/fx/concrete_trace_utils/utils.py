@@ -60,6 +60,7 @@ side_effectful_inplace_ops = {
     operator.imod, operator.ipow,
     # operator.imatmul is not implemented in torch
     # so let's ignore it now
+    operator.setitem,
 }
 
 

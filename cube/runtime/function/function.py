@@ -1,6 +1,7 @@
 from typing import Optional, List, Tuple, Union
 import torch
 import torch.nn.functional as TorchF
+import operator
 
 
 def identity(tensor: torch.Tensor) -> torch.Tensor:
@@ -210,3 +211,8 @@ def cat(*tensors, dim=0) -> torch.Tensor:
 
 def nndropout(input: torch.Tensor, p=0.5, inplace=False):
     return torch.nn.Dropout(p, inplace)(input)
+
+
+def setitem(__a, __b, __c):
+    operator.setitem(__a, __b, __c)
+    return __a

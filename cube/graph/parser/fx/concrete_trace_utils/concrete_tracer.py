@@ -1785,7 +1785,6 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
             # some side effectful functions that should not be deleted during dead code elimination
             # there may be more than listed here
             default_extra_side_effectful_functions = {
-                operator.setitem,
                 builtins.next,
                 *side_effectful_inplace_ops
             }

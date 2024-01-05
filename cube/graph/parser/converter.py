@@ -49,6 +49,11 @@ def _rewrite_inplace_ops(traced_model: torch.fx.GraphModule):
             (n.op == "call_method" and n.target.endswith("_") and not n.target.endswith("__"))
             or (n.op == "call_function" and n.target in side_effectful_inplace_ops)
         ) and n.args[0].meta.get('type', None) == torch.Tensor:
+            # setitem is a special inplace operator that returns None instead of the first modified argument,
+            # to make it align with SSA format, we use cube runtime function to return the first argument
+            if n.op == "call_function" and n.target == operator.setitem:
+                n.meta = n.args[0].meta
+                n.target = cube_rt_function.setitem
             n.args[0].replace_all_uses_with(n, delete_user_cb=lambda node: not node in done_nodes)
     # we can't recompile
     # it will raise error if we have autograd, customized op, etc.

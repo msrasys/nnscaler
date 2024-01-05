@@ -1,8 +1,10 @@
 import operator
+import _operator
 import torch
 
 from cube.graph.parser.converter import to_fx_graph
 from cube.graph.parser.fx.concrete_trace_utils.utils import side_effectful_inplace_ops
+import cube.runtime.function as cube_rt_function
 
 from ...utils import replace_all_device_with
 
@@ -20,8 +22,13 @@ def test_side_effectful_inplace_ops():
     bool_inplace_ops = {
         operator.iand, operator.ior, operator.ixor,
     }
+    # add _operator versions to make it sure it still equals with operator version
+    # in the future
+    complex_inplace_ops = {
+        operator.setitem, _operator.setitem
+    }
 
-    assert int_inplace_ops.union(float_inplace_ops, bool_inplace_ops) == side_effectful_inplace_ops
+    assert int_inplace_ops.union(float_inplace_ops, bool_inplace_ops, complex_inplace_ops) == side_effectful_inplace_ops
 
     not_implemented_mat_inplace_ops = {
         operator.imatmul
@@ -129,3 +136,59 @@ def test_inplace_op():
     assert nodes[8].op == 'output'
     assert nodes[8].args[0] == nodes[7]  # return value of `return w`
 
+
+class SetItemModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.num_heads = 4
+        self.graph_token_virtual_distance = torch.nn.Embedding(1, self.num_heads)
+ 
+    def forward(self, x):
+        t = self.graph_token_virtual_distance.weight.view(1, self.num_heads, 1)
+        x[:, :, 1:, 0] = (
+                x[:, :, 1:, 0] + t
+        )
+        x[:, :, 0, :]  = (
+                x[:, :, 0, :] + t
+        )
+        return x
+    
+
+@replace_all_device_with('cpu')
+def test_inplace_setitem_op():
+    model = SetItemModule()
+    dummy_input = {'x': torch.rand(4,4,4,4)}
+
+    traced_graph = to_fx_graph(model, dummy_input)
+
+    assert torch.equal(
+        model(dummy_input['x']),
+        traced_graph(dummy_input['x'])
+    )
+
+    nodes = list(traced_graph.graph.nodes)
+    for idx, node in enumerate(nodes):
+        target_name = node.target.__name__ if hasattr(node.target, '__name__') else node.target
+        print(f'{idx}: ({node.op}) {node} = {target_name}{node.args}')
+
+    assert nodes[0].op == 'placeholder'
+    assert nodes[0].name == 'x'
+
+    assert nodes[1].op == 'get_attr'
+    assert nodes[1].name == 'graph_token_virtual_distance_weight'
+
+    assert nodes[5].op == 'call_function'
+    assert nodes[5].name == 'setitem'
+    assert nodes[5].target == cube_rt_function.setitem
+    
+    assert nodes[6].op == 'call_function'
+    assert nodes[6].name == 'getitem_1'
+    assert nodes[6].args[0] == nodes[5]
+
+    assert nodes[8].op == 'call_function'
+    assert nodes[8].name == 'setitem_1'
+    assert nodes[8].target == cube_rt_function.setitem
+    assert nodes[8].args[0] == nodes[5]
+
+    print(nodes[9].args[0])
+    assert nodes[9].args[0] == nodes[8]
