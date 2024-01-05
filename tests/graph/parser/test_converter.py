@@ -9,7 +9,10 @@ from cube.graph.parser.converter import to_fx_graph, to_ir_graph
 from cube.graph.parser import FxModuleParser
 from cube.ir.cten import IRObject, IRTensor
 
+from ...utils import replace_all_device_with
 
+
+@replace_all_device_with('cpu')
 def test_to_graph():
     class MyModule(torch.nn.Module):
         def __init__(self):
@@ -58,6 +61,7 @@ def test_to_graph():
         assert any(node.signature == 'torch.nn.functional.linear' for node in nodes)
 
 
+@replace_all_device_with('cpu')
 def test_record_codeline():
     class MyModule(torch.nn.Module):
         def __init__(self):
@@ -78,6 +82,7 @@ def test_record_codeline():
             raise RuntimeError(err_msg)
 
 
+@replace_all_device_with('cpu')
 def test_record_metadata():
     class MyModule(torch.nn.Module):
         def __init__(self):

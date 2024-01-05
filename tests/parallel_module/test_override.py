@@ -119,10 +119,7 @@ def _worker():
         assert (test5_module_path / 'graph.ckp').stat().st_mtime_ns != graph_stat.st_mtime_ns
         assert (test5_module_path / 'forward_args.pkl').exists()
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_override():
-    if not torch.cuda.is_available():
-        print('skip test_submodules_tp_gpu1 due to lack of cuda devices')
-        return
     launch_torchrun(1, _worker)
 

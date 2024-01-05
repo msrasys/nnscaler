@@ -5,6 +5,8 @@ from cube.parallel import _gen_graph
 from cube.ir.operator import IRFwOperation
 from cube.algorithm.ops.dimops import gen_partitions
 
+from ...utils import replace_all_device_with
+
 class NaiveFFN(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -18,6 +20,8 @@ class NaiveFFN(torch.nn.Module):
         x = self.linear2(x)
         return x
 
+
+@replace_all_device_with('cpu')
 def test_gen_partitions():
     with tempfile.TemporaryDirectory() as tempdir:
         graph, _ = _gen_graph(NaiveFFN(), {'x': torch.randn(2, 128, 1024)}, tempdir, False)

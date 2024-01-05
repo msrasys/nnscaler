@@ -3,14 +3,17 @@ import torch
 
 from cube.graph.parser.converter import to_fx_graph
 
+from ...utils import replace_all_device_with
 
+
+@replace_all_device_with('cpu')
 def test_no_grad():
     class SimpleModel(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.fc1 = torch.nn.Linear(10, 10)
             self.fc2 = torch.nn.Linear(10, 10)
-        
+
         def forward(self, x):
             with torch.no_grad():
                 x = self.fc1(x)

@@ -1,6 +1,8 @@
 from pathlib import Path
 import shutil
 import tempfile
+
+import pytest
 import torch
 from torch import nn
 
@@ -71,9 +73,12 @@ def _inference_worker(ngpus):
             cube_result = cube_model(data)
             assert torch.allclose(result, cube_result, atol=1e-4)
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_inference1():
     torchrun(1, _inference_worker, 1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_inference2():
     torchrun(2, _inference_worker, 2)

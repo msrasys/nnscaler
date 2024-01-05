@@ -37,10 +37,8 @@ def _gencode_worker(tempdir):
         _to_cube_model(m, ComputeConfig(1, 1), cube_savedir=tempdir, load_module=True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_codegen():
-    if not torch.cuda.is_available():
-        print('skip test_codegen due to lack of cuda devices')
-        return
     with tempfile.TemporaryDirectory() as tempdir:
         m = Module0()
         m_new = _to_cube_model(m, ComputeConfig(2, 4), cube_savedir=tempdir, load_module=False)
@@ -140,14 +138,12 @@ def _gencode_unused_args_worker(tempdir):
         # y must be None
         m_new(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), 1)
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_codegen_unused_args():
     """
     Verify that unused args are supported by parallalize
     """
-    if not torch.cuda.is_available():
-        print('skip test_unused_input due to lack of cuda devices')
-        return
-
     with tempfile.TemporaryDirectory() as tempdir:
         launch_torchrun(1, _gencode_unused_args_worker, tempdir)
 
@@ -191,14 +187,11 @@ def _gencode_unused_args_worker2(tempdir):
         m_new(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), 1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_codegen_unused_args2():
     """
     Verify that unused args are supported by parallalize
     """
-    if not torch.cuda.is_available():
-        print('skip test_codegen_unused_args2 due to lack of cuda devices')
-        return
-
     with tempfile.TemporaryDirectory() as tempdir:
         launch_torchrun(1, _gencode_unused_args_worker2, tempdir)
 

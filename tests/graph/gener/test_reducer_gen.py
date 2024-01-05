@@ -11,6 +11,8 @@ from cube.ir.adapter import IRWeightReducer
 import torch
 import tempfile
 
+from ...utils import replace_all_device_with
+
 
 def make_param(shape, dtype) -> IRFullTensor:
     param = IRFullTensor(shape=shape, dtype=dtype, requires_grad=True)
@@ -31,7 +33,7 @@ class ReducerModule(torch.nn.Module):
         x = x + self.param1
         x = torch.sum(x)
         return x
-    
+
 
 def build_graph():
     # build graph
@@ -47,6 +49,7 @@ def build_graph():
     return graph
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_cross_segment_weight_reducer():
 
     graph = build_graph()
@@ -59,7 +62,7 @@ def test_cross_segment_weight_reducer():
             continue
         for node in segment.nodes():
             graph.assign(node, idx)
-        
+
     print(graph.extra_repr())
 
     # build reducer
@@ -72,6 +75,7 @@ def test_cross_segment_weight_reducer():
     assert reducers[0].device == (0, 1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_replicate_shared_param():
 
     graph = build_graph()
@@ -87,6 +91,7 @@ def test_replicate_shared_param():
     assert len(reducers) == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_reducer_partially_shared_part():
     graph = build_graph()
     [matmul1, matmul2, add, sum] = graph.select(ntype=IRFwOperation)
@@ -103,7 +108,7 @@ def test_reducer_partially_shared_part():
         sn1, sn2 = graph.replicate(node, 2)
         graph.assign(sn1, 0)
         graph.assign(sn2, 1)
-    
+
     print(graph.extra_repr())
 
     with pytest.raises(RuntimeError):

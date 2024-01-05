@@ -44,10 +44,8 @@ def _init_params_worker():
             assert torch.all(p3 == 0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_init_params():
-    if not torch.cuda.is_available():
-        print('skip test_init_params due to lack of cuda devices')
-        return
     launch_torchrun(1, _init_params_worker)
 
 

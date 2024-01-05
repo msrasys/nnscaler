@@ -2,6 +2,7 @@ from typing import List
 
 import cube
 import torch
+import pytest
 
 from ..launch_torchrun import launch_torchrun, clone_to_cpu
 
@@ -98,11 +99,8 @@ def _2gpu_worker():
 
     return result
 
-
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_2gpu():
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        print('skip test_2gpu due to lack of cuda devices')
-        return
     results = launch_torchrun(2, _2gpu_worker)
 
     for op in ['', '_async']:
@@ -189,10 +187,8 @@ def _3gpu_worker():
     return result
 
 
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 3, reason='lack of gpu devices')
 def test_3gpu():
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 3:
-        print('skip test_3gpu due to lack of cuda devices')
-        return
     results = launch_torchrun(3, _3gpu_worker)
 
     for op in ['', '_async']:

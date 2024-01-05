@@ -48,8 +48,6 @@ def _nested_module_worker():
             _to_cube_model(Module2(), PASData, ComputeConfig(1, 1), cube_savedir=tempdir)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_nested_module():
-    if not torch.cuda.is_available():
-        print('skip test_nested_module due to lack of cuda devices')
-        return
     launch_torchrun(1, _nested_module_worker)

@@ -125,11 +125,9 @@ def _gpu_worker(pas, ngpus, update_freq):
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 @pytest.mark.parametrize('update_freq', [1, 2, 4])
 def test_submodules_tp_gpu1(update_freq):
-    if not torch.cuda.is_available():
-        print('skip test_submodules_tp_gpu1 due to lack of cuda devices')
-        return
     results = launch_torchrun(1, _gpu_worker, PASRandomSPMD, 1, update_freq)
     orig_results, compiled_results, _, _, _, _ = results[0]
     for orig, compiled in zip(orig_results, compiled_results):
@@ -186,11 +184,9 @@ def _compare_weights(orig0, orig1, compiled0, compiled1, fc1_fullmap, fc2_fullma
         assert torch.allclose(v, orig0[k], rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 @pytest.mark.parametrize('update_freq', [1, 2, 4])
 def test_submodules_tp_gpu2(update_freq):
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        print('skip test_submodules_tp_gpu2 due to lack of cuda devices')
-        return
     results = launch_torchrun(2, _gpu_worker, PASRandomSPMD, 2, update_freq)
     results0, results1 = results[0], results[1]
     eps = 1e-4
@@ -221,11 +217,9 @@ def test_submodules_tp_gpu2(update_freq):
         _compare_weights(orig0[3], orig1[3], compiled0[3], compiled1[3], fc1_fullmap, fc2_fullmap, fc1_dist_param_map, fc2_dist_param_map)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='cuda is not available')
 @pytest.mark.parametrize('update_freq', [1, 2, 4])
 def test_submodules_dp_gpu1(update_freq):
-    if not torch.cuda.is_available():
-        print('skip test_submodules_dp_gpu1 due to lack of cuda devices')
-        return
     results = launch_torchrun(1, _gpu_worker, PASData, 1, update_freq)
     orig_results, compiled_results, _, _, _, _ = results[0]
     for orig, compiled in zip(orig_results, compiled_results):
@@ -245,11 +239,9 @@ def test_submodules_dp_gpu1(update_freq):
             assert torch.allclose(orig[3][k], compiled_cleaned[k.replace('.', '_')], rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 @pytest.mark.parametrize('update_freq', [1, 2, 4])
 def test_submodules_dp_gpu2(update_freq):
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        print('skip test_submodules_dp_gpu2 due to lack of cuda devices')
-        return
     eps = 1e-4
     results = launch_torchrun(2, _gpu_worker, PASData, 2, update_freq)
     for r in results.values():

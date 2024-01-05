@@ -3,14 +3,17 @@ import torch
 
 from cube.graph.parser.converter import to_fx_graph
 
+from ...utils import replace_all_device_with
 
+
+@replace_all_device_with('cpu')
 def test_dce_useless_next():
     class SimpleModel(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.m_dict = torch.nn.ModuleDict({'test': torch.nn.Linear(10, 8)})
             self.m_keys = ['test', 'default']
-        
+
         def forward(self, x):
             for key in self.m_keys:
                 # TODO: (ning) This kind of code style will call instruction 'BINARY_SUBSCR'

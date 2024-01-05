@@ -1,3 +1,4 @@
+import pytest
 
 import torch
 from cube.program import SemanticModel, Program
@@ -5,6 +6,7 @@ from cube.flags import CompileFlag
 from cube.ir.cten import IRObject
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='cuda is not available')
 def test_program_model_nested_input():
 
     class MyModule(torch.nn.Module):

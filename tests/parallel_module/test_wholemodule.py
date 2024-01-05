@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 import shutil
 
+import pytest
 import torch
 from torch import nn
 import numpy as np
@@ -110,10 +111,8 @@ def _gpu_worker(pas, ngpus):
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_module_tp_gpu1():
-    if not torch.cuda.is_available():
-        print('skip test_submodules_tp_gpu1 due to lack of cuda devices')
-        return
     results = launch_torchrun(1, _gpu_worker, PASRandomSPMD, 1)
     orig_results, compiled_results, _, _ = results[0]
     for orig, compiled in zip(orig_results, compiled_results):
@@ -141,10 +140,8 @@ def _compare_weights(orig0, orig1, compiled0, compiled1, module_fullmap, module_
         assert torch.allclose(v, orig0[k], rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_module_tp_gpu2():
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        print('skip test_submodules_tp_gpu2 due to lack of cuda devices')
-        return
     results = launch_torchrun(2, _gpu_worker, PASRandomSPMD, 2)
     results0, results1 = results[0], results[1]
     eps = 1e-4

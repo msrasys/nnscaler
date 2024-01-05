@@ -3,7 +3,10 @@ import torch
 from cube.ir.cten import IRObject, IRTensor
 from cube.graph.parser.converter import to_fx_graph, to_ir_graph
 
+from ...utils import replace_all_device_with
 
+
+@replace_all_device_with('cpu')
 def test_multi_consume():
 
     class MyModule(torch.nn.Module):
@@ -34,6 +37,7 @@ def test_multi_consume():
     assert len(ir_graph.full_tensors()) == 8
 
 
+@replace_all_device_with('cpu')
 def test_parser_nested_inputs():
 
     class MyModule(torch.nn.Module):
@@ -58,7 +62,7 @@ def test_parser_nested_inputs():
     with tempfile.TemporaryDirectory() as tempdir:
         ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
         print(ir_graph.extra_repr())
-    
+
     assert len(ir_graph.inputs()) == 1
     assert isinstance(ir_graph.input(0), IRObject)
     assert isinstance(ir_graph.input(0).value, dict)
@@ -68,6 +72,7 @@ def test_parser_nested_inputs():
     assert isinstance(ir_graph.output(0)['loss'], IRTensor)
 
 
+@replace_all_device_with('cpu')
 def test_max():
 
     class MyModule(torch.nn.Module):
