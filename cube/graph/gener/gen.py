@@ -428,6 +428,10 @@ class IRAdapterGener:
 
                 badapter: Optional[IRAdapter] = fadapter.mirror
 
+                # skip badapter if it doesn't contain any primitives
+                if not fadapter.differentiable and (badapter is not None and len(badapter.prims) == 0):
+                    badapter = None
+
                 if (badapter is not None and len(fadapter.prims) == 0 and len(badapter.prims) == 0) or \
                    (badapter is None and len(fadapter.prims) == 0):
                     continue

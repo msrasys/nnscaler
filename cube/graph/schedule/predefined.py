@@ -24,6 +24,8 @@ class PredefinedSched:
                  f0 b0 f1 | b1 f2 | b2 f3 b3
         ```
         """
+        if num_microbatches <= 0:
+            raise ValueError(f"expected num_microbatches > 0, but got {num_microbatches} ")
         segments: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
         fsegs = [seg for seg in segments if seg.isfw()]
         assert len(fsegs) == num_stages, f"Mismatch of forward segement number ({len(fsegs)}) with num_stages ({len(num_stages)})"
@@ -58,6 +60,8 @@ class PredefinedSched:
         f0       f1 f0    f2 f1 b0 | f3 f2 b1 | f3 b2    b3
         f0       f1    f0 f2 b0 f1 | f3 b1 f2 | b2 f3 b
         """
+        if num_microbatches <= 0:
+            raise ValueError(f"expected num_microbatches > 0, but got {num_microbatches} ")
         segments: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
         fsegs = [seg for seg in segments if seg.isfw()]
         tp_fsegs = [seg for seg in fsegs if len(seg.device) == len(graph.device)]
@@ -130,6 +134,8 @@ class PredefinedSched:
                  f0 f1 f2 f3 b0 b1 b2 b3 
         ```
         """
+        if num_microbatches <= 0:
+            raise ValueError(f"expected num_microbatches > 0, but got {num_microbatches} ")
         segments: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
         fsegs = [seg for seg in segments if seg.isfw()]
         assert len(fsegs) == num_stages, "Mismatch of forward segement number with num_stages"
@@ -168,6 +174,8 @@ class PredefinedSched:
         
         Note the f0 and f2 (step 0) should be considered to be one segment in graph.
         """
+        if num_microbatches <= 0:
+            raise ValueError(f"expected num_microbatches > 0, but got {num_microbatches} ")
         segments: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
         fsegs = [seg for seg in segments if seg.isfw()]
         assert len(fsegs) == 4, f"Chimera-direct scheduling only applies for 4 segments, but {len(segments)} detected"

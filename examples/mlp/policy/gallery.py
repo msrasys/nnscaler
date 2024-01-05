@@ -79,10 +79,10 @@ def PASMegatron(graph: IRGraph, resource, nmicros: int, tp_size: int,  **kwargs)
             if node.name == 'linear':
                 tensor_parallelism(graph, node, idx=1, dim=idx%2, devs=tp_group)
             else:
-                replica(node, devs=tp_group)
+                replica(graph, node, devs=tp_group)
     
     for dl in graph.select(ntype=IRDataOperation):
-        replica(dl, devs=list(range(resource.ngpus)))
+        replica(graph, dl, devs=list(range(resource.ngpus)))
 
     PredefinedSched.sched_1f1b(graph, nmicros, num_stages)
     return graph
