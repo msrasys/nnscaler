@@ -3,7 +3,10 @@ import pytest
 
 from cube.graph.parser.converter import to_fx_graph
 
+from ...utils import replace_all_device_with
 
+
+@replace_all_device_with('cpu')
 def test_cls_wrapper():
     class MyModule(torch.nn.Module):
         def __init__(self):
