@@ -93,6 +93,16 @@ To run a single unit test task during development, you can run
 pytest tests/your_test_file.py
 ```
 
+### Unit tests in AzureDevops pipeline
+
+We use AzureDevops to run unit tests before you can merge your PR to main branch. You can find the pipeline definition in `azure-pipelines.yml`.
+
+Please note that in AzureDevops pipeline agent, no gpu is available. So you must make sure your unit tests can run on cpu to pass the CI. Two options are available:
+1. Use `@replace_all_device_with('cpu')` decorator to replace all devices with cpu. Please refer to other tests for example.
+2. Mark your test case only work on gpu by using `@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')` decorator. Please refer to existing tests for example.
+
+Before you push your code, please run tests at least on GPU machines to make sure all tests can pass. GPU test cases can't be run in AzureDevops pipeline. Of course, it would be better if you can run all tests on both GPU and CPU machines.
+
 ### Run unit tests in vscode
 
 VS Code has a great support to unit tests. You can run/debug every tests easily in VS Code. Please refer to this document to set up your environment https://code.visualstudio.com/docs/python/testing
