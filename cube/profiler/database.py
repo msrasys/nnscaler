@@ -7,6 +7,7 @@ import torch
 import time
 import os
 import json
+import math
 import logging
 from dataclasses import dataclass, asdict
 
@@ -57,7 +58,7 @@ class CompProfiler:
     @staticmethod
     def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
                 requires_grads: Tuple[bool], values: Tuple[Any],
-                warmup_sec: float = 2, prof_times: int = 50,
+                warmup_sec: float = 2, prof_times: int = 20, max_prof_sec: float = 20,
                 **kwargs) -> Tuple[float, float, int, Tuple[int]]:
         """
         Profile a function
@@ -70,7 +71,8 @@ class CompProfiler:
             requires_grads Tuple[bool]: whether the input tensor requires gradient
             values Tuple[Any]: the values of the inputs that are not IRTensor
             warmup_sec float: warmup seconds
-            prof_times int: profile times
+            prof_times int: number of execution for profiling an operator
+            max_prof_sec float: max seconds for profiling an operator's forward or backward
             kwargs Dict: other keyword argument for func call.
 
         Returns:
@@ -142,8 +144,8 @@ class CompProfiler:
         # ref torch/utils/checkpoint.py/_checkpoint_without_reentrant
         def pack_hook(x):
             nonlocal train_mem_info, used_tensor
-            if x.storage().data_ptr() not in used_tensor:
-                used_tensor.add(x.storage().data_ptr())
+            if x.untyped_storage().data_ptr() not in used_tensor:
+                used_tensor.add(x.untyped_storage().data_ptr())
                 byte_size = x.element_size()
                 for dim in list(x.size()):
                     byte_size = byte_size * dim
@@ -152,7 +154,7 @@ class CompProfiler:
                 for i, t in enumerate(tensors):
                     if not isinstance(t, torch.Tensor):
                         continue
-                    if t.storage().data_ptr() == x.storage().data_ptr():
+                    if t.untyped_storage().data_ptr() == x.untyped_storage().data_ptr():
                         if node.inputs()[i].is_attr():
                             is_attr = True
                         idx = i
@@ -171,28 +173,34 @@ class CompProfiler:
             outs = run_step(func, tensors, train_kwargs, backward=require_backward)
 
         # warmup
-        tic = time.time()
-        while time.time() - tic < warmup_sec:
+        warmup_cnt = 0
+        tic = time.perf_counter()
+        while time.perf_counter() - tic < warmup_sec:
             run_step(func, tensors, train_kwargs, backward=require_backward)
+            torch.cuda.synchronize()
+            warmup_cnt += 1
+        toc = time.perf_counter()
+        func_duration = (toc - tic) / warmup_cnt
+        real_prof_times = max(1, min(prof_times, math.ceil(max_prof_sec / func_duration)))
 
         # profile forward only
         torch.cuda.synchronize()
         tic = time.perf_counter()
-        for _ in range(prof_times):
+        for _ in range(real_prof_times):
             with torch.no_grad():
                 run_step(func, tensors, eval_kwargs, backward=False)
         torch.cuda.synchronize()
         toc = time.perf_counter()
-        fw_span = (toc - tic) / prof_times * 1000 # in milliseconds
+        fw_span = (toc - tic) / real_prof_times * 1000 # in milliseconds
 
         # profile forward + backward
         torch.cuda.synchronize()
         tic = time.perf_counter()
-        for _ in range(prof_times):
+        for _ in range(real_prof_times):
             run_step(func, tensors, train_kwargs, backward=require_backward)
         torch.cuda.synchronize()
         toc = time.perf_counter()
-        fwbw_span = (toc - tic) / prof_times * 1000 # in milliseconds
+        fwbw_span = (toc - tic) / real_prof_times * 1000 # in milliseconds
         bw_span = max(fwbw_span - fw_span, 0.0)
 
         return fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx
