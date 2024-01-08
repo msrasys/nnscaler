@@ -1,10 +1,13 @@
 import time
 import tempfile
+
+import pytest
 import torch
+
 from cube.parallel import _gen_graph
 from cube.ir.operator import IRFwOperation
 from cube.profiler.database import CompProfiler, ProfileDataBase
-from ..utils import replace_all_device_with
+
 
 class NaiveFFN(torch.nn.Module):
     def __init__(self):
@@ -19,7 +22,8 @@ class NaiveFFN(torch.nn.Module):
         x = self.linear2(x)
         return x
 
-@replace_all_device_with('cpu')
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_op_profile_times():
     with tempfile.TemporaryDirectory() as tempdir:
         graph, _ = _gen_graph(NaiveFFN(), {'x': torch.randn(2, 128, 1024)}, tempdir, False)

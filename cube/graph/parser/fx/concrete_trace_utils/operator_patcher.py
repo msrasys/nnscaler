@@ -163,7 +163,11 @@ class OperatorPatcher:
     def patch_inner_helper(self, func):
         if not hasattr(func, '__module__') or func.__module__ is None or func.__module__.startswith('torch'):
             return func
-        if hasattr(func, '_Patcher__fx_already_patched'):
+        # those flags are set by fx _Patcher when a method is patched
+        # we don't want to patch it again
+        # _Patcher__fx_already_patched is for torch 2.0.1+
+        # __fx_already_patched is for torch 2.0.0
+        if hasattr(func, '_Patcher__fx_already_patched') or hasattr(func, '__fx_already_patched'):
             return func
         if self.use_operator_patch == (func in self.operator_patch_backlist):
             return func
