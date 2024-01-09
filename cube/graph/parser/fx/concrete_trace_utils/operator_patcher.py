@@ -157,11 +157,31 @@ class OperatorPatcher:
         self.operator_patch_backlist = operator_patch_backlist
         self.proxy_call_name = OperatorPatcherContext.patch_run.__name__
 
-    def patch_inner(self, func):
-        return self.patch_inner_helper(func)
+    def patch_func_or_module(self, func_or_module):
+        if _orig_isinstance(func_or_module, torch.nn.Module):
+            module, func = func_or_module, func_or_module.forward
+            new_func = self.patch_func_helper(func)
+            module.forward = new_func
+            return module
+        else:
+            return self.patch_func_helper(func_or_module)
 
-    def patch_inner_helper(self, func):
-        if not hasattr(func, '__module__') or func.__module__ is None or func.__module__.startswith('torch'):
+    def patch_func_helper(self, func):
+        """
+        Patch a function here means we will modify the function source code and recompile to a new one.
+        The reason of patching function is some code style is not supported to trace, but these cases are common used,
+        we don't want users put effort on modify their source code (or even some widely used packages' code) for these cases.
+
+        The following will be modify right now:
+            1. not a -> operator.not_(a)
+            2. a is b -> operator.is_(a, b)
+            3. a is not b -> operator.is_not(a, b)
+            4. a in b -> operator.contains(b, a)
+            5. a not in b -> operator.not_(operator.contains(b, a))
+            6. super() -> super(self.__class__, self)
+            7. func(a, b, c) -> patch_run(func, a, b, c)  # for patch the functions called in the current function
+        """
+        if not hasattr(func, '__module__') or func.__module__ is None or func.__module__.startswith('torch.'):
             return func
         # those flags are set by fx _Patcher when a method is patched
         # we don't want to patch it again
@@ -171,14 +191,15 @@ class OperatorPatcher:
             return func
         if self.use_operator_patch == (func in self.operator_patch_backlist):
             return func
-        if _orig_isinstance(func, torch.nn.Module):
-            func = func.forward
+
         if _orig_isinstance(func, MethodType):
+            # patch the function, not bound method, the function will be bound back after patch
             func_inner = func.__func__
             the_self = func.__self__
         else:
             func_inner = func
             the_self = None
+        # if it is not a function, or it has no code, then we can not patch it, directly return
         if not _orig_isinstance(func_inner, FunctionType) or not hasattr(func_inner, '__code__'):
             return func
 
@@ -280,5 +301,5 @@ class OperatorPatcherContext:
         assert OperatorPatcherContext.ctx_tracer is not None
         assert OperatorPatcherContext.ctx_patcher is not None
         with OperatorPatcherContext.ctx_tracer.do_temp_disable(True, True, True):
-            new_func = OperatorPatcherContext.ctx_patcher.patch_inner(func)
+            new_func = OperatorPatcherContext.ctx_patcher.patch_func_or_module(func)
         return new_func(*args, **kwargs)

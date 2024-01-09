@@ -712,9 +712,13 @@ class ConcreteTracer(TracerBase):
                 such as '__main__.FooModel' or '__main__.bar_func'. the namespace is
                 always needed.
         """
+        if not isinstance(root, torch.nn.Module):
+            # TODO: support trace any callable function by add the fill default values logic.
+            raise RuntimeError('Only support trace a torch.nn.Module instance now.')
+
         # fill default values
-        args = inspect.getfullargspec(root.forward).args[1:]
-        defaults = inspect.getfullargspec(root.forward).defaults
+        args = inspect.getfullargspec(getattr(root, forward_function_name)).args[1:]
+        defaults = inspect.getfullargspec(getattr(root, forward_function_name)).defaults
         defaults = tuple() if defaults is None else defaults
         if isinstance(concrete_args, (tuple, list)):
             concrete_args = (*concrete_args, *defaults[len(concrete_args) + len(defaults) - len(args):])
@@ -1050,6 +1054,11 @@ class ConcreteTracer(TracerBase):
             wrapped = _create_wrapped_attr_for_middle_class(self, clz, self.the_path_of_middle_class)
             self.wrapped_leaf[clz.__getattribute__] = (((clz, '__getattribute__'),), wrapped)
 
+        # wrap all forward in the submodule to trace the module stack
+        for mod in self.root.modules():
+            wrapped = _create_wrapped_nn_module_func(self, mod, forward_function_name)
+            self.wrapped_leaf[mod.forward] = (((mod, forward_function_name),), wrapped)
+
         @functools.wraps(_orig_isinstance)
         def isinstance_wrapper(instance, clz):
             if _orig_type(clz) in (slice, tuple, list, _orig_slice, _orig_tuple, _orig_list):
@@ -1243,6 +1252,36 @@ def _create_wrapped_method(cls, name):
         if proxy is not None:
             return proxy.tracer.create_proxy('call_method', name, args, kwargs)
         return orig_fn(*args, **kwargs)
+
+    return wrapped
+
+def _create_wrapped_nn_module_func(tracer: ConcreteTracer, mod: torch.nn.Module, name: str):
+    orig_fn = _orig_getattr(mod, name)
+    if not _orig_isinstance(orig_fn, MethodType):
+        raise RuntimeError(f'{tracer.path_of_module(mod)}.{name} is not a bound method, only support wrap bound method.')
+
+    @functools.wraps(orig_fn)
+    def wrapped(*args, **kwargs):
+        module_qualified_name = tracer.path_of_module(mod)
+        with ScopeContextManager(tracer.scope, Scope(module_qualified_name, type(mod))) as _scope:
+            need_pop = False
+            if _scope.module_path not in tracer.module_stack:
+                need_pop = True
+                tracer.module_stack[_scope.module_path] = _scope.module_type
+            elif _scope.module_path != list(tracer.module_stack)[-1]:
+                raise RuntimeError(f'Scope not match: {_scope.module_path} vs {list(tracer.module_stack)[-1]}')
+            # has tracer means in tracing progress
+            if OperatorPatcherContext.ctx_tracer and OperatorPatcherContext.ctx_patcher:
+                # `patch_run` is needed because this function will be patched by fx patcher,
+                # which means it will have `__fx_already_patched` flag, and operator patcher will not patch it again,
+                # so directly call `patch_run` here to avoid the `orig_fn is not patched by the operator patcher.
+                result = OperatorPatcherContext.patch_run(orig_fn, *args, **kwargs)
+            else:
+                result = orig_fn(*args, **kwargs)
+            if need_pop:
+                key, _ = tracer.module_stack.popitem(last=True)
+                assert key == _scope.module_path, f" Unexpected key {key}"
+        return result
 
     return wrapped
 
