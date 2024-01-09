@@ -31,7 +31,7 @@ try:
     apex_fused_rms_norm_anno = apex_fused_layer_norm_anno
 
 
-    def apex_fused_layer_norm_affine_anno(input, weight, bias, normalized_shape, eps) -> str:
+    def apex_fused_layer_norm_affine_anno(input, weight, bias, normalized_shape, eps, *args, **kwargs) -> str:
         """
         apex.normalization.fused_layer_norm.FusedLayerNormAffineFunction
         """
@@ -46,10 +46,11 @@ try:
         inputs.append(ShapeAnno.create_shape_str(weight.shape, reduction='^', iterator=letters) if weight is not None else '?')
         inputs.append(ShapeAnno.create_shape_str(bias.shape, reduction='^', iterator=letters) if bias is not None else '?')
         inputs += ['?', '?']
+        inputs += ['?' for _ in args]
         return OpAnno.create_op_str(inputs, outputs)
 
 
-    def apex_fused_rms_norm_affine_anno(input, weight, normalized_shape, eps) -> str:
+    def apex_fused_rms_norm_affine_anno(input, weight, normalized_shape, eps, *args, **kwargs) -> str:
         """
         apex.normalization.fused_layer_norm.FusedRMSNormAffineFunction
         """
@@ -62,6 +63,7 @@ try:
         inputs = [input_anno]
         inputs.append(ShapeAnno.create_shape_str(weight.shape, reduction='^', iterator=letters) if weight is not None else '?')
         inputs += ['?', '?']
+        inputs += ['?' for _ in args]
         return OpAnno.create_op_str(inputs, outputs)
 
 
