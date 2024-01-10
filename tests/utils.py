@@ -271,7 +271,7 @@ def mock_cube_env(cube_module_cls: Type[ParallelModule], compute_config):
         DeviceGroup.instance = old_device_group
 
 
-def new_empty(cube_module_cls: Type[ParallelModule]):
+def new_empty(cube_module_cls: Type[ParallelModule], device='meta', init_params=False):
     """
     Create a new instance with empty weights.
 
@@ -279,5 +279,5 @@ def new_empty(cube_module_cls: Type[ParallelModule]):
     """
     module_file = Path(sys.modules[cube_module_cls.__module__].__file__)
     compute_config = torch.load(module_file.with_name(f"{cube_module_cls.COMPUTE_CONFIG_FILE}"))
-    with replace_all_device_with('meta', True), mock_cube_env(cube_module_cls, compute_config), mock_dist(cube_module_cls.rank, compute_config.runtime_ngpus):
-        return cube_module_cls(init_params=False)
+    with replace_all_device_with(device, True), mock_cube_env(cube_module_cls, compute_config), mock_dist(cube_module_cls.rank, compute_config.runtime_ngpus):
+        return cube_module_cls(init_params=init_params)

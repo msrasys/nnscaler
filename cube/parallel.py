@@ -63,6 +63,43 @@ class ComputeConfig:
     # ```
     reducer_op: str = 'sum'
 
+    # you can put any configuration here
+    # *Note*: the assumption is different user_config should generate different code.
+    # Example 1: save module configuration
+    # ```python
+    # class MyModule(torch.nn.Module):
+    #   def __init__(self):
+    #     super().__init__()
+    #   def forward(self, x):
+    #     ...
+    #     if module_config.use_3d:
+    #       ...
+    # ```
+    # here we can set `user_config={'use_3d': module_config.use_3d}`,
+    # and we can be sure different use_3d will never use the same generated code.
+    # Example 2: save file stats
+    # If you want to track all related file stats (just like traditional compilers do),
+    # you can do
+    # ```python
+    # user_config = {
+    #   'file_stats': {
+    #     str(f): os.stat(f).st_mtime_ns for f in Path('./src').glob('**/*.py')  # assume all source code is in ./src
+    #   }
+    # }
+    # ```
+    # Or you can save the md5 of the files to save some bytes:
+    # ```python
+    # import hashlib
+    # h = hashlib.md5()
+    # for f in Path('./src').glob('**/*.py'):
+    #   with open(f, 'rb') as f:
+    #     h.update(f.read())
+    # user_config = {
+    #   'files_md5': h.hexdigest()
+    # }
+    # ```
+    user_config: Optional[Dict[str, Any]] = None
+
     def __post_init__(self):
         if self.plan_ngpus <= 0:
             raise ValueError(f"plan_ngpus {self.plan_ngpus} must be > 0")
@@ -146,6 +183,16 @@ def _get_arg_default_values(fn) -> Dict[str, Any]:
     return {k: v.default for k, v in args.parameters.items()}
 
 
+def _clean_files(_dir: Path, pattern = '*') -> None:
+    """
+    Clean files of a directory. No directories will be removed.
+    """
+    for f in _dir.glob(pattern):
+        if f.is_file():
+            f.unlink()
+
+
+_DEFAULT_INSTANCE_NAME = '_'
 _GENCODE_FILE_PREFIX = 'gencode'
 _GENCODE_FILE_TEMPLATE = _GENCODE_FILE_PREFIX + '{}.py'  # 'gencode{}.py'
 _CUBE_MODULE_NAMESPACE = '_cube_modules'
@@ -155,17 +202,32 @@ _FORWARD_ARGS_DUMP_FILE = 'forward_args.pkl'
 
 class ReuseType(Enum):
     """The reuse type"""
-    NONE = 'none'    # no reuse, everything will be regenerated.
-    ALL = 'all'      # try to reuse everything if possible
-    GRAPH = 'graph'  # only graph will be reused (so we don't need to trace the graph again)
+    MATCH = 'match'        # reuse if present and match, error if present but not match, generate if not present.
+    OVERRIDE = 'override'  # no reuse, everything will be regenerated.
+    MOO = 'moo'            # (short for match or override)reuse if present and match, generate if not match or not present.
+    GRAPH = 'graph'        # reuse graph only if present and match, generate otherwise.
+
+
+def _prepare_namespace(
+        cube_savedir: str,
+        module_or_module_class: Union[Type[torch.nn.Module], torch.nn.Module],
+        instance_name: Optional[str] = None,
+):
+    cube_savedir = _add_cube_savedir_to_syspath(cube_savedir)
+
+    instance_name = instance_name or _DEFAULT_INSTANCE_NAME
+    instance_name = instance_name.strip('.') if instance_name else ''
+    instance_namespace = f'.{instance_name}' if instance_name else ''
+    namespace = f'{_CUBE_MODULE_NAMESPACE}.{_get_full_qualified_name(module_or_module_class)}{instance_namespace}'
+    return namespace
 
 
 def _prepare_and_check_reusable(
-        cube_savedir,
+        cube_savedir: str,
         module_or_module_class: Union[Type[torch.nn.Module], torch.nn.Module],
-        compute_config,
-        instance_name,
-        reuse: ReuseType = ReuseType.ALL,
+        compute_config: ComputeConfig,
+        instance_name: Optional[str] = None,
+        reuse: ReuseType = ReuseType.MATCH,
     ) -> Tuple[str, bool]:
     """
     Prepare the output directory for code generation, and also check if the existing code is reusable.
@@ -174,7 +236,7 @@ def _prepare_and_check_reusable(
         cube_savedir (str): the directory to save generated code
         module_or_module_class (Union[Type[torch.nn.Module], torch.nn.Module]): the original module or module class
         compute_config (ComputeConfig): the environment resource
-        instance_name (Optional[str]): the instance name of the generated module.
+        instance_name (Optional[str]): the instance name of the generated module. If it is None, will use the default name.
         reuse (ReuseType): specify which part can be reused.
 
     Returns:
@@ -184,36 +246,41 @@ def _prepare_and_check_reusable(
         RuntimeError: if the existing code is not reusable,
             will raise RuntimeError if the code is not reusable but the module is already loaded.
     """
-
-    cube_savedir = _add_cube_savedir_to_syspath(cube_savedir)
-
-    instance_name = instance_name.strip('.') if instance_name else ''
-    instance_namespace = f'.{instance_name}' if instance_name else ''
-    namespace = f'{_CUBE_MODULE_NAMESPACE}.{_get_full_qualified_name(module_or_module_class)}{instance_namespace}'
+    namespace = _prepare_namespace(cube_savedir, module_or_module_class, instance_name)
     outdir = cube_savedir / Path(namespace.replace('.', '/').strip('/'))
     outdir.mkdir(parents=True, exist_ok=True)
 
     # decision matrix for code generation
     # reuse flag | dir condition(imported, empty, match, unmatched) | action
     # ---------------------------------------------------------
-    #   NONE/GRAPH   | empty | generate
-    #   NONE/GRAPH   | imported | raise error
-    #   NONE/GRAPH   | match | generate
-    #   NONE/GRAPH   | unmatch | generate
-    #   ALL  | empty | generate
-    #   ALL  | match | do nothing
-    #   ALL  | unmatch | raise error
-    #   ALL  | imported | doesn't matter
+    #   OVERRIDE/GRAPH  | empty     | generate
+    #   OVERRIDE/GRAPH  | imported  | raise error
+    #   OVERRIDE/GRAPH  | match     | generate
+    #   OVERRIDE/GRAPH  | unmatch   | generate
+    #   MATCH           | empty     | generate
+    #   MATCH           | match     | reuse(do nothing)
+    #   MATCH*          | unmatch   | raise error (except when there's no python source code, see below)
+    #   MATCH           | imported  | doesn't matter
+    #   MOO             | empty     | generate
+    #   MOO             | match     | reuse(do nothing)
+    #   MOO*            | unmatch   | generate (specail case is when there's no python source code, see below)
+    #   MOO             | imported  | raise error if unmatch
+    #  *: The precondition for `except` part is the compute config should match.
+    #     you can take it as a continous operation after a failed MATCH/OVERRIDE.
     reusable = False
-    if reuse == ReuseType.ALL:
-        trace_meta_files = [
-            outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
-            outdir / FxModuleParser.ATTR_MAP_FILE,
-        ]
+    config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
+    old_config = torch.load(config_file) if config_file.exists() else None
+    is_config_match = old_config == compute_config
+    trace_meta_files = [
+        outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
+        outdir / FxModuleParser.ATTR_MAP_FILE,
+    ]
+
+    if reuse == ReuseType.MATCH or reuse == ReuseType.MOO:
         # check if the module is already generated
         expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
         expected_output_files.extend(trace_meta_files)
-        expected_output_files.append(outdir / ParallelModule.COMPUTE_CONFIG_FILE)
+        expected_output_files.append(config_file)
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         existing_output_files = [
@@ -224,11 +291,12 @@ def _prepare_and_check_reusable(
             )
         ]
         if existing_output_files:
-            if all([output_file.exists() for output_file in expected_output_files]) \
-                and len(existing_output_files) == len(expected_output_files) \
-                and torch.load(outdir / ParallelModule.COMPUTE_CONFIG_FILE) == compute_config:
+            if is_config_match \
+                and all([output_file.exists() for output_file in expected_output_files]) \
+                and len(existing_output_files) == len(expected_output_files):
                 reusable = True  # everything is matched.
-            elif all(f.suffix != '.py'  for f in existing_output_files):
+            elif is_config_match \
+                and all(f.suffix != '.py'  for f in existing_output_files):
                 # No python source code is generated.
                 # which means its last generation failed.
                 # in this case, we can reuse the same directory safely.
@@ -237,27 +305,32 @@ def _prepare_and_check_reusable(
                             f'Will reuse the directory and the graph dump if present.')
                 # we have to trace the graph again if not all meta files are present.
                 if not all([meta_file.exists() for meta_file in trace_meta_files]):
-                    for f in outdir.glob('*'):
-                        if f.is_file():
-                            f.unlink()
-            else:
+                    _clean_files(outdir)
+            elif reuse == ReuseType.MATCH:
                 raise RuntimeError(f'Output directory {outdir} is not empty. '
                                    f'And the existing files do not match with current config. '
                                    f'You can remove the directory and try again, '
-                                   f'or set reuse to ReuseType.NONE to regenerate the code.')
+                                   f'or set reuse to ReuseType.NONE/ReuseType.OVERRIDE to regenerate the code.')
+            else:
+                assert reuse == ReuseType.MOO
+                if _is_any_gencode_loaded(namespace):
+                    raise RuntimeError(f'Output directory {outdir} is already loaded. '
+                                       f'You can not override a loaded module.')
+                _clean_files(outdir)
     else:
         # check if the module is already loaded
         if _is_any_gencode_loaded(namespace):
             raise RuntimeError(f'Output directory {outdir} is already loaded. '
                                f'You can not override a loaded module.')
         # clear existing generated files
-        if reuse == ReuseType.NONE:
+        if reuse == ReuseType.OVERRIDE \
+            or not is_config_match \
+            or not all([meta_file.exists() for meta_file in trace_meta_files]):
+            # we have to trace the graph again if not all meta files are present even when reuse=graph.
             glob_pattern = '*'
         else:
             glob_pattern = '*.py'  # so we can keep graph dumps.
-        for f in outdir.glob(glob_pattern):
-            if f.is_file():
-                f.unlink()
+        _clean_files(outdir, glob_pattern)
 
     return outdir, reusable
 
@@ -435,7 +508,6 @@ def _gencode(
         execplan = Grouping.apply(execplan)
 
     # code generation
-    torch.save(compute_config, outdir / ParallelModule.COMPUTE_CONFIG_FILE)
     assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
     mgener = ModuleCodeGen(execplan, compute_config.runtime_ngpus)
     for rank in range(compute_config.runtime_ngpus):
@@ -462,17 +534,15 @@ def _load_cube_module_class(
     Args:
         module_class (Type[torch.nn.Module]): the original module class
         cube_savedir (Union[str, Path]): the directory to load generated code
-        instance_name (Optional[str]): the instance name of the generated module.
+        instance_name (Optional[str]): the instance name of the generated module. If it is None, will use the default name.
         rank (Optional[int]): the rank of the module. If it is None, will get the rank from torch.distributed.get_rank().
             This option is only useful for debugging or writing pre/post-processing tools.
             when you need to load the generated module in a non-torchrun environment.
     """
-    _add_cube_savedir_to_syspath(cube_savedir)
     rank = torch.distributed.get_rank() if rank is None else rank
-    instance_name = instance_name.strip('.') if instance_name else ''
-    instance_namespace = f'.{instance_name}' if instance_name else ''
+    namespace = _prepare_namespace(cube_savedir, module_class, instance_name)
     gen_imported = importlib.import_module(
-        f'{_CUBE_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}{instance_namespace}.{Path(_GENCODE_FILE_TEMPLATE.format(rank)).stem}'
+        f'{namespace}.{Path(_GENCODE_FILE_TEMPLATE.format(rank)).stem}'
     )
     cube_module_class = gen_imported.GenModel
     # rewrite class name and module name
@@ -490,7 +560,7 @@ def parallelize(
     compute_config: ComputeConfig,
     *,
     cube_savedir: Union[str, Path] = './.cube',
-    reuse: Union[ReuseType, str] = ReuseType.ALL,
+    reuse: Union[ReuseType, str] = ReuseType.MATCH,
     instance_name: Optional[str] = None,
     load_module: bool = True,
     module_dtype:  Optional[torch.dtype] = None,
@@ -553,7 +623,7 @@ def parallelize(
         compute_config (ComputeConfig): the environment resource
         reuse (ReuseType): specify which part can be reused.
         cube_savedir (Union[str, Path]): the directory to save generated code
-        instance_name (Optional[str]): the instance name of the generated module.
+        instance_name (Optional[str]): the instance name of the generated module. If it is None, will use the default name.
         load_module (bool): whether to load the generated module or module class after conversion is done.
         init_module_params (bool): If true, when we construct the module, all its parameters are initialized with the same value with when we traced.
             Otherwise, they will be empty tensor.
@@ -582,6 +652,9 @@ def parallelize(
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         outdir, reusable = _prepare_and_check_reusable(cube_savedir, module_class, compute_config, instance_name, reuse)
         if not reusable:
+            config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
+            if not config_file.exists():
+                torch.save(compute_config, config_file)
             with _compile_flags(compute_config):
                 _gencode(
                     module_or_module_class,

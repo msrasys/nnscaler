@@ -27,7 +27,7 @@ def _init_params_worker():
             PASRandomSPMD,
             ComputeConfig(1, 1),
             cube_savedir=tempdir,
-            reuse='all',
+            reuse='match',
         )
         module1 = cube_module()
         module2 = cube_module()
@@ -70,7 +70,7 @@ def test_empty_weights(model_class, tp):
             PASRandomSPMD,
             ComputeConfig(2, 4, use_zero=True, zero_ngroups=2),
             cube_savedir=tempdir,
-            reuse='all',
+            reuse='match',
             load_module=False,
         )
         for i in range(4):

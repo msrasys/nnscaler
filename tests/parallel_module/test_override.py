@@ -6,23 +6,33 @@ import pytest
 import torch
 import shutil
 
-from cube.parallel import ReuseType, parallelize, ComputeConfig
+from cube.graph.parser.fx.parser import FxModuleParser
+from cube.parallel import ReuseType, parallelize, ComputeConfig, _load_cube_module_class
 
-from .common import PASData, init_distributed
-from ..launch_torchrun import launch_torchrun
+from ..utils import new_empty, replace_all_device_with
+from .common import PASData
 
 
-def _to_cube_model(module, compute_config, cube_savedir, reuse, instance_name, load_module=True):
-    return parallelize(
-        module,
+def _to_cube_model(model_class, compute_config, cube_savedir, reuse, instance_name, load_module=True):
+    parallelize(
+        model_class,
         {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
         PASData,
         compute_config,
         reuse=reuse,
         cube_savedir=cube_savedir,
         instance_name=instance_name,
-        load_module=load_module,
+        load_module=False,
     )
+    if load_module:
+        module_class = _load_cube_module_class(
+            model_class,
+            cube_savedir=cube_savedir,
+            instance_name=instance_name,
+            rank=0
+        )
+        m = new_empty(module_class, device='cpu', init_params=True)
+        return m
 
 
 class MyModule(torch.nn.Module):
@@ -34,21 +44,20 @@ class MyModule(torch.nn.Module):
         return self.linear(x)
 
 
-def _worker():
-    init_distributed()
-
+@replace_all_device_with('cpu')
+def test_override():
     with tempfile.TemporaryDirectory() as tempdir:
-        # False   | empty | generate
-        cmodule1 = _to_cube_model(MyModule(), ComputeConfig(1, 1),tempdir, ReuseType.ALL, None)
-        # False  | match | do nothing
-        cmodule2 = _to_cube_model(MyModule(), ComputeConfig(1, 1),tempdir, ReuseType.ALL, None)
-        # true
+        # MATCH   | empty | generate
+        cmodule1 = _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MATCH, 'mm0')
+        # MATCH  | match | do nothing
+        cmodule2 = _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MATCH, 'mm0')
         for (n1, v1), (n2, v2) in zip(cmodule1.named_parameters(), cmodule2.named_parameters()):
             assert n1 == n2
             assert torch.equal(v1, v2)
 
-        cmodule3 = _to_cube_model(MyModule(), ComputeConfig(1, 1),tempdir, ReuseType.ALL, 'test')
-        cmodule4 = _to_cube_model(MyModule(), ComputeConfig(1, 1),tempdir, 'all', 'test')
+        # MATCH  | match | do nothing
+        cmodule3 = _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MATCH, 'test')
+        cmodule4 = _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, 'match', 'test')
 
         for (n1, v1), (n2, v2) in zip(cmodule3.named_parameters(), cmodule4.named_parameters()):
             assert n1 == n2
@@ -59,19 +68,42 @@ def _worker():
         keys = cmodule3_p.keys()
         assert any(not torch.equal(cmodule2_p[key], cmodule3_p[key]) for key in keys)
 
-        # True   | imported | raise error
-        with pytest.raises(RuntimeError):
-            _to_cube_model(MyModule(), ComputeConfig(1, 1),tempdir, ReuseType.NONE, None)
+        # MATCH  | unmatch | raise error
+        _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MATCH, 'm0')
+        with pytest.raises(RuntimeError, match='.*not empty.*'):
+            _to_cube_model(MyModule, ComputeConfig(2, 2),tempdir, 'match', 'm0')
 
-        with pytest.raises(RuntimeError):
-            _to_cube_model(MyModule(), ComputeConfig(1, 1),tempdir, ReuseType.NONE, 'test')
+        # MOO   | empty | generate
+        omodule1 = _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MOO, 'o0')
+        # MOO  | match | do nothing
+        omodule2 = _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MOO, 'o0')
+        for (n1, v1), (n2, v2) in zip(omodule1.named_parameters(), omodule2.named_parameters()):
+            assert n1 == n2
+            assert torch.equal(v1, v2)
 
-        # False  | unmatch | raise error
-        with pytest.raises(RuntimeError):
-            _to_cube_model(MyModule(), ComputeConfig(2, 2),tempdir, ReuseType.NONE, 'test')
+        # MOO  | unmatch | generate
+        _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MOO, 'o1', load_module=False)
+        _to_cube_model(MyModule, ComputeConfig(2, 2),tempdir, ReuseType.MOO, 'o1')
 
-        # True   | empty | generate
-        cmodule1 = _to_cube_model(MyModule(), ComputeConfig(1, 1),tempdir, ReuseType.NONE, 'test2')
+        # MOO  | imported | raise error
+        _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MOO, 'o2', load_module=True)
+        with pytest.raises(RuntimeError):
+            _to_cube_model(MyModule, ComputeConfig(2, 2),tempdir, ReuseType.MOO, 'o2')
+
+        # OVERRIDE   | imported | raise error
+        with pytest.raises(RuntimeError):
+            _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.OVERRIDE, 'mm0')
+
+        # OVERRIDE   | imported | raise error
+        with pytest.raises(RuntimeError):
+            _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.OVERRIDE, 'test')
+
+        # OVERRIDE  | imported | raise error
+        with pytest.raises(RuntimeError):
+            _to_cube_model(MyModule, ComputeConfig(2, 2),tempdir, ReuseType.OVERRIDE, 'test')
+
+        # OVERRIDE   | empty | generate
+        cmodule1 = _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.OVERRIDE, 'test2')
         module_path = Path(sys.modules[cmodule1.__module__].__file__).parent
         test3_module_path = module_path.with_name('test3')
         test3_module_path.mkdir(exist_ok=True, parents=True)
@@ -88,16 +120,16 @@ def _worker():
         shutil.copy(test4_module_path / 'gencode0.py', test4_module_path / 'gencode1.py')
         shutil.copy(test5_module_path / 'gencode0.py', test5_module_path / 'gencode1.py')
 
-        # True   | match | generate
-        cmodule2 = _to_cube_model(MyModule(), ComputeConfig(1, 1), tempdir, ReuseType.NONE, 'test3')
+        # OVERRIDE   | match | generate
+        cmodule2 = _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, ReuseType.OVERRIDE, 'test3')
         cmodule2_p = dict(cmodule2.named_parameters())
         cmodule1_p = dict(cmodule1.named_parameters())
         keys = cmodule2_p.keys()
         assert any(not torch.equal(cmodule2_p[key], cmodule1_p[key]) for key in keys)
 
-        # True   | unmatch | generate
+        # OVERRIDE   | unmatch | generate
         assert (test4_module_path / 'gencode1.py').exists()
-        cmodule3 = _to_cube_model(MyModule(), ComputeConfig(1, 1), tempdir, 'none', 'test4')
+        cmodule3 = _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'override', 'test4')
         assert not (test4_module_path / 'gencode1.py').exists()
 
         # Graph | matched | generate
@@ -105,7 +137,7 @@ def _worker():
         code_stat = (test5_module_path / 'gencode0.py').stat()
         graph_stat = (test5_module_path / 'graph.ckp').stat()
         args_stat = (test5_module_path / 'forward_args.pkl').stat()
-        cmodule4 = _to_cube_model(MyModule(), ComputeConfig(1, 1), tempdir, 'graph', 'test5', False)
+        _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'graph', 'test5', False)
         assert not (test5_module_path / 'gencode1.py').exists()
         assert (test5_module_path / 'gencode0.py').stat().st_mtime_ns != code_stat.st_mtime_ns
         assert (test5_module_path / 'graph.ckp').stat().st_mtime_ns == graph_stat.st_mtime_ns
@@ -114,12 +146,33 @@ def _worker():
         code_stat = (test5_module_path / 'gencode0.py').stat()
         graph_stat = (test5_module_path / 'graph.ckp').stat()
         (test5_module_path / 'forward_args.pkl').unlink()  # remove foward_args.pkl will force to generate new code
-        cmodule5 = _to_cube_model(MyModule(), ComputeConfig(1, 1), tempdir, 'graph', 'test5', False)
+        _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'graph', 'test5', False)
         assert (test5_module_path / 'gencode0.py').stat().st_mtime_ns != code_stat.st_mtime_ns
         assert (test5_module_path / 'graph.ckp').stat().st_mtime_ns != graph_stat.st_mtime_ns
         assert (test5_module_path / 'forward_args.pkl').exists()
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
-def test_override():
-    launch_torchrun(1, _worker)
+        code_stat = (test5_module_path / 'gencode0.py').stat()
+        graph_stat = (test5_module_path / 'graph.ckp').stat()
+        attrmap_stat = (test5_module_path / FxModuleParser.ATTR_MAP_FILE).stat()
+        (test5_module_path / FxModuleParser.ATTR_CONTENT_FILE_0).unlink()  # remove fullmodel.pt.0 will force to generate new code
+        _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'graph', 'test5', False)
+        assert (test5_module_path / 'gencode0.py').stat().st_mtime_ns != code_stat.st_mtime_ns
+        assert (test5_module_path / 'graph.ckp').stat().st_mtime_ns != graph_stat.st_mtime_ns
+        assert (test5_module_path / FxModuleParser.ATTR_MAP_FILE).stat().st_mtime_ns != attrmap_stat.st_mtime_ns
+        assert (test5_module_path / 'forward_args.pkl').exists()
 
+        # Graph | empty | generate
+        g6_module = _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'graph', 'g6')
+
+        # Graph | imported | raise error
+        with pytest.raises(RuntimeError):
+            _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'graph', 'g6')
+
+        # Graph | unmatch | generate
+        _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'graph', 'g7', False)
+        g7_module_path = module_path.with_name('g7')
+        graph_stat = (g7_module_path / 'graph.ckp').stat()
+        args_stat = (g7_module_path / 'forward_args.pkl').stat()
+        _to_cube_model(MyModule, ComputeConfig(2, 2), tempdir, 'graph', 'g7', False)
+        assert (g7_module_path / 'graph.ckp').stat().st_mtime_ns != graph_stat.st_mtime_ns
+        assert (g7_module_path / 'forward_args.pkl').stat().st_mtime_ns != args_stat.st_mtime_ns

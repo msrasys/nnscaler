@@ -205,10 +205,10 @@ class AttrModule(torch.nn.Module):
 
 
 def _gencode_contains(cubesave_dir, module_class, index, search_re):
-    from cube.parallel import _CUBE_MODULE_NAMESPACE, _get_full_qualified_name
+    from cube.parallel import _CUBE_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
     from pathlib import Path
     import re
-    namespace = f'{_CUBE_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}'
+    namespace = f'{_CUBE_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{_DEFAULT_INSTANCE_NAME}'
     outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
     filecontent = (outdir /f'gencode{index}.py').read_text()
     matches = re.findall(search_re, filecontent)
@@ -419,7 +419,7 @@ def test_codegen_tensor_slice():
                 ComputeConfig(1, 1),
                 cube_savedir=tempdir,
                 load_module=False,
-                reuse='none',
+                reuse='override',
             )
         m = TensorSliceFixedModule()
         m.train()
@@ -430,7 +430,7 @@ def test_codegen_tensor_slice():
             ComputeConfig(1, 1),
             cube_savedir=tempdir,
             load_module=False,
-            reuse='none',
+            reuse='override',
         )
 
 
