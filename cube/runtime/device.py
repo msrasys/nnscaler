@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import os
 import logging
+import datetime
 
 from cube.flags import CompileFlag
 
@@ -25,7 +26,8 @@ class DeviceGroup:
                 self.node_rank = 0
             else:
                 if not torch.distributed.is_initialized():
-                    torch.distributed.init_process_group(backend='nccl')
+                    torch.distributed.init_process_group(
+                        backend='nccl', timeout=datetime.timedelta(seconds=21600))
                 self.rank = torch.distributed.get_rank()
                 self.world_size = torch.distributed.get_world_size()
                 # assume each node has the same device number
@@ -70,7 +72,8 @@ class DeviceGroup:
             return None
         rank_bits = DeviceGroup.bitmap(ranks)
         if rank_bits not in self.instance.groups:
-            self.groups[rank_bits] = torch.distributed.new_group(list(ranks))
+            self.groups[rank_bits] = torch.distributed.new_group(
+                list(ranks), timeout=datetime.timedelta(seconds=21600))
         return self.groups[rank_bits]
 
     def get_stream(self, name: str) -> torch.cuda.Stream:
