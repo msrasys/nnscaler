@@ -212,6 +212,8 @@ class FxModuleParser:
                 ir_node = IRPyFunc(fsig, input_vals, [IRObject()], **kwargs)
 
         if isinstance(ir_node, IRCell):
+            module_stack = node.meta.get('nn_module_stack')
+            ir_node.module_stack = module_stack
             comment = str(node.meta.get('frame_record', ''))
             if comment:
                 ir_node.comment = comment

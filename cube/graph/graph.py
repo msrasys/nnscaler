@@ -261,6 +261,7 @@ class IRGraph(IRSegment):
                 fnode.recompute = node.recompute
             if isinstance(node.comment, str):
                 fnode.comment = node.comment
+            fnode.module_stack = node.module_stack
             fnode.device = node.device
         fsegment.replace(node, fnodes)
         # insert backward
@@ -321,6 +322,7 @@ class IRGraph(IRSegment):
                 fnode.recompute = node.recompute
             if isinstance(node.comment, str):
                 fnode.comment = node.comment
+            fnode.module_stack = node.module_stack
             fnode.device = node.device
         fsegment.replace(node, fnodes)
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import List, Tuple, Union, Optional, Any, Dict
+from collections import OrderedDict
 import copy
 import torch
 
@@ -63,6 +64,8 @@ class IRCell:
         self._mirror: Optional[IRCell] = None
         # the comment for code generation
         self._comment: Optional[str] = None
+        # the module stack that preserves the hierarchy information
+        self._module_stack: Optional[OrderedDict[str, Any]] = None
 
     @property
     def cid(self) -> int:
@@ -242,6 +245,17 @@ class IRCell:
         """
         assert isinstance(info, str), "comment only allowed to be string"
         self._comment = info 
+
+    @property
+    def module_stack(self) -> Optional[OrderedDict[str, Any]]:
+        return self._module_stack
+
+    @module_stack.setter
+    def module_stack(self, stack: OrderedDict[str, Any]):
+        """
+        Set the module stack
+        """
+        self._module_stack = stack
 
     def __repr__(self) -> str:
         """

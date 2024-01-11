@@ -133,10 +133,12 @@ def Matmul(input, other, *, out=None, signature=None):
     signature = 'torch.matmul'
     assert out is None
     annos = [
+        'k+, k+ -> 1',
         'm k+, k+ n -> m n',
         'k+, k+ n -> n',
         'm k+, k+ -> m',
         '* m k+, k+ n -> * m n',
+        'm k+, * k+ n -> * m n',
         '* m k+, * k+ n -> * m n'  # TODO: broadcast
     ]
     if len(input.shape) > 2 and len(other.shape) > 2:
