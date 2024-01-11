@@ -1119,13 +1119,13 @@ class IRSegment(IRCell):
 
     @staticmethod
     def modify_objects_of_complex(val: Any, modifier: Callable) -> Any:
-        """Return a complex data structure where its IRObjects are in-placemently modified
+        """Return a complex data structure with modified IRObjects
 
         Supported complex of types: List, Tuple, Dict, IRTensor, IRObject
 
         Args:
             val (Any): the complex data structure to be modified
-            modifier (Callable): an inplacement modifier that takes an IRObject and return None
+            modifier (Callable): a modifier that takes an IRObject and return a new one.
 
         Return:
             new_val (Any): complex data structure with modified IRObjects

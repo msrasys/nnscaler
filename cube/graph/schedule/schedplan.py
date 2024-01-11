@@ -64,7 +64,9 @@ class ScheduleDependency:
         self.dataloaders : List[IRDataOperation] = []
         self.segments: List[IRSegment] = []
         self.adapters: List[IRAdapter] = []
+        # the IRSegment that consumes the output of IRAdapter
         self.recvers: Dict[IRAdapter, IRSegment] = {}
+        # the IRSegment that produces the input of IRAdapter
         self.senders: Dict[IRAdapter, IRSegment] = {}
         self.reducers: List[IRWeightReducer] = []
 
@@ -391,6 +393,17 @@ class SchedulePlan(PlanBase):
                 f"This usually happens when its sender is dataloader or graph inputs."
                 f"Please replicate dataloader to remove this adapter.")
             sender: IRSegment = self._dependency.senders[adapter]
+
+            # since the schedule should return the same graph outputs on every device,
+            # there will be adapters created to broadcast outputs of each microbatch
+            # from the last-stage devices to all the devices.
+            # These adapters don't have any dependent recver segment,
+            # and will be placed at the end of the plan to not block the schedule execution.
+            if adapter not in self._dependency.recvers:
+                for mid in range(self._num_microbatches):
+                    self._step_adapters[self.nsteps-1].append(Block(adapter, mid, 1))
+                continue
+
             # find sender step and insert adapter
             for step in range(self.nsteps):
                 blocks = self.start_blocks(step)

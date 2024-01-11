@@ -1,4 +1,4 @@
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Any
 import copy
 import numpy as np
 import sys
@@ -130,7 +130,20 @@ class ExecutionPlan:
                 block = block2reuse(block)
             assert isinstance(block, IRCell)
             topo_seqs.append(block)
-        return ExecutionPlan(schedplan.graph, topo_seqs)
+
+        # set up returning outputs by packing output results from each micro-batch into a list
+        outputs = []
+        for mid in range(schedplan.nmicros):
+            outs = []
+            for output in schedplan.graph.outputs():
+                outs.append(IRSegment.modify_objects_of_complex(output, lambda x: get(x, mid)))
+            if len(outs) > 0:
+                outputs.append(outs[0] if len(outs) == 1 else outs)
+
+        execplan = ExecutionPlan(schedplan.graph, topo_seqs)
+        execplan.set_outputs(outputs)
+
+        return execplan
 
     def __init__(self, graph: IRGraph, topo_seqs: List[IRCell]):
 
@@ -138,6 +151,7 @@ class ExecutionPlan:
         self._graph = graph
         self._topo_seqs = topo_seqs
         self._seq: Dict[int, List[IRCell]] = {}
+        self._outputs = list(graph.outputs())
 
         for node in self._topo_seqs:
             assert len(node.device) > 0, f"Node device not set: {node}"
@@ -172,6 +186,10 @@ class ExecutionPlan:
     @property
     def inference(self) -> bool:
         return not self._graph.train
+
+    def outputs(self) -> List[Any]:
+        """Get execution plan return outputs"""
+        return self._outputs
 
     def devices(self) -> List[int]:
         """
@@ -221,6 +239,11 @@ class ExecutionPlan:
         if not all([isinstance(su, IRCell) for su in seq]):
             raise TypeError("Expected a list of Cell")
         self._seq[devid] = seq
+
+    def set_outputs(self, outputs: List[Any]):
+        if not isinstance(outputs, list):
+            raise TypeError("Expected a list of outputs")
+        self._outputs = outputs
 
     def visualize(self, outfile: str,
                   map2time: Optional[Callable] = None,

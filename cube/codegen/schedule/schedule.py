@@ -72,7 +72,7 @@ class ScheduleCodeGen(FuncEmission):
         assert all(not isinstance(n, IRFwOperation) for n in device_nodes), \
             "Expected all forward operators have been grouped into IRSegment"
 
-        lifetime = LifeCycle(device_nodes, [], self.execplan.graph.outputs())
+        lifetime = LifeCycle(device_nodes, [], self.execplan.outputs())
 
         args = ['model'] + [self.tensor_name(t) for t in self.execplan.graph.inputs()]
 
@@ -93,7 +93,7 @@ class ScheduleCodeGen(FuncEmission):
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         fb.insert_body(self.emit_release(tensors))
             # return code
-            outputs = self.return_name_complex(self.execplan.graph.outputs())
+            outputs = self.return_name_complex(self.execplan.outputs())
             code = f'return {outputs}'
             fb.insert_body(code)
         gencode += fb.code
@@ -120,7 +120,7 @@ class ScheduleCodeGen(FuncEmission):
                     if len(tensors) > 0 : # not necessarily to have one after each line
                         fb.insert_body(self.emit_release(tensors))
                 # return code
-                outputs = self.return_name_complex(self.execplan.graph.outputs())
+                outputs = self.return_name_complex(self.execplan.outputs())
                 code = f'return {outputs}'
                 fb.insert_body(code)
             gencode += fb.code
