@@ -891,7 +891,7 @@ class ConcreteTracer(TracerBase):
             else:
                 # codes below corresponds to symbolic tracer's call_module
                 module_qualified_name = self.path_of_module(mod)
-                with ScopeContextManager(self.scope, Scope(module_qualified_name, type(mod))) as _scope:
+                with ScopeContextManager(self.scope, Scope(module_qualified_name, _orig_type(mod))) as _scope:
                     self.module_stack[_scope.module_path] = _scope.module_type
                     if not self.is_leaf_module(mod, module_qualified_name):
                         _autowrap_check(self,
@@ -912,8 +912,10 @@ class ConcreteTracer(TracerBase):
                 return ret_val
 
         class map_wrapper_clz:
-            @functools.wraps(_orig_map)
-            def __call__(self, the_func, *iterables: Any):
+            # used to track the original class
+            _fx_wrapped_ori_clz = _orig_map
+
+            def __new__(cls, the_func, *iterables: Any):
                 tracers = _orig_set()
                 for one_iter in iterables:
                     if _orig_isinstance(one_iter, ep.Proxy):
@@ -946,11 +948,13 @@ class ConcreteTracer(TracerBase):
                 return id(__o) in (id(self), id(_orig_map))
             def __hash__(self):
                 return id(self)
-        map_wrapper = map_wrapper_clz()
+        map_wrapper = map_wrapper_clz
 
         class range_wrapper_clz:
-            @functools.wraps(_orig_range)
-            def __call__(self, *args):
+            # used to track the original class
+            _fx_wrapped_ori_clz = _orig_range
+
+            def __new__(cls, *args):
                 # TODO: better infomation
                 assert 1 <= _orig_len(args) <= 3
                 args = (arg.value if _orig_isinstance(arg, ep.ConcreteProxy) else arg for arg in args)
@@ -959,11 +963,13 @@ class ConcreteTracer(TracerBase):
                 return id(__o) in (id(self), id(_orig_range))
             def __hash__(self):
                 return id(self)
-        range_wrapper = range_wrapper_clz()
+        range_wrapper = range_wrapper_clz
 
         class enumerate_wrapper_clz:
-            @functools.wraps(_orig_enumerate)
-            def __call__(self, iterable, start=0):
+            # used to track the original class
+            _fx_wrapped_ori_clz = _orig_enumerate
+
+            def __new__(cls, iterable, start=0):
                 count = start
                 for elem in iterable:
                     if _orig_isinstance(elem, ep.ConcreteProxy) and _orig_isinstance(elem.value, (_orig_int, str)):
@@ -975,21 +981,32 @@ class ConcreteTracer(TracerBase):
                 return id(__o) in (id(self), id(_orig_enumerate))
             def __hash__(self):
                 return id(self)
-        enumerate_wrapper = enumerate_wrapper_clz()
+        enumerate_wrapper = enumerate_wrapper_clz
 
         class type_wrapper_clz:
-            @functools.wraps(_orig_type)
-            def __call__(self, instance):
-                orig_type = _orig_type(instance)
-                if orig_type in (ep.ConcreteProxy, ep.ConcreteAttrProxy, ep.ConcreteUnpackIterProxy):
-                    return _orig_type(instance.value)
+            # used to track the original class
+            _fx_wrapped_ori_clz = _orig_type
+
+            def __new__(cls, obj_or_name, *args):
+                # case 1: class type(name, bases, dict, **kwds)
+                if _orig_len(args) > 0:
+                    assert _orig_len(args) == 2
+                    base_cls, cls_dict = args[0], args[1]
+                    # if it is a wrapped class, replace it to the original one
+                    base_cls = _orig_tuple(bs._fx_wrapped_ori_clz if hasattr(bs, '_fx_wrapped_ori_clz') else bs for bs in base_cls)
+                    return _orig_type(obj_or_name, base_cls, cls_dict)
+                # case 2: class type(object)
                 else:
-                    return orig_type
+                    orig_type = _orig_type(obj_or_name)
+                    if orig_type in (ep.ConcreteProxy, ep.ConcreteAttrProxy, ep.ConcreteUnpackIterProxy):
+                        return _orig_type(obj_or_name.value)
+                    else:
+                        return orig_type
             def __eq__(self, __o: object) -> bool:
                 return id(__o) in (id(self), id(_orig_enumerate))
             def __hash__(self):
                 return id(self)
-        type_wrapper = type_wrapper_clz()
+        type_wrapper = type_wrapper_clz
 
         @classmethod
         @functools.wraps(_orig_agfunc_apply)
@@ -1300,7 +1317,7 @@ def _create_wrapped_nn_module_func(tracer: ConcreteTracer, mod: torch.nn.Module,
     @functools.wraps(orig_fn)
     def wrapped(*args, **kwargs):
         module_qualified_name = tracer.path_of_module(mod)
-        with ScopeContextManager(tracer.scope, Scope(module_qualified_name, type(mod))) as _scope:
+        with ScopeContextManager(tracer.scope, Scope(module_qualified_name, _orig_type(mod))) as _scope:
             need_pop = False
             if _scope.module_path not in tracer.module_stack:
                 need_pop = True
@@ -1490,8 +1507,10 @@ def _create_wrapped_leaf_class(tracer: ConcreteTracer, clz):
         ...
     """
     class clz_wrapper_clz:
-        @functools.wraps(clz)
-        def __call__(self, *args, **kwargs):
+        # used to track the original class
+        _fx_wrapped_ori_clz = clz
+
+        def __new__(cls, *args, **kwargs):
             if tracer.temp_disable_call:
                 return clz(*args, **kwargs)
             tracers = _orig_set()
@@ -1510,15 +1529,15 @@ def _create_wrapped_leaf_class(tracer: ConcreteTracer, clz):
             return id(__o) in (id(self), id(clz))
         def __hash__(self):
             return id(self)
-    clz_wrapper = clz_wrapper_clz()
+
     for name in dir(clz):
         attr = _orig_getattr(clz, name)
         if not name.startswith('_'):
             if _orig_isinstance(attr, Callable):
-                setattr(clz_wrapper, name, _create_wrapped_leaf_method(tracer, attr, name, None))
+                setattr(clz_wrapper_clz, name, _create_wrapped_leaf_method(tracer, attr, name, None))
             else:
-                setattr(clz_wrapper, name, attr)
-    return clz_wrapper
+                setattr(clz_wrapper_clz, name, attr)
+    return clz_wrapper_clz
 
 def _create_wrapped_leaf_iterable_class(tracer: ConcreteTracer, clz):
     """
@@ -1531,8 +1550,10 @@ def _create_wrapped_leaf_iterable_class(tracer: ConcreteTracer, clz):
         ...
     """
     class clz_wrapper_clz:
-        @functools.wraps(clz)
-        def __call__(self, *args, **kwargs):
+        # used to track the original class
+        _fx_wrapped_ori_clz = clz
+
+        def __new__(cls, *args, **kwargs):
             if tracer.temp_disable_call:
                 return clz(*args, **kwargs)
             tracers = _orig_set()
@@ -1556,15 +1577,15 @@ def _create_wrapped_leaf_iterable_class(tracer: ConcreteTracer, clz):
             return id(__o) in (id(self), id(clz))
         def __hash__(self):
             return id(self)
-    clz_wrapper = clz_wrapper_clz()
+
     for name in dir(clz):
         attr = _orig_getattr(clz, name)
         if not name.startswith('_') or name in ('__getitem__', '__setitem__', '__iter__', '__len__'):
             if _orig_isinstance(attr, Callable):
-                setattr(clz_wrapper, name, _create_wrapped_leaf_method(tracer, attr, name, None))
+                setattr(clz_wrapper_clz, name, _create_wrapped_leaf_method(tracer, attr, name, None))
             else:
-                setattr(clz_wrapper, name, attr)
-    return clz_wrapper
+                setattr(clz_wrapper_clz, name, attr)
+    return clz_wrapper_clz
 
 def _create_wrapped_attr_for_middle_class(tracer: ConcreteTracer, clz, the_path_of_middle_class):
     _orig_clz_getattribute = clz.__getattribute__
