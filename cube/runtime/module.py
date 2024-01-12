@@ -24,11 +24,12 @@ class CubeModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self._reducers: List[Reducer] = list()
-        # Key: str, parameter name (from named_parameters)
-        # Value: Tuple[int, Tuple[slice], int]:
-        # full tensor tid,
-        # position of sub tensor in full tensor,
-        # position of value in value partition.
+        # self._fullmap contains the mapping of local attribute tensors to its fulltensor
+        # name (from named_parameters or named_buffers) -> (
+        #   fulltensor.tid,
+        #   index position of its fulltensor,
+        #   value partition num_chunks,
+        # )
         self._fullmap : Dict[str, Tuple[int, Tuple[slice], int]] = dict()
 
     @property
@@ -151,28 +152,41 @@ class CubeModule(torch.nn.Module):
         return self._fullmap
 
     def load_attr_content(self, filename: str):
-        partitioned_model_pt = 0
-        while os.path.isfile(filename + f'.{partitioned_model_pt}'):
-            partitioned_model_pt += 1
-        if partitioned_model_pt == 0:
+        """Load module attribute (parameters and buffers) from file
+        
+        Args:
+            filename (str): base file name (without '.0', '.1', etc.) 
+                that saved with model parameters
+        """
+        npartitions = 0
+        while os.path.isfile(filename + f'.{npartitions}'):
+            npartitions += 1
+        if npartitions == 0:
             raise RuntimeError(f"Cannot find file {filename}.0 in load_attr_content")
         with torch.no_grad():
-            _logger.info(f'load partitioned model from {filename}, partitioned_model_pt={partitioned_model_pt}')
-            fullmap2 = {tid: (attr, slicer, nchunks) for attr, (tid, slicer, nchunks) in self._fullmap.items()}
-            for file_idx in range(partitioned_model_pt):
-                full = torch.load(filename + f'.{file_idx}')
-                for tid in full.keys():
-                    if tid not in fullmap2:
-                        _logger.warning(f'cannot find tid {tid} in fullmap2')
+            _logger.info(f'loading partitioned model from {filename}, number of model parameter chunks: {npartitions}')
+            # self._fullmap 
+            attr_names = set(self._fullmap.keys())
+            for file_idx in range(npartitions):
+                # part_model contains a subset of attributes, where each attribute is a fulltensor
+                # fulltensor.tid -> torch.Tensor
+                part_model: Dict[int, torch.Tensor] = torch.load(filename + f'.{file_idx}')
+                loaded_name = set()
+                for attr_name in attr_names:
+                    tid, slicers, val_nchunks = self._fullmap[attr_name]
+                    if tid not in part_model:
                         continue
-                    fm = fullmap2[tid]
-                    tensor: torch.Tensor = getattr(self, fm[0])
-                    content = full[tid][fm[1]] / fm[2]
-                    tensor.copy_(content)
-                    fullmap2.pop(tid, None)
-
-            if len(fullmap2) != 0:
-                raise RuntimeError(f'cannot find tid {list(fullmap2.keys())} in partitioned model files')
+                    attr = getattr(self, attr_name)
+                    content = part_model[tid][slicers]
+                    if val_nchunks != 1:
+                        content = content / val_nchunks
+                    attr.copy_(content)
+                    loaded_name.add(attr_name)
+                for name in loaded_name:
+                    attr_names.remove(name)
+            if len(attr_names) != 0:
+                raise RuntimeError(
+                    f'remaining graph parameters / buffers cannot find in model files: {list(attr_names)}')
 
     def init_group(self, ranks: List[int]):
         if not all([isinstance(rank, int) for rank in ranks]):
