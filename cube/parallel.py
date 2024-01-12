@@ -266,7 +266,7 @@ def _prepare_and_check_reusable(
     #   MOO*            | unmatch   | generate (specail case is when there's no python source code, see below)
     #   MOO             | imported  | raise error if unmatch
     #  *: The precondition for `except` part is the compute config should match.
-    #     you can take it as a continous operation after a failed MATCH/OVERRIDE.
+    #     you can take it as a continous operation after a failed generation.
     reusable = False
     config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
     old_config = torch.load(config_file) if config_file.exists() else None
