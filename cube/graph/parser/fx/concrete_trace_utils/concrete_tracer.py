@@ -36,6 +36,8 @@ from torch.fx.proxy import TracerBase
 from torch.fx.operator_schemas import check_for_mutable_operation
 
 dict_keys_type = type(dict().keys())
+dict_values_type = type(dict().values())
+dict_items_type = type(dict().items())
 
 try:
     # Scope is a new class to record module path in pytorch 2.0
@@ -597,7 +599,7 @@ class ConcreteTracer(TracerBase):
         if isinstance(a, (torch.autograd.function.Function, torch.autograd.function.FunctionMeta)):
             return a
 
-        if isinstance(a, dict_keys_type):
+        if isinstance(a, (dict_keys_type, dict_values_type, dict_items_type)):
             return a
 
         return super().create_arg(a)
