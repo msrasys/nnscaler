@@ -200,8 +200,9 @@ class CubeModule(torch.nn.Module):
         # so we will try to load it from file on the fly.
         dist_param_map = getattr(self, '_dist_param_map', None)
         if not dist_param_map:
-            assert os.path.isfile('dist_param_map.pt'), 'Cannot open distributed parameter mapping file: dist_param_map.pt'
-            dist_param_map = torch.load('dist_param_map.pt')
+            module_file = Path(sys.modules[self.__module__].__file__)
+            # load from the same directory as the module file
+            dist_param_map = torch.load(module_file.with_name(FxModuleParser.ATTR_MAP_FILE))
         param_area_map = self._fullmap
         optimizer_state_dict = optimizer.state_dict() if optimizer is not None else None
         return state_dict, dist_param_map, param_area_map, optimizer_state_dict

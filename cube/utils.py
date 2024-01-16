@@ -1,6 +1,8 @@
 import os
 from typing import Optional, Tuple, Callable
 import logging
+from pathlib import Path
+import sys
 
 import cube
 from cube.runtime.device import DeviceGroup
@@ -13,7 +15,7 @@ _logger = logging.getLogger(__name__)
 
 def print_each_rank(msg: str, rank_only: Optional[int] = None, logger: Optional[logging.Logger] = None):
     """Logging the message.
-    
+
     Args:
         msg (str): message to be logged.
         rank_only (int, optional):
@@ -41,21 +43,25 @@ def print_each_rank(msg: str, rank_only: Optional[int] = None, logger: Optional[
 
 
 def _load_module_attr(filename: str, name: str):
+    # TODO: use `importlib.import_module` instead
     import importlib.util
     spec = importlib.util.spec_from_file_location(name, filename)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    sys.modules[name] = module  # so you can find the loaded module in sys.modules
     return module
 
 
-def load_model(filename: Optional[str] = None, load_content: bool = True):
+def load_model(filename: Optional[str] = None, load_content: bool = True, fullmodel_filename: Optional[str] = None):
     filename = f'gencode{DeviceGroup().rank}.py' if filename is None else filename
-    module = _load_module_attr(filename, 'GenModel')
+    module = _load_module_attr(filename, Path(filename).stem)
     loaded_module: cube.runtime.module.CubeModule = module.GenModel().cuda()
     # load parameter content
     if load_content:
         _logger.info("loading parameter content...")
-        loaded_module.load_attr_content('./fullmodel.pt')
+        if not fullmodel_filename:
+            fullmodel_filename = str(Path(filename).with_name('fullmodel.pt'))
+        loaded_module.load_attr_content(fullmodel_filename)
     # initialize reducer
     for reducer in loaded_module.reducers:
         reducer.build_buckets()
@@ -64,13 +70,13 @@ def load_model(filename: Optional[str] = None, load_content: bool = True):
 
 def load_default_schedule(filename: Optional[str] = None):
     filename = f'gencode{DeviceGroup().rank}.py' if filename is None else filename
-    module = _load_module_attr(filename, '_train_step')
+    module = _load_module_attr(filename, Path(filename).stem)
     return module._train_step
 
 
 def load_eval_schedule(filename: Optional[str] = None):
     filename = f'gencode{DeviceGroup().rank}.py' if filename is None else filename
-    module = _load_module_attr(filename, '_infer_step')
+    module = _load_module_attr(filename, Path(filename).stem)
     return module._infer_step
 
 
@@ -91,7 +97,7 @@ class accum_mode:
         optimizer.zero_grad()
     ```
 
-    Or, 
+    Or,
 
     ```
     for _ in range(num_iters):
@@ -111,17 +117,17 @@ class accum_mode:
                 of the parameters in the reducer.
             end (bool): Whether the iteration is the last accumulation step.
                 If True, the `model.reduce_grad()` will be enabled to reduce gradients at
-                the end of the iteration. 
+                the end of the iteration.
         """
         self.begin: bool = begin
         self.end: bool = end
         self.old: Tuple[bool, bool] = None
-    
+
     def __enter__(self):
         """Enter the accumulation mode.
 
         Example usage:
-        
+
         ```
         for _ in range(num_iters):
             for step in range(accum_steps):
@@ -131,7 +137,7 @@ class accum_mode:
             optimizer.step()
             optimizer.zero_grad()
         ```
-        
+
         """
         self.old = (RuntimeFlag.skip_zero_grad, RuntimeFlag.skip_reducer)
         RuntimeFlag.skip_zero_grad = (not self.begin)
@@ -158,10 +164,10 @@ class accum_mode:
             optimizer.step()
             optimizer.zero_grad()
         ```
-        
+
         Args:
             nsteps (int): The number of accumulation steps.
-        
+
         Yield:
             int: The current step index.
         """

@@ -126,7 +126,9 @@ class SemanticModel:
 
     def __init__(self, model: Optional[torch.nn.Module],
                  save_content: bool = True,
-                 dynamic_shape: bool = False):
+                 dynamic_shape: bool = False,
+                 attr_savedir: str = './',
+    ):
         """
         Create semantic model based on AI Scientist description.
 
@@ -137,6 +139,8 @@ class SemanticModel:
                 whether to save the content of model and load it into generated model. Default True.
             dynamic_shape (bool):
                 whether to use dynamic shape. Default False.
+            attr_savedir (str):
+                directory to save content (attribtes)
         """
         if DeviceGroup().local_rank == 0 and model is not None:
             assert isinstance(model, torch.nn.Module), f"device of local_rank == 0 must provide model"
@@ -147,6 +151,7 @@ class SemanticModel:
         # parser configuration
         self.save_content: bool = save_content
         self.dynamic_shape: bool = dynamic_shape
+        self.attr_savedir: str = attr_savedir
 
     @property
     def dummy_input(self) -> Any:
@@ -223,7 +228,7 @@ class SemanticModel:
             self._ir_graph = parser.convert_model(
                 self.model,
                 dummy_input=self.dummy_input,
-                attr_savedir='./',
+                attr_savedir=self.attr_savedir,
                 dynamic_shape=self.dynamic_shape
             )
             return self._ir_graph(*args)
