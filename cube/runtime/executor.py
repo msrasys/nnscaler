@@ -76,7 +76,7 @@ class Executor:
     # Each graph has its name, and multiple call for the graph will append
     # (instant id -> detached) input tensor pairs for backward reference.
     _detach: Dict[str, List[TensorPairs]] = dict()
-    _fn: Callable = None
+    _backward_pre_hook: Optional[Callable] = None
 
     @staticmethod
     def fexecute(name: str, subgraph: Callable, *input_tensors: Tuple[Any], requires_grad=True):
@@ -143,12 +143,6 @@ class Executor:
             gradient tensors corresponding to input_tensors.
         """
         output_tensor_grads = Executor.sync_tensors(output_tensor_grads)
-        if Executor._fn is not None and output_tensor_grads[0] is None:
-            assert len(output_tensor_grads) == 1
-            assert len(output_tensors) == 1
-            output_tensors = (Executor._fn(output_tensors[0]), )
-
-        if len(output_tensors) == 0: return None
 
         saved_pairs = Executor._detach[name].pop(0)
         tensor_ids: List[int] = [pair[0] for pair in saved_pairs]
@@ -162,7 +156,8 @@ class Executor:
                     f"Remain {len(Executor._detach[name])} segments.\n"
                     f"{''.join(traceback.format_stack())}"
                 )
-
+        
+        if len(output_tensors) == 0: return None
 
         input_tensors = []
         for t in dtensors:
@@ -180,6 +175,15 @@ class Executor:
                 visited.add(pair)
                 dedup_output_tensors.append(t)
                 dedup_output_tensor_grads.append(g)
+
+        # apply hook before backward
+        if Executor._backward_pre_hook is not None:
+            input_tensors, dedup_output_tensors, dedup_output_tensor_grads = \
+                Executor._backward_pre_hook(
+                    input_tensors,
+                    dedup_output_tensors,
+                    dedup_output_tensor_grads
+                )
 
         torch.autograd.backward(
             dedup_output_tensors,
@@ -199,9 +203,33 @@ class Executor:
         """
         return [AsyncCommHandler().wait(t) if torch.is_tensor(t) else t for t in tensors]
 
+
+    @staticmethod
+    def register_backward_pre_hook(hook: Optional[Callable]):
+        """Register a backward hook for the right before the backward executor.
+
+        The backward hook will be called with the following arguments:
+            hook(input_tensors, output_tensors, output_tensor_grads) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]
+
+        The backward hook mainly serves for the scenarios like loss scaling.
+
+        Notes:
+            Users can only register one backward pre_hook. If there was a hook
+            registered before, it will be overwritten.
+
+        Args:
+            hook (Callable or None): the backward hook to be registered. The hook takes
+                input_tensors (List[torch.Tensor]),
+                output_tensors (List[torch.Tensor]),
+                output_tensor_grads (List[torch.Tensor]) as inputs and returns the
+                same format of updated tensors.
+        """
+        Executor._backward_pre_hook = hook
+    
     @staticmethod
     def clear():
         Executor._detach = dict()
+        Executor._backward_pre_hook = None
 
     @staticmethod
     def check_clear():
