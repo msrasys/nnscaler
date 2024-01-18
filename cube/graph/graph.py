@@ -856,13 +856,12 @@ class IRGraph(IRSegment):
         # adjust the start of the first stage to involve beginning operators
         for idx in range(starts[0]):
             node = self.node(idx)
+            # IRDataOperation cannot be involved in the IRSegment in current
+            # implementation.
             if isinstance(node, IRDataOperation): continue
             assert isinstance(node, IRFwOperation), \
                 f"Expected nodes previous from the first stage are all IRFwOperation, but got {type(node)}"
-            if node.name == 'multiref' or isinstance(node, IRPyFunc):
-                pass
-            else:
-                _logger.info(f'involve node {node.name}({node.cid}) into the first stage')
+            _logger.info(f'involve node {node.name}({node.cid}) into the first stage')
             starts[0] = idx
             break
 
@@ -895,11 +894,9 @@ class IRGraph(IRSegment):
 
         def insert_identity(tensor: IRSubTensor, sid: int) -> IRFwOperation:
             fwop = Identity(tensor)
-            fwop.infer_shape()
-            fwop.output(0).parent.dtype = tensor.dtype
-            fwop.set_output(0, fwop.output(0).tosub())
+            output = tensor.parent.like().tosub()
+            fwop.set_output(0, output)
             if tensor.requires_grad:
-                fwop.output(0).parent.requires_grad = True
                 # set input grad
                 igrad = tensor.parent.grad.select(tensor.indmap, tensor.valmap)
                 fwop.input(0).grad = igrad
@@ -958,24 +955,21 @@ class IRGraph(IRSegment):
                 for cidx, consumer in enumerate(buckets[sid]):
                     if fgrad is None:
                         grad = None
-                    elif isinstance(fgrad, float):
-                        assert fgrad == 1.0, "Detect a backward tensor, but gradient can only be 1.0"
-                        grad = fgrad
                     else:
                         valmap = curr_valmap.map((0, 2)) if cidx != nconsumers - 1 else curr_valmap
                         grad = fgrad.select(ptensor.indmap, valmap)
                         curr_valmap = curr_valmap.map((1, 2)) if cidx != nconsumers - 1 else curr_valmap
                     # update forward consumer
                     idx = consumer.inputs().index(ptensor)
-                    ptensor = consumer.input(idx)
+                    tensor = consumer.input(idx)
                     with self.update(consumer) as consumer:
                         consumer.set_input(idx, out)
                         consumer.input(idx).grad = grad
                     # update backward
-                    if isinstance(consumer.mirror, IRCell):
+                    if tensor.grad is not None:
                         with self.update(consumer.mirror) as bconsumer:
-                            idx = bconsumer.outputs().index(ptensor.grad)
-                            bconsumer.set_output(idx,grad )
+                            idx = bconsumer.outputs().index(tensor.grad)
+                            bconsumer.set_output(idx, grad)
 
         # grouping into segment
         for sid in range(len(fstages)):

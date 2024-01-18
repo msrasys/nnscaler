@@ -284,6 +284,13 @@ class PlanBase:
         """
         Place dataloaders together with segments
         """
+        def insert_block(dl, mid, step):
+            dl_block = Block(dl, mid, 1)
+            # print(f'inserting microbatch {mid} at step {step} before {segment.name}{segment.cid}')
+            self._blocks.append(dl_block)
+            self._step_blocks[step+block.span-1].insert(0, dl_block)
+            self._block_start_step[dl_block] = step+block.span-1
+
         # insert dataloaders to its devices before the first required segment
         for dl in self._dependency.dataloaders:
             inserted_mids = set()
@@ -294,13 +301,14 @@ class PlanBase:
                     if mid in inserted_mids: continue
                     if dl.device[0] not in segment.device: continue
                     if self.graph.depends(dl, segment):
-                        dl_block = Block(dl, mid, 1)
-                        # print(f'inserting microbatch {mid} at step {step} before {segment.name}{segment.cid}')
-                        self._blocks.append(dl_block)
-                        self._step_blocks[step+block.span-1].insert(0, dl_block)
-                        self._block_start_step[dl_block] = step+block.span-1
+                        insert_block(dl, mid, step)
                         inserted_mids.add(mid)
                         break
+            # we guarantee each dataloader is inserted into the schedule plan,
+            # in case that graph output requires the data from dataloader.
+            for mid in range(self._num_microbatches):
+                if mid not in inserted_mids:
+                    insert_block(dl, mid, self.nsteps - 1)
 
     def topo_sort(self):
         """
