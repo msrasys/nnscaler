@@ -477,6 +477,7 @@ def _gencode(
         if is_module_class:
             del module
     else:
+        logger.info(f"Reuse graph dump in {outdir}")
         graph = IRGraph.load(graph_ckp)
         forward_args = torch.load(forward_args_ckp)
 
@@ -577,7 +578,7 @@ def parallelize(
     Or you can unset load_module flag, and manually copy the generated files to other nodes.
     After all nodes have the generated files, you can call parallelize() again with load_module flag set.
 
-    Note: if reuse is not set to ReuseType.ALL,
+    Note: if reuse is not set to ReuseType.MATCH,
     the generated code in outdir will be removed EVEN IF the code generetion fails in this call.
 
     if the input is a module object.
@@ -665,6 +666,8 @@ def parallelize(
                     module_dtype=module_dtype,
                     module_fn=module_fn,
                 )
+        else:
+            logger.info(f"Reuse generated code in {outdir}")
 
     if load_module:
         if not torch.distributed.is_initialized(): # we only support loading in torchrun environment
