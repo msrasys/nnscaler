@@ -615,7 +615,7 @@ class IRDimops(IRFwOperation):
         for anno in self._annos_candidates:
             anno = OpAnno(anno)
             # expand * and check shape dimension consistency
-            if self.align(inputs, anno, **kwargs):
+            if self.align(signature, inputs, anno, kwargs):
                 self._iannos = anno.inputs()
                 self._oannos = anno.outputs()
                 self._anno = anno
@@ -706,7 +706,7 @@ class IRDimops(IRFwOperation):
             op.set_output(idx, output)
         return op
 
-    def align(self, inputs: List[IRTensor], op_anno: OpAnno, **kwargs) -> bool:
+    def align(self, signature, inputs: List[IRTensor], op_anno: OpAnno, kwargs: Dict) -> bool:
         """!
         Align input tensor shapes to the operator annotation.
 
@@ -776,9 +776,19 @@ class IRDimops(IRFwOperation):
                             if identifier not in kwargs:
                                 toinfer.append(identifier)
                             else:
-                                assert isinstance(kwargs[identifier], int), "require integer for annotation inference"
-                                ret = op_anno.setlen(identifier, kwargs[identifier])
-                                accum *= kwargs[identifier]
+                                if isinstance(kwargs[identifier], IRObject):
+                                    _logger.warning(
+                                        f"Function {signature}: Found identifier {identifier} in kwargs to be IRObject, "
+                                        f"this will turn it into a static value. Pay attention to the usage "
+                                        f"in dynamic-shape scenarios")
+                                    kwargs[identifier] = kwargs[identifier].value
+                                length = kwargs[identifier]
+                                if not isinstance(length, int):
+                                    raise ValueError(
+                                        f"Function {signature}: identifier {identifier} in kwargs "
+                                        f"must be int or IRObject[value=int], but got {length}")
+                                ret = op_anno.setlen(identifier, length)
+                                accum *= length
                         else:
                             accum *= length
                     if len(toinfer) == 0 and accum != dimlen:
