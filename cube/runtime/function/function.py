@@ -149,6 +149,14 @@ def select_scatter(input:torch.Tensor, src:torch.Tensor, dim:int, index:int):
     return torch.masked_scatter(input, mask, src)
 
 
+def tensor(data, *, dtype=None, requires_grad=False, pin_memory=False):
+    return torch.tensor(
+        data, dtype=dtype,
+        device=torch.cuda.current_device(),
+        requires_grad=requires_grad, pin_memory=pin_memory
+    )
+
+
 def empty(size: Tuple[int], dtype=None, requires_grad=False, pin_memory=False):
     return torch.empty(
         size, dtype=torch.get_default_dtype() if dtype is None else dtype,

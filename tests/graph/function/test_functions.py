@@ -5,6 +5,7 @@ from cube.ir.cten import IRObject, IRTensor
 
 import pytest
 import torch
+import numpy as np
 
 
 def o(value):
@@ -273,3 +274,24 @@ def test_Unsqueeze():
 def test_ScaledDotProductAttention():
     op = F.ScaledDotProductAttention(IRTensor([8, 128, 64]), IRTensor([8, 256, 64]), IRTensor([8, 256, 32]), None, 0.05)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a e d^, a b^ d^, a b^ c -> a e c'
+
+
+def test_NewTensor():
+    op = F.NewTensor(torch.tensor(1))
+    assert op.signature == 'cube.runtime.function.tensor'
+    assert repr(op.anno) == ' -> 1^'
+    assert op.kwargs['data'] == 1
+
+    op = F.NewTensor(torch.tensor([1,2]))
+    assert op.signature == 'cube.runtime.function.tensor'
+    assert repr(op.anno) == ' -> 2^'
+    assert op.kwargs['data'] == [1,2]
+
+    obj = IRObject(value=np.array([1,2]))
+    op = F.NewTensor(obj)
+    assert repr(op.anno) == ' -> 2^'
+    assert op.kwargs['data'] == obj
+
+    op = F.NewTensor(np.array([[1],[2],[3]]))
+    assert repr(op.anno) == ' -> 3^ 1^'
+    assert op.kwargs['data'] == [[1],[2],[3]]

@@ -292,15 +292,30 @@ def Full(size, fill_value, *, out=None, dtype=None, layout=None,
 
 def NewTensor(data, *, dtype=None, device=None,
               requires_grad=False, pin_memory=False, signature=None):
-    # note: device is ignored
-    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    """
+    torch.tensor(data, *, dtype=None, device=None, requires_grad=False, pin_memory=False)
+    """
     signature = 'cube.runtime.function.tensor'
-    size = tuple(np.array(data).shape) if np.array(data).shape else (1,)  # (1,) means it is a scalar
-    kwargs = {'size': size, 'requires_grad': requires_grad,
+
+    val = data
+    if isinstance(data, IRTensor):
+        size = data.shape
+    elif isinstance(data, IRObject):
+        size = torch.tensor(data.value).shape
+    else:
+        # for non-IRObject instance, we will always convert to list
+        # through torch.tensor, since we cannot guarantee the `data`
+        # instance to be executable for its `repr(data)` string
+        # in gencode
+        val = torch.tensor(data)
+        size = val.shape
+        val = val.tolist()
+    size = size if len(size) > 0 else (1,)  # for scalar
+    
+    kwargs = {'data': val, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
-    anno, rules = _get_creator_anno_rules(size, True)
+    anno, rules = _get_creator_anno_rules(size, False)
     dimop = IRDimops(NewTensor, 'tensor', signature, [anno], [], rules, **kwargs)
-    dimop.output(0).parent.dtype = dtype
     return dimop
 
 
