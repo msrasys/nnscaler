@@ -360,22 +360,23 @@ class IRAdapterGener:
             # print(f'backward:\n{graph.mirror.debug_tensor_map_str(ftensor.grad)}')
 
             # producers can be operators and graph inputs
-            fptensors = graph.ptensors(ftensor)
+            fproducers, fptensors = graph.producers(ftensor), graph.ptensors(ftensor)
             if ftensor in input_producer:
                 fptensors = fptensors + tuple(fop.output(0) for fop in input_producer[ftensor])
             fptensors = expand_devices(fptensors, producer=True)
             assert all(len(ptensor.device) == 1 for ptensor in fptensors), "Not support for multi-device"
 
             # consumers can be operators and graph outputs
-            fctensors = graph.ctensors(ftensor)
+            fconsumers, fctensors = graph.consumers(ftensor), graph.ctensors(ftensor)
             fctensors = expand_devices(fctensors, consumer=True)
             assert all(len(ctensor.device) == 1 for ctensor in fctensors), "Not support for multi-device"
 
-            bptensors, bctensors = [], []
+            bproducers, bptensors = [], []
+            bconsumers, bctensors = [], []
             if isinstance(ftensor.grad, IRFullTensor):
-                bptensors = bgraph.ptensors(ftensor.grad)
+                bproducers, bptensors = bgraph.producers(ftensor.grad), bgraph.ptensors(ftensor.grad)
                 bptensors = expand_devices(bptensors, producer=True)
-                bctensors = bgraph.ctensors(ftensor.grad)
+                bconsumers, bctensors = bgraph.consumers(ftensor.grad), bgraph.ctensors(ftensor.grad)
                 if ftensor in input_producer:
                     bctensors = bctensors + tuple(fwop.output(0).grad for fwop in input_producer[ftensor]) 
                 bctensors = expand_devices(bctensors, consumer=True)
@@ -391,23 +392,22 @@ class IRAdapterGener:
                     fadapters.append(fadapter)
 
             # (activation -> graph/segment output) generation: generate communication adapters between
-            # producer operators and graph/segment output tensors. Note graph/segment output tensors
+            # producer operatiors and graph/segment output tensors. Note graph/segment output tensors
             # always require for full-shape/value for output, while consumers may partition them. Therefore,
             # we need to additionally generate adapters for this case.
             if ftensor in output_consumer:
                 out_fctensors = tuple(fwop.input(0) for fwop in output_consumer[ftensor])
                 out_fctensors = expand_devices(out_fctensors, consumer=True)
-                out_bptensors = []
-                if isinstance(ftensor.grad, IRFullTensor):
-                    out_bptensors = tuple(fwop.input(0).grad for fwop in output_consumer[ftensor])
-                    out_bptensors = expand_devices(out_bptensors, consumer=True)
                 # dedup adapter if the output is same with activation tensor
                 if set(out_fctensors) == set(fctensors) and \
-                   set(out_bptensors) == set(bptensors) and \
                    set(t.device[0] for t in out_fctensors) == set(t.device[0] for t in fctensors):
                     pass
                 else:
-                    fctensors, bptensors = out_fctensors, out_bptensors
+                    fctensors = out_fctensors
+                    bptensors = []
+                    if isinstance(ftensor.grad, IRFullTensor):
+                        bptensors = tuple(fwop.input(0).grad for fwop in output_consumer[ftensor])
+                        bptensors = expand_devices(bptensors, producer=True)
                     if (not skip(fptensors, fctensors)) or (not skip(bptensors, bctensors)):
                         fadapter = ConcurrentGener.gen(fptensors, fctensors, bptensors, bctensors, cost_fn)
                         if fadapter is not None:
@@ -438,7 +438,6 @@ class IRAdapterGener:
 
                 # insert forward adapter
                 # graph.insert(fadapter, max(producers) + 1)
-                fconsumers = graph.consumers(ftensor)
                 if len(fconsumers) > 0:
                     fidx = min(graph.multi_index(fconsumers))
                 else:
@@ -459,7 +458,6 @@ class IRAdapterGener:
                 if badapter is not None:
                     assert isinstance(badapter, IRAdapter)
                     assert isinstance(bgraph, IRSegment)
-                    bproducers = bgraph.producers(ftensor.grad)
                     if len(bproducers) > 0:
                         bidx = max(bgraph.multi_index(bproducers)) + 1
                     else:
