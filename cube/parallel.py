@@ -487,11 +487,12 @@ def _gencode(
 
     # check assignment and remove anchor node
     for node in graph.nodes(flatten=True):
-        # skip graph anchor and multiref: they will be removed or replaced by system
+        # skip graph anchor: will be removed
+        # skip multiref and IRPyFunc: they will be managed by system
         if isinstance(node, IRGraphAnchor) or node.name == 'multiref':
-            graph.assign(node, 0)
+            continue
         if isinstance(node, IRPyFunc):
-            graph.assign(node, 0)
+            continue
         if len(node.device) == 0:
             raise RuntimeError(f"Node {node} device is not set")
     graph = IRAdapterGener.gen(graph, cost_fn=None)

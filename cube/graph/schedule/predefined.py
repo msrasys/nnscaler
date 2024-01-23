@@ -28,7 +28,7 @@ class PredefinedSched:
             raise ValueError(f"expected num_microbatches > 0, but got {num_microbatches} ")
         segments: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
         fsegs = [seg for seg in segments if seg.isfw()]
-        assert len(fsegs) == num_stages, f"Mismatch of forward segement number ({len(fsegs)}) with num_stages ({len(num_stages)})"
+        assert len(fsegs) == num_stages, f"Mismatch of forward segement number ({len(fsegs)}) with num_stages ({num_stages})"
 
         # describe schedule
         sched = SchedulePlan(graph, num_microbatches)

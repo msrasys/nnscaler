@@ -371,10 +371,10 @@ class SchedulePlan(PlanBase):
         """
         # step 1: build dependency for scheduling
         self._dependency.build()
-        # step 2: apply this scheduling
+        # step 2: insert adapters and dataloaders to the plan
         self._place_adapters()
         self._place_dataloader()
-        # step 3: generate topological sequence
+        # step 3: generate topological sequence, append reducers
         self.topo_sort()
 
     def validate(self) -> bool:
