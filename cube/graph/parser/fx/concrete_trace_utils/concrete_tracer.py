@@ -29,7 +29,7 @@ from torch.utils._pytree import tree_map
 import torch.fx
 from torch.fx import GraphModule
 from torch.fx._compatibility import compatibility
-from torch.fx._symbolic_trace import _Patcher, _proxyable_classes
+from torch.fx._symbolic_trace import _proxyable_classes
 from torch.fx.graph import Graph
 from torch.fx.node import Target, Node, Argument, _side_effectful_functions
 from torch.fx.proxy import TracerBase
@@ -86,6 +86,7 @@ except ImportError:
             return
 
 from . import concrete_proxy as ep
+from .function_patcher import FunctionPatcher
 from .operator_patcher import OperatorPatcherContext
 from .utils import (
     _orig_module_call,
@@ -320,6 +321,7 @@ class ConcreteTracer(TracerBase):
         self.node_name_to_scope = {}
         self.cpu_offload = cpu_offload
         self.record_frames = record_frames
+        self.patcher = FunctionPatcher()
 
     @contextmanager
     def do_temp_disable(self, call=False, attr=False, agfunc_apply=False):
@@ -388,26 +390,17 @@ class ConcreteTracer(TracerBase):
             if kind == 'call_function':
                 assert isinstance(target, Callable)
                 fn = target
-                if _orig_getattr(fn, '__module__', None) != self.__module__ \
-                    and hasattr(fn, '__globals__'):
-                    _autowrap_check(self, fn.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
-                return OperatorPatcherContext.patch_run(fn, *args, **kwargs)
+                result = fn(*args, **kwargs)
             elif kind == 'call_method':
                 self_obj, *args_tail = args
                 fn = _orig_getattr(self_obj, target)
-                if _orig_getattr(fn, '__module__', None) != self.__module__ \
-                    and hasattr(fn, '__globals__'):
-                    _autowrap_check(self, fn.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
                 result = fn(*args_tail, **kwargs)
             elif kind == 'call_module':
                 assert isinstance(target, str)
                 mod = self.fetch_attr(target)
                 if self.cpu_offload:
                     mod.cuda()  # how it works in ddp?
-                if _orig_getattr(mod, '__module__', None) != self.__module__ \
-                    and hasattr(mod, '__globals__'):
-                    _autowrap_check(self, mod.__globals__, self._autowrap_function_ids, self.autowrap_leaf_pairs, self.agfunc_dict)
-                result = OperatorPatcherContext.patch_run(mod, *args, **kwargs)
+                result = mod(*args, **kwargs)
                 if self.cpu_offload:
                     mod.cpu()
             elif kind == 'get_attr':
@@ -479,6 +472,7 @@ class ConcreteTracer(TracerBase):
         """
         similar to _symbolic_trace.Tracer.create_proxy.
         use the 'run_target' to actually execute the code, and store the value in 'value' field.
+        create the nodes for the target and the input of the target (if the target is one of call_method, call_function, call_module).
         """
         def unwrap(obj: Any):
             while _orig_isinstance(obj, ep.ConcreteProxy):
@@ -487,8 +481,8 @@ class ConcreteTracer(TracerBase):
         args_unwrapped = ep.map_aggregate_not_proxy(args, unwrap)
         kwargs_unwrapped = ep.map_aggregate_not_proxy(kwargs, unwrap)
 
-        # real value by execution
-        value_unwrapped = self.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+        with self.patcher.revert():
+            value_unwrapped = self.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
 
         args_ = self.create_arg(args)
         kwargs_ = self.create_arg(kwargs)
@@ -1172,12 +1166,13 @@ class ConcreteTracer(TracerBase):
         self.temp_disable_attr_level = 0
         self.temp_disable_agfunc_apply_level = 0
         try:
-            with _Patcher() as self.patcher:
+            with self.patcher:
                 # allow duplicate patches to support the case of nested calls
                 self.patcher.patch_method(torch.nn.Module, "__getattribute__", module_getattribute_wrapper, deduplicate=False)
 
                 self.patcher.patch_method(torch.nn.Module, "__call__", module_call_wrapper, deduplicate=False)
-                self.patcher.patch_method(torch.autograd.Function, "apply", agfunc_apply_wrapper, deduplicate=False)
+                # for cuda versions of pytorch, autograd.Function.apply should be reverted by delattr
+                self.patcher.patch_method(torch.autograd.Function, "apply", agfunc_apply_wrapper, deduplicate=False, revert_by_del=True)
                 self.patcher.patch_method(torch, "_assert", torch_assert_wrapper, deduplicate=False)
 
                 self.patcher.patch_method(builtins, "map", map_wrapper, deduplicate=False)
@@ -1207,8 +1202,6 @@ class ConcreteTracer(TracerBase):
                     self.create_node('output', 'output', (self.create_arg(results),),
                                      {}, type_expr=fn.__annotations__.get('return', None), node_result=ep.map_aggregate_not_proxy(results, unwrap))
         finally:
-            # for cuda versions of pytorch, autograd.Function.apply should be reverted manually
-            delattr(torch.autograd.Function, 'apply')
             _retain_weight_consistency(self.root)
             pass
 
@@ -1257,7 +1250,7 @@ def _create_wrapped_func(orig_fn):
 
     return wrapped
 
-def _patch_wrapped_functions(patcher : _Patcher):
+def _patch_wrapped_functions(patcher : FunctionPatcher):
     """
     Go through ``_wrapped_fn_patch_table`` and, for each frame object, wrap
     the listed global functions in the `_create_wrapped_func` wrapper.
@@ -1877,7 +1870,7 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
                 *side_effectful_inplace_ops
             }
             extra_side_effectful_functions = default_extra_side_effectful_functions | dce_ignored_function
-            with _Patcher() as patcher, ExtraSEFPatcher(extra_side_effectful_functions):
+            with FunctionPatcher() as patcher, ExtraSEFPatcher(extra_side_effectful_functions):
                 patcher.patch_method(Node, 'is_impure', node_is_impure_wrapper, deduplicate=False)
                 traced.graph.eliminate_dead_code()
             traced.recompile()  # this need to be done in MagicMethodPatcher context

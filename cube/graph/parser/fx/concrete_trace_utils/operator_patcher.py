@@ -185,9 +185,7 @@ class OperatorPatcher:
             return func
         # those flags are set by fx _Patcher when a method is patched
         # we don't want to patch it again
-        # _Patcher__fx_already_patched is for torch 2.0.1+
-        # __fx_already_patched is for torch 2.0.0
-        if hasattr(func, '_Patcher__fx_already_patched') or hasattr(func, '__fx_already_patched'):
+        if hasattr(func, '__fx_already_patched'):
             return func
         if self.use_operator_patch == (func in self.operator_patch_backlist):
             return func
