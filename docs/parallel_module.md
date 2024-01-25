@@ -4,6 +4,8 @@ Besides the support of end-to-end model training, Cube can also convert a `torch
 
 ## An example
 
+- Example 1: Parallelize the whole module
+
 ```python
 import torch
 from cube.parallel import parallelize, ComputeConfig, build_optimizer
@@ -28,7 +30,55 @@ ParallelizedLLM = parallelize(
     pas_policy,
     compute_config,
 )
+```
 
+- Example 2: Parallelize submodules.
+
+In this case, for non-paralle modules, they are replicated inside unit, and run data parallelism across units. See more details about unit in [Compute Config](###ComputeConfig) section.
+
+```python
+import torch
+from cube.parallel import parallelize, ComputeConfig, build_optimizer
+
+class HeavyModule(torch.nn.Module):
+    def __init__(self, ...):
+        ...
+    def forward(self, x):
+        ...
+
+class ParallelizedLLM(torch.nn.Module):
+    def __init__(self, ...):
+        ...
+        # use parallelize to convert submodules
+        heavy_module_sample_input = ...     # dummpy input will be used to do tracing
+        pas_policy = ...                    # the PAS policy, you can use autodist pas
+        compute_config = ComputeConfig(
+            plan_ngpus=...,
+            runtime_ngpus=...,
+            use_zero=...,
+            ...,
+        )                                  # compute environment config
+        self.heavy_module = parallelize(
+            HeavyModule(),
+            {'x': heavy_module_sample_input},
+            pas_policy,
+            compute_config,
+        )
+        # you can add other submodules here
+        ...
+
+    def forward(self, x, ...):
+        # call other submodules
+        ...
+        x = self.heavy_module(x)
+        ...
+        # call other submodules
+        return x
+```
+
+For both example 1 & 2, you can train/infer that module in multiple GPUs/Nodes just like a normal `torch.nn.Module`:
+
+```python
 # do inference exactly the same way
 def infer(model: ParallelizedLLM, x):
     model.eval()
@@ -239,6 +289,7 @@ We have `build_optimizer` to build an optimizer for distributed training.
 def build_optimizer(
     module: torch.nn.Module,
     optimizer_fn: Union[Type[OptimizerT], Callable[..., OptimizerT]],
+    non_parallel_module_reducer_op: str = 'sum',
     *args,
     **kwargs,
 ) -> OptimizerT:
@@ -247,7 +298,10 @@ It has the following parameters:
 - module (torch.nn.Module): the module to be optimized
 - optimizer_fn (Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]]):
     It can be the optimizer class or optimizer factory function.
-- *args: the args will pass to `optimizer_fn`
+- non_parallel_module_reducer_op (str): the reducer op for non-parallel modules. Default is 'sum'.
+- *args: the args will pass to `optimizer_fn`.
+ If you use `*args`, you must specify `non_parallel_module_reducer_op` explicitly even when you only need its default value.
+ So we suggest using `kwargs` instead of `args` to specify `optimizer_fn` arguments if possible.
 - **kwargs: the kwargs will pass to `optimizer_fn`
 
 To support distrubted training, in the function we need to hook 4 places:
@@ -263,11 +317,13 @@ To support distrubted training, in the function we need to hook 4 places:
 3. `optimizer.zero_grad()`:
     We need to call `CubeModule.zero_grad()` after `optimizer.zero_grad()`
 
-`build_optimizer` will patch optimizer for you. Besides the above patches, we also add several utility functions to optimizer:
+`build_optimizer` will patch optimizer for you. Besides the above patches, we also add several utility functions/variables to optimizer:
 
 1. `sync_shard_grad`: Sync the shard gradients of the module from nodes with same shard to the optimizer. This function is called in optimizer's pre-step hook. But If you want to access the gradients before `optimizer.step()`(for example, you need gnorm),  you need to call this function manually.
 
-2. `register_reducer_pre_hook`, `register_reducer_post_hook`: Register pre/post hooks to reducers which will be applied before/after gradient synchronization.
+2. `register_reducer_pre_hook`, `register_reducer_post_hook`: Register pre/post hooks to reducers which will be applied before/after gradient synchronization. These hooks will apply to all the reducers (including `_non_parallel_module_reducer`) in the optimizer.
+
+3. `_non_parallel_module_reducer`: The reducer for the modules which are not parallelized. It is used to sync the parameters in those modules across units.
 
 ### Dataset
 
@@ -287,5 +343,4 @@ def create_distributed_sampler(dataset):
 ```
 
 ## TODOs
-1. When ParallelModule is a submodule of another Module, Pytorch DDP is not supported yet.
-2. Pipeline parallelism is not supported yet.
+1. Pipeline parallelism is not supported yet.

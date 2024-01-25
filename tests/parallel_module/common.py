@@ -92,28 +92,18 @@ def PASData(graph: IRGraph, env_resource: ComputeConfig):
     for dl in graph.select(ntype=IRDataOperation):
         _replica(dl, list(range(ngpus)))
 
-    graph_inputs = IRSegment.get_objects_from_complex(graph.inputs())
-    graph_outputs = IRSegment.get_objects_from_complex(graph.outputs())
     for node in graph.nodes():
         # print(node)
         if isinstance(node, IRFwOperation):
-            # Currently cube only support replicate if node's input or input is part of the graph output
-            # workaround for now
-            # will fix later.
-            if any(output in graph_outputs for output in node.outputs()) \
-                or any(input in graph_outputs for input in node.inputs()):
-                # or any(input in graph_inputs for input in node.inputs()):
+            try:
+                algo = node.algorithms('dim')
+                idx = 0
+                sub_nodes = graph.partition(
+                    node, algo, idx=idx, dim=batch_dim, num=ngpus)
+            # except AssertionError:
+            except:
+                # print(f'WARNING: {node} cannot find dim algo, using replicate instead')
                 sub_nodes = graph.replicate(node, ngpus)
-            else:
-                try:
-                    algo = node.algorithms('dim')
-                    idx = 0
-                    sub_nodes = graph.partition(
-                        node, algo, idx=idx, dim=batch_dim, num=ngpus)
-                # except AssertionError:
-                except:
-                    # print(f'WARNING: {node} cannot find dim algo, using replicate instead')
-                    sub_nodes = graph.replicate(node, ngpus)
 
             for idx, node in enumerate(sub_nodes):
                 graph.assign(node, idx)

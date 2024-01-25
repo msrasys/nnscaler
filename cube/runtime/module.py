@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, TYPE_CHECKING
 import logging
 import os
 import sys
@@ -11,6 +11,10 @@ from cube.graph.parser.fx.parser import FxModuleParser
 from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.reducer import Reducer
 from cube.runtime.gnorm import ParamsInfo
+
+if TYPE_CHECKING:
+    from cube.parallel import ComputeConfig
+
 
 _logger = logging.getLogger(__name__)
 
@@ -153,9 +157,9 @@ class CubeModule(torch.nn.Module):
 
     def load_attr_content(self, filename: str):
         """Load module attribute (parameters and buffers) from file
-        
+
         Args:
-            filename (str): base file name (without '.0', '.1', etc.) 
+            filename (str): base file name (without '.0', '.1', etc.)
                 that saved with model parameters
         """
         npartitions = 0
@@ -165,7 +169,7 @@ class CubeModule(torch.nn.Module):
             raise RuntimeError(f"Cannot find file {filename}.0 in load_attr_content")
         with torch.no_grad():
             _logger.info(f'loading partitioned model from {filename}, number of model parameter chunks: {npartitions}')
-            # self._fullmap 
+            # self._fullmap
             attr_names = set(self._fullmap.keys())
             for file_idx in range(npartitions):
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
@@ -518,7 +522,7 @@ class ParallelModule(CubeModule):
     def get_dist_param_map(self):
         return self._dist_param_map
 
-    def get_compute_config(self):
+    def get_compute_config(self) -> 'ComputeConfig':
         return self._compute_config
 
     def get_rank(self):

@@ -78,6 +78,8 @@ def _train(model):
     for m in model.modules():
         if isinstance(m, ParallelModule):
             reducers.extend(m.reducers)
+    if optimizer._non_parallel_module_reducer:
+        reducers.append(optimizer._non_parallel_module_reducer)
 
     if not reducers:
         print('No reducer found, skip test_hook')
@@ -110,10 +112,10 @@ def _train(model):
     return results
 
 
-def _gpu_worker(pas, ngpus):
+def _gpu_worker(pas, plan_ngpus, runtime_ngpus=None):
     init_distributed()
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_hook') as tempdir:
-        compiled_module = _create_module(pas, ComputeConfig(ngpus, ngpus), tempdir)
+        compiled_module = _create_module(pas, ComputeConfig(plan_ngpus, runtime_ngpus or plan_ngpus), tempdir)
         _train(compiled_module)
 
 
@@ -125,6 +127,11 @@ def test_hook_tp_gpu1():
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_hook_tp_gpu2():
     launch_torchrun(2, _gpu_worker, PASRandomSPMD, 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_hook_tp_gpu4():
+    launch_torchrun(4, _gpu_worker, PASRandomSPMD, 2, 4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')

@@ -33,9 +33,11 @@ from cube.ir.unique import IDGenerator
 from cube.program import Program
 from cube.runtime.adapter.reducer import Reducer
 from cube.runtime.module import CubeModule, ParallelModule
+from cube.runtime.device import DeviceGroup
 
 
 logger = logging.getLogger(__name__)
+_VALID_REDUCER_OPS = ['sum', 'avg', 'mean', 'max', 'min']
 
 
 @dataclass(frozen=True)
@@ -109,8 +111,15 @@ class ComputeConfig:
             raise ValueError(f"runtime_ngpus {self.runtime_ngpus} must be a multiple of plan_ngpus {self.plan_ngpus}")
         if self.use_zero and self.zero_ngroups < 0:
                 raise ValueError(f"zero_ngroups {self.zero_ngroups} must be >= 0")
-        if self.reducer_op not in ['sum', 'avg', 'mean', 'max', 'min']:
+        if self.reducer_op not in _VALID_REDUCER_OPS:
             raise ValueError(f"reducer_op {self.reducer_op} is not supported.")
+
+    @property
+    def gpu_config(self) -> Dict[str, int]:
+        return {
+            'plan_ngpus': self.plan_ngpus,
+            'runtime_ngpus': self.runtime_ngpus,
+        }
 
 
 @contextmanager
@@ -692,6 +701,10 @@ class ParallelOptimizer(torch.optim.Optimizer):
     A optimizer stub to support parallelized module.
     The returned optimizer of build_optimizer() will have the same methods in this class.
     """
+
+    # this is a reducer for non-parallel modules
+    _non_parallel_module_reducer: Optional[Reducer] = None
+
     def sync_shard_grad(self):
         """
         Sync the shard gradients of the module from nodes with same shard to the optimizer.
@@ -729,6 +742,7 @@ OptimizerT = TypeVar('OptimizerT', bound=torch.optim.Optimizer)
 def build_optimizer(
     module: torch.nn.Module,
     optimizer_fn: Union[Type[OptimizerT], Callable[..., OptimizerT]],
+    non_parallel_module_reducer_op: str = 'sum',
     *args,
     **kwargs,
 ) -> OptimizerT:
@@ -755,7 +769,10 @@ def build_optimizer(
         optimizer_fn (Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]]):
             It can be the optimizer class or optimizer factory function.
             If it is a factory function, the signature should be the same with optimizer class constructor.
-        *args: the args for optimizer constructor
+        non_parallel_module_reducer_op (str): the reducer op for non-parallel modules. Default is 'sum'.
+        *args: the args for optimizer constructor.
+            Note: If you use `*args`, you must specify `non_parallel_module_reducer_op`.
+            Suggest to use kwargs instead, so you don't need to explicitly specify the default value of `non_parallel_module_reducer_op`.
         **kwargs: the kwargs for optimizer constructor
 
     Returns:
@@ -766,9 +783,38 @@ def build_optimizer(
 
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
         raise RuntimeError("End2End mode is not supported")
+    if not non_parallel_module_reducer_op in _VALID_REDUCER_OPS:
+        raise ValueError(f"non_parallel_module_reducer_op {non_parallel_module_reducer_op} is not supported.")
 
     RuntimeFlag.skip_reducer = True
     RuntimeFlag.skip_zero_grad = False
+
+    non_parallel_module_reducer = None
+    non_parallel_modules = [m for m in module.modules() if not isinstance(m, ParallelModule)]
+    parallel_modules = [m for m in module.modules() if isinstance(m, ParallelModule)]
+    if not parallel_modules:
+        raise RuntimeError("No ParallelModule found in the module. Please make sure you have called parallelize() before build_optimizer().")
+
+    # check if all ParallelModules have the same gpu_config
+    compute_configs = [m.get_compute_config() for m in parallel_modules]
+    for i in range(1, len(compute_configs)):
+        if compute_configs[i].gpu_config != compute_configs[0].gpu_config:
+            raise RuntimeError("All ParallelModules should have the same gpu_config.")
+    plan_ngpus, runtime_ngpus = compute_configs[0].plan_ngpus, compute_configs[0].runtime_ngpus
+
+    # we need to add all parameters of non-parallel modules to a reducer to reduce grads
+    # if there are non-parallel parameters
+    if plan_ngpus != runtime_ngpus and non_parallel_modules and any(p.numel() for m in non_parallel_modules for p in m.parameters(False)):
+        rank = torch.distributed.get_rank()
+        # create all groups
+        for i in range(plan_ngpus):
+            DeviceGroup().get_group(list(range(i, runtime_ngpus, plan_ngpus)))
+        group = list(range(rank % plan_ngpus, runtime_ngpus, plan_ngpus))
+        non_parallel_module_reducer = Reducer(group, reduce_op=non_parallel_module_reducer_op)
+        for m in non_parallel_modules:
+            for param in m.parameters(recurse=False): # only add leaf parameters to avoid duplicate
+                non_parallel_module_reducer.add_param(param)
+        non_parallel_module_reducer.build_buckets()
 
     def _local_parameters(module: torch.nn.Module):
         gen = module._named_members(lambda m: m._parameters.items())
@@ -776,52 +822,54 @@ def build_optimizer(
             yield param
 
     optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), *args, **kwargs)
+    optimizer._non_parallel_module_reducer = non_parallel_module_reducer
 
     def _step_pre_hook(opt, *args, **kwargs):
         opt.sync_shard_grad()
+
     def _step_post_hook(opt, *args, **kwargs):
-        for m in module.modules():
-            if isinstance(m, ParallelModule):
-                m.gather_params()
-            else:
-                assert not isinstance(m, CubeModule), "Only ParallelModule is supported in this mode"
+        for m in parallel_modules:
+            m.gather_params()
+
     optimizer.register_step_pre_hook(_step_pre_hook)
     optimizer.register_step_post_hook(_step_post_hook)
 
     orig_zero_grad = optimizer.zero_grad
     def _patched_zero_grad_hook(self, set_to_none: bool = True):
         orig_zero_grad(set_to_none)
-        for m in module.modules():
-            if isinstance(m, ParallelModule):
-                m.zero_grad()
-            else:
-                assert not isinstance(m, CubeModule), "Only ParallelModule is supported in this mode"
+        for m in parallel_modules:
+            m.zero_grad()
+        if non_parallel_module_reducer:
+            non_parallel_module_reducer.zero_grad()
     optimizer.zero_grad = types.MethodType(_patched_zero_grad_hook, optimizer)
 
     def _sync_shard_grad(self):
         with _runtime_flags(skip_reducer=False):
-            for m in module.modules():
-                if isinstance(m, ParallelModule):
-                    m.sync_grad()
-                else:
-                    assert not isinstance(m, CubeModule), "Only ParallelModule is supported in this mode"
+            # HACK: we reuse the _sync_grad_required flag of the first parallel module
+            # in order to support calling sync_shard_grad() multiple times.
+            # _sync_grad_required will reset to `True` in forward() of ParallelModule.
+            if parallel_modules[0]._sync_grad_required:
+                for m in parallel_modules:
+                    m.sync_grad()  # _sync_grad_required flag will reset inside sync_grad()
+
+                if non_parallel_module_reducer:
+                    non_parallel_module_reducer.sync_grads()
+
     optimizer.sync_shard_grad = types.MethodType(_sync_shard_grad, optimizer)
 
     def _register_reducer_pre_hook(self, fn: Callable[[Reducer, torch.Tensor], None]):
-        for m in module.modules():
-            if isinstance(m, ParallelModule):
-                for reducer in m.reducers:
-                    reducer.register_pre_hook(partial(fn, reducer))
-            else:
-                assert not isinstance(m, CubeModule), "Only ParallelModule is supported in this mode"
+        for m in parallel_modules:
+            for reducer in m.reducers:
+                reducer.register_pre_hook(partial(fn, reducer))
+        if non_parallel_module_reducer:
+            non_parallel_module_reducer.register_pre_hook(partial(fn, non_parallel_module_reducer))
 
     def _register_reducer_post_hook(self, fn: Callable[[Reducer, torch.Tensor], None]):
-        for m in module.modules():
-            if isinstance(m, ParallelModule):
-                for reducer in m.reducers:
-                    reducer.register_post_hook(partial(fn, reducer))
-            else:
-                assert not isinstance(m, CubeModule), "Only ParallelModule is supported in this mode"
+        for m in parallel_modules:
+            for reducer in m.reducers:
+                reducer.register_post_hook(partial(fn, reducer))
+        if non_parallel_module_reducer:
+            non_parallel_module_reducer.register_post_hook(partial(fn, non_parallel_module_reducer))
 
     optimizer.register_reducer_pre_hook = types.MethodType(_register_reducer_pre_hook, optimizer)
     optimizer.register_reducer_post_hook = types.MethodType(_register_reducer_post_hook, optimizer)

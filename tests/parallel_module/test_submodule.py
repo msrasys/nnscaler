@@ -80,11 +80,14 @@ def _create_modules(pas, compute_config, cube_savedir):
     return orig_module, compiled_module
 
 
-def _train(model, update_freq):
+def _train(model, update_freq, is_cube):
     init_random()
 
     loss_fn = nn.BCELoss()
-    optimizer = build_optimizer(model, torch.optim.Adam, lr=0.1)
+    if is_cube:
+        optimizer = build_optimizer(model, torch.optim.Adam, lr=0.1)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
     data = []
     DATA_SIZE = 20
     UPDATE_FREQ = update_freq
@@ -113,8 +116,8 @@ def _gpu_worker(pas, ngpus, update_freq):
     init_distributed()
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test') as tempdir:
         orig_module, compiled_module = _create_modules(pas, ComputeConfig(ngpus, ngpus), tempdir)
-        orig_results = _train(orig_module, update_freq)
-        compiled_results = _train(compiled_module, update_freq)
+        orig_results = _train(orig_module, update_freq, False)
+        compiled_results = _train(compiled_module, update_freq, True)
         return (
             orig_results,
             compiled_results,
