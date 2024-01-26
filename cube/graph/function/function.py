@@ -180,9 +180,7 @@ def CubeArange(start: Union[int, IRObject], end: Union[int, IRObject], step: Uni
     size = (math.ceil((end_val-start_val)/step_val),)
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), False)
-    dimop = IRDimops(CubeArange, 'arange', signature, [anno], [], rules, **kwargs)
-    dimop.output(0).parent.dtype = dtype
-    return dimop
+    return IRDimops(CubeArange, 'arange', signature, [anno], [], rules, **kwargs)
 
 
 def Arange(*args, out=None, dtype=None, layout=None,
@@ -215,9 +213,7 @@ def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requi
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
-    dimop = IRDimops(Empty, 'empty', signature, [anno], [], rules, **kwargs)
-    dimop.output(0).parent.dtype = dtype
-    return dimop
+    return IRDimops(Empty, 'empty', signature, [anno], [], rules, **kwargs)
 
 
 def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
@@ -232,9 +228,7 @@ def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
     kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
-    dimop = IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs)
-    dimop.output(0).parent.dtype = dtype
-    return dimop
+    return IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs)
 
 
 def Ones(size, *arg_size, out=None, dtype=None, layout=None,
@@ -249,9 +243,7 @@ def Ones(size, *arg_size, out=None, dtype=None, layout=None,
     kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
-    dimop = IRDimops(Ones, 'ones', signature, [anno], [], rules, **kwargs)
-    dimop.output(0).parent.dtype = dtype
-    return dimop
+    return IRDimops(Ones, 'ones', signature, [anno], [], rules, **kwargs)
 
 
 def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
@@ -267,9 +259,7 @@ def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requir
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
-    dimop = IRDimops(Rand, 'rand', signature, [anno], [], rules, **kwargs)
-    dimop.output(0).parent.dtype = dtype
-    return dimop
+    return IRDimops(Rand, 'rand', signature, [anno], [], rules, **kwargs)
 
 
 def Full(size, fill_value, *, out=None, dtype=None, layout=None,
@@ -284,10 +274,8 @@ def Full(size, fill_value, *, out=None, dtype=None, layout=None,
     size = tuple(size) if size else (1,)
     anno, rules = _get_creator_anno_rules(
         tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
-    dimop = IRDimops(Full, 'full', signature, [anno], [], rules,
+    return IRDimops(Full, 'full', signature, [anno], [], rules,
                      size=size, fill_value=fill_value, dtype=dtype, requires_grad=requires_grad)
-    dimop.output(0).parent.dtype = dtype
-    return dimop
 
 
 def NewTensor(data, *, dtype=None, device=None,
@@ -311,12 +299,11 @@ def NewTensor(data, *, dtype=None, device=None,
         size = val.shape
         val = val.tolist()
     size = size if len(size) > 0 else (1,)  # for scalar
-    
+
     kwargs = {'data': val, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
     anno, rules = _get_creator_anno_rules(size, False)
-    dimop = IRDimops(NewTensor, 'tensor', signature, [anno], [], rules, **kwargs)
-    return dimop
+    return IRDimops(NewTensor, 'tensor', signature, [anno], [], rules, **kwargs)
 
 
 def _handle_broadcast(lhs: IRTensor, rhs: IRTensor) -> Tuple[List[str]]:
@@ -823,8 +810,8 @@ def Where(condition, input, other, *, out=None, signature = None):
         edim_out = copy.copy(edim_in0)
 
     annos = [OpAnno.create_op_str([edim_in0, edim_in1, edim_in2], [edim_out])]
-    dimop = IRDimops(Where, 'where', signature, annos, [condition, input, other])
-    return dimop
+    return IRDimops(Where, 'where', signature, annos, [condition, input, other])
+
 
 def CubeLayerNorm(input, weight=None, bias=None, normalized_shape=None, eps=1e-05, signature = None):
     """
@@ -1784,15 +1771,11 @@ def _comparison(creator: Callable, f: Callable, name: str, signature: str,
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-        dimop = IRDimops(creator, name, signature, annos, [input, other])
-        dimop.output(0).parent.dtype = torch.bool
-        return dimop
+        return IRDimops(creator, name, signature, annos, [input, other])
     # case2: torch.equal(tensor1, obj2) / torch.equal(obj1, tensor2)
     if isinstance(input, IRTensor) or isinstance(other, IRTensor):
         annos = ['*, ? -> *', '?, * -> *',]
-        dimop = IRDimops(creator, name, signature, annos, [input, other])
-        dimop.output(0).parent.dtype = torch.bool
-        return dimop
+        return IRDimops(creator, name, signature, annos, [input, other])
     # case3: torch.equal(obj1, obj2)
     else:
         return IRPyFunc(signature, [input, other], [IRObject()])

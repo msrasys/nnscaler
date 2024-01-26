@@ -30,34 +30,18 @@ class IRFwOperation(IRCell):
         # setup input
         for idx, input in enumerate(inputs):
             self.set_input(idx, input)
-        
+
         # additional argument
         self.kwargs.update(kwargs)
 
         # default infer rule
         requires_grad = any(
             t.requires_grad for t in inputs if isinstance(t, IRTensor))
-        
+
         # setup output
         outputs = [IRFullTensor(requires_grad=requires_grad) for _ in range(num_outputs)]
         for idx, output in enumerate(outputs):
             self.set_output(idx, output)
-
-    def infer_dtype(self):
-        """
-        Infer output value dtype.
-        By default will follow the same dtype promotion rule with PyTorch.
-        """
-        itensors = [t for t in self.inputs() if isinstance(t, IRTensor)]
-        otensors = [t for t in self.outputs() if isinstance(t, IRTensor)]
-        odtype = DTypeInfo.promote([t.dtype for t in itensors])
-        for tensor in otensors:
-            # in case of setting manually due to special rules
-            if tensor.dtype is None:
-                if isinstance(tensor, IRFullTensor):
-                    tensor.dtype = odtype
-                else:
-                    tensor.parent.dtype = odtype
 
     def infer_shape(self):
         """
@@ -155,7 +139,7 @@ class IRBpOperation(IRCell):
     def __init__(self, ograds: Tuple[Any], igrads: Tuple[Any]):
         """
         Create dummy backward node for forward inputs and forward outputs
-        
+
         @param fwop IRFwOperation: forward operator
         """
         super().__init__(
@@ -196,7 +180,7 @@ class IRBpOperation(IRCell):
 
 class IRDataOperation(IRCell):
     """Dataloader operator
-    
+
     The output of a dataloader operator is a tuple of (IRObject,).
     """
 
@@ -233,7 +217,7 @@ class IRDataOperation(IRCell):
         Infer output value shape
         """
         return True
-    
+
     def __repr__(self):
         dscp = (f"DataLoader{self._id}-{self.device}(outputs={self.outputs()})")
         return dscp

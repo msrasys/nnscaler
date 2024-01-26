@@ -45,9 +45,6 @@ class IRGraphAnchor(IRFwOperation):
         super().__init__(name, signature, [], 1)
         self.kwargs['name'] = name
         self.set_output(0, IRObject('anchor', value=None))
-    
-    def infer_dtype(self):
-        return
 
     def infer_shape(self):
         return True

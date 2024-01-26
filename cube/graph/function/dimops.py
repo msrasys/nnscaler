@@ -664,7 +664,7 @@ class IRDimops(IRFwOperation):
 
     def infer_shape(self) -> bool:
         """
-        Shape and dtype inference using the matched annotation and tensor.
+        Shape inference using the matched annotation and tensor.
 
         @return sucess: True if successfully inferred shape
         """
