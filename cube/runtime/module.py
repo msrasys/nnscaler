@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple, TYPE_CHECKING
+from typing import List, Dict, Tuple, Optional, TYPE_CHECKING
 import logging
 import os
 import sys
@@ -475,6 +475,12 @@ class ParallelModule(CubeModule):
         super().__init__()
         # this is used to allow multiple sync_grad() calls
         self._sync_grad_required = False
+        # save the param replicas info for calculating gradient norm
+        # it is a dict mapping from number_of_replicas to a list of local params.
+        # For example, _nreplicas2localparams[2] contains all the parameters that have replicated 2 times.
+        # this is a lazy initialization,
+        # which will be initialized in the first call of `clip_gnorm`
+        self._nreplicas2localparams: Optional[Dict[int, List[torch.nn.Parameter]]] = None
 
     def _post_init(self, init_params=True):
         """
@@ -527,3 +533,22 @@ class ParallelModule(CubeModule):
 
     def get_rank(self):
         return self.rank  # rank is a class varible defined in gencode
+
+    def clip_gnorm(self, max_norm: Optional[float] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Calculate the gradient norm and clip gradients.
+
+        Args:
+            max_norm (Optional[float]): max norm value. If None or <= 0, no clipping will be performed.
+
+        Returns:
+            Tuple of The gradient norm and the list of gradients.
+        """
+        from cube.runtime.gnorm import prepare_for_grad_clip, clip_gnorm
+        if self._nreplicas2localparams is None:
+            self._nreplicas2localparams = prepare_for_grad_clip(self, self.get_compute_config().use_zero)
+
+        # make sure the gradients are synchronized
+        self.sync_grad()
+
+        return clip_gnorm(self._nreplicas2localparams, max_norm)

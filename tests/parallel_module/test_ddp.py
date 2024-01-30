@@ -16,6 +16,7 @@ import numpy as np
 
 from cube.parallel import ComputeConfig, parallelize, build_optimizer
 from cube.runtime.module import ParallelModule
+from cube.runtime.gnorm import calcuate_gnorm
 
 from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
@@ -102,6 +103,7 @@ class StepResult:
     pred: torch.Tensor
     loss: torch.Tensor
     grads: Dict[str, torch.Tensor]
+    gnorm: torch.Tensor
     weights: Dict[str, torch.Tensor]
 
 
@@ -133,7 +135,8 @@ def _train_ddp(model, update_freq, num_replicas, rank):
             # remove leadding `module.` prefix
             prefix_len = len('module.')
             grads = {n[prefix_len:]: p.grad for n, p in model.named_parameters()}
-            results.append(clone_to_cpu_recursively([y_pred, loss, grads]))
+            gnorm = calcuate_gnorm(list(model.parameters()))[0]
+            results.append(clone_to_cpu_recursively([y_pred, loss, grads, gnorm]))
             optimizer.zero_grad()
             weights = {n[prefix_len:]: p.data for n, p in model.named_parameters()}
             results[-1].append(clone_to_cpu_recursively(weights))
@@ -167,7 +170,11 @@ def _train(model, is_cube, update_freq, num_replicas, rank):
         if i % UPDATE_FREQ == UPDATE_FREQ - 1:
             optimizer.step()
             grads = {n: p.grad for n, p in model.named_parameters()}
-            results.append(clone_to_cpu_recursively([y_pred, loss, grads]))
+            if is_cube:
+                gnorm = optimizer.clip_gnorm()
+            else:
+                gnorm = calcuate_gnorm(list(model.parameters()))[0]
+            results.append(clone_to_cpu_recursively([y_pred, loss, grads, gnorm]))
             optimizer.zero_grad()
             weights = {n: p.data for n, p in model.named_parameters()}
             results[-1].append(clone_to_cpu_recursively(weights))
@@ -263,7 +270,7 @@ def test_tp_ddp(update_freq):
         for k in ddp_result0[i].weights.keys():  # weights
             assert torch.equal(ddp_result0[i].weights[k], ddp_result1[i].weights[k])
 
-    ga_simulated_result0 = orig_results2[0][0]
+    ga_simulated_result0: List[StepResult] = orig_results2[0][0]
     assert len(ddp_result0) == len(ga_simulated_result0)
     assert len(ddp_result1) == len(ga_simulated_result0)
     for i in range(len(ddp_result0)):
@@ -278,7 +285,10 @@ def test_tp_ddp(update_freq):
 
     cube_results = launch_torchrun(4, _gpu_worker_cube, PASRandomSPMD, 2, 4, update_freq)
     worker_results0, worker_results1,  worker_results2, worker_results3 = cube_results[0], cube_results[1], cube_results[2], cube_results[3]
-    results0, results1, results2, results3 = worker_results0[0], worker_results1[0], worker_results2[0], worker_results3[0]
+    results0: List[StepResult] = worker_results0[0]
+    results1: List[StepResult] = worker_results1[0]
+    results2: List[StepResult] = worker_results2[0]
+    results3: List[StepResult] = worker_results3[0]
 
     fc1_fullmap = worker_results0[1], worker_results1[1]
     assert fc1_fullmap == (worker_results2[1], worker_results3[1])
@@ -298,6 +308,7 @@ def test_tp_ddp(update_freq):
             a, b = r0[i], r1[i]
             assert torch.equal(a.pred, b.pred)  # pred
             assert torch.equal(a.loss, b.loss)  # loss
+            assert torch.equal(a.gnorm, b.gnorm)  # gnorm
 
     # grad, weights
     for r0, r1 in [(results0, results2), (results1, results3)]:
@@ -305,6 +316,7 @@ def test_tp_ddp(update_freq):
         assert len(r0) == len(r1)
         for i in range(len(r0)):
             a, b = r0[i], r1[i]
+            assert torch.equal(a.gnorm, b.gnorm)  # gnorm
             for k in a.grads.keys(): # grad
                 assert torch.equal(a.grads[k], b.grads[k])
             for k in a.weights.keys():  # weights
@@ -312,13 +324,9 @@ def test_tp_ddp(update_freq):
 
     assert len(ga_simulated_result0) == len(results0)
     for i in range(len(ddp_result0)):
-        print('iteration: ', i)
         orig0, compiled0, compiled1 = ga_simulated_result0[i], results0[i], results1[i]
-
-        print('grads')
+        assert torch.allclose(orig0.gnorm, compiled0.gnorm, atol=1e-6, rtol=1e-6)  # gnorm
         # grad
         _compare_weights(orig0.grads, compiled0.grads, compiled1.grads, fc1_fullmap, fc2_fullmap, fc1_dist_param_map, fc2_dist_param_map)
-
-        print('weights')
         # weights
         _compare_weights(orig0.weights, compiled0.weights, compiled1.weights, fc1_fullmap, fc2_fullmap, fc1_dist_param_map, fc2_dist_param_map)

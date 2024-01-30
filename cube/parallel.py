@@ -1,7 +1,7 @@
 from enum import Enum
 from functools import partial
 import types
-from typing import Callable, Any, Dict, Optional, Tuple, Type, Union, TypeVar
+from typing import Callable, Any, Dict, Optional, Tuple, Type, Union, TypeVar, List
 from pathlib import Path
 import inspect
 import sys
@@ -34,6 +34,7 @@ from cube.program import Program
 from cube.runtime.adapter.reducer import Reducer
 from cube.runtime.module import CubeModule, ParallelModule
 from cube.runtime.device import DeviceGroup
+from cube.runtime.gnorm import calcuate_gnorm, clip_grads
 
 
 logger = logging.getLogger(__name__)
@@ -714,6 +715,18 @@ class ParallelOptimizer(torch.optim.Optimizer):
         """
         ...
 
+    def clip_gnorm(self, max_norm: Optional[float] = None) -> torch.Tensor:
+        """
+        Clip the gradients with global norm, and return the global gnorm value.
+
+        Args:
+            max_norm (Optional[float]): the max global norm. If it is None, no clipping will be applied.
+
+        Returns:
+            torch.Tensor: the gradient norm.
+        """
+        ...
+
     def register_reducer_pre_hook(self, fn: Callable[[Reducer, torch.Tensor], None]):
         """
         Register pre hooks to reducers which will be applied before gradient synchronization.
@@ -856,6 +869,31 @@ def build_optimizer(
                     non_parallel_module_reducer.sync_grads()
 
     optimizer.sync_shard_grad = types.MethodType(_sync_shard_grad, optimizer)
+
+    @torch.no_grad()
+    def _clip_gnorm(self, max_norm: Optional[float] = None):
+        self.sync_shard_grad()
+        total_norm_squared = 0.0
+        grads: List[torch.Tensor] = []
+
+        for m in parallel_modules:
+            mnorm, mgrads = m.clip_gnorm(None)
+            total_norm_squared += torch.square(mnorm)
+            grads.extend(mgrads)
+
+        if non_parallel_module_reducer:
+            params = non_parallel_module_reducer.parameters_for_optimizer()
+            mnorm, mgrads = calcuate_gnorm(params)
+            total_norm_squared += torch.square(mnorm)
+            grads.extend(mgrads)
+
+        total_norm = torch.sqrt(total_norm_squared)
+        if max_norm is not None and max_norm > 0:
+            clip_grads(grads, total_norm, max_norm)
+
+        return total_norm
+
+    optimizer.clip_gnorm = types.MethodType(_clip_gnorm, optimizer)
 
     def _register_reducer_pre_hook(self, fn: Callable[[Reducer, torch.Tensor], None]):
         for m in parallel_modules:
