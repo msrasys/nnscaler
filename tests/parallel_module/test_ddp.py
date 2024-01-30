@@ -200,10 +200,13 @@ def _gpu_worker_ddp(update_freq):
         orig_results,
     )
 
-def _gpu_worker_cube(pas, plan_ngpus, runtime_ngpus, update_freq):
+def _gpu_worker_cube(pas, plan_ngpus, runtime_ngpus, update_freq, use_zero):
     init_distributed()
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test') as tempdir:
-        compiled_module = _create_cube_module(pas, ComputeConfig(plan_ngpus, runtime_ngpus), tempdir)
+        compiled_module = _create_cube_module(pas,
+            ComputeConfig(plan_ngpus, runtime_ngpus, use_zero=use_zero),
+            tempdir
+        )
         compiled_results = _train(
             compiled_module, True, update_freq,
             runtime_ngpus // plan_ngpus,
@@ -283,12 +286,18 @@ def test_tp_ddp(update_freq):
             # print('weight: ', k, torch.max(torch.abs(a0[3][k]- b[3][k])))
             assert torch.allclose(a0.weights[k], b.weights[k], atol=1e-2, rtol=1e-2)  # weights
 
-    cube_results = launch_torchrun(4, _gpu_worker_cube, PASRandomSPMD, 2, 4, update_freq)
+    cube_results = launch_torchrun(4, _gpu_worker_cube, PASRandomSPMD, 2, 4, update_freq, False)
+    zcube_results = launch_torchrun(4, _gpu_worker_cube, PASRandomSPMD, 2, 4, update_freq, True)
     worker_results0, worker_results1,  worker_results2, worker_results3 = cube_results[0], cube_results[1], cube_results[2], cube_results[3]
     results0: List[StepResult] = worker_results0[0]
     results1: List[StepResult] = worker_results1[0]
     results2: List[StepResult] = worker_results2[0]
     results3: List[StepResult] = worker_results3[0]
+    zworker_results0, zworker_results1,  zworker_results2, zworker_results3 = zcube_results[0], zcube_results[1], zcube_results[2], zcube_results[3]
+    zresults0: List[StepResult] = zworker_results0[0]
+    zresults1: List[StepResult] = zworker_results1[0]
+    zresults2: List[StepResult] = zworker_results2[0]
+    zresults3: List[StepResult] = zworker_results3[0]
 
     fc1_fullmap = worker_results0[1], worker_results1[1]
     assert fc1_fullmap == (worker_results2[1], worker_results3[1])
@@ -300,8 +309,21 @@ def test_tp_ddp(update_freq):
     fc2_dist_param_map = worker_results0[4],worker_results1[4]
     assert fc2_dist_param_map == (worker_results2[4], worker_results3[4])
 
+    fc1_fullmap = zworker_results0[1], zworker_results1[1]
+    assert fc1_fullmap == (zworker_results2[1], zworker_results3[1])
+    fc1_dist_param_map = (zworker_results0[2], zworker_results1[2])
+    assert fc1_dist_param_map == (zworker_results2[2], zworker_results3[2])
+
+    fc2_fullmap = zworker_results0[3], zworker_results1[3]
+    assert fc2_fullmap == (zworker_results2[3], zworker_results3[3])
+    fc2_dist_param_map = zworker_results0[4], zworker_results1[4]
+    assert fc2_dist_param_map == (zworker_results2[4], zworker_results3[4])
+
     # pred, loss
-    for r0, r1 in [(results0, results1), (results2, results3)]:
+    for r0, r1 in [(results0, results1), (results2, results3),
+                   (zresults0, zresults1), (zresults2, zresults3),
+                   (results0, zresults0), (results2, zresults2)
+        ]:
         # have the same input
         assert len(r0) == len(r1)  # iteration count
         for i in range(len(r0)):
@@ -311,7 +333,10 @@ def test_tp_ddp(update_freq):
             assert torch.equal(a.gnorm, b.gnorm)  # gnorm
 
     # grad, weights
-    for r0, r1 in [(results0, results2), (results1, results3)]:
+    for r0, r1 in [(results0, results2), (results1, results3),
+                   (zresults0, zresults2), (zresults1, zresults3),
+                   (results0, zresults0), (results1, zresults1)
+        ]:
         # in the same shard, grads and weights are the same
         assert len(r0) == len(r1)
         for i in range(len(r0)):

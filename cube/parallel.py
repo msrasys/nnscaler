@@ -830,7 +830,11 @@ def build_optimizer(
         non_parallel_module_reducer.build_buckets()
 
     def _local_parameters(module: torch.nn.Module):
-        gen = module._named_members(lambda m: m._parameters.items())
+        gen = module._named_members(
+            lambda m: [(str(id(p)), p) for p in m.parameters_for_optimizer()]  # (str(id(p)), p) to meet _named_members requirement
+                if isinstance(m, ParallelModule)
+                else m._parameters.items()
+        )
         for _, param in gen:
             yield param
 
