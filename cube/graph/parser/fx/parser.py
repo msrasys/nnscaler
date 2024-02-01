@@ -1,16 +1,16 @@
-import os
 import torch
 import logging
 from pathlib import Path
 from typing import Any, List, Tuple, Callable, Union, Dict, Type, Optional
 
 from cube.ir.operator import IRFwOperation
-from cube.ir.tensor import IRFullTensor
+from cube.ir.tensor import IRFullTensor, IRTensor
 from cube.ir.cten import IRObject, IRCell
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.fx.mapping import SignFx2Op
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import IRDimops
+from cube.graph.function.function import ir_object_recursive
 
 import torch.fx
 from .concrete_trace_utils import TensorMetadata
@@ -60,8 +60,10 @@ class FxModuleParser:
 
         # create IRObjects and IRTensors
         for node in module.graph.nodes:
-            concrete_value = dummy_inputs.get(node.name) if node.op == 'placeholder' else None
-            FxModuleParser.init_objects(node, module, frame, concrete_value)
+            if node.op == 'placeholder':
+                FxModuleParser.init_objects(node, module, frame, dummy_inputs.get(node.name), is_constant=False)
+            else:
+                FxModuleParser.init_objects(node, module, frame, None, is_constant=True)            
 
         # get graph inputs
         placeholders = [n for n in module.graph.nodes if n.op == 'placeholder']
@@ -111,7 +113,7 @@ class FxModuleParser:
 
     @staticmethod
     def init_objects(node: torch.fx.Node, module: torch.fx.GraphModule,
-                     frame: Frame, concrete_value: Optional[Any] = None):
+                     frame: Frame, concrete_value: Optional[Any] = None, is_constant: bool = True):
         assert isinstance(node, torch.fx.Node)
 
         def meta2var(meta: Any) -> Any:
@@ -133,7 +135,7 @@ class FxModuleParser:
                     raise TypeError(f"only support dict type with str key, but got {meta.keys()}.\n{node}")
                 return {key : meta2var(value) for key, value in meta.items()}
             # TODO: data type check, with cases like {'a': 1.2, 'b': torch.Tensor}
-            return IRObject(name=node.name, value=meta)
+            return IRObject(name=node.name, value=meta, is_constant=is_constant)
 
         if hasattr(node, 'meta') and node.meta.get('tensor_meta'):
             meta = node.meta['tensor_meta']
@@ -141,7 +143,7 @@ class FxModuleParser:
         else:
             # FIXME: double check: there should be a concrete value as example,
             # otherwise, it may fail in parsing node like getattr
-            val = IRObject(name=node.name, value=concrete_value)
+            val = IRObject(name=node.name, value=concrete_value, is_constant=is_constant)
 
         frame.add_var(node.name, val)
 
@@ -209,6 +211,10 @@ class FxModuleParser:
             # case2: python runtime function
             else:
                 _logger.warning(f'Set python runtime function: {fsig}')
+                if ir_object_recursive(input_vals, lambda a: not a.is_constant):
+                    err_msg = f'non register python runtime function {fsig} has a non constant input: {input_vals}, ' + \
+                            'please register it as a customized function using cube.graph.parser.register'
+                    raise RuntimeError(err_msg)
                 ir_node = IRPyFunc(fsig, input_vals, [IRObject()], **kwargs)
 
         if isinstance(ir_node, IRCell):
@@ -226,8 +232,10 @@ class FxModuleParser:
                 assert len(vals) == len(ir_node.outputs()), f'{vals}, {ir_node.outputs()}'
                 for i in range(len(vals)):
                     ir_node.set_output(i, vals[i])
-            elif ir_node.output(0).value is not None:
-                if dynamic_shape:
+            elif not isinstance(ir_node.output(0), IRTensor) and ir_node.output(0).value is not None:
+                if dynamic_shape or \
+                    ir_object_recursive(ir_node.output(0), lambda a: not a.is_constant) or \
+                    ir_object_recursive(ir_node.output(0), lambda a: isinstance(a, IRTensor)):
                     frame.set_var(node.name, ir_node.output(0))
                     ir_node.output(0).name = node.name
                 else:

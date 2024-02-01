@@ -219,7 +219,7 @@ class IRCell:
 
     def set_output(self, index: int, val: NestedVarOrStatic):
         """
-        Set the node inputs[output_index] with the tensor
+        Set the node outputs[output_index] with the tensor
 
         Args:
             val (NestedVarOrStatic): (nested) IRObject or any deterministic value (int, bool, str, etc)
@@ -273,16 +273,19 @@ class IRObject:
     IRObject serves as general data of IRGraph edge
     """
 
-    def __init__(self, name: Optional[str] = None, tid: Optional[int] = None, value: Optional[None] = None):
+    def __init__(self, name: Optional[str] = None, tid: Optional[int] = None, value: Optional[None] = None, is_constant: bool = True):
         """
         @param name str: object name
         @param tid int: object unique id
+        @param val any: the value of this object
+        @param is_constant bool: if the value is a constant during the whole training / inference
         """
         self._id: int = tid if isinstance(tid, int) else IDGenerator().gen_tensor_id()
         self.name: str = name if name else 'obj'
         self._cell: Optional[IRCell] = None
         self._is_attr: bool = False
         self._value: Optional[Any] = value
+        self._is_constant: bool = is_constant
 
     def __eq__(self, obj):
         if not isinstance(obj, IRObject):
@@ -340,6 +343,10 @@ class IRObject:
         """Get example value"""
         return self._value
 
+    @property
+    def is_constant(self) -> bool:
+        return self._is_constant
+
     def __eq__(self, obj) -> bool:
         if not isinstance(obj, IRObject):
             return False
@@ -347,7 +354,7 @@ class IRObject:
 
     def __copy__(self):
         """Copy this object but remove the cell information"""
-        return IRObject(self.name, self._id, self._value)
+        return IRObject(self.name, self._id, self._value, self._is_constant)
 
     def as_attr(self):
         """
@@ -374,7 +381,7 @@ class IRObject:
             return False
 
     def __repr__(self):
-        return f'Object({self.name}{self.tid}, val={self.value})'
+        return f'Object({self.name}{self.tid}, val={self.value}, is_constant={self.is_constant})'
 
 
 class IRTensor(IRObject):

@@ -45,6 +45,27 @@ def is_list_or_tuple(v: Any) -> bool:
     )
 
 
+def ir_object_recursive(obj: IRObject, fn: Callable):
+    """recursive on obj.value / dict / list / tuple"""
+    if isinstance(obj, dict):
+        return any(ir_object_recursive(v, fn) for v in obj.values())
+    elif isinstance(obj, (list, tuple)):
+        return any(ir_object_recursive(v, fn) for v in obj)
+    elif isinstance(obj, IRObject):
+        if fn(obj):
+            return True
+        elif obj.value is not None:
+            return ir_object_recursive(obj.value, fn)
+        else:
+            return False
+    else:
+        return False
+
+
+def ir_object_contains_dynamic(obj: IRObject):
+    return ir_object_recursive(obj, lambda a: not a.is_constant)
+
+
 def Identity(tensor: IRObject, signature = None):
     signature = 'cube.runtime.function.identity'
     eshape = ShapeAnno.create_shape_str(tensor.shape)
@@ -459,14 +480,31 @@ def BitwiseNot(input, *, out=None, signature=None):
     return IRDimops(BitwiseNot, 'bitwise_not', signature, annos, [input])
 
 
+def _unwrap_value(obj: IRObject):
+    if isinstance(obj, IRObject):
+        return _unwrap_value(obj.value)
+    else:
+        return obj
+
+
+def _compute_unary_op(input, fn, name):
+    out_val = fn(_unwrap_value(input))
+    contains_dynamic_val = ir_object_contains_dynamic(input)
+    return IRObject(name=name, value=out_val, is_constant=not contains_dynamic_val)
+
+
+def _compute_binary_op(input, other, fn, name):
+    out_val = fn(_unwrap_value(input), _unwrap_value(other))
+    contains_dynamic_val = ir_object_contains_dynamic(input) or ir_object_contains_dynamic(other)
+    return IRObject(name=name, value=out_val, is_constant=not contains_dynamic_val)
+
+
 def Add(input, other, alpha=1, *, out=None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input + alpha * other
     if (not isinstance(input, IRTensor)) and (not isinstance(other, IRTensor)):
-        iv = input.value if isinstance(input, IRObject) else input
-        ov = other.value if isinstance(other, IRObject) else other
-        return IRPyFunc(signature, [input, other], [IRObject(name='add', value=iv+ov)])
+        return IRPyFunc(signature, [input, other], [_compute_binary_op(input, other, operator.add, 'add')])
     signature = 'torch.add'
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
@@ -481,9 +519,7 @@ def Sub(input, other, alpha=1, *, out=None, signature = None):
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input - alpha * other
     if (not isinstance(input, IRTensor)) and (not isinstance(other, IRTensor)):
-        iv = input.value if isinstance(input, IRObject) else input
-        ov = other.value if isinstance(other, IRObject) else other
-        return IRPyFunc(signature, [input, other], [IRObject(name='sub', value=iv-ov)])
+        return IRPyFunc(signature, [input, other], [_compute_binary_op(input, other, operator.sub, 'sub')])
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
@@ -496,9 +532,7 @@ def Mul(input, other, *, out=None, signature = None):
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input * other
     if (not isinstance(input, IRTensor)) and (not isinstance(other, IRTensor)):
-        iv = input.value if isinstance(input, IRObject) else input
-        ov = other.value if isinstance(other, IRObject) else other
-        return IRPyFunc(signature, [input, other], [IRObject(name='mul', value=iv*ov)])
+        return IRPyFunc(signature, [input, other], [_compute_binary_op(input, other, operator.mul, 'mul')])
     signature = 'torch.mul'
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
@@ -511,6 +545,8 @@ def Mod(input, other, *, out = None, signature = None):
     assert out is None
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input % other
+    if (not isinstance(input, IRTensor)) and (not isinstance(other, IRTensor)):
+        return IRPyFunc(signature, [input, other], [_compute_binary_op(input, other, operator.mod, 'mod')])
     signature = 'torch.fmod'
     annos = ['*, ? -> *']
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
@@ -524,9 +560,7 @@ def Div(input, other, *, rounding_mode=None, out=None, signature = None):
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input / other
     if (not isinstance(input, IRTensor)) and (not isinstance(other, IRTensor)):
-        iv = input.value if isinstance(input, IRObject) else input
-        ov = other.value if isinstance(other, IRObject) else other
-        return IRPyFunc(signature, [input, other], [IRObject(name='div', value=iv/ov)])
+        return IRPyFunc(signature, [input, other], [_compute_binary_op(input, other, operator.truediv, 'div')])
     signature = 'torch.div'
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
@@ -541,10 +575,10 @@ def Exp(input, *, out=None, signature=None):
     """
     assert out is None
     if not isinstance(input, IRObject):
-        return torch.exp(input)
+        return torch.exp(input) if isinstance(input, torch.Tensor) else math.exp(input)
     if not isinstance(input, IRTensor):
         assert input.value is not None
-        return IRPyFunc(signature, [input], [IRObject(name='exp', value=torch.exp(input.value))])
+        return IRPyFunc(signature, [input], [_compute_unary_op(input, math.exp, 'exp')])
     shape = ShapeAnno.create_shape_str(input.shape)
     annos = [OpAnno.create_op_str([shape], [shape])]
     return IRDimops(Exp, 'exp', signature, annos, [input])
@@ -556,10 +590,9 @@ def Sqrt(input, *, out=None, signature=None):
     """
     assert out is None
     if not isinstance(input, IRObject):
-        return torch.sqrt(input)
+        return torch.sqrt(input) if isinstance(input, torch.Tensor) else math.sqrt(input)
     if not isinstance(input, IRTensor):
-        iv = input.value if isinstance(input, IRObject) else input
-        return IRPyFunc(signature, [input], [IRObject(name='sqrt', value=torch.sqrt(iv))])
+        return IRPyFunc(signature, [input], [_compute_unary_op(input, math.sqrt, 'sqrt')])
     shape = ShapeAnno.create_shape_str(input.shape)
     annos = [OpAnno.create_op_str([shape], [shape])]
     return IRDimops(Sqrt, 'sqrt', signature, annos, [input])
@@ -570,8 +603,8 @@ def RSqrt(input, *, out=None, signature=None):
     if not isinstance(input, IRObject):
         return torch.rsqrt(input)
     if not isinstance(input, IRTensor):
-        iv = input.value if isinstance(input, IRObject) else input
-        return IRPyFunc(signature, [input], [IRObject(name='rsqrt', value=torch.rsqrt(iv))])
+        # NOTE: can not find a common library implementation of rsqrt for non-tensor
+        return IRPyFunc(signature, [input], [_compute_unary_op(input, lambda a: 1 / math.sqrt(a), 'rsqrt')])
     shape = ShapeAnno.create_shape_str(input.shape)
     annos = [OpAnno.create_op_str([shape], [shape])]
     return IRDimops(RSqrt, 'rsqrt', signature, annos, [input])
@@ -582,9 +615,7 @@ def FloorDiv(input, other, *, out=None, signature = None):
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input // other
     if (not isinstance(input, IRTensor)) and (not isinstance(other, IRTensor)):
-        iv = input.value if isinstance(input, IRObject) else input
-        ov = other.value if isinstance(other, IRObject) else other
-        return IRPyFunc(signature, [input, other], [IRObject(name='fdiv', value=iv//ov)])
+        return IRPyFunc(signature, [input, other], [_compute_binary_op(input, other, operator.floordiv, 'fdiv')])
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, other)
@@ -597,9 +628,7 @@ def Pow(input, exponent, *, out=None, signature = None):
     if (not isinstance(input, IRObject)) and (not isinstance(exponent, IRObject)):
         return input ** exponent
     if (not isinstance(input, IRTensor)) and (not isinstance(exponent, IRTensor)):
-        iv = input.value if isinstance(input, IRObject) else input
-        ev = exponent.value if isinstance(exponent, IRObject) else exponent
-        return IRPyFunc(signature, [input, exponent], [IRObject(name='pow', value=iv**ev)])
+        return IRPyFunc(signature, [input, exponent], [_compute_binary_op(input, exponent, operator.pow, 'pow')])
     annos = ['*, ? -> *', '?, * -> *',]
     if isinstance(input, IRTensor) and isinstance(exponent, IRTensor):
         lshape, rshape, oshape = _handle_broadcast(input, exponent)
@@ -611,8 +640,7 @@ def Neg(input, *, out=None, signature = None):
     assert out is None
     if not isinstance(input, IRObject): return -1 * input
     if not isinstance(input, IRTensor):
-        iv = input.value if isinstance(input, IRObject) else input
-        return IRPyFunc(signature, [input], [IRObject(name='neg', value=-iv)])
+        return IRPyFunc(signature, [input], [_compute_unary_op(input, operator.neg, 'neg')])
     annos = ['* -> *']
     return IRDimops(Neg, 'neg', signature, annos, [input])
 
@@ -1778,7 +1806,7 @@ def _comparison(creator: Callable, f: Callable, name: str, signature: str,
         return IRDimops(creator, name, signature, annos, [input, other])
     # case3: torch.equal(obj1, obj2)
     else:
-        return IRPyFunc(signature, [input, other], [IRObject()])
+        return IRPyFunc(signature, [input, other], [_compute_binary_op(input, other, f, name)])
 
 
 def CompareGT(input, other, *, out=None, signature = None):
@@ -1953,7 +1981,9 @@ def GetItem(a: Any, b: Any, signature = None) -> Union[Any, IRPyFunc]:
         if isinstance(obj.value[index], IRTensor):
             out = obj.value[index]
         else:
-            out = IRObject(name='getitem', value=obj.value[index])
+            val = obj.value[index]
+            is_constant = not (isinstance(val, IRObject) and not val.is_constant)
+            out = IRObject(name='getitem', value=val, is_constant=is_constant)
         return IRPyFunc(signature, [obj, index], [out])
     return obj[index]
 
