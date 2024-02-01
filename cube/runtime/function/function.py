@@ -201,6 +201,12 @@ def arange(start: int, end: int, step: int, dtype: torch.dtype, requires_grad=Fa
                         device=torch.cuda.current_device())
 
 
+def linspace(start: Union[int, torch.Tensor], end: Union[int, torch.Tensor],
+             steps: int, dtype: torch.dtype, requires_grad=False):
+    return torch.linspace(start, end, steps, dtype=dtype, requires_grad=requires_grad,
+                          device=torch.cuda.current_device())
+
+
 def index_select(input: torch.Tensor, index: torch.Tensor, dim: int) -> torch.Tensor:
     return torch.index_select(input, dim, index)
 

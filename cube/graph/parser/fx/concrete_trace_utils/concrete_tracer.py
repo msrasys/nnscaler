@@ -420,7 +420,7 @@ class ConcreteTracer(TracerBase):
                     result = result.cpu()
                 elif isinstance(result, (list, dict, tuple)):
                     result = tree_map(to_cpu, result)
-                elif isinstance(result, (int, bool, torch.device, torch.dtype)) or result is None:
+                elif isinstance(result, (int, bool, float, torch.device, torch.dtype, torch.finfo)) or result is None:
                     # avoid too noisy warning
                     pass
                 else:

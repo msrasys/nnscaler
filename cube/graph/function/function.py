@@ -221,6 +221,29 @@ def Arange(*args, out=None, dtype=None, layout=None,
     return CubeArange(start, end, step, dtype, requires_grad=requires_grad)
 
 
+def CubeLinspace(start: Union[int, IRObject], end: Union[int, IRObject], steps: Union[int, IRObject],
+                 dtype=None, requires_grad=False, signature=None):
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
+    signature = 'cube.runtime.function.linspace'
+    kwargs = {'start': start, 'end': end, 'steps': steps,
+              'dtype': dtype, 'requires_grad': requires_grad}
+    steps_val = steps.value if isinstance(steps, IRObject) else steps
+    anno, rules = _get_creator_anno_rules((steps_val,), False)
+    dimop = IRDimops(CubeLinspace, 'linspace', signature, [anno], [], rules, **kwargs)
+    dimop.output(0).parent.dtype = dtype
+    return dimop
+
+
+def Linspace(start, end, steps, *, out=None, dtype=None,
+             layout=None, device=None, requires_grad=False, signature=None):
+    """
+    torch.linspace(start, end, steps, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False) → Tensor
+    """
+    assert layout is None
+    return CubeLinspace(start, end, steps, dtype, requires_grad=requires_grad)
+
+
 def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
           pin_memory=False, memory_format=None, signature=None):
     # note: device is ignored
@@ -1934,6 +1957,11 @@ def To(tensor: IRTensor, dtype_or_device=None, *, device=None, dtype=None, out=N
     # FIXME: support full version of torch.Tensor.to
     dtype_or_device = dtype if dtype is not None else dtype_or_device
     dtype_or_device = device if dtype_or_device is None else dtype_or_device
+    if isinstance(dtype_or_device, torch.device) or isinstance(device, torch.device):
+        warn_msg = 'Cube will handle the tensor device placement, the call of torch.Tensor.to(device=...) will be ignore, ' \
+                   'if you really want to put the tensor on cpu to excute some op, please wrap all related ops in an independent function ' \
+                   'and using cube.graph.parser.register to register this function.'
+        _logger.warning(warn_msg)
     # create "to" in cube runtime functions because dtype if not kwarg in torch.Tensor.to
     signature = 'cube.runtime.function.to'
     annos = ['* -> *']

@@ -100,6 +100,7 @@ class SignFx2Op:
         __tttemplate('expand'): function.Expand,
         __tttemplate('expand_as'): function.ExpandAs,
         __ttemplate('arange'): function.Arange,
+        __ttemplate('linspace'): function.Linspace,
         __ttemplate('detach'): function.Detach,
         __ttemplate('_shape_as_tensor'): function.ShapeAsTensor,
         __ttemplate('index_select'): function.IndexSelect,
