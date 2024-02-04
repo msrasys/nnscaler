@@ -1,8 +1,9 @@
-from typing import List, Dict, Tuple, Optional, TYPE_CHECKING
+from typing import List, Set, Dict, Tuple, Optional, TYPE_CHECKING
 import logging
 import os
 import sys
 from pathlib import Path
+from dataclasses import dataclass, asdict
 
 import torch
 import torch.distributed as dist
@@ -465,8 +466,40 @@ class CubeModule(torch.nn.Module):
                     }, filename_prefix + '.full.ckpt')
 
 
+@dataclass
+class OriginModuleMetadata:
+    origin_state_dict_names: List[str]
+    origin_param_names: List[str]
+    origin_shared_param_names: List[Set[str]]
+
+
+@dataclass
+class ZeroMetadata:
+    # a mapping from the index of the parameter in the model
+    # to (optimizer_index, the start and end in the bucket, the shape of the parameter)
+    model_idx2opt_idx: Optional[Dict] = None
+    # a mapping from optimizer_index to the related bucket information (sub_ranks, bucket_size)
+    opt_idx2ranks: Optional[Dict] = None
+
+
+@dataclass
+class ParallelModuleConfig:
+    rank: int
+    compute_config: 'ComputeConfig'
+    dist_param_map: Dict
+    param_area_map: Dict
+    cube_param_names: List[str]
+
+
+@dataclass
+class ExtraState(ZeroMetadata, OriginModuleMetadata, ParallelModuleConfig):
+    pass
+
+
 class ParallelModule(CubeModule):
     COMPUTE_CONFIG_FILE = 'compute_config.pt'
+    ORIGIN_MODULE_METADATA_FILE = 'origin_module_metadata.pt'
+    EXTRA_STATE_KEY = 'CUBE_EXTRA_STATE'
 
     def __init__(self):
         if self.__class__  == ParallelModule:  # not init via super().__init__()
@@ -500,10 +533,20 @@ class ParallelModule(CubeModule):
         if init_params:
             self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
         self._dist_param_map = torch.load(module_file.with_name(f"{FxModuleParser.ATTR_MAP_FILE}"))
-        self._compute_config = torch.load(module_file.with_name(f"{self.COMPUTE_CONFIG_FILE}"))
+        self._compute_config: 'ComputeConfig' = torch.load(module_file.with_name(f"{self.COMPUTE_CONFIG_FILE}"))
+        self._orign_module_metadata: OriginModuleMetadata = torch.load(module_file.with_name(f"{self.ORIGIN_MODULE_METADATA_FILE}"))
 
         for reducer in self.reducers:
             reducer.build_buckets()
+
+        self._zero_metadata = self._get_zero_metadata()
+
+        # add state_dict hook to save extra state
+        # Please note extra_state is only used for merging, not for loading
+        # so we can safely remove it in load_state_dict pre hook
+        self._register_state_dict_hook(ParallelModule._post_state_dict_hook)
+        # add load_state_dict pre hook to pop extra state to prevent warning
+        self._register_load_state_dict_pre_hook(ParallelModule._pre_load_state_dict_hook, with_module=True)
 
     def forward(self, *args, **kwargs):
         if self.training:
@@ -552,3 +595,117 @@ class ParallelModule(CubeModule):
         self.sync_grad()
 
         return clip_gnorm(self._nreplicas2localparams, max_norm)
+
+    def _get_zero_metadata(self) -> ZeroMetadata:
+        """
+        Get zero related metadata for checkpointing.
+
+        In this function, we have a mocked optimizer index representing the combined flattened index of (reducer_index, bucket_index)
+
+        Note:
+        Parameters can be in one bucket or not in any bucket.
+        When we need to reduce(sume) the gradient of a parameter across ranks,
+        the parameters will be added in one reducer based on the rank group.
+        There are two types of reducing: cross scale unit or intra scale unit.
+
+        So when num of scale unit > 1, the parameters have to be reduced across scale units,
+        so they will be in a reducer.
+
+        When the num of scale unit == 1, the parameters can still need to be reduced inside the scale unit,
+        when the parameters is replicated because the ops using that parameters are partitioned.
+        (when the paremeter is used by multiple ops,
+        but some of ops are partitioned and some of ops are replicated,
+        In that case, the parameter will not be in a reudcer.
+        We will use mutliref, and insert identity-allreduce in generated code to reduce the parameter instead of using a reducer.
+        )
+
+        Returns:
+            ZeroMetadata: the zero related metadata
+        """
+        if not self.get_compute_config().use_zero:
+            return ZeroMetadata()
+
+        model_params = self.parameters_for_optimizer()
+        opt_idx = 0  # the combined flattened index of (reducer_index, bucket_index)
+        # key: the index of the parameter in the model
+        # value: (opt_idx, param_start, param_end, param_shape)
+        #   where param_start and param_end are the start and end index of the parameter in the bucket
+        model_idx2opt_idx: Dict[int, Tuple[int, int, int, torch.Size]] = {}
+        # key: opt_idx
+        # value: (sub_ranks, bucket_size), If value is None, then the parameter is not in a bucket
+        opt_idx2ranks: Dict[int, Optional[Tuple[List[int], int]]] = {}
+        model_params_id = [id(param) for param in self.parameters()]
+
+        for reducer in self.reducers:
+            _, sub_ranks = self._get_zero_subranks(reducer)
+            for bucket in reducer.buckets:
+                pstart, pend = 0, 0
+                for param in bucket.params:
+                    pstart = pend
+                    pend += param.numel()
+                    model_idx = model_params_id.index(id(param))
+                    model_idx2opt_idx[model_idx] = (opt_idx, pstart, pend, param.shape)
+                assert len(bucket._contiguous_params.shape) == 1
+                opt_idx2ranks[opt_idx] = (sub_ranks, bucket._contiguous_params.shape[0])
+                opt_idx += 1
+
+        assert len(model_params) >= opt_idx
+        # The remaining parameters are not in any bucket
+        # we assign them to the next available opt_idx
+        # and set the opt_idx2ranks to None
+        for param in model_params[opt_idx:]:
+            model_idx = model_params_id.index(id(param))
+            model_idx2opt_idx[model_idx] = opt_idx
+            opt_idx2ranks[opt_idx] = None
+            opt_idx += 1
+
+        assert len(model_params) == opt_idx
+
+        return ZeroMetadata(
+            model_idx2opt_idx=model_idx2opt_idx,
+            opt_idx2ranks=opt_idx2ranks,
+        )
+
+    def _get_zero_subranks(self, reducer: Reducer) -> Tuple[int, List[int]]:
+        """
+        Get the index in the zero subgroup the reducer belongs to, and the ranks of the subgroup.
+
+        Args:
+            reducer (cube.runtime.adapter.Reducer): a reducer of cube model
+
+        Returns:
+            rank_idx (int): the index of current rank in sub_ranks
+            sub_ranks (list): the ranks of ZeRO subgroup the current rank belongs to
+        """
+        cf = self.get_compute_config()
+        if not cf.use_zero:
+            raise RuntimeError('ZERO is not enabled, cannot get the zero subgroup info')
+
+        rank_idx = reducer.ranks.index(self.get_rank())
+        if cf.zero_ngroups > 1:
+            assert len(reducer.ranks) % cf.zero_ngroups == 0, \
+                f'reducer.ranks {reducer.ranks} should be divisible by ZERO_NUM_GROUPS {cf.zero_ngroups}'
+            zgroup_sz = len(reducer.ranks) // cf.zero_ngroups
+            group_idx = rank_idx // zgroup_sz
+            sub_ranks = reducer.ranks[group_idx * zgroup_sz : (group_idx + 1) * zgroup_sz]
+            new_rank_idx = sub_ranks.index(self.get_rank())
+            return new_rank_idx, sub_ranks
+        else:
+            assert cf.zero_ngroups == 1
+            return rank_idx, reducer.ranks
+
+    def _post_state_dict_hook(self, state_dict, prefix, local_metadata) -> None:
+        state_dict[f'{prefix}{self.EXTRA_STATE_KEY}'] = asdict(
+            ExtraState(
+                rank=self.get_rank(),
+                compute_config=asdict(self._compute_config),
+                dist_param_map=self._dist_param_map,
+                param_area_map=self._fullmap,
+                cube_param_names=[name for name, _ in self.named_parameters()],
+                **asdict(self._orign_module_metadata),
+                **asdict(self._zero_metadata),
+            )
+        )
+
+    def _pre_load_state_dict_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs) -> None:
+        state_dict.pop(f'{prefix}{self.EXTRA_STATE_KEY}', None)

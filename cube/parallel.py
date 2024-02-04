@@ -17,6 +17,7 @@ from cube.ir.cten import IRObject
 from cube.ir.tensor import IRFullTensor
 
 from cube.flags import CompileFlag, RuntimeFlag
+from cube.utils import get_shared_params
 
 from cube.graph import IRGraph
 from cube.graph import parser
@@ -32,7 +33,7 @@ from cube.execplan.planpass.fusion import DiffFusion
 from cube.ir.unique import IDGenerator
 from cube.program import Program
 from cube.runtime.adapter.reducer import Reducer
-from cube.runtime.module import CubeModule, ParallelModule
+from cube.runtime.module import CubeModule, ParallelModule, OriginModuleMetadata
 from cube.runtime.device import DeviceGroup
 from cube.runtime.gnorm import calcuate_gnorm, clip_grads
 
@@ -293,6 +294,7 @@ def _prepare_and_check_reusable(
         expected_output_files.append(config_file)
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
+        expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
         existing_output_files = [
             f for f in outdir.glob('*')
             if f.is_file() and (  # just take fullmap.pt.0 to compare
@@ -456,7 +458,8 @@ def _gencode(
     """
     graph_ckp = outdir / _GRAPH_DUMP_FILE
     forward_args_ckp = outdir / _FORWARD_ARGS_DUMP_FILE
-    if not graph_ckp.exists() or not forward_args_ckp.exists():
+    origin_module_metadata_ckp = outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE
+    if not graph_ckp.exists() or not forward_args_ckp.exists() or not origin_module_metadata_ckp.exists():
         is_module_class = inspect.isclass(module_or_module_class)
         if is_module_class:
             try:
@@ -479,6 +482,14 @@ def _gencode(
 
         if any(isinstance(m, CubeModule) for m in module.modules()):
             raise RuntimeError('CubeModule can not be nested.')
+
+        # save origin module metadata
+        meta_info = OriginModuleMetadata(
+            origin_param_names=[name for name, _ in module.named_parameters()],
+            origin_state_dict_names=list(module.state_dict().keys()),
+            origin_shared_param_names=get_shared_params(module),
+        )
+        torch.save(meta_info, origin_module_metadata_ckp)
 
         graph, forward_args = _gen_graph(module, dummy_input, outdir, compute_config.dynamic_shape)
         graph.dump(graph_ckp)
@@ -758,7 +769,7 @@ def build_optimizer(
     non_parallel_module_reducer_op: str = 'sum',
     *args,
     **kwargs,
-) -> OptimizerT:
+) -> Union[OptimizerT, ParallelOptimizer]:
     """
     Build an optimizer for a module.
 
@@ -792,6 +803,7 @@ def build_optimizer(
         torch.optim.Optimizer: the optimizer you should use to train the module
         The optimizer is created by optimizer_fn,
         and will be patched with the methods in ParallelModule class to support parallelized module.
+        Please note the type annotation of the returned optimizer (`Union[OptimizerT, ParallelOptimizer]`) is just for intellisense.
     """
 
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):

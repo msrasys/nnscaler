@@ -100,7 +100,7 @@ class Bucket:
         return self._numel
 
     @property
-    def params(self) -> Tuple:
+    def params(self) -> List[torch.nn.Parameter]:
         """Parameter list"""
         return self._params
 
@@ -481,7 +481,7 @@ class Reducer:
         for params in seq_buckets:
             starts.append(buffer_length)
             numel = sum(p.numel() for p in params)
-            padding = len(self._ranks) - numel % len(self._ranks)
+            padding = (len(self._ranks) - numel % len(self._ranks)) % len(self._ranks)
             buffer_length += numel + padding
             stops.append(buffer_length)
 

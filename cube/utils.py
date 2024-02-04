@@ -1,8 +1,9 @@
 import os
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, List, Set
 import logging
 from pathlib import Path
 import sys
+from collections import defaultdict
 
 import cube
 from cube.runtime.device import DeviceGroup
@@ -78,6 +79,26 @@ def load_eval_schedule(filename: Optional[str] = None):
     filename = f'gencode{DeviceGroup().rank}.py' if filename is None else filename
     module = _load_module_attr(filename, Path(filename).stem)
     return module._infer_step
+
+
+def get_param_by_name(model: torch.nn.Module, name: str) -> torch.nn.Parameter:
+    """
+    Get the parameter of the model by its full name.
+    """
+    sliced_names = name.split(".")
+    model_attr = model
+    for sliced_name in sliced_names:
+        model_attr = getattr(model_attr, sliced_name)
+    return model_attr
+
+
+def get_shared_params(model: torch.nn.Module) -> List[Set[str]]:
+    paramid2name = defaultdict(set)
+    for name in model.state_dict().keys():
+        param = get_param_by_name(model, name)
+        paramid = id(param)
+        paramid2name[paramid].add(name)
+    return [names for _, names in paramid2name.items() if len(names) > 1]
 
 
 class accum_mode:
