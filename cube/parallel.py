@@ -21,6 +21,7 @@ from cube.utils import get_shared_params
 
 from cube.graph import IRGraph
 from cube.graph import parser
+from cube.ir.operator import IRBpOperation
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.schedule.schedplan import SchedulePlan
@@ -506,7 +507,7 @@ def _gencode(
     if not isinstance(graph, IRGraph):
         raise RuntimeError("Expected policy return IRGraph")
 
-    # check assignment and remove anchor node
+    # check assignment
     for node in graph.nodes(flatten=True):
         # skip graph anchor: will be removed
         # skip multiref and IRPyFunc: they will be managed by system
@@ -514,8 +515,11 @@ def _gencode(
             continue
         if isinstance(node, IRPyFunc):
             continue
+        if isinstance(node, IRBpOperation) and node.mirror.name == 'multiref':
+            continue
         if len(node.device) == 0:
             raise RuntimeError(f"Node {node} device is not set")
+    # anchor node removed in gener
     graph = IRAdapterGener.gen(graph, cost_fn=None)
     if graph.sched is not None:
         graph.sched.apply()

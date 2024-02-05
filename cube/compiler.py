@@ -11,6 +11,7 @@ from cube.ir.tensor import IRFullTensor
 from cube.ir.unique import IDGenerator
 from cube.graph.gener.gen import IRAdapterGener
 from cube.graph.graph import IRGraph
+from cube.ir.operator import IRBpOperation
 from cube.ir.cten import IRObject
 from cube.ir.tensor import IRFullTensor
 from cube.graph.function.anchor import IRGraphAnchor
@@ -200,7 +201,7 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
             if not isinstance(graph, IRGraph):
                 raise RuntimeError("Expected policy return IRGraph")
 
-            # check assignment and remove anchor node
+            # check assignment
             for node in graph.nodes(flatten=True):
                 # skip graph anchor: will be removed
                 # skip multiref and IRPyFunc: they will be managed by system
@@ -208,11 +209,14 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
                     continue
                 if isinstance(node, IRPyFunc):
                     continue
+                if isinstance(node, IRBpOperation) and node.mirror.name == 'multiref':
+                    continue
                 if len(node.device) == 0:
                     raise RuntimeError(f"Node {node} device is not set")
 
             # generate adapter
             start = time.time()
+            # anchor node removed in gener
             graph = IRAdapterGener.gen(graph, cost_fn=comm_cost_fn)
             span = time.time() - start
             _logger.info('finish generating adapters: {:.2f} s'.format(span))

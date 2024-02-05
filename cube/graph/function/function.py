@@ -104,8 +104,6 @@ def Linear(input, weight, bias=None, signature = None):
         return IRDimops(Linear, 'linear', signature, annos, [input, weight], bias=None)
     else:
         annos = ['b * k^, n k^, n -> b * n']
-        _logger.warning(
-            'detected a linear operator has bias, the partition on reduction dimension is disabled.')
         return IRDimops(Linear, 'linear', signature, annos, [input, weight, bias])
 
 

@@ -670,7 +670,7 @@ class IRAdapterGener:
                 devops.setdefault(devid, []).append(consumer)
                 assert devtensors[devid][0] == ctensor, (
                     f"Detect that a full tensor is partitioned differently on a device.\n"
-                    f"To achieve this, need call graph.multiref before graph transformation.\n"
+                    f"To avoid this, need call graph.multiref before graph transformation.\n"
                     f"{graph.debug_tensor_map_str(ftensor)}"
                 )
 
