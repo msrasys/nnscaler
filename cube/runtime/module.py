@@ -612,7 +612,7 @@ class ParallelModule(CubeModule):
         so they will be in a reducer.
 
         When the num of scale unit == 1, the parameters can still need to be reduced inside the scale unit,
-        when the parameters is replicated because the ops using that parameters are partitioned.
+        when a parameter is replicated due to its operator's partition (i.e., through graph.partition)
         (when the paremeter is used by multiple ops,
         but some of ops are partitioned and some of ops are replicated,
         In that case, the parameter will not be in a reudcer.

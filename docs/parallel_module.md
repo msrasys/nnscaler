@@ -114,7 +114,6 @@ class ComputeConfig:
 
     dynamic_shape: bool = True
 
-    reducer_op: str = 'sum'
     use_zero: bool = False
     zero_ngroups: int = 1
 
@@ -132,23 +131,11 @@ We can categorize the fields into 4 categories:
 3. Code generation feature configuration
     - use_zero: whether to use zero. If it is true, the generated code will use zero1 to do distributed training.
     - zero_ngroups: the number of groups to be used in zero.
-    - reducer_op: the reducer operation for the gradients. It can be `sum`, `mean`, `min`, `max`, `avg`.
 4. User configuration
     - user_config: the user configuration. A typical usage is deciding whether skipping compiling and reusing the previously compiled parallel module. If user_config is the same between two runs, compiling in the second run will be skipped.
 
 Note:
-1.  `reducer_op` represents which `torch.distributed.ReduceOp` is used when reduce gradients
-    by torch.distributed.all_reduce or torch.distributed.reduce_scatter
-
-    In some cases, you may want to firstly divide the local gradients, and then use torch.distributed.ReduceOp.SUM to get the final the gradients.
-    You can achieve that speical mean with `optimizer.register_reducer_pre_hook` by setting `reducer_op` to `sum` and divide the local gradients with the following code:
-    ```python
-    def _mean_hook(reducer, grad):
-      if reducer.reduce_op == torch.distributed.ReduceOp.SUM:
-        grad.div_(reducer.ranks)
-    optimizer.register_reducer_pre_hook(_mean_hook)
-    ```
-2.  You can put any graph related configuration here. The assumption is different user_config should generate different graph/code. So if the user config is changed, we will regenerate the graph/code automatically. Here are some examples:
+1.  You can put any graph related configuration here. The assumption is different user_config should generate different graph/code. So if the user config is changed, we will regenerate the graph/code automatically. Here are some examples:
 
     - Example 1: save module configuration
         ```python
@@ -289,7 +276,6 @@ We have `build_optimizer` to build an optimizer for distributed training.
 def build_optimizer(
     module: torch.nn.Module,
     optimizer_fn: Union[Type[OptimizerT], Callable[..., OptimizerT]],
-    non_parallel_module_reducer_op: str = 'sum',
     *args,
     **kwargs,
 ) -> OptimizerT:
@@ -298,10 +284,8 @@ It has the following parameters:
 - module (torch.nn.Module): the module to be optimized
 - optimizer_fn (Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]]):
     It can be the optimizer class or optimizer factory function.
-- non_parallel_module_reducer_op (str): the reducer op for non-parallel modules. Default is 'sum'.
-- *args: the args will pass to `optimizer_fn`.
- If you use `*args`, you must specify `non_parallel_module_reducer_op` explicitly even when you only need its default value.
- So we suggest using `kwargs` instead of `args` to specify `optimizer_fn` arguments if possible.
+    The first parameter of the optimizer_fn should be the module parameters.
+- *args: other args for `optimizer_fn` besides module parameters.
 - **kwargs: the kwargs will pass to `optimizer_fn`
 
 To support distrubted training, in the function we need to hook 4 places:
@@ -321,9 +305,23 @@ To support distrubted training, in the function we need to hook 4 places:
 
 1. `sync_shard_grad`: Sync the shard gradients of the module from nodes with same shard to the optimizer. This function is called in optimizer's pre-step hook. But If you want to access the gradients before `optimizer.step()`(for example, you need gnorm),  you need to call this function manually.
 
-2. `register_reducer_pre_hook`, `register_reducer_post_hook`: Register pre/post hooks to reducers which will be applied before/after gradient synchronization. These hooks will apply to all the reducers (including `_non_parallel_module_reducer`) in the optimizer.
+2. `scale_grads`: Scale the gradients of the module by multiplying a factor. This function is useful to avoid overflow when the gradients are large. Please note you can only call this function **after** `sync_shard_grad`, because the gradients are `None` until `sync_shard_grad` is called.
 
-3. `_non_parallel_module_reducer`: The reducer for the modules which are not parallelized. It is used to sync the parameters in those modules across units.
+3. `clip_gnorm`: Clip the gradients with global norm, and return the global gnorm value, it will sync grads across devices if necessary. This function is useful to avoid gradient explosion.
+
+4. `register_reducer_pre_hook`, `register_reducer_post_hook`: Register pre/post hooks to reducers which will be applied before/after gradient synchronization. These hooks will apply to all the reducers (including `_non_parallel_module_reducer`) in the optimizer.
+
+You can use `register_reducer_pre_hook` and `register_reducer_post_hook` to do some operations before/after gradient synchronization. Not all paramers are managed by reducers, so it is tricky to use them. Actually we don't encourage you to use these functions.
+
+Here is one example (Assume we calculate loss with sum) showing how to carefully scale down the gradient locally and scale up the gradient after reduce. This is useful to avoid overflow when the gradients are large:.
+
+```python
+num_scale_units = ...
+optimizer.register_reducer_pre_hook(lambda reducer, grad: grad.div_(num_scale_units)) # scale down with factor num_scale_units before reduce
+optimizer.register_reducer_post_hook(lambda reducer, grad: grad.mul_(num_scale_units) # scale up with factor num_scale_units after reduce
+```
+
+5. `_non_parallel_module_reducer`: The reducer for the modules which are not parallelized. It is used to sync the parameters in those modules across units.
 
 ### Dataset
 

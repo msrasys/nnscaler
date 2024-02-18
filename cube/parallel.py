@@ -40,7 +40,6 @@ from cube.runtime.gnorm import calcuate_gnorm, clip_grads
 
 
 logger = logging.getLogger(__name__)
-_VALID_REDUCER_OPS = ['sum', 'avg', 'mean', 'max', 'min']
 
 
 @dataclass(frozen=True)
@@ -53,20 +52,6 @@ class ComputeConfig:
 
     use_zero: bool = False
     zero_ngroups: int = 1
-
-    # which torch.distributed.ReduceOp is used when reduce gradients
-    # by torch.distributed.all_reduce or torch.distributed.reduce_scatter
-    # a special case for mean op
-    # In some cases, you may want to firstly divide the local gradients, and then use torch.distributed.ReduceOp.SUM
-    # to get the final the gradients
-    # example code to divide the local gradients:
-    #```python
-    # def _mean_hook(reducer, grad):
-    #   if reducer.reduce_op == torch.distributed.ReduceOp.SUM:
-    #     grad.div_(reducer.ranks)
-    # optimizer.register_reducer_pre_hook(_mean_hook)
-    # ```
-    reducer_op: str = 'sum'
 
     # you can put any configuration here
     # *Note*: the assumption is different user_config should generate different code.
@@ -114,8 +99,6 @@ class ComputeConfig:
             raise ValueError(f"runtime_ngpus {self.runtime_ngpus} must be a multiple of plan_ngpus {self.plan_ngpus}")
         if self.use_zero and self.zero_ngroups < 0:
                 raise ValueError(f"zero_ngroups {self.zero_ngroups} must be >= 0")
-        if self.reducer_op not in _VALID_REDUCER_OPS:
-            raise ValueError(f"reducer_op {self.reducer_op} is not supported.")
 
     @property
     def gpu_config(self) -> Dict[str, int]:
@@ -141,7 +124,7 @@ def _flags(flags, /, **kwargs):
 def _compile_flags(compute_config: ComputeConfig):
     return _flags(
         CompileFlag,
-        async_reducer=False, reducer_op=compute_config.reducer_op, async_comm=False,
+        async_reducer=False, reducer_op='sum', async_comm=False,
         use_zero=compute_config.use_zero,
         zero_ngroups=compute_config.zero_ngroups,
     )
@@ -742,6 +725,21 @@ class ParallelOptimizer(torch.optim.Optimizer):
         """
         ...
 
+    def scale_grads(self, scale: float) -> None:
+        """
+        Scale the gradients of the module.
+
+        Please note
+        1. you can only call this function **after** `sync_shard_grad`,
+        because the gradients are `None` until `sync_shard_grad` is called.
+        2. Only the gradients of parameters in this optimizer be multiplied by this factor,
+        (When ZERO is on, not all parameters of the module are added to the optimizer).
+
+        Args:
+            scale (float): the scale factor. Gradients will be multiplied by this factor.
+        """
+        ...
+
     def register_reducer_pre_hook(self, fn: Callable[[Reducer, torch.Tensor], None]):
         """
         Register pre hooks to reducers which will be applied before gradient synchronization.
@@ -770,7 +768,6 @@ OptimizerT = TypeVar('OptimizerT', bound=torch.optim.Optimizer)
 def build_optimizer(
     module: torch.nn.Module,
     optimizer_fn: Union[Type[OptimizerT], Callable[..., OptimizerT]],
-    non_parallel_module_reducer_op: str = 'sum',
     *args,
     **kwargs,
 ) -> Union[OptimizerT, ParallelOptimizer]:
@@ -796,11 +793,8 @@ def build_optimizer(
         module (torch.nn.Module): the module to be optimized
         optimizer_fn (Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]]):
             It can be the optimizer class or optimizer factory function.
-            If it is a factory function, the signature should be the same with optimizer class constructor.
-        non_parallel_module_reducer_op (str): the reducer op for non-parallel modules. Default is 'sum'.
-        *args: the args for optimizer constructor.
-            Note: If you use `*args`, you must specify `non_parallel_module_reducer_op`.
-            Suggest to use kwargs instead, so you don't need to explicitly specify the default value of `non_parallel_module_reducer_op`.
+            The first parameter of the optimizer_fn should be the parameters of the module.
+        *args: other args for `optimizer_fn` besides parameters.
         **kwargs: the kwargs for optimizer constructor
 
     Returns:
@@ -812,8 +806,6 @@ def build_optimizer(
 
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
         raise RuntimeError("End2End mode is not supported")
-    if not non_parallel_module_reducer_op in _VALID_REDUCER_OPS:
-        raise ValueError(f"non_parallel_module_reducer_op {non_parallel_module_reducer_op} is not supported.")
 
     RuntimeFlag.skip_reducer = True
     RuntimeFlag.skip_zero_grad = False
@@ -839,7 +831,7 @@ def build_optimizer(
         for i in range(plan_ngpus):
             DeviceGroup().get_group(list(range(i, runtime_ngpus, plan_ngpus)))
         group = list(range(rank % plan_ngpus, runtime_ngpus, plan_ngpus))
-        non_parallel_module_reducer = Reducer(group, reduce_op=non_parallel_module_reducer_op)
+        non_parallel_module_reducer = Reducer(group)
         for m in non_parallel_modules:
             for param in m.parameters(recurse=False): # only add leaf parameters to avoid duplicate
                 non_parallel_module_reducer.add_param(param)
@@ -914,6 +906,15 @@ def build_optimizer(
         return total_norm
 
     optimizer.clip_gnorm = types.MethodType(_clip_gnorm, optimizer)
+
+    def _scale_grads(self, scale: float) -> None:
+        if parallel_modules[0]._sync_grad_required:
+            raise RuntimeError("You can only call scale_grads() after gradients are synchronized.")
+        for pg in optimizer.param_groups:
+            for p in pg['params']:
+                if p.grad is not None:
+                    p.grad.mul_(scale)
+    optimizer.scale_grads = types.MethodType(_scale_grads, optimizer)
 
     def _register_reducer_pre_hook(self, fn: Callable[[Reducer, torch.Tensor], None]):
         for m in parallel_modules:
