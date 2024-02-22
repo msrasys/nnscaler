@@ -44,8 +44,7 @@ def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None) -> Any:
     """
     if isinstance(val, IRObject):
         tensor_name = val.name
-        if '.' in tensor_name:
-            tensor_name = tensor_name.split('.')[0]
+        tensor_name = tensor_name.replace('.', '_')
         name = '_'.join([tensor_name, str(val.tid)])
         if prefix_attr is not None and val.is_attr():
             name = prefix_attr + name

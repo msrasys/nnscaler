@@ -598,7 +598,7 @@ class ModuleCodeGen(FuncEmission):
         """
         psign = "self.register_parameter('{name}', torch.nn.Parameter(torch.empty({shape}, dtype={dtype})))"
         bsign = "self.register_buffer('{name}', torch.empty({shape}, dtype={dtype}))"
-        map_sign = "self.add_full_map('{attr}', {tid}, {slicers}, {val_chunks})"
+        map_sign = "self.add_full_map('{attr}', {tid}, {is_param}, '{orig_name}', {full_shape}, {slicers}, {val_chunks})"
         if not isinstance(node, IRSegment):
             for itensor in node.inputs():
                 name = self.tensor_name(itensor, prefix_attr='self.')
@@ -612,12 +612,16 @@ class ModuleCodeGen(FuncEmission):
                             dtype=itensor.dtype
                         )
                         self.model_init_statements.append(code)
-                        tid = itensor.parent.tid
                         slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
                         val_chunks = itensor.valmap[1]
                         code = map_sign.format(
-                            attr=self.tensor_name(itensor), tid=tid,
-                            slicers=str(slicers), val_chunks=val_chunks
+                            attr=self.tensor_name(itensor),
+                            tid=itensor.parent.tid,
+                            is_param=itensor.is_param(),
+                            orig_name=itensor.parent.name,
+                            full_shape=tuple(itensor.parent.shape),
+                            slicers=str(slicers),
+                            val_chunks=val_chunks
                         )
                         self.model_init_statements.append(code)
                         self.model_init_statements.append('')

@@ -153,7 +153,7 @@ class Frame:
         """
         Save local_param -> origin_param name map.
         """
-        ir_name_to_orig_name = {str(t.name): name for t, (name, _) in self._attr_map.items()}
+        ir_name_to_orig_name = {str(t.name).replace('.', '_'): name for t, (name, _) in self._attr_map.items()}
         torch.save(ir_name_to_orig_name, save_file)
 
     def push_param(self, var_name):

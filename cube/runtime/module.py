@@ -1,4 +1,4 @@
-from typing import List, Set, Dict, Tuple, Optional, TYPE_CHECKING
+from typing import List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any
 import logging
 import os
 import sys
@@ -12,6 +12,7 @@ from cube.graph.parser.fx.parser import FxModuleParser
 from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.reducer import Reducer
 from cube.runtime.gnorm import ParamsInfo
+from cube.flags import CompileFlag
 
 if TYPE_CHECKING:
     from cube.parallel import ComputeConfig
@@ -19,6 +20,22 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
+
+@dataclass
+class AttrMeta:
+    # full tensor ID
+    tid: int
+    # is this a parameter
+    is_param: bool
+    # original name in the module
+    orig_name: str
+    # shape of the full tensor
+    shape: Tuple[int, ...]
+    # list of slicers to index the full tensor
+    slicers: Tuple[slice, ...]
+    # the number of the partitioned values, usually 1
+    # (i.e., no partition on value -> no need to sum up)
+    val_chunks: int
 
 class CubeModule(torch.nn.Module):
     """
@@ -29,13 +46,9 @@ class CubeModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self._reducers: List[Reducer] = list()
-        # self._fullmap contains the mapping of local attribute tensors to its fulltensor
-        # name (from named_parameters or named_buffers) -> (
-        #   fulltensor.tid,
-        #   index position of its fulltensor,
-        #   value partition num_chunks,
-        # )
-        self._fullmap : Dict[str, Tuple[int, Tuple[slice], int]] = dict()
+        # self._fullmap is mapping from the name of local attribute tensor 
+        # to its corresponding fulltensor meta
+        self._fullmap : Dict[str, AttrMeta] = dict()
 
     @property
     def reducers(self):
@@ -138,19 +151,22 @@ class CubeModule(torch.nn.Module):
             if reducer.zero:
                 reducer.gather_params()
 
-    def add_full_map(self, attr: str, tid: int, slicers: Tuple[slice], val_chunks: int):
-        """
-        Add an attribute map.
-        The mapping includes current attribute name (str) to logical tensor id,
-        and the mapping of logical tensor id including spatial (slice) and val chunks
+    def add_full_map(self, attr: str, tid: int, is_param: bool, orig_name: str, shape: Tuple[int],
+                     slicers: Tuple[slice], val_chunks: int):
+        """Add an attribute map.
 
-        @param attr str: attribute name of this moudle
-        @param tid int: full tensor id
-        @param slicers Tuple[slice]: indexing from full tensor
-        @param val_chunks int: the number of value chunks.
+        Args:
+            attr (str): attribute name of this module
+            tid (int): full tensor id
+            is_param (bool): whether this attribute is a parameter, otherwise it is a buffer
+            orig_name (str): attribute name in the original module
+            shape (Tuple[int]): shape of the full tensor
+            slicers (Tuple[slicer]): indexing from full tensor
+            val_chunks int: the number of value chunks.
         """
         assert hasattr(self, attr), f"{attr} is not in the module"
-        self._fullmap[attr] = (tid, slicers, val_chunks)
+        meta = AttrMeta(tid, is_param, orig_name, shape, slicers, val_chunks)
+        self._fullmap[attr] = meta
 
     # TODO: remove this function, use the property instead
     def get_full_map(self):
@@ -170,7 +186,6 @@ class CubeModule(torch.nn.Module):
             raise RuntimeError(f"Cannot find file {filename}.0 in load_attr_content")
         with torch.no_grad():
             _logger.info(f'loading partitioned model from {filename}, number of model parameter chunks: {npartitions}')
-            # self._fullmap
             attr_names = set(self._fullmap.keys())
             for file_idx in range(npartitions):
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
@@ -178,13 +193,13 @@ class CubeModule(torch.nn.Module):
                 part_model: Dict[int, torch.Tensor] = torch.load(filename + f'.{file_idx}')
                 loaded_name = set()
                 for attr_name in attr_names:
-                    tid, slicers, val_nchunks = self._fullmap[attr_name]
-                    if tid not in part_model:
+                    meta = self._fullmap[attr_name]
+                    if meta.tid not in part_model:
                         continue
                     attr = getattr(self, attr_name)
-                    content = part_model[tid][slicers]
-                    if val_nchunks != 1:
-                        content = content / val_nchunks
+                    content = part_model[meta.tid][meta.slicers]
+                    if meta.val_chunks != 1:
+                        content = content / meta.val_chunks
                     attr.copy_(content)
                     loaded_name.add(attr_name)
                 for name in loaded_name:
@@ -226,13 +241,76 @@ class CubeModule(torch.nn.Module):
         }, filename)
 
     @staticmethod
-    def merge_partial_states(state_dicts, zero_idx_maps=None):
+    def merge_model_state_dicts(state_dicts: List[Dict],
+                                fullmaps: List[Dict[str, AttrMeta]]):
+        """Merge model states from multiple shard into a single-model state.
+        
+        Note:
+            Users only need to provide as fewer local model states as necessary to
+            cover the full model state.
+
+        Args:
+            state_dicts (List[Dict[str, torch.Tensor]]): per-rank local model state dict from model.state_dict()
+            fullmaps (List[Dict[str, AttrMeta]]): per-rank fullmap
+            
+        Returns:
+            full_state_dicts (List[Dict[str, torch.Tensor]]): Full model state dict
         """
-        :param state_dicts: list of state_dict from different ranks
-        state_dict(model_state_dict, optimizer_state_dict, dist_param_map, param_area_map)
-        :return: merged state_dict(model_state_dict, optimizer_state_dict,)
+        if len(state_dicts) != len(fullmaps):
+            raise ValueError("Expected model state dicts to have the same length as fullmaps")
+        
+        full_model_state_dict: Dict[str, torch.Tensor] = {}
+        # gather param/buffer full tensor
+        for model_state_dict, local_fullmap in zip(state_dicts, fullmaps):
+            for local_name, meta in local_fullmap.items():
+                # create full tensor on cpu
+                partial_tensor = model_state_dict[local_name]
+                if meta.orig_name not in full_model_state_dict:
+                    full_model_state_dict[meta.orig_name] = torch.empty(
+                        meta.shape, dtype=partial_tensor.dtype)
+                # assign partial tensor
+                if meta.val_chunks > 1:
+                    raise NotImplementedError("Not support of partitioning parameter / buffer at value dimension")
+                full_model_state_dict[meta.orig_name][meta.slicers] = partial_tensor
+        return full_model_state_dict
+
+    @staticmethod
+    def merge_partial_states(state_dicts: List,
+                             zero_idx_maps=None):
+        """Merge model and optimizer states from different shard into a single-model state.
+        
+        Warnings:
+            * This function only supports merging optimizer states of Adam-like optimizers,
+            in which the optimizer state is expected to contain 'state' keyword.
+            * Only support single parameter group, i.e., code implementations like: `torch.optim.Adam(model.parameters(), lr=0.1)`
+
+        Args:
+            state_dicts (List[(Dict, Dict, Dict, Dict)]): per-rank states containing: 
+                * model_state_dicts (List[Dict[str, torch.Tensor]]): per-rank model state dict from model.state_dict()
+                * optim_state_dicts (Optional[List[Dict]]): per-rank optimizer state dict from optimizer.state_dict()
+                * dist_param_map: deprecated, will be removed in the future.
+                * fullmaps (List[Dict[str, AttrMeta]]): per-rank fullmap
+            zero_idx_maps (Optional[List[Dict]])
+        
+        Returns:
+            Dict[str, torch.Tensor]: Full model state dict
+            Dict[str, Dict[str, torch.Tensor]]: Full optimizer state dict
         """
-        assert len(state_dicts) > 0
+        model_state_dicts = [states[0] for states in state_dicts]
+        optim_state_dicts = [states[1] for states in state_dicts]
+        fullmaps: List[Dict[str, AttrMeta]] = [states[-1] for states in state_dicts]
+
+        if len(model_state_dicts) != len(fullmaps):
+            raise ValueError("Expected model state dicts to have the same length as fullmaps")
+        if optim_state_dicts is not None:
+            if len(optim_state_dicts) != len(fullmaps):
+                raise ValueError("Expected optimizer state dicts to have the same length as fullmaps")
+
+        # gather model states
+        full_model_state_dict = CubeModule.merge_model_state_dicts(model_state_dicts, fullmaps)
+
+        # gather optimizer states
+        full_optim_state_dict: Dict[str, Any] = {}  # param_id -> Dict[state_name, value]
 
         plan_ngpus = -1
         # TODO: remove this flag
@@ -244,203 +322,148 @@ class CubeModule(torch.nn.Module):
             _logger.info(f'plan_ngpus = {plan_ngpus}')
 
         # at first, merge the partitioned optimizer states due to zero to the zero-disabled format
-        if zero_idx_maps is not None:
-            if bool(int(os.environ.get('USE_ZERO', default=0))):
-                def _check_state_size(opt_state_keys, bucket_state):
-                    if len(opt_state_keys) <= 1:
-                        return True
-                    return all(bucket_state[key].shape == bucket_state[opt_state_keys[0]].shape
-                               for key in opt_state_keys)
+        if CompileFlag.use_zero:
+            if zero_idx_maps is None:
+                raise ValueError(f"Detected zero optimization enabled, "
+                                 f"expected zero_idx_maps for merging.")
+            def _check_state_size(opt_state_keys, bucket_state):
+                """
+                Check that all the keys except the scalar step for a 
+                parameter in optimizer states have the same shaped tensor. 
+                
+                For example, exp_avg, exp_avg_sq in Adam.
+                """
+                if len(opt_state_keys) <= 1:
+                    return True
+                return all(bucket_state[key].shape == bucket_state[opt_state_keys[0]].shape
+                           for key in opt_state_keys)
 
-                def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size):
-                    assert bucket_size % len(bucket_states) == 0
-                    opt_state_keys = list(bucket_states[0].keys())
-                    if 'step' in bucket_states[0]:
-                        opt_state_keys.remove('step')
-                    assert _check_state_size(opt_state_keys, bucket_states[0]), f'the keys {opt_state_keys} have different shape'
-                    # NOTE: only support adam for now
-                    assert 'exp_avg' in opt_state_keys
-                    assert 'exp_avg_sq' in opt_state_keys
-                    chunk_size = bucket_size // len(bucket_states)
-                    start_rank_id, start_offset = pstart // chunk_size, pstart % chunk_size
-                    end_rank_id, end_offset = pend // chunk_size, pend % chunk_size
-                    opt_states, opt_states_1d = {}, {}
+            def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size):
+                assert bucket_size % len(bucket_states) == 0
+                opt_state_keys = list(bucket_states[0].keys())
+                if 'step' in bucket_states[0]:
+                    opt_state_keys.remove('step')
+                assert _check_state_size(opt_state_keys, bucket_states[0]), f'the keys {opt_state_keys} have different shape'
+                # NOTE: only support adam for now
+                assert 'exp_avg' in opt_state_keys
+                assert 'exp_avg_sq' in opt_state_keys
+                chunk_size = bucket_size // len(bucket_states)
+                start_rank_id, start_offset = pstart // chunk_size, pstart % chunk_size
+                end_rank_id, end_offset = pend // chunk_size, pend % chunk_size
+                opt_states, opt_states_1d = {}, {}
+                for key in opt_state_keys:
+                    opt_states[key] = torch.zeros(pshape, dtype=bucket_states[0][key].dtype,
+                                                  device=bucket_states[0][key].device, requires_grad=False)
+                    opt_states_1d[key] = opt_states[key].view(-1)
+
+                if start_rank_id == end_rank_id:
                     for key in opt_state_keys:
-                        opt_states[key] = torch.zeros(pshape, dtype=bucket_states[0][key].dtype,
-                                                      device=bucket_states[0][key].device, requires_grad=False)
-                        opt_states_1d[key] = opt_states[key].view(-1)
-
-                    if start_rank_id == end_rank_id:
+                        opt_states_1d[key][:] = bucket_states[start_rank_id][key][start_offset:end_offset]
+                else:
+                    offset = chunk_size-start_offset
+                    for key in opt_state_keys:
+                        opt_states_1d[key][:offset] = bucket_states[start_rank_id][key][start_offset:]
+                    for i in range(start_rank_id+1, end_rank_id):
                         for key in opt_state_keys:
-                            opt_states_1d[key][:] = bucket_states[start_rank_id][key][start_offset:end_offset]
-                    else:
-                        offset = chunk_size-start_offset
-                        for key in opt_state_keys:
-                            opt_states_1d[key][:offset] = bucket_states[start_rank_id][key][start_offset:]
-                        for i in range(start_rank_id+1, end_rank_id):
-                            for key in opt_state_keys:
-                                opt_states_1d[key][offset:offset+chunk_size] = bucket_states[i][key][:]
-                            offset += chunk_size
-                        for key in opt_state_keys:
-                            opt_states_1d[key][offset:] = bucket_states[end_rank_id][key][:end_offset]
+                            opt_states_1d[key][offset:offset+chunk_size] = bucket_states[i][key][:]
+                        offset += chunk_size
+                    for key in opt_state_keys:
+                        opt_states_1d[key][offset:] = bucket_states[end_rank_id][key][:end_offset]
 
-                    if 'step' in bucket_states[0]:
-                        opt_states['step'] = bucket_states[0]['step']
-                    return opt_states
+                if 'step' in bucket_states[0]:
+                    opt_states['step'] = bucket_states[0]['step']
+                return opt_states
 
-                opt_state_list = []
-                worker_cnt = len(state_dicts)
-                for work_idx in (range(worker_cnt) if plan_ngpus < 0 else range(plan_ngpus)):
-                    model_idx2opt_idx, opt_idx2ranks = zero_idx_maps[work_idx]
-                    opt_state = {}
-                    for model_idx, opt_idx in model_idx2opt_idx.items():
-                        if isinstance(opt_idx, int):
-                            # the param without reducer
-                            assert opt_idx2ranks[opt_idx] is None
-                            # state_dicts [worker idx][opt state]['state'][param idx]
-                            opt_state[model_idx] = state_dicts[work_idx][1]['state'][opt_idx]
-                        else:
-                            # the param in reducer bucket
-                            opt_idx, pstart, pend, pshape = opt_idx
-                            ranks, bucket_size = opt_idx2ranks[opt_idx]
-                            bucket_states = [state_dicts[rank][1]['state'][opt_idx] for rank in ranks]
-                            opt_state[model_idx] = _retrieve_param_opt_state(
-                                bucket_states,
-                                pstart,
-                                pend,
-                                pshape,
-                                bucket_size)
-                    opt_state_list.append(opt_state)
-                    assert len(state_dicts[work_idx][1]['param_groups']) == 1, 'only support param_groups to be one group'
-            else:
-                if plan_ngpus > 0:
-                    _logger.warning(f'plan_ngpus {plan_ngpus} not handled USE_ZERO == False')
-                def _check_opt_state(opt_state):
-                    cnt = 0
-                    sorted_opt_state = {}
-                    for idx in sorted(opt_state.keys()):
-                        assert cnt == idx, f'opt state error: {idx} vs {cnt}, in {opt_state.keys()}'
-                        sorted_opt_state[idx] = opt_state[idx]
-                        cnt += 1
-                    return sorted_opt_state
-                optimizer_state_dict = {}
-                worker_cnt = len(state_dicts)
-                opt_state_list = []
-                for work_idx in range(worker_cnt):
-                    zero_idx2model_idx, model_idx2zero_idx, zero_rank_groups = zero_idx_maps[work_idx]
-                    opt_state = {}
-                    # first place local opt state to right index
-                    if len(zero_idx2model_idx) == 0:
-                        assert len(state_dicts[work_idx][1]['state']) == 0
-                    for local_idx, val in state_dicts[work_idx][1]['state'].items(): # worker / last_optimizer_state / state
-                        global_idx = zero_idx2model_idx[local_idx]
-                        assert global_idx not in opt_state
-                        opt_state[global_idx] = val
-                    # for each rank group, copy opt state from other buckets
-                    for rank_group, param_idx_buckets in zero_rank_groups.items():
-                        for bucket_idx, rank in enumerate(rank_group):
-                            if rank == work_idx: continue
-                            for global_idx in param_idx_buckets[bucket_idx]:
-                                other_local_idx = zero_idx_maps[rank][1][global_idx] # rank / model_idx2zero_idx / global_idx
-                                assert global_idx not in opt_state
-                                opt_state[global_idx] = state_dicts[rank][1]['state'][other_local_idx] # worker / last_optimizer_state / state / local idx
-                    opt_state = _check_opt_state(opt_state)
-                    opt_state_list.append(opt_state)
-                    assert len(state_dicts[work_idx][1]['param_groups']) == 1, 'only support param_groups to be one group'
-            # assign opt_state to state_dicts, cannot be assigned in the above loop
-            opt_state_len = len(opt_state_list[0])
+            opt_state_list = []
+            worker_cnt = len(state_dicts)
             for work_idx in (range(worker_cnt) if plan_ngpus < 0 else range(plan_ngpus)):
-                state_dicts[work_idx][1]['state'] = opt_state_list[work_idx]
-                state_dicts[work_idx][1]['param_groups'][0]['params'] = sorted(opt_state_list[work_idx].keys())
-                assert len(opt_state_list[work_idx]) == opt_state_len
+                model_idx2opt_idx, opt_idx2ranks = zero_idx_maps[work_idx]
+                opt_state = {}
+                for model_idx, opt_idx in model_idx2opt_idx.items():
+                    if isinstance(opt_idx, int):
+                        # the param without reducer
+                        assert opt_idx2ranks[opt_idx] is None
+                        # state_dicts [worker idx][opt state]['state'][param idx]
+                        opt_state[model_idx] = state_dicts[work_idx][1]['state'][opt_idx]
+                    else:
+                        # the param in reducer bucket
+                        opt_idx, pstart, pend, pshape = opt_idx
+                        ranks, bucket_size = opt_idx2ranks[opt_idx]
+                        bucket_states = [state_dicts[rank][1]['state'][opt_idx] for rank in ranks]
+                        opt_state[model_idx] = _retrieve_param_opt_state(
+                            bucket_states,
+                            pstart,
+                            pend,
+                            pshape,
+                            bucket_size)
+                opt_state_list.append(opt_state)
+                assert len(state_dicts[work_idx][1]['param_groups']) == 1, 'only support param_groups to be one group'
 
-        # find tensor full shape
-        param_max_dimsize = {}
-        if plan_ngpus > 0:
-            state_dicts = state_dicts[0:plan_ngpus]
-        for model_state_dict, optimizer_state_dict, dist_param_map, param_area_map in state_dicts:
-            for param_area in param_area_map.items():
-                local_name = param_area[0][0:param_area[0].rfind('_')]
-                assert len(local_name) > 0
-                raw_name = dist_param_map[local_name]
-                slices = param_area[1][1]
-                if param_area[1][2] != 1:
-                    _logger.error(f'value-split on {raw_name} is not supported')
-                if raw_name in param_max_dimsize:
-                    param_max_dimsize[raw_name] = max(param_max_dimsize[raw_name], slices)
-                else:
-                    param_max_dimsize[raw_name] = slices
+        # build parameter order to match with the optimizer state order
+        # NOTE: the param IDs in optimizer typically follow the same order of
+        # local `model.parameters()`. However, `state_dict.keys()` contains 
+        # both parameters and buffers, we need to remove the buffers from the list.
+        # More details refer to the implementation:
+        # https://pytorch.org/docs/stable/_modules/torch/nn/modules/module.html#Module._save_to_state_dict
+        origin_parameter_names: List[str] = []
+        for local_fullmap in fullmaps:
+            for _, meta in local_fullmap.items():
+                if not meta.is_param: continue
+                # shared parameters in CubeModule is already de-duplicated. So in the
+                # local model state, we will not have multiple parameters sharing with same content
+                # but in different names.
+                if meta.orig_name not in origin_parameter_names:
+                    origin_parameter_names.append(meta.orig_name)
+        
+        # handle 'state' in optimizer state dict
+        # NOTE: each rank may have its local optimizer state working on a sub-set
+        # of parameters of the full model. So the param IDs in each local optimizer
+        # state is a sub-sequence of global parameter ordering.
 
-        # create full tensors
-        param_full_tensors = {}
-        sample_step = -1
-        optim_full_tensors: Dict[int, Dict[any, any]] = {}  # param_id, (state_name, state_val)
-        for model_state_dict, optimizer_state_dict, dist_param_map, param_area_map in state_dicts:
-            if len(optimizer_state_dict['state'].items()) > 0:
-                optimizer_state_names = list(optimizer_state_dict['state'][0].keys())
-                _logger.info(f'optimizer_state_names = {optimizer_state_names}')
-                if 'step' in optimizer_state_names:
-                    sample_step = optimizer_state_dict['state'][0]['step']
-                    optimizer_state_names.remove('step')
-                _logger.info(f'optimizer_state_names (without step) = {optimizer_state_names}')
-            else:
-                optimizer_state_names = []
+        # we follow the order of in origin parameter names to find each (partitioned)
+        # parameter in the local model state, and assign the slice to the position.
+        full_optim_state_dict['state'] = {}
+        full_states = full_optim_state_dict['state']
+        # full_index: param IDs in the full optimizer state
+        for full_index, param_name in enumerate(origin_parameter_names):
+            for optim_state, fullmap in zip(optim_state_dicts, fullmaps):
+                if 'state' not in optim_state: continue
+                # adam-like optimizers have optim_state['state']={} before any optimizer.step()
+                if not optim_state['state']: continue
+                # filter out non-param attributes as they don't appear in the optimizer state
+                param_fullmap = [meta for meta in fullmap.values() if meta.is_param]
+                # local index: param IDs in the local optimizer state, we assume
+                # it aligns with the order of local `model.parameters()`
+                for local_index, meta in enumerate(param_fullmap):
+                    if meta.orig_name != param_name: continue
+                    full_states.setdefault(full_index, {})
+                    # TODO: support customized param groups, where each parameter has IDs
+                    # specified from its own param_group
+                    states: Dict[str, torch.Tensor] = optim_state['state'][local_index]
+                    for state_name in states.keys():
+                        value = states[state_name]
+                        # special handle for step: scalar tensor type
+                        if state_name == 'step':
+                            full_states[full_index][state_name] = value
+                            continue
+                        # for non-tensor states
+                        if not isinstance(value, torch.Tensor):
+                            full_states[full_index][state_name] = value
+                        # for tensor states, like 'exp_avg'
+                        else:
+                            # create optimizer state tensor
+                            if state_name not in full_states[full_index]:
+                                full_states[full_index][state_name] = torch.empty(meta.shape, dtype=value.dtype)
+                            # assign with partial tensor
+                            full_states[full_index][state_name][meta.slicers] = value
 
-            other_optim_keys = [key for key in optimizer_state_dict.keys() if key != 'state']
-            optimizer_other_state_dict = {}
-            for key in other_optim_keys:
-                optimizer_other_state_dict[key] = optimizer_state_dict[key]
+        # handle additional state dict keys
+        for optim_state_dict in optim_state_dicts:
+            for key in optim_state_dict.keys():
+                if key != 'state':
+                    full_optim_state_dict[key] = optim_state_dict[key]
 
-            # for raw_name in param_max_dimsize.keys():
-            model_state_dict_keys = list(model_state_dict.keys())
-            for param_area in param_area_map.items():
-                local_name_with_id = param_area[0]
-                local_name = local_name_with_id[0:local_name_with_id.rfind('_')]
-                raw_name = dist_param_map[local_name]
-
-                tensor_size_slice = param_max_dimsize[raw_name]
-                tensor_size = []
-                for dim_slice in tensor_size_slice:
-                    tensor_size.append(dim_slice.stop)
-                partial_tensor = model_state_dict[local_name_with_id]
-                param_full_tensors[raw_name] = torch.zeros(tuple(tensor_size), dtype=partial_tensor.dtype)
-
-                index = model_state_dict_keys.index(local_name_with_id)
-                if index in optimizer_state_dict['state']:
-                    for state_name in optimizer_state_names:  # 'step'
-                        if index not in optim_full_tensors:
-                            optim_full_tensors[index] = {}
-                        optim_full_tensors[index][state_name] = torch.zeros(tuple(tensor_size))
-                else:
-                    _logger.info(f'merge_checkpoint skips {local_name_with_id}\'s optimizer state')
-            break  # only create once
-
-        # assign value
-        for model_state_dict, optimizer_state_dict, dist_param_map, param_area_map in state_dicts:
-            model_state_dict_keys = list(model_state_dict.keys())
-            for param_area in param_area_map.items():
-                local_name_with_id = param_area[0]
-                local_name = local_name_with_id[0:local_name_with_id.rfind('_')]
-                raw_name = dist_param_map[local_name]
-                slices = param_area[1][1]
-                partial_tensor = model_state_dict[local_name_with_id]
-                param_full_tensors[raw_name][slices] = partial_tensor
-
-                index = model_state_dict_keys.index(local_name_with_id)
-                if index in optimizer_state_dict['state']:
-                    states = optimizer_state_dict['state'][index]
-                    for name in optimizer_state_names:
-                        val = states[name]
-                        optim_full_tensors[index][name][slices] = val
-                        if sample_step > 0:
-                            optim_full_tensors[index]['step'] = sample_step
-
-        # print(f'param_full_tensors (assigned) = {param_full_tensors}')
-        # print(f'optim_full_tensors (assigned) = {optim_full_tensors}')
-
-        optimizer_other_state_dict.update({'state': optim_full_tensors})
-        # dump to ckpt
-        return param_full_tensors, optimizer_other_state_dict
+        return full_model_state_dict, full_optim_state_dict
 
     @staticmethod
     def merge_checkpoints(filename_prefix='dist_checkpoint'):

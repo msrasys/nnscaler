@@ -137,7 +137,7 @@ class FxModuleParser:
             # TODO: data type check, with cases like {'a': 1.2, 'b': torch.Tensor}
             return IRObject(name=node.name, value=meta, is_constant=is_constant)
 
-        if hasattr(node, 'meta') and node.meta.get('tensor_meta'):
+        if hasattr(node, 'meta') and 'tensor_meta' in node.meta:
             meta = node.meta['tensor_meta']
             val = meta2var(meta)
         else:
@@ -273,6 +273,8 @@ class FxModuleParser:
             # the case that the parameter is the first time used by getattr
             if not exist_tensor:
                 tensor = frame.get_var(node.name)
+                # set tensor name same with the name in original model
+                tensor.name = node.target
                 if tensor.requires_grad:
                     tensor.as_param()
                 else:
