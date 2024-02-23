@@ -639,11 +639,10 @@ class IRGraph(IRSegment):
         Returns:
             ret (bool): True if post_node depends on pre_node on dataflow, otherwise False.
         """
-        itensors = [t for t in succ_node.inputs() if isinstance(t, IRSubTensor)]
-        for otensor in pre_node.outputs():
-            if not isinstance(otensor, IRSubTensor): continue
-            for itensor in itensors:
-                if otensor.overlap(itensor):
+        input_objs = IRSegment.get_objects_from_complex(succ_node.inputs())
+        for out_obj in IRSegment.get_objects_from_complex(pre_node.outputs()):
+            for in_obj in input_objs:
+                if out_obj.overlap(in_obj):
                     return True
         return False
 

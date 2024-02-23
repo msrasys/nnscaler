@@ -84,9 +84,13 @@ class Program:
 class SemanticDataLoader:
 
     def __init__(self, dataloader: MicroBatchDataLoader):
-        """
-        Create semantic dataloader which will produces IRDataOperation
-        when calling `next`.
+        """Create semantic dataloader representing the dataloader in training iteration.
+
+        Calling `next(SemanticDataLoader)` will generate an IRDataOperation in graph,
+        which takes the `self.irobj` (i.e., reperesenting the non-tensor value of real 
+        dataloader instance) as input and produces outputs that are converted to
+        IRObject or IRTensor. The IRDataOperation will be added to the final
+        graph and generate code like `data = next(dataloader)`
 
         Args:
             dataloader (MicroBatchDataLoader): torch dataloader
@@ -94,31 +98,42 @@ class SemanticDataLoader:
         if not isinstance(dataloader, MicroBatchDataLoader):
             raise TypeError("Expected data loader to be MicroBatchDataLoader")
         self.dataloader: data.DataLoader = dataloader
-        self.object = IRObject(name='dataloader', value=None)
+        # the IRObject representing the `dataloader` instance, which is only used by the
+        # IRDataOperation. Since we already know the output of the dataloader,
+        # we don't need to set the value for it. 
+        self.irobj = IRObject(name='dataloader', value=None)
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        def generate_output(sample):
-            """Support complex of types: List, Tuple, torch.Tensor, object"""
+        def generate_output(sample, name='data'):
+            """Support complex of types: Tuple, List, Dict, torch.Tensor"""
             if isinstance(sample, tuple):
-                return tuple(generate_output(t) for t in sample)
+                return tuple(generate_output(t, name) for t in sample)
             if isinstance(sample, list):
-                return list(generate_output(t) for t in sample)
+                return list(generate_output(t, name) for t in sample)
+            if isinstance(sample, dict):
+                return {k: generate_output(v, str(k)) for k, v in sample.items()}
             if isinstance(sample, torch.Tensor):
-                tensor = IRFullTensor(list(sample.shape), 'data', dtype=sample.dtype).tosub()
+                tensor = IRFullTensor(list(sample.shape), name, dtype=sample.dtype).tosub()
                 tensor._value = sample
                 return tensor
-            return IRObject('data', value=sample)
+            return IRObject(name, value=sample, is_constant=False)
         # get dataloader sample
         sample = next(iter(self.dataloader))
+        if not isinstance(sample, tuple):
+            sample = (sample,)
         # turn sample into IRObjects
-        outputs = generate_output(sample)
+        outputs = tuple(generate_output(s) for s in sample)
+        outputs = tuple(IRObject('data', value=out) if not isinstance(out, IRObject) else out for out in outputs)
         # create dataloader operation
-        node_outputs = outputs if isinstance(outputs, (tuple, list)) else (outputs,)
-        data_op = IRDataOperation(self.object, node_outputs)
+        # the `self.irobj` is the IRObject standing for the non-tensor value of real dataloader.
+        # the `self.irobj` are also usually used as one input of the whole graph
+        data_op = IRDataOperation(self.irobj, outputs)
         Program().add_node(data_op)
+        # return the outputs in the same format with real dataloader
+        outputs = outputs[0] if len(outputs) == 1 else outputs
         return outputs
 
 

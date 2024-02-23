@@ -3,7 +3,7 @@ import copy
 import numpy as np
 import sys
 
-from cube.ir.cten import IRCell
+from cube.ir.cten import IRCell, IRObject
 from cube.ir.tensor import IRSubTensor, IRFullTensor
 from cube.ir.adapter import IRAdapter, IRWeightReducer
 from cube.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
@@ -88,20 +88,38 @@ class ExecutionPlan:
 
     @staticmethod
     def from_schedplan(schedplan: SchedulePlan):
+        """Create execution plan from SchedulePlan
+
+        A schedule plan has multiple micro-batches, where each micro-batch
+        goes through the all operators in the model graph. So an operator
+        will be executed multiple times with different data from different micro-batches.
+        
+        The IRGraph only contains operators / IRTensors / IRObjects of one micro-batch. 
+        To represent data of a different micro-batch, we need to map the data in IRGraph to a 
+        new one with different IDs.
         """
-        Create execution plan from SchedulePlan
-        """
-        micro_ftensors: Dict[int, Dict[IRFullTensor, IRFullTensor]] = {}
-        def get(tensor: IRSubTensor, micro_idx: int) -> IRSubTensor:
-            """Get a same-shape tensor for micro-batch index"""
-            if not isinstance(tensor, IRSubTensor): return tensor
+        graph_inputs = schedplan.graph.inputs()
+        micro_objs: Dict[int, Dict[IRObject, IRObject]] = {}
+        def get(tensor: IRObject, micro_idx: int) -> IRObject:
+            """Get an IRObject same to tensor, but with different tid for each given micro-batch index"""
+            if not isinstance(tensor, IRObject): return tensor
+            # NOTE: the graph inputs (e.g., dataloader) serves as the global variables during the
+            # execution of schedules, where every micro-batch shares the same one for execution.
+            # Typically, the graph inputs can be dataloader object
+            if tensor in graph_inputs: return tensor
             if micro_idx == 0: return tensor
-            ftensor = micro_ftensors.setdefault(micro_idx, {}).setdefault(tensor.parent, tensor.parent.like())
-            t = ftensor.select(tensor.indmap, tensor.valmap)
-            if tensor.grad is not None:
-                fgrad: IRFullTensor = ftensor.grad
-                micro_ftensors.setdefault(micro_idx, {}).setdefault(tensor.parent.grad, fgrad)
-                t.grad = fgrad.select(tensor.grad.indmap, tensor.grad.valmap)
+            if not isinstance(tensor, IRSubTensor):
+                # IRObject but not IRSubTensor
+                micro_objs.setdefault(micro_idx, {}).setdefault(tensor, IRObject(tensor.name, value=tensor.value))
+                t = micro_objs[micro_idx][tensor]
+            else:
+                # IRSubTensor
+                ftensor = micro_objs.setdefault(micro_idx, {}).setdefault(tensor.parent, tensor.parent.like())
+                t = ftensor.select(tensor.indmap, tensor.valmap)
+                if tensor.grad is not None:
+                    fgrad: IRFullTensor = ftensor.grad
+                    micro_objs.setdefault(micro_idx, {}).setdefault(tensor.parent.grad, fgrad)
+                    t.grad = fgrad.select(tensor.grad.indmap, tensor.grad.valmap)
             return t
         
         micro_fcells: Dict[(int, IRCell), ExeReuseCell] = {}

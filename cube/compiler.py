@@ -149,7 +149,7 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
                     if isinstance(input, SemanticModel):
                         pinputs.append('model')
                     elif isinstance(input, SemanticDataLoader):
-                        pinputs.append(input.object)
+                        pinputs.append(input.irobj)
                     else:
                         pinputs.append(input)
                 Program().set_input(pinputs)
