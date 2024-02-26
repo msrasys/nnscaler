@@ -6,7 +6,7 @@ from pathlib import Path
 import inspect
 import sys
 import importlib
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from contextlib import contextmanager
 import logging
 
@@ -34,7 +34,7 @@ from cube.execplan.planpass.fusion import DiffFusion
 from cube.ir.unique import IDGenerator
 from cube.program import Program
 from cube.runtime.adapter.reducer import Reducer
-from cube.runtime.module import CubeModule, ParallelModule, OriginModuleMetadata
+from cube.runtime.module import CubeModule, ParallelModule, OriginModuleMetadata, ExtraState
 from cube.runtime.device import DeviceGroup
 from cube.runtime.gnorm import calcuate_gnorm, clip_grads
 
@@ -185,6 +185,11 @@ def _clean_files(_dir: Path, pattern = '*') -> None:
     for f in _dir.glob(pattern):
         if f.is_file():
             f.unlink()
+
+
+def _int_dict_to_list(d: Dict[int, Any]) -> List[Any]:
+    """Convert a dict with int keys to a list"""
+    return [d[i] for i in range(len(d))]
 
 
 _DEFAULT_INSTANCE_NAME = '_'
@@ -762,6 +767,26 @@ class ParallelOptimizer(torch.optim.Optimizer):
         """
         ...
 
+@dataclass(unsafe_hash=True)
+class ModuleParameterLocation:
+    # the location of the parameters of a module in optimizer.param_groups[0]['params']
+    # [offset, offset + count) is the range of the parameters in optimizer.param_groups[0]['params']
+    offset: int
+    count: int
+
+
+@dataclass
+class OptimizerExtraState:
+    rank: int
+    name: str  # the name of the optimizer
+    module_locs: Dict[str, ModuleParameterLocation]
+
+    def __post_init__(self):
+        for k in self.module_locs:
+            if isinstance(self.module_locs[k], dict):
+                self.module_locs[k] = ModuleParameterLocation(**self.module_locs[k])
+
+
 OptimizerT = TypeVar('OptimizerT', bound=torch.optim.Optimizer)
 
 
@@ -837,13 +862,24 @@ def build_optimizer(
                 non_parallel_module_reducer.add_param(param)
         non_parallel_module_reducer.build_buckets()
 
+    opt_module_locs: Dict[str, ModuleParameterLocation] = {}
     def _local_parameters(module: torch.nn.Module):
+        cube_suffix = "_CUBE_SUFFIX"
         gen = module._named_members(
-            lambda m: [(str(id(p)), p) for p in m.parameters_for_optimizer()]  # (str(id(p)), p) to meet _named_members requirement
+            lambda m: [(cube_suffix, p) for p in m.parameters_for_optimizer()]  # (cube_suffix, p) to meet _named_members requirement
                 if isinstance(m, ParallelModule)
                 else m._parameters.items()
         )
-        for _, param in gen:
+        for idx, (name, param) in enumerate(gen):
+            if name.endswith(cube_suffix):  # is a parameter of ParallelModule
+                # -1 for removing the dot
+                # please note when the whole module is a ParallModule,
+                # the name will be empty after removing the suffix
+                name = name[:-len(cube_suffix) - 1]
+                if name not in opt_module_locs:
+                    opt_module_locs[name] = ModuleParameterLocation(idx, 1)
+                else:
+                    opt_module_locs[name].count += 1
             yield param
 
     optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), *args, **kwargs)
@@ -860,13 +896,30 @@ def build_optimizer(
     optimizer.register_step_post_hook(_step_post_hook)
 
     orig_zero_grad = optimizer.zero_grad
-    def _patched_zero_grad_hook(self, set_to_none: bool = True):
+    def _patched_zero_grad(self, set_to_none: bool = True):
         orig_zero_grad(set_to_none)
         for m in parallel_modules:
             m.zero_grad()
         if non_parallel_module_reducer:
             non_parallel_module_reducer.zero_grad()
-    optimizer.zero_grad = types.MethodType(_patched_zero_grad_hook, optimizer)
+    optimizer.zero_grad = types.MethodType(_patched_zero_grad, optimizer)
+
+    orig_state_dict = optimizer.state_dict
+    def _patched_state_dict(self):
+        state_dict = orig_state_dict()
+        state_dict[ParallelModule.EXTRA_STATE_KEY] = asdict(OptimizerExtraState(
+            rank=torch.distributed.get_rank(),
+            name=type(optimizer).__name__,
+            module_locs=opt_module_locs,
+        ))
+        return state_dict
+    optimizer.state_dict = types.MethodType(_patched_state_dict, optimizer)
+
+    orig_load_state_dict = optimizer.load_state_dict
+    def _patched_load_state_dict(self, state_dict):
+        state_dict.pop(ParallelModule.EXTRA_STATE_KEY, None)
+        orig_load_state_dict(state_dict)
+    optimizer.load_state_dict = types.MethodType(_patched_load_state_dict, optimizer)
 
     def _sync_shard_grad(self):
         with _runtime_flags(skip_reducer=False):
@@ -934,3 +987,211 @@ def build_optimizer(
     optimizer.register_reducer_post_hook = types.MethodType(_register_reducer_post_hook, optimizer)
 
     return optimizer
+
+
+def _get_parallel_module_state_dict_info(
+        model_state_dicts: List[Dict[str, Any]]
+) -> Tuple[
+    Dict[Tuple[str, ...], List[ExtraState]],    # parallel module extrastate for each rank
+    Dict[Tuple[str,...], List[Dict[str, Any]]], # parallel module state dict for each rank
+    Dict[str, Any]                              # non-parallel module state dict
+]:
+    # parted key model state dicts
+    pk_model_state_dicts: List[Dict[Tuple[str,...], Any]] = []
+    for model_state_dict in model_state_dicts:
+        pk_model_state_dicts.append({tuple(k.split('.')): v for k, v in model_state_dict.items()})
+
+    # find all parallel module state keys (whose key ends with ParallelModule.EXTRA_STATE_KEY)
+    # key: the module prefix
+    # value: the list of extra states from all ranks
+    pm_extra_states: Dict[Tuple[str, ...], List[ExtraState]] = {}
+    for pk_model_state_dict in pk_model_state_dicts:
+        for k in pk_model_state_dict:
+            if k[-1] == ParallelModule.EXTRA_STATE_KEY:
+                module_prefix = k[:-1]
+                if module_prefix not in pm_extra_states:
+                    pm_extra_states[module_prefix] = [None] * len(pk_model_state_dicts)
+                opt_extra_state = ExtraState(**pk_model_state_dict[k])
+                pm_extra_states[module_prefix][opt_extra_state.rank] = opt_extra_state
+
+    # collect ParallelModule state dicts
+    # key is the module prefix of the parallel module in state dict
+    # value is the list of state dicts of the parallel module from all ranks
+    pm_state_dicts: Dict[Tuple[str,...], List[Dict[str, Any]]] = {}
+    # non-parallel module state dict
+    non_pm_state_dict: Dict[str, Any] = {}
+    for pk_model_state_dict in pk_model_state_dicts:
+        for k in pk_model_state_dict:
+            if k[-1] == ParallelModule.EXTRA_STATE_KEY: # skip extra state, we already have them
+                    continue
+            module_prefix = k[:-1]
+            if module_prefix in pm_extra_states:
+                if module_prefix not in pm_state_dicts:
+                    pm_state_dicts[module_prefix] = [dict() for _ in range(len(pk_model_state_dicts))]
+                opt_extra_state = ExtraState(**pk_model_state_dict[module_prefix + (ParallelModule.EXTRA_STATE_KEY,)])
+                pm_state_dicts[module_prefix][opt_extra_state.rank][k[-1]] = pk_model_state_dict[k]
+            else:
+                # no further processing
+                # here we assume values from all ranks are the same
+                non_pm_state_dict['.'.join(k)] = pk_model_state_dict[k]
+
+    return pm_extra_states, pm_state_dicts, non_pm_state_dict
+
+
+def _get_optimizer_state_dict_info(
+    optimizer_state_dicts: List[Dict[str, Any]]
+) -> Tuple[
+    List[OptimizerExtraState],
+    Dict[str,                     # key: the module prefix
+        List[Dict[                 # value: a list of dict from all ranks. The dict is
+                str,               # key: the state key `state` (all other keys will be ignored.)
+                Dict[              # value: a dict which is the same with opt_state_dict['state'], it is:
+                    int,           # key: an integer representing the parameter index
+                    Dict[str, Any] # value: a dict contains the parameter related info, the keys include 'step', 'exp_avg', 'exp_avg_sq'.
+                ]
+            ]
+        ]
+    ],
+    Dict[str, Any]
+]:
+    ret_opt_state_dict = {'state': {}}
+    # collect optimizer state dicts
+    # merge ParallelModule state dicts
+    # here we only need to handle `state` key in the optimizer state dict
+    # all other keys will be copied to the final state dict
+    opt_extra_states: List[OptimizerExtraState] = [None] * len(optimizer_state_dicts)
+    opt_state_dicts: Dict[str,     # key: the module prefix
+        List[Dict[                 # value: a list of dict from all ranks. The dict is
+                str,               # key: the state key `state` (all other keys will be ignored.)
+                Dict[              # value: a dict which is the same with opt_state_dict['state'], it is:
+                    int,           # key: an integer representing the parameter index
+                    Dict[str, Any] # value: a dict contains the parameter related info, the keys include 'step', 'exp_avg', 'exp_avg_sq'.
+                ]
+            ]
+        ]
+    ] = {}
+    for opt_state_dict in optimizer_state_dicts:
+        opt_extra_state = OptimizerExtraState(**opt_state_dict[ParallelModule.EXTRA_STATE_KEY])
+        if 'adam' not in opt_extra_state.name.lower():
+            raise ValueError("Only Adam-like optimizers are supported.")
+        opt_extra_states[opt_extra_state.rank] = opt_extra_state
+
+        for module_prefix, loc in opt_extra_state.module_locs.items():
+            if module_prefix not in opt_state_dicts:
+                opt_state_dicts[module_prefix] = [dict(state=[], param_groups=[]) for _ in range(len(optimizer_state_dicts))]
+            for i in range(loc.offset, loc.offset + loc.count):
+                opt_state_dicts[module_prefix][opt_extra_state.rank]['state'].append(opt_state_dict['state'][i])
+            # TODO: inaccurate param_groups, for example, the 'params' in it is not right.
+            # we have this to make `ParallelModule.merge_partial_states` happy.
+            opt_state_dicts[module_prefix][opt_extra_state.rank]['param_groups'] = opt_state_dict['param_groups']
+
+        for k, v in opt_state_dict.items():
+            if k == ParallelModule.EXTRA_STATE_KEY or k == 'state':
+                continue
+            # no further processing
+            # here we assume values from all ranks are the same
+            ret_opt_state_dict[k] = v
+
+    return opt_extra_states, opt_state_dicts, ret_opt_state_dict
+
+
+def merge_state_dicts(
+    model_state_dicts: List[Dict[str, Any]],
+    optimizer_state_dicts: Optional[List[Dict[str, Any]]],
+) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
+    """
+    Merge a list of shard state dicts (one for each rank) to a single full state dict
+    Note: Only Adam-like optimizers are supported for merging
+
+    Args:
+        model_state_dicts (List[Dict[str, Any]]): the model state dicts from each rank
+        optimizer_state_dicts (Optional[List[Dict[str, Any]]]): the optimizer state dicts from each rank
+
+    Returns:
+        Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]: the merged model state dict and the merged optimizer state dict
+    """
+    if optimizer_state_dicts is not None:
+        # TODO: support checkpoint optimization
+        # where the following check may be too strong.
+        if len(model_state_dicts) != len(optimizer_state_dicts):
+            raise ValueError("The length of model_state_dicts and optimizer_state_dicts should be the same.")
+    if not model_state_dicts:
+        raise ValueError("model_state_dicts should not be empty.")
+
+    pm_extra_states, pm_state_dicts, ret_state_dict = _get_parallel_module_state_dict_info(model_state_dicts)
+    if optimizer_state_dicts is not None:
+        opt_extra_states, opt_state_dicts, ret_opt_state_dict = _get_optimizer_state_dict_info(optimizer_state_dicts)
+        # the new optimizer state dict for ParallelModules
+        # key: the parallel module location in the optimizer state
+        # value: the new state values for the parallel module
+        #    (index is the parameter index in parallel module)
+        new_pm_states: Dict[ModuleParameterLocation, List[Any]] = {}
+    else:
+        opt_extra_states, opt_state_dicts, ret_opt_state_dict, new_pm_states = None, None, None, None
+
+    # do merging
+    # every loop will merge one ParallelModule
+    for k, state_dicts_for_merge in pm_state_dicts.items():
+        extra_states = pm_extra_states[k]
+        module_prefix = '.'.join(k)
+        opt_state_dicts_for_merge = [{'state': {}} for _ in range(len(state_dicts_for_merge))] \
+            if opt_state_dicts is None else opt_state_dicts[module_prefix]
+
+        merge_partial_states_state_dicts = []
+        merge_partial_states_zero_idx_maps = []
+        for m, opt, extra in zip(state_dicts_for_merge, opt_state_dicts_for_merge, extra_states):
+            merge_partial_states_state_dicts.append((m, opt, extra.dist_param_map, extra.param_area_map))
+            merge_partial_states_zero_idx_maps.append((extra.model_idx2opt_idx, extra.opt_idx2ranks))
+        if not extra_states[0].compute_config.use_zero: # all ranks should have the same use_zero
+            merge_partial_states_zero_idx_maps = None
+        merged_state_dict, merged_opt_state_dict = ParallelModule.merge_partial_states(
+            merge_partial_states_state_dicts,
+            merge_partial_states_zero_idx_maps
+        )
+
+        # merge back module state dict
+        for km, vm in merged_state_dict.items():
+            key = km if not module_prefix else f'{module_prefix}.{km}'
+            ret_state_dict[key] = vm
+
+        # merge back opt state dict
+        if opt_state_dicts is not None:
+            opt_module_locs = [opt_extra_states[i].module_locs[module_prefix] for i in range(len(opt_extra_states))]
+
+            # Assume all ranks have the same opt_module_locs (offset and count)
+            # TODO: assert may fail for pipeline parallelism
+            for i in range(1, len(opt_module_locs)):
+                assert opt_module_locs[i] == opt_module_locs[0]
+            new_pm_states[opt_module_locs[0]] = _int_dict_to_list(merged_opt_state_dict['state'])
+
+    if new_pm_states:
+        ret_state_list: List[Any] = _int_dict_to_list(optimizer_state_dicts[0]['state'])
+        sorted_keys = sorted(new_pm_states.keys(), key=lambda x: x.offset, reverse=True)
+        for loc in sorted_keys:
+            # this assign is only safe in reverse order
+            ret_state_list[loc.offset:loc.offset + loc.count] = new_pm_states[loc]
+        ret_opt_state_dict['state'] = {i: v for i, v in enumerate(ret_state_list)}
+
+    return ret_state_dict, ret_opt_state_dict
+
+
+def load_merged_state_dicts(module: torch.nn.Module, state_dict: Dict[str, Any]) -> torch.nn.Module:
+    """
+    Load the merged state dicts to the module and optimizer.
+
+    Args:
+        module (torch.nn.Module): the module to be loaded
+        state_dict (Dict[str, Any]): the merged model state dict
+    Returns:
+        torch.nn.Module: the module after loading the state dict
+    """
+    # there will be mismatched keys if the module is a ParallelModule or contains ParallelModule
+    # so we need to ignore the mismatched keys
+    module.load_state_dict(state_dict, strict=False)
+    # load ParallelModule state dicts
+    for name, child_module in module.named_modules():
+        if isinstance(child_module, ParallelModule):
+            prefix = name + '.' if name else ''
+            child_module.load_merged_state_dict(state_dict, prefix=prefix)
+
+    return module

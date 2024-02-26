@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 from dataclasses import dataclass, asdict
+from collections import defaultdict
 
 import torch
 import torch.distributed as dist
@@ -46,8 +47,9 @@ class CubeModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self._reducers: List[Reducer] = list()
-        # self._fullmap is mapping from the name of local attribute tensor 
+        # self._fullmap is mapping from the name of local attribute tensor
         # to its corresponding fulltensor meta
+        # please note there can be multiple entries with same tid
         self._fullmap : Dict[str, AttrMeta] = dict()
 
     @property
@@ -244,7 +246,7 @@ class CubeModule(torch.nn.Module):
     def merge_model_state_dicts(state_dicts: List[Dict],
                                 fullmaps: List[Dict[str, AttrMeta]]):
         """Merge model states from multiple shard into a single-model state.
-        
+
         Note:
             Users only need to provide as fewer local model states as necessary to
             cover the full model state.
@@ -252,13 +254,13 @@ class CubeModule(torch.nn.Module):
         Args:
             state_dicts (List[Dict[str, torch.Tensor]]): per-rank local model state dict from model.state_dict()
             fullmaps (List[Dict[str, AttrMeta]]): per-rank fullmap
-            
+
         Returns:
             full_state_dicts (List[Dict[str, torch.Tensor]]): Full model state dict
         """
         if len(state_dicts) != len(fullmaps):
             raise ValueError("Expected model state dicts to have the same length as fullmaps")
-        
+
         full_model_state_dict: Dict[str, torch.Tensor] = {}
         # gather param/buffer full tensor
         for model_state_dict, local_fullmap in zip(state_dicts, fullmaps):
@@ -278,20 +280,20 @@ class CubeModule(torch.nn.Module):
     def merge_partial_states(state_dicts: List,
                              zero_idx_maps=None):
         """Merge model and optimizer states from different shard into a single-model state.
-        
+
         Warnings:
             * This function only supports merging optimizer states of Adam-like optimizers,
             in which the optimizer state is expected to contain 'state' keyword.
             * Only support single parameter group, i.e., code implementations like: `torch.optim.Adam(model.parameters(), lr=0.1)`
 
         Args:
-            state_dicts (List[(Dict, Dict, Dict, Dict)]): per-rank states containing: 
+            state_dicts (List[(Dict, Dict, Dict, Dict)]): per-rank states containing:
                 * model_state_dicts (List[Dict[str, torch.Tensor]]): per-rank model state dict from model.state_dict()
                 * optim_state_dicts (Optional[List[Dict]]): per-rank optimizer state dict from optimizer.state_dict()
                 * dist_param_map: deprecated, will be removed in the future.
                 * fullmaps (List[Dict[str, AttrMeta]]): per-rank fullmap
             zero_idx_maps (Optional[List[Dict]])
-        
+
         Returns:
             Dict[str, torch.Tensor]: Full model state dict
             Dict[str, Dict[str, torch.Tensor]]: Full optimizer state dict
@@ -322,21 +324,18 @@ class CubeModule(torch.nn.Module):
             _logger.info(f'plan_ngpus = {plan_ngpus}')
 
         # at first, merge the partitioned optimizer states due to zero to the zero-disabled format
-        if CompileFlag.use_zero:
-            if zero_idx_maps is None:
-                raise ValueError(f"Detected zero optimization enabled, "
-                                 f"expected zero_idx_maps for merging.")
+        if zero_idx_maps is not None:
             def _check_state_size(opt_state_keys, bucket_state):
                 """
-                Check that all the keys except the scalar step for a 
-                parameter in optimizer states have the same shaped tensor. 
-                
+                Check that all the keys except the scalar step for a
+                parameter in optimizer states have the same shaped tensor.
+
                 For example, exp_avg, exp_avg_sq in Adam.
                 """
                 if len(opt_state_keys) <= 1:
                     return True
                 return all(bucket_state[key].shape == bucket_state[opt_state_keys[0]].shape
-                           for key in opt_state_keys)
+                            for key in opt_state_keys)
 
             def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size):
                 assert bucket_size % len(bucket_states) == 0
@@ -353,7 +352,7 @@ class CubeModule(torch.nn.Module):
                 opt_states, opt_states_1d = {}, {}
                 for key in opt_state_keys:
                     opt_states[key] = torch.zeros(pshape, dtype=bucket_states[0][key].dtype,
-                                                  device=bucket_states[0][key].device, requires_grad=False)
+                                                    device=bucket_states[0][key].device, requires_grad=False)
                     opt_states_1d[key] = opt_states[key].view(-1)
 
                 if start_rank_id == end_rank_id:
@@ -367,8 +366,9 @@ class CubeModule(torch.nn.Module):
                         for key in opt_state_keys:
                             opt_states_1d[key][offset:offset+chunk_size] = bucket_states[i][key][:]
                         offset += chunk_size
-                    for key in opt_state_keys:
-                        opt_states_1d[key][offset:] = bucket_states[end_rank_id][key][:end_offset]
+                    if end_offset:  # skip if end_offset == 0, because it is a no-op
+                        for key in opt_state_keys:
+                            opt_states_1d[key][offset:] = bucket_states[end_rank_id][key][:end_offset]
 
                 if 'step' in bucket_states[0]:
                     opt_states['step'] = bucket_states[0]['step']
@@ -399,9 +399,16 @@ class CubeModule(torch.nn.Module):
                 opt_state_list.append(opt_state)
                 assert len(state_dicts[work_idx][1]['param_groups']) == 1, 'only support param_groups to be one group'
 
+            # assign opt_state to state_dicts, cannot be assigned in the above loop
+            opt_state_len = len(opt_state_list[0])
+            for work_idx in (range(worker_cnt) if plan_ngpus < 0 else range(plan_ngpus)):
+                optim_state_dicts[work_idx]['state'] = opt_state_list[work_idx]
+                optim_state_dicts[work_idx]['param_groups'][0]['params'] = sorted(opt_state_list[work_idx].keys())
+                assert len(opt_state_list[work_idx]) == opt_state_len
+
         # build parameter order to match with the optimizer state order
         # NOTE: the param IDs in optimizer typically follow the same order of
-        # local `model.parameters()`. However, `state_dict.keys()` contains 
+        # local `model.parameters()`. However, `state_dict.keys()` contains
         # both parameters and buffers, we need to remove the buffers from the list.
         # More details refer to the implementation:
         # https://pytorch.org/docs/stable/_modules/torch/nn/modules/module.html#Module._save_to_state_dict
@@ -414,7 +421,7 @@ class CubeModule(torch.nn.Module):
                 # but in different names.
                 if meta.orig_name not in origin_parameter_names:
                     origin_parameter_names.append(meta.orig_name)
-        
+
         # handle 'state' in optimizer state dict
         # NOTE: each rank may have its local optimizer state working on a sub-set
         # of parameters of the full model. So the param IDs in each local optimizer
@@ -509,9 +516,20 @@ class ZeroMetadata:
 class ParallelModuleConfig:
     rank: int
     compute_config: 'ComputeConfig'
-    dist_param_map: Dict
-    param_area_map: Dict
+    # the dist_param_map of ParallelModule
+    dist_param_map: Dict[str, str]
+    # the fullmap of ParallelModule
+    param_area_map: Dict[str, AttrMeta]
+    # the parameter names of ParallelModule
     cube_param_names: List[str]
+
+    def __post_init__(self):
+        if isinstance(self.compute_config, dict):
+            from cube.parallel import ComputeConfig
+            self.compute_config = ComputeConfig(**self.compute_config)
+        for k in self.param_area_map:
+            if isinstance(self.param_area_map[k], dict):
+                self.param_area_map[k] = AttrMeta(**self.param_area_map[k])
 
 
 @dataclass
@@ -553,6 +571,7 @@ class ParallelModule(CubeModule):
         #     raise RuntimeError(f"The rank to load this module file name is expected to be {self._rank}, but got {dist.get_rank()}")
 
         module_file = Path(sys.modules[self.__module__].__file__)
+        self.module_dir = module_file.parent
         if init_params:
             self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
         self._dist_param_map = torch.load(module_file.with_name(f"{FxModuleParser.ATTR_MAP_FILE}"))
@@ -591,7 +610,12 @@ class ParallelModule(CubeModule):
             for reducer in self._reducers:
                 reducer.sync_grads()
 
-    def get_dist_param_map(self):
+    def get_dist_param_map(self) -> Dict[str, str]:
+        """
+        Get the parameter map of the model.
+        The map is a dict mapping from the new parameter name (without tid suffix) in parallel module
+            to the parameter name in original module.
+        """
         return self._dist_param_map
 
     def get_compute_config(self) -> 'ComputeConfig':
@@ -721,7 +745,7 @@ class ParallelModule(CubeModule):
         state_dict[f'{prefix}{self.EXTRA_STATE_KEY}'] = asdict(
             ExtraState(
                 rank=self.get_rank(),
-                compute_config=asdict(self._compute_config),
+                compute_config=self._compute_config,
                 dist_param_map=self._dist_param_map,
                 param_area_map=self._fullmap,
                 cube_param_names=[name for name, _ in self.named_parameters()],
@@ -732,3 +756,66 @@ class ParallelModule(CubeModule):
 
     def _pre_load_state_dict_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs) -> None:
         state_dict.pop(f'{prefix}{self.EXTRA_STATE_KEY}', None)
+
+    def _list_fullmodel_files(self) -> List[Path]:
+        legacy_fullmodel_path = self.module_dir / FxModuleParser.ATTR_CONTENT_FILE_STEM
+        files = []
+        if not legacy_fullmodel_path.is_file():
+            file_idx = 0
+            while True:
+                filepath = self.module_dir / FxModuleParser.ATTR_CONTENT_FILE_FORMAT.format(stem=FxModuleParser.ATTR_CONTENT_FILE_STEM, idx=file_idx)
+                if not filepath.is_file():
+                    break
+                files.append(filepath)
+                file_idx += 1
+        else:
+            files.append(legacy_fullmodel_path)
+
+        return files
+
+    def load_merged_state_dict(self, state_dict: Dict[str, Any], prefix: str = '', strict: bool = True):
+        """
+        Load the model from a merged state dict.
+
+        Args:
+            state_dict (Dict[str, Any]): the merged state dict
+            prefix (str): the prefix of the model state dict in the merged state dict
+            strict (bool, optional): whether to strictly enforce that state_dict has have all the parameters of the module
+                Note: unlike `torch.nn.Module.load_state_dict`,
+                we only make sure no missing keys. Unexpected keys are not checked.
+                Default: `True`
+        Returns:
+            None
+        Raises:
+            RuntimeError: if strict=True and there are missing keys.
+        """
+
+        dist2param = self.get_dist_param_map()
+        orig_param_names = list(dist2param.values())  # param names in original module (without prefix)
+
+        with torch.no_grad():
+            attr_names = set(self._fullmap.keys())
+
+            origname_tid_map = {meta.orig_name: meta.tid for meta in self._fullmap.values()}
+            tid_info = defaultdict(list)
+            for attr, meta in self._fullmap.items():
+                tid_info[meta.tid].append((attr, meta.slicers, meta.val_chunks))  # multiple params may share the same tid
+
+            for orig_param_name in orig_param_names:
+                orig_param_name_with_prefix = prefix + orig_param_name
+                param_value = state_dict[orig_param_name_with_prefix]
+                tid = origname_tid_map[orig_param_name]
+                for attr, slicer, nchunks in tid_info[tid]:
+                    tensor: torch.Tensor = getattr(self, attr)
+                    content = param_value[slicer]
+                    if nchunks != 1:
+                        content = content / nchunks
+                    tensor.copy_(content)
+                    attr_names.remove(attr)
+
+            if len(attr_names) != 0:
+                erro_msg = f'Missing key(s) in state_dict: {[prefix + self._fullmap[attr].orig_name for attr in attr_names]}.'
+                if strict:
+                    raise RuntimeError(erro_msg)
+                else:
+                    _logger.warning(erro_msg)

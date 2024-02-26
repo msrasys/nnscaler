@@ -1,18 +1,31 @@
 import torch
 import cube
+import os
 
 from functools import partial
+import pytest
 
 from cube.ir.operator import IRFwOperation
 from cube.runtime.device import DeviceGroup
 from ..launch_torchrun import torchrun
-import tempfile
+
+
+@pytest.fixture(autouse=True, scope='module')
+def clean_checkpoints():
+    yield
+    i = 0
+    while True:
+        try:
+            os.remove(f'checkpoint-shard{i}.pt')
+            i += 1
+        except Exception:
+            break
 
 
 class Module(torch.nn.Module):
     def __init__(self):
         super(Module, self).__init__()
-        
+
         self.register_buffer('buffer0', torch.randn(8, 8))
         self.param0 = torch.nn.Parameter(torch.randn(8, 8))
         self.param1 = torch.nn.Parameter(torch.randn(8, 8))
@@ -26,7 +39,7 @@ class Module(torch.nn.Module):
         x = x + self.buffer1
         x = x * self.param2
         return torch.sum(x)
-    
+
 def tp_policy(graph, resource):
     for idx, node in enumerate(graph.select(ntype=IRFwOperation)):
         if node.name == 'add':
@@ -60,16 +73,16 @@ def merge_model_states_test():
     sample = torch.randn(8, 8, device=torch.cuda.current_device())
 
     full_model_state = model.state_dict()
-                
+
     @cube.compile(model, sample, PAS=tp_policy)
     def train_iter(model, sample):
         loss = model(sample)
         loss.backward()
         return loss
     cube_model = cube.load_model()
-    
+
     state_dict = cube_model.state_dict()
-    torch.save({'state_dict': state_dict, 'fullmap': cube_model.fullmap}, 
+    torch.save({'state_dict': state_dict, 'fullmap': cube_model.fullmap},
                f'checkpoint-shard{DeviceGroup().rank}.pt')
     torch.distributed.barrier()
     if DeviceGroup().rank == 0:
@@ -96,13 +109,13 @@ def merge_optimizer_states_test():
 
     full_model_state = model.state_dict()
     full_optim_state = full_optimizer.state_dict()
-                
+
     @cube.compile(model, sample, PAS=tp_policy)
     def train_iter(model, sample):
         loss = model(sample)
         loss.backward()
         return loss
-    
+
     cube_model = cube.load_model()
     optimizer = torch.optim.Adam(cube_model.parameters(), lr=0.01)
 
@@ -135,12 +148,12 @@ def merge_optimizer_states_test():
         loss.backward()
         full_optimizer.step()
         full_optimizer.zero_grad()
-        
+
         # cube model
         loss = train_iter(cube_model, sample)
         optimizer.step()
         optimizer.zero_grad()
-    
+
     model_state_dict = cube_model.state_dict()
     optim_state_dict = optimizer.state_dict()
     states = {
@@ -163,5 +176,6 @@ def merge_optimizer_states_test():
         merged_model_states, merged_optim_states = cube_model.merge_partial_states(states)
         assert_same_state(full_model_state, merged_model_states)
         assert_same_state(full_optim_state, merged_optim_states)
+
 
 test_merge_optim_states = partial(torchrun, 2, merge_optimizer_states_test)

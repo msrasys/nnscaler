@@ -125,29 +125,35 @@ class Frame:
                 return tensor
         return None
 
-    def save_attr_content(self, save_file: str):
+    def save_attr_content(self, save_file_stem: str, params_per_file: int = 1024 * 1024 * 1024):
         """
         Save attribute content into file.
+
+        Args:
+            save_file_stem (str): stem file name. Actual file name will be `save_file_stem`.0, `save_file_stem`.1, etc.
+            params_per_file (int): number of params per file,default is 1 billion
+
+        Returns:
+            None
         """
         #TODO: use FxModuleParser.ATTR_CONTENT_FILE_FORMAT to name the files.
-        params_per_part = 1024 * 1024 * 1024 # 1 billion per part
         total_size = sum([val.numel() for _, (_, val) in self._attr_map.items()])
-        model_pt_part_num = (total_size + params_per_part - 1) // params_per_part
+        model_pt_part_num = (total_size + params_per_file - 1) // params_per_file
 
         tid2value = {t.tid: val.cpu() for t, (_, val) in self._attr_map.items()}
         # it can be zero if there is no param in the module (self._attr_map is empty)
         if model_pt_part_num <= 1:
-            torch.save(tid2value, f'{save_file}.0')
+            torch.save(tid2value, f'{save_file_stem}.0')
         else:
-            sorted_keys = sorted(list(tid2value.keys()))
-            assert len(sorted_keys) > 0, "Empty attr map"
-            chunk_size = (len(sorted_keys) + model_pt_part_num - 1) // model_pt_part_num
-            chunks = [sorted_keys[i:min(i + chunk_size, len(sorted_keys))] for i in
-                      range(0, len(sorted_keys), chunk_size)]
+            tids = list(tid2value.keys())
+            assert len(tids) > 0, "Empty attr map"
+            chunk_size = (len(tids) + model_pt_part_num - 1) // model_pt_part_num
+            chunks = [tids[i:min(i + chunk_size, len(tids))] for i in
+                      range(0, len(tids), chunk_size)]
             for idx, chunk in enumerate(chunks):
                 assert len(chunk) > 0, f"Empty chunk {idx}"
                 part = {k: tid2value[k] for k in chunk}
-                torch.save(part, f'{save_file}.{idx}')
+                torch.save(part, f'{save_file_stem}.{idx}')
 
     def save_attr_map(self, save_file: str = 'dist_param_map.pt'):
         """
