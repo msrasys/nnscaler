@@ -192,6 +192,19 @@ class IRGraph(IRSegment):
                     node.set_output(idx, subtensor)
         graph = IRGraph(nodes, inputs, outputs, module_name)
 
+        # check IRPyFunc
+        requires_grad_pyfunc: List[IRPyFunc] = []
+        for node in nodes:
+            if not isinstance(node, IRPyFunc): continue
+            if any(isinstance(t, IRSubTensor) and t.requires_grad for t in node.outputs()):
+                requires_grad_pyfunc.append(node)
+        if len(requires_grad_pyfunc) > 0:
+            dscp = (f'Cube does not support to compute gradients for IRPyFunc.\n'
+                    f'Following nodes require gradients, this may trigger error in backward:\n')
+            for node in requires_grad_pyfunc:
+                dscp += f'\t{node.signature}, cid: {node.cid}\n'
+            _logger.warning(dscp)
+
         # check unused outputs
         unused_obj_nodes: Dict[IRObject, List[IRCell]] = {}
         graph_output_objects = [

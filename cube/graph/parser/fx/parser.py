@@ -159,7 +159,7 @@ class FxModuleParser:
             frame (Frame): the frame to get the fx.Node
 
         Returns:
-            the copied strcuture where the fx.Node is replaced by IRObjects/IRTensors
+            the copied structure where the fx.Node is replaced by IRObjects/IRTensors
         """
         # to support more nested types, we can refer to the implementation of
         # https://github.com/pytorch/pytorch/blob/main/torch/utils/_pytree.py
