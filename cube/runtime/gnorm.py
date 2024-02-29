@@ -65,7 +65,7 @@ def prepare_for_grad_clip_legacy(cube_model: 'CubeModule', curr_rank: int) -> Di
         assert name in cube_model.fullmap
         if param.requires_grad:
             tid = cube_model.tid_of_param_name(name)
-            slicers = cube_model.fullmap[name][1]
+            slicers = cube_model.fullmap[name].slicers
             tid2param[tid] = param
             tid2slicers[tid] = slicers
     # gather all parameters' slicers
