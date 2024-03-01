@@ -24,14 +24,14 @@ from pathlib import Path
 import torch
 from torch._C import ScriptObject
 from torch.nn.modules.container import Sequential, ModuleList, ModuleDict, ParameterList, ParameterDict
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_flatten, tree_unflatten
 
 import torch.fx
 from torch.fx import GraphModule
 from torch.fx._compatibility import compatibility
 from torch.fx._symbolic_trace import _proxyable_classes
 from torch.fx.graph import Graph
-from torch.fx.node import Target, Node, Argument, _side_effectful_functions
+from torch.fx.node import Target, Node, Argument, _side_effectful_functions, base_types
 from torch.fx.proxy import TracerBase
 from torch.fx.operator_schemas import check_for_mutable_operation
 
@@ -134,7 +134,15 @@ from .utils import (
 
     side_effectful_inplace_ops,
 )
-from .utils import FrameRecord, ExtraSEFPatcher, extract_results_metadata, EmptyResult
+from .utils import (
+    FrameRecord,
+    ExtraSEFPatcher,
+    EmptyResult,
+    extract_results_metadata,
+    flatten_trees_with_func,
+    flatten_trees_with_func_and_spec,
+    map_trees_with_func,
+)
 
 # pyright: reportGeneralTypeIssues=false
 _logger = logging.getLogger(__name__)
@@ -375,18 +383,11 @@ class ConcreteTracer(TracerBase):
         apply the patcher, and the _autowrap_check to the target function.
         """
         if kind == 'output':
-            return args[0]
+            return args[0], args, kwargs
         elif kind == 'placeholder':
-            return self.placeholder_dict[target]
-
-        to_cpu = lambda t: t.cpu() if _orig_isinstance(t, torch.Tensor) else t
-        to_cuda = lambda t: t.cuda() if _orig_isinstance(t, torch.Tensor) else t
+            return self.placeholder_dict[target], args, kwargs
 
         def run(kind: str, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]):
-            if self.cpu_offload:
-                args = tree_map(to_cuda, args)
-                kwargs = tree_map(to_cuda, kwargs)
-
             if kind == 'call_function':
                 assert isinstance(target, Callable)
                 fn = target
@@ -411,25 +412,21 @@ class ConcreteTracer(TracerBase):
             return result
 
         with self.do_temp_disable(call=True):
-            result = run(kind, target, args, kwargs)
             if self.cpu_offload:
-                # move back arguments to cpu if cpu_offload
-                args = tree_map(to_cpu, args)
-                kwargs = tree_map(to_cpu, kwargs)
-                if isinstance(result, torch.Tensor):
-                    result = result.cpu()
-                elif isinstance(result, (list, dict, tuple)):
-                    result = tree_map(to_cpu, result)
-                elif isinstance(result, (int, bool, float, torch.device, torch.dtype, torch.finfo)) or result is None:
-                    # avoid too noisy warning
-                    pass
-                else:
-                    _logger.warning(f"result of target {target} is {type(result)}, which is not a common behavior.")
+                args, kwargs = tree_to_cuda(args), tree_to_cuda(kwargs)
 
+            result = run(kind, target, args, kwargs)
+
+            if self.cpu_offload:
+                args, kwargs, result = tree_to_cpu(args), tree_to_cpu(kwargs), tree_to_cpu(result)
+
+                unexpected_types = types_other_than(result, (*base_types, type(None), torch.Tensor))
+                if not contains_types(result, (torch.Tensor,)) and unexpected_types:
+                    _logger.warning(f"result of target {target} contains unexpected types {unexpected_types}, which is not a common behavior.")
                 torch.cuda.empty_cache()
 
         self.temp_disable_call = False
-        return result
+        return result, args, kwargs
 
     @compatibility(is_backward_compatible=True)
     def create_node(self, kind : str, target : Target,
@@ -474,22 +471,22 @@ class ConcreteTracer(TracerBase):
         use the 'run_target' to actually execute the code, and store the value in 'value' field.
         create the nodes for the target and the input of the target (if the target is one of call_method, call_function, call_module).
         """
-        def unwrap(obj: Any):
-            while _orig_isinstance(obj, ep.ConcreteProxy):
-                obj = obj.value
-            return obj
-        args_unwrapped = ep.map_aggregate_not_proxy(args, unwrap)
-        kwargs_unwrapped = ep.map_aggregate_not_proxy(kwargs, unwrap)
-
         with self.patcher.revert():
-            value_unwrapped = self.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+            args_unwrapped, kwargs_unwrapped = unwrap_nested_proxy(args), unwrap_nested_proxy(kwargs)
+            value_unwrapped, args_run, kwargs_run = self.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+
+            # because setitem is an inplace operation and will not return the obj, so here is a workaound to record node result
+            node_result = args_run[0] if kind == "call_function" and target == operator.setitem else value_unwrapped
+            # here update the origin args/kwargs to prevent inplace operator to the input
+            args = update_tree_proxy_value(args, args_run)
+            kwargs = update_tree_proxy_value(kwargs, kwargs_run)
 
         args_ = self.create_arg(args)
         kwargs_ = self.create_arg(kwargs)
         assert isinstance(args_, tuple)
         assert isinstance(kwargs_, dict)
 
-        node = self.create_node(kind, target, args_, kwargs_, name, type_expr, value_unwrapped)
+        node = self.create_node(kind, target, args_, kwargs_, name, type_expr, node_result)
 
         if self.record_frames and kind != 'placeholder':
             with self.do_temp_disable(True, True, True):
@@ -594,7 +591,9 @@ class ConcreteTracer(TracerBase):
             return a
 
         if isinstance(a, (dict_keys_type, dict_values_type, dict_items_type)):
-            return a
+            # here we directly flat all values as a list,
+            # for the create_arg do not support (dict_keys_type, dict_values_type, dict_items_type)
+            a = list(a)
 
         return super().create_arg(a)
 
@@ -1333,6 +1332,61 @@ def _create_wrapped_nn_module_func(tracer: ConcreteTracer, mod: torch.nn.Module,
         return result
 
     return wrapped
+
+
+def contains_types(pytree, types) -> bool:
+    """if pytree leaf has the given types, return true"""
+    return any(flatten_trees_with_func(lambda x: isinstance(x, types), [pytree])[0])
+
+
+def types_other_than(pytree, given_types) -> Set[Type]:
+    """return a set of types of the pytree leaf other than given_types"""
+    types = set(flatten_trees_with_func(lambda x: type(x) if not isinstance(x, given_types) else None, [pytree])[0])
+    if None in types:
+        types.remove(None)
+    return types
+
+
+def tree_to_cuda(pytree):
+    """return a same spec pytree with all the given pytree leaf tensor to cuda"""
+    return map_trees_with_func(lambda a: a.cuda() if isinstance(a, torch.Tensor) else a, [pytree])
+
+
+def tree_to_cpu(pytree):
+    """return a same spec pytree with all the given pytree leaf tensor to cpu"""
+    return map_trees_with_func(lambda a: a.cpu() if isinstance(a, torch.Tensor) else a, [pytree])
+
+
+def unwrap_nested_proxy(pytree):
+    """
+    return a same spec pytree with the ConcreteProxy in the old pytree replaced with ConcreteProxy.value
+    """
+    def unwrap(obj: Any):
+        while isinstance(obj, ep.ConcreteProxy):
+            obj = obj.value
+        return obj
+
+    while contains_types(pytree, (ep.ConcreteProxy,)):
+        pytree = map_trees_with_func(unwrap, [pytree])
+    return pytree
+
+
+def update_tree_proxy_value(dst_pytree, src_pytree):
+    """
+    copy the value from src_pytree to dst_pytree with the dst_pytree spec,
+    if the leaf is proxy, only replace the proxy.value, not replace the proxy.
+    """
+    _, spec = tree_flatten(dst_pytree)
+
+    def update_proxy_value(a, b):
+        if isinstance(a, ep.ConcreteProxy):
+            a.value = update_tree_proxy_value(a.value, b)
+            return a
+        else:
+            return b
+
+    flat_arg = flatten_trees_with_func_and_spec(update_proxy_value, [dst_pytree, src_pytree], spec)
+    return tree_unflatten(flat_arg, spec)
 
 
 @compatibility(is_backward_compatible=True)

@@ -45,17 +45,23 @@ def is_list_or_tuple(v: Any) -> bool:
     )
 
 
-def ir_object_recursive(obj: IRObject, fn: Callable):
-    """recursive on obj.value / dict / list / tuple"""
+# TODO: this function should rewrite with pytree
+def any_ir_object_satisfy(obj: Union[Any, IRObject], condition: Callable[[IRObject], bool]) -> bool:
+    """
+    recursive on obj.value / dict / list / tuple / slice with a function returned bool,
+    if any IRObject hit the condition, return True, or return false.
+    """
     if isinstance(obj, dict):
-        return any(ir_object_recursive(v, fn) for v in obj.values())
+        return any(any_ir_object_satisfy(v, condition) for v in obj.values())
     elif isinstance(obj, (list, tuple)):
-        return any(ir_object_recursive(v, fn) for v in obj)
+        return any(any_ir_object_satisfy(v, condition) for v in obj)
+    elif isinstance(obj, slice):
+        return any(any_ir_object_satisfy(v, condition) for v in (obj.start, obj.stop, obj.step))
     elif isinstance(obj, IRObject):
-        if fn(obj):
+        if condition(obj):
             return True
         elif obj.value is not None:
-            return ir_object_recursive(obj.value, fn)
+            return any_ir_object_satisfy(obj.value, condition)
         else:
             return False
     else:
@@ -63,7 +69,7 @@ def ir_object_recursive(obj: IRObject, fn: Callable):
 
 
 def ir_object_contains_dynamic(obj: IRObject):
-    return ir_object_recursive(obj, lambda a: not a.is_constant)
+    return any_ir_object_satisfy(obj, lambda a: not a.is_constant)
 
 
 def Identity(tensor: IRObject, signature = None):
@@ -501,9 +507,16 @@ def BitwiseNot(input, *, out=None, signature=None):
     return IRDimops(BitwiseNot, 'bitwise_not', signature, annos, [input])
 
 
-def _unwrap_value(obj: IRObject):
+# TODO: this function should rewrite with pytree
+def _unwrap_value(obj: Union[IRObject, Any]):
     if isinstance(obj, IRObject):
         return _unwrap_value(obj.value)
+    elif isinstance(obj, (list, tuple)):
+        return type(obj)(_unwrap_value(v) for v in obj)
+    elif isinstance(obj, dict):
+        return {k: _unwrap_value(v) for k, v in obj.items()}
+    elif isinstance(obj, slice):
+        return slice(_unwrap_value(obj.start), _unwrap_value(obj.stop), _unwrap_value(obj.step))
     else:
         return obj
 
@@ -1236,13 +1249,13 @@ def Reshape(input, shape: Tuple[int], *arg_shape, signature = None):
         assert shape.value is not None, f"shape should have a reference value but got: {shape}"
         if isinstance(shape.value, int):
             shape = (shape,) + arg_shape
-            ou_shape = [d.value if isinstance(d, IRObject) else d for d in shape]
+            ou_shape = _unwrap_value(list(shape))
         else:  # tuple[int] / list[int]
             assert len(arg_shape) == 0, f"already got a tuple of int shape"
-            ou_shape = list(shape.value)
+            ou_shape = _unwrap_value(list(shape.value))
     else:  # int / tuple[int]
         shape = ((shape,) if isinstance(shape, int) else tuple(shape)) + arg_shape
-        ou_shape = [d.value if isinstance(d, IRObject) else d for d in shape]
+        ou_shape = _unwrap_value(list(shape))
     assert all(isinstance(d, int) for d in ou_shape), f"but got {ou_shape}"
 
     anno, rules = _reshape_anno(in_shape, ou_shape, kwarg_name='shape')
@@ -2004,14 +2017,56 @@ def GetItem(a: Any, b: Any, signature = None) -> Union[Any, IRPyFunc]:
     # object slice
     if isinstance(obj, IRObject):
         assert obj.value is not None
-        if isinstance(obj.value[index], IRTensor):
-            out = obj.value[index]
+        unwrap_index = _unwrap_value(index)
+        if isinstance(obj.value[unwrap_index], IRTensor):
+            out = obj.value[unwrap_index]
         else:
-            val = obj.value[index]
+            val = obj.value[unwrap_index]
             is_constant = not (isinstance(val, IRObject) and not val.is_constant)
             out = IRObject(name='getitem', value=val, is_constant=is_constant)
         return IRPyFunc(signature, [obj, index], [out])
+    # obj is not a IRObject, index is a IRObject
+    if any_ir_object_satisfy(index, lambda a: isinstance(a, IRObject)):
+        # if index is not constant, than the out is not constant
+        is_constant = not ir_object_contains_dynamic(index)
+        val = obj[_unwrap_value(index)]
+        out = IRObject(name='getitem', value=val, is_constant=is_constant)
+        return IRPyFunc(signature, [obj, index], [out])
     return obj[index]
+
+
+def SetItem(__a: Any, __b: Any, __c: Any, signature = None) -> Union[Any, IRPyFunc]:
+    """_operator.setitem(__a, __b, __c) / cube.runtime.function.setitem(__a, __b, __c)"""
+    signature = 'cube.runtime.function.setitem'
+    obj, index, val = __a, __b, __c
+    if isinstance(obj, IRTensor):
+        # TODO: move to some function like FullSlice when ready
+        # TODO: give a IRTensor as return value or return a IRDimops
+        return IRPyFunc(signature, [__a, __b, __c], [IRObject()])
+
+    is_constant = not ir_object_contains_dynamic(index)
+    index = _unwrap_value(index)
+    if isinstance(obj, IRObject):
+        is_constant = is_constant and obj.is_constant
+        obj = obj.value
+
+    # not sure if it is safe the original obj be modified,
+    # we can not get the original value in the following program if we need it but it is inplace modified,
+    # here use shallow copy to prevent modify the original obj
+    obj = copy.copy(obj)
+    obj[index] = val
+    return IRPyFunc(signature, [__a, __b, __c], [IRObject(value=obj, is_constant=is_constant)])
+
+
+def Len(__obj: Any, signature = None) -> Union[Any, IRPyFunc]:
+    """builtins.len"""
+    if isinstance(__obj, IRTensor):
+        # TODO: IRTensor did not support dynamic shape attr now, so here the returned IRObject is constant
+        return IRPyFunc(signature, [__obj], [IRObject(value=__obj.shape[0])])
+    elif isinstance(__obj, IRObject):
+        return IRPyFunc(signature, [__obj], [IRObject(value=len(__obj.value), is_constant=__obj.is_constant)])
+    else:
+        return IRPyFunc(signature, [__obj], [IRObject(value=len(__obj))])
 
 
 def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], IRPyFunc]:

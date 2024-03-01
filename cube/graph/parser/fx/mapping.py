@@ -123,10 +123,12 @@ class SignFx2Op:
         __tttemplate('to'): function.To,
         __tttemplate('dim'): function.Dim,
         '_operator.getitem': function.GetItem,
+        '_operator.setitem': function.SetItem,
         'builtins.getattr': function.GetAttr,
         'builtins.tuple': function.MakeTuple,
         'builtins.list': function.MakeList,
         'builtins.slice': function.MakeSlice,
+        'builtins.len': function.Len,
 
         # # torch nn functional
         '_operator.matmul': function.Matmul,
@@ -211,6 +213,7 @@ class SignFx2Op:
         __rtemplate('identity'): function.Identity,
         __rtemplate('multiref'): function.MultiRef,
         __rtemplate('accum'): function.Accum,
+        __rtemplate('setitem'): function.SetItem,
 
         # #einops
         # __einopsize('apply_for_scriptable_torch'): function.ScriptEinOps,

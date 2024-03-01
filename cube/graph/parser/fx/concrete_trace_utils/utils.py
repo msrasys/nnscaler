@@ -2,13 +2,17 @@
 # Licensed under the MIT license.
 
 import builtins
+from collections import namedtuple
 from dataclasses import dataclass
 import operator
-from typing import Any, Callable, Dict, NamedTuple, Optional, Set, Tuple, Type
-import functools
+from typing import Any, Callable, Dict, NamedTuple, Optional, Set, Tuple, Type, List
 
 import torch
+import torch.utils._pytree as torch_pytree
 from torch.fx.node import Node, map_aggregate, _side_effectful_functions
+from torch.utils._pytree import tree_flatten, tree_unflatten, LeafSpec, TreeSpec, SUPPORTED_NODES
+
+from . import concrete_proxy as ep
 
 # These need to run in global scope to handle nested calls correctly
 _orig_module_call: Callable = torch.nn.Module.__call__
@@ -64,24 +68,6 @@ side_effectful_inplace_ops = {
 }
 
 
-def run_onlyif_instance(cond_type: Type[Any], return_orig: bool = True, return_const: Any = None):
-    def helper(fn):
-        if return_orig:
-            @functools.wraps(fn)
-            def wrapper_orig(*args):
-                if _orig_isinstance(args[-1], cond_type):
-                    return fn(*args)
-                return args[-1]
-            return wrapper_orig
-        else:
-            @functools.wraps(fn)
-            def wrapper_const(*args):
-                if _orig_isinstance(args[-1], cond_type):
-                    return fn(*args)
-                return return_const
-            return wrapper_const
-    return helper
-
 def map_recursive(fn: Callable, arg) -> Any:
     """
     Apply fn to each Node appearing arg. arg may be a list, tuple, slice, or dict with string keys.
@@ -97,28 +83,110 @@ def map_recursive(fn: Callable, arg) -> Any:
     else:
         return fn(arg)
 
-def map_recursive_zip(fn: Callable, arg0, *args) -> Any:
+
+def _get_node_type(pytree: Any) -> Any:
+    if isinstance(pytree, ep.ConcreteProxy):
+        return _orig_type(pytree)
+    if torch_pytree._is_namedtuple_instance(pytree):
+        return namedtuple
+    return type(pytree)
+
+torch_pytree._get_node_type = _get_node_type
+
+
+def flatten_trees_with_func(fn, pytrees):
     """
-    Apply fn to each Node appearing arg. arg may be a list, tuple, slice, or dict with string keys.
+    Each pytree in pytrees should have the same structure.
+
+    Example:
+
+        pytrees = [
+            [1, 2, (3, 4)], # pytree 1
+            [5, 6, (7, 8)], # pytree 2
+        ]
+
+        # the returned value is
+        [fn(1, 5), fn(2, 6), fn(3, 7), fn(4, 8)], [*, *, (*, *)]
     """
-    if _orig_type(arg0) != torch.Size and _orig_isinstance(arg0, _orig_tuple):
-        for arg in args:
-            assert (not _orig_isinstance(arg, torch.Size)) and _orig_isinstance(arg, _orig_tuple)
-            assert len(arg0) == len(arg)
-        return _orig_tuple(map_recursive_zip(fn, *sub_args) for sub_args in _orig_zip(arg0, *args))
-    elif _orig_isinstance(arg0, _orig_list):
-        for arg in args:
-            assert _orig_isinstance(arg, _orig_list)
-            assert len(arg0) == len(arg)
-        return _orig_list(map_recursive_zip(fn, *sub_args) for sub_args in _orig_zip(arg0, *args))
-    elif _orig_isinstance(arg0, _orig_dict):
-        keys = _orig_set(arg0.keys())
-        for arg in args:
-            assert _orig_isinstance(arg, _orig_dict) and len(keys.symmetric_difference(arg.keys())) == 0
-        return {k: map_recursive_zip(fn, arg0[k], *(arg[k] for arg in args)) for k in keys}
-    else:
-        # assert not _orig_isinstance(arg0, slice)
-        return fn(arg0, *args)
+    flat_trees = [tree_flatten(pytree) for pytree in pytrees]
+    flat_args = [v[0] for v in flat_trees]
+    specs = [v[1] for v in flat_trees]
+
+    if not all(len(flat_arg) == len(flat_args[0]) for flat_arg in flat_args):
+        raise RuntimeError('the element number of pytrees are not equal')
+    if not all(str(spec) == str(specs[0]) for spec in specs):
+        raise RuntimeError('the structure of pytrees are not equal')
+
+    return [fn(*vals) for vals in zip(*flat_args)], specs[0]
+
+
+def map_trees_with_func(fn, pytrees):
+    """
+    Each pytree in pytrees should have the same structure.
+    The returned value has the same structure with pytree in pytrees.
+
+    Example:
+
+        pytrees = [
+            [1, 2, (3, 4)], # pytree 1
+            [5, 6, (7, 8)], # pytree 2
+        ]
+
+        # the returned value is
+        [fn(1, 5), fn(2, 6), (fn(3, 7), fn(4, 8))]
+    """
+    flat_args, spec = flatten_trees_with_func(fn, pytrees)
+    return tree_unflatten([i for i in flat_args], spec)
+
+
+def flatten_tree_with_spec(pytree, spec: TreeSpec) -> List:
+    """
+    Flat a pytree with a given spec.
+
+    Example:
+
+        pytree = [1, (2, {3: 4})]
+        spec = TreeSpec([*, (*, *)])
+    
+        # the returned value is
+        [1, 2, {3: 4}]
+    """
+    assert isinstance(spec, TreeSpec)
+
+    if isinstance(spec, LeafSpec):
+        return [pytree]
+
+    flatten_fn = SUPPORTED_NODES[spec.type].flatten_fn
+    child_pytrees, _ = flatten_fn(pytree)
+
+    if len(child_pytrees) != len(spec.children_specs):
+        raise RuntimeError(f'The number of pytree children is not equal to the give specs.')
+
+    result = []
+    for child, child_spec in zip(child_pytrees, spec.children_specs):
+        flat = flatten_tree_with_spec(child, child_spec)
+        result += flat
+
+    return result
+
+
+def flatten_trees_with_func_and_spec(fn, pytrees, spec):
+    """
+    Example:
+
+        pytrees = [
+            [1, (2, {3: 4})],
+            [5, (6, 7)]
+        ]
+        spec = [*, (*, *)]
+
+        # the returned value is
+        [fn(1, 5), fn(2, 6), fn({3: 4}, 7)]
+    """
+    flat_args = [flatten_tree_with_spec(pytree, spec) for pytree in pytrees]
+    if not all(len(flat_arg) == len(flat_args[0]) for flat_arg in flat_args):
+        raise RuntimeError('the element number of pytrees are not equal')
+    return [fn(*vals) for vals in zip(*flat_args)]
 
 
 @dataclass

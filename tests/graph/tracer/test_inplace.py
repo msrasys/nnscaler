@@ -192,3 +192,46 @@ def test_inplace_setitem_op():
 
     print(nodes[9].args[0])
     assert nodes[9].args[0] == nodes[8]
+
+
+class InplaceOpBranchModule(torch.nn.Module):
+    def forward(self, x: torch.Tensor, ls: list):
+        y = torch.ones_like(x)
+        y.add_(1)
+        # if y can be correct add 1 during trace, it will always go into the first branch
+        if y.mean().item() > 1.5:
+            x.sub_(y)
+        else:
+            x.mul_(y)
+        ls[-1] = 1
+        ls[-2] = 2
+        return ls
+
+
+@replace_all_device_with('cpu')
+def test_inplace_op_value():
+    model = InplaceOpBranchModule()
+    dummy_input = {'x': torch.rand(10), 'ls': [3, 3, 3]}
+    traced_graph = to_fx_graph(model, dummy_input)
+
+    contains_sub_node, contains_mul_node = False, False
+    setitem_count = 0
+    for node in traced_graph.graph.nodes:
+        if node.op == 'call_method':
+            if node.target == 'sub_':
+                contains_sub_node = True
+            if node.target == 'mul_':
+                contains_mul_node = True
+        if node.op == 'call_function':
+            if node.target is cube_rt_function.setitem:
+                # this means during trace, the value of ls after setitem is correct
+                if setitem_count == 0:
+                    assert node.meta['tensor_meta'] == [3, 3, 1]
+                if setitem_count == 1:
+                    assert node.meta['tensor_meta'] == [3, 2, 1]
+                setitem_count += 1
+
+    # this means during trace, the value of y after inplace add is correct
+    assert contains_sub_node and not contains_mul_node
+    # there should have two setitem node in graph
+    assert setitem_count == 2

@@ -10,7 +10,7 @@ from cube.graph.parser.frame import Frame
 from cube.graph.parser.fx.mapping import SignFx2Op
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.function.dimops import IRDimops
-from cube.graph.function.function import ir_object_recursive
+from cube.graph.function.function import any_ir_object_satisfy
 
 import torch.fx
 from .concrete_trace_utils import TensorMetadata
@@ -211,7 +211,7 @@ class FxModuleParser:
             # case2: python runtime function
             else:
                 _logger.warning(f'Set python runtime function: {fsig}')
-                if ir_object_recursive(input_vals, lambda a: not a.is_constant):
+                if any_ir_object_satisfy(input_vals, lambda a: not a.is_constant):
                     err_msg = f'non register python runtime function {fsig} has a non constant input: {input_vals}, ' + \
                             'please register it as a customized function using cube.graph.parser.register'
                     raise RuntimeError(err_msg)
@@ -234,8 +234,8 @@ class FxModuleParser:
                     ir_node.set_output(i, vals[i])
             elif not isinstance(ir_node.output(0), IRTensor) and ir_node.output(0).value is not None:
                 if dynamic_shape or \
-                    ir_object_recursive(ir_node.output(0), lambda a: not a.is_constant) or \
-                    ir_object_recursive(ir_node.output(0), lambda a: isinstance(a, IRTensor)):
+                    any_ir_object_satisfy(ir_node.output(0), lambda a: not a.is_constant) or \
+                    any_ir_object_satisfy(ir_node.output(0), lambda a: isinstance(a, IRTensor)):
                     frame.set_var(node.name, ir_node.output(0))
                     ir_node.output(0).name = node.name
                 else:

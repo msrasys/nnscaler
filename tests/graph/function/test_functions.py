@@ -221,6 +221,8 @@ def test_GetItem():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c, d -> d b c'
     op = F.GetItem(IRTensor([3, 4, 2]), IRTensor([3, 5], dtype=torch.int64))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c, d e -> d e b c'
+    op = F.GetItem([1, 2, 3], IRObject(value=0, is_constant=False), signature='operator.getitem')
+    assert op.outputs()[0].value == 1 and op.outputs()[0].is_constant == False
 
 
 def test_Max():
@@ -295,3 +297,22 @@ def test_NewTensor():
     op = F.NewTensor(np.array([[1],[2],[3]]))
     assert repr(op.anno) == ' -> 3^ 1^'
     assert op.kwargs['data'] == [[1],[2],[3]]
+
+
+def test_Setitem():
+    set_val = IRObject(value=4, is_constant=False)
+    op = F.SetItem(IRObject(value=[1, 2, 3]), 0, set_val)
+    assert op.outputs()[0].value == [set_val, 2, 3]
+    assert op.outputs()[0].is_constant
+
+    op = F.SetItem(IRObject(value=[1, 2, 3], is_constant=False), 0, set_val)
+    assert op.outputs()[0].value == [set_val, 2, 3]
+    assert not op.outputs()[0].is_constant
+
+
+def test_Len():
+    op = F.Len([1, 2, 3], signature='builtins.len')
+    assert op.outputs()[0].value == 3
+
+    op = F.Len(IRObject(value=[1, 2, 3], is_constant=False), signature='builtins.len')
+    assert op.outputs()[0].value == 3 and not op.outputs()[0].is_constant

@@ -181,7 +181,8 @@ class OperatorPatcher:
             6. super() -> super(self.__class__, self)
             7. func(a, b, c) -> patch_run(func, a, b, c)  # for patch the functions called in the current function
         """
-        if not hasattr(func, '__module__') or func.__module__ is None or func.__module__.startswith('torch.'):
+        if not hasattr(func, '__module__') or func.__module__ is None \
+            or func.__module__.startswith('torch.') or func.__module__.startswith('cube.'):
             return func
         # those flags are set by fx _Patcher when a method is patched
         # we don't want to patch it again
