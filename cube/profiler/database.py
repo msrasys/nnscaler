@@ -230,11 +230,14 @@ class ProfileDataBase:
             fn = eval(node.signature)
         shapes, dtypes, requires_grads, values = [], [], [], []
 
+        # TODO: this function should rewrite with pytree
         def extract_val(val: Union[IRObject, Any]) -> Any:
             if isinstance(val, IRObject):
                 return extract_val(val.value)
             elif isinstance(val, tuple):
                 return tuple([extract_val(v) for v in val])
+            elif isinstance(val, list):
+                return list([extract_val(v) for v in val])
             elif isinstance(val, dict):
                 return {k: extract_val(v) for k, v in val.items()}
             elif isinstance(val, slice):
@@ -373,7 +376,7 @@ class ProfileDataBase:
             key str: the serialized string
         """
         shapes, dtypes, requires_grads = [], [], []
-        for t in node.inputs():
+        for t in node.inputs() + node.outputs():
             if isinstance(t, IRTensor):
                 shapes.append(t.shape)
                 dtypes.append(t.dtype)

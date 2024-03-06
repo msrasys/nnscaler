@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from cube.parallel import _gen_graph
+from cube.ir.tensor import IRTensor
 from cube.ir.operator import IRFwOperation
 from cube.profiler.database import CompProfiler, ProfileDataBase
 
@@ -34,3 +35,14 @@ def test_op_profile_times():
         toc = time.perf_counter()
         # this is always true because the op is very small.
         assert toc - tic < 20, f'op profile time is too long {toc - tic}'
+
+
+def test_serialize():
+    op = IRFwOperation('test', 'cube_test', [IRTensor(shape=[10, 20], dtype=torch.float)], 1)
+    db = ProfileDataBase()
+    op.set_output(0, IRTensor(shape=[10, 20], dtype=torch.float))
+    key1 = db._serialize(op)
+    op.set_output(0, IRTensor(shape=[10, 10], dtype=torch.float))
+    key2 = db._serialize(op)
+    # test different output have different serialize
+    assert key1 != key2
