@@ -481,3 +481,77 @@ def test_codegen_clone():
             True
         )
         assert isinstance(g.nodes()[0], cube.graph.function.dimops.IRDimops)
+
+
+class MinModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, a, b):
+        return torch.min(a, b)
+
+def _gencode_min_function_worker(tempdir):
+    init_distributed()
+    m_new = parallelize(
+        MinModule(),
+        {
+            'a': torch.tensor([5, 2, 3]),
+            'b': torch.tensor([1, 8, 1]),
+        },
+        PASData,
+        ComputeConfig(1, 1),
+        cube_savedir=tempdir,
+        load_module=True
+    )
+    assert m_new is not None
+    args = inspect.signature(m_new._forward_impl)
+    assert len(args.parameters) == 2
+    assert args.parameters['a'].default is inspect.Parameter.empty
+    assert args.parameters['b'].default is inspect.Parameter.empty
+
+
+    assert torch.equal(m_new(torch.tensor([5, 2, 3]), torch.tensor([1, 8, 1])), torch.tensor([1, 2, 1])), "Expected element-wise min"
+    assert torch.equal(m_new(torch.tensor([-5, -2, -3]), torch.tensor([-1, -8, -1])), torch.tensor([-5, -8, -3])), "Expected element-wise min with negative values"
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_codegen_min():
+    with tempfile.TemporaryDirectory() as tempdir:
+        launch_torchrun(1, _gencode_min_function_worker, tempdir)
+
+
+
+class MaxModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, a):
+        return torch.max(a, dim=1, keepdim=True)[0]
+
+def _gencode_max_function(tempdir):
+    init_distributed()
+    m_new = parallelize(
+        MaxModule(),
+        {
+            'a': torch.tensor([[1, 2, 3], [4, 5, 6]]),
+        },
+        PASData,  
+        ComputeConfig(1, 1), 
+        cube_savedir=tempdir,
+        load_module=True
+    )
+    assert m_new is not None
+    args = inspect.signature(m_new._forward_impl).parameters
+
+    assert len(args) == 1, "Expected 1 argument in the forward method"
+    assert args['a'].default is inspect.Parameter.empty, "Expected 'a' to have no default value"
+
+    expected_output = torch.tensor([[3], [6]])
+    actual_output = m_new(torch.tensor([[1, 2, 3], [4, 5, 6]]))
+    assert torch.equal(actual_output, expected_output), "Expected each row's max value with original dimension"
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of GPU devices')
+def test_codegen_max():
+    with tempfile.TemporaryDirectory() as tempdir:
+        launch_torchrun(1, _gencode_max_function, tempdir)

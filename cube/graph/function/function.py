@@ -1885,40 +1885,42 @@ def CompareNE(input, other, *, out=None, signature = None):
     return _comparison(CompareNE, operator.eq, 'ne', signature, input, other)
 
 
-def Max(input, other_or_dim=None, out_or_keepdim=None, *, out=None, signature = None, **kwargs):
+def Max(input, other_or_dim=None, keepdim=False, *, out=None, signature = None, **kwargs):
     """
     torch.max(input)
     torch.max(input, dim, keepdim=False, *, out=None)
     torch.max(input, other, *, out=None)
     """
-    signature = 'cube.runtime.function.max_'
+    assert out is None
     if 'dim' in kwargs:
+        assert other_or_dim is None and 'other' not in kwargs, f'dim and other cannot be both specified, get {kwargs}'
         other_or_dim = kwargs['dim']
-    if 'keepdim' in kwargs:
-        assert 'out' not in kwargs, f'out and keepdim cannot be both specified, get {kwargs}'
-        out_or_keepdim = kwargs['keepdim']
-    if 'out' in kwargs:
-        assert 'keepdim' not in kwargs, f'out and keepdim cannot be both specified, get {kwargs}'
-        out_or_keepdim = kwargs['out']
-    if other_or_dim is None:
-        edim_in = [s + '^' for s in ShapeAnno.create_shape_str(input.shape)]
-        annos = [OpAnno.create_op_str([edim_in], ['1'])]
-        return IRDimops(Max, 'max', signature, annos, [input])
-    elif isinstance(other_or_dim, IRTensor):
-        lshape, rshape, oshape = _handle_broadcast(input, other_or_dim)
+    if 'other' in kwargs:
+        assert other_or_dim is None and 'dim' not in kwargs, f'dim and other cannot be both specified, get {kwargs}'
+        other_or_dim = kwargs['other']
+    if isinstance(other_or_dim, IRTensor):
+        other = other_or_dim
+        lshape, rshape, oshape = _handle_broadcast(input, other)
         annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
-        return IRDimops(Max, 'max', signature, annos, [input, other_or_dim])
+        return IRDimops(Max, 'max', signature, annos, [input, other])
     else:
-        assert isinstance(other_or_dim, int) and isinstance(out_or_keepdim, bool)
-        edim_in = ShapeAnno.create_shape_str(input.shape)
-        edim_in[other_or_dim] += '^'
-        edim_out = copy.copy(edim_in)
-        if out_or_keepdim:
-            edim_out[other_or_dim] = '1'
-        else:
-            edim_out.pop(other_or_dim)
-        annos = [OpAnno.create_op_str([edim_in], [edim_out, edim_out])]
-        return IRDimops(Max, 'max', signature, annos, [input], other_or_dim=other_or_dim, out_or_keepdim=out_or_keepdim)
+        other_or_dim_val = _unwrap_value(other_or_dim)
+        if other_or_dim_val is None:
+            edim_in = [s + '^' for s in ShapeAnno.create_shape_str(input.shape)]
+            annos = [OpAnno.create_op_str([edim_in], ['1'])]
+            return IRDimops(Max, 'max', signature, annos, [input])
+        elif isinstance(other_or_dim_val, int):
+            keepdim_val = _unwrap_value(keepdim)
+            edim_in = ShapeAnno.create_shape_str(input.shape)
+            edim_in[other_or_dim_val] += '^'
+            edim_out = copy.copy(edim_in)
+            if keepdim_val:
+                edim_out[other_or_dim_val] = '1'
+            else:
+                edim_out.pop(other_or_dim_val)
+            kwargs = {'dim': other_or_dim, 'keepdim': keepdim}
+            annos = [OpAnno.create_op_str([edim_in], [edim_out, edim_out])]
+            return IRDimops(Max, 'max', signature, annos, [input], **kwargs)
 
 
 def ShapeAsTensor(input: IRTensor, signature = None):
@@ -2172,3 +2174,67 @@ def ScaledDotProductAttention(query, key, value, attn_mask=None, dropout_p=0.0,
     anno = OpAnno.create_op_str([query_anno, key_anno, value_anno], [out_anno])
     return IRDimops(ScaledDotProductAttention, 'scaled_dot_product_attention', signature, [anno], [query, key, value],
                     attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, **kwargs)
+
+
+def Min(input, other_or_dim=None, keepdim=False, *, out=None, signature = None, **kwargs):
+    """
+    torch.min(input)
+    torch.min(input, dim, keepdim=False, *, out=None)
+    torch.min(input, other, *, out=None)
+    """
+    assert out is None
+    if 'dim' in kwargs:
+        assert other_or_dim is None and 'other' not in kwargs, f'dim and other cannot be both specified, get {kwargs}'
+        other_or_dim = kwargs['dim']
+    if 'other' in kwargs:
+        assert other_or_dim is None and 'dim' not in kwargs, f'dim and other cannot be both specified, get {kwargs}'
+        other_or_dim = kwargs['other']
+    if isinstance(other_or_dim, IRTensor):
+        other = other_or_dim
+        lshape, rshape, oshape = _handle_broadcast(input, other)
+        annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
+        return IRDimops(Min, 'min', signature, annos, [input, other])
+    else:
+        other_or_dim_val = _unwrap_value(other_or_dim)
+        if other_or_dim_val is None:
+            edim_in = [s + '^' for s in ShapeAnno.create_shape_str(input.shape)]
+            annos = [OpAnno.create_op_str([edim_in], ['1'])]
+            return IRDimops(Min, 'min', signature, annos, [input])
+        elif isinstance(other_or_dim_val, int):
+            keepdim_val = _unwrap_value(keepdim)
+            edim_in = ShapeAnno.create_shape_str(input.shape)
+            edim_in[other_or_dim_val] += '^'
+            edim_out = copy.copy(edim_in)
+            if keepdim_val:
+                edim_out[other_or_dim_val] = '1'
+            else:
+                edim_out.pop(other_or_dim_val)
+            kwargs = {'dim': other_or_dim, 'keepdim': keepdim}
+            annos = [OpAnno.create_op_str([edim_in], [edim_out, edim_out])]
+            return IRDimops(Min, 'min', signature, annos, [input], **kwargs)
+        
+
+def Log(input, *, out=None, signature=None):
+    """
+    torch.log(input, *, out=None) -> Tensor
+    """
+    assert out is None
+    if not isinstance(input, IRObject):
+        return torch.log(input) if isinstance(input, torch.Tensor) else math.log(input)
+    if not isinstance(input, IRTensor):
+        return IRPyFunc(signature, [input], [_compute_unary_op(input, math.log, 'log')])
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    annos = [OpAnno.create_op_str([edim_in], [edim_in])]
+    return IRDimops(Log, 'log', signature, annos, [input])
+
+    
+def FullLike(input, fill_value, *, dtype=None, layout=None,
+             device=None, requires_grad=False, memory_format=None, signature=None):
+    """
+    torch.full_like(input, fill_value, \*, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=torch.preserve_format) → Tensor
+    """
+    assert layout in (None, torch.strided) and memory_format is None, f"Not support for non-default memory_format and layout"
+    kwargs = {'fill_value': fill_value, 'requires_grad': requires_grad,'dtype': dtype}
+    shape = ShapeAnno.create_shape_str(input.shape)
+    annos = [OpAnno.create_op_str([shape], [shape])]
+    return IRDimops(FullLike, 'full_like', signature, annos,[input],**kwargs)

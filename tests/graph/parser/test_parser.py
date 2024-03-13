@@ -93,3 +93,26 @@ def test_max():
 
     assert isinstance(ir_graph.output(0), IRTensor)
     assert ir_graph.output(0).shape == (4, 1)
+
+
+@replace_all_device_with('cpu')
+def test_min():
+
+    class MyModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, x):
+            return torch.min(x, dim=1, keepdim=True)[0]
+
+    dummy_input = {'x': torch.randn(10, 256)}
+    module = MyModule()
+    fx_graph = to_fx_graph(module, dummy_input)
+
+    print(fx_graph.graph)
+    with tempfile.TemporaryDirectory() as tempdir:
+        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
+        print(ir_graph.extra_repr())
+
+    assert isinstance(ir_graph.output(0), IRTensor)
+    assert ir_graph.output(0).shape == (10, 1)

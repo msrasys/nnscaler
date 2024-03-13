@@ -6,6 +6,7 @@ from cube.ir.cten import IRObject, IRTensor
 import pytest
 import torch
 import numpy as np
+import math
 
 
 def o(value):
@@ -228,12 +229,28 @@ def test_GetItem():
 def test_Max():
     op = F.Max(IRTensor([2, 3, 4]))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> 1'
-    op = F.Max(IRTensor([2, 3, 4]), IRTensor([4]))
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c, c -> a b c'
     op = F.Max(IRTensor([2, 3, 4]), 1, True)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c -> a 1 c, a 1 c'
     op = F.Max(IRTensor([2, 3, 4]), 1, False)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c -> a c, a c'
+    op = F.Max(IRTensor([2, 3, 4]), 1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c -> a c, a c'
+    op = F.Max(IRTensor([2, 3, 4]), IRTensor([4]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c, c -> a b c'
+    op = F.Max(IRTensor([2, 3, 4]), IRObject(value=2, is_constant=False), True)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b 1, a b 1'
+    op = F.Max(IRTensor([2, 3, 4]), 2,IRObject(value=True, is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b 1, a b 1'
+    op = F.Max(IRTensor([2, 3, 4]), 2,IRObject(value=False, is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b, a b'
+    op = F.Max(IRTensor([2, 3, 4]), IRObject(value=2, is_constant=False),IRObject(value=True, is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b 1, a b 1'
+    op = F.Max(IRTensor([2, 3, 4]), IRObject(value=2, is_constant=False),IRObject(value=IRObject(value=True), is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b 1, a b 1'
+    op = F.Max(IRTensor([2, 3, 4]), IRObject(value=2, is_constant=False),IRObject(value=None, is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b, a b'
+    op = F.Max(IRTensor([2, 3, 4]), IRObject(value=2, is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b, a b'
 
 
 def test_Squeeze():
@@ -316,3 +333,53 @@ def test_Len():
 
     op = F.Len(IRObject(value=[1, 2, 3], is_constant=False), signature='builtins.len')
     assert op.outputs()[0].value == 3 and not op.outputs()[0].is_constant
+
+
+def test_Min(): 
+    op = F.Min(IRTensor([2, 3, 4]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> 1'
+    op = F.Min(IRTensor([2, 3, 4]), 1, True)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c -> a 1 c, a 1 c'
+    op = F.Min(IRTensor([2, 3, 4]), 1, False)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c -> a c, a c'
+    op = F.Min(IRTensor([2, 3, 4]), 1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c -> a c, a c'
+    op = F.Min(IRTensor([2, 3, 4]), IRTensor([4]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c, c -> a b c'
+    op = F.Min(IRTensor([2, 3, 4]), IRObject(value=2, is_constant=False), True)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b 1, a b 1'
+    op = F.Min(IRTensor([2, 3, 4]), 2,IRObject(value=True, is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b 1, a b 1'
+    op = F.Min(IRTensor([2, 3, 4]), 2,IRObject(value=False, is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b, a b'
+    op = F.Min(IRTensor([2, 3, 4]), IRObject(value=2, is_constant=False),IRObject(value=True, is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b 1, a b 1'
+    op = F.Min(IRTensor([2, 3, 4]), IRObject(value=2, is_constant=False),IRObject(value=None, is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b, a b'
+    op = F.Min(IRTensor([2, 3, 4]), IRObject(value=2, is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b, a b'
+    op = F.Min(IRTensor([2, 3, 4]), IRObject(value=2, is_constant=False),IRObject(value=IRObject(value=True), is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b 1, a b 1'
+
+
+def test_FullLike():
+    op = F.FullLike(IRTensor([2, 1, 4, 1]), 1.)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c d -> a b c d'
+    op_int = F.FullLike(IRTensor([3, 2]), 5)
+    assert len(op_int._annos_candidates) == 1 and op_int._annos_candidates[0] == 'a b -> a b'  
+    op_true = F.FullLike(IRTensor([2, 2]), 1., requires_grad=True)
+    assert len(op_true._annos_candidates) == 1 and op_true._annos_candidates[0] == 'a b -> a b'     
+    op_float = F.FullLike(IRTensor([1, 2],dtype=int), 1, dtype=torch.float)
+    assert len(op_float._annos_candidates) == 1 and op_float._annos_candidates[0] == 'a b -> a b'
+
+
+def test_Log():
+    result = F.Log(2)
+    assert result == math.log(2)
+    input_tensor = torch.rand(1, 2, 3)
+    op = F.Log(input_tensor)
+    assert torch.allclose(op, torch.log(input_tensor)) and op.shape == (1, 2, 3)
+    op = F.Log(IRTensor([1,2,3]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c -> a b c'
+    op = F.Log(IRObject(value=6, is_constant=False), signature='math.log')
+    assert op.outputs()[0].value == math.log(6) and not op.outputs()[0].is_constant
