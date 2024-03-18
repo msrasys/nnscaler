@@ -277,6 +277,23 @@ class CubeModule(torch.nn.Module):
         return full_model_state_dict
 
     @staticmethod
+    def get_origin_parameter_names(fullmaps: List[Dict[str, AttrMeta]]):
+        """
+        Get a list of original parameter names from the fullmaps.
+        `merge_partial_states` will use this list to build the parameter order
+        """
+        origin_parameter_names: List[str] = []
+        for local_fullmap in fullmaps:
+            for _, meta in local_fullmap.items():
+                if not meta.is_param: continue
+                # shared parameters in CubeModule is already de-duplicated. So in the
+                # local model state, we will not have multiple parameters sharing with same content
+                # but in different names.
+                if meta.orig_name not in origin_parameter_names:
+                    origin_parameter_names.append(meta.orig_name)
+        return origin_parameter_names
+
+    @staticmethod
     def merge_partial_states(state_dicts: List,
                              zero_idx_maps=None):
         """Merge model and optimizer states from different shard into a single-model state.
@@ -412,15 +429,7 @@ class CubeModule(torch.nn.Module):
         # both parameters and buffers, we need to remove the buffers from the list.
         # More details refer to the implementation:
         # https://pytorch.org/docs/stable/_modules/torch/nn/modules/module.html#Module._save_to_state_dict
-        origin_parameter_names: List[str] = []
-        for local_fullmap in fullmaps:
-            for _, meta in local_fullmap.items():
-                if not meta.is_param: continue
-                # shared parameters in CubeModule is already de-duplicated. So in the
-                # local model state, we will not have multiple parameters sharing with same content
-                # but in different names.
-                if meta.orig_name not in origin_parameter_names:
-                    origin_parameter_names.append(meta.orig_name)
+        origin_parameter_names: List[str] = CubeModule.get_origin_parameter_names(fullmaps)
 
         # handle 'state' in optimizer state dict
         # NOTE: each rank may have its local optimizer state working on a sub-set
@@ -498,9 +507,9 @@ class CubeModule(torch.nn.Module):
 
 @dataclass
 class OriginModuleMetadata:
-    origin_state_dict_names: List[str]
-    origin_param_names: List[str]
-    origin_shared_param_names: List[Set[str]]
+    origin_state_dict_names: List[str]       # used for merging module state dict
+    origin_param_names: List[str]            # used for merging optimizer state dict
+    origin_shared_param_names: List[List[str]]# used for merging module state dict
 
 
 @dataclass
@@ -803,6 +812,8 @@ class ParallelModule(CubeModule):
 
             for orig_param_name in orig_param_names:
                 orig_param_name_with_prefix = prefix + orig_param_name
+                if orig_param_name_with_prefix not in state_dict:
+                    continue
                 param_value = state_dict[orig_param_name_with_prefix]
                 tid = origname_tid_map[orig_param_name]
                 for attr, slicer, nchunks in tid_info[tid]:

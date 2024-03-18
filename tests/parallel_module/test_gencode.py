@@ -212,7 +212,7 @@ def _gencode_contains(cubesave_dir, module_class, index, search_re):
     outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
     filecontent = (outdir /f'gencode{index}.py').read_text()
     matches = re.findall(search_re, filecontent)
-    return bool(matches)
+    return matches
 
 class AttrHelper:
     def __init__(self) -> None:
@@ -514,12 +514,10 @@ def _gencode_min_function_worker(tempdir):
     assert torch.equal(m_new(torch.tensor([-5, -2, -3]), torch.tensor([-1, -8, -1])), torch.tensor([-5, -8, -3])), "Expected element-wise min with negative values"
 
 
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_codegen_min():
     with tempfile.TemporaryDirectory() as tempdir:
         launch_torchrun(1, _gencode_min_function_worker, tempdir)
-
 
 
 class MaxModule(torch.nn.Module):
@@ -536,8 +534,8 @@ def _gencode_max_function(tempdir):
         {
             'a': torch.tensor([[1, 2, 3], [4, 5, 6]]),
         },
-        PASData,  
-        ComputeConfig(1, 1), 
+        PASData,
+        ComputeConfig(1, 1),
         cube_savedir=tempdir,
         load_module=True
     )
@@ -551,7 +549,78 @@ def _gencode_max_function(tempdir):
     actual_output = m_new(torch.tensor([[1, 2, 3], [4, 5, 6]]))
     assert torch.equal(actual_output, expected_output), "Expected each row's max value with original dimension"
 
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of GPU devices')
 def test_codegen_max():
     with tempfile.TemporaryDirectory() as tempdir:
         launch_torchrun(1, _gencode_max_function, tempdir)
+
+
+class SharedParameterModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(3, 3)
+        self.linear2 = torch.nn.Linear(3, 3)
+        self.linear2.weight = self.linear1.weight  # shared parameter
+
+    def forward(self, x):
+        return self.linear2(self.linear1(x))
+
+
+@replace_all_device_with('cpu')
+def test_codegen_shared_parameter():
+    with tempfile.TemporaryDirectory() as tempdir:
+        m = SharedParameterModule()
+        m.train()
+        parallelize(
+            m,
+            {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+            PASData,
+            ComputeConfig(1, 1),
+            cube_savedir=tempdir,
+            load_module=False,
+            reuse='override',
+        )
+        assert _gencode_contains(tempdir, SharedParameterModule, 0, r"self\.register_parameter\('linear1_bias_*")
+        assert _gencode_contains(tempdir, SharedParameterModule, 0, r"self\.register_parameter\('linear2_bias_*")
+        assert _gencode_contains(tempdir, SharedParameterModule, 0, r"self\.register_parameter\('linear1_weight_*")
+        # linear2_weight shares the same parameter with linear1_weight
+        # so there will be no linear2_weight in the generated code
+        assert not _gencode_contains(tempdir, SharedParameterModule, 0, r"self\.register_parameter\('linear2_weight_*")
+
+
+class BufferModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('buffer', torch.ones(128, 64), persistent=False)
+        self.fc = torch.nn.Linear(64, 64)
+
+    # x with shape [128, 64]
+    def forward(self, x):
+        return self.fc(x + self.buffer)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_buffer():
+    """
+    Test even the buffer is not persistent,
+    it will be registered in the generated code as a persistent buffer.
+    """
+    with tempfile.TemporaryDirectory() as tempdir:
+        m = BufferModule()
+        m.train()
+        parallelize(
+            m,
+            {'x': torch.randn(128, 64)},
+            PASData,
+            ComputeConfig(1, 1),
+            cube_savedir=tempdir,
+            load_module=False,
+            reuse='override',
+        )
+        matches =  _gencode_contains(tempdir, BufferModule, 0,
+            r"self\.register_buffer\('buffer_*"
+        )
+        assert len(matches) == 1
+        match = matches[0]
+        assert 'persistent' not in match

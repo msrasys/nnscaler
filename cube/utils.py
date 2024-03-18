@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Tuple, Callable, List, Set
+from typing import Optional, Tuple, Callable, List, Set, Any
 import logging
 from pathlib import Path
 import sys
@@ -81,10 +81,13 @@ def load_eval_schedule(filename: Optional[str] = None):
     return module._infer_step
 
 
-def get_param_by_name(model: torch.nn.Module, name: str) -> torch.nn.Parameter:
+def get_member_by_name(model: torch.nn.Module, name: str) -> Any:
     """
-    Get the parameter of the model by its full name.
+    Get the member of the model by its full name.
+    if name is empty, return the model itself.
     """
+    if not name:
+        return model
     sliced_names = name.split(".")
     model_attr = model
     for sliced_name in sliced_names:
@@ -92,13 +95,13 @@ def get_param_by_name(model: torch.nn.Module, name: str) -> torch.nn.Parameter:
     return model_attr
 
 
-def get_shared_params(model: torch.nn.Module) -> List[Set[str]]:
+def get_shared_params(model: torch.nn.Module) -> List[List[str]]:
     paramid2name = defaultdict(set)
     for name in model.state_dict().keys():
-        param = get_param_by_name(model, name)
+        param = get_member_by_name(model, name)
         paramid = id(param)
         paramid2name[paramid].add(name)
-    return [names for _, names in paramid2name.items() if len(names) > 1]
+    return [list(names) for _, names in paramid2name.items() if len(names) > 1]
 
 
 class accum_mode:

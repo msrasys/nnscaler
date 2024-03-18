@@ -323,6 +323,54 @@ optimizer.register_reducer_post_hook(lambda reducer, grad: grad.mul_(num_scale_u
 
 5. `_non_parallel_module_reducer`: The reducer for the modules which are not parallelized. It is used to sync the parameters in those modules across units.
 
+### Checkpoint support
+
+You can save/load the checkpoints for parallel modules.
+Each rank will save/load its own checkpoint just like the normal module.
+
+You can also merge the checkpoints from different ranks to a single checkpoint.
+We call it a merged checkpoint. The merged checkpoint can be loaded by original module directly.
+So you can easily share the checkpoint with the original module.
+
+
+We provide two functions to help you save/load the merged checkpoint for the parallel module.
+
+#### `merge_state_dicts`
+```python
+def merge_state_dicts(
+    module_state_dicts: List[Dict[str, Any]],
+    optimizer_state_dicts: Optional[List[Dict[str, Any]]],
+) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
+```
+
+Merge a list of shard state dicts (one for each rank) to a single full state dict
+Note: Only Adam-like optimizers are supported for merging
+
+Please Note:
+    We don't garantee the devices of tensors are the same in the merged state dict.
+    You can assume the device of the tensors in the merged state dict can be one of the following:
+        1. the current device when running this function
+        2. the current cuda device when running this function
+        3. the device of the tensor in the original state dict
+    When you load the state dict from file, you can just use `torch.load(..., map_location='...')` to unify the device of the tensors.
+
+
+#### `load_merged_state_dicts`
+```python
+def load_merged_state_dicts(
+        module: torch.nn.Module,
+        module_state_dict: Dict[str, Any],
+        optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
+        optimizer_state_dict: Optional[Dict[str, Any]] = None,
+        *,
+        device: Union[str, torch.device] = None
+) -> None:
+```
+Load the merged state dicts to the module, and optionally the optimizer to a specified device.
+
+Please note the `device` parameter. If it is None, we will use `torch.cuda.current_device()` to get the current device. If you want to load the state dict to a specific device, you can set it to the device you want.
+
+
 ### Dataset
 
 We use the same dataset/dataloader as pytorch. For example, you can use `torch.utils.data.DistributedSampler` to create a distributed sampler.

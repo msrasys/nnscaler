@@ -145,9 +145,13 @@ class Bucket:
             opt = self._contiguous_params[:self._numel]
         else:
             rank = torch.distributed.get_rank(group=self._zero_subgroup)
+            assert len(self._contiguous_params) % self._zgroup_sz == 0
+            # Note:
+            #  There may be paddings both in the middle and at the end of the contiguous buffer
+            #  When there are paddings in the middle or end of the contiguous buffer,
+            #  the calculation of gnorm is not affected as long as the paddings are all 0.
+            #   So for now, it looks harmless.
             opt = self._contiguous_params.chunk(self._zgroup_sz)[rank]
-            if rank == self._zgroup_sz - 1 and self._padding != 0:
-                opt = opt[:-self._padding]
         self._param_for_optimizer = torch.nn.Parameter(opt)
 
     def register_hooks(self):
@@ -246,8 +250,6 @@ class Bucket:
         if self._zero:
             rank = torch.distributed.get_rank(group=self._zero_subgroup)
             grad = self._contiguous_grads.chunk(self._zgroup_sz, dim=0)[rank]
-            if rank == self._zgroup_sz - 1 and self._padding != 0:
-                grad = grad[:-self._padding]
             self._param_for_optimizer.grad = grad
         else:
             self._param_for_optimizer.grad = self._contiguous_grads[:self._numel]
@@ -559,6 +561,14 @@ class Reducer:
     def parameters_for_optimizer(self) -> List[torch.nn.Parameter]:
         """
         Get parameters for optimizers
+        Please note for ZeRO optimization,
+        the returned parameters are not the same as the original parameters,
+        and can have paddings (with value 0.0) both at the end and in the middle of paramters data.
+
+        the calculation of gnorm is not affected as paddings are all 0.
+
+        Returns:
+            List[torch.nn.Parameter]: parameters for optimizer
         """
         params = []
         for bucket in self._buckets:

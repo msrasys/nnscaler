@@ -11,7 +11,7 @@ def launch_torchrun(nproc_per_node, worker_fn, *args, **kwargs):
         max_nodes=1,
         nproc_per_node=nproc_per_node,
         rdzv_backend = "c10d",
-        rdzv_endpoint = "localhost:29400",
+        rdzv_endpoint = "localhost:29401",
         run_id = str(uuid.uuid4()),
         monitor_interval=0.1,
         max_restarts=0,

@@ -20,6 +20,7 @@ from cube.runtime.gnorm import calcuate_gnorm
 
 from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
+from ..utils import replace_all_device_with
 
 
 class FcRelu(nn.Module):
@@ -38,6 +39,9 @@ class FcRelu(nn.Module):
 class FcRelu_4_4(FcRelu):
     def __init__(self):
         super().__init__(4, 4)
+        self.register_buffer('buffer', torch.ones(1, 4))
+    def forward(self, x):
+        return super().forward(x + self.buffer)
 
 
 def _to_cube_model(module, pas, compute_config, cube_savedir, instance_name):
@@ -72,7 +76,7 @@ def _create_cube_module(pas, compute_config, cube_savedir, module_type='whole'):
                 x = self.sigmoid(x)
                 return x
         CompiledModule = _to_cube_model(CompiledModule, pas, compute_config, cube_savedir, 'whole')
-    else:
+    elif module_type == 'sub':
         class CompiledModule(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -88,6 +92,54 @@ def _create_cube_module(pas, compute_config, cube_savedir, module_type='whole'):
                 x = self.linear2(x)
                 x = self.fc_relu2(x)
                 x = self.linear3(x)
+                x = self.sigmoid(x)
+                return x
+    elif module_type == 'start':
+        class CompiledModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = _to_cube_model(CubeLinear(4, 4, bias=True),
+                    pas, compute_config, cube_savedir, f'start_linear1'
+                )
+                self.linear2 = CubeLinear(4, 1, bias=True)
+                self.sigmoid = nn.Sigmoid()
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                x = self.sigmoid(x)
+                return x
+    elif module_type == 'end':
+        # parallel module as the last module
+        class CompiledModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = CubeLinear(4, 4, bias=True)
+                self.linear2 = _to_cube_model(CubeLinear(4, 4, bias=True),
+                    pas, compute_config, cube_savedir, f'end_linear2'
+                )
+                self.sigmoid = nn.Sigmoid()
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                x = torch.sum(x, dim=1, keepdim=True)
+                x = self.sigmoid(x)
+                return x
+    elif module_type == 'small':
+        # num of parameter elements is small
+        class CompiledModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = CubeLinear(4, 4, bias=True)
+                self.linear2 = _to_cube_model(CubeLinear(4, 1, bias=True),
+                    pas, compute_config, cube_savedir, f'small_linear2'
+                )
+                # the following tests depend on the rngstate in PASRandomSPMD
+                assert len(self.linear2.reducers) == 1
+                assert len(self.linear2.reducers[0].ranks) == 4
+                self.sigmoid = nn.Sigmoid()
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.linear2(x)
                 x = self.sigmoid(x)
                 return x
     init_random()
@@ -134,20 +186,33 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir):
         assert ckpt_start_merged_file.exists()
         merged_ckpt_dict = torch.load(ckpt_start_merged_file)
         merged_model_state_dict = merged_ckpt_dict['model']
-        model_from_merged = load_merged_state_dicts(type(model)(), merged_model_state_dict)
+        merged_opt_state_dict = merged_ckpt_dict['optimizer']
+        model_from_merged = type(model)()
+        optimizer_from_merged = build_optimizer(model_from_merged, torch.optim.Adam, lr=0.01)
+        load_merged_state_dicts(
+            model_from_merged, merged_model_state_dict,
+            optimizer_from_merged, merged_opt_state_dict,
+        )
 
         # check merged model
         result_orig_model_state_dict = model.state_dict()
         result_merged_model_state_dict = model_from_merged.state_dict()
         assert set(result_orig_model_state_dict.keys()) == set(result_merged_model_state_dict.keys())
-        for k in result_orig_model_state_dict.keys():
-            if k.endswith('CUBE_EXTRA_STATE'):
+        for index in result_orig_model_state_dict.keys():
+            if index.endswith('CUBE_EXTRA_STATE'):
                 continue
-            assert torch.equal(result_orig_model_state_dict[k], result_merged_model_state_dict[k])
+            assert torch.equal(result_orig_model_state_dict[index], result_merged_model_state_dict[index])
 
-        # TODO: check merged optimizer
-        # merged_optimizer_state_dict = merged_ckpt_dict['optimizer']
-
+        result_orig_opt_state_dict = optimizer.state_dict()
+        result_merged_opt_state_dict = optimizer_from_merged.state_dict()
+        assert set(result_orig_opt_state_dict.keys()) == set(result_merged_opt_state_dict.keys())
+        assert result_orig_opt_state_dict['CUBE_EXTRA_STATE'] == result_merged_opt_state_dict['CUBE_EXTRA_STATE']
+        assert result_orig_opt_state_dict['param_groups'] == result_merged_opt_state_dict['param_groups']
+        assert set(result_orig_opt_state_dict['state']) == set(result_merged_opt_state_dict['state'])
+        for index in result_orig_opt_state_dict['state']:
+            for key in ('step', 'exp_avg', 'exp_avg_sq'):
+                assert torch.equal(result_orig_opt_state_dict['state'][index][key], result_merged_opt_state_dict['state'][index][key])
+    torch.distributed.barrier()
     data = []
     init_random()
     for _ in range(DATA_SIZE):
@@ -186,8 +251,9 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir):
             assert f'{prefix}CUBE_EXTRA_STATE' in model_state_dict
             extra_state1 = ExtraState(**model_state_dict[f'{prefix}CUBE_EXTRA_STATE'])
             assert extra_state1.compute_config
-            assert extra_state1.model_idx2opt_idx
-            assert extra_state1.opt_idx2ranks
+            if extra_state1.compute_config.use_zero:
+                assert extra_state1.model_idx2opt_idx
+                assert extra_state1.opt_idx2ranks
             assert extra_state1.origin_param_names
     optimizer_state_dict = optimizer.state_dict()
     assert 'CUBE_EXTRA_STATE' in optimizer_state_dict
@@ -206,10 +272,11 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir):
             'model': merged_model_state_dicts,
             'optimizer': merged_optimizer_state_dict
         }, ckpt_merged_file)
+    torch.distributed.barrier()
     return results
 
 
-def _gpu_worker(module_type, pas, plan_ngpus, runtime_ngpus, per_resume_update_count, resume_count):
+def _gpu_worker(module_type, use_zero, pas, plan_ngpus, runtime_ngpus, per_resume_update_count, resume_count, check_module=None):
     init_distributed()
     compiled_results = []
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt') as tempdir:
@@ -217,10 +284,12 @@ def _gpu_worker(module_type, pas, plan_ngpus, runtime_ngpus, per_resume_update_c
             start = i * per_resume_update_count
             end = (i + 1) * per_resume_update_count
             compiled_module = _create_cube_module(pas,
-                ComputeConfig(plan_ngpus, runtime_ngpus, use_zero=True),
+                ComputeConfig(plan_ngpus, runtime_ngpus, use_zero=use_zero),
                 tempdir,
                 module_type,
             )
+            if check_module:
+                check_module(compiled_module)
             compiled_results.extend(_train(
                 compiled_module,
                 runtime_ngpus // plan_ngpus,
@@ -230,10 +299,13 @@ def _gpu_worker(module_type, pas, plan_ngpus, runtime_ngpus, per_resume_update_c
         return compiled_results
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-@pytest.mark.parametrize('module_type', ['sub', 'whole'])
-def test_checkpoint(module_type):
-    cube_results = launch_torchrun(4, _gpu_worker, module_type, PASRandomSPMD, 2, 4, 32, 1)
-    rcube_results = launch_torchrun(4, _gpu_worker, module_type, PASRandomSPMD, 2, 4, 16, 2)
+@pytest.mark.parametrize('module_type', ['sub', 'whole', 'start', 'end', 'small'])
+@pytest.mark.parametrize('use_zero', [True, False])
+def test_checkpoint(module_type, use_zero):
+    plan_ngpus = 2
+    runtime_ngpus = 4
+    cube_results = launch_torchrun(4, _gpu_worker, module_type, use_zero, PASRandomSPMD, plan_ngpus, runtime_ngpus, 32, 1)
+    rcube_results = launch_torchrun(4, _gpu_worker, module_type, use_zero, PASRandomSPMD, plan_ngpus, runtime_ngpus, 16, 2)
 
     results0, results1,  results2, results3 = cube_results[0], cube_results[1], cube_results[2], cube_results[3]
     rresults0, rresults1,  rresults2, rresults3 = rcube_results[0], rcube_results[1], rcube_results[2], rcube_results[3]
@@ -256,6 +328,53 @@ def test_checkpoint(module_type):
                    (rresults0, rresults2), (rresults1, rresults3),
                    (results0, rresults0), (results1, rresults1)
         ]:
+        # in the same shard, grads and weights are the same
+        assert len(r0) == len(r1)
+        for i in range(len(r0)):
+            a, b = r0[i], r1[i]
+            assert torch.equal(a.gnorm, b.gnorm)  # gnorm
+            for k in a.grads.keys(): # grad
+                assert torch.equal(a.grads[k], b.grads[k])
+            for k in a.weights.keys():  # weights
+                assert torch.equal(a.weights[k], b.weights[k])
+
+
+def assert_intra_reducer(module: ParallelModule):
+    assert module.get_compute_config().plan_ngpus == module.get_compute_config().runtime_ngpus
+    assert len(module.reducers) > 0
+    # so we have both parameters in reducers and not in reducers
+    # (assume one reducer gives one bucket, which is true in general.)
+    assert len(module.parameters_for_optimizer()) > len(module.reducers)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+@pytest.mark.parametrize('module_type', ['whole'])
+@pytest.mark.parametrize('use_zero', [True, False])
+def test_checkpoint_intra_reducer(module_type, use_zero):
+    """
+    Test when:
+    Some of the parameters will be added to reducers,
+    but some of the parameters are not.
+    """
+    plan_ngpus = 2
+    runtime_ngpus = 2
+    cube_results = launch_torchrun(2, _gpu_worker, module_type, use_zero, PASRandomSPMD, plan_ngpus, runtime_ngpus, 32, 1, assert_intra_reducer)
+    rcube_results = launch_torchrun(2, _gpu_worker, module_type, use_zero, PASRandomSPMD, plan_ngpus, runtime_ngpus, 16, 2, assert_intra_reducer)
+    results0 = cube_results[0]
+    rresults0 = rcube_results[0]
+
+    # pred, loss
+    for r0, r1 in [(results0, rresults0)]:
+        # have the same input
+        assert len(r0) == len(r1)  # iteration count
+        for i in range(len(r0)):
+            a, b = r0[i], r1[i]
+            assert torch.equal(a.pred, b.pred)  # pred
+            assert torch.equal(a.loss, b.loss)  # loss
+            assert torch.equal(a.gnorm, b.gnorm)  # gnorm
+
+    # grad, weights
+    for r0, r1 in [(results0, rresults0)]:
         # in the same shard, grads and weights are the same
         assert len(r0) == len(r1)
         for i in range(len(r0)):
