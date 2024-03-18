@@ -8,6 +8,7 @@ from functools import partial
 import cube.graph.function as F
 from cube.graph.function.dimops import IRDimops
 from cube.ir.tensor import IRFullTensor
+from cube.ir.cten import IRObject
 
 
 def create_op(creator: Callable,
@@ -36,11 +37,21 @@ test_view2 = partial(partitionable,
     idx=0, dim=1, num=2,          
 )
 
-def create_udf_op1(input, weight, signature='test_udf_op1'):
+def UDFOp1(input, weight, signature='test_udf_op1'):
     anno = 'L 8^ (L 2), L E -> 8^ (L 2) E '
-    return IRDimops(create_udf_op1, 'udf_op1', signature, [anno], [input, weight])
+    return IRDimops(UDFOp1, 'udf_op1', signature, [anno], [input, weight])
 
 test_multi_dim_partition = partial(partitionable,
-    create_op(create_udf_op1, [(2048, 8, 4096), (2048, 4096)]),
+    create_op(UDFOp1, [(2048, 8, 4096), (2048, 4096)]),
     idx=0, dim=0, num=2,
 )
+
+
+def test_no_return_op():
+
+    def NoReturnOp(input, weight, signature='no_return_op'):
+        anno = 'a b, b c -> ?'
+        return IRDimops(NoReturnOp, 'no_return_op', signature, [anno], [input, weight])
+    
+    op = create_op(NoReturnOp, [(1024, 512), (512, 1024)])
+    assert len(op.outputs()) == 1 and isinstance(op.output(0), IRObject) and (not isinstance(op.output(0), IRFullTensor))

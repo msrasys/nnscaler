@@ -18,7 +18,7 @@ An `identifier` must be one of:
 
 Special identifier:
   1) '*': this special identifier indicates the dimension is dynamic, which will automatically get expanded given the shape
-  2) '?': this special identifier indicates the value is not a tensor, which will be ignored
+  2) '?': this special identifier indicates the value is can only be replicated, no matter it is a tensor or a non-tensor.
 
 A `reduction` can be a set of {'', '+', '^'}:
   '' indicates this dimension can be partitioned, and each output should have this dimension.
@@ -631,6 +631,11 @@ class IRDimops(IRFwOperation):
 
         n_outputs = len(self._oannos)
         super().__init__(name, signature, inputs, n_outputs, **kwargs)
+
+        # change tensor to IRObject for '?' annotation
+        for idx, shape_anno in enumerate(self._oannos):
+            if shape_anno.ignore:
+                self.set_output(idx, IRObject())
 
     @property
     def anno(self) -> OpAnno:

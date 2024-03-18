@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Any, List, Tuple, Callable, Union, Dict, Type, Optional
 
 from cube.ir.operator import IRFwOperation
-from cube.ir.tensor import IRFullTensor, IRTensor
-from cube.ir.cten import IRObject, IRCell
+from cube.ir.tensor import IRFullTensor
+from cube.ir.cten import IRObject, IRCell, IRTensor
 from cube.graph.parser.frame import Frame
 from cube.graph.parser.fx.mapping import SignFx2Op
 from cube.graph.function.pyfunc import IRPyFunc
@@ -247,10 +247,11 @@ class FxModuleParser:
                 output_val = frame.get_var(node.name)
                 if isinstance(ir_node, IRDimops):
                     ir_node.infer_shape()
-                    assert output_val.shape == ir_node.output(0).shape, (
-                        f'find shape inference not match: {output_val.shape} vs {ir_node.output(0).shape}'
-                        f'\nnode: {node}'
-                    )
+                    if isinstance(output_val, IRTensor) and isinstance(ir_node.output(0), IRTensor):
+                        assert output_val.shape == ir_node.output(0).shape, (
+                            f'find shape inference not match: {output_val.shape} vs {ir_node.output(0).shape}'
+                            f'\nnode: {node}'
+                        )
                 ir_node.set_output(0, output_val)
         else:
             frame.set_var(node.name, ir_node)
