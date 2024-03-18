@@ -10,6 +10,7 @@ from dataclasses import dataclass, asdict
 from contextlib import contextmanager
 import logging
 import copy
+import os
 
 import torch
 from cube.graph.parser.fx.parser import FxModuleParser
@@ -209,18 +210,64 @@ class ReuseType(Enum):
     GRAPH = 'graph'        # reuse graph only if present and match, generate otherwise.
 
 
+class BroadcastGenFilesStrategy(Enum):
+    """
+    The broadcast strategy for generated files.
+    Only new generated files can be broadcasted.
+    The files includes:
+    1. config file: compute config (compute_config.pt)
+    2. trace files: graph dump (graph.ckp), forward args dump(forward_args.pkl),
+            origin module metadata (origin_module_metadata.pt), init weights file(fullmodel.pt.*),
+            param name mapping (dist_param_map.pt)
+    3. code: generated code files (gencode*.py)
+    Reused files will not be broadcasted with any of the following options.
+    """
+
+    # nothing will be broadcasted.
+    # You need to do it by yourself or the generated files are saved in a shared directory (like azure blob).
+    NONE = 'none'
+
+    # broadcast all new generated files to all nodes.
+    # This is useful when you want to run the same code on all nodes.
+    # please note the init weight files can be huge.
+    ALL = 'all'
+
+    # broadcast all new generated files except init weights (fullmodel.pt.*).
+    # Without weights,
+    # you can only construct the parallel module with `init_params=False`.
+    # You can then
+    # 1. Load the weights from a checkpoint file with `module.load_state_dict` or `load_merged_state_dict`
+    # 2. Or you can use `ParallelModule.broadcast_weights` to get the weights from the workers in node0.
+    #    (local world size should be bigger than plan_ngpus)
+    NO_WEIGHTS = 'no_weights'
+
+    # broadcast the new generated code only (gencode*.py)
+    # It's your responsibility to make sure other necessary files are available on all nodes.
+    CODE = 'code'
+
+
+class RegenStatus(Enum):
+    NONE = 'none'   # nothing is regenerated.
+    ALL = 'all'     # everything is regenerated, including graph and code
+    CODE = 'code'   # only code is regenerated.
+
+
 def _prepare_namespace(
         cube_savedir: str,
         module_or_module_class: Union[Type[torch.nn.Module], torch.nn.Module],
         instance_name: Optional[str] = None,
-):
+) -> Tuple[str, Path]:
     cube_savedir = _add_cube_savedir_to_syspath(cube_savedir)
 
     instance_name = instance_name or _DEFAULT_INSTANCE_NAME
     instance_name = instance_name.strip('.') if instance_name else ''
     instance_namespace = f'.{instance_name}' if instance_name else ''
     namespace = f'{_CUBE_MODULE_NAMESPACE}.{_get_full_qualified_name(module_or_module_class)}{instance_namespace}'
-    return namespace
+
+    outdir = cube_savedir / Path(namespace.replace('.', '/').strip('/'))
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    return namespace, outdir
 
 
 def _prepare_and_check_reusable(
@@ -247,9 +294,7 @@ def _prepare_and_check_reusable(
         RuntimeError: if the existing code is not reusable,
             will raise RuntimeError if the code is not reusable but the module is already loaded.
     """
-    namespace = _prepare_namespace(cube_savedir, module_or_module_class, instance_name)
-    outdir = cube_savedir / Path(namespace.replace('.', '/').strip('/'))
-    outdir.mkdir(parents=True, exist_ok=True)
+    namespace, outdir = _prepare_namespace(cube_savedir, module_or_module_class, instance_name)
 
     # decision matrix for code generation
     # reuse flag | dir condition(imported, empty, match, unmatched) | action
@@ -287,7 +332,7 @@ def _prepare_and_check_reusable(
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
         existing_output_files = [
             f for f in outdir.glob('*')
-            if f.is_file() and (  # just take fullmap.pt.0 to compare
+            if f.is_file() and (  # just take fullmodel.pt.0 to compare
                 not f.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
                 or f.name == FxModuleParser.ATTR_CONTENT_FILE_0
             )
@@ -364,7 +409,7 @@ def _gen_graph(
     )
 
     # generate dummy inputs for logic graph
-    # that is, generate IRObject/IRFullTensor for fx graph dummpy input
+    # that is, generate IRObject/IRFullTensor for fx graph dummy input
     fx_input_nodes = [node for node in fx_graph.graph.nodes if node.op == 'placeholder']
     # the inputs of graph is different with original forward args
     # so we get the real forward args from fx inputs
@@ -423,7 +468,7 @@ def _gencode(
         *,
         module_dtype:  Optional[torch.dtype] = None,
         module_fn: Optional[Callable[[], torch.nn.Module]] = None,
-    ) -> None:
+    ) -> RegenStatus:
     """
     Generate cube module source code from a torch module, and save it to file.
     Generated module will be save according to its full qualified name.
@@ -444,13 +489,15 @@ def _gencode(
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
 
     Returns:
-        None
+        RegenStatus: which part is regenerated.
     """
     graph_ckp = outdir / _GRAPH_DUMP_FILE
     forward_args_ckp = outdir / _FORWARD_ARGS_DUMP_FILE
     origin_module_metadata_ckp = outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE
+    ret = RegenStatus.NONE
     if not graph_ckp.exists() or not forward_args_ckp.exists() or not origin_module_metadata_ckp.exists():
         is_module_class = inspect.isclass(module_or_module_class)
+        ret = RegenStatus.ALL
         if is_module_class:
             try:
                 if module_fn is None:
@@ -488,6 +535,7 @@ def _gencode(
         if is_module_class:
             del module
     else:
+        ret = RegenStatus.CODE
         logger.info(f"Reuse graph dump in {outdir}")
         graph = IRGraph.load(graph_ckp)
         forward_args = torch.load(forward_args_ckp)
@@ -534,6 +582,8 @@ def _gencode(
             as_parallel_module=True,
         )
 
+    return ret
+
 
 def _load_cube_module_class(
     module_class: Type[torch.nn.Module],
@@ -556,7 +606,7 @@ def _load_cube_module_class(
             when you need to load the generated module in a non-torchrun environment.
     """
     rank = torch.distributed.get_rank() if rank is None else rank
-    namespace = _prepare_namespace(cube_savedir, module_class, instance_name)
+    namespace, _ = _prepare_namespace(cube_savedir, module_class, instance_name)
     gen_imported = importlib.import_module(
         f'{namespace}.{Path(_GENCODE_FILE_TEMPLATE.format(rank)).stem}'
     )
@@ -582,19 +632,20 @@ def parallelize(
     module_dtype:  Optional[torch.dtype] = None,
     module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     init_module_params: bool = True,
+    broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
     """
     Convert a torch.nn.Module object or class to CubeModule object or class.
 
     If you want to save multiple instances of the same module,
-    you can specify the instance_name to distingish them.
+    you can specify the instance_name to distinguish them.
 
     Currently you must use a shared file system to share the generated files (like mounted Azure Blob)
     Or you can unset load_module flag, and manually copy the generated files to other nodes.
     After all nodes have the generated files, you can call parallelize() again with load_module flag set.
 
     Note: if reuse is not set to ReuseType.MATCH,
-    the generated code in outdir will be removed EVEN IF the code generetion fails in this call.
+    the generated code in outdir will be removed EVEN IF the code generation fails in this call.
 
     if the input is a module object.
         The module object will be copied to cpu to handle possible insufficient gpu memory.
@@ -614,7 +665,7 @@ def parallelize(
     2. If the input is a module class, it will return a CubeModule class if load_module is True.
         a. module_fn is used to create the module object, or module's__init__ if not prent.
         b. module_dtype is used to control the dtype of the created module (by constructor or module_fn).
-            Of cousre, it can be merged into module_fn.
+            Of course, it can be merged into module_fn.
         c. init_module_params is ignored.
 
     After the module is converted, you can use it to create module object by calling it like a module class.
@@ -627,7 +678,7 @@ def parallelize(
         ...
     ```
     So you can use `init_params` in `__init__` to control whether to initialize the module parameters.
-    For example, if you don't want to intialize module params:
+    For example, if you don't want to initialize module params:
     ```
     module = GenModule(init_params=False)
         ```
@@ -647,7 +698,9 @@ def parallelize(
             so it is only used when module_or_module_class is a module object, and load_module is true.
         module_dtype (Optional[torch.dtype]): the dtype of the module. Keep the module as it is if it is None.
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
-
+        broadcast_strategy (Union[str, BroadcastGenFilesStrategy]): the broadcast strategy for generated files.
+            Please note that the broadcasting will only be done in torchrun environment,
+            and will throw an error if torch.distributed is not initialized and broadcast_strategy is not NONE.
     Returns:
         Union[CubeModule, Type[CubeModule], None]:
             if load_module flag is set, return the converted CubeModule object or class
@@ -662,6 +715,7 @@ def parallelize(
     is_module_class = inspect.isclass(module_or_module_class)
     module_class = module_or_module_class if is_module_class else module_or_module_class.__class__
     reuse = ReuseType(reuse) if isinstance(reuse, str) else reuse
+    broadcast_strategy = BroadcastGenFilesStrategy(broadcast_strategy) if isinstance(broadcast_strategy, str) else broadcast_strategy
 
     # genereate code only in node0
     # if it is not in a torchrun environment, just generate.
@@ -672,7 +726,7 @@ def parallelize(
             if not config_file.exists():
                 torch.save(compute_config, config_file)
             with _compile_flags(compute_config):
-                _gencode(
+                regen_status = _gencode(
                     module_or_module_class,
                     dummy_input,
                     pas_policy,
@@ -682,7 +736,46 @@ def parallelize(
                     module_fn=module_fn,
                 )
         else:
+            regen_status = RegenStatus.NONE
             logger.info(f"Reuse generated code in {outdir}")
+
+    if broadcast_strategy != BroadcastGenFilesStrategy.NONE:
+        if not torch.distributed.is_initialized(): # we only support loading in torchrun environment
+            raise RuntimeError("Broadcast generated files failed: torch.distributed is not initialized.")
+        torch.distributed.barrier()
+        # sync regen_status
+        curr_rank = torch.distributed.get_rank()
+        if curr_rank == 0:
+            sent_obj = [regen_status]
+        else:
+            sent_obj = [None]
+        torch.distributed.broadcast_object_list(
+            sent_obj,
+            src=0,
+        )
+        if curr_rank != 0:
+            regen_status = sent_obj[0]
+
+        # narrow down broadcast_strategy according to regen_status
+        if regen_status == RegenStatus.NONE:
+            # we don't need to broadcast anything
+            broadcast_strategy = BroadcastGenFilesStrategy.NONE
+        elif regen_status == RegenStatus.CODE:
+            # narrow ALL/NO_WEIGHTS down to code
+            broadcast_strategy = BroadcastGenFilesStrategy.CODE
+        else:
+            # we don't need to narrow broadcast_strategy in this case
+            # keep the original broadcast_strategy
+            assert regen_status == RegenStatus.ALL
+
+        # broadcast generated files according to regen_status
+        if broadcast_strategy != BroadcastGenFilesStrategy.NONE:
+            _broadcast_gen_files(
+                module_class,
+                cube_savedir=cube_savedir,
+                instance_name=instance_name,
+                broadcast_strategy=broadcast_strategy,
+            )
 
     if load_module:
         if not torch.distributed.is_initialized(): # we only support loading in torchrun environment
@@ -831,7 +924,7 @@ def build_optimizer(
         so we need to replace the parameters of optimizer with CubeModule.parameters_for_optimizer
         It is impossible to make this change transparent to end users.
     2. optimizer.step():
-        we need to call optimier.sync_shard_grad() to sync the gradients of the module before optimizer.step().
+        we need to call optimizer.sync_shard_grad() to sync the gradients of the module before optimizer.step().
         In zero mode, we have to call CubeModule.gather_params() after optimizer.step()
     3. optimizer.zero_grad():
         We need to call CubeModule.zero_grad() after optimizer.zero_grad()
@@ -905,7 +998,7 @@ def build_optimizer(
         for idx, (name, param) in enumerate(gen):
             if name.endswith(cube_suffix):  # is a parameter of ParallelModule
                 # -1 for removing the dot
-                # please note when the whole module is a ParallModule,
+                # please note when the whole module is a ParallelModule,
                 # the name will be empty after removing the suffix
                 name = name[:-len(cube_suffix) - 1]
                 if name not in opt_module_locs:
@@ -1574,3 +1667,89 @@ def _get_valid_name_from_merged_model(
                     return name
             break
     return None
+
+
+def _broadcast_gen_files(
+    module_class: Type[torch.nn.Module],
+    *,
+    cube_savedir: Union[str, Path] = './.cube',
+    instance_name: Optional[str] = None,
+    broadcast_strategy: Union[str, BroadcastGenFilesStrategy],
+):
+    """
+    Broadcast new generated files for a module to all nodes.
+
+    Args:
+        module_class (Type[torch.nn.Module]): the original torch module class
+        cube_savedir (Union[str, Path]): the directory to save generated code
+        instance_name (Optional[str]): the instance name of the generated module. If it is None, will use the default name.
+        broadcast_strategy (Union[str, BroadcastGenFilesStrategy]): the broadcast strategy for generated files.
+
+    Returns:
+        None
+    """
+
+    broadcast_strategy = BroadcastGenFilesStrategy(broadcast_strategy) if isinstance(broadcast_strategy, str) else broadcast_strategy
+    if broadcast_strategy == BroadcastGenFilesStrategy.NONE:
+        return
+
+    world_size = torch.distributed.get_world_size()
+    local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', default=1))
+    assert world_size % local_world_size == 0, "world_size should be a multiple of local_world_size"
+    nnode = world_size // local_world_size
+
+    if nnode == 1:
+        # no need to broadcast generated files
+        return
+
+    curr_rank = torch.distributed.get_rank()
+    ranks = list(range(0, world_size, local_world_size))
+    group = DeviceGroup().get_group(ranks)
+
+    # use the first rank of each node to broadcast
+    if  curr_rank % local_world_size == 0:
+        _, outdir = _prepare_namespace(cube_savedir, module_class, instance_name)
+        files: List[str] = []
+        # send file list
+        if curr_rank == 0:
+            for file in outdir.glob('*'):
+                if file.is_file() and (
+                    broadcast_strategy == BroadcastGenFilesStrategy.ALL or
+                    (
+                        broadcast_strategy == BroadcastGenFilesStrategy.NO_WEIGHTS
+                        and not file.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
+                    ) or
+                    (
+                        broadcast_strategy == BroadcastGenFilesStrategy.CODE
+                        and file.suffix  == '.py'
+                    )
+                ):
+                    files.append(file.name)
+            sent_obj = [files]
+        else:
+            sent_obj = [None]
+        torch.distributed.broadcast_object_list(
+            sent_obj,
+            src=0,
+            group=group,
+        )
+        # get file list
+        if curr_rank != 0:
+            files = sent_obj[0]
+
+        logging.info(f'File list broadcasted ({len(files)} in total).')
+        # send file content one by one
+        for fname in files:
+            if curr_rank == 0:
+                with open(outdir / fname, 'rb') as f:
+                    data = [f.read()]
+            else:
+                data = [None]
+            torch.distributed.broadcast_object_list(data, src=0, group=group)
+            if curr_rank != 0:
+                with open(outdir / fname, 'wb') as f:
+                    f.write(data[0])
+            logging.info(f'File {fname} broadcasted.')
+
+    # wait for all nodes to finish
+    torch.distributed.barrier()

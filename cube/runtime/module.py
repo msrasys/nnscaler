@@ -830,3 +830,41 @@ class ParallelModule(CubeModule):
                     raise RuntimeError(erro_msg)
                 else:
                     _logger.warning(erro_msg)
+
+    def broadcast_weights(self):
+        """
+        Broadcast weights (including parameters and buffers) across scale units.
+        The source ranks is the ranks in first scale unit.
+        The weights in the ranks in the rest scale units will be replace inplace.
+        """
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', default=1))
+        plan_ngpus = self.get_compute_config().plan_ngpus
+
+        if local_world_size < plan_ngpus:
+            raise RuntimeError(f'LOCAL_WORLD_SIZE {local_world_size} is less than plan_ngpus {self.get_compute_config().plan_ngpus}. Cannot broadcast weights.')
+
+        for i in range(plan_ngpus):
+            ranks = list(range(i, world_size, plan_ngpus))
+            DeviceGroup().get_group(ranks)
+
+        curr_parallel_group_ranks = list(range(rank % plan_ngpus, world_size, plan_ngpus))
+        curr_parallel_group = DeviceGroup().get_group(curr_parallel_group_ranks)
+        src_rank = min(curr_parallel_group_ranks)
+        logging.info(f'Rank-{rank} is broadcasting weight to ranks {curr_parallel_group_ranks}, broadcast root: {src_rank}...')
+
+        # NOTE: please make sure the above checkpoint load is from local checkpoint file,
+        # otherwise, the following broadcast may time out due to slow checkpoint file read.
+        # Broadcast parameters and buffers across scale units
+        params = self.parameters_for_broadcast()
+        logging.info(f'Inplace broadcasting {len(params)} parameters...')
+        for i, param in enumerate(params):
+            torch.distributed.broadcast(param.data, src=src_rank, group=curr_parallel_group)
+            logging.info(f'Inplace broadcasted {i+1}/{len(params)} parameters')
+
+        # NOTE: may batch buffers for efficient broadcast,
+        # current implementation is the most memory efficient way.
+        logging.info(f'Inplace broadcasting {len(self._buffers)} buffers...')
+        for _, buffer in self._buffers.items():
+            torch.distributed.broadcast(buffer.data, src=src_rank, group=curr_parallel_group)

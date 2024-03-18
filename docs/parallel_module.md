@@ -175,6 +175,7 @@ Note:
 ### ReuseType
 
 The reuse policy for the existing generated code. It is an enum with the following values:
+
 ```python
 class ReuseType(Enum):
     MATCH = 'match'
@@ -188,6 +189,36 @@ We call it a `match` when the `ComputeConfig` is the same with the previous run.
 2. OVERRIDE: Nothing will be reused. Everything will be regenerated.
 3. MOO: MOO is short for 'match or override'. It will reuse if match, generate if not match or no previous gerenated code exists.
 4. GRAPH: Reuse graph only if match, generate otherwise.
+
+### BroadcastGenFilesStrategy
+
+The broadcast strategy for new generated files.
+Please note we never broadcast reused files.
+
+```python
+class BroadcastGenFilesStrategy(Enum):
+    NONE = 'none'
+    ALL = 'all'
+    NO_WEIGHTS = 'no_weights'
+    CODE = 'code'
+```
+
+1. None:  nothing will be broadcasted.
+    You need to do it by yourself or the generated files are save in a shared directory (like azure blob).
+
+2. ALL: broadcast all the generated files to all nodes.
+    This is useful when you want to run the same code on all nodes.
+    please note the init weight files can be huge.
+
+3. NO_WEIGHTS: broadcast all except init weights.
+    Without weights, you can only construct the parallel module with `init_params=False`.
+    You can then
+    - Load the weights from a checkpoint file with `module.load_state_dict` or `load_merged_state_dict`
+    - Or you can use `broadcast_weights_inplace` to get the weights from the workers in node0.
+       (local world size should be bigger than plan_ngpus)
+
+4. CODE: broadcast the new generated code only
+    It's your responsibility to make sure other necessary files are available on all nodes.
 
 
 ### Module Conversion
@@ -207,6 +238,7 @@ def parallelize(
     module_dtype:  Optional[torch.dtype] = None,
     module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     init_module_params: bool = True,
+    broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
 ```
 It has the following parameters:
@@ -237,6 +269,8 @@ so it is only used when `module_or_module_class` is a module object, and `load_m
 
 - module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use `__init__` if it is None. This parameter is only used when `module_or_module_class` is a module class.
 
+- broadcast_strategy (Union[str, BroadcastGenFilesStrategy]): the broadcast strategy for new generated files.
+
 Note:
 
 1. This function can be used to convert both module object and module class to cube module or cube module class.
@@ -254,6 +288,9 @@ After all nodes have the generated files, you can call `parallelize()` again wit
 4. if reuse is not set to ReuseType.MATCH,
 the generated code in outdir will be removed EVEN IF the code generetion fails in this call.
 
+5. For broadcast_strategy, Please note that the broadcast will only be done in torchrun environment,
+      and will throw an error if torch.distributed is not initialized and broadcast_strategy is not NONE.
+
 After the module is converted, you can use it to create module object by calling it like a module class.
 The module class is defined like:
 ```python
@@ -268,6 +305,7 @@ For example, if you don't want to intialize module params:
 ```python
 module = GenModule(init_params=False)
 ```
+
 
 ### Optimizer Creation
 
