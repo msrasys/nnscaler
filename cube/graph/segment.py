@@ -642,25 +642,31 @@ class IRSegment(IRCell):
         return False
 
     def select(self, name: Optional[str] = None, ntype: Optional[IRCell] = None, flatten: bool = True) -> List[IRCell]:
-        """
-        Select all the nodes (including nodes in sub-segment) that
-        satisfy the condition.
+        """Select all the nodes that satisfy all the specified conditions.
 
-        @param name Optional[str]: the node name
-        @param ntype Optional[Type]: the node type
-        @param flatten bool: whether to flatten the segment to nodes. (Default True)
+        Note:
+            Current IRGraph can have at most a 2-level hierarchy (IRGraph[IRSegment]).
+            We don't allow IRSegment inside IRSegment. So when users try to index
+            IRSegment, turn `flatten=False` will get the same result as `flatten=True`,
+            and can save more time because `flatten=False` will not traverse the
+            nodes in IRSegment.
+        
+        Args:
+            name (Optional[str]): the node name
+            ntype (Optional[Type]): the node type
+            flatten (bool): whether to recursively search the nodes inside segments (Default True).
 
-        @return nodes List[IRCell]: the nodes that have the name.
+        Returns:
+            List[IRCell]: the nodes that satisfied the name or ntype.
         """
         nodes = []
-        for node in self.nodes(flatten=flatten):
-            if name is not None:
-                if node.name != name:
-                    continue
-            if ntype is not None:
-                if not isinstance(node, ntype):
-                    continue
-            nodes.append(node)
+        for node in self._nodes:
+            if (name is None or name == node.name) and \
+               (ntype is None or isinstance(node, ntype)):
+                nodes.append(node)
+            # recursively search in sub-segment
+            if flatten and isinstance(node, IRSegment):
+                nodes += node.select(name, ntype, flatten)
         return nodes
 
     def finsert(self, fwop: IRFwOperation, index: Union[int, CellPosition]) -> IRFwOperation:

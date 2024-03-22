@@ -162,14 +162,22 @@ class ModuleCodeGen(FuncEmission):
                 all_params.update(reducer.inputs())
             # create a reducer for the rest parameters used for this device
             rest_params = []
-            for param in self.execplan.graph.attributes():
-                if not param.is_param(): continue
-                for ctensor in graph.ctensors(param):
-                    if device not in ctensor.device: continue
-                    if ctensor not in all_params:
-                        # a same parameter can be consumed multiple times by different operators
-                        if ctensor not in rest_params:
-                            rest_params.append(ctensor)
+
+            def collect_rest_params(segment):
+                """Resursively collect parameters. Note parameters can be in sub-segments,
+                which is invisible to its top-level segment."""
+                for param in segment.attributes():
+                    if not param.is_param(): continue
+                    for ctensor in segment.ctensors(param):
+                        if device not in ctensor.device: continue
+                        if ctensor not in all_params:
+                            # a same parameter can be consumed multiple times by different operators
+                            if ctensor not in rest_params:
+                                rest_params.append(ctensor)
+                for seg in segment.select(ntype=IRSegment, flatten=False):
+                    collect_rest_params(seg)
+
+            collect_rest_params(graph)
             if len(rest_params) == 0:
                 continue
             # create reducer and append to the execution

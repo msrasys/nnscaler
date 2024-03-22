@@ -2,12 +2,14 @@
 pytest unit_tests/compiler/test_compile.py
 """
 import torch
-import logging
 from functools import partial
+import more_itertools as mitr
 
 import cube
+from cube.runtime.utils import microbatches
 from cube.graph import IRGraph
-from cube.ir.operator import IRFwOperation
+from cube.graph.segment import IRSegment
+from cube.ir.operator import IRFwOperation, IRDataOperation
 from cube.flags import CompileFlag
 from ..launch_torchrun import torchrun
 from ..utils import init_parameter, assert_parity
@@ -57,38 +59,64 @@ def baseline():
     return losses
 
 
-def scale(ngpus_per_unit: int):
+# ================================== cube functionality ========================================
+
+def pipe_policy(graph: IRGraph, resource, ngpus_per_unit: int):
+
+    ngpus = min(ngpus_per_unit, resource.ngpus)
+    fnodes = graph.select(ntype=IRFwOperation)
+    
+    stages = mitr.divide(ngpus, fnodes)
+    stages = [list(s) for s in stages]
+    lead_nodes = [s[0] for s in stages]
+    graph.staging(lead_nodes)
+
+    for dl in graph.select(ntype=IRDataOperation):
+        graph.assign(dl, 0)
+
+    stages = graph.select(ntype=IRSegment, flatten=False)
+    stages = [s for s in stages if s.isfw()]
+    for idx, stage in enumerate(stages):
+        graph.assign(stage, idx)
+    return graph
+
+
+def tp_policy(graph: IRGraph, resource, ngpus_per_unit: int):
+
+    ngpus = min(ngpus_per_unit, resource.ngpus)
+
+    def tensor_parallelism(node, idx, dim, num):
+        sub_nodes = graph.partition(
+            node, node.algorithms('dim'), idx=idx, dim=dim, num=num)
+        for idx, sub_node in enumerate(sub_nodes):
+            graph.assign(sub_node, idx)
+        return sub_nodes
+
+    l1, l2, l3, l4 = graph.select(name='linear')
+
+    # l1 tensor parallelism
+    tensor_parallelism(l1, idx=1, dim=0, num=ngpus)
+    # l2 data parallelism
+    tensor_parallelism(l2, idx=0, dim=0, num=ngpus)
+    # l3 tensor parallelism
+    tensor_parallelism(l3, idx=1, dim=1, num=ngpus)
+    # l4 replicate
+
+    for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
+        if len(node.device) == 0:
+            sub_nodes = graph.replicate(node, times=ngpus)
+            for idx, sub_node in enumerate(sub_nodes):
+                graph.assign(sub_node, idx)
+    return graph
+
+
+def cube_run(ngpus_per_unit: int, policy):
+
+    cube.init()
+    CompileFlag.disable_code_line_info = True  # speedup parse
 
     model = MLP()
     init_parameter(model)
-    
-    def policy(graph: IRGraph, resource):
-
-        ngpus = min(ngpus_per_unit, resource.ngpus)
-
-        def tensor_parallelism(node, idx, dim, num):
-            sub_nodes = graph.partition(
-                node, node.algorithms('dim'), idx=idx, dim=dim, num=num)
-            for idx, sub_node in enumerate(sub_nodes):
-                graph.assign(sub_node, idx)
-            return sub_nodes
-
-        l1, l2, l3, l4 = graph.select(name='linear')
-
-        # l1 tensor parallelism
-        tensor_parallelism(l1, idx=1, dim=0, num=ngpus)
-        # l2 data parallelism
-        tensor_parallelism(l2, idx=0, dim=0, num=ngpus)
-        # l3 tensor parallelism
-        tensor_parallelism(l3, idx=1, dim=1, num=ngpus)
-        # l4 replicate
-
-        for node in graph.select(ntype=IRFwOperation):
-            if len(node.device) == 0:
-                sub_nodes = graph.replicate(node, times=ngpus)
-                for idx, sub_node in enumerate(sub_nodes):
-                    graph.assign(sub_node, idx)
-        return graph
     
     ngpus_per_unit = min(ngpus_per_unit, torch.distributed.get_world_size())
     nreplicas = torch.distributed.get_world_size() // ngpus_per_unit
@@ -96,8 +124,13 @@ def scale(ngpus_per_unit: int):
     print('>> set batch size to', batch_size)
     x = get_dummy_data(batch_size=batch_size)
 
-    @cube.compile(model, x, PAS=policy, scale=True)
-    def train_iter(model, x):
+    dl = microbatches([x,])
+
+    policy = partial(policy, ngpus_per_unit=ngpus_per_unit)
+
+    @cube.compile(model, dl, PAS=policy, scale=True)
+    def train_iter(model, dataloader):
+        x = next(iter(dataloader))
         loss = model(x)
         loss.backward()
         return loss
@@ -108,7 +141,8 @@ def scale(ngpus_per_unit: int):
     losses = []
     for _ in range(3):
         x = get_dummy_data(batch_size=batch_size)
-        loss = train_iter(model, x)
+        dl = microbatches([x,])
+        loss = train_iter(model, dl)
         loss = loss * nreplicas
         optimizer.step()
         optimizer.zero_grad()
@@ -119,19 +153,38 @@ def scale(ngpus_per_unit: int):
 
     return losses
 
+# single-gpu test
+test_single = partial(torchrun, 1, assert_parity,
+    baseline,
+    partial(cube_run, 1, tp_policy)
+)
 
-def scale_test():
-    cube.init()
-    CompileFlag.disable_code_line_info = True  # speedup parse
-    assert_parity(baseline, partial(scale, 2))
+# scale test
+test_scale2 = partial(torchrun, 2, assert_parity,
+    baseline, 
+    partial(cube_run, 1, tp_policy)
+)
 
+# tensor parallelism test
+test_tp2 = partial(torchrun, 2, assert_parity,
+    baseline, 
+    partial(cube_run, 2, tp_policy)
+)
 
-def scale_test_dp():
-    cube.init()
-    CompileFlag.disable_code_line_info = True  # speedup parse
-    assert_parity(baseline, partial(scale, 1))
+# tensor parallelism + scale test
+test_tp2scale2 = partial(torchrun, 4, assert_parity,
+    baseline, 
+    partial(cube_run, 2, tp_policy)
+)
 
+# pipeline parallelism test
+test_pipe2 = partial(torchrun, 2, assert_parity,
+    baseline, 
+    partial(cube_run, 2, pipe_policy)
+)
 
-test_scale_2gpu = partial(torchrun, 2, scale_test)
-test_scale_2gpu_dp = partial(torchrun, 2, scale_test_dp)
-test_scale_4gpu = partial(torchrun, 4, scale_test)
+# pipeline parallelism + scale test
+test_pipe2scale2 = partial(torchrun, 4, assert_parity,
+    baseline, 
+    partial(cube_run, 2, pipe_policy)
+)
