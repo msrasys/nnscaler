@@ -243,8 +243,10 @@ class CubeModule(torch.nn.Module):
         }, filename)
 
     @staticmethod
-    def merge_model_state_dicts(state_dicts: List[Dict],
-                                fullmaps: List[Dict[str, AttrMeta]]):
+    def merge_model_state_dicts(
+        state_dicts: List[Dict],
+        fullmaps: List[Dict[str, AttrMeta]]
+    ):
         """Merge model states from multiple shard into a single-model state.
 
         Note:
@@ -309,36 +311,56 @@ class CubeModule(torch.nn.Module):
                 * optim_state_dicts (Optional[List[Dict]]): per-rank optimizer state dict from optimizer.state_dict()
                 * dist_param_map: deprecated, will be removed in the future.
                 * fullmaps (List[Dict[str, AttrMeta]]): per-rank fullmap
-            zero_idx_maps (Optional[List[Dict]])
+            zero_idx_maps (Optional[List[Dict]]): zero information for the model, `None` if zero is not enabled
 
         Returns:
             Dict[str, torch.Tensor]: Full model state dict
-            Dict[str, Dict[str, torch.Tensor]]: Full optimizer state dict
+            Dict[str, Any]: Full optimizer state dict
         """
-        model_state_dicts = [states[0] for states in state_dicts]
-        optim_state_dicts = [states[1] for states in state_dicts]
-        fullmaps: List[Dict[str, AttrMeta]] = [states[-1] for states in state_dicts]
+        # the filtering below is to be compatible with fairseq
+        # which will set some model_state_dicts/optim_state_dicts to None for deduplication
+        return CubeModule.merge_state_dicts(
+            [state_dict[-1] for state_dict in state_dicts],
+            [state_dict[0] for state_dict in state_dicts if state_dict[0] is not None],
+            [state_dict[1] for state_dict in state_dicts if state_dict[1] is not None],
+            zero_idx_maps
+        )
 
-        if len(model_state_dicts) != len(fullmaps):
-            raise ValueError("Expected model state dicts to have the same length as fullmaps")
-        if optim_state_dicts is not None:
-            if len(optim_state_dicts) != len(fullmaps):
-                raise ValueError("Expected optimizer state dicts to have the same length as fullmaps")
+    @staticmethod
+    def merge_state_dicts(
+        fullmaps: List[Dict[str, AttrMeta]],
+        model_state_dicts: List[Dict[str, torch.Tensor]],
+        optim_state_dicts: Optional[List[Dict[str, Any]]] = None,
+        zero_idx_maps: Optional[List[Dict]] = None
+    ) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, Any]]]:
+        """Merge model and optimizer states from different shard into a single-model state.
 
+        `fullmaps` should always have the information for all ranks.
+        To support checkpoint deduplication, `model_state_dicts` and `optim_state_dicts`
+        can contains only the first `dedup_group_size` items.
+
+        Warnings:
+            * This function only supports merging optimizer states of Adam-like optimizers,
+            in which the optimizer state is expected to contain 'state' keyword.
+            * Only support single parameter group, i.e., code implementations like: `torch.optim.Adam(model.parameters(), lr=0.1)`
+
+        Args:
+            fullmaps (List[Dict[str, AttrMeta]]): per-rank fullmap
+            model_state_dicts (List[Dict[str, torch.Tensor]]): per-rank model state dict from model.state_dict()
+            optim_state_dicts (Optional[List[Dict]]): per-rank optimizer state dict from optimizer.state_dict()
+            zero_idx_maps (Optional[List[Dict]]): zero information for the model, `None` if zero is not enabled
+
+        Returns:
+            Dict[str, torch.Tensor]: Full model state dict
+            Dict[str, Any]: Full optimizer state dict
+        """
         # gather model states
-        full_model_state_dict = CubeModule.merge_model_state_dicts(model_state_dicts, fullmaps)
+        full_model_state_dict = CubeModule.merge_model_state_dicts(model_state_dicts, fullmaps[0: len(model_state_dicts)])
+        if optim_state_dicts is None:
+            return full_model_state_dict, None
 
         # gather optimizer states
         full_optim_state_dict: Dict[str, Any] = {}  # param_id -> Dict[state_name, value]
-
-        plan_ngpus = -1
-        # TODO: remove this flag
-        if 'PLAN_NGPUS' in os.environ:
-            plan_ngpus = int(os.environ['PLAN_NGPUS'])
-            assert plan_ngpus >= 1, plan_ngpus
-            assert plan_ngpus <= len(state_dicts), f'plan_ngpus = {plan_ngpus}, len(state_dicts) = {len(state_dicts)}'
-            assert len(state_dicts) % plan_ngpus == 0, f'plan_ngpus = {plan_ngpus}, len(state_dicts) = {len(state_dicts)}'
-            _logger.info(f'plan_ngpus = {plan_ngpus}')
 
         # at first, merge the partitioned optimizer states due to zero to the zero-disabled format
         if zero_idx_maps is not None:
@@ -392,21 +414,20 @@ class CubeModule(torch.nn.Module):
                 return opt_states
 
             opt_state_list = []
-            worker_cnt = len(state_dicts)
-            for work_idx in (range(worker_cnt) if plan_ngpus < 0 else range(plan_ngpus)):
+            worker_cnt = len(optim_state_dicts)
+            for work_idx in range(worker_cnt):
                 model_idx2opt_idx, opt_idx2ranks = zero_idx_maps[work_idx]
                 opt_state = {}
                 for model_idx, opt_idx in model_idx2opt_idx.items():
                     if isinstance(opt_idx, int):
                         # the param without reducer
                         assert opt_idx2ranks[opt_idx] is None
-                        # state_dicts [worker idx][opt state]['state'][param idx]
-                        opt_state[model_idx] = state_dicts[work_idx][1]['state'][opt_idx]
+                        opt_state[model_idx] = optim_state_dicts[work_idx]['state'][opt_idx]
                     else:
                         # the param in reducer bucket
                         opt_idx, pstart, pend, pshape = opt_idx
                         ranks, bucket_size = opt_idx2ranks[opt_idx]
-                        bucket_states = [state_dicts[rank][1]['state'][opt_idx] for rank in ranks]
+                        bucket_states = [optim_state_dicts[rank]['state'][opt_idx] for rank in ranks]
                         opt_state[model_idx] = _retrieve_param_opt_state(
                             bucket_states,
                             pstart,
@@ -414,11 +435,11 @@ class CubeModule(torch.nn.Module):
                             pshape,
                             bucket_size)
                 opt_state_list.append(opt_state)
-                assert len(state_dicts[work_idx][1]['param_groups']) == 1, 'only support param_groups to be one group'
+                assert len(optim_state_dicts[work_idx]['param_groups']) == 1, 'only support param_groups to be one group'
 
             # assign opt_state to state_dicts, cannot be assigned in the above loop
             opt_state_len = len(opt_state_list[0])
-            for work_idx in (range(worker_cnt) if plan_ngpus < 0 else range(plan_ngpus)):
+            for work_idx in range(worker_cnt):
                 optim_state_dicts[work_idx]['state'] = opt_state_list[work_idx]
                 optim_state_dicts[work_idx]['param_groups'][0]['params'] = sorted(opt_state_list[work_idx].keys())
                 assert len(opt_state_list[work_idx]) == opt_state_len
@@ -536,9 +557,10 @@ class ParallelModuleConfig:
         if isinstance(self.compute_config, dict):
             from cube.parallel import ComputeConfig
             self.compute_config = ComputeConfig(**self.compute_config)
-        for k in self.param_area_map:
-            if isinstance(self.param_area_map[k], dict):
-                self.param_area_map[k] = AttrMeta(**self.param_area_map[k])
+        self.param_area_map = {
+            k: AttrMeta(**v) if isinstance(v, dict) else v
+            for k, v in self.param_area_map.items()
+        }
 
 
 @dataclass
@@ -630,7 +652,7 @@ class ParallelModule(CubeModule):
     def get_compute_config(self) -> 'ComputeConfig':
         return self._compute_config
 
-    def get_rank(self):
+    def get_rank(self) -> int:
         return self.rank  # rank is a class varible defined in gencode
 
     def clip_gnorm(self, max_norm: Optional[float] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
@@ -750,7 +772,7 @@ class ParallelModule(CubeModule):
             assert cf.zero_ngroups == 1
             return rank_idx, reducer.ranks
 
-    def _post_state_dict_hook(self, state_dict, prefix, local_metadata) -> None:
+    def _add_extra_state(self, state_dict, prefix) -> None:
         state_dict[f'{prefix}{self.EXTRA_STATE_KEY}'] = asdict(
             ExtraState(
                 rank=self.get_rank(),
@@ -763,8 +785,28 @@ class ParallelModule(CubeModule):
             )
         )
 
-    def _pre_load_state_dict_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs) -> None:
+    def _remove_extra_state(self, state_dict, prefix) -> None:
         state_dict.pop(f'{prefix}{self.EXTRA_STATE_KEY}', None)
+
+    def _post_state_dict_hook(self, state_dict, prefix, local_metadata) -> None:
+        self._add_extra_state(state_dict, prefix)
+
+    def _pre_load_state_dict_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs) -> None:
+        self._remove_extra_state(state_dict, prefix)
+
+    @property
+    def module_dedup_group_size(self) -> int:
+        """
+        Get the size of the deduplication group of the model state dict, which is `plan_ngpus`.
+        """
+        return self.get_compute_config().module_dedup_group_size
+
+    @property
+    def optimizer_dedup_group_size(self) -> int:
+        """
+        Get the size of the deduplication group of the optimizer state dict.
+        """
+        return self.get_compute_config().optimizer_dedup_group_size
 
     def _list_fullmodel_files(self) -> List[Path]:
         legacy_fullmodel_path = self.module_dir / FxModuleParser.ATTR_CONTENT_FILE_STEM
@@ -830,41 +872,3 @@ class ParallelModule(CubeModule):
                     raise RuntimeError(erro_msg)
                 else:
                     _logger.warning(erro_msg)
-
-    def broadcast_weights(self):
-        """
-        Broadcast weights (including parameters and buffers) across scale units.
-        The source ranks is the ranks in first scale unit.
-        The weights in the ranks in the rest scale units will be replace inplace.
-        """
-        rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-        local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', default=1))
-        plan_ngpus = self.get_compute_config().plan_ngpus
-
-        if local_world_size < plan_ngpus:
-            raise RuntimeError(f'LOCAL_WORLD_SIZE {local_world_size} is less than plan_ngpus {self.get_compute_config().plan_ngpus}. Cannot broadcast weights.')
-
-        for i in range(plan_ngpus):
-            ranks = list(range(i, world_size, plan_ngpus))
-            DeviceGroup().get_group(ranks)
-
-        curr_parallel_group_ranks = list(range(rank % plan_ngpus, world_size, plan_ngpus))
-        curr_parallel_group = DeviceGroup().get_group(curr_parallel_group_ranks)
-        src_rank = min(curr_parallel_group_ranks)
-        logging.info(f'Rank-{rank} is broadcasting weight to ranks {curr_parallel_group_ranks}, broadcast root: {src_rank}...')
-
-        # NOTE: please make sure the above checkpoint load is from local checkpoint file,
-        # otherwise, the following broadcast may time out due to slow checkpoint file read.
-        # Broadcast parameters and buffers across scale units
-        params = self.parameters_for_broadcast()
-        logging.info(f'Inplace broadcasting {len(params)} parameters...')
-        for i, param in enumerate(params):
-            torch.distributed.broadcast(param.data, src=src_rank, group=curr_parallel_group)
-            logging.info(f'Inplace broadcasted {i+1}/{len(params)} parameters')
-
-        # NOTE: may batch buffers for efficient broadcast,
-        # current implementation is the most memory efficient way.
-        logging.info(f'Inplace broadcasting {len(self._buffers)} buffers...')
-        for _, buffer in self._buffers.items():
-            torch.distributed.broadcast(buffer.data, src=src_rank, group=curr_parallel_group)

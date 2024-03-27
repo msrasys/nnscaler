@@ -1,9 +1,10 @@
 import os
-from typing import Optional, Tuple, Callable, List, Set, Any
+from typing import Optional, Tuple, Callable, List, Set, Any, Iterable
 import logging
 from pathlib import Path
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 
 import cube
 from cube.runtime.device import DeviceGroup
@@ -102,6 +103,47 @@ def get_shared_params(model: torch.nn.Module) -> List[List[str]]:
         paramid = id(param)
         paramid2name[paramid].add(name)
     return [list(names) for _, names in paramid2name.items() if len(names) > 1]
+
+
+@dataclass
+class BroadcastGroup:
+    src_rank: int      # the source rank in the group which the current rank belongs to
+    ranks: List[int]   # the ranks in the group which the current rank belongs to
+    group: torch.distributed.ProcessGroup
+
+
+def setup_stride_broadcast_group(stride_size: int) -> BroadcastGroup:
+    """
+    Setup the broadcast group for the given stride size.
+
+    For example, assume stride size is 4, then
+    we will create 4 broadcasting groups:
+        [0, 4, 8, ...],
+        [1, 5, 9, ...],
+        [2, 6, 10, ...],
+        [3, 7, 11, ...]
+    the broadcast will happen in above groups, the sending rank is the first rank in the group.
+
+    Args:
+        stride_size (int): the stride size.
+    Returns:
+        BroadcastGroup: the source rank and the broadcast group.
+    """
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    for i in range(stride_size):
+        ranks = list(range(i, world_size, stride_size))
+        DeviceGroup().get_group(ranks)
+
+    curr_parallel_group_ranks = list(range(rank % stride_size, world_size, stride_size))
+    curr_parallel_group = DeviceGroup().get_group(curr_parallel_group_ranks)
+    src_rank = min(curr_parallel_group_ranks)
+
+    return BroadcastGroup(
+        src_rank=src_rank,
+        ranks=curr_parallel_group_ranks,
+        group=curr_parallel_group
+    )
 
 
 class accum_mode:

@@ -39,7 +39,7 @@ from cube.runtime.adapter.reducer import Reducer
 from cube.runtime.module import AttrMeta, CubeModule, ParallelModule, OriginModuleMetadata, ExtraState
 from cube.runtime.device import DeviceGroup
 from cube.runtime.gnorm import calcuate_gnorm, clip_grads
-from cube.utils import get_member_by_name
+from cube.utils import get_member_by_name, setup_stride_broadcast_group
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,8 @@ class ComputeConfig:
     zero_ngroups: int = 1
 
     # you can put any configuration here
-    # *Note*: the assumption is different user_config should generate different code.
+    # Note: different user_config should generate different graph/code.
+    #       so if user_config is changed, both graph and code will be regenerated.
     # Example 1: save module configuration
     # ```python
     # class MyModule(torch.nn.Module):
@@ -99,8 +100,11 @@ class ComputeConfig:
             raise ValueError(f"runtime_ngpus {self.runtime_ngpus} must be > 0")
         if self.runtime_ngpus % self.plan_ngpus != 0:
             raise ValueError(f"runtime_ngpus {self.runtime_ngpus} must be a multiple of plan_ngpus {self.plan_ngpus}")
-        if self.use_zero and self.zero_ngroups < 0:
-                raise ValueError(f"zero_ngroups {self.zero_ngroups} must be >= 0")
+        if self.use_zero and self.zero_ngroups <= 0:
+                raise ValueError(f"zero_ngroups {self.zero_ngroups} must be > 0")
+        if not self.use_zero and self.zero_ngroups != 1:
+            logger.warning(f"use_zero is False, but zero_ngroups is {self.zero_ngroups}. Will set zero_ngroups to 1.")
+            self.zero_ngroups = 1
 
     @property
     def gpu_config(self) -> Dict[str, int]:
@@ -108,6 +112,34 @@ class ComputeConfig:
             'plan_ngpus': self.plan_ngpus,
             'runtime_ngpus': self.runtime_ngpus,
         }
+
+    @property
+    def graph_config(self) -> Dict[str, Any]:
+        return {
+            'dynamic_shape': self.dynamic_shape,
+            'user_config': self.user_config,
+        }
+
+    @property
+    def module_dedup_group_size(self) -> int:
+        """
+        Get the size of the deduplication group of the model state dict, which is `plan_ngpus`.
+        """
+        return self.plan_ngpus
+
+    @property
+    def optimizer_dedup_group_size(self) -> int:
+        """
+        Get the size of the deduplication group of the optimizer state dict.
+
+        Nonzero mode: the group size is the same with plan_ngpus
+        Zero mode: the group size is `zero_group`, which equals `runtime_ngpus//zero_ngroups`
+        """
+
+        if self.use_zero:
+            return self.runtime_ngpus // self.zero_ngroups
+        else:
+            return self.plan_ngpus
 
 
 @contextmanager
@@ -237,7 +269,7 @@ class BroadcastGenFilesStrategy(Enum):
     # you can only construct the parallel module with `init_params=False`.
     # You can then
     # 1. Load the weights from a checkpoint file with `module.load_state_dict` or `load_merged_state_dict`
-    # 2. Or you can use `ParallelModule.broadcast_weights` to get the weights from the workers in node0.
+    # 2. Or you can use `broadcast_weights` to get the weights from the workers in node0.
     #    (local world size should be bigger than plan_ngpus)
     NO_WEIGHTS = 'no_weights'
 
@@ -807,6 +839,7 @@ class ModuleParameterLocation:
     offset: int
     count: int
 
+
 @dataclass
 class OptimizerExtraState:
     """
@@ -829,11 +862,17 @@ class OptimizerExtraState:
     rank: int
     name: str
     parallel_module_locs: Dict[str, ModuleParameterLocation]
+    parallel_module_configs: Dict[str, ComputeConfig]
 
     def __post_init__(self):
-        for k in self.parallel_module_locs:
-            if isinstance(self.parallel_module_locs[k], dict):
-                self.parallel_module_locs[k] = ModuleParameterLocation(**self.parallel_module_locs[k])
+        self.parallel_module_locs = {
+            k: ModuleParameterLocation(**v) if isinstance(v, dict) else v
+            for k, v in self.parallel_module_locs.items()
+        }
+        self.parallel_module_configs = {
+            k: ComputeConfig(**v) if isinstance(v, dict) else v
+            for k, v in self.parallel_module_configs.items()
+        }
 
 
 class ParallelOptimizer(torch.optim.Optimizer):
@@ -1013,6 +1052,11 @@ def build_optimizer(
             rank=torch.distributed.get_rank(),
             name=type(optimizer).__name__,
             parallel_module_locs=opt_module_locs,
+            parallel_module_configs={
+                name: m.get_compute_config()
+                for name, m in module.named_modules()
+                if isinstance(m, ParallelModule)
+            }
     )
 
     def _step_pre_hook(opt, *args, **kwargs):
@@ -1137,8 +1181,8 @@ def _get_parallel_module_state_dict_info(
                 module_prefix = k[:-1]
                 if module_prefix not in pm_extra_states:
                     pm_extra_states[module_prefix] = [None] * len(pk_model_state_dicts)
-                opt_extra_state = ExtraState(**pk_model_state_dict[k])
-                pm_extra_states[module_prefix][opt_extra_state.rank] = opt_extra_state
+                pm_extra_state = ExtraState(**pk_model_state_dict[k])
+                pm_extra_states[module_prefix][pm_extra_state.rank] = pm_extra_state
 
     # collect ParallelModule state dicts
     # key is the module prefix of the parallel module in state dict
@@ -1152,10 +1196,13 @@ def _get_parallel_module_state_dict_info(
                     continue
             module_prefix = k[:-1]
             if module_prefix in pm_extra_states:
+                pm_extra_state = ExtraState(**pk_model_state_dict[module_prefix + (ParallelModule.EXTRA_STATE_KEY,)])
+                module_dedup_group_size = pm_extra_state.compute_config.module_dedup_group_size
                 if module_prefix not in pm_state_dicts:
-                    pm_state_dicts[module_prefix] = [dict() for _ in range(len(pk_model_state_dicts))]
-                opt_extra_state = ExtraState(**pk_model_state_dict[module_prefix + (ParallelModule.EXTRA_STATE_KEY,)])
-                pm_state_dicts[module_prefix][opt_extra_state.rank][k[-1]] = pk_model_state_dict[k]
+                    pm_state_dicts[module_prefix] = [dict() for _ in range(module_dedup_group_size)]
+                # only collect the state from the first module_dedup_group_size ranks
+                if pm_extra_state.rank < module_dedup_group_size:
+                    pm_state_dicts[module_prefix][pm_extra_state.rank][k[-1]] = pk_model_state_dict[k]
             else:
                 # no further processing
                 # here we assume values from all ranks are the same
@@ -1225,25 +1272,30 @@ def _get_optimizer_state_dict_info(
         opt_extra_states[opt_extra_state.rank] = opt_extra_state
 
         for module_prefix, loc in opt_extra_state.parallel_module_locs.items():
+            opt_dedup_group_size = opt_extra_state.parallel_module_configs[module_prefix].optimizer_dedup_group_size
             if module_prefix not in opt_state_dicts:
-                opt_state_dicts[module_prefix] = [dict(state={}, param_groups=[]) for _ in range(len(optimizer_state_dicts))]
-            for i in range(loc.offset, loc.offset + loc.count):
-                # if the parameter is not used or requires_grad is False, it will not be in the state dict
-                # for us, as we use a continous buffer, it will always have grad, so it will always be in the state dict
-                # the state for each parameters is inserted in Adam in a lazy way.
-                # see https://github.com/pytorch/pytorch/blob/dad1b765848c4f52501c4c60b1c3e6fbd3cc8837/torch/optim/adam.py#L103
-                assert i in opt_state_dict['state']
-                opt_state_dicts[module_prefix][opt_extra_state.rank]['state'][i - loc.offset] = opt_state_dict['state'][i]
-            # TODO: inaccurate param_groups, for example, the 'params' in it is not right.
-            # we have this to make `ParallelModule.merge_partial_states` happy.
-            opt_state_dicts[module_prefix][opt_extra_state.rank]['param_groups'] = copy.deepcopy(opt_state_dict['param_groups'])
+                opt_state_dicts[module_prefix] = [dict(state={}, param_groups=[]) for _ in range(opt_dedup_group_size)]
+            # only collect the state from the first optimizer_dedup_group_size ranks
+            if opt_extra_state.rank < opt_dedup_group_size:
+                for i in range(loc.offset, loc.offset + loc.count):
+                    # if the parameter is not used or requires_grad is False, it will not be in the state dict
+                    # for us, as we use a continous buffer, it will always have grad, so it will always be in the state dict
+                    # the state for each parameters is inserted in Adam in a lazy way.
+                    # see https://github.com/pytorch/pytorch/blob/dad1b765848c4f52501c4c60b1c3e6fbd3cc8837/torch/optim/adam.py#L103
+                    assert i in opt_state_dict['state']
+                    opt_state_dicts[module_prefix][opt_extra_state.rank]['state'][i - loc.offset] = opt_state_dict['state'][i]
+                # TODO: inaccurate param_groups, for example, the 'params' in it is not right.
+                # we have this to make `ParallelModule.merge_partial_states` happy.
+                opt_state_dicts[module_prefix][opt_extra_state.rank]['param_groups'] = copy.deepcopy(opt_state_dict['param_groups'])
 
         for k, v in opt_state_dict.items():
             if k == ParallelModule.EXTRA_STATE_KEY or k == 'state':
                 continue
             # no further processing
             # here we assume values from all ranks are the same
-            ret_opt_state_dict[k] = v
+            # the value may change, so we deepcopy to make sure the input is not accidentally changed
+            # for example, it will updated in `merge_state_dict` function.
+            ret_opt_state_dict[k] = copy.deepcopy(v)
 
     return opt_extra_states, opt_state_dicts, ret_opt_state_dict
 
@@ -1271,11 +1323,6 @@ def merge_state_dicts(
     Returns:
         Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]: the merged model state dict and the merged optimizer state dict
     """
-    if optimizer_state_dicts is not None:
-        # TODO: support checkpoint optimization
-        # where the following check may be too strong.
-        if len(module_state_dicts) != len(optimizer_state_dicts):
-            raise ValueError("The length of model_state_dicts and optimizer_state_dicts should be the same.")
     if not module_state_dicts:
         raise ValueError("model_state_dicts should not be empty.")
 
@@ -1300,19 +1347,16 @@ def merge_state_dicts(
     for k, state_dicts_for_merge in pm_state_dicts.items():
         extra_states = pm_extra_states[k]
         module_prefix = '.'.join(k)
-        opt_state_dicts_for_merge = [{'state': {}} for _ in range(len(state_dicts_for_merge))] \
-            if opt_state_dicts is None else opt_state_dicts[module_prefix]
+        opt_state_dicts_for_merge = None if opt_state_dicts is None else opt_state_dicts[module_prefix]
 
-        merge_partial_states_state_dicts = []
-        merge_partial_states_zero_idx_maps = []
-        for m, opt, extra in zip(state_dicts_for_merge, opt_state_dicts_for_merge, extra_states):
-            merge_partial_states_state_dicts.append((m, opt, extra.dist_param_map, extra.param_area_map))
-            merge_partial_states_zero_idx_maps.append((extra.model_idx2opt_idx, extra.opt_idx2ranks))
+        merge_partial_states_zero_idx_maps = [(e.model_idx2opt_idx, e.opt_idx2ranks) for e in extra_states]
         if not extra_states[0].compute_config.use_zero: # all ranks should have the same use_zero
             merge_partial_states_zero_idx_maps = None
-        merged_state_dict, merged_opt_state_dict = ParallelModule.merge_partial_states(
-            merge_partial_states_state_dicts,
-            merge_partial_states_zero_idx_maps
+        merged_state_dict, merged_opt_state_dict = ParallelModule.merge_state_dicts(
+            [e.param_area_map for e in extra_states],
+            state_dicts_for_merge,
+            opt_state_dicts_for_merge,
+            merge_partial_states_zero_idx_maps,
         )
 
         # merge back module state dict
@@ -1398,12 +1442,12 @@ def merge_state_dicts(
 
 @torch.no_grad()
 def load_merged_state_dicts(
-        module: torch.nn.Module,
-        module_state_dict: Dict[str, Any],
-        optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
-        optimizer_state_dict: Optional[Dict[str, Any]] = None,
-        *,
-        device: Union[str, torch.device] = None
+    module: torch.nn.Module,
+    module_state_dict: Dict[str, Any],
+    optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
+    optimizer_state_dict: Optional[Dict[str, Any]] = None,
+    *,
+    device: Union[str, torch.device] = None
 ):
     """
     Load the merged state dicts to the module, and optionally the optimizer to a specified device.
@@ -1752,4 +1796,236 @@ def _broadcast_gen_files(
             logging.info(f'File {fname} broadcasted.')
 
     # wait for all nodes to finish
+    torch.distributed.barrier()
+
+
+@torch.no_grad()
+def deduped_state_dict(
+    module: torch.nn.Module,
+    optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Return the state dict only for the ranks that is necessary.
+    For details, see `ComputeConfig.optimizer_dedup_group_size`
+        and `ComputeConfig.module_dedup_group_size`.
+
+    Args:
+        module (torch.nn.Module): the module to get state dict
+        optimizer (Optional[Union[torch.optim.Optimizer, ParallelOptimizer]]): the optimizer to get state dict
+
+    Returns:
+        Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]: the deduped state dict for the module and optimizer
+    """
+
+    cur_rank = torch.distributed.get_rank()
+    module_state_dict, opt_state_dict = None, None
+    parallel_modules = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
+
+    # The reason we use `Module.state_dict` on the whole to get the complete state dict
+    # instead of call `Module.state_dict` on each submodule
+    # is to make sure the hooks to state_dict are called.
+    module_state_dict = module.state_dict()
+    for key in list(module_state_dict.keys()):
+        if key.endswith(ParallelModule.EXTRA_STATE_KEY): # never remove extra state
+            continue
+        prefix = '.'.join(key.split('.')[:-1]) # remove the last part of the key
+        dedup_group_size = parallel_modules[prefix].module_dedup_group_size \
+            if prefix in parallel_modules else 1
+        # only keep the first `dedup_group_size` ranks' state
+        if cur_rank >= dedup_group_size:
+            module_state_dict.pop(key, None)
+
+    if optimizer is not None:
+        opt_state_dict = optimizer.state_dict()
+
+        # get the locations of non-parallel module parameters
+        # by removing the parallel module locations
+        non_parallel_module_locs: Set[int] = set(opt_state_dict['param_groups'][0]['params'])
+        for pm_loc in optimizer._extra_state.parallel_module_locs.values():
+            non_parallel_module_locs.difference_update(range(pm_loc.offset, pm_loc.offset + pm_loc.count))
+
+        # only keep non-parallel module parameters in rank 0
+        if cur_rank > 0:
+            for idx in non_parallel_module_locs:
+                opt_state_dict['state'].pop(idx, None)
+
+        for pm_prefix, pm_loc in optimizer._extra_state.parallel_module_locs.items():
+            dedup_group_size = optimizer._extra_state.parallel_module_configs[pm_prefix].optimizer_dedup_group_size
+            # only keep the first `dedup_group_size` ranks' state
+            if cur_rank >= dedup_group_size:
+                for idx in range(pm_loc.offset, pm_loc.offset + pm_loc.count):
+                    opt_state_dict['state'].pop(idx, None)
+
+    return module_state_dict, opt_state_dict
+
+
+@torch.no_grad()
+def load_deduped_state_dict(
+    module: torch.nn.Module,
+    module_state_dict: Dict[str, Any],
+    optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
+    optimizer_state_dict: Optional[Dict[str, Any]] = None,
+    *,
+    device: Union[str, torch.device] = None
+) -> None:
+    """
+    Load the deduped state dicts to the module and optionally the optimizer to a specified device.
+
+    Args:
+        module (torch.nn.Module): the module to be loaded
+        module_state_dict (Dict[str, Any]): the deduped model state dict
+        optimizer (Optional[Union[torch.optim.Optimizer, ParallelOptimizer]]): the optimizer to be loaded
+        optimizer_state_dict (Optional[Dict[str, Any]]): the deduped optimizer state dict
+        device (Union[str, torch.device]): the device to put the module and optimizer state dicts.
+            Use torch.cuda.current_device() if it is None.
+    Returns:
+        None
+    """
+    device = device or torch.cuda.current_device()
+
+    # only load partial state for all ranks except rank 0
+    module.load_state_dict(module_state_dict, strict=False)
+    module.to(device)
+    torch.distributed.barrier()
+
+    # broadcast weights
+    broadcast_weights(module)
+
+    if optimizer is not None:
+        if 'adam' not in optimizer._extra_state.name.lower():
+            raise ValueError("Only Adam-like optimizers are supported.")
+        if optimizer_state_dict is None:
+            raise ValueError("optimizer_state_dict should be provided when optimizer is not None.")
+
+        for idx, state in optimizer_state_dict['state'].items():
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    optimizer_state_dict['state'][idx][key] = value.to(device)
+
+        # get the locations of non-parallel module parameters
+        # by removing the parallel module locations
+        non_parallel_module_locs: Set[int] = set(optimizer_state_dict['param_groups'][0]['params'])
+        # a list of tuple to track how to broadcast states
+        # Tuple:
+        #   0: a list of state idx
+        #   1: the dedup group size for the state idx's
+        opt_broadcast_groups: List[Tuple[List[int], int]] = []
+        for prefix, pm_loc in optimizer._extra_state.parallel_module_locs.items():
+            state_range = list(range(pm_loc.offset, pm_loc.offset + pm_loc.count))
+            opt_broadcast_groups.append((state_range, optimizer._extra_state.parallel_module_configs[prefix].optimizer_dedup_group_size))
+            non_parallel_module_locs.difference_update(state_range)
+        # append also works
+        # but insert to 0 feels better
+        # the dedup size for non-parallel module is 1
+        opt_broadcast_groups.insert(0, (list(non_parallel_module_locs), 1))
+        # TODO: what if opt_broadcast_groups are different in different ranks?
+        # Will it happend in pipeline parallelism?
+        for bg in opt_broadcast_groups:
+            _broadcast_opt_state(optimizer_state_dict, *bg)
+        optimizer.load_state_dict(optimizer_state_dict)
+
+        torch.distributed.barrier()
+
+
+def _broadcast_opt_state(optimizer_state_dict, state_indexes: List[int], dedup_group_size: int):
+    rank = torch.distributed.get_rank()
+    broadcast_group = setup_stride_broadcast_group(dedup_group_size)
+    src_rank, curr_parallel_group, curr_parallel_group_ranks = broadcast_group.src_rank, broadcast_group.group, broadcast_group.ranks
+
+    logging.info(f'Rank-{rank} is broadcasting states to ranks {curr_parallel_group_ranks}, broadcast root: {src_rank}...')
+
+    # broadcast param groups and state keys/shapes/dtypes via broadcast_object_list
+    if rank == src_rank:
+        state_info = {}
+        for idx in state_indexes:
+            state_info[idx] = {key: (value.shape, value.dtype) for key, value in optimizer_state_dict['state'][idx].items()}
+        sent = [state_info]
+    else:
+        sent = [None]
+    torch.distributed.broadcast_object_list(
+            sent,
+            src=src_rank,
+            group=curr_parallel_group,
+    )
+    if rank != src_rank:
+        for k, v in sent[0].items():
+            optimizer_state_dict['state'][k] = {
+                key: torch.zeros(value[0], dtype=value[1], device=torch.cuda.current_device())
+                for key, value in v.items()
+            }
+
+    # broadcast step
+    # step is too small, so we can just broadcast all of them all together
+    if rank == src_rank:
+        step_stack = torch.stack(
+            [optimizer_state_dict['state'][k]['step'] for k in state_indexes]
+        )
+    else:
+        step_stack = torch.zeros(
+            len(state_indexes),
+            dtype=optimizer_state_dict['state'][k]['step'].dtype,
+            device=torch.cuda.current_device()
+        )
+    torch.distributed.broadcast(step_stack, src=src_rank, group=curr_parallel_group)
+    if rank != src_rank:
+        for k, v in zip(state_indexes, step_stack):
+            optimizer_state_dict['state'][k]['step'].copy_(v)
+
+    # broadcast other states
+    # TODO: can be slow?
+    for k in state_indexes:
+        keys = sorted(optimizer_state_dict['state'][k].keys())
+        assert set(keys) == {'step', 'exp_avg', 'exp_avg_sq'}
+        keys.remove('step')  # we have done step in previous.
+        for key in keys:
+            value = optimizer_state_dict['state'][k][key]
+            torch.distributed.broadcast(value.data, src=src_rank, group=curr_parallel_group)
+
+    torch.distributed.barrier()
+
+
+def broadcast_weights(module: torch.nn.Module, stride_size: Optional[int] = None):
+    """
+    Broadcast the weights of the module from the ranks in dedup group to all ranks.
+
+    When you load the deduped state dict to broadcast the weights, you don't need to specify the `stride_size`.
+
+    Args:
+        module (torch.nn.Module): the module to be broadcasted
+        stride_size (Optional[int]): the stride size for broadcast.
+            If it is None, will use the dedup group size of each submodule.
+    Returns:
+        None
+    """
+    parallel_modules = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
+
+    for prefix, m in module.named_modules():
+        if stride_size is not None:
+            stride = stride_size
+        elif prefix not in parallel_modules:
+            stride = 1
+        else:
+            stride = parallel_modules[prefix].module_dedup_group_size
+        _broadcast_weights(m, stride)
+
+
+def _broadcast_weights(module: torch.nn.Module, stride_size: int):
+    broadcast_group = setup_stride_broadcast_group(stride_size)
+    rank = torch.distributed.get_rank()
+    src_rank, curr_parallel_group, curr_parallel_group_ranks = broadcast_group.src_rank, broadcast_group.group, broadcast_group.ranks
+    logging.info(f'Rank-{rank} is broadcasting weight to ranks {curr_parallel_group_ranks}, broadcast root: {src_rank}...')
+
+    # we have a special optimization for ParallelModule
+    params = module.parameters_for_broadcast() if isinstance(module, ParallelModule) else module._parameters.values()
+    logging.info(f'Inplace broadcasting {len(params)} parameters...')
+    for i, param in enumerate(params):
+        torch.distributed.broadcast(param.data, src=src_rank, group=curr_parallel_group)
+        logging.info(f'Inplace broadcasted {i+1}/{len(params)} parameters')
+
+    # NOTE: may batch buffers for efficient broadcast,
+    # current implementation is the most memory efficient way.
+    logging.info(f'Inplace broadcasting {len(module._buffers)} buffers...')
+    for _, buffer in module._buffers.items():
+        torch.distributed.broadcast(buffer.data, src=src_rank, group=curr_parallel_group)
+
     torch.distributed.barrier()

@@ -128,6 +128,7 @@ We can categorize the fields into 4 categories:
         1. if `rank1 // plan_gpus == rank2 // plan_ngpus`, then they are in the same unit.
         2. If `rank1 % plan_ngpus == rank2 % plan_ngpus`, then the portion of model hold on both gpus are exactly the same.
     - runtime_ngpus: the number of gpus to be used in runtime. It should be a multiple of `plan_ngpus`, which means we have `runtime_ngpus // plan_ngpus` units in runtime, and the data parallelism is `runtime_ngpus // plan_ngpus`.
+    Please note all modules must have the same `plan_ngpus` and `runtime_ngpus`.
 3. Code generation feature configuration
     - use_zero: whether to use zero. If it is true, the generated code will use zero1 to do distributed training.
     - zero_ngroups: the number of groups to be used in zero.
@@ -187,13 +188,13 @@ We call it a `match` when the `ComputeConfig` is the same with the previous run.
 
 1. MATCH: Reuse if match, error if not match, generate if no previous gerenated code exists.
 2. OVERRIDE: Nothing will be reused. Everything will be regenerated.
-3. MOO: MOO is short for 'match or override'. It will reuse if match, generate if not match or no previous gerenated code exists.
+3. MOO: MOO is short for 'match or override'. It will reuse if match, generate if not match or no previous generated code exists.
 4. GRAPH: Reuse graph only if match, generate otherwise.
 
 ### BroadcastGenFilesStrategy
 
 The broadcast strategy for new generated files.
-Please note we never broadcast reused files.
+Please note we never broadcast reused files (i.e., specified by `ReuseType`.).
 
 ```python
 class BroadcastGenFilesStrategy(Enum):
@@ -203,25 +204,55 @@ class BroadcastGenFilesStrategy(Enum):
     CODE = 'code'
 ```
 
-1. None:  nothing will be broadcasted.
+1. `None`:  nothing will be broadcasted.
     You need to do it by yourself or the generated files are save in a shared directory (like azure blob).
 
-2. ALL: broadcast all the generated files to all nodes.
+2. `ALL`: broadcast all the generated files to all nodes.
     This is useful when you want to run the same code on all nodes.
     please note the init weight files can be huge.
 
-3. NO_WEIGHTS: broadcast all except init weights.
+3. `NO_WEIGHTS`: broadcast all except init weights.
     Without weights, you can only construct the parallel module with `init_params=False`.
     You can then
-    - Load the weights from a checkpoint file with `module.load_state_dict` or `load_merged_state_dict`
-    - Or you can use `broadcast_weights_inplace` to get the weights from the workers in node0.
+    - Load the weights from a checkpoint file with `module.load_state_dict`, `load_merged_state_dict`
+        or `load_deduped_state_dict`
+    - Or you can use `broadcast_weights` to get the weights from the workers in node0.
        (local world size should be bigger than plan_ngpus)
 
-4. CODE: broadcast the new generated code only
+4. `CODE`: broadcast the new generated code only
     It's your responsibility to make sure other necessary files are available on all nodes.
 
+Here are some guidelines to choose the strategy:
 
-### Module Conversion
+1. When restarting a training and there is a successful previous run: As we have a previous run, the compiling process has been done before. So there will be no new generated files and no broadcast will happen no matter what this option is. Please be sure the reuse flag of `parallelize` is `MATCH`, so we can make sure the generated code is the same with the previous run.
+
+2. When training a model from scratch. If there is only one node, `none` is good enough.
+If there are multiple nodes, here are some strategies:
+
+a. If use `none`, the user should run `parallelize(..., load_module=False, ..)`, and then copy all files to all nodes manually, so all nodes have the same files. Then the user load the module by running `parallelize(..., load_module=True, ..)`.
+
+b. if they are using a NAS-like device to save generated files, and the upload/download speed is fast in the cluster, they can also use `none`, and just run `parallelize(..., load_module=True, ..)` to do the training.
+
+c. If use `all`, then user can just run `parallelize(..., load_module=True, ..)` safely. (remember to set `nccl` communication timeout to a very big value to tolerate the duration of this `nccl` broadcast)
+
+d. If use `no_weights`. then user can run `parallelize(..., load_module=True, init_module_params=rank<plan_ngpus, ..)`. After module is loaded, the user should call `broadcast_weights(plan_ngpus)` manually to synchronize the module weights before training (Note all submodules have the same `plan_ngpus`).
+```python
+class Module(torch.nn.Module):
+    ...
+plan_ngpus = ...
+rank = torch.distributed.get_rank()
+local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', default=1))
+assert local_world_size < plan_ngpus
+
+parallel_module = parallelize(Module(), ..., load_module=True, init_module_params=rank<plan_ngpus, broadcast_strategy='no_weights, ...)
+
+broadcast_weights(parallel_module, plan_ngpus)
+# now the module is ready to train
+```
+
+e. Currently `code` option is provided just for completeness. Do not suggest users to use.
+
+### Module Parallelization
 
 We have `parallelize` function to Convert a torch.nn.Module to a ParallelModule.
 ```python
@@ -243,53 +274,50 @@ def parallelize(
 ```
 It has the following parameters:
 
-- module_or_module_class (Union[torch.nn.Module, Type[torch.nn.Module]]): the module or module class to be compiled. Please note if the input is a module object, we will return a `ParalleModule` object. If the input is a module class, we will return a `ParalleModule` class.
+- `module_or_module_class` (`Union[torch.nn.Module, Type[torch.nn.Module]]`): the module or module class to be compiled. Please note if the input is a module object, we will return a `ParallelModule` object. If the input is a module class, we will return a `ParallelModule` class.
 
-- dummy_input (dict): the dummy input for the module
+- `dummy_input` (`dict`): the dummy input for the module
 
-- pas_policy (Callable[[IRGraph, ComputeConfig], IRGraph]): the pas policy, which describes how to place all computations across devices. You can use `autodist` to do the pas automatically in the most efficient way.
+- `pas_policy` (`Callable[[IRGraph, ComputeConfig], IRGraph]`): the pas policy, which describes how to place all computations across devices. You can use `autodist` to do the pas automatically in the most efficient way.
 
-- compute_config (ComputeConfig): the environment resource
+- `compute_config` (`ComputeConfig`): the environment resource
 
-- reuse (ReuseType): specify which part can be reused.
+- `reuse` (`ReuseType`): specify which part can be reused.
 
-- cube_savedir (Union[str, Path]): the directory to save generated code
+- `cube_savedir` (`Union[str, Path]`): the directory to save generated code
 
-- instance_name (Optional[str]): the instance name of the generated module. If it is `None`, will use the default name.
+- `instance_name` (`Optional[str]`): the instance name of the generated module. If it is `None`, will use the default name `_`.
 
-- load_module (bool): whether to load the generated module or module class after conversion is done.
-Currently the module can only be loaded in torchrun environment. So you can do the conversion in any environment (with `load_module` unset), and load the module in torchrun environment.
+- `load_module` (`bool`): whether to load the generated module or module class after parallelization is done.
+Currently the module can only be loaded in `torchrun` environment. So you can do the parallelization in any environment (with `load_module` unset), and load the module in `torchrun` environment.
 
-- init_module_params (bool): If true, when we construct the module, all its parameters are initialized with the same value with when we traced.
+- `init_module_params` (`bool`): If true, when we construct the module, all its parameters are initialized with the same value with when we traced.
 Otherwise, they will be empty tensor.
 This parameter will be passed to the module constructor,
 so it is only used when `module_or_module_class` is a module object, and `load_module` is true.
 
-- module_dtype (Optional[torch.dtype]): the dtype of the module. Keep the module as it is if it is None.
+- `module_dtype` (`Optional[torch.dtype]`): the dtype of the module. Keep the module as it is if it is None.
 
-- module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use `__init__` if it is None. This parameter is only used when `module_or_module_class` is a module class.
+- `module_fn` (`Optional[Callable[[], torch.nn.Module]]`): the function to create the module. Will use `__init__` if it is None. This parameter is only used when `module_or_module_class` is a module class.
 
-- broadcast_strategy (Union[str, BroadcastGenFilesStrategy]): the broadcast strategy for new generated files.
+- `broadcast_strategy` (`Union[str, BroadcastGenFilesStrategy]`): the broadcast strategy for new generated files.
 
 Note:
 
 1. This function can be used to convert both module object and module class to cube module or cube module class.
 Among key-value arguments,
 `module_fn` and `module_dtype` control how to create the module object.
-whereas `init_module_params` controls how to load cube module object after conversion is done.
+whereas `init_module_params` controls how to load cube module object after parallelization is done.
 
-2. If you want to save multiple instances of the same module (with differnt configurations),
-you can specify the `instance_name` to distingish them.
+2. If you want to save multiple instances of the same module (with different configurations),
+you can specify the `instance_name` to distinguish them.
 
-3. Currently you must use a shared file system to share the generated files (like mounted Azure Blob).
-Or you can unset `load_module` flag, and manually copy the generated files to other nodes.
-After all nodes have the generated files, you can call `parallelize()` again with `load_module` flag set.
+3. `load_module` flag should be used with `broadcast_strategy`. See more details in the `BroadcastGenFilesStrategy` section.
 
-4. if reuse is not set to ReuseType.MATCH,
-the generated code in outdir will be removed EVEN IF the code generetion fails in this call.
+4. if `reuse` is not set to `ReuseType.MATCH`,
+the generated code in outdir will be removed EVEN IF the code generation fails in this call.
 
-5. For broadcast_strategy, Please note that the broadcast will only be done in torchrun environment,
-      and will throw an error if torch.distributed is not initialized and broadcast_strategy is not NONE.
+5. For `broadcast_strategy`, Please note that the broadcast will only be done in `torchrun` environment, and will throw an error if `torch.distributed` is not initialized and `broadcast_strategy` is not `NONE`.
 
 After the module is converted, you can use it to create module object by calling it like a module class.
 The module class is defined like:
@@ -319,14 +347,14 @@ def build_optimizer(
 ) -> OptimizerT:
 ```
 It has the following parameters:
-- module (torch.nn.Module): the module to be optimized
-- optimizer_fn (Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]]):
+- `module` (`torch.nn.Module`): the module to be optimized
+- `optimizer_fn` (`Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]]`):
     It can be the optimizer class or optimizer factory function.
-    The first parameter of the optimizer_fn should be the module parameters.
+    The first parameter of the `optimizer_fn` should be the module parameters.
 - *args: other args for `optimizer_fn` besides module parameters.
 - **kwargs: the kwargs will pass to `optimizer_fn`
 
-To support distrubted training, in the function we need to hook 4 places:
+To support distributed training, in the function we need to hook 4 places:
 
 1. optimizer constructor:
     the parameters of optimizer will not be the same with the parameters of the module if we use zero.
@@ -349,7 +377,7 @@ To support distrubted training, in the function we need to hook 4 places:
 
 4. `register_reducer_pre_hook`, `register_reducer_post_hook`: Register pre/post hooks to reducers which will be applied before/after gradient synchronization. These hooks will apply to all the reducers (including `_non_parallel_module_reducer`) in the optimizer.
 
-You can use `register_reducer_pre_hook` and `register_reducer_post_hook` to do some operations before/after gradient synchronization. Not all paramers are managed by reducers, so it is tricky to use them. Actually we don't encourage you to use these functions.
+You can use `register_reducer_pre_hook` and `register_reducer_post_hook` to do some operations before/after gradient synchronization. Not all parameters are managed by reducers, so it is tricky to use them. Actually we don't encourage you to use these functions.
 
 Here is one example (Assume we calculate loss with sum) showing how to carefully scale down the gradient locally and scale up the gradient after reduce. This is useful to avoid overflow when the gradients are large:.
 
@@ -370,8 +398,11 @@ You can also merge the checkpoints from different ranks to a single checkpoint.
 We call it a merged checkpoint. The merged checkpoint can be loaded by original module directly.
 So you can easily share the checkpoint with the original module.
 
+On the other hand, a lot of weights/state in the module and the optimizer will be the same in the ranks in parallel training. So we can save a lot of space by deduping the state dicts before saving them to the disk.
 
-We provide two functions to help you save/load the merged checkpoint for the parallel module.
+
+We provide two functions to help you save/load the merged checkpoint for the parallel module,
+and two other functions to help you save/load the deduped state dicts for the parallel module.
 
 #### `merge_state_dicts`
 ```python
@@ -385,7 +416,7 @@ Merge a list of shard state dicts (one for each rank) to a single full state dic
 Note: Only Adam-like optimizers are supported for merging
 
 Please Note:
-    We don't garantee the devices of tensors are the same in the merged state dict.
+    We don't guarantee the devices of tensors are the same in the merged state dict.
     You can assume the device of the tensors in the merged state dict can be one of the following:
         1. the current device when running this function
         2. the current cuda device when running this function
@@ -409,11 +440,35 @@ Load the merged state dicts to the module, and optionally the optimizer to a spe
 Please note the `device` parameter. If it is None, we will use `torch.cuda.current_device()` to get the current device. If you want to load the state dict to a specific device, you can set it to the device you want.
 
 
+#### `deduped_state_dicts`
+
+In parallel training, a lot of weights/state in the module and the optimizer will be the same in the ranks. So we can save a lot of space by deduping the state dicts before saving them to the disk.
+
+```python
+def deduped_state_dict(
+    module: torch.nn.Module,
+    optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+```
+
+#### `load_deduped_state_dict`
+
+```python
+def load_deduped_state_dict(
+    module: torch.nn.Module,
+    module_state_dict: Dict[str, Any],
+    optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
+    optimizer_state_dict: Optional[Dict[str, Any]] = None,
+    *,
+    device: Union[str, torch.device] = None
+) -> None:
+```
+
 ### Dataset
 
 We use the same dataset/dataloader as pytorch. For example, you can use `torch.utils.data.DistributedSampler` to create a distributed sampler.
 
-`ParallelModule`s running in the same unit should use the same input, and will get the same output. `ParallelModule`s runing in different units should use different input and will get different output (similar to data parallelism). The gradients of all parameters will be synced across all the devices automatically.
+`ParallelModule`s running in the same unit should use the same input, and will get the same output. `ParallelModule`s running in different units should use different input and will get different output (similar to data parallelism). The gradients of all parameters will be synced across all the devices automatically.
 
 Take `torch.utils.data.DistributedSampler` for example, you can create the sampler like this:
 ```python
@@ -427,4 +482,5 @@ def create_distributed_sampler(dataset):
 ```
 
 ## TODOs
+
 1. Pipeline parallelism is not supported yet.

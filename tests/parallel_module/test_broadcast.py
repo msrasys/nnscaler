@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from cube.parallel import ComputeConfig, parallelize
+from cube.parallel import ComputeConfig, parallelize, broadcast_weights
 
 from .common import PASRandomSPMD, init_distributed
 from ..launch_torchrun import launch_torchrun
@@ -91,7 +91,7 @@ def _gpu_worker():
             for n, pa in m.named_parameters():
                 if n.startswith('linear_weight'):
                     assert not torch.equal(pa.data, torch.ones_like(pa.data))
-        m.broadcast_weights()
+        broadcast_weights(m)
         # check if broadcast_weights works
         for n, pa in m.named_parameters():
             if n.startswith('linear_weight'):
@@ -113,7 +113,7 @@ def _gpu_worker():
         m = p(tempdir, 'all', '_6', load_module=False, reuse='graph')
         if torch.distributed.get_rank() != 0:
             # only python files are broadcasted
-            assert list(f.name for f in Path(tempdir).glob('**/*') if f.is_file()) == ['gencode0.py', 'gencode1.py']
+            assert set(f.name for f in Path(tempdir).glob('**/*') if f.is_file()) == set(['gencode0.py', 'gencode1.py'])
 
         # case 6.2: everything should be broadcasted, including weights
         # so the load_module will succeed.

@@ -2,7 +2,7 @@ from datetime import datetime
 import math
 import random
 import shutil
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import contextlib
 
 import torch
@@ -158,3 +158,19 @@ def clear_dir_on_rank0(tempdir):
     torch.distributed.barrier()
     if torch.distributed.get_rank() == 0 and tempdir.exists():
         shutil.rmtree(tempdir)
+
+
+def assert_equal(a: Any, b: Any):
+    assert type(a) == type(b)
+    if isinstance(a, torch.Tensor):
+        assert torch.equal(a.cpu(), b.cpu())
+    elif isinstance(a, dict):
+        assert len(a) == len(b)
+        for k in a.keys():
+            assert_equal(a[k], b[k])
+    elif isinstance(a, (list, tuple)):
+        assert len(a) == len(b)
+        for i in range(len(a)):
+            assert_equal(a[i], b[i])
+    else:
+        assert a == b
