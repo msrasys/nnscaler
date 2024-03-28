@@ -331,42 +331,37 @@ class ConcreteTracer(TracerBase):
         self.record_frames = record_frames
         self.patcher = FunctionPatcher()
 
+        # When we concrete executing some functions,
+        # we need revert all the patched function to the unpatched version to ensure the correctness of some underlying code.
+        # For most functions, disable_call is sufficient, but it is necessary when executing, for example, a triton function.
+        # Here we put all user wrapped function into the set, and unpatch all the patched functions when executing the user function.
+        self.need_revert_functions = set()
+        self.need_revert_wrapped_functions = set()
+
+        self.temp_call_origin = False
+
+    def add_need_revert_function(self, func, wrapped_func):
+        self.need_revert_functions.add(func)
+        self.need_revert_wrapped_functions.add(wrapped_func)
+
+    def need_revert(self, func):
+        return func in self.need_revert_functions or func in self.need_revert_wrapped_functions
+
     @contextmanager
-    def do_temp_disable(self, call=False, attr=False, agfunc_apply=False):
-        assert call | attr | agfunc_apply
-        # to pass pyright check
-        temp_disable_call, temp_disable_attr, temp_disable_agfunc_apply = False, False, False
-        if call:
-            self.temp_disable_call_level += 1
-            temp_disable_call = self.temp_disable_call
-            self.temp_disable_call = True
-        if attr:
-            self.temp_disable_attr_level += 1
-            temp_disable_attr = self.temp_disable_attr
-            self.temp_disable_attr = True
-        if agfunc_apply:
-            self.temp_disable_agfunc_apply_level += 1
-            temp_disable_agfunc_apply = self.temp_disable_agfunc_apply
-            self.temp_disable_agfunc_apply = True
+    def do_temp_call_origin(self):
+        temp_call_origin = self.temp_call_origin
+        self.temp_call_origin = True
         try:
             yield
         finally:
-            if agfunc_apply:
-                self.temp_disable_agfunc_apply = temp_disable_agfunc_apply
-                self.temp_disable_agfunc_apply_level -= 1
-            if attr:
-                self.temp_disable_attr = temp_disable_attr
-                self.temp_disable_attr_level -= 1
-            if call:
-                self.temp_disable_call = temp_disable_call
-                self.temp_disable_call_level -= 1
+            self.temp_call_origin = temp_call_origin
 
     @compatibility(is_backward_compatible=True)
     def fetch_attr(self, target: str) -> Any:
         """
         to get the attr in self.root. only for execution of 'call_module' nodes.
         """
-        with self.do_temp_disable(attr=True):
+        with self.do_temp_call_origin():
             target_atoms = target.split('.')
             attr_itr = self.root
             for i, atom in _orig_enumerate(target_atoms):
@@ -400,10 +395,14 @@ class ConcreteTracer(TracerBase):
                 assert isinstance(target, str)
                 mod = self.fetch_attr(target)
                 if self.cpu_offload:
-                    mod.cuda()  # how it works in ddp?
-                result = mod(*args, **kwargs)
-                if self.cpu_offload:
-                    mod.cpu()
+                    try:
+                        mod.cuda()
+                        result = mod(*args, **kwargs)
+                    except:
+                        mod.cpu()
+                        raise
+                else:
+                    result = mod(*args, **kwargs)
             elif kind == 'get_attr':
                 assert isinstance(target, str)
                 return self.fetch_attr(target)
@@ -411,21 +410,27 @@ class ConcreteTracer(TracerBase):
                 raise RuntimeError()
             return result
 
-        with self.do_temp_disable(call=True):
-            if self.cpu_offload:
-                args, kwargs = tree_to_cuda(args), tree_to_cuda(kwargs)
+        if self.cpu_offload:
+            args, kwargs = tree_to_cuda(args), tree_to_cuda(kwargs)
 
+        try:
             result = run(kind, target, args, kwargs)
-
+        except torch.cuda.OutOfMemoryError:
             if self.cpu_offload:
-                args, kwargs, result = tree_to_cpu(args), tree_to_cpu(kwargs), tree_to_cpu(result)
+                _logger.warning(f"cuda out of memory, try to trace {target} on cpu.")
+                args, kwargs = tree_to_cpu(args), tree_to_cpu(kwargs)
+                result = run(kind, target, args, kwargs)
+            else:
+                raise
 
-                unexpected_types = types_other_than(result, (*base_types, type(None), torch.Tensor))
-                if not contains_types(result, (torch.Tensor,)) and unexpected_types:
-                    _logger.warning(f"result of target {target} contains unexpected types {unexpected_types}, which is not a common behavior.")
-                torch.cuda.empty_cache()
+        if self.cpu_offload:
+            args, kwargs, result = tree_to_cpu(args), tree_to_cpu(kwargs), tree_to_cpu(result)
 
-        self.temp_disable_call = False
+            unexpected_types = types_other_than(result, (*base_types, type(None), torch.Tensor))
+            if not contains_types(result, (torch.Tensor,)) and unexpected_types:
+                _logger.warning(f"result of target {target} contains unexpected types {unexpected_types}, which is not a common behavior.")
+            torch.cuda.empty_cache()
+
         return result, args, kwargs
 
     @compatibility(is_backward_compatible=True)
@@ -471,9 +476,14 @@ class ConcreteTracer(TracerBase):
         use the 'run_target' to actually execute the code, and store the value in 'value' field.
         create the nodes for the target and the input of the target (if the target is one of call_method, call_function, call_module).
         """
-        with self.patcher.revert():
+        with self.do_temp_call_origin():
             args_unwrapped, kwargs_unwrapped = unwrap_nested_proxy(args), unwrap_nested_proxy(kwargs)
-            value_unwrapped, args_run, kwargs_run = self.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+
+            if self.need_revert(target):
+                with self.patcher.revert():
+                    value_unwrapped, args_run, kwargs_run = self.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+            else:
+                value_unwrapped, args_run, kwargs_run = self.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
 
             # because setitem is an inplace operation and will not return the obj, so here is a workaound to record node result
             node_result = args_run[0] if kind == "call_function" and target == operator.setitem else value_unwrapped
@@ -489,7 +499,7 @@ class ConcreteTracer(TracerBase):
         node = self.create_node(kind, target, args_, kwargs_, name, type_expr, node_result)
 
         if self.record_frames and kind != 'placeholder':
-            with self.do_temp_disable(True, True, True):
+            with self.do_temp_call_origin():
                 # record code frame, include filename, line number, and function name
                 frame_record = FrameRecord(None, None, None, None)
                 cube_path = str(Path(importlib.util.find_spec('cube').origin).parent) + '/'  # the cube path
@@ -842,12 +852,12 @@ class ConcreteTracer(TracerBase):
 
         @functools.wraps(_orig_module_getattribute)
         def module_getattribute_wrapper(mod, attr):
-            if self.temp_disable_call | self.temp_disable_attr:
+            if self.temp_call_origin:
                 try:
                     return _orig_module_getattribute(mod, attr)
                 except AttributeError:
                     return _orig_module_getattr(mod, attr)
-            with self.do_temp_disable(attr=True):
+            with self.do_temp_call_origin():
                 try:
                     attr_val = _orig_module_getattribute(mod, attr)
                 except AttributeError:
@@ -881,7 +891,7 @@ class ConcreteTracer(TracerBase):
 
         @functools.wraps(_orig_module_call)
         def module_call_wrapper(mod, *args, **kwargs):
-            if self.temp_disable_call:
+            if self.temp_call_origin:
                 return _orig_module_call(mod, *args, **kwargs)
             else:
                 # codes below corresponds to symbolic tracer's call_module
@@ -1008,7 +1018,7 @@ class ConcreteTracer(TracerBase):
         def agfunc_apply_wrapper(clz, *args, **kwargs):
             if clz not in self.agfunc_dict:
                 self.agfunc_dict[clz] = torch._C._FunctionBase.__dict__['apply'].__get__(None, clz)
-            if self.temp_disable_agfunc_apply or self.temp_disable_call:
+            if self.temp_call_origin:
                 return self.agfunc_dict[clz](*args, **kwargs)
             tracers = _orig_set()
             def unwrap_detect_tracers(obj):
@@ -1060,25 +1070,44 @@ class ConcreteTracer(TracerBase):
                 elif func.__name__ != func.__qualname__ and func.__qualname__ != 'boolean_dispatch.<locals>.fn' \
                     and not func.__qualname__.startswith('PyCapsule'):
                     # method
-                    if func.__module__.startswith('_') and func.__module__ != '__main__':
-                        path = sys.modules[func.__module__[1:]]
-                    else:
-                        path = sys.modules[func.__module__]
-                    path = getattr(path, func.__qualname__.split('.')[0])
-                    locations = (*locations, Location(path, func.__name__))
+                    # in torch >= 2.2, we found two functions under torch._C has no __module__:
+                    #   <built-in method _make_subclass of torch._C._TensorMeta>
+                    #   <built-in method _make_wrapper_subclass of torch._C._TensorMeta>
+                    if func.__module__ is not None:
+                        if func.__module__.startswith('_') and func.__module__ != '__main__':
+                            path = sys.modules[func.__module__[1:]]
+                        else:
+                            path = sys.modules[func.__module__]
+                        path = getattr(path, func.__qualname__.split('.')[0])
+                        locations = (*locations, Location(path, func.__name__))
+                    if len(locations) == 0:
+                        _logger.warning(f'Can not find location of {func}, skip wrap it.')
+                        continue
                     wrapped = _create_wrapped_leaf_method(self, func, func.__name__, wrap_info.replace_fn)
                 else:
                     # common function
-                    if func.__module__.startswith('_') and func.__module__ != '__main__':
-                        path = sys.modules[func.__module__[1:]]
-                    else:
-                        path = sys.modules[func.__module__]
-                    locations = (*locations, Location(path, func.__name__))
+                    # in torch >= 2.2, we found two functions under torch._C has no __module__:
+                    #   <built-in method _make_subclass of torch._C._TensorMeta>
+                    #   <built-in method _make_wrapper_subclass of torch._C._TensorMeta>
+                    if func.__module__ is not None:
+                        if func.__module__.startswith('_') and func.__module__ != '__main__':
+                            path = sys.modules[func.__module__[1:]]
+                        else:
+                            path = sys.modules[func.__module__]
+                        locations = (*locations, Location(path, func.__name__))
+                    if len(locations) == 0:
+                        _logger.warning(f'Can not find location of {func}, skip wrap it.')
+                        continue
                     if wrap_info.is_force_trace:
                         wrapped = _create_wrapped_leaf_func(self, func, wrap_info.replace_fn, (self,))
                     else:
                         wrapped = _create_wrapped_leaf_func(self, func, wrap_info.replace_fn)
             self.wrapped_leaf[func] = (locations, wrapped)
+
+        # for the customized functions, we need to revert all the wrapped function to the original one to run it
+        # for the functions default wrapped, we don't revert to save time
+        for func in autowrap_leaf_function:
+            self.add_need_revert_function(func, self.wrapped_leaf.get(func, (None, None))[1])
 
         self.clz_wrapper_map: Dict[Any, Type] = {
             map_wrapper: _orig_map,
@@ -1157,13 +1186,6 @@ class ConcreteTracer(TracerBase):
                 args[0] = args[0].value
             return _orig_getattr(obj, *args)
 
-        # for passing the tracing of leaf modules
-        self.temp_disable_call = False
-        self.temp_disable_attr = False
-        self.temp_disable_agfunc_apply = False
-        self.temp_disable_call_level = 0
-        self.temp_disable_attr_level = 0
-        self.temp_disable_agfunc_apply_level = 0
         try:
             with self.patcher:
                 # allow duplicate patches to support the case of nested calls
@@ -1506,7 +1528,7 @@ def _create_wrapped_leaf_func(tracer: ConcreteTracer, func: Callable, to_func: O
         to_func = func
     @functools.wraps(func)
     def func_wrapper(*args, **kwargs):
-        if tracer.temp_disable_call:
+        if tracer.temp_call_origin:
             return func(*args, **kwargs)
         tracers = _orig_set(init_tracers)
         def unwrap_detect_tracers(obj):
@@ -1525,7 +1547,7 @@ def _create_wrapped_leaf_func(tracer: ConcreteTracer, func: Callable, to_func: O
 def _create_wrapped_leaf_method(tracer: ConcreteTracer, method, name: str, to_func: Optional[Callable]):
     @functools.wraps(method)
     def method_wrapper(*args, **kwargs):
-        if tracer.temp_disable_call:
+        if tracer.temp_call_origin:
             return method(*args, **kwargs)
         tracers = _orig_set()
         def unwrap_detect_tracers(obj):
@@ -1560,7 +1582,7 @@ def _create_wrapped_leaf_class(tracer: ConcreteTracer, clz):
         _fx_wrapped_ori_clz = clz
 
         def __new__(cls, *args, **kwargs):
-            if tracer.temp_disable_call:
+            if tracer.temp_call_origin:
                 return clz(*args, **kwargs)
             tracers = _orig_set()
             def unwrap_detect_tracers(obj):
@@ -1603,7 +1625,7 @@ def _create_wrapped_leaf_iterable_class(tracer: ConcreteTracer, clz):
         _fx_wrapped_ori_clz = clz
 
         def __new__(cls, *args, **kwargs):
-            if tracer.temp_disable_call:
+            if tracer.temp_call_origin:
                 return clz(*args, **kwargs)
             tracers = _orig_set()
             if _orig_len(args) != 0:
@@ -1644,7 +1666,7 @@ def _create_wrapped_attr_for_middle_class(tracer: ConcreteTracer, clz, the_path_
         _orig_clz_getattr = None
     @functools.wraps(_orig_clz_getattribute)
     def clz_getattr_wrapper(obj, attr):
-        if tracer.temp_disable_call | tracer.temp_disable_attr:
+        if tracer.temp_call_origin:
             if _orig_clz_getattr == None:
                 return _orig_clz_getattribute(obj, attr)
             else:

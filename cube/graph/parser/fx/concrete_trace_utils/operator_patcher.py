@@ -299,6 +299,6 @@ class OperatorPatcherContext:
     def patch_run(func, *args, **kwargs):
         assert OperatorPatcherContext.ctx_tracer is not None
         assert OperatorPatcherContext.ctx_patcher is not None
-        with OperatorPatcherContext.ctx_tracer.do_temp_disable(True, True, True):
+        with OperatorPatcherContext.ctx_tracer.do_temp_call_origin():
             new_func = OperatorPatcherContext.ctx_patcher.patch_func_or_module(func)
         return new_func(*args, **kwargs)
