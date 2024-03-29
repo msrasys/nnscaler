@@ -121,10 +121,10 @@ def _gpu_worker(pas, ngpus, update_freq):
         return (
             orig_results,
             compiled_results,
-            compiled_module.fc_relu1.get_full_map(),
-            compiled_module.fc_relu1.get_dist_param_map(),
-            compiled_module.fc_relu2.get_full_map(),
-            compiled_module.fc_relu2.get_dist_param_map(),
+            compiled_module.fc_relu1.fullmap,
+            compiled_module.fc_relu1.dist_param_map,
+            compiled_module.fc_relu2.fullmap,
+            compiled_module.fc_relu2.dist_param_map,
         )
 
 

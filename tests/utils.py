@@ -1,8 +1,10 @@
 import os
+import re
 import sys
-from typing import Type
+from typing import Optional, Tuple, Type, Union, Pattern
 from contextlib import contextmanager
 from typing import Callable
+import functools
 import math
 import random
 from datetime import timedelta
@@ -227,9 +229,11 @@ def mock_dist(rank, world_size):
     """
 
     old_store_based_barrier = c10d._store_based_barrier
+    old_new_group = dist.new_group
     try:
         c10d._store_based_barrier = lambda *args, **kwargs: None
         mock_init_dist(rank, world_size)
+        dist.new_group = lambda *args, **kwargs: None
         yield
     finally:
         dist.destroy_process_group()
@@ -281,3 +285,34 @@ def new_empty(cube_module_cls: Type[ParallelModule], device='meta', init_params=
     compute_config = torch.load(module_file.with_name(f"{cube_module_cls.COMPUTE_CONFIG_FILE}"))
     with replace_all_device_with(device, True), mock_cube_env(cube_module_cls, compute_config), mock_dist(cube_module_cls.rank, compute_config.runtime_ngpus):
         return cube_module_cls(init_params=init_params)
+
+
+def retry(*exceptions, max_tries=3, match: Optional[Union[str, Pattern[str]]] = None, delay=5):
+    """
+    Retry the function if an exception is raised.
+
+    Args:
+        max_tries (int): the maximum number of tries
+
+    Example:
+        @retry():
+        def f(*args, **kwargs):
+            ...
+    """
+    exceptions = exceptions or (Exception,)
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for i in range(max_tries):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    matched = not match or re.search(match, str(e))
+                    if i == max_tries - 1 or not matched:
+                        raise
+                    from time import sleep
+                    print(f"retrying... {e} after {delay} seconds")
+                    sleep(delay)
+        return wrapper
+
+    return decorator

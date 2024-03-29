@@ -109,8 +109,8 @@ def _gpu_worker(pas, ngpus):
         return (
             orig_results,
             compiled_results,
-            compiled_module.get_full_map(),
-            compiled_module.get_dist_param_map(),
+            compiled_module.fullmap,
+            compiled_module.dist_param_map,
         )
 
 

@@ -32,9 +32,9 @@ def _init_params_worker():
         module1 = cube_module()
         module2 = cube_module()
         module3 = cube_module(init_params=False)
-        assert module1.get_rank() == 0
-        assert module2.get_rank() == 0
-        assert module3.get_rank() == 0
+        assert module1.rank == 0
+        assert module2.rank == 0
+        assert module3.rank == 0
 
         for p1, p2 in zip(module1.parameters(), module2.parameters()):
             assert torch.equal(p1, p2)
@@ -76,7 +76,7 @@ def test_empty_weights(model_class, tp):
         for i in range(4):
             module_class = _load_cube_module_class(model_class, cube_savedir=tempdir, rank=i)
             m = new_empty(module_class)
-            assert m.get_rank() == i
+            assert m.rank == i
             for p in m.parameters():
                 assert p.device == torch.device('meta')
             for r in m.reducers:

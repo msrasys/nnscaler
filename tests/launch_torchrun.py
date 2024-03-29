@@ -3,8 +3,12 @@ import uuid
 import torch
 
 from torch.distributed.run import elastic_launch, LaunchConfig
+from torch.distributed.elastic.multiprocessing.errors import ChildFailedError
+
+from .utils import retry
 
 
+@retry(ChildFailedError, delay=10, match='RuntimeError: The server socket has failed to listen on any local network address.')
 def launch_torchrun(nproc_per_node, worker_fn, *args, **kwargs):
     launch_config = LaunchConfig(
         min_nodes=1,

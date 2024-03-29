@@ -749,7 +749,13 @@ def parallelize(
     reuse = ReuseType(reuse) if isinstance(reuse, str) else reuse
     broadcast_strategy = BroadcastGenFilesStrategy(broadcast_strategy) if isinstance(broadcast_strategy, str) else broadcast_strategy
 
-    # genereate code only in node0
+    # Call it here just to ensure the device group is initialized.
+    # If the user initializes torch.distributed
+    #     and doesn't call `cube.init()` before calling this function, this is necessary.
+    if torch.distributed.is_initialized():
+        _ = DeviceGroup()
+
+    # generate code only in node0
     # if it is not in a torchrun environment, just generate.
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         outdir, reusable = _prepare_and_check_reusable(cube_savedir, module_class, compute_config, instance_name, reuse)
@@ -770,6 +776,13 @@ def parallelize(
         else:
             regen_status = RegenStatus.NONE
             logger.info(f"Reuse generated code in {outdir}")
+
+    if torch.distributed.is_initialized():
+        # code generation can take very long time (for example, over 1 hour)
+        # It is not always OK to use torch.distributed.barrier() directly.
+        # because the default timeout for nccl is 30 minutes
+        # (we can't control the timeout setting if torch.distributed is not initialized by us)
+        DeviceGroup().long_barrier()
 
     if broadcast_strategy != BroadcastGenFilesStrategy.NONE:
         if not torch.distributed.is_initialized(): # we only support loading in torchrun environment
@@ -1000,7 +1013,7 @@ def build_optimizer(
         raise RuntimeError("No ParallelModule found in the module. Please make sure you have called parallelize() before build_optimizer().")
 
     # check if all ParallelModules have the same gpu_config
-    compute_configs = [m.get_compute_config() for m in parallel_modules]
+    compute_configs = [m.compute_config for m in parallel_modules]
     for i in range(1, len(compute_configs)):
         if compute_configs[i].gpu_config != compute_configs[0].gpu_config:
             raise RuntimeError("All ParallelModules should have the same gpu_config.")
@@ -1027,7 +1040,7 @@ def build_optimizer(
             lambda m: [
                     (cube_suffix, p)  # (cube_suffix, p) to meet _named_members requirement
                     for p in (
-                        m.parameters_for_optimizer() if m.get_compute_config().use_zero
+                        m.parameters_for_optimizer() if m.compute_config.use_zero
                         else m.parameters() # `CubeModule.merge_partial_states` supports parameters_for_optimizer() only in zero mode
                     )
                 ]
@@ -1053,7 +1066,7 @@ def build_optimizer(
             name=type(optimizer).__name__,
             parallel_module_locs=opt_module_locs,
             parallel_module_configs={
-                name: m.get_compute_config()
+                name: m.compute_config
                 for name, m in module.named_modules()
                 if isinstance(m, ParallelModule)
             }
@@ -1551,7 +1564,7 @@ def _opt_load_merged_state_dict(module: ParallelModule, states: Dict[int, Dict[s
                 orig_param_dict[name] = states[cnt]
             cnt = cnt + 1
 
-        if module.get_compute_config().use_zero:
+        if module.compute_config.use_zero:
             return _construct_optim_state_zero(module, orig_param_dict)
         else:
             return _construct_optim_state_nonzero(module, orig_param_dict)
@@ -1561,8 +1574,8 @@ def _construct_optim_state_zero(
         module: ParallelModule,
         orig_param_dict: Dict[str, Dict[str, Any]],
 ):
-    dist_param_map = module.get_dist_param_map()  # name in parallel module (without tid suffix) -> name in origin module
-    param_area_map = module.get_full_map()        # str -> AttrMeta
+    dist_param_map = module.dist_param_map  # name in parallel module (without tid suffix) -> name in origin module
+    param_area_map = module.fullmap         # str -> AttrMeta
     def _get_optimizer_state_of_param(param, param_ids, local_names):
         # find the parameter's optimizer state and pick the slices induced by tensor parallelism
         param_idx = param_ids.index(id(param))
@@ -1667,8 +1680,8 @@ def _construct_optim_state_nonzero(
         module: ParallelModule,
         orig_param_dict: Dict[str, Dict[str, Any]]
 ):
-    dist_param_map = module.get_dist_param_map()  # name in parallel module (without tid suffix) -> name in origin module
-    param_area_map = module.get_full_map()        # str -> AttrMeta
+    dist_param_map = module.dist_param_map  # name in parallel module (without tid suffix) -> name in origin module
+    param_area_map = module.fullmap         # str -> AttrMeta
 
     new_states = {}
     for index, (local_name, _) in enumerate(module.named_parameters()):

@@ -928,7 +928,7 @@ def Norm(input, p='fro', dim=None, keepdim=False, out=None, dtype=None, signatur
     }
     if dim is None:
         einput = [edim + '^' for edim in einput]
-        anno = OpAnno.create_op_str([einput], ['1'])
+        anno = OpAnno.create_op_str([einput], [['1']])
         return IRDimops(Norm, 'norm', signature, [anno], [input], **kwargs)
     else:
         dim = (dim,) if isinstance(dim, int) else dim
@@ -959,7 +959,7 @@ def Sum(input, dim=None, keepdim=False, *, dtype=None, signature = None):
     eoutput = copy.copy(einput)
     if dim is None:
         einput = [edim + '+' for edim in einput]
-        anno = OpAnno.create_op_str([einput], ['1'])
+        anno = OpAnno.create_op_str([einput], [['1']])
         return IRDimops(Sum, 'sum', signature, [anno], [input])
     else:
         dim = (dim,) if isinstance(dim, int) else dim
@@ -1907,7 +1907,7 @@ def Max(input, other_or_dim=None, keepdim=False, *, out=None, signature = None, 
         other_or_dim_val = _unwrap_value(other_or_dim)
         if other_or_dim_val is None:
             edim_in = [s + '^' for s in ShapeAnno.create_shape_str(input.shape)]
-            annos = [OpAnno.create_op_str([edim_in], ['1'])]
+            annos = [OpAnno.create_op_str([edim_in], [['1']])]
             return IRDimops(Max, 'max', signature, annos, [input])
         elif isinstance(other_or_dim_val, int):
             keepdim_val = _unwrap_value(keepdim)
@@ -2198,7 +2198,7 @@ def Min(input, other_or_dim=None, keepdim=False, *, out=None, signature = None, 
         other_or_dim_val = _unwrap_value(other_or_dim)
         if other_or_dim_val is None:
             edim_in = [s + '^' for s in ShapeAnno.create_shape_str(input.shape)]
-            annos = [OpAnno.create_op_str([edim_in], ['1'])]
+            annos = [OpAnno.create_op_str([edim_in], [['1']])]
             return IRDimops(Min, 'min', signature, annos, [input])
         elif isinstance(other_or_dim_val, int):
             keepdim_val = _unwrap_value(keepdim)
@@ -2212,7 +2212,7 @@ def Min(input, other_or_dim=None, keepdim=False, *, out=None, signature = None, 
             kwargs = {'dim': other_or_dim, 'keepdim': keepdim}
             annos = [OpAnno.create_op_str([edim_in], [edim_out, edim_out])]
             return IRDimops(Min, 'min', signature, annos, [input], **kwargs)
-        
+
 
 def Log(input, *, out=None, signature=None):
     """
@@ -2227,7 +2227,7 @@ def Log(input, *, out=None, signature=None):
     annos = [OpAnno.create_op_str([edim_in], [edim_in])]
     return IRDimops(Log, 'log', signature, annos, [input])
 
-    
+
 def FullLike(input, fill_value, *, dtype=None, layout=None,
              device=None, requires_grad=False, memory_format=None, signature=None):
     """

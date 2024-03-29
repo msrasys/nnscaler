@@ -11,6 +11,7 @@ import datetime
 from cube.flags import CompileFlag
 
 _logger = logging.getLogger(__name__)
+_LARGE_TIMEOUT = datetime.timedelta(seconds=21600)
 
 
 class DeviceGroup:
@@ -27,7 +28,16 @@ class DeviceGroup:
             else:
                 if not torch.distributed.is_initialized():
                     torch.distributed.init_process_group(
-                        backend='nccl', timeout=datetime.timedelta(seconds=21600))
+                        backend='nccl', timeout=_LARGE_TIMEOUT
+                    )
+
+                # create a barrier group for synchronization
+                # it is OK even the user has already created this gloo group
+                # this new timeout will override the old one.
+                self.barrier_gloo_group = torch.distributed.new_group(
+                    backend='gloo', timeout=_LARGE_TIMEOUT
+                )
+
                 self.rank = torch.distributed.get_rank()
                 self.world_size = torch.distributed.get_world_size()
                 # assume each node has the same device number
@@ -73,8 +83,14 @@ class DeviceGroup:
         rank_bits = DeviceGroup.bitmap(ranks)
         if rank_bits not in self.instance.groups:
             self.groups[rank_bits] = torch.distributed.new_group(
-                list(ranks), timeout=datetime.timedelta(seconds=21600))
+                list(ranks), timeout=_LARGE_TIMEOUT)
         return self.groups[rank_bits]
+
+    def long_barrier(self):
+        """
+        Barrier synchronization with very long timeout
+        """
+        torch.distributed.barrier(group=self.instance.barrier_gloo_group)
 
     def get_stream(self, name: str) -> torch.cuda.Stream:
         """

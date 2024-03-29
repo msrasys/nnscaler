@@ -214,10 +214,10 @@ def _gpu_worker_cube(pas, plan_ngpus, runtime_ngpus, update_freq, use_zero):
         )
         return (
             compiled_results,
-            compiled_module.fc_relu1.get_full_map(),
-            compiled_module.fc_relu1.get_dist_param_map(),
-            compiled_module.fc_relu2.get_full_map(),
-            compiled_module.fc_relu2.get_dist_param_map(),
+            compiled_module.fc_relu1.fullmap,
+            compiled_module.fc_relu1.dist_param_map,
+            compiled_module.fc_relu2.fullmap,
+            compiled_module.fc_relu2.dist_param_map,
         )
 
 def _get_fc_weights(state_dict: dict, prefix):

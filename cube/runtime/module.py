@@ -57,7 +57,11 @@ class CubeModule(torch.nn.Module):
         return self._reducers
 
     @property
-    def fullmap(self):
+    def fullmap(self) -> Dict[str, AttrMeta]:
+        """
+        Get the mapping from the name of local attribute tensor
+        to its corresponding fulltensor meta
+        """
         return self._fullmap
 
     def tid_of_param_name(self, name: str) -> int:
@@ -572,6 +576,8 @@ class ParallelModule(CubeModule):
     COMPUTE_CONFIG_FILE = 'compute_config.pt'
     ORIGIN_MODULE_METADATA_FILE = 'origin_module_metadata.pt'
     EXTRA_STATE_KEY = 'CUBE_EXTRA_STATE'
+    # the rank of the module, will be assigned in the generated subclasses
+    rank: int
 
     def __init__(self):
         if self.__class__  == ParallelModule:  # not init via super().__init__()
@@ -641,7 +647,8 @@ class ParallelModule(CubeModule):
             for reducer in self._reducers:
                 reducer.sync_grads()
 
-    def get_dist_param_map(self) -> Dict[str, str]:
+    @property
+    def dist_param_map(self) -> Dict[str, str]:
         """
         Get the parameter map of the model.
         The map is a dict mapping from the new parameter name (without tid suffix) in parallel module
@@ -649,11 +656,9 @@ class ParallelModule(CubeModule):
         """
         return self._dist_param_map
 
-    def get_compute_config(self) -> 'ComputeConfig':
+    @property
+    def compute_config(self) -> 'ComputeConfig':
         return self._compute_config
-
-    def get_rank(self) -> int:
-        return self.rank  # rank is a class varible defined in gencode
 
     def clip_gnorm(self, max_norm: Optional[float] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
@@ -667,7 +672,7 @@ class ParallelModule(CubeModule):
         """
         from cube.runtime.gnorm import prepare_for_grad_clip, clip_gnorm
         if self._nreplicas2localparams is None:
-            self._nreplicas2localparams = prepare_for_grad_clip(self, self.get_compute_config().use_zero)
+            self._nreplicas2localparams = prepare_for_grad_clip(self, self.compute_config.use_zero)
 
         # make sure the gradients are synchronized
         self.sync_grad()
@@ -700,7 +705,7 @@ class ParallelModule(CubeModule):
         Returns:
             ZeroMetadata: the zero related metadata
         """
-        if not self.get_compute_config().use_zero:
+        if not self.compute_config.use_zero:
             return ZeroMetadata()
 
         model_params = self.parameters_for_optimizer()
@@ -755,18 +760,18 @@ class ParallelModule(CubeModule):
             rank_idx (int): the index of current rank in sub_ranks
             sub_ranks (list): the ranks of ZeRO subgroup the current rank belongs to
         """
-        cf = self.get_compute_config()
+        cf = self.compute_config
         if not cf.use_zero:
             raise RuntimeError('ZERO is not enabled, cannot get the zero subgroup info')
 
-        rank_idx = reducer.ranks.index(self.get_rank())
+        rank_idx = reducer.ranks.index(self.rank)
         if cf.zero_ngroups > 1:
             assert len(reducer.ranks) % cf.zero_ngroups == 0, \
                 f'reducer.ranks {reducer.ranks} should be divisible by ZERO_NUM_GROUPS {cf.zero_ngroups}'
             zgroup_sz = len(reducer.ranks) // cf.zero_ngroups
             group_idx = rank_idx // zgroup_sz
             sub_ranks = reducer.ranks[group_idx * zgroup_sz : (group_idx + 1) * zgroup_sz]
-            new_rank_idx = sub_ranks.index(self.get_rank())
+            new_rank_idx = sub_ranks.index(self.rank)
             return new_rank_idx, sub_ranks
         else:
             assert cf.zero_ngroups == 1
@@ -775,7 +780,7 @@ class ParallelModule(CubeModule):
     def _add_extra_state(self, state_dict, prefix) -> None:
         state_dict[f'{prefix}{self.EXTRA_STATE_KEY}'] = asdict(
             ExtraState(
-                rank=self.get_rank(),
+                rank=self.rank,
                 compute_config=self._compute_config,
                 dist_param_map=self._dist_param_map,
                 param_area_map=self._fullmap,
@@ -799,14 +804,14 @@ class ParallelModule(CubeModule):
         """
         Get the size of the deduplication group of the model state dict, which is `plan_ngpus`.
         """
-        return self.get_compute_config().module_dedup_group_size
+        return self.compute_config.module_dedup_group_size
 
     @property
     def optimizer_dedup_group_size(self) -> int:
         """
         Get the size of the deduplication group of the optimizer state dict.
         """
-        return self.get_compute_config().optimizer_dedup_group_size
+        return self.compute_config.optimizer_dedup_group_size
 
     def _list_fullmodel_files(self) -> List[Path]:
         legacy_fullmodel_path = self.module_dir / FxModuleParser.ATTR_CONTENT_FILE_STEM
@@ -841,7 +846,7 @@ class ParallelModule(CubeModule):
             RuntimeError: if strict=True and there are missing keys.
         """
 
-        dist2param = self.get_dist_param_map()
+        dist2param = self.dist_param_map
         orig_param_names = list(dist2param.values())  # param names in original module (without prefix)
 
         with torch.no_grad():

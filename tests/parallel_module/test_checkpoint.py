@@ -340,7 +340,7 @@ def test_checkpoint(module_type, use_zero):
 
 
 def assert_intra_reducer(module: ParallelModule):
-    assert module.get_compute_config().plan_ngpus == module.get_compute_config().runtime_ngpus
+    assert module.compute_config.plan_ngpus == module.compute_config.runtime_ngpus
     assert len(module.reducers) > 0
     # so we have both parameters in reducers and not in reducers
     # (assume one reducer gives one bucket, which is true in general.)
