@@ -190,6 +190,7 @@ class IRGraph(IRSegment):
                 if isinstance(ftensor, IRObject):
                     subtensor = ftensor.tosub() if isinstance(ftensor, IRFullTensor) else ftensor
                     node.set_output(idx, subtensor)
+            node.kwargs.update(IRSegment.modify_objects_of_complex(node.kwargs, modifier))
         graph = IRGraph(nodes, inputs, outputs, module_name)
 
         # check IRPyFunc
