@@ -32,6 +32,7 @@ from .utils import (
     _orig_slice,
     _orig_set,
     map_recursive,
+    get_frame_record,
 )
 
 _logger = logging.getLogger(__name__)
@@ -290,7 +291,8 @@ class ConcreteAttrProxy(ConcreteProxy):
         elif _orig_isinstance(root.value, torch.Tensor) and attr == 'device' and self.tracer.cpu_offload:
             self.value = torch.device('cuda')
             warning_msg = "operation <tensor>.device is detected, it will always return torch.device('cuda') during trace, " + \
-                          "please make sure don't manually change the tensor device in the code."
+                          "please make sure don't manually change the tensor device in the code.\n" + \
+                          f"\t{get_frame_record()}"
             _logger.warning(warning_msg)
         else:
             self.value = _orig_getattr(root.value, attr)

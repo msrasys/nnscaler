@@ -11,15 +11,12 @@ import logging
 import operator
 import functools
 import builtins
-import traceback
-import importlib.util
 from dataclasses import dataclass, field
 
 from itertools import chain
 from types import FunctionType, MethodDescriptorType, MethodType, MethodWrapperType, ModuleType
 from typing import Any, Dict, Iterable, Iterator, Optional, Set, Tuple, Type, List, Callable, Union
 from contextlib import contextmanager
-from pathlib import Path
 
 import torch
 from torch._C import ScriptObject
@@ -142,6 +139,7 @@ from .utils import (
     flatten_trees_with_func,
     flatten_trees_with_func_and_spec,
     map_trees_with_func,
+    get_frame_record,
 )
 
 # pyright: reportGeneralTypeIssues=false
@@ -500,20 +498,7 @@ class ConcreteTracer(TracerBase):
 
         if self.record_frames and kind != 'placeholder':
             with self.do_temp_call_origin():
-                # record code frame, include filename, line number, and function name
-                frame_record = FrameRecord(None, None, None, None)
-                cube_path = str(Path(importlib.util.find_spec('cube').origin).parent) + '/'  # the cube path
-                torch_path = str(Path(importlib.util.find_spec('torch').origin).parent) + '/'  # the torch path
-                ignore_dirs = [cube_path, torch_path]
-                for frame in traceback.extract_stack()[-2::-1]:
-                    if any(p in frame.filename for p in ignore_dirs):
-                        continue
-                    frame_record.filename = frame.filename
-                    frame_record.lineno = frame.lineno
-                    frame_record.line = frame.line
-                    frame_record.name = frame.name
-                    break
-                node.meta['frame_record'] = frame_record
+                node.meta['frame_record'] = get_frame_record()
 
         proxy = self.proxy(value_unwrapped, node)
         return proxy
@@ -867,9 +852,6 @@ class ConcreteTracer(TracerBase):
                     'this is usually caused by directly assigning the return value of some leaf function to the attribute of the module. ' + \
                     'Please note that this writing method may cause some trace errors.'
                 _logger.warning(warn_msg)
-            if callable(attr_val) and not _orig_isinstance(attr_val, ep.ConcreteProxy):
-                if attr_val in self.wrapped_leaf:
-                    return self.wrapped_leaf[attr_val][1]
                 return attr_val
             # using isinstance instead of _orig_isinstance to judge whether
             # the ConcreteProxy.value is the following three types if the attr_val is a ConcreteProxy

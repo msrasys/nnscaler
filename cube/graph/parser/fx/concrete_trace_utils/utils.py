@@ -4,7 +4,10 @@
 import builtins
 from collections import namedtuple
 from dataclasses import dataclass
+import importlib
 import operator
+import traceback
+from pathlib import Path
 from typing import Any, Callable, Dict, NamedTuple, Optional, Set, Tuple, Type, List
 
 import torch
@@ -189,20 +192,6 @@ def flatten_trees_with_func_and_spec(fn, pytrees, spec):
     return [fn(*vals) for vals in zip(*flat_args)]
 
 
-@dataclass
-class FrameRecord:
-    filename: str
-    lineno: str
-    line: str
-    name: str
-
-    def __repr__(self) -> str:
-        if self.filename:
-            return f'File "{self.filename}", line {self.lineno}, in {self.name},  {self.line}'
-        else:
-            return ''
-
-
 class ExtraSEFPatcher:
     def __init__(self, extra_side_effectful_functions: Set[Callable]):
         self.extra_side_effectful_functions = extra_side_effectful_functions
@@ -292,3 +281,33 @@ class EmptyResult:
     """Used for identification no results.
     """
     pass
+
+
+@dataclass
+class FrameRecord:
+    filename: str
+    lineno: str
+    line: str
+    # the name of the frame is the function name
+    name: str
+
+    def __repr__(self) -> str:
+        if self.filename:
+            return f'File "{self.filename}", line {self.lineno}, in {self.name},  {self.line}'
+        else:
+            return ''
+
+
+def get_frame_record() -> Optional[FrameRecord]:
+    # record code frame, include filename, line number, and function name
+    frame_record = None
+    cube_path = str(Path(importlib.util.find_spec('cube').origin).parent) + '/'  # the cube path
+    torch_path = str(Path(importlib.util.find_spec('torch').origin).parent) + '/'  # the torch path
+    ignore_dirs = [cube_path, torch_path]
+    # the last frame is the current frame [get_frame_record], so we need to skip it
+    for frame in traceback.extract_stack()[-2::-1]:
+        if any(p in frame.filename for p in ignore_dirs):
+            continue
+        frame_record = FrameRecord(frame.filename, frame.lineno, frame.line, frame.name)
+        break
+    return frame_record
