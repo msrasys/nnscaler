@@ -101,7 +101,7 @@ def _train_raw(model: torch.nn.Module, ckpt_dir):
     for _ in range(DATA_SIZE):
         DATA.append((
             torch.randn((2, 4), device='cuda', dtype=torch.float32),
-            torch.randn((2, 1), device='cuda', dtype=torch.float32),
+            torch.rand((2, 1), device='cuda', dtype=torch.float32),
         ))
     loss_fn = nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)

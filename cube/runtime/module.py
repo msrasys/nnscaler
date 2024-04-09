@@ -358,8 +358,12 @@ class CubeModule(torch.nn.Module):
             Dict[str, torch.Tensor]: Full model state dict
             Dict[str, Any]: Full optimizer state dict
         """
+        # state dicts in the 1st scale unit may be a subset of `model_state_dicts`. Using `plan_ngpus` here to
+        # help understand the whole logic. In other words, the real plan_ngpus is <= len(model_state_dicts).
+        plan_ngpus = len(model_state_dicts)
         # gather model states
-        full_model_state_dict = CubeModule.merge_model_state_dicts(model_state_dicts, fullmaps[0: len(model_state_dicts)])
+        full_model_state_dict = CubeModule.merge_model_state_dicts(model_state_dicts, fullmaps[0: plan_ngpus])
+        _logger.info('finish merge model states')
         if optim_state_dicts is None:
             return full_model_state_dict, None
 
@@ -417,9 +421,14 @@ class CubeModule(torch.nn.Module):
                     opt_states['step'] = bucket_states[0]['step']
                 return opt_states
 
+            # Parameters are partitioned inside a scale unit composed of plan_ngpus GPUs.
+            # When ZeRO-1 is enabled, optimizer states (like exp_avg and exp_avg_sq) are partitioned within
+            # each ZeRO group. Since the training is done in a synchronized way, the optimizer states are
+            # identical across each ZeRO group.
+            # As a result, we can retrieve and merge the optimizer states in other scale units following the
+            # information stored in zero_idx_maps ONLY for the first scale unit.
             opt_state_list = []
-            worker_cnt = len(optim_state_dicts)
-            for work_idx in range(worker_cnt):
+            for work_idx in range(plan_ngpus):
                 model_idx2opt_idx, opt_idx2ranks = zero_idx_maps[work_idx]
                 opt_state = {}
                 for model_idx, opt_idx in model_idx2opt_idx.items():
@@ -438,14 +447,16 @@ class CubeModule(torch.nn.Module):
                             pend,
                             pshape,
                             bucket_size)
+                _logger.info(f'finish handle optimizer state for worker {work_idx}')
                 opt_state_list.append(opt_state)
                 assert len(optim_state_dicts[work_idx]['param_groups']) == 1, 'only support param_groups to be one group'
 
             # assign opt_state to state_dicts, cannot be assigned in the above loop
             opt_state_len = len(opt_state_list[0])
-            for work_idx in range(worker_cnt):
+            for work_idx in range(plan_ngpus):
                 optim_state_dicts[work_idx]['state'] = opt_state_list[work_idx]
                 optim_state_dicts[work_idx]['param_groups'][0]['params'] = sorted(opt_state_list[work_idx].keys())
+                _logger.info(f'finish assign optimizer state for worker {work_idx}')
                 assert len(opt_state_list[work_idx]) == opt_state_len
 
         # build parameter order to match with the optimizer state order
@@ -467,7 +478,8 @@ class CubeModule(torch.nn.Module):
         full_states = full_optim_state_dict['state']
         # full_index: param IDs in the full optimizer state
         for full_index, param_name in enumerate(origin_parameter_names):
-            for optim_state, fullmap in zip(optim_state_dicts, fullmaps):
+            _logger.info(f'start to handle optimizer state for param {param_name} with full_index {full_index}')
+            for optim_state, fullmap in zip(optim_state_dicts[0 : plan_ngpus], fullmaps[0 : plan_ngpus]):
                 if 'state' not in optim_state: continue
                 # adam-like optimizers have optim_state['state']={} before any optimizer.step()
                 if not optim_state['state']: continue
@@ -499,9 +511,13 @@ class CubeModule(torch.nn.Module):
                             full_states[full_index][state_name][meta.slicers] = value
 
         # handle additional state dict keys
-        for optim_state_dict in optim_state_dicts:
+        for optim_state_dict in optim_state_dicts[0 : plan_ngpus]:
             for key in optim_state_dict.keys():
                 if key != 'state':
+                    if key in full_optim_state_dict:
+                        _logger.info(f'overwrite optimizer state key {key}')
+                    else:
+                        _logger.info(f'inherit optimizer state key {key}')
                     full_optim_state_dict[key] = optim_state_dict[key]
 
         return full_model_state_dict, full_optim_state_dict

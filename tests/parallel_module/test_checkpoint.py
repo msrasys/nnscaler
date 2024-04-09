@@ -218,7 +218,7 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir):
     for _ in range(DATA_SIZE):
         data.append((
             torch.randn((2, 4), device='cuda', dtype=torch.float32),
-            torch.randn((2, 1), device='cuda', dtype=torch.float32),
+            torch.rand((2, 1), device='cuda', dtype=torch.float32),
         ))
     data = data[start:end]  # continue from last training
     data = [data[i] for i in range(rank, len(data), num_replicas)]

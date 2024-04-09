@@ -121,7 +121,7 @@ def _train_ddp(model, update_freq, num_replicas, rank):
     for _ in range(DATA_SIZE):
         data.append((
             torch.randn((2, 4), device='cuda', dtype=torch.float32),
-            torch.randn((2, 1), device='cuda', dtype=torch.float32),
+            torch.rand((2, 1), device='cuda', dtype=torch.float32),
         ))
     data = [data[i] for i in range(rank, DATA_SIZE, num_replicas)]
     results = []
@@ -158,7 +158,7 @@ def _train(model, is_cube, update_freq, num_replicas, rank):
     for _ in range(DATA_SIZE):
         data.append((
             torch.randn((2, 4), device='cuda', dtype=torch.float32),
-            torch.randn((2, 1), device='cuda', dtype=torch.float32),
+            torch.rand((2, 1), device='cuda', dtype=torch.float32),
         ))
     data = [data[i] for i in range(rank, DATA_SIZE, num_replicas)]
     results = []

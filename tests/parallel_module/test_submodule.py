@@ -94,7 +94,7 @@ def _train(model, update_freq, is_cube):
     for _ in range(DATA_SIZE):
         data.append((
             torch.randn((2, 4), device='cuda', dtype=torch.float32),
-            torch.randn((2, 1), device='cuda', dtype=torch.float32),
+            torch.rand((2, 1), device='cuda', dtype=torch.float32),
         ))
     results = []
     for i, (x, y) in enumerate(data):
