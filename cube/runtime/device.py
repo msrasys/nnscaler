@@ -31,12 +31,14 @@ class DeviceGroup:
                         backend='nccl', timeout=_LARGE_TIMEOUT
                     )
 
+                # disable it for now due to connection refused error when nnodes > 1
+                # TODO: investigate the root cause
                 # create a barrier group for synchronization
                 # it is OK even the user has already created this gloo group
                 # this new timeout will override the old one.
-                self.barrier_gloo_group = torch.distributed.new_group(
-                    backend='gloo', timeout=_LARGE_TIMEOUT
-                )
+                # self.barrier_gloo_group = torch.distributed.new_group(
+                #     backend='gloo', timeout=_LARGE_TIMEOUT
+                # )
 
                 self.rank = torch.distributed.get_rank()
                 self.world_size = torch.distributed.get_world_size()
@@ -90,7 +92,8 @@ class DeviceGroup:
         """
         Barrier synchronization with very long timeout
         """
-        torch.distributed.barrier(group=self.instance.barrier_gloo_group)
+        # torch.distributed.barrier(group=self.instance.barrier_gloo_group)
+        torch.distributed.barrier()
 
     def get_stream(self, name: str) -> torch.cuda.Stream:
         """
