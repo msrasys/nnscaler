@@ -709,6 +709,12 @@ def SiLU(input, inplace=False, signature = None):
     return IRDimops(SiLU, 'silu', signature, annos, [input], inplace=inplace)
 
 
+def LogSigmoid(input, signature = None):
+    annos = ['* -> *']
+    signature = 'torch._C._nn.log_sigmoid'
+    return IRDimops(LogSigmoid, 'log_sigmoid', signature, annos, [input])
+
+
 def ReLU(input, inplace=False, signature = None):
     annos = ['* -> *']
     signature = 'torch.nn.functional.relu'

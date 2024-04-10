@@ -74,6 +74,7 @@ class SignFx2Op:
         __ttemplate('tril'): function.Tril,
         __ftemplate('relu'): function.ReLU,
         __ftemplate('silu'): function.SiLU,
+        __fcntemplate('log_sigmoid'): function.LogSigmoid,
         __fcntemplate('gelu'): function.GeLU,
         __ttemplate('eq') : function.CompareEQ,
         '_operator.eq': function.CompareEQ,

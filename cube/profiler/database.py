@@ -6,6 +6,7 @@ from typing import Callable, Tuple, Union, Optional, Dict, NewType, List, Any
 import torch
 import time
 import os
+import copy
 import json
 import math
 import logging
@@ -296,7 +297,14 @@ class ProfileDataBase:
                 CompProfiler.profile(node, fn, shapes, dtypes, requires_grads, values, **kwargs)
         except Exception:
             _logger.exception(f'fail to profile {node}, use default values')
-            fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx = 0, 0, 0, [], []
+            fw_span, bw_span = 0, 0
+            infer_memory = 0
+            for t in node.outputs():
+                if isinstance(t, IRTensor):
+                    infer_memory += t.byte_size()
+            # by default, we assume that all the input tensors are saved for backward
+            train_mem_info = copy.deepcopy(in_mem_info)
+            train_mem2in_idx = list(range(len(in_mem_info)))
         # log to database
         key = self._serialize(node)
         profiled_metrics = ProfiledMetrics(in_mem_info, param_mem_info, buffer_mem_info,
