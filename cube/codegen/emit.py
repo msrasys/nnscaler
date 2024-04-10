@@ -58,7 +58,7 @@ def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None) -> Any:
     elif isinstance(val, tuple):
         # TODO: support subclasses of tuple, like torch.Size?
         return tuple(_safe_repr_value(v, prefix_attr) for v in val)
-    elif isinstance(val, (int, str, bool, float, type(None), bytes)): # only primitive type supported
+    elif isinstance(val, (int, str, bool, float, type(None), bytes, type(Ellipsis))):
         return val
     raise ValueError(f'Unsupported data type: {type(val)}')
 

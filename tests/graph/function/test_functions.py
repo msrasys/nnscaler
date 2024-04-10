@@ -8,6 +8,8 @@ import torch
 import numpy as np
 import math
 
+from cube.ir.tensor import IRFullTensor
+
 
 def o(value):
     return IRObject(value=value)
@@ -199,21 +201,50 @@ def test_Where():
 
 
 def test_FullSlice():
-    op = F.FullSlice(IRTensor([2, 3, 4]), (1, 2, 3))
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> 1'
-    op = F.FullSlice(IRTensor([2, 3, 4]), (..., 2))
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b'
-    op = F.FullSlice(IRTensor([2, 3, 4]), (1, 2, slice(0, 3, 2)))
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> 2'
-    op = F.FullSlice(IRTensor([2, 3, 4]), (1, 2, slice(1, 10, 1)))
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> 3'
+    op = F.FullSlice(IRTensor([2, 3, 4]), 1, [1.2, -1], 2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^, ?, ?, ? -> 2'
+
+    op = F.FullSlice(IRTensor([2, 3, 4]), 1, 2, 3)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^, ?, ?, ? -> 1'
+    op = F.FullSlice(IRTensor([2, 3, 4]), ..., 2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^, ?, ?, ? -> a b'
+    op = F.FullSlice(IRTensor([2, 3, 4]), 1, 2, slice(0, 3, 2))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^, ?, ?, ? -> 2'
+    op = F.FullSlice(IRTensor([2, 3, 4]), 1, 2, slice(1, 10, 1))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^, ?, ?, ? -> 3'
+    op = F.FullSlice(IRTensor([2, 3, 4]), 1, None, ..., None, slice(0, 2, None))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c^, ?, ?, ?, ?, ? -> 1 b 1 2'
+
     with pytest.raises(RuntimeError):
-        op = F.FullSlice(IRTensor([2, 3, 4]), (IRTensor([1, 2, 3]),))
-    with pytest.raises(RuntimeError):
-        op = F.FullSlice(IRTensor([2, 3, 4]),(slice(1, IRTensor([2]), 3),))
+        op = F.FullSlice(IRTensor([2, 3, 4]), slice(1, IRTensor([2]), 3))
+    op = F.FullSlice(IRTensor([3, 4]), None, 0, slice(0, 4, 2))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^, ?, ?, ? -> 1 2'
+    op = F.FullSlice(IRTensor([3, 4]), [0,2], 0)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^, ?, ? -> 2'
+    op = F.FullSlice(IRTensor([3, 4]), [[0,1], [1,2]], 0)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^, ?, ? -> 2 2'
+    op = F.FullSlice(IRTensor([3, 4]), IRFullTensor([2]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b, c -> c b'
+    op = F.FullSlice(IRTensor([3, 4]), IRFullTensor([2,2]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b, c d -> c d b'
+    op = F.FullSlice(IRTensor([3, 4]), [True, False, True])
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b, ? -> ?'
+    op = F.FullSlice(IRTensor([3, 4]), IRFullTensor([3], dtype=torch.bool), 0)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^, c^, ? -> ?'
+    op = F.FullSlice(IRTensor([3, 4]), [True, False, True], [0,1])
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^, ?, ? -> ?'
+    op = F.FullSlice(IRTensor([3, 4]), [True, False, True], IRFullTensor([2,2]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^, ?, c^ d^ -> ?'
+    op = F.FullSlice(IRTensor([3, 4]), IRFullTensor([3, 4], dtype=torch.bool))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^, c^ d^ -> ?'
+    op = F.FullSlice(IRTensor([3, 4]), IRFullTensor([3]), IRFullTensor([3]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^, c^, d^ -> ?'
+    op = F.FullSlice(IRTensor([3, 4]), IRFullTensor([2,2]), IRFullTensor([2,2]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^, c^ d^, e^ f^ -> ?'
 
 
 def test_GetItem():
+    # obj is IRTensor, index is IRTensor
     op = F.GetItem(IRTensor([4, 2]), IRTensor([3, 5], dtype=torch.int64))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b, c d -> c d b'
     op = F.GetItem(IRTensor([4, 2]), IRTensor([3], dtype=torch.int64))
@@ -222,8 +253,38 @@ def test_GetItem():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c, d -> d b c'
     op = F.GetItem(IRTensor([3, 4, 2]), IRTensor([3, 5], dtype=torch.int64))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c, d e -> d e b c'
+
+    # obj is IRTensor, index is not IRTensor, will call FullSlice
+    op = F.GetItem(IRTensor([3, 4, 2]), 0)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c, ? -> b c'
+    op = F.GetItem(IRTensor([3, 4, 2]), [0, 1])
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c, ?, ? -> c'
+    op = F.GetItem(IRTensor([3, 4, 2]), slice(0, 3, 2))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b c, ? -> 2 b c'
+    op = F.GetItem(IRTensor([3, 4, 2]), [slice(None), IRTensor([3, 5], dtype=torch.int64)])
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c, ?, d e -> a d e c'
+    op = F.GetItem(IRTensor([3, 4, 2]), [slice(None), IRTensor([4, 2], dtype=torch.bool)])
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c^, ?, d^ e^ -> ?'
+
+    # obj is IRObject
+    op = F.GetItem(IRObject(value=[3, 4, 5], is_constant=False), IRObject(value=0, is_constant=False), signature='operator.getitem')
+    assert op.outputs()[0].value == 3 and op.outputs()[0].is_constant == True
+    op = F.GetItem(IRObject(value=[3, 4, 5], is_constant=False), IRObject(value=slice(0, 2, 1), is_constant=False), signature='operator.getitem')
+    assert op.outputs()[0].value == [3, 4] and op.outputs()[0].is_constant == True
+    op = F.GetItem(IRObject(value=[3, 4, 5], is_constant=False), 0, signature='operator.getitem')
+    assert op.outputs()[0].value == 3 and op.outputs()[0].is_constant == True
+    op = F.GetItem(IRObject(value=[3, 4, 5], is_constant=False), slice(0, 2, 1), signature='operator.getitem')
+    assert op.outputs()[0].value == [3, 4] and op.outputs()[0].is_constant == True
+
+    # obj is not a IRObject, index is a IRObject
     op = F.GetItem([1, 2, 3], IRObject(value=0, is_constant=False), signature='operator.getitem')
     assert op.outputs()[0].value == 1 and op.outputs()[0].is_constant == False
+
+    # direct call obj[index]
+    op = F.GetItem([3, 4, 2], 1)
+    assert op == 4
+    op = F.GetItem([3, 4, 2], slice(0, 2, 1))
+    assert op == [3, 4]
 
 
 def test_Max():
@@ -293,6 +354,17 @@ def test_Unsqueeze():
 def test_ScaledDotProductAttention():
     op = F.ScaledDotProductAttention(IRTensor([8, 128, 64]), IRTensor([8, 256, 64]), IRTensor([8, 256, 32]), None, 0.05)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a e d^, a b^ d^, a b^ c -> a e c'
+    op = F.ScaledDotProductAttention(IRTensor([16, 8, 128, 64]), IRTensor([16, 8, 256, 64]), IRTensor([16, 8, 256, 32]), IRTensor([128, 256]), 0.05)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f e^, a b c^ e^, a b c^ d, f c^ -> a b f d'
+    op = F.ScaledDotProductAttention(IRTensor([16, 8, 128, 64]), IRTensor([16, 8, 256, 64]), IRTensor([16, 8, 256, 32]), IRTensor([1, 128, 256]), 0.05)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f e^, a b c^ e^, a b c^ d, 1 f c^ -> a b f d'
+    op = F.ScaledDotProductAttention(IRTensor([16, 8, 128, 64]), IRTensor([16, 8, 256, 64]), IRTensor([16, 8, 256, 32]), IRTensor([1, 8, 128, 256]), 0.05)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f e^, a b c^ e^, a b c^ d, 1 b f c^ -> a b f d'
+    op = F.ScaledDotProductAttention(IRTensor([16, 8, 128, 64]), IRTensor([16, 8, 256, 64]), IRTensor([16, 8, 256, 32]), IRTensor([1, 1, 256]), 0.05)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f e^, a b c^ e^, a b c^ d, 1 1 c^ -> a b f d'
+    op = F.ScaledDotProductAttention(IRTensor([16, 8, 128, 64]), IRTensor([16, 8, 256, 64]), IRTensor([16, 8, 256, 32]), IRTensor([1, 8, 128, 1]), 0.05)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f e^, a b c^ e^, a b c^ d, 1 b f 1 -> a b f d'
+
 
 
 def test_NewTensor():
@@ -383,3 +455,28 @@ def test_Log():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c -> a b c'
     op = F.Log(IRObject(value=6, is_constant=False), signature='math.log')
     assert op.outputs()[0].value == math.log(6) and not op.outputs()[0].is_constant
+
+
+def test_Arange():
+    op = F.Arange(10)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 10^' and op.kwargs['dtype'] == torch.int64
+    op = F.Arange(1, 10, 2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 5^' and op.kwargs['dtype'] == torch.int64
+    op = F.Arange(1, 10, 2, dtype=torch.float)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 5^' and op.kwargs['dtype'] == torch.float
+    op = F.Arange(1.0, 10.0, 2.0)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 5^' and op.kwargs['dtype'] == torch.float
+    op = F.Arange(IRObject(value=10))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 10^' and op.kwargs['dtype'] == torch.int64
+    op = F.Arange(IRObject(value=1), IRObject(value=10.0), 2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 5^' and op.kwargs['dtype'] == torch.float
+
+def test_Flatten():
+    op = F.Flatten(IRTensor([2,3,4,5]), 1, 2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c^ d -> a (b^ c^) d'
+    op = F.Flatten(IRTensor([2,3,4,5]), 1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c^ d^ -> a (b^ c^ d^)'
+    op = F.Flatten(IRTensor([2,3,4,5]), end_dim = 2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ d -> (a^ b^ c^) d'
+
+

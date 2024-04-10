@@ -19,6 +19,8 @@ def test_tensor_name():
     assert repr_expr({'a': 1, 'b': IRObject('name', 111, 'value')}, 'model.') == "{'a': 1, 'b': name_111}"
     assert repr_expr([1], 'model.') == '[1]'
     assert repr_expr((1,), 'model.') == '(1,)'
+    
+    assert repr_expr((1,...), ) == '(1, Ellipsis)'
 
     with pytest.raises(ValueError):
         from datetime import datetime

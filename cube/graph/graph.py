@@ -351,7 +351,7 @@ class IRGraph(IRSegment):
         ctensors: Dict[IRFullTensor, List[IRSubTensor]] = dict()
         consumers: Dict[IRFullTensor, List[IRCell]] = dict()
         for fnode in fnodes:
-            for itensor in set(fnode.inputs()):
+            for itensor in set(IRSegment.get_objects_from_complex(fnode.inputs())):
                 if not isinstance(itensor, IRSubTensor): continue
                 ctensors.setdefault(itensor.parent, []).append(itensor)
                 consumers.setdefault(itensor.parent, []).append(fnode)

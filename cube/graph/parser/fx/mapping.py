@@ -226,4 +226,5 @@ class SignFx2Op:
         'torch.functional.split': function.Split,
         __ttemplate('split'): function.Split,
         __tttemplate('split'): function.Split,
+        __ttemplate('topk'): function.Topk,
     }

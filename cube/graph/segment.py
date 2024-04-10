@@ -1119,6 +1119,8 @@ class IRSegment(IRCell):
             for key, value in val.items():
                 IRSegment.get_objects_from_complex(key, _objects)
                 IRSegment.get_objects_from_complex(value, _objects)
+        if isinstance(val, slice):
+            IRSegment.get_objects_from_complex([val.start, val.stop, val.step], _objects)
         if isinstance(val, IRObject):
             _objects.append(val)
         return _objects

@@ -826,7 +826,8 @@ class IRDimops(IRFwOperation):
 
     def transform_space(self) -> List[Tuple[int, int]]:
         """
-        Get transformation space of the operator
+        Get transformation space of the operator, the transformation space 
+        represents all configurations that can be segmented
 
         @return List[Tuple[int, int]]: list of (idx, dim)
         """
@@ -834,6 +835,7 @@ class IRDimops(IRFwOperation):
         configs = []
         ashapes = self.anno.inputs() + self.anno.outputs()
         for idx, eshape in enumerate(ashapes):
+            if eshape.ignore: continue
             if idx < len(self.inputs()):
                 if not isinstance(self.input(idx), IRTensor): continue
             for dim, edim in enumerate(eshape.dims):

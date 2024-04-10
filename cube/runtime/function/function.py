@@ -39,7 +39,7 @@ def accum(*tensors: Tuple[torch.Tensor]) -> torch.Tensor:
         return torch.sum(torch.stack(tensors, dim=0), dim=0)
 
 
-def fullslice(input: torch.Tensor, slicers: Tuple[Union[None, slice, int]]):
+def fullslice(input: torch.Tensor, *slicers: Union[None, slice, int, torch.Tensor]):
     """Slice tensors
 
     Note:
@@ -49,13 +49,12 @@ def fullslice(input: torch.Tensor, slicers: Tuple[Union[None, slice, int]]):
     
     Args:
         input (torch.Tensor): input tensor
-        slicers (Tuple[None | slicer | int]): slicer tuple
-
+        slicers (Union[None | slicer | int | torch.Tensor]): slicers for input
 
     Returns:
         torch.Tensor: sliced tensor
     """
-    return input[slicers]
+    return input[tuple(slicers)]
 
 
 def conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],

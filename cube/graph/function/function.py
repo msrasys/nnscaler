@@ -194,7 +194,12 @@ def _get_creator_anno_rules(size: Tuple[int], partitionable: bool) -> str:
 
 def CubeArange(start: Union[int, IRObject], end: Union[int, IRObject], step: Union[int, IRObject],
                dtype=None, requires_grad=False, signature=None):
-    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    if dtype is None:
+        if any(isinstance(_unwrap_value(s), float) for s in (start, end, step)) or \
+                any(s.dtype in [torch.float32, torch.float, torch.float64, torch.double, torch.float16, torch.bfloat16] for s in (start, end, step) if s is IRTensor):
+            dtype = torch.get_default_dtype()
+        else:
+            dtype = torch.int64
     assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
     signature = 'cube.runtime.function.arange'
     kwargs = {'start': start, 'end': end, 'step': step,
@@ -859,11 +864,43 @@ def MaskedFill(input, mask, value, signature = None):
     return IRDimops(MaskedFill, 'masked_fill', signature, [anno], [input, mask], value=value)
 
 
-def Where(condition, input, other, *, out=None, signature = None):
+def Topk(input, k, dim=None, largest=True, sorted=True, *, out=None, signature = None):
+    """
+    torch.topk(input, k, dim=None, largest=True, sorted=True, *, out=None)
+    """
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    if dim is None:
+        edim_in[-1] += '^'
+    else:
+        edim_in[dim] += '^'
+    edim_ou = [['?'], ['?']]
+    anno = OpAnno.create_op_str([edim_in], edim_ou)
+    return IRDimops(Topk, 'topk', signature, [anno], [input], k=k, dim=dim, largest=largest, sorted=sorted)
+
+
+def Nonzero(input, *, out=None, as_tuple=False, signature = None):
+    """
+    torch.nonzero(input, *, out=None, as_tuple=False)
+    """
+    edim_in = ShapeAnno.create_shape_str(input.shape, reduction="^")
+    if as_tuple:
+        edim_ou = list(['?'] for _ in range(len(input.shape)))
+    else:
+        edim_ou = [['?']]
+    anno = OpAnno.create_op_str([edim_in], edim_ou)
+    return IRDimops(Nonzero, 'nonzero', signature, [anno], [input], as_tuple=as_tuple)
+
+
+def Where(condition, input=None, other=None, *, out=None, signature = None):
     """
     torch.where
     """
     assert isinstance(condition, IRTensor)
+    if input is None and other is None or \
+        (input is IRObject and input.value is None) and (other is IRObject and other.value is None):
+        return Nonzero(condition, as_tuple=True, signature = 'torch.nonzero')
+    if input is None or other is None:
+        raise ValueError("Both input and other must be provided together")
     if isinstance(input, IRTensor) and isinstance(other, IRTensor):
         (edim_in0, edim_in1, edim_in2), edim_out = _handle_broadcast_multi([condition, input, other])
     elif isinstance(input, IRTensor) and len(input.shape) > 0 and not (len(input.shape) == 1 and input.shape[0] == 1):
@@ -1562,7 +1599,7 @@ def IndexSelect(input: torch.Tensor, dim: int, index: torch.Tensor, *, out=None,
     return CubeIndexSelect(input, index, dim, signature=signature)
 
 
-def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice, int]], signature=None):
+def FullSlice(tensor: IRTensor, *slicers: Tuple[Union[None, slice, int, IRTensor, IRObject]], signature=None):
     """
     Examples:
         >>> a = torch.randn((4,2))
@@ -1572,9 +1609,9 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice, int]], signatu
         >>> a[(2, None)]                           # shape [1,2]
         >>> a[(2, slice(None, None, None)), None]  # shape [2,1]
         >>> a[(2, None, slice(None, None, None))]  # shape [1,2]
+        >>> a[(2, torch.tensor([0, 1]), None)]     # shape [2,1]
     """
     signature = 'cube.runtime.function.fullslice'
-    slicers = tuple(slicers)
 
     # deal with ... in slice
     if any(slicer is Ellipsis for slicer in slicers):
@@ -1590,7 +1627,9 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice, int]], signatu
         mid_slicers = [slice(None, None, None) for _ in range(len(tensor.shape) - front_count - back_count)]
         slicers = tuple(front_slicers + mid_slicers + back_slicers)
 
-    edim_in = ShapeAnno.create_shape_str(tensor.shape)
+    edim_in_additional = []
+    fullslice_iterator = iter(string.ascii_lowercase)
+    edim_in = ShapeAnno.create_shape_str(tensor.shape, iterator=fullslice_iterator)
     edim_ou = []
     in_idx = 0
     tensor_error_msg = ("Tensor is not supported in slice. "
@@ -1604,13 +1643,24 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice, int]], signatu
             return obj.value
         else:
             return obj
+
+    # If there are more than one tensors or lists in slicers and their date type is not bool, they will broadcast to each other,
+    # and the output shape will be infered by the shapes of all tensors and lists in slicers, will use '?' in edim_ou
+    _single_int_tensor = len([slicer for slicer in slicers if 
+                                   (isinstance(slicer, IRTensor) and slicer.dtype is not bool ) 
+                                   or (isinstance(slicer, list) and slicer[0] is not bool)]) <= 1
+    output_shape_unkonwn = False
+    slicers = list(slicers)
     for slicer in slicers:
         if slicer is None:
+            edim_in_additional.append(['?'])
             edim_ou.append('1')
         elif isinstance(slicer, int):
+            edim_in_additional.append(['?'])
             edim_in[in_idx] += '^'
             in_idx += 1
         elif isinstance(slicer, slice):
+            edim_in_additional.append(['?'])
             if slicer != slice(None, None, None):
                 edim_in[in_idx] += '^'
             _start, _stop, _step = obj_helper(slicer.start), obj_helper(slicer.stop), obj_helper(slicer.step)
@@ -1625,15 +1675,57 @@ def FullSlice(tensor: IRTensor, slicers: Tuple[Union[None, slice, int]], signatu
                 edim_ou.append(str(dimlen))
             in_idx += 1
         elif isinstance(slicer, IRTensor):
-            raise RuntimeError(tensor_error_msg)
+            # TODO: output shape can be infered by shapes of all lists and tensors in slicers
+            # Examples: a = torch.randn(3,4)
+            # a[torch.tensor([0, 1, 2]) ,[0, 1, 1]] == a[[0, 1, 2] ,[0, 1, 1]] == [a[0, 0], a[1, 1], a[2, 1]]
+            # a[[0] ,[0, 1, 1]] == a[[0, 0, 0] ,[0, 1, 1]]
+            # a[[True, False, True]] == a[torch.tensor([0, 2])] == a[[0, 2]] == [a[0,:], a[2,:]]
+            # a[[True, False, True], [0, 1]] == a[torch.tensor([0, 2]), [0, 1]] == a[[0, 2], [0, 1]] == [a[0, 0], a[2, 1]]
+            # when dtype of IRTensor or value of list is bool, the input shape must be the same as the sliced tensor at corresponding dimensions
+            slicer_anno = ShapeAnno.create_shape_str(slicer.shape, iterator=fullslice_iterator)
+            if slicer.dtype != torch.bool:
+                edim_in[in_idx] += '^'
+                in_idx += 1
+            else:
+                slen = len(slicer.shape)
+                for i in range(in_idx, in_idx+slen):
+                    edim_in[i] += '^'
+                in_idx += slen
+            if not _single_int_tensor or slicer.dtype == torch.bool:
+                slicer_anno = [ anno + "^" for anno in slicer_anno ]
+                output_shape_unkonwn = True
+            edim_in_additional.append(slicer_anno)
+            edim_ou.extend(slicer_anno)
+        elif isinstance(slicer, list):
+            if len(slicer) == 0:
+                raise RuntimeError(f"Unsupported slicer {slicer}. The length of the list in the slicer cannot be 0")
+            def list_shape(lst):
+                return [len(lst)] + (list_shape(lst[0]) if isinstance(lst[0], list) else [])
+            if type(slicer[0]) == bool and len(list_shape(slicer)) > 1:
+                raise RuntimeError(f"Unsupported slicer {slicer}. The depth of the list in the slicer cannot exceed 1 when value type is bool")
+            edim_in_additional.append(['?'])
+            edim_in[in_idx] += '^'
+            in_idx += 1
+            if not _single_int_tensor or type(slicer[0]) == bool:
+                output_shape_unkonwn = True
+            else:
+                edim_ou.extend([str(a) for a in list_shape(slicer)])
         else:
             raise RuntimeError(f"Unsupported slicer {slicer}. you may need to wrap related logic in a Customized Op.")
-    edim_ou += edim_in[in_idx:]
-    # special case for scalar = torch.Tensor([1,2,3])[0]
-    if len(edim_ou) == 0:
-        edim_ou.append('1')
-    anno = OpAnno.create_op_str([edim_in], [edim_ou])
-    return IRDimops(FullSlice, 'fullslice', signature, [anno], [tensor], slicers=slicers)
+
+    if output_shape_unkonwn:
+        edim_ou = ['?']
+    else:
+        edim_ou += edim_in[in_idx:]
+        if len(edim_ou) == 0:
+            # special case for scalar = torch.Tensor([1,2,3])[0]
+            edim_ou.append('1')
+    
+    edim_in = [edim_in]
+    edim_in.extend(edim_in_additional)
+    anno = OpAnno.create_op_str(edim_in, [edim_ou])
+
+    return IRDimops(FullSlice, 'fullslice', signature, [anno], [tensor] + slicers)
 
 
 def Slice(tensor: torch.Tensor, dim, start, end, step, signature = None):
@@ -1742,6 +1834,9 @@ def Embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0,
 
 
 def Flatten(input, start_dim=0, end_dim=-1, signature = None):
+    """
+    torch.flatten(input, start_dim=0, end_dim=-1) -> Tensor
+    """
     start_dim = len(input.shape) + start_dim if start_dim < 0 else start_dim
     end_dim = len(input.shape) + end_dim if end_dim < 0 else end_dim
     ishape = ShapeAnno.create_shape_str(input.shape)
@@ -1749,6 +1844,7 @@ def Flatten(input, start_dim=0, end_dim=-1, signature = None):
         ishape[dim] += '^'
     oshape = ishape[:start_dim]
     oshape.append(ishape[start_dim:end_dim+1])
+    oshape.extend(ishape[end_dim+1:])
     anno = OpAnno.create_op_str([ishape], [oshape])
     return IRDimops(Flatten, 'flatten', signature, [anno], [input],
                     start_dim=start_dim, end_dim=end_dim)
@@ -2001,27 +2097,9 @@ def GetItem(a: Any, b: Any, signature = None) -> Union[Any, IRPyFunc]:
     obj, index = a, b
     # tensor slice
     if isinstance(obj, IRTensor):
-        # note `None` will always
-        if isinstance(index, IRTensor):
         # TODO: support general tensor slicing: https://pytorch.org/cppdocs/notes/tensor_indexing.html
-        # move to FullSlice when ready
-            """
-            Examples:
-                >>> a = torch.randn((4,2))
-                >>> b = torch.randn((3,5)).to(torch.int64)
-                >>> a[b]    # shape [3,5,2]
-            """
-            if index.dtype not in (torch.int64, torch.int32):
-                raise RuntimeError(f"index should be int64 or int32, but got {index.dtype}")
-            gener = iter(string.ascii_lowercase)
-            obj_shape = ShapeAnno.create_shape_str(obj.shape, iterator=gener)
-            obj_shape[0] = obj_shape[0] + '^'
-            index_shape = ShapeAnno.create_shape_str(index.shape, iterator=gener)
-            out_shape = index_shape + obj_shape[1:]
-            anno = OpAnno.create_op_str([obj_shape, index_shape], [out_shape])
-            return IRDimops(GetItem, 'getitem', signature, [anno], [obj, index])
-        index = (index,) if isinstance(index, (int, slice)) else tuple(index)
-        return FullSlice(obj, index)
+        index = (index,) if isinstance(index, (int, slice, IRTensor, IRObject)) else tuple(index)
+        return FullSlice(obj, *index)
     # object slice
     if isinstance(obj, IRObject):
         assert obj.value is not None
@@ -2165,8 +2243,6 @@ def ScaledDotProductAttention(query, key, value, attn_mask=None, dropout_p=0.0,
     """
     if not isinstance(query, IRTensor) or not isinstance(key, IRTensor) or not isinstance(value, IRTensor):
         raise RuntimeError(f'query: {query}, key: {key}, value: {value} should be IRTensor, something went wrong.')
-    if attn_mask is not None:
-        raise RuntimeError(f'Only support attn_mask is None in scaled_dot_product_attention now.')
     gener = iter(string.ascii_lowercase)
     value_anno = ShapeAnno.create_shape_str(value.shape, iterator=gener)
     value_anno[-2] += '^'
@@ -2176,10 +2252,30 @@ def ScaledDotProductAttention(query, key, value, attn_mask=None, dropout_p=0.0,
     query_anno[-2] = next(gener)
     out_anno = copy.copy(query_anno)
     out_anno[-1] = value_anno[-1]
-
-    anno = OpAnno.create_op_str([query_anno, key_anno, value_anno], [out_anno])
-    return IRDimops(ScaledDotProductAttention, 'scaled_dot_product_attention', signature, [anno], [query, key, value],
-                    attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, **kwargs)
+    if attn_mask is not None:
+        if not isinstance(attn_mask, IRTensor):
+            raise RuntimeError(f'attn_mask: {attn_mask} should be IRTensor, something went wrong.')
+        if len(attn_mask.shape) < 2 or len(attn_mask.shape) > len(query.shape):
+            raise RuntimeError(f'attn_mask shape {attn_mask.shape} is not supported, while query shape is {query.shape}')
+        attn_mask_anno = []
+        # the anno of attn_mask will conbine query and attn_mask shape except last dimension,
+        # the last dimension of the attn_mask anno will be the same as key penultimate dimension
+        for index, sval in enumerate(attn_mask.shape[-2::-1]):
+            if attn_mask.shape[-2-index] == query.shape[-2-index]:
+                attn_mask_anno.insert(0, query_anno[-2-index])
+            else:
+                attn_mask_anno.insert(0, str(attn_mask.shape[-2-index]))
+        if attn_mask.shape[-1] == key.shape[-2]:
+            attn_mask_anno.append(key_anno[-2])
+        else:
+            attn_mask_anno.append(str(attn_mask.shape[-1]))
+        anno = OpAnno.create_op_str([query_anno, key_anno, value_anno, attn_mask_anno], [out_anno])
+        return IRDimops(ScaledDotProductAttention, 'scaled_dot_product_attention', signature, [anno], [query, key, value, attn_mask],
+                    dropout_p=dropout_p, is_causal=is_causal, **kwargs)
+    else:
+        anno = OpAnno.create_op_str([query_anno, key_anno, value_anno], [out_anno])
+        return IRDimops(ScaledDotProductAttention, 'scaled_dot_product_attention', signature, [anno], [query, key, value],
+                        dropout_p=dropout_p, is_causal=is_causal, **kwargs)
 
 
 def Min(input, other_or_dim=None, keepdim=False, *, out=None, signature = None, **kwargs):
