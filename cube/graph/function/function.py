@@ -469,12 +469,23 @@ def Expand(input, size, *arg_size, signature = None):
                 edim_ou[exp_len - ori_len + idx] = edim_in[idx]
             else:
                 edim_ou[exp_len - ori_len + idx] = str(new_dim)
-            # explicit set tid to -1 to avoid changing IDGenerator state.
-            new_size[exp_len - ori_len + idx] = IRObject(tid=-1, value=expand_dim) if expand_dim_is_ir else new_dim
+            new_size[exp_len - ori_len + idx] = new_dim
     for idx in range(exp_len - ori_len):
         edim_ou[idx] = str(size[idx])
         new_size[idx] = size[idx]
     anno = OpAnno.create_op_str([edim_in], [edim_ou])
+
+    # fix the size parameter with IRObject
+    if isinstance(complete_size, IRObject):
+        new_size = complete_size  # use the original IRObject size
+    else:
+        assert isinstance(complete_size, (tuple, list))
+        assert len(complete_size) == len(new_size)
+        for idx in range(len(new_size)):
+            if isinstance(complete_size[idx], IRObject):
+                # replace with IRObject version
+                new_size[idx] = complete_size[idx]
+
     return IRDimops(Expand, 'expand', signature, [anno], [input], size=new_size)
 
 
@@ -1646,8 +1657,8 @@ def FullSlice(tensor: IRTensor, *slicers: Tuple[Union[None, slice, int, IRTensor
 
     # If there are more than one tensors or lists in slicers and their date type is not bool, they will broadcast to each other,
     # and the output shape will be infered by the shapes of all tensors and lists in slicers, will use '?' in edim_ou
-    _single_int_tensor = len([slicer for slicer in slicers if 
-                                   (isinstance(slicer, IRTensor) and slicer.dtype is not bool ) 
+    _single_int_tensor = len([slicer for slicer in slicers if
+                                   (isinstance(slicer, IRTensor) and slicer.dtype is not bool )
                                    or (isinstance(slicer, list) and slicer[0] is not bool)]) <= 1
     output_shape_unkonwn = False
     slicers = list(slicers)
@@ -1720,7 +1731,7 @@ def FullSlice(tensor: IRTensor, *slicers: Tuple[Union[None, slice, int, IRTensor
         if len(edim_ou) == 0:
             # special case for scalar = torch.Tensor([1,2,3])[0]
             edim_ou.append('1')
-    
+
     edim_in = [edim_in]
     edim_in.extend(edim_in_additional)
     anno = OpAnno.create_op_str(edim_in, [edim_ou])
