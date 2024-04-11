@@ -184,7 +184,7 @@ class ValueMap:
         if not isinstance(other, ValueMap):
             raise TypeError("Expected ValueMap")
         idx1, nchunk1 = self.weight
-        idx2, nchunk2 = self.weight
+        idx2, nchunk2 = other.weight
         span1 = (idx1 * nchunk2, idx1 * nchunk2 + nchunk2)
         span2 = (idx2 * nchunk1, idx2 * nchunk1 + nchunk1)
         if max(span1[0], span2[0]) < min(span1[1], span2[1]):
