@@ -57,6 +57,8 @@ class SignFx2Op:
         __ftemplate('dropout') : function.Dropout,
         __ttemplate('sum'): function.Sum,
         __ttemplate('mean') : function.Mean,
+        __ttemplate('outer'): function.Outer,
+        __ttemplate('erf'): function.Erf,
         __ttemplate('abs'): function.Abs,
         __ttemplate('exp'): function.Exp,
         'math.exp': function.Exp,
@@ -84,6 +86,7 @@ class SignFx2Op:
         __ttemplate('min'): function.Min,
         __ttemplate('where'): function.Where,
         __ttemplate('nan_to_num') : function.NanToNum,
+        __tttemplate('type'): function.Type,
         __tttemplate('long'): function.Long,
         __tttemplate('int'): function.Int,
         __tttemplate('float'): function.Float,
@@ -94,6 +97,7 @@ class SignFx2Op:
         __ttemplate('cumsum'): function.CumSum,
         __ttemplate('tanh'): function.Tanh,
         __ftemplate('softmax') : function.Softmax,
+        __ttemplate('softmax'): function.Softmax,
         __ftemplate('log_softmax') : function.LogSoftmax,
         __ttemplate('bmm') : function.BatchLinear,
         __ttemplate('pow'): function.Pow,
@@ -145,7 +149,9 @@ class SignFx2Op:
         # # creators
         __ttemplate('empty'): function.Empty,
         __ttemplate('zeros'): function.Zeros,
+        __ttemplate('zeros_like'): function.ZerosLike,
         __ttemplate('ones'): function.Ones,
+        __ttemplate('ones_like'): function.OnesLike,
         __ttemplate('tensor'): function.NewTensor,
         __ttemplate('full'): function.Full,
         __ttemplate('full_like'): function.FullLike,
@@ -156,12 +162,14 @@ class SignFx2Op:
         '_operator.is_not': function.IsNot,
         __ttemplate('add') : function.Add,
         '_operator.add': function.Add,
+        __ttemplate('addmm'): function.Addmm,
         '_operator.iadd': function.Add, # FIXME: may waste memory
         __ttemplate('sub') : function.Sub,
         '_operator.sub': function.Sub,
         __ttemplate('mul') : function.Mul,
         '_operator.mul': function.Mul,
         '_operator.imul': function.Mul, # FIXME: may waste memory
+        __ttemplate('multiply') : function.Mul,
         '_operator.mod': function.Mod,
 
         __ttemplate('div') : function.Div,
@@ -190,6 +198,8 @@ class SignFx2Op:
         __tttemplate('contiguous'): function.Contiguous,
 
         __ttemplate('reshape'): function.Reshape,
+        
+        __ttemplate('conv1d'): function.Conv1D,
         #
         # __ttemplate('conv2d'): function.Conv2D,
         #

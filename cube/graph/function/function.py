@@ -1,4 +1,4 @@
-from typing import Any, Callable, List, Tuple, Dict, Union, Iterable
+from typing import Any, Callable, List, Optional, Tuple, Dict, Union, Iterable
 import string
 import copy
 import torch
@@ -2346,8 +2346,174 @@ def FullLike(input, fill_value, *, dtype=None, layout=None,
     """
     torch.full_like(input, fill_value, \*, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=torch.preserve_format) → Tensor
     """
-    assert layout in (None, torch.strided) and memory_format is None, f"Not support for non-default memory_format and layout"
+    if not (layout in (None, torch.strided) and memory_format is None):
+        raise ValueError("Not support for non-default memory_format and layout")
     kwargs = {'fill_value': fill_value, 'requires_grad': requires_grad,'dtype': dtype}
     shape = ShapeAnno.create_shape_str(input.shape)
     annos = [OpAnno.create_op_str([shape], [shape])]
     return IRDimops(FullLike, 'full_like', signature, annos,[input],**kwargs)
+
+
+def ZerosLike(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=None, signature=None):
+    """
+    torch.zeros_like(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format) → Tensor
+    """
+    if not (layout in (None, torch.strided) and memory_format is None):
+        raise ValueError("Not support for non-default memory_format and layout")
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError("only supports torch.dtype but got {}".format(dtype))
+    kwargs = {'requires_grad': requires_grad, 'dtype': dtype}
+    shape = ShapeAnno.create_shape_str(input.shape)
+    annos = [OpAnno.create_op_str([shape], [shape])]
+    return IRDimops(ZerosLike, 'zeros_like', signature, annos,[input],**kwargs)
+
+
+def OnesLike(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=None, signature=None):
+    """
+    torch.ones_like(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format) → Tensor
+    """
+    if not (layout in (None, torch.strided) and memory_format is None):
+        raise ValueError("Not support for non-default memory_format and layout")
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError("only supports torch.dtype but got {}".format(dtype))
+    kwargs = {'requires_grad': requires_grad, 'dtype': dtype}
+    shape = ShapeAnno.create_shape_str(input.shape)
+    annos = [OpAnno.create_op_str([shape], [shape])]
+    return IRDimops(OnesLike, 'onesLike', signature, annos,[input],**kwargs)
+
+
+def Addmm(input: IRTensor, mat1: IRTensor, mat2: IRTensor, *, beta=1, alpha=1, out=None, signature = None):
+    """
+    torch.addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None) → Tensor
+    """
+    if out is not None:
+        raise ValueError("Expected 'out' to be None")
+    if len(mat1.shape) != 2 or len(mat2.shape) != 2:
+        raise ValueError("mat1 and mat2 must both be 2-dimensional.")
+    if mat1.shape[-1] != mat2.shape[-2]:
+        raise ValueError("Shapes of mat1 and mat2 are incompatible for matrix multiplication.")
+    matmul_result_shape = (mat1.shape[0], mat2.shape[1])
+    if len(input.shape) < 2:
+        matmul_result = IRTensor(shape=matmul_result_shape)
+        lshape, rshape, oshape = _handle_broadcast(input, matmul_result)
+        anno = f"{' '.join(lshape)}, {rshape[0]} k^, k^ {rshape[1]} -> {' '.join(oshape)}"
+    elif len(input.shape) == 2:
+        if (input.shape[0] != 1 and input.shape[0] != matmul_result_shape[0]) or \
+                (input.shape[1] != 1 and input.shape[1] != matmul_result_shape[1]):
+            raise ValueError("`input` shape cannot be broadcasted to match the result of mat1 @ mat2.")
+        else:
+            anno = f'{"1" if input.shape[0] == 1 else "a"} {"1" if input.shape[1] == 1 else "b"}, a k^, k^ b -> a b'
+    else:
+        raise ValueError("The `input` tensor does not have a compatible shape for this operation.")
+    return IRDimops(Addmm, 'addmm', signature, [anno], [input, mat1, mat2], beta=beta, alpha=alpha)
+
+
+def Type(tensor: IRTensor, dtype: Optional[Union[str, torch.dtype, IRObject]] = None, non_blocking: bool = False, out=None, signature=None, **kwargs):
+    """
+    Tensor.type(dtype=None, non_blocking=False, **kwargs) → str or Tensor
+    """
+    if out is not None:
+        raise ValueError("Expected 'out' to be None")
+    annos = ['* -> *']
+    original_dtype = dtype
+    dtype = _unwrap_value(dtype) 
+    if dtype is None:
+        return IRPyFunc(signature,[tensor], [IRObject(value=str(tensor.dtype))])
+    else:
+        if isinstance(dtype, str):
+            return IRDimops(Type, 'type', signature, annos, [tensor], dtype=original_dtype, non_blocking=non_blocking)
+        elif isinstance(dtype, torch.dtype):
+            return IRDimops(Type, 'type', signature, annos, [tensor], dtype=original_dtype, non_blocking=non_blocking)
+        else:
+            raise RuntimeError(f'function.type with unknown arg: {dtype}')
+
+
+def Outer(input, vec2, *, out=None, signature=None):
+    """
+    torch.outer(input, vec2, *, out=None) → Tensor
+    """
+    if out is not None:
+        raise ValueError("Expected 'out' to be None")
+    if not (len(input.shape) == 1 and len(vec2.shape) == 1):
+        raise ValueError("'input' and 'vec2' must both be 1-D tensors.")
+    anno = 'n, m -> n m'
+    return IRDimops(Outer, 'outer', signature, [anno], [input, vec2])
+
+
+def Erf(input, *, out=None, signature=None):
+    """
+    torch.erf(input, *, out=None) → Tensor
+    """
+    if out is not None:
+        raise ValueError("Expected 'out' to be None")
+    shape = ShapeAnno.create_shape_str(input.shape)
+    annos = [OpAnno.create_op_str([shape], [shape])]
+    return IRDimops(Erf, 'erf', signature, annos, [input])
+
+
+def Conv1D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, signature=None):
+    """
+    torch.nn.functional.conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1) → Tensor
+    """
+    if isinstance(stride, int): 
+        stride = (stride,)
+    if isinstance(dilation, int): 
+        dilation = (dilation,)
+    if isinstance(padding, str):
+        if padding == 'same':
+            # For 'same' padding, calculate padding needed to keep the output shape the same as input shape
+            # this mode doesn’t support any stride values other than 1.
+            kW = weight.shape[2]
+            iW = input.shape[2]
+            effective_kernel_size = (kW - 1) * dilation[0] + 1
+            total_padding = max(0, (iW - 1) * stride[0] + effective_kernel_size - iW)
+            pad_ = total_padding // 2
+            # NOTE: While we calculate padding for both sides, conv1d expects a single integer for symmetrical padding.
+            padding = (pad_, )
+        elif padding == 'valid':
+            padding = (0, )
+        else:
+            raise ValueError("Unsupported padding value: {}. Use 'valid', 'same', or an integer.".format(padding))
+    elif isinstance(padding, int):
+        padding = (padding,)
+    elif not isinstance(padding, tuple):
+        raise ValueError("Padding must be a string ('valid', 'same'), an integer, or a tuple")
+
+    ori_groups = groups
+    if isinstance(groups, IRObject): groups = groups.value
+    _, iW = input.shape[1:3]
+    oC, iC, kW = weight.shape
+    oW = (iW + 2 * padding[0] - dilation[0] * (kW - 1) - 1) // stride[0] + 1
+    if input.shape[1] // groups != weight.shape[1]:
+        raise ValueError(f'Input shape and weight shape are not compatible for the number of groups. input shape: {input.shape}, weight shape: {weight.shape}, groups: {groups}')
+    if weight.shape[0] % groups != 0:
+        raise ValueError('The output channels of weight must be divisible by the number of groups.')
+    def modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
+        # only for partitioning groups
+        kwargs = dict(**kwargs)
+        kw_groups = kwargs['groups']
+        if isinstance(kw_groups, IRObject):
+            _logger.warning(f'partition groups in IRObject: {kw_groups}')
+            kw_groups = kw_groups.value
+        kwargs['groups'] = kw_groups // num
+        return kwargs
+    if bias is None:
+        # NOTE: cannot support partitioning inchannel when groups>1
+        if groups == 1:
+            annos = [f'n iC+ {iW}, oC iC+ {kW} -> n oC {oW}']
+            rules = None
+        else:
+            rules = [TransformRule([DimopSplit.D(1), DimopSplit.D(0)], [DimopSplit.D(1)], modifier)]
+            annos = [f'n (g {iC}) {iW}, (g {oC//groups}) {iC} {kW} -> n (g {oC//groups}) {oW}']
+    else:
+        # NOTE: not supported value partition of bias yet
+        if groups == 1:
+            annos = [f'n iC^ {iW}, oC iC^ {kW}, oC -> n oC {oW}']
+            rules = None
+        else:
+            rules = [TransformRule([DimopSplit.D(1), DimopSplit.D(0), DimopSplit.D(0)], [DimopSplit.D(1)], modifier)]
+            annos = [f'n (g {iC}) {iW}, (g {oC//groups}) {iC} {kW}, (g {oC//groups}) -> n (g {oC//groups}) {oW}']
+    return IRDimops(Conv1D, 'conv1d', signature, annos, [input, weight, bias] if bias is not None else [input, weight], rules,
+                    stride=stride, padding=padding, dilation=dilation, groups=ori_groups)

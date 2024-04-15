@@ -418,6 +418,8 @@ def test_Min():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c -> a c, a c'
     op = F.Min(IRTensor([2, 3, 4]), IRTensor([4]))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c, c -> a b c'
+    op = F.Min(IRTensor([4]), IRTensor([2, 3, 4]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'c, a b c -> a b c'
     op = F.Min(IRTensor([2, 3, 4]), IRObject(value=2, is_constant=False), True)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b 1, a b 1'
     op = F.Min(IRTensor([2, 3, 4]), 2,IRObject(value=True, is_constant=False))
@@ -457,6 +459,140 @@ def test_Log():
     assert op.outputs()[0].value == math.log(6) and not op.outputs()[0].is_constant
 
 
+def test_ZerosLike():
+    op = F.ZerosLike(IRTensor([2, 1, 4, 1]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c d -> a b c d'
+    op_true = F.ZerosLike(IRTensor([2, 2]), requires_grad=True)
+    assert len(op_true._annos_candidates) == 1 and op_true._annos_candidates[0] == 'a b -> a b'     
+    op_float = F.ZerosLike(IRTensor([1, 2],dtype=int), dtype=torch.float)
+    assert len(op_float._annos_candidates) == 1 and op_float._annos_candidates[0] == 'a b -> a b'
+
+
+def test_OnesLike():
+    op = F.OnesLike(IRTensor([2, 1, 4, 1]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c d -> a b c d'
+    op_true = F.OnesLike(IRTensor([2, 2]), requires_grad=True)
+    assert len(op_true._annos_candidates) == 1 and op_true._annos_candidates[0] == 'a b -> a b'     
+    op_float = F.OnesLike(IRTensor([1, 2],dtype=int), dtype=torch.float)
+    assert len(op_float._annos_candidates) == 1 and op_float._annos_candidates[0] == 'a b -> a b'
+
+
+def test_addmm():
+    op = F.Addmm(IRTensor([2, 3]), mat1=IRTensor([2, 7]), mat2=IRTensor([7, 3]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b, a k^, k^ b -> a b'
+    op = F.Addmm(IRTensor([1, 3]), mat1=IRTensor([2, 7]), mat2=IRTensor([7, 3]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '1 b, a k^, k^ b -> a b'
+    op = F.Addmm(IRTensor([2, 1]), mat1=IRTensor([2, 7]), mat2=IRTensor([7, 3]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a 1, a k^, k^ b -> a b'
+    op = F.Addmm(IRTensor([1, 1]), mat1=IRTensor([2, 7]), mat2=IRTensor([7, 3]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '1 1, a k^, k^ b -> a b'
+    op = F.Addmm(IRTensor([3]), mat1=IRTensor([2, 3]), mat2=IRTensor([3, 3]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'b, a k^, k^ b -> a b'
+    op = F.Addmm(IRTensor([7]), mat1=IRTensor([2, 3]), mat2=IRTensor([3, 7]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'b, a k^, k^ b -> a b'
+
+
+def test_type():
+    op = F.Type(IRTensor([2,3],dtype=None),torch.float32)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs['dtype'] == torch.float32
+    op = F.Type(IRTensor([3, 5], dtype=torch.int64),torch.float32)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *'  and op.kwargs['dtype'] == torch.float32
+    op = F.Type(IRTensor([3, 5], dtype=torch.int64),IRObject(value=torch.float32, is_constant=False), signature='torch.type')
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *'  and op.kwargs['dtype'].value == torch.float32
+    op = F.Type(IRTensor([3, 5], dtype=torch.int64),dtype=IRObject(value=None, is_constant=False), signature='torch.type')
+    assert op.outputs()[0].value == "torch.int64"
+    op = F.Type(IRTensor([3, 5], dtype=torch.int64),dtype=torch.int64)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs['dtype'] == torch.int64
+    op = F.Type(IRTensor([3, 5], dtype=torch.int64),"torch.int64")
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs['dtype'] == 'torch.int64'
+    op = F.Type(IRTensor([3, 5], dtype=torch.int64), signature='torch.type')
+    assert op.outputs()[0].value == "torch.int64"
+
+
+def test_to():
+    op = F.To(IRTensor([2, 3], dtype=None), dtype=torch.float32)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs['dtype_or_device'] == torch.float32
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), device=torch.device('cuda:0'))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> a b'
+    op = F.To(IRTensor([3, 5], dtype=torch.int64), dtype=torch.float32)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs['dtype_or_device'] == torch.float32
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), device=torch.device('cuda:0'))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> a b'
+    op = F.To(IRTensor([3, 5], dtype=torch.int64), dtype=IRTensor(dtype=torch.float32))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *'
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), device=torch.device('cuda:0'), dtype=torch.float32)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs['dtype_or_device'] == torch.float32
+    op = F.To(IRTensor([3, 5], dtype=torch.int64),  dtype_or_device=IRTensor(dtype=torch.float32))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *'
+
+
+
+def test_outer():
+    op = F.Outer(IRTensor([2]), vec2=IRTensor([2]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n, m -> n m'
+
+
+def test_erf():
+    op = F.Erf(IRTensor([2]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a -> a'
+    op = F.Erf(IRTensor([2,3]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> a b'
+    op = F.Erf(IRTensor([2,3,4]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c -> a b c'
+    op = F.Erf(IRTensor([2,3,4,5]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c d -> a b c d'
+
+
+def test_mul_or_multiply():
+    op = F.Mul(IRTensor([1,2]),100)
+    assert len(op._annos_candidates) == 2 and op._annos_candidates[0] == '*, ? -> *'
+    op = F.Mul(IRTensor([1,2]),IRTensor([1,2]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b, a b -> a b'
+    op = F.Mul(IRTensor([2,2]),IRTensor([2]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b, b -> a b'
+    op = F.Mul(100,IRTensor([6]))
+    assert len(op._annos_candidates) == 2 and op._annos_candidates[1] == '?, * -> *'
+    op = F.Mul(torch.tensor([[1, 2], [1, 2]]),100)
+    assert torch.equal(torch.mul(torch.tensor([[1, 2], [1, 2]]), 100), op), "The result does not match the expected output"
+    op = F.Mul(torch.tensor([[1, 2], [1, 2]]),torch.tensor([[1, 2]]))
+    assert torch.equal(torch.mul(torch.tensor([[1, 2], [1, 2]]), torch.tensor([[1, 2]])), op), "The result does not match the expected output"
+    op = F.Mul(torch.tensor([1, 2]),IRObject(value=100, is_constant=False), signature='torch.mul')
+    assert torch.equal(op.outputs()[0].value, torch.mul(torch.tensor([1, 2]), 100)) and not op.outputs()[0].is_constant  and  torch.equal(op.outputs()[0].value, torch.tensor([100, 200]))
+
+
+def test_Softmax():
+    op = F.Softmax(IRTensor([2, 3, 4]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c -> a b c'
+    op = F.Softmax(IRTensor([2, 3, 4]), dim=1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c -> a b^ c'
+    op = F.Softmax(IRTensor([2, 3, 4]), dim=2, dtype=torch.float64)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b c^'
+    op = F.Softmax(IRTensor([2, 3, 4]), dtype=torch.float32)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c -> a b c'
+
+    
+def test_Conv1D():
+    op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 4'
+    op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), stride=2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 2'
+    op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), padding=1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 6'
+    op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), dilation=2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 4'
+    op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), groups=1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 4'
+    op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), groups=1,padding="valid")
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 4'
+    op = F.Conv1D(input=IRTensor([4, 8, 32]), weight=IRTensor([16, 8, 3]), bias=IRTensor([16,]),groups=1,padding="same")
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC^ 32, oC iC^ 3, oC -> n oC 32'
+    op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 1, 1]), groups=3)
+    expected_annotation_for_groups = 'n (g 1) 4, (g 1) 1 1 -> n (g 1) 4'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation_for_groups
+    op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), bias=IRTensor([3]))
+    assert op._annos_candidates[0] == 'n iC^ 4, oC iC^ 1, oC -> n oC 4', "Annotation mismatch."
+
+
 def test_Arange():
     op = F.Arange(10)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 10^' and op.kwargs['dtype'] == torch.int64
@@ -471,6 +607,7 @@ def test_Arange():
     op = F.Arange(IRObject(value=1), IRObject(value=10.0), 2)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 5^' and op.kwargs['dtype'] == torch.float
 
+
 def test_Flatten():
     op = F.Flatten(IRTensor([2,3,4,5]), 1, 2)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c^ d -> a (b^ c^) d'
@@ -478,5 +615,3 @@ def test_Flatten():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c^ d^ -> a (b^ c^ d^)'
     op = F.Flatten(IRTensor([2,3,4,5]), end_dim = 2)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ d -> (a^ b^ c^) d'
-
-
