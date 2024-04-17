@@ -75,7 +75,7 @@ class PredefinedSched:
         wait_steps = [sid for sid in range(num_stages)]
         bw_ofst = [num_stages - 1 - sid for sid in range(num_stages)]
         total_steps = num_microbatches * 2 + (num_stages - 1) * 2
-        
+
         # 1f1b schedule
         for step in range(total_steps):
             for sid in range(num_stages):
@@ -88,7 +88,7 @@ class PredefinedSched:
                 # append for execution
                 if mb_idx < 0 or mb_idx >= num_microbatches: continue
                 sched.add_segment(segment, mb_idx, step)
-        
+
         # insert
         for mid in range(num_microbatches):
             for tp_seg in tp_fsegs:
@@ -104,7 +104,7 @@ class PredefinedSched:
                     # insert forward
                     if next_seg in segments:
                         sched.insert_step(step, tp_seg, mid, 1)
-                        assert not insert_fw 
+                        assert not insert_fw
                         insert_fw = True
                     # insert backward
                     if next_seg.mirror in segments:
@@ -116,7 +116,7 @@ class PredefinedSched:
                 assert insert_fw and insert_bw, (
                     f'find one segment cannot be inserted in schedplan: ',
                     f'mid: {mid}, fw: {insert_fw}, bs: {insert_bw}')
-        
+
         sched.finish()
         # print(sched)
         return sched
@@ -131,7 +131,7 @@ class PredefinedSched:
         f0 f1 f2 f3                   b0 b1 b2 b3
            f0 f1 f2 f3             b0 b1 b2 b3
               f0 f1 f2 f3       b0 b1 b2 b3
-                 f0 f1 f2 f3 b0 b1 b2 b3 
+                 f0 f1 f2 f3 b0 b1 b2 b3
         ```
         """
         if num_microbatches <= 0:
@@ -171,14 +171,14 @@ class PredefinedSched:
 
         0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 (-> steps)
         ```
-        
+
         Note the f0 and f2 (step 0) should be considered to be one segment in graph.
         """
         if num_microbatches <= 0:
             raise ValueError(f"expected num_microbatches > 0, but got {num_microbatches} ")
         segments: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
         fsegs = [seg for seg in segments if seg.isfw()]
-        assert len(fsegs) == 4, f"Chimera-direct scheduling only applies for 4 segments, but {len(segments)} detected"
+        assert len(fsegs) == 4, f"Chimera-direct scheduling only applies for 4 segments, but {len(fsegs)} detected"
         sched = SchedulePlan(graph, num_microbatches)
         assert num_microbatches % 2 == 0
         mid = 0
@@ -215,9 +215,9 @@ class PredefinedSched:
 
         An illustration of scheduling schema (the number is micro-batch index):
         ```
-        f0 f1 f2 f3                 
-           f0 f1 f2 f3           
-              f0 f1 f2 f3     
+        f0 f1 f2 f3
+           f0 f1 f2 f3
+              f0 f1 f2 f3
                  f0 f1 f2 f3
         ```
         """

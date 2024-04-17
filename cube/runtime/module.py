@@ -1,4 +1,4 @@
-from typing import List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any
+from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union
 import logging
 import os
 import sys
@@ -12,8 +12,11 @@ import torch.distributed as dist
 from cube.graph.parser.fx.parser import FxModuleParser
 from cube.runtime.device import DeviceGroup
 from cube.runtime.adapter.reducer import Reducer
+from cube.runtime.executor import Executor
 from cube.runtime.gnorm import ParamsInfo
 from cube.flags import CompileFlag
+from cube.runtime.utils import microbatches
+from cube.utils import accum_mode
 
 if TYPE_CHECKING:
     from cube.parallel import ComputeConfig
@@ -452,12 +455,10 @@ class CubeModule(torch.nn.Module):
                 assert len(optim_state_dicts[work_idx]['param_groups']) == 1, 'only support param_groups to be one group'
 
             # assign opt_state to state_dicts, cannot be assigned in the above loop
-            opt_state_len = len(opt_state_list[0])
             for work_idx in range(plan_ngpus):
                 optim_state_dicts[work_idx]['state'] = opt_state_list[work_idx]
                 optim_state_dicts[work_idx]['param_groups'][0]['params'] = sorted(opt_state_list[work_idx].keys())
                 _logger.info(f'finish assign optimizer state for worker {work_idx}')
-                assert len(opt_state_list[work_idx]) == opt_state_len
 
         # build parameter order to match with the optimizer state order
         # NOTE: the param IDs in optimizer typically follow the same order of
@@ -662,6 +663,142 @@ class ParallelModule(CubeModule):
             self._sync_grad_required = False  # mark sync_grad() has been called
             for reducer in self._reducers:
                 reducer.sync_grads()
+
+    def _train_step(self, dataloader) -> Union[List[Any], Any]:
+        """
+        This function is assigned automatically when loading module class
+        Returns:
+            Union[List[Any], Any]: the output of the training step,
+                In Pipeline mode, it should return a list of outputs for each sample
+                Otherwise, it should return a single output
+        """
+        ...
+
+    def _infer_step(self, dataloader) -> Union[List[Any], Any]:
+        """
+        This function is assigned automatically when loading module class
+        Returns:
+            Union[List[Any], Any]: the output of the training step,
+                In Pipeline mode, it should return a list of outputs for each sample
+                Otherwise, it should return a single output
+        """
+        ...
+
+    def _scale_loss(self, is_dummy_batch: Optional[List[bool]], scale_fn: Optional[Callable[[torch.Tensor], torch.Tensor]]) -> None:
+        """Setup cube backward hook for loss scale and dummy batch.
+
+        If the batch is a dummy batch, the loss will be 0 to make the
+        gradient 0.
+
+        Args:
+            is_dummy_batch (List[bool]): indicate whether the each micro-batch is dummy
+            scale_fn (Callable[[torch.Tensor], torch.Tensor]): the function to scale the loss
+        """
+
+        # clear the previous hook
+        Executor.register_backward_pre_hook(None)
+
+        if not is_dummy_batch and not scale_fn:
+            return
+
+        accum_idx = 0
+        def cube_scale(ins, outs, grads):
+            nonlocal accum_idx
+            if is_dummy_batch and accum_idx >= len(is_dummy_batch):
+                raise RuntimeError(
+                    f"Expected {len(is_dummy_batch)} number of micro-batches, but got more than it."
+            )
+            mul_coef = 0.0 if is_dummy_batch and is_dummy_batch[accum_idx] else 1.0
+            # find loss
+            for idx in range(len(outs)):
+                # loss always requires to be a scalar, and its gradient should be None
+                if grads[idx] is None:
+                    assert idx == 0, "Loss must be the first output."
+                    if outs[idx].size() != torch.Size([]):
+                        raise ValueError(f"Expected scalar loss, but got {outs[idx].size()}.")
+                    if scale_fn:
+                        outs[idx] = mul_coef * scale_fn(outs[idx])
+                    else:
+                        outs[idx] = mul_coef * outs[idx]
+                    break
+            accum_idx += 1
+            return ins, outs, grads
+
+        Executor.register_backward_pre_hook(cube_scale)
+
+    def train_step(self,
+        samples: List[Any],
+        is_dummy_batch: Optional[List[bool]] = None,
+        scale_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ) -> List[Any]:
+        """
+        The training step function. It should be called in the training loop.
+        Please note:
+            1. This function is only supported in end2end mode.
+            2. Gradient accumulation is done inside this function.
+                You shouldn't do gradient accumulation outside this function,
+                because the gradients will be cleared in the beginning of this function
+        Args:
+            samples (List[Any]): a list of samples.
+                if pipeline is used, it must have the same length as pipeline_nmicros
+            is_dummy_batch (Optional[List[bool]]): indicates whether the each micro-batch is dummy
+            scale_fn (Optional[Callable[[torch.Tensor], torch.Tensor]]): the function to scale the loss
+        Results:
+            List[Any]: a list of outputs for each sample
+        """
+        if not self.compute_config.use_end2end:
+            raise RuntimeError("train_step() is only supported in end2end mode")
+        if is_dummy_batch and len(samples) != len(is_dummy_batch):
+            raise ValueError("The length of samples and is_dummy_batch should be the same")
+
+        self._scale_loss(is_dummy_batch, scale_fn)
+
+        # sync_grad will be done in _train_step
+        # so we never need to call it manually
+        self._sync_grad_required = False
+        sample_count = len(samples)
+        dataloader = microbatches(samples, cycle=False)
+
+        if self.compute_config.use_pipeline:
+            if len(samples) != self.compute_config.pipeline_nmicros:
+                raise ValueError(f"Expected {self.compute_config.pipeline_nmicros} samples, but got {sample_count}")
+            # only one step, so begin/end are both True
+            with accum_mode(begin=True, end=True):
+                return self._train_step(dataloader)
+        else:
+            outputs = []
+            for idx in range(sample_count):
+                with accum_mode(begin=(idx==0), end=(idx==sample_count-1)):
+                    output = self._train_step(dataloader)
+                outputs.append(output)
+            return outputs
+
+    def infer_step(self, samples: List[Any]) -> List[Any]:
+        """
+        The inference step function. It should be called in the inference loop.
+        Please note this function is only supported in end2end mode.
+
+        Args:
+            samples (List[Any]): a list of samples.
+                if pipeline is used, it must have the same length as pipeline_nmicros
+        Results:
+            List[Any]: a list of outputs for each sample
+        """
+        if not self.compute_config.use_end2end:
+            raise RuntimeError("infer_step() is only supported in end2end mode")
+
+        sample_count = len(samples)
+        dataloader = microbatches(samples, cycle=False)
+        if self.compute_config.use_pipeline:
+            if len(samples) != self.compute_config.pipeline_nmicros:
+                raise ValueError(f"Expected {self.compute_config.pipeline_nmicros} samples, but got {sample_count}")
+            return self._infer_step(dataloader)
+        else:
+            outputs = []
+            for _ in range(sample_count):
+                output = self._infer_step(dataloader)
+                outputs.append(output)
+            return outputs
 
     @property
     def dist_param_map(self) -> Dict[str, str]:
@@ -874,6 +1011,9 @@ class ParallelModule(CubeModule):
                 tid_info[meta.tid].append((attr, meta.slicers, meta.val_chunks))  # multiple params may share the same tid
 
             for orig_param_name in orig_param_names:
+                if orig_param_name not in origname_tid_map:
+                    # in pipeline mode, the parameter may not be in this rank
+                    continue
                 orig_param_name_with_prefix = prefix + orig_param_name
                 if orig_param_name_with_prefix not in state_dict:
                     continue

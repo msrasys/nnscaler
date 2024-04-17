@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 import pytest
 from typing import Dict, Tuple, List
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
@@ -18,7 +18,7 @@ from cube.parallel import ComputeConfig, parallelize, build_optimizer, merge_sta
 from cube.runtime.module import ParallelModule, ExtraState
 from cube.runtime.gnorm import calcuate_gnorm
 
-from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
+from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0, PASMegatron
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 from ..utils import replace_all_device_with
 
@@ -44,10 +44,10 @@ class FcRelu_4_4(FcRelu):
         return super().forward(x + self.buffer)
 
 
-def _to_cube_model(module, pas, compute_config, cube_savedir, instance_name):
+def _to_cube_model(module, pas, compute_config, cube_savedir, instance_name, dummy_input = None):
     return parallelize(
         module,
-        {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},
+        dummy_input if dummy_input is not None else {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},
         pas,
         compute_config,
         cube_savedir=cube_savedir,
@@ -55,7 +55,122 @@ def _to_cube_model(module, pas, compute_config, cube_savedir, instance_name):
     )
 
 
-def _create_cube_module(pas, compute_config, cube_savedir, module_type='whole'):
+def pipeline_dummy_data():
+    return {
+        'data': torch.randn(
+            2, 16, device=torch.cuda.current_device()),
+        'target': torch.rand(
+            2, 16, device=torch.cuda.current_device())
+    }
+
+
+class End2EndMLP(nn.Module):
+    def __init__(self):
+        init_random()
+        super().__init__()
+        self.layers = torch.nn.ModuleList([])
+        for _ in range(8):
+            self.layers.append(nn.Linear(16, 16, bias=False))
+        self.loss_fn = nn.BCELoss()
+
+    def forward(self, data: Dict[str, torch.Tensor]):
+        x = data['data']
+        for layer in self.layers:
+            x = layer(x)
+        x = torch.sigmoid(x)
+        loss = self.loss_fn(x, data['target'])
+        return loss
+
+    @classmethod
+    def to_pipeline_module(cls, compute_config: ComputeConfig, cube_savedir,
+        instance_name='pipeline', scheduler='1f1b'
+    ):
+        assert compute_config.runtime_ngpus == 4
+        assert compute_config.plan_ngpus == 2
+        compute_config = replace(compute_config,
+            use_end2end=True,
+            use_pipeline=True,
+            pipeline_nmicros=2,
+            pipeline_nstages=2,
+            pipeline_scheduler=scheduler
+        )
+        return parallelize(
+            cls,
+            {'data': pipeline_dummy_data()},
+            PASMegatron,
+            compute_config,
+            cube_savedir=cube_savedir,
+            instance_name=instance_name
+        )
+
+    @classmethod
+    def gen_pipeline_data(cls, data_size, start, end, rank, num_replicas):
+        data = []
+        for _ in range(data_size):
+            data.append(pipeline_dummy_data())
+        data = data[start:end]
+        data = [data[i] for i in range(rank, len(data), num_replicas)]
+        data = [(data[i:i + 2], None) for i in range(0, len(data), 2)]
+        return data
+
+    @classmethod
+    def gen_raw_data(cls, data_size, start, end, rank, num_replicas):
+        data = []
+        for _ in range(data_size):
+            data.append(pipeline_dummy_data())
+        data = data[start:end]
+        data = [(data[i], None) for i in range(rank, len(data), num_replicas)]
+        return data
+
+
+class End2EndMLPWithUnusedAndShared(End2EndMLP):
+    def __init__(self):
+        super().__init__()
+        self.linear0_unused = nn.Linear(4, 4)  # unused weights
+        self.layers[5].weight = self.layers[0].weight  # shared weights across stages
+
+
+def train_step(model, x, y, optimizer):
+    model.train()
+    if isinstance(model, ParallelModule) and model.compute_config.use_pipeline:
+        # actually train_step will return two losses (for each input)
+        # here we fake one loss to y_pred, so we don't need to change the check logic
+        y_pred, loss = model.train_step(x)
+        # workaround scalar tensor bug
+        y_pred = y_pred.reshape(())
+        loss = loss.reshape(())
+    elif isinstance(model, End2EndMLP):
+        y_pred = model(x)
+        loss = y_pred
+        loss.backward()
+    else:
+        loss_fn = nn.BCELoss()
+        y_pred = model(x)
+        loss = loss_fn(y_pred, y)
+        loss.backward()
+    optimizer.step()
+    return y_pred, loss
+
+
+def gendata(model, data_size, start, end, rank, num_replicas):
+    data = []
+    init_random()
+    if isinstance(model, ParallelModule) and model.compute_config.use_pipeline:
+        data = End2EndMLP.gen_pipeline_data(data_size, start, end, rank, num_replicas)
+    elif isinstance(model, End2EndMLP):
+        data = End2EndMLP.gen_raw_data(data_size, start, end, rank, num_replicas)
+    else:
+        for _ in range(data_size):
+            data.append((
+                torch.randn((2, 4), device='cuda', dtype=torch.float32),
+                torch.rand((2, 1), device='cuda', dtype=torch.float32),
+            ))
+        data = data[start:end]  # continue from last training
+        data = [data[i] for i in range(rank, len(data), num_replicas)]
+    return data
+
+
+def _create_cube_module(pas, compute_config: ComputeConfig, cube_savedir, module_type='whole'):
     init_random()
     if module_type == 'whole':
         class CompiledModule(torch.nn.Module):
@@ -75,15 +190,20 @@ def _create_cube_module(pas, compute_config, cube_savedir, module_type='whole'):
                 x = self.linear3(x)
                 x = self.sigmoid(x)
                 return x
-        CompiledModule = _to_cube_model(CompiledModule, pas, compute_config, cube_savedir, 'whole')
+        CompiledModule = _to_cube_model(CompiledModule, pas, compute_config, cube_savedir, f'whole-{compute_config.inference_only}')
+    elif module_type == 'pipeline':
+        CompiledModule = End2EndMLP.to_pipeline_module(compute_config, cube_savedir,
+            f'pipeline-{compute_config.inference_only}',
+            scheduler='infer_pipe' if compute_config.inference_only else '1f1b'
+        )
     elif module_type == 'sub':
         class CompiledModule(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.linear1 = nn.Linear(4, 4)
-                self.fc_relu1 = _to_cube_model(FcRelu_4_4(), pas, compute_config, cube_savedir, 'fc_relu1')
+                self.fc_relu1 = _to_cube_model(FcRelu_4_4(), pas, compute_config, cube_savedir, f'fc_relu1-{compute_config.inference_only}')
                 self.linear2 = nn.Linear(4, 4)
-                self.fc_relu2 = _to_cube_model(FcRelu_4_4(), pas, compute_config, cube_savedir, 'fc_relu2')
+                self.fc_relu2 = _to_cube_model(FcRelu_4_4(), pas, compute_config, cube_savedir, f'fc_relu2-{compute_config.inference_only}')
                 self.linear3 = nn.Linear(4, 1)
                 self.sigmoid = nn.Sigmoid()
             def forward(self, x):
@@ -99,7 +219,7 @@ def _create_cube_module(pas, compute_config, cube_savedir, module_type='whole'):
             def __init__(self):
                 super().__init__()
                 self.linear1 = _to_cube_model(CubeLinear(4, 4, bias=True),
-                    pas, compute_config, cube_savedir, f'start_linear1'
+                    pas, compute_config, cube_savedir, f'start_linear1-{compute_config.inference_only}'
                 )
                 self.linear2 = CubeLinear(4, 1, bias=True)
                 self.sigmoid = nn.Sigmoid()
@@ -115,7 +235,7 @@ def _create_cube_module(pas, compute_config, cube_savedir, module_type='whole'):
                 super().__init__()
                 self.linear1 = CubeLinear(4, 4, bias=True)
                 self.linear2 = _to_cube_model(CubeLinear(4, 4, bias=True),
-                    pas, compute_config, cube_savedir, f'end_linear2'
+                    pas, compute_config, cube_savedir, f'end_linear2-{compute_config.inference_only}'
                 )
                 self.sigmoid = nn.Sigmoid()
             def forward(self, x):
@@ -131,11 +251,12 @@ def _create_cube_module(pas, compute_config, cube_savedir, module_type='whole'):
                 super().__init__()
                 self.linear1 = CubeLinear(4, 4, bias=True)
                 self.linear2 = _to_cube_model(CubeLinear(4, 1, bias=True),
-                    pas, compute_config, cube_savedir, f'small_linear2'
+                    pas, compute_config, cube_savedir, f'small_linear2-{compute_config.inference_only}'
                 )
                 # the following tests depend on the rngstate in PASRandomSPMD
-                assert len(self.linear2.reducers) == 1
-                assert len(self.linear2.reducers[0].ranks) == 4
+                if not compute_config.inference_only:
+                    assert len(self.linear2.reducers) == 1
+                    assert len(self.linear2.reducers[0].ranks) == 4
                 self.sigmoid = nn.Sigmoid()
             def forward(self, x):
                 x = self.linear1(x)
@@ -157,9 +278,18 @@ class StepResult:
     weights: Dict[str, torch.Tensor]
 
 
-def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir):
+def assert_model_state_dict_equal(state_dict1: dict, state_dict2: dict):
+    assert set(state_dict1.keys()) == set(state_dict2.keys())
+    for index in state_dict1.keys():
+        if index.endswith('CUBE_EXTRA_STATE'):
+            continue
+        assert torch.equal(state_dict1[index].cpu(), state_dict2[index].cpu())
+
+
+def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inference_module: torch.nn.Module = None):
     ckpt_file_template = 'ckpt_{rank}_{start}.pth'
     ckpt_merged_file_template = 'ckpt_merged_{start}.pth'
+    temp_inferenece_ckpt_file_template = 'inference-{rank}.pth'
     ckpt_start_file = ckpt_dir / ckpt_file_template.format(
         rank=torch.distributed.get_rank(),
         start=start
@@ -167,6 +297,8 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir):
     ckpt_start_merged_file = ckpt_dir / ckpt_merged_file_template.format(
         start=start
     )
+    temp_inferenece_ckpt_file = ckpt_dir / temp_inferenece_ckpt_file_template.format(rank=torch.distributed.get_rank())
+
     init_random()
 
     loss_fn = nn.BCELoss()
@@ -187,6 +319,21 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir):
         merged_ckpt_dict = torch.load(ckpt_start_merged_file)
         merged_model_state_dict = merged_ckpt_dict['model']
         merged_opt_state_dict = merged_ckpt_dict['optimizer']
+
+        # In most cases, we can't load state_dict directly
+        # because they are different models, and the names of parameters are changed.
+        # inference_module.load_state_dict(model_state_dict, strict=False)
+        # assert not check_model_state_dict_equal(inference_module.state_dict(), model_state_dict)
+
+        # inference model can be loaded from merged state_dict
+        load_merged_state_dicts(inference_module, merged_model_state_dict)
+        torch.save(inference_module.state_dict(), temp_inferenece_ckpt_file)
+        torch.distributed.barrier()
+        inference_ckpt_files = [ckpt_dir / temp_inferenece_ckpt_file_template.format(rank=i) for i in range(torch.distributed.get_world_size())]
+        inference_state_dicts = [torch.load(f) for f in inference_ckpt_files]
+        merged_inference_state_dict, _ = merge_state_dicts(inference_state_dicts)
+        assert_model_state_dict_equal(merged_model_state_dict, merged_inference_state_dict)
+
         model_from_merged = type(model)()
         optimizer_from_merged = build_optimizer(model_from_merged, torch.optim.Adam, lr=0.01)
         load_merged_state_dicts(
@@ -197,11 +344,7 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir):
         # check merged model
         result_orig_model_state_dict = model.state_dict()
         result_merged_model_state_dict = model_from_merged.state_dict()
-        assert set(result_orig_model_state_dict.keys()) == set(result_merged_model_state_dict.keys())
-        for index in result_orig_model_state_dict.keys():
-            if index.endswith('CUBE_EXTRA_STATE'):
-                continue
-            assert torch.equal(result_orig_model_state_dict[index], result_merged_model_state_dict[index])
+        assert_model_state_dict_equal(result_orig_model_state_dict, result_merged_model_state_dict)
 
         result_orig_opt_state_dict = optimizer.state_dict()
         result_merged_opt_state_dict = optimizer_from_merged.state_dict()
@@ -213,22 +356,10 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir):
             for key in ('step', 'exp_avg', 'exp_avg_sq'):
                 assert torch.equal(result_orig_opt_state_dict['state'][index][key], result_merged_opt_state_dict['state'][index][key])
     torch.distributed.barrier()
-    data = []
-    init_random()
-    for _ in range(DATA_SIZE):
-        data.append((
-            torch.randn((2, 4), device='cuda', dtype=torch.float32),
-            torch.rand((2, 1), device='cuda', dtype=torch.float32),
-        ))
-    data = data[start:end]  # continue from last training
-    data = [data[i] for i in range(rank, len(data), num_replicas)]
+    data = gendata(model, DATA_SIZE, start, end, rank, num_replicas)
     results = []
     for i, (x, y) in enumerate(data):
-        model.train()
-        y_pred = model(x)
-        loss = loss_fn(y_pred, y)
-        loss.backward()
-        optimizer.step()
+        y_pred, loss = train_step(model, x, y, optimizer)
         grads = {n: p.grad for n, p in model.named_parameters()}
         gnorm = optimizer.clip_gnorm()
         results.append(clone_to_cpu_recursively([y_pred, loss, grads, gnorm]))
@@ -288,18 +419,24 @@ def _gpu_worker(module_type, use_zero, pas, plan_ngpus, runtime_ngpus, per_resum
                 tempdir,
                 module_type,
             )
+            compiled_inference_module = _create_cube_module(pas,
+                ComputeConfig(plan_ngpus, runtime_ngpus, use_zero=use_zero, inference_only=True),
+                tempdir,
+                module_type,
+            )
             if check_module:
                 check_module(compiled_module)
             compiled_results.extend(_train(
                 compiled_module,
                 runtime_ngpus // plan_ngpus,
                 torch.distributed.get_rank() // plan_ngpus,
-                start, end, tempdir
+                start, end, tempdir,
+                inference_module=compiled_inference_module
             ))
         return compiled_results
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-@pytest.mark.parametrize('module_type', ['sub', 'whole', 'start', 'end', 'small'])
+@pytest.mark.parametrize('module_type', ['sub', 'whole', 'start', 'end', 'small', 'pipeline'])
 @pytest.mark.parametrize('use_zero', [True, False])
 def test_checkpoint(module_type, use_zero):
     plan_ngpus = 2

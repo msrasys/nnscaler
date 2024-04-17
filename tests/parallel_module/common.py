@@ -2,19 +2,49 @@ from datetime import datetime
 import math
 import random
 import shutil
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import more_itertools as mitr
 import contextlib
 
 import torch
 from torch import nn
 import numpy as np
 
+from cube.graph.schedule.predefined import PredefinedSched
 from cube.parallel import ComputeConfig
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.function.dimops import IRDimops
 from cube.graph.graph import IRGraph
 from cube.graph.segment import IRSegment
 from cube.ir.operator import IRDataOperation, IRFwOperation
+
+
+def create_mesh(ngpus: int, group_num: Tuple[int]) -> Tuple[Tuple[Tuple[int]]]:
+    """
+    Create hybrid (nested) groups given the each group number.
+
+    The product of group_num should be same with total devices.
+
+    e.g., 6 device to 2 x 3 mesh will results [dim][group_id] = tuple[int]:
+        (
+            ( (0,1,2), (3,4,5) ),
+            ( (0,3), (2,5), (3,6) ),
+        )
+    """
+    group_num = np.array(group_num)
+    cnt = np.prod(group_num)
+    assert cnt == ngpus, 'total device not match'
+    grid = np.arange(cnt).reshape(tuple(group_num))
+    dims = list(range(len(group_num)))
+    outputs = []
+    for dim, num in enumerate(group_num):
+        remain = ngpus // num
+        order = tuple(dims[:dim] + dims[dim+1:] + [dim])
+        grid_dim = np.transpose(grid, order).reshape((remain,num))
+        grid_dim = grid_dim.tolist()
+        outputs.append(tuple(tuple(ranks) for ranks in grid_dim))
+    assert len(outputs) == len(group_num)
+    return tuple(outputs)
 
 
 def _tp(graph: IRGraph, node: IRDimops, devs: List[int], idx: int, dim: int):
@@ -90,7 +120,7 @@ def PASData(graph: IRGraph, env_resource: ComputeConfig):
 
     batch_dim = 0
     for dl in graph.select(ntype=IRDataOperation):
-        _replica(dl, list(range(ngpus)))
+        _replica(graph, dl, list(range(ngpus)))
 
     for node in graph.nodes():
         # print(node)
@@ -108,6 +138,78 @@ def PASData(graph: IRGraph, env_resource: ComputeConfig):
             for idx, node in enumerate(sub_nodes):
                 graph.assign(node, idx)
     # print(graph.extra_repr())
+    return graph
+
+
+def PASMegatron(graph: IRGraph, config: ComputeConfig):
+    num_stages = config.pipeline_nstages
+    tp_size = config.plan_ngpus // num_stages
+    _, tp_mesh = create_mesh(config.plan_ngpus, (num_stages, tp_size))
+
+    # group to sub-graphs
+    linears = graph.select(name='linear')
+    stage_start_nodes = linears[::len(linears) // num_stages][:num_stages]
+    graph.staging(stage_start_nodes)
+
+    segments = graph.select(ntype=IRSegment, flatten=False)
+    fsegs = [seg for seg in segments if seg.isfw()]
+
+    for sid, segment in enumerate(fsegs):
+        # get tensor parallel group
+        tp_group = tp_mesh[sid]
+        for idx, node in enumerate(segment.nodes()):
+            if node.name == 'linear':
+                _tp(graph, node, idx=1, dim=idx%2, devs=tp_group)
+            else:
+                _replica(graph, node, devs=tp_group)
+
+    for dl in graph.select(ntype=IRDataOperation):
+        _replica(graph, dl, devs=list(range(config.plan_ngpus)))
+    config.apply_pipeline_scheduler(graph)
+    return graph
+
+
+def PASHybrid(graph: IRGraph, config: ComputeConfig):
+    """
+    Hybrid Tensor and Pipeline Parallelism
+    """
+    ngpus: int = config.plan_ngpus
+    nstages = config.pipeline_nstages
+    tp_size: int = config.plan_ngpus // nstages
+    if ngpus % tp_size != 0:
+        raise ValueError(f'invalid tp_size {tp_size} for ngpus {ngpus}')
+    pp_size = ngpus // tp_size
+
+    fnodes = graph.select(ntype=IRFwOperation)
+    stages = mitr.divide(pp_size, fnodes)
+    stages = [list(s) for s in stages]
+    for idx, stage in enumerate(stages):
+        print(f'> stage {idx}: {stage[0]}')
+    graph.staging([s[0] for s in stages])
+
+    stages: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
+    stages = [s for s in stages if s.isfw()]
+    assert len(stages) == pp_size, "Internal Error"
+
+    # stage-wise tensor parallelism
+    curr_devices = list(range(ngpus))
+    for stage in stages:
+        for node in stage.nodes():
+            devs = curr_devices[:tp_size]
+            try:
+                _tp(graph, node, devs, idx=0, dim=0)
+            except Exception as e:
+                _replica(graph, node, devs)
+        curr_devices = curr_devices[tp_size:]
+    assert len(curr_devices) == 0, f"remaining devices: {curr_devices} not used"
+
+    # replicate dataloader
+    for dl in graph.select(ntype=IRDataOperation):
+        _replica(graph, dl, devs=list(range(ngpus)))
+
+    # setup 1f1b pipeline scheduler
+    # PredefinedSched.sched_1f1b(graph, nmicros, pp_size)
+    config.apply_pipeline_scheduler(graph)
     return graph
 
 
@@ -147,7 +249,6 @@ def init_random():
     torch.manual_seed(1)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1)
-
 
 
 @contextlib.contextmanager

@@ -624,3 +624,110 @@ def test_codegen_buffer():
         assert len(matches) == 1
         match = matches[0]
         assert 'persistent' not in match
+
+
+class End2EndModule(torch.nn.Module):
+    def __init__(self, dim: int = 1024, nlayers: int = 16):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([])
+        for _ in range(nlayers):
+            self.layers.append(torch.nn.Linear(dim, dim, bias=False))
+
+    def forward(self, data: torch.Tensor, return_type: int = 0):
+        x = data
+        for layer in self.layers:
+            x = layer(x)
+        loss = torch.sum(x)
+        if return_type == 0:
+            return loss
+        elif return_type == 1:
+            return loss, data.shape # the second return is not tensor
+        elif return_type == 2:
+            return loss, {'data': data}
+        elif return_type == 3:
+            return torch.sum(x, -1)  # bad loss
+        elif return_type == 4:
+            return {'data': data}  # not tensor
+
+
+@replace_all_device_with('cpu')
+def test_codegen_inference():
+    with tempfile.TemporaryDirectory() as tempdir:
+        parallelize(
+            Module0(),
+            {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+            PASData,
+            ComputeConfig(1, 1, inference_only=True),
+            cube_savedir=tempdir,
+            load_module=False
+        )
+        assert _gencode_contains(tempdir, Module0, 0,
+                r"self\.register_buffer"
+        )
+        assert not _gencode_contains(tempdir, Module0, 0,
+                r"self\.register_parameter"
+        )
+
+
+@replace_all_device_with('cpu')
+def test_codegen_end2end():
+    """
+    Test end2end code generation for different configs
+    (use_pipeline, dynamic shape, return value)
+    """
+    dim = 1024
+    nlayers = 16
+    batch_size = 64
+    def p(cube_dir, use_pipeline, dynamic_shape, return_type, inference_only=False):
+        m = End2EndModule(dim, nlayers)
+        m.train()
+        parallelize(
+            m,
+            {'data': torch.randn(batch_size, dim), 'return_type': return_type},
+            PASData,
+            compute_config= ComputeConfig(
+                4, 4,
+                inference_only=inference_only,
+                dynamic_shape=dynamic_shape,
+                use_end2end=True,
+                use_pipeline=use_pipeline,
+                pipeline_nmicros=4,
+                pipeline_nstages=4,
+                pipeline_scheduler='infer_pipe' if inference_only else '1f1b'
+            ),
+            cube_savedir=cube_dir,
+            load_module=False,
+            reuse='override',
+        )
+    with tempfile.TemporaryDirectory() as tempdir:
+        for use_pipeline in [True, False]:
+            p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=0) # should success
+            assert not _gencode_contains(tempdir, End2EndModule, 0,
+                    r"self\.register_buffer"
+            )
+            assert _gencode_contains(tempdir, End2EndModule, 0,
+                    r"self\.register_parameter"
+            )
+            p(tempdir, use_pipeline=use_pipeline, dynamic_shape=False, return_type=0)  # should success
+            with pytest.raises(RuntimeError, match='.*Communication generation.*'):
+                # fail for non-tensor IRObject return
+                p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=1)
+            p(tempdir, use_pipeline=use_pipeline, dynamic_shape=False, return_type=1)  # should success
+            p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=2)  # should success
+            p(tempdir, use_pipeline=use_pipeline, dynamic_shape=False, return_type=2)  # should success
+            with pytest.raises(RuntimeError, match='.*Loss can only be scalar tensor.*'):
+                p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=3)
+            with pytest.raises(RuntimeError, match='.*Loss can only be scalar tensor.*'):
+                p(tempdir, use_pipeline=use_pipeline, dynamic_shape=False, return_type=3)
+            with pytest.raises(RuntimeError, match='.*Loss can only be scalar tensor.*'):
+                p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=4)
+            with pytest.raises(RuntimeError, match='.*Loss can only be scalar tensor.*'):
+                p(tempdir, use_pipeline=use_pipeline, dynamic_shape=False, return_type=4)
+
+            p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=0, inference_only=True)  # should success
+            assert not _gencode_contains(tempdir, End2EndModule, 0,
+                    r"self\.register_parameter"
+            )
+            assert _gencode_contains(tempdir, End2EndModule, 0,
+                    r"self\.register_buffer"
+            )

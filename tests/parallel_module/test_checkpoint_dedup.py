@@ -11,8 +11,9 @@ from cube.parallel import ComputeConfig, parallelize, build_optimizer, \
     deduped_state_dict, load_deduped_state_dict
 from cube.runtime.module import ParallelModule
 
-from .common import PASRandomSPMD, CubeLinear, init_random, init_distributed, clear_dir_on_rank0, assert_equal
+from .common import PASRandomSPMD, PASMegatron, CubeLinear, init_random, init_distributed, clear_dir_on_rank0, assert_equal
 from ..launch_torchrun import launch_torchrun
+from .test_checkpoint import gendata, train_step, End2EndMLP, End2EndMLPWithUnusedAndShared
 
 
 class FcRelu(nn.Module):
@@ -82,21 +83,12 @@ CKPT_FILE_NAME_TEMPLATE = '{}.pth'
 
 def _train(model: torch.nn.Module, ckpt_dir):
     CKPT_FILE_NAME = CKPT_FILE_NAME_TEMPLATE.format(torch.distributed.get_rank())
-    DATA = []
-    for _ in range(DATA_SIZE):
-        DATA.append((
-            torch.randn((2, 4), device='cuda', dtype=torch.float32),
-            torch.rand((2, 1), device='cuda', dtype=torch.float32),
-        ))
-    loss_fn = nn.BCELoss()
+
+    DATA = gendata(model, DATA_SIZE, 0, DATA_SIZE, 0, 1)
     optimizer = build_optimizer(model, torch.optim.Adam, lr=0.01)
     for i, (x, y) in enumerate(DATA):
-        model.train()
+        train_step(model, x, y, optimizer)
         optimizer.zero_grad()
-        y_pred = model(x)
-        loss = loss_fn(y_pred, y)
-        loss.backward()
-        optimizer.step()
     deduped_model_state_dict, deduped_opt_state_dict = deduped_state_dict(model, optimizer)
     torch.save({
             'model': model.state_dict(),
@@ -119,7 +111,7 @@ def _check_deduped(model: torch.nn.Module, ckpt_dir):
     dedupped_optimizer_state_dicts = [ckpt['optimizer-dedup'] for ckpt in ckpt_state_dicts]
 
     parallel_modules = [m for m in model.modules() if isinstance(m, ParallelModule)]
-    assert len(parallel_modules) == 2
+    # assert len(parallel_modules) == 2
 
     module_dedup_group_size = [m.module_dedup_group_size for m in parallel_modules]
     opt_dedup_group_size = [m.optimizer_dedup_group_size for m in parallel_modules]
@@ -140,7 +132,11 @@ def _check_deduped(model: torch.nn.Module, ckpt_dir):
             assert len(dedupped_model_state_dict) == len(parallel_modules)
             assert all(k.endswith(ParallelModule.EXTRA_STATE_KEY) for k in dedupped_model_state_dict.keys())
         else:
-            assert len(parallel_modules) < len(dedupped_model_state_dict) < len(model_state_dict)
+            if not isinstance(model, ParallelModule):
+                # in this case, non parallel module is removed, so it should have less keys
+                assert len(parallel_modules) < len(dedupped_model_state_dict) < len(model_state_dict)
+            else:
+                assert len(dedupped_model_state_dict) == len(model_state_dict)
             for k, v in dedupped_model_state_dict.items():
                 assert_equal(v, model_state_dict[k])
 
@@ -152,7 +148,11 @@ def _check_deduped(model: torch.nn.Module, ckpt_dir):
             # only EXTRA_STATEs and param_groups are kept
             assert not dedupped_optimizer_state_dict['state']  # should have empty state
         else:
-            assert 0 < len(dedupped_optimizer_state_dict['state'])  < len(optimizer_state_dict['state'])
+            if not isinstance(model, ParallelModule):
+                # in this case, non parallel module is removed, so it should have less keys
+                assert 0 < len(dedupped_optimizer_state_dict['state'])  < len(optimizer_state_dict['state'])
+            else:
+                assert len(dedupped_optimizer_state_dict['state']) == len(optimizer_state_dict['state'])
             for k, v in dedupped_optimizer_state_dict['state'].items():
                 assert_equal(v, optimizer_state_dict['state'][k])
 
@@ -196,3 +196,30 @@ def test_checkpoint_compact(use_zero):
     cc1 = ComputeConfig(2, 4, use_zero=not use_zero, zero_ngroups=2 if not use_zero else 1)
     cc2 = ComputeConfig(2, 4, use_zero=use_zero, zero_ngroups=1)
     launch_torchrun(4, _gpu_worker, PASRandomSPMD, cc1, cc2)
+
+
+def _gpu_worker_pipeline(cc):
+    init_distributed()
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt_compact_pipeline') as tempdir:
+        for model_cls in [End2EndMLP, End2EndMLPWithUnusedAndShared]:
+            pipeline_moule_cls = model_cls.to_pipeline_module(cc, tempdir)
+            _train(pipeline_moule_cls().cuda(), tempdir)
+            torch.distributed.barrier()
+            _check_deduped(
+                pipeline_moule_cls().cuda(),
+                tempdir
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_checkpoint_compact_pipeline():
+    cc1 = ComputeConfig(2, 4, use_zero=False)
+    launch_torchrun(4, _gpu_worker_pipeline, cc1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_checkpoint_compact_pipeline_use_zero():
+    cc1 = ComputeConfig(2, 4, use_zero=True, zero_ngroups=1)
+    cc2 = ComputeConfig(2, 4, use_zero=True, zero_ngroups=2)
+    launch_torchrun(4, _gpu_worker_pipeline, cc1)
+    launch_torchrun(4, _gpu_worker_pipeline, cc2)

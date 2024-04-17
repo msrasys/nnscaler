@@ -297,6 +297,7 @@ class ModuleCodeGen(FuncEmission):
         attach: bool = False,
         *,
         as_parallel_module: bool = False,
+        end2end_mode: bool = False,
         forward_args: Optional[Dict[str, Any]] = None
     ) -> str:
         """
@@ -380,6 +381,10 @@ class ModuleCodeGen(FuncEmission):
                 1. Inherit from ParallelModule
                 2. Has forward method
                 3. Add more content to constructor
+            end2end_mode (bool): whether to generate code for end2end mode.
+                If True, a mocked `forward` will be generated which only raises NotImplementedError.
+                If False, the real forward function will be generated.
+                This is used only in parallel module.
             forward_args (Dict[str, Any]): argument names and their default values of forward function, if None, use node inputs.
                 This is used only in parallel module.
 
@@ -490,15 +495,20 @@ class ModuleCodeGen(FuncEmission):
                 cb.insert_body(fb.code)
 
             if as_parallel_module:
-                if len(segment_idxs) > 1:
-                        raise RuntimeError("The graph has more than one segment, forward code cannot be generated.")
-                elif not segment_idxs:
+                if not segment_idxs:
                     raise RuntimeError("The graph has no segment, forward code cannot be generated.")
-                segment_idx = segment_idxs[0]
-                node = gen_nodes[segment_idx]
-
                 cb.insert_body('')
-                cb.insert_body(self._generate_forward(node, forward_args))
+                if not end2end_mode:
+                    if len(segment_idxs) > 1:
+                        raise RuntimeError("The graph has more than one segment, forward code cannot be generated.")
+                    segment_idx = segment_idxs[0]
+                    node = gen_nodes[segment_idx]
+                    cb.insert_body(self._generate_forward(node, forward_args))
+                else:
+                    msg = "Code of forward is not generated. You should use module.train_step/module.infer_step instead."
+                    with FunctionBlock(func_name='_forward_impl', args=['self', '*args', '**kwargs']) as fb:
+                        fb.insert_body(f'raise NotImplementedError("{msg}")')
+                    cb.insert_body(fb.code)
 
         gencode += cb.code
         gencode += ['']

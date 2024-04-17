@@ -113,7 +113,7 @@ def _gpu_worker():
         m = p(tempdir, 'all', '_6', load_module=False, reuse='graph')
         if torch.distributed.get_rank() != 0:
             # only python files are broadcasted
-            assert set(f.name for f in Path(tempdir).glob('**/*') if f.is_file()) == set(['gencode0.py', 'gencode1.py'])
+            assert set(f.name for f in Path(tempdir).glob('**/*') if f.is_file()) == set(['gencode0.py', 'gencode1.py', 'compute_config.pt'])
 
         # case 6.2: everything should be broadcasted, including weights
         # so the load_module will succeed.

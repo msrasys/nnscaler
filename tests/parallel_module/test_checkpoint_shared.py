@@ -10,6 +10,7 @@ from cube.parallel import ComputeConfig, parallelize, build_optimizer, merge_sta
 
 from .common import PASRandomSPMD, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun
+from .test_checkpoint import End2EndMLP, train_step, gendata
 
 
 class FcReluWithShared(nn.Module):
@@ -45,9 +46,9 @@ def _to_cube_model(module, pas, compute_config, cube_savedir, instance_name):
     )
 
 
-def _create_cube_module(pas, compute_config, cube_savedir, module_type='raw'):
+def _create_cube_module(pas, compute_config, cube_savedir, module_type='sub/raw'):
     init_random()
-    if module_type == 'raw':
+    if module_type == 'sub/raw':
         class RawModuleWithShared(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -67,7 +68,7 @@ def _create_cube_module(pas, compute_config, cube_savedir, module_type='raw'):
                 return x
         init_random()
         return RawModuleWithShared().cuda()
-    else:
+    elif module_type == 'sub/cube':
         class ParallelModuleWithShared(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -90,6 +91,28 @@ def _create_cube_module(pas, compute_config, cube_savedir, module_type='raw'):
                 return x
         init_random()
         return ParallelModuleWithShared().cuda()
+    elif module_type.startswith('pipeline/'):
+        class RawModuleWithUnused(End2EndMLP):
+            def __init__(self):
+                super().__init__()
+                self.linear0_unused = nn.Linear(4, 4)  # unused weights
+                self.layers[2].weight = self.layers[0].weight  # shared weights in same stage
+        init_random()
+        if module_type.endswith('/raw'):
+            return RawModuleWithUnused().cuda()
+        else:
+            return RawModuleWithUnused.to_pipeline_module(compute_config, cube_savedir, 'pipeline')().cuda()
+    elif module_type.startswith('pipeline2/'):
+        class RawModuleWithUnused(End2EndMLP):
+            def __init__(self):
+                super().__init__()
+                self.linear0_unused = nn.Linear(4, 4)  # unused weights
+                self.layers[5].weight = self.layers[0].weight  # shared weights across stages
+        init_random()
+        if module_type.endswith('/raw'):
+            return RawModuleWithUnused().cuda()
+        else:
+            return RawModuleWithUnused.to_pipeline_module(compute_config, cube_savedir, 'pipeline')().cuda()
 
 
 DATA_SIZE = 256
@@ -97,21 +120,11 @@ RAW_CKPT_FILE_NAME = 'raw.pth'
 
 
 def _train_raw(model: torch.nn.Module, ckpt_dir):
-    DATA = []
-    for _ in range(DATA_SIZE):
-        DATA.append((
-            torch.randn((2, 4), device='cuda', dtype=torch.float32),
-            torch.rand((2, 1), device='cuda', dtype=torch.float32),
-        ))
-    loss_fn = nn.BCELoss()
+    DATA = gendata(model, DATA_SIZE, 0, DATA_SIZE, 0, 1)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     for i, (x, y) in enumerate(DATA):
-        model.train()
+        y_pred, loss = train_step(model, x, y, optimizer)
         optimizer.zero_grad()
-        y_pred = model(x)
-        loss = loss_fn(y_pred, y)
-        loss.backward()
-        optimizer.step()
     torch.save({
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict()
@@ -151,10 +164,11 @@ def _load_merged(parallel_model: torch.nn.Module, ckpt_dir):
             'model': merged_model_state_dicts,
             'optimizer': merged_optimizer_state_dict
         }, ckpt_merged_file)
+         # only key that contains `unused`` and not start with `unused` will be removed
         raw_model_state_dict = {
             key: value
             for key, value in raw_model_state_dict.items()
-            if not key.startswith('fc_relu1.unused_fc')
+            if not ('unused' in key and not key.startswith('unused'))
         }
         assert set(merged_model_state_dicts.keys()) == set(raw_model_state_dict.keys())
         for index in merged_model_state_dicts.keys():
@@ -168,7 +182,7 @@ def _load_merged(parallel_model: torch.nn.Module, ckpt_dir):
                 assert torch.equal(merged_optimizer_state_dict['state'][index][key].cuda(), raw_opt_state_dict['state'][index][key].cuda())
 
 
-def _gpu_worker(use_zero, pas, plan_ngpus, runtime_ngpus):
+def _gpu_worker(module_type, use_zero, pas, plan_ngpus, runtime_ngpus):
     # Basic logic:
     #   a. first train the original model, get a full state dict
     #   b. then use parallel model to load the full state dict as a merged state dict
@@ -179,19 +193,20 @@ def _gpu_worker(use_zero, pas, plan_ngpus, runtime_ngpus):
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt') as tempdir:
         if torch.distributed.get_rank() == 0:
             tempdir.mkdir(parents=True, exist_ok=True)
-            _train_raw(_create_cube_module(pas, compute_config, tempdir, 'raw'), tempdir)
+            _train_raw(_create_cube_module(pas, compute_config, tempdir, f'{module_type}/raw'), tempdir)
         torch.distributed.barrier()
         _load_merged(
-            _create_cube_module(pas, compute_config, tempdir, 'cube'),
+            _create_cube_module(pas, compute_config, tempdir, f'{module_type}/cube'),
             tempdir
         )
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 @pytest.mark.parametrize('use_zero', [True, False])
-def test_checkpoint_load_from_raw_checkpoint(use_zero):
+@pytest.mark.parametrize('module_type', ['sub', 'pipeline', 'pipeline2'])
+def test_checkpoint_load_from_raw_checkpoint(module_type, use_zero):
     """
     Test when the checkpoint is generated from raw module and need to be loaded to parallel module.
     """
     plan_ngpus = 2
     runtime_ngpus = 4
-    launch_torchrun(4, _gpu_worker, use_zero, PASRandomSPMD, plan_ngpus, runtime_ngpus)
+    launch_torchrun(4, _gpu_worker, module_type, use_zero, PASRandomSPMD, plan_ngpus, runtime_ngpus)

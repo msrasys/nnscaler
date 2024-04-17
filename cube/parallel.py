@@ -6,16 +6,18 @@ from pathlib import Path
 import inspect
 import sys
 import importlib
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from contextlib import contextmanager
 import logging
 import copy
 import os
 
 import torch
+from cube.codegen.schedule.schedule import ScheduleCodeGen
 from cube.graph.parser.fx.parser import FxModuleParser
 
-from cube.ir.cten import IRObject
+from cube.graph.schedule.predefined import PredefinedSched
+from cube.ir.cten import IRObject, IRTensor
 from cube.ir.tensor import IRFullTensor
 
 from cube.flags import CompileFlag, RuntimeFlag
@@ -23,7 +25,7 @@ from cube.utils import get_shared_params
 
 from cube.graph import IRGraph
 from cube.graph import parser
-from cube.ir.operator import IRBpOperation
+from cube.ir.operator import IRBpOperation, IRDataOperation
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.function.pyfunc import IRPyFunc
 from cube.graph.schedule.schedplan import SchedulePlan
@@ -44,6 +46,48 @@ from cube.utils import get_member_by_name, setup_stride_broadcast_group
 logger = logging.getLogger(__name__)
 
 
+_PREDEFINE_SCHEDS: Dict[str, Callable[[IRGraph, int, int], SchedulePlan]] = {}
+_PREDEFINED_INFERENCE_SCHEDS = ['infer_pipe']
+_PREDEFINE_SCHED_NAME_PREFIX = 'sched_'
+for k, v in PredefinedSched.__dict__.items():
+    if isinstance(v, staticmethod) and k.startswith(_PREDEFINE_SCHED_NAME_PREFIX):
+        _PREDEFINE_SCHEDS[k[len(_PREDEFINE_SCHED_NAME_PREFIX):]] = v
+
+@dataclass
+class UserConfig:
+    # you should put any configuration that may affect the traced graph here.
+    # So we can track the changes and make sure the generated code is correct.
+    # Example 1: save module configuration
+    # ```python
+    # class MyModule(torch.nn.Module):
+    #   def __init__(self):
+    #     super().__init__()
+    #   def forward(self, x):
+    #     ...
+    #     if module_config.use_3d:
+    #       ...
+    # ```
+    # here we can set `graph={'use_3d': module_config.use_3d}`,
+    # and we can be sure different use_3d will never use the same generated code.
+    # Example 2: save file stats
+    # If you want to track all related file stats (just like traditional compilers do),
+    # you can save the md5 of the files to save some bytes:
+    # ```python
+    # import hashlib
+    # h = hashlib.md5()
+    # for f in Path('./src').glob('**/*.py'):
+    #   with open(f, 'rb') as f:
+    #     h.update(f.read())
+    # graph = {
+    #   'files_md5': h.hexdigest()
+    # }
+    # ```
+    graph: Dict[str, Any] = field(default_factory=dict)
+    # you can put any configuration that may affect the generated code (but not affect the traced graph) here.
+    # For example, extra arguments of your PAS function can put here.
+    code: Dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class ComputeConfig:
     plan_ngpus: int
@@ -55,43 +99,27 @@ class ComputeConfig:
     use_zero: bool = False
     zero_ngroups: int = 1
 
-    # you can put any configuration here
-    # Note: different user_config should generate different graph/code.
-    #       so if user_config is changed, both graph and code will be regenerated.
-    # Example 1: save module configuration
-    # ```python
-    # class MyModule(torch.nn.Module):
-    #   def __init__(self):
-    #     super().__init__()
-    #   def forward(self, x):
-    #     ...
-    #     if module_config.use_3d:
-    #       ...
-    # ```
-    # here we can set `user_config={'use_3d': module_config.use_3d}`,
-    # and we can be sure different use_3d will never use the same generated code.
-    # Example 2: save file stats
-    # If you want to track all related file stats (just like traditional compilers do),
-    # you can do
-    # ```python
-    # user_config = {
-    #   'file_stats': {
-    #     str(f): os.stat(f).st_mtime_ns for f in Path('./src').glob('**/*.py')  # assume all source code is in ./src
-    #   }
-    # }
-    # ```
-    # Or you can save the md5 of the files to save some bytes:
-    # ```python
-    # import hashlib
-    # h = hashlib.md5()
-    # for f in Path('./src').glob('**/*.py'):
-    #   with open(f, 'rb') as f:
-    #     h.update(f.read())
-    # user_config = {
-    #   'files_md5': h.hexdigest()
-    # }
-    # ```
-    user_config: Optional[Dict[str, Any]] = None
+    # whether the generated code is for inference only
+    inference_only: bool = False
+
+    # end2end means,
+    #  1. the first argument of `module.forward` must be the data sample
+    #  2. the first return value of `module.forward` must be the loss
+    #  which must be a scalar tensor
+    use_end2end: bool = False
+
+    # current only end2end module supports in pipeline mode.
+    # so be sure to set use_end2end=True when use_pipeline=True
+    use_pipeline: bool = False
+    # number of micro-batches
+    pipeline_nmicros: int = -1
+    # number of stages
+    pipeline_nstages: int = -1
+    # it is pas's responsibility to apply the scheduler
+    pipeline_scheduler: str = '1f1b'
+    # the customized configs from user that can affect the graph and code generation.
+    # for example, module configuration or PAS policy settings.
+    user_config: UserConfig = field(default_factory=UserConfig)
 
     def __post_init__(self):
         if self.plan_ngpus <= 0:
@@ -101,10 +129,40 @@ class ComputeConfig:
         if self.runtime_ngpus % self.plan_ngpus != 0:
             raise ValueError(f"runtime_ngpus {self.runtime_ngpus} must be a multiple of plan_ngpus {self.plan_ngpus}")
         if self.use_zero and self.zero_ngroups <= 0:
-                raise ValueError(f"zero_ngroups {self.zero_ngroups} must be > 0")
+            raise ValueError(f"zero_ngroups {self.zero_ngroups} must be > 0")
         if not self.use_zero and self.zero_ngroups != 1:
             logger.warning(f"use_zero is False, but zero_ngroups is {self.zero_ngroups}. Will set zero_ngroups to 1.")
-            self.zero_ngroups = 1
+            # have to use __setattr__ for frozen dataclass
+            super().__setattr__('zero_ngroups', 1)
+
+        if self.use_pipeline:
+            if not self.use_end2end:
+                raise ValueError("pipeline is only supported in end2end mode")
+            if self.pipeline_nmicros <= 0:
+                raise ValueError(f"pipeline_nmicros {self.pipeline_nmicros} must be > 0 when use pipeline")
+            if self.pipeline_nstages <= 0:
+                raise ValueError(f"pipeline_nstages {self.pipeline_nstages} must be > 0 when use pipeline")
+            if self.plan_ngpus % self.pipeline_nstages != 0:
+                raise ValueError(f"pipeline_nstages {self.plan_ngpus} must be a multiple of plan_ngpus {self.pipeline_nstages}")
+            if self.pipeline_scheduler not in _PREDEFINE_SCHEDS:
+                raise ValueError(f"pipeline_scheduler {self.pipeline_scheduler} is not supported. "
+                                 f"Supported schedulers are {_PREDEFINE_SCHEDS.keys()}")
+            if self.inference_only and self.pipeline_scheduler not in _PREDEFINED_INFERENCE_SCHEDS:
+                raise ValueError(f"pipeline_scheduler {self.pipeline_scheduler} is not supported in inference mode. "
+                                 f"Supported schedulers are {_PREDEFINED_INFERENCE_SCHEDS}")
+            if not self.inference_only and self.pipeline_scheduler in _PREDEFINED_INFERENCE_SCHEDS:
+                raise ValueError(f"pipeline_scheduler {self.pipeline_scheduler} is not supported in training mode.")
+
+        if isinstance(self.user_config, dict):
+            super().__setattr__('user_config', UserConfig(**self.user_config))
+
+    def apply_pipeline_scheduler(self, graph: IRGraph) -> Optional[SchedulePlan]:
+        """
+        Do nothing if not use_pipeline
+        """
+        if self.use_pipeline:
+            sched = _PREDEFINE_SCHEDS[self.pipeline_scheduler]
+            return sched(graph, self.pipeline_nmicros, self.pipeline_nstages)
 
     @property
     def gpu_config(self) -> Dict[str, int]:
@@ -115,9 +173,12 @@ class ComputeConfig:
 
     @property
     def graph_config(self) -> Dict[str, Any]:
-        return {
+      return {
             'dynamic_shape': self.dynamic_shape,
-            'user_config': self.user_config,
+            'graph_user_config': self.user_config.graph,
+            'inference_only': self.inference_only, # there will be no backward nodes in the graph in inference mode
+            'use_pipeline': self.use_pipeline,  # pipeline option can affect the graph generation.
+            'end2end_mode': self.use_end2end,  # end2end_mode can affect the graph generation.
         }
 
     @property
@@ -168,19 +229,58 @@ def _runtime_flags(**kwargs):
     return _flags(RuntimeFlag, **kwargs)
 
 
-def _complex(val: Any):
+def _to_cpu(val: Any):
     """Complex to CPU"""
     if isinstance(val, tuple):
-        return tuple(_complex(t) for t in val)
+        return tuple(_to_cpu(t) for t in val)
     if isinstance(val, list):
-        return list(_complex(t) for t in val)
+        return list(_to_cpu(t) for t in val)
     if isinstance(val, dict):
-        return {_complex(key):_complex(val) for key, val in val.items()}
+        return {_to_cpu(key):_to_cpu(val) for key, val in val.items()}
     if isinstance(val, set):
-        return {_complex(t) for t in val}
+        return {_to_cpu(t) for t in val}
     if isinstance(val, torch.Tensor):
         return val.cpu()
     return val
+
+def to_ir_input(sample, name):
+    """Support complex of types: Tuple, List, Dict, torch.Tensor"""
+    if isinstance(sample, tuple):
+        return tuple(to_ir_input(t, name) for t in sample)
+    if isinstance(sample, list):
+        return list(to_ir_input(t, name) for t in sample)
+    if isinstance(sample, dict):
+        return {k: to_ir_input(v, str(k)) for k, v in sample.items()}
+    if isinstance(sample, torch.Tensor):
+        # note: we will always set tensor to require gradient, which may
+        # generate backward communications in adapter. However, as long as
+        # the data doesn't require gradient in real runtime, the backward
+        # communication will not be triggered.
+        tensor = IRFullTensor(
+            shape=sample.size(),
+            name=name,
+            requires_grad=True,
+            dtype=sample.dtype
+        ).tosub()
+        tensor._value = sample
+        tensor.grad = tensor.parent.grad.tosub()
+        return tensor
+    return IRObject(name, value=sample, is_constant=False)
+
+
+def _contains_uncommutable_data(ir_outputs: Any):
+    """
+    only IRObject (but not IRTensor) is not commutable between gpus.
+    """
+    if isinstance(ir_outputs, (tuple, list)):
+        return any(_contains_uncommutable_data(t) for t in ir_outputs)
+    elif isinstance(ir_outputs, dict):
+        return any(_contains_uncommutable_data(k) or _contains_uncommutable_data(v) for k, v in ir_outputs.items())
+    elif isinstance(ir_outputs, IRTensor):
+        return False
+    elif isinstance(ir_outputs, IRObject):
+        return True
+    return False
 
 
 def _get_full_qualified_name(obj: Any) -> str:
@@ -219,11 +319,6 @@ def _clean_files(_dir: Path, pattern = '*') -> None:
     for f in _dir.glob(pattern):
         if f.is_file():
             f.unlink()
-
-
-def _int_dict_to_list(d: Dict[int, Any]) -> List[Any]:
-    """Convert a dict with int keys to a list"""
-    return [d[i] for i in range(len(d))]
 
 
 _DEFAULT_INSTANCE_NAME = '_'
@@ -273,7 +368,7 @@ class BroadcastGenFilesStrategy(Enum):
     #    (local world size should be bigger than plan_ngpus)
     NO_WEIGHTS = 'no_weights'
 
-    # broadcast the new generated code only (gencode*.py)
+    # broadcast the new generated code (gencode*.py) and compute_config.pt only.
     # It's your responsibility to make sure other necessary files are available on all nodes.
     CODE = 'code'
 
@@ -331,24 +426,30 @@ def _prepare_and_check_reusable(
     # decision matrix for code generation
     # reuse flag | dir condition(imported, empty, match, unmatched) | action
     # ---------------------------------------------------------
-    #   OVERRIDE/GRAPH  | empty     | generate
-    #   OVERRIDE/GRAPH  | imported  | raise error
-    #   OVERRIDE/GRAPH  | match     | generate
-    #   OVERRIDE/GRAPH  | unmatch   | generate
-    #   MATCH           | empty     | generate
-    #   MATCH           | match     | reuse(do nothing)
-    #   MATCH*          | unmatch   | raise error (except when there's no python source code, see below)
-    #   MATCH           | imported  | doesn't matter
-    #   MOO             | empty     | generate
-    #   MOO             | match     | reuse(do nothing)
-    #   MOO*            | unmatch   | generate (specail case is when there's no python source code, see below)
-    #   MOO             | imported  | raise error if unmatch
+    #   OVERRIDE   | empty           | generate
+    #   OVERRIDE   | imported        | raise error
+    #   OVERRIDE   | whatever match  | generate
+    #   OVERRIDE   | unmatch         | generate
+    #   GRAPH      | empty           | generate
+    #   GRAPH      | imported        | raise error
+    #   GRAPH      | graph match     | reuse graph, and regenerate code
+    #   GRAPH      | all match       | reuse graph, and regenerate code
+    #   GRAPH      | unmatch         | generate
+    #   MATCH      | empty           | generate
+    #   MATCH      | match           | reuse(do nothing)
+    #   MATCH*     | whatever unmatch| raise error (except when there's no python source code, see below)
+    #   MATCH      | imported        | doesn't matter
+    #   MOO        | empty           | generate
+    #   MOO        | match           | reuse(do nothing)
+    #   MOO        | match graph     | reuse graph, and regenerate code
+    #   MOO        | imported        | raise error if whatever unmatch
     #  *: The precondition for `except` part is the compute config should match.
     #     you can take it as a continous operation after a failed generation.
     reusable = False
     config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
-    old_config = torch.load(config_file) if config_file.exists() else None
+    old_config: ComputeConfig = torch.load(config_file) if config_file.exists() else None
     is_config_match = old_config == compute_config
+    is_graph_config_match = old_config is not None and old_config.graph_config == compute_config.graph_config
     trace_meta_files = [
         outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
         outdir / FxModuleParser.ATTR_MAP_FILE,
@@ -395,7 +496,11 @@ def _prepare_and_check_reusable(
                 if _is_any_gencode_loaded(namespace):
                     raise RuntimeError(f'Output directory {outdir} is already loaded. '
                                        f'You can not override a loaded module.')
-                _clean_files(outdir)
+                elif is_graph_config_match:
+                    # reuse the graph dump
+                    _clean_files(outdir, '*.py')
+                else:
+                    _clean_files(outdir)
     else:
         # check if the module is already loaded
         if _is_any_gencode_loaded(namespace):
@@ -403,7 +508,7 @@ def _prepare_and_check_reusable(
                                f'You can not override a loaded module.')
         # clear existing generated files
         if reuse == ReuseType.OVERRIDE \
-            or not is_config_match \
+            or not is_graph_config_match \
             or not all([meta_file.exists() for meta_file in trace_meta_files]):
             # we have to trace the graph again if not all meta files are present even when reuse=graph.
             glob_pattern = '*'
@@ -419,6 +524,8 @@ def _gen_graph(
     dummy_input: dict,
     outdir: Path,
     dynamic_shape: bool,
+    end2end_mode: bool = False,
+    inference_only: bool = False,
 ):
     # reset environment
     program = Program()
@@ -432,7 +539,7 @@ def _gen_graph(
             raise ValueError(f"Default value type {type(v)} of forward args is not supported.")
 
     # generate fx graph
-    dummy_input = _complex(dummy_input)
+    dummy_input = _to_cpu(dummy_input)
     fx_graph = parser.to_fx_graph(module, dummy_input)
 
     # generate ir logic graph
@@ -460,31 +567,48 @@ def _gen_graph(
         else:
             raise ValueError(f"Input {node.target} not in dummy input. Default value is not supported.")
     for i in range(len(ir_dummy_inputs)):
-        if isinstance(ir_dummy_inputs[i], torch.Tensor):
-            # note: we will always set tensor to require gradient, which may
-            # generate backward communications in adapter. However, as long as
-            # the data doesn't require gradient in real runtime, the backward
-            # communication will not be triggered.
-            ir_dummy_inputs[i] = IRFullTensor(
-                shape=ir_dummy_inputs[i].size(),
-                name=fx_input_nodes[i].target,
-                requires_grad=True,
-                dtype=ir_dummy_inputs[i].dtype).tosub()
-            ir_dummy_inputs[i].grad = ir_dummy_inputs[i].parent.grad.tosub()
-        else:
-            ir_dummy_inputs[i] = IRObject(
-                name=fx_input_nodes[i].target,
-                value=ir_dummy_inputs[i]
-            )
-    # generate complete ir graph
-    ir_dummy_outputs = ir_graph(*ir_dummy_inputs)
+        ir_dummy_inputs[i] = to_ir_input(ir_dummy_inputs[i], fx_input_nodes[i].target)
+        # if the input is not a tensor, we should wrap it with IRObject
+        if not isinstance(ir_dummy_inputs[i], IRObject):
+            ir_dummy_inputs[i] = IRObject(fx_input_nodes[i].target, value=ir_dummy_inputs[i], is_constant=False)
 
-    graph = program.get_graph()
-    graph.backward()
-    program.set_input(ir_dummy_inputs)
+    # generate complete ir graph
+    if end2end_mode:
+        # in end2end mode, we must use dataloader as the first argument of forward
+        # we assume the first argument of forward is the data sample (which is a requirement in our doc)
+
+        # the IRObject representing the `dataloader` instance, which is only used by the
+        # IRDataOperation. Since we already know the output of the dataloader,
+        # we don't need to set the value for it.
+        ir_root_obj = IRObject(name='dataloader', value=None)
+        Program().set_input([ir_root_obj])
+        data_op = IRDataOperation(ir_root_obj, ir_dummy_inputs)
+        # add the data operation to the graph, which will use `next` to get data.
+        Program().add_node(data_op)
+        ir_dummy_outputs = ir_graph(*ir_dummy_inputs)
+        graph = program.get_graph()
+        # we require the first output is the loss
+        if isinstance(ir_dummy_outputs, (list, tuple)):
+            ir_loss = ir_dummy_outputs[0]
+        else:
+            ir_loss = ir_dummy_outputs
+        if not isinstance(ir_loss, IRTensor) or ir_loss.shape != (1,):
+            # TODO: update when we support scalar tensor
+            raise RuntimeError(f"Loss can only be scalar tensor but got {ir_loss.shape if isinstance(ir_loss, IRTensor) else ir_loss}")
+        if not inference_only:
+            ir_loss.backward()
+    else:
+        program.set_input(ir_dummy_inputs)
+        ir_dummy_outputs = ir_graph(*ir_dummy_inputs)
+        graph = program.get_graph()
+        if not inference_only:
+            graph.backward()
+
     if ir_dummy_outputs is None: ir_dummy_outputs = []
-    elif not (isinstance(ir_dummy_outputs, tuple) or isinstance(ir_dummy_outputs, list)):
+    elif not isinstance(ir_dummy_outputs, (tuple, list)):
         ir_dummy_outputs = [ir_dummy_outputs]
+    if _contains_uncommutable_data(ir_dummy_outputs):
+        raise RuntimeError(f"Communication generation error: some of outputs are not commutable between gpus.")
     program.set_output(ir_dummy_outputs)
     program.finalize()
 
@@ -560,7 +684,11 @@ def _gencode(
         )
         torch.save(meta_info, origin_module_metadata_ckp)
 
-        graph, forward_args = _gen_graph(module, dummy_input, outdir, compute_config.dynamic_shape)
+        graph, forward_args = _gen_graph(
+            module, dummy_input, outdir,
+            dynamic_shape=compute_config.dynamic_shape, end2end_mode=compute_config.use_end2end,
+            inference_only=compute_config.inference_only
+        )
         graph.dump(graph_ckp)
         torch.save(forward_args, forward_args_ckp)
 
@@ -606,12 +734,21 @@ def _gencode(
     # code generation
     assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
     mgener = ModuleCodeGen(execplan, compute_config.runtime_ngpus)
+    sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
     for rank in range(compute_config.runtime_ngpus):
+        fname = outdir / _GENCODE_FILE_TEMPLATE.format(rank)
         mgener.gen(rank,
             forward_args=forward_args,
-            outfile=outdir / _GENCODE_FILE_TEMPLATE.format(rank),
+            outfile=fname,
             attach=False,
             as_parallel_module=True,
+            end2end_mode=compute_config.use_end2end
+        )
+        # generate temporal schedule code
+        sgener.gen(
+            device=rank,
+            outfile=fname,
+            attach=True
         )
 
     return ret
@@ -625,7 +762,8 @@ def _load_cube_module_class(
     rank: Optional[int] = None,
 ) -> Type[ParallelModule]:
     """
-    Load the generated cube module class.
+    Load the generated cube module class, with train_step and infer_step assigned as member function..
+
 
     Please note that the cube module class should be generated beforehand by _gencode().
 
@@ -636,6 +774,8 @@ def _load_cube_module_class(
         rank (Optional[int]): the rank of the module. If it is None, will get the rank from torch.distributed.get_rank().
             This option is only useful for debugging or writing pre/post-processing tools.
             when you need to load the generated module in a non-torchrun environment.
+    Returns:
+        Type[ParallelModule]: the generated module class
     """
     rank = torch.distributed.get_rank() if rank is None else rank
     namespace, _ = _prepare_namespace(cube_savedir, module_class, instance_name)
@@ -648,6 +788,8 @@ def _load_cube_module_class(
     cube_module_class.__qualname__ = module_class.__qualname__
     # cube_module_class.__module__ = module_class.__module__
     cube_module_class.__orig_module_class__ = module_class  # save the original module class
+    cube_module_class._train_step = gen_imported._train_step
+    cube_module_class._infer_step = gen_imported._infer_step
     return cube_module_class
 
 
@@ -761,8 +903,7 @@ def parallelize(
         outdir, reusable = _prepare_and_check_reusable(cube_savedir, module_class, compute_config, instance_name, reuse)
         if not reusable:
             config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
-            if not config_file.exists():
-                torch.save(compute_config, config_file)
+            torch.save(compute_config, config_file)  # always refresh compute config
             with _compile_flags(compute_config):
                 regen_status = _gencode(
                     module_or_module_class,
@@ -1002,6 +1143,10 @@ def build_optimizer(
 
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
         raise RuntimeError("End2End mode is not supported")
+
+    # only the root module can be end2end module.
+    if any(m != module and isinstance(m, ParallelModule) and  m.compute_config.use_end2end for m in module.modules()):
+        raise RuntimeError("End2End module cannot be nested in another module")
 
     RuntimeFlag.skip_reducer = True
     RuntimeFlag.skip_zero_grad = False
@@ -1399,10 +1544,12 @@ def merge_state_dicts(
         if opt_state_dicts is not None:
             opt_module_locs = [opt_extra_states[i].parallel_module_locs[module_prefix] for i in range(len(opt_extra_states))]
 
-            # Assume all ranks have the same opt_module_locs (offset and count)
-            # TODO: assert may fail for pipeline parallelism
-            for i in range(1, len(opt_module_locs)):
-                assert opt_module_locs[i] == opt_module_locs[0]
+            # We can't assume all ranks have the same opt_module_locs (offset and count)
+            # when we use pipeline parallelism, different ranks may have different opt_module_locs
+            # fortunately, we can use the location information from any rank to do the merging in following
+            # here we always use the location information from rank 0
+            # for i in range(1, len(opt_module_locs)):
+            #     assert opt_module_locs[i] == opt_module_locs[0]
             opt_new_pm_states[opt_module_locs[0]] = (merged_opt_state_dict['state'], module_prefix, extra_states[0].origin_param_names)
 
     if opt_new_pm_states:
@@ -1411,7 +1558,7 @@ def merge_state_dicts(
             module_prefix = '.'.join(k)
             pm_orig_param_names[module_prefix] = CubeModule.get_origin_parameter_names([e.param_area_map for e in extra_states])
         # now we can construct the merged state of optimizer from any rank
-        # let's just use the first rank
+        # as said previously, the merge will be based on rank0's data
         orig_states: Dict[int, Any] = optimizer_state_dicts[0]['state']
         ret_states: Dict[int, Any] = {}  # see `_get_optimizer_state_dict_info` for the value structure.
         sorted_pm_locs = sorted(opt_new_pm_states.keys(), key=lambda x: x.offset)
@@ -1777,8 +1924,11 @@ def _broadcast_gen_files(
                         and not file.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
                     ) or
                     (
+                        # broadcast code files and compute config file
+                        # please note the compute config file can be updated
+                        # even when the graph is reused.
                         broadcast_strategy == BroadcastGenFilesStrategy.CODE
-                        and file.suffix  == '.py'
+                        and (file.suffix  == '.py' or file.name == ParallelModule.COMPUTE_CONFIG_FILE)
                     )
                 ):
                     files.append(file.name)
@@ -1930,9 +2080,9 @@ def load_deduped_state_dict(
         # append also works
         # but insert to 0 feels better
         # the dedup size for non-parallel module is 1
-        opt_broadcast_groups.insert(0, (list(non_parallel_module_locs), 1))
-        # TODO: what if opt_broadcast_groups are different in different ranks?
-        # Will it happend in pipeline parallelism?
+        if non_parallel_module_locs:
+            opt_broadcast_groups.insert(0, (list(non_parallel_module_locs), 1))
+
         for bg in opt_broadcast_groups:
             _broadcast_opt_state(optimizer_state_dict, *bg)
         optimizer.load_state_dict(optimizer_state_dict)
@@ -1976,7 +2126,7 @@ def _broadcast_opt_state(optimizer_state_dict, state_indexes: List[int], dedup_g
     else:
         step_stack = torch.zeros(
             len(state_indexes),
-            dtype=optimizer_state_dict['state'][k]['step'].dtype,
+            dtype=optimizer_state_dict['state'][0]['step'].dtype,
             device=torch.cuda.current_device()
         )
     torch.distributed.broadcast(step_stack, src=src_rank, group=curr_parallel_group)

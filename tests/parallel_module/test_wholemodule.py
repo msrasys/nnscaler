@@ -140,7 +140,7 @@ def _compare_weights(orig0, orig1, compiled0, compiled1, module_fullmap, module_
     merged_state, _ = ParallelModule.merge_partial_states(cube_state)
     assert len(compiled1) == len(compiled0) == len(orig0)
     for k, v in merged_state.items():
-        assert torch.allclose(v, orig0[k], rtol=1e-4, atol=1e-4)
+        assert torch.allclose(v.cpu(), orig0[k].cpu(), rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')

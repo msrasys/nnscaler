@@ -1,8 +1,18 @@
 # Parallel Module
 
-Besides the support of end-to-end model training, Cube can also convert a `torch.nn.Module` to a parallel module. A parallel module is a special `torch.nn.Module` but runs in multiple gpus/nodes. All the complexity of distributed training/inferring is hidden from the user.
+Cube can parallelize a `torch.nn.Module` to a parallel module. A parallel module is a special `torch.nn.Module` but runs in multiple gpus/nodes. All the complexity of distributed training/inferring is hidden from the user.
 
-## An example
+Currently we support three kinds of parallelism: data parallelism, tensor parallelism and pipeline parallelism (model parallelism). We can also combine them to get the best performance.
+
+Data parallelism and tensor parallelism are support for all kinds of module, but pipeline parallelism is only supported for end2end modules for scheduling reason.
+
+An end2end module is a module which satisfies:
+- the first argument of `module.forward` is the data sample
+- the first return value of `module.forward` is the loss (scalar tensor)
+
+The above restrictions are necessary for the pipeline parallelism to work. Of course, you can still use the parallel module without pipeline parallelism for end2end modules.
+
+## Examples
 
 - Example 1: Parallelize the whole module
 
@@ -102,11 +112,80 @@ def train(model: ParallelizedLLM, data):
         optimizer.zero_grad()
 ```
 
+- Example 3: Parallelize end2end module.
+```python
+class End2EndMLP(nn.Module):
+    def __init__(self):
+        init_random()
+        super().__init__()
+        self.layers = torch.nn.ModuleList([])
+        for _ in range(8):
+            self.layers.append(nn.Linear(16, 16, bias=False))
+        self.loss_fn = nn.BCELoss()
+
+    def forward(self, data: Dict[str, torch.Tensor]):
+        x = data['data']
+        for layer in self.layers:
+            x = layer(x)
+        x = torch.sigmoid(x)
+        loss = self.loss_fn(x, data['target'])
+        return loss
+
+    llm_sample_input = {'data': ..., 'target': ...}  # dummpy input will be used to do tracing
+    pas_policy = ...                    # the PAS policy, you can use autodist pas
+    compute_config = ComputeConfig(
+        plan_ngpus=...,
+        runtime_ngpus=...,
+        use_zero=...,
+        use_end2end=True,
+        use_pipeline=...,
+        pipeline_nmicros=...,
+        pipeline_nstages=...,
+        pipeline_scheduler=...,
+        ...,
+    )                                   # compute environment config
+    ParallelizedPipelinedLLM = parallelize(
+        LLM,
+        {'data': llm_sample_input},
+        pas_policy,
+        compute_config,
+    )
+```
+
+If you want to enable pipeline parallelism, you need to set `use_end2end=True` and `use_pipeline=True` in `ComputeConfig`. You also need to set `pipeline_nmicros` and `pipeline_nstages` to specify the number of microbatches and stages in the pipeline. The `pipeline_scheduler` is the scheduler to schedule the pipeline. See below for details.
+
+For end2end modules, you can't use `Module.forward`.
+Instead, you must use `ParallelModule.train_step` and `ParallelModule.infer_step` to train/infer the module.
+
+```python
+def infer(model: ParallelizedPipelinedLLM, data):
+    model.eval()
+    with torch.inference_mode():
+        return model.infer_step(data)
+
+
+def train(model: ParallelizedPipelinedLLM, data):
+    # build_optimizer function will help to create a distributed optimizer
+    optimizer = build_optimizer(model, ...)
+
+    for i, x in enumerate(data):
+        model.train()
+        losses = model.train_step(x)
+        optimizer.step()
+        optimizer.zero_grad()
+```
+
 ## APIs
 
 ### ComputeConfig
 The configuration of the compute environment. It is a dataclass with the following fields:
 ```python
+
+@dataclass
+class UserConfig:
+    graph: Dict[str, Any] = field(default_factory=dict)
+    code: Dict[str, Any] = field(default_factory=dict)
+
 @dataclass(frozen=True)
 class ComputeConfig:
     plan_ngpus: int
@@ -117,26 +196,42 @@ class ComputeConfig:
     use_zero: bool = False
     zero_ngroups: int = 1
 
-    user_config: Optional[Dict[str, Any]] = None
+    inference_only : bool = False
+    use_end2end: bool = False
+
+    use_pipeline: bool = False
+    pipeline_nmicros: int = -1
+    pipeline_nstages: int = 1
+    pipeline_scheduler: Optional[str] = None
+
+    user_config: UserConfig = field(default_factory=UserConfig)
 ```
 We can categorize the fields into 4 categories:
 
 1. Trace configuration
-    - dynamic_shape: whether to use dynamic shape or static shape.
+    - `dynamic_shape`: whether to use dynamic shape or static shape.
 2. Compute environment configuration
-    - plan_ngpus: the number of gpus to be used as a unit. The model is partitioned (TP or PP) within a unit, and then data parallelism is applied across multiple units. So every `plan_ngpus` devices holds the whole model. Furthermore, assume we have two workers, and their ranks are `rank1` and `rank2`:
+    - `plan_ngpus`: the number of gpus to be used as a unit. The model is partitioned (TP or PP) within a unit, and then data parallelism is applied across multiple units. So every `plan_ngpus` devices holds the whole model. Furthermore, assume we have two workers, and their ranks are `rank1` and `rank2`:
         1. if `rank1 // plan_gpus == rank2 // plan_ngpus`, then they are in the same unit.
         2. If `rank1 % plan_ngpus == rank2 % plan_ngpus`, then the portion of model hold on both gpus are exactly the same.
-    - runtime_ngpus: the number of gpus to be used in runtime. It should be a multiple of `plan_ngpus`, which means we have `runtime_ngpus // plan_ngpus` units in runtime, and the data parallelism is `runtime_ngpus // plan_ngpus`.
+    - `runtime_ngpus`: the number of gpus to be used in runtime. It should be a multiple of `plan_ngpus`, which means we have `runtime_ngpus // plan_ngpus` units in runtime, and the data parallelism is `runtime_ngpus // plan_ngpus`.
     Please note all modules must have the same `plan_ngpus` and `runtime_ngpus`.
 3. Code generation feature configuration
-    - use_zero: whether to use zero. If it is true, the generated code will use zero1 to do distributed training.
-    - zero_ngroups: the number of groups to be used in zero.
+    - `use_zero`: whether to use zero. If it is true, the generated code will use zero1 to do distributed training.
+    - `zero_ngroups`: the number of groups to be used in zero.
+    - `inference_only`: whether to generate code for inference only. If it is true, the generated code can not be used to train the model.
+    - `use_end2end`: whether to use end2end training. For the requirement of end2end, see the description above.
+    - `use_pipeline`: whether to use pipeline. Please note the pipeline parallelism is only supported for end2end modules, so you must set `use_end2end=True` if you want to use pipeline.
+    - `pipeline_nmicros`: the number of microbatches in the pipeline.
+    - `pipeline_nstages`: the number of stages in the pipeline.
+    - `pipeline_scheduler`: the scheduler name for the pipeline. Current we support four schedulers in training `1f1b`/`1f1b_plus`/`gpipe`/`chimera_direct` (4 stages pipeline only), and one scheduler in inference `infer_pipe`.
 4. User configuration
-    - user_config: the user configuration. A typical usage is deciding whether skipping compiling and reusing the previously compiled parallel module. If user_config is the same between two runs, compiling in the second run will be skipped.
+    - user_config: the user configuration,which is used to decide whether skipping compiling and reusing the previously compiled parallel module. It has two categories of configuration:
+        - `graph`: the graph related configuration, which is used to decide whether skipping graph generation only.
+        - `code`: if it has changed, the code will be regenerated.
 
 Note:
-1.  You can put any graph related configuration here. The assumption is different user_config should generate different graph/code. So if the user config is changed, we will regenerate the graph/code automatically. Here are some examples:
+1.  You can put any custom configurations in `user_config`. The assumption is different `user_config` should generate different graph/code. So if the user config is changed, we will regenerate the graph/code automatically. Here are some examples:
 
     - Example 1: save module configuration
         ```python
@@ -148,28 +243,25 @@ Note:
             if module_config.use_3d:
             ...
         ```
-        here we can set `user_config={'use_3d': module_config.use_3d}`,
-        and we can be sure different use_3d config will never use the same generated code.
+        here we can set `user_config.graph` to `{'use_3d': module_config.use_3d}`,
+        and we can be sure different use_3d config will never use the same graph (and eventually the generated code).
 
     - Example 2: save file stats
         If you want to track all related file stats (just like traditional compilers do),
-        you can do
-        ```python
-        user_config = {
-            'file_stats': {
-                str(f): os.stat(f).st_mtime_ns for f in Path('./src').glob('**/*.py')  # assume all source code is in ./src
-            }
-        }
-        ```
-        Or you can save the md5 of the files to save some bytes:
+        you can save the md5 of the files to save some bytes:
         ```python
         import hashlib
         h = hashlib.md5()
         for f in Path('./src').glob('**/*.py'):
         with open(f, 'rb') as f:
             h.update(f.read())
-        user_config = {
-            'files_md5': h.hexdigest()
+        compute_config = {
+            ....,
+            user_config: UserConfig(
+                graph = {
+                    'files_md5': h.hexdigest()
+                }
+            )
         }
         ```
 
@@ -389,6 +481,50 @@ optimizer.register_reducer_post_hook(lambda reducer, grad: grad.mul_(num_scale_u
 
 5. `_non_parallel_module_reducer`: The reducer for the modules which are not parallelized. It is used to sync the parameters in those modules across units.
 
+### ParallelModule APIs
+
+The `ParallelModule` is a subclass of `torch.nn.Module`. It has the following APIs:
+
+1. constructor
+```python
+def __init__(self, init_params=True):
+    ...
+```
+You can use `init_params` to control whether to initialize the module parameters with the module parameters' values when we trace it. You can set it to `False` if you don't want to.
+
+2. `train_step`
+```python
+def train_step(self,
+    samples: List[Any],
+    is_dummy_batch: Optional[List[bool]],
+    scale_fn: Optional[Callable[[torch.Tensor], torch.Tensor]]
+) -> List[Any]:
+    ...
+```
+The training step function. It should be called in the training loop.
+Please note:
+    1. This function is only supported in end2end mode.
+    2. Gradient accumulation is done in this function.
+        You shouldn't do it outside this function,
+        because `zero_grad` will be called in the beginning of this function
+
+It has the following arguments:
+- `samples` (`List[Any]`): a list of samples.
+        if pipeline is used, it must have the same length as pipeline_nmicros
+- `is_dummy_batch` (`Optional[List[bool]]`): indicates whether the each micro-batch is dummy
+- `scale_fn` (`Optional[Callable[[torch.Tensor], torch.Tensor]]`): the function to scale the loss
+
+And it will return a list of outputs for the samples.
+
+3. `infer_step`
+```python
+def infer_step(self, samples: List[Any]) -> List[Any]:
+    ...
+```
+The inference step function. It should be called in the inference loop.
+The input is a list of samples, and returns a list of outputs for the samples. If pipeline is used, it must have the same length as pipeline_nmicros
+
+
 ### Checkpoint support
 
 You can save/load the checkpoints for parallel modules.
@@ -480,7 +616,3 @@ def create_distributed_sampler(dataset):
         ...,
     )
 ```
-
-## TODOs
-
-1. Pipeline parallelism is not supported yet.

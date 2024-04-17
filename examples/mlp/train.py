@@ -70,7 +70,7 @@ def train():
         loss.backward()
     # load generated model
     model = cube.utils.load_model()
-    
+
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
     CudaTimer(enable=False).warmup()

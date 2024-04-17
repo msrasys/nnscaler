@@ -182,9 +182,9 @@ def _compare_weights(orig0, orig1, compiled0, compiled1, fc1_fullmap, fc2_fullma
     assert len(merged_fc1_fixed) + len(merged_fc2_fixed) + len(compiled0) == len(orig0)
     assert len(compiled1) == len(compiled0)
     for k, v in compiled0.items():
-        assert torch.allclose(compiled0[k], compiled1[k], rtol=1e-4, atol=1e-4)
+        assert torch.allclose(compiled0[k].cpu(), compiled1[k].cpu(), rtol=1e-4, atol=1e-4)
     for k, v in itertools.chain(merged_fc1_fixed.items(), merged_fc2_fixed.items(), compiled0.items()):
-        assert torch.allclose(v, orig0[k], rtol=1e-4, atol=1e-4)
+        assert torch.allclose(v.cpu(), orig0[k].cpu(), rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')

@@ -8,6 +8,7 @@ import shutil
 
 from cube.graph.parser.fx.parser import FxModuleParser
 from cube.parallel import ReuseType, parallelize, ComputeConfig, _load_cube_module_class
+from cube.runtime.module import ParallelModule
 
 from ..utils import new_empty, replace_all_device_with
 from .common import PASData
@@ -83,7 +84,7 @@ def test_override():
 
         # MOO  | unmatch | generate
         _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MOO, 'o1', load_module=False)
-        _to_cube_model(MyModule, ComputeConfig(2, 2),tempdir, ReuseType.MOO, 'o1')
+        _to_cube_model(MyModule, ComputeConfig(2, 2, dynamic_shape=False),tempdir, ReuseType.MOO, 'o1')
 
         # MOO  | imported | raise error
         _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MOO, 'o2', load_module=True)
@@ -173,6 +174,28 @@ def test_override():
         g7_module_path = module_path.with_name('g7')
         graph_stat = (g7_module_path / 'graph.ckp').stat()
         args_stat = (g7_module_path / 'forward_args.pkl').stat()
-        _to_cube_model(MyModule, ComputeConfig(2, 2), tempdir, 'graph', 'g7', False)
+        _to_cube_model(MyModule, ComputeConfig(2, 2, dynamic_shape=False), tempdir, 'graph', 'g7', False)
         assert (g7_module_path / 'graph.ckp').stat().st_mtime_ns != graph_stat.st_mtime_ns
         assert (g7_module_path / 'forward_args.pkl').stat().st_mtime_ns != args_stat.st_mtime_ns
+
+        # Graph | graph match | generate
+        _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'graph', 'g8', False)
+        g8_module_path = module_path.with_name('g8')
+        assert torch.load(g8_module_path / ParallelModule.COMPUTE_CONFIG_FILE) == ComputeConfig(1, 1)
+        graph_stat = (g8_module_path / 'graph.ckp').stat()
+        args_stat = (g8_module_path / 'forward_args.pkl').stat()
+        _to_cube_model(MyModule, ComputeConfig(2, 2), tempdir, 'graph', 'g8', False)
+        assert (g8_module_path / 'graph.ckp').stat().st_mtime_ns == graph_stat.st_mtime_ns
+        assert (g8_module_path / 'forward_args.pkl').stat().st_mtime_ns == args_stat.st_mtime_ns
+        assert torch.load(g8_module_path / ParallelModule.COMPUTE_CONFIG_FILE) == ComputeConfig(2, 2)
+
+        # MOO | graph match | generate code only
+        _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'moo', 'g9', False)
+        g9_module_path = module_path.with_name('g9')
+        assert torch.load(g9_module_path / ParallelModule.COMPUTE_CONFIG_FILE) == ComputeConfig(1, 1)
+        graph_stat = (g9_module_path / 'graph.ckp').stat()
+        args_stat = (g9_module_path / 'forward_args.pkl').stat()
+        _to_cube_model(MyModule, ComputeConfig(2, 2), tempdir, 'moo', 'g9', False)
+        assert (g9_module_path / 'graph.ckp').stat().st_mtime_ns == graph_stat.st_mtime_ns
+        assert (g9_module_path / 'forward_args.pkl').stat().st_mtime_ns == args_stat.st_mtime_ns
+        assert torch.load(g9_module_path / ParallelModule.COMPUTE_CONFIG_FILE) == ComputeConfig(2, 2)

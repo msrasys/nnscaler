@@ -54,14 +54,18 @@ def _to_cube_model(module, pas, compute_config, cube_savedir, instance_name):
         instance_name=instance_name
     )
 
-def _inference_worker(ngpus):
+def _inference_worker(ngpus, inference_only):
     init_distributed()
     init_random()
 
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_inference_test') as tempdir:
         model = Module()
         model.eval()
-        cube_model = _to_cube_model(model, PASRandomSPMD, ComputeConfig(ngpus, ngpus), tempdir, 'test_inference')
+
+        cube_model = _to_cube_model(model, PASRandomSPMD,
+            ComputeConfig(ngpus, ngpus, inference_only=inference_only),
+            tempdir, 'test_inference'
+        )
 
         data = torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])
         assert not model.training
@@ -76,9 +80,11 @@ def _inference_worker(ngpus):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_inference1():
-    torchrun(1, _inference_worker, 1)
+    torchrun(1, _inference_worker, 1, True)
+    torchrun(1, _inference_worker, 1, False)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_inference2():
-    torchrun(2, _inference_worker, 2)
+    torchrun(2, _inference_worker, 2, True)
+    torchrun(2, _inference_worker, 2, False)
