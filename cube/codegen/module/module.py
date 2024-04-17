@@ -615,7 +615,7 @@ class ModuleCodeGen(FuncEmission):
         the names of the variables for the tensors ever encountered.
         """
         psign = "self.register_parameter('{name}', torch.nn.Parameter(torch.empty({shape}, dtype={dtype})))"
-        bsign = "self.register_buffer('{name}', torch.empty({shape}, dtype={dtype}))"
+        bsign = "self.register_buffer('{name}', torch.empty({shape}, dtype={dtype}), persistent={persistent})"
         map_sign = "self.add_full_map('{attr}', {tid}, {is_param}, '{orig_name}', {full_shape}, {slicers}, {val_chunks})"
         if not isinstance(node, IRSegment):
             for itensor in node.inputs():
@@ -623,12 +623,21 @@ class ModuleCodeGen(FuncEmission):
                 if isinstance(itensor, IRSubTensor):
                     if itensor.is_attr() and not self.symbols.exist(name):
                         self.symbols.create(name)
-                        sign = psign if itensor.is_param() else bsign
-                        code = sign.format(
-                            name=self.tensor_name(itensor),
-                            shape=tuple(itensor.shape),
-                            dtype=itensor.dtype
-                        )
+                        if itensor.is_param():
+                            code = psign.format(
+                                name=self.tensor_name(itensor),
+                                shape=tuple(itensor.shape),
+                                dtype=itensor.dtype
+                            )
+                        elif itensor.is_buffer():
+                            code = bsign.format(
+                                name=self.tensor_name(itensor),
+                                shape=tuple(itensor.shape),
+                                dtype=itensor.dtype,
+                                persistent=itensor.is_persistent()
+                            )
+                        else:
+                            raise RuntimeError(f"Unexpected tensor type: {itensor}")
                         self.model_init_statements.append(code)
                         slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
                         val_chunks = itensor.valmap[1]

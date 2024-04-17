@@ -274,6 +274,10 @@ class CubeModule(torch.nn.Module):
         # gather param/buffer full tensor
         for model_state_dict, local_fullmap in zip(state_dicts, fullmaps):
             for local_name, meta in local_fullmap.items():
+                if local_name not in model_state_dict:
+                    # this is a non persistent buffer, skip
+                    # non persistent buffer should be stored in the fullmap, but not in the model state dict
+                    continue
                 # create full tensor on cpu
                 partial_tensor = model_state_dict[local_name]
                 if meta.orig_name not in full_model_state_dict:

@@ -392,7 +392,7 @@ class IRTensor(IRObject):
     and will be translated to None in code generation. 
     """
 
-    _meta = ['name', '_is_attr', '_is_grad', '_requires_grad', '_dtype']
+    _meta = ['name', '_is_attr', '_is_grad', '_requires_grad', '_dtype', '_persistent']
 
     def __init__(self, shape=None, name='tensor', dtype=None, tid=None):
 
@@ -404,6 +404,9 @@ class IRTensor(IRObject):
         self._is_grad: bool = False
         self._requires_grad: bool = False
         self._grad: Optional[Union[IRTensor, float]] = None
+        # _persistent is a buffer only field, but in inference mode all params will be post-processed to buffers,
+        # so set _persistent True in as_param() for register these params to persistent buffers.
+        self._persistent = False
 
     @property
     def dtype(self) -> Optional[torch.dtype]:
@@ -435,6 +438,14 @@ class IRTensor(IRObject):
         @return is_buffer boolean: True if is buffer.
         """
         return self._is_attr and not self.requires_grad
+    
+    def is_persistent(self) -> bool:
+        """!
+        Check if the tensor is persistent buffer.
+
+        @return is_persistent boolean: True if is persistent.
+        """
+        return self.is_buffer() and self._persistent
 
     def is_grad(self) -> bool:
         """!
@@ -452,15 +463,17 @@ class IRTensor(IRObject):
         self._requires_grad = True
         self._is_attr = True
         self._is_grad = False
+        self._persistent = True
         return self
 
-    def as_buffer(self):
+    def as_buffer(self, persistent=True):
         """
         Set the tensor as un-trainable buffer
         """
         self._requires_grad = False
         self._is_attr = True
         self._is_grad = False
+        self._persistent = persistent
         return self
 
     def as_grad(self):

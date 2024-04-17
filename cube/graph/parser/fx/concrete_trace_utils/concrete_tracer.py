@@ -1439,10 +1439,11 @@ class MagicMethodPatcher:
             from_module, to_module = f, t
 
         orig = getattr(from_module, field)
-        # If it is a tensor and not a parameter attribute of a module, it should be a named buffer.
-        # So, we register it as a named buffer in the target module.
+        
+        # If it is a buffer, register the tensor as the same type of buffer, otherwise, just set the attribute.
         if isinstance(orig, torch.Tensor) and not isinstance(orig, torch.nn.Parameter):
-            to_module.register_buffer(field, orig)
+            persistent = field in from_module._buffers and field not in from_module._non_persistent_buffers_set
+            to_module.register_buffer(field, orig, persistent=persistent)
         else:
             setattr(to_module, field, orig)
 

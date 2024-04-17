@@ -346,16 +346,18 @@ class IRFullTensor(IRTensor):
         self.requires_grad = True
         self._is_attr = True
         self._is_grad = False
+        self._persistent = True
         if isinstance(self.grad, IRFullTensor):
             self.grad._is_attr = True
 
-    def as_buffer(self):
+    def as_buffer(self, persistent=True):
         """
         Set the tensor as un-trainable buffer
         """
         self.requires_grad = False
         self._is_attr = True
         self._is_grad = False
+        self._persistent = persistent
 
     def as_grad(self, of_attr: bool = False):
         self._attr = True if of_attr else False

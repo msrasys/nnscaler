@@ -49,7 +49,7 @@ def _gpu_worker():
     with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt') as tempdir:
         net1 = _to_cube_model(Net1(), compute_config, tempdir, 'net1', (128, 64))
         cube_state_dict = net1.state_dict()
-        assert any(key.startswith('buffer') for key in cube_state_dict)
+        assert not any(key.startswith('buffer') for key in cube_state_dict)
         merged_state_dict, _ = merge_state_dicts([cube_state_dict])
         assert 'buffer' not in merged_state_dict
 
