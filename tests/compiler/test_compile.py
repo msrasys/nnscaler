@@ -5,12 +5,12 @@ import torch
 from functools import partial
 import more_itertools as mitr
 
-import cube
-from cube.runtime.utils import microbatches
-from cube.graph import IRGraph
-from cube.graph.segment import IRSegment
-from cube.ir.operator import IRFwOperation, IRDataOperation
-from cube.flags import CompileFlag
+import nnscaler
+from nnscaler.runtime.utils import microbatches
+from nnscaler.graph import IRGraph
+from nnscaler.graph.segment import IRSegment
+from nnscaler.ir.operator import IRFwOperation, IRDataOperation
+from nnscaler.flags import CompileFlag
 from ..launch_torchrun import torchrun
 from ..utils import init_parameter, assert_parity
 
@@ -112,7 +112,7 @@ def tp_policy(graph: IRGraph, resource, ngpus_per_unit: int):
 
 def cube_run(ngpus_per_unit: int, policy):
 
-    cube.init()
+    nnscaler.init()
     CompileFlag.disable_code_line_info = True  # speedup parse
 
     model = MLP()
@@ -128,14 +128,14 @@ def cube_run(ngpus_per_unit: int, policy):
 
     policy = partial(policy, ngpus_per_unit=ngpus_per_unit)
 
-    @cube.compile(model, dl, PAS=policy, scale=True)
+    @nnscaler.compile(model, dl, PAS=policy, scale=True)
     def train_iter(model, dataloader):
         x = next(iter(dataloader))
         loss = model(x)
         loss.backward()
         return loss
     
-    model = cube.load_model()
+    model = nnscaler.load_model()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     
     losses = []

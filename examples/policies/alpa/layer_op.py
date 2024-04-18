@@ -1,10 +1,10 @@
 from typing import List, Dict, Tuple
 import more_itertools
 
-from cube.ir.cten import IRCell
-from cube.ir.operator import IRFwOperation
-from cube.graph.graph import IRGraph
-from cube.graph.function.anchor import IRGraphAnchor
+from nnscaler.ir.cten import IRCell
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.graph.graph import IRGraph
+from nnscaler.graph.function.anchor import IRGraphAnchor
 
 
 class IRLayerOp(IRCell):

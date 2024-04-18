@@ -17,11 +17,11 @@ import logging
 
 from examples.llama.generation import Llama
 
-import cube
+import nnscaler
 
-cube.init()
-cube.set_logger_level(level=logging.WARNING)
-logging.getLogger('cube.compiler').setLevel(logging.INFO)
+nnscaler.init()
+nnscaler.set_logger_level(level=logging.WARNING)
+logging.getLogger('nnscaler.compiler').setLevel(logging.INFO)
 
 
 def main(

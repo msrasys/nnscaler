@@ -13,11 +13,11 @@ import torch
 from torch import nn
 import torch.distributed
 
-import cube
-from cube.runtime.gnorm import calcuate_gnorm
-from cube.runtime.utils import microbatches
-from cube.runtime.module import ParallelModule
-from cube.parallel import ComputeConfig, build_optimizer, parallelize, merge_state_dicts
+import nnscaler
+from nnscaler.runtime.gnorm import calcuate_gnorm
+from nnscaler.runtime.utils import microbatches
+from nnscaler.runtime.module import ParallelModule
+from nnscaler.parallel import ComputeConfig, build_optimizer, parallelize, merge_state_dicts
 from .common import PASData, PASRandomSPMD, assert_equal, clear_dir_on_rank0, init_distributed, PASMegatron, init_random, PASHybrid
 from ..launch_torchrun import clone_to_cpu_recursively, launch_torchrun
 

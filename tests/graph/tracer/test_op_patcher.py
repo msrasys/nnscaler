@@ -1,6 +1,6 @@
 import torch
 from types import MethodType
-from cube.graph.parser.fx.concrete_trace_utils.operator_patcher import OperatorPatcher
+from nnscaler.graph.parser.fx.concrete_trace_utils.operator_patcher import OperatorPatcher
 
 
 def test_patch_func_or_module():

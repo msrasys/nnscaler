@@ -5,9 +5,9 @@ import numpy as np
 import warnings
 import time
 
-from cube.ir.cten import IRTensor
-from cube.ir.operator import IRFwOperation
-from cube.graph.function.anchor import IRGraphAnchor
+from nnscaler.ir.cten import IRTensor
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.graph.function.anchor import IRGraphAnchor
 
 from examples.policies.alpa.layer_op import IRLayerOp
 from examples.policies.alpa.cost_model import CostModel

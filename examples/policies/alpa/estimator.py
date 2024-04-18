@@ -4,16 +4,16 @@ import os
 import json
 
 # ===== neccesaary for profiling =====
-import cube
+import nnscaler
 import torch
 # ====================================
 
-from cube.ir.cten import IRTensor, IRObject, IRCell
-from cube.ir.operator import IRFwOperation
-from cube.graph.parser.register import CustomizedOps
-from cube.graph.segment import IRSegment
-from cube.graph.function.dimops import IRDimops
-from cube.graph.function import IRGraphAnchor
+from nnscaler.ir.cten import IRTensor, IRObject, IRCell
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.graph.parser.register import CustomizedOps
+from nnscaler.graph.segment import IRSegment
+from nnscaler.graph.function.dimops import IRDimops
+from nnscaler.graph.function import IRGraphAnchor
 
 
 Shapes = NewType('Shapes', Tuple[Tuple[int]])

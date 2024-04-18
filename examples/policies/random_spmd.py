@@ -2,10 +2,10 @@
 Random SPMD policy
 """
 from typing import List, Optional
-from cube.graph.graph import IRGraph
-from cube.graph.function.dimops import IRDimops
-from cube.ir.operator import IRDataOperation, IRFwOperation
-from cube.graph.function.anchor import IRGraphAnchor
+from nnscaler.graph.graph import IRGraph
+from nnscaler.graph.function.dimops import IRDimops
+from nnscaler.ir.operator import IRDataOperation, IRFwOperation
+from nnscaler.graph.function.anchor import IRGraphAnchor
 from datetime import datetime
 
 import random

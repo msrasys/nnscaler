@@ -1,6 +1,6 @@
 from typing import List
 
-import cube
+import nnscaler
 import torch
 import pytest
 
@@ -27,10 +27,10 @@ def _move_worker(async_op: bool):
     shape = [128, 256]
 
     tensor = _get_tensor(shape)
-    tensor = cube.runtime.adapter.move(tensor, shape, torch.float32, 0, 1, async_op=async_op)
+    tensor = nnscaler.runtime.adapter.move(tensor, shape, torch.float32, 0, 1, async_op=async_op)
 
     if async_op:
-        tensor = cube.runtime.executor.AsyncCommHandler().wait(tensor)
+        tensor = nnscaler.runtime.executor.AsyncCommHandler().wait(tensor)
     return clone_to_cpu(tensor)
 
 
@@ -39,10 +39,10 @@ def _allreduce_worker(async_op: bool):
 
     tensor = _get_tensor(shape)
     sum_tensor = tensor.clone().detach()
-    sum_tensor = cube.runtime.adapter.all_reduce(sum_tensor, [0, 1], async_op=async_op)
+    sum_tensor = nnscaler.runtime.adapter.all_reduce(sum_tensor, [0, 1], async_op=async_op)
 
     if async_op:
-        sum_tensor = cube.runtime.executor.AsyncCommHandler().wait(sum_tensor)
+        sum_tensor = nnscaler.runtime.executor.AsyncCommHandler().wait(sum_tensor)
     return (clone_to_cpu(tensor), clone_to_cpu(sum_tensor))
 
 
@@ -50,10 +50,10 @@ def _allgather_worker(async_op: bool):
     shape = [128, 256]
 
     tensor = _get_tensor(shape)
-    otensor = cube.runtime.adapter.all_gather(tensor, 0, [0, 1], async_op=async_op)
+    otensor = nnscaler.runtime.adapter.all_gather(tensor, 0, [0, 1], async_op=async_op)
 
     if async_op:
-        otensor = cube.runtime.executor.AsyncCommHandler().wait(otensor)
+        otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
 
@@ -61,10 +61,10 @@ def _reduce_scatter_worker(async_op: bool):
     shape = [128, 256]
 
     tensor = _get_tensor(shape)
-    otensor = cube.runtime.adapter.reduce_scatter(tensor, 0, [0, 1], async_op=async_op)
+    otensor = nnscaler.runtime.adapter.reduce_scatter(tensor, 0, [0, 1], async_op=async_op)
 
     if async_op:
-        otensor = cube.runtime.executor.AsyncCommHandler().wait(otensor)
+        otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
@@ -75,10 +75,10 @@ def _all2all_worker(async_op):
     tensor = _get_tensor(shape)
 
     # # synchronize
-    otensor = cube.runtime.adapter.all_to_all(tensor, 0, 1, [0, 1], async_op=async_op)
+    otensor = nnscaler.runtime.adapter.all_to_all(tensor, 0, 1, [0, 1], async_op=async_op)
 
     if async_op:
-        otensor = cube.runtime.executor.AsyncCommHandler().wait(otensor)
+        otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
@@ -139,11 +139,11 @@ def _rdscatter_worker(async_op):
     shape = [128, 256]
 
     tensor = _get_tensor(shape)
-    otensor = cube.runtime.adapter.rdscatter(
+    otensor = nnscaler.runtime.adapter.rdscatter(
         tensor, shape, torch.float32, dim=0, src=0, dsts=[1,2], async_op=async_op)
 
     if async_op:
-        otensor = cube.runtime.executor.AsyncCommHandler().wait(otensor)
+        otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
@@ -152,11 +152,11 @@ def _rdgather_worker(async_op):
     shape = [128, 256]
 
     tensor = _get_tensor(shape)
-    otensor = cube.runtime.adapter.rdgather(
+    otensor = nnscaler.runtime.adapter.rdgather(
         tensor, shape, torch.float32, dim=0, srcs=[1,2], dst=0)
 
     if async_op:
-        otensor = cube.runtime.executor.AsyncCommHandler().wait(otensor)
+        otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 
@@ -167,10 +167,10 @@ def _broadcast_worker(async_op):
     tensor = _get_tensor(shape)
 
     # synchronize
-    otensor = cube.runtime.adapter.broadcast(
+    otensor = nnscaler.runtime.adapter.broadcast(
         tensor, shape, torch.float32, src=0, ranks=[0,1,2])
     if async_op:
-        otensor = cube.runtime.executor.AsyncCommHandler().wait(otensor)
+        otensor = nnscaler.runtime.executor.AsyncCommHandler().wait(otensor)
 
     return (clone_to_cpu(tensor), clone_to_cpu(otensor))
 

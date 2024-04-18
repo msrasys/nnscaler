@@ -6,12 +6,12 @@ with open("requirements.txt") as f:
     ]
 
 setuptools.setup(
-    name=             'cube',
+    name=             'nnscaler',
     version=          '0.2',
-    author=           'Cube Team',
+    author=           'nnScaler Team',
     description=      'Parallelize DNN Traning from A Systematic Way',
     long_description= 'Parallelize DNN Traning from A Systematic Way',
-    packages=         ['cube'],
+    packages=         ['nnscaler'],
     python_requires=  '>=3.8',
     install_requires= install_requires,
 )

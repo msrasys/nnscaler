@@ -1,9 +1,9 @@
 import tempfile
 import torch
 import os
-from cube.parallel import _gen_graph
-from cube.ir.operator import IRFwOperation
-from cube.algorithm.ops.dimops import gen_partitions
+from nnscaler.parallel import _gen_graph
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.algorithm.ops.dimops import gen_partitions
 
 from ...utils import replace_all_device_with
 

@@ -3,11 +3,11 @@ import torch.nn as nn
 
 from typing import Tuple, Optional
 
-import cube
+import nnscaler
 
 
 
-@cube.graph.parser.register('N res, cz nobins, cz -> N res res cz', name='relpos')
+@nnscaler.graph.parser.register('N res, cz nobins, cz -> N res res cz', name='relpos')
 def input_embedder_pair_emb(ri: torch.Tensor,
                             tf_emb_i: torch.Tensor, tf_emb_j: torch.Tensor,
                             w_relpos: torch.Tensor, b_relpos: torch.Tensor,
@@ -32,7 +32,7 @@ def input_embedder_pair_emb(ri: torch.Tensor,
     return pair_emb
 
 
-@cube.graph.parser.register('N res tfdim^, cm tfdim^, cm -> N nclust^, res, cm')
+@nnscaler.graph.parser.register('N res tfdim^, cm tfdim^, cm -> N nclust^, res, cm')
 def input_embedder_tf_m(tf: torch.Tensor, w_tf_m: torch.Tensor, b_tf_m: torch.Tensor, nclust: int) -> torch.Tensor:
     tf_m = torch.nn.linear(tf, w_tf_m, b_tf_m)
     tf_m = tf_m.unsqueeze(-3).expand(((-1,) * len(tf.shape[:-2]) + (nclust, -1, -1)))
@@ -119,7 +119,7 @@ class InputEmbedder(nn.Module):
 
 
 
-@cube.graph.parser.register()
+@nnscaler.graph.parser.register()
 def sum_d(x: torch.Tensor, bins: torch.Tensor, inf: float) -> torch.Tensor:
     squared_bins = bins ** 2
     upper = torch.cat(

@@ -3,11 +3,11 @@ from gpt_model import build_model, GeLUFunction
 model = build_model()
 
 # 2. register customized op
-from cube.graph.parser.register import register
+from nnscaler.graph.parser.register import register
 register('* h, h -> * h')(GeLUFunction.apply)
 
 # 3. build semantic model
-from cube import SemanticModel
+from nnscaler import SemanticModel
 smodel = SemanticModel(model)
 
 # 4. set dummy input
@@ -21,8 +21,8 @@ smodel.dummy_input={
     'ntokens': 128,
 }
 
-from cube.graph.function import IRObject
-from cube.ir import IRFullTensor
+from nnscaler.graph.function import IRObject
+from nnscaler.ir import IRFullTensor
 
 src_tokens = IRFullTensor(shape=[batch_size, seq_len],
                           name='src_tokens',
@@ -35,8 +35,8 @@ target = IRFullTensor(shape=[batch_size, seq_len],
 ntokens = IRObject(name='ntokens')
 
 # 5. convert to graph
-from cube.graph.segment import IRSegment
-from cube.program import Program
+from nnscaler.graph.segment import IRSegment
+from nnscaler.program import Program
 
 from torch.autograd.graph import saved_tensors_hooks
 

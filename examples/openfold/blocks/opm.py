@@ -2,16 +2,16 @@
 Outer Product Mean module for Evoformer
 """
 
-import cube
+import nnscaler
 import torch
 import torch.utils.checkpoint as ckpt
 
 
-# @cube.graph.parser.register('N S+ R^ M^, M^ c^, M^ c^, (c^ c^) cz^ -> N R^ R^ cz^', name='outer_prod_mean')
+# @nnscaler.graph.parser.register('N S+ R^ M^, M^ c^, M^ c^, (c^ c^) cz^ -> N R^ R^ cz^', name='outer_prod_mean')
 @torch.jit.ignore
 def outer_prod_mean(msa_repr: torch.Tensor, left_proj: torch.Tensor, right_proj: torch.Tensor,
                     out_proj: torch.Tensor, chunk_size: int, training: bool):
-    # cube.profiler.CudaTimer().start('opm')
+    # nnscaler.profiler.CudaTimer().start('opm')
     # N S R M, M c -> N S R c
     opm_left = torch.matmul(msa_repr, left_proj)
     # N S T M, M c -> N S T c
@@ -45,17 +45,17 @@ def outer_prod_mean(msa_repr: torch.Tensor, left_proj: torch.Tensor, right_proj:
             ret = opm(a, b, start)
             out_chunks.append(ret)
         outer = torch.cat(out_chunks, dim=1)
-    # cube.profiler.CudaTimer().stop('opm')
+    # nnscaler.profiler.CudaTimer().stop('opm')
     return outer
 
 
-@cube.graph.parser.register('N S R M+, M+ C -> N S R C', name='opm_projection')
+@nnscaler.graph.parser.register('N S R M+, M+ C -> N S R C', name='opm_projection')
 def opm_projection(msa_repr: torch.Tensor, proj1: torch.Tensor):
     x = torch.matmul(msa_repr, proj1)
     return x
 
 
-@cube.graph.parser.register('N S^ R C^, N S^ T^ C^, F^ Z^ -> N R T^ Z^')
+@nnscaler.graph.parser.register('N S^ R C^, N S^ T^ C^, F^ Z^ -> N R T^ Z^')
 @torch.jit.ignore
 def opm(left: torch.Tensor, right: torch.Tensor, out_proj: torch.Tensor,
         chunk_size: int, training: bool):
@@ -87,7 +87,7 @@ def opm(left: torch.Tensor, right: torch.Tensor, out_proj: torch.Tensor,
             ret = opm(a, b, start)
             out_chunks.append(ret)
         outer = torch.cat(out_chunks, dim=1)
-    # cube.profiler.CudaTimer().stop('opm')
+    # nnscaler.profiler.CudaTimer().stop('opm')
     return outer
 
 

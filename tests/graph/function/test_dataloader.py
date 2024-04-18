@@ -4,9 +4,9 @@ pytest unit_tests/graph/function/test_dataloader.py
 
 import torch
 
-from cube.ir.cten import IRObject
-from cube.ir.tensor import IRFullTensor
-from cube.ir.operator import IRDataOperation
+from nnscaler.ir.cten import IRObject
+from nnscaler.ir.tensor import IRFullTensor
+from nnscaler.ir.operator import IRDataOperation
 
 
 def test_data_operation():

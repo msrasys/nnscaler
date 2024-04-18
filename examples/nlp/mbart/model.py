@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from examples.nlp.blocks.transformer import TransformerLayer
 
-import cube
+import nnscaler
 
 
 @dataclass
@@ -126,7 +126,7 @@ class MBartForSentenceClassification(torch.nn.Module):
         The loss computation is also simplified by using sum.
         """
         # encoder embedding
-        cube.runtime.function.anchor('encoder embedding')
+        nnscaler.runtime.function.anchor('encoder embedding')
         enc_emb = torch.nn.functional.embedding(input_ids, self.vocab)
         enc_emb = enc_emb * self.embed_scale_encoder
         enc_emb = enc_emb + self.encoder_position
@@ -136,12 +136,12 @@ class MBartForSentenceClassification(torch.nn.Module):
 
         # encoder layers
         for layer in self.encoders:
-            cube.runtime.function.anchor('encoder layer')
+            nnscaler.runtime.function.anchor('encoder layer')
             enc = layer(enc)
         enc = self.layer_norm_encoder(enc)
         
         # decoder embedding
-        cube.runtime.function.anchor('decoder embedding')
+        nnscaler.runtime.function.anchor('decoder embedding')
         dec_emb = torch.nn.functional.embedding(decoder_input_ids, self.vocab)
         dec_emb = dec_emb * self.embed_scale_decoder
         dec_emb = dec_emb + self.decoder_position
@@ -151,7 +151,7 @@ class MBartForSentenceClassification(torch.nn.Module):
 
         # decoder layers
         for layer in self.decoders:
-            cube.runtime.function.anchor('decoder layer')            
+            nnscaler.runtime.function.anchor('decoder layer')
             dec = layer(dec, enc)
         
         dec = self.layer_norm_decoder(dec)

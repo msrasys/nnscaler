@@ -3,7 +3,7 @@ import tempfile
 import math
 import torch
 
-from cube.graph.parser.converter import convert_model
+from nnscaler.graph.parser.converter import convert_model
 
 from ...utils import replace_all_device_with
 

@@ -9,8 +9,8 @@ import torch
 from torch import nn
 import numpy as np
 
-from cube.parallel import ComputeConfig, parallelize, build_optimizer
-from cube.runtime.module import ParallelModule
+from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
+from nnscaler.runtime.module import ParallelModule
 
 from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively

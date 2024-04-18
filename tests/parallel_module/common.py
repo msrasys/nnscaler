@@ -10,13 +10,13 @@ import torch
 from torch import nn
 import numpy as np
 
-from cube.graph.schedule.predefined import PredefinedSched
-from cube.parallel import ComputeConfig
-from cube.graph.function.anchor import IRGraphAnchor
-from cube.graph.function.dimops import IRDimops
-from cube.graph.graph import IRGraph
-from cube.graph.segment import IRSegment
-from cube.ir.operator import IRDataOperation, IRFwOperation
+from nnscaler.graph.schedule.predefined import PredefinedSched
+from nnscaler.parallel import ComputeConfig
+from nnscaler.graph.function.anchor import IRGraphAnchor
+from nnscaler.graph.function.dimops import IRDimops
+from nnscaler.graph.graph import IRGraph
+from nnscaler.graph.segment import IRSegment
+from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 
 
 def create_mesh(ngpus: int, group_num: Tuple[int]) -> Tuple[Tuple[Tuple[int]]]:

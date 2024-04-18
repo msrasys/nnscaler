@@ -1,4 +1,4 @@
-from cube.ir.tensor import IRSubTensor, IRFullTensor
+from nnscaler.ir.tensor import IRSubTensor, IRFullTensor
 
 
 def test_tensor_grad():

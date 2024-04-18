@@ -5,7 +5,7 @@ from examples.vision.swin.blocks.utils import trunc_normal_
 from examples.vision.swin.blocks.transformer import SwinTransformerBlock
 from examples.vision.swin.blocks.patch import PatchEmbed, PatchMerging
 
-import cube
+import nnscaler
 
 
 class Config:
@@ -110,7 +110,7 @@ class BasicLayer(nn.Module):
 
     def forward(self, x):
         for blk in self.blocks:
-            cube.runtime.function.anchor('transformer block start')
+            nnscaler.runtime.function.anchor('transformer block start')
             x = blk(x)
         if self.downsample is not None:
             x = self.downsample(x)

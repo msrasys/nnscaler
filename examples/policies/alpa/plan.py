@@ -2,8 +2,8 @@ from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
 import json
 
-from cube.ir.operator import IRFwOperation
-from cube.graph.graph import IRGraph
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.graph.graph import IRGraph
 
 @dataclass
 class StageSpec:

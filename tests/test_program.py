@@ -1,9 +1,9 @@
 import pytest
 
 import torch
-from cube.program import SemanticModel, Program
-from cube.flags import CompileFlag
-from cube.ir.cten import IRObject
+from nnscaler.program import SemanticModel, Program
+from nnscaler.flags import CompileFlag
+from nnscaler.ir.cten import IRObject
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='cuda is not available')

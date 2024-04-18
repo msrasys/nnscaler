@@ -1,8 +1,8 @@
 from typing import List
-from cube.graph import IRGraph
-from cube.graph.segment import IRSegment
-from cube.ir.operator import IRDataOperation, IRFwOperation
-from cube.graph.schedule.predefined import PredefinedSched
+from nnscaler.graph import IRGraph
+from nnscaler.graph.segment import IRSegment
+from nnscaler.ir.operator import IRDataOperation, IRFwOperation
+from nnscaler.graph.schedule.predefined import PredefinedSched
 
 from examples.utils import tensor_parallelism, replica, create_mesh
 

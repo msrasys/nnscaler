@@ -2,17 +2,17 @@
 Attention Module for MSA Attention and Pair Attention in Evoformer
 """
 
-import cube
+import nnscaler
 import torch
 import torch.utils.checkpoint as ckpt
 
 
-@cube.graph.parser.register('N S R^ M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^ -> N S R^ M^', name='msa_attn')
+@nnscaler.graph.parser.register('N S R^ M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^ -> N S R^ M^', name='msa_attn')
 @torch.jit.ignore
 def msa_attn(x: torch.Tensor, gate_proj: torch.Tensor,
                  qkv_proj: torch.Tensor, out_proj: torch.Tensor, head: int,
                  c: int, scale: float, chunk_size: int, is_train: bool):
-    # cube.profiler.CudaTimer().start('msa_attn')
+    # nnscaler.profiler.CudaTimer().start('msa_attn')
     bs, s, r, cm = x.size()
 
     if chunk_size == -1:
@@ -60,17 +60,17 @@ def msa_attn(x: torch.Tensor, gate_proj: torch.Tensor,
             out_chunks.append(attend)
 
         out = torch.matmul(torch.cat(out_chunks, dim=1), out_proj)
-    # cube.profiler.CudaTimer().stop('msa_attn')
+    # nnscaler.profiler.CudaTimer().stop('msa_attn')
     return out
 
 
-@cube.graph.parser.register('N S R^ M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^, N 1 head+ R^ R^ -> N S R^ M^', name='msa_attn_bias')
+@nnscaler.graph.parser.register('N S R^ M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^, N 1 head+ R^ R^ -> N S R^ M^', name='msa_attn_bias')
 @torch.jit.ignore
 def msa_attn_bias(x: torch.Tensor, gate_proj: torch.Tensor,
                   qkv_proj: torch.Tensor, out_proj: torch.Tensor,
                   bias: torch.Tensor, head: int, c: int, scale: float,
                   chunk_size: int, is_train: bool):
-    # cube.profiler.CudaTimer().start('msa_attn_bias')
+    # nnscaler.profiler.CudaTimer().start('msa_attn_bias')
     bs, s, r, cm = x.size()
     assert gate_proj.size(1) % head == 0
     c = gate_proj.size(1) // head
@@ -127,12 +127,12 @@ def msa_attn_bias(x: torch.Tensor, gate_proj: torch.Tensor,
                 attend = attention_bias(q, k, v, gate, bias, start)
             out_chunks.append(attend)
         out = torch.matmul(torch.cat(out_chunks, dim=1), out_proj)
-    # cube.profiler.CudaTimer().stop('msa_attn_bias')
+    # nnscaler.profiler.CudaTimer().stop('msa_attn_bias')
     return out
 
 
 # note: code not reused constrained by cube's interface
-@cube.graph.parser.register('N S R^ M^, N R^ R^ Z^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^, Z^ head+ -> N S R^ M^', name='row_attn')
+@nnscaler.graph.parser.register('N S R^ M^, N R^ R^ Z^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^, Z^ head+ -> N S R^ M^', name='row_attn')
 def row_attn(msa_repr: torch.Tensor, pair_repr: torch.Tensor,
              gate_proj: torch.Tensor,
              qkv_proj: torch.Tensor, out_proj: torch.Tensor,
@@ -147,7 +147,7 @@ def row_attn(msa_repr: torch.Tensor, pair_repr: torch.Tensor,
                         head, c, scale, chunk_size, is_train)
 
 
-@cube.graph.parser.register('N S^ R M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^ -> N S^ R M^', name='col_attn')
+@nnscaler.graph.parser.register('N S^ R M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^ -> N S^ R M^', name='col_attn')
 def col_attn(msa_repr: torch.Tensor, gate_proj: torch.Tensor,
              qkv_proj: torch.Tensor, out_proj: torch.Tensor, head: int,
              c: int, scale: float, chunk_size: int, is_train: bool):
@@ -160,7 +160,7 @@ def col_attn(msa_repr: torch.Tensor, gate_proj: torch.Tensor,
     return out
 
 
-# @cube.graph.parser.register('N S^ R^ M^, M^ (head+ dim^), M^ E^, M^ E^, M^ (head+ dim^), (head+ dim) M^ -> N S^ R^ M^', name='MSAColGlobalAttention')
+# @nnscaler.graph.parser.register('N S^ R^ M^, M^ (head+ dim^), M^ E^, M^ E^, M^ (head+ dim^), (head+ dim) M^ -> N S^ R^ M^', name='MSAColGlobalAttention')
 def global_attn(msa_repr: torch.Tensor, q_proj: torch.Tensor,
                           k_proj: torch.Tensor, v_proj: torch.Tensor,
                           gate_proj: torch.Tensor, out_proj: torch.Tensor,
@@ -197,21 +197,21 @@ def global_attn(msa_repr: torch.Tensor, q_proj: torch.Tensor,
     return torch.matmul(o, out_proj).transpose(-2, -3)
 
 
-@cube.graph.parser.register('N S R M^, M^ E+, E+ M^ -> N S R M^', name='feedforward')
+@nnscaler.graph.parser.register('N S R M^, M^ E+, E+ M^ -> N S R M^', name='feedforward')
 @torch.jit.ignore
 def feedforward(msa_repr: torch.Tensor, proj1: torch.Tensor, proj2: torch.Tensor):
     """
     MSA transition
     """
-    # cube.profiler.CudaTimer().start('ffn')
+    # nnscaler.profiler.CudaTimer().start('ffn')
     x = torch.matmul(msa_repr, proj1)
     x = torch.nn.functional.relu(x)
     x = torch.matmul(x, proj2)
-    # cube.profiler.CudaTimer().stop('ffn')
+    # nnscaler.profiler.CudaTimer().stop('ffn')
     return x
 
 
-@cube.graph.parser.register('N S R^ Z^, Z^ (head+ dim), Z^ (head+ dim 3), (head+ dim) Z^, N R^ R^ head+ -> N S R^ Z^', name='tri_attn_start')
+@nnscaler.graph.parser.register('N S R^ Z^, Z^ (head+ dim), Z^ (head+ dim 3), (head+ dim) Z^, N R^ R^ head+ -> N S R^ Z^', name='tri_attn_start')
 def tri_attn_start(pair_repr: torch.Tensor,
                    gate: torch.Tensor, qkv: torch.Tensor,
                    out: torch.Tensor, bias: torch.Tensor,
@@ -224,7 +224,7 @@ def tri_attn_start(pair_repr: torch.Tensor,
     return out
 
 
-@cube.graph.parser.register('N S^ R Z^, Z^ (head+ dim), Z^ (head+ dim 3), (head+ dim) Z^, N S^ S^ head+ -> N S^ R Z^', name='tri_attn_end')
+@nnscaler.graph.parser.register('N S^ R Z^, Z^ (head+ dim), Z^ (head+ dim 3), (head+ dim) Z^, N S^ S^ head+ -> N S^ R Z^', name='tri_attn_end')
 def tri_attn_end(pair_repr: torch.Tensor,
                  gate: torch.Tensor, qkv: torch.Tensor,
                  out: torch.Tensor, bias: torch.Tensor,

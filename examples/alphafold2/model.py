@@ -1,4 +1,4 @@
-import cube
+import nnscaler
 import torch
 import math
 from torch import nn
@@ -155,7 +155,7 @@ class Evoformer(torch.nn.Module):
             torch.randn(ff_mult * cz, cz))
 
     def forward(self, msa_repr, pair_repr):
-        cube.runtime.function.anchor('MSARow')
+        nnscaler.runtime.function.anchor('MSARow')
 
         pair_repr, dummy_pair_repr = multi2ref(pair_repr)
         msa_repr = msa_repr + MSARowAttentionWithPairBias(
@@ -164,7 +164,7 @@ class Evoformer(torch.nn.Module):
             self.msa_head, self.c, self.scale, self.msa_row_chunk,
             self.is_train)
 
-        cube.runtime.function.anchor('MSACol')
+        nnscaler.runtime.function.anchor('MSACol')
         if self.is_extra:
             msa_repr = msa_repr + MSAColGlobalAttention(
                 self.col_norm(msa_repr), self.col_q_proj, self.col_k_proj,
@@ -176,13 +176,13 @@ class Evoformer(torch.nn.Module):
                 self.col_out_proj, self.msa_head, self.c, self.scale,
                 self.msa_col_chunk, self.is_train)
 
-        cube.runtime.function.anchor('MSATrans')
+        nnscaler.runtime.function.anchor('MSATrans')
         msa_repr = msa_repr + MSATransition(self.msa_transition_norm(msa_repr),
                                             self.msa_transition_proj1,
                                             self.msa_transition_proj2)
         succ_msa_repr, msa_repr = multi2ref(msa_repr)
 
-        cube.runtime.function.anchor('OPM')
+        nnscaler.runtime.function.anchor('OPM')
         msa_repr = self.outer_norm(msa_repr)
         opm_left, opm_right = OPMLeftProj(msa_repr,
                                           self.outer_proj1), OPMRightProj(
@@ -191,7 +191,7 @@ class Evoformer(torch.nn.Module):
             opm_left, opm_right, self.outer_out_proj, self.opm_chunk,
             self.is_train)
 
-        cube.runtime.function.anchor('TMO')
+        nnscaler.runtime.function.anchor('TMO')
         pair_repr = self.tri_mul_out_norm1(pair_repr)
         tmo_left, tmo_right = TMOLeftProj(
             pair_repr, self.tri_mul_out_proj1,
@@ -203,7 +203,7 @@ class Evoformer(torch.nn.Module):
             tmo_left, tmo_right, tmo_g, self.tri_mul_out_norm2_weight,
             self.tri_mul_out_norm2_bias, self.tri_mul_out_proj5, self.cz)
 
-        cube.runtime.function.anchor('TMI')
+        nnscaler.runtime.function.anchor('TMI')
         pair_repr = self.tri_mul_in_norm1(pair_repr)
         tmi_left = TMILeftProj(pair_repr, self.tri_mul_in_proj1,
                                self.tri_mul_in_proj2)
@@ -214,7 +214,7 @@ class Evoformer(torch.nn.Module):
             tmi_left, tmi_right, tmi_gate, self.tri_mul_in_norm2_weight,
             self.tri_mul_in_norm2_bias, self.tri_mul_in_proj5, self.cz)
 
-        cube.runtime.function.anchor('TANS')
+        nnscaler.runtime.function.anchor('TANS')
         pair_repr = self.tri_att_start_norm(pair_repr)
         bias = TANSBias(pair_repr, self.tri_att_start_bias_proj)
         pair_repr = pair_repr + TriangleAttentionNodeStart(
@@ -222,7 +222,7 @@ class Evoformer(torch.nn.Module):
             self.tri_att_start_qkv_proj, self.tri_att_start_out_proj, bias,
             self.pair_head, self.c, self.scale, self.tans_chunk, self.is_train)
 
-        cube.runtime.function.anchor('TANE')
+        nnscaler.runtime.function.anchor('TANE')
         pair_repr = self.tri_att_end_norm(pair_repr)
         bias = TANEBias(pair_repr, self.tri_att_end_bias_proj)
         pair_repr = pair_repr + TriangleAttentionNodeEnd(
@@ -230,7 +230,7 @@ class Evoformer(torch.nn.Module):
             self.tri_att_end_out_proj, bias, self.pair_head, self.c,
             self.scale, self.tane_chunk, self.is_train)
 
-        cube.runtime.function.anchor('PairTrans')
+        nnscaler.runtime.function.anchor('PairTrans')
         pair_repr = pair_repr + PairTransition(
             self.pair_transition_norm(pair_repr), self.pair_transition_proj1,
             self.pair_transition_proj2)
@@ -266,12 +266,12 @@ class AlphaFold2(nn.Module):
         msa = self.msa_norm(msa)
         pair = self.pair_norm(pair)
 
-        cube.runtime.function.anchor('Evoformer Stack Start')
+        nnscaler.runtime.function.anchor('Evoformer Stack Start')
         for evoformer in self.evoformers:
-            cube.runtime.function.anchor('One Layer Evoformer Start')
+            nnscaler.runtime.function.anchor('One Layer Evoformer Start')
             msa, pair = evoformer(msa, pair)
-            cube.runtime.function.anchor('One Layer Evoformer End')
-        cube.runtime.function.anchor('Evoformer Stack End')
+            nnscaler.runtime.function.anchor('One Layer Evoformer End')
+        nnscaler.runtime.function.anchor('Evoformer Stack End')
         loss = torch.sum(msa) * torch.sum(pair)
         return loss
 
@@ -296,11 +296,11 @@ class AlphaFoldlrw(nn.Module):
         msa = self.msa_norm(msa)
         pair = self.pair_norm(pair)
 
-        cube.runtime.function.anchor('Evoformer Stack Start')
+        nnscaler.runtime.function.anchor('Evoformer Stack Start')
         for evoformer in self.evoformers:
-            cube.runtime.function.anchor('One Layer Evoformer Start')
+            nnscaler.runtime.function.anchor('One Layer Evoformer Start')
             msa, pair = evoformer(msa, pair)
-            cube.runtime.function.anchor('One Layer Evoformer End')
-        cube.runtime.function.anchor('Evoformer Stack End')
+            nnscaler.runtime.function.anchor('One Layer Evoformer End')
+        nnscaler.runtime.function.anchor('Evoformer Stack End')
         loss = torch.sum(msa) * torch.sum(pair)
         return loss

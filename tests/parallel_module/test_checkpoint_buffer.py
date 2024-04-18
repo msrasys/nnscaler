@@ -4,7 +4,7 @@ import torch
 
 import pytest
 
-from cube.parallel import parallelize, ComputeConfig, merge_state_dicts, load_merged_state_dicts
+from nnscaler.parallel import parallelize, ComputeConfig, merge_state_dicts, load_merged_state_dicts
 
 from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun

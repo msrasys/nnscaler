@@ -8,16 +8,16 @@ OMP_NUM_THREADS=4 torchrun \
 import torch
 from examples.openfold.model import AlphaFold, Config
 
-import cube
-from cube.profiler.timer import CudaTimer, print_each_rank
-from cube.profiler.memory import memory_summary
+import nnscaler
+from nnscaler.profiler.timer import CudaTimer, print_each_rank
+from nnscaler.profiler.memory import memory_summary
 from examples.openfold.policy.mpmd import PASDAP, PASRoundRobin, PASNF1B, PASDAPPipe
 
 import argparse
 from functools import partial
 
 
-cube.init()
+nnscaler.init()
 
 parser = argparse.ArgumentParser(description='AlphaFold Train')
 parser.add_argument('--fp16', action='store_true', default=False,
@@ -42,7 +42,7 @@ parser.add_argument('--recycle', type=int, default=2,
                     help='data parallelism size')
 
 args = parser.parse_args()
-dp = cube.runtime.device.DeviceGroup().world_size // (args.tp * args.pp)
+dp = nnscaler.runtime.device.DeviceGroup().world_size // (args.tp * args.pp)
 assert args.gbs % args.mbs == 0
 assert args.mbs % dp == 0
 assert args.msa_hidden % args.head_dim == 0
@@ -74,7 +74,7 @@ def train():
         model = model.half()
 
     dtype = torch.float16 if args.fp16 else torch.float32
-    dataloader = cube.runtime.syndata.SynDataLoader(
+    dataloader = nnscaler.runtime.syndata.SynDataLoader(
         shapes=([cfg.bs, cfg.evoformer_s, cfg.evoformer_r, cfg.evoformer_cm], 
                 [cfg.bs, cfg.evoformer_r, cfg.evoformer_r, cfg.evoformer_cz]),
         dtypes=(dtype, dtype),
@@ -83,8 +83,8 @@ def train():
 
     print_each_rank(f'before partitioned model parameter: {nparams(model)}')
 
-    model = cube.SemanticModel(model)
-    @cube.compile(model, dataloader, PAS=PASDAPPipe, override=True, load_content=True)
+    model = nnscaler.SemanticModel(model)
+    @nnscaler.compile(model, dataloader, PAS=PASDAPPipe, override=True, load_content=True)
     def train_iter(model, dataloader):
         input_ids, position_ids = next(dataloader)
         loss = model(input_ids, position_ids)

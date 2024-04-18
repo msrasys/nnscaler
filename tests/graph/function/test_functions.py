@@ -1,14 +1,14 @@
 ### Only test the anno creation in these tests
 
-import cube.graph.function.function as F
-from cube.ir.cten import IRObject, IRTensor
+import nnscaler.graph.function.function as F
+from nnscaler.ir.cten import IRObject, IRTensor
 
 import pytest
 import torch
 import numpy as np
 import math
 
-from cube.ir.tensor import IRFullTensor
+from nnscaler.ir.tensor import IRFullTensor
 
 
 def o(value):
@@ -369,12 +369,12 @@ def test_ScaledDotProductAttention():
 
 def test_NewTensor():
     op = F.NewTensor(torch.tensor(1))
-    assert op.signature == 'cube.runtime.function.tensor'
+    assert op.signature == 'nnscaler.runtime.function.tensor'
     assert repr(op.anno) == ' -> 1^'
     assert op.kwargs['data'] == 1
 
     op = F.NewTensor(torch.tensor([1,2]))
-    assert op.signature == 'cube.runtime.function.tensor'
+    assert op.signature == 'nnscaler.runtime.function.tensor'
     assert repr(op.anno) == ' -> 2^'
     assert op.kwargs['data'] == [1,2]
 

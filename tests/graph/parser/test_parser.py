@@ -1,7 +1,7 @@
 import tempfile
 import torch
-from cube.ir.cten import IRObject, IRTensor
-from cube.graph.parser.converter import to_fx_graph, to_ir_graph
+from nnscaler.ir.cten import IRObject, IRTensor
+from nnscaler.graph.parser.converter import to_fx_graph, to_ir_graph
 
 from ...utils import replace_all_device_with
 

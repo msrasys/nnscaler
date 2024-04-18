@@ -1,6 +1,6 @@
 
 import torch
-from cube.runtime.utils import MicroBatchDataLoader, microbatches
+from nnscaler.runtime.utils import MicroBatchDataLoader, microbatches
 
 
 import pytest

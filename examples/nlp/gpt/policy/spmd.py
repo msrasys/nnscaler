@@ -2,9 +2,9 @@
 
 from typing import List
 
-from cube.graph import IRGraph
-from cube.graph.function.pyfunc import IRPyFunc
-from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
+from nnscaler.graph import IRGraph
+from nnscaler.graph.function.pyfunc import IRPyFunc
+from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 
 from examples.utils import tensor_parallelism, replica
 

@@ -3,10 +3,10 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-import cube
+import nnscaler
 
 
-@cube.graph.parser.register('B (2 h^ 2 w^) C^ -> B (h w) (4 C)')
+@nnscaler.graph.parser.register('B (2 h^ 2 w^) C^ -> B (h w) (4 C)')
 def patch_merge(x: torch.Tensor, h: int, w: int):
     B, L, C = x.shape
     H = 2 * h
@@ -22,7 +22,7 @@ def patch_merge(x: torch.Tensor, h: int, w: int):
     x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
     return x
 
-@cube.graph.parser.register('B ic+ (ps^ w^) (ps^ h^), oc ic+ k^ k^, oc -> B oc w^ h^')
+@nnscaler.graph.parser.register('B ic+ (ps^ w^) (ps^ h^), oc ic+ k^ k^, oc -> B oc w^ h^')
 def patch(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, ps: int):
     """
     @param ps int: patch size

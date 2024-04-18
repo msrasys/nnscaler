@@ -1,7 +1,7 @@
 import torch
 from dataclasses import dataclass
 
-import cube
+import nnscaler
 
 from examples.nlp.blocks.transformer import TransformerLayer
 
@@ -76,7 +76,7 @@ class GPT(torch.nn.Module):
         enc = embed.transpose(0, 1)
 
         for layer in self.layers:
-            cube.runtime.function.anchor('transformer start')
+            nnscaler.runtime.function.anchor('transformer start')
             enc = layer(enc)
         enc = self.final_layernorm(enc)
 

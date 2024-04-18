@@ -6,10 +6,10 @@ from typing import Dict, Tuple, List, Any
 import torch
 from torch import nn
 
-from cube.parallel import ComputeConfig, parallelize, build_optimizer, \
+from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, \
     merge_state_dicts, load_merged_state_dicts, \
     deduped_state_dict, load_deduped_state_dict
-from cube.runtime.module import ParallelModule
+from nnscaler.runtime.module import ParallelModule
 
 from .common import PASRandomSPMD, PASMegatron, CubeLinear, init_random, init_distributed, clear_dir_on_rank0, assert_equal
 from ..launch_torchrun import launch_torchrun

@@ -1,6 +1,6 @@
-import cube
-from cube.graph.parser.converter import convert_model
-from cube.profiler.database import ProfileDataBase
+import nnscaler
+from nnscaler.graph.parser.converter import convert_model
+from nnscaler.profiler.database import ProfileDataBase
 import tempfile
 import torch
 
@@ -10,15 +10,15 @@ from ...utils import replace_all_device_with
 def mock_add(x: torch.Tensor, y: torch.Tensor):
     return x + y
 
-cube.graph.parser.register('*, * -> *')(mock_add)
+nnscaler.graph.parser.register('*, * -> *')(mock_add)
 
 
-@cube.graph.parser.register('*, * -> *')
+@nnscaler.graph.parser.register('*, * -> *')
 def mock_add2(x: torch.Tensor, y: torch.Tensor):
     return x + y
 
 
-@cube.graph.parser.register('(h w^) k^ -> h (w^ k^)')
+@nnscaler.graph.parser.register('(h w^) k^ -> h (w^ k^)')
 def mock_view_with_obj(x, h):
     return x.view(h, -1)
 
@@ -32,7 +32,7 @@ class MockAGF(torch.autograd.Function):
     def backward(ctx, grad):
         return grad, grad
 
-cube.graph.parser.register('*, * -> *')(MockAGF.apply)
+nnscaler.graph.parser.register('*, * -> *')(MockAGF.apply)
 
 
 class MockModel(torch.nn.Module):

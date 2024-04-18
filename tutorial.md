@@ -73,7 +73,7 @@ If a tensor is represented as `'m^ kd+'`, it indicates the tensor has two dimens
 To register a customized "matmul" operator in the runtime, user can simply define a python function and add an decorator on the function with its annotations:
 
 ```py
-@cube.graph.parser.register('(h^ m^) kd+, kd+ n -> h^ m^ n', name='matmul_custom')
+@nnscaler.graph.parser.register('(h^ m^) kd+, kd+ n -> h^ m^ n', name='matmul_custom')
 def operator(x: torch.Tensor, w: torch.Tensor, h: float) -> torch.Tensor:
     out = torch.matmul(x, w)
     out = out.view(h, out.size(0) // h, out.size(1))

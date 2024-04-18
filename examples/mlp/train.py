@@ -9,10 +9,10 @@ import torch
 from torch import nn
 from functools import partial
 
-import cube
-from cube.profiler import CudaTimer
-from cube.profiler.timer import print_each_rank
-from cube.runtime.utils import microbatches
+import nnscaler
+from nnscaler.profiler import CudaTimer
+from nnscaler.profiler.timer import print_each_rank
+from nnscaler.runtime.utils import microbatches
 
 
 import examples.mlp.policy.gallery as gallery
@@ -29,7 +29,7 @@ parser.add_argument('--mbs', type=int, default=64, help='micro batch size')
 parser.add_argument('--tp-size', type=int, default=2, help='tensor parallelism size only for Megatron policy')
 args = parser.parse_args()
 
-cube.init()
+nnscaler.init()
 
 # get policy
 policy = get_policy([gallery], args.policy)
@@ -63,13 +63,13 @@ def train():
     dataloader = microbatches((dummy_data(),))
 
     # compile a training iteration
-    @cube.compile(model, dataloader, PAS=policy)
+    @nnscaler.compile(model, dataloader, PAS=policy)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)
         loss.backward()
     # load generated model
-    model = cube.utils.load_model()
+    model = nnscaler.utils.load_model()
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 

@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 
-from cube.graph.parser.fx.parser import FxModuleParser
+from nnscaler.graph.parser.fx.parser import FxModuleParser
 
 @pytest.fixture(autouse=True)
 def clean_generated_files():

@@ -1,17 +1,17 @@
 import torch
 import math
-import cube
+import nnscaler
 
-from cube.profiler import CudaTimer
-from cube.profiler.timer import print_each_rank
+from nnscaler.profiler import CudaTimer
+from nnscaler.profiler.timer import print_each_rank
 
 from examples.alphafold2.model import *
 import examples.alphafold2.policy.spmd as spmd
 
-from cube.ir.operator import IRFwOperation, IRBpOperation
-from cube.profiler.database import ProfileDataBase
-from cube.algorithm.ops.dimops import gen_partitions
-from cube.graph.function.anchor import IRGraphAnchor
+from nnscaler.ir.operator import IRFwOperation, IRBpOperation
+from nnscaler.profiler.database import ProfileDataBase
+from nnscaler.algorithm.ops.dimops import gen_partitions
+from nnscaler.graph.function.anchor import IRGraphAnchor
 
 
     
@@ -44,15 +44,15 @@ def run(size_config, other_config, policy):
     if not is_train:
         model.eval()
 
-    model = cube.SemanticModel(model,
+    model = nnscaler.SemanticModel(model,
                                input_shapes=([bs, s, r, cm], [bs, r, r, cz]))
 
-    dataloader = cube.runtime.syndata.SynDataLoader(shapes=([bs, s, r, cm],
+    dataloader = nnscaler.runtime.syndata.SynDataLoader(shapes=([bs, s, r, cm],
                                                             [bs, r, r, cz]),
                                                     dtypes=(dtype, dtype),
                                                     batch_dims=(0, 0))
 
-    @cube.compile(model, dataloader, PAS=policy, override=True)
+    @nnscaler.compile(model, dataloader, PAS=policy, override=True)
     def train_iter(model, dataloader):
         msa_repr, pair_repr = next(dataloader)
         loss = model(msa_repr, pair_repr)
@@ -125,5 +125,5 @@ def test_main():
 
 
 if __name__ == '__main__':
-    cube.init()
+    nnscaler.init()
     test_main()

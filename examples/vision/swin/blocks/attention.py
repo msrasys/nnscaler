@@ -1,13 +1,13 @@
 from typing import Optional
 import torch
-import cube
+import nnscaler
 
 
 # REMARK: as default attention has qkv project weight of (3 head dim_head) C, 
 # this cannot partition on head dimension
 # as the head dimension is a secondary hidden dimension in (3 head dim_head).
 # To make partition work (correctness guarantee), the dimension is swapped as (head dim_head 3)
-@cube.graph.parser.register('B N^ C^, (h+ dh^ 3) C^, (h+ dh^ 3), (wh^ ww^) (wh^ ww^), t^ h+, C^ (h+ dh^), nw N^ N^ -> B N^ C^')
+@nnscaler.graph.parser.register('B N^ C^, (h+ dh^ 3) C^, (h+ dh^ 3), (wh^ ww^) (wh^ ww^), t^ h+, C^ (h+ dh^), nw N^ N^ -> B N^ C^')
 def window_attn(x: torch.Tensor,
                 qkv_w: torch.Tensor, qkv_bias: torch.Tensor,
                 relative_position_index: torch.Tensor,

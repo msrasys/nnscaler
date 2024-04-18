@@ -4,11 +4,11 @@ Policy example following GShard
 
 from typing import List
 
-from cube.ir.tensor import IRSubTensor
-from cube.ir.operator import IRDataOperation, IRFwOperation
-from cube.graph.graph import IRGraph
-from cube.graph.function.dimops import IRDimops
-from cube.graph.function.anchor import IRGraphAnchor
+from nnscaler.ir.tensor import IRSubTensor
+from nnscaler.ir.operator import IRDataOperation, IRFwOperation
+from nnscaler.graph.graph import IRGraph
+from nnscaler.graph.function.dimops import IRDimops
+from nnscaler.graph.function.anchor import IRGraphAnchor
 
 
 def follow(graph: IRGraph, node: IRDimops, devs: List[int], idx: int, dim: int,

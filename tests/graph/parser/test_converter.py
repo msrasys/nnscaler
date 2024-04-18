@@ -5,9 +5,9 @@ from pathlib import Path
 import torch
 import pytest
 
-from cube.graph.parser.converter import to_fx_graph, to_ir_graph
-from cube.graph.parser import FxModuleParser
-from cube.ir.cten import IRObject, IRTensor
+from nnscaler.graph.parser.converter import to_fx_graph, to_ir_graph
+from nnscaler.graph.parser import FxModuleParser
+from nnscaler.ir.cten import IRObject, IRTensor
 
 from ...utils import replace_all_device_with
 
@@ -74,7 +74,7 @@ def test_record_codeline():
     module = MyModule()
     fx_graph = to_fx_graph(module, dummy_input)
 
-    cube_path = str(Path(importlib.util.find_spec('cube').origin).parent) + '/'
+    cube_path = str(Path(importlib.util.find_spec('nnscaler').origin).parent) + '/'
 
     for node in fx_graph.graph.nodes:
         if 'frame_record' in node.meta and cube_path in str(node.meta['frame_record']):
@@ -95,8 +95,8 @@ def test_record_metadata():
     module = MyModule()
     fx_graph = to_fx_graph(module, dummy_input)
 
-    from cube.graph.parser.fx.concrete_trace_utils.concrete_proxy import ConcreteProxy
-    from cube.graph.parser.fx.concrete_trace_utils import TensorMetadata
+    from nnscaler.graph.parser.fx.concrete_trace_utils.concrete_proxy import ConcreteProxy
+    from nnscaler.graph.parser.fx.concrete_trace_utils import TensorMetadata
 
     for node in fx_graph.graph.nodes:
         # this assert is only for this simple model, all node should have TensorMetadata type 'tensor_meta'

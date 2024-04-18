@@ -16,8 +16,8 @@ from examples.llama.tokenizer import Tokenizer
 
 Role = Literal["system", "user", "assistant"]
 
-import cube
-from cube.flags import CompileFlag
+import nnscaler
+from nnscaler.flags import CompileFlag
 
 
 class Message(TypedDict):
@@ -108,12 +108,12 @@ class Llama:
             1, 1000, size=(4, 38), dtype=torch.int64)
 
         def policy(graph, resource):
-            from cube.ir.operator import IRFwOperation
+            from nnscaler.ir.operator import IRFwOperation
             for fwop in graph.select(ntype=IRFwOperation):
                 graph.assign(fwop, 0)
             return graph
 
-        @cube.compile(self.model, sample_tokens, 0,
+        @nnscaler.compile(self.model, sample_tokens, 0,
                       PAS=policy, model_dynamic_shape=True)
         def infer(model: torch.nn.Module, tokens: torch.Tensor, prev_pos: int):
             logits = model(tokens, prev_pos)
@@ -123,7 +123,7 @@ class Llama:
         vocab_size, n_layers = params.vocab_size, params.n_layers
 
         del self.model
-        self.model = cube.load_model()
+        self.model = nnscaler.load_model()
 
         # TODO: support auto reset non-parameter attributes for llama model
         self.model.params = params

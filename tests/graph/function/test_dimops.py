@@ -5,10 +5,10 @@ pytest unit_tests/graph/function/test_dimops.py
 from typing import Callable, Tuple, List
 from functools import partial
 
-import cube.graph.function as F
-from cube.graph.function.dimops import IRDimops
-from cube.ir.tensor import IRFullTensor
-from cube.ir.cten import IRObject
+import nnscaler.graph.function as F
+from nnscaler.graph.function.dimops import IRDimops
+from nnscaler.ir.tensor import IRFullTensor
+from nnscaler.ir.cten import IRObject
 
 
 def create_op(creator: Callable,

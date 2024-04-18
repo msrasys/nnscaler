@@ -3,14 +3,14 @@ from functools import partial
 import warnings
 import torch
 
-from cube.graph.function.anchor import IRGraphAnchor
-from cube.graph.function.dimops import IRDimops, TransformRule, DimopSplit
-from cube.graph.graph import IRGraph
-from cube.graph.segment import IRSegment
-from cube.ir.operator import IRFwOperation, IRDataOperation
-from cube.ir.tensor import IRFullTensor
-from cube.graph.schedule.predefined import PredefinedSched
-from cube.runtime.device import DeviceGroup
+from nnscaler.graph.function.anchor import IRGraphAnchor
+from nnscaler.graph.function.dimops import IRDimops, TransformRule, DimopSplit
+from nnscaler.graph.graph import IRGraph
+from nnscaler.graph.segment import IRSegment
+from nnscaler.ir.operator import IRFwOperation, IRDataOperation
+from nnscaler.ir.tensor import IRFullTensor
+from nnscaler.graph.schedule.predefined import PredefinedSched
+from nnscaler.runtime.device import DeviceGroup
 
 from examples.policies.alpa.plan import ParallelSpec
 from examples.policies.alpa.inter_op import inter_op

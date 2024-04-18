@@ -1,8 +1,8 @@
 import torch
-import cube
+import nnscaler
 
 
-@cube.graph.parser.register('L^ N E^, H+ E^, H+, E^ H+ -> L^ N E^', name='feedforward')
+@nnscaler.graph.parser.register('L^ N E^, H+ E^, H+, E^ H+ -> L^ N E^', name='feedforward')
 def feedforward(x: torch.Tensor,
                 proj1: torch.Tensor, proj1_bias: torch.Tensor,
                 proj2: torch.Tensor,

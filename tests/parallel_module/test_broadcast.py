@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from cube.parallel import ComputeConfig, parallelize, broadcast_weights
+from nnscaler.parallel import ComputeConfig, parallelize, broadcast_weights
 
 from .common import PASRandomSPMD, init_distributed
 from ..launch_torchrun import launch_torchrun

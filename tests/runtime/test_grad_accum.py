@@ -2,8 +2,8 @@ import torch
 import pytest
 from functools import partial
 
-import cube
-from cube.runtime.module import CubeModule
+import nnscaler
+from nnscaler.runtime.module import CubeModule
 from ..launch_torchrun import torchrun
 from ..utils import init_parameter, assert_parity
 
@@ -18,7 +18,7 @@ class MLP(CubeModule):
         for _ in range(nlayers):
             self.layers.append(torch.nn.Linear(dim, dim, bias=False))
         
-        self.wreducer1 = cube.runtime.adapter.Reducer(ranks=ranks, reduce_op='sum', async_op=async_op, zero=False,
+        self.wreducer1 = nnscaler.runtime.adapter.Reducer(ranks=ranks, reduce_op='sum', async_op=async_op, zero=False,
                                                       max_bucket_size_bytes=137217728, zero_ngroups=1)
         for param in self.parameters():
             self.wreducer1.add_param(param)
@@ -151,7 +151,7 @@ def reducer_async_test_correct(accum_times: int = 4):
     for _ in range(3):
         model.zero_grad()
         for step in range(accum_times):
-            with cube.accum_mode(begin=(step == 0), end=(step == accum_times - 1)):
+            with nnscaler.accum_mode(begin=(step == 0), end=(step == accum_times - 1)):
                 x = get_dummy_data()
                 x = x.chunk(ngpus, dim=0)[rank]
                 loss = model(x)
@@ -170,7 +170,7 @@ def reducer_async_test_correct(accum_times: int = 4):
         
 
 def accum_test():
-    cube.init()
+    nnscaler.init()
     print('starting reducer sync')
     assert_parity(baseline, partial(reducer_sync_test, 4))
     print('starting reducer async')

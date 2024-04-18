@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from cube.graph.parser.fx.concrete_trace_utils.operator_patcher import (
+from nnscaler.graph.parser.fx.concrete_trace_utils.operator_patcher import (
     OperatorTransformer,
     SuperTransformer,
     ProxyCallTransformer,

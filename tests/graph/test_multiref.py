@@ -5,9 +5,9 @@ import torch
 import logging
 from functools import partial
 
-import cube
-from cube.graph import IRGraph
-from cube.ir.operator import IRFwOperation
+import nnscaler
+from nnscaler.graph import IRGraph
+from nnscaler.ir.operator import IRFwOperation
 from ..launch_torchrun import torchrun
 from ..utils import init_parameter, assert_parity
 
@@ -94,13 +94,13 @@ def multiref():
     
     x, y = get_dummy_data()
 
-    @cube.compile(model, x, y, PAS=policy)
+    @nnscaler.compile(model, x, y, PAS=policy)
     def train_iter(model, x, y):
         loss = model(x, y)
         loss.backward()
         return loss
 
-    model = cube.load_model()
+    model = nnscaler.load_model()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
     losses = []
@@ -115,8 +115,8 @@ def multiref():
 
 
 def multiref_test():
-    cube.init()
-    cube.set_logger_level(logging.INFO)
+    nnscaler.init()
+    nnscaler.set_logger_level(logging.INFO)
     assert_parity(baseline, multiref)
 
 

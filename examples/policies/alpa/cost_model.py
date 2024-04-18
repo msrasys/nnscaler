@@ -4,11 +4,11 @@ Cost model for intra-op plan search
 from typing import List, Callable, Tuple, Dict
 import numpy as np
 
-from cube.graph import IRGraph
-from cube.ir.cten import IRTensor
-from cube.ir.operator import IRFwOperation
-from cube.graph.function.anchor import IRGraphAnchor
-from cube.graph.function.dimops import IRDimops, TransformRule, DimopSplit
+from nnscaler.graph import IRGraph
+from nnscaler.ir.cten import IRTensor
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.graph.function.anchor import IRGraphAnchor
+from nnscaler.graph.function.dimops import IRDimops, TransformRule, DimopSplit
 
 
 DistSpec = Dict[int, Tuple[Tuple[int, int]]]

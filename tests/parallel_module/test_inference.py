@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from cube.parallel import ComputeConfig, parallelize
+from nnscaler.parallel import ComputeConfig, parallelize
 
 from .common import CubeLinear, init_distributed, init_random, PASRandomSPMD, clear_dir_on_rank0
 from ..launch_torchrun import torchrun

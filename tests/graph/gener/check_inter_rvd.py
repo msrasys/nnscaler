@@ -7,16 +7,16 @@ OMP_NUM_THREADS=4 torchrun \
 """
 
 from typing import List, Tuple
-import cube
-from cube.ir.tensor import IRFullTensor
-from cube.graph.gener.rvd.layout import RVDLayout, RVDInspector
-from cube.graph.gener.rvd.inter import InterPathFinder
+import nnscaler
+from nnscaler.ir.tensor import IRFullTensor
+from nnscaler.graph.gener.rvd.layout import RVDLayout, RVDInspector
+from nnscaler.graph.gener.rvd.inter import InterPathFinder
 import numpy as np
 
-from cube.graph.gener.utils import tensor_vd_repr
+from nnscaler.graph.gener.utils import tensor_vd_repr
 
 
-cube.init()
+nnscaler.init()
 
 
 def factors(k: int, num: int) -> List[Tuple[int]]:

@@ -1,7 +1,7 @@
 
-from cube.ir.tensor import IRFullTensor, IRSubTensor
-from cube.ir.operator import IRFwOperation
-from cube.graph.graph import IRGraph
+from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.graph.graph import IRGraph
 
 
 def test_graph_from_logic():

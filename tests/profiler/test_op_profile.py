@@ -4,10 +4,10 @@ import tempfile
 import pytest
 import torch
 
-from cube.parallel import _gen_graph
-from cube.ir.tensor import IRTensor
-from cube.ir.operator import IRFwOperation
-from cube.profiler.database import CompProfiler, ProfileDataBase
+from nnscaler.parallel import _gen_graph
+from nnscaler.ir.tensor import IRTensor
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.profiler.database import CompProfiler, ProfileDataBase
 
 
 class NaiveFFN(torch.nn.Module):

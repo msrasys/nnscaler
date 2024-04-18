@@ -2,9 +2,9 @@
 import torch
 import logging
 import tempfile
-from cube.graph.parser.converter import convert_model
-from cube.ir.operator import IRFwOperation
-from cube.graph.function.dimops import IRDimops
+from nnscaler.graph.parser.converter import convert_model
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.graph.function.dimops import IRDimops
 
 _logger = logging.getLogger(__name__)
 

@@ -9,7 +9,7 @@ pip install pulp
 
 ## Implementation Notes
 
-* The implementation doesn't support auto_layer construction, and relies on the `cube.runtime.function.anchor` as stage division candidates.
+* The implementation doesn't support auto_layer construction, and relies on the `nnscaler.runtime.function.anchor` as stage division candidates.
 
 * The implementation doesn't support `follow`, which relies on the user customized operator to achieve manual fusion.
 

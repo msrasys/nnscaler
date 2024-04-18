@@ -1,9 +1,9 @@
 from typing import List
 
-from cube.graph import IRGraph
-from cube.graph.function.anchor import IRGraphAnchor
-from cube.graph.schedule.predefined import PredefinedSched
-from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
+from nnscaler.graph import IRGraph
+from nnscaler.graph.function.anchor import IRGraphAnchor
+from nnscaler.graph.schedule.predefined import PredefinedSched
+from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 
 from examples.utils import tensor_parallelism, replica, group_to_layers
 

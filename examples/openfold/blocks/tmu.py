@@ -1,21 +1,21 @@
-import cube
+import nnscaler
 import torch
 from examples.openfold.blocks.utils import multi2ref
 
 
-# @cube.graph.parser.register('N S R Z^, Z^ E, Z^ E -> N S R E')
+# @nnscaler.graph.parser.register('N S R Z^, Z^ E, Z^ E -> N S R E')
 # def tmu_projection(pair_repr: torch.Tensor, proj1: torch.Tensor, proj2: torch.Tensor):
 #     x = torch.matmul(pair_repr, proj1)
 #     x = torch.sigmoid(x)
 #     x = x * torch.matmul(pair_repr, proj2)
 # 
 # 
-# @cube.graph.parser.register('N S R Z+, Z+ E-> N S R E')
+# @nnscaler.graph.parser.register('N S R Z+, Z+ E-> N S R E')
 # def tmu_gate(pair_repr: torch.Tensor, proj: torch.Tensor):
 #     return torch.sigmoid(torch.matmul(pair_repr, proj))
 
 
-@cube.graph.parser.register('N S R Z^, Z^ E^, Z^ E^, Z^ E, Z^ E^, Z^ Z^ -> N S R E, N S R E^, N S R Z^', name='tmu_projection')
+@nnscaler.graph.parser.register('N S R Z^, Z^ E^, Z^ E^, Z^ E, Z^ E^, Z^ Z^ -> N S R E, N S R E^, N S R Z^', name='tmu_projection')
 def tmu_projection(pair_repr: torch.Tensor, 
                    left1: torch.Tensor, left2: torch.Tensor,
                    right1: torch.Tensor, right2: torch.Tensor,
@@ -34,7 +34,7 @@ def tmu_projection(pair_repr: torch.Tensor,
     return left, right, gate
 
 
-@cube.graph.parser.register('N S R^ E, N T^ R^ E^, N S^ T^ Z^, E^, E^, E^ Z^ -> N S T^ Z^', name='tmo')
+@nnscaler.graph.parser.register('N S R^ E, N T^ R^ E^, N S^ T^ Z^, E^, E^, E^ Z^ -> N S T^ Z^', name='tmo')
 def tmo(left: torch.Tensor, right: torch.Tensor, gate: torch.Tensor,
         norm_w: torch.Tensor, norm_b: torch.Tensor, out: torch.Tensor):
     a = left.permute(0, 3, 1, 2)
@@ -46,7 +46,7 @@ def tmo(left: torch.Tensor, right: torch.Tensor, gate: torch.Tensor,
     return p
 
 
-@cube.graph.parser.register('N R^ S E, N R^ T^ E^, N T^ S^ Z^, E^, E^, E^ Z^ -> N T^ S Z^', name='tmi')
+@nnscaler.graph.parser.register('N R^ S E, N R^ T^ E^, N T^ S^ Z^, E^, E^, E^ Z^ -> N T^ S Z^', name='tmi')
 def tmi(left: torch.Tensor, right: torch.Tensor, gate: torch.Tensor,
         norm_w: torch.Tensor, norm_b: torch.Tensor, out: torch.Tensor):
     a = left.permute(0, 3, 2, 1)

@@ -4,8 +4,8 @@ import tempfile
 import torch
 import pytest
 
-import cube.graph.function.dimops
-from cube.parallel import parallelize, ComputeConfig, CubeModule, _gen_graph
+import nnscaler.graph.function.dimops
+from nnscaler.parallel import parallelize, ComputeConfig, CubeModule, _gen_graph
 
 from .common import PASData, init_distributed, PASRandomSPMD
 from ..launch_torchrun import launch_torchrun
@@ -205,7 +205,7 @@ class AttrModule(torch.nn.Module):
 
 
 def _gencode_contains(cubesave_dir, module_class, index, search_re):
-    from cube.parallel import _CUBE_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
+    from nnscaler.parallel import _CUBE_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
     from pathlib import Path
     import re
     namespace = f'{_CUBE_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{_DEFAULT_INSTANCE_NAME}'
@@ -480,7 +480,7 @@ def test_codegen_clone():
             tempdir,
             True
         )
-        assert isinstance(g.nodes()[0], cube.graph.function.dimops.IRDimops)
+        assert isinstance(g.nodes()[0], nnscaler.graph.function.dimops.IRDimops)
 
 
 class MinModule(torch.nn.Module):

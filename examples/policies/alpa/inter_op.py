@@ -8,7 +8,7 @@ The implementation is a little bit adapted to fit with cube's view
 from typing import List, Callable, Tuple, Dict, Optional
 import time
 
-from cube.ir.operator import IRFwOperation
+from nnscaler.ir.operator import IRFwOperation
 from examples.policies.alpa.layer_op import IRLayerOp, cluster_to_layer_ops
 from examples.policies.alpa.plan import StageSpec, ParallelSpec
 

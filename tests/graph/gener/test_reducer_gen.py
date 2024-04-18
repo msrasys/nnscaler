@@ -1,12 +1,12 @@
 import pytest
-from cube.graph.gener.gen import IRAdapterGener
+from nnscaler.graph.gener.gen import IRAdapterGener
 
-from cube.graph import IRGraph
-from cube.graph.segment import IRSegment
-from cube.graph.parser.converter import convert_model
-from cube.ir.operator import IRFwOperation
-from cube.ir.tensor import IRFullTensor
-from cube.ir.adapter import IRWeightReducer
+from nnscaler.graph import IRGraph
+from nnscaler.graph.segment import IRSegment
+from nnscaler.graph.parser.converter import convert_model
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.ir.tensor import IRFullTensor
+from nnscaler.ir.adapter import IRWeightReducer
 
 import torch
 import tempfile

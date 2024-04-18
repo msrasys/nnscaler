@@ -14,9 +14,9 @@ from torch.utils.data.distributed import DistributedSampler
 
 import numpy as np
 
-from cube.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dicts
-from cube.runtime.module import ParallelModule, ExtraState
-from cube.runtime.gnorm import calcuate_gnorm
+from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dicts
+from nnscaler.runtime.module import ParallelModule, ExtraState
+from nnscaler.runtime.gnorm import calcuate_gnorm
 
 from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0, PASMegatron
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively

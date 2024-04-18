@@ -6,9 +6,9 @@ import pytest
 import torch
 import shutil
 
-from cube.graph.parser.fx.parser import FxModuleParser
-from cube.parallel import ReuseType, parallelize, ComputeConfig, _load_cube_module_class
-from cube.runtime.module import ParallelModule
+from nnscaler.graph.parser.fx.parser import FxModuleParser
+from nnscaler.parallel import ReuseType, parallelize, ComputeConfig, _load_cube_module_class
+from nnscaler.runtime.module import ParallelModule
 
 from ..utils import new_empty, replace_all_device_with
 from .common import PASData

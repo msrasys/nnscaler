@@ -14,8 +14,8 @@ import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 
-from cube.runtime.module import ParallelModule
-from cube.runtime.device import DeviceGroup, CompileFlag
+from nnscaler.runtime.module import ParallelModule
+from nnscaler.runtime.device import DeviceGroup, CompileFlag
 
 
 def init_parameter(model: torch.nn.Module, seed: int = 0):
@@ -94,7 +94,7 @@ def replace_all_device_with(device='cpu', force=False):
         yield
         return
 
-    from cube.graph.parser.fx.concrete_trace_utils.concrete_tracer import ConcreteTracer
+    from nnscaler.graph.parser.fx.concrete_trace_utils.concrete_tracer import ConcreteTracer
 
     orig_to = torch.Tensor.to
     orig_cuda = torch.Tensor.cuda

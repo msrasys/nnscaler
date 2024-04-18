@@ -1,12 +1,12 @@
 import torch
-import cube
+import nnscaler
 import os
 
 from functools import partial
 import pytest
 
-from cube.ir.operator import IRFwOperation
-from cube.runtime.device import DeviceGroup
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.runtime.device import DeviceGroup
 from ..launch_torchrun import torchrun
 
 
@@ -67,19 +67,19 @@ def assert_same_state(origin, merged):
 
 
 def merge_model_states_test():
-    cube.init()
+    nnscaler.init()
 
     model = Module()
     sample = torch.randn(8, 8, device=torch.cuda.current_device())
 
     full_model_state = model.state_dict()
 
-    @cube.compile(model, sample, PAS=tp_policy)
+    @nnscaler.compile(model, sample, PAS=tp_policy)
     def train_iter(model, sample):
         loss = model(sample)
         loss.backward()
         return loss
-    cube_model = cube.load_model()
+    cube_model = nnscaler.load_model()
 
     state_dict = cube_model.state_dict()
     torch.save({'state_dict': state_dict, 'fullmap': cube_model.fullmap},
@@ -100,7 +100,7 @@ test_merge_model_states = partial(torchrun, 2, merge_model_states_test)
 
 
 def merge_optimizer_states_test():
-    cube.init()
+    nnscaler.init()
 
     torch.manual_seed(0)
     model = Module().cuda()
@@ -110,13 +110,13 @@ def merge_optimizer_states_test():
     full_model_state = model.state_dict()
     full_optim_state = full_optimizer.state_dict()
 
-    @cube.compile(model, sample, PAS=tp_policy)
+    @nnscaler.compile(model, sample, PAS=tp_policy)
     def train_iter(model, sample):
         loss = model(sample)
         loss.backward()
         return loss
 
-    cube_model = cube.load_model()
+    cube_model = nnscaler.load_model()
     optimizer = torch.optim.Adam(cube_model.parameters(), lr=0.01)
 
     # test for initial state

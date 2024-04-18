@@ -2,7 +2,7 @@ import pytest
 
 from torch.utils._pytree import tree_flatten
 
-from cube.graph.parser.fx.concrete_trace_utils.utils import (
+from nnscaler.graph.parser.fx.concrete_trace_utils.utils import (
     flatten_tree_with_spec,
     flatten_trees_with_func,
     flatten_trees_with_func_and_spec,

@@ -1,15 +1,15 @@
 from typing import List, Union, Callable, Optional, Tuple
 import logging
 
-from cube.graph import IRGraph
-from cube.graph.segment import IRSegment
-from cube.graph.function.dimops import IRDimops
-from cube.graph.gener.rvd.intra import IntraAutoPlacer
-from cube.ir.operator import IRDataOperation, IRFwOperation
-from cube.ir.cten import IRCell
-from cube.ir.tensor import IRFullTensor
-from cube.graph.function.anchor import IRGraphAnchor
-from cube.utils import print_each_rank
+from nnscaler.graph import IRGraph
+from nnscaler.graph.segment import IRSegment
+from nnscaler.graph.function.dimops import IRDimops
+from nnscaler.graph.gener.rvd.intra import IntraAutoPlacer
+from nnscaler.ir.operator import IRDataOperation, IRFwOperation
+from nnscaler.ir.cten import IRCell
+from nnscaler.ir.tensor import IRFullTensor
+from nnscaler.graph.function.anchor import IRGraphAnchor
+from nnscaler.utils import print_each_rank
 
 import numpy as np
 

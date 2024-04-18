@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-import cube
+import nnscaler
 
 @dataclass
 class ModelArgs:
@@ -58,7 +58,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
 
 
 # TODO: fix annotation
-@cube.graph.parser.register('*, *, 38^ 64^ -> *, *')
+@nnscaler.graph.parser.register('*, *, 38^ 64^ -> *, *')
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
@@ -72,7 +72,7 @@ def apply_rotary_emb(
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
-@cube.graph.parser.register('N seqlen^, N seqlen^ H^ -> 1 1 seqlen^ seqlen^')
+@nnscaler.graph.parser.register('N seqlen^, N seqlen^ H^ -> 1 1 seqlen^ seqlen^')
 def create_mask(tokens: torch.Tensor, h: torch.Tensor, start_pos: int):
     seqlen = tokens.shape[1]
     mask = None
@@ -84,7 +84,7 @@ def create_mask(tokens: torch.Tensor, h: torch.Tensor, start_pos: int):
     return mask
 
 
-@cube.graph.parser.register('N seqlen *, 1 1 * -> N seqlen *')
+@nnscaler.graph.parser.register('N seqlen *, 1 1 * -> N seqlen *')
 def apply_mask(x: torch.Tensor, mask: torch.Tensor):
     return x if mask is None else x + mask
 

@@ -1,12 +1,12 @@
 from typing import List
 
-from cube.graph import IRGraph
-from cube.ir.cten import IRCell
-from cube.graph.function.anchor import IRGraphAnchor
-from cube.graph.segment import IRSegment
-from cube.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
-from cube.graph.schedule.schednf1b import IRScheduleNF1B
-from cube.graph.schedule.sched1f1b import IRSchedule1F1B
+from nnscaler.graph import IRGraph
+from nnscaler.ir.cten import IRCell
+from nnscaler.graph.function.anchor import IRGraphAnchor
+from nnscaler.graph.segment import IRSegment
+from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
+from nnscaler.graph.schedule.schednf1b import IRScheduleNF1B
+from nnscaler.graph.schedule.sched1f1b import IRSchedule1F1B
 
 import more_itertools
 import numpy as np

@@ -3,7 +3,7 @@ import tempfile
 import torch
 import pytest
 
-from cube.parallel import parallelize, ComputeConfig
+from nnscaler.parallel import parallelize, ComputeConfig
 
 from .common import PASData, init_distributed
 from ..launch_torchrun import launch_torchrun

@@ -1,9 +1,9 @@
 import pytest
-from cube.codegen.emit import CodeEmission
-from cube.ir.cten import IRObject
-from cube.codegen.emit import FuncEmission
-from cube.graph.function import Dropout
-from cube.ir.tensor import IRFullTensor
+from nnscaler.codegen.emit import CodeEmission
+from nnscaler.ir.cten import IRObject
+from nnscaler.codegen.emit import FuncEmission
+from nnscaler.graph.function import Dropout
+from nnscaler.ir.tensor import IRFullTensor
 
 
 def test_tensor_name():

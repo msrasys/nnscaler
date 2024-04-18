@@ -6,17 +6,17 @@ from examples.openfold.blocks.opm import OuterProducterMean
 from examples.openfold.blocks.utils import multi2ref
 
 import math
-import cube
+import nnscaler
 
 
-# @cube.graph.parser.register('N S^ R^ cm^, N R^ R^ cz^ -> N out^')
+# @nnscaler.graph.parser.register('N S^ R^ cm^, N R^ R^ cz^ -> N out^')
 # @torch.jit.ignore
 # def input_packing(msa: torch.Tensor, pair: torch.Tensor, out: int) -> torch.Tensor:
 #     buffer = torch.cat((torch.flatten(msa, start_dim=1), torch.flatten(pair, start_dim=1)))
 #     return buffer
 # 
 # 
-# @cube.graph.parser.register('N out^ -> N S^ R^ cm^, N R^ R^ cz^', name='input_unflatten')
+# @nnscaler.graph.parser.register('N out^ -> N S^ R^ cm^, N R^ R^ cz^', name='input_unflatten')
 # @torch.jit.ignore
 # def input_unpacking(buffer: torch.Tensor,
 #                     S: int, R: int, cm: int, cz: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -86,46 +86,46 @@ class Evoformer(torch.nn.Module):
 
     def forward(self, msa_repr, pair_repr):
 
-        cube.runtime.function.anchor('MSARow')
+        nnscaler.runtime.function.anchor('MSARow')
         pair_repr, dummy_pair_repr = multi2ref(pair_repr)
         residual = msa_repr
         msa_repr = self.row_norm_m(msa_repr)
         dummy_pair_repr = self.row_norm_z(dummy_pair_repr)
         msa_repr = residual + self.row_attn(msa_repr, dummy_pair_repr)
 
-        cube.runtime.function.anchor('MSACol')
+        nnscaler.runtime.function.anchor('MSACol')
         residual = msa_repr
         msa_repr = self.col_norm(msa_repr)
         msa_repr = residual + self.col_attn(msa_repr)
 
-        # cube.runtime.function.anchor('MSATrans')
+        # nnscaler.runtime.function.anchor('MSATrans')
         residual = msa_repr
         msa_repr = self.msa_transition_norm(msa_repr)
         msa_repr = self.msa_transition(msa_repr)
         msa_repr = residual + msa_repr
         succ_msa_repr, msa_repr = multi2ref(msa_repr)
 
-        cube.runtime.function.anchor('OPM')
+        nnscaler.runtime.function.anchor('OPM')
         msa_repr = self.outer_norm(msa_repr)
         pair_repr = pair_repr + self.outer_prod_mean(msa_repr)
 
-        cube.runtime.function.anchor('TMO')
+        nnscaler.runtime.function.anchor('TMO')
         pair_repr = self.tmo(pair_repr)
 
-        cube.runtime.function.anchor('TMI')
+        nnscaler.runtime.function.anchor('TMI')
         pair_repr = self.tmi(pair_repr)
 
-        cube.runtime.function.anchor('TANS')
+        nnscaler.runtime.function.anchor('TANS')
         residual = pair_repr
         pair_repr = self.tri_attn_node_start(pair_repr)
         pair_repr = residual + pair_repr
 
-        cube.runtime.function.anchor('TANE')
+        nnscaler.runtime.function.anchor('TANE')
         residual = pair_repr
         pair_repr = self.tri_attn_node_end(pair_repr)
         pair_repr = residual + pair_repr
 
-        cube.runtime.function.anchor('PairTrans')
+        nnscaler.runtime.function.anchor('PairTrans')
         residual = pair_repr
         pair_repr = self.pair_transition_norm(pair_repr)
         pair_repr = self.pair_transition(pair_repr)

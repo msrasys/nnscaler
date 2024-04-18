@@ -10,14 +10,14 @@ OMP_NUM_THREADS=4 torchrun \
 """
 
 from typing import Callable
-import cube
+import nnscaler
 import torch
 import time
 import argparse
-from cube.profiler.timer import CudaTimer, print_each_rank
+from nnscaler.profiler.timer import CudaTimer, print_each_rank
 
-from cube.runtime.adapter.collectives import all_reduce, all_gather, reduce_scatter, all_to_all
-from cube.runtime.device import DeviceGroup
+from nnscaler.runtime.adapter.collectives import all_reduce, all_gather, reduce_scatter, all_to_all
+from nnscaler.runtime.device import DeviceGroup
 
 
 def prim_allreduce(itensor, ranks, dim0=None, dim1=None):
@@ -100,7 +100,7 @@ def prim_bw(prim: Callable, bandwidth: Callable, ranks, size, warmup=100, profil
 
 if __name__ == '__main__':
 
-    cube.init()
+    nnscaler.init()
 
     parser = argparse.ArgumentParser(description='comm primitive')
     parser.add_argument('--prims', type=str, nargs='+', action='append', 

@@ -1,9 +1,9 @@
 from typing import List
 
 from numpy import TooHardError
-from cube.graph import IRGraph
-from cube.ir.operator import IRDataOperation, IRFwOperation, IRBpOperation
-from cube.graph.function.anchor import IRGraphAnchor
+from nnscaler.graph import IRGraph
+from nnscaler.ir.operator import IRDataOperation, IRFwOperation, IRBpOperation
+from nnscaler.graph.function.anchor import IRGraphAnchor
 
 
 def _replica(graph: IRGraph, node: IRFwOperation, devs: List[int]):

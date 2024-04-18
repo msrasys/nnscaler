@@ -1,8 +1,8 @@
 import torch
-import cube
+import nnscaler
 
 
-@cube.graph.parser.register('L^ N E^, (h+ d^ 3) E^, (h+ d^ 3), E^ (h+ d^) -> L^ N E^', name='self_attention')
+@nnscaler.graph.parser.register('L^ N E^, (h+ d^ 3) E^, (h+ d^ 3), E^ (h+ d^) -> L^ N E^', name='self_attention')
 def self_attention(query: torch.Tensor, 
                    qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
                    out_proj: torch.Tensor,
@@ -56,7 +56,7 @@ def self_attention(query: torch.Tensor,
     return output
 
 
-@cube.graph.parser.register('L^ N E^, L^ N E^, (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), E^ (h+ d) -> L^ N E^', name='cross_attention')
+@nnscaler.graph.parser.register('L^ N E^, L^ N E^, (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), E^ (h+ d) -> L^ N E^', name='cross_attention')
 def cross_attention(query: torch.Tensor, key: torch.Tensor,
                     q_proj: torch.Tensor, q_bias: torch.Tensor,
                     k_proj: torch.Tensor, k_bias: torch.Tensor,

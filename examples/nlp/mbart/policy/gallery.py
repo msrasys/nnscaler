@@ -1,11 +1,11 @@
 from typing import List
 
-from cube.graph import IRGraph
-from cube.ir.operator import IRFwOperation, IRDataOperation
-from cube.graph.function.anchor import IRGraphAnchor
-from cube.graph.schedule.predefined import PredefinedSched
-from cube.graph.segment import IRSegment
-from cube.ir.cten import IRCell
+from nnscaler.graph import IRGraph
+from nnscaler.ir.operator import IRFwOperation, IRDataOperation
+from nnscaler.graph.function.anchor import IRGraphAnchor
+from nnscaler.graph.schedule.predefined import PredefinedSched
+from nnscaler.graph.segment import IRSegment
+from nnscaler.ir.cten import IRCell
 
 from examples.utils import create_mesh, tensor_parallelism, replica
 

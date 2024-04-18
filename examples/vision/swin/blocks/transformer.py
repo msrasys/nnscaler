@@ -5,10 +5,10 @@ import torch.nn as nn
 from examples.vision.swin.blocks.attention import WindowAttention
 from examples.vision.swin.blocks.mlp import Mlp
 
-import cube
+import nnscaler
 
 
-@cube.graph.parser.register('* -> *')
+@nnscaler.graph.parser.register('* -> *')
 def drop_path(x: torch.Tensor, drop_prob: float, training: bool):
     if drop_prob <= 0. or not training:
         return x
@@ -20,7 +20,7 @@ def drop_path(x: torch.Tensor, drop_prob: float, training: bool):
     return output
 
 
-@cube.graph.parser.register('B (nh ws) (nw ws) C -> (B nh nw) ws ws C')
+@nnscaler.graph.parser.register('B (nh ws) (nw ws) C -> (B nh nw) ws ws C')
 def window_partition(x: torch.Tensor, ws: int):
     """
     Args:
@@ -36,7 +36,7 @@ def window_partition(x: torch.Tensor, ws: int):
     return windows
 
 
-@cube.graph.parser.register('(B nh nw) ws ws C -> B (nh ws) (nw ws) C')
+@nnscaler.graph.parser.register('(B nh nw) ws ws C -> B (nh ws) (nw ws) C')
 def window_reverse(windows: torch.Tensor, ws: int, nh: int, nw: int):
     """
     Args:

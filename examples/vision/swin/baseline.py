@@ -13,10 +13,10 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 
-from cube.profiler.memory import memory_summary, model_summary
-from cube.profiler.timer import CudaTimer, print_each_rank
+from nnscaler.profiler.memory import memory_summary, model_summary
+from nnscaler.profiler.timer import CudaTimer, print_each_rank
 
-import cube
+import nnscaler
 
 
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
@@ -628,7 +628,7 @@ class SwinTransformer(nn.Module):
         return flops
 
 
-class ImageDataLoader(cube.runtime.syndata.CubeDataLoader):
+class ImageDataLoader(nnscaler.runtime.syndata.CubeDataLoader):
 
     def __init__(self, batch_size: int, img_size: int, num_classes: int):
 
@@ -769,5 +769,5 @@ def train():
 
 if __name__ == '__main__':
 
-    cube.init()
+    nnscaler.init()
     train()

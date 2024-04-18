@@ -10,7 +10,7 @@ from examples.openfold.blocks.evoformer import Evoformer
 
 from dataclasses import dataclass
 
-import cube
+import nnscaler
 
 
 @dataclass
@@ -143,10 +143,10 @@ class AlphaFold(nn.Module):
         """
         msa = self.msa_norm(msa)
         pair = self.pair_norm(pair)
-        # cube.runtime.function.anchor('PackingRegion')
+        # nnscaler.runtime.function.anchor('PackingRegion')
         # x = input_packing(msa, pair, self.fout)
         for evoformer in self.evoformers:
-            cube.runtime.function.anchor('Evoformer Start')
+            nnscaler.runtime.function.anchor('Evoformer Start')
             msa, pair = evoformer(msa, pair)
             # x = evoformer(x)
         # msa, pair = input_unpacking(x, self.s, self.r, self.cm, self.cz)

@@ -18,7 +18,7 @@ The above restrictions are necessary for the pipeline parallelism to work. Of co
 
 ```python
 import torch
-from cube.parallel import parallelize, ComputeConfig, build_optimizer
+from nnscaler.parallel import parallelize, ComputeConfig, build_optimizer
 
 class LLM(torch.nn.Module):
     def __init__(self, ...):
@@ -48,7 +48,7 @@ In this case, for non-paralle modules, they are replicated inside unit, and run 
 
 ```python
 import torch
-from cube.parallel import parallelize, ComputeConfig, build_optimizer
+from nnscaler.parallel import parallelize, ComputeConfig, build_optimizer
 
 class HeavyModule(torch.nn.Module):
     def __init__(self, ...):
@@ -414,7 +414,7 @@ the generated code in outdir will be removed EVEN IF the code generation fails i
 After the module is converted, you can use it to create module object by calling it like a module class.
 The module class is defined like:
 ```python
-class GenModule(cube.runtime.module.ParallelModule):
+class GenModule(nnscaler.runtime.module.ParallelModule):
     def __init__(self, init_params=True):
         super().__init__()
         ...

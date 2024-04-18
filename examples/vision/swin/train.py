@@ -12,10 +12,10 @@ from functools import partial
 from examples.vision.swin.blocks.attention import init_relative_position_index
 from examples.vision.swin.model import Config, SwinTransformer, dummy_data
 
-import cube
-from cube.profiler.timer import CudaTimer, print_each_rank
-from cube.profiler.memory import memory_summary
-from cube.runtime.utils import microbatches
+import nnscaler
+from nnscaler.profiler.timer import CudaTimer, print_each_rank
+from nnscaler.profiler.memory import memory_summary
+from nnscaler.runtime.utils import microbatches
 
 import examples.vision.swin.policy.gallery as gallery
 from examples.utils import get_policy
@@ -35,7 +35,7 @@ parser.add_argument('--gbs', type=int, default=4, help='global batch size')
 parser.add_argument('--mbs', type=int, default=4, help='micro batch size')
 
 args = parser.parse_args()
-cube.init()
+nnscaler.init()
 
 
 # get policy
@@ -62,12 +62,12 @@ def train():
     gen_data = partial(dummy_data, args.mbs, torch.float16, cfg)
     dataloader = microbatches((gen_data(),))
 
-    @cube.compile(model, dataloader, PAS=policy, load_content=load_content)
+    @nnscaler.compile(model, dataloader, PAS=policy, load_content=load_content)
     def train_iter(model, dataloader):
         imgs = next(dataloader)
         loss = model(imgs)
         loss.backward()
-    model = cube.utils.load_model()
+    model = nnscaler.utils.load_model()
 
     if not load_content:
         for name, buffer in model.named_buffers():

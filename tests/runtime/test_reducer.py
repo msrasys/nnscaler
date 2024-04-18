@@ -5,10 +5,10 @@ import torch
 import logging
 from functools import partial
 
-import cube
-from cube.graph import IRGraph
-from cube.ir.operator import IRFwOperation
-from cube.flags import CompileFlag
+import nnscaler
+from nnscaler.graph import IRGraph
+from nnscaler.ir.operator import IRFwOperation
+from nnscaler.flags import CompileFlag
 from ..launch_torchrun import torchrun
 from ..utils import init_parameter, assert_parity
 
@@ -91,13 +91,13 @@ def reducer(use_zero: bool, async_reducer: bool):
     
     x = get_dummy_data()
 
-    @cube.compile(model, x, PAS=policy)
+    @nnscaler.compile(model, x, PAS=policy)
     def train_iter(model, x):
         loss = model(x)
         loss.backward()
         return loss
     
-    model = cube.load_model()
+    model = nnscaler.load_model()
     optimizer = torch.optim.Adam(model.parameters_for_optimizer(), lr=0.01)
     
     losses = []
@@ -118,7 +118,7 @@ def reducer(use_zero: bool, async_reducer: bool):
 
 
 def reducer_test():
-    cube.init()
+    nnscaler.init()
     CompileFlag.disable_code_line_info = True  # speedup parse
     print('starting zero=True, async=True')
     assert_parity(baseline, partial(reducer, True, True))
