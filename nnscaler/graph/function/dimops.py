@@ -758,6 +758,18 @@ class IRDimops(IRFwOperation):
                     op_anno.set_output(idx, shape_anno)
             op_anno.reset_identifiers()
 
+        identifier_values: Dict[str, int] = dict()
+        for ashape, itensor in zip(op_anno.inputs(), inputs):
+            if not isinstance(itensor, IRTensor) or ashape.ignore:
+                continue
+            if ashape.ndims != len(itensor.shape):
+                return False
+            for adim, dimlen in zip(ashape.dims, itensor.shape):
+                if len(adim.identifiers) == 1:
+                    if adim.identifiers[0] in identifier_values and identifier_values[adim.identifiers[0]] != dimlen:
+                        raise RuntimeError(f'the exist identifier value {identifier_values[adim.identifiers[0]]} is not equal to the new value {dimlen}')
+                    identifier_values[adim.identifiers[0]] = dimlen
+
         # check dimension consistency
         for ashape, itensor in zip(op_anno.inputs(), inputs):
             if itensor is None:
@@ -778,9 +790,7 @@ class IRDimops(IRFwOperation):
                     for identifier in identifiers:
                         length = op_anno.getlen(identifier)
                         if length is None:
-                            if identifier not in kwargs:
-                                toinfer.append(identifier)
-                            else:
+                            if identifier in kwargs:
                                 if isinstance(kwargs[identifier], IRObject):
                                     _logger.warning(
                                         f"Function {signature}: Found identifier {identifier} in kwargs to be IRObject, "
@@ -794,6 +804,11 @@ class IRDimops(IRFwOperation):
                                         f"must be int or IRObject[value=int], but got {length}")
                                 ret = op_anno.setlen(identifier, length)
                                 accum *= length
+                            elif identifier in identifier_values:
+                                ret = op_anno.setlen(identifier, identifier_values[identifier])
+                                accum *= identifier_values[identifier]
+                            else:
+                                toinfer.append(identifier)
                         else:
                             accum *= length
                     if len(toinfer) == 0 and accum != dimlen:

@@ -55,3 +55,32 @@ def test_no_return_op():
     
     op = create_op(NoReturnOp, [(1024, 512), (512, 1024)])
     assert len(op.outputs()) == 1 and isinstance(op.output(0), IRObject) and (not isinstance(op.output(0), IRFullTensor))
+
+
+def test_inner_dimensions_infer():
+
+    def TestFunc(input, weight, signature='test_func'):
+        anno = 'a b, (b c) -> a (b c)'
+        return IRDimops(TestFunc, 'test_func', signature, [anno], [input, weight])
+
+    op = create_op(TestFunc, [(1024, 512), (2048,)])
+    partitionable(op, idx=0, dim=1, num=2)
+
+def test_anno_kwargs_infer():
+
+    def TestFunc(input, weight, number=128, signature='test_func'):
+        anno = '(a number), (b number) -> (a b)'
+        return IRDimops(TestFunc, 'test_func', signature, [anno], [input, weight], number=number)
+
+    op = create_op(TestFunc, [(1024,), (2048,)])
+    partitionable(op, idx=0, dim=0, num=2)
+
+
+def test_dynamic_shape_infer():
+    # TODO: please note that this test should be rewritten after we can fully support dynamic shape
+    def TestFunc(input, weight, bias, number=128, signature='test_func'):
+        anno = '(a number), (b number), (a b) -> 1'
+        return IRDimops(TestFunc, 'test_func', signature, [anno], [input, weight, bias], number=number)
+
+    op = create_op(TestFunc, [(1024,), (2048,), (128,)], number=IRObject(value=128))
+    partitionable(op, idx=0, dim=0, num=2)
