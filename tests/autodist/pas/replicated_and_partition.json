@@ -1,0 +1,87 @@
+{
+  "desc": {
+    "spmd_descs": [
+      {
+        "partition_descs": [
+          [
+            3,
+            [
+              [
+                [
+                  -1,
+                  -1
+                ],
+                2
+              ]
+            ]
+          ],
+          [
+            4,
+            [
+              [
+                [
+                  0,
+                  0
+                ],
+                2
+              ]
+            ]
+          ]
+        ],
+        "recompute_groups": [],
+        "mesh_desc": [
+          1,
+          2
+        ]
+      },
+      {
+        "partition_descs": [
+          [
+            5,
+            [
+              [
+                [
+                  0,
+                  0
+                ],
+                2
+              ]
+            ]
+          ],
+          [
+            6,
+            [
+              [
+                [
+                  0,
+                  0
+                ],
+                2
+              ]
+            ]
+          ]
+        ],
+        "recompute_groups": [],
+        "mesh_desc": [
+          1,
+          2
+        ]
+      }
+    ],
+    "recompute_groups": [],
+    "mesh_desc": [
+      1,
+      4
+    ]
+  },
+  "e2e_time": 0.0,
+  "stage_mems": [
+    0.0
+  ],
+  "stage_all_times": [
+    0.0
+  ],
+  "stage_comp_times": [
+    0.0
+  ]
+}

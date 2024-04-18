@@ -1,5 +1,7 @@
-numpy>=1.23.0
+dill
 matplotlib
 more-itertools
-dill
+numpy>=1.23.0
+pulp
+pyyaml
 torch>=2.0

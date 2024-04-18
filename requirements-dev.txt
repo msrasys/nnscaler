@@ -1,8 +1,10 @@
-pytest
-mock
-pytest-mock
-tox
 coverage
+mock
+pre-commit
+pytest
 pytest-cov
+pytest-mock
 tabulate
+tox
 tox-conda
+yapf
