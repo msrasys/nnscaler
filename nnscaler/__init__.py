@@ -13,6 +13,8 @@ from nnscaler.utils import accum_mode
 
 from nnscaler.flags import CompileFlag
 
+from .version import __version__
+
 
 def _check_torch_version():
     import torch
