@@ -1,7 +1,9 @@
+cppimport
 dill
 matplotlib
 more-itertools
 numpy>=1.23.0
 pulp
+pybind11
 pyyaml
 torch>=2.0

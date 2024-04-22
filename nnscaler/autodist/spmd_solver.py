@@ -1,12 +1,6 @@
 from .model_graph import ModelGraph
 from .cube_operator import CubeOperator
 from .descs import *
-from .util import (
-    int2byte,
-    int4byte,
-    double2byte,
-    double4byte,
-)
 from .cost_database import CostDatabase
 from .autodist_config import AutoDistConfig
 from .op_partition import OpPartition, generate_partitions
@@ -997,113 +991,33 @@ class SPMDSolver:
 
     def do_dp(self, intervals: List[Tuple[int, int]],
               topk: int) -> List[SPMDSearchOutput]:
+        import cppimport.import_hook
+        import nnscaler.autodist.dp_solver as dp_solver
 
-        idx_map = {}
-        for idx, item in enumerate(intervals):
-            idx_map[item] = idx
-
-        ret = [None] * len(intervals)
-
-        in_fname = f'./cpp_in_{self.device_num}_{self.stage_num}.bin'
-        out_fname = f'./cpp_out_{self.device_num}_{self.stage_num}.bin'
-        """
-        cpp_in format
-        is_train node_num mem_bound mem_div topk interval_num
-        interval_num tuples of (start_idx, end_idx)
-        node_num groups of
-        - id
-        - father_id
-        - cut_lens, [cut_ids]
-        - partition nums, [p_father, comp_time + weight_update_time, train_mem, buffer_mem, act_mem, opt_mem]
-        - producer_num, [producer_id, comm time mat]
-        """
-        # TODO: hardcode value which should change according to device memory
+        mode = 0 if self.is_train else 1
         mem_div = 64
-        with open(in_fname, 'wb') as f:
-            # header
-            if self.is_train:
-                f.write(int2byte(0))
-            else:
-                f.write(int2byte(1))
-            f.write(
-                int2byte(self.graph.op_num) +
-                int2byte(int(self.mem_bound) // mem_div) + int2byte(mem_div))
-            f.write(int2byte(topk) + int2byte(len(intervals)))
-            # intervals
-            for u, v in intervals:
-                f.write(int2byte(u) + int2byte(v))
-            # partition info
-            for idx in range(self.graph.op_num):
-                f.write(int2byte(idx))
-                f.write(int2byte(self.father_ids[idx]))
-
-                f.write(int2byte(len(self.cut_ops[idx])))
-                for cut_op in self.cut_ops[idx]:
-                    f.write(int2byte(cut_op))
-
-                f.write(int2byte(self.get_op_partition_count(idx)))
-                for i, partition in enumerate(self._op_partitions[idx]):
-                    p_cost_desc = self.partition_info[idx][i]
-                    f.write(
-                        double2byte(p_cost_desc.comp_time +
-                                    p_cost_desc.weight_update_time))
-
-                    f.write(
-                        int2byte(p_cost_desc.mem // mem_div) +
-                        int2byte(p_cost_desc.transient_mem // mem_div) +
-                        int2byte(p_cost_desc.activation_mem // mem_div) +
-                        int2byte(p_cost_desc.opt_transient_mem // mem_div) +
-                        int2byte(self.p_fathers[idx][i]))
-
-                f.write(int2byte(len(self.producers[idx])))
-                for p_i, producer in enumerate(self.producers[idx]):
-                    f.write(int2byte(producer))
-                    for i, tgt_p in enumerate(self._op_partitions[idx]):
-                        comm_time = self.partition_info[idx][i].comm_time
-                        for j, src_p in enumerate(
-                                self._op_partitions[producer]):
-                            f.write(double2byte(comm_time[p_i][j]))
-
-        os.system(
-            f'{str(Path.home())}/.autodist/solver {in_fname} {out_fname} {int(self.autodist_config.verbose)}'
-        )
-        """
-        cpp_out file format
-        interval_num parts, each part's format is
-        start_idx end_idx path_num path_len
-        each path is (opt_time, inner_time, opt_mem, a sequence of path_len (op_idx, partition_idx))
-        """
-        with open(out_fname, 'rb') as f:
-            data = f.read()
-            offset = 0
-            for _ in range(len(intervals)):
-                descs = []
-                start_level = int4byte(data[offset:offset + 4])
-                end_level = int4byte(data[offset + 4:offset + 8])
-                num = int4byte(data[offset + 8:offset + 12])
-                path_len = int4byte(data[offset + 12:offset + 16])
-                offset += 16
-                for i in range(num):
-                    opt_time = double4byte(data[offset:offset + 8])
-                    offset += 8
-                    inner_time = double4byte(data[offset:offset + 8])
-                    offset += 8
-                    opt_mem = int4byte(data[offset:offset + 4])
-                    offset += 4
-                    plans = []
-                    for j in range(path_len):
-                        cur_op_idx = int4byte(data[offset:offset + 4])
-                        offset += 4
-                        cur_p_idx = int4byte(data[offset:offset + 4])
-                        offset += 4
-                        plans.append((cur_op_idx, cur_p_idx))
-                    desc = self.partition_path2desc(plans)
-                    descs.append(
-                        SPMDSearchOutput(desc,
-                                         opt_mem * mem_div / 1024 / 1024 / 1024,
-                                         opt_time, inner_time))
-                ret[idx_map[(start_level, end_level)]] = descs
-        os.system(f'rm {in_fname} {out_fname}')
+        mem_bound = int(self.mem_bound) // mem_div
+        solver = dp_solver.DPSolver(self.autodist_config.verbose, mode, mem_bound, mem_div, topk)
+        for start, end in intervals:
+            solver.add_interval(start, end)
+        for idx in range(self.graph.op_num):
+            solver.add_node(idx, self.father_ids[idx], self.cut_ops[idx],
+            self.producers[idx], self.get_op_partition_count(idx))
+            for i, partition in enumerate(self._op_partitions[idx]):
+                p_cost_desc = self.partition_info[idx][i]
+                solver.add_partition(idx, i, p_cost_desc.comp_time + p_cost_desc.weight_update_time,
+                p_cost_desc.mem // mem_div, p_cost_desc.transient_mem // mem_div,
+                p_cost_desc.activation_mem // mem_div, p_cost_desc.opt_transient_mem // mem_div,
+                self.p_fathers[idx][i], p_cost_desc.comm_time)
+        solver.solve()
+        ret = []
+        for start, end in intervals:
+            cpp_results = solver.get_results(start, end)
+            descs = []
+            for result in cpp_results:
+                desc = self.partition_path2desc(result.path)
+                descs.append(SPMDSearchOutput(desc, result.memory * mem_div / 1024 / 1024 / 1024, result.all_time, result.inner_time))
+            ret.append(descs)
         return ret
 
     def solve(self, intervals: List[Tuple[int, int]],

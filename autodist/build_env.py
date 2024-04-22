@@ -44,13 +44,6 @@ def main():
                 default_path + f'/comm_back_{str(datetime.now().timestamp())}')
         shutil.copytree(code_path / 'autodist/profile_data/16xmi200/comm', default_path + '/comm')
 
-    # compile solver
-    solver_csrc = code_path / 'nnscaler/autodist/csrc/solver.cpp'
-    compile_command = f'g++ -std=c++11 {solver_csrc} -O3 -pthread -o solver'
-    compile_out = subprocess.check_output(compile_command,
-                                          shell=True,
-                                          text=True)
-    subprocess.check_output(f'mv solver {base_path}/', shell=True, text=True)
     print('> build env successfully')
 
 
