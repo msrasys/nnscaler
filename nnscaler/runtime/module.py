@@ -55,6 +55,16 @@ class CubeModule(torch.nn.Module):
         # please note there can be multiple entries with same tid
         self._fullmap : Dict[str, AttrMeta] = dict()
 
+    def get_non_persistent_buffers(self) -> Dict[str, torch.Tensor]:
+        """
+        Get non-persistent buffers in the module
+        """
+        non_persistent_buffers = {}
+        for name, buffer in self.named_buffers(recurse=False):
+            if name in self._non_persistent_buffers_set:
+                non_persistent_buffers[name] = buffer
+        return non_persistent_buffers
+
     @property
     def reducers(self):
         return self._reducers

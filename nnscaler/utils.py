@@ -58,6 +58,12 @@ def load_model(filename: Optional[str] = None, load_content: bool = True, fullmo
     filename = f'gencode{DeviceGroup().rank}.py' if filename is None else filename
     module = _load_module_attr(filename, Path(filename).stem)
     loaded_module: nnscaler.runtime.module.CubeModule = module.GenModel().cuda()
+    non_persistent_buffers = loaded_module.get_non_persistent_buffers()
+    if non_persistent_buffers:
+        names = [name for name, _ in non_persistent_buffers.items()]
+        _logger.warning(f'Detected non-persistent buffers: {names}, will load content, make sure fullmodel.pt.* are available and consistent.')
+        if not load_content:
+            load_content = True
     # load parameter content
     if load_content:
         _logger.info("loading parameter content...")
