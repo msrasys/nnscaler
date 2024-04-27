@@ -2,6 +2,7 @@ from pathlib import Path
 import argparse
 import logging
 from .descs import MeshDesc
+from .util import get_default_profile_path
 
 _logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class AutoDistConfig:
         - fp16 & bf16 training w/ memory efficient adam w/o inkernal cast: (2 + 2) (fp32 weight + fp32 gradient)
     - partition_constraints_path (`str`, *optional*, defaults to `''`):
         The path to the partition constraints file. Details can be found in docs/solver_interface/partition_constraints.md
-    - profile_dir (`str`, *optional*, defaults to `~/.autodist`):
+    - profile_dir (`str`, *optional*, defaults to `~/.nnscaler/autodist`):
         The directory to store the profiling results.
     - load_plan_path (`str`, *optional*, defaults to `''`):
         The path to the plan file to load. If specified, the plan will be loaded from the file instead of searching.
@@ -103,7 +104,7 @@ class AutoDistConfig:
                  opt_resident_coef=2,
                  opt_transient_coef=0,
                  partition_constraints_path='',
-                 profile_dir=str(Path.home()) + '/.autodist',
+                 profile_dir=get_default_profile_path(),
                  load_plan_path='',
                  save_plan_path='',
                  topk=20,
@@ -172,7 +173,9 @@ class AutoDistConfig:
         if self.pc_path:
             _validate_file_path(self.pc_path)
 
-        _validate_dir_path(self.profile_dir)
+        if not Path(self.profile_dir).exists():
+            _logger.info(f'create folder: {self.profile_dir}')
+            Path(self.profile_dir).mkdir(parents=True, exist_ok=True)
 
         if self.pipeline:
             if self.max_pipeline_bubble_ratio <= 0 or self.max_pipeline_bubble_ratio >= 1:

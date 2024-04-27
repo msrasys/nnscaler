@@ -29,12 +29,10 @@ __all__ = [
 
 
 def check_env(autodist_config: AutoDistConfig):
-    error_msg = ' does not exist, please run \'python autodist/build_env.py\' first'
-    autodist_dir = autodist_config.profile_dir + '/' + get_node_arch()
-    assert os.path.exists(autodist_dir), autodist_dir + error_msg
-    comm_path = autodist_dir + '/comm'
-    assert os.path.exists(comm_path), comm_path + error_msg
-
+    arch_dir = autodist_config.profile_dir / get_node_arch()
+    if not arch_dir.exists():
+        _logger.info(f'create folder: {arch_dir}')
+        arch_dir.mkdir(parents=True, exist_ok=True)
 
 def pre_estimate_mem(graph: ModelGraph):
     '''

@@ -3,6 +3,7 @@ from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 
 import struct
+from pathlib import Path
 from typing import List
 from collections import deque
 
@@ -22,6 +23,8 @@ def double2byte(val):
 def double4byte(val):
     return struct.unpack('d', val)[0]
 
+def get_default_profile_path():
+    return Path.home() / '.cache' / 'nnscaler' / 'autodist' / '1.0'
 
 def get_node_arch():
     import torch

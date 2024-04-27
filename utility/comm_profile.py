@@ -9,7 +9,7 @@ import nnscaler
 from nnscaler.runtime.adapter.collectives import all_gather, all_reduce, all_to_all, reduce_scatter
 from nnscaler.profiler import CudaTimer
 from nnscaler.runtime.device import DeviceGroup
-from nnscaler.autodist.util import get_node_arch
+from nnscaler.autodist.util import get_node_arch, get_default_profile_path
 
 
 class CommProfiler:
@@ -81,27 +81,28 @@ class CommProfiler:
                 primitive=primitive)
         return profile_info
 
+if __name__ == '__main__':
 
-parser = argparse.ArgumentParser(
-    description='Profile runtime communication cost')
-parser.add_argument('--comm_profile_dir',
-                    type=str,
-                    default=str(Path.home()) + '/.autodist/comm',
-                    help='autodist comm profile folder')
-args = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        description='Profile runtime communication cost')
+    parser.add_argument('--comm_profile_dir',
+                        type=str,
+                        default=get_default_profile_path() / get_node_arch() / 'comm',
+                        help='autodist comm profile folder')
+    args = parser.parse_args()
 
-nnscaler.init()
+    nnscaler.init()
 
-CudaTimer(enable=True, predefined=True)
-world_size = DeviceGroup().world_size
-comm_profiler = CommProfiler(nranks=world_size)
+    CudaTimer(enable=True, predefined=True)
+    world_size = DeviceGroup().world_size
+    comm_profiler = CommProfiler(nranks=world_size)
 
-profile_info = comm_profiler.profile()
+    profile_info = comm_profiler.profile()
 
-if torch.distributed.get_rank() == 0:
-    dir_path = args.comm_profile_dir
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
-    file_name = dir_path + '/' + f'intra_{world_size}.json'
-    with open(file_name, 'w') as f:
-        json.dump(profile_info, f, indent=2)
+    if torch.distributed.get_rank() == 0:
+        dir_path = Path(args.comm_profile_dir)
+        if not dir_path.exists():
+            dir_path.mkdir(parents=True, exist_ok=True)
+        file_name = dir_path / f'intra_{world_size}.json'
+        with open(file_name, 'w') as f:
+            json.dump(profile_info, f, indent=2)

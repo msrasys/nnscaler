@@ -52,6 +52,8 @@ def _piecewise_estimator(xs: List[float], ys: List[float], x: float) -> float:
                                                                 xs[i])
     raise RuntimeError(f'x={x}, xs={xs}, ys={ys}, should not reach here')
 
+import nnscaler
+_DEFAULT_COMM_DATA_PATH = Path(nnscaler.__file__).parent.parent / 'profile_data/mi200/comm'
 
 class CostDatabase:
 
@@ -70,9 +72,8 @@ class CostDatabase:
 
         comm_dir = self.profile_dir / 'comm'
         if not comm_dir.exists():
-            raise RuntimeError(
-                f'{comm_dir} does not exist, please run \'python autodist/build_env.py\' first'
-            )
+            _logger.warning(f'Communication profile data not found, using default data at {_DEFAULT_COMM_DATA_PATH}')
+            comm_dir = Path(_DEFAULT_COMM_DATA_PATH)
         for fname in listdir(comm_dir):
             with open(comm_dir / fname, 'r') as f:
                 self.comm_info[fname] = json.load(f)

@@ -433,7 +433,7 @@ class ProfileDataBase:
             json.dump(self._data, f)
 
     def dump_op(self, file: str, signature, override=False):
-        assert signature in self._data.keys(), f'this node not be profiled'
+        assert signature in self._data.keys(), f'{signature} has not been profiled'
         file_n = os.path.join(file, signature +'.json')
         with open(file_n, 'w') as f:
             to_dump = {key: asdict(value) for key, value in self._data[signature].items()}
