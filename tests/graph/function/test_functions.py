@@ -615,3 +615,67 @@ def test_Flatten():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c^ d^ -> a (b^ c^ d^)'
     op = F.Flatten(IRTensor([2,3,4,5]), end_dim = 2)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ d -> (a^ b^ c^) d'
+
+
+def test_Gather():
+    op = F.Gather(IRTensor([2, 5, 3]), 2, IRTensor([2, 5, 1]))
+    expected_annotation = 'a b c^, a b f^ -> a b f^'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
+    op = F.Gather(IRTensor([2, 5, 3]), 2, IRTensor([2, 5, 3]))
+    expected_annotation = 'a b c^, a b c^ -> a b c^'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
+    op = F.Gather(IRTensor([2, 5, 3]), 2, IRTensor([2, 4, 3]))
+    expected_annotation = 'a b^ c^, a e^ c^ -> a e^ c^'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
+    op = F.Gather(IRTensor([2, 5, 3]), 2, IRTensor([1, 3, 1]))
+    expected_annotation = 'a^ b^ c^, d^ e^ f^ -> d^ e^ f^'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
+    op = F.Gather(IRTensor([2, 5, 3]), 1, IRTensor([2, 2, 3]))
+    expected_annotation = 'a b^ c, a e^ c -> a e^ c'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
+    op = F.Gather(IRTensor([2, 5, 3]), 0, IRTensor([1, 5, 3]))
+    expected_annotation = 'a^ b c, d^ b c -> d^ b c'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
+    op = F.Gather(IRTensor([2, 3]), 1, IRTensor([2, 1]))
+    expected_annotation = 'a b^, a d^ -> a d^'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
+    op = F.Gather(IRTensor([2, 3]), 1, IRTensor([1, 1]))
+    expected_annotation = 'a^ b^, c^ d^ -> c^ d^'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
+
+
+def test_Ceil():
+    input_tensor = IRTensor([2, 3])
+    op = F.Ceil(input_tensor)
+    expected_annotation = '* -> *'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Ceil."
+    input_tensor = IRTensor([2, 3, 4])
+    op = F.Ceil(input_tensor)
+    expected_annotation = '* -> *'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Ceil."
+
+
+def test_Sign():
+    input_tensor = IRTensor([2, 3])
+    op = F.Sign(input_tensor)
+    expected_annotation = '* -> *'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Sign."
+    input_tensor = IRTensor([2, 3, 4])
+    op = F.Sign(input_tensor)
+    expected_annotation = '* -> *'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Sign."
+
+
+def test_Unfold():
+    input_tensor = IRTensor([2, 3, 32, 32])
+    kernel_size = (3, 3)
+    stride = (2, 2)
+    padding = (1, 1)
+    dilation = (1, 1)
+    op = F.Unfold(input_tensor, kernel_size=kernel_size, dilation=dilation, padding=padding, stride=stride)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'N C 32 32 -> N (C 9) 256'
+
+
+def test_Sigmoid():
+    op = F.Sigmoid(IRTensor([2, 3, 4]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *'

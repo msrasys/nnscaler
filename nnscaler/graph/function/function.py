@@ -2517,3 +2517,85 @@ def Conv1D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, 
             annos = [f'n (g {iC}) {iW}, (g {oC//groups}) {iC} {kW}, (g {oC//groups}) -> n (g {oC//groups}) {oW}']
     return IRDimops(Conv1D, 'conv1d', signature, annos, [input, weight, bias] if bias is not None else [input, weight], rules,
                     stride=stride, padding=padding, dilation=dilation, groups=ori_groups)
+
+
+def Gather(input: IRTensor, dim, index: IRTensor, sparse_grad=False, out=None, signature=None):
+    """
+    torch.gather(input, dim, index, *, sparse_grad=False, out=None) -> Tensor
+    """
+    if not (0 <= dim < len(input.shape)):
+        raise ValueError(f"Dimension {dim} is out of bounds for input with {len(input.shape)} dimensions.")
+    if len(input.shape) != len(index.shape):
+        raise ValueError("The dimensions of 'input' and 'index' must be the same.")
+    for i, (dim_input, dim_index) in enumerate(zip(input.shape, index.shape)):
+        if i != dim and dim_index > dim_input:
+            raise ValueError(f"Index size {dim_index} at dimension {i} exceeds input size {dim_input} at the same dimension.")
+    gener = iter(string.ascii_lowercase)
+    input_anno = ShapeAnno.create_shape_str(input.shape, iterator=gener)
+    index_anno = ShapeAnno.create_shape_str(index.shape, iterator=gener)
+    for i, (dim_input, dim_index) in enumerate(zip(input.shape, index.shape)):
+        if dim_input != dim_index:
+            input_anno[i] += '^'
+            index_anno[i] += '^'
+        elif i == dim:
+            index_anno[i] = input_anno[i]
+            input_anno[i] += '^'
+            index_anno[i] += '^'
+        else:
+            # TODO: Currently, this only works in static cases. 
+            # When dynamic shape is enabled, this partition may be incorrect.
+            # We keep the partition here for now, and consider reporting errors that cannot be partitioned at run time in future.
+            index_anno[i] = input_anno[i]
+    anno = OpAnno.create_op_str([input_anno, index_anno], [index_anno])
+    return IRDimops(Gather, 'gather', signature, [anno], [input, index], dim=dim)
+
+
+def Ceil(input: IRTensor, out=None, signature=None):
+    """
+    # torch.ceil(input, *, out=None) → Tensor
+    """
+    if out is not None:
+        raise ValueError("Expected 'out' to be None")
+    annos = ['* -> *']
+    return IRDimops(Ceil, 'ceil', signature, annos, [input])
+
+
+def Sign(input: IRTensor, out=None, signature=None):
+    """
+    torch.sign(input, *, out=None) → Tensor
+    """
+    if out is not None:
+        raise ValueError("Expected 'out' to be None")
+    annos = ['* -> *']
+    return IRDimops(Sign, 'sign', signature, annos, [input])
+
+
+def Unfold(input: IRTensor, kernel_size, dilation=1, padding=0, stride=1, signature=None):
+    """
+    Extracts sliding local blocks from a batched input tensor.
+    torch.nn.functional.unfold(input, kernel_size, dilation=1, padding=0, stride=1)
+    """
+    if not isinstance(input, IRTensor) or len(input.shape) != 4:
+        raise ValueError("Input must be an IRTensor with 4 dimensions, [N, C, H, W].")
+    
+    kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+    dilation = (dilation, dilation) if isinstance(dilation, int) else dilation
+    padding = (padding, padding) if isinstance(padding, int) else padding
+    stride = (stride, stride) if isinstance(stride, int) else stride
+    N, C, H, W = input.shape
+    H_out = (H + 2 * padding[0] - dilation[0] * (kernel_size[0] - 1) - 1) // stride[0] + 1
+    W_out = (W + 2 * padding[1] - dilation[1] * (kernel_size[1] - 1) - 1) // stride[1] + 1
+    L = H_out * W_out
+    kernel_area = kernel_size[0] * kernel_size[1]
+    anno = f'N C {H} {W} -> N (C {kernel_area}) {L}'
+    return IRDimops(Unfold, 'unfold', signature, [anno], [input], kernel_size=kernel_size, dilation=dilation, padding=padding, stride=stride)
+
+
+def Sigmoid(input, *, out=None, signature=None):
+    '''
+    torch.sigmoid(input, *, out=None) → Tensor
+    '''
+    if out is not None:
+        raise ValueError("Expected 'out' to be None")
+    annos = ['* -> *']
+    return IRDimops(Sigmoid, 'sigmoid', signature, annos, [input])
