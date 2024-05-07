@@ -42,24 +42,25 @@ def test_shared_param_pipeline():
             model = Model(hidden_dim)
             model.train()
 
+            program = Program()
+            program.clear()
             IDGenerator().clear()
-            if idx > 0:
-                Program().clear()
-            smodel = nnscaler.SemanticModel(model, attr_savedir=tempdir)
-            smodel.dummy_input = {'x': torch.randn(bsz, hidden_dim)}
-            smodel.dynamic_shape = False
 
             dataloader = SemanticDataLoader(
                 microbatches([{
                     'x': torch.randn(bsz, hidden_dim)
                 }]))
-            Program().set_input([dataloader.irobj])
+
+            smodel = nnscaler.SemanticModel(model, attr_savedir=tempdir)
+            smodel.dummy_input = {'x': torch.randn(bsz, hidden_dim)}
+            smodel.dynamic_shape = False
+            program.set_input([dataloader.irobj])
             ir_dummy_input = next(dataloader)
             outputs = smodel(ir_dummy_input)
             outputs.backward()
-            Program().set_output([outputs])
-            Program().finalize()
-            ir_graph = Program().get_graph()
+            program.set_output([outputs])
+            program.finalize()
+            ir_graph = program.get_graph()
 
             print(ir_graph.nodes())
             plan_path = Path(os.path.dirname(__file__)) / cfg_fname

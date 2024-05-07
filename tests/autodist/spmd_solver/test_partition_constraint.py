@@ -75,7 +75,7 @@ def test_partition_constraint():
 
         pc_path = Path(os.path.dirname(
             os.path.realpath(__file__))) / 'test_pc.yaml'
-        cfg = AutoDistConfig(partition_constraints_path=pc_path, mesh_col=2)
+        cfg = AutoDistConfig(partition_constraints_path=pc_path, mesh_col=2, re_profile=True)
         model_graph = ModelGraph(ir_graph, cfg)
 
         spmd_solver = SPMDSolver(

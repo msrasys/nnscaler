@@ -194,6 +194,8 @@ def parallelize_graph(graph: IRGraph,
         for spmd_desc in pp_desc.spmd_descs:
             stage = []
             for cid in spmd_desc.partition_descs:
+                if cid not in cid2node:
+                    raise RuntimeError(f'node {cid} not found in {cid2node}, make sure the plan is correct')
                 stage.append(cid2node[cid])
             stages.append(stage)
         graph.staging([s[0] for s in stages])
