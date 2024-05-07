@@ -3,7 +3,7 @@ import torch
 import torch.utils.checkpoint as ckpt
 
 
-@nnscaler.graph.parser.register('*, *, * -> *, *, *, *', name='calc_qkvg')
+@nnscaler.register_op('*, *, * -> *, *, *, *', name='calc_qkvg')
 def calc_qkvg(x: torch.Tensor, qkv_proj: torch.Tensor, gate_proj: torch.Tensor,
               bs: int, s: int, r: int, head: int, c: int):
     gate = torch.sigmoid(torch.matmul(x, gate_proj))
@@ -23,7 +23,7 @@ used as column-wise gated self-attention
 """
 
 
-@nnscaler.graph.parser.register('N S R^ M^, M^ E^, M^ F^, E^ M^ -> N S R^ M^',
+@nnscaler.register_op('N S R^ M^, M^ E^, M^ F^, E^ M^ -> N S R^ M^',
                             name='MSAAttention')
 @torch.jit.ignore
 def MSAAttention(x: torch.Tensor, gate_proj: torch.Tensor,
@@ -91,7 +91,7 @@ def MSAAttention(x: torch.Tensor, gate_proj: torch.Tensor,
     return out
 
 
-@nnscaler.graph.parser.register('N S R^ M^, M^ E^, M^ F^, E^ M^, N 1^ 8^ R^ R^ -> N S R^ M^',
+@nnscaler.register_op('N S R^ M^, M^ E^, M^ F^, E^ M^, N 1^ 8^ R^ R^ -> N S R^ M^',
                             name='MSAAttentionWithBias')
 @torch.jit.ignore
 def MSAAttentionWithBias(x: torch.Tensor, gate_proj: torch.Tensor,
@@ -177,7 +177,7 @@ def MSAAttentionWithBias(x: torch.Tensor, gate_proj: torch.Tensor,
 
 
 # note: code not reused constrained by cube's interface
-@nnscaler.graph.parser.register('N S R^ M^, N R^ R^ Z^, M^ E^, M^ F^, E^ M^, Z^ H^ -> N S R^ M^',
+@nnscaler.register_op('N S R^ M^, N R^ R^ Z^, M^ E^, M^ F^, E^ M^, Z^ H^ -> N S R^ M^',
                             name='MSARowAttentionWithPairBias')
 def MSARowAttentionWithPairBias(msa_repr: torch.Tensor,
                                 pair_repr: torch.Tensor,
@@ -196,7 +196,7 @@ def MSARowAttentionWithPairBias(msa_repr: torch.Tensor,
                                 head, c, scale, chunk_size, is_train)
 
 
-@nnscaler.graph.parser.register('N S^ R M^, M^ E^, M^ F^, E^ M^ -> N S^ R M^',
+@nnscaler.register_op('N S^ R M^, M^ E^, M^ F^, E^ M^ -> N S^ R M^',
                             name='MSAColAttention')
 def MSAColAttention(msa_repr: torch.Tensor, gate_proj: torch.Tensor,
                     qkv_proj: torch.Tensor, out_proj: torch.Tensor, head: int,
@@ -207,7 +207,7 @@ def MSAColAttention(msa_repr: torch.Tensor, gate_proj: torch.Tensor,
                         is_train).permute(0, 2, 1, 3)
 
 
-@nnscaler.graph.parser.register('N S^ R^ M^, M^ M^, M^ E^, M^ E^, M^ M^, M^ M^ -> N S^ R^ M^',
+@nnscaler.register_op('N S^ R^ M^, M^ M^, M^ E^, M^ E^, M^ M^, M^ M^ -> N S^ R^ M^',
                             name='MSAColGlobalAttention')
 def MSAColGlobalAttention(msa_repr: torch.Tensor, q_proj: torch.Tensor,
                           k_proj: torch.Tensor, v_proj: torch.Tensor,
@@ -250,7 +250,7 @@ def MSAColGlobalAttention(msa_repr: torch.Tensor, q_proj: torch.Tensor,
 """
 
 
-@nnscaler.graph.parser.register('N S R M^, M^ E^, E^ M^ -> N S R M^',
+@nnscaler.register_op('N S R M^, M^ E^, E^ M^ -> N S R M^',
                             name='MSATransition')
 def MSATransition(msa_repr: torch.Tensor, proj1: torch.Tensor,
                   proj2: torch.Tensor):
@@ -258,12 +258,12 @@ def MSATransition(msa_repr: torch.Tensor, proj1: torch.Tensor,
         torch.nn.functional.relu(torch.matmul(msa_repr, proj1)), proj2)
 
 
-@nnscaler.graph.parser.register('N S R M^, M^ C^ -> N S R C^', name='OPMLeftProj')
+@nnscaler.register_op('N S R M^, M^ C^ -> N S R C^', name='OPMLeftProj')
 def OPMLeftProj(msa_repr: torch.Tensor, proj: torch.Tensor):
     return torch.matmul(msa_repr, proj)
 
 
-@nnscaler.graph.parser.register('N S R M^, M^ C^ -> N S R C^', name='OPMRightProj')
+@nnscaler.register_op('N S R M^, M^ C^ -> N S R C^', name='OPMRightProj')
 def OPMRightProj(msa_repr: torch.Tensor, proj: torch.Tensor):
     return torch.matmul(msa_repr, proj)
 
@@ -273,7 +273,7 @@ def OPMRightProj(msa_repr: torch.Tensor, proj: torch.Tensor):
 """
 
 
-@nnscaler.graph.parser.register('N S^ R M^, N S^ T^ M^, F^ Z^ -> N R^ T Z^',
+@nnscaler.register_op('N S^ R M^, N S^ T^ M^, F^ Z^ -> N R^ T Z^',
                             name='OuterProductMean')
 @torch.jit.ignore
 def OuterProductMean(left_act: torch.Tensor, right_act: torch.Tensor,
@@ -308,7 +308,7 @@ def OuterProductMean(left_act: torch.Tensor, right_act: torch.Tensor,
     return outer
 
 
-@nnscaler.graph.parser.register('N S R^ Z^, Z^ E^, Z^ E^ -> N S R^ E^', name='TMOLeftProj')
+@nnscaler.register_op('N S R^ Z^, Z^ E^, Z^ E^ -> N S R^ E^', name='TMOLeftProj')
 def TMOLeftProj(pair_repr: torch.Tensor, proj1: torch.Tensor,
                 proj2: torch.Tensor):
     a = torch.sigmoid(torch.matmul(pair_repr, proj1))
@@ -316,7 +316,7 @@ def TMOLeftProj(pair_repr: torch.Tensor, proj1: torch.Tensor,
     return b
 
 
-@nnscaler.graph.parser.register('N S R^ Z^, Z^ E^, Z^ E^ -> N S R^ E^',
+@nnscaler.register_op('N S R^ Z^, Z^ E^, Z^ E^ -> N S R^ E^',
                             name='TMORightProj')
 def TMORightProj(pair_repr: torch.Tensor, proj1: torch.Tensor,
                  proj2: torch.Tensor):
@@ -325,12 +325,12 @@ def TMORightProj(pair_repr: torch.Tensor, proj1: torch.Tensor,
     return b
 
 
-@nnscaler.graph.parser.register('N S T^ Z^, Z^ Z^ -> N S T^ Z^', name='TMOGate')
+@nnscaler.register_op('N S T^ Z^, Z^ Z^ -> N S T^ Z^', name='TMOGate')
 def TMOGate(pair_repr: torch.Tensor, proj: torch.Tensor):
     return torch.sigmoid(torch.matmul(pair_repr, proj))
 
 
-@nnscaler.graph.parser.register('N S R^ E^, N T^ R^ E^, N S T^ Z^, E^, E^, E^ Z^ -> N S T^ Z^',
+@nnscaler.register_op('N S R^ E^, N T^ R^ E^, N S T^ Z^, E^, E^, E^ Z^ -> N S T^ Z^',
                             name='TriangleMultiplicationOut')
 def TriangleMultiplicationOut(a: torch.Tensor, b: torch.Tensor,
                               g: torch.Tensor,
@@ -347,7 +347,7 @@ def TriangleMultiplicationOut(a: torch.Tensor, b: torch.Tensor,
     return p * g
 
 
-@nnscaler.graph.parser.register('N R^ S Z^, Z^ E^, Z^ E^ -> N R^ S E^', name='TMILeftProj')
+@nnscaler.register_op('N R^ S Z^, Z^ E^, Z^ E^ -> N R^ S E^', name='TMILeftProj')
 def TMILeftProj(pair_repr: torch.Tensor, proj1: torch.Tensor,
                 proj2: torch.Tensor):
     a = torch.sigmoid(torch.matmul(pair_repr, proj1))
@@ -355,7 +355,7 @@ def TMILeftProj(pair_repr: torch.Tensor, proj1: torch.Tensor,
     return a
 
 
-@nnscaler.graph.parser.register('N R^ T Z^, Z^ E^, Z^ E^ -> N R^ T E^',
+@nnscaler.register_op('N R^ T Z^, Z^ E^, Z^ E^ -> N R^ T E^',
                             name='TMIRightProj')
 def TMIRightProj(pair_repr: torch.Tensor, proj1: torch.Tensor,
                  proj2: torch.Tensor):
@@ -364,12 +364,12 @@ def TMIRightProj(pair_repr: torch.Tensor, proj1: torch.Tensor,
     return a
 
 
-@nnscaler.graph.parser.register('N S^ T Z^, Z^ Z^ -> N S^ T Z^', name='TMIGate')
+@nnscaler.register_op('N S^ T Z^, Z^ Z^ -> N S^ T Z^', name='TMIGate')
 def TMIGate(pair_repr: torch.Tensor, proj: torch.Tensor):
     return torch.sigmoid(torch.matmul(pair_repr, proj))
 
 
-@nnscaler.graph.parser.register('N R^ S E^, N R^ T^ E^, N T^ S Z^, E^, E^, E^ Z^ -> N T^ S Z^',
+@nnscaler.register_op('N R^ S E^, N R^ T^ E^, N T^ S Z^, E^, E^, E^ Z^ -> N T^ S Z^',
                             name='TriangleMultiplicationIn')
 def TriangleMultiplicationIn(a: torch.Tensor, b: torch.Tensor, g: torch.Tensor,
                              tri_mul_norm2_weight: torch.Tensor,
@@ -385,12 +385,12 @@ def TriangleMultiplicationIn(a: torch.Tensor, b: torch.Tensor, g: torch.Tensor,
     return p.permute(0, 2, 1, 3) * g
 
 
-@nnscaler.graph.parser.register('N S R^ C^, C^ D^ -> N S R^ D^', name='TANSBias')
+@nnscaler.register_op('N S R^ C^, C^ D^ -> N S R^ D^', name='TANSBias')
 def TANSBias(pair_repr: torch.Tensor, bias_proj: torch.Tensor):
     return torch.matmul(pair_repr, bias_proj)
 
 
-@nnscaler.graph.parser.register('N S R^ Z^, Z^ E^, Z^ F^, E^ Z^, N T^ R^ G^ -> N S R^ Z^',
+@nnscaler.register_op('N S R^ Z^, Z^ E^, Z^ F^, E^ Z^, N T^ R^ G^ -> N S R^ Z^',
                             name='TriangleAttentionNodeStart')
 def TriangleAttentionNodeStart(pair_repr: torch.Tensor,
                                gate_proj: torch.Tensor, qkv_proj: torch.Tensor,
@@ -404,12 +404,12 @@ def TriangleAttentionNodeStart(pair_repr: torch.Tensor,
                                 head, c, scale, chunk_size, is_train)
 
 
-@nnscaler.graph.parser.register('N S^ R C^, C^ D^ -> N S^ R D^', name='TANEBias')
+@nnscaler.register_op('N S^ R C^, C^ D^ -> N S^ R D^', name='TANEBias')
 def TANEBias(pair_repr: torch.Tensor, bias_proj: torch.Tensor):
     return torch.matmul(pair_repr, bias_proj)
 
 
-@nnscaler.graph.parser.register('N R^ S Z^, Z^ E^, Z^ F^, E^ Z^, N R^ T^ G^ -> N R^ S Z^',
+@nnscaler.register_op('N R^ S Z^, Z^ E^, Z^ F^, E^ Z^, N R^ T^ G^ -> N R^ S Z^',
                             name='TriangleAttentionNodeEnd')
 def TriangleAttentionNodeEnd(pair_repr: torch.Tensor, gate_proj: torch.Tensor,
                              qkv_proj: torch.Tensor, out_proj: torch.Tensor,
@@ -424,7 +424,7 @@ def TriangleAttentionNodeEnd(pair_repr: torch.Tensor, gate_proj: torch.Tensor,
     return out.permute(0, 2, 1, 3)
 
 
-@nnscaler.graph.parser.register('N R T^ Z^, Z^ E^, E^ Z^ -> N R T^ Z^',
+@nnscaler.register_op('N R T^ Z^, Z^ E^, E^ Z^ -> N R T^ Z^',
                             name='PairTransition')
 def PairTransition(pair_repr: torch.Tensor, proj1: torch.Tensor,
                    proj2: torch.Tensor):
@@ -432,6 +432,6 @@ def PairTransition(pair_repr: torch.Tensor, proj1: torch.Tensor,
         torch.nn.functional.relu(torch.matmul(pair_repr, proj1)), proj2)
 
 
-@nnscaler.graph.parser.register('* -> *, *', name='multi2ref')
+@nnscaler.register_op('* -> *, *', name='multi2ref')
 def multi2ref(x: torch.Tensor):
     return (x, x)

@@ -18,9 +18,10 @@ import logging
 from examples.llama.generation import Llama
 
 import nnscaler
+from nnscaler.utils import set_default_logger_level
 
 nnscaler.init()
-nnscaler.set_logger_level(level=logging.WARNING)
+set_default_logger_level(level=logging.WARNING)
 logging.getLogger('nnscaler.compiler').setLevel(logging.INFO)
 
 
@@ -43,7 +44,7 @@ def main(
     )
 
     dialog = [
-        {"role": "system", "content": 
+        {"role": "system", "content":
           "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Please ensure that your responses are socially unbiased and positive in nature."},
     ]
 

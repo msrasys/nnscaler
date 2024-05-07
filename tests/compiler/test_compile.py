@@ -6,6 +6,8 @@ from functools import partial
 import more_itertools as mitr
 
 import nnscaler
+from nnscaler.utils import load_model
+from nnscaler.compiler import compile
 from nnscaler.runtime.utils import microbatches
 from nnscaler.graph import IRGraph
 from nnscaler.graph.segment import IRSegment
@@ -33,7 +35,7 @@ class MLP(torch.nn.Module):
 def get_dummy_data(batch_size: int = 512):
     torch.random.manual_seed(0)
     return torch.randn(
-        [128, 512], dtype=torch.float32, 
+        [128, 512], dtype=torch.float32,
         device=torch.cuda.current_device()).repeat([batch_size // 128, 1])
 
 
@@ -43,7 +45,7 @@ def baseline():
     init_parameter(model)
     model.cuda()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    
+
     losses = []
     for _ in range(3):
         x = get_dummy_data()
@@ -65,7 +67,7 @@ def pipe_policy(graph: IRGraph, resource, ngpus_per_unit: int):
 
     ngpus = min(ngpus_per_unit, resource.ngpus)
     fnodes = graph.select(ntype=IRFwOperation)
-    
+
     stages = mitr.divide(ngpus, fnodes)
     stages = [list(s) for s in stages]
     lead_nodes = [s[0] for s in stages]
@@ -117,7 +119,7 @@ def cube_run(ngpus_per_unit: int, policy):
 
     model = MLP()
     init_parameter(model)
-    
+
     ngpus_per_unit = min(ngpus_per_unit, torch.distributed.get_world_size())
     nreplicas = torch.distributed.get_world_size() // ngpus_per_unit
     batch_size = 512 // nreplicas
@@ -128,16 +130,16 @@ def cube_run(ngpus_per_unit: int, policy):
 
     policy = partial(policy, ngpus_per_unit=ngpus_per_unit)
 
-    @nnscaler.compile(model, dl, PAS=policy, scale=True)
+    @compile(model, dl, PAS=policy, scale=True)
     def train_iter(model, dataloader):
         x = next(iter(dataloader))
         loss = model(x)
         loss.backward()
         return loss
-    
-    model = nnscaler.load_model()
+
+    model = load_model()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    
+
     losses = []
     for _ in range(3):
         x = get_dummy_data(batch_size=batch_size)
@@ -161,30 +163,30 @@ test_single = partial(torchrun, 1, assert_parity,
 
 # scale test
 test_scale2 = partial(torchrun, 2, assert_parity,
-    baseline, 
+    baseline,
     partial(cube_run, 1, tp_policy)
 )
 
 # tensor parallelism test
 test_tp2 = partial(torchrun, 2, assert_parity,
-    baseline, 
+    baseline,
     partial(cube_run, 2, tp_policy)
 )
 
 # tensor parallelism + scale test
 test_tp2scale2 = partial(torchrun, 4, assert_parity,
-    baseline, 
+    baseline,
     partial(cube_run, 2, tp_policy)
 )
 
 # pipeline parallelism test
 test_pipe2 = partial(torchrun, 2, assert_parity,
-    baseline, 
+    baseline,
     partial(cube_run, 2, pipe_policy)
 )
 
 # pipeline parallelism + scale test
 test_pipe2scale2 = partial(torchrun, 4, assert_parity,
-    baseline, 
+    baseline,
     partial(cube_run, 2, pipe_policy)
 )

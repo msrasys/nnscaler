@@ -2,7 +2,7 @@ import torch
 import nnscaler
 
 
-@nnscaler.graph.parser.register('L^ N E^, H+ E^, H+, E^ H+ -> L^ N E^', name='feedforward')
+@nnscaler.register_op('L^ N E^, H+ E^, H+, E^ H+ -> L^ N E^', name='feedforward')
 def feedforward(x: torch.Tensor,
                 proj1: torch.Tensor, proj1_bias: torch.Tensor,
                 proj2: torch.Tensor,

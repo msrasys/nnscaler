@@ -18,9 +18,10 @@ import logging
 from examples.llama.generation import Llama
 
 import nnscaler
+from nnscaler.utils import set_logger_level
 
 nnscaler.init()
-nnscaler.set_logger_level(level=logging.WARNING)
+set_logger_level(level=logging.WARNING)
 logging.getLogger('nnscaler.compiler').setLevel(logging.INFO)
 
 

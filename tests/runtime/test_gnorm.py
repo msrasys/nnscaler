@@ -2,13 +2,15 @@
 This test is to verify the correctness of the gradient norm algorithm for nnscaler.
 
 To avoid other potential parity issues that may have influence the gradient value,
-we use weight data as gradient, and calculate its norm to verify the correctness 
+we use weight data as gradient, and calculate its norm to verify the correctness
 of gnorm calculation.
 """
 import torch
 from functools import partial
 
 import nnscaler
+from nnscaler.compiler import compile
+from nnscaler.utils import load_model
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.runtime.module import CubeModule
 from nnscaler.runtime.gnorm import prepare_for_grad_clip, clip_gnorm
@@ -86,14 +88,14 @@ def model_test(policy, su_num: int = 1, use_zero: bool = False):
     wnorm_baseline = cal_wnorm_baseline(model)
 
     sample = torch.randn(16, 16).cuda()
-    @nnscaler.compile(model, sample, PAS=partial(policy, su_num=su_num),
+    @compile(model, sample, PAS=partial(policy, su_num=su_num),
                   scale=su_num > 1)
     def train_iter(model, data):
         loss = model(data)
         loss.backward()
         return loss
-    
-    model = nnscaler.load_model()
+
+    model = load_model()
 
     # train_iter(model, sample)  # link .grad to reducer buffer
     wnorm_cube = cal_wnorm_cube(model)

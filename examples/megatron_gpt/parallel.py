@@ -8,8 +8,8 @@ graph = IRGraph.load('megatron_gpt2.cube')
 
 # 2. register customized op
 from gpt_model import GeLUFunction
-from nnscaler.graph.parser.register import register
-register('* h, h -> * h')(GeLUFunction.apply)
+from nnscaler import register_op
+register_op('* h, h -> * h')(GeLUFunction.apply)
 
 # 3. parallel model
 from fairseq.nnscaler.pas_policies import PASData, PASRandomSPMD

@@ -7,12 +7,12 @@ import nnscaler
 
 
 
-@nnscaler.graph.parser.register('N res, cz nobins, cz -> N res res cz', name='relpos')
+@nnscaler.register_op('N res, cz nobins, cz -> N res res cz', name='relpos')
 def input_embedder_pair_emb(ri: torch.Tensor,
                             tf_emb_i: torch.Tensor, tf_emb_j: torch.Tensor,
                             w_relpos: torch.Tensor, b_relpos: torch.Tensor,
                             relpos_k) -> torch.Tensor:
-    
+
     ri = ri.type(tf_emb_i.dtype)
     d = ri[..., None] - ri[..., None, :]
     boundaries = torch.arange(
@@ -25,14 +25,14 @@ def input_embedder_pair_emb(ri: torch.Tensor,
     d = nn.functional.one_hot(d, num_classes=len(boundaries)).float()
     d = d.to(ri.dtype)
     pair_emb = torch.nn.functional.linear(d, w_relpos, b_relpos)
-    
+
     pair_emb = pair_emb + tf_emb_i[..., None, :]
     pair_emb = pair_emb + tf_emb_j[..., None, :, :]
 
     return pair_emb
 
 
-@nnscaler.graph.parser.register('N res tfdim^, cm tfdim^, cm -> N nclust^, res, cm')
+@nnscaler.register_op('N res tfdim^, cm tfdim^, cm -> N nclust^, res, cm')
 def input_embedder_tf_m(tf: torch.Tensor, w_tf_m: torch.Tensor, b_tf_m: torch.Tensor, nclust: int) -> torch.Tensor:
     tf_m = torch.nn.linear(tf, w_tf_m, b_tf_m)
     tf_m = tf_m.unsqueeze(-3).expand(((-1,) * len(tf.shape[:-2]) + (nclust, -1, -1)))
@@ -104,7 +104,7 @@ class InputEmbedder(nn.Module):
 
         # [*, N_res, N_res, c_z]
         pair_emb = input_embedder_pair_emb(
-            ri, tf_emb_i, tf_emb_j, 
+            ri, tf_emb_i, tf_emb_j,
             self.w_linear_relpos, self.b_linear_relpos
         )
         # pair_emb = relpos(ri.type(tf_emb_i.dtype))
@@ -119,7 +119,7 @@ class InputEmbedder(nn.Module):
 
 
 
-@nnscaler.graph.parser.register()
+@nnscaler.register_op()
 def sum_d(x: torch.Tensor, bins: torch.Tensor, inf: float) -> torch.Tensor:
     squared_bins = bins ** 2
     upper = torch.cat(

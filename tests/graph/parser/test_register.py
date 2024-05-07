@@ -10,15 +10,15 @@ from ...utils import replace_all_device_with
 def mock_add(x: torch.Tensor, y: torch.Tensor):
     return x + y
 
-nnscaler.graph.parser.register('*, * -> *')(mock_add)
+nnscaler.register_op('*, * -> *')(mock_add)
 
 
-@nnscaler.graph.parser.register('*, * -> *')
+@nnscaler.register_op('*, * -> *')
 def mock_add2(x: torch.Tensor, y: torch.Tensor):
     return x + y
 
 
-@nnscaler.graph.parser.register('(h w^) k^ -> h (w^ k^)')
+@nnscaler.register_op('(h w^) k^ -> h (w^ k^)')
 def mock_view_with_obj(x, h):
     return x.view(h, -1)
 
@@ -32,7 +32,7 @@ class MockAGF(torch.autograd.Function):
     def backward(ctx, grad):
         return grad, grad
 
-nnscaler.graph.parser.register('*, * -> *')(MockAGF.apply)
+nnscaler.register_op('*, * -> *')(MockAGF.apply)
 
 
 class MockModel(torch.nn.Module):

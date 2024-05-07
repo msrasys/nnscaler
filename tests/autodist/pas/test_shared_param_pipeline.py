@@ -13,7 +13,7 @@ from nnscaler.ir.unique import IDGenerator
 from nnscaler.graph.segment import IRSegment
 from nnscaler.flags import CompileFlag
 from nnscaler.runtime.utils import microbatches
-from nnscaler.program import Program, SemanticDataLoader
+from nnscaler.program import Program, SemanticDataLoader, SemanticModel
 from nnscaler.graph.gener.gen import IRAdapterGener
 
 
@@ -51,7 +51,7 @@ def test_shared_param_pipeline():
                     'x': torch.randn(bsz, hidden_dim)
                 }]))
 
-            smodel = nnscaler.SemanticModel(model, attr_savedir=tempdir)
+            smodel = SemanticModel(model, attr_savedir=tempdir)
             smodel.dummy_input = {'x': torch.randn(bsz, hidden_dim)}
             smodel.dynamic_shape = False
             program.set_input([dataloader.irobj])

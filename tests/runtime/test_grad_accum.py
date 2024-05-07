@@ -3,6 +3,7 @@ import pytest
 from functools import partial
 
 import nnscaler
+from nnscaler.utils import accum_mode
 from nnscaler.runtime.module import CubeModule
 from ..launch_torchrun import torchrun
 from ..utils import init_parameter, assert_parity
@@ -17,7 +18,7 @@ class MLP(CubeModule):
         self.layers = torch.nn.ModuleList([])
         for _ in range(nlayers):
             self.layers.append(torch.nn.Linear(dim, dim, bias=False))
-        
+
         self.wreducer1 = nnscaler.runtime.adapter.Reducer(ranks=ranks, reduce_op='sum', async_op=async_op, zero=False,
                                                       max_bucket_size_bytes=137217728, zero_ngroups=1)
         for param in self.parameters():
@@ -30,7 +31,7 @@ class MLP(CubeModule):
             x = layer(x)
         loss = torch.sum(x)
         return loss
-    
+
 
 class BaseMLP(torch.nn.Module):
     def __init__(self, dim=512, nlayers=4,):
@@ -50,7 +51,7 @@ class BaseMLP(torch.nn.Module):
 def get_dummy_data(batch_size: int = 256):
     torch.random.manual_seed(0)
     return torch.randn(
-        [batch_size, 512], dtype=torch.float32, 
+        [batch_size, 512], dtype=torch.float32,
         device=torch.cuda.current_device())
 
 
@@ -59,7 +60,7 @@ def baseline(accum_times: int = 4):
     init_parameter(model)
     model = model.cuda()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    
+
     losses = []
     for _ in range(3):
         for _ in range(accum_times):
@@ -84,7 +85,7 @@ def reducer_sync_test(accum_times: int = 4):
     for reducer in model.reducers:
         reducer.build_buckets()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    
+
     losses = []
     for _ in range(3):
         model.zero_grad()
@@ -115,7 +116,7 @@ def reducer_async_test_wrong(accum_times: int = 4):
     for reducer in model.reducers:
         reducer.build_buckets()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    
+
     losses = []
     for _ in range(3):
         model.zero_grad()
@@ -146,12 +147,12 @@ def reducer_async_test_correct(accum_times: int = 4):
     for reducer in model.reducers:
         reducer.build_buckets()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    
+
     losses = []
     for _ in range(3):
         model.zero_grad()
         for step in range(accum_times):
-            with nnscaler.accum_mode(begin=(step == 0), end=(step == accum_times - 1)):
+            with accum_mode(begin=(step == 0), end=(step == accum_times - 1)):
                 x = get_dummy_data()
                 x = x.chunk(ngpus, dim=0)[rank]
                 loss = model(x)
@@ -167,7 +168,7 @@ def reducer_async_test_correct(accum_times: int = 4):
             loss /= 10.0
         losses.append(loss)
     return losses
-        
+
 
 def accum_test():
     nnscaler.init()

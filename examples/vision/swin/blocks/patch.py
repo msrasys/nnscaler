@@ -6,7 +6,7 @@ import torch.nn as nn
 import nnscaler
 
 
-@nnscaler.graph.parser.register('B (2 h^ 2 w^) C^ -> B (h w) (4 C)')
+@nnscaler.register_op('B (2 h^ 2 w^) C^ -> B (h w) (4 C)')
 def patch_merge(x: torch.Tensor, h: int, w: int):
     B, L, C = x.shape
     H = 2 * h
@@ -22,7 +22,7 @@ def patch_merge(x: torch.Tensor, h: int, w: int):
     x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
     return x
 
-@nnscaler.graph.parser.register('B ic+ (ps^ w^) (ps^ h^), oc ic+ k^ k^, oc -> B oc w^ h^')
+@nnscaler.register_op('B ic+ (ps^ w^) (ps^ h^), oc ic+ k^ k^, oc -> B oc w^ h^')
 def patch(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, ps: int):
     """
     @param ps int: patch size
@@ -92,7 +92,7 @@ class PatchEmbed(nn.Module):
         # self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.conv_w = nn.Parameter(torch.empty(embed_dim, in_chans, self.patch_size, self.patch_size))
         self.conv_b = nn.Parameter(torch.empty(embed_dim))
-    
+
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
         else:

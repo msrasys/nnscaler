@@ -6,6 +6,8 @@ import logging
 from functools import partial
 
 import nnscaler
+from nnscaler.compiler import compile
+from nnscaler.utils import load_model
 from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
@@ -31,7 +33,7 @@ class MLP(torch.nn.Module):
 def get_dummy_data(batch_size: int = 256):
     torch.random.manual_seed(0)
     return torch.randn(
-        [batch_size, 512], dtype=torch.float32, 
+        [batch_size, 512], dtype=torch.float32,
         device=torch.cuda.current_device())
 
 
@@ -41,7 +43,7 @@ def baseline():
     init_parameter(model)
     model.cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    
+
     losses = []
     for _ in range(3):
         x = get_dummy_data()
@@ -64,7 +66,7 @@ def reducer(use_zero: bool, async_reducer: bool):
 
     model = MLP()
     init_parameter(model)
-    
+
     def policy(graph: IRGraph, resource):
 
         def tensor_parallelism(node, idx, dim, num):
@@ -88,18 +90,18 @@ def reducer(use_zero: bool, async_reducer: bool):
                 for idx, sub_node in enumerate(sub_nodes):
                     graph.assign(sub_node, idx)
         return graph
-    
+
     x = get_dummy_data()
 
-    @nnscaler.compile(model, x, PAS=policy)
+    @compile(model, x, PAS=policy)
     def train_iter(model, x):
         loss = model(x)
         loss.backward()
         return loss
-    
-    model = nnscaler.load_model()
+
+    model = load_model()
     optimizer = torch.optim.Adam(model.parameters_for_optimizer(), lr=0.01)
-    
+
     losses = []
     for _ in range(3):
         x = get_dummy_data()

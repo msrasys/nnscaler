@@ -9,14 +9,14 @@ import math
 import nnscaler
 
 
-# @nnscaler.graph.parser.register('N S^ R^ cm^, N R^ R^ cz^ -> N out^')
+# @nnscaler.register_op('N S^ R^ cm^, N R^ R^ cz^ -> N out^')
 # @torch.jit.ignore
 # def input_packing(msa: torch.Tensor, pair: torch.Tensor, out: int) -> torch.Tensor:
 #     buffer = torch.cat((torch.flatten(msa, start_dim=1), torch.flatten(pair, start_dim=1)))
 #     return buffer
-# 
-# 
-# @nnscaler.graph.parser.register('N out^ -> N S^ R^ cm^, N R^ R^ cz^', name='input_unflatten')
+#
+#
+# @nnscaler.register_op('N out^ -> N S^ R^ cm^, N R^ R^ cz^', name='input_unflatten')
 # @torch.jit.ignore
 # def input_unpacking(buffer: torch.Tensor,
 #                     S: int, R: int, cm: int, cz: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -59,11 +59,11 @@ class Evoformer(torch.nn.Module):
         # MSA column-wise gated self-attention
         self.col_norm = torch.nn.LayerNorm(cm)
         self.col_attn = MSAColAttention(cm, msa_head, self.scale, self.msa_col_chunk)
-        
+
         # MSA transition
         self.msa_transition_norm = torch.nn.LayerNorm(cm)
         self.msa_transition = Transition(cm, ff_mult)
-        
+
         # Outer product mean
         self.outer_norm = torch.nn.LayerNorm(cm)
         self.outer_prod_mean = OuterProducterMean(cm, c, cz, self.opm_chunk)
@@ -79,7 +79,7 @@ class Evoformer(torch.nn.Module):
 
         # Triangular gated self-attention around ending node
         self.tri_attn_node_end = TriangleAttentionNodeEnd(cz, pair_head, c, self.scale, self.tane_chunk)
-        
+
         # Transition in the pair stack
         self.pair_transition_norm = torch.nn.LayerNorm(cz)
         self.pair_transition = Transition(cz, ff_mult)
@@ -145,20 +145,20 @@ class Evoformer(torch.nn.Module):
         flops += 4 * (msa_size * 4)
         # pair layer norm
         flops += 2 * (pair_size * 4)
-        
+
         # attention: gate + qkv + q@k (N S head r c, N S head c r) + k@v + dense
         msa_attn = n_seq * n_res * self.cm * self.cm + \
                    3 * n_seq * n_res * self.cm * self.cm + \
                    n_seq * (self.cm // self.c) * n_res * n_res * self.c + \
                    n_seq * (self.cm // self.c) * n_res * n_res * self.c + \
                    n_seq * n_res * self.cm * self.cm
-        
+
         pair_attn = n_res * n_res * self.cz * self.cz + \
                     3 * n_res * n_res * self.cz * self.cz + \
                     n_res * (self.cz // self.c) * n_res * n_res * self.c + \
                     n_res * (self.cz // self.c) * n_res * n_res * self.c + \
                     n_res * n_res * self.cz * self.cz
-        
+
         # row and col end attention
         flops += 2 * msa_attn
         # tirangle start and triangle end

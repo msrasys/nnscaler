@@ -12,7 +12,7 @@ from nnscaler.autodist.spmd_solver import SPMDSolver
 import nnscaler
 
 
-@nnscaler.graph.parser.register(
+@nnscaler.register_op(
     '(1 h) l^ d^, (1 h) l^ d^, (1 h) l^ d^ -> (1 h) l^ d^', 'mock_attention')
 def mock_attention(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor):
     return x + y + z

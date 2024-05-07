@@ -7,6 +7,8 @@ import pytest
 
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.compiler import compile
+from nnscaler.utils import load_model
 from ..launch_torchrun import torchrun
 
 
@@ -74,12 +76,12 @@ def merge_model_states_test():
 
     full_model_state = model.state_dict()
 
-    @nnscaler.compile(model, sample, PAS=tp_policy)
+    @compile(model, sample, PAS=tp_policy)
     def train_iter(model, sample):
         loss = model(sample)
         loss.backward()
         return loss
-    cube_model = nnscaler.load_model()
+    cube_model = load_model()
 
     state_dict = cube_model.state_dict()
     torch.save({'state_dict': state_dict, 'fullmap': cube_model.fullmap},
@@ -110,13 +112,13 @@ def merge_optimizer_states_test():
     full_model_state = model.state_dict()
     full_optim_state = full_optimizer.state_dict()
 
-    @nnscaler.compile(model, sample, PAS=tp_policy)
+    @compile(model, sample, PAS=tp_policy)
     def train_iter(model, sample):
         loss = model(sample)
         loss.backward()
         return loss
 
-    cube_model = nnscaler.load_model()
+    cube_model = load_model()
     optimizer = torch.optim.Adam(cube_model.parameters(), lr=0.01)
 
     # test for initial state

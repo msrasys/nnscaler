@@ -58,7 +58,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
 
 
 # TODO: fix annotation
-@nnscaler.graph.parser.register('*, *, 38^ 64^ -> *, *')
+@nnscaler.register_op('*, *, 38^ 64^ -> *, *')
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
@@ -72,7 +72,7 @@ def apply_rotary_emb(
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
-@nnscaler.graph.parser.register('N seqlen^, N seqlen^ H^ -> 1 1 seqlen^ seqlen^')
+@nnscaler.register_op('N seqlen^, N seqlen^ H^ -> 1 1 seqlen^ seqlen^')
 def create_mask(tokens: torch.Tensor, h: torch.Tensor, start_pos: int):
     seqlen = tokens.shape[1]
     mask = None
@@ -84,7 +84,7 @@ def create_mask(tokens: torch.Tensor, h: torch.Tensor, start_pos: int):
     return mask
 
 
-@nnscaler.graph.parser.register('N seqlen *, 1 1 * -> N seqlen *')
+@nnscaler.register_op('N seqlen *, 1 1 * -> N seqlen *')
 def apply_mask(x: torch.Tensor, mask: torch.Tensor):
     return x if mask is None else x + mask
 
@@ -184,12 +184,12 @@ class Attention(nn.Module):
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
+
         # NOTE: cube doesn't support dynamic graph
         # if mask is not None:
         #     scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = apply_mask(scores, mask)
-        
+
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)

@@ -1,6 +1,6 @@
 # Dimop Tutorial
 
-## Dimop: Dimension-annotated Operator 
+## Dimop: Dimension-annotated Operator
 
 ### Annotation for Shape Inference and Transformation
 
@@ -16,11 +16,11 @@ def operator(x: torch.Tensor, w: torch.Tensor, h: float) -> torch.Tensor:
     return out
 ```
 
-To separate inputs and outputs of an operator, `'->'` is a separation keyword where its left part are inputs and right part are outputs. Inside inputs and outputs region, annotation of each tensor is further separated by `','`. 
+To separate inputs and outputs of an operator, `'->'` is a separation keyword where its left part are inputs and right part are outputs. Inside inputs and outputs region, annotation of each tensor is further separated by `','`.
 
 Every dimension of a tensor is annotated by a template of **{identifiers}{reduction}**, like `'m^ kd+'`, `'kd+ n'`, `'m^ n'`, where `m`, `kd` and `n` are identitifiers, `'^'` and `'+'` are reductions.
 
-If a tensor is represented as `'m^ kd+'`, it indicates the tensor has two dimensions, the first dimension is `m` and the second dimension is `kd`. Dimensions need to be separated by space `' '`. 
+If a tensor is represented as `'m^ kd+'`, it indicates the tensor has two dimensions, the first dimension is `m` and the second dimension is `kd`. Dimensions need to be separated by space `' '`.
 
 * Identifiers
 
@@ -35,7 +35,7 @@ If a tensor is represented as `'m^ kd+'`, it indicates the tensor has two dimens
   Special identifier:
 
     1) `'*'`: this special identifier indicates the dimension is dynamic, which will automatically get expanded given the shape. If there are multiple `*` for different tensors, then they must have same shape for the expanded dimensions,
-    
+
         e.g., `'* t -> a * t'` can be expanded into `'b c t -> a b c t'`
 
     2) `'?'`: this special identifier indicates the value is not a tensor, which will be ignored
@@ -45,7 +45,7 @@ If a tensor is represented as `'m^ kd+'`, it indicates the tensor has two dimens
 * Reductions
 
   Reductions are served for transformation plans. The reduction can be one of {`''`, `'+'`, `'^'`}:
-  
+
     * `''` (empty) indicates this dimension can be spatially partitioned, and each output that have this identifier will also be spatially partitioned.
 
     * `'+'` indicates this dimension can be spatially partitioned. And each output that doesn't have this identifier will be numerically partitioned (sum-reduction required).
@@ -73,7 +73,7 @@ If a tensor is represented as `'m^ kd+'`, it indicates the tensor has two dimens
 To register a customized "matmul" operator in the runtime, user can simply define a python function and add an decorator on the function with its annotations:
 
 ```py
-@nnscaler.graph.parser.register('(h^ m^) kd+, kd+ n -> h^ m^ n', name='matmul_custom')
+@nnscaler.register_op('(h^ m^) kd+, kd+ n -> h^ m^ n', name='matmul_custom')
 def operator(x: torch.Tensor, w: torch.Tensor, h: float) -> torch.Tensor:
     out = torch.matmul(x, w)
     out = out.view(h, out.size(0) // h, out.size(1))

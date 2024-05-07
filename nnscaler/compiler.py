@@ -29,7 +29,7 @@ from nnscaler.runtime.utils import MicroBatchDataLoader
 
 from nnscaler.program import Program, SemanticDataLoader, SemanticModel
 from nnscaler.flags import CompileFlag
-from nnscaler.utils import print_each_rank
+from nnscaler.utils import print_each_rank, load_default_schedule
 
 
 _logger = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
         args (Tuple[Any]): compile function example inputs
         PAS (Callable | Tuple[Callable, Callable, Callable]): policy to transform and schedule graph
         model_dynamic_shape (bool): whether to compile model with dynamic shape
-        load_graph_file (str | None): 
+        load_graph_file (str | None):
             load cached graph. This will skip parsing the function and model.
             Note the user should keep correct `fullmodel.pt` if load_content is True.
         save_graph_file (str | None): save parsed graph before applying policy.
@@ -99,7 +99,7 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
             arg = SemanticDataLoader(arg)
         elif isinstance(arg, torch.Tensor):
             tensor = arg
-            arg = IRFullTensor(arg.shape, name='tensor', 
+            arg = IRFullTensor(arg.shape, name='tensor',
                                requires_grad=arg.requires_grad,
                                dtype=arg.dtype).tosub()
             arg._value = tensor
@@ -299,6 +299,6 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
         model.dummy_input = None
         # load temporal schedule
         print_each_rank(f'loading generated schedule from {filename} ...', logger=_logger)
-        return nnscaler.load_default_schedule(filename)
+        return load_default_schedule(filename)
 
     return decorator

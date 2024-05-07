@@ -9,6 +9,7 @@ import torch
 from examples.openfold.model import AlphaFold, Config
 
 import nnscaler
+from nnscaler.compiler import compile, SemanticModel
 from nnscaler.profiler.timer import CudaTimer, print_each_rank
 from nnscaler.profiler.memory import memory_summary
 from examples.openfold.policy.mpmd import PASDAP, PASRoundRobin, PASNF1B, PASDAPPipe
@@ -75,7 +76,7 @@ def train():
 
     dtype = torch.float16 if args.fp16 else torch.float32
     dataloader = nnscaler.runtime.syndata.SynDataLoader(
-        shapes=([cfg.bs, cfg.evoformer_s, cfg.evoformer_r, cfg.evoformer_cm], 
+        shapes=([cfg.bs, cfg.evoformer_s, cfg.evoformer_r, cfg.evoformer_cm],
                 [cfg.bs, cfg.evoformer_r, cfg.evoformer_r, cfg.evoformer_cz]),
         dtypes=(dtype, dtype),
         batch_dims=(0, 0)
@@ -83,8 +84,8 @@ def train():
 
     print_each_rank(f'before partitioned model parameter: {nparams(model)}')
 
-    model = nnscaler.SemanticModel(model)
-    @nnscaler.compile(model, dataloader, PAS=PASDAPPipe, override=True, load_content=True)
+    model = SemanticModel(model)
+    @compile(model, dataloader, PAS=PASDAPPipe, override=True, load_content=True)
     def train_iter(model, dataloader):
         input_ids, position_ids = next(dataloader)
         loss = model(input_ids, position_ids)

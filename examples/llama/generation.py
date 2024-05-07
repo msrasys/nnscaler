@@ -17,6 +17,8 @@ from examples.llama.tokenizer import Tokenizer
 Role = Literal["system", "user", "assistant"]
 
 import nnscaler
+from nnscaler.compiler import compile
+from nnscaler.utils import load_model
 from nnscaler.flags import CompileFlag
 
 
@@ -94,7 +96,7 @@ class Llama:
     def __init__(self, model: Transformer, tokenizer: Tokenizer, use_cube: bool):
         self.model = model
         self.tokenizer = tokenizer
-        
+
         # ======================= cube initilizer =================
         self.use_cube = use_cube
         if use_cube:
@@ -113,17 +115,17 @@ class Llama:
                 graph.assign(fwop, 0)
             return graph
 
-        @nnscaler.compile(self.model, sample_tokens, 0,
+        @compile(self.model, sample_tokens, 0,
                       PAS=policy, model_dynamic_shape=True)
         def infer(model: torch.nn.Module, tokens: torch.Tensor, prev_pos: int):
             logits = model(tokens, prev_pos)
             return logits
-        
+
         params = self.model.params
         vocab_size, n_layers = params.vocab_size, params.n_layers
 
         del self.model
-        self.model = nnscaler.load_model()
+        self.model = load_model()
 
         # TODO: support auto reset non-parameter attributes for llama model
         self.model.params = params

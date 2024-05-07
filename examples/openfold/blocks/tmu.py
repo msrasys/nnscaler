@@ -3,20 +3,20 @@ import torch
 from examples.openfold.blocks.utils import multi2ref
 
 
-# @nnscaler.graph.parser.register('N S R Z^, Z^ E, Z^ E -> N S R E')
+# @nnscaler.register_op('N S R Z^, Z^ E, Z^ E -> N S R E')
 # def tmu_projection(pair_repr: torch.Tensor, proj1: torch.Tensor, proj2: torch.Tensor):
 #     x = torch.matmul(pair_repr, proj1)
 #     x = torch.sigmoid(x)
 #     x = x * torch.matmul(pair_repr, proj2)
-# 
-# 
-# @nnscaler.graph.parser.register('N S R Z+, Z+ E-> N S R E')
+#
+#
+# @nnscaler.register_op('N S R Z+, Z+ E-> N S R E')
 # def tmu_gate(pair_repr: torch.Tensor, proj: torch.Tensor):
 #     return torch.sigmoid(torch.matmul(pair_repr, proj))
 
 
-@nnscaler.graph.parser.register('N S R Z^, Z^ E^, Z^ E^, Z^ E, Z^ E^, Z^ Z^ -> N S R E, N S R E^, N S R Z^', name='tmu_projection')
-def tmu_projection(pair_repr: torch.Tensor, 
+@nnscaler.register_op('N S R Z^, Z^ E^, Z^ E^, Z^ E, Z^ E^, Z^ Z^ -> N S R E, N S R E^, N S R Z^', name='tmu_projection')
+def tmu_projection(pair_repr: torch.Tensor,
                    left1: torch.Tensor, left2: torch.Tensor,
                    right1: torch.Tensor, right2: torch.Tensor,
                    gate: torch.Tensor):
@@ -34,7 +34,7 @@ def tmu_projection(pair_repr: torch.Tensor,
     return left, right, gate
 
 
-@nnscaler.graph.parser.register('N S R^ E, N T^ R^ E^, N S^ T^ Z^, E^, E^, E^ Z^ -> N S T^ Z^', name='tmo')
+@nnscaler.register_op('N S R^ E, N T^ R^ E^, N S^ T^ Z^, E^, E^, E^ Z^ -> N S T^ Z^', name='tmo')
 def tmo(left: torch.Tensor, right: torch.Tensor, gate: torch.Tensor,
         norm_w: torch.Tensor, norm_b: torch.Tensor, out: torch.Tensor):
     a = left.permute(0, 3, 1, 2)
@@ -46,7 +46,7 @@ def tmo(left: torch.Tensor, right: torch.Tensor, gate: torch.Tensor,
     return p
 
 
-@nnscaler.graph.parser.register('N R^ S E, N R^ T^ E^, N T^ S^ Z^, E^, E^, E^ Z^ -> N T^ S Z^', name='tmi')
+@nnscaler.register_op('N R^ S E, N R^ T^ E^, N T^ S^ Z^, E^, E^, E^ Z^ -> N T^ S Z^', name='tmi')
 def tmi(left: torch.Tensor, right: torch.Tensor, gate: torch.Tensor,
         norm_w: torch.Tensor, norm_b: torch.Tensor, out: torch.Tensor):
     a = left.permute(0, 3, 2, 1)
@@ -68,7 +68,7 @@ class TriangleMultiplicativeUpdate(torch.nn.Module):
         self.left2 = torch.nn.Parameter(torch.empty(cz, mult))
         self.right1 = torch.nn.Parameter(torch.empty(cz, mult))
         self.right2 = torch.nn.Parameter(torch.empty(cz, mult))
-        
+
         # self.norm = torch.nn.LayerNorm(mult)
         self.normw = torch.nn.Parameter(torch.empty(mult))
         self.normb = torch.nn.Parameter(torch.empty(mult))
@@ -76,7 +76,7 @@ class TriangleMultiplicativeUpdate(torch.nn.Module):
         self.out = torch.nn.Parameter(torch.empty(mult, cz))
         self.gate = torch.nn.Parameter(torch.empty(cz, cz))
         self.outgoing = outgoing
-        
+
     def forward(self, pair_repr: torch.Tensor):
         """
         pair_repr: [N S R Z]
@@ -85,7 +85,7 @@ class TriangleMultiplicativeUpdate(torch.nn.Module):
         pair_repr = self.layer_norm(pair_repr)
 
         left, right, gate = tmu_projection(pair_repr,
-            self.left1, self.left2, 
+            self.left1, self.left2,
             self.right1, self.right2, self.gate
         )
 

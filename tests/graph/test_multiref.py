@@ -6,6 +6,8 @@ import logging
 from functools import partial
 
 import nnscaler
+from nnscaler.compiler import compile
+from nnscaler.utils import set_default_logger_level, load_model
 from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from ..launch_torchrun import torchrun
@@ -31,7 +33,7 @@ class OpModule(torch.nn.Module):
         y = y * self.param
         loss = torch.sum(y)
         return loss
-    
+
 
 def get_dummy_data(batch_size: int = 256):
     torch.random.manual_seed(0)
@@ -47,7 +49,7 @@ def baseline():
     init_parameter(model)
     model.cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    
+
     losses = []
     for _ in range(3):
         x, y = get_dummy_data()
@@ -67,19 +69,19 @@ def multiref():
     x, y = get_dummy_data()
 
     def policy(graph: IRGraph, resource):
-        
+
         first_mul = graph.select('mul')[0]
         first_add = graph.select('add')[0]
 
         sub_muls = graph.partition(
-            first_mul, first_mul.algorithms('dim'), 
+            first_mul, first_mul.algorithms('dim'),
             idx=0, dim=0, num=resource.ngpus
         )
         for idx, sub_node in enumerate(sub_muls):
             graph.assign(sub_node, idx)
 
         sub_adds = graph.partition(
-            first_add, first_add.algorithms('dim'), 
+            first_add, first_add.algorithms('dim'),
             idx=0, dim=0, num=resource.ngpus
         )
         for idx, sub_node in enumerate(sub_adds):
@@ -91,16 +93,16 @@ def multiref():
                 for idx, sub_node in enumerate(sub_nodes):
                     graph.assign(sub_node, idx)
         return graph
-    
+
     x, y = get_dummy_data()
 
-    @nnscaler.compile(model, x, y, PAS=policy)
+    @compile(model, x, y, PAS=policy)
     def train_iter(model, x, y):
         loss = model(x, y)
         loss.backward()
         return loss
 
-    model = nnscaler.load_model()
+    model = load_model()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
     losses = []
@@ -116,7 +118,7 @@ def multiref():
 
 def multiref_test():
     nnscaler.init()
-    nnscaler.set_logger_level(logging.INFO)
+    set_default_logger_level(logging.INFO)
     assert_parity(baseline, multiref)
 
 

@@ -18,7 +18,7 @@ The above restrictions are necessary for the pipeline parallelism to work. Of co
 
 ```python
 import torch
-from nnscaler.parallel import parallelize, ComputeConfig, build_optimizer
+from nnscaler import parallelize, ComputeConfig, build_optimizer
 
 class LLM(torch.nn.Module):
     def __init__(self, ...):
@@ -48,7 +48,7 @@ In this case, for non-paralle modules, they are replicated inside unit, and run 
 
 ```python
 import torch
-from nnscaler.parallel import parallelize, ComputeConfig, build_optimizer
+from nnscaler import parallelize, ComputeConfig, build_optimizer
 
 class HeavyModule(torch.nn.Module):
     def __init__(self, ...):

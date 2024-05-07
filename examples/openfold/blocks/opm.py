@@ -7,7 +7,7 @@ import torch
 import torch.utils.checkpoint as ckpt
 
 
-# @nnscaler.graph.parser.register('N S+ R^ M^, M^ c^, M^ c^, (c^ c^) cz^ -> N R^ R^ cz^', name='outer_prod_mean')
+# @nnscaler.register_op('N S+ R^ M^, M^ c^, M^ c^, (c^ c^) cz^ -> N R^ R^ cz^', name='outer_prod_mean')
 @torch.jit.ignore
 def outer_prod_mean(msa_repr: torch.Tensor, left_proj: torch.Tensor, right_proj: torch.Tensor,
                     out_proj: torch.Tensor, chunk_size: int, training: bool):
@@ -49,13 +49,13 @@ def outer_prod_mean(msa_repr: torch.Tensor, left_proj: torch.Tensor, right_proj:
     return outer
 
 
-@nnscaler.graph.parser.register('N S R M+, M+ C -> N S R C', name='opm_projection')
+@nnscaler.register_op('N S R M+, M+ C -> N S R C', name='opm_projection')
 def opm_projection(msa_repr: torch.Tensor, proj1: torch.Tensor):
     x = torch.matmul(msa_repr, proj1)
     return x
 
 
-@nnscaler.graph.parser.register('N S^ R C^, N S^ T^ C^, F^ Z^ -> N R T^ Z^')
+@nnscaler.register_op('N S^ R C^, N S^ T^ C^, F^ Z^ -> N R T^ Z^')
 @torch.jit.ignore
 def opm(left: torch.Tensor, right: torch.Tensor, out_proj: torch.Tensor,
         chunk_size: int, training: bool):

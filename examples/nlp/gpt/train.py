@@ -14,6 +14,8 @@ from functools import partial
 from model import GPT, Config, dummy_data
 
 import nnscaler
+from nnscaler.compiler import compile
+from nnscaler.utils import set_default_logger_level
 from nnscaler.profiler.timer import CudaTimer, print_each_rank
 from nnscaler.profiler.memory import memory_summary
 from nnscaler.runtime.utils import microbatches
@@ -34,7 +36,7 @@ parser.add_argument('--mbs', type=int, default=8,
                     help='micro-batch size')
 parser.add_argument('--gbs', type=int, default=8,
                     help='global batch size')
-parser.add_argument('--dp', type=int, default=1, 
+parser.add_argument('--dp', type=int, default=1,
                     help='data parallel size, only for megatron')
 parser.add_argument('--tp', type=int, default=1,
                     help='tensor parallel size, only for megatron')
@@ -52,13 +54,13 @@ args = parser.parse_args()
 
 
 nnscaler.init()
-nnscaler.set_logger_level(logging.WARN)
+set_default_logger_level(logging.WARN)
 logging.getLogger('nnscaler.compiler').setLevel(logging.INFO)
 
 # get policy
 policy = get_policy([spmd, mpmd], args.policy)
-policy = partial(policy, 
-    nmicros=args.gbs//args.mbs, 
+policy = partial(policy,
+    nmicros=args.gbs//args.mbs,
     dp_size=args.dp,
     tp_size=args.tp
 )
@@ -72,7 +74,7 @@ def train():
         heads=args.heads,
         ffn_hidden_dim=4*args.hidden,
         num_embeddings=51200,
-        seqlen=args.seqlen,   
+        seqlen=args.seqlen,
     )
     model = GPT(config)
     model = model if not args.fp16 else model.half()
@@ -80,7 +82,7 @@ def train():
     gen_data = partial(dummy_data, args.mbs, config)
     dataloader = microbatches((gen_data(),), cycle=True)
 
-    @nnscaler.compile(model, dataloader, PAS=policy)
+    @compile(model, dataloader, PAS=policy)
     def train_iter(model, dataloader):
         input_ids, position_ids = next(dataloader)
         loss = model(input_ids, position_ids)

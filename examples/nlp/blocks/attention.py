@@ -2,8 +2,8 @@ import torch
 import nnscaler
 
 
-@nnscaler.graph.parser.register('L^ N E^, (h+ d^ 3) E^, (h+ d^ 3), E^ (h+ d^) -> L^ N E^', name='self_attention')
-def self_attention(query: torch.Tensor, 
+@nnscaler.register_op('L^ N E^, (h+ d^ 3) E^, (h+ d^ 3), E^ (h+ d^) -> L^ N E^', name='self_attention')
+def self_attention(query: torch.Tensor,
                    qkv_proj: torch.Tensor, qkv_bias: torch.Tensor,
                    out_proj: torch.Tensor,
                    h: int, scale: float, dropout_p: float, mask: bool = False):
@@ -17,14 +17,14 @@ def self_attention(query: torch.Tensor,
     q = q.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     k = k.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
     v = v.contiguous().view(L, (N * num_head), dim_head) # L N (h d) -> L (N h) d
-    
+
     # ======== replace the semantic into more efficient implementation ============
     # q = q.transpose(0, 1)  # L (N h) d -> (N h) L d
     # k = k.transpose(0, 1)  # L (N h) d -> (N h) L d
     # q = q * scale          # (N h) L d, 1 -> (N h) L d
     # k = k.transpose(1, 2)  # (N h) L d -> (N h) d L
     # attn = torch.bmm(q, k) # (N h) L d, (N h) d L -> (N h) L L
-    
+
     # preallocating input tensor: (N h) L L
     matmul_input_buffer = torch.empty([N * h, L, L], dtype=query.dtype, device=query.device)
     # L (N h) d, L (N h) d -> (N h) L L
@@ -56,7 +56,7 @@ def self_attention(query: torch.Tensor,
     return output
 
 
-@nnscaler.graph.parser.register('L^ N E^, L^ N E^, (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), E^ (h+ d) -> L^ N E^', name='cross_attention')
+@nnscaler.register_op('L^ N E^, L^ N E^, (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), (h+ d) E^, (h+ d), E^ (h+ d) -> L^ N E^', name='cross_attention')
 def cross_attention(query: torch.Tensor, key: torch.Tensor,
                     q_proj: torch.Tensor, q_bias: torch.Tensor,
                     k_proj: torch.Tensor, k_bias: torch.Tensor,

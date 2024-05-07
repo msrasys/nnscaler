@@ -3,6 +3,7 @@ import math
 import nnscaler
 
 from nnscaler.profiler import CudaTimer
+from nnscaler.compiler import compile, SemanticModel
 from nnscaler.profiler.timer import print_each_rank
 
 from examples.alphafold2.model import *
@@ -14,7 +15,7 @@ from nnscaler.algorithm.ops.dimops import gen_partitions
 from nnscaler.graph.function.anchor import IRGraphAnchor
 
 
-    
+
 def build_alphafold_config(setting:int):
     assert setting in [1, 2, 3], "setting should be in [1, 2, 3]."
     # dtype, evo_num, use_chunk, is_train, is_extra = torch.float16, 48, False, True, False
@@ -44,7 +45,7 @@ def run(size_config, other_config, policy):
     if not is_train:
         model.eval()
 
-    model = nnscaler.SemanticModel(model,
+    model = SemanticModel(model,
                                input_shapes=([bs, s, r, cm], [bs, r, r, cz]))
 
     dataloader = nnscaler.runtime.syndata.SynDataLoader(shapes=([bs, s, r, cm],
@@ -52,7 +53,7 @@ def run(size_config, other_config, policy):
                                                     dtypes=(dtype, dtype),
                                                     batch_dims=(0, 0))
 
-    @nnscaler.compile(model, dataloader, PAS=policy, override=True)
+    @compile(model, dataloader, PAS=policy, override=True)
     def train_iter(model, dataloader):
         msa_repr, pair_repr = next(dataloader)
         loss = model(msa_repr, pair_repr)

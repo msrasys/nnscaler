@@ -3,8 +3,8 @@ from gpt_model import build_model, GeLUFunction
 model = build_model()
 
 # 2. register customized op
-from nnscaler.graph.parser.register import register
-register('* h, h -> * h')(GeLUFunction.apply)
+from nnscaler import register_op
+register_op('* h, h -> * h')(GeLUFunction.apply)
 
 # 3. build semantic model
 from nnscaler import SemanticModel

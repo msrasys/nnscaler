@@ -17,6 +17,8 @@ from examples.nlp.mbart.model import MBartForSentenceClassification, Config
 from examples.nlp.mbart.model import dummy_data
 
 import nnscaler
+from nnscaler.compiler import compile
+from nnscaler.utils import set_default_logger_level, load_model
 from nnscaler.profiler.timer import CudaTimer, print_each_rank
 from nnscaler.profiler.memory import memory_summary
 from nnscaler.runtime.utils import microbatches
@@ -29,7 +31,7 @@ parser = argparse.ArgumentParser(description='GPT Train')
 parser.add_argument('--policy', type=str, help='PAS policy choice, starting with PAS')
 parser.add_argument('--fp16', action='store_true', default=False,
                     help='use fp16 for the training')
-parser.add_argument('--dp', type=int, default=1, 
+parser.add_argument('--dp', type=int, default=1,
                     help='data parallel size, only for megatron')
 parser.add_argument('--tp', type=int, default=1,
                     help='tensor parallel size, only for megatron')
@@ -55,13 +57,13 @@ print(args)
 
 
 nnscaler.init()
-nnscaler.set_logger_level(logging.WARN)
+set_default_logger_level(logging.WARN)
 logging.getLogger('nnscaler.compiler').setLevel(logging.INFO)
 
 # get policy
 policy = get_policy([gallery], args.policy)
-policy = partial(policy, 
-    nmicros=args.gbs//args.mbs, 
+policy = partial(policy,
+    nmicros=args.gbs//args.mbs,
     dp_size=args.dp,
     tp_size=args.tp
 )
@@ -105,12 +107,12 @@ def train():
     gen_data = partial(dummy_data, batch_size, config)
     dataloader = microbatches((gen_data(),), cycle=True)
 
-    @nnscaler.compile(model, dataloader, PAS=policy)
+    @compile(model, dataloader, PAS=policy)
     def train_iter(model, dataloader):
         input_ids, decoder_input_ids = next(dataloader)
         loss = model(input_ids, decoder_input_ids)
         loss.backward()
-    model = nnscaler.load_model()
+    model = load_model()
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=3e-05, betas=(0.9, 0.98))

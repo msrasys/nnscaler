@@ -13,6 +13,7 @@ from examples.vision.swin.blocks.attention import init_relative_position_index
 from examples.vision.swin.model import Config, SwinTransformer, dummy_data
 
 import nnscaler
+from nnscaler.compiler import compile
 from nnscaler.profiler.timer import CudaTimer, print_each_rank
 from nnscaler.profiler.memory import memory_summary
 from nnscaler.runtime.utils import microbatches
@@ -26,7 +27,7 @@ parser = argparse.ArgumentParser(description='GPT Train')
 parser.add_argument('--policy', type=str, help='PAS policy choice, starting with PAS')
 parser.add_argument('--fp16', action='store_true', default=False,
                     help='use fp16 for the training')
-parser.add_argument('--dp', type=int, default=1, 
+parser.add_argument('--dp', type=int, default=1,
                     help='data parallel size, only for megatron')
 parser.add_argument('--tp', type=int, default=1,
                     help='tensor parallel size, only for megatron')
@@ -40,8 +41,8 @@ nnscaler.init()
 
 # get policy
 policy = get_policy([gallery], args.policy)
-policy = partial(policy, 
-    nmicros=args.gbs//args.mbs, 
+policy = partial(policy,
+    nmicros=args.gbs//args.mbs,
     dp_size=args.dp,
     tp_size=args.tp
 )
@@ -62,7 +63,7 @@ def train():
     gen_data = partial(dummy_data, args.mbs, torch.float16, cfg)
     dataloader = microbatches((gen_data(),))
 
-    @nnscaler.compile(model, dataloader, PAS=policy, load_content=load_content)
+    @compile(model, dataloader, PAS=policy, load_content=load_content)
     def train_iter(model, dataloader):
         imgs = next(dataloader)
         loss = model(imgs)

@@ -10,6 +10,7 @@ from torch import nn
 from functools import partial
 
 import nnscaler
+from nnscaler.compiler import compile
 from nnscaler.profiler import CudaTimer
 from nnscaler.profiler.timer import print_each_rank
 from nnscaler.runtime.utils import microbatches
@@ -63,7 +64,7 @@ def train():
     dataloader = microbatches((dummy_data(),))
 
     # compile a training iteration
-    @nnscaler.compile(model, dataloader, PAS=policy)
+    @compile(model, dataloader, PAS=policy)
     def train_iter(model, dataloader):
         data = next(dataloader)
         loss = model(data)

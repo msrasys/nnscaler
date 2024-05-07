@@ -7,7 +7,7 @@ import torch
 import torch.utils.checkpoint as ckpt
 
 
-@nnscaler.graph.parser.register('N S R^ M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^ -> N S R^ M^', name='msa_attn')
+@nnscaler.register_op('N S R^ M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^ -> N S R^ M^', name='msa_attn')
 @torch.jit.ignore
 def msa_attn(x: torch.Tensor, gate_proj: torch.Tensor,
                  qkv_proj: torch.Tensor, out_proj: torch.Tensor, head: int,
@@ -64,7 +64,7 @@ def msa_attn(x: torch.Tensor, gate_proj: torch.Tensor,
     return out
 
 
-@nnscaler.graph.parser.register('N S R^ M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^, N 1 head+ R^ R^ -> N S R^ M^', name='msa_attn_bias')
+@nnscaler.register_op('N S R^ M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^, N 1 head+ R^ R^ -> N S R^ M^', name='msa_attn_bias')
 @torch.jit.ignore
 def msa_attn_bias(x: torch.Tensor, gate_proj: torch.Tensor,
                   qkv_proj: torch.Tensor, out_proj: torch.Tensor,
@@ -132,7 +132,7 @@ def msa_attn_bias(x: torch.Tensor, gate_proj: torch.Tensor,
 
 
 # note: code not reused constrained by cube's interface
-@nnscaler.graph.parser.register('N S R^ M^, N R^ R^ Z^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^, Z^ head+ -> N S R^ M^', name='row_attn')
+@nnscaler.register_op('N S R^ M^, N R^ R^ Z^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^, Z^ head+ -> N S R^ M^', name='row_attn')
 def row_attn(msa_repr: torch.Tensor, pair_repr: torch.Tensor,
              gate_proj: torch.Tensor,
              qkv_proj: torch.Tensor, out_proj: torch.Tensor,
@@ -147,7 +147,7 @@ def row_attn(msa_repr: torch.Tensor, pair_repr: torch.Tensor,
                         head, c, scale, chunk_size, is_train)
 
 
-@nnscaler.graph.parser.register('N S^ R M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^ -> N S^ R M^', name='col_attn')
+@nnscaler.register_op('N S^ R M^, M^ (head+ dim), M^ (head+ dim 3), (head+ dim) M^ -> N S^ R M^', name='col_attn')
 def col_attn(msa_repr: torch.Tensor, gate_proj: torch.Tensor,
              qkv_proj: torch.Tensor, out_proj: torch.Tensor, head: int,
              c: int, scale: float, chunk_size: int, is_train: bool):
@@ -160,7 +160,7 @@ def col_attn(msa_repr: torch.Tensor, gate_proj: torch.Tensor,
     return out
 
 
-# @nnscaler.graph.parser.register('N S^ R^ M^, M^ (head+ dim^), M^ E^, M^ E^, M^ (head+ dim^), (head+ dim) M^ -> N S^ R^ M^', name='MSAColGlobalAttention')
+# @nnscaler.register_op('N S^ R^ M^, M^ (head+ dim^), M^ E^, M^ E^, M^ (head+ dim^), (head+ dim) M^ -> N S^ R^ M^', name='MSAColGlobalAttention')
 def global_attn(msa_repr: torch.Tensor, q_proj: torch.Tensor,
                           k_proj: torch.Tensor, v_proj: torch.Tensor,
                           gate_proj: torch.Tensor, out_proj: torch.Tensor,
@@ -197,7 +197,7 @@ def global_attn(msa_repr: torch.Tensor, q_proj: torch.Tensor,
     return torch.matmul(o, out_proj).transpose(-2, -3)
 
 
-@nnscaler.graph.parser.register('N S R M^, M^ E+, E+ M^ -> N S R M^', name='feedforward')
+@nnscaler.register_op('N S R M^, M^ E+, E+ M^ -> N S R M^', name='feedforward')
 @torch.jit.ignore
 def feedforward(msa_repr: torch.Tensor, proj1: torch.Tensor, proj2: torch.Tensor):
     """
@@ -211,7 +211,7 @@ def feedforward(msa_repr: torch.Tensor, proj1: torch.Tensor, proj2: torch.Tensor
     return x
 
 
-@nnscaler.graph.parser.register('N S R^ Z^, Z^ (head+ dim), Z^ (head+ dim 3), (head+ dim) Z^, N R^ R^ head+ -> N S R^ Z^', name='tri_attn_start')
+@nnscaler.register_op('N S R^ Z^, Z^ (head+ dim), Z^ (head+ dim 3), (head+ dim) Z^, N R^ R^ head+ -> N S R^ Z^', name='tri_attn_start')
 def tri_attn_start(pair_repr: torch.Tensor,
                    gate: torch.Tensor, qkv: torch.Tensor,
                    out: torch.Tensor, bias: torch.Tensor,
@@ -224,7 +224,7 @@ def tri_attn_start(pair_repr: torch.Tensor,
     return out
 
 
-@nnscaler.graph.parser.register('N S^ R Z^, Z^ (head+ dim), Z^ (head+ dim 3), (head+ dim) Z^, N S^ S^ head+ -> N S^ R Z^', name='tri_attn_end')
+@nnscaler.register_op('N S^ R Z^, Z^ (head+ dim), Z^ (head+ dim 3), (head+ dim) Z^, N S^ S^ head+ -> N S^ R Z^', name='tri_attn_end')
 def tri_attn_end(pair_repr: torch.Tensor,
                  gate: torch.Tensor, qkv: torch.Tensor,
                  out: torch.Tensor, bias: torch.Tensor,
@@ -286,7 +286,7 @@ class MSAColAttention(torch.nn.Module):
         msa_repr: [N S R M]
         """
         out = col_attn(
-            msa_repr, self.gate, self.qkv, self.out, 
+            msa_repr, self.gate, self.qkv, self.out,
             self.heads, self.dhead, self.scale,self.chunk_size, self.training
         )
         return out

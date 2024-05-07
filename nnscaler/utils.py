@@ -152,6 +152,19 @@ def setup_stride_broadcast_group(stride_size: int) -> BroadcastGroup:
     )
 
 
+def set_default_logger_level(level):
+    """Set the logger level with predefined logging format.
+
+    Args:
+        level (int): the level of the logger.
+    """
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+
 class accum_mode:
     """Make cube execution in gradient accumulation mode.
 

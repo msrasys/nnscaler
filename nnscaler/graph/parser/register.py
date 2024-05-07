@@ -19,7 +19,7 @@ class CustomizedOps:
 
     # signature -> IRDimop creation function
     kOpMap: Dict[str, Callable] = {}
-    # singature -> runtime function 
+    # singature -> runtime function
     kOpRuntime: Dict[str, Callable] = {}
     # signature -> runtime function implementation code
     kOpCodeDef: Dict[str, str] = {}
@@ -27,7 +27,7 @@ class CustomizedOps:
     @staticmethod
     def map(signature: str) -> Callable:
         """Get IRDimop creation function by signature
-        
+
         Args:
             signature (str): operator signature
 
@@ -65,7 +65,7 @@ class CustomizedOps:
         CustomizedOps.kOpCodeDef[signature] = code
 
 
-def register(node_repr: Union[str, Callable], name: Optional[str] = None,
+def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
              code_impl_pattern: str = 'import') -> Callable:
     """
     Register a function with IRDimops annotations.
@@ -73,9 +73,9 @@ def register(node_repr: Union[str, Callable], name: Optional[str] = None,
     This function is cooperated with IRDimops. Users can only register functions defined under a module, instead of
     ones defined inside a function / class or __main__ scope.
 
-    The annotation (`node_repr`) specifies the number of inputs as *args,
-    and treat all the rest inputs as **kwargs. 
-    
+    The annotation (`annotation`) specifies the number of inputs as *args,
+    and treat all the rest inputs as **kwargs.
+
     For tensor-type inputs, the annotation should be a string of identifiers separated by space, e.g., `'a b'`;
     For non-tensor-type inputs, the annotation should be specified '?'.
 
@@ -98,7 +98,7 @@ def register(node_repr: Union[str, Callable], name: Optional[str] = None,
     def func(x, b = 4):
         xxx
     ```
-    
+
     or,
 
     ```python
@@ -112,7 +112,7 @@ def register(node_repr: Union[str, Callable], name: Optional[str] = None,
     ```
 
     Args:
-        node_repr (str | Callable): operator annotation of IRDimops or callable function that generates IRFwOperation.
+        annotation (str | Callable): operator annotation of IRDimops or callable function that generates IRFwOperation.
             - op annotation: e.g., 'a (b c) -> (a b) c'
             - a callable function that generates op annotation (str). The function
             taks inputs and kwargs as arguments and returns the operator annotation.
@@ -166,7 +166,7 @@ def register(node_repr: Union[str, Callable], name: Optional[str] = None,
                 code = inspect.getsource(fn)
                 code = code[code.index('def'):]
             return code
-        
+
         def get_import_code(fn: Callable) -> str:
             import_path = get_import_path(fn)
             code = f'import {import_path}'
@@ -180,11 +180,11 @@ def register(node_repr: Union[str, Callable], name: Optional[str] = None,
             raise ValueError(f'code_impl_pattern should be either "import" or "source", got {code_impl_pattern}')
 
         # step 3. define customized IRDimops creation function
-        if not (isinstance(node_repr, str) or callable(node_repr)):
-            raise TypeError(f"node_repr should be either str or callable, got {type(node_repr)}")
+        if not (isinstance(annotation, str) or callable(annotation)):
+            raise TypeError(f"annotation should be either str or callable, got {type(annotation)}")
 
         def udfop(*args, signature=None, **kwargs):
-            anno = node_repr if isinstance(node_repr, str) else node_repr(*args, **kwargs)
+            anno = annotation if isinstance(annotation, str) else annotation(*args, **kwargs)
             if not isinstance(anno, str):
                 raise TypeError(f"node_repr should return a string, but got {type(anno)}: {anno}")
             anno = OpAnno(anno)
@@ -212,3 +212,8 @@ def register(node_repr: Union[str, Callable], name: Optional[str] = None,
         return fn
 
     return decorator
+
+
+# [Deprecated] register_op alias
+# Will remove in future.
+register = register_op
