@@ -316,3 +316,18 @@ def retry(*exceptions, max_tries=3, match: Optional[Union[str, Pattern[str]]] = 
         return wrapper
 
     return decorator
+
+
+@contextmanager
+def catch_log(_logger, loglevel='DEBUG'):
+    import logging
+    from io import StringIO
+    string_stream = StringIO()
+    old = _logger.level
+    _logger.setLevel(loglevel)
+    handler = logging.StreamHandler(string_stream)
+    handler.setLevel(loglevel)
+    _logger.addHandler(handler)
+    yield string_stream
+    _logger.removeHandler(handler)
+    _logger.setLevel(old)

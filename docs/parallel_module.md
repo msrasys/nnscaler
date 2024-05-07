@@ -297,21 +297,26 @@ class BroadcastGenFilesStrategy(Enum):
 ```
 
 1. `None`:  nothing will be broadcasted.
+
     You need to do it by yourself or the generated files are save in a shared directory (like azure blob).
 
-2. `ALL`: broadcast all the generated files to all nodes.
+2. `ALL`: broadcast all the generated files to all nodes (Recommended).
+
     This is useful when you want to run the same code on all nodes.
     please note the init weight files can be huge.
 
-3. `NO_WEIGHTS`: broadcast all except init weights.
+3. `NO_WEIGHTS`: broadcast all except init weights (Only for experts).
+
     Without weights, you can only construct the parallel module with `init_params=False`.
     You can then
-    - Load the weights from a checkpoint file with `module.load_state_dict`, `load_merged_state_dict`
-        or `load_deduped_state_dict`
-    - Or you can use `broadcast_weights` to get the weights from the workers in node0.
-       (local world size should be bigger than plan_ngpus)
+    - Safe way: you can use `broadcast_weights` to get the weights from the workers who have init weights. By default rank 0 will run the `parallelize` and store all the generated files. So if local world size is bigger than plan_ngpus, you can use `broadcast_weights` to get the weights from workers on node0.
+    - Risk Way: Load the weights from a checkpoint file with `module.load_state_dict`, `load_merged_state_dict` or `load_deduped_state_dict`.
 
-4. `CODE`: broadcast the new generated code only
+    Please note: the non-persistent buffers will remain uninitialized after loading the checkpoints,
+    because they are not saved in the state dict.
+    To make sure all the buffers are initialized,  you still need to set `init_params=True` to make sure non-persistent buffers are initialized if you want to initialize weights by loading a checkpoint.
+
+4. `CODE`: broadcast the new generated code only (Not recommeneded)
     It's your responsibility to make sure other necessary files are available on all nodes.
 
 Here are some guidelines to choose the strategy:
@@ -325,9 +330,9 @@ a. If use `none`, the user should run `parallelize(..., load_module=False, ..)`,
 
 b. if they are using a NAS-like device to save generated files, and the upload/download speed is fast in the cluster, they can also use `none`, and just run `parallelize(..., load_module=True, ..)` to do the training.
 
-c. If use `all`, then user can just run `parallelize(..., load_module=True, ..)` safely. (remember to set `nccl` communication timeout to a very big value to tolerate the duration of this `nccl` broadcast)
+c. If use `all`, then user can just run `parallelize(..., load_module=True, ..)` safely. (remember to set `nccl` communication timeout to a very big value to tolerate the duration of this `nccl` broadcast). This is the most recommended way.
 
-d. If use `no_weights`. then user can run `parallelize(..., load_module=True, init_module_params=rank<plan_ngpus, ..)`. After module is loaded, the user should call `broadcast_weights(plan_ngpus)` manually to synchronize the module weights before training (Note all submodules have the same `plan_ngpus`).
+d. If use `no_weights`. then user can run `parallelize(..., load_module=True, init_module_params=rank<plan_ngpus, ..)`. After module is loaded, the user should call `broadcast_weights(plan_ngpus)` manually to synchronize the module weights before training (Note all submodules have the same `plan_ngpus`). Here is an example:
 ```python
 class Module(torch.nn.Module):
     ...
@@ -336,11 +341,13 @@ rank = torch.distributed.get_rank()
 local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', default=1))
 assert local_world_size < plan_ngpus
 
-parallel_module = parallelize(Module(), ..., load_module=True, init_module_params=rank<plan_ngpus, broadcast_strategy='no_weights, ...)
+parallel_module = parallelize(Module(), ..., load_module=True, init_module_params=rank<plan_ngpus, broadcast_strategy='no_weights', ...)
 
 broadcast_weights(parallel_module, plan_ngpus)
 # now the module is ready to train
 ```
+`no_weights` option is only suggested for experts, because you must be very careful to make it right
+when there are non-persistent buffers in the module.
 
 e. Currently `code` option is provided just for completeness. Do not suggest users to use.
 
@@ -368,7 +375,7 @@ It has the following parameters:
 
 - `module_or_module_class` (`Union[torch.nn.Module, Type[torch.nn.Module]]`): the module or module class to be compiled. Please note if the input is a module object, we will return a `ParallelModule` object. If the input is a module class, we will return a `ParallelModule` class.
 
-- `dummy_input` (`dict`): the dummy input for the module
+- `dummy_input` (`dict`): the dummy input for the module. The keys are the argument names of `Module.forward` function, and the values are the dummy input for the arguments. The dummy input will be used to trace the module. Please note the module can't be parallelize if `Module.forward` has positional-only arguments.
 
 - `pas_policy` (`Callable[[IRGraph, ComputeConfig], IRGraph]`): the pas policy, which describes how to place all computations across devices. You can use `autodist` to do the pas automatically in the most efficient way.
 
@@ -387,6 +394,7 @@ Currently the module can only be loaded in `torchrun` environment. So you can do
 Otherwise, they will be empty tensor.
 This parameter will be passed to the module constructor,
 so it is only used when `module_or_module_class` is a module object, and `load_module` is true.
+See more details in the `ParallelModule APIs` section.
 
 - `module_dtype` (`Optional[torch.dtype]`): the dtype of the module. Keep the module as it is if it is None.
 
@@ -410,21 +418,6 @@ you can specify the `instance_name` to distinguish them.
 the generated code in outdir will be removed EVEN IF the code generation fails in this call.
 
 5. For `broadcast_strategy`, Please note that the broadcast will only be done in `torchrun` environment, and will throw an error if `torch.distributed` is not initialized and `broadcast_strategy` is not `NONE`.
-
-After the module is converted, you can use it to create module object by calling it like a module class.
-The module class is defined like:
-```python
-class GenModule(nnscaler.runtime.module.ParallelModule):
-    def __init__(self, init_params=True):
-        super().__init__()
-        ...
-    ...
-```
-So you can use `init_params` in `__init__` to control whether to initialize the module parameters.
-For example, if you don't want to intialize module params:
-```python
-module = GenModule(init_params=False)
-```
 
 
 ### Optimizer Creation
@@ -492,6 +485,9 @@ def __init__(self, init_params=True):
 ```
 You can use `init_params` to control whether to initialize the module parameters with the module parameters' values when we trace it. You can set it to `False` if you don't want to.
 
+As noted before, in most cases, you still need to set `init_params=True` to make sure non-persistent buffers are initialized if you want to initialize weights by loading a checkpoint.
+
+
 2. `train_step`
 ```python
 def train_step(self,
@@ -530,12 +526,13 @@ The input is a list of samples, and returns a list of outputs for the samples. I
 You can save/load the checkpoints for parallel modules.
 Each rank will save/load its own checkpoint just like the normal module.
 
+Note: The only exception is the non-persistent buffers, which will remain uninitialized after loading the checkpoints, because they are not saved in the state dict. To make sure all the buffers are initialized, you must initialize the module with `init_params=True`.
+
 You can also merge the checkpoints from different ranks to a single checkpoint.
 We call it a merged checkpoint. The merged checkpoint can be loaded by original module directly.
 So you can easily share the checkpoint with the original module.
 
 On the other hand, a lot of weights/state in the module and the optimizer will be the same in the ranks in parallel training. So we can save a lot of space by deduping the state dicts before saving them to the disk.
-
 
 We provide two functions to help you save/load the merged checkpoint for the parallel module,
 and two other functions to help you save/load the deduped state dicts for the parallel module.

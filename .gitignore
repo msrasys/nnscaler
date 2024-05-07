@@ -34,3 +34,6 @@ gencode*
 shelf
 *.iml
 *.xml
+
+# cppimport generated file
+.rendered.*.cpp

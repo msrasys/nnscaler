@@ -623,6 +623,29 @@ class ParallelModule(CubeModule):
         # this is a lazy initialization,
         # which will be initialized in the first call of `clip_gnorm`
         self._nreplicas2localparams: Optional[Dict[int, List[torch.nn.Parameter]]] = None
+        # track whether all the parames (especially the non-persistent buffers) have been initialized
+        self._non_presistent_buffers_inited = False
+
+    @property
+    def non_presistent_buffers_inited(self):
+        return self._non_presistent_buffers_inited
+
+    def mark_non_persistent_buffers_inited(self):
+        self._non_presistent_buffers_inited = True
+
+    def _warn_uninitialized_non_persistent_buffers(self, raise_error = False):
+        _non_persistent_buffers_load_warning = (
+            "Non-persistent buffers cannot be initialized with load_[/merged/dedupped]state_dict. "
+            "Please be sure to you will initialize them manually. "
+        )
+        _non_persistent_buffers_load_error = (
+            "Non-persistent buffers haven't been initialized."
+        )
+        if not self._non_presistent_buffers_inited:
+            if raise_error:
+                raise RuntimeError(_non_persistent_buffers_load_error)
+            else:
+                _logger.warning(_non_persistent_buffers_load_warning)
 
     def _post_init(self, init_params=True):
         """
@@ -638,10 +661,14 @@ class ParallelModule(CubeModule):
         # if dist.is_initialized() and self.rank != dist.get_rank():
         #     raise RuntimeError(f"The rank to load this module file name is expected to be {self._rank}, but got {dist.get_rank()}")
 
+        self._non_presistent_buffers_inited = init_params or not self._non_persistent_buffers_set
         module_file = Path(sys.modules[self.__module__].__file__)
         self.module_dir = module_file.parent
         if init_params:
             self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
+
+        self._warn_uninitialized_non_persistent_buffers()
+
         self._dist_param_map = torch.load(module_file.with_name(f"{FxModuleParser.ATTR_MAP_FILE}"))
         self._compute_config: 'ComputeConfig' = torch.load(module_file.with_name(f"{self.COMPUTE_CONFIG_FILE}"))
         self._orign_module_metadata: OriginModuleMetadata = torch.load(module_file.with_name(f"{self.ORIGIN_MODULE_METADATA_FILE}"))
@@ -659,6 +686,7 @@ class ParallelModule(CubeModule):
         self._register_load_state_dict_pre_hook(ParallelModule._pre_load_state_dict_hook, with_module=True)
 
     def forward(self, *args, **kwargs):
+        self._warn_uninitialized_non_persistent_buffers(raise_error=True)
         if self.training:
             self._sync_grad_required = True  # mark sync_grad() can be called again
         return self._forward_impl(*args, **kwargs)
@@ -760,6 +788,8 @@ class ParallelModule(CubeModule):
         Results:
             List[Any]: a list of outputs for each sample
         """
+        self._warn_uninitialized_non_persistent_buffers(raise_error=True)
+
         if not self.compute_config.use_end2end:
             raise RuntimeError("train_step() is only supported in end2end mode")
         if is_dummy_batch and len(samples) != len(is_dummy_batch):
@@ -798,6 +828,8 @@ class ParallelModule(CubeModule):
         Results:
             List[Any]: a list of outputs for each sample
         """
+        self._warn_uninitialized_non_persistent_buffers(raise_error=True)
+
         if not self.compute_config.use_end2end:
             raise RuntimeError("infer_step() is only supported in end2end mode")
 
@@ -965,6 +997,8 @@ class ParallelModule(CubeModule):
 
     def _pre_load_state_dict_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs) -> None:
         self._remove_extra_state(state_dict, prefix)
+        # Both load_state_dict and load_deduped_state_dict will trigger this hook
+        self._warn_uninitialized_non_persistent_buffers()
 
     @property
     def module_dedup_group_size(self) -> int:
@@ -1047,3 +1081,5 @@ class ParallelModule(CubeModule):
                     raise RuntimeError(erro_msg)
                 else:
                     _logger.warning(erro_msg)
+
+        self._warn_uninitialized_non_persistent_buffers()

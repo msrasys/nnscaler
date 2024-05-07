@@ -243,6 +243,7 @@ def _to_cpu(val: Any):
         return val.cpu()
     return val
 
+
 def to_ir_input(sample, name):
     """Support complex of types: Tuple, List, Dict, torch.Tensor"""
     if isinstance(sample, tuple):
@@ -319,6 +320,16 @@ def _clean_files(_dir: Path, pattern = '*') -> None:
     for f in _dir.glob(pattern):
         if f.is_file():
             f.unlink()
+
+
+def _broadcast_single_value(src_rank, group, obj=None):
+    sent_obj = [obj]
+    torch.distributed.broadcast_object_list(
+        sent_obj,
+        src=src_rank,
+        group=group,
+    )
+    return sent_obj[0]
 
 
 _DEFAULT_INSTANCE_NAME = '_'
@@ -2178,6 +2189,10 @@ def _broadcast_weights(module: torch.nn.Module, stride_size: int):
     src_rank, curr_parallel_group, curr_parallel_group_ranks = broadcast_group.src_rank, broadcast_group.group, broadcast_group.ranks
     logging.info(f'Rank-{rank} is broadcasting weight to ranks {curr_parallel_group_ranks}, broadcast root: {src_rank}...')
 
+    if isinstance(module, ParallelModule):
+        if not _broadcast_single_value(src_rank, curr_parallel_group, module.non_presistent_buffers_inited):
+            module._warn_uninitialized_non_persistent_buffers(raise_error=True)
+
     # we have a special optimization for ParallelModule
     params = module.parameters_for_broadcast() if isinstance(module, ParallelModule) else module._parameters.values()
     logging.info(f'Inplace broadcasting {len(params)} parameters...')
@@ -2190,5 +2205,8 @@ def _broadcast_weights(module: torch.nn.Module, stride_size: int):
     logging.info(f'Inplace broadcasting {len(module._buffers)} buffers...')
     for _, buffer in module._buffers.items():
         torch.distributed.broadcast(buffer.data, src=src_rank, group=curr_parallel_group)
+
+    if isinstance(module, ParallelModule):
+        module.mark_non_persistent_buffers_inited()
 
     torch.distributed.barrier()
