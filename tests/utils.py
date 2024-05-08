@@ -331,3 +331,14 @@ def catch_log(_logger, loglevel='DEBUG'):
     yield string_stream
     _logger.removeHandler(handler)
     _logger.setLevel(old)
+
+
+@contextmanager
+def catch_stdout():
+    import sys
+    from io import StringIO
+    old = sys.stdout
+    string_stream = StringIO()
+    sys.stdout = string_stream
+    yield string_stream
+    sys.stdout = old

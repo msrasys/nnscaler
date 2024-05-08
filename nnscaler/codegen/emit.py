@@ -174,6 +174,8 @@ class FuncEmission(CodeEmission):
         # insert comment
         if node.comment is not None:
             codes.append(f'# {node.comment}')
+        if CompileFlag.line_timer:
+            codes.append(f'nnscaler.runtime.function.print_time({repr(node.comment or node.signature)})')
 
         signature = node.signature
         # setup arg string
@@ -242,6 +244,8 @@ class FuncEmission(CodeEmission):
                 prim_kwargs['async_op'] = True
             kwargs = self.kwargs_name(**prim_kwargs)
             outputs = self.return_name(prim.outputs())
+            if CompileFlag.line_timer:
+                codes.append(f'nnscaler.runtime.function.print_time({repr(prim.signature)})')
             code = f'{outputs} = {prim.signature}({itensors}, {kwargs})'
             codes.append(code)
         return codes
@@ -254,8 +258,11 @@ class FuncEmission(CodeEmission):
         -   NONE
         """
         reducer_name = f'self.wreducer{node._id}'
-        code = f'{reducer_name}.sync_grads()'
-        return [code]
+        codes = []
+        if CompileFlag.line_timer:
+            codes.append(f'nnscaler.runtime.function.print_time({repr(reducer_name)})')
+        codes.append(f'{reducer_name}.sync_grads()')
+        return codes
 
     def emit_release(self, tensors: Iterable[IRTensor]) -> str:
         tnames : Generator = (self.tensor_name(t) for t in tensors)

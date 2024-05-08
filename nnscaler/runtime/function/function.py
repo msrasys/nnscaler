@@ -2,6 +2,8 @@ from typing import Optional, List, Tuple, Union
 import torch
 import torch.nn.functional as TorchF
 import operator
+import datetime
+from nnscaler.flags import CompileFlag
 
 
 def identity(tensor: torch.Tensor) -> torch.Tensor:
@@ -219,3 +221,12 @@ def nndropout(input: torch.Tensor, p=0.5, inplace=False):
 def setitem(__a, __b, __c):
     operator.setitem(__a, __b, __c)
     return __a
+
+
+def print_time(content: str):
+    if not CompileFlag.line_timer:
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"line timer: {rank} - {datetime.datetime.now()} - {content}")

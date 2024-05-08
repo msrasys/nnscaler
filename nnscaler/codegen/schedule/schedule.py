@@ -15,6 +15,7 @@ from nnscaler.codegen.emit import FuncEmission
 from nnscaler.codegen.syntax.symtable import SymbolTable
 from nnscaler.codegen.lifecycle import LifeCycle
 from nnscaler.codegen.syntax.blocks import FunctionBlock
+from nnscaler.flags import CompileFlag
 
 
 _logger = logging.getLogger(__name__)
@@ -200,4 +201,8 @@ class ScheduleCodeGen(FuncEmission):
         else:
             raise RuntimeError(f"Unspported node type: {type(unwrap_node)}")
 
-        return [code]
+        if CompileFlag.line_timer:
+            type_str = type(unwrap_node).__name__
+            return [f'nnscaler.runtime.function.print_time({repr(type_str)})', code]
+        else:
+            return [code]
