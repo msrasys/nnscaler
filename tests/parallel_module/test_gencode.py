@@ -7,7 +7,7 @@ import pytest
 import nnscaler.graph.function.dimops
 from nnscaler.parallel import parallelize, ComputeConfig, CubeModule, _gen_graph
 
-from .common import PASData, init_distributed, PASRandomSPMD
+from .common import init_distributed
 from ..launch_torchrun import launch_torchrun
 from ..utils import replace_all_device_with
 
@@ -15,7 +15,7 @@ def _to_cube_model(module, compute_config, cube_savedir, load_module):
     return parallelize(
         module,
         {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
-        PASData,
+        'data',
         compute_config,
         cube_savedir=cube_savedir,
         load_module=load_module
@@ -59,7 +59,7 @@ def test_codegen_slice():
         m_new = parallelize(
             SliceModule(),
             {'x': torch.tensor([1.0, 2.0, 3.0, 6.0])},
-            PASData,
+            'dp',
             ComputeConfig(1, 1),
             cube_savedir=tempdir,
             load_module=False
@@ -87,7 +87,7 @@ def test_codegen_args():
                     'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
                     'y': 1.0,
                 },
-                PASData,
+                'dp',
                 ComputeConfig(1, 1),
                 cube_savedir=tempdir,
                 load_module=True
@@ -114,7 +114,7 @@ def _gencode_unused_args_worker(tempdir):
             'm': 0,
             'n': None,
          },
-        PASData,
+        'dp',
         ComputeConfig(1, 1),
         cube_savedir=tempdir,
         load_module=True
@@ -166,7 +166,7 @@ def _gencode_unused_args_worker2(tempdir):
             'y': torch.tensor([1, 2, 3]),
             'm': 0
          },
-        PASData,
+        'dp',
         ComputeConfig(1, 1),
         cube_savedir=tempdir,
         load_module=True
@@ -225,7 +225,7 @@ def test_codegen_attr():
         m_new = parallelize(
             AttrModule(),
             {'x': torch.tensor([1.0, 2.0, 3.0, 6.0]), 'attr': AttrHelper()},
-            PASData,
+            'dp',
             ComputeConfig(1, 1),
             cube_savedir=tempdir,
             load_module=False
@@ -257,7 +257,7 @@ def test_codegen_getitem():
         m_new = parallelize(
             GetItemModule(),
             {'batched_data': {'x': torch.tensor([[[1.0], [2.0], [3.0], [6.0]]])}},
-            PASRandomSPMD,
+            'tp',
             ComputeConfig(2, 2),
             cube_savedir=tempdir,
             load_module=False,
@@ -287,7 +287,7 @@ def test_codegen_training_flag():
         parallelize(
             m,
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
-            PASData,
+            'dp',
             ComputeConfig(1, 1),
             cube_savedir=tempdir,
             load_module=False
@@ -346,7 +346,7 @@ def test_codegen_iter():
         parallelize(
             m,
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
-            PASData,
+            'dp',
             ComputeConfig(1, 1),
             cube_savedir=tempdir,
             load_module=False
@@ -376,7 +376,7 @@ def test_codegen_const():
         parallelize(
             m,
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
-            PASData,
+            'dp',
             ComputeConfig(1, 1),
             cube_savedir=tempdir,
             load_module=False
@@ -415,7 +415,7 @@ def test_codegen_tensor_slice():
             parallelize(
                 m,
                 {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
-                PASData,
+                'dp',
                 ComputeConfig(1, 1),
                 cube_savedir=tempdir,
                 load_module=False,
@@ -426,7 +426,7 @@ def test_codegen_tensor_slice():
         parallelize(
             m,
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
-            PASData,
+            'dp',
             ComputeConfig(1, 1),
             cube_savedir=tempdir,
             load_module=False,
@@ -453,7 +453,7 @@ def test_codegen_dictget():
                 'x': torch.tensor([[[1.0], [2.0], [3.0], [6.0]]]),
                 'z': torch.tensor([[[1.0], [2.0], [3.0], [6.0]]])
             }},
-            PASRandomSPMD,
+            'tp',
             ComputeConfig(2, 2),
             cube_savedir=tempdir,
             load_module=False,
@@ -498,7 +498,7 @@ def _gencode_min_function_worker(tempdir):
             'a': torch.tensor([5, 2, 3]),
             'b': torch.tensor([1, 8, 1]),
         },
-        PASData,
+        'dp',
         ComputeConfig(1, 1),
         cube_savedir=tempdir,
         load_module=True
@@ -534,7 +534,7 @@ def _gencode_max_function(tempdir):
         {
             'a': torch.tensor([[1, 2, 3], [4, 5, 6]]),
         },
-        PASData,
+        'dp',
         ComputeConfig(1, 1),
         cube_savedir=tempdir,
         load_module=True
@@ -575,7 +575,7 @@ def test_codegen_shared_parameter():
         parallelize(
             m,
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
-            PASData,
+            'dp',
             ComputeConfig(1, 1),
             cube_savedir=tempdir,
             load_module=False,
@@ -612,7 +612,7 @@ def test_codegen_buffer():
         parallelize(
             m,
             {'x': torch.randn(128, 64)},
-            PASData,
+            'dp',
             ComputeConfig(1, 1),
             cube_savedir=tempdir,
             load_module=False,
@@ -656,7 +656,7 @@ def test_codegen_inference():
         parallelize(
             Module0(),
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
-            PASData,
+            'dp',
             ComputeConfig(1, 1, inference_only=True),
             cube_savedir=tempdir,
             load_module=False
@@ -684,7 +684,7 @@ def test_codegen_end2end():
         parallelize(
             m,
             {'data': torch.randn(batch_size, dim), 'return_type': return_type},
-            PASData,
+            'data',
             compute_config= ComputeConfig(
                 4, 4,
                 inference_only=inference_only,

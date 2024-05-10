@@ -7,7 +7,7 @@ import torch
 
 from nnscaler.parallel import ComputeConfig, parallelize, broadcast_weights
 
-from .common import PASRandomSPMD, init_distributed
+from .common import init_distributed
 from ..launch_torchrun import launch_torchrun
 
 
@@ -28,7 +28,7 @@ def _to_cube_model(module, compute_config, cube_savedir,
     return parallelize(
         module,
         {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},
-        PASRandomSPMD,
+        'tp',
         compute_config,
         cube_savedir=cube_savedir,
         instance_name=instance_name,

@@ -114,13 +114,14 @@ def parallelize_graph(graph: IRGraph,
             search_out_json = json.load(f)
         search_out = PipelineSearchOutput.from_json(search_out_json)
     else:
-        _logger.info(f'save plan to {autodist_config.save_plan_path}')
         compile_start_time = time.time()
         search_out = calc_parallel_plan(graph, autodist_config)
         compile_cost_time = time.time() - compile_start_time
 
-        with open(autodist_config.save_plan_path, 'w') as f:
-            json.dump(search_out.to_json(), f, indent=2)
+        if autodist_config.save_plan_path:
+            _logger.info(f'save plan to {autodist_config.save_plan_path}')
+            with open(autodist_config.save_plan_path, 'w') as f:
+                json.dump(search_out.to_json(), f, indent=2)
 
     _logger.info(f'use plan with e2e time/s {search_out.e2e_time}s,' +
                  f'stage mems/GB {search_out.stage_mems}, ' +
@@ -203,6 +204,10 @@ def parallelize_graph(graph: IRGraph,
         stages = [s for s in stages if s.isfw()]
     else:
         stages = [graph]
+
+    # TODO: check pipeline_nstages when ready.
+    # if autodist_config.pipeline and len(stages) != autodist_config.pipeline_nstages:
+    #     raise RuntimeError("pipeline_nstages doesn't match the number of stages (based on your pipeline_pivots config) in the plan")
 
     # add multiref to a tensor when
     # 1. it is not a grad tensor

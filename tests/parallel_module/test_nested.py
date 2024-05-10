@@ -5,7 +5,7 @@ import pytest
 
 from nnscaler.parallel import parallelize, ComputeConfig
 
-from .common import PASData, init_distributed
+from .common import init_distributed
 from ..launch_torchrun import launch_torchrun
 
 def _to_cube_model(module, pas, compute_config, cube_savedir):
@@ -32,7 +32,7 @@ def _nested_module_worker():
         class Module1(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.module0 = _to_cube_model(Module0(), PASData, ComputeConfig(1, 1), cube_savedir=tempdir)
+                self.module0 = _to_cube_model(Module0(), 'dp', ComputeConfig(1, 1), cube_savedir=tempdir)
 
             def forward(self, x):
                 return self.module0(x)
@@ -45,7 +45,7 @@ def _nested_module_worker():
                 return self.module1(x)
 
         with pytest.raises(RuntimeError, match='CubeModule can not be nested.'):
-            _to_cube_model(Module2(), PASData, ComputeConfig(1, 1), cube_savedir=tempdir)
+            _to_cube_model(Module2(), 'data', ComputeConfig(1, 1), cube_savedir=tempdir)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')

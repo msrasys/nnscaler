@@ -8,7 +8,7 @@ from torch import nn
 
 from nnscaler.parallel import ComputeConfig, parallelize
 
-from .common import CubeLinear, init_distributed, init_random, PASRandomSPMD, clear_dir_on_rank0
+from .common import CubeLinear, init_distributed, init_random, clear_dir_on_rank0
 from ..launch_torchrun import torchrun
 
 
@@ -62,7 +62,7 @@ def _inference_worker(ngpus, inference_only):
         model = Module()
         model.eval()
 
-        cube_model = _to_cube_model(model, PASRandomSPMD,
+        cube_model = _to_cube_model(model, 'tp',
             ComputeConfig(ngpus, ngpus, inference_only=inference_only),
             tempdir, 'test_inference'
         )

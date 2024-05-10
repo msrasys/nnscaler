@@ -18,7 +18,7 @@ from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.runtime.module import ParallelModule
 from nnscaler.runtime.gnorm import calcuate_gnorm
 
-from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
+from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 
 
@@ -286,8 +286,8 @@ def test_tp_ddp(update_freq):
             # print('weight: ', k, torch.max(torch.abs(a0[3][k]- b[3][k])))
             assert torch.allclose(a0.weights[k], b.weights[k], atol=1e-2, rtol=1e-2)  # weights
 
-    cube_results = launch_torchrun(4, _gpu_worker_cube, PASRandomSPMD, 2, 4, update_freq, False)
-    zcube_results = launch_torchrun(4, _gpu_worker_cube, PASRandomSPMD, 2, 4, update_freq, True)
+    cube_results = launch_torchrun(4, _gpu_worker_cube, 'tp', 2, 4, update_freq, False)
+    zcube_results = launch_torchrun(4, _gpu_worker_cube, 'tp', 2, 4, update_freq, True)
     worker_results0, worker_results1,  worker_results2, worker_results3 = cube_results[0], cube_results[1], cube_results[2], cube_results[3]
     results0: List[StepResult] = worker_results0[0]
     results1: List[StepResult] = worker_results1[0]

@@ -377,7 +377,7 @@ It has the following parameters:
 
 - `dummy_input` (`dict`): the dummy input for the module. The keys are the argument names of `Module.forward` function, and the values are the dummy input for the arguments. The dummy input will be used to trace the module. Please note the module can't be parallelize if `Module.forward` has positional-only arguments.
 
-- `pas_policy` (`Callable[[IRGraph, ComputeConfig], IRGraph]`): the pas policy, which describes how to place all computations across devices. You can use `autodist` to do the pas automatically in the most efficient way.
+- `pas_policy` (`Union[str, Callable[[IRGraph, ComputeConfig], IRGraph]]`): the pas (partition-assign-schedule) policy, which describes how to place all computations across devices. You need either pass a builtin PAS policy name or a a custom policy function which should take an `IRGraph` and a `ComputeConfig` as input, and return a new `IRGraph` with the PAS policy applied. We have 6 builtin PAS policies: `dp`, `tp`, `pp`, `data`, `hybrid`, and `autodist`. Please note all builtin PAS policies except `autodist` are only for test purpose. The `autodist` policy is the recommended policy for most cases. For details, please refer to `PAS Policies` section.
 
 - `compute_config` (`ComputeConfig`): the environment resource
 
@@ -439,7 +439,7 @@ It has the following parameters:
 - *args: other args for `optimizer_fn` besides module parameters.
 - **kwargs: the kwargs will pass to `optimizer_fn`
 
-To support distributed training, in the function we need to hook 4 places:
+To support distributed training, in the function we need to hook 4 places (which we have done for you in `build_optimizer`. That's why you should use `build_optimizer` to create optimizer):
 
 1. optimizer constructor:
     the parameters of optimizer will not be the same with the parameters of the module if we use zero.
@@ -447,7 +447,7 @@ To support distributed training, in the function we need to hook 4 places:
 
 2. `optimizer.step()`:
     we need to call `optimizer.sync_shard_grad()` to sync the gradients of the module before `optimizer.step()`.
-    In zero mode (not supported yet), we have to call `CubeModule.gather_params()` after `optimizer.step()`
+    In zero mode, we have to call `CubeModule.gather_params()` after `optimizer.step()`
 
 3. `optimizer.zero_grad()`:
     We need to call `CubeModule.zero_grad()` after `optimizer.zero_grad()`
@@ -520,6 +520,41 @@ def infer_step(self, samples: List[Any]) -> List[Any]:
 The inference step function. It should be called in the inference loop.
 The input is a list of samples, and returns a list of outputs for the samples. If pipeline is used, it must have the same length as pipeline_nmicros
 
+### PAS Policies
+
+Writing a pas policy can be very hard and error-prone. So we provide 6 builtin PAS policies to help you. `dp`, `tp`, `pp`, `data`, `hybrid`, and `autodist`. Please note only `autodist` policy is the recommended policy for most cases, and all other PAS policies are mainly test purpose only.
+
+The configuration of the PAS policy should be passed in the `user_config.code['pas']` of `ComputeConfig` as a dictionary.
+
+1. `dp`: data parallelism. It will replicate the module across all devices, and run data parallelism across all devices. It requires the `plan_ngpus` must be 1 and no configurations
+
+2. `tp`: tensor parallelism + data parallelism. It will do tensor parallelism inside a scale unit, and run data parallelism across scale units. It has only one configuration:
+    - seed: the random seed for choose the partition dimension. Default is `1`
+
+3. `pp`: pipeline parallelism + data parallelism. It will do model parallelism inside a scale unit, and run data parallelism across scale units. It requires the `use_end2end`  and `use_pipeline` to be true. It has no configurations.
+
+4. `data`: tensor parallelism on batch dimension. It has no configurations.
+
+5. `hybrid`: pipeline parallelism + tensor parallelism + data parallelism. It will do model parallelism and tensor parallelism(on 0 dimension) inside a scale unit, and run data parallelism across scale units. It requires the `use_end2end`  and `use_pipeline` to be true. It has no configurations.
+
+6. `autodist`: the recommended policy for most cases. Currently it only support Adam-like optimizers. It will automatically choose the best partition for you by balancing the memory usage and speed. It has the following configurations.
+    - `update_freq (int)`: the update frequency when training the module. Required.
+    - `mem_constraint (float)`: The memory constraint in each device in GB. Optional.
+    - `task_name (str)`: The name of the current task to distinguish runs. Optional.
+    - `use_fp16 (bool)`: Whether you use `fp16`. Default is `False`. Optional.
+    - `use_memory_efficient_fp16` Whether you use memory efficient fp16 optimizer. Default is `False`. Optional.
+    - `use_bf16`: Whether you use `bf16`. Default is `False`. Optional.
+    - `use_memory_efficient_bf16`: Whether you use memory efficient bf16 optimizer. Default is `False`. Optional.
+    - `re_profile (bool)`: If set to `True`, the computation profiling results will be overridden. Please note reprofiling will take some time. Optional.
+    - `verbose (bool)`:  Whether to print verbose information. Optional.
+    - `load_plan_path (str)`: The path to the plan file to load. If specified, the plan will be loaded from the file instead of searching. Optional.
+    - `save_plan_path (str)`: The path to the plan file to save. Optional.
+    - `partition_constraints_path (str)`: The path to the partition constraints file. Optional.
+    - `recompute_modules (str)`: The module names to recompute, separated by `,`. For example, `module1,module2`. Optional.
+    - `pipeline_pivots (str)`: The module names to pivot the pipeline, separated by `,`. For example, if `module1,module2` is specified, stages searched by pipeline solver only start from either `module1` or `module2`. Optional.
+    - `use_apex_fused_adam_v2`: If set to `True`, the apex fused adam v2 optimizer will be used. Default is `False`. Optional.
+
+Please note all options to `autodist` are just suggestions. `autodist` will try to find the best partition for you, which may not be the same with your suggestions.
 
 ### Checkpoint support
 

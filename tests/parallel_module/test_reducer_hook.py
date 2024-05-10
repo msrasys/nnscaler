@@ -9,7 +9,7 @@ from torch import nn
 from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.runtime.module import ParallelModule
 
-from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
+from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 
 
@@ -121,24 +121,24 @@ def _gpu_worker(pas, plan_ngpus, runtime_ngpus=None):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_hook_tp_gpu1():
-    launch_torchrun(1, _gpu_worker, PASRandomSPMD, 1)
+    launch_torchrun(1, _gpu_worker, 'tp', 1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_hook_tp_gpu2():
-    launch_torchrun(2, _gpu_worker, PASRandomSPMD, 2)
+    launch_torchrun(2, _gpu_worker, 'tp', 2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_hook_tp_gpu4():
-    launch_torchrun(4, _gpu_worker, PASRandomSPMD, 2, 4)
+    launch_torchrun(4, _gpu_worker, 'tp', 2, 4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_hook_dp_gpu1():
-    launch_torchrun(1, _gpu_worker, PASData, 1)
+    launch_torchrun(1, _gpu_worker, 'dp', 1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_hook_dp_gpu2():
-    launch_torchrun(2, _gpu_worker, PASData, 2)
+    launch_torchrun(2, _gpu_worker, 'data', 2)

@@ -14,11 +14,11 @@ from torch.utils.data.distributed import DistributedSampler
 
 import numpy as np
 
-from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dicts
+from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dicts, UserConfig
 from nnscaler.runtime.module import ParallelModule, ExtraState
 from nnscaler.runtime.gnorm import calcuate_gnorm
 
-from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0, PASMegatron
+from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0, PASMegatron
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 from ..utils import replace_all_device_with
 
@@ -441,8 +441,8 @@ def _gpu_worker(module_type, use_zero, pas, plan_ngpus, runtime_ngpus, per_resum
 def test_checkpoint(module_type, use_zero):
     plan_ngpus = 2
     runtime_ngpus = 4
-    cube_results = launch_torchrun(4, _gpu_worker, module_type, use_zero, PASRandomSPMD, plan_ngpus, runtime_ngpus, 32, 1)
-    rcube_results = launch_torchrun(4, _gpu_worker, module_type, use_zero, PASRandomSPMD, plan_ngpus, runtime_ngpus, 16, 2)
+    cube_results = launch_torchrun(4, _gpu_worker, module_type, use_zero, 'tp', plan_ngpus, runtime_ngpus, 32, 1)
+    rcube_results = launch_torchrun(4, _gpu_worker, module_type, use_zero, 'tp', plan_ngpus, runtime_ngpus, 16, 2)
 
     results0, results1,  results2, results3 = cube_results[0], cube_results[1], cube_results[2], cube_results[3]
     rresults0, rresults1,  rresults2, rresults3 = rcube_results[0], rcube_results[1], rcube_results[2], rcube_results[3]
@@ -495,8 +495,8 @@ def test_checkpoint_intra_reducer(module_type, use_zero):
     """
     plan_ngpus = 2
     runtime_ngpus = 2
-    cube_results = launch_torchrun(2, _gpu_worker, module_type, use_zero, PASRandomSPMD, plan_ngpus, runtime_ngpus, 32, 1, assert_intra_reducer)
-    rcube_results = launch_torchrun(2, _gpu_worker, module_type, use_zero, PASRandomSPMD, plan_ngpus, runtime_ngpus, 16, 2, assert_intra_reducer)
+    cube_results = launch_torchrun(2, _gpu_worker, module_type, use_zero, 'tp', plan_ngpus, runtime_ngpus, 32, 1, assert_intra_reducer)
+    rcube_results = launch_torchrun(2, _gpu_worker, module_type, use_zero, 'tp', plan_ngpus, runtime_ngpus, 16, 2, assert_intra_reducer)
     results0 = cube_results[0]
     rresults0 = rcube_results[0]
 

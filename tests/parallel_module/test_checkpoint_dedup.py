@@ -11,7 +11,7 @@ from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, \
     deduped_state_dict, load_deduped_state_dict
 from nnscaler.runtime.module import ParallelModule
 
-from .common import PASRandomSPMD, PASMegatron, CubeLinear, init_random, init_distributed, clear_dir_on_rank0, assert_equal
+from .common import PASMegatron, CubeLinear, init_random, init_distributed, clear_dir_on_rank0, assert_equal
 from ..launch_torchrun import launch_torchrun
 from .test_checkpoint import gendata, train_step, End2EndMLP, End2EndMLPWithUnusedAndShared
 
@@ -190,12 +190,12 @@ def _gpu_worker(pas, cc1, cc2):
 def test_checkpoint_compact(use_zero):
     cc1 = ComputeConfig(1, 4, use_zero=use_zero, zero_ngroups=2 if use_zero else 1)
     cc2 = ComputeConfig(1, 4, use_zero=use_zero, zero_ngroups=4 if use_zero else 1)
-    launch_torchrun(4, _gpu_worker, PASRandomSPMD, cc1, cc2)
+    launch_torchrun(4, _gpu_worker, 'tp', cc1, cc2)
 
     # mixed zero and non-zero
     cc1 = ComputeConfig(2, 4, use_zero=not use_zero, zero_ngroups=2 if not use_zero else 1)
     cc2 = ComputeConfig(2, 4, use_zero=use_zero, zero_ngroups=1)
-    launch_torchrun(4, _gpu_worker, PASRandomSPMD, cc1, cc2)
+    launch_torchrun(4, _gpu_worker, 'tp', cc1, cc2)
 
 
 def _gpu_worker_pipeline(cc):

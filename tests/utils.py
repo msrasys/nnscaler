@@ -10,6 +10,8 @@ import random
 from datetime import timedelta
 from pathlib import Path
 
+import numpy as np
+
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
@@ -41,6 +43,13 @@ def init_parameter(model: torch.nn.Module, seed: int = 0):
             trunc_normal_(param, std=.02)
         else:
             torch.nn.init.constant_(param, 0)
+
+
+def init_random():
+    np.random.seed(1)
+    torch.manual_seed(1)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1)
 
 
 def assert_parity(baseline_fn: Callable, compile_fn: Callable, atol: float=1e-4) -> bool:

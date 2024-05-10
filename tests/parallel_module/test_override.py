@@ -11,14 +11,13 @@ from nnscaler.parallel import ReuseType, parallelize, ComputeConfig, _load_cube_
 from nnscaler.runtime.module import ParallelModule
 
 from ..utils import new_empty, replace_all_device_with
-from .common import PASData
 
 
 def _to_cube_model(model_class, compute_config, cube_savedir, reuse, instance_name, load_module=True):
     parallelize(
         model_class,
         {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
-        PASData,
+        'data',
         compute_config,
         reuse=reuse,
         cube_savedir=cube_savedir,

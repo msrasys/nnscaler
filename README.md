@@ -8,7 +8,7 @@ Install the following packages before the installation of cube:
 
 * Python >= 3.8
 
-* PyTorch >= 1.13
+* PyTorch >= 2.0
 
 ## Install
 

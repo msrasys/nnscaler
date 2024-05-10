@@ -12,7 +12,7 @@ import numpy as np
 from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.runtime.module import ParallelModule
 
-from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
+from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 
 
@@ -116,7 +116,7 @@ def _gpu_worker(pas, ngpus):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_module_tp_gpu1():
-    results = launch_torchrun(1, _gpu_worker, PASRandomSPMD, 1)
+    results = launch_torchrun(1, _gpu_worker, 'tp', 1)
     orig_results, compiled_results, _, _ = results[0]
     for orig, compiled in zip(orig_results, compiled_results):
         assert torch.allclose(orig[0], compiled[0], rtol=1e-6, atol=1e-6)  # pred
@@ -145,7 +145,7 @@ def _compare_weights(orig0, orig1, compiled0, compiled1, module_fullmap, module_
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_module_tp_gpu2():
-    results = launch_torchrun(2, _gpu_worker, PASRandomSPMD, 2)
+    results = launch_torchrun(2, _gpu_worker, 'tp', 2)
     results0, results1 = results[0], results[1]
     eps = 1e-4
 

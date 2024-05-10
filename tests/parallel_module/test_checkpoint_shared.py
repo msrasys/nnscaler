@@ -8,7 +8,7 @@ from torch import nn
 
 from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dicts
 
-from .common import PASRandomSPMD, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
+from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun
 from .test_checkpoint import End2EndMLP, train_step, gendata
 
@@ -209,4 +209,4 @@ def test_checkpoint_load_from_raw_checkpoint(module_type, use_zero):
     """
     plan_ngpus = 2
     runtime_ngpus = 4
-    launch_torchrun(4, _gpu_worker, module_type, use_zero, PASRandomSPMD, plan_ngpus, runtime_ngpus)
+    launch_torchrun(4, _gpu_worker, module_type, use_zero, 'tp', plan_ngpus, runtime_ngpus)

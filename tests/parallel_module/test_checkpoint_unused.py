@@ -18,7 +18,7 @@ from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge
 from nnscaler.runtime.module import ParallelModule, ExtraState
 from nnscaler.runtime.gnorm import calcuate_gnorm
 
-from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
+from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 from .test_checkpoint_shared import _train_raw, _load_merged
 
@@ -127,4 +127,4 @@ def test_checkpoint_load_from_raw_checkpoint(use_zero):
     """
     plan_ngpus = 2
     runtime_ngpus = 4
-    launch_torchrun(4, _gpu_worker, use_zero, PASRandomSPMD, plan_ngpus, runtime_ngpus)
+    launch_torchrun(4, _gpu_worker, use_zero, 'tp', plan_ngpus, runtime_ngpus)

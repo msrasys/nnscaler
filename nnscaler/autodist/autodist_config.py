@@ -88,6 +88,8 @@ class AutoDistConfig:
     - pipeline_pivots (`str`, *optional*, defaults to `''`):
         The module names to pivot the pipeline, separated by `,`. For example, if `module1,module2`
         is specified, stages searched by pipeline solver only start from either `module1` or `module2`.
+    - pipeline_nstages(`int`, *optional*, defaults to `1`):
+        The number of stages in pipeline parallelism. This option is only used when pipeline is True.
     - max_pipeline_bubble_ratio (`float`, *optional*, defaults to `0.4`):
         The maximum bubble ratio in pipeline parallelism. The higher the ratio, the more bubbles will be allowed,
         the larger search space will be explored.
@@ -125,6 +127,7 @@ class AutoDistConfig:
                  re_profile=False,
                  pipeline=False,
                  pipeline_pivots='',
+                 pipeline_nstages=1,
                  max_pipeline_bubble_ratio=0.4,
                  max_pipeline_unbalance_ratio=0.5,
                  solver='dp',
@@ -158,6 +161,7 @@ class AutoDistConfig:
         self.re_profile = re_profile
         self.pipeline = pipeline
         self.pipeline_pivots = pipeline_pivots
+        self.pipeline_nstages = pipeline_nstages
         self.max_pipeline_bubble_ratio = max_pipeline_bubble_ratio
         self.max_pipeline_unbalance_ratio = max_pipeline_unbalance_ratio
         self.solver = solver
@@ -198,13 +202,9 @@ class AutoDistConfig:
             if self.save_plan_path:
                 raise ValueError(
                     'cannot specify both load plan path and save plan path')
-            else:
-                self.save_plan_path = self.load_plan_path
 
         if self.save_plan_path:
-            _validate_dir_path(Path(self.save_plan_path).parent)
-        else:
-            self.save_plan_path = f'./{self.task_name}.json'
+            Path(self.save_plan_path).parent.mkdir(parents=True, exist_ok=True)
 
         if self.zero_stage not in [0, 1]:
             raise ValueError(f'zero stage {self.zero_stage} must be 0 or 1')

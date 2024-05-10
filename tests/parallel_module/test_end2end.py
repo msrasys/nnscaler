@@ -18,7 +18,7 @@ from nnscaler.runtime.gnorm import calcuate_gnorm
 from nnscaler.runtime.utils import microbatches
 from nnscaler.runtime.module import ParallelModule
 from nnscaler.parallel import ComputeConfig, build_optimizer, parallelize, merge_state_dicts
-from .common import PASData, PASRandomSPMD, assert_equal, clear_dir_on_rank0, init_distributed, PASMegatron, init_random, PASHybrid
+from .common import assert_equal, clear_dir_on_rank0, init_distributed, PASMegatron, init_random
 from ..launch_torchrun import clone_to_cpu_recursively, launch_torchrun
 
 from .test_checkpoint import End2EndMLP
@@ -170,7 +170,7 @@ def test_end2end():
     ga4_result = _train_ga(model, 4)  # micro_batch_size = 4
     assert len(ga4_result) == 16
 
-    cube2_results = launch_torchrun(4, gpu_worker_cube, 4, 2, PASHybrid, True) # micro_batch_size = 4
+    cube2_results = launch_torchrun(4, gpu_worker_cube, 4, 2, 'hybrid', True) # micro_batch_size = 4
     cube2_result = merge_cube_result({k: v[0] for k, v in cube2_results.items()})
     assert len(cube2_result) == 16
     allclose(cube2_result, ga4_result)
@@ -180,7 +180,7 @@ def test_end2end():
     assert len(cube4_result) == 16
     allclose(cube4_result, ga4_result)
 
-    cube2_results_non_pipeline = launch_torchrun(4, gpu_worker_cube, 4, 2, PASRandomSPMD, False)  # micro_batch_size = 4
+    cube2_results_non_pipeline = launch_torchrun(4, gpu_worker_cube, 4, 2, 'tp', False)  # micro_batch_size = 4
     cube2_result_non_pipeline = merge_cube_result({k: v[0] for k, v in cube2_results_non_pipeline.items()})
     assert len(cube2_result_non_pipeline) == 16
     allclose(cube2_result_non_pipeline, ga4_result, atol=1e-5, rtol=1e-5) # looks tp introduces more error
@@ -242,7 +242,7 @@ def test_pipeline_shared():
         # 'chimera_direct' needs more gpus
         # 'infer_pipe' only work for inference
         # None looks doesn't work
-        cube2_results = launch_torchrun(4, gpu_worker_cube, 4, 2, PASHybrid, True, None, None, MLPShared, ps) # micro_batch_size = 4
+        cube2_results = launch_torchrun(4, gpu_worker_cube, 4, 2, 'hybrid', True, None, None, MLPShared, ps) # micro_batch_size = 4
         cube2_result = merge_cube_result({k: v[0] for k, v in cube2_results.items()})
         assert len(cube2_result) == 16
         allclose(cube2_result, ga4_result)
@@ -323,7 +323,7 @@ def gpu_worker_cube_one_sample():
         model = parallelize(
             model,
             {'data': dummy_data()},
-            pas_policy=PASHybrid,
+            pas_policy='hybrid',
             compute_config= ComputeConfig(
                 2, 2,
                 use_end2end=True,

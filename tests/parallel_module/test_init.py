@@ -6,7 +6,7 @@ import torch
 from nnscaler.parallel import _load_cube_module_class, parallelize, ComputeConfig
 
 from ..launch_torchrun import launch_torchrun
-from .common import CubeLinear, init_distributed, init_random, PASRandomSPMD, clear_dir_on_rank0
+from .common import CubeLinear, init_distributed, init_random, clear_dir_on_rank0
 from ..utils import new_empty, replace_all_device_with, mock_dist
 
 class MyModule(torch.nn.Module):
@@ -24,7 +24,7 @@ def _init_params_worker():
         cube_module = parallelize(
             MyModule,
             {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},
-            PASRandomSPMD,
+            'tp',
             ComputeConfig(1, 1),
             cube_savedir=tempdir,
             reuse='match',
@@ -67,7 +67,7 @@ def test_empty_weights(model_class, tp):
         parallelize(
             model_class,
             {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},
-            PASRandomSPMD,
+            'tp',
             ComputeConfig(2, 4, use_zero=True, zero_ngroups=2),
             cube_savedir=tempdir,
             reuse='match',

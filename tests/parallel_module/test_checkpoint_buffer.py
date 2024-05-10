@@ -7,7 +7,7 @@ import torch.distributed
 
 from nnscaler.parallel import parallelize, ComputeConfig, merge_state_dicts, load_merged_state_dicts, broadcast_weights
 
-from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
+from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun
 from ..utils import catch_log
 
@@ -49,7 +49,7 @@ def _to_cube_model(module, compute_config, cube_savedir, instance_name, input_sh
     return parallelize(
         module,
         {'x': torch.randn(input_shape)},
-        PASRandomSPMD,
+        'tp',
         compute_config,
         cube_savedir=cube_savedir,
         instance_name=instance_name,

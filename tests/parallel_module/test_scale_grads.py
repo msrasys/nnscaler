@@ -18,7 +18,7 @@ from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.runtime.module import ParallelModule, ExtraState
 from nnscaler.runtime.gnorm import calcuate_gnorm
 
-from .common import PASRandomSPMD, PASData, CubeLinear, init_random, init_distributed, clear_dir_on_rank0
+from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
 
 
@@ -140,8 +140,8 @@ def _gpu_worker(pas, plan_ngpus, runtime_ngpus, scale_grads: bool):
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_scale_grads():
-    cube_results = launch_torchrun(4, _gpu_worker, PASRandomSPMD, 2, 4, True)
-    rcube_results = launch_torchrun(4, _gpu_worker, PASRandomSPMD, 2, 4, False)
+    cube_results = launch_torchrun(4, _gpu_worker, 'tp', 2, 4, True)
+    rcube_results = launch_torchrun(4, _gpu_worker, 'tp', 2, 4, False)
 
     results0, results1,  results2, results3 = cube_results[0], cube_results[1], cube_results[2], cube_results[3]
     rresults0, rresults1,  rresults2, rresults3 = rcube_results[0], rcube_results[1], rcube_results[2], rcube_results[3]

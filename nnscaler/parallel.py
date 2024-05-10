@@ -13,35 +13,37 @@ import copy
 import os
 
 import torch
+
+from nnscaler.codegen import ModuleCodeGen
 from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
-from nnscaler.graph.parser.fx.parser import FxModuleParser
 
-from nnscaler.graph.schedule.predefined import PredefinedSched
-from nnscaler.ir.cten import IRObject, IRTensor
-from nnscaler.ir.tensor import IRFullTensor
-
-from nnscaler.flags import CompileFlag, RuntimeFlag
-from nnscaler.utils import get_shared_params
+from nnscaler.execplan import ExecutionPlan
+from nnscaler.execplan.planpass.fusion import DiffFusion
+from nnscaler.execplan.planpass.grouping import Grouping
 
 from nnscaler.graph import IRGraph
 from nnscaler.graph import parser
-from nnscaler.ir.operator import IRBpOperation, IRDataOperation
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.pyfunc import IRPyFunc
-from nnscaler.graph.schedule.schedplan import SchedulePlan
 from nnscaler.graph.gener.gen import IRAdapterGener
+from nnscaler.graph.parser.fx.parser import FxModuleParser
+from nnscaler.graph.schedule.predefined import PredefinedSched
+from nnscaler.graph.schedule.schedplan import SchedulePlan
 
-from nnscaler.codegen import ModuleCodeGen
-from nnscaler.execplan import ExecutionPlan
-from nnscaler.execplan.planpass.grouping import Grouping
-from nnscaler.execplan.planpass.fusion import DiffFusion
+from nnscaler.ir.cten import IRObject, IRTensor
+from nnscaler.ir.operator import IRBpOperation, IRDataOperation
+from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.unique import IDGenerator
-from nnscaler.program import Program
+
 from nnscaler.runtime.adapter.reducer import Reducer
-from nnscaler.runtime.module import AttrMeta, CubeModule, ParallelModule, OriginModuleMetadata, ExtraState
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
-from nnscaler.utils import get_member_by_name, setup_stride_broadcast_group
+from nnscaler.runtime.module import AttrMeta, CubeModule, ParallelModule, OriginModuleMetadata, ExtraState
+
+from nnscaler.flags import CompileFlag, RuntimeFlag
+import nnscaler.policies as policies
+from nnscaler.program import Program
+from nnscaler.utils import get_member_by_name, setup_stride_broadcast_group, get_shared_params
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,13 @@ _PREDEFINE_SCHED_NAME_PREFIX = 'sched_'
 for k, v in PredefinedSched.__dict__.items():
     if isinstance(v, staticmethod) and k.startswith(_PREDEFINE_SCHED_NAME_PREFIX):
         _PREDEFINE_SCHEDS[k[len(_PREDEFINE_SCHED_NAME_PREFIX):]] = v
+
+_PREDEFINED_POLICIES: Dict[str, Callable[[IRGraph, 'ComputeConfig'], IRGraph]] = {}
+_PREDEFINED_POLICIES_NAME_PREFIX = 'pas_'
+for k, v in policies.__dict__.items():
+    if callable(v) and k.startswith(_PREDEFINED_POLICIES_NAME_PREFIX):
+        _PREDEFINED_POLICIES[k[len(_PREDEFINED_POLICIES_NAME_PREFIX):]] = v
+
 
 @dataclass
 class UserConfig:
@@ -85,7 +94,14 @@ class UserConfig:
     graph: Dict[str, Any] = field(default_factory=dict)
     # you can put any configuration that may affect the generated code (but not affect the traced graph) here.
     # For example, extra arguments of your PAS function can put here.
+    # For all builtin pas, we will put PAS config in `code['pas']`.
     code: Dict[str, Any] = field(default_factory=dict)
+
+    def get_pas_config(self) -> Dict[str, Any]:
+        """
+        All builtin pas will read their config here.
+        """
+        return self.code.get('pas', {})
 
 
 @dataclass(frozen=True)
@@ -807,7 +823,7 @@ def _load_cube_module_class(
 def parallelize(
     module_or_module_class: Union[torch.nn.Module, Type[torch.nn.Module]],
     dummy_input: dict,
-    pas_policy: Callable[[IRGraph, ComputeConfig], IRGraph],
+    pas_policy: Union[str, Callable[[IRGraph, ComputeConfig], IRGraph]],
     compute_config: ComputeConfig,
     *,
     cube_savedir: Union[str, Path] = './.cube',
@@ -871,7 +887,8 @@ def parallelize(
     Args:
         module_or_module_class (Union[torch.nn.Module, Type[torch.nn.Module]]): the module or module class to be compiled
         dummy_input (dict): the dummy input for the module
-        pas_policy (Callable[[IRGraph, ComputeConfig], IRGraph]): the pas policy
+        pas_policy (Union[str, Callable[[IRGraph, ComputeConfig], IRGraph]]): the pas policy,
+            it can be a name of builtin policies, or a custom policy function.
         compute_config (ComputeConfig): the environment resource
         reuse (ReuseType): specify which part can be reused.
         cube_savedir (Union[str, Path]): the directory to save generated code
@@ -896,6 +913,11 @@ def parallelize(
         (inspect.isclass(module_or_module_class) and issubclass(module_or_module_class, CubeModule))
     ):
         return module_or_module_class if load_module else None
+
+    if isinstance(pas_policy, str):
+        if not pas_policy in _PREDEFINED_POLICIES:
+            raise ValueError(f"Invalid pas_policy: {pas_policy}")
+        pas_policy = _PREDEFINED_POLICIES[pas_policy]
 
     is_module_class = inspect.isclass(module_or_module_class)
     module_class = module_or_module_class if is_module_class else module_or_module_class.__class__
@@ -1122,7 +1144,7 @@ def build_optimizer(
     """
     Build an optimizer for a module.
 
-    To support parallelized module (CubeModule), we need to hook 4 places:
+    To support parallelized module (CubeModule), we hook 4 places in this function:
     1. optimizer constructor:
         the parameters of optimizer will not be the same with the parameters of the module if we use zero
         so we need to replace the parameters of optimizer with CubeModule.parameters_for_optimizer
@@ -1134,8 +1156,6 @@ def build_optimizer(
         We need to call CubeModule.zero_grad() after optimizer.zero_grad()
     4. backward():
         you need to call optimizer.sync_shard_grad() manually if you want to read the gradients of the module before optimizer.step().
-
-    Please note this DOES NOT work in end2end mode.
 
     Args:
         module (torch.nn.Module): the module to be optimized
@@ -1153,7 +1173,7 @@ def build_optimizer(
     """
 
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
-        raise RuntimeError("End2End mode is not supported")
+        raise RuntimeError("Old style CubeModule is not supported")
 
     # only the root module can be end2end module.
     if any(m != module and isinstance(m, ParallelModule) and  m.compute_config.use_end2end for m in module.modules()):

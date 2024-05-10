@@ -17,6 +17,9 @@ from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.graph.graph import IRGraph
 from nnscaler.graph.segment import IRSegment
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
+from nnscaler.policies import _tp, _replica
+
+from ..utils import init_random
 
 
 def create_mesh(ngpus: int, group_num: Tuple[int]) -> Tuple[Tuple[Tuple[int]]]:
@@ -47,100 +50,6 @@ def create_mesh(ngpus: int, group_num: Tuple[int]) -> Tuple[Tuple[Tuple[int]]]:
     return tuple(outputs)
 
 
-def _tp(graph: IRGraph, node: IRDimops, devs: List[int], idx: int, dim: int):
-    sub_nodes = graph.partition(
-        node, node.algorithms('dim'), idx=idx, dim=dim, num=len(devs))
-    for devid, sub_node in zip(devs, sub_nodes):
-        graph.assign(sub_node, devid)
-    return sub_nodes
-
-
-def _replica(graph: IRGraph, node, devs: List[int]):
-    sub_nodes = graph.replicate(node, times=len(devs))
-    for devid, sub_node in zip(devs, sub_nodes):
-        graph.assign(sub_node, devid)
-    return sub_nodes
-
-
-def PASRandomSPMD(graph: IRGraph, env_resource: ComputeConfig):
-    """
-    Random SPMD policy
-    """
-    ngpus = env_resource.plan_ngpus
-    # get the current random state
-    state = random.getstate()
-
-    seed = 1
-    # print(f'> set random SPDM policy seed to {seed}')
-    random.seed(seed)
-    devs = list(range(ngpus))
-
-    for ftensor in graph.full_tensors():
-        if ftensor.is_grad(): continue
-        if len(graph.consumers(ftensor)) > 1:
-            graph.multiref(ftensor)
-
-    for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
-        if node.name == 'multiref' or isinstance(node, IRGraphAnchor):
-            continue
-        if isinstance(node, IRDimops):
-            configs = node.transform_space()
-            if len(configs) == 0:
-                _replica(graph, node, devs)
-            else:
-                configs = sorted(configs, reverse=True,
-                                 key=lambda config: node.input(config[0]).shape[config[1]])
-                random.shuffle(configs)
-                for (idx, dim) in configs:
-                    if node.input(idx).shape[dim] % len(devs) != 0: continue
-                    if node.algorithms('dim').satisfy(idx=idx, dim=dim, num=len(devs)):
-                        # print(f'> partition node {node.name} ({node.cid}) with config idx={idx}, dim={dim}')
-                        _tp(graph, node, devs, idx, dim)
-                        break
-                else:
-                    _replica(graph, node, devs)
-        else:
-            _replica(graph, node, devs)
-
-    # restore the random state
-    random.setstate(state)
-    # print(graph.extra_repr())
-    return graph
-
-
-def PASData(graph: IRGraph, env_resource: ComputeConfig):
-    """
-    Data Parallel
-    """
-    ngpus = env_resource.plan_ngpus
-    # auto multi-ref
-    for ftensor in graph.full_tensors():
-        if len(graph.consumers(ftensor)) > 1:
-            graph.multiref(ftensor, [[n] for n in graph.consumers(ftensor)])
-
-    batch_dim = 0
-    for dl in graph.select(ntype=IRDataOperation):
-        _replica(graph, dl, list(range(ngpus)))
-
-    for node in graph.nodes():
-        # print(node)
-        if isinstance(node, IRFwOperation):
-            try:
-                algo = node.algorithms('dim')
-                idx = 0
-                sub_nodes = graph.partition(
-                    node, algo, idx=idx, dim=batch_dim, num=ngpus)
-            # except AssertionError:
-            except:
-                # print(f'WARNING: {node} cannot find dim algo, using replicate instead')
-                sub_nodes = graph.replicate(node, ngpus)
-
-            for idx, node in enumerate(sub_nodes):
-                graph.assign(node, idx)
-    # print(graph.extra_repr())
-    return graph
-
-
 def PASMegatron(graph: IRGraph, config: ComputeConfig):
     num_stages = config.pipeline_nstages
     tp_size = config.plan_ngpus // num_stages
@@ -165,50 +74,6 @@ def PASMegatron(graph: IRGraph, config: ComputeConfig):
 
     for dl in graph.select(ntype=IRDataOperation):
         _replica(graph, dl, devs=list(range(config.plan_ngpus)))
-    config.apply_pipeline_scheduler(graph)
-    return graph
-
-
-def PASHybrid(graph: IRGraph, config: ComputeConfig):
-    """
-    Hybrid Tensor and Pipeline Parallelism
-    """
-    ngpus: int = config.plan_ngpus
-    nstages = config.pipeline_nstages
-    tp_size: int = config.plan_ngpus // nstages
-    if ngpus % tp_size != 0:
-        raise ValueError(f'invalid tp_size {tp_size} for ngpus {ngpus}')
-    pp_size = ngpus // tp_size
-
-    fnodes = graph.select(ntype=IRFwOperation)
-    stages = mitr.divide(pp_size, fnodes)
-    stages = [list(s) for s in stages]
-    for idx, stage in enumerate(stages):
-        print(f'> stage {idx}: {stage[0]}')
-    graph.staging([s[0] for s in stages])
-
-    stages: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
-    stages = [s for s in stages if s.isfw()]
-    assert len(stages) == pp_size, "Internal Error"
-
-    # stage-wise tensor parallelism
-    curr_devices = list(range(ngpus))
-    for stage in stages:
-        for node in stage.nodes():
-            devs = curr_devices[:tp_size]
-            try:
-                _tp(graph, node, devs, idx=0, dim=0)
-            except Exception as e:
-                _replica(graph, node, devs)
-        curr_devices = curr_devices[tp_size:]
-    assert len(curr_devices) == 0, f"remaining devices: {curr_devices} not used"
-
-    # replicate dataloader
-    for dl in graph.select(ntype=IRDataOperation):
-        _replica(graph, dl, devs=list(range(ngpus)))
-
-    # setup 1f1b pipeline scheduler
-    # PredefinedSched.sched_1f1b(graph, nmicros, pp_size)
     config.apply_pipeline_scheduler(graph)
     return graph
 
@@ -242,13 +107,6 @@ def init_distributed():
     rank = torch.distributed.get_rank()
     torch.cuda.set_device(rank)
     torch.set_default_device(f'cuda:{rank}')
-
-
-def init_random():
-    np.random.seed(1)
-    torch.manual_seed(1)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(1)
 
 
 @contextlib.contextmanager
