@@ -404,7 +404,7 @@ class IRFullTensor(IRTensor):
         return sub_tensor
 
     def __repr__(self):
-        dscp = f'FullTensor(id={self._id}, shape={self.shape})'
+        dscp = f'FullTensor(id={self._id}, shape={self.shape}, req_grad={self.requires_grad})'
         return dscp
 
     def extra_repr(self) -> str:

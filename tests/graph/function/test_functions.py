@@ -354,16 +354,18 @@ def test_Unsqueeze():
 def test_ScaledDotProductAttention():
     op = F.ScaledDotProductAttention(IRTensor([8, 128, 64]), IRTensor([8, 256, 64]), IRTensor([8, 256, 32]), None, 0.05)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a e d^, a b^ d^, a b^ c -> a e c'
+    op = F.ScaledDotProductAttention(IRTensor([8, 128, 64]), IRTensor([8, 256, 64]), IRTensor([8, 256, 32]), None, 0.05, True)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a e^ d^, a b^ d^, a b^ c -> a e^ c'
     op = F.ScaledDotProductAttention(IRTensor([16, 8, 128, 64]), IRTensor([16, 8, 256, 64]), IRTensor([16, 8, 256, 32]), IRTensor([128, 256]), 0.05)
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f e^, a b c^ e^, a b c^ d, f c^ -> a b f d'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f^ e^, a b c^ e^, a b c^ d, f^ c^ -> a b f^ d'
     op = F.ScaledDotProductAttention(IRTensor([16, 8, 128, 64]), IRTensor([16, 8, 256, 64]), IRTensor([16, 8, 256, 32]), IRTensor([1, 128, 256]), 0.05)
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f e^, a b c^ e^, a b c^ d, 1 f c^ -> a b f d'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f^ e^, a b c^ e^, a b c^ d, 1 f^ c^ -> a b f^ d'
     op = F.ScaledDotProductAttention(IRTensor([16, 8, 128, 64]), IRTensor([16, 8, 256, 64]), IRTensor([16, 8, 256, 32]), IRTensor([1, 8, 128, 256]), 0.05)
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f e^, a b c^ e^, a b c^ d, 1 b f c^ -> a b f d'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f^ e^, a b c^ e^, a b c^ d, 1 b f^ c^ -> a b f^ d'
     op = F.ScaledDotProductAttention(IRTensor([16, 8, 128, 64]), IRTensor([16, 8, 256, 64]), IRTensor([16, 8, 256, 32]), IRTensor([1, 1, 256]), 0.05)
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f e^, a b c^ e^, a b c^ d, 1 1 c^ -> a b f d'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f^ e^, a b c^ e^, a b c^ d, 1 1 c^ -> a b f^ d'
     op = F.ScaledDotProductAttention(IRTensor([16, 8, 128, 64]), IRTensor([16, 8, 256, 64]), IRTensor([16, 8, 256, 32]), IRTensor([1, 8, 128, 1]), 0.05)
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f e^, a b c^ e^, a b c^ d, 1 b f 1 -> a b f d'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b f^ e^, a b c^ e^, a b c^ d, 1 b f^ 1 -> a b f^ d'
 
 
 
@@ -397,6 +399,12 @@ def test_Setitem():
     op = F.SetItem(IRObject(value=[1, 2, 3], is_constant=False), 0, set_val)
     assert op.outputs()[0].value == [set_val, 2, 3]
     assert not op.outputs()[0].is_constant
+
+    op = F.SetItem(IRTensor([3, 4, 5]), IRObject(value=slice(0, 5, 1)), IRObject(value=1.))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^, ?, ? -> a^ b^ c^'
+
+    op = F.SetItem(IRTensor([3, 4, 5]), IRTensor([3, 4, 5]), IRObject(value=1.))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^, d^ e^ f^, ? -> a^ b^ c^'
 
 
 def test_Len():

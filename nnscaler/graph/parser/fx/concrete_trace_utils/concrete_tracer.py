@@ -1353,12 +1353,16 @@ def types_other_than(pytree, given_types) -> Set[Type]:
 
 def tree_to_cuda(pytree):
     """return a same spec pytree with all the given pytree leaf tensor to cuda"""
-    return map_trees_with_func(lambda a: a.cuda() if isinstance(a, torch.Tensor) else a, [pytree])
+    # any operations under torch.no_grad context will have the result tensor with attribute requires_grad is False,
+    # here we must follow the original tensor requires_grad attribute when we move tensor to cuda to ensure the correctness of the tensor requires_grad state
+    return map_trees_with_func(lambda a: a.cuda().requires_grad_(a.requires_grad) if isinstance(a, torch.Tensor) else a, [pytree])
 
 
 def tree_to_cpu(pytree):
     """return a same spec pytree with all the given pytree leaf tensor to cpu"""
-    return map_trees_with_func(lambda a: a.cpu() if isinstance(a, torch.Tensor) else a, [pytree])
+    # any operations under torch.no_grad context will have the result tensor with attribute requires_grad is False,
+    # here we must follow the original tensor requires_grad attribute when we move tensor to cpu to ensure the correctness of the tensor requires_grad state
+    return map_trees_with_func(lambda a: a.cpu().requires_grad_(a.requires_grad) if isinstance(a, torch.Tensor) else a, [pytree])
 
 
 def unwrap_nested_proxy(pytree):

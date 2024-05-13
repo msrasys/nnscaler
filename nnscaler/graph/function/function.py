@@ -105,11 +105,13 @@ def Accum(*inputs, signature = None):
 
 def Linear(input, weight, bias=None, signature = None):
     signature = 'torch.nn.functional.linear'
+    assert isinstance(input, IRTensor) and isinstance(weight, IRTensor)
     if bias is None:
-        annos = ['b * k+, n k+ -> b * n']
+        annos = ['* k+, n k+ -> * n']
         return IRDimops(Linear, 'linear', signature, annos, [input, weight], bias=None)
     else:
-        annos = ['b * k^, n k^, n -> b * n']
+        assert isinstance(bias, IRTensor)
+        annos = ['* k^, n k^, n -> * n']
         return IRDimops(Linear, 'linear', signature, annos, [input, weight, bias])
 
 
@@ -2139,7 +2141,31 @@ def SetItem(__a: Any, __b: Any, __c: Any, signature = None) -> Union[Any, IRPyFu
     if isinstance(obj, IRTensor):
         # TODO: move to some function like FullSlice when ready
         # TODO: give a IRTensor as return value or return a IRDimops
-        return IRPyFunc(signature, [__a, __b, __c], [IRObject()])
+        gener = iter(string.ascii_lowercase)
+        # obj annotation
+        edim_obj = ShapeAnno.create_shape_str(obj.shape, '^', iterator=gener)
+        edim_out = copy.copy(edim_obj)
+
+        edim_ins = [edim_obj]
+
+        # index annotation
+        if isinstance(index, IRTensor):
+            edim_index = ShapeAnno.create_shape_str(index.shape, '^', iterator=gener)
+            edim_ins.append(edim_index)
+        elif isinstance(index, IRObject) and any_ir_object_satisfy(index, lambda a: isinstance(a, IRTensor)):
+            raise RuntimeError(f"setitem did not support slicers include tensor now, got {index}")
+        else:
+            edim_ins.append(['?'])
+
+        # value annotation
+        if isinstance(val, IRTensor):
+            edim_val = ShapeAnno.create_shape_str(val.shape, '^', iterator=gener)
+            edim_ins.append(edim_val)
+        else:
+            edim_ins.append(['?'])
+
+        anno = OpAnno.create_op_str(edim_ins, [edim_out])
+        return IRDimops(SetItem, 'setitem', signature, [anno], [obj, index, val])
 
     is_constant = not ir_object_contains_dynamic(index)
     index = _unwrap_value(index)
@@ -2236,13 +2262,17 @@ def MakeSlice(*inputs: Iterable, signature=None):
 
 
 def Is(input, other, signature=None):
-    assert not isinstance(input, IRObject) and not isinstance(other, IRObject)
-    return input is other
+    if not isinstance(input, IRObject) and not isinstance(other, IRObject):
+        return input is other
+    else:
+        return IRPyFunc(signature, [input, other], [_compute_binary_op(input, other, operator.is_, 'is')])
 
 
 def IsNot(input, other, signature=None):
-    assert not isinstance(input, IRObject) and not isinstance(other, IRObject)
-    return input is not other
+    if not isinstance(input, IRObject) and not isinstance(other, IRObject):
+        return input is not other
+    else:
+        return IRPyFunc(signature, [input, other], [_compute_binary_op(input, other, operator.is_not, 'is_not')])
 
 
 def ScaledDotProductAttention(query, key, value, attn_mask=None, dropout_p=0.0,
@@ -2261,6 +2291,8 @@ def ScaledDotProductAttention(query, key, value, attn_mask=None, dropout_p=0.0,
     key_anno[-1] = next(gener) + '^'
     query_anno = copy.copy(key_anno)
     query_anno[-2] = next(gener)
+    if is_causal or attn_mask is not None:
+        query_anno[-2] += '^'
     out_anno = copy.copy(query_anno)
     out_anno[-1] = value_anno[-1]
     if attn_mask is not None:

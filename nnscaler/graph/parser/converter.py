@@ -158,5 +158,6 @@ def convert_model(
         IRGraph: IRGraph of model
     """
     traced_model = to_fx_graph(model, dummy_input)
+    _logger.debug(f'the traced model is:\n{traced_model}')
     graph = to_ir_graph(traced_model, dummy_input, attr_savedir, dynamic_shape)
     return graph
