@@ -68,7 +68,7 @@ def pre_estimate_mem(graph: ModelGraph):
         zero_group_size=zero_group_size,
         cfg=graph.autodist_config,
     )
-    min_single_dev_mem += graph.recompute_mem
+    min_single_dev_mem += graph.min_recompute_mem
     _logger.info(
         f'estimated minimum memory per device {to_mb(min_single_dev_mem)} MB')
     mem_constraint = graph.autodist_config.memory_constraint
@@ -91,14 +91,13 @@ def calc_parallel_plan(graph: IRGraph,
     recompute_groups = [
         [node.cid for node in group] for group in recompute_groups
     ]
-    recompute_mem = autodist_graph.recompute_mem / 1024 / 1024 / 1024
 
     if autodist_config.pipeline:
         pp_out = calc_optimal_pp_plan(autodist_graph, autodist_config)
     else:
         pp_out = calc_optimal_spmd_plan(autodist_graph, autodist_config)
     pp_out.desc.recompute_groups = recompute_groups
-    pp_out.stage_mems = [mem + recompute_mem for mem in pp_out.stage_mems]
+    pp_out.stage_mems = [mem for mem in pp_out.stage_mems]
     return pp_out
 
 

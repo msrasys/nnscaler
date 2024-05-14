@@ -15,8 +15,10 @@ class CubeOperator:
     - dim_info: a mapping from dimension name to its position and reduce type
     - parallelable_dims: a set of dimension names that can be parallelized
     - recompute: a flag indicating whether the operator will be recomputed
+    - recompute_start_op: a flag indicating whether the operator consumes tensors outside of a recompute region
     - has_batch_dim: a flag indicating whether the operator has a batch dimension
     - since there can be shared tensors in the model, we use the following vars to estimate the memory usage accurately:
+    - omit_recompute_in_idx: a list of indices of input tensors that should be omitted
     - omit_train_idx: a list of indices of activation tensors that should be omitted
     - omit_param_idx: a list of indices of parameter tensors that should be omitted
     - omit_buffer_idx: a list of indices of buffer tensors that should be omitted
@@ -33,7 +35,9 @@ class CubeOperator:
         self.dim_info = {}
         self.parallelable_dims = set()
         self._recompute = False
+        self._recompute_start_op = False
 
+        self.omit_recompute_in_idx = []
         self.omit_train_idx = []
         self.omit_param_idx = []
         self.omit_buffer_idx = []
@@ -58,6 +62,14 @@ class CubeOperator:
     @recompute.setter
     def recompute(self, value: bool):
         self._recompute = value
+
+    @property
+    def recompute_start_op(self):
+        return self._recompute_start_op
+
+    @recompute_start_op.setter
+    def recompute_start_op(self, value: bool):
+        self._recompute_start_op = value
 
     def add_producer(self, producer: 'CubeOperator'):
         self.producers.add(producer)

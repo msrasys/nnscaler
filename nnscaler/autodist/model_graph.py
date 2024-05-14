@@ -460,7 +460,7 @@ class ModelGraph:
         self.scope_tree_root = self.reconstruct_scope_tree()
         self.scope_leaf_nodes = self.scope_tree_root.select(lambda x: x.is_leaf)
 
-        self.recompute_mem, self.recompute_groups = self.init_recompute_nodes()
+        self.min_recompute_mem, self.recompute_groups = self.init_recompute_nodes()
 
         self.operator_list: List[CubeOperator] = []
         self._ir_cell2idx: Dict[IRFwOperation, int] = dict()
@@ -620,25 +620,30 @@ class ModelGraph:
         if len(recompute_modules) == 0:
             return 0, []
 
-        def fetch_module(scope_node):
+        def fetch_module(scope_node: ScopeNode, prefix: List[str]):
             if scope_node.node is not None:
                 return []
+            if scope_node.is_root:
+                next_prefix = copy.deepcopy(prefix)
+            else:
+                next_prefix = prefix + [scope_node.module_type.__name__]
+            cur_name = '.'.join(next_prefix)
             for module in recompute_modules:
-                if module in str(scope_node.module_type):
+                if module in cur_name:
                     return [scope_node]
             ret = []
             for child in scope_node.children:
-                ret += fetch_module(child)
+                ret += fetch_module(child, next_prefix)
             return ret
 
-        modules = fetch_module(self.scope_tree_root)
-        in_mem, train_mem = 0, 0
+        modules = fetch_module(self.scope_tree_root, [])
+        train_mem = 0
         for module in modules:
-            in_mem += module.in_mem
             train_mem = max(train_mem, module.train_mem)
-        recompute_mem = in_mem + train_mem
-        _logger.info(f'recompute mem {recompute_mem / 1024 / 1024} MB')
-        self.autodist_config.memory_constraint -= recompute_mem
+        # calculate the lower bound of memory consumption for recompute
+        # assume the activation memory is evenly distributed across devices
+        min_recompute_mem = train_mem / self.autodist_config.ngpus
+        _logger.info(f'estimated recompute mem {min_recompute_mem / 1024 / 1024} MB')
 
         def fetch_nodes(scope_node):
             if scope_node.node is not None:
@@ -651,14 +656,16 @@ class ModelGraph:
         recompute_groups = []
         for module in modules:
             recompute_groups.append(fetch_nodes(module))
-        return recompute_mem, recompute_groups
+        return min_recompute_mem, recompute_groups
 
     def label_ops(self, operator_list: List[CubeOperator]):
+        # NOTE: complicated input composed of tensors are not considered, like list of tensors
         # label the tensors that are shared by multiple operators, examples:
         # 1. the embedding matrix is shared by embedding lookup and the last linear layer
         # 2. the activation tensor is shared by query, key and value projections in transformer
         # label the operators that have been set to recompute
         counted_tensors: Set[IRTensor] = set()
+        counted_in_tensors: Set[IRTensor] = set()
         recompute_nodes: Set[IRFwOperation] = set()
         for group in self.recompute_groups:
             recompute_nodes.update(group)
@@ -679,7 +686,7 @@ class ModelGraph:
             # deduplicate parameter and buffer tensors
             # assume the traverse order of input tensors is the same as
             # the order in profiling
-            b_idx, w_idx = -1, -1
+            in_idx, b_idx, w_idx = -1, -1, -1
             for in_tensor in operator.in_tensors:
                 if in_tensor.is_param():
                     assert not in_tensor.is_buffer()
@@ -688,16 +695,60 @@ class ModelGraph:
                         operator.omit_param_idx.append(w_idx)
                     else:
                         counted_tensors.add(in_tensor.tid)
-                if in_tensor.is_buffer():
+                elif in_tensor.is_buffer():
                     assert not in_tensor.is_param()
                     b_idx += 1
                     if in_tensor.tid in counted_tensors:
                         operator.omit_buffer_idx.append(b_idx)
                     else:
                         counted_tensors.add(in_tensor.tid)
+                else:
+                    in_idx += 1
+                    # avoid an input tensor is counted multiple times
+                    # when it is shared by multiple operators on the
+                    # border of recompute groups. For example, if tensor
+                    # x is consumed by two operators a and b who are on the
+                    # border of a recompute group, x should not be counted twice.
+                    if in_tensor.tid in counted_in_tensors:
+                        operator.omit_recompute_in_idx.append(in_idx)
+                    else:
+                        counted_in_tensors.add(in_tensor.tid)
             if operator.ir_cell in recompute_nodes:
                 operator.recompute = True
-                operator.omit_train_idx = list(range(len(train_mem2in_idx)))
+
+        # label border operators for recompute groups
+        for group in self.recompute_groups:
+            output_tensors: Set[IRTensor] = set()
+            for node in group:
+                for t in node.outputs():
+                    if isinstance(t, IRTensor):
+                        output_tensors.add(t)
+            for node in group:
+                is_border = False
+                for t in node.inputs():
+                    if isinstance(t, IRTensor) and not t.is_attr():
+                        if not t in output_tensors:
+                            is_border = True
+                            break
+                if is_border:
+                    op = operator_list[self._ir_cell2idx[node]]
+                    op.recompute_start_op = True
+                    train_mem2in_idx = self.cost_database.query_profiled_metrics(
+                        op).train_mem2in_idx
+                    for idx, tensor in enumerate(op.in_tensors):
+                        if tensor.is_attr():
+                            continue
+                        if tensor in output_tensors:
+                            # avoid count multiple times when the input is another
+                            # border operator's output
+                            op.omit_recompute_in_idx.append(idx)
+                        else:
+                            # avoid count multiple times when the input has been
+                            # saved by the recompute interface
+                            if idx in train_mem2in_idx:
+                                i = train_mem2in_idx.index(idx)
+                                if i not in op.omit_train_idx:
+                                    op.omit_train_idx.append(i)
 
     def query_mem(self, start: int, end: int) -> Tuple[int, int, int]:
         '''
@@ -717,9 +768,13 @@ class ModelGraph:
             op = self.operator_list[idx]
             if not isinstance(op.ir_cell, IRDimops):
                 return 0, 0, 0
-            return db_inst.query_single_mem(op, 'param', round=False), \
-                db_inst.query_single_mem(op, 'buffer', round=False), \
-                db_inst.query_single_mem(op, 'train', round=False)
+            param_mem = db_inst.query_single_mem(op, 'param', round=False)
+            buffer_mem = db_inst.query_single_mem(op, 'buffer', round=False)
+            # set the activation memory to 0 if the operator is set to recompute.
+            # the memory is considered in `min_recompute_mem` instead
+            activation_mem = 0 if op.recompute else db_inst.query_single_mem(
+                op, 'train', round=False)
+            return param_mem, buffer_mem, activation_mem
 
         def merger(sub_rets):
             param_mem, buffer_mem, activation_mem = 0, 0, 0
@@ -787,11 +842,25 @@ class ModelGraph:
             if not op.has_batch_dim:
                 _logger.debug(f'{op.ir_cell} don\'t have batch dim')
 
-        self.label_ops(operator_list)
         if len(operator_list) != len(self.scope_leaf_nodes):
             raise RuntimeError(
                 f'expect {len(self.scope_leaf_nodes)} operators, got {len(operator_list)}'
             )
         for i, op in enumerate(operator_list):
             self._ir_cell2idx[op.ir_cell] = i
+        self.label_ops(operator_list)
         self.operator_list = operator_list
+
+        self._recompute_group_idxs: List[List[int]] = list()
+        for recompute_group in self.recompute_groups:
+            interval = []
+            for node in recompute_group:
+                interval.append(self._ir_cell2idx[node])
+            start, end = interval[0], interval[-1]
+            if end - start + 1 != len(interval):
+                raise RuntimeError('recompute nodes are not continuous')
+            self._recompute_group_idxs.append(interval)
+
+    @property
+    def recompute_group_idxs(self) -> List[List[int]]:
+        return self._recompute_group_idxs

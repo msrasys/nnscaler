@@ -1,4 +1,4 @@
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Callable, Dict
 import numpy as np
 import json
 import os
@@ -53,7 +53,7 @@ def _piecewise_estimator(xs: List[float], ys: List[float], x: float) -> float:
     raise RuntimeError(f'x={x}, xs={xs}, ys={ys}, should not reach here')
 
 import nnscaler
-_DEFAULT_COMM_DATA_PATH = Path(nnscaler.__file__).parent.parent / 'profile_data/mi200/comm'
+_DEFAULT_COMM_DATA_PATH = Path(nnscaler.__file__).parent.parent / 'data/profile/mi200/comm'
 
 class CostDatabase:
 
@@ -159,6 +159,7 @@ class CostDatabase:
             node_buffer: the buffer memory consumption of the partition option
             activation_mem: the activation memory consumption of the partition option
             opt_transient_mem: the optimizer transient memory consumption of the partition option
+            input_mem: the input memory consumption of the partition option
         """
         memory_results = self.get_mems(op_partition)
         activation_mem = memory_results['train']
@@ -209,7 +210,8 @@ class CostDatabase:
                 f'activation mem: {to_mb(activation_mem)} MB, ' +
                 f'optimizer transient mem: {to_mb(opt_transient_mem)} MB')
 
-        return node_mem, node_buffer, activation_mem, opt_transient_mem
+        return node_mem, node_buffer, activation_mem, opt_transient_mem, memory_results[
+            'input']
 
     def query_single_mem(self, obj, memory_type, round=True) -> int:
         """
@@ -482,6 +484,9 @@ class CostDatabase:
                 for mem in mems
             ]
 
+        in_mask = helper(inputs)
+        for idx in op.omit_recompute_in_idx:
+            in_mask[idx] = 0
         param_mask = helper(param)
         for idx in op.omit_param_idx:
             param_mask[idx] = 0
@@ -495,7 +500,7 @@ class CostDatabase:
         # the saved input tensors for backward have been considered in train_m.
 
         masks = {
-            'input': helper(inputs),
+            'input': in_mask,
             'param': param_mask,
             'train': train_m_mask,
             'buffer': buffer_mask,

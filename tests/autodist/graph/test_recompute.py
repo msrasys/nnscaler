@@ -3,6 +3,7 @@ import pytest
 import tempfile
 import torch
 from nnscaler.graph.parser.converter import to_fx_graph, to_ir_graph
+from nnscaler.ir.operator import IRFwOperation
 from nnscaler.autodist.model_graph import ModelGraph
 from nnscaler.autodist.autodist_config import AutoDistConfig
 
@@ -33,6 +34,18 @@ class Layer(torch.nn.Module):
         x = x + residual
         return x
 
+class Encoder(torch.nn.Module):
+
+    def __init__(self, hidden_dim, ffn_dim, num_layers):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            [Layer(hidden_dim, ffn_dim) for _ in range(num_layers)])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
 
 class Decoder(torch.nn.Module):
 
@@ -44,7 +57,6 @@ class Decoder(torch.nn.Module):
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
-        x = x.sum()
         return x
 
 
@@ -52,10 +64,14 @@ class Model(torch.nn.Module):
 
     def __init__(self, hidden_dim, ffn_dim, num_layers):
         super().__init__()
+        self.encoder = Encoder(hidden_dim, ffn_dim, num_layers)
         self.decoder = Decoder(hidden_dim, ffn_dim, num_layers)
 
     def forward(self, x):
-        return self.decoder.forward(x)
+        x = self.encoder.forward(x)
+        x = self.decoder.forward(x)
+        x = x.sum()
+        return x
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
@@ -74,16 +90,18 @@ def test_recompute():
                                attr_savedir=tempdir,
                                dynamic_shape=True)
 
-    config = AutoDistConfig(recompute_modules='Layer')
+    config = AutoDistConfig(recompute_modules='Decoder.Layer')
     model_graph = ModelGraph(ir_graph, config)
     model_node = model_graph.scope_tree_root
     print(model_node)
 
-    assert len(model_node.children) == 1
-    decoder_node = model_node.children[0]
+    assert len(model_node.children) == 3
+    encoder_node = model_node.children[0]
+    decoder_node = model_node.children[1]
+    print(decoder_node)
 
-    assert len(decoder_node.children) == num_layers + 1
-    for layer_node in decoder_node.children[:-1]:
+    assert len(decoder_node.children) == num_layers
+    for layer_node in decoder_node.children:
         assert len(layer_node.children) == 3
         ln_node = layer_node.children[0]
         assert ln_node.leaf_size == 1
@@ -110,16 +128,18 @@ def test_recompute():
         assert layer_node.param_mem == ln_node.param_mem + mlp_node.param_mem + add_node.param_mem
         assert layer_node.buffer_mem == 0
 
-    assert decoder_node.leaf_size == num_layers * layer_node.leaf_size + 1
+    assert decoder_node.leaf_size == num_layers * layer_node.leaf_size
     assert decoder_node.in_mem == batch_size * hidden_dim * 4
     assert decoder_node.train_mem == num_layers * layer_node.train_mem
     assert decoder_node.param_mem == num_layers * layer_node.param_mem
     assert decoder_node.buffer_mem == 0
 
-    assert model_node.leaf_size == decoder_node.leaf_size
-    assert model_node.in_mem == decoder_node.in_mem
-    assert model_node.train_mem == decoder_node.train_mem
-    assert model_node.param_mem == decoder_node.param_mem
-    assert model_node.buffer_mem == decoder_node.buffer_mem
+    assert model_node.leaf_size == encoder_node.leaf_size + decoder_node.leaf_size + 1
+    assert model_node.in_mem == encoder_node.in_mem
+    assert model_node.train_mem == encoder_node.train_mem + decoder_node.train_mem
+    assert model_node.param_mem == encoder_node.param_mem + decoder_node.param_mem
+    assert model_node.buffer_mem == encoder_node.buffer_mem + decoder_node.buffer_mem
 
-    assert model_graph.recompute_mem == layer_node.train_mem + num_layers * layer_node.in_mem
+    assert model_graph.min_recompute_mem == layer_node.train_mem
+    fnodes = ir_graph.select(ntype=IRFwOperation)
+    assert model_graph.recompute_groups == [fnodes[5 * (num_layers + i) : 5 * (num_layers + i) + 5] for i in range(num_layers)]

@@ -40,6 +40,8 @@ class PartitionCostDesc:
     # 4. buffer memory (weight does not need gradient)
     # 5. optimizer resident memory: like 1st and 2nd moment in Adam
     mem: int
+    # input memory size, used in recompute
+    in_mem: int
     # additional transient mem cost: currently use the maximum tensor size
     transient_mem: int
     # sum of the activation tensor size
@@ -283,24 +285,23 @@ class SPMDSolver:
                     raise RuntimeError(
                         f'operator {operator.op_name} is not a dimops, check the partition constraint'
                     )
-                module_info = [(module_path, module_type)
-                               for module_path, module_type in
-                               operator.ir_cell.module_stack.items()]
-                module_info.reverse()
-                selected_pc = None
-                for module_path, module_type in module_info:
-                    for pc in self.pcs[operator.op_name].values():
-                        if pc.parent_module in str(module_type):
-                            selected_pc = pc
-                            _logger.debug(
-                                f'find partition constraint {pc} for {operator.ir_cell}'
-                            )
-                            break
-                    if selected_pc is not None:
-                        break
+                nested_module_type = '.'.join(
+                    [module_type.__name__ for _, module_type in operator.ir_cell.module_stack.items()])
+                candidate_pcs: List[Tuple[int, PartitionConstraint]] = []
+                for pc in self.pcs[operator.op_name].values():
+                    name_pos = nested_module_type.rfind(pc.parent_module)
+                    if name_pos == -1:
+                        continue
+                    # use the length of the parent module name to find the closest partition constraint
+                    candidate_pcs.append([len(pc.parent_module), pc])
+                candidate_pcs.sort(key=lambda x: -x[0])
+                if candidate_pcs:
+                    selected_pc = candidate_pcs[0][1]
+                else:
+                    selected_pc = None
                 if selected_pc is not None:
                     _logger.debug(
-                        f'find partition constraint {selected_pc} for {operator.ir_cell} {module_info}'
+                        f'find partition constraint {selected_pc} for {operator.ir_cell} {nested_module_type}'
                     )
                     self.non_used_pcs.discard(selected_pc)
                     for u, v in zip(p_ids, p_nums):
@@ -597,9 +598,9 @@ class SPMDSolver:
             weight_comm_time = 0
 
         if not self.autodist_config.consider_mem:
-            node_mem, node_buffer, act_mem, opt_transient_mem = 0, 0, 0, 0
+            node_mem, node_buffer, act_mem, opt_transient_mem, in_mem = 0, 0, 0, 0, 0
         else:
-            node_mem, node_buffer, act_mem, opt_transient_mem = self.cost_database.get_mem_and_buffer(
+            node_mem, node_buffer, act_mem, opt_transient_mem, in_mem = self.cost_database.get_mem_and_buffer(
                 tgt_p, self.is_train, self.stage_num)
 
         # communication cost induced by partitioning activation tensors of the given op partition
@@ -641,6 +642,7 @@ class SPMDSolver:
             comp_time=micro_batch_num * comp_time,
             weight_update_time=weight_comm_time,
             mem=node_mem,
+            in_mem=in_mem,
             transient_mem=node_buffer,
             activation_mem=act_mem,
             opt_transient_mem=opt_transient_mem,
@@ -722,15 +724,54 @@ class SPMDSolver:
             plan.append((i, cur_mem.index(min(cur_mem))))
         return plan
 
-    def satisfy_mem_constraint(self, plan: List[Tuple[int, int]]) -> bool:
+    def calc_mem_cost(self, plan: List[Tuple[int, int]]) -> int:
+        '''
+        calculate the memory cost of the plan
+
+        Args:
+            plan (List[Tuple[int, int]]): the plan to be evaluated
+
+        Returns:
+            int: the memory cost of the plan in bytes
+        '''
+
+        def to_mb(size: int) -> int:
+            return size // 1024 // 1024
+
         mem, act_mem, opt_transient_mem, transient_mem = 0, 0, 0, []
         for op_idx, p_idx in plan:
             desc = self.partition_info[op_idx][p_idx]
-            mem += desc.mem
-            act_mem += desc.activation_mem
+            if self.graph.operator_list[op_idx].recompute:
+                if self.graph.operator_list[op_idx].recompute_start_op:
+                    mem += desc.in_mem
+                mem += desc.mem - desc.activation_mem
+            else:
+                mem += desc.mem
+                act_mem += desc.activation_mem
             opt_transient_mem += desc.opt_transient_mem
             transient_mem.append(desc.transient_mem)
+        _logger.info(f'resident mem: {to_mb(mem)} MB')
+        _logger.info(f'activation mem: {to_mb(act_mem)} MB')
+        _logger.info(f'opt transient mem: {to_mb(opt_transient_mem)} MB')
         cost = mem - act_mem + max(act_mem, opt_transient_mem)
+
+        start, end = plan[0][0], plan[-1][0]
+        recompute_mem_cost = 0
+        for group in self.graph.recompute_group_idxs:
+            cur_start, cur_end = group[0], group[-1]
+            # do not consider the recompute cost when it is out of the current stage
+            if cur_start > end or cur_end < start:
+                continue
+            if cur_start >= start and cur_end <= end:
+                cur_recompute_mem_cost = 0
+                for i in range(cur_start, cur_end + 1):
+                    p_cost_desc = self.partition_info[i][plan[i - start][1]]
+                    cur_recompute_mem_cost += p_cost_desc.activation_mem
+                recompute_mem_cost = max(recompute_mem_cost,
+                                         cur_recompute_mem_cost)
+        _logger.info(f'recompute mem: {to_mb(recompute_mem_cost)} MB')
+        cost += recompute_mem_cost
+
         # A heuristic that helps to estimate the memory cost accurately.
         # It is hard to fully reuse large memory blocks in the cached allocator.
         # - in training, use the maximum 2 transient memory
@@ -740,9 +781,51 @@ class SPMDSolver:
             transient_mem.reverse()
             if len(transient_mem) == 1 or not self.autodist_config.is_train:
                 cost += transient_mem[0]
+                _logger.info(f'transient mem: {to_mb(transient_mem[0])} MB')
             else:
                 cost += transient_mem[0] + transient_mem[1]
-        return cost <= self.mem_bound
+                _logger.info(
+                    f'transient mem: {to_mb(transient_mem[0])} MB, {to_mb(transient_mem[1])} MB'
+                )
+        _logger.info(f'total mem cost: {to_mb(cost)} MB')
+        return cost
+
+    def calc_inner_time_cost(self, plan: List[Tuple[int, int]]) -> float:
+        '''
+        calculate the inner time cost of the plan: computation time + weight update time
+
+        Args:
+            plan (List[Tuple[int, int]]): the plan to be evaluated
+
+        Returns:
+            float: the inner time cost of the plan
+        '''
+        cost = 0.0
+        for op_idx, p_idx in plan:
+            desc = self.partition_info[op_idx][p_idx]
+            cost += desc.comp_time + desc.weight_update_time
+        return cost
+
+    def calc_intra_time_cost(self, plan: List[Tuple[int, int]]) -> float:
+        '''
+        calculate the intra time cost of the plan: communication time between operators
+
+        Args:
+            plan (List[Tuple[int, int]]): the plan to be evaluated
+
+        Returns:
+            float: the intra time cost of the plan
+        '''
+        cost = 0.0
+        op_idx2p_idx: Dict[int, int] = dict(plan)
+        for op_idx, p_idx in plan:
+            desc = self.partition_info[op_idx][p_idx]
+            for k, comm_vec in enumerate(desc.comm_time):
+                producer = self.producers[op_idx][k]
+                if not producer in op_idx2p_idx:
+                    continue
+                cost += comm_vec[op_idx2p_idx[producer]]
+        return cost
 
     def build_cut_ops(self):
         cid2idx = {}
@@ -811,14 +894,15 @@ class SPMDSolver:
                                           (range(len(s[i]) * len(s[j])),),
                                           cat='Binary'))
 
+        # NOTE: comment temporarily, refine it later
         # 2. set initial value for warm start
-        plan = self.gen_min_mem_plan_greedy(start, end)
-        for op_idx, p_idx in plan:
-            s_idx = op_idx - start
-            if len(s[s_idx]) == 1:
-                continue
-            for i in range(len(s[s_idx])):
-                s[s_idx][i].setInitialValue(i == p_idx)
+        # plan = self.gen_min_mem_plan_greedy(start, end)
+        # for op_idx, p_idx in plan:
+        #     s_idx = op_idx - start
+        #     if len(s[s_idx]) == 1:
+        #         continue
+        #     for i in range(len(s[s_idx])):
+        #         s[s_idx][i].setInitialValue(i == p_idx)
 
         # 3. define the objective function
         prob = LpProblem('SPMD', LpMinimize)
@@ -865,25 +949,51 @@ class SPMDSolver:
         max_transient = LpVariable('max_transient', lowBound=0)
         for i in range(start, end + 1):
             cur_mem = []
+            cur_in_mem = []
             cur_act_mem = []
+            cur_param_mem = []
             cur_opt_transient_mem = []
             cur_transient_mem = []
             for desc in self.partition_info[i]:
                 cur_mem.append(desc.mem)
+                cur_in_mem.append(desc.in_mem)
                 cur_act_mem.append(desc.activation_mem)
+                cur_param_mem.append(desc.mem - desc.activation_mem)
                 cur_opt_transient_mem.append(desc.opt_transient_mem)
                 cur_transient_mem.append(desc.transient_mem)
-            mem += lpDot(s[i - start], cur_mem)
-            act_mem += lpDot(s[i - start], cur_act_mem)
+            if not self.graph.operator_list[i].recompute:
+                mem += lpDot(s[i - start], cur_mem)
+                act_mem += lpDot(s[i - start], cur_act_mem)
+            else:
+                if self.graph.operator_list[i].recompute_start_op:
+                    mem += lpDot(s[i - start], cur_in_mem)
+                mem += lpDot(s[i - start], cur_param_mem)
             opt_transient_mem += lpDot(s[i - start], cur_opt_transient_mem)
             prob += lpDot(s[i - start], cur_transient_mem) <= max_transient
+        recompute_mem = LpVariable('recompute_mem', lowBound=0)
+        for group in self.graph.recompute_group_idxs:
+            cur_start, cur_end = group[0], group[-1]
+            if cur_start > end or cur_end < start:
+                continue
+            if cur_start >= start and cur_end <= end:
+                cur_group_mem = 0
+                for i in range(cur_start, cur_end + 1):
+                    cur_act_mem = []
+                    for desc in self.partition_info[i]:
+                        cur_act_mem.append(desc.activation_mem)
+                    cur_group_mem += lpDot(s[i - start], cur_act_mem)
+                prob += cur_group_mem <= recompute_mem
+            else:
+                _logger.warning(
+                    f'interval {start} {end} and recompute group {cur_start} {cur_end} overlap'
+                )
         prob += act_mem <= max_act_opt_transient
         prob += opt_transient_mem <= max_act_opt_transient
         if self.autodist_config.is_train:
             transient_coef = 2
         else:
             transient_coef = 1
-        prob += mem - act_mem + max_act_opt_transient + transient_coef * max_transient <= self.mem_bound
+        prob += mem - act_mem + max_act_opt_transient + transient_coef * max_transient + recompute_mem <= self.mem_bound
 
         # 4.3. constraint over e
         offset = 0
@@ -965,18 +1075,18 @@ class SPMDSolver:
                 offset += 1
         plans = []
         all_time_cost = objective
-        inner_time_cost, mem_cost = 0, 0
+        inner_time_cost = 0
         for i in range(start, end + 1):
             plans.append((i, s_val[i - start]))
             p_cost_desc = self.partition_info[i][s_val[i - start]]
             inner_time_cost += p_cost_desc.comp_time + p_cost_desc.weight_update_time
-            mem_cost += p_cost_desc.mem
+        mem_cost = self.calc_mem_cost(plans)
         return SPMDSearchOutput(self.partition_path2desc(plans),
                                 mem_cost / 1024 / 1024 / 1024, all_time_cost,
                                 inner_time_cost)
 
     def do_ilp(self, intervals: List[Tuple[int, int]],
-               topk: int) -> List[SPMDSearchOutput]:
+               topk: int) -> List[List[SPMDSearchOutput]]:
         if topk != 1:
             raise RuntimeError('topk != 1 is not supported')
         ret = []
@@ -990,7 +1100,7 @@ class SPMDSolver:
         return ret
 
     def do_dp(self, intervals: List[Tuple[int, int]],
-              topk: int) -> List[SPMDSearchOutput]:
+              topk: int) -> List[List[SPMDSearchOutput]]:
         import cppimport.import_hook
         import nnscaler.autodist.dp_solver as dp_solver
 
@@ -1022,6 +1132,18 @@ class SPMDSolver:
 
     def solve(self, intervals: List[Tuple[int, int]],
               topk: int) -> List[SPMDSearchOutput]:
+        '''
+        generate the optimal partition plan for operators in the interval [start, end] by
+        integer linear programming (ILP) or dynamic programming (DP). Communication cost
+        between the node in the interval to its producer outside the interval is not considered.
+
+        Args:
+            intervals (List[Tuple[int, int]]): the intervals to be solved
+            topk (int): the number of top-k plans for each interval
+
+        Returns:
+            List[List[SPMDSearchOutput]]: the top-k partition plans for each interval
+        '''
         if self.autodist_config.solver == 'ilp':
             return self.do_ilp(intervals, topk)
         elif self.autodist_config.solver == 'dp':
@@ -1032,6 +1154,15 @@ class SPMDSolver:
 
     def partition_path2desc(
             self, plans: List[Tuple[int, int]]) -> Dict[int, NodePartitionDesc]:
+        '''
+        convert the partition representation: (op_idx, partition_idx) to (op_cid, partition_desc)
+
+        Args:
+            plans (List[Tuple[int, int]]): the partition plan to be converted
+
+        Returns:
+            Dict[int, NodePartitionDesc]: the converted partition plan
+        '''
         partitions = [self._op_partitions[u][v] for u, v in plans]
 
         partition_descs = {}
@@ -1051,6 +1182,17 @@ class SPMDSolver:
 def calc_optimal_spmd_plan(
         model_graph: ModelGraph,
         autodist_config: AutoDistConfig) -> PipelineSearchOutput:
+    '''
+        calculate the optimal sigle-program-multiple-data plan for the input graph,
+        the returned plan is wrapped in a PipelineSearchOutput object
+
+        Args:
+            model_graph (ModelGraph): the wrapped input IRGraph
+            autodist_config (AutoDistConfig): the configuration for AutoDist
+
+        Returns:
+            PipelineSearchOutput: the optimal plan
+    '''
     spmd_solver = SPMDSolver(
         graph=model_graph,
         mesh_desc=autodist_config.mesh_desc,

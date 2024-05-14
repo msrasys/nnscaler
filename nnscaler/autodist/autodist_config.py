@@ -44,7 +44,7 @@ class AutoDistConfig:
         - fp16 & bf16 training w/ memory efficient adam w/o inkernal cast: (2 + 2) (fp32 weight + fp32 gradient)
     - partition_constraints_path (`str`, *optional*, defaults to `''`):
         The path to the partition constraints file. Details can be found in docs/solver_interface/partition_constraints.md
-    - profile_dir (`str`, *optional*, defaults to `~/.nnscaler/autodist`):
+    - profile_dir (`str`, *optional*, defaults to `~/.cache/nnscaler/autodist`):
         The directory to store the profiling results.
     - load_plan_path (`str`, *optional*, defaults to `''`):
         The path to the plan file to load. If specified, the plan will be loaded from the file instead of searching.
@@ -65,6 +65,8 @@ class AutoDistConfig:
         The number of available devices in each node.
     - recompute_modules (`str`, *optional*, defaults to `''`):
         The module names to recompute, separated by `,`. For example, `module1,module2`.
+        Module name can be any suffix of the full module name, e.g., `module1` will match `x.module1`, `y.module1`,
+        `x.module1` will match `x.module1` but not `y.module1`.
     - memory_constraint (`float`, *optional*, defaults to `32`):
         The memory constraint in each device in GB.
     - memory_granularity (`int`, *optional*, defaults to `1`):
@@ -97,7 +99,9 @@ class AutoDistConfig:
         The maximum unbalance ratio in pipeline parallelism. The higher the ratio, the more unbalance is required,
         the smaller search space will be explored.
     - solver (`str`, *optional*, defaults to `'dp'`):
-        The solver to use in spmd parallelism. Currently only support `'dp'` (dynamic programming) and `'ilp'` (integer linear programming).
+        The solver to use in spmd parallelism. Currently only support
+        `'dp'` (dynamic programming)
+        `'ilp'` (integer linear programming).
     """
 
     def __init__(self,
@@ -130,7 +134,7 @@ class AutoDistConfig:
                  pipeline_nstages=1,
                  max_pipeline_bubble_ratio=0.4,
                  max_pipeline_unbalance_ratio=0.5,
-                 solver='dp',
+                 solver='ilp',
                  **kwargs):
         self.pc_path = partition_constraints_path
         self.profile_dir = profile_dir
@@ -220,7 +224,10 @@ class AutoDistConfig:
                         f'world size {self.world_size} must be divisible by zero num groups {self.zero_ngroups}'
                     )
 
-        if not self.solver in ['dp', 'ilp']:
+        if not self.solver in [
+                'dp',
+                'ilp',
+        ]:
             raise ValueError(f'solver {self.solver} must be dp or ilp')
 
     def __repr__(self):
