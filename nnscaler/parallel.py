@@ -370,11 +370,13 @@ class BroadcastGenFilesStrategy(Enum):
     The broadcast strategy for generated files.
     Only new generated files can be broadcasted.
     The files includes:
+
     1. config file: compute config (compute_config.pt)
     2. trace files: graph dump (graph.ckp), forward args dump(forward_args.pkl),
-            origin module metadata (origin_module_metadata.pt), init weights file(fullmodel.pt.*),
-            param name mapping (dist_param_map.pt)
+       origin module metadata (origin_module_metadata.pt), init weights file(fullmodel.pt.*),
+       param name mapping (dist_param_map.pt)
     3. code: generated code files (gencode*.py)
+
     Reused files will not be broadcasted with any of the following options.
     """
 
@@ -859,8 +861,8 @@ def parallelize(
     the generated code in outdir will be removed EVEN IF the code generation fails in this call.
 
     if the input is a module object.
-        The module object will be copied to cpu to handle possible insufficient gpu memory.
-        The training flag will be the same as the original module
+    * The module object will be copied to cpu to handle possible insufficient gpu memory.
+    * The training flag will be the same as the original module
 
     This function can be used to convert both module object and module class to cube module or cube module class.
     Among key-value arguments,
@@ -868,31 +870,36 @@ def parallelize(
     whereas init_module_params controls how to load cube module object after conversion is done.
 
     1. If the input is a module object, it will return a CubeModule object if load_module is True.
-        This is useful when the module is created by a factory function.
-        a. module_fn is ignored.
-        b. module_dtype is used to control the dtype of the input module.
-        c. init_module_params is used to control whether to initialize the cube module parameters when load it.
+       This is useful when the module is created by a factory function.
+
+       a. module_fn is ignored.
+       b. module_dtype is used to control the dtype of the input module.
+       c. init_module_params is used to control whether to initialize the cube module parameters when load it.
 
     2. If the input is a module class, it will return a CubeModule class if load_module is True.
-        a. module_fn is used to create the module object, or module's__init__ if not prent.
-        b. module_dtype is used to control the dtype of the created module (by constructor or module_fn).
-            Of course, it can be merged into module_fn.
-        c. init_module_params is ignored.
+
+       a. module_fn is used to create the module object, or module's__init__ if not prent.
+       b. module_dtype is used to control the dtype of the created module (by constructor or module_fn).
+          Of course, it can be merged into module_fn.
+       c. init_module_params is ignored.
 
     After the module is converted, you can use it to create module object by calling it like a module class.
     The module class is defined like:
-    ```
-    class GenModule(nnscaler.runtime.module.ParallelModule):
-        def __init__(self, init_params=True):
-            super().__init__()
+
+    ::
+
+        class GenModule(nnscaler.runtime.module.ParallelModule):
+            def __init__(self, init_params=True):
+                super().__init__()
+                ...
             ...
-        ...
-    ```
+
     So you can use `init_params` in `__init__` to control whether to initialize the module parameters.
     For example, if you don't want to initialize module params:
-    ```
-    module = GenModule(init_params=False)
-        ```
+
+    ::
+
+        module = GenModule(init_params=False)
 
     Args:
         module_or_module_class (Union[torch.nn.Module, Type[torch.nn.Module]]): the module or module class to be compiled
@@ -1047,10 +1054,14 @@ class OptimizerExtraState:
             the key is the module prefix of the parallel module.
             A module prefix is the same prefix used when you call `module.state_dict()` without the ending dot.
             For example, if you have a module
+
+            ::
+
                 module
                     submodule1_1
                         submodule2_1
                     submodule1_2
+
             then the prefix of `module` itself is `` (empty str).
             the prefix of `submodule1_1` is `submodule1_1`.
             the prefix of `submodule2_1` is `submodule1_1.submodule2_1`.
@@ -1155,17 +1166,18 @@ def build_optimizer(
     Build an optimizer for a module.
 
     To support parallelized module (CubeModule), we hook 4 places in this function:
+
     1. optimizer constructor:
-        the parameters of optimizer will not be the same with the parameters of the module if we use zero
-        so we need to replace the parameters of optimizer with CubeModule.parameters_for_optimizer
-        It is impossible to make this change transparent to end users.
+       the parameters of optimizer will not be the same with the parameters of the module if we use zero
+       so we need to replace the parameters of optimizer with CubeModule.parameters_for_optimizer
+       It is impossible to make this change transparent to end users.
     2. optimizer.step():
-        we need to call optimizer.sync_shard_grad() to sync the gradients of the module before optimizer.step().
-        In zero mode, we have to call CubeModule.gather_params() after optimizer.step()
+       we need to call optimizer.sync_shard_grad() to sync the gradients of the module before optimizer.step().
+       In zero mode, we have to call CubeModule.gather_params() after optimizer.step()
     3. optimizer.zero_grad():
-        We need to call CubeModule.zero_grad() after optimizer.zero_grad()
+       We need to call CubeModule.zero_grad() after optimizer.zero_grad()
     4. backward():
-        you need to call optimizer.sync_shard_grad() manually if you want to read the gradients of the module before optimizer.step().
+       you need to call optimizer.sync_shard_grad() manually if you want to read the gradients of the module before optimizer.step().
 
     Args:
         module (torch.nn.Module): the module to be optimized
@@ -1509,12 +1521,16 @@ def merge_state_dicts(
     Note: Only Adam-like optimizers are supported for merging
 
     Please Note:
-        We don't garantee the devices of tensors are the same in the merged state dict.
-        You can assume the device of the tensors in the merged state dict can be one of the following:
-            1. the current device when running this function
-            2. the current cuda device when running this function
-            3. the device of the tensor in the original state dict
-        When you load the state dict from file, you can just use `torch.load(..., map_location='...')` to unify the device of the tensors.
+
+    We don't garantee the devices of tensors are the same in the merged state dict.
+    You can assume the device of the tensors in the merged state dict can be one of the following:
+
+    1. the current device when running this function
+    2. the current cuda device when running this function
+    3. the device of the tensor in the original state dict
+
+    When you load the state dict from file, you can just use `torch.load(..., map_location='...')` to unify the device of the tensors.
+
     Args:
         model_state_dicts (List[Dict[str, Any]]): the model state dicts from each rank
         optimizer_state_dicts (Optional[List[Dict[str, Any]]]): the optimizer state dicts from each rank
@@ -1652,6 +1668,7 @@ def load_merged_state_dicts(
 ):
     """
     Load the merged state dicts to the module, and optionally the optimizer to a specified device.
+
     Args:
         module (torch.nn.Module): the module to be loaded
         module_state_dict (Dict[str, Any]): the merged model state dict
@@ -1659,6 +1676,7 @@ def load_merged_state_dicts(
         optimizer_state_dict (Optional[Dict[str, Any]]): the merged optimizer state dict
         device (Union[str, torch.device]): the device to put the module and optimizer state dicts.
             Use torch.cuda.current_device() if it is None.
+
     Returns:
         None
     """
@@ -2011,7 +2029,7 @@ def deduped_state_dict(
     """
     Return the state dict only for the ranks that is necessary.
     For details, see `ComputeConfig.optimizer_dedup_group_size`
-        and `ComputeConfig.module_dedup_group_size`.
+    and `ComputeConfig.module_dedup_group_size`.
 
     Args:
         module (torch.nn.Module): the module to get state dict

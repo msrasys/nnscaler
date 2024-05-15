@@ -18,6 +18,8 @@ fullmodel.pt
 fullmodel.pt.*
 dist_param_map.pt
 
+docs/build/
+
 ## autodist ##
 
 # Python cache

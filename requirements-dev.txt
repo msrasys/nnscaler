@@ -1,9 +1,13 @@
 coverage
+furo
 mock
+myst-parser
 pre-commit
 pytest
 pytest-cov
 pytest-mock
+sphinx
+sphinxcontrib-napoleon
 tabulate
 tox
 tox-conda
