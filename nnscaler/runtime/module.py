@@ -708,23 +708,23 @@ class ParallelModule(CubeModule):
 
     def _train_step(self, dataloader) -> Union[List[Any], Any]:
         """
-        This function is assigned automatically when loading module class
+        This function is assigned automatically when loading end2end module class
         Returns:
             Union[List[Any], Any]: the output of the training step,
                 In Pipeline mode, it should return a list of outputs for each sample
                 Otherwise, it should return a single output
         """
-        ...
+        raise NotImplementedError
 
     def _infer_step(self, dataloader) -> Union[List[Any], Any]:
         """
-        This function is assigned automatically when loading module class
+        This function is assigned automatically when loading end2end module class
         Returns:
             Union[List[Any], Any]: the output of the training step,
                 In Pipeline mode, it should return a list of outputs for each sample
                 Otherwise, it should return a single output
         """
-        ...
+        raise NotImplementedError
 
     def _scale_loss(self, is_dummy_batch: Optional[List[bool]], scale_fn: Optional[Callable[[torch.Tensor], torch.Tensor]]) -> None:
         """Setup cube backward hook for loss scale and dummy batch.

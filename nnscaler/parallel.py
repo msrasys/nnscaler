@@ -53,7 +53,7 @@ _PREDEFINED_INFERENCE_SCHEDS = ['infer_pipe']
 _PREDEFINE_SCHED_NAME_PREFIX = 'sched_'
 for k, v in PredefinedSched.__dict__.items():
     if isinstance(v, staticmethod) and k.startswith(_PREDEFINE_SCHED_NAME_PREFIX):
-        _PREDEFINE_SCHEDS[k[len(_PREDEFINE_SCHED_NAME_PREFIX):]] = v
+        _PREDEFINE_SCHEDS[k[len(_PREDEFINE_SCHED_NAME_PREFIX):]] = getattr(PredefinedSched, k)  # be compatible with python 3.8
 
 _PREDEFINED_POLICIES: Dict[str, Callable[[IRGraph, 'ComputeConfig'], IRGraph]] = {}
 _PREDEFINED_POLICIES_NAME_PREFIX = 'pas_'
@@ -174,6 +174,7 @@ class ComputeConfig:
 
     def apply_pipeline_scheduler(self, graph: IRGraph) -> Optional[SchedulePlan]:
         """
+        Apply the pipeline scheduler to the graph.
         Do nothing if not use_pipeline
         """
         if self.use_pipeline:
@@ -317,7 +318,7 @@ def _add_cube_savedir_to_syspath(cube_savedir: str) -> Path:
 
 def _is_any_gencode_loaded(namespace: str) -> bool:
     """Check if a module is loaded"""
-    for m in sys.modules.values():
+    for m in list(sys.modules.values()):  # list() to avoid mulitple thread confliction
         # m.__name__ doesn't always work as some module doesn't have __name__ attribute.
         if getattr(m, '__name__', '').startswith(namespace + '.' + _GENCODE_FILE_PREFIX):
             return True
@@ -553,6 +554,7 @@ def _gen_graph(
     dynamic_shape: bool,
     end2end_mode: bool = False,
     inference_only: bool = False,
+    use_pipeline: bool = False,
 ):
     # reset environment
     program = Program()
@@ -591,8 +593,10 @@ def _gen_graph(
             ir_dummy_inputs.append(None)  # always set None to *args/**kwargs
         elif node.target in dummy_input:
             ir_dummy_inputs.append(dummy_input[node.target])
+        elif forward_args[node.target] is not inspect.Parameter.empty:
+            ir_dummy_inputs.append(forward_args[node.target])
         else:
-            raise ValueError(f"Input {node.target} not in dummy input. Default value is not supported.")
+            raise ValueError(f"Input {node.target} not in dummy input, nor has default value.")
     for i in range(len(ir_dummy_inputs)):
         ir_dummy_inputs[i] = to_ir_input(ir_dummy_inputs[i], fx_input_nodes[i].target)
         # if the input is not a tensor, we should wrap it with IRObject
@@ -634,8 +638,8 @@ def _gen_graph(
     if ir_dummy_outputs is None: ir_dummy_outputs = []
     elif not isinstance(ir_dummy_outputs, (tuple, list)):
         ir_dummy_outputs = [ir_dummy_outputs]
-    if _contains_uncommutable_data(ir_dummy_outputs):
-        raise RuntimeError(f"Communication generation error: some of outputs are not commutable between gpus.")
+    if use_pipeline and _contains_uncommutable_data(ir_dummy_outputs):
+        raise RuntimeError(f"Communication generation error: some of outputs are not commutable between gpus, which is not supported in pipeline parallelism.")
     program.set_output(ir_dummy_outputs)
     program.finalize()
 
@@ -714,7 +718,8 @@ def _gencode(
         graph, forward_args = _gen_graph(
             module, dummy_input, outdir,
             dynamic_shape=compute_config.dynamic_shape, end2end_mode=compute_config.use_end2end,
-            inference_only=compute_config.inference_only
+            inference_only=compute_config.inference_only,
+            use_pipeline=compute_config.use_pipeline,
         )
         graph.dump(graph_ckp)
         torch.save(forward_args, forward_args_ckp)
@@ -761,7 +766,9 @@ def _gencode(
     # code generation
     assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
     mgener = ModuleCodeGen(execplan, compute_config.runtime_ngpus)
-    sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
+    sgener = None
+    if compute_config.use_end2end:
+        sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
     for rank in range(compute_config.runtime_ngpus):
         fname = outdir / _GENCODE_FILE_TEMPLATE.format(rank)
         mgener.gen(rank,
@@ -771,12 +778,14 @@ def _gencode(
             as_parallel_module=True,
             end2end_mode=compute_config.use_end2end
         )
-        # generate temporal schedule code
-        sgener.gen(
-            device=rank,
-            outfile=fname,
-            attach=True
-        )
+        # generate temporal schedule code only for end2end module
+        # because the code generated is wrong for non-end2end module.
+        if compute_config.use_end2end:
+            sgener.gen(
+                device=rank,
+                outfile=fname,
+                attach=True
+            )
 
     return ret
 
@@ -815,8 +824,9 @@ def _load_cube_module_class(
     cube_module_class.__qualname__ = module_class.__qualname__
     # cube_module_class.__module__ = module_class.__module__
     cube_module_class.__orig_module_class__ = module_class  # save the original module class
-    cube_module_class._train_step = gen_imported._train_step
-    cube_module_class._infer_step = gen_imported._infer_step
+    # override train_step and infer_step only if they are defined in the generated module (end2end module only)
+    cube_module_class._train_step = getattr(gen_imported, '_train_step', cube_module_class._train_step)
+    cube_module_class._infer_step = getattr(gen_imported, '_infer_step', cube_module_class._infer_step)
     return cube_module_class
 
 

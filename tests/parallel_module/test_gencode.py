@@ -34,7 +34,9 @@ def _gencode_worker(tempdir):
     init_distributed()
     m = Module0()
     with pytest.raises(RuntimeError):  # config mismatch
-        _to_cube_model(m, ComputeConfig(1, 1), cube_savedir=tempdir, load_module=True)
+        pm = _to_cube_model(m, ComputeConfig(1, 1), cube_savedir=tempdir, load_module=True)
+        with pytest.raises(NotImplementedError):
+            pm._train_step(None)  # for non-end2end parallel module, _train_step is not implemented
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
@@ -194,6 +196,30 @@ def test_codegen_unused_args2():
     """
     with tempfile.TemporaryDirectory() as tempdir:
         launch_torchrun(1, _gencode_unused_args_worker2, tempdir)
+
+
+class DefaultArgsModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(3, 5)
+
+    def forward(self, x, m=0, n=None):
+        return self.linear(x) + m
+
+
+@replace_all_device_with('cpu')
+def test_codegen_default_args():
+    with tempfile.TemporaryDirectory() as tempdir:
+        parallelize(
+            DefaultArgsModule(),
+            {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+            'dp',
+            ComputeConfig(1, 1),
+            cube_savedir=tempdir,
+            load_module=False
+        )
+        # parallelize will succeed.
+        assert True
 
 
 class AttrModule(torch.nn.Module):
@@ -684,7 +710,7 @@ def test_codegen_end2end():
         parallelize(
             m,
             {'data': torch.randn(batch_size, dim), 'return_type': return_type},
-            'data',
+            'data' if not use_pipeline else 'pp',
             compute_config= ComputeConfig(
                 4, 4,
                 inference_only=inference_only,
@@ -709,8 +735,11 @@ def test_codegen_end2end():
                     r"self\.register_parameter"
             )
             p(tempdir, use_pipeline=use_pipeline, dynamic_shape=False, return_type=0)  # should success
-            with pytest.raises(RuntimeError, match='.*Communication generation.*'):
-                # fail for non-tensor IRObject return
+            if use_pipeline:
+                with pytest.raises(RuntimeError, match='.*Communication generation.*'):
+                    # fail for non-tensor IRObject return in pipeline mode
+                    p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=1)
+            else:
                 p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=1)
             p(tempdir, use_pipeline=use_pipeline, dynamic_shape=False, return_type=1)  # should success
             p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=2)  # should success
