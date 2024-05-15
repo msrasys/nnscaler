@@ -44,7 +44,7 @@ class AutoDistConfig:
         - fp16 & bf16 training w/ memory efficient adam w/o inkernal cast: (2 + 2) (fp32 weight + fp32 gradient)
     - partition_constraints_path (`str`, *optional*, defaults to `''`):
         The path to the partition constraints file. Details can be found in docs/solver_interface/partition_constraints.md
-    - profile_dir (`str`, *optional*, defaults to `~/.cache/nnscaler/autodist`):
+    - profile_dir (`str`, *optional*, defaults to `~/.cache/nnscaler/autodist/1.0/get_node_arch()`):
         The directory to store the profiling results.
     - load_plan_path (`str`, *optional*, defaults to `''`):
         The path to the plan file to load. If specified, the plan will be loaded from the file instead of searching.

@@ -4,7 +4,8 @@ Policy Writing Guidelines
 Users can write the policy following the steps:
 
 1. Apply multiref
-2. Apply recompute
+    If all consumers of a full tensor consume the same subtensor (the partitions are exactly the same), we can skip this step.
+2. Apply recompute (if needed)
 3. Graph staging (pipeline only)
 4. Graph partition & assign
 5. Apply schedule (pipeline only)
@@ -63,14 +64,8 @@ def pas_dp(graph: IRGraph, cfg: 'ComputeConfig'):
     if ngpus != 1:
         raise ValueError("Data parallelism only supports 1 plan GPU")
 
-    for ftensor in graph.full_tensors():
-        if ftensor.is_grad(): continue
-        if len(graph.consumers(ftensor)) > 1:
-            graph.multiref(ftensor)
-
+    # no partition is done, so we can skip multiref safely
     for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
-        if node.name == 'multiref' or isinstance(node, IRGraphAnchor):
-            continue
         _replica(graph, node, [0])
     return graph
 
@@ -101,7 +96,7 @@ def pas_tp(graph: IRGraph, cfg: 'ComputeConfig'):
                 _replica(graph, node, devs)
             else:
                 configs = sorted(configs, reverse=True,
-                                 key=lambda config: node.input(config[0]).shape[config[1]])
+                                key=lambda config: node.input(config[0]).shape[config[1]])
                 random.shuffle(configs)
                 for (idx, dim) in configs:
                     if node.input(idx).shape[dim] % len(devs) != 0: continue

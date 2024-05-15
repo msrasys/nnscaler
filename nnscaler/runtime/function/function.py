@@ -48,7 +48,7 @@ def fullslice(input: torch.Tensor, *slicers: Union[None, slice, int, torch.Tenso
     1) `None` will always extend a dimension at current position.
     2) `slice(None, None, None)` equals to `:`,
         meaning select every element at its dimension.
-    
+
     Args:
         input (torch.Tensor): input tensor
         slicers (Union[None | slicer | int | torch.Tensor]): slicers for input
@@ -181,13 +181,13 @@ def rand(size: Tuple[int], dtype=None, requires_grad=False):
 
 def full(size: Tuple[int], fill_value, dtype=None, requires_grad=False):
     return torch.full(
-        size, fill_value, dtype=dtype, requires_grad=requires_grad, 
+        size, fill_value, dtype=dtype, requires_grad=requires_grad,
         device=torch.cuda.current_device()
     )
 
 
 def arange(start: int, end: int, step: int, dtype: torch.dtype, requires_grad=False):
-    return torch.arange(start=start, end=end, step=step, 
+    return torch.arange(start=start, end=end, step=step,
                         dtype=dtype, requires_grad=requires_grad,
                         device=torch.cuda.current_device())
 

@@ -44,7 +44,7 @@ class Config:
     drop_path_rate = 0.2
     drop_rate = 0.2
     attn_drop_rate = 0.0
-    
+
     # dataloader
 
     # 224 x 224
@@ -146,7 +146,7 @@ class SwinTransformer(nn.Module):
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
             img_size=cfg.img_size,
-            patch_size=self.patch_size, 
+            patch_size=self.patch_size,
             in_chans=3, embed_dim=cfg.embed_dim,
             norm_layer=nn.LayerNorm
         )
@@ -221,7 +221,7 @@ class SwinTransformer(nn.Module):
 
 # =========================== Data Loader =======================
 
-def dummy_data(batch_size: int, 
+def dummy_data(batch_size: int,
                dtype: torch.dtype, cfg: Config):
     input_ids = torch.randn(
         [batch_size, 3, cfg.img_size, cfg.img_size],

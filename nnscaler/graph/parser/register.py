@@ -194,7 +194,7 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             tensors = args[:ninputs]
             for idx, t in enumerate(tensors):
                 # argument check
-                if str(anno.input(idx)) != '?':
+                if not anno.input(idx).ignore:
                     if not isinstance(t, IRTensor):
                         raise ValueError(
                             f"{idx}-th input needs IRTensor, but got {type(t)}: {t}\n"

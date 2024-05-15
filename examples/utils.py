@@ -1,6 +1,9 @@
 from typing import List, Union, Callable, Optional, Tuple
 import logging
 
+import torch
+
+import nnscaler
 from nnscaler.graph import IRGraph
 from nnscaler.graph.segment import IRSegment
 from nnscaler.graph.function.dimops import IRDimops
@@ -9,6 +12,7 @@ from nnscaler.ir.operator import IRDataOperation, IRFwOperation
 from nnscaler.ir.cten import IRCell
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.graph.function.anchor import IRGraphAnchor
+import nnscaler.runtime
 from nnscaler.utils import print_each_rank
 
 import numpy as np
@@ -24,7 +28,7 @@ def create_mesh(ngpus: int, group_num: Tuple[int]) -> Tuple[Tuple[Tuple[int]]]:
     The product of group_num should be same with total devices.
 
     e.g., 6 device to 2 x 3 mesh will results [dim][group_id] = tuple[int]:
-        ( 
+        (
             ( (0,1,2), (3,4,5) ),
             ( (0,3), (2,5), (3,6) ),
         )
@@ -66,7 +70,7 @@ def _tp_autoplace(segment: IRSegment, ftensor: IRFullTensor,
                   producers: List[IRFwOperation], devs: List[int],
                   sub_nodes: List[IRFwOperation]) -> List[int]:
     """decide the devices of the partitioned `sub-nodes` to achieve optimal communication
-    
+
     Args:
         segment (IRSegment): segment of the ftensor
         ftensor (IRFullTensor): the tensor to be partitioned
@@ -87,7 +91,7 @@ def _tp_autoplace(segment: IRSegment, ftensor: IRFullTensor,
     return devs
 
 # tensor parallelism
-def tensor_parallelism(graph: IRGraph, node: IRDimops, 
+def tensor_parallelism(graph: IRGraph, node: IRDimops,
                        idx: int, dim: int, devs: List[int],
                        autoplace: bool = False) -> List[IRDimops]:
     """Apply tensor parallelism of a node to devs"""
@@ -111,7 +115,7 @@ def tensor_parallelism(graph: IRGraph, node: IRDimops,
 
 
 # replica
-def replica(graph: IRGraph, node: Union[IRFwOperation, IRDataOperation], 
+def replica(graph: IRGraph, node: Union[IRFwOperation, IRDataOperation],
             devs: List[int]) -> List[Union[IRFwOperation, IRDataOperation]]:
     """Replicate a forward node or dataloader to devs"""
     if len(devs) == 1:
@@ -131,7 +135,7 @@ def get_policy(modules: List, name: str) -> Callable:
     Args:
         modules (List): list of modules
         name (str): name of policy
-    
+
     Returns:
         Callable: policy
     """
@@ -143,3 +147,10 @@ def get_policy(modules: List, name: str) -> Callable:
     for module in modules:
         policies += list(policy for policy in module.__dict__.keys() if policy.startswith('PAS'))
     raise ValueError(f"policy {name} not found. Candidates: {policies}")
+
+
+def init_random():
+    np.random.seed(1)
+    torch.manual_seed(1)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1)

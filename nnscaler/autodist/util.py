@@ -23,13 +23,18 @@ def double2byte(val):
 def double4byte(val):
     return struct.unpack('d', val)[0]
 
+
 def get_default_profile_path():
-    return Path.home() / '.cache' / 'nnscaler' / 'autodist' / '1.0'
+    return Path.home() / '.cache' / 'nnscaler' / 'autodist' / '1.0' / get_node_arch()
+
 
 def get_node_arch():
     import torch
-    return torch.cuda.get_device_name(torch.cuda.current_device()).replace(
-        ' ', '_')
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_name(torch.cuda.current_device()).replace(
+            ' ', '_')
+    else:
+        return 'cpu'  # although we don't support cpu now, we still need to return something for testing
 
 
 # tensor parallelism

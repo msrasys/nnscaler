@@ -6,7 +6,7 @@ import torch.nn as nn
 import nnscaler
 
 
-@nnscaler.register_op('B (2 h^ 2 w^) C^ -> B (h w) (4 C)')
+@nnscaler.register_op('B (2 h^ 2 w^) C^ -> B (h^ w^) (4 C^)')
 def patch_merge(x: torch.Tensor, h: int, w: int):
     B, L, C = x.shape
     H = 2 * h
@@ -21,6 +21,7 @@ def patch_merge(x: torch.Tensor, h: int, w: int):
     x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
     x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
     return x
+
 
 @nnscaler.register_op('B ic+ (ps^ w^) (ps^ h^), oc ic+ k^ k^, oc -> B oc w^ h^')
 def patch(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, ps: int):

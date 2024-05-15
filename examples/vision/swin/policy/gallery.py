@@ -1,8 +1,13 @@
 from typing import List
 
+import more_itertools as mitr
+import itertools
+
+from nnscaler import ComputeConfig
 from nnscaler.graph import IRGraph
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.schedule.predefined import PredefinedSched
+from nnscaler.graph.segment import IRSegment
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 
 from examples.utils import tensor_parallelism, replica, group_to_layers
@@ -24,42 +29,19 @@ def coshard(graph: IRGraph, node: IRFwOperation, devs: List[int], colocate: int,
     return sub_nodes
 
 
-def PASSingle(graph: IRGraph, resource, **kwargs):
-    assert resource.ngpus == 1
-    # print(graph.extra_repr())
-    for node in graph.nodes():
-        if not isinstance(node, IRBpOperation):
-            graph.assign(node, 0)
-    return graph
-
-
-def PASData(graph: IRGraph, resource, **kwargs):
-    """Data parallelism"""
-    devs = list(range(resource.ngpus))
-    dataloader = graph.select(ntype=IRDataOperation)[0]
-    bs = dataloader.output(0).shape[0]
-    # replicate dataloader
-    replica(graph, dataloader, devs)
-    # partition forward operators
-    for node in graph.select(ntype=IRFwOperation):
-        if isinstance(node, IRGraphAnchor): continue
-        try:
-            tensor_parallelism(graph, node, idx=0, dim=0, devs=devs)
-        except Exception as e:
-            _logger.warning(f'fail to partition node {node.name} at idx=0, using replica')
-            replica(graph, node, devs)
-    return graph
-
-
-def PASMegatronTP(graph: IRGraph, resource, **kwargs):
+def pas_megatron(graph: IRGraph, cfg: ComputeConfig):
     """Megatron-way tensor parallelism"""
-    devs = list(range(resource.ngpus))
+    devs = list(range(cfg.plan_ngpus))
+
+    # skip mutliref because the partition of tensors in transformer are the same for all tensors
+
     # attention
     for attn in graph.select(name='window_attn'):
         tensor_parallelism(graph, attn, idx=1, dim=0, devs=devs)
     # feedforward
     for ffn in graph.select(name='feedforward'):
         tensor_parallelism(graph, ffn, idx=1, dim=0, devs=devs)
+
     # replicate other nodes
     for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
         if len(node.device) == 0:
@@ -67,9 +49,19 @@ def PASMegatronTP(graph: IRGraph, resource, **kwargs):
     return graph
 
 
-def PASMeshShard(graph: IRGraph, resource, **kwargs):
-    """Coshard policy example"""
-    devs = list(range(resource.ngpus))
+def pas_mesh_shard(graph: IRGraph, cfg: ComputeConfig):
+    """
+    Coshard policy example
+
+    It will partition a tensor `colocate*plan_ngpus` subtensors,
+        and each device will have `colocate` subtensors.
+
+    This can save GPU memory when work with recompute
+    """
+    devs = list(range(cfg.plan_ngpus))
+
+    # skip mutliref because the partition of tensors in transformer are the same for all tensors
+
     # attention
     for attn in graph.select(name='window_attn'):
         # _tp(graph, attn, tp_devs, idx=1, dim=0)
@@ -78,6 +70,7 @@ def PASMeshShard(graph: IRGraph, resource, **kwargs):
     for ffn in graph.select(name='feedforward'):
         # _tp(graph, ffn, tp_devs, idx=1, dim=0)
         coshard(graph, ffn, devs, colocate=4, idx=1, dim=0)
+
     # replicate other nodes
     for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
         if len(node.device) == 0:
@@ -85,22 +78,29 @@ def PASMeshShard(graph: IRGraph, resource, **kwargs):
     return graph
 
 
-def PAS1F1B(graph: IRGraph, resource, nmicros: int, **kwargs):
+def pas_1f1b(graph: IRGraph, cfg: ComputeConfig):
     """1F1B schedule"""
-    num_stages = resource.ngpus
-    num_microbatch = nmicros
+    num_stages = cfg.pipeline_nstages
+    if num_stages != cfg.plan_ngpus:
+        raise ValueError('1F1B schedule requires num_stages == plan_ngpus')
+
     # group to transformer layers
     transformers = group_to_layers(graph.select(ntype=IRFwOperation))
+    stages = mitr.divide(cfg.pipeline_nstages, transformers)
+    stages = [list(itertools.chain(*s)) for s in stages]
+    graph.staging([t[0] for t in stages])
+
     # staging
-    nlayer_per_stage = (len(transformers) // resource.ngpus)
-    for lid, fnodes in enumerate(transformers):
-        stage_id = min(lid // nlayer_per_stage, num_stages-1)
-        _logger.info(f'assigning {lid}-th transformer layter to stage {stage_id}')
-        for fnode in fnodes:
-            graph.assign(fnode, stage_id)
+    stages: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
+    stages = [s for s in stages if s.isfw()]
+
+    for idx, stage in enumerate(stages):
+        for fnode in stage.nodes():
+            graph.assign(fnode, idx)
+
     # replicate dataloader
     for node in graph.select(ntype=IRDataOperation):
-        replica(graph, node, list(range(resource.ngpus)))
+        replica(graph, node, list(range(cfg.plan_ngpus)))
     # apply 1f1b schedule
-    PredefinedSched.sched_1f1b(graph, num_microbatch, num_stages)
+    cfg.apply_pipeline_scheduler(graph)
     return graph

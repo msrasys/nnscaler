@@ -14,6 +14,7 @@ from dataclasses import dataclass, asdict
 
 import _operator # required by eval()
 import nnscaler      # required by eval()
+from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.ir.cten import IRTensor, IRObject
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.graph.parser.register import CustomizedOps
@@ -279,7 +280,7 @@ class ProfileDataBase:
         if isinstance(device, int):
             orig_device = torch.cuda.current_device()
             torch.cuda.set_device(device)
-        
+
         in_mem_info, param_mem_info, buffer_mem_info = [], [], []
         for t in node.inputs():
             if isinstance(t, IRTensor) and t.is_param():

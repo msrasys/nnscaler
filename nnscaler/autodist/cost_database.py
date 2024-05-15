@@ -15,7 +15,6 @@ from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.dimops import DimopSplit, IRDimops
 
-from .util import get_node_arch
 from .autodist_config import AutoDistConfig
 
 _logger = logging.getLogger(__name__)
@@ -63,7 +62,7 @@ class CostDatabase:
         self.graph = graph
         self.autodist_config = config
 
-        self.profile_dir = Path(config.profile_dir) / get_node_arch()
+        self.profile_dir = Path(config.profile_dir)
         self.db = ProfileDataBase()
         self.comp_profile_path = self.profile_dir / 'comp'
         if not self.comp_profile_path.exists():

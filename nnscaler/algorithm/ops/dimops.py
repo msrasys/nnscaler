@@ -241,7 +241,7 @@ class DimSplitEinops(GenericDistAlgo):
         return TransformRule(itransform, otransform, modify)
 
 
-def collect_split_info(node: IRFwOperation):
+def collect_split_info(node: IRDimops):
     """
     Collect the split information of the node.
     Args:
@@ -258,6 +258,7 @@ def collect_split_info(node: IRFwOperation):
     split_info = {}
 
     for idx_shape, shape_anno in enumerate(anno.inputs()):
+        if shape_anno.ignore: continue
         if not isinstance(node.inputs()[idx_shape], IRSubTensor):
             continue
         for idx_dim, dim_anno in enumerate(shape_anno.dims):

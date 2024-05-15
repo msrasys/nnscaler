@@ -67,6 +67,7 @@ import enum
 import re
 import string
 import logging
+from itertools import dropwhile
 
 from nnscaler.ir.cten import IRTensor, IRObject
 from nnscaler.ir.operator import IRFwOperation
@@ -149,7 +150,7 @@ class DimAnno:
             assert str.isdecimal(identifier) or str.isidentifier(identifier) or identifier in _kSpecialIdentifiers, \
                 f"identifier can only be integer or python identifier but got {identifier}"
             # integer will always have stay reduction type
-            if str.isdecimal(identifier):
+            if str.isdecimal(identifier) or identifier == '?':
                 reduce = DimAnno.ReduceType.Freeze
             identifiers.append(identifier)
             reduces.append(reduce)
@@ -481,6 +482,45 @@ class OpAnno:
             ou_annos.append(' '.join(flatten))
         return ', '.join(in_annos) + ' -> ' + ', '.join(ou_annos)
 
+    def transform_space(self) -> List[Tuple[int, int]]:
+        """
+        Get transformation space of the operator, the transformation space
+        represents all configurations that can be segmented
+
+        @return List[Tuple[int, int]]: list of (idx, dim)
+        """
+        # only the first identifier in a dim anno is partitionable
+        # eg. (a b c) x -> (b x)
+        # b, c or x can't be partitioned, because they are not in the first position
+        # a special case is when the leading identifiers are '1'
+        # for example
+        # (1 a b) -> b or (1 1 a b) -> b
+        # in both cases, a can be partitioned, but b can't
+
+        # collect all unpartitioned identifiers that are not in first position
+        nonleading_ids = set()
+        for shape in self.inputs() + self.outputs():
+            for dim, dim_anno in enumerate(shape.dims):
+                for identifier in list(dropwhile(lambda x: x == '1', dim_anno.identifiers))[1:]:
+                    if not str.isdecimal(identifier):
+                        nonleading_ids.add(identifier)
+
+        visited : Set[str] = set()  # to remove equavalent configurations
+        configs = []
+        shapes = self.inputs()
+        for idx, shape in enumerate(shapes):
+            if shape.ignore: continue
+            for dim, edim in enumerate(shape.dims):
+                # this for loop just checks the first element.
+                for identifier, reduce in dropwhile(lambda x: x[0] == '1', zip(edim.identifiers, edim.reduces)):
+                    if identifier in visited: continue
+                    visited.add(identifier)
+                    if reduce != DimAnno.ReduceType.Freeze and identifier not in nonleading_ids:
+                        configs.append((idx, dim))
+                    break
+
+        return configs
+
 
 class DimopSplit:
     """
@@ -774,8 +814,8 @@ class IRDimops(IRFwOperation):
         for ashape, itensor in zip(op_anno.inputs(), inputs):
             if itensor is None:
                 continue
-            if not (isinstance(itensor, IRTensor) ^ ashape.ignore):
-                return False
+            if ashape.ignore:
+                continue
             if not isinstance(itensor, IRTensor):
                 continue
             if ashape.ndims != len(itensor.shape):
@@ -841,24 +881,9 @@ class IRDimops(IRFwOperation):
 
     def transform_space(self) -> List[Tuple[int, int]]:
         """
-        Get transformation space of the operator, the transformation space 
+        Get transformation space of the operator, the transformation space
         represents all configurations that can be segmented
 
         @return List[Tuple[int, int]]: list of (idx, dim)
         """
-        visited : Set[str] = set()
-        configs = []
-        ashapes = self.anno.inputs() + self.anno.outputs()
-        for idx, eshape in enumerate(ashapes):
-            if eshape.ignore: continue
-            if idx < len(self.inputs()):
-                if not isinstance(self.input(idx), IRTensor): continue
-            for dim, edim in enumerate(eshape.dims):
-                for identifier, reduce in zip(edim.identifiers, edim.reduces):
-                    if identifier in visited: continue
-                    visited.add(identifier)
-                    if identifier == '1' or self.anno.getlen(identifier) == 1: continue
-                    if reduce == DimAnno.ReduceType.Freeze: break
-                    configs.append((idx, dim))
-                    break
-        return configs
+        return self.anno.transform_space()

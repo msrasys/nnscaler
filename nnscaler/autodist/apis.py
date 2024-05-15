@@ -3,7 +3,7 @@ from .pipeline_solver import calc_optimal_pp_plan
 from .autodist_config import AutoDistConfig
 from .model_graph import ModelGraph, estimate_mem_lower_bound
 from .descs import *
-from .util import get_node_arch, replica, partition_node
+from .util import replica, partition_node
 
 from nnscaler.graph import IRGraph
 from nnscaler.graph.segment import IRSegment
@@ -29,7 +29,7 @@ __all__ = [
 
 
 def check_env(autodist_config: AutoDistConfig):
-    arch_dir = autodist_config.profile_dir / get_node_arch()
+    arch_dir = Path(autodist_config.profile_dir)
     if not arch_dir.exists():
         _logger.info(f'create folder: {arch_dir}')
         arch_dir.mkdir(parents=True, exist_ok=True)

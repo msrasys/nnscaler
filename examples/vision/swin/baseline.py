@@ -7,6 +7,7 @@ OMP_NUM_THREADS=4 torchrun \
 
 
 import math
+from typing import List, Tuple
 import warnings
 
 import torch
@@ -628,7 +629,47 @@ class SwinTransformer(nn.Module):
         return flops
 
 
-class ImageDataLoader(nnscaler.runtime.syndata.CubeDataLoader):
+class CubeDataLoader:
+    r"""
+    Cube Dataloader
+    """
+    def __init__(self, shapes: Tuple[List[int]], dtypes: Tuple[torch.dtype], batch_dims: Tuple[int] = None):
+        """
+        shapes Tuple[Tuple[int]]:
+            The shape for each data
+        dtypes Tuple[torch.dtype]:
+            The dtype for each data
+        batch_dims Tuple[int]:
+            The batch dimension of each data
+        """
+        if not all(isinstance(shape, list) for shape in shapes):
+            raise TypeError("Expected each shape in shapes to be a list")
+        if len(shapes) != len(batch_dims) or len(shapes) != len(dtypes):
+            raise TypeError("Expected number batch dim and dtypes to len(shapes)")
+        self.shapes = tuple([list(shape) for shape in shapes])
+        self.dtypes = dtypes
+        self.batch_dims = (0,) * len(self.shapes) if batch_dims is None else batch_dims
+
+    def get_batch_size(self) -> int:
+        """
+        get batch size
+        """
+        all_batch_size = set([shape[dim] for shape, dim in zip(self.shapes, self.batch_dims)])
+        if len(all_batch_size) != 1:
+            raise ValueError("Heterogenous batch size in dataloader")
+        return list(all_batch_size)[0]
+
+    def set_batch_size(self, batch_size: int):
+        """
+        set batch size
+        """
+        self.batch_size = batch_size
+        for shape, dim in zip(self.shapes, self.batch_dims):
+            shape[dim] = batch_size
+        print(f'> data loader output shape change to: {self.shapes}')
+
+
+class ImageDataLoader(CubeDataLoader):
 
     def __init__(self, batch_size: int, img_size: int, num_classes: int):
 
@@ -643,7 +684,7 @@ class ImageDataLoader(nnscaler.runtime.syndata.CubeDataLoader):
             batch_dims=(0, 0)
         )
         self.samples = [self.random_sample()]
-        
+
     def random_sample(self):
         torch.manual_seed(0)
         img = torch.rand(
@@ -658,7 +699,7 @@ class ImageDataLoader(nnscaler.runtime.syndata.CubeDataLoader):
             device=torch.cuda.current_device()
         )
         return (img, labels)
-    
+
     def __iter__(self):
         return self
 
@@ -684,7 +725,7 @@ class Config:
 
     drop_path_rate = 0.2
     drop_rate = 0.2
-    
+
 
     # 224 x 224
     img_size = 224
@@ -759,7 +800,7 @@ def train():
 
         if step == 0:
             print_each_rank('passed first iteration')
-        
+
         if (step + 1) % 2 == 0:
             print_each_rank(f'iter [{step + 1}/{iter_num}]', rank_only=0)
 

@@ -82,7 +82,8 @@ def test_follow_rope():
         in future, we may add follow chains for binary ops, like mul, add, etc.
         '''
 
-        cfg = AutoDistConfig(mesh_col=2, re_profile=True)
+        profile_dir = Path(os.path.dirname(__file__)) / './test_follow_rope_profile'
+        cfg = AutoDistConfig(mesh_col=2, profile_dir=profile_dir)
         model_graph = ModelGraph(ir_graph, cfg)
 
         spmd_solver = SPMDSolver(
@@ -208,7 +209,8 @@ def test_follow_attention():
         '''
 
         pc_path = Path(os.path.dirname(__file__)) / 'test_attention_follow.yaml'
-        cfg = AutoDistConfig(partition_constraints_path=pc_path, mesh_col=2, re_profile=True)
+        profile_dir = Path(os.path.dirname(__file__)) / './test_follow_attention_profile'
+        cfg = AutoDistConfig(partition_constraints_path=pc_path, mesh_col=2, profile_dir=profile_dir)
         model_graph = ModelGraph(ir_graph, cfg)
 
         spmd_solver = SPMDSolver(
