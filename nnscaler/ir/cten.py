@@ -16,7 +16,7 @@ If an IRTensor is the output of Cell, then Cell.device == IRTensor.device
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import List, Tuple, Union, Optional, Any, Dict
+from typing import List, Tuple, Union, Optional, Any, Dict, Callable
 from collections import OrderedDict
 import copy
 import torch
@@ -40,6 +40,13 @@ class IRCell:
                  output_length: int):
         """
         Create a node with name (variable name) and module type (module_name)
+
+        Notes: setting input / kwarg / output IRObject will cause a copy-on-write
+        behavior, where the IRObject will be copied (see `set_input` and `set_output`)
+        to prevent users accidently updating it outside.
+
+        To update the IRObject in input / kwarg / output, please use `find`, `input(s)`,
+        and `output(s)` to get the real instance tensor in the IRCell. 
 
         Args:
             name (str): the cell name
@@ -164,6 +171,18 @@ class IRCell:
             Tuple[NestedVarOrStatic]
         """
         return tuple(self._inputs)
+    
+    @lru_cache(maxsize=None)
+    def iobjs(self) -> Tuple[IRObject]:
+        """
+        Get all IRObject in the inputs and kwargs.
+
+        The order follows the inputs order then kwargs order.
+
+        Returns:
+            Tuple[IRObject]: all IRObject in the inputs
+        """
+        return tuple(IRCell.get_objects_from_complex([self._inputs, self._kwargs]))
 
     def output(self, index: int) -> NestedVarOrStatic:
         """Get the index-th output value
@@ -175,6 +194,16 @@ class IRCell:
             NestedVarOrStatic: (nested) IRObject or any static value (int, bool, str, etc)
         """
         return self._outputs[index]
+    
+    @lru_cache(maxsize=None)
+    def oobjs(self) -> Tuple[IRObject]:
+        """
+        Get all IRObjects in the outputs.
+
+        Returns:
+            Tuple[IRObject]: all IRObject in the outputs
+        """
+        return tuple(IRCell.get_objects_from_complex(self._outputs))
 
     # 'maxsize=None' set no limit on cache growth, but it's ok since we have no args
     @lru_cache(maxsize=None)
@@ -192,6 +221,7 @@ class IRCell:
         """
         self._inputs = [None] * length
         self.inputs.cache_clear()
+        self.iobjs.cache_clear()
 
     def set_input(self, index: int, val: NestedVarOrStatic) -> NestedVarOrStatic:
         """Set the index-th input
@@ -208,6 +238,7 @@ class IRCell:
             val.cell = self
         self._inputs[index] = val
         self.inputs.cache_clear()
+        self.iobjs.cache_clear()
         return val
 
     def reset_outputs(self, length:int) -> None:
@@ -216,6 +247,7 @@ class IRCell:
         """
         self._outputs = [None] * length
         self.outputs.cache_clear()
+        self.oobjs.cache_clear()
 
     def set_output(self, index: int, val: NestedVarOrStatic):
         """
@@ -232,7 +264,66 @@ class IRCell:
             val.cell = self
         self._outputs[index] = val
         self.outputs.cache_clear()
+        self.oobjs.cache_clear()
         return val
+    
+    def replace_input(self, old: IRObject, new: IRObject):
+        """Replace the old input (including kwargs) with the new input
+
+        Args:
+            old (IRObject): the old input
+            new (IRObject): the new input
+        """
+        def replace(obj):
+            val = copy.copy(new) if obj == old else obj
+            val.cell = self
+            return val
+
+        self._inputs = IRCell.modify_objects_of_complex(self._inputs, replace)
+        self._kwargs = IRCell.modify_objects_of_complex(self._kwargs, replace)
+        self.inputs.cache_clear()
+        self.iobjs.cache_clear()
+    
+    def replace_output(self, old: IRObject, new: IRObject):
+        """Replace the old output with the new output
+
+        Args:
+            old (IRObject): the old output
+            new (IRObject): the new output
+        """
+        def replace(obj):
+            val = copy.copy(new) if obj == old else obj
+            val.cell = self
+            return val
+
+        self._outputs = IRCell.modify_objects_of_complex(self._outputs, replace)
+        self.outputs.cache_clear()
+        self.oobjs.cache_clear()
+    
+    def replace(self, old: IRObject, new: IRObject):
+        """Replace the old object with the new object in inputs, kwargs, and outputs
+
+        Args:
+            old (IRObject): the old object
+            new (IRObject): the new object
+        """
+        self.replace_input(old, new)
+        self.replace_output(old, new)
+
+    def find(self, obj: IRObject) -> Tuple[IRObject]:
+        """Find all the objects equal to `obj` in inputs, kwargs, or outputs
+
+        Args:
+            obj (IRObject): the object to find
+
+        Returns:
+            Tuple[IRObject]: all the objects equal to `obj`
+        """
+        outs = []
+        IRCell.get_objects_from_complex(self._inputs, outs)
+        IRCell.get_objects_from_complex(self._kwargs, outs)
+        IRCell.get_objects_from_complex(self._outputs, outs)
+        return tuple(out for out in outs if out == obj)
 
     @property
     def comment(self) -> Optional[str]:
@@ -266,6 +357,59 @@ class IRCell:
                 f"inputs={ins}, "
                 f"outputs={self.outputs()})")
         return dscp
+    
+    @staticmethod
+    def get_objects_from_complex(val: Any, _objects: List[IRObject] = None) -> List[IRObject]:
+        """Get all IRObjects from a complex data structure
+
+        Supported complex of types: List, Tuple, Dict, IRTensor, IRObject
+        
+        Args:
+            val (Any): the complex data structure to be modified
+            _objects (List[IRObject] | None):
+                if provided, the objects will be appened into this
+
+        @return _objects List[IRObject]: all IRObject
+        """
+        _objects = [] if _objects is None else _objects
+        if isinstance(val, (tuple, list)):
+            for item in val:
+                IRCell.get_objects_from_complex(item, _objects)
+        elif isinstance(val, dict):
+            for key, value in val.items():
+                IRCell.get_objects_from_complex(key, _objects)
+                IRCell.get_objects_from_complex(value, _objects)
+        elif isinstance(val, slice):
+            IRCell.get_objects_from_complex([val.start, val.stop, val.step], _objects)
+        elif isinstance(val, IRObject):
+            _objects.append(val)
+        return _objects
+
+    @staticmethod
+    def modify_objects_of_complex(val: Any, modifier: Callable) -> Any:
+        """Return a complex data structure with modified IRObjects
+
+        Supported complex of types: List, Tuple, Dict, IRTensor, IRObject
+
+        Args:
+            val (Any): the complex data structure to be modified
+            modifier (Callable): a modifier that takes an IRObject and return a new one.
+
+        Return:
+            new_val (Any): complex data structure with modified IRObjects
+        """
+        rcall = IRCell.modify_objects_of_complex
+        if isinstance(val, tuple):
+            return tuple(rcall(item, modifier) for item in val)
+        if isinstance(val, list):
+            return list(rcall(item, modifier) for item in val)
+        if isinstance(val, dict):
+            return {rcall(key, modifier):rcall(value, modifier) for key, value in val.items()}
+        if isinstance(val, slice):
+            return slice(rcall(val.start, modifier), rcall(val.stop, modifier), rcall(val.step, modifier))
+        if isinstance(val, IRObject):
+            return modifier(val)
+        return val
 
 
 class IRObject:

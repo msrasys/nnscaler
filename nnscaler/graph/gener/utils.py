@@ -106,11 +106,12 @@ def flatten_grad(graph: IRSegment, ftensor: IRFullTensor):
                 valmap = curr_valmap.map((0, 2)) if cidx != len(consumers) - 1 else curr_valmap
                 grad = ftensor.grad.select(ctensor.indmap, valmap)
                 # update consumer and its mirror node
-                fidx = consumer.inputs().index(ctensor)
                 assert consumer.mirror is not None, consumer
-                bidx = consumer.mirror.outputs().index(consumer.input(fidx).grad)
-                consumer.input(fidx).grad = grad
+                with graph.update(consumer) as fnode:
+                    for t in fnode.find(ctensor):
+                        old_grad = t.grad
+                        t.grad = grad
                 with graph.mirror.update(consumer.mirror) as bnode:
-                    bnode.set_output(bidx, grad)
+                    bnode.replace_output(old_grad, grad)
                 # update current valmap
                 curr_valmap = curr_valmap.map((1, 2)) if cidx != len(consumers) - 1 else curr_valmap

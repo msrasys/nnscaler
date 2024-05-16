@@ -31,7 +31,16 @@ class IRFwOperation(IRCell):
         for idx, input in enumerate(inputs):
             self.set_input(idx, input)
 
-        # additional argument
+        # setup kwargs
+        # similar with set_input and set_output, the IRObject
+        # in kwargs will be set with copy-on-write to avoid
+        # potential modifications outside.
+        def replace(t: IRObject):
+            t = copy.copy(t)
+            t.cell = self
+            return t
+
+        kwargs = IRCell.modify_objects_of_complex(kwargs, replace)
         self.kwargs.update(kwargs)
 
         # default infer rule

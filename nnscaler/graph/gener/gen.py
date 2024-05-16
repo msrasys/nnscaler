@@ -518,11 +518,9 @@ class IRAdapterGener:
             itensor = new_ftensor.select(ctensor.indmap, ctensor.valmap)
             igrad = new_ftensor.grad.select(ctensor.grad.indmap, ctensor.grad.valmap)
             with graph.update(consumer) as consumer:
-                idx = consumer.inputs().index(ctensor)
-                consumer.set_input(idx, itensor)
+                consumer.replace_input(ctensor, itensor)
             with graph.mirror.update(consumer.mirror) as bconsumer:
-                idx = bconsumer.outputs().index(ctensor.grad)
-                bconsumer.set_output(idx, igrad)
+                bconsumer.replace_output(ctensor.grad, igrad)
 
         for devid in devtensors:
             indmaps = [t.indmap for t in devtensors[devid]]
@@ -621,14 +619,13 @@ class IRAdapterGener:
             if node is None:
                 for ptensor, producer in zip(devtensors[devid], devops[devid]):
                     otensor = new_ftensor.select(ptensor.indmap, ptensor.valmap)
-                    ograd = new_ftensor.grad.select(otensor.grad.indmap, otensor.grad.valmap)
+                    ograd = new_ftensor.grad.select(ptensor.grad.indmap, ptensor.grad.valmap)
                     with graph.update(producer):
-                        idx = producer.outputs().index(ptensor)
-                        producer.set_input(idx, otensor)
-                        producer.input(idx).grad = ograd
+                        producer.replace_output(ptensor, otensor)
+                        for t in producer.find(otensor):
+                            t.grad = ograd
                     with graph.mirror.update(producer.mirror) as bproducer:
-                        idx = bproducer.inputs().index(otensor.grad)
-                        bproducer.set_input(idx, ograd)
+                        bproducer.replace_input(ptensor.grad, ograd)
             else:
                 node.device = devid
                 node.recompute = rcid
@@ -712,14 +709,12 @@ class IRAdapterGener:
                 # set corresponding consumer input and its backward
                 consumer = devops[devid][idx]
                 with graph.update(consumer):
-                    while ctensor in consumer.inputs():
-                        fidx = consumer.inputs().index(ctensor)
-                        consumer.set_input(fidx, otensor)
-                        consumer.input(fidx).grad = new_ftensor.grad.select(ctensor.indmap, (0,1))
+                    consumer.replace_input(ctensor, otensor)
+                    for t in consumer.find(otensor):
+                        t.grad = new_ftensor.grad.select(ctensor.indmap, (0,1))
                 with graph.mirror.update(consumer.mirror) as bconsumer:
-                    while ctensor.grad in bconsumer.outputs():
-                        bidx = bconsumer.outputs().index(ctensor.grad)
-                        bconsumer.set_output(bidx, new_ftensor.grad.select(ctensor.indmap, (0,1)))
+                    bconsumer.replace_output(
+                        ctensor.grad, new_ftensor.grad.select(ctensor.indmap, (0,1)))
             # insert multiref
             multiref.device = devid
             min_fidx = min(graph.index(consumer) for consumer in devops[devid])

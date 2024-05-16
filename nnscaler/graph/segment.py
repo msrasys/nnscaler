@@ -359,17 +359,17 @@ class IRSegment(IRCell):
         for ptensor, producer in zip(self.ptensors(ftensor), self.producers(ftensor)):
             # filter out non-autograd operators of IRPyFunc
             if isinstance(producer, IRPyFunc): continue
-            idx = producer.outputs().index(ptensor)
             grad = None if fgrad is None else fgrad.select(ptensor.indmap, (0, 1))
-            producer.output(idx).grad = grad
+            for t in producer.find(ptensor):
+                t.grad = grad
         
         # set for consumers
         consumers, ctensors = [], []  # consumers that require gradient
         for ctensor, consumer in zip(self.ctensors(ftensor), self.consumers(ftensor)):
+            itensors = consumer.find(ctensor)
             # set by default None
-            for t in consumer.inputs():  # consider an op can have multiple same-tensor inputs
-                if isinstance(t, IRSubTensor) and t == ctensor:
-                    t.grad = None
+            for itensor in itensors:
+                itensor.grad = None
             # filter out non-autograd operators
             if fgrad is None: continue
             if isinstance(consumer, IRPyFunc): continue
@@ -383,9 +383,8 @@ class IRSegment(IRCell):
             valmap = curr_valmap.map((0, 2)) if cidx != nconsumers - 1 else curr_valmap
             grad = fgrad.select(ctensor.indmap, valmap)
             curr_valmap = curr_valmap.map((1, 2)) if cidx != nconsumers - 1 else curr_valmap
-            for t in consumer.inputs():
-                if isinstance(t, IRSubTensor) and t == ctensor:
-                    t.grad = grad
+            for t in consumer.find(ctensor):
+                t.grad = grad
 
     def debug_tensor_map_str(self, ftensor: Optional[IRFullTensor] = None) -> str:
         dscp : str = ''
@@ -412,8 +411,8 @@ class IRSegment(IRCell):
         @return bwop IRBpOperation: the created backward operation
         """
         assert isinstance(fwop, IRFwOperation), "Expected IRFwOperation"
-        fins = [t for t in fwop.inputs() if isinstance(t, IRSubTensor)]
-        fous = [t for t in fwop.outputs() if isinstance(t, IRSubTensor)]
+        fins = [t for t in fwop.iobjs() if isinstance(t, IRSubTensor)]
+        fous = [t for t in fwop.oobjs() if isinstance(t, IRSubTensor)]
         igrads = [t.grad for t in fins if t.grad is not None]
         # note not all output tensors will be consumed by nodes, e.g., chunk.
         # for these cases, the backward op doesn't have exactly the same number of
@@ -466,22 +465,22 @@ class IRSegment(IRCell):
         self._consumers, self._ctensors = dict(), dict()
 
         # set input and output
-        for obj in IRSegment.get_objects_from_complex(self.inputs()):
+        for obj in self.iobjs():
             self._add_ftensor(obj.parent)
-        for obj in IRSegment.get_objects_from_complex(self.outputs()):
+        for obj in self.oobjs():
             self._add_ftensor(obj.parent)
 
         # set producer and consumer
+        # NOTE: we use `dict.fromkeys` to remove duplicate tensors
+        # as well as keep the order of tensors
         for node in self._nodes:
             if isinstance(node, IRAdapter): continue
-            itensors = set(t for t in node.inputs() if isinstance(t, IRObject))
-            for itensor in itensors:
+            for itensor in dict.fromkeys(node.iobjs()):
                 ftensor = itensor.parent
                 self._add_ftensor(ftensor)
                 self._consumers[ftensor].append(node)
                 self._ctensors[ftensor].append(itensor)
-            otensors = set(t for t in node.outputs() if isinstance(t, IRObject))
-            for otensor in otensors:
+            for otensor in dict.fromkeys(node.oobjs()):
                 ftensor = otensor.parent
                 self._add_ftensor(ftensor)
                 self._producers[ftensor].append(node)
@@ -493,11 +492,9 @@ class IRSegment(IRCell):
         """
         Insert a node at index.
 
-        TODO: dataflow dependency update
-        TODO: input / output check
-
-        @param node IRCell: the inserted node
-        @param index int: the index
+        Args:
+            node (IRCell): the inserted node
+            index (int or CellPosition): the index
 
         """
         pos = CellPosition((index,)) if isinstance(index, int) else index
@@ -507,18 +504,18 @@ class IRSegment(IRCell):
             index = pos[0]
             # insert node
             self._nodes.insert(index, node)
-            # update producer and consumer
             if isinstance(node, IRAdapter): return
-            # consumer
-            itensors = set(t for t in node.inputs() if isinstance(t, IRObject))
-            for itensor in itensors:
+            # update producer and consumer
+            # NOTE: we use `dict.fromkeys` to remove duplicate tensors
+            # as well as keep the order of tensors
+            # - consumer
+            for itensor in dict.fromkeys(node.iobjs()):
                 ftensor = itensor.parent
                 self._add_ftensor(ftensor)
                 self._consumers[ftensor].append(node)
                 self._ctensors[ftensor].append(itensor)
-            # producer
-            otensors = set(t for t in node.outputs() if isinstance(t, IRObject))
-            for otensor in otensors:
+            # - producer
+            for otensor in dict.fromkeys(node.oobjs()):
                 ftensor = otensor.parent
                 self._add_ftensor(ftensor)
                 self._producers[ftensor].append(node)
@@ -533,12 +530,12 @@ class IRSegment(IRCell):
         """
         Remove a node at index
 
-        # TODO: check input and output
-
-        @param node IRCell: the removed node
-        @param _pos Optional[Union[int, CellPosition]: help to save cost if provide node position.
+        Args:
+            node (IRCell): the removed node
+            _pos (Optional[Union[int, CellPosition]): help to save cost if provide node position.
         
-        @return index CellPosition: the removed index
+        Returns:
+            CellPosition: the removed index
         """
         pos = self.index(node) if _pos is None else _pos
         assert self.node(pos) == node, \
@@ -551,8 +548,7 @@ class IRSegment(IRCell):
             # update producer and consumer
             if isinstance(node, IRAdapter): return pos
             # consumer
-            itensors = set(t for t in node.inputs() if isinstance(t, IRObject))
-            for itensor in itensors:
+            for itensor in dict.fromkeys(node.iobjs()):
                 ftensor = itensor.parent
                 idx = self._consumers[ftensor].index(node)
                 self._consumers[ftensor].pop(idx)
@@ -560,8 +556,7 @@ class IRSegment(IRCell):
                 if len(self._consumers[ftensor]) == 0 and len(self._producers[ftensor]) == 0:
                     self._remove_ftensor(ftensor)
             # producer
-            otensors = set(t for t in node.outputs() if isinstance(t, IRObject))
-            for otensor in otensors:
+            for otensor in dict.fromkeys(node.oobjs()):
                 ftensor = otensor.parent
                 idx = self._producers[ftensor].index(node)
                 self._producers[ftensor].pop(idx)
@@ -1098,55 +1093,3 @@ class IRSegment(IRCell):
         dscp += f"\nOutputs: {self.outputs()}\n{'=' * len(self.name)}\n"
         return dscp
 
-    @staticmethod
-    def get_objects_from_complex(val: Any, _objects: List[IRObject] = None) -> List[IRObject]:
-        """Get all IRObjects from a complex data structure
-
-        Supported complex of types: List, Tuple, Dict, IRTensor, IRObject
-        
-        Args:
-            val (Any): the complex data structure to be modified
-            _objects (List[IRObject] | None):
-                if provided, the objects will be appened into this
-
-        @return _objects List[IRObject]: all IRObject
-        """
-        _objects = [] if _objects is None else _objects
-        if isinstance(val, (tuple, list)):
-            for item in val:
-                IRSegment.get_objects_from_complex(item, _objects)
-        if isinstance(val, dict):
-            for key, value in val.items():
-                IRSegment.get_objects_from_complex(key, _objects)
-                IRSegment.get_objects_from_complex(value, _objects)
-        if isinstance(val, slice):
-            IRSegment.get_objects_from_complex([val.start, val.stop, val.step], _objects)
-        if isinstance(val, IRObject):
-            _objects.append(val)
-        return _objects
-
-    @staticmethod
-    def modify_objects_of_complex(val: Any, modifier: Callable) -> Any:
-        """Return a complex data structure with modified IRObjects
-
-        Supported complex of types: List, Tuple, Dict, IRTensor, IRObject
-
-        Args:
-            val (Any): the complex data structure to be modified
-            modifier (Callable): a modifier that takes an IRObject and return a new one.
-
-        Return:
-            new_val (Any): complex data structure with modified IRObjects
-        """
-        rcall = IRSegment.modify_objects_of_complex
-        if isinstance(val, tuple):
-            return tuple(rcall(item, modifier) for item in val)
-        if isinstance(val, list):
-            return list(rcall(item, modifier) for item in val)
-        if isinstance(val, dict):
-            return {rcall(key, modifier):rcall(value, modifier) for key, value in val.items()}
-        if isinstance(val, slice):
-            return slice(rcall(val.start, modifier), rcall(val.stop, modifier), rcall(val.step, modifier))
-        if isinstance(val, IRObject):
-            return modifier(val)
-        return val

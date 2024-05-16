@@ -87,25 +87,20 @@ class IRGraph(IRSegment):
             else:
                 raise RuntimeError('len(args) < len(itensors)')
 
+        # replace the graph input tensors with provided input tensors
+        # this is to connect outside-model operators like dataloader.
         for idx, (iobj, arg) in enumerate(zip(iobjs, args)):
             # reset input
             self.set_input(idx, arg)
-            # replace node inputs
+            # replace node inputs, kwargs and outputs
             for producer in self.producers(iobj.parent):
                 with self.update(producer):
-                    while iobj in producer.outputs():
-                        oidx = producer.outputs().index(iobj)
-                        producer.set_output(oidx, arg)
+                    producer.replace_output(iobj, arg)
             for consumer in self.consumers(iobj.parent):
                 with self.update(consumer):
-                    while iobj in consumer.inputs():
-                        iidx = consumer.inputs().index(iobj)
-                        consumer.set_input(iidx, arg)
+                    consumer.replace_input(iobj, arg)
             # reset output
-            for oidx, output in enumerate(self.outputs()):
-                output = IRGraph.modify_objects_of_complex(
-                    self.output(oidx), lambda t: t if t != iobj else arg)
-                self.set_output(oidx, output)
+            self.replace_output(iobj, arg)
 
         from nnscaler.program import Program
         Program().add_nodes(self.nodes())
@@ -178,19 +173,17 @@ class IRGraph(IRSegment):
         """
         modifier = lambda t: t.tosub() if isinstance(t, IRFullTensor) else t
         # input / output
-        inputs = [IRGraph.modify_objects_of_complex(t, modifier) for t in inputs]
-        outputs = [IRGraph.modify_objects_of_complex(t, modifier) for t in outputs]
+        inputs = [IRCell.modify_objects_of_complex(t, modifier) for t in inputs]
+        outputs = [IRCell.modify_objects_of_complex(t, modifier) for t in outputs]
         # nodes
         for node in nodes:
             for idx, ftensor in enumerate(node.inputs()):
-                if isinstance(ftensor, IRObject):
-                    subtensor = ftensor.tosub() if isinstance(ftensor, IRFullTensor) else ftensor
-                    node.set_input(idx, subtensor)
+                subtensor = IRCell.modify_objects_of_complex(ftensor, modifier)
+                node.set_input(idx, subtensor)
             for idx, ftensor in enumerate(node.outputs()):
-                if isinstance(ftensor, IRObject):
-                    subtensor = ftensor.tosub() if isinstance(ftensor, IRFullTensor) else ftensor
-                    node.set_output(idx, subtensor)
-            node.kwargs.update(IRSegment.modify_objects_of_complex(node.kwargs, modifier))
+                subtensor = IRCell.modify_objects_of_complex(ftensor, modifier)
+                node.set_output(idx, subtensor)
+            node.kwargs.update(IRCell.modify_objects_of_complex(node.kwargs, modifier))
         graph = IRGraph(nodes, inputs, outputs, module_name)
 
         # check IRPyFunc
