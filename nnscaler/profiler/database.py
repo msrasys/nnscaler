@@ -11,9 +11,10 @@ import json
 import math
 import logging
 from dataclasses import dataclass, asdict
+from pathlib import Path
 
 import _operator # required by eval()
-import nnscaler      # required by eval()
+import nnscaler  # required by eval()
 from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.ir.cten import IRTensor, IRObject
 from nnscaler.ir.operator import IRFwOperation
@@ -29,6 +30,9 @@ NameOrFunc = Union[str, Callable]
 
 _train_module_ref: torch.nn.Module = torch.nn.Module().train()
 _eval_module_ref: torch.nn.Module = torch.nn.Module().eval()
+
+# when profiling fails, we use the long default value as a penalty
+_FAIL_FW_SPAN = 1000 * 1000  # 1000 seconds
 
 
 @dataclass
@@ -54,158 +58,209 @@ class ProfiledMetrics:
     # the index of the tensor saved for backward in `node.inputs()` list
     train_mem2in_idx: Tuple[int]
 
-
-class CompProfiler:
-
-    @staticmethod
-    def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
-                requires_grads: Tuple[bool], values: Tuple[Any],
-                warmup_sec: float = 2, prof_times: int = 20, max_prof_sec: float = 20,
-                **kwargs) -> Tuple[float, float, int, Tuple[int]]:
-        """
-        Profile a function
-
-        Args:
-            node IRFwOperation: the node in IRGraph
-            func Callable: the callable function, e.g., torch.nn.functional.linear
-            shapes Tuple[Tuple[int]]: the shapes of each input tensor
-            dtypes Optional[Tuple[torch.dtype]]: the dtype of each input tensor. Default will use torch.float32
-            requires_grads Tuple[bool]: whether the input tensor requires gradient
-            values Tuple[Any]: the values of the inputs that are not IRTensor
-            warmup_sec float: warmup seconds
-            prof_times int: number of execution for profiling an operator
-            max_prof_sec float: max seconds for profiling an operator's forward or backward
-            kwargs Dict: other keyword argument for func call.
-
-        Returns:
-            fw_span float: the time in milliseconds for forward time
-            bw_span float: the time in milliseconds for backward time
-            infer_mem int: the peak memory in bytes after inference of the function
-            train_mem_info Tuple[int]: byte sizes of activation tensors saved for backward
-        """
-        assert len(shapes) == len(dtypes), \
-            f"func {func.__name__}: expected each shape has a corresponding dtype, but got {shapes} and {dtypes}"
-        # create data
-        assert dtypes is not None
-        def gen_torch_tensors(shape, dtype, requires_grad):
-            """Generate dummy input tenosrs"""
-            constructor = torch.zeros if dtype in (torch.int64, torch.int32, torch.bool) else torch.rand
-            return constructor(tuple(shape), dtype=dtype, device=torch.cuda.current_device(), requires_grad=requires_grad)
-
-        tensors = tuple(
-            gen_torch_tensors(shape, dtype, requires_grad) if isinstance(value, IRTensor) else value \
-                for shape, dtype, requires_grad, value in zip(shapes, dtypes, requires_grads, values)
-        )
-        require_backward = any([t.requires_grad for t in tensors if hasattr(t, 'requires_grad')])
-        # FIXME: reconsidering requires_grad
-        if func.__name__ in ('type_as'):
-            require_backward = False
-        # repalce kwargs starting with 'self.xxx'
-        train_kwargs, eval_kwargs = {}, {}
-        for name, value in kwargs.items():
-            if isinstance(value, str) and value.startswith('self.'):
-                train_val = getattr(_train_module_ref, value[5:])
-                eval_val = getattr(_eval_module_ref, value[5:])
+    def __repr__(self) -> str:
+        contents = dict()
+        for key, value in self.__dict__.items():
+            if key in ('in_mem_info', 'param_mem_info', 'buffer_mem_info', 'train_mem_info'):
+                contents[key] = [f'{v / 1024 / 1024:.2f} MB' for v in value]
+            elif key == 'infer_memory':
+                contents[key] = f'{value / 1024 / 1024:.2f} MB'
+            elif key in ('fw_span', 'bw_span'):
+                contents[key] = f'{value:.2f} ms'
             else:
-                train_val = eval_val = value
-            train_kwargs[name] = train_val
-            eval_kwargs[name] = eval_val
+                contents[key] = value
+        return str(contents)
 
-        # run one sample
-        outputs = func(*tensors, **train_kwargs)
-        # only profile IRDimops currently, which has at least one tensor output and
-        # may have non-tensor outputs (like list, tuple, dict, etc.). In addition,
-        # we assume that non-tensor outputs will not be used in backward.
+
+def get_func(node: IRFwOperation) -> Tuple[Callable, Shapes, DTypes, Dict]:
+    """
+    Get function call and its arguments from a cude IRGraph node
+    """
+    assert isinstance(node, IRFwOperation), f"Only support profiling forward operation but got {type(node)}"
+
+    if node.signature in CustomizedOps.kOpRuntime:
+        fn = CustomizedOps.kOpRuntime[node.signature]
+    else:
+        fn = eval(node.signature)
+    shapes, dtypes, requires_grads, values = [], [], [], []
+
+    # TODO: this function should rewrite with pytree
+    def extract_val(val: Union[IRObject, Any]) -> Any:
+        if isinstance(val, IRObject):
+            return extract_val(val.value)
+        elif isinstance(val, tuple):
+            return tuple([extract_val(v) for v in val])
+        elif isinstance(val, list):
+            return list([extract_val(v) for v in val])
+        elif isinstance(val, dict):
+            return {k: extract_val(v) for k, v in val.items()}
+        elif isinstance(val, slice):
+            return slice(extract_val(val.start), extract_val(val.stop), extract_val(val.step))
+        else:
+            return val
+
+    for t in node.inputs():
+        if isinstance(t, IRTensor):
+            shapes.append(t.shape)
+            dtypes.append(t.dtype)
+            requires_grads.append(t.requires_grad)
+            values.append(t)
+        else:
+            shapes.append(None)
+            dtypes.append(None)
+            requires_grads.append(None)
+            values.append(extract_val(t))
+    return fn, shapes, dtypes, requires_grads, values, extract_val(node.kwargs)
+
+
+def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
+            requires_grads: Tuple[bool], values: Tuple[Any],
+            warmup_sec: float = 2, prof_times: int = 20, max_prof_sec: float = 20,
+            **kwargs) -> Tuple[float, float, int, Tuple[int]]:
+    """
+    Profile a function
+
+    Args:
+        node IRFwOperation: the node in IRGraph
+        func Callable: the callable function, e.g., torch.nn.functional.linear
+        shapes Tuple[Tuple[int]]: the shapes of each input tensor
+        dtypes Optional[Tuple[torch.dtype]]: the dtype of each input tensor. Default will use torch.float32
+        requires_grads Tuple[bool]: whether the input tensor requires gradient
+        values Tuple[Any]: the values of the inputs that are not IRTensor
+        warmup_sec float: warmup seconds
+        prof_times int: number of execution for profiling an operator
+        max_prof_sec float: max seconds for profiling an operator's forward or backward
+        kwargs Dict: other keyword argument for func call.
+
+    Returns:
+        fw_span float: the time in milliseconds for forward time
+        bw_span float: the time in milliseconds for backward time
+        infer_mem int: the peak memory in bytes after inference of the function
+        train_mem_info Tuple[int]: byte sizes of activation tensors saved for backward
+    """
+    assert len(shapes) == len(dtypes), \
+        f"func {func.__name__}: expected each shape has a corresponding dtype, but got {shapes} and {dtypes}"
+    # create data
+    assert dtypes is not None
+    def gen_torch_tensors(shape, dtype, requires_grad):
+        """Generate dummy input tenosrs"""
+        constructor = torch.zeros if dtype in (torch.int64, torch.int32, torch.bool) else torch.rand
+        return constructor(tuple(shape), dtype=dtype, device=torch.cuda.current_device(), requires_grad=requires_grad)
+
+    tensors = tuple(
+        gen_torch_tensors(shape, dtype, requires_grad) if isinstance(value, IRTensor) else value \
+            for shape, dtype, requires_grad, value in zip(shapes, dtypes, requires_grads, values)
+    )
+    require_backward = any([t.requires_grad for t in tensors if hasattr(t, 'requires_grad')])
+    # FIXME: reconsidering requires_grad
+    if func.__name__ in ('type_as'):
+        require_backward = False
+    # repalce kwargs starting with 'self.xxx'
+    train_kwargs, eval_kwargs = {}, {}
+    for name, value in kwargs.items():
+        if isinstance(value, str) and value.startswith('self.'):
+            train_val = getattr(_train_module_ref, value[5:])
+            eval_val = getattr(_eval_module_ref, value[5:])
+        else:
+            train_val = eval_val = value
+        train_kwargs[name] = train_val
+        eval_kwargs[name] = eval_val
+
+    # run one sample
+    outputs = func(*tensors, **train_kwargs)
+    # only profile IRDimops currently, which has at least one tensor output and
+    # may have non-tensor outputs (like list, tuple, dict, etc.). In addition,
+    # we assume that non-tensor outputs will not be used in backward.
+    outputs = (outputs,) if torch.is_tensor(outputs) else outputs
+    outputs = tuple(filter(lambda x: torch.is_tensor(x) and x.requires_grad, outputs))
+    assert all(torch.is_tensor(otensor) for otensor in outputs), \
+        f"{func.__name__}: require all the outputs to be tensors"
+    grads = tuple(torch.zeros_like(otensor) for otensor in outputs)
+
+    def run_step(func, tensors, kwargs, backward: bool):
+        outputs = func(*tensors, **kwargs)
         outputs = (outputs,) if torch.is_tensor(outputs) else outputs
         outputs = tuple(filter(lambda x: torch.is_tensor(x) and x.requires_grad, outputs))
-        assert all(torch.is_tensor(otensor) for otensor in outputs), \
-            f"{func.__name__}: require all the outputs to be tensors"
-        grads = tuple(torch.zeros_like(otensor) for otensor in outputs)
+        if backward:
+            torch.autograd.backward(outputs, grads)
+        return outputs
 
-        def run_step(func, tensors, kwargs, backward: bool):
-            outputs = func(*tensors, **kwargs)
-            outputs = (outputs,) if torch.is_tensor(outputs) else outputs
-            outputs = tuple(filter(lambda x: torch.is_tensor(x) and x.requires_grad, outputs))
-            if backward:
-                torch.autograd.backward(outputs, grads)
-            return outputs
+    # profile inference peak memory
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    mtic = torch.cuda.max_memory_allocated()  # in bytes
+    with torch.no_grad():
+        run_step(func, tensors, eval_kwargs, backward=False)
+    mtoc = torch.cuda.max_memory_allocated()  # in bytes
+    infer_memory = mtoc - mtic
 
-        # profile inference peak memory
+    train_mem_info = []
+    train_mem2in_idx = []
+    used_tensor = set()
+    # ref torch/utils/checkpoint.py/_checkpoint_without_reentrant
+    def pack_hook(x):
+        nonlocal train_mem_info, used_tensor
+        if x.untyped_storage().data_ptr() not in used_tensor:
+            used_tensor.add(x.untyped_storage().data_ptr())
+            byte_size = x.element_size()
+            for dim in list(x.size()):
+                byte_size = byte_size * dim
+            idx = -1
+            is_attr = False
+            for i, t in enumerate(tensors):
+                if not isinstance(t, torch.Tensor):
+                    continue
+                if t.untyped_storage().data_ptr() == x.untyped_storage().data_ptr():
+                    if node.inputs()[i].is_attr():
+                        is_attr = True
+                    idx = i
+                    break
+            if not is_attr:
+                train_mem_info.append(byte_size)
+                train_mem2in_idx.append(idx)
+        return x
+
+    def unpack_hook(x):
+        return x
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
+        outs = run_step(func, tensors, train_kwargs, backward=require_backward)
+
+    # warmup
+    warmup_cnt = 0
+    tic = time.perf_counter()
+    while time.perf_counter() - tic < warmup_sec:
+        run_step(func, tensors, train_kwargs, backward=require_backward)
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        mtic = torch.cuda.max_memory_allocated()  # in bytes
+        warmup_cnt += 1
+    toc = time.perf_counter()
+    func_duration = (toc - tic) / warmup_cnt
+    real_prof_times = max(1, min(prof_times, math.ceil(max_prof_sec / func_duration)))
+
+    # profile forward only
+    torch.cuda.synchronize()
+    tic = time.perf_counter()
+    for _ in range(real_prof_times):
         with torch.no_grad():
             run_step(func, tensors, eval_kwargs, backward=False)
-        mtoc = torch.cuda.max_memory_allocated()  # in bytes
-        infer_memory = mtoc - mtic
+    torch.cuda.synchronize()
+    toc = time.perf_counter()
+    fw_span = (toc - tic) / real_prof_times * 1000 # in milliseconds
 
-        train_mem_info = []
-        train_mem2in_idx = []
-        used_tensor = set()
-        # ref torch/utils/checkpoint.py/_checkpoint_without_reentrant
-        def pack_hook(x):
-            nonlocal train_mem_info, used_tensor
-            if x.untyped_storage().data_ptr() not in used_tensor:
-                used_tensor.add(x.untyped_storage().data_ptr())
-                byte_size = x.element_size()
-                for dim in list(x.size()):
-                    byte_size = byte_size * dim
-                idx = -1
-                is_attr = False
-                for i, t in enumerate(tensors):
-                    if not isinstance(t, torch.Tensor):
-                        continue
-                    if t.untyped_storage().data_ptr() == x.untyped_storage().data_ptr():
-                        if node.inputs()[i].is_attr():
-                            is_attr = True
-                        idx = i
-                        break
-                if not is_attr:
-                    train_mem_info.append(byte_size)
-                    train_mem2in_idx.append(idx)
-            return x
+    # profile forward + backward
+    torch.cuda.synchronize()
+    tic = time.perf_counter()
+    for _ in range(real_prof_times):
+        run_step(func, tensors, train_kwargs, backward=require_backward)
+    torch.cuda.synchronize()
+    toc = time.perf_counter()
+    fwbw_span = (toc - tic) / real_prof_times * 1000 # in milliseconds
+    bw_span = max(fwbw_span - fw_span, 0.0)
 
-        def unpack_hook(x):
-            return x
-
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
-            outs = run_step(func, tensors, train_kwargs, backward=require_backward)
-
-        # warmup
-        warmup_cnt = 0
-        tic = time.perf_counter()
-        while time.perf_counter() - tic < warmup_sec:
-            run_step(func, tensors, train_kwargs, backward=require_backward)
-            torch.cuda.synchronize()
-            warmup_cnt += 1
-        toc = time.perf_counter()
-        func_duration = (toc - tic) / warmup_cnt
-        real_prof_times = max(1, min(prof_times, math.ceil(max_prof_sec / func_duration)))
-
-        # profile forward only
-        torch.cuda.synchronize()
-        tic = time.perf_counter()
-        for _ in range(real_prof_times):
-            with torch.no_grad():
-                run_step(func, tensors, eval_kwargs, backward=False)
-        torch.cuda.synchronize()
-        toc = time.perf_counter()
-        fw_span = (toc - tic) / real_prof_times * 1000 # in milliseconds
-
-        # profile forward + backward
-        torch.cuda.synchronize()
-        tic = time.perf_counter()
-        for _ in range(real_prof_times):
-            run_step(func, tensors, train_kwargs, backward=require_backward)
-        torch.cuda.synchronize()
-        toc = time.perf_counter()
-        fwbw_span = (toc - tic) / real_prof_times * 1000 # in milliseconds
-        bw_span = max(fwbw_span - fw_span, 0.0)
-
-        return fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx
+    return fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx
 
 
 class ProfileDataBase:
@@ -219,68 +274,22 @@ class ProfileDataBase:
         if filename is not None:
             self.load(filename)
 
-    @staticmethod
-    def get_func(node: IRFwOperation) -> Tuple[Callable, Shapes, DTypes, Dict]:
+    def profile(self, node: IRFwOperation, override: bool = False) -> ProfiledMetrics:
         """
-        Get function call and its arguments from a cude IRGraph node
-        """
-        assert isinstance(node, IRFwOperation), f"Only support profiling forward operation but got {type(node)}"
-
-        if node.signature in CustomizedOps.kOpRuntime:
-            fn = CustomizedOps.kOpRuntime[node.signature]
-        else:
-            fn = eval(node.signature)
-        shapes, dtypes, requires_grads, values = [], [], [], []
-
-        # TODO: this function should rewrite with pytree
-        def extract_val(val: Union[IRObject, Any]) -> Any:
-            if isinstance(val, IRObject):
-                return extract_val(val.value)
-            elif isinstance(val, tuple):
-                return tuple([extract_val(v) for v in val])
-            elif isinstance(val, list):
-                return list([extract_val(v) for v in val])
-            elif isinstance(val, dict):
-                return {k: extract_val(v) for k, v in val.items()}
-            elif isinstance(val, slice):
-                return slice(extract_val(val.start), extract_val(val.stop), extract_val(val.step))
-            else:
-                return val
-
-        for t in node.inputs():
-            if isinstance(t, IRTensor):
-                shapes.append(t.shape)
-                dtypes.append(t.dtype)
-                requires_grads.append(t.requires_grad)
-                values.append(t)
-            else:
-                shapes.append(None)
-                dtypes.append(None)
-                requires_grads.append(None)
-                values.append(extract_val(t))
-        return fn, shapes, dtypes, requires_grads, values, extract_val(node.kwargs)
-
-    def profile(self, node: IRFwOperation, device: Optional[int] = None, override: bool = False) -> ProfiledMetrics:
-        """
-        Profile a forward node in IRGraph on a specific device (default current device)
+        Profile a forward node in IRGraph
 
         Args:
             node IRFwOperation: node of IRGraph
-            device int: the device that the node will execute on
             override bool: True if the existed can be overrided else False
 
         Returns:
             profiled_metrics ProfiledMetrics: the profiling data
         """
-        fn, shapes, dtypes, requires_grads, values, kwargs = ProfileDataBase.get_func(node)
-
         if not override and self.exist(node):
             return self.query(node)
 
-        if isinstance(device, int):
-            orig_device = torch.cuda.current_device()
-            torch.cuda.set_device(device)
-
+        fn, shapes, dtypes, requires_grads, values, kwargs = get_func(node)
+        
         in_mem_info, param_mem_info, buffer_mem_info = [], [], []
         for t in node.inputs():
             if isinstance(t, IRTensor) and t.is_param():
@@ -290,15 +299,15 @@ class ProfileDataBase:
             elif hasattr(t, 'byte_size'):
                 in_mem_info.append(t.byte_size())
             else:
-                _logger.warning(f'node {node}: skip input {t}')
+                _logger.debug(f'node {node}: skip input {t}')
 
         # run profiling
         try:
             fw_span, bw_span, infer_memory, train_mem_info, train_mem2in_idx = \
-                CompProfiler.profile(node, fn, shapes, dtypes, requires_grads, values, **kwargs)
+                profile(node, fn, shapes, dtypes, requires_grads, values, **kwargs)
         except Exception:
             _logger.exception(f'fail to profile {node}, use default values')
-            fw_span, bw_span = 0, 0
+            fw_span, bw_span = _FAIL_FW_SPAN, 2 * _FAIL_FW_SPAN
             infer_memory = 0
             for t in node.outputs():
                 if isinstance(t, IRTensor):
@@ -306,20 +315,9 @@ class ProfileDataBase:
             # by default, we assume that all the input tensors are saved for backward
             train_mem_info = copy.deepcopy(in_mem_info)
             train_mem2in_idx = list(range(len(in_mem_info)))
-        # log to database
-        key = self._serialize(node)
         profiled_metrics = ProfiledMetrics(in_mem_info, param_mem_info, buffer_mem_info,
                                            fw_span, bw_span, infer_memory,
                                            train_mem_info, train_mem2in_idx)
-        self.insert(node.signature, key, profiled_metrics)
-        _logger.info(
-            f"profiled {node.signature} | shapes: {shapes} | dtypes: {dtypes} | requires_grads: {requires_grads} | "
-            f"=> in mem info: {in_mem_info} | param mem info: {param_mem_info} | "
-            f"buffer mem info: {buffer_mem_info} | fw: {round(fw_span, 2)} ms | bw: {round(bw_span, 2)} ms | "
-            f"infer mem: {infer_memory} | train mem info: {train_mem_info} | idx: {train_mem2in_idx}")
-
-        if isinstance(device, int):
-            torch.cuda.set_device(orig_device)
         return profiled_metrics
 
     def insert(self, name: str, key: str, profiled_metrics: ProfiledMetrics):
@@ -345,9 +343,22 @@ class ProfileDataBase:
         @return exist bool: True if the performance is recorded, else False
         """
         key = self._serialize(node)
-        if node.signature not in self._data:
+        return self.exist_serialized(node.signature, key)
+
+    def exist_serialized(self, signature: str, key: str) -> bool:
+        """
+        Check if the node has the performance recorded in the database
+
+        Args:
+            signature str: the signature of the function
+            key str: the serialized key
+
+        Returns:
+            exist bool: True if the performance is recorded, else False
+        """
+        if signature not in self._data:
             return False
-        if key not in self._data[node.signature]:
+        if key not in self._data[signature]:
             return False
         return True
 
@@ -433,12 +444,22 @@ class ProfileDataBase:
         with open(file, 'w') as f:
             json.dump(self._data, f)
 
-    def dump_op(self, file: str, signature, override=False):
-        assert signature in self._data.keys(), f'{signature} has not been profiled'
-        file_n = os.path.join(file, signature +'.json')
-        with open(file_n, 'w') as f:
-            to_dump = {key: asdict(value) for key, value in self._data[signature].items()}
-            json.dump(to_dump, f, indent=2)
+    def dump_ops(self, folder: str, override=False):
+        """
+        dump the profiled data into json format, each operator is saved in a separate file with the signature as the file name
+
+        Args:
+            folder str: the folder name
+            override bool: True if the existed can be overrided else False
+        """
+        folder = Path(folder)
+        for signature in self._data:
+            fname = folder / (signature + '.json')
+            if fname.exists():
+                assert override, f"File {fname} exists. Set override = True to force dump."
+            with open(fname, 'w') as f:
+                to_dump = {key: asdict(value) for key, value in self._data[signature].items()}
+                json.dump(to_dump, f, indent=2)
 
     def load(self, file: str):
         """!
@@ -450,10 +471,16 @@ class ProfileDataBase:
         with open(file, 'r') as f:
             self._data = json.load(f)
 
-    def load_ops(self, file: str):
-        for filename in os.listdir(file):
+    def load_ops(self, folder: str):
+        """
+        load the profiled data from json files in a folder. Each operator is saved in a separate file with the signature as the file name
+
+        Args:
+            folder str: the folder name
+        """
+        for filename in os.listdir(folder):
             if filename.endswith('.json'):
-                with open(os.path.join(file, filename)) as f:
+                with open(os.path.join(folder, filename)) as f:
                     signature = filename[:-len('.json')]
                     loaded_json = json.load(f)
                     self._data[signature] = {key: ProfiledMetrics(**value) for key, value in loaded_json.items()}

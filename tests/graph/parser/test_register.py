@@ -1,6 +1,6 @@
 import nnscaler
 from nnscaler.graph.parser.converter import convert_model
-from nnscaler.profiler.database import ProfileDataBase
+from nnscaler.profiler.database import get_func
 import tempfile
 import torch
 
@@ -83,7 +83,7 @@ def test_common_register():
 
         # test profiler.database
         for node, p_name in zip(ir_graph.nodes(), ['linear', 'linear', 'mock_add']):
-            profile_name = ProfileDataBase.get_func(node)[0].__qualname__
+            profile_name = get_func(node)[0].__qualname__
             assert profile_name == p_name, f'{profile_name} should be {p_name}'
 
 
@@ -95,7 +95,7 @@ def test_common_register2():
 
         # test profiler.database
         for node, p_name in zip(ir_graph.nodes(), ['linear', 'linear', 'mock_add2']):
-            profile_name = ProfileDataBase.get_func(node)[0].__qualname__
+            profile_name = get_func(node)[0].__qualname__
             assert profile_name == p_name, f'{profile_name} should be {p_name}'
 
 
@@ -107,7 +107,7 @@ def test_autograd_register():
 
         # test profiler.database
         for node, p_name in zip(ir_graph.nodes(), ['linear', 'linear', 'Function.apply']):
-            profile_name = ProfileDataBase.get_func(node)[0].__qualname__
+            profile_name = get_func(node)[0].__qualname__
             assert profile_name == p_name, f'{profile_name} should be {p_name}'
 
 

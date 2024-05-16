@@ -7,7 +7,7 @@ import torch
 from nnscaler.parallel import _gen_graph
 from nnscaler.ir.tensor import IRTensor
 from nnscaler.ir.operator import IRFwOperation
-from nnscaler.profiler.database import CompProfiler, ProfileDataBase
+from nnscaler.profiler.database import get_func, profile, ProfileDataBase
 
 
 class NaiveFFN(torch.nn.Module):
@@ -29,9 +29,9 @@ def test_op_profile_times():
     with tempfile.TemporaryDirectory() as tempdir:
         graph, _ = _gen_graph(NaiveFFN(), {'x': torch.randn(2, 128, 1024)}, tempdir, False)
         fc1, relu, fc2 = graph.select(ntype=IRFwOperation)
-        fn, shapes, dtypes, requires_grads, values, kwargs = ProfileDataBase.get_func(fc1)
+        fn, shapes, dtypes, requires_grads, values, kwargs = get_func(fc1)
         tic = time.perf_counter()
-        CompProfiler.profile(fc1, fn, shapes, dtypes, requires_grads, values, **kwargs)
+        profile(fc1, fn, shapes, dtypes, requires_grads, values, **kwargs)
         toc = time.perf_counter()
         # this is always true because the op is very small.
         assert toc - tic < 20, f'op profile time is too long {toc - tic}'

@@ -653,7 +653,7 @@ class SPMDSolver:
         self.partition_info: List[List[PartitionCostDesc]] = list()
         for i in range(self.graph.op_num):
             cur_info = []
-            _logger.info(f'calc partition info for {self.get_operator(i)}')
+            _logger.debug(f'calc partition info for {self.get_operator(i)}')
             for j in range(self.get_op_partition_count(i)):
                 cost_desc = self.calc_partition_cost(i, j)
                 if cost_desc.comp_time == float('inf'):
@@ -662,7 +662,7 @@ class SPMDSolver:
                     )
                     cost_desc.comp_time = 0.0
                 cur_info.append(cost_desc)
-                _logger.info(f'{self._op_partitions[i][j]} {cost_desc}')
+                _logger.debug(f'{self._op_partitions[i][j]} {cost_desc}')
             self.partition_info.append(cur_info)
         _logger.info('finish spmd solver initializetion')
 

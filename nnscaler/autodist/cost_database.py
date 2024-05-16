@@ -5,6 +5,8 @@ import os
 from os import listdir
 from pathlib import Path
 import logging
+import multiprocessing
+import torch
 
 from nnscaler.graph import IRGraph
 from nnscaler.ir.cten import IRTensor
@@ -18,6 +20,9 @@ from nnscaler.graph.function.dimops import DimopSplit, IRDimops
 from .autodist_config import AutoDistConfig
 
 _logger = logging.getLogger(__name__)
+
+import nnscaler
+_DEFAULT_COMM_DATA_PATH = Path(nnscaler.__file__).parent.parent / 'data/profile/mi200/comm'
 
 
 def _piecewise_estimator(xs: List[float], ys: List[float], x: float) -> float:
@@ -51,8 +56,53 @@ def _piecewise_estimator(xs: List[float], ys: List[float], x: float) -> float:
                                                                 xs[i])
     raise RuntimeError(f'x={x}, xs={xs}, ys={ys}, should not reach here')
 
-import nnscaler
-_DEFAULT_COMM_DATA_PATH = Path(nnscaler.__file__).parent.parent / 'data/profile/mi200/comm'
+
+def _filter_and_group_nodes(graph: IRGraph, db: ProfileDataBase) -> List[List[IRFwOperation]]:
+    visited_nodes = set()
+    node_to_profile = list()
+    for node in graph.select(ntype=IRFwOperation):
+        if isinstance(node, (IRGraphAnchor, IRPyFunc)):
+            continue
+        hash_code = node.signature + ' : ' + db._serialize(node)
+        if hash_code in visited_nodes:
+            continue
+        node_to_profile.append(node)
+        visited_nodes.add(hash_code)
+
+    dev_num = torch.cuda.device_count()
+
+    # divide `node_to_profile` into `dev_num` groups
+    node_groups = [[] for _ in range(dev_num)]
+    for i, node in enumerate(node_to_profile):
+        node_groups[i % dev_num].append(node)
+    return node_groups
+
+
+def _profile_nodes(dilled_info: str, dev_id: int, partition_degree: int, re_profile: bool, comp_profile_path: str, result: multiprocessing.Queue):
+    import dill
+    torch.cuda.set_device(dev_id)
+
+    id_state, dilled_graph = dill.loads(dilled_info)
+    graph = IRGraph.from_dill(id_state, dilled_graph)
+    db = ProfileDataBase()
+    db.load_ops(comp_profile_path)
+    nodes = _filter_and_group_nodes(graph, db)[dev_id]
+
+    ret = list()
+    for node in nodes:
+        if isinstance(node, IRDimops):
+            partition_nodes = gen_partitions(node,
+                                             partition_degree,
+                                             base=partition_degree,
+                                             depth=1)
+        else:
+            partition_nodes = [node]
+        for partition_node in partition_nodes:
+            profiled_metrics: ProfiledMetrics = db.profile(partition_node, override=re_profile)
+            ret.append((partition_node.signature, db._serialize(partition_node), profiled_metrics))
+    _logger.info(f'device {dev_id} finished profiling {len(nodes)} nodes')
+    result.put(ret)
+
 
 class CostDatabase:
 
@@ -81,35 +131,32 @@ class CostDatabase:
         self.ignore_small_tensor_threshold = self.autodist_config.ignore_small_tensor_threshold
 
     def profile_comp(self, partition_degree: int):
-        visited_nodes = set()
-        for node in self.graph.select(ntype=IRFwOperation):
-            if isinstance(node, (IRGraphAnchor, IRPyFunc)):
-                continue
-            hash_code = node.signature + ' : ' + self.db._serialize(node)
-            if hash_code in visited_nodes:
-                continue
-            if hasattr(node, 'anno'):
-                partition_nodes = gen_partitions(node,
-                                                 partition_degree,
-                                                 base=partition_degree,
-                                                 depth=1)
-            else:
-                _logger.info(f'only profile replicated for {node}')
-                partition_nodes = [node]
-            for partition_node in partition_nodes:
-                # the returned schema may change over time, we re-profile
-                # if encountered an exception
-                try:
-                    profiled_metrics: ProfiledMetrics = self.db.profile(
-                        partition_node,
-                        override=self.autodist_config.re_profile)
-                except Exception:
-                    profiled_metrics: ProfiledMetrics = self.db.profile(
-                        partition_node, override=True)
-            self.db.dump_op(self.comp_profile_path,
-                            node.signature,
-                            override=True)
-            visited_nodes.add(hash_code)
+
+        # use spawn to make sure the profiling process is independent from each other
+        # and the main process, this is also required by torch
+        mp_context = multiprocessing.get_context('spawn')
+
+        results = mp_context.Queue()
+        processes = []
+        for i in range(torch.cuda.device_count()):
+            p = mp_context.Process(target=_profile_nodes,
+                                   args=(self.graph.dumps(), i, partition_degree, self.autodist_config.re_profile, self.comp_profile_path, results))
+            processes.append(p)
+            p.start()
+
+        # put queue.get() before join to avoid deadlock
+        for p in processes:
+            ret = results.get()
+            for sign, serialized, profiled_metrics in ret:
+                _logger.debug(f'profiled {sign} in {serialized} with {profiled_metrics}')
+                if not self.db.exist_serialized(sign, serialized):
+                    self.db.insert(sign, serialized, profiled_metrics)
+        results.close()
+
+        for p in processes:
+            p.join()
+
+        self.db.dump_ops(self.comp_profile_path, override=True)
 
     def exist(self, node: IRFwOperation) -> bool:
         return self.db.exist(node)

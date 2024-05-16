@@ -1042,11 +1042,9 @@ class IRGraph(IRSegment):
 
     # =================== Helpers ====================
 
-    def dump(self, filename: str) -> None:
+    def dumps(self) -> str:
         """
-        Dump the graph into pickled format
-
-        @param filename str
+        Dump the graph into binary by dill
         """
         # FIXME: dump doesn't support customized op
         class PicklingContextSave:
@@ -1056,9 +1054,17 @@ class IRGraph(IRSegment):
                 IRObject.__getstate__ = lambda self: self.__dict__.copy()
 
         with PicklingContextSave():
-            with open(filename, 'wb') as f:
-                save = (IDGenerator().get_states(), self)
-                dill.dump(save, f)
+            save = (IDGenerator().get_states(), self)
+            return dill.dumps(save)
+
+    def dump(self, filename: str) -> None:
+        """
+        Dump the graph into pickled format
+
+        @param filename str
+        """
+        with open(filename, 'wb') as f:
+            f.write(self.dumps())
 
     @staticmethod
     def from_dill(id_state, graph):
