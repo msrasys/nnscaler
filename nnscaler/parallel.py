@@ -313,14 +313,18 @@ def to_ir_input(sample, name):
         # generate backward communications in adapter. However, as long as
         # the data doesn't require gradient in real runtime, the backward
         # communication will not be triggered.
+        # PyTorch only supports floating point and complex tensors for autograd.
+        # To align with PyTorch, we set requires_grad to False for other types.
+        requires_grad = sample.is_floating_point() or sample.is_complex()
         tensor = IRFullTensor(
             shape=sample.size(),
             name=name,
-            requires_grad=True,
+            requires_grad=requires_grad,
             dtype=sample.dtype
         ).tosub()
         tensor._value = sample
-        tensor.grad = tensor.parent.grad.tosub()
+        if requires_grad:
+            tensor.grad = tensor.parent.grad.tosub()
         return tensor
     return IRObject(name, value=sample, is_constant=False)
 
