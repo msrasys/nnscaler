@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, Iterator, Optional, Set, Tuple, Type, Li
 from contextlib import contextmanager
 
 import torch
-from torch._C import ScriptObject
+from torch._C import ScriptObject, ScriptFunction
 from torch.nn.modules.container import Sequential, ModuleList, ModuleDict, ParameterList, ParameterDict
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
@@ -132,12 +132,12 @@ from .utils import (
     side_effectful_inplace_ops,
 )
 from .utils import (
-    FrameRecord,
     ExtraSEFPatcher,
     EmptyResult,
     extract_results_metadata,
     flatten_trees_with_func,
     flatten_trees_with_func_and_spec,
+    get_common_spec,
     map_trees_with_func,
     get_frame_record,
 )
@@ -162,8 +162,8 @@ class Location:
 class LeafFnWrapInfo:
     """
     extra_locs: The place the function is imported.
-    is_force_trace: If set to false, the function will only be traced if input relates to concrete_args.
-        Such as 'torch.rand', we should trace it even if it doesn't relate to concrete_args.
+    is_force_trace: If set to false, the function will only be traced if inputs include proxy.
+        Such as 'torch.rand', we should trace it even if it doesn't have proxy as input, so it should be force traced.
     replace_fn: If not `None`, we will use it to replace the original function in traced code.
         Such as ModuleList.__getitem__, we can use operator.getitem to replace it.
     """
@@ -1035,6 +1035,24 @@ class ConcreteTracer(TracerBase):
                 if func.__self__ not in self.agfunc_dict:
                     self.agfunc_dict[func.__self__] = _create_wrapped_leaf_func(self, func, func)
                 wrapped = self.agfunc_dict[func.__self__]
+            elif isinstance(func, ScriptFunction):
+                # if it is a script function,
+                # here will wrap the origin function location and forward the script function to the origin one.
+                # _torchdynamo_inline is introduced in pytorch 2.0, it is the original function of the script function.
+                inner_func = func._torchdynamo_inline
+                # some `func.__module__` may have additional `_` compare with its import path in user code,
+                # for example, `operator.add.__module__` is `_operator` and `_operator` is a built-in module and we don't want to touch it,
+                # we assume user won't import function from module named with prefix `_`,
+                # here we only wrap the function under no prefix `_` module, i.e. functions under `operator`.
+                if inner_func.__module__.startswith('_') and inner_func.__module__ != '__main__':
+                    path = sys.modules.get(inner_func.__module__[1:], sys.modules[inner_func.__module__])
+                else:
+                    path = sys.modules[inner_func.__module__]
+                locations = (*locations, Location(path, inner_func.__name__))
+                if wrap_info.is_force_trace:
+                    wrapped = _create_wrapped_leaf_func(self, func, inner_func, (self,))
+                else:
+                    wrapped = _create_wrapped_leaf_func(self, func, inner_func)
             else:
                 if func.__qualname__.startswith('_TensorBase'):
                     locations = (*locations, Location(torch.Tensor, func.__name__))
@@ -1057,7 +1075,7 @@ class ConcreteTracer(TracerBase):
                     #   <built-in method _make_wrapper_subclass of torch._C._TensorMeta>
                     if func.__module__ is not None:
                         if func.__module__.startswith('_') and func.__module__ != '__main__':
-                            path = sys.modules[func.__module__[1:]]
+                            path = sys.modules.get(func.__module__[1:], sys.modules[func.__module__])
                         else:
                             path = sys.modules[func.__module__]
                         path = getattr(path, func.__qualname__.split('.')[0])
@@ -1073,7 +1091,7 @@ class ConcreteTracer(TracerBase):
                     #   <built-in method _make_wrapper_subclass of torch._C._TensorMeta>
                     if func.__module__ is not None:
                         if func.__module__.startswith('_') and func.__module__ != '__main__':
-                            path = sys.modules[func.__module__[1:]]
+                            path = sys.modules.get(func.__module__[1:], sys.modules[func.__module__])
                         else:
                             path = sys.modules[func.__module__]
                         locations = (*locations, Location(path, func.__name__))
@@ -1099,7 +1117,7 @@ class ConcreteTracer(TracerBase):
         }
         for clz, wrap_info in self.autowrap_leaf_class.items():
             if clz.__module__.startswith('_') and clz.__module__ != '__main__':
-                path = sys.modules[clz.__module__[1:]]
+                path = sys.modules.get(func.__module__[1:], sys.modules[func.__module__])
             else:
                 path = sys.modules[clz.__module__]
             if wrap_info.is_iterable:
@@ -1384,7 +1402,11 @@ def update_tree_proxy_value(dst_pytree, src_pytree):
     copy the value from src_pytree to dst_pytree with the dst_pytree spec,
     if the leaf is proxy, only replace the proxy.value, not replace the proxy.
     """
-    _, spec = tree_flatten(dst_pytree)
+    # consider about this case:
+    #   dst_pytree: {'a': [1, 2, 3]}
+    #   src_pytree: {'a': [1, 2, 3, 4]}
+    # then the public spec is {'a': *}, we don't want to flatten the list here.
+    spec = get_common_spec(tree_flatten(dst_pytree)[1], tree_flatten(src_pytree)[1])
 
     def update_proxy_value(a, b):
         if isinstance(a, ep.ConcreteProxy):

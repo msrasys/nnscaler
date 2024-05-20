@@ -17,6 +17,11 @@ from torch.utils._pytree import tree_flatten, tree_unflatten, LeafSpec, TreeSpec
 
 from . import concrete_proxy as ep
 
+DICT_KEYS_TYPE = type({}.keys())
+DICT_VALUES_TYPE= type({}.values())
+DICT_ITEMS_TYPE= type({}.items())
+
+
 # These need to run in global scope to handle nested calls correctly
 _orig_module_call: Callable = torch.nn.Module.__call__
 _orig_module_getattr: Callable = torch.nn.Module.__getattr__
@@ -97,7 +102,24 @@ def _get_node_type(pytree: Any) -> Any:
 torch_pytree._get_node_type = _get_node_type
 
 
-def flatten_trees_with_func(fn, pytrees):
+def get_common_spec(dst_spec: TreeSpec, src_sepc: TreeSpec) -> TreeSpec:
+    """
+    Return the common part of two treespec.
+    For example:
+        dst_spec is {'a': [*,], 'b': [*, *]}
+        src_sepc is {'a': [*,], 'b': [*, *, *]}
+        common spec is {'a': [*,], 'b': *}
+    """
+    if isinstance(dst_spec, LeafSpec) or isinstance(src_sepc, LeafSpec):
+        return LeafSpec()
+    if dst_spec.type == src_sepc.type and dst_spec.context == src_sepc.context:
+        if len(dst_spec.children_specs) == len(src_sepc.children_specs):
+            children_specs = [get_common_spec(dst, src) for dst, src in zip(dst_spec.children_specs, src_sepc.children_specs)]
+            return TreeSpec(type=dst_spec.type, context=dst_spec.context, children_specs=children_specs)
+    return LeafSpec()
+
+
+def flatten_trees_with_func(fn, pytrees) -> Tuple[List[Any], TreeSpec]:
     """
     Each pytree in pytrees should have the same structure.
 
@@ -272,7 +294,15 @@ def extract_tensor_metadata(obj: Any):
 
 def extract_results_metadata(results: Any, node: Node):
     if results is not EmptyResult:
-        meta = map_aggregate(results, extract_tensor_metadata)
+        res = tuple(results) if isinstance(results, (DICT_KEYS_TYPE, DICT_VALUES_TYPE, DICT_ITEMS_TYPE)) else results
+        meta = map_aggregate(res, extract_tensor_metadata)
+        # we should get the meta info of the inner element of these type obj
+        if isinstance(results, DICT_KEYS_TYPE):
+            meta = {i: m for i, m in enumerate(meta)}.keys()
+        if isinstance(results, DICT_VALUES_TYPE):
+            meta = {i: m for i, m in enumerate(meta)}.values()
+        if isinstance(results, DICT_ITEMS_TYPE):
+            meta = {i: m for i, m in meta}.items()
         node.meta['tensor_meta'] = meta
         node.meta['type'] = type(results)
 

@@ -14,6 +14,7 @@ from nnscaler.graph.function.function import any_ir_object_satisfy
 
 import torch.fx
 from .concrete_trace_utils import TensorMetadata
+from .concrete_trace_utils.utils import DICT_KEYS_TYPE, DICT_VALUES_TYPE, DICT_ITEMS_TYPE
 
 _logger = logging.getLogger(__name__)
 
@@ -134,6 +135,10 @@ class FxModuleParser:
                 if not all(isinstance(key, str) for key in meta.keys()):
                     raise TypeError(f"only support dict type with str key, but got {meta.keys()}.\n{node}")
                 return {key : meta2var(value) for key, value in meta.items()}
+            if isinstance(meta, DICT_VALUES_TYPE):
+                return {key : meta2var(value) for key, value in enumerate(meta)}.values()
+            if isinstance(meta, DICT_ITEMS_TYPE):
+                return {key : meta2var(value) for key, value in meta}.items()
             # TODO: data type check, with cases like {'a': 1.2, 'b': torch.Tensor}
             return IRObject(name=node.name, value=meta, is_constant=is_constant)
 
@@ -169,6 +174,11 @@ class FxModuleParser:
             return list(FxModuleParser.parse_complex(t, frame) for t in val)
         if isinstance(val, dict):
             return {key: FxModuleParser.parse_complex(val, frame) for key, val in val.items()}
+        # because fx node cannot be a dict key, so skip DICT_KEYS_TYPE here
+        if isinstance(val, DICT_VALUES_TYPE):
+            return {i: FxModuleParser.parse_complex(x, frame) for i, x in enumerate(val)}.values()
+        if isinstance(val, DICT_ITEMS_TYPE):
+            return {i: FxModuleParser.parse_complex(x, frame) for i, x in val}.items()
         if isinstance(val, torch.fx.Node):
             return frame.get_var(val.name)
         return val
@@ -235,7 +245,9 @@ class FxModuleParser:
             elif not isinstance(ir_node.output(0), IRTensor) and ir_node.output(0).value is not None:
                 if dynamic_shape or \
                     any_ir_object_satisfy(ir_node.output(0), lambda a: not a.is_constant) or \
-                    any_ir_object_satisfy(ir_node.output(0), lambda a: isinstance(a, IRTensor)):
+                    any_ir_object_satisfy(ir_node.output(0), lambda a: isinstance(a, IRTensor)) or \
+                    any_ir_object_satisfy(ir_node.output(0), lambda a: isinstance(a, (DICT_KEYS_TYPE, DICT_VALUES_TYPE, DICT_ITEMS_TYPE))):
+                    # type of return values of dict.keys, dict.values and dict.items can not be repr, so we must take it as a node
                     frame.set_var(node.name, ir_node.output(0))
                     ir_node.output(0).name = node.name
                 else:
@@ -327,17 +339,27 @@ class FxModuleParser:
         """
         if not isinstance(node_target, str):
             raise ValueError(f'node_target must be a string, but got {type(node_target)} with value {node_target}')
-        for module, module_name in [(torch, 'torch'), (torch.Tensor, 'torch.Tensor')]:
-            lib_func = getattr(module, node_target, None)
-            if lib_func is not None and callable(lib_func):
-                return f'{module_name}.{node_target}'
+        # NOTE(nishang): seems that we don't need to guess the method sig?
+        # for module, module_name in [(torch, 'torch'), (torch.Tensor, 'torch.Tensor')]:
+        #     lib_func = getattr(module, node_target, None)
+        #     if lib_func is not None and callable(lib_func):
+        #         return f'{module_name}.{node_target}'
 
         assert len(node.args) > 0, 'Expect an object as the first argument of call_method'
         # example node.args[0].meta is {'type': <class 'dict'>}
         in_type = node.args[0].meta['type']
         assert node_target in in_type().__dir__(), f'node_target = {node_target}, in_type().__dir__() = {in_type().__dir__()}'
-        sig = f'{in_type.__name__}.{node_target}'
-        return sig
+        # TODO: for the history issue (please see the comment out lines after NOTE),
+        # we should forward the torch.Tensor.xxx to torch.xxx if xxx existed under torch,
+        # because many torch.Tensor functions are not included in the mapping.py,
+        # we should add torch.Tensor.xxx in mapping.py
+        if issubclass(in_type, torch.Tensor) and getattr(torch, node_target, None) and callable(getattr(torch, node_target)):
+            return f'torch.{node.target}'
+        # here forward torch.nn.Parameter.xxx to torch.Tensor.xxx
+        elif issubclass(in_type, torch.Tensor) and getattr(torch.Tensor, node_target, None) and callable(getattr(torch.Tensor, node_target)):
+            return f'torch.Tensor.{node.target}'
+        else:
+            return f'{in_type.__module__}.{in_type.__name__}.{node_target}'
 
     @staticmethod
     def _find_module_of_method(orig_method: Callable[..., Any]) -> str:

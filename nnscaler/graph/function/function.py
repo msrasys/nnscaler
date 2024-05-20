@@ -2631,3 +2631,18 @@ def Sigmoid(input, *, out=None, signature=None):
         raise ValueError("Expected 'out' to be None")
     annos = ['* -> *']
     return IRDimops(Sigmoid, 'sigmoid', signature, annos, [input])
+
+
+def Dictkeys(o: Union[Dict, IRObject], signature=None):
+    assert isinstance(o, dict) or isinstance(o.value, dict), f'the input should be a dict or an IRObject with dict value, but get {o}'
+    return IRPyFunc(signature, inputs=[o], outputs=[IRObject(name='dictkeys', value=o.value.keys(), is_constant=o.is_constant)])
+
+
+def DictValues(o: Union[Dict, IRObject], signature=None):
+    assert isinstance(o, dict) or isinstance(o.value, dict), f'the input should be a dict or an IRObject with dict value, but get {o}'
+    return IRPyFunc(signature, inputs=[o], outputs=[IRObject(name='dictvalues', value=o.value.values(), is_constant=o.is_constant)])
+
+
+def DictItems(o: Union[Dict, IRObject], signature=None):
+    assert isinstance(o, dict) or isinstance(o.value, dict), f'the input should be a dict or an IRObject with dict value, but get {o}'
+    return IRPyFunc(signature, inputs=[o], outputs=[IRObject(name='dictitems', value=o.value.items(), is_constant=o.is_constant)])

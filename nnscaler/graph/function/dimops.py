@@ -685,24 +685,24 @@ class IRDimops(IRFwOperation):
     def transform_rules(self) -> Tuple[TransformRule]:
         return self._trans_rules
 
-    def ianno(self, index: int) -> Tuple[DimAnno]:
+    def ianno(self, index: int) -> ShapeAnno:
         """!
         Get index-th input tensor shape annotation
 
         @param index int: the input index
 
-        @return dim_annos Tuple[DimAnno]: a tuple that each element is a dimension annotation
+        @return dim_annos ShapeAnno: a tuple that each element is a dimension annotation
         """
         assert index < len(self.inputs()), "index out of boudary"
         return tuple(self._iannos[index])
 
-    def oanno(self, index: int) -> Tuple[DimAnno]:
+    def oanno(self, index: int) -> ShapeAnno:
         """!
         Get index-th output tensor shape annotation
 
         @param index int: the output index
 
-        @return dim_annos Tuple[DimAnno]: a tuple that each element is a dimension annotation
+        @return dim_annos ShapeAnno: a tuple that each element is a dimension annotation
         """
         assert index < len(self.outputs()), "index out of boudary"
         return self._oannos[index]
@@ -715,11 +715,8 @@ class IRDimops(IRFwOperation):
         """
         for oidx, otensor in enumerate(self.outputs()):
             shape_anno = self.oanno(oidx)
-            if str(shape_anno) == '?':
+            if shape_anno.ignore:
                 assert isinstance(otensor, IRObject), f"expect IRObject for unknown shape, get {otensor}"
-                _logger.warning(
-                    'detect IRObject output in a IRDimops, please ensure the annotation is '
-                    'correct w.r.t the partition policy.')
                 continue
             shape = []
             for odim in range(shape_anno.ndims):

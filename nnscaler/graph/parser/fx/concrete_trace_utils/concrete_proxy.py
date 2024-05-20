@@ -235,8 +235,14 @@ class ConcreteProxy(Proxy):
             return self.tracer.create_proxy('call_method', 'keys', (self,), {})
 
     @compatibility(is_backward_compatible=True)
+    @property
     def values(self):
-        return self.tracer.create_proxy('call_method', 'values', (self,), {})
+        if callable(self.value.values):
+            def _values():
+                return self.tracer.create_proxy('call_method', 'values', (self,), {})
+            return _values
+        else:
+            return ConcreteAttrProxy(self, 'values')
 
     @compatibility(is_backward_compatible=True)
     def items(self):

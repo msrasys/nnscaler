@@ -154,7 +154,8 @@ def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
     total_input_size = sum(t.numel() * t.element_size() for t in tensors if torch.is_tensor(t))
     require_backward = any([t.requires_grad for t in tensors if hasattr(t, 'requires_grad')])
     # FIXME: reconsidering requires_grad
-    if func.__name__ in ('type_as'):
+    # the __name__ of function with type of torch.ScriptFunction is None
+    if hasattr(func, '__name__') and func.__name__ in ('type_as'):
         require_backward = False
     # repalce kwargs starting with 'self.xxx'
     train_kwargs, eval_kwargs = {}, {}

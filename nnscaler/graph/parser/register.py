@@ -7,6 +7,8 @@ from functools import partial
 import inspect
 import logging
 
+from torch import ScriptFunction
+
 from nnscaler.graph.function.dimops import IRDimops, OpAnno
 from nnscaler.graph.parser.fx.concrete_trace_utils.concrete_tracer import is_autograd_apply
 from nnscaler.ir.operator import IRTensor
@@ -136,6 +138,9 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
         def get_import_path(fn: Callable) -> str:
             if is_autograd_apply(fn):
                 import_path = inspect.getmodule(fn.__self__).__name__
+            elif isinstance(fn, ScriptFunction):
+                # fn._torchdynamo_inline is the original function
+                import_path = inspect.getmodule(fn._torchdynamo_inline).__name__
             else:
                 import_path = inspect.getmodule(fn).__name__
             return import_path
@@ -151,6 +156,12 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             op_name = name if name is not None else fn.__self__.__name__
             args = inspect.signature(fn.__self__.forward)
             arg_names = list(args.parameters.keys())[1:]
+        elif isinstance(fn, ScriptFunction):
+            # fn._torchdynamo_inline is the original function
+            fsig = f'{import_path}.{fn._torchdynamo_inline.__name__}'
+            op_name = name if name is not None else fn.name
+            args = inspect.signature(fn._torchdynamo_inline)
+            arg_names = list(args.parameters.keys())
         else:
             fsig = f'{import_path}.{fn.__name__}'
             op_name = name if name is not None else fn.__name__
@@ -162,6 +173,8 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             if is_autograd_apply(fn):
                 code = inspect.getsource(fn.__self__)
                 code = code[code.index(f'class {fn.__self__.__name__}'):]
+            elif isinstance(fn, ScriptFunction):
+                raise NotImplementedError('Do not support get source code for ScriptFunction.')
             else:
                 code = inspect.getsource(fn)
                 code = code[code.index('def'):]
