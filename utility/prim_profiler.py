@@ -20,8 +20,7 @@ logger = logging.getLogger("nnscaler.comm_profiler")
 
 
 def main():
-    base_path = get_default_profile_path()
-    default_path = base_path / get_node_arch()
+    default_path = get_default_profile_path()
 
     if not default_path.is_dir():
         default_path.mkdir(parents=True)

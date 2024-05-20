@@ -256,7 +256,7 @@ class FxModuleParser:
         else:
             frame.set_var(node.name, ir_node)
 
-        _logger.info(f'parsing result: {ir_node}')
+        _logger.debug(f'parsing result: {ir_node}')
         return ir_nodes
 
     @staticmethod

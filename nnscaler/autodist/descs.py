@@ -35,6 +35,7 @@ class TensorParallelDesc:
     partition_descs: Dict[int, NodePartitionDesc]
     recompute_groups: List[List[int]]
     mesh_desc: MeshDesc
+    analysis: Dict[str, Any]
 
     def to_json(self):
         ret = {}
@@ -42,6 +43,7 @@ class TensorParallelDesc:
         ret['partition_descs'] = descs_list
         ret['recompute_groups'] = self.recompute_groups
         ret['mesh_desc'] = self.mesh_desc.to_json()
+        ret['analysis'] = self.analysis
         return ret
 
     @staticmethod
@@ -51,7 +53,8 @@ class TensorParallelDesc:
             partition_descs[k] = NodePartitionDesc(v)
         return TensorParallelDesc(partition_descs,
                                   copy.deepcopy(ret['recompute_groups']),
-                                  MeshDesc.from_json(ret['mesh_desc']))
+                                  MeshDesc.from_json(ret['mesh_desc']),
+                                  ret['analysis'])
 
 
 @dataclass

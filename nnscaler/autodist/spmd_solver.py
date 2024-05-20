@@ -1,4 +1,4 @@
-from .model_graph import ModelGraph
+from .model_graph import ModelGraph, collect_depth2scope_nodes
 from .cube_operator import CubeOperator
 from .descs import *
 from .cost_database import CostDatabase
@@ -14,6 +14,7 @@ import json
 import yaml
 import numpy
 import logging
+from dataclasses import dataclass, asdict
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Tuple, List, Set, Any
@@ -21,9 +22,15 @@ from typing import Dict, Tuple, List, Set, Any
 __all__ = [
     'SPMDSolver',
     'calc_optimal_spmd_plan',
+    'analysis_pretty_printer',
 ]
 
 _logger = logging.getLogger(__name__)
+
+_PLAN_ANALYSIS_LIST_TIME_TOP_NUM = 10
+_PLAN_ANALYSIS_LIST_PARTITIONS_TOP_NUM = 2
+_PLAN_ANALYSIS_MODULE_MAX_DEPTH = 4
+_PLAN_ANALYSIS_MODULE_TOP_NUM = 3
 
 
 @dataclass
@@ -55,12 +62,28 @@ class PartitionCostDesc:
 
     def __repr__(self):
         contents = dict()
-        for k, v in self.__dict__.items():
+        for k, v in asdict(self).items():
             if 'mem' in k:
                 k_in_mb = k + ' (MB)'
                 contents[k_in_mb] = v // 1024 // 1024
             else:
                 contents[k] = v
+        return str(contents)
+
+@dataclass
+class ModuleMemCostDesc:
+    total_cost: int
+    resident_mem: int
+    activation_mem: int
+    opt_transient_mem: int
+    recompute_mem: int
+    transient_mem: int
+
+    def __repr__(self):
+        contents = dict()
+        for k, v in asdict(self).items():
+            k_in_mb = k + ' (MB)'
+            contents[k_in_mb] = v // 1024 // 1024
         return str(contents)
 
 
@@ -366,9 +389,9 @@ class SPMDSolver:
                         operator.ir_cell)
         if replicated_ops:
             for signature, ops in replicated_ops.items():
-                _logger.info(f'find {len(ops)} replicated {signature}')
+                _logger.debug(f'find {len(ops)} replicated {signature}')
                 for op in ops:
-                    _logger.info(f'\t{op}\n\t{op.comment}\n\n')
+                    _logger.debug(f'\t{op}\n\t{op.comment}\n\n')
         if self.non_used_pcs:
             _logger.warning(
                 f'find unused partition constraints {self.non_used_pcs}')
@@ -724,7 +747,7 @@ class SPMDSolver:
             plan.append((i, cur_mem.index(min(cur_mem))))
         return plan
 
-    def calc_mem_cost(self, plan: List[Tuple[int, int]]) -> int:
+    def calc_mem_cost(self, plan: List[Tuple[int, int]]) -> ModuleMemCostDesc:
         '''
         calculate the memory cost of the plan
 
@@ -732,11 +755,8 @@ class SPMDSolver:
             plan (List[Tuple[int, int]]): the plan to be evaluated
 
         Returns:
-            int: the memory cost of the plan in bytes
+            ModuleMemCostDesc: the memory cost of the plan in bytes
         '''
-
-        def to_mb(size: int) -> int:
-            return size // 1024 // 1024
 
         mem, act_mem, opt_transient_mem, transient_mem = 0, 0, 0, []
         for op_idx, p_idx in plan:
@@ -750,9 +770,6 @@ class SPMDSolver:
                 act_mem += desc.activation_mem
             opt_transient_mem += desc.opt_transient_mem
             transient_mem.append(desc.transient_mem)
-        _logger.info(f'resident mem: {to_mb(mem)} MB')
-        _logger.info(f'activation mem: {to_mb(act_mem)} MB')
-        _logger.info(f'opt transient mem: {to_mb(opt_transient_mem)} MB')
         cost = mem - act_mem + max(act_mem, opt_transient_mem)
 
         start, end = plan[0][0], plan[-1][0]
@@ -769,26 +786,23 @@ class SPMDSolver:
                     cur_recompute_mem_cost += p_cost_desc.activation_mem
                 recompute_mem_cost = max(recompute_mem_cost,
                                          cur_recompute_mem_cost)
-        _logger.info(f'recompute mem: {to_mb(recompute_mem_cost)} MB')
         cost += recompute_mem_cost
 
         # A heuristic that helps to estimate the memory cost accurately.
         # It is hard to fully reuse large memory blocks in the cached allocator.
-        # - in training, use the maximum 2 transient memory
-        # - in inference, use the largest transient memory
+        # In training and inference, we use the top 2 largest inference transient
+        # memory cost. In training, we double the cost as a result of the backward pass.
         if transient_mem:
             transient_mem.sort()
             transient_mem.reverse()
-            if len(transient_mem) == 1 or not self.autodist_config.is_train:
-                cost += transient_mem[0]
-                _logger.info(f'transient mem: {to_mb(transient_mem[0])} MB')
+            if len(transient_mem) == 1:
+                transient_mem_cost = transient_mem[0]
             else:
-                cost += transient_mem[0] + transient_mem[1]
-                _logger.info(
-                    f'transient mem: {to_mb(transient_mem[0])} MB, {to_mb(transient_mem[1])} MB'
-                )
-        _logger.info(f'total mem cost: {to_mb(cost)} MB')
-        return cost
+                transient_mem_cost = transient_mem[0] + transient_mem[1]
+            if self.autodist_config.is_train:
+                transient_mem_cost *= 2
+        cost += transient_mem_cost
+        return ModuleMemCostDesc(cost, mem, act_mem, opt_transient_mem, recompute_mem_cost, transient_mem_cost)
 
     def calc_inner_time_cost(self, plan: List[Tuple[int, int]]) -> float:
         '''
@@ -990,9 +1004,9 @@ class SPMDSolver:
         prob += act_mem <= max_act_opt_transient
         prob += opt_transient_mem <= max_act_opt_transient
         if self.autodist_config.is_train:
-            transient_coef = 2
+            transient_coef = 4
         else:
-            transient_coef = 1
+            transient_coef = 2
         prob += mem - act_mem + max_act_opt_transient + transient_coef * max_transient + recompute_mem <= self.mem_bound
 
         # 4.3. constraint over e
@@ -1080,7 +1094,7 @@ class SPMDSolver:
             plans.append((i, s_val[i - start]))
             p_cost_desc = self.partition_info[i][s_val[i - start]]
             inner_time_cost += p_cost_desc.comp_time + p_cost_desc.weight_update_time
-        mem_cost = self.calc_mem_cost(plans)
+        mem_cost = self.calc_mem_cost(plans).total_cost
         return SPMDSearchOutput(self.partition_path2desc(plans),
                                 mem_cost / 1024 / 1024 / 1024, all_time_cost,
                                 inner_time_cost)
@@ -1130,6 +1144,149 @@ class SPMDSolver:
             ret.append(descs)
         return ret
 
+    def analyze_plan(self, plan: List[Tuple[int, int]]) -> Dict[str, Any]:
+        """
+        Analyze the given plan and return the analysis results.
+        The analysis includes:
+        - Computation Related
+            - the total computation time
+            - the top-10 operators that consume the most computation time
+            - detailed partition plans for the top-2 operators that consume the most computation time
+        - Communication Related
+            - the total communication time
+            - the top-10 operators that consume the most communication time
+        - Memory Related
+            - the top-3 modules that consume the most memory in depth 1-4
+        - Detailed Partition Plans for each IRDimops
+
+        Args:
+            plan (List[Tuple[int, int]]): the plan to be analyzed
+
+        Returns:
+            Dict[str, Any]: the analysis results
+        """
+        ret = dict()
+        start, end = plan[0][0], plan[-1][0]
+
+        # top 10 operators grouped by signature that:
+        # - consume the most computation time
+        # - consume the most communication time
+        sig2comp_time = dict()
+        sig2comm_time = dict()
+        op_idx2comp_time = dict()
+        op_idx2comm_time = dict()
+        dimops_split_info = list()
+        sig2split_info = dict()
+        comp_time_sum, comm_time_sum = 0, 0
+        for op_idx, p_idx in plan:
+            desc = self.partition_info[op_idx][p_idx]
+            node = self.graph.operator_list[op_idx].ir_cell
+            sig = node.signature
+            if sig not in sig2comp_time:
+                sig2comp_time[sig] = 0
+            if sig not in sig2split_info:
+                sig2split_info[sig] = []
+            sig2comp_time[sig] += desc.comp_time
+            op_idx2comp_time[op_idx] = desc.comp_time
+            comm_cost = 0
+            for k, comm_vec in enumerate(desc.comm_time):
+                producer = self.producers[op_idx][k]
+                # do not consider the communication cost between the node in the interval
+                # to its producer outside the interval currently
+                if start <= producer <= end:
+                    producer_p_idx = plan[producer - start][1]
+                    comm_cost += comm_vec[producer_p_idx]
+            op_idx2comm_time[op_idx] = comm_cost
+            if isinstance(node, IRDimops):
+                partition_repr = (repr(node), repr(node.anno), node.comment, repr(self._op_partitions[op_idx][p_idx]))
+                split_info = (partition_repr, desc.comp_time, comm_cost)
+                dimops_split_info.append(split_info)
+                sig2split_info[sig].append(split_info)
+            if comm_cost == 0:
+                continue
+            if sig not in sig2comm_time:
+                sig2comm_time[sig] = 0
+            sig2comm_time[sig] += comm_cost
+            comp_time_sum += desc.comp_time
+            comm_time_sum += comm_cost
+
+        sig2comp_time = sorted(sig2comp_time.items(), key=lambda x: x[1], reverse=True)
+        comp_sig_num = min(_PLAN_ANALYSIS_LIST_TIME_TOP_NUM, len(sig2comp_time))
+        sig2comp_time = sig2comp_time[:comp_sig_num]
+        top_comp_time_sum = sum([x[1] for x in sig2comp_time])
+        ret['comp_time_sum'] = comp_time_sum
+        ret[f'top_comp_time'] = sig2comp_time
+        ret[f'top_comp_time_sum'] = top_comp_time_sum
+
+        # in addition list partition plans for top comp time operators
+        top_op_split_info = {}
+        for sig, _ in sig2comp_time[:min(_PLAN_ANALYSIS_LIST_PARTITIONS_TOP_NUM, len(sig2comp_time))]:
+            top_op_split_info[sig] = sig2split_info[sig]
+        ret['top_op_split_info'] = top_op_split_info
+
+        sig2comm_time = sorted(sig2comm_time.items(), key=lambda x: x[1], reverse=True)
+        comm_sig_num = min(_PLAN_ANALYSIS_LIST_TIME_TOP_NUM, len(sig2comm_time))
+        sig2comm_time = sig2comm_time[:comm_sig_num]
+        top_comm_time_sum = sum([x[1] for x in sig2comm_time])
+        ret['comm_time_sum'] = comm_time_sum
+        ret[f'top_comm_time'] = sig2comm_time
+        ret[f'top_comm_time_sum'] = top_comm_time_sum
+
+        # similar to analysis in the raw graph, we list the top-3 modules that:
+        # - consume the most computation time
+        # - consume the most communication time
+        # - consume the most memory
+        # to reduce the complexity, we only consider the modules:
+        # - 1 <= depth <= _PLAN_ANALYSIS_MODULE_MAX_DEPTH
+        # - in the interval [start, end]
+        # - composed of more than one operator
+        ret['module_analysis'] = {}
+        op_idx2plan_offset = {op_idx: i for i, (op_idx, _) in enumerate(plan)}
+        depth2scope_nodes = collect_depth2scope_nodes(self.graph.scope_tree_root)
+        for depth, scope_nodes in depth2scope_nodes.items():
+            if depth == 0 or depth > _PLAN_ANALYSIS_MODULE_MAX_DEPTH:
+                continue
+            content = {'comp_time': [], 'comm_time': [], 'mem': []}
+            info = list()
+            for scope_node in scope_nodes:
+                # currently do not consider the module that is not in the interval
+                if scope_node.start < start or scope_node.end > end:
+                    continue
+                # skip modules composed of only one operator, since they are covered
+                # at the operator level analysis
+                if scope_node.start == scope_node.end:
+                    continue
+                comp_time, comm_time = 0, 0
+                for op_idx in range(scope_node.start, scope_node.end + 1):
+                    comp_time += op_idx2comp_time[op_idx]
+                    comm_time += op_idx2comm_time[op_idx]
+                sub_plan_start = op_idx2plan_offset[scope_node.start]
+                sub_plan_end = op_idx2plan_offset[scope_node.end]
+                sub_plan = plan[sub_plan_start:sub_plan_end + 1]
+                mem_cost = self.calc_mem_cost(sub_plan)
+                info.append((scope_node.get_full_name(), comp_time, comm_time, mem_cost))
+            # sort by comp_time
+            info.sort(key=lambda x: x[1], reverse=True)
+            for i in range(min(_PLAN_ANALYSIS_MODULE_TOP_NUM, len(info))):
+                name, comp_time, _, _ = info[i]
+                content['comp_time'].append((name, comp_time))
+            # sort by comm_time
+            info.sort(key=lambda x: x[2], reverse=True)
+            for i in range(min(_PLAN_ANALYSIS_MODULE_TOP_NUM, len(info))):
+                name, _, comm_time, _ = info[i]
+                content['comm_time'].append((name, comm_time))
+            # sort by mem
+            info.sort(key=lambda x: x[3].total_cost, reverse=True)
+            for i in range(min(_PLAN_ANALYSIS_MODULE_TOP_NUM, len(info))):
+                name, _, _, mem = info[i]
+                content['mem'].append((name, repr(mem)))
+            ret['module_analysis'][depth] = content
+
+        # TODO: generate a visualization of the plan like torch.profiler
+        ret['dimops_split_info'] = dimops_split_info
+
+        return ret
+
     def solve(self, intervals: List[Tuple[int, int]],
               topk: int) -> List[SPMDSearchOutput]:
         '''
@@ -1176,7 +1333,46 @@ class SPMDSolver:
 
         return TensorParallelDesc(partition_descs=partition_descs,
                                   mesh_desc=self.mesh_desc,
-                                  recompute_groups=[])
+                                  recompute_groups=[],
+                                  analysis=self.analyze_plan(plans))
+
+
+def analysis_pretty_printer(analysis: Dict[str, Any]) -> str:
+    ret = ''
+    ret += f'Total computation time: {1000.0 * analysis["comp_time_sum"]:.2f} ms\n'
+    ret += f'Top {_PLAN_ANALYSIS_LIST_TIME_TOP_NUM} of operators that consume the most computation time:\n'
+    for sig, time in analysis[f'top_comp_time']:
+        ret += f'    {sig}: {1000.0 * time:.2f} ms\n'
+    ret += f'Top {_PLAN_ANALYSIS_LIST_TIME_TOP_NUM} of operators computation time sum: {1000.0 * analysis["top_comp_time_sum"]:.2f} ms\n'
+    ret += '\n'
+    ret += f'Top {_PLAN_ANALYSIS_LIST_PARTITIONS_TOP_NUM} operators split info:\n'
+    for sig, split_info in analysis[f'top_op_split_info'].items():
+        ret += f'    {sig}:\n'
+        for partition_repr, comp_time, comm_time in split_info:
+            node_repr, anno, comment, partition_info = partition_repr
+            ret += f'        {node_repr}\n'
+            ret += f'        {comment}\n'
+            ret += f'        {anno}, {partition_info}, comp_time: {1000.0 * comp_time:.2f} ms, comm_time: {1000.0 * comm_time:.2f} ms\n\n'
+        ret += '\n'
+    ret += f'Total communication time: {1000.0 * analysis["comm_time_sum"]:.2f} ms\n'
+    ret += f'Top {_PLAN_ANALYSIS_LIST_TIME_TOP_NUM} operators that consume the most communication time:\n'
+    for sig, time in analysis[f'top_comm_time']:
+        ret += f'    {sig}: {1000.0 * time:.2f} ms\n'
+    ret += f'Top {_PLAN_ANALYSIS_LIST_TIME_TOP_NUM} of operators communication time sum: {1000.0 * analysis[f"top_comm_time_sum"]:.2f} ms\n'
+    ret += '\n'
+    ret += 'Module analysis:\n'
+    for depth, content in analysis['module_analysis'].items():
+        ret += f'Depth {depth}:\n'
+        ret += f'    Top {_PLAN_ANALYSIS_MODULE_TOP_NUM} modules that consume the most computation time:\n'
+        for name, time in content['comp_time']:
+            ret += f'        {name}: {1000.0 * time:.2f} ms\n'
+        ret += f'    Top {_PLAN_ANALYSIS_MODULE_TOP_NUM} modules that consume the most communication time:\n'
+        for name, time in content['comm_time']:
+            ret += f'        {name}: {1000.0 * time:.2f} ms\n'
+        ret += f'    Top {_PLAN_ANALYSIS_MODULE_TOP_NUM} modules that consume the most memory:\n'
+        for name, mem_desc in content['mem']:
+            ret += f'        {name}: {mem_desc}\n'
+    return ret
 
 
 def calc_optimal_spmd_plan(

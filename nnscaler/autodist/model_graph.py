@@ -107,8 +107,7 @@ def estimate_mem_lower_bound(
     else:
         raise RuntimeError(f'invalid zero stage {cfg.zero_stage}')
 
-    min_single_dev_mem = max(opt_transient_mem, activation_mem) \
-    + 2 * param_mem + buffer_mem + opt_resident_mem
+    min_single_dev_mem = max(opt_transient_mem, activation_mem) + 2 * param_mem + buffer_mem + opt_resident_mem
     return min_single_dev_mem
 
 
@@ -274,6 +273,11 @@ class ScopeNode:
         self.start = start
         self.end = end
 
+    def get_full_name(self):
+        if self.module_type is None:
+            return self.name
+        return f'{self.name}, {self.module_type.__name__}'
+
     def insert(self, node: IRFwOperation, module_info: List[Tuple[str, Any]],
                flops: int, fw_span: float, idx: int):
         self.leaf_size += 1
@@ -423,6 +427,66 @@ class ScopeNode:
         return desc
 
 
+def collect_depth2scope_nodes(root: ScopeNode) -> Dict[int, List[ScopeNode]]:
+    depth2scope_nodes: Dict[int, List[ScopeNode]] = dict()
+
+    def dfs(node: ScopeNode):
+        if node.depth not in depth2scope_nodes:
+            depth2scope_nodes[node.depth] = []
+        depth2scope_nodes[node.depth].append(node)
+        for child in node.children:
+            dfs(child)
+
+    dfs(root)
+    return depth2scope_nodes
+
+
+def analyze_base_graph(root: ScopeNode) -> None:
+    '''
+    Analyze the input graph's structure and statistics based on profiling results.
+    NOTE: if the input graph contains operators that consumes or generates extremely
+    large tensors, the profiling result may be incorrect. User should check the
+    partition plan's analysis later.
+    '''
+    depth2scope_nodes = collect_depth2scope_nodes(root)
+
+    # Similar to deepspeed profiler, we list top3 modules in terms of
+    # params, buffers, activation mem and fw_span
+    show_num = 3
+    def get_val(node: ScopeNode, key: str):
+        # pretty print the memory size in MB and span in ms for ScopeNode
+        val = getattr(node, key)
+        if 'mem' in key:
+            return f'{val / 1024 / 1024:.2f} MB'
+        elif 'span' in key:
+            return f'{val:.2f} ms'
+        else:
+            raise RuntimeError(f'invalid key {key}')
+
+    def build_info(nodes: List[ScopeNode], key: str):
+        info = list()
+        sorted_nodes = sorted(nodes, key=lambda x: getattr(x, key), reverse=True)
+        for node in sorted_nodes[:min(show_num, len(sorted_nodes))]:
+            info.append((node.get_full_name(), get_val(node, key)))
+        return info
+
+    visual_contents = dict()
+    for depth, scope_nodes in depth2scope_nodes.items():
+        # ignore the root node, since it doesn't have module info
+        if depth == 0:
+            continue
+        visual_contents[depth] = dict()
+        for key in ['param_mem', 'fw_span', 'train_mem', 'buffer_mem']:
+            visual_contents[depth][key] = build_info(scope_nodes, key)
+
+    ret = '-' * 25 + 'nnScaler Graph Profiling Result' + '-' * 25 + '\n\n'
+    for depth, contents in visual_contents.items():
+        ret += f'depth {depth}\n'
+        for key, info in contents.items():
+            ret += f'    {key} - {info}\n'
+    return ret
+
+
 # a class to store statistics of a continuous sub-sequence
 # in the initial graph's topology sequence
 @dataclass
@@ -499,7 +563,8 @@ class ModelGraph:
             root.insert(node, module_info, calc_flops(node), fw_span, idx=i)
 
         root.pull_up(db)
-        _logger.info('\n' + root.__repr__())
+        _logger.debug('\n' + root.__repr__())
+        _logger.info('\n' + analyze_base_graph(root))
 
         return root
 

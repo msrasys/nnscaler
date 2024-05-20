@@ -151,6 +151,7 @@ def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
         gen_torch_tensors(shape, dtype, requires_grad) if isinstance(value, IRTensor) else value \
             for shape, dtype, requires_grad, value in zip(shapes, dtypes, requires_grads, values)
     )
+    total_input_size = sum(t.numel() * t.element_size() for t in tensors if torch.is_tensor(t))
     require_backward = any([t.requires_grad for t in tensors if hasattr(t, 'requires_grad')])
     # FIXME: reconsidering requires_grad
     if func.__name__ in ('type_as'):
@@ -193,7 +194,7 @@ def profile(node: IRFwOperation, func: Callable, shapes: Shapes, dtypes: DTypes,
     with torch.no_grad():
         run_step(func, tensors, eval_kwargs, backward=False)
     mtoc = torch.cuda.max_memory_allocated()  # in bytes
-    infer_memory = mtoc - mtic
+    infer_memory = mtoc - mtic + total_input_size
 
     train_mem_info = []
     train_mem2in_idx = []

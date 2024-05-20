@@ -1,4 +1,4 @@
-from .spmd_solver import calc_optimal_spmd_plan
+from .spmd_solver import calc_optimal_spmd_plan, analysis_pretty_printer
 from .pipeline_solver import calc_optimal_pp_plan
 from .autodist_config import AutoDistConfig
 from .model_graph import ModelGraph, estimate_mem_lower_bound
@@ -122,10 +122,7 @@ def parallelize_graph(graph: IRGraph,
             with open(autodist_config.save_plan_path, 'w') as f:
                 json.dump(search_out.to_json(), f, indent=2)
 
-    _logger.info(f'use plan with e2e time/s {search_out.e2e_time}s,' +
-                 f'stage mems/GB {search_out.stage_mems}, ' +
-                 f'stage all times/s {search_out.stage_all_times}, ' +
-                 f'stage comp times/s {search_out.stage_comp_times}')
+    _logger.info(f'use plan with e2e time/s {1000 * search_out.e2e_time:.2f}ms')
     pp_desc = search_out.desc
 
     cid2node: Dict[int, IRFwOperation] = dict()
@@ -240,9 +237,11 @@ def parallelize_graph(graph: IRGraph,
     # partition and assign nodes to devices
     # TODO(yizhu1): network topo aware device map
     offset = 0
-    for spmd_desc, stage in zip(pp_desc.spmd_descs, stages):
+    for idx, (spmd_desc, stage) in enumerate(zip(pp_desc.spmd_descs, stages)):
         cur_ngpus = spmd_desc.mesh_desc.ngpus
         dev = [offset + i for i in range(cur_ngpus)]
+        stage_info_str = f'stage {idx} on devices {dev} with mem {search_out.stage_mems[idx]:.2f} GB'
+        _logger.info(f'\nautodist plan analysis for {stage_info_str}:\n\n{analysis_pretty_printer(spmd_desc.analysis)}')
         offset += cur_ngpus
         for node in stage.nodes():
             if isinstance(node, IRFwOperation):
@@ -254,16 +253,16 @@ def parallelize_graph(graph: IRGraph,
                     p_desc = spmd_desc.partition_descs[node.cid]
                     partition_node(node, graph, dev, p_desc)
                     if isinstance(node, IRDimops):
-                        _logger.info(
+                        _logger.debug(
                             f'apply {node} with {node.anno} at {node.comment}, plan: {p_desc}'
                         )
                     else:
-                        _logger.info(
+                        _logger.debug(
                             f'replicate non-IRDimops {node.signature} with {node.comment}'
                         )
                 else:
                     replica(graph, node, dev)
-                    _logger.info(
+                    _logger.debug(
                         f'NOT included in plan, replicate {node.signature} with {node.comment}'
                     )
 

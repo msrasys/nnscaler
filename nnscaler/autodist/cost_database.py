@@ -1,5 +1,4 @@
 from typing import List, Tuple, Union, Callable, Dict
-import numpy as np
 import json
 import os
 from os import listdir
@@ -241,7 +240,7 @@ class CostDatabase:
         node_mem = opt_resident_mem + memory_results[
             'train'] + 2 * memory_results['param'] + memory_results['buffer']
         node_mem = node_mem + (stage_num - 1) * activation_mem \
-            if is_train else memory_results['param']
+            if is_train else node_mem
         node_buffer = max(memory_results.values()) \
             if is_train else memory_results['infer']
 
