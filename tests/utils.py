@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 
+from nnscaler.parallel import ComputeConfig
 from nnscaler.runtime.module import ParallelModule
 from nnscaler.runtime.device import DeviceGroup, CompileFlag
 
@@ -291,7 +292,7 @@ def new_empty(cube_module_cls: Type[ParallelModule], device='meta', init_params=
     This is useful when you want to get model information (e.g. fullmap/zero) without allocating memory.
     """
     module_file = Path(sys.modules[cube_module_cls.__module__].__file__)
-    compute_config = torch.load(module_file.with_name(f"{cube_module_cls.COMPUTE_CONFIG_FILE}"))
+    compute_config = ComputeConfig.safe_load_from_file(module_file.with_name(f"{cube_module_cls.COMPUTE_CONFIG_FILE}"))
     with replace_all_device_with(device, True), mock_cube_env(cube_module_cls, compute_config), mock_dist(cube_module_cls.rank, compute_config.runtime_ngpus):
         return cube_module_cls(init_params=init_params)
 

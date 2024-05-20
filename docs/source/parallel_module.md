@@ -204,6 +204,7 @@ class ComputeConfig:
     pipeline_nstages: int = 1
     pipeline_scheduler: Optional[str] = None
 
+    pas_config: Dict[str, Any] = field(default_factory=dict)
     user_config: UserConfig = field(default_factory=UserConfig)
 ```
 We can categorize the fields into 4 categories:
@@ -225,6 +226,7 @@ We can categorize the fields into 4 categories:
     - `pipeline_nmicros`: the number of microbatches in the pipeline.
     - `pipeline_nstages`: the number of stages in the pipeline.
     - `pipeline_scheduler`: the scheduler name for the pipeline. Current we support four schedulers in training `1f1b`/`1f1b_plus`/`gpipe`/`chimera_direct` (4 stages pipeline only), and one scheduler in inference `infer_pipe`.
+    - `pas_config`: the configuration for the PAS policy. It is a dictionary, and will be used by the PAS policy. Please note different PAS will have different configurations, and please check the PAS policy for details.
 4. User configuration
     - user_config: the user configuration,which is used to decide whether skipping compiling and reusing the previously compiled parallel module. It has two categories of configuration:
         - `graph`: the graph related configuration, which is used to decide whether skipping graph generation only.
@@ -524,7 +526,7 @@ The input is a list of samples, and returns a list of outputs for the samples. I
 
 Writing a pas policy can be very hard and error-prone. So we provide 6 builtin PAS policies to help you. `dp`, `tp`, `pp`, `data`, `hybrid`, and `autodist`. Please note only `autodist` policy is the recommended policy for most cases, and all other PAS policies are mainly test purpose only.
 
-The configuration of the PAS policy should be passed in the `user_config.code['pas']` of `ComputeConfig` as a dictionary.
+The configuration of the PAS policy should be passed in the `pas_config` of `ComputeConfig` as a dictionary.
 
 1. `dp`: data parallelism. It will replicate the module across all devices, and run data parallelism across all devices. It requires the `plan_ngpus` must be 1 and no configurations
 

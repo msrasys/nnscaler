@@ -660,6 +660,7 @@ class ParallelModule(CubeModule):
         # TODO: re-enable this check
         # if dist.is_initialized() and self.rank != dist.get_rank():
         #     raise RuntimeError(f"The rank to load this module file name is expected to be {self._rank}, but got {dist.get_rank()}")
+        from nnscaler.parallel import ComputeConfig
 
         self._non_presistent_buffers_inited = init_params or not self._non_persistent_buffers_set
         module_file = Path(sys.modules[self.__module__].__file__)
@@ -670,7 +671,10 @@ class ParallelModule(CubeModule):
         self._warn_uninitialized_non_persistent_buffers()
 
         self._dist_param_map = torch.load(module_file.with_name(f"{FxModuleParser.ATTR_MAP_FILE}"))
-        self._compute_config: 'ComputeConfig' = torch.load(module_file.with_name(f"{self.COMPUTE_CONFIG_FILE}"))
+        self._compute_config: ComputeConfig = ComputeConfig.safe_load_from_file(
+            module_file.with_name(f"{self.COMPUTE_CONFIG_FILE}"),
+            return_none_on_error=False
+        )
         self._orign_module_metadata: OriginModuleMetadata = torch.load(module_file.with_name(f"{self.ORIGIN_MODULE_METADATA_FILE}"))
 
         for reducer in self.reducers:

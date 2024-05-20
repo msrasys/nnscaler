@@ -47,14 +47,10 @@ def test_autodist():
             MLP(),
             {'data': dummy_data()},
             'autodist',
-            ComputeConfig(2, 4, user_config=UserConfig(
-                code={
-                    'pas': {
-                        'update_freq': 1,
-                        'task_name': 'test_autodist',
-                    }
-                }
-            )),
+            ComputeConfig(2, 4, pas_config={
+                    'update_freq': 1,
+                    'task_name': 'test_autodist',
+            }),
             cube_savedir=tempdir,
             load_module=False
         )

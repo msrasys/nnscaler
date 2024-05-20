@@ -78,7 +78,7 @@ def pas_tp(graph: IRGraph, cfg: 'ComputeConfig'):
     # get the current random state
     state = random.getstate()
 
-    seed = cfg.user_config.get_pas_config().get('seed', 1)  # by default we fix the seed for test reproducibility
+    seed = cfg.pas_config.get('seed', 1)  # by default we fix the seed for test reproducibility
     random.seed(seed)
     devs = list(range(ngpus))
 
@@ -197,7 +197,7 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
 
 
 def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
-    pas_cfg = cfg.user_config.get_pas_config()
+    pas_cfg = cfg.pas_config
 
     # required parameters
     update_freq = pas_cfg['update_freq']

@@ -180,21 +180,21 @@ def test_override():
         # Graph | graph match | generate
         _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'graph', 'g8', False)
         g8_module_path = module_path.with_name('g8')
-        assert torch.load(g8_module_path / ParallelModule.COMPUTE_CONFIG_FILE) == ComputeConfig(1, 1)
+        assert ComputeConfig.safe_load_from_file(g8_module_path / ParallelModule.COMPUTE_CONFIG_FILE) == ComputeConfig(1, 1)
         graph_stat = (g8_module_path / 'graph.ckp').stat()
         args_stat = (g8_module_path / 'forward_args.pkl').stat()
         _to_cube_model(MyModule, ComputeConfig(2, 2), tempdir, 'graph', 'g8', False)
         assert (g8_module_path / 'graph.ckp').stat().st_mtime_ns == graph_stat.st_mtime_ns
         assert (g8_module_path / 'forward_args.pkl').stat().st_mtime_ns == args_stat.st_mtime_ns
-        assert torch.load(g8_module_path / ParallelModule.COMPUTE_CONFIG_FILE) == ComputeConfig(2, 2)
+        assert ComputeConfig.safe_load_from_file(g8_module_path / ParallelModule.COMPUTE_CONFIG_FILE) == ComputeConfig(2, 2)
 
         # MOO | graph match | generate code only
         _to_cube_model(MyModule, ComputeConfig(1, 1), tempdir, 'moo', 'g9', False)
         g9_module_path = module_path.with_name('g9')
-        assert torch.load(g9_module_path / ParallelModule.COMPUTE_CONFIG_FILE) == ComputeConfig(1, 1)
+        assert ComputeConfig.safe_load_from_file(g9_module_path / ParallelModule.COMPUTE_CONFIG_FILE) == ComputeConfig(1, 1)
         graph_stat = (g9_module_path / 'graph.ckp').stat()
         args_stat = (g9_module_path / 'forward_args.pkl').stat()
         _to_cube_model(MyModule, ComputeConfig(2, 2), tempdir, 'moo', 'g9', False)
         assert (g9_module_path / 'graph.ckp').stat().st_mtime_ns == graph_stat.st_mtime_ns
         assert (g9_module_path / 'forward_args.pkl').stat().st_mtime_ns == args_stat.st_mtime_ns
-        assert torch.load(g9_module_path / ParallelModule.COMPUTE_CONFIG_FILE) == ComputeConfig(2, 2)
+        assert ComputeConfig.safe_load_from_file(g9_module_path / ParallelModule.COMPUTE_CONFIG_FILE) == ComputeConfig(2, 2)

@@ -93,15 +93,7 @@ class UserConfig:
     # ```
     graph: Dict[str, Any] = field(default_factory=dict)
     # you can put any configuration that may affect the generated code (but not affect the traced graph) here.
-    # For example, extra arguments of your PAS function can put here.
-    # For all builtin pas, we will put PAS config in `code['pas']`.
     code: Dict[str, Any] = field(default_factory=dict)
-
-    def get_pas_config(self) -> Dict[str, Any]:
-        """
-        All builtin pas will read their config here.
-        """
-        return self.code.get('pas', {})
 
 
 @dataclass(frozen=True)
@@ -133,8 +125,9 @@ class ComputeConfig:
     pipeline_nstages: int = -1
     # it is pas's responsibility to apply the scheduler
     pipeline_scheduler: str = '1f1b'
+    # PAS policy settings
+    pas_config: Dict[str, Any] = field(default_factory=dict)
     # the customized configs from user that can affect the graph and code generation.
-    # for example, module configuration or PAS policy settings.
     user_config: UserConfig = field(default_factory=UserConfig)
 
     def __post_init__(self):
@@ -218,6 +211,52 @@ class ComputeConfig:
             return self.runtime_ngpus // self.zero_ngroups
         else:
             return self.plan_ngpus
+
+    @classmethod
+    def safe_dump_to_file(cls, cfg: 'ComputeConfig', file: Union[str, Path]) -> None:
+        """
+        torch.save(cfg) is not safe when we change the fields of ComputeConfig.
+        So we should use this method to save the config.
+        """
+        torch.save(asdict(cfg), file)
+
+    @classmethod
+    def safe_load_from_file(cls, file: Union[str, Path], return_none_on_error=True) -> Optional['ComputeConfig']:
+        """
+        Load the config from file.
+        `return_none_on_error` controls the behaivor when the file not exists or failed to load.
+        If `return_none_on_error` is True, will return None when failed to load.
+        If `return_none_on_error` is False, will raise when failed to load.
+        """
+        if Path(file).exists():
+            try:
+                cfg = torch.load(file)
+                if isinstance(cfg, dict): # in old version, we save the object directly (not save as dict)
+                    # this can raise if cfg has extra keys.
+                    # which means some fields of ComputeConfig has been removed(we should avoid this).
+                    # in this case, we just return None.
+                    return cls(**cfg)
+                return cfg
+            except Exception as e:
+                if not return_none_on_error:
+                    raise
+                logger.warning(f"Failed to load ComputeConfig with error {str(e)}.")
+        elif not return_none_on_error:
+            raise FileNotFoundError(f"Failed to load compute config from {file}. File not found.")
+        return None
+
+    @classmethod
+    def safe_equals(cls, a: Optional['ComputeConfig'], b: Optional['ComputeConfig']) -> bool:
+        """
+        Return False if a and b are from incompatible version of ComputeConfig
+        This is only for backward compatibility, and will be removed in future
+        and can use `==` when we save dict version of ComputeConfig to file.
+        """
+        try:
+            return a == b
+        except AttributeError:
+            logger.warning("Failed to compare ComputeConfig. They are incompatible.")
+            return False
 
 
 @contextmanager
@@ -477,8 +516,8 @@ def _prepare_and_check_reusable(
     #     you can take it as a continous operation after a failed generation.
     reusable = False
     config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
-    old_config: ComputeConfig = torch.load(config_file) if config_file.exists() else None
-    is_config_match = old_config == compute_config
+    old_config: Optional[ComputeConfig] = ComputeConfig.safe_load_from_file(config_file)
+    is_config_match = ComputeConfig.safe_equals(old_config, compute_config)
     is_graph_config_match = old_config is not None and old_config.graph_config == compute_config.graph_config
     trace_meta_files = [
         outdir / FxModuleParser.ATTR_CONTENT_FILE_0,  # just check the first is good enough
@@ -953,7 +992,7 @@ def parallelize(
         outdir, reusable = _prepare_and_check_reusable(cube_savedir, module_class, compute_config, instance_name, reuse)
         if not reusable:
             config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
-            torch.save(compute_config, config_file)  # always refresh compute config
+            ComputeConfig.safe_dump_to_file(compute_config, config_file)  # always refresh compute config
             with _compile_flags(compute_config):
                 regen_status = _gencode(
                     module_or_module_class,

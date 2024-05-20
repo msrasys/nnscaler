@@ -153,6 +153,10 @@ if __name__ == '__main__':
         use_pipeline=args.pp_size > 1,
         pipeline_nmicros=args.gbs // args.mbs,
         pipeline_nstages=args.pp_size,
+        pas_config={  # for autodist only
+            'update_freq': args.gbs // args.mbs,
+            'use_fp16': args.fp16,
+        },
         user_config=nnscaler.UserConfig(
             graph={
                 'mbs': args.mbs,
@@ -165,9 +169,6 @@ if __name__ == '__main__':
                 'pp_size': args.pp_size,
                 'tp_size': args.tp_size,
                 'dp_size': args.dp_size,
-                'pas': {
-                    'update_freq': args.gbs // args.mbs,  # for autodist only
-                }
             }
         )
     )
