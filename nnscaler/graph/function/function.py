@@ -255,66 +255,119 @@ def Linspace(start, end, steps, *, out=None, dtype=None,
     return CubeLinspace(start, end, steps, dtype, requires_grad=requires_grad)
 
 
+def creation_function_args_check(op_name, *, generator=None, dtype=None, layout=None, device=None, memory_format=None):
+    if generator is not None:
+        raise ValueError(f"not support non-default generator for {op_name}")
+    if dtype is not None and not isinstance(dtype, torch.dtype):
+        raise ValueError(f"only supports torch.dtype for {op_name} but got {dtype}")
+    if layout not in (None, torch.strided):
+        raise ValueError(f"not support non-default layout for {op_name}")
+    if memory_format is not None:
+        raise ValueError(f"not support non-default memory_format for {op_name}")
+    if device is not None:
+        _logger.warning(f"not support manual device in {op_name}, the device will be ignored")
+
+
+def creation_function_size_check(op_name, size, *arg_size) -> Tuple[Union[int, IRObject]]:
+    size_val = _unwrap_value(size)
+    if isinstance(size_val, int):
+        size = (size, *arg_size)
+    elif isinstance(size_val, (tuple, list)):
+        if len(arg_size) > 0:
+            raise ValueError(f"get illegal input size={size}, arg_size={arg_size} in {op_name}")
+        # convert scalar to shape (1,) tensor, nnscaler don't support empty shape [] now.
+        if len(size_val) == 0:
+            _logger.warn(f"detect tensor creation function {op_name} create a scalar, force it to create a shape [1] tensor instead")
+            size = (1,)
+    else:
+        raise ValueError(f"get unknown input type size={size} in {op_name}")
+    return size
+
+
 def Empty(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
           pin_memory=False, memory_format=None, signature=None):
-    # note: device is ignored
-    assert layout in (None, torch.strided) and memory_format is None, f"Not support for non-default memory_format and layout"
+    """
+    torch.empty(*size, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False, pin_memory=False,
+                memory_format=torch.contiguous_format) → Tensor
+    """
     dtype = dtype if dtype is not None else torch.get_default_dtype()
-    assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
+    creation_function_args_check('torch.empty', dtype=dtype, layout=layout, device=device, memory_format=memory_format)
+
+    # using nnscaler runtime function is because we need set device on the correct device during runtime
     signature = 'nnscaler.runtime.function.empty'
-    size = (size,) if isinstance(size, (int, IRObject)) else tuple(size)
-    size: Tuple[Union[int, IRObject]] = size + arg_size
+    size = creation_function_size_check('torch.empty', size, *arg_size)
     kwargs = {'size': size, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
-    anno, rules = _get_creator_anno_rules(
-        tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
+    anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
     return IRDimops(Empty, 'empty', signature, [anno], [], rules, **kwargs)
 
 
 def Zeros(size, *arg_size, out=None, dtype=None, layout=None,
           device=None, requires_grad=False, signature=None):
-    # note: device is ignored
-    assert layout in (None, torch.strided), f"Not support for non-strided layout, get {layout}"
+    """
+    torch.zeros(*size, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False) → Tensor
+    """
     dtype = dtype if dtype is not None else torch.get_default_dtype()
-    assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
+    creation_function_args_check('torch.zeros', dtype=dtype, layout=layout, device=device)
+
+    # using nnscaler runtime function is because we need set device on the correct device during runtime
     signature = 'nnscaler.runtime.function.zeros'
-    size = (size,) if isinstance(size, (int, IRObject)) else tuple(size)
-    size: Tuple[Union[int, IRObject]] = size + arg_size
+    size = creation_function_size_check('torch.zeros', size, *arg_size)
     kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
-    anno, rules = _get_creator_anno_rules(
-        tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
+    anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
     return IRDimops(Zeros, 'zeros', signature, [anno], [], rules, **kwargs)
 
 
 def Ones(size, *arg_size, out=None, dtype=None, layout=None,
          device=None, requires_grad=False, signature=None):
-    # note: device is ignored
-    assert layout in (None, torch.strided), f"Not support for non-strided layout, get {layout}"
+    """
+    torch.ones(*size, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False) → Tensor
+    """
     dtype = dtype if dtype is not None else torch.get_default_dtype()
-    assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
+    creation_function_args_check('torch.ones', dtype=dtype, layout=layout, device=device)
+
+    # using nnscaler runtime function is because we need set device on the correct device during runtime
     signature = 'nnscaler.runtime.function.ones'
-    size = (size,) if isinstance(size, (int, IRObject)) else tuple(size)
-    size: Tuple[Union[int, IRObject]] = size + arg_size
+    size = creation_function_size_check('torch.ones', size, *arg_size)
     kwargs = {'size': size, 'requires_grad': requires_grad, 'dtype': dtype}
-    anno, rules = _get_creator_anno_rules(
-        tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
+    anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
     return IRDimops(Ones, 'ones', signature, [anno], [], rules, **kwargs)
 
 
 def Rand(size, *arg_size, out=None, dtype=None, layout=None, device=None, requires_grad=False,
          pin_memory=False, memory_format=None, signature=None):
-    # note: device is ignored
-    assert layout in (None, torch.strided) and memory_format is None, f"Not support for non-default memory_format and layout"
+    """
+    torch.rand(*size, *, generator=None, out=None, dtype=None, layout=torch.strided, device=None,
+               requires_grad=False, pin_memory=False) → Tensor
+    """
     dtype = dtype if dtype is not None else torch.get_default_dtype()
-    assert isinstance(dtype, torch.dtype), f"only supports torch.dtype but got {dtype}"
+    creation_function_args_check('torch.rand', dtype=dtype, layout=layout, device=device, memory_format=memory_format)
+
+    # using nnscaler runtime function is because we need set device on the correct device during runtime
     signature = 'nnscaler.runtime.function.rand'
-    size = (size,) if isinstance(size, (int, IRObject)) else tuple(size)
-    size: Tuple[Union[int, IRObject]] = size + arg_size
+    size = creation_function_size_check('torch.rand', size, *arg_size)
     kwargs = {'size': size, 'requires_grad': requires_grad,
               'dtype': dtype, 'pin_memory': pin_memory}
-    anno, rules = _get_creator_anno_rules(
-        tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
+    anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
     return IRDimops(Rand, 'rand', signature, [anno], [], rules, **kwargs)
+
+
+def Randn(size, *arg_size, generator=None, out=None, dtype=None, layout=None, device=None, requires_grad=False,
+         pin_memory=False, memory_format=None, signature=None):
+    """
+    torch.randn(*size, *, generator=None, out=None, dtype=None, layout=torch.strided, device=None,
+                requires_grad=False, pin_memory=False) → Tensor
+    """
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    creation_function_args_check('torch.randn', generator=generator, dtype=dtype, layout=layout, device=device, memory_format=memory_format)
+
+    # using nnscaler runtime function is because we need set device on the correct device during runtime
+    signature = 'nnscaler.runtime.function.randn'
+    size = creation_function_size_check('torch.randn', size, *arg_size)
+    kwargs = {'size': size, 'requires_grad': requires_grad,
+              'dtype': dtype, 'pin_memory': pin_memory}
+    anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
+    return IRDimops(Randn, 'randn', signature, [anno], [], rules, **kwargs)
 
 
 def Full(size, fill_value, *, out=None, dtype=None, layout=None,
@@ -322,13 +375,13 @@ def Full(size, fill_value, *, out=None, dtype=None, layout=None,
     """
     torch.full(size, fill_value, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False)
     """
-    assert layout in (None, torch.strided), f"Not support for non-default layout"
     dtype = dtype if dtype is not None else torch.get_default_dtype()
+    creation_function_args_check('torch.full', dtype=dtype, layout=layout, device=device)
+
+    # using nnscaler runtime function is because we need set device on the correct device during runtime
     signature = 'nnscaler.runtime.function.full'
-    # cube treat scalar as size (1,) tensor now, scalar support will in another pr if necessary
-    size = tuple(size) if size else (1,)
-    anno, rules = _get_creator_anno_rules(
-        tuple(dim.value if isinstance(dim, IRObject) else dim for dim in size), True)
+    size = creation_function_size_check('torch.full', size)
+    anno, rules = _get_creator_anno_rules(_unwrap_value(size), True)
     return IRDimops(Full, 'full', signature, [anno], [], rules,
                      size=size, fill_value=fill_value, dtype=dtype, requires_grad=requires_grad)
 
@@ -338,6 +391,9 @@ def NewTensor(data, *, dtype=None, device=None,
     """
     torch.tensor(data, *, dtype=None, device=None, requires_grad=False, pin_memory=False)
     """
+    creation_function_args_check('torch.ones', device=device)
+
+    # using nnscaler runtime function is because we need set device on the correct device during runtime
     signature = 'nnscaler.runtime.function.tensor'
 
     val = data
@@ -512,7 +568,8 @@ def BitwiseOr(input, other, *, out=None, signature=None):
     if (not isinstance(input, IRObject)) and (not isinstance(other, IRObject)):
         return input | other
     assert isinstance(input, IRTensor) and isinstance(other, IRTensor)
-    annos = ['*, * -> *']
+    lshape, rshape, oshape = _handle_broadcast(input, other)
+    annos = [OpAnno.create_op_str([lshape, rshape], [oshape])]
     return IRDimops(BitwiseOr, 'bitwise_or', signature, annos, [input, other])
 
 
@@ -523,6 +580,20 @@ def BitwiseNot(input, *, out=None, signature=None):
     assert isinstance(input, IRTensor)
     annos = ['* -> *']
     return IRDimops(BitwiseNot, 'bitwise_not', signature, annos, [input])
+
+
+def IsNan(input, *, signature=None):
+    """
+    torch.isnan(input) → Tensor
+    """
+    return IRDimops(IsNan, 'isnan', signature, ['* -> *'], [input])
+
+
+def IsInf(input, *, signature=None):
+    """
+    torch.isinf(input) → Tensor
+    """
+    return IRDimops(IsInf, 'isinf', signature, ['* -> *'], [input])
 
 
 # TODO: this function should rewrite with pytree
@@ -1031,6 +1102,27 @@ def Sum(input, dim=None, keepdim=False, *, dtype=None, signature = None):
                 eoutput.pop(dimidx)
         anno = OpAnno.create_op_str([einput], [eoutput])
         return IRDimops(Sum, 'sum', signature, [anno], [input], dim=dim, keepdim=keepdim)
+
+
+def TorchAny(input, dim=None, keepdim=False, *, out=None, signature = None):
+    """
+    torch.any(input) -> Tensor
+    torch.any(input, dim, keepdim=False, *, out=None) -> Tensor
+    """
+    einput = ShapeAnno.create_shape_str(input.shape, '^')
+    dim_value = _unwrap_value(dim)
+    if dim_value is None:
+        anno = OpAnno.create_op_str([einput], [['1']])
+        return IRDimops(TorchAny, 'any', signature, [anno], [input])
+    else:
+        eoutput = copy.copy(einput)
+        keepdim_value = _unwrap_value(keepdim)
+        if keepdim_value:
+            eoutput[dim] = '1'
+        else:
+            eoutput.pop(dim)
+        anno = OpAnno.create_op_str([einput], [eoutput])
+        return IRDimops(TorchAny, 'any', signature, [anno], [input], dim=dim, keepdim=keepdim)
 
 
 def Mean(input, dim=None, keepdim=False, *, dtype=None, signature = None):
@@ -2134,10 +2226,24 @@ def GetItem(a: Any, b: Any, signature = None) -> Union[Any, IRPyFunc]:
     return obj[index]
 
 
-def SetItem(__a: Any, __b: Any, __c: Any, signature = None) -> Union[Any, IRPyFunc]:
-    """_operator.setitem(__a, __b, __c) / nnscaler.runtime.function.setitem(__a, __b, __c)"""
+def SetItem(__a: Any, __b: Any, __c: Any, *additonal, signature = None) -> Union[Any, IRPyFunc]:
+    """
+    _operator.setitem(__a, __b, __c) / nnscaler.runtime.function.setitem(__a, *__bc)
+    
+    If __a is a IRTensor and __b is a tuple, __b will be flatten to ensure we can give each element an annotation,
+    and the returned value is a IRDimops.
+    If __a is a IRObject, the returned value is a IRPyFunc.
+
+    Note that in IRDimops.new, __c might not the original __c of the setitem during parse, it may be one of the elements of the flatten __b,
+    in this case, original __c is the last element in additonal, original __b is (__b, __c, *additonal[:-1]).
+    """
     signature = 'nnscaler.runtime.function.setitem'
-    obj, index, val = __a, __b, __c
+    # additional is used to receive additional parameters due to __b flatten
+    # unflatten __b here if additional is not empty
+    if len(additonal) > 0:
+        obj, index, val = __a, (__b, __c, *additonal[:-1]), additonal[-1]
+    else:
+        obj, index, val = __a, __b, __c
     if isinstance(obj, IRTensor):
         # TODO: move to some function like FullSlice when ready
         # TODO: give a IRTensor as return value or return a IRDimops
@@ -2149,13 +2255,15 @@ def SetItem(__a: Any, __b: Any, __c: Any, signature = None) -> Union[Any, IRPyFu
         edim_ins = [edim_obj]
 
         # index annotation
-        if isinstance(index, IRTensor):
-            edim_index = ShapeAnno.create_shape_str(index.shape, '^', iterator=gener)
-            edim_ins.append(edim_index)
-        elif isinstance(index, IRObject) and any_ir_object_satisfy(index, lambda a: isinstance(a, IRTensor)):
-            raise RuntimeError(f"setitem did not support slicers include tensor now, got {index}")
-        else:
-            edim_ins.append(['?'])
+        idxes = index if isinstance(index, tuple) else (index,)
+        for idx in idxes:
+            if isinstance(idx, IRTensor):
+                edim_index = ShapeAnno.create_shape_str(idx.shape, '^', iterator=gener)
+                edim_ins.append(edim_index)
+            elif isinstance(idx, IRObject) and any_ir_object_satisfy(idx, lambda a: isinstance(a, IRTensor)):
+                raise RuntimeError(f"setitem did not support slicers include tensor now, got {idx}")
+            else:
+                edim_ins.append(['?'])
 
         # value annotation
         if isinstance(val, IRTensor):
@@ -2165,7 +2273,8 @@ def SetItem(__a: Any, __b: Any, __c: Any, signature = None) -> Union[Any, IRPyFu
             edim_ins.append(['?'])
 
         anno = OpAnno.create_op_str(edim_ins, [edim_out])
-        return IRDimops(SetItem, 'setitem', signature, [anno], [obj, index, val])
+        # because we cannot annotate the tensor inside tuple/dict, so here we flatten the idxes.
+        return IRDimops(SetItem, 'setitem', signature, [anno], [obj, *idxes, val])
 
     is_constant = not ir_object_contains_dynamic(index)
     index = _unwrap_value(index)
@@ -2233,17 +2342,59 @@ def NLLLoss(input, target, weight=None, size_average=None,
     torch.nn.functional.nll_loss(input, target, weight=None, size_average=None,
                                  ignore_index=-100, reduce=None, reduction='mean')
     """
-    assert weight is None
-    annos = [
-        'C^, N -> 1',
-        'N+ C, N+ -> 1',
-        'N+ C *, N+ * -> 1'
-    ]
+    if weight is not None:
+        raise NotImplementedError("weight has not support for torch.nn.functional.nll_loss")
+    if _unwrap_value(reduction) == 'none':
+        annos = [
+            'C^, N -> N',
+            'N C^, N -> N',
+            'N C^ *, N * -> N *'
+        ]
+    elif _unwrap_value(reduction) == 'sum':
+        annos = [
+            'C^, N -> 1',
+            'N+ C^, N+ -> 1',
+            'N+ C^ *, N+ * -> 1'
+        ]
+    elif _unwrap_value(reduction) == 'mean':
+        # TODO(nishang): here should consider about the ignore idx and the scale of the result if we apply tp
+        # for now, we give '^' to all anno, only replicated is allowed for mean reduction.
+        annos = [
+            'C^, N^ -> 1',
+            'N^ C^, N^ -> 1',
+            'N^ C^ *, N^ * -> 1'
+        ]
+    else:
+        raise NotImplementedError(f'unknow reduction in torch.nn.functional.nll_loss: {reduction}')
     return IRDimops(
         NLLLoss, 'nll_loss',
         signature, annos, [input, target],
         weight=weight, size_average=size_average, ignore_index=ignore_index,
         reduce=reduce, reduction=reduction)
+
+
+def L1Loss(input, target, size_average=None, reduce=None, reduction='mean', signature=None):
+    """
+    torch.nn.functional.l1_loss(input, target, size_average=None, reduce=None, reduction='mean')
+    """
+    if not isinstance(input, IRTensor) or not isinstance(target, IRTensor):
+        raise ValueError(f"expect input and target are IRTensor, but get input={input} and target={target}")
+    if input.shape != target.shape:
+        raise ValueError(f"shape mismatched, input shape is {input.shape}, target shape is {target.shape}")
+    if _unwrap_value(reduction) == 'none':
+        annos = ['*, * -> *']
+    elif _unwrap_value(reduction) == 'sum':
+        edim_in = ShapeAnno.create_shape_str(input.shape, '+')
+        annos = [OpAnno.create_op_str([edim_in, edim_in], ['1'])]
+    elif _unwrap_value(reduction) == 'mean':
+        # TODO(nishang): I don't know how to give a correct tp anno, the result of loss will be scaled by tp number if we apply tp
+        # for now, we give '^' to all anno, only replicated is allowed for mean reduction.
+        edim_in = ShapeAnno.create_shape_str(input.shape, '^')
+        annos = [OpAnno.create_op_str([edim_in, edim_in], ['1'])]
+    else:
+        raise NotImplementedError(f'unknow reduction in torch.nn.functional.l1_loss: {reduction}')
+    return IRDimops(L1Loss, 'l1_loss', signature, annos, [input, target],
+                    size_average=size_average, reduce=reduce, reduction=reduction)
 
 
 def MakeTuple(inputs: Iterable, signature=None):
@@ -2283,7 +2434,7 @@ def ScaledDotProductAttention(query, key, value, attn_mask=None, dropout_p=0.0,
     For a common attention, the generated anno is like (a e d^, a b^ d^, a b^ c -> a e c).
     """
     if not isinstance(query, IRTensor) or not isinstance(key, IRTensor) or not isinstance(value, IRTensor):
-        raise RuntimeError(f'query: {query}, key: {key}, value: {value} should be IRTensor, something went wrong.')
+        raise ValueError(f'query: {query}, key: {key}, value: {value} should be IRTensor, something went wrong.')
     gener = iter(string.ascii_lowercase)
     value_anno = ShapeAnno.create_shape_str(value.shape, iterator=gener)
     value_anno[-2] += '^'
@@ -2297,9 +2448,9 @@ def ScaledDotProductAttention(query, key, value, attn_mask=None, dropout_p=0.0,
     out_anno[-1] = value_anno[-1]
     if attn_mask is not None:
         if not isinstance(attn_mask, IRTensor):
-            raise RuntimeError(f'attn_mask: {attn_mask} should be IRTensor, something went wrong.')
+            raise ValueError(f'attn_mask: {attn_mask} should be IRTensor, something went wrong.')
         if len(attn_mask.shape) < 2 or len(attn_mask.shape) > len(query.shape):
-            raise RuntimeError(f'attn_mask shape {attn_mask.shape} is not supported, while query shape is {query.shape}')
+            raise ValueError(f'attn_mask shape {attn_mask.shape} is not supported, while query shape is {query.shape}')
         attn_mask_anno = []
         # the anno of attn_mask will conbine query and attn_mask shape except last dimension,
         # the last dimension of the attn_mask anno will be the same as key penultimate dimension
@@ -2378,8 +2529,7 @@ def FullLike(input, fill_value, *, dtype=None, layout=None,
     """
     torch.full_like(input, fill_value, \*, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=torch.preserve_format) → Tensor
     """
-    if not (layout in (None, torch.strided) and memory_format is None):
-        raise ValueError("Not support for non-default memory_format and layout")
+    creation_function_args_check('torch.full_like', dtype=dtype, layout=layout, memory_format=memory_format)
     kwargs = {'fill_value': fill_value, 'requires_grad': requires_grad,'dtype': dtype}
     shape = ShapeAnno.create_shape_str(input.shape)
     annos = [OpAnno.create_op_str([shape], [shape])]
@@ -2390,30 +2540,44 @@ def ZerosLike(input, *, dtype=None, layout=None, device=None, requires_grad=Fals
     """
     torch.zeros_like(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format) → Tensor
     """
-    if not (layout in (None, torch.strided) and memory_format is None):
-        raise ValueError("Not support for non-default memory_format and layout")
-    dtype = dtype if dtype is not None else torch.get_default_dtype()
-    if not isinstance(dtype, torch.dtype):
-        raise TypeError("only supports torch.dtype but got {}".format(dtype))
+    creation_function_args_check('torch.zeros_like', dtype=dtype, layout=layout, memory_format=memory_format)
     kwargs = {'requires_grad': requires_grad, 'dtype': dtype}
     shape = ShapeAnno.create_shape_str(input.shape)
     annos = [OpAnno.create_op_str([shape], [shape])]
-    return IRDimops(ZerosLike, 'zeros_like', signature, annos,[input],**kwargs)
+    return IRDimops(ZerosLike, 'zeros_like', signature, annos, [input], **kwargs)
 
 
 def OnesLike(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=None, signature=None):
     """
     torch.ones_like(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format) → Tensor
     """
-    if not (layout in (None, torch.strided) and memory_format is None):
-        raise ValueError("Not support for non-default memory_format and layout")
-    dtype = dtype if dtype is not None else torch.get_default_dtype()
-    if not isinstance(dtype, torch.dtype):
-        raise TypeError("only supports torch.dtype but got {}".format(dtype))
+    creation_function_args_check('torch.ones_like', dtype=dtype, layout=layout, memory_format=memory_format)
     kwargs = {'requires_grad': requires_grad, 'dtype': dtype}
     shape = ShapeAnno.create_shape_str(input.shape)
     annos = [OpAnno.create_op_str([shape], [shape])]
-    return IRDimops(OnesLike, 'onesLike', signature, annos,[input],**kwargs)
+    return IRDimops(OnesLike, 'ones_like', signature, annos, [input], **kwargs)
+
+
+def RandLike(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=None, signature=None):
+    """
+    torch.rand_like(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format) → Tensor
+    """
+    creation_function_args_check('torch.rand_like', dtype=dtype, layout=layout, memory_format=memory_format)
+    kwargs = {'requires_grad': requires_grad, 'dtype': dtype}
+    shape = ShapeAnno.create_shape_str(input.shape)
+    annos = [OpAnno.create_op_str([shape], [shape])]
+    return IRDimops(RandLike, 'rand_like', signature, annos, [input], **kwargs)
+
+
+def RandnLike(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=None, signature=None):
+    """
+    torch.randn_like(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format) → Tensor
+    """
+    creation_function_args_check('torch.randn_like', dtype=dtype, layout=layout, memory_format=memory_format)
+    kwargs = {'requires_grad': requires_grad, 'dtype': dtype}
+    shape = ShapeAnno.create_shape_str(input.shape)
+    annos = [OpAnno.create_op_str([shape], [shape])]
+    return IRDimops(RandnLike, 'randn_like', signature, annos, [input], **kwargs)
 
 
 def Addmm(input: IRTensor, mat1: IRTensor, mat2: IRTensor, *, beta=1, alpha=1, out=None, signature = None):
@@ -2551,16 +2715,69 @@ def Conv1D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, 
                     stride=stride, padding=padding, dilation=dilation, groups=ori_groups)
 
 
+def SVD(input, some=True, compute_uv=True, *, out=None, signature=None):
+    """
+    torch.svd(input, some=True, compute_uv=True, *, out=None)
+
+    NOTE: the signature of torch.linalg.svd is different with torch.svd, don't forward torch.linalg.svd to this function
+    """
+    if not isinstance(input, IRTensor):
+        raise ValueError(f"expect input is an IRTensor, but get input={input}")
+    if len(input.shape) < 2:
+        raise ValueError(f"expect input at least a 2-D tensor, but get input with shape {input.shape}")
+
+    some_value = _unwrap_value(some)
+    compute_uv_value = _unwrap_value(compute_uv)
+
+    in_shape = ShapeAnno.create_shape_str(input.shape, '^')
+    m, n = input.shape[-2:]
+    # for the some is False or compute_uv is False
+    o1_shape = copy.copy(in_shape)
+    o1_shape[-1] = o1_shape[-2]
+    o2_shape = [in_shape[-1] if m > n else in_shape[-2]]
+    o3_shape = copy.copy(in_shape)
+    o3_shape[-2] = o3_shape[-1]
+
+    if some_value and compute_uv_value:
+        o1_shape[-1] = in_shape[-2] if m < n else in_shape[-1]
+        o3_shape[-1] = in_shape[-2] if m < n else in_shape[-1]
+
+    annos = [OpAnno.create_op_str([in_shape], [o1_shape, o2_shape, o3_shape])]
+    return IRDimops(SVD, 'svd', signature, annos, [input], some=some, compute_uv=compute_uv)
+
+
+def Diag(input, diagonal=0, *, out=None, signature=None):
+    """
+    torch.diag(input, diagonal=0, *, out=None) -> Tensor
+    """
+    assert isinstance(input, IRTensor)
+    diagonal_value = _unwrap_value(diagonal)
+    if len(input.shape) == 1:
+        dim_len = input.shape[0]
+        odim_len = dim_len + abs(diagonal_value)
+        anno = f'{dim_len} -> {odim_len} {odim_len}'
+    else:
+        # TODO: in fact, we can partition with modifier here, will do it latter
+        if diagonal_value >= 0:
+            outlen = min(input.shape[0], input.shape[1] - diagonal_value)
+        else:
+            outlen = min(input.shape[0] + diagonal_value, input.shape[1])
+        anno = f'{input.shape[0]} {input.shape[1]} -> {max(0, outlen)}'
+    return IRDimops(Diag, 'diag', signature, [anno], [input], diagonal=diagonal)
+
+
 def Gather(input: IRTensor, dim, index: IRTensor, sparse_grad=False, out=None, signature=None):
     """
     torch.gather(input, dim, index, *, sparse_grad=False, out=None) -> Tensor
     """
-    if not (0 <= dim < len(input.shape)):
-        raise ValueError(f"Dimension {dim} is out of bounds for input with {len(input.shape)} dimensions.")
+    dim_value = _unwrap_value(dim)
+    if not (-len(input.shape) <= dim_value < len(input.shape)):
+        raise ValueError(f"Dimension {dim_value} is out of bounds for input with {len(input.shape)} dimensions.")
+    dim_value = (dim_value + len(input.shape)) % len(input.shape)
     if len(input.shape) != len(index.shape):
         raise ValueError("The dimensions of 'input' and 'index' must be the same.")
     for i, (dim_input, dim_index) in enumerate(zip(input.shape, index.shape)):
-        if i != dim and dim_index > dim_input:
+        if i != dim_value and dim_index > dim_input:
             raise ValueError(f"Index size {dim_index} at dimension {i} exceeds input size {dim_input} at the same dimension.")
     gener = iter(string.ascii_lowercase)
     input_anno = ShapeAnno.create_shape_str(input.shape, iterator=gener)
@@ -2569,7 +2786,7 @@ def Gather(input: IRTensor, dim, index: IRTensor, sparse_grad=False, out=None, s
         if dim_input != dim_index:
             input_anno[i] += '^'
             index_anno[i] += '^'
-        elif i == dim:
+        elif i == dim_value:
             index_anno[i] = input_anno[i]
             input_anno[i] += '^'
             index_anno[i] += '^'
@@ -2578,8 +2795,8 @@ def Gather(input: IRTensor, dim, index: IRTensor, sparse_grad=False, out=None, s
             # When dynamic shape is enabled, this partition may be incorrect.
             # We keep the partition here for now, and consider reporting errors that cannot be partitioned at run time in future.
             index_anno[i] = input_anno[i]
-    anno = OpAnno.create_op_str([input_anno, index_anno], [index_anno])
-    return IRDimops(Gather, 'gather', signature, [anno], [input, index], dim=dim)
+    anno = OpAnno.create_op_str([input_anno, '?', index_anno], [index_anno])
+    return IRDimops(Gather, 'gather', signature, [anno], [input, dim, index])
 
 
 def Ceil(input: IRTensor, out=None, signature=None):

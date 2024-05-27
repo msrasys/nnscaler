@@ -406,6 +406,9 @@ def test_Setitem():
     op = F.SetItem(IRTensor([3, 4, 5]), IRTensor([3, 4, 5]), IRObject(value=1.))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^, d^ e^ f^, ? -> a^ b^ c^'
 
+    op = F.SetItem(IRTensor([3, 4, 5]), IRTensor([3]), IRObject(value=0), IRObject(value=0), IRObject(value=1.))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^, d^, ?, ?, ? -> a^ b^ c^'
+
 
 def test_Len():
     op = F.Len([1, 2, 3], signature='builtins.len')
@@ -627,28 +630,31 @@ def test_Flatten():
 
 def test_Gather():
     op = F.Gather(IRTensor([2, 5, 3]), 2, IRTensor([2, 5, 1]))
-    expected_annotation = 'a b c^, a b f^ -> a b f^'
+    expected_annotation = 'a b c^, ?, a b f^ -> a b f^'
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
     op = F.Gather(IRTensor([2, 5, 3]), 2, IRTensor([2, 5, 3]))
-    expected_annotation = 'a b c^, a b c^ -> a b c^'
+    expected_annotation = 'a b c^, ?, a b c^ -> a b c^'
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
     op = F.Gather(IRTensor([2, 5, 3]), 2, IRTensor([2, 4, 3]))
-    expected_annotation = 'a b^ c^, a e^ c^ -> a e^ c^'
+    expected_annotation = 'a b^ c^, ?, a e^ c^ -> a e^ c^'
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
     op = F.Gather(IRTensor([2, 5, 3]), 2, IRTensor([1, 3, 1]))
-    expected_annotation = 'a^ b^ c^, d^ e^ f^ -> d^ e^ f^'
+    expected_annotation = 'a^ b^ c^, ?, d^ e^ f^ -> d^ e^ f^'
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
     op = F.Gather(IRTensor([2, 5, 3]), 1, IRTensor([2, 2, 3]))
-    expected_annotation = 'a b^ c, a e^ c -> a e^ c'
+    expected_annotation = 'a b^ c, ?, a e^ c -> a e^ c'
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
     op = F.Gather(IRTensor([2, 5, 3]), 0, IRTensor([1, 5, 3]))
-    expected_annotation = 'a^ b c, d^ b c -> d^ b c'
+    expected_annotation = 'a^ b c, ?, d^ b c -> d^ b c'
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
     op = F.Gather(IRTensor([2, 3]), 1, IRTensor([2, 1]))
-    expected_annotation = 'a b^, a d^ -> a d^'
+    expected_annotation = 'a b^, ?, a d^ -> a d^'
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
     op = F.Gather(IRTensor([2, 3]), 1, IRTensor([1, 1]))
-    expected_annotation = 'a^ b^, c^ d^ -> c^ d^'
+    expected_annotation = 'a^ b^, ?, c^ d^ -> c^ d^'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
+    op = F.Gather(IRTensor([2, 3]), -1, IRTensor([1, 1]))
+    expected_annotation = 'a^ b^, ?, c^ d^ -> c^ d^'
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Gather."
 
 
@@ -687,3 +693,55 @@ def test_Unfold():
 def test_Sigmoid():
     op = F.Sigmoid(IRTensor([2, 3, 4]))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *'
+
+
+def test_BitwiseOr():
+    op = F.BitwiseOr(IRTensor([8, 10]), IRTensor([10]))
+    assert op._annos_candidates[0] == 'a b, b -> a b'
+
+
+def test_TorchAny():
+    op = F.TorchAny(IRTensor([10, 10]))
+    assert op._annos_candidates[0] == 'a^ b^ -> 1'
+
+    op = F.TorchAny(IRTensor([10, 10]), dim=1)
+    assert op._annos_candidates[0] == 'a^ b^ -> a^'
+
+    op = F.TorchAny(IRTensor([10, 10]), dim=1, keepdim=True)
+    assert op._annos_candidates[0] == 'a^ b^ -> a^ 1'
+
+
+def test_L1Loss():
+    op = F.L1Loss(IRTensor([8, 10]), IRTensor([8, 10]), reduction='sum')
+    assert op._annos_candidates[0] == 'a+ b+, a+ b+ -> 1'
+
+    op = F.L1Loss(IRTensor([8, 10]), IRTensor([8, 10]), reduction='mean')
+    assert op._annos_candidates[0] == 'a^ b^, a^ b^ -> 1'
+
+
+def test_SVD():
+    op = F.SVD(IRTensor([3, 4]))
+    assert op._annos_candidates[0] == 'a^ b^ -> a^ a^, a^, b^ a^'
+
+    op = F.SVD(IRTensor([4, 3]))
+    assert op._annos_candidates[0] == 'a^ b^ -> a^ b^, b^, b^ b^'
+
+    op = F.SVD(IRTensor([4, 3]), False)
+    assert op._annos_candidates[0] == 'a^ b^ -> a^ a^, b^, b^ b^'
+
+
+def test_Diag():
+    op = F.Diag(IRTensor([5, 10]), 0)
+    assert op._annos_candidates[0] == '5 10 -> 5'
+
+    op = F.Diag(IRTensor([5, 10]), 5)
+    assert op._annos_candidates[0] == '5 10 -> 5'
+
+    op = F.Diag(IRTensor([5, 10]), 7)
+    assert op._annos_candidates[0] == '5 10 -> 3'
+
+    op = F.Diag(IRTensor([5, 10]), 10)
+    assert op._annos_candidates[0] == '5 10 -> 0'
+
+    op = F.Diag(IRTensor([5, 10]), -1)
+    assert op._annos_candidates[0] == '5 10 -> 4'

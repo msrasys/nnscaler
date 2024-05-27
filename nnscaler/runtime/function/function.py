@@ -141,6 +141,9 @@ def select_scatter(input:torch.Tensor, src:torch.Tensor, dim:int, index:int):
 
 
 def tensor(data, *, dtype=None, requires_grad=False, pin_memory=False):
+    """
+    force set the device to torch.cuda.current_device()
+    """
     return torch.tensor(
         data, dtype=dtype,
         device=torch.cuda.current_device(),
@@ -149,6 +152,9 @@ def tensor(data, *, dtype=None, requires_grad=False, pin_memory=False):
 
 
 def empty(size: Tuple[int], dtype=None, requires_grad=False, pin_memory=False):
+    """
+    force set the device to torch.cuda.current_device()
+    """
     return torch.empty(
         size, dtype=torch.get_default_dtype() if dtype is None else dtype,
         device=torch.cuda.current_device(),
@@ -157,6 +163,9 @@ def empty(size: Tuple[int], dtype=None, requires_grad=False, pin_memory=False):
 
 
 def zeros(size: Tuple[int], dtype=None, requires_grad=False):
+    """
+    force set the device to torch.cuda.current_device()
+    """
     return torch.zeros(
         size, dtype=torch.get_default_dtype() if dtype is None else dtype,
         device=torch.cuda.current_device(),
@@ -165,6 +174,9 @@ def zeros(size: Tuple[int], dtype=None, requires_grad=False):
 
 
 def ones(size: Tuple[int], dtype=None, requires_grad=False):
+    """
+    force set the device to torch.cuda.current_device()
+    """
     return torch.ones(
         size, dtype=torch.get_default_dtype() if dtype is None else dtype,
         device=torch.cuda.current_device(),
@@ -172,14 +184,34 @@ def ones(size: Tuple[int], dtype=None, requires_grad=False):
     )
 
 
-def rand(size: Tuple[int], dtype=None, requires_grad=False):
+def rand(size: Tuple[int], dtype=None, requires_grad=False, pin_memory=False):
+    """
+    force set the device to torch.cuda.current_device()
+    """
     return torch.rand(
         size, dtype=torch.get_default_dtype() if dtype is None else dtype,
         device=torch.cuda.current_device(),
-        requires_grad=requires_grad
+        pin_memory=pin_memory,
+        requires_grad=requires_grad,
     )
 
+
+def randn(size: Tuple[int], dtype=None, requires_grad=False, pin_memory=False):
+    """
+    force set the device to torch.cuda.current_device()
+    """
+    return torch.randn(
+        size, dtype=torch.get_default_dtype() if dtype is None else dtype,
+        device=torch.cuda.current_device(),
+        pin_memory=pin_memory,
+        requires_grad=requires_grad,
+    )
+
+
 def full(size: Tuple[int], fill_value, dtype=None, requires_grad=False):
+    """
+    force set the device to torch.cuda.current_device()
+    """
     return torch.full(
         size, fill_value, dtype=dtype, requires_grad=requires_grad,
         device=torch.cuda.current_device()
@@ -218,7 +250,18 @@ def nndropout(input: torch.Tensor, p=0.5, inplace=False):
     return torch.nn.Dropout(p, inplace)(input)
 
 
-def setitem(__a, __b, __c):
+def setitem(__a, *__bc):
+    """
+    If __bc has more than 2 elements, that means idxs are flatten becasue idxs contains tensor.
+    In this runtime function, idxs will be structured as a tuple if they are flatten,
+    and return __a to make this inplace operation trackable.
+    """
+    if len(__bc) < 2:
+        raise ValueError(f'at least two arguments needed, but get __bc={__bc}')
+    elif len(__bc) == 2:
+        __b, __c = __bc[0], __bc[1]
+    else:
+        __b, __c = __bc[:-1], __bc[-1]
     operator.setitem(__a, __b, __c)
     return __a
 
