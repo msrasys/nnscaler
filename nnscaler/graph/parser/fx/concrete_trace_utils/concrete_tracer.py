@@ -408,10 +408,9 @@ class ConcreteTracer(TracerBase):
                 raise RuntimeError()
             return result
 
-        if self.cpu_offload:
-            args, kwargs = tree_to_cuda(args), tree_to_cuda(kwargs)
-
         try:
+            if self.cpu_offload:
+                args, kwargs = tree_to_cuda(args), tree_to_cuda(kwargs)
             result = run(kind, target, args, kwargs)
         except torch.cuda.OutOfMemoryError:
             if self.cpu_offload:

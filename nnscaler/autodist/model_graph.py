@@ -238,7 +238,8 @@ def aggregate_train_mem(sub_nodes: List[IRFwOperation], db) -> int:
                 train_mem += mem
             else:
                 t = node.inputs()[in_idx]
-                if t not in visited_tensors:
+                # `t` also can be any other unhashable var, if we set ? in annotation
+                if isinstance(t, IRTensor) and t not in visited_tensors:
                     train_mem += mem
                     visited_tensors.add(t)
     return train_mem
