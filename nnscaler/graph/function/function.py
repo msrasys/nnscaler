@@ -953,12 +953,15 @@ def Topk(input, k, dim=None, largest=True, sorted=True, *, out=None, signature =
     torch.topk(input, k, dim=None, largest=True, sorted=True, *, out=None)
     """
     edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_ou = copy.copy(edim_in)
+    k = _unwrap_value(k)
     if dim is None:
         edim_in[-1] += '^'
+        edim_ou[-1] = str(k)
     else:
         edim_in[dim] += '^'
-    edim_ou = [['?'], ['?']]
-    anno = OpAnno.create_op_str([edim_in], edim_ou)
+        edim_ou[dim] = str(k)
+    anno = OpAnno.create_op_str([edim_in], [edim_ou, edim_ou])
     return IRDimops(Topk, 'topk', signature, [anno], [input], k=k, dim=dim, largest=largest, sorted=sorted)
 
 
@@ -1369,6 +1372,8 @@ def View(input, size: Tuple[int], *arg_size, signature = None):
     """
     out = torch.Tensor.view(tensor: torch.Tensor, *size)
     """
+    if isinstance(size, torch.dtype):
+        raise ValueError(f"View by dtype is not supported: {size}")
     in_shape = list(input.shape)
     if isinstance(size, IRObject):
         assert size.value is not None, f"shape should have a reference value but got: {size}"
@@ -1818,9 +1823,7 @@ def FullSlice(tensor: IRTensor, *slicers: Tuple[Union[None, slice, int, IRTensor
         else:
             raise RuntimeError(f"Unsupported slicer {slicer}. you may need to wrap related logic in a Customized Op.")
 
-    if output_shape_unkonwn:
-        edim_ou = ['?']
-    else:
+    if not output_shape_unkonwn:
         edim_ou += edim_in[in_idx:]
         if len(edim_ou) == 0:
             # special case for scalar = torch.Tensor([1,2,3])[0]
@@ -1828,6 +1831,16 @@ def FullSlice(tensor: IRTensor, *slicers: Tuple[Union[None, slice, int, IRTensor
 
     edim_in = [edim_in]
     edim_in.extend(edim_in_additional)
+
+    if output_shape_unkonwn:
+        edim_ou = ['?']
+        for i in range(len(edim_in)):
+            for j in range(len(edim_in[i])):
+                # current implementation doesn't use '()', so we don't consider it to simply the code
+                assert '(' not in edim_in[i][j], 'no () is supposed to be used'
+                if not edim_in[i][j].endswith(('^', '+', '?')):
+                    edim_in[i][j] += '^'
+
     anno = OpAnno.create_op_str(edim_in, [edim_ou])
 
     return IRDimops(FullSlice, 'fullslice', signature, [anno], [tensor] + slicers)

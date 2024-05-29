@@ -181,6 +181,20 @@ def test_Repeat():
         op = F.Repeat(inp, o(2))
 
 
+def test_Topk():
+    op = F.Topk(IRTensor([3, 4, 5]), 3)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c^ -> a b 3, a b 3'
+    op = F.Topk(IRTensor([3, 4, 5]), 3, dim = 1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c -> a 3 c, a 3 c'
+
+
+def test_Nonzero():
+    op = F.Nonzero(IRTensor([3, 4, 5]), as_tuple=True)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> ?, ?, ?'
+    op = F.Nonzero(IRTensor([3, 4, 5]), as_tuple=False)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> ?'
+
+
 def test_Where():
     op = F.Where(IRTensor([3, 4]), IRTensor([3, 4]), IRTensor([3, 4]))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b, a b, a b -> a b'
@@ -228,7 +242,7 @@ def test_FullSlice():
     op = F.FullSlice(IRTensor([3, 4]), IRFullTensor([2,2]))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b, c d -> c d b'
     op = F.FullSlice(IRTensor([3, 4]), [True, False, True])
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b, ? -> ?'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^, ? -> ?'
     op = F.FullSlice(IRTensor([3, 4]), IRFullTensor([3], dtype=torch.bool), 0)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^, c^, ? -> ?'
     op = F.FullSlice(IRTensor([3, 4]), [True, False, True], [0,1])
@@ -264,7 +278,7 @@ def test_GetItem():
     op = F.GetItem(IRTensor([3, 4, 2]), [slice(None), IRTensor([3, 5], dtype=torch.int64)])
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c, ?, d e -> a d e c'
     op = F.GetItem(IRTensor([3, 4, 2]), [slice(None), IRTensor([4, 2], dtype=torch.bool)])
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b^ c^, ?, d^ e^ -> ?'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^, ?, d^ e^ -> ?'
 
     # obj is IRObject
     op = F.GetItem(IRObject(value=[3, 4, 5], is_constant=False), IRObject(value=0, is_constant=False), signature='operator.getitem')
