@@ -41,6 +41,80 @@ class AttrMeta:
     # (i.e., no partition on value -> no need to sum up)
     val_chunks: int
 
+
+def dedup_attrs(rank2attr_area_map: Dict[int, Dict[str, AttrMeta]]) -> Dict[int, Dict[str, AttrMeta]]:
+    '''
+    Deduplicate the attributes according to `rank2attr_area_map`.
+    For each `slicers` of a full tensor with the name `orig_name`, we only store its first appearance
+    in the `rank2attr_area_map`.
+    In addition, we will check
+    - the shape of the full tensor is consistent across different ranks
+    - the slicers of the full tensor are not intersected with each other
+    - the slicers of the full tensor can cover the full tensor
+    The input and output attribute area map's key is the local attribute name.
+
+    Args:
+        rank2attr_area_map (Dict[int, Dict[str, AttrMeta]]): the mapping from rank to the attribute area map
+
+    Returns:
+        Dict[int, Dict[str, AttrMeta]]: the deduplicated attribute area map
+    '''
+    # assume ranks in rank2attr_area_map are in increasing order
+    ranks = list(rank2attr_area_map.keys())
+    for i in range(1, len(ranks)):
+        assert ranks[i - 1] < ranks[i], f'rank {ranks[i - 1]} should be less than rank {ranks[i]}'
+
+    orig_name2slice_info = defaultdict(list)
+    orig_name2shape = dict()
+
+    def need_save(slicers: Tuple[slice, ...], saved_slicers_list: List[Tuple[slice, ...]]) -> bool:
+        for saved_slicers in saved_slicers_list:
+            assert len(slicers) == len(saved_slicers), f'If two slicers are related to one same full tensor, lengths should be equal, but get {slicers} vs {saved_slicers}'
+            if slicers == saved_slicers:
+                return False
+            # if slicers intersect with saved_slicers, raise error
+            for s, ss in zip(slicers, saved_slicers):
+                if s == ss:
+                    continue
+                if s.start < ss.stop and s.stop > ss.start:
+                    raise RuntimeError(f'intersected slicers {slicers} vs {saved_slicers}')
+        return True
+
+    ret = dict()
+    for rank, attr_area_map in rank2attr_area_map.items():
+        dedup_attr_area_map = dict()
+        for attr, attr_meta in attr_area_map.items():
+            assert attr_meta.val_chunks == 1, 'not support partitioning on value dimension'
+            if attr_meta.orig_name not in orig_name2shape:
+                orig_name2shape[attr_meta.orig_name] = attr_meta.shape
+            else:
+                assert orig_name2shape[attr_meta.orig_name] == attr_meta.shape, \
+                    f'unmatched shape {orig_name2shape[attr_meta.orig_name]} vs {attr_meta.shape}'
+            if need_save(attr_meta.slicers, orig_name2slice_info[attr_meta.orig_name]):
+                orig_name2slice_info[attr_meta.orig_name].append(attr_meta.slicers)
+                dedup_attr_area_map[attr] = attr_meta
+        ret[rank] = dedup_attr_area_map
+
+    # since we
+    # - skip saving when there are identical weights
+    # - assert the slicers are disjoint
+    # we can use the sum of the sub-slicers to verify the full tensor is covered
+    for orig_name, slicerss in orig_name2slice_info.items():
+        shape = orig_name2shape[orig_name]
+        full_size = 1
+        for s in shape:
+            full_size *= s
+        covered_size = 0
+        for slicers in slicerss:
+            size = 1
+            for s in slicers:
+                size *= s.stop - s.start
+            covered_size += size
+        assert full_size == covered_size, f'uncovered size for {orig_name} with shape {shape}, slicerss {slicerss}'
+
+    return ret
+
+
 class CubeModule(torch.nn.Module):
     """
     The module is responsible for parameter synchronization
