@@ -2,7 +2,7 @@
 Register cutomized function
 """
 
-from typing import Dict, Callable, Optional, Union
+from typing import Dict, Callable, Optional, Union, List
 from functools import partial
 import inspect
 import logging
@@ -11,7 +11,7 @@ from torch import ScriptFunction
 
 from nnscaler.graph.function.dimops import IRDimops, OpAnno
 from nnscaler.graph.parser.fx.concrete_trace_utils.concrete_tracer import is_autograd_apply
-from nnscaler.ir.operator import IRTensor
+from nnscaler.ir.operator import IRTensor, IRFwOperation
 
 _logger = logging.getLogger(__name__)
 
@@ -25,6 +25,10 @@ class CustomizedOps:
     kOpRuntime: Dict[str, Callable] = {}
     # signature -> runtime function implementation code
     kOpCodeDef: Dict[str, str] = {}
+    # signature -> special emit function, will not store if emit_fn is None
+    # It accepts the node, repred args, repred kwargs, runtime_devid, plan_ndevs, runtime_ndevs
+    # as input and returns the generated code.
+    kOpEmit: Dict[str, Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str]] = {}
 
     @staticmethod
     def map(signature: str) -> Callable:
@@ -46,7 +50,8 @@ class CustomizedOps:
         return signature in CustomizedOps.kOpMap
 
     @staticmethod
-    def register(signature: str, op_create_fn: Callable, code: str, runtime_fn: Callable):
+    def register(signature: str, op_create_fn: Callable, code: str, runtime_fn: Callable,
+                 emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None):
         """Register an operator
 
         Args:
@@ -54,6 +59,9 @@ class CustomizedOps:
             op_create_fn (Callable): IRDimops creation function
             code (str): runtime function implementation code
             runtime_fn (Callable): runtime function
+            emit_fn (Callable): special emit function for codegen, will use default emit function if emit_fn is None.
+                                It accepts the node, repred args, repred kwargs, runtime_devid, plan_ndevs, runtime_ndevs
+                                as input and returns the generated code.
 
         Returns:
             None
@@ -65,10 +73,12 @@ class CustomizedOps:
         CustomizedOps.kOpMap[signature] = op_create_fn
         CustomizedOps.kOpRuntime[signature] = runtime_fn
         CustomizedOps.kOpCodeDef[signature] = code
+        if emit_fn is not None:
+            CustomizedOps.kOpEmit[signature] = emit_fn
 
 
 def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
-             code_impl_pattern: str = 'import') -> Callable:
+             code_impl_pattern: str = 'import', emit_fn: Callable[[IRFwOperation, List[str], Dict[str, str], int, int, int], str] = None) -> Callable:
     """
     Register a function with IRDimops annotations.
 
@@ -123,6 +133,10 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             can only be 'import' or 'source'. If 'import', will generate code with
             import statement. If 'source', will take the source code directly.
             Default: 'import'.
+        emit_fn (Callable): special emit function for codegen, this emit accepts the node, repred args, repred kwargs, runtime_devid,
+            plan_ndevs, runtime_ndevs as input and returns the generated code. Check examples/zigzag_ring_attention/zigzag_attn.py
+            for more details.
+            Default: None.
 
     Returns:
         fn (Callable): the runtime function
@@ -221,7 +235,7 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
 
         # step 4. register in CustomizedOps
         _logger.info(f'registering op {fsig}...')
-        CustomizedOps.register(fsig, udfop, code, fn)
+        CustomizedOps.register(fsig, udfop, code, fn, emit_fn)
         return fn
 
     return decorator

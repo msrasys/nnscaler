@@ -424,7 +424,7 @@ class ModuleCodeGen(FuncEmission):
         for node in sequence:
             if isinstance(node, IRSegment):
                 if not node.isfw(): continue  # skip backward segment
-                codes = self.emit_segment(node)
+                codes = self.emit_segment(node, device)
             elif isinstance(node, IRFwOperation):
                 raise RuntimeError(f"Unexcepted global-level op call: {node}")
             elif isinstance(node, IRAdapter):
@@ -700,7 +700,7 @@ class ModuleCodeGen(FuncEmission):
         add_code = reducer_add.format(reducer=reducer_name)
         self.model_init_statements.append(add_code)
 
-    def emit_segment(self, segment: IRSegment) -> List[str]:
+    def emit_segment(self, segment: IRSegment, runtime_devid: int) -> List[str]:
         """
         Emit IRSegment code.
 
@@ -740,12 +740,12 @@ class ModuleCodeGen(FuncEmission):
             assert len(rc_group) > 0
             gid: Optional[int] = rc_group[0].recompute
             if gid is None:
-                codes += self._emit_nodes(rc_group, lifetime)
+                codes += self._emit_nodes(rc_group, lifetime, runtime_devid)
             else:
                 # get recompute excution code
                 rc_segment = segment.create_segment(rc_group)
                 rc_codes = self._emit_recompute(rc_group,
-                    rc_segment.inputs(), rc_segment.outputs(), lifetime)
+                    rc_segment.inputs(), rc_segment.outputs(), lifetime, runtime_devid)
                 codes += rc_codes
                 # release input tensors after exiting a RC group:
                 last_node = rc_group[-1]
@@ -758,7 +758,7 @@ class ModuleCodeGen(FuncEmission):
 
         return codes
 
-    def _emit_nodes(self, nodes: List[IRCell], lifecycle: LifeCycle) -> List[str]:
+    def _emit_nodes(self, nodes: List[IRCell], lifecycle: LifeCycle, runtime_devid: int) -> List[str]:
         """
         Emit code to invoke operations and adapter,
         e.g. (the lines are split into `List[str]`)
@@ -777,7 +777,7 @@ class ModuleCodeGen(FuncEmission):
         for node in nodes:
             # execute
             if isinstance(node, IRFwOperation):
-                code = self.emit_fnode(node, prefix_attr='self.')
+                code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=len(self.devices), runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
                 node_codes += code
             elif isinstance(node, IRAdapter):
                 # for adapters inside an IRSegment, we don't apply async communication to it
@@ -794,7 +794,7 @@ class ModuleCodeGen(FuncEmission):
         return node_codes
 
     def _emit_recompute(self, nodes: Tuple[IRCell], inputs: List[IRSubTensor], outputs: List[IRSubTensor],
-                        lifecycle: LifeCycle) -> List[str]:
+                        lifecycle: LifeCycle, runtime_devid: int) -> List[str]:
         """
         Emit code to define a Python function for Recomputing and invoke it
         e.g. (the lines are split into `List[str]`)
@@ -845,7 +845,7 @@ class ModuleCodeGen(FuncEmission):
 
             # for ncode in ModuleCodeGen._emit_nodes(nodes, lifecycle):
             #     fb.insert_body(ncode)
-            fb.insert_body(self._emit_nodes(nodes, lifecycle))
+            fb.insert_body(self._emit_nodes(nodes, lifecycle, runtime_devid))
             fb.insert_body(f'return {output_names_tuple}')
         codes = [''] + fb.code + ['']
         codes.append(

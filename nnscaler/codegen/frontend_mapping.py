@@ -1,11 +1,12 @@
 # Some operators should be specially handled during codegen to the frontend code,
 # here we define the customized rule for code emisson.
 
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from nnscaler import ir
 from nnscaler.ir.cten import IRTensor
 from nnscaler.ir.operator import IRFwOperation
+from nnscaler.graph.parser.register import CustomizedOps
 
 
 class Sign2EmitRule:
@@ -27,9 +28,12 @@ class Sign2EmitRule:
         Returns:
             Callable: emit rule that takes the node, args (List[str]) and kwargs (Dict[str, str]) as input
         """
-        return self._sign2rule.get(signature, self.emit_common)
+        if signature in CustomizedOps.kOpEmit:
+            return CustomizedOps.kOpEmit[signature]
+        else:
+            return self._sign2rule.get(signature, self.emit_common)
 
-    def emit_common(self, node: IRFwOperation, args: List[str], kwargs: Dict[str, str]) -> str:
+    def emit_common(self, node: IRFwOperation, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
         """Default rule to join all args and kwargs"""
 
         signature = node.signature
@@ -42,7 +46,7 @@ class Sign2EmitRule:
         args = ", ".join(list(args) + kw_pairs)
         return f"{signature}({args})"
 
-    def emit_slice(self, node: IRFwOperation, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
+    def emit_slice(self, node: IRFwOperation, arg_vars: List[str], kw_pairs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
         """Special rule for generating slice node
 
         The op is:
@@ -71,7 +75,7 @@ class Sign2EmitRule:
 
         return f"{in_tensor_var}[{', '.join(subscript_components)}]"
 
-    def emit_setattr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str]) -> str:
+    def emit_setattr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
         """Special rule for generating setattr node
         """
         assert False, f"This emit rule is deprecated, please report if you reach here"

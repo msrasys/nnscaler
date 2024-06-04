@@ -157,7 +157,7 @@ class FuncEmission(CodeEmission):
         outputs = self.return_name(node.outputs())
         return [f'{outputs} = next({self.tensor_name(node.input(0))})']
 
-    def emit_fnode(self, node: IRFwOperation, prefix_attr: str = None) -> List[str]:
+    def emit_fnode(self, node: IRFwOperation, runtime_devid: int, plan_ndevs: int, runtime_ndevs: int, prefix_attr: str = None) -> List[str]:
         """Emit forward node code
 
         The result will look like (the lines are split into `List[str]`)
@@ -168,6 +168,16 @@ class FuncEmission(CodeEmission):
 
         The fields storing intermediate codes that are populated by this method:
         -   NONE
+
+        Args:
+            node (IRFwOperation): the forward node to emit
+            runtime_devid (int): the device id at the runtime
+            plan_ndevs (int): the number of devices in the scale unit
+            runtime_ndevs (int): the number of devices at the runtime, which is a multiple of `plan_ndevs`
+            prefix_attr (str): prefix to the tensor name
+
+        Returns:
+            List[str]: the lines of the statements of the final Python code
         """
         assert isinstance(node, IRFwOperation)
         codes = []
@@ -190,7 +200,7 @@ class FuncEmission(CodeEmission):
         kwargs = IRSegment.modify_objects_of_complex(kwargs, modifier)
 
         emit_rule = self._emit_rules.map(signature)
-        body = emit_rule(node, inputs, kwargs)
+        body = emit_rule(node, inputs, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)
 
         if len(node.outputs()) == 0:
             code = body

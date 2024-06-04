@@ -30,6 +30,6 @@ def test_tensor_name():
 
 def test_emit_module_attr():
     dropout = Dropout(IRFullTensor([1024, 1024], requires_grad=True), p=0.5, training='self.training', signature='torch.nn.functional.dropout')
-    code = FuncEmission().emit_fnode(dropout)
+    code = FuncEmission().emit_fnode(dropout, runtime_devid=0, plan_ndevs=1, runtime_ndevs=1)
     print(code)
     assert 'training=self.training' in code[0]
