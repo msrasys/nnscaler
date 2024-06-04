@@ -6,6 +6,8 @@ pre-commit
 pytest
 pytest-cov
 pytest-mock
+scikit-learn
+lightning
 sphinx
 sphinxcontrib-napoleon
 tabulate
