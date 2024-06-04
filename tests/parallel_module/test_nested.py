@@ -14,7 +14,7 @@ def _to_cube_model(module, pas, compute_config, cube_savedir):
         {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
         pas,
         compute_config,
-        cube_savedir=cube_savedir
+        gen_savedir=cube_savedir
     )
 
 class Module0(torch.nn.Module):
@@ -44,7 +44,7 @@ def _nested_module_worker():
             def forward(self, x):
                 return self.module1(x)
 
-        with pytest.raises(RuntimeError, match='CubeModule can not be nested.'):
+        with pytest.raises(RuntimeError, match='Parallel modules can not be nested.'):
             _to_cube_model(Module2(), 'data', ComputeConfig(1, 1), cube_savedir=tempdir)
 
 

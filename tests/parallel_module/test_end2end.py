@@ -120,7 +120,7 @@ def gpu_worker_cube(runtime_ngpus, plan_ngpus, policy, use_pipeline, nstages=Non
                 use_pipeline=use_pipeline, pipeline_nmicros=nmicros, pipeline_nstages=nstages,
                 pipeline_scheduler=pipeline_scheduler
             ),
-            cube_savedir=tempdir
+            gen_savedir=tempdir
         )
         model.cuda()
         train_result = _train_cube(model, nmicros, runtime_ngpus // plan_ngpus, torch.distributed.get_rank() // plan_ngpus)
@@ -330,7 +330,7 @@ def gpu_worker_cube_one_sample():
                 use_pipeline=True, pipeline_nmicros=2, pipeline_nstages=2,
                 pipeline_scheduler='1f1b'
             ),
-            cube_savedir=tempdir
+            gen_savedir=tempdir
         )
         model.cuda()
         train_result = _train_cube_one_sample(model, 2)

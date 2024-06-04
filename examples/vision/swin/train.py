@@ -153,24 +153,22 @@ if __name__ == '__main__':
         use_pipeline=args.pp_size > 1,
         pipeline_nmicros=args.gbs // args.mbs,
         pipeline_nstages=args.pp_size,
-        pas_config={  # for autodist only
+        pas_config={
+            # customized settings that can affect code generation.
+            '_pas_name': args.policy,
+            '_gbs': args.gbs,
+            '_pp_size': args.pp_size,
+            '_tp_size': args.tp_size,
+            '_dp_size': args.dp_size,
+            # for autodist only
             'update_freq': args.gbs // args.mbs,
             'use_fp16': args.fp16,
         },
-        user_config=nnscaler.UserConfig(
-            graph={
-                'mbs': args.mbs,
-                'fp16': args.fp16,
-                'src_hash': src_hash(),
-            },
-            code={
-                'pas_name': args.policy,
-                'gbs': args.gbs,
-                'pp_size': args.pp_size,
-                'tp_size': args.tp_size,
-                'dp_size': args.dp_size,
-            }
-        )
+        user_config={
+            'mbs': args.mbs,
+            'fp16': args.fp16,
+            'src_hash': src_hash(),
+        }
     )
 
     train(args, compute_config)

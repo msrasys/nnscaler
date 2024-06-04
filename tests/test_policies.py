@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nnscaler.parallel import ComputeConfig, UserConfig, parallelize
+from nnscaler.parallel import ComputeConfig, parallelize
 
 from .utils import init_random
 
@@ -51,7 +51,7 @@ def test_autodist():
                     'update_freq': 1,
                     'task_name': 'test_autodist',
             }),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False
         )
         assert m_new is None

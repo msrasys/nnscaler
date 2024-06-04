@@ -22,6 +22,6 @@ def test_script_func():
             {'a': torch.rand(10), 'b': torch.rand(10)},
             'tp',
             ComputeConfig(2, 2),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False
         )

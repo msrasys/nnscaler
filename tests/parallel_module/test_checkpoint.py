@@ -14,7 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 import numpy as np
 
-from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dicts, UserConfig
+from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dicts
 from nnscaler.runtime.module import ParallelModule, ExtraState
 from nnscaler.runtime.gnorm import calcuate_gnorm
 
@@ -50,7 +50,7 @@ def _to_cube_model(module, pas, compute_config, cube_savedir, instance_name, dum
         dummy_input if dummy_input is not None else {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},
         pas,
         compute_config,
-        cube_savedir=cube_savedir,
+        gen_savedir=cube_savedir,
         instance_name=instance_name
     )
 
@@ -99,7 +99,7 @@ class End2EndMLP(nn.Module):
             {'data': pipeline_dummy_data()},
             PASMegatron,
             compute_config,
-            cube_savedir=cube_savedir,
+            gen_savedir=cube_savedir,
             instance_name=instance_name
         )
 

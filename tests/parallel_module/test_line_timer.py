@@ -29,7 +29,7 @@ def _to_cube_model(module, compute_config, cube_savedir, instance_name, input_sh
         {'x': torch.randn(input_shape)},
         'tp',
         compute_config,
-        cube_savedir=cube_savedir,
+        gen_savedir=cube_savedir,
         instance_name=instance_name,
         init_module_params=init_module_params
     )

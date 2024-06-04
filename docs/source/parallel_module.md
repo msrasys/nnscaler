@@ -1,6 +1,8 @@
 # Parallel Module
 
-Cube can parallelize a `torch.nn.Module` to a parallel module. A parallel module is a special `torch.nn.Module` but runs in multiple gpus/nodes. All the complexity of distributed training/inferring is hidden from the user.
+nnScaler can parallelize a `torch.nn.Module` to a parallel module.
+A parallel module is a special `torch.nn.Module` but runs in multiple gpus/nodes.
+All the complexity of distributed training/inferring is hidden from the user.
 
 Currently we support three kinds of parallelism: data parallelism, tensor parallelism and pipeline parallelism (model parallelism). We can also combine them to get the best performance.
 
@@ -181,11 +183,6 @@ def train(model: ParallelizedPipelinedLLM, data):
 The configuration of the compute environment. It is a dataclass with the following fields:
 ```python
 
-@dataclass
-class UserConfig:
-    graph: Dict[str, Any] = field(default_factory=dict)
-    code: Dict[str, Any] = field(default_factory=dict)
-
 @dataclass(frozen=True)
 class ComputeConfig:
     plan_ngpus: int
@@ -205,7 +202,7 @@ class ComputeConfig:
     pipeline_scheduler: Optional[str] = None
 
     pas_config: Dict[str, Any] = field(default_factory=dict)
-    user_config: UserConfig = field(default_factory=UserConfig)
+    user_config: Dict[str, Any] = field(default_factory=dict)
 ```
 We can categorize the fields into 4 categories:
 
@@ -226,11 +223,11 @@ We can categorize the fields into 4 categories:
     - `pipeline_nmicros`: the number of microbatches in the pipeline.
     - `pipeline_nstages`: the number of stages in the pipeline.
     - `pipeline_scheduler`: the scheduler name for the pipeline. Current we support four schedulers in training `1f1b`/`1f1b_plus`/`gpipe`/`chimera_direct` (4 stages pipeline only), and one scheduler in inference `infer_pipe`.
-    - `pas_config`: the configuration for the PAS policy. It is a dictionary, and will be used by the PAS policy. Please note different PAS will have different configurations, and please check the PAS policy for details.
-4. User configuration
-    - user_config: the user configuration,which is used to decide whether skipping compiling and reusing the previously compiled parallel module. It has two categories of configuration:
-        - `graph`: the graph related configuration, which is used to decide whether skipping graph generation only.
-        - `code`: if it has changed, the code will be regenerated.
+    - `pas_config`: the configuration for the PAS policy (partition-assign-schedule policy, which describes how to place all computations across devices. For details, please refer to [PAS Policies](#pas-policies)).
+    It is a dictionary, and will be used by the PAS policy.
+    Please note different PAS will have different configurations,
+    You can also put any other settings that can affect code generation here. but please prefix the keys with `_` to avoid conflicts with PAS configurations.
+    - `user_config`: the user configuration, which is used to decide whether skipping compiling and reusing the previously traced graph.
 
 Note:
 1.  You can put any custom configurations in `user_config`. The assumption is different `user_config` should generate different graph/code. So if the user config is changed, we will regenerate the graph/code automatically. Here are some examples:
@@ -245,7 +242,7 @@ Note:
             if module_config.use_3d:
             ...
         ```
-        here we can set `user_config.graph` to `{'use_3d': module_config.use_3d}`,
+        here we can set `user_config` to `{'use_3d': module_config.use_3d}`,
         and we can be sure different use_3d config will never use the same graph (and eventually the generated code).
 
     - Example 2: save file stats
@@ -259,13 +256,23 @@ Note:
             h.update(f.read())
         compute_config = {
             ....,
-            user_config: UserConfig(
-                graph = {
-                    'files_md5': h.hexdigest()
-                }
-            )
+            user_config: {
+                'files_md5': h.hexdigest()
+            }
         }
         ```
+2.  If some settings doesn't affect tracing/graph generation, but do affect code generation, you can put them in `pas_config`. Please prefix the keys with `_` to avoid conflicts with predefined PAS configurations. One typical example is you can put the name of selected PAS policy in `pas_config`, so changing PAS policy will regenerate code but the graph will be reused.
+
+    ```python
+    compute_config = ComputeConfig(
+        ...
+        pas_config={
+            '_pas_name': ...,
+            # PAS policy specific configurations
+            ...
+        },
+    )
+    ```
 
 ### ReuseType
 
@@ -280,10 +287,10 @@ class ReuseType(Enum):
 ```
 We call it a `match` when the `ComputeConfig` is the same with the previous run.
 
-1. MATCH: Reuse if match, error if not match, generate if no previous gerenated code exists.
-2. OVERRIDE: Nothing will be reused. Everything will be regenerated.
-3. MOO: MOO is short for 'match or override'. It will reuse if match, generate if not match or no previous generated code exists.
-4. GRAPH: Reuse graph only if match, generate otherwise.
+1. `MATCH`: Reuse if match, error if not match, generate if no previous gerenated code exists.
+2. `OVERRIDE`: Nothing will be reused. Everything will be regenerated.
+3. `MOO`: `MOO` is short for 'match or override'. It will reuse if match, generate if not match or no previous generated code exists.
+4. `GRAPH`: Reuse graph only if match, generate otherwise.
 
 ### BroadcastGenFilesStrategy
 
@@ -363,7 +370,7 @@ def parallelize(
     pas_policy: Callable[[IRGraph, ComputeConfig], IRGraph],
     compute_config: ComputeConfig,
     *,
-    cube_savedir: Union[str, Path] = './.cube',
+    gen_savedir: Union[str, Path] = './.nnscaler',
     reuse: Union[ReuseType, str] = ReuseType.MATCH,
     instance_name: Optional[str] = None,
     load_module: bool = True,
@@ -379,13 +386,16 @@ It has the following parameters:
 
 - `dummy_input` (`dict`): the dummy input for the module. The keys are the argument names of `Module.forward` function, and the values are the dummy input for the arguments. The dummy input will be used to trace the module. Please note the module can't be parallelize if `Module.forward` has positional-only arguments.
 
-- `pas_policy` (`Union[str, Callable[[IRGraph, ComputeConfig], IRGraph]]`): the pas (partition-assign-schedule) policy, which describes how to place all computations across devices. You need either pass a builtin PAS policy name or a a custom policy function which should take an `IRGraph` and a `ComputeConfig` as input, and return a new `IRGraph` with the PAS policy applied. We have 6 builtin PAS policies: `dp`, `tp`, `pp`, `data`, `hybrid`, and `autodist`. Please note all builtin PAS policies except `autodist` are only for test purpose. The `autodist` policy is the recommended policy for most cases. For details, please refer to `PAS Policies` section.
+- `pas_policy` (`Union[str, Callable[[IRGraph, ComputeConfig], IRGraph]]`): the pas (partition-assign-schedule) policy, which describes how to place all computations across devices.
+You need either pass a builtin PAS policy name or a a custom policy function which should take an `IRGraph` and a `ComputeConfig` as input, and return a new `IRGraph` with the PAS policy applied.
+ We have 6 builtin PAS policies: `dp`, `tp`, `pp`, `data`, `hybrid`, and `autodist`. Please note all builtin PAS policies except `autodist` are only for test purpose. The `autodist` policy is the recommended policy for most cases.
+ For details, please refer to [PAS Policies](#pas-policies) section.
 
 - `compute_config` (`ComputeConfig`): the environment resource
 
 - `reuse` (`ReuseType`): specify which part can be reused.
 
-- `cube_savedir` (`Union[str, Path]`): the directory to save generated code
+- `gen_savedir` (`Union[str, Path]`): the directory to save generated code
 
 - `instance_name` (`Optional[str]`): the instance name of the generated module. If it is `None`, will use the default name `_`.
 
@@ -406,10 +416,10 @@ See more details in the `ParallelModule APIs` section.
 
 Note:
 
-1. This function can be used to convert both module object and module class to cube module or cube module class.
+1. This function can be used to convert both module object and module class to parallel module or parallel module class.
 Among key-value arguments,
 `module_fn` and `module_dtype` control how to create the module object.
-whereas `init_module_params` controls how to load cube module object after parallelization is done.
+whereas `init_module_params` controls how to load parallel module object after parallelization is done.
 
 2. If you want to save multiple instances of the same module (with different configurations),
 you can specify the `instance_name` to distinguish them.
@@ -445,14 +455,14 @@ To support distributed training, in the function we need to hook 4 places (which
 
 1. optimizer constructor:
     the parameters of optimizer will not be the same with the parameters of the module if we use zero.
-    So we need to replace the parameters of optimizer with `CubeModule.parameters_for_optimizer`.
+    So we need to replace the parameters of optimizer with `ParallelModule.parameters_for_optimizer`.
 
 2. `optimizer.step()`:
     we need to call `optimizer.sync_shard_grad()` to sync the gradients of the module before `optimizer.step()`.
-    In zero mode, we have to call `CubeModule.gather_params()` after `optimizer.step()`
+    In zero mode, we have to call `ParallelModule.gather_params()` after `optimizer.step()`
 
 3. `optimizer.zero_grad()`:
-    We need to call `CubeModule.zero_grad()` after `optimizer.zero_grad()`
+    We need to call `ParallelModule.zero_grad()` after `optimizer.zero_grad()`
 
 `build_optimizer` will patch optimizer for you. Besides the above patches, we also add several utility functions/variables to optimizer:
 
@@ -540,7 +550,7 @@ The configuration of the PAS policy should be passed in the `pas_config` of `Com
 5. `hybrid`: pipeline parallelism + tensor parallelism + data parallelism. It will do model parallelism and tensor parallelism(on 0 dimension) inside a scale unit, and run data parallelism across scale units. It requires the `use_end2end`  and `use_pipeline` to be true. It has no configurations.
 
 6. `autodist`: the recommended policy for most cases. Currently it only support Adam-like optimizers. It will automatically choose the best partition for you by balancing the memory usage and speed. It has the following configurations.
-    - `update_freq (int)`: the update frequency when training the module. Required.
+    - `update_freq (int)`: the update frequency when training the module. Default is 1. Optional.
     - `mem_constraint (float)`: The memory constraint in each device in GB. Optional.
     - `task_name (str)`: The name of the current task to distinguish runs. Optional.
     - `use_fp16 (bool)`: Whether you use `fp16`. Default is `False`. Optional.
@@ -557,6 +567,35 @@ The configuration of the PAS policy should be passed in the `pas_config` of `Com
     - `use_apex_fused_adam_v2`: If set to `True`, the apex fused adam v2 optimizer will be used. Default is `False`. Optional.
 
 Please note all options to `autodist` are just suggestions. `autodist` will try to find the best partition for you, which may not be the same with your suggestions.
+
+ You can also put any other settings that can affect code generation here. but please prefix the keys with `_` to avoid conflicts with predefined keys.
+
+Here is an example:
+```python
+compute_config = ComputeConfig(
+    plan_ngpus=...,
+    runtime_ngpus=...,
+    use_zero=...,
+    pas_config={
+        '__pas_name': ...,   # addtional configurations that can affect code generation.
+        'update_freq': ...,
+        'mem_constraint': ...,
+        'task_name': ...,
+        'use_fp16': ...,
+        'use_memory_efficient_fp16': ...,
+        'use_bf16': ...,
+        'use_memory_efficient_bf16': ...,
+        're_profile': ...,
+        'verbose': ...,
+        'load_plan_path': ...,
+        'save_plan_path': ...,
+        'partition_constraints_path': ...,
+        'recompute_modules': ...,
+        'pipeline_pivots': ...,
+        'use_apex_fused_adam_v2': ...,
+    },
+)
+```
 
 ### Checkpoint support
 

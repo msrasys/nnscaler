@@ -17,7 +17,7 @@ def _to_cube_model(module, compute_config, cube_savedir, load_module):
         {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
         'data',
         compute_config,
-        cube_savedir=cube_savedir,
+        gen_savedir=cube_savedir,
         load_module=load_module
     )
 
@@ -63,7 +63,7 @@ def test_codegen_slice():
             {'x': torch.tensor([1.0, 2.0, 3.0, 6.0])},
             'dp',
             ComputeConfig(1, 1),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False
         )
         assert m_new is None
@@ -91,7 +91,7 @@ def test_codegen_args():
                 },
                 'dp',
                 ComputeConfig(1, 1),
-                cube_savedir=tempdir,
+                gen_savedir=tempdir,
                 load_module=True
             )
 
@@ -118,7 +118,7 @@ def _gencode_unused_args_worker(tempdir):
          },
         'dp',
         ComputeConfig(1, 1),
-        cube_savedir=tempdir,
+        gen_savedir=tempdir,
         load_module=True
     )
     assert m_new is not None
@@ -170,7 +170,7 @@ def _gencode_unused_args_worker2(tempdir):
          },
         'dp',
         ComputeConfig(1, 1),
-        cube_savedir=tempdir,
+        gen_savedir=tempdir,
         load_module=True
     )
     assert m_new is not None
@@ -215,7 +215,7 @@ def test_codegen_default_args():
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
             'dp',
             ComputeConfig(1, 1),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False
         )
         # parallelize will succeed.
@@ -231,10 +231,10 @@ class AttrModule(torch.nn.Module):
 
 
 def _gencode_contains(cubesave_dir, module_class, index, search_re):
-    from nnscaler.parallel import _CUBE_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
+    from nnscaler.parallel import _PARALLEL_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
     from pathlib import Path
     import re
-    namespace = f'{_CUBE_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{_DEFAULT_INSTANCE_NAME}'
+    namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{_DEFAULT_INSTANCE_NAME}'
     outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
     filecontent = (outdir /f'gencode{index}.py').read_text()
     matches = re.findall(search_re, filecontent)
@@ -253,7 +253,7 @@ def test_codegen_attr():
             {'x': torch.tensor([1.0, 2.0, 3.0, 6.0]), 'attr': AttrHelper()},
             'dp',
             ComputeConfig(1, 1),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False
         )
         # in old version, all 'forward' functions will patched to a function named 'new_func'
@@ -285,7 +285,7 @@ def test_codegen_getitem():
             {'batched_data': {'x': torch.tensor([[[1.0], [2.0], [3.0], [6.0]]])}},
             'tp',
             ComputeConfig(2, 2),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False,
         )
         assert _gencode_contains(tempdir, GetItemModule, 0, r'_operator.getitem\(.*, slice\(None, 2, None\)\)')
@@ -315,7 +315,7 @@ def test_codegen_training_flag():
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
             'dp',
             ComputeConfig(1, 1),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False
         )
 
@@ -374,7 +374,7 @@ def test_codegen_iter():
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
             'dp',
             ComputeConfig(1, 1),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False
         )
 
@@ -404,7 +404,7 @@ def test_codegen_const():
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
             'dp',
             ComputeConfig(1, 1),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False
         )
         assert not _gencode_contains(tempdir, ConstantModule, 0, r'\s+5 = builtins.int')
@@ -443,7 +443,7 @@ def test_codegen_tensor_slice():
                 {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
                 'dp',
                 ComputeConfig(1, 1),
-                cube_savedir=tempdir,
+                gen_savedir=tempdir,
                 load_module=False,
                 reuse='override',
             )
@@ -454,7 +454,7 @@ def test_codegen_tensor_slice():
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
             'dp',
             ComputeConfig(1, 1),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False,
             reuse='override',
         )
@@ -481,7 +481,7 @@ def test_codegen_dictget():
             }},
             'tp',
             ComputeConfig(2, 2),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False,
         )
         assert _gencode_contains(tempdir, DictGetModule, 0, r"dict.get\(\w+, 'y', \w+\)")
@@ -526,7 +526,7 @@ def _gencode_min_function_worker(tempdir):
         },
         'dp',
         ComputeConfig(1, 1),
-        cube_savedir=tempdir,
+        gen_savedir=tempdir,
         load_module=True
     )
     assert m_new is not None
@@ -562,7 +562,7 @@ def _gencode_max_function(tempdir):
         },
         'dp',
         ComputeConfig(1, 1),
-        cube_savedir=tempdir,
+        gen_savedir=tempdir,
         load_module=True
     )
     assert m_new is not None
@@ -603,7 +603,7 @@ def test_codegen_shared_parameter():
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
             'dp',
             ComputeConfig(1, 1),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False,
             reuse='override',
         )
@@ -640,7 +640,7 @@ def test_codegen_buffer():
             {'x': torch.randn(128, 64)},
             'dp',
             ComputeConfig(1, 1),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False,
             reuse='override',
         )
@@ -684,7 +684,7 @@ def test_codegen_inference():
             {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
             'dp',
             ComputeConfig(1, 1, inference_only=True),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False
         )
         assert _gencode_contains(tempdir, Module0, 0,
@@ -721,7 +721,7 @@ def test_codegen_end2end():
                 pipeline_nstages=4,
                 pipeline_scheduler='infer_pipe' if inference_only else '1f1b'
             ),
-            cube_savedir=cube_dir,
+            gen_savedir=cube_dir,
             load_module=False,
             reuse='override',
         )

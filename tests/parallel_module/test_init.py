@@ -3,7 +3,7 @@ import pytest
 
 import torch
 
-from nnscaler.parallel import _load_cube_module_class, parallelize, ComputeConfig
+from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig
 
 from ..launch_torchrun import launch_torchrun
 from .common import CubeLinear, init_distributed, init_random, clear_dir_on_rank0
@@ -26,7 +26,7 @@ def _init_params_worker():
             {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},
             'tp',
             ComputeConfig(1, 1),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             reuse='match',
         )
         module1 = cube_module()
@@ -69,12 +69,12 @@ def test_empty_weights(model_class, tp):
             {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},
             'tp',
             ComputeConfig(2, 4, use_zero=True, zero_ngroups=2),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             reuse='match',
             load_module=False,
         )
         for i in range(4):
-            module_class = _load_cube_module_class(model_class, cube_savedir=tempdir, rank=i)
+            module_class = _load_parallel_module_class(model_class, gen_savedir=tempdir, rank=i)
             m = new_empty(module_class)
             assert m.rank == i
             for p in m.parameters():

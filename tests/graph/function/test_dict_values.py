@@ -8,7 +8,7 @@ from ...utils import replace_all_device_with
 class Model(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-    
+
     def forward(self, x):
         k = list(x.keys())[0]
         v = x[k]
@@ -25,6 +25,6 @@ def test_script_func():
             {'x': {'a': torch.rand(10)}},
             'tp',
             ComputeConfig(2, 2),
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             load_module=False
         )

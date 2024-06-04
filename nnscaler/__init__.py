@@ -1,7 +1,6 @@
 from .version import __version__
 from .parallel import (
     ParallelModule,
-    UserConfig,
     ComputeConfig,
     ReuseType,
     BroadcastGenFilesStrategy,

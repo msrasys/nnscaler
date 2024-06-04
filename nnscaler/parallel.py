@@ -62,40 +62,6 @@ for k, v in policies.__dict__.items():
         _PREDEFINED_POLICIES[k[len(_PREDEFINED_POLICIES_NAME_PREFIX):]] = v
 
 
-@dataclass
-class UserConfig:
-    # you should put any configuration that may affect the traced graph here.
-    # So we can track the changes and make sure the generated code is correct.
-    # Example 1: save module configuration
-    # ```python
-    # class MyModule(torch.nn.Module):
-    #   def __init__(self):
-    #     super().__init__()
-    #   def forward(self, x):
-    #     ...
-    #     if module_config.use_3d:
-    #       ...
-    # ```
-    # here we can set `graph={'use_3d': module_config.use_3d}`,
-    # and we can be sure different use_3d will never use the same generated code.
-    # Example 2: save file stats
-    # If you want to track all related file stats (just like traditional compilers do),
-    # you can save the md5 of the files to save some bytes:
-    # ```python
-    # import hashlib
-    # h = hashlib.md5()
-    # for f in Path('./src').glob('**/*.py'):
-    #   with open(f, 'rb') as f:
-    #     h.update(f.read())
-    # graph = {
-    #   'files_md5': h.hexdigest()
-    # }
-    # ```
-    graph: Dict[str, Any] = field(default_factory=dict)
-    # you can put any configuration that may affect the generated code (but not affect the traced graph) here.
-    code: Dict[str, Any] = field(default_factory=dict)
-
-
 @dataclass(frozen=True)
 class ComputeConfig:
     plan_ngpus: int
@@ -126,9 +92,38 @@ class ComputeConfig:
     # it is pas's responsibility to apply the scheduler
     pipeline_scheduler: str = '1f1b'
     # PAS policy settings
+    # you can also put any other settings that can affect code generation here.
+    # but please prefix the keys with `_` to avoid conflicts with predefined keys.
     pas_config: Dict[str, Any] = field(default_factory=dict)
     # the customized configs from user that can affect the graph and code generation.
-    user_config: UserConfig = field(default_factory=UserConfig)
+    # you should put any configuration that may affect the traced graph here.
+    # So we can track the changes and make sure the generated code is correct.
+    # Example 1: save module configuration
+    # ```python
+    # class MyModule(torch.nn.Module):
+    #   def __init__(self):
+    #     super().__init__()
+    #   def forward(self, x):
+    #     ...
+    #     if module_config.use_3d:
+    #       ...
+    # ```
+    # here we can set `graph={'use_3d': module_config.use_3d}`,
+    # and we can be sure different use_3d will never use the same generated code.
+    # Example 2: save file stats
+    # If you want to track all related file stats (just like traditional compilers do),
+    # you can save the md5 of the files to save some bytes:
+    # ```python
+    # import hashlib
+    # h = hashlib.md5()
+    # for f in Path('./src').glob('**/*.py'):
+    #   with open(f, 'rb') as f:
+    #     h.update(f.read())
+    # graph = {
+    #   'files_md5': h.hexdigest()
+    # }
+    # ```
+    user_config: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.plan_ngpus <= 0:
@@ -162,9 +157,6 @@ class ComputeConfig:
             if not self.inference_only and self.pipeline_scheduler in _PREDEFINED_INFERENCE_SCHEDS:
                 raise ValueError(f"pipeline_scheduler {self.pipeline_scheduler} is not supported in training mode.")
 
-        if isinstance(self.user_config, dict):
-            super().__setattr__('user_config', UserConfig(**self.user_config))
-
     def apply_pipeline_scheduler(self, graph: IRGraph) -> Optional[SchedulePlan]:
         """
         Apply the pipeline scheduler to the graph.
@@ -185,7 +177,7 @@ class ComputeConfig:
     def graph_config(self) -> Dict[str, Any]:
       return {
             'dynamic_shape': self.dynamic_shape,
-            'graph_user_config': self.user_config.graph,
+            'user_config': self.user_config,
             'inference_only': self.inference_only, # there will be no backward nodes in the graph in inference mode
             'use_pipeline': self.use_pipeline,  # pipeline option can affect the graph generation.
             'end2end_mode': self.use_end2end,  # end2end_mode can affect the graph generation.
@@ -351,12 +343,12 @@ def _get_full_qualified_name(obj: Any) -> str:
     return obj.__module__ + '.' + obj.__class__.__qualname__
 
 
-def _add_cube_savedir_to_syspath(cube_savedir: str) -> Path:
-    cube_savedir = Path(cube_savedir).resolve()
-    cube_savedir.mkdir(parents=True, exist_ok=True)
-    if str(cube_savedir) not in sys.path:
-        sys.path.append(str(cube_savedir))
-    return cube_savedir
+def _add_gen_savedir_to_syspath(gen_savedir: str) -> Path:
+    gen_savedir = Path(gen_savedir).resolve()
+    gen_savedir.mkdir(parents=True, exist_ok=True)
+    if str(gen_savedir) not in sys.path:
+        sys.path.append(str(gen_savedir))
+    return gen_savedir
 
 
 def _is_any_gencode_loaded(namespace: str) -> bool:
@@ -395,7 +387,7 @@ def _broadcast_single_value(src_rank, group, obj=None):
 _DEFAULT_INSTANCE_NAME = '_'
 _GENCODE_FILE_PREFIX = 'gencode'
 _GENCODE_FILE_TEMPLATE = _GENCODE_FILE_PREFIX + '{}.py'  # 'gencode{}.py'
-_CUBE_MODULE_NAMESPACE = '_cube_modules'
+_PARALLEL_MODULE_NAMESPACE = '_parallel_modules'
 _GRAPH_DUMP_FILE = 'graph.ckp'
 _FORWARD_ARGS_DUMP_FILE = 'forward_args.pkl'
 
@@ -453,25 +445,25 @@ class RegenStatus(Enum):
 
 
 def _prepare_namespace(
-        cube_savedir: str,
+        gen_savedir: str,
         module_or_module_class: Union[Type[torch.nn.Module], torch.nn.Module],
         instance_name: Optional[str] = None,
 ) -> Tuple[str, Path]:
-    cube_savedir = _add_cube_savedir_to_syspath(cube_savedir)
+    gen_savedir = _add_gen_savedir_to_syspath(gen_savedir)
 
     instance_name = instance_name or _DEFAULT_INSTANCE_NAME
     instance_name = instance_name.strip('.') if instance_name else ''
     instance_namespace = f'.{instance_name}' if instance_name else ''
-    namespace = f'{_CUBE_MODULE_NAMESPACE}.{_get_full_qualified_name(module_or_module_class)}{instance_namespace}'
+    namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_or_module_class)}{instance_namespace}'
 
-    outdir = cube_savedir / Path(namespace.replace('.', '/').strip('/'))
+    outdir = gen_savedir / Path(namespace.replace('.', '/').strip('/'))
     outdir.mkdir(parents=True, exist_ok=True)
 
     return namespace, outdir
 
 
 def _prepare_and_check_reusable(
-        cube_savedir: str,
+        gen_savedir: str,
         module_or_module_class: Union[Type[torch.nn.Module], torch.nn.Module],
         compute_config: ComputeConfig,
         instance_name: Optional[str] = None,
@@ -481,7 +473,7 @@ def _prepare_and_check_reusable(
     Prepare the output directory for code generation, and also check if the existing code is reusable.
 
     Args:
-        cube_savedir (str): the directory to save generated code
+        gen_savedir (str): the directory to save generated code
         module_or_module_class (Union[Type[torch.nn.Module], torch.nn.Module]): the original module or module class
         compute_config (ComputeConfig): the environment resource
         instance_name (Optional[str]): the instance name of the generated module. If it is None, will use the default name.
@@ -494,7 +486,7 @@ def _prepare_and_check_reusable(
         RuntimeError: if the existing code is not reusable,
             will raise RuntimeError if the code is not reusable but the module is already loaded.
     """
-    namespace, outdir = _prepare_namespace(cube_savedir, module_or_module_class, instance_name)
+    namespace, outdir = _prepare_namespace(gen_savedir, module_or_module_class, instance_name)
 
     # decision matrix for code generation
     # reuse flag | dir condition(imported, empty, match, unmatched) | action
@@ -702,14 +694,14 @@ def _gencode(
         module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     ) -> RegenStatus:
     """
-    Generate cube module source code from a torch module, and save it to file.
+    Generate parallel module source code from a torch module, and save it to file.
     Generated module will be save according to its full qualified name.
 
     If you want to save multiple instances of the same module,
     you can specify the instance_name to distingish them.
 
     For example, if the module is `torchscale.x.y`, then the generated module will be save to
-    `cube_savedir/_cube_modules/torchscale/x/y/instance_name`.
+    `gen_savedir/_parallel_modules/torchscale/x/y/instance_name`.
 
     Args:
         module (torch.nn.Module): the module to be compiled
@@ -750,7 +742,7 @@ def _gencode(
             module = module.to(dtype=module_dtype)
 
         if any(isinstance(m, CubeModule) for m in module.modules()):
-            raise RuntimeError('CubeModule can not be nested.')
+            raise RuntimeError('Parallel modules can not be nested.')
 
         # save origin module metadata
         meta_info = OriginModuleMetadata(
@@ -835,22 +827,22 @@ def _gencode(
     return ret
 
 
-def _load_cube_module_class(
+def _load_parallel_module_class(
     module_class: Type[torch.nn.Module],
     *,
-    cube_savedir: Union[str, Path] = './.cube',
+    gen_savedir: Union[str, Path] = './.nnscaler',
     instance_name: Optional[str] = None,
     rank: Optional[int] = None,
 ) -> Type[ParallelModule]:
     """
-    Load the generated cube module class, with train_step and infer_step assigned as member function..
+    Load the generated parallel module class, with train_step and infer_step assigned as member function..
 
 
-    Please note that the cube module class should be generated beforehand by _gencode().
+    Please note that the parallel module class should be generated beforehand by _gencode().
 
     Args:
         module_class (Type[torch.nn.Module]): the original module class
-        cube_savedir (Union[str, Path]): the directory to load generated code
+        gen_savedir (Union[str, Path]): the directory to load generated code
         instance_name (Optional[str]): the instance name of the generated module. If it is None, will use the default name.
         rank (Optional[int]): the rank of the module. If it is None, will get the rank from torch.distributed.get_rank().
             This option is only useful for debugging or writing pre/post-processing tools.
@@ -859,20 +851,20 @@ def _load_cube_module_class(
         Type[ParallelModule]: the generated module class
     """
     rank = torch.distributed.get_rank() if rank is None else rank
-    namespace, _ = _prepare_namespace(cube_savedir, module_class, instance_name)
+    namespace, _ = _prepare_namespace(gen_savedir, module_class, instance_name)
     gen_imported = importlib.import_module(
         f'{namespace}.{Path(_GENCODE_FILE_TEMPLATE.format(rank)).stem}'
     )
-    cube_module_class = gen_imported.GenModel
+    parallel_module_class = gen_imported.GenModel
     # rewrite class name and module name
-    cube_module_class.__name__ = module_class.__name__
-    cube_module_class.__qualname__ = module_class.__qualname__
-    # cube_module_class.__module__ = module_class.__module__
-    cube_module_class.__orig_module_class__ = module_class  # save the original module class
+    parallel_module_class.__name__ = module_class.__name__
+    parallel_module_class.__qualname__ = module_class.__qualname__
+    # parallel_module_class.__module__ = module_class.__module__
+    parallel_module_class.__orig_module_class__ = module_class  # save the original module class
     # override train_step and infer_step only if they are defined in the generated module (end2end module only)
-    cube_module_class._train_step = getattr(gen_imported, '_train_step', cube_module_class._train_step)
-    cube_module_class._infer_step = getattr(gen_imported, '_infer_step', cube_module_class._infer_step)
-    return cube_module_class
+    parallel_module_class._train_step = getattr(gen_imported, '_train_step', parallel_module_class._train_step)
+    parallel_module_class._infer_step = getattr(gen_imported, '_infer_step', parallel_module_class._infer_step)
+    return parallel_module_class
 
 
 def parallelize(
@@ -881,7 +873,7 @@ def parallelize(
     pas_policy: Union[str, Callable[[IRGraph, ComputeConfig], IRGraph]],
     compute_config: ComputeConfig,
     *,
-    cube_savedir: Union[str, Path] = './.cube',
+    gen_savedir: Union[str, Path] = './.nnscaler',
     reuse: Union[ReuseType, str] = ReuseType.MATCH,
     instance_name: Optional[str] = None,
     load_module: bool = True,
@@ -891,7 +883,7 @@ def parallelize(
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
     """
-    Convert a torch.nn.Module object or class to CubeModule object or class.
+    Convert a torch.nn.Module object or class to ParallelModule object or class.
 
     If you want to save multiple instances of the same module,
     you can specify the instance_name to distinguish them.
@@ -907,19 +899,19 @@ def parallelize(
     * The module object will be copied to cpu to handle possible insufficient gpu memory.
     * The training flag will be the same as the original module
 
-    This function can be used to convert both module object and module class to cube module or cube module class.
+    This function can be used to convert both module object and module class to parallel module or parallel module class.
     Among key-value arguments,
     module_fn and module_dtype control how to create the module object.
-    whereas init_module_params controls how to load cube module object after conversion is done.
+    whereas init_module_params controls how to load parallel module object after conversion is done.
 
-    1. If the input is a module object, it will return a CubeModule object if load_module is True.
+    1. If the input is a module object, it will return a ParallelModule object if load_module is True.
        This is useful when the module is created by a factory function.
 
        a. module_fn is ignored.
        b. module_dtype is used to control the dtype of the input module.
-       c. init_module_params is used to control whether to initialize the cube module parameters when load it.
+       c. init_module_params is used to control whether to initialize the parallel module parameters when load it.
 
-    2. If the input is a module class, it will return a CubeModule class if load_module is True.
+    2. If the input is a module class, it will return a ParallelModule sub class if load_module is True.
 
        a. module_fn is used to create the module object, or module's__init__ if not prent.
        b. module_dtype is used to control the dtype of the created module (by constructor or module_fn).
@@ -951,7 +943,7 @@ def parallelize(
             it can be a name of builtin policies, or a custom policy function.
         compute_config (ComputeConfig): the environment resource
         reuse (ReuseType): specify which part can be reused.
-        cube_savedir (Union[str, Path]): the directory to save generated code
+        gen_savedir (Union[str, Path]): the directory to save generated code
         instance_name (Optional[str]): the instance name of the generated module. If it is None, will use the default name.
         load_module (bool): whether to load the generated module or module class after conversion is done.
         init_module_params (bool): If true, when we construct the module, all its parameters are initialized with the same value with when we traced.
@@ -964,15 +956,22 @@ def parallelize(
             Please note that the broadcasting will only be done in torchrun environment,
             and will throw an error if torch.distributed is not initialized and broadcast_strategy is not NONE.
     Returns:
-        Union[CubeModule, Type[CubeModule], None]:
-            if load_module flag is set, return the converted CubeModule object or class
+        Union[ParallelModule, Type[ParallelModule], None]:
+            if load_module flag is set, return the converted ParallelModule object or class
             if load_module flag is not set, return None
     """
+    if (
+        isinstance(module_or_module_class, ParallelModule) or
+        (inspect.isclass(module_or_module_class) and issubclass(module_or_module_class, ParallelModule))
+    ):
+        # already done
+        return module_or_module_class if load_module else None
+
     if (
         isinstance(module_or_module_class, CubeModule) or
         (inspect.isclass(module_or_module_class) and issubclass(module_or_module_class, CubeModule))
     ):
-        return module_or_module_class if load_module else None
+        raise RuntimeError("Old style CubeModule is not supported")
 
     if isinstance(pas_policy, str):
         if not pas_policy in _PREDEFINED_POLICIES:
@@ -993,7 +992,7 @@ def parallelize(
     # generate code only in node0
     # if it is not in a torchrun environment, just generate.
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        outdir, reusable = _prepare_and_check_reusable(cube_savedir, module_class, compute_config, instance_name, reuse)
+        outdir, reusable = _prepare_and_check_reusable(gen_savedir, module_class, compute_config, instance_name, reuse)
         if not reusable:
             config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
             ComputeConfig.safe_dump_to_file(compute_config, config_file)  # always refresh compute config
@@ -1051,26 +1050,26 @@ def parallelize(
         if broadcast_strategy != BroadcastGenFilesStrategy.NONE:
             _broadcast_gen_files(
                 module_class,
-                cube_savedir=cube_savedir,
+                gen_savedir=gen_savedir,
                 instance_name=instance_name,
                 broadcast_strategy=broadcast_strategy,
             )
 
     if load_module:
         if not torch.distributed.is_initialized(): # we only support loading in torchrun environment
-            raise RuntimeError("Load CubeModule failed: torch.distributed is not initialized.")
+            raise RuntimeError("Load ParallelModule failed: torch.distributed is not initialized.")
         torch.distributed.barrier()
-        cube_module_class = _load_cube_module_class(
+        parallel_module_class = _load_parallel_module_class(
             module_class,
-            cube_savedir=cube_savedir,
+            gen_savedir=gen_savedir,
             instance_name=instance_name,
         )
         if is_module_class:
-            return cube_module_class
+            return parallel_module_class
         else:
-            cube_module = cube_module_class(init_module_params)
-            cube_module.train(module_or_module_class.training)  # set training state to the same as original module
-            return cube_module
+            parallel_module = parallel_module_class(init_module_params)
+            parallel_module.train(module_or_module_class.training)  # set training state to the same as original module
+            return parallel_module
 
 
 @dataclass(unsafe_hash=True)
@@ -1208,17 +1207,17 @@ def build_optimizer(
     """
     Build an optimizer for a module.
 
-    To support parallelized module (CubeModule), we hook 4 places in this function:
+    To support parallelized module (ParallelModule), we hook 4 places in this function:
 
     1. optimizer constructor:
        the parameters of optimizer will not be the same with the parameters of the module if we use zero
-       so we need to replace the parameters of optimizer with CubeModule.parameters_for_optimizer
+       so we need to replace the parameters of optimizer with ParallelModule.parameters_for_optimizer
        It is impossible to make this change transparent to end users.
     2. optimizer.step():
        we need to call optimizer.sync_shard_grad() to sync the gradients of the module before optimizer.step().
-       In zero mode, we have to call CubeModule.gather_params() after optimizer.step()
+       In zero mode, we have to call ParallelModule.gather_params() after optimizer.step()
     3. optimizer.zero_grad():
-       We need to call CubeModule.zero_grad() after optimizer.zero_grad()
+       We need to call ParallelModule.zero_grad() after optimizer.zero_grad()
     4. backward():
        you need to call optimizer.sync_shard_grad() manually if you want to read the gradients of the module before optimizer.step().
 
@@ -1276,24 +1275,24 @@ def build_optimizer(
 
     opt_module_locs: Dict[str, ModuleParameterLocation] = {}
     def _local_parameters(module: torch.nn.Module):
-        cube_suffix = "_CUBE_SUFFIX"
+        pm_suffix = "_PARALLEL_MODULE_PARAM_SUFFIX"
         gen = module._named_members(
             lambda m: [
-                    (cube_suffix, p)  # (cube_suffix, p) to meet _named_members requirement
+                    (pm_suffix, p)  # (pm_suffix, p) to meet _named_members requirement
                     for p in (
                         m.parameters_for_optimizer() if m.compute_config.use_zero
-                        else m.parameters() # `CubeModule.merge_partial_states` supports parameters_for_optimizer() only in zero mode
+                        else m.parameters() # `ParallelModule.merge_partial_states` supports parameters_for_optimizer() only in zero mode
                     )
                 ]
                 if isinstance(m, ParallelModule)
                 else m._parameters.items()
         )
         for idx, (name, param) in enumerate(gen):
-            if name.endswith(cube_suffix):  # is a parameter of ParallelModule
+            if name.endswith(pm_suffix):  # is a parameter of ParallelModule
                 # -1 for removing the dot
                 # please note when the whole module is a ParallelModule,
                 # the name will be empty after removing the suffix
-                name = name[:-len(cube_suffix) - 1]
+                name = name[:-len(pm_suffix) - 1]
                 if name not in opt_module_locs:
                     opt_module_locs[name] = ModuleParameterLocation(idx, 1)
                 else:
@@ -1656,7 +1655,7 @@ def merge_state_dicts(
         pm_orig_param_names: Dict[str, List[str]] = {}
         for k, extra_states in pm_extra_states.items():
             module_prefix = '.'.join(k)
-            pm_orig_param_names[module_prefix] = CubeModule.get_origin_parameter_names([e.param_area_map for e in extra_states])
+            pm_orig_param_names[module_prefix] = ParallelModule.get_origin_parameter_names([e.param_area_map for e in extra_states])
         # now we can construct the merged state of optimizer from any rank
         # as said previously, the merge will be based on rank0's data
         orig_states: Dict[int, Any] = optimizer_state_dicts[0]['state']
@@ -1978,7 +1977,7 @@ def _get_valid_name_from_merged_model(
 def _broadcast_gen_files(
     module_class: Type[torch.nn.Module],
     *,
-    cube_savedir: Union[str, Path] = './.cube',
+    gen_savedir: Union[str, Path] = './.nnscaler',
     instance_name: Optional[str] = None,
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy],
 ):
@@ -1987,7 +1986,7 @@ def _broadcast_gen_files(
 
     Args:
         module_class (Type[torch.nn.Module]): the original torch module class
-        cube_savedir (Union[str, Path]): the directory to save generated code
+        gen_savedir (Union[str, Path]): the directory to save generated code
         instance_name (Optional[str]): the instance name of the generated module. If it is None, will use the default name.
         broadcast_strategy (Union[str, BroadcastGenFilesStrategy]): the broadcast strategy for generated files.
 
@@ -2014,7 +2013,7 @@ def _broadcast_gen_files(
 
     # use the first rank of each node to broadcast
     if  curr_rank % local_world_size == 0:
-        _, outdir = _prepare_namespace(cube_savedir, module_class, instance_name)
+        _, outdir = _prepare_namespace(gen_savedir, module_class, instance_name)
         files: List[str] = []
         # send file list
         if curr_rank == 0:

@@ -7,7 +7,7 @@ import torch
 import shutil
 
 from nnscaler.graph.parser.fx.parser import FxModuleParser
-from nnscaler.parallel import ReuseType, parallelize, ComputeConfig, _load_cube_module_class
+from nnscaler.parallel import ReuseType, parallelize, ComputeConfig, _load_parallel_module_class
 from nnscaler.runtime.module import ParallelModule
 
 from ..utils import new_empty, replace_all_device_with
@@ -20,14 +20,14 @@ def _to_cube_model(model_class, compute_config, cube_savedir, reuse, instance_na
         'data',
         compute_config,
         reuse=reuse,
-        cube_savedir=cube_savedir,
+        gen_savedir=cube_savedir,
         instance_name=instance_name,
         load_module=False,
     )
     if load_module:
-        module_class = _load_cube_module_class(
+        module_class = _load_parallel_module_class(
             model_class,
-            cube_savedir=cube_savedir,
+            gen_savedir=cube_savedir,
             instance_name=instance_name,
             rank=0
         )
