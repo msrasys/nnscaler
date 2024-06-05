@@ -43,7 +43,7 @@ def test_calc_flops():
         ir_graph = to_ir_graph(fx_graph,
                                dummy_input,
                                attr_savedir=tempdir,
-                               dynamic_shape=True)
+                               constant_folding=False)
     nodes = ir_graph.select(ntype=IRFwOperation)
     assert calc_flops(
         nodes[0]) == 2 * batch_size * hidden_dim * hidden_dim * hidden_dim

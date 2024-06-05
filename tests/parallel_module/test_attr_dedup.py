@@ -54,7 +54,7 @@ def _gpu_worker_spmd(cc: ComputeConfig):
             {'x': torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]])},
             pas,
             cc,
-            cube_savedir=tempdir,
+            gen_savedir=tempdir,
             instance_name='attr_dedup'
         )
         print(module.fullmap)
@@ -84,7 +84,7 @@ def _gpu_worker_spmd(cc: ComputeConfig):
             assert dedup_area_map[0][1].slicers == (slice(2, 4, None), slice(0, 4, None))
         else:
             raise RuntimeError(f'Unexpected rank {curr_rank}')
-        
+
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
 def test_attr_dedup():

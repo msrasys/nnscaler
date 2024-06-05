@@ -30,7 +30,7 @@ def test_input_broadcast_constant_attr():
             return self.fc(sample['x']), res
 
     with tempfile.TemporaryDirectory() as tempdir:
-        cube_graph = convert_model(SimpleModel(), {'sample': {'x': torch.rand(4, 10), 'y': 10}}, tempdir, dynamic_shape=True)
+        cube_graph = convert_model(SimpleModel(), {'sample': {'x': torch.rand(4, 10), 'y': 10}}, tempdir, constant_folding=False)
         # check input is not constant
         assert not cube_graph.input(0).value['y'].is_constant
         for i, name in enumerate(['add', 'sub', 'mul', 'truediv', 'floordiv', 'mod', 'pow', 'sub', 'neg', 'exp', 'sqrt']):

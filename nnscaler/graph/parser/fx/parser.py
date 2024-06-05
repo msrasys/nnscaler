@@ -35,7 +35,7 @@ class FxModuleParser:
               attr_savedir='./',
               *,
               save_content: bool = True,
-              dynamic_shape: bool = True
+              constant_folding: bool = False
         ) -> Tuple[List[IRObject], List[IRFwOperation], List[IRObject]]:
         """Parse torch.fx module into cube IR
 
@@ -46,7 +46,7 @@ class FxModuleParser:
             dummy_inputs (Dict[str, Any]): the dummy inputs to run the module
             attr_savedir (str): the directory to save the attribute content
             save_content (bool): whether to save the content of the module
-            dynamic_shape (bool): whether to parse the module with dynamic shape
+            constant_folding (bool): whether to parse the module with constant folding
 
         Returns:
             inputs (List[IRObject]): the input IRObjects
@@ -64,7 +64,7 @@ class FxModuleParser:
             if node.op == 'placeholder':
                 FxModuleParser.init_objects(node, module, frame, dummy_inputs.get(node.name), is_constant=False)
             else:
-                FxModuleParser.init_objects(node, module, frame, None, is_constant=True)            
+                FxModuleParser.init_objects(node, module, frame, None, is_constant=True)
 
         # get graph inputs
         placeholders = [n for n in module.graph.nodes if n.op == 'placeholder']
@@ -80,7 +80,7 @@ class FxModuleParser:
         # parse graph nodes
         all_ir_nodes = []
         for node in module.graph.nodes:
-            ir_nodes = FxModuleParser.parse_node(node, module, dynamic_shape, frame)
+            ir_nodes = FxModuleParser.parse_node(node, module, constant_folding, frame)
             all_ir_nodes += ir_nodes
 
         # get graph outputs
@@ -95,7 +95,7 @@ class FxModuleParser:
         return inputs, all_ir_nodes, outputs
 
     @staticmethod
-    def parse_node(node: torch.fx.Node, module, dynamic_shape: bool, frame: Frame) -> List[IRFwOperation]:
+    def parse_node(node: torch.fx.Node, module, constant_folding: bool, frame: Frame) -> List[IRFwOperation]:
         """
         Parse the node and return the IRFwOperation nodes
         """
@@ -104,7 +104,7 @@ class FxModuleParser:
         if node.op == 'output':
             return FxModuleParser.parse_prim_output_node(node, module, frame)
         if node.op in ('call_function', 'call_method'):
-            return FxModuleParser.parse_prim_function_method(node, module, dynamic_shape, frame)
+            return FxModuleParser.parse_prim_function_method(node, module, constant_folding, frame)
         if node.op == 'get_attr':
             return FxModuleParser.parse_prim_get_attr_node(node, module, frame)
         if node.op == 'call_module':
@@ -202,7 +202,7 @@ class FxModuleParser:
             raise RuntimeError(f'unknown module: {prim_module.__class__.__module__}')
 
     @staticmethod
-    def parse_prim_function_method(node: torch.fx.Node, module: torch.fx.GraphModule, dynamic_shape: bool, frame: Frame) -> List[IRFwOperation]:
+    def parse_prim_function_method(node: torch.fx.Node, module: torch.fx.GraphModule, constant_folding: bool, frame: Frame) -> List[IRFwOperation]:
         # get signature
         fsig = FxModuleParser._get_qualified_name(node.target, node)
         # get inputs
@@ -243,7 +243,7 @@ class FxModuleParser:
                 for i in range(len(vals)):
                     ir_node.set_output(i, vals[i])
             elif not isinstance(ir_node.output(0), IRTensor) and ir_node.output(0).value is not None:
-                if dynamic_shape or \
+                if not constant_folding or \
                     any_ir_object_satisfy(ir_node.output(0), lambda a: not a.is_constant) or \
                     any_ir_object_satisfy(ir_node.output(0), lambda a: isinstance(a, IRTensor)) or \
                     any_ir_object_satisfy(ir_node.output(0), lambda a: isinstance(a, (DICT_KEYS_TYPE, DICT_VALUES_TYPE, DICT_ITEMS_TYPE))):

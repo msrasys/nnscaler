@@ -46,7 +46,7 @@ class IRCell:
         to prevent users accidently updating it outside.
 
         To update the IRObject in input / kwarg / output, please use `find`, `input(s)`,
-        and `output(s)` to get the real instance tensor in the IRCell. 
+        and `output(s)` to get the real instance tensor in the IRCell.
 
         Args:
             name (str): the cell name
@@ -106,7 +106,7 @@ class IRCell:
         For single operators, the mirror node will be reserved.
         For nodes that cover multiple devices, e.g., IRSegment and IRAdapter,
         the mirror node will be removed and require additional `make_pair` elsewhere.
-        
+
         @param device int: device id
         @return dispatched_node IRCell: the node that only has one device placement.
         """
@@ -171,7 +171,7 @@ class IRCell:
             Tuple[NestedVarOrStatic]
         """
         return tuple(self._inputs)
-    
+
     @lru_cache(maxsize=None)
     def iobjs(self) -> Tuple[IRObject]:
         """
@@ -194,7 +194,7 @@ class IRCell:
             NestedVarOrStatic: (nested) IRObject or any static value (int, bool, str, etc)
         """
         return self._outputs[index]
-    
+
     @lru_cache(maxsize=None)
     def oobjs(self) -> Tuple[IRObject]:
         """
@@ -266,7 +266,7 @@ class IRCell:
         self.outputs.cache_clear()
         self.oobjs.cache_clear()
         return val
-    
+
     def replace_input(self, old: IRObject, new: IRObject):
         """Replace the old input (including kwargs) with the new input
 
@@ -283,7 +283,7 @@ class IRCell:
         self._kwargs = IRCell.modify_objects_of_complex(self._kwargs, replace)
         self.inputs.cache_clear()
         self.iobjs.cache_clear()
-    
+
     def replace_output(self, old: IRObject, new: IRObject):
         """Replace the old output with the new output
 
@@ -299,7 +299,7 @@ class IRCell:
         self._outputs = IRCell.modify_objects_of_complex(self._outputs, replace)
         self.outputs.cache_clear()
         self.oobjs.cache_clear()
-    
+
     def replace(self, old: IRObject, new: IRObject):
         """Replace the old object with the new object in inputs, kwargs, and outputs
 
@@ -335,7 +335,7 @@ class IRCell:
         Tag an info to the cell
         """
         assert isinstance(info, str), "comment only allowed to be string"
-        self._comment = info 
+        self._comment = info
 
     @property
     def module_stack(self) -> Optional[OrderedDict[str, Any]]:
@@ -357,13 +357,13 @@ class IRCell:
                 f"inputs={ins}, "
                 f"outputs={self.outputs()})")
         return dscp
-    
+
     @staticmethod
     def get_objects_from_complex(val: Any, _objects: List[IRObject] = None) -> List[IRObject]:
         """Get all IRObjects from a complex data structure
 
         Supported complex of types: List, Tuple, Dict, IRTensor, IRObject
-        
+
         Args:
             val (Any): the complex data structure to be modified
             _objects (List[IRObject] | None):
@@ -419,10 +419,15 @@ class IRObject:
 
     def __init__(self, name: Optional[str] = None, tid: Optional[int] = None, value: Optional[None] = None, is_constant: bool = True):
         """
-        @param name str: object name
-        @param tid int: object unique id
-        @param val any: the value of this object
-        @param is_constant bool: if the value is a constant during the whole training / inference
+        Args:
+            name (str): object name
+            tid (int): object unique id
+            val (Any): the value of this object
+            is_constant (bool): if the value is a constant during the whole training / inference
+                This flag is only used in constant_folding mode, to prevent the object from being folded.
+                An IROject is considered constant only when:
+                    1. val is not a tensor
+                    2. val is model input, or is the result of a non-torch operation on another constant IRObject
         """
         self._id: int = tid if isinstance(tid, int) else IDGenerator().gen_tensor_id()
         self.name: str = name if name else 'obj'
@@ -458,7 +463,7 @@ class IRObject:
     @property
     def cell(self) -> IRCell:
         return self._cell
-    
+
     @cell.setter
     def cell(self, val: Optional[IRCell]):
         assert isinstance(val, IRCell) or val is None, "Expected cell to be Optional[IRCell]"
@@ -476,7 +481,7 @@ class IRObject:
         raise RuntimeError(
             "IRObject placement is not allowed to set manually"
         )
-    
+
     @property
     def parent(self):
         """Get parent"""
@@ -533,7 +538,7 @@ class IRTensor(IRObject):
     IRTensor serves as tensor data of IRGraph edge
 
     Note by setting IRTensor name to "None" indicates this tensor holds nothing
-    and will be translated to None in code generation. 
+    and will be translated to None in code generation.
     """
 
     _meta = ['name', '_is_attr', '_is_grad', '_requires_grad', '_dtype', '_persistent']
@@ -582,7 +587,7 @@ class IRTensor(IRObject):
         @return is_buffer boolean: True if is buffer.
         """
         return self._is_attr and not self.requires_grad
-    
+
     def is_persistent(self) -> bool:
         """!
         Check if the tensor is persistent buffer.

@@ -76,8 +76,8 @@ def test_anno_kwargs_infer():
     partitionable(op, idx=0, dim=0, num=2)
 
 
-def test_dynamic_shape_infer():
-    # TODO: please note that this test should be rewritten after we can fully support dynamic shape
+def test_constant_folding_infer():
+    # TODO: please note that this test should be rewritten after we can fully support constant folding
     def TestFunc(input, weight, bias, number=128, signature='test_func'):
         anno = '(a number), (b number), (a b) -> 1'
         return IRDimops(TestFunc, 'test_func', signature, [anno], [input, weight, bias], number=number)

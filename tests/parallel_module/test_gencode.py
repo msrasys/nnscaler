@@ -704,7 +704,7 @@ def test_codegen_end2end():
     dim = 1024
     nlayers = 16
     batch_size = 64
-    def p(cube_dir, use_pipeline, dynamic_shape, return_type, inference_only=False):
+    def p(cube_dir, use_pipeline, constant_folding, return_type, inference_only=False):
         m = End2EndModule(dim, nlayers)
         m.train()
         parallelize(
@@ -714,7 +714,7 @@ def test_codegen_end2end():
             compute_config= ComputeConfig(
                 4, 4,
                 inference_only=inference_only,
-                dynamic_shape=dynamic_shape,
+                constant_folding=constant_folding,
                 use_end2end=True,
                 use_pipeline=use_pipeline,
                 pipeline_nmicros=4,
@@ -727,33 +727,33 @@ def test_codegen_end2end():
         )
     with tempfile.TemporaryDirectory() as tempdir:
         for use_pipeline in [True, False]:
-            p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=0) # should success
+            p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=0) # should success
             assert not _gencode_contains(tempdir, End2EndModule, 0,
                     r"self\.register_buffer"
             )
             assert _gencode_contains(tempdir, End2EndModule, 0,
                     r"self\.register_parameter"
             )
-            p(tempdir, use_pipeline=use_pipeline, dynamic_shape=False, return_type=0)  # should success
+            p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=0)  # should success
             if use_pipeline:
                 with pytest.raises(RuntimeError, match='.*Communication generation.*'):
                     # fail for non-tensor IRObject return in pipeline mode
-                    p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=1)
+                    p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=1)
             else:
-                p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=1)
-            p(tempdir, use_pipeline=use_pipeline, dynamic_shape=False, return_type=1)  # should success
-            p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=2)  # should success
-            p(tempdir, use_pipeline=use_pipeline, dynamic_shape=False, return_type=2)  # should success
+                p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=1)
+            p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=1)  # should success
+            p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=2)  # should success
+            p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=2)  # should success
             with pytest.raises(RuntimeError, match='.*Loss can only be scalar tensor.*'):
-                p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=3)
+                p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=3)
             with pytest.raises(RuntimeError, match='.*Loss can only be scalar tensor.*'):
-                p(tempdir, use_pipeline=use_pipeline, dynamic_shape=False, return_type=3)
+                p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=3)
             with pytest.raises(RuntimeError, match='.*Loss can only be scalar tensor.*'):
-                p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=4)
+                p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=4)
             with pytest.raises(RuntimeError, match='.*Loss can only be scalar tensor.*'):
-                p(tempdir, use_pipeline=use_pipeline, dynamic_shape=False, return_type=4)
+                p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=4)
 
-            p(tempdir, use_pipeline=use_pipeline, dynamic_shape=True, return_type=0, inference_only=True)  # should success
+            p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=0, inference_only=True)  # should success
             assert not _gencode_contains(tempdir, End2EndModule, 0,
                     r"self\.register_parameter"
             )

@@ -83,7 +83,7 @@ def test_override():
 
         # MOO  | unmatch | generate
         _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MOO, 'o1', load_module=False)
-        _to_cube_model(MyModule, ComputeConfig(2, 2, dynamic_shape=False),tempdir, ReuseType.MOO, 'o1')
+        _to_cube_model(MyModule, ComputeConfig(2, 2, constant_folding=True),tempdir, ReuseType.MOO, 'o1')
 
         # MOO  | imported | raise error
         _to_cube_model(MyModule, ComputeConfig(1, 1),tempdir, ReuseType.MOO, 'o2', load_module=True)
@@ -173,7 +173,7 @@ def test_override():
         g7_module_path = module_path.with_name('g7')
         graph_stat = (g7_module_path / 'graph.ckp').stat()
         args_stat = (g7_module_path / 'forward_args.pkl').stat()
-        _to_cube_model(MyModule, ComputeConfig(2, 2, dynamic_shape=False), tempdir, 'graph', 'g7', False)
+        _to_cube_model(MyModule, ComputeConfig(2, 2, constant_folding=True), tempdir, 'graph', 'g7', False)
         assert (g7_module_path / 'graph.ckp').stat().st_mtime_ns != graph_stat.st_mtime_ns
         assert (g7_module_path / 'forward_args.pkl').stat().st_mtime_ns != args_stat.st_mtime_ns
 

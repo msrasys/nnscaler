@@ -149,7 +149,7 @@ if __name__ == '__main__':
         runtime_ngpus=torch.distributed.get_world_size(),
         use_zero=args.zero,
         use_end2end=True,
-        dynamic_shape=False,
+        constant_folding=True,
         use_pipeline=args.pp_size > 1,
         pipeline_nmicros=args.gbs // args.mbs,
         pipeline_nstages=args.pp_size,

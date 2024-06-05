@@ -67,8 +67,8 @@ class ComputeConfig:
     plan_ngpus: int
     runtime_ngpus: int
 
-    # whether to use dynamic shape to generate code
-    dynamic_shape: bool = True
+    # whether to fold constant when generating code
+    constant_folding: bool = False
 
     use_zero: bool = False
     zero_ngroups: int = 1
@@ -176,7 +176,7 @@ class ComputeConfig:
     @property
     def graph_config(self) -> Dict[str, Any]:
       return {
-            'dynamic_shape': self.dynamic_shape,
+            'constant_folding': self.constant_folding,
             'user_config': self.user_config,
             'inference_only': self.inference_only, # there will be no backward nodes in the graph in inference mode
             'use_pipeline': self.use_pipeline,  # pipeline option can affect the graph generation.
@@ -588,7 +588,7 @@ def _gen_graph(
     module: torch.nn.Module,
     dummy_input: dict,
     outdir: Path,
-    dynamic_shape: bool,
+    constant_folding: bool,
     end2end_mode: bool = False,
     inference_only: bool = False,
     use_pipeline: bool = False,
@@ -610,7 +610,7 @@ def _gen_graph(
 
     # generate ir logic graph
     ir_graph = parser.to_ir_graph(
-        fx_graph, dummy_input, outdir, dynamic_shape
+        fx_graph, dummy_input, outdir, constant_folding
     )
 
     # generate dummy inputs for logic graph
@@ -754,7 +754,7 @@ def _gencode(
 
         graph, forward_args = _gen_graph(
             module, dummy_input, outdir,
-            dynamic_shape=compute_config.dynamic_shape, end2end_mode=compute_config.use_end2end,
+            constant_folding=compute_config.constant_folding, end2end_mode=compute_config.use_end2end,
             inference_only=compute_config.inference_only,
             use_pipeline=compute_config.use_pipeline,
         )

@@ -188,7 +188,7 @@ class ComputeConfig:
     plan_ngpus: int
     runtime_ngpus: int
 
-    dynamic_shape: bool = True
+    constant_folding: bool = False
 
     use_zero: bool = False
     zero_ngroups: int = 1
@@ -207,7 +207,24 @@ class ComputeConfig:
 We can categorize the fields into 4 categories:
 
 1. Trace configuration
-    - `dynamic_shape`: whether to use dynamic shape or static shape.
+    - `constant_folding`: whether to enable constant folding when generating code.
+    When it is true, all non-tensor non-input values will be folded into the generated code.
+
+        For example, if user's code contains following snippet, and `bsz=1`, `num_heads=32`, `len=1024`, `hidden_dim=128` at tracing.
+        ```python
+            bsz, num_heads, len, hidden_dim = x.size()
+            x = x.view(bsz * num_heads, len, hidden_dim)
+        ```
+        The code (graph) is folded into the following format
+
+        ```python
+            y = x.view(32, 1024, 128)
+        ```
+
+        Constant folding is helpful to simplify the input program,
+        and can make the compiling process faster and reduce the communication cost at runtime.
+        However, user should make sure that inputs at runtime share a same schema (including shape) with tracing and correspond to a same computation graph.
+        Errors may be raised at runtime when this assumption is broken.
 2. Compute environment configuration
     - `plan_ngpus`: the number of gpus to be used as a unit. The model is partitioned (TP or PP) within a unit, and then data parallelism is applied across multiple units. So every `plan_ngpus` devices holds the whole model. Furthermore, assume we have two workers, and their ranks are `rank1` and `rank2`:
         1. if `rank1 // plan_gpus == rank2 // plan_ngpus`, then they are in the same unit.

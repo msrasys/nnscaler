@@ -39,3 +39,4 @@ shelf
 
 # cppimport generated file
 .rendered.*.cpp
+.nnscaler/

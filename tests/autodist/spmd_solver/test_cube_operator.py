@@ -42,7 +42,7 @@ def test_cube_operator():
         ir_graph = to_ir_graph(fx_graph,
                                dummy_input,
                                attr_savedir=tempdir,
-                               dynamic_shape=False)
+                               constant_folding=True)
         cfg = AutoDistConfig(mesh_col=2)
         model_graph = ModelGraph(ir_graph, cfg)
         mock_attention_op = model_graph.operator_list[0]

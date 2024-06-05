@@ -53,7 +53,7 @@ def test_shared_param_pipeline():
 
             smodel = SemanticModel(model, attr_savedir=tempdir)
             smodel.dummy_input = {'x': torch.randn(bsz, hidden_dim)}
-            smodel.dynamic_shape = False
+            smodel.constant_folding = True
             program.set_input([dataloader.irobj])
             ir_dummy_input = next(dataloader)
             outputs = smodel(ir_dummy_input)

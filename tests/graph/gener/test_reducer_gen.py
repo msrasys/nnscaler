@@ -43,7 +43,7 @@ def build_graph():
             model,
             {'x': torch.randn([128, 128], dtype=torch.float16)},
             attr_savedir=tempdir,
-            dynamic_shape=False
+            constant_folding=True
         )
     graph.backward(graph.output(0))
     return graph

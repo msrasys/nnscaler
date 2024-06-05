@@ -87,7 +87,7 @@ class SemanticDataLoader:
         """Create semantic dataloader representing the dataloader in training iteration.
 
         Calling `next(SemanticDataLoader)` will generate an IRDataOperation in graph,
-        which takes the `self.irobj` (i.e., reperesenting the non-tensor value of real 
+        which takes the `self.irobj` (i.e., reperesenting the non-tensor value of real
         dataloader instance) as input and produces outputs that are converted to
         IRObject or IRTensor. The IRDataOperation will be added to the final
         graph and generate code like `data = next(dataloader)`
@@ -100,7 +100,7 @@ class SemanticDataLoader:
         self.dataloader: data.DataLoader = dataloader
         # the IRObject representing the `dataloader` instance, which is only used by the
         # IRDataOperation. Since we already know the output of the dataloader,
-        # we don't need to set the value for it. 
+        # we don't need to set the value for it.
         self.irobj = IRObject(name='dataloader', value=None)
 
     def __iter__(self):
@@ -141,7 +141,7 @@ class SemanticModel:
 
     def __init__(self, model: Optional[torch.nn.Module],
                  save_content: bool = True,
-                 dynamic_shape: bool = False,
+                 constant_folding: bool = True,
                  attr_savedir: str = './',
     ):
         """
@@ -152,8 +152,8 @@ class SemanticModel:
                 single-device model description, only required for rank 0
             save_content (bool):
                 whether to save the content of model and load it into generated model. Default True.
-            dynamic_shape (bool):
-                whether to use dynamic shape. Default False.
+            constant_folding (bool):
+                whether to enable constant folding. Default True.
             attr_savedir (str):
                 directory to save content (attribtes)
         """
@@ -165,7 +165,7 @@ class SemanticModel:
         self._loaded_module: CubeModule = None
         # parser configuration
         self.save_content: bool = save_content
-        self.dynamic_shape: bool = dynamic_shape
+        self.constant_folding: bool = constant_folding
         self.attr_savedir: str = attr_savedir
 
     @property
@@ -244,6 +244,6 @@ class SemanticModel:
                 self.model,
                 dummy_input=self.dummy_input,
                 attr_savedir=self.attr_savedir,
-                dynamic_shape=self.dynamic_shape
+                constant_folding=self.constant_folding
             )
             return self._ir_graph(*args)

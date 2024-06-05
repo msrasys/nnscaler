@@ -11,21 +11,21 @@ class Model(torch.nn.Module):
 
     def forward(self, x):
         return self.embed(x).sum()
- 
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_requires_grad():
     model = Model()
     model.train()
-    
+
     dummy_input = {'x': torch.randint(0, 10, (10, 10))}
-    
+
     with tempfile.TemporaryDirectory() as tempdir:
-    
+
         graph, _ = _gen_graph(
             model,
             dummy_input,
             outdir=tempdir,
-            dynamic_shape=False,
+            constant_folding=True,
             end2end_mode=True,
         )
         embed_op = graph.nodes()[1]

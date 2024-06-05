@@ -31,7 +31,7 @@ def test_multi_consume():
     print(fx_graph.graph)
 
     with tempfile.TemporaryDirectory() as tempdir:
-        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
+        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, constant_folding=False)
     assert ir_graph is not None
     assert len(ir_graph.attributes()) == 2  # param1 and param2
     assert len(ir_graph.full_tensors()) == 8
@@ -60,7 +60,7 @@ def test_parser_nested_inputs():
 
     print(fx_graph.graph)
     with tempfile.TemporaryDirectory() as tempdir:
-        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
+        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, constant_folding=False)
         print(ir_graph.extra_repr())
 
     assert len(ir_graph.inputs()) == 1
@@ -88,7 +88,7 @@ def test_max():
 
     print(fx_graph.graph)
     with tempfile.TemporaryDirectory() as tempdir:
-        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
+        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, constant_folding=False)
         print(ir_graph.extra_repr())
 
     assert isinstance(ir_graph.output(0), IRTensor)
@@ -111,7 +111,7 @@ def test_min():
 
     print(fx_graph.graph)
     with tempfile.TemporaryDirectory() as tempdir:
-        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
+        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, constant_folding=False)
         print(ir_graph.extra_repr())
 
     assert isinstance(ir_graph.output(0), IRTensor)

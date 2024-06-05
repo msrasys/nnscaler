@@ -54,7 +54,7 @@ def test_follow_rope():
         ir_graph = to_ir_graph(fx_graph,
                                dummy_input,
                                attr_savedir=tempdir,
-                               dynamic_shape=False)
+                               constant_folding=True)
         '''
         the computation graph is as follows:
         getitem                      getitem
@@ -167,7 +167,7 @@ def test_follow_attention():
         ir_graph = to_ir_graph(fx_graph,
                                dummy_input,
                                attr_savedir=tempdir,
-                               dynamic_shape=False)
+                               constant_folding=True)
         print(ir_graph.nodes())
         '''
         the computation graph is as follows:

@@ -116,7 +116,7 @@ class Llama:
             return graph
 
         @compile(self.model, sample_tokens, 0,
-                      PAS=policy, model_dynamic_shape=True)
+                      PAS=policy, model_constant_folding=False)
         def infer(model: torch.nn.Module, tokens: torch.Tensor, prev_pos: int):
             logits = model(tokens, prev_pos)
             return logits

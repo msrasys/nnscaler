@@ -38,7 +38,7 @@ _logger.setLevel(logging.INFO)
 
 def compile(model: Union[torch.nn.Module, SemanticModel], *args,
             PAS: Union[Callable, Tuple[Callable, Callable, Callable]] = None,
-            model_dynamic_shape: bool = False,
+            model_constant_folding: bool = True,
             load_graph_file: Optional[str] = None,
             save_graph_file: Optional[str] = None,
             comm_cost_fn: Optional[Callable] = None,
@@ -61,7 +61,7 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
         model (SemanticModel | torch.nn.Module): single-device model
         args (Tuple[Any]): compile function example inputs
         PAS (Callable | Tuple[Callable, Callable, Callable]): policy to transform and schedule graph
-        model_dynamic_shape (bool): whether to compile model with dynamic shape
+        model_constant_folding (bool): whether to compile model with constant folding
         load_graph_file (str | None):
             load cached graph. This will skip parsing the function and model.
             Note the user should keep correct `fullmodel.pt` if load_content is True.
@@ -90,7 +90,7 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
         model = SemanticModel(model)
     assert isinstance(model, SemanticModel), f'Require nnscaler.SemanticModel or torch.nn.Module, but got model: {type(model)}'
     model.save_content = load_content
-    model.dynamic_shape = model_dynamic_shape
+    model.constant_folding = model_constant_folding
 
     inputs = [model]
     for arg in args:

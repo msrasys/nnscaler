@@ -71,7 +71,7 @@ def test_partition_constraint():
         ir_graph = to_ir_graph(fx_graph,
                                dummy_input,
                                attr_savedir=tempdir,
-                               dynamic_shape=False)
+                               constant_folding=True)
 
         pc_path = Path(os.path.dirname(
             os.path.realpath(__file__))) / 'test_pc.yaml'

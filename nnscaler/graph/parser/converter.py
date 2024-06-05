@@ -104,7 +104,7 @@ def to_ir_graph(
     traced_model: torch.fx.GraphModule,
     dummy_input: Dict[str, Any],
     attr_savedir: Union[str, Path],
-    dynamic_shape: bool = False,
+    constant_folding: bool = True,
 ) -> IRGraph:
     """Convert torch.fx.GraphModule based model into IRGraph
 
@@ -112,20 +112,20 @@ def to_ir_graph(
         traced_model (torch.fx.GraphModule): single-device model description in fx format
         dummy_input (Dict[str, Any]):
             dummy input of model, the keys are the names of forward arguments.
-        dynamic_shape (bool):
-            whether to use dynamic shape. Default False.
+        constant_folding (bool):
+            whether to enable constant folding. Default True.
         attr_savedir (Union[str, Path]): directory to save content (attribtes)
 
     Returns:
         IRGraph: IRGraph of model
     """
-    _logger.info(f"use {'dynamic' if dynamic_shape else 'static'} shape to parse graph")
+    _logger.info(f"constant folding {'enabled' if constant_folding else 'disabled'} to parse graph")
 
     with no_save_tensor_hook():
         inputs, nodes, outputs = FxModuleParser.parse(
             traced_model, dummy_input,
             attr_savedir=attr_savedir,
-            dynamic_shape=dynamic_shape,
+            constant_folding=constant_folding,
             save_content=True,
         )
     module_name = traced_model.__class__.__name__
@@ -142,7 +142,7 @@ def convert_model(
     model: torch.nn.Module,
     dummy_input: Dict[str, Any],
     attr_savedir: Union[str, Path],
-    dynamic_shape: bool = False
+    constant_folding: bool = True
 ) -> IRGraph:
     """Convert torch.nn.Module based model into IRGraph
 
@@ -150,8 +150,8 @@ def convert_model(
         model (torch.nn.Module): single-device model description
         dummy_input (Dict[str, Any]):
             dummy input of model, the keys are the names of forward arguments.
-        dynamic_shape (bool):
-            whether to use dynamic shape. Default False.
+        constant_folding (bool):
+            whether to use constant folding. Default True.
         attr_save_dir (Union[str, Path]): directory to save content (attribtes)
 
     Returns:
@@ -159,5 +159,5 @@ def convert_model(
     """
     traced_model = to_fx_graph(model, dummy_input)
     _logger.debug(f'the traced model is:\n{traced_model}')
-    graph = to_ir_graph(traced_model, dummy_input, attr_savedir, dynamic_shape)
+    graph = to_ir_graph(traced_model, dummy_input, attr_savedir, constant_folding)
     return graph

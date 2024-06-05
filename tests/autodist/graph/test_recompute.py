@@ -88,7 +88,7 @@ def test_recompute():
         ir_graph = to_ir_graph(fx_graph,
                                dummy_input,
                                attr_savedir=tempdir,
-                               dynamic_shape=True)
+                               constant_folding=False)
 
     config = AutoDistConfig(recompute_modules='Decoder.Layer')
     model_graph = ModelGraph(ir_graph, config)

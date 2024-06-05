@@ -30,7 +30,7 @@ def test_program_model_nested_input():
 
         dummy_input = {'x': {'data': torch.randn(4, 4)}}
         module = MyModule()
-        model = SemanticModel(module, save_content=False, dynamic_shape=False)
+        model = SemanticModel(module, save_content=False, constant_folding=True)
 
         obj = IRObject(value=dummy_input['x'])
         model(obj)

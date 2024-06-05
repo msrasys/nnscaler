@@ -41,8 +41,8 @@ def test_to_graph():
     assert any(node.op == 'call_function' and node.target == torch.nn.functional.linear for node in nodes)
 
     with tempfile.TemporaryDirectory() as tempdir:
-        to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
-        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, dynamic_shape=True)
+        to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, constant_folding=False)
+        ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tempdir, constant_folding=False)
         assert ir_graph is not None
         assert (Path(tempdir) / FxModuleParser.ATTR_MAP_FILE).exists()
         assert (Path(tempdir) / FxModuleParser.ATTR_CONTENT_FILE_0).exists()
