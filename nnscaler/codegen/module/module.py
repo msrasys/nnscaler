@@ -849,7 +849,7 @@ class ModuleCodeGen(FuncEmission):
             fb.insert_body(f'return {output_names_tuple}')
         codes = [''] + fb.code + ['']
         codes.append(
-            f'{output_names_tuple} = ckpt.checkpoint(recompute, {input_names_tuple}, use_reentrant=True)'
+            f'{output_names_tuple} = ckpt.checkpoint(recompute, {input_names_tuple}, use_reentrant=False)'
         )
 
         return codes
