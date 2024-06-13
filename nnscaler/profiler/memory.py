@@ -4,7 +4,6 @@ from nnscaler.utils import print_each_rank
 import torch
 
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO)
 
 
 def memory_summary():

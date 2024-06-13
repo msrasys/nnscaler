@@ -882,20 +882,17 @@ class ModelGraph:
                     src_op.add_consumer(dst_op)
                     dst_op.add_producer(src_op)
 
-        # infer batch dims
+        # Infer batch dims
+        # Assume operators with parameters consume and generate tensors
+        # with batch dim. A search is followed to propagate the possible
+        # batch dim to the whole graph.
         seed_ops = []
         visited = set()
         for op in operator_list:
-            if len(op.producers) == 0 and len(op.in_tensors) > 0:
-                contain_non_param = False
-                for t in op.in_tensors:
-                    if not t.is_attr():
-                        contain_non_param = True
-                        break
-                if contain_non_param:
-                    _logger.info(f'add seed op {op.ir_cell}')
-                    seed_ops.append(op)
-                    visited.add(op.ir_cell.cid)
+            if any([t.is_param() for t in op.in_tensors]):
+                _logger.debug(f'add seed op {op.ir_cell}')
+                seed_ops.append(op)
+                visited.add(op.ir_cell.cid)
         dq = deque(seed_ops)
         while len(dq) > 0:
             op = dq.popleft()

@@ -33,7 +33,6 @@ from nnscaler.utils import print_each_rank, load_default_schedule
 
 
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO)
 
 
 def compile(model: Union[torch.nn.Module, SemanticModel], *args,

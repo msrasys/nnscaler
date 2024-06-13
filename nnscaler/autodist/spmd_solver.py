@@ -1188,6 +1188,7 @@ class SPMDSolver:
                 sig2split_info[sig] = []
             sig2comp_time[sig] += desc.comp_time
             op_idx2comp_time[op_idx] = desc.comp_time
+            comp_time_sum += desc.comp_time
             comm_cost = 0
             for k, comm_vec in enumerate(desc.comm_time):
                 producer = self.producers[op_idx][k]
@@ -1207,7 +1208,6 @@ class SPMDSolver:
             if sig not in sig2comm_time:
                 sig2comm_time[sig] = 0
             sig2comm_time[sig] += comm_cost
-            comp_time_sum += desc.comp_time
             comm_time_sum += comm_cost
 
         sig2comp_time = sorted(sig2comp_time.items(), key=lambda x: x[1], reverse=True)

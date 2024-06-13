@@ -143,3 +143,7 @@ def test_recompute():
     assert model_graph.min_recompute_mem == layer_node.train_mem
     fnodes = ir_graph.select(ntype=IRFwOperation)
     assert model_graph.recompute_groups == [fnodes[5 * (num_layers + i) : 5 * (num_layers + i) + 5] for i in range(num_layers)]
+
+    # will label operator like GELU and add with `has_batch_dim=True`
+    for op in model_graph.operator_list:
+        assert op.has_batch_dim, f'{op} does not have batch dim'

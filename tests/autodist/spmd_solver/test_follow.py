@@ -283,3 +283,75 @@ def test_follow_attention():
         ilp_spmd_outs = spmd_solver.do_ilp([(0, model_graph.op_num - 1)], 1)
         assert helper(dp_spmd_outs) == expected_out
         assert helper(ilp_spmd_outs) == expected_out
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
+def test_solver_data_parallel():
+    from nnscaler.ir.unique import IDGenerator
+    IDGenerator().clear()
+    bsz, seq_len, hidden_dim, num_heads = 2, 2048, 512, 8
+    dummy_input = {
+        'x': torch.rand(bsz, seq_len, hidden_dim),
+    }
+    model = AttentionModel(hidden_dim, num_heads)
+    model.train()
+    fx_graph = to_fx_graph(model, dummy_input)
+
+    with tempfile.TemporaryDirectory() as tempdir:
+        ir_graph = to_ir_graph(fx_graph,
+                               dummy_input,
+                               attr_savedir=tempdir,
+                               constant_folding=True)
+        print(ir_graph.nodes())
+
+        profile_dir = Path(os.path.dirname(__file__)) / './test_solver_data_parallel'
+        cfg = AutoDistConfig(mesh_col=2, profile_dir=profile_dir)
+        model_graph = ModelGraph(ir_graph, cfg)
+
+        spmd_solver = SPMDSolver(
+            graph=model_graph,
+            mesh_desc=cfg.mesh_desc,
+            autodist_config=cfg,
+            stage_num=1,
+            micro_batch_num=cfg.update_freq,
+        )
+
+        partition_counts = [
+            spmd_solver.get_op_partition_count(i)
+            for i in range(model_graph.op_num)
+        ]
+        print(partition_counts)
+        assert partition_counts == [
+            5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 6, 4, 4, 4, 6, 4, 4, 4, 5, 4
+        ]
+        # should generate a pure data parallel plan, e.g., partition the batch dim
+        expected_out = [
+            (2, (((0, 0), 2),)),
+            (3, (((0, 0), 2),)),
+            (4, (((0, 0), 2),)),
+            (5, (((0, 0), 2),)),
+            (6, (((0, 0), 2),)),
+            (7, (((0, 0), 2),)),
+            (8, (((0, 0), 2),)),
+            (9, (((0, 0), 2),)),
+            (10, (((0, 0), 2),)),
+            (11, (((0, 0), 2),)),
+            (12, (((0, 0), 2),)),
+            (13, (((0, 0), 2),)),
+            (14, (((0, 0), 2),)),
+            (15, (((0, 0), 2),)),
+            (16, (((0, 0), 2),)),
+            (17, (((0, 0), 2),)),
+            (18, (((0, 0), 2),)),
+            (19, (((0, 0), 2),)),
+            (20, (((0, 0), 2),)),
+            (21, (((0, 0), 2),))
+        ]
+
+        def helper(search_out):
+            return search_out[0][0].to_json()['desc']['partition_descs']
+
+        dp_spmd_outs = spmd_solver.do_dp([(0, model_graph.op_num - 1)], 1)
+        ilp_spmd_outs = spmd_solver.do_ilp([(0, model_graph.op_num - 1)], 1)
+        assert helper(dp_spmd_outs) == expected_out
+        assert helper(ilp_spmd_outs) == expected_out
+
