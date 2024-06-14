@@ -103,7 +103,7 @@ def compile(model: Union[torch.nn.Module, SemanticModel], *args,
                                dtype=arg.dtype).tosub()
             arg._value = tensor
         else:
-            arg = IRObject('obj', value=arg)
+            arg = IRObject('obj', value=arg, is_constant=False)
         inputs.append(arg)
 
     myrank = DeviceGroup().rank

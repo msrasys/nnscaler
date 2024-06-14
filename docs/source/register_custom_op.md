@@ -130,6 +130,33 @@ A `reduction` can be a set of {'', '+', '^'}:
 A dimension can also be annotated with inner-dimensions using brackets, i.e., '(' and ')'.
 The value of inner dimension needs to be inferrable, or indicated by function args (of same name).
 
+Please be very careful when you use '?'. If it depends on the tensor input,
+then the tensor input should be marked as non-partitionable.
+
+Example 1:
+```python
+@nnscaler.register_op('a^ b^ -> a^ b^, ?')
+def op1(x: torch.Tensor):
+    x = ...
+    y = some_func(x)
+    return x, y
+```
+
+Example 2:
+```python
+@nnscaler.register_op('a b -> a b, ?')
+def op1(x: torch.Tensor):
+    x = ...
+    y = 10
+    return x, y
+```
+
+In Example 1, as `y` has dependency on `x`, its value will be wrong if we partition `x`.
+So `x` should be marked as non-partitionable.
+
+In Example 2, `y` is a constant, and its value is independent of `x`.
+So we can mark `x` partitioned.
+
 ### Shape Annotation
 
   e.g., 'a (c+ d^) e'

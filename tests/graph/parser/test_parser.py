@@ -1,5 +1,8 @@
 import tempfile
+import pytest
 import torch
+
+import nnscaler
 from nnscaler.ir.cten import IRObject, IRTensor
 from nnscaler.graph.parser.converter import to_fx_graph, to_ir_graph
 
@@ -116,3 +119,55 @@ def test_min():
 
     assert isinstance(ir_graph.output(0), IRTensor)
     assert ir_graph.output(0).shape == (10, 1)
+
+
+@nnscaler.register_op('m n -> m n, m n, ?')
+def func_multi_outputs(x):
+    return x, x, 3
+
+
+@nnscaler.register_op('m n -> ?')
+def func_output_list(x, factor=1):
+    x = x * factor
+    return [x, x]
+
+
+@nnscaler.register_op('m n -> m n, m n')
+def func_output_list2(x, factor=1):
+    x = x * factor
+    return [x, x]
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('output_list', [True, False])
+def test_num_outputs(tmp_path, output_list):
+    class MyModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, x):
+            out = func_multi_outputs(x)
+            y, _, scalar = out
+            (sz, _) = y.shape
+            sz = sz + scalar
+            if output_list:
+                return func_output_list(y, factor=sz)
+            else:
+                return func_output_list2(y, factor=sz)
+
+    dummy_input = {'x': torch.randn(4, 4)}
+    module = MyModule()
+    fx_graph = to_fx_graph(module, dummy_input)
+
+    print(fx_graph.graph)
+    ir_graph = to_ir_graph(fx_graph, dummy_input, attr_savedir=tmp_path, constant_folding=False)
+    print(ir_graph.extra_repr())
+
+    assert len(ir_graph.nodes()) == 5
+    assert len(ir_graph.nodes()[0].outputs()) == 3
+    assert isinstance(ir_graph.output(0), list)
+    assert len(ir_graph.outputs()) == 1
+    if output_list:
+        assert len(ir_graph.nodes()[-1].outputs()) == 1
+    else:
+        assert len(ir_graph.nodes()[-1].outputs()) == 2

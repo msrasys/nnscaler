@@ -62,9 +62,9 @@ class FxModuleParser:
         # create IRObjects and IRTensors
         for node in module.graph.nodes:
             if node.op == 'placeholder':
-                FxModuleParser.init_objects(node, module, frame, dummy_inputs.get(node.name), is_constant=False)
+                FxModuleParser.init_objects(node, module, frame, is_constant=False)
             else:
-                FxModuleParser.init_objects(node, module, frame, None, is_constant=True)
+                FxModuleParser.init_objects(node, module, frame, is_constant=True)
 
         # get graph inputs
         placeholders = [n for n in module.graph.nodes if n.op == 'placeholder']
@@ -73,7 +73,7 @@ class FxModuleParser:
         #   it should be wrapped into an IRObject
         for idx, placeholder in enumerate(placeholders):
             if not isinstance(inputs[idx], IRObject):
-                obj = IRObject(name=placeholder.name, value=inputs[idx])
+                obj = IRObject(name=placeholder.name, value=inputs[idx], is_constant=False)
                 inputs[idx] = obj
                 frame.set_var(placeholder.name, obj)
 
@@ -85,6 +85,9 @@ class FxModuleParser:
 
         # get graph outputs
         outputs = [frame.get_var(node.name) for node in module.graph.nodes if node.op == 'output']
+        # currently fx graph always has only one output
+        # even if a tuple/list is returned, it is still just one output
+        assert len(outputs) == 1, f"Expect only one output, but got {len(outputs)}"
 
         if save_content:
             attr_savedir = Path(attr_savedir)
@@ -114,7 +117,7 @@ class FxModuleParser:
 
     @staticmethod
     def init_objects(node: torch.fx.Node, module: torch.fx.GraphModule,
-                     frame: Frame, concrete_value: Optional[Any] = None, is_constant: bool = True):
+                     frame: Frame, is_constant: bool = True):
         assert isinstance(node, torch.fx.Node)
 
         def meta2var(meta: Any) -> Any:
@@ -142,14 +145,9 @@ class FxModuleParser:
             # TODO: data type check, with cases like {'a': 1.2, 'b': torch.Tensor}
             return IRObject(name=node.name, value=meta, is_constant=is_constant)
 
-        if hasattr(node, 'meta') and 'tensor_meta' in node.meta:
-            meta = node.meta['tensor_meta']
-            val = meta2var(meta)
-        else:
-            # FIXME: double check: there should be a concrete value as example,
-            # otherwise, it may fail in parsing node like getattr
-            val = IRObject(name=node.name, value=concrete_value, is_constant=is_constant)
-
+        assert hasattr(node, 'meta') and 'tensor_meta' in node.meta, f"Node {node} should have tensor_meta"
+        meta = node.meta['tensor_meta']
+        val = meta2var(meta)
         frame.add_var(node.name, val)
 
     @staticmethod
@@ -221,11 +219,13 @@ class FxModuleParser:
             # case2: python runtime function
             else:
                 _logger.warning(f'Set python runtime function: {fsig}')
+                is_constant = True
                 if any_ir_object_satisfy(input_vals, lambda a: not a.is_constant):
-                    err_msg = f'non register python runtime function {fsig} has a non constant input: {input_vals}, ' + \
-                            'please register it as a customized function using nnscaler.graph.parser.register'
-                    raise RuntimeError(err_msg)
-                ir_node = IRPyFunc(fsig, input_vals, [IRObject()], **kwargs)
+                    warning_msg = f'non register python runtime function {fsig} has a non constant input: {input_vals}, ' + \
+                            'You can register it as a customized function using nnscaler.register_op to remove this warning'
+                    _logger.warning(warning_msg)
+                    is_constant = False
+                ir_node = IRPyFunc(fsig, input_vals, [IRObject(frame.get_var(node.name), is_constant=is_constant)], **kwargs)
 
         if isinstance(ir_node, IRCell):
             module_stack = node.meta.get('nn_module_stack')
@@ -266,6 +266,8 @@ class FxModuleParser:
                         )
                 ir_node.set_output(0, output_val)
         else:
+            # SignFx2Op may return object that is not IRCell but a concrete value, for example Add.
+            # As node is deleted, we must set concrete value or IRTensor/IRObject into framework.
             frame.set_var(node.name, ir_node)
 
         _logger.debug(f'parsing result: {ir_node}')

@@ -648,7 +648,7 @@ def _gen_graph(
         # the IRObject representing the `dataloader` instance, which is only used by the
         # IRDataOperation. Since we already know the output of the dataloader,
         # we don't need to set the value for it.
-        ir_root_obj = IRObject(name='dataloader', value=None)
+        ir_root_obj = IRObject(name='dataloader', value=None, is_constant=False)
         Program().set_input([ir_root_obj])
         data_op = IRDataOperation(ir_root_obj, ir_dummy_inputs)
         # add the data operation to the graph, which will use `next` to get data.

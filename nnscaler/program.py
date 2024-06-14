@@ -101,7 +101,7 @@ class SemanticDataLoader:
         # the IRObject representing the `dataloader` instance, which is only used by the
         # IRDataOperation. Since we already know the output of the dataloader,
         # we don't need to set the value for it.
-        self.irobj = IRObject(name='dataloader', value=None)
+        self.irobj = IRObject(name='dataloader', value=None, is_constant=False)
 
     def __iter__(self):
         return self

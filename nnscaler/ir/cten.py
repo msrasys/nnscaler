@@ -425,9 +425,11 @@ class IRObject:
             val (Any): the value of this object
             is_constant (bool): if the value is a constant during the whole training / inference
                 This flag is only used in constant_folding mode, to prevent the object from being folded.
-                An IROject is considered constant only when:
-                    1. val is not a tensor
-                    2. val is model input, or is the result of a non-torch operation on another constant IRObject
+                An IROject is considered not constant when either of two satisifies:
+                    1. val is a tensor
+                    2. val is model input, or is the result of a non-torch operation on another not constant IRObject
+                Please note is_constant flag is only used in parser,
+                so after parser, you can totally ignore this flag.
         """
         self._id: int = tid if isinstance(tid, int) else IDGenerator().gen_tensor_id()
         self.name: str = name if name else 'obj'
@@ -545,7 +547,7 @@ class IRTensor(IRObject):
 
     def __init__(self, shape=None, name='tensor', dtype=None, tid=None):
 
-        super().__init__(name, tid)
+        super().__init__(name, tid, is_constant=False)
         self._shape: Tuple[int] = () if shape is None else tuple(shape)
         self._cell: Optional[IRCell] = None
         self._dtype: Optional[torch.dtype] = dtype
