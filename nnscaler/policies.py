@@ -210,7 +210,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     mesh_col = pas_cfg.get('mesh_col', cfg.plan_ngpus)
     if mesh_col != cfg.plan_ngpus:
         raise ValueError("mesh_col should be equal to plan_ngpus")
-    mem_constraint = pas_cfg.get('mem_constraint', -1)
+    memory_constraint = pas_cfg.get('mem_constraint', -1)
     task_name = pas_cfg.get('task_name', '_')
     use_memory_efficient_fp16 = pas_cfg.get('use_memory_efficient_fp16', False)
     use_memory_efficient_bf16 = pas_cfg.get('use_memory_efficient_bf16', False)
@@ -228,7 +228,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     mesh_row = 1
     ngpus = mesh_row * mesh_col
     task_name = f'{task_name}_{ngpus}gpus_{update_freq}update_freq'
-    if mem_constraint == -1:
+    if memory_constraint == -1:
         # consider memory fragmentation and other buffers, use 80% of the memory
         memory_constraint = int(0.8 * torch.cuda.mem_get_info()[1] / 1024 /
                                 1024 / 1024)
