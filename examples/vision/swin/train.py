@@ -86,7 +86,7 @@ def train(args, compute_config: nnscaler.ComputeConfig):
 
     model: nnscaler.ParallelModule = nnscaler.parallelize(
         model,
-        dummy_input={'x': gen_data()},
+        dummy_forward_args={'x': gen_data()},
         pas_policy=policy,
         compute_config=compute_config,
         reuse='moo',

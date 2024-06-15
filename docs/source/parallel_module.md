@@ -28,7 +28,7 @@ class LLM(torch.nn.Module):
     def forward(self, x):
         ...
 
-llm_sample_input = ...              # dummpy input will be used to do tracing
+llm_sample_input = ...              # dummy input will be used to do tracing
 pas_policy = ...                    # the PAS policy, you can use autodist pas
 compute_config = ComputeConfig(
     plan_ngpus=...,
@@ -133,7 +133,7 @@ class End2EndMLP(nn.Module):
         loss = self.loss_fn(x, data['target'])
         return loss
 
-    llm_sample_input = {'data': ..., 'target': ...}  # dummpy input will be used to do tracing
+    llm_sample_input = {'data': ..., 'target': ...}  # dummy input will be used to do tracing
     pas_policy = ...                    # the PAS policy, you can use autodist pas
     compute_config = ComputeConfig(
         plan_ngpus=...,
@@ -383,7 +383,7 @@ We have `parallelize` function to Convert a torch.nn.Module to a ParallelModule.
 ```python
 def parallelize(
     module_or_module_class: Union[torch.nn.Module, Type[torch.nn.Module]],
-    dummy_input: dict,
+    dummy_forward_args: Dict[str, Any],
     pas_policy: Callable[[IRGraph, ComputeConfig], IRGraph],
     compute_config: ComputeConfig,
     *,
@@ -401,7 +401,11 @@ It has the following parameters:
 
 - `module_or_module_class` (`Union[torch.nn.Module, Type[torch.nn.Module]]`): the module or module class to be compiled. Please note if the input is a module object, we will return a `ParallelModule` object. If the input is a module class, we will return a `ParallelModule` class.
 
-- `dummy_input` (`dict`): the dummy input for the module. The keys are the argument names of `Module.forward` function, and the values are the dummy input for the arguments. The dummy input will be used to trace the module. Please note the module can't be parallelize if `Module.forward` has positional-only arguments.
+- `dummy_forward_args` (`Dict[str, Any]`): the dummy input for the module forward.
+The keys are the argument names of `Module.forward` function,
+and the values are the dummy input for the arguments.
+The dummy forward args will be used to trace the module.
+Please note the module can't be parallelize if `Module.forward` has positional-only arguments.
 
 - `pas_policy` (`Union[str, Callable[[IRGraph, ComputeConfig], IRGraph]]`): the pas (partition-assign-schedule) policy, which describes how to place all computations across devices.
 You need either pass a builtin PAS policy name or a a custom policy function which should take an `IRGraph` and a `ComputeConfig` as input, and return a new `IRGraph` with the PAS policy applied.

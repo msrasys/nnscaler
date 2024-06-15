@@ -32,7 +32,7 @@ class ClassificationModel(LightningModule):
         self.test_acc = acc.clone()
 
     @property
-    def dummy_input(self):
+    def dummy_forward_args(self):
         return {'x': torch.randn(self.batch_size, self.num_features)}
 
     def forward(self, x):
@@ -165,7 +165,7 @@ class BoringModel(LightningModule):
         self.layer = torch.nn.Linear(32, 2)
 
     @property
-    def dummy_input(self):
+    def dummy_forward_args(self):
         return {'x': torch.randn(32)}
 
     def forward(self, x: Tensor) -> Tensor:

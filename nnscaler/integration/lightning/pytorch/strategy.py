@@ -200,10 +200,10 @@ class NnScalerStrategy(ParallelStrategy):
     def _setup_model(self, model: Module) -> Module:
         """Set up a module for inference (no optimizers).
         """
-        if getattr(model, 'dummy_input', None) is None:
-            raise ValueError("The `dummy_input` must be defined as a property in the module.")
-        if not isinstance(model.dummy_input, dict):
-            raise ValueError("The `dummy_input` must be a dictionary with forward arguments names as keys.")
+        if getattr(model, 'dummy_forward_args', None) is None:
+            raise ValueError("The `dummy_forward_args` must be defined as a property in the module.")
+        if not isinstance(model.dummy_forward_args, dict):
+            raise ValueError("The `dummy_forward_args` must be a dictionary with forward arguments names as keys.")
 
         old_training_flag = model.training
         if not old_training_flag:
@@ -211,7 +211,7 @@ class NnScalerStrategy(ParallelStrategy):
         model.train()  # always use the model in training mode
         pmodule = nnscaler.parallelize(
             model,
-            self.precision_plugin.convert_input(model.dummy_input),
+            self.precision_plugin.convert_input(model.dummy_forward_args),
             self.pas_policy,
             self.compute_config,
             gen_savedir=self.gen_savedir,

@@ -5,7 +5,7 @@ from nnscaler.ir.operator import IRFwOperation
 from nnscaler.parallel import parallelize, ComputeConfig, ReuseType
 import torch.distributed as dist
 from flash_attn import flash_attn_func
- 
+
 import nnscaler.graph
 import nnscaler.graph.function
 from examples.zigzag_ring_attention.zigzag_attn import wrap_zigzag_attn_func
@@ -14,9 +14,9 @@ import random
 
 def set_seed(rank, seed=42):
     seed = rank + seed
-    random.seed(seed)             
-    torch.manual_seed(seed)      
-    torch.cuda.manual_seed(seed)  
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 def log(msg, a, rank0_only=False):
@@ -47,7 +47,7 @@ def log(msg, a, rank0_only=False):
 class TestModule(torch.nn.Module):
     def __init__(self):
         super(TestModule, self).__init__()
- 
+
     def forward(self, _in0, _in1, _in2):
         out = wrap_zigzag_attn_func(_in0, _in1, _in2)
         return out
@@ -103,7 +103,7 @@ if __name__ == "__main__":
     _in1 = k.detach().clone().requires_grad_()
     _in2 = v.detach().clone().requires_grad_()
 
-    parallel_model = parallelize(model, dummy_input={"_in0": _in0, "_in1": _in1, "_in2": _in2}, pas_policy=policy,
+    parallel_model = parallelize(model, dummy_forward_args={"_in0": _in0, "_in1": _in1, "_in2": _in2}, pas_policy=policy,
                                  compute_config=ComputeConfig(world_size, world_size), reuse=ReuseType.OVERRIDE)
     parallel_model = parallel_model.cuda()
 

@@ -586,7 +586,7 @@ def _prepare_and_check_reusable(
 
 def _gen_graph(
     module: torch.nn.Module,
-    dummy_input: dict,
+    dummy_forward_args: dict,
     outdir: Path,
     constant_folding: bool,
     end2end_mode: bool = False,
@@ -605,12 +605,12 @@ def _gen_graph(
             raise ValueError(f"Default value type {type(v)} of forward args is not supported.")
 
     # generate fx graph
-    dummy_input = _to_cpu(dummy_input)
-    fx_graph = parser.to_fx_graph(module, dummy_input)
+    dummy_forward_args = _to_cpu(dummy_forward_args)
+    fx_graph = parser.to_fx_graph(module, dummy_forward_args)
 
     # generate ir logic graph
     ir_graph = parser.to_ir_graph(
-        fx_graph, dummy_input, outdir, constant_folding
+        fx_graph, dummy_forward_args, outdir, constant_folding
     )
 
     # generate dummy inputs for logic graph
@@ -625,15 +625,15 @@ def _gen_graph(
     ir_dummy_inputs = []
     for node in fx_input_nodes:
         if node.target.startswith('*'):  # *args or **kwargs
-            if node.target.strip('*') in dummy_input:
+            if node.target.strip('*') in dummy_forward_args:
                 raise ValueError(f"Input {node.target}: *args or **kwargs is not suppported")
             ir_dummy_inputs.append(None)  # always set None to *args/**kwargs
-        elif node.target in dummy_input:
-            ir_dummy_inputs.append(dummy_input[node.target])
+        elif node.target in dummy_forward_args:
+            ir_dummy_inputs.append(dummy_forward_args[node.target])
         elif forward_args[node.target] is not inspect.Parameter.empty:
             ir_dummy_inputs.append(forward_args[node.target])
         else:
-            raise ValueError(f"Input {node.target} not in dummy input, nor has default value.")
+            raise ValueError(f"Input {node.target} not in dummy forward args, nor has default value.")
     for i in range(len(ir_dummy_inputs)):
         ir_dummy_inputs[i] = to_ir_input(ir_dummy_inputs[i], fx_input_nodes[i].target)
         # if the input is not a tensor, we should wrap it with IRObject
@@ -685,7 +685,7 @@ def _gen_graph(
 
 def _gencode(
         module_or_module_class: torch.nn.Module,
-        dummy_input: dict,
+        dummy_forward_args: Dict[str, Any],
         pas_policy: Callable[[IRGraph, ComputeConfig], IRGraph],
         compute_config: ComputeConfig,
         outdir: Path,
@@ -705,7 +705,7 @@ def _gencode(
 
     Args:
         module (torch.nn.Module): the module to be compiled
-        dummy_input (dict): the dummy input for the module
+        dummy_forward_args (Dict[str, Any]): the dummy input for the module forward
         pas_policy (Callable[[IRGraph, ComputeConfig], IRGraph]): the pas policy
         compute_config (ComputeConfig): the environment resource
         outdir (Path): the directory to save generated code
@@ -753,7 +753,7 @@ def _gencode(
         torch.save(meta_info, origin_module_metadata_ckp)
 
         graph, forward_args = _gen_graph(
-            module, dummy_input, outdir,
+            module, dummy_forward_args, outdir,
             constant_folding=compute_config.constant_folding, end2end_mode=compute_config.use_end2end,
             inference_only=compute_config.inference_only,
             use_pipeline=compute_config.use_pipeline,
@@ -869,7 +869,7 @@ def _load_parallel_module_class(
 
 def parallelize(
     module_or_module_class: Union[torch.nn.Module, Type[torch.nn.Module]],
-    dummy_input: dict,
+    dummy_forward_args: Dict[str, Any],
     pas_policy: Union[str, Callable[[IRGraph, ComputeConfig], IRGraph]],
     compute_config: ComputeConfig,
     *,
@@ -938,7 +938,7 @@ def parallelize(
 
     Args:
         module_or_module_class (Union[torch.nn.Module, Type[torch.nn.Module]]): the module or module class to be compiled
-        dummy_input (dict): the dummy input for the module
+        dummy_forward_args (Dict[str, Any]): the dummy input for the module forward
         pas_policy (Union[str, Callable[[IRGraph, ComputeConfig], IRGraph]]): the pas policy,
             it can be a name of builtin policies, or a custom policy function.
         compute_config (ComputeConfig): the environment resource
@@ -999,7 +999,7 @@ def parallelize(
             with _compile_flags(compute_config):
                 regen_status = _gencode(
                     module_or_module_class,
-                    dummy_input,
+                    dummy_forward_args,
                     pas_policy,
                     compute_config,
                     outdir,
