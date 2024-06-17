@@ -1,0 +1,26 @@
+compute_config:
+  plan_ngpus: 4
+  runtime_ngpus: 100
+  constant_folding: true
+  use_zero: true
+  use_end2end: true
+
+run_mode: run
+pas_policy: autodist
+micro_batch_size: 2
+global_batch_size: 8
+max_epochs: 4
+
+model_class: tests.cli.common.MLP
+model_args:
+  dim: 16
+  nlayers: 16
+
+optimizer_class: torch.optim.Adam
+optimizer_args:
+  lr: 0.01
+
+dataset_class: tests.cli.common.SimpleDataset
+train_dataset_args:
+  dim: 16
+  size: 100

@@ -141,7 +141,7 @@ if __name__ == '__main__':
 
     if torch.distributed.get_world_size() != args.dp_size * args.pp_size * args.tp_size:
         raise ValueError('world size should be equal to dp_size * pp_size * tp_size')
-    if args.gbs % args.mbs != 0:
+    if args.gbs % (args.mbs * args.dp_size) != 0:
         raise ValueError('global batch size should be divisible by micro batch size')
 
     compute_config=nnscaler.ComputeConfig(
@@ -151,7 +151,7 @@ if __name__ == '__main__':
         use_end2end=True,
         constant_folding=True,
         use_pipeline=args.pp_size > 1,
-        pipeline_nmicros=args.gbs // args.mbs,
+        pipeline_nmicros=args.gbs // args.mbs // args.dp_size,
         pipeline_nstages=args.pp_size,
         pas_config={
             # customized settings that can affect code generation.
@@ -161,7 +161,7 @@ if __name__ == '__main__':
             '_tp_size': args.tp_size,
             '_dp_size': args.dp_size,
             # for autodist only
-            'update_freq': args.gbs // args.mbs,
+            'update_freq': args.gbs // args.mbs// args.dp_size,
             'use_fp16': args.fp16,
         },
         user_config={
