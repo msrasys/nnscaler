@@ -109,7 +109,7 @@ class ModelCompiler:
                 model,
                 self.dummy_input,
                 pas_policy=self.policy,
-                compute_config=ComputeConfig(1, 1, dynamic_shape=False),
+                compute_config=ComputeConfig(1, 1),
                 reuse='override',
                 load_module=True
             )

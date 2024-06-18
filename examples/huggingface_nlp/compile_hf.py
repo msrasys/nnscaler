@@ -408,6 +408,8 @@ if __name__ == "__main__":
     if torch.distributed.get_rank() == 0:
         if not args.log_dir.exists():
             args.log_dir.mkdir()
+        if not args.cache_dir.exists():
+            args.cache_dir.mkdir()
 
     # load error dict
     error_dict = load_error_summary(args.log_dir)
