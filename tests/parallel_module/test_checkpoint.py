@@ -286,7 +286,7 @@ def assert_model_state_dict_equal(state_dict1: dict, state_dict2: dict):
         assert torch.equal(state_dict1[index].cpu(), state_dict2[index].cpu())
 
 
-def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inference_module: torch.nn.Module = None):
+def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inference_module: torch.nn.Module = None, check_merge_log=False):
     ckpt_file_template = 'ckpt_{rank}_{start}.pth'
     ckpt_merged_file_template = 'ckpt_merged_{start}.pth'
     temp_inferenece_ckpt_file_template = 'inference-{rank}.pth'
@@ -398,7 +398,25 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
         ckpt_state_dicts = [torch.load(f) for f in ckpt_files]
         model_state_dicts = [ckpt['model'] for ckpt in ckpt_state_dicts]
         optimizer_state_dicts = [ckpt['optimizer'] for ckpt in ckpt_state_dicts]
-        merged_model_state_dicts, merged_optimizer_state_dict = merge_state_dicts(model_state_dicts, optimizer_state_dicts)
+        if check_merge_log:
+            from nnscaler.runtime.module import _logger
+            import logging
+            from io import StringIO
+            string_stream = StringIO()
+            old = _logger.level
+            _logger.setLevel(logging.DEBUG)
+            handler = logging.StreamHandler(string_stream)
+            handler.setLevel(logging.DEBUG)
+            _logger.addHandler(handler)
+            merged_model_state_dicts, merged_optimizer_state_dict = merge_state_dicts(model_state_dicts, optimizer_state_dicts)
+            logs = string_stream.getvalue()
+            # check some zero merging is skipped due to replicate
+            assert 'skip merging duplicated optimizer state for param' in logs
+            assert 'skip merging duplicated model state for param' in logs
+            _logger.removeHandler(handler)
+            _logger.setLevel(old)
+        else:
+            merged_model_state_dicts, merged_optimizer_state_dict = merge_state_dicts(model_state_dicts, optimizer_state_dicts)
         torch.save({
             'model': merged_model_state_dicts,
             'optimizer': merged_optimizer_state_dict
@@ -521,3 +539,27 @@ def test_checkpoint_intra_reducer(module_type, use_zero):
                 assert torch.equal(a.grads[k], b.grads[k])
             for k in a.weights.keys():  # weights
                 assert torch.equal(a.weights[k], b.weights[k])
+
+
+def _gpu_merge_worker():
+    init_distributed()
+    with clear_dir_on_rank0(Path(tempfile.gettempdir()) / 'cube_test_ckpt_merge') as tempdir:
+        compiled_module = _create_cube_module('data',
+            ComputeConfig(2, 2, use_zero=True),
+            tempdir,
+            'whole',
+        )
+        _train(
+            compiled_module,
+            1,
+            0,
+            0,
+            8,
+            tempdir,
+            check_merge_log=True
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
+def test_checkpoint_merge():
+    launch_torchrun(2, _gpu_merge_worker)
