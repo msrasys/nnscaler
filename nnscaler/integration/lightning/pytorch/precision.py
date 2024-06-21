@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Any, Callable, ContextManager, Dict, Literal, 
 
 import torch
 from torch import Tensor
+import torch.distributed
 from torch.optim import Optimizer
 import torch.amp
 
@@ -16,7 +17,7 @@ from lightning.fabric.utilities.types import Steppable
 from lightning.pytorch.utilities import GradClipAlgorithmType
 
 
-_PRECISION_INPUT = Literal["32-true", "16-true", "bf16-true"]
+_PRECISION_INPUT = Literal["32-true", "16-true", "bf16-true", "16-mixed", "bf16-mixed"]
 
 
 class NnScalerPrecision(Precision):
@@ -25,7 +26,8 @@ class NnScalerPrecision(Precision):
     .. warning::  This is an :ref:`experimental <versioning:Experimental API>` feature.
 
     Args:
-        precision: Full precision (32-true), half precision (16-true, bf16-true)
+        precision: Full precision (32-true), half precision (16-true, bf16-true) or
+            mixed precision (16-mixed, bf16-mixed).
 
     Raises:
         ValueError:
@@ -56,6 +58,8 @@ class NnScalerPrecision(Precision):
         self.scaler = scaler
 
         precision_to_type = {
+            "bf16-mixed": torch.float32,
+            "16-mixed": torch.float32,
             "bf16-true": torch.bfloat16,
             "16-true": torch.float16,
             "32-true": torch.float32,
@@ -80,7 +84,9 @@ class NnScalerPrecision(Precision):
 
     @override
     def forward_context(self) -> ContextManager:
-        return _DtypeContextManager(self._desired_input_dtype)
+        if "mixed" in self.precision:
+            return torch.autocast("cuda", dtype=(torch.bfloat16 if self.precision == "bf16-mixed" else torch.float16))
+        return self.tensor_init_context()
 
     @override
     def convert_input(self, data: Any) -> Any:
@@ -97,6 +103,17 @@ class NnScalerPrecision(Precision):
         return super().pre_backward(tensor, module)
 
     @override
+    def _after_closure(self, model: "pl.LightningModule", optimizer: Steppable) -> None:
+        if self.scaler is None:  # will be handled in optimizer_step instead of here when using scaler
+            self._sync_grad(model, optimizer)
+        super()._after_closure(model, optimizer)
+
+    def _sync_grad(self, model: "pl.LightningModule", optimizer: Steppable):
+        optimizer.sync_shard_grad()  # closure is used, so we have to sync gradients after closure
+        cf = model._trainer.strategy.compute_config
+        optimizer.scale_grads(cf.plan_ngpus / cf.runtime_ngpus)
+
+    @override
     def optimizer_step(  # type: ignore[override]
         self,
         optimizer: Steppable,
@@ -107,23 +124,26 @@ class NnScalerPrecision(Precision):
         if self.scaler is None:
             return super().optimizer_step(optimizer, model=model, closure=closure, **kwargs)
 
-        closure_result = closure()
+        # TODO: test the following logic
 
-        if not _optimizer_handles_unscaling(optimizer):
-            # Unscaling needs to be performed here in case we are going to apply gradient clipping.
-            # Optimizers that perform unscaling in their `.step()` method are not supported (e.g., fused Adam).
-            # Note: `unscale` happens after the closure is executed, but before the `on_before_optimizer_step` hook.
-            self.scaler.unscale_(optimizer)  # type: ignore[arg-type]
+        closure_result = closure()
+        self._sync_grad(model, optimizer)
+        # Note: `unscale` happens after the closure is executed, but before the `on_before_optimizer_step` hook.
+        # Unscaling needs to be performed after grad sync but before gradient clipping
+        self.scaler.unscale_(optimizer)
 
         self._after_closure(model, optimizer)
-        skipped_backward = closure_result is None
-        # in manual optimization, the closure does not return a value
-        if not model.automatic_optimization or not skipped_backward:
-            # note: the scaler will skip the `optimizer.step` if nonfinite gradients are found
-            step_output = self.scaler.step(optimizer, **kwargs)  # type: ignore[arg-type]
-            self.scaler.update()
-            return step_output
-        return closure_result
+
+        if not model.automatic_optimization:
+            raise ValueError("nnscaler does not support manual optimization.")
+        if closure_result is None:
+            # in manual optimization, the closure does not return a value
+            raise ValueError("nnscaler does not support None as the return value of the closure.")
+
+        # note: the scaler will skip the `optimizer.step` if nonfinite gradients are found
+        step_output = self.scaler.step(optimizer, **kwargs)  # type: ignore[arg-type]
+        self.scaler.update()
+        return step_output
 
     def clip_gradients(
         self,
@@ -138,3 +158,14 @@ class NnScalerPrecision(Precision):
             raise ValueError('nnscaler does not support clipping gradients by value.')
         elif gradient_clip_algorithm == GradClipAlgorithmType.NORM:
             optimizer.clip_gnorm(clip_val)  # define in nnscaler
+
+    @override
+    def state_dict(self) -> Dict[str, Any]:
+        if self.scaler is not None:
+            return self.scaler.state_dict()
+        return {}
+
+    @override
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        if self.scaler is not None:
+            self.scaler.load_state_dict(state_dict)

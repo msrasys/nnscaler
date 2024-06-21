@@ -487,7 +487,11 @@ To support distributed training, in the function we need to hook 4 places (which
 
 `build_optimizer` will patch optimizer for you. Besides the above patches, we also add several utility functions/variables to optimizer:
 
-1. `sync_shard_grad`: Sync the shard gradients of the module from nodes with same shard to the optimizer. This function is called in optimizer's pre-step hook. But If you want to access the gradients before `optimizer.step()`(for example, you need gnorm),  you need to call this function manually.
+1. `sync_shard_grad`: Sync the shard gradients of the module from nodes with same shard to the optimizer.
+Please note the gradients are `None` until `optimizer.sync_shard_grad()` is called.
+This function is called in optimizer's pre-step hook.  You need to manually call it in two cases:
+    - If you want to access the gradients before `optimizer.step()`.
+    - When closure is used in optimizer.step(). In this case, optimizer's pre-step hook will be called before `train_step`, so no gradients are synced.
 
 2. `scale_grads`: Scale the gradients of the module by multiplying a factor. This function is useful to avoid overflow when the gradients are large. Please note you can only call this function **after** `sync_shard_grad`, because the gradients are `None` until `sync_shard_grad` is called.
 

@@ -133,3 +133,19 @@ def assert_equal(a: Any, b: Any):
             assert_equal(a[i], b[i])
     else:
         assert a == b
+
+
+def assert_close(a: Any, b: Any, atol=1e-6, rtol=1e-6):
+    assert type(a) == type(b)
+    if isinstance(a, torch.Tensor):
+        assert torch.allclose(a.cpu(), b.cpu(), atol=atol, rtol=rtol)
+    elif isinstance(a, dict):
+        assert len(a) == len(b)
+        for k in a.keys():
+            assert_close(a[k], b[k])
+    elif isinstance(a, (list, tuple)):
+        assert len(a) == len(b)
+        for i in range(len(a)):
+            assert_close(a[i], b[i])
+    else:
+        raise ValueError(f'unsupported type {type(a)}')

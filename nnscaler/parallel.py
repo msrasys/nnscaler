@@ -1319,6 +1319,10 @@ def build_optimizer(
         for m in parallel_modules:
             m.gather_params()
 
+    # Please note:
+    # register_step_pre_hook doesn't work expectly
+    # when closure is used in optimizer.step()
+    # in that case, you must call sync_shard_grad() manually
     optimizer.register_step_pre_hook(_step_pre_hook)
     optimizer.register_step_post_hook(_step_post_hook)
 

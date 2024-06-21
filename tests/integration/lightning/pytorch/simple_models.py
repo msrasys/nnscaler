@@ -6,6 +6,7 @@ from torch.optim.lr_scheduler import LRScheduler
 import torch.nn.functional as F
 from lightning.pytorch import LightningModule
 from torch import Tensor, nn
+from torch.optim.optimizer import Optimizer
 from torchmetrics import Accuracy
 from torch.utils.data import DataLoader, Dataset, IterableDataset, Subset
 
@@ -30,10 +31,12 @@ class ClassificationModel(LightningModule):
         self.train_acc = acc.clone()
         self.valid_acc = acc.clone()
         self.test_acc = acc.clone()
+        self.dummy_forward_args_fn = lambda batch: {"x": batch[0]}
+        self.update_history = []
 
-    @property
-    def dummy_forward_args(self):
-        return {'x': torch.randn(self.batch_size, self.num_features)}
+    # @property
+    # def dummy_forward_args(self):
+    #     return {'x': torch.randn(self.batch_size, self.num_features)}
 
     def forward(self, x):
         x = self.layer_0(x)
@@ -76,6 +79,24 @@ class ClassificationModel(LightningModule):
         assert not self.training
         x, _ = batch
         return self.forward(x)
+
+    def configure_gradient_clipping(self, optimizer: Optimizer, gradient_clip_val, gradient_clip_algorithm) -> None:
+        def _fix_name(name):
+            prefix = 'nnscaler_pmodule.'
+            if name.startswith(prefix):
+                return name[len(prefix):]
+            return name
+        grads = {_fix_name(n): p.grad.cpu() for n, p in self.named_parameters()}
+        weights = {_fix_name(n): p.data.cpu() for n, p in self.named_parameters()}
+        self.update_history.append((grads, weights))
+        return super().configure_gradient_clipping(optimizer, gradient_clip_val, gradient_clip_algorithm)
+
+
+class ClassificationModelWithLRScheduler(ClassificationModel):
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+        return [optimizer], [scheduler]
 
 
 class RandomDictDataset(Dataset):

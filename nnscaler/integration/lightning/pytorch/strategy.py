@@ -1,8 +1,9 @@
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 import logging
 from pathlib import Path
 import os
+import types
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -22,9 +23,11 @@ from typing import (
 
 import torch
 from torch import Tensor
+import torch.distributed
 from torch.nn import Module
 from torch.optim import Optimizer
 from typing_extensions import TypeGuard, override
+from torch.utils.data import DataLoader
 
 import lightning.pytorch as pl
 from lightning.pytorch.accelerators import Accelerator, CUDAAccelerator
@@ -55,6 +58,7 @@ from lightning.pytorch.utilities import GradClipAlgorithmType
 
 import nnscaler
 from nnscaler.integration.lightning.utils import inplace_optimizer_fn
+from nnscaler.runtime.device import DeviceGroup
 from .precision import NnScalerPrecision
 
 
@@ -196,14 +200,38 @@ class NnScalerStrategy(ParallelStrategy):
         if self.lightning_module.trainer.gradient_clip_algorithm == GradClipAlgorithmType.VALUE:
             raise MisconfigurationException("nnscaler does not support clipping gradients by value.")
 
+    def _get_dummy_forward_args(self, model: pl.LightningModule) -> Dict[str, Any]:
+        # two options to set the dummy forward arguments
+
+        if hasattr(model, 'dummy_forward_args'):
+            if not isinstance(model.dummy_forward_args, dict):
+                raise ValueError("The `dummy_forward_args` must be a dictionary with forward arguments names as keys.")
+            return model.dummy_forward_args
+
+        if hasattr(model, 'dummy_forward_args_fn'):
+            dummy_forward_args_fn = getattr(model, 'dummy_forward_args_fn')
+            if not callable(dummy_forward_args_fn):
+                raise ValueError("The `dummy_forward_args_fn` must be a callable function.")
+            trainer = model._trainer
+            data_source = trainer.fit_loop._data_source
+            assert data_source is not None, "The `data_source` must be defined in the trainer."
+            assert data_source.instance is not None, "The `instance` must be defined in the data source."
+            with enforce_0_num_worker(DataLoader):
+                dataloader = data_source.dataloader()
+                assert dataloader.num_workers == 0, "The dataloader must have `num_workers=0`."
+                data = next(iter(dataloader))
+                dummy_forward_args = dummy_forward_args_fn(data)
+                if not isinstance(dummy_forward_args, dict):
+                    raise ValueError("The return value of `dummy_forward_args_fn` must be a dictionary with forward arguments names as keys.")
+                return dummy_forward_args
+
+        raise ValueError("The `dummy_forward_args` or `dummy_forward_args_fn` must be defined in the module.")
+
     @override
     def _setup_model(self, model: Module) -> Module:
         """Set up a module for inference (no optimizers).
         """
-        if getattr(model, 'dummy_forward_args', None) is None:
-            raise ValueError("The `dummy_forward_args` must be defined as a property in the module.")
-        if not isinstance(model.dummy_forward_args, dict):
-            raise ValueError("The `dummy_forward_args` must be a dictionary with forward arguments names as keys.")
+        dummy_forward_args = self._get_dummy_forward_args(model)
 
         old_training_flag = model.training
         if not old_training_flag:
@@ -211,7 +239,7 @@ class NnScalerStrategy(ParallelStrategy):
         model.train()  # always use the model in training mode
         pmodule = nnscaler.parallelize(
             model,
-            self.precision_plugin.convert_input(model.dummy_forward_args),
+            self.precision_plugin.convert_input(dummy_forward_args),
             self.pas_policy,
             self.compute_config,
             gen_savedir=self.gen_savedir,
@@ -239,6 +267,24 @@ class NnScalerStrategy(ParallelStrategy):
         model.to(self.root_device)
         # rewrite model forward to parallelized model forward
         model.forward = pmodule.forward
+
+        # patch log function to add sync_dist_group
+        rank = torch.distributed.get_rank()
+        # create all groups
+        plan_ngpus = self.compute_config.plan_ngpus
+        runtime_ngpus = self.compute_config.runtime_ngpus
+        for i in range(plan_ngpus):
+            DeviceGroup().get_group(
+                list(range(i, runtime_ngpus, plan_ngpus))
+            )
+        sync_group = list(range(rank % plan_ngpus, runtime_ngpus, plan_ngpus))
+
+        _old_log = model.log
+        def _new_log(self, *args, **kwargs) -> None:
+            kwargs['sync_dist_group'] = sync_group
+            _old_log(*args, **kwargs)
+        model.log = types.MethodType(_new_log, model)
+        model._old__log = _old_log
 
         return model
 
@@ -496,3 +542,15 @@ class NnScalerStrategy(ParallelStrategy):
 
     def _get_process_group_backend(self) -> str:
         return 'nccl'  # nnscaler only support nccl
+
+
+@contextmanager
+def enforce_0_num_worker(cls) -> Generator[None, None, None]:
+    """Context manager to enforce the number of workers to be 0 in DataLoader."""
+    _old__init__ = cls.__init__
+    def _new__init__(self, *args, **kwargs) -> None:
+        kwargs['num_workers'] = 0
+        _old__init__(self, *args, **kwargs)
+    cls.__init__ = _new__init__
+    yield
+    cls.__init__ = _old__init__
