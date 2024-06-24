@@ -98,7 +98,7 @@ class AutoDistConfig:
     - max_pipeline_unbalance_ratio (`float`, *optional*, defaults to `0.5`):
         The maximum unbalance ratio in pipeline parallelism. The higher the ratio, the more unbalance is required,
         the smaller search space will be explored.
-    - solver (`str`, *optional*, defaults to `'dp'`):
+    - solver (`str`, *optional*, defaults to `'ilp'`):
         The solver to use in spmd parallelism. Currently only support
         `'dp'` (dynamic programming)
         `'ilp'` (integer linear programming).

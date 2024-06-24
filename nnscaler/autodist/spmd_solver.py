@@ -14,6 +14,7 @@ import json
 import yaml
 import numpy
 import logging
+import functools
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 from pathlib import Path
@@ -444,17 +445,26 @@ class SPMDSolver:
         self.follow_ids = list(range(self.graph.op_num))
         self.father_ids = list(range(self.graph.op_num))
 
+        def follow(op_idx: int, follow_idx: int):
+            # an operator is not allowed to be followed if it has a sum dimension
+            # this constraint is added to make sure the output shapes of the partitions
+            # are different.
+            if not self.get_operator(follow_idx).has_sum_dim:
+                self.follow_ids[op_idx] = follow_idx
+                self.father_ids[op_idx] = self.get_father_id(follow_idx)
+
         for i, op in enumerate(self.graph.operator_list):
-            # - op consumes tensors from only one producer
-            # - op has only one input tensor
-            # - the producer has only one input tensor
             if len(self.producers[i]) == 1:
+                # consumes tensors from only one producer and has only one input tensor
                 if len(op.in_tensors) == 1:
-                    j = self.producers[i][0]
-                    # constrain the following chain starts from a unary operator
-                    if len(self.graph.operator_list[j].in_tensors) == 1:
-                        self.follow_ids[i] = j
-                        self.father_ids[i] = self.get_father_id(j)
+                    follow(i, self.producers[i][0])
+                elif not op.in_tensors and isinstance(op.ir_cell, IRDimops):
+                    raise RuntimeError(f'find operator {op.ir_cell} has producer but no input tensor')
+            elif len(self.producers[i]) > 1:
+                producer_father_ids = [self.get_father_id(j) for j in self.producers[i]]
+                # all producers have the same father
+                if len(set(producer_father_ids)) == 1:
+                    follow(i, self.producers[i][0])
 
         _logger.info('finish building following relationships')
 
@@ -513,20 +523,19 @@ class SPMDSolver:
                         self.get_op_partition_count(i))))
                     father_id2preserved_pids[i] = set(p_fathers[-1])
                 else:
-                    cur_p_fathers = [-1] * self.get_op_partition_count(i)
+                    # store the candidate father idxs for each partition
+                    cur_p_fathers = [-1 for _ in range(self.get_op_partition_count(i))]
                     for producer in self.producers[i]:
                         if self.get_father_id(producer) != fi:
                             continue
                         # assume there is only one tensor from producer to consumer
                         idx_map = find_idx_map(self.get_operator(producer),
                                                self.get_operator(i))
-                        if len(idx_map) != 1:
-                            raise RuntimeError(
-                                f'find multiple or no idx_map {idx_map}')
+                        if not idx_map:
+                            raise RuntimeError(f'find no idx_map {idx_map} between {self.get_operator(producer)} and {self.get_operator(i)}')
                         u, v = idx_map[0]
                         for j, tgt_p in enumerate(self._op_partitions[i]):
-                            have_changed = False
-                            p_father = -1
+                            p_father = []
                             for k, src_p in enumerate(
                                     self._op_partitions[producer]):
                                 # use shape to check follow relationship between partitions
@@ -534,17 +543,18 @@ class SPMDSolver:
                                 if src_p.ir_cell.outputs()[u].shape == tgt_p.ir_cell.inputs()[v].shape and \
                                 not src_p.is_partial_val:
                                     p_producer = p_fathers[producer][k]
-                                    if p_producer == -1:
-                                        p_father = -1
-                                    else:
-                                        if not have_changed:
-                                            p_father = p_producer
-                                    have_changed = True
-                            # if p_father = -1, this partition will be filtered out
-                            if cur_p_fathers[j] != -1:
-                                assert p_father == cur_p_fathers[
-                                    j], f'{i} {self.get_operator(i).ir_cell} {fi} {self.get_operator(fi).ir_cell}'
-                            cur_p_fathers[j] = p_father
+                                    if p_producer != -1:
+                                        p_father.append(p_producer)
+                            if cur_p_fathers[j] == -1:
+                                cur_p_fathers[j] = p_father
+                            else:
+                                cur_p_fathers[j] = list(set(cur_p_fathers[j]).intersection(set(p_father)))
+                    for j in range(self.get_op_partition_count(i)):
+                        if not cur_p_fathers[j]:
+                            cur_p_fathers[j] = -1
+                        else:
+                            assert len(cur_p_fathers[j]) == 1, f'unexpected partition {self.get_operator(i).ir_cell}, {cur_p_fathers[j]}'
+                            cur_p_fathers[j] = cur_p_fathers[j][0]
                     p_fathers.append(cur_p_fathers)
                     # -1 will be filtered out in the intersection operation below
                     father_id2preserved_pids[fi] = father_id2preserved_pids[
@@ -674,6 +684,7 @@ class SPMDSolver:
 
     def calc_partition_info(self):
         self.partition_info: List[List[PartitionCostDesc]] = list()
+        state_num = 0
         for i in range(self.graph.op_num):
             cur_info = []
             _logger.debug(f'calc partition info for {self.get_operator(i)}')
@@ -687,6 +698,11 @@ class SPMDSolver:
                 cur_info.append(cost_desc)
                 _logger.debug(f'{self._op_partitions[i][j]} {cost_desc}')
             self.partition_info.append(cur_info)
+            cut_partition_cnts = [self.get_op_partition_count(idx) for idx in self.cut_ops[i]]
+            cur_state_num = functools.reduce(lambda x, y: x * y, cut_partition_cnts, 1)
+            state_num += cur_state_num
+            _logger.debug(f'{i}-th operator follow {self.get_father_id(i)} with cut ops {self.cut_ops[i]}, {cut_partition_cnts}, {cur_state_num}')
+        _logger.info(f'total state num is {state_num}')
         _logger.info('finish spmd solver initializetion')
 
     def estimate_min_mem(self, start: int, end: int) -> int:

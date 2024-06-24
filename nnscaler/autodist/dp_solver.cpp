@@ -110,13 +110,13 @@ void ThreadPool::waitFinished() {
 const int MAX_CONCURRENCY = std::thread::hardware_concurrency();
 ThreadPool pool(MAX_CONCURRENCY);
 
-std::vector<std::pair<int, int>> split_work(int num) {
+std::vector<std::pair<int, int>> split_work(int num, int base) {
   std::vector<int> work;
-  if (num < MAX_CONCURRENCY) {
+  if (num < base) {
     work = std::vector<int>(num, 1);
   } else {
-    work = std::vector<int>(MAX_CONCURRENCY, num / MAX_CONCURRENCY);
-    for (int i = 0; i < num % MAX_CONCURRENCY; ++i) {
+    work = std::vector<int>(base, num / base);
+    for (int i = 0; i < num % base; ++i) {
       work[i] += 1;
     }
   }
@@ -463,14 +463,11 @@ public:
                 find_existing_follow = true;
                 // update
                 if (tmp->id < producer->id) {
-                  for (int _ = 0; _ < producer->p_num; ++_) {
-                    if (producer->p_father[_] ==
-                        tmp->p_father[cur_ir[i].second]) {
-                      // replace to align with the filter logic in python
-                      // only the newest node in the follow chain is kept
-                      cur_ir[i] = std::make_pair(producer->id, _);
-                      break;
-                    }
+                  if (tmp->p_father[cur_ir[i].second] !=
+                      producer->p_father[producer_p]) {
+                    is_legal = false;
+                  } else {
+                    cur_ir[i] = std::make_pair(producer_id, producer_p);
                   }
                 }
                 break;
@@ -642,8 +639,7 @@ public:
                   << ", state num: " << iter->second->dp_nodes.size()
                   << std::endl;
       }
-      std::vector<std::pair<int, int>> split_info =
-          split_work(iter->second->dp_num);
+      std::vector<std::pair<int, int>> split_info = split_work(iter->second->dp_num, MAX_CONCURRENCY);
       for (const auto &item : split_info) {
         pool.enqueue([=] {
           for (int i = 0; i < item.second; ++i) {

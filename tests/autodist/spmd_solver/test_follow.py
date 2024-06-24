@@ -17,7 +17,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=0):
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -27,10 +27,20 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 class Model(torch.nn.Module):
 
-    def __init__(self):
+    def __init__(self, head_num, hidden_dim):
         super().__init__()
+        self.q_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.head_num = head_num
+        self.hidden_dim = hidden_dim
+        self.head_dim = hidden_dim // head_num
 
-    def forward(self, q, k, cos, sin, position_ids):
+    def forward(self, x, cos, sin, position_ids):
+        bsz, seq_len, hidden_dim = x.shape
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        q = q.view(bsz, seq_len, self.head_num, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, seq_len, self.head_num, self.head_dim).transpose(1, 2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
         out = q + k
         return out.sum()
@@ -38,15 +48,17 @@ class Model(torch.nn.Module):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
 def test_follow_rope():
-    bsz, seq_len, hidden_dim = 2, 128, 512
+    from nnscaler.ir.unique import IDGenerator
+    IDGenerator().clear()
+    bsz, seq_len, head_num, hidden_dim = 2, 128, 8, 512
+    head_dim = hidden_dim // head_num
     dummy_input = {
-        'q': torch.rand(bsz, 1, seq_len, hidden_dim),
-        'k': torch.rand(bsz, 1, seq_len, hidden_dim),
-        'cos': torch.rand(seq_len, hidden_dim),
-        'sin': torch.rand(seq_len, hidden_dim),
+        'x': torch.rand(bsz, seq_len, hidden_dim),
+        'cos': torch.rand(seq_len, head_dim),
+        'sin': torch.rand(seq_len, head_dim),
         'position_ids': torch.arange(seq_len, dtype=torch.long),
     }
-    model = Model()
+    model = Model(head_num, hidden_dim)
     model.train()
     fx_graph = to_fx_graph(model, dummy_input)
 
@@ -57,28 +69,31 @@ def test_follow_rope():
                                constant_folding=True)
         '''
         the computation graph is as follows:
-        getitem                      getitem
-           |                            |
-        unsqueeze                    unsqueeze
-           |  \                         |
-           |    -------------------------------------------------mul
-           |                            |                         |
-          mul   fullsclie fullslice     |   fullsclie fullslice   |
-           |       \       |            |      \       |          |
-           |        \     neg           |       \     neg         |
-           |         \     |            |        \     |          |
-           |          concat            |         concat          |
-           |             |              |            |            |
-          add-----------mul-------------------------mul----------add
-           |                                                      |
-           |                                                      |
-           ---------------------------add--------------------------
-                                       |
-                                      sum
+        q_proj      fullslice                    fullslice                          k_proj
+          |            |                            |                                |                    
+        view        unsqueeze                    unsqueeze                          view
+          |            |  \                         |                                |
+        transpose      |    -------------------------------------------------mul----transpose
+          |            |                            |                         |
+          ------------mul   fullsclie fullslice     |   fullsclie fullslice   |
+                       |       \       |            |      \       |          |
+                       |        \     neg           |       \     neg         |
+                       |         \     |            |        \     |          |
+                       |          concat            |         concat          |
+                       |             |              |            |            |
+                      add-----------mul-------------------------mul----------add
+                       |                                                      |
+                       |                                                      |
+                       ---------------------------add--------------------------
+                                                   |
+                                                  sum
         currently, the following chain is only composed of unary ops
         there are 2 chains in total:
-        1. fullslice -> neg
-        2. fullslice -> neg
+        1. view -> transpose -> fullslice -> fullslice -> neg -> concat 
+        2. view -> transpose -> fullslice -> fullslice -> neg -> concat 
+        3. fullslice -> unsqueeze
+        4. fullslice -> unsqueeze
+        5. add -> sum
         in future, we may add follow chains for binary ops, like mul, add, etc.
         '''
 
@@ -95,14 +110,15 @@ def test_follow_rope():
         )
 
         assert spmd_solver.follow_ids == [
-            0, 1, 2, 3, 4, 5, 6, 6, 8, 9, 10, 11, 12, 13, 13, 15, 16, 17, 18, 19
+            0, 1, 2, 2, 4, 4, 6, 6, 8, 8, 10, 3, 3, 12, 11, 15, 16, 17, 5, 5, 19, 18, 22, 23, 24, 24
         ]
         partition_counts = [
             spmd_solver.get_op_partition_count(i)
             for i in range(model_graph.op_num)
         ]
-        assert partition_counts[6] == partition_counts[7]
-        assert partition_counts[13] == partition_counts[14]
+        chains = [[2, 3, 11, 12, 13, 14], [4, 5, 18, 19, 20, 21], [2, 3], [4, 5], [24, 25]]
+        for chain in chains:
+            assert all(partition_counts[i] == partition_counts[chain[0]] for i in chain)
 
 
 class Attention(torch.nn.Module):
@@ -354,4 +370,3 @@ def test_solver_data_parallel():
         ilp_spmd_outs = spmd_solver.do_ilp([(0, model_graph.op_num - 1)], 1)
         assert helper(dp_spmd_outs) == expected_out
         assert helper(ilp_spmd_outs) == expected_out
-
