@@ -404,11 +404,12 @@ if __name__ == "__main__":
     args = parse_arguments()
     if isinstance(args.log_dir, str):
         args.log_dir = pathlib.Path(os.path.expanduser(args.log_dir))
+        args.cache_dir = pathlib.Path(os.path.expanduser(args.cache_dir))
     nnscaler.init()
     if torch.distributed.get_rank() == 0:
-        if not args.log_dir.exists():
+        if args.log_dir and not args.log_dir.exists():
             args.log_dir.mkdir()
-        if not args.cache_dir.exists():
+        if args.cache_dir and not args.cache_dir.exists():
             args.cache_dir.mkdir()
 
     # load error dict
