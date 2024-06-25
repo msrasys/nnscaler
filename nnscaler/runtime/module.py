@@ -334,7 +334,13 @@ class CubeModule(torch.nn.Module):
         }, filename)
 
     @classmethod
-    def _safe_tensor_equal(cls, tensor1: torch.Tensor, tensor2: torch.Tensor):
+    def _safe_tensor_equal(cls, tensor1: Any, tensor2: Any):
+        # in different versions, the data may be different types
+        # for example, step in optimizer.state_dict can be scalar tensor or int.
+        if type(tensor1) != type(tensor2):
+            return False
+        if not isinstance(tensor1, torch.Tensor):
+            return tensor1 == tensor2
         if tensor1.shape != tensor2.shape:
             return False
         if tensor1.dtype != tensor2.dtype:
