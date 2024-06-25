@@ -449,7 +449,8 @@ class SPMDSolver:
             # an operator is not allowed to be followed if it has a sum dimension
             # this constraint is added to make sure the output shapes of the partitions
             # are different.
-            if not self.get_operator(follow_idx).has_sum_dim:
+            follow_op = self.get_operator(follow_idx)
+            if not follow_op.has_sum_dim and not follow_op.has_attr:
                 self.follow_ids[op_idx] = follow_idx
                 self.father_ids[op_idx] = self.get_father_id(follow_idx)
 

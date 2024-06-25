@@ -37,6 +37,7 @@ class CubeOperator:
         self._has_sum_dim = False
         self._recompute = False
         self._recompute_start_op = False
+        self._has_attr = False
 
         self.omit_recompute_in_idx = []
         self.omit_train_idx = []
@@ -50,6 +51,8 @@ class CubeOperator:
         for item in ir_cell.inputs():
             if isinstance(item, IRTensor):
                 self.in_tensors.append(item)
+                if item.is_attr():
+                    self._has_attr = True
         for item in ir_cell.outputs():
             if isinstance(item, IRTensor):
                 self.out_tensors.append(item)
@@ -59,6 +62,10 @@ class CubeOperator:
     @property
     def has_sum_dim(self):
         return self._has_sum_dim
+
+    @property
+    def has_attr(self):
+        return self._has_attr
 
     @property
     def recompute(self):
