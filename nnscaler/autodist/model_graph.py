@@ -745,10 +745,13 @@ class ModelGraph:
             for i, idx in enumerate(train_mem2in_idx):
                 if idx == -1:
                     continue
-                if operator.in_tensors[idx].tid in counted_tensors:
+                tensor = operator.ir_cell.inputs()[idx]
+                assert isinstance(tensor, IRTensor), f'expect tensor, but get {type(tensor)}'
+                if tensor.tid in counted_tensors:
                     operator.omit_train_idx.append(i)
                 else:
-                    counted_tensors.add(operator.in_tensors[idx].tid)
+                    counted_tensors.add(tensor.tid)
+
             # deduplicate parameter and buffer tensors
             # assume the traverse order of input tensors is the same as
             # the order in profiling
