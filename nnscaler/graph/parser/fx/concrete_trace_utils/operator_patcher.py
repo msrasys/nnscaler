@@ -42,6 +42,56 @@ class OperatorTransformer(TrackedTransformer):
             ast.IsNot: 'is_not', # operator.is_not
             ast.In: 'contains',  # operator.contains
     }
+    def visit_IfExp(self, node: ast.IfExp):
+        # only handle self.training case
+        # Attribute(value=Name(id='self', ctx=Load()), attr='training', ctx=Load())
+        # And the body and orelse should not contain any function call
+        # because we can't handle the short-circuit evaluation in if-expression
+        # For example,
+        # `x[0] if x is not None else None` will raise an error
+        # if we convert it to `nnscaler.runtime.function.ifexpr(x is not None, x[0], None)`
+        if not _orig_isinstance(node.test, ast.Attribute) \
+            or not _orig_isinstance(node.test.value, ast.Name) \
+            or node.test.value.id != 'self' or node.test.attr != 'training'\
+            or any(_orig_isinstance(n, ast.Call) for n in ast.walk(node.body)) \
+            or any(_orig_isinstance(n, ast.Call) for n in ast.walk(node.orelse)):
+            return self.generic_visit(node)
+
+        self.modified = True
+        # convert to nnscaler.runtime.function.ifexpr(condition, true_expr, false_expr)
+        # Please note short-circuit evaluation is not supported in this function.
+        # so it is not 100% equivalent to the original if-else expression.
+        # TODO: support short-circuit evaluation,
+        #   which requires to expand the condition/true_expr/false_expr inplace
+        # For example, currently implementation will convert:
+        #   x = f(m) if a else g(n)
+        # to:
+        #  x = nnscaler.runtime.function.ifexpr(a, f(m), g(n))
+        # And the generated code will be
+        #  t0 = f(m)
+        #  t1 = g(n)
+        #  x = t0 if a else t1
+        # The fix should remove t0/t1, and expand them in if-expression.
+        return self.generic_visit(
+            ast.Call(
+                func=ast.Attribute(
+                    attr='ifexpr',
+                    value=ast.Attribute(
+                        attr='function',
+                        value = ast.Attribute(
+                            attr='runtime',
+                            value=ast.Name(id='nnscaler', ctx=ast.Load()),
+                            ctx=ast.Load(),
+                        ),
+                        ctx=ast.Load(),
+                    ),
+                    ctx=ast.Load(),
+                ),
+                args=[node.test, node.body, node.orelse],
+                keywords=[]
+            )
+        )
+
     def visit_UnaryOp(self, node: ast.UnaryOp):
         if _orig_isinstance(node.op, ast.Not):
             self.modified = True
@@ -231,6 +281,13 @@ class OperatorPatcher:
                         ast.alias(name='contains'),
                     ],
                     level=0
+                ),
+                # equals to
+                # import nnscaler
+                ast.Import(
+                    names=[
+                        ast.alias(name='nnscaler')
+                    ]
                 ),
                 *body0.body
             ]

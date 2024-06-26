@@ -117,6 +117,10 @@ def replace_all_device_with(device='cpu', force=False):
             return orig_func(*args, **kwargs)
         wrapper.__name__ = orig_func.__name__
         wrapper.__qualname__ = orig_func.__qualname__
+        if hasattr(orig_func, '__module__'):
+            # torch.Tensor.new_empty, etc. don't have this attribute
+            # TODO: FxModuleParser._find_module_of_method will fail if __module__ is not set
+            wrapper.__module__ = orig_func.__module__
         wrapper.__cube_orig_func__ = orig_func
         return wrapper
     # these constructors are enough for most cases

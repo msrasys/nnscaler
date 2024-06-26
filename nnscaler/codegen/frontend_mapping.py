@@ -8,6 +8,8 @@ from nnscaler.ir.cten import IRTensor
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.graph.parser.register import CustomizedOps
 
+from nnscaler.graph.parser.fx.parser import SELF_GETATTR_SIG
+
 
 class Sign2EmitRule:
     """Emit rule for frontend PyTorch codegen"""
@@ -16,7 +18,8 @@ class Sign2EmitRule:
         # the registered emit rules
         self._sign2rule = {
             'torch.slice': self.emit_slice,
-            'setattr': self.emit_setattr,
+            SELF_GETATTR_SIG: self.emit_self_getattr,
+            'nnscaler.runtime.function.function.ifexpr': self.emit_ifexpr,
         }
 
     def map(self, signature: str) -> Callable:
@@ -75,7 +78,18 @@ class Sign2EmitRule:
 
         return f"{in_tensor_var}[{', '.join(subscript_components)}]"
 
-    def emit_setattr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
+    def emit_self_getattr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
         """Special rule for generating setattr node
         """
-        assert False, f"This emit rule is deprecated, please report if you reach here"
+        assert len(node.inputs()) == 1, f"self_getattr should have 1 input, but got {len(node.inputs())}"
+        assert isinstance(node.input(0), str), f"self_getattr should have string input, but got {type(node.input(0))}"
+        # use node.input(0) instead of arg_vars[0]
+        # because we don't want to use it `repr` form
+        return f'self.{node.input(0)}'
+
+    def emit_ifexpr(self, node, arg_vars: List[str], kw_pairs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
+        """Special rule for generating setattr node
+        """
+        assert len(node.inputs()) == 3, f"ifexpr should have 3 inputs, but got {len(node.inputs())}"
+        return f'{arg_vars[1]} if {arg_vars[0]} else {arg_vars[2]}'
+

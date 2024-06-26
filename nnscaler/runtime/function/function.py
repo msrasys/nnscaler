@@ -1,4 +1,4 @@
-from typing import Optional, List, Tuple, Union
+from typing import Optional, List, Tuple, Union, Any
 import torch
 import torch.nn.functional as TorchF
 import operator
@@ -11,6 +11,14 @@ def identity(tensor: torch.Tensor) -> torch.Tensor:
     identity forward
     """
     return tensor
+
+
+def ifexpr(cond: bool, true_value: Any, false_value: Any) -> Any:
+    """
+    if expression
+    Please note there is no short-circuit evaluation in this function.
+    """
+    return true_value if cond else false_value
 
 
 def anchor(name: str):

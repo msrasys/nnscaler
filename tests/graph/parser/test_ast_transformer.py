@@ -11,6 +11,62 @@ from nnscaler.graph.parser.fx.concrete_trace_utils.operator_patcher import (
     transform
 )
 
+
+@pytest.mark.skipif(sys.version_info < (3, 9), reason='ast.unparse is not available in python3.8')
+def test_ifexpr_transfomer():
+    # x = ast.parse('nnscaler.runtime.ifexpr(1, 2, 3)')
+
+    tree = ast.parse(dedent('''
+        x = 0.1 if self.training else 0.2
+    ''').strip())
+    transformers = [OperatorTransformer()]
+    modified, new_ast  = transform(tree, transformers)
+    assert modified
+    assert '\n'.join(line for line in ast.unparse(new_ast).split('\n') if line.strip()) == dedent('''
+        x = nnscaler.runtime.function.ifexpr(self.training, 0.1, 0.2)
+        ''').strip()
+
+    tree = ast.parse(dedent('''
+        x = x.p if self.training else 0.2 + 0.3
+    ''').strip())
+    transformers = [OperatorTransformer()]
+    modified, new_ast  = transform(tree, transformers)
+    assert modified
+    assert '\n'.join(line for line in ast.unparse(new_ast).split('\n') if line.strip()) == dedent('''
+        x = nnscaler.runtime.function.ifexpr(self.training, x.p, 0.2 + 0.3)
+        ''').strip()
+
+    tree = ast.parse(dedent('''
+        x = x.p if self.training else 0.2 + f(0.3)
+    ''').strip())
+    transformers = [OperatorTransformer()]
+    modified, new_ast  = transform(tree, transformers)
+    assert not modified
+
+    tree = ast.parse(dedent('''
+        x = f(x) if self.training else 0.2
+    ''').strip())
+    transformers = [OperatorTransformer()]
+    modified, new_ast  = transform(tree, transformers)
+    assert not modified
+
+    tree = ast.parse(dedent('''
+        x = 0.1 if self.training else f(0.2)
+    ''').strip())
+    transformers = [OperatorTransformer()]
+    modified, new_ast  = transform(tree, transformers)
+    assert not modified
+
+    tree = ast.parse(dedent('''
+        x = f(0.1) if self.training else f(0.2)
+    ''').strip())
+    transformers = [OperatorTransformer()]
+    modified, new_ast  = transform(tree, transformers)
+    assert not modified
+
+
+
+
 @pytest.mark.skipif(sys.version_info < (3, 9), reason='ast.unparse is not available in python3.8')
 def test_op_transfomer():
     tree = ast.parse(dedent('''

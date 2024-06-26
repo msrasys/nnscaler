@@ -19,6 +19,10 @@ from .concrete_trace_utils.utils import DICT_KEYS_TYPE, DICT_VALUES_TYPE, DICT_I
 _logger = logging.getLogger(__name__)
 
 
+# virtual signature for `self.<attribute>`
+SELF_GETATTR_SIG = 'self_getattr'
+
+
 class FxModuleParser:
     """
     torch.fx module parser
@@ -225,7 +229,11 @@ class FxModuleParser:
                             'You can register it as a customized function using nnscaler.register_op to remove this warning'
                     _logger.warning(warning_msg)
                     is_constant = False
-                ir_node = IRPyFunc(fsig, input_vals, [IRObject(frame.get_var(node.name), is_constant=is_constant)], **kwargs)
+                output = frame.get_var(node.name)
+                if not isinstance(output, IRObject):
+                    # avoid nested IRObject
+                    output = IRObject(name=node.name, value=output, is_constant=is_constant)
+                ir_node = IRPyFunc(fsig, input_vals, [output], **kwargs)
 
         if isinstance(ir_node, IRCell):
             module_stack = node.meta.get('nn_module_stack')
@@ -279,7 +287,11 @@ class FxModuleParser:
         There are two types of get_attr, one is `FxNodeKind.PrimGetAttr` which is dealt with in this function.
         The other is `FxNodeKind.PrimCallFunction ` (i.e., <built-in function getattr>)
         which is dealt with by parse_prim_function_method.
+
+        The object of get_attr node is always the traced module or its sub modules.
+        node.target is the attribute name of the object.
         """
+        ir_nodes = []
         concrete_value = FxModuleParser.fetch_attr(module, node.target)
         if isinstance(concrete_value, torch.Tensor):
             assert isinstance(concrete_value, torch.Tensor), \
@@ -300,9 +312,17 @@ class FxModuleParser:
             else:
                 frame.set_var(node.name, exist_tensor)
         else:
-            assert not isinstance(concrete_value, torch.Tensor), f"GetAttrPrim: unexpected parameter"
-            frame.set_var(node.name, concrete_value)
-        return []
+            if node.target == 'training':
+                # Let's just support `self.training` and ignore all other cases for now
+                output = IRObject(name=node.name, value=frame.get_var(node.name), is_constant=False)
+                ir_node = IRPyFunc(SELF_GETATTR_SIG, ['training'], [output])
+                frame.set_var(node.name, output)
+                # never fold the IRPyFunc node
+                ir_nodes.append(ir_node)
+            else:
+                frame.set_var(node.name, concrete_value)
+
+        return ir_nodes
 
     @staticmethod
     def parse_prim_output_node(node: torch.fx.Node, module: torch.fx.GraphModule, frame: Frame) -> List[IRCell]:

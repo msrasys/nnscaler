@@ -230,6 +230,16 @@ class AttrModule(torch.nn.Module):
         return x + getattr(attr, 'a')
 
 
+def print_gencode(cubesave_dir, module_class, index=0):
+    from nnscaler.parallel import _PARALLEL_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
+    from pathlib import Path
+    import re
+    namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{_DEFAULT_INSTANCE_NAME}'
+    outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
+    filecontent = (outdir /f'gencode{index}.py').read_text()
+    print(filecontent)
+
+
 def _gencode_contains(cubesave_dir, module_class, index, search_re):
     from nnscaler.parallel import _PARALLEL_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
     from pathlib import Path
@@ -239,6 +249,7 @@ def _gencode_contains(cubesave_dir, module_class, index, search_re):
     filecontent = (outdir /f'gencode{index}.py').read_text()
     matches = re.findall(search_re, filecontent)
     return matches
+
 
 class AttrHelper:
     def __init__(self) -> None:
@@ -760,3 +771,162 @@ def test_codegen_end2end():
             assert _gencode_contains(tempdir, End2EndModule, 0,
                     r"self\.register_buffer"
             )
+
+from dataclasses import dataclass
+@dataclass
+class DataT:
+    x: int = 0
+    y: int = 0
+
+
+class DropoutModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._data = DataT()
+
+    def forward(self, x):
+        x = x + self._data.x
+        return torch.nn.functional.dropout(x, 0.1 if self.training else 0.2, self.training)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_dropout():
+    """
+    Test if self.training is correctly handled in the generated code
+    """
+    with tempfile.TemporaryDirectory() as tempdir:
+        m = DropoutModule()
+        m.train()
+        parallelize(
+            m,
+            {'x': torch.randn(128, 64)},
+            'dp',
+            ComputeConfig(1, 1),
+            gen_savedir=tempdir,
+            load_module=False,
+            reuse='override',
+        )
+        # it should looks like:
+        # add_17 = torch.add(x_20, 0, alpha=1)
+        # del x_20
+        # training_9 = self.training
+        # # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 778, in forward,  return torch.nn.functional.dropout(x, 0.1 if self.training else 0.2, self.training)
+        # ifexpr_4 = 0.1 if training_9 else 0.2
+        # training_1_12 = self.training
+        # # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 778, in forward,  return torch.nn.functional.dropout(x, 0.1 if self.training else 0.2, self.training)
+        # dropout_16 = torch.nn.functional.dropout(add_17, p=ifexpr_4, training=training_1_12, inplace=False)
+        # del add_17
+        # return dropout_16
+        assert _gencode_contains(tempdir, DropoutModule, 0,
+                r"ifexpr_\d+ = 0.1 if training_\d+ else 0.2"
+        )
+        assert _gencode_contains(tempdir, DropoutModule, 0,
+                    r" = torch.nn.functional.dropout\(add_\d+, p=ifexpr_\d+, training=training_1_\d+, inplace=False\)"
+            )
+
+
+@nnscaler.register_op('?, ? -> ?')
+def get_dropout(training, dropout):
+    return dropout if training else 0.0
+
+
+class DropoutModule2(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return torch.nn.functional.dropout(x, get_dropout(self.training, 0.2), self.training)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_dropout2(tmp_path):
+    """
+    Test if register_op is correctly handled in the generated code
+    """
+    m = DropoutModule2()
+    m.train()
+    parallelize(
+        m,
+        {'x': torch.randn(128, 64)},
+        'dp',
+        ComputeConfig(1, 1),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # it should looks like:
+    # training_7 = self.training
+    # # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 838, in forward,  return torch.nn.functional.dropout(x, get_dropout(self.training), self.training)
+    # get_dropout_3 = tests.parallel_module.test_gencode.get_dropout(training_7)
+    # training_1_11 = self.training
+    # # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 838, in forward,  return torch.nn.functional.dropout(x, get_dropout(self.training), self.training)
+    # dropout_15 = torch.nn.functional.dropout(x_18, p=get_dropout_3, training=training_1_11, inplace=False)
+    # del x_18
+    # return dropout_15
+    assert _gencode_contains(tmp_path, DropoutModule2, 0,
+            r"= tests.parallel_module.test_gencode.get_dropout\(training_\d+"
+    )
+    assert _gencode_contains(tmp_path, DropoutModule2, 0,
+            r"= torch.nn.functional.dropout\(x_\d+, p=get_dropout_\d+"
+    )
+
+
+class DictOutputModule(torch.nn.Module):
+     def forward(self, x):
+        return {'data': x + 10}
+
+
+@replace_all_device_with('cpu')
+def test_codegen_dictout(tmp_path):
+    m = DictOutputModule()
+    m.train()
+    parallelize(
+        m,
+        {'x': torch.randn(128, 64)},
+        'dp',
+        ComputeConfig(1, 1),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # it should looks like:
+    # def segment9(self, x_9):
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 819, in forward,  return {'data': x + 10}
+    #     add_6 = torch.add(x_9, 10, alpha=1)                                                                                                             del x_9
+    #     return add_6
+
+    # def _forward_impl(self, x):                                                                                                                         add_6 = self.segment9(x)
+    #     return {'data': add_6}
+    assert _gencode_contains(tmp_path, DictOutputModule, 0,
+            r"return {'data': add_\d+}"
+    )
+
+
+class KwargsModule(torch.nn.Module):
+     def forward(self, x):
+        return x + torch.zeros_like(x, dtype=torch.float32)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_kwargs(tmp_path):
+    m = KwargsModule()
+    m.train()
+    parallelize(
+        m,
+        {'x': torch.randn(128, 64)},
+        'dp',
+        ComputeConfig(1, 1),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # it should looks like:
+    # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 861, in forward,  return x + torch.zeros_like(x, dtype=torch.float32)
+    # zeros_like_9 = torch.zeros_like(x_12, requires_grad=False, dtype=torch.float32)
+    # # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 861, in forward,  return x + torch.zeros_like(x, dtype=torch.float32)
+    # add_8 = torch.add(x_12, zeros_like_9, alpha=1)
+    # del x_12, zeros_like_9
+    # return add_8
+    assert _gencode_contains(tmp_path, KwargsModule, 0,
+            r"torch.zeros_like\(x_\d+, requires_grad=False, dtype=torch.float32\)"
+    )

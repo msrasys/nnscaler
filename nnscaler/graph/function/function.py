@@ -860,7 +860,7 @@ def Dropout(input, p=0.5, training=True, inplace=False, signature = None):
     """
     annos = ['* -> *']
     return IRDimops(Dropout, 'dropout', signature, annos, [input],
-                    p=p, training='self.training', inplace=inplace)
+                    p=p, training=training, inplace=inplace)
 
 
 def nnDropout(input, p=0.5, inplace=False, signature=None):
@@ -2242,7 +2242,7 @@ def GetItem(a: Any, b: Any, signature = None) -> Union[Any, IRPyFunc]:
 def SetItem(__a: Any, __b: Any, __c: Any, *additonal, signature = None) -> Union[Any, IRPyFunc]:
     """
     _operator.setitem(__a, __b, __c) / nnscaler.runtime.function.setitem(__a, *__bc)
-    
+
     If __a is a IRTensor and __b is a tuple, __b will be flatten to ensure we can give each element an annotation,
     and the returned value is a IRDimops.
     If __a is a IRObject, the returned value is a IRPyFunc.
@@ -2627,7 +2627,7 @@ def Type(tensor: IRTensor, dtype: Optional[Union[str, torch.dtype, IRObject]] = 
         raise ValueError("Expected 'out' to be None")
     annos = ['* -> *']
     original_dtype = dtype
-    dtype = _unwrap_value(dtype) 
+    dtype = _unwrap_value(dtype)
     if dtype is None:
         return IRPyFunc(signature,[tensor], [IRObject(value=str(tensor.dtype))])
     else:
@@ -2666,9 +2666,9 @@ def Conv1D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, 
     """
     torch.nn.functional.conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1) → Tensor
     """
-    if isinstance(stride, int): 
+    if isinstance(stride, int):
         stride = (stride,)
-    if isinstance(dilation, int): 
+    if isinstance(dilation, int):
         dilation = (dilation,)
     if isinstance(padding, str):
         if padding == 'same':
@@ -2804,7 +2804,7 @@ def Gather(input: IRTensor, dim, index: IRTensor, sparse_grad=False, out=None, s
             input_anno[i] += '^'
             index_anno[i] += '^'
         else:
-            # TODO: Currently, this only works in static cases. 
+            # TODO: Currently, this only works in static cases.
             # When dynamic shape is enabled, this partition may be incorrect.
             # We keep the partition here for now, and consider reporting errors that cannot be partitioned at run time in future.
             index_anno[i] = input_anno[i]
@@ -2839,7 +2839,7 @@ def Unfold(input: IRTensor, kernel_size, dilation=1, padding=0, stride=1, signat
     """
     if not isinstance(input, IRTensor) or len(input.shape) != 4:
         raise ValueError("Input must be an IRTensor with 4 dimensions, [N, C, H, W].")
-    
+
     kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
     dilation = (dilation, dilation) if isinstance(dilation, int) else dilation
     padding = (padding, padding) if isinstance(padding, int) else padding

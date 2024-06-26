@@ -1,5 +1,7 @@
-from typing import Generator, Iterable, List, Any, Optional, Tuple
+from typing import Generator, Iterable, List, Any, Optional, Tuple, Dict
 import logging
+
+import torch
 
 from nnscaler.ir.cten import IRCell, IRTensor, IRObject
 from nnscaler.ir.tensor import IRSubTensor
@@ -42,6 +44,8 @@ def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None) -> Any:
     Returns:
         the val that can be repr safely
     """
+    if isinstance(val, IRValue):
+        return val
     if isinstance(val, IRObject):
         tensor_name = val.name
         tensor_name = tensor_name.replace('.', '_')
@@ -58,9 +62,21 @@ def _safe_repr_value(val: Any, prefix_attr: Optional[str] = None) -> Any:
     elif isinstance(val, tuple):
         # TODO: support subclasses of tuple, like torch.Size?
         return tuple(_safe_repr_value(v, prefix_attr) for v in val)
-    elif isinstance(val, (int, str, bool, float, type(None), bytes, type(Ellipsis))):
+    elif isinstance(val, (int, str, bool, float, type(None), bytes, type(Ellipsis), torch.dtype)):
         return val
+    elif isinstance(val, torch.device):
+        # use device string representation
+        # this should be rarely used
+        # as we will ignore device parameters.
+        return val.type if val.index is None else f'{val.type}:{val.index}'
     raise ValueError(f'Unsupported data type: {type(val)}')
+
+
+def _safe_str_dict(val: Dict[str, Any], prefix_attr: Optional[str] = None) -> Dict[str, str]:
+    """
+    Return str-able value of a dict of tensors or values.
+    """
+    return {k: repr(_safe_repr_value(v, prefix_attr)) for k, v in val.items()}
 
 
 class CodeEmission:
@@ -91,6 +107,7 @@ class CodeEmission:
         """
         modifier = lambda t: IRValue(self.tensor_name(t, prefix_attr))
         val = IRSegment.modify_objects_of_complex(val, modifier)
+        # TODO: use repr() instead of str()
         return str(val)
 
     def tuple_name(self, tensors: List[Any],
@@ -109,6 +126,7 @@ class CodeEmission:
             if isinstance(t, IRTensor) and skip_attr and t.is_attr():
                 continue
             names.append(self.tensor_name(t, prefix_attr))
+        # TODO: use repr()
         name = '(' + ', '.join(names + ['']) + ')'
         return name
 
@@ -135,17 +153,25 @@ class CodeEmission:
     def kwargs_name(self, **kwargs) -> str:
         """Get kwarg name"""
         names = []
-        # FIXME make the str include `""`
-        # for name, val in kwargs.items():
-        #     if isinstance(val, str) and not val.startswith('self.'):
-        #         kwargs[name] = '"' + val + '"'
         # turn object into name
         modifier = lambda t: IRValue(self.tensor_name(t))
         kwargs = IRSegment.modify_objects_of_complex(kwargs, modifier)
         for name, val in kwargs.items():
+            # TODO: use repr() instead of str()
+            # names.append(f'{name}={repr(val)}')
+            # the problem here is current adapter prims use dtype as str for code generation
+            # It is too big change for now, and will fix it later.
             names.append(f'{name}={val}')
         name = ', '.join(names)
         return name
+
+    def kwargs_dict(self, **kwargs) -> Dict[str, str]:
+        """Get kwarg dict
+        Key is the orignial string
+        And value is the `repr` of the value,
+        so you can safely use it in the code generation
+        """
+        return _safe_str_dict(kwargs)
 
 
 class FuncEmission(CodeEmission):
@@ -191,13 +217,7 @@ class FuncEmission(CodeEmission):
         # setup arg string
         inputs = [self.tensor_name(t, prefix_attr=prefix_attr) for t in node.inputs()]
         # setup kwarg string
-        kwargs = dict(**node.kwargs)
-        for name, val in kwargs.items():
-            if isinstance(val, str) and not val.startswith('self.'):
-                kwargs[name] = '"' + val + '"'
-        # turn IRObject into name
-        modifier = lambda t: IRValue(self.tensor_name(t))
-        kwargs = IRSegment.modify_objects_of_complex(kwargs, modifier)
+        kwargs = self.kwargs_dict(**node.kwargs)
 
         emit_rule = self._emit_rules.map(signature)
         body = emit_rule(node, inputs, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)
