@@ -871,6 +871,50 @@ def test_codegen_dropout2(tmp_path):
     )
 
 
+class DropoutModuleNested(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dropout = DropoutModule2()
+
+    def forward(self, x):
+        return self.dropout(x)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_dropout_nested(tmp_path):
+    """
+    Test if register_op is correctly handled in the generated code
+    """
+    m = DropoutModuleNested()
+    m.train()
+    parallelize(
+        m,
+        {'x': torch.randn(128, 64)},
+        'dp',
+        ComputeConfig(1, 1),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # it should looks like:
+    # # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 838, in forward,  return torch.nn.functional.dropout(x, get_dropout(self.training, 0.2), self.training)
+    # dropout_training_7 = self.training
+    # # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 838, in forward,  return torch.nn.functional.dropout(x, get_dropout(self.training, 0.2), self.training)
+    # get_dropout_3 = tests.parallel_module.test_gencode.get_dropout(dropout_training_7, 0.2)
+    # # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 838, in forward,  return torch.nn.functional.dropout(x, get_dropout(self.training, 0.2), self.training)
+    # dropout_training_1_11 = self.training
+    # # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 838, in forward,  return torch.nn.functional.dropout(x, get_dropout(self.training, 0.2), self.training)
+    # dropout_15 = torch.nn.functional.dropout(x_18, p=get_dropout_3, training=dropout_training_1_11, inplace=False)
+    # del x_18
+    # return dropout_15
+    assert _gencode_contains(tmp_path, DropoutModuleNested, 0,
+            r"= tests.parallel_module.test_gencode.get_dropout\(dropout_training_\d+"
+    )
+    assert _gencode_contains(tmp_path, DropoutModuleNested, 0,
+            r"= torch.nn.functional.dropout\(x_\d+, p=get_dropout_\d+"
+    )
+
+
 class DictOutputModule(torch.nn.Module):
      def forward(self, x):
         return {'data': x + 10}

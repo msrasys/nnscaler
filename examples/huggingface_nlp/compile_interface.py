@@ -50,9 +50,9 @@ def set_seed(seed):
     import numpy as np
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)  
-    if torch.cuda.is_available():  
-        torch.cuda.manual_seed_all(seed)  
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 class TraceCompileException(Exception):
@@ -75,7 +75,7 @@ class ModelCompiler:
         self.policy = policy
         self.model.eval()
         self.before_trace = self.model(**self.dummy_input)
-    
+
     def forward_diff(self, model):
         """Compute the model's output and compare it with the original model's output"""
         if model is None:
@@ -111,7 +111,7 @@ class ModelCompiler:
                 pas_policy=self.policy,
                 compute_config=ComputeConfig(1, 1),
                 reuse='override',
-                load_module=True
+                load_module=True,
             )
             return parallel_model
         except Exception as e:
@@ -163,4 +163,3 @@ class ModelCompiler:
                 raise RuntimeError("CUDA is not available")
         except Exception as e:
             raise TraceCompileException("An error occurred during export and forward the model.", e)
-        

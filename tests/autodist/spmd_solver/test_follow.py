@@ -70,7 +70,7 @@ def test_follow_rope():
         '''
         the computation graph is as follows:
         q_proj      fullslice                    fullslice                          k_proj
-          |            |                            |                                |                    
+          |            |                            |                                |
         view        unsqueeze                    unsqueeze                          view
           |            |  \                         |                                |
         transpose      |    -------------------------------------------------mul----transpose
@@ -89,8 +89,8 @@ def test_follow_rope():
                                                   sum
         currently, the following chain is only composed of unary ops
         there are 2 chains in total:
-        1. view -> transpose -> fullslice -> fullslice -> neg -> concat 
-        2. view -> transpose -> fullslice -> fullslice -> neg -> concat 
+        1. view -> transpose -> fullslice -> fullslice -> neg -> concat
+        2. view -> transpose -> fullslice -> fullslice -> neg -> concat
         3. fullslice -> unsqueeze
         4. fullslice -> unsqueeze
         5. add -> sum
@@ -187,34 +187,34 @@ def test_follow_attention():
         print(ir_graph.nodes())
         '''
         the computation graph is as follows:
-        linear    linear    linear
+        2linear    3linear    4linear
            |         |         |
-          view      view      view
+          5view      7view     9view
            |         |         |
-        transpose transpose transpose
+        6transpose 8transpose 10transpose
             \        |         |
-             |    transpose    |
+             |    11transpose  |
              \      /          |
-              matmul           |
+              12matmul         |
                 |              |
-               div             |
+               13div           |
                 |              |
-              softmax          |
-                |              |
-              dropout          |
+15training   14softmax         |
+    |           |              |
+      \ ----  16dropout        |
                  \            /
                   \          /
-                    matmul
+                    17matmul
                        |
-                  transpose
+                  18transpose
                        |
-                  contiguous
+                  19contiguous
                        |
-                    reshape
+                    20reshape
                        |
-                    linear
+                    21linear
                        |
-                      sum
+                      22sum
 
         the follow chain is as follows:
         1. view -> transpose
@@ -238,14 +238,14 @@ def test_follow_attention():
         )
 
         assert spmd_solver.follow_ids == [
-            0, 1, 2, 3, 3, 5, 5, 7, 7, 6, 10, 11, 11, 12, 14, 15, 15, 16, 18, 19
+            0, 1, 2, 3, 3, 5, 5, 7, 7, 6, 10, 11, 11, 13, 12, 15, 16, 16, 17, 19, 20
         ]
         partition_counts = [
             spmd_solver.get_op_partition_count(i)
             for i in range(model_graph.op_num)
         ]
         assert partition_counts == [
-            2, 2, 2, 4, 4, 4, 4, 4, 4, 4, 2, 2, 2, 2, 2, 4, 4, 4, 2, 4
+            2, 2, 2, 4, 4, 4, 4, 4, 4, 4, 2, 2, 2, 1, 2, 2, 4, 4, 4, 2, 4
         ]
         # under the current partition constraints, the solver should generate
         # a Megatron-LM plan
@@ -276,20 +276,22 @@ def test_follow_attention():
             (13, (((0, 1), 2),)),
             # partition the head dim for softmax
             (14, (((0, 1), 2),)),
+            # replicate `training`
+            (15, (((-1, -1), 2),)),
             # partition the head dim for dropout
-            (15, (((0, 1), 2),)),
-            # partition the head dim for matmul(attn_weights, v)
             (16, (((0, 1), 2),)),
-            # partition the head dim for attn_out.transpose
+            # partition the head dim for matmul(attn_weights, v)
             (17, (((0, 1), 2),)),
+            # partition the head dim for attn_out.transpose
+            (18, (((0, 1), 2),)),
             # partition the head dim for contiguous
-            (18, (((0, 2), 2),)),
-            # partition the head dim for reshape
             (19, (((0, 2), 2),)),
-            # partition the input feature for o_proj
+            # partition the head dim for reshape
             (20, (((0, 2), 2),)),
+            # partition the input feature for o_proj
+            (21, (((0, 2), 2),)),
             # replicate the sum
-            (21, (((-1, -1), 2),))
+            (22, (((-1, -1), 2),))
         ]
 
         def helper(search_out):
@@ -337,7 +339,7 @@ def test_solver_data_parallel():
         ]
         print(partition_counts)
         assert partition_counts == [
-            5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 6, 4, 4, 4, 6, 4, 4, 4, 5, 4
+            5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 6, 4, 4, 1, 4, 6, 4, 4, 4, 5, 4
         ]
         # should generate a pure data parallel plan, e.g., partition the batch dim
         expected_out = [
@@ -354,13 +356,14 @@ def test_solver_data_parallel():
             (12, (((0, 0), 2),)),
             (13, (((0, 0), 2),)),
             (14, (((0, 0), 2),)),
-            (15, (((0, 0), 2),)),
+            (15, (((-1, -1), 2),)),
             (16, (((0, 0), 2),)),
             (17, (((0, 0), 2),)),
             (18, (((0, 0), 2),)),
             (19, (((0, 0), 2),)),
             (20, (((0, 0), 2),)),
-            (21, (((0, 0), 2),))
+            (21, (((0, 0), 2),)),
+            (22, (((0, 0), 2),))
         ]
 
         def helper(search_out):

@@ -235,12 +235,7 @@ class FxModuleParser:
                     output = IRObject(name=node.name, value=output, is_constant=is_constant)
                 ir_node = IRPyFunc(fsig, input_vals, [output], **kwargs)
 
-        if isinstance(ir_node, IRCell):
-            module_stack = node.meta.get('nn_module_stack')
-            ir_node.module_stack = module_stack
-            comment = str(node.meta.get('frame_record', ''))
-            if comment:
-                ir_node.comment = comment
+        FxModuleParser._set_node_meta(node, ir_node)
 
         ir_nodes = []
         if isinstance(ir_node, IRCell):
@@ -312,10 +307,13 @@ class FxModuleParser:
             else:
                 frame.set_var(node.name, exist_tensor)
         else:
-            if node.target == 'training':
+            assert isinstance(node.target, str), f"GetAttrPrim: expect `node.target` to be str but got {type(node.target)}"
+            # in sub modules, the target is full qualified name (for example `embeddings.dropout.training`)
+            if node.target.split('.')[-1] == 'training':
                 # Let's just support `self.training` and ignore all other cases for now
                 output = IRObject(name=node.name, value=frame.get_var(node.name), is_constant=False)
                 ir_node = IRPyFunc(SELF_GETATTR_SIG, ['training'], [output])
+                FxModuleParser._set_node_meta(node, ir_node)
                 frame.set_var(node.name, output)
                 # never fold the IRPyFunc node
                 ir_nodes.append(ir_node)
@@ -330,6 +328,18 @@ class FxModuleParser:
         output = FxModuleParser.parse_complex(node.args[0], frame)
         frame.set_var(node.name, output)
         return []
+
+    @staticmethod
+    def _set_node_meta(node: torch.fx.Node, ir_node: Union[IRCell, Any]):
+        if not isinstance(ir_node, IRCell):
+            return
+
+        module_stack = node.meta.get('nn_module_stack')
+        ir_node.module_stack = module_stack
+        comment = str(node.meta.get('frame_record', ''))
+        if comment:
+            ir_node.comment = comment
+
 
     @staticmethod
     def _get_qualified_name(node_target: Union[str, Callable[..., Any]], node: torch.fx.Node = None) -> str:

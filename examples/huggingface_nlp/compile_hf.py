@@ -139,9 +139,9 @@ def dump_orged_errors(model_name, error_dict, log_path):
         error_dict[first_line]['count'] += 1
     else:
         error_dict[first_line] = {"count": 1, 'model_name': [model_name]}   #, "example": exception_string
-    
+
     error_dict = dict(sorted(error_dict.items(), key=lambda item: item[1]["count"], reverse=True))
-    
+
     with open(log_path, 'w') as json_file:
         json.dump(error_dict, json_file, indent=4)
 
@@ -337,6 +337,7 @@ class HFCompiler:
                     loggers[ERROR_FNAME].error(f"{model_name} not aligned before and after compile, max diff:{max_diff}")
 
                 if self.train:
+                    self.model = self.model_loader.load_hf_model(self.config)
                     add_logger(self.log_dir, TRAIN_FNAME, prefix="model trained: ", level = logging.INFO, need_timestamp = False)
                     add_logger(self.log_dir, TRAIN_ALIGNED_FNAME, prefix="model train aligned: ", level = logging.INFO, need_timestamp = False)
                     steps = 10
@@ -345,7 +346,7 @@ class HFCompiler:
 
                     origin_loss = compiler.train(self.model, steps = steps)
                     origin_logit = self.model(**compiler.dummy_input)
-                    
+
                     loggers[TRAIN_FNAME].info(f"{model_name}")
 
                     max_diff = calcu_max_diff(origin_logit, compile_logit)

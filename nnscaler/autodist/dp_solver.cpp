@@ -502,6 +502,7 @@ public:
           // we select the 1st partition of the pre_node
           // need to be careful when the graph has multiple outputs
           // shall we constrain that the output of the graph is replicated?
+          cur_ir.push_back(*follow_candidates.rbegin());
         } else if (pre_node->father_id == pre_node->id) {
           assert(follow_candidates.rbegin()->first == pre_node->id);
           cur_ir.push_back(*follow_candidates.rbegin());
