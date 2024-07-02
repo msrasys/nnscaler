@@ -204,11 +204,14 @@ class ComputeConfig:
         else:
             return self.plan_ngpus
 
-    def create_sync_group(self) -> Tuple[List[int], torch.distributed.ProcessGroup]:
+    def get_sync_group(self) -> Tuple[List[int], torch.distributed.ProcessGroup]:
         """
-        Create a sync group for the current rank.
+        Get sync group for the current rank.
         The sync group is a group of ranks that have exactly the same weights, but different inputs,
         so they should synchronize with each other to get the whole gradients/loss/etc.
+
+        Please note if sync groups haven't been created, it will create them.
+        So it will deadlock if only some of ranks call this function.
 
         Returns:
             Tuple[List[int], torch.distributed.ProcessGroup]: return the rank list of the group and its torch.distributed group
@@ -1282,7 +1285,7 @@ def build_optimizer(
     # we need to add all parameters of non-parallel modules to a reducer to reduce grads
     # if there are non-parallel parameters
     if plan_ngpus != runtime_ngpus and non_parallel_modules and any(p.numel() for m in non_parallel_modules for p in m.parameters(False)):
-        group, _ = compute_configs[0].create_sync_group()
+        group, _ = compute_configs[0].get_sync_group()
         non_parallel_module_reducer = Reducer(group)
         for m in non_parallel_modules:
             for param in m.parameters(recurse=False): # only add leaf parameters to avoid duplicate

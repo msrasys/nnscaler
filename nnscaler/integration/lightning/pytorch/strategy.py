@@ -269,7 +269,7 @@ class NnScalerStrategy(ParallelStrategy):
         model.forward = pmodule.forward
 
         # patch log function to add sync_dist_group
-        _, sync_group = self.compute_config.create_sync_group()
+        _, sync_group = self.compute_config.get_sync_group()
 
         _old_log = model.log
         def _new_log(self, *args, **kwargs) -> None:

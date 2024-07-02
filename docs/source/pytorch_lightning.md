@@ -60,6 +60,27 @@ It has exactly the same constructor arguments as `Precision`'s constructor.
 Currently we support `32-true`, `16-true`, `bf16-true`, `16-mixed`, `bf16-mixed`.
 You can specify a grad scaler when you use `16-true`.
 
+## Checkpoint
+
+If this is the first time you run the model, and you have a pretrained model, you must load the pretrained model before you pass it to the `Trainer` constructor. The tracing process will use the pretrained model weights to trace the forward function.
+
+Just like other pytorch lightning strategy,
+you can resume from a checkpoint by specifying the `ckpt_path` argument in the `Trainer.fit` function.
+Please note when the parallel plan is changed (i.e you re-trace the model with different configurations),
+the checkpoints become incompatible, and can't be loaded any more.
+You must firstly merge the checkpoints to a merged checkpoint and load it as a pretrained model.
+
+You can also merge all checkpoints (saved by each rank) to a complete checkpoint by using the `nnscaler.merge_state_dicts` function.
+```python
+import nnscaler
+from pathlib import Path
+state_dicts = []
+CHECKPOINT_DIR = Path(...)
+for rank in range(world_size):
+    state_dicts.append(torch.load(CHECKPOINT_DIR / f"{rank}.pt")['state_dict'])
+merged_state_dict, _ = nnscaler.merge_state_dicts(state_dicts)
+torch.save(merged_state_dict, CHECKPOINT_DIR / "merged.pt")
+```
 
 ## Limitation
 
