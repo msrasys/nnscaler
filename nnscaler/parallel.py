@@ -204,6 +204,26 @@ class ComputeConfig:
         else:
             return self.plan_ngpus
 
+    def create_sync_group(self) -> Tuple[List[int], torch.distributed.ProcessGroup]:
+        """
+        Create a sync group for the current rank.
+        The sync group is a group of ranks that have exactly the same weights, but different inputs,
+        so they should synchronize with each other to get the whole gradients/loss/etc.
+
+        Returns:
+            Tuple[List[int], torch.distributed.ProcessGroup]: return the rank list of the group and its torch.distributed group
+        """
+        rank = torch.distributed.get_rank()
+        # create all groups
+        plan_ngpus = self.plan_ngpus
+        runtime_ngpus = self.runtime_ngpus
+        for i in range(plan_ngpus):
+            DeviceGroup().get_group(
+                list(range(i, runtime_ngpus, plan_ngpus))
+            )
+        rank_list = list(range(rank % plan_ngpus, runtime_ngpus, plan_ngpus))
+        return rank_list, DeviceGroup().get_group(rank_list)
+
     @classmethod
     def safe_dump_to_file(cls, cfg: 'ComputeConfig', file: Union[str, Path]) -> None:
         """
@@ -1262,11 +1282,7 @@ def build_optimizer(
     # we need to add all parameters of non-parallel modules to a reducer to reduce grads
     # if there are non-parallel parameters
     if plan_ngpus != runtime_ngpus and non_parallel_modules and any(p.numel() for m in non_parallel_modules for p in m.parameters(False)):
-        rank = torch.distributed.get_rank()
-        # create all groups
-        for i in range(plan_ngpus):
-            DeviceGroup().get_group(list(range(i, runtime_ngpus, plan_ngpus)))
-        group = list(range(rank % plan_ngpus, runtime_ngpus, plan_ngpus))
+        group, _ = compute_configs[0].create_sync_group()
         non_parallel_module_reducer = Reducer(group)
         for m in non_parallel_modules:
             for param in m.parameters(recurse=False): # only add leaf parameters to avoid duplicate

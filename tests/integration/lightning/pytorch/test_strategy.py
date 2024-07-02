@@ -173,6 +173,62 @@ def correctnes_worker_nnscaler(tmp_path, gradient_clip_val, with_lr_scheduler,
     return model.update_history, model.nnscaler_pmodule.fullmap
 
 
+def correctnes_worker_nnscaler_checkpoint(tmp_path, gradient_clip_val, with_lr_scheduler,
+    precision='32-true',
+    with_tp=False, with_empty_scaler=False
+):
+    init_random()
+    dm = ClassifDataModule()
+    init_random()
+    if with_lr_scheduler:
+        model = ClassificationModelWithLRScheduler()
+        state_dict_type = 'sharded'
+    else:
+        model = ClassificationModel()
+        state_dict_type = 'deduped'
+    if with_tp:
+        compute_config=ComputeConfig(2, 4)
+        policy = 'tp'
+        devices = 4
+    else:
+        compute_config=ComputeConfig(1, 2)
+        policy = 'dp'
+        devices = 2
+    scaler = None
+    if with_empty_scaler or precision == '16-mixed':
+        scaler = torch.cuda.amp.GradScaler(enabled=(precision == '16-mixed'))
+    trainer = Trainer(
+        default_root_dir=tmp_path,
+        max_epochs=1,
+        callbacks=[ModelCheckpoint(dirpath=tmp_path, save_top_k=1, save_last=True)],
+        accelerator="gpu", devices=devices,
+        gradient_clip_val=gradient_clip_val,
+        strategy=NnScalerStrategy(
+            compute_config=compute_config, pas_policy=policy, gen_savedir=tmp_path,
+            instance_name=policy + '_resume',
+            state_dict_type=state_dict_type
+        ),
+        plugins=[NnScalerPrecision(precision, scaler=scaler)]
+    )
+    trainer.fit(model, datamodule=dm)
+
+    trainer = Trainer(
+        default_root_dir=tmp_path,
+        max_epochs=2,
+        callbacks=[ModelCheckpoint(dirpath=tmp_path, save_top_k=1, save_last=True)],
+        accelerator="gpu", devices=devices,
+        gradient_clip_val=gradient_clip_val,
+        strategy=NnScalerStrategy(
+            compute_config=compute_config, pas_policy=policy, gen_savedir=tmp_path,
+            instance_name=policy + '_resume',
+            state_dict_type=state_dict_type
+        ),
+        plugins=[NnScalerPrecision(precision, scaler=scaler)]
+    )
+    trainer.fit(model, datamodule=dm, ckpt_path='last')
+    return model.update_history, model.nnscaler_pmodule.fullmap
+
+
 def correctnes_worker_ddp(tmp_path, gradient_clip_val, with_lr_scheduler, precision='32-true'):
     init_random()
     dm = ClassifDataModule()
@@ -231,14 +287,26 @@ def test_correctness(tmp_path, gradient_clip_val, with_lr_scheduler):
             assert_close(nnscaler_merged_grad_results_fp16[i], ddp_results[0][i][0])
             assert_equal(ddp_results[1][i], ddp_results[0][i])
 
+    nnscaler_returns_ckpt = launch_torchrun(2, correctnes_worker_nnscaler_checkpoint, tmp_path, gradient_clip_val, with_lr_scheduler)
+    nnscaler_merged_weight_results_ckpt, nnscaler_merged_grad_results_ckpt = _merge_results(nnscaler_returns_ckpt)
+
     nnscaler_returns = launch_torchrun(2, correctnes_worker_nnscaler, tmp_path, gradient_clip_val, with_lr_scheduler)
     nnscaler_merged_weight_results, nnscaler_merged_grad_results = _merge_results(nnscaler_returns)
 
     nnscaler_returns = launch_torchrun(2, correctnes_worker_nnscaler, tmp_path, gradient_clip_val, with_lr_scheduler, '32-true', False, True)
     nnscaler_merged_weight_results_scaler, nnscaler_merged_grad_results_scaler = _merge_results(nnscaler_returns)
+
+    assert len(nnscaler_merged_weight_results) == len(nnscaler_merged_weight_results_ckpt)
+    assert len(nnscaler_merged_weight_results) == len(nnscaler_merged_weight_results_scaler)
+
+    assert len(nnscaler_merged_grad_results) == len(nnscaler_merged_grad_results_ckpt)
+    assert len(nnscaler_merged_grad_results) == len(nnscaler_merged_grad_results_scaler)
+
     for i in range(len(nnscaler_merged_weight_results_scaler)):
         assert_equal(nnscaler_merged_weight_results[i], nnscaler_merged_weight_results_scaler[i])
+        assert_equal(nnscaler_merged_weight_results[i], nnscaler_merged_weight_results_ckpt[i])
         assert_equal(nnscaler_merged_grad_results[i], nnscaler_merged_grad_results_scaler[i])
+        assert_equal(nnscaler_merged_grad_results[i], nnscaler_merged_grad_results_ckpt[i])
 
     ddp_results = launch_torchrun(2, correctnes_worker_ddp, tmp_path, gradient_clip_val, with_lr_scheduler)
     for i in range(len(ddp_results[0])):

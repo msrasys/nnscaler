@@ -6,7 +6,7 @@ from tests.parallel_module.test_end2end import MLP
 class SimpleDataset(Dataset):
     def __init__(self, dim: int, size: int = 100):
         self.data = torch.randn(size, dim)
-        self.target = torch.randn(size, dim)
+        self.target = torch.rand(size, dim)
 
     def __getitem__(self, idx: int):
         return {

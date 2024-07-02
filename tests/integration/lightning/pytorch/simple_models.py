@@ -57,23 +57,23 @@ class ClassificationModel(LightningModule):
         x, y = batch
         logits = self.forward(x)
         loss = F.cross_entropy(logits, y)
-        self.log("train_loss", loss, prog_bar=True)
-        self.log("train_acc", self.train_acc(logits, y), prog_bar=True)
+        self.log("train_loss", loss, prog_bar=True, sync_dist=True)
+        self.log("train_acc", self.train_acc(logits, y), prog_bar=True, sync_dist=True)
         return {"loss": loss}
 
     def validation_step(self, batch, batch_idx):
         assert not self.training
         x, y = batch
         logits = self.forward(x)
-        self.log("val_loss", F.cross_entropy(logits, y), prog_bar=False)
-        self.log("val_acc", self.valid_acc(logits, y), prog_bar=True)
+        self.log("val_loss", F.cross_entropy(logits, y), prog_bar=False, sync_dist=True)
+        self.log("val_acc", self.valid_acc(logits, y), prog_bar=True, sync_dist=True)
 
     def test_step(self, batch, batch_idx):
         assert not self.training
         x, y = batch
         logits = self.forward(x)
-        self.log("test_loss", F.cross_entropy(logits, y), prog_bar=False)
-        self.log("test_acc", self.test_acc(logits, y), prog_bar=True)
+        self.log("test_loss", F.cross_entropy(logits, y), prog_bar=False, sync_dist=True)
+        self.log("test_acc", self.test_acc(logits, y), prog_bar=True, sync_dist=True)
 
     def predict_step(self, batch, batch_idx):
         assert not self.training

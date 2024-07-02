@@ -269,15 +269,7 @@ class NnScalerStrategy(ParallelStrategy):
         model.forward = pmodule.forward
 
         # patch log function to add sync_dist_group
-        rank = torch.distributed.get_rank()
-        # create all groups
-        plan_ngpus = self.compute_config.plan_ngpus
-        runtime_ngpus = self.compute_config.runtime_ngpus
-        for i in range(plan_ngpus):
-            DeviceGroup().get_group(
-                list(range(i, runtime_ngpus, plan_ngpus))
-            )
-        sync_group = list(range(rank % plan_ngpus, runtime_ngpus, plan_ngpus))
+        _, sync_group = self.compute_config.create_sync_group()
 
         _old_log = model.log
         def _new_log(self, *args, **kwargs) -> None:
@@ -384,13 +376,15 @@ class NnScalerStrategy(ParallelStrategy):
     def barrier(self, name: Optional[str] = None) -> None:
         if not _distributed_is_initialized():
             return
-        if torch.distributed.get_backend() == "nccl":
-            torch.distributed.barrier(device_ids=[self.root_device.index])
-        else:
-            torch.distributed.barrier()
+        assert torch.distributed.get_backend() == "nccl", "nnscaler only supports nccl backend"
+        # https://github.com/pytorch/pytorch/issues/53658
+        # It would be better to provide device_ids=[self.root_device.index]
+        torch.distributed.barrier(device_ids=[self.root_device.index])
 
     @override
     def broadcast(self, obj: TBroadcast, src: int = 0) -> TBroadcast:
+        assert torch.distributed.get_backend() == "nccl", "nnscaler only supports nccl backend"
+
         if not _distributed_is_initialized():
             return obj
 
@@ -417,8 +411,19 @@ class NnScalerStrategy(ParallelStrategy):
             reduced value, except when the input was not a tensor the output remains is unchanged
 
         """
-        if isinstance(tensor, Tensor):
-            return _sync_ddp_if_available(tensor, group, reduce_op=reduce_op)
+        assert torch.distributed.get_backend() == "nccl", "nnscaler only supports nccl backend"
+
+        if not _distributed_is_initialized() or not isinstance(tensor, Tensor):
+            return tensor
+
+        op: Optional[ReduceOp]
+        if isinstance(reduce_op, str):
+            reduce_op = "avg" if reduce_op == "mean" else reduce_op
+            op = getattr(ReduceOp, reduce_op.upper())
+        else:
+            op = reduce_op
+
+        torch.distributed.all_reduce(tensor, op=op, group=group, async_op=False)
         return tensor
 
     @override

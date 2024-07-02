@@ -8,7 +8,7 @@ from torch.distributed.elastic.multiprocessing.errors import ChildFailedError
 from .utils import retry
 
 
-@retry(ChildFailedError, delay=10, match='RuntimeError: The server socket has failed to listen on any local network address.')
+@retry(ChildFailedError, delay=10, match='The server socket has failed to listen on any local network address.')
 def launch_torchrun(nproc_per_node, worker_fn, *args, **kwargs):
     launch_config = LaunchConfig(
         min_nodes=1,

@@ -238,6 +238,9 @@ def calcuate_gnorm(params: List[torch.Tensor], device: Optional[torch.device] = 
         if multi_tensor_l2norm_available:
             total_norm = _multi_tensor_total_norm(grads).to(device)
         else:
+            # torch.nn.utils.clip_grad_norm_ way to calculate the norm
+            # norms = torch._foreach_norm(grads, 2.0)
+            # total_norm = torch.linalg.vector_norm(torch.stack([norm.to(device) for norm in norms]), 2.0)
             total_norm = torch.norm(
                 torch.stack(
                     [torch.norm(g, p=2, dtype=torch.float32).to(device) for g in grads]
