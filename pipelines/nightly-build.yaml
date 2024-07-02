@@ -1,0 +1,25 @@
+trigger:
+- main
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- task: TwineAuthenticate@1
+  inputs:
+    artifactFeed: SuperScaler/nightly
+
+- script: |
+    python -m pip install --upgrade build twine
+  displayName: prepare environment
+
+- script: |
+    python pipelines/scripts/update_version.py --nightly
+    python -m build
+  displayName: build wheel
+
+- script: |
+    number_of_wheels=`ls dist/*.whl | wc -l`
+    test $number_of_wheels -eq 1
+    python -m twine upload -r nightly --config-file $(PYPIRC_PATH) dist/*.whl
+  displayName: upload nightly wheel

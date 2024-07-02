@@ -15,13 +15,13 @@ from nnscaler.ir.operator import IRFwOperation
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.dimops import DimopSplit, IRDimops
+import nnscaler.resources
 
 from .autodist_config import AutoDistConfig
 
 _logger = logging.getLogger(__name__)
 
-import nnscaler
-_DEFAULT_COMM_DATA_PATH = Path(nnscaler.__file__).parent.parent / 'data/profile/mi200/comm'
+_DEFAULT_COMM_DATA_PATH = nnscaler.resources.files() / 'profile/mi200/comm'
 
 
 def _piecewise_estimator(xs: List[float], ys: List[float], x: float) -> float:
