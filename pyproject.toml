@@ -11,13 +11,13 @@ readme = "README.md"
 requires-python = ">=3.8"
 # TODO: license
 authors = [
-    {name = "nnScaler Team", email = "nnscaler@microsoft.com"}  # FIXME: email
+    {name = "nnScaler Team", email = "nnscaler@service.microsoft.com"}
 ]
 # TODO: keywords
 # TODO: classifiers
 
 [project.urls]
-Homepage = "https://msrasrg.visualstudio.com/SuperScaler/_git/MagicCube"
+Homepage = "https://msrasrg.visualstudio.com/SuperScaler/_git/MagicCube"  # TODO: github
 
 [tool.setuptools]
 dynamic.version.attr = "nnscaler.version.__version__"
