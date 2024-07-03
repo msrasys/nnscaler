@@ -790,7 +790,8 @@ class DropoutModule(torch.nn.Module):
 
 
 @replace_all_device_with('cpu')
-def test_codegen_dropout():
+@pytest.mark.parametrize('constant_fold', [False, True])
+def test_codegen_dropout(constant_fold):
     """
     Test if self.training is correctly handled in the generated code
     """
@@ -801,7 +802,7 @@ def test_codegen_dropout():
             m,
             {'x': torch.randn(128, 64)},
             'dp',
-            ComputeConfig(1, 1),
+            ComputeConfig(1, 1, constant_folding=constant_fold),
             gen_savedir=tempdir,
             load_module=False,
             reuse='override',
@@ -839,7 +840,8 @@ class DropoutModule2(torch.nn.Module):
 
 
 @replace_all_device_with('cpu')
-def test_codegen_dropout2(tmp_path):
+@pytest.mark.parametrize('constant_fold', [False, True])
+def test_codegen_dropout2(tmp_path, constant_fold):
     """
     Test if register_op is correctly handled in the generated code
     """
@@ -849,7 +851,7 @@ def test_codegen_dropout2(tmp_path):
         m,
         {'x': torch.randn(128, 64)},
         'dp',
-        ComputeConfig(1, 1),
+        ComputeConfig(1, 1, constant_folding=constant_fold),
         gen_savedir=tmp_path,
         load_module=False,
         reuse='override',
@@ -881,7 +883,8 @@ class DropoutModuleNested(torch.nn.Module):
 
 
 @replace_all_device_with('cpu')
-def test_codegen_dropout_nested(tmp_path):
+@pytest.mark.parametrize('constant_fold', [False, True])
+def test_codegen_dropout_nested(tmp_path, constant_fold):
     """
     Test if register_op is correctly handled in the generated code
     """
@@ -891,7 +894,7 @@ def test_codegen_dropout_nested(tmp_path):
         m,
         {'x': torch.randn(128, 64)},
         'dp',
-        ComputeConfig(1, 1),
+        ComputeConfig(1, 1, constant_folding=constant_fold),
         gen_savedir=tmp_path,
         load_module=False,
         reuse='override',

@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 from typing import Any, List, Tuple, Callable, Union, Dict, Type, Optional
 
+import nnscaler
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.cten import IRObject, IRCell, IRTensor
@@ -246,7 +247,10 @@ class FxModuleParser:
                 for i in range(len(vals)):
                     ir_node.set_output(i, vals[i])
             elif not isinstance(ir_node.output(0), IRTensor) and ir_node.output(0).value is not None:
+                # never fold our own functions defined in `nnscaler.runtime.function` module.
+                # currently only `ifexpr` will go here, and it will never be folded.
                 if not constant_folding or \
+                    ir_node.signature.startswith(nnscaler.runtime.function.__name__ + '.') or \
                     any_ir_object_satisfy(ir_node.output(0), lambda a: not a.is_constant) or \
                     any_ir_object_satisfy(ir_node.output(0), lambda a: isinstance(a, IRTensor)) or \
                     any_ir_object_satisfy(ir_node.output(0), lambda a: isinstance(a, (DICT_KEYS_TYPE, DICT_VALUES_TYPE, DICT_ITEMS_TYPE))):
@@ -303,7 +307,7 @@ class FxModuleParser:
                     persistent = node.name not in module._non_persistent_buffers_set
                     tensor.as_buffer(persistent=persistent)
                 frame.add_attr(tensor, concrete_value, node.target)
-            # the case that the parameter is consumed multiple times and regisetered previously
+            # the case that the parameter is consumed multiple times and registered previously
             else:
                 frame.set_var(node.name, exist_tensor)
         else:
