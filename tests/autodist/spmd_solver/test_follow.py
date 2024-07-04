@@ -226,7 +226,7 @@ def test_follow_attention():
 
         pc_path = Path(os.path.dirname(__file__)) / 'test_attention_follow.yaml'
         profile_dir = Path(os.path.dirname(__file__)) / './test_follow_attention_profile'
-        cfg = AutoDistConfig(partition_constraints_path=pc_path, mesh_col=2, profile_dir=profile_dir)
+        cfg = AutoDistConfig(partition_constraints_path=pc_path, mesh_col=2, profile_dir=profile_dir, memory_granularity=1024)
         model_graph = ModelGraph(ir_graph, cfg)
 
         spmd_solver = SPMDSolver(
@@ -322,7 +322,7 @@ def test_solver_data_parallel():
         print(ir_graph.nodes())
 
         profile_dir = Path(os.path.dirname(__file__)) / './test_solver_data_parallel'
-        cfg = AutoDistConfig(mesh_col=2, profile_dir=profile_dir)
+        cfg = AutoDistConfig(mesh_col=2, profile_dir=profile_dir, memory_granularity=1024)
         model_graph = ModelGraph(ir_graph, cfg)
 
         spmd_solver = SPMDSolver(

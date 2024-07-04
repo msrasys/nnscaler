@@ -9,20 +9,20 @@ import nnscaler.autodist.dp_solver as dp_solver
 # each operator has 2 partition options
 
 def test_dp_solver():
-    solver = dp_solver.DPSolver(True, 0, 80 * 1024, 1, 1)
+    solver = dp_solver.DPSolver(True, 80 * 1024, 1)
     solver.add_interval(0, 2)
 
-    solver.add_node(0, 0, [0], [], 2)
-    solver.add_partition(0, 0, 1, 1, 1, 1, 1, 0, [[]])
-    solver.add_partition(0, 1, 2, 2, 2, 2, 2, 1, [[]])
+    solver.add_node(0, 0, [0], [], 2, False, False, False)
+    solver.add_partition(0, 0, 1, 1, 1, 1, 1, 1, 0, [[]])
+    solver.add_partition(0, 1, 2, 2, 2, 2, 2, 2, 1, [[]])
 
-    solver.add_node(1, 1, [1], [0], 2)
-    solver.add_partition(1, 0, 0.5, 1, 1, 1, 1, 0, [[0.1, 1]])
-    solver.add_partition(1, 1, 1, 2, 2, 2, 2, 1, [[1, 0]])
+    solver.add_node(1, 1, [1], [0], 2, False, False, False)
+    solver.add_partition(1, 0, 0.5, 1, 1, 1, 1, 1, 0, [[0.1, 1]])
+    solver.add_partition(1, 1, 1, 2, 2, 2, 2, 2, 1, [[1, 0]])
 
-    solver.add_node(2, 2, [2], [1], 2)
-    solver.add_partition(2, 0, 1, 1, 1, 1, 1, 0, [[0.2, 1]])
-    solver.add_partition(2, 1, 2, 2, 2, 2, 2, 1, [[1, 0]])
+    solver.add_node(2, 2, [2], [1], 2, False, False, False)
+    solver.add_partition(2, 0, 1, 1, 1, 1, 1, 1, 0, [[0.2, 1]])
+    solver.add_partition(2, 1, 2, 2, 2, 2, 2, 2, 1, [[1, 0]])
 
     solver.solve()
 
@@ -32,7 +32,41 @@ def test_dp_solver():
 
     # optimal all time 1 + 0.5 + 0.1 + 1 + 0.2 = 2.8
     assert best.all_time == 2.8
-    # optimal inner time 1 + 0.5 + 1 = 2.5
-    assert best.inner_time == 2.5
     # the optimal plan is each operator's first partition
     assert best.path == [(0, 0), (1, 0), (2, 0)]
+
+def test_dp_solver_mem():
+    solver = dp_solver.DPSolver(True, 100, 1)
+    solver.add_interval(0, 4)
+
+    solver.add_node(0, 0, [0], [], 1, True, True, False)
+    solver.add_partition(0, 0, 0.1, 10, 1, 1, 1, 1, 0, [[]])
+
+    solver.add_node(1, 1, [1], [0], 1, True, False, True)
+    solver.add_partition(1, 0, 0.2, 10, 2, 2, 2, 2, 0, [[0]])
+
+    solver.add_node(2, 2, [2], [1], 1, True, True, False)
+    solver.add_partition(2, 0, 0.3, 10, 3, 3, 3, 3, 0, [[0]])
+
+    solver.add_node(3, 3, [3], [2], 1, True, True, False)
+    solver.add_partition(3, 0, 0.4, 10, 4, 4, 4, 4, 0, [[0]])
+
+    solver.add_node(4, 4, [4], [3], 1, True, False, True)
+    solver.add_partition(4, 0, 0.5, 10, 5, 5, 5, 5, 0, [[0]])
+
+    # the total memory cost should be
+    # param: 10 - 1 + 10 - 2 + 10 - 3 + 10 - 4 + 10 - 5 = 35
+    # buffer: 5 + 4 = 9
+    # activation: 1 + 3 + 4 = 8
+    # opt_transient_mem: 1 + 2 + 3 + 4 + 5 = 15
+    # recompute: max(1 + 2, 3 + 4 + 5) = 12
+    # in all: 35 + 9 + max(8, 15) + 12 = 71
+
+    solver.solve()
+
+    ans = solver.get_results(0, 4)
+
+    best = ans[0]
+    assert best.all_time == 1.5
+    assert best.path == [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]
+    assert best.memory == 71

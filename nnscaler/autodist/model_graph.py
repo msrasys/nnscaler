@@ -926,6 +926,7 @@ class ModelGraph:
             if end - start + 1 != len(interval):
                 raise RuntimeError('recompute nodes are not continuous')
             self._recompute_group_idxs.append(interval)
+            self.operator_list[end].recompute_last_op = True
 
     @property
     def recompute_group_idxs(self) -> List[List[int]]:

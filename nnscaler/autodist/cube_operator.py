@@ -37,6 +37,7 @@ class CubeOperator:
         self._has_sum_dim = False
         self._recompute = False
         self._recompute_start_op = False
+        self._recompute_last_op = False
         self._has_attr = False
 
         self.omit_recompute_in_idx = []
@@ -82,6 +83,14 @@ class CubeOperator:
     @recompute_start_op.setter
     def recompute_start_op(self, value: bool):
         self._recompute_start_op = value
+
+    @property
+    def recompute_last_op(self):
+        return self._recompute_last_op
+
+    @recompute_last_op.setter
+    def recompute_last_op(self, value: bool):
+        self._recompute_last_op = value
 
     def add_producer(self, producer: 'CubeOperator'):
         self.producers.append(producer)

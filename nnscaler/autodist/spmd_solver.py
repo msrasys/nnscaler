@@ -1106,15 +1106,12 @@ class SPMDSolver:
                 offset += 1
         plans = []
         all_time_cost = objective
-        inner_time_cost = 0
         for i in range(start, end + 1):
             plans.append((i, s_val[i - start]))
-            p_cost_desc = self.partition_info[i][s_val[i - start]]
-            inner_time_cost += p_cost_desc.comp_time + p_cost_desc.weight_update_time
         mem_cost = self.calc_mem_cost(plans).total_cost
         return SPMDSearchOutput(self.partition_path2desc(plans),
                                 mem_cost / 1024 / 1024 / 1024, all_time_cost,
-                                inner_time_cost)
+                                self.calc_inner_time_cost(plans))
 
     def do_ilp(self, intervals: List[Tuple[int, int]],
                topk: int) -> List[List[SPMDSearchOutput]]:
@@ -1135,20 +1132,22 @@ class SPMDSolver:
         import cppimport.import_hook
         import nnscaler.autodist.dp_solver as dp_solver
 
-        mode = 0 if self.is_train else 1
-        mem_div = 64
-        mem_bound = int(self.mem_bound) // mem_div
-        solver = dp_solver.DPSolver(self.autodist_config.verbose, mode, mem_bound, mem_div, topk)
+        if self.autodist_config.memory_granularity < 1024:
+            raise RuntimeError('dp solver assumes the memory granularity is at least 1024 bytes')
+        buf_mul = 2 if self.is_train else 1
+        mem_divisor = self.autodist_config.memory_granularity
+        solver = dp_solver.DPSolver(self.autodist_config.verbose, self.mem_bound // mem_divisor, topk)
         for start, end in intervals:
             solver.add_interval(start, end)
         for idx in range(self.graph.op_num):
+            op = self.graph.operator_list[idx]
             solver.add_node(idx, self.father_ids[idx], self.cut_ops[idx],
-            self.producers[idx], self.get_op_partition_count(idx))
+            self.producers[idx], self.get_op_partition_count(idx), op.recompute, op.recompute_start_op, op.recompute_last_op)
             for i, partition in enumerate(self._op_partitions[idx]):
                 p_cost_desc = self.partition_info[idx][i]
                 solver.add_partition(idx, i, p_cost_desc.comp_time + p_cost_desc.weight_update_time,
-                p_cost_desc.mem // mem_div, p_cost_desc.transient_mem // mem_div,
-                p_cost_desc.activation_mem // mem_div, p_cost_desc.opt_transient_mem // mem_div,
+                p_cost_desc.mem // mem_divisor, p_cost_desc.in_mem // mem_divisor, buf_mul * p_cost_desc.transient_mem // mem_divisor,
+                p_cost_desc.activation_mem // mem_divisor, p_cost_desc.opt_transient_mem // mem_divisor,
                 self.p_fathers[idx][i], p_cost_desc.comm_time)
         solver.solve()
         ret = []
@@ -1157,7 +1156,7 @@ class SPMDSolver:
             descs = []
             for result in cpp_results:
                 desc = self.partition_path2desc(result.path)
-                descs.append(SPMDSearchOutput(desc, result.memory * mem_div / 1024 / 1024 / 1024, result.all_time, result.inner_time))
+                descs.append(SPMDSearchOutput(desc, result.memory * mem_divisor / 1024 / 1024 / 1024, result.all_time, self.calc_inner_time_cost(result.path)))
             ret.append(descs)
         return ret
 
