@@ -213,6 +213,20 @@ struct UnitDPState {
                        pred_dp_node, pred_idx);
   }
 
+  std::string to_string() {
+    return "param_related_mem: " + std::to_string(param_related_mem) +
+           ", activation_mem: " + std::to_string(activation_mem) +
+           ", opt_transient_mem: " + std::to_string(opt_transient_mem) +
+           ", largest_transient_mem_1st: " +
+           std::to_string(largest_transient_mem_1st) +
+           ", largest_transient_mem_2nd: " +
+           std::to_string(largest_transient_mem_2nd) +
+           ", max_recompute_mem: " + std::to_string(max_recompute_mem) +
+           ", cur_recompute_mem: " + std::to_string(cur_recompute_mem) +
+           ", total_mem: " + std::to_string(total_mem) +
+           ", time_cost: " + std::to_string(time_cost);
+  }
+
   // for priority queue, sort the state by total memory cost from small to large
   // if the total memory cost is the same, sort by time cost from small to large
   bool operator<(const UnitDPState &other) const {

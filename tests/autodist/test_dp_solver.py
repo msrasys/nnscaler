@@ -70,3 +70,50 @@ def test_dp_solver_mem():
     assert best.all_time == 1.5
     assert best.path == [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]
     assert best.memory == 71
+
+def test_dp_solver_build_in_edges():
+    # mock following code
+    # dropout_rate = self.attention_dropout if self.training else 0.0
+    # attn_output = nnscaler_flash_attention_forward(
+    #     query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate, causal=causal
+    # )
+    # 3 nodes will be generated, there are no following chains and tensors between them
+    # 1. self_getattr
+    # 2. ifexpr
+    # 3. nnscaler_flash_attention_forward
+    solver = dp_solver.DPSolver(True, 100, 1)
+    solver.add_interval(0, 2)
+
+    solver.add_node(0, 0, [0], [], 1, False, False, False)
+    solver.add_partition(0, 0, 0, 0, 0, 0, 0, 0, 0, [[]])
+
+    solver.add_node(1, 1, [1], [], 1, False, False, False)
+    solver.add_partition(1, 0, 0, 0, 0, 0, 0, 0, 0, [[]])
+
+    solver.add_node(2, 2, [2], [], 1, False, False, False)
+    solver.add_partition(2, 0, 1, 0, 0, 0, 0, 0, 0, [[]])
+
+    solver.solve()
+
+    ans = solver.get_results(0, 2)
+
+    best = ans[0]
+    assert best.path == [(0, 0), (1, 0), (2, 0)]
+
+def test_dp_solver_mem_bound():
+    solver = dp_solver.DPSolver(True, 10, 1)
+    solver.add_interval(0, 2)
+
+    solver.add_node(0, 0, [0], [], 1, False, False, False)
+    solver.add_partition(0, 0, 0, 8, 0, 0, 0, 0, 0, [[]])
+
+    solver.add_node(1, 1, [1], [], 1, False, False, False)
+    solver.add_partition(1, 0, 0, 5, 0, 0, 0, 0, 0, [[]])
+
+    solver.add_node(2, 2, [2], [], 1, False, False, False)
+    solver.add_partition(2, 0, 1, 11, 0, 0, 0, 0, 0, [[]])
+
+    solver.solve()
+
+    ans = solver.get_results(0, 2)
+    assert len(ans) == 0

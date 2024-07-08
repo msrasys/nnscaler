@@ -267,8 +267,9 @@ public:
     for (int idx = 0; idx < producer_comb_num; ++idx) {
       bool is_legal = true;
       int val = idx;
-      std::vector<int> producer_ps(node->producer_num);
       // decode the producer partition combination
+      // continue if the partition states of producers are illegal
+      std::vector<int> producer_ps(node->producer_num);
       for (int j = 0; j < node->producer_num; ++j) {
         int k = node->producer_num - 1 - j;
         producer_ps[k] = val % node->producers[k]->p_num;
@@ -291,6 +292,7 @@ public:
       if (!is_legal) {
         continue;
       }
+      // build the representation of the predecessor dp node
       // <cut_node_id, cut_node_partition_id>
       std::vector<std::pair<int, int>> cur_ir(node->cut_len - 1);
       bool has_found_follow = false;
@@ -361,8 +363,9 @@ public:
           // do nothing, means the pre_node's output is not used
           // we select the 1st partition of the pre_node
           // need to be careful when the graph has multiple outputs
-          // shall we constrain that the output of the graph is replicated?
-          cur_ir.push_back(*follow_candidates.rbegin());
+          if (!has_found_follow && !follow_candidates.empty()) {
+            cur_ir.push_back(*follow_candidates.rbegin());
+          }
         } else if (pre_node->father_id == pre_node->id) {
           assert(follow_candidates.rbegin()->first == pre_node->id);
           cur_ir.push_back(*follow_candidates.rbegin());
@@ -422,6 +425,9 @@ public:
     std::priority_queue<std::tuple<UnitDPState, int>> pq;
     for (std::size_t i = 0; i < dp_node->in_edges.size(); ++i) {
       DPNode *pred = dp_node->in_edges[i].first;
+      if (pred->state.empty()) {
+        continue;
+      }
       UnitDPState pred_state = pred->state[0];
       double transition_cost = dp_node->in_edges[i].second;
       UnitDPState new_state =
@@ -445,7 +451,7 @@ public:
         pq.push(std::make_tuple(new_state, pred_idx));
         ++lows[pred_idx];
       }
-      if (dp_node->state.empty()) {
+      if (dp_node->state.empty() && cur_state.total_mem <= mem_bound) {
         dp_node->state.push_back(cur_state);
       } else {
         UnitDPState pre_state = dp_node->state[dp_node->state.size() - 1];

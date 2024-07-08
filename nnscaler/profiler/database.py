@@ -292,14 +292,15 @@ class ProfileDataBase:
 
         fn, shapes, dtypes, requires_grads, values, kwargs = get_func(node)
         
-        in_mem_info, param_mem_info, buffer_mem_info = [], [], []
-        for t in node.inputs():
+        in_mem_info, param_mem_info, buffer_mem_info, in_mem_idx = [], [], [], []
+        for idx, t in enumerate(node.inputs()):
             if isinstance(t, IRTensor) and t.is_param():
                 param_mem_info.append(t.byte_size())
             elif isinstance(t, IRTensor) and t.is_buffer():
                 buffer_mem_info.append(t.byte_size())
             elif hasattr(t, 'byte_size'):
                 in_mem_info.append(t.byte_size())
+                in_mem_idx.append(idx)
             else:
                 _logger.debug(f'node {node}: skip input {t}')
 
@@ -316,7 +317,7 @@ class ProfileDataBase:
                     infer_memory += t.byte_size()
             # by default, we assume that all the input tensors are saved for backward
             train_mem_info = copy.deepcopy(in_mem_info)
-            train_mem2in_idx = list(range(len(in_mem_info)))
+            train_mem2in_idx = in_mem_idx
         profiled_metrics = ProfiledMetrics(in_mem_info, param_mem_info, buffer_mem_info,
                                            fw_span, bw_span, infer_memory,
                                            train_mem_info, train_mem2in_idx)
