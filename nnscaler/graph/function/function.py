@@ -12,7 +12,7 @@ from nnscaler.ir.cten import IRTensor, IRObject
 from nnscaler.ir.tensor import IRSubTensor, IRFullTensor
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
-from nnscaler.graph.function.conv import IRPad, IRConv2D, IRConv3D
+from nnscaler.graph.function.conv import IRPad, IRConv3D
 from nnscaler.graph.function.anchor import IRGraphAnchor
 
 _logger = logging.getLogger(__name__)
@@ -1580,19 +1580,6 @@ def Pad(input, pad, mode='constant', value=0.0, signature = None):
 #                     stride=stride, padding=padding, dilation=dilation, groups=groups)
 
 
-def Conv2D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, signature = None):
-    """
-    torch.nn.functional.conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1)
-    """
-    if isinstance(padding, int):
-        padding = [padding] * 4
-    elif len(padding) == 2:
-        padH, padW = padding
-        padding = [padH, padH, padW, padW]
-    return IRConv2D(signature, [input, weight, bias], 'conv2d',
-                    stride=stride, padding=padding, dilation=dilation, groups=groups)
-
-
 def Conv3D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, signature = None):
     """
     torch.nn.functional.conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1)
@@ -2662,42 +2649,50 @@ def Erf(input, *, out=None, signature=None):
     return IRDimops(Erf, 'erf', signature, annos, [input])
 
 
+def unwrap_if_irobject(x):
+        return x.value if isinstance(x, IRObject) else x
+
+
 def Conv1D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, signature=None):
     """
     torch.nn.functional.conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1) → Tensor
     """
-    if isinstance(stride, int):
-        stride = (stride,)
-    if isinstance(dilation, int):
-        dilation = (dilation,)
-    if isinstance(padding, str):
-        if padding == 'same':
+    if len(input.shape) not in [2, 3]:
+        raise ValueError(f"Expected input tensor to have 2 or 3 dimensions, but got {input.shape}")
+    stride_val = unwrap_if_irobject(stride)
+    padding_val = unwrap_if_irobject(padding)
+    dilation_val = unwrap_if_irobject(dilation)
+    groups_val = unwrap_if_irobject(groups)
+    if isinstance(stride_val, int): 
+        stride_val = (stride_val,)
+    if isinstance(dilation_val, int): 
+        dilation_val = (dilation_val,)
+    kW = weight.shape[-1]
+    effective_kernel_size = (kW - 1) * dilation_val[0]
+    if isinstance(padding_val, str):
+        if padding_val == 'same':
             # For 'same' padding, calculate padding needed to keep the output shape the same as input shape
             # this mode doesn’t support any stride values other than 1.
-            kW = weight.shape[2]
-            iW = input.shape[2]
-            effective_kernel_size = (kW - 1) * dilation[0] + 1
-            total_padding = max(0, (iW - 1) * stride[0] + effective_kernel_size - iW)
+            iW = input.shape[-1]
+            total_padding = (iW - 1) * stride_val[0] + effective_kernel_size + 1 - iW
             pad_ = total_padding // 2
             # NOTE: While we calculate padding for both sides, conv1d expects a single integer for symmetrical padding.
-            padding = (pad_, )
-        elif padding == 'valid':
-            padding = (0, )
+            padding_val = (pad_, )
+        elif padding_val == 'valid':
+            padding_val = (0, )
         else:
-            raise ValueError("Unsupported padding value: {}. Use 'valid', 'same', or an integer.".format(padding))
-    elif isinstance(padding, int):
-        padding = (padding,)
-    elif not isinstance(padding, tuple):
+            raise ValueError("Unsupported padding value: {}. Use 'valid', 'same', or an integer.".format(padding_val))
+    elif isinstance(padding_val, int):
+        padding_val = (padding_val,)
+    elif not isinstance(padding_val, tuple):
         raise ValueError("Padding must be a string ('valid', 'same'), an integer, or a tuple")
 
-    ori_groups = groups
-    if isinstance(groups, IRObject): groups = groups.value
-    _, iW = input.shape[1:3]
-    oC, iC, kW = weight.shape
-    oW = (iW + 2 * padding[0] - dilation[0] * (kW - 1) - 1) // stride[0] + 1
-    if input.shape[1] // groups != weight.shape[1]:
-        raise ValueError(f'Input shape and weight shape are not compatible for the number of groups. input shape: {input.shape}, weight shape: {weight.shape}, groups: {groups}')
-    if weight.shape[0] % groups != 0:
+    iC, iW = input.shape[-2:]
+    oC, iCg, kW = weight.shape
+    oW = (iW + 2 * padding_val[0] - effective_kernel_size - 1) // stride_val[0] + 1
+    if iC // groups_val != iCg:
+        raise ValueError(f'Input shape and weight shape are not compatible for the number of groups. input shape: {input.shape}, weight shape: {weight.shape}, groups: {groups_val}')
+    if oC % groups_val != 0:
         raise ValueError('The output channels of weight must be divisible by the number of groups.')
     def modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
         # only for partitioning groups
@@ -2708,24 +2703,249 @@ def Conv1D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, 
             kw_groups = kw_groups.value
         kwargs['groups'] = kw_groups // num
         return kwargs
-    if bias is None:
-        # NOTE: cannot support partitioning inchannel when groups>1
-        if groups == 1:
-            annos = [f'n iC+ {iW}, oC iC+ {kW} -> n oC {oW}']
-            rules = None
+    if len(input.shape) == 2:
+        if bias is None:
+            if groups_val == 1:
+                annos = [f'iC+ {iW}, oC iC+ {kW} -> oC {oW}']
+                rules = None
+            else:
+                rules = [TransformRule([DimopSplit.D(0), DimopSplit.D(0)], [DimopSplit.D(0)], modifier)]
+                annos = [f'(g {iCg}) {iW}, (g {oC // groups_val}) {iCg} {kW} -> (g {oC // groups_val}) {oW}']
         else:
-            rules = [TransformRule([DimopSplit.D(1), DimopSplit.D(0)], [DimopSplit.D(1)], modifier)]
-            annos = [f'n (g {iC}) {iW}, (g {oC//groups}) {iC} {kW} -> n (g {oC//groups}) {oW}']
-    else:
-        # NOTE: not supported value partition of bias yet
-        if groups == 1:
-            annos = [f'n iC^ {iW}, oC iC^ {kW}, oC -> n oC {oW}']
-            rules = None
+            if groups_val == 1:
+                annos = [f'iC^ {iW}, oC iC^ {kW}, oC -> oC {oW}']
+                rules = None
+            else:
+                rules = [TransformRule([DimopSplit.D(1), DimopSplit.D(0), DimopSplit.D(0)], [DimopSplit.D(0)], modifier)]
+                annos = [f'(g {iCg}) {iW}, (g {oC // groups_val}) {iCg} {kW}, (g {oC // groups_val}) -> (g {oC // groups_val}) {oW}']
+    elif len(input.shape) == 3:
+        if bias is None:
+            # NOTE: cannot support partitioning inchannel when groups>1
+            if groups_val == 1:
+                annos = [f'n iC+ {iW}, oC iC+ {kW} -> n oC {oW}']
+                rules = None
+            else:
+                rules = [TransformRule([DimopSplit.D(1), DimopSplit.D(0)], [DimopSplit.D(1)], modifier)]
+                annos = [f'n (g {iCg}) {iW}, (g {oC//groups_val}) {iCg} {kW} -> n (g {oC//groups_val}) {oW}']
         else:
-            rules = [TransformRule([DimopSplit.D(1), DimopSplit.D(0), DimopSplit.D(0)], [DimopSplit.D(1)], modifier)]
-            annos = [f'n (g {iC}) {iW}, (g {oC//groups}) {iC} {kW}, (g {oC//groups}) -> n (g {oC//groups}) {oW}']
+            # NOTE: not supported value partition of bias yet
+            if groups_val == 1:
+                annos = [f'n iC^ {iW}, oC iC^ {kW}, oC -> n oC {oW}']
+                rules = None
+            else:
+                rules = [TransformRule([DimopSplit.D(1), DimopSplit.D(0), DimopSplit.D(0)], [DimopSplit.D(1)], modifier)]
+                annos = [f'n (g {iCg}) {iW}, (g {oC//groups_val}) {iCg} {kW}, (g {oC//groups_val}) -> n (g {oC//groups_val}) {oW}']
     return IRDimops(Conv1D, 'conv1d', signature, annos, [input, weight, bias] if bias is not None else [input, weight], rules,
-                    stride=stride, padding=padding, dilation=dilation, groups=ori_groups)
+                    stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+
+def ConvTranspose1D(input, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1, signature=None):
+    """
+    torch.nn.functional.conv_transpose1d(input, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1)
+    """
+    if len(input.shape) not in [2, 3]:
+        raise ValueError(f"Expected input tensor to have 2 or 3 dimensions, but got {input.shape}")
+    stride_val = unwrap_if_irobject(stride)
+    padding_val = unwrap_if_irobject(padding)
+    output_padding_val = unwrap_if_irobject(output_padding)
+    dilation_val = unwrap_if_irobject(dilation)
+    groups_val = unwrap_if_irobject(groups)
+    if isinstance(stride_val, int):
+        stride_val = (stride_val,)
+    if isinstance(padding_val, int):
+        padding_val = (padding_val,)
+    if isinstance(output_padding_val, int):
+        output_padding_val = (output_padding_val,)
+    if isinstance(dilation_val, int):
+        dilation_val = (dilation_val,)
+    if not (len(stride_val) == 1 and len(padding_val) == 1 and len(output_padding_val) == 1 and len(dilation_val) == 1):
+        raise ValueError("stride, padding, output_padding, and dilation must have a length of 1")
+    if weight.shape[1] % groups_val != 0:
+        raise ValueError(f'Weight output channels must be divisible by groups. weight output channels: {weight.shape[1]}, groups: {groups_val}')
+    if input.shape[-2] != weight.shape[0]:
+        raise ValueError(f'Input channels and weight input channels must be the same. input channels: {input.shape[-2]}, weight input channels: {weight.shape[0]}')
+    if input.shape[-2] % groups_val != 0 or weight.shape[0] % groups_val != 0:
+        raise ValueError(f'Input shape and groups are not compatible. input shape: {input.shape}, weight shape: {weight.shape}, groups: {groups_val}')
+    iW = input.shape[-1]
+    kW = weight.shape[2]
+    oW = (iW - 1) * stride_val[0] - 2 * padding_val[0] + dilation_val[0] * (kW - 1) + output_padding_val[0] + 1
+    # iC+ represents the merging of input channels
+    # Example: If the input is (batch_size, 3, 32), with three input channels
+    # Partition: The 3 input channels can be logically divided into 3 subsets (each subset contains 1 channel).
+    # In the convolution calculation, these three subsets are combined into a whole for processing, and the output result is a new feature graph.
+    if len(input.shape) == 2:
+        if bias is None:
+            annos = [f'iC+ {iW}, iC+ oC {kW} -> oC {oW}'] if groups_val == 1 else \
+                    [f'(groups group_size^) {iW}, (groups group_size^) oC {kW} -> (groups oC) {oW}']
+            return IRDimops(ConvTranspose1D, 'conv_transpose1d', signature, annos, [input, weight],
+                            bias=None, stride=stride, padding=padding, output_padding=output_padding, groups=groups, dilation=dilation)
+        else:
+            annos = [f'iC+ {iW}, iC+ oC {kW}, oC -> oC {oW}'] if groups_val == 1 else \
+                    [f'(groups group_size^) {iW}, (groups group_size^) oC {kW}, oC -> (groups oC) {oW}']
+            return IRDimops(ConvTranspose1D, 'conv_transpose1d', signature, annos, [input, weight, bias],
+                        stride=stride, padding=padding, output_padding=output_padding, groups=groups, dilation=dilation)
+    if len(input.shape) == 3:    
+        if bias is None:
+            annos = [f'n iC+ {iW}, iC+ oC {kW} -> n oC {oW}'] if groups_val == 1 else \
+                    [f'n (groups group_size^) {iW}, (groups group_size^) oC {kW} -> n (groups oC) {oW}']
+            return IRDimops(ConvTranspose1D, 'conv_transpose1d', signature, annos, [input, weight],
+                            bias=None, stride=stride, padding=padding, output_padding=output_padding, groups=groups, dilation=dilation)
+        else:
+            annos = [f'n iC+ {iW}, iC+ oC {kW}, oC -> n oC {oW}'] if groups_val == 1 else \
+                    [f'n (groups group_size^) {iW}, (groups group_size^) oC {kW}, oC -> n (groups oC) {oW}']
+            return IRDimops(ConvTranspose1D, 'conv_transpose1d', signature, annos, [input, weight, bias],
+                        stride=stride, padding=padding, output_padding=output_padding, groups=groups, dilation=dilation)
+
+
+def Conv2D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, signature=None):
+    """
+    torch.nn.functional.conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1)
+
+    NOTE: the helo-exchange partitioning is supported in IRConv2D
+    TODO: partitioning groups or iC+ is possible, but need full fledged implementation of the annotation
+    """
+    if len(input.shape) not in [3, 4]:
+        raise ValueError(f"Expected input tensor to have 3 or 4 dimensions, but got {input.shape}")
+    stride_val = unwrap_if_irobject(stride)
+    padding_val = unwrap_if_irobject(padding)
+    dilation_val = unwrap_if_irobject(dilation)
+    groups_val = unwrap_if_irobject(groups)
+    if isinstance(stride_val, int): 
+        stride_val = (stride_val, stride_val)
+    if isinstance(dilation_val, int): 
+        dilation_val = (dilation_val, dilation_val)
+    if isinstance(padding_val, str):
+        if padding_val == 'same':
+            kH, kW = weight.shape[2:4]
+            iH, iW = input.shape[-2:]
+            effective_kernel_size_h = (kH - 1) * dilation_val[0] + 1
+            effective_kernel_size_w = (kW - 1) * dilation_val[1] + 1
+            total_padding_h = (iH - 1) * stride_val[0] + effective_kernel_size_h - iH
+            total_padding_w = (iW - 1) * stride_val[1] + effective_kernel_size_w - iW
+            pad_h = total_padding_h // 2
+            pad_w = total_padding_w // 2
+            padding_val = (pad_h, pad_w)
+        elif padding_val == 'valid':
+            padding_val = (0, 0)
+        else:
+            raise ValueError("Unsupported padding value: {}. Use 'valid', 'same', or an integer.".format(padding_val))
+    elif isinstance(padding_val, int):
+        padding_val = (padding_val, padding_val)
+    elif not isinstance(padding_val, tuple):
+        raise ValueError("Padding must be a string ('valid', 'same'), an integer, or a tuple")
+    iC, iH, iW = input.shape[-3:]
+    oC, iCg, kH, kW = weight.shape
+    oH = (iH + 2 * padding_val[0] - dilation_val[0] * (kH - 1) - 1) // stride_val[0] + 1
+    oW = (iW + 2 * padding_val[1] - dilation_val[1] * (kW - 1) - 1) // stride_val[1] + 1
+
+    if iC // groups_val != iCg:
+        raise ValueError(f'Input shape and weight shape are not compatible for the number of groups. input shape: {input.shape}, weight shape: {weight.shape}, groups: {groups_val}')
+    if oC % groups_val != 0:
+        raise ValueError('The output channels of weight must be divisible by the number of groups.')
+
+    def modifier(kwargs: dict, idx, dim, num: int) -> dict:
+        # only for partitioning groups
+        kwargs = dict(**kwargs)
+        kw_groups = kwargs['groups']
+        if isinstance(kw_groups, IRObject):
+            kw_groups = kw_groups.value
+        kwargs['groups'] = kw_groups // num
+        return kwargs
+
+    if len(input.shape) == 3:
+        if bias is None:
+            if groups_val == 1:
+                annos = [f'iC+ {iH} {iW}, oC iC+ {kH} {kW} -> oC {oH} {oW}']
+                rules = None
+            else:
+                # NOTE: g can be partitioned only when rules are provided
+                annos = [f'(g {iCg}) {iH} {iW}, (g {oC // groups_val}) {iCg} {kH} {kW} -> (g {oC // groups_val}) {oH} {oW}']
+                rules = [TransformRule([DimopSplit.D(0), DimopSplit.D(0)], [DimopSplit.D(0)], modifier)]
+        else:
+            # NOTE: not supported value partition of bias yet
+            if groups_val == 1:
+                annos = [f'iC^ {iH} {iW}, oC iC^ {kH} {kW}, oC -> oC {oH} {oW}']
+                rules = None
+            else:
+                annos = [f'(g {iCg}) {iH} {iW}, (g {oC // groups_val}) {iCg} {kH} {kW}, (g {oC // groups_val}) -> (g {oC // groups_val}) {oH} {oW}']
+                rules = [TransformRule([DimopSplit.D(0), DimopSplit.D(0), DimopSplit.D(0)], [DimopSplit.D(0)], modifier)]
+    elif len(input.shape) == 4:
+        if bias is None:
+            if groups_val == 1:
+                annos = [f'n iC+ {iH} {iW}, oC iC+ {kH} {kW} -> n oC {oH} {oW}']
+                rules = None
+            else:
+                # NOTE: g can be partitioned only when rules are provided
+                annos = [f'n (g {iCg}) {iH} {iW}, (g {oC // groups_val}) {iCg} {kH} {kW} -> n (g {oC // groups_val}) {oH} {oW}']
+                rules = [TransformRule([DimopSplit.D(1), DimopSplit.D(0)], [DimopSplit.D(1)], modifier)]
+        else:
+            # NOTE: not supported value partition of bias yet
+            if groups_val == 1:
+                annos = [f'n iC^ {iH} {iW}, oC iC^ {kH} {kW}, oC -> n oC {oH} {oW}']
+                rules = None
+            else:
+                annos = [f'n (g {iCg}) {iH} {iW}, (g {oC // groups_val}) {iCg} {kH} {kW}, (g {oC // groups_val}) -> n (g {oC // groups_val}) {oH} {oW}']
+                rules = [TransformRule([DimopSplit.D(1), DimopSplit.D(0), DimopSplit.D(0)], [DimopSplit.D(1)], modifier)]
+
+    return IRDimops(Conv2D, 'conv2d', signature, annos, [input, weight, bias] if bias is not None else [input, weight], rules,
+                    stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+
+def ConvTranspose2D(input, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1, signature = None):
+    """
+    torch.nn.functional.conv_transpose2d(input, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1)
+    """
+    if len(input.shape) not in [3, 4]:
+        raise ValueError(f"Expected input tensor to have 3 or 4 dimensions, but got {input.shape}")
+    stride_val = unwrap_if_irobject(stride)
+    padding_val = unwrap_if_irobject(padding)
+    output_padding_val = unwrap_if_irobject(output_padding)
+    dilation_val = unwrap_if_irobject(dilation)
+    groups_val = unwrap_if_irobject(groups)
+    if isinstance(stride_val, int): 
+        stride_val = (stride_val, stride_val)
+    if isinstance(padding_val, int): 
+        padding_val = (padding_val, padding_val)
+    if isinstance(output_padding_val, int): 
+        output_padding_val = (output_padding_val, output_padding_val)
+    if isinstance(dilation_val, int): 
+        dilation_val = (dilation_val, dilation_val)
+    if not (len(stride_val) == 2 and len(padding_val) == 2 and len(output_padding_val) == 2 and len(dilation_val) == 2):
+        raise ValueError("stride, padding, output_padding, and dilation must have a length of 2")
+    iH, iW = input.shape[-2:]
+    kH, kW = weight.shape[2:4]
+    oH = (iH - 1) * stride_val[0] - 2 * padding_val[0] + dilation_val[0] * (kH - 1) + output_padding_val[0] + 1
+    oW = (iW - 1) * stride_val[1] - 2 * padding_val[1] + dilation_val[1] * (kW - 1) + output_padding_val[1] + 1
+    if input.shape[-3] != weight.shape[0]:
+        raise ValueError(f'Input channels and weight input channels must be the same. input channels: {input.shape[-3]}, weight input channels: {weight.shape[0]}')
+    if input.shape[-3] % groups_val != 0:
+        raise ValueError(f'Input shape and groups are not compatible. input shape: {input.shape}, groups: {groups_val}')
+    if weight.shape[0] % groups_val != 0:
+        raise ValueError(f'Weight shape and groups are not compatible. weight shape: {weight.shape}, groups: {groups_val}')
+    # FIXME: inchannel is reduction dim or outchannel?
+    # iC+ represents the merging of input channels
+    if len(input.shape) == 3:
+        if bias is None:
+            annos = [f'iC+ {iH} {iW}, iC+ oC {kH} {kW} -> oC {oH} {oW}'] if groups_val == 1 else \
+                    [f'(groups group_size^) {iH} {iW}, (groups group_size^) oC {kH} {kW} -> (groups oC) {oH} {oW}']
+            return IRDimops(ConvTranspose2D, 'conv_transpose2d', signature, annos, [input, weight],
+                            bias=None, stride=stride, padding=padding, output_padding=output_padding, groups=groups, dilation=dilation)
+        else:
+            annos = [f'iC+ {iH} {iW}, iC+ oC {kH} {kW}, oC -> oC {oH} {oW}'] if groups_val == 1 else \
+                    [f'(groups group_size^) {iH} {iW}, (groups group_size^) oC {kH} {kW}, oC -> (groups oC) {oH} {oW}']
+            return IRDimops(ConvTranspose2D, 'conv_transpose2d', signature, annos, [input, weight, bias],
+                            stride=stride, padding=padding, output_padding=output_padding, groups=groups, dilation=dilation)
+    if len(input.shape) == 4:    
+        if bias is None:
+            annos = [f'n iC+ {iH} {iW}, iC+ oC {kH} {kW} -> n oC {oH} {oW}'] if groups_val == 1 else \
+                    [f'n (groups group_size^) {iH} {iW}, (groups group_size^) oC {kH} {kW} -> n (groups oC) {oH} {oW}']
+            return IRDimops(ConvTranspose2D, 'conv_transpose2d', signature, annos, [input, weight],
+                            bias=None, stride=stride, padding=padding, output_padding=output_padding, groups=groups, dilation=dilation)
+        else:
+            annos = [f'n iC+ {iH} {iW}, iC+ oC {kH} {kW}, oC -> n oC {oH} {oW}'] if groups_val == 1 else \
+                    [f'n (groups group_size^) {iH} {iW}, (groups group_size^) oC {kH} {kW}, oC -> n (groups oC) {oH} {oW}']
+            return IRDimops(ConvTranspose2D, 'conv_transpose2d', signature, annos, [input, weight, bias],
+                            stride=stride, padding=padding, output_padding=output_padding, groups=groups, dilation=dilation)
 
 
 def SVD(input, some=True, compute_uv=True, *, out=None, signature=None):

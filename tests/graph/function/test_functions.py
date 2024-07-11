@@ -597,11 +597,19 @@ def test_Softmax():
 
     
 def test_Conv1D():
+    op = F.Conv1D(IRTensor([3, 4]), IRTensor([3, 3, 1]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'iC+ 4, oC iC+ 1 -> oC 4'
+    op = F.Conv1D(IRTensor([3, 4]), IRTensor([3, 3, 1]), groups=1,padding="valid")
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'iC+ 4, oC iC+ 1 -> oC 4'
+    op = F.Conv1D(input=IRTensor([8, 32]), weight=IRTensor([16, 8, 3]), bias=IRObject(value=16),groups=1,padding="same")
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'iC^ 32, oC iC^ 3, oC -> oC 32'
     op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 4'
     op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), stride=2)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 2'
     op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), padding=1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 6'
+    op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), padding=IRObject(value=1))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 6'
     op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), dilation=2)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 4'
@@ -609,13 +617,14 @@ def test_Conv1D():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 4'
     op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), groups=1,padding="valid")
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, oC iC+ 1 -> n oC 4'
-    op = F.Conv1D(input=IRTensor([4, 8, 32]), weight=IRTensor([16, 8, 3]), bias=IRTensor([16,]),groups=1,padding="same")
+    op = F.Conv1D(input=IRTensor([4, 8, 32]), weight=IRTensor([16, 8, 3]), bias=IRObject(value=16),groups=1,padding="same")
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC^ 32, oC iC^ 3, oC -> n oC 32'
     op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 1, 1]), groups=3)
     expected_annotation_for_groups = 'n (g 1) 4, (g 1) 1 1 -> n (g 1) 4'
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation_for_groups
-    op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), bias=IRTensor([3]))
+    op = F.Conv1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), bias=IRObject(value=3))
     assert op._annos_candidates[0] == 'n iC^ 4, oC iC^ 1, oC -> n oC 4', "Annotation mismatch."
+
 
 
 def test_Arange():
@@ -759,3 +768,91 @@ def test_Diag():
 
     op = F.Diag(IRTensor([5, 10]), -1)
     assert op._annos_candidates[0] == '5 10 -> 4'
+
+
+def test_Conv2D():
+    op = F.Conv2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, oC iC+ 1 1 -> n oC 4 4'
+    op = F.Conv2D(IRTensor([3, 4, 4]), IRTensor([3, 3, 1, 1]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'iC+ 4 4, oC iC+ 1 1 -> oC 4 4'
+    op = F.Conv2D(IRTensor([3, 4, 4]), IRTensor([3, 3, 1, 1]), groups=1, padding="valid")
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'iC+ 4 4, oC iC+ 1 1 -> oC 4 4'
+    op = F.Conv2D(input=IRTensor([8, 32, 32]), weight=IRTensor([16, 8, 3, 3]), bias=IRObject(value=16), groups=1, padding="same")
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'iC^ 32 32, oC iC^ 3 3, oC -> oC 32 32'
+    op = F.Conv2D(input=IRTensor([8, 32, 32]), weight=IRTensor([16, 4, 3, 3]), bias=IRObject(value=16), groups=2, padding="same")
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '(g 4) 32 32, (g 8) 4 3 3, (g 8) -> (g 8) 32 32'
+    op = F.Conv2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), stride=2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, oC iC+ 1 1 -> n oC 2 2'
+    op = F.Conv2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), padding=1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, oC iC+ 1 1 -> n oC 6 6'
+    op = F.Conv2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), padding=IRObject(value=1))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, oC iC+ 1 1 -> n oC 6 6'
+    op = F.Conv2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), dilation=2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, oC iC+ 1 1 -> n oC 4 4'
+    op = F.Conv2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), groups=1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, oC iC+ 1 1 -> n oC 4 4'
+    op = F.Conv2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), groups=1, padding="valid")
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, oC iC+ 1 1 -> n oC 4 4'
+    op = F.Conv2D(input=IRTensor([4, 8, 32, 32]), weight=IRTensor([16, 8, 3, 3]), bias=IRObject(value=16), groups=1, padding="same")
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC^ 32 32, oC iC^ 3 3, oC -> n oC 32 32'
+    op = F.Conv2D(input=IRTensor([4, 8, 32, 32]), weight=IRTensor([16, 4, 3, 3]), bias=IRObject(value=16), groups=2, padding="same")
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n (g 4) 32 32, (g 8) 4 3 3, (g 8) -> n (g 8) 32 32'
+    op = F.Conv2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 1, 1, 1]), groups=3)
+    expected_annotation_for_groups = 'n (g 1) 4 4, (g 1) 1 1 1 -> n (g 1) 4 4'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation_for_groups
+    op = F.Conv2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), bias=IRObject(value=3))
+    assert op._annos_candidates[0] == 'n iC^ 4 4, oC iC^ 1 1, oC -> n oC 4 4', "Annotation mismatch."
+
+
+def test_ConvTranspose2D():
+    op = F.ConvTranspose2D(IRTensor([3, 4, 4]), IRTensor([3, 3, 1, 1]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'iC+ 4 4, iC+ oC 1 1 -> oC 4 4'
+    op = F.ConvTranspose2D(IRTensor([3, 4, 4]), IRTensor([3, 3, 1, 1]), bias=IRObject(value=3))
+    assert op._annos_candidates[0] == 'iC+ 4 4, iC+ oC 1 1, oC -> oC 4 4', "Annotation mismatch."
+    op = F.ConvTranspose2D(IRTensor([3, 4, 4]), IRTensor([3, 3, 1, 1]), padding=IRObject(value=1))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'iC+ 4 4, iC+ oC 1 1 -> oC 2 2'
+    op = F.ConvTranspose2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, iC+ oC 1 1 -> n oC 4 4'
+    op = F.ConvTranspose2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), stride=2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, iC+ oC 1 1 -> n oC 7 7'
+    op = F.ConvTranspose2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), padding=1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, iC+ oC 1 1 -> n oC 2 2'
+    op = F.ConvTranspose2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), padding=IRObject(value=1))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, iC+ oC 1 1 -> n oC 2 2'
+    op = F.ConvTranspose2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), dilation=2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, iC+ oC 1 1 -> n oC 4 4'
+    op = F.ConvTranspose2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), groups=1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4 4, iC+ oC 1 1 -> n oC 4 4'
+    op = F.ConvTranspose2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 1, 1, 1]), groups=3)
+    expected_annotation_for_groups = 'n (groups group_size^) 4 4, (groups group_size^) oC 1 1 -> n (groups oC) 4 4'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation_for_groups
+    op = F.ConvTranspose2D(IRTensor([2, 3, 4, 4]), IRTensor([3, 3, 1, 1]), bias=IRObject(value=3))
+    assert op._annos_candidates[0] == 'n iC+ 4 4, iC+ oC 1 1, oC -> n oC 4 4', "Annotation mismatch."
+
+
+def test_ConvTranspose1D():
+    op = F.ConvTranspose1D(IRTensor([3, 4]), IRTensor([3, 3, 1]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'iC+ 4, iC+ oC 1 -> oC 4'
+    op = F.ConvTranspose1D(IRTensor([3, 4]), IRTensor([3, 3, 1]), groups=3)
+    expected_annotation_for_groups = '(groups group_size^) 4, (groups group_size^) oC 1 -> (groups oC) 4'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation_for_groups
+    op = F.ConvTranspose1D(IRTensor([3, 4]), IRTensor([3, 3, 1]), bias=IRObject(value=3))
+    assert op._annos_candidates[0] == 'iC+ 4, iC+ oC 1, oC -> oC 4', "Annotation mismatch."
+    op = F.ConvTranspose1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, iC+ oC 1 -> n oC 4'
+    op = F.ConvTranspose1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), stride=2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, iC+ oC 1 -> n oC 7'
+    op = F.ConvTranspose1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), padding=1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, iC+ oC 1 -> n oC 2'
+    op = F.ConvTranspose1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), padding=IRObject(value=1))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, iC+ oC 1 -> n oC 2'
+    op = F.ConvTranspose1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), dilation=2)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, iC+ oC 1 -> n oC 4'
+    op = F.ConvTranspose1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), groups=1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'n iC+ 4, iC+ oC 1 -> n oC 4'
+    op = F.ConvTranspose1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), groups=3)
+    expected_annotation_for_groups = 'n (groups group_size^) 4, (groups group_size^) oC 1 -> n (groups oC) 4'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation_for_groups
+    op = F.ConvTranspose1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), bias=IRObject(value=3))
+    assert op._annos_candidates[0] == 'n iC+ 4, iC+ oC 1, oC -> n oC 4', "Annotation mismatch."
+

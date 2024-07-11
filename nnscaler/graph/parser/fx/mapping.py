@@ -222,8 +222,14 @@ class SignFx2Op:
         __ttemplate('reshape'): function.Reshape,
         
         __ttemplate('conv1d'): function.Conv1D,
+        __ftemplate('conv1d'): function.Conv1D,
+        __ttemplate('conv_transpose1d'): function.ConvTranspose1D,
+        __ftemplate('conv_transpose1d'): function.ConvTranspose1D,
         #
-        # __ttemplate('conv2d'): function.Conv2D,
+        __ttemplate('conv2d'): function.Conv2D,
+        __ftemplate('conv2d'): function.Conv2D,
+        __ttemplate('conv_transpose2d'): function.ConvTranspose2D,
+        __ftemplate('conv_transpose2d'): function.ConvTranspose2D,
         #
         # __ttemplate('conv3d'): function.Conv3D,
         #

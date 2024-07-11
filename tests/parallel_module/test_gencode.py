@@ -977,3 +977,134 @@ def test_codegen_kwargs(tmp_path):
     assert _gencode_contains(tmp_path, KwargsModule, 0,
             r"torch.zeros_like\(x_\d+, requires_grad=False, dtype=torch.float32\)"
     )
+
+
+class ConvTranspose1DModule(torch.nn.Module):
+    def __init__(self, weight, bias=None, stride=1, padding=0, output_padding=0, dilation=1, groups=1):
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight)
+        self.bias = torch.nn.Parameter(bias) if bias is not None else None
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.dilation = dilation
+        self.groups = groups
+
+    def forward(self, input, **kwargs):
+        groups = kwargs.get('groups', self.groups)
+        return torch.nn.functional.conv_transpose1d(input, self.weight, self.bias, self.stride, self.padding, self.output_padding, groups, self.dilation)
+
+
+def _gencode_conv_transpose1d_function(tempdir):
+    init_distributed()
+    weight = torch.randn(3, 3, 3)
+    bias = torch.randn(3)
+    m_new = parallelize(
+        ConvTranspose1DModule(weight, bias),
+        {
+            'input': torch.randn(2, 3, 4),
+            'groups': 1,
+        },
+        'dp',
+        ComputeConfig(1, 1),
+        gen_savedir=tempdir,
+        load_module=True
+    )
+    assert m_new is not None
+    args = inspect.signature(m_new._forward_impl).parameters
+    assert len(args) == 2
+    assert args['input'].default is inspect.Parameter.empty, "Expected 'input' to have no default value"
+    assert args['kwargs'].default == inspect.Parameter.empty, "Expected 'kwargs' to have no default value"
+
+    input_tensor = torch.randn(2, 3, 4)
+    model = ConvTranspose1DModule(weight, bias)
+    expected_output = model(input_tensor, groups=1)
+    actual_output = m_new(input_tensor, groups=1)
+    assert torch.allclose(actual_output, expected_output, atol=1e-6), "Expected the output of ConvTranspose1DModule to match the expected output"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of GPU devices')
+def test_codegen_conv_transpose1d():
+    with tempfile.TemporaryDirectory() as tempdir:
+        launch_torchrun(1, _gencode_conv_transpose1d_function, tempdir)
+
+
+class Conv2DModule(torch.nn.Module):
+    def __init__(self, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight)
+        self.bias = torch.nn.Parameter(bias) if bias is not None else None
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+
+    def forward(self, input, **kwargs):
+        groups = kwargs.get('groups', self.groups)
+        return torch.nn.functional.conv2d(input, self.weight, self.bias, self.stride, self.padding, self.dilation, groups)
+
+
+def _gencode_conv2d_function(tempdir):
+    init_distributed()
+    weight = torch.randn(3, 3, 3, 3)
+    bias = torch.randn(3)
+    m_new = parallelize(
+        Conv2DModule(weight, bias),
+        {
+            'input': torch.randn(2, 3, 32, 32),
+            'groups': 1,
+        },
+        'dp',
+        ComputeConfig(1, 1),
+        gen_savedir=tempdir,
+        load_module=True
+    )
+    assert m_new is not None
+    args = inspect.signature(m_new._forward_impl).parameters
+    assert len(args) == 2
+    assert args['input'].default is inspect.Parameter.empty, "Expected 'input' to have no default value"
+    assert args['kwargs'].default == inspect.Parameter.empty, "Expected 'kwargs' to have no default value"
+    input_tensor = torch.randn(2, 3, 32, 32)
+    model = Conv2DModule(weight, bias)
+    expected_output = model(input_tensor, groups=1)
+    actual_output = m_new(input_tensor, groups=1)
+    assert torch.allclose(actual_output, expected_output, atol=1e-6), "Expected the output of Conv2DModule to match the expected output"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of GPU devices')
+def test_codegen_conv2d():
+    with tempfile.TemporaryDirectory() as tempdir:
+        launch_torchrun(1, _gencode_conv2d_function, tempdir)
+
+
+def _gencode_conv2d_function_(tempdir):
+    init_distributed()
+    weight = torch.randn(6, 3, 3, 3)
+    bias = torch.randn(6)
+    m_new = parallelize(
+        Conv2DModule(weight, bias, groups=2),
+        {
+            'input': torch.randn(2, 6, 32, 32), 
+            'groups': 2,
+        },
+        'dp',
+        ComputeConfig(1, 1),
+        gen_savedir=tempdir,
+        load_module=True
+    )
+    assert m_new is not None
+    args = inspect.signature(m_new._forward_impl).parameters
+    assert len(args) == 2
+    assert args['input'].default is inspect.Parameter.empty, "Expected 'input' to have no default value"
+    assert args['kwargs'].default == inspect.Parameter.empty, "Expected 'kwargs' to have no default value"
+    input_tensor = torch.randn(2, 6, 32, 32)
+    model = Conv2DModule(weight, bias, groups=2)
+    expected_output = model(input_tensor, groups=2)
+    actual_output = m_new(input_tensor, groups=2)
+    assert torch.allclose(actual_output, expected_output, atol=1e-6), "Expected the output of Conv2DModule to match the expected output"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of GPU devices')
+def test_codegen_conv2d_groups():
+    with tempfile.TemporaryDirectory() as tempdir:
+        launch_torchrun(1, _gencode_conv2d_function_, tempdir)
