@@ -1053,7 +1053,10 @@ class ConcreteTracer(TracerBase):
                 else:
                     wrapped = _create_wrapped_leaf_func(self, func, inner_func)
             else:
-                if func.__qualname__.startswith('_TensorBase'):
+                # for example, torch.Tensor.view.__qualname__ is 'TensorBase.view',
+                # should also add the location `Location(torch.Tensor, func.__name__)` for these methods.
+                # NOTE: `_TensorBase` is renamed to `TensorBase` in the latest pytorch version.
+                if func.__qualname__.startswith('_TensorBase') or func.__qualname__.startswith('TensorBase'):
                     locations = (*locations, Location(torch.Tensor, func.__name__))
                     wrapped = _create_wrapped_leaf_method(self, getattr(torch.Tensor, func.__name__), func.__name__, wrap_info.replace_fn)
                 elif func.__qualname__.startswith('_VariableFunctionsClass'):
