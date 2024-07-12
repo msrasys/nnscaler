@@ -87,28 +87,31 @@ If the example works for you, you can now follow the documentation to paralleliz
 
 .. _Fairseq:
 
-Fairseq
+Fairseq (TODO)
 =======
 
-nnScaler provides `fairseq integration <https://msrasrg.visualstudio.com/SuperScaler/_git/Fairseq>`_.
+.. TODO:
 
-TODO: refine the example (and its doc), assigned to Youshan Miao
+    nnScaler provides `fairseq integration <https://msrasrg.visualstudio.com/SuperScaler/_git/Fairseq>`_.
 
-TODO (long term): write an example using unmodified fairseq
+    TODO: refine the example (and its doc), assigned to Youshan Miao
 
-Installation
-------------
+    TODO (long term): write an example using unmodified fairseq
 
-To use fairseq, clone the fork and install it:  ::
+    Installation
+    ------------
 
-    python -m pip uninstall fairseq
+    To use fairseq, clone the fork and install it:  ::
 
-    git clone https://msrasrg.visualstudio.com/SuperScaler/_git/Fairseq
-    cd Fairseq
-    python -m pip install -e .
+        python -m pip uninstall fairseq
 
-Example
--------
+        git clone https://msrasrg.visualstudio.com/SuperScaler/_git/Fairseq
+        cd Fairseq
+        python -m pip install -e .
 
-Follow the example
-`here <https://msrasrg.visualstudio.com/SuperScaler/_git/Fairseq?path=/nnscaler_examples/finetune_hf_model/Quickstart.md>`_.
+    Example
+    -------
+
+    Follow the example
+    `here <https://msrasrg.visualstudio.com/SuperScaler/_git/Fairseq?path=/nnscaler_examples/finetune_hf_model/Quickstart.md>`_.
+

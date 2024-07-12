@@ -10,10 +10,13 @@ Welcome to nnScaler's documentation!
    :maxdepth: 1
    :caption: Contents:
 
+   readme
    quickstart
+   pytorch_lightning
    parallel_module
    register_custom_op
    parallel
+   faq
 
 Indices and tables
 ==================
