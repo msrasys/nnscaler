@@ -220,7 +220,7 @@ class SignFx2Op:
         __tttemplate('contiguous'): function.Contiguous,
 
         __ttemplate('reshape'): function.Reshape,
-        
+
         __ttemplate('conv1d'): function.Conv1D,
         __ftemplate('conv1d'): function.Conv1D,
         __ttemplate('conv_transpose1d'): function.ConvTranspose1D,
@@ -253,6 +253,7 @@ class SignFx2Op:
         #
         # runtime functions
         __rtemplate('anchor'): function.GraphAnchor,
+        __rtemplate('ifexpr'): function.Ifexpr,
         __rtemplate('identity'): function.Identity,
         __rtemplate('multiref'): function.MultiRef,
         __rtemplate('accum'): function.Accum,

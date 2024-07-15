@@ -19,7 +19,7 @@ class Sign2EmitRule:
         self._sign2rule = {
             'torch.slice': self.emit_slice,
             SELF_GETATTR_SIG: self.emit_self_getattr,
-            'nnscaler.runtime.function.function.ifexpr': self.emit_ifexpr,
+            'nnscaler.runtime.function.ifexpr': self.emit_ifexpr,
         }
 
     def map(self, signature: str) -> Callable:

@@ -79,6 +79,18 @@ def Identity(tensor: IRObject, signature = None):
     return IRDimops(Identity, 'identity', signature, [anno], [tensor])
 
 
+def Ifexpr(cond: Any, true_value: Any, false_value: Any, signature = None) -> IRPyFunc:
+    signature = 'nnscaler.runtime.function.ifexpr'
+    cond_val = cond.value if isinstance(cond, IRObject) else cond
+    result = true_value if cond_val else false_value
+    result_val= result.value if isinstance(result, IRObject) else result
+
+    return IRPyFunc(signature,
+        inputs=[cond, true_value, false_value],
+        outputs=[IRObject(name='ifexpr', value=result_val, is_constant=False)]
+    )
+
+
 def MultiRef(tensor: IRTensor, times: int, signature = None):
     """
     nnscaler.runtime.function.multiref(itensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]
@@ -2527,7 +2539,7 @@ def Log(input, *, out=None, signature=None):
 def FullLike(input, fill_value, *, dtype=None, layout=None,
              device=None, requires_grad=False, memory_format=None, signature=None):
     """
-    torch.full_like(input, fill_value, \*, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=torch.preserve_format) → Tensor
+    torch.full_like(input, fill_value, *, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=torch.preserve_format) → Tensor
     """
     creation_function_args_check('torch.full_like', dtype=dtype, layout=layout, memory_format=memory_format)
     kwargs = {'fill_value': fill_value, 'requires_grad': requires_grad,'dtype': dtype}

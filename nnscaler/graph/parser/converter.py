@@ -2,6 +2,7 @@ from typing import Any, Dict, Union
 import logging
 from pathlib import Path
 import operator
+import warnings
 
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.graph.parser.register import CustomizedOps
@@ -86,7 +87,11 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     })
     dce_ignored_funcs = set(cube_rt_funcs)
 
-    with no_save_tensor_hook():
+    with no_save_tensor_hook(), warnings.catch_warnings():
+        # ignore the warning from fx about get_attr
+        warnings.filterwarnings("ignore", message=
+            ".*does not reference an nn.Module, nn.Parameter, or buffer, which is what 'get_attr' Nodes typically target"
+        )
         traced_model = concrete_trace(
             model,
             dummy_input,
