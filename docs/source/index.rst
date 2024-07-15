@@ -12,6 +12,7 @@ Welcome to nnScaler's documentation!
 
    readme
    quickstart
+   nanogpt_example
    pytorch_lightning
    parallel_module
    register_custom_op
