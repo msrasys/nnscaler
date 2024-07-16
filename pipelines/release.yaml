@@ -1,0 +1,39 @@
+# depends on two variables:
+#
+# - version
+#   must be set on devops website for each run
+#   the value should be something like "0.1" or "v0.1a1" (w/ or w/o leading v)
+#
+# - test_pypi_token
+#   secret, should never expire
+#   to view it or to update it, check onenote accounts/pypi page (test.pypi token)
+
+trigger: none
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- task: TwineAuthenticate@1
+  inputs:
+    artifactFeed: SuperScaler/release
+
+- script: |
+    python -m pip install --upgrade build twine
+  displayName: prepare environment
+
+- script: |
+    python pipelines/scripts/update_version.py $(version)
+    python -m build
+    number_of_wheels=`ls dist/*.whl | wc -l`
+    test $number_of_wheels -eq 1
+  displayName: build wheel
+
+- script: |
+    python -m twine upload -r release --config-file $(PYPIRC_PATH) dist/*.whl
+  displayName: upload to artifact
+
+- script: |
+    python -m twine upload -r testpypi -p $(test_pypi_token) dist/*.whl
+  displayName: upload to testpypi
