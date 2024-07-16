@@ -23,7 +23,7 @@ class CellPosition:
     def __eq__(self, other: object) -> bool:
         assert isinstance(other, CellPosition), "Cannot compare with non-GraphIndex object"
         return self.indices == other.indices
-    
+
     def __lt__(self, other: object) -> bool:
         assert isinstance(other, CellPosition), "Cannot compare with non-GraphIndex object"
         if len(self.indices) < len(other.indices):
@@ -203,7 +203,7 @@ class IRSegment(IRCell):
 
     def index(self, node: IRCell) -> CellPosition:
         """
-        Get node index. The dispatched node (e.g., IRAdapter, IRSegment) 
+        Get node index. The dispatched node (e.g., IRAdapter, IRSegment)
         will return the index to its un-dispatched node
 
         @param node IRCell: the queried node
@@ -293,7 +293,7 @@ class IRSegment(IRCell):
         A full tensor (ftensor) is originally produced by some operator(s).
         These operators can be further partitioned into multiple sub-operators.
         Each sub-operator potentially produces a smaller part of the ftensor (a.k.a. sub-tensor).
-        This function returns all the sub-tensors that are produced by operators 
+        This function returns all the sub-tensors that are produced by operators
         inside the segment.
 
         Args:
@@ -310,7 +310,7 @@ class IRSegment(IRCell):
         A full tensor (ftensor) is originally consumed by some operator(s).
         These operators can be further partitioned into multiple sub-operators.
         Each sub-operator potentially consumes a smaller part of the ftensor (a.k.a. sub-tensor).
-        This function returns all the sub-tensors that are consumed by operators 
+        This function returns all the sub-tensors that are consumed by operators
         inside the segment.
 
         Args:
@@ -329,15 +329,15 @@ class IRSegment(IRCell):
         applied for this graph.
 
         If a tensor is consumed by multiple consumers, the value map of its gradient
-        will be in exponential format. 
+        will be in exponential format.
 
         E.g., t has consumed by node1, node2, node3 and node4.
         Then the gradient value_map of t (t.grad) of each consumer is (idx, nchunks):
             (0, 2), (2, 4), (6, 8), (7, 8),
         where:
               (0, 2) + (2, 4) + (6, 8) + (7, 8)
-            = (0, 2) + (2, 4) + (3, 4) 
-            = (0, 2) + (1, 2) 
+            = (0, 2) + (2, 4) + (3, 4)
+            = (0, 2) + (1, 2)
             = FULL VALUE
 
         @param ftensor IRFullTensor: the full tensor.
@@ -362,7 +362,7 @@ class IRSegment(IRCell):
             grad = None if fgrad is None else fgrad.select(ptensor.indmap, (0, 1))
             for t in producer.find(ptensor):
                 t.grad = grad
-        
+
         # set for consumers
         consumers, ctensors = [], []  # consumers that require gradient
         for ctensor, consumer in zip(self.ctensors(ftensor), self.consumers(ftensor)):
@@ -437,7 +437,7 @@ class IRSegment(IRCell):
             self._ctensors[ftensor] = []
         if ftensor.is_attr():
             self._attributes.add(ftensor)
-    
+
     def _remove_ftensor(self, ftensor: IRObject):
         """
         Remove a full tensor in segment
@@ -533,7 +533,7 @@ class IRSegment(IRCell):
         Args:
             node (IRCell): the removed node
             _pos (Optional[Union[int, CellPosition]): help to save cost if provide node position.
-        
+
         Returns:
             CellPosition: the removed index
         """
@@ -603,15 +603,15 @@ class IRSegment(IRCell):
     @contextmanager
     def update(self, node):
         """
-        Update a node. Note the related change in backward operator 
+        Update a node. Note the related change in backward operator
         will not be automatically updated.
-    
+
         TODO: update operator dependency
 
         e.g.,
             with graph.modify(node) as node:
                 node.set_input(0, tensor)
-        
+
         @param node IRCell: the node that must in the graph
         @return node IRCell: the modify node
         """
@@ -645,7 +645,7 @@ class IRSegment(IRCell):
             IRSegment, turn `flatten=False` will get the same result as `flatten=True`,
             and can save more time because `flatten=False` will not traverse the
             nodes in IRSegment.
-        
+
         Args:
             name (Optional[str]): the node name
             ntype (Optional[Type]): the node type
@@ -681,7 +681,7 @@ class IRSegment(IRCell):
         assert isinstance(fwop, IRFwOperation), "Only allow insert an IRFwOperation"
         pos = CellPosition((index,)) if isinstance(index, int) else index
         assert isinstance(pos, CellPosition), "Expect index to be int or CellPosition"
-    
+
         index = pos.indices[-1]
         fsegment = self if len(pos) == 1 else self.node(CellPosition(pos.indices[1:]))
         fsegment.insert(fwop, index)
@@ -720,7 +720,7 @@ class IRSegment(IRCell):
         # check no transformation
         assert len(self.ptensors(ftensor)) <= 1, f"no transformation should be called before multiref"
         assert len(set(self.ctensors(ftensor))) == 1, f"no transformation should be called before multiref"
-        
+
         # create new full tensors
         consumers = self.consumers(ftensor)
         tensor = self.ctensors(ftensor)[0]
@@ -768,7 +768,7 @@ class IRSegment(IRCell):
     def single_consume(self, one_for_all: bool = True):
         """
         Transform graph to make each non-attribute tensor has up to
-        one consumer. Multiref nodes will be inserted. The API is useful 
+        one consumer. Multiref nodes will be inserted. The API is useful
         for cases like inference, where different consumers are partitioned
         with different tensor dimensions.
 
@@ -890,14 +890,14 @@ class IRSegment(IRCell):
                     self.insert(multiref, idx)
 
     # ====================== Graph Generations ============================
-    
+
     @staticmethod
     def get_inputs(nodes: List[IRCell], exclude_attr: bool = True):
         """
         Get all the input tensors that are required by nodes.
 
         @param nodes List[IRCell]: the nodes
-        
+
         @return inputs List[IRTensor]: the input tensors
         """
         all_outputs = list()
@@ -961,7 +961,7 @@ class IRSegment(IRCell):
             attr_as_inputs (bool): whether to treat attributes as segment inputs
 
         Returns:
-            segment (IRSegment): the grouped segment. 
+            segment (IRSegment): the grouped segment.
         """
         segment = self
         segment_outputs = IRSegment.get_objects_from_complex(segment.outputs())
@@ -981,7 +981,7 @@ class IRSegment(IRCell):
 
         # tensor and its device match
         dmatch = lambda t1, t2: t1 == t2 and t1.device == t2.device
-        
+
         inputs, outputs = set(), set()
         sub_cids = set(node.cid for node in nodes)
         for node in nodes:
@@ -1056,7 +1056,7 @@ class IRSegment(IRCell):
             tids = np.array([t.parent.tid for t in tensors])
             indices = np.argsort(tids)
             return tuple(tensors[idx] for idx in indices)
-        
+
         if self.isfw():
             inputs, outputs = order(inputs), order(outputs)
 

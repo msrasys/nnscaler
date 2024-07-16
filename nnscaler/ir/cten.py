@@ -541,38 +541,76 @@ class IRTensor(IRObject):
 
     Note by setting IRTensor name to "None" indicates this tensor holds nothing
     and will be translated to None in code generation.
+
+    Note scalar tensors will always be converted to 1-d tensors.
+    So all further operations could ignore the scalar tensor case.
+    You can get the original shape with `origin_shape` property.
     """
 
-    _meta = ['name', '_is_attr', '_is_grad', '_requires_grad', '_dtype', '_persistent']
-
-    def __init__(self, shape=None, name='tensor', dtype=None, tid=None):
-
+    def __init__(self, shape=None, name='tensor', dtype=None, tid=None, *,
+        is_attr=False, is_grad=False, requires_grad=False, persistent=False
+    ):
         super().__init__(name, tid, is_constant=False)
-        self._shape: Tuple[int] = () if shape is None else tuple(shape)
-        self._cell: Optional[IRCell] = None
-        self._dtype: Optional[torch.dtype] = dtype
+        self._is_scalar_tensor: bool = True
+        self._shape: Tuple[int] = ()
+        self._dtype: Optional[torch.dtype] = None
         # tensor gradient
         self._is_grad: bool = False
         self._requires_grad: bool = False
-        self._grad: Optional[Union[IRTensor, float]] = None
         # _persistent is a buffer only field, but in inference mode all params will be post-processed to buffers,
         # so set _persistent True in as_param() for register these params to persistent buffers.
-        self._persistent = False
+        self._persistent: bool = False
+        self._update(
+            shape=shape if shape is not None else (),
+            name=name,
+            dtype=dtype,
+            is_attr=is_attr,
+            is_grad=is_grad,
+            requires_grad=requires_grad,
+            persistent=persistent,
+        )
+        self._cell: Optional[IRCell] = None
+
+    def _update(
+            self,
+            shape=None,
+            name=None,
+            dtype=None,
+            is_attr=None,
+            is_grad=None,
+            requires_grad=None,
+            persistent=None,
+    ):
+        """
+        Set tensor metadata
+        """
+        if shape is not None:
+            self._is_scalar_tensor = not shape
+            # will always convert scalar tensor to 1-d tensor
+            self._shape: Tuple[int] = (1,) if not shape else tuple(shape)
+        if name is not None or self.name is None:
+            self.name = name
+        if dtype is not None:
+            if not isinstance(dtype, torch.dtype):
+                raise ValueError(
+                    "Only support setting IRTensor with dtype of torch.dtype"
+                )
+            self._dtype = dtype
+        if is_attr is not None:
+            self._is_attr = is_attr
+        if is_grad is not None:
+            self._is_grad = is_grad
+        if requires_grad is not None:
+            self._requires_grad = requires_grad
+        if persistent is not None:
+            self._persistent = persistent
+
+        return self
 
     @property
     def dtype(self) -> Optional[torch.dtype]:
         """Tensor data type"""
         return self._dtype
-
-    @dtype.setter
-    def dtype(self, val: Optional[torch.dtype]):
-        """Set data type"""
-        if not isinstance(val, torch.dtype):
-            raise NotImplementedError(
-                "Only support setting IRTensor with dtype of torch.dtype")
-        self._dtype = val
-        if isinstance(self._grad, IRTensor):
-            self._grad._dtype = val
 
     def is_param(self) -> bool:
         """!
@@ -580,7 +618,7 @@ class IRTensor(IRObject):
 
         @return is_param boolean: True if is parameter.
         """
-        return self._is_attr and self.requires_grad
+        return not self._is_grad and self._is_attr and self._requires_grad
 
     def is_buffer(self) -> bool:
         """!
@@ -588,7 +626,7 @@ class IRTensor(IRObject):
 
         @return is_buffer boolean: True if is buffer.
         """
-        return self._is_attr and not self.requires_grad
+        return not self._is_grad and self._is_attr and not self._requires_grad
 
     def is_persistent(self) -> bool:
         """!
@@ -606,35 +644,13 @@ class IRTensor(IRObject):
         """
         return self._is_grad
 
-    def as_param(self):
-        """
-        Set the tensor as trainable parameter
-        """
-        assert self._grad is not None, "missing grad tensor"
-        self._requires_grad = True
-        self._is_attr = True
-        self._is_grad = False
-        self._persistent = True
-        return self
+    def is_scalar_tensor(self) -> bool:
+        """!
+        Check if the tensor is scalar tensor
 
-    def as_buffer(self, persistent=True):
+        @return is_scalar_tensor boolean: True if is scalar tensor
         """
-        Set the tensor as un-trainable buffer
-        """
-        self._requires_grad = False
-        self._is_attr = True
-        self._is_grad = False
-        self._persistent = persistent
-        return self
-
-    def as_grad(self):
-        """
-        Set the tensor as gradient
-        """
-        self._is_param = False
-        self._is_attr = False
-        self._is_grad = True
-        return self
+        return self._is_scalar_tensor
 
     @property
     def requires_grad(self) -> bool:
@@ -656,17 +672,19 @@ class IRTensor(IRObject):
         return tensor
 
     @property
+    def origin_shape(self) -> Tuple[int]:
+        """
+        Get the original shape of the tensor
+        (Because self.shape will convert scalar tensor to 1-dim tensor)
+        """
+        return self.shape if not self.is_scalar_tensor() else ()
+
+    @property
     def shape(self) -> Tuple[int]:
         # NOTE: here return a tuple but not a real torch.Size obj may have risk, here is an example:
         # (torch.Size + tuple -> torch.Size) will change to (tuple + tuple -> tuple), is ok.
         # (torch.Size + list -> torch.Size) will change to (tuple + list -> error), is wrong.
         return self._shape
-
-    @shape.setter
-    def shape(self, val: Tuple[int]):
-        self._shape = tuple(val)
-        if isinstance(self._grad, IRTensor):
-            self._grad.shape = tuple(val)
 
     def nelement(self) -> int:
         """

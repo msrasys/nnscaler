@@ -171,16 +171,25 @@ def test_end2end():
     assert len(ga4_result) == 16
 
     cube2_results = launch_torchrun(4, gpu_worker_cube, 4, 2, 'hybrid', True) # micro_batch_size = 4
+    for _, v in cube2_results.items():
+        # all losses should be scalar tensor
+        assert all(i.shape == () for i in v[1])
     cube2_result = merge_cube_result({k: v[0] for k, v in cube2_results.items()})
     assert len(cube2_result) == 16
     allclose(cube2_result, ga4_result)
 
     cube4_results = launch_torchrun(4, gpu_worker_cube, 4, 4, PASMegatron, True)  # micro_batch_size = 4
+    for _, v in cube2_results.items():
+        # all losses should be scalar tensor
+        assert all(i.shape == () for i in v[1])
     cube4_result = merge_cube_result({k: v[0] for k, v in cube4_results.items()})
     assert len(cube4_result) == 16
     allclose(cube4_result, ga4_result)
 
     cube2_results_non_pipeline = launch_torchrun(4, gpu_worker_cube, 4, 2, 'tp', False)  # micro_batch_size = 4
+    for _, v in cube2_results.items():
+        # all losses should be scalar tensor
+        assert all(i.shape == () for i in v[1])
     cube2_result_non_pipeline = merge_cube_result({k: v[0] for k, v in cube2_results_non_pipeline.items()})
     assert len(cube2_result_non_pipeline) == 16
     allclose(cube2_result_non_pipeline, ga4_result, atol=1e-5, rtol=1e-5) # looks tp introduces more error

@@ -432,7 +432,7 @@ def test_Len():
     assert op.outputs()[0].value == 3 and not op.outputs()[0].is_constant
 
 
-def test_Min(): 
+def test_Min():
     op = F.Min(IRTensor([2, 3, 4]))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^ -> 1'
     op = F.Min(IRTensor([2, 3, 4]), 1, True)
@@ -465,10 +465,10 @@ def test_FullLike():
     op = F.FullLike(IRTensor([2, 1, 4, 1]), 1.)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c d -> a b c d'
     op_int = F.FullLike(IRTensor([3, 2]), 5)
-    assert len(op_int._annos_candidates) == 1 and op_int._annos_candidates[0] == 'a b -> a b'  
+    assert len(op_int._annos_candidates) == 1 and op_int._annos_candidates[0] == 'a b -> a b'
     op_true = F.FullLike(IRTensor([2, 2]), 1., requires_grad=True)
-    assert len(op_true._annos_candidates) == 1 and op_true._annos_candidates[0] == 'a b -> a b'     
-    op_float = F.FullLike(IRTensor([1, 2],dtype=int), 1, dtype=torch.float)
+    assert len(op_true._annos_candidates) == 1 and op_true._annos_candidates[0] == 'a b -> a b'
+    op_float = F.FullLike(IRTensor([1, 2],dtype=torch.int), 1, dtype=torch.float)
     assert len(op_float._annos_candidates) == 1 and op_float._annos_candidates[0] == 'a b -> a b'
 
 
@@ -488,8 +488,8 @@ def test_ZerosLike():
     op = F.ZerosLike(IRTensor([2, 1, 4, 1]))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c d -> a b c d'
     op_true = F.ZerosLike(IRTensor([2, 2]), requires_grad=True)
-    assert len(op_true._annos_candidates) == 1 and op_true._annos_candidates[0] == 'a b -> a b'     
-    op_float = F.ZerosLike(IRTensor([1, 2],dtype=int), dtype=torch.float)
+    assert len(op_true._annos_candidates) == 1 and op_true._annos_candidates[0] == 'a b -> a b'
+    op_float = F.ZerosLike(IRTensor([1, 2],dtype=torch.int), dtype=torch.float)
     assert len(op_float._annos_candidates) == 1 and op_float._annos_candidates[0] == 'a b -> a b'
 
 
@@ -497,8 +497,8 @@ def test_OnesLike():
     op = F.OnesLike(IRTensor([2, 1, 4, 1]))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c d -> a b c d'
     op_true = F.OnesLike(IRTensor([2, 2]), requires_grad=True)
-    assert len(op_true._annos_candidates) == 1 and op_true._annos_candidates[0] == 'a b -> a b'     
-    op_float = F.OnesLike(IRTensor([1, 2],dtype=int), dtype=torch.float)
+    assert len(op_true._annos_candidates) == 1 and op_true._annos_candidates[0] == 'a b -> a b'
+    op_float = F.OnesLike(IRTensor([1, 2],dtype=torch.int), dtype=torch.float)
     assert len(op_float._annos_candidates) == 1 and op_float._annos_candidates[0] == 'a b -> a b'
 
 
@@ -595,7 +595,7 @@ def test_Softmax():
     op = F.Softmax(IRTensor([2, 3, 4]), dtype=torch.float32)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c -> a b c'
 
-    
+
 def test_Conv1D():
     op = F.Conv1D(IRTensor([3, 4]), IRTensor([3, 3, 1]))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'iC+ 4, oC iC+ 1 -> oC 4'

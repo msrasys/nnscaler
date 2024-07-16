@@ -73,7 +73,7 @@ class IRGraph(IRSegment):
         """
         if not all(isinstance(arg, IRObject) for arg in args):
             raise TypeError("Expected input arguments to be IRObject")
-        
+
         # align graph with input tensors
         iobjs: Tuple[IRObject, ...] = self.inputs()
         if len(args) != len(iobjs):
@@ -560,7 +560,7 @@ class IRGraph(IRSegment):
 
     def sequential(self, prev_nodes: Tuple[IRFwOperation], succ_nodes: Tuple[IRFwOperation]):
         """Schedule primitive: schedule prev_nodes right before the succ_nodes
-        
+
         The position of `succ_nodes` will keep unchanged in the sequence
         while the `prev_nodes` will be scheduled right before the `succ_nodes`.
         Corresponding backward operators will also be re-ordered.
@@ -595,7 +595,7 @@ class IRGraph(IRSegment):
         if len(set(prev_indices).intersection(set(succ_indices))) != 0:
             raise ValueError(f'find duplicated node in both succ_nodes and prev_nodes')
         # TODO: check dependency
-        
+
         seq = list(self._nodes)
         # cut out prev_nodes
         fstart, fend = min(prev_indices), max(prev_indices) + 1
@@ -635,7 +635,7 @@ class IRGraph(IRSegment):
 
         Note this function only checks direct data dependency that whether
         the outputs in `prev_node` and inputs in `post_node` have data dependency.
-        
+
         The function cannot detect data dependency in graph like:
             pre_node -> (some nodes) ... -> post_node
 
@@ -749,7 +749,7 @@ class IRGraph(IRSegment):
 
         Args:
             nodes Tuple[IRFwOperations]: the start forward node of each stage.
-        
+
         Returns:
             None
         """
@@ -799,7 +799,7 @@ class IRGraph(IRSegment):
             assert all(isinstance(node, IRFwOperation) for node in fnodes), \
                 f"find at least one nodes are not of IRFwOperation in the stage {sid}. They should be moved to the front"
             fstages.append(fnodes)
-        
+
         # grouping into segment
         for sid in range(len(fstages)):
             self.group(fstages[sid])
@@ -1115,7 +1115,7 @@ class IRGraph(IRSegment):
 
     def checksum(self, strict: bool = True) -> str:
         """Get the MD5 checksum of the graph.
-        
+
         This is used to guarantee the consistency of the graph between
         multiple nodes.
 
@@ -1123,7 +1123,7 @@ class IRGraph(IRSegment):
             The checksum considers the IDGenerator status. If the user modifies
             the IDGenerator status (i.e., creating tensors or nodes), it will
             have a different checksum.
-        
+
         Args:
             strict (bool): If True (by default), get the checksum of the whole graph status,
                 including tensor shapes, tensor ids and node ids;

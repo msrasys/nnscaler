@@ -129,8 +129,6 @@ class FxModuleParser:
             """Support complex data type of List, Tuple, Dict, Tensor/Object"""
             if isinstance(meta, TensorMetadata):
                 shape = meta.shape
-                # TODO: support scalar type
-                shape = torch.Size([1]) if shape == torch.Size([]) else shape
                 dtype = meta.dtype
                 requires_grad = meta.requires_grad
                 return IRFullTensor(shape=shape, name=node.name,
@@ -265,6 +263,13 @@ class FxModuleParser:
             else:
                 output_val = frame.get_var(node.name)
                 if isinstance(ir_node, IRDimops):
+                    # TODO: refine here
+                    # infer_type actually just check whether the annoation is consistent
+                    # with actual output
+                    # internally it will set the shape of output,
+                    # but the output is quickly rewritten by the actual output
+                    # in following code `ir_node.set_output(0, output_val)`
+                    # So the scalar-tensor flag is not removed with `infer_shape`
                     ir_node.infer_shape()
                     if isinstance(output_val, IRTensor) and isinstance(ir_node.output(0), IRTensor):
                         assert output_val.shape == ir_node.output(0).shape, (
