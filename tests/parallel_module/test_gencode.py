@@ -979,6 +979,36 @@ def test_codegen_kwargs(tmp_path):
     )
 
 
+class ScalarTensorModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = torch.nn.Linear(1024, 1024, bias=False)
+        self.scale = torch.nn.Parameter(torch.zeros(64))
+
+    def forward(self, x):
+        x = self.proj(x)
+        coef = torch.exp(torch.sum(self.scale, dim=-1))
+        x = x / coef
+        return x.sum()
+
+
+@replace_all_device_with('cpu')
+def test_codegen_scalar_tensor(tmp_path):
+    m = ScalarTensorModule()
+    m.train()
+    parallelize(
+        m,
+        {'x': torch.randn(1024, 1024)},
+        'dp',
+        ComputeConfig(1, 1),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # parallelize will succeed.
+    assert True
+
+
 class ConvTranspose1DModule(torch.nn.Module):
     def __init__(self, weight, bias=None, stride=1, padding=0, output_padding=0, dilation=1, groups=1):
         super().__init__()

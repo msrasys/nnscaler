@@ -1115,6 +1115,9 @@ def Sum(input, dim=None, keepdim=False, *, dtype=None, signature = None):
             sort_dim.sort()
             for dimidx in sort_dim[::-1]:
                 eoutput.pop(dimidx)
+            # handle the case of scalar tensor output
+            if not eoutput:
+                eoutput = ['1']
         anno = OpAnno.create_op_str([einput], [eoutput])
         return IRDimops(Sum, 'sum', signature, [anno], [input], dim=dim, keepdim=keepdim)
 
