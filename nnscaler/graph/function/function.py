@@ -1939,6 +1939,8 @@ def CubeEmbedding(input, weight, padding_idx, signature = None, **kwargs):
         start, stop = weight.indmap[0]
     else:
         start, stop = 0, weight.shape[0]
+    # here we can split the vocab dim with `+`, because we rewrite the embedding logic to ensure the result is right
+    # please review nnscaler.runtime.function.embedding for more information
     annos = ['*, n+ e -> * e']
     return IRDimops(CubeEmbedding, 'embedding', signature, annos, [input, weight],
                     padding_idx=padding_idx, start=start, stop=stop)

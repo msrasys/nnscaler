@@ -101,21 +101,40 @@ def conv3d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tenso
 
 def embedding(input: torch.Tensor, weight: torch.Tensor, padding_idx: Optional[int], start: int, stop: int):
     """
-    Embedding
+    add start/stop to make vocab dim partitionable.
+
+    for example, if the vocab size is 100, and partition the weigth on vocab dim to 4 part,
+    then on each part, it will have different start/stop:
+        1: [start=0, stop=25]
+        2: [start=25, stop=50]
+        3: [start=50, stop=75]
+        4: [start=75, stop=100]
+    before do embedding, the input index outside the range will be masked,
+    and directly assign 0.0 to the masked position on the output.
+
+    If vocab dim is partitioned, the results are summed to ensure the correctness of the final result.
 
     Inputs:
         input: torch.Tensor [*]
         weight: [vocab size, embed size]
-        start: int
-        stop: int
+        start: int, the weight split start index on vocab dim
+        stop: int, the weight split stop index on vocab dim
 
     Outputs:
         output: [*, embed_size]
     """
     input = input.long()
     input_mask = (input < start) | (input >= stop)
+    # make the range of value in the input to [0, stop-start)
+    # note that the embedding is implemented like a look up table.
     masked_input = input.clone() - start
     masked_input[input_mask] = 0
+    # if padding_idx is inside [start, stop), should map it to [0, stop-start)
+    # if padding_idx is outside [start, stop), directly make it None
+    if padding_idx is not None and start <= padding_idx < stop:
+        padding_idx -= start
+    else:
+        padding_idx = None
     output = TorchF.embedding(
         masked_input, weight, padding_idx,
         None, 2.0, False, False
