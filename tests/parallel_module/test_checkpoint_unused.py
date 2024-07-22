@@ -14,7 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 import numpy as np
 
-from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dicts
+from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dict
 from nnscaler.runtime.module import ParallelModule, ExtraState
 from nnscaler.runtime.gnorm import calcuate_gnorm
 

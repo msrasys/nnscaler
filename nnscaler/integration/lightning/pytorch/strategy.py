@@ -59,6 +59,7 @@ from lightning.pytorch.utilities import GradClipAlgorithmType
 import nnscaler
 from nnscaler.integration.lightning.utils import inplace_optimizer_fn
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.utils import enforce_zero_num_worker
 from .precision import NnScalerPrecision
 
 
@@ -216,7 +217,7 @@ class NnScalerStrategy(ParallelStrategy):
             data_source = trainer.fit_loop._data_source
             assert data_source is not None, "The `data_source` must be defined in the trainer."
             assert data_source.instance is not None, "The `instance` must be defined in the data source."
-            with enforce_0_num_worker(DataLoader):
+            with enforce_zero_num_worker(DataLoader):
                 dataloader = data_source.dataloader()
                 assert dataloader.num_workers == 0, "The dataloader must have `num_workers=0`."
                 data = next(iter(dataloader))
@@ -547,15 +548,3 @@ class NnScalerStrategy(ParallelStrategy):
 
     def _get_process_group_backend(self) -> str:
         return 'nccl'  # nnscaler only support nccl
-
-
-@contextmanager
-def enforce_0_num_worker(cls) -> Generator[None, None, None]:
-    """Context manager to enforce the number of workers to be 0 in DataLoader."""
-    _old__init__ = cls.__init__
-    def _new__init__(self, *args, **kwargs) -> None:
-        kwargs['num_workers'] = 0
-        _old__init__(self, *args, **kwargs)
-    cls.__init__ = _new__init__
-    yield
-    cls.__init__ = _old__init__

@@ -1,10 +1,12 @@
-import os
-from typing import Optional, Tuple, Callable, List, Set, Any, Iterable
+from contextlib import contextmanager
+from functools import wraps
+from typing import Generator, Optional, Tuple, Callable, List, Set, Any, Iterable, Type, Union
 import logging
 from pathlib import Path
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
+import inspect
 
 import nnscaler
 from nnscaler.runtime.device import DeviceGroup
@@ -163,6 +165,101 @@ def set_default_logger_level(level):
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
+
+
+@contextmanager
+def enforce_zero_num_worker(cls) -> Generator[None, None, None]:
+    """Context manager to enforce the number of workers to be 0 in DataLoader."""
+    _old__init__ = cls.__init__
+    def _new__init__(self, *args, **kwargs) -> None:
+        kwargs['num_workers'] = 0
+        _old__init__(self, *args, **kwargs)
+    cls.__init__ = _new__init__
+    yield
+    cls.__init__ = _old__init__
+
+
+def rank_zero_only(fn: Callable[..., None]) -> Callable[..., None]:
+    """
+    Wrap a function to call internal function only in rank zero.
+    Function that can be used as a decorator to enable a function/method being called only on global rank 0.
+    Please note
+    1. that the fn should be no return values, and no side effect.
+    So it is only recommend to use this decorator for logging or printing.
+    2. `fn` will also be called if the distributed environment is not initialized.
+    """
+
+    @wraps(fn)
+    def wrapped_fn(*args, **kwargs):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else None
+        if rank == 0 or rank is None:
+            fn(*args, **kwargs)
+
+    return wrapped_fn
+
+
+_DICT_ITEMS_TYPE = type({}.items())
+_DICT_KEYS_TYPE = type({}.keys())
+_DICT_VALUES_TYPE = type({}.values())
+
+
+def transform_recursively(data: Any, fn: Callable[[Any], Any],
+    target_types: Union[Callable[[Any], bool], Type, Tuple[Type, ...]],
+    collection_types = (tuple, list, dict), skip_dict_keys = True
+) -> Any:
+    """
+    Transform the data with the given function, will recursively apply the function to the nested data.
+    Args:
+        data: the data to be transformed.
+        fn: the function to apply.
+        target_types: the target types to apply the function.
+        collection_types: the collection types to apply the function to the nested data.
+        skip_dict_keys: whether to skip the dict keys (for types dict, _DICT_ITEMS_TYPE).
+            _DICT_KEYS_TYPE is not skipped, if you want to skip it, just remove it from the collection_types.
+    """
+    if isinstance(data, collection_types):
+        if isinstance(data, tuple):
+            return tuple(transform_recursively(t, fn, target_types, collection_types) for t in data)
+        if isinstance(data, list):
+            return list(transform_recursively(t, fn, target_types, collection_types) for t in data)
+        if isinstance(data, set):
+            return set(transform_recursively(t, fn, target_types, collection_types) for t in data)
+        if isinstance(data, dict):
+            return {
+                k if skip_dict_keys else transform_recursively(k, fn, target_types, collection_types):
+                transform_recursively(v, fn, target_types, collection_types)
+                for k, v in data.items()
+        }
+        if isinstance(data, _DICT_ITEMS_TYPE):
+            return {
+                k if skip_dict_keys else transform_recursively(k, fn, target_types, collection_types):
+                transform_recursively(v, fn, target_types, collection_types)
+                for k, v in data
+            }.items()
+        if isinstance(data, _DICT_KEYS_TYPE):
+            return {
+                    transform_recursively(k, fn, target_types, collection_types): i
+                    for i, k in enumerate(data)
+            }.keys()
+        if isinstance(data, _DICT_VALUES_TYPE):
+            return {
+                i: transform_recursively(v, fn, target_types, collection_types)
+                for i, v in enumerate(data)
+            }.values()
+        if isinstance(data, slice):
+            return slice(
+                transform_recursively(data.start, fn, target_types, collection_types),
+                transform_recursively(data.stop, fn, target_types, collection_types),
+                transform_recursively(data.step, fn, target_types, collection_types)
+            )
+        raise ValueError(f"Unsupported collection type: {type(data)}")
+    elif isinstance(target_types, (tuple, list)) or inspect.isclass(target_types):
+        if isinstance(data, target_types):
+            return fn(data)
+    elif callable(target_types):  # not a class, but callable. treat as a check function.
+        if target_types(data):
+            return fn(data)
+    return data
 
 
 class accum_mode:

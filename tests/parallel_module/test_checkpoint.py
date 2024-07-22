@@ -14,7 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 import numpy as np
 
-from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dicts
+from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dict
 from nnscaler.runtime.module import ParallelModule, ExtraState
 from nnscaler.runtime.gnorm import calcuate_gnorm
 
@@ -326,7 +326,7 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
         # assert not check_model_state_dict_equal(inference_module.state_dict(), model_state_dict)
 
         # inference model can be loaded from merged state_dict
-        load_merged_state_dicts(inference_module, merged_model_state_dict)
+        load_merged_state_dict(inference_module, merged_model_state_dict)
         torch.save(inference_module.state_dict(), temp_inferenece_ckpt_file)
         torch.distributed.barrier()
         inference_ckpt_files = [ckpt_dir / temp_inferenece_ckpt_file_template.format(rank=i) for i in range(torch.distributed.get_world_size())]
@@ -336,7 +336,7 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
 
         model_from_merged = type(model)()
         optimizer_from_merged = build_optimizer(model_from_merged, torch.optim.Adam, lr=0.01)
-        load_merged_state_dicts(
+        load_merged_state_dict(
             model_from_merged, merged_model_state_dict,
             optimizer_from_merged, merged_opt_state_dict,
         )

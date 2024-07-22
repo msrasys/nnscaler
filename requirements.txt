@@ -8,3 +8,4 @@ pulp
 pybind11
 pyyaml
 torch>=2.0
+tqdm

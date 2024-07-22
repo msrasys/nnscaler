@@ -15,3 +15,5 @@ tabulate
 tox
 tox-conda
 yapf
+wandb
+tensorboard

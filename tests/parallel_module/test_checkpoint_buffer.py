@@ -5,7 +5,7 @@ import torch
 import pytest
 import torch.distributed
 
-from nnscaler.parallel import parallelize, ComputeConfig, merge_state_dicts, load_merged_state_dicts, broadcast_weights
+from nnscaler.parallel import parallelize, ComputeConfig, merge_state_dicts, load_merged_state_dict, broadcast_weights
 
 from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun

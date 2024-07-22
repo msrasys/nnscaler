@@ -33,6 +33,8 @@ class ClassificationModel(LightningModule):
         self.test_acc = acc.clone()
         self.dummy_forward_args_fn = lambda batch: {"x": batch[0]}
         self.update_history = []
+        self.loss_history = []
+        self.val_loss_history = []
 
     # @property
     # def dummy_forward_args(self):
@@ -65,8 +67,11 @@ class ClassificationModel(LightningModule):
         assert not self.training
         x, y = batch
         logits = self.forward(x)
+        loss = F.cross_entropy(logits, y)
         self.log("val_loss", F.cross_entropy(logits, y), prog_bar=False, sync_dist=True)
         self.log("val_acc", self.valid_acc(logits, y), prog_bar=True, sync_dist=True)
+        return {'loss': loss}
+
 
     def test_step(self, batch, batch_idx):
         assert not self.training
@@ -90,6 +95,14 @@ class ClassificationModel(LightningModule):
         weights = {_fix_name(n): p.data.cpu() for n, p in self.named_parameters()}
         self.update_history.append((grads, weights))
         return super().configure_gradient_clipping(optimizer, gradient_clip_val, gradient_clip_algorithm)
+
+    def on_train_batch_end(self, outputs: STEP_OUTPUT, batch: Any, batch_idx: int) -> None:
+        self.loss_history.append(outputs["loss"].item())
+
+    def on_validation_batch_end(
+        self, outputs: STEP_OUTPUT, batch: Any, batch_idx: int, dataloader_idx: int = 0
+    ):
+        self.val_loss_history.append(outputs["loss"].item())
 
 
 class ClassificationModelWithLRScheduler(ClassificationModel):

@@ -199,10 +199,12 @@ def deserialize_dataclass(value, value_type):
 
     type_info = _get_type_info(value_type)
     member_values = {}
-    for k, ti in type_info.items():
-        if not k in value:
+    used_keys = set()
+    for key, ti in type_info.items():
+        if not key in value:
             continue
-        v = value[k]
+        used_keys.add(key)
+        v = value[key]
         if ti.type is bool and v is None:
             v = True   # set bool to True if it shows up in cmd line
         if v is None:
@@ -215,16 +217,24 @@ def deserialize_dataclass(value, value_type):
             ti.type = type(v)
 
         if ti.item_type or ti.key_type or ti.value_type:
-            if ti.type == list:
-                v = [_deserialize_object(x, ti.item_type) for x in v]
-            elif ti.type == tuple:
-                v = tuple(_deserialize_object(x, ti.item_type) for x in v)
+            if ti.type in (list, tuple):
+                if isinstance(v, (list, tuple)):
+                    v = ti.type(_deserialize_object(x, ti.item_type) for x in v)
+                elif isinstance(v, dict):
+                    v_dict = {_deserialize_object(k, int): _deserialize_object(v, ti.item_type) for k, v in v.items()}
+                    v = [None] * (max(v_dict.keys()) + 1)
+                    for k, x in v_dict.items():
+                        v[k] = x
+                    v = ti.type(v)
+                else:
+                    raise ValueError(f"Invalid value {v} for {value_type}")
             elif ti.type == dict:
                 v = {_deserialize_object(k, ti.key_type): _deserialize_object(v, ti.value_type) for k, v in v.items()}
         else:
             v = _deserialize_object(v, ti.type)
 
         if v is not None: # for none values, use default value.
-            member_values[k] = v
-
+            member_values[key] = v
+    if set(value.keys()) - used_keys:
+        raise ValueError(f"Unknown members {set(value.keys()) - used_keys} for {value_type}")
     return value_type(**member_values)

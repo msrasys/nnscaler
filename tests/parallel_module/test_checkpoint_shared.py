@@ -6,7 +6,7 @@ from typing import Dict, Tuple, List, Any
 import torch
 from torch import nn
 
-from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dicts
+from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge_state_dicts, load_merged_state_dict
 
 from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0
 from ..launch_torchrun import launch_torchrun
@@ -136,7 +136,7 @@ def _load_merged(parallel_model: torch.nn.Module, ckpt_dir):
     raw_model_state_dict: Dict[str, Any] = raw_ckpt_dict['model']
     raw_opt_state_dict = raw_ckpt_dict['optimizer']
     optimizer = build_optimizer(parallel_model, torch.optim.Adam, lr=0.01)
-    load_merged_state_dicts(
+    load_merged_state_dict(
         parallel_model, raw_model_state_dict,
         optimizer, raw_opt_state_dict,
     )

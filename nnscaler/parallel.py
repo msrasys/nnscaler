@@ -1723,7 +1723,7 @@ def merge_state_dicts(
 
 
 @torch.no_grad()
-def load_merged_state_dicts(
+def load_merged_state_dict(
     module: torch.nn.Module,
     module_state_dict: Dict[str, Any],
     optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
@@ -2323,3 +2323,36 @@ def _broadcast_weights(module: torch.nn.Module, stride_size: int):
         module.mark_non_persistent_buffers_inited()
 
     torch.distributed.barrier()
+
+
+@torch.no_grad()
+def load_sharded_state_dict(
+    module: torch.nn.Module,
+    module_state_dict: Dict[str, Any],
+    optimizer: Optional[Union[torch.optim.Optimizer, ParallelOptimizer]] = None,
+    optimizer_state_dict: Optional[Dict[str, Any]] = None,
+    *,
+    device: Union[str, torch.device] = None
+):
+    """
+    Load the sharded state dicts to the module, and optionally the optimizer to a specified device.
+
+    Args:
+        module (torch.nn.Module): the module to be loaded
+        module_state_dict (Dict[str, Any]): the sharded model state dict
+        optimizer (Optional[torch.optim.Optimizer]): the optimizer to be loaded
+        optimizer_state_dict (Optional[Dict[str, Any]]): the sharded optimizer state dict
+        device (Union[str, torch.device]): the device to put the module and optimizer state dicts.
+            Use torch.cuda.current_device() if it is None.
+
+    Returns:
+        None
+    """
+
+    device = device or torch.cuda.current_device()
+    module.load_state_dict(module_state_dict)
+    module.to(device)
+    if optimizer:
+        if optimizer_state_dict is None:
+            raise ValueError("optimizer_state_dict should be provided when optimizer is not None.")
+        optimizer.load_state_dict(optimizer_state_dict)

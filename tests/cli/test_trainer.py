@@ -1,28 +1,189 @@
 from pathlib import Path
+import shutil
 
 import torch
 import pytest
+import torch.distributed
 
 from nnscaler.cli.trainer import Trainer
+from tests.parallel_module.common import assert_equal
 from ..launch_torchrun import launch_torchrun
 
 
-def trainer_worker(save_dir):
+def trainer_logging_worker(save_dir):
+    save_dir = Path(save_dir)
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    gen_savedir = save_dir / 'gen'
+    log_savedir = save_dir / 'log'
+    tb_log_savedir = log_savedir / 'tensorboard'
+    wandb_log_savedir = log_savedir / 'wandb'
+    # train 4 epcho in one time
+    trainer = Trainer([
+        '-f', config_path,
+        '--max_epochs', '2',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--checkpoint_config.no_save', 'true',
+        '--log_config.0.type', 'nnscaler.cli.loggers.TensorBoardLogger',
+        '--log_config.0.args.name', 'test-cli',
+        '--log_config.0.args.root_dir', str(tb_log_savedir),
+        '--log_config.1.type', 'nnscaler.cli.loggers.WandbLogger',
+        '--log_config.1.args.name', 'test-cli',
+        '--log_config.1.args.dir', str(wandb_log_savedir),
+        '--log_config.1.args.project', 'nnscaler',
+        '--log_config.1.args.mode', 'offline',
+    ])
+    trainer.train()
+
+    torch.distributed.barrier()
+
+    if torch.distributed.get_rank() == 0:
+        assert (tb_log_savedir / 'test-cli').exists()
+        tfevents = list((tb_log_savedir / 'test-cli').glob('events.out.tfevents.*'))
+        assert len(tfevents) == 1
+        assert tfevents[0].stat().st_size > 1000
+
+        assert (wandb_log_savedir / 'wandb').exists()
+        wandb_offline_dir = list((wandb_log_savedir / 'wandb').glob('offline-run-*'))
+        assert len(wandb_offline_dir) == 1
+        wandb_run_db = list(wandb_offline_dir[0].glob('run-*.wandb'))
+        assert len(wandb_run_db) == 1
+        assert wandb_run_db[0].stat().st_size > 1000
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_trainer_logging(tmp_path):
+    launch_torchrun(4, trainer_logging_worker, tmp_path)
+
+
+def trainer_resume_worker(save_dir, save_type, bf16):
     save_dir = Path(save_dir)
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
     gen_savedir = save_dir / 'gen'
     ckpt_savedir = save_dir / 'ckpt'
+    # train 4 epcho in one time
     trainer = Trainer([
         '-f', config_path,
+        '--bf16', str(bf16),
+        '--max_epochs', '4',
+        '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen_savedir),
         '--compute_config.plan_ngpus', '2',
         '--compute_config.runtime_ngpus', '4',
-        '--ckpt_save_type', 'sharded',
-        '--ckpt_save_dir', str(ckpt_savedir),
+        '--checkpoint_config.save_type', save_type,
+        '--checkpoint_config.save_dir', str(ckpt_savedir),
+        '--checkpoint_config.resume_from', 'last',
+        '--checkpoint_config.keep_last_n_checkpoints', '30',
     ])
     trainer.train()
+    ckpt_files = set(ckpt_savedir.glob('**/*.ckpt'))
+    assert len(ckpt_files)/4 == min(30, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
+
+    # train 4 epcho two times (resume from last)
+    ckpt0_savedir = save_dir / 'ckpt0'
+    # first two epochs
+    trainer = Trainer([
+        '-f', config_path,
+        '--bf16', str(bf16),
+        '--max_epochs', '2',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--checkpoint_config.save_type', save_type,
+        '--checkpoint_config.save_dir', str(ckpt0_savedir),
+        '--checkpoint_config.resume_from', 'last',
+        '--checkpoint_config.keep_last_n_checkpoints', '30',
+    ])
+    trainer.train()
+    ckpt0_files0 = {f: f.stat().st_mtime_ns for f in ckpt0_savedir.glob('**/*.ckpt')}
+    assert len(ckpt0_files0)/4 == min(30, trainer.total_train_steps_per_epoch * 2) + 2 # 2 for best/last
+
+    # create merged checkpoint
+    ckpt1_savedir = save_dir / 'ckpt1'
+    ckpt1_savedir.mkdir(parents=True, exist_ok=True)
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(list((ckpt0_savedir / 'last').glob('*.ckpt')), ckpt1_savedir / 'merged.pt')
+
+    # continue with the last two epochs (resume for sharded/deduped checkpoint)
+    trainer = Trainer([
+        '-f', config_path,
+        '--bf16', str(bf16),
+        '--max_epochs', '4',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--checkpoint_config.save_type', save_type,
+        '--checkpoint_config.save_dir', str(ckpt0_savedir),
+        '--checkpoint_config.resume_from', 'last',
+        '--checkpoint_config.keep_last_n_checkpoints', '30',
+    ])
+    trainer.train()
+    left_files = {
+        f: f.stat().st_mtime_ns for f in ckpt0_files0.keys()
+        if f.exists() and f.parent.name not in ['last', 'best']
+    }
+    assert left_files  # some checkpoints are removed
+    for f, s in left_files.items(): # make sure the old checkpoints are not overwritten
+        assert ckpt0_files0[f] == s
+
+    ckpt0_files1 = set(ckpt0_savedir.glob('**/*.ckpt'))
+    assert len(ckpt0_files1)/4 == min(30, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
+
+    torch.distributed.barrier()
+
+    # continue with the last two epochs (resume for merged)
+    trainer = Trainer([
+        '-f', config_path,
+        '--bf16', str(bf16),
+        '--max_epochs', '4',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--checkpoint_config.save_type', save_type,
+        '--checkpoint_config.save_dir', str(ckpt1_savedir),
+        '--checkpoint_config.resume_from', str(ckpt1_savedir / 'merged.pt'),
+        '--checkpoint_config.keep_last_n_checkpoints', '30',
+    ])
+    trainer.train()
+    left_files = {
+        f: f.stat().st_mtime_ns for f in ckpt0_files0.keys()
+        if f.exists() and f.parent.name not in ['last', 'best']
+    }
+    assert left_files  # some checkpoints are removed
+    for f, s in left_files.items(): # make sure the old checkpoints are not overwritten
+        assert ckpt0_files0[f] == s
+
+    ckpt0_files1 = set(ckpt0_savedir.glob('**/*.ckpt'))
+    assert len(ckpt0_files1)/4 == min(30, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
+
+    torch.distributed.barrier()
+
+    if torch.distributed.get_rank() == 0:
+        assert {f.parent.name for f in ckpt_files} == {f.parent.name for f in ckpt0_files1}
+        for i in range(4):
+            x = torch.load(ckpt_savedir / 'last' / f'{i}.ckpt')
+            y = torch.load(ckpt0_savedir / 'last' / f'{i}.ckpt')
+            z = torch.load(ckpt1_savedir / 'last' / f'{i}.ckpt')
+            assert_equal(x['model'], y['model'])
+            assert_equal(x['optimizer'], y['optimizer'])
+            assert_equal(x['lr_scheduler'], y['lr_scheduler'])
+            assert_equal(x['model'], z['model'])
+            assert_equal(x['optimizer'], z['optimizer'])
+            assert_equal(x['lr_scheduler'], z['lr_scheduler'])
+
+        if save_type == 'deduped':
+            assert (ckpt_savedir / 'last/0.ckpt').stat().st_size > (ckpt_savedir / 'last/2.ckpt').stat().st_size
+            assert (ckpt_savedir / 'last/1.ckpt').stat().st_size > (ckpt_savedir / 'last/3.ckpt').stat().st_size
+        else:
+            assert (ckpt_savedir / 'last/0.ckpt').stat().st_size == (ckpt_savedir / 'last/2.ckpt').stat().st_size
+            assert (ckpt_savedir / 'last/1.ckpt').stat().st_size == (ckpt_savedir / 'last/3.ckpt').stat().st_size
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-def test_trainer(tmp_path):
-    launch_torchrun(4, trainer_worker, tmp_path)
+@pytest.mark.parametrize('save_type', ['sharded', 'deduped'])
+@pytest.mark.parametrize('bf16', [True, False])
+def test_trainer_resume(tmp_path, save_type, bf16):
+    launch_torchrun(4, trainer_resume_worker, tmp_path, save_type, bf16)

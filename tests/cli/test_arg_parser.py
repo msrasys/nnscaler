@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Tuple, Dict, Any, Union
 import sys
 
@@ -108,6 +108,14 @@ def test_deserialize():
     y = deserialize_dataclass(x, A)
     assert y == A(a=1, b=False, c=C(d=3, e=4), f=F(g=G(h=5)), k=[10, 12], v={'a': 10, 'b': 20})
 
+    x = parse_args(['--a=1', '--b', 'False', '--c.d=3', '--c.e', '4', '--f.g.unknown=5', '--v.a=10', '--v.b=20', '--k=[10,12]'])
+    with pytest.raises(ValueError):
+        y = deserialize_dataclass(x, A)
+
+    x = parse_args(['--unknowna=1', '--b', 'False', '--c.d=3', '--c.e', '4', '--f.g.h=5', '--v.a=10', '--v.b=20', '--k=[10,12]'])
+    with pytest.raises(ValueError):
+        y = deserialize_dataclass(x, A)
+
     x = parse_args(['--a=1', '--b', '0', '--c.d=3', '--c.e', '4', '--f.g.h=5',
                     '--v.a=10', '--v.b=20',
                     '--z.__type=tests.cli.test_arg_parser.GConfig',
@@ -138,3 +146,16 @@ def test_deserialize():
                 }
     )
     assert deserialize_dataclass(asdict(y), A) == y
+
+
+def test_deserialize_list():
+    @dataclass
+    class A:
+        a: List[int] = field(default_factory=list)
+        b: List[GConfig] = field(default_factory=list)
+        c: Tuple[int, ...] = None
+
+
+    x = parse_args(['--a.0=1', '--a.1=2', '--b.0.h=3', '--b.1.h=4', '--c.1=4'])
+    y = deserialize_dataclass(x, A)
+    assert y == A(a=[1, 2], b=[GConfig(h=3), GConfig(h=4)], c=(None, 4))

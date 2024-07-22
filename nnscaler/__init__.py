@@ -7,10 +7,11 @@ from .parallel import (
     parallelize,
     build_optimizer,
     merge_state_dicts,
-    load_merged_state_dicts,
+    load_merged_state_dict,
     deduped_state_dict,
     load_deduped_state_dict,
     broadcast_weights,
+    load_sharded_state_dict,
 )
 from nnscaler.graph.parser.register import register_op
 

@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, \
-    merge_state_dicts, load_merged_state_dicts, \
+    merge_state_dicts, load_merged_state_dict, \
     deduped_state_dict, load_deduped_state_dict
 from nnscaler.runtime.module import ParallelModule
 from nnscaler.graph.graph import IRGraph
