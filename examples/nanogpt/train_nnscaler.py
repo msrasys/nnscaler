@@ -60,7 +60,7 @@ use_nnscaler = True
 plan_ngpus = 1
 runtime_ngpus = -1  # use -1 for WORLD_SIZE since nanoGPT's argparse require it to have static type
 
-deterministic = False
+deterministic = os.environ.get('DETERMINISTIC') is not None
 
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -73,6 +73,7 @@ if deterministic:
     dropout = 0.0  # must set before model init
     grad_clip = 0.0
     torch.use_deterministic_algorithms(True)  # NOTE: requires env CUBLAS_WORKSPACE_CONFIG=":4096:8"
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
 
 # various inits, derived attributes, I/O setup
 

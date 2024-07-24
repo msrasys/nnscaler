@@ -2,7 +2,7 @@ import logging
 
 import nnscaler
 
-from .trainer import Trainer
+from nnscaler.cli.trainer import Trainer
 
 
 if __name__ == '__main__':

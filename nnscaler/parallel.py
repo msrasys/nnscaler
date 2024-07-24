@@ -65,7 +65,7 @@ for k, v in policies.__dict__.items():
 @dataclass(frozen=True)
 class ComputeConfig:
     plan_ngpus: int
-    runtime_ngpus: int
+    runtime_ngpus: Optional[int] = None
 
     # whether to fold constant when generating code
     constant_folding: bool = False
@@ -128,6 +128,10 @@ class ComputeConfig:
     def __post_init__(self):
         if self.plan_ngpus <= 0:
             raise ValueError(f"plan_ngpus {self.plan_ngpus} must be > 0")
+        if self.runtime_ngpus is None:
+            super().__setattr__('runtime_ngpus', int(os.environ.get('WORLD_SIZE', 0)))
+            if not self.runtime_ngpus:
+                raise ValueError(f"runtime_ngpus is not set and WORLD_SIZE is not set.")
         if self.runtime_ngpus <= 0:
             raise ValueError(f"runtime_ngpus {self.runtime_ngpus} must be > 0")
         if self.runtime_ngpus % self.plan_ngpus != 0:

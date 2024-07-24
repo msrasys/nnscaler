@@ -133,6 +133,7 @@ class Trainer:
             return next(iter(dataloader))
 
     def _setup(self):
+        self.train_args.init_env()
         compile_only = self.train_args.run_mode == 'compile'
         if not compile_only:
             nnscaler.init()
@@ -154,6 +155,12 @@ class Trainer:
         # create dataset and dataloader
         for stage in ['train', 'val', 'test']:
             self.dataset[stage] = self.train_args.create_dataset(stage)
+
+        # load a dummy input from training dataset
+        self.dummy_input = self._load_dummy_input()
+        self.dummy_input = self._fix_input(self.dummy_input)
+
+        for stage in ['train', 'val', 'test']:
             self.dataloader[stage] = self.train_args.create_dataloader(stage, self.dataset[stage])
             if self.dataloader[stage] is not None \
                 and not self.dataloader[stage].drop_last \
@@ -165,13 +172,14 @@ class Trainer:
                         f"You can specify `drop_last=True` in DataLoader to fix this problem."
                     )
 
-        # load a dummy input from training dataset
-        self.dummy_input = self._load_dummy_input()
-        self.dummy_input = self._fix_input(self.dummy_input)
-
         # setup compute config
         compute_config = copy.deepcopy(self.train_args.compute_config)
         compute_config.pas_config['__pas_name'] = self.train_args.pas_policy
+        # autodist configs
+        compute_config.pas_config['update_freq'] = self.train_args.update_freq
+        compute_config.pas_config['use_bf16'] = self.train_args.bf16
+        compute_config.pas_config['use_fp16'] = self.train_args.fp16
+
         compute_config.user_config['__from_trainer_args'] = {
             'mbs': self.train_args.micro_batch_size,
             'gbs': self.train_args.global_batch_size,
@@ -203,6 +211,7 @@ class Trainer:
             self.total_train_steps_per_epoch += 1  # will add extra dummy batches
         _, self.sync_group = self.train_args.compute_config.get_sync_group()
         self.model = pmodel_class()
+        self.model.cuda()
         self.optimizer = self.train_args.create_parallel_optimizer(self.model)
         self.lr_scheduler = self.train_args.create_lr_scheduler(self.optimizer)
         self.loggers = self.train_args.create_loggers()
@@ -447,7 +456,7 @@ class Trainer:
         next_batch_index = self.train_status.next_batch_index
         self.hook.on_train_start(self)
 
-        for epoch in range(self.train_status.epoch, self.train_args.max_epochs):
+        for epoch in range(self.train_status.epoch, self.train_args.max_epochs or sys.maxsize):
             self.dataloader['train'].sampler.set_epoch(epoch)
 
             torch.distributed.barrier()
@@ -487,7 +496,6 @@ class Trainer:
             logger.info('No val dataset specified. Validation skipped.')
             return step_stat.train_loss
 
-        logger.info('Validating...')
         data_iter = enumerate(self._global_batch_iterator(stage='val'))
         if self.rank == 0:
             total_val_steps_per_epoch = len(self.dataloader['val']) // self.train_args.update_freq

@@ -279,13 +279,17 @@ class TrainerArgs:
     fp16: bool = False
     bf16: bool = False
     micro_batch_size: int = 1
-    # default is self.micro_batch_size*self.scaling_factor
-    # which means update_freq is 1
+    # You can set one of `global_batch_size` and `grad_accumulation_steps` option.
+    # Please note if both are set, they must be consistent.
+    # default is
+    # global_batch_size = self.micro_batch_size*self.scaling_factor
+    # grad_accumulation_steps = 1
     global_batch_size: Optional[int] = None
+    grad_accumulation_steps: Optional[int] = None
 
-    max_epochs: int = 1000
-    max_train_steps: int = 0
-    max_val_steps: int = 0
+    max_epochs: Optional[int] = None
+    max_train_steps: Optional[int] = None
+    max_val_steps: Optional[int] = None
 
     # validation frequency
     val_every_n_train_steps: Optional[int] = None
@@ -293,20 +297,35 @@ class TrainerArgs:
 
     enable_progress_bar: bool = True
 
+    seed: Optional[int] = None
+    # environment initialization function
+    # you can put your environment initialization code here
+    init_env_fn: str = None
+
     def __post_init__(self):
         if not self.compute_config:
             raise ValueError("compute_config is required")
         if not self.compute_config.use_end2end:
             raise ValueError("use_end2end must be True")
-        if not self.global_batch_size:
+
+        if not self.global_batch_size and not self.grad_accumulation_steps:
             self.global_batch_size = self.micro_batch_size*self.scaling_factor
-        if self.global_batch_size % (self.micro_batch_size*self.scaling_factor) != 0:
-            raise ValueError(f"`global_batch_size` {self.global_batch_size} is not divisible by `micro_batch_size*(runtime_ngpus/plan_ngpus)` "
-                             f"which is {self.micro_batch_size * self.compute_config.runtime_ngpus // self.compute_config.plan_ngpus}")
+            self.grad_accumulation_steps = 1
+        elif not self.global_batch_size:
+            self.global_batch_size = self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps
+        elif not self.grad_accumulation_steps:
+            self.grad_accumulation_steps = self.global_batch_size // (self.micro_batch_size*self.scaling_factor)
+
+        if self.global_batch_size != self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps:
+            raise ValueError(f"`global_batch_size` {self.global_batch_size} is not equal to `micro_batch_size*scaling_factor*grad_accumulation_steps` "
+                             f"{self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps}")
+
         if self.run_mode not in ('compile', 'run'):
             raise ValueError(f"Invalid run_mode {self.run_mode}")
         if self.fp16 and self.bf16:
             raise ValueError("Cannot use both fp16 and bf16")
+        if not self.max_epochs and not self.max_train_steps:
+            raise ValueError("max_epochs or max_train_steps is required")
         if not self.model_config.type:
             raise ValueError("model type is required")
         if not self.optimizer_config.type:
@@ -351,29 +370,28 @@ class TrainerArgs:
             return cls.from_dict(yaml.safe_load(f))
 
     @classmethod
-    def create_kwarg(cls, value: dict):
-        value = copy.deepcopy(value)
-        for k, v in value.items():
-            if isinstance(v, dict):
-                value[k] = cls.create_kwarg(v)
-            elif isinstance(v, list):
-                value[k] = [cls.create_kwarg(i) for i in v]
-            elif isinstance(v, tuple):
-                value[k] = tuple(cls.create_kwarg(i) for i in v)
-
-        if '__type' in value:
-            value_type = load_type(value.pop('__type'))
-            return value_type(**value)
-        elif '__value_type' in value:
-            if 'value' not in value:
-                raise ValueError("value is required when __value_type is present")
-            value_type = value.pop('__value_type')
-            if value_type == 'function':  # when type is function, the value should be the full qualified name of the function
-                return load_type(value['value'])
+    def create_kwarg(cls, value: Any):
+        if isinstance(value, dict):
+            value = {k: cls.create_kwarg(v) for k, v in value.items()}
+            if '__type' in value:
+                value_type = load_type(value.pop('__type'))
+                return value_type(**value)
+            elif '__value_type' in value:
+                if 'value' not in value:
+                    raise ValueError("value is required when __value_type is present")
+                value_type = value.pop('__value_type')
+                if value_type == 'function':  # when type is function, the value should be the full qualified name of the function
+                    return load_type(value['value'])
+                else:
+                    # call its __init__ function
+                    value_type = load_type(value_type)
+                    return value_type(value['value'])
             else:
-                # call its __init__ function
-                value_type = load_type(value_type)
-                return value_type(value['value'])
+                return value
+        elif isinstance(value, list):
+            return [cls.create_kwarg(i) for i in value]
+        elif isinstance(value, tuple):
+            return tuple(cls.create_kwarg(i) for i in value)
         else:
             return value
 
@@ -394,6 +412,19 @@ class TrainerArgs:
     @property
     def update_freq(self):
         return self.global_batch_size // self.micro_batch_size // self.scaling_factor
+
+    def init_env(self):
+        if self.seed is not None:
+            import random
+            import numpy as np
+            torch.manual_seed(self.seed)
+            np.random.seed(self.seed)
+            random.seed(self.seed)
+
+        if self.init_env_fn is None:
+            return
+        init_env_fn = load_type(self.init_env_fn)
+        init_env_fn(self)
 
     def create_model(self) -> torch.nn.Module:
         kwargs = self.create_kwarg(self.model_config.args)

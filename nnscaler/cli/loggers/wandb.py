@@ -20,6 +20,11 @@ class WandbLogger(LoggerBase):
         dir: Optional[str] = None,
         **kwargs
     ) -> None:
+        if wandb is None:
+            raise RuntimeError(
+                "wandb not found, please install with: pip install wandb"
+            )
+
         super().__init__()
 
         self._name = name
