@@ -106,10 +106,8 @@ class Trainer:
         elif isinstance(input, tuple):
             return tuple(self._fix_input(v) for v in input)
         elif isinstance(input, torch.Tensor):
-            if self.train_args.fp16:
-                return input.half().cuda()
-            elif self.train_args.bf16:
-                return input.bfloat16().cuda()
+            if input.is_floating_point() and self.train_args.input_dtype is not None:
+                return input.to(self.train_args.input_dtype).cuda()
             else:
                 return input.cuda()
         return input
@@ -144,10 +142,27 @@ class Trainer:
 
         def _create_model():
             model = self.train_args.create_model()
-            if self.train_args.fp16:
-                model = model.half()
-            elif self.train_args.bf16:
-                model = model.bfloat16()
+            if self.train_args.param_dtype == self.train_args.buffer_dtype:
+                if self.train_args.param_dtype is not None:
+                    model = model.to(self.train_args.param_dtype)
+            else:
+                # separate param and buffer dtype
+                # TODO: a little hacky. A better way?
+                # 3 kinds of tensors are converted in Module._apply:
+                # model parameters, its grad, and buffer
+                # param_dtype controls the first two, (but grad is `None` here)
+                # and buffer_dtype controls the last one
+                buf_ids = { id(buf) for buf in model.buffers(recurse=True) }
+                if self.train_args.param_dtype is not None:
+                    model._apply(
+                        lambda t: t.to(self.train_args.param_dtype)
+                            if t.is_floating_point() and id(t) not in buf_ids
+                            else t)
+                if self.train_args.buffer_dtype is not None:
+                    model._apply(
+                        lambda t: t.to(self.train_args.buffer_dtype)
+                            if t.is_floating_point() and id(t) in buf_ids
+                            else t)
             if self.train_args.tracing_from_weights:
                 model.load_state_dict(torch.load(self.train_args.tracing_from_weights))
             return model
@@ -177,15 +192,14 @@ class Trainer:
         compute_config.pas_config['__pas_name'] = self.train_args.pas_policy
         # autodist configs
         compute_config.pas_config['update_freq'] = self.train_args.update_freq
-        compute_config.pas_config['use_bf16'] = self.train_args.bf16
-        compute_config.pas_config['use_fp16'] = self.train_args.fp16
+        compute_config.pas_config['use_bf16'] = self.train_args.param_dtype == torch.bfloat16
+        compute_config.pas_config['use_fp16'] = self.train_args.param_dtype == torch.float16
 
         compute_config.user_config['__from_trainer_args'] = {
             'mbs': self.train_args.micro_batch_size,
             'gbs': self.train_args.global_batch_size,
-            'fp16': self.train_args.fp16,
-            'bf16': self.train_args.bf16,
-            'model_args': self.train_args.model_config.args,
+            'precision': self.train_args.precision,
+            'model_args': self.train_args.model.args,
         }
 
         # parallalize model
@@ -231,7 +245,7 @@ class Trainer:
             [s['optimizer'] for s in state_dicts]
         )
         train_args = copy.deepcopy(state_dicts[0]['train_args'])
-        train_args['checkpoint_config']['save_type'] = 'merged'
+        train_args['checkpoint']['save_type'] = 'merged'
         merged_state_dict = {
             'model': module_state_dict,
             'optimizer': opt_state_dict,
@@ -254,7 +268,7 @@ class Trainer:
             logger.setup(config)
 
     def _load_checkpoint(self):
-        resume_from = self.train_args.checkpoint_config.get_resume_checkpoint_dir()
+        resume_from = self.train_args.checkpoint.get_resume_checkpoint_dir()
         if not resume_from:
             return
         logger.info(f"Resuming from {resume_from}")
@@ -264,7 +278,7 @@ class Trainer:
             resume_from = resume_from / f'{self.rank}.ckpt'
         state_dict = torch.load(resume_from, map_location='cpu')
         self.hook.on_load_checkpoint(self, state_dict)
-        ckpt_save_type = state_dict['train_args']['checkpoint_config']['save_type']
+        ckpt_save_type = state_dict['train_args']['checkpoint']['save_type']
 
         if ckpt_save_type == 'merged': # it is a merged state dict
             nnscaler.load_merged_state_dict(
@@ -292,7 +306,7 @@ class Trainer:
         self.train_status = TrainStatus(**state_dict['train_status'])
 
     def _save_checkpoint(self, loss):
-        checkpoint_config = self.train_args.checkpoint_config
+        checkpoint_config = self.train_args.checkpoint
 
         if checkpoint_config.no_save:
             logger.info('Skip saving checkpoint because `no_save` is set to True')
@@ -375,21 +389,21 @@ class Trainer:
             self._expire_checkpoints()
 
     def _expire_checkpoints(self):
-        if not self.train_args.checkpoint_config.keep_last_n_checkpoints:  # keep all
+        if not self.train_args.checkpoint.keep_last_n_checkpoints:  # keep all
             return
 
-        save_dir = Path(self.train_args.checkpoint_config.save_dir)
+        save_dir = Path(self.train_args.checkpoint.save_dir)
         checkpoints = [
             p.name for p in save_dir.glob('*')
             if p.is_dir() and p.name not in [CHECKPOINT_BEST_DIR_NAME, CHECKPOINT_LAST_DIR_NAME]
         ]
-        if len(checkpoints) <= self.train_args.checkpoint_config.keep_last_n_checkpoints:
+        if len(checkpoints) <= self.train_args.checkpoint.keep_last_n_checkpoints:
             return
 
         # (step, num) pairs
         checkpoint_info = [(int(p.split('-')[1]), p) for p in checkpoints]
         checkpoint_info.sort()
-        expire_list = checkpoint_info[:-self.train_args.checkpoint_config.keep_last_n_checkpoints]
+        expire_list = checkpoint_info[:-self.train_args.checkpoint.keep_last_n_checkpoints]
 
         best_ckpt = save_dir / CHECKPOINT_BEST_DIR_NAME
         if best_ckpt.exists():
@@ -467,7 +481,7 @@ class Trainer:
             self.train_epoch(epoch)
             self.hook.on_epoch_end(self, epoch)
 
-            if self.lr_scheduler and self.train_args.lr_scheduler_config.interval == 'epoch':
+            if self.lr_scheduler and self.train_args.lr_scheduler.interval == 'epoch':
                 self.lr_scheduler.step()
 
             if self.train_args.max_train_steps and self.num_train_steps >= self.train_args.max_train_steps:
@@ -582,7 +596,7 @@ class Trainer:
 
             aggregate_outputs = self.train_args.aggregate_outputs or self.aggregate_outputs
             aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)
-            if self.train_args.optimizer_config.loss_reduction == 'mean':
+            if self.train_args.optimizer.loss_reduction == 'mean':
                 loss = aggregated_outputs.loss_sum / aggregated_outputs.num_batches
             else:
                 loss = aggregated_outputs.loss_sum
@@ -594,23 +608,23 @@ class Trainer:
             self.optimizer.sync_shard_grad()
 
             # scale gradients
-            if self.train_args.optimizer_config.grad_reduction == 'sum':
+            if self.train_args.optimizer.grad_reduction == 'sum':
                 # do nothing. Already done in reducers
                 pass
-            elif self.train_args.optimizer_config.grad_reduction == 'mean':
+            elif self.train_args.optimizer.grad_reduction == 'mean':
                 if not aggregated_outputs.num_batches:
                     raise RuntimeError("`aggregate_outputs` doesn't set `num_batches` field")
                 self.optimizer.scale_grads(1.0 / aggregated_outputs.num_batches)
             else:
-                assert self.train_args.optimizer_config.grad_reduction == 'per-token-mean'
+                assert self.train_args.optimizer.grad_reduction == 'per-token-mean'
                 if not aggregated_outputs.num_tokens:
                     raise RuntimeError("`aggregate_outputs` doesn't set `num_tokens` field")
                 self.optimizer.scale_grads(1.0 / aggregated_outputs.num_tokens)
 
             # clip gradients
             self.hook.before_gnorm_clip(self)
-            if self.train_args.optimizer_config.clip_gnorm:
-                step_stat.gnorm = self.optimizer.clip_gnorm(self.train_args.optimizer_config.clip_gnorm)
+            if self.train_args.optimizer.clip_gnorm:
+                step_stat.gnorm = self.optimizer.clip_gnorm(self.train_args.optimizer.clip_gnorm)
             else:
                 step_stat.gnorm = self.optimizer.clip_gnorm()
             self.hook.after_gnorm_clip(self, step_stat.gnorm)
@@ -621,12 +635,12 @@ class Trainer:
             self.hook.before_optimizer_step(self)
             self.optimizer.step()
             self.hook.after_optimizer_step(self)
-            if self.lr_scheduler and self.train_args.lr_scheduler_config.interval == 'step':
+            if self.lr_scheduler and self.train_args.lr_scheduler.interval == 'step':
                 self.lr_scheduler.step()
 
             # validate and save checkpoint
-            if self.train_args.checkpoint_config.every_n_train_steps and \
-                self.num_train_steps % self.train_args.checkpoint_config.every_n_train_steps == 0:
+            if self.train_args.checkpoint.every_n_train_steps and \
+                self.num_train_steps % self.train_args.checkpoint.every_n_train_steps == 0:
                 self._validate_and_save(step_stat)
                 has_validated = VAL_STATUS_SAVE
 
@@ -646,8 +660,8 @@ class Trainer:
         else:  # not from `break`
             if not has_validated:
                 if self.train_args.max_epochs == self.train_status.epoch + 1 \
-                    or (self.train_args.checkpoint_config.every_n_epochs and \
-                    (self.train_status.epoch + 1) % self.train_args.checkpoint_config.every_n_epochs == 0):
+                    or (self.train_args.checkpoint.every_n_epochs and \
+                    (self.train_status.epoch + 1) % self.train_args.checkpoint.every_n_epochs == 0):
                     self._validate_and_save(step_stat)
                     has_validated = VAL_STATUS_SAVE
                 elif self.train_args.val_every_n_epochs and \

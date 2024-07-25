@@ -24,15 +24,15 @@ def trainer_logging_worker(save_dir):
         '--gen_savedir', str(gen_savedir),
         '--compute_config.plan_ngpus', '2',
         '--compute_config.runtime_ngpus', '4',
-        '--checkpoint_config.no_save', 'true',
-        '--log_config.0.type', 'nnscaler.cli.loggers.TensorBoardLogger',
-        '--log_config.0.args.name', 'test-cli',
-        '--log_config.0.args.root_dir', str(tb_log_savedir),
-        '--log_config.1.type', 'nnscaler.cli.loggers.WandbLogger',
-        '--log_config.1.args.name', 'test-cli',
-        '--log_config.1.args.dir', str(wandb_log_savedir),
-        '--log_config.1.args.project', 'nnscaler',
-        '--log_config.1.args.mode', 'offline',
+        '--checkpoint.no_save', 'true',
+        '--log.0.type', 'nnscaler.cli.loggers.TensorBoardLogger',
+        '--log.0.args.name', 'test-cli',
+        '--log.0.args.root_dir', str(tb_log_savedir),
+        '--log.1.type', 'nnscaler.cli.loggers.WandbLogger',
+        '--log.1.args.name', 'test-cli',
+        '--log.1.args.dir', str(wandb_log_savedir),
+        '--log.1.args.project', 'nnscaler',
+        '--log.1.args.mode', 'offline',
     ])
     trainer.train()
 
@@ -65,16 +65,16 @@ def trainer_resume_worker(save_dir, save_type, bf16):
     # train 4 epcho in one time
     trainer = Trainer([
         '-f', config_path,
-        '--bf16', str(bf16),
+        '--precision', 'bf16' if bf16 else 'none',
         '--max_epochs', '4',
         '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen_savedir),
         '--compute_config.plan_ngpus', '2',
         '--compute_config.runtime_ngpus', '4',
-        '--checkpoint_config.save_type', save_type,
-        '--checkpoint_config.save_dir', str(ckpt_savedir),
-        '--checkpoint_config.resume_from', 'last',
-        '--checkpoint_config.keep_last_n_checkpoints', '30',
+        '--checkpoint.save_type', save_type,
+        '--checkpoint.save_dir', str(ckpt_savedir),
+        '--checkpoint.resume_from', 'last',
+        '--checkpoint.keep_last_n_checkpoints', '30',
     ])
     trainer.train()
     ckpt_files = set(ckpt_savedir.glob('**/*.ckpt'))
@@ -85,16 +85,16 @@ def trainer_resume_worker(save_dir, save_type, bf16):
     # first two epochs
     trainer = Trainer([
         '-f', config_path,
-        '--bf16', str(bf16),
+        '--precision', 'bf16' if bf16 else 'none',
         '--max_epochs', '2',
         '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen_savedir),
         '--compute_config.plan_ngpus', '2',
         '--compute_config.runtime_ngpus', '4',
-        '--checkpoint_config.save_type', save_type,
-        '--checkpoint_config.save_dir', str(ckpt0_savedir),
-        '--checkpoint_config.resume_from', 'last',
-        '--checkpoint_config.keep_last_n_checkpoints', '30',
+        '--checkpoint.save_type', save_type,
+        '--checkpoint.save_dir', str(ckpt0_savedir),
+        '--checkpoint.resume_from', 'last',
+        '--checkpoint.keep_last_n_checkpoints', '30',
     ])
     trainer.train()
     ckpt0_files0 = {f: f.stat().st_mtime_ns for f in ckpt0_savedir.glob('**/*.ckpt')}
@@ -109,16 +109,16 @@ def trainer_resume_worker(save_dir, save_type, bf16):
     # continue with the last two epochs (resume for sharded/deduped checkpoint)
     trainer = Trainer([
         '-f', config_path,
-        '--bf16', str(bf16),
+        '--precision', 'bf16' if bf16 else 'none',
         '--max_epochs', '4',
         '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen_savedir),
         '--compute_config.plan_ngpus', '2',
         '--compute_config.runtime_ngpus', '4',
-        '--checkpoint_config.save_type', save_type,
-        '--checkpoint_config.save_dir', str(ckpt0_savedir),
-        '--checkpoint_config.resume_from', 'last',
-        '--checkpoint_config.keep_last_n_checkpoints', '30',
+        '--checkpoint.save_type', save_type,
+        '--checkpoint.save_dir', str(ckpt0_savedir),
+        '--checkpoint.resume_from', 'last',
+        '--checkpoint.keep_last_n_checkpoints', '30',
     ])
     trainer.train()
     left_files = {
@@ -137,15 +137,15 @@ def trainer_resume_worker(save_dir, save_type, bf16):
     # continue with the last two epochs (resume for merged)
     trainer = Trainer([
         '-f', config_path,
-        '--bf16', str(bf16),
+        '--precision', 'bf16' if bf16 else 'none',
         '--max_epochs', '4',
         '--gen_savedir', str(gen_savedir),
         '--compute_config.plan_ngpus', '2',
         '--compute_config.runtime_ngpus', '4',
-        '--checkpoint_config.save_type', save_type,
-        '--checkpoint_config.save_dir', str(ckpt1_savedir),
-        '--checkpoint_config.resume_from', str(ckpt1_savedir / 'merged.pt'),
-        '--checkpoint_config.keep_last_n_checkpoints', '30',
+        '--checkpoint.save_type', save_type,
+        '--checkpoint.save_dir', str(ckpt1_savedir),
+        '--checkpoint.resume_from', str(ckpt1_savedir / 'merged.pt'),
+        '--checkpoint.keep_last_n_checkpoints', '30',
     ])
     trainer.train()
     left_files = {

@@ -42,11 +42,8 @@ def test_fix_type():
     with pytest.raises(ValueError):
         _fix_type(List[str], True)
 
-    with pytest.raises(ValueError):
-        _fix_type(Union[bool, int])
-
-    with pytest.raises(ValueError):
-        _fix_type(Union[bool, int, None])
+    assert _fix_type(Union[bool, int]) == None
+    assert _fix_type(Union[bool, int, None]) == None
 
 
 @pytest.mark.skipif(sys.version_info < (3, 10), reason='| is not available as union type for python < 3.10')
@@ -59,11 +56,8 @@ def test_fix_type2():
     with pytest.raises(ValueError):
         _fix_type(list[str], True)
 
-    with pytest.raises(ValueError):
-        _fix_type(bool|int)
-
-    with pytest.raises(ValueError):
-        _fix_type(bool|int|None)
+    assert _fix_type(bool|int) == None
+    assert _fix_type(bool|int|None) == None
 
 
 @dataclass
@@ -159,3 +153,21 @@ def test_deserialize_list():
     x = parse_args(['--a.0=1', '--a.1=2', '--b.0.h=3', '--b.1.h=4', '--c.1=4'])
     y = deserialize_dataclass(x, A)
     assert y == A(a=[1, 2], b=[GConfig(h=3), GConfig(h=4)], c=(None, 4))
+
+
+def test_deserialize_union():
+    @dataclass
+    class A:
+        p: Union[str, Dict[str, str], None] = None
+
+    x = parse_args(['--p=hello'])
+    y = deserialize_dataclass(x, A)
+    assert y.p == 'hello'
+
+    x = parse_args(['--p.a=a', '--p.b=b'])
+    y = deserialize_dataclass(x, A)
+    assert y.p == {'a': 'a', 'b': 'b'}
+
+    x = parse_args(['--p.a=1', '--p.b=b'])
+    y = deserialize_dataclass(x, A)
+    assert y.p == {'a': 1, 'b': 'b'}  # Dict[str, str] is ignored. so '1' will be converted to int

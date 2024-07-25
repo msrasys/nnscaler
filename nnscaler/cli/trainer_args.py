@@ -1,6 +1,6 @@
 from dataclasses import asdict, dataclass, field
 import importlib
-from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING, Union, get_args
 from pathlib import Path
 import logging
 import copy
@@ -250,6 +250,16 @@ class ArgsTrainHook(TrainHook):
                 setattr(self, k, load_type(v))
 
 
+_TENSOR_TYPE = Literal['param', 'buffer', 'input']
+_PRECISION_TYPE = Literal['fp32', 'fp16', 'bf16', 'none']
+_PRECISION_MAP = {
+    'fp32': torch.float32,
+    'fp16': torch.float16,
+    'bf16': torch.bfloat16,
+    'none': None  # as it is. no conversion will happen.
+}
+
+
 @dataclass
 class TrainerArgs:
     compute_config: ComputeConfig = None
@@ -265,19 +275,20 @@ class TrainerArgs:
     # It is only used in tracing to serve as the initial state dict of the model.
     tracing_from_weights: str = None
 
-    model_config: ModelConfig = field(default_factory=ModelConfig)
-    optimizer_config: OptimizerConfig = field(default_factory=OptimizerConfig)
-    dataset_config: DatasetConfig = field(default_factory=DatasetConfig)
-    dataloader_config: DataloaderConfig = field(default_factory=DataloaderConfig)
-    dataset_sampler_config: DatasetSamplerConfig = field(default_factory=DatasetSamplerConfig)
-    lr_scheduler_config: Optional[LRSchedulerConfig] = None
-    checkpoint_config: CheckpointConfig = field(default_factory=CheckpointConfig)
-    log_config: List[LogConfig] = field(default_factory=list)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
+    dataset_sampler: DatasetSamplerConfig = field(default_factory=DatasetSamplerConfig)
+    lr_scheduler: Optional[LRSchedulerConfig] = None
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    log: List[LogConfig] = field(default_factory=list)
     # It can be `HookConfig` or `HookMapConfig`
-    hook_config: Any = None
+    hook: Union[HookConfig, HookMapConfig, None] = None
 
-    fp16: bool = False
-    bf16: bool = False
+    # TODO: mixed precision support
+    precision: Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE], None] = None
+
     micro_batch_size: int = 1
     # You can set one of `global_batch_size` and `grad_accumulation_steps` option.
     # Please note if both are set, they must be consistent.
@@ -322,21 +333,34 @@ class TrainerArgs:
 
         if self.run_mode not in ('compile', 'run'):
             raise ValueError(f"Invalid run_mode {self.run_mode}")
-        if self.fp16 and self.bf16:
-            raise ValueError("Cannot use both fp16 and bf16")
+
+        supported_precision_type = get_args(_PRECISION_TYPE)
+        supported_tensor_type = get_args(_TENSOR_TYPE)
+        if not self.precision:
+            self.precision = 'none'
+        if isinstance(self.precision, str):
+            self.precision = {k: self.precision for k in supported_tensor_type}
+        for tensor_type in supported_tensor_type:
+            if tensor_type not in self.precision:
+                self.precision[tensor_type] = 'none'
+            if self.precision[tensor_type] not in supported_precision_type:
+                raise ValueError(f"Invalid precision {self.precision[tensor_type]} for {tensor_type}")
+        if any(k not in supported_tensor_type for k in self.precision):
+            raise ValueError(f"Invalid tensor type found in {self.precision.keys()}")
+
         if not self.max_epochs and not self.max_train_steps:
             raise ValueError("max_epochs or max_train_steps is required")
-        if not self.model_config.type:
+        if not self.model.type:
             raise ValueError("model type is required")
-        if not self.optimizer_config.type:
+        if not self.optimizer.type:
             raise ValueError("optimizer type is required")
-        if not self.dataset_config.type:
+        if not self.dataset.type:
             raise ValueError("dataset type is required")
-        if not self.dataloader_config.type:
+        if not self.dataloader.type:
             raise ValueError("dataloader type is required")
-        if not self.dataset_sampler_config.type:
+        if not self.dataset_sampler.type:
             raise ValueError("dataset_sampler type is required")
-        if self.lr_scheduler_config and not self.lr_scheduler_config.type:
+        if self.lr_scheduler and not self.lr_scheduler.type:
             raise ValueError("lr_scheduler type is required")
 
     @classmethod
@@ -397,13 +421,13 @@ class TrainerArgs:
 
     @property
     def model_type(self):
-        return load_type(self.model_config.type)
+        return load_type(self.model.type)
 
     @property
     def aggregate_outputs(self):
-        if not self.optimizer_config.aggregate_outputs_fn:
+        if not self.optimizer.aggregate_outputs_fn:
             return None
-        return load_type(self.optimizer_config.aggregate_outputs_fn)
+        return load_type(self.optimizer.aggregate_outputs_fn)
 
     @property
     def scaling_factor(self):
@@ -412,6 +436,18 @@ class TrainerArgs:
     @property
     def update_freq(self):
         return self.global_batch_size // self.micro_batch_size // self.scaling_factor
+
+    @property
+    def param_dtype(self) -> torch.dtype:
+        return _PRECISION_MAP[self.precision['param']]
+
+    @property
+    def buffer_dtype(self) -> torch.dtype:
+        return _PRECISION_MAP[self.precision['buffer']]
+
+    @property
+    def input_dtype(self) -> torch.dtype:
+        return _PRECISION_MAP[self.precision['input']]
 
     def init_env(self):
         if self.seed is not None:
@@ -427,38 +463,38 @@ class TrainerArgs:
         init_env_fn(self)
 
     def create_model(self) -> torch.nn.Module:
-        kwargs = self.create_kwarg(self.model_config.args)
+        kwargs = self.create_kwarg(self.model.args)
         return self.model_type(**kwargs)
 
     def create_parallel_optimizer(self, parallel_model: ParallelModule):
-        kwargs = self.create_kwarg(self.optimizer_config.args)
-        optimizer_class = load_type(self.optimizer_config.type)
+        kwargs = self.create_kwarg(self.optimizer.args)
+        optimizer_class = load_type(self.optimizer.type)
         return build_optimizer(parallel_model, optimizer_class, **kwargs)
 
     def create_dataset(self, stage='train'):
-        dataset_args = getattr(self.dataset_config, f'{stage}_args')
+        dataset_args = getattr(self.dataset, f'{stage}_args')
         if not dataset_args:
             return None
         kwargs = self.create_kwarg(dataset_args)
-        dataset_class = load_type(self.dataset_config.type)
+        dataset_class = load_type(self.dataset.type)
         dataset = dataset_class(**kwargs)
         if isinstance(dataset_class, torch.utils.data.IterableDataset):
             raise ValueError("IterableDataset is not supported")
         return dataset
 
     def create_sampler(self, dataset, stage='train'):
-        sampler_args = getattr(self.dataset_sampler_config, f'{stage}_args')
-        sampler_args = sampler_args or self.dataset_sampler_config.train_args
+        sampler_args = getattr(self.dataset_sampler, f'{stage}_args')
+        sampler_args = sampler_args or self.dataset_sampler.train_args
         kwargs = self.create_kwarg(sampler_args)
         kwargs['dataset'] = dataset
         kwargs['num_replicas'] = self.compute_config.runtime_ngpus // self.compute_config.plan_ngpus
         kwargs['rank'] = torch.distributed.get_rank() // self.compute_config.plan_ngpus
-        sampler_class = load_type(self.dataset_sampler_config.type)
+        sampler_class = load_type(self.dataset_sampler.type)
         return sampler_class(**kwargs)
 
     def create_dataloader(self, stage='train', dataset=None):
-        dataloader_args = getattr(self.dataloader_config, f'{stage}_args')
-        dataloader_args = dataloader_args or self.dataloader_config.train_args
+        dataloader_args = getattr(self.dataloader, f'{stage}_args')
+        dataloader_args = dataloader_args or self.dataloader.train_args
         kwargs = self.create_kwarg(dataloader_args)
         if 'batch_size' in kwargs:
             raise ValueError("`batch_size` should not be specified in dataloader_args. "
@@ -472,35 +508,35 @@ class TrainerArgs:
             kwargs['collate_fn'] = load_type(kwargs['collate_fn'])
         kwargs['batch_size'] = self.micro_batch_size
         kwargs['sampler'] = self.create_sampler(kwargs['dataset'], stage)
-        dataloader_class = load_type(self.dataloader_config.type)
+        dataloader_class = load_type(self.dataloader.type)
         return dataloader_class(**kwargs)
 
     def create_lr_scheduler(self, optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler.LRScheduler:
-        if not self.lr_scheduler_config:
+        if not self.lr_scheduler:
             return None
-        kwargs = self.create_kwarg(self.lr_scheduler_config.args)
-        lr_scheduler_class = load_type(self.lr_scheduler_config.type)
+        kwargs = self.create_kwarg(self.lr_scheduler.args)
+        lr_scheduler_class = load_type(self.lr_scheduler.type)
         return lr_scheduler_class(optimizer, **kwargs)
 
     def create_loggers(self) -> List['LoggerBase']:
         loggers = []
-        for log_config in self.log_config:
+        for log_config in self.log:
             kwargs = self.create_kwarg(log_config.args)
             logger_class = load_type(log_config.type)
             loggers.append(logger_class(**kwargs))
         return loggers
 
     def create_hook(self) -> TrainHook:
-        if not self.hook_config:
+        if not self.hook:
             return TrainHook()  # empty hook
 
-        if isinstance(self.hook_config, dict):
-            if 'type' in self.hook_config:
-                hook_config = HookConfig(**self.hook_config)
+        if isinstance(self.hook, dict):
+            if 'type' in self.hook:
+                hook_config = HookConfig(**self.hook)
             else:
-                hook_config = HookMapConfig(**self.hook_config)
+                hook_config = HookMapConfig(**self.hook)
         else:
-            hook_config = self.hook_config
+            hook_config = self.hook
 
         if isinstance(hook_config, HookConfig):
             kwargs = self.create_kwarg(hook_config.args)

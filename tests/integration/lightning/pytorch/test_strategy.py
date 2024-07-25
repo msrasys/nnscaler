@@ -244,10 +244,10 @@ def correctnes_worker_cli(
         pas_policy=policy,
         instance_name=f'cli_{policy}',
         enable_progress_bar=False,
-        model_config=ModelConfig(
+        model=ModelConfig(
             type=CorrectnessWorkerM,
         ),
-        dataset_config=DatasetConfig(
+        dataset=DatasetConfig(
             type=correctnes_worker_cli_dataset,
             train_args={
                 'stage': 'train'
@@ -256,24 +256,24 @@ def correctnes_worker_cli(
                 'stage': 'val'
             },
         ),
-        dataset_sampler_config=DatasetSamplerConfig(
+        dataset_sampler=DatasetSamplerConfig(
             type='torch.utils.data.DistributedSampler',
             val_args={
                 'shuffle': False, # lightning doesn't shuffle val set
             },
         ),
-        optimizer_config=OptimizerConfig(
+        optimizer=OptimizerConfig(
             type=torch.optim.Adam,
             args={
                 'lr': _correctnes_worker_model.lr
             },
             clip_gnorm=gradient_clip_val,
         ),
-        checkpoint_config=CheckpointConfig(
+        checkpoint=CheckpointConfig(
             no_save=True,
         ),
-        lr_scheduler_config=lr_config,
-        hook_config=dict(
+        lr_scheduler=lr_config,
+        hook=dict(
             before_gnorm_clip=on_before_grad_clip,
             after_aggregate_train_step_outputs=after_aggregate_train_step_outputs,
             on_train_step_end=on_train_step_end,

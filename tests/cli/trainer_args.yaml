@@ -12,18 +12,18 @@ global_batch_size: 8
 max_epochs: 4
 max_train_steps: 100
 
-model_config:
+model:
   type: tests.cli.common.MLP
   args:
     dim: 16
     nlayers: 16
 
-optimizer_config:
+optimizer:
   type: torch.optim.Adam
   args:
     lr: 0.01
 
-dataset_config:
+dataset:
   type: tests.cli.common.SimpleDataset
   train_args:
     dim: 16
@@ -32,7 +32,7 @@ dataset_config:
     dim: 16
     size: 10
 
-checkpoint_config:
+checkpoint:
   keep_last_n_checkpoints: 30
   every_n_train_steps: 1
   save_type: deduped

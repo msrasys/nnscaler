@@ -60,7 +60,10 @@ def _fix_optional(type_info):
         or (UnionType and isinstance(type_info, UnionType)):
         args = getattr(type_info, '__args__', None)
         if len(args) != 2 or (args[1] != type(None) and args[0] != type(None)):
-            raise ValueError(f"Invalid optional type {type_info}")
+            # when multiple types are allowed,
+            # we don't do any conversion
+            # let's the user to handle it
+            return Any
         if args[1] == type(None):
             return _fix_optional(args[0])
         else:
