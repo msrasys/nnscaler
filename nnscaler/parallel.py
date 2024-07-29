@@ -2266,7 +2266,8 @@ def _broadcast_opt_state(optimizer_state_dict, state_indexes: List[int], dedup_g
     # TODO: can be slow?
     for k in state_indexes:
         keys = sorted(optimizer_state_dict['state'][k].keys())
-        assert set(keys) == {'step', 'exp_avg', 'exp_avg_sq'}
+        # for mixed precision f16 optimizer, we will add custom keys
+        # assert set(keys) == {'step', 'exp_avg', 'exp_avg_sq'}
         keys.remove('step')  # we have done step in previous.
         for key in keys:
             value = optimizer_state_dict['state'][k][key]

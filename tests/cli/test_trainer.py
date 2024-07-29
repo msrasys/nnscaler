@@ -63,9 +63,14 @@ def trainer_resume_worker(save_dir, save_type, bf16):
     gen_savedir = save_dir / 'gen'
     ckpt_savedir = save_dir / 'ckpt'
     # train 4 epcho in one time
+    optimizer_type = 'nnscaler.runtime.f16_optimizer.MixedPrecisionAdam' \
+        if bf16 == 'Mixed' \
+        else 'torch.optim.Adam'
+
     trainer = Trainer([
         '-f', config_path,
         '--precision', 'bf16' if bf16 else 'none',
+        '--optimizer.type', optimizer_type,
         '--max_epochs', '4',
         '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen_savedir),
@@ -80,12 +85,14 @@ def trainer_resume_worker(save_dir, save_type, bf16):
     ckpt_files = set(ckpt_savedir.glob('**/*.ckpt'))
     assert len(ckpt_files)/4 == min(30, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
 
+    torch.distributed.barrier()
     # train 4 epcho two times (resume from last)
     ckpt0_savedir = save_dir / 'ckpt0'
     # first two epochs
     trainer = Trainer([
         '-f', config_path,
         '--precision', 'bf16' if bf16 else 'none',
+        '--optimizer.type', optimizer_type,
         '--max_epochs', '2',
         '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen_savedir),
@@ -106,10 +113,12 @@ def trainer_resume_worker(save_dir, save_type, bf16):
     if trainer.rank == 0:
         Trainer.merge_checkpoint(list((ckpt0_savedir / 'last').glob('*.ckpt')), ckpt1_savedir / 'merged.pt')
 
+    torch.distributed.barrier()
     # continue with the last two epochs (resume for sharded/deduped checkpoint)
     trainer = Trainer([
         '-f', config_path,
         '--precision', 'bf16' if bf16 else 'none',
+        '--optimizer.type', optimizer_type,
         '--max_epochs', '4',
         '--enable_progress_bar', 'false',
         '--gen_savedir', str(gen_savedir),
@@ -138,6 +147,7 @@ def trainer_resume_worker(save_dir, save_type, bf16):
     trainer = Trainer([
         '-f', config_path,
         '--precision', 'bf16' if bf16 else 'none',
+        '--optimizer.type', optimizer_type,
         '--max_epochs', '4',
         '--gen_savedir', str(gen_savedir),
         '--compute_config.plan_ngpus', '2',
@@ -184,6 +194,6 @@ def trainer_resume_worker(save_dir, save_type, bf16):
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 @pytest.mark.parametrize('save_type', ['sharded', 'deduped'])
-@pytest.mark.parametrize('bf16', [True, False])
+@pytest.mark.parametrize('bf16', [True, False, 'Mixed'])
 def test_trainer_resume(tmp_path, save_type, bf16):
     launch_torchrun(4, trainer_resume_worker, tmp_path, save_type, bf16)
