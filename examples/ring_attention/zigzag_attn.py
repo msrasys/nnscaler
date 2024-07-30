@@ -5,7 +5,7 @@ import torch.distributed
 
 from nnscaler.graph.parser.register import register_op
 from nnscaler.ir.operator import IRFwOperation
-from examples.zigzag_ring_attention.zigzag_utils.zigzag_attn_implementation import ZigZagRingFlashAttnFunc
+from core.zigzag_attn_implementation import ZigZagRingFlashAttnFunc
 from flash_attn import flash_attn_func
 
 import torch.distributed as dist

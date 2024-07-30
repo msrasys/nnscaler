@@ -1,4 +1,4 @@
-# zigzag ring attention
+# ring attention
 
 Tensor parallel (partition head) is a widely used distributed plan to train large language models. Computation and memory are 
 distributed evenly across devices. However, when the sequence length is extremely long (e.g., 1M), the partition degree of 
@@ -12,7 +12,10 @@ implements a high-performance version in PyTorch. This example attempts to integ
 
 The interface is wrapped in `zigzag_attn.py`. [flash attention](https://github.com/Dao-AILab/flash-attention) is required for this example.
 
+In addition to the zigzag version, we also include a implementation based on [llama 3.1](https://ai.meta.com/research/publications/the-llama-3-herd-of-models/)'s technical report. This version uses `all_gather` and `reduce_scatter` to collect and distribute the kv values and gradients. You can check the code in `ring_attn.py`.
+
 Test can be run with the following command:
 ```bash
+torchrun --nproc_per_node 4 test_ring_attn.py
 torchrun --nproc_per_node 4 test_zigzag_attn.py
 ```

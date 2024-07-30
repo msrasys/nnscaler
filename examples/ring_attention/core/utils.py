@@ -1,9 +1,31 @@
 from typing import Optional, Tuple
+from functools import reduce
+import operator
 
 import torch
 import torch.distributed as dist
 
-__all__ = ["update_out_and_lse", "RingComm"]
+
+# copy from megatron/core/utils.py
+class GlobalMemoryBuffer:
+    """Global buffer to avoid dynamic memory allocations.
+    Caller should ensure that buffers of the same name
+    are not used concurrently."""
+
+    def __init__(self):
+        self.buffer = {}
+
+    def get_tensor(self, tensor_shape, dtype, name):
+        required_len = reduce(operator.mul, tensor_shape, 1)
+        if (
+            self.buffer.get((name, dtype), None) is None
+            or self.buffer[(name, dtype)].numel() < required_len
+        ):
+            self.buffer[(name, dtype)] = torch.empty(
+                required_len, dtype=dtype, device=torch.cuda.current_device(), requires_grad=False
+            )
+
+        return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
 
 
 def update_out_and_lse(
@@ -45,6 +67,7 @@ def update_out_and_lse(
     else:
         out, lse = _update_out_and_lse(out, lse, block_out, block_lse)
     return out, lse
+
 
 class RingComm:
     def __init__(self, process_group: dist.ProcessGroup):
@@ -93,6 +116,7 @@ class RingComm:
             req.wait()
         self._reqs = None
         self._ops = []
+
 
 def shuffle_input(to_send: torch.Tensor, 
                   process_group: dist.ProcessGroup = None):
@@ -158,6 +182,7 @@ def shuffle_input(to_send: torch.Tensor,
     # GPU D: [1 6]
     
     return to_send_f
+
 
 def recover_output(to_send: torch.Tensor, 
                    process_group: dist.ProcessGroup = None):

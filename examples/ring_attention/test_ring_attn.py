@@ -8,7 +8,7 @@ from flash_attn import flash_attn_func
 
 import nnscaler.graph
 import nnscaler.graph.function
-from examples.zigzag_ring_attention.zigzag_attn import wrap_zigzag_attn_func
+from ring_attn import wrap_ring_attn_func
 
 import random
 
@@ -49,14 +49,14 @@ class TestModule(torch.nn.Module):
         super(TestModule, self).__init__()
 
     def forward(self, _in0, _in1, _in2):
-        out = wrap_zigzag_attn_func(_in0, _in1, _in2)
+        out = wrap_ring_attn_func(_in0, _in1, _in2)
         return out
 
 def policy(graph: IRGraph, resource: ComputeConfig) -> IRGraph:
     ngpus = resource.plan_ngpus
     partitioned = False
     for idx, node in enumerate(graph.select(ntype=IRFwOperation)):
-        if not partitioned and node.signature == 'examples.zigzag_ring_attention.zigzag_attn.wrap_zigzag_attn_func':
+        if not partitioned and node.signature == 'ring_attn.wrap_ring_attn_func':
             print('Partitioned node: ', node)
             sub_nodes = graph.partition(
                 node, node.algorithms('dim'), idx=0, dim=1, num=ngpus)
@@ -65,7 +65,7 @@ def policy(graph: IRGraph, resource: ComputeConfig) -> IRGraph:
             sub_nodes = graph.replicate(node, times=ngpus)
         for idx, sub_node in enumerate(sub_nodes):
             graph.assign(sub_node, idx)
-    assert partitioned, f'expect zigzag_attn_func in graph, but not found.'
+    assert partitioned, f'expect ring_attn_func in graph, but not found.'
     return graph
 
 if __name__ == "__main__":
@@ -75,13 +75,13 @@ if __name__ == "__main__":
 
     set_seed(rank_id)
     bsz = 1
-    seqlen = 3824
-    nheads = 5
+    seqlen = 8192
+    nheads = 24
     d = 128
 
     device = torch.device(f"cuda:{rank_id}")
-    dtype = torch.float16
-    # dtype = torch.bfloat16
+    # dtype = torch.float16
+    dtype = torch.bfloat16
 
     q = torch.randn(bsz, seqlen, nheads, d, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(bsz, seqlen, nheads, d, device=device, dtype=dtype, requires_grad=True)
@@ -92,7 +92,7 @@ if __name__ == "__main__":
     dist.broadcast(v, src=0)
     dist.barrier()
 
-    single_out = wrap_zigzag_attn_func(q, k, v)
+    single_out = wrap_ring_attn_func(q, k, v)
     single_out.retain_grad()
     single_loss = single_out.sum()
     single_loss.backward()
