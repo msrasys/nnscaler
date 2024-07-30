@@ -346,6 +346,10 @@ def correctnes_worker_nnscaler_checkpoint(tmp_path, gradient_clip_val, with_lr_s
     else:
         model = ClassificationModel()
         state_dict_type = 'deduped'
+    if gradient_clip_val:
+        do_merge = True
+    else:
+        do_merge = False
     if with_tp:
         compute_config=ComputeConfig(2, 4)
         policy = 'tp'
@@ -374,6 +378,17 @@ def correctnes_worker_nnscaler_checkpoint(tmp_path, gradient_clip_val, with_lr_s
     )
     trainer.fit(model, datamodule=dm)
 
+    torch.distributed.barrier()
+    if do_merge:
+        resume_ckpt = Path(tmp_path) / 'merged.ckpt'
+        ckpt_last_dir = Path(tmp_path) / 'last.ckpt'
+        ckpt_last_files = list(ckpt_last_dir.glob('**/*.pt'))
+        if torch.distributed.get_rank() == 0:
+            NnScalerStrategy.merge_checkpoint(ckpt_last_files, resume_ckpt)
+    else:
+        resume_ckpt = Path(tmp_path) / 'last.ckpt'
+    torch.distributed.barrier()
+
     trainer = Trainer(
         default_root_dir=tmp_path,
         max_epochs=2,
@@ -389,7 +404,7 @@ def correctnes_worker_nnscaler_checkpoint(tmp_path, gradient_clip_val, with_lr_s
         ),
         plugins=[NnScalerPrecision(precision, scaler=scaler)]
     )
-    trainer.fit(model, datamodule=dm, ckpt_path='last')
+    trainer.fit(model, datamodule=dm, ckpt_path=resume_ckpt)
     return model.update_history, model.nnscaler_pmodule.fullmap, model.val_loss_history, model.loss_history
 
 

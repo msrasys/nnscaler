@@ -68,19 +68,12 @@ Just like other pytorch lightning strategy,
 you can resume from a checkpoint by specifying the `ckpt_path` argument in the `Trainer.fit` function.
 Please note when the parallel plan is changed (i.e you re-trace the model with different configurations),
 the checkpoints become incompatible, and can't be loaded any more.
-You must firstly merge the checkpoints to a merged checkpoint and load it as a pretrained model.
+You must firstly merge the checkpoints to a merged checkpoint with `NnScalerStrategy.merge_checkpoint` and then load the merged checkpoint as a regular checkpoint.
 
-You can also merge all checkpoints (saved by each rank) to a complete checkpoint by using the `nnscaler.merge_state_dicts` function.
 ```python
-import nnscaler
-from pathlib import Path
-state_dicts = []
-CHECKPOINT_DIR = Path(...)
-for rank in range(world_size):
-    state_dicts.append(torch.load(CHECKPOINT_DIR / f"{rank}.pt")['state_dict'])
-merged_state_dict, _ = nnscaler.merge_state_dicts(state_dicts)
-torch.save(merged_state_dict, CHECKPOINT_DIR / "merged.pt")
+def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str) -> None:
 ```
+where `checkpoint_files` is a list of checkpoint files to merge, and `output_file` is the output file path.
 
 ## Limitation
 

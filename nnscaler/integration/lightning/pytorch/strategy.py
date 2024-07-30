@@ -81,6 +81,12 @@ class NnScalerStrategy(ParallelStrategy):
     """
     strategy_name = "nnscaler"
     _registered_strategies: List[str] = []
+    _nnscaler_extra_state_key = 'nnscaler-extra-state'
+    _state_dict_type_key = 'state-dict-type'
+    _pl_module_name_key = 'pl_state_dict'  # save some extra pl module states
+    _pmodule_attr_name = 'nnscaler_pmodule'
+    _module_name_key = 'state_dict'
+    _opt_name_key = 'optimizer_states'
 
     def __init__(
         self,
@@ -116,12 +122,6 @@ class NnScalerStrategy(ParallelStrategy):
             raise ValueError("The `pas_policy` must be provided to the `NnScalerStrategy`.")
 
         self._state_dict_type = state_dict_type
-        self._nnscaler_extra_state_key = 'nnscaler-extra-state'
-        self._state_dict_type_key = 'state-dict-type'
-        self._pl_module_name_key = 'pl_state_dict'  # save some extra pl module states
-        self._pmodule_attr_name = 'nnscaler_pmodule'
-        self._module_name_key = 'state_dict'
-        self._opt_name_key = 'optimizer_states'
 
     @override
     def setup_environment(self) -> None:
@@ -507,7 +507,13 @@ class NnScalerStrategy(ParallelStrategy):
         assert self.model is not None
         assert self.lightning_module is not None
 
-        state_dict: dict = torch.load(path / f'{self.global_rank}.pt')
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint file {path} not found.")
+
+        if path.is_dir():
+            state_dict: dict = torch.load(path / f'{self.global_rank}.pt')
+        else:
+            state_dict: dict = torch.load(path)
         nnscaler_extra_state = state_dict.pop(self._nnscaler_extra_state_key)
         # load the extra states of the pl module
         self._lightning_module.load_state_dict(nnscaler_extra_state[self._pl_module_name_key], strict=False)
@@ -524,14 +530,42 @@ class NnScalerStrategy(ParallelStrategy):
         module = getattr(self._lightning_module, self._pmodule_attr_name)
         optimizer = self.optimizers[0] if self.optimizers else None
 
-        if state_dict_type == "deduped":
+        if state_dict_type == 'merged':
+            nnscaler.load_merged_state_dict(module, module_dict, optimizer, optimizer_dict)
+        elif state_dict_type == "deduped":
             nnscaler.load_deduped_state_dict(module, module_dict, optimizer, optimizer_dict)
-        else:
-            module.load_state_dict(module_dict)
-            if optimizer_dict is not None:
-                optimizer.load_state_dict(optimizer_dict)
+        else:  # sharded
+            nnscaler.load_sharded_state_dict(module, module_dict, optimizer, optimizer_dict)
 
         return state_dict
+
+    @classmethod
+    def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str) -> None:
+        """
+        Merge the checkpoint files into a single checkpoint file.
+
+        Args:
+            checkpoint_files: The list of checkpoint files to merge.
+            output_file: The output file path.
+        """
+        state_dicts = [torch.load(f, map_location='cpu') for f in checkpoint_files]
+
+        module_state_dicts = [s[cls._module_name_key] for s in state_dicts]
+        opt_state_dicts = None
+        if cls._opt_name_key in state_dicts[0]:
+            opt_state_dicts = [s[cls._opt_name_key][0] for s in state_dicts]
+
+        merged_module_state_dict, merged_opt_state_dict = nnscaler.merge_state_dicts(
+            module_state_dicts,
+            opt_state_dicts
+        )
+        merged_state_dict = state_dicts[0]
+        # reuse all states from the first checkpoint except the module and optimizer states
+        merged_state_dict[cls._module_name_key] = merged_module_state_dict
+        merged_state_dict[cls._opt_name_key] = [merged_opt_state_dict]
+        merged_state_dict[cls._nnscaler_extra_state_key][cls._state_dict_type_key] = 'merged'
+
+        torch.save(merged_state_dict, output_file)
 
     @classmethod
     @override
