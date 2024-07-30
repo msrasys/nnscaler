@@ -94,6 +94,10 @@ def tp_policy(graph: IRGraph, resource, ngpus_per_unit: int):
             graph.assign(sub_node, idx)
         return sub_nodes
 
+    # loss partition
+    for loss in graph.select(name='sum'):
+        tensor_parallelism(loss, idx=0, dim=0, num=ngpus)
+
     l1, l2, l3, l4 = graph.select(name='linear')
 
     # l1 tensor parallelism

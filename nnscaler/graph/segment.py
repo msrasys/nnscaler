@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from typing import Dict, Union, List, Optional, Set, Tuple, Any, Callable
 import numpy as np
+import logging
 
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
 from nnscaler.ir.cten import IRTensor, IRCell, IRObject
@@ -9,6 +10,9 @@ from nnscaler.ir.adapter import IRAdapter
 
 from nnscaler.graph.function.function import MultiRef
 from nnscaler.graph.function.pyfunc import IRPyFunc
+
+
+_logger = logging.getLogger(__name__)
 
 
 class CellPosition:
@@ -358,24 +362,39 @@ class IRSegment(IRCell):
         # set for producer
         for ptensor, producer in zip(self.ptensors(ftensor), self.producers(ftensor)):
             # filter out non-autograd operators of IRPyFunc
-            if isinstance(producer, IRPyFunc): continue
+            if isinstance(producer, IRPyFunc):
+                if fgrad is not None:
+                    msg = f'nnScaler does not support backward of IRPyFunc: {producer}, ' + \
+                           'skip setting gradient, please register it as IRDimOps.'
+                    _logger.warning(msg)
+                continue
             grad = None if fgrad is None else fgrad.select(ptensor.indmap, (0, 1))
             for t in producer.find(ptensor):
                 t.grad = grad
 
         # set for consumers
-        consumers, ctensors = [], []  # consumers that require gradient
+        # We strictly follow the behavior in the fx graph. It is possible that there
+        # exists a node that consumes a tensor with gradient but generates tensors without
+        # gradient, e.g., the `.data` operation in torch. As a result, nnscaler will generate
+        # backward adapter (communications) between this consumer and its producer.
+        # According to the runtime behavior, we have
+        # case 1: there are gradients flowing in the consume full tensor. This case happens
+        #         when the full tensor is the segment output at the same time. Note in nnscaler
+        #         we will replicate segment's outputs and we will generate another adapter for
+        #         the activation -> segment output case if the two adapters are different. As a
+        #         result, the node (not matter IRDimOps or IRPyFunc, e.g., .data) should be replicated
+        #         as well. In this case, the backward adapter is correct.
+        # case 2: no gradients exist, then the backward adapter does not influence the result.
+        consumers, ctensors = [], []
         for ctensor, consumer in zip(self.ctensors(ftensor), self.consumers(ftensor)):
             itensors = consumer.find(ctensor)
             # set by default None
             for itensor in itensors:
                 itensor.grad = None
-            # filter out non-autograd operators
-            if fgrad is None: continue
-            if isinstance(consumer, IRPyFunc): continue
-            if any(isinstance(t, IRSubTensor) and t.requires_grad for t in consumer.outputs()):
+            if fgrad is not None:
                 consumers.append(consumer)
                 ctensors.append(ctensor)
+
         # set with value map
         curr_valmap = ValueMap((0, 1))
         nconsumers = len(consumers)
@@ -1001,8 +1020,8 @@ class IRSegment(IRCell):
                     inputs.add(itensor)
             for otensor in node.outputs():
                 if not isinstance(otensor, IRObject): continue
-                # if the tensor is required by segment outputs or is loss during train, set as output
-                if (isinstance(otensor, IRSubTensor) and otensor.is_loss()) or otensor in segment_outputs:
+                # if the tensor is required by segment outputs, set as output
+                if otensor in segment_outputs:
                     outputs.add(otensor)
                     continue
                 consumers, ctensors = self.consumers(otensor.parent), self.ctensors(otensor.parent)
