@@ -626,13 +626,13 @@ class ModuleCodeGen(FuncEmission):
                         if itensor.is_param():
                             code = psign.format(
                                 name=self.tensor_name(itensor),
-                                shape=tuple(itensor.shape),
+                                shape=tuple(itensor.origin_shape),
                                 dtype=itensor.dtype
                             )
                         elif itensor.is_buffer():
                             code = bsign.format(
                                 name=self.tensor_name(itensor),
-                                shape=tuple(itensor.shape),
+                                shape=tuple(itensor.origin_shape),
                                 dtype=itensor.dtype,
                                 persistent=itensor.is_persistent()
                             )
@@ -640,13 +640,16 @@ class ModuleCodeGen(FuncEmission):
                             raise RuntimeError(f"Unexpected tensor type: {itensor}")
                         self.model_init_statements.append(code)
                         slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
+                        if itensor.is_scalar_tensor():
+                            assert len(slicers) == 1 and slicers[0] == slice(0, 1), f"Unexpected slicers {slicers} for scalar tensor."
+                            slicers = '...'  # Ellipsis slicer for scalar tensor, x[...] is equivalent to x
                         val_chunks = itensor.valmap[1]
                         code = map_sign.format(
                             attr=self.tensor_name(itensor),
                             tid=itensor.parent.tid,
                             is_param=itensor.is_param(),
                             orig_name=itensor.parent.name,
-                            full_shape=tuple(itensor.parent.shape),
+                            full_shape=tuple(itensor.parent.origin_shape),
                             slicers=str(slicers),
                             val_chunks=val_chunks
                         )

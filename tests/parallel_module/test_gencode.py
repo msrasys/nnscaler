@@ -984,8 +984,11 @@ class ScalarTensorModule(torch.nn.Module):
         super().__init__()
         self.proj = torch.nn.Linear(1024, 1024, bias=False)
         self.scale = torch.nn.Parameter(torch.zeros(64))
+        self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
+        self.num_batches_tracked: torch.Tensor
 
     def forward(self, x):
+        self.num_batches_tracked.add_(1)
         x = self.proj(x)
         coef = torch.exp(torch.sum(self.scale, dim=-1))
         x = x / coef
@@ -1005,8 +1008,47 @@ def test_codegen_scalar_tensor(tmp_path):
         load_module=False,
         reuse='override',
     )
-    # parallelize will succeed.
-    assert True
+    # the code will look like this:
+    # def __init__(self, init_params=True):
+    #     super().__init__()
+    #     # communication groups
+
+    #     self.register_buffer('num_batches_tracked_33', torch.empty((), dtype=torch.int64), persistent=True)
+    #     self.add_full_map('num_batches_tracked_33', 2, False, 'num_batches_tracked', (), ..., 1)
+
+    #     self.register_parameter('proj_weight_35', torch.nn.Parameter(torch.empty((1024, 1024), dtype=torch.float32)))
+    #     self.add_full_map('proj_weight_35', 4, True, 'proj.weight', (1024, 1024), (slice(0, 1024, None), slice(0, 1024, None)), 1)
+
+    #     self.register_parameter('scale_37', torch.nn.Parameter(torch.empty((64,), dtype=torch.float32)))
+    #     self.add_full_map('scale_37', 8, True, 'scale', (64,), (slice(0, 64, None),), 1)
+
+
+    #     self._post_init(init_params)
+
+    # def segment41(self, x_43):
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 990, in forward,  self.num_batches_tracked.add_(1)
+    #     add__34 = torch.Tensor.add_(self.num_batches_tracked_33, 1)
+    #     del add__34
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 991, in forward,  x = self.proj(x)
+    #     linear_36 = torch.nn.functional.linear(x_43, self.proj_weight_35, bias=None)
+    #     del x_43
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 992, in forward,  coef = torch.exp(torch.sum(self.scale, dim=-1))
+    #     sum_1_38 = torch.sum(self.scale_37, dim=(-1,), keepdim=False)
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 992, in forward,  coef = torch.exp(torch.sum(self.scale, dim=-1))
+    #     exp_39 = torch.exp(sum_1_38)
+    #     del sum_1_38
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 993, in forward,  x = x / coef
+    #     truediv_40 = torch.div(linear_36, exp_39, rounding_mode=None)
+    #     del linear_36, exp_39
+    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 994, in forward,  return x.sum()
+    #     sum_2_32 = torch.sum(truediv_40)
+    #     del truediv_40
+    #     return sum_2_32
+
+    assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
+        r"self\.register_buffer\('num_batches_tracked_\d+', torch\.empty\(\(\), dtype=torch\.int64\), persistent=True\)")
+    assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
+        r"self\.add_full_map\('num_batches_tracked_\d+', 2, False, 'num_batches_tracked', \(\), \.\.\., 1\)")
 
 
 class ConvTranspose1DModule(torch.nn.Module):
@@ -1114,7 +1156,7 @@ def _gencode_conv2d_function_(tempdir):
     m_new = parallelize(
         Conv2DModule(weight, bias, groups=2),
         {
-            'input': torch.randn(2, 6, 32, 32), 
+            'input': torch.randn(2, 6, 32, 32),
             'groups': 2,
         },
         'dp',
