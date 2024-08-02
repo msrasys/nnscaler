@@ -50,10 +50,10 @@ class TrainStatus:
 
 @dataclass
 class _StepStat:
-    train_loss: float = None
-    val_loss: float = None
-    lr: float = None
-    gnorm: float = None
+    train_loss: Optional[float] = None
+    val_loss: Optional[float] = None
+    lr: Optional[float] = None
+    gnorm: Optional[float] = None
 
 
 class Trainer:
@@ -485,11 +485,12 @@ class Trainer:
                 self.lr_scheduler.step()
 
             if self.train_args.max_train_steps and self.num_train_steps >= self.train_args.max_train_steps:
-                logger.info(f"Reached train steps({self.train_args.max_train_steps}): Training is done.")
+                logger.info(f"Reached max train steps({self.train_args.max_train_steps}): Training is done.")
                 break
 
             next_batch_index = 0
-        else:  # not from `break`
+        else:  # not break from for loop, which means not finished with max_train_steps
+            # finished with max_epochs
             logger.info(f"Reached max_epochs({self.train_args.max_epochs}): Training is done.")
 
         self._log_finalize()
@@ -500,15 +501,20 @@ class Trainer:
         if self.dataloader['val'] is None:
             self._save_checkpoint(step_stat.train_loss)
             return
-        loss = self._validate(step_stat)
+
+        if step_stat.val_loss is None:
+            self._validate(step_stat)  # will update step_stat.val_loss internally
+
+        loss = step_stat.val_loss
         self._save_checkpoint(loss)
         if self.train_status.best_loss > loss:
             self.train_status.best_loss = loss
 
     def _validate(self, step_stat: _StepStat):
         if self.dataloader['val'] is None:
-            logger.info('No val dataset specified. Validation skipped.')
-            return step_stat.train_loss
+            logger.info('No val dataset specified. Use train_loss as val_loss.')
+            step_stat.val_loss = step_stat.train_loss
+            return step_stat.val_loss
 
         data_iter = enumerate(self._global_batch_iterator(stage='val'))
         if self.rank == 0:
@@ -556,7 +562,7 @@ class Trainer:
 
         step_stat.val_loss = loss
         self._log_metrics(asdict(step_stat), self.num_train_steps)
-        return loss
+        return step_stat.val_loss
 
     def train_epoch(self, epoch):
         VAL_STATUS_NO = 0     # not validated or saved
@@ -574,8 +580,9 @@ class Trainer:
                 disable=not self.train_args.enable_progress_bar
             )
 
-        step_stat = _StepStat()
+        step_stat: Optional[_StepStat] = None
         for idx, batches in data_iter:
+            step_stat = _StepStat()
             has_validated = VAL_STATUS_NO
             # the current batch is idx + resume_from_idx
             # `+1` because the next_batch_index is the index of the next batch
@@ -648,7 +655,6 @@ class Trainer:
                 if not has_validated:
                     self._validate_and_save(step_stat)
                     has_validated = VAL_STATUS_SAVE
-                logger.info(f"Reached max_train_steps({self.train_args.max_train_steps}): Training is done.")
                 break
 
             if not has_validated and self.train_args.val_every_n_train_steps and \
@@ -657,14 +663,16 @@ class Trainer:
                 has_validated = VAL_STATUS_VAL
             # import time
             # time.sleep(0.2)
-        else:  # not from `break`
-            if not has_validated:
-                if self.train_args.max_epochs == self.train_status.epoch + 1 \
-                    or (self.train_args.checkpoint.every_n_epochs and \
-                    (self.train_status.epoch + 1) % self.train_args.checkpoint.every_n_epochs == 0):
-                    self._validate_and_save(step_stat)
-                    has_validated = VAL_STATUS_SAVE
-                elif self.train_args.val_every_n_epochs and \
-                    (self.train_status.epoch + 1) % self.train_args.val_every_n_epochs == 0:
-                    self._validate(step_stat)
-                    has_validated = VAL_STATUS_VAL
+        else:  # not finished with max_train_steps
+            if step_stat is None:
+                return  # no train step runs. No need to save checkpoint
+            if has_validated < VAL_STATUS_SAVE and \
+                self.train_args.max_epochs == self.train_status.epoch + 1 \
+                or (self.train_args.checkpoint.every_n_epochs and \
+                (self.train_status.epoch + 1) % self.train_args.checkpoint.every_n_epochs == 0):
+                self._validate_and_save(step_stat)
+                has_validated = VAL_STATUS_SAVE
+            if not has_validated and self.train_args.val_every_n_epochs and \
+                (self.train_status.epoch + 1) % self.train_args.val_every_n_epochs == 0:
+                self._validate(step_stat)
+                has_validated = VAL_STATUS_VAL

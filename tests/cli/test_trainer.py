@@ -197,3 +197,32 @@ def trainer_resume_worker(save_dir, save_type, bf16):
 @pytest.mark.parametrize('bf16', [True, False, 'Mixed'])
 def test_trainer_resume(tmp_path, save_type, bf16):
     launch_torchrun(4, trainer_resume_worker, tmp_path, save_type, bf16)
+
+
+def trainer_last_checkpoint_worker(save_dir):
+    save_dir = Path(save_dir)
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    gen_savedir = save_dir / 'gen'
+    ckpt_savedir = save_dir / 'ckpt'
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--max_epochs', '1',
+        '--global_batch_size', '4',  # mini_batch_size=2, update_freq=2
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '1',
+        '--val_every_n_train_steps', '1',
+        '--checkpoint.every_n_train_steps', '15',
+        '--checkpoint.save_dir', str(ckpt_savedir),
+    ])
+    trainer.train()
+
+    torch.distributed.barrier()
+    # make sure the last checkpoint is saved.
+    assert (ckpt_savedir / '0000-0025' / f'{trainer.rank}.ckpt').exists()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_trainer_last_checkpoint(tmp_path):
+    launch_torchrun(1, trainer_last_checkpoint_worker, tmp_path)
