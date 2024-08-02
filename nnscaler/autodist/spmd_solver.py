@@ -816,8 +816,11 @@ class SPMDSolver:
                 transient_mem_cost = transient_mem[0]
             else:
                 transient_mem_cost = transient_mem[0] + transient_mem[1]
-            if self.autodist_config.is_train:
-                transient_mem_cost *= 2
+            transient_mem_cost *= self.autodist_config.transient_mem_coef
+            if not self.autodist_config.is_train:
+                transient_mem_cost /= 2
+        else:
+            transient_mem_cost = 0
         cost += transient_mem_cost
         return ModuleMemCostDesc(cost, mem, act_mem, opt_transient_mem, recompute_mem_cost, transient_mem_cost)
 
@@ -1021,9 +1024,9 @@ class SPMDSolver:
         prob += act_mem <= max_act_opt_transient
         prob += opt_transient_mem <= max_act_opt_transient
         if self.autodist_config.is_train:
-            transient_coef = 4
+            transient_coef = 2 * self.autodist_config.transient_mem_coef
         else:
-            transient_coef = 2
+            transient_coef = self.autodist_config.transient_mem_coef
         prob += mem - act_mem + max_act_opt_transient + transient_coef * max_transient + recompute_mem <= self.mem_bound
 
         # 4.3. constraint over e
@@ -1134,7 +1137,8 @@ class SPMDSolver:
 
         if self.autodist_config.memory_granularity < 1024:
             raise RuntimeError('dp solver assumes the memory granularity is at least 1024 bytes')
-        buf_mul = 2 if self.is_train else 1
+        buf_mul = self.autodist_config.transient_mem_coef
+        if not self.is_train: buf_mul /= 2
         mem_divisor = self.autodist_config.memory_granularity
         solver = dp_solver.DPSolver(self.autodist_config.verbose, self.mem_bound // mem_divisor, topk)
         for start, end in intervals:
@@ -1146,7 +1150,7 @@ class SPMDSolver:
             for i, partition in enumerate(self._op_partitions[idx]):
                 p_cost_desc = self.partition_info[idx][i]
                 solver.add_partition(idx, i, p_cost_desc.comp_time + p_cost_desc.weight_update_time,
-                p_cost_desc.mem // mem_divisor, p_cost_desc.in_mem // mem_divisor, buf_mul * p_cost_desc.transient_mem // mem_divisor,
+                p_cost_desc.mem // mem_divisor, p_cost_desc.in_mem // mem_divisor, int(buf_mul * p_cost_desc.transient_mem // mem_divisor),
                 p_cost_desc.activation_mem // mem_divisor, p_cost_desc.opt_transient_mem // mem_divisor,
                 self.p_fathers[idx][i], p_cost_desc.comm_time)
         solver.solve()

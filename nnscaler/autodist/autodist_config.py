@@ -102,6 +102,11 @@ class AutoDistConfig:
         The solver to use in spmd parallelism. Currently only support
         `'dp'` (dynamic programming)
         `'ilp'` (integer linear programming).
+    - transient_mem_coef (`float`, *optional*, defaults to `2`):
+        In autodist, a heuristic is used to estimate the transient memory size:
+        `transient_mem_size = opt_transient_coef * (1st_largest_infer_mem + 2nd_largest_infer_mem)`. This formula
+        is useful in many cases, but it may be too strict when some operators consume or generate a large tensor
+        (>= 4GB). In this case, you can set `transient_mem_coef` to a smaller value to relax the constraint.
     """
 
     def __init__(self,
@@ -135,6 +140,7 @@ class AutoDistConfig:
                  max_pipeline_bubble_ratio=0.4,
                  max_pipeline_unbalance_ratio=0.5,
                  solver='ilp',
+                 transient_mem_coef=2,
                  **kwargs):
         self.pc_path = partition_constraints_path
         self.profile_dir = profile_dir
@@ -169,6 +175,7 @@ class AutoDistConfig:
         self.max_pipeline_bubble_ratio = max_pipeline_bubble_ratio
         self.max_pipeline_unbalance_ratio = max_pipeline_unbalance_ratio
         self.solver = solver
+        self.transient_mem_coef = transient_mem_coef
 
         ignored_keys = list(kwargs.keys())
         if ignored_keys:
