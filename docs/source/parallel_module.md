@@ -590,6 +590,8 @@ The configuration of the PAS policy should be passed in the `pas_config` of `Com
     - `recompute_modules (str)`: The module names to recompute, separated by `,`. For example, `module1,module2`. Optional.
     - `pipeline_pivots (str)`: The module names to pivot the pipeline, separated by `,`. For example, if `module1,module2` is specified, stages searched by pipeline solver only start from either `module1` or `module2`. Optional.
     - `use_apex_fused_adam_v2`: If set to `True`, the apex fused adam v2 optimizer will be used. Default is `False`. Optional.
+    - `parallel_profile`: If set to `True`, autodist will profile operators in parallel by using available gpus. Default is `True`. Optional.
+    - `max_partition_degree`: Max degree when partitioning an operator / node. When pipeline parallelism is enbaled (`use_pipeline` is True), user can change the value to constrain the plan to be composed of stages that span on less or equal to `max_partition_degree` devices (recommend to set `max_partition_degree` to the number of devices in a node to avoid inter-node communication, but should be be no more than `plan_ngpus`). Default is `plan_ngpus`. Optional.
 
 Please note all options to `autodist` are just suggestions. `autodist` will try to find the best partition for you, which may not be the same with your suggestions.
 

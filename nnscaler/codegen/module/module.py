@@ -462,6 +462,7 @@ class ModuleCodeGen(FuncEmission):
             class_name='GenModel',
             derived=[f'nnscaler.runtime.module.{"ParallelModule" if as_parallel_module else "CubeModule"}']
         ) as cb:
+            cb.insert_body(f'use_scheduler = {self.execplan.graph.sched is not None}')
             if as_parallel_module:
                 cb.insert_body(f'rank = {device}')  # save rank in class level
                 with FunctionBlock(func_name='__init__', args=['self', 'init_params=True']) as ib:
@@ -707,9 +708,9 @@ class ModuleCodeGen(FuncEmission):
         """
         Emit IRSegment code.
 
-        The resultant `List[str]` will be lines of the statements of the final
+        The returned `List[str]` will be lines of the statements of the final
         Python method for the targeted Segment.
-        The resultant lines will not include the signature and the return statement
+        The returned lines will not include the signature and the return statement
         of the generated Python method. These lines will be put into `model_methods_bodies`
         and the missing Python-syntactic parts will be injected later on.
 

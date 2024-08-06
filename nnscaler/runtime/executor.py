@@ -9,6 +9,8 @@ import logging
 
 _logger = logging.getLogger(__name__)
 
+_ALLOW_GRAD_DTYPES = (torch.double, torch.float32, torch.float16, torch.bfloat16)
+
 
 def debug_id(tensors, msg: str, rank: int):
     if torch.distributed.get_rank() == rank:
@@ -113,11 +115,10 @@ class Executor:
                 outputs = subgraph(*input_tensors)
         else:
             outputs = subgraph(*input_tensors)
-            allow_grad_dtypes = (torch.float32, torch.float16)
-            if torch.is_tensor(outputs) and outputs.dtype in allow_grad_dtypes:
+            if isinstance(outputs, tuple):
+                outputs = (t.requires_grad_() if torch.is_tensor(t) and t.dtype in _ALLOW_GRAD_DTYPES else t for t in outputs)
+            elif torch.is_tensor(outputs) and outputs.dtype in _ALLOW_GRAD_DTYPES:
                 outputs = outputs.requires_grad_()
-            else:
-                outputs = (t.requires_grad_() if t.dtype in allow_grad_dtypes else t for t in outputs)
         return outputs
 
     @staticmethod

@@ -410,7 +410,7 @@ class IRAdapterGener:
                     fadapters.append(fadapter)
 
             # (activation -> graph/segment output) generation: generate communication adapters between
-            # producer operatiors and graph/segment output tensors. Note graph/segment output tensors
+            # producer operators and graph/segment output tensors. Note graph/segment output tensors
             # always require for full-shape/value for output, while consumers may partition them. Therefore,
             # we need to additionally generate adapters for this case.
             if ftensor in output_consumer:

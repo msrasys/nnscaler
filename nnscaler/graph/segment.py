@@ -965,7 +965,7 @@ class IRSegment(IRCell):
     def create_segment(self, nodes: List[IRCell], attr_as_inputs: bool = False) -> IRCell:
         """Create a segment (sub-graph) with part of the nodes.
 
-        This only return the created segment wihout modifying the graph.
+        This only return the created segment without modifying the graph.
 
         Calling this requires that the dependencies are already materialized,
         i.e., every input IRSubTensor should have a corresponding producer. Two scenarios
@@ -1045,7 +1045,7 @@ class IRSegment(IRCell):
 
     def dispatch(self, devid: int, _gen_mirror: bool = True) -> Optional[IRCell]:
         """
-        Instantiate the segement to a specific device.
+        Instantiate the segment to a specific device.
 
         @param devid int: the target device
 
@@ -1057,17 +1057,11 @@ class IRSegment(IRCell):
             return self
         if devid in self._dispatch_cached:
             return self._dispatch_cached[devid]
-        # inputs, outputs, nodes = [], [], []
+
         inputs, outputs, nodes = self.inputs(), self.outputs(), []
         for node in self._nodes:
             if devid in node.device:
                 nodes.append(node.dispatch(devid))
-                # for itensor in node.inputs():
-                #     if itensor in self._inputs and itensor not in inputs:
-                #         inputs.append(itensor)
-                # for otensor in node.outputs():
-                #     if otensor in self._outputs and otensor not in outputs:
-                #         outputs.append(otensor)
 
         def order(tensors: Set[IRObject]) -> Tuple[IRObject]:
             """Reorder by logical tensor id. Temporally necessary for pipeline scheduling"""

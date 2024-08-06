@@ -56,7 +56,7 @@ def _piecewise_estimator(xs: List[float], ys: List[float], x: float) -> float:
     raise RuntimeError(f'x={x}, xs={xs}, ys={ys}, should not reach here')
 
 
-def _filter_and_group_nodes(graph: IRGraph, db: ProfileDataBase) -> List[List[IRFwOperation]]:
+def _filter_nodes(graph: IRGraph, db: ProfileDataBase) -> List[List[IRFwOperation]]:
     visited_nodes = set()
     node_to_profile = list()
     for node in graph.select(ntype=IRFwOperation):
@@ -67,26 +67,17 @@ def _filter_and_group_nodes(graph: IRGraph, db: ProfileDataBase) -> List[List[IR
             continue
         node_to_profile.append(node)
         visited_nodes.add(hash_code)
+    return node_to_profile
 
-    dev_num = torch.cuda.device_count()
 
-    # divide `node_to_profile` into `dev_num` groups
-    node_groups = [[] for _ in range(dev_num)]
+def _group_nodes(node_to_profile: List[IRFwOperation], group_num: int) -> List[List[IRFwOperation]]:
+    node_groups = [[] for _ in range(group_num)]
     for i, node in enumerate(node_to_profile):
-        node_groups[i % dev_num].append(node)
+        node_groups[i % group_num].append(node)
     return node_groups
 
 
-def _profile_nodes(dilled_info: str, dev_id: int, partition_degree: int, re_profile: bool, comp_profile_path: str, result: multiprocessing.Queue):
-    import dill
-    torch.cuda.set_device(dev_id)
-
-    id_state, dilled_graph = dill.loads(dilled_info)
-    graph = IRGraph.from_dill(id_state, dilled_graph)
-    db = ProfileDataBase()
-    db.load_ops(comp_profile_path)
-    nodes = _filter_and_group_nodes(graph, db)[dev_id]
-
+def _profile_nodes(nodes: List[IRFwOperation], db: ProfileDataBase, partition_degree: int, re_profile: bool):
     ret = list()
     for node in nodes:
         if isinstance(node, IRDimops):
@@ -99,6 +90,20 @@ def _profile_nodes(dilled_info: str, dev_id: int, partition_degree: int, re_prof
         for partition_node in partition_nodes:
             profiled_metrics: ProfiledMetrics = db.profile(partition_node, override=re_profile)
             ret.append((partition_node.signature, db._serialize(partition_node), profiled_metrics))
+    return ret
+
+
+def _profile_graph(dilled_info: str, dev_id: int, partition_degree: int, re_profile: bool, comp_profile_path: str, result: multiprocessing.Queue):
+    import dill
+    torch.cuda.set_device(dev_id)
+
+    id_state, dilled_graph = dill.loads(dilled_info)
+    graph = IRGraph.from_dill(id_state, dilled_graph)
+    db = ProfileDataBase()
+    db.load_ops(comp_profile_path)
+    node_to_profile = _filter_nodes(graph, db)
+    nodes = _group_nodes(node_to_profile, group_num=torch.cuda.device_count())[dev_id]
+    ret = _profile_nodes(nodes, db, partition_degree, re_profile)
     _logger.info(f'device {dev_id} finished profiling {len(nodes)} nodes')
     result.put(ret)
 
@@ -130,30 +135,35 @@ class CostDatabase:
         self.ignore_small_tensor_threshold = self.autodist_config.ignore_small_tensor_threshold
 
     def profile_comp(self, partition_degree: int):
+        if self.autodist_config.parallel_profile:
+            _logger.info('Profiling in parallel')
+            # use spawn to make sure the profiling process is independent from each other
+            # and the main process, this is also required by torch
+            mp_context = multiprocessing.get_context('spawn')
 
-        # use spawn to make sure the profiling process is independent from each other
-        # and the main process, this is also required by torch
-        mp_context = multiprocessing.get_context('spawn')
+            results = mp_context.Queue()
+            processes = []
+            for i in range(torch.cuda.device_count()):
+                p = mp_context.Process(target=_profile_graph,
+                                       args=(self.graph.dumps(), i, partition_degree, self.autodist_config.re_profile, self.comp_profile_path, results))
+                processes.append(p)
+                p.start()
 
-        results = mp_context.Queue()
-        processes = []
-        for i in range(torch.cuda.device_count()):
-            p = mp_context.Process(target=_profile_nodes,
-                                   args=(self.graph.dumps(), i, partition_degree, self.autodist_config.re_profile, self.comp_profile_path, results))
-            processes.append(p)
-            p.start()
+            # put queue.get() before join to avoid deadlock
+            for p in processes:
+                ret = results.get()
+                for sign, serialized, profiled_metrics in ret:
+                    _logger.debug(f'profiled {sign} in {serialized} with {profiled_metrics}')
+                    if not self.db.exist_serialized(sign, serialized):
+                        self.db.insert(sign, serialized, profiled_metrics)
+            results.close()
 
-        # put queue.get() before join to avoid deadlock
-        for p in processes:
-            ret = results.get()
-            for sign, serialized, profiled_metrics in ret:
-                _logger.debug(f'profiled {sign} in {serialized} with {profiled_metrics}')
-                if not self.db.exist_serialized(sign, serialized):
-                    self.db.insert(sign, serialized, profiled_metrics)
-        results.close()
-
-        for p in processes:
-            p.join()
+            for p in processes:
+                p.join()
+        else:
+            _logger.info('Profiling in serial')
+            node_to_profile = _filter_nodes(self.graph, self.db)
+            _profile_nodes(node_to_profile, self.db, partition_degree, self.autodist_config.re_profile)
 
         self.db.dump_ops(self.comp_profile_path, override=True)
 

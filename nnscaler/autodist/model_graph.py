@@ -90,14 +90,15 @@ def estimate_mem_lower_bound(
     1. activations, parameters, buffers and gradients are distributed evenly across plan_ngpus
     2. the optimizer memory is distributed evenly across zero_group_size (when zero stage 1 is enabled) or plan_ngpus
     '''
+    opt_resident_mem = cfg.opt_resident_coef * param_mem
+    opt_transient_mem = cfg.opt_transient_coef * param_mem
+
     # avg memory cost of activation, param (grad), buffer
     activation_mem = activation_mem / plan_ngpus
     param_mem = param_mem / plan_ngpus
     buffer_mem = buffer_mem / plan_ngpus
 
     # avg opt mem
-    opt_resident_mem = cfg.opt_resident_coef * param_mem
-    opt_transient_mem = cfg.opt_transient_coef * param_mem
     if cfg.zero_stage == 1:
         opt_resident_mem = opt_resident_mem / zero_group_size
         opt_transient_mem = opt_transient_mem / zero_group_size

@@ -149,7 +149,7 @@ class ExecutionPlan:
             assert isinstance(block, IRCell)
             topo_seqs.append(block)
 
-        # set up returning outputs by packing output results from each micro-batch into a list
+        # set up returned outputs by packing output results from each micro-batch into a list
         outputs = []
         for mid in range(schedplan.nmicros):
             outs = []

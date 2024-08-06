@@ -207,9 +207,12 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         raise ValueError("pipeline_nmicros should be equal to update_freq")
 
     # optional parameters
-    mesh_col = pas_cfg.get('mesh_col', cfg.plan_ngpus)
-    if mesh_col != cfg.plan_ngpus:
-        raise ValueError("mesh_col should be equal to plan_ngpus")
+    mesh_col = pas_cfg.get('max_partition_degree', cfg.plan_ngpus)
+    if cfg.plan_ngpus % mesh_col != 0:
+        raise ValueError(f"plan_ngpus {cfg.plan_ngpus} should be divisible by max_partition_degree {mesh_col}")
+    mesh_row = cfg.plan_ngpus // mesh_col
+    if not cfg.use_pipeline and mesh_row != 1:
+        raise ValueError("mesh_row should be 1 if pipeline is not enabled")
     memory_constraint = pas_cfg.get('mem_constraint', -1)
     task_name = pas_cfg.get('task_name', '_')
     use_memory_efficient_fp16 = pas_cfg.get('use_memory_efficient_fp16', False)
@@ -224,10 +227,9 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     recompute_modules = pas_cfg.get('recompute_modules', '')
     pipeline_pivots = pas_cfg.get('pipeline_pivots', '')
     use_apex_fused_adam_v2 = pas_cfg.get('use_apex_fused_adam_v2', False)
+    parallel_profile = pas_cfg.get('parallel_profile', True)
 
-    mesh_row = 1
-    ngpus = mesh_row * mesh_col
-    task_name = f'{task_name}_{ngpus}gpus_{update_freq}update_freq'
+    task_name = f'{task_name}_{cfg.plan_ngpus}gpus_{update_freq}update_freq'
     if memory_constraint == -1:
         # consider memory fragmentation and other buffers, use 80% of the memory
         memory_constraint = int(0.8 * torch.cuda.mem_get_info()[1] / 1024 /
@@ -289,6 +291,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         pipeline=cfg.use_pipeline,
         pipeline_pivots=pipeline_pivots,
         pipeline_nstages=cfg.pipeline_nstages,
+        parallel_profile=parallel_profile,
     )
 
     return parallelize_graph(graph, autodist_cfg)

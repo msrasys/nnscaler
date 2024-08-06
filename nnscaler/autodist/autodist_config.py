@@ -92,16 +92,19 @@ class AutoDistConfig:
         is specified, stages searched by pipeline solver only start from either `module1` or `module2`.
     - pipeline_nstages(`int`, *optional*, defaults to `1`):
         The number of stages in pipeline parallelism. This option is only used when pipeline is True.
-    - max_pipeline_bubble_ratio (`float`, *optional*, defaults to `0.4`):
+    - max_pipeline_bubble_ratio (`float`, *optional*, defaults to `0.2`):
         The maximum bubble ratio in pipeline parallelism. The higher the ratio, the more bubbles will be allowed,
         the larger search space will be explored.
     - max_pipeline_unbalance_ratio (`float`, *optional*, defaults to `0.5`):
-        The maximum unbalance ratio in pipeline parallelism. The higher the ratio, the more unbalance is required,
-        the smaller search space will be explored.
-    - solver (`str`, *optional*, defaults to `'ilp'`):
+        The maximum unbalance ratio in pipeline parallelism. This is a metric control min_pipeline_stage_time / max_pipeline_stage_time.
+        The higher the ratio, the more balance is required, the smaller search space will be explored.
+    - solver (`str`, *optional*, defaults to `'dp'`):
         The solver to use in spmd parallelism. Currently only support
         `'dp'` (dynamic programming)
         `'ilp'` (integer linear programming).
+    - parallel_profile (`bool`, *optional*, defaults to `True`):
+        Whether to profile on multiple device in parallel. If set to `False`, the profiling will be done in a
+        single device sequentially.
     - transient_mem_coef (`float`, *optional*, defaults to `2`):
         In autodist, a heuristic is used to estimate the transient memory size:
         `transient_mem_size = opt_transient_coef * (1st_largest_infer_mem + 2nd_largest_infer_mem)`. This formula
@@ -137,9 +140,10 @@ class AutoDistConfig:
                  pipeline=False,
                  pipeline_pivots='',
                  pipeline_nstages=1,
-                 max_pipeline_bubble_ratio=0.4,
+                 max_pipeline_bubble_ratio=0.2,
                  max_pipeline_unbalance_ratio=0.5,
-                 solver='ilp',
+                 solver='dp',
+                 parallel_profile=True,
                  transient_mem_coef=2,
                  **kwargs):
         self.pc_path = partition_constraints_path
@@ -175,6 +179,12 @@ class AutoDistConfig:
         self.max_pipeline_bubble_ratio = max_pipeline_bubble_ratio
         self.max_pipeline_unbalance_ratio = max_pipeline_unbalance_ratio
         self.solver = solver
+        if pipeline and solver != 'dp':
+            _logger.warning(
+                f'pipeline is enabled, but solver is not dp, set solver to dp'
+            )
+            self.solver = 'dp'
+        self.parallel_profile = parallel_profile
         self.transient_mem_coef = transient_mem_coef
 
         ignored_keys = list(kwargs.keys())

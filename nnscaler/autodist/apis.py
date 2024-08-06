@@ -155,7 +155,7 @@ def parallelize_graph(graph: IRGraph,
                             )
                         (p_idx, p_dim), p_num = stage_desc.partition_descs[
                             consumer.cid].desc[0]
-                        if p_idx != -1 and consumer.inputs()[p_dim] == ftensor:
+                        if p_idx != -1 and consumer.inputs()[p_idx] == ftensor:
                             raise RuntimeError(
                                 f'node {consumer} has partitioned input {ftensor}'
                             )

@@ -1112,7 +1112,7 @@ class SPMDSolver:
         for i in range(start, end + 1):
             plans.append((i, s_val[i - start]))
         mem_cost = self.calc_mem_cost(plans).total_cost
-        return SPMDSearchOutput(self.partition_path2desc(plans),
+        return SPMDSearchOutput(self.build_tp_desc(plans),
                                 mem_cost / 1024 / 1024 / 1024, all_time_cost,
                                 self.calc_inner_time_cost(plans))
 
@@ -1159,7 +1159,7 @@ class SPMDSolver:
             cpp_results = solver.get_results(start, end)
             descs = []
             for result in cpp_results:
-                desc = self.partition_path2desc(result.path)
+                desc = self.build_tp_desc(result.path)
                 descs.append(SPMDSearchOutput(desc, result.memory * mem_divisor / 1024 / 1024 / 1024, result.all_time, self.calc_inner_time_cost(result.path)))
             ret.append(descs)
         return ret
@@ -1329,18 +1329,41 @@ class SPMDSolver:
             raise RuntimeError(
                 f'unsupported solver {self.autodist_config.solver}')
 
+
+    def node_desc2idx(self, node_idx: int, node_desc: NodePartitionDesc) -> int:
+        '''
+        convert the node partition description to the corresponding index
+
+        Args:
+            node_idx (int): the index of the node
+            node_desc (NodePartitionDesc): the partition description of the node
+
+        Returns:
+            int: the index of the partition
+        '''
+        for i, p in enumerate(self._op_partitions[node_idx]):
+            op = p.operator
+            p_info = tuple([
+                (op.dim_id2pos(dim), num)
+                for dim, num in zip(p.partition_dims, p.partition_nums)
+            ])
+            if p_info == node_desc.desc:
+                return i
+        raise RuntimeError(f'fail to find the partition {node_desc} for node {self.get_operator(node_idx)}')
+
+
     def partition_path2desc(
-            self, plans: List[Tuple[int, int]]) -> Dict[int, NodePartitionDesc]:
+            self, plan: List[Tuple[int, int]]) -> Dict[int, NodePartitionDesc]:
         '''
         convert the partition representation: (op_idx, partition_idx) to (op_cid, partition_desc)
 
         Args:
-            plans (List[Tuple[int, int]]): the partition plan to be converted
+            plan (List[Tuple[int, int]]): the partition plan to be converted
 
         Returns:
             Dict[int, NodePartitionDesc]: the converted partition plan
         '''
-        partitions = [self._op_partitions[u][v] for u, v in plans]
+        partitions = [self._op_partitions[u][v] for u, v in plan]
 
         partition_descs = {}
         for p in partitions:
@@ -1351,10 +1374,23 @@ class SPMDSolver:
             ])
             partition_descs[op.ir_cell.cid] = NodePartitionDesc(desc=p_info)
 
-        return TensorParallelDesc(partition_descs=partition_descs,
+        return partition_descs
+
+
+    def build_tp_desc(self, plan: List[Tuple[int, int]]) -> TensorParallelDesc:
+        '''
+        build the tensor parallelism description for the plan
+
+        Args:
+            plan (List[Tuple[int, int]]): the plan to be converted
+
+        Returns:
+            TensorParallelDesc: the tensor parallelism description
+        '''
+        return TensorParallelDesc(partition_descs=self.partition_path2desc(plan),
                                   mesh_desc=self.mesh_desc,
                                   recompute_groups=[],
-                                  analysis=self.analyze_plan(plans))
+                                  analysis=self.analyze_plan(plan))
 
 
 def analysis_pretty_printer(analysis: Dict[str, Any]) -> str:
