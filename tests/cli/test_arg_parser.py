@@ -171,3 +171,17 @@ def test_deserialize_union():
     x = parse_args(['--p.a=1', '--p.b=b'])
     y = deserialize_dataclass(x, A)
     assert y.p == {'a': 1, 'b': 'b'}  # Dict[str, str] is ignored. so '1' will be converted to int
+
+
+def test_deserialize_value_type():
+    @dataclass
+    class A:
+        p: Any = None
+
+    x = parse_args(['--p.__value_type=int', '--p.value=1'])
+    y = deserialize_dataclass(x, A)
+    assert y.p == {'__value_type': 'int', 'value': '1'}
+
+    x = parse_args(['--p.value=1'])
+    y = deserialize_dataclass(x, A)
+    assert y.p == {'value': 1}

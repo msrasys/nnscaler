@@ -63,17 +63,14 @@ class MixedPrecisionF16OptimizerMixin:
         assert 'exp_avg' in state_dict['state'][0], f'currently only verified for adam-like optimizer'
         for key, value in state_dict['state'].items():
             assert self.fp32_params[key].shape == value['exp_avg'].shape, f'Shape mismatch: {value["exp_avg"].shape} vs {self.fp32_params[key].shape}'
-            value['fp32_params'] = self.fp32_params[key]
+            # .detach(): save tensor instead of Parameter.
+            value['fp32_params'] = self.fp32_params[key].detach()
 
         return state_dict
 
     def load_state_dict(self, state_dict):
         """Load an optimizer state dict.
-
-        In general we should prefer the configuration of the existing optimizer
-        instance (e.g., learning rate) over that found in the state_dict. This
-        allows us to resume training from a checkpoint using a new set of
-        optimizer args.
+        This will also load the fp32_params from the state
         """
         if 'state' in state_dict and len(state_dict['state']) > 0 and 'fp32_params' in state_dict['state'][0]:
             logger.info('try to load fp32_params from state_dict in f16_optimizer')

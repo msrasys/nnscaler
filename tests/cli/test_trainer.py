@@ -6,6 +6,7 @@ import pytest
 import torch.distributed
 
 from nnscaler.cli.trainer import Trainer
+from nnscaler.cli.trainer_args import AggregatedOutputs
 from tests.parallel_module.common import assert_equal
 from ..launch_torchrun import launch_torchrun
 
@@ -66,6 +67,7 @@ def trainer_resume_worker(save_dir, save_type, bf16):
     optimizer_type = 'nnscaler.runtime.f16_optimizer.MixedPrecisionAdam' \
         if bf16 == 'Mixed' \
         else 'torch.optim.Adam'
+    use_zero = save_type == 'sharded'
 
     trainer = Trainer([
         '-f', config_path,
@@ -76,6 +78,7 @@ def trainer_resume_worker(save_dir, save_type, bf16):
         '--gen_savedir', str(gen_savedir),
         '--compute_config.plan_ngpus', '2',
         '--compute_config.runtime_ngpus', '4',
+        '--compute_config.use_zero', str(use_zero),
         '--checkpoint.save_type', save_type,
         '--checkpoint.save_dir', str(ckpt_savedir),
         '--checkpoint.resume_from', 'last',
@@ -98,6 +101,7 @@ def trainer_resume_worker(save_dir, save_type, bf16):
         '--gen_savedir', str(gen_savedir),
         '--compute_config.plan_ngpus', '2',
         '--compute_config.runtime_ngpus', '4',
+        '--compute_config.use_zero', str(use_zero),
         '--checkpoint.save_type', save_type,
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--checkpoint.resume_from', 'last',
@@ -124,6 +128,7 @@ def trainer_resume_worker(save_dir, save_type, bf16):
         '--gen_savedir', str(gen_savedir),
         '--compute_config.plan_ngpus', '2',
         '--compute_config.runtime_ngpus', '4',
+        '--compute_config.use_zero', str(use_zero),
         '--checkpoint.save_type', save_type,
         '--checkpoint.save_dir', str(ckpt0_savedir),
         '--checkpoint.resume_from', 'last',
@@ -152,6 +157,7 @@ def trainer_resume_worker(save_dir, save_type, bf16):
         '--gen_savedir', str(gen_savedir),
         '--compute_config.plan_ngpus', '2',
         '--compute_config.runtime_ngpus', '4',
+        '--compute_config.use_zero', str(use_zero),
         '--checkpoint.save_type', save_type,
         '--checkpoint.save_dir', str(ckpt1_savedir),
         '--checkpoint.resume_from', str(ckpt1_savedir / 'merged.pt'),
@@ -226,3 +232,174 @@ def trainer_last_checkpoint_worker(save_dir):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_trainer_last_checkpoint(tmp_path):
     launch_torchrun(1, trainer_last_checkpoint_worker, tmp_path)
+
+
+_train_losses = []
+_val_losses = []
+
+
+def after_aggregate_train_step_outputs(trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', train_loss: float, idx: int) -> None:
+    _train_losses.append(train_loss)
+
+
+def after_aggregate_val_step_outputs(trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', val_loss: float, idx: int) -> None:
+    _val_losses.append(val_loss)
+
+
+def trainer_loss_reduction_worker(save_dir):
+    save_dir = Path(save_dir)
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    gen_savedir = save_dir / 'gen'
+
+    _train_losses.clear()
+    _val_losses.clear()
+    trainer = Trainer([
+        '-f', config_path,
+        '--enable_progress_bar', 'false',
+        '--max_epochs', '1',
+        '--global_batch_size', '4',  # mini_batch_size=2, update_freq=2
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '1',
+        '--val_every_n_train_steps', '1',
+        '--checkpoint.no_save', 'true',
+        '--optimizer.loss_reduction', 'mean',
+        '--hook.after_aggregate_train_step_outputs',
+            'tests.cli.test_trainer.after_aggregate_train_step_outputs',
+        '--hook.after_aggregate_val_step_outputs',
+            'tests.cli.test_trainer.after_aggregate_val_step_outputs',
+    ])
+    trainer.train()
+
+    # get a copy
+    train_loss_mean = _train_losses[:]
+    val_loss_mean = _val_losses[:]
+
+    torch.distributed.barrier()
+
+    _train_losses.clear()
+    _val_losses.clear()
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--enable_progress_bar', 'false',
+        '--max_epochs', '1',
+        '--global_batch_size', '4',  # mini_batch_size=2, update_freq=2
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '1',
+        '--val_every_n_train_steps', '1',
+        '--checkpoint.no_save', 'true',
+        '--optimizer.loss_reduction', 'sum',
+        '--hook.after_aggregate_train_step_outputs',
+            'tests.cli.test_trainer.after_aggregate_train_step_outputs',
+        '--hook.after_aggregate_val_step_outputs',
+            'tests.cli.test_trainer.after_aggregate_val_step_outputs',
+    ])
+    trainer.train()
+    torch.distributed.barrier()
+
+    assert len(train_loss_mean) == len(_train_losses)
+    assert len(val_loss_mean) == len(_val_losses)
+    for i in range(len(train_loss_mean)):
+        assert train_loss_mean[i] == _train_losses[i] / 2  # 2 is update freq
+
+    for i in range(len(val_loss_mean)):
+        assert val_loss_mean[i] == _val_losses[i]
+
+    torch.distributed.barrier()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_trainer_loss_reduction(tmp_path):
+    launch_torchrun(1, trainer_loss_reduction_worker, tmp_path)
+
+
+_before_step_grads = None
+def before_gnorm_clip(trainer: 'Trainer') -> None:
+    global _before_step_grads
+    _before_step_grads = {i: g.grad.clone() for i, g in enumerate(trainer.optimizer.param_groups[0]['params'])}
+
+
+def aggregate_outputs(loss_outputs, sync_group) -> 'AggregatedOutputs':
+    # loss is the first element of the output (or the only element)
+    losses = [
+        loss if isinstance(loss, torch.Tensor)
+        else loss[0]
+        for loss in loss_outputs
+    ]
+    loss_sum = torch.sum(torch.stack(losses), dtype=torch.float64)
+    torch.distributed.all_reduce(loss_sum, group=sync_group)
+    num_batches = torch.tensor(len(losses), device=torch.cuda.current_device())
+    torch.distributed.all_reduce(num_batches, group=sync_group)
+    num_tokens = num_batches * 2  # fake value
+
+    return AggregatedOutputs(
+        loss_sum = loss_sum.item(),
+        num_batches=num_batches.item(),
+        num_tokens=num_tokens.item(),
+    )
+
+
+def trainer_per_token_worker(save_dir):
+    save_dir = Path(save_dir)
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    gen_savedir = save_dir / 'gen'
+
+    _train_losses.clear()
+    _val_losses.clear()
+    trainer = Trainer([
+        '-f', config_path,
+        '--enable_progress_bar', 'false',
+        '--max_epochs', '1',
+        '--global_batch_size', '8',
+        '--grad_accumulation_steps', '2',
+        '--gen_savedir', str(gen_savedir),
+        '--max_train_steps', '1',
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--val_every_n_train_steps', '1',
+        '--checkpoint.no_save', 'true',
+        '--optimizer.grad_reduction', 'mean',
+        '--optimizer.aggregate_outputs_fn', 'tests.cli.test_trainer.aggregate_outputs',
+        '--hook.before_gnorm_clip',
+            'tests.cli.test_trainer.before_gnorm_clip',
+    ])
+    trainer.train()
+
+    # get a copy
+    grads = _before_step_grads
+
+    torch.distributed.barrier()
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--enable_progress_bar', 'false',
+        '--max_epochs', '1',
+        '--global_batch_size', '8',
+        '--grad_accumulation_steps', '2',
+        '--gen_savedir', str(gen_savedir),
+        '--max_train_steps', '1',
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+        '--val_every_n_train_steps', '1',
+        '--checkpoint.no_save', 'true',
+        '--optimizer.grad_reduction', 'per-token-mean',
+        '--optimizer.aggregate_outputs_fn', 'tests.cli.test_trainer.aggregate_outputs',
+        '--hook.before_gnorm_clip',
+            'tests.cli.test_trainer.before_gnorm_clip',
+    ])
+    trainer.train()
+
+    torch.distributed.barrier()
+
+    assert set(grads.keys()) == set(_before_step_grads.keys())
+    for n, p in grads.items():
+        assert torch.equal(p / 2, _before_step_grads[n])
+
+    torch.distributed.barrier()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_trainer_per_token(tmp_path):
+    launch_torchrun(2, trainer_per_token_worker, tmp_path)

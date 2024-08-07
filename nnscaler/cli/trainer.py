@@ -206,11 +206,11 @@ class Trainer:
         pmodel_class = nnscaler.parallelize(
             self.train_args.model_type,
             self._create_dummy_forward_args(),
-            self.train_args.pas_policy,
+            self.train_args.resolved_pas_policy,
             compute_config,
             module_fn=_create_model,
             gen_savedir=self.train_args.gen_savedir,
-            reuse='moo' if compile_only else 'match',
+            reuse=self.train_args.gen_reuse,
             instance_name=self.train_args.instance_name,
             broadcast_strategy='all',
             load_module=not compile_only,
@@ -382,11 +382,17 @@ class Trainer:
             else:
                 shutil.copy(ckpt_file, best_file)
 
+        torch.distributed.barrier()
         # remove old checkpoints
         local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
         # only the first rank in the group will do the job
         if self.rank % local_world_size == 0:
-            self._expire_checkpoints()
+            try:
+                self._expire_checkpoints()
+            except Exception as e:
+                logger.warning('Error when removing old checkpoints: %s. Will try later.', e)
+
+        torch.distributed.barrier()
 
     def _expire_checkpoints(self):
         if not self.train_args.checkpoint.keep_last_n_checkpoints:  # keep all
@@ -546,7 +552,7 @@ class Trainer:
                 losses = self.model.infer_step(batches)
                 self.hook.on_val_step_end(self, losses[:num_batches], batches[:num_batches], idx)
 
-            aggregate_outputs = self.train_args.aggregate_outputs or self.aggregate_outputs
+            aggregate_outputs = self.train_args.resolved_aggregate_outputs_fn or self.aggregate_outputs
             aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)
             self.hook.after_aggregate_val_step_outputs(
                 self, aggregated_outputs,
@@ -601,7 +607,7 @@ class Trainer:
             losses = self.model.train_step(batches, is_dummy_batch)
             self.hook.on_train_step_end(self, losses[:num_batches], batches[:num_batches], idx)
 
-            aggregate_outputs = self.train_args.aggregate_outputs or self.aggregate_outputs
+            aggregate_outputs = self.train_args.resolved_aggregate_outputs_fn or self.aggregate_outputs
             aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)
             if self.train_args.optimizer.loss_reduction == 'mean':
                 loss = aggregated_outputs.loss_sum / aggregated_outputs.num_batches
@@ -612,7 +618,9 @@ class Trainer:
             if self.rank == 0:
                 data_iter.set_postfix({'loss': loss})
 
+            self.hook.before_sync_grad(self)
             self.optimizer.sync_shard_grad()
+            self.hook.after_sync_grad(self)
 
             # scale gradients
             if self.train_args.optimizer.grad_reduction == 'sum':

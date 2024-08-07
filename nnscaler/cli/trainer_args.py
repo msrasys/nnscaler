@@ -1,6 +1,7 @@
 from dataclasses import asdict, dataclass, field
 import importlib
-from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING, Union, get_args
+from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING, Union
+from typing_extensions import get_args
 from pathlib import Path
 import logging
 import copy
@@ -13,10 +14,10 @@ import yaml
 import torch
 
 from nnscaler.utils import transform_recursively
-from nnscaler.parallel import ComputeConfig, build_optimizer
+from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, _PREDEFINED_POLICIES
 from nnscaler.runtime.module import ParallelModule
 
-from .arg_parser import deserialize_dataclass, merge_args, parse_args
+from .arg_parser import deserialize_dataclass, merge_args, parse_args, _TYPE_KEY, _VALUE_TYPE_KEY, _VALUE_KEY
 from .loggers.logger_base import LoggerBase
 from .train_hook import TrainHook
 
@@ -154,8 +155,8 @@ class CheckpointConfig:
     every_n_epochs: Optional[int] = None
     keep_last_n_checkpoints: Optional[int] = None
 
-    # resume training from a checkpoint folder
-    # can be 'last'/'best'/a specific folder
+    # resume training from a checkpoint folder/file
+    # can be 'last'/'best'/a specific folder/file
     # we will not resume if resume_from is last or best but the corresponding checkpoint does not exist
     resume_from: str = None
 
@@ -232,6 +233,9 @@ class HookMapConfig:
     before_zero_grad: str = None
     after_zero_grad: str = None
 
+    before_sync_grad: str = None
+    after_sync_grad: str = None
+
     before_gnorm_clip: str = None
     after_gnorm_clip: str = None
 
@@ -265,6 +269,10 @@ class TrainerArgs:
     compute_config: ComputeConfig = None
 
     gen_savedir: str = './.nnscaler'
+    # the reuse strategy of the generated code
+    # auto: automatically decide the reuse strategy (moo for compile, match for run)
+    # Or one of match/override/moo/graph (see `nnscaler.ReuseType`)
+    gen_reuse: str = 'auto'
     pas_policy: str = 'autodist'
     broadcast_strategy: str = 'all'
     instance_name: str = None
@@ -331,8 +339,18 @@ class TrainerArgs:
             raise ValueError(f"`global_batch_size` {self.global_batch_size} is not equal to `micro_batch_size*scaling_factor*grad_accumulation_steps` "
                              f"{self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps}")
 
+        if self.compute_config.use_pipeline and self.grad_accumulation_steps != self.compute_config.pipeline_nmicros:
+            raise ValueError(f"grad_accumulation_steps {self.grad_accumulation_steps} must be equal to "
+                             f"compute_config.pipeline_nmicros {self.compute_config.pipeline_nmicros}")
+
         if self.run_mode not in ('compile', 'run'):
             raise ValueError(f"Invalid run_mode {self.run_mode}")
+
+        if self.gen_reuse != 'auto':
+            if self.gen_reuse not in [e.value for e in ReuseType]:
+                raise ValueError(f"Invalid gen_reuse {self.gen_reuse}")
+        else:
+            self.gen_reuse = 'moo' if self.run_mode == 'compile' else 'match'
 
         supported_precision_type = get_args(_PRECISION_TYPE)
         supported_tensor_type = get_args(_TENSOR_TYPE)
@@ -397,19 +415,19 @@ class TrainerArgs:
     def create_kwarg(cls, value: Any):
         if isinstance(value, dict):
             value = {k: cls.create_kwarg(v) for k, v in value.items()}
-            if '__type' in value:
-                value_type = load_type(value.pop('__type'))
+            if _TYPE_KEY in value:
+                value_type = load_type(value.pop(_TYPE_KEY))
                 return value_type(**value)
-            elif '__value_type' in value:
-                if 'value' not in value:
-                    raise ValueError("value is required when __value_type is present")
-                value_type = value.pop('__value_type')
+            elif _VALUE_TYPE_KEY in value:
+                if _VALUE_KEY not in value:
+                    raise ValueError(f"`{_VALUE_KEY}` is required when `{_VALUE_TYPE_KEY}` is present")
+                value_type = value.pop(_VALUE_TYPE_KEY)
                 if value_type == 'function':  # when type is function, the value should be the full qualified name of the function
-                    return load_type(value['value'])
+                    return load_type(value[_VALUE_KEY])
                 else:
                     # call its __init__ function
                     value_type = load_type(value_type)
-                    return value_type(value['value'])
+                    return value_type(value[_VALUE_KEY])
             else:
                 return value
         elif isinstance(value, list):
@@ -424,10 +442,16 @@ class TrainerArgs:
         return load_type(self.model.type)
 
     @property
-    def aggregate_outputs(self):
+    def resolved_aggregate_outputs_fn(self):
         if not self.optimizer.aggregate_outputs_fn:
             return None
         return load_type(self.optimizer.aggregate_outputs_fn)
+
+    @property
+    def resolved_pas_policy(self):
+        if self.pas_policy in _PREDEFINED_POLICIES:
+            return self.pas_policy
+        return load_type(self.pas_policy)
 
     @property
     def scaling_factor(self):

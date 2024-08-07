@@ -101,6 +101,16 @@ class TrainHook:
         Called after zero_grad
         """
 
+    def before_sync_grad(self, trainer: 'Trainer') -> None:
+        """
+        Called before sync_shard_grad
+        """
+
+    def after_sync_grad(self, trainer: 'Trainer') -> None:
+        """
+        Called after sync_shard_grad
+        """
+
     def before_gnorm_clip(self, trainer: 'Trainer') -> None:
         """
         Called before gradient clipping
