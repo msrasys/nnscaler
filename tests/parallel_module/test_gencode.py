@@ -727,10 +727,11 @@ def test_codegen_end2end():
                 inference_only=inference_only,
                 constant_folding=constant_folding,
                 use_end2end=True,
-                use_pipeline=use_pipeline,
-                pipeline_nmicros=4,
-                pipeline_nstages=4,
-                pipeline_scheduler='infer_pipe' if inference_only else '1f1b'
+                pas_config=dict(
+                    pipeline_nmicros=4,
+                    pipeline_nstages=4,
+                    pipeline_scheduler='infer_pipe' if inference_only else '1f1b'
+                )
             ),
             gen_savedir=cube_dir,
             load_module=False,

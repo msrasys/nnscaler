@@ -51,7 +51,9 @@ def create_mesh(ngpus: int, group_num: Tuple[int]) -> Tuple[Tuple[Tuple[int]]]:
 
 
 def PASMegatron(graph: IRGraph, config: ComputeConfig):
-    num_stages = config.pipeline_nstages
+    num_stages = config.pas_config['pipeline_nstages']
+    nmicros = config.pas_config['pipeline_nmicros']
+    scheduler = config.pas_config.get('pipeline_scheduler', '1f1b')
     tp_size = config.plan_ngpus // num_stages
     _, tp_mesh = create_mesh(config.plan_ngpus, (num_stages, tp_size))
 
@@ -74,7 +76,7 @@ def PASMegatron(graph: IRGraph, config: ComputeConfig):
 
     for dl in graph.select(ntype=IRDataOperation):
         _replica(graph, dl, devs=list(range(config.plan_ngpus)))
-    config.apply_pipeline_scheduler(graph)
+    config.apply_pipeline_scheduler(graph, num_stages, nmicros, scheduler)
     return graph
 
 

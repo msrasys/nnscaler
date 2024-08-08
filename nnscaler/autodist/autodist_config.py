@@ -92,6 +92,8 @@ class AutoDistConfig:
         is specified, stages searched by pipeline solver only start from either `module1` or `module2`.
     - pipeline_nstages(`int`, *optional*, defaults to `1`):
         The number of stages in pipeline parallelism. This option is only used when pipeline is True.
+    - pipeline_scheduler (`str`, *optional*, defaults to `'1f1b'`):
+        The pipeline scheduler to use. Currently only support `'1f1b'`.
     - max_pipeline_bubble_ratio (`float`, *optional*, defaults to `0.2`):
         The maximum bubble ratio in pipeline parallelism. The higher the ratio, the more bubbles will be allowed,
         the larger search space will be explored.
@@ -140,6 +142,7 @@ class AutoDistConfig:
                  pipeline=False,
                  pipeline_pivots='',
                  pipeline_nstages=1,
+                 pipeline_scheduler='1f1b',
                  max_pipeline_bubble_ratio=0.2,
                  max_pipeline_unbalance_ratio=0.5,
                  solver='dp',
@@ -176,6 +179,9 @@ class AutoDistConfig:
         self.pipeline = pipeline
         self.pipeline_pivots = pipeline_pivots
         self.pipeline_nstages = pipeline_nstages
+        self.pipeline_scheduler = pipeline_scheduler
+        if self.pipeline_scheduler != '1f1b':
+            raise ValueError(f'pipeline scheduler {self.pipeline_scheduler} must be 1f1b')
         self.max_pipeline_bubble_ratio = max_pipeline_bubble_ratio
         self.max_pipeline_unbalance_ratio = max_pipeline_unbalance_ratio
         self.solver = solver

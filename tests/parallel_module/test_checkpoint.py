@@ -89,10 +89,11 @@ class End2EndMLP(nn.Module):
         assert compute_config.plan_ngpus == 2
         compute_config = replace(compute_config,
             use_end2end=True,
-            use_pipeline=True,
-            pipeline_nmicros=2,
-            pipeline_nstages=2,
-            pipeline_scheduler=scheduler
+            pas_config=dict(
+                pipeline_nmicros=2,
+                pipeline_nstages=2,
+                pipeline_scheduler=scheduler
+            )
         )
         return parallelize(
             cls,
@@ -132,7 +133,7 @@ class End2EndMLPWithUnusedAndShared(End2EndMLP):
 
 def train_step(model, x, y, optimizer):
     model.train()
-    if isinstance(model, ParallelModule) and model.compute_config.use_pipeline:
+    if isinstance(model, ParallelModule) and model.use_scheduler:
         # actually train_step will return two losses (for each input)
         # here we fake one loss to y_pred, so we don't need to change the check logic
         y_pred, loss = model.train_step(x)
@@ -155,7 +156,7 @@ def train_step(model, x, y, optimizer):
 def gendata(model, data_size, start, end, rank, num_replicas):
     data = []
     init_random()
-    if isinstance(model, ParallelModule) and model.compute_config.use_pipeline:
+    if isinstance(model, ParallelModule) and model.use_scheduler:
         data = End2EndMLP.gen_pipeline_data(data_size, start, end, rank, num_replicas)
     elif isinstance(model, End2EndMLP):
         data = End2EndMLP.gen_raw_data(data_size, start, end, rank, num_replicas)

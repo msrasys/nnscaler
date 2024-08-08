@@ -462,7 +462,9 @@ class ModuleCodeGen(FuncEmission):
             class_name='GenModel',
             derived=[f'nnscaler.runtime.module.{"ParallelModule" if as_parallel_module else "CubeModule"}']
         ) as cb:
-            cb.insert_body(f'use_scheduler = {self.execplan.graph.sched is not None}')
+            graph_sched = self.execplan.graph.sched
+            cb.insert_body(f'use_scheduler = {graph_sched is not None}')
+            cb.insert_body(f'nmicros_per_scheduler_step = {graph_sched.nmicros if graph_sched is not None else 1}')
             if as_parallel_module:
                 cb.insert_body(f'rank = {device}')  # save rank in class level
                 with FunctionBlock(func_name='__init__', args=['self', 'init_params=True']) as ib:

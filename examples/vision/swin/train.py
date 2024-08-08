@@ -150,9 +150,7 @@ if __name__ == '__main__':
         use_zero=args.zero,
         use_end2end=True,
         constant_folding=True,
-        use_pipeline=args.pp_size > 1,
-        pipeline_nmicros=args.gbs // args.mbs // args.dp_size,
-        pipeline_nstages=args.pp_size,
+
         pas_config={
             # customized settings that can affect code generation.
             '_pas_name': args.policy,
@@ -163,6 +161,10 @@ if __name__ == '__main__':
             # for autodist only
             'update_freq': args.gbs // args.mbs// args.dp_size,
             'use_fp16': args.fp16,
+            'explore_pipeline': args.pp_size > 1,
+            # for pp
+            'pipeline_nmicros': args.gbs // args.mbs // args.dp_size,
+            'pipeline_nstages': args.pp_size,
         },
         user_config={
             'mbs': args.mbs,

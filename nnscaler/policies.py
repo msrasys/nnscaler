@@ -117,8 +117,8 @@ def pas_pp(graph: IRGraph, cfg: 'ComputeConfig'):
     """
     pipeline parallelism inside a scale unit, and dp across scale units
     """
-    if cfg.pipeline_nstages != cfg.plan_ngpus:
-        raise ValueError("pipeline_nstages should be equal to plan_ngpus")
+    if cfg.pas_config.get('pipeline_nstages', cfg.plan_ngpus) != cfg.plan_ngpus:
+        raise ValueError("pas_pp requires pipeline_nstages == plan_ngpus")
     return pas_hybrid(graph, cfg)
 
 
@@ -155,11 +155,12 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
     """
     pipeline and tensor parallelism inside a scale unit, and dp across scale units
     """
-    if not cfg.use_pipeline:
-        raise ValueError("pipeline should be enabled")
-
+    if not cfg.use_end2end:
+        raise ValueError("Hybrid policy only supports end2end module")
     ngpus: int = cfg.plan_ngpus
-    nstages = cfg.pipeline_nstages
+    nstages = cfg.pas_config.get('pipeline_nstages', cfg.plan_ngpus)
+    nmicros = cfg.pas_config['pipeline_nmicros']
+    scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
     tp_size: int = cfg.plan_ngpus // nstages
     if ngpus % tp_size != 0:
         raise ValueError(f'invalid tp_size {tp_size} for ngpus {ngpus}')
@@ -192,26 +193,30 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
     for dl in graph.select(ntype=IRDataOperation):
         _replica(graph, dl, devs=list(range(ngpus)))
 
-    cfg.apply_pipeline_scheduler(graph)
+    cfg.apply_pipeline_scheduler(graph, nstages, nmicros, scheduler)
     return graph
 
 
 def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     pas_cfg = cfg.pas_config
 
-    # required parameters
     update_freq = pas_cfg.get('update_freq', 1)
     if isinstance(update_freq, (tuple, list)):
         update_freq = update_freq[0]
-    if cfg.use_pipeline and update_freq != cfg.pipeline_nmicros:
-        raise ValueError("pipeline_nmicros should be equal to update_freq")
 
     # optional parameters
+    explore_pipeline = pas_cfg.get('explore_pipeline', False)
+    if explore_pipeline and not cfg.use_end2end:
+        raise ValueError("explore_pipeline cannot be enabled if use_end2end is False")
+    pipeline_scheduler = pas_cfg.get('pipeline_scheduler', '1f1b')
+    if pipeline_scheduler != '1f1b':
+        raise ValueError(f"Only 1f1b scheduler is supported in autodist.")
+
     mesh_col = pas_cfg.get('max_partition_degree', cfg.plan_ngpus)
     if cfg.plan_ngpus % mesh_col != 0:
         raise ValueError(f"plan_ngpus {cfg.plan_ngpus} should be divisible by max_partition_degree {mesh_col}")
     mesh_row = cfg.plan_ngpus // mesh_col
-    if not cfg.use_pipeline and mesh_row != 1:
+    if not explore_pipeline and mesh_row != 1:
         raise ValueError("mesh_row should be 1 if pipeline is not enabled")
     memory_constraint = pas_cfg.get('mem_constraint', -1)
     task_name = pas_cfg.get('task_name', '_')
@@ -288,9 +293,8 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         zero_ngroups=zero_ngroups,
         load_plan_path=load_plan_path,
         save_plan_path=save_plan_path,
-        pipeline=cfg.use_pipeline,
+        pipeline=explore_pipeline,
         pipeline_pivots=pipeline_pivots,
-        pipeline_nstages=cfg.pipeline_nstages,
         parallel_profile=parallel_profile,
     )
 

@@ -121,6 +121,14 @@ class CubeModule(torch.nn.Module):
     before training
     """
 
+    # whether the train_step/infer_step is using a scheduler,
+    # will be assigned in the generated subclasses
+    use_scheduler: bool
+    # the number of microbatches in one scheduler train/infer step
+    # 1 if no scheduler is used.
+    # will be assigned in the generated subclasses
+    nmicros_per_scheduler_step: int
+
     def __init__(self):
         super().__init__()
         self._reducers: List[Reducer] = list()
@@ -925,7 +933,7 @@ class ParallelModule(CubeModule):
                 because the gradients will be cleared in the beginning of this function
         Args:
             samples (List[Any]): a list of samples.
-                if pipeline is used, it must have the same length as pipeline_nmicros
+                if pipeline is used, it must have the same length as configured to pas policy
             is_dummy_batch (Optional[List[bool]]): indicates whether the each micro-batch is dummy
             scale_fn (Optional[Callable[[torch.Tensor], torch.Tensor]]): the function to scale the loss
         Results:
@@ -946,9 +954,9 @@ class ParallelModule(CubeModule):
         sample_count = len(samples)
         dataloader = microbatches(samples, cycle=False)
 
-        if self.compute_config.use_pipeline:
-            if len(samples) != self.compute_config.pipeline_nmicros:
-                raise ValueError(f"Expected {self.compute_config.pipeline_nmicros} samples, but got {sample_count}")
+        if self.use_scheduler:
+            if len(samples) != self.nmicros_per_scheduler_step:
+                raise ValueError(f"Expected {self.nmicros_per_scheduler_step} samples, but got {sample_count}")
             # only one step, so begin/end are both True
             with accum_mode(begin=True, end=True):
                 return self._train_step(dataloader)
@@ -967,7 +975,7 @@ class ParallelModule(CubeModule):
 
         Args:
             samples (List[Any]): a list of samples.
-                if pipeline is used, it must have the same length as pipeline_nmicros
+                if pipeline is used, it must have the same length as configured to pas policy
         Results:
             List[Any]: a list of outputs for each sample
         """
@@ -978,9 +986,9 @@ class ParallelModule(CubeModule):
 
         sample_count = len(samples)
         dataloader = microbatches(samples, cycle=False)
-        if self.compute_config.use_pipeline:
-            if len(samples) != self.compute_config.pipeline_nmicros:
-                raise ValueError(f"Expected {self.compute_config.pipeline_nmicros} samples, but got {sample_count}")
+        if self.use_scheduler:
+            if len(samples) != self.nmicros_per_scheduler_step:
+                raise ValueError(f"Expected {self.nmicros_per_scheduler_step} samples, but got {sample_count}")
             return self._infer_step(dataloader)
         else:
             outputs = []

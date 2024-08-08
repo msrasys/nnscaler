@@ -82,15 +82,6 @@ class ComputeConfig:
     #  which must be a scalar tensor
     use_end2end: bool = False
 
-    # current only end2end module supports in pipeline mode.
-    # so be sure to set use_end2end=True when use_pipeline=True
-    use_pipeline: bool = False
-    # number of micro-batches
-    pipeline_nmicros: int = -1
-    # number of stages
-    pipeline_nstages: int = -1
-    # it is pas's responsibility to apply the scheduler
-    pipeline_scheduler: str = '1f1b'
     # PAS policy settings
     # you can also put any other settings that can affect code generation here.
     # but please prefix the keys with `_` to avoid conflicts with predefined keys.
@@ -143,32 +134,35 @@ class ComputeConfig:
             # have to use __setattr__ for frozen dataclass
             super().__setattr__('zero_ngroups', 1)
 
-        if self.use_pipeline:
-            if not self.use_end2end:
-                raise ValueError("pipeline is only supported in end2end mode")
-            if self.pipeline_nmicros <= 0:
-                raise ValueError(f"pipeline_nmicros {self.pipeline_nmicros} must be > 0 when use pipeline")
-            if self.pipeline_nstages <= 0:
-                raise ValueError(f"pipeline_nstages {self.pipeline_nstages} must be > 0 when use pipeline")
-            if self.plan_ngpus % self.pipeline_nstages != 0:
-                raise ValueError(f"pipeline_nstages {self.plan_ngpus} must be a multiple of plan_ngpus {self.pipeline_nstages}")
-            if self.pipeline_scheduler not in _PREDEFINE_SCHEDS:
-                raise ValueError(f"pipeline_scheduler {self.pipeline_scheduler} is not supported. "
-                                 f"Supported schedulers are {_PREDEFINE_SCHEDS.keys()}")
-            if self.inference_only and self.pipeline_scheduler not in _PREDEFINED_INFERENCE_SCHEDS:
-                raise ValueError(f"pipeline_scheduler {self.pipeline_scheduler} is not supported in inference mode. "
-                                 f"Supported schedulers are {_PREDEFINED_INFERENCE_SCHEDS}")
-            if not self.inference_only and self.pipeline_scheduler in _PREDEFINED_INFERENCE_SCHEDS:
-                raise ValueError(f"pipeline_scheduler {self.pipeline_scheduler} is not supported in training mode.")
-
-    def apply_pipeline_scheduler(self, graph: IRGraph) -> Optional[SchedulePlan]:
+    def apply_pipeline_scheduler(
+            self,
+            graph: IRGraph,
+            pipeline_nstages: int,
+            pipeline_nmicros: int,
+            pipeline_scheduler: str,
+    ) -> Optional[SchedulePlan]:
         """
         Apply the pipeline scheduler to the graph.
-        Do nothing if not use_pipeline
         """
-        if self.use_pipeline:
-            sched = _PREDEFINE_SCHEDS[self.pipeline_scheduler]
-            return sched(graph, self.pipeline_nmicros, self.pipeline_nstages)
+        if not self.use_end2end:
+            raise ValueError("pipeline is only supported in end2end mode")
+        if pipeline_nmicros <= 0:
+            raise ValueError(f"pipeline_nmicros {pipeline_nmicros} must be > 0.")
+        if pipeline_nstages <= 0:
+            raise ValueError(f"pipeline_nstages {pipeline_nstages} must be > 0.")
+        if self.plan_ngpus % pipeline_nstages != 0:
+            raise ValueError(f"pipeline_nstages {pipeline_nstages} must be a multiple of plan_ngpus {self.plan_ngpus}")
+        if pipeline_scheduler not in _PREDEFINE_SCHEDS:
+            raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not supported. "
+                             f"Supported schedulers are {_PREDEFINE_SCHEDS.keys()}")
+        if self.inference_only and pipeline_scheduler not in _PREDEFINED_INFERENCE_SCHEDS:
+            raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not supported in inference mode. "
+                             f"Supported schedulers are {_PREDEFINED_INFERENCE_SCHEDS}")
+        if not self.inference_only and pipeline_scheduler in _PREDEFINED_INFERENCE_SCHEDS:
+            raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not supported in training mode.")
+
+        sched = _PREDEFINE_SCHEDS[pipeline_scheduler]
+        return sched(graph, pipeline_nmicros, pipeline_nstages)
 
     @property
     def gpu_config(self) -> Dict[str, int]:
@@ -183,7 +177,6 @@ class ComputeConfig:
             'constant_folding': self.constant_folding,
             'user_config': self.user_config,
             'inference_only': self.inference_only, # there will be no backward nodes in the graph in inference mode
-            'use_pipeline': self.use_pipeline,  # pipeline option can affect the graph generation.
             'end2end_mode': self.use_end2end,  # end2end_mode can affect the graph generation.
         }
 
@@ -618,7 +611,6 @@ def _gen_graph(
     constant_folding: bool,
     end2end_mode: bool = False,
     inference_only: bool = False,
-    use_pipeline: bool = False,
 ):
     # reset environment
     program = Program()
@@ -702,8 +694,6 @@ def _gen_graph(
     if ir_dummy_outputs is None: ir_dummy_outputs = []
     elif not isinstance(ir_dummy_outputs, (tuple, list)):
         ir_dummy_outputs = [ir_dummy_outputs]
-    if use_pipeline and _contains_uncommutable_data(ir_dummy_outputs):
-        raise RuntimeError(f"Communication generation error: some of outputs are not commutable between gpus, which is not supported in pipeline parallelism.")
     program.set_output(ir_dummy_outputs)
     program.finalize()
 
@@ -783,7 +773,6 @@ def _gencode(
             module, dummy_forward_args, outdir,
             constant_folding=compute_config.constant_folding, end2end_mode=compute_config.use_end2end,
             inference_only=compute_config.inference_only,
-            use_pipeline=compute_config.use_pipeline,
         )
         graph.dump(graph_ckp)
         torch.save(forward_args, forward_args_ckp)
@@ -799,6 +788,13 @@ def _gencode(
     graph = pas_policy(graph, compute_config)
     if not isinstance(graph, IRGraph):
         raise RuntimeError("Expected policy return IRGraph")
+
+    # currently graph.sched is only used for pipeline parallelism
+    # so it is not none means we are in pipeline parallelism
+    if graph.sched is not None and _contains_uncommutable_data(graph.outputs()):
+        raise RuntimeError("Communication generation error: "
+                           "some of outputs are not commutable between gpus, "
+                           "which is not supported in pipeline parallelism.")
 
     # check assignment
     for node in graph.nodes(flatten=True):

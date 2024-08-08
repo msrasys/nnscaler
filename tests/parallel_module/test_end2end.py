@@ -102,7 +102,7 @@ def _train_ga(model, update_freq, data_size=DATA_SIZE):
     return results
 
 
-def gpu_worker_cube(runtime_ngpus, plan_ngpus, policy, use_pipeline, nstages=None, nmicros=None, model_cls=MLP, pipeline_scheduler='1f1b'):
+def gpu_worker_cube(runtime_ngpus, plan_ngpus, policy, nstages=None, nmicros=None, model_cls=MLP, pipeline_scheduler='1f1b'):
     init_distributed()
     init_random()
     nstages = nstages or plan_ngpus
@@ -117,8 +117,11 @@ def gpu_worker_cube(runtime_ngpus, plan_ngpus, policy, use_pipeline, nstages=Non
             compute_config= ComputeConfig(
                 plan_ngpus, runtime_ngpus,
                 use_end2end=True,
-                use_pipeline=use_pipeline, pipeline_nmicros=nmicros, pipeline_nstages=nstages,
-                pipeline_scheduler=pipeline_scheduler
+                pas_config=dict(
+                    pipeline_nmicros=nmicros,
+                    pipeline_nstages=nstages,
+                    pipeline_scheduler=pipeline_scheduler
+                ),
             ),
             gen_savedir=tempdir
         )
@@ -170,7 +173,7 @@ def test_end2end():
     ga4_result = _train_ga(model, 4)  # micro_batch_size = 4
     assert len(ga4_result) == 16
 
-    cube2_results = launch_torchrun(4, gpu_worker_cube, 4, 2, 'hybrid', True) # micro_batch_size = 4
+    cube2_results = launch_torchrun(4, gpu_worker_cube, 4, 2, 'hybrid') # micro_batch_size = 4
     for _, v in cube2_results.items():
         # all losses should be scalar tensor
         assert all(i.shape == () for i in v[1])
@@ -178,7 +181,7 @@ def test_end2end():
     assert len(cube2_result) == 16
     allclose(cube2_result, ga4_result)
 
-    cube4_results = launch_torchrun(4, gpu_worker_cube, 4, 4, PASMegatron, True)  # micro_batch_size = 4
+    cube4_results = launch_torchrun(4, gpu_worker_cube, 4, 4, PASMegatron)  # micro_batch_size = 4
     for _, v in cube2_results.items():
         # all losses should be scalar tensor
         assert all(i.shape == () for i in v[1])
@@ -186,7 +189,7 @@ def test_end2end():
     assert len(cube4_result) == 16
     allclose(cube4_result, ga4_result)
 
-    cube2_results_non_pipeline = launch_torchrun(4, gpu_worker_cube, 4, 2, 'tp', False)  # micro_batch_size = 4
+    cube2_results_non_pipeline = launch_torchrun(4, gpu_worker_cube, 4, 2, 'tp')  # micro_batch_size = 4
     for _, v in cube2_results.items():
         # all losses should be scalar tensor
         assert all(i.shape == () for i in v[1])
@@ -234,16 +237,16 @@ def test_pipeline_shared():
         ComputeConfig(
             2, 2,
             inference_only=False,
-            use_end2end=True,
-            use_pipeline=True, pipeline_nmicros=2, pipeline_nstages=2,
+            use_end2end=True).apply_pipeline_scheduler(
+            None, pipeline_nmicros=2, pipeline_nstages=2,
             pipeline_scheduler='infer_pipe'
         )
     with pytest.raises(ValueError, match='is not supported in inference mode'):
         ComputeConfig(
             2, 2,
             inference_only=True,
-            use_end2end=True,
-            use_pipeline=True, pipeline_nmicros=2, pipeline_nstages=2,
+            use_end2end=True).apply_pipeline_scheduler(
+            None, pipeline_nmicros=2, pipeline_nstages=2,
             pipeline_scheduler='1f1b'
         )
 
@@ -251,13 +254,13 @@ def test_pipeline_shared():
         # 'chimera_direct' needs more gpus
         # 'infer_pipe' only work for inference
         # None looks doesn't work
-        cube2_results = launch_torchrun(4, gpu_worker_cube, 4, 2, 'hybrid', True, None, None, MLPShared, ps) # micro_batch_size = 4
+        cube2_results = launch_torchrun(4, gpu_worker_cube, 4, 2, 'hybrid', None, None, MLPShared, ps) # micro_batch_size = 4
         cube2_result = merge_cube_result({k: v[0] for k, v in cube2_results.items()})
         assert len(cube2_result) == 16
         allclose(cube2_result, ga4_result)
 
     # TODO: fix `chimera_direct`
-    # cube4_results = launch_torchrun(4, gpu_worker_cube, 4, 4, PASMegatron, True, None, None, MLPShared, 'chimera_direct')  # micro_batch_size = 4
+    # cube4_results = launch_torchrun(4, gpu_worker_cube, 4, 4, PASMegatron, None, None, MLPShared, 'chimera_direct')  # micro_batch_size = 4
     # cube4_result = merge_cube_result({k: v[0] for k, v in cube4_results.items()})
     # assert len(cube4_result) == 16
     # allclose(cube4_result, ga4_result)
@@ -274,7 +277,7 @@ def test_pipeline():
     # pp_size = 2
     # tp_size = 2
     # scale unit size = 4
-    cube8_results = launch_torchrun(8, gpu_worker_cube, 8, 4, PASMegatron, True, 2, 2)  # micro_batch_size = 4
+    cube8_results = launch_torchrun(8, gpu_worker_cube, 8, 4, PASMegatron, 2, 2)  # micro_batch_size = 4
     cube8_result = merge_cube_result({k: v[0] for k, v in cube8_results.items()})
     assert len(cube8_result) == 16
     allclose(cube8_result, ga4_result, atol=1e-5, rtol=1e-5) # looks tp introduces more error
@@ -336,8 +339,10 @@ def gpu_worker_cube_one_sample():
             compute_config= ComputeConfig(
                 2, 2,
                 use_end2end=True,
-                use_pipeline=True, pipeline_nmicros=2, pipeline_nstages=2,
-                pipeline_scheduler='1f1b'
+                pas_config=dict(
+                    pipeline_nmicros=2, pipeline_nstages=2,
+                    pipeline_scheduler='1f1b'
+                ),
             ),
             gen_savedir=tempdir
         )

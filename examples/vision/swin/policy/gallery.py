@@ -80,13 +80,15 @@ def pas_mesh_shard(graph: IRGraph, cfg: ComputeConfig):
 
 def pas_1f1b(graph: IRGraph, cfg: ComputeConfig):
     """1F1B schedule"""
-    num_stages = cfg.pipeline_nstages
+    num_stages = cfg.pas_config['pipeline_nstages']
+    nmicros = cfg.pas_config['pipeline_nmicros']
+    scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
     if num_stages != cfg.plan_ngpus:
         raise ValueError('1F1B schedule requires num_stages == plan_ngpus')
 
     # group to transformer layers
     transformers = group_to_layers(graph.select(ntype=IRFwOperation))
-    stages = mitr.divide(cfg.pipeline_nstages, transformers)
+    stages = mitr.divide(num_stages, transformers)
     stages = [list(itertools.chain(*s)) for s in stages]
     graph.staging([t[0] for t in stages])
 
@@ -102,5 +104,5 @@ def pas_1f1b(graph: IRGraph, cfg: ComputeConfig):
     for node in graph.select(ntype=IRDataOperation):
         replica(graph, node, list(range(cfg.plan_ngpus)))
     # apply 1f1b schedule
-    cfg.apply_pipeline_scheduler(graph)
+    cfg.apply_pipeline_scheduler(graph, num_stages, nmicros, scheduler)
     return graph

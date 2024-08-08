@@ -339,10 +339,6 @@ class TrainerArgs:
             raise ValueError(f"`global_batch_size` {self.global_batch_size} is not equal to `micro_batch_size*scaling_factor*grad_accumulation_steps` "
                              f"{self.micro_batch_size*self.scaling_factor*self.grad_accumulation_steps}")
 
-        if self.compute_config.use_pipeline and self.grad_accumulation_steps != self.compute_config.pipeline_nmicros:
-            raise ValueError(f"grad_accumulation_steps {self.grad_accumulation_steps} must be equal to "
-                             f"compute_config.pipeline_nmicros {self.compute_config.pipeline_nmicros}")
-
         if self.run_mode not in ('compile', 'run'):
             raise ValueError(f"Invalid run_mode {self.run_mode}")
 

@@ -140,10 +140,6 @@ class End2EndMLP(nn.Module):
         runtime_ngpus=...,
         use_zero=...,
         use_end2end=True,
-        use_pipeline=...,
-        pipeline_nmicros=...,
-        pipeline_nstages=...,
-        pipeline_scheduler=...,
         ...,
     )                                   # compute environment config
     ParallelizedPipelinedLLM = parallelize(
@@ -153,8 +149,6 @@ class End2EndMLP(nn.Module):
         compute_config,
     )
 ```
-
-If you want to enable pipeline parallelism, you need to set `use_end2end=True` and `use_pipeline=True` in `ComputeConfig`. You also need to set `pipeline_nmicros` and `pipeline_nstages` to specify the number of microbatches and stages in the pipeline. The `pipeline_scheduler` is the scheduler to schedule the pipeline. See below for details.
 
 For end2end modules, you can't use `Module.forward`.
 Instead, you must use `ParallelModule.train_step` and `ParallelModule.infer_step` to train/infer the module.
@@ -196,11 +190,6 @@ class ComputeConfig:
     inference_only : bool = False
     use_end2end: bool = False
 
-    use_pipeline: bool = False
-    pipeline_nmicros: int = -1
-    pipeline_nstages: int = 1
-    pipeline_scheduler: Optional[str] = None
-
     pas_config: Dict[str, Any] = field(default_factory=dict)
     user_config: Dict[str, Any] = field(default_factory=dict)
 ```
@@ -236,10 +225,6 @@ We can categorize the fields into 4 categories:
     - `zero_ngroups`: the number of groups to be used in zero.
     - `inference_only`: whether to generate code for inference only. If it is true, the generated code can not be used to train the model.
     - `use_end2end`: whether to use end2end training. For the requirement of end2end, see the description above.
-    - `use_pipeline`: whether to use pipeline. Please note the pipeline parallelism is only supported for end2end modules, so you must set `use_end2end=True` if you want to use pipeline.
-    - `pipeline_nmicros`: the number of microbatches in the pipeline.
-    - `pipeline_nstages`: the number of stages in the pipeline.
-    - `pipeline_scheduler`: the scheduler name for the pipeline. Current we support four schedulers in training `1f1b`/`1f1b_plus`/`gpipe`/`chimera_direct` (4 stages pipeline only), and one scheduler in inference `infer_pipe`.
     - `pas_config`: the configuration for the PAS policy (partition-assign-schedule policy, which describes how to place all computations across devices. For details, please refer to [PAS Policies](#pas-policies)).
     It is a dictionary, and will be used by the PAS policy.
     Please note different PAS will have different configurations,
@@ -543,7 +528,7 @@ Please note:
 
 It has the following arguments:
 - `samples` (`List[Any]`): a list of samples.
-        if pipeline is used, it must have the same length as pipeline_nmicros
+        if pipeline is used, it must have the same length as configured to pas policy.
 - `is_dummy_batch` (`Optional[List[bool]]`): indicates whether the each micro-batch is dummy
 - `scale_fn` (`Optional[Callable[[torch.Tensor], torch.Tensor]]`): the function to scale the loss
 
@@ -555,7 +540,7 @@ def infer_step(self, samples: List[Any]) -> List[Any]:
     ...
 ```
 The inference step function. It should be called in the inference loop.
-The input is a list of samples, and returns a list of outputs for the samples. If pipeline is used, it must have the same length as pipeline_nmicros
+The input is a list of samples, and returns a list of outputs for the samples. If pipeline is used, it must have the same length as configured to pas policy.
 
 ### PAS Policies
 
@@ -568,11 +553,22 @@ The configuration of the PAS policy should be passed in the `pas_config` of `Com
 2. `tp`: tensor parallelism + data parallelism. It will do tensor parallelism inside a scale unit, and run data parallelism across scale units. It has only one configuration:
     - seed: the random seed for choose the partition dimension. Default is `1`
 
-3. `pp`: pipeline parallelism + data parallelism. It will do model parallelism inside a scale unit, and run data parallelism across scale units. It requires the `use_end2end`  and `use_pipeline` to be true. It has no configurations.
+3. `pp`: pipeline parallelism + data parallelism.
+It will do model parallelism inside a scale unit,
+and run data parallelism across scale units.
+It requires the `use_end2end` be true.
+It has two configurations `pipeline_nmicros` and `pipeline_scheduler`.
+See `hybrid` policy for more details.
 
 4. `data`: tensor parallelism on batch dimension. It has no configurations.
 
-5. `hybrid`: pipeline parallelism + tensor parallelism + data parallelism. It will do model parallelism and tensor parallelism(on 0 dimension) inside a scale unit, and run data parallelism across scale units. It requires the `use_end2end`  and `use_pipeline` to be true. It has no configurations.
+5. `hybrid`: pipeline parallelism + tensor parallelism + data parallelism.
+It will do model parallelism and tensor parallelism(on 0 dimension) inside a scale unit,
+and run data parallelism across scale units.
+It requires the `use_end2end` to be true. It has the following configurations.
+    - `pipeline_nstages`: the number of stages in the pipeline. Default is `plan_ngpus`. Optional.
+    - `pipeline_nmicros`: the number of microbatches in the pipeline. Required.
+    - `pipeline_scheduler`: the scheduler name for the pipeline. Current we support four schedulers in training `1f1b`/`1f1b_plus`/`gpipe`/`chimera_direct` (4 stages pipeline only), and one scheduler in inference `infer_pipe`. Default is `1f1b`. Optional.
 
 6. `autodist`: the recommended policy for most cases. Currently it only support Adam-like optimizers. It will automatically choose the best partition for you by balancing the memory usage and speed. It has the following configurations.
     - `update_freq (int)`: the update frequency when training the module. Default is 1. Optional.
@@ -590,10 +586,11 @@ The configuration of the PAS policy should be passed in the `pas_config` of `Com
     - `recompute_modules (str)`: The module names to recompute, separated by `,`. For example, `module1,module2`. Optional.
     - `pipeline_pivots (str)`: The module names to pivot the pipeline, separated by `,`. For example, if `module1,module2` is specified, stages searched by pipeline solver only start from either `module1` or `module2`. Optional.
     - `use_apex_fused_adam_v2`: If set to `True`, the apex fused adam v2 optimizer will be used. Default is `False`. Optional.
+    - `explore_pipeline`: If set to `True`, autodist will try pipeline parallelism to find the best partition plan
+    (but the selected partition plan is not necessarily pipeline parallelism).
+    - `pipeline_scheduler`: The scheduler name for the pipeline. Please note currently `1f1b` is the only supported scheduler in `autodist`. Default is `1f1b`. Optional.
     - `parallel_profile`: If set to `True`, autodist will profile operators in parallel by using available gpus. Default is `True`. Optional.
-    - `max_partition_degree`: Max degree when partitioning an operator / node. When pipeline parallelism is enbaled (`use_pipeline` is True), user can change the value to constrain the plan to be composed of stages that span on less or equal to `max_partition_degree` devices (recommend to set `max_partition_degree` to the number of devices in a node to avoid inter-node communication, but should be be no more than `plan_ngpus`). Default is `plan_ngpus`. Optional.
-
-Please note all options to `autodist` are just suggestions. `autodist` will try to find the best partition for you, which may not be the same with your suggestions.
+    - `max_partition_degree`: Max degree when partitioning an operator / node. When pipeline parallelism is enabled to explore (`explore_pipeline` is True), user can change the value to constrain the plan to be composed of stages that span on less or equal to `max_partition_degree` devices (recommend to set `max_partition_degree` to the number of devices in a node to avoid inter-node communication, but should be be no more than `plan_ngpus`). Default is `plan_ngpus`. Optional.
 
  You can also put any other settings that can affect code generation here. but please prefix the keys with `_` to avoid conflicts with predefined keys.
 
