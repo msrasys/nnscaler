@@ -2013,7 +2013,13 @@ def CrossEntropy(input, target, weight=None,
         size_average=None, ignore_index=- 100, reduce=None,
         reduction='mean', label_smoothing=0.0)
     """
-    if reduction == 'sum':
+    if reduction == 'none':
+        annos = [
+            'C^, N -> N',
+            'N C^, N -> N',
+            'N C^ *, N * -> N',
+        ]
+    elif reduction == 'sum':
         annos = [
             'C^, N -> 1',
             'N+ C^, N+ -> 1',
