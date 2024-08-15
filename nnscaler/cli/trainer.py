@@ -228,6 +228,10 @@ class Trainer:
         self.model = pmodel_class()
         self.model.cuda()
         self.optimizer = self.train_args.create_parallel_optimizer(self.model)
+        # the reduce op is `sum` by default, follow torch's c10d, grad is divided by scaling_factor before allreduce
+        def reducer_pre_hook(reducer, grad):
+            grad.div_(self.train_args.scaling_factor)
+        self.optimizer.register_reducer_pre_hook(reducer_pre_hook)
         self.lr_scheduler = self.train_args.create_lr_scheduler(self.optimizer)
         self.loggers = self.train_args.create_loggers()
 
@@ -464,7 +468,7 @@ class Trainer:
         torch.distributed.all_reduce(num_batches, group=sync_group)
 
         return AggregatedOutputs(
-            loss_sum = loss_sum.item(),
+            loss_sum=loss_sum.item(),
             num_batches=num_batches.item(),
         )
 
@@ -569,7 +573,7 @@ class Trainer:
             aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)
             self.hook.after_aggregate_val_step_outputs(
                 self, aggregated_outputs,
-                aggregated_outputs.loss_sum/aggregated_outputs.num_batches,
+                aggregated_outputs.loss_sum / aggregated_outputs.num_batches,
                 idx
             )
             loss_sum += aggregated_outputs.loss_sum
@@ -639,18 +643,20 @@ class Trainer:
             self.hook.after_sync_grad(self)
 
             # scale gradients
+            multiplier = self.train_args.scaling_factor
             if self.train_args.optimizer.grad_reduction == 'sum':
-                # do nothing. Already done in reducers
+                # do nothing. `multiplier` is already correct
                 pass
             elif self.train_args.optimizer.grad_reduction == 'mean':
                 if not aggregated_outputs.num_batches:
                     raise RuntimeError("`aggregate_outputs` doesn't set `num_batches` field")
-                self.optimizer.scale_grads(1.0 / aggregated_outputs.num_batches)
+                multiplier /= aggregated_outputs.num_batches
             else:
                 assert self.train_args.optimizer.grad_reduction == 'per-token-mean'
                 if not aggregated_outputs.num_tokens:
                     raise RuntimeError("`aggregate_outputs` doesn't set `num_tokens` field")
-                self.optimizer.scale_grads(1.0 / aggregated_outputs.num_tokens)
+                multiplier /= aggregated_outputs.num_tokens
+            self.optimizer.scale_grads(multiplier)
 
             # clip gradients
             self.hook.before_gnorm_clip(self)
