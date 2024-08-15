@@ -276,9 +276,9 @@ class Trainer:
         for logger in self.loggers:
             logger.finalize()
 
-    def _log_metrics(self, metrics: Dict[str, float], step: int):
+    def log_metrics(self, metrics: Dict[str, float], step: int, *, tag: Optional[str] = None):
         for logger in self.loggers:
-            logger.log_metrics(metrics, step)
+            logger.log_metrics(metrics, step, tag=tag)
 
     def _log_config(self, config: Dict):
         for logger in self.loggers:
@@ -584,7 +584,7 @@ class Trainer:
         self.hook.on_val_end(self, loss)
 
         step_stat.val_loss = loss
-        self._log_metrics(asdict(step_stat), self.num_train_steps)
+        self.log_metrics(asdict(step_stat), self.num_train_steps, tag='val')
         return step_stat.val_loss
 
     def train_epoch(self, epoch):
@@ -674,6 +674,12 @@ class Trainer:
             self.hook.after_optimizer_step(self)
             if self.lr_scheduler and self.train_args.lr_scheduler.interval == 'step':
                 self.lr_scheduler.step()
+
+            self.log_metrics(
+                {k:v for k, v in asdict(step_stat).items() if v is not None},
+                self.num_train_steps,
+                tag='train'
+            )
 
             # validate and save checkpoint
             if self.train_args.checkpoint.every_n_train_steps and \

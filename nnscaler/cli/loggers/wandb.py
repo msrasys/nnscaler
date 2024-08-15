@@ -50,7 +50,9 @@ class WandbLogger(LoggerBase):
         )
 
     @rank_zero_only
-    def log_metrics(self, metrics: Dict[str, float], step: int) -> None:
+    def log_metrics(self, metrics: Dict[str, float], step: int, *, tag: Optional[str] = None) -> None:
+        prefix = "" if tag is None else tag + "/"
+        metrics = {prefix + k: v for k, v in metrics.items()}
         wandb.log(metrics, step=step)
 
     @rank_zero_only

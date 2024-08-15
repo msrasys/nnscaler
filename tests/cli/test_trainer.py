@@ -41,9 +41,10 @@ def trainer_logging_worker(save_dir):
 
     if torch.distributed.get_rank() == 0:
         assert (tb_log_savedir / 'test-cli').exists()
-        tfevents = list((tb_log_savedir / 'test-cli').glob('events.out.tfevents.*'))
-        assert len(tfevents) == 1
-        assert tfevents[0].stat().st_size > 1000
+        for tag in ['val', 'train']:
+            tfevents = list((tb_log_savedir / 'test-cli' / tag).glob('events.out.tfevents.*'))
+            assert len(tfevents) == 1
+            assert tfevents[0].stat().st_size > 1000
 
         assert (wandb_log_savedir / 'wandb').exists()
         wandb_offline_dir = list((wandb_log_savedir / 'wandb').glob('offline-run-*'))

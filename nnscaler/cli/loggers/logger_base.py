@@ -16,7 +16,7 @@ class LoggerBase(ABC):
         ...
 
     @abstractmethod
-    def log_metrics(self, metrics: Dict[str, float], step: int) -> None:
+    def log_metrics(self, metrics: Dict[str, float], step: int, *, tag: Optional[str] = None) -> None:
         ...
 
     @abstractmethod

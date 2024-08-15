@@ -352,7 +352,7 @@ class CheckpointConfig:
     The checkpoint is a folder with as many files as the world size.
     - `"merged"`: everything has been merged into a single file. Used internally only when you merge the checkpoint files via `Trainer.merge_checkpoints`
 - `save_last` (`bool`): Whether to save the last checkpoint. Default is `True`.
-- `save_best` (`bool`): Whether to save the best checkpoint. Default is `True`.
+- `save_best` (`bool`): Whether to save the best (lowest `val_loss`) checkpoint. Default is `True`.
 - `symlink_best_and_last` (`bool`): Whether to use symlink (instead of copy) to the best and last checkpoint. Default is `True`.
 - `every_n_train_steps` (`Optional[int]`): Save the checkpoint every `every_n_train_steps` training steps. Default is `None`, which means no checkpoint is saved based on training steps.
 - `every_n_epochs` (`Optional[int]`): Save the checkpoint every `every_n_epochs` epochs. Default is `None`, which means no checkpoint is saved based on epochs.
@@ -362,14 +362,21 @@ Default is `None`, which means all checkpoints are kept.
 We will not resume (nor report error) if resume_from is `last` or `best` but the corresponding checkpoint does not exist.
 Default is `None`.
 
-Please note when the parallel plan is changed (i.e you re-trace the model with different configurations),
+Please note
+
+1. When the parallel plan is changed (i.e you re-trace the model with different configurations),
 the checkpoints become incompatible, and can't be loaded any more.
 You must firstly merge the checkpoints to a merged checkpoint with `Trainer.merge_checkpoint` and then load the merged checkpoint just like a regular checkpoint.
 
-```python
-def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str):
-```
-where `checkpoint_files` is a list of checkpoint files to merge, and `output_file` is the output file path.
+    ```python
+    def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str):
+    ```
+    where `checkpoint_files` is a list of checkpoint files to merge, and `output_file` is the output file path.
+
+2. When a checkpoint is saved,
+we will run validation on the validation dataset and save the validation loss to the checkpoint file.
+The validation run will ignore the `val_every_n_train_steps` and `val_every_n_epochs` configurations.
+If no valid dataset is provided, validation is skipped and `valid_loss` is set to `train_loss` by default.
 
 ### Other configs
 - `gen_savedir` (`str`): The directory to save the generated files. Default is `./.nnscaler`.
