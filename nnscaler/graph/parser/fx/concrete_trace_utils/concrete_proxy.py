@@ -18,6 +18,7 @@ from torch.fx.proxy import Proxy
 from torch.overrides import is_tensor_method_or_property
 
 from . import concrete_tracer as et
+from . import pytree_utils
 from .utils import (
     _orig_tuple,
     _orig_list,
@@ -31,7 +32,6 @@ from .utils import (
     _orig_bool,
     _orig_slice,
     _orig_set,
-    map_recursive,
     get_frame_record,
 )
 
@@ -262,8 +262,9 @@ class ConcreteProxy(Proxy):
         def find_tracer(a):
             if _orig_isinstance(a, cls):
                 tracers.add(a.tracer)
-        map_recursive(find_tracer, args)
-        map_recursive(find_tracer, kwargs)
+        
+        pytree_utils.tree_map(find_tracer, args)
+        pytree_utils.tree_map(find_tracer, kwargs)
 
         if _orig_len(tracers) > 1:
             raise RuntimeError(f'Found multiple different tracers {_orig_list(tracers)} while '

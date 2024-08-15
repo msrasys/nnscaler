@@ -83,6 +83,7 @@ except ImportError:
             return
 
 from . import concrete_proxy as ep
+from . import pytree_utils
 from .function_patcher import FunctionPatcher
 from .operator_patcher import OperatorPatcherContext
 from .utils import (
@@ -135,10 +136,6 @@ from .utils import (
     ExtraSEFPatcher,
     EmptyResult,
     extract_results_metadata,
-    flatten_trees_with_func,
-    flatten_trees_with_func_and_spec,
-    get_common_spec,
-    map_trees_with_func,
     get_frame_record,
 )
 
@@ -410,21 +407,26 @@ class ConcreteTracer(TracerBase):
 
         try:
             if self.cpu_offload:
-                args, kwargs = tree_to_cuda(args), tree_to_cuda(kwargs)
+                args = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cuda(), args)
+                kwargs = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cuda(), kwargs)
             result = run(kind, target, args, kwargs)
         except torch.cuda.OutOfMemoryError:
             if self.cpu_offload:
                 _logger.warning(f"cuda out of memory, try to trace {target} on cpu.")
-                args, kwargs = tree_to_cpu(args), tree_to_cpu(kwargs)
+                args = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu(), args)
+                kwargs = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu(), kwargs)
                 result = run(kind, target, args, kwargs)
             else:
                 raise
 
         if self.cpu_offload:
-            args, kwargs, result = tree_to_cpu(args), tree_to_cpu(kwargs), tree_to_cpu(result)
+            args = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu(), args)
+            kwargs = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu(), kwargs)
+            result = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu(), result)
 
-            unexpected_types = types_other_than(result, (*base_types, type(None), torch.Tensor))
-            if not contains_types(result, (torch.Tensor,)) and unexpected_types:
+            if not pytree_utils.tree_any(lambda x: isinstance(x, torch.Tensor), result) and \
+                pytree_utils.tree_any(lambda x: not isinstance(x, (*base_types, type(None), torch.Tensor)), result):
+                unexpected_types = set([type(elem) for elem in pytree_utils.tree_flatten(result)[0] if not isinstance(elem, (*base_types, type(None), torch.Tensor))])
                 _logger.warning(f"result of target {target} contains unexpected types {unexpected_types}, which is not a common behavior.")
             torch.cuda.empty_cache()
 
@@ -474,7 +476,11 @@ class ConcreteTracer(TracerBase):
         create the nodes for the target and the input of the target (if the target is one of call_method, call_function, call_module).
         """
         with self.do_temp_call_origin():
-            args_unwrapped, kwargs_unwrapped = unwrap_nested_proxy(args), unwrap_nested_proxy(kwargs)
+            def unwrap_nested_proxy(proxy: ep.ConcreteProxy):
+                return pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, proxy.value)
+
+            args_unwrapped = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, args)
+            kwargs_unwrapped = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, kwargs)
 
             if self.need_revert(target):
                 with self.patcher.revert():
@@ -902,6 +908,8 @@ class ConcreteTracer(TracerBase):
             _fx_wrapped_ori_clz = _orig_map
 
             def __new__(cls, the_func, *iterables: Any):
+                if self.temp_call_origin:
+                    return _orig_map(the_func, *iterables)
                 tracers = _orig_set()
                 for one_iter in iterables:
                     if _orig_isinstance(one_iter, ep.Proxy):
@@ -1358,47 +1366,6 @@ def _create_wrapped_nn_module_func(tracer: ConcreteTracer, mod: torch.nn.Module,
     return wrapped
 
 
-def contains_types(pytree, types) -> bool:
-    """if pytree leaf has the given types, return true"""
-    return any(flatten_trees_with_func(lambda x: isinstance(x, types), [pytree])[0])
-
-
-def types_other_than(pytree, given_types) -> Set[Type]:
-    """return a set of types of the pytree leaf other than given_types"""
-    types = set(flatten_trees_with_func(lambda x: type(x) if not isinstance(x, given_types) else None, [pytree])[0])
-    if None in types:
-        types.remove(None)
-    return types
-
-
-def tree_to_cuda(pytree):
-    """return a same spec pytree with all the given pytree leaf tensor to cuda"""
-    # any operations under torch.no_grad context will have the result tensor with attribute requires_grad is False,
-    # here we must follow the original tensor requires_grad attribute when we move tensor to cuda to ensure the correctness of the tensor requires_grad state
-    return map_trees_with_func(lambda a: a.cuda().requires_grad_(a.requires_grad) if isinstance(a, torch.Tensor) else a, [pytree])
-
-
-def tree_to_cpu(pytree):
-    """return a same spec pytree with all the given pytree leaf tensor to cpu"""
-    # any operations under torch.no_grad context will have the result tensor with attribute requires_grad is False,
-    # here we must follow the original tensor requires_grad attribute when we move tensor to cpu to ensure the correctness of the tensor requires_grad state
-    return map_trees_with_func(lambda a: a.cpu().requires_grad_(a.requires_grad) if isinstance(a, torch.Tensor) else a, [pytree])
-
-
-def unwrap_nested_proxy(pytree):
-    """
-    return a same spec pytree with the ConcreteProxy in the old pytree replaced with ConcreteProxy.value
-    """
-    def unwrap(obj: Any):
-        while isinstance(obj, ep.ConcreteProxy):
-            obj = obj.value
-        return obj
-
-    while contains_types(pytree, (ep.ConcreteProxy,)):
-        pytree = map_trees_with_func(unwrap, [pytree])
-    return pytree
-
-
 def update_tree_proxy_value(dst_pytree, src_pytree):
     """
     copy the value from src_pytree to dst_pytree with the dst_pytree spec,
@@ -1408,7 +1375,7 @@ def update_tree_proxy_value(dst_pytree, src_pytree):
     #   dst_pytree: {'a': [1, 2, 3]}
     #   src_pytree: {'a': [1, 2, 3, 4]}
     # then the public spec is {'a': *}, we don't want to flatten the list here.
-    spec = get_common_spec(tree_flatten(dst_pytree)[1], tree_flatten(src_pytree)[1])
+    common_spec = pytree_utils.get_common_spec(pytree_utils.tree_structure(dst_pytree), pytree_utils.tree_structure(src_pytree))
 
     def update_proxy_value(a, b):
         if isinstance(a, ep.ConcreteProxy):
@@ -1417,8 +1384,10 @@ def update_tree_proxy_value(dst_pytree, src_pytree):
         else:
             return b
 
-    flat_arg = flatten_trees_with_func_and_spec(update_proxy_value, [dst_pytree, src_pytree], spec)
-    return tree_unflatten(flat_arg, spec)
+    flat_dst_leaves = pytree_utils.tree_leaves_with_spec(dst_pytree, common_spec)
+    flat_src_leaves = pytree_utils.tree_leaves_with_spec(src_pytree, common_spec)
+    new_leaves = [update_proxy_value(dst_leaf, src_leaf) for dst_leaf, src_leaf in zip(flat_dst_leaves, flat_src_leaves)]
+    return pytree_utils.tree_unflatten(new_leaves, common_spec)
 
 
 @compatibility(is_backward_compatible=True)

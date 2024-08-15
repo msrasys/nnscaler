@@ -2,20 +2,15 @@
 # Licensed under the MIT license.
 
 import builtins
-from collections import namedtuple
 from dataclasses import dataclass
 import importlib
 import operator
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, NamedTuple, Optional, Set, Tuple, Type, List
+from typing import Any, Callable, Dict, NamedTuple, Optional, Set, Tuple, Type
 
 import torch
-import torch.utils._pytree as torch_pytree
 from torch.fx.node import Node, map_aggregate, _side_effectful_functions
-from torch.utils._pytree import tree_flatten, tree_unflatten, LeafSpec, TreeSpec, SUPPORTED_NODES
-
-from . import concrete_proxy as ep
 
 DICT_KEYS_TYPE = type({}.keys())
 DICT_VALUES_TYPE= type({}.values())
@@ -74,144 +69,6 @@ side_effectful_inplace_ops = {
     # so let's ignore it now
     operator.setitem,
 }
-
-
-def map_recursive(fn: Callable, arg) -> Any:
-    """
-    Apply fn to each Node appearing arg. arg may be a list, tuple, slice, or dict with string keys.
-    """
-    if _orig_type(arg) != torch.Size and _orig_isinstance(arg, _orig_tuple):
-        t = _orig_tuple(map_recursive(fn, elem) for elem in arg)
-        # Support NamedTuple (if it has `_fields`) by repacking into original type.
-        return t if not hasattr(arg, '_fields') else _orig_type(arg)(*t)
-    elif _orig_isinstance(arg, _orig_list):
-        return _orig_list(map_recursive(fn, elem) for elem in arg)
-    elif _orig_isinstance(arg, _orig_dict):
-        return {k: map_recursive(fn, v) for k, v in arg.items()}
-    else:
-        return fn(arg)
-
-
-def _get_node_type(pytree: Any) -> Any:
-    if isinstance(pytree, ep.ConcreteProxy):
-        return _orig_type(pytree)
-    if torch_pytree._is_namedtuple_instance(pytree):
-        return namedtuple
-    return type(pytree)
-
-torch_pytree._get_node_type = _get_node_type
-
-
-def get_common_spec(dst_spec: TreeSpec, src_sepc: TreeSpec) -> TreeSpec:
-    """
-    Return the common part of two treespec.
-    For example:
-        dst_spec is {'a': [*,], 'b': [*, *]}
-        src_sepc is {'a': [*,], 'b': [*, *, *]}
-        common spec is {'a': [*,], 'b': *}
-    """
-    if isinstance(dst_spec, LeafSpec) or isinstance(src_sepc, LeafSpec):
-        return LeafSpec()
-    if dst_spec.type == src_sepc.type and dst_spec.context == src_sepc.context:
-        if len(dst_spec.children_specs) == len(src_sepc.children_specs):
-            children_specs = [get_common_spec(dst, src) for dst, src in zip(dst_spec.children_specs, src_sepc.children_specs)]
-            return TreeSpec(type=dst_spec.type, context=dst_spec.context, children_specs=children_specs)
-    return LeafSpec()
-
-
-def flatten_trees_with_func(fn, pytrees) -> Tuple[List[Any], TreeSpec]:
-    """
-    Each pytree in pytrees should have the same structure.
-
-    Example:
-
-        pytrees = [
-            [1, 2, (3, 4)], # pytree 1
-            [5, 6, (7, 8)], # pytree 2
-        ]
-
-        # the returned value is
-        [fn(1, 5), fn(2, 6), fn(3, 7), fn(4, 8)], [*, *, (*, *)]
-    """
-    flat_trees = [tree_flatten(pytree) for pytree in pytrees]
-    flat_args = [v[0] for v in flat_trees]
-    specs = [v[1] for v in flat_trees]
-
-    if not all(len(flat_arg) == len(flat_args[0]) for flat_arg in flat_args):
-        raise RuntimeError('the element number of pytrees are not equal')
-    if not all(str(spec) == str(specs[0]) for spec in specs):
-        raise RuntimeError('the structure of pytrees are not equal')
-
-    return [fn(*vals) for vals in zip(*flat_args)], specs[0]
-
-
-def map_trees_with_func(fn, pytrees):
-    """
-    Each pytree in pytrees should have the same structure.
-    The returned value has the same structure with pytree in pytrees.
-
-    Example:
-
-        pytrees = [
-            [1, 2, (3, 4)], # pytree 1
-            [5, 6, (7, 8)], # pytree 2
-        ]
-
-        # the returned value is
-        [fn(1, 5), fn(2, 6), (fn(3, 7), fn(4, 8))]
-    """
-    flat_args, spec = flatten_trees_with_func(fn, pytrees)
-    return tree_unflatten([i for i in flat_args], spec)
-
-
-def flatten_tree_with_spec(pytree, spec: TreeSpec) -> List:
-    """
-    Flat a pytree with a given spec.
-
-    Example:
-
-        pytree = [1, (2, {3: 4})]
-        spec = TreeSpec([*, (*, *)])
-    
-        # the returned value is
-        [1, 2, {3: 4}]
-    """
-    assert isinstance(spec, TreeSpec)
-
-    if isinstance(spec, LeafSpec):
-        return [pytree]
-
-    flatten_fn = SUPPORTED_NODES[spec.type].flatten_fn
-    child_pytrees, _ = flatten_fn(pytree)
-
-    if len(child_pytrees) != len(spec.children_specs):
-        raise RuntimeError(f'The number of pytree children is not equal to the give specs.')
-
-    result = []
-    for child, child_spec in zip(child_pytrees, spec.children_specs):
-        flat = flatten_tree_with_spec(child, child_spec)
-        result += flat
-
-    return result
-
-
-def flatten_trees_with_func_and_spec(fn, pytrees, spec):
-    """
-    Example:
-
-        pytrees = [
-            [1, (2, {3: 4})],
-            [5, (6, 7)]
-        ]
-        spec = [*, (*, *)]
-
-        # the returned value is
-        [fn(1, 5), fn(2, 6), fn({3: 4}, 7)]
-    """
-    flat_args = [flatten_tree_with_spec(pytree, spec) for pytree in pytrees]
-    if not all(len(flat_arg) == len(flat_args[0]) for flat_arg in flat_args):
-        raise RuntimeError('the element number of pytrees are not equal')
-    return [fn(*vals) for vals in zip(*flat_args)]
 
 
 class ExtraSEFPatcher:
