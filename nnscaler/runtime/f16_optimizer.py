@@ -1,11 +1,17 @@
 import logging
+from typing import Optional, TYPE_CHECKING
 
 import torch
+
+from nnscaler.cli.train_hook import TrainHook
+
+if TYPE_CHECKING:
+    from nnscaler.cli.trainer import Trainer
 
 logger = logging.getLogger(__name__)
 
 
-class MixedPrecisionF16OptimizerMixin:
+class MixedPrecisionF16OptimizerMixin(TrainHook):
     """
     A mixin class for mixed precision optimizer.
     Support both FP16 and BF16 parameters.
@@ -20,6 +26,23 @@ class MixedPrecisionF16OptimizerMixin:
     def __init__(self, *args, **kwargs):
         # forward __init__ call to the next class in mro(method resolution order)
         super().__init__(*args, **kwargs)
+        self._multiply_factor = 1.0
+
+    def after_setup(self, trainer: 'Trainer') -> None:
+        """
+        Here we override the clip_gnorm and scale_grads methods in the optimizer.
+        Reason:
+        1. The original clip_gnorm and scale_grads methods apply to bf16 grads, which is not what we want.
+           We need to apply them to fp32 grads.
+        2. Combine the multiply_factors of clip_gnorm and scale_grads. So only one muliply is needed.
+           This can mitigate the precision loss caused by multiple multiplications.
+        Assumption:
+        `clip_gnorm` is called immediately after `scale_grads` in training loop.
+        """
+        trainer.optimizer._clip_gnorm = trainer.optimizer.clip_gnorm
+        trainer.optimizer.clip_gnorm = self.overrided_clip_gnorm
+        trainer.optimizer._scale_grads = trainer.optimizer.scale_grads
+        trainer.optimizer.scale_grads = self.overrided_scale_grads
 
     @classmethod
     def build_fp32_params(cls, params):
@@ -102,6 +125,9 @@ class MixedPrecisionF16OptimizerMixin:
                     p32.grad.data.copy_(p.grad.data)
             else:
                 p32.grad = torch.zeros_like(p.data, dtype=torch.float)
+            if self._multiply_factor != 1.0:
+                p32.grad.mul_(self._multiply_factor)
+        self._multiply_factor = 1.0
 
     def _sync_fp32_params_to_f16(self):
         # copy FP32 params back into FP16 model
@@ -109,6 +135,24 @@ class MixedPrecisionF16OptimizerMixin:
             if not p.requires_grad:
                 continue
             p.data.copy_(p32.data)
+
+    def overrided_scale_grads(self, scale: float):
+        """
+        Scale the gradients by a factor.
+        Will override the original scale_grads method in ParallelOptimizer.
+        """
+        self._multiply_factor *= scale
+
+    def overrided_clip_gnorm(self, max_norm: Optional[float] = None) -> float:
+        """
+        Will override the original clip_gnorm method in ParallelOptimizer.
+        """
+        # self._clip_gnorm() is ParallelOptimizer.clip_gnorm
+        grad_norm = self._multiply_factor * self._clip_gnorm()
+        if max_norm is not None and max_norm > 0.0:
+            clip_coef = (max_norm / (grad_norm + 1e-6)).clamp(max=1.0)
+            self._multiply_factor *= clip_coef
+        return grad_norm
 
 
 class MixedPrecisionAdam(MixedPrecisionF16OptimizerMixin, torch.optim.Adam):

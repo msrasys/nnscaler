@@ -11,6 +11,13 @@ class TrainHook:
     """
     Note: All hooks are called in all ranks, and the inputs of hooks are only the local data.
     """
+
+    def after_setup(self, trainer: 'Trainer') -> None:
+        """
+        Called after trainer setup when run_mode == 'run'.
+        When run_mode == 'compile', this hook will not be called.
+        """
+
     def on_train_start(self, trainer: 'Trainer') -> None:
         """Called at the beginning of training"""
 
@@ -103,7 +110,8 @@ class TrainHook:
 
     def before_sync_grad(self, trainer: 'Trainer') -> None:
         """
-        Called before sync_shard_grad
+        Called before sync_shard_grad.
+        TODO: Please note this can't be triggered correctly, because end2end mode is not supported.
         """
 
     def after_sync_grad(self, trainer: 'Trainer') -> None:
@@ -149,3 +157,100 @@ class TrainHook:
         Args:
             checkpoint: the checkpoint to be saved
         """
+
+
+class AggregatedTrainHook(TrainHook):
+    def __init__(self, hooks: List[TrainHook]):
+        self.hooks = hooks
+
+    def after_setup(self, trainer: 'Trainer') -> None:
+        for hook in self.hooks:
+            hook.after_setup(trainer)
+
+    def on_train_start(self, trainer: 'Trainer') -> None:
+        for hook in self.hooks:
+            hook.on_train_start(trainer)
+
+    def on_train_end(self, trainer: 'Trainer') -> None:
+        for hook in self.hooks:
+            hook.on_train_end(trainer)
+
+    def on_val_start(self, trainer: 'Trainer') -> None:
+        for hook in self.hooks:
+            hook.on_val_start(trainer)
+
+    def on_val_end(self, trainer: 'Trainer', val_loss: float) -> None:
+        for hook in self.hooks:
+            hook.on_val_end(trainer, val_loss)
+
+    def on_epoch_start(self, trainer: 'Trainer', epoch: int) -> None:
+        for hook in self.hooks:
+            hook.on_epoch_start(trainer, epoch)
+
+    def on_epoch_end(self, trainer: 'Trainer', epoch: int) -> None:
+        for hook in self.hooks:
+            hook.on_epoch_end(trainer, epoch)
+
+    def on_train_step_start(self, trainer: 'Trainer', batches: List[Any], idx: int) -> None:
+        for hook in self.hooks:
+            hook.on_train_step_start(trainer, batches, idx)
+
+    def on_train_step_end(self, trainer: 'Trainer', outputs: List[Any], batches: List[Any], idx: int) -> None:
+        for hook in self.hooks:
+            hook.on_train_step_end(trainer, outputs, batches, idx)
+
+    def on_val_step_start(self, trainer: 'Trainer', batches: List[Any], idx: int) -> None:
+        for hook in self.hooks:
+            hook.on_val_step_start(trainer, batches, idx)
+
+    def on_val_step_end(self, trainer: 'Trainer', outputs: List[Any], batches: List[Any], idx: int) -> None:
+        for hook in self.hooks:
+            hook.on_val_step_end(trainer, outputs, batches, idx)
+
+    def after_aggregate_train_step_outputs(self, trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', train_loss: float, idx: int) -> None:
+        for hook in self.hooks:
+            hook.after_aggregate_train_step_outputs(trainer, aggregated_outputs, train_loss, idx)
+
+    def after_aggregate_val_step_outputs(self, trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', val_loss: float, idx: int) -> None:
+        for hook in self.hooks:
+            hook.after_aggregate_val_step_outputs(trainer, aggregated_outputs, val_loss, idx)
+
+    def before_zero_grad(self, trainer: 'Trainer') -> None:
+        for hook in self.hooks:
+            hook.before_zero_grad(trainer)
+
+    def after_zero_grad(self, trainer: 'Trainer') -> None:
+        for hook in self.hooks:
+            hook.after_zero_grad(trainer)
+
+    def before_sync_grad(self, trainer: 'Trainer') -> None:
+        for hook in self.hooks:
+            hook.before_sync_grad(trainer)
+
+    def after_sync_grad(self, trainer: 'Trainer') -> None:
+        for hook in self.hooks:
+            hook.after_sync_grad(trainer)
+
+    def before_gnorm_clip(self, trainer: 'Trainer') -> None:
+        for hook in self.hooks:
+            hook.before_gnorm_clip(trainer)
+
+    def after_gnorm_clip(self, trainer: 'Trainer', gnorm: torch.Tensor) -> None:
+        for hook in self.hooks:
+            hook.after_gnorm_clip(trainer, gnorm)
+
+    def before_optimizer_step(self, trainer: 'Trainer') -> None:
+        for hook in self.hooks:
+            hook.before_optimizer_step(trainer)
+
+    def after_optimizer_step(self, trainer: 'Trainer') -> None:
+        for hook in self.hooks:
+            hook.after_optimizer_step(trainer)
+
+    def on_load_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:
+        for hook in self.hooks:
+            hook.on_load_checkpoint(trainer, checkpoint)
+
+    def on_save_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:
+        for hook in self.hooks:
+            hook.on_save_checkpoint(trainer, checkpoint)

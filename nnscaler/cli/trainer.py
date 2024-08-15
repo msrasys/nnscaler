@@ -19,6 +19,7 @@ from nnscaler.utils import enforce_zero_num_worker
 import nnscaler.utils
 
 from .trainer_args import AggregatedOutputs, TrainerArgs
+from .train_hook import AggregatedTrainHook, TrainHook
 
 
 logger = logging.getLogger(__name__)
@@ -229,9 +230,21 @@ class Trainer:
         self.optimizer = self.train_args.create_parallel_optimizer(self.model)
         self.lr_scheduler = self.train_args.create_lr_scheduler(self.optimizer)
         self.loggers = self.train_args.create_loggers()
-        self.hook = self.train_args.create_hook()
+
+        supported_hook_components = [
+            self.model,
+            self.optimizer,
+            self.lr_scheduler,
+        ]
+        self.hook = AggregatedTrainHook(
+            [x for x in supported_hook_components if isinstance(x, TrainHook)]
+            + [self.train_args.create_hook()]
+        )
+
         self._log_config(self.train_args.to_dict())
         self._load_checkpoint()
+
+        self.hook.after_setup(self)
 
     @classmethod
     def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str):
@@ -619,6 +632,9 @@ class Trainer:
                 data_iter.set_postfix({'loss': loss})
 
             self.hook.before_sync_grad(self)
+            # actually `sync_shard_grad` is no-op here
+            # because trainer only supports end2end model
+            # and syncing grad in end2end model is done in `_train_step`.
             self.optimizer.sync_shard_grad()
             self.hook.after_sync_grad(self)
 

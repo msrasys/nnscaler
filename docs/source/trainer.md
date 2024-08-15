@@ -231,7 +231,12 @@ Internally we will get the final value with `__value_type(value)`.
     - `type` (`str`): The logger type or factory function.
     - `args` (`Dict[str, Any]`): The arguments of the logger.
 
-- `hook` (`Union[HookConfig, HookMapConfig, None]`): The hooks to be used. You can provide a hook with a hook class or a map of hook functions.
+- `hook` (`Union[HookConfig, HookMapConfig, None]`): The hooks to be used.
+You can provide a hook with a hook class or a map of hook functions.
+Please note if your `model`/`optimizer`/`lr_scheduler` inherit from `TrainHook`,
+their hook functions will be called automatically.
+The order of the hook functions called is `model` -> `optimizer` -> `lr_scheduler`,
+and hooks passed with this config is called in the last.
 
     Hook class:
 
@@ -250,6 +255,8 @@ Internally we will get the final value with `__value_type(value)`.
         ```python
         @dataclass
         class HookMapConfig:
+            after_setup: str = None
+
             on_train_start: str = None
             on_train_end: str = None
             on_val_start: str = None
@@ -278,6 +285,9 @@ Internally we will get the final value with `__value_type(value)`.
             on_load_checkpoint: str = None
             on_save_checkpoint: str = None
         ```
+    - `after_setup` (`str`): The hook function to be called after setting up the trainer.
+    Only be called when `run_mode == 'run'`.
+    Signature:  `def after_setup(trainer: 'Trainer') -> None:`
     - `on_train_start` (`str`): The hook function to be called at the start of the training stage. Signature:  `def on_train_start(trainer: 'Trainer') -> None:`
     - `on_train_end` (`str`): The hook function to be called at the end of the training stage. Signature:  `def on_train_end(trainer: 'Trainer') -> None:`
     - `on_val_start` (`str`): The hook function to be called at the start of the validation stage. Signature:  `def on_val_start(trainer: 'Trainer') -> None:`
@@ -292,7 +302,11 @@ Internally we will get the final value with `__value_type(value)`.
     - `after_aggregate_val_step_outputs` (`str`): The hook function to be called after aggregating the outputs of the model in the validation step. Signature:  `def after_aggregate_val_step_outputs(trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', val_loss: float, idx: int) -> None:`
     - `before_zero_grad` (`str`): The hook function to be called before zeroing the gradients. Signature:  `def before_zero_grad(trainer: 'Trainer') -> None:`
     - `after_zero_grad` (`str`): The hook function to be called after zeroing the gradients. Signature:  `def after_zero_grad(trainer: 'Trainer') -> None:`
-    - `before_sync_grad` (`str`): The hook function to be called before syncing the gradients between ranks. Signature:  `def before_sync_grad(trainer: 'Trainer') -> None:`
+    - `before_sync_grad` (`str`): The hook function to be called before syncing the gradients between ranks.
+    Please note this hook can't be triggered correctly,
+    and you should not reply on this.
+    Will fix it later.
+    Signature:  `def before_sync_grad(trainer: 'Trainer') -> None:`
     - `after_sync_grad` (`str`): The hook function to be called after syncing the gradients between ranks. Signature:  `def after_sync_grad(trainer: 'Trainer') -> None:`
     - `before_gnorm_clip` (`str`): The hook function to be called before gradient clipping. Signature:  `def before_gnorm_clip(trainer: 'Trainer') -> None:`
     - `after_gnorm_clip` (`str`): The hook function to be called after gradient clipping. Signature:  `def after_gnorm_clip(trainer: 'Trainer', gnorm: torch.Tensor) -> None:`

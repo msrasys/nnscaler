@@ -214,6 +214,8 @@ class HookConfig:
 
 @dataclass
 class HookMapConfig:
+    after_setup: str = None
+
     on_train_start: str = None
     on_train_end: str = None
     on_val_start: str = None
