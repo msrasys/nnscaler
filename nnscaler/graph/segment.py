@@ -1004,8 +1004,7 @@ class IRSegment(IRCell):
         inputs, outputs = set(), set()
         sub_cids = set(node.cid for node in nodes)
         for node in nodes:
-            for itensor in node.inputs():
-                if not isinstance(itensor, IRObject): continue
+            for itensor in node.iobjs():
                 if itensor.is_attr():
                     if attr_as_inputs:
                         inputs.add(itensor)
@@ -1018,8 +1017,7 @@ class IRSegment(IRCell):
                 # if no producers inside the nodes can produce data, set as input
                 if all(pid not in sub_cids for pid in pids):
                     inputs.add(itensor)
-            for otensor in node.outputs():
-                if not isinstance(otensor, IRObject): continue
+            for otensor in node.oobjs():
                 # if the tensor is required by segment outputs, set as output
                 if otensor in segment_outputs:
                     outputs.add(otensor)

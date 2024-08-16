@@ -9,7 +9,6 @@ from dataclasses import dataclass
 import inspect
 
 import nnscaler
-from nnscaler.runtime.device import DeviceGroup
 from nnscaler.flags import RuntimeFlag, CompileFlag
 
 import torch
@@ -57,7 +56,7 @@ def _load_module_attr(filename: str, name: str):
 
 
 def load_model(filename: Optional[str] = None, load_content: bool = True, fullmodel_filename: Optional[str] = None):
-    filename = f'gencode{DeviceGroup().rank}.py' if filename is None else filename
+    filename = f'gencode{nnscaler.runtime.device.DeviceGroup().rank}.py' if filename is None else filename
     module = _load_module_attr(filename, Path(filename).stem)
     loaded_module: nnscaler.runtime.module.CubeModule = module.GenModel().cuda()
     non_persistent_buffers = loaded_module.get_non_persistent_buffers()
@@ -79,13 +78,13 @@ def load_model(filename: Optional[str] = None, load_content: bool = True, fullmo
 
 
 def load_default_schedule(filename: Optional[str] = None):
-    filename = f'gencode{DeviceGroup().rank}.py' if filename is None else filename
+    filename = f'gencode{nnscaler.runtime.device.DeviceGroup().rank}.py' if filename is None else filename
     module = _load_module_attr(filename, Path(filename).stem)
     return module._train_step
 
 
 def load_eval_schedule(filename: Optional[str] = None):
-    filename = f'gencode{DeviceGroup().rank}.py' if filename is None else filename
+    filename = f'gencode{nnscaler.runtime.device.DeviceGroup().rank}.py' if filename is None else filename
     module = _load_module_attr(filename, Path(filename).stem)
     return module._infer_step
 
@@ -141,10 +140,10 @@ def setup_stride_broadcast_group(stride_size: int) -> BroadcastGroup:
     world_size = torch.distributed.get_world_size()
     for i in range(stride_size):
         ranks = list(range(i, world_size, stride_size))
-        DeviceGroup().get_group(ranks)
+        nnscaler.runtime.device.DeviceGroup().get_group(ranks)
 
     curr_parallel_group_ranks = list(range(rank % stride_size, world_size, stride_size))
-    curr_parallel_group = DeviceGroup().get_group(curr_parallel_group_ranks)
+    curr_parallel_group = nnscaler.runtime.device.DeviceGroup().get_group(curr_parallel_group_ranks)
     src_rank = min(curr_parallel_group_ranks)
 
     return BroadcastGroup(
@@ -260,6 +259,12 @@ def transform_recursively(data: Any, fn: Callable[[Any], Any],
         if target_types(data):
             return fn(data)
     return data
+
+
+def select_many(data: Iterable[Any], fn: Callable[[Any], Iterable[Any]]) -> Iterable[Any]:
+    """Select many elements from the iterable with the given function."""
+    for item in data:
+        yield from fn(item)
 
 
 class accum_mode:

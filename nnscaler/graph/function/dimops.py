@@ -716,7 +716,7 @@ class IRDimops(IRFwOperation):
         for oidx, otensor in enumerate(self.outputs()):
             shape_anno = self.oanno(oidx)
             if shape_anno.ignore:
-                assert isinstance(otensor, IRObject), f"expect IRObject for unknown shape, get {otensor}"
+                # otensor can be any type, including IRObject, collection types (list, dict, etc.)
                 continue
             shape = []
             for odim in range(shape_anno.ndims):

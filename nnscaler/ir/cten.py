@@ -215,6 +215,11 @@ class IRCell:
         """
         return tuple(self._outputs)
 
+    def _copy_and_set_cell(self, x: IRObject) -> IRObject:
+        x = copy.copy(x)
+        x.cell = self
+        return x
+
     def reset_inputs(self, length:int) -> None:
         """
         Resize the inputs list to the new length and reset all input items to None.
@@ -232,12 +237,39 @@ class IRCell:
         Returns:
             NestedVarOrStatic: copied value
         """
-        if isinstance(val, IRObject):
-            # copy the val
-            val = copy.copy(val)
-            val.cell = self
+        # recursive set cell
+        val = IRCell.modify_objects_of_complex(val, self._copy_and_set_cell)
+
         self._inputs[index] = val
         self.inputs.cache_clear()
+        self.iobjs.cache_clear()
+        return val
+
+    def reset_kwargs(self) -> None:
+        """
+        Clear all kwargs
+        """
+        self._kwargs = {}
+        self.iobjs.cache_clear()
+
+    def set_kwarg(self, name: str, val: NestedVarOrStatic) -> NestedVarOrStatic:
+        """Set the kwarg with name
+
+        Args:
+            val (NestedVarOrStatic): (nested) IRObject or any deterministic value (int, bool, str, etc)
+
+        Returns:
+            NestedVarOrStatic: copied value
+        """
+        # TODO: is it possible that kwargs can be IRTensor?
+        # But it is used in unit tests.
+        # if isinstance(val, IRTensor):
+        #     raise ValueError("IRTensor is not allowed to be a kwarg")
+
+        # recursive set cell
+        val = IRCell.modify_objects_of_complex(val, self._copy_and_set_cell)
+
+        self._kwargs[name] = val
         self.iobjs.cache_clear()
         return val
 
@@ -259,9 +291,9 @@ class IRCell:
         Returns:
             NestedVarOrStatic: copied value
         """
-        if isinstance(val, IRObject):
-            val = copy.copy(val)
-            val.cell = self
+        # recursive set cell
+        val = IRCell.modify_objects_of_complex(val, self._copy_and_set_cell)
+
         self._outputs[index] = val
         self.outputs.cache_clear()
         self.oobjs.cache_clear()

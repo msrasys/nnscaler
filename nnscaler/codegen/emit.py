@@ -223,12 +223,52 @@ class FuncEmission(CodeEmission):
         body = emit_rule(node, inputs, kwargs, runtime_devid, plan_ndevs, runtime_ndevs)
 
         if len(node.outputs()) == 0:
-            code = body
+            codes.append(body)
         else:
-            outputs = [self.tensor_name(t) for t in node.outputs()]
-            outputs = ', '.join(outputs)
-            code = f'{outputs} = {body}'
-        codes.append(code)
+            irobj_path = {}
+            def r(t, current_path):
+                if isinstance(t, IRObject):
+                    irobj_path[t] = current_path
+                elif isinstance(t, (list, tuple)):
+                    for i, v in enumerate(t):
+                        r(v, current_path + [i])
+                elif isinstance(t, dict):
+                    for k, v in t.items():
+                        r(v, current_path + [k])
+                else:
+                    # do nothing
+                    pass
+            r(node.outputs(), [])
+            if all(len(x) == 1 for x in irobj_path.values()):
+                # if all IRObjects are leafs, we can directly assign the output
+                outputs = [self.tensor_name(t) for t in node.outputs()]
+                outputs = ', '.join(outputs)
+                codes.append(f'{outputs} = {body}')
+            else:
+                outputs = []
+                im_outputs = []
+                for t in node.outputs():
+                    if isinstance(t, IRObject):
+                        outputs.append(self.tensor_name(t))
+                    else:
+                        # new intermediate output
+                        im_ouptut = self.tensor_name(IRObject('im_output'))
+                        im_outputs.append(im_ouptut)
+                        outputs.append(im_ouptut)
+                codes.append(f'{", ".join(outputs)} = {body}')
+
+                for t, path in irobj_path.items():
+                    if len(path) == 1: # immediate output, skip
+                        continue
+                    out = outputs[path[0]]
+                    for p in path[1:]:
+                        out = f'{out}[{repr(p)}]' # extract step by step
+                    codes.append(f'{self.tensor_name(t)} = {out}')
+                # release intermediate outputs
+                # because they are not used in the future, and don't managed by lifecycle
+                for im_output in im_outputs:
+                    codes.append(f'del {im_output}')
+
         return codes
 
     def emit_adapter(self, node: IRAdapter, prefix_attr: Optional[str] = None,

@@ -183,7 +183,10 @@ class IRGraph(IRSegment):
             for idx, ftensor in enumerate(node.outputs()):
                 subtensor = IRCell.modify_objects_of_complex(ftensor, modifier)
                 node.set_output(idx, subtensor)
-            node.kwargs.update(IRCell.modify_objects_of_complex(node.kwargs, modifier))
+            for key in node.kwargs.keys():
+                subtensor = IRCell.modify_objects_of_complex(node.kwargs[key], modifier)
+                node.set_kwarg(key, subtensor)
+
         graph = IRGraph(nodes, inputs, outputs, module_name)
 
         # check IRPyFunc

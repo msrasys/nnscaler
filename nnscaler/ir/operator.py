@@ -32,16 +32,8 @@ class IRFwOperation(IRCell):
             self.set_input(idx, input)
 
         # setup kwargs
-        # similar with set_input and set_output, the IRObject
-        # in kwargs will be set with copy-on-write to avoid
-        # potential modifications outside.
-        def replace(t: IRObject):
-            t = copy.copy(t)
-            t.cell = self
-            return t
-
-        kwargs = IRCell.modify_objects_of_complex(kwargs, replace)
-        self.kwargs.update(kwargs)
+        for name, value in kwargs.items():
+            self.set_kwarg(name, value)
 
         # default infer rule
         requires_grad = any(
@@ -122,6 +114,9 @@ class IRFwOperation(IRCell):
         cpy.reset_outputs(len(self.outputs()))
         for idx, output in enumerate(self.outputs()):
             cpy.set_output(idx, output)
+        cpy.reset_kwargs()
+        for name, value in self.kwargs.items():
+            cpy.set_kwarg(name, value)
         cpy._mirror = None
         cpy.recompute = self.recompute
         return cpy
@@ -177,6 +172,7 @@ class IRBpOperation(IRCell):
         cpy.reset_outputs(len(self.outputs()))
         for idx, output in enumerate(self.outputs()):
             cpy.set_output(idx, output)
+        assert not cpy.kwargs, "No kwargs for backward op"
         cpy._mirror = None
         return cpy
 
@@ -218,6 +214,9 @@ class IRDataOperation(IRCell):
         cpy.reset_outputs(len(self.outputs()))
         for idx, output in enumerate(self.outputs()):
             cpy.set_output(idx, output)
+        cpy.reset_kwargs()
+        for name, value in self.kwargs.items():
+            cpy.set_kwarg(name, value)
         cpy._mirror = None
         return cpy
 

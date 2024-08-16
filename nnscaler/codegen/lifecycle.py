@@ -54,10 +54,10 @@ class LifeCycle:
 
             # aggressively mark all outputs for immediate deletion,
             # namely *after* 'i'-th statement, in case it's never used.
-            self.lifetime.update((tout, i) for tout in outputs if is_activation(tout))
+            self.lifetime.update((tout, i) for tout in IRSegment.get_objects_from_complex(outputs) if is_activation(tout))
 
             # "fast-forward" all inputs to the current statement, namely after 'i'-th node.
-            self.lifetime.update((tin, i) for tin in inputs if is_activation(tin))
+            self.lifetime.update((tin, i) for tin in IRSegment.get_objects_from_complex(inputs) if is_activation(tin))
 
 
         # Here (i+1) is always greater than 'len(nodes)'
