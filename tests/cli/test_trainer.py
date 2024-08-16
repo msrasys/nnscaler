@@ -8,6 +8,7 @@ import torch.distributed
 from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import AggregatedOutputs
 from tests.parallel_module.common import assert_equal
+from tests.utils import replace_all_device_with
 from ..launch_torchrun import launch_torchrun
 
 
@@ -57,6 +58,27 @@ def trainer_logging_worker(save_dir):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 def test_trainer_logging(tmp_path):
     launch_torchrun(4, trainer_logging_worker, tmp_path)
+
+
+@replace_all_device_with('cpu')
+def test_trainer_compile_worker(tmp_path):
+    save_dir = Path(tmp_path)
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    gen_savedir = save_dir / 'gen'
+    # compile only
+    Trainer([
+        '-f', config_path,
+        '--max_epochs', '2',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--checkpoint.no_save', 'true',
+        '--run_mode', 'compile',
+        '--broadcast_strategy', 'none',
+    ])
+
+    assert set([f.name for f in gen_savedir.glob('**/*.py')]) == set(['gencode0.py', 'gencode1.py', 'gencode2.py', 'gencode3.py'])
+    shutil.rmtree(gen_savedir)
 
 
 def trainer_resume_worker(save_dir, save_type, bf16):

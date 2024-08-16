@@ -11,6 +11,7 @@ import logging
 import torch
 import torch.distributed
 from torch.utils.data import DataLoader
+import psutil
 
 from tqdm import tqdm
 
@@ -213,7 +214,7 @@ class Trainer:
             gen_savedir=self.train_args.gen_savedir,
             reuse=self.train_args.gen_reuse,
             instance_name=self.train_args.instance_name,
-            broadcast_strategy='all',
+            broadcast_strategy=self.train_args.broadcast_strategy,
             load_module=not compile_only,
         )
         if compile_only:
@@ -228,7 +229,11 @@ class Trainer:
         self.model = pmodel_class()
         self.model.cuda()
         self.optimizer = self.train_args.create_parallel_optimizer(self.model)
-        # the reduce op is `sum` by default, follow torch's c10d, grad is divided by scaling_factor before allreduce
+        # Here we carefully scale down the gradient locally with 1/scale_factor before reduce,
+        # (the reduce op is `sum` by default, follow torch's c10d, grad is divided by scaling_factor before allreduce)
+        # and scale up the gradient after reduce
+        # (see `train_args.optimizer.grad_reduction`` handling in `train_epoch`).
+        # This is useful to avoid overflow when the gradients are large.
         def reducer_pre_hook(reducer, grad):
             grad.div_(self.train_args.scaling_factor)
         self.optimizer.register_reducer_pre_hook(reducer_pre_hook)
@@ -276,7 +281,8 @@ class Trainer:
         for logger in self.loggers:
             logger.finalize()
 
-    def log_metrics(self, metrics: Dict[str, float], step: int, *, tag: Optional[str] = None):
+    def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None, *, tag: Optional[str] = None):
+        step = step or self.num_train_steps
         for logger in self.loggers:
             logger.log_metrics(metrics, step, tag=tag)
 
@@ -321,6 +327,22 @@ class Trainer:
             if self.lr_scheduler:
                 self.lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
         self.train_status = TrainStatus(**state_dict['train_status'])
+
+    def _log_mem_stats(self, tag=None):
+        # log minimum free memory over the iteration
+        cuda_free, _ = torch.cuda.mem_get_info()
+        cuda_gb_free = cuda_free / 1024 / 1024 / 1024
+        cuda_gb_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024
+        cuda_gb_reserved = torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024
+        ram_gb_used = psutil.virtual_memory().used / 1024 / 1024 / 1024
+        torch.cuda.reset_peak_memory_stats()
+
+        self.log_metrics({
+            'cuda_gb_allocated': cuda_gb_allocated,
+            'cuda_gb_reserved': cuda_gb_reserved,
+            'cuda_gb_free': cuda_gb_free,
+            'ram_gb_used': ram_gb_used,
+         }, tag=tag)
 
     def _save_checkpoint(self, loss):
         checkpoint_config = self.train_args.checkpoint
@@ -485,6 +507,10 @@ class Trainer:
         assert self.train_status.next_batch_index <= self.total_train_steps_per_epoch, \
             f"next_batch_index({self.train_status.next_batch_index}) " \
             f"should not be larger than total_train_steps_per_epoch ({self.total_train_steps_per_epoch})"
+
+        # reset peak memory stats before training
+        # So that we can get accurate peak memory usage for each step
+        torch.cuda.reset_peak_memory_stats()
 
         if self.train_status.next_batch_index == self.total_train_steps_per_epoch:
             self.train_status.epoch += 1
@@ -675,6 +701,7 @@ class Trainer:
             if self.lr_scheduler and self.train_args.lr_scheduler.interval == 'step':
                 self.lr_scheduler.step()
 
+            self._log_mem_stats(tag='train')
             self.log_metrics(
                 {k:v for k, v in asdict(step_stat).items() if v is not None},
                 self.num_train_steps,

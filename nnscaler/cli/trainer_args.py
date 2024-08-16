@@ -5,6 +5,7 @@ from typing_extensions import get_args
 from pathlib import Path
 import logging
 import copy
+import os
 
 import torch
 import torch.utils
@@ -14,7 +15,7 @@ import yaml
 import torch
 
 from nnscaler.utils import transform_recursively
-from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, _PREDEFINED_POLICIES
+from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
 from nnscaler.runtime.module import ParallelModule
 
 from .arg_parser import deserialize_dataclass, merge_args, parse_args, _TYPE_KEY, _VALUE_TYPE_KEY, _VALUE_KEY
@@ -350,6 +351,9 @@ class TrainerArgs:
         else:
             self.gen_reuse = 'moo' if self.run_mode == 'compile' else 'match'
 
+        if self.broadcast_strategy not in [e.value for e in BroadcastGenFilesStrategy]:
+            raise ValueError(f"Invalid broadcast_strategy {self.broadcast_strategy}")
+
         supported_precision_type = get_args(_PRECISION_TYPE)
         supported_tensor_type = get_args(_TENSOR_TYPE)
         if not self.precision:
@@ -510,7 +514,8 @@ class TrainerArgs:
         kwargs = self.create_kwarg(sampler_args)
         kwargs['dataset'] = dataset
         kwargs['num_replicas'] = self.compute_config.runtime_ngpus // self.compute_config.plan_ngpus
-        kwargs['rank'] = torch.distributed.get_rank() // self.compute_config.plan_ngpus
+        # if not distributed, we use the rank 0 sampler
+        kwargs['rank'] = int(os.environ.get('RANK', 0)) // self.compute_config.plan_ngpus
         sampler_class = load_type(self.dataset_sampler.type)
         return sampler_class(**kwargs)
 

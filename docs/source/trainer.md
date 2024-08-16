@@ -388,7 +388,11 @@ You can pass builtin pas policy name or your own pas policy function.
 See `parallelize` API for more information.
 - `broadcast_strategy` (`str`): The strategy of broadcasting the model. Default is `all`. See `parallelize` API for more information.
 - `instance_name` (`str`): The instance name of the trainer. Default is `None`. See `parallelize` API for more information.
-- `run_mode` (`str`): The run mode of the trainer. It can be `run` (compile and train the model) and `compile` (only compile the model to generate code). Default is `run`.
+- `run_mode` (`str`): The run mode of the trainer.
+It can be `run` (compile and train the model in a single python script OR train from previous compiling results) and `compile` (only compile the model for code generation). Default is `run`.
+Please note you can only use `run` mode with `torchrun`.
+On the other hand, if you disable broadcasting generated files (by setting `broadcast_strategy` to `none`),
+you can run `compile` mode without `torchrun`.
 - `tracing_from_weights` (`str`): The path to the weights to be loaded when tracing(compiling) the model. It is only used in tracing to serve as the initial state dict of the model. Default is `None`.
 - `precison`(`Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE], None]`): The precision of the model. It can be a `str`, which means the same precision for all tensors, or a `Dict[_TENSOR_TYPE, _PRECISION_TYPE]`, which means the precision for each tensor type. Default is `None`. Currently we support 3 tensor types (`param`, `buffer`, `input`) and three precisions (`fp32`, `fp16`, `bf16`). You can set precision to `none` to avoid any precision conversion.
 - `micro_batch_size` (`int`): The micro batch size. Default is `1`.
