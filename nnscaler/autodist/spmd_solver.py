@@ -89,6 +89,61 @@ class ModuleMemCostDesc:
 
 
 class SPMDSolver:
+    """
+    Assume the dataflow graph is
+           a
+          / \
+         b   c
+         |  / \
+         d  e  f
+         | /   |
+         g     h
+    and operators are stored in a topological order [a, b, d, c, e, f, g, h].
+
+    In SPMD solver, dynamic programming is used to find the optimal partition plan where
+    dp[p(u), M] is the optimal plan for the subgraph ending with u in partition state p,
+    with memory bound M. if v is the predecessor of u in the topological order, then
+    dp[p(u), M] = min(dp[q(v), M - mem(p(u))] + comm_cost(p(u), q(v))) + comp_cost(p(u)) + comm_cost(p(u))
+    where q(v) is the partition state of v, mem(p(u)) is the memory cost of p(u),
+    comm_cost(p(u), q(v)) is the communication cost between p(u) and q(v), and
+    comp_cost(p(u)) is the computation cost of p(u), comm_cost(p(u)) is the communication
+    cost of p(u) (like the allreduce cost in model update).
+
+    However, u and v may be disconnected in the dataflow graph, like [d, c], [e, f], [f, g]
+    and [g, h] in the example above. To calculate the communication cost between p(u) and q(v),
+    we need to store additional information in the partition state. For example, we need to maintain
+    the partition state of node d in the partition state of node c, so that we can calculate the
+    communication cost when reaching node g.
+
+    To achieve this, we calcuate the `cut_ops` for each node, which is the set of nodes that
+    need to be maintained in the partition state of the current node. The cut ops for the example
+    above are:
+    a: [a]
+    b: [a, b]
+    d: [a, d]
+    c: [d, c]
+    e: [d, c, e]
+    f: [d, e, f]
+    g: [f, g]
+    h: [h]
+
+    To be more specific, the `cut_ops` is calculated by the following steps:
+    1. calculate the `out_degs` for each node, which is the number of consumers of the node
+    2. traverse the nodes in the topological order
+        - decrease each producer's `out_degs` by 1, if the `out_degs` is 0, remove the producer
+          from the `unclosed_idx` and set current node's idx (time) as the producer's 'close_time' 
+        - set current node's `cut_ops` as the union of `unclosed_idx` and the node itself
+        - add the node to `unclosed_idx` if its #consumers > 0 
+
+    However, in real-world scenarios, certain positions might have a large number of `cut_ops`, 
+    and each op may have more than one partitioning strategy (for example, when the input data flow graph
+    is a complete graph). In such cases, the search space becomes very large, making it impossible to solve
+    within limited time and space. To help users reduce the search space, we calculate a metric called
+    `importance_ratio` for each op, which describes the percentage reduction in search space if the partitioning
+    strategy for that op is restricted to just one.
+    Thus, users can view the top 10 ops with the highest `importance ratio` output by autodist and use the
+    `partition constraint` interface to restrict the partitioning space of these ops, thereby speeding up the search process.
+    """
 
     def __init__(
         self,
@@ -119,39 +174,6 @@ class SPMDSolver:
         self.cost_database.profile_comp(self.device_num)
         self.stage_num = stage_num
 
-        # assume the dataflow graph is
-        #        a
-        #       / \
-        #      b   c
-        #      |  / \
-        #      d  e  f
-        #      | /   |
-        #      g     h
-        # the ops are stored in a topological order [a, b, d, c, e, f, g, h]
-        # in spmd solver, dynamic programming is used to find the optimal partition plan
-        # dp[p(u), M] is the optimal plan for the subgraph ending with u in partition state p,
-        # with memory bound M. if v is the predecessor of u in the topological order, then
-        # dp[p(u), M] = min(dp[q(v), M - mem(p(u))] + comm_cost(p(u), q(v))) + comp_cost(p(u)) + comm_cost(p(u))
-        # where q(v) is the partition state of v, mem(p(u)) is the memory cost of p(u),
-        # comm_cost(p(u), q(v)) is the communication cost between p(u) and q(v), and
-        # comp_cost(p(u)) is the computation cost of p(u), comm_cost(p(u)) is the communication
-        # cost of p(u) (like the allreduce cost in model update).
-        # However, u and v may not be connected in the dataflow graph, like [d, c], [e, f], [f, g]
-        # and [g, h] in the example above. To calculate the communication cost between p(u) and q(v),
-        # we need to store additional information in the partition state. For example, we need to maintain
-        # the partition state of node d in the partition state of node c, so that we can calculate the
-        # communication cost when reaching node g.
-        # to achieve this, we calcuate the 'cut ops' for each node, which is the set of nodes that
-        # need to be maintained in the partition state of the current node. The cut ops for the example
-        # above are:
-        # a: [a]
-        # b: [a, b]
-        # d: [a, d]
-        # c: [d, c]
-        # e: [d, c, e]
-        # f: [d, e, f]
-        # g: [f, g]
-        # h: [h]
         self.initialize()
 
     def initialize(self):
@@ -686,6 +708,7 @@ class SPMDSolver:
     def calc_partition_info(self):
         self.partition_info: List[List[PartitionCostDesc]] = list()
         state_num = 0
+        prefix_state_sums: List[int] = [0] * self.graph.op_num
         for i in range(self.graph.op_num):
             cur_info = []
             _logger.debug(f'calc partition info for {self.get_operator(i)}')
@@ -702,8 +725,30 @@ class SPMDSolver:
             cut_partition_cnts = [self.get_op_partition_count(idx) for idx in self.cut_ops[i]]
             cur_state_num = functools.reduce(lambda x, y: x * y, cut_partition_cnts, 1)
             state_num += cur_state_num
+            prefix_state_sums[i] = state_num
             _logger.debug(f'{i}-th operator follow {self.get_father_id(i)} with cut ops {self.cut_ops[i]}, {cut_partition_cnts}, {cur_state_num}')
         _logger.info(f'total state num is {state_num}')
+        if state_num > 1024 * 1024:
+            _logger.warning(f'too many states, please consider to add constraints to partition spaces of following operators')
+        importance_ratios: List[Tuple[float, int]] = list()
+        desc_str = 'output each operator\'s importance ratio (percentages of states that can be reduced by forcing the operator to be partitioned in a single partition)\n'
+        for i in range(self.graph.op_num):
+            partition_cnt = self.get_op_partition_count(i)
+            if partition_cnt == 1:
+                continue
+            if i not in self.close_times:
+                continue
+            related_state_num = prefix_state_sums[self.close_times[i] - 1]
+            if i > 0:
+                related_state_num -= prefix_state_sums[i - 1]
+            ratio = related_state_num / partition_cnt / state_num * (partition_cnt - 1)
+            importance_ratios.append((ratio, i))
+        importance_ratios.sort(reverse=True)
+        for idx in range(min(10, len(importance_ratios))):
+            ratio, i = importance_ratios[idx]
+            node = self.get_operator(i).ir_cell
+            desc_str += f'operator {node} has {self.get_op_partition_count(i)} partitions, importance ratio {ratio:.3f}\nat {node.comment}\n\n'
+        _logger.info(desc_str)
         _logger.info('finish spmd solver initializetion')
 
     def estimate_min_mem(self, start: int, end: int) -> int:
@@ -868,6 +913,7 @@ class SPMDSolver:
         out_degs = [len(op.consumers) for op in self.graph.operator_list]
         unclosed_idx = set()
         self.cut_ops: List[List[int]] = list()
+        self.close_times: Dict[int, int] = dict()
         for i, op in enumerate(self.graph.operator_list):
             for pred in op.producers:
                 pred_idx = cid2idx[pred.ir_cell.cid]
@@ -875,6 +921,7 @@ class SPMDSolver:
                 out_degs[pred_idx] -= 1
                 if out_degs[pred_idx] == 0:
                     unclosed_idx.remove(pred_idx)
+                    self.close_times[pred_idx] = i
             ret = list(unclosed_idx) + [i]
             ret.sort()
             self.cut_ops.append(ret)
