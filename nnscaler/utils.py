@@ -7,6 +7,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 import inspect
+import os
 
 import nnscaler
 from nnscaler.flags import RuntimeFlag, CompileFlag
@@ -259,6 +260,14 @@ def transform_recursively(data: Any, fn: Callable[[Any], Any],
         if target_types(data):
             return fn(data)
     return data
+
+
+def is_running_distributed() -> bool:
+    """Check if the current process is running under torchrun."""
+    # TORCHELASTIC_RUN_ID is more unique than 'RANK'/'WORLD_SIZE'
+    # so we use it to determine if the process is running under torchrun.
+    # TODO: Is there a better way?
+    return 'TORCHELASTIC_RUN_ID' in os.environ
 
 
 def select_many(data: Iterable[Any], fn: Callable[[Any], Iterable[Any]]) -> Iterable[Any]:

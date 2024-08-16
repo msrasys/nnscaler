@@ -16,7 +16,7 @@ import psutil
 from tqdm import tqdm
 
 import nnscaler
-from nnscaler.utils import enforce_zero_num_worker
+from nnscaler.utils import enforce_zero_num_worker, is_running_distributed
 import nnscaler.utils
 
 from .trainer_args import AggregatedOutputs, TrainerArgs
@@ -135,7 +135,8 @@ class Trainer:
     def _setup(self):
         self.train_args.init_env()
         compile_only = self.train_args.run_mode == 'compile'
-        if not compile_only:
+
+        if is_running_distributed():
             nnscaler.init()
             if torch.distributed.get_rank() == 0:
                 logging.getLogger().setLevel(logging.INFO)
