@@ -407,22 +407,27 @@ class ConcreteTracer(TracerBase):
 
         try:
             if self.cpu_offload:
-                args = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cuda(), args)
-                kwargs = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cuda(), kwargs)
+                # Concrete tracer use `.cuda()` to execute operators in device and `.cpu()` to move the result back to host.
+                # In most cases, `.cuda()` and `.cpu()` keeps the source tensor's `requires_grad` attributes.
+                # The context `torch.no_grad` enforces requires_grad=False for all tensors that generated in its scope.
+                # As a result, behavior of `.cuda()` and `.cpu()' is unexpected.
+                # To handle this case, we manually set the `requires_grad` field after `.cuda()` and `.cpu()`. 
+                args = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cuda().requires_grad_(x.requires_grad), args)
+                kwargs = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cuda().requires_grad_(x.requires_grad), kwargs)
             result = run(kind, target, args, kwargs)
         except torch.cuda.OutOfMemoryError:
             if self.cpu_offload:
                 _logger.warning(f"cuda out of memory, try to trace {target} on cpu.")
-                args = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu(), args)
-                kwargs = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu(), kwargs)
+                args = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu().requires_grad_(x.requires_grad), args)
+                kwargs = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu().requires_grad_(x.requires_grad), kwargs)
                 result = run(kind, target, args, kwargs)
             else:
                 raise
 
         if self.cpu_offload:
-            args = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu(), args)
-            kwargs = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu(), kwargs)
-            result = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu(), result)
+            args = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu().requires_grad_(x.requires_grad), args)
+            kwargs = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu().requires_grad_(x.requires_grad), kwargs)
+            result = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu().requires_grad_(x.requires_grad), result)
 
             if not pytree_utils.tree_any(lambda x: isinstance(x, torch.Tensor), result) and \
                 pytree_utils.tree_any(lambda x: not isinstance(x, (*base_types, type(None), torch.Tensor)), result):
