@@ -42,7 +42,7 @@ from nnscaler.runtime.module import AttrMeta, CubeModule, ParallelModule, Origin
 
 from nnscaler.flags import CompileFlag, RuntimeFlag
 import nnscaler.policies as policies
-from nnscaler.program import Program
+from nnscaler.program import disable_global_graph
 from nnscaler.utils import get_member_by_name, setup_stride_broadcast_group, get_shared_params
 
 logger = logging.getLogger(__name__)
@@ -613,9 +613,8 @@ def _gen_graph(
     inference_only: bool = False,
 ):
     # reset environment
-    program = Program()
-    program.clear()
     IDGenerator().clear()
+    disable_global_graph()
 
     module.cpu()
     forward_args_default = _get_arg_default_values(module.forward)
@@ -628,7 +627,7 @@ def _gen_graph(
     fx_graph = parser.to_fx_graph(module, dummy_forward_args)
 
     # generate ir logic graph
-    ir_graph = parser.to_ir_graph(
+    graph = parser.to_ir_graph(
         fx_graph, dummy_forward_args, outdir, constant_folding
     )
 
@@ -660,42 +659,27 @@ def _gen_graph(
             ir_dummy_inputs[i] = IRObject(fx_input_nodes[i].target, value=ir_dummy_inputs[i], is_constant=False)
 
     # generate complete ir graph
+    ir_dummy_outputs = graph(*ir_dummy_inputs)
     if end2end_mode:
         # in end2end mode, we must use dataloader as the first argument of forward
         # we assume the first argument of forward is the data sample (which is a requirement in our doc)
+        graph.use_dataloader_input()
 
-        # the IRObject representing the `dataloader` instance, which is only used by the
-        # IRDataOperation. Since we already know the output of the dataloader,
-        # we don't need to set the value for it.
-        ir_root_obj = IRObject(name='dataloader', value=None, is_constant=False)
-        Program().set_input([ir_root_obj])
-        data_op = IRDataOperation(ir_root_obj, ir_dummy_inputs)
-        # add the data operation to the graph, which will use `next` to get data.
-        Program().add_node(data_op)
-        ir_dummy_outputs = ir_graph(*ir_dummy_inputs)
-        graph = program.get_graph()
         # we require the first output is the loss
         if isinstance(ir_dummy_outputs, (list, tuple)):
             ir_loss = ir_dummy_outputs[0]
         else:
             ir_loss = ir_dummy_outputs
         if not isinstance(ir_loss, IRTensor) or ir_loss.shape != (1,):
-            # TODO: update when we support scalar tensor
+            # internally scalar tensor will be reshaped to (1,) in IRGraph
             raise RuntimeError(f"Loss can only be scalar tensor but got {ir_loss.shape if isinstance(ir_loss, IRTensor) else ir_loss}")
-        if not inference_only:
-            ir_loss.backward()
     else:
-        program.set_input(ir_dummy_inputs)
-        ir_dummy_outputs = ir_graph(*ir_dummy_inputs)
-        graph = program.get_graph()
-        if not inference_only:
-            graph.backward()
+        ir_loss = None
 
-    if ir_dummy_outputs is None: ir_dummy_outputs = []
-    elif not isinstance(ir_dummy_outputs, (tuple, list)):
-        ir_dummy_outputs = [ir_dummy_outputs]
-    program.set_output(ir_dummy_outputs)
-    program.finalize()
+    if not inference_only:
+        graph.backward(ir_loss)
+    else:
+        graph.no_backward()
 
     return graph, forward_args
 

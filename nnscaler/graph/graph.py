@@ -102,10 +102,15 @@ class IRGraph(IRSegment):
             # reset output
             self.replace_output(iobj, arg)
 
-        from nnscaler.program import Program
-        Program().add_nodes(self.nodes())
+        # set global graph, so @compile can access it.
+        # @compile needs a global graph to work
+        from nnscaler.program import Program, is_global_graph_enabled
+        if is_global_graph_enabled():
+            Program().add_nodes(self.nodes())
 
-        # return
+        # return the output of the graph
+        # the return value simulates the output of the model `forward`
+        # e.g. If there is only one output, return the output tensor directly instead of a tuple
         if len(self.outputs()) == 1:
             return self.output(0)
         else:
@@ -135,6 +140,18 @@ class IRGraph(IRSegment):
         if loss is not None:  # optimize graph with loss
             # set loss gradient
             loss.parent.to_loss()
+
+        # update input gradient
+        # Please note `infer_grad` will not set the grad of input tensors.
+        for t in IRGraph.get_objects_from_complex(self.inputs()):
+            if isinstance(t, IRSubTensor) and t.requires_grad:
+                t.grad = t.parent.grad.tosub()
+
+        # update output gradient
+        # Please note `infer_grad` will not set the grad of output tensors.
+        for t in IRGraph.get_objects_from_complex(self.outputs()):
+            if isinstance(t, IRSubTensor) and t.requires_grad:
+                t.grad = t.parent.grad.tosub()
 
         # infer gradient
         for ftensor in self.full_tensors():
@@ -171,6 +188,30 @@ class IRGraph(IRSegment):
         Returns:
             IRGraph: the graph with each tensor is IRSubTensor.
         """
+        # currently fx graph always has only one output
+        assert len(outputs) == 1, "Single output graph is expected"
+        if isinstance(outputs[0], tuple):
+            # fx graph will always wrap the graph output with a tuple of outputs
+            # case 1: the return value of graph looks like `return x, y, z`
+            #    here `outputs` will be `[(x,y,z)]`
+            #    we will remove the outer tuple to make graph outputs[0]/[1]/[2] as x/y/z respectively
+            # case 2: the return value of graph is a single value `return [[x]]`
+            #    here `outputs` will be `[[[x]]]`
+            #    just meet our requirement, no need to change
+            #    the graph outputs[0] is `[[x]]``
+            # case 3: the return value of graph is a single value `return x`
+            #    here `outputs` will be `[x]`
+            #    just meet our requirement, no need to change
+            #    the graph outputs[0] is `x`
+            # Please note that
+            # 1. we treat `return x, y, z` and `return tuple(x, y, z)` as the same
+            # 2. we treat `return (x,)` and `return x` as the same
+            # Case 2 can lead to problem because it changes the return of `module.forward`,
+            #    so we will raise error for this case for now.
+            outputs = outputs[0]
+            if isinstance(outputs, tuple) and len(outputs) == 1:
+                raise RuntimeError("Single tuple outputs (like `return (x,)`) is not supported")
+
         modifier = lambda t: t.tosub() if isinstance(t, IRFullTensor) else t
         # input / output
         inputs = [IRCell.modify_objects_of_complex(t, modifier) for t in inputs]
@@ -229,6 +270,30 @@ class IRGraph(IRSegment):
             _logger.warning(dscp)
 
         return graph
+
+    def use_dataloader_input(self):
+        """
+        connect the graph with dataloader input.
+        """
+        # replace graph inputs with dataloader
+        # the IRObject representing the `dataloader` instance, which is only used by the
+        # IRDataOperation. Since we already know the output of the dataloader,
+        # we don't need to set the value for it.
+        ir_root_obj = IRObject(name='dataloader', value=None, is_constant=False)
+        data_op = IRDataOperation(ir_root_obj, self.inputs())
+        # add the data operation to the graph, which will use `next` to get data.
+        self.insert(data_op, 0)
+        self.reset_inputs(1)
+        self.set_input(0, ir_root_obj)
+
+    def no_backward(self):
+        """
+        Set all tensors with requires_grad=False to simulate no backward scenario (inference only).
+        """
+        if any(isinstance(node, IRBpOperation) for node in self.nodes()):
+            raise RuntimeError("Cannot set no_backward for a graph with backward operators")
+        for ftensor in self.full_tensors():
+            ftensor.requires_grad = False
 
     ##### Transformation Primitives #####
 

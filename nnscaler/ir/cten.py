@@ -734,13 +734,14 @@ class IRTensor(IRObject):
 
     def backward(self) -> None:
         """
-        Autograd backward on the tensor
+        Autograd backward on the tensor, which is used in @compile
 
         The backward will apply on the program graph
 
         @return None
         """
-        from nnscaler.program import Program
+        from nnscaler.program import Program, is_global_graph_enabled
+        assert is_global_graph_enabled(), "Require global graph enabled to call loss.backward()"
         graph = Program().get_graph()
         return graph.backward(self)
 

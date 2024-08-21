@@ -1,5 +1,6 @@
 import inspect
 import tempfile
+from contextlib import nullcontext
 
 import torch
 import pytest
@@ -94,6 +95,66 @@ def test_codegen_args():
                 gen_savedir=tempdir,
                 load_module=True
             )
+
+
+class TupleReturnModule1(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(3, 5)
+
+    def forward(self, x, y):
+        return self.linear(x) + y, y + 10
+
+
+@replace_all_device_with('cpu')
+def test_codegen_tuple_return1():
+    with tempfile.TemporaryDirectory() as tempdir:
+        parallelize(
+            TupleReturnModule1(),
+            {
+                'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+                'y': 1.0,
+            },
+            'dp',
+            ComputeConfig(1, 1),
+            gen_savedir=tempdir,
+            load_module=False
+        )
+        assert len(_gencode_contains(tempdir, TupleReturnModule1, 0,
+            r"return add_.*, add_.*")) == 2
+
+
+class TupleReturnModule2(torch.nn.Module):
+    def __init__(self, return_type):
+        super().__init__()
+        self.return_type = return_type
+        self.linear = torch.nn.Linear(3, 5)
+
+    def forward(self, x, y):
+        if self.return_type == 0:
+            return self.linear(x),
+        else:
+            return [[self.linear(x) + y]]
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('return_type', [0, 1])
+def test_codegen_tuple_return2(return_type):
+    test_context = nullcontext() if return_type != 0 else pytest.raises(RuntimeError, match='Single tuple outputs.*')
+    with tempfile.TemporaryDirectory() as tempdir, test_context:
+        parallelize(
+            TupleReturnModule2(return_type),
+            {
+                'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+                'y': 1.0,
+            },
+            'dp',
+            ComputeConfig(1, 1),
+            gen_savedir=tempdir,
+            load_module=False
+        )
+        assert _gencode_contains(tempdir, TupleReturnModule2, 0,
+            r"return \[\[add_.*\]\]")
 
 
 class UnusedArgsModule(torch.nn.Module):

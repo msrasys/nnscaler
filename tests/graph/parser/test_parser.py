@@ -165,8 +165,8 @@ def test_num_outputs(tmp_path, output_list):
 
     assert len(ir_graph.nodes()) == 5
     assert len(ir_graph.nodes()[0].outputs()) == 3
-    assert isinstance(ir_graph.output(0), list)
     assert len(ir_graph.outputs()) == 1
+    assert isinstance(ir_graph.output(0), list)
     if output_list:
         assert len(ir_graph.nodes()[-1].outputs()) == 1
     else:

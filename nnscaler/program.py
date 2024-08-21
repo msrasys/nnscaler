@@ -18,47 +18,52 @@ import torch
 import torch.utils.data as data
 
 
+_program_graph: Optional[IRGraph] = None
+
+
+def enable_global_graph():
+    global _program_graph
+    _program_graph = IRGraph([], [], [], 'program')
+
+
+def disable_global_graph():
+    global _program_graph
+    _program_graph = None
+
+
+def is_global_graph_enabled():
+    return _program_graph is not None
+
+
 class Program:
-
-    class __Program:
-
-        def __init__(self):
-            self._graph = IRGraph([], [], [], 'program')
-
-    instance = None
-
-    def __init__(self):
-        if not Program.instance:
-            Program.instance = Program.__Program()
-
-    def __getattr__(self, name):
-        return getattr(self.instance, name)
-
+    """
+    This is only used in @compile for backward compatibility.
+    """
     def add_node(self, node: IRCell):
-        self.instance._graph.insert(node, self.instance._graph.nnodes)
+        _program_graph.insert(node, _program_graph.nnodes)
 
     def add_nodes(self, nodes: List[IRCell]):
         for node in nodes:
             self.add_node(node)
 
     def get_graph(self) -> IRGraph:
-        return self.instance._graph
+        return _program_graph
 
     def set_input(self, inputs: Tuple[Any]):
-        self.instance._graph.reset_inputs(len(inputs))
+        _program_graph.reset_inputs(len(inputs))
         for idx, obj in enumerate(inputs):
-            self.instance._graph.set_input(idx, obj)
+            _program_graph.set_input(idx, obj)
         # update gradient
-        for t in IRGraph.get_objects_from_complex(self.instance._graph.inputs()):
+        for t in IRGraph.get_objects_from_complex(_program_graph.inputs()):
             if isinstance(t, IRSubTensor) and t.requires_grad:
                 t.grad = t.parent.grad.tosub()
 
     def set_output(self, outputs: Tuple[Any]):
-        self.instance._graph.reset_outputs(len(outputs))
+        _program_graph.reset_outputs(len(outputs))
         for idx, otensor in enumerate(outputs):
-            self.instance._graph.set_output(idx, otensor)
+            _program_graph.set_output(idx, otensor)
         # update gradient
-        for t in IRGraph.get_objects_from_complex(self.instance._graph.outputs()):
+        for t in IRGraph.get_objects_from_complex(_program_graph.outputs()):
             if isinstance(t, IRSubTensor) and t.requires_grad:
                 t.grad = t.parent.grad.tosub()
 
@@ -67,18 +72,16 @@ class Program:
         Close the recording of program.
         If the program doesn't do backward, set all tensors with requires_grad=False.
         """
-        graph = self.get_graph()
         # inference scenario, set all gradients to none.
-        if not any(isinstance(node, IRBpOperation) for node in graph.nodes()):
-            # set gradients of activation tensors to none
-            for ftensor in graph.full_tensors():
-                ftensor.requires_grad = False
+        if not any(isinstance(node, IRBpOperation) for node in _program_graph.nodes()):
+            _program_graph.no_backward()
 
     def clear(self):
-        Program.instance._graph = IRGraph([], [], [], 'program')
+        # will enable and create an empty global graph
+        enable_global_graph()
 
     def __repr__(self):
-        return repr(self.instance._graph)
+        return repr(_program_graph)
 
 
 class SemanticDataLoader:

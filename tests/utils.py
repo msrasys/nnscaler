@@ -17,6 +17,7 @@ import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 
 from nnscaler.parallel import ComputeConfig
+import nnscaler
 from nnscaler.runtime.module import ParallelModule
 from nnscaler.runtime.device import DeviceGroup, CompileFlag
 
@@ -256,26 +257,27 @@ def mock_dist(rank, world_size):
 
 @contextmanager
 def mock_cube_env(cube_module_cls: Type[ParallelModule], compute_config):
-    old_device_group = DeviceGroup.instance
+    old_device_group = nnscaler.runtime.device._instance
     old_dev_mode = CompileFlag.dev_mode
     used_cuda_fns = ['set_device', 'current_device', 'default_stream']
     old_cuda_fns = {
         fname: getattr(torch.cuda, fname)
         for fname in used_cuda_fns
     }
-    torchrun_envs = ['RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'LOCAL_WORLD_SIZE', 'GROUP_RANK']
+    torchrun_envs = ['RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'LOCAL_WORLD_SIZE', 'GROUP_RANK', 'TORCHELASTIC_RUN_ID']
     old_envs = {
         env: os.environ.get(env, None)
         for env in torchrun_envs
     }
     try:
-        DeviceGroup.instance = None
+        nnscaler.runtime.device._instance = None
         CompileFlag.dev_mode = False
         for fname, fn in old_cuda_fns.items():
             setattr(torch.cuda, fname, lambda *args, **kwargs: None)
         os.environ['RANK'] = os.environ['LOCAL_RANK'] = str(cube_module_cls.rank)
         os.environ['WORLD_SIZE'] = os.environ['LOCAL_WORLD_SIZE'] = str(compute_config.runtime_ngpus)
         os.environ['GROUP_RANK'] = '0'
+        os.environ['TORCHELASTIC_RUN_ID'] = '0' # fake torchrun env
         yield
     finally:
         for env, val in old_envs.items():
@@ -286,7 +288,7 @@ def mock_cube_env(cube_module_cls: Type[ParallelModule], compute_config):
         for fname, fn in old_cuda_fns.items():
             setattr(torch.cuda, fname, fn)
         CompileFlag.dev_mode = old_dev_mode
-        DeviceGroup.instance = old_device_group
+        nnscaler.runtime.device._instance = old_device_group
 
 
 def new_empty(cube_module_cls: Type[ParallelModule], device='meta', init_params=False):

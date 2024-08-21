@@ -5,7 +5,10 @@ import torch
 from functools import partial
 import more_itertools as mitr
 
+import pytest
+
 import nnscaler
+from nnscaler.ir.tensor import IRSubTensor
 from nnscaler.utils import load_model
 from nnscaler.compiler import compile
 from nnscaler.runtime.utils import microbatches
@@ -14,7 +17,7 @@ from nnscaler.graph.segment import IRSegment
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
 from nnscaler.flags import CompileFlag
 from ..launch_torchrun import torchrun
-from ..utils import init_parameter, assert_parity
+from ..utils import init_parameter, assert_parity, replace_all_device_with
 
 
 class MLP(torch.nn.Module):
@@ -194,3 +197,43 @@ test_pipe2scale2 = partial(torchrun, 4, assert_parity,
     baseline,
     partial(cube_run, 2, pipe_policy)
 )
+
+
+class TupleReturnModule2(torch.nn.Module):
+    def __init__(self, return_type=0):
+        super().__init__()
+        self.return_type = return_type
+        self.linear = torch.nn.Linear(3, 5)
+
+    def forward(self, x):
+        if self.return_type == 0:
+            return self.linear(x),
+        else:
+            return [[self.linear(x)]]
+
+
+def tuple_return_run(return_type):
+    from nnscaler.policies import pas_dp
+    from nnscaler import ComputeConfig
+    from contextlib import nullcontext
+
+    model = TupleReturnModule2(return_type)
+    data = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    dl = microbatches([data,])
+
+    def policy(graph, *args, **kwargs):
+        return pas_dp(graph, ComputeConfig(1, 1))
+
+    context = nullcontext() if return_type != 0 else pytest.raises(RuntimeError, match='Single tuple outputs.*')
+    with context:
+        @compile(model, dl, PAS=policy, scale=False)
+        def train_iter(model, dataloader):
+            x = next(iter(dataloader))
+            loss = model(x)
+            assert len(loss) == 1 and len(loss[0]) == 1 and isinstance(loss[0][0], IRSubTensor)
+            return loss
+
+
+
+test_tuple_return0 = partial(torchrun, 1, tuple_return_run, 0)
+test_tuple_return1 = partial(torchrun, 1, tuple_return_run, 1)
