@@ -73,7 +73,7 @@ def _gpu_worker():
         from nnscaler.runtime.module import _logger
         with catch_log(_logger) as log_stream:
             net2 = _to_cube_model(Net2(), compute_config, tempdir, 'net2', (256, 64))
-            net2.load_merged_state_dict(merged_state_dict, strict=False) # should success
+            net2.load_merged_state_dict(merged_state_dict, strict=True) # should success
             assert torch.equal(list(net2._buffers.values())[0], torch.ones(256, 64))
 
             logs = log_stream.getvalue()
@@ -81,7 +81,7 @@ def _gpu_worker():
 
         with catch_log(_logger) as log_stream:
             net2 = _to_cube_model(Net2(), compute_config, tempdir, 'net2-2', (256, 64), init_module_params=False)
-            net2.load_merged_state_dict(merged_state_dict, strict=False) # should success
+            net2.load_merged_state_dict(merged_state_dict, strict=True) # should success
             assert not torch.equal(list(net2._buffers.values())[0], torch.ones(256, 64))
 
             logs = log_stream.getvalue()
@@ -99,7 +99,7 @@ def _gpu_worker():
 
         with catch_log(_logger) as log_stream:
             net3 = _to_cube_model(Net3(), compute_config, tempdir, 'net3-2', (128, 64))
-            net3.load_merged_state_dict(merged_state_dict, strict=False) # should success
+            net3.load_merged_state_dict(merged_state_dict, strict=True) # should success
             assert torch.equal(list(net3._buffers.values())[0], torch.ones(128, 64))
 
             logs = log_stream.getvalue()
@@ -107,7 +107,7 @@ def _gpu_worker():
 
         with catch_log(_logger) as log_stream:
             net3 = _to_cube_model(Net3(), compute_config, tempdir, 'net3-2', (128, 64), init_module_params=False)
-            net3.load_merged_state_dict(merged_state_dict, strict=False) # should success
+            net3.load_merged_state_dict(merged_state_dict, strict=True) # should success
             assert torch.equal(list(net3._buffers.values())[0], torch.ones(128, 64))
 
             logs = log_stream.getvalue()

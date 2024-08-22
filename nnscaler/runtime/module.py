@@ -390,8 +390,8 @@ class CubeModule(torch.nn.Module):
             for local_name, meta in local_fullmap.items():
                 if local_name not in model_state_dict:
                     # the parameter may not in model_state_dict (deduped with optimization)
-                    # Another casee is when this is a non persistent buffer, we should skip it.
-                    #   because non persistent buffer should be stored in the fullmap, but not in the model state dict
+                    # Another case is when this is a non persistent buffer, we should skip it,
+                    # since non persistent buffer should be stored in the fullmap, but not in the model state dict
                     continue
                 # create full tensor on cpu
                 partial_tensor = model_state_dict[local_name]
@@ -1200,9 +1200,11 @@ class ParallelModule(CubeModule):
 
         dist2param = self.dist_param_map
         orig_param_names = list(dist2param.values())  # param names in original module (without prefix)
+        non_persistent_buffers = self.get_non_persistent_buffers()
 
         with torch.no_grad():
-            attr_names = set(self._fullmap.keys())
+            # avoid checking the non-persistent buffers
+            attr_names = set([attr for attr in self._fullmap.keys() if attr not in non_persistent_buffers])
 
             origname_tid_map = {meta.orig_name: meta.tid for meta in self._fullmap.values()}
             tid_info = defaultdict(list)

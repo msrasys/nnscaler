@@ -505,7 +505,7 @@ class OpAnno:
                     if not str.isdecimal(identifier):
                         nonleading_ids.add(identifier)
 
-        visited : Set[str] = set()  # to remove equavalent configurations
+        visited : Set[str] = set()  # to remove equivalent configurations
         configs = []
         shapes = self.inputs()
         for idx, shape in enumerate(shapes):

@@ -1397,6 +1397,7 @@ def build_optimizer(
             for p in pg['params']:
                 if p.grad is not None:
                     p.grad.mul_(scale)
+
     optimizer.scale_grads = types.MethodType(_scale_grads, optimizer)
 
     def _register_reducer_pre_hook(self, fn: Callable[[Reducer, torch.Tensor], None]):
