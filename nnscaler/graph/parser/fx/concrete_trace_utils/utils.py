@@ -1,13 +1,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-import builtins
 from dataclasses import dataclass
 import importlib
 import operator
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, NamedTuple, Optional, Set, Tuple, Type
+from typing import Any, Callable, Dict, NamedTuple, Optional, Set, Tuple
 
 import torch
 from torch.fx.node import Node, map_aggregate, _side_effectful_functions
@@ -15,49 +14,6 @@ from torch.fx.node import Node, map_aggregate, _side_effectful_functions
 DICT_KEYS_TYPE = type({}.keys())
 DICT_VALUES_TYPE= type({}.values())
 DICT_ITEMS_TYPE= type({}.items())
-
-
-# These need to run in global scope to handle nested calls correctly
-_orig_module_call: Callable = torch.nn.Module.__call__
-_orig_module_getattr: Callable = torch.nn.Module.__getattr__
-_orig_module_getattribute: Callable = torch.nn.Module.__getattribute__
-
-_orig_agfunc_apply: Callable = torch.autograd.function.Function.apply
-_orig_torch_assert: Callable = torch._assert
-
-_orig_type: Callable = builtins.type
-_orig_isinstance: Callable = builtins.isinstance
-_orig_issubclass: Callable = builtins.issubclass
-_orig_getattr: Callable = builtins.getattr
-
-_orig_range: Type[Any] = builtins.range
-_orig_int: Type[Any] = builtins.int
-_orig_float: Type[Any] = builtins.float
-_orig_bool: Type[Any] = builtins.bool
-_orig_tuple: Type[Any] = builtins.tuple
-_orig_list: Type[Any] = builtins.list
-_orig_set: Type[Any] = builtins.set
-_orig_frozenset: Type[Any] = builtins.frozenset
-_orig_dict: Type[Any] = builtins.dict
-_orig_map: Type[Any] = builtins.map
-_orig_zip: Type[Any] = builtins.zip
-_orig_enumerate: Type[Any] = builtins.enumerate
-_orig_slice: Type[Any] = builtins.slice
-_orig_reversed: Type[Any] = builtins.reversed
-
-_orig_torch_size: Type[Any] = torch.Size
-_orig_torch_finfo: Type[Any] = torch.finfo
-
-_orig_len: Callable = builtins.len
-_orig_not: Callable = operator.not_
-_orig_is: Callable = operator.is_
-_orig_is_not: Callable = operator.is_not
-_orig_contains: Callable = operator.contains
-_orig_index: Callable = operator.index
-
-_orig_all: Callable = builtins.all
-_orig_min: Callable = builtins.min
-_orig_max: Callable = builtins.max
 
 _orig_node_is_impure: Callable = Node.is_impure
 

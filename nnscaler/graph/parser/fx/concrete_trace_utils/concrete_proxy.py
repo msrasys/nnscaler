@@ -18,20 +18,8 @@ from torch.fx.proxy import Proxy
 from torch.overrides import is_tensor_method_or_property
 
 from . import concrete_tracer as et
-from . import pytree_utils
+from . import pytree_utils, orig_func
 from .utils import (
-    _orig_tuple,
-    _orig_list,
-    _orig_type,
-    _orig_isinstance,
-    _orig_getattr,
-    _orig_range,
-    _orig_dict,
-    _orig_len,
-    _orig_index,
-    _orig_bool,
-    _orig_slice,
-    _orig_set,
     get_frame_record,
 )
 
@@ -52,7 +40,7 @@ class ConcreteProxy(Proxy):
         'POP_JUMP_IF_TRUE',
         'JUMP_IF_NOT_EXC_MATCH', # occurred in new python vertion, not tested
     )
-    jump_opcodes = _orig_tuple(dis.opmap[name] for name in jump_opnames if name in dis.opmap)
+    jump_opcodes = orig_func.tuple(dis.opmap[name] for name in jump_opnames if name in dis.opmap)
     op_compare = dis.opmap['COMPARE_OP']
     op_extended_arg = dis.opmap['EXTENDED_ARG']
     op_call_ex = dis.opmap['CALL_FUNCTION_EX']
@@ -78,7 +66,7 @@ class ConcreteProxy(Proxy):
 
     def __getattr__(self, k) -> ConcreteProxy:
         # if the proxy is a wrapped module, forward this call to the torch.nn.Module.__getattribute__
-        if _orig_isinstance(self.value, torch.nn.Module):
+        if orig_func.isinstance(self.value, torch.nn.Module):
             return torch.nn.Module.__getattribute__(self.value, k)
         return ConcreteAttrProxy(self, k)
 
@@ -97,7 +85,7 @@ class ConcreteProxy(Proxy):
         calling_frame = frame.f_back
         assert calling_frame is not None
         cur = calling_frame.f_lasti // 2
-        insts: List[dis.Instruction] = _orig_list(dis.get_instructions(calling_frame.f_code))
+        insts: List[dis.Instruction] = orig_func.list(dis.get_instructions(calling_frame.f_code))
         while insts[cur].opcode == self.op_extended_arg:
             cur += 1
 
@@ -117,7 +105,7 @@ class ConcreteProxy(Proxy):
         elif insts[cur].opcode == self.op_unpack_sequence:
             # in executing `a, b, c = atuple`
             return ConcreteUnpackIterProxy(self)
-        elif insts[cur].opname == 'GET_ITER' and insts[cur + 1].opname == 'FOR_ITER' and _orig_isinstance(self.value, _orig_range):
+        elif insts[cur].opname == 'GET_ITER' and insts[cur + 1].opname == 'FOR_ITER' and orig_func.isinstance(self.value, orig_func.range):
             # in executing `for i in range(...)`
             return iter(self.value)
         # elif insts[cur].opname == 'CONTAINS_OP':
@@ -136,23 +124,23 @@ class ConcreteProxy(Proxy):
         calling_frame = frame.f_back
         assert calling_frame is not None
         cur = calling_frame.f_lasti // 2
-        insts: List[dis.Instruction] = _orig_list(dis.get_instructions(calling_frame.f_code))
+        insts: List[dis.Instruction] = orig_func.list(dis.get_instructions(calling_frame.f_code))
         while insts[cur].opcode == self.op_extended_arg:
             cur += 1
 
         if insts[cur].opcode == self.op_call_ex:
             # in executing func(..., *proxy)
-            return _orig_len(self.value)
+            return orig_func.len(self.value)
         elif insts[cur].opcode == self.op_tuple_unpack_call:
             # in executing func(*..., *proxy)
             # <= python 3.8
-            return _orig_len(self.value)
+            return orig_func.len(self.value)
         elif insts[cur].opcode == self.op_list_extend:
             # in executing x.extend(*proxy) or [x, *proxy]
             # >= python 3.9
-            return _orig_len(self.value)
+            return orig_func.len(self.value)
         else:
-            return self.tracer.create_proxy('call_function', _orig_len, (self,), {})
+            return self.tracer.create_proxy('call_function', orig_func.len, (self,), {})
 
     def __getitem__(self, *args, **kwargs) -> ConcreteProxy:
         return self.tracer.create_proxy('call_function', operator.getitem, (self,) + args, kwargs)
@@ -167,34 +155,34 @@ class ConcreteProxy(Proxy):
         calling_frame = frame.f_back
         assert calling_frame is not None
         cur = calling_frame.f_lasti // 2
-        insts: List[dis.Instruction] = _orig_list(dis.get_instructions(calling_frame.f_code))
+        insts: List[dis.Instruction] = orig_func.list(dis.get_instructions(calling_frame.f_code))
         while insts[cur].opcode == self.op_extended_arg:
             cur += 1
 
         if insts[cur].opcode in self.jump_opcodes or (
             insts[cur].opcode in self.jump_before_opcodes and insts[cur + 1].opcode in self.jump_opcodes):
             # in executing branch condition
-            return _orig_bool(self.value)
+            return orig_func.bool(self.value)
         elif insts[cur].opname == 'CONTAINS_OP':
             # in executing 'in'
-            return _orig_bool(self.value)
+            return orig_func.bool(self.value)
         elif insts[cur].opname == 'BINARY_SUBSCR':
             # in executing slice or index, my_list[index] or my_dict[key]
-            return _orig_bool(self.value)
+            return orig_func.bool(self.value)
         elif insts[cur].opcode == self.op_call_ex:
             # in executing func(..., *proxy)
-            return _orig_bool(self.value)
+            return orig_func.bool(self.value)
         elif insts[cur].opcode == self.op_not:
             # We cannot return a proxy because 'UNARY_NOT' op will check the type.
             _logger.warning('please use the function patcher, or use "x = operator.not_(y)" instead of "x = not y",'
                             'otherwise the traced graph may be wrong')
-            return _orig_bool(self.value)
+            return orig_func.bool(self.value)
         else:
-            return self.tracer.create_proxy('call_function', _orig_bool, (self,), {})
+            return self.tracer.create_proxy('call_function', orig_func.bool, (self,), {})
 
     def __index__(self) -> Union[int, ConcreteProxy]:
         # should only be in list/tuple getitem
-        return _orig_index(self.value)
+        return orig_func.index(self.value)
 
     def __hash__(self) -> Union[int, ConcreteProxy]:
         # should only be in dict getitem
@@ -224,7 +212,7 @@ class ConcreteProxy(Proxy):
         calling_frame = frame.f_back
         assert calling_frame is not None
         cur = calling_frame.f_lasti // 2
-        insts: List[dis.Instruction] = _orig_list(dis.get_instructions(calling_frame.f_code))
+        insts: List[dis.Instruction] = orig_func.list(dis.get_instructions(calling_frame.f_code))
         while insts[cur].opcode == self.op_extended_arg:
             cur += 1
 
@@ -257,17 +245,17 @@ class ConcreteProxy(Proxy):
         args = args if args else ()
         kwargs = kwargs if kwargs else {}
 
-        tracers: Set[Any] = _orig_set()
+        tracers: Set[Any] = orig_func.set()
 
         def find_tracer(a):
-            if _orig_isinstance(a, cls):
+            if orig_func.isinstance(a, cls):
                 tracers.add(a.tracer)
         
         pytree_utils.tree_map(find_tracer, args)
         pytree_utils.tree_map(find_tracer, kwargs)
 
-        if _orig_len(tracers) > 1:
-            raise RuntimeError(f'Found multiple different tracers {_orig_list(tracers)} while '
+        if orig_func.len(tracers) > 1:
+            raise RuntimeError(f'Found multiple different tracers {orig_func.list(tracers)} while '
                                f'trying to trace operations {orig_method}')
         tracer, = tracers
 
@@ -293,16 +281,16 @@ class ConcreteAttrProxy(ConcreteProxy):
         self.attr = attr
         self.tracer = root.tracer
         self._node: Optional[Node] = None
-        if _orig_isinstance(root.value, torch.Tensor) and attr == 'is_cuda' and self.tracer.cpu_offload:
+        if orig_func.isinstance(root.value, torch.Tensor) and attr == 'is_cuda' and self.tracer.cpu_offload:
             self.value = True
-        elif _orig_isinstance(root.value, torch.Tensor) and attr == 'device' and self.tracer.cpu_offload:
+        elif orig_func.isinstance(root.value, torch.Tensor) and attr == 'device' and self.tracer.cpu_offload:
             self.value = torch.device('cuda')
             warning_msg = "operation <tensor>.device is detected, it will always return torch.device('cuda') during trace, " + \
                           "please make sure don't manually change the tensor device in the code.\n" + \
                           f"\t{get_frame_record()}"
             _logger.warning(warning_msg)
         else:
-            self.value = _orig_getattr(root.value, attr)
+            self.value = orig_func.getattr(root.value, attr)
 
     def __repr__(self) -> str:
         calling_frame_name = inspect.stack()[1][1]
@@ -316,7 +304,7 @@ class ConcreteAttrProxy(ConcreteProxy):
         # which do not rely on the getitem call
         if self._node is None:
             self._node = self.tracer.create_proxy(
-                'call_function', _orig_getattr, (self.root, self.attr), {}).node
+                'call_function', orig_func.getattr, (self.root, self.attr), {}).node
         return self._node
 
     def __call__(self, *args, **kwargs):
@@ -363,15 +351,15 @@ class ConcreteUnpackIterProxy(ConcreteProxy):
     def __init__(self, root: ConcreteProxy):
         if not hasattr(root.value, '__getitem__'):
             # transfer 'set' to 'tuple'
-            # it's tuple not _orig_tuple!
+            # it's tuple not orig_func.tuple!
             # root = tuple(root)
-            root = root.tracer.create_proxy('call_function', _orig_tuple, (root,), {})
+            root = root.tracer.create_proxy('call_function', orig_func.tuple, (root,), {})
         self.root = root
         self.tracer = root.tracer
         self._node: Optional[Node] = None
         self._value: List[Any] = []
         self.index = -1
-        self.len = _orig_len(root.value)
+        self.len = orig_func.len(root.value)
 
     def __repr__(self) -> str:
         return f'ConcreteUnpackIterProxy({self.node.name})'
@@ -389,7 +377,7 @@ class ConcreteUnpackIterProxy(ConcreteProxy):
     def value(self):
         # the node for attributes is added lazily, since most will just be method calls
         # which do not rely on the getitem call
-        if _orig_len(self._value) == 0:
+        if orig_func.len(self._value) == 0:
             self._value.append(iter(self.root.value))
         return self._value[0]
 
@@ -404,18 +392,18 @@ def map_aggregate_not_proxy(a, fn):
     """
     Apply fn to each Node appearing arg. arg may be a list, tuple, slice, or dict with string keys.
     """
-    if _orig_isinstance(a, ConcreteProxy):
+    if orig_func.isinstance(a, ConcreteProxy):
         return fn(a)
-    elif _orig_isinstance(a, _orig_tuple):
-        t = _orig_tuple(map_aggregate_not_proxy(elem, fn) for elem in a)
+    elif orig_func.isinstance(a, orig_func.tuple):
+        t = orig_func.tuple(map_aggregate_not_proxy(elem, fn) for elem in a)
         # Support NamedTuple (if it has `_fields`) by repacking into original type.
-        return t if not hasattr(a, '_fields') else _orig_type(a)(*t)
-    elif _orig_type(a) == _orig_list:
-        return _orig_list(map_aggregate_not_proxy(elem, fn) for elem in a)
-    elif _orig_isinstance(a, _orig_dict):
-        return _orig_dict((k, map_aggregate_not_proxy(v, fn)) for k, v in a.items())
-    elif _orig_isinstance(a, _orig_slice):
-        return _orig_slice(map_aggregate_not_proxy(a.start, fn), map_aggregate_not_proxy(a.stop, fn), map_aggregate_not_proxy(a.step, fn))
+        return t if not hasattr(a, '_fields') else orig_func.type(a)(*t)
+    elif orig_func.type(a) == orig_func.list:
+        return orig_func.list(map_aggregate_not_proxy(elem, fn) for elem in a)
+    elif orig_func.isinstance(a, orig_func.dict):
+        return orig_func.dict((k, map_aggregate_not_proxy(v, fn)) for k, v in a.items())
+    elif orig_func.isinstance(a, orig_func.slice):
+        return orig_func.slice(map_aggregate_not_proxy(a.start, fn), map_aggregate_not_proxy(a.stop, fn), map_aggregate_not_proxy(a.step, fn))
     else:
         return fn(a)
 
@@ -442,7 +430,7 @@ for method in {**magic_methods, **inplace_methods}:
     def _scope(method):
         def impl(*args, **kwargs):
             tracer = args[0].tracer
-            target = _orig_getattr(operator, method)
+            target = orig_func.getattr(operator, method)
             return tracer.create_proxy('call_function', target, args, kwargs)
         impl.__name__ = method
         as_magic = f'__{method.strip("_")}__'
@@ -454,7 +442,7 @@ def _define_reflectable(orig_method_name):
     method_name = f'__r{orig_method_name.strip("_")}__'
 
     def impl(self, rhs):
-        target = _orig_getattr(operator, orig_method_name)
+        target = orig_func.getattr(operator, orig_method_name)
         return self.tracer.create_proxy('call_function', target, (rhs, self), {})
     impl.__name__ = method_name
     impl.__qualname__ = method_name

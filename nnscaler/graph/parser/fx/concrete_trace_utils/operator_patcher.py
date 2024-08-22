@@ -13,18 +13,11 @@ import logging
 
 from textwrap import dedent
 from types import MethodType, FunctionType
-from typing import List, Optional, Callable, Dict, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
-from .utils import (
-    _orig_type,
-    _orig_isinstance,
-    _orig_len,
-    _orig_dict,
-    _orig_zip,
-    _orig_tuple,
-)
+from . import orig_func
 
 _logger = logging.getLogger(__name__)
 
@@ -50,11 +43,11 @@ class OperatorTransformer(TrackedTransformer):
         # For example,
         # `x[0] if x is not None else None` will raise an error
         # if we convert it to `nnscaler.runtime.function.ifexpr(x is not None, x[0], None)`
-        if not _orig_isinstance(node.test, ast.Attribute) \
-            or not _orig_isinstance(node.test.value, ast.Name) \
+        if not orig_func.isinstance(node.test, ast.Attribute) \
+            or not orig_func.isinstance(node.test.value, ast.Name) \
             or node.test.value.id != 'self' or node.test.attr != 'training'\
-            or any(_orig_isinstance(n, ast.Call) for n in ast.walk(node.body)) \
-            or any(_orig_isinstance(n, ast.Call) for n in ast.walk(node.orelse)):
+            or any(orig_func.isinstance(n, ast.Call) for n in ast.walk(node.body)) \
+            or any(orig_func.isinstance(n, ast.Call) for n in ast.walk(node.orelse)):
             return self.generic_visit(node)
 
         self.modified = True
@@ -93,7 +86,7 @@ class OperatorTransformer(TrackedTransformer):
         )
 
     def visit_UnaryOp(self, node: ast.UnaryOp):
-        if _orig_isinstance(node.op, ast.Not):
+        if orig_func.isinstance(node.op, ast.Not):
             self.modified = True
             return self.generic_visit(ast.Call(
                 func=ast.Name(id=self.func_map[ast.Not], ctx=ast.Load()),
@@ -104,17 +97,17 @@ class OperatorTransformer(TrackedTransformer):
             return self.generic_visit(node)
 
     def visit_Compare(self, node: ast.Compare):
-        if not any(_orig_isinstance(op, (ast.Is, ast.IsNot, ast.In, ast.NotIn)) for op in node.ops):
+        if not any(orig_func.isinstance(op, (ast.Is, ast.IsNot, ast.In, ast.NotIn)) for op in node.ops):
             return self.generic_visit(node)
-        if _orig_len(node.ops) != 1:
+        if orig_func.len(node.ops) != 1:
             raise RuntimeError('Chained Comparison is not supported')
         self.modified = True
-        if _orig_isinstance(node.ops[0], (ast.In, ast.NotIn)):
+        if orig_func.isinstance(node.ops[0], (ast.In, ast.NotIn)):
             args = [node.comparators[0], node.left]
         else:
             args = [node.left, node.comparators[0]]
 
-        if not _orig_isinstance(node.ops[0], ast.NotIn):
+        if not orig_func.isinstance(node.ops[0], ast.NotIn):
             ret_node = ast.Call(
                     func=ast.Name(id=self.func_map[type(node.ops[0])], ctx=ast.Load()),
                     args=args,
@@ -143,7 +136,7 @@ class SuperTransformer(TrackedTransformer):
     super() is not supported for a standalone function.
     """
     def visit_Call(self, node: ast.Call):
-        if _orig_isinstance(node.func, ast.Name) and node.func.id == 'super' and _orig_len(node.args) == 0:
+        if orig_func.isinstance(node.func, ast.Name) and node.func.id == 'super' and orig_func.len(node.args) == 0:
             self.modified = True
             # convert super() to super(self.__class__, self)
             return self.generic_visit(ast.Call(
@@ -172,7 +165,7 @@ class ProxyCallTransformer(TrackedTransformer):
     def visit_Call(self, node: ast.Call):
         # will transform all function call to `proxy_call_name(func_name, *args, **kwargs)`
         # node.func can be expression, in that case, node.func.id is undefined.
-        if not _orig_isinstance(node.func, ast.Name) or (
+        if not orig_func.isinstance(node.func, ast.Name) or (
             node.func.id != self.proxy_call_name and node.func.id not in self.ignore_funcs
         ):
             self.modified = True
@@ -208,7 +201,7 @@ class OperatorPatcher:
         self.proxy_call_name = OperatorPatcherContext.patch_run.__name__
 
     def patch_func_or_module(self, func_or_module):
-        if _orig_isinstance(func_or_module, torch.nn.Module):
+        if orig_func.isinstance(func_or_module, torch.nn.Module):
             module, func = func_or_module, func_or_module.forward
             new_func = self.patch_func_helper(func)
             module.forward = new_func
@@ -241,7 +234,7 @@ class OperatorPatcher:
         if self.use_operator_patch == (func in self.operator_patch_backlist):
             return func
 
-        if _orig_isinstance(func, MethodType):
+        if orig_func.isinstance(func, MethodType):
             # patch the function, not bound method, the function will be bound back after patch
             func_inner = func.__func__
             the_self = func.__self__
@@ -249,7 +242,7 @@ class OperatorPatcher:
             func_inner = func
             the_self = None
         # if it is not a function, or it has no code, then we can not patch it, directly return
-        if not _orig_isinstance(func_inner, FunctionType) or not hasattr(func_inner, '__code__'):
+        if not orig_func.isinstance(func_inner, FunctionType) or not hasattr(func_inner, '__code__'):
             return func
 
         lines, lnum = inspect.findsource(func_inner)
@@ -305,14 +298,14 @@ class OperatorPatcher:
             closure_dict = {}
             closures = func_inner.__closure__
             co_freevars = func_inner.__code__.co_freevars
-            if (closures != None and _orig_len(closures) != 0) or _orig_len(co_freevars) != 0:
-                assert _orig_len(closures) == _orig_len(co_freevars)
-                closure_dict = _orig_dict(_orig_zip(co_freevars, [c.cell_contents for c in closures]))
+            if (closures != None and orig_func.len(closures) != 0) or orig_func.len(co_freevars) != 0:
+                assert orig_func.len(closures) == orig_func.len(co_freevars)
+                closure_dict = orig_func.dict(zip(co_freevars, [c.cell_contents for c in closures]))
 
             tuple_wrapped = tuple
             try:
                 if sys.version_info < (3, 9):
-                    setattr(builtins, 'tuple', _orig_tuple)
+                    setattr(builtins, 'tuple', orig_func.tuple)
                 var_dict = {}
                 exec(
                     # use func.__code__.co_filename to make the new function easily debuggable.

@@ -31,6 +31,10 @@ reversed = builtins.reversed
 type = builtins.type
 slice = builtins.slice
 
+all = builtins.all
+min = builtins.min
+max = builtins.max
+
 # the wrapped functon/class method/class in torch
 import torch
 

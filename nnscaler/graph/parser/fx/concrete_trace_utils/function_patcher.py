@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, List, Dict, NamedTuple
 
 from torch.fx._symbolic_trace import _Patcher
-from .utils import _orig_reversed
+from . import orig_func
 
 class _PatchedFnReusable(NamedTuple):
     frame_dict: Any
@@ -99,7 +99,7 @@ class FunctionPatcher(_Patcher):
     def revert(self):
         if self.in_global_context:
             self._change_patch_mode_to(False)
-            for patch in _orig_reversed(self.patches_made):
+            for patch in orig_func.reversed(self.patches_made):
                 # unpatch in reverse order to handle duplicates correctly
                 patch.revert()
             try:
