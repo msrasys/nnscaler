@@ -135,10 +135,6 @@ def to_ir_graph(
         )
     module_name = traced_model.__class__.__name__
 
-    for input in inputs:
-        if isinstance(input, IRFullTensor):
-            input.requires_grad = False
-
     graph = IRGraph.from_logic_graph(nodes, inputs, outputs, module_name)
     return graph
 

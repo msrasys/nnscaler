@@ -259,6 +259,89 @@ def test_codegen_unused_args2():
         launch_torchrun(1, _gencode_unused_args_worker2, tempdir)
 
 
+def pas_dp_with_recompute(graph, cfg):
+    """
+    pure data parallelism policy
+    """
+    from nnscaler.ir import IRFwOperation, IRDataOperation
+    from nnscaler.policies import _replica
+    ngpus = cfg.plan_ngpus
+    if ngpus != 1:
+        raise ValueError("Data parallelism only supports 1 plan GPU")
+
+    # combine
+    # x = _add(x, v1)
+    # x = x + v2
+    # x = self.linear(x)
+    # together as a recompute unit
+    graph.recompute([
+        *graph.select(name='_add', ntype=IRFwOperation),
+        *graph.select(name='add', ntype=IRFwOperation),
+        *graph.select(name='linear', ntype=IRFwOperation),
+    ])
+    for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
+        _replica(graph, node, [0])
+    return graph
+
+
+@nnscaler.register_op('* -> *')
+def _add(x, k):
+    return x + k
+
+
+class RecomputeKwArgsModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(3, 5)
+
+    def forward(self, x, v1, v2):
+        x = _add(x, v1)  # v1 will be kwargs
+        x = x + v2       # v2 will be normal args
+        x = self.linear(x)
+        x = x - v2
+        return x
+
+
+@replace_all_device_with('cpu')
+def test_codegen_recompute_kwargs():
+    with tempfile.TemporaryDirectory() as tempdir:
+        parallelize(
+            RecomputeKwArgsModule(),
+            {
+                'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+                'v1': 1.0,
+                'v2': 2.0,
+            },
+            pas_dp_with_recompute,
+            ComputeConfig(1, 1),
+            gen_savedir=tempdir,
+            load_module=False
+        )
+        # It will look like
+        # def segment33(self, x_36, v1_38, v2_39):
+        #     def recompute(x_36, v1_38, v2_39):
+        #         # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 237, in forward,  x = _add(x, v1)  # v1 will be kwargs
+        #         _add_29 = tests.parallel_module.test_gencode._add(x_36, k=v1_38)
+        #         del x_36
+        #         # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 238, in forward,  x = x + v2       # v2 will be normal args
+        #         add_30 = torch.add(_add_29, v2_39, alpha=1)
+        #         del _add_29
+        #         # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 239, in forward,  x = self.linear(x)
+        #         linear_33 = torch.nn.functional.linear(add_30, self.linear_weight_31, self.linear_bias_32)
+        #         del add_30
+        #         return linear_33
+        #     linear_33 = ckpt.checkpoint(recompute, x_36, v1_38, v2_39, use_reentrant=False)
+        #     del x_36
+        #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 240, in forward,  x = x - v2
+        #     sub_28 = torch.sub(linear_33, v2_39, alpha=1)
+        #     del linear_33
+        #     return sub_28
+        assert _gencode_contains(tempdir, RecomputeKwArgsModule, 0,
+                r'def recompute\(x_\d+, v1_\d+, v2_\d+\)'
+        )
+
+
+
 class DefaultArgsModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -1110,7 +1193,7 @@ def test_codegen_scalar_tensor(tmp_path):
     assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
         r"self\.register_buffer\('num_batches_tracked_\d+', torch\.empty\(\(\), dtype=torch\.int64\), persistent=True\)")
     assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
-        r"self\.add_full_map\('num_batches_tracked_\d+', 2, False, 'num_batches_tracked', \(\), \.\.\., 1\)")
+        r"self\.add_full_map\('num_batches_tracked_\d+', \d+, False, 'num_batches_tracked', \(\), \.\.\., 1\)")
 
 
 class ConvTranspose1DModule(torch.nn.Module):

@@ -95,7 +95,13 @@ def _gencode_batchnorm2d_function(tempdir, config, pas_policy):
     bn.train()
     ref_output = bn(x)
     assert torch.equal(
-        m_new.bn_running_mean_22, bn.bn.running_mean
+        [y for x, y in m_new.named_buffers() if x.startswith('bn_running_mean_')][0],
+        bn.bn.running_mean
+    ), "Custom output does not match PyTorch output"
+
+    assert torch.equal(
+        [y for x, y in m_new.named_buffers() if x.startswith('bn_running_var_')][0],
+        bn.bn.running_var
     ), "Custom output does not match PyTorch output"
 
     assert torch.equal(
@@ -282,9 +288,18 @@ def _gencode_batchnorm2d_function_eval(tempdir, config, pas_policy):
     bn = BatchNorm2dModule().cuda()
     bn.eval()
     ref_output = bn(x)
+
     assert torch.equal(
-        m_new.bn_running_mean_22, bn.bn.running_mean
+        [y for x, y in m_new.named_buffers() if x.startswith('bn_running_mean_')][0],
+        bn.bn.running_mean
     ), "Custom output does not match PyTorch output"
+
+    assert torch.equal(
+        [y for x, y in m_new.named_buffers() if x.startswith('bn_running_var_')][0],
+        bn.bn.running_var
+    ), "Custom output does not match PyTorch output"
+
+
     assert torch.equal(
         output, ref_output
     ), "Custom output does not match PyTorch output"
@@ -412,7 +427,7 @@ def _gencode_batchnorm2d_function_eval_4(tempdir, config, pas_policy, dim):
     assert torch.allclose(
         y_output, ref_output, 1e-6
     ), "Custom output does not match PyTorch output"
-    
+
     x = torch.chunk(x_list[rank_id // 2], 2, dim=0)[rank_id % 2]
 
     bn = BatchNorm2dModule().to(device)

@@ -17,7 +17,7 @@ class LifeCycle:
         graph_outputs = IRSegment.get_objects_from_complex(graph_outputs)
         func_emission = FuncEmission()
 
-        self.nodes: Dict[int] = {node: lid for lid, node in enumerate(nodes)}
+        self.nodes: Dict[IRCell, int] = {node: lid for lid, node in enumerate(nodes)}
         # the last line id of consuming or producing a tensor
         self.lifetime: Dict[IRObject, int] = {}
         # the tensors can be released given the finish of line id
@@ -91,30 +91,43 @@ class LifeCycle:
         line_id = self.nodes[node]
         return self.release.get(line_id, [])
 
-    def releasable_after_node(self, tensor: IRSubTensor, node: IRCell) -> bool:
+    def releasable_after_node(self, obj: IRObject, node: IRCell) -> bool:
         """
-        Check if the tensor is releasable after executing the node
+        Check if the tensor is releasable after executing the node.
+        Please note that if it is not a IRSubTensor(is IRObject),
+            we will never manually release it.
 
-        @param tensor IRSubTensor
-        @param node IRCell
-
-        @return releasable bool
+        Args:
+            tensor (IRObject): the tensor to be checked
+            node (IRCell): the node to be checked
+        Returns:
+            releasable (bool): whether the tensor is releasable after executing
         """
+        if not isinstance(obj, IRSubTensor):
+            return False
+
         assert node in self.nodes
-        assert tensor in self.lifetime[tensor]
+        assert obj in self.lifetime
         line_id = self.nodes[node]
-        return self.lifetime[tensor] < line_id
+        return self.lifetime[obj] < line_id
 
-    def releasable_after_line(self, tensor: IRSubTensor, line: int) -> bool:
+    def releasable_after_line(self, obj: IRObject, line: int) -> bool:
         """
-        Check if the tensor is releasable after executing the node
+        Check if the tensor is releasable after executing the node.
+        Please note that if it is not a IRSubTensor(is IRObject),
+            we will never manually release it.
 
-        @param tensor IRSubTensor
-        @param line int
-
-        @return releasable bool
+        Args:
+            tensor (IRObject): the tensor to be checked
+            line (int): the line to be checked
+        Returns:
+            releasable (bool): whether the tensor is releasable after specific line.
         """
-        return self.lifetime[tensor] < line
+        if not isinstance(obj, IRSubTensor):
+            return False
+
+        assert obj in self.lifetime
+        return self.lifetime[obj] < line
 
     def get_line(self, node: IRCell) -> int:
         """
