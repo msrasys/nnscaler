@@ -699,13 +699,7 @@ class ModuleCodeGen(FuncEmission):
             reducer=reducer_name, ranks=ranks, reduce_op=reduce_op,
             async_op=async_op, zero=zero, max_nbytes=max_nbytes, zero_ngroups=zero_ngroups)
         self.model_init_statements.append(init_code)
-        # sorted with tid: to make the order of weights deterministic
-        # different order of weights in reducer can lead different all-reduce result
-        # not sure why (may be the result of ring-allreduce). but it is observed in the test, and causes parity check failed in the test
-        weights = [
-            self.tensor_name(t, prefix_attr='self.')
-            for t in sorted(weights, key=lambda x: x.tid)
-        ]
+        weights = [self.tensor_name(t, prefix_attr='self.') for t in weights]
         for weight in weights:
             add_param_code = add_param.format(reducer=reducer_name, weight=weight)
             self.model_init_statements.append(add_param_code)

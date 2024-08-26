@@ -1,6 +1,8 @@
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import math
+from typing import Dict, List
 
 import torch
 from lightning import Trainer
@@ -198,7 +200,38 @@ def on_train_step_end(trainer: 'Trainer', outputs, batches, idx: int) -> None:
     _correctnes_worker_single_loss_history.append(outputs[0].item())
 
 
+_mocked_params: Dict[int, List[torch.Tensor]] = {}
+@contextmanager
+def mock_reducer_add_param():
+    """
+    Reorder the parameters in the reducer to match the order in the model
+    """
+    from nnscaler.runtime.adapter.reducer import Reducer
+    from nnscaler.runtime.module import CubeModule
+    def add_param(self, param):
+        if id(self) not in _mocked_params:
+            _mocked_params[id(self)] = []
+        _mocked_params[id(self)].append(param)
+    old_add_param = Reducer.add_param
+    old_add_reducer = CubeModule.add_reducer
+    Reducer.add_param = add_param
+    def add_reducer(self, reducer):
+        register_parameters = {}
+        for idx, p in enumerate(self.parameters()):
+            register_parameters[id(p)] = idx
+        if id(reducer) in _mocked_params:
+            _mocked_params[id(reducer)].sort(key=lambda x: register_parameters[id(x)])
+            for p in _mocked_params[id(reducer)]:
+                old_add_param(reducer, p)
+            _mocked_params.pop(id(reducer))
+        old_add_reducer(self, reducer)
+    CubeModule.add_reducer = add_reducer
+    yield
+    Reducer.add_param = old_add_param
+    CubeModule.add_reducer = old_add_reducer
 
+
+@mock_reducer_add_param()
 def correctnes_worker_cli(
     tmp_path,
     gradient_clip_val,
@@ -294,6 +327,7 @@ def correctnes_worker_cli(
         _correctnes_worker_single_loss_history
 
 
+@mock_reducer_add_param()
 def correctnes_worker_nnscaler(tmp_path, gradient_clip_val, with_lr_scheduler,
     precision='32-true',
     with_tp=False, with_empty_scaler=False
@@ -333,6 +367,7 @@ def correctnes_worker_nnscaler(tmp_path, gradient_clip_val, with_lr_scheduler,
     return model.update_history, model.nnscaler_pmodule.fullmap, model.val_loss_history, model.loss_history
 
 
+@mock_reducer_add_param()
 def correctnes_worker_nnscaler_checkpoint(tmp_path, gradient_clip_val, with_lr_scheduler,
     precision='32-true',
     with_tp=False, with_empty_scaler=False
