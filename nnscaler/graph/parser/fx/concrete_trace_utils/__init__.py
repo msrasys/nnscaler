@@ -12,4 +12,5 @@ Then we can get the **intermediate representation** of ``nn.Module`` instances.
 More information about concrete tracing can be found in the :func:`concrete_trace` documentation.
 """
 from .concrete_tracer import ConcreteTracer, concrete_trace
+from .concrete_proxy import ConcreteProxy
 from .utils import ExtraSEFPatcher, TensorMetadata

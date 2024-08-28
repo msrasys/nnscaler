@@ -105,7 +105,7 @@ def replace_all_device_with(device='cpu', force=False):
         yield
         return
 
-    from nnscaler.graph.parser.fx.concrete_trace_utils.concrete_tracer import ConcreteTracer
+    from nnscaler.graph.parser.fx.concrete_trace_utils import wrap_utils
 
     orig_to = torch.Tensor.to
     orig_cuda = torch.Tensor.cuda
@@ -182,17 +182,17 @@ def replace_all_device_with(device='cpu', force=False):
 
         # patch concrete tracer's autowrap leaf function
         for tf_name, fn in old_tensor_constructors.items():
-            leaf_info = ConcreteTracer.default_autowrap_leaf_function.pop(fn, None)
+            leaf_info = wrap_utils.default_autowrap_leaf_function.pop(fn, None)
             if leaf_info:
-                ConcreteTracer.default_autowrap_leaf_function[
+                wrap_utils.default_autowrap_leaf_function[
                     patched_tensor_constructors[tf_name]
                 ] = leaf_info
         yield
     finally:
         for tf_name, fn in patched_tensor_constructors.items():
-            leaf_info = ConcreteTracer.default_autowrap_leaf_function.pop(fn, None)
+            leaf_info = wrap_utils.default_autowrap_leaf_function.pop(fn, None)
             if leaf_info:
-                ConcreteTracer.default_autowrap_leaf_function[
+                wrap_utils.default_autowrap_leaf_function[
                     old_tensor_constructors[tf_name]
                 ] = leaf_info
         for tf_name, fn in old_tensor_member_constructors.items():

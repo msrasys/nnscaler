@@ -11,7 +11,7 @@ from nnscaler.flags import CompileFlag
 
 from nnscaler.graph.parser.fx.parser import FxModuleParser
 from nnscaler.graph.parser.fx.concrete_trace_utils import concrete_trace
-from nnscaler.graph.parser.fx.concrete_trace_utils.concrete_tracer import Location, is_autograd_apply, LeafFnWrapInfo
+from nnscaler.graph.parser.fx.concrete_trace_utils.wrap_utils import Location, is_autograd_apply, LeafWrapInfo
 from nnscaler.graph.parser.fx.concrete_trace_utils.utils import side_effectful_inplace_ops
 
 import nnscaler.runtime.function as cube_rt_function
@@ -77,12 +77,12 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     autowrap_funcs = [CustomizedOps.kOpRuntime[sign] for sign in CustomizedOps.kOpMap]
     # filter out torch.autograd.Function.apply as concrete trace already treats them as leaf function
     autowrap_funcs = [fn for fn in autowrap_funcs if not is_autograd_apply(fn)]
-    leaf_functions = {func: LeafFnWrapInfo([], True, None) for func in autowrap_funcs if func is not None}
+    leaf_functions = {func: LeafWrapInfo([], True, None) for func in autowrap_funcs if func is not None}
 
     # get cube runtime functions
     cube_rt_funcs = [cube_rt_function.anchor, cube_rt_function.ifexpr]
     leaf_functions.update({
-        func: LeafFnWrapInfo([Location(cube_rt_function, func.__name__)], True, None)
+        func: LeafWrapInfo([Location(cube_rt_function, func.__name__)], True, None)
         for func in cube_rt_funcs
     })
     dce_ignored_funcs = set(cube_rt_funcs)

@@ -6,7 +6,6 @@ from __future__ import annotations
 import dis
 import logging
 import inspect
-import operator
 
 from typing import List, Optional, Iterable, Any, Set, Union
 
@@ -143,10 +142,10 @@ class ConcreteProxy(Proxy):
             return self.tracer.create_proxy('call_function', orig_func.len, (self,), {})
 
     def __getitem__(self, *args, **kwargs) -> ConcreteProxy:
-        return self.tracer.create_proxy('call_function', operator.getitem, (self,) + args, kwargs)
+        return self.tracer.create_proxy('call_function', orig_func.getitem, (self,) + args, kwargs)
 
     def __setitem__(self, *args, **kwargs) -> ConcreteProxy:
-        return self.tracer.create_proxy('call_function', operator.setitem, (self,) + args, kwargs)
+        return self.tracer.create_proxy('call_function', orig_func.setitem, (self,) + args, kwargs)
 
     def __bool__(self) -> Union[bool, ConcreteProxy]:
         # to detect if in executing branch condition
@@ -385,7 +384,7 @@ class ConcreteUnpackIterProxy(ConcreteProxy):
         self.index += 1
         if self.index == self.len:
             raise StopIteration()
-        return self.tracer.create_proxy('call_function', operator.getitem, (self.root, self.index), {})
+        return self.tracer.create_proxy('call_function', orig_func.getitem, (self.root, self.index), {})
 
 @compatibility(is_backward_compatible=True)
 def map_aggregate_not_proxy(a, fn):
@@ -430,7 +429,7 @@ for method in {**magic_methods, **inplace_methods}:
     def _scope(method):
         def impl(*args, **kwargs):
             tracer = args[0].tracer
-            target = orig_func.getattr(operator, method)
+            target = orig_func.getattr(orig_func, method)
             return tracer.create_proxy('call_function', target, args, kwargs)
         impl.__name__ = method
         as_magic = f'__{method.strip("_")}__'
@@ -442,7 +441,7 @@ def _define_reflectable(orig_method_name):
     method_name = f'__r{orig_method_name.strip("_")}__'
 
     def impl(self, rhs):
-        target = orig_func.getattr(operator, orig_method_name)
+        target = orig_func.getattr(orig_func, orig_method_name)
         return self.tracer.create_proxy('call_function', target, (rhs, self), {})
     impl.__name__ = method_name
     impl.__qualname__ = method_name
