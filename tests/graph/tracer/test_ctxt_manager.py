@@ -38,7 +38,7 @@ class TestModule(torch.nn.Module):
         self.rotary_emb = LlamaRotaryEmbedding(128)
         self.fc1 = torch.nn.Linear(128, 128)
         self.fc2 = torch.nn.Linear(128, 128)
-    
+
     def forward(self, x, position_ids):
         hidden = self.fc1(x)
         cos, sin = self.rotary_emb(hidden, position_ids)

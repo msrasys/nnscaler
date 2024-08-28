@@ -309,7 +309,11 @@ class FxModuleParser:
                 if tensor.requires_grad:
                     tensor.as_param()
                 else:
-                    persistent = node.name not in module._non_persistent_buffers_set
+                    direct_module = module
+                    full_qualified_name = node.target.split('.')
+                    for name in full_qualified_name[:-1]:  # last one is the attribute name
+                        direct_module = getattr(direct_module, name)
+                    persistent = full_qualified_name[-1] not in direct_module._non_persistent_buffers_set
                     tensor.as_buffer(persistent=persistent)
                 frame.add_attr(tensor, concrete_value, node.target)
             # the case that the parameter is consumed multiple times and registered previously
