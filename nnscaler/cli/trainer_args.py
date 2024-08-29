@@ -6,6 +6,7 @@ from pathlib import Path
 import logging
 import copy
 import os
+import builtins
 
 import torch
 import torch.utils
@@ -33,14 +34,28 @@ def load_type(type_name: str):
     if callable(type_name):  # a function or class
         return type_name
 
-    parts = type_name.rsplit('.', 1)
-    if len(parts) == 1:
-        nm = __builtins__
-        type_name = parts[0]
-    else:
-        namespace, type_name = parts
-        nm = importlib.import_module(namespace)
-    return getattr(nm, type_name)
+    parts = type_name.split('.')
+
+    # s: the number of parts to be the namespace
+    # s == 0: use builtins
+    # so the range() part includes 0 (with stop=-1)
+    for s in range(len(parts) - 1, -1, -1):
+        if s == 0:
+            nm = builtins
+        else:
+            namespace = '.'.join(parts[:s])
+            try:
+                nm = importlib.import_module(namespace)
+                break
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+    try:
+        for i in range(s, len(parts)):
+            nm = getattr(nm, parts[i])
+        return nm
+    except AttributeError as e:
+        raise RuntimeError(f"Failed to load type {type_name}") from e
 
 
 @dataclass
@@ -318,6 +333,10 @@ class TrainerArgs:
     val_every_n_epochs: Optional[int] = 1
 
     enable_progress_bar: bool = True
+    # if progress_bar is disabled (enable_progress_bar is False),
+    # the frequency to print the training progress
+    # validation metrics will also be printed if it is not None.
+    log_progress_every_n_train_steps: Optional[int] = 100
 
     seed: Optional[int] = None
     # environment initialization function
@@ -462,6 +481,10 @@ class TrainerArgs:
     @property
     def update_freq(self):
         return self.global_batch_size // self.micro_batch_size // self.scaling_factor
+
+    @property
+    def enable_log_progress(self):
+        return not self.enable_progress_bar and self.log_progress_every_n_train_steps
 
     @property
     def param_dtype(self) -> torch.dtype:

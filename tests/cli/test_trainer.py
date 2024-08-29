@@ -134,6 +134,27 @@ def trainer_resume_worker(save_dir, save_type, bf16):
     ckpt0_files0 = {f: f.stat().st_mtime_ns for f in ckpt0_savedir.glob('**/*.ckpt')}
     assert len(ckpt0_files0)/4 == min(30, trainer.total_train_steps_per_epoch * 2) + 2 # 2 for best/last
 
+    # resume from last without update max_epochs
+    trainer = Trainer([
+        '-f', config_path,
+        '--precision', 'bf16' if bf16 else 'none',
+        '--optimizer.type', optimizer_type,
+        '--max_epochs', '2',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--compute_config.use_zero', str(use_zero),
+        '--checkpoint.save_type', save_type,
+        '--checkpoint.save_dir', str(ckpt0_savedir),
+        '--checkpoint.resume_from', 'last',
+        '--checkpoint.keep_last_n_checkpoints', '30',
+    ])
+    trainer.train()
+    ckpt0_files0_x = {f: f.stat().st_mtime_ns for f in ckpt0_savedir.glob('**/*.ckpt')}
+    # nothing should be updated in this case.
+    assert ckpt0_files0 == ckpt0_files0_x
+
     # create merged checkpoint
     ckpt1_savedir = save_dir / 'ckpt1'
     ckpt1_savedir.mkdir(parents=True, exist_ok=True)

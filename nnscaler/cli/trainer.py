@@ -7,6 +7,7 @@ import inspect
 import warnings
 import shutil
 import logging
+import time
 
 import torch
 import torch.distributed
@@ -40,14 +41,7 @@ CHECKPOINT_BEST_FILE_FORMAT: str = 'best/{rank}.ckpt'
 @dataclass
 class TrainStatus:
     best_loss = float('inf')
-    epoch: int = 0
-    # used for resuming training
-    # it is the index of the next batch in the current epoch
-    # i means the i-1 batch is done, and we should resume from ith batch
-    # for example
-    # 0 means the epoch is not started
-    # 1 means the 0th batch is done, and we should resume from 1st batch
-    next_batch_index: int = 0
+    num_train_steps_done: int = 0
 
 
 @dataclass
@@ -92,13 +86,10 @@ class Trainer:
         self.train_status = TrainStatus()
         self.dummy_input = None
         self.total_train_steps_per_epoch = None
+        self.max_train_steps = None
         self.loggers = []
         self.hook = None
         self._setup()
-
-    @property
-    def num_train_steps(self):
-        return self.train_status.epoch  * self.total_train_steps_per_epoch + self.train_status.next_batch_index
 
     def _fix_input(self, input):
         if isinstance(input, dict):
@@ -223,9 +214,22 @@ class Trainer:
 
         torch.distributed.barrier()
         self.rank = torch.distributed.get_rank()
+
         self.total_train_steps_per_epoch = len(self.dataloader['train']) // self.train_args.update_freq
         if len(self.dataloader['train']) % self.train_args.update_freq != 0:
             self.total_train_steps_per_epoch += 1  # will add extra dummy batches
+
+        if self.train_args.max_epochs and self.train_args.max_train_steps:
+            self.max_train_steps = min(
+                self.total_train_steps_per_epoch * self.train_args.max_epochs,
+                self.train_args.max_train_steps
+            )
+        elif self.train_args.max_train_steps:
+            self.max_train_steps = self.train_args.max_train_steps
+        else:
+            assert self.train_args.max_epochs, "max_epochs or max_train_steps should be specified"
+            self.max_train_steps = self.total_train_steps_per_epoch * self.train_args.max_epochs
+
         _, self.sync_group = self.train_args.compute_config.get_sync_group()
         self.model = pmodel_class()
         self.model.cuda()
@@ -283,7 +287,7 @@ class Trainer:
             logger.finalize()
 
     def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None, *, tag: Optional[str] = None):
-        step = step or self.num_train_steps
+        step = step or self.train_status.num_train_steps_done
         for logger in self.loggers:
             logger.log_metrics(metrics, step, tag=tag)
 
@@ -345,6 +349,23 @@ class Trainer:
             'ram_gb_used': ram_gb_used,
          }, tag=tag)
 
+    def _format_metrics(self, epoch_desc, idx, metrics: Dict[str, Union[float,int]]):
+        ndigits = len(str(self.total_train_steps_per_epoch))
+        idx_format = f"0{ndigits}d"
+        int_format = ''
+        float_format = '.3f'
+        metris_str = ', '.join(
+            [
+                f"{k}={format(v, float_format if isinstance(v, float) else int_format)}"
+                for k, v in metrics.items()
+            ]
+        )
+        if idx is not None:
+            step_str = f'{format(idx, idx_format)}/{self.total_train_steps_per_epoch} '
+        else:
+            step_str = f''
+        return f"{epoch_desc}: {step_str}{metris_str}"
+
     def _save_checkpoint(self, loss):
         checkpoint_config = self.train_args.checkpoint
 
@@ -353,9 +374,13 @@ class Trainer:
             return
 
         torch.distributed.barrier()
-        logger.info(f"Saving checkpoint after {self.num_train_steps} steps with loss={loss:.3f}.")
+        logger.info(f"Saving checkpoint after {self.train_status.num_train_steps_done} steps with loss={loss:.3f}.")
         save_dir = Path(checkpoint_config.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
+        current_epoch = self.train_status.num_train_steps_done // self.total_train_steps_per_epoch
+        # the last step of the epoch
+        if self.train_status.num_train_steps_done % self.total_train_steps_per_epoch == 0:
+            current_epoch -= 1
 
         if checkpoint_config.save_type == 'sharded':
             model_state_dict= self.model.state_dict()
@@ -378,8 +403,8 @@ class Trainer:
         }
         self.hook.on_save_checkpoint(self, state_dict)
         ckpt_file = save_dir / CHECKPOINT_FILE_FORMAT.format(
-            epoch=self.train_status.epoch,
-            step=self.num_train_steps,
+            epoch=current_epoch,
+            step=self.train_status.num_train_steps_done,
             rank=self.rank,
         )
         logger.info(f"Saving checkpoint to {str(ckpt_file.parent)}")
@@ -408,8 +433,8 @@ class Trainer:
             logger.info(f"Best loss updated: {self.train_status.best_loss:.3f} -> {loss:.3f}")
             logger.info(f"Saving checkpoint as the best checkpoint.")
             best_file = save_dir / CHECKPOINT_BEST_FILE_FORMAT.format(
-                epoch=self.train_status.epoch,
-                step=self.num_train_steps,
+                epoch=current_epoch,
+                step=self.train_status.num_train_steps_done,
                 rank=self.rank,
             )
             best_file.parent.mkdir(parents=True, exist_ok=True)
@@ -505,27 +530,23 @@ class Trainer:
         return batches, is_dummy_batch
 
     def train(self):
-        assert self.train_status.next_batch_index <= self.total_train_steps_per_epoch, \
-            f"next_batch_index({self.train_status.next_batch_index}) " \
-            f"should not be larger than total_train_steps_per_epoch ({self.total_train_steps_per_epoch})"
-
+        logger.info('Training...')
         # reset peak memory stats before training
         # So that we can get accurate peak memory usage for each step
         torch.cuda.reset_peak_memory_stats()
 
-        if self.train_status.next_batch_index == self.total_train_steps_per_epoch:
-            self.train_status.epoch += 1
-            self.train_status.next_batch_index = 0
+        if self.train_status.num_train_steps_done >= self.max_train_steps:
+            logger.info(f"Training is skipped: already done.")
+            return
 
-        next_batch_index = self.train_status.next_batch_index
+        start_epoch = self.train_status.num_train_steps_done // self.total_train_steps_per_epoch
+
         self.hook.on_train_start(self)
 
-        for epoch in range(self.train_status.epoch, self.train_args.max_epochs or sys.maxsize):
+        for epoch in range(start_epoch, self.train_args.max_epochs or sys.maxsize):
             self.dataloader['train'].sampler.set_epoch(epoch)
 
             torch.distributed.barrier()
-            self.train_status.epoch = epoch
-            self.train_status.next_batch_index = next_batch_index
 
             self.hook.on_epoch_start(self, epoch)
             self.train_epoch(epoch)
@@ -534,11 +555,10 @@ class Trainer:
             if self.lr_scheduler and self.train_args.lr_scheduler.interval == 'epoch':
                 self.lr_scheduler.step()
 
-            if self.train_args.max_train_steps and self.num_train_steps >= self.train_args.max_train_steps:
+            if self.train_args.max_train_steps and self.train_status.num_train_steps_done >= self.train_args.max_train_steps:
                 logger.info(f"Reached max train steps({self.train_args.max_train_steps}): Training is done.")
                 break
 
-            next_batch_index = 0
         else:  # not break from for loop, which means not finished with max_train_steps
             # finished with max_epochs
             logger.info(f"Reached max_epochs({self.train_args.max_epochs}): Training is done.")
@@ -566,6 +586,7 @@ class Trainer:
             step_stat.val_loss = step_stat.train_loss
             return step_stat.val_loss
 
+        logger.info(f"Validating...")
         data_iter = enumerate(self._global_batch_iterator(stage='val'))
         if self.rank == 0:
             total_val_steps_per_epoch = len(self.dataloader['val']) // self.train_args.update_freq
@@ -576,7 +597,7 @@ class Trainer:
                 total=total_val_steps_per_epoch,
                 initial=0,
                 desc=f'Validating',
-                disable=not self.train_args.enable_progress_bar
+                disable=not self.train_args.enable_progress_bar,
             )
 
         loss_sum = 0.0
@@ -611,7 +632,10 @@ class Trainer:
         self.hook.on_val_end(self, loss)
 
         step_stat.val_loss = loss
-        self.log_metrics(asdict(step_stat), self.num_train_steps, tag='val')
+        val_metrics = asdict(step_stat)
+        self.log_metrics(val_metrics, tag='val')
+        if self.rank == 0 and self.train_args.enable_log_progress:
+            logger.info(self._format_metrics(f'Validation', None, val_metrics))
         return step_stat.val_loss
 
     def train_epoch(self, epoch):
@@ -619,25 +643,42 @@ class Trainer:
         VAL_STATUS_VAL = 1    # validated but not saved
         VAL_STATUS_SAVE = 2   # validated and saved
         has_validated = VAL_STATUS_NO   # 3 states
-        resume_from_idx = self.train_status.next_batch_index
+
+        resume_from_idx = self.train_status.num_train_steps_done % self.total_train_steps_per_epoch
         data_iter = enumerate(self._global_batch_iterator(num_skip_first=resume_from_idx))
+
+        max_epoch = self.max_train_steps // self.total_train_steps_per_epoch
+        if self.max_train_steps % self.total_train_steps_per_epoch != 0:
+            max_epoch += 1
+        ndigits = len(str(max_epoch))
+        epoch_format = f"0{ndigits}d"
+        epoch_desc = f'Epoch {format(epoch, epoch_format)}'
+
         if self.rank == 0:
-            data_iter = tqdm(
-                data_iter,
+            progress = tqdm(
+                None,
                 total=self.total_train_steps_per_epoch,
                 initial=resume_from_idx,
-                desc=f'Epoch {epoch:04d}',
-                disable=not self.train_args.enable_progress_bar
+                desc=epoch_desc,
+                disable=not self.train_args.enable_progress_bar,
             )
+        else:
+            progress = None
 
         step_stat: Optional[_StepStat] = None
-        for idx, batches in data_iter:
+        for i, batches in data_iter:
+            idx = i + resume_from_idx
+
+            if self.rank == 0:
+                # looks manually update progress bar is easier
+                # than using tqdm directly
+                # the difference is we update progress bar at the beginning of the loop
+                # instead of the end of the loop
+                progress.update(1)
+            step_start_at = time.perf_counter()
             step_stat = _StepStat()
+            step_metrics = {}
             has_validated = VAL_STATUS_NO
-            # the current batch is idx + resume_from_idx
-            # `+1` because the next_batch_index is the index of the next batch
-            # all save_checkpoint will be done at the end of the loop with correct next_batch_index
-            self.train_status.next_batch_index = idx + resume_from_idx + 1
             num_batches = len(batches)
             batches, is_dummy_batch = self._fix_batches(batches)
 
@@ -659,8 +700,6 @@ class Trainer:
                 loss = aggregated_outputs.loss_sum
             step_stat.train_loss = loss
             self.hook.after_aggregate_train_step_outputs(self, aggregated_outputs, loss, idx)
-            if self.rank == 0:
-                data_iter.set_postfix({'loss': loss})
 
             self.hook.before_sync_grad(self)
             # actually `sync_shard_grad` is no-op here
@@ -702,41 +741,56 @@ class Trainer:
             if self.lr_scheduler and self.train_args.lr_scheduler.interval == 'step':
                 self.lr_scheduler.step()
 
+            self.train_status.num_train_steps_done += 1
             self._log_mem_stats(tag='train')
-            self.log_metrics(
-                {k:v for k, v in asdict(step_stat).items() if v is not None},
-                self.num_train_steps,
-                tag='train'
-            )
+            step_metrics = {k:v for k, v in asdict(step_stat).items() if v is not None}
+            step_metrics['train_wall'] = time.perf_counter() - step_start_at
+            self.log_metrics(step_metrics, tag='train')
+            if self.rank == 0:
+                progress.set_postfix(step_metrics)
+                if self.train_args.enable_log_progress \
+                    and self.train_status.num_train_steps_done % self.train_args.log_progress_every_n_train_steps == 0:
+                    logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics))
+                    step_metrics = {}
 
             # validate and save checkpoint
             if self.train_args.checkpoint.every_n_train_steps and \
-                self.num_train_steps % self.train_args.checkpoint.every_n_train_steps == 0:
+                self.train_status.num_train_steps_done % self.train_args.checkpoint.every_n_train_steps == 0:
                 self._validate_and_save(step_stat)
                 has_validated = VAL_STATUS_SAVE
 
-            if self.train_args.max_train_steps and self.num_train_steps >= self.train_args.max_train_steps:
+            # max_train_steps is reached
+            if self.train_status.num_train_steps_done >= self.max_train_steps:
+                if step_metrics and self.train_args.enable_log_progress:
+                    logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics))
+                    step_metrics = {}
                 if not has_validated:
                     self._validate_and_save(step_stat)
                     has_validated = VAL_STATUS_SAVE
+                if self.rank == 0:
+                    # disable refresh the progress bar to avoid redundant progress bar
+                    progress.leave = False
+                    progress.close()
                 break
 
             if not has_validated and self.train_args.val_every_n_train_steps and \
-                self.num_train_steps % self.train_args.val_every_n_train_steps == 0:
+                self.train_status.num_train_steps_done % self.train_args.val_every_n_train_steps == 0:
                 self._validate(step_stat)
                 has_validated = VAL_STATUS_VAL
-            # import time
-            # time.sleep(0.2)
-        else:  # not finished with max_train_steps
+
+            # time.sleep(1)
+        else:
+            # Do per-epoch operations here.
+            # if the loop exits with `break` (max_train_steps is reached)
+            # those operations have done in the loop
             if step_stat is None:
-                return  # no train step runs. No need to save checkpoint
-            if has_validated < VAL_STATUS_SAVE and \
-                self.train_args.max_epochs == self.train_status.epoch + 1 \
-                or (self.train_args.checkpoint.every_n_epochs and \
-                (self.train_status.epoch + 1) % self.train_args.checkpoint.every_n_epochs == 0):
+                return  # no train step runs. Nothing to do.
+            if has_validated < VAL_STATUS_SAVE \
+                and self.train_args.checkpoint.every_n_epochs \
+                and (epoch + 1) % self.train_args.checkpoint.every_n_epochs == 0:
                 self._validate_and_save(step_stat)
                 has_validated = VAL_STATUS_SAVE
-            if not has_validated and self.train_args.val_every_n_epochs and \
-                (self.train_status.epoch + 1) % self.train_args.val_every_n_epochs == 0:
+            if not has_validated and self.train_args.val_every_n_epochs \
+                and (epoch + 1) % self.train_args.val_every_n_epochs == 0:
                 self._validate(step_stat)
                 has_validated = VAL_STATUS_VAL
