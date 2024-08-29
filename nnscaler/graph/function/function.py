@@ -1895,7 +1895,6 @@ def Repeat(tensor, repeats: _VariadicInt, *arg_repeats, signature = None):
     """
     torch.Tensor.repeat(*sizes)
     """
-    signature = 'torch.ops.aten.repeat'
     if isinstance(repeats, (list, tuple)) or (
         isinstance(repeats, IRObject) and isinstance(repeats.value, (list, tuple))
     ):
