@@ -233,6 +233,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     pipeline_pivots = pas_cfg.get('pipeline_pivots', '')
     use_apex_fused_adam_v2 = pas_cfg.get('use_apex_fused_adam_v2', False)
     parallel_profile = pas_cfg.get('parallel_profile', True)
+    transient_mem_coef = pas_cfg.get('transient_mem_coef', 2)
 
     task_name = f'{task_name}_{cfg.plan_ngpus}gpus_{update_freq}update_freq'
     if memory_constraint == -1:
@@ -296,6 +297,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         pipeline=explore_pipeline,
         pipeline_pivots=pipeline_pivots,
         parallel_profile=parallel_profile,
+        transient_mem_coef=transient_mem_coef,
     )
 
     return parallelize_graph(graph, autodist_cfg)

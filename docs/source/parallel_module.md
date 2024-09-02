@@ -591,6 +591,7 @@ It requires the `use_end2end` to be true. It has the following configurations.
     - `pipeline_scheduler`: The scheduler name for the pipeline. Please note currently `1f1b` is the only supported scheduler in `autodist`. Default is `1f1b`. Optional.
     - `parallel_profile`: If set to `True`, autodist will profile operators in parallel by using available gpus. Default is `True`. Optional.
     - `max_partition_degree`: Max degree when partitioning an operator / node. When pipeline parallelism is enabled to explore (`explore_pipeline` is True), user can change the value to constrain the plan to be composed of stages that span on less or equal to `max_partition_degree` devices (recommend to set `max_partition_degree` to the number of devices in a node to avoid inter-node communication, but should be be no more than `plan_ngpus`). Default is `plan_ngpus`. Optional.
+    - `transient_mem_coef`: In autodist, a heuristic is used to estimate the transient memory size: `transient_mem_size = opt_transient_coef * (1st_largest_infer_mem + 2nd_largest_infer_mem)`. This formula is useful in many cases, but it may be too strict when some operators consume or generate a large tensor (>= 4GB). In this case, you can set `transient_mem_coef` to a smaller value to relax the constraint. Default is `2`. Optional.
 
  You can also put any other settings that can affect code generation here. but please prefix the keys with `_` to avoid conflicts with predefined keys.
 
