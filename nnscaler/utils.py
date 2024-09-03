@@ -173,6 +173,7 @@ def enforce_zero_num_worker(cls) -> Generator[None, None, None]:
     _old__init__ = cls.__init__
     def _new__init__(self, *args, **kwargs) -> None:
         kwargs['num_workers'] = 0
+        kwargs['prefetch_factor'] = None
         _old__init__(self, *args, **kwargs)
     cls.__init__ = _new__init__
     yield

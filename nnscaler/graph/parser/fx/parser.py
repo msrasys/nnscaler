@@ -125,32 +125,13 @@ class FxModuleParser:
                      frame: Frame, is_constant: bool = True):
         assert isinstance(node, torch.fx.Node)
 
-        def meta2var(meta: Any) -> Any:
-            """Support complex data type of List, Tuple, Dict, Tensor/Object"""
-            if isinstance(meta, TensorMetadata):
-                shape = meta.shape
-                dtype = meta.dtype
-                requires_grad = meta.requires_grad
-                return IRFullTensor(shape=shape, name=node.name,
-                                    requires_grad=requires_grad, dtype=dtype)
-            if isinstance(meta, list):
-                return list(meta2var(item) for item in meta)
-            if isinstance(meta, tuple):
-                return tuple(meta2var(item) for item in meta)
-            if isinstance(meta, dict):
-                if not all(isinstance(key, str) for key in meta.keys()):
-                    raise TypeError(f"only support dict type with str key, but got {meta.keys()}.\n{node}")
-                return {key : meta2var(value) for key, value in meta.items()}
-            if isinstance(meta, DICT_VALUES_TYPE):
-                return {key : meta2var(value) for key, value in enumerate(meta)}.values()
-            if isinstance(meta, DICT_ITEMS_TYPE):
-                return {key : meta2var(value) for key, value in meta}.items()
-            # TODO: data type check, with cases like {'a': 1.2, 'b': torch.Tensor}
-            return IRObject(name=node.name, value=meta, is_constant=is_constant)
-
         assert hasattr(node, 'meta') and 'tensor_meta' in node.meta, f"Node {node} should have tensor_meta"
         meta = node.meta['tensor_meta']
-        val = meta2var(meta)
+        val = IRObject.from_complex(node.name, meta,
+            collection_types=(list, tuple, dict, DICT_VALUES_TYPE, DICT_ITEMS_TYPE),
+            tensor_types=(TensorMetadata,),
+            is_constant=is_constant
+        )
         frame.add_var(node.name, val)
 
     @staticmethod

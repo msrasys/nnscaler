@@ -23,6 +23,7 @@ import torch
 
 from nnscaler.ir.unique import IDGenerator
 from nnscaler.ir.dtype import DTypeInfo
+from nnscaler.utils import _DICT_ITEMS_TYPE, _DICT_VALUES_TYPE
 
 
 NestedVarOrStatic = Any
@@ -470,11 +471,6 @@ class IRObject:
         self._value: Optional[Any] = value
         self._is_constant: bool = is_constant
 
-    def __eq__(self, obj):
-        if not isinstance(obj, IRObject):
-            return False
-        return self._id == obj.tid
-
     def __hash__(self) -> int:
         return self._id
 
@@ -562,6 +558,126 @@ class IRObject:
             return other.tid == self._id
         else:
             return False
+
+    @classmethod
+    def from_complex(cls,
+        name: str,
+        data: Any,
+        *,
+        collection_types: Tuple = (tuple, list, dict),
+        tensor_types: Tuple = (torch.Tensor,),
+        is_constant: bool = False,
+        requires_grad: Optional[bool] = None,
+        tosub: bool = False,
+    ) -> Any:
+        """
+        Convert complex data type of
+            collection_types (tuple, list, dict)
+            tensor_types (has shape/dtype/requires_grad)
+        into intermediate representation object.
+
+        Rule:
+            1. All tensor-like objects will be converted into IRFullTensor
+            2. For any complex types,
+                a. if there is no tensor-like object, the whole object will be converted into IRObject
+                b. if there is tensor-like object, all items will be converted into IRObject.
+        Examples:
+            [1, 2, torch.tensor(3)]
+                -> [IRObject(1), IRObject(2), IRFullTensor(3)]
+            {'a': [1, 2, 3], 'b': torch.tensor(2)}
+                -> {'a': IRObject([1, 2, 3]), 'b': IRFullTensor(2)}
+            {'a': [1, 2, torch.tensor(3)], 'b': 2}
+                -> {'a': [IRObject(1), IRObject(2), IRFullTensor(3)], 'b': IRObject(2)}
+        Args:
+            name (str): the object name
+            data (Any): the complex data structure to be converted
+            collection_types (Tuple): the complex data types to be converted
+            tensor_types (Tuple): the tensor data types to be converted
+            tosub(bool): whether convert full tensor to sub-tensor
+            requires_grad (Optional[bool]): the requires_grad flag for the tensor-like object
+                None: will respect the original requires_grad flag
+                True: will set requires_grad to True
+                False: will set requires_grad to False
+        """
+        from nnscaler.ir.tensor import IRFullTensor
+
+        collection_types = tuple(collection_types)
+        tensor_types = tuple(tensor_types)
+        supported_collection_types = (tuple, list, dict, _DICT_VALUES_TYPE, _DICT_ITEMS_TYPE)
+        if any(t not in supported_collection_types for t in collection_types):
+            raise ValueError(f"Only support converting complex data type of {supported_collection_types}")
+
+        def _inner(obj) -> Tuple[Any, bool]:
+            # second return is to know if there is any tensor-like object
+
+            if isinstance(obj, tensor_types):
+                if requires_grad is None:
+                    rg = obj.requires_grad
+                else:
+                    # PyTorch only supports floating point and complex tensors for autograd.
+                    # To align with PyTorch, we set requires_grad to False for other types.
+                    rg = requires_grad and (obj.dtype.is_floating_point or obj.dtype.is_complex)
+
+                tensor = IRFullTensor(
+                    list(obj.shape),
+                    name,
+                    dtype=obj.dtype,
+                    requires_grad=rg,
+                )
+                if tosub:
+                    tensor = tensor.tosub()
+                tensor._value = obj  # is required in SemanticModel.forward
+                return tensor, True
+
+            if isinstance(obj, collection_types):
+                if isinstance(obj, tuple):
+                    result = [_inner(item) for item in obj]
+                    if not any(r[1] for r in result):
+                        return IRObject(name, value=obj, is_constant=is_constant), False
+                    else:
+                        return tuple(r[0] for r in result), True
+                if isinstance(obj, list):
+                    result = [_inner(item) for item in obj]
+                    if not any(r[1] for r in result):
+                        return IRObject(name, value=obj, is_constant=is_constant), False
+                    else:
+                        return [r[0] for r in result], True
+                if isinstance(obj, dict):
+                    if not all(isinstance(key, str) for key in obj.keys()):
+                        raise TypeError(f"only support dict type with str key, but got {obj.keys()}.")
+                    result = {k: _inner(v) for k, v in obj.items()}
+                    if not any(r[1] for r in result.values()):
+                        return IRObject(name, value=obj, is_constant=is_constant), False
+                    else:
+                        return {k: r[0] for k, r in result.items()}, True
+                if isinstance(obj, _DICT_VALUES_TYPE):
+                    result = [_inner(item) for item in obj]
+                    if not any(r[1] for r in result):
+                        return IRObject(name, value=obj, is_constant=is_constant), False
+                    else:
+                        return {k: r[0] for k, r in enumerate(result)}.values(), True
+                if isinstance(obj, _DICT_ITEMS_TYPE):
+                    result = {k: _inner(v) for k, v in obj}
+                    if not any(r[1] for r in result.values()):
+                        return IRObject(name, value=obj, is_constant=is_constant), False
+                    else:
+                        return {k: r[0] for k, r in result.items()}.items(), True
+
+            return IRObject(name, value=obj, is_constant=is_constant), False
+
+        return _inner(data)[0]
+
+    @classmethod
+    def tosub_complex(cls, obj: Any) -> Any:
+        """
+        Convert complex data type of tensor-like object into sub-tensor
+
+        Args:
+            obj (Any): the complex data structure to be converted
+        """
+        from nnscaler.ir.tensor import IRFullTensor
+        modifier = lambda t: t.tosub() if isinstance(t, IRFullTensor) else t
+        return IRCell.modify_objects_of_complex(obj, modifier)
 
     def __repr__(self):
         return f'Object({self.name}{self.tid}, val={self.value}, is_constant={self.is_constant})'

@@ -313,35 +313,6 @@ def _to_cpu(val: Any):
     return val
 
 
-def to_ir_input(sample, name):
-    """Support complex of types: Tuple, List, Dict, torch.Tensor"""
-    if isinstance(sample, tuple):
-        return tuple(to_ir_input(t, name) for t in sample)
-    if isinstance(sample, list):
-        return list(to_ir_input(t, name) for t in sample)
-    if isinstance(sample, dict):
-        return {k: to_ir_input(v, str(k)) for k, v in sample.items()}
-    if isinstance(sample, torch.Tensor):
-        # note: we will always set tensor to require gradient, which may
-        # generate backward communications in adapter. However, as long as
-        # the data doesn't require gradient in real runtime, the backward
-        # communication will not be triggered.
-        # PyTorch only supports floating point and complex tensors for autograd.
-        # To align with PyTorch, we set requires_grad to False for other types.
-        requires_grad = sample.is_floating_point() or sample.is_complex()
-        tensor = IRFullTensor(
-            shape=sample.size(),
-            name=name,
-            requires_grad=requires_grad,
-            dtype=sample.dtype
-        ).tosub()
-        tensor._value = sample
-        if requires_grad:
-            tensor.grad = tensor.parent.grad.tosub()
-        return tensor
-    return IRObject(name, value=sample, is_constant=False)
-
-
 def _contains_uncommutable_data(ir_outputs: Any):
     """
     only IRObject (but not IRTensor) is not commutable between gpus.
@@ -654,8 +625,17 @@ def _gen_graph(
         else:
             raise ValueError(f"Input {node.target} not in dummy forward args, nor has default value.")
     for i in range(len(ir_dummy_inputs)):
-        ir_dummy_inputs[i] = to_ir_input(ir_dummy_inputs[i], fx_input_nodes[i].target)
-        # if the input is not a tensor, we should wrap it with IRObject
+        # note: we will always set tensor to require gradient, which may
+        # generate backward communications in adapter. However, as long as
+        # the data doesn't require gradient in real runtime, the backward
+        # communication will not be triggered.
+        ir_dummy_inputs[i] = IRObject.from_complex(
+            fx_input_nodes[i].target, ir_dummy_inputs[i],
+            requires_grad=True,
+            tosub=True,
+            is_constant=False,
+        )
+        # if the input is a complex type, we should wrap it with IRObject
         if not isinstance(ir_dummy_inputs[i], IRObject):
             ir_dummy_inputs[i] = IRObject(fx_input_nodes[i].target, value=ir_dummy_inputs[i], is_constant=False)
 

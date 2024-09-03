@@ -110,25 +110,12 @@ class SemanticDataLoader:
         return self
 
     def __next__(self):
-        def generate_output(sample, name='data'):
-            """Support complex of types: Tuple, List, Dict, torch.Tensor"""
-            if isinstance(sample, tuple):
-                return tuple(generate_output(t, name) for t in sample)
-            if isinstance(sample, list):
-                return list(generate_output(t, name) for t in sample)
-            if isinstance(sample, dict):
-                return {k: generate_output(v, str(k)) for k, v in sample.items()}
-            if isinstance(sample, torch.Tensor):
-                tensor = IRFullTensor(list(sample.shape), name, dtype=sample.dtype).tosub()
-                tensor._value = sample
-                return tensor
-            return IRObject(name, value=sample, is_constant=False)
         # get dataloader sample
         sample = next(iter(self.dataloader))
         if not isinstance(sample, tuple):
             sample = (sample,)
         # turn sample into IRObjects
-        outputs = tuple(generate_output(s) for s in sample)
+        outputs = tuple(IRObject.from_complex('data', s, tosub=True, requires_grad=False, is_constant=False) for s in sample)
         outputs = tuple(IRObject('data', value=out) if not isinstance(out, IRObject) else out for out in outputs)
         # create dataloader operation
         # the `self.irobj` is the IRObject standing for the non-tensor value of real dataloader.
