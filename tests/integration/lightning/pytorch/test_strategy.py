@@ -320,7 +320,7 @@ def correctnes_worker_cli(
     _correctnes_worker_train_loss_history.clear()
     _correctnes_worker_single_loss_history.clear()
     _correctnes_worker_val_loss_history.clear()
-    trainer.train()
+    trainer.run()
     return _correctnes_worker_update_history, trainer.model.fullmap, \
         _correctnes_worker_val_loss_history, \
         _correctnes_worker_train_loss_history, \

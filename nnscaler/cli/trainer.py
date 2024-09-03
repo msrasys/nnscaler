@@ -90,7 +90,12 @@ class Trainer:
         self.max_train_steps = None
         self.loggers = []
         self.hook = None
+
+    def run(self):
         self._setup()
+        if self.train_args.compile_mode:
+            return
+        self._train()
 
     def _fix_input(self, input):
         if isinstance(input, dict):
@@ -126,7 +131,7 @@ class Trainer:
 
     def _setup(self):
         self.train_args.init_env()
-        compile_only = self.train_args.run_mode == 'compile'
+        compile_only = self.train_args.compile_mode
 
         if is_running_distributed():
             nnscaler.init()
@@ -530,7 +535,7 @@ class Trainer:
             batches += [self.dummy_input] * gap
         return batches, is_dummy_batch
 
-    def train(self):
+    def _train(self):
         logger.info('Training...')
         # reset peak memory stats before training
         # So that we can get accurate peak memory usage for each step
@@ -550,7 +555,7 @@ class Trainer:
             torch.distributed.barrier()
 
             self.hook.on_epoch_start(self, epoch)
-            self.train_epoch(epoch)
+            self._train_epoch(epoch)
             self.hook.on_epoch_end(self, epoch)
 
             if self.lr_scheduler and self.train_args.lr_scheduler.interval == 'epoch':
@@ -639,7 +644,7 @@ class Trainer:
             logger.info(self._format_metrics(f'Validation', None, val_metrics))
         return step_stat.val_loss
 
-    def train_epoch(self, epoch):
+    def _train_epoch(self, epoch):
         VAL_STATUS_NO = 0     # not validated or saved
         VAL_STATUS_VAL = 1    # validated but not saved
         VAL_STATUS_SAVE = 2   # validated and saved

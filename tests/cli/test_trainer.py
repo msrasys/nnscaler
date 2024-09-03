@@ -36,7 +36,7 @@ def trainer_logging_worker(save_dir):
         '--log.1.args.project', 'nnscaler',
         '--log.1.args.mode', 'offline',
     ])
-    trainer.train()
+    trainer.run()
 
     torch.distributed.barrier()
 
@@ -66,7 +66,7 @@ def test_trainer_compile_worker(tmp_path):
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
     gen_savedir = save_dir / 'gen'
     # compile only
-    Trainer([
+    trainer = Trainer([
         '-f', config_path,
         '--max_epochs', '2',
         '--gen_savedir', str(gen_savedir),
@@ -76,6 +76,7 @@ def test_trainer_compile_worker(tmp_path):
         '--run_mode', 'compile',
         '--broadcast_strategy', 'none',
     ])
+    trainer.run()
 
     assert set([f.name for f in gen_savedir.glob('**/*.py')]) == set(['gencode0.py', 'gencode1.py', 'gencode2.py', 'gencode3.py'])
     shutil.rmtree(gen_savedir)
@@ -107,7 +108,7 @@ def trainer_resume_worker(save_dir, save_type, bf16):
         '--checkpoint.resume_from', 'last',
         '--checkpoint.keep_last_n_checkpoints', '30',
     ])
-    trainer.train()
+    trainer.run()
     ckpt_files = set(ckpt_savedir.glob('**/*.ckpt'))
     assert len(ckpt_files)/4 == min(30, trainer.total_train_steps_per_epoch * 4) + 2 # 2 for best/last
 
@@ -130,7 +131,7 @@ def trainer_resume_worker(save_dir, save_type, bf16):
         '--checkpoint.resume_from', 'last',
         '--checkpoint.keep_last_n_checkpoints', '30',
     ])
-    trainer.train()
+    trainer.run()
     ckpt0_files0 = {f: f.stat().st_mtime_ns for f in ckpt0_savedir.glob('**/*.ckpt')}
     assert len(ckpt0_files0)/4 == min(30, trainer.total_train_steps_per_epoch * 2) + 2 # 2 for best/last
 
@@ -150,7 +151,7 @@ def trainer_resume_worker(save_dir, save_type, bf16):
         '--checkpoint.resume_from', 'last',
         '--checkpoint.keep_last_n_checkpoints', '30',
     ])
-    trainer.train()
+    trainer.run()
     ckpt0_files0_x = {f: f.stat().st_mtime_ns for f in ckpt0_savedir.glob('**/*.ckpt')}
     # nothing should be updated in this case.
     assert ckpt0_files0 == ckpt0_files0_x
@@ -178,7 +179,7 @@ def trainer_resume_worker(save_dir, save_type, bf16):
         '--checkpoint.resume_from', 'last',
         '--checkpoint.keep_last_n_checkpoints', '30',
     ])
-    trainer.train()
+    trainer.run()
     left_files = {
         f: f.stat().st_mtime_ns for f in ckpt0_files0.keys()
         if f.exists() and f.parent.name not in ['last', 'best']
@@ -207,7 +208,7 @@ def trainer_resume_worker(save_dir, save_type, bf16):
         '--checkpoint.resume_from', str(ckpt1_savedir / 'merged.pt'),
         '--checkpoint.keep_last_n_checkpoints', '30',
     ])
-    trainer.train()
+    trainer.run()
     left_files = {
         f: f.stat().st_mtime_ns for f in ckpt0_files0.keys()
         if f.exists() and f.parent.name not in ['last', 'best']
@@ -266,7 +267,7 @@ def trainer_last_checkpoint_worker(save_dir):
         '--checkpoint.every_n_train_steps', '15',
         '--checkpoint.save_dir', str(ckpt_savedir),
     ])
-    trainer.train()
+    trainer.run()
 
     torch.distributed.barrier()
     # make sure the last checkpoint is saved.
@@ -313,7 +314,7 @@ def trainer_loss_reduction_worker(save_dir):
         '--hook.after_aggregate_val_step_outputs',
             'tests.cli.test_trainer.after_aggregate_val_step_outputs',
     ])
-    trainer.train()
+    trainer.run()
 
     # get a copy
     train_loss_mean = _train_losses[:]
@@ -340,7 +341,7 @@ def trainer_loss_reduction_worker(save_dir):
         '--hook.after_aggregate_val_step_outputs',
             'tests.cli.test_trainer.after_aggregate_val_step_outputs',
     ])
-    trainer.train()
+    trainer.run()
     torch.distributed.barrier()
 
     assert len(train_loss_mean) == len(_train_losses)
@@ -409,7 +410,7 @@ def trainer_per_token_worker(save_dir):
         '--hook.before_gnorm_clip',
             'tests.cli.test_trainer.before_gnorm_clip',
     ])
-    trainer.train()
+    trainer.run()
 
     # get a copy
     grads = _before_step_grads
@@ -433,7 +434,7 @@ def trainer_per_token_worker(save_dir):
         '--hook.before_gnorm_clip',
             'tests.cli.test_trainer.before_gnorm_clip',
     ])
-    trainer.train()
+    trainer.run()
 
     torch.distributed.barrier()
 

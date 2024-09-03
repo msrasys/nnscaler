@@ -23,7 +23,7 @@ def trainer_worker(save_dir):
         '--gen_savedir', str(gen_savedir),
         '--checkpoint.save_dir', str(ckpt0_savedir),
     ])
-    trainer.train()
+    trainer.run()
     torch.distributed.barrier()
 
     # train with normal optimizer
@@ -34,7 +34,7 @@ def trainer_worker(save_dir):
         '--gen_savedir', str(gen_savedir),
         '--checkpoint.save_dir', str(ckpt1_savedir),
     ])
-    trainer.train()
+    trainer.run()
     torch.distributed.barrier()
 
     if torch.distributed.get_rank() == 0:

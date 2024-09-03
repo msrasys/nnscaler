@@ -487,6 +487,10 @@ class TrainerArgs:
         return not self.enable_progress_bar and self.log_progress_every_n_train_steps
 
     @property
+    def compile_mode(self) -> bool:
+        return self.run_mode == 'compile'
+
+    @property
     def param_dtype(self) -> torch.dtype:
         return _PRECISION_MAP[self.precision['param']]
 

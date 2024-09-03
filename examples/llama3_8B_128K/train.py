@@ -231,8 +231,7 @@ def main(args):
     )
 
     trainer = Trainer(train_args=trainer_args)
-    if args.run_mode == 'run':
-        trainer.train()
+    trainer.run()
 
 
 if __name__ == '__main__':
