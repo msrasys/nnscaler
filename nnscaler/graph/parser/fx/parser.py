@@ -14,8 +14,7 @@ from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.graph.function.function import any_ir_object_satisfy
 
 import torch.fx
-from .concrete_trace_utils import TensorMetadata
-from .concrete_trace_utils.utils import DICT_KEYS_TYPE, DICT_VALUES_TYPE, DICT_ITEMS_TYPE
+from .concrete_trace_utils import TensorMetadata, DICT_KEYS_TYPE, DICT_VALUES_TYPE, DICT_ITEMS_TYPE
 
 _logger = logging.getLogger(__name__)
 

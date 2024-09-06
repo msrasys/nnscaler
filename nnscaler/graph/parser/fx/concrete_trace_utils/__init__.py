@@ -13,4 +13,4 @@ More information about concrete tracing can be found in the :func:`concrete_trac
 """
 from .concrete_tracer import ConcreteTracer, concrete_trace
 from .concrete_proxy import ConcreteProxy
-from .utils import ExtraSEFPatcher, TensorMetadata
+from .metadata import TensorMetadata, DICT_KEYS_TYPE, DICT_VALUES_TYPE, DICT_ITEMS_TYPE

@@ -4,6 +4,9 @@ This file is the pytree extension by nnscaler.
 from collections import namedtuple
 from typing import Any, List, Tuple, Iterable
 
+import torch
+import inspect
+
 from . import orig_func, _pytree
 from ._pytree import *
 
@@ -55,6 +58,39 @@ _pytree._private_register_pytree_node(
     serialized_type_name="builtins.slice",
     flatten_with_keys_fn=_slice_flatten_with_keys,
 )
+
+
+# register return_types to pytree, copy from torch.return_types
+return_types = torch._C._return_types
+
+def pytree_register_structseq(cls):
+    def structseq_flatten(structseq):
+        return list(structseq), None
+
+    def structseq_flatten_with_keys(structseq):
+        values, context = structseq_flatten(structseq)
+        return [(_pytree.SequenceKey(i), v) for i, v in enumerate(values)], context
+
+    def structseq_unflatten(values, context):
+        return cls(values)
+
+    _pytree.register_pytree_node(
+        cls,
+        structseq_flatten,
+        structseq_unflatten,
+        flatten_with_keys_fn=structseq_flatten_with_keys,
+    )
+
+for name in dir(return_types):
+    if name.startswith('__'):
+        continue
+
+    _attr = getattr(return_types, name)
+    globals()[name] = _attr
+
+    # torch.return_types is a structseq, aka a "namedtuple"-like thing defined by the Python C-API.
+    if inspect.isclass(_attr) and issubclass(_attr, tuple):
+        pytree_register_structseq(_attr)
 
 
 def tree_leaves_with_spec(pytree: _pytree.PyTree, spec: TreeSpec) -> List:

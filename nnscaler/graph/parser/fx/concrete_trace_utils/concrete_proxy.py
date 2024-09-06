@@ -7,7 +7,7 @@ import dis
 import logging
 import inspect
 
-from typing import List, Optional, Iterable, Any, Set, Union
+from typing import List, Optional, Iterable, Any, Union
 
 import torch
 from torch.fx._compatibility import compatibility
@@ -17,10 +17,8 @@ from torch.fx.proxy import Proxy
 from torch.overrides import is_tensor_method_or_property
 
 from . import concrete_tracer as et
-from . import pytree_utils, orig_func
-from .utils import (
-    get_frame_record,
-)
+from . import pytree_utils, orig_func, wrap_utils
+from .frame_utils import get_frame_record, get_instruction
 
 _logger = logging.getLogger(__name__)
 
@@ -77,16 +75,8 @@ class ConcreteProxy(Proxy):
             return self.value.__call__(*args, **kwargs)
         return self.tracer.create_proxy('call_method', '__call__', (self,) + args, kwargs)
 
-    def __iter__(self) -> Union[Iterable, ConcreteProxy]:
-        # to detect if in executing `*proxy`, or `a, b, c = atuple`
-        frame = inspect.currentframe()
-        assert frame is not None
-        calling_frame = frame.f_back
-        assert calling_frame is not None
-        cur = calling_frame.f_lasti // 2
-        insts: List[dis.Instruction] = orig_func.list(dis.get_instructions(calling_frame.f_code))
-        while insts[cur].opcode == self.op_extended_arg:
-            cur += 1
+    def __iter__(self) -> Union[Iterable, ConcreteProxy]:        
+        insts, cur = get_instruction(1)
 
         if insts[cur].opcode == self.op_call_ex:
             # in executing func(..., *proxy)
@@ -117,15 +107,7 @@ class ConcreteProxy(Proxy):
         return self.tracer.create_proxy('call_function', next, (self,), {})
 
     def __len__(self) -> Union[int, ConcreteProxy]:
-        # to detect if in executing `*proxy`
-        frame = inspect.currentframe()
-        assert frame is not None
-        calling_frame = frame.f_back
-        assert calling_frame is not None
-        cur = calling_frame.f_lasti // 2
-        insts: List[dis.Instruction] = orig_func.list(dis.get_instructions(calling_frame.f_code))
-        while insts[cur].opcode == self.op_extended_arg:
-            cur += 1
+        insts, cur = get_instruction(1)
 
         if insts[cur].opcode == self.op_call_ex:
             # in executing func(..., *proxy)
@@ -148,15 +130,7 @@ class ConcreteProxy(Proxy):
         return self.tracer.create_proxy('call_function', orig_func.setitem, (self,) + args, kwargs)
 
     def __bool__(self) -> Union[bool, ConcreteProxy]:
-        # to detect if in executing branch condition
-        frame = inspect.currentframe()
-        assert frame is not None
-        calling_frame = frame.f_back
-        assert calling_frame is not None
-        cur = calling_frame.f_lasti // 2
-        insts: List[dis.Instruction] = orig_func.list(dis.get_instructions(calling_frame.f_code))
-        while insts[cur].opcode == self.op_extended_arg:
-            cur += 1
+        insts, cur = get_instruction(1)
 
         if insts[cur].opcode in self.jump_opcodes or (
             insts[cur].opcode in self.jump_before_opcodes and insts[cur + 1].opcode in self.jump_opcodes):
@@ -205,15 +179,7 @@ class ConcreteProxy(Proxy):
 
     @compatibility(is_backward_compatible=True)
     def keys(self):
-        # to detect if in executing `**proxy`
-        frame = inspect.currentframe()
-        assert frame is not None
-        calling_frame = frame.f_back
-        assert calling_frame is not None
-        cur = calling_frame.f_lasti // 2
-        insts: List[dis.Instruction] = orig_func.list(dis.get_instructions(calling_frame.f_code))
-        while insts[cur].opcode == self.op_extended_arg:
-            cur += 1
+        insts, cur = get_instruction(1)
 
         if insts[cur].opcode == self.op_call_ex or insts[cur].opcode == self.op_dict_merge:
             # in executing `**proxy`
@@ -239,33 +205,38 @@ class ConcreteProxy(Proxy):
     def __torch_function__(cls, orig_method, types, args=None, kwargs=None):
         # to wrap all the functions/methods with tensor inputs in the namespace 'torch.*'.
         # actually a simple way to do wrap, but may get wrong in functions with no tensor inputs.
-        # TODO: now for most functions in torch namespace, we do wrap directly and not use __torch_function__
+        # NOTE: now for most functions in torch namespace, we do wrap directly and not use __torch_function__
+        _logger.warning(f"{orig_method} is not wrapped by tracer, which is not expected, please consider to register this function.")
 
         args = args if args else ()
         kwargs = kwargs if kwargs else {}
 
-        tracers: Set[Any] = orig_func.set()
+        with wrap_utils.do_temp_call_origin():
+            tracers = orig_func.set()
 
-        def find_tracer(a):
-            if orig_func.isinstance(a, cls):
-                tracers.add(a.tracer)
-        
-        pytree_utils.tree_map(find_tracer, args)
-        pytree_utils.tree_map(find_tracer, kwargs)
+            def detect_tracer(obj):
+                if isinstance(obj, ConcreteProxy):
+                    tracers.add(obj.tracer)
 
-        if orig_func.len(tracers) > 1:
-            raise RuntimeError(f'Found multiple different tracers {orig_func.list(tracers)} while '
-                               f'trying to trace operations {orig_method}')
-        tracer, = tracers
+            pytree_utils.tree_map(detect_tracer, args)
+            pytree_utils.tree_map(detect_tracer, kwargs)
 
-        if isinstance(orig_method, torch._C.ScriptMethod):
-            args = (orig_method.owner,) + args
-            return tracer.create_proxy('call_method', orig_method.name, args, kwargs)
-        if is_tensor_method_or_property(orig_method):
-            return tracer.create_proxy('call_method', orig_method.__name__, args, kwargs)
+            if len(tracers) > 1:
+                raise Exception('more than 1 tracer detected. please report the issue')
+
+            tracer = None if len(tracers) == 0 else tracers.pop()
+
+        if tracer is None:
+            raise RuntimeError(f"no proxy detected in the inputs of {orig_method}, please wrap this function for trace completeness.")
         else:
-            return tracer.create_proxy('call_function', orig_method, args, kwargs,
-                                       name=tracer.graph._target_to_str(orig_method.__name__))
+            if isinstance(orig_method, torch._C.ScriptMethod):
+                args = (orig_method.owner,) + args
+                return tracer.create_proxy('call_method', orig_method.name, args, kwargs)
+            if is_tensor_method_or_property(orig_method):
+                return tracer.create_proxy('call_method', orig_method.__name__, args, kwargs)
+            else:
+                return tracer.create_proxy('call_function', orig_method, args, kwargs,
+                                           name=tracer.graph._target_to_str(orig_method.__name__))
 
 
 @compatibility(is_backward_compatible=True)

@@ -8,8 +8,6 @@ import copy
 import sys
 import inspect
 import logging
-import operator
-import functools
 import builtins
 
 from types import FunctionType, MethodDescriptorType, MethodType, MethodWrapperType, ModuleType
@@ -18,79 +16,27 @@ from contextlib import contextmanager
 
 import torch
 from torch._C import ScriptObject
-from torch.nn.modules.container import Sequential, ModuleList, ModuleDict, ParameterList, ParameterDict
 
 import torch.fx
 from torch.fx import GraphModule
 from torch.fx._compatibility import compatibility
 from torch.fx._symbolic_trace import _proxyable_classes
 from torch.fx.graph import Graph
-from torch.fx.node import Target, Node, Argument, _side_effectful_functions, base_types
-from torch.fx.proxy import TracerBase
+from torch.fx.node import Target, Node, Argument, base_types
+from torch.fx.proxy import TracerBase, Scope
 from torch.fx.operator_schemas import check_for_mutable_operation
 
 dict_keys_type = type(dict().keys())
 dict_values_type = type(dict().values())
 dict_items_type = type(dict().items())
 
-try:
-    # Scope is a new class to record module path in pytorch 2.0
-    from torch.fx.proxy import Scope
-except ImportError:
-    # copy from pytorch 2.0
-    @compatibility(is_backward_compatible=False)
-    class Scope:
-        def __init__(self, module_path: str, module_type: Any):
-            super().__init__()
-            self.module_path = module_path
-            self.module_type = module_type
-
-try:
-    # comes with Scope
-    from torch.fx.proxy import ScopeContextManager
-except ImportError:
-    # copy from pytorch 2.0
-    @compatibility(is_backward_compatible=False)
-    class ScopeContextManager:
-        """ A context manager to track the Scope of Node during symbolic tracing.
-        When entering a forward function of a Module, we'll update the scope information of
-        the current module, and when we exit, we'll restore the previous scope information.
-        """
-
-        def __init__(
-            self,
-            scope: Scope,
-            current_scope: Scope,
-        ):
-            super().__init__()
-            # Keep a copy of prev scope to restore on exit
-            self._prev_scope = copy.copy(scope)
-            # Update scope to current scope
-            scope.module_path = current_scope.module_path
-            scope.module_type = current_scope.module_type
-            # Save a reference so we can restore it
-            self._scope = scope
-
-        def __enter__(self):
-            return self._scope
-
-        def __exit__(self, *args):
-            self._scope.module_path = self._prev_scope.module_path
-            self._scope.module_type = self._prev_scope.module_type
-            return
-
 from . import concrete_proxy as ep
 from . import pytree_utils, orig_func, wrap_utils
+from .frame_utils import get_frame_record
 from .function_patcher import FunctionPatcher
+from .metadata import EmptyResult, extract_results_metadata
 from .operator_patcher import OperatorPatcherContext
-from .utils import (
-    _orig_node_is_impure,
-    side_effectful_inplace_ops,
-    ExtraSEFPatcher,
-    EmptyResult,
-    extract_results_metadata,
-    get_frame_record,
-)
+from .torch_fx_patcher import TorchFXPatcher, ExtraSEFPatcher, side_effectful_inplace_ops
 
 # pyright: reportGeneralTypeIssues=false
 _logger = logging.getLogger(__name__)
@@ -732,12 +678,13 @@ class ConcreteTracer(TracerBase):
                 with OperatorPatcherContext(self, use_operator_patch, operator_patch_backlist):
                     results = OperatorPatcherContext.patch_run(fn, *args, *more_args, **kwargs)
                     # we should unwrap proxy to the original value in the results when we record it to node.meta['tensor_meta']
-                    def unwrap(obj: Any):
-                        while orig_func.isinstance(obj, ep.ConcreteProxy):
-                            obj = obj.value
-                        return obj
+                    with wrap_utils.do_temp_call_origin():
+                        def unwrap_nested_proxy(proxy: ep.ConcreteProxy):
+                            return pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, proxy.value)
+
+                        node_result = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, results)
                     self.create_node('output', 'output', (self.create_arg(results),),
-                                     {}, type_expr=fn.__annotations__.get('return', None), node_result=ep.map_aggregate_not_proxy(results, unwrap))
+                                     {}, type_expr=fn.__annotations__.get('return', None), node_result=node_result)
         finally:
             _retain_weight_consistency(self.root)
 
@@ -774,109 +721,6 @@ class GraphAppendingConcreteTracer(ConcreteTracer):
         super().__init__()
         self.graph = graph
 
-class MagicMethodPatcher:
-    from torch.fx import graph as fx_graph
-    from torch.fx import graph_module as fx_graph_module
-    from torch.fx import node as fx_node
-    magic_methods_ori = fx_graph.magic_methods
-    magic_methods_new = {
-        **fx_graph.magic_methods,
-        'not_': 'not {}',
-        'is_': '{} is {}',
-        'is_not': '{} is not {}',
-        'contains': '{1} in {0}',
-    }
-    copy_attr_ori: Any = fx_graph_module._copy_attr
-    find_module_of_method_ori: Any = fx_node._find_module_of_method
-    format_import_statement_ori: Any = fx_graph_module._format_import_statement
-
-    @staticmethod
-    def copy_attr_new(from_module: torch.nn.Module, to_module: torch.nn.Module, target: str):
-        *prefix, field = target.split('.')
-        for item in prefix:
-            f = getattr(from_module, item)
-            t = getattr(to_module, item, None)
-            if f is t:
-                return
-
-            if t is None:
-                if isinstance(f, Sequential):
-                    t = Sequential()
-                elif isinstance(f, ModuleList):
-                    t = ModuleList()
-                elif isinstance(f, ModuleDict):
-                    t = ModuleDict()
-                else:
-                    t = torch.nn.Module()
-                if hasattr(f, '_get_name'):
-                    t._get_name = f._get_name
-                to_module.add_module(item, t)
-            from_module, to_module = f, t
-
-        orig = getattr(from_module, field)
-        
-        # If it is a buffer, register the tensor as the same type of buffer, otherwise, just set the attribute.
-        if isinstance(orig, torch.Tensor) and not isinstance(orig, torch.nn.Parameter):
-            persistent = field in from_module._buffers and field not in from_module._non_persistent_buffers_set
-            to_module.register_buffer(field, orig, persistent=persistent)
-        else:
-            setattr(to_module, field, orig)
-
-    @staticmethod
-    def find_module_of_method_new(orig_method: Callable[..., Any]) -> str:
-        if wrap_utils.is_autograd_apply(orig_method):
-            # for torch.autograd.Function
-            return f'{orig_method.__self__.__module__}.{orig_method.__self__.__name__}'
-
-        name = orig_method.__name__
-        module = orig_method.__module__
-        # if hasattr(orig_method, '__qualname__') and isinstance(orig_method.__qualname__, str):
-        #     # if there has '.' in '__qualname__', it means this function is in a nested structure,
-        #     #
-        #     # for example, it is a method / function in a class:
-        #     # torch.nn.Linear.forward.__module__ = torch.nn
-        #     # torch.nn.Linear.forward.__name__ = forward
-        #     # torch.nn.Linear.forward.__qualname__ = Linear.forward
-        #     #
-        #     # And in fx.node qualified name creating rule, the module also should include the class name,
-        #     # in this example, the returned module should be `torch.nn.Linear`.
-        #     # It is not the original meaning of a obj's module, but we need this workaround to reuse fx node.
-        #     splited_names = orig_method.__qualname__.split('.')
-        #     class_name, name = splited_names[:-1], splited_names[-1]
-        #     module = '.'.join([module] + class_name)
-        if module == 'torch.autograd.grad_mode' and name in ['__enter__', '__exit__']:
-            return 'torch.autograd.grad_mode.no_grad'
-        if module is not None:
-            return module
-        if hasattr(orig_method, '__qualname__')\
-            and isinstance(orig_method.__qualname__, str) and orig_method.__qualname__.startswith('_VariableFunctionsClass.'):
-            return 'torch._C._VariableFunctions'
-        for guess in [torch, getattr(torch.nn, 'functional')]:
-            if getattr(guess, name, None) is orig_method:
-                return guess.__name__
-        raise RuntimeError(f'cannot find module for {orig_method}')
-
-    @staticmethod
-    def format_import_statement_new(name: str, obj: Any, importer) -> str:
-        if wrap_utils.is_autograd_apply(obj):  # type: ignore
-            # torch.autograd.function
-            return MagicMethodPatcher.format_import_statement_ori(name, obj.__self__, importer) + f'\n{name} = {name}.apply'
-        return MagicMethodPatcher.format_import_statement_ori(name, obj, importer)
-
-    def __enter__(self):
-        MagicMethodPatcher.fx_graph.magic_methods = self.magic_methods_new
-        MagicMethodPatcher.fx_graph_module._copy_attr = self.copy_attr_new
-        MagicMethodPatcher.fx_node._find_module_of_method = self.find_module_of_method_new
-        MagicMethodPatcher.fx_graph_module._format_import_statement = self.format_import_statement_new
-        MagicMethodPatcher.available = True
-
-    def __exit__(self, exc_type, exc_value, tb):
-        MagicMethodPatcher.fx_graph.magic_methods = MagicMethodPatcher.magic_methods_ori
-        MagicMethodPatcher.fx_graph_module._copy_attr = MagicMethodPatcher.copy_attr_ori
-        MagicMethodPatcher.fx_node._find_module_of_method = MagicMethodPatcher.find_module_of_method_ori
-        MagicMethodPatcher.fx_graph_module._format_import_statement = MagicMethodPatcher.format_import_statement_ori
-        MagicMethodPatcher.available = False
-        return exc_type is None
 
 def _retain_weight_consistency(root: torch.nn.Module):
     _flag = 0
@@ -898,56 +742,6 @@ def _retain_weight_consistency(root: torch.nn.Module):
                         ' ``concrete_trace`` may not guarantee the consistency of the traced graph.')
     return root
 
-@functools.wraps(_orig_node_is_impure)
-def node_is_impure_wrapper(node):
-    if is_useless_iter(node):
-        return False
-
-    if node.op in {"placeholder", "output"}:
-        return True
-
-    if node.op == "call_function":
-        return node.target in _side_effectful_functions
-
-    if node.op == "call_method":
-        return node.target.endswith("_")
-
-    if node.op == "call_module":
-        assert (
-            node.graph.owning_module is not None
-        ), "self.graph.owning_module not set for purity check"
-        target_mod = node.graph.owning_module.get_submodule(node.target)
-        assert (
-            target_mod is not None
-        ), f"Did not find expected submodule target {node.target}"
-        return getattr(target_mod, "_is_impure", False)
-
-    return False
-
-def is_useless_iter(node: Node):
-    if node.op == 'call_function' and node.target is iter:
-        node_is_impure = False
-        for iter_user in node.users:
-            if not is_useless_next(iter_user):
-                node_is_impure = True
-                break
-        if not node_is_impure:
-            for iter_user in list(node.users.keys()):
-                setattr(iter_user, '_is_impure', False)
-                iter_user.graph.erase_node(iter_user)
-            if len(node.users) > 0:
-                raise RuntimeError('The user node of iter is not empty, something goning wrong.')
-            setattr(node, '_is_impure', False)
-            return True
-    else:
-        return False
-
-def is_useless_next(node: Node):
-    if node.op == "call_function" and node.target is next:
-        if len(node.users) == 0:
-            return True
-    else:
-        return False
 
 def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
                    concrete_args: Union[Dict[str, Any], Tuple],
@@ -1128,7 +922,7 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
             else:
                 assert node_a.op == node_b.op and target_a == target_b, f'op: {node_a.op} vs {node_b.op}, target: {target_a} vs {target_b}'
 
-    with MagicMethodPatcher():
+    with TorchFXPatcher():
         name = root.__class__.__name__ if isinstance(root, torch.nn.Module) else root.__name__
         traced = GraphModule(tracer.root, graph, name)
 
@@ -1140,10 +934,9 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
                 *side_effectful_inplace_ops
             }
             extra_side_effectful_functions = default_extra_side_effectful_functions | dce_ignored_function
-            with FunctionPatcher() as patcher, ExtraSEFPatcher(extra_side_effectful_functions):
-                patcher.patch_method(Node, 'is_impure', node_is_impure_wrapper, deduplicate=False)
+            with ExtraSEFPatcher(extra_side_effectful_functions):
                 traced.graph.eliminate_dead_code()
-            traced.recompile()  # this need to be done in MagicMethodPatcher context
+            traced.recompile()  # this need to be done in TorchFXPatcher context
 
     # TODO: better infomation
     if check_args is not None:
