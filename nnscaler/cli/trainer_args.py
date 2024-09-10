@@ -526,7 +526,11 @@ class TrainerArgs:
 
     def create_dataset(self, stage='train'):
         dataset_args = getattr(self.dataset, f'{stage}_args')
-        if not dataset_args:
+        # Sometimes a user uses a parameterless dataset class/factory function.
+        # To support this case, we will create train dataset even without any arguments.
+        # but val/test dataset must have arguments.
+        if not dataset_args and stage != 'train':
+            logger.info(f"{stage} dataset will not be created because empty arguments are provided.")
             return None
         kwargs = self.create_kwarg(dataset_args)
         dataset_class = load_type(self.dataset.type)

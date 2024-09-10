@@ -6,7 +6,7 @@ import pytest
 import torch.distributed
 
 from nnscaler.cli.trainer import Trainer
-from nnscaler.cli.trainer_args import AggregatedOutputs
+from nnscaler.cli.trainer_args import AggregatedOutputs, TrainerArgs
 from tests.parallel_module.common import assert_equal
 from tests.utils import replace_all_device_with
 from ..launch_torchrun import launch_torchrun
@@ -448,3 +448,21 @@ def trainer_per_token_worker(save_dir):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_trainer_per_token(tmp_path):
     launch_torchrun(2, trainer_per_token_worker, tmp_path)
+
+
+def test_dataset_empty_train_args():
+    def _empty_train_args():
+        from .common import SimpleDataset
+        return SimpleDataset(10)
+
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    train_args = TrainerArgs.from_cli([
+        '-f', config_path,
+        '--compute_config.plan_ngpus', '1',
+        '--compute_config.runtime_ngpus', '2',
+    ])
+    train_args.dataset.type = _empty_train_args
+    train_args.dataset.train_args = {}
+    train_args.dataset.val_args = {}
+    assert train_args.create_dataset() is not None
+    assert train_args.create_dataset('val') is None
