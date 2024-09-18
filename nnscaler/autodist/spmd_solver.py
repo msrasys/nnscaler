@@ -131,11 +131,11 @@ class SPMDSolver:
     1. calculate the `out_degs` for each node, which is the number of consumers of the node
     2. traverse the nodes in the topological order
         - decrease each producer's `out_degs` by 1, if the `out_degs` is 0, remove the producer
-          from the `unclosed_idx` and set current node's idx (time) as the producer's 'close_time' 
+          from the `unclosed_idx` and set current node's idx (time) as the producer's 'close_time'
         - set current node's `cut_ops` as the union of `unclosed_idx` and the node itself
-        - add the node to `unclosed_idx` if its #consumers > 0 
+        - add the node to `unclosed_idx` if its #consumers > 0
 
-    However, in real-world scenarios, certain positions might have a large number of `cut_ops`, 
+    However, in real-world scenarios, certain positions might have a large number of `cut_ops`,
     and each op may have more than one partitioning strategy (for example, when the input data flow graph
     is a complete graph). In such cases, the search space becomes very large, making it impossible to solve
     within limited time and space. To help users reduce the search space, we calculate a metric called
@@ -1180,7 +1180,14 @@ class SPMDSolver:
     def do_dp(self, intervals: List[Tuple[int, int]],
               topk: int) -> List[List[SPMDSearchOutput]]:
         import cppimport.import_hook
-        import nnscaler.autodist.dp_solver as dp_solver
+        try:
+            import nnscaler.autodist.dp_solver as dp_solver
+        except ImportError:
+            raise RuntimeError(
+                'Failed to import solver. '
+                'If you installed nnscaler from source (`pip install -e .`), '
+                'please also make sure to put parent directory of `nnscaler` in `PYTHONPATH`.'
+            )
 
         if self.autodist_config.memory_granularity < 1024:
             raise RuntimeError('dp solver assumes the memory granularity is at least 1024 bytes')
