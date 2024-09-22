@@ -36,11 +36,11 @@ class IntraTransition:
     def d2r(rvd: TRVD, dim: int, chunks: int) -> Tuple[TRVD, Callable]:
         """
         intra-RVD primitive D->R: allgather
-        
+
         @param rvd Tuple[int]: input RVD
         @param dim int: tensor dimension
         @param chunks int: the number of chunks to transfer
-        
+
         @return rvd Tuple[int]: output RVD
         @return prim Callable: IRAdapter primitive
         """
@@ -53,12 +53,12 @@ class IntraTransition:
     def d2d(rvd: TRVD, from_dim: int, to_dim: int, chunks: int) -> Tuple[TRVD, Callable]:
         """
         intra-RVD primitive D(...,i,..)->D(..,j,...): alltoall
-        
+
         @param rvd Tuple[int]: input RVD
         @param from_dim int: source tensor axis
         @param to_dim int: destination tensor axis
         @param chunks int: the number of chunks to transfer
-        
+
         @return rvd Tuple[int]: output RVD
         @return prim Callable: IRAdapter primitive
         """
@@ -71,10 +71,10 @@ class IntraTransition:
     def v2r(rvd: TRVD, chunks: int) -> Tuple[TRVD, Callable]:
         """
         intra-RVD primitive V->R: allreduce
-        
+
         @param dim int: tensor dimension
         @param chunks int: the number of chunks to transfer
-        
+
         @return rvd Tuple[int]: output RVD
         @return prim Callable: IRAdapter primitive
         """
@@ -82,15 +82,15 @@ class IntraTransition:
         rvd = list(rvd)
         rvd[1], rvd[0] = rvd[1] // chunks, rvd[0] * chunks
         return rvd, AllReducePrim
-    
+
     @staticmethod
     def v2d(rvd: TRVD, dim: int, chunks: int) -> Tuple[TRVD, Callable]:
         """
         intra-RVD primitive V->D: reduce-scatter
-        
+
         @param dim int: tensor dimension
         @param chunks int: the number of chunks to transfer
-        
+
         @return rvd Tuple[int]: output RVD
         """
         assert rvd[1] % chunks == 0, f"not dividable value chunks: {rvd[1]} // {chunks}"
@@ -102,10 +102,10 @@ class IntraTransition:
     def r2d(rvd: TRVD, dim: int, chunks: int) -> Tuple:
         """
         intra-RVD primitive V->D: schunk
-        
+
         @param dim int: tensor axis
         @param chunks int: the number of chunks to transfer
-        
+
         @return rvd Tuple[int]: output RVD
         @return prim Callable: IRAdapter primitive
         """
@@ -118,10 +118,10 @@ class IntraTransition:
     def r2v(rvd: TRVD, chunks: int) -> Tuple:
         """
         intra-RVD primitive V->D: schunk
-        
+
         @param dim int: tensor axis
         @param chunks int: the number of chunks to transfer
-        
+
         @return rvd Tuple[int]: output RVD
         @return prim Callable: IRAdapter primitive
         """
@@ -174,7 +174,7 @@ class IntraTransition:
 
         @param src_layout RVDLayout: source ilayout
         @param dst_rvd Tuple[int]: destination RVD
-        
+
         @return rets List[Tuple[GridLayout, List[IRAdapterPrim]], ...]:
             tuple of pairs of <layout, [prims]> with each has a different device mapping.
         """
@@ -187,7 +187,7 @@ class IntraTransition:
         decd = [dim for dim, (d1, d2) in enumerate(zip(src_rvd, dst_rvd)) if d1 > d2][0]
         chunks = src_rvd[decd] // dst_rvd[decd]
         _, primitive = trans_fn(src_rvd, chunks=chunks)
-        
+
         # get device spaces
         optional_dims = {0, 1}
         devices = tuple(t.device[0] for t in src_layout.mat.flatten())
@@ -281,7 +281,7 @@ class IntraPathFinder:
         @param olayout RVDLayout: output tensor layout
         @param cost_fn Optional[Callable]: cost function of each primitive.
             Default (None) will use transmission volume as metrics
-        
+
         @return all_primitives List[IRAdapterPrims]: all primitives for communication path
         """
         assert ilayout.ftensor == olayout.ftensor, f"ilayout and olayout should have a same full tensor"
@@ -336,14 +336,16 @@ class IntraPathFinder:
                          cost_fn: Optional[Callable] = None) -> Tuple[TRVD]:
         """
         Get optimal RVD path from source RVD to destination RVD
-        
+
         @param src_rvd Tuple[int]: source RVD
         @param dst_rvd Tuple[int]: destination RVD
 
         @return path Tuple[Tuple[int]]:
             The first one is src_rvd. The last one is dst_rvd.
-            Otherwise they are intermediate RVD status 
+            Otherwise they are intermediate RVD status
         """
+        # Please note the following int can be either python int or np.int*
+
         src_rvd, dst_rvd = tuple(src_rvd), tuple(dst_rvd)
         if src_rvd == dst_rvd: return [src_rvd, dst_rvd]
 
@@ -388,14 +390,18 @@ class IntraPathFinder:
                 unvisited.remove(visit)
                 visited.add(visit)
             IntraPathFinder._cached_intra_paths[key][src_rvd] = paths
-        
+
         # for idx, path in enumerate(paths):
         #     print(f"{src} -> {nodes[idx]}: {' -> '.join([str(nodes[i]) for i in path])} | cost: {cost[idx]}")
-        
+
         # get layout
         nodes = IntraPathFinder._cached_intra_nodes[key]
         path: List[int] = paths[nodes.index(dst_rvd)]
         rvds: List[Tuple[int]] = [nodes[idx] for idx in path]
+        rvds = tuple(
+            tuple(int(x) for x in rvd)  # make sure all int (not np.int*) for rvds
+            for rvd in rvds
+        )
         assert len(path) > 0, f"Un-reachable src RVD ({src_rvd}) -> dst RVD ({dst_rvd})"
         # print(f'get optimal path from {src_rvd} -> {dst_rvd}: {rvds}')
         return rvds
@@ -422,7 +428,7 @@ class IntraPathFinder:
         @param ftensor IRFullTensor
         @param rvd_paths Tuple[TRVDS]: transition RVD paths from source to destination
         @param placement Tuple[int]: device placement of the first RVD in rvd_paths
-        
+
         @return placements Set[Tuple[int]]: all possible device placement
         """
         init, hops = rvd_paths[0], rvd_paths[1:]
@@ -475,10 +481,10 @@ class IntraPathFinder:
         @param ilayout GridLayout: input layout
         @param olayout GridLayout: output layout
 
-        @return layouts List[GridLayout]: 
+        @return layouts List[GridLayout]:
         """
         all_layouts: List[int] = []
-        
+
         def factors(ndevs: int, length: int):
             if length == 1: yield [ndevs]
             else:
@@ -486,7 +492,7 @@ class IntraPathFinder:
                     if ndevs % i == 0:
                         for res in factors(ndevs // i, length - 1):
                             yield [i] + res
-        
+
         for rvd in factors(ndevs, 2+len(ftensor.shape)):
             skip = False
             for dimlen, pnum in zip(ftensor.shape, rvd[2:]):
@@ -537,7 +543,7 @@ class IntraAutoPlacer:
         """
         Automatically find good device placement for consumers given the producer placement
         The backward will also be considered.
-        
+
         @param graph IRSegment
         @param ftensor IRFullTensor
         @param producers List[IRCell]: producers that must be assigned to devices
@@ -548,10 +554,10 @@ class IntraAutoPlacer:
         """
         assert not ftensor.is_param(), f"Cannot automatically assign device given weight tensor"
         assert all(len(p.device) > 0 for p in producers), f"Expect all producers have been assigned to a device"
-        
+
         devices = [p.device[0] for p in producers]
         assert len(set(devices)) == len(producers),f"Expect each producer is on a different device"
-        
+
         assert len(producers) == len(consumers), \
             f"Expect same number of producer and consumer, but got {len(producers)} producers and {len(consumers)} consumers"
 
@@ -586,14 +592,14 @@ class IntraAutoPlacer:
         if ftensor.grad is not None:
             bw_src_rvd = RVDLayout.togrid(ftensor.grad, bptensors).vec
             bw_dst_rvd = RVDLayout.togrid(ftensor.grad, bctensors).vec
-        
+
         # get placement advice
         devices = [t.device[0] for t in fw_src.mat.flatten()]
         placement, _ = IntraAutoPlacer.advice(
-            ftensor.shape, 
+            ftensor.shape,
             fw_src_rvd, fw_dst_rvd, bw_src_rvd, bw_dst_rvd,
             devices, cost_fn)
-        
+
         # assign to device
         ordered_placement = [None] * len(consumers)
         for devid, t in zip(placement, fw_dst.mat.flatten()):
@@ -609,9 +615,9 @@ class IntraAutoPlacer:
                src_placement: List[int],
                cost_fn: Optional[Callable] = None) -> Tuple[Tuple[int], float]:
         """
-        Search for a good device placement for 
+        Search for a good device placement for
         source and destination RVD partition
-        
+
         @param shape Tuple[int]: full tensor shape
         @param fw_src_rvd Tuple[int]: forward producer RVD layout vector
         @param fw_dst_rvd Tuple[int]: forward consumer RVD layout vector
@@ -619,7 +625,7 @@ class IntraAutoPlacer:
         @param bw_dst_rvd Optional[Tuple[int]]: backward consumer RVD layout vector
         @param cost_fn Optional[Callable]: cost function of each primitive.
             Default (None) will use communication volume as metrics
-        
+
         @return devices Tuple[int]: device sequence for RVD tensors
         @return cost float: Cost of communication plan
         """
@@ -642,7 +648,7 @@ class IntraAutoPlacer:
                 bw_consumer_devices = IntraPathFinder.get_device_space(
                     ftensor, bw_rvd_hops, bw_producer_devs
                 )
-                # FIXME: this comparison on tuples some misses possible placement 
+                # FIXME: this comparison on tuples some misses possible placement
                 # that can be actually aligned by using layout.align (false possitive).
                 if src_placement in bw_consumer_devices:
                     devices.add(bw_producer_devs)
