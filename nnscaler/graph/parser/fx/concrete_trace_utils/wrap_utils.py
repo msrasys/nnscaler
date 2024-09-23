@@ -296,7 +296,7 @@ def create_wrapped_module_getattribute(tracer: 'ConcreteTracer'):
             except AttributeError:
                 attr_val = orig_func.torch_module_getattr(mod, attr)
         if orig_func.isinstance(attr_val, cct.ConcreteProxy):
-            warn_msg = f'Detected {tracer.path_of_module[id(mod)]}.{attr} is a ConcreteProxy, ' + \
+            warn_msg = f'Detected {tracer.get_path_of_module(mod)}.{attr} is a ConcreteProxy, ' + \
                 'this is usually caused by directly assigning the return value of some leaf function to the attribute of the module. ' + \
                 'Please note that this writing method may cause some trace errors.'
             _logger.warning(warn_msg)
@@ -304,15 +304,15 @@ def create_wrapped_module_getattribute(tracer: 'ConcreteTracer'):
         # using isinstance instead of _orig_isinstance to judge whether
         # the ConcreteProxy.value is the following three types if the attr_val is a ConcreteProxy
         elif isinstance(attr_val, (orig_func.tuple, orig_func.list)):
-            if tracer.path_of_module[id(mod)] == '':
+            if tracer.get_path_of_module(mod) == '':
                 return tracer.create_proxy('get_attr', f'{attr}', (), {})
             else:
-                return tracer.create_proxy('get_attr', f'{tracer.path_of_module[id(mod)]}.{attr}', (), {})
+                return tracer.create_proxy('get_attr', f'{tracer.get_path_of_module(mod)}.{attr}', (), {})
         elif attr in tracer.default_module_getattr:
-            if tracer.path_of_module[id(mod)] == '':
+            if tracer.get_path_of_module(mod) == '':
                 return tracer.create_proxy('get_attr', f'{attr}', (), {})
             else:
-                return tracer.create_proxy('get_attr', f'{tracer.path_of_module[id(mod)]}.{attr}', (), {})
+                return tracer.create_proxy('get_attr', f'{tracer.get_path_of_module(mod)}.{attr}', (), {})
         elif id(attr_val) in tracer.path_of_parameter:
             return tracer.create_proxy('get_attr', tracer.path_of_parameter[id(attr_val)], (), {})
         elif id(attr_val) in tracer.path_of_buffer:
@@ -329,7 +329,7 @@ def create_wrapped_module_call(tracer: 'ConcreteTracer'):
             return orig_func.torch_module_call(mod, *args, **kwargs)
         else:
             # codes below corresponds to symbolic tracer's call_module
-            module_qualified_name = tracer.path_of_module[id(mod)]
+            module_qualified_name = tracer.get_path_of_module(mod)
             with ScopeContextManager(tracer.scope, Scope(module_qualified_name, type(mod))) as _scope:
                 tracer.module_stack[_scope.module_path] = _scope.module_type
                 if not tracer.is_leaf_module(mod, module_qualified_name):
@@ -346,12 +346,12 @@ def create_wrapped_module_call(tracer: 'ConcreteTracer'):
 def create_wrapped_nn_module_func(tracer: 'ConcreteTracer', mod: torch.nn.Module, name: str):
     orig_fn = orig_func.getattr(mod, name)
     if not orig_func.isinstance(orig_fn, MethodType):
-        raise RuntimeError(f'{tracer.path_of_module[id(mod)]}.{name} is not a bound method, only support wrap bound method.')
+        raise RuntimeError(f'{tracer.get_path_of_module(mod)}.{name} is not a bound method, only support wrap bound method.')
 
     @functools.wraps(orig_fn)
     def wrapped(*args, **kwargs):
-        module_qualified_name = tracer.path_of_module[id(mod)]
-        with ScopeContextManager(tracer.scope, Scope(module_qualified_name, orig_func.type(mod))) as _scope:
+        module_qualified_name = tracer.get_path_of_module(mod)
+        with ScopeContextManager(tracer.scope, Scope(module_qualified_name, type(mod))) as _scope:
             need_pop = False
             if _scope.module_path not in tracer.module_stack:
                 need_pop = True

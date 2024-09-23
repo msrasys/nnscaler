@@ -303,6 +303,30 @@ class ConcreteTracer(TracerBase):
         """
         return False
 
+    def get_path_of_module(self, mod: torch.nn.Module):
+        if id(mod) in self.path_of_module:
+            return self.path_of_module[id(mod)]
+        else:
+            # if the module id does not exsit in the self.path_of_module, that means this module is not in the orginal root model,
+            # may be created somewhere outside of the root model, e.g., created on the fly in the forward computation,
+            # in the following example, a new CrossEntropyLoss module will be created during forward:
+            #
+            #   def forward(self, x, y):
+            #       loss = torch.nn.CrossEntropyLoss()
+            #       return loss(x, y)
+            #
+            # in this case, we create a `_module_constants` field on root model to save these module for the completeness.
+            if not hasattr(self.root, '_module_constants'):
+                self.root._module_constants = torch.nn.ModuleList()
+            module_constants = self.root._module_constants
+            assert isinstance(module_constants, torch.nn.ModuleList)
+            sub_path = str(orig_func.len(module_constants))
+            if not hasattr(module_constants, sub_path):
+                module_constants.add_module(sub_path, mod)
+            path = '_module_constants.%s' % sub_path
+            self.path_of_module[id(mod)] = path
+            return path
+
     # This method will be refactored
     @compatibility(is_backward_compatible=False)
     def create_args_for_root(self, root_fn, is_module, concrete_args: Union[Dict[str, Any], Tuple]) -> Tuple[Any, list, Any, Any]:
