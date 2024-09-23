@@ -183,6 +183,7 @@ class ComputeConfig:
     runtime_ngpus: int
 
     constant_folding: bool = False
+    trace_strategy: Literal['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache'] = 'cuda_run_cpu_offload'
 
     use_zero: bool = False
     zero_ngroups: int = 1
@@ -214,6 +215,13 @@ We can categorize the fields into 4 categories:
         and can make the compiling process faster and reduce the communication cost at runtime.
         However, user should make sure that inputs at runtime share a same schema (including shape) with tracing and correspond to a same computation graph.
         Errors may be raised at runtime when this assumption is broken.
+    - `trace_strategy`: how to execute the functions during trace.
+    Five strategies are supported:
+        1. `cpu`: Execute all functions on cpu device, model weights and intermediate results are on cpu device.
+        2. `cuda`: Execute all functions on cuda device, model weights and intermediate results are on cuda device. This strategy is recommended if the model can inference on single gpu.
+        3. `meta`: Execute all functions on meta device, model weights are on cpu and intermediate results are on meta device. For more information about meta device type, please view https://pytorch.org/docs/stable/meta.html.
+        4. `cuda_run_cpu_offload`: Try to execute all functions on cuda, and retry to execute the function on cpu as backup if OOM is catched, model weights and intermediate results are on cpu. This strategy is recommanded for most case if the model is too large to inference on single gpu.
+        5. `reuse_cache`: Compared to `cuda_run_cpu_offload` strategy, maintains a map from function signatures to output values. The cached output is returned when the signature of the function that generates it has been executed. Same signature means the funtions are the same and have almost the same inputs (for tensor type input, just check if they have same tensor meta data[shape, dtyep, requires_grad, stride, memory_format, ...], and don't check the value). This strategy is an experimental strategy to speedup the large-model-large-input case, and have risk to trace an incorrect graph if the signature defined here can not distinguish the differnet functions used in the model, for example, torch.nonzero will always return the same result if the input have same meta data but different value. We have plan to continue improve this strategy to handle most these kind of data dependence cases, but please note that the risk is still inevitable.
 2. Compute environment configuration
     - `plan_ngpus`: the number of gpus to be used as a unit. The model is partitioned (TP or PP) within a unit, and then data parallelism is applied across multiple units. So every `plan_ngpus` devices holds the whole model. Furthermore, assume we have two workers, and their ranks are `rank1` and `rank2`:
         1. if `rank1 // plan_gpus == rank2 // plan_ngpus`, then they are in the same unit.

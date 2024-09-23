@@ -11,7 +11,7 @@ import logging
 import builtins
 
 from types import FunctionType, MethodDescriptorType, MethodType, MethodWrapperType, ModuleType
-from typing import Any, Dict, Optional, Set, Tuple, Type, List, Callable, Union
+from typing import Any, Dict, Optional, Set, Tuple, Type, List, Callable, Union, Literal
 from contextlib import contextmanager
 
 import torch
@@ -22,7 +22,7 @@ from torch.fx import GraphModule
 from torch.fx._compatibility import compatibility
 from torch.fx._symbolic_trace import _proxyable_classes
 from torch.fx.graph import Graph
-from torch.fx.node import Target, Node, Argument, base_types
+from torch.fx.node import Target, Node, Argument
 from torch.fx.proxy import TracerBase, Scope
 from torch.fx.operator_schemas import check_for_mutable_operation
 
@@ -37,6 +37,7 @@ from .function_patcher import FunctionPatcher
 from .metadata import EmptyResult, extract_results_metadata
 from .operator_patcher import OperatorPatcherContext
 from .torch_fx_patcher import TorchFXPatcher, ExtraSEFPatcher, side_effectful_inplace_ops
+from .trace_strategy import TRACE_STRATEGY
 
 # pyright: reportGeneralTypeIssues=false
 _logger = logging.getLogger(__name__)
@@ -55,16 +56,37 @@ class ConcreteTracer(TracerBase):
     )
 
     @compatibility(is_backward_compatible=True)
-    def __init__(self, cpu_offload = False, record_frames = False):
+    def __init__(self, strategy, record_frames = False):
         """
         similar to _symbolic_trace.Tracer.__init__.
         remove the 'param_shapes_constant' because we can get real shape when executing.
+
+        Args:
+            strategy (Literal['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache']):
+                The device placement strategy for intermediate results and module parameters/buffer, and run target.
+                The following strategies are supported:
+                    'cpu': Execute all functions on cpu, model weights and intermediate results are on cpu.
+                    `cuda': Execute all functions on cuda, model weights and intermediate results are on cuda.
+                        This strategy is recommended if the model can inference on single gpu.
+                    'meta': Execute all functions on meta, model weights are on cpu and intermediate results are on meta.
+                    'cuda_run_cpu_offload': Try to execute all functions on cuda, and retry to execute the function on cpu as backup if meet OOM error,
+                        model weights and intermediate results are on cpu. This strategy is recommanded for most case if the model is too large to inference on single gpu.
+                    'reuse_cache': Similar to `cuda_run_cpu_offload` strategy, additional add a buffer to cache all the intermediate results with different function signatures on cpu,
+                        function with same signature exist in cache directly take the cached result as this time function execution to save time.
+                        Same signature means the funtions are the same and have almost the same inputs
+                        (for tensor type input, just check if they have same tensor meta data[shape, dtyep, requires_grad, stride, memory_format, ...], and don't check the value).
+                        This strategy is an experimental strategy to speedup the large-model-large-input case,
+                        and have risk to trace an incorrect graph if the signature defined here can not distinguish the differnet functions used in the model,
+                        for example, torch.nonzero will always return the same result if the input have same meta data but different value.
+                        We have plan to continue improve this strategy to handle most these kind of data dependence cases, but please note that the risk is still inevitable.
+
+            record_frames (bool): If set to True, will add frame information to node.meta['frame_record']. Note this will cost additional trace time.
         """
         super().__init__()
         self.scope = Scope("", None)
         self.module_stack = collections.OrderedDict()
         self.node_name_to_scope = {}
-        self.cpu_offload = cpu_offload
+        self.strategy = TRACE_STRATEGY[strategy](self)
         self.record_frames = record_frames
         self.patcher = FunctionPatcher()
 
@@ -108,75 +130,6 @@ class ConcreteTracer(TracerBase):
                     raise RuntimeError(f"Node referenced nonexistent target \'{'.'.join(target_atoms[:i])}\'")
                 attr_itr = orig_func.getattr(attr_itr, atom)
             return attr_itr
-
-    def run_target(self, kind: str, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]):
-        """
-        actually execute the code.
-        """
-        if kind == 'output':
-            return args[0], args, kwargs
-        elif kind == 'placeholder':
-            return self.placeholder_dict[target], args, kwargs
-
-        def run(kind: str, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]):
-            if kind == 'call_function':
-                assert isinstance(target, Callable)
-                fn = target
-                result = fn(*args, **kwargs)
-            elif kind == 'call_method':
-                self_obj, *args_tail = args
-                fn = orig_func.getattr(self_obj, target)
-                result = fn(*args_tail, **kwargs)
-            elif kind == 'call_module':
-                assert isinstance(target, str)
-                mod = self.fetch_attr(target)
-                if self.cpu_offload:
-                    try:
-                        mod.cuda()
-                        result = mod(*args, **kwargs)
-                    except:
-                        mod.cpu()
-                        raise
-                else:
-                    result = mod(*args, **kwargs)
-            elif kind == 'get_attr':
-                assert isinstance(target, str)
-                return self.fetch_attr(target)
-            else:
-                raise RuntimeError()
-            return result
-
-        try:
-            if self.cpu_offload:
-                # Concrete tracer use `.cuda()` to execute operators in device and `.cpu()` to move the result back to host.
-                # In most cases, `.cuda()` and `.cpu()` keeps the source tensor's `requires_grad` attributes.
-                # The context `torch.no_grad` enforces requires_grad=False for all tensors that generated in its scope.
-                # As a result, behavior of `.cuda()` and `.cpu()' is unexpected.
-                # To handle this case, we manually set the `requires_grad` field after `.cuda()` and `.cpu()`. 
-                args = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cuda().requires_grad_(x.requires_grad), args)
-                kwargs = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cuda().requires_grad_(x.requires_grad), kwargs)
-            result = run(kind, target, args, kwargs)
-        except torch.cuda.OutOfMemoryError:
-            if self.cpu_offload:
-                _logger.warning(f"cuda out of memory, try to trace {target} on cpu.")
-                args = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu().requires_grad_(x.requires_grad), args)
-                kwargs = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu().requires_grad_(x.requires_grad), kwargs)
-                result = run(kind, target, args, kwargs)
-            else:
-                raise
-
-        if self.cpu_offload:
-            args = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu().requires_grad_(x.requires_grad), args)
-            kwargs = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu().requires_grad_(x.requires_grad), kwargs)
-            result = pytree_utils.tree_map_only(torch.Tensor, lambda x: x.cpu().requires_grad_(x.requires_grad), result)
-
-            if not pytree_utils.tree_any(lambda x: isinstance(x, torch.Tensor), result) and \
-                pytree_utils.tree_any(lambda x: not isinstance(x, (*base_types, type(None), torch.Tensor)), result):
-                unexpected_types = set([type(elem) for elem in pytree_utils.tree_flatten(result)[0] if not isinstance(elem, (*base_types, type(None), torch.Tensor))])
-                _logger.warning(f"result of target {target} contains unexpected types {unexpected_types}, which is not a common behavior.")
-            torch.cuda.empty_cache()
-
-        return result, args, kwargs
 
     @compatibility(is_backward_compatible=True)
     def create_node(self, kind : str, target : Target,
@@ -230,9 +183,9 @@ class ConcreteTracer(TracerBase):
 
             if self.need_revert(target):
                 with self.patcher.revert():
-                    value_unwrapped, args_run, kwargs_run = self.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+                    value_unwrapped, args_run, kwargs_run = self.strategy.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
             else:
-                value_unwrapped, args_run, kwargs_run = self.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
+                value_unwrapped, args_run, kwargs_run = self.strategy.run_target(kind, target, args_unwrapped, kwargs_unwrapped)
 
             # because setitem is an inplace operation and will not return the obj, so here is a workaound to record node result
             node_result = args_run[0] if kind == "call_function" and target == orig_func.setitem else value_unwrapped
@@ -572,13 +525,17 @@ class ConcreteTracer(TracerBase):
             # TODO: support trace any callable function by add the fill default values logic.
             raise RuntimeError('Only support trace a torch.nn.Module instance now.')
 
+        self.root = self.strategy.place_model(root)
+
         # fill default values
         args = inspect.getfullargspec(getattr(root, forward_function_name)).args[1:]
         defaults = inspect.getfullargspec(getattr(root, forward_function_name)).defaults
         defaults = tuple() if defaults is None else defaults
         if isinstance(concrete_args, (tuple, list)):
+            concrete_args, _ = self.strategy.place_inputs(concrete_args, {})
             concrete_args = (*concrete_args, *defaults[len(concrete_args) + len(defaults) - len(args):])
         else:
+            _, concrete_args = self.strategy.place_inputs((), concrete_args)
             kv_default = {k: v for k, v in zip(args[-len(defaults):], defaults)}
             concrete_args = {
                 **concrete_args,
@@ -754,7 +711,7 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
                    autowrap_leaf_class: Optional[Dict[Type, wrap_utils.LeafWrapInfo]] = None,
                    dce: bool = True,
                    dce_ignored_function: Set[Callable] | None = None,
-                   cpu_offload: bool = False,
+                   strategy: Literal['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache'] = 'cuda_run_cpu_offload',
                    trace_twice: bool = False,
                    record_frames: bool = False,
                    ) -> GraphModule:
@@ -873,9 +830,23 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
 
         dce_ignored_function (Set[Callable]): The node that its target in this set will not be removed from the graph during dce.
 
-        cpu_offload (bool): Whether to offload the module to CPU during tracing. If set to True, the traced code will be executed on GPU,
-            but is offloaded to CPU afterward. This is useful for reducing memory usage during tracing, but may cause performance issues.
-            If set to False, there will be no offloading during tracing, but the traced code will be executed on default device.
+        strategy (Literal['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache']):
+            The device placement strategy for intermediate results and module parameters/buffer, and run target.
+            The following strategies are supported:
+                'cpu': Execute all functions on cpu, model weights and intermediate results are on cpu.
+                `cuda': Execute all functions on cuda, model weights and intermediate results are on cuda.
+                    This strategy is recommended if the model can inference on single gpu.
+                'meta': Execute all functions on meta, model weights are on cpu and intermediate results are on meta.
+                'cuda_run_cpu_offload': Try to execute all functions on cuda, and retry to execute the function on cpu as backup if meet OOM error,
+                    model weights and intermediate results are on cpu. This strategy is recommanded for most case if the model is too large to inference on single gpu.
+                'reuse_cache': Similar to `cuda_run_cpu_offload` strategy, additional add a buffer to cache all the intermediate results with different function signatures on cpu,
+                    function with same signature exist in cache directly take the cached result as this time function execution to save time.
+                    Same signature means the funtions are the same and have almost the same inputs
+                    (for tensor type input, just check if they have same tensor meta data[shape, dtyep, requires_grad, stride, memory_format, ...], and don't check the value).
+                    This strategy is an experimental strategy to speedup the large-model-large-input case,
+                    and have risk to trace an incorrect graph if the signature defined here can not distinguish the differnet functions used in the model,
+                    for example, torch.nonzero will always return the same result if the input have same meta data but different value.
+                    We have plan to continue improve this strategy to handle most these kind of data dependence cases, but please note that the risk is still inevitable.
 
         trace_twice (bool): If set to True, a second trace will be performed, and the two obtained graphs will be checked for consistency.
 
@@ -887,7 +858,7 @@ def concrete_trace(root : Union[torch.nn.Module, Callable[..., Any]],
     dce_ignored_function = dce_ignored_function if isinstance(dce_ignored_function, set) else set()
     assert all(callable(ignore_func) for ignore_func in dce_ignored_function)
 
-    tracer = ConcreteTracer(cpu_offload = cpu_offload, record_frames = record_frames)
+    tracer = ConcreteTracer(strategy = strategy, record_frames = record_frames)
 
     graph = tracer.trace(root,
         autowrap_leaf_function = autowrap_leaf_function,

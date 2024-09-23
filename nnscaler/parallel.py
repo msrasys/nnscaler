@@ -1,7 +1,7 @@
 from enum import Enum
 from functools import partial
 import types
-from typing import Callable, Any, Dict, Optional, Tuple, Type, Union, TypeVar, List, Set
+from typing import Callable, Any, Dict, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
 from pathlib import Path
 import inspect
 import sys
@@ -69,6 +69,9 @@ class ComputeConfig:
 
     # whether to fold constant when generating code
     constant_folding: bool = False
+
+    # how to execute the functions during trace
+    trace_strategy: str = 'cuda_run_cpu_offload'
 
     use_zero: bool = False
     zero_ngroups: int = 1
@@ -178,6 +181,7 @@ class ComputeConfig:
             'user_config': self.user_config,
             'inference_only': self.inference_only, # there will be no backward nodes in the graph in inference mode
             'end2end_mode': self.use_end2end,  # end2end_mode can affect the graph generation.
+            'trace_strategy': self.trace_strategy,  # different strategy might lead to different graph
         }
 
     @property
@@ -290,6 +294,7 @@ def _compile_flags(compute_config: ComputeConfig):
         async_reducer=False, reducer_op='sum', async_comm=False,
         use_zero=compute_config.use_zero,
         zero_ngroups=compute_config.zero_ngroups,
+        trace_strategy=compute_config.trace_strategy,
     )
 
 

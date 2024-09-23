@@ -98,7 +98,7 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
             use_operator_patch=True,
             autowrap_leaf_function=leaf_functions,
             dce_ignored_function=dce_ignored_funcs,
-            cpu_offload=True,
+            strategy=CompileFlag.trace_strategy,
             record_frames=not CompileFlag.disable_code_line_info,
         )
     _rewrite_inplace_ops(traced_model)

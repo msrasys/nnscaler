@@ -155,8 +155,7 @@ def replace_all_device_with(device='cpu', force=False):
 
     def patched_to(self, *args, **kwargs):
         if len(args) > 0 and isinstance(args[0], (torch.device, str)):
-            args[0] = device
-            return orig_to(self, *args, **kwargs)
+            return orig_to(self, device, *args[1:], **kwargs)
         if 'device' in kwargs:
             kwargs['device'] = device
             return orig_to(self, *args, **kwargs)

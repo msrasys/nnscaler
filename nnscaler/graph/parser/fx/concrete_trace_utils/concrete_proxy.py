@@ -17,7 +17,7 @@ from torch.fx.proxy import Proxy
 from torch.overrides import is_tensor_method_or_property
 
 from . import concrete_tracer as et
-from . import pytree_utils, orig_func, wrap_utils
+from . import pytree_utils, orig_func, wrap_utils, trace_strategy
 from .frame_utils import get_frame_record, get_instruction
 
 _logger = logging.getLogger(__name__)
@@ -251,9 +251,9 @@ class ConcreteAttrProxy(ConcreteProxy):
         self.attr = attr
         self.tracer = root.tracer
         self._node: Optional[Node] = None
-        if orig_func.isinstance(root.value, torch.Tensor) and attr == 'is_cuda' and self.tracer.cpu_offload:
+        if orig_func.isinstance(root.value, torch.Tensor) and attr == 'is_cuda':
             self.value = True
-        elif orig_func.isinstance(root.value, torch.Tensor) and attr == 'device' and self.tracer.cpu_offload:
+        elif orig_func.isinstance(root.value, torch.Tensor) and attr == 'device':
             self.value = torch.device('cuda')
             warning_msg = "operation <tensor>.device is detected, it will always return torch.device('cuda') during trace, " + \
                           "please make sure don't manually change the tensor device in the code.\n" + \
