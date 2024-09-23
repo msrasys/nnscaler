@@ -155,6 +155,12 @@ class ConcreteTracer(TracerBase):
             node.meta['nn_module_stack'] = copy.copy(self.module_stack)
         else:
             node.meta['nn_module_stack'] = collections.OrderedDict()
+
+        def unwrap_nested_proxy(proxy: ep.ConcreteProxy):
+                return pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, proxy.value)
+
+        # unwrap all proxy in the node result here, because no proxy should be record in the tensor metadata
+        node_result = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, node_result)
         extract_results_metadata(node_result, node)
         return node
 
@@ -193,10 +199,10 @@ class ConcreteTracer(TracerBase):
             args = update_tree_proxy_value(args, args_run)
             kwargs = update_tree_proxy_value(kwargs, kwargs_run)
 
-        args_ = self.create_arg(args)
-        kwargs_ = self.create_arg(kwargs)
-        assert isinstance(args_, tuple)
-        assert isinstance(kwargs_, dict)
+            args_ = self.create_arg(args)
+            kwargs_ = self.create_arg(kwargs)
+            assert isinstance(args_, tuple)
+            assert isinstance(kwargs_, dict)
 
         node = self.create_node(kind, target, args_, kwargs_, name, type_expr, node_result)
 
