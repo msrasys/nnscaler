@@ -144,6 +144,7 @@ def merge_optimizer_states_test():
 
     # test after training
 
+    model.cuda()
     for _ in range(2):
         # full model
         loss = model(sample)
