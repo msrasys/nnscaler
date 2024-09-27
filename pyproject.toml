@@ -27,4 +27,4 @@ dynamic.dependencies.file = "requirements.txt"
 # the following part only affects wheel, not sdist
 # since our current plan is to use cppimport, sdist is not needed
 packages.find.include = ["nnscaler*"]
-package-data = { nnscaler = ["resources/**", "autodist/*.cpp"] }
+package-data = { nnscaler = ["resources/**", "autodist/*.h", "autodist/*.cpp"] }
