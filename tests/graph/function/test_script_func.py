@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import tempfile
 import torch
 from nnscaler.parallel import parallelize, ComputeConfig

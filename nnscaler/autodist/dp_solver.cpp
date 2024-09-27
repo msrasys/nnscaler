@@ -1,4 +1,10 @@
 // cppimport
+
+/*
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ */
+
 #include "dp_solver.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>

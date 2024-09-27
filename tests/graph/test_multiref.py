@@ -1,6 +1,9 @@
 """
 pytest unit_tests/graph/test_multiref.py
 """
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import torch
 import logging
 from functools import partial

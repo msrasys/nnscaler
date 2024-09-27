@@ -1,3 +1,8 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
+# CREDITS: This implementation is inspired by Fairseq https://github.com/facebookresearch/fairseq/blob/main/fairseq/optim/fp16_optimizer.py
+
 import logging
 from typing import Optional, TYPE_CHECKING
 

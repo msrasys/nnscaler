@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 """
 Run training with this command in this directory:
 ```
@@ -5,6 +8,7 @@ DETERMINISTIC=1 torchrun --standalone --nproc_per_node=1 \
      ../../nnscaler/cli/train.py -f train_cli_args.yaml
 ```
 """
+
 import math
 import os
 from pathlib import Path

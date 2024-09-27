@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import torch
 from chunk_linear_cross_entropy import chunk_linear_cross_entropy, linear_cross_entropy
 

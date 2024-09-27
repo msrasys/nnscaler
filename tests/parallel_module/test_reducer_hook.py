@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import tempfile
 from pathlib import Path
 from collections import defaultdict

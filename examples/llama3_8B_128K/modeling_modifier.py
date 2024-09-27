@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 # This file modifies the official modeling_llama.py file at runtime to
 # 1. register the flash attention function to nnscaler and update related code
 # 2. replace the un-fused RMSNorm with apex's fused version

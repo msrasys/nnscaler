@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 ### Only test the anno creation in these tests
 
 import nnscaler.graph.function.function as F

@@ -1,5 +1,7 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT license.
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
+# CREDITS: This implementation is inspired by PyTorch fx symbolic trace: https://github.com/pytorch/pytorch/blob/main/torch/fx/_symbolic_trace.py
 
 from __future__ import annotations
 

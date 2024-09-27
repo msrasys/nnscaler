@@ -1,3 +1,8 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
+# CREDITS: This logger implementation is inspired by Fairseq https://github.com/facebookresearch/fairseq/blob/main/fairseq/logging/progress_bar.py
+
 import atexit
 from pathlib import Path
 from typing import Dict, Optional

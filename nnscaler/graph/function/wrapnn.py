@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 """
 This file deals with some special nn modules which have control flows (if/else) in their forward function.
 These control flows go different branches according to self.training.

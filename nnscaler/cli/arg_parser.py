@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 from typing import List, Tuple, Dict, Any, Union
 from dataclasses import dataclass, is_dataclass, asdict
 import enum

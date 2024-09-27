@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoModelForCausalLM
 from _collections_abc import MutableMapping
 import os

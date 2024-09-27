@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import (
     TrainerArgs,

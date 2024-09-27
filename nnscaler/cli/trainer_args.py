@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 from dataclasses import asdict, dataclass, field
 import importlib
 from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING, Union

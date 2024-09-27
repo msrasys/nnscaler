@@ -1,5 +1,5 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT license.
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
 
 """
 FX is a toolkit for developers to use to transform ``nn.Module`` instances. FX consists of three main components, and this pipeline of

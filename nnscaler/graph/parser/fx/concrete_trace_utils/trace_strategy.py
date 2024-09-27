@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import time
 from typing import TYPE_CHECKING, Any, Tuple, Dict, Callable, Type
 

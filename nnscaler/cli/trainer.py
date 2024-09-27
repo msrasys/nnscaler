@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Union
 from pathlib import Path

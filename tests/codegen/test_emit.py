@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import pytest
 from nnscaler.codegen.emit import CodeEmission, IRValue
 from nnscaler.ir.cten import IRObject

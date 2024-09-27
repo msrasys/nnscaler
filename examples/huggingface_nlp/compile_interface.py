@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import torch
 from nnscaler.graph.parser.converter import to_fx_graph
 import nnscaler

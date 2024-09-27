@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 """
 This test is to verify the correctness of the gradient norm algorithm for nnscaler.
 

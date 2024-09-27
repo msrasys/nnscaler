@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import argparse
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 

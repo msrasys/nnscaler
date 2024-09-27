@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import torch
 from types import MethodType
 from nnscaler.graph.parser.fx.concrete_trace_utils.operator_patcher import OperatorPatcher

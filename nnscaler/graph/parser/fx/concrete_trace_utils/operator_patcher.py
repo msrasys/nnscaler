@@ -1,5 +1,5 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT license.
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:

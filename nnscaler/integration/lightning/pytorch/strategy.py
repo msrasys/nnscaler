@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 from contextlib import contextmanager, nullcontext
 from functools import partial
 import logging

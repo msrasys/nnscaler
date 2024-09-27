@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import nnscaler
 from nnscaler.graph.parser.converter import convert_model
 from nnscaler.profiler.database import get_func

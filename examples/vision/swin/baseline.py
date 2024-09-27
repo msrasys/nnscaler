@@ -1,10 +1,12 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 """
 OMP_NUM_THREADS=4 torchrun \
     --nproc_per_node=1 \
     --nnodes=1 \
     examples/vision/swin/baseline.py
 """
-
 
 import math
 from typing import List, Tuple

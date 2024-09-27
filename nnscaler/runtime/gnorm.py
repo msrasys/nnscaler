@@ -1,3 +1,8 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
+# CREDITS: This implementation is inspired by Fairseq https://github.com/facebookresearch/fairseq/blob/main/fairseq/utils.py
+
 from typing import List, Dict, Tuple, Optional, TYPE_CHECKING
 from dataclasses import dataclass
 from collections import defaultdict

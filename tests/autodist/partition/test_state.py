@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 from nnscaler.autodist.op_partition import calc_factors, generate_partitions
 
 

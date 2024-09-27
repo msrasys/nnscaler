@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import cppimport.import_hook
 import nnscaler.autodist.dp_solver as dp_solver
 

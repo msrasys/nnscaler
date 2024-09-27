@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 from contextlib import contextmanager
 from functools import wraps
 from typing import Generator, Optional, Tuple, Callable, List, Set, Any, Iterable, Type, Union

@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import tempfile
 import torch
 from nnscaler.graph.parser.converter import convert_model

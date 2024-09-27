@@ -1,9 +1,12 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 """
 During tracing, the function or class in this file might be wrapped as another function or class.
 If the original function is needed to use (usually in tracer), should call the function in this file.
 """
 
-# all functions in operator will be wrapped during tracing 
+# all functions in operator will be wrapped during tracing
 from operator import *
 
 # the wrapped functon/class in builtins

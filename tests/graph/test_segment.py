@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 import nnscaler
 import nnscaler.graph.function.function as F
 from nnscaler.ir.tensor import IRFullTensor

@@ -1,3 +1,5 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
 
 import torch
 from nnscaler.runtime.utils import MicroBatchDataLoader, microbatches

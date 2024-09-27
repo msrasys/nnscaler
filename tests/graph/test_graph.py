@@ -1,3 +1,5 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
 
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.ir.operator import IRFwOperation

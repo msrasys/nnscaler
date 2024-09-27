@@ -1,3 +1,6 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
 from nnscaler.graph.parser.fx.concrete_trace_utils import pytree_utils
 from nnscaler.graph.parser.fx.concrete_trace_utils.pytree_utils import (
     get_common_spec,
