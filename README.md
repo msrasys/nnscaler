@@ -1,4 +1,4 @@
-<img src="docs/source/images/nnScaler-c-1.png" alt="drawing" width="100" align="left"/>  
+<img src="docs/source/images/nnScaler-c-1.png" alt="drawing" width="100" align="left"/>
 
 nnScaler: Compiling DNN models for Parallel Training over Multiple Devices
 ==============
@@ -40,7 +40,7 @@ Install the following packages before the installation of cube:
     PyTorch >= 2.0, < 2.4 (2.2.0 is recommanded)
 
 ### (Option 1) Install nnScaler from source
-Execute below commands in nnScaler directory: 
+Execute below commands in nnScaler directory:
 
     pip install -r requirements.txt
     pip install -e .
@@ -62,13 +62,13 @@ To get started, install the latest wheel by visiting [DevOps Artifacts](https://
 
 ### Prerequisite for Llama-3
 
-Install packages required to run Llama-3. Besides, a certain version of CUDA library is needed during flash-attn installation. For example, [CUDA V11.8](https://developer.nvidia.com/cuda-11-8-0-download-archive) is needed if using PyTorch 2.20. 
+Install packages required to run Llama-3. Besides, a certain version of CUDA library is needed during flash-attn installation. For example, [CUDA V11.8](https://developer.nvidia.com/cuda-11-8-0-download-archive) is needed if using PyTorch 2.20.
 
     python -m pip install transformers==4.40.0 flash-attn==2.5.5 tensorboard
 
 ### Model Access
 
-Obtain access of Llama-3 model from [HuggingFace](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct), where you will receive an access token which should be set as an environment variable: 
+Obtain access of Llama-3 model from [HuggingFace](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct), where you will receive an access token which should be set as an environment variable:
 
     export HF_TOKEN=<HUGGINGFACE_ACCESS_TOKEN>
 
@@ -101,7 +101,7 @@ class WrapperModel(torch.nn.Module):
 def main(args):
     # data config
     dataloader_config = ...
-    
+
     # model config
     model_config = ModelConfig(
         type=WrapperModel,
@@ -109,15 +109,15 @@ def main(args):
             'model_id': args.model_id,
         },
     )
-    # optimizer hyperparameters 
+    # optimizer hyperparameters
     optimizer_config = OptimizerConfig(
         type=MixedPrecisionAdamW,
         args={'lr': 2e-5, 'betas': (0.9, 0.95), 'weight_decay': 0.0, 'fused': True},
         #...
     )
     #...
-    
-    # setup trainer with configs of dataloader/model/optimizer, etc. 
+
+    # setup trainer with configs of dataloader/model/optimizer, etc.
     trainer = Trainer(train_args=TrainerArgs(
             #...
             model=model_config,
@@ -131,7 +131,7 @@ def main(args):
 
 ### Run the example Llama-3 training
 
-Then we can start the example, and all the parallelization tasks will be finished by nnScaler automatically. 
+Then we can start the example, and all the parallelization tasks will be finished by nnScaler automatically.
 
 ```shell
 cd examples/llama3_8B_128K
@@ -189,8 +189,6 @@ Or if you have multiple nodes, for example 2 nodes with 4 GPUs each:
         train_nnscaler.py nanoGPT/config/train_shakespeare_char.py
 
 NOTE: The local batch size is fixed by default, so using more workers will result in a larger global batch size.
-
-💡 _For advanced usages, please refer to: **TODO:link to rst docs**_
 
 
 # Success Stories
