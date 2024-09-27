@@ -1,3 +1,4 @@
-datasets
+datasets==2.21.0
 tensorboard
-transformers<4.43
+torch==2.3.1
+transformers==4.42.4

@@ -30,6 +30,9 @@ Installation
 
     pip install -r requirements.txt
 
+   Note: The requirements file has pinned ``torch``, ``transformers``, and ``datasets`` versions
+   to ensure their compatibility with each others.
+
 4. Prepare dataset ::
 
     # To run Llama 3 8B:
