@@ -258,7 +258,7 @@ def mock_dist(rank, world_size):
 
 
 @contextmanager
-def mock_cube_env(cube_module_cls: Type[ParallelModule], compute_config):
+def mock_cube_env(rank, world_size):
     old_device_group = nnscaler.runtime.device._instance
     old_dev_mode = CompileFlag.dev_mode
     used_cuda_fns = ['set_device', 'current_device', 'default_stream']
@@ -276,8 +276,8 @@ def mock_cube_env(cube_module_cls: Type[ParallelModule], compute_config):
         CompileFlag.dev_mode = False
         for fname, fn in old_cuda_fns.items():
             setattr(torch.cuda, fname, lambda *args, **kwargs: None)
-        os.environ['RANK'] = os.environ['LOCAL_RANK'] = str(cube_module_cls.rank)
-        os.environ['WORLD_SIZE'] = os.environ['LOCAL_WORLD_SIZE'] = str(compute_config.runtime_ngpus)
+        os.environ['RANK'] = os.environ['LOCAL_RANK'] = str(rank)
+        os.environ['WORLD_SIZE'] = os.environ['LOCAL_WORLD_SIZE'] = str(world_size)
         os.environ['GROUP_RANK'] = '0'
         os.environ['TORCHELASTIC_RUN_ID'] = '0' # fake torchrun env
         yield
@@ -293,6 +293,11 @@ def mock_cube_env(cube_module_cls: Type[ParallelModule], compute_config):
         nnscaler.runtime.device._instance = old_device_group
 
 
+@contextmanager
+def mock_reducer_env(rank, runtime_ngpus, device='cpu'):
+    with replace_all_device_with(device, True), mock_cube_env(rank, runtime_ngpus), mock_dist(rank, runtime_ngpus):
+        yield
+
 def new_empty(cube_module_cls: Type[ParallelModule], device='meta', init_params=False):
     """
     Create a new instance with empty weights.
@@ -301,7 +306,7 @@ def new_empty(cube_module_cls: Type[ParallelModule], device='meta', init_params=
     """
     module_file = Path(sys.modules[cube_module_cls.__module__].__file__)
     compute_config = ComputeConfig.safe_load_from_file(module_file.with_name(f"{cube_module_cls.COMPUTE_CONFIG_FILE}"))
-    with replace_all_device_with(device, True), mock_cube_env(cube_module_cls, compute_config), mock_dist(cube_module_cls.rank, compute_config.runtime_ngpus):
+    with replace_all_device_with(device, True), mock_cube_env(cube_module_cls.rank, compute_config.runtime_ngpus), mock_dist(cube_module_cls.rank, compute_config.runtime_ngpus):
         return cube_module_cls(init_params=init_params)
 
 

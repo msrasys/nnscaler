@@ -191,6 +191,9 @@ class ComputeConfig:
     inference_only : bool = False
     use_end2end: bool = False
 
+    use_async_reducer: bool = False
+    reducer_bucket_cap_mb: Optional[float] = None
+
     pas_config: Dict[str, Any] = field(default_factory=dict)
     user_config: Dict[str, Any] = field(default_factory=dict)
 ```
@@ -233,6 +236,15 @@ We can categorize the fields into 4 categories:
     - `zero_ngroups`: the number of groups to be used in zero.
     - `inference_only`: whether to generate code for inference only. If it is true, the generated code can not be used to train the model.
     - `use_end2end`: whether to use end2end training. For the requirement of end2end, see the description above.
+    - `use_async_reducer`: whether to use async reducer.
+        If it is true, the gradients will be reduced asynchronously.
+        Please note this only works when `use_end2end` is true.
+    - `reducer_bucket_cap_mb`: the bucket capacity of the reducer.
+        If it is `None` or `0`, the default value will be used, which is
+        - 25MB for async, the same default value with pytorch ddp implementation
+        - no limit for sync
+
+        Please note this only works when `use_end2end` is true.
     - `pas_config`: the configuration for the PAS policy (partition-assign-schedule policy, which describes how to place all computations across devices. For details, please refer to [PAS Policies](#pas-policies)).
     It is a dictionary, and will be used by the PAS policy.
     Please note different PAS will have different configurations,

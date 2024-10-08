@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Dict, Tuple, Any, Callable, Optional, Set
+from typing import List, Dict, Tuple, Any, Callable, Optional, Set, Sequence
 from functools import partial
 import logging
 import torch
@@ -328,8 +328,12 @@ class Bucket:
 
 
 class Reducer:
+    # the default bucket cap for async reducer in megabytes
+    # with the same value as pytorch
+    # https://github.com/pytorch/pytorch/blob/4fd16dd8aa259cd75c9a6d2ddcd8171cd1ee8e28/torch/nn/parallel/distributed.py#L548
+    _DEFAULT_BUCKET_CAP_MB = 25  # 25MB, the same as pytorch
 
-    def __init__(self, ranks: List[int], max_bucket_size_bytes=536870912,
+    def __init__(self, ranks: List[int], max_bucket_size_bytes: Optional[int] = None,
                  reduce_op: str = 'sum', async_op: bool = False,
                  zero: bool = False, zero_ngroups: int = 1):
         """
@@ -337,20 +341,27 @@ class Reducer:
 
         This assumes the communication group is already created by every rank.
 
-        @param ranks List[int]: reducer communication group
-        @param max_bucket_size_bytes int: largest bucket size for one-time communication,
-            only work for asynchronous reducer.
-        @param reduce_op str: reduce operation, can be 'sum', 'avg', 'max' or 'min' (default 'sum')
-        @param async_op bool: whether to overlap with backward computation (default False)
-        @param zero bool: whether to apply ZeRO optimization on gradients
-        @param zero_ngroups int: number of ZeRO subgroups in the original ZeRO group
+        Args:
+            ranks (List[int]): reducer communication group
+            max_bucket_size_bytes (Optional[int]): largest bucket size for one-time communication,
+                `0` or `None` will use default value,
+                which is `_DEFAULT_BUCKET_CAP_MB` for async reducer, and no limit for sync reducer.
+                Default is `None`
+            reduce_op (str): reduce operation, can be 'sum', 'avg', 'max' or 'min' (default 'sum')
+            async_op (bool): whether to overlap with backward computation (default False)
+            zero (bool): whether to apply ZeRO optimization on gradients
+            zero_ngroups (int): number of ZeRO subgroups in the original ZeRO group
         """
         self._params: List[torch.nn.Parameter] = list()
         self._param_ids: Set[int] = set()
         self._numel: int = 0
         self._ranks = ranks
         self._group = DeviceGroup().get_group(ranks)
-        self._bucket_size: Optional[int] = max_bucket_size_bytes if async_op else None
+
+        self._bucket_size: Optional[int] = max_bucket_size_bytes
+        if not self._bucket_size and async_op:
+            self._bucket_size = self._DEFAULT_BUCKET_CAP_MB * 1024 * 1024
+
         self._reduce_op = _get_reduce_op(reduce_op)
         # buckets stands for a transission unit
         self._buckets: List[Bucket] = list()
@@ -397,11 +408,11 @@ class Reducer:
         return self._zero_ngroups
 
     @property
-    def params(self) -> Tuple[torch.nn.Parameter]:
+    def params(self) -> Tuple[torch.nn.Parameter, ...]:
         return tuple(self._params)
 
     @property
-    def ranks(self) -> Tuple[int]:
+    def ranks(self) -> Tuple[int, ...]:
         return tuple(self._ranks)
 
     @property
@@ -415,7 +426,7 @@ class Reducer:
         return self._zero
 
     @property
-    def buckets(self) -> Tuple[Bucket]:
+    def buckets(self) -> Tuple[Bucket, ...]:
         return tuple(self._buckets)
 
     @property
@@ -451,33 +462,39 @@ class Reducer:
         than the max_bucket_size_bytes.
         """
         # step 1: build bucket for overlapping gradient synchronization
-        bucket_size = self._numel * 8 + 1 if self._bucket_size is None else self._bucket_size
-        buckets = {}
-        dtype2size = {}
+        # self._numel * 8 + 1 here is to make sure
+        # the bucket size is larger than the total size of all parameters
+        # 8 is the size of float64, which is the largest data type in PyTorch
+
+        # TODO: we may use a small bucket size for the first bucket, which is used in pytorch
+        # https://github.com/pytorch/pytorch/blob/4fd16dd8aa259cd75c9a6d2ddcd8171cd1ee8e28/torch/nn/parallel/distributed.py#L1172C17-L1172C36
+        # TODO: use native version of reducer, which is more efficient
+        #       (used in pytorch, with a couple percentage improvement)
+        bucket_size = self._numel * 8 + 1 if not self._bucket_size else self._bucket_size
+
+        # items in the bucket is params list
+        seq_buckets: List[List[torch.nn.Parameter]] = []
+        last_bucket_size = None
+
+        assert len(set(p.dtype for p in self._params)) == 1, (
+            "All parameters in the reducer should have the same data type"
+        )
         for param in self._params:
             if param.requires_grad:
                 cur_byte_size = param.nelement() * param.element_size()
-                tp = param.data.type()
-                if tp not in buckets:
-                    buckets[tp] = [[param]]
-                    dtype2size[tp] = cur_byte_size
+                # also work when cur_byte_size > bucket_size
+                # It will go the `else` branch
+                # and finish the current bucket and start a new bucket.
+                # This new bucket will be sealed in the next iteration
+                if len(seq_buckets) == 0:
+                    seq_buckets.append([param])
+                    last_bucket_size = cur_byte_size
+                elif last_bucket_size + cur_byte_size <= bucket_size:
+                    seq_buckets[-1].append(param)
+                    last_bucket_size += cur_byte_size
                 else:
-                    if cur_byte_size > bucket_size:
-                        _logger.warning(f'find one parameter {param.shape} ({cur_byte_size} bytes) larger than bucket size {self._bucket_size}')
-                        buckets[tp].insert(0, [param])
-                    elif dtype2size[tp] + cur_byte_size <= bucket_size:
-                        dtype2size[tp] = dtype2size[tp] + cur_byte_size
-                        buckets[tp][-1].append(param)
-                    else:
-                        dtype2size[tp] = cur_byte_size
-                        buckets[tp].append([param])
-        seq_buckets: List[List[torch.nn.Parameter]] = []
-        for dtype in buckets:
-            if not self._async:
-                assert len(buckets[dtype]) == 1, \
-                    f"internal error: synchronized reducer only needs one bucket, but got {len(buckets[dtype])}"
-            for bucket in buckets[dtype]:
-                seq_buckets.append(bucket)
+                    seq_buckets.append([param])
+                    last_bucket_size = cur_byte_size
 
         # step 2: build meta data for the offset of each bucket
         # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
@@ -524,7 +541,9 @@ class Reducer:
             )
             buckets.append(bucket)
         torch.cuda.empty_cache()
+
         # make it in reverse order as the backward happens from tail to head
+        # it is not important but may be helpful for waiting cuda stream to finish
         self._buckets: List[Bucket] = list(reversed(buckets))
         assert len(self._buckets) > 0, (
             f"Find {len(self._params)} parameters in the reducer. "

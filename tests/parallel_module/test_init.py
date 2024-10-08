@@ -6,6 +6,7 @@ import pytest
 
 import torch
 
+import nnscaler
 from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig
 
 from ..launch_torchrun import launch_torchrun
@@ -66,6 +67,7 @@ class MyModule2(torch.nn.Module):
 def test_empty_weights(model_class, tp):
     # MyModule2 uses CubeLinear, so tp works
     # MyModule uses torch.nn.Linear, so tp doesn't work
+    instance_name = f'm_{tp}'
     with tempfile.TemporaryDirectory() as tempdir:
         parallelize(
             model_class,
@@ -75,9 +77,10 @@ def test_empty_weights(model_class, tp):
             gen_savedir=tempdir,
             reuse='match',
             load_module=False,
+            instance_name=instance_name,
         )
         for i in range(4):
-            module_class = _load_parallel_module_class(model_class, gen_savedir=tempdir, rank=i)
+            module_class = _load_parallel_module_class(model_class, gen_savedir=tempdir, instance_name=instance_name, rank=i)
             m = new_empty(module_class)
             assert m.rank == i
             for p in m.parameters():
@@ -93,3 +96,96 @@ def test_empty_weights(model_class, tp):
                 for b in r.buckets:
                     assert b._contiguous_grads.device == torch.device('meta')
                     assert b._contiguous_params.device == torch.device('meta')
+
+
+class MyModule3(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = CubeLinear(8, 8, bias=True)
+
+    def forward(self, x):
+        x = self.linear(x)
+        return torch.sum(x)
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('async_op', [True, False])
+def test_async_reducer(async_op):
+    instance_name = f'm_{async_op}'
+    with tempfile.TemporaryDirectory() as tempdir:
+        parallelize(
+            MyModule3,
+            {'x': torch.randn(8, 8)},
+            'dp',
+            ComputeConfig(1, 2, use_zero=True, zero_ngroups=2, use_end2end=True,
+                          use_async_reducer=async_op,
+                          # 1e-6to make sure one parameter per bucket
+                          reducer_bucket_cap_mb=1e-6 if async_op else 0
+            ),
+            gen_savedir=tempdir,
+            reuse='match',
+            load_module=False,
+            instance_name=instance_name,
+        )
+        for i in range(2):
+            module_class = _load_parallel_module_class(MyModule3, gen_savedir=tempdir, instance_name=instance_name, rank=i)
+            m = new_empty(module_class, device='cpu')
+            assert m.rank == i
+            assert m.runtime_version == nnscaler.__version__
+            assert len(m.reducers) == 1
+            assert m.reducers[0]._async == async_op
+            if async_op:
+                assert len(m.reducers[0].buckets) == 2
+            else:
+                assert len(m.reducers[0].buckets) == 1
+
+
+class MyModule4(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w0 = torch.nn.Parameter(torch.randn(8, 8, dtype=torch.float32))
+        self.b0 = torch.nn.Parameter(torch.randn(8, dtype=torch.float32))
+
+        self.w1 = torch.nn.Parameter(torch.randn(8, 8, dtype=torch.float16))
+        self.b1 = torch.nn.Parameter(torch.randn(8, dtype=torch.float16))
+
+        self.w2 = torch.nn.Parameter(torch.randn(8, 8, dtype=torch.float32))
+        self.b2 = torch.nn.Parameter(torch.randn(8, dtype=torch.float16))
+
+    def forward(self, x: torch.Tensor):
+        x = self.w0 @ x + self.b0
+        x = x.half()
+        x = self.w1 @ x + self.b1
+        x = self.w2 @ x.float()
+        x = x.half() + self.b2
+        return torch.sum(x).float()
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('async_op', [True, False])
+def test_reducer_mixed_precision(async_op):
+    instance_name = f'm_{async_op}'
+    with tempfile.TemporaryDirectory() as tempdir:
+        parallelize(
+            MyModule4,
+            {'x': torch.randn(8, 8)},
+            'tp',
+            ComputeConfig(2, 4, use_end2end=True,
+                          use_async_reducer=async_op,
+                          # a big number to make sure all parameters in one bucket
+                          reducer_bucket_cap_mb=100
+            ),
+            gen_savedir=tempdir,
+            reuse='match',
+            load_module=False,
+            instance_name=instance_name,
+        )
+        for i in range(4):
+            module_class = _load_parallel_module_class(MyModule4, gen_savedir=tempdir, instance_name=instance_name, rank=i)
+            m = new_empty(module_class, device='cpu')
+            assert m.rank == i
+            assert m.runtime_version == nnscaler.__version__
+            # (intra-group + inter-group) * (float16 + float32)
+            # totally 4 reducers
+            assert len(m.reducers) == 4
+            assert m.reducers[0]._async == async_op

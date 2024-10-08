@@ -47,8 +47,9 @@ class CompileFlag:
     use_zero = _to_bool('USE_ZERO')
     # use async communication to overlap gradient synchronization and backward computation
     async_reducer = _to_bool('ASYNC_REDUCER')  # use async reducer
-    # maximal reducer weight bytes for one allreduce (only effective for async): default 128MB
-    max_reducer_bucket = _to_int('MAX_REDUCER_BUCKET', default=137217728)
+    # maximal reducer weight bytes for one allreduce (only effective for async):
+    # default 0 means using the default value in reducer
+    max_reducer_bucket = _to_int('MAX_REDUCER_BUCKET', default=0)
     # perform reducer op on gradients, can be sum, avg, mean, max, min. Default is sum
     reducer_op = os.environ.get('REDUCER_OP', default='sum')
     # zero_ngroups is the number of subgroups in each original ZeRO gruop (e.g., weights reducer)

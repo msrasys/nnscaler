@@ -10,7 +10,7 @@ PYTHONPATH=.:$PYTHONPATH torchrun \
 
 from pathlib import Path
 import tempfile
-from typing import Dict
+from typing import Dict, TypedDict
 import pytest
 import torch
 from torch import nn
@@ -105,7 +105,7 @@ def _train_ga(model, update_freq, data_size=DATA_SIZE):
     return results
 
 
-def gpu_worker_cube(runtime_ngpus, plan_ngpus, policy, nstages=None, nmicros=None, model_cls=MLP, pipeline_scheduler='1f1b'):
+def gpu_worker_cube_general(runtime_ngpus, plan_ngpus, policy, nstages=None, nmicros=None, model_cls=MLP, async_reducer=False, use_zero=False, use_bucket=False, pipeline_scheduler='1f1b'):
     init_distributed()
     init_random()
     nstages = nstages or plan_ngpus
@@ -120,6 +120,9 @@ def gpu_worker_cube(runtime_ngpus, plan_ngpus, policy, nstages=None, nmicros=Non
             compute_config= ComputeConfig(
                 plan_ngpus, runtime_ngpus,
                 use_end2end=True,
+                use_zero=use_zero,
+                use_async_reducer=async_reducer,
+                reducer_bucket_cap_mb=1e-6 if use_bucket else 0, # 1e-6 to make sure one parameter per bucket
                 pas_config=dict(
                     pipeline_nmicros=nmicros,
                     pipeline_nstages=nstages,
@@ -140,6 +143,24 @@ def gpu_worker_cube(runtime_ngpus, plan_ngpus, policy, nstages=None, nmicros=Non
             infer_result = clone_to_cpu_recursively(model.infer_step(infer_data))
 
         return train_result, infer_result, clone_to_cpu_recursively(infer_data)
+
+
+def gpu_worker_cube(runtime_ngpus, plan_ngpus, policy, nstages=None, nmicros=None, model_cls=MLP, pipeline_scheduler='1f1b'):
+    return gpu_worker_cube_general(runtime_ngpus, plan_ngpus, policy, nstages, nmicros, model_cls, False, False, False, pipeline_scheduler)
+
+
+class CubeOptions(TypedDict):
+    use_zero: bool = False
+    use_async_reducer: bool = False
+    use_bucket: bool = False
+
+
+def gpu_work_cube_tp_2_4(option: CubeOptions):
+    return gpu_worker_cube_general(4, 2, 'tp',
+        use_zero=option['use_zero'],
+        use_bucket=option['use_bucket'],
+        async_reducer=option['use_async_reducer']
+    )
 
 
 def merge_cube_result(cube_results):
@@ -192,16 +213,37 @@ def test_end2end():
     assert len(cube4_result) == 16
     allclose(cube4_result, ga4_result)
 
-    cube2_results_non_pipeline = launch_torchrun(4, gpu_worker_cube, 4, 2, 'tp')  # micro_batch_size = 4
-    for _, v in cube2_results.items():
-        # all losses should be scalar tensor
-        assert all(i.shape == () for i in v[1])
-    cube2_result_non_pipeline = merge_cube_result({k: v[0] for k, v in cube2_results_non_pipeline.items()})
-    assert len(cube2_result_non_pipeline) == 16
-    allclose(cube2_result_non_pipeline, ga4_result, atol=1e-5, rtol=1e-5) # looks tp introduces more error
+    cube2_results_non_pipeline = {}
+    for use_async_reducer in [False, True]:
+        for use_zero in [False, True]:
+            for use_bucket in [False, True]:
+                cube2_results_non_pipeline[(use_zero, use_async_reducer, use_bucket)] = launch_torchrun(
+                    4, gpu_work_cube_tp_2_4,
+                    CubeOptions(use_zero=use_zero, use_async_reducer=use_async_reducer, use_bucket=use_bucket)
+                )
 
-    infer_results = {k: v[1] for k, v in cube2_results_non_pipeline.items()}
-    infer_datas = {k: v[2] for k, v in cube2_results_non_pipeline.items()}
+    for r in cube2_results_non_pipeline.values():
+        for _, v in r.items():
+            # all losses should be scalar tensor
+            assert all(i.shape == () for i in v[1])
+
+    cube2_result_non_pipeline = {kk: merge_cube_result({k: v[0] for k, v in vv.items()}) for kk, vv in cube2_results_non_pipeline.items()}
+
+    for r in cube2_result_non_pipeline.values():
+        assert len(r) == 16
+
+    for use_async_reducer in [False, True]:
+        for use_zero in [False, True]:
+            for use_bucket in [False, True]:
+                allclose(cube2_result_non_pipeline[(use_zero, use_async_reducer, use_bucket)], ga4_result, atol=1e-5, rtol=1e-5) # looks tp introduces more error
+
+    for use_zero in [False, True]:
+        # when use_bucket, it should be the same for both async and non-async
+        assert_equal(cube2_result_non_pipeline[(use_zero, use_async_reducer, True)],
+                     cube2_result_non_pipeline[(use_zero, not use_async_reducer, True)])
+
+    infer_results = {k: v[1] for k, v in cube2_results_non_pipeline[(False, False, False)].items()}
+    infer_datas = {k: v[2] for k, v in cube2_results_non_pipeline[(False, False, False)].items()}
     assert len(infer_results) == 4
     assert len(infer_datas) == 4
     infer_result = infer_results[0]
