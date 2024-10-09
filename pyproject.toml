@@ -6,18 +6,18 @@ build-backend = "setuptools.build_meta"
 dynamic = ["version", "dependencies"]
 
 name = "nnscaler"
-description = "Parallelize DNN Traning from A Systematic Way"
+description = "Parallelize DNN Training via A Systematic Way"
 readme = "README.md"
 requires-python = ">=3.8"
-# TODO: license
 authors = [
     {name = "nnScaler Team", email = "nnscaler@service.microsoft.com"}
 ]
-# TODO: keywords
-# TODO: classifiers
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+]
 
 [project.urls]
-Homepage = "https://msrasrg.visualstudio.com/SuperScaler/_git/MagicCube"  # TODO: github
+Homepage = "https://github.com/microsoft/nnscaler"
 
 [tool.setuptools]
 dynamic.version.attr = "nnscaler.version.__version__"
@@ -25,6 +25,6 @@ dynamic.dependencies.file = "requirements.txt"
 
 # NOTE:
 # the following part only affects wheel, not sdist
-# since our current plan is to use cppimport, sdist is not needed
+# since we are using cppimport, sdist is not needed
 packages.find.include = ["nnscaler*"]
 package-data = { nnscaler = ["resources/**", "autodist/*.h", "autodist/*.cpp"] }
