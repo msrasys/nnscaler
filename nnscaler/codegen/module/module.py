@@ -486,14 +486,17 @@ class ModuleCodeGen(FuncEmission):
 
             if as_parallel_module:
                 cb.insert_body(f'rank = {device}')  # save rank in class level
-                # async_op and max_bucket_size_bytes parameters are for testing purpose
+                # async_op, max_bucket_size_bytes and zero_use_reduce_scatter
+                # parameters are for testing purpose
                 # and will not expose to user
                 with FunctionBlock(func_name='__init__',
                     args=[
                         'self',
                         'init_params=True',
+                        '*',
                         f'async_op={CompileFlag.async_reducer}',
-                        f'max_bucket_size_bytes={CompileFlag.max_reducer_bucket}'
+                        f'max_bucket_size_bytes={CompileFlag.max_reducer_bucket}',
+                        f'zero_use_reduce_scatter={CompileFlag.zero_use_reduce_scatter}',
                     ]
                 ) as ib:
                     ib.insert_body(self.model_init_statements)
@@ -713,6 +716,8 @@ class ModuleCodeGen(FuncEmission):
         # `max_bucket_size_bytes` and `async_op` are passed as arguments
         max_nbytes = CompileFlag.max_reducer_bucket if not as_parallel_module else 'max_bucket_size_bytes'
         async_op = CompileFlag.async_reducer if not as_parallel_module else 'async_op'
+        zero_use_reduce_scatter = CompileFlag.zero_use_reduce_scatter if not as_parallel_module else 'zero_use_reduce_scatter'
+
         zero = CompileFlag.use_zero
         zero_ngroups = CompileFlag.zero_ngroups
         reduce_op = f"'{CompileFlag.reducer_op}'"
@@ -721,6 +726,7 @@ class ModuleCodeGen(FuncEmission):
             "{reducer} = nnscaler.runtime.adapter.Reducer("
             "ranks={ranks}, reduce_op={reduce_op}, "
             "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes}, "
+            "zero_use_reduce_scatter={zero_use_reduce_scatter}, "
             "zero_ngroups={zero_ngroups})"
         )
         reducer_add = 'self.add_reducer({reducer})'
@@ -732,7 +738,9 @@ class ModuleCodeGen(FuncEmission):
         ranks = list(sorted(node.device))
         init_code = reducer_init.format(
             reducer=reducer_name, ranks=ranks, reduce_op=reduce_op,
-            async_op=async_op, zero=zero, max_nbytes=max_nbytes, zero_ngroups=zero_ngroups)
+            async_op=async_op, zero=zero, max_nbytes=max_nbytes,
+            zero_ngroups=zero_ngroups, zero_use_reduce_scatter=zero_use_reduce_scatter
+        )
         self.model_init_statements.append(init_code)
         # sort weights by first used time (which is gradient all-reduce time in reverse order)
         # so that weights with similar gradient all-reduce time are bucketed together

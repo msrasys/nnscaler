@@ -105,7 +105,7 @@ def _train_ga(model, update_freq, data_size=DATA_SIZE):
     return results
 
 
-def gpu_worker_cube_general(runtime_ngpus, plan_ngpus, policy, nstages=None, nmicros=None, model_cls=MLP, async_reducer=False, use_zero=False, use_bucket=False, pipeline_scheduler='1f1b'):
+def gpu_worker_cube_general(runtime_ngpus, plan_ngpus, policy, nstages=None, nmicros=None, model_cls=MLP, async_reducer=False, use_zero=False, use_bucket=False, zero_use_reduce_scatter=False, pipeline_scheduler='1f1b'):
     init_distributed()
     init_random()
     nstages = nstages or plan_ngpus
@@ -121,6 +121,7 @@ def gpu_worker_cube_general(runtime_ngpus, plan_ngpus, policy, nstages=None, nmi
                 plan_ngpus, runtime_ngpus,
                 use_end2end=True,
                 use_zero=use_zero,
+                zero_use_reduce_scatter=zero_use_reduce_scatter,
                 use_async_reducer=async_reducer,
                 reducer_bucket_cap_mb=1e-6 if use_bucket else 0, # 1e-6 to make sure one parameter per bucket
                 pas_config=dict(
@@ -146,47 +147,57 @@ def gpu_worker_cube_general(runtime_ngpus, plan_ngpus, policy, nstages=None, nmi
 
 
 def gpu_worker_cube(runtime_ngpus, plan_ngpus, policy, nstages=None, nmicros=None, model_cls=MLP, pipeline_scheduler='1f1b'):
-    return gpu_worker_cube_general(runtime_ngpus, plan_ngpus, policy, nstages, nmicros, model_cls, False, False, False, pipeline_scheduler)
+    return gpu_worker_cube_general(runtime_ngpus, plan_ngpus, policy, nstages, nmicros, model_cls, False, False, False, False, pipeline_scheduler)
 
 
 class CubeOptions(TypedDict):
     use_zero: bool = False
     use_async_reducer: bool = False
     use_bucket: bool = False
+    zero_use_reduce_scatter: bool = False
 
 
 def gpu_work_cube_tp_2_4(option: CubeOptions):
     return gpu_worker_cube_general(4, 2, 'tp',
         use_zero=option['use_zero'],
         use_bucket=option['use_bucket'],
-        async_reducer=option['use_async_reducer']
+        async_reducer=option['use_async_reducer'],
+        zero_use_reduce_scatter=option['zero_use_reduce_scatter'],
     )
 
 
-def merge_cube_result(cube_results):
+def merge_cube_result(cube_results, zero_use_reduce_scatter=False):
     cube_result = []
     for i in range(len(cube_results[0])):
         for rank in cube_results:
             assert torch.equal(cube_results[rank][i][2], cube_results[0][i][2])
-        cube_result.append([
-            merge_state_dicts([cube_results[rank][i][0] for rank in cube_results])[0],
-            merge_state_dicts([cube_results[rank][i][1] for rank in cube_results])[0],
-            cube_results[0][i][2]
-        ])
+        if not zero_use_reduce_scatter:
+            cube_result.append([
+                merge_state_dicts([cube_results[rank][i][0] for rank in cube_results])[0],
+                merge_state_dicts([cube_results[rank][i][1] for rank in cube_results])[0],
+                cube_results[0][i][2]
+            ])
+        else:
+            # grads are not merged for zero_use_reduce_scatter
+            # as they are different in different ranks
+            cube_result.append([
+                merge_state_dicts([cube_results[rank][i][1] for rank in cube_results])[0],
+                cube_results[0][i][2]
+            ])
     return cube_result
 
 
 def allclose(a, b, atol=1e-6, rtol=1e-6):
     assert len(a) == len(b)
     for step in range(len(a)):
-        assert len(a[step][0]) == len(b[step][0])
-        assert len(a[step][1]) == len(b[step][1])
-        for k in a[step][0].keys():  # grads
-            assert torch.allclose(a[step][0][k].cpu(), b[step][0][k].cpu(), atol=atol, rtol=rtol)
-        for k in a[step][1].keys():  # weights
-            assert torch.allclose(a[step][1][k].cpu(), b[step][1][k].cpu(), atol=atol, rtol=rtol)
-        # gnorm
-        assert torch.allclose(a[step][2].cpu(), b[step][2].cpu(), atol=atol, rtol=rtol)
+        # grads and weights (grads can be absent in case of zero_use_reduce_scatter)
+        assert len(a[step]) == len(b[step])
+        for i in range(len(a[step]) - 1):
+            assert len(a[step][i]) == len(b[step][i])
+            for k in a[step][i].keys():
+                assert torch.allclose(a[step][i][k].cpu(), b[step][i][k].cpu(), atol=atol, rtol=rtol)
+        # gnorm is last element
+        assert torch.allclose(a[step][-1].cpu(), b[step][-1].cpu(), atol=atol, rtol=rtol)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
@@ -196,6 +207,10 @@ def test_end2end():
     model = MLP()
     ga4_result = _train_ga(model, 4)  # micro_batch_size = 4
     assert len(ga4_result) == 16
+    # will be used for comparision when zero_use_reduce_scatter is True
+    ga4_result_without_grads = []
+    for i in range(len(ga4_result)):
+        ga4_result_without_grads.append([ga4_result[i][1], ga4_result[i][2]])
 
     cube2_results = launch_torchrun(4, gpu_worker_cube, 4, 2, 'hybrid') # micro_batch_size = 4
     for _, v in cube2_results.items():
@@ -217,17 +232,37 @@ def test_end2end():
     for use_async_reducer in [False, True]:
         for use_zero in [False, True]:
             for use_bucket in [False, True]:
-                cube2_results_non_pipeline[(use_zero, use_async_reducer, use_bucket)] = launch_torchrun(
+                zero_use_reduce_scatter = False
+                cube2_results_non_pipeline[(use_zero, use_async_reducer, use_bucket, zero_use_reduce_scatter)] = launch_torchrun(
                     4, gpu_work_cube_tp_2_4,
-                    CubeOptions(use_zero=use_zero, use_async_reducer=use_async_reducer, use_bucket=use_bucket)
+                    CubeOptions(use_zero=use_zero,
+                        use_async_reducer=use_async_reducer,
+                        use_bucket=use_bucket,
+                        zero_use_reduce_scatter=zero_use_reduce_scatter
+                    )
                 )
+                if not use_zero:
+                    cube2_results_non_pipeline[(use_zero, use_async_reducer, use_bucket, not zero_use_reduce_scatter)] = \
+                    cube2_results_non_pipeline[(use_zero, use_async_reducer, use_bucket, zero_use_reduce_scatter)]
+                else:
+                    cube2_results_non_pipeline[(use_zero, use_async_reducer, use_bucket, not zero_use_reduce_scatter)] = launch_torchrun(
+                        4, gpu_work_cube_tp_2_4,
+                        CubeOptions(use_zero=use_zero,
+                            use_async_reducer=use_async_reducer,
+                            use_bucket=use_bucket,
+                            zero_use_reduce_scatter=not zero_use_reduce_scatter
+                        )
+                    )
 
     for r in cube2_results_non_pipeline.values():
         for _, v in r.items():
             # all losses should be scalar tensor
             assert all(i.shape == () for i in v[1])
 
-    cube2_result_non_pipeline = {kk: merge_cube_result({k: v[0] for k, v in vv.items()}) for kk, vv in cube2_results_non_pipeline.items()}
+    cube2_result_non_pipeline = {
+        kk: merge_cube_result({k: v[0] for k, v in vv.items()}, zero_use_reduce_scatter=kk[3])
+        for kk, vv in cube2_results_non_pipeline.items()
+    }
 
     for r in cube2_result_non_pipeline.values():
         assert len(r) == 16
@@ -235,15 +270,21 @@ def test_end2end():
     for use_async_reducer in [False, True]:
         for use_zero in [False, True]:
             for use_bucket in [False, True]:
-                allclose(cube2_result_non_pipeline[(use_zero, use_async_reducer, use_bucket)], ga4_result, atol=1e-5, rtol=1e-5) # looks tp introduces more error
+                for zero_use_reduce_scatter in [False, True]:
+                    allclose(cube2_result_non_pipeline[(use_zero, use_async_reducer, use_bucket, zero_use_reduce_scatter)],
+                             ga4_result if not zero_use_reduce_scatter else ga4_result_without_grads,
+                             atol=1e-5, rtol=1e-5) # looks tp introduces more error
 
     for use_zero in [False, True]:
-        # when use_bucket, it should be the same for both async and non-async
-        assert_equal(cube2_result_non_pipeline[(use_zero, use_async_reducer, True)],
-                     cube2_result_non_pipeline[(use_zero, not use_async_reducer, True)])
+        for zero_use_reduce_scatter in [False, True]:
+            # when use_bucket, it should be the same for both async and non-async
+            use_async_reducer = True
+            use_bucket = True
+            assert_equal(cube2_result_non_pipeline[(use_zero, use_async_reducer, use_bucket, zero_use_reduce_scatter)],
+                        cube2_result_non_pipeline[(use_zero, not use_async_reducer, use_bucket, zero_use_reduce_scatter)])
 
-    infer_results = {k: v[1] for k, v in cube2_results_non_pipeline[(False, False, False)].items()}
-    infer_datas = {k: v[2] for k, v in cube2_results_non_pipeline[(False, False, False)].items()}
+    infer_results = {k: v[1] for k, v in cube2_results_non_pipeline[(False, False, False, False)].items()}
+    infer_datas = {k: v[2] for k, v in cube2_results_non_pipeline[(False, False, False, False)].items()}
     assert len(infer_results) == 4
     assert len(infer_datas) == 4
     infer_result = infer_results[0]

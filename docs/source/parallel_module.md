@@ -187,6 +187,7 @@ class ComputeConfig:
 
     use_zero: bool = False
     zero_ngroups: int = 1
+    zero_use_reduce_scatter: bool = False
 
     inference_only : bool = False
     use_end2end: bool = False
@@ -234,6 +235,11 @@ We can categorize the fields into 4 categories:
 3. Code generation feature configuration
     - `use_zero`: whether to use zero. If it is true, the generated code will use zero1 to do distributed training.
     - `zero_ngroups`: the number of groups to be used in zero.
+    - `zero_use_reduce_scatter`: whether to use reduce scatter in zero. If it is true, the gradients will be reduced by reduce scatter in zero.
+
+       Please note
+        - Reduce scatter is only available when `zero_ngroups` is 1. when `zero_ngroups` > 1, you should set it to `False`, or an error will be raised.
+        - In some cases, it can introduce parity issue. So use it with caution.
     - `inference_only`: whether to generate code for inference only. If it is true, the generated code can not be used to train the model.
     - `use_end2end`: whether to use end2end training. For the requirement of end2end, see the description above.
     - `use_async_reducer`: whether to use async reducer.

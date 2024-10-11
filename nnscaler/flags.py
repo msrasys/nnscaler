@@ -57,6 +57,12 @@ class CompileFlag:
     # it helps reduce communication cost of allgather weights in ZeRO, but increase the weights'
     # optimization states on each GPU.
     zero_ngroups = _to_int('ZERO_NUM_GROUPS', default=1)
+    # whether to use reduce scatter for zero (default False).
+    # By default we use `allreduce` for zero, which is due to
+    # 1) `reduce_scatter` will make some parameters have stale gradient after synchronization,
+    #    hence break the consistency of `.data` and `.grad` of parameters. Need to be careful when using optimizer.
+    # 2) `reduce_scatter`` doesn't significantly improve performance comparing with `allreduce`.
+    zero_use_reduce_scatter = _to_bool('ZERO_USE_REDUCE_SCATTER')
 
     # use automate mixture precision training, where weights, gradients
     # and optimizer status are kept in its original data type (can be float32),

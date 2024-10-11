@@ -298,6 +298,7 @@ def mock_reducer_env(rank, runtime_ngpus, device='cpu'):
     with replace_all_device_with(device, True), mock_cube_env(rank, runtime_ngpus), mock_dist(rank, runtime_ngpus):
         yield
 
+
 def new_empty(cube_module_cls: Type[ParallelModule], device='meta', init_params=False):
     """
     Create a new instance with empty weights.

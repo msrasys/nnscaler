@@ -78,6 +78,11 @@ class ComputeConfig:
 
     use_zero: bool = False
     zero_ngroups: int = 1
+    # whether to use reduce scatter for zero
+    # Please note
+    # 1. this only works when `use_zero` is True and `zero_ngroups` is 1.
+    # 2. In some cases, it can introduce parity issue. So use it with caution.
+    zero_use_reduce_scatter: bool = False
 
     # whether the generated code is for inference only
     inference_only: bool = False
@@ -87,6 +92,7 @@ class ComputeConfig:
     #  2. the first return value of `module.forward` must be the loss
     #  which must be a scalar tensor
     use_end2end: bool = False
+
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
     # This only works when the `use_end2end` is `True` for now.
@@ -153,6 +159,12 @@ class ComputeConfig:
 
         if self.reducer_bucket_cap_mb and self.reducer_bucket_cap_mb < 0:
             raise ValueError(f"reducer_bucket_cap_mb {self.reducer_bucket_cap_mb} should not be negative.")
+
+        # TODO: Please note in current implementation of Bucket,
+        # zero_use_reduce_scatter still works when zero_ngroups > 1 in sync mode
+        # Let's hide this feature for now for consistency.
+        if self.use_zero and self.zero_use_reduce_scatter and self.zero_ngroups != 1:
+            raise ValueError("zero_use_reduce_scatter is only supported when zero_ngroups is 1.")
 
     def apply_pipeline_scheduler(
             self,
@@ -314,6 +326,7 @@ def _compile_flags(compute_config: ComputeConfig):
         async_comm=False,
         use_zero=compute_config.use_zero,
         zero_ngroups=compute_config.zero_ngroups,
+        zero_use_reduce_scatter=compute_config.zero_use_reduce_scatter,
         trace_strategy=compute_config.trace_strategy,
     )
 
