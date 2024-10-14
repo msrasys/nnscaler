@@ -629,7 +629,6 @@ def test_Conv1D():
     assert op._annos_candidates[0] == 'n iC^ 4, oC iC^ 1, oC -> n oC 4', "Annotation mismatch."
 
 
-
 def test_Arange():
     op = F.Arange(10)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == ' -> 10^' and op.kwargs['dtype'] == torch.int64
@@ -859,3 +858,15 @@ def test_ConvTranspose1D():
     op = F.ConvTranspose1D(IRTensor([2, 3, 4]), IRTensor([3, 3, 1]), bias=IRObject(value=3))
     assert op._annos_candidates[0] == 'n iC+ 4, iC+ oC 1, oC -> n oC 4', "Annotation mismatch."
 
+
+def test_Pad():
+    op = F.Pad(IRTensor([3, 3, 4, 2]), pad=(1, 1))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c 2 -> a b c 4'
+    op = F.Pad(IRTensor([3, 3, 4, 2]), pad=(1, 1, 2, 2))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b 4 2 -> a b 8 4'
+    op = F.Pad(IRTensor([3, 3, 4, 2]), pad=(0, 1, 2, 1, 3, 3))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a 3 4 2 -> a 9 7 3'
+    op = F.Pad(IRTensor([3, 4, 2]), pad=(0, 1, 2, 1, 3, 3))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '3 4 2 -> 9 7 3'
+    op = F.Pad(IRTensor([3, 3, 4, 2]), pad=(o(1), o(1)))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c 2 -> a b c 4'

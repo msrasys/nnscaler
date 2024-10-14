@@ -1566,7 +1566,26 @@ def Pad(input, pad, mode='constant', value=0.0, signature = None):
     """
     torch.nn.functional.pad(input, pad, mode='constant', value=0.0)
     """
-    return IRPad(signature, [input], 'pad', pad=pad, mode=mode, value=value)
+    if mode != 'constant':
+        raise ValueError(f"Currently only support mode='constant' but got {mode}")
+
+    pad_vals, _ = extract_variadic(pad)
+    if len(pad_vals) % 2 != 0:
+        raise ValueError(f"pad should be a list of even length but got {pad}")
+
+    pad_vals = [(pad_l, pad_r) for pad_l, pad_r in zip(pad_vals[::2], pad_vals[1::2])]
+    pad_vals.reverse()
+    pad_dim_num = len(pad_vals)
+
+    gener = iter(string.ascii_lowercase)
+    prefix_anno = ShapeAnno.create_shape_str(input.shape[:-pad_dim_num], iterator=gener)
+    in_pad_dim_anno = [str(dim) for dim in input.shape[-pad_dim_num:]]
+    out_pad_dim_anno = [str(dim + pad_l + pad_r) for dim, (pad_l, pad_r) in zip(input.shape[-pad_dim_num:], pad_vals)]
+    in_anno = prefix_anno + in_pad_dim_anno
+    out_anno = prefix_anno + out_pad_dim_anno
+    anno = OpAnno.create_op_str([in_anno], [out_anno])
+
+    return IRDimops(Pad, 'pad', signature, [anno], [input], pad=pad, mode=mode, value=value)
 
 
 # def Conv2D(signature, inputs):
