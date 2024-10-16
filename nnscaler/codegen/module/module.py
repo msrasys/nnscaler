@@ -131,7 +131,7 @@ class ModuleCodeGen(FuncEmission):
             self.init_code.extend(['import nnfusion', ''])
 
         # customized op code
-        for _, op_impl in CustomizedOps.kOpCodeDef.items():
+        for op_impl in set(CustomizedOps.kOpCodeDef.values()):
             # self.init_code.append('@torch.jit.script')
             self.init_code.append(op_impl)
             self.init_code += ['']

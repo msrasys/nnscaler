@@ -1357,7 +1357,7 @@ def _reshape_anno(in_shape: List[int], ou_shape: List[int], kwarg_name: str) -> 
             if bracket[hdim] not in spatial:
                 bracket[hdim] = str(shape_map[bracket[hdim]])
 
-    def modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
+    def modifier(kwargs: Dict, idx, dim, num: int, subnode_idx: int) -> Dict:
         kwargs = dict(**kwargs)
         identifier = ifirst[dim]
         oidx = ofirst.index(identifier)
@@ -2738,7 +2738,7 @@ def Conv1D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, 
         raise ValueError(f'Input shape and weight shape are not compatible for the number of groups. input shape: {input.shape}, weight shape: {weight.shape}, groups: {groups_val}')
     if oC % groups_val != 0:
         raise ValueError('The output channels of weight must be divisible by the number of groups.')
-    def modifier(kwargs: Dict, idx, dim, num: int) -> Dict:
+    def modifier(kwargs: Dict, idx, dim, num: int, subnode_idx: int) -> Dict:
         # only for partitioning groups
         kwargs = dict(**kwargs)
         kw_groups = kwargs['groups']
@@ -2887,7 +2887,7 @@ def Conv2D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, 
     if oC % groups_val != 0:
         raise ValueError('The output channels of weight must be divisible by the number of groups.')
 
-    def modifier(kwargs: dict, idx, dim, num: int) -> dict:
+    def modifier(kwargs: dict, idx, dim, num: int, subnode_idx: int) -> dict:
         # only for partitioning groups
         kwargs = dict(**kwargs)
         kw_groups = kwargs['groups']
