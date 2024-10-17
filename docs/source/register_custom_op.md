@@ -108,10 +108,15 @@ This function has the following parameters:
 - `transform_rules` (`Tuple[TransformRule]`): a tuple of special TransformRules which will be used when partitioning the node.
     Default: None.
 - `input_gen_fn` (`Callable`): input generator function for profiler, this function accepts the IRFwOperation as input and returns
-    the list of input tensors, which is used during operator profiling. kwargs are same as that in the input node. By default, the
+    the list of input tensors, which is used during operator profiling. kwargs are same as that in the input node. By default, nnScaler's
     profiler will use `torch.rand` for floating point data types and `torch.zeros` for special types like `torch.int64` and `torch.bool`.
-    However, input tensors' contents may influence the speed dramatically. The mask in attention and dispatched expert index in MoE
-    are real examples. To handle this scenario, user can provide the customized `input_gen_fn`.
+    However, input tensors' contents may influence operator's behavior and speed dramatically.
+    Take function `nnscaler_moe_gmm` in `examples/deepseek_coder_v2_lite/modeling/modeling_deepseek_modifier.py` as an example. It dispatches
+    tokens (`hidden_states`) to experts according to another input tensor `topk_idx`. In most of the training time, tokens are distributed
+    evenly among experts with indices in `[local_expert_start, local_expert_end]`. Since `top_idx`'s type is `torch.int64`, if we generate
+    it with `torch.zeros` then all of the tokens are dispatched to the 1st expert, which can be ilegal and far from the real profile statistics
+    of the operator. By using `input_gen_fn`, we can provide compatible input tensors to the profiler so that the solver can generate a
+    good distributed plan.
     Default: None.
 
 
