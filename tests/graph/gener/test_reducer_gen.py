@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 import pytest
+from pathlib import Path
 from nnscaler.graph.gener.gen import IRAdapterGener
 
 from nnscaler.graph import IRGraph
@@ -10,9 +11,12 @@ from nnscaler.graph.parser.converter import convert_model
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.adapter import IRWeightReducer
+from nnscaler.parallel import ComputeConfig, _load_parallel_module_class, parallelize
+from ...utils import new_empty
 
 import torch
 import tempfile
+import importlib
 
 from ...utils import replace_all_device_with
 
@@ -27,8 +31,8 @@ class ReducerModule(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.param1 = torch.nn.Parameter(torch.zeros([128, 128], dtype=torch.float16))
-        self.param2 = torch.nn.Parameter(torch.zeros([128, 128], dtype=torch.float16))
+        self.param1 = torch.nn.Parameter(torch.zeros([128, 128], dtype=torch.float32))
+        self.param2 = torch.nn.Parameter(torch.zeros([128, 128], dtype=torch.float32))
 
     def forward(self, x):
         x = torch.matmul(x, self.param1)
@@ -44,7 +48,7 @@ def build_graph():
     with tempfile.TemporaryDirectory() as tempdir:
         graph = convert_model(
             model,
-            {'x': torch.randn([128, 128], dtype=torch.float16)},
+            {'x': torch.randn([128, 128], dtype=torch.float32)},
             attr_savedir=tempdir,
             constant_folding=True
         )
@@ -117,3 +121,52 @@ def test_reducer_partially_shared_part():
     with pytest.raises(RuntimeError):
         graph = IRAdapterGener.gen_weight(graph)
     print(graph.extra_repr())
+
+
+def pas_intra_reducer(graph: IRGraph, config: ComputeConfig):
+    dataloader = graph.nodes()[0]
+    sn0, sn1 = graph.replicate(dataloader, 2)
+    graph.assign(sn0, 0)
+    graph.assign(sn1, 1)
+
+    fw_nodes = graph.select(ntype=IRFwOperation)
+
+    for i, node in enumerate(fw_nodes):
+        if i == 1:
+            sn0, sn1 = graph.partition(node, node.algorithms('dim'), idx=1, dim=0, num=2)
+        else:
+            sn0, sn1 = graph.replicate(node, 2)
+        graph.assign(sn0, 0)
+        graph.assign(sn1, 1)
+    return graph
+
+
+@replace_all_device_with('cpu')
+def test_intra_scale_unit_reducers():
+    compute_config = ComputeConfig(
+        plan_ngpus=2,
+        runtime_ngpus=4,
+        constant_folding=True,
+        use_zero=True,
+        use_end2end=True,
+    )
+    model = ReducerModule()
+    with tempfile.TemporaryDirectory() as tempdir:
+        parallelize(
+            model,
+            {'x': torch.randn([128, 128], dtype=torch.float32)},
+            pas_intra_reducer,
+            compute_config,
+            gen_savedir=tempdir,
+            reuse='match',
+            load_module=False,
+        )
+        for i in range(4):
+            module_class = _load_parallel_module_class(ReducerModule, gen_savedir=Path(tempdir), rank=i)
+            m = new_empty(module_class)
+            assert len(m.reducers) == 2
+            reducer0, reducer1 = m.reducers
+            assert len(reducer0.params) == 1
+            assert reducer0.params[0].shape == torch.Size([128, 128])
+            assert len(reducer1.params) == 1
+            assert reducer1.params[0].shape == torch.Size([64, 128])

@@ -237,6 +237,10 @@ class CubeModule(torch.nn.Module):
         reducer_pids = set()
         for reducer in self._reducers:
             param_names = [paramid2name[id(p)] for p in reducer.params]
+            # we should use `parameters_for_optimizer` here since calculating gnorm
+            # is ahead of the optimizer step. When ZeRO is enabled, each device only
+            # maintains a subset of the parameters. As a result, `param_names` may not
+            # align with the value of `reducer.parameters_for_optimizer()`.
             params_info = ParamsInfo(reducer.ranks, reducer.parameters_for_optimizer(),
                                      param_names, reducer.zero_ngroups)
             params_info_for_gnorm.append(params_info)

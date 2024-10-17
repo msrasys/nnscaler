@@ -166,8 +166,14 @@ class ModuleCodeGen(FuncEmission):
                     assert param not in all_params, \
                         f'detected a parameter {param} in multiple reducers on device {device}'
                 all_params.update(reducer.inputs())
-            # create a reducer for the rest parameters used for this device
-            rest_params = []
+            # create reducers for the rest parameters used for this device
+            # nnscaler's weights are either fully replicated or partitioned, which has been checked
+            # at graph/gener/gen.py/gen_weights.
+            # We decouple the replicated and partitioned weights to align with the calculation of
+            # gradient norm which uses the replicated number of each weight to make the global value
+            # correct.
+            rest_params_replicated = []
+            rest_params_partitioned = []
 
             def collect_rest_params(segment):
                 """Resursively collect parameters. Note parameters can be in sub-segments,
@@ -178,17 +184,21 @@ class ModuleCodeGen(FuncEmission):
                         if device not in ctensor.device: continue
                         if ctensor not in all_params:
                             # a same parameter can be consumed multiple times by different operators
-                            if ctensor not in rest_params:
-                                rest_params.append(ctensor)
+                            if ctensor.shape == ctensor.parent.shape:
+                                if ctensor not in rest_params_replicated:
+                                    rest_params_replicated.append(ctensor)
+                            else:
+                                if ctensor not in rest_params_partitioned:
+                                    rest_params_partitioned.append(ctensor)
                 for seg in segment.select(ntype=IRSegment, flatten=False):
                     collect_rest_params(seg)
 
             collect_rest_params(graph)
-            if len(rest_params) == 0:
-                continue
             # create reducer and append to the execution
             # device will be scaled in `self.scale`
-            for reducer in IRWeightReducer.from_weights(rest_params, device):
+            for reducer in IRWeightReducer.from_weights(rest_params_replicated, device):
+                self.execplan.at(device).append(reducer)
+            for reducer in IRWeightReducer.from_weights(rest_params_partitioned, device):
                 self.execplan.at(device).append(reducer)
 
     def get_comm_groups(self):
