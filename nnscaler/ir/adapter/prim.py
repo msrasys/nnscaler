@@ -9,6 +9,7 @@ from typing import List, Optional, Union, Tuple
 import copy
 
 from nnscaler.ir.tensor import IRSubTensor, IndexMap, ValueMap
+from nnscaler.flags import CompileFlag
 
 
 # the general adapter primitive class
@@ -344,7 +345,6 @@ class BroadcastPrim(CollectivePrim):
         return f"{self.outputs()} = broadcast{self.device}({self.inputs()}, src={self.kwargs['src']})"
 
 
-
 class AllReducePrim(CollectivePrim):
     """
     non-differentiable allreduce
@@ -396,9 +396,10 @@ class ReduceScatterPrim(CollectivePrim):
         Use ring-based communication cost
         """
         ndevs = len(self.inputs())
-        # FIXME: temporally disable reduce scatter in code generation
-        # which has parity issues for now.
-        return 100 * (ndevs - 1) * self.input(0).nelement() // ndevs
+        vol = (ndevs - 1) * self.input(0).nelement() // ndevs
+        if not CompileFlag.enable_reduce_scatter_adapter:
+            vol *= 100
+        return vol
 
     def __repr__(self) -> str:
         return f'{self.outputs()} = reduce_scatter[{self.device}]({self.inputs()})'
@@ -462,6 +463,7 @@ class VChunkPrim(CollectivePrim):
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
         super().__init__(itensors, otensors, **kwargs)
+        # FIXME: nnscaler.runtime.adapter.vchunk does not exist
         self.signature = 'nnscaler.runtime.adapter.vchunk'
 
     def volume(self) -> int:

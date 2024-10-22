@@ -280,6 +280,18 @@ def select_many(data: Iterable[Any], fn: Callable[[Any], Iterable[Any]]) -> Iter
         yield from fn(item)
 
 
+# ref: https://stackoverflow.com/questions/128573/using-property-on-classmethods
+class classproperty(property):
+    """
+    A simple class property decorator.
+    """
+    def __get__(self, obj, objtype=None):
+        # obj will be None when accessed from the class like `MyClass.my_property`
+        return super(classproperty, self).__get__(objtype)
+    # This hack doesn't work for __set__ and __delete__.
+    # so here __set__ and __delete__ are not implemented, and the property is read-only
+
+
 class accum_mode:
     """Make cube execution in gradient accumulation mode.
 

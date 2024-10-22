@@ -8,6 +8,7 @@ from contextlib import nullcontext
 import torch
 import pytest
 
+from nnscaler.flags import CompileFlag
 import nnscaler.graph.function.dimops
 from nnscaler.parallel import parallelize, ComputeConfig, CubeModule, _gen_graph
 
@@ -1095,6 +1096,78 @@ def test_codegen_dictout(tmp_path):
     assert _gencode_contains(tmp_path, DictOutputModule, 0,
             r"return {'data': add_\d+}"
     )
+
+
+class ReduceScatterModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(512, 1024, bias=False)
+        self.relu = torch.nn.ReLU()
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.relu(x)
+        return x
+
+
+def pas_reduce_scatter(graph, cfg):
+    from nnscaler.ir import IRFwOperation, IRDataOperation
+    from nnscaler.policies import _tp, _replica
+    ngpus = cfg.plan_ngpus
+
+    for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
+        if node.name == 'linear':
+            _tp(graph, node, list(range(ngpus)), 0, 1)
+        elif node.name == 'relu':
+            _tp(graph, node, list(range(ngpus)), 0, 0)
+        else:
+            _replica(graph, node, list(range(ngpus)))
+    return graph
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('enable_reduce_scatter_adapter', [True, False])
+def test_codegen_reduce_scatter(tmp_path, enable_reduce_scatter_adapter):
+    old = CompileFlag.enable_reduce_scatter_adapter
+    CompileFlag.enable_reduce_scatter_adapter = enable_reduce_scatter_adapter
+    m = ReduceScatterModule()
+    m.train()
+    parallelize(
+        m,
+        {'x': torch.randn(2, 512)},
+        pas_reduce_scatter,
+        ComputeConfig(2, 2),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # With reduce-scatter, it should looks like:
+    # ...
+    # linear_40 = nnscaler.runtime.adapter.nn.reducescatter_allgather(linear_30, dim=0, ranks=[0, 1])
+    # ...
+
+    # without reduce-scatter, it should looks like:
+    # ...
+    # class Adapter24(torch.autograd.Function):
+    #     @staticmethod
+    #     def forward(ctx, linear_30):
+    #         linear_18 = nnscaler.runtime.adapter.all_reduce(linear_30, ranks=[0, 1])
+    #         linear_40 = nnscaler.runtime.adapter.chunk(linear_18, dim=0, ranks=[0, 1])
+    #         return linear_40
+    #     @staticmethod
+    #     def backward(ctx, glinear_48):
+    #         glinear_25 = nnscaler.runtime.adapter.all_gather(glinear_48, dim=0, ranks=[0, 1])
+    #         return glinear_25
+    # ...
+    CompileFlag.enable_reduce_scatter_adapter = old
+    if enable_reduce_scatter_adapter:
+        assert _gencode_contains(tmp_path, ReduceScatterModule, 0,
+                r"nnscaler.runtime.adapter.nn.reducescatter_allgather"
+        )
+    else:
+        assert not _gencode_contains(tmp_path, ReduceScatterModule, 0,
+                r"nnscaler.runtime.adapter.nn.reducescatter_allgather"
+        )
 
 
 class KwargsModule(torch.nn.Module):

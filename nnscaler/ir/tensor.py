@@ -487,6 +487,7 @@ class IRSubTensor(IRTensor):
                  **kwargs):
         """
         Create an IRSubTensor.
+        Please note same sub-tensor (parent+indmap+valmap) will have the same tid
 
         @param ftensor IRFullTensor: the full tensor
         @param indmap IndexMap: index map
