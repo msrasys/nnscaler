@@ -218,22 +218,22 @@ class InterPathFinder:
     inter-RVD Path finder for generating communication plans for RVDLayout
     """
     # Key is configuration.
-    # Currently only CompileFlag.enable_reduce_scatter_adapter is considered
+    # Currently only CompileFlag.disable_reduce_scatter_adapter is considered
     _config_cached_inter_nodes: Dict[Tuple, Dict[Tuple[TShape, int, int], Tuple[Tuple[InterRVD]]]] = {}
     _config_cached_inter_edges: Dict[Tuple, Dict[Tuple[TShape, int, int], Tuple[np.ndarray]]] = {}
     _config_cached_inter_paths: Dict[Tuple, Dict[Tuple[TShape, int, int], Dict[TRVD, List[List[int]]]]] = {}
 
     @classproperty
     def _cached_inter_nodes(cls):
-        return cls._config_cached_inter_nodes.setdefault((CompileFlag.enable_reduce_scatter_adapter,), {})
+        return cls._config_cached_inter_nodes.setdefault((CompileFlag.disable_reduce_scatter_adapter,), {})
 
     @classproperty
     def _cached_inter_edges(cls):
-        return cls._config_cached_inter_edges.setdefault((CompileFlag.enable_reduce_scatter_adapter,), {})
+        return cls._config_cached_inter_edges.setdefault((CompileFlag.disable_reduce_scatter_adapter,), {})
 
     @classproperty
     def _cached_inter_paths(cls):
-        return cls._config_cached_inter_paths.setdefault((CompileFlag.enable_reduce_scatter_adapter,), {})
+        return cls._config_cached_inter_paths.setdefault((CompileFlag.disable_reduce_scatter_adapter,), {})
 
     # type annotation because type cannot be inferred from `classproperty`
     _cached_inter_nodes: Dict[Tuple[TShape, int, int], Tuple[Tuple[InterRVD]]]

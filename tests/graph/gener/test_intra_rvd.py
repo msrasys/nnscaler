@@ -15,10 +15,10 @@ import pytest
 @pytest.fixture(autouse=True)
 def enable_reduce_scatter_adapter():
     from nnscaler.flags import CompileFlag
-    old = CompileFlag.enable_reduce_scatter_adapter
-    CompileFlag.enable_reduce_scatter_adapter = True
+    old = CompileFlag.disable_reduce_scatter_adapter
+    CompileFlag.disable_reduce_scatter_adapter = False
     yield
-    CompileFlag.enable_reduce_scatter_adapter = old
+    CompileFlag.disable_reduce_scatter_adapter = old
 
 
 def factors(k: int, num: int) -> List[Tuple[int]]:
@@ -217,6 +217,43 @@ def test_f_reducescatter_alltoall():
     assert fprims[3]._outputs[1].device == (3,)
     assert fprims[3]._outputs[0] == fc_subtensors[fprims[3]._outputs[0].device]
     assert fprims[3]._outputs[1] == fc_subtensors[fprims[3]._outputs[1].device]
+
+
+def print_prims(fp_rvd, fc_rvd, fprims):
+    print('fp_rvd:')
+    for f in fp_rvd.mat.flatten():
+        print(f'\tdevice({f.device[0]}): indmap({f.indmap}) | valmap({f.valmap})')
+
+    print('prims:')
+    for f in fprims:
+        print(f.signature)
+        for i, t in enumerate(f._inputs):
+            print(f'\tinput {i}: device({t.device[0]}) | indmap({t.indmap}) | valmap({t.valmap})')
+        for i, t in enumerate(f._outputs):
+            print(f'\toutput {i}: device({t.device[0]}) | indmap({t.indmap}) | valmap({t.valmap})')
+
+    print('fc_rvd:')
+    for f in fc_rvd.mat.flatten():
+        print(f'\tdevice({f.device[0]}): indmap({f.indmap}) | valmap({f.valmap})')
+
+
+def test_align():
+    fshape = [8, 8]
+
+    src_r, src_v, src_d = 1,2,(1,2)
+    dst_r, dst_v, dst_d = 1,1,(4,1)
+
+    ftensor = IRFullTensor(shape=fshape, name='tensor', requires_grad=False)
+
+    pdevs = [0, 2, 1, 3]
+    fp_rvd = RVDLayout.grid(ftensor, r=src_r, v=src_v, dims=src_d, devices=pdevs)
+
+    cdevs = [0, 1, 2, 3]
+    fc_rvd = RVDLayout.grid(ftensor, r=dst_r, v=dst_v, dims=dst_d, devices=cdevs)
+
+    rvds = ((1,2,1,2), (1, 1, 1, 4), (1, 1, 4, 1))
+    align, all_prims = IntraPathFinder.device_align(fp_rvd, fc_rvd, rvds)
+    assert True
 
 
 def test_all_f_cases_fix_placement():

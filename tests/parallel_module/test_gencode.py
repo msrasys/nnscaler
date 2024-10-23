@@ -1126,10 +1126,10 @@ def pas_reduce_scatter(graph, cfg):
 
 
 @replace_all_device_with('cpu')
-@pytest.mark.parametrize('enable_reduce_scatter_adapter', [True, False])
-def test_codegen_reduce_scatter(tmp_path, enable_reduce_scatter_adapter):
-    old = CompileFlag.enable_reduce_scatter_adapter
-    CompileFlag.enable_reduce_scatter_adapter = enable_reduce_scatter_adapter
+@pytest.mark.parametrize('disable_reduce_scatter_adapter', [True, False])
+def test_codegen_reduce_scatter(tmp_path, disable_reduce_scatter_adapter):
+    old = CompileFlag.disable_reduce_scatter_adapter
+    CompileFlag.disable_reduce_scatter_adapter = disable_reduce_scatter_adapter
     m = ReduceScatterModule()
     m.train()
     parallelize(
@@ -1159,8 +1159,8 @@ def test_codegen_reduce_scatter(tmp_path, enable_reduce_scatter_adapter):
     #         glinear_25 = nnscaler.runtime.adapter.all_gather(glinear_48, dim=0, ranks=[0, 1])
     #         return glinear_25
     # ...
-    CompileFlag.enable_reduce_scatter_adapter = old
-    if enable_reduce_scatter_adapter:
+    CompileFlag.disable_reduce_scatter_adapter = old
+    if not disable_reduce_scatter_adapter:
         assert _gencode_contains(tmp_path, ReduceScatterModule, 0,
                 r"nnscaler.runtime.adapter.nn.reducescatter_allgather"
         )

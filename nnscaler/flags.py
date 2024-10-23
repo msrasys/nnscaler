@@ -35,10 +35,8 @@ class CompileFlag:
     # how to execute the functions during trace, available choices ['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache']
     trace_strategy = os.environ.get('TRACE_STRATEGY', default='cuda_run_cpu_offload')
     # reduce scatter adapter can reduce the communication cost, and improve the performance
-    # but sometimes it may cause communication problems, so we provide an option to enable/disable it
-    # by default, we disable it and use allreduce+chunk instead.
-    # TODO: enable it by default after we fix the parity issue
-    enable_reduce_scatter_adapter = _to_bool('ENABLE_REDUCE_SCATTER_ADAPTER', False)
+    # but sometimes it may cause communication bugs, so we provide an option to enable/disable it
+    disable_reduce_scatter_adapter = _to_bool('DISABLE_REDUCE_SCATTER_ADAPTER', False)
 
     # ============== runtime ====================
     dev_mode = _to_bool('SINGLE_DEV_MODE')  # allow to use python xx.py

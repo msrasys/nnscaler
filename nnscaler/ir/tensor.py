@@ -914,6 +914,33 @@ class IRSubTensor(IRTensor):
             return sub_tensor
         return None
 
+    @classmethod
+    def is_dim_continous(cls, tensors: List['IRSubTensor'], dim: int) -> bool:
+        """
+        Check if the tensors are continuous along a dimension
+
+        Args:
+            tensors (List[IRSubTensor]): the tensors to check
+            dim (int): the dimension
+        Returns:
+            bool: True if continuous
+        Raises:
+            ValueError: if `tensors` is empty
+        """
+        if not tensors:
+            raise ValueError("Expected a non-empty tensor list")
+        if dim < 0:
+            dim += len(tensors[0].shape)
+        if dim < 0 or dim >= len(tensors[0].shape):
+            raise ValueError(f"Expected 0 <= dim < {len(tensors[0].shape)}. Got {dim}")
+        indmaps = [t.indmap[dim] for t in tensors]
+        indmaps.sort()
+        # [start, end) should be continuous after sorted
+        for idx in range(1, len(indmaps)):
+            if indmaps[idx][0] != indmaps[idx-1][1]:
+                return False
+        return True
+
     def __repr__(self) -> str:
         anno = 't'
         if self.is_attr():

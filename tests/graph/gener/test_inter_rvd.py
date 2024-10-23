@@ -8,7 +8,7 @@ from nnscaler.graph.gener.rvd.layout import RVDLayout, RVDInspector
 from nnscaler.graph.gener.rvd.inter import InterPathFinder
 import numpy as np
 
-from .test_intra_rvd import enable_reduce_scatter_adapter
+from .test_intra_rvd import enable_reduce_scatter_adapter  # noqa
 
 
 def factors(k: int, num: int) -> List[Tuple[int]]:

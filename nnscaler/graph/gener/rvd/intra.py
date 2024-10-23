@@ -226,7 +226,7 @@ class IntraTransition:
                     otensor.cell = itensor.cell
                 prims = []
                 for itensors, otensors in zip(imat.reshape(-1, chunks), omat.reshape(-1, chunks)):
-                    prims.append(primitive(itensors, otensors))
+                    prims.append(primitive(itensors.tolist(), otensors.tolist()))
                 rets.append((olayout, prims))
         return rets
 
@@ -236,7 +236,7 @@ class IntraPathFinder:
     intra-RVD Path finder for generating communication plans for RVDLayout
     """
     # Key is configuration.
-    # Currently only CompileFlag.enable_reduce_scatter_adapter is considered
+    # Currently only CompileFlag.disable_reduce_scatter_adapter is considered
     # intra-shard: cached nodes. paths[shape][i][j] = List[int] of indices from (src -> dst]
     _config_cached_intra_nodes: Dict[Tuple, Dict[Tuple[TShape, int], Tuple[TRVD]]] = {}
     _config_cached_intra_edges: Dict[Tuple, Dict[Tuple[TShape, int], np.ndarray]] = {}
@@ -244,15 +244,15 @@ class IntraPathFinder:
 
     @classproperty
     def _cached_intra_nodes(cls):
-        return cls._config_cached_intra_nodes.setdefault((CompileFlag.enable_reduce_scatter_adapter,), {})
+        return cls._config_cached_intra_nodes.setdefault((CompileFlag.disable_reduce_scatter_adapter,), {})
 
     @classproperty
     def _cached_intra_edges(cls):
-        return cls._config_cached_intra_edges.setdefault((CompileFlag.enable_reduce_scatter_adapter,), {})
+        return cls._config_cached_intra_edges.setdefault((CompileFlag.disable_reduce_scatter_adapter,), {})
 
     @classproperty
     def _cached_intra_paths(cls):
-        return cls._config_cached_intra_paths.setdefault((CompileFlag.enable_reduce_scatter_adapter,), {})
+        return cls._config_cached_intra_paths.setdefault((CompileFlag.disable_reduce_scatter_adapter,), {})
 
     # type annotation because type cannot be inferred from `classproperty`
     _cached_intra_nodes: Dict[Tuple[TShape, int], Tuple[TRVD]]
@@ -563,7 +563,7 @@ class IntraPathFinder:
             olayout: RVDLayout = RVDLayout.grid(ftensor, r=hop[0], v=hop[1], dims=hop[2:])
             imat = RVDLayout.dim2last(ilayout.mat, decd, chunks)
             omat = RVDLayout.dim2last(olayout.mat, incd, chunks)
-            prim = primitive(imat.reshape(-1, chunks)[0], omat.reshape(-1, chunks)[0])
+            prim = primitive(imat.reshape(-1, chunks)[0].tolist(), omat.reshape(-1, chunks)[0].tolist())
             cost += cost_fn(prim)
             src = hop
         return cost

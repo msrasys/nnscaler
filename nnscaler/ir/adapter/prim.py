@@ -14,7 +14,6 @@ from nnscaler.flags import CompileFlag
 
 # the general adapter primitive class
 class IRAdapterPrim:
-
     def __init__(self, inputs: List[IRSubTensor], outputs: List[IRSubTensor], **kwargs):
         self._inputs = list(inputs)
         self._outputs = list(outputs)
@@ -25,6 +24,17 @@ class IRAdapterPrim:
         self.signature = None
         # whether the primitive is happened locally
         self.local: bool = False
+
+    def is_valid(self) -> bool:
+        """
+        check if the input to the adapter primitive is valid
+        """
+        # TODO: put this check to the constructor
+        # In current implementation of RVDLayout optimal path search
+        # Invalid inputs can be generated, but then discarded later.
+        # In order to keep current flow, let's disable this check in construction,
+        # and call it after all the prims are generated
+        return True
 
     def input(self, idx:int):
         return self._inputs[idx]
@@ -397,7 +407,7 @@ class ReduceScatterPrim(CollectivePrim):
         """
         ndevs = len(self.inputs())
         vol = (ndevs - 1) * self.input(0).nelement() // ndevs
-        if not CompileFlag.enable_reduce_scatter_adapter:
+        if CompileFlag.disable_reduce_scatter_adapter:
             vol *= 100
         return vol
 
@@ -433,6 +443,22 @@ class AllToAllPrim(CollectivePrim):
         """
         super().__init__(itensors, otensors, idim=idim, odim=odim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.all_to_all'
+
+    def is_valid(self) -> bool:
+        """
+        check if the input to all-to-all primitive is valid
+        """
+        indmaps = [t.indmap for t in self._inputs]
+
+        idim = self.kwargs['idim']
+        odim = self.kwargs['odim']
+
+        # odim should be the same for all input tensors
+        for i in range(1, len(indmaps)):
+            if indmaps[i][odim] != indmaps[0][odim]:
+                return False
+
+        return IRSubTensor.is_dim_continous(self._inputs, idim)
 
     def volume(self) -> int:
         ndevs = len(self.inputs())

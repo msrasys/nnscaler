@@ -68,8 +68,6 @@ def test_ifexpr_transfomer():
     assert not modified
 
 
-
-
 @pytest.mark.skipif(sys.version_info < (3, 9), reason='ast.unparse is not available in python3.8')
 def test_op_transfomer():
     tree = ast.parse(dedent('''
