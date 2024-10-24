@@ -20,7 +20,7 @@ from torch.overrides import is_tensor_method_or_property
 
 from . import concrete_tracer as et
 from . import pytree_utils, orig_func, wrap_utils, trace_strategy
-from .frame_utils import get_frame_record, get_instruction
+from .frame_utils import get_frame_record, get_instructions
 
 _logger = logging.getLogger(__name__)
 
@@ -77,8 +77,8 @@ class ConcreteProxy(Proxy):
             return self.value.__call__(*args, **kwargs)
         return self.tracer.create_proxy('call_method', '__call__', (self,) + args, kwargs)
 
-    def __iter__(self) -> Union[Iterable, ConcreteProxy]:        
-        insts, cur = get_instruction(1)
+    def __iter__(self) -> Union[Iterable, ConcreteProxy]:
+        insts, cur = get_instructions(1)
 
         if insts[cur].opcode == self.op_call_ex:
             # in executing func(..., *proxy)
@@ -109,7 +109,7 @@ class ConcreteProxy(Proxy):
         return self.tracer.create_proxy('call_function', next, (self,), {})
 
     def __len__(self) -> Union[int, ConcreteProxy]:
-        insts, cur = get_instruction(1)
+        insts, cur = get_instructions(1)
 
         if insts[cur].opcode == self.op_call_ex:
             # in executing func(..., *proxy)
@@ -132,7 +132,7 @@ class ConcreteProxy(Proxy):
         return self.tracer.create_proxy('call_function', orig_func.setitem, (self,) + args, kwargs)
 
     def __bool__(self) -> Union[bool, ConcreteProxy]:
-        insts, cur = get_instruction(1)
+        insts, cur = get_instructions(1)
 
         if insts[cur].opcode in self.jump_opcodes or (
             insts[cur].opcode in self.jump_before_opcodes and insts[cur + 1].opcode in self.jump_opcodes):
@@ -181,7 +181,7 @@ class ConcreteProxy(Proxy):
 
     @compatibility(is_backward_compatible=True)
     def keys(self):
-        insts, cur = get_instruction(1)
+        insts, cur = get_instructions(1)
 
         if insts[cur].opcode == self.op_call_ex or insts[cur].opcode == self.op_dict_merge:
             # in executing `**proxy`
