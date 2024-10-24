@@ -157,12 +157,13 @@ def main(args):
         use_zero=True,
         use_end2end=True,
         # autodist config:
-        # - memory constraint is set to 64GB
+        # - memory constraint default value is 64GB
         # - recompute by the transformer layer in Llama
         pas_config={
-            'mem_constraint': 64,
+            'mem_constraint': args.gpu_mem_constraint,
             'recompute_modules': 'LlamaDecoderLayer',
         },
+        trace_strategy=args.trace_strategy,
     )
 
     model_config = ModelConfig(
@@ -282,6 +283,18 @@ if __name__ == '__main__':
         default=None,
         type=str,
         help='transformers model id',
+    )
+    parser.add_argument(
+        '--gpu_mem_constraint',
+        default=64,
+        type=int,
+        help='the max memory usage constraint (GB) per GPU during nnscaler generating distribution plan, recommended to be 80 percent of GPU memory',
+    )
+    parser.add_argument(
+        '--trace_strategy',
+        default='reuse_cache',
+        type=str,
+        help='trace strategy control the function execution during tracing model graph, `cuda_run_cpu_offload` and `reuse_cache` are recommended, please read `docs/source/parallel_module.md` for more information',
     )
     args = parser.parse_args()
 

@@ -104,6 +104,23 @@ We execute the training script on a node with 8xH100 80GB HBM3. The time cost is
 - add more devices to avoid recomputation: in order to fit the model into the memory, we recompute by layer.
 - do more kernel optimizations. For example, the swiglu activation can be fused into the matmul ahead of it.
 
+## Trace Strategy
+
+During compiling, the time cost of trace model graph can vary significantly depending on the tracing strategy employed. Below are some reference time to trace `meta-llama/Meta-Llama-3-8B-Instruct` with different strategies and different context length, the time tested on one single A100 80GB:
+
+| Strategy | Context Length | Time/seconds |
+| :------: | :------------: | :----------: |
+| `reuse_cache`          | 8k   | 8.11   |
+| `reuse_cache`          | 32k  | 11.06  |
+| `reuse_cache`          | 64k  | 15.36  |
+| `reuse_cache`          | 128k | 26.29  |
+| `cuda_run_cpu_offload` | 8k   | 55.28  |
+| `cuda_run_cpu_offload` | 32k  | 194.27 |
+| `cuda_run_cpu_offload` | 64k  | 342.15 |
+| `cuda_run_cpu_offload` | 128k | 789.15 |
+
+The trace strategy can be changed by setting `--trace_strategy` option. Please note that different strategies have different applicable scenarios. For more information and explanation to the different strategies, please read `docs/source/parallel_module.md`.
+
 # Debugging
 
 Since the 128K config is challenging, it is recommended to use a smaller model for debugging. For example, you can use the following command to prepare data and train a smaller llama3 (same architecture, but with 4 decoder layers) model on two GPUs.
