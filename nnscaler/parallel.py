@@ -28,6 +28,7 @@ from nnscaler.graph import IRGraph
 from nnscaler.graph import parser
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.pyfunc import IRPyFunc
+from nnscaler.graph.function.wrapnn import convert_to_wrapnn, wrapnn
 from nnscaler.graph.gener.gen import IRAdapterGener
 from nnscaler.graph.parser.fx.parser import FxModuleParser
 from nnscaler.graph.schedule.predefined import PredefinedSched
@@ -772,11 +773,13 @@ def _gencode(
         )
         torch.save(meta_info, origin_module_metadata_ckp)
 
-        graph, forward_args = _gen_graph(
-            module, dummy_forward_args, outdir,
-            constant_folding=compute_config.constant_folding, end2end_mode=compute_config.use_end2end,
-            inference_only=compute_config.inference_only,
-        )
+        with wrapnn(module, restore=not is_module_class) as wrapped_module:
+            graph, forward_args = _gen_graph(
+                wrapped_module, dummy_forward_args, outdir,
+                constant_folding=compute_config.constant_folding, end2end_mode=compute_config.use_end2end,
+                inference_only=compute_config.inference_only,
+            )
+
         graph.dump(graph_ckp)
         torch.save(forward_args, forward_args_ckp)
 

@@ -7,12 +7,14 @@ import tempfile
 import torch
 import pytest
 import random
+from unittest.mock import patch
+
 import nnscaler
 from nnscaler.graph.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.runtime.device import DeviceGroup
 from tests.parallel_module.test_gencode import _gencode_contains
-from nnscaler.graph.function.wrapnn import convert_to_wrapnn
+from nnscaler.graph.function.wrapnn import convert_to_wrapnn, wrapnn, NnScalerBatchNorm2d, undo_convert_to_wrapnn, _ORIGINAL_MODULE_ATTR
 from nnscaler.parallel import parallelize, ComputeConfig
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -77,18 +79,23 @@ class BatchNorm2dModule(torch.nn.Module):
 def _gencode_batchnorm2d_function(tempdir, config, pas_policy):
     init_distributed()
     m = BatchNorm2dModule().cuda()
-    m_2d = convert_to_wrapnn(m)
     x = torch.randn(8, 8, 32, 32).cuda()
 
-    m_new = parallelize(
-        m_2d,
-        {"x": x},
-        pas_policy,
-        config,
-        gen_savedir=tempdir,
-        load_module=True,
-        reuse="override",
-    )
+    with patch("nnscaler.graph.function.wrapnn.undo_convert_to_wrapnn", side_effect=undo_convert_to_wrapnn) as px:
+        m_new = parallelize(
+            m,
+            {"x": x},
+            pas_policy,
+            config,
+            gen_savedir=tempdir,
+            load_module=True,
+            reuse="override",
+        )
+    px.assert_called()
+    # bn should be restored after parallelize
+    assert isinstance(m.bn, torch.nn.BatchNorm2d)
+    assert not hasattr(m.bn, _ORIGINAL_MODULE_ATTR)
+
     assert m_new is not None
     m_new.train()
     output = m_new(x)
@@ -128,12 +135,11 @@ def _gencode_batchnorm2d_function_2(tempdir, config, pas_policy):
     device = torch.device(f"cuda:{rank_id}")
 
     m = BatchNorm2dModule().to(device)
-    m_2d = convert_to_wrapnn(m)
     shared_data = generate_parallel_data((8, 8, 32, 32), device, dtype)
     x_part = shared_data[rank_id]
 
     m_new = parallelize(
-        m_2d,
+        m,
         {"x": x_part},
         pas_policy,
         config,
@@ -193,13 +199,12 @@ def _gencode_batchnorm2d_function_4(tempdir, config, pas_policy, dim):
     device = torch.device(f"cuda:{rank_id}")
 
     m = BatchNorm2dModule().to(device)
-    m_2d = convert_to_wrapnn(m)
 
     x_list = generate_parallel_data((8, 8, 32, 32), device, dtype)
     x = x_list[rank_id // 2]
 
     m_new = parallelize(
-        m_2d,
+        m,
         {"x": x},
         lambda graph, resource: pas_policy(graph, resource, dim),
         config,
@@ -274,7 +279,6 @@ def _gencode_batchnorm2d_function_eval(tempdir, config, pas_policy):
     init_distributed()
     m = BatchNorm2dModule().cuda()
     x = torch.randn(8, 8, 32, 32).cuda()
-    m = convert_to_wrapnn(m)
     m_new = parallelize(
         m,
         {"x": x},
@@ -324,12 +328,11 @@ def _gencode_batchnorm2d_function_eval_2(tempdir, config, pas_policy):
     device = torch.device(f"cuda:{rank_id}")
 
     m = BatchNorm2dModule().to(device)
-    m_2d = convert_to_wrapnn(m)
     shared_data = generate_parallel_data((4, 8, 32, 32), device, dtype)
     x_part = shared_data[rank_id]
 
     m_new = parallelize(
-        m_2d,
+        m,
         {"x": x_part},
         pas_policy,
         config,
@@ -395,13 +398,12 @@ def _gencode_batchnorm2d_function_eval_4(tempdir, config, pas_policy, dim):
     device = torch.device(f"cuda:{rank_id}")
 
     m = BatchNorm2dModule().to(device)
-    m_2d = convert_to_wrapnn(m)
 
     x_list = generate_parallel_data((8, 8, 32, 32), device, dtype)
     x = x_list[rank_id // 2]
 
     m_new = parallelize(
-        m_2d,
+        m,
         {"x": x},
         lambda graph, resource: pas_policy(graph, resource, dim),
         config,
@@ -489,7 +491,6 @@ class InstanceNorm2dModule(torch.nn.Module):
 def _gencode_instancenorm2d_function(tempdir, config, pas_policy):
     init_distributed()
     m = InstanceNorm2dModule().cuda()
-    m = convert_to_wrapnn(m)
     m_new = parallelize(
         m,
         {"x": torch.randn(4, 4, 32, 32).cuda()},
@@ -529,7 +530,6 @@ def _gencode_instancenorm2d_function_2(tempdir, config, pas_policy):
     init_random()
     device = torch.device(f"cuda:{rank_id}")
     m = InstanceNorm2dModule().cuda()
-    m = convert_to_wrapnn(m)
 
     shared_data = generate_parallel_data((2, 4, 32, 32), device, dtype)
     x_part = shared_data[rank_id]
@@ -582,7 +582,6 @@ def _gencode_instancenorm2d_function_4(tempdir, config, pas_policy):
     init_random()
     device = torch.device(f"cuda:{rank_id}")
     m = InstanceNorm2dModule().cuda()
-    m = convert_to_wrapnn(m)
 
     x_list = generate_parallel_data((2, 4, 32, 32), device, dtype)
     x = x_list[rank_id // 2]
@@ -631,7 +630,6 @@ def test_codegen_instancenorm2d_2_4():
 def _gencode_instancenorm2d_function_eval(tempdir, config, pas_policy):
     init_distributed()
     m = InstanceNorm2dModule().cuda()
-    m = convert_to_wrapnn(m)
     m.eval()
     m_new = parallelize(
         m,
@@ -676,7 +674,6 @@ def _gencode_instancenorm2d_function_eval_2(tempdir, config, pas_policy):
     init_random()
     device = torch.device(f"cuda:{rank_id}")
     m = InstanceNorm2dModule().cuda()
-    m = convert_to_wrapnn(m)
 
     shared_data = generate_parallel_data((2, 4, 32, 32), device, dtype)
     x_part = shared_data[rank_id]
@@ -733,7 +730,6 @@ def _gencode_instancenorm2d_function_eval_4(tempdir, config, pas_policy):
     init_random()
     device = torch.device(f"cuda:{rank_id}")
     m = InstanceNorm2dModule().cuda()
-    m = convert_to_wrapnn(m)
 
     x_list = generate_parallel_data((2, 4, 32, 32), device, dtype)
     x = x_list[rank_id // 2]
@@ -781,3 +777,60 @@ def test_codegen_instancenorm2d_2_4_eval():
             ComputeConfig(2, 4),
             policy,
         )
+
+
+class NestedBatchNorm2dModule(torch.nn.Module):
+    def __init__(self):
+        super(NestedBatchNorm2dModule, self).__init__()
+        self.nested = BatchNorm2dModule()
+        self.linear = torch.nn.Linear(8, 8)
+
+    def forward(self, x):
+        # doesn't care about forward
+        pass
+
+
+def test_convert_to_wrapnn():
+    m = NestedBatchNorm2dModule()
+
+    def check_converted(mc):
+        assert len(list(mc.children())) == 2
+        assert isinstance(mc.nested, BatchNorm2dModule)
+        assert len(list(mc.nested.children())) == 1
+        assert isinstance(mc.nested.bn, NnScalerBatchNorm2d)
+        assert len(list(mc.nested.bn.children())) == 0
+        assert id(m.linear) == id(mc.linear)
+        assert len(list(m.modules())) == len(list(mc.modules()))
+
+        assert isinstance(getattr(mc.nested.bn, _ORIGINAL_MODULE_ATTR), torch.nn.BatchNorm2d)
+        assert not hasattr(mc.linear, _ORIGINAL_MODULE_ATTR)
+        assert not hasattr(mc, _ORIGINAL_MODULE_ATTR)
+        assert not hasattr(mc.nested, _ORIGINAL_MODULE_ATTR)
+
+    def check_undo_converted(mcc):
+        assert len(list(mcc.children())) == 2
+        assert isinstance(mcc.nested, BatchNorm2dModule)
+        assert len(list(mcc.nested.children())) == 1
+        assert not isinstance(mcc.nested.bn, NnScalerBatchNorm2d)
+        assert len(list(mcc.nested.bn.children())) == 0
+        assert id(m.linear) == id(mcc.linear)
+        assert not hasattr(mc.linear, _ORIGINAL_MODULE_ATTR)
+        assert len(list(m.modules())) == len(list(mcc.modules()))
+
+        assert not hasattr(mcc.nested.bn, _ORIGINAL_MODULE_ATTR)
+        assert not hasattr(mcc.linear, _ORIGINAL_MODULE_ATTR)
+        assert not hasattr(mcc, _ORIGINAL_MODULE_ATTR)
+        assert not hasattr(mcc.nested, _ORIGINAL_MODULE_ATTR)
+
+    mc = convert_to_wrapnn(m)
+    check_converted(mc)
+    mcc = undo_convert_to_wrapnn(mc)
+    check_undo_converted(mcc)
+
+    with wrapnn(m) as mc:
+        check_converted(mc)
+    check_undo_converted(m)
+
+    with wrapnn(m, restore=False) as mc:
+        check_converted(mc)
+    check_converted(m)
