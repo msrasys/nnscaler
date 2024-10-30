@@ -8,6 +8,8 @@ pytest unit_tests/graph/function/test_dimops.py
 from typing import Callable, Tuple, List
 from functools import partial
 
+import pytest
+
 import nnscaler.graph.function as F
 from nnscaler.graph.function.dimops import IRDimops, OpAnno
 from nnscaler.ir.tensor import IRFullTensor
@@ -98,3 +100,17 @@ def test_transform_space():
     assert OpAnno('a b, (b n) c -> a (1 1 1 b c) n').transform_space() == [(0, 0), (0, 1)]
     assert OpAnno('a b, (b n) c^ -> a (1 1 1 b) n c^').transform_space() == [(0, 0), (0, 1)]
     assert OpAnno('a b, (d^ n) c -> a (c n) d^').transform_space() == [(0, 0), (0, 1), (1,1)]
+
+
+def test_parse_op():
+    assert str(OpAnno('a b, b c -> a c')) == 'a b, b c -> a c'
+    assert str(OpAnno('a^ b, b c -> a^ c')) == 'a^ b, b c -> a^ c'
+    assert str(OpAnno('a b, (b n) c -> a (n c)')) == 'a b, (b n^) c^ -> a (n^ c^)'
+    assert str(OpAnno('a b, (b n) c -> a (n b c)')) == 'a b^, (b^ n^) c^ -> a (n^ b^ c^)'
+    assert str(OpAnno('a b, (b n) c -> a (1 b c) n')) == 'a b, (b n^) c^ -> a (1^ b c^) n^'
+    assert str(OpAnno('a b, (b n) c -> a (1 1 1 b c) n')) == 'a b, (b n^) c^ -> a (1^ 1^ 1^ b c^) n^'
+    assert str(OpAnno('a b, (b n) c^ -> a (1 1 1 b) n c^')) == 'a b, (b n^) c^ -> a (1^ 1^ 1^ b) n^ c^'
+    assert str(OpAnno('a b, (d^ n) c -> a (c n) d^')) == 'a b, (d^ n^) c -> a (c n^) d^'
+
+    with pytest.raises(ValueError):
+        str(OpAnno('a b^, b^ c -> a c^')) == 'a b^, b^ c -> a c^'

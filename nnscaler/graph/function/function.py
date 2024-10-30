@@ -2707,9 +2707,9 @@ def Conv1D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, 
     padding_val = unwrap_if_irobject(padding)
     dilation_val = unwrap_if_irobject(dilation)
     groups_val = unwrap_if_irobject(groups)
-    if isinstance(stride_val, int): 
+    if isinstance(stride_val, int):
         stride_val = (stride_val,)
-    if isinstance(dilation_val, int): 
+    if isinstance(dilation_val, int):
         dilation_val = (dilation_val,)
     kW = weight.shape[-1]
     effective_kernel_size = (kW - 1) * dilation_val[0]
@@ -2828,7 +2828,7 @@ def ConvTranspose1D(input, weight, bias=None, stride=1, padding=0, output_paddin
                     [f'(groups group_size^) {iW}, (groups group_size^) oC {kW}, oC -> (groups oC) {oW}']
             return IRDimops(ConvTranspose1D, 'conv_transpose1d', signature, annos, [input, weight, bias],
                         stride=stride, padding=padding, output_padding=output_padding, groups=groups, dilation=dilation)
-    if len(input.shape) == 3:    
+    if len(input.shape) == 3:
         if bias is None:
             annos = [f'n iC+ {iW}, iC+ oC {kW} -> n oC {oW}'] if groups_val == 1 else \
                     [f'n (groups group_size^) {iW}, (groups group_size^) oC {kW} -> n (groups oC) {oW}']
@@ -2854,9 +2854,9 @@ def Conv2D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, 
     padding_val = unwrap_if_irobject(padding)
     dilation_val = unwrap_if_irobject(dilation)
     groups_val = unwrap_if_irobject(groups)
-    if isinstance(stride_val, int): 
+    if isinstance(stride_val, int):
         stride_val = (stride_val, stride_val)
-    if isinstance(dilation_val, int): 
+    if isinstance(dilation_val, int):
         dilation_val = (dilation_val, dilation_val)
     if isinstance(padding_val, str):
         if padding_val == 'same':
@@ -2946,13 +2946,13 @@ def ConvTranspose2D(input, weight, bias=None, stride=1, padding=0, output_paddin
     output_padding_val = unwrap_if_irobject(output_padding)
     dilation_val = unwrap_if_irobject(dilation)
     groups_val = unwrap_if_irobject(groups)
-    if isinstance(stride_val, int): 
+    if isinstance(stride_val, int):
         stride_val = (stride_val, stride_val)
-    if isinstance(padding_val, int): 
+    if isinstance(padding_val, int):
         padding_val = (padding_val, padding_val)
-    if isinstance(output_padding_val, int): 
+    if isinstance(output_padding_val, int):
         output_padding_val = (output_padding_val, output_padding_val)
-    if isinstance(dilation_val, int): 
+    if isinstance(dilation_val, int):
         dilation_val = (dilation_val, dilation_val)
     if not (len(stride_val) == 2 and len(padding_val) == 2 and len(output_padding_val) == 2 and len(dilation_val) == 2):
         raise ValueError("stride, padding, output_padding, and dilation must have a length of 2")
@@ -2979,7 +2979,7 @@ def ConvTranspose2D(input, weight, bias=None, stride=1, padding=0, output_paddin
                     [f'(groups group_size^) {iH} {iW}, (groups group_size^) oC {kH} {kW}, oC -> (groups oC) {oH} {oW}']
             return IRDimops(ConvTranspose2D, 'conv_transpose2d', signature, annos, [input, weight, bias],
                             stride=stride, padding=padding, output_padding=output_padding, groups=groups, dilation=dilation)
-    if len(input.shape) == 4:    
+    if len(input.shape) == 4:
         if bias is None:
             annos = [f'n iC+ {iH} {iW}, iC+ oC {kH} {kW} -> n oC {oH} {oW}'] if groups_val == 1 else \
                     [f'n (groups group_size^) {iH} {iW}, (groups group_size^) oC {kH} {kW} -> n (groups oC) {oH} {oW}']

@@ -6,6 +6,7 @@ import tempfile
 from contextlib import nullcontext
 
 import torch
+import torch.nn.functional as F
 import pytest
 
 from nnscaler.flags import CompileFlag
@@ -1167,6 +1168,63 @@ def test_codegen_reduce_scatter(tmp_path, disable_reduce_scatter_adapter):
     else:
         assert not _gencode_contains(tmp_path, ReduceScatterModule, 0,
                 r"nnscaler.runtime.adapter.nn.reducescatter_allgather"
+        )
+
+
+class CVModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.out_channel = 32
+        self.kernel_size = 3
+
+    def forward(self, input):
+        batch, in_channel, height, width = input.shape
+
+        input = input.view(1, batch * in_channel, height, width)
+        weight = torch.randn(batch * in_channel, self.out_channel, self.kernel_size, self.kernel_size)
+        out = F.conv_transpose2d(input, weight, padding=0, stride=2, groups=batch)
+        _, _, height, width = out.shape
+        out = out.view(batch, self.out_channel, height, width)
+        return out
+
+
+def pas_conv2d(graph, cfg):
+    from nnscaler.ir import IRFwOperation, IRDataOperation
+    from nnscaler.policies import _tp, _replica
+    ngpus = cfg.plan_ngpus
+
+    for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
+        if node.name == 'conv_transpose2d':
+            # this is an invalid partition
+            # ValueError will be raised
+            _tp(graph, node, list(range(ngpus)), 1, 1)
+        else:
+            _replica(graph, node, list(range(ngpus)))
+    return graph
+
+
+@replace_all_device_with('cpu')
+def test_invalid_partition(tmp_path):
+    """
+    ConvTranspose2D and ConvTranspose1D oC dim can't be split
+    """
+    batch, in_channel, height, width = 2, 16, 32, 32
+    input = torch.randn((batch, in_channel, height, width))
+
+    dummy_input = {'input': input}
+
+    m = CVModel()
+    m.train()
+
+    with pytest.raises(ValueError):
+        parallelize(
+            m,
+            dummy_input,
+            pas_conv2d,
+            ComputeConfig(2, 2),
+            gen_savedir=tmp_path,
+            load_module=False,
+            reuse='override',
         )
 
 

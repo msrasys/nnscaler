@@ -391,7 +391,8 @@ class IRGraph(IRSegment):
 
         # get partitioned sub-nodes
         fnodes = algo.instantiate(**config)
-        assert fnodes is not None, f"Fail to partition node: {node} use algorithm and config: {config}"
+        if not fnodes:
+            raise ValueError(f"Fail to partition node: {node}. Please check your config: {config}.")
 
         # insert forward node
         fsegment: IRSegment = self.segment(node)
