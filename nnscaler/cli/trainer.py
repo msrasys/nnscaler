@@ -538,6 +538,94 @@ class Trainer:
             batches += [self.dummy_input] * gap
         return batches, is_dummy_batch
 
+    @torch.no_grad()
+    def _check_grad_cross_devices_correctness(self):
+        # if ZeRO is enabled, will check the gradient cross each ZeRO group.
+        # if ZeRO is not enabled, will check the gradient cross each nnscaler scale unit.
+        def get_optimizer_sync_group():
+            # if ZeRO is enabled, `compute_config.optimizer_dedup_group_size` is the ZeRO group size,
+            # return the corresponding rank list and device group cross ZeRO groups, parallel to the current rank,
+            # if ZeRO is not enabled, `compute_config.optimizer_dedup_group_size` is the plan_ngpus,
+            # return the corresponding rank list and device group cross scale units, parallel to the current rank.
+            rank = torch.distributed.get_rank()
+            group_size = self.train_args.compute_config.optimizer_dedup_group_size
+            runtime_ngpus = self.train_args.compute_config.runtime_ngpus
+
+            # group_size equal to runtime_ngpus means one of:
+            #   1. ZeRO is enabled and ZeRO group number is 1
+            #   2. ZeRO is not enabled and nnscaler scale unit number is 1
+            # in these cases, the gradient of one parameter/sub-parameter have only one copy,
+            # so there is not need to check the gradient consistent cross rank.
+            if group_size == runtime_ngpus:
+                return [rank], None
+
+            from nnscaler.runtime.device import DeviceGroup
+            # make sure all needed device groups have been created to make safe
+            for i in range(group_size):
+                DeviceGroup().get_group(
+                    list(range(i, runtime_ngpus, group_size))
+                )
+            rank_list = list(range(rank % group_size, runtime_ngpus, group_size))
+            return rank_list, DeviceGroup().get_group(rank_list)
+
+        rank_list, sync_group = get_optimizer_sync_group()
+
+        if sync_group is None:
+            return
+
+        params_info_for_gnorm = self.model.parameters_for_calc_gnorm()
+        tidx2param = {}
+        for r_idx, params_info in enumerate(params_info_for_gnorm):
+            for p_idx, param in enumerate(params_info.params):
+                # each param is the `Bucket._param_for_optimizer` of one of reducer's bucket,
+                # r_idx is the index of the reducer, p_idx is the index of the bucket.
+                tidx2param[(r_idx, p_idx)] = param
+        tidx2grad = {k: v.grad for k, v in sorted(tidx2param.items(), key=lambda item: item[0])}
+
+        def get_grad_metric(grad: torch.Tensor):
+            mean, max, min, norm = grad.float().mean().item(), grad.max().item(), grad.min().item(), grad.float().norm().item()
+            return mean, max, min, norm
+
+        # check gradient metric: (mean, max, min, norm)
+        tidx2metric = {k: get_grad_metric(v) for k, v in tidx2grad.items()}
+        tidx2ranks_metric = [None for _ in range(len(rank_list))]
+        torch.distributed.all_gather_object(tidx2ranks_metric, tidx2metric, group=sync_group)
+
+        def is_consistent(m1, m2, delta=1e-6):
+            # refer to Fairseq's approach, we don't check the completely equal here
+            # to ignore the precision loss due to communication.
+            abs_diff = abs(m1 - m2)
+            return abs_diff / (abs(m1) + delta) < delta
+
+        # check if all the gradient metric gathered from other rank is consistent with corrent rank
+        grad_consistent = True
+        for _tidx2metric in tidx2ranks_metric:
+            for tidx, metric in tidx2metric.items():
+                check_result = [is_consistent(m1, m2) for m1, m2 in zip(_tidx2metric[tidx], metric)]
+                if not all(check_result):
+                    grad_consistent = False
+                    break
+
+        if not grad_consistent:
+            pretty_detail = []
+            header = "rank mean{:6} max{:7} min{:7} norm{:7}".format("", "", "", "")
+            line = "-" * 80
+            for tidx, _ in tidx2metric.items():
+                pretty_detail.extend([line, f"reducer {tidx[0]} bucket {tidx[1]}", line, header])
+                for r, _tidx2metric in zip(rank_list, tidx2ranks_metric):
+                    pretty_detail.append("{:4d} {:10.6f} {:10.6f} {:10.6f} {:10.6f}".format(r, *_tidx2metric[tidx]))
+                pretty_detail.append(line)
+            pretty_detail = "\n".join(pretty_detail)
+
+            error_detail = "grad metric detail across the workers:\n{}\n".format(pretty_detail)
+            raise RuntimeError(
+                "Fatal error: gradients are inconsistent between workers. "
+                + "\n"
+                + "=" * 80
+                + "\n{}\n".format(error_detail)
+                + "=" * 80
+            )
+
     def _train(self):
         logger.info('Training...')
         # reset peak memory stats before training
@@ -732,6 +820,10 @@ class Trainer:
                     raise RuntimeError("`aggregate_outputs` doesn't set `num_tokens` field")
                 multiplier /= aggregated_outputs.num_tokens
             self.optimizer.scale_grads(multiplier)
+
+            # check gradient sync & scale correctness
+            if self.train_args.check_gradient_sync_cross_devices:
+                self._check_grad_cross_devices_correctness()
 
             # clip gradients
             self.hook.before_gnorm_clip(self)

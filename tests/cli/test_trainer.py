@@ -469,3 +469,44 @@ def test_dataset_empty_train_args():
     train_args.dataset.val_args = {}
     assert train_args.create_dataset() is not None
     assert train_args.create_dataset('val') is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4 or torch.cuda.device_count() >= 8, reason='lack of gpu devices')
+@pytest.mark.parametrize('use_bf16', [True, False])
+@pytest.mark.parametrize('zero_ngroups', [None, '1', '2'])
+def test_trainer_grad_sync_check_4gpu(tmp_path, use_bf16, zero_ngroups):
+    launch_torchrun(4, trainer_grad_sync_check, tmp_path, use_bf16, zero_ngroups, '4')
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 8, reason='lack of gpu devices')
+@pytest.mark.parametrize('use_bf16', [True, False])
+@pytest.mark.parametrize('zero_ngroups', [None, '1', '2', '4'])
+def test_trainer_grad_sync_check_8gpu(tmp_path, use_bf16, zero_ngroups):
+    launch_torchrun(8, trainer_grad_sync_check, tmp_path, use_bf16, zero_ngroups, '8')
+
+
+def trainer_grad_sync_check(save_dir, use_bf16, zero_ngroups, runtime_ngpus):
+    save_dir = Path(save_dir)
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    gen_savedir = save_dir / 'gen'
+    ckpt_savedir = save_dir / 'ckpt'
+    optimizer_type = 'torch.optim.Adam'
+    use_zero = False if zero_ngroups is None else True
+    zero_ngroups = '1' if zero_ngroups is None else zero_ngroups
+
+    trainer = Trainer([
+        '-f', config_path,
+        '--precision', 'bf16' if use_bf16 else 'none',
+        '--optimizer.type', optimizer_type,
+        '--max_epochs', '1',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', runtime_ngpus,
+        '--compute_config.use_zero', str(use_zero),
+        '--compute_config.zero_ngroups', zero_ngroups,
+        '--checkpoint.save_dir', str(ckpt_savedir),
+        '--debug.check_gradient_sync_cross_devices', 'true',
+    ])
+    trainer.run()
+    torch.distributed.barrier()

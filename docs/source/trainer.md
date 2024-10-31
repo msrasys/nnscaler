@@ -231,6 +231,16 @@ Internally we will get the final value with `__value_type(value)`.
     - `type` (`str`): The logger type or factory function.
     - `args` (`Dict[str, Any]`): The arguments of the logger.
 
+- `debug` (`DebugConfig`): Trainer debug related setting.
+
+    ```python
+    @dataclass
+    class DebugConfig:
+        check_gradient_sync_cross_devices: bool = True
+    ```
+
+    - `check_gradient_sync_cross_devices` (`bool`): Before gradient clip norm, check the gradient sync for the same parameter is consistent cross devices, if ZeRO is enabled, will check the gradient cross each ZeRO group, if ZeRO is not enabled, will check the gradient cross each nnscaler scale unit. This helps to find bugs related to gradient updates during training. Default is `True`.
+
 - `hook` (`Union[HookConfig, HookMapConfig, None]`): The hooks to be used.
 You can provide a hook with a hook class or a map of hook functions.
 Please note if your `model`/`optimizer`/`lr_scheduler` inherit from `TrainHook`,
@@ -240,51 +250,51 @@ and hooks passed with this config is called in the last.
 
     Hook class:
 
-        ```python
-        @dataclass
-        class HookConfig:
-            type: str = None
-            args: Dict[str, Any] = field(default_factory=dict)
-        ```
+    ```python
+    @dataclass
+    class HookConfig:
+        type: str = None
+        args: Dict[str, Any] = field(default_factory=dict)
+    ```
 
     - `type` (`str`): The hook type or factory function.
     - `args` (`Dict[str, Any]`): The arguments of the hook.
 
     Hook map:
 
-        ```python
-        @dataclass
-        class HookMapConfig:
-            after_setup: str = None
+    ```python
+    @dataclass
+    class HookMapConfig:
+        after_setup: str = None
 
-            on_train_start: str = None
-            on_train_end: str = None
-            on_val_start: str = None
-            on_val_end: str = None
+        on_train_start: str = None
+        on_train_end: str = None
+        on_val_start: str = None
+        on_val_end: str = None
 
-            on_epoch_start: str = None
-            on_epoch_end: str = None
+        on_epoch_start: str = None
+        on_epoch_end: str = None
 
-            on_train_step_start: str = None
-            on_train_step_end: str = None
-            on_val_step_start: str = None
-            on_val_step_end: str = None
+        on_train_step_start: str = None
+        on_train_step_end: str = None
+        on_val_step_start: str = None
+        on_val_step_end: str = None
 
-            after_aggregate_train_step_outputs: str = None
-            after_aggregate_val_step_outputs: str = None
+        after_aggregate_train_step_outputs: str = None
+        after_aggregate_val_step_outputs: str = None
 
-            before_zero_grad: str = None
-            after_zero_grad: str = None
+        before_zero_grad: str = None
+        after_zero_grad: str = None
 
-            before_gnorm_clip: str = None
-            after_gnorm_clip: str = None
+        before_gnorm_clip: str = None
+        after_gnorm_clip: str = None
 
-            before_optimizer_step: str = None
-            after_optimizer_step: str = None
+        before_optimizer_step: str = None
+        after_optimizer_step: str = None
 
-            on_load_checkpoint: str = None
-            on_save_checkpoint: str = None
-        ```
+        on_load_checkpoint: str = None
+        on_save_checkpoint: str = None
+    ```
     - `after_setup` (`str`): The hook function to be called after setting up the trainer.
     Only be called when `run_mode == 'run'`.
     Signature:  `def after_setup(trainer: 'Trainer') -> None:`
