@@ -822,7 +822,7 @@ class Trainer:
             self.optimizer.scale_grads(multiplier)
 
             # check gradient sync & scale correctness
-            if self.train_args.check_gradient_sync_cross_devices:
+            if self.train_args.debug.check_gradient_sync_cross_devices:
                 self._check_grad_cross_devices_correctness()
 
             # clip gradients
