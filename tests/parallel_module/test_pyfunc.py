@@ -43,7 +43,7 @@ def _worker():
     init_distributed()
 
     dummy_input = {'x': torch.rand(2, 10)}
-    from nnscaler.graph.parser.fx.parser import _logger as _logger_parser
+    from nnscaler.graph.parser.parser import _logger as _logger_parser
     from nnscaler.graph.graph import _logger as _logger_graph
     from nnscaler.graph.segment import _logger as _logger_seg
     with tempfile.TemporaryDirectory() as tempdir, \

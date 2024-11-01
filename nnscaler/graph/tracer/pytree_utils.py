@@ -13,7 +13,7 @@ import inspect
 from . import orig_func, _pytree
 from ._pytree import *
 
-import nnscaler.graph.parser.fx.concrete_trace_utils.concrete_proxy as cct
+import nnscaler.graph.tracer as cct
 
 
 # if pytree is a ConcreteProxy, type(pytree) will return the type of ConcreteProxy.value

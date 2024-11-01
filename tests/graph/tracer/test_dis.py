@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from nnscaler.graph.parser.fx.concrete_trace_utils.frame_utils import get_last_instruction, get_instructions
+from nnscaler.graph.tracer.frame_utils import get_last_instruction, get_instructions
 
 
 class A:

@@ -12,7 +12,7 @@ from collections import defaultdict
 import torch
 import torch.distributed as dist
 
-from nnscaler.graph.parser.fx.parser import FxModuleParser
+from nnscaler.graph.parser import FxModuleParser
 
 from nnscaler.runtime.device import DeviceGroup
 from nnscaler.runtime.adapter.reducer import Reducer

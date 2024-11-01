@@ -9,7 +9,7 @@ import pytest
 import torch
 import shutil
 
-from nnscaler.graph.parser.fx.parser import FxModuleParser
+from nnscaler.graph.parser import FxModuleParser
 from nnscaler.parallel import ReuseType, parallelize, ComputeConfig, _load_parallel_module_class
 from nnscaler.runtime.module import ParallelModule
 

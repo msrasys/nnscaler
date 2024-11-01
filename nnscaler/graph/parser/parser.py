@@ -11,13 +11,13 @@ from nnscaler.ir.operator import IRFwOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.cten import IRObject, IRCell, IRTensor
 from nnscaler.graph.parser.frame import Frame
-from nnscaler.graph.parser.fx.mapping import SignFx2Op
+from nnscaler.graph.parser.mapping import SignFx2Op
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.graph.function.function import any_ir_object_satisfy
+from nnscaler.graph.tracer import TensorMetadata, DICT_KEYS_TYPE, DICT_VALUES_TYPE, DICT_ITEMS_TYPE
 
 import torch.fx
-from .concrete_trace_utils import TensorMetadata, DICT_KEYS_TYPE, DICT_VALUES_TYPE, DICT_ITEMS_TYPE
 
 _logger = logging.getLogger(__name__)
 

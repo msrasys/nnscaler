@@ -7,7 +7,7 @@ import pytest
 
 from nnscaler.ir.cten import IRObject
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
-from nnscaler.graph.parser.fx.parser import TensorMetadata, DICT_VALUES_TYPE, DICT_ITEMS_TYPE
+from nnscaler.graph.parser.parser import TensorMetadata, DICT_VALUES_TYPE, DICT_ITEMS_TYPE
 
 
 @pytest.mark.parametrize('tosub', [True, False])

@@ -14,7 +14,7 @@ import math
 import torch
 from torch.fx.proxy import Scope, ScopeContextManager
 
-import nnscaler.graph.parser.fx.concrete_trace_utils as cct
+import nnscaler.graph.tracer as cct
 from . import pytree_utils, orig_func, operator_patcher
 if TYPE_CHECKING:
     from .concrete_tracer import ConcreteTracer

@@ -1,13 +1,13 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from nnscaler.graph.parser.fx.concrete_trace_utils import pytree_utils
-from nnscaler.graph.parser.fx.concrete_trace_utils.pytree_utils import (
+from nnscaler.graph.tracer import pytree_utils
+from nnscaler.graph.tracer.pytree_utils import (
     get_common_spec,
     tree_leaves_with_spec,
 )
-from nnscaler.graph.parser.fx.concrete_trace_utils.concrete_proxy import ConcreteProxy
-from nnscaler.graph.parser.fx.concrete_trace_utils.concrete_tracer import (
+from nnscaler.graph.tracer.concrete_proxy import ConcreteProxy
+from nnscaler.graph.tracer.concrete_tracer import (
     update_tree_proxy_value,
 )
 

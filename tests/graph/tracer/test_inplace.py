@@ -6,7 +6,7 @@ import _operator
 import torch
 
 from nnscaler.graph.parser.converter import to_fx_graph
-from nnscaler.graph.parser.fx.concrete_trace_utils.torch_fx_patcher import side_effectful_inplace_ops
+from nnscaler.graph.tracer.torch_fx_patcher import side_effectful_inplace_ops
 import nnscaler.runtime.function as cube_rt_function
 
 from ...utils import replace_all_device_with

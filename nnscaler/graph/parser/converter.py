@@ -12,10 +12,10 @@ from nnscaler.graph.parser.register import CustomizedOps
 from nnscaler.graph import IRGraph
 from nnscaler.flags import CompileFlag
 
-from nnscaler.graph.parser.fx.parser import FxModuleParser
-from nnscaler.graph.parser.fx.concrete_trace_utils import concrete_trace
-from nnscaler.graph.parser.fx.concrete_trace_utils.wrap_utils import Location, is_autograd_apply, LeafWrapInfo
-from nnscaler.graph.parser.fx.concrete_trace_utils.torch_fx_patcher import side_effectful_inplace_ops
+from nnscaler.graph.parser import FxModuleParser
+from nnscaler.graph.tracer import concrete_trace
+from nnscaler.graph.tracer.wrap_utils import Location, is_autograd_apply, LeafWrapInfo
+from nnscaler.graph.tracer.torch_fx_patcher import side_effectful_inplace_ops
 
 import nnscaler.runtime.function as cube_rt_function
 

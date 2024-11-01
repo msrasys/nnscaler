@@ -108,7 +108,7 @@ def replace_all_device_with(device='cpu', force=False):
         yield
         return
 
-    from nnscaler.graph.parser.fx.concrete_trace_utils import wrap_utils
+    from nnscaler.graph.tracer import wrap_utils
 
     orig_to = torch.Tensor.to
     orig_cuda = torch.Tensor.cuda

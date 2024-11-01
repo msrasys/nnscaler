@@ -98,8 +98,8 @@ def test_record_metadata():
     module = MyModule()
     fx_graph = to_fx_graph(module, dummy_input)
 
-    from nnscaler.graph.parser.fx.concrete_trace_utils.concrete_proxy import ConcreteProxy
-    from nnscaler.graph.parser.fx.concrete_trace_utils import TensorMetadata
+    from nnscaler.graph.tracer.concrete_proxy import ConcreteProxy
+    from nnscaler.graph.tracer import TensorMetadata
 
     for node in fx_graph.graph.nodes:
         # this assert is only for this simple model, all node should have TensorMetadata type 'tensor_meta'

@@ -30,7 +30,7 @@ from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.wrapnn import convert_to_wrapnn, wrapnn
 from nnscaler.graph.gener.gen import IRAdapterGener
-from nnscaler.graph.parser.fx.parser import FxModuleParser
+from nnscaler.graph.parser import FxModuleParser
 from nnscaler.graph.schedule.predefined import PredefinedSched
 from nnscaler.graph.schedule.schedplan import SchedulePlan
 

@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from nnscaler.graph.parser.fx.concrete_trace_utils.operator_patcher import (
+from nnscaler.graph.tracer.operator_patcher import (
     OperatorTransformer,
     SuperTransformer,
     ProxyCallTransformer,
