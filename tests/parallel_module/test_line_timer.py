@@ -11,9 +11,9 @@ import torch.distributed
 from nnscaler.parallel import parallelize, ComputeConfig
 from nnscaler.flags import CompileFlag
 
-from .common import init_distributed, clear_dir_on_rank0
+from .common import init_distributed
 from ..launch_torchrun import launch_torchrun
-from ..utils import catch_stdout
+from ..utils import catch_stdout, clear_dir_on_rank0
 
 
 class Net(torch.nn.Module):

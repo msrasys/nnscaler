@@ -114,16 +114,6 @@ def init_distributed():
     torch.set_default_device(f'cuda:{rank}')
 
 
-@contextlib.contextmanager
-def clear_dir_on_rank0(tempdir):
-    if torch.distributed.get_rank() == 0 and tempdir.exists():
-        shutil.rmtree(tempdir)
-    yield tempdir
-    torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0 and tempdir.exists():
-        shutil.rmtree(tempdir)
-
-
 def assert_equal(a: Any, b: Any):
     assert type(a) == type(b)
     if isinstance(a, torch.Tensor):

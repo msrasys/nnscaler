@@ -518,6 +518,8 @@ class IRSubTensor(IRTensor):
     def __eq__(self, other) -> bool:
         if isinstance(other, IRSubTensor):
             return self._id == other._id
+        else:
+            return False
 
     def __hash__(self) -> int:
         return self._id

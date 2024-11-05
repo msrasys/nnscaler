@@ -21,9 +21,9 @@ from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, merge
 from nnscaler.runtime.module import ParallelModule, ExtraState
 from nnscaler.runtime.gnorm import calcuate_gnorm
 
-from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0, PASMegatron
+from .common import CubeLinear, init_random, init_distributed, PASMegatron
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
-from ..utils import replace_all_device_with
+from ..utils import replace_all_device_with, clear_dir_on_rank0
 
 
 class FcRelu(nn.Module):

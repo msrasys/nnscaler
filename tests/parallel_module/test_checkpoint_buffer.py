@@ -10,9 +10,9 @@ import torch.distributed
 
 from nnscaler.parallel import parallelize, ComputeConfig, merge_state_dicts, load_merged_state_dict, broadcast_weights
 
-from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0
+from .common import CubeLinear, init_random, init_distributed
 from ..launch_torchrun import launch_torchrun
-from ..utils import catch_log
+from ..utils import catch_log, clear_dir_on_rank0
 
 
 class Net1(torch.nn.Module):

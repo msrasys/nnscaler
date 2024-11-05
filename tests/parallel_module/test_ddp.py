@@ -21,8 +21,9 @@ from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.runtime.module import ParallelModule
 from nnscaler.runtime.gnorm import calcuate_gnorm
 
-from .common import CubeLinear, init_random, init_distributed, clear_dir_on_rank0
+from .common import CubeLinear, init_random, init_distributed
 from ..launch_torchrun import launch_torchrun, clone_to_cpu_recursively
+from ..utils import clear_dir_on_rank0
 
 
 class FcRelu(nn.Module):

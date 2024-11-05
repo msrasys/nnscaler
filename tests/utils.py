@@ -12,6 +12,7 @@ import math
 import random
 from datetime import timedelta
 from pathlib import Path
+import shutil
 
 import numpy as np
 
@@ -366,3 +367,13 @@ def catch_stdout():
     sys.stdout = string_stream
     yield string_stream
     sys.stdout = old
+
+
+@contextmanager
+def clear_dir_on_rank0(tempdir):
+    if torch.distributed.get_rank() == 0 and tempdir.exists():
+        shutil.rmtree(tempdir)
+    yield tempdir
+    torch.distributed.barrier()
+    if torch.distributed.get_rank() == 0 and tempdir.exists():
+        shutil.rmtree(tempdir)

@@ -14,9 +14,10 @@ from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer, \
     deduped_state_dict, load_deduped_state_dict
 from nnscaler.runtime.module import ParallelModule
 
-from .common import PASMegatron, CubeLinear, init_random, init_distributed, clear_dir_on_rank0, assert_equal
+from .common import PASMegatron, CubeLinear, init_random, init_distributed, assert_equal
 from ..launch_torchrun import launch_torchrun
 from .test_checkpoint import gendata, train_step, End2EndMLP, End2EndMLPWithUnusedAndShared
+from ..utils import clear_dir_on_rank0
 
 
 class FcRelu(nn.Module):

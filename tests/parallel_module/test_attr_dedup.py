@@ -18,8 +18,9 @@ from nnscaler.ir.operator import IRFwOperation
 from nnscaler.policies import _tp, _replica
 from nnscaler.runtime.module import dedup_attrs
 
-from .common import init_distributed, clear_dir_on_rank0, assert_equal
+from .common import init_distributed, assert_equal
 from ..launch_torchrun import launch_torchrun
+from ..utils import clear_dir_on_rank0
 
 class Net(torch.nn.Module):
     def __init__(self):

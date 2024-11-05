@@ -132,10 +132,15 @@ class IRGraph(IRSegment):
         For operators that doesn't need backward, all gradients of their
         input/output tensors will make to None (despite require_grad is True)
 
-        @param loss IRSubTensor: the loss tensor, must be in the output
+        Note grad of input tensors of a IRPyFunc will be None and we will not
+        generate a backward node for IRPyFunc.
+
+        Args:
+            loss (IRSubTensor): the loss tensor, must be in the output
             of current graph. The loss shape should be (1,)
 
-        @return self IRGraph: None
+        Returns:
+            self (IRGraph): updated graph with backward operators
         """
         # set mirror as self
         self._mirror = self

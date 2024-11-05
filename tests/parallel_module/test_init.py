@@ -10,8 +10,8 @@ import nnscaler
 from nnscaler.parallel import _load_parallel_module_class, parallelize, ComputeConfig
 
 from ..launch_torchrun import launch_torchrun
-from .common import CubeLinear, init_distributed, init_random, clear_dir_on_rank0
-from ..utils import new_empty, replace_all_device_with, mock_dist
+from .common import CubeLinear, init_distributed, init_random
+from ..utils import new_empty, replace_all_device_with, mock_dist, clear_dir_on_rank0
 
 class MyModule(torch.nn.Module):
     def __init__(self):

@@ -21,8 +21,9 @@ from nnscaler.runtime.gnorm import calcuate_gnorm
 from nnscaler.runtime.utils import microbatches
 from nnscaler.runtime.module import ParallelModule
 from nnscaler.parallel import ComputeConfig, build_optimizer, parallelize, merge_state_dicts
-from .common import assert_equal, clear_dir_on_rank0, init_distributed, PASMegatron, init_random
+from .common import assert_equal, init_distributed, PASMegatron, init_random
 from ..launch_torchrun import clone_to_cpu_recursively, launch_torchrun
+from ..utils import replace_all_device_with, clear_dir_on_rank0
 
 from .test_checkpoint import End2EndMLP
 

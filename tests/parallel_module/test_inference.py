@@ -11,8 +11,9 @@ from torch import nn
 
 from nnscaler.parallel import ComputeConfig, parallelize
 
-from .common import CubeLinear, init_distributed, init_random, clear_dir_on_rank0
+from .common import CubeLinear, init_distributed, init_random
 from ..launch_torchrun import torchrun
+from ..utils import clear_dir_on_rank0
 
 
 class FcRelu(nn.Module):
