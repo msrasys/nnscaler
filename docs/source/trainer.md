@@ -414,7 +414,7 @@ you can run `compile` mode without `torchrun`.
 - `val_every_n_epochs` (`Optional[int]`): Validate every `val_every_n_epochs` epochs. Default is `1`.
 - `enable_progress_bar` (`bool`): Whether to enable the progress bar. Default is `True`.
 - `seed` (`Optional[int]`): The random seed. Default is `None`.
-- `init_env_fn` (`str`): The function to initialize the environment. Default is `None`.
+- `init_env_fn` (`str`): The function to initialize the environment. Its only input is `Trainer`. Default is `None`.
 
 ## CLI
 

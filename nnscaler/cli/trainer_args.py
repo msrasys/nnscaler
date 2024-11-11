@@ -26,6 +26,9 @@ from .arg_parser import deserialize_dataclass, merge_args, parse_args, _TYPE_KEY
 from .loggers.logger_base import LoggerBase
 from .train_hook import TrainHook
 
+if TYPE_CHECKING:
+    from .trainer import Trainer
+
 
 logger = logging.getLogger(__name__)
 
@@ -516,7 +519,7 @@ class TrainerArgs:
     def input_dtype(self) -> torch.dtype:
         return _PRECISION_MAP[self.precision['input']]
 
-    def init_env(self):
+    def init_env(self, trainer: 'Trainer'):
         if self.seed is not None:
             import random
             import numpy as np
@@ -527,7 +530,7 @@ class TrainerArgs:
         if self.init_env_fn is None:
             return
         init_env_fn = load_type(self.init_env_fn)
-        init_env_fn(self)
+        init_env_fn(trainer)
 
     def create_model(self) -> torch.nn.Module:
         kwargs = self.create_kwarg(self.model.args)

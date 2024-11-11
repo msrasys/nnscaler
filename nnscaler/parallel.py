@@ -348,7 +348,7 @@ def _to_cpu(val: Any):
         return {_to_cpu(t) for t in val}
     if isinstance(val, torch.Tensor):
         requires_grad = val.is_floating_point() or val.is_complex()
-        return val.cpu().requires_grad_(requires_grad)
+        return val.detach().clone().cpu().requires_grad_(requires_grad)
     return val
 
 

@@ -133,7 +133,7 @@ class Trainer:
             return next(iter(dataloader))
 
     def _setup(self):
-        self.train_args.init_env()
+        self.train_args.init_env(self)
         compile_only = self.train_args.compile_mode
 
         if is_running_distributed():
@@ -641,7 +641,10 @@ class Trainer:
         self.hook.on_train_start(self)
 
         for epoch in range(start_epoch, self.train_args.max_epochs or sys.maxsize):
-            self.dataloader['train'].sampler.set_epoch(epoch)
+            if hasattr(self.dataloader['train'], 'set_epoch'):
+                self.dataloader['train'].set_epoch(epoch)
+            elif hasattr(self.dataloader['train'].sampler, 'set_epoch'):
+                self.dataloader['train'].sampler.set_epoch(epoch)
 
             torch.distributed.barrier()
 
