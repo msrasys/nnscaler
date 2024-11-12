@@ -36,3 +36,39 @@ def test_gen_partitions():
         assert len(gen_partitions(fc1, 4)) == 14
         # C(4, 1) + 1 - 1 = 4
         assert len(gen_partitions(fc1, 4, base=4, depth=1)) == 4
+
+
+class DepthwiseConv2d(torch.nn.Module):
+    def __init__(self, in_channels, multiplier_k, kernel_size, stride=1, padding=0):
+        super(DepthwiseConv2d, self).__init__()
+        self.depthwise = torch.nn.Conv2d(in_channels, in_channels * multiplier_k, kernel_size=kernel_size, 
+                                   stride=stride, padding=padding, groups=in_channels)
+    
+    def forward(self, x):
+        return self.depthwise(x)
+
+
+@replace_all_device_with('cpu')
+def test_gen_partitions_depthwise_conv2d():
+    in_channels = 8
+    multiplier_k = 4
+    kernel_size = 3
+    stride = 1
+    padding = 1
+    batch_size = 16
+    height = 256
+    width = 256
+    with tempfile.TemporaryDirectory() as tempdir:
+        graph, _ = _gen_graph(DepthwiseConv2d(in_channels, multiplier_k, kernel_size, stride, padding), 
+                              {'x': torch.randn(batch_size, in_channels, height, width)}, 
+                              tempdir, False)
+        depthwise = graph.select(ntype=IRFwOperation)[0]
+        # anno: n (g 1^) 256^ 256^, (g 4^) 1^ 3^ 3^, (g 4^) -> n (g 4^) 256^ 256^
+        assert len(gen_partitions(depthwise, 1)) == 1
+        # n g, n/2 g, n g/2
+        assert len(gen_partitions(depthwise, 2)) == 3
+        # n g, n/2 g, n g/2, n/2 g/2, n g/2/2, n/2/2 g
+        assert len(gen_partitions(depthwise, 4)) == 6
+        # n g, n/4 g, n g/4
+        assert len(gen_partitions(depthwise, 4, base=4, depth=1)) == 3
+
