@@ -155,9 +155,6 @@ class ComputeConfig:
             # have to use __setattr__ for frozen dataclass
             super().__setattr__('zero_ngroups', 1)
 
-        if self.use_async_reducer and not self.use_end2end:
-            raise ValueError("use_async_reducer is only supported in end2end mode.")
-
         if self.reducer_bucket_cap_mb and self.reducer_bucket_cap_mb < 0:
             raise ValueError(f"reducer_bucket_cap_mb {self.reducer_bucket_cap_mb} should not be negative.")
 
@@ -2365,3 +2362,33 @@ def load_sharded_state_dict(
         if optimizer_state_dict is None:
             raise ValueError("optimizer_state_dict should be provided when optimizer is not None.")
         optimizer.load_state_dict(optimizer_state_dict)
+
+
+def sync_grad_when(cond: bool):
+    """
+    Context manager to enable/disable gradient synchronizations across workers.
+
+    Within this context, gradients will be accumulated
+    only when `cond` is True.
+
+    This is needed when
+    1. The mode is not end2end model.
+        For end2end model, gradients are synchronized across workers automatically.
+    2. async is enabled (`compute_config.use_async_reducer` is `True`).
+
+    If both conditions are not satisfied, this function has no effect.
+
+    Example:
+        >>> model = parallelize(model, ...)
+        >>> accum_steps = ...
+        >>> for step in range(accum_steps)
+        >>>     with sync_grad_when(step == accum_steps - 1):
+        >>>         loss = ...
+        >>>         loss.backward()
+        >>> optimizer.step()
+        >>> optimizer.zero_grad()
+
+    Args:
+        cond (bool): whether to synchronize gradients.
+    """
+    return _runtime_flags(skip_reducer=not cond)

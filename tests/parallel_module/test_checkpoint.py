@@ -457,6 +457,7 @@ def _gpu_worker(module_type, use_zero, pas, plan_ngpus, runtime_ngpus, per_resum
             ))
         return compiled_results
 
+
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
 @pytest.mark.parametrize('module_type', ['sub', 'whole', 'start', 'end', 'small', 'pipeline'])
 @pytest.mark.parametrize('use_zero', [True, False])
