@@ -39,6 +39,8 @@ def multiref(tensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]:
 
 
 def to(tensor: torch.Tensor, dtype_or_device: Union[torch.device, torch.dtype]) -> torch.Tensor:
+    # deprecated
+    # keep it only for backward compatibility
     return tensor.to(dtype_or_device)
 
 

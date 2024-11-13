@@ -538,21 +538,102 @@ def test_type():
 
 
 def test_to():
-    op = F.To(IRTensor([2, 3], dtype=None), dtype=torch.float32)
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs['dtype_or_device'] == torch.float32
-    op = F.To(IRTensor([2, 3], dtype=torch.float32), device=torch.device('cuda:0'))
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> a b'
-    op = F.To(IRTensor([3, 5], dtype=torch.int64), dtype=torch.float32)
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs['dtype_or_device'] == torch.float32
-    op = F.To(IRTensor([2, 3], dtype=torch.float32), device=torch.device('cuda:0'))
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> a b'
-    op = F.To(IRTensor([3, 5], dtype=torch.int64), dtype=IRTensor(dtype=torch.float32))
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *'
-    op = F.To(IRTensor([2, 3], dtype=torch.float32), device=torch.device('cuda:0'), dtype=torch.float32)
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs['dtype_or_device'] == torch.float32
-    op = F.To(IRTensor([3, 5], dtype=torch.int64),  dtype_or_device=IRTensor(dtype=torch.float32))
-    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *'
+    with pytest.raises(ValueError, match='.*is not a valid argument.*'):
+        op = F.To(IRTensor([2, 3], dtype=torch.float32), xx=None)
 
+    with pytest.raises(ValueError, match='.*is not a valid argument.*'):
+        op = F.To(IRTensor([2, 3], dtype=torch.float32), 0, xx=None)
+
+    with pytest.raises(ValueError, match='.*is not a valid argument.*'):
+        op = F.To(IRTensor([2, 3], dtype=torch.float32), torch.float32, xx=None)
+
+    # 1st overload
+    op = F.To(IRTensor([2, 3], dtype=torch.float32))  # No arguments
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and not op.kwargs
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), None)  # only None
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and not op.kwargs
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), torch.device('cuda:0'))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and not op.kwargs
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), 'cuda:0')
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and not op.kwargs
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), 0)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and not op.kwargs
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), device=None)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and not op.kwargs
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), device=torch.device('cuda:0'))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and not op.kwargs
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), device=0)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and not op.kwargs
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), device='cuda:0')
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and not op.kwargs
+
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), 0, None)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' \
+        and op.kwargs == {'dtype': None}
+
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), 0, None, True)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' \
+        and op.kwargs == {'dtype': None, 'non_blocking': True}
+
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), 0, None, True, None)
+    # Note type of copy is None, which is not correct.
+    # because currently we don't do type checking
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' \
+        and op.kwargs == {'dtype': None, 'non_blocking': True, 'copy': None}
+
+    # 1st overload with options
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), 0, copy=True)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' \
+        and op.kwargs == {'copy': True}
+
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), 0, None, copy=True)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' \
+        and op.kwargs == {'dtype': None, 'copy': True}
+
+    op = F.To(IRTensor([2, 3], dtype=torch.float32), 0, copy=True, non_blocking=True, memory_format=torch.contiguous_format)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' \
+        and op.kwargs == {'copy': True, 'non_blocking': True, 'memory_format': torch.contiguous_format}
+
+    # 1st overload with duplicate options
+    with pytest.raises(ValueError):
+        op = F.To(IRTensor([2, 3], dtype=torch.float32), 0, copy=True, device=None)
+
+    # 2nd overload
+    op = F.To(IRTensor([2, 3]), torch.float32)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs == {'dtype': torch.float32}
+
+    op = F.To(IRTensor([2, 3]), dtype=torch.float32)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs == {'dtype': torch.float32}
+
+    op = F.To(IRTensor([2, 3]), torch.float32, False)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' \
+        and op.kwargs == {'dtype': torch.float32, 'non_blocking': False}
+
+    op = F.To(IRTensor([2, 3]), torch.float32, False, copy=False, memory_format=torch.contiguous_format)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' \
+        and op.kwargs == {'dtype': torch.float32, 'non_blocking': False,
+                          'copy': False, 'memory_format': torch.contiguous_format}
+
+    # duplicate options
+    with pytest.raises(ValueError):
+        op = F.To(IRTensor([2, 3]), torch.float32, False, non_blocking=True)
+
+    # 3rd overload
+    op = F.To(IRTensor([3, 5], dtype=torch.int64), IRTensor(dtype=torch.float32))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs == {'dtype': torch.float32}
+    op = F.To(IRTensor([3, 5], dtype=torch.int64), IRTensor(dtype=torch.float32), True)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs == {'dtype': torch.float32, 'non_blocking': True}
+    op = F.To(IRTensor([3, 5], dtype=torch.int64), IRTensor(dtype=torch.float32), True, None)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs == {'dtype': torch.float32, 'non_blocking': True, 'copy': None}
+    op = F.To(IRTensor([3, 5], dtype=torch.int64), IRTensor(dtype=torch.float32), True, copy=True)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '* -> *' and op.kwargs == {'dtype': torch.float32, 'non_blocking': True, 'copy': True}
+
+    # duplicate options
+    with pytest.raises(ValueError):
+        op = F.To(IRTensor([2, 3]), IRTensor(dtype=torch.float32), False, non_blocking=True)
+    # too many positional arguments
+    with pytest.raises(ValueError, match='.*too many positional arguments.*'):
+        op = F.To(IRTensor([3, 5], dtype=torch.int64), IRTensor(dtype=torch.float32), True, None, True)
 
 
 def test_outer():

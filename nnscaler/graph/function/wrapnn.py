@@ -128,10 +128,6 @@ def wrap_batchnorm2d_func(
         )
 
 
-def unwrap_if_irobject(x):
-    return x.value if isinstance(x, IRObject) and not isinstance(x, IRTensor) else x
-
-
 def batchnorm2d_annotation_fn(*inputs, **kwargs):
     assert (
         len(inputs) == 6
@@ -148,11 +144,11 @@ def batchnorm2d_annotation_fn(*inputs, **kwargs):
        should also be absent.
        Reference: https://pytorch.org/docs/stable/generated/torch.nn.BatchNorm2d.html
     """
-    weight = unwrap_if_irobject(weight)
-    bias = unwrap_if_irobject(bias)
-    running_mean = unwrap_if_irobject(running_mean)
-    running_var = unwrap_if_irobject(running_var)
-    num_batches_tracked = unwrap_if_irobject(num_batches_tracked)
+    weight = IRObject.try_unwrap(weight)
+    bias = IRObject.try_unwrap(bias)
+    running_mean = IRObject.try_unwrap(running_mean)
+    running_var = IRObject.try_unwrap(running_var)
+    num_batches_tracked = IRObject.try_unwrap(num_batches_tracked)
 
     if weight is None:
         assert bias is None
@@ -379,10 +375,10 @@ def instancenorm2d_annotation_fn(*inputs, **kwargs):
     ), "Expected 5 inputs: input, weight, bias, running_mean, running_var"
     input, weight, bias, running_mean, running_var = inputs
 
-    weight = unwrap_if_irobject(weight)
-    bias = unwrap_if_irobject(bias)
-    running_mean = unwrap_if_irobject(running_mean)
-    running_var = unwrap_if_irobject(running_var)
+    weight = IRObject.try_unwrap(weight)
+    bias = IRObject.try_unwrap(bias)
+    running_mean = IRObject.try_unwrap(running_mean)
+    running_var = IRObject.try_unwrap(running_var)
 
     if weight is None:
         assert bias is None

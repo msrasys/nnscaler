@@ -1459,3 +1459,29 @@ def _gencode_conv2d_function_(tempdir):
 def test_codegen_conv2d_groups():
     with tempfile.TemporaryDirectory() as tempdir:
         launch_torchrun(1, _gencode_conv2d_function_, tempdir)
+
+
+class FunctionToModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(3, 5)
+
+    def forward(self, x):
+        return self.linear(x.to(0)).to(torch.float32, copy=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of GPU devices')
+def test_codegen_function_to(tmp_path):
+    parallelize(
+        FunctionToModule(),
+        {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+        'dp',
+        ComputeConfig(1, 1),
+        gen_savedir=tmp_path,
+        load_module=False
+    )
+    # device argument is removed
+    # to_23 = torch.Tensor.to(x_29)
+    assert _gencode_contains(tmp_path, FunctionToModule, 0, r'to_\d+ = torch\.Tensor\.to\(x_\d+\)')
+    # to_1_22 = torch.Tensor.to(linear_26, copy=True, dtype=torch.float32)
+    assert _gencode_contains(tmp_path, FunctionToModule, 0, r'torch\.Tensor\.to([^, ]*, copy=True, dtype=torch.float32)')

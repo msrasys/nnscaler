@@ -665,7 +665,7 @@ class IRObject:
                         return IRObject(name, value=obj, is_constant=is_constant), False
                     else:
                         return {k: r[0] for k, r in result.items()}.items(), True
-
+            # slice will go here, as its start/stop/step are never tensor-like objects
             return IRObject(name, value=obj, is_constant=is_constant), False
 
         return _inner(data)[0]
@@ -681,6 +681,29 @@ class IRObject:
         from nnscaler.ir.tensor import IRFullTensor
         modifier = lambda t: t.tosub() if isinstance(t, IRFullTensor) else t
         return IRCell.modify_objects_of_complex(obj, modifier)
+
+    @classmethod
+    def try_unwrap(cls, x: Union[Any, 'IRObject']) -> Any:
+        """
+        Unwrap the IRObject to its original value if it is an IRObject
+        otherwise, go recursively.
+
+        Args:
+            x (Any): the object to unwrap
+
+        Returns:
+            Any: the original value
+        """
+        if isinstance(x, IRObject) and not isinstance(x, IRTensor):
+            return x.value
+        elif isinstance(x, (list, tuple)):
+            return type(x)(cls.try_unwrap(v) for v in x)
+        elif isinstance(x, dict):
+            return {k: cls.try_unwrap(v) for k, v in x.items()}
+        elif isinstance(x, slice):
+            return slice(cls.try_unwrap(x.start), cls.try_unwrap(x.stop), cls.try_unwrap(x.step))
+        else:
+            return x
 
     def __repr__(self):
         return f'Object({self.name}{self.tid}, val={self.value}, is_constant={self.is_constant})'
