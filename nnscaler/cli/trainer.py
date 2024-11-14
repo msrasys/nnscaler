@@ -1,6 +1,8 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+from __future__ import annotations
+
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
@@ -93,6 +95,8 @@ class Trainer:
         self.max_train_steps = None
         self.loggers = []
         self.hook = None
+        # RNG states pending resume; reset to None after resuming
+        self.rng_states_from_resume: dict[str, torch.Tensor] | None = None
 
     def run(self):
         self._setup()
@@ -288,6 +292,7 @@ class Trainer:
             'lr_scheduler': state_dicts[0].get('lr_scheduler', None),
             'train_status': state_dicts[0]['train_status'],
             'train_args': train_args,
+            'rng_states': None,
         }
         torch.save(merged_state_dict, output_file)
 
@@ -341,6 +346,7 @@ class Trainer:
             if self.lr_scheduler:
                 self.lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
         self.train_status = TrainStatus(**state_dict['train_status'])
+        self.rng_states_from_resume = state_dict.get('rng_states')  # resumed in _global_batch_iterator()
 
     def _log_mem_stats(self, tag=None):
         # log minimum free memory over the iteration
@@ -409,6 +415,7 @@ class Trainer:
             'lr_scheduler': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
             'train_status': asdict(self.train_status),
             'train_args': self.train_args.to_dict(),
+            'rng_states': self._get_rng_states(),
         }
         self.hook.on_save_checkpoint(self, state_dict)
         ckpt_file = save_dir / CHECKPOINT_FILE_FORMAT.format(
@@ -499,11 +506,26 @@ class Trainer:
             logger.info('Removing old checkpoint: %s', ckpt_name)
             shutil.rmtree(save_dir / ckpt_name)
 
-    def _global_batch_iterator(self, num_skip_first = 0, stage='train'):
+    def _global_batch_iterator(self, num_skip_first=0, stage='train'):
+        if num_skip_first == 0:
+            # if the checkpoint stops at the end of an epoch,
+            # the rng states must be resumed before creating iterator
+            # because `DataLoader.__iter__()` uses the rng (dunno why),
+            # and the previous run had not call it yet
+            self._try_resume_rng_states()
+
+        it = iter(self.dataloader[stage])
+        for _ in range(num_skip_first * self.train_args.update_freq):
+            _sample = next(it)
+
+        if num_skip_first != 0:
+            # if the checkpoint stops in the middle of an epoch,
+            # the rng states must be resumed before loading the first batch, which depends on the rng;
+            # and must be resumed after skipping unused batches, which will affect the rng
+            self._try_resume_rng_states()
+
         samples = []
-        for idx, sample in enumerate(self.dataloader[stage]):
-            if idx < num_skip_first * self.train_args.update_freq:
-                continue
+        for sample in it:
             sample = self._fix_input(sample)
             samples.append(sample)
             if len(samples) == self.train_args.update_freq:
@@ -738,14 +760,14 @@ class Trainer:
             logger.info(self._format_metrics(f'Validation', None, val_metrics))
         return step_stat.val_loss
 
-    def _train_epoch(self, epoch):
+    def _train_epoch(self, epoch: int) -> None:
         VAL_STATUS_NO = 0     # not validated or saved
         VAL_STATUS_VAL = 1    # validated but not saved
         VAL_STATUS_SAVE = 2   # validated and saved
         has_validated = VAL_STATUS_NO   # 3 states
 
         resume_from_idx = self.train_status.finished_train_steps % self.total_train_steps_per_epoch
-        data_iter = enumerate(self._global_batch_iterator(num_skip_first=resume_from_idx))
+        data_iter = enumerate(self._global_batch_iterator(resume_from_idx))
 
         max_epoch = self.max_train_steps // self.total_train_steps_per_epoch
         if self.max_train_steps % self.total_train_steps_per_epoch != 0:
@@ -898,3 +920,18 @@ class Trainer:
                 and (epoch + 1) % self.train_args.val_every_n_epochs == 0:
                 self._validate(step_stat)
                 has_validated = VAL_STATUS_VAL
+
+    def _get_rng_states(self) -> dict[str, torch.Tensor]:
+        return {
+            'torch': torch.get_rng_state(),
+            'torch_cuda': torch.cuda.get_rng_state(),
+        }
+
+    def _try_resume_rng_states(self) -> None:
+        # assuming hooks do not use rng
+        if self.rng_states_from_resume is not None:
+            if self.rng_states_from_resume.get('torch') is not None:
+                torch.set_rng_state(self.rng_states_from_resume['torch'])
+            if self.rng_states_from_resume.get('torch_cuda') is not None:
+                torch.cuda.set_rng_state(self.rng_states_from_resume['torch_cuda'])
+            self.rng_states_from_resume = None

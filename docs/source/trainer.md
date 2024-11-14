@@ -388,6 +388,11 @@ we will run validation on the validation dataset and save the validation loss to
 The validation run will ignore the `val_every_n_train_steps` and `val_every_n_epochs` configurations.
 If no valid dataset is provided, validation is skipped and `valid_loss` is set to `train_loss` by default.
 
+3. The sharded checkpoints will contain PyTorch's RNG state, but not Python's or NumPy's.
+The checkpoint's RNG state will be resumed right before training start,
+which means the initialization stage will use `TrainerArgs.seed` instead.
+Merged checkpoints will discard the RNG state.
+
 ### Other configs
 - `gen_savedir` (`str`): The directory to save the generated files. Default is `./.nnscaler`.
 - `gen_reuse` (`str`):  the reuse strategy of the generated code, it can be
