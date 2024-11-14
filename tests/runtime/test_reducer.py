@@ -140,18 +140,23 @@ test_reducer_2gpu = partial(torchrun, 2, reducer_test)
 
 @mock_reducer_env(0, 2)
 def test_reducer_build():
-    reducer = Reducer([0, 1], max_bucket_size_bytes=16)  # 16 bytes means 4 float32
-    reducer.add_param(torch.nn.Parameter(torch.randn(1, 2)))  # small at first <bucket 0>
-    reducer.add_param(torch.nn.Parameter(torch.randn(1, 10)))  # bigger than max_bucket_size_bytes <bucket 1>
-    reducer.add_param(torch.nn.Parameter(torch.randn(1, 3)))  # small again <bucket 2>
-    reducer.add_param(torch.nn.Parameter(torch.randn(1, 3)))  # small again <bucket 3>
-    reducer.add_param(torch.nn.Parameter(torch.randn(1, 1)))  # small again <bucket 3>
-    reducer.add_param(torch.nn.Parameter(torch.randn(1, 1)))  # small again <bucket 4>
+    reducer = Reducer([0, 1], max_bucket_size_bytes=48)  # 24 bytes means 12 float32
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 2)))  # 4 floats # small at first <bucket 0>
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 14))) # 16 floats # bigger than max_bucket_size_bytes <bucket 1>
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 5)))  # 8 floats # small again <bucket 2>
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 5)))  # 8 floats # small again <bucket 3>
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 1)))  # 4 floats small again <bucket 3>
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 1)))  # 4 floats small again <bucket 4>
     reducer.build_buckets()
     assert len(reducer.buckets) == 5
     buckets = list(reversed(reducer.buckets))
     assert buckets[0].numel == 2
-    assert buckets[1].numel == 10
-    assert buckets[2].numel == 3
-    assert buckets[3].numel == 4
+    assert buckets[0]._aligned_numel == 4
+    assert buckets[1].numel == 14
+    assert buckets[1]._aligned_numel == 16
+    assert buckets[2].numel == 5
+    assert buckets[2]._aligned_numel == 8
+    assert buckets[3].numel == 6
+    assert buckets[3]._aligned_numel == 12
     assert buckets[4].numel == 1
+    assert buckets[4]._aligned_numel == 4

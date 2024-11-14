@@ -1093,9 +1093,10 @@ class ParallelModule(CubeModule):
                 pstart, pend = 0, 0
                 for param in bucket.params:
                     pstart = pend
-                    pend += param.numel()
+                    pend = pstart + bucket.get_aligned_numel(param)
+                    pend_without_padding = pstart + param.numel()
                     model_idx = model_params_id.index(id(param))
-                    model_idx2opt_idx[model_idx] = (opt_idx, pstart, pend, param.shape)
+                    model_idx2opt_idx[model_idx] = (opt_idx, pstart, pend_without_padding, param.shape)
                 assert len(bucket._contiguous_params.shape) == 1
                 opt_idx2ranks[opt_idx] = (sub_ranks, bucket._contiguous_params.shape[0])
                 opt_idx += 1

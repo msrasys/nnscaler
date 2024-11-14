@@ -364,11 +364,11 @@ def _train(model: torch.nn.Module, num_replicas, rank, start, end, ckpt_dir, inf
     results = []
     for i, (x, y) in enumerate(data):
         y_pred, loss = train_step(model, x, y, optimizer)
-        grads = {n: p.grad for n, p in model.named_parameters()}
+        grads = {n: p.grad.clone() for n, p in model.named_parameters()}
         gnorm = optimizer.clip_gnorm()
         results.append(clone_to_cpu_recursively([y_pred, loss, grads, gnorm]))
         optimizer.zero_grad()
-        weights = {n: p.data for n, p in model.named_parameters()}
+        weights = {n: p.data.clone() for n, p in model.named_parameters()}
         results[-1].append(clone_to_cpu_recursively(weights))
         results[-1] = StepResult(*results[-1])
 

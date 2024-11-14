@@ -1884,6 +1884,8 @@ def _construct_optim_state_zero(
             step, opt_states, opt_state_keys = None, {}, None
             for param in bucket.params:
                 sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
+                # there are padding in the chunk, so `param.numel()` doesn't work here
+                param_numel = bucket.get_aligned_numel(param)
                 # init the chunk's optimizer state
                 if opt_state_keys is None:
                     opt_state_keys = [key for key in sliced_new_val]
@@ -1900,41 +1902,46 @@ def _construct_optim_state_zero(
 
                 # parameter range: <>
                 # bucket range: []
+                # in the following branches, we check the range including paddings.
+                # but in branch body, we only copy the valid range (without paddings) but update the chunk_offset with paddings.
                 if param_offset < bucket_chunk_start \
-                    and bucket_chunk_start < param_offset + param.numel() < bucket_chunk_end:
+                    and bucket_chunk_start < param_offset + param_numel < bucket_chunk_end:
                     # case: < [ > ]
-                    copy_size = param_offset + param.numel() - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+copy_size] = sliced_new_val[key][-copy_size:]
+                    copy_size = param_offset + param_numel - bucket_chunk_start
+                    copy_size_without_padding = param_offset + param.numel() - bucket_chunk_start
+                    if copy_size_without_padding > 0:
+                        for key in opt_state_keys:
+                            opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][-copy_size_without_padding:]
                     chunk_offset += copy_size
                 elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and bucket_chunk_start <= param_offset + param.numel() < bucket_chunk_end:
+                    and bucket_chunk_start <= param_offset + param_numel < bucket_chunk_end:
                     # case: [ <  > ]
                     for key in opt_state_keys:
                         opt_states[key][chunk_offset:chunk_offset+param.numel()] = sliced_new_val[key][:]
-                    chunk_offset += param.numel()
+                    chunk_offset += param_numel
                 elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and param_offset + param.numel() >= bucket_chunk_end:
+                    and param_offset + param_numel >= bucket_chunk_end:
                     # case: [ < ] >
                     copy_size = bucket_chunk_end - param_offset
+                    copy_size_without_padding = min(copy_size, param.numel())
                     for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+copy_size] = sliced_new_val[key][:copy_size]
+                        opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][:copy_size_without_padding]
                     chunk_offset += copy_size
                 elif param_offset < bucket_chunk_start \
-                    and param_offset + param.numel() >= bucket_chunk_end:
+                    and param_offset + param_numel >= bucket_chunk_end:
                     # case: < [ ] >
                     copy_size = bucket_chunk_end - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset + copy_size] \
-                            = sliced_new_val[key][bucket_chunk_start-param_offset:bucket_chunk_start-param_offset + copy_size]
+                    copy_size_without_padding = min(copy_size, param_offset + param.numel() - bucket_chunk_start)
+                    if copy_size_without_padding > 0:
+                        for key in opt_state_keys:
+                            opt_states[key][chunk_offset:chunk_offset + copy_size_without_padding] \
+                                = sliced_new_val[key][bucket_chunk_start-param_offset:bucket_chunk_start-param_offset + copy_size_without_padding]
                     chunk_offset += copy_size
                 else:
                     # case: [] <>, <> []
-                    logger.debug(f'Skipped: parameter range({param_offset},{param_offset + param.numel()}) vs. bucket range({bucket_chunk_start},{bucket_chunk_end})')
-                param_offset += param.numel()
-            # as there is padding in chunk, slicing to obtain the correct shape opt states
-            for key in opt_state_keys:
-                opt_states[key] = opt_states[key][:opt_param[opt_param_idx].shape[0]]
+                    logger.debug(f'Skipped: parameter range({param_offset},{param_offset + param_numel}) vs. bucket range({bucket_chunk_start},{bucket_chunk_end})')
+                param_offset += param_numel
+
             if step is not None:
                 opt_states['step'] = step
             state_dict[opt_param_idx] = opt_states
