@@ -82,6 +82,14 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     autowrap_funcs = [fn for fn in autowrap_funcs if not is_autograd_apply(fn)]
     leaf_functions = {func: LeafWrapInfo([], True, None) for func in autowrap_funcs if func is not None}
 
+    # importlib functions
+    # currently only import_module is handled in the code
+    import importlib
+    leaf_functions.update({
+        func: LeafWrapInfo([Location(importlib, func.__name__)], False, None)
+        for func in [importlib.import_module]
+    })
+
     # get cube runtime functions
     cube_rt_funcs = [cube_rt_function.anchor, cube_rt_function.ifexpr]
     leaf_functions.update({

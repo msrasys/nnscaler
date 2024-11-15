@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 import functools
 import operator
+import importlib
 
 from types import MethodType, ModuleType
 from typing import Any, Dict, Optional, Type, List, Callable, Union, TYPE_CHECKING, Tuple
@@ -127,6 +128,23 @@ def _functions_in_module(module: ModuleType):
                 yield op, name
 
 
+# the functions that should never be wrapped
+# TODO:
+# currently we only have import_module, and should add more if needed
+# Putting these functions as leaf functions doesn't work
+# because
+#  1. We only wrap function calls via `ProxyCallTransformer`
+#  2. But some functions can be triggered by getattr (e.g. torch._dynamo)
+#  Two ways to fix this:
+#  1. Handle popular functions in `default_never_wrap_function` in a special way.
+#  2. Refine the `ProxyCallTransformer` to handle getattr as well.
+#  The second way is more general, but it's more complex and may introduce potential bugs.
+#  For now, we choose the first way as a quick fix.
+default_never_wrap_function: Dict[Callable, LeafWrapInfo] = {
+    orig_func.import_module: LeafWrapInfo([Location(importlib, 'import_module')], False, None)
+}
+
+
 # get all functions in the default_autowrap_modules and add them to default_autowrap_leaf_function
 default_autowrap_modules = (operator, math, torch, torch.functional, torch.nn.functional)
 for module in default_autowrap_modules:
@@ -220,7 +238,7 @@ def create_wrapped_leaf_class(clz, *, replace_cls: Optional[Callable]=None, defa
         x_value = int(x)
         new_x = torch.tensor([x_value, x_value])
         ...
-    
+
     Args:
         clz : the original class.
         replace_cls : forward the call to another function.
@@ -441,7 +459,7 @@ class map_wrapper_clz:
                     raise Exception('more than 1 tracer detected. please report the issue')
                 elif len(tracers) == 1:
                     return next(iter(tracers)).create_proxy('call_function', orig_func.tuple, (results,), {})
-            
+
             return orig_func.tuple(results)
 
     def __eq__(self, __o: object) -> bool:

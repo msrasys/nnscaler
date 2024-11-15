@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import collections
 import copy
+from functools import partial
 import sys
 import inspect
 import logging
@@ -640,8 +641,20 @@ class ConcreteTracer(TracerBase):
             wrapped = wrap_utils.create_wrapped_nn_module_func(self, mod, forward_function_name)
             self.wrapped_leaf[mod.forward] = ((wrap_utils.Location(mod, forward_function_name),), wrapped)
 
+        # make sure never_wrap_function are called right
+        def wrap_never_wrap_function(func, *args, **kwargs):
+            if self.patcher.patch_mode:
+                with self.patcher.revert():
+                    return func(*args, **kwargs)
+            else:
+                return func(*args, **kwargs)
+
         try:
             with self.patcher:
+                for func, leaf_info in wrap_utils.default_never_wrap_function.items():
+                    for loc in leaf_info.extra_locs:
+                        self.patcher.patch_method(loc.ns, loc.name, partial(wrap_never_wrap_function, func), deduplicate=True)
+
                 # allow duplicate patches to support the case of nested calls
                 self.patcher.patch_method(torch.nn.Module, "__getattribute__", wrap_utils.create_wrapped_module_getattribute(self), deduplicate=False)
 
@@ -661,7 +674,7 @@ class ConcreteTracer(TracerBase):
                 for obj, (positions, wrapped) in self.wrapped_leaf.items():
                     for loc in positions:
                         self.patcher.patch_method(loc.ns, loc.name, wrapped, deduplicate=False)
-                
+
                 wrap_utils.autowrap_check(self, fn_globals)
 
                 with OperatorPatcherContext(self, use_operator_patch, operator_patch_backlist):

@@ -8,6 +8,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 import pytest
+from torch.torch_version import TorchVersion
 
 from nnscaler.flags import CompileFlag
 import nnscaler.graph.function.dimops
@@ -1328,6 +1329,67 @@ def test_codegen_scalar_tensor(tmp_path):
         r"self\.register_buffer\('num_batches_tracked_\d+', torch\.empty\(\(\), dtype=torch\.int64\), persistent=True\)")
     assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
         r"self\.add_full_map\('num_batches_tracked_\d+', \d+, False, 'num_batches_tracked', \(\), \.\.\., 1\)")
+
+
+class ImportlibModel(torch.nn.Module):
+   def __init__(self):
+       super().__init__()
+       self.model = torch.nn.Linear(1024, 1024)
+
+   def forward(self, data):
+       import importlib
+       x = importlib.import_module('datetime')
+       r = self.model(data + x.datetime.now().year)
+       return torch.sum(r)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_importlib(tmp_path):
+    m = ImportlibModel()
+    m.train()
+    parallelize(
+        m,
+        {'data': torch.randn(1024, 1024)},
+        'dp',
+        ComputeConfig(1, 1),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    # should success
+    assert True
+
+
+class ImportlibModel2(torch.nn.Module):
+   def __init__(self):
+       super().__init__()
+       self.model = torch.nn.Linear(1024, 1024)
+
+   def forward(self, data):
+       torch._dynamo
+       r = self.model(data)
+       return torch.sum(r)
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.skipif(torch.torch_version.__version__ < (2,1,0), reason='torch._dynamo is not a valid import')
+def test_codegen_importlib2(tmp_path):
+    m = ImportlibModel2()
+    m.train()
+    parallelize(
+        m,
+        {'data': torch.randn(1024, 1024)},
+        'dp',
+        ComputeConfig(1, 1),
+        gen_savedir=tmp_path,
+        load_module=False,
+        reuse='override',
+    )
+    import  nnscaler.graph.tracer.orig_func as orig_func
+    import importlib
+    assert orig_func.import_module == importlib.import_module
+    # should success
+    assert True
 
 
 class ConvTranspose1DModule(torch.nn.Module):
