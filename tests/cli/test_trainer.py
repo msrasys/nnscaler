@@ -259,6 +259,9 @@ def trainer_last_checkpoint_worker(save_dir):
     gen_savedir = save_dir / 'gen'
     ckpt_savedir = save_dir / 'ckpt'
 
+    for i in range (100): # make a lot of fake checkpoints
+        (ckpt_savedir / f'0000-{i*15:04d}').mkdir(parents=True, exist_ok=True)
+
     trainer = Trainer([
         '-f', config_path,
         '--max_epochs', '1',

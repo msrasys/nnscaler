@@ -487,22 +487,25 @@ class Trainer:
         if len(checkpoints) <= self.train_args.checkpoint.keep_last_n_checkpoints:
             return
 
-        # (step, num) pairs
+        # (step, ckpt_name) pairs
         checkpoint_info = [(int(p.split('-')[1]), p) for p in checkpoints]
         checkpoint_info.sort()
-        expire_list = checkpoint_info[:-self.train_args.checkpoint.keep_last_n_checkpoints]
+        expire_list = [c[1] for c in checkpoint_info[:-self.train_args.checkpoint.keep_last_n_checkpoints]]
 
         best_ckpt = save_dir / CHECKPOINT_BEST_DIR_NAME
-        if best_ckpt.exists():
-            for p in best_ckpt.glob('*.ckpt'):
+        last_ckpt = save_dir / CHECKPOINT_LAST_DIR_NAME
+        for ckpt_dir in [best_ckpt, last_ckpt]:
+            if not ckpt_dir.exists():
+                continue
+            for p in ckpt_dir.glob('*.ckpt'):
                 if p.is_symlink():
                     ckpt_name = p.resolve().parent.name
                     if ckpt_name in expire_list:
                         expire_list.remove(ckpt_name)
-                        logger.info('Keep old checkpoint `%s` because it is the best.', ckpt_name)
+                        logger.info('Keep old checkpoint `%s` because it is symbol linked in best or last.', ckpt_name)
                 break # just check the first file is enough
 
-        for _, ckpt_name in expire_list:
+        for ckpt_name in expire_list:
             logger.info('Removing old checkpoint: %s', ckpt_name)
             shutil.rmtree(save_dir / ckpt_name)
 
@@ -777,26 +780,17 @@ class Trainer:
         epoch_desc = f'Epoch {format(epoch, epoch_format)}'
 
         if self.rank == 0:
-            progress = tqdm(
-                None,
+            data_iter = tqdm(
+                data_iter,
                 total=self.total_train_steps_per_epoch,
                 initial=resume_from_idx,
                 desc=epoch_desc,
                 disable=not self.train_args.enable_progress_bar,
             )
-        else:
-            progress = None
 
         step_stat: Optional[_StepStat] = None
         for i, batches in data_iter:
             idx = i + resume_from_idx
-
-            if self.rank == 0:
-                # looks manually update progress bar is easier
-                # than using tqdm directly
-                # the difference is we update progress bar at the beginning of the loop
-                # instead of the end of the loop
-                progress.update(1)
             step_start_at = time.perf_counter()
             step_stat = _StepStat()
             step_metrics = {}
@@ -873,7 +867,7 @@ class Trainer:
             step_metrics['train_wall'] = time.perf_counter() - step_start_at
             self.log_metrics(step_metrics, tag='train')
             if self.rank == 0:
-                progress.set_postfix(step_metrics)
+                data_iter.set_postfix(step_metrics)
                 if self.train_args.enable_log_progress \
                     and self.train_status.finished_train_steps % self.train_args.log_progress_every_n_train_steps == 0:
                     logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics))
@@ -895,8 +889,8 @@ class Trainer:
                     has_validated = VAL_STATUS_SAVE
                 if self.rank == 0:
                     # disable refresh the progress bar to avoid redundant progress bar
-                    progress.leave = False
-                    progress.close()
+                    data_iter.leave = False
+                    data_iter.close()
                 break
 
             if not has_validated and self.train_args.val_every_n_train_steps and \

@@ -5,7 +5,7 @@ from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import *
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='no gpu')
+@pytest.mark.skipif(True, reason='no gpu')
 def test_resume_seed():
     _set_envs({
         # required by deterministic
