@@ -256,6 +256,7 @@ class SignFx2Op:
         # runtime functions
         __rtemplate('anchor'): function.GraphAnchor,
         __rtemplate('ifexpr'): function.Ifexpr,
+        __rtemplate('fold_constant'): function.FoldConstant,
         __rtemplate('identity'): function.Identity,
         __rtemplate('multiref'): function.MultiRef,
         __rtemplate('accum'): function.Accum,

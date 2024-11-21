@@ -252,7 +252,12 @@ class ConcreteAttrProxy(ConcreteProxy):
         self.root = root
         self.attr = attr
         self.tracer = root.tracer
-        self._node: Optional[Node] = None
+        # In previous version, the node creation is done lazily.
+        # But when we support scoped context,
+        # Lazy creation of node will cause the node to be created in the wrong context.
+        # Please note unused nodes can still be removed by DCE later.
+        self._node: Node = self.tracer.create_proxy(
+                'call_function', orig_func.getattr, (self.root, self.attr), {}).node
         if orig_func.isinstance(root.value, torch.Tensor) and attr == 'is_cuda':
             self.value = True
         elif orig_func.isinstance(root.value, torch.Tensor) and attr == 'device':
@@ -272,11 +277,6 @@ class ConcreteAttrProxy(ConcreteProxy):
 
     @property
     def node(self):
-        # the node for attributes is added lazily, since most will just be method calls
-        # which do not rely on the getitem call
-        if self._node is None:
-            self._node = self.tracer.create_proxy(
-                'call_function', orig_func.getattr, (self.root, self.attr), {}).node
         return self._node
 
     def __call__(self, *args, **kwargs):

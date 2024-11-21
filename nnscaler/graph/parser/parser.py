@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, List, Tuple, Callable, Union, Dict, Type, Optional
 
 import nnscaler
+from nnscaler.utils import fields
+from nnscaler.graph.tracer.metadata import OpContext
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.ir.tensor import IRFullTensor
 from nnscaler.ir.cten import IRObject, IRCell, IRTensor
@@ -193,6 +195,16 @@ class FxModuleParser:
         input_vals = FxModuleParser.parse_complex(list(node.args), frame)
         kwargs = FxModuleParser.parse_complex(node.kwargs, frame)
 
+        # use context constant_folding if set
+        # Please note constant_folding only controls the output of the op
+        # For op inputs, we will not fold/unfold them
+        # when we enter the code block with different constant folding setting
+        # as a workaround,
+        # you can use `nnscaler.runtime.function.fold_constant` to fold inputs if needed
+        op_context: Optional[Dict[str, Any]] = node.meta.get('op_context')
+        if op_context is not None and op_context.get(fields(OpContext).constant_folding) is not None:
+            constant_folding = op_context[fields(OpContext).constant_folding]
+
         if SignFx2Op.exist(fsig):
             ir_node = SignFx2Op.map(fsig)(*input_vals, **kwargs)
         else:
@@ -330,6 +342,7 @@ class FxModuleParser:
         if not isinstance(ir_node, IRCell):
             return
 
+        ir_node.op_context = node.meta.get('op_context')
         module_stack = node.meta.get('nn_module_stack')
         ir_node.module_stack = module_stack
         comment = str(node.meta.get('frame_record', ''))

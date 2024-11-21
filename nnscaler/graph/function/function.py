@@ -94,6 +94,15 @@ def Ifexpr(cond: Any, true_value: Any, false_value: Any, signature = None) -> IR
     )
 
 
+def FoldConstant(value: Any, signature = None):
+    if any_ir_object_satisfy(value, lambda x: isinstance(x, IRTensor)):
+        raise ValueError("FoldConstant doesn't support IRTensor")
+
+    # always return a constant
+    # no node will be created
+    return IRObject.try_unwrap(value)
+
+
 def MultiRef(tensor: IRTensor, times: int, signature = None):
     """
     nnscaler.runtime.function.multiref(itensor: torch.Tensor, times: int) -> Tuple[torch.Tensor]

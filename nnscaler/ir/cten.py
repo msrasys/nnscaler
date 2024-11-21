@@ -77,6 +77,8 @@ class IRCell:
         self._comment: Optional[str] = None
         # the module stack that preserves the hierarchy information
         self._module_stack: Optional[OrderedDict[str, Any]] = None
+        # the operation context information
+        self._op_context: Optional[Dict[str, Any]] = None
 
     @property
     def cid(self) -> int:
@@ -383,6 +385,14 @@ class IRCell:
         Set the module stack
         """
         self._module_stack = stack
+
+    @property
+    def op_context(self) -> Optional[Dict[str, Any]]:
+        return self._op_context
+
+    @op_context.setter
+    def op_context(self, context: Optional[Dict[str, Any]]):
+        self._op_context = context
 
     def __repr__(self) -> str:
         """

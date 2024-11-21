@@ -14,10 +14,11 @@ class SimpleModel(torch.nn.Module):
         super().__init__()
         self.fc1 = torch.nn.Linear(10, 5)
         self.fc2 = torch.nn.Linear(10, 5)
-    
+
     def forward(self, x):
         Result = namedtuple('Result', ['r1', 'r2'])
         return Result(self.fc1(x), self.fc2(x))
+
 
 @replace_all_device_with('cpu')
 def test_namedtuple():

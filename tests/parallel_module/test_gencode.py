@@ -3,6 +3,7 @@
 
 import inspect
 import tempfile
+import re
 from contextlib import nullcontext
 
 import torch
@@ -1547,3 +1548,131 @@ def test_codegen_function_to(tmp_path):
     assert _gencode_contains(tmp_path, FunctionToModule, 0, r'to_\d+ = torch\.Tensor\.to\(x_\d+\)')
     # to_1_22 = torch.Tensor.to(linear_26, copy=True, dtype=torch.float32)
     assert _gencode_contains(tmp_path, FunctionToModule, 0, r'torch\.Tensor\.to([^, ]*, copy=True, dtype=torch.float32)')
+
+
+class CCFModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(3, 3)
+        self.linear2 = torch.nn.Linear(3, 3)
+        self.linear3 = torch.nn.Linear(3, 3)
+        self.linear4 = torch.nn.Linear(3, 3)
+        self.linear5 = torch.nn.Linear(3, 3)
+        self.linear6 = torch.nn.Linear(3, 3)
+        self.linear7 = torch.nn.Linear(3, 3)
+        self.linear8 = torch.nn.Linear(3, 3)
+
+    def forward(self, a: torch.Tensor):
+        ashape = a.shape[0]  # not folded
+        b = self.linear1(a) + ashape
+        bshape = b.shape[0]  # not folded
+        with nnscaler.constant_folding():
+            d = self.linear3(b) + ashape
+            dshape = d.shape[0]  # folded
+            e = self.linear4(d) + dshape + bshape + ashape
+            with nnscaler.no_constant_folding():
+                f = self.linear5(e) + dshape + bshape + ashape
+                fshape = f.shape[0]  # not folded
+                g = self.linear6(f) + fshape + dshape + bshape + ashape
+            gshape = g.shape[0]  # folded
+            h = self.linear7(g) + gshape + fshape + dshape + bshape + ashape
+        hshape = h.shape[0]
+        i = self.linear8(h) + hshape + gshape + fshape + dshape + bshape + ashape
+        return i
+
+
+@replace_all_device_with('cpu')
+def test_constant_folding_context(tmp_path):
+    parallelize(
+        CCFModule(),
+        {'a': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+        'dp',
+        ComputeConfig(1, 1, constant_folding=False),
+        gen_savedir=tmp_path,
+        load_module=False
+    )
+    # Just check all torch.add code
+    add_codes = _gencode_contains(tmp_path, CCFModule, 0, r'.*torch\.add.*')
+    assert len(add_codes) == 23
+
+    not_folded_names = ['ashape', 'bshape', 'fshape', 'hshape']
+    folded_names = ['dshape', 'gshape']
+
+    def check_op(*names):
+        for name in names:
+            code = add_codes.pop(0)
+            if name in not_folded_names:
+                assert re.match(r'\s*add_.* = torch\.add\((linear|add)_.*, getitem_.*, alpha=1\)', code)
+            else:
+                assert re.match(r'\s*add_.* = torch\.add\((linear|add)_.*, 2, alpha=1\)', code)
+
+    # b = self.linear1(a) + ashape
+    check_op('ashape')
+    # d = self.linear3(b) + ashape
+    check_op('ashape')
+    # e = self.linear4(d) + dshape + bshape + ashape
+    check_op('dshape', 'bshape', 'ashape')
+    # f = self.linear5(e) + dshape + bshape + ashape
+    check_op('dshape', 'bshape', 'ashape')
+    # g = self.linear6(f) + fshape + dshape + bshape + ashape
+    check_op('fshape', 'dshape', 'bshape', 'ashape')
+    # h = self.linear7(g) + gshape + fshape + dshape + bshape + ashape
+    check_op('gshape', 'fshape', 'dshape', 'bshape', 'ashape')
+    # i = self.linear8(h) + hshape + gshape + fshape + dshape + bshape + ashape
+    check_op('hshape', 'gshape', 'fshape', 'dshape', 'bshape', 'ashape')
+
+    assert not add_codes
+
+
+class CCFModule2(torch.nn.Module):
+    def __init__(self, fold_input=False):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(3, 3)
+        self.fold_input = fold_input
+
+    def forward(self, a: torch.Tensor):
+        from nnscaler.runtime.function import fold_constant
+        ashape = a.shape[0]  # not folded
+        ashape2 = a.shape[1] # not folded
+        ashape3 = ashape + ashape2 # not folded
+        with nnscaler.constant_folding():
+            if self.fold_input:
+                ashape = fold_constant(ashape)
+            b = self.linear1(a) + ashape
+            if self.fold_input:
+                # check if the constant folding is correctly applied to tuple
+                # here we have 3 constants to fold
+                # In graph, it will be two nodes `fold_constant` and `getitem`
+                ashape, ashape2, ashape3 = fold_constant((ashape, ashape2, ashape3))
+            b  = b * ashape * ashape2 * ashape3
+        return b
+
+
+@replace_all_device_with('cpu')
+@pytest.mark.parametrize('fold_input', [False, True])
+def test_fold_constant(tmp_path, fold_input):
+    parallelize(
+        CCFModule2(fold_input),
+        {'a': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+        'dp',
+        ComputeConfig(1, 1, constant_folding=False),
+        gen_savedir=tmp_path,
+        reuse='override',
+        load_module=False
+    )
+    if fold_input:
+        # add_28 = torch.add(linear_31, 2, alpha=1)
+        assert _gencode_contains(tmp_path, CCFModule2, 0,
+                                 r'add_.* = torch\.add\(linear_.*, 2, alpha=1\)')
+        # b  = b * ashape3
+        # mul_2_59 = torch.mul(mul_1_65, 5)
+        assert _gencode_contains(tmp_path, CCFModule2, 0,
+                                 r'mul_.* = torch\.mul\(mul_.*, 5\)')
+    else:
+        # add_27 = torch.add(linear_30, getitem_20, alpha=1)
+        assert _gencode_contains(tmp_path, CCFModule2, 0,
+                                 r'add_.* = torch\.add\(linear_.*, getitem_.*, alpha=1\)')
+        # b  = b * ashape3
+        # mul_2_51 = torch.mul(mul_1_57, add_38)
+        assert _gencode_contains(tmp_path, CCFModule2, 0,
+                                 r'mul_.* = torch\.mul\(mul_.*, add_.*\)')

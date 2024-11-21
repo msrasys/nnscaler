@@ -37,7 +37,7 @@ from . import concrete_proxy as ep
 from . import pytree_utils, orig_func, wrap_utils
 from .frame_utils import get_frame_record
 from .function_patcher import FunctionPatcher
-from .metadata import EmptyResult, extract_results_metadata
+from .metadata import EmptyResult, extract_results_metadata, get_op_context
 from .operator_patcher import OperatorPatcherContext
 from .torch_fx_patcher import TorchFXPatcher, ExtraSEFPatcher, side_effectful_inplace_ops
 from .trace_strategy import TRACE_STRATEGY
@@ -148,6 +148,7 @@ class ConcreteTracer(TracerBase):
             check_for_mutable_operation(target, args, kwargs)
 
         node = self.graph.create_node(kind, target, args, kwargs, name, type_expr)
+        node.meta['op_context'] = get_op_context()
         # TODO node_name_to_scope will be depricated in favor of
         # node.meta['nn_module_stack']
         self.node_name_to_scope[node.name] = (

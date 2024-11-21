@@ -1,9 +1,10 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+from dataclasses import dataclass
 import pytest
 
-from nnscaler.utils import select_many, classproperty
+from nnscaler.utils import select_many, classproperty, fields
 
 
 def test_select_many():
@@ -40,3 +41,15 @@ def test_classproperty_dict():
     x[1] = 2
     assert A.cfg == {1: 2}
     assert id(A().cfg) == id(x)
+
+
+def test_fields():
+    @dataclass
+    class A:
+        x: int
+        y: int
+
+    assert fields(A).x == 'x'
+    assert fields(A).y == 'y'
+    with pytest.raises(AttributeError):
+        fields(A).z

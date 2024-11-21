@@ -91,7 +91,11 @@ def to_fx_graph(model: torch.nn.Module, dummy_input) -> torch.fx.GraphModule:
     })
 
     # get cube runtime functions
-    cube_rt_funcs = [cube_rt_function.anchor, cube_rt_function.ifexpr]
+    cube_rt_funcs = [
+        cube_rt_function.anchor,
+        cube_rt_function.ifexpr,
+        cube_rt_function.fold_constant
+    ]
     leaf_functions.update({
         func: LeafWrapInfo([Location(cube_rt_function, func.__name__)], True, None)
         for func in cube_rt_funcs

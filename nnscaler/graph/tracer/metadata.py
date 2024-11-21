@@ -2,6 +2,8 @@
 #  Licensed under the MIT License.
 
 from typing import Any, Dict, NamedTuple, Optional, Tuple
+from dataclasses import dataclass, asdict
+import copy
 
 import torch
 from torch.fx.node import Node
@@ -18,6 +20,26 @@ class EmptyResult:
     Used for identification no results.
     """
     pass
+
+
+@dataclass
+class OpContext:
+    """
+    OpContext is a dataclass that holds the context of an operation.
+
+    Args:
+        constant_folding: Whether constant folding is enabled.
+        Please note we will not unfold/fold inputs
+            when we enter the code block with different constant folding setting.
+    """
+    constant_folding: Optional[bool] = None
+
+
+_GLOBAL_OP_CONTEXT = OpContext()
+
+
+def get_op_context() -> OpContext:
+    return asdict(_GLOBAL_OP_CONTEXT)
 
 
 class TensorMetadata(NamedTuple):
