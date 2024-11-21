@@ -3,62 +3,50 @@ import pytest
 import torch
 from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import *
+from tests.launch_torchrun import launch_torchrun
 
 
-@pytest.mark.skipif(True, reason='no gpu')
-def test_resume_seed():
-    _set_envs({
-        # required by deterministic
-        'CUBLAS_WORKSPACE_CONFIG': ':4096:8',
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='no gpu')
+def test_resume_seed(tmp_path):
+    launch_torchrun(1, resume_seed_worker, tmp_path)
 
-        # fake torchrun environment, check https://pytorch.org/docs/stable/elastic/run.html#environment-variables
-        'LOCAL_RANK': 0,
-        'RANK': 0,
-        'GROUP_RANK': 0,
-        'LOCAL_WORLD_SIZE': 1,
-        'WORLD_SIZE': 1,
-        'MASTER_ADDR': 'localhost',
-        'MASTER_PORT': 29470,
-        'TORCHELASTIC_RUN_ID': 'UT',
-    })
 
+def resume_seed_worker(tmp_path):
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
     torch.use_deterministic_algorithms(True)
 
     # compile separately because run multiple trainers in one process will confuse `gen_reuse`
-    _compile()
-
-    _test_resume_seed(steps_per_epoch=100, max_steps=20, resume_at=10)
-
-    _test_resume_seed(steps_per_epoch=5, max_steps=20, resume_at=10)
-
-    _restore_envs()
+    _compile(tmp_path)
+    _test_resume_seed(tmp_path, steps_per_epoch=100, max_steps=20, resume_at=10)
+    _test_resume_seed(tmp_path, steps_per_epoch=5, max_steps=20, resume_at=10)
 
 
-def _test_resume_seed(steps_per_epoch, max_steps, resume_at):
+def _test_resume_seed(tmp_path, steps_per_epoch, max_steps, resume_at):
     # no resume
-    model_1 = _train(steps_per_epoch, max_train_steps=max_steps, resume_from=None)
+    model_1 = _train(tmp_path, steps_per_epoch, max_train_steps=max_steps, resume_from=None)
     weight_1 = next(model_1.parameters()).data
 
     # resume
-    _train(steps_per_epoch, max_train_steps=resume_at, resume_from=None)
-    model_2 = _train(steps_per_epoch, max_train_steps=max_steps, resume_from='last')
+    _train(tmp_path, steps_per_epoch, max_train_steps=resume_at, resume_from=None)
+    model_2 = _train(tmp_path, steps_per_epoch, max_train_steps=max_steps, resume_from='last')
     weight_2 = next(model_2.parameters()).data
 
     assert torch.equal(weight_1, weight_2)
 
     ## resume without resuming seeds
-    _train(steps_per_epoch, max_train_steps=resume_at, resume_from=None)
-    _remove_rng_states()
-    model_3 = _train(steps_per_epoch, max_train_steps=max_steps, resume_from='last')
+    _train(tmp_path, steps_per_epoch, max_train_steps=resume_at, resume_from=None)
+    _remove_rng_states(tmp_path)
+    model_3 = _train(tmp_path, steps_per_epoch, max_train_steps=max_steps, resume_from='last')
     weight_3 = next(model_3.parameters()).data
 
     assert not torch.equal(weight_1, weight_3)
 
 
-def _compile():
+def _compile(tmp_path):
     trainer_args = TrainerArgs(
         compute_config=ComputeConfig(plan_ngpus=1, runtime_ngpus=1, use_end2end=True),
         gen_reuse='override',
+        gen_savedir=tmp_path/'src',
         run_mode='compile',
         model=ModelConfig(type=Model),
         optimizer=OptimizerConfig(type=torch.optim.AdamW),
@@ -71,13 +59,14 @@ def _compile():
     trainer.run()
 
 
-def _train(steps_per_epoch, max_train_steps, resume_from):
+def _train(tmp_path, steps_per_epoch, max_train_steps, resume_from):
     trainer_args = TrainerArgs(
+        gen_savedir=tmp_path/'src',
         compute_config=ComputeConfig(plan_ngpus=1, runtime_ngpus=1, use_end2end=True),
         model=ModelConfig(type=Model),
         optimizer=OptimizerConfig(type=torch.optim.AdamW),
         dataset=DatasetConfig(type=RandomDataset, train_args={'length': steps_per_epoch}),
-        checkpoint=CheckpointConfig(resume_from=resume_from),
+        checkpoint=CheckpointConfig(resume_from=resume_from, save_dir=tmp_path/'checkpoints'),
         max_train_steps=max_train_steps,
         enable_progress_bar=False,
         seed=0,
@@ -87,27 +76,11 @@ def _train(steps_per_epoch, max_train_steps, resume_from):
     return trainer.model
 
 
-def _remove_rng_states():
-    ckpt_path = 'checkpoints/last/0.ckpt'
+def _remove_rng_states(tmp_path):
+    ckpt_path = tmp_path / 'checkpoints/last/0.ckpt'
     ckpt = torch.load(ckpt_path, weights_only=False)
     ckpt['rng_states'] = None
     torch.save(ckpt, ckpt_path)
-
-
-_backup_envs = {}
-
-def _set_envs(envs):
-    _backup_envs.clear()
-    for key, value in envs.items():
-        _backup_envs[key] = os.environ.get(key, None)
-        os.environ[key] = str(value)
-
-def _restore_envs():
-    for key, value in _backup_envs.items():
-        if value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = value
 
 
 class Model(torch.nn.Module):
