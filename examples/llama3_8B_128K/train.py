@@ -227,6 +227,7 @@ def main(args):
         checkpoint=checkpoint_config,
         precision='bf16',
         max_epochs=2,
+        max_train_steps=args.max_train_steps,
         grad_accumulation_steps=4,
         log=[log_config],
         seed=0,
@@ -296,6 +297,16 @@ if __name__ == '__main__':
         type=str,
         help='trace strategy control the function execution during tracing model graph, `cuda_run_cpu_offload` and `reuse_cache` are recommended, please read `docs/source/parallel_module.md` for more information',
     )
+    parser.add_argument(
+        '--max_train_steps',
+        default=None,
+        type=int,
+        help='max training steps',
+    )
     args = parser.parse_args()
+
+    if os.getenv('DETERMINISTIC'):  # reduce randomness for integration test
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+        torch.use_deterministic_algorithms(True)
 
     main(args)

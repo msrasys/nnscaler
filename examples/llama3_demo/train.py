@@ -271,4 +271,8 @@ def main():
 
 
 if __name__ == '__main__':
+    if os.getenv('DETERMINISTIC'):  # reduce randomness for integration test
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+        torch.use_deterministic_algorithms(True)
+
     main()
