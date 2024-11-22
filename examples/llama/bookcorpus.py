@@ -11,7 +11,7 @@ import torch
 
 
 def get_tokenizer(model_path):
-    return AutoTokenizer.from_pretrained(model_path)
+    return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
 
 def tokenize(sample: Dict[str, str], tokenizer: PreTrainedTokenizer, text_key: str):

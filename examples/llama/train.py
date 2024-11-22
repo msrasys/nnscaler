@@ -59,19 +59,31 @@ def get_tokenizer(tokenizer_name_or_path,
 
 
 class WrapperModel(torch.nn.Module):
-    def __init__(self, model_id):
+    def __init__(self, model_id, enable_chunk_loss):
         super().__init__()
         self.model = AutoModelForCausalLM.from_pretrained(model_id, attn_implementation='flash_attention_2')
+        self.enable_chunk_loss = enable_chunk_loss
 
     def forward(self, samples):
-        outputs = self.model.model(
-            input_ids=samples['net_input']['src_tokens'],
-            use_cache=False,
-            return_dict=False,
-        )
-        hidden_states = outputs[0]
-        losses = chunk_linear_cross_entropy(hidden_states, self.model.lm_head.weight, samples['target'], IGNORE_IDX, 1024)
-        loss = torch.sum(losses)
+        if self.enable_chunk_loss:
+            outputs = self.model.model(
+                input_ids=samples['net_input']['src_tokens'],
+                use_cache=False,
+                return_dict=False,
+            )
+            hidden_states = outputs[0]
+            losses = chunk_linear_cross_entropy(hidden_states, self.model.lm_head.weight, samples['target'], IGNORE_IDX, 1024)
+            loss = torch.sum(losses)
+        else:
+            outputs = self.model(
+                input_ids=samples['net_input']['src_tokens'],
+                use_cache=False,
+                return_dict=False,
+            )
+            logits = outputs[0].view(-1, outputs[0].size(-1))
+            labels = samples['target'].view(-1)
+            normalized_logits = torch.nn.functional.log_softmax(logits, dim=-1, dtype=torch.float32)
+            loss = torch.nn.functional.nll_loss(normalized_logits, labels, reduction='sum', ignore_index=IGNORE_IDX)
         return loss, loss.data, samples['ntokens'], samples['nsentences']
 
 
@@ -126,9 +138,10 @@ def main(args):
         shift_labels = mini_batch['labels'][..., 1:]
         _mini_batch['labels'] = torch.nn.functional.pad(shift_labels, (0, 1), 'constant', IGNORE_IDX).contiguous()
 
+        # cast `nsentences` and `ntokens` to tensor since current pipeline parallelism can only transfer data in tensor format
         return {
-            "nsentences": len(samples),
-            "ntokens": len(samples) * seq_len,
+            "nsentences": torch.tensor(len(samples), dtype=torch.long),
+            "ntokens": torch.tensor(len(samples) * seq_len, dtype=torch.long),
             "net_input": _mini_batch,
             "target": _mini_batch.pop('labels'),
         }
@@ -156,12 +169,11 @@ def main(args):
         constant_folding=True,
         use_zero=True,
         use_end2end=True,
-        # autodist config:
-        # - memory constraint default value is 64GB
-        # - recompute by the transformer layer in Llama
         pas_config={
             'mem_constraint': args.gpu_mem_constraint,
-            'recompute_modules': 'LlamaDecoderLayer',
+            'explore_pipeline': args.explore_pipeline,
+            'pipeline_pivots': args.pipeline_pivots,
+            'recompute_modules': args.recompute_modules,
         },
         trace_strategy=args.trace_strategy,
     )
@@ -170,6 +182,7 @@ def main(args):
         type=WrapperModel,
         args={
             'model_id': args.model_id,
+            'enable_chunk_loss': args.enable_chunk_loss,
         },
     )
 
@@ -197,7 +210,7 @@ def main(args):
 
     sampler_config = DatasetSamplerConfig(
         train_args={
-            'shuffle': False,
+            'shuffle': True,
         },
     )
 
@@ -227,8 +240,8 @@ def main(args):
         checkpoint=checkpoint_config,
         precision='bf16',
         max_epochs=2,
+        grad_accumulation_steps=args.grad_accumulation_steps,
         max_train_steps=args.max_train_steps,
-        grad_accumulation_steps=4,
         log=[log_config],
         seed=0,
         broadcast_strategy=broadcast_strategy,
@@ -245,7 +258,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--name',
-        default='llama3-8b',
+        default='llama',
         type=str,
         help='name of the experiment',
     )
@@ -298,12 +311,42 @@ if __name__ == '__main__':
         help='trace strategy control the function execution during tracing model graph, `cuda_run_cpu_offload` and `reuse_cache` are recommended, please read `docs/source/parallel_module.md` for more information',
     )
     parser.add_argument(
+        '--enable-chunk-loss',
+        action='store_true',
+        help='enable chunk loss that exchanges the speed of training for the memory usage',
+    )
+    parser.add_argument(
+        '--explore_pipeline',
+        action='store_true',
+        help='explore pipeline parallelism in autodist',
+    )
+    parser.add_argument(
+        '--pipeline_pivots',
+        default='',
+        type=str,
+        help='specify the pipeline pivots for autodist',
+    )
+    parser.add_argument(
+        '--recompute_modules',
+        default='',
+        type=str,
+        help='specify the modules to recompute in autodist',
+    )
+    parser.add_argument(
+        '--grad_accumulation_steps',
+        default=4,
+        type=int,
+        help='number of gradient accumulation steps',
+    )
+    parser.add_argument(
         '--max_train_steps',
         default=None,
         type=int,
         help='max training steps',
     )
     args = parser.parse_args()
+    if args.explore_pipeline and not args.pipeline_pivots:
+        raise ValueError('pipeline_pivots must be specified when explore_pipeline is enabled')
 
     if os.getenv('DETERMINISTIC'):  # reduce randomness for integration test
         os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
