@@ -52,7 +52,7 @@ if __name__ == '__main__':
     save_path = args.save_path
     sequence_length = args.sequence_length
 
-    raw_dataset = load_dataset(data_path_or_name)["train"]
+    raw_dataset = load_dataset(data_path_or_name, trust_remote_code=True)["train"]
     tokenizer = get_tokenizer(tokenizer_path_or_name)
     dataset = create_dataset(tokenizer, raw_dataset, "text", sequence_length)
     dataset.save_to_disk(save_path)
