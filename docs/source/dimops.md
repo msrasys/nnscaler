@@ -1,10 +1,10 @@
-# Dimop Tutorial
+# Dimops
 
 ## Dimop: Dimension-annotated Operator
 
 ### Annotation for Shape Inference and Transformation
 
-SuperScaler uses annotation to represent an operator (Dimop).
+nnScaler uses annotation to represent an operator (Dimop).
 The goal of annotation is for 1). shape inference and 2) transformation plan.
 
 To annotate an operator, following example shows the annotation of matrix multiplication. An operator has inputs and outputs. The inputs can be tensors or non-tensors, while outputs are usually tensors.

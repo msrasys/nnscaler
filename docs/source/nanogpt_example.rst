@@ -1,6 +1,6 @@
-###############
-nanoGPT Example
-###############
+#########################
+nanoGPT Lightning Example
+#########################
 
 This is an example showing how to parallelize `nanoGPT <https://github.com/karpathy/nanoGPT>`_
 with nnScaler and `Lightning <https://lightning.ai/docs/pytorch/stable/>`_ trainer.
@@ -14,23 +14,17 @@ Get Started
 Installation
 ============
 
-1. Install nnScaler ::
+1. Clone nnScaler repo ::
 
-    pip install nnscaler
+    git clone --recursive https://github.com/microsoft/nnscaler
 
-2. Clone nnScaler repo to get the example ::
+2. Install dependencies (including nanoGPT's dependencies) and :doc:`nnScaler from source <install_from_source>` ::
 
-    git clone --recursive https://msrasrg.visualstudio.com/SuperScaler/_git/MagicCube
-    cd MagicCube/examples/nanogpt
-
-..
-    FIXME: update url to github?
-
-3. Install nanoGPT's dependencies ::
-
+    cd nnscaler
     pip install -r requirements.txt
+    pip install -e .
 
-4. Prepare dataset ::
+3. Prepare dataset ::
 
     python nanoGPT/data/shakespeare_char/prepare.py
 
@@ -47,7 +41,7 @@ It will take several minutes and the best validation loss will be around 1.47.
 Get Distributed
 ===============
 
-nnScaler is meant for distribution. For v0.1 release, we are focusing on data parallel.
+nnScaler is meant for distribution. For the current release, we are focusing on data parallel.
 
 If you have 4 GPUs on one node: ::
 
@@ -64,7 +58,7 @@ NOTE: The local batch size is fixed by default, so using more workers will resul
 Tensor Parallel (Experimental)
 ==============================
 
-nnScaler will support tensor parallel and hybrid parallel in the next release.
+nnScaler will support tensor parallel and hybrid parallel in following release.
 You can try this feature now, but its stability and parity has not been strictly verified yet.
 
 Using data parallel: (each model instance runs on 1 GPU, 4 instances using DP) ::
@@ -82,7 +76,7 @@ Using hybrid parallel: (each model instance runs on 2 GPUs, 2 instances using DP
 Resuming
 ========
 
-You may resume a interrupted training: ::
+You may resume an interrupted training: ::
 
     torchrun --standalone --nproc_per_node=1 train_nnscaler.py nanoGPT/config/train_shakespeare_char.py --init_from=resume
 
@@ -141,7 +135,7 @@ To parallelize the lightning model with nnScaler, there are 2 noteworthy places:
 
    Other parameters are used for performance (efficiency) tuning.
 
-For details, please check the :doc:`API reference <parallel_module>`.
+.. For details, please check the :doc:`API reference <parallel_module>`.
 
 **********************
 Parity and Limitations
@@ -188,6 +182,6 @@ The Lightning Port
 The Lightning port is not exactly the same as the original nanoGPT training script for the following reaons:
 
 1. The Lightning ``Trainer`` is different from nanoGPT's training loop.
-2. nnScaler v0.1 lacks the support for multiple parameter groups, and therefore the weight decay is configured for all parameters.
+2. nnScaler currently lacks the support for multiple parameter groups, and therefore the weight decay is configured for all parameters.
 
 .. image:: ./images/nanogpt-curves-orig.png

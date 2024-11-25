@@ -30,4 +30,9 @@ exclude_patterns = []
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = 'furo'
-# html_static_path = ['_static']
+html_logo = './images/nnScaler-c-1.png'
+
+html_static_path = ['_static']
+html_css_files = ['nnscaler.css']
+
+mathjax3_config = {'chtml': {'displayAlign': 'left'}}

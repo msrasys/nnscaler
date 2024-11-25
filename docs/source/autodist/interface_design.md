@@ -1,11 +1,11 @@
-# Interface Design
+# AutoDist Interface Design
 
-Similar to current user experiences in cube, the entrance to *AutoDist* is a function that accept a data flow graph and a resource descriptor as input. The function returns a rewritten graph. The core modules including
+Similar to current user experiences in nnScaler, the entrance to *AutoDist* is a function that accepts a data flow graph and a resource descriptor as input. The function returns a rewritten graph. The core modules include:
 1. *profile*: build cost models to provide the underlying solver with operator and communication information
 2. *dp_solver*: encapsulate existing dynamic programming logic
 
 ```python
-from cube.graph import IRGraph
+from nnscaler.graph import IRGraph
 
 def annotate_graph(graph: IRGraph) -> AnnotatedIRGraph:
     # TODO

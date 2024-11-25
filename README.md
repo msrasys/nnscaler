@@ -33,13 +33,13 @@ For **_DNN system experts_**, they can leverage nnScaler to explore new DNN para
 
 ### Prerequisite
 
-Install the following packages before the installation of cube:
+Install the following packages before the installation of nnScaler:
 
     Python >= 3.8, < 3.11 (3.10 is recommanded)
 
     PyTorch >= 2.0, < 2.4 (2.2.0 is recommanded)
 
-### (Option 1) Install nnScaler from source
+### Install nnScaler from source
 Execute below commands in nnScaler directory:
 
     pip install -r requirements.txt
@@ -52,11 +52,6 @@ Besides, to avoid *cppimport* error, it also needs to include nnScaler directory
 
 [//]: # (Reference output: Successfully installed MarkupSafe-2.1.5 contourpy-1.3.0 cppimport-22.8.2 cycler-0.12.1 dill-0.3.8 filelock-3.15.4 fonttools-4.53.1 fsspec-2024.6.1 importlib-resources-6.4.4 jinja2-3.1.4 kiwisolver-1.4.5 mako-1.3.5 matplotlib-3.9.2 more-itertools-10.4.0 mpmath-1.3.0 networkx-3.3 numpy-2.1.0 nvidia-cublas-cu12-12.1.3.1 nvidia-cuda-cupti-cu12-12.1.105 nvidia-cuda-nvrtc-cu12-12.1.105 nvidia-cuda-runtime-cu12-12.1.105 nvidia-cudnn-cu12-9.1.0.70 nvidia-cufft-cu12-11.0.2.54 nvidia-curand-cu12-10.3.2.106 nvidia-cusolver-cu12-11.4.5.107 nvidia-cusparse-cu12-12.1.0.106 nvidia-nccl-cu12-2.20.5 nvidia-nvjitlink-cu12-12.6.68 nvidia-nvtx-cu12-12.1.105 packaging-24.1 pillow-10.4.0 psutil-6.0.0 pulp-2.9.0 pybind11-2.13.5 pyparsing-3.1.4 python-dateutil-2.9.0.post0 pyyaml-6.0.2 six-1.16.0 sympy-1.13.2 torch-2.4.0 tqdm-4.66.5 triton-3.0.0 typing-extensions-4.12.2)
 
-### (Option 2) Install nnScaler from whl package
-
-To get started, install the latest wheel by visiting [DevOps Artifacts](https://msrasrg.visualstudio.com/SuperScaler/_artifacts/feed/nightly/PyPI/nnscaler/overview/). You may follow DevOps guide to set up the repository, or alternatively download the **.whl** file from the “Files” section of the website, then install locally:
-
-    python -m pip install nnscaler-*.whl
 
 ## Example Llama-3
 
@@ -152,23 +147,20 @@ torchrun --nproc_per_node=2 train.py --plan_ngpus 1 --runtime_ngpus 2 --name lla
 We also provide an example to demonstrate how to parallelize a model through a [PyTorch Lightning](https://lightning.ai/docs/pytorch/stable/)-compatible interface in nnScaler.
 
 * Find the [nanoGPT](https://github.com/karpathy/nanoGPT) example in nnScaler repo:
-
-
-    cd MagicCube/examples/nanogpt
-
+```shell
+    cd examples/nanogpt
+```
 * Install nanoGPT's dependencies:
-
-
+```shell
     pip install -r requirements.txt
-
+```
 * Prepare dataset:
-
-
+```shell
     python nanoGPT/data/shakespeare_char/prepare.py
-
+```
 * Test with Single GPU
 
-Now you can run ``train_nnscaler.py`` with `torchrun <https://pytorch.org/docs/stable/elastic/run.html>`_:
+Now you can run ``train_nnscaler.py`` with `torchrun <https://pytorch.org/docs/stable/elastic/run.html>`:
 
     torchrun --nproc_per_node=1 train_nnscaler.py nanoGPT/config/train_shakespeare_char.py
 
@@ -190,6 +182,8 @@ Or if you have multiple nodes, for example 2 nodes with 4 GPUs each:
 
 NOTE: The local batch size is fixed by default, so using more workers will result in a larger global batch size.
 
+💡 For advanced usages, please stay tuned for our future release.
+
 
 # Success Stories
 
@@ -201,6 +195,7 @@ nnScaler has been adopted by multiple projects, including both product and resea
 # Reference
 
 ---------
+You may find the Artifact Evaluation for OSDI'24 with the guidance [here](https://github.com/microsoft/nnscaler/tree/osdi24ae). 
 Please cite nnScaler in your publications if it helps your research:
 
     @inproceedings{lin2024nnscaler,

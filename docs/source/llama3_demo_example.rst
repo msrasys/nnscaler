@@ -1,6 +1,6 @@
-###############
-Llama 3 Example
-###############
+############
+Llama 3 Demo
+############
 
 This is an example demostrating how to train Llama 3 8B with nnScaler's :doc:`trainer <trainer>`.
 
@@ -17,21 +17,19 @@ Installation
 
     export HF_TOKEN=...
 
-1. Install nnScaler ::
+1. Clone nnScaler repo ::
 
-    pip install nnscaler
+    git clone --recursive https://github.com/microsoft/nnscaler
 
-2. Clone nnScaler repo to get the example ::
+2. Install dependencies (including Llama 3 dependencies) and :doc:`nnScaler from source <install_from_source>` ::
 
-    git clone --recursive https://msrasrg.visualstudio.com/SuperScaler/_git/MagicCube
-    cd MagicCube/examples/llama3_demo
-
-3. Install Llama 3 dependencies ::
-
+    cd nnscaler
     pip install -r requirements.txt
+    pip install -e .
 
-   Note: The requirements file has pinned ``torch``, ``transformers``, and ``datasets`` versions
-   to ensure their compatibility with each others.
+3. Find the Llama 3 example ::
+
+    cd nnscaler/examples/llama3_demo
 
 4. Prepare dataset ::
 
@@ -44,30 +42,32 @@ Installation
 Train a Mini-model
 ==================
 
-This examples requires 8 × 80GB GPU memory to train a full 8B model.
-If your have adequate GPUs, you can skip to :ref:`the next section <Finetune Llama 3 8B>`.
+This examples requires 8 x 80GB GPU memory to train a full 8B model.
+If your have qualified GPUs, you can go to :ref:`the next section <finetune>`.
 
-Alternatively, you can start from a smaller model for verification: ::
+Alternatively, you may start from a smaller model for verification: ::
 
     python train.py --prepare_data --mini
     torchrun --nproc_per_node=2 train.py --mini
 
-This will resize Llama 3 to 4 hidden layers and reduce max sequence length to 4K.
-We have tested it with 2 × 48GB memory.
+This will resize Llama 3 into a model with 4 hidden layers and max-sequence-length reduced to 4K (4096).
+We have tested it with 2 x 48GB GPUs.
 
-If the model is still too large, you can shrink it further: ::
+You may further shrink it if the model is still too large: ::
 
     python train.py --prepare_data --max_seq_len=1024
     torchrun --nproc_per_node=2 train.py --max_seq_len=1024 --num_hidden_layers=2 --from_scratch
 
-With the default mini config (4 layers, 4K sequence length), the loss curve will be like following:
+Here is the training loss with the default mini config (4 layers, 4K sequence length):
 
 .. image:: ./images/llama3-curves-mini.png
+
+.. _finetune:
 
 Finetune Llama 3 8B
 ===================
 
-Use the following commands to finetune `Meta-Llama-3-8B-Instruct <https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct>`: ::
+Use the following commands to finetune `Meta-Llama-3-8B-Instruct <https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct>`_: ::
 
     python train.py --prepare_data
     torchrun --nproc_per_node=8 train.py
@@ -78,13 +78,13 @@ Use the following commands to finetune `Meta-Llama-3-8B-Instruct <https://huggin
 Resuming
 ********
 
-The example will save a checkpoint on finish.
-To continue training from the checkpoint: ::
+The example will save checkpoint files after finishing 1000 steps then exit.
+To continue training from the saved checkpoint: ::
 
     torchrun --nproc_per_node=8 train.py --resume_from=last --max_train_steps=2000
 
-Please note that the checkpoint is sharded according to the distribution strategy.
-If you want to resume a checkpoint in a different environment, you need to merge it into an ordinal checkpoint first: ::
+Please note that the checkpoint is sharded as multiple files.
+If you want to resume a checkpoint in a different environment, you need to merge it into an single checkpoint file first: ::
 
     python train.py --merge_checkpoint=./checkpoints/last
     torchrun --nproc_per_node=8 train.py --resume_from=./checkpoints/merged.ckpt --max_train_steps=3000

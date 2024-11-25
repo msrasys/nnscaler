@@ -1,16 +1,18 @@
-## verify-graph support
-"""
-Used to verify operations in IRGraph to ensure their functionality and consistency across single and multiple Gpus.
-"""
-## example:
+# Verify-graph support
+Used to verify operations in IRGraph to ensure their functionality and consistency across single and multiple GPUs.
+
 Command-line interface for verifying operations in an IRGraph.
 
 Usage:
+```
 python verify_graph_operations.py --graph <path_to_graph_ckp> --outdir <path_to_output_directory>
+```
 
 Parameters:
---graph (str): Path to the graph checkpoint file (.ckp) to be loaded. This is the same graph used as the input for the pas policy.
---outdir (str): Directory where verification results will be saved.
+
+    --graph (str): Path to the graph checkpoint file (.ckp) to be loaded. This is the same graph used as the input for the pas policy.
+    --outdir (str): Directory where verification results will be saved.
+
 
 This script performs the following steps:
 1.  Load the IRGraph: Reads the graph checkpoint file specified by the `--graph` argument.
@@ -22,13 +24,13 @@ This script performs the following steps:
 
 To test a module: you should first use parallelize to generate the required graph.ckp file, then test graph against the current script.
 
-## verify-dimops support
-"""
+## Verify-dimops support
 Define a configuration for verifying partition options of a tensor operation.
 This configuration helps ensure that the operation's partitioning logic is valid
 by specifying the function signature, arguments, expected outputs, and partitioning options.
-"""
-## example 1:
+
+## Example of Conv2D
+```python:
 This is used to verify that Conv2D's partition configuration is correct. This configuration defines a basic Conv2D operation with input Tensor, convolution kernel, and bias.
 ```python
 @dataclass
@@ -68,7 +70,7 @@ conv2d_config = VerifyConfig(
 verify_partition_options(conv2d_config)
 ```
 
-## Examples for configuring different op
+## Examples for more operators 
 
 ```
 dropout_config = VerifyConfig(

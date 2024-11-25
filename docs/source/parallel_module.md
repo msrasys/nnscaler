@@ -1,12 +1,10 @@
-# Parallel Module
+# Paralleling a Module
 
-nnScaler can parallelize a `torch.nn.Module` to a parallel module.
-A parallel module is a special `torch.nn.Module` but runs in multiple gpus/nodes.
-All the complexity of distributed training/inferring is hidden from the user.
+nnScaler can transform a `torch.nn.Module` into a parallel module, which is a specialized version of `torch.nn.Module` capable of running across multiple GPUs or nodes. This process hides the complexity of distributed training and inference from the user.
 
-Currently we support three kinds of parallelism: data parallelism, tensor parallelism and pipeline parallelism (model parallelism). We can also combine them to get the best performance.
+Currently, we support three kinds of parallelism: data parallelism, tensor parallelism and pipeline parallelism. We can also combine them for better performance.
 
-Data parallelism and tensor parallelism are support for all kinds of module, but pipeline parallelism is only supported for end2end modules for scheduling reason.
+Data parallelism and tensor parallelism can be supported for any module, but pipeline parallelism is only supported for end2end modules for scheduling reason.
 
 An end2end module is a module which satisfies:
 - the first argument of `module.forward` is the data sample, and every other argument should have default value, and use its default value in `module.forward` function.
@@ -170,155 +168,6 @@ def train(model: ParallelizedPipelinedLLM, data):
         optimizer.step()
         optimizer.zero_grad()
 ```
-
-## APIs
-
-### ComputeConfig
-The configuration of the compute environment. It is a dataclass with the following fields:
-```python
-
-@dataclass(frozen=True)
-class ComputeConfig:
-    plan_ngpus: int
-    runtime_ngpus: int
-
-    constant_folding: bool = False
-    trace_strategy: Literal['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache'] = 'cuda_run_cpu_offload'
-
-    use_zero: bool = False
-    zero_ngroups: int = 1
-    zero_use_reduce_scatter: bool = False
-
-    inference_only : bool = False
-    use_end2end: bool = False
-
-    use_async_reducer: bool = False
-    reducer_bucket_cap_mb: Optional[float] = None
-
-    pas_config: Dict[str, Any] = field(default_factory=dict)
-    user_config: Dict[str, Any] = field(default_factory=dict)
-```
-We can categorize the fields into 4 categories:
-
-1. Trace configuration
-    - `constant_folding`: whether to enable constant folding when generating code.
-    When it is true, all non-tensor non-input values will be folded into the generated code.
-
-        For example, if user's code contains following snippet, and `bsz=1`, `num_heads=32`, `len=1024`, `hidden_dim=128` at tracing.
-        ```python
-            bsz, num_heads, len, hidden_dim = x.size()
-            x = x.view(bsz * num_heads, len, hidden_dim)
-        ```
-        The code (graph) is folded into the following format
-
-        ```python
-            y = x.view(32, 1024, 128)
-        ```
-
-        Constant folding is helpful to simplify the input program,
-        and can make the compiling process faster and reduce the communication cost at runtime.
-        However, user should make sure that inputs at runtime share a same schema (including shape) with tracing and correspond to a same computation graph.
-        Errors may be raised at runtime when this assumption is broken.
-    - `trace_strategy`: how to execute the functions during trace.
-    Five strategies are supported:
-        1. `cpu`: Execute all functions on cpu device, model weights and intermediate results are on cpu device.
-        2. `cuda`: Execute all functions on cuda device, model weights and intermediate results are on cuda device. This strategy is recommended if the model can inference on single gpu.
-        3. `meta`: Execute all functions on meta device, model weights are on cpu and intermediate results are on meta device. For more information about meta device type, please view https://pytorch.org/docs/stable/meta.html.
-        4. `cuda_run_cpu_offload`: Try to execute all functions on cuda, and retry to execute the function on cpu as backup if OOM is catched, model weights and intermediate results are on cpu. This strategy is recommanded for most case if the model is too large to inference on single gpu.
-        5. `reuse_cache`: Compared to `cuda_run_cpu_offload` strategy, maintains a map from function signatures to output values. The cached output is returned when the signature of the function that generates it has been executed. Same signature means the funtions are the same and have almost the same inputs (for tensor type input, just check if they have same tensor meta data[shape, dtyep, requires_grad, stride, memory_format, ...], and don't check the value). This strategy is an experimental strategy to speedup the large-model-large-input case, and have risk to trace an incorrect graph if the signature defined here can not distinguish the differnet functions used in the model, for example, torch.nonzero will always return the same result if the input have same meta data but different value. We have plan to continue improve this strategy to handle most these kind of data dependence cases, but please note that the risk is still inevitable.
-2. Compute environment configuration
-    - `plan_ngpus`: the number of gpus to be used as a unit. The model is partitioned (TP or PP) within a unit, and then data parallelism is applied across multiple units. So every `plan_ngpus` devices holds the whole model. Furthermore, assume we have two workers, and their ranks are `rank1` and `rank2`:
-        1. if `rank1 // plan_gpus == rank2 // plan_ngpus`, then they are in the same unit.
-        2. If `rank1 % plan_ngpus == rank2 % plan_ngpus`, then the portion of model hold on both gpus are exactly the same.
-    - `runtime_ngpus`: the number of gpus to be used in runtime. It should be a multiple of `plan_ngpus`, which means we have `runtime_ngpus // plan_ngpus` units in runtime, and the data parallelism is `runtime_ngpus // plan_ngpus`.
-    Please note all modules must have the same `plan_ngpus` and `runtime_ngpus`.
-3. Code generation feature configuration
-    - `use_zero`: whether to use zero. If it is true, the generated code will use zero1 to do distributed training.
-    - `zero_ngroups`: the number of groups to be used in zero.
-    - `zero_use_reduce_scatter`: whether to use reduce scatter in zero. If it is true, the gradients will be reduced by reduce scatter in zero.
-
-       Please note
-        - Reduce scatter is only available when `zero_ngroups` is 1. when `zero_ngroups` > 1, you should set it to `False`, or an error will be raised.
-        - In some cases, it can introduce parity issue. So use it with caution.
-    - `inference_only`: whether to generate code for inference only. If it is true, the generated code can not be used to train the model.
-    - `use_end2end`: whether to use end2end training. For the requirement of end2end, see the description above.
-    - `use_async_reducer`: whether to use async reducer.
-        If it is true, the gradients will be reduced asynchronously.
-        Please note this only works when `use_end2end` is true.
-    - `reducer_bucket_cap_mb`: the bucket capacity of the reducer.
-        If it is `None` or `0`, the default value will be used, which is
-        - 25MB for async, the same default value with pytorch ddp implementation
-        - no limit for sync
-
-        Please note this only works when `use_end2end` is true.
-    - `pas_config`: the configuration for the PAS policy (partition-assign-schedule policy, which describes how to place all computations across devices. For details, please refer to [PAS Policies](#pas-policies)).
-    It is a dictionary, and will be used by the PAS policy.
-    Please note different PAS will have different configurations,
-    You can also put any other settings that can affect code generation here. but please prefix the keys with `_` to avoid conflicts with PAS configurations.
-    - `user_config`: the user configuration, which is used to decide whether skipping compiling and reusing the previously traced graph.
-
-Note:
-1.  You can put any custom configurations in `user_config`. The assumption is different `user_config` should generate different graph/code. So if the user config is changed, we will regenerate the graph/code automatically. Here are some examples:
-
-    - Example 1: save module configuration
-        ```python
-        class MyModule(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-        def forward(self, x):
-            ...
-            if module_config.use_3d:
-            ...
-        ```
-        here we can set `user_config` to `{'use_3d': module_config.use_3d}`,
-        and we can be sure different use_3d config will never use the same graph (and eventually the generated code).
-
-    - Example 2: save file stats
-        If you want to track all related file stats (just like traditional compilers do),
-        you can save the md5 of the files to save some bytes:
-        ```python
-        import hashlib
-        h = hashlib.md5()
-        for f in Path('./src').glob('**/*.py'):
-        with open(f, 'rb') as f:
-            h.update(f.read())
-        compute_config = {
-            ....,
-            user_config: {
-                'files_md5': h.hexdigest()
-            }
-        }
-        ```
-2.  If some settings doesn't affect tracing/graph generation, but do affect code generation, you can put them in `pas_config`. Please prefix the keys with `_` to avoid conflicts with predefined PAS configurations. One typical example is you can put the name of selected PAS policy in `pas_config`, so changing PAS policy will regenerate code but the graph will be reused.
-
-    ```python
-    compute_config = ComputeConfig(
-        ...
-        pas_config={
-            '_pas_name': ...,
-            # PAS policy specific configurations
-            ...
-        },
-    )
-    ```
-
-### ReuseType
-
-The reuse policy for the existing generated code. It is an enum with the following values:
-
-```python
-class ReuseType(Enum):
-    MATCH = 'match'
-    OVERRIDE = 'override'
-    MOO = 'moo'
-    GRAPH = 'graph'
-```
-We call it a `match` when the `ComputeConfig` is the same with the previous run.
-
-1. `MATCH`: Reuse if match, error if not match, generate if no previous gerenated code exists.
-2. `OVERRIDE`: Nothing will be reused. Everything will be regenerated.
-3. `MOO`: `MOO` is short for 'match or override'. It will reuse if match, generate if not match or no previous generated code exists.
-4. `GRAPH`: Reuse graph only if match, generate otherwise.
 
 ### BroadcastGenFilesStrategy
 
@@ -568,86 +417,6 @@ def infer_step(self, samples: List[Any]) -> List[Any]:
 The inference step function. It should be called in the inference loop.
 The input is a list of samples, and returns a list of outputs for the samples. If pipeline is used, it must have the same length as configured to pas policy.
 
-### PAS Policies
-
-Writing a pas policy can be very hard and error-prone. So we provide 6 builtin PAS policies to help you. `dp`, `tp`, `pp`, `data`, `hybrid`, and `autodist`. Please note only `autodist` policy is the recommended policy for most cases, and all other PAS policies are mainly test purpose only.
-
-The configuration of the PAS policy should be passed in the `pas_config` of `ComputeConfig` as a dictionary.
-
-1. `dp`: data parallelism. It will replicate the module across all devices, and run data parallelism across all devices. It requires the `plan_ngpus` must be 1 and no configurations
-
-2. `tp`: tensor parallelism + data parallelism. It will do tensor parallelism inside a scale unit, and run data parallelism across scale units. It has only one configuration:
-    - seed: the random seed for choose the partition dimension. Default is `1`
-
-3. `pp`: pipeline parallelism + data parallelism.
-It will do model parallelism inside a scale unit,
-and run data parallelism across scale units.
-It requires the `use_end2end` be true.
-It has two configurations `pipeline_nmicros` and `pipeline_scheduler`.
-See `hybrid` policy for more details.
-
-4. `data`: tensor parallelism on batch dimension. It has no configurations.
-
-5. `hybrid`: pipeline parallelism + tensor parallelism + data parallelism.
-It will do model parallelism and tensor parallelism(on 0 dimension) inside a scale unit,
-and run data parallelism across scale units.
-It requires the `use_end2end` to be true. It has the following configurations.
-    - `pipeline_nstages`: the number of stages in the pipeline. Default is `plan_ngpus`. Optional.
-    - `pipeline_nmicros`: the number of microbatches in the pipeline. Required.
-    - `pipeline_scheduler`: the scheduler name for the pipeline. Current we support four schedulers in training `1f1b`/`1f1b_plus`/`gpipe`/`chimera_direct` (4 stages pipeline only), and one scheduler in inference `infer_pipe`. Default is `1f1b`. Optional.
-
-6. `autodist`: the recommended policy for most cases. Currently it only support Adam-like optimizers. It will automatically choose the best partition for you by balancing the memory usage and speed. It has the following configurations.
-    - `update_freq (int)`: the update frequency when training the module. Default is 1. Optional.
-    - `mem_constraint (float)`: The memory constraint in each device in GB. Optional.
-    - `task_name (str)`: The name of the current task to distinguish runs. Optional.
-    - `use_fp16 (bool)`: Whether you use `fp16`. Default is `False`. Optional.
-    - `use_memory_efficient_fp16` Whether you use memory efficient fp16 optimizer. Default is `False`. Optional.
-    - `use_bf16`: Whether you use `bf16`. Default is `False`. Optional.
-    - `use_memory_efficient_bf16`: Whether you use memory efficient bf16 optimizer. Default is `False`. Optional.
-    - `re_profile (bool)`: If set to `True`, the computation profiling results will be overridden. Please note reprofiling will take some time. Optional.
-    - `verbose (bool)`:  Whether to print verbose information. Optional.
-    - `load_plan_path (str)`: The path to the plan file to load. If specified, the plan will be loaded from the file instead of searching. Optional.
-    - `save_plan_path (str)`: The path to the plan file to save. Optional.
-    - `partition_constraints_path (str)`: The path to the partition constraints file. Optional.
-    - `recompute_modules (str)`: The module names to recompute, separated by `,`. For example, `module1,module2`. Optional.
-    - `pipeline_pivots (str)`: The module names to pivot the pipeline, separated by `,`. For example, if `module1,module2` is specified, stages searched by pipeline solver only start from either `module1` or `module2`. Optional.
-    - `use_apex_fused_adam_v2`: If set to `True`, the apex fused adam v2 optimizer will be used. Default is `False`. Optional.
-    - `explore_pipeline`: If set to `True`, autodist will try pipeline parallelism to find the best partition plan
-    (but the selected partition plan is not necessarily pipeline parallelism).
-    - `pipeline_scheduler`: The scheduler name for the pipeline. Please note currently `1f1b` is the only supported scheduler in `autodist`. Default is `1f1b`. Optional.
-    - `parallel_profile`: If set to `True`, autodist will profile operators in parallel by using available gpus. Default is `True`. Optional.
-    - `max_partition_degree`: Max degree when partitioning an operator / node. When pipeline parallelism is enabled to explore (`explore_pipeline` is True), user can change the value to constrain the plan to be composed of stages that span on less or equal to `max_partition_degree` devices (recommend to set `max_partition_degree` to the number of devices in a node to avoid inter-node communication, but should be be no more than `plan_ngpus`). Default is `plan_ngpus`. Optional.
-    - `transient_mem_coef`: In autodist, a heuristic is used to estimate the transient memory size: `transient_mem_size = opt_transient_coef * (1st_largest_infer_mem + 2nd_largest_infer_mem)`. This formula is useful in many cases, but it may be too strict when some operators consume or generate a large tensor (>= 4GB). In this case, you can set `transient_mem_coef` to a smaller value to relax the constraint. Default is `2`. Optional.
-
- You can also put any other settings that can affect code generation here. but please prefix the keys with `_` to avoid conflicts with predefined keys.
-
-Here is an example:
-```python
-compute_config = ComputeConfig(
-    plan_ngpus=...,
-    runtime_ngpus=...,
-    use_zero=...,
-    pas_config={
-        '__pas_name': ...,   # addtional configurations that can affect code generation.
-        'update_freq': ...,
-        'mem_constraint': ...,
-        'task_name': ...,
-        'use_fp16': ...,
-        'use_memory_efficient_fp16': ...,
-        'use_bf16': ...,
-        'use_memory_efficient_bf16': ...,
-        're_profile': ...,
-        'verbose': ...,
-        'load_plan_path': ...,
-        'save_plan_path': ...,
-        'partition_constraints_path': ...,
-        'recompute_modules': ...,
-        'pipeline_pivots': ...,
-        'use_apex_fused_adam_v2': ...,
-    },
-)
-```
-
 ### Checkpoint support
 
 You can save/load the checkpoints for parallel modules.
@@ -740,3 +509,14 @@ def create_distributed_sampler(dataset):
         ...,
     )
 ```
+
+### self.training support
+
+To parallelize the training process, we firstly need to trace the module and get a static computational graph.
+
+A common problem with static graph is that it is impossible to handle control flow.
+
+But on the other hand, `self.training` is very common used in module forward method.
+So we add a very limited support for `self.training` in tracing.
+
+Please note that user code is flattened and transformed into a single `ParallelModule` at runtime, so `training` is a global module state, and we don't support the case that user want to set a sub-module's training to True but remaining modules to False.
