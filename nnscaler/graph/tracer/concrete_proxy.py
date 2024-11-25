@@ -31,13 +31,20 @@ class ConcreteProxy(Proxy):
     We can use it to trace a more compatible model, and pass the branches.
     """
 
-    # TODO: python bytecode changes a lot in version 3.11. these ops should be updated.
+    # some jump ops have not find practical examples, add them because they are in python doc,
+    # TODO: after finding specific cases, need to add them to the unit tests.
     jump_opnames = (
-        'JUMP_IF_FALSE_OR_POP',
-        'JUMP_IF_TRUE_OR_POP',
-        'POP_JUMP_IF_FALSE',
-        'POP_JUMP_IF_TRUE',
-        'JUMP_IF_NOT_EXC_MATCH', # occurred in new python vertion, not tested
+        'JUMP_IF_NOT_EXC_MATCH', # <= python 3.10
+        'JUMP_IF_FALSE_OR_POP',  # <= python 3.11
+        'JUMP_IF_TRUE_OR_POP',  # <= python 3.11
+        'POP_JUMP_IF_FALSE',  # != python 3.11
+        'POP_JUMP_IF_TRUE',  # != python 3.11
+        'POP_JUMP_FORWARD_IF_FALSE',  # == python 3.11
+        'POP_JUMP_FORWARD_IF_TRUE',  # == python 3.11
+        'POP_JUMP_FORWARD_IF_NOT_NONE',  # == python 3.11, not included in unit test
+        'POP_JUMP_FORWARD_IF_NONE',  # == python 3.11, not included in unit test
+        'POP_JUMP_IF_NOT_NONE',  # >= python 3.12, not included in unit test
+        'POP_JUMP_IF_NONE',  # >= python 3.12, not included in unit test
     )
     jump_opcodes = orig_func.tuple(dis.opmap[name] for name in jump_opnames if name in dis.opmap)
     op_compare = dis.opmap['COMPARE_OP']

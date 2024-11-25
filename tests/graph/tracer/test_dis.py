@@ -111,8 +111,14 @@ def test_normal_item_with_starargs2():
 def test_extend():
     a = A()
     [1,2].extend(a)
-    assert a.caller_inst.opname == 'CALL_METHOD'
-    assert a.len_caller_inst.opname == 'CALL_METHOD'
+    # in <= python 3.10, opname is CALL_METHOD
+    # in >= python 3.11, opname is CALL
+    if sys.version_info.minor <= 10:
+        assert a.caller_inst.opname == 'CALL_METHOD'
+        assert a.len_caller_inst.opname == 'CALL_METHOD'
+    else:
+        assert a.caller_inst.opname == 'CALL'
+        assert a.len_caller_inst.opname == 'CALL'
 
     [1, *a]
     assert a.caller_inst.opname == 'LIST_EXTEND' # BUILD_LIST_UNPACK in python 3.8
@@ -177,7 +183,12 @@ def test_bool():
 
     x = {c: c}
     bool(x[c])  # CALL_FUNCTION
-    assert c.caller_inst.opname == 'CALL_FUNCTION'
+    # in <= python 3.10, opname is CALL_FUNCTION
+    # in >= python 3.11, opname is CALL
+    if sys.version_info.minor <= 10:
+        assert c.caller_inst.opname == 'CALL_FUNCTION'
+    else:
+        assert c.caller_inst.opname == 'CALL'
 
     c and 1 # JUMP_IF_FALSE_OR_POP
     assert c.caller_inst.opname == 'JUMP_IF_FALSE_OR_POP'
@@ -188,24 +199,43 @@ def test_bool():
     c.caller_inst = None
 
     bool(c)  # CALL_FUNCTION
-    assert c.caller_inst.opname == 'CALL_FUNCTION'
+    # in <= python 3.10, opname is CALL_FUNCTION
+    # in >= python 3.11, opname is CALL
+    if sys.version_info.minor <= 10:
+        assert c.caller_inst.opname == 'CALL_FUNCTION'
+    else:
+        assert c.caller_inst.opname == 'CALL'
     c.caller_inst = None
 
-    if c:    # POP_JUMP_IF_FALSE
+    if c:
         pass
-    assert c.caller_inst.opname == 'POP_JUMP_IF_FALSE'
+    if sys.version_info.minor != 11:
+        assert c.caller_inst.opname == 'POP_JUMP_IF_FALSE'
+    else:
+        assert c.caller_inst.opname == 'POP_JUMP_FORWARD_IF_FALSE'
     c.caller_inst = None
 
     if not c:  # POP_JUMP_IF_TRUE
         pass
-    assert c.caller_inst.opname == 'POP_JUMP_IF_TRUE'
+    if sys.version_info.minor != 11:
+        assert c.caller_inst.opname == 'POP_JUMP_IF_TRUE'
+    else:
+        assert c.caller_inst.opname == 'POP_JUMP_FORWARD_IF_TRUE'
     c.caller_inst = None
 
     if bool(c):  # CALL_FUNCTION
         pass
-    assert c.caller_inst.opname == 'CALL_FUNCTION'
+    # in <= python 3.10, opname is CALL_FUNCTION
+    # in >= python 3.11, opname is CALL
+    if sys.version_info.minor <= 10:
+        assert c.caller_inst.opname == 'CALL_FUNCTION'
+    else:
+        assert c.caller_inst.opname == 'CALL'
     c.caller_inst = None
 
     x = 1 if c else 0  # POP_JUMP_IF_FALSE
-    assert c.caller_inst.opname == 'POP_JUMP_IF_FALSE'
+    if sys.version_info.minor != 11:
+        assert c.caller_inst.opname == 'POP_JUMP_IF_FALSE'
+    else:
+        assert c.caller_inst.opname == 'POP_JUMP_FORWARD_IF_FALSE'
     c.caller_inst = None
