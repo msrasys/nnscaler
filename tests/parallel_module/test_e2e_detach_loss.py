@@ -37,6 +37,19 @@ class Model(torch.nn.Module):
         return x.sum()
 
 
+class Model2(torch.nn.Module):
+    def __init__(self):
+        super(Model2, self).__init__()
+        self.fc1 = torch.nn.Linear(4096, 4096, bias=False)
+        self.fc2 = torch.nn.Linear(4096, 4096, bias=False)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.fc2(x)
+        l = x.sum()
+        return l, l.data
+
+
 def policy_pp(graph, cfg):
     data_loader, fc1, fc2, loss = graph.nodes()[:4]
     graph.staging([fc1, fc2])
@@ -69,9 +82,9 @@ def policy_pp(graph, cfg):
     return graph
 
 
-def worker_pipeline_2x2():
+def worker_pipeline_2x2(model_cls):
     nnscaler.init()
-    m = Model()
+    m = model_cls()
     m.train()
     torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -89,7 +102,7 @@ def worker_pipeline_2x2():
             )
 
         if pm.rank in [2, 3]:
-            assert len(_gencode_contains(tempdir, Model, pm.rank, 'detach\(\)')) == 4
+            assert len(_gencode_contains(tempdir, model_cls, pm.rank, 'detach\(\)')) == 4
 
         samples = [torch.randn([2048, 4096], dtype=torch.float32, device=torch.cuda.current_device()) for _ in range(4)]
         ret = pm.train_step(samples)
@@ -105,9 +118,11 @@ def worker_pipeline_2x2():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
-def test_detach_loss_pipeline_hard():
+@pytest.mark.parametrize('model_cls', [Model, Model2])
+def test_detach_loss_pipeline_hard(model_cls):
+    torchrun(4, worker_pipeline_2x2, model_cls)
     # should not raise any exception
-    torchrun(4, worker_pipeline_2x2)
+    assert True
 
 
 def policy_easy(graph, cfg):
@@ -132,9 +147,9 @@ def policy_easy(graph, cfg):
     return graph
 
 
-def worker_pipeline_2():
+def worker_pipeline_2(model_cls):
     nnscaler.init()
-    m = Model()
+    m = model_cls()
     m.train()
     torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -153,7 +168,7 @@ def worker_pipeline_2():
         pm.to(torch.cuda.current_device())
 
         if pm.rank == 1:
-            assert len(_gencode_contains(tempdir, Model, pm.rank, 'detach\(\)')) == 4
+            assert len(_gencode_contains(tempdir, model_cls, pm.rank, 'detach\(\)')) == 4
         samples = [torch.randn([2048, 4096], dtype=torch.float32, device=torch.cuda.current_device()) for _ in range(4)]
         ret = pm.train_step(samples)
         mem0 = get_mem()
@@ -167,7 +182,8 @@ def worker_pipeline_2():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
-def test_detach_loss_pipeline_easy():
-    torchrun(2, worker_pipeline_2)
+@pytest.mark.parametrize('model_cls', [Model, Model2])
+def test_detach_loss_pipeline_easy(model_cls):
+    torchrun(2, worker_pipeline_2, model_cls)
     # should not raise any exception
     assert True

@@ -196,10 +196,11 @@ class ScheduleCodeGen(FuncEmission):
                 operation here so that the backward graph's tensors can be deallocated right after the
                 backward pass.
                 """
+                plan_outputs = IRCell.get_objects_from_complex(self.execplan.outputs())
                 for tensor in output_tensors:
                     if not isinstance(tensor, IRTensor):
                         continue
-                    if tensor in self.execplan.outputs():
+                    if tensor in plan_outputs:
                         codes.append(self.emit_detach(tensor))
 
         elif isinstance(unwrap_node, IRDataOperation):
