@@ -59,9 +59,9 @@ def get_tokenizer(tokenizer_name_or_path,
 
 
 class WrapperModel(torch.nn.Module):
-    def __init__(self, model_id, enable_chunk_loss):
+    def __init__(self, model_id, enable_chunk_loss, attn_implementation='flash_attention_2'):
         super().__init__()
-        self.model = AutoModelForCausalLM.from_pretrained(model_id, attn_implementation='flash_attention_2')
+        self.model = AutoModelForCausalLM.from_pretrained(model_id, attn_implementation=attn_implementation)
         self.enable_chunk_loss = enable_chunk_loss
 
     def forward(self, samples):
@@ -183,6 +183,7 @@ def main(args):
         args={
             'model_id': args.model_id,
             'enable_chunk_loss': args.enable_chunk_loss,
+            'attn_implementation': args.attn_implementation,
         },
     )
 
@@ -343,6 +344,12 @@ if __name__ == '__main__':
         default=None,
         type=int,
         help='max training steps',
+    )
+    parser.add_argument(
+        '--attn_implementation',
+        default='flash_attention_2',
+        type=str,
+        help='attn implementation, can be flash_attention_2, spda or eager',
     )
     args = parser.parse_args()
     if args.explore_pipeline and not args.pipeline_pivots:
