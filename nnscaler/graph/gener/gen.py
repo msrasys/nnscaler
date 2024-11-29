@@ -704,6 +704,7 @@ class IRAdapterGener:
                 )
 
             multiref = MultiRef(devtensors[devid][0], len(grads))
+            multiref.comment = 'created at IRAdapterGener:local_consumer_multiref'
             # set input gradient
             multiref.input(0).grad = accum_grad
             # set output and its gradient
@@ -757,6 +758,7 @@ class IRAdapterGener:
                 ptensors = sorted(ptensors, key=lambda t: t.device[0])
                 for tensor in ptensors:
                     mr = MultiRef(tensor, len(multiref.outputs()))
+                    mr.comment = f'create at IRAdapterGener:autoref, src tensor is {multiref.comment}'
                     mr.input(0).grad = tensor.grad
                     for idx, out in enumerate(multiref.outputs()):
                         output = out.parent.select(tensor.indmap, tensor.valmap)

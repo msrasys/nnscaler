@@ -17,7 +17,7 @@ from nnscaler.graph import IRGraph
 from nnscaler.ir.adapter import IRAdapter
 from nnscaler.parallel import ComputeConfig, parallelize, build_optimizer
 from nnscaler.ir.operator import IRFwOperation, IRDataOperation
-from tests.parallel_module.test_gencode import _gencode_contains
+from tests.parallel_module.test_gencode import _gencode_contains, print_gencode
 from ..utils import replace_all_device_with, clear_dir_on_rank0, init_random
 from ..launch_torchrun import torchrun
 
@@ -94,7 +94,9 @@ def policy_transpose(graph: IRGraph, resource: ComputeConfig) -> IRGraph:
     ngpus = resource.plan_ngpus
     for _, node in enumerate(graph.select(ntype=IRFwOperation)):
         print(node.signature)
-        if node.signature in ["torch.transpose"]:
+        if node.signature == 'torch.sum':
+            graph.multiref(node.outputs()[0].parent)
+        if node.signature in ["torch.transpose", "torch.sum"]:
             sub_nodes = graph.partition(
                 node, node.algorithm('dim'), idx=0, dim=0, num=ngpus)
         else:
@@ -126,6 +128,7 @@ def worker_a():
             gen_savedir=tempdir,
             reuse='override',
         )
+        # print_gencode(tempdir, ModelA, pm.rank)
         pm.to('cuda')
         ret = pm.train_step((data,))
 
