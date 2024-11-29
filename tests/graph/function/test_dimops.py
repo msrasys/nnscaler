@@ -25,7 +25,7 @@ def create_op(creator: Callable,
 def partitionable(node: IRDimops, **config):
     print(f'\n\n# {node.anno}')
     print(f'testing node: {node}')
-    sub_nodes = node.algorithms('dim').instantiate(**config)
+    sub_nodes = node.algorithm('dim').instantiate(**config)
     print(f'partitioned sub nodes:')
     for sub_node in sub_nodes:
         print(f'# {sub_node.anno}')

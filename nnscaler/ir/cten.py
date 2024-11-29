@@ -408,14 +408,15 @@ class IRCell:
     def get_objects_from_complex(val: Any, _objects: List[IRObject] = None) -> List[IRObject]:
         """Get all IRObjects from a complex data structure
 
-        Supported complex of types: List, Tuple, Dict, IRTensor, IRObject
+        Supported complex of types: List, Tuple, Dict, Slice, IRTensor, IRObject
 
         Args:
             val (Any): the complex data structure to be modified
             _objects (List[IRObject] | None):
                 if provided, the objects will be appened into this
 
-        @return _objects List[IRObject]: all IRObject
+        Return:
+            List[IRObject]: all IRObject
         """
         _objects = [] if _objects is None else _objects
         if isinstance(val, (tuple, list)):
@@ -432,10 +433,10 @@ class IRCell:
         return _objects
 
     @staticmethod
-    def modify_objects_of_complex(val: Any, modifier: Callable) -> Any:
+    def modify_objects_of_complex(val: Any, modifier: Callable[['IRObject'], 'IRObject']) -> Any:
         """Return a complex data structure with modified IRObjects
 
-        Supported complex of types: List, Tuple, Dict, IRTensor, IRObject
+        Supported complex of types: List, Tuple, Dict, Slice, IRTensor, IRObject
 
         Args:
             val (Any): the complex data structure to be modified
@@ -693,19 +694,22 @@ class IRObject:
         return IRCell.modify_objects_of_complex(obj, modifier)
 
     @classmethod
-    def try_unwrap(cls, x: Union[Any, 'IRObject']) -> Any:
+    def try_unwrap(cls, x: Union[Any, 'IRObject'], unwrap_ir_tensor=False) -> Any:
         """
         Unwrap the IRObject to its original value if it is an IRObject
         otherwise, go recursively.
 
         Args:
             x (Any): the object to unwrap
+            unwrap_ir_tensor (bool): whether unwrap IRTensor
 
         Returns:
             Any: the original value
         """
-        if isinstance(x, IRObject) and not isinstance(x, IRTensor):
-            return x.value
+        if isinstance(x, IRObject):
+            if not isinstance(x, IRTensor) or unwrap_ir_tensor:
+                return x.value
+            return x
         elif isinstance(x, (list, tuple)):
             return type(x)(cls.try_unwrap(v) for v in x)
         elif isinstance(x, dict):

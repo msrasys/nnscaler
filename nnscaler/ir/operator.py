@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Optional, Tuple, Any, Union, List
+from typing import Optional, Tuple, Any, Union, List, overload
 import copy
 
 from nnscaler.ir.cten import IRCell, IRTensor, IRObject
@@ -76,29 +76,29 @@ class IRFwOperation(IRCell):
             assert self._recompute == group_id, "The operator is set to recompute in another recompute group."
         self._recompute = group_id
 
-    def algorithms(self, tag: Optional[str] = None) -> Union[Tuple[GenericDistAlgo], GenericDistAlgo]:
+    def algorithms(self) -> List[GenericDistAlgo]:
         """
-        get algorithm from algorithm factory
+        get all algorithms from algorithm factory
 
-        @param tag Optional[str]: the queried tag (default None for all)
-
-        @return algorithm(s) Union[Tuple[GenericDistAlgo], GenericDistAlgo]:
-            If None (default), return all possible algorithms.
-            Otherwise, return the specified one.
+        Returns:
+            List[GenericDistAlgo]: all possible algorithms
         """
         factory = DistAlgorithmFactory()
-        if tag is None:
-            templates = list()
-            if factory.exist(type(self)):
-                templates = factory.algorithms(type(self))
-            algos = list()
-            for template in templates:
-                algos.append(template(self))
-            return algos
-        else:
-            assert factory.exist(type(self), tag), f"Node {self} doesn't have transformation algorithm tag: {tag}"
-            template = factory.algorithms(type(self), tag)
-            return template(self)
+        return [template(self) for template in factory.algorithms(type(self))]
+
+    def algorithm(self, tag: str) -> GenericDistAlgo:
+        """
+        get a specific algorithm from algorithm factory
+
+        Args:
+            tag (str): the tag of the algorithm
+
+        Returns:
+            GenericDistAlgo: the algorithm
+        """
+        factory = DistAlgorithmFactory()
+        template = factory.algorithm(type(self), tag)
+        return template(self)
 
     def replicate(self):
         """!

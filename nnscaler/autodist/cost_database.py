@@ -209,15 +209,15 @@ class CostDatabase:
         return memory_results
 
     def get_mem_and_buffer(
-        self, 
-        op_partition, 
-        is_train: bool, 
-        stage_num: int, 
-        world_size: int, 
-        plan_ngpus: int, 
-        zero_stage: int, 
-        zero_ngroups: int, 
-        opt_resident_coef: float, 
+        self,
+        op_partition,
+        is_train: bool,
+        stage_num: int,
+        world_size: int,
+        plan_ngpus: int,
+        zero_stage: int,
+        zero_ngroups: int,
+        opt_resident_coef: float,
         opt_transient_coef: float
     ) -> Tuple[int, int, int, int, int]:
         """
@@ -523,10 +523,10 @@ class CostDatabase:
         dst_idx, dst_dim = dst_p.operator.dim_id2pos(dst_p_dim)
         rule_src, rule_dst = None, None
         if src_idx != -1:
-            rule_src = src_p.operator.ir_cell.algorithms('dim').infer(
+            rule_src = src_p.operator.ir_cell.algorithm('dim').infer(
                 src_idx, src_dim, src_p_num)
         if dst_idx != -1:
-            rule_dst = dst_p.operator.ir_cell.algorithms('dim').infer(
+            rule_dst = dst_p.operator.ir_cell.algorithm('dim').infer(
                 dst_idx, dst_dim, dst_p_num)
         cost = 0.0
         for i, src_t in enumerate(src_p.operator.ir_cell.outputs()):

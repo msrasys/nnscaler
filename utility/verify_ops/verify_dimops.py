@@ -48,21 +48,21 @@ import random
 class TestModule(torch.nn.Module):
     def __init__(self):
         super(TestModule, self).__init__()
-        
+
     def forward(self, {args}):
         # Add clone to resolve the issue:
         # a leaf Variable that requires grad is being used in an in-place operation.
         {clone_args}
-        
+
         {func_sig_call}
-        
+
         out = 0
         for one_out in [{outputs}]:
             if not isinstance(one_out, torch.Tensor):
                 continue
             out += torch.sum(one_out)
         return out
-        
+
 model = TestModule() #.to(torch.float16)
 """
 
@@ -91,18 +91,18 @@ rank_id = torch.distributed.get_rank()
 def policy(graph: IRGraph, resource) -> IRGraph:
     ngpus = 2
     partitioned = False
-    
+
     for idx, node in enumerate(graph.select(ntype=IRFwOperation)):
         if not partitioned and node.signature == '{func_sig}':
             print('Partitioned node: ', node)
             sub_nodes = graph.partition(
-                node, node.algorithms('dim'), idx={idx}, dim={dim}, num=ngpus)
+                node, node.algorithm('dim'), idx={idx}, dim={dim}, num=ngpus)
             partitioned = True
         else:
             sub_nodes = graph.replicate(node, times=ngpus)
         for idx, sub_node in enumerate(sub_nodes):
             graph.assign(sub_node, idx)
-            
+
     assert partitioned, f'No node is partitioned for {func_sig}.'
     return graph
 

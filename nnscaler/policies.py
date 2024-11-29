@@ -44,7 +44,7 @@ _logger = logging.getLogger(__name__)
 def _tp(graph: IRGraph, node: IRDimops, devs: List[int], idx: int, dim: int):
     if len(devs) > 1:
         sub_nodes = graph.partition(
-            node, node.algorithms('dim'), idx=idx, dim=dim, num=len(devs))
+            node, node.algorithm('dim'), idx=idx, dim=dim, num=len(devs))
     else:
         sub_nodes = [node]
     for devid, sub_node in zip(devs, sub_nodes):
@@ -103,7 +103,7 @@ def pas_tp(graph: IRGraph, cfg: 'ComputeConfig'):
                 random.shuffle(configs)
                 for (idx, dim) in configs:
                     if node.input(idx).shape[dim] % len(devs) != 0: continue
-                    if node.algorithms('dim').satisfy(idx=idx, dim=dim, num=len(devs)):
+                    if node.algorithm('dim').satisfy(idx=idx, dim=dim, num=len(devs)):
                         _tp(graph, node, devs, idx, dim)
                         break
                 else:
@@ -142,7 +142,7 @@ def pas_data(graph: IRGraph, env_resource: 'ComputeConfig'):
     for node in graph.nodes():
         if isinstance(node, IRFwOperation):
             try:
-                algo = node.algorithms('dim')
+                algo = node.algorithm('dim')
                 idx = 0
                 sub_nodes = graph.partition(
                     node, algo, idx=idx, dim=batch_dim, num=ngpus)

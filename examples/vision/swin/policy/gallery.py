@@ -21,7 +21,7 @@ _logger = logging.getLogger(__name__)
 
 def coshard(graph: IRGraph, node: IRFwOperation, devs: List[int], colocate: int,
              idx: int, dim: int):
-    algo = node.algorithms('dim')
+    algo = node.algorithm('dim')
     sub_nodes = graph.partition(node, algo, idx=idx, dim=dim, num=colocate*len(devs))
     assert sub_nodes is not None
     graph.recompute(sub_nodes)

@@ -65,7 +65,7 @@ A shape annotation consists of dimension annotation separated by (multiple) spac
 
 """
 
-from typing import Callable, Dict, Iterable, List, Union, Set, Tuple, Optional
+from typing import Callable, Dict, Iterable, List, Union, Set, Tuple, Optional, overload
 import enum
 import re
 import string
@@ -74,7 +74,6 @@ from itertools import dropwhile
 
 from nnscaler.ir.cten import IRTensor, IRObject
 from nnscaler.ir.operator import IRFwOperation
-from nnscaler.algorithm.factory import DistAlgorithmFactory
 
 
 _kSpecialIdentifiers = ('*', '?')
@@ -920,24 +919,6 @@ class IRDimops(IRFwOperation):
                 if not ret:
                     return False
         return True
-
-    def algorithms(self, tag: Optional[str] = None):
-        factory = DistAlgorithmFactory()
-        if tag is None:
-            algos = list()
-            if factory.exist(type(self)):
-                algos += [template(self) for template in factory.algorithms(type(self))]
-            if factory.exist(IRDimops):
-                algos += [template(self) for template in factory.algorithms(IRDimops)]
-            return algos
-        else:
-            if factory.exist(type(self), tag):
-                template = factory.algorithms(type(self), tag)
-                return template(self)
-            if factory.exist(IRDimops, tag):
-                template = factory.algorithms(IRDimops, tag)
-                return template(self)
-            return None
 
     def transform_space(self) -> List[Tuple[int, int]]:
         """
