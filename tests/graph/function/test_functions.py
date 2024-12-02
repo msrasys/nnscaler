@@ -951,3 +951,12 @@ def test_Pad():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '3 4 2 -> 9 7 3'
     op = F.Pad(IRTensor([3, 3, 4, 2]), pad=(o(1), o(1)))
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c 2 -> a b c 4'
+
+
+def test_Split():
+    op = F.Split(IRTensor([3, 3, 4, 2]), split_size_or_sections=1)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '3 b c d -> 1 b c d, 1 b c d, 1 b c d'
+    op = F.Split(IRTensor([5, 3, 4, 2]), split_size_or_sections=IRObject(value=2, is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '5 b c d -> 2 b c d, 2 b c d, 1 b c d'
+    op = F.Split(IRTensor([7, 3, 4, 2]), split_size_or_sections=IRObject(value=[2, 2, 3], is_constant=False))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '7 b c d -> 2 b c d, 2 b c d, 3 b c d'

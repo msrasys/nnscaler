@@ -1200,12 +1200,13 @@ def Split(tensor, split_size_or_sections, dim = 0, signature = None):
     """
     torch.functional.split(tensor, split_size_or_sections, dim=0) -> List[Tensor]
     """
-    if isinstance(split_size_or_sections, int):
-        sections = [split_size_or_sections for _ in range(tensor.shape[dim] // split_size_or_sections)]
-        if tensor.shape[dim] % split_size_or_sections != 0:
-            sections.append(tensor.shape[dim] % split_size_or_sections)
+    unwrap_split_size = _unwrap_value(split_size_or_sections)
+    if isinstance(unwrap_split_size, int):
+        sections = [unwrap_split_size for _ in range(tensor.shape[dim] // unwrap_split_size)]
+        if tensor.shape[dim] % unwrap_split_size != 0:
+            sections.append(tensor.shape[dim] % unwrap_split_size)
     else:
-        sections = split_size_or_sections
+        sections = unwrap_split_size
     assert sum(sections) == tensor.shape[dim]
     edim_in = ShapeAnno.create_shape_str(tensor.shape)
     edim_ous = [copy.copy(edim_in) for _ in sections]
