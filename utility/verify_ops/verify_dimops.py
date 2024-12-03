@@ -305,11 +305,19 @@ def verify_partition_options(verify_config: VerifyConfig) -> bool:
                 for k, v in verify_config.kwargs.items()
             ]
         )
-        args_str = ", ".join([f"_in{i}" for i, tinfo in enumerate(verify_config.args)])
-        func_sig_call = verify_config.fsig
 
-        if args_str:
-            func_call = f"{outputs_str} = {func_sig_call}({args_str}, {kwargs_str})"
+        func_sig_call = verify_config.fsig
+        args_str = ", ".join([f"_in{i}" for i in range(len(verify_config.args))])
+        tensor_member_methods_prefix = 'torch.Tensor.'
+        if func_sig_call.startswith(tensor_member_methods_prefix):
+            # workaround because tracer does not support tensor member methods
+            func_sig_call = f'_in0.' + func_sig_call[len(tensor_member_methods_prefix):]
+            func_args_str = ", ".join([f"_in{i}" for i in range(1, len(verify_config.args))])
+        else:
+            func_args_str = args_str
+
+        if func_args_str:
+            func_call = f"{outputs_str} = {func_sig_call}({func_args_str}, {kwargs_str})"
         else:
             func_call = f"{outputs_str} = {func_sig_call}({kwargs_str})"
 

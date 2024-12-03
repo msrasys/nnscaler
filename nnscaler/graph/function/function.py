@@ -1229,143 +1229,188 @@ def Contiguous(input, memory_format = None, signature = None):
 
 def _reshape_anno(in_shape: List[int], ou_shape: List[int], kwarg_name: str) -> Tuple[str, List[TransformRule]]:
     """
-    reshape / view annotation and transformation rule generator
+    The general rule is that aligned dimensions in the input shape and output shape
+    are labeled with partitionable.
+    Here `align` means when we group input and output shapes (see `_group` function),
+    the input dims and output dims in a matched groups have exactly one non-1 dim.
 
-    Args:
-        in_shape List[int]: input shape
-        ou_shape List[int]: output shape
-        kwarg_name str: kwarg name of reshape / view op
+    For example,
+    input shape: [10, 12, 16, 18]
+    output shape: [10, 2, 3, 32, 18]
+    The first and the last dimension is aligned, so we can partition both dimensions.
 
-    Returns:
-        str: annotation string
-        List[TransformRule]: transformation rules
+    There are two additional rules when we apply inner dimensions:
+    1. When `input_dim % output_dim == 0 or output_dim % input_dim == 0`,
+        we can break the larger dimension to inner dimensions.
+        In above example, we can partition the second dimension, as `12 % 2 == 0`.
+        We first break the second dimension into `(2 6)`, then align the `2` with `2` in output shape.
+        So the final annotation is `a (b 6) 16 c -> a b 3 32 c`
+    2. When a dimension size is `1`, we can skip it and align to the next dimension.
+       For example, input_shape: [2, 16, 32, 32]
+                    output shape: [1, 32, 32, 32]
+       We can align the first dimension of input to the second dimension of output.
+       The final annotation is `a 16 b c -> 1 (a 16) b c`. Please note the first dimension of output is skipped.
+
+    TODO:
+    We assume all dimensions are static.
+    We need to handle dynamic shapes (passed as IRObject) in the future.
     """
-    def nele(shape, nele=1):
-        for dimlen in shape: nele *= dimlen
-        return nele
 
-    # infer -1
-    cnt = nele(in_shape)
+    if not in_shape or not ou_shape:
+        # scalar tensor, no need to partition
+        return '1 -> 1', []
+
+    from functools import reduce
+    from operator import mul
+
+    nele = reduce(mul, in_shape)
     if -1 in ou_shape:
         idx = ou_shape.index(-1)
-        ou_shape[idx] = cnt // (-nele(ou_shape))
-    assert nele(in_shape) == nele(ou_shape), f"shape mismatch: {in_shape}, {ou_shape}"
+        ou_shape[idx] = nele // (-reduce(mul, ou_shape))
+    if nele != reduce(mul, ou_shape):
+        raise ValueError(f"shape mismatch: {in_shape}, {ou_shape}")
 
-    # generate annotation
-    rest_inshape = [dimlen for dimlen in in_shape]
-    rest_oushape = [dimlen for dimlen in ou_shape]
-    chain = []
-    can_bucket = True
-    while len(rest_inshape) != 0 or len(rest_oushape) != 0:
-        if len(rest_inshape) == 0:
-            chain = chain + rest_oushape
-            rest_oushape = []
-        elif len(rest_oushape) == 0:
-            chain = chain + rest_inshape
-            rest_inshape = []
-        else:
-            dimlen = min(rest_inshape[0], rest_oushape[0])
-            if max(rest_inshape[0], rest_oushape[0]) % dimlen == 0:
-                chain.append(dimlen)
-                if dimlen == rest_inshape[0]:
-                    rest_inshape.pop(0)
-                else:
-                    rest_inshape[0] = rest_inshape[0] // dimlen
-                if dimlen == rest_oushape[0]:
-                    rest_oushape.pop(0)
-                else:
-                    rest_oushape[0] = rest_oushape[0] // dimlen
-            else:
-                can_bucket = False
-                break
+    def _group(input_shape, output_shape) -> List[Tuple[List[int], List[int]]]:
+        """
+        Group input and output shape into groups that can be aligned together
+        For example
+        input shape: [10, 12, 16, 18]
+        output shape: [10, 2, 3, 32, 18]
+        We can group them into [
+            ([10], [10]),
+            ([12, 16], [2, 3, 32]),
+            ([18], [18])
+        ]
+        Please note when we group the dimensions,
+        the dimensions with size 1 will be grouped with next dimension if not matched.
+        The only exception is when the 1 dimension is the last dimensions.
 
+        For example
+            [10, 1, 1, 5, 1, 7, 1, 1] and [10, 5, 7]
+        We will group them into
+            ([10], [10])
+            ([1, 1, 5], [5])
+            ([1, 7, 1, 1], [7])
+
+        And
+            [10, 1, 1, 5, 1, 7, 1, 1] and [10, 5, 7, 1]
+        We will group them into
+            ([10], [10])
+            ([1, 1, 5], [5])
+            ([1, 7], [7])
+            ([1, 1], [1])
+        """
+
+        groups = []
+        input_idx = 0
+        output_idx = 0
+
+        while input_idx < len(input_shape) and output_idx < len(output_shape):
+            # find one group in each iteration until all dimensions are aligned
+            input_dim = input_shape[input_idx]
+            output_dim = output_shape[output_idx]
+            group_input = [input_dim]
+            group_output = [output_dim]
+            # we find a group match when input_dim == output_dim
+            while input_dim != output_dim:
+                if input_dim < output_dim:
+                    # add more dimensions from input shape
+                    input_idx += 1
+                    input_dim *= input_shape[input_idx]
+                    group_input.append(input_shape[input_idx])
+                else:
+                    # add more dimensions from output shape
+                    output_idx += 1
+                    output_dim *= output_shape[output_idx]
+                    group_output.append(output_shape[output_idx])
+            groups.append((group_input, group_output))
+            input_idx += 1
+            output_idx += 1
+
+        # at least one of input_shape and output_shape is exhausted
+        # put all remaining dimensions into the last group
+        for i in range(input_idx, len(input_shape)):
+            assert input_shape[i] == 1
+            groups[-1][0].append(input_shape[i])
+        for i in range(output_idx, len(output_shape)):
+            assert output_shape[i] == 1
+            groups[-1][1].append(output_shape[i])
+
+        return groups
+
+    shape_groups = _group(in_shape, ou_shape)
     letters = iter(string.ascii_lowercase)
-    if can_bucket:
-        inchain = ouchain = chain
-        inedims = ouedims = edims = [next(letters) for _ in chain]
-    else:
-        inchain, ouchain = in_shape, ou_shape
-        inedims = [str(dimlen) for dimlen in in_shape]
-        ouedims = [str(dimlen) for dimlen in ou_shape]
-        chain = inchain + ouchain
-        edims = inedims + ouedims
-    shape_map: Dict[str, int] = {edim: eshape for (edim, eshape) in zip(edims, chain)}
+    in_anno = []
+    ou_anno = []
+    # the first letter in each in/out annotation
+    # which will be used to partition the tensor
+    ifirst = []
+    ofirst = []
 
-    # generate input and output shape annotations
-    # greedy fuse suffix number
-    def buckets(shape: List[int], chain: List[int], edims: List[int]) -> List[List[str]]:
-        anno = []
-        dimidx = 0
-        for idx, dimlen in enumerate(shape):
-            elements, bracket = 1, []
-            maxele = len(chain) - dimidx - (len(shape) - 1 - idx)
-            while True:
-                if len(bracket) == maxele:
-                    assert elements == dimlen, f"internal match error1: {bracket}"
-                    break
-                if dimidx >= len(chain) or elements * chain[dimidx] > dimlen:
-                    assert elements == dimlen, f"internal match error2: {bracket}"
-                    break
-                else:
-                    elements *= chain[dimidx]
-                    bracket.append(edims[dimidx])
-                    dimidx += 1
-            # fetch as many 1^ as possible from tail of the previous bracket
-            if len(bracket) == 0:
-                assert dimlen == 1, f"internal match error3: dimlen={dimlen}"
-                back = 0
-                for edim in anno[-1][1:][::-1]:
-                    if chain[edims.index(edim)] != 1:
-                        break
-                    back += 1
-                assert back > 0, f"internal match error4: dimlen={dimlen}"
-                bracket = anno[-1][-back:]
-                anno[-1] = anno[-1][:-back]
-            assert len(bracket) > 0, f"got a dimension with no edim"
-            anno.append(bracket)
-        return anno
+    def _append_partitionable(extra_in_anno=None, extra_out_anno=None):
+        """
+        Allocate a letter for the partitionable dimension
+        If we need to break the dimension into inner dimensions,
+        pass the rest of annotation with `extra_in_anno` and `extra_out_anno`
+        """
+        letter = next(letters)
+        in_anno.append(letter if extra_in_anno is None else f'({letter} {extra_in_anno})')
+        ou_anno.append(letter if extra_out_anno is None else f'({letter} {extra_out_anno})')
+        ifirst.append(letter)
+        ofirst.append(letter)
 
-    in_anno = buckets(in_shape, inchain, inedims)
-    ou_anno = buckets(ou_shape, ouchain, ouedims)
+    # handle each aligned group
+    for in_group, ou_group in shape_groups:
+        # step 1: remove all leading 1's
+        # find the first non-1 dimension in input
+        for in_group_non_one_idx in range(len(in_group)):
+            if in_group[in_group_non_one_idx] != 1:
+                break
+            in_anno.append(f'1')
+            ifirst.append(None)
+        else:
+            in_group_non_one_idx = len(in_group)
+        in_group = in_group[in_group_non_one_idx:]
 
-    # postprocess on dimlen == 1
-    shape_map['1'] = 1
-    for bracket in in_anno + ou_anno:
-        for subdim, edim in enumerate(bracket):
-            if shape_map[edim] == 1:
-                bracket[subdim] = str(shape_map[edim])
+        # find the first non-1 dimension in output
+        for ou_group_non_one_idx in range(len(ou_group)):
+            if ou_group[ou_group_non_one_idx] != 1:
+                break
+            ou_anno.append(f'1')
+            ofirst.append(None)
+        else:
+            ou_group_non_one_idx = len(ou_group)
+        ou_group = ou_group[ou_group_non_one_idx:]
 
-    # find out the axis that can be partitioned
-    ispatial, ifirst = set(), []
-    for bracket in in_anno:
-        sdim = None
-        for hdim in range(len(bracket)):
-            if bracket[hdim] == '1' or shape_map[bracket[hdim]] == 1: continue
-            sdim = bracket[hdim]
-            break
-        if sdim is not None:
-            ispatial.add(sdim)
-        ifirst.append(sdim)
+        if not in_group or not ou_group:
+            # all dimensions are 1, we are done
+            assert len(in_group) == 0 and len(ou_group) == 0
+            continue
 
-    ospatial, ofirst = set(), []
-    for bracket in ou_anno:
-        sdim = None
-        for hdim in range(len(bracket)):
-            if bracket[hdim] == '1' or shape_map[bracket[hdim]] == 1: continue
-            sdim = bracket[hdim]
-            break
-        if sdim is not None:
-            ospatial.add(sdim)
-        ofirst.append(sdim)
+        if len(in_group) == 1 and len(ou_group) == 1: # aligned
+            _append_partitionable()
+        else:
+            # use inner dimention to partition when possible
+            rest_start = 0
 
-    # intersection for spatial partitioned dimensions
-    spatial = ispatial.intersection(ospatial)
+            if in_group[0] == ou_group[0]:  # special case: no need to use inner dimension
+                _append_partitionable()
+                rest_start = 1
+            elif in_group[0] % ou_group[0] == 0:
+                _append_partitionable(extra_in_anno=in_group[0] // ou_group[0])
+                rest_start = 1
+            elif ou_group[0] % in_group[0] == 0:
+                _append_partitionable(extra_out_anno=ou_group[0] // in_group[0])
+                rest_start = 1
 
-    # set dimension cannot be partitioned
-    for bracket in in_anno + ou_anno:
-        for hdim in range(len(bracket)):
-            if bracket[hdim] not in spatial:
-                bracket[hdim] = str(shape_map[bracket[hdim]])
+            for _ in in_group[rest_start:]:
+                in_anno.append(f'{in_shape[len(in_anno)]}')
+                ifirst.append(None)
+            for _ in ou_group[rest_start:]:
+                ou_anno.append(f'{ou_shape[len(ou_anno)]}')
+                ofirst.append(None)
+
+    anno = OpAnno.create_op_str([in_anno], [ou_anno])
 
     def modifier(kwargs: Dict, idx, dim, num: int, subnode_idx: int) -> Dict:
         kwargs = dict(**kwargs)
@@ -1379,20 +1424,29 @@ def _reshape_anno(in_shape: List[int], ou_shape: List[int], kwarg_name: str) -> 
         if isinstance(size[oidx], IRObject):
             _logger.warning(f'partition dim size in IRObject: {size[oidx]}')
             size[oidx] = size[oidx].value
-        size[oidx] = size[oidx] // num
+        if size[oidx] != -1:
+            size[oidx] = size[oidx] // num
         kwargs[kwarg_name] = tuple(size)
         return kwargs
 
+    non_none_ifirst = [i for i in ifirst if i is not None]
+    non_none_ofirst = [i for i in ofirst if i is not None]
+    # no duplicated identifier
+    assert len(set(non_none_ifirst)) == len(non_none_ifirst)
+    assert len(set(non_none_ofirst)) == len(non_none_ofirst)
+    # all identifier shown in input shape are also shown in output shape
+    assert set(non_none_ifirst) == set(non_none_ofirst)
+
     # special rules: to change output size argument
     rules: TransformRule = []
-    for identifier in spatial:
-        iidx = ifirst.index(identifier)
+    for iidx, identifier in enumerate(ifirst):
+        if identifier is None:
+            continue
         oidx = ofirst.index(identifier)
         rules.append(
             TransformRule([DimopSplit.D(iidx)], [DimopSplit.D(oidx)], modifier)
         )
 
-    anno = OpAnno.create_op_str([in_anno], [ou_anno])
     return anno, rules
 
 
