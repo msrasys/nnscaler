@@ -35,7 +35,7 @@ For **_DNN system experts_**, they can leverage nnScaler to explore new DNN para
 
 Install the following packages before the installation of nnScaler:
 
-    Python >= 3.8, < 3.11 (3.10 is recommanded)
+    Python >= 3.9, < 3.11 (3.10 is recommanded)
 
     PyTorch >= 2.0, < 2.4 (2.2.0 is recommanded)
 
