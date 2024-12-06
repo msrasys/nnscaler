@@ -727,6 +727,11 @@ class IRSegment(IRCell):
         ids and dispatched to the corresponding consumers.
         The input tensor can be parameter, buffer or activation tensors.
 
+        Note that during the adapter generation (IRAdapterGener), the multiref inserted
+        here will be partitioned automatically by `autoref`. Further more, multiref may
+        be added to the graph at that time to reduce the communication time, check
+        `gen_activation` and `local_consumer_multiref` for more details.
+
         Args:
             tensor (IRSubTensor): full tensor to be multiref.
 
