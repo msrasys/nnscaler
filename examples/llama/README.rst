@@ -162,7 +162,7 @@ If the profiling is skipped, the system will use MI250's data by default. You ca
 
 .. code-block:: bash
 
-    cd nnscaler && python utility/prim_profiler.py
+    torchrun --nnodes=<X> --nproc_per_node=<Y> -m nnscaler.profiler
 
 Checkpoint
 ==========
