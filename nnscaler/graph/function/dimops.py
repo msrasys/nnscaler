@@ -737,7 +737,7 @@ class IRDimops(IRFwOperation):
         # change tensor to IRObject for '?' annotation
         for idx, shape_anno in enumerate(self._oannos):
             if shape_anno.ignore:
-                self.set_output(idx, IRObject())
+                self.set_output(idx, IRObject.missing)
 
     @property
     def anno(self) -> OpAnno:

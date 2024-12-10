@@ -7,7 +7,7 @@ from functools import reduce
 from operator import add
 from nnscaler.graph.function.dimops import IRDimops, OpAnno
 import nnscaler.graph.function.function as F
-from nnscaler.ir.cten import IRObject, IRTensor
+from nnscaler.ir.cten import IR, IRObject, IRTensor
 
 import pytest
 import torch
@@ -974,9 +974,9 @@ def factors(n):
 def verify_partition(op: IRDimops):
     anno = op.anno
     inputs = torch.randn(op.inputs()[0].shape)
-    outputs = inputs.reshape(**IRObject.try_unwrap(op.kwargs)).clone() \
+    outputs = inputs.reshape(**IR.try_unwrap(op.kwargs)).clone() \
         if 'reshape' in op.signature \
-        else inputs.view(**IRObject.try_unwrap(op.kwargs)).clone()
+        else inputs.view(**IR.try_unwrap(op.kwargs)).clone()
 
     def _get_anno_ids_map(shape_annos: tuple):
         anno_ids = {}
@@ -1019,7 +1019,7 @@ def verify_partition(op: IRDimops):
             input_chunks = torch.chunk(inputs, factor, dim=input_dim)
             # 2. update kwargs
             kwargs = transform_rules[(input_dim, output_dim)](op.kwargs, 0, input_dim, factor, 0)
-            kwargs = IRObject.try_unwrap(kwargs)
+            kwargs = IR.try_unwrap(kwargs)
             # 3. reshape/view
             reshaped_input_chunks = [chunk.reshape(**kwargs) for chunk in input_chunks] \
                 if 'reshape' in op.signature \
@@ -1036,7 +1036,7 @@ def test_reshape_view():
         query = IRTensor([2048, 1, 2, 512])
         op = f(query, IRObject(value=2048), IRObject(value=1), -1, 32)
         assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a 1 b 512 -> a 1 (b 16) 32'
-        assert IRObject.try_unwrap(op.kwargs[kwname]) == (2048, 1, -1, 32)
+        assert IR.try_unwrap(op.kwargs[kwname]) == (2048, 1, -1, 32)
         assert [type(x) for x in op.kwargs[kwname]] == [IRObject, IRObject, int, int]
         verify_partition(op)
 

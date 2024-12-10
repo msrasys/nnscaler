@@ -1,6 +1,24 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+"""
+Rules:
+1. `dict`/`list`/`tuple`/`slice` are the only supported container types for IRObject/IRTensor.
+2. IRObjects created in functions should be the outputs. Never create new IRObjects as function inputs/kwargs.
+3. `iter` is not compatible with our system, and should be avoided.
+   That's because the values in the iterator have been exausted in tracer
+4. Never nest IRObject, i.e. put another IRObject in IRObject.value.
+   Currently some functions still nest IRObject. Will be fixed in the future.
+5. You can return concrete value in function only when there is no IRObjects in function args/kwargs.
+6. When the tensor shape is unknown, you can annotate with `?`. In this case, the tensor will never be partitioned.
+7. When a function returns multiple tensors, you should return them as tuple/list,
+   and annotate them correctly.
+8. When a function is annotated with no-output (the right side of `->` of annotation is empty),
+   If you don't use its output in source code, this function will be removed in tracer
+   But if you use its output in source code, KeyError will be trigger in parser.
+   So it is a bad idea to annotate a function with no-output.
+"""
+
 from typing import Any, Callable, List, Optional, Tuple, Dict, Union, Iterable
 import string
 import copy
@@ -11,7 +29,7 @@ import math
 import logging
 from collections.abc import Iterable
 
-from nnscaler.ir.cten import IRTensor, IRObject
+from nnscaler.ir.cten import IRTensor, IRObject, IR
 from nnscaler.ir.tensor import IRSubTensor, IRFullTensor
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.dimops import DimopSplit, ShapeAnno, OpAnno, IRDimops, TransformRule
@@ -100,7 +118,7 @@ def FoldConstant(value: Any, signature = None):
 
     # always return a constant
     # no node will be created
-    return IRObject.try_unwrap(value)
+    return IR.try_unwrap(value)
 
 
 def MultiRef(tensor: IRTensor, times: int, signature = None):
@@ -2302,7 +2320,7 @@ def _resolve_overload_args(
         # overload matching is done by checking the type of the first positional argument
         # here we use unwrapped value,
         # because if it's a wrapped IRObject, it's impossible for us to select the correct overload
-        arg0 = IRObject.try_unwrap(args[0])
+        arg0 = IR.try_unwrap(args[0])
         for overload_idx in range(len(positional_arg_names)):
             # if arg[0] is None, use the first overload
             if arg0 is None or isinstance(arg0, arg_types[positional_arg_names[overload_idx][0]]):
@@ -2538,7 +2556,7 @@ def GetAttr(instance: object, field: str, signature = None) -> Union[List[int], 
             return torch.strided
     if isinstance(obj, torch.finfo):
         return getattr(obj, name)
-    return IRPyFunc(signature, [instance, field], [IRObject()])
+    return IRPyFunc(signature, [instance, field], [IRObject.missing])
 
 
 def FInfo(dtype: torch.dtype, signature = None) -> torch.finfo:
@@ -2866,10 +2884,10 @@ def Conv1D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, 
     """
     if len(input.shape) not in [2, 3]:
         raise ValueError(f"Expected input tensor to have 2 or 3 dimensions, but got {input.shape}")
-    stride_val = IRObject.try_unwrap(stride)
-    padding_val = IRObject.try_unwrap(padding)
-    dilation_val = IRObject.try_unwrap(dilation)
-    groups_val = IRObject.try_unwrap(groups)
+    stride_val = IR.try_unwrap(stride)
+    padding_val = IR.try_unwrap(padding)
+    dilation_val = IR.try_unwrap(dilation)
+    groups_val = IR.try_unwrap(groups)
     if isinstance(stride_val, int):
         stride_val = (stride_val,)
     if isinstance(dilation_val, int):
@@ -2952,11 +2970,11 @@ def ConvTranspose1D(input, weight, bias=None, stride=1, padding=0, output_paddin
     """
     if len(input.shape) not in [2, 3]:
         raise ValueError(f"Expected input tensor to have 2 or 3 dimensions, but got {input.shape}")
-    stride_val = IRObject.try_unwrap(stride)
-    padding_val = IRObject.try_unwrap(padding)
-    output_padding_val = IRObject.try_unwrap(output_padding)
-    dilation_val = IRObject.try_unwrap(dilation)
-    groups_val = IRObject.try_unwrap(groups)
+    stride_val = IR.try_unwrap(stride)
+    padding_val = IR.try_unwrap(padding)
+    output_padding_val = IR.try_unwrap(output_padding)
+    dilation_val = IR.try_unwrap(dilation)
+    groups_val = IR.try_unwrap(groups)
     if isinstance(stride_val, int):
         stride_val = (stride_val,)
     if isinstance(padding_val, int):
@@ -3013,10 +3031,10 @@ def Conv2D(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, 
     """
     if len(input.shape) not in [3, 4]:
         raise ValueError(f"Expected input tensor to have 3 or 4 dimensions, but got {input.shape}")
-    stride_val = IRObject.try_unwrap(stride)
-    padding_val = IRObject.try_unwrap(padding)
-    dilation_val = IRObject.try_unwrap(dilation)
-    groups_val = IRObject.try_unwrap(groups)
+    stride_val = IR.try_unwrap(stride)
+    padding_val = IR.try_unwrap(padding)
+    dilation_val = IR.try_unwrap(dilation)
+    groups_val = IR.try_unwrap(groups)
     if isinstance(stride_val, int):
         stride_val = (stride_val, stride_val)
     if isinstance(dilation_val, int):
@@ -3104,11 +3122,11 @@ def ConvTranspose2D(input, weight, bias=None, stride=1, padding=0, output_paddin
     """
     if len(input.shape) not in [3, 4]:
         raise ValueError(f"Expected input tensor to have 3 or 4 dimensions, but got {input.shape}")
-    stride_val = IRObject.try_unwrap(stride)
-    padding_val = IRObject.try_unwrap(padding)
-    output_padding_val = IRObject.try_unwrap(output_padding)
-    dilation_val = IRObject.try_unwrap(dilation)
-    groups_val = IRObject.try_unwrap(groups)
+    stride_val = IR.try_unwrap(stride)
+    padding_val = IR.try_unwrap(padding)
+    output_padding_val = IR.try_unwrap(output_padding)
+    dilation_val = IR.try_unwrap(dilation)
+    groups_val = IR.try_unwrap(groups)
     if isinstance(stride_val, int):
         stride_val = (stride_val, stride_val)
     if isinstance(padding_val, int):

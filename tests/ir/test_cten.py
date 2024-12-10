@@ -5,7 +5,7 @@ import torch
 
 import pytest
 
-from nnscaler.ir.cten import IRObject
+from nnscaler.ir.cten import IRObject, IR
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.graph.parser.parser import TensorMetadata, DICT_VALUES_TYPE, DICT_ITEMS_TYPE
 
@@ -20,28 +20,28 @@ def test_from_complex(tosub, requires_grad):
     rgt = requires_grad
     if rgt is None:
         rgt = True
-    obj = IRObject.from_complex('n', 1, tosub=tosub, requires_grad=requires_grad)
+    obj = IR.new('n', 1, tosub=tosub, requires_grad=requires_grad)
     assert type(obj) == IRObject and obj.value == 1 and not obj.is_constant and obj.name == 'n'
 
-    obj = IRObject.from_complex('n', [1, 2], tosub=tosub, requires_grad=requires_grad)
+    obj = IR.new('n', [1, 2], tosub=tosub, requires_grad=requires_grad)
     assert type(obj) == IRObject and obj.value == [1, 2] and not obj.is_constant and obj.name == 'n'
 
-    obj = IRObject.from_complex('n', {'a': 1, 'b': 2}, tosub=tosub, requires_grad=requires_grad)
+    obj = IR.new('n', {'a': 1, 'b': 2}, tosub=tosub, requires_grad=requires_grad)
     assert type(obj) == IRObject and obj.value == {'a': 1, 'b': 2} and not obj.is_constant and obj.name == 'n'
 
-    obj = IRObject.from_complex('n', {'a': {'c': [3, 4], 'd': [4, 5]}, 'b': [1,2]}, tosub=tosub, requires_grad=requires_grad)
+    obj = IR.new('n', {'a': {'c': [3, 4], 'd': [4, 5]}, 'b': [1,2]}, tosub=tosub, requires_grad=requires_grad)
     assert type(obj) == IRObject and obj.value == {'a': {'c': [3, 4], 'd': [4, 5]}, 'b': [1,2]} and not obj.is_constant and obj.name == 'n'
 
     t1 = torch.tensor(1.0)
     t2 = torch.tensor([2.0, 3.0], requires_grad=True)
 
-    obj = IRObject.from_complex('n', t1, tosub=tosub, requires_grad=requires_grad)
+    obj = IR.new('n', t1, tosub=tosub, requires_grad=requires_grad)
     assert type(obj) == tensor_type and id(obj.value) == id(t1) \
         and obj.shape == (1,) and obj.origin_shape == () and obj.dtype == torch.float \
         and obj.requires_grad == rg and not obj.is_constant \
         and obj.name == 'n'
 
-    obj = IRObject.from_complex('n', [t1, t2, 1], tosub=tosub, requires_grad=requires_grad)
+    obj = IR.new('n', [t1, t2, 1], tosub=tosub, requires_grad=requires_grad)
     assert type(obj) == list and len(obj) == 3
     assert type(obj[0]) == tensor_type and id(obj[0].value) == id(t1) \
         and obj[0].shape == (1,) and obj[0].origin_shape == () and obj[0].dtype == torch.float \
@@ -53,7 +53,7 @@ def test_from_complex(tosub, requires_grad):
         and obj[1].name == 'n'
     assert type(obj[2]) == IRObject and obj[2].value == 1 and not obj[2].is_constant and obj[2].name == 'n'
 
-    obj = IRObject.from_complex('n', {'a': [1, 2, t1], 'b': 2}, tosub=tosub, requires_grad=requires_grad)
+    obj = IR.new('n', {'a': [1, 2, t1], 'b': 2}, tosub=tosub, requires_grad=requires_grad)
     assert type(obj) == dict and len(obj) == 2
     x = obj['a']
     assert type(x) == list and len(x) == 3
@@ -67,13 +67,13 @@ def test_from_complex(tosub, requires_grad):
     assert type(y) == IRObject and y.value == 2 and not y.is_constant and y.name == 'n'
 
     x = [t1, t2, 1]
-    obj = IRObject.from_complex('n', x, tosub=tosub, tensor_types=(), requires_grad=requires_grad)
+    obj = IR.new('n', x, tosub=tosub, tensor_types=(), requires_grad=requires_grad)
     assert type(obj) == IRObject and id(obj.value) == id(x) and not obj.is_constant and obj.name == 'n'
 
-    obj = IRObject.from_complex('n', x, tosub=tosub, collection_types=(tuple,), requires_grad=requires_grad)
+    obj = IR.new('n', x, tosub=tosub, collection_types=(tuple,), requires_grad=requires_grad)
     assert type(obj) == IRObject and id(obj.value) == id(x) and not obj.is_constant and obj.name == 'n'
 
-    obj = IRObject.from_complex('n', [t1, [1, 2, {'a': 3}], (4, 5, {'b': 6, 'c': t2})], tosub=tosub, requires_grad=requires_grad)
+    obj = IR.new('n', [t1, [1, 2, {'a': 3}], (4, 5, {'b': 6, 'c': t2})], tosub=tosub, requires_grad=requires_grad)
     assert type(obj) == list and len(obj) == 3
     assert type(obj[0]) == tensor_type and id(obj[0].value) == id(t1) \
         and obj[0].shape == (1,) and obj[0].origin_shape == () and obj[0].dtype == torch.float \
@@ -97,7 +97,7 @@ def test_from_complex(tosub, requires_grad):
     t2 = TensorMetadata(shape=(2,), dtype=torch.float, requires_grad=True,
         stride=None, memory_format=None, is_quantized=None, qparams=None)
 
-    obj = IRObject.from_complex('n', {'a': t1, 'b': t2}.values(),
+    obj = IR.new('n', {'a': t1, 'b': t2}.values(),
         collection_types=(DICT_VALUES_TYPE,),
         tensor_types=(TensorMetadata,),
         tosub=tosub, requires_grad=requires_grad
@@ -114,7 +114,7 @@ def test_from_complex(tosub, requires_grad):
         and y.requires_grad == rgt and not y.is_constant \
         and y.name == 'n'
 
-    obj = IRObject.from_complex('n', {'a': t1, 'b': t2}.items(),
+    obj = IR.new('n', {'a': t1, 'b': t2}.items(),
         collection_types=(DICT_ITEMS_TYPE,),
         tensor_types=(TensorMetadata,),
         tosub=tosub, requires_grad=requires_grad
