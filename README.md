@@ -1,4 +1,4 @@
-<img src="docs/source/images/nnScaler-c-1.png" alt="drawing" width="100" align="left"/>
+<img src="docs/source/images/nnScaler-c-1.png" alt="drawing" width="100" align="left"/>  
 
 nnScaler: Compiling DNN models for Parallel Training over Multiple Devices
 ==============
@@ -11,6 +11,12 @@ nnScaler is a parallelization engine that compiles a Deep neural network (DNN) m
 
 <img src="docs/source/images/nnScaler_flow.png" alt="drawing" width="600"/>
 
+# Latest News
+nnScaler (also known as CUBE as code name) has been adopted by multiple product and research projects, this section includes some of the latest news from the team and partner projects.
+* **2024-11-26** nnScaler 0.5 released: https://github.com/microsoft/nnscaler/releases/tag/0.5
+* **2024-05-09** YOCO utilizes nnScaler for long-sequence training: [(YOCO)You only cache once: Decoder-decoder architectures for language models](https://arxiv.org/abs/2405.05254)
+* **2024-04-22** Post training for the long context version of [Phi-3 series](https://arxiv.org/abs/2404.14219)
+* **2024-02-21** LongRoPE utilizes nnScaler to reduce both the training and inference costs: [LongRoPE: Extending LLM context window beyond 2 million tokens](https://arxiv.org/abs/2402.13753)
 
 ### System Highlights:
 
@@ -40,7 +46,7 @@ Install the following packages before the installation of nnScaler:
     PyTorch >= 2.0, < 2.4 (2.2.0 is recommanded)
 
 ### Install nnScaler from source
-Execute below commands in nnScaler directory:
+Execute below commands in nnScaler directory: 
 
     pip install -r requirements.txt
     pip install -e .
@@ -57,13 +63,13 @@ Besides, to avoid *cppimport* error, it also needs to include nnScaler directory
 
 ### Prerequisite for Llama-3
 
-Install packages required to run Llama-3. Besides, a certain version of CUDA library is needed during flash-attn installation. For example, [CUDA V11.8](https://developer.nvidia.com/cuda-11-8-0-download-archive) is needed if using PyTorch 2.20.
+Install packages required to run Llama-3. Besides, a certain version of CUDA library is needed during flash-attn installation. For example, [CUDA V11.8](https://developer.nvidia.com/cuda-11-8-0-download-archive) is needed if using PyTorch 2.20. 
 
     python -m pip install transformers==4.40.0 flash-attn==2.5.5 tensorboard
 
 ### Model Access
 
-Obtain access of Llama-3 model from [HuggingFace](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct), where you will receive an access token which should be set as an environment variable:
+Obtain access of Llama-3 model from [HuggingFace](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct), where you will receive an access token which should be set as an environment variable: 
 
     export HF_TOKEN=<HUGGINGFACE_ACCESS_TOKEN>
 
@@ -96,7 +102,7 @@ class WrapperModel(torch.nn.Module):
 def main(args):
     # data config
     dataloader_config = ...
-
+    
     # model config
     model_config = ModelConfig(
         type=WrapperModel,
@@ -104,15 +110,15 @@ def main(args):
             'model_id': args.model_id,
         },
     )
-    # optimizer hyperparameters
+    # optimizer hyperparameters 
     optimizer_config = OptimizerConfig(
         type=MixedPrecisionAdamW,
         args={'lr': 2e-5, 'betas': (0.9, 0.95), 'weight_decay': 0.0, 'fused': True},
         #...
     )
     #...
-
-    # setup trainer with configs of dataloader/model/optimizer, etc.
+    
+    # setup trainer with configs of dataloader/model/optimizer, etc. 
     trainer = Trainer(train_args=TrainerArgs(
             #...
             model=model_config,
@@ -126,7 +132,7 @@ def main(args):
 
 ### Run the example Llama-3 training
 
-Then we can start the example, and all the parallelization tasks will be finished by nnScaler automatically.
+Then we can start the example, and all the parallelization tasks will be finished by nnScaler automatically. 
 
 ```shell
 cd examples/llama3_8B_128K
@@ -183,14 +189,6 @@ Or if you have multiple nodes, for example 2 nodes with 4 GPUs each:
 NOTE: The local batch size is fixed by default, so using more workers will result in a larger global batch size.
 
 💡 For advanced usages, please stay tuned for our future release.
-
-
-# Success Stories
-
-nnScaler has been adopted by multiple projects, including both product and research explorations:
-* [(YOCO)You only cache once: Decoder-decoder architectures for language models](https://arxiv.org/abs/2405.05254)
-* [LongRoPE: Extending LLM context window beyond 2 million tokens](https://arxiv.org/abs/2402.13753)
-* Post training for the long context version of [Phi-3 series](https://arxiv.org/abs/2404.14219)
 
 # Reference
 
