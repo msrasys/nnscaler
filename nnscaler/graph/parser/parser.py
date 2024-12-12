@@ -285,11 +285,9 @@ class FxModuleParser:
 
         # step 1: align the node output with the value in frame
 
-        # TODO: handle the case when the function has no output
+        # handle the case when the function has no output
         # Currently this can only happened for user registered functions
-        # We may need to assume the function has side effect, and keep it in the graph
-        # But in current implementation, this kind of function will be removed by DCE in tracer
-        # As a result, the follow check will not be triggered in normal cases
+        # We need to assume the function has side effect, and keep it in the graph
         if not ir_node.outputs():
             # To avoid the case that the function is annotated no output
             # but its output is used in other nodes.

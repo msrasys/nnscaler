@@ -1724,22 +1724,24 @@ def test_no_return(tmp_path):
         load_module=False,
     )
     # it should looks like:
-    # def segment18(self, x_22):
-    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 1700, in forward,  r = _op2(3)
-    #     _op2_3 = tests.parallel_module.test_gencode._op2(3)
-    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 1701, in forward,  r = _op3() + _op4(r)
-    #     _op3_4 = tests.parallel_module.test_gencode._op3()
-    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 1701, in forward,  r = _op3() + _op4(r)
-    #     _op4_5 = tests.parallel_module.test_gencode._op4(_op2_3)
-    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 1701, in forward,  r = _op3() + _op4(r)
-    #     add_14 = _operator.add(_op3_4, _op4_5)
-    #     # File "/home/weijiangxu/MagicCube/tests/parallel_module/test_gencode.py", line 1702, in forward,  return x + r
-    #     add_1_19 = torch.add(x_22, add_14, alpha=1)
-    #     del x_22
-    #     return add_1_19
+    # def segment19(self, x_23):
+    #     # File "/home/weijiangxu/nanogpt/MagicCube/tests/parallel_module/test_gencode.py", line 1707, in forward,  _op1(2)
+    #     tests.parallel_module.test_gencode._op1(2)
+    #     # File "/home/weijiangxu/nanogpt/MagicCube/tests/parallel_module/test_gencode.py", line 1708, in forward,  r = _op2(3)
+    #     _op2_4 = tests.parallel_module.test_gencode._op2(3)
+    #     # File "/home/weijiangxu/nanogpt/MagicCube/tests/parallel_module/test_gencode.py", line 1709, in forward,  r = _op3() + _op4(r)
+    #     _op3_5 = tests.parallel_module.test_gencode._op3()
+    #     # File "/home/weijiangxu/nanogpt/MagicCube/tests/parallel_module/test_gencode.py", line 1709, in forward,  r = _op3() + _op4(r)
+    #     _op4_6 = tests.parallel_module.test_gencode._op4(_op2_4)
+    #     # File "/home/weijiangxu/nanogpt/MagicCube/tests/parallel_module/test_gencode.py", line 1709, in forward,  r = _op3() + _op4(r)
+    #     add_15 = _operator.add(_op3_5, _op4_6)
+    #     # File "/home/weijiangxu/nanogpt/MagicCube/tests/parallel_module/test_gencode.py", line 1710, in forward,  return x + r
+    #     add_1_20 = torch.add(x_23, add_15, alpha=1)
+    #     del x_23
+    #     return add_1_20
 
-    #  _op1 will be removed by DCE in tracer
-    assert not _gencode_contains(tmp_path, IRNoneModule, 0,
+    #  _op1 will not be removed by DCE in tracer
+    assert _gencode_contains(tmp_path, IRNoneModule, 0,
                                  r'tests\.parallel_module\.test_gencode\._op1')
 
 
