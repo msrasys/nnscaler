@@ -312,28 +312,9 @@ class FxModuleParser:
             vals = type(vals)(IRObject(name=node.name, value=v, is_constant=is_constant) for v in vals)
             frame.set_var(node.name, vals)
 
-        # this is only for annoation check
-        # to make sure the annoation is consistent with actual output
-        if isinstance(ir_node, IRDimops):
-            # TODO: refine here
-            # infer_shape actually just check whether the annoation is consistent
-            # with actual output
-            # internally it will set the shape of output,
-            # but the output is quickly rewritten by the actual output
-            # in following code `ir_node.set_output(0, output_val)`
-            # So the scalar-tensor flag is not removed with `infer_shape`
-            ir_node.infer_shape()
-            for oidx, otensor in enumerate(ir_node.outputs()):
-                shape_anno = ir_node.oanno(oidx)
-                if shape_anno.ignore:
-                    continue
-                assert isinstance(vals[oidx], IRTensor) and isinstance(otensor, IRTensor), \
-                    f'find type inference not match: {vals[oidx]} vs {otensor}'
-
-                assert vals[oidx].shape == otensor.shape, (
-                        f'find shape inference not match: {vals[oidx].shape} vs {otensor.shape}'
-                        f'\nnode: {node}'
-                    )
+        # verify the inferred shape are consistent with actual output
+        if isinstance(ir_node, IRFwOperation):
+            ir_node.verify_shape(vals)
 
         assert len(vals) == len(ir_node.outputs()), f'{vals}, {ir_node.outputs()}'
         contains_undefined_output = any(v is IRObject.missing for v in ir_node.outputs())

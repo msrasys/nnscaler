@@ -38,20 +38,43 @@ class IRFwOperation(IRCell):
         for name, value in kwargs.items():
             self.set_kwarg(name, value)
 
-        # default infer rule
-        requires_grad = any(
-            t.requires_grad for t in inputs if isinstance(t, IRTensor))
-
         # setup output
-        outputs = [IRFullTensor(requires_grad=requires_grad) for _ in range(num_outputs)]
+        outputs = [IRObject.missing for _ in range(num_outputs)]
         for idx, output in enumerate(outputs):
             self.set_output(idx, output)
 
-    def infer_shape(self):
+    def infer_shape(self) -> dict[int, tuple[int, ...]]:
         """
-        Infer output value shape
+        Infer output value shape for each output
+        Will not update graph or shape of `self._outputs`
         """
-        raise NotImplementedError
+        # by default, no shape inference
+        return {}
+
+    def verify_shape(self, outputs=None) -> None:
+        """
+        Verify the shape of the outputs with inferred shape of the operator.
+        Raise error if shape mismatch.
+
+        Args:
+            outputs: the outputs to match. If None, use self.outputs()
+
+        Raises:
+            ValueError: if shape mismatch
+        """
+        infered_shapes = self.infer_shape()
+        outputs = outputs if outputs is not None else self.outputs()
+        for oidx in range(len(outputs)):
+            if oidx not in infered_shapes:
+                continue
+            if not isinstance(outputs[oidx], IRTensor):
+                raise ValueError(f'find type inference not match: {outputs[oidx]} expected to be a tensor')
+
+            if tuple(outputs[oidx].shape) != tuple(infered_shapes[oidx]):
+                raise ValueError(
+                    f'find shape inference not match: {outputs[oidx].shape} vs {infered_shapes[oidx]}'
+                    f'\nnode: {self}'
+                )
 
     @property
     def recompute(self) -> Optional[int]:

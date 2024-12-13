@@ -170,7 +170,7 @@ class DimSplitEinops(GenericDistAlgo):
             outputs = [t[nid] for t in ous]
             kwargs = rule.modifier()(node.kwargs, idx, dim, num, nid)
             sub_node: IRDimops = node.new(inputs, outputs, **kwargs)
-            sub_node.infer_shape()
+            sub_node.verify_shape()
             sub_nodes.append(sub_node)
 
         return sub_nodes

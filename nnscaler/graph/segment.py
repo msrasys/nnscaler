@@ -813,7 +813,7 @@ class IRSegment(IRCell):
 
             - IRWeightReducer generation case 1: when gradients over devices can not be accumulated directly to
               synchronize. This typically happens when a parameter is shared, especially in pipeline parallelism.
-              Here we can use multiref to synchronize gradients, but the semantic is different. (TODO: add a new 
+              Here we can use multiref to synchronize gradients, but the semantic is different. (TODO: add a new
               function to handle this case to make it more clear). With multiref, the weight becomes an activation,
               so no IRWeightReducer will be generated. Instead, Adapter will be used in runtime.
 
@@ -1001,7 +1001,7 @@ class IRSegment(IRCell):
                         multiref.comment = 'create at IRSegment:single_consume'
                         for idx, itensor in enumerate(itensors):
                             multiref.set_output(idx, itensor)
-                        multiref.infer_shape()
+                        multiref.verify_shape()
                         # insert multiref right before the consumor
                         idx = self.index(consumer)
                         # require backward
@@ -1042,7 +1042,7 @@ class IRSegment(IRCell):
                 multiref.comment = 'create at IRSegment:single_consume'
                 for idx, itensor in enumerate(itensors):
                     multiref.set_output(idx, itensor)
-                multiref.infer_shape()
+                multiref.verify_shape()
                 idx = self.index(producers[ftensor]) + 1 if ftensor in producers else 0
                 # idx = nodes.index(cnodes[0])
                 if any(itensor.requires_grad for itensor in node.inputs()):
