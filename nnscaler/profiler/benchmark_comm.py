@@ -150,12 +150,16 @@ class CommProfiler:
         return sizes_in_mb, times_in_s
 
 
-def main() -> bool:
+def main():
     if not is_running_distributed():
-        print('Usage: torchrun {TORCHRUN_ARGS} -m nnscaler.profiler')
+        print('Usage: torchrun {TORCHRUN_ARGS} -m nnscaler.profiler.benchmark_comm')
         sys.exit(1)
 
     nnscaler.init()
+
+    if DeviceGroup().world_size == 1:
+        _logger.warning('Single GPU profiling is not supported')
+        return
 
     if DeviceGroup().local_rank == 0:
         nnscaler.utils.set_default_logger_level('INFO')
