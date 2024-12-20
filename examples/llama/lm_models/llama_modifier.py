@@ -16,36 +16,14 @@ import torch
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.models.llama.modeling_llama import LlamaAttention, LLAMA_ATTENTION_CLASSES, apply_rotary_pos_emb, LlamaRMSNorm
 from transformers.utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
     is_flash_attn_2_available,
     is_flash_attn_greater_or_equal_2_10,
-    logging,
-    replace_return_docstrings,
 )
 
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
-
-
-try:
-    from apex.normalization.fused_layer_norm import fused_rms_norm_affine
-    has_apex = True
-except ImportError:
-    has_apex = False
-
-
-def rmsnorm_fwd(self, hidden_states):
-    if has_apex:
-        return fused_rms_norm_affine(hidden_states, self.weight, self.weight.shape, self.variance_epsilon)
-    else:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
 
 
 class NNScalerLlamaFlashAttention2(LlamaAttention):
@@ -263,8 +241,3 @@ def llama_flash_attention_anno(query_states, key_states, value_states, attention
 
 
 register_op(llama_flash_attention_anno)(nnscaler_flash_attention_forward)
-
-
-def nnscaler_llama_init():
-    LLAMA_ATTENTION_CLASSES["flash_attention_2"] = NNScalerLlamaFlashAttention2
-    LlamaRMSNorm.forward = rmsnorm_fwd

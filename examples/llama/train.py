@@ -9,7 +9,7 @@ from datasets import load_from_disk
 import huggingface_hub
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
-from modeling_modifier import nnscaler_llama_init
+from lm_models.utils import nnscaler_lm_init
 from chunk_linear_cross_entropy import chunk_linear_cross_entropy
 
 from nnscaler.utils import set_default_logger_level
@@ -116,7 +116,7 @@ def main(args):
 
     set_default_logger_level('INFO')
 
-    nnscaler_llama_init()
+    nnscaler_lm_init(args)
 
     ## Setup Dataset ##
 
@@ -349,7 +349,12 @@ if __name__ == '__main__':
         '--attn_implementation',
         default='flash_attention_2',
         type=str,
-        help='attn implementation, can be flash_attention_2, spda or eager',
+        help='attn implementation, can be flash_attention_2, spda, eager',
+    )
+    parser.add_argument(
+        '--enable_diff_attn',
+        action='store_true',
+        help='enable diff attention implementation, eager is normal diff attention, flash_attention_2 is diff flash attention, and spda diff attention is not currently supported',
     )
     args = parser.parse_args()
     if args.explore_pipeline and not args.pipeline_pivots:
