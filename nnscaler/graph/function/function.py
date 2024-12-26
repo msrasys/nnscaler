@@ -3,7 +3,12 @@
 
 """
 Rules:
-1. `dict`/`list`/`tuple`/`slice` are the only supported container types for IRObject/IRTensor.
+1. `dict`/`list`/`tuple`/`slice` are the only supported container types for IRTensor.
+   `DictValues`/`DictItems` will be converted to tuple to make it compatible with our system.
+   TODO: Set is incompatible with our system, but it is really rare to put tensors in a set.
+   The problem to support set is that hash of IRObject is different with the hash of original value.
+   So set functions (add/discard/etc) can have different behavior.
+   `DictKeys` has the same problem, so we don't support it either.
 2. IRObjects created in functions should be the outputs. Never create new IRObjects as function inputs/kwargs.
 3. `iter` is not compatible with our system, and should be avoided.
    That's because the values in the iterator have been exausted in tracer
@@ -2627,14 +2632,31 @@ def L1Loss(input, target, size_average=None, reduce=None, reduction='mean', sign
 
 
 def MakeTuple(inputs: Iterable, signature=None):
-    return tuple(inputs)
+    """
+    builtins.tuple
+    1. inputs can be an IRObject or a tuple/list of any type(including IRObject)
+    2. If inputs is IRObject, return IRPyFunc op
+       Otherwise, return concrete value.
+    """
+    if not isinstance(inputs, IRObject):
+        return tuple(inputs)
+
+    ir_value = IR.new('tuple', tuple(inputs.value), is_constant=inputs.is_constant)
+    return IRPyFunc(signature, inputs=[inputs], outputs=[ir_value])
 
 
 def MakeList(inputs: Iterable, signature=None):
-    if isinstance(inputs, Iterable):
+    """
+    builtins.list
+    1. inputs can be an IRObject or a tuple/list of any type(including IRObject)
+    2. If inputs is IRObject, return IRPyFunc op
+       Otherwise, return concrete value.
+    """
+    if not isinstance(inputs, IRObject):
         return list(inputs)
-    else:
-        return IRPyFunc(signature, [inputs], [IRObject(value=list(inputs.value))])
+
+    ir_value = IR.new('list', list(inputs.value), is_constant=inputs.is_constant)
+    return IRPyFunc(signature, inputs=[inputs], outputs=[ir_value])
 
 
 def MakeSlice(*inputs: Iterable, signature=None):
@@ -3308,16 +3330,43 @@ def Sigmoid(input, *, out=None, signature=None):
     return IRDimops(Sigmoid, 'sigmoid', signature, annos, [input])
 
 
-def Dictkeys(o: Union[Dict, IRObject], signature=None):
-    assert isinstance(o, dict) or isinstance(o.value, dict), f'the input should be a dict or an IRObject with dict value, but get {o}'
-    return IRPyFunc(signature, inputs=[o], outputs=[IRObject(name='dictkeys', value=o.value.keys(), is_constant=o.is_constant)])
+def DictKeys(o: Union[Dict, IRObject], signature=None):
+    signature = 'nnscaler.runtime.function.dict_keys'
+
+    if not isinstance(o, dict) and not (isinstance(o, IRObject) and isinstance(o.value, dict)):
+         raise ValueError(f'the input should be a dict or an IRObject with dict value, but get {o}')
+
+    # put tuple of keys as value, because tuple supports all operations of dict.keys()
+    value = tuple(o.keys() if isinstance(o, dict) else o.value.keys())
+
+    # set is_constant to False to make sure it will never be folded.
+    ir_value = IR.new('dictkeys', value, is_constant=False)
+    return IRPyFunc(signature, inputs=[o], outputs=[ir_value])
 
 
 def DictValues(o: Union[Dict, IRObject], signature=None):
-    assert isinstance(o, dict) or isinstance(o.value, dict), f'the input should be a dict or an IRObject with dict value, but get {o}'
-    return IRPyFunc(signature, inputs=[o], outputs=[IRObject(name='dictvalues', value=o.value.values(), is_constant=o.is_constant)])
+    signature = 'nnscaler.runtime.function.dict_values'
+
+    if not isinstance(o, dict) and not (isinstance(o, IRObject) and isinstance(o.value, dict)):
+         raise ValueError(f'the input should be a dict or an IRObject with dict value, but get {o}')
+
+    # put tuple of values as value, because tuple supports all operations of dict.values()
+    value = o.values() if isinstance(o, dict) else o.value.values()
+
+    # set is_constant to False to make sure it will never be folded.
+    ir_value = IR.new('dictvalues', value, is_constant=False)
+    return IRPyFunc(signature, inputs=[o], outputs=[ir_value])
 
 
 def DictItems(o: Union[Dict, IRObject], signature=None):
-    assert isinstance(o, dict) or isinstance(o.value, dict), f'the input should be a dict or an IRObject with dict value, but get {o}'
-    return IRPyFunc(signature, inputs=[o], outputs=[IRObject(name='dictitems', value=o.value.items(), is_constant=o.is_constant)])
+    signature = 'nnscaler.runtime.function.dict_values'
+
+    if not isinstance(o, dict) and not (isinstance(o, IRObject) and isinstance(o.value, dict)):
+         raise ValueError(f'the input should be a dict or an IRObject with dict value, but get {o}')
+
+    # put tuple of kv pairs as value, because tuple supports all operations of dict.items()
+    value = o.items() if isinstance(o, dict) else o.value.items()
+
+    # set is_constant to False to make sure it will never be folded.
+    ir_value = IR.new('dictitems', value, is_constant=False)
+    return IRPyFunc(signature, inputs=[o], outputs=[ir_value])

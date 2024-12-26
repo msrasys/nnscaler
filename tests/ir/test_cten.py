@@ -70,8 +70,9 @@ def test_from_complex(tosub, requires_grad):
     obj = IR.new('n', x, tosub=tosub, tensor_types=(), requires_grad=requires_grad)
     assert type(obj) == IRObject and id(obj.value) == id(x) and not obj.is_constant and obj.name == 'n'
 
-    obj = IR.new('n', x, tosub=tosub, collection_types=(tuple,), requires_grad=requires_grad)
-    assert type(obj) == IRObject and id(obj.value) == id(x) and not obj.is_constant and obj.name == 'n'
+    x_set = {1, t1, t2} # set is not supported
+    obj = IR.new('n', x_set, tosub=tosub, requires_grad=requires_grad)
+    assert type(obj) == IRObject and id(obj.value) == id(x_set) and not obj.is_constant and obj.name == 'n'
 
     obj = IR.new('n', [t1, [1, 2, {'a': 3}], (4, 5, {'b': 6, 'c': t2})], tosub=tosub, requires_grad=requires_grad)
     assert type(obj) == list and len(obj) == 3
@@ -92,42 +93,66 @@ def test_from_complex(tosub, requires_grad):
         and y['c'].requires_grad == rgt and not y['c'].is_constant \
         and y['c'].name == 'n'
 
+    obj_item = IRObject('obj_item', value=1, is_constant=False)
+    obj_tensor_item = IRFullTensor(t1.shape, 'obj_tensor_item')
+
+    obj = IR.new('n', slice(obj_item, 2, obj_item))
+    assert type(obj) == IRObject and obj.value == slice(1, 2, 1)
+
+    obj = IR.new('n', [obj_item, 2], tosub=tosub, requires_grad=requires_grad)
+    assert type(obj) == IRObject and obj.value == [1, 2]
+
+    obj = IR.new('n', [obj_item, 2, obj_tensor_item], tosub=tosub, requires_grad=requires_grad)
+    assert type(obj) == list and len(obj) == 3
+    assert obj[0].value == 1 and obj[0].tid != obj_item.tid
+    assert obj[1].value == 2
+    assert type(obj[2]) == tensor_type and obj[2].parent.tid != obj_tensor_item.tid
+
+    obj = IR.new('n', [t1, obj_item], tosub=tosub, requires_grad=requires_grad)
+    assert type(obj) == list and len(obj) == 2
+    assert type(obj[0]) == tensor_type and id(obj[0].value) == id(t1)
+    assert type(obj[1]) == IRObject and obj[1].value == 1 and obj[1].tid != obj_item.tid
+
+    obj = IR.new('n', [t1, obj_item, obj_tensor_item], tosub=tosub, requires_grad=requires_grad)
+    assert type(obj) == list and len(obj) == 3
+    assert type(obj[0]) == tensor_type and id(obj[0].value) == id(t1)
+    assert type(obj[1]) == IRObject and obj[1].value == 1 and obj[1].tid != obj_item.tid
+    assert type(obj[2]) == tensor_type and obj[2].parent.tid != obj_tensor_item.tid
+
     t1 = TensorMetadata(shape=(), dtype=torch.float, requires_grad=False,
         stride=None, memory_format=None, is_quantized=None, qparams=None)
     t2 = TensorMetadata(shape=(2,), dtype=torch.float, requires_grad=True,
         stride=None, memory_format=None, is_quantized=None, qparams=None)
 
     obj = IR.new('n', {'a': t1, 'b': t2}.values(),
-        collection_types=(DICT_VALUES_TYPE,),
         tensor_types=(TensorMetadata,),
         tosub=tosub, requires_grad=requires_grad
     )
-    assert type(obj) == DICT_VALUES_TYPE and len(obj) == 2
-    x = list(obj)[0]
+    assert type(obj) == tuple and len(obj) == 2
+    x = obj[0]
     assert type(x) == tensor_type and id(x.value) == id(t1) \
         and x.shape == (1,) and x.origin_shape == () and x.dtype == torch.float \
         and x.requires_grad == rg and not x.is_constant \
         and x.name == 'n'
-    y = list(obj)[1]
+    y = obj[1]
     assert type(y) == tensor_type and id(y.value) == id(t2) \
         and y.shape == (2,) and y.origin_shape == (2,) and y.dtype == torch.float \
         and y.requires_grad == rgt and not y.is_constant \
         and y.name == 'n'
 
     obj = IR.new('n', {'a': t1, 'b': t2}.items(),
-        collection_types=(DICT_ITEMS_TYPE,),
         tensor_types=(TensorMetadata,),
         tosub=tosub, requires_grad=requires_grad
     )
-    assert type(obj) == DICT_ITEMS_TYPE and len(obj) == 2
-    x = list(obj)[0]
+    assert type(obj) == tuple and len(obj) == 2
+    x = obj[0]
     assert x[0] == 'a'
     x = x[1]
     assert type(x) == tensor_type and id(x.value) == id(t1) \
         and x.shape == (1,) and x.origin_shape == () and x.dtype == torch.float \
         and x.requires_grad == rg and not x.is_constant \
         and x.name == 'n'
-    y = list(obj)[1]
+    y = obj[1]
     assert y[0] == 'b'
     y = y[1]
     assert type(y) == tensor_type and id(y.value) == id(t2) \

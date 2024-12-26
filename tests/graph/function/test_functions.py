@@ -1074,3 +1074,59 @@ def test_reshape_view():
         op = f(query, 10, 5, 7)
         assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a 1 1 b 1 c 1 1 -> a b c'
         verify_partition(op)
+
+
+def test_make_collection():
+    # test non-irobject
+    l = [1, 2, 3]
+    t = (1, 2, 3)
+    s = slice(*l)
+    r = F.MakeList(l)
+    assert r == l
+    r = F.MakeTuple(t)
+    assert r == t
+    r = F.MakeSlice(*l)
+    assert r == s
+
+    # test irobject items
+    l = [IRObject(value=1), IRFullTensor([2]), 3]
+    t = (IRObject(value=1), IRFullTensor([2]), 3)
+    s = slice(*l)
+    r = F.MakeList(l)
+    assert r == l
+    r = F.MakeTuple(t)
+    assert r == t
+    r = F.MakeSlice(*l)
+    assert r == s
+
+    # test whole irobject
+    l = IRObject(value=[1, 2, 3])
+    t = IRObject(value=(1, 2, 3))
+    r = F.MakeList(l, signature='builtins.list')
+    assert r.output(0).value == l.value
+    r = F.MakeTuple(t, signature='builtins.tuple')
+    assert r.output(0).value == t.value
+    # MakeSlice is not valid.
+    # F.MakeSlice(s)
+
+
+def test_dict_keys_values_items():
+    # normal dict
+    d = {'a': 1, 'b': 2, 'c': 3}
+    r = F.DictKeys(d)
+    assert r.output(0).value == tuple(d.keys())
+    r = F.DictValues(d)
+    assert r.output(0).value == tuple(d.values())
+    r = F.DictItems(d)
+    assert r.output(0).value == tuple(d.items())
+
+    d = {'a': IRFullTensor([1]), 'b': IRFullTensor([2]), 'c': IRFullTensor([3])}
+    r = F.DictKeys(d)
+    assert r.output(0).value == tuple(d.keys())
+    r = F.DictValues(d)
+    # IRFullTensor will be reconstructed, so their ids are different
+    assert all(x.shape == y.shape and x != y for x, y in zip(r.output(0), d.values()))
+    r = F.DictItems(d)
+    # key will never be wrapped with IRObject
+    # IRFullTensor will be reconstructed, so their ids are different
+    assert all(x[0] == y[0] and x[1].shape == y[1].shape and x[1] != y[1] for x, y in zip(r.output(0), d.items()))

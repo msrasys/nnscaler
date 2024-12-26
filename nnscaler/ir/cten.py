@@ -590,7 +590,6 @@ class IR:
         name: str,
         data: Any,
         *,
-        collection_types: Tuple = (tuple, list, dict),
         tensor_types: Tuple = (torch.Tensor,),
         is_constant: bool = False,
         requires_grad: Optional[bool] = None,
@@ -598,9 +597,14 @@ class IR:
     ) -> Any:
         """
         Convert complex data type of
-            collection_types (tuple, list, dict)
+            collection_types (tuple, list, dict, slice, DICT_VALUES_TYPE, DICT_ITEMS_TYPE)
             tensor_types (has shape/dtype/requires_grad)
         into intermediate representation object.
+
+        Note:
+        1. dict_values will be converted into `Tuple`
+           dict_items will be converted into `Tuple[Tuple[Key, Value]]`
+        2. This function cannot be used after logical graph is created (i.e., after parser).
 
         Rule:
             1. All tensor-like objects will be converted into IRFullTensor
@@ -617,25 +621,33 @@ class IR:
         Args:
             name (str): the object name
             data (Any): the complex data structure to be converted
-            collection_types (Tuple): the complex data types to be converted
             tensor_types (Tuple): the tensor data types to be converted
-            tosub(bool): whether convert full tensor to sub-tensor
+            tosub(bool): whether convert all full tensors to sub-tensor
             is_constant (bool): whether the object is constant
             requires_grad (Optional[bool]): the requires_grad flag for the tensor-like object
                 None: will respect the original requires_grad flag
                 True: will set requires_grad to True
                 False: will set requires_grad to False
         """
-        from nnscaler.ir.tensor import IRFullTensor
+        from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 
-        collection_types = tuple(collection_types)
         tensor_types = tuple(tensor_types)
-        supported_collection_types = (tuple, list, dict, _DICT_VALUES_TYPE, _DICT_ITEMS_TYPE)
-        if any(t not in supported_collection_types for t in collection_types):
-            raise ValueError(f"Only support converting complex data type of {supported_collection_types}")
 
         def _inner(obj) -> Tuple[Any, bool]:
-            # second return is to know if there is any tensor-like object
+            """second return is to know if there is any tensor-like object"""
+
+            if isinstance(obj, IRObject) :
+                assert not isinstance(obj, IRSubTensor), "IRSubTensor is not supported"
+                # Never reuse existing ir object
+                # to make sure we have SSA semantics.
+                if isinstance(obj, IRFullTensor):
+                    new_ir_tensor = obj.like()
+                    if tosub:
+                        new_ir_tensor = new_ir_tensor.tosub()
+                    new_ir_tensor._value = obj.value
+                    return new_ir_tensor, True
+                else:
+                    return IRObject(name, value=obj.value, is_constant=is_constant), False
 
             if isinstance(obj, tensor_types):
                 if requires_grad is None:
@@ -656,40 +668,58 @@ class IR:
                 tensor._value = obj  # is required in SemanticModel.forward
                 return tensor, True
 
-            if isinstance(obj, collection_types):
-                if isinstance(obj, tuple):
-                    result = [_inner(item) for item in obj]
-                    if not any(r[1] for r in result):
-                        return IRObject(name, value=obj, is_constant=is_constant), False
-                    else:
-                        return tuple(r[0] for r in result), True
-                if isinstance(obj, list):
-                    result = [_inner(item) for item in obj]
-                    if not any(r[1] for r in result):
-                        return IRObject(name, value=obj, is_constant=is_constant), False
-                    else:
-                        return [r[0] for r in result], True
-                if isinstance(obj, dict):
-                    if not all(isinstance(key, str) for key in obj.keys()):
-                        raise TypeError(f"only support dict type with str key, but got {obj.keys()}.")
-                    result = {k: _inner(v) for k, v in obj.items()}
-                    if not any(r[1] for r in result.values()):
-                        return IRObject(name, value=obj, is_constant=is_constant), False
-                    else:
-                        return {k: r[0] for k, r in result.items()}, True
-                if isinstance(obj, _DICT_VALUES_TYPE):
-                    result = [_inner(item) for item in obj]
-                    if not any(r[1] for r in result):
-                        return IRObject(name, value=obj, is_constant=is_constant), False
-                    else:
-                        return {k: r[0] for k, r in enumerate(result)}.values(), True
-                if isinstance(obj, _DICT_ITEMS_TYPE):
-                    result = {k: _inner(v) for k, v in obj}
-                    if not any(r[1] for r in result.values()):
-                        return IRObject(name, value=obj, is_constant=is_constant), False
-                    else:
-                        return {k: r[0] for k, r in result.items()}.items(), True
-            # slice will go here, as its start/stop/step are never tensor-like objects
+            if isinstance(obj, slice):
+                result = [_inner(item) for item in [obj.start, obj.stop, obj.step]]
+                if not any(r[1] for r in result):
+                    # try not to re-construct the slice if possible.
+                    unwrapped_value = cls.try_unwrap(obj) if cls.contains_object(obj) else obj
+                    return IRObject(name, value=unwrapped_value, is_constant=is_constant), False
+                else:
+                    return slice(*[r[0] for r in result]), True
+
+            if isinstance(obj, tuple):
+                result = [_inner(item) for item in obj]
+                if not any(r[1] for r in result):
+                    # try not to re-construct the tuple if possible.
+                    unwrapped_value = cls.try_unwrap(obj) if cls.contains_object(obj) else obj
+                    return IRObject(name, value=unwrapped_value, is_constant=is_constant), False
+                else:
+                    return tuple(r[0] for r in result), True
+
+            if isinstance(obj, list):
+                result = [_inner(item) for item in obj]
+                if not any(r[1] for r in result):
+                    # try not to re-construct the list if possible.
+                    unwrapped_value = cls.try_unwrap(obj) if cls.contains_object(obj) else obj
+                    return IRObject(name, value=unwrapped_value, is_constant=is_constant), False
+                else:
+                    return [r[0] for r in result], True
+
+            if isinstance(obj, dict):
+                if not all(isinstance(key, str) for key in obj.keys()):
+                    raise TypeError(f"only support dict type with str key, but got {obj.keys()}.")
+                result = {k: _inner(v) for k, v in obj.items()}
+                if not any(r[1] for r in result.values()):
+                    # try not to re-construct the dict if possible.
+                    unwrapped_value = cls.try_unwrap(obj) if cls.contains_object(obj) else obj
+                    return IRObject(name, value=unwrapped_value, is_constant=is_constant), False
+                else:
+                    return {k: r[0] for k, r in result.items()}, True
+
+            if isinstance(obj, _DICT_VALUES_TYPE):
+                result = [_inner(item) for item in obj]
+                if not any(r[1] for r in result):
+                    return IRObject(name, value=cls.try_unwrap(tuple(obj)), is_constant=is_constant), False
+                else:
+                    return tuple(r[0] for r in result), True
+
+            if isinstance(obj, _DICT_ITEMS_TYPE):
+                result = {k: _inner(v) for k, v in obj}
+                if not any(r[1] for r in result.values()):
+                    return IRObject(name, value=cls.try_unwrap(tuple(obj)), is_constant=is_constant), False
+                else:
+                    return tuple((k,r[0]) for k, r in result.items()), True
+
             return IRObject(name, value=obj, is_constant=is_constant), False
 
         return _inner(data)[0]

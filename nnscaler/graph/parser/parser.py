@@ -161,7 +161,6 @@ class FxModuleParser:
         assert hasattr(node, 'meta') and 'tensor_meta' in node.meta, f"Node {node} should have tensor_meta"
         meta = node.meta['tensor_meta']
         val = IR.new(node.name, meta,
-            collection_types=(list, tuple, dict, DICT_VALUES_TYPE, DICT_ITEMS_TYPE),
             tensor_types=(TensorMetadata,),
             is_constant=is_constant
         )
@@ -189,11 +188,17 @@ class FxModuleParser:
             return list(FxModuleParser.parse_complex(t, frame) for t in val)
         if isinstance(val, dict):
             return {key: FxModuleParser.parse_complex(val, frame) for key, val in val.items()}
+        # TODO: Currently slice/DICT_VALUES_TYPE/DICT_ITEMS_TYPE cases are never found.
+        # We need to find some examples to test them.
+        if isinstance(val, slice):
+            return slice(FxModuleParser.parse_complex(val.start, frame),
+                         FxModuleParser.parse_complex(val.stop, frame),
+                         FxModuleParser.parse_complex(val.step, frame))
         # because fx node cannot be a dict key, so skip DICT_KEYS_TYPE here
         if isinstance(val, DICT_VALUES_TYPE):
-            return {i: FxModuleParser.parse_complex(x, frame) for i, x in enumerate(val)}.values()
+            return tuple(FxModuleParser.parse_complex(x, frame) for x in val)
         if isinstance(val, DICT_ITEMS_TYPE):
-            return {i: FxModuleParser.parse_complex(x, frame) for i, x in val}.items()
+            return tuple((i, FxModuleParser.parse_complex(x, frame)) for i, x in val)
         if isinstance(val, torch.fx.Node):
             return frame.get_var(val.name)
         return val
