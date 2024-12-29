@@ -20,7 +20,6 @@ from transformers.utils import (
     is_flash_attn_2_available,
     is_flash_attn_greater_or_equal_2_10,
 )
-from flash_attn import flash_attn_func
 
 from nnscaler.graph.parser.register import register_op
 if is_flash_attn_2_available():
@@ -244,5 +243,5 @@ def flash_attention_anno(query_states, key_states, value_states, *args, **kwargs
         q_anno = kv_anno = 'num_heads'
     return f'b l^ {q_anno} hd^, b s^ {kv_anno} hd^, b s^ {kv_anno} vd^ -> b l^ {q_anno} vd^'
 
-
-register_op(flash_attention_anno)(flash_attn_func)
+if is_flash_attn_2_available():
+    register_op(flash_attention_anno)(flash_attn_func)

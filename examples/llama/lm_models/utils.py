@@ -3,8 +3,6 @@
 
 import torch
 from transformers.models.llama.modeling_llama import LLAMA_ATTENTION_CLASSES, LlamaRMSNorm
-from .llama_modifier import NNScalerLlamaFlashAttention2
-from .diff_transformer_modifier import NNScalerMultiheadDiffAttn, NNScalerMultiheadDiffFlashAttn
 
 try:
     from apex.normalization.fused_layer_norm import fused_rms_norm_affine
@@ -26,10 +24,12 @@ def rmsnorm_fwd(self, hidden_states):
 
 def nnscaler_lm_init(args):
     if args.enable_diff_attn:
+        from .diff_transformer_modifier import NNScalerMultiheadDiffAttn, NNScalerMultiheadDiffFlashAttn
         if args.attn_implementation == "sdpa":
             raise ValueError("sdpa is currently not supported in Diff-Transformer")
         LLAMA_ATTENTION_CLASSES["eager"] = NNScalerMultiheadDiffAttn
         LLAMA_ATTENTION_CLASSES["flash_attention_2"] = NNScalerMultiheadDiffFlashAttn
     else:
+        from .llama_modifier import NNScalerLlamaFlashAttention2
         LLAMA_ATTENTION_CLASSES["flash_attention_2"] = NNScalerLlamaFlashAttention2
     LlamaRMSNorm.forward = rmsnorm_fwd
