@@ -111,11 +111,41 @@ def _profile_graph(dilled_info: str, dev_id: int, partition_degree: int, re_prof
     result.put(ret)
 
 
+def _load_comm_data(profile_dir: Path, plan_ngpus: int) -> Dict[str, Dict[str, List[Tuple[float, float]]]]:
+    '''
+    Load communication profile data from the profile directory. If the data is not found, use the default data
+    at _DEFAULT_COMM_DATA_PATH. Note that in autodist's current design, we only consider the communication
+    cost across 2^n devices, where n is an positive integer. For example, if plan_ngpus is 8, we will try to
+    load intra_2.json, intra_4.json, and intra_8.json from the profile directory. If any of the files is not
+    found, we will use the default data as well.
+    '''
+    def loader(path: Path):
+        if not os.path.exists(path):
+            return False, None
+        info = {}
+        dev = 2
+        while dev <= plan_ngpus:
+            fname = f'intra_{dev}.json'
+            if not (path / fname).exists():
+                return False, None
+            with open(path / fname, 'r') as f:
+                info[fname] = json.load(f)
+            dev *= 2
+        return True, info
+
+    comm_path = profile_dir / 'comm'
+    success, comm_info = loader(comm_path)
+    if not success:
+        _logger.warning(f'Communication profile data not found, using default data at {_DEFAULT_COMM_DATA_PATH}')
+        success, comm_info = loader(Path(_DEFAULT_COMM_DATA_PATH))
+    if not success:
+        raise RuntimeError(f'Communication profile data is not compatible with plan_ngpus {plan_ngpus}')
+    return comm_info
+
+
 class CostDatabase:
 
-    def __init__(self, graph: IRGraph, profile_dir: str, memory_granularity: int, ignore_small_tensor_threshold: int):
-        self.comm_info = {}
-
+    def __init__(self, graph: IRGraph, profile_dir: str, plan_ngpus: int, memory_granularity: int, ignore_small_tensor_threshold: int):
         self.graph = graph
 
         self.profile_dir = Path(profile_dir)
@@ -125,13 +155,7 @@ class CostDatabase:
             self.comp_profile_path.mkdir(parents=True)
         self.db.load_ops(self.comp_profile_path)
 
-        comm_dir = self.profile_dir / 'comm'
-        if not comm_dir.exists():
-            _logger.warning(f'Communication profile data not found, using default data at {_DEFAULT_COMM_DATA_PATH}')
-            comm_dir = Path(_DEFAULT_COMM_DATA_PATH)
-        for fname in listdir(comm_dir):
-            with open(comm_dir / fname, 'r') as f:
-                self.comm_info[fname] = json.load(f)
+        self.comm_info = _load_comm_data(self.profile_dir, plan_ngpus)
 
         self.memory_granularity = memory_granularity
         self.ignore_small_tensor_threshold = ignore_small_tensor_threshold
@@ -188,8 +212,7 @@ class CostDatabase:
         if mem % self.memory_granularity == 0:
             return mem
         else:
-            return (mem + self.memory_granularity
-                   ) // self.memory_granularity * self.memory_granularity
+            return (mem + self.memory_granularity) // self.memory_granularity * self.memory_granularity
 
     def filter_then_sum(self, tensor_sizes: Tuple[int], mask=[]):
         # assert len(tensor_sizes) == len(
