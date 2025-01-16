@@ -298,6 +298,10 @@ def create_wrapped_leaf_class(clz, *, replace_cls: Optional[Callable]=None, defa
                 else:
                     setattr(clz_wrapper_clz, name, attr)
 
+        # to support subscriptable type hint like func(x: dict[str, str])
+        if hasattr(clz, '__class_getitem__'):
+            setattr(clz_wrapper_clz, '__class_getitem__', clz.__class_getitem__)
+
     wrapped_cls_to_orig_cls[clz_wrapper_clz] = clz
     return clz_wrapper_clz
 
