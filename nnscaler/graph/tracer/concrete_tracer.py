@@ -615,7 +615,7 @@ class ConcreteTracer(TracerBase):
 
         if isinstance(fn, MethodType):
             fn = fn.__func__
-        assert isinstance(fn, FunctionType)
+        assert isinstance(fn, FunctionType), f"Expected a function, but got {fn} with type {type(fn)}"
 
         fn_globals = fn.__globals__  # run before it gets patched
 

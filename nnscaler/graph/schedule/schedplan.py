@@ -1,6 +1,41 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+"""In pipeline parallelism, we want to execute micro-batches of samples on multiple devices
+simultaneously. To achieve this, the computation dataflow graph is split into
+several sub-graph (`IRSegment` in nnScaler), each of which has been assigned to related
+devices (by default, we assumed a forward segment and its corresponding backward segment
+share a same device placement).
+In a pipeline schedule, each segment is replicated and annotated with different micro-batch
+index (`Block` in nnScaler). Therefore, the schedule plan is a list of `Block` on each device.
+To be valid, the blocks should satisfy the data dependency constraints, i.e., if block A
+and block B share the same micro-batch index, and segment in B is dependent on segment in A,
+then block A should be executed before block B. Note that there is no data dependency
+between blocks with different micro-batch index.
+Given the schedule (execution orders of blocks in each device), we can estimate the execution
+time of the whole pipeline by:
+- the execution time (span) of each block
+- the data dependency between blocks belonging to different device groups
+- the communication time between devices
+
+In nnScaler's current implementation, we use a global view to define and validate the schedule
+plan. To be more specific
+- the execution time is discreted into integer steps
+- each block takes an integer span to finish execution
+- the communication time between blocks is omitted
+- a valid schedule plan should satisfy that if block A depends on block B, then the start step
+  of block A should not be earlier than end time of block B.
+
+This implementation may be improved in the future, since
+- it is hard to estimate the span of each block before the actual execution
+- the communication time between blocks cannot be ignored in a real system, especially when
+  the network bandwidth is limited
+- the real start time of each block may be different from that defined in the schedule plan.
+  Dependencies are materialized by inserting send and recv adapters between blocks. As a result,
+  a block may start as soon as its input data is ready, rather than strictly following the start
+  time in the schedule plan.
+"""
+
 from typing import Dict, List,  Optional, Tuple, Set
 
 from nnscaler.ir.cten import IRCell
@@ -384,12 +419,13 @@ class SchedulePlan(PlanBase):
         """
         Validate the plan to check if it satisfies data dependency
 
-        @return valid bool
+        Returns:
+            valid (bool): whether the plan is valid
         """
         for block1 in self._blocks:
             for block2 in self._blocks:
                 if self._dependency.depends(block1, block2):
-                    if self.start(block1) >= self.start(block2):
+                    if self.start(block1) + block1.span > self.start(block2):
                         return False
         return True
 

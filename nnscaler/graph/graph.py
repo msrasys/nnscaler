@@ -910,8 +910,8 @@ class IRGraph(IRSegment):
         Returns:
             None
         """
-        assert all(isinstance(node, IRFwOperation) for node in nodes), \
-            f"Find node is not IRFwOperation or IRDataOperation: {node}"
+        for node in nodes:
+            assert isinstance(node, IRFwOperation), f"Expected node to be IRFwOperation, but got {node}"
         assert all(node in self._nodes for node in nodes), \
             f"Exist node is not in graph nodes"
         starts = list(self._nodes.index(node) for node in nodes)
