@@ -178,25 +178,29 @@ def parallelize_graph(graph: IRGraph,
                 break
             assert find_desc, f'node {consumer} not found in any stage'
 
+    # add multiref for shared parameters across stages
+    # note that we have constrained that shared parameters cannot be partitioned in SPMDSolver, other input tensors
+    # belonging to the same operator can be partitioned. For example, in some LLMs, the embedding matrix is shared
+    # with the output layer. In this case, the batch dim / seq dim of the activation tensor can be partitioned.
+    for ftensor, stage_info in tensor_split_info.items():
+        if not ftensor.is_param():
+            continue
+        splits = set()
+        find_replicated = False
+        for stage_splits in stage_info.values():
+            splits.update(stage_splits)
+            if any(s[0] == 'REPLICATED' for s in stage_splits):
+                find_replicated = True
+        splits = list(splits)
+        # For safety, we will add multiref when detecting shared param are all replicated for pipeline parallelism.
+        # The reason is that stages may have different number of devices, it is hard to synchronize gradients directly
+        # by inserting reducers although weights are all REPLICAED.
+        if len(splits) > 1 or (len(pp_desc.spmd_descs) > 1 and find_replicated):
+            _logger.info(f'add multiref for shared param {ftensor}')
+            graph.multiref(ftensor, comment='shared param')
+
     # graph staging
     if len(pp_desc.spmd_descs) > 1:
-        # add multiref for shared parameters across stages
-        # note that we have constrained that shared parameters cannot
-        # be partitioned in SPMDSolver.
-        for ftensor, stage_info in tensor_split_info.items():
-            if not ftensor.is_param():
-                continue
-            splits = set()
-            find_replicated = False
-            for stage_splits in stage_info.values():
-                splits.update(stage_splits)
-                if any(s[0] == 'REPLICATED' for s in stage_splits):
-                    find_replicated = True
-            splits = list(splits)
-            if len(splits) > 1 or find_replicated:
-                _logger.info(f'add multiref for shared param {ftensor}')
-                graph.multiref(ftensor, comment='shared param')
-
         stages = []
         for spmd_desc in pp_desc.spmd_descs:
             stage = []
