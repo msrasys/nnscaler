@@ -125,7 +125,8 @@ class ModuleCodeGen(FuncEmission):
             'from typing import *',
             'from pathlib import Path',
             'import torch', 'import torch.utils.checkpoint as ckpt',
-            'import nnscaler', 'import _operator', 'from numpy import inf', 'import builtins', '',
+            'import nnscaler', 'import nnscaler.flags',
+            'import _operator', 'from numpy import inf', 'import builtins', '',
             f'runtime_version = {runtime_version!r}', '', ''
         ]
 

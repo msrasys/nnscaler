@@ -180,8 +180,6 @@ class ComputeConfig:
             raise ValueError(f"pipeline_nmicros {pipeline_nmicros} must be > 0.")
         if pipeline_nstages <= 0:
             raise ValueError(f"pipeline_nstages {pipeline_nstages} must be > 0.")
-        if self.plan_ngpus % pipeline_nstages != 0:
-            raise ValueError(f"pipeline_nstages {pipeline_nstages} must be a multiple of plan_ngpus {self.plan_ngpus}")
         if pipeline_scheduler not in _PREDEFINE_SCHEDS:
             raise ValueError(f"pipeline_scheduler {pipeline_scheduler} is not supported. "
                              f"Supported schedulers are {_PREDEFINE_SCHEDS.keys()}")

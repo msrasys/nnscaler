@@ -17,7 +17,7 @@ All the arguments are defined in ``TrainerArgs`` class. Here is the definition o
     @dataclass
     class TrainerArgs:
         compute_config: ComputeConfig = None
-    
+
         gen_savedir: str = './.nnscaler'
         gen_reuse: str = 'auto'
         pas_policy: str = 'autodist'
@@ -25,7 +25,7 @@ All the arguments are defined in ``TrainerArgs`` class. Here is the definition o
         instance_name: str = None
         run_mode: str = 'run'
         tracing_from_weights: str = None
-    
+
         model: ModelConfig = field(default_factory=ModelConfig)
         optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
         dataset: DatasetConfig = field(default_factory=DatasetConfig)
@@ -35,22 +35,22 @@ All the arguments are defined in ``TrainerArgs`` class. Here is the definition o
         checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
         log: List[LogConfig] = field(default_factory=list)
         hook: Union[HookConfig, HookMapConfig, None] = None
-    
+
         precision: Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE], None] = None
-    
+
         micro_batch_size: int = 1
         global_batch_size: Optional[int] = None
         grad_accumulation_steps: Optional[int] = None
-    
+
         max_epochs: Optional[int] = None
         max_train_steps: Optional[int] = None
         max_val_steps: Optional[int] = None
-    
+
         val_every_n_train_steps: Optional[int] = None
         val_every_n_epochs: Optional[int] = 1
-    
+
         enable_progress_bar: bool = True
-    
+
         seed: Optional[int] = None
         init_env_fn: str = None
 
@@ -378,17 +378,17 @@ Checkpoint Config
       class CheckpointConfig:
           save_dir: str = './checkpoints'
           no_save: bool = False
-      
+
           save_type: str = 'sharded'
-      
+
           save_last: bool = True
           save_best: bool = True
           symlink_best_and_last: bool = True
-      
+
           every_n_train_steps: Optional[int] = None
           every_n_epochs: Optional[int] = None
           keep_last_n_checkpoints: Optional[int] = None
-      
+
           resume_from: str = None
 
 * ``save_dir`` (``str``): The directory to save the checkpoints.
@@ -488,25 +488,25 @@ CONFIG_FILE is the path to the configuration yaml file. It looks like (taken fro
       constant_folding: true
       use_zero: true
       use_end2end: true
-    
+
     run_mode: run
     pas_policy: autodist
     micro_batch_size: 2
     global_batch_size: 8
     max_epochs: 4
     max_train_steps: 10
-    
+
     model:
       type: tests.cli.common.MLP
       args:
         dim: 16
         nlayers: 16
-    
+
     optimizer:
       type: torch.optim.Adam
       args:
         lr: 0.01
-    
+
     dataset:
       type: tests.cli.common.SimpleDataset
       train_args:
@@ -515,7 +515,7 @@ CONFIG_FILE is the path to the configuration yaml file. It looks like (taken fro
       val_args:
         dim: 16
         size: 10
-    
+
     checkpoint:
       keep_last_n_checkpoints: 30
       every_n_train_steps: 1
@@ -542,16 +542,16 @@ The configuration of the compute environment. It is a dataclass with the followi
     class ComputeConfig:
         plan_ngpus: int
         runtime_ngpus: int
-    
+
         constant_folding: bool = False
         trace_strategy: Literal['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache'] = 'cuda_run_cpu_offload'
-    
+
         use_zero: bool = False
         zero_ngroups: int = 1
-    
+
         inference_only : bool = False
         use_end2end: bool = False
-    
+
         pas_config: Dict[str, Any] = field(default_factory=dict)
         user_config: Dict[str, Any] = field(default_factory=dict)
 
@@ -712,7 +712,8 @@ The configuration of the PAS policy should be passed in the ``pas_config`` of ``
 
    * ``pipeline_nstages``: the number of stages in the pipeline. Default is ``plan_ngpus``. Optional.
    * ``pipeline_nmicros``: the number of microbatches in the pipeline. Required.
-   * ``pipeline_scheduler``: the scheduler name for the pipeline. Current we support four schedulers in training ``1f1b``/``1f1b_plus``/``gpipe``/``chimera_direct`` (4 stages pipeline only), and one scheduler in inference ``infer_pipe``. Default is ``1f1b``. Optional.
+   * ``pipeline_scheduler``: the scheduler name for the pipeline. Current we support four schedulers in training ``1f1b``/``1f1b_plus``/``1f1b_interleaved``/``gpipe``/``chimera_direct`` (4 stages pipeline only), and one scheduler in inference ``infer_pipe``. Default is ``1f1b``. Optional.
+   * ``pp_size``: the pipeline parallelism size. Default is ``pipeline_nstages``. Optional.
 
 #. ``autodist``: the recommended policy for most cases. Currently it only support Adam-like optimizers. It will automatically choose the best partition for you by balancing the memory usage and speed. It has the following configurations.
 

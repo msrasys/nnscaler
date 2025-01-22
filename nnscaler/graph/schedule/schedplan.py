@@ -55,7 +55,7 @@ class Block:
     """
 
     def __init__(self, cell: IRCell, micro_batch_id: int, span: int) -> None:
-        """Create an execution block with IRCell on microbatch index. The 
+        """Create an execution block with IRCell on microbatch index. The
         block will take `span` steps to finish execution.
         """
         assert isinstance(cell, IRCell), f"Expected IRCell, but got {type(cell)}: {cell}"
@@ -67,7 +67,7 @@ class Block:
         if isinstance(other, Block):
             return other.content == self.content and other.mid == self.mid
         return False
-    
+
     def __hash__(self) -> int:
         return hash((self._content, self._micro_batch_id))
 
@@ -78,15 +78,15 @@ class Block:
     @property
     def mid(self) -> int:
         return self._micro_batch_id
-    
+
     @property
     def content(self) -> IRCell:
         return self._content
-    
+
     @property
     def span(self) -> int:
         return self._span
-    
+
     def dispatch(self, devid: int):
         return Block(self._content.dispatch(devid), self._micro_batch_id)
 
@@ -132,7 +132,7 @@ class ScheduleDependency:
                     self.senders[adapter] = segment
         # get all weight reducers
         self.reducers = self.graph.select(ntype=IRWeightReducer, flatten=False)
-    
+
     def depends(self, prev: Block, next: Block) -> bool:
         return prev.mid == next.mid and self.graph.depends(prev.content, next.content)
 
@@ -163,11 +163,11 @@ class PlanBase:
     @property
     def nsteps(self) -> int:
         return len(self._step_blocks)
-    
+
     @property
     def graph(self) -> IRGraph:
         return self._graph
-    
+
     @property
     def device(self) -> Tuple[int]:
         device = set()
@@ -177,7 +177,7 @@ class PlanBase:
 
     def nodes(self) -> Tuple[Block]:
         return tuple(self._seqs)
-    
+
     def add_block(self, block: Block, step: int):
         """Add a block to start executing from step"""
         self._extend_step(step + block.span - 1)
@@ -246,10 +246,10 @@ class PlanBase:
         self._block_start_step[block] = step
         self._blocks.append(block)
         return block
-    
+
     def remove_step(self, step: int):
         """Remove the step if there are no blocks in execution.
-        
+
         All the blocks after the `step` will be shifted earlier.
         This can only apply when no adapters are placed.
 
@@ -273,7 +273,7 @@ class PlanBase:
 
     def shrink(self):
         """Remove steps that have no blocks in execution
-        
+
         Note the implementation is costly. Users should avoid
         calling it many times.
         """
@@ -295,21 +295,21 @@ class PlanBase:
         blocks = self._step_blocks[step]
         blocks = tuple(blk for blk in blocks if self.start(blk) == step)
         return blocks
-    
+
     def start(self, block: Block) -> int:
         """Get the start step of the block"""
         return self._block_start_step[block]
-    
+
     def all_blocks(self) -> Tuple[Block]:
         """
         Get all segment blocks
         """
         return tuple(self._blocks)
-    
+
     def depends(self, prev: Block, succ: Block) -> bool:
         """Check whether prev block directly depends on succ block"""
         return self._dependency.depends(prev, succ)
-    
+
     def _extend_step(self, step: int):
         """Extend the maximal accessible steps of plan to `step` index"""
         if len(self._step_blocks) <= step:
@@ -377,8 +377,6 @@ class SchedulePlan(PlanBase):
 
     def __init__(self, graph: IRGraph, num_microbatches: int):
         super().__init__(graph)
-        if CompileFlag.async_reducer:
-            raise NotImplementedError("Async reducer is not supported for schedule plan yet.")
         # execution sequence
         self._num_microbatches = num_microbatches
         # bind to the graph
@@ -390,7 +388,7 @@ class SchedulePlan(PlanBase):
         Get number of micro-batches
         """
         return self._num_microbatches
-    
+
     @property
     def graph(self) -> IRGraph:
         return self._graph
@@ -479,12 +477,12 @@ class SchedulePlan(PlanBase):
         for block in self._blocks:
             if block.content not in sids:
                 sids[block.content] = len(sids)
-        
+
         for idx, (cell, sid) in enumerate(sids.items()):
             dscp += f'{cell.name}{cell.cid:<3} = {sid}; '
             if (idx + 1) % 3 == 0:
                 dscp += '\n'
-        
+
         dscp += '\nAnnotation: i(f/b)j = segment i on executing (forward/backward) microbatch j'
         for devid in sorted(self.device):
             timeline = '\n'
@@ -517,6 +515,6 @@ class SchedulePlan(PlanBase):
                 timeline += f" ... (remaining {self.nsteps-show_max_steps} steps)"
             dscp += timeline
         return dscp
-    
+
     def __repr__(self):
         return self.str(show_max_steps=20)

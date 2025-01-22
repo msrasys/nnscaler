@@ -170,21 +170,23 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
     """
     if not cfg.use_end2end:
         raise ValueError("Hybrid policy only supports end2end module")
-    if cfg.use_async_reducer:
-        raise ValueError("Hybrid policy does not support async reducer")
 
     ngpus: int = cfg.plan_ngpus
     nstages = cfg.pas_config.get('pipeline_nstages', cfg.plan_ngpus)
     nmicros = cfg.pas_config['pipeline_nmicros']
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
-    tp_size: int = cfg.plan_ngpus // nstages
-    if ngpus % tp_size != 0:
-        raise ValueError(f'invalid tp_size {tp_size} for ngpus {ngpus}')
-    pp_size = ngpus // tp_size
+    pp_size = cfg.pas_config.get('pp_size', nstages)
+
+    if nstages % pp_size != 0:
+        raise ValueError(f'invalid pp_size {pp_size} for nstages {nstages}')
+    if ngpus % pp_size != 0:
+        raise ValueError(f'invalid pp_size {pp_size} for ngpus {ngpus}')
+    tp_size = ngpus // pp_size
+
 
     auto_multiref(graph)
     fnodes = graph.select(ntype=IRFwOperation)
-    stages = mitr.divide(pp_size, fnodes)
+    stages = mitr.divide(nstages, fnodes)
     stages = [list(s) for s in stages]
     for idx, stage in enumerate(stages):
         _logger.info(f'> stage {idx}: {stage[0]}')
@@ -192,19 +194,18 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
 
     stages: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
     stages = [s for s in stages if s.isfw()]
-    assert len(stages) == pp_size, "Internal Error"
+    assert len(stages) == nstages, "Internal Error"
 
     # stage-wise tensor parallelism
     curr_devices = list(range(ngpus))
-    for stage in stages:
+    for idx, stage in enumerate(stages):
+        idx = idx % pp_size
+        devs = curr_devices[idx * tp_size: (idx + 1)* tp_size]
         for node in stage.nodes():
-            devs = curr_devices[:tp_size]
             try:
                 _tp(graph, node, devs, idx=0, dim=0)
             except Exception as e:
                 _replica(graph, node, devs)
-        curr_devices = curr_devices[tp_size:]
-    assert len(curr_devices) == 0, f"remaining devices: {curr_devices} not used"
 
     # replicate dataloader
     for dl in graph.select(ntype=IRDataOperation):
