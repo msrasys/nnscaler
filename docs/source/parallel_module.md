@@ -320,7 +320,7 @@ We have `build_optimizer` to build an optimizer for distributed training.
 def build_optimizer(
     module: torch.nn.Module,
     optimizer_fn: Union[Type[OptimizerT], Callable[..., OptimizerT]],
-    *args,
+    compute_config: Optional[ComputeConfig] = None,
     **kwargs,
 ) -> OptimizerT:
 ```
@@ -329,8 +329,10 @@ It has the following parameters:
 - `optimizer_fn` (`Union[Type[torch.optim.Optimizer], Callable[..., torch.optim.Optimizer]]`):
     It can be the optimizer class or optimizer factory function.
     The first parameter of the `optimizer_fn` should be the module parameters.
-- *args: other args for `optimizer_fn` besides module parameters.
-- **kwargs: the kwargs will pass to `optimizer_fn`
+- compute_config (Optional[ComputeConfig]):
+    The config will be used to generate communication reducer.
+    If it is None, Default configuration will be used when creating reducer for non-parallel modules.
+- **kwargs: the kwargs will pass to `optimizer_fn`.
 
 To support distributed training, in the function we need to hook 4 places (which we have done for you in `build_optimizer`. That's why you should use `build_optimizer` to create optimizer):
 

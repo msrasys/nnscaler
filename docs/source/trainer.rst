@@ -142,6 +142,98 @@ Component Configs
       class ModelConfig:
           type: str = None
           args: Dict[str, Any] = field(default_factory=dict)
+          parallel_modules: list[ModuleParallelizeConfig] = field(default_factory=list)
+
+  * ``type`` (``str``): The model type. Note: It can't be a factory function.
+  * ``args`` (``Dict[str, Any]``): The arguments of the model's ``__init__`` function.
+  * ``parallel_modules`` (``List[ModuleParallelizeConfig]``): The sub modules to be parallelized.
+    If this is not empty, these modules will be parallelized instead of the whole model.
+    i.e. sub modules (in the list of ``parallel_modules``) in the model
+    will be replaced with parallelized version
+
+    Note: When parallel_modules is not empty,
+    pipeline parallelism is not supported as the model is not end-to-end parallelized any more.
+
+  .. code-block:: python
+
+      @dataclass(frozen=True)
+      class OptionalComputeConfig:
+          constant_folding: Optional[bool] = None
+          trace_strategy: Optional[str] = None
+          use_zero: Optional[bool] = None
+          zero_ngroups: Optional[int] = None
+          zero_use_reduce_scatter: Optional[bool] = None
+          use_async_reducer: Optional[bool] = None
+          reducer_bucket_cap_mb: Optional[float] = None
+
+          pas_config: Optional[Dict[str, Any]] = None
+          user_config: Optional[Dict[str, Any]] = None
+
+This is an optional version of the ``ComputeConfig``.
+Please refer to :ref:`ComputeConfig <computeconfig>` for more information.
+
+  .. code-block:: python
+
+      @dataclass
+      class ModuleParallelizeConfig:
+          type: str = None
+          args: Dict[str, Any] = field(default_factory=dict)
+          forward_args_gen_fn: str = None
+          tracing_from_weights: str = None
+          tracing_from_weights_prefix: str = None
+
+          # For the following config, If None, the config of the trainer_args will be used
+          compute_config: Optional[OptionalComputeConfig] = None
+          gen_savedir: Optional[str] = None
+          gen_reuse: Optional[str] = None
+          pas_policy: Optional[str] = None
+          broadcast_strategy: Optional[str] = None
+          instance_name: Optional[str] = None
+          precision: Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE], None] = None
+
+  * ``type`` (``str``): The sub model type to be parallelized. Note: It can't be a factory function.
+  * ``args`` (``Dict[str, Any]``): The arguments of the model's ``__init__`` function.
+  * ``forward_args_gen_fn`` (``str``): The full qualified name of the function to generate dummy forward args.
+    Its type should be ``Callable[[TrainerArgs],Dict[str, Any]]``.
+    The function should return a dict of dummy forward args for the model.
+  * ``tracing_from_weights`` (``str``): The path to the weights to be loaded when tracing(compiling) the model.
+    It is only used in tracing to serve as the initial state dict of the model. Default is ``None``.
+  * ``tracing_from_weights_prefix`` (``str``): the prefix in the state dict (loaded from ``trainer_args.tracing_from_weights``) to be used for tracing.
+    Please note ``trainer_args.tracing_from_weights`` must be set if you want to use this,
+    and ``tracing_from_weights`` and ``tracing_from_weights_prefix`` shouldn't be set at the same time.
+  * ``compute_config`` (``Optional[OptionalComputeConfig]``): The compute config for the parallelized module.
+    The merged config with the compute config of the ``trainer_args.compute_config`` will be used.
+  * ``gen_savedir`` (``Optional[str]``): The directory to save the generated files.
+    If None, the config of the trainer_args will be used. You can find more information below.
+  * ``gen_reuse`` (``Optional[str]``): The reuse strategy of the generated code.
+    If None, the config of the trainer_args will be used. You can find more information below.
+  * ``pas_policy`` (``Optional[str]``): The policy of parameter partitioning.
+    If None, the config of the trainer_args will be used. You can find more information below.
+  * ``broadcast_strategy`` (``Optional[str]``): The strategy of broadcasting the model.
+    If None, the config of the trainer_args will be used. You can find more information below.
+  * ``instance_name`` (``Optional[str]``): The instance name of the trainer.
+    If None, the config of the trainer_args will be used. You can find more information below.
+  * ``precision`` (``Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE], None]``): The precision of the model.
+    If None, the config of the trainer_args will be used. You can find more information below.
+
+Please Note:
+1. The parallelization is per-module-type, which means one module type can only be parallelized once.
+   Moreover, the initial weights of the parallelized modules with the same type are all the same.
+
+   So if you want to parallelize a module multiple times (with different arguments or different inital weights),
+   you need to create an alias for it.
+
+   For example, if you want to parallelize a module named ``SomeModule`` twice, you can create an alias for it:
+    .. code-block:: python
+
+       class SomeModuleAlias(SomeModule):
+           pass
+
+2. The initial weights of the whole model will be different when sub module parallelization is enabled,
+   since parallelization process will change the ``rng_state`` of torch.
+
+   To make the initial weights of the whole model the same as the original model,
+   We recommend to save the initial weights of the original model and load them before training.
 
 * ``optimizer`` (``OptimizerConfig``): The optimizer to be used.
 
@@ -467,6 +559,7 @@ Other configs
 * ``enable_progress_bar`` (``bool``): Whether to enable the progress bar. Default is ``True``.
 * ``seed`` (``Optional[int]``): The random seed. Default is ``None``.
 * ``init_env_fn`` (``str``): The function to initialize the environment. Default is ``None``.
+  Note: one of ``seed`` and ``init_env_fn`` must be set.
 
 ***
 CLI
