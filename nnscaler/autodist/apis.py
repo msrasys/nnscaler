@@ -97,7 +97,7 @@ def calc_parallel_plan(graph: IRGraph,
         [node.cid for node in group] for group in recompute_groups
     ]
 
-    if autodist_config.pipeline:
+    if autodist_config.pipeline_enabled:
         pp_out = calc_optimal_pp_plan(autodist_graph, autodist_config)
     else:
         pp_out = calc_optimal_spmd_plan(autodist_graph, autodist_config)
@@ -215,9 +215,8 @@ def parallelize_graph(graph: IRGraph,
     else:
         stages = [graph]
 
-    # TODO: check pipeline_nstages when ready.
-    # if autodist_config.pipeline and len(stages) != autodist_config.pipeline_nstages:
-    #     raise RuntimeError("pipeline_nstages doesn't match the number of stages (based on your pipeline_pivots config) in the plan")
+    if autodist_config.pipeline_nstages != 'auto' and len(stages) != autodist_config.pipeline_nstages:
+        raise RuntimeError("pipeline_nstages doesn't match the number of stages (based on your pipeline_pivots config) in the plan")
 
     # add multiref to an activation tensor when the states of the tensor and its grad are different
     # among consumers and current segment's outputs

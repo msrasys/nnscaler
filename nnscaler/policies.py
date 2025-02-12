@@ -133,7 +133,8 @@ def pas_pp(graph: IRGraph, cfg: 'ComputeConfig'):
     """
     pipeline parallelism inside a scale unit, and dp across scale units
     """
-    if cfg.pas_config.get('pipeline_nstages', cfg.plan_ngpus) != cfg.plan_ngpus:
+    nstages = cfg.pas_config.get('pipeline_nstages', 'auto')
+    if nstages != 'auto' and nstages != cfg.plan_ngpus:
         raise ValueError("pas_pp requires pipeline_nstages == plan_ngpus")
     return pas_hybrid(graph, cfg)
 
@@ -172,7 +173,9 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
         raise ValueError("Hybrid policy only supports end2end module")
 
     ngpus: int = cfg.plan_ngpus
-    nstages = cfg.pas_config.get('pipeline_nstages', cfg.plan_ngpus)
+    nstages = cfg.pas_config.get('pipeline_nstages', 'auto')
+    if nstages == 'auto':
+        nstages = cfg.plan_ngpus
     nmicros = cfg.pas_config['pipeline_nmicros']
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
     pp_size = cfg.pas_config.get('pp_size', nstages)
@@ -223,11 +226,29 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         update_freq = update_freq[0]
 
     # optional parameters
-    explore_pipeline = pas_cfg.get('explore_pipeline', False)
-    if explore_pipeline and not cfg.use_end2end:
-        raise ValueError("explore_pipeline cannot be enabled if use_end2end is False")
-    if explore_pipeline and cfg.use_async_reducer:
-        raise ValueError("explore_pipeline cannot be enabled if use_async_reducer is True")
+
+    # Note we don't directly pass pipeline_nstages to autodist.
+    # when `pipeline_nstages == 'auto'`, we will check if there are options incompatible with pipeline.
+    # if we find incompabible options (here use_async_reducer and pipeline_pivots),
+    # we will disable pipeline effectively by setting it to 1.
+    pipeline_nstages = pas_cfg.get('pipeline_nstages', 'auto')
+
+    if pipeline_nstages == 'auto':
+        if not pas_cfg.get('pipeline_pivots'):
+            pipeline_nstages = 1
+        if not cfg.use_end2end or cfg.use_async_reducer:
+            pipeline_nstages = 1
+    elif pipeline_nstages > 1:
+        # the user manually enabled pipeline, should not disable, so raise
+        if not pas_cfg.get('pipeline_pivots'):
+            raise ValueError("pipeline_pivots must be set to enable pipeline")
+        if not cfg.use_end2end:
+            raise ValueError("explore_pipeline cannot be enabled if use_end2end is False")
+        if cfg.use_async_reducer:
+            raise ValueError("explore_pipeline cannot be enabled if use_async_reducer is True")
+    else:
+        if pas_cfg.get('pipeline_pivots'):
+            raise ValueError("pipeline_pivots must not be set because pipeline is disabled by pipeline_nstages<=1")
 
     pipeline_scheduler = pas_cfg.get('pipeline_scheduler', '1f1b')
     if pipeline_scheduler != '1f1b':
@@ -237,7 +258,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     if cfg.plan_ngpus % mesh_col != 0:
         raise ValueError(f"plan_ngpus {cfg.plan_ngpus} should be divisible by max_partition_degree {mesh_col}")
     mesh_row = cfg.plan_ngpus // mesh_col
-    if not explore_pipeline and mesh_row != 1:
+    if pipeline_nstages == 1 and mesh_row != 1:
         raise ValueError("mesh_row should be 1 if pipeline is not enabled")
     memory_constraint = pas_cfg.get('mem_constraint', -1)
     task_name = pas_cfg.get('task_name', '_')
@@ -252,6 +273,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     partition_constraints_path = pas_cfg.get('partition_constraints_path', '')
     recompute_modules = pas_cfg.get('recompute_modules', '')
     pipeline_pivots = pas_cfg.get('pipeline_pivots', '')
+    max_pipeline_bubble_ratio = pas_cfg.get('max_pipeline_bubble_ratio', 0.2)
     use_apex_fused_adam_v2 = pas_cfg.get('use_apex_fused_adam_v2', False)
     parallel_profile = pas_cfg.get('parallel_profile', True)
     transient_mem_coef = pas_cfg.get('transient_mem_coef', 2)
@@ -315,8 +337,9 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         zero_ngroups=zero_ngroups,
         load_plan_path=load_plan_path,
         save_plan_path=save_plan_path,
-        pipeline=explore_pipeline,
         pipeline_pivots=pipeline_pivots,
+        pipeline_nstages=pipeline_nstages,
+        max_pipeline_bubble_ratio=max_pipeline_bubble_ratio,
         parallel_profile=parallel_profile,
         transient_mem_coef=transient_mem_coef,
     )

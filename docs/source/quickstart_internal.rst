@@ -87,7 +87,7 @@ If the example works for you, you can now follow the documentation to paralleliz
 .. _Fairseq:
 
 Fairseq (To be retired)
-=======
+=======================
 
 .. TODO:
 

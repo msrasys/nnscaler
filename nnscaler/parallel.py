@@ -2435,8 +2435,10 @@ def sync_grad_when(cond: bool):
     only when `cond` is True.
 
     This is needed when
+
     1. The mode is not end2end model.
-        For end2end model, gradients are synchronized across workers automatically.
+       For end2end model, gradients are synchronized across workers automatically.
+
     2. async is enabled (`compute_config.use_async_reducer` is `True`).
 
     If both conditions are not satisfied, this function has no effect.

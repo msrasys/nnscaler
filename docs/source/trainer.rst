@@ -803,7 +803,15 @@ The configuration of the PAS policy should be passed in the ``pas_config`` of ``
    and run data parallelism across scale units.
    It requires the ``use_end2end`` to be true. It has the following configurations.
 
-   * ``pipeline_nstages``: the number of stages in the pipeline. Default is ``plan_ngpus``. Optional.
+   * ``pipeline_nstages``: the number of stages in the pipeline, or ``"auto"`` (let autodist to decide).
+     Default is ``"auto"``. Optional.
+
+     * If ``pipeline_nstages`` is ``"auto"`` and ``pipeline_pivots`` is specified, it will use pipeline.
+       (The number of stages will be determined automatically by autodist)
+     * If ``pipeline_nstages`` is ``"auto"`` and ``pipeline_pivots`` is not specified, it will not use pipeline.
+     * If ``pipeline_nstages`` is a 1, pipeline will not be used. (``pipeline_pivots`` must not be set)
+     * If ``pipeline_nstages`` is a number > 1, pipeline will be used. (``pipeline_pivots`` must be set)
+
    * ``pipeline_nmicros``: the number of microbatches in the pipeline. Required.
    * ``pipeline_scheduler``: the scheduler name for the pipeline. Current we support four schedulers in training ``1f1b``/``1f1b_plus``/``1f1b_interleaved``/``gpipe``/``chimera_direct`` (4 stages pipeline only), and one scheduler in inference ``infer_pipe``. Default is ``1f1b``. Optional.
    * ``pp_size``: the pipeline parallelism size. Default is ``pipeline_nstages``. Optional.
@@ -823,10 +831,11 @@ The configuration of the PAS policy should be passed in the ``pas_config`` of ``
    * ``save_plan_path (str)``: The path to the plan file to save. Optional.
    * ``partition_constraints_path (str)``: The path to the partition constraints file. Optional.
    * ``recompute_modules (str)``: The module names to recompute, separated by ``,``. For example, ``module1,module2``. Optional.
-   * ``pipeline_pivots (str)``: The module names to pivot the pipeline, separated by ``,``. For example, if ``module1,module2`` is specified, stages searched by pipeline solver only start from either ``module1`` or ``module2``. Optional.
+   * ``pipeline_pivots (str)``: If set, autodist will try pipeline parallelism to find the best partition plan.
+     It specifies the module names to pivot the pipeline, separated by ``,``.
+     For example, if ``module1,module2`` is specified, stages searched by pipeline solver only start from either ``module1`` or ``module2``.
+     Optional.
    * ``use_apex_fused_adam_v2``: If set to ``True``, the apex fused adam v2 optimizer will be used. Default is ``False``. Optional.
-   * ``explore_pipeline``: If set to ``True``, autodist will try pipeline parallelism to find the best partition plan
-     (but the selected partition plan is not necessarily pipeline parallelism).
    * ``pipeline_scheduler``: The scheduler name for the pipeline. Please note currently ``1f1b`` is the only supported scheduler in ``autodist``. Default is ``1f1b``. Optional.
    * ``parallel_profile``: If set to ``True``, autodist will profile operators in parallel by using available gpus. Default is ``True``. Optional.
    * ``max_partition_degree``: Max degree when partitioning an operator / node. When pipeline parallelism is enabled to explore (``explore_pipeline`` is True), user can change the value to constrain the plan to be composed of stages that span on less or equal to ``max_partition_degree`` devices (recommend to set ``max_partition_degree`` to the number of devices in a node to avoid inter-node communication, but should be be no more than ``plan_ngpus``). Default is ``plan_ngpus``. Optional.
