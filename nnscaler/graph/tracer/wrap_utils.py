@@ -553,6 +553,8 @@ class torch_autocast_wrapper_clz:
     _fx_wrapped_ori_clz = orig_func.torch_autocast
 
     def __new__(cls, *args, **kwargs):
+        args = (arg.value if orig_func.isinstance(arg, cct.ConcreteProxy) else arg for arg in args)
+        kwargs = {k: v.value if orig_func.isinstance(v, cct.ConcreteProxy) else v for k, v in kwargs.items()}
         return orig_func.torch_autocast(*args, **kwargs)
 
     def __eq__(self, __o: object) -> bool:
