@@ -277,7 +277,7 @@ class ComputeConfig:
         """
         if Path(file).exists():
             try:
-                cfg = torch.load(file)
+                cfg = torch.load(file, weights_only=False)
                 if isinstance(cfg, dict): # in old version, we save the object directly (not save as dict)
                     # this can raise if cfg has extra keys.
                     # which means some fields of ComputeConfig has been removed(we should avoid this).
@@ -790,7 +790,7 @@ def _gencode(
         ret = RegenStatus.CODE
         logger.info(f"Reuse graph dump in {outdir}")
         graph = IRGraph.load(graph_ckp)
-        forward_args = torch.load(forward_args_ckp)
+        forward_args = torch.load(forward_args_ckp, weights_only=False)
 
     graph = pas_policy(graph, compute_config)
     if not isinstance(graph, IRGraph):

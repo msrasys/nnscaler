@@ -201,7 +201,7 @@ class Trainer:
 
     @classmethod
     def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str):
-        state_dicts = [torch.load(f, map_location='cpu') for f in checkpoint_files]
+        state_dicts = [torch.load(f, map_location='cpu', weights_only=False) for f in checkpoint_files]
         for i in range(1, len(state_dicts)):
             if state_dicts[i]['train_args'] != state_dicts[0]['train_args']:
                 raise ValueError(f"train_args in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
@@ -244,7 +244,7 @@ class Trainer:
             resume_from = resume_from   # when we load from merged checkpoint
         else:
             resume_from = resume_from / f'{self.rank}.ckpt'
-        state_dict = torch.load(resume_from, map_location='cpu')
+        state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
         self.hook.on_load_checkpoint(self, state_dict)
         ckpt_save_type = state_dict['train_args']['checkpoint']['save_type']
 

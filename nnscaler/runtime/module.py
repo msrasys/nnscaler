@@ -334,7 +334,7 @@ class CubeModule(torch.nn.Module):
         if not dist_param_map:
             module_file = Path(sys.modules[self.__module__].__file__)
             # load from the same directory as the module file
-            dist_param_map = torch.load(module_file.with_name(FxModuleParser.ATTR_MAP_FILE))
+            dist_param_map = torch.load(module_file.with_name(FxModuleParser.ATTR_MAP_FILE), weights_only=False)
         param_area_map = self._fullmap
         optimizer_state_dict = optimizer.state_dict() if optimizer is not None else None
         return state_dict, dist_param_map, param_area_map, optimizer_state_dict
@@ -700,7 +700,7 @@ class CubeModule(torch.nn.Module):
         ckpts = {}
         for rank in range(DeviceGroup().world_size):
             filename = f"{filename_prefix}-{rank}.ckpt"
-            ckpts[rank] = torch.load(filename)
+            ckpts[rank] = torch.load(filename, weights_only=False)
         _logger.info(f'checkpoints = {ckpts}')
 
         state_dicts = []
@@ -835,12 +835,12 @@ class ParallelModule(CubeModule):
 
         self._warn_uninitialized_non_persistent_buffers()
 
-        self._dist_param_map = torch.load(module_file.with_name(f"{FxModuleParser.ATTR_MAP_FILE}"))
+        self._dist_param_map = torch.load(module_file.with_name(f"{FxModuleParser.ATTR_MAP_FILE}"), weights_only=False)
         self._compute_config: ComputeConfig = ComputeConfig.safe_load_from_file(
             module_file.with_name(f"{self.COMPUTE_CONFIG_FILE}"),
             return_none_on_error=False
         )
-        self._orign_module_metadata: OriginModuleMetadata = torch.load(module_file.with_name(f"{self.ORIGIN_MODULE_METADATA_FILE}"))
+        self._orign_module_metadata: OriginModuleMetadata = torch.load(module_file.with_name(f"{self.ORIGIN_MODULE_METADATA_FILE}"), weights_only=False)
 
         for reducer in self.reducers:
             reducer.build_buckets()

@@ -7,5 +7,5 @@ psutil
 pulp
 pybind11
 pyyaml
-torch>=2.0,<2.4
+torch>=2.0,<=2.6
 tqdm

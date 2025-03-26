@@ -293,9 +293,9 @@ def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
     if torch.distributed.get_rank() == 0:
         assert {f.parent.name for f in ckpt_files} == {f.parent.name for f in ckpt0_files1}
         for i in range(4):
-            x = torch.load(ckpt_savedir / 'last' / f'{i}.ckpt')
-            y = torch.load(ckpt0_savedir / 'last' / f'{i}.ckpt')
-            z = torch.load(ckpt1_savedir / 'last' / f'{i}.ckpt')
+            x = torch.load(ckpt_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            y = torch.load(ckpt0_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            z = torch.load(ckpt1_savedir / 'last' / f'{i}.ckpt', weights_only=False)
             assert_equal(x['model'], y['model'])
             assert_equal(x['optimizer'], y['optimizer'])
             assert_equal(x['lr_scheduler'], y['lr_scheduler'])
