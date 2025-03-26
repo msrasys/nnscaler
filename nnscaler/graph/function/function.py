@@ -869,6 +869,35 @@ def Clamp(input, min=None, max=None, *, out=None, signature = None):
     return IRDimops(Clamp, 'clamp', signature, annos, [input], min=min, max=max)
 
 
+def ViewAsComplex(input, signature = None):
+    """
+    torch.view_as_complex(input)
+    """
+    assert input.shape[-1] == 2
+    edim_in = ShapeAnno.create_shape_str(input.shape)
+    edim_in[-1] = '2'
+    if len(edim_in) == 1:
+        edim_ou = ['1']
+    else:
+        edim_ou = copy.copy(edim_in[:-1])
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(ViewAsComplex, 'view_as_complex', signature, [anno], [input])
+
+
+def ViewAsReal(input, signature = None):
+    """
+    torch.view_as_real(input)
+    """
+    if input.is_scalar_tensor():
+        edim_in, edim_ou = ['1'], ['2']
+    else:
+        edim_in = ShapeAnno.create_shape_str(input.shape)
+        edim_ou = copy.copy(edim_in)
+        edim_ou.append('2')
+    anno = OpAnno.create_op_str([edim_in], [edim_ou])
+    return IRDimops(ViewAsReal, 'view_as_real', signature, [anno], [input])
+
+
 def ClampMin(input, min, *, out=None, signature = None):
     return Clamp(input, min=min, out=out, signature='torch.clamp')
 

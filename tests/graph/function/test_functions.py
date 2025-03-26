@@ -965,6 +965,20 @@ def test_Split():
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '7 b c d -> 2 b c d, 2 b c d, 3 b c d'
 
 
+def test_ViewAsComplex():
+    op = F.ViewAsComplex(IRTensor([2, 3, 2]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b 2 -> a b'
+    op = F.ViewAsComplex(IRTensor([2]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '2 -> 1'
+
+
+def test_ViewAsReal():
+    op = F.ViewAsReal(IRTensor([2, 3]))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b -> a b 2'
+    op = F.ViewAsReal(IRTensor(shape=None))
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == '1 -> 2'
+
+
 def factors(n):
     return set(reduce(
         list.__add__,
