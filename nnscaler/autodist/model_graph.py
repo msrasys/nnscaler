@@ -803,6 +803,9 @@ class ModelGraph:
                     if isinstance(t, IRTensor):
                         output_tensors.add(t)
             for node in group:
+                # Since we only profile IRDimops, skip if the node is not
+                if not isinstance(node, IRDimops):
+                    continue
                 is_border = False
                 for t in node.inputs():
                     if isinstance(t, IRTensor) and not t.is_attr():
