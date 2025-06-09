@@ -24,7 +24,12 @@ from nnscaler.utils import fields, transform_recursively
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
 from nnscaler.runtime.module import ParallelModule
 
-from .arg_parser import deserialize_dataclass, merge_args, parse_args, _TYPE_KEY, _VALUE_TYPE_KEY, _VALUE_KEY
+from .arg_parser import (
+    deserialize_dataclass,
+    merge_args, parse_args,
+    _TYPE_KEY, _VALUE_TYPE_KEY, _VALUE_KEY,
+    resolve_args
+)
 from .loggers.logger_base import LoggerBase
 from .train_hook import TrainHook
 
@@ -499,7 +504,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
-    dataset_sampler: DatasetSamplerConfig = field(default_factory=DatasetSamplerConfig)
+    dataset_sampler: Optional[DatasetSamplerConfig] = None
     lr_scheduler: Optional[LRSchedulerConfig] = None
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     log: List[LogConfig] = field(default_factory=list)
@@ -594,7 +599,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             raise ValueError("dataset type is required")
         if not self.dataloader.type:
             raise ValueError("dataloader type is required")
-        if not self.dataset_sampler.type:
+        if self.dataset_sampler and not self.dataset_sampler.type:
             raise ValueError("dataset_sampler type is required")
         if self.lr_scheduler and not self.lr_scheduler.type:
             raise ValueError("lr_scheduler type is required")
@@ -612,9 +617,10 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         if argv[0] == '-f':
             with open(argv[1], 'r') as f:
                 d = yaml.safe_load(f)
+            resolve_args(d)
             argv = argv[2:]
 
-        merge_args(d, parse_args(argv))
+        merge_args(d, argv)
         return cls.from_dict(d)
 
     @classmethod
@@ -721,19 +727,18 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         kwargs = self.create_kwarg(dataset_args)
         dataset_class = load_type(self.dataset.type)
         dataset = dataset_class(**kwargs)
-        if isinstance(dataset_class, torch.utils.data.IterableDataset):
-            raise ValueError("IterableDataset is not supported")
         return dataset
 
     def create_sampler(self, dataset, stage='train'):
-        sampler_args = getattr(self.dataset_sampler, f'{stage}_args')
-        sampler_args = sampler_args or self.dataset_sampler.train_args
+        dataset_sampler = self.dataset_sampler or DatasetSamplerConfig()
+        sampler_args = getattr(dataset_sampler, f'{stage}_args')
+        sampler_args = sampler_args or dataset_sampler.train_args
         kwargs = self.create_kwarg(sampler_args)
         kwargs['dataset'] = dataset
         kwargs['num_replicas'] = self.compute_config.runtime_ngpus // self.compute_config.plan_ngpus
         # if not distributed, we use the rank 0 sampler
         kwargs['rank'] = int(os.environ.get('RANK', 0)) // self.compute_config.plan_ngpus
-        sampler_class = load_type(self.dataset_sampler.type)
+        sampler_class = load_type(dataset_sampler.type)
         return sampler_class(**kwargs)
 
     def create_dataloader(self, stage='train', dataset=None):
@@ -751,8 +756,15 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             # here we don't use self.collate_fn to avoid its implementation hacking
             kwargs['collate_fn'] = load_type(kwargs['collate_fn'])
         kwargs['batch_size'] = self.micro_batch_size
-        kwargs['sampler'] = self.create_sampler(kwargs['dataset'], stage)
+
         dataloader_class = load_type(self.dataloader.type)
+        if isinstance(dataset, torch.utils.data.IterableDataset):
+            if self.dataset_sampler:
+                raise ValueError("IterableDataset does not support sampler. "
+                                 "Please remove dataset_sampler from TrainerArgs.")
+        else:
+            kwargs['sampler'] = self.create_sampler(kwargs['dataset'], stage)
+
         return dataloader_class(**kwargs)
 
     def create_lr_scheduler(self, optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler.LRScheduler:

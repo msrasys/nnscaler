@@ -151,6 +151,7 @@ class Trainer:
 
         torch.distributed.barrier()
         self.rank = torch.distributed.get_rank()
+        self.world_size = torch.distributed.get_world_size()
 
         self.total_train_steps_per_epoch = len(self.dataloader['train']) // self.train_args.update_freq
         if len(self.dataloader['train']) % self.train_args.update_freq != 0:
@@ -205,6 +206,10 @@ class Trainer:
         for i in range(1, len(state_dicts)):
             if state_dicts[i]['train_args'] != state_dicts[0]['train_args']:
                 raise ValueError(f"train_args in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
+            if state_dicts[i].get('dataloader', None) != state_dicts[0].get('dataloader', None):
+                raise ValueError(f"dataloader state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
+            if state_dicts[i].get('lr_scheduler', None) != state_dicts[0].get('lr_scheduler', None):
+                raise ValueError(f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
 
         module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
             [s['model'] for s in state_dicts],
@@ -219,6 +224,8 @@ class Trainer:
             'train_status': state_dicts[0]['train_status'],
             'train_args': train_args,
             'rng_states': None,
+            # assume the dataloader state is the same for all checkpoints
+            'dataloader': state_dicts[0].get('dataloader', None)
         }
         torch.save(merged_state_dict, output_file)
 
@@ -271,6 +278,10 @@ class Trainer:
                 raise ValueError("lr_scheduler is not set in the current trainer")
             if self.lr_scheduler:
                 self.lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
+        if 'dataloader' in state_dict and state_dict['dataloader'] is not None:
+            if not self._is_resumable_dataloader():
+                raise ValueError("dataloader is not resumable, but checkpoint contains dataloader state")
+            self.dataloader['train'].load_state_dict(state_dict['dataloader'])
         self.train_status = TrainStatus(**state_dict['train_status'])
         self.rng_states_from_resume = state_dict.get('rng_states')  # resumed in _global_batch_iterator()
 
@@ -306,6 +317,12 @@ class Trainer:
         else:
             step_str = f''
         return f"{epoch_desc}: {step_str}{metris_str}"
+
+    def _is_resumable_dataloader(self):
+        return (
+            callable(getattr(self.dataloader['train'], 'state_dict', None)) and
+            callable(getattr(self.dataloader['train'], 'load_state_dict', None))
+        )
 
     def _save_checkpoint(self, loss):
         checkpoint_config = self.train_args.checkpoint
@@ -343,6 +360,8 @@ class Trainer:
             'train_args': self.train_args.to_dict(),
             'rng_states': self._get_rng_states(),
         }
+        if self._is_resumable_dataloader():
+            state_dict['dataloader'] = self.dataloader['train'].state_dict()
         self.hook.on_save_checkpoint(self, state_dict)
         ckpt_file = save_dir / CHECKPOINT_FILE_FORMAT.format(
             epoch=current_epoch,
@@ -436,22 +455,25 @@ class Trainer:
             shutil.rmtree(save_dir / ckpt_name)
 
     def _global_batch_iterator(self, num_skip_first=0, stage='train'):
-        if num_skip_first == 0:
-            # if the checkpoint stops at the end of an epoch,
-            # the rng states must be resumed before creating iterator
-            # because `DataLoader.__iter__()` uses the rng (dunno why),
-            # and the previous run had not call it yet
-            self._try_resume_rng_states()
-
-        it = iter(self.dataloader[stage])
-        for _ in range(num_skip_first * self.train_args.update_freq):
-            _sample = next(it)
-
-        if num_skip_first != 0:
-            # if the checkpoint stops in the middle of an epoch,
-            # the rng states must be resumed before loading the first batch, which depends on the rng;
-            # and must be resumed after skipping unused batches, which will affect the rng
-            self._try_resume_rng_states()
+        if stage == 'train':
+            if self._is_resumable_dataloader() or num_skip_first == 0:
+                # if the checkpoint stops at the end of an epoch,
+                # the rng states must be resumed before creating iterator
+                # because `DataLoader.__iter__()` uses the rng (dunno why),
+                # and the previous run had not call it yet
+                self._try_resume_rng_states()
+                it = iter(self.dataloader[stage])
+            else:  # dry run until reach the desired batch.
+                it = iter(self.dataloader[stage])
+                for _ in range(num_skip_first * self.train_args.update_freq):
+                    _sample = next(it)
+                # if the checkpoint stops in the middle of an epoch,
+                # the rng states must be resumed before loading the first batch, which depends on the rng;
+                # and must be resumed after skipping unused batches, which will affect the rng
+                self._try_resume_rng_states()
+        else:
+            # for validation and test, we don't need to resume rng states
+            it = iter(self.dataloader[stage])
 
         samples = []
         for sample in it:

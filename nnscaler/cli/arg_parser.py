@@ -1,7 +1,10 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Tuple, Dict, Any, Union
+import os
+import copy
+
+from typing import List, Optional, Tuple, Dict, Any, Union
 from dataclasses import dataclass, is_dataclass, asdict
 import enum
 import ast
@@ -22,7 +25,7 @@ def parse_args(argv: List[str]) -> dict:
     raw_args = {}
     last_key = None
     for v in argv:
-        if v.startswith('--'):
+        if isinstance(v, str) and v.startswith('--'):
             if '=' in v:
                 k, v = v[2:].split('=', 1)
                 raw_args[k] = v
@@ -51,12 +54,146 @@ def parse_args(argv: List[str]) -> dict:
     return args
 
 
-def merge_args(args: dict, new_args: dict):
-    for k, v in new_args.items():
-        if k in args and isinstance(args[k], dict) and isinstance(v, dict):
-            merge_args(args[k], v)
+def merge_args(args: dict, argv: List[str]):
+    """
+    Please note that this function will modify the args in place.
+    """
+    _merge_args(args, parse_args(argv))
+
+
+def _merge_args(args: dict, new_args: dict):
+    MISSING = object()
+
+    def _is_removed_key(k):
+        return isinstance(k, str) and k.endswith('!')
+
+    def _clear_keys(data):
+        # values in new_args can only be dict or str
+        if isinstance(data, dict):
+            new_data = {}
+            for k, v in data.items():
+                if _is_removed_key(k):
+                    continue
+                v = _clear_keys(v)
+                if v is not MISSING:
+                    new_data[k] = v
+            return new_data if new_data else MISSING
         else:
-            args[k] = v
+            return data
+
+    for k, v in new_args.items():
+        if _is_removed_key(k):
+            # if the key ends with '!', we will remove the key from args
+            k = k[:-1]
+            args.pop(k, None)
+            continue
+        if k not in args or not isinstance(args[k], (dict, list)):
+            # if the existing value is not a dict/list, we will overwrite it with the new value
+            # for example, if args is {'a': 1} and new_args is {'a': {'b': 2}},
+            # we will overwrite args['a'] with new_args['a']
+            new_v = _clear_keys(v)
+            if new_v is not MISSING:
+                args[k] = new_v
+        elif isinstance(args[k], dict):
+            if isinstance(v, dict):
+                _merge_args(args[k], v)
+            else:
+                args[k] = v
+        else:
+            assert isinstance(args[k], list)
+            # we only update per-element value if the new value is a dict
+            if isinstance(v, dict) \
+                and all(
+                    isinstance(item, int) or
+                    (isinstance(item, str) and item.isdigit())
+                    for item in v.keys()
+                ):
+                # note: you can't delete an item in a list by index (with '!' ending),
+                current_value = {idx: item for idx, item in enumerate(args[k])}
+                new_value = {int(idx): item for idx, item in v.items()}
+                _merge_args(current_value, new_value)
+                args[k] = [None] * (max(current_value.keys()) + 1)
+                for nk, nv in current_value.items():
+                    args[k][nk] = nv
+            else:
+                args[k] = v
+
+
+def resolve_args(args: dict):
+    """
+    Substitute the args with the value from the args.
+    For example, if args is {'a': '$(b)', 'b': 'c'}, then
+    it will be updated to {'a': 'c', 'b': 'c'}.
+    """
+    def _is_variable(var_path):
+        return isinstance(var_path, str) and (
+            (var_path.startswith('$(') and var_path.endswith(')')) or
+            (var_path.startswith('${') and var_path.endswith('}'))
+        )
+
+    def _get_variable(var_path: str) -> Optional[str]:
+        if not _is_variable(var_path):
+            return None
+        return var_path[2:-1]
+
+    def _get_value(data, var_path: list[Any]):
+        for key in var_path:
+            if isinstance(data, list):
+                data = data[int(key)]
+            elif key in data:
+                data = data[key]
+            else:
+                raise ValueError(f"{var_path} not found in args")
+        return data
+
+    def _set_value(data, var_path: list[Any], value):
+        value = copy.deepcopy(value)
+        for key in var_path[:-1]:
+            if isinstance(data, list):
+                data = data[int(key)]
+            elif key in data:
+                data = data[key]
+            else:
+                raise ValueError(f"{var_path} not found in args")
+
+        if isinstance(data, list):
+            data[int(var_path[-1])] = value
+        else:
+            data[var_path[-1]] = value
+
+    pending_values = set()
+    def _resolve(var_path: list[Any], value: Any):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                _resolve(var_path + [k], v)
+            return value
+        elif isinstance(value, list):
+            for i, v in enumerate(value):
+                _resolve(var_path + [i], v)
+            return value
+        else:
+            ref_key = _get_variable(value)
+            if ref_key:
+                if ref_key in pending_values:
+                    raise ValueError(f"Circular reference detected for {ref_key}")
+                pending_values.add(ref_key)
+                ref_var_path = ref_key.split('.')
+                try:
+                    value = _get_value(args, ref_var_path)
+                    resolved_value = _resolve(ref_var_path, value)
+                except ValueError as e:
+                    if ref_key in os.environ:
+                        resolved_value = os.environ[ref_key]
+                    else:
+                        raise
+
+                _set_value(args, var_path, resolved_value)
+                pending_values.remove(ref_key)
+                return resolved_value
+            else:
+                return value
+
+    _resolve([], args)
 
 
 def _fix_any(type_):
@@ -154,6 +291,12 @@ def _guess_deserialize_object(value):
     if isinstance(value, tuple):
         return tuple(_guess_deserialize_object(v) for v in value)
     if isinstance(value, str):
+        # special handling for 'false'/'true'.
+        # 'False'/'True' are handled in ast.literal_eval
+        if value == 'false':
+            return False
+        if value == 'true':
+            return True
         try:
             # try to parse as literal
             # if failed, return as it is

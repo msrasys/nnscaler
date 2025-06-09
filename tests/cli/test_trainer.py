@@ -793,3 +793,147 @@ def tracing_from_weights_worker(tmp_path):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_tracing_from_weights(tmp_path):
     launch_torchrun(1, tracing_from_weights_worker, tmp_path)
+
+
+def trainer_resumable_dataloader(save_dir):
+    save_dir = Path(save_dir)
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    config_path_streaming = str(Path(__file__).with_name('trainer_args_streaming.yaml').resolve())
+    gen_savedir = save_dir / 'gen'
+    ckpt_savedir = save_dir / 'ckpt'
+
+    optimizer_type = 'nnscaler.runtime.f16_optimizer.MixedPrecisionAdam'
+    use_zero = True
+    save_type = 'deduped'
+
+    # ground truth: train 4 epcho in one time
+    trainer = Trainer([
+        '-f', config_path,
+        '--precision', 'bf16',
+        '--optimizer.type', optimizer_type,
+        '--max_epochs', '4',
+        '--enable_progress_bar', False,
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', 2,
+        '--compute_config.runtime_ngpus', 4,
+        '--compute_config.use_zero', use_zero,
+        '--dataset_sampler.train_args.shuffle', False,
+        '--dataloader.train_args.shuffle', False,
+        '--checkpoint.save_type', save_type,
+        '--checkpoint.save_dir', str(ckpt_savedir),
+        '--checkpoint.resume_from', 'last',
+        '--checkpoint.keep_last_n_checkpoints', 30,
+    ])
+    trainer.run()
+
+    # train 4 epcho in one time
+    ckpt0_savedir = save_dir / 'ckpt0'
+    gen_savedir = save_dir / 'gen0'  # use a different gen_savedir for resumable dataloader
+    trainer = Trainer([
+        '-f', config_path_streaming,
+        '--precision', 'bf16',
+        '--optimizer.type', optimizer_type,
+        '--max_epochs', '4',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_type', save_type,
+        '--checkpoint.save_dir', str(ckpt0_savedir),
+        '--checkpoint.resume_from', 'last',
+        '--checkpoint.keep_last_n_checkpoints', '30',
+    ])
+    trainer.run()
+
+    torch.distributed.barrier()
+    # train 4 epcho two times (resume from last)
+    ckpt1_savedir = save_dir / 'ckpt1'
+    # first 5 steps
+    trainer = Trainer([
+        '-f', config_path_streaming,
+        '--precision', 'bf16',
+        '--optimizer.type', optimizer_type,
+        '--max_train_steps', '5',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_type', save_type,
+        '--checkpoint.save_dir', str(ckpt1_savedir),
+        '--checkpoint.resume_from', 'last',
+        '--checkpoint.keep_last_n_checkpoints', '30',
+    ])
+    trainer.run()
+    ckpt1_files0 = {f: f.stat().st_mtime_ns for f in ckpt1_savedir.glob('**/*.ckpt')}
+
+    # resume from last without update max_epochs
+    trainer = Trainer([
+        '-f', config_path_streaming,
+        '--precision', 'bf16',
+        '--optimizer.type', optimizer_type,
+        '--max_train_steps', '5',
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_type', save_type,
+        '--checkpoint.save_dir', str(ckpt1_savedir),
+        '--checkpoint.resume_from', 'last',
+        '--checkpoint.keep_last_n_checkpoints', '30',
+    ])
+    trainer.run()
+    ckpt1_files0_x = {f: f.stat().st_mtime_ns for f in ckpt1_savedir.glob('**/*.ckpt')}
+    # nothing should be updated in this case.
+    assert ckpt1_files0 == ckpt1_files0_x
+
+    # create merged checkpoint
+    ckpt2_savedir = save_dir / 'ckpt2'
+    ckpt2_savedir.mkdir(parents=True, exist_ok=True)
+    if trainer.rank == 0:
+        Trainer.merge_checkpoint(list((ckpt1_savedir / 'last').glob('*.ckpt')), ckpt2_savedir / 'merged.pt')
+
+    torch.distributed.barrier()
+    # resume for sharded/deduped checkpoint
+    trainer = Trainer([
+        '-f', config_path_streaming,
+        '--precision', 'bf16',
+        '--optimizer.type', optimizer_type,
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_type', save_type,
+        '--checkpoint.save_dir', str(ckpt1_savedir),
+        '--checkpoint.resume_from', 'last',
+        '--checkpoint.keep_last_n_checkpoints', '30',
+    ])
+    trainer.run()
+
+    torch.distributed.barrier()
+
+    # resume for merged
+    trainer = Trainer([
+        '-f', config_path_streaming,
+        '--precision', 'bf16',
+        '--optimizer.type', optimizer_type,
+        '--enable_progress_bar', 'false',
+        '--gen_savedir', str(gen_savedir),
+        '--checkpoint.save_type', save_type,
+        '--checkpoint.save_dir', str(ckpt2_savedir),
+        '--checkpoint.resume_from', str(ckpt2_savedir / 'merged.pt'),
+        '--checkpoint.keep_last_n_checkpoints', '30',
+    ])
+    trainer.run()
+
+    torch.distributed.barrier()
+
+    if torch.distributed.get_rank() == 0:
+        for i in range(4):
+            g = torch.load(ckpt_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            x = torch.load(ckpt0_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            y = torch.load(ckpt1_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            z = torch.load(ckpt2_savedir / 'last' / f'{i}.ckpt', weights_only=False)
+            assert 'dataloader' not in g
+            assert 'dataloader' in x
+            for key in ['model', 'optimizer', 'lr_scheduler', 'dataloader']:
+                assert_equal(x[key], y[key])
+                assert_equal(x[key], z[key])
+                if key != 'dataloader':
+                    assert_equal(g[key], x[key])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason='lack of gpu devices')
+def test_trainer_resumable_dataloader(tmp_path):
+    launch_torchrun(4, trainer_resumable_dataloader, tmp_path)
