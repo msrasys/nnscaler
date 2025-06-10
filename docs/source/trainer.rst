@@ -441,6 +441,8 @@ Please Note:
     Signature:  ``def after_optimizer_step(trainer: 'Trainer') -> None:``
   * ``on_load_checkpoint`` (``str``): The hook function to be called after loading the checkpoint.
     If you saved something with ``on_save_checkpoint`` this is your chance to restore this.
+    Please note when checkpoints are merged, the custom data saved in the checkpoint
+    will be collected and saved as array in merged checkpoint. You must handle this case.
     Signature:  ``def on_load_checkpoint(trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:``
   * ``on_save_checkpoint`` (``str``): The hook function to be called before saving the checkpoint.
     If you want to save something, you can add it to the checkpoint here.

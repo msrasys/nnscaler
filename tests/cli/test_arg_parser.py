@@ -257,14 +257,17 @@ def test_remove():
     z0 = copy.deepcopy(z)
     z1 = copy.deepcopy(z)
     z2 = copy.deepcopy(z)
+    z3 = copy.deepcopy(z)
+    z4 = copy.deepcopy(z)
     merge_args(z, ['--a.2=3','--b.0.h=3', '--b.1.h!', '--b.2.h!'])
     assert z == {
         'a': [1, 2, '3'],
-        'b': [{'h': '3'}, {}],
+        'b': [{'h': '3'}, {}, {}],
     }
     merge_args(z0, ['--a.2=3','--b!', '--b.2.h!'])
     assert z0 == {
         'a': [1, 2, '3'],
+        'b': {'2': {}}
     }
     merge_args(z1, ['--a.2=3','--b!', '--b.2.h=3'])
     assert z1 == {
@@ -278,6 +281,18 @@ def test_remove():
     assert z2 == {
         'a': [1, 2, '3'],
         'b': [None, {'h': '3'}],
+    }
+
+    merge_args(z3, ['--a.2=3','--b.0.h=3', '--b.1.h!', '--b.2.h=3', '--b.2.h!', '--b.2.g=3'])
+    assert z3 == {
+        'a': [1, 2, '3'],
+        'b': [{'h': '3'}, {}, {'g': '3'}],
+    }
+
+    merge_args(z4, ['--a.2=3','--b.1!', '--b.2!', '--b.3.h=3', '--b.4!'])
+    assert z4 == {
+        'a': [1, 2, '3'],
+        'b': [None, None, None, {'h': '3'}],
     }
 
 

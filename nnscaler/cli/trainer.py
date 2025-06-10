@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_FILE_FORMAT: str = '{epoch:04d}-{step:04d}/{rank}.ckpt'
 CHECKPOINT_LAST_DIR_NAME: str = 'last'
 CHECKPOINT_BEST_DIR_NAME: str = 'best'
+CHECKPOINT_MERGED_FILE_NAME: str = 'merged.ckpt'
 CHECKPOINT_LAST_FILE_FORMAT: str = 'last/{rank}.ckpt'
 CHECKPOINT_BEST_FILE_FORMAT: str = 'best/{rank}.ckpt'
 
@@ -83,11 +84,16 @@ class Trainer:
             self.train_args = TrainerArgs.from_cli(cli_args)
 
         self.rank = None
+        self.world_size = None
+        self.local_world_size = None
+        self.local_rank = None
+        self.node_rank = None
         self.sync_group = None
         self.model = None
         self.optimizer = None
         self.dataset = {'train': None, 'val': None, 'test': None}
         self.dataloader: Dict[str, Optional[DataLoader]] = {'train': None, 'val': None, 'test': None}
+        self.dataloader_resumed = False  # whether the dataloader is resumed from checkpoint
         self.lr_scheduler = None
         self.train_status = TrainStatus()
         self.dummy_input = None
@@ -152,6 +158,9 @@ class Trainer:
         torch.distributed.barrier()
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
+        self.local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE'))
+        self.local_rank = int(os.environ.get('LOCAL_RANK'))
+        self.node_rank = int(os.environ.get('GROUP_RANK'))
 
         self.total_train_steps_per_epoch = len(self.dataloader['train']) // self.train_args.update_freq
         if len(self.dataloader['train']) % self.train_args.update_freq != 0:
@@ -201,13 +210,11 @@ class Trainer:
         self.hook.after_setup(self)
 
     @classmethod
-    def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str):
+    def _merge_checkpoint(cls, checkpoint_files: List[str]):
         state_dicts = [torch.load(f, map_location='cpu', weights_only=False) for f in checkpoint_files]
         for i in range(1, len(state_dicts)):
             if state_dicts[i]['train_args'] != state_dicts[0]['train_args']:
                 raise ValueError(f"train_args in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
-            if state_dicts[i].get('dataloader', None) != state_dicts[0].get('dataloader', None):
-                raise ValueError(f"dataloader state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
             if state_dicts[i].get('lr_scheduler', None) != state_dicts[0].get('lr_scheduler', None):
                 raise ValueError(f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
 
@@ -217,16 +224,35 @@ class Trainer:
         )
         train_args = copy.deepcopy(state_dicts[0]['train_args'])
         train_args['checkpoint']['save_type'] = 'merged'
+
+        global_keys = {
+            'model', 'optimizer', 'train_args',
+            'train_status', 'lr_scheduler', 'rank'
+        }
+        # for extra keys (including `dataloader` and `rng_states`), we will not merge them.
+        # Intead we will collect them from all state_dicts
+        extra_keys: Dict[str, list] = {}
+        for s in state_dicts:
+            extra_keys.update({k: [] for k in s.keys() if k not in global_keys})
+        if extra_keys:
+            sorted_state_dicts = sorted(state_dicts, key=lambda x: x['rank'])
+            for s in sorted_state_dicts:
+                for k in extra_keys:
+                    extra_keys[k].append(s.get(k, None))
+
         merged_state_dict = {
             'model': module_state_dict,
             'optimizer': opt_state_dict,
             'lr_scheduler': state_dicts[0].get('lr_scheduler', None),
             'train_status': state_dicts[0]['train_status'],
             'train_args': train_args,
-            'rng_states': None,
-            # assume the dataloader state is the same for all checkpoints
-            'dataloader': state_dicts[0].get('dataloader', None)
+            **extra_keys,
         }
+        return merged_state_dict
+
+    @classmethod
+    def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str):
+        merged_state_dict = cls._merge_checkpoint(checkpoint_files)
         torch.save(merged_state_dict, output_file)
 
     def _log_finalize(self):
@@ -249,9 +275,32 @@ class Trainer:
         logger.info(f"Resuming from {resume_from}")
         if resume_from.is_file():
             resume_from = resume_from   # when we load from merged checkpoint
+            state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
         else:
-            resume_from = resume_from / f'{self.rank}.ckpt'
-        state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
+            ckpt_files = list(resume_from.glob('*.ckpt'))
+            rank_ckpt_files = {int(f.stem): f for f in ckpt_files if f.stem.isdigit()}
+            if set(rank_ckpt_files.keys()) != set(range(len(rank_ckpt_files))):
+                raise ValueError(f"Checkpoint files in {resume_from} are not complete: {rank_ckpt_files.keys()}")
+            if len(rank_ckpt_files) != self.world_size \
+                and self.train_args.checkpoint.resume_from.with_merged is False:
+                raise ValueError(f"World size is different with original one: {len(rank_ckpt_files)} != {self.world_size}")
+
+            if len(rank_ckpt_files) != self.world_size or self.train_args.checkpoint.resume_from.with_merged:
+                # merge the checkpoint files from all ranks and broadcast to all ranks
+                torch.distributed.barrier()
+                if self.rank == 0:
+                    logger.info(f"Merging checkpoint files from {resume_from}")
+                    state_dict = self._merge_checkpoint(list(rank_ckpt_files.values()))
+                else:
+                    state_dict = None
+                state_dict_list = [state_dict]
+                logger.info(f"Broadcasting merged checkpoint to all ranks.")
+                torch.distributed.broadcast_object_list(state_dict_list, src=0)
+                state_dict = state_dict_list[0]
+            else:
+                resume_from = resume_from / f'{self.rank}.ckpt'
+                state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
+
         self.hook.on_load_checkpoint(self, state_dict)
         ckpt_save_type = state_dict['train_args']['checkpoint']['save_type']
 
@@ -281,9 +330,28 @@ class Trainer:
         if 'dataloader' in state_dict and state_dict['dataloader'] is not None:
             if not self._is_resumable_dataloader():
                 raise ValueError("dataloader is not resumable, but checkpoint contains dataloader state")
-            self.dataloader['train'].load_state_dict(state_dict['dataloader'])
+            if ckpt_save_type == 'merged':
+                dataloader_states = state_dict['dataloader']
+                # only load dataloader state when all ranks have the same state
+                # TODO: is this reasonable?
+                if all(dataloader_states[i] == dataloader_states[0] for i in range(1, len(dataloader_states))):
+                    self.dataloader['train'].load_state_dict(dataloader_states[0])
+                    self.dataloader_resumed = True
+                else:
+                    logger.warning("Dataloader states are not the same across ranks, will use dry run to resume dataloader state.")
+                    self.dataloader_resumed = False
+            else:
+                self.dataloader['train'].load_state_dict(state_dict['dataloader'])
+                self.dataloader_resumed = True
+        else:
+            self.dataloader_resumed = False
         self.train_status = TrainStatus(**state_dict['train_status'])
-        self.rng_states_from_resume = state_dict.get('rng_states')  # resumed in _global_batch_iterator()
+
+        # we don't resume rng states when loading merged checkpoint,
+        if ckpt_save_type != 'merged':
+            self.rng_states_from_resume = state_dict.get('rng_states')  # resumed in _global_batch_iterator()
+        else:
+            logger.warning("RNG states are not resumed when loading merged checkpoint.")
 
     def _log_mem_stats(self, tag=None):
         # log minimum free memory over the iteration
@@ -359,6 +427,7 @@ class Trainer:
             'train_status': asdict(self.train_status),
             'train_args': self.train_args.to_dict(),
             'rng_states': self._get_rng_states(),
+            'rank': self.rank,
         }
         if self._is_resumable_dataloader():
             state_dict['dataloader'] = self.dataloader['train'].state_dict()
@@ -410,9 +479,8 @@ class Trainer:
 
         torch.distributed.barrier()
         # remove old checkpoints
-        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
         # only the first rank in the group will do the job
-        if self.rank % local_world_size == 0:
+        if self.rank % self.local_world_size == 0:
             try:
                 self._expire_checkpoints()
             except Exception as e:
@@ -456,7 +524,7 @@ class Trainer:
 
     def _global_batch_iterator(self, num_skip_first=0, stage='train'):
         if stage == 'train':
-            if self._is_resumable_dataloader() or num_skip_first == 0:
+            if self.dataloader_resumed or num_skip_first == 0:
                 # if the checkpoint stops at the end of an epoch,
                 # the rng states must be resumed before creating iterator
                 # because `DataLoader.__iter__()` uses the rng (dunno why),

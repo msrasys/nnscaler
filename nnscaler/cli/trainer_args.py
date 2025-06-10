@@ -349,6 +349,17 @@ class LRSchedulerConfig:
 
 
 @dataclass
+class ResumeOptions:
+    checkpoint: str = 'last'
+    # whether to merge the checkpoint files
+    # Only used when `checkpoint` is a directory.
+    # `True` means will load the merged checkpoint (without saving)
+    # `False` means will load the sharded checkpoint files
+    # `None` means will load the sharded checkpoint files if the world size is not changed.
+    #    and will load merged checkpoint if the world size is changed.
+    with_merged: Optional[bool] = None
+
+@dataclass
 class CheckpointConfig:
     save_dir: str = './checkpoints'
     no_save: bool = False
@@ -374,27 +385,33 @@ class CheckpointConfig:
     # resume training from a checkpoint folder/file
     # can be 'last'/'best'/a specific folder/file
     # we will not resume if resume_from is last or best but the corresponding checkpoint does not exist
-    resume_from: str = None
+    resume_from: Optional[ResumeOptions] = field(default=None, metadata={
+        'normalize': lambda x: {'checkpoint': x} if isinstance(x, str) else x
+    })
 
     def get_resume_checkpoint_dir(self) -> Optional[Path]:
         if not self.resume_from:
             return None
-        if self.resume_from in ['last', 'best']:
-            d = Path(self.save_dir) / self.resume_from
+        if self.resume_from.checkpoint in ['last', 'best']:
+            d = Path(self.save_dir) / self.resume_from.checkpoint
             if not d.exists():
                 return None
             return d
-        return Path(self.resume_from)
+        return Path(self.resume_from.checkpoint)
 
     def __post_init__(self):
+        if isinstance(self.resume_from, str):
+            self.resume_from = ResumeOptions(checkpoint=self.resume_from)
+        elif isinstance(self.resume_from, dict):
+            self.resume_from = deserialize_dataclass(self.resume_from, ResumeOptions)
         if self.resume_from:
-            if self.resume_from in ['last', 'best']:
+            if self.resume_from.checkpoint in ['last', 'best']:
                 if not self.save_dir:
                     raise ValueError("save_dir is required when resume_from is 'last'/'best'")
-                if not (Path(self.save_dir) / self.resume_from).exists():
-                    logger.warning(f"`{self.resume_from}` checkpoint does not exist. Will train from scratch.")
-            elif not Path(self.resume_from).exists():
-                raise ValueError(f"resume_from {self.resume_from} does not exist")
+                if not (Path(self.save_dir) / self.resume_from.checkpoint).exists():
+                    logger.warning(f"`{self.resume_from.checkpoint}` checkpoint does not exist. Will train from scratch.")
+            elif not Path(self.resume_from.checkpoint).exists():
+                raise ValueError(f"resume_from {self.resume_from.checkpoint} does not exist")
         if self.no_save:
             return
 
@@ -481,6 +498,18 @@ class ArgsTrainHook(TrainHook):
                 setattr(self, k, load_type(v))
 
 
+def _deserialize_hook_config(hook) -> Union[HookConfig, HookMapConfig]:
+    if isinstance(hook, dict):
+        if 'type' in hook:
+            return deserialize_dataclass(hook, HookConfig)
+        else:
+            # treat hook map as a dict. this is for backward compatibility
+            # don't use `deserialize_dataclass` here
+            # because hooks can be functions (not str)
+            return HookMapConfig(**hook)
+    raise ValueError(f"Invalid hook config {hook}.")
+
+
 @dataclass
 class TrainerArgs(PrecisionMixin, PolicyMixin):
     compute_config: ComputeConfig = None
@@ -509,12 +538,16 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     log: List[LogConfig] = field(default_factory=list)
     # It can be `HookConfig` or `HookMapConfig`
-    hook: Union[HookConfig, HookMapConfig, None] = None
+    hook: Union[HookConfig, HookMapConfig, None] = field(default=None, metadata={
+        'deserialize': _deserialize_hook_config
+    })
 
     debug: DebugConfig = field(default_factory=DebugConfig)
 
-    # TODO: mixed precision support
-    precision: Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE], None] = None
+    # None value will be resolved in __post_init__
+    precision: Dict[_TENSOR_TYPE, _PRECISION_TYPE] = field(default=None, metadata={
+        'skip_deserialization': True,
+    })
 
     micro_batch_size: int = 1
     # You can set one of `global_batch_size` and `grad_accumulation_steps` option.
@@ -603,6 +636,11 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             raise ValueError("dataset_sampler type is required")
         if self.lr_scheduler and not self.lr_scheduler.type:
             raise ValueError("lr_scheduler type is required")
+
+        if isinstance(self.hook, dict):
+            # if it is a dict, we will deserialize it to HookMapConfig
+            # This is for backward compatibility
+            self.hook = _deserialize_hook_config(self.hook)
 
         if self.seed is None and self.init_env_fn is None:
             logger.warning(
@@ -786,13 +824,7 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         if not self.hook:
             return TrainHook()  # empty hook
 
-        if isinstance(self.hook, dict):
-            if 'type' in self.hook:
-                hook_config = HookConfig(**self.hook)
-            else:
-                hook_config = HookMapConfig(**self.hook)
-        else:
-            hook_config = self.hook
+        hook_config = self.hook
 
         if isinstance(hook_config, HookConfig):
             kwargs = self.create_kwarg(hook_config.args)
