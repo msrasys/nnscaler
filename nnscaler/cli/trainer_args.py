@@ -3,7 +3,7 @@
 
 from dataclasses import asdict, dataclass, field, replace
 import importlib
-from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, TYPE_CHECKING, Union, TypeVar
 from typing_extensions import get_args
 from pathlib import Path
 import logging
@@ -20,7 +20,7 @@ import yaml
 import torch
 
 import nnscaler
-from nnscaler.utils import fields, transform_recursively
+from nnscaler.utils import fields, transform_recursively, load_type
 from nnscaler.parallel import ComputeConfig, build_optimizer, ReuseType, BroadcastGenFilesStrategy, _PREDEFINED_POLICIES
 from nnscaler.runtime.module import ParallelModule
 
@@ -48,6 +48,8 @@ _PRECISION_MAP = {
     'bf16': torch.bfloat16,
     'none': None  # as it is. no conversion will happen.
 }
+_SELF_ARG_VALUE = 'self'
+_LOSS_TYPE = TypeVar('_LOSS_TYPE')
 
 
 def _get_tensor_dtype(precision: Dict[_TENSOR_TYPE, _PRECISION_TYPE], tensor_type: _TENSOR_TYPE) -> torch.dtype:
@@ -144,37 +146,6 @@ class PolicyMixin:
         return load_type(self.pas_policy)
 
 
-def load_type(type_name: str):
-    """
-    Load function/class from its full qualified name
-    """
-    if callable(type_name):  # a function or class
-        return type_name
-
-    parts = type_name.split('.')
-
-    # s: the number of parts to be the namespace
-    # s == 0: use builtins
-    # so the range() part includes 0 (with stop=-1)
-    for s in range(len(parts) - 1, -1, -1):
-        if s == 0:
-            nm = builtins
-        else:
-            namespace = '.'.join(parts[:s])
-            try:
-                nm = importlib.import_module(namespace)
-                break
-            except (ImportError, ModuleNotFoundError):
-                pass
-
-    try:
-        for i in range(s, len(parts)):
-            nm = getattr(nm, parts[i])
-        return nm
-    except AttributeError as e:
-        raise RuntimeError(f"Failed to load type {type_name}") from e
-
-
 @dataclass
 class AggregatedOutputs:
     """
@@ -188,6 +159,37 @@ class AggregatedOutputs:
     num_tokens: Optional[int] = None
     # any other custom outputs
     aggregated_outputs: Any = None
+
+    @classmethod
+    def aggregate(cls,
+        loss_outputs: list[_LOSS_TYPE],
+        sync_group: torch.distributed.ProcessGroup,
+        loss_fn: Callable[[_LOSS_TYPE], torch.Tensor],
+        ntokens_fn: Callable[[_LOSS_TYPE], torch.Tensor] | None = None,
+    ) -> 'AggregatedOutputs':
+        losses, ntokens = [], []
+        for output in loss_outputs:
+            losses.append(loss_fn(output))
+            if ntokens_fn is not None:
+                ntokens.append(ntokens_fn(output))
+
+        loss_sum = torch.sum(torch.stack(losses), dtype=torch.float64)
+        torch.distributed.all_reduce(loss_sum, group=sync_group)
+
+        if ntokens_fn is not None:
+            ntokens_sum = torch.sum(torch.tensor(ntokens, dtype=torch.int64, device=torch.cuda.current_device()))
+            torch.distributed.all_reduce(ntokens_sum, group=sync_group)
+        else:
+            ntokens_sum = None
+
+        num_batches = torch.tensor(len(losses), device=torch.cuda.current_device())
+        torch.distributed.all_reduce(num_batches, group=sync_group)
+
+        return AggregatedOutputs(
+            loss_sum=loss_sum.item(),
+            num_batches=num_batches.item(),
+            num_tokens=ntokens_sum.item() if ntokens_sum is not None else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -220,7 +222,11 @@ class ModuleParallelizeConfig:
     # Please note if you specify this
     # pipeline parallelism will be disabled, and you must ensure ComputeConfig.use_end2end is False
     type: str = None
-    args: Dict[str, Any] = field(default_factory=dict)
+    # the module args to be used for creating the module
+    # If run_mode is 'compile' and `args` is not None
+    # we can parallelize submodules instead of creating whole model.
+    # This is useful sometimes.
+    args: Optional[Dict[str, Any]] = None
     # the full qualified name of the function to generate dummy forward args
     # Its type should be `Callable[[TrainerArgs],Dict[str, Any]]`
     forward_args_gen_fn: str = None
@@ -255,9 +261,14 @@ class ModuleParallelizeConfig:
     def model_type(self):
         return load_type(self.type)
 
-    def create_model(self, trainer_args: 'TrainerArgs') -> torch.nn.Module:
-        kwargs = trainer_args.create_kwarg(self.args)
-        return self.model_type(**kwargs)
+    def create_model(self, trainer_args: 'TrainerArgs', module_args: Optional[tuple[tuple, dict]]=None) -> torch.nn.Module:
+        if self.args:
+            args, kwargs = (), trainer_args.create_kwarg(self.args)
+        elif module_args:
+            args, kwargs = module_args
+        else:
+            raise ValueError("`module_args` or `args` must be provided")
+        return self.model_type(*args, **kwargs)
 
     def create_dummy_forward_args(self, trainer_args: 'TrainerArgs') -> dict[str, Any]:
         forward_args_gen_fn = load_type(self.forward_args_gen_fn)
@@ -275,9 +286,9 @@ class ModelConfig:
     parallel_modules: list[ModuleParallelizeConfig] = field(default_factory=list)
 
     def __post_init__(self):
-        parallel_sub_modules = [load_type(m.type) for m in self.parallel_modules]
-        if set(parallel_sub_modules) != set(parallel_sub_modules):
-            raise ValueError(f"parallelized sub modules must be unique")
+        if len(set(m.type for m in self.parallel_modules)) != len(self.parallel_modules):
+            raise ValueError(f"parallelized sub modules must be unique by type")
+
 
 @dataclass
 class OptimizerConfig:
@@ -288,6 +299,8 @@ class OptimizerConfig:
     # loss reduction method
     # mean: average the loss over all micro-batches
     # sum: sum the loss of all micro-batches
+    # per-token-mean: average the gradients over all tokens
+    #    you must specify `aggregate_outputs_fn` and return the number of tokens
     # Please note in validation stage, this configuration is ignored
     # the loss is always averaged over all batches
     loss_reduction: str = 'mean'
@@ -308,8 +321,11 @@ class OptimizerConfig:
             raise ValueError(f"Invalid gradient_accumulation {self.grad_reduction}")
         if self.grad_reduction == 'per-token-mean' and not self.aggregate_outputs_fn:
             raise ValueError("aggregate_outputs_fn is required when grad_reduction is 'per-token-mean'")
-        if self.loss_reduction not in ('mean', 'sum'):
+        if self.loss_reduction == 'per-token-mean' and not self.aggregate_outputs_fn:
+            raise ValueError("aggregate_outputs_fn is required when loss_reduction is 'per-token-mean'")
+        if self.loss_reduction not in ('mean', 'sum', 'per-token-mean'):
             raise ValueError(f"Invalid loss_reduction {self.loss_reduction}")
+
 
 @dataclass
 class DatasetConfig:
@@ -351,6 +367,11 @@ class LRSchedulerConfig:
 @dataclass
 class ResumeOptions:
     checkpoint: str = 'last'
+    # the full qualified name of the function to
+    # convert the checkpoint to nnscaler format
+    # It should be `Callable[[Dict[str, Any]], Dict[str, Any]]`
+    # Only applied when `checkpoint` is a file.
+    convert_fn: Optional[str] = None
     # whether to merge the checkpoint files
     # Only used when `checkpoint` is a directory.
     # `True` means will load the merged checkpoint (without saving)
@@ -358,6 +379,7 @@ class ResumeOptions:
     # `None` means will load the sharded checkpoint files if the world size is not changed.
     #    and will load merged checkpoint if the world size is changed.
     with_merged: Optional[bool] = None
+
 
 @dataclass
 class CheckpointConfig:
@@ -389,8 +411,8 @@ class CheckpointConfig:
         'normalize': lambda x: {'checkpoint': x} if isinstance(x, str) else x
     })
 
-    def get_resume_checkpoint_dir(self) -> Optional[Path]:
-        if not self.resume_from:
+    def get_resume_checkpoint(self) -> Optional[Path]:
+        if not self.resume_from or not self.resume_from.checkpoint:
             return None
         if self.resume_from.checkpoint in ['last', 'best']:
             d = Path(self.save_dir) / self.resume_from.checkpoint
@@ -399,12 +421,14 @@ class CheckpointConfig:
             return d
         return Path(self.resume_from.checkpoint)
 
+    @property
+    def resolved_convert_fn(self) -> Optional[Callable[[Dict[str, Any]], Dict[str, Any]]]:
+        if not self.resume_from or not self.resume_from.convert_fn:
+            return None
+        return load_type(self.resume_from.convert_fn)
+
     def __post_init__(self):
-        if isinstance(self.resume_from, str):
-            self.resume_from = ResumeOptions(checkpoint=self.resume_from)
-        elif isinstance(self.resume_from, dict):
-            self.resume_from = deserialize_dataclass(self.resume_from, ResumeOptions)
-        if self.resume_from:
+        if self.resume_from and self.resume_from.checkpoint:
             if self.resume_from.checkpoint in ['last', 'best']:
                 if not self.save_dir:
                     raise ValueError("save_dir is required when resume_from is 'last'/'best'")
@@ -438,6 +462,13 @@ class LogConfig:
     type: str = None
     args: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self):
+        if not self.type:
+            raise ValueError("type is required")
+        if isinstance(self.type, str) and '.' not in self.type:
+            # assume it is a built-in logger
+            self.type = f'nnscaler.cli.loggers.{self.type}'
+
 
 @dataclass
 class DebugConfig:
@@ -457,6 +488,7 @@ class HookConfig:
 @dataclass
 class HookMapConfig:
     after_setup: str = None
+    on_finalize: str = None
 
     on_train_start: str = None
     on_train_end: str = None
@@ -487,6 +519,7 @@ class HookMapConfig:
     after_optimizer_step: str = None
 
     on_load_checkpoint: str = None
+    after_load_checkpoint: str = None
     on_save_checkpoint: str = None
 
 
@@ -512,6 +545,8 @@ def _deserialize_hook_config(hook) -> Union[HookConfig, HookMapConfig]:
 
 @dataclass
 class TrainerArgs(PrecisionMixin, PolicyMixin):
+    init_module: Optional[str] = None
+    vars: Dict[str, Any] = field(default_factory=dict)
     compute_config: ComputeConfig = None
 
     gen_savedir: str = './.nnscaler'
@@ -525,6 +560,9 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     # compile: compile the model but not training
     # run: compile and run the model
     run_mode: str = 'run'
+    # the full qualified name of the function to generate dummy sample for forward
+    # Its type should be `Callable[[TrainerArgs], Any]`
+    dummy_sample_gen_fn: str = None
     # the model state dict file for tracing.
     # It is only used in tracing to serve as the initial state dict of the model.
     tracing_from_weights: str = None
@@ -649,6 +687,8 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
                 "and the model weights on different devices can be different."
             )
 
+        self._vars = self.create_kwarg(self.vars)
+
     @classmethod
     def from_cli(cls, argv: List[str]) -> 'TrainerArgs':
         d = {}
@@ -663,6 +703,8 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'TrainerArgs':
+        if init_module := d.get('init_module', None):
+            importlib.import_module(init_module)
         ta = deserialize_dataclass(d, TrainerArgs)
         return ta
 
@@ -677,13 +719,11 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
 
     @classmethod
     def from_yaml(cls, path: str) -> 'TrainerArgs':
-        with open(path, 'r') as f:
-            return cls.from_dict(yaml.safe_load(f))
+        return cls.from_cli(['-f', path])
 
-    @classmethod
-    def create_kwarg(cls, value: Any):
+    def create_kwarg(self, value: Any) -> Any:
         if isinstance(value, dict):
-            value = {k: cls.create_kwarg(v) for k, v in value.items()}
+            value = {k: self.create_kwarg(v) for k, v in value.items()}
             if _TYPE_KEY in value:
                 value_type = load_type(value.pop(_TYPE_KEY))
                 return value_type(**value)
@@ -700,21 +740,46 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             else:
                 return value
         elif isinstance(value, list):
-            return [cls.create_kwarg(i) for i in value]
+            return [self.create_kwarg(i) for i in value]
         elif isinstance(value, tuple):
-            return tuple(cls.create_kwarg(i) for i in value)
+            return tuple(self.create_kwarg(i) for i in value)
+        elif isinstance(value, str):
+            # resolved reference
+            # Note: resolved reference can only be used in various args
+            # (train/optimizer/dataloader/etc args).
+            if (value.startswith('$!(') and value.endswith(')')) \
+                or (value.startswith('$!{') and value.endswith('}')):
+                value = value[3:-1]
+                if value == 'self':
+                    return self
+                else:
+                    parts = value.split('.')
+                    if parts[0] != 'vars':
+                        raise ValueError(f"Invalid resolved reference {value}. It must be `self` or start with `vars`.")
+                    # resolve self.vars.x.y.z
+                    return self.get_resolved_var('.'.join(parts[1:]))
+            return value
         else:
             return value
 
     @property
     def model_type(self):
-        return load_type(self.model.type)
+        m = load_type(self.model.type)
+        if not inspect.isclass(m) or not issubclass(m, torch.nn.Module):
+            raise ValueError(f"Invalid model type {self.model.type}. It must be a subclass of torch.nn.Module")
+        return m
 
     @property
     def resolved_aggregate_outputs_fn(self):
         if not self.optimizer.aggregate_outputs_fn:
             return None
         return load_type(self.optimizer.aggregate_outputs_fn)
+
+    @property
+    def resolved_dummy_sample_gen_fn(self):
+        if not self.dummy_sample_gen_fn:
+            return None
+        return load_type(self.dummy_sample_gen_fn)
 
     @property
     def scaling_factor(self):
@@ -744,6 +809,19 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
             return
         init_env_fn = load_type(self.init_env_fn)
         init_env_fn(trainer)
+
+    def get_resolved_var(self, fqn: str) -> Any:
+        """
+        Get a resolved variable from the vars dictionary.
+        The fqn is a full qualified name of the variable, e.g. 'x.y.z'.
+        """
+        parts = fqn.split('.')
+        var = self._vars
+        for part in parts:
+            if part not in var:
+                raise ValueError(f"Variable {fqn} not found in vars")
+            var = var[part]
+        return var
 
     def create_model(self) -> torch.nn.Module:
         kwargs = self.create_kwarg(self.model.args)

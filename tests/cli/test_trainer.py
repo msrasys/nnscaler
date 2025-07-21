@@ -86,6 +86,27 @@ def test_trainer_compile_worker(tmp_path):
     assert set([f.name for f in gen_savedir.glob('**/*.py')]) == set(['gencode0.py', 'gencode1.py', 'gencode2.py', 'gencode3.py'])
     shutil.rmtree(gen_savedir)
 
+    # mixed compile only
+    trainer = Trainer([
+        '-f', config_path,
+        '--max_epochs', '2',
+        '--gen_savedir', str(gen_savedir),
+        '--compute_config.plan_ngpus', '2',
+        '--compute_config.runtime_ngpus', '4',
+        '--checkpoint.no_save', 'true',
+        '--run_mode', 'compile',
+        '--broadcast_strategy', 'none',
+        '--model.type', 'tests.cli.common.MixedModule',
+        '--model.parallel_modules.0.type', 'tests.cli.common.MixModuleMLP2',
+        '--model.parallel_modules.0.args.dim', '16',
+        '--model.parallel_modules.0.args.nlayers', '16',
+        '--model.parallel_modules.0.forward_args_gen_fn', 'tests.cli.common.forward_args_gen_fn',
+    ])
+    trainer.run()
+
+    assert set([f.name for f in gen_savedir.glob('**/*.py')]) == set(['gencode0.py', 'gencode1.py', 'gencode2.py', 'gencode3.py'])
+    shutil.rmtree(gen_savedir)
+
 
 def trainer_resume_worker(save_dir, save_type, bf16, parallel_type=0):
     save_dir = Path(save_dir)

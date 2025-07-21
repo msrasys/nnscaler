@@ -24,6 +24,7 @@ from nnscaler.ir.cten import IRTensor, IRObject
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.graph.parser.register import CustomizedOps
 from nnscaler.graph.tracer.metadata import AutocastInfo
+from nnscaler.utils import load_type
 
 _logger = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ def get_func(node: IRFwOperation) -> Tuple[Callable, Shapes, DTypes, Dict]:
     if node.signature in CustomizedOps.kOpRuntime:
         fn = CustomizedOps.kOpRuntime[node.signature]
     else:
-        fn = eval(node.signature)
+        fn = load_type(node.signature)
     shapes, dtypes, requires_grads, values = [], [], [], []
 
     # TODO: this function should rewrite with pytree

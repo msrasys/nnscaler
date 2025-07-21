@@ -675,6 +675,37 @@ def test_codegen_clone():
         assert isinstance(g.nodes()[0], nnscaler.graph.function.dimops.IRDimops)
 
 
+class ItemModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, a):
+        return a.item()
+
+
+def _gencode_item_function_worker(tempdir):
+    init_distributed()
+    m_new = parallelize(
+        ItemModule(),
+        {
+            'a': torch.tensor([5.0]),
+        },
+        'dp',
+        ComputeConfig(1, 1, constant_folding=True),
+        gen_savedir=tempdir,
+        load_module=True
+    )
+    assert m_new is not None
+    # never fold torch.Tensor.item() to constant
+    assert _gencode_contains(tempdir, ItemModule, 0, '.*torch.Tensor.item.*')
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_codegen_item():
+    with tempfile.TemporaryDirectory() as tempdir:
+        launch_torchrun(1, _gencode_item_function_worker, tempdir)
+
+
 class MinModule(torch.nn.Module):
     def __init__(self):
         super().__init__()

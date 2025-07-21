@@ -275,6 +275,10 @@ class FxModuleParser:
                 if not isinstance(output, IRObject):
                     # avoid nested IRObject
                     output = IRObject(name=node.name, value=output, is_constant=is_constant)
+                elif not isinstance(output, IRTensor):
+                    # make sure is_constant is set correctly
+                    # IRTensor is always non-constant
+                    output.is_constant = is_constant
                 ir_node = IRPyFunc(fsig, input_vals, [output], **kwargs)
 
         if not isinstance(ir_node, IRCell):
@@ -357,6 +361,7 @@ class FxModuleParser:
         #    only user registered functions and `getattr` will have undefined output.
         #    So I think the original intention is to avoid folding user registered functions.
         # 5. Only fold primitive types (int, float, bool, None, str, Ellipsis) and its complex types
+        # 6. Only fold constant_foldable node
         def _is_primitive_type(val):
             # we don't fold a list/tuple/dict with length larger than this
             # Just a quick filter, and may not work when val has multiple nested levels
@@ -369,7 +374,8 @@ class FxModuleParser:
             return isinstance(val, (int, float, bool, type(None), str, type(Ellipsis)))
 
         # Note when it is not IRObject as a whole, we will not fold it
-        if constant_folding and len(ir_node.outputs()) == 1 \
+        if constant_folding and ir_node.constant_foldable \
+            and len(ir_node.outputs()) == 1 \
             and isinstance(ir_node.output(0), IRObject) \
             and not isinstance(ir_node.output(0), IRTensor) \
             and not contains_undefined_output \

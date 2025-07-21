@@ -1170,6 +1170,26 @@ class ParallelModule(CubeModule):
         # Both load_state_dict and load_deduped_state_dict will trigger this hook
         self._warn_uninitialized_non_persistent_buffers()
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """
+        Override the default load_from_state_dict to support loading from a merged state dict.
+        Please note
+         1. we have to trigger the pre_load_state_dict_hook explicitly when loading merged state dict,
+         2. post_load_state_dict_hook will be triggered in `super().load_state_dict`.
+        """
+        if f'{prefix}{self.EXTRA_STATE_KEY}' in state_dict:
+            super()._load_from_state_dict(
+                state_dict, prefix, local_metadata, strict,
+                missing_keys, unexpected_keys, error_msgs
+            )
+        else:
+            for hook in self._load_state_dict_pre_hooks.values():
+                hook(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+            new_missing_keys = self.load_merged_state_dict(state_dict, prefix, strict=False)
+            if strict:
+                missing_keys.extend(new_missing_keys)
+
     @property
     def module_dedup_group_size(self) -> int:
         """
@@ -1212,7 +1232,8 @@ class ParallelModule(CubeModule):
                 we only make sure no missing keys. Unexpected keys are not checked.
                 Default: `True`
         Returns:
-            None
+            list[str]: a list of missing keys in the state_dict.
+            Please note currently we don't check unexpected keys.
         Raises:
             RuntimeError: if strict=True and there are missing keys.
         """
@@ -1247,11 +1268,13 @@ class ParallelModule(CubeModule):
                     tensor.copy_(content)
                     attr_names.remove(attr)
 
+            missing_keys = [prefix + self._fullmap[attr].orig_name for attr in attr_names]
             if len(attr_names) != 0:
-                erro_msg = f'Missing key(s) in state_dict: {[prefix + self._fullmap[attr].orig_name for attr in attr_names]}.'
+                erro_msg = f'Missing key(s) in state_dict: {missing_keys}.'
                 if strict:
                     raise RuntimeError(erro_msg)
                 else:
                     _logger.warning(erro_msg)
 
         self._warn_uninitialized_non_persistent_buffers()
+        return missing_keys

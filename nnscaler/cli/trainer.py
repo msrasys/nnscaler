@@ -105,25 +105,40 @@ class Trainer:
         self.rng_states_from_resume: dict[str, torch.Tensor] | None = None
 
     def run(self):
-        self._setup()
-        if self.train_args.compile_mode:
-            return
-        self._train()
+        try:
+            self._setup()
+            if not self.train_args.compile_mode:
+                self._train()
+        finally:
+            for stage in ['train', 'val', 'test']:
+                if self.dataloader[stage] is not None and (close_fn := getattr(self.dataloader[stage], 'close', None)):
+                    close_fn()
+                self.dataset[stage] = None
+                self.dataloader[stage] = None
+            if self.hook:
+                self.hook.on_finalize(self)
+            # It is very common to use `torch.distributed` after training
+            # So let's not uninitialize nnscaler here.
+            # TODO: make it configurable?
+            # nnscaler.uninit()
 
     def _fix_input(self, input):
         return fix_input(input, self.train_args.input_dtype)
 
     def _load_dummy_input(self):
+        if dummy_sample_gen_fn := self.train_args.resolved_dummy_sample_gen_fn:
+            return dummy_sample_gen_fn(self.train_args)
+
         with enforce_zero_num_worker(DataLoader):
-            assert self.dataset['train'] is not None, "train dataset is not set"
-            dataloader = self.train_args.create_dataloader('train', self.dataset['train'])
+            dataset = self.train_args.create_dataset('train')
+            dataloader = self.train_args.create_dataloader('train', dataset)
             assert dataloader.num_workers == 0, "The dataloader must have `num_workers=0`."
-            return next(iter(dataloader))
+            value = next(iter(dataloader))
+            if close_fn := getattr(dataloader, 'close', None):
+                close_fn()
+            return value
 
     def _setup(self):
-        self.train_args.init_env(self)
-        compile_only = self.train_args.compile_mode
-
         if is_running_distributed():
             nnscaler.init()
             if torch.distributed.get_rank() == 0:
@@ -131,13 +146,27 @@ class Trainer:
             else:
                 logging.getLogger().setLevel(logging.WARNING)
 
-        # create dataset and dataloader
-        for stage in ['train', 'val', 'test']:
-            self.dataset[stage] = self.train_args.create_dataset(stage)
+        self.train_args.init_env(self)
+
+        # make sure all ranks are synchronized after init_env
+        if is_running_distributed():
+            torch.distributed.barrier()
+
+        compile_only = self.train_args.compile_mode
 
         # load a dummy input from training dataset
         self.dummy_input = self._load_dummy_input()
         self.dummy_input = self._fix_input(self.dummy_input)
+
+        pmodel = parallelize_model(self.train_args, self.dummy_input, load_module=not compile_only)
+        if compile_only:
+            return
+
+        torch.distributed.barrier()
+
+        # create dataset and dataloader
+        for stage in ['train', 'val', 'test']:
+            self.dataset[stage] = self.train_args.create_dataset(stage)
 
         for stage in ['train', 'val', 'test']:
             self.dataloader[stage] = self.train_args.create_dataloader(stage, self.dataset[stage])
@@ -151,11 +180,6 @@ class Trainer:
                         f"You can specify `drop_last=True` in DataLoader to fix this problem."
                     )
 
-        pmodel = parallelize_model(self.train_args, self.dummy_input, load_module=not compile_only)
-        if compile_only:
-            return
-
-        torch.distributed.barrier()
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
         self.local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE'))
@@ -269,13 +293,15 @@ class Trainer:
             logger.setup(config)
 
     def _load_checkpoint(self):
-        resume_from = self.train_args.checkpoint.get_resume_checkpoint_dir()
+        resume_from = self.train_args.checkpoint.get_resume_checkpoint()
         if not resume_from:
             return
         logger.info(f"Resuming from {resume_from}")
         if resume_from.is_file():
             resume_from = resume_from   # when we load from merged checkpoint
             state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
+            if convert_fn := self.train_args.checkpoint.resolved_convert_fn:
+                state_dict = convert_fn(state_dict)
         else:
             ckpt_files = list(resume_from.glob('*.ckpt'))
             rank_ckpt_files = {int(f.stem): f for f in ckpt_files if f.stem.isdigit()}
@@ -295,6 +321,8 @@ class Trainer:
                     state_dict = None
                 state_dict_list = [state_dict]
                 logger.info(f"Broadcasting merged checkpoint to all ranks.")
+                # TODO: it will be easily out of memory when the model is large
+                # We should broadcast the state_dict one parameter by one
                 torch.distributed.broadcast_object_list(state_dict_list, src=0)
                 state_dict = state_dict_list[0]
             else:
@@ -302,7 +330,11 @@ class Trainer:
                 state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
 
         self.hook.on_load_checkpoint(self, state_dict)
-        ckpt_save_type = state_dict['train_args']['checkpoint']['save_type']
+        # if it is not a well-formed state_dict (from third party)
+        # we will treat it as a merged state_dict
+        ckpt_save_type = state_dict.get('train_args', {}) \
+            .get('checkpoint', {}) \
+            .get('save_type', 'merged')
 
         if ckpt_save_type == 'merged': # it is a merged state dict
             nnscaler.load_merged_state_dict(
@@ -345,13 +377,17 @@ class Trainer:
                 self.dataloader_resumed = True
         else:
             self.dataloader_resumed = False
-        self.train_status = TrainStatus(**state_dict['train_status'])
+
+        if 'train_status' in state_dict:
+            self.train_status = TrainStatus(**state_dict['train_status'])
 
         # we don't resume rng states when loading merged checkpoint,
         if ckpt_save_type != 'merged':
             self.rng_states_from_resume = state_dict.get('rng_states')  # resumed in _global_batch_iterator()
         else:
             logger.warning("RNG states are not resumed when loading merged checkpoint.")
+
+        self.hook.after_load_checkpoint(self, state_dict)
 
     def _log_mem_stats(self, tag=None):
         # log minimum free memory over the iteration
@@ -374,9 +410,17 @@ class Trainer:
         idx_format = f"0{ndigits}d"
         int_format = ''
         float_format = '.3f'
-        metris_str = ', '.join(
+        float_scientific_format = '.3e'
+        def _select_format(v):
+            if isinstance(v, float):
+                if v != 0.0  and (v < 1e-3 or v > 1e3):
+                    return float_scientific_format
+                else:
+                    return float_format
+            return int_format
+        metrics_str = ', '.join(
             [
-                f"{k}={format(v, float_format if isinstance(v, float) else int_format)}"
+                f"{k}={format(v, _select_format(v))}"
                 for k, v in metrics.items()
             ]
         )
@@ -384,7 +428,7 @@ class Trainer:
             step_str = f'{format(idx, idx_format)}/{self.total_train_steps_per_epoch} '
         else:
             step_str = f''
-        return f"{epoch_desc}: {step_str}{metris_str}"
+        return f"{epoch_desc}: {step_str}{metrics_str}"
 
     def _is_resumable_dataloader(self):
         return (
@@ -428,10 +472,14 @@ class Trainer:
             'train_args': self.train_args.to_dict(),
             'rng_states': self._get_rng_states(),
             'rank': self.rank,
+            'nnscaler': nnscaler.__version__,
         }
+
         if self._is_resumable_dataloader():
-            state_dict['dataloader'] = self.dataloader['train'].state_dict()
+            state_dict['dataloader'] = self.dataloader['train'].state_dict()  # problematic
+
         self.hook.on_save_checkpoint(self, state_dict)
+
         ckpt_file = save_dir / CHECKPOINT_FILE_FORMAT.format(
             epoch=current_epoch,
             step=self.train_status.finished_train_steps,
@@ -555,19 +603,9 @@ class Trainer:
 
     def aggregate_outputs(self, loss_outputs, sync_group) -> AggregatedOutputs:
         # loss is the first element of the output (or the only element)
-        losses = [
-            loss if isinstance(loss, torch.Tensor)
-            else loss[0]
-            for loss in loss_outputs
-        ]
-        loss_sum = torch.sum(torch.stack(losses), dtype=torch.float64)
-        torch.distributed.all_reduce(loss_sum, group=sync_group)
-        num_batches = torch.tensor(len(losses), device=torch.cuda.current_device())
-        torch.distributed.all_reduce(num_batches, group=sync_group)
-
-        return AggregatedOutputs(
-            loss_sum=loss_sum.item(),
-            num_batches=num_batches.item(),
+        return AggregatedOutputs.aggregate(
+            loss_outputs, sync_group=sync_group,
+            loss_fn=lambda loss: loss if isinstance(loss, torch.Tensor) else loss[0]
         )
 
     def _fix_batches(self, batches):
@@ -682,6 +720,7 @@ class Trainer:
         self.hook.on_train_start(self)
 
         for epoch in range(start_epoch, self.train_args.max_epochs or sys.maxsize):
+            # TODO: make sure set_epoch doesn't have negative effect when called multiple times (i.e. when resuming)
             if hasattr(self.dataloader['train'], 'set_epoch'):
                 self.dataloader['train'].set_epoch(epoch)
             elif hasattr(self.dataloader['train'].sampler, 'set_epoch'):
@@ -828,15 +867,18 @@ class Trainer:
             aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)
             if self.train_args.optimizer.loss_reduction == 'mean':
                 loss = aggregated_outputs.loss_sum / aggregated_outputs.num_batches
+            elif self.train_args.optimizer.loss_reduction == 'per-token-mean':
+                if not aggregated_outputs.num_tokens:
+                    raise RuntimeError("`aggregate_outputs` doesn't set `num_tokens` field")
+                loss = aggregated_outputs.loss_sum / aggregated_outputs.num_tokens
             else:
                 loss = aggregated_outputs.loss_sum
             step_stat.train_loss = loss
             self.hook.after_aggregate_train_step_outputs(self, aggregated_outputs, loss, idx)
 
             self.hook.before_sync_grad(self)
-            # actually `sync_shard_grad` is no-op here
-            # because trainer only supports end2end model
-            # and syncing grad in end2end model is done in `_train_step`.
+            # `sync_shard_grad` is no-op if the whole model is parallelized
+            #  because syncing grad in end2end model is done in `_train_step`.
             self.optimizer.sync_shard_grad()
             self.hook.after_sync_grad(self)
 
@@ -881,6 +923,7 @@ class Trainer:
             self._log_mem_stats(tag='train')
             step_metrics = {k:v for k, v in asdict(step_stat).items() if v is not None}
             step_metrics['train_wall'] = time.perf_counter() - step_start_at
+            step_metrics['loss'] = step_metrics['train_loss']
             self.log_metrics(step_metrics, tag='train')
             if self.rank == 0:
                 data_iter.set_postfix(step_metrics)

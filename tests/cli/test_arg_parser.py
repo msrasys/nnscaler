@@ -8,7 +8,7 @@ import sys
 import pytest
 
 from nnscaler.cli.arg_parser import (
-    parse_args, deserialize_dataclass, _fix_type,
+    _KeyNotFoundError, parse_args, deserialize_dataclass, _fix_type,
     resolve_args, merge_args
 )
 
@@ -332,6 +332,9 @@ def test_resolve_args2():
         'v': {'a': 10, 'b': 20},
         'x': {'y': '$(c.d)', 'z': '$(k.2.y)'},
         'k': ['$(f.g.h)', {'x': 20}, {'y': '$(c.e)'}],
+        'm': '${k.0}1',
+        'n': '${m}2$(x.y)',
+        'o': r'$\{k.0}1$(x.y)2$\(x.y)',
     }
     resolve_args(data)
     assert data == {
@@ -342,6 +345,9 @@ def test_resolve_args2():
         'v': {'a': 10, 'b': 20},
         'x': {'y': 3, 'z': 4},
         'k': [5, {'x': 20}, {'y': 4}],
+        'm': '51',
+        'n': '5123',
+        'o': '${k.0}132$(x.y)',
     }
 
 def test_circular_resolve_args():
@@ -374,5 +380,5 @@ def test_missing_resolve_args():
         'b': True,
         'c': {'d': 3, 'e': '$(k.2.y)'},
     }
-    with pytest.raises(ValueError):
+    with pytest.raises(_KeyNotFoundError):
         resolve_args(data)

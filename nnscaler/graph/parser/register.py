@@ -241,7 +241,14 @@ def register_op(annotation: Union[str, Callable], name: Optional[str] = None,
             anno = OpAnno(anno)
             ninputs = len(anno.inputs())
             if len(args) < ninputs:
-                raise ValueError(f"calling function {signature} should include at least {ninputs} *args")
+                # try to fill args with kwargs
+                args = list(args)
+                kwargs = dict(kwargs)
+                for idx in range(len(args), ninputs):
+                    if arg_names[idx] in kwargs:
+                        args.append(kwargs.pop(arg_names[idx]))
+                    else:
+                        raise ValueError(f"calling function {signature} should include at least {ninputs} *args")
             tensors = args[:ninputs]
             for idx, t in enumerate(tensors):
                 # argument check

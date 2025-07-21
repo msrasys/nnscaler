@@ -3359,6 +3359,14 @@ def Sigmoid(input, *, out=None, signature=None):
     return IRDimops(Sigmoid, 'sigmoid', signature, annos, [input])
 
 
+def Item(input, signature = None):
+    """
+    torch.Tensor.item()
+    """
+    anno = '? -> ?'
+    return IRDimops(Item, 'item', signature, [anno], [input], constant_foldable=False)
+
+
 def DictKeys(o: Union[Dict, IRObject], signature=None):
     signature = 'nnscaler.runtime.function.dict_keys'
 

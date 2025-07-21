@@ -21,6 +21,11 @@ class TrainHook:
         When run_mode == 'compile', this hook will not be called.
         """
 
+    def on_finalize(self, trainer: 'Trainer') -> None:
+        """
+        Called after training is done.
+        """
+
     def on_train_start(self, trainer: 'Trainer') -> None:
         """Called at the beginning of training"""
 
@@ -152,6 +157,15 @@ class TrainHook:
             checkpoint: the checkpoint loaded
         """
 
+    def after_load_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:
+        """
+        Called after setting model/optimizer/etc from checkpoint.
+        You can use this to restore some states for model/optimizer/etc that are not saved in the checkpoint.
+
+        Args:
+            checkpoint: the checkpoint loaded
+        """
+
     def on_save_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:
         """
         Called before saving checkpoint.
@@ -169,6 +183,10 @@ class AggregatedTrainHook(TrainHook):
     def after_setup(self, trainer: 'Trainer') -> None:
         for hook in self.hooks:
             hook.after_setup(trainer)
+
+    def on_finalize(self, trainer: 'Trainer') -> None:
+        for hook in self.hooks:
+            hook.on_finalize(trainer)
 
     def on_train_start(self, trainer: 'Trainer') -> None:
         for hook in self.hooks:
@@ -253,6 +271,10 @@ class AggregatedTrainHook(TrainHook):
     def on_load_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:
         for hook in self.hooks:
             hook.on_load_checkpoint(trainer, checkpoint)
+
+    def after_load_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:
+        for hook in self.hooks:
+            hook.after_load_checkpoint(trainer, checkpoint)
 
     def on_save_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:
         for hook in self.hooks:

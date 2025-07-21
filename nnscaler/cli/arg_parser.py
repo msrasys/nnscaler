@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple, Dict, Any, Union
 from dataclasses import dataclass, field, is_dataclass, asdict
 import enum
 import ast
+import regex
 
 
 try:
@@ -33,6 +34,10 @@ NORMALIZE_KEY = 'normalize'
 # if set to True, the field will be skipped during deserialization
 # You can use `__post_init__` to handle the deserialization of the field.
 SKIP_DESERIALIZATION_KEY = 'skip_deserialization'
+
+
+class _KeyNotFoundError(KeyError):
+    pass
 
 
 def parse_args(argv: List[str]) -> dict:
@@ -134,16 +139,46 @@ def resolve_args(args: dict):
     For example, if args is {'a': '$(b)', 'b': 'c'}, then
     it will be updated to {'a': 'c', 'b': 'c'}.
     """
+    pattern = r'(\$\{[^}]+\}|\$\([^)]+\))'
+
     def _is_variable(var_path):
         return isinstance(var_path, str) and (
             (var_path.startswith('$(') and var_path.endswith(')')) or
             (var_path.startswith('${') and var_path.endswith('}'))
         )
 
-    def _get_variable(var_path: str) -> Optional[str]:
+    def _get_variable(var_path: Any) -> Optional[str]:
         if not _is_variable(var_path):
             return None
         return var_path[2:-1]
+
+    def _get_variables(var_path: str) -> List[str]:
+        """
+        Get all variables in the var_path.
+        For example, if var_path is 'a$(a.b.c)b$(c.d)c', it will return ['a.b.c', 'c.d'].
+        """
+        # use regex to find all variables in the var_path
+        matches = regex.findall(pattern, var_path)
+        return [_get_variable(m) for m in matches]
+
+    def _resolve_variables(var_path: Any, resolved_vars: dict[str, str]) -> str | Any:
+        """
+        Resolve all variables in the var_path by replacing them with their values.
+        For example, if var_path is 'a$(b.c)d$(e.f)g', and resolved_vars is {'b.c': 'x', 'e.f': 'y'},
+        it will return 'axdyg'.
+        """
+        # special case, this will keep the type of the variable
+        if _is_variable(var_path):
+            return resolved_vars[_get_variable(var_path)]
+
+        # always return a string
+        var_path = regex.sub(
+            pattern,
+            lambda m: str(resolved_vars[_get_variable(m.group(0))]),
+            var_path
+        )
+        var_path = var_path.replace(r'$\(', '$(').replace(r'$\{', '${')  # escape the variable syntax
+        return var_path
 
     def _get_value(data, var_path: list[Any]):
         for key in var_path:
@@ -152,7 +187,7 @@ def resolve_args(args: dict):
             elif key in data:
                 data = data[key]
             else:
-                raise ValueError(f"{var_path} not found in args")
+                raise _KeyNotFoundError(f"{var_path} not found in args")
         return data
 
     def _set_value(data, var_path: list[Any], value):
@@ -163,7 +198,7 @@ def resolve_args(args: dict):
             elif key in data:
                 data = data[key]
             else:
-                raise ValueError(f"{var_path} not found in args")
+                raise _KeyNotFoundError(f"{var_path} not found in args")
 
         if isinstance(data, list):
             data[int(var_path[-1])] = value
@@ -180,28 +215,28 @@ def resolve_args(args: dict):
             for i, v in enumerate(value):
                 _resolve(var_path + [i], v)
             return value
-        else:
-            ref_key = _get_variable(value)
-            if ref_key:
+        elif isinstance(value, str):
+            ref_keys = _get_variables(value)
+            ref_values = {}
+            for ref_key in ref_keys:
                 if ref_key in pending_values:
                     raise ValueError(f"Circular reference detected for {ref_key}")
                 pending_values.add(ref_key)
                 ref_var_path = ref_key.split('.')
                 try:
-                    value = _get_value(args, ref_var_path)
-                    resolved_value = _resolve(ref_var_path, value)
-                except ValueError as e:
+                    raw_ref_value = _get_value(args, ref_var_path)
+                    ref_values[ref_key] = _resolve(ref_var_path, raw_ref_value)
+                except _KeyNotFoundError as e:
                     if ref_key in os.environ:
-                        resolved_value = os.environ[ref_key]
+                        ref_values[ref_key] = os.environ[ref_key]
                     else:
                         raise
-
-                _set_value(args, var_path, resolved_value)
                 pending_values.remove(ref_key)
-                return resolved_value
-            else:
-                return value
-
+            resolved_value = _resolve_variables(value, ref_values)
+            _set_value(args, var_path, resolved_value)
+            return resolved_value
+        else:
+            return value
     _resolve([], args)
 
 
