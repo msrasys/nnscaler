@@ -1187,14 +1187,12 @@ class SPMDSolver:
 
     def do_dp(self, intervals: List[Tuple[int, int]],
               topk: int) -> List[List[SPMDSearchOutput]]:
-        import cppimport.import_hook
         try:
             import nnscaler.autodist.dp_solver as dp_solver
         except ImportError:
             raise RuntimeError(
-                'Failed to import solver. '
-                'If you installed nnscaler from source (`pip install -e .`), '
-                'please also make sure to put parent directory of `nnscaler` in `PYTHONPATH`.'
+                'Failed to import dp_solver. '
+                'Please install nnscaler with: pip install -e .'
             )
 
         if self.autodist_config.memory_granularity < 1024:
