@@ -350,6 +350,7 @@ def test_resolve_args2():
         'o': '${k.0}132$(x.y)',
     }
 
+
 def test_circular_resolve_args():
     data = {
         'a': 1,

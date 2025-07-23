@@ -1,10 +1,11 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+from pathlib import Path
 import pytest
 
 import nnscaler
-from nnscaler.cli.trainer_args import load_type, ComputeConfig, OptionalComputeConfig
+from nnscaler.cli.trainer_args import load_type, ComputeConfig, OptionalComputeConfig, TrainerArgs
 
 
 def test_load_type():
@@ -37,3 +38,16 @@ def test_compute_config_merge():
     occ2 = OptionalComputeConfig(zero_ngroups=-1)
     with pytest.raises(ValueError):
         occ2.resolve(cc)
+
+
+def test_arg_merge_resolve():
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    args = TrainerArgs.from_cli(['-f', config_path,
+        '--vars.dim', '22',
+        '--vars.hello', '$(compute_config.plan_ngpus)',
+        '--global_batch_size!'
+    ])
+    assert args.vars['dim'] == 22
+    assert args.dataset.train_args['dim'] == 22
+    assert args.dataset.val_args['dim'] == 22
+    assert args.vars['hello'] == args.compute_config.plan_ngpus

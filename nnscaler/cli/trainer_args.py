@@ -695,10 +695,11 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
         if argv[0] == '-f':
             with open(argv[1], 'r') as f:
                 d = yaml.safe_load(f)
-            resolve_args(d)
             argv = argv[2:]
 
         merge_args(d, argv)
+        resolve_args(d)
+
         return cls.from_dict(d)
 
     @classmethod
