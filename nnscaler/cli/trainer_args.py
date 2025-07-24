@@ -103,6 +103,17 @@ def _resolve_precision(precision: Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE]
     return precision
 
 
+def _factory_normalize(value):
+    if isinstance(value, dict) and _TYPE_KEY in value:
+        kwargs = {
+            k: v for k, v in value.items()
+            if k != _TYPE_KEY
+        }
+        return load_type(value[_TYPE_KEY])(**kwargs)
+    else:
+        return value
+
+
 def fix_input(input, input_dtype=None):
     if isinstance(input, dict):
         return {k: fix_input(v, input_dtype) for k, v in input.items()}
@@ -242,8 +253,15 @@ class ModuleParallelizeConfig:
     gen_reuse: Optional[str] = None
     pas_policy: Optional[str] = None
     broadcast_strategy: Optional[str] = None
-    instance_name: Optional[str] = None
-    precision: Union[str, Dict[_TENSOR_TYPE, _PRECISION_TYPE], None] = None
+    # sometimes you want to dynamically set the instance name
+    # for example, you can set it to the hash of related files
+    # In that case, we can pass a dict with callable __type field.
+    instance_name: Optional[str] = field(default=None, metadata={
+        'normalize': _factory_normalize
+    })
+    precision: Optional[Dict[_TENSOR_TYPE, _PRECISION_TYPE]] = field(default=None, metadata={
+        'skip_deserialization': True,
+    })
 
     def __post_init__(self):
         if not self.type:
@@ -366,11 +384,17 @@ class LRSchedulerConfig:
 
 @dataclass
 class ResumeOptions:
-    checkpoint: str = 'last'
+    # sometimes you want to dynamically set checkpoint path
+    # for example, you can set it to finetune model if no `last` checkpoint exists
+    checkpoint: str = field(default='last', metadata={
+        'normalize': _factory_normalize
+    })
     # the full qualified name of the function to
     # convert the checkpoint to nnscaler format
     # It should be `Callable[[Dict[str, Any]], Dict[str, Any]]`
     # Only applied when `checkpoint` is a file.
+    # Please note you should handle the case
+    # when checkpoint file comes from a factory method
     convert_fn: Optional[str] = None
     # whether to merge the checkpoint files
     # Only used when `checkpoint` is a directory.
@@ -498,6 +522,9 @@ class HookMapConfig:
     on_epoch_start: str = None
     on_epoch_end: str = None
 
+    on_step_start: str = None
+    on_step_end: str = None
+
     on_train_step_start: str = None
     on_train_step_end: str = None
     on_val_step_start: str = None
@@ -556,7 +583,12 @@ class TrainerArgs(PrecisionMixin, PolicyMixin):
     gen_reuse: str = 'auto'
     pas_policy: str = 'autodist'
     broadcast_strategy: str = 'all'
-    instance_name: str = None
+    # sometimes you want to dynamically set the instance name
+    # for example, you can set it to the hash of related files
+    # In that case, we can pass a dict with callable __type field.
+    instance_name: Optional[str] = field(default=None, metadata={
+        'normalize': _factory_normalize
+    })
     # compile: compile the model but not training
     # run: compile and run the model
     run_mode: str = 'run'

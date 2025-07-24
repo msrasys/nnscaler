@@ -23,8 +23,10 @@ logger = logging.getLogger(__name__)
 
 def fork_rng():
     if torch.distributed.is_initialized():
-        rank = torch.distributed.get_rank()
-        return torch.random.fork_rng([rank])
+        # only capture the random state of the current device
+        # which is good enough for us
+        device = torch.cuda.current_device()
+        return torch.random.fork_rng([device])
     else:
         return torch.random.fork_rng()
 

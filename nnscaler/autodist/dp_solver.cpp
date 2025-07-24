@@ -623,3 +623,16 @@ PYBIND11_MODULE(dp_solver, m) {
       .def("solve", &DPSolver::solve)
       .def("get_results", &DPSolver::get_results);
 }
+
+// the following is used to build the cpp file in cppimport
+// which is just for local development convenience
+// For production, `setup.py` will be used to build the cpp file
+/*
+<%
+setup_pybind11(cfg)
+cfg['extra_compile_args'] = ['-std=c++11']
+cfg['extra_compile_args'] = ['-O3']
+cfg['extra_compile_args'] = ['-pthread']
+cfg['dependencies'] = ['dp_solver.h']
+%>
+*/

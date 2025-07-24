@@ -1,13 +1,21 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Any, Dict, List, TYPE_CHECKING
+from typing import Any, Dict, List, TYPE_CHECKING, TypedDict, Optional
 
 import torch
 
 if TYPE_CHECKING:
     from nnscaler.cli.trainer import Trainer
     from nnscaler.cli.trainer_args import AggregatedOutputs
+
+
+class StepMetrics(TypedDict):
+    train_loss: float
+    loss: float  # alias for train_loss
+    lr: float
+    gnorm: float
+    train_wall: float  # wall time for training step
 
 
 class TrainHook:
@@ -50,6 +58,21 @@ class TrainHook:
         Called at the end of each epoch
         Args:
             epoch: the current epoch index
+        """
+
+    def on_step_start(self, trainer: 'Trainer', epoch: int, idx: int) -> None:
+        """
+        Called at the beginning of each step
+        Args:
+            idx: the index of current step
+        """
+
+    def on_step_end(self, trainer: 'Trainer', epoch: int, idx: int, step_metrics: StepMetrics) -> None:
+        """
+        Called at the end of each step (validation and checkpoint saving are not included)
+        Args:
+            idx: the index of current step
+            step_metrics: the metrics of the current step
         """
 
     def on_train_step_start(self, trainer: 'Trainer', batches: List[Any], idx: int) -> None:
@@ -211,6 +234,14 @@ class AggregatedTrainHook(TrainHook):
     def on_epoch_end(self, trainer: 'Trainer', epoch: int) -> None:
         for hook in self.hooks:
             hook.on_epoch_end(trainer, epoch)
+
+    def on_step_start(self, trainer: 'Trainer', epoch: int, idx: int) -> None:
+        for hook in self.hooks:
+            hook.on_step_start(trainer, epoch, idx)
+
+    def on_step_end(self, trainer: 'Trainer', epoch: int, idx: int, step_metrics: StepMetrics) -> None:
+        for hook in self.hooks:
+            hook.on_step_end(trainer, epoch, idx, step_metrics)
 
     def on_train_step_start(self, trainer: 'Trainer', batches: List[Any], idx: int) -> None:
         for hook in self.hooks:

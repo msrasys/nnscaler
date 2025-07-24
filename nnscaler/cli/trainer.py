@@ -274,6 +274,69 @@ class Trainer:
         }
         return merged_state_dict
 
+    def _broadcast_merged_state_dict(self, state_dict: Dict[str, Any]):
+        """
+        Broadcast the merged state dict to all ranks.
+        We can't broadcast the whole state_dict at once, because it may be too large, and leads to OOM.
+        Here we will break the model and optimizer state_dict into smaller pieces and broadcast them one by one.
+        Please note we use `torch.distributed.broadcast_object_list` to broadcast the state_dict (including tensors inside).
+        """
+
+        def _broadcast_keys(sdict: Dict[str, Any], set_keys=True):
+            if self.rank == 0:
+                state_keys = list(sdict.keys())
+            else:
+                state_keys = None
+            state_key_list = [state_keys]
+            torch.distributed.broadcast_object_list(state_key_list, src=0)
+            state_keys = state_key_list[0]
+            if set_keys and self.rank != 0:
+                for key in state_keys:
+                    sdict[key] = {}  # assume the values are empty dicts
+            return state_keys
+
+        def _broadcast_value(sdict, key):
+            if self.rank == 0:
+                value_list = [sdict[key]]
+            else:
+                value_list = [None]
+            torch.distributed.broadcast_object_list(value_list, src=0)
+            if self.rank != 0:
+                sdict[key] = value_list[0]
+
+        def _broadcast_values(sdict, keys):
+            for key in keys:
+                _broadcast_value(sdict, key)
+
+        if self.rank == 0:
+            if state_dict is None:
+                raise ValueError("state_dict should not be None in rank 0 when broadcasting")
+        else:
+            if state_dict is not None:
+                raise ValueError("state_dict should be None in other ranks when broadcasting")
+            state_dict = {}
+
+        state_keys = _broadcast_keys(state_dict)
+
+        for skey in state_keys:
+            logger.info(f"Broadcasting {skey}.")
+            if skey == 'optimizer':
+                opt_keys = _broadcast_keys(state_dict['optimizer'])
+                opt_keys_without_state = [
+                    k for k in opt_keys if k != 'state'
+                ]
+                _broadcast_values(state_dict['optimizer'], opt_keys_without_state)
+                idxs = _broadcast_keys(state_dict['optimizer']['state'])
+                for idx in idxs:
+                    idx_keys = _broadcast_keys(state_dict['optimizer']['state'][idx])
+                    _broadcast_values(state_dict['optimizer']['state'][idx], idx_keys)
+            elif skey == 'model':
+                model_keys = _broadcast_keys(state_dict['model'])
+                _broadcast_values(state_dict['model'], model_keys)
+            else:
+                _broadcast_value(state_dict, skey)
+        return state_dict
+
     @classmethod
     def merge_checkpoint(cls, checkpoint_files: List[str], output_file: str):
         merged_state_dict = cls._merge_checkpoint(checkpoint_files)
@@ -319,12 +382,9 @@ class Trainer:
                     state_dict = self._merge_checkpoint(list(rank_ckpt_files.values()))
                 else:
                     state_dict = None
-                state_dict_list = [state_dict]
                 logger.info(f"Broadcasting merged checkpoint to all ranks.")
-                # TODO: it will be easily out of memory when the model is large
-                # We should broadcast the state_dict one parameter by one
-                torch.distributed.broadcast_object_list(state_dict_list, src=0)
-                state_dict = state_dict_list[0]
+                state_dict = self._broadcast_merged_state_dict(state_dict)
+                logger.info(f"Broadcasted merged checkpoint to all ranks.")
             else:
                 resume_from = resume_from / f'{self.rank}.ckpt'
                 state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
@@ -846,6 +906,8 @@ class Trainer:
         step_stat: Optional[_StepStat] = None
         for i, batches in data_iter:
             idx = i + resume_from_idx
+            self.hook.on_step_start(self, epoch, idx)
+
             step_start_at = time.perf_counter()
             step_stat = _StepStat()
             step_metrics = {}
@@ -931,6 +993,8 @@ class Trainer:
                     and self.train_status.finished_train_steps % self.train_args.log_progress_every_n_train_steps == 0:
                     logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics))
                     step_metrics = {}
+
+            self.hook.on_step_end(self, epoch, idx, step_metrics)
 
             # validate and save checkpoint
             if self.train_args.checkpoint.every_n_train_steps and \

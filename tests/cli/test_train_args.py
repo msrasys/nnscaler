@@ -51,3 +51,18 @@ def test_arg_merge_resolve():
     assert args.dataset.train_args['dim'] == 22
     assert args.dataset.val_args['dim'] == 22
     assert args.vars['hello'] == args.compute_config.plan_ngpus
+
+
+def gen_instance_name(stem):
+    return f'instance_{stem}'
+
+
+def test_dyn_str_config():
+    config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
+    args = TrainerArgs.from_cli(['-f', config_path,
+        '--instance_name.__type', 'tests.cli.test_train_args.gen_instance_name',
+        '--instance_name.stem', 'p$(compute_config.plan_ngpus)',
+        '--compute_config.plan_ngpus', '1',
+        '--global_batch_size!',
+    ])
+    assert args.instance_name == 'instance_p1'
