@@ -2,28 +2,36 @@
 #  Licensed under the MIT License.
 
 from typing import Tuple, List, Dict
+import torch
 from torch import Tensor
+import torch.distributed
 
 from nnscaler.graph.parser.register import register_op
 from nnscaler.ir.operator import IRFwOperation
-from core.ring_attn_implementation import RingFlashAttnFunc
+from .core.zigzag_attn_implementation import ZigZagRingFlashAttnFunc
+from .core.utils import gen_head_anno
 from flash_attn import flash_attn_func
 
+import torch.distributed as dist
 from nnscaler.runtime.device import DeviceGroup
 
 
-def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor, softmax_scale: Tensor=None,
+def wrap_zigzag_attn_func(q: Tensor, k: Tensor, v: Tensor, softmax_scale: Tensor=None,
                           dropout_p: float=0.0, causal: bool=True, window_size: Tuple[int]=(-1, -1),
-                          softcap: float=0.0, alibi_slopes: Tensor=None, deterministic: bool=False,
+                          alibi_slopes: Tensor=None, deterministic: bool=False,
                           return_attn_probs: bool=False,
                           process_group: Tuple[int]=None) -> Tensor:
     '''
-    wrap the ring_attn_func to support the distributed training in nnScaler.
+    wrap the zigzag_attn_func to support the distributed training in nnScaler.
     most of the arguments are the same as the original flash_attn_func.
     `process_group` should be none in the user code since nnScaler accepts the
     program defined for the single device and will automatically generate the
     required communications.
     '''
+
+    assert window_size == (-1, -1), "window_size is not supported in zigzag-attention"
+    assert not return_attn_probs, "return_attn_probs is not supported in zigzag-attention"
+    assert alibi_slopes is None, "alibi_slopes is not supported in zigzag-attention"
 
     if process_group is None or len(process_group) == 1:
         # there is an additional checker for the `softmax_scale`, which is equivalent
@@ -33,6 +41,7 @@ def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor, softmax_scale: Tensor=N
         output = flash_attn_func(q, k, v, 0.0, softmax_scale, causal)
         return output
 
+    assert causal == True, "zigzag_ring is meaningless for causal=False"
     assert len(q.shape) == 4, "q must have shape [bs, ql, qh, dim]"
     assert len(k.shape) == 4, "k must have shape [bs, kl, kh, dim]"
     assert len(v.shape) == 4, "v must have shape [bs, vl, vh, dim]"
@@ -47,11 +56,7 @@ def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor, softmax_scale: Tensor=N
 
     local_process_group = DeviceGroup().get_group(process_group)
 
-    # In the RingFlashAttnFunc.apply function, the torch.distributed._all_gather_base function 
-    # requires that the k and v tensors be contiguous.
-    k = k.contiguous()
-    v = v.contiguous()
-    output = RingFlashAttnFunc.apply(
+    output = ZigZagRingFlashAttnFunc.apply(
         q,
         k,
         v,
@@ -59,7 +64,6 @@ def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor, softmax_scale: Tensor=N
         softmax_scale,
         causal,
         window_size,
-        softcap,
         alibi_slopes,
         deterministic,
         return_attn_probs,
@@ -68,8 +72,8 @@ def wrap_ring_attn_func(q: Tensor, k: Tensor, v: Tensor, softmax_scale: Tensor=N
 
     return output
 
-def emit_ring(node: IRFwOperation, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
-    """Special rule to generate ring_attn node"""
+def emit_zigzag(node: IRFwOperation, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
+    """Special rule to generate zigzag_attn node"""
 
     signature = node.signature
 
@@ -104,4 +108,10 @@ def emit_ring(node: IRFwOperation, args: List[str], kwargs: Dict[str, str], runt
     args = ", ".join(list(args) + kw_pairs)
     return f"{signature}({args})"
 
-register_op('bs l h dim^, bs l h dim^, bs l h dim^ -> bs l h dim^', emit_fn=emit_ring)(wrap_ring_attn_func)
+
+def flash_attention_anno(query_states, key_states, value_states, *args, **kwargs) -> str:
+    q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states)
+    return f'b l {q_anno} hd^, b l {kv_anno} hd^, b l {kv_anno} vd^ -> b l {q_anno} vd^'
+
+
+register_op(flash_attention_anno, emit_fn=emit_zigzag)(wrap_zigzag_attn_func)

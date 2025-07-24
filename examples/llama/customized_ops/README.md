@@ -18,4 +18,5 @@ Test can be run with the following command:
 ```bash
 torchrun --nproc_per_node 4 test_ring_attn.py
 torchrun --nproc_per_node 4 test_zigzag_attn.py
+torchrun --nproc_per_node 4 test_ring_attn_varlen.py
 ```

@@ -6,9 +6,95 @@
 from typing import Optional, Tuple
 from functools import reduce
 import operator
+import inspect
+from functools import cache
+import random
 
 import torch
 import torch.distributed as dist
+
+
+def set_seed(rank, seed=42):
+    seed = rank + seed
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def log(msg, a, rank0_only=False):
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    if rank0_only:
+        if rank == 0:
+            print(
+                f"{msg}: "
+                f"max {a.abs().max().item()}, "
+                f"mean {a.abs().mean().item()}",
+                flush=True,
+            )
+        return
+
+    for i in range(world_size):
+        if i == rank:
+            if rank == 0:
+                print(f"{msg}:")
+            print(
+                f"[{rank}] "
+                f"max {a.abs().max().item()}, "
+                f"mean {a.abs().mean().item()}",
+                flush=True,
+            )
+        dist.barrier()
+
+
+def gen_head_anno(query_states, key_states, value_states):
+    if query_states.shape[2] != key_states.shape[2]:
+        assert query_states.shape[2] % key_states.shape[2] == 0
+        group_size = query_states.shape[2] // key_states.shape[2]
+        assert query_states.shape[2] == value_states.shape[2] * group_size
+        q_anno = f'(group_num {group_size})'
+        kv_anno = 'group_num'
+    else:
+        q_anno = kv_anno = 'num_heads'
+    return q_anno, kv_anno
+
+
+# copied from project https://github.com/zhuzilin/ring-flash-attention
+@cache
+def _get_default_args(func):
+    spec = inspect.getfullargspec(func)
+    defaults = spec.defaults if spec.defaults is not None else ()
+    padded_defaults = (None,) * (len(spec.args) - len(defaults)) + defaults
+    args = dict(zip(spec.args, padded_defaults))
+    if "softcap" in args:
+        args["softcap"] = 0.0
+    return args
+
+
+def get_default_args(func):
+    if inspect.isfunction(func):
+        return _get_default_args(func)
+    else:
+        # Use the origin _init_fn in CustomOpDef
+        return _get_default_args(func._init_fn)
+
+
+class AllGatherComm:
+    def __init__(self, group=None) -> None:
+        self.group = group
+        self.handles = []
+
+    def all_gather(self, output_tensor: torch.Tensor, input_tensor: torch.Tensor):
+        handle = dist.all_gather_into_tensor(
+            output_tensor, input_tensor, group=self.group, async_op=True
+        )
+        self.handles.append(handle)
+
+    def wait(self):
+        for handle in self.handles:
+            handle.wait()
+        self.handles = []
 
 
 # copy from megatron/core/utils.py

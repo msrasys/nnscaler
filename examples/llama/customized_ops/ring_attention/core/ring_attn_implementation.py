@@ -4,17 +4,10 @@
 import torch
 import torch.distributed as dist
 from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
-from .utils import shuffle_input, recover_output, GlobalMemoryBuffer
+from .utils import shuffle_input, recover_output, GlobalMemoryBuffer, get_default_args
 
 
 _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
-
-
-import flash_attn
-
-version = flash_attn.__version__
-if not version.startswith("2.6"):
-    raise ImportError("The current version of Ring Attention is not compatible with Flash Attention versions other than 2.6.x.")
 
 
 def ring_flash_attn_forward(
@@ -26,10 +19,40 @@ def ring_flash_attn_forward(
     dropout_p=0,
     causal=True,
     window_size=(-1, -1),
-    softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
 ):
+    def forward(q, k, v, causal):
+        params = get_default_args(_flash_attn_forward).copy()
+        params.update(
+            {
+                "q": q,
+                "k": k,
+                "v": v,
+                "dropout_p": dropout_p,
+                "softmax_scale": softmax_scale,
+                "causal": causal,
+                "alibi_slopes": alibi_slopes,
+                "return_softmax": True and dropout_p > 0,
+            }
+        )
+        if "window_size" in params:
+            params.update({"window_size": window_size})
+        else:
+            params.update(
+                {
+                    "window_size_left": window_size[0],
+                    "window_size_right": window_size[1],
+                }
+            )
+        outputs = _flash_attn_forward(**params)
+        if len(outputs) == 8:
+            block_out, _, _, _, _, block_lse, _, _ = outputs
+        else:
+            assert len(outputs) == 4
+            block_out, block_lse, _, _ = outputs
+        return block_out, block_lse
+
     block_len = q.size(1) // 2
     curr_rank = dist.get_rank(process_group)
     world_size = dist.get_world_size(process_group)
@@ -45,18 +68,8 @@ def ring_flash_attn_forward(
         up_v = v[:, :(up_rank + 1) * block_len]
     else:
         up_k, up_v = k, v
-    up_out, _, _, _, _, up_lse, _, _ = _flash_attn_forward(
-        up_q,
-        up_k,
-        up_v,
-        dropout_p,
-        softmax_scale,
-        causal=causal,
-        window_size=window_size,
-        softcap=softcap,
-        alibi_slopes=alibi_slopes,
-        return_softmax=True and dropout_p > 0,
-    )
+
+    up_out, up_lse = forward(up_q, up_k, up_v, causal)
 
     down_q = q[:, block_len:]
     if causal:
@@ -64,18 +77,7 @@ def ring_flash_attn_forward(
         down_v = v[:, :(down_rank + 1) * block_len]
     else:
         down_k, down_v = k, v
-    down_out, _, _, _, _, down_lse, _, _ = _flash_attn_forward(
-        down_q,
-        down_k,
-        down_v,
-        dropout_p,
-        softmax_scale,
-        causal=causal,
-        window_size=window_size,
-        softcap=softcap,
-        alibi_slopes=alibi_slopes,
-        return_softmax=True and dropout_p > 0,
-    )
+    down_out, down_lse = forward(down_q, down_k, down_v, causal)
 
     out = torch.cat([up_out, down_out], dim=1)
     return out, up_lse, down_lse
@@ -94,7 +96,6 @@ def ring_flash_attn_backward(
     dropout_p=0,
     causal=True,
     window_size=(-1, -1),
-    softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
 ):
@@ -121,25 +122,36 @@ def ring_flash_attn_backward(
         up_v = v[:, :(up_rank + 1) * block_len]
     else:
         up_k, up_v = k, v
-    _flash_attn_backward(
-        up_dout,
-        up_q,
-        up_k,
-        up_v,
-        up_out,
-        up_lse,
-        dq[:, :block_len],
-        dk_buffer[:, :(up_rank + 1) * block_len],
-        dv_buffer[:, :(up_rank + 1) * block_len],
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,
-        alibi_slopes,
-        deterministic,
-        rng_state=None,
+
+    params = get_default_args(_flash_attn_backward).copy()
+    params.update(
+        {
+            "dout": up_dout,
+            "q": up_q,
+            "k": up_k,
+            "v": up_v,
+            "out": up_out,
+            "softmax_lse": up_lse,
+            "dq": dq[:, :block_len],
+            "dk": dk_buffer[:, :(up_rank + 1) * block_len],
+            "dv": dv_buffer[:, :(up_rank + 1) * block_len],
+            "dropout_p": dropout_p,
+            "softmax_scale": softmax_scale,
+            "causal": causal,
+            "alibi_slopes": alibi_slopes,
+            "deterministic": deterministic,
+        }
     )
+    if "window_size" in params:
+        params.update({"window_size": window_size})
+    else:
+        params.update(
+            {
+                "window_size_left": window_size[0],
+                "window_size_right": window_size[1],
+            }
+        )
+    _flash_attn_backward(**params)
 
     down_q = q[:, block_len:]
     down_out = out[:, block_len:]
@@ -154,25 +166,36 @@ def ring_flash_attn_backward(
         down_v = v[:, :(down_rank + 1) * block_len]
     else:
         down_k, down_v = k, v
-    _flash_attn_backward(
-        down_dout,
-        down_q,
-        down_k,
-        down_v,
-        down_out,
-        down_lse,
-        dq[:, block_len:],
-        down_dk_buffer[:, :(down_rank + 1) * block_len],
-        down_dv_buffer[:, :(down_rank + 1) * block_len],
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,
-        alibi_slopes,
-        deterministic,
-        rng_state=None,
+
+    params = get_default_args(_flash_attn_backward).copy()
+    params.update(
+        {
+            "dout": down_dout,
+            "q": down_q,
+            "k": down_k,
+            "v": down_v,
+            "out": down_out,
+            "softmax_lse": down_lse,
+            "dq": dq[:, block_len:],
+            "dk": down_dk_buffer[:, :(down_rank + 1) * block_len],
+            "dv": down_dv_buffer[:, :(down_rank + 1) * block_len],
+            "dropout_p": dropout_p,
+            "softmax_scale": softmax_scale,
+            "causal": causal,
+            "alibi_slopes": alibi_slopes,
+            "deterministic": deterministic,
+        }
     )
+    if "window_size" in params:
+        params.update({"window_size": window_size})
+    else:
+        params.update(
+            {
+                "window_size_left": window_size[0],
+                "window_size_right": window_size[1],
+            }
+        )
+    _flash_attn_backward(**params)
     dk_buffer.add_(down_dk_buffer)
     dv_buffer.add_(down_dv_buffer)
 
@@ -180,8 +203,8 @@ def ring_flash_attn_backward(
     dim_size[1] = dim_size[1] // world_size
     dk = torch.empty(dim_size, dtype=k.dtype, device=k.device)
     dv = torch.empty(dim_size, dtype=v.dtype, device=v.device)
-    dist._reduce_scatter_base(dk, dk_buffer, group=process_group)
-    dist._reduce_scatter_base(dv, dv_buffer, group=process_group)
+    dist.reduce_scatter_tensor(dk, dk_buffer, group=process_group)
+    dist.reduce_scatter_tensor(dv, dv_buffer, group=process_group)
     
     return dq, dk, dv
 
@@ -205,7 +228,6 @@ class RingFlashAttnFunc(torch.autograd.Function):
         softmax_scale,
         causal,
         window_size,
-        softcap,
         alibi_slopes,
         deterministic,
         return_softmax,
@@ -221,8 +243,8 @@ class RingFlashAttnFunc(torch.autograd.Function):
         dim_size[1] = dim_size[1] * world_size
         k_buffer = _GLOBAL_MEMORY_BUFFER.get_tensor(dim_size, k.dtype, "fwd_k")
         v_buffer = _GLOBAL_MEMORY_BUFFER.get_tensor(dim_size, v.dtype, "fwd_v")
-        torch.distributed._all_gather_base(k_buffer, k, group=group)
-        torch.distributed._all_gather_base(v_buffer, v, group=group)
+        torch.distributed.all_gather_into_tensor(k_buffer, k, group=group)
+        torch.distributed.all_gather_into_tensor(v_buffer, v, group=group)
 
         out, up_lse, down_lse = ring_flash_attn_forward(
             group,
@@ -233,7 +255,6 @@ class RingFlashAttnFunc(torch.autograd.Function):
             dropout_p=dropout_p,
             causal=causal,
             window_size=window_size,
-            softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=False,
         )
@@ -243,12 +264,11 @@ class RingFlashAttnFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
-        ctx.softcap = softcap
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         ctx.group = group
         out = recover_output(out, process_group=group)
-        return out if not return_softmax else (out, softmax_lse, None)
+        return out
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -259,8 +279,8 @@ class RingFlashAttnFunc(torch.autograd.Function):
         dim_size[1] = dim_size[1] * world_size
         k_buffer = _GLOBAL_MEMORY_BUFFER.get_tensor(dim_size, k.dtype, "fwd_k")
         v_buffer = _GLOBAL_MEMORY_BUFFER.get_tensor(dim_size, v.dtype, "fwd_v")
-        torch.distributed._all_gather_base(k_buffer, k, group=ctx.group)
-        torch.distributed._all_gather_base(v_buffer, v, group=ctx.group)
+        torch.distributed.all_gather_into_tensor(k_buffer, k, group=ctx.group)
+        torch.distributed.all_gather_into_tensor(v_buffer, v, group=ctx.group)
 
         dq, dk, dv = ring_flash_attn_backward(
             ctx.group,
@@ -275,9 +295,8 @@ class RingFlashAttnFunc(torch.autograd.Function):
             dropout_p=ctx.dropout_p,
             causal=ctx.causal,
             window_size=ctx.window_size,
-            softcap=ctx.softcap,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
         )
         dq = recover_output(dq, ctx.group)
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None
