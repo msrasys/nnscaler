@@ -683,27 +683,48 @@ class ItemModule(torch.nn.Module):
         return a.item()
 
 
-def _gencode_item_function_worker(tempdir):
-    init_distributed()
-    m_new = parallelize(
-        ItemModule(),
-        {
-            'a': torch.tensor([5.0]),
-        },
-        'dp',
-        ComputeConfig(1, 1, constant_folding=True),
-        gen_savedir=tempdir,
-        load_module=True
-    )
-    assert m_new is not None
-    # never fold torch.Tensor.item() to constant
-    assert _gencode_contains(tempdir, ItemModule, 0, '.*torch.Tensor.item.*')
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+@replace_all_device_with('cpu')
 def test_codegen_item():
     with tempfile.TemporaryDirectory() as tempdir:
-        launch_torchrun(1, _gencode_item_function_worker, tempdir)
+        m_new = parallelize(
+            ItemModule(),
+            {
+                'a': torch.tensor([5.0]),
+            },
+            'dp',
+            ComputeConfig(1, 1, constant_folding=True),
+            gen_savedir=tempdir,
+            load_module=False
+        )
+        assert m_new is None
+        # never fold torch.Tensor.item() to constant
+        assert _gencode_contains(tempdir, ItemModule, 0, '.*torch.Tensor.item.*')
+
+
+class ArangeModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, end):
+        return torch.arange(start=0, end=end, dtype=torch.float32)
+
+
+@replace_all_device_with('cpu')
+def test_codegen_arange():
+    with tempfile.TemporaryDirectory() as tempdir:
+        m_new = parallelize(
+            ArangeModule(),
+            {
+                'end': 5,
+            },
+            'dp',
+            ComputeConfig(1, 1, constant_folding=True),
+            gen_savedir=tempdir,
+            load_module=False
+        )
+        assert m_new is None
+        # never fold torch.Tensor.item() to constant
+        assert _gencode_contains(tempdir, ArangeModule, 0, '.*nnscaler.runtime.function.arange\(start=0, end=.*, step=1.*')
 
 
 class MinModule(torch.nn.Module):
@@ -712,6 +733,7 @@ class MinModule(torch.nn.Module):
 
     def forward(self, a, b):
         return torch.min(a, b)
+
 
 def _gencode_min_function_worker(tempdir):
     init_distributed()

@@ -221,6 +221,9 @@ def test_Where():
 
 
 def test_FullSlice():
+    op = F.FullSlice(IRTensor([2, 3, 4]), None)
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a b c, ? -> 1 a b c'
+
     op = F.FullSlice(IRTensor([2, 3, 4]), 1, [1.2, -1], 2)
     assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == 'a^ b^ c^, ?, ?, ? -> 2'
 
