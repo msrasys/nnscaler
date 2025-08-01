@@ -861,7 +861,7 @@ class IRDimops(IRFwOperation):
             for adim, dimlen in zip(ashape.dims, itensor.shape):
                 if len(adim.identifiers) == 1:
                     if adim.identifiers[0] in identifier_values and identifier_values[adim.identifiers[0]] != dimlen:
-                        raise RuntimeError(f'the exist identifier value {identifier_values[adim.identifiers[0]]} is not equal to the new value {dimlen}')
+                        raise RuntimeError(f'at {signature} with {op_anno} the exist identifier {adim.identifiers[0]} value {identifier_values[adim.identifiers[0]]} is not equal to the new value {dimlen}')
                     identifier_values[adim.identifiers[0]] = dimlen
 
         # check dimension consistency

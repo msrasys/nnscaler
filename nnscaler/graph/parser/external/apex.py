@@ -83,6 +83,7 @@ try:
     parser.register(apex_fused_layer_norm_affine_anno)(fused_layer_norm_affine)
     parser.register(apex_fused_rms_norm_anno)(fused_rms_norm)
     parser.register(apex_fused_rms_norm_affine_anno)(fused_rms_norm_affine)
+    _logger.info("apex ops registered successfully.")
 
 except:
     _logger.warning('skip apex ops as it is not installed.')

@@ -21,13 +21,16 @@ _LARGE_TIMEOUT = datetime.timedelta(seconds=21600)
 class _DeviceGroup:
     def __init__(self):
         self._is_pg_initer = False
-        if CompileFlag.dev_mode or not is_running_distributed():
+        # if CompileFlag.dev_mode or not is_running_distributed():
+        if CompileFlag.dev_mode:
+            print('>>> running in dev mode or not distributed')
             self.rank = 0
             self.world_size = 1
             self.local_world_size = 1
             self.local_rank = 0
             self.node_rank = 0
         else:
+            print('>>> running in distributed mode')
             if not torch.distributed.is_initialized():
                 torch.distributed.init_process_group(
                     backend='nccl', timeout=_LARGE_TIMEOUT
@@ -48,7 +51,7 @@ class _DeviceGroup:
             # assume each node has the same device number
             self.local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE'))
             self.local_rank = int(os.environ.get('LOCAL_RANK'))
-            self.node_rank = int(os.environ.get('GROUP_RANK'))
+            self.node_rank = int(os.environ.get('GROUP_RANK', '0'))
 
         torch.cuda.set_device(self.local_rank)
         self.groups: Dict = { '1'*self.world_size: None }
