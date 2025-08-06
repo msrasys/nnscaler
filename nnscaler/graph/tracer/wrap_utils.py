@@ -408,6 +408,14 @@ def is_autograd_apply(func) -> bool:
         and orig_func.isinstance(getattr(func, '__self__', None), Type) and issubclass(func.__self__, torch.autograd.Function)
 
 
+def is_autograd_op(func) -> bool:
+    try:
+        return issubclass(func, torch.autograd.Function)
+    except TypeError:
+        # if func is not a class, then it is not an autograd function
+        return False
+
+
 def create_wrapped_autograd_apply(default_tracer: 'ConcreteTracer'):
     @classmethod
     @functools.wraps(orig_func.torch_agfunc_apply)

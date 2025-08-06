@@ -352,7 +352,6 @@ def test_codegen_recompute_kwargs():
         )
 
 
-
 class DefaultArgsModule(torch.nn.Module):
     def __init__(self):
         super().__init__()

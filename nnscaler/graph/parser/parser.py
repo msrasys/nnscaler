@@ -262,7 +262,12 @@ class FxModuleParser:
                 _logger.warning(f'Find unknown pytorch operation: {fsig}')
                 fname = fsig.split('.')[-1] if '.' in fsig else fsig
                 ir_node = IRFwOperation(fname, fsig, input_vals, 1, **kwargs)
-            # case2: python runtime function
+            # case2: custom autograd function
+            elif FxModuleParser._is_custom_autograd_op(node):
+                # custom autograd function
+                _logger.warning(f'Find unknown custom autograd operation: {fsig}. You should register it with nnscaler.register_op')
+                ir_node = IRFwOperation(fsig, fsig, input_vals, 1, **kwargs)
+            # case3: python runtime function
             else:
                 _logger.warning(f'Set python runtime function: {fsig}')
                 is_constant = True
@@ -549,3 +554,11 @@ class FxModuleParser:
         # an IRTensor, thus cannot be considered as a pytorch autograd operator.
         return signature.startswith('torch.') and \
                isinstance(frame.get_var(node.name), IRFullTensor)
+
+    @staticmethod
+    def _is_custom_autograd_op(node: torch.fx.Node) -> bool:
+        node_target = node.target
+        return callable(node_target) \
+            and getattr(node_target, '__name__', None) == 'apply' \
+            and isinstance(getattr(node_target, '__self__', None), Type) \
+            and issubclass(node_target.__self__, torch.autograd.Function)
