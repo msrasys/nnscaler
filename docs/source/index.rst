@@ -127,6 +127,13 @@ For any questions or inquiries, please contact us at nnscaler@service.microsoft.
 .. toctree::
    :maxdepth: 1
    :hidden:
+   :caption: AutoDist
+
+   autodist/configuration
+
+.. toctree::
+   :maxdepth: 1
+   :hidden:
    :caption: Miscellaneous
 
    control_flow

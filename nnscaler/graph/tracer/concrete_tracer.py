@@ -160,7 +160,7 @@ class ConcreteTracer(TracerBase):
             node.meta['nn_module_stack'] = collections.OrderedDict()
 
         def unwrap_nested_proxy(proxy: ep.ConcreteProxy):
-                return pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, proxy.value)
+            return pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, proxy.value)
 
         # unwrap all proxy in the node result here, because no proxy should be record in the tensor metadata
         node_result = pytree_utils.tree_map_only(ep.ConcreteProxy, unwrap_nested_proxy, node_result)
