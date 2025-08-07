@@ -47,7 +47,8 @@ CHECKPOINT_BEST_FILE_FORMAT: str = 'best/{rank}.ckpt'
 @dataclass
 class TrainStatus:
     best_loss = float('inf')
-    # the train steps done so far
+    # the train steps done (forward/backward/optimizer step) so far
+    # This will be updated after optimizer.step is done, but before validation/logging metrics/saving checkpoint.
     finished_train_steps: int = 0
 
 
@@ -844,6 +845,7 @@ class Trainer:
         batches_count = 0
 
         self.hook.on_val_start(self)
+        val_start_at = time.perf_counter()
         for idx, batches in data_iter:
             if self.train_args.max_val_steps and idx >= self.train_args.max_val_steps:
                 break
@@ -853,29 +855,30 @@ class Trainer:
 
             self.model.eval()
             with torch.inference_mode():
-                self.hook.on_val_step_start(self, batches[:num_batches], idx)
+                self.hook.on_val_step_start(self, batches[:num_batches])
                 losses = self.model.infer_step(batches)
-                self.hook.on_val_step_end(self, losses[:num_batches], batches[:num_batches], idx)
+                self.hook.on_val_step_end(self, losses[:num_batches])
 
             aggregate_outputs = self.train_args.resolved_aggregate_outputs_fn or self.aggregate_outputs
             aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)
             self.hook.after_aggregate_val_step_outputs(
                 self, aggregated_outputs,
                 aggregated_outputs.loss_sum / aggregated_outputs.num_batches,
-                idx
             )
             loss_sum += aggregated_outputs.loss_sum
             batches_count += aggregated_outputs.num_batches
 
+        val_wall = time.perf_counter() - val_start_at
         # update train status
         loss = loss_sum / batches_count
         self.hook.on_val_end(self, loss)
 
         step_stat.val_loss = loss
-        val_metrics = asdict(step_stat)
+        val_metrics = {'val_loss': loss, 'val_wall': val_wall}
+        self.hook.before_log_val_metrics(self, val_metrics)
         self.log_metrics(val_metrics, tag='val')
         if self.rank == 0 and self.train_args.enable_log_progress:
-            logger.info(self._format_metrics(f'Validation', None, val_metrics))
+            logger.info(self._format_metrics(f'Validation', None, asdict(step_stat)))
         return step_stat.val_loss
 
     def _train_epoch(self, epoch: int) -> None:
@@ -921,9 +924,9 @@ class Trainer:
             self.optimizer.zero_grad()
             self.hook.after_zero_grad(self)
 
-            self.hook.on_train_step_start(self, batches[:num_batches], idx)
+            self.hook.on_train_step_start(self, batches[:num_batches])
             losses = self.model.train_step(batches, is_dummy_batch)
-            self.hook.on_train_step_end(self, losses[:num_batches], batches[:num_batches], idx)
+            self.hook.on_train_step_end(self, losses[:num_batches])
 
             aggregate_outputs = self.train_args.resolved_aggregate_outputs_fn or self.aggregate_outputs
             aggregated_outputs = aggregate_outputs(losses[:num_batches], self.sync_group)
@@ -936,7 +939,7 @@ class Trainer:
             else:
                 loss = aggregated_outputs.loss_sum
             step_stat.train_loss = loss
-            self.hook.after_aggregate_train_step_outputs(self, aggregated_outputs, loss, idx)
+            self.hook.after_aggregate_train_step_outputs(self, aggregated_outputs, loss)
 
             self.hook.before_sync_grad(self)
             # `sync_shard_grad` is no-op if the whole model is parallelized
@@ -986,6 +989,7 @@ class Trainer:
             step_metrics = {k:v for k, v in asdict(step_stat).items() if v is not None}
             step_metrics['train_wall'] = time.perf_counter() - step_start_at
             step_metrics['loss'] = step_metrics['train_loss']
+            self.hook.before_log_train_metrics(self, step_metrics, aggregated_outputs)
             self.log_metrics(step_metrics, tag='train')
             if self.rank == 0:
                 data_iter.set_postfix(step_metrics)
@@ -994,7 +998,7 @@ class Trainer:
                     logger.info(self._format_metrics(epoch_desc, idx + 1, step_metrics))
                     step_metrics = {}
 
-            self.hook.on_step_end(self, epoch, idx, step_metrics)
+            self.hook.on_step_end(self, epoch, idx, step_metrics, aggregated_outputs)
 
             # validate and save checkpoint
             if self.train_args.checkpoint.every_n_train_steps and \
