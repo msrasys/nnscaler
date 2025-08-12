@@ -70,6 +70,8 @@ class AutoDistConfig:
         The module names to recompute, separated by `,`. For example, `module1,module2`.
         Module name can be any suffix of the full module name, e.g., `module1` will match `x.module1`, `y.module1`,
         `x.module1` will match `x.module1` but not `y.module1`.
+        Due to constraint of the tracer, you can pass `ROOT` to recompute_modules if you want the whole module to
+        be recomputed.
     - memory_constraint (`float`, *optional*, defaults to `32`):
         The memory constraint in each device in GB.
     - memory_granularity (`int`, *optional*, defaults to `1`):

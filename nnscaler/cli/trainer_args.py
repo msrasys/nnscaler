@@ -545,6 +545,9 @@ class HookMapConfig:
     before_optimizer_step: str = None
     after_optimizer_step: str = None
 
+    before_log_train_metrics: str = None
+    before_log_val_metrics: str = None
+
     on_load_checkpoint: str = None
     after_load_checkpoint: str = None
     on_save_checkpoint: str = None

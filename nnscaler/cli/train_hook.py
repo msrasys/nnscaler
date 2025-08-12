@@ -1,7 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Any, Dict, List, TYPE_CHECKING, TypedDict, Optional
+from typing import Any, Dict, List, TYPE_CHECKING, Literal, TypedDict, Optional
 
 import torch
 
@@ -10,12 +10,17 @@ if TYPE_CHECKING:
     from nnscaler.cli.trainer_args import AggregatedOutputs
 
 
-class StepMetrics(TypedDict):
+class TrainStepMetrics(TypedDict):
     train_loss: float
     loss: float  # alias for train_loss
     lr: float
     gnorm: float
     train_wall: float  # wall time for training step
+
+
+class ValMetrics(TypedDict):
+    val_loss: float
+    val_wall: float  # wall time for validation
 
 
 class TrainHook:
@@ -67,66 +72,59 @@ class TrainHook:
             idx: the index of current step
         """
 
-    def on_step_end(self, trainer: 'Trainer', epoch: int, idx: int, step_metrics: StepMetrics) -> None:
+    def on_step_end(self, trainer: 'Trainer', epoch: int, idx: int, step_metrics: TrainStepMetrics, aggregated_outputs: 'AggregatedOutputs') -> None:
         """
         Called at the end of each step (validation and checkpoint saving are not included)
         Args:
             idx: the index of current step
             step_metrics: the metrics of the current step
+            aggregated_outputs: the aggregated outputs of the current step
         """
 
-    def on_train_step_start(self, trainer: 'Trainer', batches: List[Any], idx: int) -> None:
+    def on_train_step_start(self, trainer: 'Trainer', batches: List[Any]) -> None:
         """
         Called at the beginning of each training step
         Please note one train step may contain multiple batches
         Args:
             batches: the current batches
-            idx: the index of current step
         """
 
-    def on_train_step_end(self, trainer: 'Trainer', outputs: List[Any], batches: List[Any], idx: int) -> None:
+    def on_train_step_end(self, trainer: 'Trainer', outputs: List[Any]) -> None:
         """
         Called at the end of each training step
         Args:
             outputs: the outputs of the train_step
-            batches: the current batches
-            idx: the index of current step
         """
 
-    def on_val_step_start(self, trainer: 'Trainer', batches: List[Any], idx: int) -> None:
+    def on_val_step_start(self, trainer: 'Trainer', batches: List[Any]) -> None:
         """
         Called at the beginning of each validating step
         Please note one val step may contain multiple batches
         Args:
             batches: the current batches
-            idx: the index of current step
         """
 
-    def on_val_step_end(self, trainer: 'Trainer', outputs: List[Any], batches: List[Any], idx: int) -> None:
+    def on_val_step_end(self, trainer: 'Trainer', outputs: List[Any]) -> None:
         """
         Called at the end of each validating step
         Args:
             outputs: the outputs of the val_step
-            batches: the current batches
-            idx: the index of current step
         """
 
-    def after_aggregate_train_step_outputs(self, trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', train_loss: float, idx: int) -> None:
+    def after_aggregate_train_step_outputs(self, trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', train_loss: float) -> None:
         """
         Called after aggregating outputs in train step
         Args:
             aggregated_outputs: the aggregated outputs
             train_loss: the loss of the current step
-            idx: the index of current step
         """
 
-    def after_aggregate_val_step_outputs(self, trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', val_loss: float, idx: int) -> None:
+    def after_aggregate_val_step_outputs(self, trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', val_loss: float) -> None:
         """
         Called after aggregating outputs in val step
         Args:
             aggregated_outputs: the aggregated outputs
             val_loss: the loss of the current step
-            idx: the index of current step
         """
 
     def before_zero_grad(self, trainer: 'Trainer') -> None:
@@ -168,6 +166,23 @@ class TrainHook:
     def after_optimizer_step(self, trainer: 'Trainer') -> None:
         """
         Called after optimizer.step()
+        """
+
+    def before_log_train_metrics(self, trainer: 'Trainer', step_metrics: TrainStepMetrics, aggregated_outputs: 'AggregatedOutputs') -> None:
+        """
+        Called before logging metrics.
+        This is useful for modifying the metrics (inplace) before logging.
+        Args:
+            step_metrics: the metrics of the current step
+            aggregated_outputs: the aggregated outputs of the current step
+        """
+
+    def before_log_val_metrics(self, trainer: 'Trainer', metrics: ValMetrics) -> None:
+        """
+        Called before logging validation metrics.
+        This is useful for modifying the metrics (inplace) before logging.
+        Args:
+            metrics: the metrics of the current validation
         """
 
     def on_load_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:
@@ -239,33 +254,33 @@ class AggregatedTrainHook(TrainHook):
         for hook in self.hooks:
             hook.on_step_start(trainer, epoch, idx)
 
-    def on_step_end(self, trainer: 'Trainer', epoch: int, idx: int, step_metrics: StepMetrics) -> None:
+    def on_step_end(self, trainer: 'Trainer', epoch: int, idx: int, step_metrics: TrainStepMetrics, aggregated_outputs: 'AggregatedOutputs') -> None:
         for hook in self.hooks:
-            hook.on_step_end(trainer, epoch, idx, step_metrics)
+            hook.on_step_end(trainer, epoch, idx, step_metrics, aggregated_outputs)
 
-    def on_train_step_start(self, trainer: 'Trainer', batches: List[Any], idx: int) -> None:
+    def on_train_step_start(self, trainer: 'Trainer', batches: List[Any]) -> None:
         for hook in self.hooks:
-            hook.on_train_step_start(trainer, batches, idx)
+            hook.on_train_step_start(trainer, batches)
 
-    def on_train_step_end(self, trainer: 'Trainer', outputs: List[Any], batches: List[Any], idx: int) -> None:
+    def on_train_step_end(self, trainer: 'Trainer', outputs: List[Any]) -> None:
         for hook in self.hooks:
-            hook.on_train_step_end(trainer, outputs, batches, idx)
+            hook.on_train_step_end(trainer, outputs)
 
-    def on_val_step_start(self, trainer: 'Trainer', batches: List[Any], idx: int) -> None:
+    def on_val_step_start(self, trainer: 'Trainer', batches: List[Any]) -> None:
         for hook in self.hooks:
-            hook.on_val_step_start(trainer, batches, idx)
+            hook.on_val_step_start(trainer, batches)
 
-    def on_val_step_end(self, trainer: 'Trainer', outputs: List[Any], batches: List[Any], idx: int) -> None:
+    def on_val_step_end(self, trainer: 'Trainer', outputs: List[Any]) -> None:
         for hook in self.hooks:
-            hook.on_val_step_end(trainer, outputs, batches, idx)
+            hook.on_val_step_end(trainer, outputs)
 
-    def after_aggregate_train_step_outputs(self, trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', train_loss: float, idx: int) -> None:
+    def after_aggregate_train_step_outputs(self, trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', train_loss: float) -> None:
         for hook in self.hooks:
-            hook.after_aggregate_train_step_outputs(trainer, aggregated_outputs, train_loss, idx)
+            hook.after_aggregate_train_step_outputs(trainer, aggregated_outputs, train_loss)
 
-    def after_aggregate_val_step_outputs(self, trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', val_loss: float, idx: int) -> None:
+    def after_aggregate_val_step_outputs(self, trainer: 'Trainer', aggregated_outputs: 'AggregatedOutputs', val_loss: float) -> None:
         for hook in self.hooks:
-            hook.after_aggregate_val_step_outputs(trainer, aggregated_outputs, val_loss, idx)
+            hook.after_aggregate_val_step_outputs(trainer, aggregated_outputs, val_loss)
 
     def before_zero_grad(self, trainer: 'Trainer') -> None:
         for hook in self.hooks:
@@ -298,6 +313,14 @@ class AggregatedTrainHook(TrainHook):
     def after_optimizer_step(self, trainer: 'Trainer') -> None:
         for hook in self.hooks:
             hook.after_optimizer_step(trainer)
+
+    def before_log_train_metrics(self, trainer: 'Trainer', step_metrics: TrainStepMetrics, aggregated_outputs: 'AggregatedOutputs') -> None:
+        for hook in self.hooks:
+            hook.before_log_train_metrics(trainer, step_metrics, aggregated_outputs)
+
+    def before_log_val_metrics(self, trainer: 'Trainer', metrics: ValMetrics) -> None:
+        for hook in self.hooks:
+            hook.before_log_val_metrics(trainer, metrics)
 
     def on_load_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:
         for hook in self.hooks:
