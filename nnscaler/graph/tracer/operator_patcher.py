@@ -350,5 +350,6 @@ class OperatorPatcherContext:
         assert OperatorPatcherContext.ctx_tracer is not None
         assert OperatorPatcherContext.ctx_patcher is not None
         with wrap_utils.do_temp_call_origin():
+            OperatorPatcherContext.ctx_tracer.on_function_call(func)
             new_func = OperatorPatcherContext.ctx_patcher.patch_func_or_module(func)
         return new_func(*args, **kwargs)

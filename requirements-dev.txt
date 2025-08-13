@@ -19,3 +19,4 @@ wandb
 tensorboard
 mosaicml-streaming
 cppimport
+einops
