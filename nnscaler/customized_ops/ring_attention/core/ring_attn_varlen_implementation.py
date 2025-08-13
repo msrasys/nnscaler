@@ -328,7 +328,6 @@ class Llama3FlashAttnVarlenFunc(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
-        assert alibi_slopes is None
         k = k.contiguous()
         v = v.contiguous()
         out, softmax_lse = llama3_flash_attn_varlen_forward(

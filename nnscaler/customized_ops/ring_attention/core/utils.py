@@ -48,11 +48,11 @@ def log(msg, a, rank0_only=False):
         dist.barrier()
 
 
-def gen_head_anno(query_states, key_states, value_states):
-    if query_states.shape[2] != key_states.shape[2]:
-        assert query_states.shape[2] % key_states.shape[2] == 0
-        group_size = query_states.shape[2] // key_states.shape[2]
-        assert query_states.shape[2] == value_states.shape[2] * group_size
+def gen_head_anno(query_states, key_states, value_states, head_pos=2):
+    if query_states.shape[head_pos] != key_states.shape[head_pos]:
+        assert query_states.shape[head_pos] % key_states.shape[head_pos] == 0
+        group_size = query_states.shape[head_pos] // key_states.shape[head_pos]
+        assert query_states.shape[head_pos] == value_states.shape[head_pos] * group_size
         q_anno = f'(group_num {group_size})'
         kv_anno = 'group_num'
     else:

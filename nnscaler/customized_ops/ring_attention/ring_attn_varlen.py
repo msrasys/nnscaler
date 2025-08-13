@@ -2,16 +2,17 @@
 #  Licensed under the MIT License.
 
 from typing import Tuple, List, Dict
+import torch
 from torch import Tensor
 import torch.distributed as dist
 
 from nnscaler.graph.parser.register import register_op
-from nnscaler.ir.operator import IRFwOperation
+from nnscaler.graph.function.dimops import IRDimops
+from nnscaler.ir import IRTensor
+from nnscaler.runtime.device import DeviceGroup
 from flash_attn import flash_attn_varlen_func
 from .core.ring_attn_varlen_implementation import llama3_flash_attn_prepare_cu_seqlens, llama3_flash_attn_varlen_func
 from .core.utils import gen_head_anno
-
-from nnscaler.runtime.device import DeviceGroup
 
 
 def wrap_ring_attn_varlen_func(
@@ -20,11 +21,11 @@ def wrap_ring_attn_varlen_func(
         v: Tensor,
         cu_seqlens_q: Tensor,
         cu_seqlens_k: Tensor,
+        alibi_slopes: Tensor,
         dropout_p: float = 0.0,
         softmax_scale: Tensor = None,
         causal: bool = False,
         window_size: Tuple[int] = (-1, -1),
-        alibi_slopes: Tensor = None,
         deterministic: bool = False,
         return_attn_probs: bool = False,
         process_group: Tuple[int] = None,
@@ -37,7 +38,6 @@ def wrap_ring_attn_varlen_func(
     required communications.
     '''
     assert not return_attn_probs, "return_attn_probs is not supported in ring-attention"
-    assert alibi_slopes is None, "alibi_slopes is not supported in ring-attention"
     max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
 
@@ -95,7 +95,7 @@ def wrap_ring_attn_varlen_func(
         dropout_p=dropout_p,
         causal=causal,
         window_size=window_size,
-        alibi_slopes=None,
+        alibi_slopes=alibi_slopes,
         deterministic=deterministic,
         return_attn_probs=False,
         group=local_process_group,
@@ -104,7 +104,7 @@ def wrap_ring_attn_varlen_func(
     return output
 
 
-def emit_ring(node: IRFwOperation, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
+def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_devid: int, plan_ndevs: int, runtime_ndevs: int) -> str:
     """Special rule to generate ring_attn node"""
 
     signature = node.signature
@@ -137,9 +137,31 @@ def emit_ring(node: IRFwOperation, args: List[str], kwargs: Dict[str, str], runt
     return f"{signature}({args})"
 
 
-def flash_attention_anno(query_states, key_states, value_states, *args, **kwargs) -> str:
-    q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states)
-    return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^ -> l {q_anno} vd^'
+def flash_attention_anno(query_states, key_states, value_states, cu_seq_lens_q, cu_seq_lens_k, alibi_slopes, *args, **kwargs) -> str:
+    q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
+    if isinstance(alibi_slopes, IRTensor):
+        return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {q_anno} -> l {q_anno} vd^'
+    else:
+        return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, ? -> l {q_anno} vd^'
 
 
-register_op(flash_attention_anno, emit_fn=emit_ring)(wrap_ring_attn_varlen_func)
+def input_gen_fn(node: IRDimops):
+    inputs = []
+    device = torch.cuda.current_device()
+    seqlen = node.inputs()[0].shape[0]
+    for i, t in enumerate(node.inputs()):
+        if i < 3:  # query, key, value
+            inputs.append(torch.randn(t.shape, dtype=t.dtype, device=device, requires_grad=t.requires_grad))
+        elif i in [3, 4]: # cu_seqlens
+            inputs.append(torch.Tensor([0, seqlen]).to(torch.int32).to(device))
+        elif i == 5: # optional alibi_slopes
+            if isinstance(t, IRTensor):
+                inputs.append(torch.randn(t.shape, dtype=t.dtype, device=device, requires_grad=t.requires_grad))
+            else:
+                inputs.append(None)
+        else:  # other kwargs, use defaults
+            break
+    return tuple(inputs)
+
+
+register_op(flash_attention_anno, emit_fn=emit_ring, input_gen_fn=input_gen_fn)(wrap_ring_attn_varlen_func)

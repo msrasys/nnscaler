@@ -853,7 +853,7 @@ class IRDimops(IRFwOperation):
             op_anno.reset_identifiers()
 
         identifier_values: Dict[str, int] = dict()
-        for ashape, itensor in zip(op_anno.inputs(), inputs):
+        for idx, (ashape, itensor) in enumerate(zip(op_anno.inputs(), inputs)):
             if not isinstance(itensor, IRTensor) or ashape.ignore:
                 continue
             if ashape.ndims != len(itensor.shape):
@@ -861,7 +861,12 @@ class IRDimops(IRFwOperation):
             for adim, dimlen in zip(ashape.dims, itensor.shape):
                 if len(adim.identifiers) == 1:
                     if adim.identifiers[0] in identifier_values and identifier_values[adim.identifiers[0]] != dimlen:
-                        raise RuntimeError(f'at {signature} with {op_anno} the exist identifier {adim.identifiers[0]} value {identifier_values[adim.identifiers[0]]} is not equal to the new value {dimlen}')
+                        error_msg = (
+                            f"at {signature} with {op_anno} the exist identifier {adim.identifiers[0]} value "
+                            f"{identifier_values[adim.identifiers[0]]} is not equal to the new value {dimlen}, "
+                            f"error idx {idx}, input tensors {inputs}"
+                        )
+                        raise RuntimeError(error_msg)
                     identifier_values[adim.identifiers[0]] = dimlen
 
         # check dimension consistency
