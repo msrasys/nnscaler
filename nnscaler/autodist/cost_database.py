@@ -119,27 +119,33 @@ def _load_comm_data(profile_dir: Path, plan_ngpus: int) -> Dict[str, Dict[str, L
     load intra_2.json, intra_4.json, and intra_8.json from the profile directory. If any of the files is not
     found, we will use the default data as well.
     '''
-    def loader(path: Path):
+    def loader(path: Path, strict: bool):
         if not os.path.exists(path):
             return False, None
         info = {}
         dev = 2
+        prev_info = None
         while dev <= plan_ngpus:
             fname = f'intra_{dev}.json'
             if not (path / fname).exists():
-                return False, None
-            with open(path / fname, 'r') as f:
-                info[fname] = json.load(f)
+                if strict or prev_info is None:
+                    return False, None
+                else:
+                    content = prev_info
+                    _logger.warning(f'{dev} devices communication profile data not found, using previous data')
+            else:
+                with open(path / fname, 'r') as f:
+                    content = json.load(f)
+            prev_info = content
+            info[fname] = content
             dev *= 2
         return True, info
 
     comm_path = profile_dir / 'comm'
-    success, comm_info = loader(comm_path)
+    success, comm_info = loader(comm_path, strict=True)
     if not success:
         _logger.warning(f'Communication profile data not found, using default data at {_DEFAULT_COMM_DATA_PATH}')
-        success, comm_info = loader(Path(_DEFAULT_COMM_DATA_PATH))
-    if not success:
-        raise RuntimeError(f'Communication profile data is not compatible with plan_ngpus {plan_ngpus}')
+        success, comm_info = loader(Path(_DEFAULT_COMM_DATA_PATH), strict=False)
     return comm_info
 
 
