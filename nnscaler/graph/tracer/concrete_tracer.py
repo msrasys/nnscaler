@@ -16,6 +16,7 @@ import builtins
 from types import FunctionType, MethodDescriptorType, MethodType, MethodWrapperType, ModuleType
 from typing import Any, Dict, Optional, Set, Tuple, Type, List, Callable, Union, Literal
 from contextlib import contextmanager
+import weakref
 
 import torch
 from torch._C import ScriptObject
@@ -100,6 +101,16 @@ class ConcreteTracer(TracerBase):
         self.need_revert_functions = set()
         self.need_revert_wrapped_functions = set()
 
+        # Save functions decorated with functools.cache/lru_cache
+        # We need to clear up caches after tracing to avoid memory leak or tracing error.
+        # TODO: currently only functions/methods are tracked.
+        # Cached Properties (via @property @cache or @cached_property) are not tracked
+        # The reason is:
+        # 1. Cached properties is rare to cause problem as they have no arguments (no ConcrateProxy object will pass to it)
+        # 2. We need to patch all getattr (`a.b``) to support this scenario, which is too expensive
+        #    Currently only function calls (`f(a,b)`) are patched and tracked. (See `operator_patcher`)
+        self.cached_function = weakref.WeakSet()
+
         self.temp_call_origin = False
 
     def add_need_revert_function(self, func, wrapped_func):
@@ -108,6 +119,45 @@ class ConcreteTracer(TracerBase):
 
     def need_revert(self, func):
         return func in self.need_revert_functions or func in self.need_revert_wrapped_functions
+
+    @classmethod
+    def _is_cache_wrapped_function(cls, func):
+        return callable(func) \
+            and hasattr(func, 'cache_clear') \
+            and hasattr(func, 'cache_info') \
+            and hasattr(func, 'cache_parameters') \
+            and hasattr(func, '__wrapped__') \
+            and callable(func.__wrapped__)
+
+    def _track_cache_wrapped_function(self, func):
+        while func is not None:
+            if self._is_cache_wrapped_function(func):
+                self.cached_function.add(func)
+                break
+            func = getattr(func, '__wrapped__', None)
+
+    @classmethod
+    def _is_torch_compile_function(cls, func):
+        return callable(func) \
+            and hasattr(func, '__wrapped__') \
+            and hasattr(func, '_torchdynamo_orig_callable')
+
+    def _check_torch_compile_function(self, func):
+        outmost_func = func
+        while func is not None:
+            if self._is_torch_compile_function(func):
+                # If func is registered, run this func will be in a reverted context.
+                if not self.need_revert(outmost_func):
+                    raise RuntimeError(
+                        f"@torch.compile decorated function `{outmost_func.__module__}.{outmost_func.__qualname__}` is not registered. "
+                        f"You must register it to avoid tracing failure."
+                    )
+                break
+            func = getattr(func, '__wrapped__', None)
+
+    def on_function_call(self, func):
+        self._track_cache_wrapped_function(func)
+        self._check_torch_compile_function(func)
 
     @contextmanager
     def do_temp_call_origin(self):
@@ -692,6 +742,10 @@ class ConcreteTracer(TracerBase):
                                      {}, type_expr=fn.__annotations__.get('return', None), node_result=node_result)
         finally:
             _retain_weight_consistency(self.root)
+            # clean up caches
+            for func in self.cached_function:
+                if func is not None:
+                    func.cache_clear()
 
         return self.graph
 

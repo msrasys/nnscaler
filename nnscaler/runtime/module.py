@@ -48,22 +48,33 @@ class AttrMeta:
     val_chunks: int
 
 
-def dedup_attrs(rank2attr_area_map: Dict[int, Dict[str, AttrMeta]]) -> Dict[int, Dict[str, AttrMeta]]:
+def dedup_attrs(rank2attr_area_map: Dict[int, Dict[str, Dict[str, AttrMeta]]]) -> Dict[int, Dict[str, Dict[str, AttrMeta]]]:
     '''
     Deduplicate the attributes according to `rank2attr_area_map`.
-    For each `slicers` of a full tensor with the name `orig_name`, we only store its first appearance
-    in the `rank2attr_area_map`.
+    For each `slicers` of a full tensor identified by its full qualified name, we only store its first appearance
+    in the `rank2attr_area_map`. In nnscaler, this dedup process leads to:
+    - If an attribute is not within the first scale unit, it will be deduplicated.
+    - If an attribute is shared by different operators, it will be deduplicated.
+    - If an attribute is replicated across several devices, we only save it at the devices with the smallest rank.
+    - If an attribute is partitioned across several devices, all these sub tensors will be saved.
+    - Note that nnscaler supports partition an operator across multiple dimensions, attributes in the operator may
+      be saved at a subset of related devices.
+    - Pipeline parallelism is supported since it is composed of different segments in nnscaler, which are different
+      parallel modules with their own attribute maps at runtime.
     In addition, we will check
     - the shape of the full tensor is consistent across different ranks
     - the slicers of the full tensor are not intersected with each other
     - the slicers of the full tensor can cover the full tensor
-    The input and output attribute area map's key is the local attribute name.
 
     Args:
-        rank2attr_area_map (Dict[int, Dict[str, AttrMeta]]): the mapping from rank to the attribute area map
+        rank2attr_area_map (
+            Dict[int, # rank id
+                Dict[str, # submodule prefix
+                    Dict[str, # attribute name in parallel module (not original name)
+                        AttrMeta]]]): fullmap information for all parallel modules in all ranks.
 
     Returns:
-        Dict[int, Dict[str, AttrMeta]]: the deduplicated attribute area map
+        Dict[int, Dict[str, Dict[str, AttrMeta]]]: the deduplicated fullmap info, the structure is the same as the input.
     '''
     # assume ranks in rank2attr_area_map are in increasing order
     ranks = list(rank2attr_area_map.keys())
@@ -87,26 +98,32 @@ def dedup_attrs(rank2attr_area_map: Dict[int, Dict[str, AttrMeta]]) -> Dict[int,
         return True
 
     ret = dict()
-    for rank, attr_area_map in rank2attr_area_map.items():
-        dedup_attr_area_map = dict()
-        for attr, attr_meta in attr_area_map.items():
-            assert attr_meta.val_chunks == 1, 'not support partitioning on value dimension'
-            if attr_meta.orig_name not in orig_name2shape:
-                orig_name2shape[attr_meta.orig_name] = attr_meta.shape
-            else:
-                assert orig_name2shape[attr_meta.orig_name] == attr_meta.shape, \
-                    f'unmatched shape {orig_name2shape[attr_meta.orig_name]} vs {attr_meta.shape}'
-            if need_save(attr_meta.slicers, orig_name2slice_info[attr_meta.orig_name]):
-                orig_name2slice_info[attr_meta.orig_name].append(attr_meta.slicers)
-                dedup_attr_area_map[attr] = attr_meta
-        ret[rank] = dedup_attr_area_map
+    for rank, module_fullmaps in rank2attr_area_map.items():
+        dedup_module_fullmaps = dict()
+        for module_name, attr_area_map in module_fullmaps.items():
+            dedup_attr_area_map = dict()
+            for attr, attr_meta in attr_area_map.items():
+                assert attr_meta.val_chunks == 1, 'not support partitioning on value dimension'
+                # use module_name.orig_name as the unique identifier for full tensor
+                full_tensor_name = f"{module_name}.{attr_meta.orig_name}"
+                if full_tensor_name not in orig_name2shape:
+                    orig_name2shape[full_tensor_name] = attr_meta.shape
+                else:
+                    assert orig_name2shape[full_tensor_name] == attr_meta.shape, \
+                        f'unmatched shape {orig_name2shape[full_tensor_name]} vs {attr_meta.shape}'
+                if need_save(attr_meta.slicers, orig_name2slice_info[full_tensor_name]):
+                    orig_name2slice_info[full_tensor_name].append(attr_meta.slicers)
+                    dedup_attr_area_map[attr] = attr_meta
+            if dedup_attr_area_map:  # only add non-empty maps
+                dedup_module_fullmaps[module_name] = dedup_attr_area_map
+        ret[rank] = dedup_module_fullmaps
 
     # since we
     # - skip saving when there are identical weights
     # - assert the slicers are disjoint
     # we can use the sum of the sub-slicers to verify the full tensor is covered
-    for orig_name, slicerss in orig_name2slice_info.items():
-        shape = orig_name2shape[orig_name]
+    for full_tensor_name, slicerss in orig_name2slice_info.items():
+        shape = orig_name2shape[full_tensor_name]
         full_size = 1
         for s in shape:
             full_size *= s
@@ -116,7 +133,7 @@ def dedup_attrs(rank2attr_area_map: Dict[int, Dict[str, AttrMeta]]) -> Dict[int,
             for s in slicers:
                 size *= s.stop - s.start
             covered_size += size
-        assert full_size == covered_size, f'uncovered size for {orig_name} with shape {shape}, slicerss {slicerss}'
+        assert full_size == covered_size, f'uncovered size for {full_tensor_name} with shape {shape}, slicerss {slicerss}'
 
     return ret
 
