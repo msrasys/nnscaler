@@ -22,6 +22,7 @@ from .common import init_distributed, assert_equal
 from ..launch_torchrun import launch_torchrun
 from ..utils import clear_dir_on_rank0
 
+
 class Net(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -38,6 +39,7 @@ class Net(torch.nn.Module):
         x = self.buffer + x
         return x
 
+
 def pas(graph: IRGraph, config: ComputeConfig):
     fw_nodes = graph.select(ntype=IRFwOperation)
     assert len(fw_nodes) == 4
@@ -49,6 +51,7 @@ def pas(graph: IRGraph, config: ComputeConfig):
     _replica(graph, fw_nodes[2], devs=devs)
     _replica(graph, fw_nodes[3], devs=devs)
     return graph
+
 
 def _gpu_worker_spmd(cc: ComputeConfig):
     init_distributed()
@@ -65,13 +68,17 @@ def _gpu_worker_spmd(cc: ComputeConfig):
         world_size = torch.distributed.get_world_size()
         attr_area_maps = [None for _ in range(world_size)]
         curr_rank = torch.distributed.get_rank()
-        torch.distributed.all_gather_object(attr_area_maps, module.fullmap)
+        # Construct the three-level nested structure: rank -> module_name -> fullmap
+        # In this test case, we have only one module instance 'attr_dedup'
+        module_fullmap = {'attr_dedup': module.fullmap}
+        torch.distributed.all_gather_object(attr_area_maps, module_fullmap)
         rank2attr_area_map = {}
         for i, attr_area_map in enumerate(attr_area_maps):
             rank2attr_area_map[i] = attr_area_map
         torch.distributed.barrier()
         dedup_meta_info = dedup_attrs(rank2attr_area_map)
-        dedup_area_map = list(dedup_meta_info[curr_rank].items())
+        # Access the deduped fullmap for the specific module
+        dedup_area_map = list(dedup_meta_info[curr_rank]['attr_dedup'].items())
         if curr_rank == 0:
             assert len(dedup_area_map) == 4
             assert dedup_area_map[0][1].orig_name == 'fc1.weight'
