@@ -129,12 +129,35 @@ class ConcreteTracer(TracerBase):
             and hasattr(func, '__wrapped__') \
             and callable(func.__wrapped__)
 
-    def on_function_call(self, func):
+    def _track_cache_wrapped_function(self, func):
         while func is not None:
             if self._is_cache_wrapped_function(func):
                 self.cached_function.add(func)
                 break
             func = getattr(func, '__wrapped__', None)
+
+    @classmethod
+    def _is_torch_compile_function(cls, func):
+        return callable(func) \
+            and hasattr(func, '__wrapped__') \
+            and hasattr(func, '_torchdynamo_orig_callable')
+
+    def _check_torch_compile_function(self, func):
+        outmost_func = func
+        while func is not None:
+            if self._is_torch_compile_function(func):
+                # If func is registered, run this func will be in a reverted context.
+                if not self.need_revert(outmost_func):
+                    raise RuntimeError(
+                        f"@torch.compile decorated function `{outmost_func.__module__}.{outmost_func.__qualname__}` is not registered. "
+                        f"You must register it to avoid tracing failure."
+                    )
+                break
+            func = getattr(func, '__wrapped__', None)
+
+    def on_function_call(self, func):
+        self._track_cache_wrapped_function(func)
+        self._check_torch_compile_function(func)
 
     @contextmanager
     def do_temp_call_origin(self):

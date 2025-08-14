@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from nnscaler import parallelize, ComputeConfig, register_op
 
-from tests.utils import replace_all_device_with
+from tests.utils import raises_with_cause, replace_all_device_with
 
 from .test_gencode import _gencode_contains, print_gencode
 
@@ -182,7 +182,7 @@ class Module2(torch.nn.Module):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
 def test_codegen_compile_failed_g():
-    with pytest.raises(RuntimeError), tempfile.TemporaryDirectory() as tempdir:
+    with raises_with_cause(RuntimeError, match=".*You must register it to avoid tracing failure..*"), tempfile.TemporaryDirectory() as tempdir:
         parallelize(
             Module2(),
             {'x': torch.randn(3, 3)},
