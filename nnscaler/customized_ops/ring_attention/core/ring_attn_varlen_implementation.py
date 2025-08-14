@@ -121,6 +121,10 @@ def llama3_flash_attn_varlen_forward(
         q_i = q[:, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
         k_i = kv_buffer[0][local_k_slice]
         v_i = kv_buffer[1][local_k_slice]
+        if alibi_slopes is None:
+            cur_alibi_slopes = None
+        else:
+            cur_alibi_slopes = alibi_slopes[i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
 
         params = get_default_args(_flash_attn_varlen_forward).copy()
         params.update(
@@ -135,7 +139,7 @@ def llama3_flash_attn_varlen_forward(
                 "dropout_p": dropout_p,
                 "softmax_scale": softmax_scale,
                 "causal": causal,
-                "alibi_slopes": alibi_slopes,
+                "alibi_slopes": cur_alibi_slopes,
                 "return_softmax": True and dropout_p > 0,
             }
         )
@@ -251,6 +255,11 @@ def llama3_flash_attn_varlen_backward(
         dk_i = dkv_buffer[0][local_k_slice]
         dv_i = dkv_buffer[1][local_k_slice]
 
+        if alibi_slopes is None:
+            cur_alibi_slopes = None
+        else:
+            cur_alibi_slopes = alibi_slopes[i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
+
         params = get_default_args(_flash_attn_varlen_backward).copy()
         params.update(
             {
@@ -270,7 +279,7 @@ def llama3_flash_attn_varlen_backward(
                 "dropout_p": dropout_p,
                 "softmax_scale": softmax_scale,
                 "causal": causal,
-                "alibi_slopes": alibi_slopes,
+                "alibi_slopes": cur_alibi_slopes,
                 "deterministic": deterministic,
             }
         )
