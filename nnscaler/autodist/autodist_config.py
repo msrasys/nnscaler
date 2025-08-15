@@ -244,7 +244,7 @@ class AutoDistConfig:
                 scale_factor = self.world_size // self.mesh_desc.ngpus
                 if scale_factor % self.zero_ngroups != 0:
                     raise ValueError(
-                        f'world size {self.world_size} must be divisible by zero num groups {self.zero_ngroups}'
+                        f'scale_factor {scale_factor} must be divisible by zero num groups {self.zero_ngroups}'
                     )
 
         if not self.solver in [
