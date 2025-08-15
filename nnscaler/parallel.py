@@ -2220,15 +2220,26 @@ def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Dict[str
 
     world_size = torch.distributed.get_world_size()
     local_fullmaps = {prefix: m.fullmap for prefix, m in parallel_modules.items()}
+    local_tensor_meta = dict()
+    for prefix, m in parallel_modules.items():
+        module_meta = {}
+        for local_name in m.fullmap.keys():
+            assert hasattr(m, local_name), f'Module {prefix} does not have attribute {local_name}'
+            tensor = getattr(m, local_name)
+            module_meta[local_name] = (tuple(tensor.shape), tensor.dtype)
+        local_tensor_meta[prefix] = module_meta
     global_fullmaps = [None for _ in range(world_size)]
     torch.distributed.all_gather_object(global_fullmaps, local_fullmaps)
     # `dedup_attrs` is a deterministic algorithm, so it produces same results across different ranks
     rank2deduped_fullmap = dedup_attrs(OrderedDict(list(enumerate(global_fullmaps))))
+    global_tensor_meta = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(global_tensor_meta, local_tensor_meta)
+    global_tensor_meta = OrderedDict(list(enumerate(global_tensor_meta)))
 
     for rank in range(dedup_group_size, world_size):
         assert len(rank2deduped_fullmap[rank]) == 0, f'Rank {rank} has non-empty deduped_fullmap: {rank2deduped_fullmap[rank]}'
 
-    return rank2deduped_fullmap, dedup_group_size
+    return rank2deduped_fullmap, dedup_group_size, global_tensor_meta
 
 
 @torch.no_grad()
@@ -2253,7 +2264,7 @@ def deduped_state_dict(
     module_state_dict, opt_state_dict = None, None
     parallel_modules = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
 
-    rank2deduped_fullmap, _ = _collect_dedup_info(parallel_modules)
+    rank2deduped_fullmap, _, _ = _collect_dedup_info(parallel_modules)
     cur_deduped_fullmap = rank2deduped_fullmap[cur_rank]
 
     # The reason we use `Module.state_dict` on the whole to get the complete state dict
@@ -2323,39 +2334,39 @@ def load_deduped_state_dict(
 
     # step 1: load deduped state dict at each rank
     module.load_state_dict(module_state_dict, strict=False)
+    module.to(device)
     torch.distributed.barrier()
     logger.debug(f'at rank {cur_rank}, state_dict keys: {module_state_dict.keys()}')
 
     # step 2: broadcast deduped weights inside 1st scale unit
     parallel_modules = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
-    rank2deduped_fullmap, dedup_group_size = _collect_dedup_info(parallel_modules)
+    rank2deduped_fullmap, dedup_group_size, global_tensor_meta = _collect_dedup_info(parallel_modules)
     broadcast_group = DeviceGroup().get_group(list(range(dedup_group_size)))
     logger.debug(f'at rank {cur_rank}, dedup_group_size: {dedup_group_size}, rank2deduped_fullmap: {rank2deduped_fullmap}')
     if cur_rank < dedup_group_size:
         for rank, deduped_fullmap in rank2deduped_fullmap.items():
             logger.debug(f'at rank {cur_rank}, process rank: {rank}')
             for prefix, fullmap in deduped_fullmap.items():
-                for local_name, _ in fullmap.items():
+                for local_name, attr_meta in fullmap.items():
                     key = f'{prefix}.{local_name}' if prefix else local_name
+                    assert prefix in parallel_modules, f'prefix {prefix} not found in parallel_modules: {list(parallel_modules.keys())}'
+                    pm = parallel_modules[prefix]
+                    shape, dtype = global_tensor_meta[rank][prefix][local_name]
                     if rank == cur_rank:
-                        assert key in module_state_dict, f'expect {key} in {module_state_dict.keys()}'
-                        object_list = [module_state_dict[key]]
-                        logger.debug(f'at rank {cur_rank}, broadcast: {key} from {cur_rank}')
+                        assert hasattr(pm, local_name), f'local_name {local_name} not found in {pm}'
+                        broadcast_tensor = getattr(pm, local_name)
+                        logger.info(f'at rank {cur_rank}, broadcast: {key} from {cur_rank}')
                     else:
-                        object_list = [None]
-                    torch.distributed.broadcast_object_list(object_list, src=rank, group=broadcast_group)
+                        broadcast_tensor = torch.empty(shape, device=device, requires_grad=False, dtype=dtype)
+                    torch.distributed.broadcast(broadcast_tensor, src=rank, group=broadcast_group)
                     if rank != cur_rank:
-                        tensor = object_list[0]
-                        logger.debug(f'at rank {cur_rank}, try to load: {key} to rank {cur_rank}')
-                        assert prefix in parallel_modules, f'prefix {prefix} not found in parallel_modules: {list(parallel_modules.keys())}'
-                        pm = parallel_modules[prefix]
+                        logger.info(f'at rank {cur_rank}, try to load: {key} to rank {cur_rank}')
                         # in pipeline parallelism, the local_name may not be found in the module
                         if hasattr(pm, local_name):
                             attr = getattr(pm, local_name)
-                            attr.data.copy_(tensor)
+                            attr.data.copy_(broadcast_tensor)
     torch.distributed.barrier()
 
-    module.to(device)
     # step 3: broadcast weights from 1st scale unit to other units
     broadcast_weights(module)
 
