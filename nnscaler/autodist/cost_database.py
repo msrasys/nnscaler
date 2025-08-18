@@ -343,10 +343,14 @@ class CostDatabase:
         from .op_partition import OpPartition
         from .cube_operator import CubeOperator
         if isinstance(obj, OpPartition):
-            masks = self.gen_masks(obj.operator)
+            query_obj = obj.operator
         else:
             assert isinstance(obj, CubeOperator)
-            masks = self.gen_masks(obj)
+            query_obj = obj
+        try:
+            masks = self.gen_masks(query_obj)
+        except Exception as e:
+            raise RuntimeError(f"Failed to generate masks for {query_obj} with {self.query_profiled_metrics(query_obj)}: {e}")
         if memory_type == 'full_weight' and isinstance(obj, OpPartition):
             profiled_metrics = self.query_profiled_metrics(obj.operator)
         else:

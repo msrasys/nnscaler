@@ -358,10 +358,13 @@ class SPMDSolver:
                             if not selected_pc.replica_allowed:
                                 return False
                         else:
-                            allowed_pids = [
-                                operator.pos2dim_id(pos)
-                                for pos in selected_pc.allowed_partition_dims
-                            ]
+                            allowed_pids = list()
+                            for pos in selected_pc.allowed_partition_dims:
+                                try:
+                                    cur_allowed_pid = operator.pos2dim_id(pos)
+                                    allowed_pids.append(cur_allowed_pid)
+                                except Exception as e:
+                                    _logger.warning(f"Failed to get allowed partition id for {selected_pc}'s {pos}: {e}")
                             if u not in allowed_pids:
                                 return False
 
