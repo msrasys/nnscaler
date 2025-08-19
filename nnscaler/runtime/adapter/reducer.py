@@ -363,6 +363,26 @@ class Bucket:
         self._async_param_cnt = 0
         self._async_handle = None
 
+    def offload_params(self):
+        cpu = torch.device('cpu')
+        self._param_for_optimizer.data = self._param_for_optimizer.data.to(cpu)
+        # set none to release memory
+        self._contiguous_params = None
+        self._contiguous_grads = None
+
+    def load_params(self, param_buffer, grad_buffer):
+        self._contiguous_params = param_buffer
+        self._contiguous_grads = grad_buffer
+
+        if not self._zero:
+            opt = self._contiguous_params
+        else:
+            rank = torch.distributed.get_rank(group=self._zero_subgroup)
+            assert len(self._contiguous_params) % self._zgroup_sz == 0
+            opt = self._contiguous_params.chunk(self._zgroup_sz)[rank]
+        self._param_for_optimizer.data = opt
+        self._hooks = []
+
 
 class Reducer:
     # the default bucket cap for async reducer in megabytes
@@ -418,6 +438,11 @@ class Reducer:
         # contiguous parameter buffer and gradient buffer
         self._contiguous_params: torch.Tensor = None
         self._contiguous_grads: torch.Tensor = None
+
+        # items in the bucket is params list
+        self.seq_buckets: List[List[torch.nn.Parameter]] = []
+        # bucket start and stop pos in buffer
+        self.starts, self.stops = [], []
 
         # build the subgroup of zero the current rank belongs to.
         # When zero_ngroups is larger than 1, the number of ranks
@@ -526,8 +551,6 @@ class Reducer:
         #       (used in pytorch, with a couple percentage improvement)
         bucket_size = self._numel * 8 + 1 if not self._bucket_size else self._bucket_size
 
-        # items in the bucket is params list
-        seq_buckets: List[List[torch.nn.Parameter]] = []
         last_bucket_size = None
 
         assert len(set(p.dtype for p in self._params)) == 1, (
@@ -540,29 +563,28 @@ class Reducer:
                 # It will go the `else` branch
                 # and finish the current bucket and start a new bucket.
                 # This new bucket will be sealed in the next iteration
-                if len(seq_buckets) == 0:
-                    seq_buckets.append([param])
+                if len(self.seq_buckets) == 0:
+                    self.seq_buckets.append([param])
                     last_bucket_size = cur_byte_size
                 elif last_bucket_size + cur_byte_size <= bucket_size:
-                    seq_buckets[-1].append(param)
+                    self.seq_buckets[-1].append(param)
                     last_bucket_size += cur_byte_size
                 else:
-                    seq_buckets.append([param])
+                    self.seq_buckets.append([param])
                     last_bucket_size = cur_byte_size
 
         # step 2: build meta data for the offset of each bucket
         # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
         buffer_length: int = 0
-        starts, stops = [], []
-        for params in seq_buckets:
-            starts.append(buffer_length)
+        for params in self.seq_buckets:
+            self.starts.append(buffer_length)
             numel = sum(_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params)
             # this pad is for zero, which needs numels in each Bucket can be divided by the number of ranks in this group * _align_size
             # so that each chunck during zero can be divided by _align_size
             align_nelements = self._align_size // params[0].element_size() * len(self._ranks)
             padding = (align_nelements - numel % align_nelements) % len(self._ranks)
             buffer_length += numel + padding
-            stops.append(buffer_length)
+            self.stops.append(buffer_length)
 
         # step3: allocate memory
         # gradient buffer
@@ -576,7 +598,7 @@ class Reducer:
 
         # step 4: build buckets
         buckets: List[Bucket] = []
-        for params, start, stop in zip(seq_buckets, starts, stops):
+        for params, start, stop in zip(self.seq_buckets, self.starts, self.stops):
             # replace underlying parameter content using shared storage from parameter
             ofst = start
             for param in params:
@@ -723,3 +745,40 @@ class Reducer:
         """Clear all post hooks."""
         for bucket in self._buckets:
             bucket.clear_post_hooks()
+
+    def offload_params(self):
+        """Offload parameters to CPU."""
+        for bucket in self._buckets:
+            bucket.offload_params()
+
+        # record the buffer shape then release
+        self.buffer_shape = tuple(self._contiguous_params.shape)
+        self._contiguous_params = None
+        self._contiguous_grads = None
+
+    def load_params(self):
+        """Load parameters from CPU."""
+        gpu = torch.cuda.current_device()
+        # reallocate buffer and copy param data
+        self._contiguous_grads: torch.Tensor = torch.zeros(
+            self.buffer_shape, dtype=self._params[0].dtype,
+            device=torch.cuda.current_device(), requires_grad=False)
+        self._contiguous_params: torch.Tensor = torch.zeros(
+            self.buffer_shape, dtype=self._params[0].dtype,
+            device=torch.cuda.current_device(), requires_grad=False)
+
+        for params, start, stop, bucket in zip(self.seq_buckets, self.starts, self.stops, self._buckets):
+            ofst = start
+            for param in params:
+                with torch.no_grad():
+                    self._contiguous_params[ofst:ofst+param.numel()].copy_(param.data.view(-1))
+                    param.data = self._contiguous_params[ofst:ofst+param.numel()].view(param.size())
+                aligned_nelements = _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
+                ofst += aligned_nelements
+
+            bucket.load_params(
+                self._contiguous_params[start:stop],
+                self._contiguous_grads[start:stop],
+            )
+            # we should register hooks here
+            bucket.register_hooks()
