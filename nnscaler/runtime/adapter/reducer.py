@@ -439,10 +439,12 @@ class Reducer:
         self._contiguous_params: torch.Tensor = None
         self._contiguous_grads: torch.Tensor = None
 
+        # record following variables for params offload
         # items in the bucket is params list
         self.seq_buckets: List[List[torch.nn.Parameter]] = []
         # bucket start and stop pos in buffer
         self.starts, self.stops = [], []
+        self.buffer_length: int = 0
 
         # build the subgroup of zero the current rank belongs to.
         # When zero_ngroups is larger than 1, the number of ranks
@@ -575,25 +577,24 @@ class Reducer:
 
         # step 2: build meta data for the offset of each bucket
         # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
-        buffer_length: int = 0
         for params in self.seq_buckets:
-            self.starts.append(buffer_length)
+            self.starts.append(self.buffer_length)
             numel = sum(_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params)
             # this pad is for zero, which needs numels in each Bucket can be divided by the number of ranks in this group * _align_size
             # so that each chunck during zero can be divided by _align_size
             align_nelements = self._align_size // params[0].element_size() * len(self._ranks)
             padding = (align_nelements - numel % align_nelements) % len(self._ranks)
-            buffer_length += numel + padding
-            self.stops.append(buffer_length)
+            self.buffer_length += numel + padding
+            self.stops.append(self.buffer_length)
 
         # step3: allocate memory
         # gradient buffer
         self._contiguous_grads: torch.Tensor = torch.zeros(
-            (buffer_length,), dtype=self._params[0].dtype,
+            (self.buffer_length,), dtype=self._params[0].dtype,
             device=torch.cuda.current_device(), requires_grad=False)
         # parameter buffer
         self._contiguous_params: torch.Tensor = torch.zeros(
-            (buffer_length,), dtype=self._params[0].dtype,
+            (self.buffer_length,), dtype=self._params[0].dtype,
             device=torch.cuda.current_device(), requires_grad=False)
 
         # step 4: build buckets
@@ -751,8 +752,6 @@ class Reducer:
         for bucket in self._buckets:
             bucket.offload_params()
 
-        # record the buffer shape then release
-        self.buffer_shape = tuple(self._contiguous_params.shape)
         self._contiguous_params = None
         self._contiguous_grads = None
 
@@ -761,10 +760,10 @@ class Reducer:
         gpu = torch.cuda.current_device()
         # reallocate buffer and copy param data
         self._contiguous_grads: torch.Tensor = torch.zeros(
-            self.buffer_shape, dtype=self._params[0].dtype,
+            (self.buffer_length,), dtype=self._params[0].dtype,
             device=torch.cuda.current_device(), requires_grad=False)
         self._contiguous_params: torch.Tensor = torch.zeros(
-            self.buffer_shape, dtype=self._params[0].dtype,
+            (self.buffer_length,), dtype=self._params[0].dtype,
             device=torch.cuda.current_device(), requires_grad=False)
 
         for params, start, stop, bucket in zip(self.seq_buckets, self.starts, self.stops, self._buckets):
