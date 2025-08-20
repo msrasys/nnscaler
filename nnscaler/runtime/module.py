@@ -5,6 +5,7 @@ from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, An
 import logging
 import os
 import sys
+import gc
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
@@ -735,6 +736,34 @@ class CubeModule(torch.nn.Module):
                     'optim_state_dict': merged_optimizer_state_dict
                     }, filename_prefix + '.full.ckpt')
 
+    def offload_params(self):
+        cpu = torch.device('cpu')
+        for buffer in self.buffers():
+            buffer.data = buffer.data.to(cpu)
+
+        for param in self.parameters():
+            param.data = param.data.to(cpu)
+            param.grad = None
+
+        for reducer in self._reducers:
+            reducer.offload_params()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def load_params(self):
+        gpu = torch.cuda.current_device()
+        for buffer in self.buffers():
+            buffer.data = buffer.data.to(gpu)
+
+        for param in self.parameters():
+            param.data = param.data.to(gpu)
+
+        for reducer in self._reducers:
+            reducer.load_params()
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
 @dataclass
 class OriginModuleMetadata:
