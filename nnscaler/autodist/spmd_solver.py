@@ -360,6 +360,8 @@ class SPMDSolver:
                         else:
                             allowed_pids = list()
                             for pos in selected_pc.allowed_partition_dims:
+                                # When allowed dims in provided partition constraints are not correct generate warning
+                                # If there is no valid partitions for the operator, the solver will throw exception later.
                                 try:
                                     cur_allowed_pid = operator.pos2dim_id(pos)
                                     allowed_pids.append(cur_allowed_pid)

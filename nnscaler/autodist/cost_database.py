@@ -144,8 +144,12 @@ def _load_comm_data(profile_dir: Path, plan_ngpus: int) -> Dict[str, Dict[str, L
     comm_path = profile_dir / 'comm'
     success, comm_info = loader(comm_path, strict=True)
     if not success:
+        # When communication profile data is not found, use the default data. If the input `plan_ngpus` is greater
+        # than the devices in the profile data, the data with largest device count (16 for mi200) will be used. This
+        # is helpful when user wants to generate a distributed plan spanning over multiple nodes.
         _logger.warning(f'Communication profile data not found, using default data at {_DEFAULT_COMM_DATA_PATH}')
         success, comm_info = loader(Path(_DEFAULT_COMM_DATA_PATH), strict=False)
+        assert success, f'Failed to load default communication profile data from {_DEFAULT_COMM_DATA_PATH}, please check nnscaler\'s installation'
     return comm_info
 
 
