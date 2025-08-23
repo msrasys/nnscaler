@@ -168,17 +168,7 @@ class Bucket:
                 partial_tensor, self._contiguous_grads,
                 op=self._reduce_op, group=self._zero_subgroup)
 
-    def build(self):
-        """
-        Build offset for each parameter
-        This should only be called once during the construction of bucket.
-        """
-        ofst = 0
-        for param in self._params:
-            self._pofset[param] = ofst
-            ofst += _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
-        # build parameter for optimizer (shared storage).
-        # Its gradient will be updated everytime calling `self.sync_grads()`
+    def _get_opt_ref(self):
         if not self._zero:
             opt = self._contiguous_params
         else:
@@ -190,7 +180,20 @@ class Bucket:
             #  the calculation of gnorm is not affected as long as the paddings are all 0.
             #   So for now, it looks harmless.
             opt = self._contiguous_params.chunk(self._zgroup_sz)[rank]
-        self._param_for_optimizer = torch.nn.Parameter(opt)
+        return opt
+
+    def build(self):
+        """
+        Build offset for each parameter
+        This should only be called once during the construction of bucket.
+        """
+        ofst = 0
+        for param in self._params:
+            self._pofset[param] = ofst
+            ofst += _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
+        # build parameter for optimizer (shared storage).
+        # Its gradient will be updated everytime calling `self.sync_grads()`
+        self._param_for_optimizer = torch.nn.Parameter(self._get_opt_ref())
 
     def register_hooks(self):
         """
@@ -363,25 +366,22 @@ class Bucket:
         self._async_param_cnt = 0
         self._async_handle = None
 
-    def offload_params(self):
+    def release_ref(self):
         cpu = torch.device('cpu')
         self._param_for_optimizer.data = self._param_for_optimizer.data.to(cpu)
         # set none to release memory
         self._contiguous_params = None
         self._contiguous_grads = None
 
-    def load_params(self, param_buffer, grad_buffer):
+    def resume_ref(self, param_buffer, grad_buffer):
         self._contiguous_params = param_buffer
         self._contiguous_grads = grad_buffer
+        self._param_for_optimizer.data = self._get_opt_ref()
 
-        if not self._zero:
-            opt = self._contiguous_params
-        else:
-            rank = torch.distributed.get_rank(group=self._zero_subgroup)
-            assert len(self._contiguous_params) % self._zgroup_sz == 0
-            opt = self._contiguous_params.chunk(self._zgroup_sz)[rank]
-        self._param_for_optimizer.data = opt
+        # TODO(yizhu1): seems moving attributes to cpu will make hooks invalid.
+        # To make sure hooks are correctly applied, we need to re-register them.
         self._hooks = []
+        self.register_hooks()
 
 
 class Reducer:
@@ -533,6 +533,27 @@ class Reducer:
         self._param_ids.add(param.data.data_ptr())
         self._numel += param.numel()
 
+    def _allocate_buffers(self):
+        # gradient buffer
+        self._contiguous_grads: torch.Tensor = torch.zeros(
+            (self.buffer_length,), dtype=self._params[0].dtype,
+            device=torch.cuda.current_device(), requires_grad=False)
+        # parameter buffer
+        self._contiguous_params: torch.Tensor = torch.zeros(
+            (self.buffer_length,), dtype=self._params[0].dtype,
+            device=torch.cuda.current_device(), requires_grad=False)
+
+    def _bind_params(self):
+        for params, start, stop in zip(self.seq_buckets, self.starts, self.stops):
+            # replace underlying parameter content using shared storage from parameter
+            ofst = start
+            for param in params:
+                with torch.no_grad():
+                    self._contiguous_params[ofst:ofst+param.numel()].copy_(param.data.view(-1))
+                    param.data = self._contiguous_params[ofst:ofst+param.numel()].view(param.size())
+                aligned_nelements = _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
+                ofst += aligned_nelements
+
     def build_buckets(self):
         """
         Build buckets the reducer.
@@ -587,27 +608,15 @@ class Reducer:
             self.buffer_length += numel + padding
             self.stops.append(self.buffer_length)
 
-        # step3: allocate memory
-        # gradient buffer
-        self._contiguous_grads: torch.Tensor = torch.zeros(
-            (self.buffer_length,), dtype=self._params[0].dtype,
-            device=torch.cuda.current_device(), requires_grad=False)
-        # parameter buffer
-        self._contiguous_params: torch.Tensor = torch.zeros(
-            (self.buffer_length,), dtype=self._params[0].dtype,
-            device=torch.cuda.current_device(), requires_grad=False)
+        # step 3: allocate memory
+        self._allocate_buffers()
 
-        # step 4: build buckets
+        # step 4: bind parameters
+        self._bind_params()
+
+        # step 5: build buckets
         buckets: List[Bucket] = []
         for params, start, stop in zip(self.seq_buckets, self.starts, self.stops):
-            # replace underlying parameter content using shared storage from parameter
-            ofst = start
-            for param in params:
-                with torch.no_grad():
-                    self._contiguous_params[ofst:ofst+param.numel()].copy_(param.data.view(-1))
-                    param.data = self._contiguous_params[ofst:ofst+param.numel()].view(param.size())
-                aligned_nelements = _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
-                ofst += aligned_nelements
             # initialize buckets
             bucket = Bucket(
                 params,
@@ -747,37 +756,19 @@ class Reducer:
         for bucket in self._buckets:
             bucket.clear_post_hooks()
 
-    def offload_params(self):
-        """Offload parameters to CPU."""
+    def release_mem(self):
         for bucket in self._buckets:
-            bucket.offload_params()
+            bucket.release_ref()
 
         self._contiguous_params = None
         self._contiguous_grads = None
 
-    def load_params(self):
-        """Load parameters from CPU."""
-        gpu = torch.cuda.current_device()
-        # reallocate buffer and copy param data
-        self._contiguous_grads: torch.Tensor = torch.zeros(
-            (self.buffer_length,), dtype=self._params[0].dtype,
-            device=torch.cuda.current_device(), requires_grad=False)
-        self._contiguous_params: torch.Tensor = torch.zeros(
-            (self.buffer_length,), dtype=self._params[0].dtype,
-            device=torch.cuda.current_device(), requires_grad=False)
+    def resume_mem(self):
+        self._allocate_buffers()
+        self._bind_params()
 
-        for params, start, stop, bucket in zip(self.seq_buckets, self.starts, self.stops, self._buckets):
-            ofst = start
-            for param in params:
-                with torch.no_grad():
-                    self._contiguous_params[ofst:ofst+param.numel()].copy_(param.data.view(-1))
-                    param.data = self._contiguous_params[ofst:ofst+param.numel()].view(param.size())
-                aligned_nelements = _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
-                ofst += aligned_nelements
-
-            bucket.load_params(
+        for start, stop, bucket in zip(self.starts, self.stops, self._buckets):
+            bucket.resume_ref(
                 self._contiguous_params[start:stop],
                 self._contiguous_grads[start:stop],
             )
-            # we should register hooks here
-            bucket.register_hooks()

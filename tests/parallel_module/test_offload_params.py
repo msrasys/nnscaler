@@ -96,7 +96,7 @@ def _mem_worker():
         print(f"Memory before offload: {before_mem}, after offload: {after_mem}, freed: {before_mem - after_mem}")
         print(f"Total size to free: {size_to_free}")
 
-        assert size_to_free == before_mem - after_mem, f"Expected {before_mem - after_mem}, but got {size_to_free}"
+        assert size_to_free == before_mem - after_mem, f"Expected {size_to_free}, but got {before_mem - after_mem}"
 
 
 def _correctness_worker():
