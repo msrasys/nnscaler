@@ -379,7 +379,9 @@ class Bucket:
         self._param_for_optimizer.data = self._get_opt_ref()
 
         # TODO(yizhu1): seems moving attributes to cpu will make hooks invalid.
-        # To make sure hooks are correctly applied, we need to re-register them.
+        # The reason is that torch's autograd will reset the AccumulateGrad object if the data is set:
+        # https://github.com/pytorch/pytorch/blob/38a492d40d7ebb2856cb120df337c6cdac244528/torch/csrc/autograd/variable.cpp#L473
+        # To make the resuming process safe, re-register them here.
         self._hooks = []
         self.register_hooks()
 
