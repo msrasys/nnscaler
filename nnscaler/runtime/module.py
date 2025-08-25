@@ -737,10 +737,13 @@ class CubeModule(torch.nn.Module):
                     }, filename_prefix + '.full.ckpt')
 
     def offload_params(self):
+        for name, param in self.named_parameters():
+            assert param.grad is None, f'expect {name} with shape {param.shape} has no grad'
+
         for reducer in self._reducers:
             reducer.zero_grad()
 
-        # we want the variable reference is unchanged, so super().cpu() is not used here
+        # we want attribute references are unchanged, so super().cpu() is not used here
         cpu = torch.device('cpu')
         for buffer in self.buffers():
             buffer.data = buffer.data.to(cpu)
@@ -755,7 +758,10 @@ class CubeModule(torch.nn.Module):
         torch.cuda.empty_cache()
 
     def load_params(self):
-        # we want the variable reference is unchanged, so super().gpu() is not used here
+        for name, param in self.named_parameters():
+            assert param.grad is None, f'expect {name} with shape {param.shape} has no grad'
+
+        # we want attribute references are unchanged, so super().gpu() is not used here
         gpu = torch.cuda.current_device()
         for buffer in self.buffers():
             buffer.data = buffer.data.to(gpu)
