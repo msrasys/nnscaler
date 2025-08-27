@@ -30,12 +30,11 @@ class WarmupCosineAnnealingLR(LRScheduler):
         T_max: int,
         eta_min=0.0,
         last_epoch=-1,
-        verbose="deprecated",
     ):  # noqa: D107
         self.warmup_steps = warmup_steps
         self.T_max = T_max - warmup_steps + 1
         self.eta_min = eta_min
-        super().__init__(optimizer, last_epoch, verbose)
+        super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
         """Retrieve the learning rate of each parameter group."""

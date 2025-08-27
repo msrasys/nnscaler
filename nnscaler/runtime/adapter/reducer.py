@@ -168,17 +168,7 @@ class Bucket:
                 partial_tensor, self._contiguous_grads,
                 op=self._reduce_op, group=self._zero_subgroup)
 
-    def build(self):
-        """
-        Build offset for each parameter
-        This should only be called once during the construction of bucket.
-        """
-        ofst = 0
-        for param in self._params:
-            self._pofset[param] = ofst
-            ofst += _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
-        # build parameter for optimizer (shared storage).
-        # Its gradient will be updated everytime calling `self.sync_grads()`
+    def _get_opt_param_data(self):
         if not self._zero:
             opt = self._contiguous_params
         else:
@@ -190,7 +180,20 @@ class Bucket:
             #  the calculation of gnorm is not affected as long as the paddings are all 0.
             #   So for now, it looks harmless.
             opt = self._contiguous_params.chunk(self._zgroup_sz)[rank]
-        self._param_for_optimizer = torch.nn.Parameter(opt)
+        return opt
+
+    def build(self):
+        """
+        Build offset for each parameter
+        This should only be called once during the construction of bucket.
+        """
+        ofst = 0
+        for param in self._params:
+            self._pofset[param] = ofst
+            ofst += _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
+        # build parameter for optimizer (shared storage).
+        # Its gradient will be updated everytime calling `self.sync_grads()`
+        self._param_for_optimizer = torch.nn.Parameter(self._get_opt_param_data())
 
     def register_hooks(self):
         """
@@ -363,6 +366,31 @@ class Bucket:
         self._async_param_cnt = 0
         self._async_handle = None
 
+    def sleep(self):
+        """
+        release reference to contiguous buffer in reducer
+        """
+        cpu = torch.device('cpu')
+        self._param_for_optimizer.data = self._param_for_optimizer.data.to(cpu)
+        # set none to release memory
+        self._contiguous_params = None
+        self._contiguous_grads = None
+
+    def wake_up(self, param_buffer, grad_buffer):
+        """
+        re-attach to the contiguous buffer and re-build hooks
+        """
+        self._contiguous_params = param_buffer
+        self._contiguous_grads = grad_buffer
+        self._param_for_optimizer.data = self._get_opt_param_data()
+
+        # TODO(yizhu1): seems moving attributes to cpu will make hooks invalid.
+        # The reason is that torch's autograd will reset the AccumulateGrad object if the data is set:
+        # https://github.com/pytorch/pytorch/blob/38a492d40d7ebb2856cb120df337c6cdac244528/torch/csrc/autograd/variable.cpp#L473
+        # To make the resuming process safe, re-register them here.
+        self._hooks = []
+        self.register_hooks()
+
 
 class Reducer:
     # the default bucket cap for async reducer in megabytes
@@ -418,6 +446,13 @@ class Reducer:
         # contiguous parameter buffer and gradient buffer
         self._contiguous_params: torch.Tensor = None
         self._contiguous_grads: torch.Tensor = None
+
+        # record following variables for params offload
+        # items in the bucket is params list
+        self.seq_buckets: List[List[torch.nn.Parameter]] = []
+        # bucket start and stop pos in buffer
+        self.starts, self.stops = [], []
+        self.buffer_length: int = 0
 
         # build the subgroup of zero the current rank belongs to.
         # When zero_ngroups is larger than 1, the number of ranks
@@ -506,6 +541,27 @@ class Reducer:
         self._param_ids.add(param.data.data_ptr())
         self._numel += param.numel()
 
+    def _allocate_buffers(self):
+        # gradient buffer
+        self._contiguous_grads: torch.Tensor = torch.zeros(
+            (self.buffer_length,), dtype=self._params[0].dtype,
+            device=torch.cuda.current_device(), requires_grad=False)
+        # parameter buffer
+        self._contiguous_params: torch.Tensor = torch.zeros(
+            (self.buffer_length,), dtype=self._params[0].dtype,
+            device=torch.cuda.current_device(), requires_grad=False)
+
+    def _bind_params(self):
+        for params, start, stop in zip(self.seq_buckets, self.starts, self.stops):
+            # replace underlying parameter content using shared storage from parameter
+            ofst = start
+            for param in params:
+                with torch.no_grad():
+                    self._contiguous_params[ofst:ofst+param.numel()].copy_(param.data.view(-1))
+                    param.data = self._contiguous_params[ofst:ofst+param.numel()].view(param.size())
+                aligned_nelements = _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
+                ofst += aligned_nelements
+
     def build_buckets(self):
         """
         Build buckets the reducer.
@@ -526,8 +582,6 @@ class Reducer:
         #       (used in pytorch, with a couple percentage improvement)
         bucket_size = self._numel * 8 + 1 if not self._bucket_size else self._bucket_size
 
-        # items in the bucket is params list
-        seq_buckets: List[List[torch.nn.Parameter]] = []
         last_bucket_size = None
 
         assert len(set(p.dtype for p in self._params)) == 1, (
@@ -540,51 +594,37 @@ class Reducer:
                 # It will go the `else` branch
                 # and finish the current bucket and start a new bucket.
                 # This new bucket will be sealed in the next iteration
-                if len(seq_buckets) == 0:
-                    seq_buckets.append([param])
+                if len(self.seq_buckets) == 0:
+                    self.seq_buckets.append([param])
                     last_bucket_size = cur_byte_size
                 elif last_bucket_size + cur_byte_size <= bucket_size:
-                    seq_buckets[-1].append(param)
+                    self.seq_buckets[-1].append(param)
                     last_bucket_size += cur_byte_size
                 else:
-                    seq_buckets.append([param])
+                    self.seq_buckets.append([param])
                     last_bucket_size = cur_byte_size
 
         # step 2: build meta data for the offset of each bucket
         # the start of each bucket will be padded to the next multiple of `len(self.ranks)`
-        buffer_length: int = 0
-        starts, stops = [], []
-        for params in seq_buckets:
-            starts.append(buffer_length)
+        for params in self.seq_buckets:
+            self.starts.append(self.buffer_length)
             numel = sum(_aligned_nelement(p.nelement(), p.element_size(), self._align_size) for p in params)
             # this pad is for zero, which needs numels in each Bucket can be divided by the number of ranks in this group * _align_size
             # so that each chunck during zero can be divided by _align_size
             align_nelements = self._align_size // params[0].element_size() * len(self._ranks)
             padding = (align_nelements - numel % align_nelements) % len(self._ranks)
-            buffer_length += numel + padding
-            stops.append(buffer_length)
+            self.buffer_length += numel + padding
+            self.stops.append(self.buffer_length)
 
-        # step3: allocate memory
-        # gradient buffer
-        self._contiguous_grads: torch.Tensor = torch.zeros(
-            (buffer_length,), dtype=self._params[0].dtype,
-            device=torch.cuda.current_device(), requires_grad=False)
-        # parameter buffer
-        self._contiguous_params: torch.Tensor = torch.zeros(
-            (buffer_length,), dtype=self._params[0].dtype,
-            device=torch.cuda.current_device(), requires_grad=False)
+        # step 3: allocate memory
+        self._allocate_buffers()
 
-        # step 4: build buckets
+        # step 4: bind parameters
+        self._bind_params()
+
+        # step 5: build buckets
         buckets: List[Bucket] = []
-        for params, start, stop in zip(seq_buckets, starts, stops):
-            # replace underlying parameter content using shared storage from parameter
-            ofst = start
-            for param in params:
-                with torch.no_grad():
-                    self._contiguous_params[ofst:ofst+param.numel()].copy_(param.data.view(-1))
-                    param.data = self._contiguous_params[ofst:ofst+param.numel()].view(param.size())
-                aligned_nelements = _aligned_nelement(param.nelement(), param.element_size(), self._align_size)
-                ofst += aligned_nelements
+        for params, start, stop in zip(self.seq_buckets, self.starts, self.stops):
             # initialize buckets
             bucket = Bucket(
                 params,
@@ -723,3 +763,26 @@ class Reducer:
         """Clear all post hooks."""
         for bucket in self._buckets:
             bucket.clear_post_hooks()
+
+    def sleep(self):
+        """
+        release contiguous buffers on the device to save memory
+        """
+        for bucket in self._buckets:
+            bucket.sleep()
+
+        self._contiguous_params = None
+        self._contiguous_grads = None
+
+    def wake_up(self):
+        """
+        reallocate contiguous buffers and related objects
+        """
+        self._allocate_buffers()
+        self._bind_params()
+
+        for start, stop, bucket in zip(self.starts, self.stops, self._buckets):
+            bucket.wake_up(
+                self._contiguous_params[start:stop],
+                self._contiguous_grads[start:stop],
+            )

@@ -2,15 +2,19 @@
 #  Licensed under the MIT License.
 
 from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union
+from typing_extensions import Self
 import logging
 import os
 import sys
+import gc
+import warnings
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 
 import torch
 import torch.distributed as dist
+from torch import device
 
 from nnscaler.graph.parser import FxModuleParser
 
@@ -734,6 +738,100 @@ class CubeModule(torch.nn.Module):
         torch.save({'state_dict': merged_model_state_dict,
                     'optim_state_dict': merged_optimizer_state_dict
                     }, filename_prefix + '.full.ckpt')
+
+    def sleep(self):
+        """
+        Move attributes (buffer and param) to cpu and release contiguous buffer in reducers. Different from
+        nn.Module's cpu() method, references to attributes are unchanged.
+        """
+        for name, param in self.named_parameters():
+            assert param.grad is None, f'expect {name} with shape {param.shape} has no grad'
+
+        for reducer in self._reducers:
+            reducer.zero_grad()
+
+        # we want attribute references are unchanged, so super().cpu() is not used here
+        cpu = torch.device('cpu')
+        for buffer in self.buffers():
+            buffer.data = buffer.data.to(cpu)
+
+        for param in self.parameters():
+            param.data = param.data.to(cpu)
+
+        for reducer in self._reducers:
+            reducer.sleep()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        return self
+
+    def wake_up(self, device: Optional[Union[int, device]] = None) -> Self:
+        """
+        Move attributes (buffer and param) back to gpu and reallocate memories in reducers. It is a reverse
+        operation of `self.sleep()`.
+        """
+        gpu = torch.cuda.current_device()
+        if device is not None:
+            if isinstance(device, int):
+                index = device
+            elif isinstance(device, torch.device):
+                index = device.index
+            else:
+                raise RuntimeError(f'unexpected device type {type(device)}')
+            assert gpu == index, f'nnscaler module does not support cross gpu transport, expect {gpu} but got {index}'
+
+        for name, param in self.named_parameters():
+            assert param.grad is None, f'expect {name} with shape {param.shape} has no grad'
+
+        # we want attribute references are unchanged, so super().gpu() is not used here
+        for buffer in self.buffers():
+            buffer.data = buffer.data.to(gpu)
+
+        for param in self.parameters():
+            param.data = param.data.to(gpu)
+
+        for reducer in self._reducers:
+            reducer.wake_up()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        return self
+
+    def to(self, *args, **kwargs):
+        """
+        Override nn.Module's to function, currently we only allow transfer data from host and device
+
+        Args:
+            device (:class:`torch.device`): the desired device of the parameters
+                and buffers in this module
+            dtype (:class:`torch.dtype`): the desired floating point or complex dtype of
+                the parameters and buffers in this module
+            tensor (torch.Tensor): Tensor whose dtype and device are the desired
+                dtype and device for all parameters and buffers in this module
+            memory_format (:class:`torch.memory_format`): the desired memory
+                format for 4D parameters and buffers in this module (keyword
+                only argument)
+
+        Returns:
+            Module: self
+        """
+        device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(
+            *args, **kwargs
+        )
+        if dtype is not None:
+            raise ValueError(f'nnscaler does not support passing dtype {dtype} to to()')
+        if convert_to_format is not None:
+            raise ValueError(f'nnscaler does not support passing convert_to_format {convert_to_format} to to()')
+        if non_blocking is not None:
+            warnings.warn(f'nnscaler moves tensors in a blocking approach currently')
+
+        # after _parse_to `device` must in type of torch.device
+        if device.type == 'cpu':
+            return self.cpu()
+        elif device.type == 'cuda':
+            return self.cuda(device)
+        else:
+            raise ValueError(f'unsupported device type {device}')
 
 
 @dataclass
