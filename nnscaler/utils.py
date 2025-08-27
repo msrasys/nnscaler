@@ -4,16 +4,16 @@
 import builtins
 import importlib
 from contextlib import contextmanager
-from functools import wraps
+from functools import wraps, cache
 from typing import (
     Generator, Optional, Tuple, Callable, Dict, List, Set, Any,
-    Iterable, Type, Union, Protocol, ClassVar, cast, TypeVar
+    Iterable, Type, TypedDict, Union, Protocol, ClassVar, cast, TypeVar
 )
 import logging
 from pathlib import Path
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import inspect
 import os
 
@@ -325,6 +325,7 @@ def fields(model: TDataClass, /) -> TDataClass:
     return cast(TDataClass, _GetFields(model))
 
 
+@cache
 def load_type(type_name: str):
     """
     Load function/class from its full qualified name
@@ -457,3 +458,25 @@ class accum_mode:
             RuntimeFlag.skip_reducer = (not (step == nsteps - 1))
             yield step
         RuntimeFlag.skip_zero_grad, RuntimeFlag.skip_reducer = old
+
+
+class AdamOptState(TypedDict):
+    step: int
+    exp_avg: torch.Tensor
+    exp_avg_sq: torch.Tensor
+
+
+class OptStateParamGroup(TypedDict):
+    params: list[int]
+    lr: int
+
+
+class OptStateDict(TypedDict):
+    state: dict[int, AdamOptState | dict[str, Any]]
+    param_groups: list[OptStateParamGroup | dict[str, Any]]
+
+
+def fn_field(**kwargs):
+    metadata = kwargs.pop('metadata', {})
+    metadata['deserialize'] = lambda t: None if t is None else load_type(t)
+    return field(**kwargs, metadata=metadata)

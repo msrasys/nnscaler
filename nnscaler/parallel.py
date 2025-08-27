@@ -49,7 +49,7 @@ from nnscaler.runtime.module import AttrMeta, CubeModule, ParallelModule, Origin
 from nnscaler.flags import CompileFlag, RuntimeFlag
 import nnscaler.policies as policies
 from nnscaler.program import disable_global_graph
-from nnscaler.utils import get_member_by_name, setup_stride_broadcast_group, get_shared_params
+from nnscaler.utils import get_member_by_name, load_type, setup_stride_broadcast_group, get_shared_params
 
 logger = logging.getLogger(__name__)
 
@@ -913,6 +913,7 @@ def parallelize(
     module_dtype:  Optional[torch.dtype] = None,
     module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     init_module_params: bool = True,
+    build_module_buckets: bool = True,
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
     """
@@ -983,6 +984,12 @@ def parallelize(
             Otherwise, they will be empty tensor.
             This parameter will be passed to the module constructor,
             so it is only used when module_or_module_class is a module object, and load_module is true.
+        build_module_buckets (bool): For parallel module, parameters that needs to synchronize will be grouped into buckets for more efficient communication.
+            If true, grouping process will be done in `__init__`
+            If false, you should do this by yourself.
+            This parameter will be passed to the module constructor,
+            so it is only used when module_or_module_class is a module object, and load_module is true.
+            Please leave it to true until you have a good reason to change it.
         module_dtype (Optional[torch.dtype]): the dtype of the module. Keep the module as it is if it is None.
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
         broadcast_strategy (Union[str, BroadcastGenFilesStrategy]): the broadcast strategy for generated files.
@@ -1116,7 +1123,7 @@ def parallelize(
         if is_module_class:
             return parallel_module_class
         else:
-            parallel_module = parallel_module_class(init_module_params)
+            parallel_module = parallel_module_class(init_module_params, build_module_buckets)
             parallel_module.train(module_or_module_class.training)  # set training state to the same as original module
             return parallel_module
 
@@ -1245,6 +1252,27 @@ class ParallelOptimizer(torch.optim.Optimizer):
 
 
 OptimizerT = TypeVar('OptimizerT', bound=torch.optim.Optimizer)
+HybridOptimizerT = TypeVar('HybridOptimizer', bound=torch.optim.Optimizer)
+
+
+def hybrid(
+    params: list[torch.nn.Parameter],
+    param_clss_fn: Callable[[str], tuple[int, int]],
+    **kwargs,
+) -> HybridOptimizerT:
+    """
+    Stub for hybrid optimizer creation.
+    Signature of Hybrid optimizer constructor:
+    ```
+    def __init__(self, params, param_clss, **kwargs):
+       ...
+    ```
+    But when you pass arguments to `build_optimizer`
+    You must replace `param_clss` with `param_clss_fn`,
+    And `build_optimizer` will automatically replace `param_clss_fn` with the actual `param_clss`.
+    """
+    ...
+hybrid.is_hybrid = True  # mark this function as hybrid optimizer factory
 
 
 def build_optimizer(
@@ -1287,6 +1315,8 @@ def build_optimizer(
         Please note the type annotation of the returned optimizer (`Union[OptimizerT, ParallelOptimizer]`) is just for intellisense.
     """
 
+    PARAM_CLSS_FN_NAME = 'param_clss_fn'
+
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
         raise RuntimeError("Old style CubeModule is not supported")
 
@@ -1294,12 +1324,21 @@ def build_optimizer(
     if any(m != module and isinstance(m, ParallelModule) and  m.compute_config.use_end2end for m in module.modules()):
         raise RuntimeError("End2End module cannot be nested in another module")
 
+    is_hybrid = False
+    if getattr(optimizer_fn, 'is_hybrid', False):
+        if PARAM_CLSS_FN_NAME not in kwargs:
+            raise ValueError("param_clss_fn must be provided when using hybrid optimizer")
+        # syntax sugar
+        kwargs[PARAM_CLSS_FN_NAME] = load_type(kwargs[PARAM_CLSS_FN_NAME])
+        is_hybrid = True
+
     RuntimeFlag.skip_reducer = True
     RuntimeFlag.skip_zero_grad = False
 
     non_parallel_module_reducer = None
     non_parallel_modules = [m for m in module.modules() if not isinstance(m, ParallelModule)]
     parallel_modules = [m for m in module.modules() if isinstance(m, ParallelModule)]
+    parallel_modules_prefix = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
 
     if not parallel_modules:
         raise RuntimeError("No ParallelModule found in the module. Please make sure you have called parallelize() before build_optimizer().")
@@ -1310,6 +1349,22 @@ def build_optimizer(
             if param is not None and param.requires_grad:
                 non_parallel_parameters_dict[param] = None
     non_parallel_parameters = list(non_parallel_parameters_dict.keys())
+
+    param_original_names = {}
+    for n, p in module.named_parameters():
+        nparts = n.split('.')
+        module_prefix = '.'.join(nparts[:-1])
+        if module_prefix in parallel_modules_prefix:
+            name_mapping = parallel_modules_prefix[module_prefix].get_full_map()
+            original_name = name_mapping[nparts[-1]].orig_name
+            param_original_names[p] = \
+                f'{module_prefix}.{original_name}' if module_prefix else original_name
+        else:
+            param_original_names[p] = n
+    if is_hybrid:
+        param_clss = {p: kwargs[PARAM_CLSS_FN_NAME](n) for p, n in param_original_names.items()}
+    else:
+        param_clss = {}
 
     # check if all ParallelModules have the same gpu_config
     compute_configs = [m.compute_config for m in parallel_modules]
@@ -1340,7 +1395,13 @@ def build_optimizer(
         non_parallel_module_reducer = Reducer(group, **reducer_config)
         for param in non_parallel_parameters:
             non_parallel_module_reducer.add_param(param)
-        non_parallel_module_reducer.build_buckets()
+        non_parallel_module_reducer.build_buckets(param_clss=param_clss)
+
+    if is_hybrid:
+        for pm in parallel_modules:
+            pm.build_buckets(param_clss=param_clss)
+            for reducer in pm.reducers:
+                param_clss.update(reducer.get_opt_params())
 
     opt_module_locs: Dict[str, ModuleParameterLocation] = {}
     def _local_parameters(module: torch.nn.Module):
@@ -1373,7 +1434,13 @@ def build_optimizer(
                     opt_module_locs[name].count += 1
             yield param
 
-    optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), **kwargs)
+    if is_hybrid:
+        optimizer = optimizer_fn(_local_parameters(module),
+            param_clss=param_clss,
+            **{k: v for k, v in kwargs.items() if k != PARAM_CLSS_FN_NAME}
+        )
+    else:
+        optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), **kwargs)
     optimizer._non_parallel_module_reducer = non_parallel_module_reducer
     optimizer._extra_state = OptimizerExtraState(
             rank=torch.distributed.get_rank(),
@@ -1386,21 +1453,21 @@ def build_optimizer(
             }
     )
 
-    def _step_pre_hook(opt, *args, **kwargs):
-        opt.sync_shard_grad()
-
-    def _step_post_hook(opt, *args, **kwargs):
+    orig_step = optimizer.step
+    def _patched_step(self, closure=None):
+        # Please note:
+        # when closure is used in optimizer.step()
+        # the backward is done in closure,
+        # and it is useless to sync grad because grad is still unavailable there
+        # so you must call sync_shard_grad() manually in this case.
+        if closure is None:
+            self.sync_shard_grad()
+        orig_step(closure=closure)
         for m in parallel_modules:
             m.gather_params()
         if non_parallel_module_reducer:
             non_parallel_module_reducer.gather_params()
-
-    # Please note:
-    # register_step_pre_hook doesn't work expectly
-    # when closure is used in optimizer.step()
-    # in that case, you must call sync_shard_grad() manually
-    optimizer.register_step_pre_hook(_step_pre_hook)
-    optimizer.register_step_post_hook(_step_post_hook)
+    optimizer.step = types.MethodType(_patched_step, optimizer)
 
     orig_zero_grad = optimizer.zero_grad
     def _patched_zero_grad(self, set_to_none: bool = True):
@@ -1575,6 +1642,11 @@ def _get_parallel_module_state_dict_info(
     return pm_extra_states, pm_state_dicts, non_pm_state_dict
 
 
+def _is_supported_optimizer(name: str):
+    from nnscaler.runtime.hybrid_optimizer import HybridOptimizer
+    return ('adam' in name.lower()) or name == HybridOptimizer.__name__
+
+
 def _get_optimizer_state_dict_info(
     optimizer_state_dicts: List[Dict[str, Any]]
 ) -> Tuple[
@@ -1631,7 +1703,7 @@ def _get_optimizer_state_dict_info(
     ] = {}
     for opt_state_dict in optimizer_state_dicts:
         opt_extra_state = OptimizerExtraState(**opt_state_dict[ParallelModule.EXTRA_STATE_KEY])
-        if 'adam' not in opt_extra_state.name.lower():
+        if not _is_supported_optimizer(opt_extra_state.name):
             raise ValueError("Only Adam-like optimizers are supported.")
         opt_extra_states[opt_extra_state.rank] = opt_extra_state
 
@@ -1870,7 +1942,7 @@ def load_merged_state_dict(
     module.to(device)
 
     if optimizer is not None and optimizer_state_dict is not None:
-        if 'adam' not in optimizer._extra_state.name.lower():
+        if not _is_supported_optimizer(optimizer._extra_state.name):
             raise ValueError("Only Adam-like optimizers are supported.")
 
         # handle non-paralleled module parameters
@@ -2371,7 +2443,7 @@ def load_deduped_state_dict(
     broadcast_weights(module)
 
     if optimizer is not None:
-        if 'adam' not in optimizer._extra_state.name.lower():
+        if not _is_supported_optimizer(optimizer._extra_state.name):
             raise ValueError("Only Adam-like optimizers are supported.")
         if optimizer_state_dict is None:
             raise ValueError("optimizer_state_dict should be provided when optimizer is not None.")

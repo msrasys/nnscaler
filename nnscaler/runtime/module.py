@@ -213,14 +213,29 @@ class CubeModule(torch.nn.Module):
 
     def parameters_for_optimizer(self) -> List[torch.nn.Parameter]:
         """Get parameter list for optimizer"""
-        params = []
+        return list(self.get_opt_params().keys())
+
+    def get_opt_params(self, prefix='', classify_param_cls_fn: Callable[[str], Any]=None) -> dict[torch.nn.Parameter, Any]:
+        """
+        Get all parameters and their classifications
+
+        Args:
+            prefix (str): The prefix of this module,
+                which will be used to generate full names of parameters and further classify them.
+            classify_param_cls_fn (Callable[[str], Any], optional): A function to classify parameters by name.
+
+        Returns:
+            dict[torch.nn.Parameter, Any]: A dictionary mapping parameters to their classifications.
+
+        """
+        params = {}
         reducer_pids = set()
         for reducer in self._reducers:
-            params += reducer.parameters_for_optimizer()
+            params.update(reducer.get_opt_params())
             reducer_pids.update(id(p) for p in reducer.params)
-        for param in self.parameters():
+        for name, param in self.named_parameters(prefix):
             if id(param) not in reducer_pids:
-                params.append(param)
+                params[param] = classify_param_cls_fn(name) if classify_param_cls_fn else None
         # print(f'> get out parameters: {sum(p.numel() for p in params)}')
         return params
 
@@ -927,12 +942,14 @@ class ParallelModule(CubeModule):
             else:
                 _logger.warning(_non_persistent_buffers_load_warning)
 
-    def _post_init(self, init_params=True):
+    def _post_init(self, init_params=True, build_buckets=True):
         """
         This is post init function to further initialize the model. Should be called by subclass's __init__().
 
         Args:
             init_params (bool): whether to load model init parameters. Default True.
+            build_buckets (bool): whether to build buckets for the model. Default True.
+                If it is False, you must manually call `build_buckets()` later before use this module.
         """
         # Here we check the rank to load the module file name
         # Current we don't check rank when we are not in distributed mode
@@ -957,17 +974,33 @@ class ParallelModule(CubeModule):
         )
         self._orign_module_metadata: OriginModuleMetadata = torch.load(module_file.with_name(f"{self.ORIGIN_MODULE_METADATA_FILE}"), weights_only=False)
 
-        for reducer in self.reducers:
-            reducer.build_buckets()
-
-        self._zero_metadata = self._get_zero_metadata()
-
         # add state_dict hook to save extra state
         # Please note extra_state is only used for merging, not for loading
         # so we can safely remove it in load_state_dict pre hook
         self._register_state_dict_hook(ParallelModule._post_state_dict_hook)
         # add load_state_dict pre hook to pop extra state to prevent warning
         self._register_load_state_dict_pre_hook(ParallelModule._pre_load_state_dict_hook, with_module=True)
+
+        if build_buckets:
+            self.build_buckets()
+
+    def build_buckets(self, param_clss: Optional[dict[torch.nn.Parameter, Any]]=None):
+        """
+        Build buckets for the model reducers.
+
+        You can call this method multiple times to rebuild the buckets.
+        Typically this will be called when building optimizer when multiple optimizers/param groups are used.
+        And we will put parameters with different optimizer or different param groups into different buckets.
+
+        Currently we have done an optimization to make sure this is only called once even for hybrid optimizers
+        by
+        1. setting `build_buckets=False` when calling constructor in `nnscaler.parallelize`.
+        2. manually calling `build_buckets()` later in `nnscaler.build_optimizer`
+        """
+        for reducer in self.reducers:
+            reducer.build_buckets(param_clss)
+
+        self._zero_metadata = self._get_zero_metadata()
 
     def forward(self, *args, **kwargs):
         self._warn_uninitialized_non_persistent_buffers(raise_error=True)

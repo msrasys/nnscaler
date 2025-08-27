@@ -506,15 +506,17 @@ class ModuleCodeGen(FuncEmission):
                     args=[
                         'self',
                         'init_params=True',
-                        '*',
+                        'build_buckets=True',
+                        '*args',
                         f'async_op={CompileFlag.async_reducer}',
                         f'max_bucket_size_bytes={CompileFlag.max_reducer_bucket}',
                         f'zero_use_reduce_scatter={CompileFlag.zero_use_reduce_scatter}',
+                        f'**kwargs',
                     ]
                 ) as ib:
                     ib.insert_body(self.model_init_statements)
                     ib.insert_body('')
-                    ib.insert_body('self._post_init(init_params)')
+                    ib.insert_body('self._post_init(init_params, build_buckets)')
             else:
                 with FunctionBlock(func_name='__init__', args=['self']) as ib:
                     ib.insert_body(self.model_init_statements)

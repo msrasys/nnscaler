@@ -197,6 +197,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
     def parallelize(self,
         dummy_input: Optional[dict[str, Any]] = None, *,
         load_module: bool = True,
+        build_buckets: bool = True,
         module_args: Optional[tuple[tuple, dict]] = None
     ):
         pmodel_class = nnscaler.parallelize(
@@ -212,7 +213,7 @@ class ModuleParallelizeConfigAdapter(PrecisionMixin, PolicyMixin):
             load_module=load_module,
         )
         if load_module:
-            return pmodel_class()
+            return pmodel_class(build_buckets=build_buckets)
         return pmodel_class
 
 
@@ -279,7 +280,7 @@ def mixin_module(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
     return model
 
 
-def parallelize_model(trainer_args: TrainerArgs, dummy_input: dict[str, Any], load_module: bool):
+def parallelize_model(trainer_args: TrainerArgs, dummy_input: dict[str, Any], load_module: bool, build_buckets: bool):
     tracing_weights = None
     if trainer_args.tracing_from_weights:
         tracing_weights = torch.load(trainer_args.tracing_from_weights)
@@ -292,11 +293,11 @@ def parallelize_model(trainer_args: TrainerArgs, dummy_input: dict[str, Any], lo
 
     if not trainer_args.model.parallel_modules:
         # parallelize the whole model
-        return _new_adapter().parallelize(dummy_input, load_module=load_module)
+        return _new_adapter().parallelize(dummy_input, load_module=load_module, build_buckets=build_buckets)
 
     if not load_module and all(pm.args is not None for pm in trainer_args.model.parallel_modules):
         for m in trainer_args.model.parallel_modules:
-            _new_adapter(m).parallelize(dummy_input, load_module=False)
+            _new_adapter(m).parallelize(dummy_input, load_module=False, build_buckets=build_buckets)
         return
 
     parallel_sub_modules = {
@@ -346,7 +347,7 @@ def parallelize_model(trainer_args: TrainerArgs, dummy_input: dict[str, Any], lo
                 # This is a trade-off to make sure the parallelized module is consistent.
                 # Maybe we can use torch.distributed.broadcast to sync the random state in all devices.
                 with fork_rng():
-                    return adapter.parallelize(dummy_input, load_module=load_module, module_args=(args, kwargs))
+                    return adapter.parallelize(dummy_input, load_module=load_module, build_buckets=build_buckets, module_args=(args, kwargs))
         finally:
             _patch_new()
 

@@ -117,7 +117,7 @@ def init_distributed():
 def assert_equal(a: Any, b: Any):
     assert type(a) == type(b)
     if isinstance(a, torch.Tensor):
-        assert torch.equal(a.cpu(), b.cpu())
+        assert torch.equal(a.cpu(), b.cpu()), torch.max(torch.abs(a.cpu() - b.cpu()))
     elif isinstance(a, dict):
         assert len(a) == len(b)
         for k in a.keys():
@@ -127,7 +127,7 @@ def assert_equal(a: Any, b: Any):
         for i in range(len(a)):
             assert_equal(a[i], b[i])
     else:
-        assert a == b
+        assert a == b, f"Values are not equal: {a} != {b}"
 
 
 def assert_close(a: Any, b: Any, atol=1e-6, rtol=1e-6):
