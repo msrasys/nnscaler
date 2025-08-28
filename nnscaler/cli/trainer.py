@@ -641,6 +641,7 @@ class Trainer:
                 self._try_resume_rng_states()
                 it = iter(self.dataloader[stage])
             else:  # dry run until reach the desired batch.
+                logger.info(f'trainer try to resume dataloader for {stage} stage with {num_skip_first}')
                 it = iter(self.dataloader[stage])
                 for _ in range(num_skip_first * self.train_args.update_freq):
                     _sample = next(it)
