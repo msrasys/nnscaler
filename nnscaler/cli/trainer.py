@@ -634,6 +634,7 @@ class Trainer:
     def _global_batch_iterator(self, num_skip_first=0, stage='train'):
         if stage == 'train':
             if self.dataloader_resumed or num_skip_first == 0:
+                logger.info(f'trainer resumes dataloader directly')
                 # if the checkpoint stops at the end of an epoch,
                 # the rng states must be resumed before creating iterator
                 # because `DataLoader.__iter__()` uses the rng (dunno why),
