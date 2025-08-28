@@ -23,14 +23,12 @@ class _DeviceGroup:
         self._is_pg_initer = False
         # if CompileFlag.dev_mode or not is_running_distributed():
         if CompileFlag.dev_mode:
-            print('>>> running in dev mode or not distributed')
             self.rank = 0
             self.world_size = 1
             self.local_world_size = 1
             self.local_rank = 0
             self.node_rank = 0
         else:
-            print('>>> running in distributed mode')
             if not torch.distributed.is_initialized():
                 torch.distributed.init_process_group(
                     backend='nccl', timeout=_LARGE_TIMEOUT

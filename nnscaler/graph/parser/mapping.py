@@ -55,6 +55,7 @@ class SignFx2Op:
 
     kOpMap = {
         # __tnmtemplate('Dropout'): function.nnDropout,
+        __ttemplate('dot'): function.Dot,
         __fcntemplate('linear'): function.Linear,
         __ftemplate('dropout') : function.Dropout,
         __ttemplate('sum'): function.Sum,
@@ -202,6 +203,7 @@ class SignFx2Op:
         __ttemplate('div') : function.Div,
         __ttemplate('true_divide'): function.Div,
         '_operator.truediv': function.Div,
+        '_operator.itruediv': function.Div,
         __ttemplate('floor_divide') : function.FloorDiv,
         '_operator.floordiv': function.FloorDiv,
 
