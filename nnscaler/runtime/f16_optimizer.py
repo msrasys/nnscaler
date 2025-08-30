@@ -115,6 +115,9 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
             if len(self.param_groups) != 1:
                 raise RuntimeError('only support one param group')
             self.param_groups[0]['params'] = self.fp32_params
+        else:
+            logger.warning('fp32_params not found in state_dict, will sync from fp16 params to fp32 params')
+            self._sync_fp16_params_to_fp32()
 
         super().load_state_dict(state_dict)
 
