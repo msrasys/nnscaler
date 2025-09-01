@@ -8,6 +8,7 @@ import copy
 import torch
 import numpy as np
 import inspect
+import pickle
 
 from nnscaler.ir.cten import IRCell
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
@@ -317,7 +318,8 @@ class ModuleCodeGen(FuncEmission):
         *,
         as_parallel_module: bool = False,
         end2end_mode: bool = False,
-        forward_args: Optional[Dict[str, Any]] = None
+        forward_args: Optional[Dict[str, Any]] = None,
+        outfile_attr_meta_map: Optional[str] = None,
     ) -> str:
         """
         Generate model implementation code based on the given graph.
@@ -406,6 +408,7 @@ class ModuleCodeGen(FuncEmission):
                 This is used only in parallel module.
             forward_args (Dict[str, Any]): argument names and their default values of forward function, if None, use node inputs.
                 This is used only in parallel module.
+            outfile_attr_meta_map (str): output file path for parameter mapping. None if don't save
 
         Returns:
             generated code
@@ -451,6 +454,7 @@ class ModuleCodeGen(FuncEmission):
                     if k not in param_first_used_pos:
                         param_first_used_pos[k] = (i, v)
 
+        attr_meta_map = {}
         # emit code
         for node in sequence:
             if isinstance(node, IRSegment):
@@ -472,7 +476,7 @@ class ModuleCodeGen(FuncEmission):
 
             # emit node tensor declaration into `__init__`
             # typically it's about the `nn.Parameter`
-            self.init_attributes(node)
+            attr_meta_map.update(self.init_attributes(node))
 
             # emit node code
             # codes : List[str]
@@ -488,6 +492,10 @@ class ModuleCodeGen(FuncEmission):
                     args.append(self.tensor_name(t))
             node_args.append(args)
 
+        if outfile_attr_meta_map:
+            with open(outfile_attr_meta_map, 'wb') as f:
+                pickle.dump(attr_meta_map, f)
+
         # generate full code
         with ClassBlock(
             class_name='GenModel',
@@ -499,6 +507,7 @@ class ModuleCodeGen(FuncEmission):
 
             if as_parallel_module:
                 cb.insert_body(f'rank = {device}')  # save rank in class level
+                cb.insert_body(f'world_size = {self.runtime_ndevs}')  # save world size in class level
                 # async_op, max_bucket_size_bytes and zero_use_reduce_scatter
                 # parameters are for testing purpose
                 # and will not expose to user
@@ -653,7 +662,7 @@ class ModuleCodeGen(FuncEmission):
             self.model_init_statements.append(code)
         self.model_init_statements.append(' ')
 
-    def init_attributes(self, node: IRCell):
+    def init_attributes(self, node: IRCell) -> dict[str, dict[str, Any]]:
         """
         Emit tensor declaration code
 
@@ -662,10 +671,18 @@ class ModuleCodeGen(FuncEmission):
 
         This method also populates `self.symbols : SymbolTable` to record
         the names of the variables for the tensors ever encountered.
+
+        Returns:
+            dict[str, dict[str, Any]]: A mapping of tensor names to their attributes.
         """
+        attr_meta_map = {}
+        self._init_attributes(node, attr_meta_map)
+        return attr_meta_map
+
+    def _init_attributes(self, node: IRCell, attr_meta_map: Dict[str, Any]):
         psign = "self.register_parameter('{name}', torch.nn.Parameter(torch.empty({shape}, dtype={dtype})))"
         bsign = "self.register_buffer('{name}', torch.empty({shape}, dtype={dtype}), persistent={persistent})"
-        map_sign = "self.add_full_map('{attr}', {tid}, {is_param}, '{orig_name}', {full_shape}, {slicers}, {val_chunks})"
+        map_sign = "self.add_full_map('{attr}', {tid}, {is_param}, '{orig_name}', {shape}, {slicers}, {val_chunks})"
         if not isinstance(node, IRSegment):
             for itensor in node.inputs():
                 name = self.tensor_name(itensor, prefix_attr='self.')
@@ -693,14 +710,24 @@ class ModuleCodeGen(FuncEmission):
                             assert len(slicers) == 1 and slicers[0] == slice(0, 1), f"Unexpected slicers {slicers} for scalar tensor."
                             slicers = '...'  # Ellipsis slicer for scalar tensor, x[...] is equivalent to x
                         val_chunks = itensor.valmap[1]
-                        code = map_sign.format(
-                            attr=self.tensor_name(itensor),
+                        attr_name = self.tensor_name(itensor)
+                        attr_props = dict(
                             tid=itensor.parent.tid,
                             is_param=itensor.is_param(),
                             orig_name=itensor.parent.name,
-                            full_shape=tuple(itensor.parent.origin_shape),
-                            slicers=str(slicers),
-                            val_chunks=val_chunks
+                            shape=tuple(itensor.parent.origin_shape), # full tensor shape
+                            slicers=slicers,
+                            val_chunks=val_chunks,
+                        )
+                        attr_meta_map[attr_name] = dict(
+                            **attr_props,
+                            dtype=itensor.dtype,
+                            sub_shape=tuple(itensor.shape)
+                        )
+
+                        code = map_sign.format(
+                            attr=attr_name,
+                            **attr_props
                         )
                         self.model_init_statements.append(code)
                         self.model_init_statements.append('')
@@ -712,7 +739,7 @@ class ModuleCodeGen(FuncEmission):
                 self.symbols.create(self.tensor_name(output, prefix_attr='self.'))
         else:
             for sub_node in node.nodes():
-                self.init_attributes(sub_node)
+                self._init_attributes(sub_node, attr_meta_map)
         return
 
     def init_reducer(self,

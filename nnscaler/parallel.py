@@ -557,6 +557,10 @@ def _prepare_and_check_reusable(
     if reuse == ReuseType.MATCH or reuse == ReuseType.MOO:
         # check if the module is already generated
         expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
+        expected_output_files.extend([
+            outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
+            for rank in range(compute_config.runtime_ngpus)
+        ])
         expected_output_files.extend(trace_meta_files)
         expected_output_files.append(config_file)
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
@@ -840,12 +844,14 @@ def _gencode(
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
     for rank in range(compute_config.runtime_ngpus):
         fname = outdir / _GENCODE_FILE_TEMPLATE.format(rank)
+        attr_meta_map_fname = outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
         mgener.gen(rank,
             forward_args=forward_args,
             outfile=fname,
             attach=False,
             as_parallel_module=True,
-            end2end_mode=compute_config.use_end2end
+            end2end_mode=compute_config.use_end2end,
+            outfile_attr_meta_map=attr_meta_map_fname
         )
         # generate temporal schedule code only for end2end module
         # because the code generated is wrong for non-end2end module.
@@ -1979,7 +1985,7 @@ def load_merged_state_dict(
             else:
                 # NNPN<[P]PP>N: the current parallel module
                 # parallel module
-                pm_param_count = len(pm_modules[pm_cur]._orign_module_metadata.origin_param_names)
+                pm_param_count = len(pm_modules[pm_cur].origin_module_metadata.origin_param_names)
                 # will map `pm_param_count` parameters in merge state dict
                 # to `pm_locs[pm_cur].count` in optimizer state.
                 cur_states = {}
@@ -2011,7 +2017,7 @@ def _opt_load_merged_state_dict(module: ParallelModule, states: Dict[int, Dict[s
         # orig_name -> state
         orig_param_dict: Dict[str, Dict[str, Any]] = {}
         cnt = 0
-        origin_param_names = module._orign_module_metadata.origin_param_names
+        origin_param_names = module.origin_module_metadata.origin_param_names
         for name in origin_param_names:
             if cnt in states:  # some parameters may not in the sates when it is not used or requires_grad is False in training
                 orig_param_dict[name] = states[cnt]
@@ -2275,11 +2281,21 @@ def _broadcast_gen_files(
     torch.distributed.barrier()
 
 
-def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Dict[str, Any]:
+def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Tuple[
+    Dict[int, Dict[str, Dict[str, AttrMeta]]],
+    int,
+    Dict[int, Dict[str, Dict[str, AttrMeta]]]
+]:
     """
     A helper function that computes the deduplicated attribute information from all ranks.
     Note that this function may be removed in the future and dedup information are computed
     directly at the compilation stage.
+
+    Returns:
+        A tuple containing:
+            - rank2deduped_fullmap: a mapping from rank id to deduplicated attribute information
+            - dedup_group_size: the size of the deduplication group
+            - global_fullmaps: a mapping from rank id to full attribute information
     """
     dedup_group_size = None
     for prefix, parallel_module in parallel_modules.items():
@@ -2291,27 +2307,23 @@ def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Dict[str
     dedup_group_size = dedup_group_size or 1
 
     world_size = torch.distributed.get_world_size()
-    local_fullmaps = {prefix: m.fullmap for prefix, m in parallel_modules.items()}
-    local_tensor_meta = dict()
-    for prefix, m in parallel_modules.items():
-        module_meta = {}
-        for local_name in m.fullmap.keys():
-            assert hasattr(m, local_name), f'Module {prefix} does not have attribute {local_name}'
-            tensor = getattr(m, local_name)
-            module_meta[local_name] = (tuple(tensor.shape), tensor.dtype)
-        local_tensor_meta[prefix] = module_meta
-    global_fullmaps = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(global_fullmaps, local_fullmaps)
+    global_fullmaps: Dict[
+        int, # rank id
+        Dict[str, # submodule prefix
+            Dict[str, # attribute name in parallel module
+                AttrMeta]]
+    ] = {}
+    for rank in range(world_size):
+        global_fullmaps[rank] = {}
+        for prefix, m in parallel_modules.items():
+            global_fullmaps[rank][prefix] = m.get_attr_meta_map(rank)
     # `dedup_attrs` is a deterministic algorithm, so it produces same results across different ranks
-    rank2deduped_fullmap = dedup_attrs(OrderedDict(list(enumerate(global_fullmaps))))
-    global_tensor_meta = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(global_tensor_meta, local_tensor_meta)
-    global_tensor_meta = OrderedDict(list(enumerate(global_tensor_meta)))
+    rank2deduped_fullmap = dedup_attrs(global_fullmaps)
 
     for rank in range(dedup_group_size, world_size):
         assert len(rank2deduped_fullmap[rank]) == 0, f'Rank {rank} has non-empty deduped_fullmap: {rank2deduped_fullmap[rank]}'
 
-    return rank2deduped_fullmap, dedup_group_size, global_tensor_meta
+    return rank2deduped_fullmap, dedup_group_size, global_fullmaps
 
 
 @torch.no_grad()
@@ -2423,7 +2435,8 @@ def load_deduped_state_dict(
                     key = f'{prefix}.{local_name}' if prefix else local_name
                     assert prefix in parallel_modules, f'prefix {prefix} not found in parallel_modules: {list(parallel_modules.keys())}'
                     pm = parallel_modules[prefix]
-                    shape, dtype = global_tensor_meta[rank][prefix][local_name]
+                    attr_meta = global_tensor_meta[rank][prefix][local_name]
+                    shape, dtype = attr_meta.sub_shape, attr_meta.dtype
                     if rank == cur_rank:
                         assert hasattr(pm, local_name), f'local_name {local_name} not found in {pm}'
                         broadcast_tensor = getattr(pm, local_name)
