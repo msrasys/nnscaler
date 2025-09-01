@@ -32,6 +32,7 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
         # forward __init__ call to the next class in mro(method resolution order)
         super().__init__(*args, **kwargs)
         self._multiply_factor = 1.0
+        self._fp32_params_loaded = False
 
     def after_setup(self, trainer: 'Trainer') -> None:
         """
@@ -117,9 +118,9 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
 
         if len(self.param_groups) != 1:
             raise RuntimeError('only support one param group')
-        self.param_groups[0]['params'] = self.fp32_params
 
         super().load_state_dict(state_dict)
+        self._fp32_params_loaded = True
 
     def _sync_f16_grads_to_fp32(self):
         # copy FP16 grads to FP32
@@ -150,6 +151,11 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
             if not p.requires_grad:
                 continue
             p32.data.copy_(p.data)
+
+    def after_load_checkpoint(self, trainer, checkpoint) -> None:
+        if not self._fp32_params_loaded:
+            logger.info('fp32_params not loaded, will sync from fp16 params to fp32 params')
+            self._sync_fp16_params_to_fp32()
 
     def overrided_scale_grads(self, scale: float):
         """
