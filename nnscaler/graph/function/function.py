@@ -1821,7 +1821,7 @@ def CubeStack(*tensors, dim=0, signature=None):
     assert isinstance(dim, int), f"but not {dim}"
     signature = 'nnscaler.runtime.function.stack'
     iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
-    if tensors[0].is_scalar_tensor:
+    if tensors[0].is_scalar_tensor():
         oanno = [f'{len(tensors)}^']
     else:
         oanno = [None for i in range(len(tensors[0].shape) + 1)]
