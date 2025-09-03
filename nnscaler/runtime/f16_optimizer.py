@@ -156,6 +156,7 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
         if not self._fp32_params_loaded:
             logger.info('fp32_params not loaded, will sync from fp16 params to fp32 params')
             self._sync_fp16_params_to_fp32()
+            self._fp32_params_loaded = True
 
     def overrided_scale_grads(self, scale: float):
         """
