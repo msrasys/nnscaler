@@ -32,6 +32,9 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
         # forward __init__ call to the next class in mro(method resolution order)
         super().__init__(*args, **kwargs)
         self._multiply_factor = 1.0
+        # This flag is used to indicate whether fp32_params are loaded from checkpoint.
+        # If not, we will sync from fp16 params to fp32 params in after_load_checkpoint.
+        # If the model is trained from scratch, this flag will always be False.
         self._fp32_params_loaded = False
 
     def after_setup(self, trainer: 'Trainer') -> None:
