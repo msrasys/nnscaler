@@ -150,6 +150,16 @@ def Accum(*inputs, signature = None):
     return IRDimops(Cat, 'accum', signature, [anno], inputs)
 
 
+def Dot(input, tensor, *, out=None, signature = None):
+    """
+    torch.dot(input, tensor, *, out=None) -> Tensor
+    """
+    assert out is None
+    signature = 'torch.dot'
+    annos = ['k+, k+ -> 1',]
+    return IRDimops(Dot, 'dot', signature, annos, [input, tensor])
+
+
 def Linear(input, weight, bias=None, signature = None):
     signature = 'torch.nn.functional.linear'
     assert isinstance(input, IRTensor) and isinstance(weight, IRTensor)
@@ -194,6 +204,7 @@ def CubeEinSum(*operands, equation=None, signature = None):
             lhs = lhs.replace(dim, f'{dim}+')
     anno = f'{lhs} -> {rhs}'
     return IRDimops(CubeEinSum, 'einsum', signature, [anno], operands, equation=equation)
+
 
 def EinSum(equation: str, *operands, signature = None):
     return CubeEinSum(*operands, equation=equation, signature=signature)
@@ -1809,14 +1820,18 @@ def CubeStack(*tensors, dim=0, signature=None):
     assert all(isinstance(tensor, IRTensor) for tensor in tensors), f'but got {tensors}'
     assert isinstance(dim, int), f"but not {dim}"
     signature = 'nnscaler.runtime.function.stack'
-    iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
-    oanno = [None for i in range(len(tensors[0].shape) + 1)]
-    oanno[dim] = f'{len(tensors)}^'
-    offset = 0
-    for i in range(len(oanno)):
-        if oanno[i] is None:
-            oanno[i] = copy.copy(iannos[-1][offset])
-            offset += 1
+    if tensors[0].is_scalar_tensor():
+        iannos = ['1' for _ in tensors]
+        oanno = [f'{len(tensors)}']
+    else:
+        iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
+        oanno = [None for i in range(len(tensors[0].shape) + 1)]
+        oanno[dim] = f'{len(tensors)}'
+        offset = 0
+        for i in range(len(oanno)):
+            if oanno[i] is None:
+                oanno[i] = copy.copy(iannos[-1][offset])
+                offset += 1
     anno = OpAnno.create_op_str(iannos, [oanno])
     return IRDimops(CubeStack, 'stack', signature, [anno], tensors, dim=dim)
 
