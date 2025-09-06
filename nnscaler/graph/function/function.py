@@ -1820,12 +1820,13 @@ def CubeStack(*tensors, dim=0, signature=None):
     assert all(isinstance(tensor, IRTensor) for tensor in tensors), f'but got {tensors}'
     assert isinstance(dim, int), f"but not {dim}"
     signature = 'nnscaler.runtime.function.stack'
-    iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
     if tensors[0].is_scalar_tensor():
-        oanno = [f'{len(tensors)}^']
+        iannos = ['1' for _ in tensors]
+        oanno = [f'{len(tensors)}']
     else:
+        iannos = [ShapeAnno.create_shape_str(t.shape) for t in tensors]
         oanno = [None for i in range(len(tensors[0].shape) + 1)]
-        oanno[dim] = f'{len(tensors)}^'
+        oanno[dim] = f'{len(tensors)}'
         offset = 0
         for i in range(len(oanno)):
             if oanno[i] is None:
