@@ -614,7 +614,7 @@ def trainer_grad_sync_check(save_dir, use_bf16, zero_ngroups, runtime_ngpus):
     torch.distributed.barrier()
 
 
-def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False):
+def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False, hybrid_opt=False):
     save_dir = Path(save_dir)
     config_path = str(Path(__file__).with_name('trainer_args.yaml').resolve())
     gen_savedir = save_dir / 'gen'
@@ -680,6 +680,47 @@ def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False):
     else:
         raise ValueError(f'parallel_type {parallel_type} is not supported')
 
+
+    def param_clss_fn(param_name: str) -> tuple[int, int]:
+        """
+        Classify a parameter name into an optimizer index and a parameter group index.
+        """
+        if 'mlp0.' in param_name:
+            return 0, 0
+        elif 'mlp1.' in param_name:
+            return 0, 1
+        else:
+            return 1, 0
+
+    optimizer_config = {
+        'type': 'nnscaler.HybridOptimizer',
+        'args': {
+            'param_clss_fn': param_clss_fn,
+            'config': {
+                'optimizers':[
+                    {
+                        'type': torch.optim.Adam,
+                        'options': {
+                            'lr': 0.01,
+                        },
+                        'param_groups': [
+                            {},
+                            {}
+                        ],
+                    },{
+                        'type': torch.optim.Adam,
+                        'options': {
+                            'lr': 0.01
+                        }
+                    }
+                ]
+            }
+        }
+    }
+
+    if hybrid_opt:
+        additional_args.extend(['--optimizer!', '--optimizer', optimizer_config])
+
     # train 4 epcho in one time
     trainer = Trainer([
         '-f', config_path,
@@ -716,9 +757,10 @@ def trainer_correctness_worker(save_dir, parallel_type=0, async_reducer=False):
 def trainer_correctness_worker_aggregate(tmp_path):
     for parallel_type in range(5):
         for async_reducer in [False, True]:
-            print(f'parallel_type={parallel_type}, async_reducer={async_reducer}')
-            save_dir = tmp_path/f'{parallel_type}-{async_reducer}'
-            trainer_correctness_worker(save_dir, parallel_type, async_reducer)
+            for hybrid_opt in [True, False]:
+                print(f'parallel_type={parallel_type}, async_reducer={async_reducer}, hybrid_opt={hybrid_opt}')
+                save_dir = tmp_path/f'{parallel_type}-{async_reducer}-{hybrid_opt}'
+                trainer_correctness_worker(save_dir, parallel_type, async_reducer, hybrid_opt)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of gpu devices')
@@ -727,19 +769,28 @@ def test_trainer_correctness(tmp_path):
     merged_ckpts = {}
     for parallel_type in range(5):
         for async_reducer in [False, True]:
-            save_dir = tmp_path/f'{parallel_type}-{async_reducer}'
-            merged_ckpts[(parallel_type, async_reducer)] = torch.load(save_dir/'merged.pt')
+            for hybrid_opt in [True, False]:
+                save_dir = tmp_path/f'{parallel_type}-{async_reducer}-{hybrid_opt}'
+                merged_ckpts[(parallel_type, async_reducer, hybrid_opt)] = torch.load(save_dir/'merged.pt')
 
     for parallel_type in range(5):
         for async_reducer in [False, True]:
-            assert_equal(
-                merged_ckpts[(parallel_type, async_reducer)]['model'],
-                merged_ckpts[(0, False)]['model']
-            )
-            assert_equal(
-                merged_ckpts[(parallel_type, async_reducer)]['optimizer'],
-                merged_ckpts[(0, False)]['optimizer']
-            )
+            for hybrid_opt in [True, False]:
+                assert_equal(
+                    merged_ckpts[(parallel_type, async_reducer, hybrid_opt)]['model'],
+                    merged_ckpts[(0, False, False)]['model']
+                )
+                if not hybrid_opt:
+                    assert_equal(
+                        merged_ckpts[(parallel_type, async_reducer, hybrid_opt)]['optimizer'],
+                        merged_ckpts[(0, False, False)]['optimizer']
+                    )
+                else:
+                    # param_groups are different when using hybrid optimizer.
+                    assert_equal(
+                        merged_ckpts[(parallel_type, async_reducer, hybrid_opt)]['optimizer']['state'],
+                        merged_ckpts[(0, False, False)]['optimizer']['state']
+                    )
 
 
 def tracing_from_weights_worker(tmp_path):

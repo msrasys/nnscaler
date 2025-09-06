@@ -186,7 +186,8 @@ test_tp2 = partial(torchrun, 2, assert_parity,
 # tensor parallelism + scale test
 test_tp2scale2 = partial(torchrun, 4, assert_parity,
     baseline,
-    partial(cube_run, 2, tp_policy)
+    partial(cube_run, 2, tp_policy),
+    0.001,
 )
 
 # pipeline parallelism test

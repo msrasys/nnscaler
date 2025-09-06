@@ -90,7 +90,7 @@ def _mem_worker():
         for param in p_module.parameters():
             size_to_free += get_tensor_bytesize(param)
 
-        p_module.offload_params()
+        p_module.sleep()
         torch.distributed.barrier()
         after_mem = torch.cuda.memory_allocated()
         print(f"Memory before offload: {before_mem}, after offload: {after_mem}, freed: {before_mem - after_mem}")
@@ -157,12 +157,12 @@ def _correctness_worker():
         optimizer2 = build_optimizer(p_module2, torch.optim.Adam, lr=0.01)
         
         # First offload to initialize the buffer_shape
-        p_module2.offload_params()
+        p_module2.sleep()
         
         results_offload = []
         for step, x in enumerate(test_data):
             # Load params at the beginning of each step
-            p_module2.load_params()
+            p_module2.wake_up()
             
             p_module2.train()
             output = p_module2(x)
@@ -179,7 +179,7 @@ def _correctness_worker():
             })
             
             # Offload params at the end of each step
-            p_module2.offload_params()
+            p_module2.sleep()
         
         torch.distributed.barrier()
         

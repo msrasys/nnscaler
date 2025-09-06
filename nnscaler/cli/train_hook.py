@@ -333,3 +333,31 @@ class AggregatedTrainHook(TrainHook):
     def on_save_checkpoint(self, trainer: 'Trainer', checkpoint: Dict[str, Any]) -> None:
         for hook in self.hooks:
             hook.on_save_checkpoint(trainer, checkpoint)
+
+
+class TrainHookHost:
+    def _get_hook_objects(self) -> List[Any]:
+        """
+        Return a list of objects that can be hooks (but not necessarily hooks)
+        """
+        ...
+
+    def get_hooks(self) -> List[TrainHook]:
+        """
+        Return a list of TrainHook objects
+        """
+        hooks = {}
+        visited = set()
+        def _get_hooks(obj):
+            if id(obj) in visited:
+                return
+            visited.add(id(obj))
+
+            if isinstance(obj, TrainHook):
+                hooks[id(obj)] = obj
+            if isinstance(obj, TrainHookHost):
+                for o in obj._get_hook_objects():
+                    _get_hooks(o)
+
+        _get_hooks(self)
+        return list(hooks.values())

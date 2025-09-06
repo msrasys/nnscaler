@@ -1,17 +1,21 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union
+import pickle
+from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union, ClassVar
+from typing_extensions import Self
 import logging
 import os
 import sys
 import gc
+import warnings
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 
 import torch
 import torch.distributed as dist
+from torch import device
 
 from nnscaler.graph.parser import FxModuleParser
 
@@ -23,7 +27,7 @@ from nnscaler.runtime.utils import microbatches
 
 from nnscaler import __version__ as runtime_version
 from nnscaler.flags import CompileFlag
-from nnscaler.utils import accum_mode
+from nnscaler.utils import accum_mode, classproperty
 
 if TYPE_CHECKING:
     from nnscaler.parallel import ComputeConfig
@@ -47,6 +51,11 @@ class AttrMeta:
     # the number of the partitioned values, usually 1
     # (i.e., no partition on value -> no need to sum up)
     val_chunks: int
+    # data type of the full tensor and sub tensor
+    dtype: torch.dtype
+    # shape of the sub tensor
+    # it should be the shape of full_tensor[slicers]
+    sub_shape: Tuple[int, ...]
 
 
 def dedup_attrs(rank2attr_area_map: Dict[int, Dict[str, Dict[str, AttrMeta]]]) -> Dict[int, Dict[str, Dict[str, AttrMeta]]]:
@@ -210,14 +219,29 @@ class CubeModule(torch.nn.Module):
 
     def parameters_for_optimizer(self) -> List[torch.nn.Parameter]:
         """Get parameter list for optimizer"""
-        params = []
+        return list(self.get_opt_params().keys())
+
+    def get_opt_params(self, prefix='', classify_param_cls_fn: Callable[[str], Any]=None) -> dict[torch.nn.Parameter, Any]:
+        """
+        Get all parameters and their classifications
+
+        Args:
+            prefix (str): The prefix of this module,
+                which will be used to generate full names of parameters and further classify them.
+            classify_param_cls_fn (Callable[[str], Any], optional): A function to classify parameters by name.
+
+        Returns:
+            dict[torch.nn.Parameter, Any]: A dictionary mapping parameters to their classifications.
+
+        """
+        params = {}
         reducer_pids = set()
         for reducer in self._reducers:
-            params += reducer.parameters_for_optimizer()
+            params.update(reducer.get_opt_params())
             reducer_pids.update(id(p) for p in reducer.params)
-        for param in self.parameters():
+        for name, param in self.named_parameters(prefix):
             if id(param) not in reducer_pids:
-                params.append(param)
+                params[param] = classify_param_cls_fn(name) if classify_param_cls_fn else None
         # print(f'> get out parameters: {sum(p.numel() for p in params)}')
         return params
 
@@ -295,7 +319,8 @@ class CubeModule(torch.nn.Module):
             val_chunks int: the number of value chunks.
         """
         assert hasattr(self, attr), f"{attr} is not in the module"
-        meta = AttrMeta(tid, is_param, orig_name, shape, slicers, val_chunks)
+        attr_tensor: torch.Tensor = getattr(self, attr)
+        meta = AttrMeta(tid, is_param, orig_name, shape, slicers, val_chunks, attr_tensor.dtype, tuple(attr_tensor.shape))
         self._fullmap[attr] = meta
 
     # TODO: remove this function, use the property instead
@@ -348,7 +373,7 @@ class CubeModule(torch.nn.Module):
         # backward compatibility
         # in old version, dist_param_map is not loaded in constructor
         # so we will try to load it from file on the fly.
-        dist_param_map = getattr(self, '_dist_param_map', None)
+        dist_param_map = getattr(self, 'dist_param_map', None)
         if not dist_param_map:
             module_file = Path(sys.modules[self.__module__].__file__)
             # load from the same directory as the module file
@@ -736,7 +761,11 @@ class CubeModule(torch.nn.Module):
                     'optim_state_dict': merged_optimizer_state_dict
                     }, filename_prefix + '.full.ckpt')
 
-    def offload_params(self):
+    def sleep(self):
+        """
+        Move attributes (buffer and param) to cpu and release contiguous buffer in reducers. Different from
+        nn.Module's cpu() method, references to attributes are unchanged.
+        """
         for name, param in self.named_parameters():
             assert param.grad is None, f'expect {name} with shape {param.shape} has no grad'
 
@@ -752,17 +781,31 @@ class CubeModule(torch.nn.Module):
             param.data = param.data.to(cpu)
 
         for reducer in self._reducers:
-            reducer.release_mem()
+            reducer.sleep()
 
         gc.collect()
         torch.cuda.empty_cache()
+        return self
 
-    def load_params(self):
+    def wake_up(self, device: Optional[Union[int, device]] = None) -> Self:
+        """
+        Move attributes (buffer and param) back to gpu and reallocate memories in reducers. It is a reverse
+        operation of `self.sleep()`.
+        """
+        gpu = torch.cuda.current_device()
+        if device is not None:
+            if isinstance(device, int):
+                index = device
+            elif isinstance(device, torch.device):
+                index = device.index
+            else:
+                raise RuntimeError(f'unexpected device type {type(device)}')
+            assert gpu == index, f'nnscaler module does not support cross gpu transport, expect {gpu} but got {index}'
+
         for name, param in self.named_parameters():
             assert param.grad is None, f'expect {name} with shape {param.shape} has no grad'
 
         # we want attribute references are unchanged, so super().gpu() is not used here
-        gpu = torch.cuda.current_device()
         for buffer in self.buffers():
             buffer.data = buffer.data.to(gpu)
 
@@ -770,10 +813,48 @@ class CubeModule(torch.nn.Module):
             param.data = param.data.to(gpu)
 
         for reducer in self._reducers:
-            reducer.resume_mem()
+            reducer.wake_up()
 
         gc.collect()
         torch.cuda.empty_cache()
+        return self
+
+    def to(self, *args, **kwargs):
+        """
+        Override nn.Module's to function, currently we only allow transfer data from host and device
+
+        Args:
+            device (:class:`torch.device`): the desired device of the parameters
+                and buffers in this module
+            dtype (:class:`torch.dtype`): the desired floating point or complex dtype of
+                the parameters and buffers in this module
+            tensor (torch.Tensor): Tensor whose dtype and device are the desired
+                dtype and device for all parameters and buffers in this module
+            memory_format (:class:`torch.memory_format`): the desired memory
+                format for 4D parameters and buffers in this module (keyword
+                only argument)
+
+        Returns:
+            Module: self
+        """
+        device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(
+            *args, **kwargs
+        )
+        if dtype is not None:
+            raise ValueError(f'nnscaler does not support passing dtype {dtype} to to()')
+        if convert_to_format is not None:
+            raise ValueError(f'nnscaler does not support passing convert_to_format {convert_to_format} to to()')
+        if non_blocking is not None:
+            warnings.warn(f'nnscaler moves tensors in a blocking approach currently')
+
+        # after _parse_to `device` must in type of torch.device
+        if device.type == 'cpu':
+            return self.cpu()
+        elif device.type == 'cuda':
+            return self.cuda(device)
+        else:
+            raise ValueError(f'unsupported device type {device}')
+
 
 @dataclass
 class OriginModuleMetadata:
@@ -821,10 +902,27 @@ class ParallelModule(CubeModule):
     COMPUTE_CONFIG_FILE = 'compute_config.pt'
     ORIGIN_MODULE_METADATA_FILE = 'origin_module_metadata.pt'
     EXTRA_STATE_KEY = 'CUBE_EXTRA_STATE'
+    ATTR_META_FILE_PREFIX = 'attr_meta'
+    ATTR_META_FILE_TEMPLATE = ATTR_META_FILE_PREFIX + '{}.pkl'  # 'attr_meta{}.pkl'
+
     # the rank of the module, will be assigned in the generated subclasses
     rank: int
+    # the world size to run this module, will be assigned in the generated subclasses
+    world_size: int
     # the runtime version of the module when it is generated, will be assigned in the generated subclasses
     runtime_version: str
+    # mapping from the name of local attribute tensor
+    # to its corresponding fulltensor meta for all ranks.
+    # it is a list of dictionaries mapping from attribute names to their metadata
+    # and it is a replacement of `CubeModule.fullmap`
+    attr_meta_maps: list[dict[str, AttrMeta]]
+    # the directory of the module located
+    module_dir: Path
+    # The map is a dict mapping from the new parameter name (without tid suffix) in parallel module
+    # to the parameter name in original module.
+    dist_param_map: dict[str, str]
+    compute_config: 'ComputeConfig'
+    origin_module_metadata: OriginModuleMetadata
 
     def __init__(self):
         if self.__class__  == ParallelModule:  # not init via super().__init__()
@@ -847,6 +945,27 @@ class ParallelModule(CubeModule):
         # track whether all the parames (especially the non-persistent buffers) have been initialized
         self._non_presistent_buffers_inited = False
 
+    def __init_subclass__(cls, **kwargs):
+        from nnscaler.parallel import ComputeConfig
+
+        super().__init_subclass__(**kwargs)
+        cls.attr_meta_maps = []
+        cls.module_dir = Path(sys.modules[cls.__module__].__file__).parent
+
+        for rank in range(cls.world_size):
+            attr_map_file = cls.module_dir / cls.ATTR_META_FILE_TEMPLATE.format(rank)
+            with open(attr_map_file, 'rb') as f:
+                attr_meta_map = pickle.load(f)
+                attr_meta_map = {attr: AttrMeta(**meta) for attr, meta in attr_meta_map.items()}
+                cls.attr_meta_maps.append(attr_meta_map)
+
+        cls.dist_param_map = torch.load(cls.module_dir / FxModuleParser.ATTR_MAP_FILE, weights_only=False)
+        cls.compute_config = ComputeConfig.safe_load_from_file(
+            cls.module_dir / cls.COMPUTE_CONFIG_FILE,
+            return_none_on_error=False
+        )
+        cls.origin_module_metadata = torch.load(cls.module_dir / cls.ORIGIN_MODULE_METADATA_FILE, weights_only=False)
+
     @property
     def non_presistent_buffers_inited(self):
         return self._non_presistent_buffers_inited
@@ -868,12 +987,14 @@ class ParallelModule(CubeModule):
             else:
                 _logger.warning(_non_persistent_buffers_load_warning)
 
-    def _post_init(self, init_params=True):
+    def _post_init(self, init_params=True, build_buckets=True):
         """
         This is post init function to further initialize the model. Should be called by subclass's __init__().
 
         Args:
             init_params (bool): whether to load model init parameters. Default True.
+            build_buckets (bool): whether to build buckets for the model. Default True.
+                If it is False, you must manually call `build_buckets()` later before use this module.
         """
         # Here we check the rank to load the module file name
         # Current we don't check rank when we are not in distributed mode
@@ -881,27 +1002,13 @@ class ParallelModule(CubeModule):
         # TODO: re-enable this check
         # if dist.is_initialized() and self.rank != dist.get_rank():
         #     raise RuntimeError(f"The rank to load this module file name is expected to be {self._rank}, but got {dist.get_rank()}")
-        from nnscaler.parallel import ComputeConfig
 
         self._non_presistent_buffers_inited = init_params or not self._non_persistent_buffers_set
         module_file = Path(sys.modules[self.__module__].__file__)
-        self.module_dir = module_file.parent
         if init_params:
             self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
 
         self._warn_uninitialized_non_persistent_buffers()
-
-        self._dist_param_map = torch.load(module_file.with_name(f"{FxModuleParser.ATTR_MAP_FILE}"), weights_only=False)
-        self._compute_config: ComputeConfig = ComputeConfig.safe_load_from_file(
-            module_file.with_name(f"{self.COMPUTE_CONFIG_FILE}"),
-            return_none_on_error=False
-        )
-        self._orign_module_metadata: OriginModuleMetadata = torch.load(module_file.with_name(f"{self.ORIGIN_MODULE_METADATA_FILE}"), weights_only=False)
-
-        for reducer in self.reducers:
-            reducer.build_buckets()
-
-        self._zero_metadata = self._get_zero_metadata()
 
         # add state_dict hook to save extra state
         # Please note extra_state is only used for merging, not for loading
@@ -909,6 +1016,42 @@ class ParallelModule(CubeModule):
         self._register_state_dict_hook(ParallelModule._post_state_dict_hook)
         # add load_state_dict pre hook to pop extra state to prevent warning
         self._register_load_state_dict_pre_hook(ParallelModule._pre_load_state_dict_hook, with_module=True)
+
+        if build_buckets:
+            self.build_buckets()
+
+    def build_buckets(self, param_clss: Optional[dict[torch.nn.Parameter, Any]]=None):
+        """
+        Build buckets for the model reducers.
+
+        You can call this method multiple times to rebuild the buckets.
+        Typically this will be called when building optimizer when multiple optimizers/param groups are used.
+        And we will put parameters with different optimizer or different param groups into different buckets.
+
+        Currently we have done an optimization to make sure this is only called once even for hybrid optimizers
+        by
+        1. setting `build_buckets=False` when calling constructor in `nnscaler.parallelize`.
+        2. manually calling `build_buckets()` later in `nnscaler.build_optimizer`
+        """
+        for reducer in self.reducers:
+            reducer.build_buckets(param_clss)
+
+        self._zero_metadata = self._get_zero_metadata()
+
+    @classmethod
+    def get_attr_meta_map(cls, rank=None):
+        """
+        Get the attribute meta map for the given rank.
+        If rank is None, return the attribute map for the current rank.
+
+        This function is preferred over accessing `CubeModule.fullmap` in most cases,
+        since it doesn't need to instantiate the module.
+        """
+        if rank is None:
+            rank = cls.rank
+        if rank < 0 or rank >= cls.world_size:
+            raise ValueError(f"Rank {rank} is out of range [0, {cls.world_size})")
+        return cls.attr_meta_maps[rank]
 
     def forward(self, *args, **kwargs):
         self._warn_uninitialized_non_persistent_buffers(raise_error=True)
@@ -1071,19 +1214,6 @@ class ParallelModule(CubeModule):
                 outputs.append(output)
             return outputs
 
-    @property
-    def dist_param_map(self) -> Dict[str, str]:
-        """
-        Get the parameter map of the model.
-        The map is a dict mapping from the new parameter name (without tid suffix) in parallel module
-            to the parameter name in original module.
-        """
-        return self._dist_param_map
-
-    @property
-    def compute_config(self) -> 'ComputeConfig':
-        return self._compute_config
-
     def clip_gnorm(self, max_norm: Optional[float] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Calculate the gradient norm and clip gradients.
@@ -1206,11 +1336,11 @@ class ParallelModule(CubeModule):
         state_dict[f'{prefix}{self.EXTRA_STATE_KEY}'] = asdict(
             ExtraState(
                 rank=self.rank,
-                compute_config=self._compute_config,
-                dist_param_map=self._dist_param_map,
+                compute_config=self.compute_config,
+                dist_param_map=self.dist_param_map,
                 param_area_map=self._fullmap,
                 cube_param_names=[name for name, _ in self.named_parameters()],
-                **asdict(self._orign_module_metadata),
+                **asdict(self.origin_module_metadata),
                 **asdict(self._zero_metadata),
             )
         )
@@ -1246,19 +1376,19 @@ class ParallelModule(CubeModule):
             if strict:
                 missing_keys.extend(new_missing_keys)
 
-    @property
-    def module_dedup_group_size(self) -> int:
+    @classproperty
+    def module_dedup_group_size(cls) -> int:
         """
         Get the size of the deduplication group of the model state dict, which is `plan_ngpus`.
         """
-        return self.compute_config.module_dedup_group_size
+        return cls.compute_config.module_dedup_group_size
 
-    @property
-    def optimizer_dedup_group_size(self) -> int:
+    @classproperty
+    def optimizer_dedup_group_size(cls) -> int:
         """
         Get the size of the deduplication group of the optimizer state dict.
         """
-        return self.compute_config.optimizer_dedup_group_size
+        return cls.compute_config.optimizer_dedup_group_size
 
     def _list_fullmodel_files(self) -> List[Path]:
         legacy_fullmodel_path = self.module_dir / FxModuleParser.ATTR_CONTENT_FILE_STEM

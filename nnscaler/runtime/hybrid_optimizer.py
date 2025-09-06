@@ -1,0 +1,299 @@
+#  Copyright (c) Microsoft Corporation.
+#  Licensed under the MIT License.
+
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Type, Union
+
+import torch
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
+from torch.utils.hooks import RemovableHandle
+
+from nnscaler.cli.arg_parser import deserialize_dataclass
+from nnscaler.cli.train_hook import TrainHookHost, TrainHook
+from nnscaler.utils import fn_field, OptStateDict
+
+
+@dataclass
+class HybridSubOptParamGroupConfig:
+    options: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HybridSubOptConfig:
+    type: Union[Type[Optimizer], Callable[..., Optimizer]] = fn_field(default=None)
+    options: dict[str, Any] = field(default_factory=dict)
+    param_groups: list[HybridSubOptParamGroupConfig] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.type:
+            raise ValueError("Optimizer type must be specified in HybridSubOptConfig")
+
+
+@dataclass
+class HybridOptConfig:
+    optimizers: list[HybridSubOptConfig] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.optimizers:
+            raise ValueError("At least one optimizer must be specified in HybridOptConfig")
+
+
+class HybridRemovableHandle:
+    def __init__(self, removable_handles: list[RemovableHandle]):
+        self.removable_handles = removable_handles
+
+    def remove(self):
+        for removable_handle in self.removable_handles:
+            removable_handle.remove()
+
+    def __enter__(self) -> "HybridRemovableHandle":
+        return self
+
+    def __exit__(self, type: Any, value: Any, tb: Any) -> None:
+        self.remove()
+
+
+class HybridOptimizer(torch.optim.Optimizer, TrainHookHost):
+    """
+    A hybrid optimizer that combines multiple optimizers/multiple param groups
+    into a single optimizer.
+
+    Please note HybridOptimizer doesn't call super().__init__(),
+    So it is actually a duck type for optimizer.
+    """
+
+    # Identifier for hybrid optimizer
+    is_hybrid = True
+
+    def __init__(
+            self,
+            params: Iterable[torch.nn.Parameter],
+            param_clss: dict[torch.nn.Parameter, tuple[int, int]],
+            config: Union[HybridOptConfig, dict[str, Any]]
+    ):
+        """
+        Initialize the hybrid optimizer.
+
+        Args:
+            params (Iterable[torch.nn.Parameter]): The parameters to optimize.
+            param_clss (dict[torch.nn.Parameter, tuple[int, int]]): The parameter classes for each parameter.
+                Please replace this argument with `param_clss_fn` (Callable[[str], tuple[int, int]])
+                when you use creating it with `nnscaler.build_optimizer` (including cli trainer).
+            config (Union[HybridOptConfig, dict[str, Any]]): The configuration for the hybrid optimizer.
+        """
+        params = list(params)
+        if isinstance(config, dict):
+            config = deserialize_dataclass(config, HybridOptConfig)
+        self.config = config
+
+        self.optimizers = []
+        classified_params = defaultdict(list)
+        # map from (optimizer_idx, pg_idx, param_pg_idx) to param global param index
+        param_loc = {}
+
+        for idx, param in enumerate(params):
+            param_cls = param_clss[param]
+            assert param_cls[0] < len(self.config.optimizers)
+            classified_params[param_cls].append(param)
+
+            loc = *param_cls, len(classified_params[param_cls]) - 1
+            param_loc[loc] = idx
+
+        # sort with key i.e. (optimizer idx, param group idx)
+        classified_params = dict(sorted(classified_params.items()))
+
+        quick_param_groups = {param_cls: {"params": params} for param_cls, params in classified_params.items()}
+        opt_param_groups = defaultdict(dict)
+        for param_cls, group in quick_param_groups.items():
+            opt_param_groups[param_cls[0]][param_cls[1]] = group
+
+        for idx, opt_config in enumerate(config.optimizers):
+            param_groups = opt_param_groups[idx]
+            if len(param_groups) > 1:
+                if len(param_groups) != len(opt_config.param_groups):
+                    raise ValueError(f"Expected {len(opt_config.param_groups)} param groups, got {len(param_groups)}")
+                # param group indices must be consecutive.
+                if max(param_groups.keys()) != len(opt_config.param_groups) - 1:
+                    raise ValueError(f"Param group indices must be consecutive. We have {len(opt_config.param_groups)} groups, got max group id {max(param_groups.keys())}")
+                for param_group_idx, param_group in param_groups.items():
+                    param_group.update(opt_config.param_groups[param_group_idx].options)
+            else:
+                if len(opt_config.param_groups) > 1:
+                    raise ValueError(f"Expected at most 1 param group, got {len(opt_config.param_groups)}")
+                if opt_config.param_groups:
+                    param_groups[0].update(opt_config.param_groups[0].options)
+            optimizer = opt_config.type(param_groups.values(), **opt_config.options)
+            self.optimizers.append(optimizer)
+
+        # map from param global index to (optimizer_idx, param_idx)
+        self._param_map: dict[int, tuple[int, int]] = {}
+        # map from (optimizer_idx, param_idx) to param global idx
+        self._reverse_param_map: dict[tuple[int, int], int] = {}
+        for opt_idx, optimizer in enumerate(self.optimizers):
+            state_dict: OptStateDict = optimizer.state_dict()
+            for pg_idx, pg in enumerate(state_dict['param_groups']):
+                for param_idx_in_pg, param_idx in enumerate(pg['params']):
+                    # param_idx_in_pg is the index in this param group
+                    # param_idx is the index in this optimizer
+                    global_idx = param_loc[(opt_idx, pg_idx, param_idx_in_pg)]
+                    self._param_map[global_idx] = (opt_idx, param_idx)
+                    self._reverse_param_map[(opt_idx, param_idx)] = global_idx
+
+        # Don't call base init
+        # So HybridOptimizer is a duck optimizer
+        # super().__init__(params, {})
+
+        # simulated param groups
+        self.param_groups = []
+        for optimizer in self.optimizers:
+            self.param_groups.extend(optimizer.param_groups)
+
+    def _get_hook_objects(self):
+        return self.optimizers
+
+    def step(self, closure=None):
+        """
+        Perform a single optimization step.
+        """
+        assert closure is None, "Closure is not supported in HybridOptimizer"
+        for optimizer in self.optimizers:
+            optimizer.step(closure)
+
+    def zero_grad(self, set_to_none: bool = False):
+        """
+        Zero the gradients of all optimizers.
+        """
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def __repr__(self) -> str:
+        format_string = self.__class__.__name__ + " [\n"
+        format_string += ",\n".join(f"{repr(opt)}" for opt in self.optimizers)
+        format_string += "\n]"
+        return format_string
+
+    def register_step_pre_hook(self, hook) -> HybridRemovableHandle:
+        return HybridRemovableHandle([opt.register_step_pre_hook(hook) for opt in self.optimizers])
+
+    def register_step_post_hook(self, hook) -> HybridRemovableHandle:
+        return HybridRemovableHandle([opt.register_step_post_hook(hook) for opt in self.optimizers])
+
+    def register_state_dict_pre_hook(
+        self, hook, prepend: bool = False
+    ) -> HybridRemovableHandle:
+        return HybridRemovableHandle([opt.register_state_dict_pre_hook(hook, prepend=prepend) for opt in self.optimizers])
+
+    def register_state_dict_post_hook(
+        self,
+        hook,
+        prepend: bool = False,
+    ) -> HybridRemovableHandle:
+        return HybridRemovableHandle([opt.register_state_dict_post_hook(hook, prepend=prepend) for opt in self.optimizers])
+
+    def state_dict(self):
+        state_dicts: list[OptStateDict] = [opt.state_dict() for opt in self.optimizers]
+        merged_state_dict: OptStateDict = {'state': {}, 'param_groups': [{'children': {}}]}
+
+        for opt_idx, sd in enumerate(state_dicts):
+            for param_idx, s in sd['state'].items():
+                merged_state_dict['state'][self._reverse_param_map[(opt_idx, param_idx)]] = s
+            merged_state_dict['param_groups'][0]['children'][opt_idx] = sd['param_groups']
+
+        merged_state_dict['param_groups'][0]['params'] = list(range(len(self._param_map)))
+        merged_state_dict['param_groups'][0]['param_map'] = self._param_map
+        merged_state_dict['param_groups'][0]['reverse_param_map'] = self._reverse_param_map
+        merged_state_dict['state'] = dict(sorted(merged_state_dict['state'].items()))
+
+        return merged_state_dict
+
+    def register_load_state_dict_pre_hook(
+        self,
+        hook,
+        prepend: bool = False,
+    ) -> HybridRemovableHandle:
+        return HybridRemovableHandle([opt.register_load_state_dict_pre_hook(hook, prepend=prepend) for opt in self.optimizers])
+
+    def register_load_state_dict_post_hook(
+        self, hook, prepend: bool = False
+    ) -> HybridRemovableHandle:
+        return HybridRemovableHandle([opt.register_load_state_dict_post_hook(hook, prepend=prepend) for opt in self.optimizers])
+
+    def load_state_dict(self, state_dict) -> None:
+        child_state_dicts = [{'state': {}, 'param_groups': []} for _ in self.optimizers]
+
+        for idx, sd in enumerate(child_state_dicts):
+            # copy param groups from state dict
+            sd['param_groups'] = state_dict['param_groups'][0]['children'][idx]
+            if len(sd['param_groups']) != len(self.optimizers[idx].param_groups):
+                raise ValueError(f"Number of param groups mismatch. Expected {len(self.optimizers[idx].param_groups)} got {len(sd['param_groups'])}")
+            # param groups can be changed (for example, the compute config is changed)
+            # state_dict for HybridOptimizer is already well organized,
+            # here we will carefully dispatch parameters to each optimizer.
+            current_state_dict = self.optimizers[idx].state_dict()
+            for pg, current_pg in zip(sd['param_groups'], current_state_dict['param_groups']):
+                pg['params'] = current_pg['params'][:]  # make a copy
+
+        for param_idx, param_state in state_dict['state'].items():
+            opt_idx, param_state_idx = self._param_map[param_idx]
+            child_state_dicts[opt_idx]['state'][param_state_idx] = param_state
+
+        for child_state_dict, opt in zip(child_state_dicts, self.optimizers):
+            opt.load_state_dict(child_state_dict)
+
+    def add_param_group(self, param_group: dict[str, Any]) -> None:
+        # no-op to avoid creating new parameter groups
+        # all parameter groups are managed by the individual optimizers
+        pass
+
+
+@dataclass
+class HybridSubLRSchedulerConfig:
+    type: Union[Type[LRScheduler], Callable[..., LRScheduler]] = fn_field(default=None)
+    options: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HybridLRSchedulerConfig:
+    schedulers: list[HybridSubLRSchedulerConfig] = field(default_factory=list)
+
+
+class HybridLRScheduler(LRScheduler, TrainHookHost):
+    """
+    A hybrid learning rate scheduler that combines multiple schedulers.
+
+    Please note HybridLRScheduler doesn't call super().__init__(),
+    So it is actually a duck type for scheduler.
+    """
+
+    def __init__(
+            self,
+            optimizer: HybridOptimizer,
+            config: Union[HybridLRSchedulerConfig, dict[str, Any]],
+            last_epoch: int = -1,
+    ):
+        assert isinstance(optimizer, HybridOptimizer), "Optimizer must be an instance of HybridOptimizer"
+        if isinstance(config, dict):
+            config = deserialize_dataclass(config, HybridLRSchedulerConfig)
+
+        if len(config.schedulers) == 1:
+            self.schedulers = [config.schedulers[0].type(optimizer, **config.schedulers[0].options)]
+        elif len(config.schedulers) == len(optimizer.optimizers):
+            self.schedulers = [sub_config.type(opt, **sub_config.options) for sub_config, opt in zip(config.schedulers, optimizer.optimizers)]
+        else:
+            raise ValueError(f"Expected {len(optimizer.optimizers)} or 1 schedulers, got {len(config.schedulers)}")
+
+    def _get_hook_objects(self):
+        return self.schedulers
+
+    def step(self, epoch=None):
+        for scheduler in self.schedulers:
+            scheduler.step(epoch)
+
+    def state_dict(self):
+        return {idx: scheduler.state_dict() for idx, scheduler in enumerate(self.schedulers)}
+
+    def load_state_dict(self, state_dict):
+        for idx, sd in state_dict.items():
+            self.schedulers[idx].load_state_dict(sd)

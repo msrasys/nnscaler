@@ -49,7 +49,7 @@ from nnscaler.runtime.module import AttrMeta, CubeModule, ParallelModule, Origin
 from nnscaler.flags import CompileFlag, RuntimeFlag
 import nnscaler.policies as policies
 from nnscaler.program import disable_global_graph
-from nnscaler.utils import get_member_by_name, setup_stride_broadcast_group, get_shared_params
+from nnscaler.utils import get_member_by_name, load_type, setup_stride_broadcast_group, get_shared_params
 
 logger = logging.getLogger(__name__)
 
@@ -557,6 +557,10 @@ def _prepare_and_check_reusable(
     if reuse == ReuseType.MATCH or reuse == ReuseType.MOO:
         # check if the module is already generated
         expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
+        expected_output_files.extend([
+            outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
+            for rank in range(compute_config.runtime_ngpus)
+        ])
         expected_output_files.extend(trace_meta_files)
         expected_output_files.append(config_file)
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
@@ -840,12 +844,14 @@ def _gencode(
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
     for rank in range(compute_config.runtime_ngpus):
         fname = outdir / _GENCODE_FILE_TEMPLATE.format(rank)
+        attr_meta_map_fname = outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
         mgener.gen(rank,
             forward_args=forward_args,
             outfile=fname,
             attach=False,
             as_parallel_module=True,
-            end2end_mode=compute_config.use_end2end
+            end2end_mode=compute_config.use_end2end,
+            outfile_attr_meta_map=attr_meta_map_fname
         )
         # generate temporal schedule code only for end2end module
         # because the code generated is wrong for non-end2end module.
@@ -913,6 +919,7 @@ def parallelize(
     module_dtype:  Optional[torch.dtype] = None,
     module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     init_module_params: bool = True,
+    build_module_buckets: bool = True,
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
     """
@@ -983,6 +990,12 @@ def parallelize(
             Otherwise, they will be empty tensor.
             This parameter will be passed to the module constructor,
             so it is only used when module_or_module_class is a module object, and load_module is true.
+        build_module_buckets (bool): For parallel module, parameters that needs to synchronize will be grouped into buckets for more efficient communication.
+            If true, grouping process will be done in `__init__`
+            If false, you should do this by yourself.
+            This parameter will be passed to the module constructor,
+            so it is only used when module_or_module_class is a module object, and load_module is true.
+            Please leave it to true until you have a good reason to change it.
         module_dtype (Optional[torch.dtype]): the dtype of the module. Keep the module as it is if it is None.
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
         broadcast_strategy (Union[str, BroadcastGenFilesStrategy]): the broadcast strategy for generated files.
@@ -1116,7 +1129,7 @@ def parallelize(
         if is_module_class:
             return parallel_module_class
         else:
-            parallel_module = parallel_module_class(init_module_params)
+            parallel_module = parallel_module_class(init_module_params, build_module_buckets)
             parallel_module.train(module_or_module_class.training)  # set training state to the same as original module
             return parallel_module
 
@@ -1245,6 +1258,27 @@ class ParallelOptimizer(torch.optim.Optimizer):
 
 
 OptimizerT = TypeVar('OptimizerT', bound=torch.optim.Optimizer)
+HybridOptimizerT = TypeVar('HybridOptimizer', bound=torch.optim.Optimizer)
+
+
+def hybrid(
+    params: list[torch.nn.Parameter],
+    param_clss_fn: Callable[[str], tuple[int, int]],
+    **kwargs,
+) -> HybridOptimizerT:
+    """
+    Stub for hybrid optimizer creation.
+    Signature of Hybrid optimizer constructor:
+    ```
+    def __init__(self, params, param_clss, **kwargs):
+       ...
+    ```
+    But when you pass arguments to `build_optimizer`
+    You must replace `param_clss` with `param_clss_fn`,
+    And `build_optimizer` will automatically replace `param_clss_fn` with the actual `param_clss`.
+    """
+    ...
+hybrid.is_hybrid = True  # mark this function as hybrid optimizer factory
 
 
 def build_optimizer(
@@ -1287,6 +1321,8 @@ def build_optimizer(
         Please note the type annotation of the returned optimizer (`Union[OptimizerT, ParallelOptimizer]`) is just for intellisense.
     """
 
+    PARAM_CLSS_FN_NAME = 'param_clss_fn'
+
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
         raise RuntimeError("Old style CubeModule is not supported")
 
@@ -1294,12 +1330,21 @@ def build_optimizer(
     if any(m != module and isinstance(m, ParallelModule) and  m.compute_config.use_end2end for m in module.modules()):
         raise RuntimeError("End2End module cannot be nested in another module")
 
+    is_hybrid = False
+    if getattr(optimizer_fn, 'is_hybrid', False):
+        if PARAM_CLSS_FN_NAME not in kwargs:
+            raise ValueError("param_clss_fn must be provided when using hybrid optimizer")
+        # syntax sugar
+        kwargs[PARAM_CLSS_FN_NAME] = load_type(kwargs[PARAM_CLSS_FN_NAME])
+        is_hybrid = True
+
     RuntimeFlag.skip_reducer = True
     RuntimeFlag.skip_zero_grad = False
 
     non_parallel_module_reducer = None
     non_parallel_modules = [m for m in module.modules() if not isinstance(m, ParallelModule)]
     parallel_modules = [m for m in module.modules() if isinstance(m, ParallelModule)]
+    parallel_modules_prefix = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
 
     if not parallel_modules:
         raise RuntimeError("No ParallelModule found in the module. Please make sure you have called parallelize() before build_optimizer().")
@@ -1310,6 +1355,22 @@ def build_optimizer(
             if param is not None and param.requires_grad:
                 non_parallel_parameters_dict[param] = None
     non_parallel_parameters = list(non_parallel_parameters_dict.keys())
+
+    param_original_names = {}
+    for n, p in module.named_parameters():
+        nparts = n.split('.')
+        module_prefix = '.'.join(nparts[:-1])
+        if module_prefix in parallel_modules_prefix:
+            name_mapping = parallel_modules_prefix[module_prefix].get_full_map()
+            original_name = name_mapping[nparts[-1]].orig_name
+            param_original_names[p] = \
+                f'{module_prefix}.{original_name}' if module_prefix else original_name
+        else:
+            param_original_names[p] = n
+    if is_hybrid:
+        param_clss = {p: kwargs[PARAM_CLSS_FN_NAME](n) for p, n in param_original_names.items()}
+    else:
+        param_clss = {}
 
     # check if all ParallelModules have the same gpu_config
     compute_configs = [m.compute_config for m in parallel_modules]
@@ -1340,7 +1401,13 @@ def build_optimizer(
         non_parallel_module_reducer = Reducer(group, **reducer_config)
         for param in non_parallel_parameters:
             non_parallel_module_reducer.add_param(param)
-        non_parallel_module_reducer.build_buckets()
+        non_parallel_module_reducer.build_buckets(param_clss=param_clss)
+
+    if is_hybrid:
+        for pm in parallel_modules:
+            pm.build_buckets(param_clss=param_clss)
+            for reducer in pm.reducers:
+                param_clss.update(reducer.get_opt_params())
 
     opt_module_locs: Dict[str, ModuleParameterLocation] = {}
     def _local_parameters(module: torch.nn.Module):
@@ -1373,7 +1440,13 @@ def build_optimizer(
                     opt_module_locs[name].count += 1
             yield param
 
-    optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), **kwargs)
+    if is_hybrid:
+        optimizer = optimizer_fn(_local_parameters(module),
+            param_clss=param_clss,
+            **{k: v for k, v in kwargs.items() if k != PARAM_CLSS_FN_NAME}
+        )
+    else:
+        optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), **kwargs)
     optimizer._non_parallel_module_reducer = non_parallel_module_reducer
     optimizer._extra_state = OptimizerExtraState(
             rank=torch.distributed.get_rank(),
@@ -1386,21 +1459,21 @@ def build_optimizer(
             }
     )
 
-    def _step_pre_hook(opt, *args, **kwargs):
-        opt.sync_shard_grad()
-
-    def _step_post_hook(opt, *args, **kwargs):
+    orig_step = optimizer.step
+    def _patched_step(self, closure=None):
+        # Please note:
+        # when closure is used in optimizer.step()
+        # the backward is done in closure,
+        # and it is useless to sync grad because grad is still unavailable there
+        # so you must call sync_shard_grad() manually in this case.
+        if closure is None:
+            self.sync_shard_grad()
+        orig_step(closure=closure)
         for m in parallel_modules:
             m.gather_params()
         if non_parallel_module_reducer:
             non_parallel_module_reducer.gather_params()
-
-    # Please note:
-    # register_step_pre_hook doesn't work expectly
-    # when closure is used in optimizer.step()
-    # in that case, you must call sync_shard_grad() manually
-    optimizer.register_step_pre_hook(_step_pre_hook)
-    optimizer.register_step_post_hook(_step_post_hook)
+    optimizer.step = types.MethodType(_patched_step, optimizer)
 
     orig_zero_grad = optimizer.zero_grad
     def _patched_zero_grad(self, set_to_none: bool = True):
@@ -1575,6 +1648,11 @@ def _get_parallel_module_state_dict_info(
     return pm_extra_states, pm_state_dicts, non_pm_state_dict
 
 
+def _is_supported_optimizer(name: str):
+    from nnscaler.runtime.hybrid_optimizer import HybridOptimizer
+    return ('adam' in name.lower()) or name == HybridOptimizer.__name__
+
+
 def _get_optimizer_state_dict_info(
     optimizer_state_dicts: List[Dict[str, Any]]
 ) -> Tuple[
@@ -1631,7 +1709,7 @@ def _get_optimizer_state_dict_info(
     ] = {}
     for opt_state_dict in optimizer_state_dicts:
         opt_extra_state = OptimizerExtraState(**opt_state_dict[ParallelModule.EXTRA_STATE_KEY])
-        if 'adam' not in opt_extra_state.name.lower():
+        if not _is_supported_optimizer(opt_extra_state.name):
             raise ValueError("Only Adam-like optimizers are supported.")
         opt_extra_states[opt_extra_state.rank] = opt_extra_state
 
@@ -1870,7 +1948,7 @@ def load_merged_state_dict(
     module.to(device)
 
     if optimizer is not None and optimizer_state_dict is not None:
-        if 'adam' not in optimizer._extra_state.name.lower():
+        if not _is_supported_optimizer(optimizer._extra_state.name):
             raise ValueError("Only Adam-like optimizers are supported.")
 
         # handle non-paralleled module parameters
@@ -1907,7 +1985,7 @@ def load_merged_state_dict(
             else:
                 # NNPN<[P]PP>N: the current parallel module
                 # parallel module
-                pm_param_count = len(pm_modules[pm_cur]._orign_module_metadata.origin_param_names)
+                pm_param_count = len(pm_modules[pm_cur].origin_module_metadata.origin_param_names)
                 # will map `pm_param_count` parameters in merge state dict
                 # to `pm_locs[pm_cur].count` in optimizer state.
                 cur_states = {}
@@ -1939,7 +2017,7 @@ def _opt_load_merged_state_dict(module: ParallelModule, states: Dict[int, Dict[s
         # orig_name -> state
         orig_param_dict: Dict[str, Dict[str, Any]] = {}
         cnt = 0
-        origin_param_names = module._orign_module_metadata.origin_param_names
+        origin_param_names = module.origin_module_metadata.origin_param_names
         for name in origin_param_names:
             if cnt in states:  # some parameters may not in the sates when it is not used or requires_grad is False in training
                 orig_param_dict[name] = states[cnt]
@@ -2203,11 +2281,21 @@ def _broadcast_gen_files(
     torch.distributed.barrier()
 
 
-def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Dict[str, Any]:
+def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Tuple[
+    Dict[int, Dict[str, Dict[str, AttrMeta]]],
+    int,
+    Dict[int, Dict[str, Dict[str, AttrMeta]]]
+]:
     """
     A helper function that computes the deduplicated attribute information from all ranks.
     Note that this function may be removed in the future and dedup information are computed
     directly at the compilation stage.
+
+    Returns:
+        A tuple containing:
+            - rank2deduped_fullmap: a mapping from rank id to deduplicated attribute information
+            - dedup_group_size: the size of the deduplication group
+            - global_fullmaps: a mapping from rank id to full attribute information
     """
     dedup_group_size = None
     for prefix, parallel_module in parallel_modules.items():
@@ -2219,27 +2307,23 @@ def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Dict[str
     dedup_group_size = dedup_group_size or 1
 
     world_size = torch.distributed.get_world_size()
-    local_fullmaps = {prefix: m.fullmap for prefix, m in parallel_modules.items()}
-    local_tensor_meta = dict()
-    for prefix, m in parallel_modules.items():
-        module_meta = {}
-        for local_name in m.fullmap.keys():
-            assert hasattr(m, local_name), f'Module {prefix} does not have attribute {local_name}'
-            tensor = getattr(m, local_name)
-            module_meta[local_name] = (tuple(tensor.shape), tensor.dtype)
-        local_tensor_meta[prefix] = module_meta
-    global_fullmaps = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(global_fullmaps, local_fullmaps)
+    global_fullmaps: Dict[
+        int, # rank id
+        Dict[str, # submodule prefix
+            Dict[str, # attribute name in parallel module
+                AttrMeta]]
+    ] = {}
+    for rank in range(world_size):
+        global_fullmaps[rank] = {}
+        for prefix, m in parallel_modules.items():
+            global_fullmaps[rank][prefix] = m.get_attr_meta_map(rank)
     # `dedup_attrs` is a deterministic algorithm, so it produces same results across different ranks
-    rank2deduped_fullmap = dedup_attrs(OrderedDict(list(enumerate(global_fullmaps))))
-    global_tensor_meta = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(global_tensor_meta, local_tensor_meta)
-    global_tensor_meta = OrderedDict(list(enumerate(global_tensor_meta)))
+    rank2deduped_fullmap = dedup_attrs(global_fullmaps)
 
     for rank in range(dedup_group_size, world_size):
         assert len(rank2deduped_fullmap[rank]) == 0, f'Rank {rank} has non-empty deduped_fullmap: {rank2deduped_fullmap[rank]}'
 
-    return rank2deduped_fullmap, dedup_group_size, global_tensor_meta
+    return rank2deduped_fullmap, dedup_group_size, global_fullmaps
 
 
 @torch.no_grad()
@@ -2341,10 +2425,12 @@ def load_deduped_state_dict(
 
     # step 2: broadcast deduped weights inside 1st scale unit
     parallel_modules = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
+    non_parallel_modules = {prefix: m for prefix, m in module.named_modules() if not isinstance(m, ParallelModule)}
     rank2deduped_fullmap, dedup_group_size, global_tensor_meta = _collect_dedup_info(parallel_modules)
     broadcast_group = DeviceGroup().get_group(list(range(dedup_group_size)))
     logger.debug(f'at rank {cur_rank}, dedup_group_size: {dedup_group_size}, rank2deduped_fullmap: {rank2deduped_fullmap}')
     if cur_rank < dedup_group_size:
+        # broadcast weights in parallel modules
         for rank, deduped_fullmap in rank2deduped_fullmap.items():
             logger.debug(f'at rank {cur_rank}, process rank: {rank}')
             for prefix, fullmap in deduped_fullmap.items():
@@ -2352,7 +2438,8 @@ def load_deduped_state_dict(
                     key = f'{prefix}.{local_name}' if prefix else local_name
                     assert prefix in parallel_modules, f'prefix {prefix} not found in parallel_modules: {list(parallel_modules.keys())}'
                     pm = parallel_modules[prefix]
-                    shape, dtype = global_tensor_meta[rank][prefix][local_name]
+                    attr_meta = global_tensor_meta[rank][prefix][local_name]
+                    shape, dtype = attr_meta.sub_shape, attr_meta.dtype
                     if rank == cur_rank:
                         assert hasattr(pm, local_name), f'local_name {local_name} not found in {pm}'
                         broadcast_tensor = getattr(pm, local_name)
@@ -2373,14 +2460,21 @@ def load_deduped_state_dict(
                                     f'at rank {cur_rank}, the attribute {key} is already loaded, but not equal to the broadcasted tensor from rank {rank}'
                         else:
                             logger.info(f'at rank {cur_rank}, skip to load: {key} from rank {rank}, not found in the module')
-        assert not missing_keys, f'at rank {cur_rank}, some keys are not loaded: {missing_keys}'
+
+        for key in missing_keys:
+            split_names = key.split('.')
+            prefix = '.'.join(split_names[:-1]) # remove the last part of the key
+            assert prefix not in parallel_modules, f'at rank {cur_rank}, the missing key {key} should be in non-parallel modules'
+
     torch.distributed.barrier()
 
-    # step 3: broadcast weights from 1st scale unit to other units
+    # step 3:
+    # - broadcast non-parallel module weights from 0th rank to other ranks
+    # - broadcast parallel modules weights from 1st scale unit to other units
     broadcast_weights(module)
 
     if optimizer is not None:
-        if 'adam' not in optimizer._extra_state.name.lower():
+        if not _is_supported_optimizer(optimizer._extra_state.name):
             raise ValueError("Only Adam-like optimizers are supported.")
         if optimizer_state_dict is None:
             raise ValueError("optimizer_state_dict should be provided when optimizer is not None.")

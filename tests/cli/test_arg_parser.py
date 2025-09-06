@@ -209,6 +209,28 @@ def test_deserialize_union_type():
     assert y.p == {'value': 'auto'}
 
 
+def test_merge_dict():
+    a = {
+        'compute_config': {
+            'plan_ngpus': 1
+        },
+        'optimizer': {
+            'type': 'torch.nn.Adam',
+            'args': {
+                'lr': 0.001
+            }
+        }
+    }
+    merge_args(a, ['--optimizer', {
+        'type': 'torch.nn.AdamW',
+        'args': {
+            'hello': 'haha'
+        }
+    }])
+    assert a['optimizer']['args']['lr'] == 0.001
+    assert a['optimizer']['args']['hello'] == 'haha'
+
+
 def test_merge_list():
     @dataclass
     class A:

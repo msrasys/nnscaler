@@ -64,12 +64,12 @@ def _gpu_worker():
                 p(tempdir, 'none', '_1')
 
     # case 2: broadcast only code, so only rank 0 can load the module
-    #         rank 1 will raise RuntimeError because it will fail to load fullmodel.pt
+    #         rank 1 will raise FileNotFoundError because it will fail to load attr_map files and more
     with tempfile.TemporaryDirectory() as tempdir:
         if torch.distributed.get_rank() == 0:
             p(tempdir, 'code', '_2')
         else:
-            with pytest.raises(RuntimeError, match='Cannot find file.*'):
+            with pytest.raises(FileNotFoundError):
                 p(tempdir, 'code', '_2')
 
     # case 3: broadcast except weights, so only rank 0 can load the module

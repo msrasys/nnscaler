@@ -25,7 +25,7 @@ import nnscaler
 from nnscaler.utils import enforce_zero_num_worker, is_running_distributed
 
 from .trainer_args import AggregatedOutputs, TrainerArgs, fix_input
-from .train_hook import AggregatedTrainHook, TrainHook
+from .train_hook import AggregatedTrainHook, TrainHook, TrainHookHost
 from .mixed_module import parallelize_model, mixin_module
 
 
@@ -159,7 +159,11 @@ class Trainer:
         self.dummy_input = self._load_dummy_input()
         self.dummy_input = self._fix_input(self.dummy_input)
 
-        pmodel = parallelize_model(self.train_args, self.dummy_input, load_module=not compile_only)
+        pmodel = parallelize_model(
+            self.train_args, self.dummy_input,
+            load_module=not compile_only,
+            build_buckets=not self.train_args.is_hybrid_optimizer()
+        )
         if compile_only:
             return
 
@@ -216,6 +220,7 @@ class Trainer:
         def reducer_pre_hook(reducer, grad):
             grad.div_(self.train_args.scaling_factor)
         self.optimizer.register_reducer_pre_hook(reducer_pre_hook)
+        # Currently we never pass `last_epoch` to its constructor
         self.lr_scheduler = self.train_args.create_lr_scheduler(self.optimizer)
         self.loggers = self.train_args.create_loggers()
 
@@ -224,8 +229,18 @@ class Trainer:
             self.optimizer,
             self.lr_scheduler,
         ]
+        component_hooks = []
+        for component in supported_hook_components:
+            if isinstance(component, TrainHook):
+                component_hooks.append(component)
+            if isinstance(component, TrainHookHost):
+                component_hooks.extend(component.get_hooks())
+
+        # dedup hooks
+        component_hooks = list({id(hook): hook for hook in component_hooks}.values())
+
         self.hook = AggregatedTrainHook(
-            [x for x in supported_hook_components if isinstance(x, TrainHook)]
+            component_hooks
             + [self.train_args.create_hook()]
         )
 
@@ -252,7 +267,7 @@ class Trainer:
 
         global_keys = {
             'model', 'optimizer', 'train_args',
-            'train_status', 'lr_scheduler', 'rank'
+            'train_status', 'lr_scheduler', 'rank', 'nnscaler'
         }
         # for extra keys (including `dataloader` and `rng_states`), we will not merge them.
         # Intead we will collect them from all state_dicts
@@ -271,6 +286,7 @@ class Trainer:
             'lr_scheduler': state_dicts[0].get('lr_scheduler', None),
             'train_status': state_dicts[0]['train_status'],
             'train_args': train_args,
+            'nnscaler': state_dicts[0]['nnscaler'],
             **extra_keys,
         }
         return merged_state_dict
@@ -389,6 +405,11 @@ class Trainer:
             else:
                 resume_from = resume_from / f'{self.rank}.ckpt'
                 state_dict = torch.load(resume_from, map_location='cpu', weights_only=False)
+                if state_dict['train_args']['compute_config'] != asdict(self.train_args.compute_config):
+                    logger.warning(
+                        f"compute_config is changed, and loading checkpoint may fail. "
+                        f"If it fails, please try with merged checkpoint."
+                    )
 
         self.hook.on_load_checkpoint(self, state_dict)
         # if it is not a well-formed state_dict (from third party)
@@ -979,7 +1000,7 @@ class Trainer:
             step_stat.gnorm = step_stat.gnorm.item()
 
             # update parameters
-            step_stat.lr = self.optimizer.param_groups[0]['lr']
+            step_stat.lr = self.optimizer.param_groups[0]['lr']  # only log the first group's lr
             self.hook.before_optimizer_step(self)
             self.optimizer.step()
             self.hook.after_optimizer_step(self)
