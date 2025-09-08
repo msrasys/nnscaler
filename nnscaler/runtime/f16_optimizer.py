@@ -34,8 +34,8 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
         self._multiply_factor = 1.0
         # This flag is used to indicate whether fp32_params are loaded from checkpoint.
         # If not, we will sync from fp16 params to fp32 params in after_load_checkpoint.
-        # If the model is trained from scratch, this flag will always be False.
-        self._fp32_params_loaded = False
+        # If the model is trained from scratch, this flag will be None.
+        self._fp32_params_loaded = None
 
     def after_setup(self, trainer: 'Trainer') -> None:
         """
@@ -154,6 +154,10 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
             if not p.requires_grad:
                 continue
             p32.data.copy_(p.data)
+
+    def on_load_checkpoint(self, trainer, checkpoint) -> None:
+        self._fp32_params_loaded = False
+        logger.info('Set _fp32_params_loaded to False in on_load_checkpoint hook')
 
     def after_load_checkpoint(self, trainer, checkpoint) -> None:
         if not self._fp32_params_loaded:
