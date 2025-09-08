@@ -2263,7 +2263,7 @@ def _broadcast_gen_files(
         if curr_rank != 0:
             files = sent_obj[0]
 
-        logging.info(f'File list broadcasted ({len(files)} in total).')
+        logger.info(f'File list broadcasted ({len(files)} in total).')
         # send file content one by one
         for fname in files:
             if curr_rank == 0:
@@ -2275,7 +2275,7 @@ def _broadcast_gen_files(
             if curr_rank != 0:
                 with open(outdir / fname, 'wb') as f:
                     f.write(data[0])
-            logging.info(f'File {fname} broadcasted.')
+            logger.info(f'File {fname} broadcasted.')
 
     # wait for all nodes to finish
     torch.distributed.barrier()
@@ -2417,42 +2417,62 @@ def load_deduped_state_dict(
     cur_rank = torch.distributed.get_rank()
 
     # step 1: load deduped state dict at each rank
-    module.load_state_dict(module_state_dict, strict=False)
+    missing_keys, unexpected_keys = module.load_state_dict(module_state_dict, strict=False)
     module.to(device)
     torch.distributed.barrier()
-    logger.debug(f'at rank {cur_rank}, state_dict keys: {module_state_dict.keys()}')
+    logger.debug(f'At rank {cur_rank}, state_dict keys: {module_state_dict.keys()}.')
+    logger.debug(f'At rank {cur_rank}, missing_keys: {missing_keys}, unexpected_keys: {unexpected_keys}.')
 
     # step 2: broadcast deduped weights inside 1st scale unit
     parallel_modules = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
     rank2deduped_fullmap, dedup_group_size, global_tensor_meta = _collect_dedup_info(parallel_modules)
     broadcast_group = DeviceGroup().get_group(list(range(dedup_group_size)))
-    logger.debug(f'at rank {cur_rank}, dedup_group_size: {dedup_group_size}, rank2deduped_fullmap: {rank2deduped_fullmap}')
+    logger.debug(f'At rank {cur_rank}, dedup_group_size: {dedup_group_size}, rank2deduped_fullmap: {rank2deduped_fullmap}.')
     if cur_rank < dedup_group_size:
+        # broadcast weights in parallel modules
         for rank, deduped_fullmap in rank2deduped_fullmap.items():
-            logger.debug(f'at rank {cur_rank}, process rank: {rank}')
+            logger.debug(f'At rank {cur_rank}, process rank: {rank}.')
             for prefix, fullmap in deduped_fullmap.items():
                 for local_name, attr_meta in fullmap.items():
                     key = f'{prefix}.{local_name}' if prefix else local_name
-                    assert prefix in parallel_modules, f'prefix {prefix} not found in parallel_modules: {list(parallel_modules.keys())}'
+                    assert prefix in parallel_modules, f'Prefix {prefix} not found in parallel_modules: {list(parallel_modules.keys())}.'
                     pm = parallel_modules[prefix]
                     attr_meta = global_tensor_meta[rank][prefix][local_name]
                     shape, dtype = attr_meta.sub_shape, attr_meta.dtype
                     if rank == cur_rank:
-                        assert hasattr(pm, local_name), f'local_name {local_name} not found in {pm}'
+                        assert hasattr(pm, local_name), f'Local name {local_name} not found in {pm}.'
                         broadcast_tensor = getattr(pm, local_name)
-                        logger.info(f'at rank {cur_rank}, broadcast: {key} from {cur_rank}')
+                        logger.info(f'Broadcast: {key} from {cur_rank}.')
                     else:
                         broadcast_tensor = torch.empty(shape, device=device, requires_grad=False, dtype=dtype)
                     torch.distributed.broadcast(broadcast_tensor, src=rank, group=broadcast_group)
                     if rank != cur_rank:
-                        logger.info(f'at rank {cur_rank}, try to load: {key} to rank {cur_rank}')
                         # in pipeline parallelism, the local_name may not be found in the module
                         if hasattr(pm, local_name):
+                            logger.info(f'At rank {cur_rank}, try to load: {key} from rank {rank}.')
                             attr = getattr(pm, local_name)
-                            attr.data.copy_(broadcast_tensor)
+                            if key in missing_keys:
+                                attr.data.copy_(broadcast_tensor)
+                                missing_keys.remove(key)
+                            else:
+                                assert torch.equal(attr, broadcast_tensor), \
+                                    f'At rank {cur_rank}, the attribute {key} is already loaded, but not equal to the broadcasted tensor from rank {rank}.'
+                        else:
+                            logger.info(f'At rank {cur_rank}, skip to load: {key} from rank {rank}, not found in the module.')
+
+        for key in missing_keys:
+            split_names = key.split('.')
+            prefix = '.'.join(split_names[:-1]) # remove the last part of the key
+            assert prefix not in parallel_modules, f'At rank {cur_rank}, the missing key {key} should be in non-parallel modules.'
+
+    # At this point
+    # - All parallel modules in first scale unit should be complete.
+    # - Non-parallel modules in rank0 should be complete. The rest ranks will get the weights via broadcast_weights.
     torch.distributed.barrier()
 
-    # step 3: broadcast weights from 1st scale unit to other units
+    # step 3:
+    # - broadcast non-parallel module weights from 0th rank to other ranks
+    # - broadcast parallel modules weights from 1st scale unit to other units
     broadcast_weights(module)
 
     if optimizer is not None:
@@ -2499,7 +2519,7 @@ def _broadcast_opt_state(optimizer_state_dict, state_indexes: List[int], dedup_g
     broadcast_group = setup_stride_broadcast_group(dedup_group_size)
     src_rank, curr_parallel_group, curr_parallel_group_ranks = broadcast_group.src_rank, broadcast_group.group, broadcast_group.ranks
 
-    logging.info(f'Rank-{rank} is broadcasting optimizer states to ranks {curr_parallel_group_ranks}, broadcast source: {src_rank}...')
+    logger.info(f'Rank-{rank} is broadcasting optimizer states to ranks {curr_parallel_group_ranks}, broadcast source: {src_rank}...')
 
     # broadcast param groups and state keys/shapes/dtypes via broadcast_object_list
     if rank == src_rank:
@@ -2585,7 +2605,7 @@ def _broadcast_weights(module: torch.nn.Module, stride_size: int):
     broadcast_group = setup_stride_broadcast_group(stride_size)
     rank = torch.distributed.get_rank()
     src_rank, curr_parallel_group, curr_parallel_group_ranks = broadcast_group.src_rank, broadcast_group.group, broadcast_group.ranks
-    logging.info(f'Rank-{rank} is broadcasting weights of {module.__class__.__name__} to ranks {curr_parallel_group_ranks}, broadcast source: {src_rank}...')
+    logger.info(f'Rank-{rank} is broadcasting weights of {module.__class__.__name__} to ranks {curr_parallel_group_ranks}, broadcast source: {src_rank}...')
 
     if isinstance(module, ParallelModule):
         if not _broadcast_single_value(src_rank, curr_parallel_group, module.non_presistent_buffers_inited):
@@ -2593,15 +2613,15 @@ def _broadcast_weights(module: torch.nn.Module, stride_size: int):
 
     # we have a special optimization for ParallelModule
     params = module.parameters_for_broadcast() if isinstance(module, ParallelModule) else list(module.parameters(False))
-    logging.info(f'Inplace broadcasting {len(params)} parameters...')
+    logger.info(f'Inplace broadcasting {len(params)} parameters...')
     for i, param in enumerate(params):
         torch.distributed.broadcast(param.data, src=src_rank, group=curr_parallel_group)
-        logging.info(f'Inplace broadcasted {i+1}/{len(params)} parameters')
+        logger.info(f'Inplace broadcasted {i+1}/{len(params)} parameters')
 
     # NOTE: may batch buffers for efficient broadcast,
     # current implementation is the most memory efficient way.
     buffers = list(module.buffers(False))
-    logging.info(f'Inplace broadcasting {len(buffers)} buffers...')
+    logger.info(f'Inplace broadcasting {len(buffers)} buffers...')
     for buffer in buffers:
         torch.distributed.broadcast(buffer.data, src=src_rank, group=curr_parallel_group)
 
