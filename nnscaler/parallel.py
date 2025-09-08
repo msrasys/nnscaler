@@ -2465,6 +2465,9 @@ def load_deduped_state_dict(
             prefix = '.'.join(split_names[:-1]) # remove the last part of the key
             assert prefix not in parallel_modules, f'At rank {cur_rank}, the missing key {key} should be in non-parallel modules.'
 
+    # At this point
+    # - All parallel modules in first scale unit should be complete.
+    # - Non-parallel modules in rank0 should be complete. The rest ranks will get the weights via broadcast_weights.
     torch.distributed.barrier()
 
     # step 3:
