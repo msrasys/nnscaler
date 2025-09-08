@@ -2425,7 +2425,6 @@ def load_deduped_state_dict(
 
     # step 2: broadcast deduped weights inside 1st scale unit
     parallel_modules = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
-    non_parallel_modules = {prefix: m for prefix, m in module.named_modules() if not isinstance(m, ParallelModule)}
     rank2deduped_fullmap, dedup_group_size, global_tensor_meta = _collect_dedup_info(parallel_modules)
     broadcast_group = DeviceGroup().get_group(list(range(dedup_group_size)))
     logger.debug(f'At rank {cur_rank}, dedup_group_size: {dedup_group_size}, rank2deduped_fullmap: {rank2deduped_fullmap}.')
