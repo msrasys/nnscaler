@@ -1147,3 +1147,23 @@ def test_dict_keys_values_items():
     # key will never be wrapped with IRObject
     # IRFullTensor will be reconstructed, so their ids are different
     assert all(x[0] == y[0] and x[1].shape == y[1].shape and x[1] != y[1] for x, y in zip(r.output(0), d.items()))
+
+def test_Stack():
+    op = F.Stack([IRTensor([2, 3]), IRTensor([2, 3]), IRTensor([2, 3])], dim=0)
+    expected_annotation = 'a b, a b, a b -> 3 a b'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Stack."
+    op = F.Stack([IRTensor([2, 3]), IRTensor([2, 3]), IRTensor([2, 3])], dim=1)
+    expected_annotation = 'a b, a b, a b -> a 3 b'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Stack."
+    op = F.Stack([IRTensor([2, 3]), IRTensor([2, 3]), IRTensor([2, 3])], dim=2)
+    expected_annotation = 'a b, a b, a b -> a b 3'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Stack."
+
+    op = F.Stack([IRTensor([]), IRTensor([]), IRTensor([])], dim=0)
+    expected_annotation = '1, 1, 1 -> 3'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Stack."
+
+def test_Dot():
+    op = F.Dot(IRTensor([4]), IRTensor([4]))
+    expected_annotation = 'k+, k+ -> 1'
+    assert len(op._annos_candidates) == 1 and op._annos_candidates[0] == expected_annotation, "Annotation mismatch for Dot."
