@@ -2420,52 +2420,55 @@ def load_deduped_state_dict(
     missing_keys, unexpected_keys = module.load_state_dict(module_state_dict, strict=False)
     module.to(device)
     torch.distributed.barrier()
-    logger.debug(f'at rank {cur_rank}, state_dict keys: {module_state_dict.keys()}')
-    logger.debug(f'at rank {cur_rank}, missing_keys: {missing_keys}, unexpected_keys: {unexpected_keys}')
+    logger.debug(f'At rank {cur_rank}, state_dict keys: {module_state_dict.keys()}.')
+    logger.debug(f'At rank {cur_rank}, missing_keys: {missing_keys}, unexpected_keys: {unexpected_keys}.')
 
     # step 2: broadcast deduped weights inside 1st scale unit
     parallel_modules = {prefix: m for prefix, m in module.named_modules() if isinstance(m, ParallelModule)}
     non_parallel_modules = {prefix: m for prefix, m in module.named_modules() if not isinstance(m, ParallelModule)}
     rank2deduped_fullmap, dedup_group_size, global_tensor_meta = _collect_dedup_info(parallel_modules)
     broadcast_group = DeviceGroup().get_group(list(range(dedup_group_size)))
-    logger.debug(f'at rank {cur_rank}, dedup_group_size: {dedup_group_size}, rank2deduped_fullmap: {rank2deduped_fullmap}')
+    logger.debug(f'At rank {cur_rank}, dedup_group_size: {dedup_group_size}, rank2deduped_fullmap: {rank2deduped_fullmap}.')
     if cur_rank < dedup_group_size:
         # broadcast weights in parallel modules
         for rank, deduped_fullmap in rank2deduped_fullmap.items():
-            logger.debug(f'at rank {cur_rank}, process rank: {rank}')
+            logger.debug(f'At rank {cur_rank}, process rank: {rank}.')
             for prefix, fullmap in deduped_fullmap.items():
                 for local_name, attr_meta in fullmap.items():
                     key = f'{prefix}.{local_name}' if prefix else local_name
-                    assert prefix in parallel_modules, f'prefix {prefix} not found in parallel_modules: {list(parallel_modules.keys())}'
+                    assert prefix in parallel_modules, f'Prefix {prefix} not found in parallel_modules: {list(parallel_modules.keys())}.'
                     pm = parallel_modules[prefix]
                     attr_meta = global_tensor_meta[rank][prefix][local_name]
                     shape, dtype = attr_meta.sub_shape, attr_meta.dtype
                     if rank == cur_rank:
-                        assert hasattr(pm, local_name), f'local_name {local_name} not found in {pm}'
+                        assert hasattr(pm, local_name), f'Local name {local_name} not found in {pm}.'
                         broadcast_tensor = getattr(pm, local_name)
-                        logger.info(f'broadcast: {key} from {cur_rank}')
+                        logger.info(f'Broadcast: {key} from {cur_rank}.')
                     else:
                         broadcast_tensor = torch.empty(shape, device=device, requires_grad=False, dtype=dtype)
                     torch.distributed.broadcast(broadcast_tensor, src=rank, group=broadcast_group)
                     if rank != cur_rank:
                         # in pipeline parallelism, the local_name may not be found in the module
                         if hasattr(pm, local_name):
-                            logger.info(f'at rank {cur_rank}, try to load: {key} from rank {rank}')
+                            logger.info(f'At rank {cur_rank}, try to load: {key} from rank {rank}.')
                             attr = getattr(pm, local_name)
                             if key in missing_keys:
                                 attr.data.copy_(broadcast_tensor)
                                 missing_keys.remove(key)
                             else:
                                 assert torch.equal(attr, broadcast_tensor), \
-                                    f'at rank {cur_rank}, the attribute {key} is already loaded, but not equal to the broadcasted tensor from rank {rank}'
+                                    f'At rank {cur_rank}, the attribute {key} is already loaded, but not equal to the broadcasted tensor from rank {rank}.'
                         else:
-                            logger.info(f'at rank {cur_rank}, skip to load: {key} from rank {rank}, not found in the module')
+                            logger.info(f'At rank {cur_rank}, skip to load: {key} from rank {rank}, not found in the module.')
 
         for key in missing_keys:
             split_names = key.split('.')
             prefix = '.'.join(split_names[:-1]) # remove the last part of the key
-            assert prefix not in parallel_modules, f'at rank {cur_rank}, the missing key {key} should be in non-parallel modules'
+            assert prefix not in parallel_modules, f'At rank {cur_rank}, the missing key {key} should be in non-parallel modules.'
 
+    # At this point
+    # - All parallel modules in first scale unit should be complete.
+    # - Non-parallel modules in rank0 should be complete. The rest ranks will get the weights via broadcast_weights.
     torch.distributed.barrier()
 
     # step 3:
