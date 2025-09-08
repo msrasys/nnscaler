@@ -32,6 +32,10 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
         # forward __init__ call to the next class in mro(method resolution order)
         super().__init__(*args, **kwargs)
         self._multiply_factor = 1.0
+        # This flag is used to indicate whether fp32_params are loaded from checkpoint.
+        # If not, we will sync from fp16 params to fp32 params in after_load_checkpoint.
+        # If the model is trained from scratch, this flag will be None.
+        self._fp32_params_loaded = None
 
     def after_setup(self, trainer: 'Trainer') -> None:
         """
@@ -111,12 +115,15 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
                 param.data = state_dict['state'][i]['fp32_params'].data.to(device)
                 # pop to avoid store a redundant copy in the wrapped optimizer
                 state_dict['state'][i].pop('fp32_params')
+        else:
+            logger.warning('fp32_params not found in state_dict, will sync from fp16 params to fp32 params')
+            self._sync_fp16_params_to_fp32()
 
-            if len(self.param_groups) != 1:
-                raise RuntimeError('only support one param group')
-            self.param_groups[0]['params'] = self.fp32_params
+        if len(self.param_groups) != 1:
+            raise RuntimeError('only support one param group')
 
         super().load_state_dict(state_dict)
+        self._fp32_params_loaded = True
 
     def _sync_f16_grads_to_fp32(self):
         # copy FP16 grads to FP32
@@ -148,10 +155,15 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
                 continue
             p32.data.copy_(p.data)
 
+    def on_load_checkpoint(self, trainer, checkpoint) -> None:
+        self._fp32_params_loaded = False
+        logger.info('Set _fp32_params_loaded to False in on_load_checkpoint hook')
+
     def after_load_checkpoint(self, trainer, checkpoint) -> None:
-        if 'nnscaler' not in checkpoint:
-            # this checkpoint is not created by nnscaler.
+        if not self._fp32_params_loaded:
+            logger.info('fp32_params not loaded, will sync from fp16 params to fp32 params')
             self._sync_fp16_params_to_fp32()
+            self._fp32_params_loaded = True
 
     def overrided_scale_grads(self, scale: float):
         """
